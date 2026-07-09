@@ -1,0 +1,43 @@
+# Bedroom Solar Shade -- block direct morning sun (heat) while keeping the room bright enough
+# that the lights aren't needed. Collaborates with the morning alarm (wakeup_bedroom): stays out
+# of it until you're up, uses 38 (the wake-routine target / privacy floor) as the open position,
+# and uses sensor.bedroom_presence_illuminance as feedback. Opt-in via input_boolean.bedroom_solar_shade.
+# Position scale matches bedroom_blind_control / wakeup_bedroom (0 = open, 100 = closed).
+#
+# HA helpers (via MCP): input_boolean.bedroom_solar_shade, input_number.bedroom_solar_shade_position (max-shade cap)
+
+BedroomSolarShade:
+  module: bedroom_solar_shade
+  class: BedroomSolarShade
+  log: bedroom_blind_control_log
+
+  cover_entity: cover.bedroom_blind
+  sun_entity: sun.sun
+  radiation_sensor: sensor.gw2000a_solar_radiation
+  illuminance_sensor: sensor.bedroom_presence_illuminance
+  enable_entity: input_boolean.bedroom_solar_shade
+  position_entity: input_number.bedroom_solar_shade_position   # max-shade cap (most closed)
+
+  # morning-alarm collaboration
+  alarm_time_entity: input_datetime.wakeup_bedroom
+  sleep_entity: input_boolean.mikkel_sleep_mode
+  wake_grace_min: 20          # let the wake routine open to 38 + ramp first
+  fallback_wake: "07:30"
+
+  # geometry / thresholds
+  window_azimuth: 70          # ENE facade
+  az_tolerance: 55            # sun "on window" within +/-55 deg of 70 (≈ 15..125 deg)
+  min_elevation: 3
+  radiation_threshold: 250    # W/m2 -- only shade when it's actually bright
+  min_lux: 300                # keep indoor illuminance above this (the "enough light, no lamps" threshold)
+  max_shade: 92               # safety cap; otherwise the shade auto-closes as far as min_lux allows
+  lux_high_factor: 1.3        # only close more when lux is comfortably above min_lux
+  step: 9                     # position step per adjustment
+  open_position: 38           # privacy floor = wakeup_bedroom target; never more open
+  max_position: 100
+  default_shade_position: 77  # fallback max-shade (your comfy bright-day position) if helper missing
+  manual_pause_min: 120
+  position_tolerance: 6
+  check_interval_min: 10
+  status_entity: sensor.bedroom_solar_shade_status
+  dry_run: false

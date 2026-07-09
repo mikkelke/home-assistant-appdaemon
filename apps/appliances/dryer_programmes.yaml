@@ -1,0 +1,191 @@
+# dryer_programmes.yaml — Miele TCB150 WP (Heat Pump Dryer)
+#
+# Full valid programme matrix (programme × dryness × Skåne+). Internal flat keys for
+# profile lookup, ETA, and learning. HA GUI uses split selectors; app derives this key.
+#
+# Fields per programme:
+#   label:           Human-readable name for UI
+#   duration_min:    Expected cycle time (only where manual publishes; Varm luft = selected min)
+#   max_energy_kwh:  Rated energy (only where manual publishes)
+#   is_real:         False for air/refresh only (e.g. finish_uld)
+#
+# Shortest real programme: Skjorter 60 min / Strygelet 65–66 min (fill_window_minutes, min_cycle_minutes)
+
+programmes:
+  bomuld_eco__skabstoert:
+    label: "Bomuld eco - Skabstørt"
+    duration_min: 155
+    max_energy_kwh: 1.70
+
+  bomuld__ekstra_toert:
+    label: "Bomuld - Ekstra tørt"
+  bomuld__ekstra_toert__skane:
+    label: "Bomuld - Ekstra tørt - Skåne +"
+  bomuld__skabstoert:
+    label: "Bomuld - Skabstørt"
+    duration_min: 140
+    max_energy_kwh: 1.50
+  bomuld__skabstoert__skane:
+    label: "Bomuld - Skabstørt - Skåne +"
+    duration_min: 165
+    max_energy_kwh: 1.75
+  bomuld__strygetoert:
+    label: "Bomuld - Strygetørt"
+    duration_min: 120
+    max_energy_kwh: 1.25
+  bomuld__strygetoert__skane:
+    label: "Bomuld - Strygetørt - Skåne +"
+  bomuld__rulletoert:
+    label: "Bomuld - Rulletørt"
+  bomuld__rulletoert__skane:
+    label: "Bomuld - Rulletørt - Skåne +"
+
+  strygelet__skabstoert:
+    label: "Strygelet - Skabstørt"
+    duration_min: 66
+    max_energy_kwh: 0.50
+  strygelet__skabstoert__skane:
+    label: "Strygelet - Skabstørt - Skåne +"
+    duration_min: 66
+    max_energy_kwh: 0.50
+  strygelet__strygetoert:
+    label: "Strygelet - Strygetørt"
+  strygelet__strygetoert__skane:
+    label: "Strygelet - Strygetørt - Skåne +"
+
+  finvask__skabstoert__skane_fixed:
+    label: "Finvask - Skabstørt - Skåne +"
+    duration_min: 65
+    max_energy_kwh: 0.50
+  finvask__strygetoert__skane_fixed:
+    label: "Finvask - Strygetørt - Skåne +"
+
+  finish_uld:
+    label: "Finish uld"
+    duration_min: 5
+    max_energy_kwh: 0.02
+    is_real: false
+
+  skjorter__skabstoert:
+    label: "Skjorter - Skabstørt"
+    duration_min: 60
+    max_energy_kwh: 0.46
+  skjorter__skabstoert__skane:
+    label: "Skjorter - Skabstørt - Skåne +"
+  skjorter__strygetoert:
+    label: "Skjorter - Strygetørt"
+  skjorter__strygetoert__skane:
+    label: "Skjorter - Strygetørt - Skåne +"
+
+  ekspres__ekstra_toert:
+    label: "Ekspres - Ekstra tørt"
+  ekspres__skabstoert:
+    label: "Ekspres - Skabstørt"
+    duration_min: 100
+    max_energy_kwh: 0.85
+  ekspres__strygetoert:
+    label: "Ekspres - Strygetørt"
+  ekspres__rulletoert:
+    label: "Ekspres - Rulletørt"
+
+  denim__skabstoert:
+    label: "Denim - Skabstørt"
+    duration_min: 115
+    max_energy_kwh: 0.95
+  denim__skabstoert__skane:
+    label: "Denim - Skabstørt - Skåne +"
+  denim__strygetoert:
+    label: "Denim - Strygetørt"
+  denim__strygetoert__skane:
+    label: "Denim - Strygetørt - Skåne +"
+
+  sengetoej__ekstra_toert:
+    label: "Sengetøj - Ekstra tørt"
+  sengetoej__skabstoert:
+    label: "Sengetøj - Skabstørt"
+  sengetoej__strygetoert:
+    label: "Sengetøj - Strygetørt"
+  sengetoej__rulletoert:
+    label: "Sengetøj - Rulletørt"
+
+  impraegnering__skabstoert:
+    label: "Imprægnering - Skabstørt"
+    duration_min: 95
+    max_energy_kwh: 0.75
+
+  udglatning__skabstoert__skane_fixed:
+    label: "Udglatning - Skabstørt - Skåne +"
+  udglatning__strygetoert__skane_fixed:
+    label: "Udglatning - Strygetørt - Skåne +"
+
+  varm_luft__020min:
+    label: "Varm luft - 20 min"
+    duration_min: 20
+  varm_luft__020min__skane:
+    label: "Varm luft - 20 min - Skåne +"
+    duration_min: 20
+  varm_luft__030min:
+    label: "Varm luft - 30 min"
+    duration_min: 30
+  varm_luft__030min__skane:
+    label: "Varm luft - 30 min - Skåne +"
+    duration_min: 30
+  varm_luft__040min:
+    label: "Varm luft - 40 min"
+    duration_min: 40
+  varm_luft__040min__skane:
+    label: "Varm luft - 40 min - Skåne +"
+    duration_min: 40
+  varm_luft__050min:
+    label: "Varm luft - 50 min"
+    duration_min: 50
+  varm_luft__050min__skane:
+    label: "Varm luft - 50 min - Skåne +"
+    duration_min: 50
+  varm_luft__060min:
+    label: "Varm luft - 60 min"
+    duration_min: 60
+  varm_luft__060min__skane:
+    label: "Varm luft - 60 min - Skåne +"
+    duration_min: 60
+  varm_luft__070min:
+    label: "Varm luft - 70 min"
+    duration_min: 70
+  varm_luft__070min__skane:
+    label: "Varm luft - 70 min - Skåne +"
+    duration_min: 70
+  varm_luft__080min:
+    label: "Varm luft - 80 min"
+    duration_min: 80
+  varm_luft__080min__skane:
+    label: "Varm luft - 80 min - Skåne +"
+    duration_min: 80
+  varm_luft__090min:
+    label: "Varm luft - 90 min"
+    duration_min: 90
+  varm_luft__090min__skane:
+    label: "Varm luft - 90 min - Skåne +"
+    duration_min: 90
+  varm_luft__100min:
+    label: "Varm luft - 100 min"
+    duration_min: 100
+  varm_luft__100min__skane:
+    label: "Varm luft - 100 min - Skåne +"
+    duration_min: 100
+  varm_luft__110min:
+    label: "Varm luft - 110 min"
+    duration_min: 110
+  varm_luft__110min__skane:
+    label: "Varm luft - 110 min - Skåne +"
+    duration_min: 110
+  varm_luft__120min:
+    label: "Varm luft - 120 min"
+    duration_min: 120
+  varm_luft__120min__skane:
+    label: "Varm luft - 120 min - Skåne +"
+    duration_min: 120
+
+  unknown:
+    label: "Unknown"
+    duration_min: 120
+    max_energy_kwh: 2.0

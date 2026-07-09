@@ -1,0 +1,49 @@
+# Climate Alarm – notify when heating-related rooms drop below threshold.
+#
+# Uses Salus thermostats; includes open window/door context (e.g. rooftop doors).
+# Creates/updates input_boolean.climate_alarm_active and input_text.climate_alarm_message.
+# Clear button = "Recheck in 1 hour" (snooze); real completion when all rooms above threshold.
+#
+# HA helpers (created via MCP): input_boolean.climate_alarm_active,
+#   input_text.climate_alarm_message, input_button.climate_alarm_clear
+
+ClimateAlarm:
+  module: climate_alarm
+  class: ClimateAlarm
+  log: climate_alarm_log
+
+  event_active_entity: "input_boolean.climate_alarm_active"
+  message_entity: "input_text.climate_alarm_message"
+  clear_button_entity: "input_button.climate_alarm_clear"
+
+  climate_entities:
+    - climate.bedroom_thermostat
+    - climate.family_room_thermostat
+    - climate.guest_bathroom_thermostat
+    - climate.bathroom_thermostat
+    - climate.claudias_room_thermostat
+    - climate.kristines_room_thermostat
+
+  temp_threshold:
+    climate.bedroom_thermostat: 18
+    climate.family_room_thermostat: 20
+    climate.guest_bathroom_thermostat: 20
+    climate.bathroom_thermostat: 20
+    climate.claudias_room_thermostat: 20
+    climate.kristines_room_thermostat: 20
+
+  window_door_entities:
+    - binary_sensor.kitchen_window_contact
+    - binary_sensor.dining_room_window_1_contact
+    - binary_sensor.dining_room_window_2_contact
+    - binary_sensor.dining_room_window_3_contact
+    - binary_sensor.living_room_window_contact
+    - binary_sensor.rooftop_door_1_contact
+    - binary_sensor.rooftop_door_2_contact
+    - binary_sensor.kristines_room_window_contact
+
+  notify_target: "home"
+  cooldown_min: 20
+  check_interval_min: 30
+  clear_recheck_min: 60
+  notify_on_resolved: false

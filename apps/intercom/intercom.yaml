@@ -1,0 +1,41 @@
+# /conf/apps/intercom/intercom.yaml
+
+Intercom:
+  module: intercom
+  class: Intercom
+  log: intercom_log
+
+  # Sensors
+  front_sensor: "binary_sensor.intercomproxy_doorbell_front_door"
+  back_sensor: "binary_sensor.intercomproxy_doorbell_back_door"
+  apt_sensor: "binary_sensor.yale_doorbell_ding"
+
+  # Locks
+  front_lock: "lock.intercomproxy_front_door"
+  back_lock: "lock.intercomproxy_back_door"
+
+  # Door state sensors (optional - if door is already open, skip unlock)
+  # front_door_sensor: "binary_sensor.front_door_contact"  # Uncomment and set if available
+  # back_door_sensor: "binary_sensor.back_door_contact"    # Uncomment and set if available
+
+  # Auto-open guard
+  auto_open_boolean: "input_boolean.auto_open_intercom"
+
+  # Messages
+  tts_message_front: "Someone is at the front door"
+  tts_message_back: "Someone is at the back door"
+  tts_message_apt: "Someone is at the apartment door"
+  door_open_message_front: "I opened the front door"
+  door_open_message_back: "I opened the back door"
+
+  # Unlock behavior - multiple attempts so delivery person notices
+  # ESP32 unlock duration is 3 seconds per command
+  # Non-overlapping: 1s, 4s, 7s (door open 1-4s, then 4-7s, then 7-10s)
+  # This gives multiple distinct unlock events they can notice/hear
+  unlock_delay_s: 1
+  unlock_repeat_count: 3  # 3 attempts for better visibility
+  unlock_repeat_interval_s: 3  # 3s interval = non-overlapping (each unlock is a separate event)
+
+  # Debounce rapid retriggers
+  debounce_s: 5
+

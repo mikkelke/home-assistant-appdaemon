@@ -1,0 +1,45 @@
+# /conf/apps/rutines/wakeup_reminder.yaml
+# Configuration for the Wakeup Reminder App
+# Friday/Saturday after 21:00: remind to enable wakeup alarm when in bed (either bedside).
+
+WakeupReminder:
+  module: wakeup_reminder
+  class: WakeupReminder
+  log: wakeup_reminder_log
+  log_level: INFO
+
+  # Person entity to check
+  person_mikkel: "person.mikkel"
+
+  # Bedroom occupancy (FP300); old area_occupancy entity no longer exists in HA
+  bedroom_presence_entity: "binary_sensor.bedroom_presence_presence"
+
+  # Bedroom door sensor (must be closed for notification)
+  # Door closed = "off", door open = "on"
+  bedroom_door_entity: "binary_sensor.bedroom_door_contact"
+
+  in_bed_entities:
+    - binary_sensor.left_bedside
+    - binary_sensor.right_bedside
+
+  # Alarm enabled entity (to check if already enabled)
+  alarm_enabled_entity: "input_boolean.wakeup_bedroom"
+
+  # Notification settings
+  notification_title: "Wakeup routine reminder"
+  notification_message: "Do you need the alarm wakeup routine enabled for tomorrow?"
+
+  # Optional: URL to open when "Enable" button is pressed
+  # For React Kit dashboard, use hash fragment to open specific room:
+  #   - Format: "/dashboard-rooftop/0#room=<area_id>"
+  #   - The bedroom area_id is "bedroom" (from area registry)
+  #   - Relative path (recommended): "/dashboard-rooftop/0#room=bedroom"
+  #   - Entity card: "entityId:input_boolean.wakeup_bedroom"
+  # The hash fragment (#room=bedroom) will open the bedroom detail panel directly
+  # The uri field on the Enable button should open the HA app when the button is pressed
+  # Leave empty to disable URL opening
+  enable_action_url: "/dashboard-rooftop/0#room=bedroom"
+
+  # Triggers: 21:00 Fri/Sat (only if someone is already in bed), Withings in-bed -> on,
+  # bedroom presence + closed door (only if someone is already in bed).
+

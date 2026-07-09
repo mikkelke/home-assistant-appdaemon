@@ -1,0 +1,57 @@
+# /conf/apps/sonos/group_manager.yaml
+
+SonosGroupManager:
+  module: group_manager
+  class: SonosGroupManager
+  log: sonos_log
+
+  # core settings
+  all_speakers:
+    - media_player.bathroom
+    - media_player.bedroom
+    - media_player.dining_room
+    - media_player.kitchen
+    - media_player.living_room
+    - media_player.guest_bathroom
+    - media_player.kristines_room
+    - media_player.claudias_room
+    - media_player.rooftop
+
+  follow_me_flag: "input_boolean.follow_me"
+  master_select: "input_select.sonos_master_speaker"
+  last_ts_input: "input_number.sonos_last_group_ts"  # Tracks when grouping last existed
+  throttle_seconds: 2  # Minimum time between evaluations
+  settle_seconds: 2    # Delay to let state changes settle
+  reset_resume_delay: 2.5  # Same value in follow_me.yaml — delay after sonos_reset_completed before GM/FollowMe resume
+
+  # Explicit mapping of speakers to rooms
+  speaker_room_map:
+    media_player.bathroom: bathroom
+    media_player.bedroom: bedroom
+    media_player.dining_room: dining_room
+    media_player.kitchen: kitchen
+    media_player.living_room: living_room
+    media_player.guest_bathroom: guest_bathroom
+    media_player.kristines_room: kristines_room
+    media_player.claudias_room: claudias_room
+    # rooftop is handled specially in the code 
+
+  # NEW: Explicit mapping of entity_id to exact friendly name for input_select
+  entity_friendly_name_map:
+    media_player.bathroom: "Bathroom"
+    media_player.bedroom: "Bedroom"
+    media_player.dining_room: "Dining room"
+    media_player.kitchen: "Kitchen"
+    media_player.living_room: "Living room"
+    media_player.guest_bathroom: "Guest bathroom"
+    media_player.kristines_room: "Kristines room"
+    media_player.claudias_room: "Claudias Room"
+    media_player.rooftop: "Rooftop"
+
+  # Family Zone Auto-Grouping
+  family_zone_speakers:
+    - media_player.living_room
+    - media_player.kitchen
+    - media_player.dining_room
+  rooftop_entity: media_player.rooftop
+  rooftop_charging_sensor: binary_sensor.rooftop_charging 

@@ -1,0 +1,25 @@
+# Mikkel sleep mode: home + Withings in bed + phone charging or not_charging -> sleep on.
+# Phone discharging -> sleep off (also off if home / in-bed / battery combo no longer matches).
+
+MikkelSleepMode:
+  module: mikkel_sleep_mode
+  class: MikkelSleepMode
+  log: mikkel_sleep_mode_log
+
+  battery_entity: sensor.mikkels_ofx9p_battery_state
+  person_entity: person.mikkel
+  # Either bedside sensor counts as in bed (whole bed is yours now).
+  in_bed_entities:
+    - binary_sensor.left_bedside
+    - binary_sensor.right_bedside
+  sleep_mode_entity: input_boolean.mikkel_sleep_mode
+
+  # Companion app: command_dnd (see mobile_notifier.yaml for service name)
+  notify_service: notify.mobile_app_mikkels_ofx9p
+  dnd_on_command: priority_only
+  # Clear DND when sleep mode ends; must be quoted — bare `off` is YAML boolean false and skips the notify
+  dnd_off_command: "off"
+
+  # Optional overrides if HA uses different state strings:
+  # on_battery_states: [charging, not_charging]
+  # off_battery_state: discharging

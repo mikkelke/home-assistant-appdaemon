@@ -1,0 +1,23 @@
+# /conf/apps/lights/claudias_room_lights.yaml
+
+# All tunable values below are REQUIRED and must be set here. The Python app does not provide defaults.
+claudias_room_lights:
+  module: claudias_room_lights
+  class: ClaudiasRoomLights
+  log: claudias_room_lights_log
+
+  # Core entities
+  ceiling_light:       "light.claudias_room_ceiling_lights"
+  floor_light:         "light.claudias_room_floor_light"
+  # Fast occupancy path (dark/bright still from darkness_calculator push)
+  raw_pir_sensor: "binary_sensor.claudias_room_pir_presence"
+  overnight_guest:     "input_boolean.overnight_guest"
+
+  # Committed dark/bright from darkness_calculator (thresholds in darkness_calculator.yaml)
+  room_state_text_entity: "sensor.room_state_claudias_room"
+  darkness_confirmed_sensor_entity: "sensor.darkness_claudias_room"
+
+  verbosity_level: "normal"  # "quiet", "normal", "debug"
+
+  # Global mechanism: manual override toggle — ON pauses ALL automatic actions for this room
+  manual_override_boolean: "input_boolean.claudias_room_lights_manual"

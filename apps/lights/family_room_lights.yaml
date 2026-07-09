@@ -1,0 +1,115 @@
+# /conf/apps/lights/family_room_lights.yaml
+
+# All tunable values below are REQUIRED and must be set here. The Python app does not provide defaults.
+FamilyRoomLights:
+  module: family_room_lights
+  class: FamilyRoomLights
+  log: family_room_lights_log
+
+  # PIR/presence sensors by room
+  raw_pir_sensors:
+    kitchen:       "binary_sensor.kitchen_pir_presence"
+    dining_room:   "binary_sensor.dining_room_pir_presence"
+    hallway:       "binary_sensor.hallway_pir_presence"
+    living_room:   "binary_sensor.living_room_pir_presence"
+
+  # Which raw_pir_sensors are OR’d for “family zone” presence (same binaries as the dashboard — no extra delay in the app).
+  # Add or remove keys (e.g. hallway) to match how you want the zone defined; tune hold/decay only in HA/sensors.
+  family_presence_room_keys:
+    - kitchen
+    - dining_room
+    - living_room
+    - hallway        # same big open room — walking in lights the family zone (sleep modes still degrade to island-only + hallway light stays suppressed while Mikkel sleeps)
+
+  raw_adjacent_pir_sensors:
+    bedroom:            "binary_sensor.bedroom_pir_presence"
+    kristines_room:     "binary_sensor.kristines_room_pir_presence"
+    claudias_room:             "binary_sensor.claudias_room_pir_presence"
+    guest_bathroom:     "binary_sensor.guest_bathroom_pir_presence"
+
+  # Door-contact sensors by room
+  door_sensors:
+    bedroom:            "binary_sensor.bedroom_door_contact"
+    kristines_room:     "binary_sensor.kristines_room_door_contact"
+    claudias_room:             "binary_sensor.claudias_room_door_contact"
+    guest_bathroom:     "binary_sensor.guest_bathroom_door_contact"
+    
+  # Special rooftop door sensor (keeps living room lights on when open)
+  rooftop_door_sensor:  "binary_sensor.rooftop_door_1_contact"
+
+  # Template OR of Yale cloud + BLE door (binary_sensor.apartment_door_open). Drives arrival latch + entry checks.
+  apartment_entry_door_sensor: "binary_sensor.apartment_door_open"
+  # Guest-exit: all adjacent room doors closed + no family PIR; optionally require entry door closed before clearing latch.
+  guest_exit_require_entry_door_closed: false
+  guest_exit_use_adjacent_doors_only: true
+  # Living/dining only: detect human brighten via context.user_id + echo suppression after this app's service calls.
+  manual_bright_listen_groups:
+    - living
+    - dining
+  manual_bright_echo_suppress_seconds: 1.5
+
+  # Illuminance sensors by room
+  illuminance_sensors:
+    kitchen:       "sensor.kitchen_presence_illuminance"
+    living_room:   "sensor.living_room_presence_illuminance"
+    dining_room:   "sensor.dining_room_presence_illuminance"
+  
+  # Use aggregate room-state sensor (always updated) from the family_room zone
+  room_state_text_entity: "sensor.room_state_family_room"
+  # Same confirmed dark/bright as labels — optional fallback if label parse fails; gates *daylight turn-off*
+  # so lights do not flap on pending lux (see FamilyRoomLights class docstring).
+  darkness_confirmed_sensor_entity: "sensor.darkness_family_room"
+
+  # Published by this app: darkness thresholds (copied from room state), physical on/off counts,
+  # evaluation counts, last lighting decision — use to spot threshold churn vs real toggles.
+  diagnostics_sensor_entity: "sensor.family_room_lights_diagnostics"
+    
+  # Logging and presence reporting
+  # Global mechanism: per-zone manual override — ON pauses automatic control of THAT
+  # zone's lights only (presence/decisions keep running for the rest of the big room).
+  # Keys match light_map groups; island belongs to the kitchen zone.
+  manual_override_booleans:
+    kitchen: "input_boolean.kitchen_lights_manual"
+    island: "input_boolean.kitchen_lights_manual"
+    living: "input_boolean.living_room_lights_manual"
+    dining: "input_boolean.dining_room_lights_manual"
+    hallway: "input_boolean.hallway_lights_manual"
+
+  family_presence_log_interval: 30
+  darkness_change_threshold: 0.1
+  presence_summary_interval: 15
+  verbosity_level: "normal"
+  
+  # Timing parameters
+  initial_check_delay: 5  # Seconds to wait before initial light check
+  check_interval: 30  # Seconds between periodic light checks
+  
+  # Illuminance change hysteresis (optional; not used for darkness decisions)
+  illuminance_hysteresis: 50
+  
+  # Island here is ONLY light.island_lights. island_lights_sg + island_light_1 exist only in dishwasher_island_signal.
+  dishwasher_state_entity: "sensor.dishwasher_state"
+  island_entities_unemptied:
+    - "light.island_lights_sg"
+    - "light.island_light_1"
+
+  # Light groups—used by the code to centralize "which lights go on/off"
+  light_map:
+    living: [ "light.living_room_corner_light", "light.living_room_window_light", "light.living_room_wall_lights" ]
+    dining: [ "light.dining_room_lights" ]
+    kitchen: [ "light.kitchen_counter_lights" ]
+    island: [ "light.island_lights" ]
+    hallway: [ "light.hallway_lights" ]
+    all:    [ "light.living_room_corner_light"
+             , "light.living_room_window_light"
+             , "light.living_room_wall_lights"
+             , "light.dining_room_lights"
+             , "light.kitchen_counter_lights"
+             , "light.island_lights"
+             , "light.hallway_lights" ]
+
+  # Sleep modes (if any of these are "on", on-trigger only island_lights)
+  sleep_mode_booleans:
+    - "input_boolean.kristine_sleep_mode"
+    - "input_boolean.mikkel_sleep_mode"
+# reload-nudge 2026-07-06 per-zone overrides

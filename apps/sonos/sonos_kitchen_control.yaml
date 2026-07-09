@@ -1,0 +1,18 @@
+sonos_kitchen_control:
+  module: sonos_kitchen_control
+  class: SonosKitchenControl
+  log: sonos_kitchen_control_log
+
+  device_id: "4ab738fbe6136d553ebf36fc34f68277"  # Kitchen Z-Wave Switch
+  media_player: "media_player.kitchen"            # Kitchen Sonos Speaker
+  volume_step: 0.05                               # Standard volume step
+
+  master_speaker_input_select: "input_select.sonos_master_speaker" # To get master entity_id
+
+  # --- Z-Wave Listener Configurations (assumed same as bathroom) ---
+  zwave_command_class: 91                   # Default: 91 (Central Scene)
+  zwave_endpoint: 0                         # Default: 0
+  zwave_property_key_volume_up: "004"       # Scene for volume up
+  zwave_property_key_volume_down: "003"     # Scene for volume down AND join/unjoin (on hold)
+  zwave_event_value_pressed: "KeyPressed"     # Event value for a button press
+  zwave_event_value_held: "KeyHeldDown"       # Event value for a button hold (for join/unjoin) 

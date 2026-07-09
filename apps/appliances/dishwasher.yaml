@@ -1,0 +1,125 @@
+# /conf/apps/appliances/dishwasher.yaml
+#
+# Appliance: Miele G5050 VI Active
+#
+# Programmes (from Miele G5050 VI Active operating instructions):
+#   - QuickPowerWash 65°C: ~58 min
+#   - Gentle 45°C: ~149 min
+#   - ECO 50°C: ~227 min (or ~74 min with Express/short)
+#   - Auto 45–65°C: variable
+#   - Intensive 75°C: ~150 min
+#   - Rinse: for salt/maintenance only (not a full wash)
+#
+# Power characteristics (observed):
+#   - Idle/standby: 0-3W
+#   - Heating: ~1400-1800W (brief spikes)
+#   - Washing pump: ~8-50W
+#
+# Usage reference (delayed start): machine turned on with delayed start ~20:00,
+# ECO scheduled to run ~01:00 (e.g. 9/3 UTC+1). Running is detected when power
+# rises (e.g. 13-29W) at the scheduled start, not when the door is closed.
+#
+# STATE LOGIC — normal full wash (every time):
+#   Off -> Running -> Unemptied -> Emptied -> Off
+#   - Off -> Running: sustained power >= start_w (door close arms a fast-start window only; does not set Running by itself)
+#   - Running -> Unemptied: power stays low (cycle finished, door still closed)
+#   - Unemptied -> Emptied: door opens (emptying)
+#   - Emptied -> Off: door closes (emptying done)
+# Exceptions (not every run): Paused (door open mid-cycle with high power), rinse/interrupt, Error (plug unavailable too long), watchdog paths to Off.
+
+# Recovery scripts in HA (scripts.yaml): script.dishwasher_force_off, script.dishwasher_force_unemptied,
+# script.dishwasher_force_emptied (events dishwasher_force_off / dishwasher_force_unemptied / dishwasher_force_emptied).
+# Use Unemptied when the wash finished
+# and the door is still closed but the sensor is wrong (e.g. stuck Off or false Running).
+
+dishwasher_monitor:
+  module: dishwasher_monitor
+  class: DishwasherMonitor
+  log: dishwasher_monitor_log
+
+  # Core entities (WiFi plug: AP/firmware updates can cause unavailable + delayed/bursty readings — not real load spikes)
+  power_sensor: "sensor.athom_smart_plug_v3_50ec44_power"
+  energy_sensor: "sensor.athom_smart_plug_v3_50ec44_energy"
+  door_sensor: "binary_sensor.dishwasher_door_contact"
+  state_entity: "sensor.dishwasher_state"
+  # Optional: mirror state to input_select for UI persistence (default: input_select.dishwasher_state)
+  # ui_state_entity: "input_select.dishwasher_state"
+
+  # Programme selector: set before/during cycle (e.g. "ECO"). Short is separate: short_entity Yes/No.
+  # ECO with short=No ~4h; ECO with short=Yes ~74 min.
+  confirmed_programme_entity: "input_select.dishwasher_confirmed_programme"
+  short_entity: "input_select.dishwasher_short"
+  # Reset selector to "—" when a new cycle starts so you confirm each run (set false to keep last selection)
+  reset_programme_selector_on_start: true
+
+  # ============================================================================
+  # POWER THRESHOLDS (Running = power-based; door only accelerates confirmation)
+  # ============================================================================
+  # Running is published only after start-candidate validation (see below). high_power_threshold /
+  # door-close arm still control how quickly *samples* reach the candidate (2 readings vs 1 when armed);
+  # they do not publish Running by themselves. Delayed start hours later uses the normal threshold only.
+  # Typical draw after a real start: ~13–29 W (pump/circuit), then heating (~400 W+). Idle off: 0–3 W.
+  start_w: 8             # Above idle; must see sustained/extra readings per thresholds below
+  stop_w: 2               # Power level to detect cycle end (dishwasher goes to 0W when done)
+  run_for: 60             # Reserved / unused by monitor (start uses high_power_threshold)
+  stop_for: 90            # Seconds of 0W before declaring finished (longer = fewer false Unemptied during drying/gaps)
+  high_power_threshold: 2 # Consecutive readings >= start_w when not in door fast-start window
+  # After door close from Off/Emptied: arm a window where one high-power *reading* counts toward the candidate (not instant Running).
+  door_close_fast_start_window_s: 900
+  # After a wash ends (Unemptied / plug dropout while Running): require this many seconds of power >= start_w before Off->Running unless door opened or door-close arm is active (blocks ~20s plug blips).
+  start_sustain_seconds_without_door: 120
+  # Plug power entity unavailable/unknown: tolerate up to this many seconds (no instant Off); longer -> state Error. Add "Error" to input_select.dishwasher_state options if you mirror state.
+  power_unavailable_error_after_seconds: 180
+
+  # ============================================================================
+  # START CANDIDATE — false Running after emptying / short plug spikes
+  # ============================================================================
+  # Holds HA in Off (or Unemptied) until power pattern proves a real start: enough active samples,
+  # peak above idle-spike level, optional energy tie-breaker, high-W immediate path, or strict sustain.
+  # Tuning notes from history: ~15–20 W for ~20–30 s then 0 W = reject; real runs sustain or spike >= ~100 W.
+  start_validation_window_s: 180
+  start_validation_min_active_samples: 3
+  # Fast-confirm path when enough active samples are seen within the validation window.
+  start_validation_fast_confirm_samples: 3
+  start_validation_fast_confirm_w: 17.0
+  # Defaults to energy_active_watts if omitted; explicit here for clarity.
+  start_validation_high_confidence_w: 100.0
+  start_validation_idle_w: 2
+  start_candidate_idle_grace_s: 25
+  # Recovery path is always validation-gated; false is accepted for backward compatibility but ignored.
+  start_validation_apply_to_recovery: true
+  # Secondary only: 0 = disabled (kWh resolution is coarse over short windows).
+  start_validation_min_energy_kwh: 0
+
+  # ============================================================================
+  # FEEDBACK & PROGRAMMES
+  # ============================================================================
+  
+  feedback_file: /data/appdaemon/apps/appliances/dishwasher_feedback.json
+  programmes_file: /data/appdaemon/apps/appliances/dishwasher_programmes.yaml
+
+  # ============================================================================
+  # CYCLE VALIDATION - Prevents false "Unemptied" states
+  # ============================================================================
+  
+  # Shortest real programme: Eco short = 74 min. Reject rinse (14 min).
+  fill_window_minutes: 74   # Door open before this = adding dishes
+  min_cycle_minutes: 74     # Reject rinse; accept Eco short as minimum valid
+  min_energy_kwh: 0.4
+  
+  # Pause timeout - if door stays open while adding dishes
+  pause_timeout_minutes: 5
+  
+  # Safety watchdogs - prevent stuck states
+  max_running_hours: 5
+  unemptied_timeout_hours: 0   # 0 = disabled; dishwasher can stay Unemptied for days
+
+  # Emptied state: log to feedback, then auto-transition to Off after this (avoids stuck in Emptied if door close not seen).
+  # Use 30+ min so a brief/false door open (sensor glitch) doesn't falsely mark "emptied" when nobody was home.
+  emptied_timeout_minutes: 30
+
+  # If door is closed within this many seconds of entering Emptied, treat as "peek" (not really emptying) -> revert to Unemptied
+  min_emptying_seconds: 45
+
+  # History correction: threshold for "high power" in energy series (W)
+  energy_active_watts: 100.0

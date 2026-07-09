@@ -1,0 +1,16 @@
+# /conf/apps/lights/manual_override_timeout.yaml
+# GLOBAL mechanism: every *_lights_manual toggle auto-clears after timeout_hours,
+# so a forgotten override cannot keep a room manual forever.
+manual_override_timeout:
+  module: manual_override_timeout
+  class: ManualOverrideTimeout
+  timeout_hours: 12
+  booleans:
+    - input_boolean.bathroom_lights_manual
+    - input_boolean.bedroom_lights_manual
+    - input_boolean.guest_bathroom_lights_manual
+    - input_boolean.claudias_room_lights_manual
+    - input_boolean.kitchen_lights_manual
+    - input_boolean.living_room_lights_manual
+    - input_boolean.dining_room_lights_manual
+    - input_boolean.hallway_lights_manual

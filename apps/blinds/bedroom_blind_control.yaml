@@ -1,0 +1,35 @@
+bedroom_blind_control:
+  module: bedroom_blind_control
+  class: BedroomBlindControl
+  log: bedroom_blind_control_log
+
+  # Z-Wave remote configuration (from HA automation provided)
+  device_id: "fde0ce72582c723f4d8b729b522fc2fa"
+  zwave_command_class: 91
+  zwave_endpoint: 0
+
+  # Scene keys and event mapping
+  # Hold moon -> property_key "001" -> fully closed (100)
+  property_key_close: "001"
+  close_position: 100
+  # Hold people -> property_key "002" -> partial (38)
+  property_key_partial: "002"
+  partial_position: 38
+  bathroom_partial_position: 40
+  event_value_held: "KeyHeldDown"
+  # Partial position matching tolerance (used when deciding if bedroom is at partial before closing)
+  partial_match_tolerance: 2
+  # Threshold for considering a blind "closed" (handles low battery cases where blind stops at 99%)
+  # Default: 95 (so 95% and above is considered "closed")
+  closed_threshold: 95
+  # Delay for sequential state checking to avoid race conditions (seconds)
+  state_check_delay: 0.1
+  # Delay before verifying position after service call (seconds)
+  verification_delay: 2.0
+
+  # Target cover entity
+  target_cover: "cover.bedroom_blind"
+  # Optional: also close bathroom blind when bedroom blind is already at 100 and close-hold is triggered
+  bathroom_blind_entity: "cover.bathroom_blind"
+
+

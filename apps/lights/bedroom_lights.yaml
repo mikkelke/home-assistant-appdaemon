@@ -1,0 +1,32 @@
+# /conf/apps/lights/bedroom_lights.yaml
+#
+# Effective occupancy (vacant vs occupied gate only):
+#   bedroom PIR OR bathroom PIR when bathroom door is open OR any bedside sensor on.
+# Dark/bright from room_state_text_entity (darkness_calculator).
+
+bedroom_lights:
+  module: bedroom_lights
+  class: BedroomLights
+  log: bedroom_lights_log
+
+  bed_lights: "light.bedroom_bed_lights"
+  ceiling_lights: "light.bedroom_ceiling_lights"
+  in_bed_entities:
+    - binary_sensor.left_bedside
+    - binary_sensor.right_bedside
+
+  switch_device_id: "951e07324391856c37850361629523d7"
+  remote_device_id: "fde0ce72582c723f4d8b729b522fc2fa"
+
+  raw_pir_sensor: "binary_sensor.bedroom_pir_presence"
+  raw_bathroom_pir_sensor: "binary_sensor.bathroom_pir_presence"
+  bathroom_door_sensor: "binary_sensor.bathroom_door_contact"
+
+  mikkel_sleep_entity: "input_boolean.mikkel_sleep_mode"
+  # Global mechanism: manual override toggle — ON pauses ALL automatic actions for this room
+  manual_override_boolean: "input_boolean.bedroom_lights_manual"
+  bedroom_blind_entity: "cover.bedroom_blind"
+
+  verbosity_level: "normal"
+  room_state_text_entity: "sensor.room_state_bedroom_bathroom"
+  darkness_confirmed_sensor_entity: "sensor.darkness_bedroom_bathroom"

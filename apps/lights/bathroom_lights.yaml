@@ -1,0 +1,45 @@
+# /conf/apps/lights/bathroom_lights.yaml
+
+bathroom_lights:
+  module: bathroom_lights
+  class: BathroomLights
+  log: bathroom_lights_log
+
+  # Core entities
+  switch_device_id: "70e3c56c1ff23ce8f0f762b23bd67d3c" # For manual toggle
+
+  # --- Light Entities ---
+  # The existing Zigbee2MQTT group of all 6 spots (used by _on_switch, darkness checks if general presence is on)
+  all_spots_group: "light.bathroom_lights" 
+
+  # The new Zigbee2MQTT group of the 5 main spots (excluding the single bath spot)
+  main_5_spots_group: "light.bathroom_main_lights" 
+
+  # The single bath spot entity (also a member of all_spots_group)
+  bath_spot_light: "light.bathroom_bath_light"      
+
+  # --- Presence Sensors ---
+  raw_pir_sensor: "binary_sensor.bathroom_pir_presence"
+
+  # Door between bathroom and bedroom — opening triggers bathroom lights (entering from bedroom)
+  bathroom_door_sensor: "binary_sensor.bathroom_door_contact"
+  # Keep the bath-zone sensor raw (AOD does not provide a separate "bath sub-area" occupancy)
+  specific_bath_presence_entity: "binary_sensor.bathroom_bath_presence_presence"
+
+  # --- Sensors & Controls ---
+  # illuminance_entity: (not required)
+  # outside_entity: (not required)
+  mikkel_sleep_entity: "input_boolean.mikkel_sleep_mode"
+  # Global mechanism: manual override toggle — ON pauses ALL automatic actions for this room
+  manual_override_boolean: "input_boolean.bathroom_lights_manual"
+
+  # --- Blind proxy (optional) ---
+  # If the bedroom blind is fully closed (100), suppress bathroom auto-on due to darkness
+  bedroom_blind_entity: "cover.bedroom_blind"
+
+  # Logging configuration
+  verbosity_level: "normal"  # "quiet", "normal", "debug"  
+
+  # Committed dark/bright from darkness_calculator (bedroom_bathroom zone)
+  room_state_text_entity: "sensor.room_state_bathroom"
+  darkness_confirmed_sensor_entity: "sensor.darkness_bathroom"

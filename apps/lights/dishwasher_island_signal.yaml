@@ -1,0 +1,29 @@
+# ONLY this app uses island_lights_sg + island_light_1 (dishwasher Unemptied + kitchen PIR).
+# FamilyRoomLights uses light.island_lights only — never SG/bulb1.
+#
+# Unemptied + kitchen PIR + bright: full light.island_lights (green), both AL off.
+# Unemptied + kitchen PIR + dark: full group off; light.island_lights_sg on + island_light_1 green.
+# Unemptied, no kitchen PIR: all signal lights off, both AL off (presence required to light).
+# Not Unemptied: main AL on, SG AL off.
+DishwasherIslandSignal:
+  module: dishwasher_island_signal
+  class: DishwasherIslandSignal
+  log: dishwasher_island_signal_log
+
+  dishwasher_state_entity: "sensor.dishwasher_state"
+  kitchen_pir_entity: "binary_sensor.kitchen_pir_presence"
+  room_state_text_entity: "sensor.room_state_family_room"
+  darkness_confirmed_sensor_entity: "sensor.darkness_family_room"
+
+  signal_light_entity: "light.island_light_1"
+  full_island_light_entity: "light.island_lights"
+  island_sg_light_entity: "light.island_lights_sg"
+
+  adaptive_lighting_main_switch: "switch.adaptive_lighting_island_lights"
+  adaptive_lighting_sg_switch: "switch.adaptive_lighting_island_light_sg"
+
+  unemptied_option: "Unemptied"
+
+  signal_brightness_pct: 100
+  # hs_color [hue 0-360, sat 0-100]: saturated green. Prefer over rgb_color on Hue so HA state matches the lamp.
+  signal_hs: [120, 100]

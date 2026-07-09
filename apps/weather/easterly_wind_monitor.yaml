@@ -1,0 +1,38 @@
+# Easterly Wind Monitor – notify when "building creak" wind pattern (easterly + gust range)
+#
+# Requires in HA: Helper "input_boolean.easterly_wind_episode_active" (created via MCP or UI)
+
+EasterlyWindMonitor:
+  module: easterly_wind_monitor
+  class: EasterlyWindMonitor
+  log: easterly_wind_monitor_log
+
+  # GW2000A sensors
+  wind_direction_entity: "sensor.gw2000a_wind_direction"
+  wind_speed_entity: "sensor.gw2000a_wind_speed"
+  wind_gust_entity: "sensor.gw2000a_wind_gust"
+
+  # State in Home Assistant
+  episode_active_entity: "input_boolean.easterly_wind_episode_active"
+
+  # Direction (degrees). Windy = mean ≥ wind_speed_windy OR gust ≥ gust_windy (same unit as HA).
+  # Danish rule of thumb: 8 m/s / 15 m/s → with km/h sensors: 28.8 and 54 (×3.6).
+  direction_min: 60
+  direction_max: 120
+  wind_speed_windy: 28.8
+  gust_windy: 54
+  wind_unit_label: km/h
+
+  # Duration before episode is considered start/end (minutes)
+  sustained_minutes: 5
+  end_after_minutes_not_met: 10
+
+  # Check every 60 seconds
+  check_interval_seconds: 60
+
+  # Who to notify (person name; resolved via MobileNotifier device_mapping)
+  notify_target: "mikkel"
+  notify_on_episode_end: false
+
+  # Set to true to send one test notification on app start (then set back to false)
+  test_notification_on_start: false

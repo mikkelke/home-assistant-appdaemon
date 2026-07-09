@@ -1,0 +1,31 @@
+# /conf/apps/rober2/rober2.yaml
+
+rober2_control:
+  module: control
+  class: Rober2Control
+  log: rober2_log
+  # Notifications are handled by MobileNotifier app
+  # Configure MobileNotifier in apps/notify/mobile_notifier.yaml
+  # Physical room name reported by sensor.rober2_current_room when robot is docked
+  dock_room_name: "Kitchen1"
+  # Master on/off for scheduled cleaning (off = automation disabled; separate from rober2_automation_paused errors)
+  automation_enabled_entity: input_boolean.rober2_enabled
+  # Human-readable cleaning story for React / History (input_text helper in HA)
+  narrative_entity: input_text.rober2_cleaning_narrative
+  narrative_labels:
+    kitchen: "Kitchen (cook side)"
+    kitchen_2: "Kitchen (dining side)"
+    kristines_room: "Kristine's room"
+  # Min cleaning duration (seconds) to count as a zero-progress attempt; default 10 (was 20)
+  # min_duration_zero_progress_sec: 10
+  # max_room_retries: 3
+  # Max seconds after segment command to count a dock as a failed attempt (default 30 min); avoids
+  # counting unavailable->docked or state refresh hours later as attempt 3/3
+  # max_elapsed_zero_progress_sec: 1800
+  # Segment clean uses HA script.rober2_app_segment_clean (script.turn_on). Optional: use_segment_clean_script,
+  # segment_clean_script_entity, segment_script_hass_timeout_s, ha_call_timeout_s, vacuum_command_timeout_s
+
+rober2_schedule:
+  module: schedule
+  class: Rober2Schedule
+  log: rober2_log 

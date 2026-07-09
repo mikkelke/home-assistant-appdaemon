@@ -1,0 +1,26 @@
+# Private: contains full names of third parties (residents/service people).
+# Kept out of the public repo by design — see README.
+apps/people/
+
+# Runtime state written by the apps on the box — must never be tracked or deployed
+*_state.json
+*feedback*.json
+
+# Behavioral / recorded data
+*.csv
+
+# Media: copyrighted manuals, apartment layout drawings, maps
+*.pdf
+*.png
+*.jpg
+
+# Legacy ad-hoc backups (git is the history now)
+*.bak
+*.bak_*
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log

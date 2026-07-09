@@ -1,0 +1,12 @@
+# /conf/apps/climate/claudias_room_climate.yaml
+# Rooftop-door-2 frost economy for Claudias Room.
+# Replaces the HA automation 'Claudias Room climate control' (id 1743762170942).
+
+claudias_room_climate:
+  module: claudias_room_climate
+  class: ClaudiasRoomClimate
+  door_sensor: "binary_sensor.rooftop_door_2_contact"
+  climate_entity: "climate.claudias_room_thermostat"
+  previous_temp_entity: "input_number.claudias_room_previous_temperature"
+  frost_temp: 5
+  default_temp: 20

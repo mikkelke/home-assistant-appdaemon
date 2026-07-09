@@ -1,0 +1,35 @@
+# dishwasher_programmes.yaml — Miele G5050 VI Active
+# Programmes from official operating instructions (Programme overview, p.50–53).
+# No "Normal" programme; machine has: ECO, Auto, Gentle, QuickPowerWash, Intensive.
+#
+# ECO has two durations: full (manual 3:47) or short when "short" (Express) = Yes.
+# QuickPowerWash with short = Yes is the machine rinse (salt/maintenance), ~14 min — not a separate programme.
+# Shortest real wash programme: ECO with short = 74 min (fill window, min_cycle_minutes).
+
+programmes:
+  quick:
+    label: "QuickPowerWash"
+    duration_min: 58
+    duration_short_min: 14   # QuickPowerWash with short = Yes (rinse/salt cycle)
+    max_energy_kwh: 1.2
+
+  gentle:
+    label: "Gentle"
+    duration_min: 149
+    max_energy_kwh: 1.1
+
+  eco:
+    label: "ECO"
+    duration_min: 234
+    duration_short_min: 74   # when short = Yes (Express option)
+    max_energy_kwh: 0.95
+
+  auto:
+    label: "Auto"
+    duration_min: 108
+    max_energy_kwh: 1.45
+
+  intensive:
+    label: "Intensive"
+    duration_min: 150
+    max_energy_kwh: 1.2

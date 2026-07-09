@@ -1,0 +1,32 @@
+sonos_bathroom_control:
+  module: sonos_bathroom_control
+  class: SonosBathroomControl
+  log: sonos_bathroom_control_log
+  device_id: "70e3c56c1ff23ce8f0f762b23bd67d3c"
+  media_player: "media_player.bathroom"
+  volume_step: 0.05
+  master_speaker_input_select: "input_select.sonos_master_speaker"
+
+  # --- Z-Wave Listener Configurations ---
+  zwave_command_class: 91                   # Default: 91 (Central Scene)
+  zwave_endpoint: 0                         # Default: 0
+  zwave_property_key_volume_up: "004"       # Scene for volume up
+  zwave_property_key_volume_down: "003"     # Scene for volume down AND join (on hold)
+  zwave_event_value_pressed: "KeyPressed"     # Event value for a button press
+  zwave_event_value_held: "KeyHeldDown"       # Event value for a button hold (for join)
+
+  bath_presence_sensor: "binary_sensor.bathroom_bath_presence_presence"
+  bath_presence_volume_boost: 0.1 # Volume change on bath presence
+  presence_on_max_volume: 0.35
+  # plugin: HASS # AppDaemon usually infers this, but uncomment if your setup requires explicit plugin declaration for HASS
+
+  entity_friendly_name_map:
+    media_player.bathroom: "Bathroom"
+    media_player.bedroom: "Bedroom"
+    media_player.dining_room: "Dining room"
+    media_player.kitchen: "Kitchen"
+    media_player.living_room: "Living room"
+    media_player.guest_bathroom: "Guest bathroom"
+    media_player.kristines_room: "Kristines room"
+    media_player.claudias_room: "Claudias Room"
+    media_player.rooftop: "Rooftop" 

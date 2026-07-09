@@ -1,0 +1,77 @@
+# Weather opening alert – rain + wind-driven window exposure + rooftop doors.
+# Publishes synthetic entities weather_opening_alert_* via set_state (see README.md).
+
+WeatherOpeningAlert:
+  module: weather_opening_alert
+  class: WeatherOpeningAlert
+  log: weather_opening_alert_log
+
+  rain_rate_entity: sensor.gw2000a_rain_rate_piezo
+  wind_speed_entity: sensor.gw2000a_wind_speed
+  wind_gust_entity: sensor.gw2000a_wind_gust
+  wind_direction_entity: sensor.gw2000a_wind_direction
+
+  rain_rate_min_mmh: 0.5
+  wind_speed_min_kmh: 5
+  wind_gust_min_kmh: 10
+  exposure_band_degrees: 30
+
+  rooftop_rain_sustain_minutes: 2
+  rooftop_rain_clear_minutes: 1
+  window_rain_sustain_minutes: 4
+  window_rain_clear_minutes: 2
+  # Require contact open this long before it counts toward window-rain (0 = immediate).
+  # Use 1–2 if you want fewer alerts right after opening a window while rain/wind already qualify.
+  opening_open_minutes: 2
+
+  evaluate_debounce_seconds: 5
+
+  room_priority:
+    - living_room
+    - kitchen
+    - dining_room
+    - bathroom
+    - bedroom
+    - kristines_room
+
+  openings:
+    - entity_id: binary_sensor.bathroom_window_contact
+      bearing: 70
+      rooftop: false
+      area: bathroom
+    - entity_id: binary_sensor.bedroom_window_contact
+      bearing: 70
+      rooftop: false
+      area: bedroom
+    - entity_id: binary_sensor.dining_room_window_1_contact
+      bearing: 70
+      rooftop: false
+      area: dining_room
+    - entity_id: binary_sensor.living_room_window_contact
+      bearing: 155
+      rooftop: false
+      area: living_room
+    - entity_id: binary_sensor.kitchen_window_contact
+      bearing: 155
+      rooftop: false
+      area: kitchen
+    - entity_id: binary_sensor.dining_room_window_2_contact
+      bearing: 155
+      rooftop: false
+      area: dining_room
+    - entity_id: binary_sensor.dining_room_window_3_contact
+      bearing: 155
+      rooftop: false
+      area: dining_room
+    - entity_id: binary_sensor.kristines_room_window_contact
+      bearing: 335
+      rooftop: false
+      area: kristines_room
+    - entity_id: binary_sensor.rooftop_door_1_contact
+      bearing: 245
+      rooftop: true
+      area: rooftop
+    - entity_id: binary_sensor.rooftop_door_2_contact
+      bearing: 245
+      rooftop: true
+      area: rooftop

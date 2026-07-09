@@ -1,0 +1,285 @@
+# washer_programmes.yaml — Miele WEA 035 WCS Active
+# Programme truth: nominal duration, valid min/max, energy bands, option support.
+# UI matrix: allowed_temperatures, allowed_spin_speeds, default_*, available_options (canonical values only).
+# Merged with Python _DEFAULT_PROFILES; YAML overrides/extends only.
+# Manual: page 62 (consumption table); Programme overview pp. 26–28.
+#
+# Cold-water: machine is cold-water fed; any selected temp other than Cold = machine heats.
+# Programmes that can run cold (manual): Bomuld 90→cold, Strygelet 60→cold, Uld 40→cold,
+#   Finvask 40→cold, Ekspres 20 40→cold, Mørkt/Denim 60→cold, Outdoor 40→cold.
+#
+# ECO 40-60: Manual page 62 at 7 kg = 3:19 (199 min). Full load typical — use 199 so UI matches
+# machine (e.g. start 07:49, done ~11:00, machine shows ~1h42 left). Range 159–199 min.
+# Bomuld 60: 149 min. Strygelet ~119 min. Uld: 39 min. Ekspres: 20 min.
+#
+# Canonical UI values: temperatures "Cold", "20°C" … "90°C"; spin "1400 rpm" … "No spin".
+# Manual max spin by programme: 1400 = ECO, Bomuld, Pumpe/Centrifugering, Kun skyl/stivelse;
+#   1200 = Strygelet, Uld, Ekspres, Mørkt/Denim, Imprægnering; 900 = Finvask, Outdoor.
+# available_options = UI only (which toggles to show); supports_* = backend/validation.
+
+programme_display_order:
+  - ekspres
+  - uld
+  - bomuld
+  - finvask
+  - strygelet
+  - eco
+  - morkt_denim
+  - outdoor
+  - impraegnering
+  - pumpe_centrifugering
+  - kun_skyl_stivelse
+
+programmes:
+  uld:
+    label: "Uld"
+    allowed_temperatures: ["Cold", "20°C", "30°C", "40°C"]
+    allowed_spin_speeds: ["1200 rpm", "900 rpm", "700 rpm", "No spin"]   # Manual: max 1200
+    default_temperature: "30°C"
+    default_spin: "1200 rpm"
+    available_options: []
+    duration_min: 39
+    max_dur_min: 55
+    nominal_duration_min: 39
+    min_valid_duration_min: 25
+    max_valid_duration_min: 55
+    max_energy_kwh: 0.28
+    nominal_energy_kwh: 0.28
+    min_valid_energy_kwh: 0.1
+    max_valid_energy_kwh: 0.28
+    supports_anti_crease: false   # Manual: Uld is the exception (no anti-crease)
+    supports_water_plus: false
+    supports_soak: false
+    supports_prewash: false
+    supports_short: false
+
+  eco:
+    label: "ECO"
+    allowed_temperatures: ["40-60°C", "40°C", "60°C"]
+    default_temperature: "40-60°C"
+    allowed_spin_speeds: ["1400 rpm", "1200 rpm", "900 rpm", "700 rpm", "No spin"]
+    default_spin: "1400 rpm"
+    available_options: ["water_plus", "soak"]
+    duration_min: 199   # Manual p62 at 7 kg: 3:19 (199 min); full load typical
+    max_dur_min: 235
+    max_energy_kwh: 0.78
+    nominal_duration_min: 199
+    min_valid_duration_min: 129    # 0.65 * 199
+    max_valid_duration_min: 235
+    nominal_energy_kwh: 0.78
+    min_valid_energy_kwh: 0.1
+    max_valid_energy_kwh: 0.78
+    supports_anti_crease: true
+    supports_water_plus: true
+    supports_soak: true
+    supports_prewash: false
+    supports_short: false
+
+  strygelet:
+    label: "Strygelet"
+    allowed_temperatures: ["Cold", "20°C", "30°C", "40°C", "60°C"]   # Manual: 60°C → cold
+    allowed_spin_speeds: ["1200 rpm", "900 rpm", "700 rpm", "No spin"]   # Manual: max 1200
+    default_temperature: "30°C"
+    default_spin: "1200 rpm"
+    available_options: ["water_plus", "soak"]
+    duration_min: 119
+    max_dur_min: 140
+    max_energy_kwh: 0.52
+    nominal_duration_min: 119
+    min_valid_duration_min: 77
+    max_valid_duration_min: 140
+    nominal_energy_kwh: 0.52
+    min_valid_energy_kwh: 0.1
+    max_valid_energy_kwh: 0.52
+    supports_anti_crease: true
+    supports_water_plus: true
+    supports_soak: true
+    supports_prewash: false
+    supports_short: false
+
+  finvask:
+    label: "Finvask"
+    allowed_temperatures: ["Cold", "20°C", "30°C", "40°C"]
+    allowed_spin_speeds: ["900 rpm", "700 rpm", "No spin"]   # Manual: max 900
+    default_temperature: "40°C"
+    default_spin: "900 rpm"
+    available_options: ["water_plus", "soak"]
+    duration_min: 65
+    max_dur_min: 90
+    nominal_duration_min: 65
+    min_valid_duration_min: 42
+    max_valid_duration_min: 90
+    max_energy_kwh: 0.40
+    nominal_energy_kwh: 0.40
+    min_valid_energy_kwh: 0.1
+    max_valid_energy_kwh: 0.40
+    supports_anti_crease: true
+    supports_water_plus: true
+    supports_soak: true
+    supports_prewash: false
+    supports_short: false
+
+  ekspres:
+    label: "Ekspres"
+    allowed_temperatures: ["Cold", "20°C", "30°C", "40°C"]
+    allowed_spin_speeds: ["1200 rpm", "900 rpm", "700 rpm", "No spin"]   # Manual: max 1200
+    default_temperature: "40°C"
+    default_spin: "1200 rpm"
+    available_options: ["short"]
+    duration_min: 20
+    max_dur_min: 30
+    nominal_duration_min: 20
+    min_valid_duration_min: 25   # min_cycle_minutes
+    max_valid_duration_min: 30
+    max_energy_kwh: 0.40
+    nominal_energy_kwh: 0.40
+    min_valid_energy_kwh: 0.1
+    max_valid_energy_kwh: 0.40
+    supports_anti_crease: true
+    supports_water_plus: false
+    supports_soak: false
+    supports_prewash: false
+    supports_short: true
+
+  bomuld:
+    label: "Bomuld"
+    allowed_temperatures: ["Cold", "20°C", "30°C", "40°C", "60°C", "90°C"]
+    allowed_spin_speeds: ["1400 rpm", "1200 rpm", "900 rpm", "700 rpm", "No spin"]
+    default_temperature: "40°C"
+    default_spin: "1400 rpm"
+    available_options: ["water_plus", "soak", "prewash"]
+    # Per-temp duration/energy from Python defaults; YAML adds validation bands (fallback when temp unknown)
+    nominal_duration_min: 159
+    min_valid_duration_min: 103
+    max_valid_duration_min: 210
+    nominal_energy_kwh: 0.42
+    min_valid_energy_kwh: 0.1
+    max_valid_energy_kwh: 2.5
+    supports_anti_crease: true
+    supports_water_plus: true
+    supports_soak: true
+    supports_prewash: true
+    supports_short: false
+    # Warm Bomuld 20/30: wider energy envelope + 15 min stable (soaks); merged into Python defaults.
+    by_temperature:
+      "20°C":
+        duration_min: 159
+        max_energy_kwh: 0.55
+        stable_min: 15
+        max_dur_min: 185
+      "30°C":
+        duration_min: 159
+        max_energy_kwh: 0.75
+        stable_min: 15
+        max_dur_min: 185
+
+  # Manual programmes not in original map; cold variants in Python _DEFAULT_PROFILES where applicable
+  morkt_denim:
+    label: "Mørkt/Denim"
+    allowed_temperatures: ["Cold", "20°C", "30°C", "40°C", "60°C"]   # Manual: 60°C → cold
+    allowed_spin_speeds: ["1200 rpm", "900 rpm", "700 rpm", "No spin"]   # Manual: max 1200
+    default_temperature: "60°C"
+    default_spin: "1200 rpm"
+    available_options: ["water_plus"]
+    duration_min: 90
+    max_dur_min: 110
+    nominal_duration_min: 90
+    min_valid_duration_min: 58
+    max_valid_duration_min: 110
+    max_energy_kwh: 0.55
+    nominal_energy_kwh: 0.55
+    min_valid_energy_kwh: 0.1
+    max_valid_energy_kwh: 0.55
+    supports_anti_crease: true
+    supports_water_plus: true
+    supports_soak: false
+    supports_prewash: false
+    supports_short: false
+
+  outdoor:
+    label: "Outdoor"
+    allowed_temperatures: ["Cold", "20°C", "30°C", "40°C"]   # Manual: 40°C → cold
+    allowed_spin_speeds: ["900 rpm", "700 rpm", "No spin"]   # Manual: max 900
+    default_temperature: "40°C"
+    default_spin: "900 rpm"
+    available_options: ["water_plus"]
+    duration_min: 50
+    max_dur_min: 65
+    nominal_duration_min: 50
+    min_valid_duration_min: 33
+    max_valid_duration_min: 65
+    max_energy_kwh: 0.40
+    nominal_energy_kwh: 0.40
+    min_valid_energy_kwh: 0.1
+    max_valid_energy_kwh: 0.40
+    supports_anti_crease: true
+    supports_water_plus: true
+    supports_soak: false
+    supports_prewash: false
+    supports_short: false
+
+  impraegnering:
+    label: "Imprægnering"
+    allowed_temperatures: []
+    default_temperature: null
+    allowed_spin_speeds: ["1200 rpm", "900 rpm", "700 rpm", "No spin"]   # Manual: max 1200
+    default_spin: "1200 rpm"
+    available_options: []
+    duration_min: 25
+    max_dur_min: 35
+    nominal_duration_min: 25
+    min_valid_duration_min: 25
+    max_valid_duration_min: 35
+    max_energy_kwh: 0.15
+    nominal_energy_kwh: 0.15
+    min_valid_energy_kwh: 0.05
+    max_valid_energy_kwh: 0.15
+    supports_anti_crease: true
+    supports_water_plus: false
+    supports_soak: false
+    supports_prewash: false
+    supports_short: false
+
+  pumpe_centrifugering:
+    label: "Pumpe/Centrifugering"
+    allowed_temperatures: []
+    default_temperature: null
+    allowed_spin_speeds: ["1400 rpm", "1200 rpm", "900 rpm", "700 rpm", "No spin"]   # Manual: max 1400
+    default_spin: "1400 rpm"
+    available_options: []
+    duration_min: 10
+    max_dur_min: 20
+    nominal_duration_min: 10
+    min_valid_duration_min: 10
+    max_valid_duration_min: 20
+    max_energy_kwh: 0.08
+    nominal_energy_kwh: 0.08
+    min_valid_energy_kwh: 0.02
+    max_valid_energy_kwh: 0.08
+    supports_anti_crease: false
+    supports_water_plus: false
+    supports_soak: false
+    supports_prewash: false
+    supports_short: false
+
+  kun_skyl_stivelse:
+    label: "Kun skyl/stivelse"
+    allowed_temperatures: []
+    default_temperature: null
+    allowed_spin_speeds: ["1400 rpm", "1200 rpm", "900 rpm", "700 rpm", "No spin"]   # Manual: max 1400
+    default_spin: "1400 rpm"
+    available_options: []
+    duration_min: 30
+    max_dur_min: 45
+    nominal_duration_min: 30
+    min_valid_duration_min: 25
+    max_valid_duration_min: 45
+    max_energy_kwh: 0.12
+    nominal_energy_kwh: 0.12
+    min_valid_energy_kwh: 0.05
+    max_valid_energy_kwh: 0.12
+    supports_anti_crease: true
+    supports_water_plus: false
+    supports_soak: false
+    supports_prewash: false
+    supports_short: false

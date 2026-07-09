@@ -1,0 +1,111 @@
+# /conf/apps/appliances/dryer.yaml
+#
+# Appliance: Miele TCB150 WP (Heat Pump Dryer)
+#
+# Features:
+#   - Heat pump technology (lower power consumption than conventional)
+#   - Anti-crease/Keep-fresh: Intermittent tumbling after main cycle
+#   - Cottons: 88-153 min depending on drying level
+#   - Energy: 0.28-1.36 kWh depending on load/program
+#
+# Power characteristics (heat pump dryer):
+#   - Idle/standby: 0-5W
+#   - Main drying: 400-650W (much lower than conventional ~2000W)
+#   - Anti-crease tumbles: 100-250W intermittent with zero periods
+#
+# DETECTION STRATEGY:
+#   1. Anti-crease detection: Pattern of intermittent power = main cycle done
+#   2. Door handling: Door open with LOW power = finished (not paused)
+#   3. Mid-cycle check: Door open with HIGH power = paused (checking laundry)
+#
+# STATE LOGIC:
+#   - Running -> power drops (door closed) -> Unemptied (reminder to empty)
+#   - Running -> door opens + low power -> Emptied (user is emptying it)
+#   - Running -> door opens + high power -> Paused (checking laundry)
+#   - Unemptied -> door opens -> Emptied (user is emptying)
+#   - Emptied -> door closes -> Off (emptying complete)
+
+dryer_monitor:
+  module: dryer_monitor
+  class: DryerMonitor
+  log: dryer_monitor_log
+
+  # Core entities
+  power_sensor: "sensor.dryer_plug_power"
+  energy_sensor: "sensor.dryer_plug_energy"
+  door_sensor: "binary_sensor.dryer_door_contact"
+  state_entity: "sensor.dryer_state"
+  # Optional: mirror state to input_select for UI persistence (default: input_select.dryer_state)
+  # ui_state_entity: "input_select.dryer_state"
+
+  # Split selectors (match washer): programme + dryness + Skåne+ + time (time only for Varm luft).
+  # App derives one flat key from these for profile lookup, ETA, and feedback.
+  programme_entity: "input_select.dryer_programme"
+  dryness_entity: "input_select.dryer_dryness"
+  skane_plus_entity: "input_boolean.dryer_skane_plus"
+  time_minutes_entity: "input_select.dryer_time_minutes"
+
+  # After each idle transition (Off), reset selectors so the user must pick programme again.
+  reset_programme_on_idle: true
+  programme_unconfirmed_option: "Auto (unconfirmed)"
+  # Same as washer temp/spin: em dash = not chosen (washer_monitor._set_programme_helpers_default)
+  dryness_unselected_option: "—"
+  # Only used when reset_time_minutes_on_idle is true (Varm luft). Left off by default so we
+  # do not call select_option on an entity you may not use / whose options may differ.
+  reset_time_minutes_on_idle: false
+  time_minutes_idle_default: "20"
+
+  # ============================================================================
+  # FEEDBACK & PROGRAMMES
+  # ============================================================================
+
+  feedback_file: /data/appdaemon/apps/appliances/dryer_feedback.json
+  programmes_file: /data/appdaemon/apps/appliances/dryer_programmes.yaml
+
+  # ============================================================================
+  # POWER THRESHOLDS
+  # ============================================================================
+  
+  start_w: 8              # Power level to detect cycle start
+  stop_w: 5               # Power level to detect cycle end
+  run_for: 60             # Seconds to confirm Running when not in door fast-start window
+  stop_for: 60            # Seconds to confirm finished
+  main_cycle_power: 400   # Minimum watts for main drying (heat pump)
+  # Door close from Off/Emptied arms a window: first >= start_w schedules confirm after door_close_fast_confirm_s (else run_for). Stale callback clears timer only; arm stays until success/open/reset/comparison expiry.
+  door_close_fast_start_window_s: 600
+  door_close_fast_confirm_s: 12
+
+  # ============================================================================
+  # CYCLE VALIDATION - Prevents false "Unemptied" states
+  # ============================================================================
+  
+  # Shortest real programme: Skjorter 60 min / Strygelet 65–66 min. Finish uld (5 min, 0.02 kWh) excluded.
+  fill_window_minutes: 60   # Door open before this = add laundry, not emptying
+  min_cycle_minutes: 60     # Reject finish_uld; accept shortest real programmes
+  min_energy_kwh: 0.05      # Exclude finish_uld (0.02 kWh)
+  
+  # Pause timeout for checking laundry
+  pause_timeout_minutes: 10
+  
+  # Safety watchdogs - prevent stuck states
+  max_running_hours: 5
+  unemptied_timeout_hours: 24
+
+  # History correction: threshold for "high power" in energy series (W)
+  energy_active_watts: 100.0
+
+  # ============================================================================
+  # STATE MANAGEMENT
+  # ============================================================================
+  
+  cooling_period: 600     # 10 min prevent state oscillation
+  high_power_threshold: 5
+
+  # Programme detection: from dryer_programmes.yaml (energy + runtime), not power-range.
+  # The old "programs" block is deprecated and no longer used.
+
+  # ============================================================================
+  # ANNOUNCEMENT (match washer)
+  # ============================================================================
+  announce_message: "Dryer is ready to be emptied"
+  announce_entity: "input_boolean.dryer_announce"   # Toggle off to silence; app resets to on when Emptied

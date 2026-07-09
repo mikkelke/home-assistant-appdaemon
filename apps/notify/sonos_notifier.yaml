@@ -1,0 +1,31 @@
+# /conf/apps/notify/sonos_notifier.yaml
+# Configuration for the Sonos Notification App
+
+SonosNotifier:
+  module: sonos_notifier
+  class: SonosNotifier
+  log: sonos_notifier_log # Must match the log name in appdaemon.yaml
+
+  # --- Sleep Mode Configuration ---
+  kristine_sleep_mode_entity: "input_boolean.kristine_sleep_mode"
+
+  mikkel_sleep_mode_entity: "input_boolean.mikkel_sleep_mode"
+  
+  # --- Speaker Configuration (group entities for TTS routing) ---
+  tts_group_all: "media_player.sonos_tts_all"                # no one sleeping
+  tts_group_family_rooms: "media_player.sonos_tts_family_rooms"  # always included when anyone sleeps
+  tts_group_kristine: "media_player.sonos_tts_kristine"      # add when only Mikkel sleeps
+  tts_group_ms: "media_player.sonos_tts_ms"                  # add when only Kristine sleeps
+
+  # --- TTS Configuration ---
+  default_chime_path: "/config/www/chimes/alert_notification.mp3"
+  # The 'cache: true' parameter for chime_tts.say will be hardcoded in the app
+  # as it was consistently used in your example.
+  tts_platform: "piper"  # Use unprefixed name; chime_tts expects "piper"
+
+  # --- Time Constraints (using Home Assistant input_datetime helpers) ---
+  # Notifications will only be sent *after* quiet_hours_end_entity 
+  # AND *before* quiet_hours_start_entity.
+  # Ensure these input_datetime helpers are configured in Home Assistant.
+  quiet_hours_end_entity: "input_datetime.quiet_hours_end"      # e.g., when notifications can START (07:30)
+  quiet_hours_start_entity: "input_datetime.quiet_hours_start"  # e.g., when notifications should STOP (22:00) 

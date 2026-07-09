@@ -1,0 +1,28 @@
+# /conf/apps/notify/mobile_notifier.yaml
+# Configuration for the Mobile Notification App
+
+MobileNotifier:
+  module: mobile_notifier
+  class: MobileNotifier
+  log: mobile_notifier_log
+
+  # Person entities to track for presence detection
+  person_entities:
+    - "person.mikkel"
+    - "person.kristine"
+
+  # Device mapping: person name (lowercase) -> notification service(s)
+  # Find your notification services in Home Assistant:
+  # Settings -> Devices & Services -> Notifications
+  # Service names are typically: notify.mobile_app_<device_name_lowercase_with_underscores>
+  device_mapping:
+    mikkel:
+      - "notify.mobile_app_mikkels_ofx9p"  # Mikkels Android (OFX9P)
+    kristine:
+      - "notify.mobile_app_kristine_iphone_2"  # Kristines iPhone
+
+  # Default notification service for user (for vacuum errors, etc.)
+  # This will always be used when target="user"
+  # Mikkel's device (for vacuum errors)
+  user_notification_service: "notify.mobile_app_mikkels_ofx9p"
+

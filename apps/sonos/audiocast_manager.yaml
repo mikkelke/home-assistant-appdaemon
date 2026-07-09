@@ -1,0 +1,35 @@
+# /conf/apps/sonos/audiocast_manager.yaml
+
+AudiocastManager:
+  module: audiocast_manager
+  class: AudiocastManager
+  log: sonos_log
+
+  # Chromecast Audio feeding the line-in on Kristines room's Era 100
+  cast_entity: media_player.sonos_cast
+
+  # Sonos players pull this URI when on the Audiocast feed (dashboard: src/config/audiocast.ts).
+  # Update the RINCON here AND in the dashboard if the Chromecast Audio moves to another speaker.
+  audiocast_uri_prefix: "x-rincon-stream:RINCON_804AF2CB391401400"
+
+  # Raw HA Sonos entities (these expose media_content_id) -> MA base ids used by SonosStateReset
+  raw_to_base_map:
+    media_player.bathroom_2: media_player.bathroom
+    media_player.bedroom_2: media_player.bedroom
+    media_player.claudias_room_2: media_player.claudias_room
+    media_player.dining_room_2: media_player.dining_room
+    media_player.kitchen_2: media_player.kitchen
+    media_player.living_room_2: media_player.living_room
+    media_player.guest_bathroom_2: media_player.guest_bathroom
+    media_player.kristines_room_2: media_player.kristines_room
+    media_player.rooftop_2: media_player.rooftop
+
+  # Cast states treated as "stopped" ('off' = session disconnected, 'idle' = queue ended).
+  # 'paused' is deliberately NOT here - pausing keeps the Sonos group intact.
+  stopped_states: ["off", "idle"]
+
+  # State must persist this long before stopping/ungrouping (guards against blips between tracks/apps)
+  stopped_confirm_seconds: 20
+
+  # Keep the Chromecast line-out at 100% - room volume is controlled on the Sonos side
+  enforce_cast_volume: true

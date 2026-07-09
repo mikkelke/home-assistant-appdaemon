@@ -1,0 +1,228 @@
+# ─── Transit Alarm ──────────────────────────────────────────────────────────
+#
+# Three AppDaemon instances:
+#
+#   TransitStatus   — background poller; single source of line data for UI and notifications.
+#   TransitMikkel   — notifies when Mikkel leaves home (API check) or when status goes bad (listener).
+#   TransitKristine — notifies when status goes bad, only in window 05:30-08:30 when home.
+#
+# Helpers are named by ROUTE, not by person, so multiple persons can share the
+# same display card.  Each sensor_id maps to two HA helpers:
+#
+#   input_select.transit_<sensor_id>_status  →  OK / Delayed / Disrupted / Unavailable
+#   input_text.transit_<sensor_id>_info      →  human-readable one-liner
+#
+# Stop IDs (resolved from Rejseplanen /location.name):
+#   Enghave Plads (Metro)  → 8603344
+#   Carlsberg (S-tog)      → 8600631
+#   KBH H (S-tog)          → 8600626
+#   KBH H (Metro)          → 8603330
+#   Odense St. (IC/Re)     → 8600512
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─── TransitStatus ──────────────────────────────────────────────────────────
+# Polls ALL routes every 5 min and keeps the HA helpers fresh.
+# No notification logic here — that lives in the per-person instances.
+# Owns the shared refresh button.
+# ─────────────────────────────────────────────────────────────────────────────
+TransitStatus:
+  module: transit_alarm
+  class: TransitAlarm
+  log: transit_alarm_log
+
+  trigger_entity: ""          # no state trigger — poller only
+  trigger_mode: "rising"      # unused but required field
+  access_id: !secret rejseplanen_access_id
+  notify_target: ""           # no notifications from this instance
+
+  # Fetch 60 min ahead so we get more departures when it's late; front end can filter
+  duration_min: 60
+  max_journeys: 25
+  double_check_sec: 0
+
+  refresh_button: "input_button.transit_refresh"
+
+  # ── Smart polling ──────────────────────────────────────────────────────
+  status_update_interval_min: 3     # active hours: poll every 3 min
+  poll_interval_night_min: 30       # 21:00-05:30: poll every 30 min
+  poll_active_start: "05:30"
+  poll_active_end:   "21:00"
+
+  poll_pause_nobody_home: true      # skip entirely if everyone is out
+  poll_max_stale_min: 30           # still poll once when data is this stale (avoids "300+ min ago")
+  home_entities:
+    - person.mikkel
+    - person.kristine
+
+  sleep_entities:                   # skip if ALL of these are on
+    - input_boolean.mikkel_sleep_mode
+    - input_boolean.kristine_sleep_mode
+
+  status_sensor_prefix: "sensor.transit_"
+  # Frontend can read this to show "Last updated X min ago" and "Updates every N min"
+  last_updated_sensor: "sensor.transit_last_updated"
+
+  routes:
+    # ── Metro M3: Enghave Plads → KBH H ──────────────────────────────────
+    - sensor_id: "enghave_metro_kbh"
+      transport_name: "Metro M3"
+      stop_name: "Enghave Plads"
+      stop_id: "8603344"
+      direction_id: "8603330"
+      # Cityringen: filter to "via København H" (1 stop); ø normalized in code.
+      direction_name_filter: "københavn h"
+      lines:
+        - "M3"
+      evaluation_mode: high_frequency
+
+    # ── S-tog: Carlsberg → KBH H (Mikkel + Kristine) ─────────────────────
+    - sensor_id: "carlsberg_stog_kbh"
+      transport_name: "S-tog -> KBH H"
+      stop_name: "Carlsberg"
+      stop_id: "8600631"
+      direction_id: "8600626"
+      lines:
+        - "A"
+        - "B"
+        - "Bx"
+        - "C"
+        - "E"
+        - "F"
+        - "H"
+      evaluation_mode: passenger_impact
+      rescue_window_min: 5
+      delay_threshold_min: 10
+
+    # ── IC/Re: KBH H → Odense (Kristine) ─────────────────────────────────
+    # direction_id filters to trains that stop at Odense (IC + Re passing through).
+    # line_categories excludes Metro and S-tog from the same stop.
+    # duration_min: 90 overrides the instance default (30) so there are always
+    # 1-2 trains visible in the window even when IC runs every 30-60 min.
+    - sensor_id: "kbh_ic_odense"
+      transport_name: "IC -> Odense"
+      stop_name: "KBH H"
+      stop_id: "8600626"
+      direction_id: "8600512"
+      duration_min: 90
+      line_categories:
+        - "IC"
+        - "Re"
+      evaluation_mode: infrequent_strict
+      delay_threshold_min: 10   # IC/Re run ~hourly; 10+ min delay is significant
+
+
+# ─── TransitMikkel ──────────────────────────────────────────────────────────
+# Notifies when Mikkel's routes go bad: on leave-home (one API check) or when status changes (listener).
+# Notification window 08:00-09:00 weekdays when home (from status updates; no extra timer).
+# ─────────────────────────────────────────────────────────────────────────────
+TransitMikkel:
+  module: transit_alarm
+  class: TransitAlarm
+  log: transit_alarm_log
+
+  trigger_entity: person.mikkel
+  trigger_mode: "falling"
+
+  # Notification window only (when we may send alerts); line data comes from TransitStatus.
+  schedule_start: "08:00"
+  schedule_end: "09:00"
+  schedule_weekdays_only: true
+  requires_home_entity: person.mikkel
+
+  access_id: !secret rejseplanen_access_id
+  notify_target: "mikkel"
+
+  duration_min: 60
+  max_journeys: 25
+  double_check_sec: 60
+
+  refresh_button: ""              # TransitStatus owns the refresh button
+  status_update_interval_min: 0   # TransitStatus owns background polling
+  enable_status_change_alerts: false   # avoid duplicate: leave-home trigger already sends Transit Alert
+
+  routes:
+    - sensor_id: "enghave_metro_kbh"
+      transport_name: "Metro M3"
+      stop_name: "Enghave Plads"
+      stop_id: "8603344"
+      direction_id: "8603330"
+      direction_name_filter: "københavn h"
+      lines:
+        - "M3"
+      evaluation_mode: high_frequency
+
+    - sensor_id: "carlsberg_stog_kbh"
+      transport_name: "S-tog -> KBH H"
+      stop_name: "Carlsberg"
+      stop_id: "8600631"
+      direction_id: "8600626"
+      lines:
+        - "A"
+        - "B"
+        - "Bx"
+        - "C"
+        - "E"
+        - "F"
+        - "H"
+      evaluation_mode: passenger_impact
+      rescue_window_min: 5
+      delay_threshold_min: 10
+
+
+# ─── TransitKristine ────────────────────────────────────────────────────────
+# Notifies when Kristine's routes go bad. TransitStatus owns line data; we only define notification window.
+# Routes: S-tog Carlsberg → KBH H, then IC KBH H → Odense.
+# ─────────────────────────────────────────────────────────────────────────────
+TransitKristine:
+  module: transit_alarm
+  class: TransitAlarm
+  log: transit_alarm_log
+
+  trigger_mode: "schedule"
+  schedule_start: "05:30"
+  schedule_end: "08:30"
+  schedule_weekdays_only: true
+  requires_home_entity: person.kristine
+
+  access_id: !secret rejseplanen_access_id
+  notify_target: "kristine"
+
+  duration_min: 60
+  max_journeys: 15
+  double_check_sec: 0
+
+  refresh_button: ""
+  status_update_interval_min: 0
+
+  routes:
+    # First leg: get to KBH H
+    - sensor_id: "carlsberg_stog_kbh"
+      transport_name: "S-tog -> KBH H"
+      stop_name: "Carlsberg"
+      stop_id: "8600631"
+      direction_id: "8600626"
+      lines:
+        - "A"
+        - "B"
+        - "Bx"
+        - "C"
+        - "E"
+        - "F"
+        - "H"
+      evaluation_mode: passenger_impact
+      rescue_window_min: 5
+      delay_threshold_min: 10
+
+    # Second leg: IC/Re from KBH H toward Odense
+    - sensor_id: "kbh_ic_odense"
+      transport_name: "IC -> Odense"
+      stop_name: "KBH H"
+      stop_id: "8600626"
+      direction_id: "8600512"
+      duration_min: 90
+      line_categories:
+        - "IC"
+        - "Re"
+      evaluation_mode: infrequent_strict
+      delay_threshold_min: 10

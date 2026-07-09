@@ -1,0 +1,67 @@
+# /conf/apps/sonos/follow_me.yaml
+
+SonosFollowMe:
+  module: follow_me
+  class: SonosFollowMe
+  log: sonos_log
+
+  # Core settings
+  follow_me_flag:   "input_boolean.follow_me"
+  room_presence_map:
+    # Template/combined presence per room (e.g. bedroom_pir_presence already ORs motion + occupancy in HA).
+    bathroom:       "binary_sensor.bathroom_pir_presence"
+    bedroom:        "binary_sensor.bedroom_pir_presence"
+    guest_bathroom: "binary_sensor.guest_bathroom_pir_presence"
+    claudias_room:  "binary_sensor.claudias_room_pir_presence"
+    living_room:    "binary_sensor.living_room_pir_presence"
+    dining_room:    "binary_sensor.dining_room_pir_presence"
+    hallway:        "binary_sensor.hallway_pir_presence"
+    kitchen:        "binary_sensor.kitchen_pir_presence"
+    kristines_room: "binary_sensor.kristines_room_pir_presence"
+    rooftop_charging: "binary_sensor.rooftop_charging"  # Detects if rooftop speaker is docked (only follows when docked)
+  all_speakers:
+    - media_player.bathroom
+    - media_player.bedroom
+    - media_player.dining_room
+    - media_player.kitchen
+    - media_player.living_room
+    - media_player.guest_bathroom
+    - media_player.kristines_room
+    - media_player.claudias_room
+    - media_player.rooftop
+  
+  # Rate limiting (seconds between updates). Code accepts throttle_seconds or min_update_interval.
+  throttle_seconds: 2
+  settle_seconds: 2
+  reset_resume_delay: 2.5  # Same value as group_manager.yaml — FollowMe must not resume before GroupManager
+
+  # Explicit mapping of speakers to rooms
+  speaker_room_map:
+    media_player.bathroom: bathroom
+    media_player.bedroom: bedroom
+    media_player.dining_room: dining_room
+    media_player.kitchen: kitchen
+    media_player.living_room: living_room
+    media_player.guest_bathroom: guest_bathroom
+    media_player.kristines_room: kristines_room
+    media_player.claudias_room: claudias_room
+    # rooftop is handled specially in the code
+
+  # NEW: Explicit mapping of entity_id to exact friendly name (consistent with GroupManager)
+  entity_friendly_name_map:
+    media_player.bathroom: "Bathroom"
+    media_player.bedroom: "Bedroom"
+    media_player.dining_room: "Dining room"
+    media_player.kitchen: "Kitchen"
+    media_player.living_room: "Living room"
+    media_player.guest_bathroom: "Guest bathroom"
+    media_player.kristines_room: "Kristines room"
+    media_player.claudias_room: "Claudias Room"
+    media_player.rooftop: "Rooftop"
+
+  # raw_pir_sensors removed: room_presence_map now uses PIR presence (same as lights), so one source for both state and immediate response
+
+  # Special conditions for room presence
+  special_conditions:
+    kitchen_or_hallway: true   # Kitchen should unmute if either kitchen or hallway has presence
+    rooftop_with_living_room: true  # Rooftop should only unmute with living room presence + charging

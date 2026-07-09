@@ -1,0 +1,508 @@
+# /conf/apps/appliances/washer.yaml
+#
+# Appliance: Miele WEA 035 WCS Active  (da-NDS  M.-Nr. 11 592 880)
+#
+# =============================================================================
+# Forbrugsdata / Consumption data  —  page 62 of 72
+# (Miele WEA 035 WCS Active, M.-Nr. 11 592 880 / 08 da-NDS)
+# =============================================================================
+#
+# Programme    Load    Energy  Water  Duration  Temp¹  Residual  Spin
+#              kg      kWh     litre  h:min     °C     moist.%   rpm
+# -----------------------------------------------------------------------------
+# ECO 40-60 *  7.0     0.70    55     3:19      38     51        1400
+#              3.5     0.47    50     2:39      35     51        1400
+#              2.0     0.27    26     2:39      29     54        1400
+# Bomuld 60    7.0     1.20    50     2:29      54     53        1400
+# Bomuld 20 ³  7.0     0.35    69     2:39      24     53        1400
+# Strygelet 30 3.5     0.45    52     1:59      33     30        1200
+# Ekspres 20 ² 3.5     0.34    30     0:20      27     60        1200
+# Uld 30       2.0     0.23    35     0:39      –      –         1200
+#
+# *  EU Ecodesign 2019/2023 and energy label 2019/2014 test programme
+# ¹  Max. temperature reached in textiles during main wash
+# ²  Short option activated
+# ³  20°C programme for lightly soiled cotton
+#
+# Note: values may differ depending on water pressure, hardness, inlet temp,
+# room temperature, load type and quantity, mains voltage, and selected options.
+# =============================================================================
+#
+# Full programme list (Programoversigt pp. 26-28)  — not all on page 62:
+#
+#   On the machine, Programme and Temperature are separate controls; do not combine in one string.
+#
+#   Programme     Temp range     Max load  Rinses     Derived duration / notes
+#   -----------   ----------     --------  ---------  --------------------------------
+#   ECO 40-60 *   –              7.0 kg    varies     159-199 min  (page 62: 3:19 = 199 min at 7 kg; “around 3 h”)
+#   Bomuld        90°C → cold    7.0 kg    2 (≥60°C)  ~149 min  at 60°C  (page 62)
+#                                          3 (<60°C)  ~175 min  at 40°C  (extra rinse)
+#                                                     ~160 min  at 70/90°C (more heating)
+#   Strygelet     60°C → cold    3.5 kg    2-4        ~119 min (page 62)
+#   Uld ♻        40°C → cold    2.0 kg    2          ~39 min  (page 62)
+#   Finvask       40°C → cold    2.0 kg    2-4        ~50-80 min (estimated, not on p62)
+#   Ekspres 20    40°C → cold    3.5 kg    1          ~20 min  (page 62, Short active)
+#   Mørkt/Denim   60°C → cold    3.0 kg    3-5        ~90-130 min (estimated, not on p62)
+#   Outdoor       40°C → cold    2.5 kg    3-4        ~60-100 min (estimated, not on p62)
+#   Imprægnering  40°C           2.5 kg    1          ~30-45 min  (estimated, not on p62)
+#   Pumpe/Centri  –              7.0 kg    –          <10 min
+#   Kun skyl      –              7.0 kg    0-1        ~20-40 min
+#
+# KEY INSIGHT (manual p.31, footnote 1):
+#   Bomuld at 60°C and above → 2 rinse cycles
+#   Bomuld below 60°C        → 3 rinse cycles  (adds ~25 min)
+# This explains why Bomuld 40°C is visibly longer than Bomuld 60°C.
+#
+# SPIN SPEEDS (manual p.24 Centrifugering):
+#   Max spin per programme: ECO/Bomuld/Pumpe/Kun skyl 1400; Strygelet/Uld/Ekspres/Mørkt/Imprægnering 1200; Finvask/Outdoor 900 (rpm).
+#   "Ved slutcentrifugeringshastigheden under 700 o/min tilføjes et ekstra skyl" → below 700 rpm adds extra rinse.
+#   Flydeslut = no spin. Our input_select uses: —, 1400 rpm, 1200 rpm, 900 rpm, 700 rpm, No spin (all from manual).
+#
+# ENERGY GATES for programme detection (warm programmes, ascending):
+#   < 0.52 kWh + < 135 min  → Strygelet 30
+#   0.55-0.90 kWh + 140-195 min → Bomuld 40°C  (3-rinse cold-ish cotton)
+#   > 0.85 kWh               → Bomuld 60°C  (high energy)
+#   > 1.35 kWh               → Bomuld 90/70°C (extreme energy)
+#
+# Power characteristics (observed):
+#   - True idle/off: 0-2.8W
+#   - Inter-operation pauses: 3.8-4.2W (NOT idle!)
+#   - Tumbling/washing: 40-80W
+#   - Heating phases: ~2000W
+#   - Spin cycles: 200-500W
+#
+# DETECTION STRATEGY:
+#   1. AddLoad handling: Door open with HIGH power = paused (adding laundry)
+#   2. Cycle complete: We MUST detect finish BEFORE the door opens (energy/power stable).
+#   3. stop_w at 3.0W ensures inter-op pauses (3.8W) don't trigger finish
+#
+# REAL-LIFE TIMING (focus on feedback):
+#   Finish: We determine cycle finished from energy/power (not from door open). When run time is in
+#   the last hour of expected duration (or past 80%), we use finish_stable_minutes_near_end (e.g. 5 min)
+#   of stable energy so we transition to Unemptied around when the machine actually stops (~10:52),
+#   not when the user opens the door (11:05).
+#   Door open is a HARD LIMIT: we know the cycle had finished *by* then, but it may have finished earlier.
+#   When the user opens the door without Unemptied (Running -> Emptied), we still correct duration from
+#   energy history (or last_high_energy_at) so feedback stores the actual programme end, not time to door open.
+#   Programme length: The 15 min stable window (or 5/3/2 min near end) only affects *when* we declare
+#   finish (to avoid false positives during mid-cycle soaks). The *reported* run_time_minutes and
+#   feedback duration are corrected from HA energy history (or last_high_energy_at when history is
+#   unavailable) so you get the actual machine runtime, not runtime + stable delay.
+#   You can also give the exact cycle end time: set cycle_ended_at_entity (e.g. input_text with "13:33")
+#   when the machine stops; we use it for that cycle's duration and learning, then clear the entity.
+#   To correct past cycles (e.g. the first two that already ended): use bootstrap_confirmed_cycles in
+#   this config with confirmed programme key and duration_min for each; on first start we merge them
+#   into the feedback file and reload learning, so ETA is correct from the next cycle.
+#   Start: We only declare Running when we have sustained high power. start_time is clamped to
+#   last_off_at and to last_door_closed_at only when last_door_closed_trusted is true (set on a
+#   real door close in code — not legacy/stale entity data after HA restart). Infer-only anchors
+#   leave last_door_closed_trusted false.
+#
+# STATE LOGIC:
+#   - Running -> power drops (door closed) -> Unemptied (reminder to empty)
+#   - Running -> door opens + run_time <= pause_window -> Paused (AddLoad - adding laundry)
+#   - Running -> door opens + run_time > pause_window -> Unemptied then Emptied (cycle done;
+#       we record Unemptied first so the timeline and feedback are correct, then Emptied)
+#   - Paused: 15 min rule - door open timeout = pause_timeout_minutes (add item and close)
+#   - Paused -> door closes + high power -> Running (cycle resumes)
+#   - Paused -> door closes + low power + valid cycle -> Unemptied
+#   - Paused -> door closes + low power + invalid cycle -> Off
+#   - Unemptied -> door opens -> Emptied (user is emptying)
+#   - Emptied -> door closes -> Off (emptying complete)
+#
+# =============================================================================
+# FRONTEND — What the dashboard should know
+# =============================================================================
+#
+# STATE ENTITY: sensor.washer_state
+#   state: "Off" | "Running" | "Paused" | "Unemptied" | "Emptied"
+#
+#   Progress bar / ETA: Only when state = Running. When state is Off, Unemptied, or Emptied,
+#   the app clears progress attributes (cycle_start_time, estimated_end_time, elapsed_minutes,
+#   progress_pct, programme_duration_min, estimated_remaining_min, energy_at_start,
+#   last_high_energy_at) so the UI does not show the previous cycle. Check state = "Running"
+#   before showing "Started … Done …" or progress bar.
+#
+#   When state = Running, attributes:
+#     detected_programme   Internal key (ekspres, uld, bomuld_20, bomuld_40, bomuld_60, bomuld_hot, finvask, strygelet, eco, unknown)
+#     programme_label      Human label for display (e.g. "ECO", "Bomuld 40")
+#     heating_bursts       Number of heating phases seen
+#     max_power_w          Peak power (W) this cycle
+#     cycle_start_time     ISO datetime in true UTC (e.g. 08:57 local → 07:57Z). Use for toLocaleTimeString() if needed.
+#     cycle_start_time_local  ISO datetime in your timezone (e.g. 2026-02-25T08:57:00+01:00). Use for "Started" to avoid parsing.
+#     started_at_display   "HH:MM" in your timezone — use for "Started HH:MM" (no parsing; always correct)
+#     programme_duration_min  Expected total minutes (for progress bar)
+#     elapsed_minutes      Minutes run so far
+#     progress_pct         0–100 (how far through the programme)
+#     estimated_remaining_min  Minutes left (rounded)
+#     estimated_end_time    "HH:MM" in your timezone
+#     energy_at_start      kWh at cycle start (optional)
+#     last_high_energy_at  ISO datetime in your timezone, last high consumption (optional)
+#     last_door_closed_at  ISO datetime in your timezone (optional anchor for restore/clamp)
+#     last_door_closed_trusted  bool — if false, last_door_closed_at is ignored for clamps (e.g. after Off or infer-only)
+#     last_off_at          ISO datetime in your timezone, when we last went to Off (for restore/clamp)
+#
+#   When state = Off: progress attributes above are cleared (null). last_door_closed_at and
+#   last_off_at are kept; last_door_closed_trusted is false so a restart does not treat a stale
+#   door timestamp as the real close time (fixes wrong "Started" after unknown→closed artefacts).
+#
+#   When state = Unemptied, attributes:
+#     cycle_complete       true
+#     run_time_minutes     Programme length (actual run; excludes idle after programme end)
+#     detected_programme   Confirmed programme key
+#     programme_label      Human label
+#     heating_bursts       Number of heating phases
+#     max_power_w          Peak power (W)
+#     energy_used          kWh (optional)
+#     spin_rpm             User-selected spin from spin entity (optional)
+#     end_reason           How we knew the cycle ended: low_power_detected | door_opened_first | user_cycle_end
+#     idle_min             When we corrected from history: minutes from programme end to when we recorded (optional)
+#     (Progress attributes are cleared so do not show "Started … Done …" for Unemptied.)
+#
+#   When state = Emptied, attributes:
+#     reason               Why we transitioned (e.g. "Door opened - emptying")
+#     run_time_minutes     Programme length (when coming from Unemptied we keep the corrected value)
+#     energy_used          kWh (optional)
+#     end_reason           Preserved from Unemptied when present (optional)
+#     idle_min             Preserved from Unemptied when present (optional)
+#     (Progress attributes are cleared.)
+#
+# HELPERS — Do we need HA helpers (input_number, input_text, etc.)?
+#   No extra helpers are required for display. All cycle summary data (run_time_minutes, end_reason,
+#   idle_min) is on sensor.washer_state as attributes. A React/HA kit dashboard just subscribes to
+#   that entity and reads state + attributes.
+#   For user input: cycle_ended_at_entity in app args can point to an input_datetime or input_text
+#   (Helper) so the user can set the exact cycle end time; the app reads it and clears it after use.
+#   Programme/temperature/spin are already input_select helpers. No need to create helpers for
+#   duration_min, end_reason, or idle_min — they are read-only outputs on the sensor.
+#
+# HA KIT (React) — Single source of truth:
+#   Subscribe to sensor.washer_state (state + attributes). No need to create HA helpers for
+#   run_time_minutes, end_reason, idle_min, programme_label, etc. — they are all attributes on
+#   that entity. When the app updates the sensor (set_state), your React app gets the new
+#   state/attributes via the HA WebSocket or REST API. Creating duplicate helpers that mirror
+#   these would be redundant and would require the app to update two places.
+#   Only create helpers when: (1) you need a user input the app reads (e.g. cycle_ended_at_entity
+#   as input_datetime or input_text), or (2) you need HA history/recorder for a value — Recorder
+#   does not store attribute changes, only state changes, so if you need "last N cycles" from
+#   get_history you would need separate entities the app updates (e.g. sensor.washer_last_duration).
+#   For normal display, sensor.washer_state is enough.
+#
+# INPUT ENTITIES (user confirms/corrects; app may auto-set when unconfirmed):
+#   When a cycle ends (state -> Unemptied), programme/temperature/spin helpers reset to Auto/—
+#   so the next wash does not keep the previous selection. (sensor still shows detected programme for that run.)
+#   Programme:  input_select.washer_confirmed_programme
+#     Options: Auto (unconfirmed), ECO, Bomuld, Strygelet, Uld, Finvask, Ekspres
+#   Temperature: input_select.washer_temperature
+#     Options: —, 20°C, 30°C, 40°C, 60°C, 90°C  (only affects meaning when Programme = Bomuld)
+#   Spin:       input_select.washer_spin_speed
+#     Options: —, 1400 rpm, 1200 rpm, 900 rpm, 700 rpm, No spin
+#
+#   Programme and Temperature are separate (manual: do not combine in one string).
+#   Show Programme dropdown + Temperature dropdown + Spin dropdown.
+#
+# ANNOUNCE:
+#   input_boolean.washer_announce — on = play Sonos message when cycle done / door unlocks
+#
+# DISPLAY TIPS:
+#   - Use state for badge (Running / Off / Unemptied etc.).
+#   - Only show progress bar / "Started … Done …" when state = "Running" and
+#     cycle_start_time (or estimated_end_time) is present; when Off/Unemptied/Emptied
+#     these attributes are cleared so a new cycle is not confused with the previous one.
+#   - Use progress_pct + programme_duration_min + estimated_remaining_min for progress bar and countdown.
+#   - Use programme_label for "Current programme"; show Programme + Temperature selectors for confirmation/correction.
+#
+# FRONTEND MUST (so the UI updates when the backend changes):
+#   1. Only show "Started … Done …" when state = "Running" AND (cycle_start_time or started_at_display) is non-empty.
+#      If empty or missing, show "—" or hide the row (backend clears when Off/Unemptied/Emptied).
+#   2. Started: use started_at_display as-is for "Started HH:MM" (recommended). Or cycle_start_time_local (time part).
+#      Do NOT parse cycle_start_time as UTC unless you use toLocaleTimeString() with correct timezone; backend now also sets cycle_start_time from epoch so UTC is correct.
+#   3. Subscribe to the state entity (sensor.washer_state) and re-render when its state or attributes change.
+#   4. estimated_end_time and started_at_display are "HH:MM" in your timezone — use as-is.
+#
+# =============================================================================
+# HISTORY / RECORDER — Current vs historical sub-attributes
+# =============================================================================
+#
+# Developer Tools (and MCP get_state) show the current state and all sub-attributes
+# (cycle_start_time, last_door_closed_at, programme_label, etc.) live. Sub-attributes
+# are NOT saved in history: Recorder stores state changes for sensor.washer_state,
+# but attribute values at each change are not available in History / get_history.
+# So we can see "Running" an hour ago, but not cycle_start_time or programme_label
+# at that time. Sub-attributes cannot be fetched from history.
+#
+# If you need the same values in history, use helpers: separate entities (e.g.
+# sensor.washer_cycle_start_time, sensor.washer_programme_label) that the washer
+# app updates when it updates sensor.washer_state. Those are not sub-attributes —
+# they are their own entity states, which Recorder does save. Then history/MCP
+# get_history returns past values for those entities.
+#
+# Reliable washer logic on restart: Restore reads the *current* state and *current*
+# attributes from sensor.washer_state (cycle_start_time, last_door_closed_at,
+# last_off_at, etc.). HA persists that current state (e.g. in core.restore_state),
+# so it survives AppDaemon restarts and HA restarts. For normal restarts during a
+# long cycle (20 min–3 h), no change needed — we get back what we last wrote.
+#
+# The only problem is if the state entity's current state were ever *lost* (entity
+# recreated, long outage, or something overwrites it). Then we cannot recover from
+# history because sub-attributes are not in history. For that edge case, optional
+# extra reliability: persist restore-critical values (e.g. cycle_start_time,
+# last_off_at, last_door_closed_at) to helpers or a file and have restore fall back
+# to them when the main entity's attributes are missing. Without that, no code change
+# is required for reliable logic.
+#
+# MCP: get_state gives current state + all sub-attributes. get_history gives past
+# state changes for an entity only; sub-attributes are not in history.
+#
+# The washer app logic only uses current attribute values (restore, clamping, UI).
+# =============================================================================
+
+washer_monitor:
+  module: washer_monitor
+  class: WasherMonitor
+  log: washer_monitor_log
+
+  # Optional: timezone for timestamp attributes and logs. If unset, uses time_zone from appdaemon.yaml.
+  timezone: "Europe/Copenhagen"
+
+  # Core entities
+  power_sensor: "sensor.washer_plug_power"
+  energy_sensor: "sensor.washer_plug_energy"
+  door_sensor: "binary_sensor.washer_door_contact"
+  state_entity: "sensor.washer_state"
+  # Optional: HA input_select to mirror state for Lovelace (survives HA restart). Default: input_select.washer_state
+  # ui_state_entity: "input_select.washer_state"
+  # Door contact: standard is open = "on", closed = "off" (HA device_class: door convention).
+  # Only set door_sensor_inverted: true if your sensor reports "off" when door opens (raw Zigbee contact sensor).
+  # door_sensor_inverted: false
+  # Optional: lock entity (e.g. lock.washer_door). When set, announcement is sent when
+  # the door *unlocks* (state becomes "unlocked") instead of when we enter Unemptied.
+  # Leave unset to announce as soon as the cycle is detected done (power drop).
+  # door_lock_entity: lock.washer_door
+
+  # ============================================================================
+  # POWER THRESHOLDS
+  # ============================================================================
+  
+  start_w: 18             # Power level to detect cycle start
+  stop_w: 3.0             # Power level to detect cycle end (below inter-op pauses)
+  significant_w: 30       # Significant activity threshold (tumbling)
+  run_for: 60             # Seconds to confirm Running state
+  
+  # ============================================================================
+  # ENERGY-BASED FINISH DETECTION (Primary method)
+  # ============================================================================
+  
+  # Monitor energy consumption - when energy stops increasing, cycle is done
+  # This is more reliable than power detection because energy doesn't have brief spikes
+  use_energy_detection: true  # Enable energy-based finish detection
+  #
+  # DETECTION ALGORITHM (rolling-window implied-watts + adaptive threshold):
+  #   The code maintains a 20-min ring buffer of (time, kWh) readings.
+  #   Each check computes avg_watts over the most-recent ≥90s span so the
+  #   calculation always covers at least one full ~60s sensor update cycle.
+  #   This eliminates spurious 0W readings that previously caused constant
+  #   counter resets when checking faster than the sensor updates.
+  #
+  # PROGRAMME CLASSIFICATION (via peak-power signature):
+  #   Warm programmes (Cotton 60/40°C, Eco, Synthetics, Jeans):
+  #     - Miele heating element fires → power spikes to ~1800-2200W
+  #     - If any reading >1000W is observed: classified as WARM
+  #     - These programmes have mid-cycle soaks up to ~13 min → need full 15 min window
+  #   Cold programmes (Wool, Quick at cold):
+  #     - No heating element → max power ~40-200W (motor + pump only)
+  #     - If 10+ min of Running state with no >1000W reading: classified as COLD
+  #     - No extended soaks possible without heating → 5 min window is sufficient
+  #     - This makes Wool/cold detection ~10 min faster than warm programmes
+  #
+  # Mid-cycle quiet periods observed on Miele WEA 035 WCS:
+  #   Warm cycles (Cotton, Eco): max 10 min soak (P95=7 min, avg=2.7 min)
+  #   Wool/cold: up to 13 min "soak" (really just gentle agitation ≈ 0W motor)
+  # energy_stable_minutes applies to WARM programmes only; cold uses 5 min fixed.
+  # At 15 min (warm) / 5 min (cold): no false positives for any programme.
+  #
+  # Power gate: when implied watts have been low for 15 min, we require current power
+  # below post_cycle_idle_watts (80W) so post-cycle slow spin (~40W) still allows finish.
+  energy_stable_minutes: 15   # Warm programmes only (> 13 min observed soak max)
+                               # Cold/Wool programmes use 5 min (hardcoded - no soaks)
+  energy_check_interval_s: 30 # Check every 30s; rolling window handles sensor aliasing
+  energy_stable_watts: 30.0   # True idle (e.g. 3.8-4.2W)
+  # Post-cycle slow spin: washer may keep motor at 30-80W after cycle; treat as "idle" so we finish without waiting for 0W.
+  energy_active_watts: 100.0    # Above this = main cycle (heating/spin); resets the 15 min timer
+  post_cycle_idle_watts: 80.0   # Below this = idle or slow spin; we can declare cycle done (power gate uses this too)
+  # When run is in last hour of expected duration (or past 85%), use this many minutes of stable energy to declare finish.
+  # So we transition to Unemptied BEFORE the door opens (e.g. finish ~10:52, door opens 11:05).
+  finish_stable_minutes_near_end: 5
+  # Optional: detect post-cycle slow-spin by power pattern (regular ripple ~10-50W, distinct from flat idle).
+  # When detected we only require post_cycle_pattern_minutes (e.g. 5) instead of 15 min to finish.
+  # post_cycle_pattern_window_minutes: 10   # Fetch this many minutes of power history
+  # post_cycle_pattern_minutes: 5
+  # post_cycle_pattern_mean_low: 10.0
+  # post_cycle_pattern_mean_high: 70.0
+  # post_cycle_pattern_min_std: 8.0
+
+  # ============================================================================
+  # CYCLE VALIDATION - Prevents false "Unemptied" states
+  # ============================================================================
+  
+  # Express is shortest real cycle at ~30 min
+  min_cycle_minutes: 25   # Slightly below Express to allow for variation
+  # Cold washes (20°C) use as little as 0.14 kWh over 70 min; keep floor at 0.1 kWh
+  # to accept any real program while rejecting accidental spin-only (<0.05 kWh) starts.
+  min_energy_kwh: 0.1
+  completion_guard_fraction: 0.65       # Min fraction of nominal duration for valid completion
+  completion_guard_fraction_user_confirmed: 0.60  # Looser when user confirmed programme
+
+  # AddLoad: 15 min rule - user has 15 min with door open to add item when Paused
+  pause_timeout_minutes: 15
+  # AddLoad in app: door open while Running only if within N min AND no heating burst yet (manual p.22).
+  # After N min: door open while Running => wash finished before door (typical EU front-loader; not top-load). No power gate.
+  # App then goes Unemptied -> Emptied -> Off so sensor.washer_state ends Off without requiring door-close.
+  addload_window_minutes: 10
+  pause_window_minutes: 3   # Used for start_time clamping, timeouts; AddLoad also requires observed_heating == false
+
+  # Anti-crease (post-end tail): very low power (idle + small tumbling). Mid-cycle rinse can look similar
+  # (mean ~50W, peaks 200W+), so we require low mean and optional max peak.
+  anti_crease_window_minutes: 8
+  anti_crease_tail_max_mean_w: 40.0    # Real anti-crease is low; 55 matched false rinse phase
+  anti_crease_tail_max_peak_w: 150     # Gentle tumbling only; mid-cycle rinse spikes 200W+
+  anti_crease_tail_min_std_w: 6.0
+  anti_crease_max_duty_above_active: 0.15
+  anti_crease_near_end_minutes: 25
+  anti_crease_min_runtime_minutes: 60   # When programme unknown
+  finish_debug_window_minutes: 25       # When to emit finish/anti-crease debug logs
+
+  # Stricter finish guards (stop false announcements when expected duration is wrong)
+  finish_guard_fraction: 0.92          # Require 92% of expected (was 85%) before declaring done
+  finish_min_run_minutes_warm: 100      # Never declare warm cycle done before 100 min
+  finish_min_run_minutes_cold: 50       # Never declare cold/unknown done before 50 min
+
+  # Power-pattern gate: only declare cycle done when recent power looks like real end (anti-crease or off), not mid-cycle rinse
+  finish_power_gate_max_mean_w: 45      # Anti-crease / tail: max mean W in last 8 min
+  finish_power_gate_max_peak_w: 120     # Anti-crease / tail: max peak W (mid-cycle rinse spikes 150–250W)
+  finish_power_gate_off_max_mean_w: 12   # Machine off: max mean W
+  finish_power_gate_off_max_peak_w: 25  # Machine off: max peak W
+
+  # Two-stage finish: announce when the next tail pulse fails to arrive (data: 55s = 0 early triggers).
+  tail_pulse_threshold_watts: 10.0   # Outside FinishingTail / generic pulse detection
+  # FinishingTail only: power above this resets the standby timer (default 80). Miele anti-crease nudges are 10–55W;
+  # using 10W here prevented ever reaching tail_pulse_timeout without loosening global guards.
+  finishing_tail_pulse_reset_watts: 80.0
+  tail_pulse_timeout_seconds: 55.0   # No pulse above finishing_tail_pulse_reset_watts for this long + power ≤ finish_standby_max = announce
+  finish_standby_max_watts: 8.0      # Current power must be ≤ this to announce
+  # Extra reliability gate: require a short quiet window before announcing done.
+  # This blocks false finish during late spin/tail where pulses can be < finishing_tail_pulse_reset_watts.
+  tail_idle_confirm_seconds: 120.0
+  tail_idle_peak_max_watts: 18.0
+  # Tail cadence lock: when anti-crease pulses are regular, lock to that rhythm and announce
+  # when expected pulses stop arriving (faster + more reliable than fixed timeout alone).
+  tail_pattern_pulse_threshold_watts: 20.0
+  tail_pattern_lock_window_minutes: 8.0
+  tail_pattern_lock_min_pulses: 6
+  tail_pattern_min_gap_seconds: 8.0
+  tail_pattern_max_gap_seconds: 120.0
+  tail_pattern_max_jitter_fraction: 0.55
+  tail_pattern_break_missed_pulses: 2.2
+  tail_pattern_break_confirm_seconds: 18.0
+  standby_max_watts: 5.0             # Legacy / standby backstop
+  standby_no_pulse_above_watts: 10.0
+  standby_quiet_seconds: 25.0
+
+  # Safety watchdogs - prevent stuck states
+  max_running_hours: 5      # No cycle runs >5 hours
+  unemptied_timeout_hours: 12   # Wet laundry - shorter timeout (12h)
+
+  # ============================================================================
+  # TIMING THRESHOLDS
+  # ============================================================================
+  
+  no_recent_high_s: 300   # 5 min without significant power before finish (reduced from 10 min)
+  cooling_period: 300     # Prevent state oscillation
+
+  # ============================================================================
+  # CONSECUTIVE READING THRESHOLDS
+  # ============================================================================
+  
+  # Low power threshold: requires 10 readings (5 min at 30s polling) of mostly low power
+  # Uses 80% tolerance - allows brief spikes during finish detection
+  low_power_threshold: 10  # Reduced from 15 - 5 min at 30s polling (was 7.5 min)
+  high_power_threshold: 3
+  # After door close from Off/Emptied: need 2 consecutive readings >= start_w if within window and last_door_closed_trusted; else 3. Passive arm expiry only changes threshold (no counter reset).
+  door_close_fast_start_window_s: 600
+  poll_interval_s: 30
+  # history_check_interval_s: 300  # Every 5 min, fetch power history to catch missed heating (Shelly may not push every reading)
+  pattern_window: 12
+
+  # ============================================================================
+  # NOTIFICATION
+  # ============================================================================
+  
+  announce_message: "Washer is ready to be emptied"
+  announce_entity: input_boolean.washer_announce   # Toggle off to silence Sonos announcements
+  
+  # ============================================================================
+  # PROGRAMME FEEDBACK & LEARNING
+  # ============================================================================
+  #
+  # Programme input_select (confirm_entity): YOUR choice only — the app does not write predictions there.
+  #   Leave "Auto (unconfirmed)" to use energy-based classification for ETA/guards; pick a programme to lock
+  #   duration and guards to that profile (programme_confirmed_by_user on state_entity becomes true).
+  # Predicted programme (while on Auto): attributes on state_entity — predicted_programme,
+  #   predicted_programme_label, predicted_temperature — pure signature estimate; cleared when you confirm
+  #   a programme. Lovelace: e.g. {{ state_attr('sensor.washer_state','predicted_programme_label') }}.
+  # The system stores every confirmed cycle in feedback_file and uses the
+  # accumulated data to refine the ETA estimates (programme + temperature = precise key, e.g. Bomuld 40°C):
+  #   - 1 confirmed cycle: 30% learned duration, 70% manual (page 62).
+  #   - 2 confirmed cycles: 50% learned, 50% manual.
+  #   - 3+ cycles: blend ramps to 90% learned so ETA matches your machine.
+  # ETA during Running uses your current Programme + Temperature selection when set; spin is stored but does not change duration yet.
+  #
+  confirm_entity: input_select.washer_confirmed_programme
+  temperature_entity: input_select.washer_temperature
+  # Manual (Programoversigt pp.26-28): Programme and Temperature are separate controls.
+  # Do NOT combine them in one string. In HA set the helpers as follows:
+  #
+  #   Programme, temperature and spin options are driven from washer_programmes.yaml (single source of truth).
+  #   When the user selects a programme, the app updates temperature and spin dropdowns to that programme's
+  #   allowed values and defaults; "Cold" is included where the programme supports it. No need to configure
+  #   options in HA — the app sets them at startup and on programme change.
+  #
+  #   Programme (confirm_entity): Auto (unconfirmed) + programme names from YAML (stable order).
+  #   Temperature (temperature_entity): — (no choice) + programme-specific list (Cold, 20°C … 90°C as allowed).
+  #   Spin (spin_entity): — + programme-specific list (1400 rpm … No spin). Machine is cold-water only.
+  #
+  # feedback_file: created on first completed cycle (Unemptied or door opened after cycle).
+  feedback_file: /data/appdaemon/apps/appliances/washer_feedback.json
+  # One-time migration: add completion_class / valid_for_learning to existing feedback (idempotent).
+  # run_feedback_migration: true   # Set to true to run migration
+  # feedback_migration_dry_run: true   # Default true: log counts only; set false to write file
+
+  # Spin speed: user selects at cycle end (e.g. "900 rpm"). Stored in feedback + sensor.washer_state
+  # attribute spin_rpm when Unemptied. Frontend: input_select.washer_spin_speed, options below.
+  spin_entity: input_select.washer_spin_speed
+  # Recommended for learning when finish detection is late or energy is option-heavy: create these helpers in HA,
+  # then uncomment. cycle_ended_at supplies exact stop time; option_* is stored in feedback selected_options.
+  # Optional: exact cycle end time for learning. When the app transitions to Unemptied, if this
+  # entity is set, we use it as the true cycle end and record that duration in feedback (so we learn
+  # the real programme length even when detection was late). Then we clear the entity.
+  # Create a HA helper (e.g. input_datetime.washer_cycle_ended_at or input_text with "HH:MM") so the
+  # real end time can be entered from the HA UI. Use input_datetime (date+time) or input_text "HH:MM"
+  # (local time on the cycle start date). Set it to the time the machine actually stopped (e.g. 13:33)
+  # before or when you see Unemptied.
+  # cycle_ended_at_entity: input_text.washer_cycle_ended_time
+  #
+  # Optional: wash option helpers — stored with each cycle in feedback (selected_options) for audit / future ETA.
+  # option_water_plus_entity: input_boolean.washer_option_water_plus
+  # option_soak_entity: input_boolean.washer_option_soak
+  # option_prewash_entity: input_boolean.washer_option_prewash
+  # option_short_entity: input_boolean.washer_option_short
+  #
+  # Programme profiles (machine specs): loaded from washer_programmes.yaml in the same directory.
+  # Override path if needed:
+  # programmes_file: /data/appdaemon/apps/appliances/washer_programmes.yaml
+
+  # ============================================================================
+  # ANALYSIS
+  # ============================================================================
+  
+  auto_analyze_cycles: false  # Set to true to automatically analyze cycles after completion

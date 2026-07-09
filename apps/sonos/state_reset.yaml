@@ -1,0 +1,55 @@
+# /conf/apps/sonos/state_reset.yaml
+
+SonosStateReset:
+  module: state_reset
+  class: SonosStateReset
+  log: sonos_log
+
+  # How long "paused"/"idle" must persist before auto-reset (seconds). 300 = 5 min; use 600 for 10 min.
+  inactivity_seconds: 300
+
+  # Follow-me flag (will be turned off on any reset)
+  follow_me_flag: "input_boolean.follow_me"
+
+  # All Sonos speakers to consider for manual reset
+  all_speakers:
+    - media_player.bathroom
+    - media_player.bedroom
+    - media_player.dining_room
+    - media_player.kitchen
+    - media_player.living_room
+    - media_player.guest_bathroom
+    - media_player.kristines_room
+    - media_player.claudias_room
+    - media_player.rooftop
+
+  # Target volumes per speaker
+  speaker_volumes:
+    media_player.bathroom: 0.24
+    media_player.bedroom: 0.18
+    media_player.dining_room: 0.18
+    media_player.kitchen: 0.18
+    media_player.living_room: 0.20   # Arc Ultra: Era-100 default (0.18) + 2 — it is a far bigger unit (user 2026-07-08)
+    media_player.guest_bathroom: 0.24
+    media_player.kristines_room: 0.18
+    media_player.claudias_room: 0.18
+    media_player.rooftop: 0.18
+
+  # Fallback if a speaker isn't in the above map
+  default_volume: 0.18
+
+  # Reset performance controls (optional)
+  # Minimum wait after last unjoin before the first solo poll (poll loop is authoritative).
+  # You can often lower this (e.g. 2–3) for a snappier reset; 8 is conservative.
+  ungroup_settle_seconds: 8
+  # How to unjoin during reset (see HA Sonos async_unjoin_player: coalesces unjoins in ~0.1s, unjoin_multi removes coordinators last):
+  #   all_members — request unjoin on every group member (recommended; matches HA batching when calls arrive together)
+  #   members_except_coordinator — only non-coordinator members
+  #   coordinator_only — coordinator entity only (often insufficient)
+  # Legacy key skip_coordinator_unjoin still maps if set.
+  unjoin_strategy: all_members
+
+  # Solo verification after unjoin (poll group_members until all targets are solo or timeout)
+  # Defaults in code match these if omitted: 1.0s interval, 15 attempts (~15s max poll after first check)
+  reset_solo_poll_seconds: 1.0
+  reset_solo_max_poll_attempts: 15

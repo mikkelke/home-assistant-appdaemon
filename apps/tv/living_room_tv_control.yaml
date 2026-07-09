@@ -1,0 +1,97 @@
+living_room_tv_control:
+  module: living_room_tv_control
+  class: LivingRoomTvControl
+  log: living_room_tv_control_log
+  tv_entity: media_player.living_room_tv
+  lift_select_entity: select.living_room_tv_lift_position
+  zwave_device_id: "a4e4541889706aaab7948bae9c0f48b3"
+  button_3_property_key: "003" # Interpreted from "button 3 as seen on bathroom control"
+  button_4_property_key: "004" # Interpreted from "button 4 as seen on bathroom control"
+
+  # TV off to wall delay
+  off_to_wall_delay_seconds: 600 # delay moving to Wall after TV turns off (if button was pressed recently)
+  min_wall_move_delay_seconds: 10 # minimum delay before moving to Wall (prevents false off triggers during power-on)
+  smart_wall_move_delay_seconds: 5 # smart delay when both Apple TV and Hisense are confirmed off (faster response)
+
+  # Power-aware wall retract (whole stack on this relay: TV + Apple TV + Sonos).
+  # True idle is ~27W; full TV-on viewing is much higher. Sonos playing alone (no picture) still draws more than
+  # idle — relay sits in a middle band — so power is a sanity check, not the only signal; Hisense/Apple TV +
+  # app logic (e.g. stop living room speaker on TV off) matter for consistent UX.
+  # Threshold ~52W sits above idle/Sonos-only bumps and below typical TV-on draw; 45W hit edge cases (e.g. 46W).
+  # If power is already <= threshold, wall scheduling runs immediately.
+  # If power is high, poll until it stays <= threshold for power_off_confirm_seconds, within power_max_wait_seconds.
+  # ignore_apple_tv_when_relay_standby: while relay <= threshold, Apple TV paused/idle/on does NOT cancel the
+  # scheduled wall move. Hisense 'on' is also ignored at standby draw (integration often lags power-off).
+  # power_standby_wall_enabled: when relay stays <= threshold but universal TV still reports on/paused,
+  # start the normal session-end wall path (fixes Hisense/HA lag after physical TV off).
+  power_standby_wall_enabled: true
+  #
+  # Session-end grace: after universal TV is debounced 'off' and Hisense is not 'on', wait this many seconds;
+  # if still off, schedule Wall (Apple TV state ignored). Skips fragile power polling for the common case.
+  # At fire time: if relay > power_definitely_on_w, skip wall (stack still drawing like real viewing). Set to 0
+  # to disable and use only the power-verify path below.
+  session_end_grace_seconds: 15
+  power_definitely_on_w: 115
+  power_aware_wall_move_enabled: true
+  tv_power_entity: sensor.living_room_tv_relay_power
+  power_off_threshold_w: 52
+  power_off_confirm_seconds: 2
+  power_recheck_interval_seconds: 2
+  power_max_wait_seconds: 45
+  ignore_apple_tv_when_relay_standby: true
+
+  # After a real off->on, poll until relay > power_off_threshold_w or Apple/Hisense active (cap only; usually instant).
+  power_on_confirm_max_wait_seconds: 12
+  power_on_confirm_recheck_seconds: 1.0 # poll interval while waiting (first check ~0.1s after off->on)
+
+  # Apple TV remote reset (workaround for stuck Apple TV integration in older HA versions)
+  # This toggles the remote entity off/on to refresh Apple TV state
+  # Set to false to disable and test if still needed with current HA/Apple TV versions
+  apple_tv_reset_enabled: true
+  apple_tv_reset_delay_seconds: 30  # seconds to wait after TV turns on before resetting
+
+  # Optional Wake-on-LAN helper button to nudge TV power-on
+  wol_button_entity: button.wake_on_lan_c4_08_26_6d_25_0e
+
+  # Z-Wave settings.
+  # The following values are defaults in the Python code (inspired by sonos_bathroom_control.py)
+  # if not specified here, but are listed explicitly for clarity.
+  # This app specifically listens for "KeyHeldDown" as per your request.
+  zwave_command_class: 91
+  zwave_endpoint: 0
+  zwave_event_value_held: "KeyHeldDown"
+  # Optional: Override Z-Wave defaults if needed for your specific device
+  # zwave_command_class: 91 # Default is 91 (Central Scene)
+  # zwave_endpoint: 0       # Default is 0
+  # zwave_event_value_held: "KeyHeldDown" # Default for held event 
+
+  # Announcement settings for lift activation confirmations
+  announce_on_lift_move: true
+  announce_speakers_living:
+    - "media_player.sonos_tts_living_room"
+
+  # Zone isolation settings
+  family_zone_speakers:
+    - media_player.living_room
+    - media_player.kitchen
+    - media_player.dining_room
+
+  # Rooftop special handling
+  rooftop_entity: media_player.rooftop
+  rooftop_charging_sensor: binary_sensor.rooftop_charging
+  
+  # Entity configuration (for power-on checks and media control)
+  hisense_tv_entity: media_player.living_room_hisense_tv_television
+  apple_tv_entity: media_player.living_room_apple_tv
+  living_room_speaker_entity: media_player.living_room
+  
+  # Operation timing configuration
+  tv_operation_timeout_s: 45  # Seconds before resetting stuck operation flag (default 45s for WoL + multiple TV turn-ons)
+  min_operation_time_s: 3.0  # Minimum seconds to keep operation flag True (prevents race conditions)
+  
+  # Lift verification
+  lift_verify_enabled: true  # Verify lift actually moved to requested position
+  lift_verify_timeout_s: 10.0  # Seconds to wait for lift position change before timing out
+  
+  # TV state change debouncing
+  tv_off_debounce_seconds: 2.0  # Seconds to debounce "off" state before acting (prevents false triggers)

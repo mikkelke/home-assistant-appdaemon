@@ -1,0 +1,39 @@
+# Smart Cooling v2 -- closed-loop pre-cool for the bedroom AC.
+# Knobs you ever touch: input_boolean.smart_cooling (Arm) + input_datetime.smart_cooling_bedtime.
+# Optional default: input_number.smart_cooling_night_ceiling (23C). Depth is calculated, not set.
+# dry_run: true -> it runs, learns and publishes the plan, but every AC command is a no-op.
+
+SmartCooling:
+  module: smart_cooling
+  class: SmartCooling
+
+  # entities (these match the code defaults; listed for clarity)
+  climate_entity: climate.air_conditioner_thermostat
+  floor_sensor: sensor.bedroom_floor_thermometer_temperature      # mass battery + control + sleeping-zone floor
+  mid_sensor: sensor.bedroom_temperature                          # mid wall by kitchen door = top of sleeping zone
+  ceiling_sensor: sensor.bedroom_presence_temperature             # AC blows cold up here -> delivery check
+  ac_sensor: sensor.air_conditioner_indoor_temperature            # at the unit -> is cold flowing
+  bathroom_temp_sensor: sensor.bathroom_temperature               # condenser dump / back-leak guard
+  kitchen_sensor: sensor.kitchen_temperature                      # neighbour wall (headwind)
+  outdoor_temp_sensor: sensor.gw2000a_outdoor_temperature         # minor
+  vent_window_sensor: binary_sensor.bathroom_window_contact
+  price_entity: sensor.energi_data_service
+  enable_entity: input_boolean.smart_cooling
+  bedtime_entity: input_datetime.smart_cooling_bedtime
+  night_ceiling_entity: input_number.smart_cooling_night_ceiling
+
+  default_bedtime: "23:00"
+  default_night_ceiling: 23.0
+  min_temp: 16.0          # hardware floor; never drive the room below
+  sleep_hours: 8.0
+
+  # gentle actuation (low fan = higher COP, quieter, less bathroom back-leak)
+  cool_setpoint: 17.0
+  cool_fan_mode: medium
+  check_interval_min: 15
+  min_cycle_min: 10
+  status_entity: sensor.smart_cooling_status
+  notify_target: user
+
+  # SAFE ROLLOUT: runs + learns + publishes the plan, but NEVER touches the AC.
+  dry_run: true

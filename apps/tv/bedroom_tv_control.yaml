@@ -1,0 +1,54 @@
+bedroom_tv_control:
+  module: bedroom_tv_control
+  class: BedroomTVControl
+  log: bedroom_tv_control_log
+  log_level: INFO
+  
+  # Z-Wave configuration
+  zwave_device_id: "fde0ce72582c723f4d8b729b522fc2fa"  # Bedroom's Z-Wave device ID
+  zwave_command_class: 91  # Central Scene
+  zwave_endpoint: 0
+  button_1_property_key: "001"  # Volume down
+  button_2_property_key: "002"  # Volume up
+  button_4_property_key: "004"  # Play/Pause and TV toggle
+  
+  # Volume control
+  volume_step: 0.01  # Volume adjustment step
+  default_volume: 0.5  # Default volume if current volume cannot be determined
+  volume_entity: media_player.bedroom_sony_tv  # Entity ID for volume control (defaults to bedroom_sony_tv)
+  
+  # Startup configuration
+  startup_grace_seconds: 10  # Seconds to wait after startup before processing state changes
+  
+  # Apple TV state correction
+  apple_tv_reset_enabled: true   # Set to false to disable and test if still needed
+  apple_tv_reset_delay_seconds: 30
+  
+  # TV lift debounce (fast ON, verified OFF using Sony + Apple TV)
+  tv_off_debounce_seconds: 30   # min safe: worst observed on/off flicker while watching was 25.3s (most <=15s); 30s clears it with margin, real power-off raises after 30s
+  tv_on_debounce_seconds: 0.1   # near-instant lower when TV turns on (an early/extra down is harmless; the raise side is the protected one)
+  
+  # Lift command timing (to prevent conflicts and improve stability)
+  min_lift_command_interval_s: 5.0  # Minimum seconds between lift commands
+  lift_command_timeout_s: 4.0       # How long to wait before clearing lift flag (script takes ~2s)
+  lift_verify_enabled: true          # Use position entity state changes to verify commands (recommended)
+  
+  # Periodic verification (ensures lift stays in correct position)
+  periodic_verification_enabled: true  # Periodically verify lift is down when TV is active
+  periodic_verification_interval_s: 300.0  # Check every 5 minutes (300 seconds) when TV is active
+  
+  # Persistent lift position tracking
+  # Create this as an input_select helper in HA with options: Up, Down, Temporary, Unknown
+  # Settings > Devices & Services > Helpers > Create Helper > Dropdown
+  lift_position_entity: input_select.bedroom_tv_lift_position  # Default: input_select.bedroom_tv_lift_position
+  
+  global_dependencies:
+    - media_player.bedroom_sony_tv
+    - media_player.bedroom_apple_tv
+    - media_player.bedroom_tv
+    - remote.bedroom_tv
+    - remote.bedroom_apple_tv
+    - script.bedroom_tv_lift_position_down
+    - script.bedroom_tv_lift_position_up 
+    - script.bedroom_tv_lift_stop
+    - select.bedroom_tv_lift_position_configuration

@@ -1,0 +1,168 @@
+# Darkness calculator (streamlined 2026-06) — see module docstring in darkness_calculator.py.
+#
+# Contract:
+#   - Dark/bright is environment only (sun, outdoor lux, rain, indoor daylight),
+#     computed rolling for every zone 24/7. Occupancy NEVER affects dark/bright,
+#     it only sets the Occupied|Empty part of sensor.room_state_* labels.
+#   - Light apps: occupied AND dark -> on; not occupied -> off; occupied AND bright -> off.
+#   - Published state is confirmed only; pending_* attributes are informational.
+#
+# Decision per zone: 4 rules + asymmetric holds (see .py docstring).
+# Calibration 2026-06-10 from HA history (indoor daylight vs outdoor lux, lamps off):
+#   family_room k~0.055 (stable), office k 0.013 morning -> 0.08 evening sun (facade!),
+#   bedroom k~0.034 blind open, hallway/kristines marginal daylight rooms.
+#   Lamp lux at sensors, measured from on/off steps: office ~200, family ~70-125, hallway ~700.
+#
+# Room orientation (apps/apartment_wind_exposure.md + "Window and outside door placement.png"):
+#   claudias_room (was office): daylight via rooftop door 2 (WSW ~245deg) -> direct sun only afternoon/evening,
+#     which is why its k swings 6x through the day. The indoor_min_bright check is the
+#     sun-position term, MEASURED rather than computed from azimuth — it also captures
+#     shading from surrounding buildings (dense urban block).
+#   bedroom/bathroom: ENE ~70deg (morning sun);  kristines: NNW ~335deg (never direct sun);
+#   family_room: SSE + ENE windows averaged -> stable whole-day signal.
+
+darkness_calculator:
+  module: darkness_calculator
+  class: DarknessCalculator
+  log: darkness_calculator_log
+
+  # Global signals
+  outdoor_sensor: sensor.gw2000a_solar_lux
+  rain_sensor: binary_sensor.gw2000a_rain_state_piezo
+  sun_entity: sun.sun
+  dusk_elevation: 3.0            # below this sun elevation a zone is always DARK
+
+  # Smoothing + anti-flap holds
+  outdoor_smoothing_seconds: 600       # rolling median window for outdoor lux
+  hold_bright_to_dark_seconds: 180     # fast: lamps may come on promptly as light degrades
+  hold_dark_to_bright_seconds: 1200    # slow: lamps turn off only when sustainably sun-bright
+  rain_hold_multiplier: 2.0            # stretch dark->bright while raining / shortly after
+  rain_grace_seconds: 1800
+  indoor_dark_fraction: 0.6            # daylight < indoor_min_bright*0.6 under a bright sky -> DARK (blinds/facade)
+
+  # Gloomy sky — GLOBAL mechanism (one sky for the whole apartment).
+  # gloomy = raining/recently rained OR heavy overcast (sun >= 20 deg yet outdoor
+  # < 12k lx, impossible under a clear sky). While gloomy every zone's outdoor_dark
+  # is multiplied (capped under its outdoor_bright): the apartment is bright by sun
+  # design, so grey days feel dark well above the dry golden-hour thresholds.
+  gloomy_dark_multiplier: 2.2
+  gloomy_overcast_min_elevation: 20
+  gloomy_overcast_max_lux: 12000
+  # Indoor bright-bar scaling is global too (per-zone override possible): brighter
+  # outside -> less indoor daylight required to count as bright; floor 25%.
+  indoor_min_scales_with_outdoor: true
+  indoor_min_floor_fraction: 0.25
+
+  sensor_debounce_seconds: 2.0
+  periodic_recompute_seconds: 90       # safety net: re-pull signals + recompute
+
+  # Zones.
+  #   outdoor_dark / outdoor_bright : smoothed outdoor lux envelope (hysteresis band between)
+  #   indoor_min_bright             : indoor daylight (lamp lux subtracted) required to
+  #                                   confirm BRIGHT — catches closed blinds + facade angles
+  #   lights + light_on_lux_offset  : lamp contribution at the zone's lux sensors
+  zones:
+    family_room:
+      sensors:
+        - sensor.kitchen_presence_illuminance
+        - sensor.living_room_presence_illuminance
+        - sensor.dining_room_presence_illuminance
+      mirrors: [kitchen, living_room, dining_room]
+      outdoor_dark: 2500   # lowered from 4000: ride the golden-hour evening (low western sun lights the room while rooftop solar dips); winter still turns on below 2500
+      outdoor_bright: 8000
+      indoor_min_bright: 280
+      lights:
+        - light.kitchen_counter_lights
+        - light.island_lights
+        - light.dining_room_lights
+        - light.living_room_corner_light
+        - light.living_room_window_light
+        - light.living_room_wall_lights
+      light_on_lux_offset: 120
+
+    bedroom_bathroom:
+      sensors: sensor.bedroom_presence_illuminance
+      mirrors: [bedroom, bathroom]
+      outdoor_dark: 4500
+      outdoor_bright: 9000
+      indoor_min_bright: 250     # blind closed -> daylight stays below this -> stays DARK
+      covers: [cover.bedroom_blind]
+      lights:
+        - light.bedroom_ceiling_lights
+        - light.bedroom_bed_lights
+        - light.bathroom_lights
+      light_on_lux_offset: 40    # measured at sensor (night 2026-07-05, adaptive-dimmed): ceiling 9->24 lx,
+                                 # bed ~2, bathroom <5; ~40 at full daytime brightness. Kills the lamp
+                                 # feedback loop (2026-06-24 16:10 on/off strobe) — over-subtracting is
+                                 # safe here: lamps can never prove BRIGHT, they can only fail to.
+
+    kristines_room:
+      # CLASSIFICATION ONLY — Kristine prefers manual light control (no *_lights app
+      # for this room; never add one). The zone only feeds the dashboard room state
+      # and family-room adjacency logic.
+      sensors: sensor.kristines_room_presence_illuminance
+      outdoor_dark: 5000
+      outdoor_bright: 15000
+      indoor_min_bright: 2000    # marginal daylight room (sensor reads ~1.8k at 49k outdoor)
+
+    guest_bathroom:
+      sensors: sensor.guest_bathroom_presence_illuminance
+      always_dark: true          # windowless — was dark_threshold: 9999
+
+    claudias_room:
+      sensors: sensor.claudias_room_presence_illuminance
+      # Claudia's bedroom (was the office). WSW facade = the last room to lose its
+      # light in the evening: the dry threshold rides the golden hour (same 2500 as
+      # family_room's western fix). Grey days are handled by the global gloomy
+      # multiplier — no per-room weather hacks.
+      outdoor_dark: 2500         # dry evening: lights ~21:00; office era was 8000
+      outdoor_bright: 9000
+      indoor_min_bright: 250     # bedroom-grade: little indoor daylight needed to count bright
+      lights:
+        - light.claudias_room_ceiling_lights
+        - light.claudias_room_floor_light
+      light_on_lux_offset: 200   # measured: 652 -> 425 lx when ceiling light turned off
+
+    hallway:
+      sensors: sensor.hallway_presence_illuminance
+      outdoor_dark: 5000
+      outdoor_bright: 15000
+      indoor_min_bright: 2000    # marginal daylight room
+      lights: [light.hallway_lights]
+      light_on_lux_offset: 700   # measured ~750 lx at the sensor with hallway lights on
+
+  # Occupied|Empty in room_state_* labels only (dark/bright ignores these).
+  presence_sensors:
+    bedroom_bathroom:
+      - binary_sensor.bedroom_pir_presence
+      - binary_sensor.bathroom_pir_presence
+    bathroom: binary_sensor.bathroom_pir_presence
+    bedroom: binary_sensor.bedroom_pir_presence
+    family_room:
+      - binary_sensor.kitchen_pir_presence
+      - binary_sensor.living_room_pir_presence
+      - binary_sensor.dining_room_pir_presence
+      - binary_sensor.hallway_pir_presence   # hallway is an area of the same big room
+    guest_bathroom: binary_sensor.guest_bathroom_pir_presence
+    kitchen: binary_sensor.kitchen_pir_presence
+    living_room: binary_sensor.living_room_pir_presence
+    dining_room: binary_sensor.dining_room_pir_presence
+    claudias_room: binary_sensor.claudias_room_pir_presence
+    hallway: binary_sensor.hallway_pir_presence
+    kristines_room: binary_sensor.kristines_room_pir_presence   # template: room mmWave OR desk sensor OR motion large/small
+
+  # input_text helpers (e.g. HA Kit): same label as sensor.room_state_<name>.
+  room_state_helpers:
+    kitchen: input_text.kitchen_state
+    living_room: input_text.living_room_state
+    dining_room: input_text.dining_room_state
+    bathroom: input_text.bathroom_state
+    bedroom: input_text.bedroom_state
+    guest_bathroom: input_text.guest_bathroom_state
+    claudias_room: input_text.claudias_room_state
+    hallway: input_text.hallway_state
+    kristines_room: input_text.kristines_room_state
+
+  publish_binary_prefix: "binary_sensor.dark_"
+  publish_sensor_prefix: "sensor.darkness_"
+  publish_room_state_prefix: "sensor.room_state_"

@@ -1,0 +1,62 @@
+WakeupBedroom:
+  module: wakeup_bedroom
+  class: WakeupRoutine
+  log: wakeup_bedroom_log
+  log_level: INFO
+
+  alarm_time_entity: input_datetime.wakeup_bedroom
+  alarm_enabled_entity: input_boolean.wakeup_bedroom
+
+  presence_persons:
+    - person.mikkel
+
+  media_master: media_player.bedroom
+  media_join:
+    - media_player.bathroom
+  media_content_id: "https://drliveradio2.akamaized.net/hls/live/2118698/p3/playlist-320000.m3u8"
+  media_content_type: "music"
+  media_fallback: "http://live-icy.gss.dr.dk:8000/A/A05H.mp3"
+
+  volume_entities:
+    - media_player.bedroom
+    - media_player.bathroom
+  volume_start: 0.06
+  volume_target: 0.18
+  volume_step: 0.03
+  volume_interval_sec: 60
+
+  covers:
+    bedroom: cover.bedroom_blind
+    bathroom: cover.bathroom_blind
+  closed_is_100: true
+  bedroom_cover_target: 38
+  bathroom_cover_target: 40
+  # Dynamic wait after blind reaches target before deciding wake bed-light ramp.
+  # Uses outdoor lux clue so dark mornings stay responsive while bright mornings avoid flash-on.
+  outdoor_lux_entity: sensor.gw2000a_solar_lux
+  post_blind_outdoor_mid_lux: 3000
+  post_blind_outdoor_bright_lux: 5000
+  post_blind_settle_dark_sec: 10
+  post_blind_settle_mid_sec: 25
+  post_blind_settle_bright_sec: 60
+
+  # Same entity + semantics as bedroom_lights (room_state_darkness.is_dark_for_lights)
+  bedroom_state_entity: sensor.room_state_bedroom_bathroom
+  light_entity: light.bedroom_bed_lights
+
+  # Optional presence for media unmute behavior when room is empty
+  # Use AOD occupancy output (more reliable than raw presence)
+  # FP300 occupancy (area_occupancy entity was removed from HA)
+  bedroom_presence_entity: binary_sensor.bedroom_presence_presence
+
+  adaptive_main_switch: switch.adaptive_lighting_bedroom
+  adaptive_brightness_switch: switch.adaptive_lighting_adapt_brightness_bedroom_bed_lights
+  # Sleep booleans: AppDaemon apps rutines/mikkel_sleep_mode.yaml
+  mikkel_sleep_entity: input_boolean.mikkel_sleep_mode
+
+  ramp_start_pct: 1
+  ramp_step_pct: 6
+  ramp_interval_sec: 60
+  ramp_max_pct: 90
+
+
