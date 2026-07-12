@@ -81,13 +81,17 @@ def vent_helps(t_in, dp_in, t_out, dp_out):
 
 
 def classify(t, dp_now, ceiling_base, ceiling_eff):
+    """Human-comfort label on ABSOLUTE anchors - deliberately not the planning
+    knob: with the knob at 20 a perfectly nice 20.8 C room read as "hot"
+    (2026-07-12). The knob steers SmartCooling; this label describes the room."""
+    del ceiling_base, ceiling_eff  # planning inputs, not comfort anchors
     if t is None:
         return "unknown"
-    if t >= ceiling_base + 0.5:
+    if t >= 24.5:
         return "hot"
     if dp_now is not None and dp_now >= 13.5:
         return "sticky"
-    if t >= ceiling_eff:
+    if t >= 23.0:
         return "warm"
     return "comfortable"
 

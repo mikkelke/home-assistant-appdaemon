@@ -86,11 +86,12 @@ class VentHelps(unittest.TestCase):
 
 
 class Classify(unittest.TestCase):
-    def test_ladder(self):
-        self.assertEqual(bc.classify(24.0, 10.0, 23.0, 22.5), "hot")
-        self.assertEqual(bc.classify(23.0, 14.0, 23.0, 22.5), "sticky")
-        self.assertEqual(bc.classify(22.7, 10.0, 23.0, 22.5), "warm")
-        self.assertEqual(bc.classify(21.0, 10.0, 23.0, 22.5), "comfortable")
+    def test_ladder_absolute_anchors(self):
+        # anchors are human comfort, independent of the planning knob
+        self.assertEqual(bc.classify(24.6, 10.0, 20.0, 19.9), "hot")
+        self.assertEqual(bc.classify(23.0, 14.0, 20.0, 19.9), "sticky")
+        self.assertEqual(bc.classify(23.2, 10.0, 20.0, 19.9), "warm")
+        self.assertEqual(bc.classify(20.8, 10.0, 20.0, 19.9), "comfortable")
 
 
 class Morning(unittest.TestCase):
