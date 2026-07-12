@@ -1,0 +1,24 @@
+# /conf/apps/climate/bedroom_comfort.yaml
+# Bedroom comfort middle layer -> sensor.bedroom_comfort (state + reason).
+# SmartCooling consumes attribute `ceiling_effective` instead of the raw knob;
+# the dashboard SmartCoolingCard shows dew point / effective ceiling / vent advice.
+# Moisture rate calibrated on the 2026-07-09 night: +0.5 C dew point per hour
+# with 2 sleepers in the sealed room (dp 9.7 -> 14.2 over ~9 h).
+
+BedroomComfort:
+  module: bedroom_comfort
+  class: BedroomComfort
+  temperature_entity: sensor.bedroom_median_temperature
+  humidity_entity: sensor.bedroom_humidity
+  outdoor_temperature_entity: sensor.gw2000a_outdoor_temperature
+  outdoor_humidity_entity: sensor.gw2000a_humidity
+  persons:
+    - person.mikkel
+    - person.kristine
+  night_ceiling_entity: input_number.smart_cooling_night_ceiling
+  default_night_ceiling: 23.0
+  dp_rate_per_sleeper_c_per_h: 0.25
+  dp_comfort_knee_c: 12.0
+  dp_penalty_per_c: 0.15
+  second_sleeper_penalty_c: 0.5
+  max_ceiling_reduction_c: 1.5

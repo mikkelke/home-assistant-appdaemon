@@ -41,6 +41,9 @@ class SmartCooling(hass.Hass):
         # --- the only user knobs: Arm (above) + Bedtime; ceiling is an optional default ---
         self.bedtime_entity = a("bedtime_entity", "input_datetime.smart_cooling_bedtime")
         self.night_ceiling_entity = a("night_ceiling_entity", "input_number.smart_cooling_night_ceiling")
+        # Humidity-aware ceiling from the comfort middle layer (sensor.bedroom_comfort).
+        self.comfort_entity = a("comfort_entity", "sensor.bedroom_comfort")
+        self.comfort_max_reduction = float(a("comfort_max_reduction", 1.5))
         # --- fixed params (not user-facing) ---
         self.default_bedtime = str(a("default_bedtime", "23:00"))
         self.default_ceiling = float(a("default_night_ceiling", 23.0))
@@ -270,7 +273,18 @@ class SmartCooling(hass.Hass):
         bath = await self._num(self.bathroom_sensor, None)
         kitchen = await self._num(self.kitchen_sensor, None)
 
-        ceiling = await self._num(self.night_ceiling_entity, self.default_ceiling)
+        ceiling_base = await self._num(self.night_ceiling_entity, self.default_ceiling)
+        # Comfort layer may lower the ceiling on humid/two-sleeper nights. Bounded:
+        # at most comfort_max_reduction below the knob, never below min_temp, never
+        # raised above the knob; any comfort-layer problem falls back to the knob.
+        ceiling = ceiling_base
+        try:
+            ce = await self.get_state(self.comfort_entity, attribute="ceiling_effective")
+            if ce is not None:
+                ceiling = min(ceiling_base,
+                              max(float(ce), ceiling_base - self.comfort_max_reduction, self.min_temp))
+        except (TypeError, ValueError):
+            pass
         bedtime = await self._bedtime_dt(now)
 
         pm = self._build_price_map(
@@ -344,7 +358,9 @@ class SmartCooling(hass.Hass):
             "ceiling_delivery": r1(ceil_s), "ac_output": r1(ac_s),
             "bathroom": r1(bath), "kitchen": r1(kitchen),
             "equilibrium_est": r1(E), "floor_target": r1(target), "deficit": round(max(0.0, deficit), 1),
-            "floor_limited": floor_limited, "night_ceiling": r1(ceiling), "min_temp": r1(self.min_temp),
+            "floor_limited": floor_limited, "night_ceiling": r1(ceiling),
+            "ceiling_base": r1(ceiling_base), "ceiling_source": ("comfort layer" if ceiling < ceiling_base else "knob"),
+            "min_temp": r1(self.min_temp),
             "rise_frac": round(self._rise_frac, 2), "rise_samples": self._rise_samples,
             "price_now": round(price_now, 2), "window_open": window_open,
             "minutes_needed": run_min, "next_start": next_start.strftime("%H:%M") if next_start else None,

@@ -25,9 +25,10 @@ for f in "${pyfiles[@]}"; do
 done
 echo "py_compile OK (${#pyfiles[@]} files)"
 
-# 2. unit tests (stdlib unittest, no external deps)
-python3 -m unittest discover -s apps/lights/tests -q
-python3 -m unittest discover -s apps/appliances/tests -q
+# 2. unit tests (stdlib unittest, no external deps) - every apps/*/tests dir
+for tdir in apps/*/tests; do
+  [ -d "$tdir" ] && python3 -m unittest discover -s "$tdir" -q
+done
 echo "unit tests OK"
 
 # 3. sync only tracked files
