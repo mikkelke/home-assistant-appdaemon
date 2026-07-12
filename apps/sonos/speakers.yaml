@@ -1,0 +1,66 @@
+# Speaker registry - the single source of record for the Sonos fleet.
+# NOT loaded by AppDaemon (no module/class): consumed by scripts/check_speakers.py,
+# which fails the deploy when any app yaml or the dashboard drifts from this file.
+# Convention: MA entity = clean id, native twin = <id>_2 (same physical unit).
+# When a speaker moves/renames: edit HERE first, then let the checker point at
+# every file that still disagrees. (The 2026-07 rename touched ~10 surfaces by hand.)
+
+speakers:
+  living_room:
+    ma_entity: media_player.living_room
+    raw_entity: media_player.living_room_2
+    rincon: RINCON_74CA6064C9BF01400
+    model: Arc Ultra
+    default_volume: 0.20      # Era-100 default + 2: far bigger unit (user 2026-07-08)
+    tts: [all, family]
+  kitchen:
+    ma_entity: media_player.kitchen
+    raw_entity: media_player.kitchen_2
+    rincon: RINCON_F0F6C1A525A201400
+    default_volume: 0.18
+    tts: [all, family]
+  dining_room:
+    ma_entity: media_player.dining_room
+    raw_entity: media_player.dining_room_2
+    rincon: RINCON_C43875EC190201400
+    default_volume: 0.18
+    tts: [all, family]
+  bedroom:
+    ma_entity: media_player.bedroom
+    raw_entity: media_player.bedroom_2
+    rincon: RINCON_F0F6C1A526E601400
+    default_volume: 0.18
+    tts: [all]                # never family announcements in the bedroom
+  bathroom:
+    ma_entity: media_player.bathroom
+    raw_entity: media_player.bathroom_2
+    rincon: RINCON_F0F6C1A5264A01400
+    default_volume: 0.24
+    tts: [all, family]
+  guest_bathroom:
+    ma_entity: media_player.guest_bathroom
+    raw_entity: media_player.guest_bathroom_2
+    rincon: RINCON_804AF2CB366601400
+    default_volume: 0.24
+    tts: [all, family]
+  kristines_room:
+    ma_entity: media_player.kristines_room
+    raw_entity: media_player.kristines_room_2
+    rincon: RINCON_804AF2CB391401400
+    model: Era 100
+    line_in_host: true        # Audiocast: Chromecast Audio feeds this unit's line-in
+    default_volume: 0.18
+    tts: [all]
+  claudias_room:
+    ma_entity: media_player.claudias_room
+    raw_entity: media_player.claudias_room_2
+    rincon: RINCON_804AF2CB397801400
+    model: Era 100
+    default_volume: 0.18
+    tts: [all, family]
+  rooftop:
+    ma_entity: media_player.rooftop
+    raw_entity: media_player.rooftop_2
+    rincon: RINCON_74CA6021706E01400
+    default_volume: 0.18
+    tts: [all, family]

@@ -31,6 +31,9 @@ for tdir in apps/*/tests; do
 done
 echo "unit tests OK"
 
+# 2b. speaker registry drift guard
+python3 scripts/check_speakers.py
+
 # 3. sync only tracked files
 STAMP=$(ssh -o BatchMode=yes "$HOST" "date '+%Y-%m-%d %H:%M:%S'")
 LIST=$(mktemp)

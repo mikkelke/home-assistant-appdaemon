@@ -1,0 +1,21 @@
+# /conf/apps/lights/presence_model.yaml
+# Presence middle layer, SHADOW mode: publishes binary_sensor.presence_<room>
+# mirroring the existing binary_sensor.<room>_pir_presence composites, enriched
+# with reason / source introspection / kitchen music-ghost flag. NOTHING
+# consumes these yet - compare for a week, then repoint consumers room by room
+# (plan: ~/.claude/plans/middle-layer-2026-07-12.md, Phase 3).
+
+PresenceModel:
+  module: presence_model
+  class: PresenceModel
+  rooms:
+    - bathroom
+    - bedroom
+    - guest_bathroom
+    - claudias_room
+    - living_room
+    - dining_room
+    - hallway
+    - kitchen
+    - kristines_room
+  kitchen_media_entity: media_player.kitchen_2
