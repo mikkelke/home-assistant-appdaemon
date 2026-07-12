@@ -39,6 +39,16 @@ class ClaudiasRoomClimate(hass.Hass):
         if temp is not None and temp > 0:
             self.call_service("input_number/set_value", entity_id=self.prev_temp_entity, value=temp)
 
+    def _frost_effective(self):
+        """Frost target clamped to the thermostat's minimum - the device rejects
+        anything below min_temp (validation error), which silently disabled frost
+        mode when frost_temp was 5 and the Danfoss minimum is 15."""
+        try:
+            dev_min = float(self.get_state(self.climate, attribute="min_temp"))
+        except (TypeError, ValueError):
+            dev_min = 15.0
+        return max(self.frost_temp, dev_min)
+
     def _apply(self, temp):
         self._suppress = True
         self.call_service("climate/set_temperature", entity_id=self.climate, temperature=temp, hvac_mode="heat")
@@ -54,8 +64,9 @@ class ClaudiasRoomClimate(hass.Hass):
         if new == "on":
             cur = self._setpoint()
             self._remember(cur)
-            self._apply(self.frost_temp)
-            self.log("Rooftop door 2 OPEN -> %s frost %.1f C (saved %s)" % (self.climate, self.frost_temp, cur))
+            frost = self._frost_effective()
+            self._apply(frost)
+            self.log("Rooftop door 2 OPEN -> %s frost %.1f C (saved %s)" % (self.climate, frost, cur))
         elif new == "off":
             try:
                 prev = float(self.get_state(self.prev_temp_entity))
@@ -74,6 +85,6 @@ class ClaudiasRoomClimate(hass.Hass):
             t = float(new)
         except (TypeError, ValueError):
             return
-        if t > 0 and abs(t - self.frost_temp) > 0.01:
+        if t > 0 and abs(t - self._frost_effective()) > 0.01:
             self._remember(t)
             self.log("Manual setpoint %.1f C (door closed) remembered" % t, level="DEBUG")

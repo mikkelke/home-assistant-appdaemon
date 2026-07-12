@@ -8,5 +8,5 @@ claudias_room_climate:
   door_sensor: "binary_sensor.rooftop_door_2_contact"
   climate_entity: "climate.claudias_room_thermostat"
   previous_temp_entity: "input_number.claudias_room_previous_temperature"
-  frost_temp: 5
+  frost_temp: 15   # thermostat min is 15; below that the device rejects the setpoint
   default_temp: 20
