@@ -18,4 +18,21 @@ PresenceModel:
     - hallway
     - kitchen
     - kristines_room
-  kitchen_media_entity: media_player.kitchen_2
+  # Trust rules - presence is flagged `suspect` while the interference source
+  # is active and only marker-matching (mmWave) members are firing.
+  distrust_rules:
+    kitchen:
+      when_entity: media_player.kitchen_2
+      when_state: playing
+      marker: presence_presence
+      label: kitchen speaker playing (cone micro-motion)
+    bedroom:
+      when_entity: sensor.air_conditioner_real_time_power
+      when_above: 50
+      marker: bedroom_presence
+      label: AC running (airflow/curtain ghost, 2026-07-12)
+    bathroom:
+      when_entity: sensor.air_conditioner_real_time_power
+      when_above: 50
+      marker: bathroom_presence
+      label: AC condenser in bathroom

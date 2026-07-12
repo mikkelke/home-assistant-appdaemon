@@ -31,8 +31,12 @@ class PresenceModel(hass.Hass):
         self.rooms = list(a("rooms", []))
         self.composite_pattern = a("composite_pattern", "binary_sensor.{room}_pir_presence")
         self.publish_pattern = a("publish_pattern", "binary_sensor.presence_{room}")
-        self.kitchen_media = a("kitchen_media_entity", "media_player.kitchen_2")
-        self.mmwave_marker = a("mmwave_marker", "presence_presence")
+        # Trust rules: while `when_entity` is active (state match or numeric
+        # threshold), presence in that room is SUSPECT when the only active
+        # members match `marker` (or membership is not introspectable).
+        # Ghost catalogue so far: kitchen speaker cone (2026-07-07), AC airflow/
+        # louvre in bedroom + condenser in bathroom (2026-07-12).
+        self.distrust_rules = dict(a("distrust_rules", {}))
 
         self._members = {}  # room -> [member entity ids] (groups only)
         for room in self.rooms:
@@ -45,10 +49,22 @@ class PresenceModel(hass.Hass):
                     self.listen_state(self._on_change, m, room=room)
             else:
                 self._members[room] = []
-        if self.kitchen_media and "kitchen" in self.rooms:
-            self.listen_state(self._on_change, self.kitchen_media, room="kitchen")
+        for room, rule in self.distrust_rules.items():
+            if room in self.rooms and rule.get("when_entity"):
+                self.listen_state(self._on_change, rule["when_entity"], room=room)
 
         self.run_every(self._tick, "now+6", 300)
+
+    def _rule_active(self, rule):
+        if not rule or not rule.get("when_entity"):
+            return False
+        state = self.get_state(rule["when_entity"])
+        if "when_above" in rule:
+            try:
+                return float(state) > float(rule["when_above"])
+            except (TypeError, ValueError):
+                return False
+        return state == rule.get("when_state", "on")
 
     def _on_change(self, entity, attribute, old, new, kwargs):
         self._eval(kwargs.get("room"))
@@ -74,13 +90,15 @@ class PresenceModel(hass.Hass):
             else:
                 reason = "no presence"
 
-            music_suspect = False
-            if room == "kitchen" and state == "on" and active:
-                playing = self.get_state(self.kitchen_media) == "playing"
-                only_mmwave = all(self.mmwave_marker in m for m in active)
-                music_suspect = bool(playing and only_mmwave)
-                if music_suspect:
-                    reason += " - mmWave only while kitchen speaker plays (ghost suspect)"
+            rule = self.distrust_rules.get(room)
+            suspect = False
+            if rule and state == "on" and self._rule_active(rule):
+                marker = rule.get("marker", "presence_")
+                # Suspect when every active member matches the marker, or when
+                # membership is not introspectable (template composites).
+                if not active or all(marker in m for m in active):
+                    suspect = True
+                    reason += f" - SUSPECT: {rule.get('label', 'interference source active')}"
 
             self.set_state(self.publish_pattern.format(room=room),
                            state=state if state in ("on", "off") else "off",
@@ -88,7 +106,7 @@ class PresenceModel(hass.Hass):
                                "friendly_name": f"Presence {room.replace('_', ' ')}",
                                "device_class": "occupancy",
                                "reason": reason,
-                               "music_suspect": music_suspect,
+                               "suspect": suspect,
                                "shadow_of": composite,
                                "source_entities": [composite] + members,
                                "computed_at": datetime.now().isoformat(timespec="seconds"),
