@@ -28,6 +28,11 @@ confirm the app actually re-initialized.
 Note: AppDaemon only restarts an app when its **parsed yaml args** change — comment-only
 yaml edits do not trigger a reload; the deploy script warns when no reload is observed.
 
+Note: the box `appdaemon.yaml` must carry `exclude_dirs: [tests]` — AppDaemon imports
+every `.py` under the apps tree, and a failing import of a test module can abort
+loading of *other* new apps (bit us 2026-07-12: `apps/security/` never started until
+the tests dirs were excluded).
+
 ## Deliberately not in this repo
 
 - `apps/people/` — contains personal data of third parties.
