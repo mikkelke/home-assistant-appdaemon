@@ -1,0 +1,13 @@
+# /conf/apps/security/entry_truth.yaml
+# Entry arbitration middle layer -> binary_sensor.apartment_entry_secure.
+# BLE lock is authoritative; alerts once when the Yale cloud twin sticks stale
+# (e.g. missed re-lock push, seen 2026-07-12: cloud "unlocked" 1.5 h while locked).
+
+EntryTruth:
+  module: entry_truth
+  class: EntryTruth
+  lock_authoritative: lock.yale_bt
+  lock_cloud: lock.yale
+  door_open_entity: binary_sensor.apartment_door_open
+  divergence_alert_minutes: 5
+  notify_target: mikkel
