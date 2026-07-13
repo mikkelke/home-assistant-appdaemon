@@ -96,6 +96,34 @@ def classify(t, dp_now, ceiling_base, ceiling_eff):
     return "comfortable"
 
 
+def project_zone_peak(floor_c, kitchen_c, mid_c, rise_frac, person_offset_c=0.5,
+                      zone_offset_c=1.0):
+    """Sealed-night sleeping-zone peak if nobody cools (SmartCooling coast law:
+    the floor mass drifts toward the equilibrium E by fraction rise_frac over
+    the night; the sleeping zone rides zone_offset above the floor)."""
+    vals = [v for v in (floor_c, kitchen_c, mid_c) if v is not None]
+    if floor_c is None or not vals:
+        return None
+    equilibrium = max(vals) + person_offset_c
+    return floor_c + (equilibrium - floor_c) * rise_frac + zone_offset_c
+
+
+def ac_worth(projected_peak, ceiling_eff, dp_morning,
+             peak_margin_c=0.2, dp_oppressive_c=17.5):
+    """Deploy verdict: the projected night breaks the (humidity-adjusted)
+    tolerance ceiling, OR the moisture alone makes the night oppressive
+    (the AC is also the dehumidifier)."""
+    reasons = []
+    if projected_peak is not None and ceiling_eff is not None and \
+            projected_peak > ceiling_eff + peak_margin_c:
+        reasons.append(f"projected {projected_peak:.1f}C exceeds the "
+                       f"{ceiling_eff:.1f}C comfort ceiling")
+    if dp_morning is not None and dp_morning >= dp_oppressive_c:
+        reasons.append(f"morning dew point {dp_morning:.1f}C is oppressive "
+                       f"(only the AC dries the room)")
+    return (len(reasons) > 0), " and ".join(reasons)
+
+
 def hours_until_morning(now, morning_hour=7):
     """Hours from `now` to the next 07:00, capped at 10 (projection horizon)."""
     target_day = now

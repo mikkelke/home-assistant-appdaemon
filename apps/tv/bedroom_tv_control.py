@@ -84,6 +84,11 @@ class BedroomTVControl(hass.Hass):
         # Track last known lift position (Up/Down) based on commands we send
         # This helps us know if lift needs to be lowered when TV is already active
         self._last_known_lift_position = None  # "Up", "Down", or None (unknown)
+        # Raise-retry state (2026-07-13: the 01:05 raise evaporated in a Z-Wave
+        # flap window and the TV stood exposed all night - UP now retries)
+        self._raise_attempt = 1
+        self._post_raise_flap = False
+        self._post_raise_check_handle = None
         # Periodic verification when TV is active (optional, configurable)
         self._periodic_verification_handle = None
         try:
@@ -340,7 +345,8 @@ class BedroomTVControl(hass.Hass):
         If verification fails, we fall back to timeout-based clearing so the
         next command (TV on/off) can proceed normally.
         """
-        self.log(f"Lift command verification timeout: Expected state '{self._expected_lift_state}' but it didn't appear - using timeout fallback", level="WARNING")
+        expected = self._expected_lift_state
+        self.log(f"Lift command verification timeout: Expected state '{expected}' but it didn't appear - using timeout fallback", level="WARNING")
         # Fall back to timeout-based clearing - ensures main function is never blocked
         try:
             self.run_in(self._clear_lift_action_flag, self.lift_command_timeout_s)
@@ -348,6 +354,61 @@ class BedroomTVControl(hass.Hass):
             self._reset_lift_action_flag()
         self._expected_lift_state = None
         self._lift_verify_timeout_handle = None
+        # A missed DOWN self-heals via periodic verification while the TV is on;
+        # a missed UP has no second chance - retry with backoff.
+        if expected == "Up":
+            self._schedule_raise_retry()
+
+    RAISE_RETRY_DELAYS_S = (60, 300, 900)
+
+    def _schedule_raise_retry(self):
+        """Re-attempt a failed or deferred raise with backoff; notify when out of
+        tries. A missed DOWN self-heals via periodic verification while the TV is
+        on; a missed UP had no second chance until 2026-07-13 (the TV stood
+        exposed all night after a LocalTuya flap ate the command)."""
+        try:
+            if self._is_tv_actually_on():
+                self._raise_attempt = 1
+                return  # TV is back on - nothing to raise
+            attempt = int(getattr(self, "_raise_attempt", 1))
+            if attempt > len(self.RAISE_RETRY_DELAYS_S):
+                self.log("Lift raise failed after all retries - LocalTuya link likely down", level="ERROR")
+                try:
+                    notifier = self.get_app("MobileNotifier")
+                    self.create_task(notifier.notify(
+                        title="Bedroom TV lift",
+                        message="The lift did not confirm going UP after several attempts - "
+                                "the lift Tuya link looks down (WiFi or local key). Raise it manually or check the device.",
+                        target="mikkel"))
+                except Exception as e:
+                    self.log(f"raise-failure notify failed: {e}", level="WARNING")
+                self._raise_attempt = 1
+                return
+            delay = self.RAISE_RETRY_DELAYS_S[attempt - 1]
+            self.log(f"Scheduling lift raise retry {attempt}/{len(self.RAISE_RETRY_DELAYS_S)} in {delay}s", level="WARNING")
+            self.run_in(self._raise_lift_after_stop, delay,
+                        path_marker=f"raise_retry_{attempt}",
+                        allow_immediate_after_stop=True,
+                        attempt=attempt + 1)
+        except Exception as e:
+            self.log(f"Error scheduling raise retry: {e}", level="ERROR")
+
+    def _post_raise_check(self, kwargs):
+        """2 min after a raise: if the node flapped (or is dead) and the TV is
+        still off, the Up very likely never reached the motor - go around again."""
+        self._post_raise_check_handle = None
+        try:
+            if self._is_tv_actually_on():
+                return
+            sel = self.get_state("select.bedroom_tv_lift_position_configuration")
+            if self._post_raise_flap or sel in (None, "unknown", "unavailable"):
+                self.log(f"Post-raise check: node flapped (flap={self._post_raise_flap}, select={sel}) - retrying raise", level="WARNING")
+                self._schedule_raise_retry()
+            else:
+                self.log("Post-raise check: node stable - raise assumed delivered", level="DEBUG")
+                self._raise_attempt = 1
+        except Exception as e:
+            self.log(f"Error in post-raise check: {e}", level="WARNING")
 
     def _reset_lift_action_flag(self):
         """Reset lift action flag (with timeout detection)"""
@@ -583,6 +644,7 @@ class BedroomTVControl(hass.Hass):
         Called when TV turns off. Raises the lift to UP position.
         """
         path_marker = kwargs.get("path_marker", "tv_off")
+        self._raise_attempt = int(kwargs.get("attempt", 1))
         # Reset flag first
         self._reset_lift_action_flag()
         # Check minimum interval between commands
@@ -597,7 +659,15 @@ class BedroomTVControl(hass.Hass):
                 except Exception as e:
                     self.log(f"Error rescheduling raise: {e}", level="ERROR")
             return
-        
+
+        # Commanding a flapping LocalTuya device is a lost command (2026-07-13
+        # 00:37-01:10 the lift select flapped unavailable and the 01:05 raise
+        # evaporated) - defer instead of firing into the void.
+        if self.get_state("select.bedroom_tv_lift_position_configuration") in (None, "unknown", "unavailable"):
+            self.log(f"Lift device unavailable - deferring raise (attempt {self._raise_attempt})", level="WARNING")
+            self._schedule_raise_retry()
+            return
+
         try:
             self._lift_action_in_progress = True
             self._lift_action_start_time = self.datetime()
@@ -615,6 +685,15 @@ class BedroomTVControl(hass.Hass):
             self._update_lift_position("Up")
             # Stop periodic verification when TV is off
             self._stop_periodic_verification()
+            # The select can echo Up -> Clear command and the node die right
+            # after (2026-07-13 01:05): re-check in 2 min, retry if it flapped.
+            self._post_raise_flap = False
+            if self._post_raise_check_handle:
+                self._safe_cancel_timer(self._post_raise_check_handle)
+            try:
+                self._post_raise_check_handle = self.run_in(self._post_raise_check, 120)
+            except Exception:
+                self._post_raise_check_handle = None
             # Clear flag after script execution (fallback if verification disabled)
             if not self.lift_verify_enabled:
                 try:
@@ -868,6 +947,10 @@ class BedroomTVControl(hass.Hass):
 
     def lift_position_handler(self, entity, attribute, old, new, kwargs):
         """Handle manual lift position changes for bidirectional control and command verification"""
+        # LocalTuya flap bookkeeping for the post-raise check: a node that drops
+        # unavailable shortly after an Up command probably never moved the motor.
+        if new == "unavailable":
+            self._post_raise_flap = True
         # Command verification: Check if this is the expected state change from our command
         if self._lift_action_in_progress and self.lift_verify_enabled and self._expected_lift_state:
             if new == self._expected_lift_state:

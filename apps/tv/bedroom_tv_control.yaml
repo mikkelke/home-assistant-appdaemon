@@ -25,7 +25,7 @@ bedroom_tv_control:
   apple_tv_reset_delay_seconds: 30
   
   # TV lift debounce (fast ON, verified OFF using Sony + Apple TV)
-  tv_off_debounce_seconds: 30   # min safe: worst observed on/off flicker while watching was 25.3s (most <=15s); 30s clears it with margin, real power-off raises after 30s
+  tv_off_debounce_seconds: 75   # worst observed mid-watching flicker: 53s Sony off-blip 2026-07-13 00:10 (previous record 25.3s); 75s clears it with margin - a real power-off just hides the TV ~1 min later
   tv_on_debounce_seconds: 0.1   # near-instant lower when TV turns on (an early/extra down is harmless; the raise side is the protected one)
   
   # Lift command timing (to prevent conflicts and improve stability)
