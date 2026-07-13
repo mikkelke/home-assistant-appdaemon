@@ -114,8 +114,10 @@ class DeployAdvisor(hass.Hass):
         self.mid_sensor = a("mid_sensor", "sensor.bedroom_temperature")
         self.kitchen_sensor = a("kitchen_sensor", "sensor.kitchen_temperature")
         self.weather_entity = a("weather_entity", "weather.forecast_home")
-        self.ceiling_entity = a("night_ceiling_entity", "input_number.smart_cooling_night_ceiling")
-        self.default_ceiling = float(a("default_night_ceiling", 23.0))
+        # Advice threshold is NOT the SmartCooling pre-cool knob (user may run
+        # that at 20 for deep pre-cools) - 23 C is the user's "absolute max"
+        # sleeping temperature (2026-06-25, very firm).
+        self.advise_ceiling = float(a("advise_ceiling", 23.0))
         self.ac_climate = a("ac_climate_entity", "climate.air_conditioner_thermostat")
         self.ac_power = a("ac_power_entity", "sensor.air_conditioner_real_time_power")
         self.sc_state_file = a("smart_cooling_state_file", "/conf/apps/climate/smart_cooling_state.json")
@@ -128,12 +130,13 @@ class DeployAdvisor(hass.Hass):
         self.fit.update(a("fit", {}) or {})
 
         self._advisor_state = self._load_state()
+        # get_app must be resolved in the sync init context - inside async
+        # methods AD hands back a Task instead of the app instance.
+        self._notifier = self.get_app("MobileNotifier")
 
         self.run_in(lambda kw: self.create_task(self._eval()), 20)
         for hhmm in ("12:15:00", "20:30:00"):
             self.run_daily(lambda kw: self.create_task(self._eval()), hhmm)
-        self.listen_state(lambda *args, **kw: self.create_task(self._eval()),
-                          self.ceiling_entity)
 
     # -- state persistence (which dates we already notified about)
     def _load_state(self):
@@ -210,7 +213,7 @@ class DeployAdvisor(hass.Hass):
             if k0 is None or f0 is None:
                 await self._publish("unknown", "kitchen/floor sensor unavailable", [])
                 return
-            ceiling = await self._num(self.ceiling_entity, self.default_ceiling)
+            ceiling = self.advise_ceiling
             rise = self._rise_frac()
 
             hourly = await self._hourly_forecast()
@@ -276,9 +279,8 @@ class DeployAdvisor(hass.Hass):
 
     async def _notify(self, message):
         try:
-            notifier = self.get_app("MobileNotifier")
-            await notifier.notify(title="AC advisor", message=message,
-                                  target=self.notify_target)
+            await self._notifier.notify(title="AC advisor", message=message,
+                                        target=self.notify_target)
             self.log(f"notified: {message}")
         except Exception as e:
             self.log(f"notify failed: {e}", level="WARNING")

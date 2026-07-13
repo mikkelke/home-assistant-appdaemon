@@ -34,6 +34,8 @@ class EntryTruth(hass.Hass):
 
         self._diverged_since = None
         self._alerted = False
+        # get_app must be resolved in sync init - async context returns a Task.
+        self._notifier = self.get_app("MobileNotifier")
 
         for ent in (self.lock_bt, self.lock_cloud, self.door):
             self.listen_state(self._on_change, ent)
@@ -100,8 +102,7 @@ class EntryTruth(hass.Hass):
             self._alerted = True
             self.log(f"Yale divergence {minutes:.0f} min: BLE={bt} cloud={cloud} - notifying")
             try:
-                notifier = self.get_app("MobileNotifier")
-                await notifier.notify(
+                await self._notifier.notify(
                     title="Front door",
                     message=(f"Yale cloud shows '{cloud}' but the lock itself (Bluetooth) "
                              f"says '{bt}'. Trust the lock; the cloud/app is stale."),

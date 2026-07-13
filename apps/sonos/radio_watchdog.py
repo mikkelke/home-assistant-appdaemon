@@ -41,6 +41,8 @@ class RadioWatchdog(hass.Hass):
         self._playing_since = {}
         self._last_content = {}
         self._last_attempt = {}
+        # get_app must be resolved in sync init - async context returns a Task.
+        self._notifier = self.get_app("MobileNotifier")
 
         for p in self.players:
             self.listen_state(self._on_player, p, player=p)
@@ -95,9 +97,8 @@ class RadioWatchdog(hass.Hass):
                    if ok else
                    f"Radio stream died on {self.friendly_name(player)} and the retry "
                    f"failed too (stream itself is likely down).")
-            notifier = self.get_app("MobileNotifier")
-            await notifier.notify(title="Radio watchdog", message=msg,
-                                  target=self.notify_target)
+            await self._notifier.notify(title="Radio watchdog", message=msg,
+                                        target=self.notify_target)
             self.log(f"resume on {player}: {'ok' if ok else 'failed'}")
         except Exception as e:
             self.log(f"watchdog verify failed: {e}", level="ERROR")

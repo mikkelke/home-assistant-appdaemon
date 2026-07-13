@@ -12,7 +12,7 @@ DeployAdvisor:
   mid_sensor: sensor.bedroom_temperature
   kitchen_sensor: sensor.kitchen_temperature
   weather_entity: weather.forecast_home
-  night_ceiling_entity: input_number.smart_cooling_night_ceiling
+  advise_ceiling: 23.0   # user's absolute-max sleeping temp - NOT the pre-cool knob
   ac_climate_entity: climate.air_conditioner_thermostat
   ac_power_entity: sensor.air_conditioner_real_time_power
   smart_cooling_state_file: /conf/apps/climate/smart_cooling_state.json
