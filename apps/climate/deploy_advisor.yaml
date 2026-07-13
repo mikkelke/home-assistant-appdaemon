@@ -1,0 +1,21 @@
+# /conf/apps/climate/deploy_advisor.yaml
+# AC deploy advisor -> sensor.bedroom_night_projection + ONE notification when
+# a projected too-warm night is <= notify_lead_days away and the AC is not
+# running ("worth setting up the AC before <day>"), all-clear when the horizon
+# cools again. Model = A1 regression fit (see deploy_advisor.py docstring);
+# rise_frac is read live from SmartCooling's learned state.
+
+DeployAdvisor:
+  module: deploy_advisor
+  class: DeployAdvisor
+  floor_sensor: sensor.bedroom_floor_thermometer_temperature
+  mid_sensor: sensor.bedroom_temperature
+  kitchen_sensor: sensor.kitchen_temperature
+  weather_entity: weather.forecast_home
+  night_ceiling_entity: input_number.smart_cooling_night_ceiling
+  ac_climate_entity: climate.air_conditioner_thermostat
+  ac_power_entity: sensor.air_conditioner_real_time_power
+  smart_cooling_state_file: /conf/apps/climate/smart_cooling_state.json
+  state_file: /conf/apps/climate/deploy_advisor_state.json
+  notify_lead_days: 2
+  notify_target: mikkel

@@ -11,17 +11,22 @@ Key attributes:
   dew_point            - now, from bedroom T/RH (Magnus formula)
   dew_point_morning    - projected at 07:00 (sleepers exhale ~0.25 C dew point
                          per hour each in a sealed room; calibrated 2026-07-09)
-  ceiling_base         - the user's night-ceiling knob
-  ceiling_effective    - base lowered when the projected morning is humid and
+  ceiling_base         - fixed comfort anchor (~23 C; NOT a knob - the old
+                         stepper was set as a target and poisoned the math)
+  ceiling_effective    - anchor lowered when the projected morning is humid and
                          when two people share the bed; SmartCooling consumes
-                         THIS instead of the raw knob
+                         THIS instead of any knob
+  projected_peak       - sleeping-zone peak tonight if nobody cools
+                         (SmartCooling coast law + its learned rise_frac)
+  ac_worth / verdict   - the deploy recommendation, in plain words
   vent_helps + vent_reason - venting only helps when outdoor air is both
                          cooler AND drier than the room
   reason / source_entities / computed_at - middle-layer convention
 
-Consumers: SmartCooling (ceiling_effective), dashboard SmartCoolingCard.
+Consumers: SmartCooling (ceiling_effective), dashboard Sleep-cooling card.
 """
 
+import json
 import math
 from datetime import datetime
 
@@ -145,8 +150,19 @@ class BedroomComfort(hass.Hass):
         self.out_temp_entity = a("outdoor_temperature_entity", "sensor.gw2000a_outdoor_temperature")
         self.out_rh_entity = a("outdoor_humidity_entity", "sensor.gw2000a_humidity")
         self.persons = list(a("persons", ["person.mikkel", "person.kristine"]))
-        self.ceiling_entity = a("night_ceiling_entity", "input_number.smart_cooling_night_ceiling")
-        self.default_ceiling = float(a("default_night_ceiling", 23.0))
+        # The tolerance anchor is comfort science, not a knob: ~23 C is the max a
+        # sealed bedroom can be at night before sleep degrades (user spec
+        # 2026-06-25: "23 is the ABSOLUTE max"). Humidity/occupancy lower the
+        # EFFECTIVE ceiling from here. (The old stepper was set to 20.0 as a
+        # *target*, which turned the effective ceiling into nonsense - knob removed.)
+        self.comfort_anchor = float(a("comfort_anchor_c", 23.0))
+        # Night projection inputs (SmartCooling coast law + its learned rise_frac)
+        self.floor_entity = a("floor_entity", "sensor.bedroom_floor_thermometer_temperature")
+        self.mid_entity = a("mid_entity", "sensor.bedroom_temperature")
+        self.kitchen_entity = a("kitchen_entity", "sensor.kitchen_temperature")
+        self.rise_frac_fallback = float(a("rise_frac_fallback", 0.5))
+        self.smart_cooling_state_file = a("smart_cooling_state_file",
+                                          "/conf/apps/climate/smart_cooling_state.json")
         self.dp_rate = float(a("dp_rate_per_sleeper_c_per_h", 0.25))
         self.knee = float(a("dp_comfort_knee_c", 12.0))
         self.penalty = float(a("dp_penalty_per_c", 0.15))
@@ -155,7 +171,8 @@ class BedroomComfort(hass.Hass):
         self.publish_entity = a("publish_entity", "sensor.bedroom_comfort")
 
         for ent in (self.temp_entity, self.rh_entity, self.out_temp_entity,
-                    self.out_rh_entity, *self.persons):
+                    self.out_rh_entity, self.floor_entity, self.kitchen_entity,
+                    *self.persons):
             self.listen_state(self._on_change, ent)
         self.run_every(self._tick, "now+5", 300)
 
@@ -171,6 +188,15 @@ class BedroomComfort(hass.Hass):
         home = sum(1 for p in self.persons if self.get_state(p) == "home")
         return max(1, home)
 
+    def _rise_frac(self):
+        """SmartCooling's self-learned coast fraction; fallback until it exists."""
+        try:
+            with open(self.smart_cooling_state_file) as f:
+                v = json.load(f).get("rise_frac")
+            return float(v) if v else self.rise_frac_fallback
+        except Exception:
+            return self.rise_frac_fallback
+
     # -- handlers
     def _on_change(self, entity, attribute, old, new, kwargs):
         self._eval()
@@ -184,9 +210,7 @@ class BedroomComfort(hass.Hass):
             rh_in = self._num(self.rh_entity)
             t_out = self._num(self.out_temp_entity)
             rh_out = self._num(self.out_rh_entity)
-            base = self._num(self.ceiling_entity)
-            if base is None:
-                base = self.default_ceiling
+            base = self.comfort_anchor
 
             dp_in = dew_point_c(t_in, rh_in)
             dp_out = dew_point_c(t_out, rh_out)
@@ -198,6 +222,20 @@ class BedroomComfort(hass.Hass):
                 self.second_sleeper, self.max_reduction)
             vent_ok, vent_reason = vent_helps(t_in, dp_in, t_out, dp_out)
             state = classify(t_in, dp_in, base, ceiling_eff)
+
+            floor = self._num(self.floor_entity)
+            mid = self._num(self.mid_entity)
+            kitchen = self._num(self.kitchen_entity)
+            rise = self._rise_frac()
+            peak = project_zone_peak(floor, kitchen, mid, rise)
+            worth, worth_reason = ac_worth(peak, ceiling_eff, dp_morning)
+            if worth:
+                verdict = f"AC worth deploying - {worth_reason}"
+            elif peak is None:
+                verdict = "no projection (mass sensors unavailable)"
+            else:
+                verdict = (f"no AC needed - projected {peak:.1f}C stays under the "
+                           f"{ceiling_eff:.1f}C comfort ceiling")
 
             if dp_morning is not None and reduction > 0:
                 reason = (f"projected morning dew point {dp_morning:.1f}C with "
@@ -219,6 +257,10 @@ class BedroomComfort(hass.Hass):
                 "ceiling_base": round(base, 1),
                 "ceiling_effective": ceiling_eff,
                 "ceiling_reduction": reduction,
+                "projected_peak": None if peak is None else round(peak, 1),
+                "rise_frac": round(rise, 2),
+                "ac_worth": worth,
+                "verdict": verdict,
                 "vent_helps": vent_ok,
                 "vent_reason": vent_reason,
                 "outdoor_temperature": None if t_out is None else round(t_out, 1),
@@ -226,7 +268,8 @@ class BedroomComfort(hass.Hass):
                 "reason": reason,
                 "source_entities": [self.temp_entity, self.rh_entity,
                                     self.out_temp_entity, self.out_rh_entity,
-                                    *self.persons],
+                                    self.floor_entity, self.mid_entity,
+                                    self.kitchen_entity, *self.persons],
                 "computed_at": datetime.now().isoformat(timespec="seconds"),
             })
         except Exception as e:
