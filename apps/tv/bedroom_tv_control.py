@@ -76,6 +76,27 @@ class BedroomTVControl(hass.Hass):
             f"blip-guard {self.tv_off_blip_debounce_seconds:.0f}s for {self.blip_guard_hours:.0f}h",
             level="INFO",
         )
+
+        # Sony power-on network probe. The Bravia is network-DEAD in standby
+        # (verified 2026-07-14: no ping, all ports closed) and its integration
+        # can take minutes to reconnect after a CEC power-on - the TV is
+        # visibly on while HA still says off, so the lift never lowers until
+        # playback finally updates the state ("often nothing happens", user).
+        # A TCP probe answering while HA says off = the TV JUST powered on:
+        # kick the integration and lower the lift immediately. ON-detection
+        # only - a network blip cannot fake a device into existence, but it
+        # could fake an absence, so the off side stays state+debounce based.
+        self.sony_probe_host = self.args.get("sony_probe_host")
+        self.sony_probe_port = int(self.args.get("sony_probe_port", 80))
+        self.sony_probe_interval = float(self.args.get("sony_probe_interval_seconds", 4))
+        self._probe_fired_at = None
+        if self.sony_probe_host:
+            self.run_every(self._sony_probe_tick, "now+8", self.sony_probe_interval)
+            self.log(
+                f"sony power probe: {self.sony_probe_host}:{self.sony_probe_port} "
+                f"every {self.sony_probe_interval:.0f}s while HA reports off",
+                level="INFO",
+            )
         # Debounce before lowering lift on ON (fast reaction)
         try:
             self.tv_on_debounce_seconds = float(self.args.get("tv_on_debounce_seconds", 1))
@@ -768,7 +789,10 @@ class BedroomTVControl(hass.Hass):
         """
         try:
             tv_state = self.get_state(self.tv_entity)
-            if self._is_tv_actually_on():
+            # probe_confirmed: the network probe SAW the Sony answer while HA
+            # state still lags (deep-standby TVs vanish from the network; the
+            # integration can need minutes to reconnect after CEC power-on).
+            if self._is_tv_actually_on() or kwargs.get("probe_confirmed", False):
                 # Check if we think lift is already down
                 current_position = self._get_lift_position()
                 self.log(f"TV is active (state: '{tv_state}'), current lift position: '{current_position}'", level="DEBUG")
@@ -954,6 +978,45 @@ class BedroomTVControl(hass.Hass):
             self.adjust_volume(-self.volume_step)
         elif scene == self.button_2_property_key and value == "KeyPressed": # Volume up
             self.adjust_volume(self.volume_step)
+
+    def _sony_probe_tick(self, kwargs):
+        try:
+            if self.get_state(self.sony_tv_entity) not in ("off", "unavailable", "unknown", "standby", None):
+                return  # HA already knows the TV is on
+            if self._probe_fired_at is not None and \
+                    (self.datetime() - self._probe_fired_at).total_seconds() < 60:
+                return  # already acted; give the integration a minute to catch up
+            self.create_task(self._sony_probe_async())
+        except Exception:
+            pass
+
+    async def _sony_probe_async(self):
+        import asyncio
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.sony_probe_host, self.sony_probe_port),
+                timeout=1.2,
+            )
+            writer.close()
+        except Exception:
+            return  # unreachable = genuinely off
+        self._probe_fired_at = self.datetime()
+        self.log(
+            "Sony answers on the network while HA says off - TV powered on: "
+            "kicking the integration and lowering the lift (probe)",
+            level="INFO",
+        )
+        try:
+            await self.call_service("homeassistant/update_entity",
+                                    entity_id=self.sony_tv_entity)
+        except Exception as e:
+            self.log(f"probe update_entity failed: {e}", level="WARNING")
+        try:
+            self.run_in(self._ensure_lift_down_if_tv_active, 0.5,
+                        from_tv_on_transition=True, force_lower=True,
+                        probe_confirmed=True)
+        except Exception as e:
+            self.log(f"probe lift-lower scheduling failed: {e}", level="ERROR")
 
     def _turn_tv_system_on(self):
         """Robust system power-on: the universal player wakes Sony + Apple TV,

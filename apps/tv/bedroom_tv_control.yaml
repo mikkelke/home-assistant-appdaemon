@@ -33,7 +33,14 @@ bedroom_tv_control:
   tv_off_debounce_seconds: 10
   tv_off_blip_debounce_seconds: 75
   blip_guard_hours: 4
-  tv_on_debounce_seconds: 0.1   # near-instant lower when TV turns on (an early/extra down is harmless; the raise side is the protected one)
+  tv_on_debounce_seconds: 0.1
+  
+  # Sony power-on network probe: the Bravia is network-dead in standby and the
+  # integration can lag minutes after a CEC power-on. TCP-answer while HA says
+  # off = TV just powered on -> kick integration + lower lift immediately.
+  sony_probe_host: "10.21.0.85"
+  sony_probe_port: 80
+  sony_probe_interval_seconds: 4   # near-instant lower when TV turns on (an early/extra down is harmless; the raise side is the protected one)
   
   # Lift command timing (to prevent conflicts and improve stability)
   min_lift_command_interval_s: 5.0  # Minimum seconds between lift commands
