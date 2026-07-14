@@ -40,7 +40,13 @@ bedroom_tv_control:
   # off = TV just powered on -> kick integration + lower lift immediately.
   sony_probe_host: "10.21.0.85"
   sony_probe_port: 80
-  sony_probe_interval_seconds: 4   # near-instant lower when TV turns on (an early/extra down is harmless; the raise side is the protected one)
+  sony_probe_interval_seconds: 4
+
+  # TV power meter (Shelly PM Mini, planned) - uncomment when installed and the
+  # entity exists. Becomes the truth source: instant lift-lower on real watts,
+  # and a veto against raising the lift over a glowing panel (Bravia off-blips).
+  # power_sensor: sensor.bedroom_tv_power
+  # power_on_watts: 25   # near-instant lower when TV turns on (an early/extra down is harmless; the raise side is the protected one)
   
   # Lift command timing (to prevent conflicts and improve stability)
   min_lift_command_interval_s: 5.0  # Minimum seconds between lift commands

@@ -102,6 +102,20 @@ class BedroomTVControl(hass.Hass):
             self.tv_on_debounce_seconds = float(self.args.get("tv_on_debounce_seconds", 1))
         except Exception:
             self.tv_on_debounce_seconds = 1.0
+
+        # TV power meter (Shelly PM Mini planned 2026-07-14) - THE truth source
+        # once installed. Set `power_sensor` in yaml to activate:
+        #   - watts above `power_on_watts` while HA says off = the panel is ON:
+        #     lower the lift instantly + kick the integration (beats both the
+        #     state lag and the network probe's ~25 s network-boot wait)
+        #   - watts above `power_on_watts` at raise time = VETO: the state is
+        #     lying (Bravia off-blip) - never raise a lift over a glowing TV
+        self.power_sensor = self.args.get("power_sensor")
+        self.power_on_watts = float(self.args.get("power_on_watts", 25))
+        self._power_fired_at = None
+        if self.power_sensor:
+            self.listen_state(self._on_tv_power, self.power_sensor)
+            self.log(f"TV power meter active: {self.power_sensor} (on > {self.power_on_watts:.0f}W)", level="INFO")
         # Flag to track if lift actions are from our code (to avoid feedback loops)
         self._lift_action_in_progress = False
         self._lift_action_start_time = None
@@ -666,6 +680,17 @@ class BedroomTVControl(hass.Hass):
             )
             return
 
+        if self._tv_draws_power():
+            # Power veto: never raise the lift over a glowing panel. A state
+            # 'off' with real wattage = the Bravia integration lying again.
+            self._blip_guard_until = self.datetime() + timedelta(hours=self.blip_guard_hours)
+            self.log(
+                "State says off but the TV draws power - integration blip: "
+                "NOT raising (power veto), blip-guard armed",
+                level="WARNING",
+            )
+            return
+
         self.log("TV OFF verified (Sony + Apple TV): raising lift to UP position", level="INFO")
         try:
             self._reset_lift_action_flag()
@@ -978,6 +1003,46 @@ class BedroomTVControl(hass.Hass):
             self.adjust_volume(-self.volume_step)
         elif scene == self.button_2_property_key and value == "KeyPressed": # Volume up
             self.adjust_volume(self.volume_step)
+
+    def _tv_draws_power(self):
+        """True when the power meter (if configured) reads the panel as ON."""
+        if not self.power_sensor:
+            return False
+        try:
+            return float(self.get_state(self.power_sensor)) > self.power_on_watts
+        except (TypeError, ValueError):
+            return False
+
+    def _on_tv_power(self, entity, attribute, old, new, kwargs):
+        try:
+            watts = float(new)
+        except (TypeError, ValueError):
+            return
+        if watts <= self.power_on_watts:
+            return
+        if self.get_state(self.sony_tv_entity) not in ("off", "unavailable", "unknown", "standby", None):
+            return  # HA already knows
+        if self._power_fired_at is not None and \
+                (self.datetime() - self._power_fired_at).total_seconds() < 30:
+            return
+        self._power_fired_at = self.datetime()
+        self.log(
+            f"TV draws {watts:.0f}W while HA says off - panel is ON: "
+            "lowering lift and kicking the integration (power meter)",
+            level="INFO",
+        )
+        try:
+            self.call_service("homeassistant/update_entity", entity_id=self.sony_tv_entity)
+        except Exception as e:
+            self.log(f"power-meter update_entity failed: {e}", level="WARNING")
+        try:
+            # Power IS truth (unlike the network probe, it cannot read "on"
+            # for a TV in network-standby) - lower immediately.
+            self.run_in(self._ensure_lift_down_if_tv_active, 0.2,
+                        from_tv_on_transition=True, force_lower=True,
+                        probe_confirmed=True)
+        except Exception as e:
+            self.log(f"power-meter lift-lower scheduling failed: {e}", level="ERROR")
 
     def _sony_probe_tick(self, kwargs):
         try:
