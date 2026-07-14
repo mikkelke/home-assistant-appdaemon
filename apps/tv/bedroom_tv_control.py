@@ -2,7 +2,7 @@
 BedroomTVControl - Controls the bedroom TV integration and TV lift.
 """
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import appdaemon.plugins.hass.hassapi as hass # type: ignore
 
@@ -1000,10 +1000,12 @@ class BedroomTVControl(hass.Hass):
             writer.close()
         except Exception:
             return  # unreachable = genuinely off
-        self._probe_fired_at = self.datetime()
+        # stdlib datetime here: AD's self.datetime()/get_state are coroutines
+        # inside async methods (see appdaemon-deploy memory gotcha).
+        self._probe_fired_at = datetime.now()
         self.log(
-            "Sony answers on the network while HA says off - TV powered on: "
-            "kicking the integration and lowering the lift (probe)",
+            "Sony answers on the network while HA says off - likely just "
+            "powered on: kicking the integration (probe)",
             level="INFO",
         )
         try:
@@ -1011,12 +1013,18 @@ class BedroomTVControl(hass.Hass):
                                     entity_id=self.sony_tv_entity)
         except Exception as e:
             self.log(f"probe update_entity failed: {e}", level="WARNING")
-        try:
-            self.run_in(self._ensure_lift_down_if_tv_active, 0.5,
-                        from_tv_on_transition=True, force_lower=True,
-                        probe_confirmed=True)
-        except Exception as e:
-            self.log(f"probe lift-lower scheduling failed: {e}", level="ERROR")
+        # Deliberately NO direct lift command here: the kicked integration
+        # reports the true state within ~2 s (measured 2026-07-14) and the
+        # normal ON flow lowers the lift. Forcing on probe-truth alone would
+        # lower the lift on a genuinely-off TV if the Sony's network-standby
+        # ("Remote start") setting is ever enabled.
+        await self.sleep(6)
+        state_after = await self.get_state(self.sony_tv_entity)
+        if state_after in ("off", "unavailable", "unknown", "standby", None):
+            # Reachable but still off after the kick: either network-standby is
+            # enabled (probe useless) or the integration is very slow - back off.
+            self._probe_fired_at = datetime.now() + timedelta(minutes=14)
+            self.log("probe: Sony reachable but reports off - backing off 15 min", level="DEBUG")
 
     def _turn_tv_system_on(self):
         """Robust system power-on: the universal player wakes Sony + Apple TV,
