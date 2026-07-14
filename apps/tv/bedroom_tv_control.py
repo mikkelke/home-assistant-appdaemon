@@ -596,10 +596,10 @@ class BedroomTVControl(hass.Hass):
                     self.run_in(self._clear_lift_action_flag, self.lift_command_timeout_s)
                 except Exception:
                     self._reset_lift_action_flag()
-                # Schedule raise after stop (will auto-reschedule if too soon)
-                # allow_immediate: the only "recent command" is our own deliberate stop
-            # 1 s ago - colliding with it added a pointless ~5 s to every raise.
-            self.run_in(self._raise_lift_after_stop, 1, path_marker=path_marker, allow_immediate_after_stop=True)
+                # Schedule raise after stop. allow_immediate: the only "recent
+                # command" is our own deliberate stop 1 s ago - colliding with
+                # it added a pointless ~5 s to every raise.
+                self.run_in(self._raise_lift_after_stop, 1, path_marker=path_marker, allow_immediate_after_stop=True)
             except Exception as e:
                 self.log(f"Lift sequence ({path_marker}): Error calling lift script: {e}", level="ERROR")
                 self._reset_lift_action_flag()
