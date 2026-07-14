@@ -2,6 +2,8 @@
 BedroomTVControl - Controls the bedroom TV integration and TV lift.
 """
 
+from datetime import timedelta
+
 import appdaemon.plugins.hass.hassapi as hass # type: ignore
 
 class BedroomTVControl(hass.Hass):
@@ -48,11 +50,32 @@ class BedroomTVControl(hass.Hass):
             self.run_in(self._mark_ready, startup_grace_seconds)
         except Exception:
             self._ready = True
-        # Debounce before raising lift on OFF (verified against Sony + Apple TV)
+        # Debounce before raising lift on OFF (verified against Sony + Apple TV).
+        # Adaptive: FAST by default; after a detected Sony off-blip (off -> on
+        # within the blip window) escalate to the paranoid debounce for a few
+        # hours. The Bravia can report a literal 'off' for ~53 s mid-watching
+        # and no other entity disagrees (remote flips too, Apple TV reads
+        # idle), so the trade is: react fast every night, accept ONE brief
+        # lift cycle on the rare blip evening, then remember and be patient.
         try:
-            self.tv_off_debounce_seconds = float(self.args.get("tv_off_debounce_seconds", 3))
+            self.tv_off_debounce_seconds = float(self.args.get("tv_off_debounce_seconds", 10))
         except Exception:
-            self.tv_off_debounce_seconds = 3.0
+            self.tv_off_debounce_seconds = 10.0
+        try:
+            self.tv_off_blip_debounce_seconds = float(self.args.get("tv_off_blip_debounce_seconds", 75))
+        except Exception:
+            self.tv_off_blip_debounce_seconds = 75.0
+        try:
+            self.blip_guard_hours = float(self.args.get("blip_guard_hours", 4))
+        except Exception:
+            self.blip_guard_hours = 4.0
+        self._last_off_at = None
+        self._blip_guard_until = None
+        self.log(
+            f"lift off-debounce: fast {self.tv_off_debounce_seconds:.0f}s, "
+            f"blip-guard {self.tv_off_blip_debounce_seconds:.0f}s for {self.blip_guard_hours:.0f}h",
+            level="INFO",
+        )
         # Debounce before lowering lift on ON (fast reaction)
         try:
             self.tv_on_debounce_seconds = float(self.args.get("tv_on_debounce_seconds", 1))
@@ -215,8 +238,12 @@ class BedroomTVControl(hass.Hass):
         
         # TV turning OFF -> debounce, verify Sony + Apple TV, then raise lift
         if is_off_state(new) and is_on_state(old):
+            self._last_off_at = self.datetime()
+            guard_active = self._blip_guard_until is not None and self.datetime() < self._blip_guard_until
+            delay = self.tv_off_blip_debounce_seconds if guard_active else self.tv_off_debounce_seconds
             self.log(
-                f"TV turned OFF: scheduling lift raise in {self.tv_off_debounce_seconds}s "
+                f"TV turned OFF: scheduling lift raise in {delay:.0f}s"
+                f"{' (blip-guard active)' if guard_active else ''} "
                 f"after Sony/Apple verification (state: '{old}' -> '{new}')",
                 level="INFO",
             )
@@ -227,7 +254,7 @@ class BedroomTVControl(hass.Hass):
             try:
                 self._pending_raise_handle = self.run_in(
                     self._raise_lift_if_still_off,
-                    self.tv_off_debounce_seconds,
+                    delay,
                     path_marker="tv_off",
                 )
             except Exception as e:
@@ -237,6 +264,18 @@ class BedroomTVControl(hass.Hass):
         # TV turning ON -> Lower lift to DOWN position
         # Handle transitions from off/idle/None/unknown to on/playing/paused
         elif is_on_state(new) and (is_off_state(old) or old in [None, "unknown"]):
+            # Blip detection: off -> back on within 90 s = the Bravia lied.
+            # Remember it and use the paranoid debounce for the rest of the evening.
+            if self._last_off_at is not None:
+                off_secs = (self.datetime() - self._last_off_at).total_seconds()
+                if off_secs < 90:
+                    self._blip_guard_until = self.datetime() + timedelta(hours=self.blip_guard_hours)
+                    self.log(
+                        f"Sony off-blip detected ({off_secs:.0f}s off->on) - using "
+                        f"{self.tv_off_blip_debounce_seconds:.0f}s debounce for the next "
+                        f"{self.blip_guard_hours:.0f}h",
+                        level="WARNING",
+                    )
             self.log(f"TV turned ON: Lowering lift to DOWN position (state: '{old}' -> '{new}')", level="INFO")
             self._cancel_pending_raise()
             if self._pending_lower_handle is not None:
@@ -558,7 +597,9 @@ class BedroomTVControl(hass.Hass):
                 except Exception:
                     self._reset_lift_action_flag()
                 # Schedule raise after stop (will auto-reschedule if too soon)
-                self.run_in(self._raise_lift_after_stop, 1, path_marker=path_marker, allow_immediate_after_stop=False)
+                # allow_immediate: the only "recent command" is our own deliberate stop
+            # 1 s ago - colliding with it added a pointless ~5 s to every raise.
+            self.run_in(self._raise_lift_after_stop, 1, path_marker=path_marker, allow_immediate_after_stop=True)
             except Exception as e:
                 self.log(f"Lift sequence ({path_marker}): Error calling lift script: {e}", level="ERROR")
                 self._reset_lift_action_flag()
@@ -616,7 +657,9 @@ class BedroomTVControl(hass.Hass):
                 self.run_in(self._clear_lift_action_flag, self.lift_command_timeout_s)
             except Exception:
                 self._reset_lift_action_flag()
-            self.run_in(self._raise_lift_after_stop, 1, path_marker=path_marker, allow_immediate_after_stop=False)
+            # allow_immediate: the only "recent command" is our own deliberate stop
+            # 1 s ago - colliding with it added a pointless ~5 s to every raise.
+            self.run_in(self._raise_lift_after_stop, 1, path_marker=path_marker, allow_immediate_after_stop=True)
         except Exception as e:
             self.log(f"Error handling verified TV OFF: {e}", level="ERROR")
             self._reset_lift_action_flag()

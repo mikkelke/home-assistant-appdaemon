@@ -24,8 +24,15 @@ bedroom_tv_control:
   apple_tv_reset_enabled: true   # Set to false to disable and test if still needed
   apple_tv_reset_delay_seconds: 30
   
-  # TV lift debounce (fast ON, verified OFF using Sony + Apple TV)
-  tv_off_debounce_seconds: 75   # worst observed mid-watching flicker: 53s Sony off-blip 2026-07-13 00:10 (previous record 25.3s); 75s clears it with margin - a real power-off just hides the TV ~1 min later
+  # TV lift debounce (fast ON, verified OFF using Sony + Apple TV).
+  # ADAPTIVE OFF (2026-07-13, user: "reaction is bad"): fast by default, and only
+  # after a detected off-blip (off->on within 90s; records: 25.3s and 53s, both
+  # Bravia lying mid-watch with no disagreeing entity) escalate to the paranoid
+  # debounce for blip_guard_hours. Costs one brief lift cycle on a blip evening,
+  # wins ~65s on every normal power-off.
+  tv_off_debounce_seconds: 10
+  tv_off_blip_debounce_seconds: 75
+  blip_guard_hours: 4
   tv_on_debounce_seconds: 0.1   # near-instant lower when TV turns on (an early/extra down is harmless; the raise side is the protected one)
   
   # Lift command timing (to prevent conflicts and improve stability)
