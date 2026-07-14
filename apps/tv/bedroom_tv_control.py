@@ -934,18 +934,36 @@ class BedroomTVControl(hass.Hass):
         if scene is None or value is None:
             return
             
-        if scene == self.button_4_property_key and value == "KeyPressed": # Play/pause
-            self.call_service("media_player/media_play_pause", entity_id="media_player.bedroom_tv")
+        if scene == self.button_4_property_key and value == "KeyPressed": # Play/pause - or turn ON when off
+            # A single press on an OFF TV used to send play/pause into the void
+            # ("often nothing happens", user 2026-07-14). Press = the natural
+            # "on" gesture: when the TV is off, one press turns the system on.
+            if self.get_state("media_player.bedroom_tv") == "off":
+                self.log("Wall button pressed with TV off - turning the TV system on", level="INFO")
+                self._turn_tv_system_on()
+            else:
+                self.call_service("media_player/media_play_pause", entity_id="media_player.bedroom_tv")
         elif scene == self.button_4_property_key and value == "KeyHeldDown": # Toggle TV system
             current_tv_state = self.get_state("media_player.bedroom_tv")
             if current_tv_state == "off":
-                self.call_service("media_player/turn_on", entity_id="media_player.bedroom_tv") 
+                self.log("Wall button held with TV off - turning the TV system on", level="INFO")
+                self._turn_tv_system_on()
             else:
                 self.call_service("media_player/turn_off", entity_id="media_player.bedroom_tv")
         elif scene == self.button_1_property_key and value == "KeyPressed": # Volume down
             self.adjust_volume(-self.volume_step)
         elif scene == self.button_2_property_key and value == "KeyPressed": # Volume up
             self.adjust_volume(self.volume_step)
+
+    def _turn_tv_system_on(self):
+        """Robust system power-on: the universal player wakes Sony + Apple TV,
+        and remote.turn_on is the belt for a Bravia sulking in deep standby
+        (media_player.turn_on alone occasionally does nothing)."""
+        try:
+            self.call_service("media_player/turn_on", entity_id="media_player.bedroom_tv")
+            self.call_service("remote/turn_on", entity_id="remote.bedroom_sony_tv")
+        except Exception as e:
+            self.log(f"TV system turn-on failed: {e}", level="ERROR")
 
     def _tv_volume_controllable(self):
         """Sony Bravia rejects volume_set when the TV is off."""
