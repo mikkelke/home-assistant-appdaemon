@@ -1,5 +1,8 @@
 # home-assistant-appdaemon
 
+[![GitHub](https://img.shields.io/badge/GitHub-public-181717?logo=github)](https://github.com/mikkelke/home-assistant-appdaemon)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 AppDaemon apps for my Home Assistant smart home. This repo is the **source of truth**;
 the box runs a deployed copy under `/data/appdaemon/apps`.
 
