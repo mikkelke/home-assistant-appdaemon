@@ -185,6 +185,10 @@ class BedroomSolarShade(hass.Hass):
         a["friendly_name"] = "Bedroom sun shade"
         a["icon"] = "mdi:blinds-horizontal"
         try:
+            # dry_run/on_window/radiation/illuminance silently drop from published attributes
+            # whenever they're False/0 (all common at night or with dry_run on; not live-confirmed
+            # 2026-07-15 since the feature was switched off at check time -- code-reasoned) --
+            # AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish() for details.
             self.set_state(self.status_entity, state=state, attributes=a, replace=True)
         except Exception as e:
             self.log(f"publish failed: {e}", level="WARNING")

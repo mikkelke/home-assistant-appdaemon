@@ -316,9 +316,15 @@ class WasherMonitor(hass.Hass):
             attrs["cycle_start_time_local"] = self._format_local(self.start_time)
             attrs["started_at_display"] = self.start_time.astimezone(self._local_tz()).strftime("%H:%M")
             attrs["last_door_closed_trusted"] = bool(self.last_door_closed_trusted)
+            # last_door_closed_trusted silently drops from published attributes whenever it's
+            # False (no trusted door-close yet, e.g. after a restart) -- AppDaemon 4.5.13
+            # set_state bug, not ours; see smart_cooling.py's _publish() for details.
             self._set_state_entity(state="Running", attributes=attrs, replace=True)
         except Exception as e:
             self.log(f"Could not push corrected cycle_start_time: {e}", level="WARNING")
+            # last_door_closed_trusted silently drops from published attributes whenever it's
+            # False (no trusted door-close yet, e.g. after a restart) -- AppDaemon 4.5.13
+            # set_state bug, not ours; see smart_cooling.py's _publish() for details.
             self._set_state_entity(
                 state="Running",
                 attributes={
@@ -2190,6 +2196,9 @@ class WasherMonitor(hass.Hass):
             pause_attrs["reason"] = reason_override or "Door opened during cycle (AddLoad)"
             pause_attrs["run_time_minutes"] = round(self._get_run_duration_minutes(), 1)
             pause_attrs["energy_used"] = round(self._get_energy_used(), 3)
+            # run_time_minutes/energy_used can legitimately be 0 here (AddLoad fires early in the
+            # cycle, before heating starts) -- AppDaemon 4.5.13 set_state bug, not ours; see
+            # smart_cooling.py's _publish() for details.
             self._set_state_entity( state="Paused", attributes=pause_attrs)
             r = pause_attrs.get("reason", "Paused")
             self.log(f"State -> Paused: {r}", level="INFO")
@@ -2359,6 +2368,9 @@ class WasherMonitor(hass.Hass):
                 "last_door_closed_trusted": False,
                 "last_off_at": self._format_local(now_utc),
             }
+            # programme_confirmed_by_user/last_door_closed_trusted are always False here (cleared
+            # every time a cycle ends) -- AppDaemon 4.5.13 set_state bug, not ours; see
+            # smart_cooling.py's _publish() for details.
             self._set_state_entity( state="Off", attributes=clear_attrs)
             self.last_door_closed_trusted = False
             self.log(f"State -> Off ({reason})", level="INFO")
@@ -2783,6 +2795,10 @@ class WasherMonitor(hass.Hass):
         if self.last_door_closed_at:
             run_attrs["last_door_closed_at"] = self._format_local(self.last_door_closed_at)
         run_attrs["last_door_closed_trusted"] = bool(self.last_door_closed_trusted)
+        # cycle_complete is always False here; heating_bursts/estimated_remaining_min/
+        # programme_confirmed_by_user/last_door_closed_trusted can also legitimately be 0/False
+        # (cold programme, near end-of-cycle recovery, Auto mode, no trusted door-close) --
+        # AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish() for details.
         self._set_state_entity( state="Running", attributes=run_attrs)
 
         self._safe_cancel_timer(self.unemptied_watchdog_timer)
@@ -2963,6 +2979,10 @@ class WasherMonitor(hass.Hass):
             attributes["programme_confirmed_by"] = ""
             attributes["expected_dur_at_start"] = ""
 
+            # programme_confirmed_by_user is always False here (cleared for next load);
+            # heating_bursts/last_door_closed_trusted can also be 0/False (cold programme,
+            # no trusted door-close) -- AppDaemon 4.5.13 set_state bug, not ours; see
+            # smart_cooling.py's _publish() for details.
             self._set_state_entity( state="Unemptied", attributes=attributes)
 
             self.programme_confirmed_by_user = False
@@ -3585,6 +3605,10 @@ class WasherMonitor(hass.Hass):
                 pass
         if self.expected_dur_at_start is None:
             attrs["expected_dur_at_start"] = ""
+        # elapsed_minutes/progress_pct/heating_bursts/max_power_w are always 0/0.0 at cycle start
+        # (just reset); last_door_closed_trusted/programme_confirmed_by_user are commonly False too
+        # (no trusted door-close yet, Auto-mode default) -- AppDaemon 4.5.13 set_state bug, not ours;
+        # see smart_cooling.py's _publish() for details.
         self._set_state_entity( state="Running", attributes=attrs, replace=True)
 
         if not self.poll_timer:
@@ -4693,6 +4717,9 @@ class WasherMonitor(hass.Hass):
                 attrs["programme_confirmed_by_user"] = False
                 attrs["programme_confirmed_by"] = ""
                 current_state = self.get_state(self.state_entity) or "Running"
+                # programme_confirmed_by_user is always False here (user reset the selector to
+                # Auto) -- AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's
+                # _publish() for details.
                 self._set_state_entity( state=current_state, attributes=attrs, replace=True)
             except Exception:
                 pass
@@ -4817,6 +4844,9 @@ class WasherMonitor(hass.Hass):
             attrs["predicted_programme"] = ""
             attrs["predicted_programme_label"] = ""
             attrs["predicted_temperature"] = ""
+            # progress_pct/estimated_remaining_min can legitimately be 0 here (just after cycle
+            # start, or near the end of the countdown) -- AppDaemon 4.5.13 set_state bug, not
+            # ours; see smart_cooling.py's _publish() for details.
             self._set_state_entity( state="Running", attributes=attrs, replace=True)
         except Exception as e:
             self.log(f"Could not push running ETA attributes: {e}", level="DEBUG")
@@ -5164,6 +5194,10 @@ class WasherMonitor(hass.Hass):
         attrs["programme_confirmed_by_user"] = bool(self.programme_confirmed_by_user)
         attrs["programme_confirmed_by"] = self.confirmed_by_username or ""
         attrs["expected_dur_at_start"] = self.expected_dur_at_start if self.expected_dur_at_start is not None else ""
+        # cycle_complete/heating_bursts/progress_pct/estimated_remaining_min/last_door_closed_trusted/
+        # programme_confirmed_by_user can all legitimately be False/0 on a normal mid-cycle tick (still
+        # running, pre-heating, near start/end of countdown, Auto mode, no trusted door-close) --
+        # AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish() for details.
         self._set_state_entity( state="Running", attributes=attrs)
 
         # --- Finish precedence: (1) user_cycle_end, (2) anti_crease_pattern, (3) low_power_detected ---

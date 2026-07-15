@@ -246,6 +246,10 @@ class BedroomComfort(hass.Hass):
             else:
                 reason = f"dry night projected (DP {dp_morning:.1f}C) - ceiling stays {base:.1f}C"
 
+            # ceiling_reduction/vent_helps/ac_worth silently drop from published attributes
+            # whenever they're False/0 (all three are legitimately that on ordinary calm nights;
+            # confirmed live 2026-07-15: ceiling_reduction/vent_helps both absent right now) --
+            # AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish() for details.
             self.set_state(self.publish_entity, state=state, replace=True, attributes={
                 "friendly_name": "Bedroom comfort",
                 "icon": "mdi:bed-clock",

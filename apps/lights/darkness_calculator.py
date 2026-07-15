@@ -587,6 +587,11 @@ class DarknessCalculator(hass.Hass):
         if self._publish_snapshots.get(bin_ent) != snap:
             # attrs is shared across this zone's mirrors (see _publish_zone) - copy per
             # call so replace=True doesn't alias two entities' stored attributes together.
+            # indoor_lux/indoor_daylight_lux/outdoor_lux/outdoor_smoothed_lux (legitimately 0
+            # overnight, or once a lamp's offset clamps daylight lux to 0) and outdoor_valid/
+            # raining/rain_recent/gloomy (False in the common online/dry/clear case) silently
+            # drop from published attributes whenever they're False/0 -- AppDaemon 4.5.13
+            # set_state bug, not ours; see smart_cooling.py's _publish() for details.
             self.set_state(bin_ent, state="on" if is_dark else "off", attributes=dict(attrs), replace=True)
             self.set_state(sen_ent, state=DARK if is_dark else BRIGHT, attributes=dict(attrs), replace=True)
             self._publish_snapshots[bin_ent] = snap
@@ -598,6 +603,10 @@ class DarknessCalculator(hass.Hass):
             "presence_ts": time.time(),
             **attrs,
         }
+        # room_attrs also carries every attrs key above (same risk), plus its own occupied/dark
+        # -- both False in the routine empty-room / bright-daytime case -- so they too silently
+        # drop from published attributes whenever False/0 -- AppDaemon 4.5.13 set_state bug, not
+        # ours; see smart_cooling.py's _publish() for details.
         if self._publish_snapshots.get(room_ent) != snap:
             self.set_state(room_ent, state=label, attributes=room_attrs, replace=True)
             self._publish_snapshots[room_ent] = snap

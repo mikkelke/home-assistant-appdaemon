@@ -1227,6 +1227,11 @@ class FamilyRoomLights(hass.Hass):
             "icon": "mdi:chart-box-outline",
         }
         try:
+            # physical_toggles_on/off_today/session (0 until the app's first toggle today/this
+            # session) and is_dark_committed/is_dark_for_auto_on/is_confirmed_bright/
+            # family_presence (False whenever bright/empty - the routine case) silently drop
+            # from published attributes whenever they're False/0 -- AppDaemon 4.5.13 set_state
+            # bug, not ours; see smart_cooling.py's _publish() for details.
             self.set_state(self._diag_sensor, state=label, attributes=attrs, replace=True)
         except Exception as e:
             self.log(f"diagnostics set_state failed: {e}", level="DEBUG")

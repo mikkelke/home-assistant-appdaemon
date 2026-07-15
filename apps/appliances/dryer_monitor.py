@@ -502,6 +502,10 @@ class DryerMonitor(hass.Hass):
             full = self.get_state(self.state_entity, attribute="all")
             existing = dict((full or {}).get("attributes") or {})
             existing.update(attrs)
+            # elapsed_minutes/progress_pct/energy_used silently drop from published attributes
+            # whenever they're 0/0.0 (every cycle's first tick(s)); estimated_remaining_min drops
+            # the same way once a cycle overruns its estimate -- AppDaemon 4.5.13 set_state bug,
+            # not ours; see smart_cooling.py's _publish() for details.
             self._set_state_entity( state=self.get_state(self.state_entity), attributes=existing, replace=True)
         except Exception:
             pass
@@ -893,6 +897,9 @@ class DryerMonitor(hass.Hass):
         """Transition to Paused state when door opens during Running with high power."""
         if self._should_change_state("Paused"):
             self.state = "Paused"
+            # keep_fresh_detected silently drops from published attributes whenever it's False
+            # (always False on this path -- Paused excludes the keep-fresh branch) -- AppDaemon
+            # 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish() for details.
             self._set_state_entity(
                 state="Paused",
                 attributes={

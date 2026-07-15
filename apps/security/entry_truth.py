@@ -67,6 +67,10 @@ class EntryTruth(hass.Hass):
             else:
                 reason = "locked and closed"
 
+            # door_open/cloud_agrees silently drop from published attributes whenever they're
+            # False (door closed / locks agree, the common case; confirmed live 2026-07-15:
+            # door_open absent right now) -- AppDaemon 4.5.13 set_state bug, not ours; see
+            # smart_cooling.py's _publish() for details.
             await self.set_state(self.publish_entity,
                                  state="on" if secure else "off",
                                  replace=True,

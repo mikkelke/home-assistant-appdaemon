@@ -703,6 +703,9 @@ class TransitAlarm(hass.Hass):
 
             # 3. Transient sensor (rich attributes - recreated on startup)
             lines_str = ", ".join(str(ln) for ln in route.get("lines", []))
+            # mins_to_next silently drops from published attributes whenever it's 0 (departure
+            # due right now/imminently is a normal value, confirmed live) -- AppDaemon 4.5.13
+            # set_state bug, not ours; see smart_cooling.py's _publish() for details.
             self.set_state(
                 self._sensor_entity(route),
                 state=status,
@@ -744,6 +747,9 @@ class TransitAlarm(hass.Hass):
                     if in_active
                     else getattr(self, "poll_interval_night_min", 30)
                 )
+            # poll_interval_night_min/poll_max_stale_min silently drop from published attributes
+            # whenever configured as 0 (a legitimate "disabled" config value, not an error) --
+            # AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish() for details.
             self.set_state(
                 self.last_updated_sensor,
                 state=data_as_of_iso,
