@@ -27,8 +27,11 @@ BedroomSolarShade:
   wake_grace_min: 20          # let the wake routine open to 38 + ramp first
   fallback_wake: "07:30"
 
-  # away override: everyone away -> close fully instead of daylight-balancing
-  person_entities: [person.mikkel, person.kristine]
+  # away override: occupant away -> close fully instead of daylight-balancing.
+  # Mikkel only (2026-07-15): the daylight balance exists for whoever uses THIS room,
+  # and Kristine sleeps in her own room - her being home shouldn't keep an empty
+  # bedroom bright (and hot).
+  person_entities: [person.mikkel]
 
   # geometry / thresholds
   window_azimuth: 70          # ENE facade
