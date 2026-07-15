@@ -22,6 +22,12 @@ Logic each tick:
 Opt-in via input_boolean.bedroom_solar_shade (OFF by default). Publishes sensor.bedroom_solar_shade_status.
 
 HA helpers (via MCP): input_boolean.bedroom_solar_shade, input_number.bedroom_solar_shade_position (max-shade cap).
+
+Away override (user, 2026-07-15): nobody home means nobody cares about keeping the room bright -
+the daylight-preserving partial position only matters to someone actually in it. So while every
+tracked person is away, skip the lux-balanced logic and just close fully (max_pos) to block the
+most heat. Manual moves still win (checked first); the wake routine's own blind command does not
+apply while away either, since there's nobody to wake up.
 """
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
@@ -40,6 +46,7 @@ class BedroomSolarShade(hass.Hass):
         # morning-alarm collaboration
         self.alarm_time_entity = a("alarm_time_entity", "input_datetime.wakeup_bedroom")
         self.sleep_entity = a("sleep_entity", "input_boolean.mikkel_sleep_mode")
+        self.person_entities = a("person_entities", ["person.mikkel", "person.kristine"])
         self.wake_grace_min = int(a("wake_grace_min", 20))
         self.fallback_wake = self._parse_hhmm(a("fallback_wake", "07:30"), time(7, 30))
         # geometry / thresholds
@@ -99,6 +106,15 @@ class BedroomSolarShade(hass.Hass):
     def _on_change(self, entity, attribute, old, new, kwargs):
         self.run_in(self._tick, 1)
 
+    def _everyone_away(self):
+        # Fail-safe: an unknown/unavailable tracker (dead phone, lost GPS fix) must NOT count as
+        # away -- only a definite "somewhere that isn't home" reading does.
+        for p in self.person_entities:
+            state = self.get_state(p)
+            if state in (None, "unknown", "unavailable", "home"):
+                return False
+        return True
+
     def _on_cover_change(self, entity, attribute, old, new, kwargs):
         try:
             pos = int(float(new))
@@ -134,6 +150,20 @@ class BedroomSolarShade(hass.Hass):
             return
         if self._override_until is not None and now < self._override_until:
             self._publish("manual", f"Paused after a manual move until {self._override_until.strftime('%H:%M')}", {})
+            return
+
+        if self._everyone_away():
+            desired = self.max_pos
+            reason = "Nobody home - closing fully to block the most heat"
+            cur = self._num_attr(self.cover, "current_position", None)
+            self._publish("away", reason, {"desired": desired, "current": cur})
+            if cur is None or abs(cur - desired) > self.pos_tol:
+                if self.dry_run:
+                    self.log(f"DRY-RUN would set {self.cover} -> {desired}% ({reason})")
+                else:
+                    self.call_service("cover/set_cover_position", entity_id=self.cover, position=desired)
+                    self._last_cmd = desired
+                    self.log(f"Set {self.cover} -> {desired}% ({reason})")
             return
 
         rad = self._num(self.radiation_sensor, 0.0)

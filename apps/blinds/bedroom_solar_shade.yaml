@@ -3,6 +3,9 @@
 # of it until you're up, uses 38 (the wake-routine target / privacy floor) as the open position,
 # and uses sensor.bedroom_presence_illuminance as feedback. Opt-in via input_boolean.bedroom_solar_shade.
 # Position scale matches bedroom_blind_control / wakeup_bedroom (0 = open, 100 = closed).
+# While everyone in person_entities is away (2026-07-15), skip the daylight balancing and just
+# close fully (max_position) -- nobody home means nobody needs the room bright, so block the
+# most heat instead. A recent manual move still takes priority (checked first).
 #
 # HA helpers (via MCP): input_boolean.bedroom_solar_shade, input_number.bedroom_solar_shade_position (max-shade cap)
 
@@ -23,6 +26,9 @@ BedroomSolarShade:
   sleep_entity: input_boolean.mikkel_sleep_mode
   wake_grace_min: 20          # let the wake routine open to 38 + ramp first
   fallback_wake: "07:30"
+
+  # away override: everyone away -> close fully instead of daylight-balancing
+  person_entities: [person.mikkel, person.kristine]
 
   # geometry / thresholds
   window_azimuth: 70          # ENE facade
