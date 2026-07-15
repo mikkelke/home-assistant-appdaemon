@@ -12,9 +12,10 @@ BedroomComfort:
   humidity_entity: sensor.bedroom_humidity
   outdoor_temperature_entity: sensor.gw2000a_outdoor_temperature
   outdoor_humidity_entity: sensor.gw2000a_humidity
+  # Mikkel's bedroom only (2026-07-15) -- Kristine has her own room, never a second
+  # sleeper here regardless of her presence state.
   persons:
     - person.mikkel
-    - person.kristine
   night_ceiling_entity: input_number.smart_cooling_night_ceiling
   default_night_ceiling: 23.0
   dp_rate_per_sleeper_c_per_h: 0.25
