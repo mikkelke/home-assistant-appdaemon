@@ -100,6 +100,8 @@ class PresenceModel(hass.Hass):
                     suspect = True
                     reason += f" - SUSPECT: {rule.get('label', 'interference source active')}"
 
+            # "suspect" silently drops from published attributes whenever it's False --
+            # AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish() for details.
             self.set_state(self.publish_pattern.format(room=room),
                            state=state if state in ("on", "off") else "off",
                            replace=True,

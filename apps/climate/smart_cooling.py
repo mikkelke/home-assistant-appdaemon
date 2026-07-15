@@ -461,6 +461,15 @@ class SmartCooling(hass.Hass):
         a["friendly_name"] = "Smart cooling status"
         a["icon"] = "mdi:snowflake-thermometer"
         try:
+            # AppDaemon 4.5.13 bug, not ours: every set_state() HTTP publish runs through
+            # appdaemon.utils.clean_http_kwargs -> remove_literals(val, (None, False)), which
+            # deletes any attribute key whose value equals False (or 0, since 0 == False)
+            # before the /api/states POST body is built. True survives only because it's
+            # separately rewritten to the string "true" first -- so a present "boolean"
+            # attribute is actually that string, never a JSON bool; a MISSING key means false.
+            # dry_run/floor_limited vanish from this entity whenever they're False. No supported
+            # AppDaemon API bypasses this and a value-mangling wrapper would be a hack, so this
+            # is left as a known framework limitation -- do not chase it here.
             await self.set_state(self.status_entity, state=status, attributes=a, replace=True)
         except Exception as e:
             self.log(f"publish failed: {e}", level="WARNING")
