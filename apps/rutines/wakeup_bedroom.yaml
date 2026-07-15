@@ -31,6 +31,10 @@ WakeupBedroom:
   closed_is_100: true
   bedroom_cover_target: 38
   bathroom_cover_target: 40
+  # Heat-wave override (user, 2026-07-15): input_boolean.heat_wave_mode ON -> use this
+  # instead of bedroom_cover_target at wake time (less sun/heat let in). OFF = normal 38.
+  heat_wave_entity: input_boolean.heat_wave_mode
+  bedroom_cover_target_heat_wave: 65
   # Dynamic wait after blind reaches target before deciding wake bed-light ramp.
   # Uses outdoor lux clue so dark mornings stay responsive while bright mornings avoid flash-on.
   outdoor_lux_entity: sensor.gw2000a_solar_lux

@@ -40,6 +40,11 @@ class SmartCooling(hass.Hass):
         self.enable_entity = a("enable_entity", "input_boolean.smart_cooling")
         # --- the only user knobs: Arm (above) + Bedtime; ceiling is an optional default ---
         self.bedtime_entity = a("bedtime_entity", "input_datetime.smart_cooling_bedtime")
+        # Real bedtime varies night to night (22:00-01:00, user 2026-07-15) - the OLD
+        # "now >= bedtime -> force off" branch fired on the clock regardless of whether
+        # anyone was actually going to bed. bedtime now ONLY sizes the price-optimizer's
+        # search window (_schedule); the actual off+seal action is user-triggered here.
+        self.ac_removed_entity = a("ac_removed_entity", "input_boolean.smart_cooling_ac_removed")
         self.night_ceiling_entity = a("night_ceiling_entity", "input_number.smart_cooling_night_ceiling")
         # Humidity-aware ceiling from the comfort middle layer (sensor.bedroom_comfort).
         self.comfort_entity = a("comfort_entity", "sensor.bedroom_comfort")
@@ -84,7 +89,7 @@ class SmartCooling(hass.Hass):
             self.log(f"MobileNotifier not available: {e}", level="WARNING")
 
         for ent in (self.enable_entity, self.price_entity, self.bedtime_entity,
-                    self.night_ceiling_entity, self.vent_window):
+                    self.night_ceiling_entity, self.vent_window, self.ac_removed_entity):
             self.listen_state(self._on_trigger, ent)
         self.run_every(self._run_eval, "now", self.interval_min * 60)
         self.log(f"SmartCooling v2 started (dry_run={self.dry_run}, rise_frac={self._rise_frac:.2f}, "
@@ -302,16 +307,20 @@ class SmartCooling(hass.Hass):
         floor_limited = target <= self.min_temp + 0.05  # hot night: cooling as deep as the unit allows
         minutes_needed = max(0.0, deficit) / self.floor_cool_cph * 60.0
 
-        # past bedtime -> done for the night (the AC comes out)
-        if now >= bedtime:
+        # user says they're removing the AC now -> done for the night, then reset the
+        # toggle so it's a one-shot trigger, not a switch someone has to remember to flip back.
+        if (await self._state(self.ac_removed_entity)) == "on":
             await self._ensure_off(
                 "done_for_tonight",
-                "Past bedtime -- AC off. Move the unit to the bathroom and seal the bedroom.",
+                "AC removed -- sealing the bedroom for the night.",
                 self._attrs(floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
                             ceiling, price_now, window_open, bedtime, 0, None, 0.0, floor_limited,
                             ceiling_base),
-                notify_bedtime=True, bedtime=bedtime,
             )
+            try:
+                await self.call_service("input_boolean/turn_off", entity_id=self.ac_removed_entity)
+            except Exception as e:
+                self.log(f"failed to reset ac_removed toggle: {e}", level="WARNING")
             return
 
         cool_now, next_start, run_min, est_cost = self._schedule(now, bedtime, minutes_needed, price_at)

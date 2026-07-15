@@ -52,6 +52,13 @@ class WakeupRoutine(hass.Hass):
         self.bathroom_cover = A["covers"]["bathroom"]
         self.bedroom_cover_target = int(A["bedroom_cover_target"])
         self.bathroom_cover_target = int(A["bathroom_cover_target"])
+        # Heat-wave override: the normal wake nudge (38, i.e. mostly open) floods a hot
+        # bedroom with morning sun/heat if the blind was closed overnight. Toggle-gated
+        # (user, 2026-07-15) rather than auto-detected - simple, predictable, matches the
+        # same manual-toggle pattern as the AC. Off by default = today's normal behavior.
+        self.heat_wave_entity = A.get("heat_wave_entity", "input_boolean.heat_wave_mode")
+        self.bedroom_cover_target_heat_wave = int(A.get("bedroom_cover_target_heat_wave", 65))
+        self._current_bedroom_wake_target = self.bedroom_cover_target
 
         self.bedroom_state_entity = A["bedroom_state_entity"]
         self.light_entity = A["light_entity"]
@@ -296,11 +303,18 @@ class WakeupRoutine(hass.Hass):
         self._attach_cancel_listeners()
         self._group_speakers()
         self._start_media_and_volume_ramp()
-        self._nudge_cover_if_closed(self.bedroom_cover, self.bedroom_cover_target)
+        heat_wave = self.get_state(self.heat_wave_entity) == "on"
+        self._current_bedroom_wake_target = (
+            self.bedroom_cover_target_heat_wave if heat_wave else self.bedroom_cover_target
+        )
+        if heat_wave:
+            self.log(f"[wake] Heat wave mode: bedroom blind target {self._current_bedroom_wake_target} "
+                     f"instead of {self.bedroom_cover_target}", log=self.user_log)
+        self._nudge_cover_if_closed(self.bedroom_cover, self._current_bedroom_wake_target)
         self._nudge_cover_if_closed(self.bathroom_cover, self.bathroom_cover_target)
 
         pos = self._cover_position(self.bedroom_cover)
-        if pos is not None and int(pos) == self.bedroom_cover_target:
+        if pos is not None and int(pos) == self._current_bedroom_wake_target:
             self._maybe_start_light_ramp()
         else:
             if self.cover_listener:
@@ -547,7 +561,7 @@ class WakeupRoutine(hass.Hass):
             pos = int(float(new))
         except Exception:
             return
-        if pos == self.bedroom_cover_target:
+        if pos == self._current_bedroom_wake_target:
             if self.cover_listener:
                 self.cancel_listen_state(self.cover_listener)
                 self.cover_listener = None
