@@ -75,7 +75,8 @@ class BedroomSolarShade(hass.Hass):
         self.listen_state(self._on_change, self.sleep_entity)
         self.listen_state(self._on_change, self.sun, attribute="azimuth")
         self.listen_state(self._on_cover_change, self.cover, attribute="current_position")
-        self.run_every(self._tick, "now", self.interval_min * 60)
+        # "now" fires at now+interval per AppDaemon's docs, not immediately - "immediate" is the real keyword; see 8666460.
+        self.run_every(self._tick, "immediate", self.interval_min * 60)
         self.log(f"BedroomSolarShade started (dry_run={self.dry_run}, open/floor={self.open_pos}, window_az={self.window_az})")
 
     # ---------- helpers ----------

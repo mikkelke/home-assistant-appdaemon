@@ -47,7 +47,8 @@ class EasterlyWindMonitor(hass.Hass):
         except Exception as e:
             self.log(f"MobileNotifier not available: {e}", level="WARNING")
 
-        self.run_every(self._check_conditions, "now", self.interval_s)
+        # "now" fires at now+interval per AppDaemon's docs, not immediately - "immediate" is the real keyword; see 8666460.
+        self.run_every(self._check_conditions, "immediate", self.interval_s)
         ul = f" {self.wind_unit_label}" if self.wind_unit_label else ""
         self.log(
             f"Started: dir {self.dir_min}-{self.dir_max} deg; windy if mean >= {self.wind_speed_windy:g}{ul} "

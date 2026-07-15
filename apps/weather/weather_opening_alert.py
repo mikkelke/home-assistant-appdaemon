@@ -136,7 +136,8 @@ class WeatherOpeningAlert(hass.Hass):
         for o in self.openings:
             self.listen_state(self._on_change, o["entity_id"])
 
-        self.run_every(self._run_evaluate, "now", 60)
+        # "now" fires at now+interval per AppDaemon's docs, not immediately - "immediate" is the real keyword; see 8666460.
+        self.run_every(self._run_evaluate, "immediate", 60)
         self.run_in(self._run_evaluate, 2)
 
         self.log(
