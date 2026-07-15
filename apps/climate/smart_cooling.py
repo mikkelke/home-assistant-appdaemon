@@ -95,7 +95,11 @@ class SmartCooling(hass.Hass):
         for ent in (self.enable_entity, self.price_entity,
                     self.night_ceiling_entity, self.vent_window, self.ac_removed_entity):
             self.listen_state(self._on_trigger, ent)
-        self.run_every(self._run_eval, "now", self.interval_min * 60)
+        # "now" is documented to mean "first call at now + interval", not immediately - found
+        # 2026-07-15 chasing a stale post-reload status (every deploy left the AC blind for up to
+        # interval_min minutes unless a listened entity happened to change sooner). "immediate" is
+        # AppDaemon's actual keyword for "fire the first call right away".
+        self.run_every(self._run_eval, "immediate", self.interval_min * 60)
         self.log(f"SmartCooling v2 started (dry_run={self.dry_run}, rise_frac={self._rise_frac:.2f}, "
                  f"samples={self._rise_samples})", level="INFO")
 
