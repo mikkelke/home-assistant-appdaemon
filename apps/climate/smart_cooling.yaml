@@ -30,9 +30,15 @@ SmartCooling:
   min_temp: 16.0          # hardware floor; never drive the room below
   sleep_hours: 8.0
 
-  # gentle actuation (low fan = higher COP, quieter, less bathroom back-leak)
+  # actuation. Fan sweep 2026-07-15: fan draw is trivial (44 W even at full) and no fan
+  # mode prevents the intake stall -- medium kept purely for distribution.
   cool_setpoint: 17.0
   cool_fan_mode: medium
+  cool_power_kw: 0.5      # measured engaged average 2026-07-15 (was 0.6 guess); est-cost only
+  # Stall-breaker: idle-with-deficit -> fan_only burp so the intake reads room air,
+  # then cooling restarts hard (parks at ~300 W otherwise, cooling nothing).
+  stall_fanonly_min: 3
+  stall_burp_cooldown_min: 15
   check_interval_min: 15
   min_cycle_min: 10
   status_entity: sensor.smart_cooling_status

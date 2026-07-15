@@ -24,12 +24,16 @@ import smart_cooling as sc  # noqa: E402
 
 def make_app(**overrides):
     """SmartCooling instance without running AppDaemon's initialize() -
-    _attrs() only reads a handful of instance attributes."""
+    the pure helpers only read a handful of instance attributes."""
     app = sc.SmartCooling.__new__(sc.SmartCooling)
     app.min_temp = overrides.get("min_temp", 16.0)
     app._rise_frac = overrides.get("rise_frac", 0.5)
     app._rise_samples = overrides.get("rise_samples", 10)
     app.dry_run = overrides.get("dry_run", False)
+    app.stall_deficit_min = overrides.get("stall_deficit_min", 0.3)
+    app.stall_burp_cooldown_min = overrides.get("stall_burp_cooldown_min", 15)
+    app._burp_until = overrides.get("burp_until", None)
+    app._last_burp = overrides.get("last_burp", None)
     return app
 
 
@@ -123,6 +127,42 @@ class StashLightout(unittest.TestCase):
 
         self.assertEqual(app._lightout["F0"], 21.0)
         self.assertEqual(app._lightout["E"], 25.0)
+
+
+class ShouldBurp(unittest.TestCase):
+    """Stall-breaker decision (2026-07-15): the unit parks at ~300 W 'idle' with real floor
+    deficit left because its intake sensor sits in its own cold outflow. Measured: no fan
+    mode wakes it; a fan_only burp does (44 W spent, 550-800 W of real cooling resumes)."""
+
+    NOW = datetime(2026, 7, 15, 15, 30)
+
+    def test_burps_when_idle_with_deficit(self):
+        app = make_app()
+        self.assertTrue(app._should_burp("idle", "cool", 4.0, self.NOW))
+
+    def test_no_burp_while_actively_cooling(self):
+        app = make_app()
+        self.assertFalse(app._should_burp("cooling", "cool", 4.0, self.NOW))
+
+    def test_no_burp_when_mode_not_cool(self):
+        # fan_only during a burp also reports a non-cooling action; must not re-trigger
+        app = make_app()
+        self.assertFalse(app._should_burp("fan", "fan_only", 4.0, self.NOW))
+        self.assertFalse(app._should_burp("idle", "off", 4.0, self.NOW))
+
+    def test_no_burp_when_target_basically_reached(self):
+        app = make_app()
+        self.assertFalse(app._should_burp("idle", "cool", 0.2, self.NOW))
+
+    def test_cooldown_blocks_backtoback_burps(self):
+        app = make_app(last_burp=datetime(2026, 7, 15, 15, 20))  # 10 min ago < 15 cooldown
+        self.assertFalse(app._should_burp("idle", "cool", 4.0, self.NOW))
+        app2 = make_app(last_burp=datetime(2026, 7, 15, 15, 10))  # 20 min ago -> allowed
+        self.assertTrue(app2._should_burp("idle", "cool", 4.0, self.NOW))
+
+    def test_no_burp_while_one_is_in_flight(self):
+        app = make_app(burp_until=datetime(2026, 7, 15, 15, 32))
+        self.assertFalse(app._should_burp("idle", "cool", 4.0, self.NOW))
 
 
 if __name__ == "__main__":

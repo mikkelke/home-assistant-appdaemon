@@ -21,6 +21,11 @@ either wrong or a chore to keep updated. Two independent things used to share th
     to bound its search - midnight is a deliberate hard cap (user, 2026-07-15): never bank on a
     cheap slot that might not exist by the time anyone's actually asleep (see _next_midnight).
 
+Stall-breaker (2026-07-15): the unit regulates off its own intake sensor, which sits in its cold
+outflow pool -- it parks at ~300 W "idle" with the floor still degrees above target, and no fan
+mode fixes that (low/high/full all measured stalled). When a tick sees idle + real deficit, a
+short fan_only burp lets the intake read true room air and the compressor restarts hard.
+
 Knobs you ever touch: Arm + max night temperature (a default is fine, depth is calculated); AC
 removed. dry_run makes every AC command a no-op. The bathroom (condenser dump, leaky door) is
 watched so we ease off rather than back-leak heat into the bedroom.
@@ -64,10 +69,21 @@ class SmartCooling(hass.Hass):
         self.person_offset = float(a("person_offset", 0.5))      # sleeper lifts the equilibrium a touch
         self.default_rise_frac = float(a("default_rise_frac", 0.7))  # conservative gap-fraction closed in the window
         self.bathroom_max = float(a("bathroom_backleak_c", 30.0))    # ease off above this (condenser back-leak)
-        # --- actuation (GENTLE: low fan = higher COP, quieter, less back-leak; low setpoint so it doesn't idle) ---
+        # --- actuation. Fan draw is trivial (44 W even at full, measured 2026-07-15 sweep;
+        # the compressor is ~500-800 W) and NO fan mode prevents the intake stall below, so
+        # medium is kept purely for air distribution. Low setpoint so it doesn't idle a
+        # degree early. ---
         self.cool_setpoint = float(a("cool_setpoint", 17.0))
         self.cool_fan = a("cool_fan_mode", "medium")
         self.cool_kw = float(a("cool_power_kw", 0.6))   # gentle draw, est-cost only
+        # Stall-breaker: the unit regulates off its own intake sensor, which sits in its
+        # cold outflow pool -- with the floor still far above target it parks itself at
+        # ~300 W "idle", cooling nothing (fan mode can't fix it; measured low/high/full
+        # 2026-07-15). A short fan_only burp lets the intake read true room air, after
+        # which cooling restarts hard (~44 W spent, 550-800 W of real work resumes).
+        self.stall_fanonly_min = int(a("stall_fanonly_min", 3))
+        self.stall_burp_cooldown_min = int(a("stall_burp_cooldown_min", 15))
+        self.stall_deficit_min = float(a("stall_deficit_min", 0.3))
         self.dry_run = bool(a("dry_run", True))
         self.interval_min = int(a("check_interval_min", 15))
         self.min_cycle_min = int(a("min_cycle_min", 10))
@@ -80,6 +96,10 @@ class SmartCooling(hass.Hass):
         self._last_action: Optional[str] = None
         self._master_was_on: Optional[bool] = None   # one-shot AC-off on the on->off flip
         self._last_reason: Optional[str] = None
+        # in-flight stall-burp window + last burp time (in-memory: a reload mid-burp just
+        # means the next tick finds fan_only and sets cool again -- self-healing)
+        self._burp_until: Optional[datetime] = None
+        self._last_burp: Optional[datetime] = None
         # learned warm-up indicator (+ the in-flight coast record)
         self._rise_frac = self.default_rise_frac
         self._rise_samples = 0
@@ -363,7 +383,8 @@ class SmartCooling(hass.Hass):
             self._last_reason = reason
 
         if want:
-            await self._apply_cool(reason, "cooling_dryrun" if self.dry_run else "cooling", attrs)
+            await self._apply_cool(reason, "cooling_dryrun" if self.dry_run else "cooling",
+                                   attrs, deficit, now)
         else:
             await self._ensure_off("waiting" if deficit > 0.05 else "idle", reason, attrs)
 
@@ -384,15 +405,75 @@ class SmartCooling(hass.Hass):
             "price_now": round(price_now, 2), "window_open": window_open,
             "minutes_needed": run_min, "next_start": next_start.strftime("%H:%M") if next_start else None,
             "est_cost_kr": est_cost, "dry_run": self.dry_run,
+            "last_burp": self._last_burp.strftime("%H:%M") if self._last_burp else None,
         }
 
+    # ---------- stall-breaker ----------
+    def _should_burp(self, hvac_action, cur_mode, deficit, now):
+        """True when the unit has parked itself: reports idle while in cool mode with real
+        floor deficit left. Cooldown keeps burps a compressor-friendly distance apart."""
+        if hvac_action != "idle" or cur_mode != "cool":
+            return False
+        if deficit < self.stall_deficit_min:
+            return False
+        if self._burp_until is not None and now < self._burp_until:
+            return False
+        if self._last_burp is not None and \
+                (now - self._last_burp).total_seconds() < self.stall_burp_cooldown_min * 60:
+            return False
+        return True
+
+    async def _start_burp(self, deficit, now):
+        try:
+            await self.call_service("climate/set_hvac_mode",
+                                    entity_id=self.climate_entity, hvac_mode="fan_only")
+        except Exception as e:
+            self.log(f"stall-burp failed to enter fan_only: {e}", level="WARNING")
+            return
+        self._burp_until = now + timedelta(minutes=self.stall_fanonly_min)
+        self._last_burp = now
+        self.log(f"Stall-burp: unit idling with {deficit:.1f}C floor deficit -- fan-only "
+                 f"{self.stall_fanonly_min} min so the intake reads room air, then cool again",
+                 level="INFO")
+        self.run_in(self._end_burp, self.stall_fanonly_min * 60)
+
+    def _end_burp(self, kwargs):
+        self.create_task(self._end_burp_async())
+
+    async def _end_burp_async(self):
+        self._burp_until = None
+        if (await self._state(self.enable_entity)) != "on":
+            return   # disarmed mid-burp -- hands off
+        if (await self._state(self.climate_entity)) != "fan_only":
+            return   # someone/something else changed mode -- don't fight it
+        try:
+            await self.call_service("climate/set_hvac_mode",
+                                    entity_id=self.climate_entity, hvac_mode="cool")
+            await self.call_service("climate/set_temperature",
+                                    entity_id=self.climate_entity, temperature=self.cool_setpoint)
+            self.log("Stall-burp done -- cooling resumed", level="INFO")
+        except Exception as e:
+            self.log(f"stall-burp failed to resume cool: {e}", level="ERROR")
+
     # ---------- actuation (gentle; respects dry_run + anti-short-cycle) ----------
-    async def _apply_cool(self, reason, status, attrs):
+    async def _apply_cool(self, reason, status, attrs, deficit, now):
+        cur_mode = await self._state(self.climate_entity)
+        if not self.dry_run:
+            if self._burp_until is not None and now < self._burp_until:
+                await self._publish("burping", "Stall-burp in progress -- fan-only so the "
+                                    "intake reads room air, cooling resumes in a moment", attrs)
+                return
+            action = await self._attr(self.climate_entity, "hvac_action", None)
+            if self._should_burp(action, cur_mode, deficit, now):
+                await self._start_burp(deficit, now)
+                await self._publish("burping", f"Stall-burp: idling with {deficit:.1f}C to go "
+                                    f"-- fan-only {self.stall_fanonly_min} min to wake the "
+                                    f"compressor", attrs)
+                return
         await self._publish(status, reason, attrs)
         if self.dry_run:
             self.log(f"DRY-RUN would COOL ({self.cool_setpoint}C/{self.cool_fan}): {reason}")
             return
-        cur_mode = await self._state(self.climate_entity)
         need_mode = cur_mode != "cool"
         if need_mode and not self._can_switch(True):
             return
@@ -414,6 +495,7 @@ class SmartCooling(hass.Hass):
             self.log(f"Failed to start cooling: {e}", level="ERROR")
 
     async def _ensure_off(self, status, reason, attrs):
+        self._burp_until = None   # plan flipped to off mid-burp: the burp is moot
         await self._publish(status, reason, attrs)
         cur_mode = await self._state(self.climate_entity)
         already_off = cur_mode in (None, "off", "unavailable", "unknown")
