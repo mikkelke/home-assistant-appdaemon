@@ -468,6 +468,9 @@ class SmartCooling(hass.Hass):
             # dry_run/floor_limited vanish from this entity whenever they're False. No supported
             # AppDaemon API bypasses this and a value-mangling wrapper would be a hack, so this
             # is left as a known framework limitation -- do not chase it here.
+            # Fixed upstream by PR #2594 (merged to AppDaemon dev 2026-05-13): POST bodies now go
+            # raw, query-param cleaning got its own identity-checking helper. No release carries
+            # it yet (latest 4.5.13) -- these comments self-obsolete on the first upgrade past that.
             await self.set_state(self.status_entity, state=status, attributes=a, replace=True)
         except Exception as e:
             self.log(f"publish failed: {e}", level="WARNING")
