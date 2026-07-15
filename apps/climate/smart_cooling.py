@@ -308,7 +308,8 @@ class SmartCooling(hass.Hass):
                 "done_for_tonight",
                 "Past bedtime -- AC off. Move the unit to the bathroom and seal the bedroom.",
                 self._attrs(floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
-                            ceiling, price_now, window_open, bedtime, 0, None, 0.0, floor_limited),
+                            ceiling, price_now, window_open, bedtime, 0, None, 0.0, floor_limited,
+                            ceiling_base),
                 notify_bedtime=True, bedtime=bedtime,
             )
             return
@@ -338,7 +339,8 @@ class SmartCooling(hass.Hass):
                                    f"(floor {floor:.1f}->{target:.1f}C)")
 
         attrs = self._attrs(floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
-                            ceiling, price_now, window_open, bedtime, run_min, next_start, est_cost, floor_limited)
+                            ceiling, price_now, window_open, bedtime, run_min, next_start, est_cost, floor_limited,
+                            ceiling_base)
 
         if reason != self._last_reason:
             self.log(f"PLAN {reason}", level="INFO")
@@ -350,7 +352,8 @@ class SmartCooling(hass.Hass):
             await self._ensure_off("waiting" if deficit > 0.05 else "idle", reason, attrs)
 
     def _attrs(self, floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
-               ceiling, price_now, window_open, bedtime, run_min, next_start, est_cost, floor_limited):
+               ceiling, price_now, window_open, bedtime, run_min, next_start, est_cost, floor_limited,
+               ceiling_base):
         def r1(v):
             return round(v, 1) if v is not None else None
         return {
