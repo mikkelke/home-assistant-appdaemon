@@ -34,6 +34,16 @@ def make_app(**overrides):
     app.stall_burp_cooldown_min = overrides.get("stall_burp_cooldown_min", 15)
     app._burp_until = overrides.get("burp_until", None)
     app._last_burp = overrides.get("last_burp", None)
+    app.sat_engaged_min = overrides.get("sat_engaged_min", 90)
+    app.sat_reset_rise = overrides.get("sat_reset_rise", 0.5)
+    app.feasible_min_samples = overrides.get("feasible_min_samples", 2)
+    app._sat_min = overrides.get("sat_min", None)
+    app._sat_noprog_min = 0.0
+    app._saturated = False
+    app._feasible_floor = overrides.get("feasible_floor", None)
+    app._feasible_samples = overrides.get("feasible_samples", 0)
+    app._save_state = lambda: None
+    app.log = lambda *a, **k: None
     return app
 
 
@@ -163,6 +173,51 @@ class ShouldBurp(unittest.TestCase):
     def test_no_burp_while_one_is_in_flight(self):
         app = make_app(burp_until=datetime(2026, 7, 15, 15, 32))
         self.assertFalse(app._should_burp("idle", "cool", 4.0, self.NOW))
+
+
+class TrackProgress(unittest.TestCase):
+    """Feasibility detector (user, 2026-07-15): sustained engaged minutes with zero floor
+    progress = the floor won't take more cold tonight. Without this, an unreachable ideal
+    target inflates minutes_needed until the scheduler goes time-constrained and pays
+    evening-peak prices chasing it."""
+
+    def test_progress_resets_the_clock(self):
+        app = make_app()
+        app._track_progress(20.0, 0)
+        app._track_progress(20.0, 60)             # close to threshold...
+        self.assertFalse(app._track_progress(19.8, 45))  # ...but the floor moved: reset
+        self.assertEqual(app._sat_noprog_min, 0.0)
+        self.assertEqual(app._sat_min, 19.8)
+
+    def test_saturates_after_engaged_minutes_without_progress(self):
+        app = make_app()
+        app._track_progress(20.0, 0)
+        self.assertFalse(app._track_progress(20.0, 45))
+        self.assertTrue(app._track_progress(20.1, 45))   # 90 engaged min, no new low
+        self.assertEqual(app._feasible_floor, 20.0)
+        self.assertEqual(app._feasible_samples, 1)
+
+    def test_coast_time_is_not_evidence(self):
+        # AC held off between cheap slots for hours: engaged=0 must never saturate
+        app = make_app()
+        app._track_progress(20.0, 0)
+        for _ in range(20):
+            self.assertFalse(app._track_progress(20.2, 0))
+
+    def test_warming_well_past_the_low_resets(self):
+        app = make_app()
+        app._track_progress(20.0, 0)
+        app._track_progress(20.0, 80)
+        self.assertFalse(app._track_progress(20.6, 15))  # rose > sat_reset_rise: new situation
+        self.assertEqual(app._sat_min, 20.6)
+        self.assertEqual(app._sat_noprog_min, 0.0)
+
+    def test_learned_feasible_blends_across_nights(self):
+        app = make_app(feasible_floor=19.0, feasible_samples=1)
+        app._sat_noprog_min = 90.0
+        app._learn_feasible(20.0)
+        self.assertEqual(app._feasible_samples, 2)
+        self.assertAlmostEqual(app._feasible_floor, 19.5, places=2)  # w=1/2 EMA
 
 
 if __name__ == "__main__":

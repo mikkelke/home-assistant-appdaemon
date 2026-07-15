@@ -26,6 +26,13 @@ outflow pool -- it parks at ~300 W "idle" with the floor still degrees above tar
 mode fixes that (low/high/full all measured stalled). When a tick sees idle + real deficit, a
 short fan_only burp lets the intake read true room air and the compressor restarts hard.
 
+Feasibility cap (2026-07-15): the ideal target can sit below what the unit + apartment heat can
+physically deliver; an unclosable deficit would inflate minutes_needed until the scheduler goes
+time-constrained and grinds 600 W through the evening price peak chasing the impossible (user:
+"don't we lose some of what we wanted to accomplish?"). Sustained engaged time with zero floor
+progress = tonight's feasible floor: stop paying, learn it (EMA across nights), and plan future
+nights against the feasible depth -- probed slightly deeper so milder nights can re-teach us.
+
 Knobs you ever touch: Arm + max night temperature (a default is fine, depth is calculated); AC
 removed. dry_run makes every AC command a no-op. The bathroom (condenser dump, leaky door) is
 watched so we ease off rather than back-leak heat into the bedroom.
@@ -100,10 +107,29 @@ class SmartCooling(hass.Hass):
         # means the next tick finds fan_only and sets cool again -- self-healing)
         self._burp_until: Optional[datetime] = None
         self._last_burp: Optional[datetime] = None
-        # learned warm-up indicator (+ the in-flight coast record)
+        # --- feasibility (user, 2026-07-15: "we might have a limit on how low the cooling
+        # can feasibly get... if we keep doing 600+W in the expensive hours don't we lose
+        # some of what we wanted?"). The ideal target can sit below what the unit + the
+        # apartment's heat can physically deliver; without a cap the unclosable deficit
+        # inflates minutes_needed until the scheduler goes time-constrained and grinds
+        # through the evening price peak chasing the impossible. Detection is closed-loop
+        # like everything else: sat_engaged_min minutes of wanting-to-cool with zero floor
+        # progress = tonight's feasible floor. Learned across nights (EMA) so tomorrow's
+        # plan never over-promises in the first place. Code defaults only -- not knobs.
+        self.sat_engaged_min = float(a("sat_engaged_min", 90))    # floor sensor reports ~hourly
+        self.sat_reset_rise = float(a("sat_reset_rise", 0.5))     # warmed this much above the low -> new situation
+        self.feasible_min_samples = int(a("feasible_min_samples", 2))
+        self._sat_min: Optional[float] = None      # session floor minimum while pursuing
+        self._sat_noprog_min = 0.0                 # engaged minutes without a new minimum
+        self._saturated = False
+        self._last_want = False                    # was the previous eval trying to cool?
+        self._last_eval_at: Optional[datetime] = None
+        # learned warm-up indicator (+ the in-flight coast record) + learned feasible floor
         self._rise_frac = self.default_rise_frac
         self._rise_samples = 0
         self._lightout: Optional[dict] = None
+        self._feasible_floor: Optional[float] = None
+        self._feasible_samples = 0
         self._load_state()
 
         self.mobile_notifier = None
@@ -180,6 +206,9 @@ class SmartCooling(hass.Hass):
             self._rise_frac = float(d.get("rise_frac", self._rise_frac))
             self._rise_samples = int(d.get("rise_samples", 0))
             self._lightout = d.get("lightout")
+            ff = d.get("feasible_floor")
+            self._feasible_floor = float(ff) if ff is not None else None
+            self._feasible_samples = int(d.get("feasible_samples", 0))
         except Exception:
             pass
 
@@ -187,7 +216,9 @@ class SmartCooling(hass.Hass):
         try:
             with open(self.state_file, "w") as f:
                 json.dump({"rise_frac": self._rise_frac, "rise_samples": self._rise_samples,
-                           "lightout": self._lightout}, f)
+                           "lightout": self._lightout,
+                           "feasible_floor": self._feasible_floor,
+                           "feasible_samples": self._feasible_samples}, f)
         except Exception as e:
             self.log(f"state save failed ({e}) -- continuing in-memory", level="WARNING")
 
@@ -257,6 +288,49 @@ class SmartCooling(hass.Hass):
                      f"rise_frac now {self._rise_frac:.2f} (n={self._rise_samples})", level="INFO")
         self._save_state()
 
+    # ---------- feasibility (how low can the floor actually go) ----------
+    def _track_progress(self, floor, engaged_min):
+        """Feed each evaluation's floor reading + how many minutes we've been TRYING to
+        cool since the previous one (0 when holding/off -- coast time is not evidence).
+        Saturated = sat_engaged_min engaged minutes without a new floor minimum: the
+        floor has stopped taking cold at this depth tonight."""
+        if self._sat_min is None:
+            self._sat_min = floor
+            self._sat_noprog_min = 0.0
+            return False
+        if floor < self._sat_min - 0.05:          # real progress -> reset the clock
+            self._sat_min = floor
+            self._sat_noprog_min = 0.0
+            self._saturated = False
+            return False
+        if floor > self._sat_min + self.sat_reset_rise:
+            # warmed well above the low point (evening drift, door opened) -> new
+            # situation; topping back DOWN to the known-feasible depth is worthwhile
+            # and the scheduler will place it in the cheapest remaining slots.
+            self._sat_min = floor
+            self._sat_noprog_min = 0.0
+            self._saturated = False
+            return False
+        self._sat_noprog_min += max(0.0, engaged_min)
+        if not self._saturated and self._sat_noprog_min >= self.sat_engaged_min:
+            self._saturated = True
+            self._learn_feasible(self._sat_min)
+        return self._saturated
+
+    def _learn_feasible(self, floor_min):
+        """EMA the observed can't-go-lower floor across nights, so future plans stop
+        promising (and pricing) depth the unit can't deliver."""
+        n = self._feasible_samples
+        w = 1.0 / min(6, n + 1)
+        self._feasible_floor = round(
+            floor_min if self._feasible_floor is None
+            else (1 - w) * self._feasible_floor + w * floor_min, 2)
+        self._feasible_samples = n + 1
+        self._save_state()
+        self.log(f"Feasible floor tonight: {floor_min:.1f}C after {self._sat_noprog_min:.0f} "
+                 f"engaged min without progress; learned limit now {self._feasible_floor:.1f}C "
+                 f"(n={self._feasible_samples})", level="INFO")
+
     def _stash_lightout(self, floor, E, now):
         """Record the true lights-out baseline (F0, E) the moment the user confirms AC removed -
         replaces the old bedtime-time-window guess (user, 2026-07-15: a fixed clock time is
@@ -282,6 +356,7 @@ class SmartCooling(hass.Hass):
 
         if not master_on:
             # OFF = HANDS OFF. Turn the AC off ONCE on the on->off flip, then never command it again.
+            self._mark_eval(now, False)
             if self._master_was_on:
                 await self._ensure_off("off", "Disarmed -- AC turned off, now hands-off", {"deployed": deployed})
             else:
@@ -290,11 +365,13 @@ class SmartCooling(hass.Hass):
             return
         self._master_was_on = True
         if not deployed:
+            self._mark_eval(now, False)
             await self._publish("unit_stored", "AC not deployed (climate unavailable)", {})
             return
 
         floor = await self._num(self.floor_sensor, None)
         if floor is None:
+            self._mark_eval(now, False)
             await self._publish("no_data", "Missing bedroom floor temperature", {})
             return
         mid = await self._num(self.mid_sensor, floor)
@@ -330,12 +407,31 @@ class SmartCooling(hass.Hass):
         target = self._calc_target(E, ceiling)
         deficit = floor - target
         floor_limited = target <= self.min_temp + 0.05  # hot night: cooling as deep as the unit allows
-        minutes_needed = max(0.0, deficit) / self.floor_cool_cph * 60.0
+
+        # Feasibility cap: schedule (and pay) only for depth the floor will actually take.
+        # `target` stays the IDEAL for display/learning; `reach_target` is what we pursue.
+        # Tonight's live evidence (saturated at _sat_min) beats the cross-night learned
+        # limit; the learned limit is probed 0.3C deep so a milder night can beat it and
+        # re-teach us, instead of the clamp becoming self-fulfilling.
+        engaged = 0.0
+        if self._last_want and self._last_eval_at is not None:
+            engaged = min((now - self._last_eval_at).total_seconds() / 60.0,
+                          self.interval_min * 1.5)
+        saturated = self._track_progress(floor, engaged)
+        reach_target = target
+        if saturated and self._sat_min is not None:
+            reach_target = max(reach_target, self._sat_min)
+        elif (self._feasible_floor is not None
+              and self._feasible_samples >= self.feasible_min_samples):
+            reach_target = max(reach_target, self._feasible_floor - 0.3)
+        reach_deficit = floor - reach_target
+        minutes_needed = max(0.0, reach_deficit) / self.floor_cool_cph * 60.0
 
         # user says they're removing the AC now -> this IS lights-out: stash the coast baseline,
         # then done for the night, then reset the toggle so it's a one-shot trigger, not a switch
         # someone has to remember to flip back.
         if (await self._state(self.ac_removed_entity)) == "on":
+            self._mark_eval(now, False)
             self._stash_lightout(floor, E, now)
             await self._ensure_off(
                 "done_for_tonight",
@@ -360,23 +456,33 @@ class SmartCooling(hass.Hass):
             want, reason = False, f"Floor at min ({floor:.1f}<= {self.min_temp:.1f}) -- holding"
         elif deficit <= 0.05:
             want, reason = False, f"On track: floor {floor:.1f}C <= target {target:.1f}C (zone {zone:.1f}, cap {ceiling:.0f})"
+        elif reach_deficit <= 0.05:
+            lim = self._sat_min if saturated else self._feasible_floor
+            want, reason = False, (f"As cold as it feasibly gets: floor {floor:.1f}C, ideal "
+                                   f"{target:.1f}C, but the floor stops taking cold around "
+                                   f"{lim:.1f}C -- holding rather than paying for cooling it "
+                                   f"won't absorb")
         elif not window_open:
             want, reason = False, "Bathroom window closed -- open it so the condenser can vent"
         elif backleak and not time_constrained:
             want, reason = False, f"Easing off: bathroom {bath:.1f}C would back-leak -- letting it vent"
         elif cool_now:
             want = True
-            reason = (f"Pre-cool floor {floor:.1f}->{target:.1f}C (keep zone <= {ceiling:.0f} for "
+            reason = (f"Pre-cool floor {floor:.1f}->{reach_target:.1f}C (keep zone <= {ceiling:.0f} for "
                       f"{self.sleep_hours:.0f}h): ~{run_min} min in the cheapest hours, ~{est_cost:.1f} kr, "
-                      f"price {price_now:.2f}" + ("  [floor-limited: hottest it can do]" if floor_limited else ""))
+                      f"price {price_now:.2f}"
+                      + ("  [floor-limited: hottest it can do]" if floor_limited else "")
+                      + (f"  [capped by feasible ~{reach_target:.1f}C, ideal {target:.1f}C]"
+                         if reach_target > target + 0.05 else ""))
         else:
             nx = next_start.strftime("%H:%M") if next_start else "later"
             want, reason = False, (f"Hold for cheaper power: need ~{run_min} min, start ~{nx} "
-                                   f"(floor {floor:.1f}->{target:.1f}C)")
+                                   f"(floor {floor:.1f}->{reach_target:.1f}C)")
 
+        self._mark_eval(now, want)
         attrs = self._attrs(floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
                             ceiling, price_now, window_open, run_min, next_start, est_cost, floor_limited,
-                            ceiling_base)
+                            ceiling_base, reach_target=reach_target)
 
         if reason != self._last_reason:
             self.log(f"PLAN {reason}", level="INFO")
@@ -384,13 +490,19 @@ class SmartCooling(hass.Hass):
 
         if want:
             await self._apply_cool(reason, "cooling_dryrun" if self.dry_run else "cooling",
-                                   attrs, deficit, now)
+                                   attrs, reach_deficit, now)
         else:
-            await self._ensure_off("waiting" if deficit > 0.05 else "idle", reason, attrs)
+            await self._ensure_off("waiting" if reach_deficit > 0.05 else "idle", reason, attrs)
+
+    def _mark_eval(self, now, want):
+        """Bookkeeping for the feasibility tracker: engaged time only accrues between
+        evaluations where we actually wanted to cool."""
+        self._last_eval_at = now
+        self._last_want = want
 
     def _attrs(self, floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
                ceiling, price_now, window_open, run_min, next_start, est_cost, floor_limited,
-               ceiling_base):
+               ceiling_base, reach_target=None):
         def r1(v):
             return round(v, 1) if v is not None else None
         return {
@@ -398,6 +510,9 @@ class SmartCooling(hass.Hass):
             "ceiling_delivery": r1(ceil_s), "ac_output": r1(ac_s),
             "bathroom": r1(bath), "kitchen": r1(kitchen),
             "equilibrium_est": r1(E), "floor_target": r1(target), "deficit": round(max(0.0, deficit), 1),
+            "floor_target_feasible": r1(reach_target if reach_target is not None else target),
+            "saturated": self._saturated, "feasible_floor": r1(self._feasible_floor),
+            "floor_low_tonight": r1(self._sat_min),
             "floor_limited": floor_limited, "night_ceiling": r1(ceiling),
             "ceiling_base": r1(ceiling_base), "ceiling_source": ("comfort layer" if ceiling < ceiling_base else "knob"),
             "min_temp": r1(self.min_temp),
