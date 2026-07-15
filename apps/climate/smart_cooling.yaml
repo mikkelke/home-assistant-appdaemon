@@ -1,5 +1,7 @@
 # Smart Cooling v2 -- closed-loop pre-cool for the bedroom AC.
-# Knobs you ever touch: input_boolean.smart_cooling (Arm) + input_datetime.smart_cooling_bedtime.
+# Knobs you ever touch: input_boolean.smart_cooling (Arm) + input_boolean.smart_cooling_ac_removed
+# (click right before taking the unit out - whatever the clock says). No bedtime knob (removed
+# 2026-07-15): the price-optimizer's search deadline is a fixed midnight hard cap instead.
 # Optional default: input_number.smart_cooling_night_ceiling (23C). Depth is calculated, not set.
 # dry_run: true -> it runs, learns and publishes the plan, but every AC command is a no-op.
 
@@ -19,13 +21,11 @@ SmartCooling:
   vent_window_sensor: binary_sensor.bathroom_window_contact
   price_entity: sensor.energi_data_service
   enable_entity: input_boolean.smart_cooling
-  bedtime_entity: input_datetime.smart_cooling_bedtime
   night_ceiling_entity: input_number.smart_cooling_night_ceiling
   # Click before physically removing the AC (bedtime varies 22:00-01:00, user 2026-07-15) -
-  # replaces the old fixed-clock "past bedtime -> off" cutoff. Auto-resets after firing.
+  # this IS lights-out, whatever the clock says. Auto-resets after firing.
   ac_removed_entity: input_boolean.smart_cooling_ac_removed
 
-  default_bedtime: "23:00"
   default_night_ceiling: 23.0
   min_temp: 16.0          # hardware floor; never drive the room below
   sleep_hours: 8.0

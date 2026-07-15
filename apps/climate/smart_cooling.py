@@ -2,9 +2,9 @@
 Smart Cooling v2 -- closed-loop pre-cool for the bedroom PortaSplit AC.
 
 Opt-in: Arm = input_boolean.smart_cooling, and the unit must be deployed (climate available).
-The job: gently pre-cool the FURNITURE/floor "battery" before bedtime, in the cheapest hours,
-deep enough that the sealed room (AC removed) coasts with the floor-to-mid SLEEPING ZONE
-<= the ceiling (default 23C) for ~8 h.
+The job: gently pre-cool the FURNITURE/floor "battery" in the cheapest hours, deep enough that
+the sealed room (AC removed) coasts with the floor-to-mid SLEEPING ZONE <= the max temperature
+(default 23C) for ~8 h.
 
 Closed-loop, not predictive: the FLOOR sensor is the feedback. Each tick it compares the floor to a
 CALCULATED target (no knob) and schedules the remaining cooling into the cheapest hours, re-deciding
@@ -12,8 +12,17 @@ every tick so drift self-corrects. The target comes from a self-learning warm-up
 sealed sleep window IS an 8 h AC-off coast, so we learn "from floor F0 the zone closed fraction r of
 the gap to its equilibrium" and invert it.
 
-Knobs you ever touch: Arm + Bedtime. Ceiling defaults to 23C; depth is calculated. Master OFF =
-hands-off. dry_run makes every AC command a no-op. The bathroom (condenser dump, leaky door) is
+No bedtime knob (user, 2026-07-15): real bedtime varies 22:00-01:00, so a fixed clock setting was
+either wrong or a chore to keep updated. Two independent things used to share that one knob:
+  - WHEN TO STOP: the user clicks ac_removed_entity right before physically taking the unit out -
+    that IS lights-out, whatever the clock says, and also stamps the coast-learning baseline
+    (see _stash_lightout). No more forced cutoff at a stale clock time.
+  - HOW FAR AHEAD TO SHOP FOR CHEAP POWER: the price-optimizer needs SOME horizon or it has nothing
+    to bound its search - midnight is a deliberate hard cap (user, 2026-07-15): never bank on a
+    cheap slot that might not exist by the time anyone's actually asleep (see _next_midnight).
+
+Knobs you ever touch: Arm + max night temperature (a default is fine, depth is calculated); AC
+removed. dry_run makes every AC command a no-op. The bathroom (condenser dump, leaky door) is
 watched so we ease off rather than back-leak heat into the bedroom.
 """
 
@@ -38,19 +47,15 @@ class SmartCooling(hass.Hass):
         self.vent_window = a("vent_window_sensor", "binary_sensor.bathroom_window_contact")
         self.price_entity = a("price_entity", "sensor.energi_data_service")
         self.enable_entity = a("enable_entity", "input_boolean.smart_cooling")
-        # --- the only user knobs: Arm (above) + Bedtime; ceiling is an optional default ---
-        self.bedtime_entity = a("bedtime_entity", "input_datetime.smart_cooling_bedtime")
-        # Real bedtime varies night to night (22:00-01:00, user 2026-07-15) - the OLD
-        # "now >= bedtime -> force off" branch fired on the clock regardless of whether
-        # anyone was actually going to bed. bedtime now ONLY sizes the price-optimizer's
-        # search window (_schedule); the actual off+seal action is user-triggered here.
+        # --- the only user knobs: Arm (above) + AC removed; max temperature is an optional default ---
+        # Click right before physically removing the AC - the true lights-out moment, whatever
+        # the clock says. Replaces the old fixed-clock bedtime cutoff entirely (see module docstring).
         self.ac_removed_entity = a("ac_removed_entity", "input_boolean.smart_cooling_ac_removed")
         self.night_ceiling_entity = a("night_ceiling_entity", "input_number.smart_cooling_night_ceiling")
         # Humidity-aware ceiling from the comfort middle layer (sensor.bedroom_comfort).
         self.comfort_entity = a("comfort_entity", "sensor.bedroom_comfort")
         self.comfort_max_reduction = float(a("comfort_max_reduction", 1.5))
         # --- fixed params (not user-facing) ---
-        self.default_bedtime = str(a("default_bedtime", "23:00"))
         self.default_ceiling = float(a("default_night_ceiling", 23.0))
         self.min_temp = float(a("min_temp", 16.0))            # hardware floor; never drive below
         self.sleep_hours = float(a("sleep_hours", 8.0))
@@ -74,7 +79,6 @@ class SmartCooling(hass.Hass):
         self._last_switch: Optional[datetime] = None
         self._last_action: Optional[str] = None
         self._master_was_on: Optional[bool] = None   # one-shot AC-off on the on->off flip
-        self._notified_bedtime_for: Optional[str] = None
         self._last_reason: Optional[str] = None
         # learned warm-up indicator (+ the in-flight coast record)
         self._rise_frac = self.default_rise_frac
@@ -88,7 +92,7 @@ class SmartCooling(hass.Hass):
         except Exception as e:
             self.log(f"MobileNotifier not available: {e}", level="WARNING")
 
-        for ent in (self.enable_entity, self.price_entity, self.bedtime_entity,
+        for ent in (self.enable_entity, self.price_entity,
                     self.night_ceiling_entity, self.vent_window, self.ac_removed_entity):
             self.listen_state(self._on_trigger, ent)
         self.run_every(self._run_eval, "now", self.interval_min * 60)
@@ -122,15 +126,11 @@ class SmartCooling(hass.Hass):
         except Exception:
             return default
 
-    async def _bedtime_dt(self, now):
-        s = await self._state(self.bedtime_entity)
-        hhmm = str(s) if s and ":" in str(s) else self.default_bedtime
-        try:
-            p = hhmm.split(":")
-            h, m = int(p[0]), int(p[1])
-        except (ValueError, IndexError):
-            h, m = 23, 0
-        return now.replace(hour=h, minute=m, second=0, microsecond=0)
+    def _next_midnight(self, now):
+        """The price-optimizer's hard search cap (user, 2026-07-15): never plan on a cheap slot
+        past midnight, since bedtime itself varies and might arrive before that slot would. Always
+        strictly in the future, even if `now` is already past today's midnight."""
+        return datetime(now.year, now.month, now.day) + timedelta(days=1)
 
     def _build_price_map(self, *arrays):
         pm = {}
@@ -186,11 +186,11 @@ class SmartCooling(hass.Hass):
         f0 = (cap - E * r) / (1.0 - r)
         return max(self.min_temp, min(ceiling, round(f0, 2)))
 
-    def _schedule(self, now, bedtime, minutes_needed, price_at):
-        """Reserve the cheapest `minutes_needed` of 15-min slots between now and bedtime. Cool NOW if
-        the current slot is one of them, or if there isn't time left to wait. Returns
-        (cool_now, next_start, run_min, est_cost)."""
-        total = int((bedtime - now).total_seconds() // 900)
+    def _schedule(self, now, deadline, minutes_needed, price_at):
+        """Reserve the cheapest `minutes_needed` of 15-min slots between now and deadline (midnight -
+        see _next_midnight). Cool NOW if the current slot is one of them, or if there isn't time left
+        to wait. Returns (cool_now, next_start, run_min, est_cost)."""
+        total = int((deadline - now).total_seconds() // 900)
         if total <= 0 or minutes_needed <= 0:
             return False, None, 0, 0.0
         need = min(total, int((minutes_needed + 14.999) // 15))
@@ -203,48 +203,49 @@ class SmartCooling(hass.Hass):
         return cool_now, next_start, need * 15, round(est, 2)
 
     async def _learn(self, now):
-        """Runs every tick (any arm/deploy state, read-only): stash the floor at bedtime, then learn
-        the gap-fraction the zone closed once the 8 h sealed window finishes."""
+        """Runs every tick (any arm/deploy state, read-only): once a stashed lights-out window
+        (see _stash_lightout) finishes, learn the gap-fraction the zone closed over it."""
         floor = await self._num(self.floor_sensor, None)
         if floor is None:
             return
         lo = self._lightout
-        # record a finished window
-        if lo:
-            try:
-                ended = now >= datetime.fromisoformat(lo["end"])
-            except Exception:
-                self._lightout = None
-                self._save_state()
-                return
-            if ended:
-                F0, E = lo["F0"], lo["E"]
-                rise, gap = floor - F0, E - F0
-                self._lightout = None
-                if gap > 0.5 and rise > 0:
-                    r_obs = max(0.05, min(0.98, rise / gap))
-                    n = self._rise_samples
-                    w = 1.0 / min(8, n + 1)   # EMA, faster while young
-                    self._rise_frac = (1 - w) * self._rise_frac + w * r_obs
-                    self._rise_samples = n + 1
-                    self.log(f"Learned coast {lo['date']}: floor {F0:.1f}->{floor:.1f} "
-                             f"(rose {rise:.1f} of {gap:.1f} gap) r={r_obs:.2f}; "
-                             f"rise_frac now {self._rise_frac:.2f} (n={self._rise_samples})", level="INFO")
-                self._save_state()
-                lo = None
-        # stash a fresh lights-out at bedtime
-        bedtime = await self._bedtime_dt(now)
-        today = now.strftime("%Y-%m-%d")
-        if (not lo or lo.get("date") != today) and bedtime <= now < bedtime + timedelta(minutes=20):
-            mid = await self._num(self.mid_sensor, floor)
-            kitchen = await self._num(self.kitchen_sensor, None)
-            E = self._equilibrium(kitchen, mid, floor)
-            self._lightout = {"date": today, "F0": round(floor, 2), "E": round(E, 2),
-                              "end": (bedtime + timedelta(hours=self.sleep_hours)).isoformat()}
+        if not lo:
+            return
+        try:
+            ended = now >= datetime.fromisoformat(lo["end"])
+        except Exception:
+            self._lightout = None
             self._save_state()
-            self.log(f"Lights-out {today}: floor {floor:.1f}C, equilibrium {E:.1f}C "
-                     f"-> learning the rise at {(bedtime + timedelta(hours=self.sleep_hours)).strftime('%H:%M')}",
-                     level="INFO")
+            return
+        if not ended:
+            return
+        F0, E = lo["F0"], lo["E"]
+        rise, gap = floor - F0, E - F0
+        self._lightout = None
+        if gap > 0.5 and rise > 0:
+            r_obs = max(0.05, min(0.98, rise / gap))
+            n = self._rise_samples
+            w = 1.0 / min(8, n + 1)   # EMA, faster while young
+            self._rise_frac = (1 - w) * self._rise_frac + w * r_obs
+            self._rise_samples = n + 1
+            self.log(f"Learned coast {lo['date']}: floor {F0:.1f}->{floor:.1f} "
+                     f"(rose {rise:.1f} of {gap:.1f} gap) r={r_obs:.2f}; "
+                     f"rise_frac now {self._rise_frac:.2f} (n={self._rise_samples})", level="INFO")
+        self._save_state()
+
+    def _stash_lightout(self, floor, E, now):
+        """Record the true lights-out baseline (F0, E) the moment the user confirms AC removed -
+        replaces the old bedtime-time-window guess (user, 2026-07-15: a fixed clock time is
+        sometimes hours off from when they actually go to bed, which corrupted the learned rise_frac
+        by measuring the coast from the wrong starting point). Overwrites any stale in-flight
+        record - the latest press is always the truest lights-out moment."""
+        today = now.strftime("%Y-%m-%d")
+        end = now + timedelta(hours=self.sleep_hours)
+        self._lightout = {"date": today, "F0": round(floor, 2), "E": round(E, 2),
+                          "end": end.isoformat()}
+        self._save_state()
+        self.log(f"Lights-out {today}: floor {floor:.1f}C, equilibrium {E:.1f}C "
+                 f"-> learning the rise at {end.strftime('%H:%M')}", level="INFO")
 
     # ---------- main ----------
     async def _evaluate(self):
@@ -290,7 +291,7 @@ class SmartCooling(hass.Hass):
                               max(float(ce), ceiling_base - self.comfort_max_reduction, self.min_temp))
         except (TypeError, ValueError):
             pass
-        bedtime = await self._bedtime_dt(now)
+        deadline = self._next_midnight(now)
 
         pm = self._build_price_map(
             await self._attr(self.price_entity, "raw_today", []),
@@ -307,14 +308,16 @@ class SmartCooling(hass.Hass):
         floor_limited = target <= self.min_temp + 0.05  # hot night: cooling as deep as the unit allows
         minutes_needed = max(0.0, deficit) / self.floor_cool_cph * 60.0
 
-        # user says they're removing the AC now -> done for the night, then reset the
-        # toggle so it's a one-shot trigger, not a switch someone has to remember to flip back.
+        # user says they're removing the AC now -> this IS lights-out: stash the coast baseline,
+        # then done for the night, then reset the toggle so it's a one-shot trigger, not a switch
+        # someone has to remember to flip back.
         if (await self._state(self.ac_removed_entity)) == "on":
+            self._stash_lightout(floor, E, now)
             await self._ensure_off(
                 "done_for_tonight",
                 "AC removed -- sealing the bedroom for the night.",
                 self._attrs(floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
-                            ceiling, price_now, window_open, bedtime, 0, None, 0.0, floor_limited,
+                            ceiling, price_now, window_open, 0, None, 0.0, floor_limited,
                             ceiling_base),
             )
             try:
@@ -323,8 +326,8 @@ class SmartCooling(hass.Hass):
                 self.log(f"failed to reset ac_removed toggle: {e}", level="WARNING")
             return
 
-        cool_now, next_start, run_min, est_cost = self._schedule(now, bedtime, minutes_needed, price_at)
-        slots_left = int((bedtime - now).total_seconds() // 900)
+        cool_now, next_start, run_min, est_cost = self._schedule(now, deadline, minutes_needed, price_at)
+        slots_left = int((deadline - now).total_seconds() // 900)
         time_constrained = run_min >= max(1, slots_left) * 15
         backleak = bath is not None and bath >= self.bathroom_max
 
@@ -348,7 +351,7 @@ class SmartCooling(hass.Hass):
                                    f"(floor {floor:.1f}->{target:.1f}C)")
 
         attrs = self._attrs(floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
-                            ceiling, price_now, window_open, bedtime, run_min, next_start, est_cost, floor_limited,
+                            ceiling, price_now, window_open, run_min, next_start, est_cost, floor_limited,
                             ceiling_base)
 
         if reason != self._last_reason:
@@ -361,7 +364,7 @@ class SmartCooling(hass.Hass):
             await self._ensure_off("waiting" if deficit > 0.05 else "idle", reason, attrs)
 
     def _attrs(self, floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
-               ceiling, price_now, window_open, bedtime, run_min, next_start, est_cost, floor_limited,
+               ceiling, price_now, window_open, run_min, next_start, est_cost, floor_limited,
                ceiling_base):
         def r1(v):
             return round(v, 1) if v is not None else None
@@ -376,7 +379,7 @@ class SmartCooling(hass.Hass):
             "rise_frac": round(self._rise_frac, 2), "rise_samples": self._rise_samples,
             "price_now": round(price_now, 2), "window_open": window_open,
             "minutes_needed": run_min, "next_start": next_start.strftime("%H:%M") if next_start else None,
-            "est_cost_kr": est_cost, "bedtime": bedtime.strftime("%H:%M"), "dry_run": self.dry_run,
+            "est_cost_kr": est_cost, "dry_run": self.dry_run,
         }
 
     # ---------- actuation (gentle; respects dry_run + anti-short-cycle) ----------
@@ -406,10 +409,8 @@ class SmartCooling(hass.Hass):
         except Exception as e:
             self.log(f"Failed to start cooling: {e}", level="ERROR")
 
-    async def _ensure_off(self, status, reason, attrs, notify_bedtime=False, bedtime=None):
+    async def _ensure_off(self, status, reason, attrs):
         await self._publish(status, reason, attrs)
-        if notify_bedtime and not self.dry_run:
-            await self._maybe_notify_bedtime(bedtime)
         cur_mode = await self._state(self.climate_entity)
         already_off = cur_mode in (None, "off", "unavailable", "unknown")
         if self.dry_run:
@@ -439,13 +440,6 @@ class SmartCooling(hass.Hass):
         self._last_action = action
 
     # ---------- notify ----------
-    async def _maybe_notify_bedtime(self, bedtime):
-        key = bedtime.strftime("%Y-%m-%d") if bedtime else None
-        if not key or self._notified_bedtime_for == key:
-            return
-        self._notified_bedtime_for = key
-        await self._notify("Pre-cool done -- switch off, move the unit to the bathroom and seal the bedroom.")
-
     async def _notify(self, message):
         if not self.mobile_notifier:
             return
