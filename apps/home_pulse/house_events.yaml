@@ -1,0 +1,16 @@
+# HouseEvents - apartment-level "what did the house just do" feed (sensor.house_events)
+# for the dashboard's Home panel. Observer only: reads the entities below, controls nothing.
+# See house_events.py header for the feed shape and persistence caveats.
+HouseEvents:
+  module: house_events
+  class: HouseEvents
+  feed_entity: sensor.house_events
+  appliances:
+    sensor.washer_state: Washer
+    sensor.dishwasher_state: Dishwasher
+    sensor.dryer_state: Dryer
+  ac_entity: climate.air_conditioner_thermostat
+  smart_cooling_status: sensor.smart_cooling_status
+  blind_entity: cover.bedroom_blind
+  lock_entity: lock.yale_bt
+  vacuum_entity: vacuum.rober2
