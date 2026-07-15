@@ -3,7 +3,10 @@
 # SmartCooling consumes attribute `ceiling_effective` instead of the raw knob;
 # the dashboard SmartCoolingCard shows dew point / effective ceiling / vent advice.
 # Moisture rate calibrated on the 2026-07-09 night: +0.5 C dew point per hour
-# with 2 sleepers in the sealed room (dp 9.7 -> 14.2 over ~9 h).
+# (dp 9.7 -> 14.2 over ~9 h). That night was ONE sleeper (Kristine sleeps in her own
+# room - user, 2026-07-15), so the full 0.5 is the per-sleeper rate; the original 0.25
+# assumed two sleepers splitting it, which would halve projections now that persons
+# only lists Mikkel.
 
 BedroomComfort:
   module: bedroom_comfort
@@ -18,7 +21,7 @@ BedroomComfort:
     - person.mikkel
   night_ceiling_entity: input_number.smart_cooling_night_ceiling
   default_night_ceiling: 23.0
-  dp_rate_per_sleeper_c_per_h: 0.25
+  dp_rate_per_sleeper_c_per_h: 0.5
   dp_comfort_knee_c: 12.0
   dp_penalty_per_c: 0.15
   second_sleeper_penalty_c: 0.5
