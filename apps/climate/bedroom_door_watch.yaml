@@ -1,0 +1,14 @@
+# /conf/apps/climate/bedroom_door_watch.yaml
+# Alert if the bedroom door is left open too long while SmartCooling is armed -
+# family-room heat floods in through an open door the same way an open bathroom
+# window helps the condenser vent. Passing through is fine; only genuinely left
+# open triggers ONE notification per open episode.
+
+BedroomDoorWatch:
+  module: bedroom_door_watch
+  class: BedroomDoorWatch
+  door_sensor: binary_sensor.bedroom_door_contact
+  smart_cooling_entity: input_boolean.smart_cooling
+  ac_climate_entity: climate.air_conditioner_thermostat
+  open_alert_minutes: 5
+  notify_target: mikkel
