@@ -1182,7 +1182,7 @@ class SonosGroupManager(hass.Hass):
             # ensuring we don't inadvertently change it if target_option hasn't changed.
             # However, target_option should already be the desired state.
             # If input_select already is target_option, this set_state call primarily updates attributes.
-            self.set_state(self.master_select, state=target_option, attributes=new_attributes)
+            self.set_state(self.master_select, state=target_option, attributes=new_attributes, replace=True)
             self.log(f"Scenario: master_attribute_updated -> {self.master_select} set with state '{target_option}' and attribute master_entity_id: {target_entity_id_for_attribute}", level="DEBUG")
 
         except Exception as e:

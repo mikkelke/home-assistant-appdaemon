@@ -1227,7 +1227,7 @@ class FamilyRoomLights(hass.Hass):
             "icon": "mdi:chart-box-outline",
         }
         try:
-            self.set_state(self._diag_sensor, state=label, attributes=attrs)
+            self.set_state(self._diag_sensor, state=label, attributes=attrs, replace=True)
         except Exception as e:
             self.log(f"diagnostics set_state failed: {e}", level="DEBUG")
 

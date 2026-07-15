@@ -448,36 +448,43 @@ class WeatherOpeningAlert(hass.Hass):
                 **common,
                 "device_class": "problem",
             },
+            replace=True,
         )
         self.set_state(
             "sensor.weather_opening_alert_priority",
             state=prio,
             attributes={**common},
+            replace=True,
         )
         self.set_state(
             "sensor.weather_opening_alert_reason",
             state=reason,
             attributes={**common},
+            replace=True,
         )
         self.set_state(
             "sensor.weather_opening_alert_target_area",
             state=target,
             attributes={**common},
+            replace=True,
         )
 
         self.set_state(
             "binary_sensor.weather_opening_alert_rooftop_rain",
             state="on" if rooftop.get("active") else "off",
             attributes={"friendly_name": "Weather opening alert - rooftop rain"},
+            replace=True,
         )
         self.set_state(
             "binary_sensor.weather_opening_alert_window_rain",
             state="on" if window.get("active") else "off",
             attributes={"friendly_name": "Weather opening alert - window rain"},
+            replace=True,
         )
         wr = window.get("reason", "") if window.get("active") else ""
         self.set_state(
             "sensor.weather_opening_alert_window_rain_reason",
             state=wr,
             attributes={"friendly_name": "Weather opening alert - window rain reason"},
+            replace=True,
         )

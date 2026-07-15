@@ -102,6 +102,7 @@ class PresenceModel(hass.Hass):
 
             self.set_state(self.publish_pattern.format(room=room),
                            state=state if state in ("on", "off") else "off",
+                           replace=True,
                            attributes={
                                "friendly_name": f"Presence {room.replace('_', ' ')}",
                                "device_class": "occupancy",

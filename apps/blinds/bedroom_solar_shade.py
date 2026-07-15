@@ -185,6 +185,6 @@ class BedroomSolarShade(hass.Hass):
         a["friendly_name"] = "Bedroom sun shade"
         a["icon"] = "mdi:blinds-horizontal"
         try:
-            self.set_state(self.status_entity, state=state, attributes=a)
+            self.set_state(self.status_entity, state=state, attributes=a, replace=True)
         except Exception as e:
             self.log(f"publish failed: {e}", level="WARNING")

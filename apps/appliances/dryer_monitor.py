@@ -502,7 +502,7 @@ class DryerMonitor(hass.Hass):
             full = self.get_state(self.state_entity, attribute="all")
             existing = dict((full or {}).get("attributes") or {})
             existing.update(attrs)
-            self._set_state_entity( state=self.get_state(self.state_entity), attributes=existing)
+            self._set_state_entity( state=self.get_state(self.state_entity), attributes=existing, replace=True)
         except Exception:
             pass
 
@@ -1039,7 +1039,7 @@ class DryerMonitor(hass.Hass):
             if self.keep_fresh_detected:
                 attributes["keep_fresh_detected"] = True
 
-            self._set_state_entity( state="Unemptied", attributes=attributes)
+            self._set_state_entity( state="Unemptied", attributes=attributes, replace=True)
 
             if self.poll_timer:
                 self._safe_cancel_timer(self.poll_timer)
@@ -1093,7 +1093,7 @@ class DryerMonitor(hass.Hass):
             if self.keep_fresh_detected:
                 attributes["keep_fresh_detected"] = True
 
-            self._set_state_entity( state="Emptied", attributes=attributes)
+            self._set_state_entity( state="Emptied", attributes=attributes, replace=True)
 
             # Cancel unemptied watchdog since we're now emptying
             self._safe_cancel_timer(self.unemptied_watchdog_timer)

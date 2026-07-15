@@ -69,6 +69,7 @@ class EntryTruth(hass.Hass):
 
             await self.set_state(self.publish_entity,
                                  state="on" if secure else "off",
+                                 replace=True,
                                  attributes={
                                      "friendly_name": "Apartment entry secure",
                                      "device_class": "lock",

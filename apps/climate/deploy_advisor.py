@@ -241,7 +241,7 @@ class DeployAdvisor(hass.Hass):
             self.log(f"advisor eval failed: {e}", level="ERROR")
 
     async def _publish(self, state, reason, nights, ceiling=None, rise=None):
-        await self.set_state(self.publish_entity, state=state, attributes={
+        await self.set_state(self.publish_entity, state=state, replace=True, attributes={
             "friendly_name": "Bedroom night projection",
             "icon": "mdi:weather-night",
             "unit_of_measurement": "°C",

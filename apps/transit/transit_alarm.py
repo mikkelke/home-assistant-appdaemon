@@ -718,6 +718,7 @@ class TransitAlarm(hass.Hass):
                     "last_checked":   now_str,
                     "data_as_of":     data_as_of_iso,  # ISO timestamp; UI should hide departures before current time
                 },
+                replace=True,
             )
 
             self.log(
@@ -756,6 +757,7 @@ class TransitAlarm(hass.Hass):
                     "poll_interval_night_min": getattr(self, "poll_interval_night_min", 30),
                     "poll_max_stale_min": getattr(self, "poll_max_stale_min", 0),
                 },
+                replace=True,
             )
 
     def _build_info_line(self, res: dict, status: str, route: dict = None) -> str:

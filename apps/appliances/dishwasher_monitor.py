@@ -1231,7 +1231,7 @@ class DishwasherMonitor(hass.Hass):
             full = self.get_state(self.state_entity, attribute="all")
             existing = dict((full or {}).get("attributes") or {})
             existing.update(attrs)
-            self._set_state_entity( state="Running", attributes=existing)
+            self._set_state_entity( state="Running", attributes=existing, replace=True)
         except Exception:
             pass
 
@@ -1493,7 +1493,7 @@ class DishwasherMonitor(hass.Hass):
                 pause_attrs["cycle_start_time"] = self._format_utc(self.start_time)
             if self.energy_start is not None:
                 pause_attrs["energy_at_start"] = self.energy_start
-            self._set_state_entity(state="Paused", attributes=pause_attrs)
+            self._set_state_entity(state="Paused", attributes=pause_attrs, replace=True)
             label = "machine paused (low power)" if low_power else "adding dishes mid-cycle"
             self.log(f"State -> Paused ({label})", level="INFO")
 
@@ -1670,7 +1670,7 @@ class DishwasherMonitor(hass.Hass):
         """Transition to Off state."""
         if self._should_change_state("Off", force=force):
             self.state = "Off"
-            self._set_state_entity(state="Off", attributes=self._off_merged_attributes(reason))
+            self._set_state_entity(state="Off", attributes=self._off_merged_attributes(reason), replace=True)
             self.log(f"State -> Off ({reason})", level="INFO")
             self._reset_cycle_tracking()
 
@@ -1689,6 +1689,7 @@ class DishwasherMonitor(hass.Hass):
             self._set_state_entity(
                 state="Unemptied",
                 attributes=self._unemptied_merged_attributes(run_minutes, energy_used),
+                replace=True,
             )
 
             if self.poll_timer:
@@ -1818,7 +1819,7 @@ class DishwasherMonitor(hass.Hass):
                 attrs["energy_used"] = round(energy, 3)
         if self.short_entity:
             attrs["short_selected"] = self.get_state(self.short_entity)
-        self._set_state_entity( state="Unemptied", attributes=attrs)
+        self._set_state_entity( state="Unemptied", attributes=attrs, replace=True)
         self._safe_cancel_timer(self.unemptied_watchdog_timer)
         self.unemptied_watchdog_timer = None
         if self.unemptied_timeout_hours > 0:
@@ -1985,7 +1986,7 @@ class DishwasherMonitor(hass.Hass):
             return
         was_running = self.get_state(self.state_entity) == "Running"
         self.state = "Error"
-        self._set_state_entity(state="Error", attributes=self._error_merged_attributes(reason, error_key))
+        self._set_state_entity(state="Error", attributes=self._error_merged_attributes(reason, error_key), replace=True)
         self.log(f"State -> Error ({reason})", level="WARNING")
         self._reset_cycle_tracking()
         if was_running:

@@ -316,7 +316,7 @@ class WasherMonitor(hass.Hass):
             attrs["cycle_start_time_local"] = self._format_local(self.start_time)
             attrs["started_at_display"] = self.start_time.astimezone(self._local_tz()).strftime("%H:%M")
             attrs["last_door_closed_trusted"] = bool(self.last_door_closed_trusted)
-            self._set_state_entity(state="Running", attributes=attrs)
+            self._set_state_entity(state="Running", attributes=attrs, replace=True)
         except Exception as e:
             self.log(f"Could not push corrected cycle_start_time: {e}", level="WARNING")
             self._set_state_entity(
@@ -594,7 +594,7 @@ class WasherMonitor(hass.Hass):
                 try:
                     full = self.get_state(self.state_entity, attribute="all") or {}
                     keep = dict((full.get("attributes") or {}))
-                    self._set_state_entity( state="Running", attributes=keep)
+                    self._set_state_entity( state="Running", attributes=keep, replace=True)
                 except Exception:
                     self._set_state_entity( state=self.state)
             else:
@@ -1021,7 +1021,7 @@ class WasherMonitor(hass.Hass):
             attrs["programme_confirmed_by_user"] = True
             attrs["programme_confirmed_by"] = self.confirmed_by_username or ""
             attrs["expected_dur_at_start"] = self.expected_dur_at_start if self.expected_dur_at_start is not None else ""
-            self._set_state_entity( state="Running", attributes=attrs)
+            self._set_state_entity( state="Running", attributes=attrs, replace=True)
         except Exception as e:
             self.log(f"Recovery sync programme from selector failed: {e}", level="DEBUG")
 
@@ -3585,7 +3585,7 @@ class WasherMonitor(hass.Hass):
                 pass
         if self.expected_dur_at_start is None:
             attrs["expected_dur_at_start"] = ""
-        self._set_state_entity( state="Running", attributes=attrs)
+        self._set_state_entity( state="Running", attributes=attrs, replace=True)
 
         if not self.poll_timer:
             poll_interval = int(self.args.get("poll_interval_s", 60))
@@ -4693,7 +4693,7 @@ class WasherMonitor(hass.Hass):
                 attrs["programme_confirmed_by_user"] = False
                 attrs["programme_confirmed_by"] = ""
                 current_state = self.get_state(self.state_entity) or "Running"
-                self._set_state_entity( state=current_state, attributes=attrs)
+                self._set_state_entity( state=current_state, attributes=attrs, replace=True)
             except Exception:
                 pass
             return
@@ -4730,7 +4730,7 @@ class WasherMonitor(hass.Hass):
             attrs = dict((full or {}).get("attributes") or {})
             attrs["programme_confirmed_by_user"] = True
             attrs["programme_confirmed_by"] = self.confirmed_by_username or ""
-            self._set_state_entity( state=current_state, attributes=attrs)
+            self._set_state_entity( state=current_state, attributes=attrs, replace=True)
         except Exception:
             pass
 
@@ -4817,7 +4817,7 @@ class WasherMonitor(hass.Hass):
             attrs["predicted_programme"] = ""
             attrs["predicted_programme_label"] = ""
             attrs["predicted_temperature"] = ""
-            self._set_state_entity( state="Running", attributes=attrs)
+            self._set_state_entity( state="Running", attributes=attrs, replace=True)
         except Exception as e:
             self.log(f"Could not push running ETA attributes: {e}", level="DEBUG")
 

@@ -585,8 +585,10 @@ class DarknessCalculator(hass.Hass):
         room_ent = f"{self.publish_room_state_prefix}{name}"
 
         if self._publish_snapshots.get(bin_ent) != snap:
-            self.set_state(bin_ent, state="on" if is_dark else "off", attributes=attrs)
-            self.set_state(sen_ent, state=DARK if is_dark else BRIGHT, attributes=attrs)
+            # attrs is shared across this zone's mirrors (see _publish_zone) - copy per
+            # call so replace=True doesn't alias two entities' stored attributes together.
+            self.set_state(bin_ent, state="on" if is_dark else "off", attributes=dict(attrs), replace=True)
+            self.set_state(sen_ent, state=DARK if is_dark else BRIGHT, attributes=dict(attrs), replace=True)
             self._publish_snapshots[bin_ent] = snap
 
         room_attrs = {
@@ -597,11 +599,11 @@ class DarknessCalculator(hass.Hass):
             **attrs,
         }
         if self._publish_snapshots.get(room_ent) != snap:
-            self.set_state(room_ent, state=label, attributes=room_attrs)
+            self.set_state(room_ent, state=label, attributes=room_attrs, replace=True)
             self._publish_snapshots[room_ent] = snap
         else:
             try:
-                self.set_state(room_ent, attributes=room_attrs)
+                self.set_state(room_ent, attributes=room_attrs, replace=True)
             except Exception:
                 pass
 

@@ -246,7 +246,7 @@ class BedroomComfort(hass.Hass):
             else:
                 reason = f"dry night projected (DP {dp_morning:.1f}C) - ceiling stays {base:.1f}C"
 
-            self.set_state(self.publish_entity, state=state, attributes={
+            self.set_state(self.publish_entity, state=state, replace=True, attributes={
                 "friendly_name": "Bedroom comfort",
                 "icon": "mdi:bed-clock",
                 "temperature": None if t_in is None else round(t_in, 1),

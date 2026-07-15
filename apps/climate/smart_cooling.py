@@ -452,6 +452,6 @@ class SmartCooling(hass.Hass):
         a["friendly_name"] = "Smart cooling status"
         a["icon"] = "mdi:snowflake-thermometer"
         try:
-            await self.set_state(self.status_entity, state=status, attributes=a)
+            await self.set_state(self.status_entity, state=status, attributes=a, replace=True)
         except Exception as e:
             self.log(f"publish failed: {e}", level="WARNING")
