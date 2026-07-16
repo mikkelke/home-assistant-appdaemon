@@ -36,10 +36,11 @@ SmartCooling:
   # mode prevents the intake stall -- so fan choice is free; auto per user preference
   # 2026-07-16 (nobody in the room while pre-cooling, noise irrelevant).
   # Setpoint 16 since 2026-07-16: the unit always accepted 16 (proven via the Midea app);
-  # the old 17 floor was the midea_auto_cloud integration's advertised min_temp, patched
-  # locally in the T0xAC default profile (repo ~/repositories/midea_auto_cloud, branch
-  # min-temp-16 -- re-apply if a HACS update overwrites it). Lower setpoint = the intake
-  # sensor must read 1C colder before the compressor parks = fewer stall-burps.
+  # the old 17 floor was the midea_auto_cloud integration's mapping. Fixed properly via a
+  # dedicated device profile keyed ("subtype", 524) in T0xAC.py -- worktree
+  # ~/repositories/midea-porta-split, branch porta-split-profile, deployed to the box
+  # (re-apply if a HACS update overwrites it; PR-ready for upstream). Lower setpoint =
+  # the intake sensor must read 1C colder before the compressor parks = fewer stall-burps.
   cool_setpoint: 16.0
   cool_fan_mode: auto
   cool_power_kw: 0.5      # measured engaged average 2026-07-15 (was 0.6 guess); est-cost only
