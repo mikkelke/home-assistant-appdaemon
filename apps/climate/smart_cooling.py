@@ -136,6 +136,7 @@ class SmartCooling(hass.Hass):
         self._saturated = False
         self._last_want = False                    # was the previous eval trying to cool?
         self._last_eval_at: Optional[datetime] = None
+        self._feed_last: dict = {}                 # per-kind last feed emit (see _feed_allowed)
         # learned warm-up indicator (+ the in-flight coast record) + learned feasible floor
         self._rise_frac = self.default_rise_frac
         self._rise_samples = 0
