@@ -1,7 +1,9 @@
 # Smart Cooling v2 -- closed-loop pre-cool for the bedroom AC.
 # Knobs you ever touch: input_boolean.smart_cooling (Arm) + input_boolean.smart_cooling_ac_removed
 # (click right before taking the unit out - whatever the clock says). No bedtime knob (removed
-# 2026-07-15): the price-optimizer's search deadline is a fixed midnight hard cap instead.
+# 2026-07-15): the price-optimizer shops slots up to midnight; from 23:00 the horizon never
+# shrinks below 1h, and past midnight it maintains target on a rolling 1h window until the
+# AC-removed press (raw midnight cap shut the AC off at 23:52 mid-deficit, 2026-07-15).
 # Optional default: input_number.smart_cooling_night_ceiling (23C). Depth is calculated, not set.
 # dry_run: true -> it runs, learns and publishes the plan, but every AC command is a no-op.
 
@@ -31,9 +33,13 @@ SmartCooling:
   sleep_hours: 8.0
 
   # actuation. Fan sweep 2026-07-15: fan draw is trivial (44 W even at full) and no fan
-  # mode prevents the intake stall -- medium kept purely for distribution.
+  # mode prevents the intake stall -- so fan choice is free; auto per user preference
+  # 2026-07-16 (nobody in the room while pre-cooling, noise irrelevant).
+  # Setpoint stays 17: the unit itself takes 16 (proven from the Midea app 2026-07-16),
+  # but the HA integration hard-clamps set_temperature below its advertised min_temp 17
+  # (service call returns 500). App-side 16 or the boost preset are manual-only levers.
   cool_setpoint: 17.0
-  cool_fan_mode: medium
+  cool_fan_mode: auto
   cool_power_kw: 0.5      # measured engaged average 2026-07-15 (was 0.6 guess); est-cost only
   # Stall-breaker: idle-with-deficit -> fan_only burp so the intake reads room air,
   # then cooling restarts hard (parks at ~300 W otherwise, cooling nothing).

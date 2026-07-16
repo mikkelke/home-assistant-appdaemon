@@ -106,6 +106,50 @@ class NextMidnight(unittest.TestCase):
         self.assertGreater(deadline, now)
 
 
+class Deadline(unittest.TestCase):
+    """Regression coverage for the 2026-07-15 23:52 shutdown: with the raw midnight cap,
+    _schedule's slot count hit zero just before midnight and the AC went off with a live
+    deficit while the user was still up (bedtime varies 22:00-01:00). The deadline now
+    keeps a >=1h horizon at the day's edge and rolls a 1h maintenance window through the
+    night (00-06) until the AC-removed press."""
+
+    def _deadline(self, now):
+        app = make_app()
+        return app._deadline(now)
+
+    def test_daytime_is_plain_midnight(self):
+        now = datetime(2026, 7, 15, 14, 0)
+        self.assertEqual(self._deadline(now), datetime(2026, 7, 16, 0, 0))
+
+    def test_2352_keeps_an_hour_not_zero_slots(self):
+        # the exact failure minute from 2026-07-15
+        now = datetime(2026, 7, 15, 23, 52)
+        self.assertEqual(self._deadline(now), datetime(2026, 7, 16, 0, 52))
+
+    def test_past_midnight_rolls_maintenance_window(self):
+        now = datetime(2026, 7, 16, 0, 30)
+        self.assertEqual(self._deadline(now), datetime(2026, 7, 16, 1, 30))
+
+    def test_early_morning_still_maintenance(self):
+        now = datetime(2026, 7, 16, 5, 59)
+        self.assertEqual(self._deadline(now), datetime(2026, 7, 16, 6, 59))
+
+    def test_after_six_back_to_tonights_midnight(self):
+        now = datetime(2026, 7, 16, 6, 1)
+        self.assertEqual(self._deadline(now), datetime(2026, 7, 17, 0, 0))
+
+    def test_2352_schedule_cools_now_on_deficit(self):
+        # end-to-end through _schedule: at 23:52 with 90 min still needed and flat
+        # prices, the old deadline meant total=0 slots -> AC off; now it must cool.
+        app = make_app()
+        app.cool_kw = 0.5
+        now = datetime(2026, 7, 15, 23, 52)
+        cool_now, _, run_min, _ = app._schedule(
+            now, app._deadline(now), 90, lambda dt: 1.97)
+        self.assertTrue(cool_now)
+        self.assertGreater(run_min, 0)
+
+
 class StashLightout(unittest.TestCase):
     """The AC-removed toggle is now the lights-out trigger (was: a bedtime time-window guess
     that could be hours off from when anyone actually went to bed, corrupting rise_frac)."""

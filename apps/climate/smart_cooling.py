@@ -19,7 +19,10 @@ either wrong or a chore to keep updated. Two independent things used to share th
     (see _stash_lightout). No more forced cutoff at a stale clock time.
   - HOW FAR AHEAD TO SHOP FOR CHEAP POWER: the price-optimizer needs SOME horizon or it has nothing
     to bound its search - midnight is a deliberate hard cap (user, 2026-07-15): never bank on a
-    cheap slot that might not exist by the time anyone's actually asleep (see _next_midnight).
+    cheap slot that might not exist by the time anyone's actually asleep. But the cap only bounds
+    PLANNING, not operation: near and past midnight (through 06:00) the horizon becomes a rolling
+    1h maintenance window instead, holding target until the AC-removed press (see _deadline --
+    the raw cap shut the AC off at 23:52 with the user still up, 2026-07-15).
 
 Stall-breaker (2026-07-15): the unit regulates off its own intake sensor, which sits in its cold
 outflow pool -- it parks at ~300 W "idle" with the floor still degrees above target, and no fan
@@ -181,6 +184,19 @@ class SmartCooling(hass.Hass):
         past midnight, since bedtime itself varies and might arrive before that slot would. Always
         strictly in the future, even if `now` is already past today's midnight."""
         return datetime(now.year, now.month, now.day) + timedelta(days=1)
+
+    def _deadline(self, now):
+        """Price-search horizon for _schedule. Tonight's midnight normally (never BANK on
+        slots past it -- see _next_midnight), but never less than 1h out: approaching 23:45
+        the raw midnight cap left _schedule zero slots, so it shut the AC off mid-deficit
+        while the user was still up (bit us 2026-07-15 23:52). Past midnight (00-06) the
+        night is IN PROGRESS -- the AC still being deployed means nobody has gone to bed,
+        and tomorrow's cheap midday slots are useless for tonight -- so roll a 1h
+        maintenance horizon: hold the floor at target, at the going price, until the
+        AC-removed press (or 06:00, when normal next-night planning resumes)."""
+        if now.hour < 6:
+            return now + timedelta(hours=1)
+        return max(self._next_midnight(now), now + timedelta(hours=1))
 
     def _build_price_map(self, *arrays):
         pm = {}
@@ -392,7 +408,7 @@ class SmartCooling(hass.Hass):
                               max(float(ce), ceiling_base - self.comfort_max_reduction, self.min_temp))
         except (TypeError, ValueError):
             pass
-        deadline = self._next_midnight(now)
+        deadline = self._deadline(now)
 
         pm = self._build_price_map(
             await self._attr(self.price_entity, "raw_today", []),
