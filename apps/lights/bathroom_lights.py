@@ -283,15 +283,15 @@ class BathroomLights(hass.Hass):
                     if not bath_spot_on:
                         self.log("Bathroom: Bath spot ON (bright room, dark corner)", level="INFO")
                         self.turn_on(self.bath_spot_light)
-                        # Public feed report (user 2026-07-16: hidden-logic light actions are
-                        # relevant for everybody): a single lamp coming on in a bright room is
-                        # exactly the "why did THAT light turn on?" moment.
+                        # audience=admin (user 2026-07-16): this is Mikkel's own bathroom - the
+                        # housemates use the guest bathroom, so its hidden-logic moments are his.
                         try:
                             self.fire_event(
                                 "house_events_report",
                                 cause="Bright room, darker shower corner",
                                 effect="Bath spot turned on",
                                 icon="mdi:shower-head",
+                                audience="admin",
                             )
                         except Exception:
                             pass
@@ -329,7 +329,8 @@ class BathroomLights(hass.Hass):
         Only reached from the confirmed-bright auto-off path (``turn_off_bright``), so a
         successful off here IS the "daylight is enough" decision - reported to the Home
         activity feed because lights going off while you're in the room is exactly the
-        kind of house action that looks like a bug until it's explained."""
+        kind of house action that looks like a bug until it's explained. audience=admin
+        (user 2026-07-16): this is Mikkel's own bathroom, same scoping as its overrides."""
         try:
             was_on = self.get_state(self.main_5_spots_group) == "on"
             self.turn_off(self.main_5_spots_group)
@@ -340,6 +341,7 @@ class BathroomLights(hass.Hass):
                         cause="Bathroom is bright from daylight",
                         effect="Ceiling spots turned off",
                         icon="mdi:white-balance-sunny",
+                        audience="admin",
                     )
                 except Exception:
                     pass
