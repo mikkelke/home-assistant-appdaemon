@@ -212,9 +212,10 @@ class BedroomSolarShade(hass.Hass):
 
     def _report_house_event(self, cause, effect):
         """Explain a shade decision to the dashboard's Home activity feed. Fire-and-forget:
-        HouseEvents (apps/home_pulse) listens; if absent the event evaporates."""
+        HouseEvents (apps/home_pulse) listens; if absent the event evaporates. audience=admin:
+        Mikkel's bedroom blind - not the housemates' business."""
         try:
-            self.fire_event("house_events_report", cause=cause, effect=effect, icon="mdi:blinds")
+            self.fire_event("house_events_report", cause=cause, effect=effect, icon="mdi:blinds", audience="admin")
         except Exception:
             pass
 

@@ -21,9 +21,10 @@ class BedroomTVControl(hass.Hass):
     def _report_house_event(self, cause, effect):
         """Explain an automated lift move to the dashboard's Home activity feed.
         Fire-and-forget: HouseEvents (apps/home_pulse) listens for this event; if it
-        is not running the event just evaporates. Must never break lift control."""
+        is not running the event just evaporates. Must never break lift control.
+        audience=admin: Mikkel's bedroom TV - not the housemates' business."""
         try:
-            self.fire_event("house_events_report", cause=cause, effect=effect, icon="mdi:television")
+            self.fire_event("house_events_report", cause=cause, effect=effect, icon="mdi:television", audience="admin")
         except Exception:
             pass
 

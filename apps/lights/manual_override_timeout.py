@@ -163,9 +163,10 @@ class ManualOverrideTimeout(hass.Hass):
 
     def _report(self, cause, effect, by=None):
         """Explain an override change to the dashboard's Home activity feed. Fire-and-forget:
-        HouseEvents (apps/home_pulse) listens; if absent the event evaporates."""
+        HouseEvents (apps/home_pulse) listens; if absent the event evaporates. audience=admin:
+        override plumbing is Mikkel-facing - housemates' feeds skip it."""
         try:
-            payload = {"cause": cause, "effect": effect, "icon": "mdi:hand-back-right"}
+            payload = {"cause": cause, "effect": effect, "icon": "mdi:hand-back-right", "audience": "admin"}
             if by:
                 payload["by"] = by
             self.fire_event("house_events_report", **payload)

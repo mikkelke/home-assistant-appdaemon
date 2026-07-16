@@ -127,6 +127,14 @@ class LockEventTests(unittest.TestCase):
         no_by = house_events.build_report_event({"cause": "c", "effect": "e"})
         self.assertIsNone(no_by["by"])
 
+    def test_report_audience_only_admin_narrows(self):
+        admin = house_events.build_report_event({"cause": "c", "effect": "e", "audience": "admin"})
+        self.assertEqual(admin["audience"], "admin")
+        # Anything but the literal "admin" must stay public - hiding is the privileged direction.
+        for bad in (None, "", "Admin", "private", 1, True):
+            event = house_events.build_report_event({"cause": "c", "effect": "e", "audience": bad})
+            self.assertIsNone(event["audience"], f"audience={bad!r} must not narrow")
+
 
 if __name__ == "__main__":
     unittest.main()

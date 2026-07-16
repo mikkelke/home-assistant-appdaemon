@@ -93,6 +93,7 @@ class RadioWatchdog(hass.Hass):
                     cause="Radio stream went silent",
                     effect=f"Restarting the radio on {room}",
                     icon="mdi:radio",
+                    audience="admin",
                 )
             except Exception:
                 pass

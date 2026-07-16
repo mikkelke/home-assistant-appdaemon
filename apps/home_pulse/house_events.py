@@ -24,6 +24,11 @@ State = ts of the newest event (cheap change signal for the dashboard).
 `by` carries the acting HUMAN when knowable (report payloads and lock attribution);
 the dashboard renders it as its own muted "By <name>" line (HA-Activity-style), so
 emitters keep cause/effect wording neutral instead of baking names into sentences.
+`audience` (v5): the literal "admin" hides an entry from non-admin dashboard viewers -
+plumbing-level entries (override on/off/expiry, self-heals, Mikkel's own room's
+automations) that the housemates shouldn't wade through. Absent = everyone. Only the
+exact value "admin" narrows; anything else stays public (hiding is the privileged
+direction - a typo must never vanish an entry for the admin).
 
 Persistence (v3): entity first, state file second. The feed is re-read from the
 entity on app reload (survives code deploys), and from `house_events_state.json`
@@ -153,12 +158,17 @@ def build_report_event(data):
         icon = "mdi:auto-fix"
     by = data.get("by")
     by = by.strip()[:MAX_TEXT_LEN] if isinstance(by, str) and by.strip() else None
+    # v5: only the literal "admin" narrows the audience; anything else (absent, typo'd,
+    # malicious) stays visible to everyone - hiding is the privileged direction here, a
+    # bad value must never make an entry vanish for the admin.
+    audience = "admin" if data.get("audience") == "admin" else None
     return {
         "icon": icon,
         "text": f"{cause} -> {effect}",
         "cause": cause,
         "effect": effect,
         "by": by,
+        "audience": audience,
     }
 
 
@@ -247,7 +257,14 @@ class HouseEvents(hass.Hass):
     def _on_report(self, event_name, data, kwargs):
         event = build_report_event(data)
         if event:
-            self._add(event["icon"], event["text"], cause=event["cause"], effect=event["effect"], by=event["by"])
+            self._add(
+                event["icon"],
+                event["text"],
+                cause=event["cause"],
+                effect=event["effect"],
+                by=event["by"],
+                audience=event["audience"],
+            )
 
     # -- feed management ----------------------------------------------------
 
@@ -272,7 +289,7 @@ class HouseEvents(hass.Hass):
             self.log(f"Could not restore previous feed from state file: {e}", level="WARNING")
             return []
 
-    def _add(self, icon, text, cause=None, effect=None, by=None):
+    def _add(self, icon, text, cause=None, effect=None, by=None, audience=None):
         now = self.get_now()
         now_iso = now.isoformat()
         # Flap guard: identical text again within the window is noise, not news.
@@ -294,6 +311,8 @@ class HouseEvents(hass.Hass):
             entry["effect"] = effect
         if by:
             entry["by"] = by
+        if audience == "admin":
+            entry["audience"] = "admin"
         self.events.insert(0, entry)
         del self.events[MAX_EVENTS:]
         self._publish()

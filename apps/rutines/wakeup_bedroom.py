@@ -322,6 +322,7 @@ class WakeupRoutine(hass.Hass):
                 cause=f"Wake-up alarm ({alarm_hhmm})" if alarm_hhmm else "Wake-up alarm",
                 effect="Raising the blinds and fading the lights in",
                 icon="mdi:weather-sunset-up",
+                audience="admin",  # Mikkel's bedroom routine - not the housemates' business
             )
         except Exception:
             pass
