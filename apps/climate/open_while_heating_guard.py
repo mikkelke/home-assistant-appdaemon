@@ -8,11 +8,15 @@ sensor, apartment-wide.
 
 Per room: any watched opening open AND the room's heating actively running for
 grace_minutes straight -> ONE public house-activity entry per episode (public because
-whoever happens to be home can close it). An episode is the open-span: it re-arms only
-when every watched contact in the room is closed again, so heating cycling off and on
-under an open window can't double-report. Summer-silent by construction (heating_active
-simply never turns on). The too-cold half of the same problem is climate_alarm's job
-(mobile push); this guard covers the heat-waste half.
+whoever happens to be home can close it), plus ONE mobile push to the room's own
+audience (per-room `notify` list in the yaml: Mikkel everywhere; Kristine/Claudia for
+their own rooms and the shared family space). A recipient without a phone in
+MobileNotifier's device_mapping (Claudia until she moves in) resolves to nothing and
+is silently skipped - the routing is ready the day her phone is added. An episode is
+the open-span: it re-arms only when every watched contact in the room is closed again,
+so heating cycling off and on under an open window can't double-report. Summer-silent
+by construction (heating_active simply never turns on). The too-cold half of the same
+problem is climate_alarm's job (mobile push); this guard covers the heat-waste half.
 
 Claudias rooftop door 2 IS watched even though claudias_room_climate drops the setpoint
 on open - that drop stops the heating within a minute, so this guard stays silent there
@@ -95,9 +99,33 @@ class OpenWhileHeatingGuard(hass.Hass):
                 effect=f"Radiator is heating past an open {opening} - close it when you can",
                 icon="mdi:window-open-variant",
             )
+            self._push(room, cfg, label, opening)
             self.log(f"{room}: open-{opening}-while-heating reported")
         except Exception as e:
             self.log(f"report failed for {room}: {e}", level="WARNING")
+
+    def _push(self, room, cfg, label, opening):
+        """One mobile push per episode, to the room's own audience (yaml `notify` list).
+        Fail-soft on every step - a missing MobileNotifier or an unmapped recipient must
+        never take the feed entry (already sent) down with it."""
+        recipients = cfg.get("notify") or []
+        if not recipients:
+            return
+        try:
+            notifier = self.get_app("MobileNotifier")
+            if notifier is None:
+                self.log(f"{room}: MobileNotifier not available, push skipped", level="WARNING")
+                return
+            self.create_task(
+                notifier.notify(
+                    title="Heating past an open " + opening,
+                    message=f"{label}: the {opening} has been open {self.grace_min:.0f}+ min with the "
+                            f"heating on - close it when you can.",
+                    target=list(recipients),
+                )
+            )
+        except Exception as e:
+            self.log(f"push failed for {room}: {e}", level="WARNING")
 
     def _cancel(self, room):
         handle = self._timers.pop(room, None)

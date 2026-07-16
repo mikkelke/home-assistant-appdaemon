@@ -7,27 +7,36 @@ open_while_heating_guard:
   # both rooftop doors sit in the "rooftop" HA area and only door 2's inner room is
   # known (Claudias room, via claudias_room_climate) - add door 1 to its real room once
   # confirmed.
+  # Per-room push audience (person names from MobileNotifier's device_mapping).
+  # Mikkel gets every room; Kristine/Claudia get their own room + the shared family
+  # space (kitchen/living/dining). A name without a mapped phone (Claudia for now)
+  # resolves to nothing and is skipped - ready the day her phone is added.
   rooms:
     bedroom:
       label: "Bedroom"
       contacts: ["binary_sensor.bedroom_window_contact"]
       heating: "binary_sensor.bedroom_heating_active"
+      notify: ["mikkel"]
     bathroom:
       label: "Bathroom"
       contacts: ["binary_sensor.bathroom_window_contact"]
       heating: "binary_sensor.bathroom_heating_active"
+      notify: ["mikkel"]
     kitchen:
       label: "Kitchen"
       contacts: ["binary_sensor.kitchen_window_contact"]
       heating: "binary_sensor.kitchen_heating_active"
+      notify: ["mikkel", "kristine", "claudia"]
     living_room:
       label: "Living room"
       contacts: ["binary_sensor.living_room_window_contact"]
       heating: "binary_sensor.living_room_heating_active"
+      notify: ["mikkel", "kristine", "claudia"]
     kristines_room:
       label: "Kristines room"
       contacts: ["binary_sensor.kristines_room_window_contact"]
       heating: "binary_sensor.kristines_room_heating_active"
+      notify: ["mikkel", "kristine"]
     dining_room:
       label: "Dining room"
       contacts:
@@ -35,8 +44,10 @@ open_while_heating_guard:
         - "binary_sensor.dining_room_window_2_contact"
         - "binary_sensor.dining_room_window_3_contact"
       heating: "binary_sensor.dining_room_heating_active"
+      notify: ["mikkel", "kristine", "claudia"]
     claudias_room:
       label: "Claudias room"
       opening: "rooftop door"
       contacts: ["binary_sensor.rooftop_door_2_contact"]
       heating: "binary_sensor.claudias_room_heating_active"
+      notify: ["mikkel", "claudia"]
