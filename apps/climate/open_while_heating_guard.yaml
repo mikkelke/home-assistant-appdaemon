@@ -1,0 +1,42 @@
+open_while_heating_guard:
+  module: open_while_heating_guard
+  class: OpenWhileHeatingGuard
+  grace_minutes: 15
+  # Outward openings that leak heat while the room's radiator runs. Interior doors are
+  # not watched (heat just moves between rooms). rooftop_door_1 is unmapped on purpose:
+  # both rooftop doors sit in the "rooftop" HA area and only door 2's inner room is
+  # known (Claudias room, via claudias_room_climate) - add door 1 to its real room once
+  # confirmed.
+  rooms:
+    bedroom:
+      label: "Bedroom"
+      contacts: ["binary_sensor.bedroom_window_contact"]
+      heating: "binary_sensor.bedroom_heating_active"
+    bathroom:
+      label: "Bathroom"
+      contacts: ["binary_sensor.bathroom_window_contact"]
+      heating: "binary_sensor.bathroom_heating_active"
+    kitchen:
+      label: "Kitchen"
+      contacts: ["binary_sensor.kitchen_window_contact"]
+      heating: "binary_sensor.kitchen_heating_active"
+    living_room:
+      label: "Living room"
+      contacts: ["binary_sensor.living_room_window_contact"]
+      heating: "binary_sensor.living_room_heating_active"
+    kristines_room:
+      label: "Kristines room"
+      contacts: ["binary_sensor.kristines_room_window_contact"]
+      heating: "binary_sensor.kristines_room_heating_active"
+    dining_room:
+      label: "Dining room"
+      contacts:
+        - "binary_sensor.dining_room_window_1_contact"
+        - "binary_sensor.dining_room_window_2_contact"
+        - "binary_sensor.dining_room_window_3_contact"
+      heating: "binary_sensor.dining_room_heating_active"
+    claudias_room:
+      label: "Claudias room"
+      opening: "rooftop door"
+      contacts: ["binary_sensor.rooftop_door_2_contact"]
+      heating: "binary_sensor.claudias_room_heating_active"

@@ -583,16 +583,45 @@ class SmartCooling(hass.Hass):
         self.log(f"Stall-burp: unit idling with {deficit:.1f}C floor deficit -- fan-only "
                  f"{self.stall_fanonly_min} min so the intake reads room air, then cool again",
                  level="INFO")
-        await self._report_house_event(
-            "AC compressor stalled with cooling still to do",
-            f"Fan-only for {self.stall_fanonly_min} min to wake it, then cooling resumes",
-        )
         self.run_in(self._end_burp, self.stall_fanonly_min * 60)
 
-    async def _report_house_event(self, cause, effect):
-        """Explain an ACTUAL AC action to the dashboard's Home activity feed (admin audience -
-        Mikkel's bedroom AC). Call only on real transitions (mode switches, burps) - never from
-        the every-few-minutes evaluate/publish path, which would flood the 40-entry feed."""
+    # Feed etiquette (user 2026-07-16: "very chatty"): the activity feed is a 40-entry house
+    # HISTORY, not a status card. The AC's minute-to-minute breathing -- burps, cheap-slot
+    # holds/resumes, target drift -- lives on the SmartCooling card; only session-level facts
+    # (first cool-on of the night, sealed for the night, disarm) and actionable blockers
+    # (window closed, condenser hard cap) get a feed entry, each rate-limited so a flapping
+    # bathroom window or a stop-start evening cannot flood the feed.
+    FEED_COOLDOWN_MIN = {"cool_on": 240, "off_window": 60, "off_hardcap": 120,
+                         "disarm": 0, "done": 0}
+
+    def _feed_kind_for_off(self, reason):
+        """Which feed entry (if any) an AC-off deserves. None = card-only, no feed entry --
+        notably every routine 'Hold for cheaper power' / 'On track' breather."""
+        if reason.startswith("Disarmed"):
+            return "disarm"
+        if reason.startswith("Bathroom window closed"):
+            return "off_window"
+        if "hard cap" in reason:
+            return "off_hardcap"
+        return None
+
+    def _feed_allowed(self, kind, now):
+        """Gate + stamp: one entry per kind per cooldown window (in-memory; a reload's worth
+        of duplicate risk is fine for an activity feed)."""
+        if kind is None:
+            return False
+        cooldown = self.FEED_COOLDOWN_MIN.get(kind, 0)
+        last = self._feed_last.get(kind)
+        if last is not None and cooldown > 0 and (now - last).total_seconds() < cooldown * 60:
+            return False
+        self._feed_last[kind] = now
+        return True
+
+    async def _report_house_event(self, kind, cause, effect, now):
+        """Explain a session-level AC fact to the dashboard's Home activity feed (admin
+        audience - Mikkel's bedroom AC). Kind-gated + rate-limited via _feed_allowed."""
+        if not self._feed_allowed(kind, now):
+            return
         try:
             await self.fire_event(
                 "house_events_report",

@@ -221,6 +221,11 @@ class Rober2Control(hass.Hass):
         # runs on every trigger, so only report when the blocked-room set actually changes -
         # see _report_house_event and the blocked_rooms handling below).
         self._last_blocked_report: str | None = None
+        # House activity feed: whole-session guard (spans multiple rooms) - set True on the
+        # first successful segment dispatch (start_cleaning), cleared when the queue empties
+        # (queue_next_room) or cleaning stops for any reason (stop_cleaning). Deliberately
+        # separate from self.cleaning, which toggles False/True between each room in a session.
+        self._cleaning_session_active: bool = False
 
     # --- Small helpers ---
     def _is_no_error_state(self, value) -> bool:
@@ -655,7 +660,7 @@ class Rober2Control(hass.Hass):
                     blocked_pretty = ", ".join(
                         self._pretty_room_from_segment_id(r) for r in blocked_rooms
                     )
-                    blocked_report_text = f"Vacuum skipping {blocked_pretty} until the doors open"
+                    blocked_report_text = f"Vacuum skipped {blocked_pretty} - doors closed"
                     if blocked_report_text != self._last_blocked_report:
                         await self._report_house_event(
                             "Doors closed to queued rooms",
@@ -1145,6 +1150,14 @@ class Rober2Control(hass.Hass):
             if not rooms_all:
                 self.log("No rooms left, docking sequence finished", level="INFO")
                 await self._set_narrative("All queued rooms finished")
+                # Session complete - the flag gate keeps this to one entry per round (this
+                # branch also hits on triggers that fire with nothing queued at all).
+                if self._cleaning_session_active:
+                    self._cleaning_session_active = False
+                    await self._report_house_event(
+                        "All queued rooms cleaned",
+                        "Vacuum finished its round - heading to the dock",
+                    )
                 return
             if not rooms:
                 try:
@@ -1407,8 +1420,9 @@ class Rober2Control(hass.Hass):
                             self.log_state_conclusion("presence_detected", "home_occupied_near_complete", "continue_to_finish", 
                                                     f"Someone is home but room {room_name} is {self.peak_progress}% complete - letting it finish")
                         else:
-                            self.log_state_conclusion("presence_detected", "home_occupied", "stop_cleaning", 
+                            self.log_state_conclusion("presence_detected", "home_occupied", "stop_cleaning",
                                                     f"Someone is home, stopping cleaning (room {self.peak_progress}% complete)")
+                            await self._report_house_event("Someone came home", "Vacuum stopped cleaning")
                             await self.stop_cleaning()
                             await self._set_narrative("Stopped - someone home")
                     else:
@@ -1660,10 +1674,18 @@ class Rober2Control(hass.Hass):
             # This prevents false "already cleaning" states
             self.log_state_conclusion("start_cleaning", "command_sent", "wait_for_start",
                                     f"Sent cleaning command for room: {room_name}")
-            await self._report_house_event(
-                "Scheduled rooms and open doors lined up",
-                f"Vacuum starting the {self._pretty_room_from_segment_id(room_id)}",
-            )
+
+            # House activity feed: report the SESSION starting (not each room) - only on the
+            # first dispatch of a multi-room run. Re-derive why it's allowed to run from the
+            # same presence/override logic evaluate_cleaning_conditions used to get here.
+            if not self._cleaning_session_active:
+                self._cleaning_session_active = True
+                try:
+                    nobody_home = await self.is_away()
+                except Exception:
+                    nobody_home = False
+                session_cause = "Nobody home" if nobody_home else "Clean-while-home is on (someone is home)"
+                await self._report_house_event(session_cause, "Vacuum starting its cleaning round")
 
             # Watchdog: verify the robot starts within reasonable time
             self.run_in(self.verify_job_started, self.SEND_RETRY_SEC, room_id=room_id)
@@ -1682,7 +1704,11 @@ class Rober2Control(hass.Hass):
             # self.current_room = None
             # self.room_start_time = None
             self.fan_speed_enforced = False
-            
+            # This is the single common "give up on this run" path (presence, battery, quiet
+            # hours, disabled, critical error, override toggled off) - end the house-activity
+            # session here regardless of why we were asked to stop.
+            self._cleaning_session_active = False
+
             # Log that cleaning was interrupted, not completed
             if self.current_room:
                 room_name = self.room_config.get(self.current_room, self.current_room)
