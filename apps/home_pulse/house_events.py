@@ -108,14 +108,29 @@ def sanitize_feed(events):
     return [e for e in events if isinstance(e, dict) and e.get("ts") and e.get("text")][:MAX_EVENTS]
 
 
+# Residents, by first name (lowercase). The Yale cloud reports full account names
+# ("Mikkel Eskildsen") while every other feed source says "Mikkel" - _first_name_if_resident
+# trims ONLY names that start with one of these, so non-person lock users ("Cleaning",
+# "Auto Lock") and unknown values are never clipped to a misleading first word.
+RESIDENT_FIRST_NAMES = ("mikkel", "kristine", "claudia")
+
+
+def _first_name_if_resident(who):
+    """'Mikkel Eskildsen' -> 'Mikkel'; anything not starting with a resident first name
+    passes through untouched."""
+    first = who.split()[0] if who.split() else who
+    return first if first.lower() in RESIDENT_FIRST_NAMES else who
+
+
 def lock_event(name, old, new, changed_by):
     """Event tuple (icon, text, by) for a lock transition, or None.
 
     `changed_by` is best-effort attribution (the cloud twin's attribute, already
     freshness-checked by the caller): a person name lands in the separate `by`
-    field (v4 - the dashboard renders it as its own muted "By <name>" line), the
-    integration's literal "Auto Lock" reads "automatically" inside the text, and
-    no/stale attribution just states the fact - a wrong name is worse than no name.
+    field (v4 - the dashboard renders it as its own muted "By <name>" line,
+    resident full names trimmed to first name), the integration's literal
+    "Auto Lock" reads "automatically" inside the text, and no/stale attribution
+    just states the fact - a wrong name is worse than no name.
     """
     if old in (None, "unavailable", "unknown") or new == old:
         return None
@@ -134,7 +149,7 @@ def lock_event(name, old, new, changed_by):
         if who == "Auto Lock":
             text = f"{text} automatically"
         else:
-            by = who
+            by = _first_name_if_resident(who)
     return icon, text, by
 
 

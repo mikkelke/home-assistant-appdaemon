@@ -97,6 +97,19 @@ class LockEventTests(unittest.TestCase):
         self.assertEqual(text, "Front door locked automatically")
         self.assertIsNone(by)
 
+    def test_resident_full_name_trimmed_to_first_name(self):
+        _, _, by = house_events.lock_event("Front door", "locked", "unlocked", "Mikkel Eskildsen")
+        self.assertEqual(by, "Mikkel")
+
+    def test_non_resident_names_never_clipped(self):
+        # Lock code users and unknown values keep their full wording - clipping
+        # "Cleaning Service" to "Cleaning" is fine, but "Keypad Code 3" to "Keypad"
+        # would mislead, so only known resident first names trim.
+        _, _, by = house_events.lock_event("Front door", "locked", "unlocked", "Cleaning")
+        self.assertEqual(by, "Cleaning")
+        _, _, by = house_events.lock_event("Front door", "locked", "unlocked", "Keypad Code 3")
+        self.assertEqual(by, "Keypad Code 3")
+
     def test_no_attribution_states_the_fact(self):
         _, text, by = house_events.lock_event("Front door", "locked", "unlocked", None)
         self.assertEqual(text, "Front door unlocked")
