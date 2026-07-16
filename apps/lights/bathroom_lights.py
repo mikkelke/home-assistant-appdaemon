@@ -364,10 +364,22 @@ class BathroomLights(hass.Hass):
 
 
     def _on_manual_override_change(self, entity, attribute, old, new, kwargs):
-        """Global mechanism: manual override toggle - pause/resume automatic lighting."""
+        """Global mechanism: manual override toggle - pause/resume automatic lighting.
+
+        On clearing, only re-evaluate an EMPTY room (cleanup: lights left burning) - while
+        someone is in it, an instant re-evaluate would rearrange a scene the human just
+        hand-set (the 12 h timeout can expire mid-shower). Occupied rooms resume automatic
+        control on the next natural trigger instead. Same rule as bedroom_lights."""
         if new == "on":
             self.log("Bathroom: manual override ON - automatic lighting paused", level="INFO")
         elif new == "off":
-            self.log("Bathroom: manual override OFF - resuming automatic lighting", level="INFO")
-            self._evaluate_main_lights("OVERRIDE_CLEARED")
-            self._evaluate_bath_spot("OVERRIDE_CLEARED")
+            try:
+                occupied = self._is_local_occupied()
+            except Exception:
+                occupied = True  # fail toward not touching the lights
+            if occupied:
+                self.log("Bathroom: manual override OFF - room occupied, resuming on next trigger", level="INFO")
+            else:
+                self.log("Bathroom: manual override OFF - resuming automatic lighting", level="INFO")
+                self._evaluate_main_lights("OVERRIDE_CLEARED")
+                self._evaluate_bath_spot("OVERRIDE_CLEARED")

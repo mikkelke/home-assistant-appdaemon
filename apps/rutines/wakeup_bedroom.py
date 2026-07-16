@@ -76,6 +76,17 @@ class WakeupRoutine(hass.Hass):
         self.ramp_step_pct = int(A["ramp_step_pct"])
         self.ramp_interval_sec = int(A["ramp_interval_sec"])
         self.ramp_max_pct = int(A["ramp_max_pct"])
+        # The bedroom lights' manual-override toggle pauses ALL automatic light actions -
+        # including this wake ramp (user hit exactly this 2026-07-16: override on + lights
+        # manually off, and a stale ramp turned them back on). Blinds/media still run; the
+        # override is only about lights.
+        self.manual_override_entity = A.get("manual_override_boolean", "input_boolean.bedroom_lights_manual")
+        # The armed blind-position listener must not outlive the wake window: without a
+        # deadline it can fire HOURS later, the first time the blind happens to cross the
+        # wake target again (solar shade repositioning, manual move), and start the ramp
+        # mid-day. Measured from alarm fire.
+        self.wake_light_window_min = int(A.get("wake_light_window_min", 60))
+        self._alarm_fired_at = None
         # Dynamic settle after blinds reach target (based on outdoor lux clue).
         self.post_blind_settle_dark_sec = max(0, int(A.get("post_blind_settle_dark_sec", 10)))
         self.post_blind_settle_mid_sec = max(0, int(A.get("post_blind_settle_mid_sec", 25)))
@@ -300,6 +311,7 @@ class WakeupRoutine(hass.Hass):
             self.log("[wake] Both away; skipping.", log=self.user_log); return
 
         self.log("[wake] Alarm firing.", log=self.user_log)
+        self._alarm_fired_at = self.datetime()
         # Explain the routine to the dashboard's Home activity feed (fire-and-forget) -
         # blinds moving and music starting "by themselves" is the house acting, and this
         # is the one place that knows why. Once per day by construction (alarm fire).
@@ -335,6 +347,9 @@ class WakeupRoutine(hass.Hass):
             self.cover_listener = self.listen_state(
                 self._on_bedroom_position, self.bedroom_cover, attribute="current_position"
             )
+            # Hard deadline: a listener that never fires (blind never hits the exact
+            # target) must not stay armed into the day - see wake_light_window_min.
+            self.run_in(self._expire_cover_listener, self.wake_light_window_min * 60)
             self.log("[wake] Waiting for bedroom blind target to start light ramp...", log=self.user_log)
 
     # ---------- media / volume ----------
@@ -616,10 +631,41 @@ class WakeupRoutine(hass.Hass):
             self, self.bedroom_state_entity, default_dark=True
         )
 
+    def _expire_cover_listener(self, _):
+        if self.cover_listener:
+            try:
+                self.cancel_listen_state(self.cover_listener)
+            except Exception:
+                pass
+            self.cover_listener = None
+            self.log("[wake] Wake light window over - blind listener disarmed without a ramp.", log=self.user_log)
+
+    def _within_wake_window(self) -> bool:
+        """True only within wake_light_window_min of the alarm actually firing. The ramp is a
+        WAKE feature: outside this window (or before any alarm today) a start request is a
+        stale trigger, not a wake-up."""
+        if self._alarm_fired_at is None:
+            return False
+        try:
+            return (self.datetime() - self._alarm_fired_at).total_seconds() <= self.wake_light_window_min * 60
+        except Exception:
+            return False
+
     def _maybe_start_light_ramp(self):
         # Prevent multiple concurrent ramps
         if self.ramp_active:
             self.log("[wake] Ramp already active; ignoring start request", log=self.user_log)
+            return
+        # Respect the bedroom lights' manual override - the ramp is an automatic light
+        # action like any other (see initialize; user-reported 2026-07-16).
+        try:
+            if self.manual_override_entity and self.get_state(self.manual_override_entity) == "on":
+                self.log("[wake] Bedroom lights manual override on; skipping light ramp.", log=self.user_log)
+                return
+        except Exception:
+            pass
+        if not self._within_wake_window():
+            self.log("[wake] Outside the wake light window; skipping light ramp.", log=self.user_log)
             return
         if not self._room_dark_for_wake_light():
             self.log("[wake] Room is bright enough; skipping ramp.", log=self.user_log)

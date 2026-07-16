@@ -359,9 +359,25 @@ class BedroomLights(hass.Hass):
             return False
 
     def _on_manual_override_change(self, entity, attribute, old, new, kwargs):
-        """Global mechanism: manual override toggle - pause/resume automatic lighting."""
+        """Global mechanism: manual override toggle - pause/resume automatic lighting.
+
+        On clearing, only re-evaluate an EMPTY room (cleanup: lights left burning). While
+        someone is in the room, resuming instantly would apply the state machine to a scene
+        the human just hand-arranged - e.g. the 12 h timeout expiring at night would flip
+        the bed lights back ON with someone in bed (user-reported 2026-07-16). An occupied
+        room resumes automatic control on the next natural trigger (PIR/in-bed/room-state)."""
         if new == "on":
             self.log("Bedroom: manual override ON - automatic lighting paused", level="INFO")
         elif new == "off":
-            self.log("Bedroom: manual override OFF - resuming automatic lighting", level="INFO")
-            self._evaluate_lights("OVERRIDE_CLEARED")
+            try:
+                occupied = self._get_effective_occupancy()
+            except Exception:
+                occupied = True  # fail toward not touching the lights
+            if occupied:
+                self.log(
+                    "Bedroom: manual override OFF - room occupied, resuming on next trigger",
+                    level="INFO",
+                )
+            else:
+                self.log("Bedroom: manual override OFF - resuming automatic lighting", level="INFO")
+                self._evaluate_lights("OVERRIDE_CLEARED")

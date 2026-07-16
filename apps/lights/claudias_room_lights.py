@@ -130,9 +130,21 @@ class ClaudiasRoomLights(hass.Hass):
         self.log(f"LIGHTS {action} [claudias_room]{reason_str}{score_str}", level="INFO")
 
     def _on_manual_override_change(self, entity, attribute, old, new, kwargs):
-        """Global mechanism: manual override toggle - pause/resume automatic lighting."""
+        """Global mechanism: manual override toggle - pause/resume automatic lighting.
+
+        On clearing, only re-evaluate an EMPTY room (cleanup: lights left burning) - while
+        someone is in it, an instant re-evaluate would rearrange a scene the human just
+        hand-set. Occupied rooms resume automatic control on the next natural trigger
+        instead. Same rule as bedroom_lights."""
         if new == "on":
             self.log("Claudias Room: manual override ON - automatic lighting paused", level="INFO")
         elif new == "off":
-            self.log("Claudias Room: manual override OFF - resuming automatic lighting", level="INFO")
-            self._apply_lights("OVERRIDE_CLEARED")
+            try:
+                occupied = self._is_local_occupied()
+            except Exception:
+                occupied = True  # fail toward not touching the lights
+            if occupied:
+                self.log("Claudias Room: manual override OFF - room occupied, resuming on next trigger", level="INFO")
+            else:
+                self.log("Claudias Room: manual override OFF - resuming automatic lighting", level="INFO")
+                self._apply_lights("OVERRIDE_CLEARED")
