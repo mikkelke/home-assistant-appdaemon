@@ -27,6 +27,16 @@ next to this module when the entity is gone - AppDaemon set_state entities are
 ephemeral across HA RESTARTS (see appdaemon-deploy notes), which used to wipe the
 feed. The file is rewritten on every added event; deploy.sh syncs tracked files
 only and never deletes, so the box's copy is safe.
+
+EMITTER CONTRACT (user feedback 2026-07-16, after phantom lift entries): a report must
+ride an ACTION ACTUALLY TAKEN on a GENUINE transition - never an init/startup/heal/
+periodic-verify path re-asserting a state that already holds (track your state and skip;
+see bedroom_tv_control's initial_state_check). Health/self-maintenance chatter does not
+belong in this feed unless something user-visible actually happened (radio_watchdog's
+restart qualifies; its silent checks do not). When the acting HUMAN is knowable, name
+them: watch the raw ``state_changed`` event (listen_state drops HA's context), resolve
+``context.user_id`` through person entities, and fall back to neutral wording rather
+than guessing (see manual_override_timeout).
 """
 
 import json
