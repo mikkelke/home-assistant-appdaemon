@@ -127,6 +127,20 @@ class LockEventTests(unittest.TestCase):
         no_by = house_events.build_report_event({"cause": "c", "effect": "e"})
         self.assertIsNone(no_by["by"])
 
+    def test_report_audience_users(self):
+        event = house_events.build_report_event(
+            {"cause": "c", "effect": "e", "audience_users": [" Claudia ", "Claudia", "", 7, "Kristine"]}
+        )
+        self.assertEqual(event["audience_users"], ["Claudia", "Kristine"])  # trimmed, deduped, junk dropped
+        # admin outranks: a users list alongside audience="admin" is ignored
+        admin = house_events.build_report_event(
+            {"cause": "c", "effect": "e", "audience": "admin", "audience_users": ["Claudia"]}
+        )
+        self.assertIsNone(admin["audience_users"])
+        # malformed list degrades to public, never to hidden
+        bad = house_events.build_report_event({"cause": "c", "effect": "e", "audience_users": "Claudia"})
+        self.assertIsNone(bad["audience_users"])
+
     def test_report_audience_only_admin_narrows(self):
         admin = house_events.build_report_event({"cause": "c", "effect": "e", "audience": "admin"})
         self.assertEqual(admin["audience"], "admin")

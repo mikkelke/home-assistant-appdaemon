@@ -29,6 +29,10 @@ plumbing-level entries (override on/off/expiry, self-heals, Mikkel's own room's
 automations) that the housemates shouldn't wade through. Absent = everyone. Only the
 exact value "admin" narrows; anything else stays public (hiding is the privileged
 direction - a typo must never vanish an entry for the admin).
+`audience_users` (v5.1): list of HA user display names (matched case-insensitively by
+the dashboard) who see the entry besides admins - room-scoped entries like "Claudias
+room lights switched to manual" -> ["Claudia"]. Mutually exclusive with
+audience="admin" (admin-only outranks; the users list is ignored then).
 
 Persistence (v3): entity first, state file second. The feed is re-read from the
 entity on app reload (survives code deploys), and from `house_events_state.json`
@@ -162,6 +166,22 @@ def build_report_event(data):
     # malicious) stays visible to everyone - hiding is the privileged direction here, a
     # bad value must never make an entry vanish for the admin.
     audience = "admin" if data.get("audience") == "admin" else None
+    # v5.1: audience_users = HA user display names (e.g. ["Claudia"]) who see the entry
+    # besides admins. Only meaningful without audience="admin" (admin already outranks it).
+    # Same fail-open stance: a malformed list degrades to public, never to hidden.
+    audience_users = None
+    if audience is None:
+        raw_users = data.get("audience_users")
+        if isinstance(raw_users, (list, tuple)):
+            cleaned = []
+            for user in raw_users:
+                if isinstance(user, str) and user.strip():
+                    name = user.strip()[:40]
+                    if name not in cleaned:
+                        cleaned.append(name)
+                if len(cleaned) >= 5:
+                    break
+            audience_users = cleaned or None
     return {
         "icon": icon,
         "text": f"{cause} -> {effect}",
@@ -169,6 +189,7 @@ def build_report_event(data):
         "effect": effect,
         "by": by,
         "audience": audience,
+        "audience_users": audience_users,
     }
 
 
@@ -264,6 +285,7 @@ class HouseEvents(hass.Hass):
                 effect=event["effect"],
                 by=event["by"],
                 audience=event["audience"],
+                audience_users=event["audience_users"],
             )
 
     # -- feed management ----------------------------------------------------
@@ -289,7 +311,7 @@ class HouseEvents(hass.Hass):
             self.log(f"Could not restore previous feed from state file: {e}", level="WARNING")
             return []
 
-    def _add(self, icon, text, cause=None, effect=None, by=None, audience=None):
+    def _add(self, icon, text, cause=None, effect=None, by=None, audience=None, audience_users=None):
         now = self.get_now()
         now_iso = now.isoformat()
         # Flap guard: identical text again within the window is noise, not news.
@@ -313,6 +335,8 @@ class HouseEvents(hass.Hass):
             entry["by"] = by
         if audience == "admin":
             entry["audience"] = "admin"
+        elif audience_users:
+            entry["audience_users"] = list(audience_users)
         self.events.insert(0, entry)
         del self.events[MAX_EVENTS:]
         self._publish()

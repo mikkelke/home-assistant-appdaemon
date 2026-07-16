@@ -94,6 +94,7 @@ class ManualOverrideTimeout(hass.Hass):
         if new == "on":
             self._resync(entity)
             self._report(
+                entity,
                 f"{room} lights switched to manual",
                 f"Automation paused - resumes within {self.timeout_s / 3600:.0f} h",
                 by=person,
@@ -106,6 +107,7 @@ class ManualOverrideTimeout(hass.Hass):
                 self._self_cleared.discard(entity)
             else:
                 self._report(
+                    entity,
                     f"{room} manual override turned off",
                     "Lights back to automatic",
                     by=person,
@@ -147,26 +149,43 @@ class ManualOverrideTimeout(hass.Hass):
                 self._self_cleared.add(ent)
                 self.turn_off(ent)
                 self._report(
+                    ent,
                     f"{self._room_label(ent)} manual override timed out after {self.timeout_s / 3600:.0f} h",
                     "Lights back to automatic",
                 )
         except Exception as e:
             self.log(f"expire failed for {ent}: {e}", level="ERROR")
 
+    # Room-scoped feed visibility (user, 2026-07-16): overrides in SHARED rooms can be flipped
+    # by anyone, so everyone sees them; private rooms are their occupant's business (+ admin).
+    # Keys = the boolean's room part (see _room_key). Anything not listed = shared = public.
+    ROOM_AUDIENCE = {
+        "bedroom": {"audience": "admin"},  # Mikkel's rooms
+        "bathroom": {"audience": "admin"},
+        "claudias_room": {"audience_users": ["Claudia"]},
+        "kristines_room": {"audience_users": ["Kristine"]},
+    }
+
     @staticmethod
-    def _room_label(ent):
-        """input_boolean.living_room_lights_manual -> 'Living room'."""
+    def _room_key(ent):
+        """input_boolean.claudias_room_lights_manual -> 'claudias_room'."""
         name = ent.split(".", 1)[-1]
         if name.endswith("_lights_manual"):
             name = name[: -len("_lights_manual")]
-        return name.replace("_", " ").strip().capitalize()
+        return name
 
-    def _report(self, cause, effect, by=None):
+    @classmethod
+    def _room_label(cls, ent):
+        """input_boolean.living_room_lights_manual -> 'Living room'."""
+        return cls._room_key(ent).replace("_", " ").strip().capitalize()
+
+    def _report(self, ent, cause, effect, by=None):
         """Explain an override change to the dashboard's Home activity feed. Fire-and-forget:
-        HouseEvents (apps/home_pulse) listens; if absent the event evaporates. audience=admin:
-        override plumbing is Mikkel-facing - housemates' feeds skip it."""
+        HouseEvents (apps/home_pulse) listens; if absent the event evaporates. Visibility is
+        room-scoped via ROOM_AUDIENCE (shared rooms public, private rooms occupant+admin)."""
         try:
-            payload = {"cause": cause, "effect": effect, "icon": "mdi:hand-back-right", "audience": "admin"}
+            payload = {"cause": cause, "effect": effect, "icon": "mdi:hand-back-right"}
+            payload.update(self.ROOM_AUDIENCE.get(self._room_key(ent), {}))
             if by:
                 payload["by"] = by
             self.fire_event("house_events_report", **payload)

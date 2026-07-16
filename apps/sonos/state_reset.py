@@ -618,10 +618,29 @@ class SonosStateReset(hass.Hass):
     def _finish_reset(self, targets, trigger, source):
         """Fire sonos_reset_completed and clear local reset state."""
         try:
-            self.fire_event("sonos_reset_completed", 
+            self.fire_event("sonos_reset_completed",
                            targets=targets,
                            trigger=trigger,
                            source=source)
+            # Explain the invisible cleanup to the dashboard's Home activity feed
+            # (admin audience - housekeeping Mikkel cares about, housemates don't).
+            try:
+                count = len(targets) if isinstance(targets, (list, tuple)) else 0
+                speakers_txt = f"{count} speaker{'s' if count != 1 else ''}" if count else "speakers"
+                cause = (
+                    "Speakers went idle"
+                    if trigger == "inactivity"
+                    else f"Sonos reset requested ({trigger})"
+                )
+                self.fire_event(
+                    "house_events_report",
+                    cause=cause,
+                    effect=f"Restored default volume and ungrouped {speakers_txt}",
+                    icon="mdi:speaker-multiple",
+                    audience="admin",
+                )
+            except Exception:
+                pass
         finally:
             self._active_reset_ctx = None
             self._reset_in_progress = False

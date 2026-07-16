@@ -583,7 +583,26 @@ class SmartCooling(hass.Hass):
         self.log(f"Stall-burp: unit idling with {deficit:.1f}C floor deficit -- fan-only "
                  f"{self.stall_fanonly_min} min so the intake reads room air, then cool again",
                  level="INFO")
+        await self._report_house_event(
+            "AC compressor stalled with cooling still to do",
+            f"Fan-only for {self.stall_fanonly_min} min to wake it, then cooling resumes",
+        )
         self.run_in(self._end_burp, self.stall_fanonly_min * 60)
+
+    async def _report_house_event(self, cause, effect):
+        """Explain an ACTUAL AC action to the dashboard's Home activity feed (admin audience -
+        Mikkel's bedroom AC). Call only on real transitions (mode switches, burps) - never from
+        the every-few-minutes evaluate/publish path, which would flood the 40-entry feed."""
+        try:
+            await self.fire_event(
+                "house_events_report",
+                cause=cause,
+                effect=effect,
+                icon="mdi:snowflake-thermometer",
+                audience="admin",
+            )
+        except Exception:
+            pass
 
     def _end_burp(self, kwargs):
         self.create_task(self._end_burp_async())
@@ -639,6 +658,8 @@ class SmartCooling(hass.Hass):
                 await self.call_service("climate/set_hvac_mode", entity_id=self.climate_entity, hvac_mode="cool")
                 self._mark_switch("cool")
                 self.log(f"COOL on ({self.cool_setpoint}C/{self.cool_fan}): {reason}", level="INFO")
+                # reason is the planner's own explanation of WHY (cheap hour, deadline, deficit...)
+                await self._report_house_event(reason, f"AC cooling the bedroom to {self.cool_setpoint:g}C")
             cur_temp = await self._attr(self.climate_entity, "temperature", None)
             if cur_temp is None or abs(float(cur_temp) - self.cool_setpoint) > 0.1:
                 await self.call_service("climate/set_temperature", entity_id=self.climate_entity, temperature=self.cool_setpoint)
@@ -666,6 +687,7 @@ class SmartCooling(hass.Hass):
             await self.call_service("climate/set_hvac_mode", entity_id=self.climate_entity, hvac_mode="off")
             self._mark_switch("off")
             self.log(f"AC off: {reason}", level="INFO")
+            await self._report_house_event(reason, "AC turned off")
         except Exception as e:
             self.log(f"Failed to turn off: {e}", level="ERROR")
 

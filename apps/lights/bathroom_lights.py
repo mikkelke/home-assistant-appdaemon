@@ -283,6 +283,18 @@ class BathroomLights(hass.Hass):
                     if not bath_spot_on:
                         self.log("Bathroom: Bath spot ON (bright room, dark corner)", level="INFO")
                         self.turn_on(self.bath_spot_light)
+                        # Public feed report (user 2026-07-16: hidden-logic light actions are
+                        # relevant for everybody): a single lamp coming on in a bright room is
+                        # exactly the "why did THAT light turn on?" moment.
+                        try:
+                            self.fire_event(
+                                "house_events_report",
+                                cause="Bright room, darker shower corner",
+                                effect="Bath spot turned on",
+                                icon="mdi:shower-head",
+                            )
+                        except Exception:
+                            pass
                 else:
                     # No one in shower corner -> turn off bath spot
                     if bath_spot_on:
