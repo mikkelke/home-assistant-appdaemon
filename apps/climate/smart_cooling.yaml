@@ -24,8 +24,10 @@ SmartCooling:
   price_entity: sensor.energi_data_service
   enable_entity: input_boolean.smart_cooling
   night_ceiling_entity: input_number.smart_cooling_night_ceiling
-  # Click before physically removing the AC (bedtime varies 22:00-01:00, user 2026-07-15) -
-  # this IS lights-out, whatever the clock says. Auto-resets after firing.
+  # Click right before UNPLUGGING the AC (bedtime varies 22:00-01:00, user 2026-07-15) -
+  # this IS lights-out, whatever the clock says. Stamps the learning baseline, stops the
+  # compressor gracefully ahead of the power pull, auto-resets, and DISARMS the master for
+  # the night (user 2026-07-17) - arm again when redeploying next day.
   ac_removed_entity: input_boolean.smart_cooling_ac_removed
 
   default_night_ceiling: 23.0

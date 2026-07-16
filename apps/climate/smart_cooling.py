@@ -14,9 +14,12 @@ the gap to its equilibrium" and invert it.
 
 No bedtime knob (user, 2026-07-15): real bedtime varies 22:00-01:00, so a fixed clock setting was
 either wrong or a chore to keep updated. Two independent things used to share that one knob:
-  - WHEN TO STOP: the user clicks ac_removed_entity right before physically taking the unit out -
-    that IS lights-out, whatever the clock says, and also stamps the coast-learning baseline
-    (see _stash_lightout). No more forced cutoff at a stale clock time.
+  - WHEN TO STOP: the user clicks ac_removed_entity right before physically unplugging the unit -
+    that IS lights-out, whatever the clock says. The press stamps the coast-learning baseline
+    (_stash_lightout), stops the compressor gracefully ahead of the power pull, and DISARMS the
+    master for the night (user design 2026-07-17: the unplug is the real seal; a still-armed
+    planner beside a still-plugged unit would resume cooling next to the sleeping user).
+    Re-arming is the existing morning ritual.
   - HOW FAR AHEAD TO SHOP FOR CHEAP POWER: two tiers (user, 2026-07-16). GUARANTEED: until
     22:00 (the earliest plausible bedtime) the load-bearing plan must fit BEFORE 22:00 -- later
     slots can be erased by the AC-removed press, and a top-up starting at 22:08 is a noisy
@@ -482,8 +485,8 @@ class SmartCooling(hass.Hass):
         minutes_needed = max(0.0, reach_deficit) / self.floor_cool_cph * 60.0
 
         # user says they're removing the AC now -> this IS lights-out: stash the coast baseline,
-        # then done for the night, then reset the toggle so it's a one-shot trigger, not a switch
-        # someone has to remember to flip back.
+        # graceful compressor stop (they unplug right after -- better than yanking power
+        # mid-run), then reset the toggle so it's a one-shot trigger.
         if (await self._state(self.ac_removed_entity)) == "on":
             self._mark_eval(now, False)
             self._stash_lightout(floor, E, now)
@@ -498,6 +501,18 @@ class SmartCooling(hass.Hass):
                 await self.call_service("input_boolean/turn_off", entity_id=self.ac_removed_entity)
             except Exception as e:
                 self.log(f"failed to reset ac_removed toggle: {e}", level="WARNING")
+            # The press also DISARMS the master (user design 2026-07-17): the physical unplug
+            # is the real seal, so if the unit stays plugged a still-armed planner would
+            # resume cooling at the next cheap slot beside the sleeping user (nearly happened
+            # 2026-07-16 23:00). Disarm = visible on the card, no hidden seal state, and
+            # re-arming is already the user's morning ritual.
+            try:
+                self._master_was_on = False   # skip the disarm listener's redundant one-shot off
+                await self.call_service("input_boolean/turn_off", entity_id=self.enable_entity)
+                self.log("AC removed -> disarmed for the night (arm again when redeploying)",
+                         level="INFO")
+            except Exception as e:
+                self.log(f"failed to disarm after AC-removed: {e}", level="WARNING")
             return
 
         cool_now, next_start, run_min, est_cost = self._schedule(now, deadline, minutes_needed, price_at)
