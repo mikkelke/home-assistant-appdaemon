@@ -17,6 +17,7 @@ class Intercom(hass.Hass):
         self.unlock_repeat_count = int(self.args.get("unlock_repeat_count", 2))
         self.unlock_repeat_interval_s = int(self.args.get("unlock_repeat_interval_s", 7))
         self.debounce_s = int(self.args.get("debounce_s", 5))
+        self.notify_target = self.args.get("notify_target", "mikkel")
 
         # Messages
         self.msg_front = self.args.get("tts_message_front", "Someone is at the front door")
@@ -26,8 +27,10 @@ class Intercom(hass.Hass):
         self.msg_open_back = self.args.get("door_open_message_back", "I opened the back door")
 
         self.sonos_notifier = self._get_notifier()
+        self.mobile_notifier = self._get_mobile_notifier()
         self.last_trigger_at = {}
         self.pending_unlocks = {}  # Track scheduled unlock callbacks by entity
+        self.unlock_outcomes = {}  # Per trigger entity: did any attempt of the current ring succeed
 
         # Validate entities exist
         self._validate_entities()
@@ -75,6 +78,17 @@ class Intercom(hass.Hass):
             return notifier
         except Exception as e:
             self.log(f"CRITICAL: Error getting SonosNotifier app: {e}.", level="ERROR")
+            return None
+
+    def _get_mobile_notifier(self):
+        # get_app must be resolved in sync init - async context returns a Task.
+        try:
+            notifier = self.get_app("MobileNotifier")
+            if not notifier:
+                self.log("MobileNotifier app not found; auto-open failure alerts will only be logged.", level="WARNING")
+            return notifier
+        except Exception as e:
+            self.log(f"Error getting MobileNotifier app: {e}. Failure alerts will only be logged.", level="WARNING")
             return None
 
     def _validate_entities(self):
@@ -178,6 +192,14 @@ class Intercom(hass.Hass):
         if auto_open_enabled:
             # No follow-up TTS needed since the combined message covers it
             self.pending_unlocks[entity] = []
+            # Track whether ANY attempt of THIS ring succeeds; ring_ts guards
+            # against a stale verify from a cancelled ring escalating falsely.
+            ring_ts = self.last_trigger_at[entity]
+            self.unlock_outcomes[entity] = {
+                "ring_ts": ring_ts,
+                "succeeded": False,
+                "ring_label": info.get("ring_label", "door"),
+            }
             for i in range(self.unlock_repeat_count):
                 delay = self.unlock_delay_s + i * self.unlock_repeat_interval_s
 
@@ -213,6 +235,7 @@ class Intercom(hass.Hass):
                     lock_entity=lock_entity,
                     followup=None,
                     door_sensor=door_sensor,
+                    ring_ts=ring_ts,
                 )
                 handle_ref[0] = handle  # Store handle for removal in callback
                 self.pending_unlocks[entity].append(handle)
@@ -308,6 +331,8 @@ class Intercom(hass.Hass):
                 unlock_attempt=unlock_attempt,
                 followup=followup,
                 door_sensor=door_sensor,
+                trigger_entity=trigger_entity,
+                ring_ts=kwargs.get("ring_ts"),
             )
             
             self.log(f"Unlock service called for {lock_entity} (attempt {unlock_attempt})", level="INFO")
@@ -323,15 +348,25 @@ class Intercom(hass.Hass):
         unlock_attempt = kwargs.get("unlock_attempt", 1)
         followup = kwargs.get("followup")
         door_sensor = kwargs.get("door_sensor")
-        
+        trigger_entity = kwargs.get("trigger_entity")
+        ring_ts = kwargs.get("ring_ts")
+
         if not lock_entity:
             return
-            
+
+        # Outcome record for the ring this verify belongs to (None if a newer
+        # ring has replaced it - then this verify neither marks nor escalates)
+        outcome = self.unlock_outcomes.get(trigger_entity)
+        if outcome is not None and ring_ts is not None and outcome.get("ring_ts") != ring_ts:
+            outcome = None
+
         current_state = self.get_state(lock_entity)
-        
+
         # ESP32 publishes "unlocking" for 3 seconds, then "locked"
         # Accept both "unlocked" and "unlocking" as success
         if current_state in ["unlocked", "unlocking"]:
+            if outcome is not None:
+                outcome["succeeded"] = True
             self.log(f"OK: Successfully unlocked {lock_entity} (attempt {unlock_attempt})", level="INFO")
             # Check door state after unlock for additional verification
             if door_sensor:
@@ -351,4 +386,47 @@ class Intercom(hass.Hass):
             self.log(f"FAIL: Unlock failed for {lock_entity} (attempt {unlock_attempt}): state unchanged ({current_state})", level="WARNING")
         else:
             self.log(f"WARN: Unlock state unclear for {lock_entity} (attempt {unlock_attempt}): was {state_before}, now {current_state}", level="WARNING")
+
+        # After the LAST attempt of a ring: if no attempt succeeded, tell Mikkel.
+        # The house already announced "I opened the door" - a silent failure
+        # leaves a visitor stranded while everyone believes the door is open.
+        if (
+            outcome is not None
+            and unlock_attempt >= self.unlock_repeat_count
+            and not outcome.get("succeeded")
+        ):
+            self._report_auto_open_failure(trigger_entity, lock_entity, outcome)
+
+    def _report_auto_open_failure(self, trigger_entity, lock_entity, outcome):
+        """All unlock attempts for a ring failed: log, mobile-notify, house feed."""
+        ring_label = outcome.get("ring_label", "door")
+        self.unlock_outcomes.pop(trigger_entity, None)
+        self.log(
+            f"AUTO-OPEN FAILED: {self.unlock_repeat_count} unlock attempt(s) on {lock_entity} got no response after {ring_label} ring",
+            level="ERROR",
+        )
+
+        if self.mobile_notifier:
+            try:
+                self.create_task(self.mobile_notifier.notify(
+                    title="Intercom auto-open failed",
+                    message=(
+                        f"Someone rang the {ring_label} but the door did not open: "
+                        f"{self.unlock_repeat_count} unlock attempts got no response from the intercom."
+                    ),
+                    target=self.notify_target,
+                ))
+            except Exception as e:
+                self.log(f"Auto-open failure notification failed: {e}", level="WARNING")
+
+        # House feed entry - same guarded, cosmetic-only contract as the ring report
+        try:
+            self.fire_event(
+                "house_events_report",
+                cause=f"Someone rang the {ring_label}",
+                effect=f"Auto-open FAILED - {self.unlock_repeat_count} unlock attempts got no response",
+                icon="mdi:alert-circle",
+            )
+        except Exception as e:
+            self.log(f"house_events_report failed: {e}", level="DEBUG")
 

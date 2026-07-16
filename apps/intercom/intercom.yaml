@@ -39,3 +39,6 @@ Intercom:
   # Debounce rapid retriggers
   debounce_s: 5
 
+  # Mobile alert target when all unlock attempts of a ring fail
+  notify_target: "mikkel"
+
