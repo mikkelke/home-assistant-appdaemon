@@ -601,13 +601,22 @@ class SmartCooling(hass.Hass):
                                     f"-- fan-only {self.stall_fanonly_min} min to wake the "
                                     f"compressor", attrs)
                 return
-        await self._publish(status, reason, attrs)
         if self.dry_run:
+            await self._publish(status, reason, attrs)
             self.log(f"DRY-RUN would COOL ({self.cool_setpoint}C/{self.cool_fan}): {reason}")
             return
         need_mode = cur_mode != "cool"
         if need_mode and not self._can_switch(True):
+            # Deferred by anti-short-cycle: say so instead of claiming "cooling" while the
+            # unit sits off (user saw exactly that 2026-07-16 12:14 and reported it as a bug).
+            wait_min = self.min_cycle_min
+            if self._last_switch is not None:
+                wait_min = max(0.0, self.min_cycle_min
+                               - (datetime.now() - self._last_switch).total_seconds() / 60.0)
+            await self._publish("waiting", f"Starting in ~{wait_min:.0f} min "
+                                f"(compressor rest after the last stop) -- then: {reason}", attrs)
             return
+        await self._publish(status, reason, attrs)
         try:
             if need_mode:
                 await self.call_service("climate/set_hvac_mode", entity_id=self.climate_entity, hvac_mode="cool")
