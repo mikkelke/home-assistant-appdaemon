@@ -17,6 +17,16 @@ class BedroomTVControl(hass.Hass):
             pass
         return False
 
+
+    def _report_house_event(self, cause, effect):
+        """Explain an automated lift move to the dashboard's Home activity feed.
+        Fire-and-forget: HouseEvents (apps/home_pulse) listens for this event; if it
+        is not running the event just evaporates. Must never break lift control."""
+        try:
+            self.fire_event("house_events_report", cause=cause, effect=effect, icon="mdi:television")
+        except Exception:
+            pass
+
     def initialize(self):
         # Initialize the flag for Apple TV connection reset
         self.apple_tv_reset_in_progress = False
@@ -770,6 +780,7 @@ class BedroomTVControl(hass.Hass):
                     pass
             self.call_service("script/turn_on", entity_id="script.bedroom_tv_lift_position_up")
             self.log(f"TV OFF: Raising lift to UP position", level="INFO")
+            self._report_house_event("Bedroom TV turned off", "TV lift going up")
             # Update persistent position tracking
             self._update_lift_position("Up")
             # Stop periodic verification when TV is off
@@ -858,6 +869,7 @@ class BedroomTVControl(hass.Hass):
                         pass
                 self.call_service("script/turn_on", entity_id="script.bedroom_tv_lift_position_down")
                 self.log("TV ON: Lowering lift to DOWN position", level="INFO")
+                self._report_house_event("Bedroom TV turned on", "TV lift going down")
                 # Update persistent position tracking
                 self._update_lift_position("Down")
                 # Start periodic verification if enabled

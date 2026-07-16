@@ -210,7 +210,29 @@ class BedroomSolarShade(hass.Hass):
         self._last_cmd = desired
         self.log(f"Set {self.cover} -> {desired}% ({reason})")
 
+    def _report_house_event(self, cause, effect):
+        """Explain a shade decision to the dashboard's Home activity feed. Fire-and-forget:
+        HouseEvents (apps/home_pulse) listens; if absent the event evaporates."""
+        try:
+            self.fire_event("house_events_report", cause=cause, effect=effect, icon="mdi:blinds")
+        except Exception:
+            pass
+
     def _publish(self, state, reason, attrs):
+        # Home-activity reporting on MODE TRANSITIONS only - this eval runs every few
+        # minutes and nudges the position by one step at a time, so per-move reporting
+        # would flood the feed. Entering/leaving shading (or closing for away) is the
+        # decision a housemate actually notices. Never reported in dry-run - nothing moved.
+        prev_mode = getattr(self, "_house_evt_mode", None)
+        if state in ("open", "shading", "away"):
+            if prev_mode is not None and state != prev_mode and not self.dry_run:
+                if state == "shading":
+                    self._report_house_event("Sun on the bedroom window", "Shading the bedroom blind")
+                elif state == "away":
+                    self._report_house_event("Nobody home", "Closing bedroom blind fully to block heat")
+                elif state == "open" and prev_mode == "shading":
+                    self._report_house_event("Sun moved off the window", "Opening bedroom blind for daylight")
+            self._house_evt_mode = state
         a = dict(attrs or {})
         a["reason"] = reason
         a["friendly_name"] = "Bedroom sun shade"
