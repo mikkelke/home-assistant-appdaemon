@@ -190,6 +190,16 @@ class DryerMonitor(hass.Hass):
         except Exception as e:
             self.log(f"WARN: Error getting SonosNotifier app: {e}", level="WARNING")
 
+        # Dead-plug watchdog: unlike the dishwasher there is no Error state here - an
+        # unavailable plug forces Off immediately (_handle_unavailable), so a dead Shelly
+        # is indistinguishable from an idle dryer. After this grace, page the phone; one
+        # push per outage + all-clear on recovery (gw2000a_watchdog policy: dead sensor =
+        # maintenance to act on, not house-feed material).
+        self.plug_outage_push_after_seconds = int(self.args.get("power_unavailable_push_after_seconds", 180))
+        self.notify_target = self.args.get("notify_target", ["mikkel"])
+        self._plug_outage_push_timer = None
+        self._plug_outage_pushed = False
+
         # Bootstrap
         current_power = self.get_state(self.power_sensor)
         if current_power not in ["unknown", "unavailable"]:
@@ -198,6 +208,11 @@ class DryerMonitor(hass.Hass):
                 self._power_changed(self.power_sensor, None, None, current_watts, {})
             except (ValueError, TypeError):
                 self._handle_unavailable(self.power_sensor, None, None, current_power, {})
+        else:
+            # Plug already dead at app start: the unavailable listener will never fire
+            # (no transition), so arm the dead-plug watchdog here (washer does the
+            # same in its bootstrap).
+            self._begin_plug_outage_grace()
 
         self.log(f"DryerMonitor (Miele TCB150 WP) initialized - state: {self.state}", level="INFO")
 
@@ -1172,6 +1187,14 @@ class DryerMonitor(hass.Hass):
             self._handle_unavailable(entity, attr, old, new, kwargs)
             return
 
+        # Plug is reporting numbers again - stand down the dead-plug watchdog.
+        if self._plug_outage_push_timer:
+            self._safe_cancel_timer(self._plug_outage_push_timer)
+            self._plug_outage_push_timer = None
+        if self._plug_outage_pushed:
+            self._plug_outage_pushed = False
+            self._push_mobile("Power plug is reporting again - dryer monitoring resumed.")
+
         current_state = self.get_state(self.state_entity)
 
         # Record power readings when running
@@ -1446,3 +1469,36 @@ class DryerMonitor(hass.Hass):
         self._set_state_entity( state="Off")
         self._reset_programme_selectors_to_unconfirmed()
         self._reset_cycle_tracking()
+        if entity == self.power_sensor:
+            self._begin_plug_outage_grace()
+
+    def _begin_plug_outage_grace(self):
+        """Short plug dropouts are routine; only a lasting outage pages the phone."""
+        if self._plug_outage_pushed:
+            return
+        if self._plug_outage_push_timer and self.timer_running(self._plug_outage_push_timer):
+            return
+        self._plug_outage_push_timer = self.run_in(
+            self._plug_outage_push_timeout, self.plug_outage_push_after_seconds
+        )
+
+    def _plug_outage_push_timeout(self, kwargs):
+        self._plug_outage_push_timer = None
+        if self.get_state(self.power_sensor) not in ("unknown", "unavailable", None):
+            return
+        self._plug_outage_pushed = True
+        self._push_mobile(
+            f"Power plug stopped reporting (unavailable >= {self.plug_outage_push_after_seconds}s) - "
+            f"cycle monitoring is blind and the dryer just looks Off. Check the plug/WiFi."
+        )
+
+    def _push_mobile(self, message):
+        """Page the phone (plug outage / recovery) - same pattern as gw2000a_watchdog."""
+        try:
+            notifier = self.get_app("MobileNotifier")
+            if notifier is None:
+                self.log("MobileNotifier app not found - cannot push", level="WARNING")
+                return
+            self.create_task(notifier.notify(title="Dryer", message=message, target=self.notify_target))
+        except Exception as e:
+            self.log(f"notify failed: {e}", level="WARNING")
