@@ -150,6 +150,52 @@ class Deadline(unittest.TestCase):
         self.assertGreater(run_min, 0)
 
 
+class PlanDeadline(unittest.TestCase):
+    """Two-tier horizon (user, 2026-07-16): slots after 22:00 are bonus, not guaranteed --
+    bedtime spans 22:00-01:00 and the AC-removed press can erase them, so the load-bearing
+    plan must fit before 22:00. The regression that motivated it: with the plain midnight
+    horizon, a 21:1x evening top-up got scheduled to START at 22:08 -- a machine spinning up
+    right as the user might be getting into bed."""
+
+    def _plan(self, now):
+        app = make_app()
+        return app._plan_deadline(now)
+
+    def test_daytime_caps_at_2200_not_midnight(self):
+        now = datetime(2026, 7, 16, 14, 0)
+        self.assertEqual(self._plan(now), datetime(2026, 7, 16, 22, 0))
+
+    def test_evening_2113_still_2200(self):
+        # the exact situation that motivated the tier: work must land NOW, not at 22:08
+        now = datetime(2026, 7, 16, 21, 13)
+        self.assertEqual(self._plan(now), datetime(2026, 7, 16, 22, 0))
+
+    def test_final_minutes_keep_a_slot_not_zero(self):
+        # at 21:52 a hard 22:00 cap would leave zero slots and strand a live deficit
+        # for 8 minutes; the 15-min floor keeps cooling through the tier boundary.
+        now = datetime(2026, 7, 16, 21, 52)
+        self.assertEqual(self._plan(now), datetime(2026, 7, 16, 22, 7))
+
+    def test_after_2200_is_bonus_tier_midnight(self):
+        now = datetime(2026, 7, 16, 22, 30)
+        self.assertEqual(self._plan(now), datetime(2026, 7, 17, 0, 0))
+
+    def test_overnight_delegates_to_maintenance_window(self):
+        now = datetime(2026, 7, 17, 0, 30)
+        self.assertEqual(self._plan(now), datetime(2026, 7, 17, 1, 30))
+
+    def test_2113_schedule_cools_now_when_work_exceeds_remaining_slots(self):
+        # 48 min of work, 47 min of guaranteed horizon -> need >= total -> cool immediately
+        # (the old midnight horizon deferred this exact case to the 22:08+ cheap shoulder).
+        app = make_app()
+        app.cool_kw = 0.5
+        now = datetime(2026, 7, 16, 21, 13)
+        prices = {21: 2.8, 22: 2.3, 23: 2.05}
+        cool_now, _, _, _ = app._schedule(
+            now, app._plan_deadline(now), 48, lambda dt: prices.get(dt.hour, 2.5))
+        self.assertTrue(cool_now)
+
+
 class StashLightout(unittest.TestCase):
     """The AC-removed toggle is now the lights-out trigger (was: a bedtime time-window guess
     that could be hours off from when anyone actually went to bed, corrupting rise_frac)."""

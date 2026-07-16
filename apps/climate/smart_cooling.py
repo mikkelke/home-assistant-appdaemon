@@ -17,12 +17,14 @@ either wrong or a chore to keep updated. Two independent things used to share th
   - WHEN TO STOP: the user clicks ac_removed_entity right before physically taking the unit out -
     that IS lights-out, whatever the clock says, and also stamps the coast-learning baseline
     (see _stash_lightout). No more forced cutoff at a stale clock time.
-  - HOW FAR AHEAD TO SHOP FOR CHEAP POWER: the price-optimizer needs SOME horizon or it has nothing
-    to bound its search - midnight is a deliberate hard cap (user, 2026-07-15): never bank on a
-    cheap slot that might not exist by the time anyone's actually asleep. But the cap only bounds
-    PLANNING, not operation: near and past midnight (through 06:00) the horizon becomes a rolling
-    1h maintenance window instead, holding target until the AC-removed press (see _deadline --
-    the raw cap shut the AC off at 23:52 with the user still up, 2026-07-15).
+  - HOW FAR AHEAD TO SHOP FOR CHEAP POWER: two tiers (user, 2026-07-16). GUARANTEED: until
+    22:00 (the earliest plausible bedtime) the load-bearing plan must fit BEFORE 22:00 -- later
+    slots can be erased by the AC-removed press, and a top-up starting at 22:08 is a noisy
+    machine next to someone trying to sleep (see _plan_deadline). BONUS: from 22:00 until the
+    AC-removed press the user is evidently still up, so keep improving the night against the
+    wider _deadline horizon (midnight cap -- never bank on slots past it, user 2026-07-15 --
+    then a rolling 1h maintenance window through 06:00; the raw midnight cap once shut the AC
+    off at 23:52 mid-deficit, hence the 1h floor).
 
 Stall-breaker (2026-07-15): the unit regulates off its own intake sensor, which sits in its cold
 outflow pool -- it parks at ~300 W "idle" with the floor still degrees above target, and no fan
@@ -216,6 +218,22 @@ class SmartCooling(hass.Hass):
         if now.hour < 6:
             return now + timedelta(hours=1)
         return max(self._next_midnight(now), now + timedelta(hours=1))
+
+    def _plan_deadline(self, now):
+        """Two-tier horizon (user, 2026-07-16: "22-00 is just bonus, not the period we know
+        we can cool ... we need to prepare before"). Bedtime spans 22:00-01:00, so only slots
+        BEFORE 22:00 are guaranteed to exist -- anything later can be erased by the AC-removed
+        press, and a top-up that starts at 22:08 is a noisy machine next to someone trying to
+        sleep. So until 22:00 the load-bearing plan must fit before 22:00, even at peak prices
+        (user 2026-07-15: being ready for an early bed beats the last kroner). From 22:00 the
+        BONUS tier opens: the user is evidently still up, so shop the full _deadline horizon
+        (midnight cap, then the overnight maintenance window) and keep improving the night.
+        The 15-min floor keeps the final pre-22:00 minutes cooling on a live deficit instead
+        of stranding it on a zero-slot horizon (same failure shape _deadline guards at 23:5x)."""
+        if 6 <= now.hour < 22:
+            guaranteed = datetime(now.year, now.month, now.day, 22, 0)
+            return max(guaranteed, now + timedelta(minutes=15))
+        return self._deadline(now)
 
     def _build_price_map(self, *arrays):
         pm = {}
@@ -427,7 +445,7 @@ class SmartCooling(hass.Hass):
                               max(float(ce), ceiling_base - self.comfort_max_reduction, self.min_temp))
         except (TypeError, ValueError):
             pass
-        deadline = self._deadline(now)
+        deadline = self._plan_deadline(now)
 
         pm = self._build_price_map(
             await self._attr(self.price_entity, "raw_today", []),
@@ -611,6 +629,8 @@ class SmartCooling(hass.Hass):
         notably every routine 'Hold for cheaper power' / 'On track' breather."""
         if reason.startswith("Disarmed"):
             return "disarm"
+        if reason.startswith("AC removed"):
+            return "done"
         if reason.startswith("Bathroom window closed"):
             return "off_window"
         if "hard cap" in reason:
@@ -700,7 +720,9 @@ class SmartCooling(hass.Hass):
                 self._mark_switch("cool")
                 self.log(f"COOL on ({self.cool_setpoint}C/{self.cool_fan}): {reason}", level="INFO")
                 # reason is the planner's own explanation of WHY (cheap hour, deadline, deficit...)
-                await self._report_house_event(reason, f"AC cooling the bedroom to {self.cool_setpoint:g}C")
+                await self._report_house_event(
+                    "cool_on", reason,
+                    f"AC cooling the bedroom to {self.cool_setpoint:g}C", now)
             cur_temp = await self._attr(self.climate_entity, "temperature", None)
             if cur_temp is None or abs(float(cur_temp) - self.cool_setpoint) > 0.1:
                 await self.call_service("climate/set_temperature", entity_id=self.climate_entity, temperature=self.cool_setpoint)
@@ -728,7 +750,9 @@ class SmartCooling(hass.Hass):
             await self.call_service("climate/set_hvac_mode", entity_id=self.climate_entity, hvac_mode="off")
             self._mark_switch("off")
             self.log(f"AC off: {reason}", level="INFO")
-            await self._report_house_event(reason, "AC turned off")
+            now = (await self.get_now()).replace(tzinfo=None)
+            await self._report_house_event(self._feed_kind_for_off(reason), reason,
+                                           "AC turned off", now)
         except Exception as e:
             self.log(f"Failed to turn off: {e}", level="ERROR")
 
