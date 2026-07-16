@@ -35,11 +35,24 @@ echo "unit tests OK"
 python3 scripts/check_speakers.py
 
 # 3. sync only tracked files
-STAMP=$(ssh -o BatchMode=yes "$HOST" "date '+%Y-%m-%d %H:%M:%S'")
+# STAMP must be in the AppDaemon log's timezone (Europe/Copenhagen), not the box
+# clock (UTC): a UTC stamp sits 2h behind the log in summer, so the verify window
+# would include 2h of history and count stale initializations as fresh reloads.
+STAMP=$(ssh -o BatchMode=yes "$HOST" "TZ=Europe/Copenhagen date '+%Y-%m-%d %H:%M:%S'")
 LIST=$(mktemp)
 git ls-files apps > "$LIST"
-rsync -rltz --checksum --no-perms --no-owner --no-group --files-from="$LIST" . "$HOST:/data/appdaemon/"
+# apps/apps.yaml on the box is root-owned: rsync can transfer every byte and still
+# exit 23 because setting that one file's mtime is EPERM for mke. A times-only
+# failure must not kill the deploy before the reload check; any other rsync error
+# still aborts. Real cure: ssh $HOST 'sudo chown mke /data/appdaemon/apps/apps.yaml'
+rc=0
+rsync -rltz --checksum --no-perms --no-owner --no-group --files-from="$LIST" . "$HOST:/data/appdaemon/" || rc=$?
 rm -f "$LIST"
+if [ "$rc" -eq 23 ]; then
+  echo "WARNING: rsync exit 23 (attrs only, see errors above) - continuing to verify"
+elif [ "$rc" -ne 0 ]; then
+  exit "$rc"
+fi
 echo "synced (tracked files only)"
 
 # 4. verify reload
