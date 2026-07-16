@@ -31,6 +31,11 @@ SmartCooling:
   default_night_ceiling: 23.0
   min_temp: 16.0          # hardware floor; never drive the room below
   sleep_hours: 8.0
+  # Condenser room (bathroom): door kept sealed (user 2026-07-16), so a warm bathroom
+  # only costs condenser efficiency (~2-3%/C) - cheaper than deferring to peak prices.
+  # Soft cap just annotates the plan; only the hard cap stops cooling (derate guard).
+  bathroom_backleak_c: 30.0
+  bathroom_hard_max_c: 33.0
 
   # actuation. Fan sweep 2026-07-15: fan draw is trivial (44 W even at full) and no fan
   # mode prevents the intake stall -- so fan choice is free; auto per user preference

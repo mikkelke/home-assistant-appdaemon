@@ -37,8 +37,10 @@ progress = tonight's feasible floor: stop paying, learn it (EMA across nights), 
 nights against the feasible depth -- probed slightly deeper so milder nights can re-teach us.
 
 Knobs you ever touch: Arm + max night temperature (a default is fine, depth is calculated); AC
-removed. dry_run makes every AC command a no-op. The bathroom (condenser dump, leaky door) is
-watched so we ease off rather than back-leak heat into the bedroom.
+removed. dry_run makes every AC command a no-op. The bathroom (the condenser's heat dump) is
+watched price-aware: its door is kept sealed so a warm bathroom only costs condenser efficiency
+(~2-3%/C, far less than the cheap-vs-peak price spread) -- we push through warm-bathroom cheap
+slots and let venting happen in hours we'd hold anyway; only near-derate heat (hard cap) stops us.
 """
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
@@ -78,7 +80,12 @@ class SmartCooling(hass.Hass):
         self.zone_offset = float(a("zone_offset", 1.0))           # mid wall sits ~this above the floor
         self.person_offset = float(a("person_offset", 0.5))      # sleeper lifts the equilibrium a touch
         self.default_rise_frac = float(a("default_rise_frac", 0.7))  # conservative gap-fraction closed in the window
-        self.bathroom_max = float(a("bathroom_backleak_c", 30.0))    # ease off above this (condenser back-leak)
+        # Condenser-room temps: above `bathroom_max` the condenser loses ~2-3%/C efficiency
+        # (worth flagging, NOT worth skipping a cheap slot for -- door is kept sealed, so no
+        # real back-leak; user 2026-07-16). Above `bathroom_hard_max` we stop regardless of
+        # price: derate territory, extra watts stop moving heat.
+        self.bathroom_max = float(a("bathroom_backleak_c", 30.0))
+        self.bathroom_hard_max = float(a("bathroom_hard_max_c", 33.0))
         # --- actuation. Fan draw is trivial (44 W even at full, measured 2026-07-15 sweep;
         # the compressor is ~500-800 W) and NO fan mode prevents the intake stall below, so
         # medium is kept purely for air distribution. Low setpoint so it doesn't idle a
@@ -465,7 +472,14 @@ class SmartCooling(hass.Hass):
         cool_now, next_start, run_min, est_cost = self._schedule(now, deadline, minutes_needed, price_at)
         slots_left = int((deadline - now).total_seconds() // 900)
         time_constrained = run_min >= max(1, slots_left) * 15
-        backleak = bath is not None and bath >= self.bathroom_max
+        # Bathroom heat is the condenser's own dump, not a bedroom threat: the user seals the
+        # bathroom door (2026-07-16), so back-leak is ~nil and a warm condenser room only costs
+        # efficiency (~2-3%/C). That penalty is far smaller than the cheap-vs-peak price spread,
+        # so we push through warm-bathroom slots while power is cheap and let the venting happen
+        # in hours we'd hold anyway. Only the hard cap stops cooling: near condenser-derate
+        # territory more watts stop buying heat-moved at any price.
+        backleak_hard = bath is not None and bath >= self.bathroom_hard_max
+        bath_warm = bath is not None and bath >= self.bathroom_max
 
         # decision
         if floor <= self.min_temp:
@@ -480,8 +494,9 @@ class SmartCooling(hass.Hass):
                                    f"won't absorb")
         elif not window_open:
             want, reason = False, "Bathroom window closed -- open it so the condenser can vent"
-        elif backleak and not time_constrained:
-            want, reason = False, f"Easing off: bathroom {bath:.1f}C would back-leak -- letting it vent"
+        elif backleak_hard:
+            want, reason = False, (f"Bathroom {bath:.1f}C past the {self.bathroom_hard_max:.0f}C hard cap "
+                                   f"-- venting before the condenser derates")
         elif cool_now:
             want = True
             reason = (f"Pre-cool floor {floor:.1f}->{reach_target:.1f}C (keep zone <= {ceiling:.0f} for "
@@ -489,7 +504,9 @@ class SmartCooling(hass.Hass):
                       f"price {price_now:.2f}"
                       + ("  [floor-limited: hottest it can do]" if floor_limited else "")
                       + (f"  [capped by feasible ~{reach_target:.1f}C, ideal {target:.1f}C]"
-                         if reach_target > target + 0.05 else ""))
+                         if reach_target > target + 0.05 else "")
+                      + (f"  [condenser room {bath:.1f}C -- pushing through the cheap slot]"
+                         if bath_warm else ""))
         else:
             nx = next_start.strftime("%H:%M") if next_start else "later"
             want, reason = False, (f"Hold for cheaper power: need ~{run_min} min, start ~{nx} "
