@@ -410,7 +410,11 @@ class LivingRoomTvControl(hass.Hass):
                         pass
             # After stopping, request a targeted reset so volumes/mute are normalized
             try:
-                self.fire_event("sonos_reset_speakers", targets=[self.living_room_speaker_entity])
+                self.fire_event(
+                    "sonos_reset_speakers",
+                    targets=[self.living_room_speaker_entity],
+                    source="Living room TV turned off",
+                )
             except Exception:
                 pass
         except Exception as e:
@@ -804,6 +808,7 @@ class LivingRoomTvControl(hass.Hass):
             self.fire_event(
                 "sonos_reset_speakers",
                 targets=[self.living_room_speaker_entity],
+                source="Living room TV turned on",
             )
         except Exception as e:
             self.log(f"sonos_reset_speakers failed: {e}", level="WARNING")
