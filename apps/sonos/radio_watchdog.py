@@ -84,6 +84,18 @@ class RadioWatchdog(hass.Hass):
             await self.call_service("media_player/play_media", entity_id=player,
                                     media_content_id=cid, media_content_type="music")
             self.run_in(self._verify_resume, 15, player=player, cid=cid)
+            # Explain the invisible self-heal to the dashboard's Home activity feed -
+            # a silently-restarted radio is otherwise indistinguishable from "it never stopped".
+            try:
+                room = player.split(".", 1)[-1].replace("_", " ").capitalize()
+                await self.fire_event(
+                    "house_events_report",
+                    cause="Radio stream went silent",
+                    effect=f"Restarting the radio on {room}",
+                    icon="mdi:radio",
+                )
+            except Exception:
+                pass
         except Exception as e:
             self.log(f"watchdog check failed for {player}: {e}", level="ERROR")
 

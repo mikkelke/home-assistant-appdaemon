@@ -19,6 +19,9 @@ class ManualOverrideTimeout(hass.Hass):
         self.timeout_s = float(self.args.get("timeout_hours", 12)) * 3600.0
         self.booleans = list(self.args.get("booleans") or [])
         self._timers = {}
+        # Entities whose OFF we caused ourselves (expiry) - suppresses the duplicate
+        # "turned off" feed report in _on_change. See _expire.
+        self._self_cleared = set()
         for ent in self.booleans:
             self.listen_state(self._on_change, ent)
         self.run_in(lambda _: self._resync_all(), 5)
@@ -61,8 +64,21 @@ class ManualOverrideTimeout(hass.Hass):
     def _on_change(self, entity, attribute, old, new, kwargs):
         if new == "on":
             self._resync(entity)
+            self._report(
+                f"{self._room_label(entity)} lights switched to manual",
+                f"Automation paused - resumes within {self.timeout_s / 3600:.0f} h",
+            )
         elif new == "off":
             self._cancel(entity)
+            # Our own _expire turn_off lands here too - it already reported the richer
+            # "timed out" story, so only a human flipping the toggle reports this one.
+            if entity in self._self_cleared:
+                self._self_cleared.discard(entity)
+            else:
+                self._report(
+                    f"{self._room_label(entity)} manual override turned off",
+                    "Lights back to automatic",
+                )
 
     def _expire(self, ent):
         try:
@@ -71,9 +87,30 @@ class ManualOverrideTimeout(hass.Hass):
                     f"{ent}: manual override expired after {self.timeout_s / 3600:.0f}h - back to automatic",
                     level="INFO",
                 )
+                self._self_cleared.add(ent)
                 self.turn_off(ent)
+                self._report(
+                    f"{self._room_label(ent)} manual override timed out after {self.timeout_s / 3600:.0f} h",
+                    "Lights back to automatic",
+                )
         except Exception as e:
             self.log(f"expire failed for {ent}: {e}", level="ERROR")
+
+    @staticmethod
+    def _room_label(ent):
+        """input_boolean.living_room_lights_manual -> 'Living room'."""
+        name = ent.split(".", 1)[-1]
+        if name.endswith("_lights_manual"):
+            name = name[: -len("_lights_manual")]
+        return name.replace("_", " ").strip().capitalize()
+
+    def _report(self, cause, effect):
+        """Explain an override change to the dashboard's Home activity feed. Fire-and-forget:
+        HouseEvents (apps/home_pulse) listens; if absent the event evaporates."""
+        try:
+            self.fire_event("house_events_report", cause=cause, effect=effect, icon="mdi:hand-back-right")
+        except Exception:
+            pass
 
     def _cancel(self, ent):
         h = self._timers.pop(ent, None)

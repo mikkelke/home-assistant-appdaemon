@@ -300,6 +300,19 @@ class WakeupRoutine(hass.Hass):
             self.log("[wake] Both away; skipping.", log=self.user_log); return
 
         self.log("[wake] Alarm firing.", log=self.user_log)
+        # Explain the routine to the dashboard's Home activity feed (fire-and-forget) -
+        # blinds moving and music starting "by themselves" is the house acting, and this
+        # is the one place that knows why. Once per day by construction (alarm fire).
+        try:
+            alarm_hhmm = str(self.get_state(self.alarm_time_entity) or "")[:5]
+            self.fire_event(
+                "house_events_report",
+                cause=f"Wake-up alarm ({alarm_hhmm})" if alarm_hhmm else "Wake-up alarm",
+                effect="Raising the blinds and fading the lights in",
+                icon="mdi:weather-sunset-up",
+            )
+        except Exception:
+            pass
         self._attach_cancel_listeners()
         self._group_speakers()
         self._start_media_and_volume_ramp()
