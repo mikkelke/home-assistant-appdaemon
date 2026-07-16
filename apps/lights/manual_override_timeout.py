@@ -88,12 +88,15 @@ class ManualOverrideTimeout(hass.Hass):
             self.log(f"state_changed handling failed: {e}", level="ERROR")
 
     def _handle_change(self, entity, old, new, person):
+        # Wording stays neutral; the acting person travels in the report's separate `by`
+        # field (feed v4) and the dashboard renders it as its own muted "By <name>" line.
         room = self._room_label(entity)
         if new == "on":
             self._resync(entity)
             self._report(
-                f"{person} set {room} lights to manual" if person else f"{room} lights switched to manual",
+                f"{room} lights switched to manual",
                 f"Automation paused - resumes within {self.timeout_s / 3600:.0f} h",
+                by=person,
             )
         elif new == "off":
             self._cancel(entity)
@@ -103,8 +106,9 @@ class ManualOverrideTimeout(hass.Hass):
                 self._self_cleared.discard(entity)
             else:
                 self._report(
-                    f"{person} turned {room} manual override off" if person else f"{room} manual override turned off",
+                    f"{room} manual override turned off",
                     "Lights back to automatic",
+                    by=person,
                 )
 
     def _person_name(self, user_id):
@@ -157,11 +161,14 @@ class ManualOverrideTimeout(hass.Hass):
             name = name[: -len("_lights_manual")]
         return name.replace("_", " ").strip().capitalize()
 
-    def _report(self, cause, effect):
+    def _report(self, cause, effect, by=None):
         """Explain an override change to the dashboard's Home activity feed. Fire-and-forget:
         HouseEvents (apps/home_pulse) listens; if absent the event evaporates."""
         try:
-            self.fire_event("house_events_report", cause=cause, effect=effect, icon="mdi:hand-back-right")
+            payload = {"cause": cause, "effect": effect, "icon": "mdi:hand-back-right"}
+            if by:
+                payload["by"] = by
+            self.fire_event("house_events_report", **payload)
         except Exception:
             pass
 

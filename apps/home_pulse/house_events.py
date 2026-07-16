@@ -18,8 +18,12 @@ things you can see/hear yourself has no value):
 
 Feed shape (attributes, replace=True on every publish):
     events: newest-first list of {"ts": <UTC ISO>, "icon": <mdi:...>, "text": <ascii>,
-                                  "cause": <ascii, optional>, "effect": <ascii, optional>}
+                                  "cause": <ascii, optional>, "effect": <ascii, optional>,
+                                  "by": <person display name, optional - v4>}
 State = ts of the newest event (cheap change signal for the dashboard).
+`by` carries the acting HUMAN when knowable (report payloads and lock attribution);
+the dashboard renders it as its own muted "By <name>" line (HA-Activity-style), so
+emitters keep cause/effect wording neutral instead of baking names into sentences.
 
 Persistence (v3): entity first, state file second. The feed is re-read from the
 entity on app reload (survives code deploys), and from `house_events_state.json`
@@ -96,12 +100,13 @@ def sanitize_feed(events):
 
 
 def lock_event(name, old, new, changed_by):
-    """Event tuple (icon, text) for a lock transition, or None.
+    """Event tuple (icon, text, by) for a lock transition, or None.
 
     `changed_by` is best-effort attribution (the cloud twin's attribute, already
-    freshness-checked by the caller): a person name reads "by <name>", the
-    integration's literal "Auto Lock" reads "automatically", and no/stale
-    attribution just states the fact - a wrong name is worse than no name.
+    freshness-checked by the caller): a person name lands in the separate `by`
+    field (v4 - the dashboard renders it as its own muted "By <name>" line), the
+    integration's literal "Auto Lock" reads "automatically" inside the text, and
+    no/stale attribution just states the fact - a wrong name is worse than no name.
     """
     if old in (None, "unavailable", "unknown") or new == old:
         return None
@@ -114,18 +119,24 @@ def lock_event(name, old, new, changed_by):
     else:
         return None  # jammed/opening/unavailable - not a human-meaningful milestone
     text = f"{name} {verb}"
+    by = None
     if isinstance(changed_by, str) and changed_by.strip():
-        by = changed_by.strip()[:MAX_TEXT_LEN]
-        text = f"{text} automatically" if by == "Auto Lock" else f"{text} by {by}"
-    return icon, text
+        who = changed_by.strip()[:MAX_TEXT_LEN]
+        if who == "Auto Lock":
+            text = f"{text} automatically"
+        else:
+            by = who
+    return icon, text, by
 
 
 def build_report_event(data):
-    """Validated {icon, text, cause, effect} from a house_events_report payload, or None.
+    """Validated {icon, text, cause, effect, by} from a house_events_report payload, or None.
 
     `cause` and `effect` are required non-empty strings (that's the entire point of a
-    report - explaining WHY); `icon` optional. Length-capped: a misbehaving emitter
-    must not be able to bloat the feed entity.
+    report - explaining WHY); `icon` optional; `by` (v4) optional acting-person display
+    name - the dashboard renders it as its own muted "By <name>" line, so emitters keep
+    the cause/effect wording neutral instead of baking names into sentences. Length-
+    capped: a misbehaving emitter must not be able to bloat the feed entity.
     """
     if not isinstance(data, dict):
         return None
@@ -140,11 +151,14 @@ def build_report_event(data):
     icon = data.get("icon")
     if not isinstance(icon, str) or not icon.startswith("mdi:"):
         icon = "mdi:auto-fix"
+    by = data.get("by")
+    by = by.strip()[:MAX_TEXT_LEN] if isinstance(by, str) and by.strip() else None
     return {
         "icon": icon,
         "text": f"{cause} -> {effect}",
         "cause": cause,
         "effect": effect,
+        "by": by,
     }
 
 
@@ -207,8 +221,8 @@ class HouseEvents(hass.Hass):
         changed_by = self._fresh_changed_by(self.lock_attribution.get(entity))
         result = lock_event(name, kwargs["old"], kwargs["new"], changed_by)
         if result:
-            icon, text = result
-            self._add(icon, text)
+            icon, text, by = result
+            self._add(icon, text, by=by)
 
     def _fresh_changed_by(self, attribution_entity):
         """The cloud twin's changed_by, or None when absent/stale (see lock_event's doc)."""
@@ -233,7 +247,7 @@ class HouseEvents(hass.Hass):
     def _on_report(self, event_name, data, kwargs):
         event = build_report_event(data)
         if event:
-            self._add(event["icon"], event["text"], cause=event["cause"], effect=event["effect"])
+            self._add(event["icon"], event["text"], cause=event["cause"], effect=event["effect"], by=event["by"])
 
     # -- feed management ----------------------------------------------------
 
@@ -258,7 +272,7 @@ class HouseEvents(hass.Hass):
             self.log(f"Could not restore previous feed from state file: {e}", level="WARNING")
             return []
 
-    def _add(self, icon, text, cause=None, effect=None):
+    def _add(self, icon, text, cause=None, effect=None, by=None):
         now = self.get_now()
         now_iso = now.isoformat()
         # Flap guard: identical text again within the window is noise, not news.
@@ -278,6 +292,8 @@ class HouseEvents(hass.Hass):
         if cause and effect:
             entry["cause"] = cause
             entry["effect"] = effect
+        if by:
+            entry["by"] = by
         self.events.insert(0, entry)
         del self.events[MAX_EVENTS:]
         self._publish()

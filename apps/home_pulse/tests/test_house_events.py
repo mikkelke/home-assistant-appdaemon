@@ -84,23 +84,28 @@ class SanitizeFeedTests(unittest.TestCase):
 
 
 class LockEventTests(unittest.TestCase):
+    # v4: lock_event returns (icon, text, by) - the person travels in `by`, never in text.
     def test_unlocked_with_name(self):
-        icon, text = house_events.lock_event("Front door", "locked", "unlocked", "Mikkel")
+        icon, text, by = house_events.lock_event("Front door", "locked", "unlocked", "Mikkel")
         self.assertEqual(icon, "mdi:lock-open-variant")
-        self.assertEqual(text, "Front door unlocked by Mikkel")
+        self.assertEqual(text, "Front door unlocked")
+        self.assertEqual(by, "Mikkel")
 
     def test_auto_lock_reads_automatically(self):
-        icon, text = house_events.lock_event("Front door", "unlocked", "locked", "Auto Lock")
+        icon, text, by = house_events.lock_event("Front door", "unlocked", "locked", "Auto Lock")
         self.assertEqual(icon, "mdi:lock")
         self.assertEqual(text, "Front door locked automatically")
+        self.assertIsNone(by)
 
     def test_no_attribution_states_the_fact(self):
-        _, text = house_events.lock_event("Front door", "locked", "unlocked", None)
+        _, text, by = house_events.lock_event("Front door", "locked", "unlocked", None)
         self.assertEqual(text, "Front door unlocked")
+        self.assertIsNone(by)
 
     def test_blank_attribution_ignored(self):
-        _, text = house_events.lock_event("Front door", "locked", "unlocked", "   ")
+        _, text, by = house_events.lock_event("Front door", "locked", "unlocked", "   ")
         self.assertEqual(text, "Front door unlocked")
+        self.assertIsNone(by)
 
     def test_restart_replay_suppressed(self):
         self.assertIsNone(house_events.lock_event("Front door", None, "locked", None))
@@ -111,8 +116,16 @@ class LockEventTests(unittest.TestCase):
         self.assertIsNone(house_events.lock_event("Front door", "locked", "locked", None))
 
     def test_attribution_length_capped(self):
-        _, text = house_events.lock_event("Front door", "locked", "unlocked", "x" * 500)
-        self.assertLessEqual(len(text), len("Front door unlocked by ") + house_events.MAX_TEXT_LEN)
+        _, _, by = house_events.lock_event("Front door", "locked", "unlocked", "x" * 500)
+        self.assertLessEqual(len(by), house_events.MAX_TEXT_LEN)
+
+    def test_report_by_passthrough(self):
+        event = house_events.build_report_event(
+            {"cause": "Kitchen lights switched to manual", "effect": "Automation paused", "by": " Mikkel "}
+        )
+        self.assertEqual(event["by"], "Mikkel")
+        no_by = house_events.build_report_event({"cause": "c", "effect": "e"})
+        self.assertIsNone(no_by["by"])
 
 
 if __name__ == "__main__":
