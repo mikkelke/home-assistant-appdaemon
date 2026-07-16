@@ -365,6 +365,7 @@ class Intercom(hass.Hass):
         # ESP32 publishes "unlocking" for 3 seconds, then "locked"
         # Accept both "unlocked" and "unlocking" as success
         if current_state in ["unlocked", "unlocking"]:
+            first_success = outcome is not None and not outcome.get("succeeded")
             if outcome is not None:
                 outcome["succeeded"] = True
             self.log(f"OK: Successfully unlocked {lock_entity} (attempt {unlock_attempt})", level="INFO")
@@ -382,6 +383,9 @@ class Intercom(hass.Hass):
                     self.log(f"Sent follow-up TTS for {lock_entity}", level="DEBUG")
                 except Exception as e:
                     self.log(f"Error sending follow-up TTS for {lock_entity}: {e}", level="ERROR")
+            # Notify + house feed once per ring, on the attempt that first confirms success
+            if first_success:
+                self._report_auto_open_success(trigger_entity, lock_entity, outcome, unlock_attempt)
         elif current_state == state_before:
             self.log(f"FAIL: Unlock failed for {lock_entity} (attempt {unlock_attempt}): state unchanged ({current_state})", level="WARNING")
         else:
@@ -396,6 +400,36 @@ class Intercom(hass.Hass):
             and not outcome.get("succeeded")
         ):
             self._report_auto_open_failure(trigger_entity, lock_entity, outcome)
+
+    def _report_auto_open_success(self, trigger_entity, lock_entity, outcome, unlock_attempt):
+        """First confirmed unlock of a ring: notify Mikkel, log to the house feed."""
+        ring_label = outcome.get("ring_label", "door")
+        self.log(
+            f"AUTO-OPEN: confirmed unlock of {lock_entity} after {ring_label} ring (attempt {unlock_attempt})",
+            level="INFO",
+        )
+
+        if self.mobile_notifier:
+            try:
+                self.create_task(self.mobile_notifier.notify(
+                    title="Intercom auto-opened",
+                    message=f"Someone rang the {ring_label} and the door was unlocked automatically.",
+                    target=self.notify_target,
+                ))
+            except Exception as e:
+                self.log(f"Auto-open success notification failed: {e}", level="WARNING")
+
+        # House feed entry for the CONFIRMED unlock - distinct from the optimistic
+        # ring-time "opening the door" line fired in _handle_trigger before verification.
+        try:
+            self.fire_event(
+                "house_events_report",
+                cause=f"Someone rang the {ring_label}",
+                effect="Auto-open confirmed unlocked",
+                icon="mdi:lock-open-variant",
+            )
+        except Exception as e:
+            self.log(f"house_events_report failed: {e}", level="DEBUG")
 
     def _report_auto_open_failure(self, trigger_entity, lock_entity, outcome):
         """All unlock attempts for a ring failed: log, mobile-notify, house feed."""
