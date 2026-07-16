@@ -35,10 +35,12 @@ SmartCooling:
   # actuation. Fan sweep 2026-07-15: fan draw is trivial (44 W even at full) and no fan
   # mode prevents the intake stall -- so fan choice is free; auto per user preference
   # 2026-07-16 (nobody in the room while pre-cooling, noise irrelevant).
-  # Setpoint stays 17: the unit itself takes 16 (proven from the Midea app 2026-07-16),
-  # but the HA integration hard-clamps set_temperature below its advertised min_temp 17
-  # (service call returns 500). App-side 16 or the boost preset are manual-only levers.
-  cool_setpoint: 17.0
+  # Setpoint 16 since 2026-07-16: the unit always accepted 16 (proven via the Midea app);
+  # the old 17 floor was the midea_auto_cloud integration's advertised min_temp, patched
+  # locally in the T0xAC default profile (repo ~/repositories/midea_auto_cloud, branch
+  # min-temp-16 -- re-apply if a HACS update overwrites it). Lower setpoint = the intake
+  # sensor must read 1C colder before the compressor parks = fewer stall-burps.
+  cool_setpoint: 16.0
   cool_fan_mode: auto
   cool_power_kw: 0.5      # measured engaged average 2026-07-15 (was 0.6 guess); est-cost only
   # Stall-breaker: idle-with-deficit -> fan_only burp so the intake reads room air,
