@@ -225,6 +225,11 @@ class DishwasherMonitor(hass.Hass):
         # Plug unavailable: tolerate short gaps; after this many seconds -> Error (not Off)
         self.power_unavailable_error_after_seconds = int(self.args.get("power_unavailable_error_after_seconds", 180))
         self.power_unavailable_error_timer = None
+        # A dead plug is maintenance Mikkel must act on -> page the phone, one push per
+        # outage + all-clear on recovery (gw2000a_watchdog policy; the house feed stays
+        # out of it - dead sensors are not house behavior).
+        self.notify_target = self.args.get("notify_target", ["mikkel"])
+        self._plug_error_pushed = False
 
         # State tracking
         self.program_timer = None
@@ -1975,6 +1980,17 @@ class DishwasherMonitor(hass.Hass):
             error_key="power_sensor",
         )
 
+    def _push_mobile(self, message):
+        """Page the phone (plug outage / recovery) - same pattern as gw2000a_watchdog."""
+        try:
+            notifier = self.get_app("MobileNotifier")
+            if notifier is None:
+                self.log("MobileNotifier app not found - cannot push", level="WARNING")
+                return
+            self.create_task(notifier.notify(title="Dishwasher", message=message, target=self.notify_target))
+        except Exception as e:
+            self.log(f"notify failed: {e}", level="WARNING")
+
     def _error_merged_attributes(self, reason, error_key):
         try:
             full = self.get_state(self.state_entity, attribute="all") or {}
@@ -1995,6 +2011,12 @@ class DishwasherMonitor(hass.Hass):
         self.state = "Error"
         self._set_state_entity(state="Error", attributes=self._error_merged_attributes(reason, error_key), replace=True)
         self.log(f"State -> Error ({reason})", level="WARNING")
+        # One push per outage by construction (already-Error returns above).
+        self._plug_error_pushed = True
+        self._push_mobile(
+            f"{reason} - cycle monitoring is blind (state -> Error). Check the plug/WiFi; "
+            f"the state auto-resets to Off once power readings return."
+        )
         self._reset_cycle_tracking()
         if was_running:
             self._strict_start_until_door_or_sustain = True
@@ -2011,6 +2033,12 @@ class DishwasherMonitor(hass.Hass):
         current_state = self.get_state(self.state_entity)
         if current_state == "Error":
             self._transition_to_off("Power sensor OK after Error (verify dishwasher)", force=True)
+            if self._plug_error_pushed:
+                self._plug_error_pushed = False
+                self._push_mobile(
+                    "Power plug is reporting again - state reset to Off. A cycle may have "
+                    "run unseen; verify the dishwasher."
+                )
             current_state = self.get_state(self.state_entity)
         if current_state == "Error":
             return

@@ -40,6 +40,8 @@ class WakeupRoutine(hass.Hass):
         self.stream_type = A["media_content_type"]
         # Optional fallback URL for failover
         self.fallback = A.get("media_fallback")
+        # Phone target for the total-media-failure page (see _verify_media_playback)
+        self.notify_target = A.get("notify_target", ["mikkel"])
 
         self.volume_entities = list(A["volume_entities"])
         self.volume_start = float(A["volume_start"])
@@ -112,6 +114,12 @@ class WakeupRoutine(hass.Hass):
         self.volume_active = False
         self.current_pct = None
         self.media_attempt = 0
+        # One feed line / one page per wake, however many times verification loops
+        self._media_fallback_reported = False
+        self._media_exhausted_reported = False
+        # True only while _minute_watchdog is invoking _alarm_fire, so the rescue feed
+        # entry rides an alarm that actually fired (not a gated skip)
+        self._fired_via_watchdog = False
         self.last_fire_date = None  # watchdog duplicate guard
         # Must exist before _schedule_daily_alarm() (it calls _schedule_watchdog_if_needed)
         self.watchdog = None
@@ -274,7 +282,11 @@ class WakeupRoutine(hass.Hass):
             if 0 <= delta < 60:
                 # Conditions enforced inside _alarm_fire
                 self.log("[wake] Watchdog firing alarm (minute check)", log=self.user_log)
-                self._alarm_fire(None)
+                self._fired_via_watchdog = True
+                try:
+                    self._alarm_fire(None)
+                finally:
+                    self._fired_via_watchdog = False
                 self.last_fire_date = now_dt.date()
                 # Stop watchdog after firing
                 if self.watchdog:
@@ -326,6 +338,20 @@ class WakeupRoutine(hass.Hass):
             )
         except Exception:
             pass
+        if self._fired_via_watchdog:
+            # The daily scheduler tick was missed and the minute watchdog rescued the
+            # routine - one extra admin line, because repeats of this point at an
+            # AppDaemon scheduler problem. Once per day by construction (last_fire_date).
+            try:
+                self.fire_event(
+                    "house_events_report",
+                    cause="Wake alarm's scheduled tick never fired",
+                    effect="Watchdog re-fired the morning routine",
+                    icon="mdi:alarm-check",
+                    audience="admin",
+                )
+            except Exception:
+                pass
         self._attach_cancel_listeners()
         self._group_speakers()
         self._start_media_and_volume_ramp()
@@ -366,6 +392,8 @@ class WakeupRoutine(hass.Hass):
     def _start_media_and_volume_ramp(self):
         # Attempt 0: play as-provided
         self.media_attempt = 0
+        self._media_fallback_reported = False
+        self._media_exhausted_reported = False
         self._play_media(self.stream_id)
         # Unmute all target players if present sensor says empty
         try:
@@ -438,6 +466,20 @@ class WakeupRoutine(hass.Hass):
                 level="WARNING",
                 log=self.user_log
             )
+            if not self._media_fallback_reported:
+                self._media_fallback_reported = True
+                # Waking to a different stream than configured is house behavior worth
+                # explaining (same reasoning as radio_watchdog's restart entry).
+                try:
+                    self.fire_event(
+                        "house_events_report",
+                        cause="Wake music stream failed to start",
+                        effect="Switched to the fallback stream",
+                        icon="mdi:radio",
+                        audience="admin",
+                    )
+                except Exception:
+                    pass
             self._play_media(next_id)
             self.run_in(self._verify_media_playback, 2)
             return
@@ -458,6 +500,21 @@ class WakeupRoutine(hass.Hass):
             level="WARNING",
             log=self.user_log
         )
+        if not self._media_exhausted_reported:
+            self._media_exhausted_reported = True
+            # A silent wake-up needs acting on (Sonos/stream is broken) and the push
+            # doubles as a backup wake signal - page the phone, per the gw2000a policy
+            # (failures Mikkel must fix page; the feed explains behavior, not outages).
+            try:
+                notifier = self.get_app("MobileNotifier")
+                self.create_task(notifier.notify(
+                    title="Wake-up alarm",
+                    message="Wake music never started - primary and fallback streams both "
+                            "failed on the bedroom Sonos. Blinds and lights still ran.",
+                    target=self.notify_target,
+                ))
+            except Exception as e:
+                self.log(f"[wake] media-failure notify failed: {e}", level="WARNING", log=self.user_log)
 
     def _verify_media_is_still_playing(self, _):
         """

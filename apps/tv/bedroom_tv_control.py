@@ -496,6 +496,12 @@ class BedroomTVControl(hass.Hass):
                         target="mikkel"))
                 except Exception as e:
                     self.log(f"raise-failure notify failed: {e}", level="WARNING")
+                # Push says "act now"; the feed entry explains the exposed TV in the
+                # timeline (rare terminal give-up, once per raise sequence).
+                self._report_house_event(
+                    "Bedroom TV lift never confirmed going up",
+                    f"Gave up after {len(self.RAISE_RETRY_DELAYS_S)} retries - the lift needs a manual raise",
+                )
                 self._raise_attempt = 1
                 return
             delay = self.RAISE_RETRY_DELAYS_S[attempt - 1]

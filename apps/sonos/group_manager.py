@@ -53,6 +53,9 @@ class SonosGroupManager(hass.Hass):
         self._group_operation_start_time = None  # Track when operation started for timeout detection
         self._group_operation_timeout_s = 30  # Auto-reset if stuck >30s
         self._group_operation_lock = threading.Lock()  # Lock for queue operations
+        # Per-guard timestamp of the last stuck-reset feed report - a truly wedged
+        # Sonos must not chat the admin feed (see _report_stuck_guard_reset)
+        self._stuck_report_last = {}
 
         # internal state
         self._last_trigger = 0
@@ -456,6 +459,11 @@ class SonosGroupManager(hass.Hass):
                         self.log(f"Resetting stuck _family_zone_sync_in_progress flag (was set {elapsed:.1f}s ago)", level="WARNING")
                         self._family_zone_sync_in_progress = False
                         self._family_zone_sync_start_time = None
+                        self._report_stuck_guard_reset(
+                            "family_zone_sync",
+                            "Sonos auto-grouping stalled",
+                            "Cleared a stuck sync guard to resume grouping",
+                        )
                     else:
                         self.log(f"Family Zone sync already in progress for {elapsed:.1f}s, skipping", level="DEBUG")
                         return
@@ -543,6 +551,27 @@ class SonosGroupManager(hass.Hass):
         """Reset the family zone sync flag after operations complete"""
         self._family_zone_sync_in_progress = False
         self._family_zone_sync_start_time = None
+
+    def _report_stuck_guard_reset(self, guard, cause, effect):
+        """One admin feed line when a stuck guard flag had to be force-cleared. The
+        self-heal is otherwise invisible, yet it explains delayed or dropped
+        (un)grouping the user did notice. 30 min per-guard cooldown on top of the
+        feed's own dup suppression - this must stay a rare entry, never a pulse."""
+        try:
+            now = self.datetime()
+            last = self._stuck_report_last.get(guard)
+            if last is not None and (now - last).total_seconds() < 1800:
+                return
+            self._stuck_report_last[guard] = now
+            self.fire_event(
+                "house_events_report",
+                cause=cause,
+                effect=effect,
+                icon="mdi:speaker-multiple",
+                audience="admin",
+            )
+        except Exception:
+            pass
     
     def _queue_group_operation(self, operation_type, target_entity, members, priority="normal"):
         """
@@ -641,6 +670,11 @@ class SonosGroupManager(hass.Hass):
                     with self._group_operation_lock:
                         self._group_operation_in_progress = False
                         self._group_operation_start_time = None
+                    self._report_stuck_guard_reset(
+                        "group_operation",
+                        "Sonos group operation stalled",
+                        "Cleared a stuck operation guard to resume the queue",
+                    )
                 else:
                     # Still processing, will be called again when current operation finishes
                     return
