@@ -170,6 +170,53 @@ class Intercom(hass.Hass):
                 if lock_state not in [None, "unknown", "unavailable"]:
                     auto_open_enabled = True
 
+        # Schedule unlocks BEFORE any TTS: chime_tts/say blocks this callback
+        # thread for 5-10s, which was the dominant share of the measured 6-11s
+        # ring->buzz latency (every daytime ring 2026-07-03..07-16; the one
+        # quiet-hours ring, where notify() returns early, buzzed in 2.0s).
+        # The visitor is already standing at the door - open first, talk after.
+        if auto_open_enabled:
+            # No follow-up TTS needed since the combined message covers it
+            self.pending_unlocks[entity] = []
+            for i in range(self.unlock_repeat_count):
+                delay = self.unlock_delay_s + i * self.unlock_repeat_interval_s
+
+                # Store handle reference in a list to allow modification in closure
+                handle_ref = [None]  # Use list to allow modification in closure
+
+                # Capture loop variables in closure to avoid late binding issues
+                trigger_ent = entity
+                attempt_num = i + 1
+
+                def unlock_callback(kwargs_inner):
+                    # Remove handle from pending_unlocks when this timer fires
+                    # This prevents "Invalid callback handle" warnings when trying to cancel
+                    # an already-fired timer
+                    if trigger_ent in self.pending_unlocks and handle_ref[0]:
+                        try:
+                            self.pending_unlocks[trigger_ent].remove(handle_ref[0])
+                            if not self.pending_unlocks[trigger_ent]:
+                                del self.pending_unlocks[trigger_ent]
+                        except (ValueError, KeyError):
+                            pass  # Handle already removed or doesn't exist
+                    # Call the actual unlock function
+                    kwargs_inner["trigger_entity"] = trigger_ent
+                    kwargs_inner["unlock_attempt"] = attempt_num
+                    self._perform_unlock(kwargs_inner)
+
+                # Get door sensor for this trigger
+                door_sensor = info.get("door_sensor") if info else None
+
+                handle = self.run_in(
+                    unlock_callback,
+                    delay,
+                    lock_entity=lock_entity,
+                    followup=None,
+                    door_sensor=door_sensor,
+                )
+                handle_ref[0] = handle  # Store handle for removal in callback
+                self.pending_unlocks[entity].append(handle)
+
         # Send TTS - combined message if auto-open enabled, otherwise just initial message
         if self.sonos_notifier:
             try:
@@ -198,51 +245,6 @@ class Intercom(hass.Hass):
             )
         except Exception as e:
             self.log(f"house_events_report failed: {e}", level="DEBUG")
-
-        # Auto-open logic
-        if not auto_open_enabled:
-            return
-
-        # Schedule unlocks; no follow-up TTS needed since we already sent combined message
-        self.pending_unlocks[entity] = []
-        for i in range(self.unlock_repeat_count):
-            delay = self.unlock_delay_s + i * self.unlock_repeat_interval_s
-            
-            # Store handle reference in a list to allow modification in closure
-            handle_ref = [None]  # Use list to allow modification in closure
-            
-            # Capture loop variables in closure to avoid late binding issues
-            trigger_ent = entity
-            attempt_num = i + 1
-            
-            def unlock_callback(kwargs_inner):
-                # Remove handle from pending_unlocks when this timer fires
-                # This prevents "Invalid callback handle" warnings when trying to cancel
-                # an already-fired timer
-                if trigger_ent in self.pending_unlocks and handle_ref[0]:
-                    try:
-                        self.pending_unlocks[trigger_ent].remove(handle_ref[0])
-                        if not self.pending_unlocks[trigger_ent]:
-                            del self.pending_unlocks[trigger_ent]
-                    except (ValueError, KeyError):
-                        pass  # Handle already removed or doesn't exist
-                # Call the actual unlock function
-                kwargs_inner["trigger_entity"] = trigger_ent
-                kwargs_inner["unlock_attempt"] = attempt_num
-                self._perform_unlock(kwargs_inner)
-            
-            # Get door sensor for this trigger
-            door_sensor = info.get("door_sensor") if info else None
-            
-            handle = self.run_in(
-                unlock_callback,
-                delay,
-                lock_entity=lock_entity,
-                followup=None,
-                door_sensor=door_sensor,
-            )
-            handle_ref[0] = handle  # Store handle for removal in callback
-            self.pending_unlocks[entity].append(handle)
 
     def _is_door_open(self, door_sensor):
         """Check if door is physically open based on door sensor."""
