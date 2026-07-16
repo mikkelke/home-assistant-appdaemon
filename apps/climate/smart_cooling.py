@@ -186,6 +186,18 @@ class SmartCooling(hass.Hass):
         except Exception:
             return default
 
+    @staticmethod
+    def _window_open(state):
+        """Vent-window read: only an explicit "off" from the contact means closed.
+
+        unavailable/unknown/None are Zigbee dropouts, not a closed window -- the contact
+        link-flapped 5x on 2026-07-16 (~70 s blips, battery full) and the old fail-closed
+        read (state == "on") shut the AC mid-cheap-slot on every blip, each time costing
+        the 10-min anti-short-cycle lockout on the way back. Fail-open is safe here: a
+        genuinely closed window pushes the unvented condenser room past bathroom_hard_max
+        within minutes, and that guard stops cooling regardless of what the contact says."""
+        return state != "off"
+
     def _next_midnight(self, now):
         """The price-optimizer's hard search cap (user, 2026-07-15): never plan on a cheap slot
         past midnight, since bedtime itself varies and might arrive before that slot would. Always
@@ -423,7 +435,7 @@ class SmartCooling(hass.Hass):
         )
         price_now = self._price_for(pm, now, await self._num(self.price_entity, 1.7))
         price_at = lambda dt: self._price_for(pm, dt, price_now)
-        window_open = (await self._state(self.vent_window)) == "on"
+        window_open = self._window_open(await self._state(self.vent_window))
 
         zone = round((floor + mid) / 2.0, 1)            # the floor-to-mid sleeping zone
         E = self._equilibrium(kitchen, mid, floor)

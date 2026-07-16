@@ -264,5 +264,29 @@ class TrackProgress(unittest.TestCase):
         self.assertAlmostEqual(app._feasible_floor, 19.5, places=2)  # w=1/2 EMA
 
 
+class WindowOpen(unittest.TestCase):
+    """Regression for the 2026-07-16 Zigbee flaps: binary_sensor.bathroom_window_contact
+    dropped off 5x that day (~70 s unavailable->unknown->on blips, battery full), and the
+    old fail-closed read (state == "on") turned each dropout into "Bathroom window closed
+    -- open it" with the AC off mid-cheap-slot and a 10-min anti-short-cycle lockout on
+    the way back. Only an explicit "off" may read as closed; a genuinely closed window is
+    backstopped by the bathroom_hard_max guard within minutes."""
+
+    def test_on_is_open(self):
+        self.assertTrue(sc.SmartCooling._window_open("on"))
+
+    def test_off_is_the_only_closed_reading(self):
+        self.assertFalse(sc.SmartCooling._window_open("off"))
+
+    def test_unavailable_dropout_does_not_interrupt_cooling(self):
+        self.assertTrue(sc.SmartCooling._window_open("unavailable"))
+
+    def test_unknown_dropout_does_not_interrupt_cooling(self):
+        self.assertTrue(sc.SmartCooling._window_open("unknown"))
+
+    def test_missing_entity_none_does_not_interrupt_cooling(self):
+        self.assertTrue(sc.SmartCooling._window_open(None))
+
+
 if __name__ == "__main__":
     unittest.main()
