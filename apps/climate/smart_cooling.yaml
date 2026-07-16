@@ -31,6 +31,13 @@ SmartCooling:
   default_night_ceiling: 23.0
   min_temp: 16.0          # hardware floor; never drive the room below
   sleep_hours: 8.0
+  # Trust the learned feasible floor from the FIRST night (default 2): with n=1 (20.5C,
+  # 2026-07-15) still untrusted, the planner spent 2026-07-16 evening asking ~255 min
+  # toward an ideal 16.8C the floor demonstrably won't reach, which forced it into the
+  # 2-3.5 kr peak slots -- the exact "600W in the expensive hours" waste the cap exists
+  # to prevent (user). The -0.3C probe below the learned limit still lets milder nights
+  # re-teach a deeper value, so a one-night fluke self-corrects.
+  feasible_min_samples: 1
   # Condenser room (bathroom): door kept sealed (user 2026-07-16), so a warm bathroom
   # only costs condenser efficiency (~2-3%/C) - cheaper than deferring to peak prices.
   # Soft cap just annotates the plan; only the hard cap stops cooling (derate guard).
