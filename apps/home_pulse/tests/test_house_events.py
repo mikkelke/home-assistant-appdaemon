@@ -70,6 +70,19 @@ class ReportEventTests(unittest.TestCase):
         self.assertEqual(len(event["effect"]), house_events.MAX_TEXT_LEN)
 
 
+class SanitizeFeedTests(unittest.TestCase):
+    def test_filters_and_caps(self):
+        good = {"ts": "2026-07-16T10:00:00+00:00", "text": "x"}
+        raw = [good] * (house_events.MAX_EVENTS + 10) + [{"ts": ""}, {"text": "no ts"}, "junk", None]
+        out = house_events.sanitize_feed(raw)
+        self.assertEqual(len(out), house_events.MAX_EVENTS)
+        self.assertTrue(all(e is good for e in out))
+
+    def test_non_list_is_empty(self):
+        self.assertEqual(house_events.sanitize_feed(None), [])
+        self.assertEqual(house_events.sanitize_feed({"events": []}), [])
+
+
 class LockEventTests(unittest.TestCase):
     def test_unlocked_with_name(self):
         icon, text = house_events.lock_event("Front door", "locked", "unlocked", "Mikkel")

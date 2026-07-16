@@ -21,10 +21,17 @@ Feed shape (attributes, replace=True on every publish):
                                   "cause": <ascii, optional>, "effect": <ascii, optional>}
 State = ts of the newest event (cheap change signal for the dashboard).
 
-Persistence: the previous feed is re-read from the entity on app reload, so a code
-deploy does not wipe it. An HA RESTART does wipe it - AppDaemon set_state entities
-are ephemeral (see appdaemon-deploy notes); the feed simply rebuilds. Accepted for v2.
+Persistence (v3): entity first, state file second. The feed is re-read from the
+entity on app reload (survives code deploys), and from `house_events_state.json`
+next to this module when the entity is gone - AppDaemon set_state entities are
+ephemeral across HA RESTARTS (see appdaemon-deploy notes), which used to wipe the
+feed. The file is rewritten on every added event; deploy.sh syncs tracked files
+only and never deletes, so the box's copy is safe.
 """
+
+import json
+import os
+from pathlib import Path
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
@@ -67,6 +74,15 @@ def appliance_event(name, old, new, attrs):
     if new == "Emptied":
         return "emptied", f"{name} emptied"
     return None
+
+
+def sanitize_feed(events):
+    """Validated copy of an events list from ANY persistence layer (entity attributes
+    or the state file) - malformed entries dropped, newest-first order trusted (the
+    writer's documented contract), hard-capped."""
+    if not isinstance(events, list):
+        return []
+    return [e for e in events if isinstance(e, dict) and e.get("ts") and e.get("text")][:MAX_EVENTS]
 
 
 def lock_event(name, old, new, changed_by):
@@ -125,6 +141,7 @@ def build_report_event(data):
 class HouseEvents(hass.Hass):
     def initialize(self):
         self.feed_entity = self.args.get("feed_entity", "sensor.house_events")
+        self._state_file = Path(self.args.get("state_file") or Path(__file__).with_name("house_events_state.json"))
         self.events = self._load_previous_feed()
 
         self.appliances = self.args.get(
@@ -213,12 +230,23 @@ class HouseEvents(hass.Hass):
     def _load_previous_feed(self):
         try:
             full = self.get_state(self.feed_entity, attribute="all") or {}
-            events = (full.get("attributes") or {}).get("events")
-            if isinstance(events, list):
-                return [e for e in events if isinstance(e, dict) and e.get("ts") and e.get("text")][:MAX_EVENTS]
+            events = sanitize_feed((full.get("attributes") or {}).get("events"))
+            if events:
+                return events
         except Exception as e:
-            self.log(f"Could not restore previous feed: {e}", level="WARNING")
-        return []
+            self.log(f"Could not restore previous feed from entity: {e}", level="WARNING")
+        # Entity empty/gone = HA restarted since the last publish (set_state entities
+        # are ephemeral) - fall back to the state file written on every added event.
+        try:
+            events = sanitize_feed(json.loads(self._state_file.read_text()).get("events"))
+            if events:
+                self.log(f"Feed restored from state file ({len(events)} events)")
+            return events
+        except FileNotFoundError:
+            return []
+        except Exception as e:
+            self.log(f"Could not restore previous feed from state file: {e}", level="WARNING")
+            return []
 
     def _add(self, icon, text, cause=None, effect=None):
         now = self.get_now()
@@ -243,7 +271,18 @@ class HouseEvents(hass.Hass):
         self.events.insert(0, entry)
         del self.events[MAX_EVENTS:]
         self._publish()
+        self._write_state_file()
         self.log(f"Event: {text}")
+
+    def _write_state_file(self):
+        # tmp + os.replace so a crash mid-write can't leave a truncated file for the
+        # next restore to choke on.
+        try:
+            tmp = self._state_file.with_name(self._state_file.name + ".tmp")
+            tmp.write_text(json.dumps({"events": self.events}))
+            os.replace(tmp, self._state_file)
+        except Exception as e:
+            self.log(f"State file write failed: {e}", level="WARNING")
 
     def _publish(self):
         try:
