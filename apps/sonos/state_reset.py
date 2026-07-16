@@ -463,13 +463,42 @@ class SonosStateReset(hass.Hass):
     def _all_targets_solo(self, entity_ids):
         return all(self._speaker_is_solo(eid) for eid in entity_ids)
 
+    def _needs_reset(self, sp):
+        """True when the speaker deviates from its default state: grouped, muted, or off its
+        configured default volume. Lets _do_reset skip speakers (and whole resets) that would
+        change nothing. A no-op reset is not free - it pauses GroupManager and follow_me for
+        the full ceremony and drops a feed entry that reads like a duplicate (user hit exactly
+        this 2026-07-16: a TV-triggered reset at 20:12 and an idle-timeout reset at 20:15,
+        the second restoring nothing). Fail-open: unreadable state -> reset as before."""
+        try:
+            if not self._speaker_is_solo(sp):
+                return True
+            if self.get_state(sp, attribute="is_volume_muted") is True:
+                return True
+            vol = self.get_state(sp, attribute="volume_level")
+            target = float(self.speaker_volumes.get(sp, self.default_volume))
+            # 0.02 absorbs Sonos' percent-integer rounding of volume_level
+            if vol is None or abs(float(vol) - target) > 0.02:
+                return True
+            return False
+        except Exception:
+            return True
+
     def _do_reset(self, targets, trigger, source=None):
+        already_default = [sp for sp in targets if not self._needs_reset(sp)]
+        if already_default:
+            self.log(f"Reset skip (already at defaults): {', '.join(already_default)}", level="INFO")
+            targets = [sp for sp in targets if sp not in already_default]
+        if not targets:
+            self.log("Nothing to reset - every requested speaker is already at defaults", level="INFO")
+            return
+
         if trigger == "manual_trigger":
             msg = f"Manual reset. Reset list: {', '.join(targets)}"
         else:
             msg = (f"Auto-reset after inactivity on {source}, "
                    f"reset list: {', '.join(targets)}")
-        
+
         self.log(msg, level="INFO")
         self._reset_in_progress = True
         self.log("Waiting for Group Manager to pause (listening for sonos_reset_ready)...", level="INFO")
