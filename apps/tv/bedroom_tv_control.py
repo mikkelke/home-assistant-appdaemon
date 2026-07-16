@@ -378,6 +378,35 @@ class BedroomTVControl(hass.Hass):
                 except Exception as e:
                     self.log(f"Error scheduling initial lift raise: {e}", level="ERROR")
             else:
+                # Startup auto-heal (2026-07-16: a deploy stopped the apps for ~1 min and
+                # the TV was turned off inside that gap - the OFF-path heal in
+                # _raise_lift_if_still_off never saw the transition, so a stale-paused
+                # Apple TV read as "TV on" here and held the lift DOWN until manual
+                # recovery). Same condition and cure as the OFF path: universal + Sony
+                # read off but the Apple TV was left active - sleep it via the remote to
+                # clear the stale state, then _raise_after_apple_refresh re-checks and raises.
+                try:
+                    sony_state = self.get_state(self.sony_tv_entity)
+                    apple_state = self.get_state(self.apple_tv_entity)
+                except Exception:
+                    sony_state = None
+                    apple_state = None
+                sony_off = sony_state in ("off", "unavailable", "unknown", "standby", None)
+                apple_active = apple_state in ("paused", "idle", "on")  # NOT "playing": genuine playback must never be slept/refreshed/raised
+                if tv_state == "off" and sony_off and apple_active and self.apple_tv_reset_enabled and not self._apple_refresh_in_progress:
+                    self._apple_refresh_in_progress = True
+                    self.log(
+                        f"Initial state check: TV off but Apple TV still active (sony='{sony_state}', apple='{apple_state}') "
+                        f"- sleeping Apple TV via remote to refresh, then raising lift",
+                        level="INFO",
+                    )
+                    try:
+                        self.call_service("remote/turn_off", entity_id="remote.bedroom_apple_tv")
+                        self.run_in(self._raise_after_apple_refresh, 3, path_marker="initial_state_check")
+                    except Exception as e:
+                        self._apple_refresh_in_progress = False
+                        self.log(f"Error sleeping Apple TV for refresh: {e}", level="ERROR")
+                    return
                 self.log(f"Initial state check: TV is on (state: '{tv_state}') - lowering lift to DOWN position", level="INFO")
                 # TV is on at startup - ensure lift is down
                 try:
