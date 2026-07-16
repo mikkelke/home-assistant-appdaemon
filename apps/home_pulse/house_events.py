@@ -10,6 +10,11 @@ things you can see/hear yourself has no value):
    emitting app just fire_event()s and never notices whether this app is running.
 2. A small set of observed appliance milestones that carry information you can't
    see from the machine itself (finished + energy used; emptied).
+3. Observed lock activity (v3): "Front door unlocked by Mikkel" / "locked
+   automatically". The authoritative BLE lock entity carries no attribution, so the
+   entry is emitted after a short delay and enriched from the cloud twin's
+   `changed_by` if that attribute is fresh by then - see `lock_event` and the
+   `locks`/`lock_attribution` app config.
 
 Feed shape (attributes, replace=True on every publish):
     events: newest-first list of {"ts": <UTC ISO>, "icon": <mdi:...>, "text": <ascii>,
@@ -64,6 +69,31 @@ def appliance_event(name, old, new, attrs):
     return None
 
 
+def lock_event(name, old, new, changed_by):
+    """Event tuple (icon, text) for a lock transition, or None.
+
+    `changed_by` is best-effort attribution (the cloud twin's attribute, already
+    freshness-checked by the caller): a person name reads "by <name>", the
+    integration's literal "Auto Lock" reads "automatically", and no/stale
+    attribution just states the fact - a wrong name is worse than no name.
+    """
+    if old in (None, "unavailable", "unknown") or new == old:
+        return None
+    if new == "unlocked":
+        verb = "unlocked"
+        icon = "mdi:lock-open-variant"
+    elif new == "locked":
+        verb = "locked"
+        icon = "mdi:lock"
+    else:
+        return None  # jammed/opening/unavailable - not a human-meaningful milestone
+    text = f"{name} {verb}"
+    if isinstance(changed_by, str) and changed_by.strip():
+        by = changed_by.strip()[:MAX_TEXT_LEN]
+        text = f"{text} automatically" if by == "Auto Lock" else f"{text} by {by}"
+    return icon, text
+
+
 def build_report_event(data):
     """Validated {icon, text, cause, effect} from a house_events_report payload, or None.
 
@@ -108,6 +138,18 @@ class HouseEvents(hass.Hass):
         for entity in self.appliances:
             self.listen_state(self._on_appliance, entity)
 
+        # Locks: listen to the authoritative (BLE) entity, attribute from the cloud twin.
+        self.locks = self.args.get("locks", {})
+        self.lock_attribution = self.args.get("lock_attribution", {})
+        # The cloud twin lags the BLE entity by seconds; waiting this long before emitting
+        # trades feed latency for "by <name>" actually being present. Also the freshness
+        # ceiling: a changed_by older than delay+fresh margin belongs to some EARLIER
+        # operation and must not be pinned on this one.
+        self.lock_report_delay_s = int(self.args.get("lock_report_delay_s", 20))
+        self.lock_attribution_fresh_s = int(self.args.get("lock_attribution_fresh_s", 180))
+        for entity in self.locks:
+            self.listen_state(self._on_lock, entity)
+
         # Automation apps explain themselves through this event - see module docstring.
         self.listen_event(self._on_report, "house_events_report")
 
@@ -126,6 +168,40 @@ class HouseEvents(hass.Hass):
             kind, text = result
             icon = "mdi:basket-check" if kind == "emptied" else APPLIANCE_ICONS.get(name.lower(), "mdi:washing-machine")
             self._add(icon, text)
+
+    def _on_lock(self, entity, attribute, old, new, kwargs):
+        # Emit later, not now: attribution (cloud changed_by) usually hasn't landed yet
+        # when the BLE entity flips. lock_event() re-validates old/new at emit time.
+        self.run_in(self._emit_lock_event, self.lock_report_delay_s, lock_entity=entity, old=old, new=new)
+
+    def _emit_lock_event(self, kwargs):
+        entity = kwargs["lock_entity"]
+        name = self.locks.get(entity, entity)
+        changed_by = self._fresh_changed_by(self.lock_attribution.get(entity))
+        result = lock_event(name, kwargs["old"], kwargs["new"], changed_by)
+        if result:
+            icon, text = result
+            self._add(icon, text)
+
+    def _fresh_changed_by(self, attribution_entity):
+        """The cloud twin's changed_by, or None when absent/stale (see lock_event's doc)."""
+        if not attribution_entity:
+            return None
+        try:
+            full = self.get_state(attribution_entity, attribute="all") or {}
+            changed_by = (full.get("attributes") or {}).get("changed_by")
+            last_updated = full.get("last_updated")
+            if not changed_by or not last_updated:
+                return None
+            from datetime import datetime
+
+            updated = datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
+            age_s = (self.get_now() - updated).total_seconds()
+            if 0 <= age_s <= self.lock_report_delay_s + self.lock_attribution_fresh_s:
+                return changed_by
+        except Exception as e:
+            self.log(f"Lock attribution lookup failed for {attribution_entity}: {e}", level="DEBUG")
+        return None
 
     def _on_report(self, event_name, data, kwargs):
         event = build_report_event(data)

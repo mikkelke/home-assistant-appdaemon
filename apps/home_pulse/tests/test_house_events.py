@@ -70,5 +70,37 @@ class ReportEventTests(unittest.TestCase):
         self.assertEqual(len(event["effect"]), house_events.MAX_TEXT_LEN)
 
 
+class LockEventTests(unittest.TestCase):
+    def test_unlocked_with_name(self):
+        icon, text = house_events.lock_event("Front door", "locked", "unlocked", "Mikkel")
+        self.assertEqual(icon, "mdi:lock-open-variant")
+        self.assertEqual(text, "Front door unlocked by Mikkel")
+
+    def test_auto_lock_reads_automatically(self):
+        icon, text = house_events.lock_event("Front door", "unlocked", "locked", "Auto Lock")
+        self.assertEqual(icon, "mdi:lock")
+        self.assertEqual(text, "Front door locked automatically")
+
+    def test_no_attribution_states_the_fact(self):
+        _, text = house_events.lock_event("Front door", "locked", "unlocked", None)
+        self.assertEqual(text, "Front door unlocked")
+
+    def test_blank_attribution_ignored(self):
+        _, text = house_events.lock_event("Front door", "locked", "unlocked", "   ")
+        self.assertEqual(text, "Front door unlocked")
+
+    def test_restart_replay_suppressed(self):
+        self.assertIsNone(house_events.lock_event("Front door", None, "locked", None))
+        self.assertIsNone(house_events.lock_event("Front door", "unavailable", "locked", None))
+
+    def test_non_milestone_states_suppressed(self):
+        self.assertIsNone(house_events.lock_event("Front door", "locked", "jammed", None))
+        self.assertIsNone(house_events.lock_event("Front door", "locked", "locked", None))
+
+    def test_attribution_length_capped(self):
+        _, text = house_events.lock_event("Front door", "locked", "unlocked", "x" * 500)
+        self.assertLessEqual(len(text), len("Front door unlocked by ") + house_events.MAX_TEXT_LEN)
+
+
 if __name__ == "__main__":
     unittest.main()

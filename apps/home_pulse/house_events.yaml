@@ -10,3 +10,9 @@ HouseEvents:
     sensor.washer_state: Washer
     sensor.dishwasher_state: Dishwasher
     sensor.dryer_state: Dryer
+  # Lock feed entries read from the BLE entity (authoritative - see yale-lock notes);
+  # "by <name>" enrichment comes from the cloud twin's changed_by when fresh.
+  locks:
+    lock.yale_bt: Front door
+  lock_attribution:
+    lock.yale_bt: lock.yale

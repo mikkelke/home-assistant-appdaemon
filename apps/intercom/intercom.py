@@ -40,6 +40,7 @@ class Intercom(hass.Hass):
                 "lock": self.front_lock,
                 "followup": self.msg_open_front,
                 "door_sensor": self.front_door_sensor,
+                "ring_label": "front door",
             }
             self.listen_state(self._handle_trigger, self.front_sensor, new="on", old="off")
         if self.back_sensor:
@@ -48,6 +49,7 @@ class Intercom(hass.Hass):
                 "lock": self.back_lock,
                 "followup": self.msg_open_back,
                 "door_sensor": self.back_door_sensor,
+                "ring_label": "back door",
             }
             self.listen_state(self._handle_trigger, self.back_sensor, new="on", old="off")
         if self.apt_sensor:
@@ -55,6 +57,7 @@ class Intercom(hass.Hass):
                 "message": self.msg_apt,
                 "lock": None,
                 "followup": None,
+                "ring_label": "apartment door",
             }
             self.listen_state(self._handle_trigger, self.apt_sensor, new="on", old="off")
 
@@ -182,6 +185,19 @@ class Intercom(hass.Hass):
                 self.log(f"Error sending TTS for {entity}: {e}", level="ERROR")
         else:
             self.log("Skipping TTS; SonosNotifier unavailable.", level="ERROR")
+
+        # Tell the house feed (dashboard's activity log). Guarded and after the TTS attempt:
+        # the feed is cosmetic, the intercom is not - a feed problem must never block a ring.
+        try:
+            effect = "Announcing on the speakers and opening the door" if auto_open_enabled else "Announcing on the speakers"
+            self.fire_event(
+                "house_events_report",
+                cause=f"Someone rang the {info.get('ring_label', 'door')}",
+                effect=effect,
+                icon="mdi:bell-ring",
+            )
+        except Exception as e:
+            self.log(f"house_events_report failed: {e}", level="DEBUG")
 
         # Auto-open logic
         if not auto_open_enabled:
