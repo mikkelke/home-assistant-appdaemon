@@ -498,8 +498,9 @@ washer_monitor:
   # option_short_entity: input_boolean.washer_option_short
   #
   # Programme profiles (machine specs): loaded from washer_programmes.yaml in the same directory.
-  # Override path if needed:
-  # programmes_file: /data/appdaemon/apps/appliances/washer_programmes.yaml
+  # Override only with an in-container path: host /data/appdaemon is mounted at /conf, so a
+  # host path doesn't exist in the container and the app falls back to minimal defaults.
+  # programmes_file: /conf/apps/appliances/washer_programmes.yaml
 
   # ============================================================================
   # ANALYSIS

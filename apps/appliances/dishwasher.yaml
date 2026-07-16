@@ -96,7 +96,10 @@ dishwasher_monitor:
   # ============================================================================
   
   feedback_file: /data/appdaemon/apps/appliances/dishwasher_feedback.json
-  programmes_file: /data/appdaemon/apps/appliances/dishwasher_programmes.yaml
+  # Programme profiles (machine specs): loaded from dishwasher_programmes.yaml in the same directory.
+  # Override only with an in-container path: host /data/appdaemon is mounted at /conf, so a
+  # host path doesn't exist in the container and the app falls back to minimal defaults.
+  # programmes_file: /conf/apps/appliances/dishwasher_programmes.yaml
 
   # ============================================================================
   # CYCLE VALIDATION - Prevents false "Unemptied" states
