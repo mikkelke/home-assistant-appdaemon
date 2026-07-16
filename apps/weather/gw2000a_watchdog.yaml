@@ -1,0 +1,11 @@
+gw2000a_watchdog:
+  module: gw2000a_watchdog
+  class: Gw2000aWatchdog
+  # WS90-sourced (RF) entities; all must be dead/stale before it pages (see module doc).
+  entities:
+    - sensor.gw2000a_wind_speed
+    - sensor.gw2000a_solar_lux
+    - sensor.gw2000a_rain_rate_piezo
+  stale_minutes: 20
+  check_minutes: 5
+  notify_target: ["mikkel"]

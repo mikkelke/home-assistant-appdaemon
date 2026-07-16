@@ -124,6 +124,10 @@ class WeatherOpeningAlert(hass.Hass):
         self._prev_window_shown: bool = False
         self._last_window_winner: Optional[dict[str, Any]] = None
 
+        # House-activity feed: one report per NEW active episode (priority+target pair) -
+        # re-arms when the alert clears, and an escalation (window -> rooftop) re-reports.
+        self._last_feed_key: str = ""
+
         weather_entities = [
             self.rain_entity,
             self.wind_speed_entity,
@@ -439,6 +443,23 @@ class WeatherOpeningAlert(hass.Hass):
         reason = priority["reason"]
         target = priority["target_area"]
         any_active = prio != "none"
+
+        # Public house-activity report on the ACTIVE transition - the sensors below are
+        # invisible unless a dashboard card renders them, but "rain is hitting an open
+        # window" is an act-now moment for whoever is home. The situation resolving is
+        # not reported (whoever closed it knows).
+        feed_key = f"{prio}|{target}" if any_active else ""
+        if feed_key and feed_key != self._last_feed_key:
+            try:
+                await self.fire_event(
+                    "house_events_report",
+                    cause="Rain on the roof sensor" if prio == "rooftop_rain" else "Rain in the wind",
+                    effect=reason.rstrip("."),
+                    icon="mdi:weather-pouring",
+                )
+            except Exception:
+                pass
+        self._last_feed_key = feed_key
 
         common = {"friendly_name": "Weather opening alert"}
 

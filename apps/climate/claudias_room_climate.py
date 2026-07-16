@@ -19,6 +19,11 @@ class ClaudiasRoomClimate(hass.Hass):
         self.prev_temp_entity = self.args["previous_temp_entity"]
         self.frost_temp = float(self.args.get("frost_temp", 5))
         self.default_temp = float(self.args.get("default_temp", 20))
+        # Gates the house-activity report: only a drop that interrupts REAL heating is worth
+        # telling anyone about - in summer the radiator is idle and the setpoint dance is
+        # both invisible and irrelevant. Fail-closed (sensor unavailable -> no report).
+        self.heating_active_entity = self.args.get("heating_active_entity", "binary_sensor.claudias_room_heating_active")
+        self._frost_reported = False
         self._suppress = False
 
         self.listen_state(self._on_door, self.door)
@@ -57,6 +62,22 @@ class ClaudiasRoomClimate(hass.Hass):
     def _unsuppress(self, kwargs):
         self._suppress = False
 
+    def _report(self, cause, effect):
+        """Explain the frost/restore decision to the dashboard's Home activity feed.
+        Fire-and-forget; audience = Claudia (her room) + admins. NOTE: this room's
+        automation is provisional - Claudia may not want it once she moves in - so
+        this event doubles as the explanation that helps her decide."""
+        try:
+            self.fire_event(
+                "house_events_report",
+                cause=cause,
+                effect=effect,
+                icon="mdi:radiator",
+                audience_users=["Claudia"],
+            )
+        except Exception:
+            pass
+
     # --- handlers ---
     def _on_door(self, entity, attribute, old, new, kwargs):
         if new == old:
@@ -67,6 +88,12 @@ class ClaudiasRoomClimate(hass.Hass):
             frost = self._frost_effective()
             self._apply(frost)
             self.log("Rooftop door 2 OPEN -> %s frost %.1f C (saved %s)" % (self.climate, frost, cur))
+            if self.get_state(self.heating_active_entity) == "on":
+                self._frost_reported = True
+                self._report(
+                    "Rooftop door opened",
+                    "Claudias room radiator dropped to %g C to save heat" % frost,
+                )
         elif new == "off":
             try:
                 prev = float(self.get_state(self.prev_temp_entity))
@@ -75,6 +102,13 @@ class ClaudiasRoomClimate(hass.Hass):
             restore = prev if prev > 0 else self.default_temp
             self._apply(restore)
             self.log("Rooftop door 2 CLOSED -> restore %s to %.1f C" % (self.climate, restore))
+            # Only close the story we opened - an idle-season restore stays silent.
+            if self._frost_reported:
+                self._frost_reported = False
+                self._report(
+                    "Rooftop door closed",
+                    "Claudias room radiator back to %g C" % restore,
+                )
 
     def _on_setpoint(self, entity, attribute, old, new, kwargs):
         if self._suppress:

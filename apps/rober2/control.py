@@ -217,6 +217,11 @@ class Rober2Control(hass.Hass):
         self._last_narrative = None
         self._narrative_max_len = int(self.args.get("narrative_max_len", 255))
 
+        # House activity feed: last "doors closed" report text (evaluate_cleaning_conditions
+        # runs on every trigger, so only report when the blocked-room set actually changes -
+        # see _report_house_event and the blocked_rooms handling below).
+        self._last_blocked_report: str | None = None
+
     # --- Small helpers ---
     def _is_no_error_state(self, value) -> bool:
         """Return True if a vacuum error state represents 'no error'."""
@@ -338,6 +343,22 @@ class Rober2Control(hass.Hass):
                 self._last_narrative = text
         except Exception as e:
             self.log(f"Narrative update skipped: {e}", level="DEBUG")
+
+    async def _report_house_event(self, cause: str, effect: str) -> None:
+        """Explain an AUTONOMOUS vacuum decision to the dashboard's Home activity feed
+        (public - shared-space event, no audience restriction). Call only on real
+        transitions (a room actually starting, doors actually blocking, an error actually
+        stopping cleaning) - never from a periodic/evaluation loop without its own
+        change guard, since the feed's 300s dup-suppression is not enough for those."""
+        try:
+            await self.fire_event(
+                "house_events_report",
+                cause=cause,
+                effect=effect,
+                icon="mdi:robot-vacuum",
+            )
+        except Exception:
+            pass
 
     # --- Home Assistant history helpers (strengthen tracking across restarts) ---
     def _read_recent_history(self, entity_id: str, minutes: int = 120, max_points: int = 50):
@@ -623,7 +644,29 @@ class Rober2Control(hass.Hass):
             # Check if we have rooms to clean
             rooms_all = await self.get_rooms_to_clean()
             rooms, blocked_rooms = await self._partition_accessible_rooms(rooms_all)
-            
+
+            # House activity feed: report doors blocking queued rooms, whether some rooms are
+            # still proceeding or everything is blocked. This eval runs on every trigger, so
+            # gate on the report TEXT changing (not just "blocked_rooms truthy") to avoid
+            # re-emitting the same line every few seconds; reset once nothing is blocked so
+            # the next blockage reports again.
+            if blocked_rooms:
+                try:
+                    blocked_pretty = ", ".join(
+                        self._pretty_room_from_segment_id(r) for r in blocked_rooms
+                    )
+                    blocked_report_text = f"Vacuum skipping {blocked_pretty} until the doors open"
+                    if blocked_report_text != self._last_blocked_report:
+                        await self._report_house_event(
+                            "Doors closed to queued rooms",
+                            blocked_report_text,
+                        )
+                        self._last_blocked_report = blocked_report_text
+                except Exception:
+                    pass
+            else:
+                self._last_blocked_report = None
+
             # If there are flagged rooms but none are accessible (closed doors), don't treat as "completed".
             if rooms_all and not rooms:
                 try:
@@ -957,6 +1000,10 @@ class Rober2Control(hass.Hass):
                                 self._room_interrupt_counts[self.current_room] = 0
                                 flag_entity = f"input_boolean.rober2_clean_{room_name}"
                                 await self.call_service("input_boolean/turn_off", entity_id=flag_entity)
+                                await self._report_house_event(
+                                    f"Couldn't reach the {self._pretty_room_from_segment_id(self.current_room)} after several tries",
+                                    "Room skipped and its cleaning flag cleared",
+                                )
                                 if not self._robot_has_left_dock:
                                     dock_pretty = self._dock_pretty_name()
                                     if self._is_dock_room_attempt(self.current_room, room_name):
@@ -1010,6 +1057,10 @@ class Rober2Control(hass.Hass):
                                 self._last_attempted_room_id = None
                                 flag_entity = f"input_boolean.rober2_clean_{room_name}"
                                 await self.call_service("input_boolean/turn_off", entity_id=flag_entity)
+                                await self._report_house_event(
+                                    f"Couldn't reach the {self._pretty_room_from_segment_id(room_id)} after several tries",
+                                    "Room skipped and its cleaning flag cleared",
+                                )
                                 if not self._robot_has_left_dock:
                                     dock_pretty = self._dock_pretty_name()
                                     if self._is_dock_room_attempt(room_id, room_name):
@@ -1607,12 +1658,16 @@ class Rober2Control(hass.Hass):
 
             # DON'T set self.cleaning = True here - wait for robot to actually start
             # This prevents false "already cleaning" states
-            self.log_state_conclusion("start_cleaning", "command_sent", "wait_for_start", 
+            self.log_state_conclusion("start_cleaning", "command_sent", "wait_for_start",
                                     f"Sent cleaning command for room: {room_name}")
-            
+            await self._report_house_event(
+                "Scheduled rooms and open doors lined up",
+                f"Vacuum starting the {self._pretty_room_from_segment_id(room_id)}",
+            )
+
             # Watchdog: verify the robot starts within reasonable time
             self.run_in(self.verify_job_started, self.SEND_RETRY_SEC, room_id=room_id)
-            
+
         except Exception as e:
             self.log(f"Error starting cleaning: {e}", level="ERROR")
             
@@ -2410,20 +2465,28 @@ class Rober2Control(hass.Hass):
                     target=["mikkel", "kristine"],  # Always send regardless of presence
                     data={"data": {"importance": "high", "channel": "alerts"}}
                 )
-                
+                await self._report_house_event(
+                    f"Vacuum error: {new.replace('_', ' ').title()}",
+                    "Cleaning stopped - automation paused until it's rescued",
+                )
+
                 await self.stop_cleaning()
             elif new in critical_errors or new in blocking_errors:
                 self.log(f"Critical/blocking error '{new}' detected (not cleaning)", level="WARNING")
-                self.log_state_conclusion("vacuum_error", f"error_{new}", "monitor", 
+                self.log_state_conclusion("vacuum_error", f"error_{new}", "monitor",
                                         f"Error '{new}' detected - monitoring")
                 await self._set_narrative(f"Error - {str(new).replace('_', ' ')} - idle")
-                
+
                 # Send notification for critical error (not cleaning, always to Mikkel and Kristine)
                 await self.send_notification(
                     title="Rober2 Error Detected",
                     message=f"Critical error detected: {new.replace('_', ' ').title()}\nAutomation is paused.",
                     target=["mikkel", "kristine"],  # Always send regardless of presence
                     data={"data": {"importance": "high", "channel": "alerts"}}
+                )
+                await self._report_house_event(
+                    f"Vacuum error: {new.replace('_', ' ').title()}",
+                    "Cleaning stopped - automation paused until it's rescued",
                 )
             else:
                 # Non-critical errors (warnings, maintenance needed)
