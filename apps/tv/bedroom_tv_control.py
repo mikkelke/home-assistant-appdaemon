@@ -767,6 +767,17 @@ class BedroomTVControl(hass.Hass):
             self._schedule_raise_retry()
             return
 
+        # Startup/heal invocations trust the persistent position tracker (mirror of the
+        # already-Down skip in _ensure_lift_down_if_tv_active): lift already Up means
+        # nothing to heal, and commanding anyway would also re-report "TV turned off ->
+        # lift going up" to the activity feed on EVERY app reload (user saw one phantom
+        # entry per deploy, 2026-07-16). A real tv_off transition still always commands -
+        # right after the TV was on, a tracker claiming "Up" is stale by definition.
+        if path_marker == "initial_state_check" and self._get_lift_position() == "Up":
+            self.log("Initial state check: lift already Up - nothing to heal", level="INFO")
+            self._stop_periodic_verification()
+            return
+
         try:
             self._lift_action_in_progress = True
             self._lift_action_start_time = self.datetime()
