@@ -780,9 +780,12 @@ class LivingRoomTvControl(hass.Hass):
                 self._power_on_confirm_wait_start = None
                 return
 
-                self._power_on_confirm_handle = self.run_in(
-                self._power_on_confirm_tick,
-                self.power_on_confirm_recheck_seconds,
+            # Reschedule the next poll (normal path). This was mis-indented inside the timeout
+            # branch above, after its `return` - unreachable, so the loop never actually looped.
+            # Dead until 2026-07-17: every observed power-on confirmed on the first tick (60/60
+            # since April), so the bug never showed up in practice.
+            self._power_on_confirm_handle = self.run_in(
+                self._power_on_confirm_tick, self.power_on_confirm_recheck_seconds
             )
         except Exception as e:
             self.log(f"Power-on confirm tick error: {e}", level="WARNING")
