@@ -42,6 +42,7 @@ def make_app(**overrides):
     app._saturated = False
     app._feasible_floor = overrides.get("feasible_floor", None)
     app._feasible_samples = overrides.get("feasible_samples", 0)
+    app._dry_min = overrides.get("dry_min", 0.0)
     app._save_state = lambda: None
     app.log = lambda *a, **k: None
     return app
@@ -332,6 +333,68 @@ class WindowOpen(unittest.TestCase):
 
     def test_missing_entity_none_does_not_interrupt_cooling(self):
         self.assertTrue(sc.SmartCooling._window_open(None))
+
+
+class MaybeDry(unittest.TestCase):
+    """Dry-finish gates (user, 2026-07-17): evening at-target holds run `dry` mode while
+    the air is damp -- but never before the evening (dried air re-exchanges), never past
+    the nightly budget, and never on dry air or a missing dew point."""
+
+    def _app(self, dp, dry_min=0.0, dry_date=None):
+        app = make_app()
+        app.dry_from_hour = 20
+        app.dry_dp = 12.0
+        app.dry_max_min = 45.0
+        app.comfort_entity = "sensor.bedroom_comfort"
+        app._dry_min = dry_min
+        app._dry_date = dry_date
+        async def _attr(entity, key, default=None):
+            return dp
+        app._attr = _attr
+        return app
+
+    def _run(self, app, now, floor=20.2):
+        import asyncio
+        return asyncio.run(app._maybe_dry(now, floor))
+
+    def test_afternoon_never_dries(self):
+        app = self._app(dp=14.0)
+        dry, _ = self._run(app, datetime(2026, 7, 17, 15, 0))
+        self.assertFalse(dry)
+
+    def test_evening_damp_air_dries_with_budget_in_reason(self):
+        now = datetime(2026, 7, 17, 21, 0)
+        app = self._app(dp=13.5, dry_min=15.0, dry_date=now.date())
+        dry, reason = self._run(app, now)
+        self.assertTrue(dry)
+        self.assertIn("13.5", reason)
+        self.assertIn("30 more min", reason)
+
+    def test_dry_air_stays_off(self):
+        now = datetime(2026, 7, 17, 21, 0)
+        app = self._app(dp=9.0, dry_date=now.date())
+        dry, _ = self._run(app, now)
+        self.assertFalse(dry)
+
+    def test_budget_exhausted_stays_off(self):
+        now = datetime(2026, 7, 17, 21, 0)
+        app = self._app(dp=14.0, dry_min=45.0, dry_date=now.date())
+        dry, _ = self._run(app, now)
+        self.assertFalse(dry)
+
+    def test_new_day_resets_budget(self):
+        from datetime import date
+        now = datetime(2026, 7, 17, 21, 0)
+        app = self._app(dp=14.0, dry_min=45.0, dry_date=date(2026, 7, 16))
+        dry, _ = self._run(app, now)
+        self.assertTrue(dry)
+        self.assertEqual(app._dry_min, 0.0)
+
+    def test_missing_dew_point_stays_off(self):
+        now = datetime(2026, 7, 17, 21, 0)
+        app = self._app(dp=None, dry_date=now.date())
+        dry, _ = self._run(app, now)
+        self.assertFalse(dry)
 
 
 if __name__ == "__main__":

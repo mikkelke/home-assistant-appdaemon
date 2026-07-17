@@ -60,8 +60,17 @@ SmartCooling:
   cool_power_kw: 0.5      # measured engaged average 2026-07-15 (was 0.6 guess); est-cost only
   # Stall-breaker: idle-with-deficit -> fan_only burp so the intake reads room air,
   # then cooling restarts hard (parks at ~300 W otherwise, cooling nothing).
+  # Quiet gate: no burps while either bedside is occupied (the silence->800W roar is
+  # what bothers a person in bed; parked crawl accepted until the Remove press).
   stall_fanonly_min: 3
   stall_burp_cooldown_min: 15
+  # Dry-finish (user 2026-07-17): evening holds at-target switch to `dry` mode while the
+  # air is damp -- low fan over a cold coil = more water out per kWh, quietly, right
+  # before the room is sealed. A drier start delays the night's clammy crossing (the
+  # overnight dew-point climb from breathing itself is unavoidable).
+  dry_finish_from_hour: 20
+  dry_finish_dp_c: 12.0
+  dry_finish_max_min: 45
   check_interval_min: 15
   min_cycle_min: 10
   status_entity: sensor.smart_cooling_status

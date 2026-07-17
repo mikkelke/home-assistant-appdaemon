@@ -106,6 +106,21 @@ class SmartCooling(hass.Hass):
         self.stall_fanonly_min = int(a("stall_fanonly_min", 3))
         self.stall_burp_cooldown_min = int(a("stall_burp_cooldown_min", 15))
         self.stall_deficit_min = float(a("stall_deficit_min", 0.3))
+        # Dry-finish (user, 2026-07-17: "could we use the dry mode... when humidity is high?"):
+        # once the floor target is met in the evening, spend held minutes in `dry` mode when
+        # the air is damp -- low fan over a cold coil pulls more water per kWh than cool mode,
+        # QUIETLY (no burp roars), right before the room gets sealed. The overnight dew-point
+        # climb from breathing is unavoidable; a drier start delays the clammy crossing.
+        # Bounded per night; earlier-in-the-day drying is pointless (air re-exchanges).
+        self.dry_from_hour = int(a("dry_finish_from_hour", 20))
+        self.dry_dp = float(a("dry_finish_dp_c", 12.0))
+        self.dry_max_min = float(a("dry_finish_max_min", 45))
+        # Bed occupancy = quiet signal (user, 2026-07-16: "someone in bed is fine" -- presence
+        # is reliable even though the 2-sensor COUNT is not): no stall-burps while either side
+        # is occupied. The silence->800W roar cycle is what bothered a person trying to sleep;
+        # a parked crawl is accepted until the Remove press ends the night anyway.
+        self.bed_sensors = list(a("bed_occupancy_sensors",
+                                  ["binary_sensor.left_bedside", "binary_sensor.right_bedside"]))
         self.dry_run = bool(a("dry_run", True))
         self.interval_min = int(a("check_interval_min", 15))
         self.min_cycle_min = int(a("min_cycle_min", 10))
@@ -140,6 +155,9 @@ class SmartCooling(hass.Hass):
         self._last_want = False                    # was the previous eval trying to cool?
         self._last_eval_at: Optional[datetime] = None
         self._feed_last: dict = {}                 # per-kind last feed emit (see _feed_allowed)
+        self._was_drying = False                   # previous eval ran the dry-finish
+        self._dry_date = None                      # calendar day the dry budget belongs to
+        self._dry_min = 0.0                        # dry-finish minutes spent that day
         # learned warm-up indicator (+ the in-flight coast record) + learned feasible floor
         self._rise_frac = self.default_rise_frac
         self._rise_samples = 0
@@ -388,6 +406,30 @@ class SmartCooling(hass.Hass):
                  f"engaged min without progress; learned limit now {self._feasible_floor:.1f}C "
                  f"(n={self._feasible_samples})", level="INFO")
 
+    async def _maybe_dry(self, now, floor):
+        """Whether a held (at-target) evening eval should run the dry-finish instead of
+        sitting off. All gates must pass: evening hour (moisture removed earlier just
+        re-exchanges before bed), damp air (dew point at/over the threshold), and tonight's
+        bounded budget. Returns (dry_now, reason)."""
+        if now.hour < self.dry_from_hour:
+            return False, None
+        if now.date() != self._dry_date:
+            self._dry_date = now.date()
+            self._dry_min = 0.0
+        if self._dry_min >= self.dry_max_min:
+            return False, None
+        dp = await self._attr(self.comfort_entity, "dew_point", None)
+        try:
+            dp = float(dp)
+        except (TypeError, ValueError):
+            return False, None
+        if dp < self.dry_dp:
+            return False, None
+        left = self.dry_max_min - self._dry_min
+        return True, (f"Cooling done (floor {floor:.1f}C) -- drying the damp air before the "
+                      f"night: dew point {dp:.1f}C, dry mode (quiet, low fan) up to "
+                      f"~{left:.0f} more min tonight")
+
     def _stash_lightout(self, floor, E, now):
         """Record the true lights-out baseline (F0, E) the moment the user confirms AC removed -
         replaces the old bedtime-time-window guess (user, 2026-07-15: a fixed clock time is
@@ -558,6 +600,19 @@ class SmartCooling(hass.Hass):
             want, reason = False, (f"Hold for cheaper power: need ~{run_min} min, start ~{nx} "
                                    f"(floor {floor:.1f}->{reach_target:.1f}C)")
 
+        # Dry-finish bookkeeping + gate: only the at-target holds qualify (never instead of
+        # needed cooling, never with the vent window shut or the condenser room at the hard
+        # cap -- dry mode still dumps compressor heat into the bathroom).
+        if self._was_drying and self._last_eval_at is not None:
+            self._dry_min += min((now - self._last_eval_at).total_seconds() / 60.0,
+                                 self.interval_min * 1.5)
+        self._was_drying = False
+        dry_now = False
+        if not want and reach_deficit <= 0.05 and window_open and not backleak_hard:
+            dry_now, dry_reason = await self._maybe_dry(now, floor)
+            if dry_now:
+                reason = dry_reason
+
         self._mark_eval(now, want)
         attrs = self._attrs(floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
                             ceiling, price_now, window_open, run_min, next_start, est_cost, floor_limited,
@@ -570,6 +625,9 @@ class SmartCooling(hass.Hass):
         if want:
             await self._apply_cool(reason, "cooling_dryrun" if self.dry_run else "cooling",
                                    attrs, reach_deficit, now)
+        elif dry_now:
+            self._was_drying = True
+            await self._apply_dry(reason, attrs)
         else:
             await self._ensure_off("waiting" if reach_deficit > 0.05 else "idle", reason, attrs)
 
@@ -600,6 +658,7 @@ class SmartCooling(hass.Hass):
             "minutes_needed": run_min, "next_start": next_start.strftime("%H:%M") if next_start else None,
             "est_cost_kr": est_cost, "dry_run": self.dry_run,
             "last_burp": self._last_burp.strftime("%H:%M") if self._last_burp else None,
+            "dry_min_tonight": round(self._dry_min),
         }
 
     # ---------- stall-breaker ----------
@@ -709,6 +768,13 @@ class SmartCooling(hass.Hass):
                 return
             action = await self._attr(self.climate_entity, "hvac_action", None)
             if self._should_burp(action, cur_mode, deficit, now):
+                # Quiet gate (user, 2026-07-16): the burp's silence->800W restart is what
+                # bothers a person in bed. Someone on either bedside -> skip the burp and
+                # accept the parked crawl; the Remove press ends the night soon anyway.
+                if await self._bed_occupied():
+                    await self._publish(status, reason + "  [in bed -- skipping the noisy "
+                                        "compressor wake-up]", attrs)
+                    return
                 await self._start_burp(deficit, now)
                 await self._publish("burping", f"Stall-burp: idling with {deficit:.1f}C to go "
                                     f"-- fan-only {self.stall_fanonly_min} min to wake the "
@@ -750,6 +816,35 @@ class SmartCooling(hass.Hass):
                     pass
         except Exception as e:
             self.log(f"Failed to start cooling: {e}", level="ERROR")
+
+    async def _apply_dry(self, reason, attrs):
+        """Run the evening dry-finish: hvac dry mode (firmware runs its own low fan +
+        gentle compressor cycling). Entry/exit respect the same anti-short-cycle courtesy
+        as cool/off; the decision chain exits dry naturally (deficit reopens -> cool,
+        gates fail -> _ensure_off, Remove press -> sealed)."""
+        await self._publish("drying", reason, attrs)
+        if self.dry_run:
+            self.log(f"DRY-RUN would run dry mode: {reason}")
+            return
+        cur_mode = await self._state(self.climate_entity)
+        if cur_mode == "dry":
+            return
+        if not self._can_switch(True):
+            return
+        try:
+            await self.call_service("climate/set_hvac_mode",
+                                    entity_id=self.climate_entity, hvac_mode="dry")
+            self._mark_switch("dry")
+            self.log(f"DRY on: {reason}", level="INFO")
+        except Exception as e:
+            self.log(f"Failed to start dry mode: {e}", level="ERROR")
+
+    async def _bed_occupied(self):
+        """Someone is in bed (either side -- presence is reliable, the count is not)."""
+        for s in self.bed_sensors:
+            if (await self._state(s)) == "on":
+                return True
+        return False
 
     async def _ensure_off(self, status, reason, attrs):
         self._burp_until = None   # plan flipped to off mid-burp: the burp is moot
