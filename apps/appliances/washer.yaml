@@ -286,9 +286,32 @@ washer_monitor:
   
   start_w: 18             # Power level to detect cycle start
   stop_w: 3.0             # Power level to detect cycle end (below inter-op pauses)
+
+  # ============================================================================
+  # DELAYED START (Miele delay timer) - do not count the standby wait as wash time
+  # ============================================================================
+  # Delayed start draws a brief selection burst (up to ~60W for ~15 min) then sits at
+  # flat standby (~3.0-3.1W) for hours until the wash begins (heating ~2200W). The burst
+  # trips start detection, so without this the whole wait is recorded as wash time
+  # (e.g. eco 199 min nominal recorded as ~367 min) and can poison learned durations.
+  # Detection: a plateau of at least delay_plateau_minutes with ZERO samples >= start_w,
+  # before any heating/active-wash evidence - far longer than any mid-cycle soak (<= ~13 min).
+  # When activity resumes (first sample >= start_w) the cycle start slides to that moment.
+  detect_delayed_start: true       # Master switch for delayed-start handling
+  # Plateau must last at least this long (min) with no sample >= start_w. Keep well above
+  # the ~13 min soak max (>= 2x).
+  delay_plateau_minutes: 30
+  # Only slide while cumulative energy since the (bogus) start is below this. Standby leaks
+  # ~0.02-0.03 kWh over hours; a real wash exceeds it within minutes. Very long delays
+  # (> ~16h) may exceed it - the end-of-cycle history backstop still trims those.
+  delay_energy_floor_kwh: 0.05
+  # During the wait, publish delayed_start_waiting=true and blank ETA/progress so the
+  # dashboard shows waiting, not a wrong countdown.
+  delayed_start_show_waiting: true
+
   significant_w: 30       # Significant activity threshold (tumbling)
   run_for: 60             # Seconds to confirm Running state
-  
+
   # ============================================================================
   # ENERGY-BASED FINISH DETECTION (Primary method)
   # ============================================================================

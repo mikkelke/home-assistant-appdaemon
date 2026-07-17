@@ -3,6 +3,7 @@
 # These tests duplicate the validation/tail-window logic so they run without the AppDaemon runtime.
 
 import unittest
+from datetime import datetime, timedelta, timezone
 
 # Test profile set (mirrors WasherMonitor _DEFAULT_PROFILES for programmes we test)
 _TEST_PROFILES = {
@@ -35,6 +36,8 @@ def classify_cycle_completion(
 
     if run_minutes < min_valid_dur:
         flags.append("runtime_too_short")
+    if run_minutes > max_dur:
+        flags.append("duration_too_long")
     if energy_kwh < min_energy:
         flags.append("energy_too_low")
     if energy_kwh > max_energy:
@@ -53,6 +56,11 @@ def classify_cycle_completion(
     else:
         completion_class = "completed"
 
+    # Duration too long (e.g. a delayed-start wait that slipped past the trim guards) - never
+    # trust it for learning, even if it otherwise looked "completed".
+    if "duration_too_long" in flags and completion_class != "interrupted":
+        completion_class = "suspect"
+
     valid_for_learning = (
         completion_class == "completed"
         and "runtime_too_short" not in flags
@@ -60,6 +68,8 @@ def classify_cycle_completion(
         and "unknown_programme" not in flags
     )
     if transition_path == "door_opened_first" and completion_class != "completed":
+        valid_for_learning = False
+    if "duration_too_long" in flags:
         valid_for_learning = False
 
     return {"completion_class": completion_class, "valid_for_learning": valid_for_learning, "validation_flags": flags}
@@ -95,6 +105,57 @@ def detect_anti_crease_pattern_from_points(watts_list, tail_max_mean_w, tail_min
         and not any(w > 500 for w in watts_list)
     )
     return (ok, mean_w, std_w, peak_w)
+
+
+def slide_start_if_delayed(
+    samples, start_ts, delay_plateau_minutes, start_w, energy_floor_kwh,
+    observed_heating, cum_energy_kwh, heating_onset_ts=None,
+):
+    """Mirror of WasherMonitor._maybe_handle_delayed_start / _slide_start_for_delayed_start's
+    plateau/slide decision.
+
+    samples: chronological list of (timestamp, watts) as _check_energy_finish would see tick by
+    tick. Gated on observed_heating/cum_energy_kwh exactly like the live gate (real wash evidence
+    from the start means this was never a delayed start - never trim). While gated, tracks how
+    long power has stayed below start_w; the first sample >= start_w after a plateau of at least
+    delay_plateau_minutes becomes the new start. heating_onset_ts models heating/energy evidence
+    appearing MID-stream: the gate closes at that tick, and (like the live gate-disarm branch) a
+    qualifying open plateau slides at that moment - heating right after the wait is itself the
+    resume signal. Returns the (possibly slid) start.
+    """
+    if observed_heating or cum_energy_kwh >= energy_floor_kwh:
+        return start_ts
+    plateau_start = None
+    for ts, watts in samples:
+        if heating_onset_ts is not None and ts >= heating_onset_ts:
+            # Gate disarms here (heating/energy evidence). A qualifying open plateau slides
+            # at the disarm tick; otherwise detection simply ends for the cycle.
+            if plateau_start is not None and (ts - plateau_start).total_seconds() / 60 >= delay_plateau_minutes:
+                return ts
+            return start_ts
+        if watts < start_w:
+            if plateau_start is None:
+                plateau_start = ts
+        else:
+            if plateau_start is not None:
+                plateau_min = (ts - plateau_start).total_seconds() / 60
+                if plateau_min >= delay_plateau_minutes:
+                    return ts
+            plateau_start = None
+    return start_ts
+
+
+def _build_power_samples(start_ts, segments, step_minutes=1):
+    """Build a chronological (timestamp, watts) list from segments = [(duration_min, watts), ...],
+    sampled every step_minutes within each segment (helper for delayed-start tests)."""
+    samples = []
+    t = start_ts
+    for duration_min, watts in segments:
+        steps = max(1, round(duration_min / step_minutes))
+        for _ in range(steps):
+            samples.append((t, watts))
+            t = t + timedelta(minutes=step_minutes)
+    return samples
 
 
 class TestClassifyCycleCompletion(unittest.TestCase):
@@ -169,6 +230,21 @@ class TestClassifyCycleCompletion(unittest.TestCase):
         profile = _get_profile("uld", "30°C")
         self.assertFalse(profile.get("supports_anti_crease", True))
 
+    def test_duration_too_long_eco_suspect(self):
+        """366.8 min on ECO (max valid 235 min) - e.g. an unrimmed delayed-start wait leaking
+        into the recorded duration -> suspect, not learnable, even though runtime/energy alone
+        would otherwise pass."""
+        result = classify_cycle_completion(
+            run_minutes=366.8, energy_kwh=0.6,
+            min_cycle_minutes=25, min_energy_kwh=0.1,
+            completion_guard_fraction=0.65, completion_guard_fraction_user_confirmed=0.60,
+            user_confirmed=True, confirmed="eco", confirmed_temperature=None,
+            transition_path="low_power_detected",
+        )
+        self.assertEqual(result["completion_class"], "suspect")
+        self.assertFalse(result["valid_for_learning"])
+        self.assertIn("duration_too_long", result["validation_flags"])
+
 
 class TestPostEndTailWindow(unittest.TestCase):
     """Tests for _is_post_end_tail_window (anti-crease eligibility)."""
@@ -217,6 +293,118 @@ class TestDetectAntiCreasePattern(unittest.TestCase):
         )
         self.assertFalse(ok)
         self.assertLess(std_w or 0, 6.0)
+
+
+class TestDelayedStartSlide(unittest.TestCase):
+    """Tests for the delayed-start plateau/slide decision (Miele delay timer)."""
+
+    def test_delay_plateau_slides_start(self):
+        """Selection burst, then a long flat standby well past delay_plateau_minutes, then real
+        activity resumes -> start slides to the resume timestamp."""
+        start = datetime(2026, 7, 17, 20, 0, 0, tzinfo=timezone.utc)
+        samples = _build_power_samples(start, [
+            (15, 45.0),   # selection burst (~45W for 15 min) - tripped start detection
+            (350, 3.05),  # flat standby wait, well over the 30 min plateau threshold
+            (5, 22.0),    # real wash resumes
+        ])
+        new_start = slide_start_if_delayed(
+            samples, start_ts=start, delay_plateau_minutes=30, start_w=18.0,
+            energy_floor_kwh=0.05, observed_heating=False, cum_energy_kwh=0.03,
+        )
+        expected_resume = start + timedelta(minutes=15 + 350)
+        self.assertEqual(new_start, expected_resume)
+        self.assertNotEqual(new_start, start)
+
+    def test_short_soak_does_not_slide(self):
+        """A normal mid-cycle soak (dip below start_w for only 12 min, well under the 30 min
+        plateau threshold) must not be mistaken for a delayed-start wait."""
+        start = datetime(2026, 7, 17, 20, 0, 0, tzinfo=timezone.utc)
+        samples = _build_power_samples(start, [
+            (20, 40.0),  # agitation
+            (12, 2.0),   # short mid-cycle soak (well under 30 min)
+            (20, 40.0),  # agitation resumes
+        ])
+        new_start = slide_start_if_delayed(
+            samples, start_ts=start, delay_plateau_minutes=30, start_w=18.0,
+            energy_floor_kwh=0.05, observed_heating=False, cum_energy_kwh=0.03,
+        )
+        self.assertEqual(new_start, start)
+
+    def test_no_slide_after_heating(self):
+        """Once real wash evidence exists - heating observed, or cumulative energy already past
+        the standby floor - a long flat stretch must never be treated as a delayed-start wait."""
+        start = datetime(2026, 7, 17, 20, 0, 0, tzinfo=timezone.utc)
+        samples = _build_power_samples(start, [
+            (15, 45.0),
+            (350, 3.05),
+            (5, 22.0),
+        ])
+        new_start = slide_start_if_delayed(
+            samples, start_ts=start, delay_plateau_minutes=30, start_w=18.0,
+            energy_floor_kwh=0.05, observed_heating=True, cum_energy_kwh=0.03,
+        )
+        self.assertEqual(new_start, start)
+
+        new_start_energy = slide_start_if_delayed(
+            samples, start_ts=start, delay_plateau_minutes=30, start_w=18.0,
+            energy_floor_kwh=0.05, observed_heating=False, cum_energy_kwh=0.6,
+        )
+        self.assertEqual(new_start_energy, start)
+
+    def test_heating_right_after_plateau_slides(self):
+        """Heating can begin within one heartbeat of the wait ending, so no tick ever sees
+        'power >= start_w but not yet heating'. The gate disarming with a qualifying plateau
+        open IS the resume signal - the start must slide at that moment, not stay stuck on the
+        waiting UI until the end-of-cycle history backstop."""
+        start = datetime(2026, 7, 17, 20, 0, 0, tzinfo=timezone.utc)
+        samples = _build_power_samples(start, [
+            (15, 45.0),    # selection burst
+            (350, 3.05),   # flat standby wait
+            (5, 2200.0),   # heater engages immediately - observed_heating flips between ticks
+        ])
+        onset = start + timedelta(minutes=15 + 350)
+        new_start = slide_start_if_delayed(
+            samples, start_ts=start, delay_plateau_minutes=30, start_w=18.0,
+            energy_floor_kwh=0.05, observed_heating=False, cum_energy_kwh=0.03,
+            heating_onset_ts=onset,
+        )
+        self.assertEqual(new_start, onset)
+
+    def test_heating_without_plateau_does_not_slide(self):
+        """Gate disarm without a qualifying plateau (normal warm cycle heating early) must not
+        slide anything."""
+        start = datetime(2026, 7, 17, 20, 0, 0, tzinfo=timezone.utc)
+        samples = _build_power_samples(start, [
+            (10, 45.0),
+            (12, 3.0),     # only 12 min quiet - under the 30 min threshold
+            (5, 2200.0),
+        ])
+        onset = start + timedelta(minutes=10 + 12)
+        new_start = slide_start_if_delayed(
+            samples, start_ts=start, delay_plateau_minutes=30, start_w=18.0,
+            energy_floor_kwh=0.05, observed_heating=False, cum_energy_kwh=0.03,
+            heating_onset_ts=onset,
+        )
+        self.assertEqual(new_start, start)
+
+    def test_normal_cycle_no_trim(self):
+        """A normal ~155-min varied-power cycle with only short soaks (<= 13 min, never
+        contiguous past that) must never trigger a slide."""
+        start = datetime(2026, 7, 17, 20, 0, 0, tzinfo=timezone.utc)
+        samples = _build_power_samples(start, [
+            (10, 50.0),
+            (8, 2.0),
+            (15, 60.0),
+            (10, 3.0),
+            (40, 45.0),
+            (12, 2.5),
+            (60, 55.0),
+        ])
+        new_start = slide_start_if_delayed(
+            samples, start_ts=start, delay_plateau_minutes=30, start_w=18.0,
+            energy_floor_kwh=0.05, observed_heating=False, cum_energy_kwh=0.03,
+        )
+        self.assertEqual(new_start, start)
 
 
 if __name__ == "__main__":

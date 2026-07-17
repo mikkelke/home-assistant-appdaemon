@@ -353,6 +353,15 @@ class WasherMonitor(hass.Hass):
         self.run_for = int(self.args.get("run_for", 60))
         self.programs = self.args.get("programs", {})
 
+        # Delayed start (Miele delay timer): a brief selection-burst power spike (up to ~60W for
+        # ~15 min while the user picks a programme) trips start detection, then the machine sits
+        # at flat standby for hours until the wash actually begins. Without this, the whole wait
+        # is counted as wash time (see washer.yaml DELAYED START block for full rationale).
+        self.detect_delayed_start = bool(self.args.get("detect_delayed_start", True))
+        self.delay_plateau_minutes = int(self.args.get("delay_plateau_minutes", 30))
+        self.delay_energy_floor_kwh = float(self.args.get("delay_energy_floor_kwh", 0.05))
+        self.delayed_start_show_waiting = bool(self.args.get("delayed_start_show_waiting", True))
+
         # Cycle validation thresholds
         self.min_cycle_minutes = int(self.args.get("min_cycle_minutes", 25))
         self.min_energy_kwh = float(self.args.get("min_energy_kwh", 0.2))
@@ -494,6 +503,12 @@ class WasherMonitor(hass.Hass):
         self._pending_tail_mean_w = None
         self._pending_tail_std_w = None
         self._pending_tail_peak_w = None
+
+        # Delayed start (Miele delay timer) state - see detect_delayed_start config above
+        self._delay_plateau_start = None       # UTC when current sub-start_w plateau began
+        self._delayed_start_trimmed = False    # True once we've slid start_time past the wait
+        self._delay_waiting = False            # True while ETA is paused for a suspected wait
+        self._delayed_start_lead_idle_min = None  # Minutes trimmed off, for logging/diagnostics
 
         # Counters
         self.high_power_counter = 0
@@ -880,9 +895,18 @@ class WasherMonitor(hass.Hass):
             except (TypeError, ValueError, AttributeError):
                 pass
 
+        # Restore delayed-start-trimmed flag before the door-close clamp below (and the live one
+        # in _check_energy_finish) so a start_time we already slid past door-close is not dragged
+        # back to it.
+        try:
+            trimmed_attr = self.get_state(self.state_entity, attribute="delayed_start_trimmed")
+            self._delayed_start_trimmed = self._attr_bool_true(trimmed_attr)
+        except (TypeError, ValueError, AttributeError):
+            pass
+
         # Correct start_time if it's after last_door_closed_at (e.g. wrong from bad recovery).
         if (self.start_time and self.last_door_closed_trusted and self.last_door_closed_at and
-                self.start_time > self.last_door_closed_at):
+                self.start_time > self.last_door_closed_at and not self._delayed_start_trimmed):
             gap = (self.start_time - self.last_door_closed_at).total_seconds()
             if gap >= 60:
                 self.log(
@@ -1923,7 +1947,7 @@ class WasherMonitor(hass.Hass):
         if run_minutes < min_valid_dur:
             flags.append("runtime_too_short")
         if run_minutes > max_dur:
-            pass  # Optionally flag outlier but still allow completed
+            flags.append("duration_too_long")
         # B. Energy
         if energy_kwh < min_energy:
             flags.append("energy_too_low")
@@ -1948,6 +1972,11 @@ class WasherMonitor(hass.Hass):
         else:
             completion_class = "completed"
 
+        # D. Duration too long (e.g. a delayed-start wait that slipped past the trim guards) -
+        # never trust it for learning, even if it otherwise looked "completed".
+        if "duration_too_long" in flags and completion_class != "interrupted":
+            completion_class = "suspect"
+
         valid_for_learning = (
             completion_class == "completed"
             and "runtime_too_short" not in flags
@@ -1955,6 +1984,8 @@ class WasherMonitor(hass.Hass):
             and "unknown_programme" not in flags
         )
         if transition_path == "door_opened_first" and completion_class != "completed":
+            valid_for_learning = False
+        if "duration_too_long" in flags:
             valid_for_learning = False
 
         return {
@@ -2116,6 +2147,21 @@ class WasherMonitor(hass.Hass):
                     )
                 # Past addload window: front-loader door only unlocks when cycle allows (finished or brief add window).
                 if run_minutes > self.addload_window_minutes:
+                    # History backstop: catch a delayed-start wait the live detection missed (e.g.
+                    # heating started right after the plateau, closing the gate before a resume
+                    # tick) before handing off to _transition_to_unemptied.
+                    if self.detect_delayed_start and not self._delayed_start_trimmed and self.start_time:
+                        resume = self._infer_cycle_start_from_power_history(
+                            self.start_time - timedelta(minutes=5), self._now_utc()
+                        )
+                        if resume and (resume - self.start_time).total_seconds() / 60 >= self.delay_plateau_minutes:
+                            self.log(
+                                f"Delayed start (history backstop): sliding cycle start "
+                                f"{self._strftime_local(self.start_time)} -> {self._strftime_local(resume)}",
+                                level="INFO",
+                            )
+                            self.start_time = resume
+                            self._delayed_start_trimmed = True
                     self.log(
                         f"Door opened after {run_minutes:.1f} min (> {self.addload_window_minutes} min addload window) - "
                         f"front-load: finished before door -> Unemptied, Emptied, then Off",
@@ -2857,6 +2903,23 @@ class WasherMonitor(hass.Hass):
                     )
                 return
         if self._should_change_state("Unemptied", force=force):
+            # History backstop: if delayed-start detection never caught the wait live (e.g. the
+            # live gate closed before a resume tick, or the app restarted mid-wait), check power
+            # history once more before computing run_minutes so the wait is not recorded as wash
+            # time. Does not re-base energy accounting - the cycle is ending regardless.
+            if self.detect_delayed_start and not self._delayed_start_trimmed and self.start_time:
+                resume = self._infer_cycle_start_from_power_history(
+                    self.start_time - timedelta(minutes=5), self._now_utc()
+                )
+                if resume and (resume - self.start_time).total_seconds() / 60 >= self.delay_plateau_minutes:
+                    self.log(
+                        f"Delayed start (history backstop): sliding cycle start "
+                        f"{self._strftime_local(self.start_time)} -> {self._strftime_local(resume)}",
+                        level="INFO",
+                    )
+                    self.start_time = resume
+                    self._delayed_start_trimmed = True
+
             energy_used = self._get_energy_used()
             run_minutes_wall = self._get_run_duration_minutes()
 
@@ -2917,6 +2980,8 @@ class WasherMonitor(hass.Hass):
                 transition_path=end_reason,
                 spin_rpm=spin_rpm,
             )
+            if self._delayed_start_trimmed and duration_source is None:
+                duration_source = "delayed_start_trimmed"
             self._save_cycle_feedback(
                 predicted=final_prog,
                 predicted_temperature=final_temp,
@@ -3224,6 +3289,10 @@ class WasherMonitor(hass.Hass):
         self.in_finishing_tail_entered_at = None
         self.last_tail_pulse_at = None
         self.door_fast_start_armed_until = None
+        self._delay_plateau_start = None
+        self._delayed_start_trimmed = False
+        self._delay_waiting = False
+        self._delayed_start_lead_idle_min = None
         self._reset_input_selectors()
 
     def _set_programme_helpers_default(self):
@@ -3531,6 +3600,10 @@ class WasherMonitor(hass.Hass):
         self.last_high_energy_at = None
         self._zero_power_since = None
         self.expected_dur_at_start = None
+        self._delay_plateau_start = None
+        self._delayed_start_trimmed = False
+        self._delay_waiting = False
+        self._delayed_start_lead_idle_min = None
         self.start_time = self._now_utc()
         # Start time cannot be before the last door close (except in first 10 min AddLoad).
         if (
@@ -3589,6 +3662,8 @@ class WasherMonitor(hass.Hass):
             "estimated_remaining_min": profile["duration_min"],
             "estimated_end_time": (self.start_time + timedelta(minutes=profile["duration_min"])).astimezone(self._local_tz()).strftime("%H:%M"),
             "programme_duration_min": profile["duration_min"],
+            "delayed_start_trimmed": bool(self._delayed_start_trimmed),
+            "delayed_start_waiting": bool(self._delay_waiting),
         }
         if self.energy_start is not None:
             attrs["energy_at_start"] = self.energy_start
@@ -3631,9 +3706,10 @@ class WasherMonitor(hass.Hass):
         if self.expected_dur_at_start is None:
             attrs["expected_dur_at_start"] = ""
         # elapsed_minutes/progress_pct/heating_bursts/max_power_w are always 0/0.0 at cycle start
-        # (just reset); last_door_closed_trusted/programme_confirmed_by_user are commonly False too
-        # (no trusted door-close yet, Auto-mode default) -- AppDaemon 4.5.13 set_state bug, not ours;
-        # see smart_cooling.py's _publish() for details.
+        # (just reset); last_door_closed_trusted/programme_confirmed_by_user/delayed_start_trimmed/
+        # delayed_start_waiting are commonly False too (no trusted door-close yet, Auto-mode default,
+        # fresh cycle) -- AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish()
+        # for details.
         self._set_state_entity( state="Running", attributes=attrs, replace=True)
 
         if not self.poll_timer:
@@ -5002,7 +5078,109 @@ class WasherMonitor(hass.Hass):
                 self.log("Energy-based finish detection started", level="DEBUG")
         except (ValueError, TypeError):
             self.log("Could not get initial energy value for detection", level="WARNING")
-    
+
+    def _maybe_handle_delayed_start(self):
+        """Detect a Miele delayed-start wait and slide the cycle start past it.
+
+        The delay-timer selection burst (up to ~60W for ~15 min while the user picks a
+        programme) trips start detection; the machine then sits at flat standby for hours
+        until the wash actually begins. Left alone, the whole wait gets counted as wash time
+        (see washer.yaml DELAYED START block). While gated (feature on, not already trimmed,
+        no heating/energy evidence of a real wash yet) this tracks how long power has stayed
+        below start_w; once that plateau has lasted at least delay_plateau_minutes and power
+        rises back to start_w or above, the moment activity resumes becomes the new start_time.
+
+        As soon as heating or energy above delay_energy_floor_kwh proves the wash is real, we
+        stop looking for the rest of the cycle - either we already trimmed, or this was never a
+        delayed start (a normal cycle should never reach a qualifying plateau anyway).
+        """
+        gated = (
+            self.detect_delayed_start
+            and not self._delayed_start_trimmed
+            and not self.observed_heating
+            and self._get_energy_used() < self.delay_energy_floor_kwh
+        )
+        if not gated:
+            # Real wash evidence (heating/energy floor) arriving while a qualifying plateau is
+            # open IS the resume signal: heating can begin within one heartbeat of the wait
+            # ending, so a "power >= start_w but not yet heating" tick may never happen. Slide
+            # now rather than leaving the wait uncorrected (and the waiting UI stuck) until the
+            # end-of-cycle history backstop.
+            if self.detect_delayed_start and not self._delayed_start_trimmed and self._delay_waiting:
+                self._slide_start_for_delayed_start(self._now_utc())
+            self._delay_plateau_start = None
+            self._delay_waiting = False
+            return
+
+        now = self._now_utc()
+        current_power = self._get_current_power()
+        if current_power < self.start_w:
+            if self._delay_plateau_start is None:
+                self._delay_plateau_start = now
+            plateau_min = (now - self._delay_plateau_start).total_seconds() / 60
+            if plateau_min >= self.delay_plateau_minutes and not self._delay_waiting:
+                self._delay_waiting = True
+                self.log(
+                    f"Delayed start suspected: flat standby >= {self.delay_plateau_minutes} min "
+                    f"(power {current_power:.1f}W < {self.start_w:.0f}W) - ETA paused",
+                    level="INFO",
+                )
+        else:
+            if self._delay_plateau_start is not None:
+                plateau_min = (now - self._delay_plateau_start).total_seconds() / 60
+                if plateau_min >= self.delay_plateau_minutes:
+                    self._slide_start_for_delayed_start(now)
+            self._delay_plateau_start = None
+
+    def _slide_start_for_delayed_start(self, resume_at):
+        """Slide self.start_time to resume_at (activity resumed after a delayed-start wait).
+
+        Re-bases energy accounting and the running watchdog from resume_at: the finish loop's
+        stable/idle windows and the max-runtime tripwire must measure from the real wash, not
+        from the bogus (pre-wait) start.
+        """
+        old_start = self.start_time
+        lead_min = (resume_at - old_start).total_seconds() / 60
+        self._delayed_start_lead_idle_min = round(lead_min, 1)
+        self.start_time = resume_at
+        self._delayed_start_trimmed = True
+        self._delay_plateau_start = None
+        self._delay_waiting = False
+
+        # Re-base energy accounting to the real wash start.
+        try:
+            energy = self.get_state(self.energy_sensor)
+            if energy is not None and energy not in ["unknown", "unavailable"]:
+                self.energy_start = float(energy)
+                self.last_energy_value = self.energy_start
+                self.last_energy_time = resume_at
+                self.energy_buffer = [(resume_at, self.energy_start)]
+            else:
+                self.energy_buffer = []
+        except (ValueError, TypeError):
+            self.energy_buffer = []
+        self.last_high_energy_at = resume_at
+        self.energy_stable_start_time = None
+        self.finish_confirmed = False
+        self._zero_power_since = None
+
+        # Re-freeze expected duration from the real wash (was frozen from the bogus start tick).
+        self.expected_dur_at_start = None
+
+        # Re-arm the max-running-hours watchdog from the real start.
+        self._safe_cancel_timer(self.running_watchdog_timer)
+        self.running_watchdog_timer = self.run_in(
+            self._running_watchdog_timeout,
+            int(self.max_running_hours * 3600),
+        )
+
+        self._push_corrected_start_time_to_entity()
+        self.log(
+            f"Delayed start: sliding cycle start {self._strftime_local(old_start)} -> "
+            f"{self._strftime_local(resume_at)} (trimmed {self._delayed_start_lead_idle_min:.0f} min standby wait)",
+            level="INFO",
+        )
+
     def _check_energy_finish(self, kwargs):
         """Check if energy consumption has stopped (cycle finished)."""
         current_state = self.get_state(self.state_entity)
@@ -5010,6 +5188,8 @@ class WasherMonitor(hass.Hass):
         if current_state != "Running":
             self.energy_check_timer = None
             return
+
+        self._maybe_handle_delayed_start()
 
         # Compute programme classification once per tick to avoid redundant get_state calls.
         _tick_prog, _tick_temp = self._classify_programme()
@@ -5084,7 +5264,7 @@ class WasherMonitor(hass.Hass):
             except (TypeError, ValueError, AttributeError):
                 pass
         if (self.start_time and last_door and
-                self.start_time > last_door):
+                self.start_time > last_door and not self._delayed_start_trimmed):
             gap_seconds = (self.start_time - last_door).total_seconds()
             if gap_seconds >= 60:
                 self.log(
@@ -5253,6 +5433,8 @@ class WasherMonitor(hass.Hass):
             "idle_min": None,
             "heating_bursts": self.heating_phase_count,
             "max_power_w": round(self.max_power_seen, 0),
+            "delayed_start_trimmed": bool(self._delayed_start_trimmed),
+            "delayed_start_waiting": bool(self._delay_waiting),
             **pred_attrs,
         })
         if self.start_time:
@@ -5267,6 +5449,14 @@ class WasherMonitor(hass.Hass):
             attrs["elapsed_minutes"] = round(elapsed_min, 1)
             attrs["progress_pct"] = min(100, max(0, round(100 * elapsed_min / effective_dur))) if effective_dur else 0
             attrs["programme_duration_min"] = effective_dur
+            if self._delay_waiting and self.delayed_start_show_waiting:
+                # Suspected delayed-start wait: blank ETA/progress instead of showing a bogus
+                # countdown from the (not yet corrected) start_time. cycle_start_time is left
+                # as-is; delayed_start_waiting (set above) tells the UI why ETA is blank.
+                attrs["estimated_remaining_min"] = None
+                attrs["estimated_end_time"] = ""
+                attrs["progress_pct"] = 0
+                attrs["programme_duration_min"] = None
         if self.energy_start is not None:
             attrs["energy_at_start"] = self.energy_start
         if self.last_high_energy_at is not None:
@@ -5279,8 +5469,9 @@ class WasherMonitor(hass.Hass):
         attrs["programme_confirmed_by"] = self.confirmed_by_username or ""
         attrs["expected_dur_at_start"] = self.expected_dur_at_start if self.expected_dur_at_start is not None else ""
         # cycle_complete/heating_bursts/progress_pct/estimated_remaining_min/last_door_closed_trusted/
-        # programme_confirmed_by_user can all legitimately be False/0 on a normal mid-cycle tick (still
-        # running, pre-heating, near start/end of countdown, Auto mode, no trusted door-close) --
+        # programme_confirmed_by_user/delayed_start_trimmed/delayed_start_waiting can all legitimately
+        # be False/0 on a normal mid-cycle tick (still running, pre-heating, near start/end of
+        # countdown, Auto mode, no trusted door-close, no delayed start suspected) --
         # AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish() for details.
         self._set_state_entity( state="Running", attributes=attrs)
 
