@@ -95,10 +95,12 @@ dishwasher_monitor:
   # FEEDBACK & PROGRAMMES
   # ============================================================================
   
-  feedback_file: /data/appdaemon/apps/appliances/dishwasher_feedback.json
-  # Programme profiles (machine specs): loaded from dishwasher_programmes.yaml in the same directory.
-  # Override only with an in-container path: host /data/appdaemon is mounted at /conf, so a
-  # host path doesn't exist in the container and the app falls back to minimal defaults.
+  # Cycle feedback (dishwasher_feedback.json) and programme profiles (dishwasher_programmes.yaml)
+  # are loaded from this directory by default. Override only with in-container paths:
+  # host /data/appdaemon is mounted at /conf, so a host path doesn't exist in the
+  # container — every feedback write fails (learned durations lost) and programme
+  # profiles fall back to minimal defaults.
+  # feedback_file: /conf/apps/appliances/dishwasher_feedback.json
   # programmes_file: /conf/apps/appliances/dishwasher_programmes.yaml
 
   # ============================================================================
