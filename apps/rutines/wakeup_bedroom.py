@@ -42,6 +42,15 @@ class WakeupRoutine(hass.Hass):
         self.fallback = A.get("media_fallback")
         # Phone target for the total-media-failure page (see _verify_media_playback)
         self.notify_target = A.get("notify_target", ["mikkel"])
+        # Playback verification timing. The primary is a DR HLS stream: playlist +
+        # segment buffering routinely takes 3-8 s before the player reports "playing".
+        # The old fixed 2 s check produced 18 false failovers Mar-Jul 2026 (~15 % of
+        # mornings, every one "state=idle" that was really just still buffering) and
+        # on 16 of those 18 mornings the primary was audibly playing by the +4 s
+        # recheck. First check late, and recheck once before ever switching streams.
+        self.media_verify_delay_sec = int(A.get("media_verify_delay_sec", 12))
+        self.media_verify_recheck_sec = int(A.get("media_verify_recheck_sec", 5))
+        self.media_still_playing_check_sec = int(A.get("media_still_playing_check_sec", 45))
 
         self.volume_entities = list(A["volume_entities"])
         self.volume_start = float(A["volume_start"])
@@ -114,15 +123,14 @@ class WakeupRoutine(hass.Hass):
         self.volume_active = False
         self.current_pct = None
         self.media_attempt = 0
+        self._media_recheck_used = False
         # One feed line / one page per wake, however many times verification loops
         self._media_fallback_reported = False
         self._media_exhausted_reported = False
-        # True only while _minute_watchdog is invoking _alarm_fire, so the rescue feed
+        # True only while _heartbeat_check is invoking _alarm_fire, so the rescue feed
         # entry rides an alarm that actually fired (not a gated skip)
-        self._fired_via_watchdog = False
-        self.last_fire_date = None  # watchdog duplicate guard
-        # Must exist before _schedule_daily_alarm() (it calls _schedule_watchdog_if_needed)
-        self.watchdog = None
+        self._fired_via_heartbeat = False
+        self.last_fire_date = None  # heartbeat duplicate guard
 
         # Respect per-app log_level
         self.set_log_level(self.log_level)
@@ -130,9 +138,19 @@ class WakeupRoutine(hass.Hass):
         # Schedule alarm and reschedule on time change
         self._schedule_daily_alarm()
         self.listen_state(self._on_alarm_time_changed, self.alarm_time_entity)
-        # Also reschedule watchdog when alarm enabled/disabled changes
-        self.listen_state(self._on_alarm_enabled_changed, self.alarm_enabled_entity)
-        self._schedule_watchdog_if_needed()
+        # Always-on minute heartbeat as the alarm's safety net. History (Sep 19 - Nov 16
+        # 2025): the AppDaemon scheduler developed a constant +67 min phase shift, so the
+        # run_daily callback arrived 67 minutes late every single day and was rejected by
+        # the ±90 s trigger-window guard; 47 mornings were saved only because a leaked
+        # minute-level run_every from the old arm/disarm watchdog kept ticking. A fixed
+        # 60 s cadence survives that failure mode (a phase shift moves the tick within the
+        # minute, it never removes it), which arm-on-restart/config-change logic does not -
+        # the old watchdog was armed on only a handful of days per month. An AD restart on
+        # 2025-11-16 (4.5.12) cleared the shift; zero missed fires in the 8 months since,
+        # so this should never fire - if it does, that is the scheduler regressing again.
+        self.heartbeat = self.run_every(
+            self._heartbeat_check, self.datetime() + timedelta(seconds=70), 60
+        )
 
     # ---------- scheduling ----------
     def _schedule_daily_alarm(self):
@@ -153,9 +171,6 @@ class WakeupRoutine(hass.Hass):
             except Exception:
                 pass
         self.alarm_timer = self.run_daily(self._alarm_fire, sched)
-        
-        # Schedule watchdog if needed (after scheduling alarm)
-        self._schedule_watchdog_if_needed()
 
         # Also schedule an absolute run_at for the computed time today (reliable immediate test)
         try:
@@ -192,112 +207,38 @@ class WakeupRoutine(hass.Hass):
 
     def _on_alarm_time_changed(self, entity, attr, old, new, kwargs):
         self._schedule_daily_alarm()
-        self._schedule_watchdog_if_needed()
-    
-    def _on_alarm_enabled_changed(self, entity, attr, old, new, kwargs):
-        """Reschedule watchdog when alarm is enabled/disabled."""
-        self._schedule_watchdog_if_needed()
 
-    def _schedule_watchdog_if_needed(self):
-        """Schedule watchdog only if alarm is enabled and we're within 2 hours of alarm time."""
+    def _heartbeat_check(self, kwargs):
+        """Fire the routine if run_daily missed the alarm minute (see initialize).
+
+        The [5, 90) window gives a healthy run_daily a 5 s head start (it lands at
+        :00.0x when the scheduler is well), still passes _alarm_fire's ±90 s guard,
+        and tolerates one delayed tick. last_fire_date (set inside _alarm_fire)
+        makes the normal day a date-compare no-op."""
         try:
-            # Cancel existing watchdog if any
-            if self.watchdog:
-                try:
-                    if self.timer_running(self.watchdog):
-                        self.cancel_timer(self.watchdog)
-                except Exception:
-                    pass
-                self.watchdog = None
-            
-            # Only schedule if alarm is enabled
-            if self.get_state(self.alarm_enabled_entity) != "on":
-                return
-            
-            # Check if we're within 2 hours of alarm time
-            tstr = self.get_state(self.alarm_time_entity)
-            if not tstr:
-                return
-            
-            hh, mm, *ss = [int(x) for x in tstr.split(":")]
-            now_dt = self.datetime()
-            target_today = now_dt.replace(hour=hh, minute=mm, second=(ss[0] if ss else 0), microsecond=0)
-            
-            # Calculate time until alarm (handle next day if needed)
-            if target_today < now_dt:
-                target_today = target_today + timedelta(days=1)
-            
-            delta_seconds = (target_today - now_dt).total_seconds()
-            
-            # Only schedule watchdog if within 2 hours (7200 seconds) of alarm time
-            if 0 <= delta_seconds <= 7200:
-                # Schedule to start 1 minute before alarm time
-                start_watchdog_at = max(60, delta_seconds - 60)
-                self.watchdog = self.run_in(self._start_watchdog, start_watchdog_at)
-                self.log(f"[wake] Watchdog scheduled to start in {start_watchdog_at:.0f}s (alarm in {delta_seconds:.0f}s)", log=self.user_log)
-        except Exception as e:
-            self.log(f"[wake] Error scheduling watchdog: {e}", level="ERROR", log=self.user_log)
-    
-    def _start_watchdog(self, kwargs):
-        """Start the minute-level watchdog when close to alarm time."""
-        try:
-            # Cancel any existing watchdog
-            if self.watchdog:
-                try:
-                    if self.timer_running(self.watchdog):
-                        self.cancel_timer(self.watchdog)
-                except Exception:
-                    pass
-            
-            # Start watchdog that runs every minute
-            self.watchdog = self.run_every(self._minute_watchdog, self.datetime(), 60)
-            self.log("[wake] Watchdog started (running every minute until alarm fires)", log=self.user_log)
-        except Exception as e:
-            self.log(f"[wake] Error starting watchdog: {e}", level="ERROR", log=self.user_log)
-            self.watchdog = None
-    
-    def _minute_watchdog(self, kwargs):
-        """Minute-level watchdog to guarantee firing even if a daily tick is missed."""
-        try:
-            # Stop watchdog if alarm is disabled
-            if self.get_state(self.alarm_enabled_entity) != "on":
-                if self.watchdog:
-                    try:
-                        if self.timer_running(self.watchdog):
-                            self.cancel_timer(self.watchdog)
-                    except Exception:
-                        pass
-                    self.watchdog = None
-                return
-            
-            tstr = self.get_state(self.alarm_time_entity)
-            if not tstr:
-                return
-            hh, mm, *ss = [int(x) for x in tstr.split(":")]
-            target = self.datetime().replace(hour=hh, minute=mm, second=(ss[0] if ss else 0), microsecond=0)
             now_dt = self.datetime()
             if self.last_fire_date == now_dt.date():
                 return
+            if self.get_state(self.alarm_enabled_entity) != "on":
+                return
+            tstr = self.get_state(self.alarm_time_entity)
+            if not tstr:
+                return
+            hh, mm, *ss = [int(x) for x in str(tstr).split(":")]
+            target = now_dt.replace(hour=hh, minute=mm, second=(ss[0] if ss else 0), microsecond=0)
             delta = (now_dt - target).total_seconds()
-            if 0 <= delta < 60:
-                # Conditions enforced inside _alarm_fire
-                self.log("[wake] Watchdog firing alarm (minute check)", log=self.user_log)
-                self._fired_via_watchdog = True
+            if 5 <= delta < 90:
+                # The scheduled run_daily should have fired seconds ago - this is the
+                # signal the 2025 scheduler bug is back, not routine operation.
+                self.log("[wake] Heartbeat firing alarm - scheduled run_daily missed its minute",
+                         level="WARNING", log=self.user_log)
+                self._fired_via_heartbeat = True
                 try:
                     self._alarm_fire(None)
                 finally:
-                    self._fired_via_watchdog = False
-                self.last_fire_date = now_dt.date()
-                # Stop watchdog after firing
-                if self.watchdog:
-                    try:
-                        if self.timer_running(self.watchdog):
-                            self.cancel_timer(self.watchdog)
-                    except Exception:
-                        pass
-                    self.watchdog = None
-        except Exception:
-            pass
+                    self._fired_via_heartbeat = False
+        except Exception as e:
+            self.log(f"[wake] Heartbeat check error: {e}", level="WARNING", log=self.user_log)
 
     # ---------- main alarm ----------
     def _alarm_fire(self, _):
@@ -312,7 +253,7 @@ class WakeupRoutine(hass.Hass):
                 return
         except Exception:
             pass
-        # Mark date for watchdog duplicate suppression
+        # Mark date for heartbeat duplicate suppression
         try:
             self.last_fire_date = self.datetime().date()
         except Exception:
@@ -338,15 +279,15 @@ class WakeupRoutine(hass.Hass):
             )
         except Exception:
             pass
-        if self._fired_via_watchdog:
-            # The daily scheduler tick was missed and the minute watchdog rescued the
+        if self._fired_via_heartbeat:
+            # The daily scheduler tick was missed and the minute heartbeat rescued the
             # routine - one extra admin line, because repeats of this point at an
             # AppDaemon scheduler problem. Once per day by construction (last_fire_date).
             try:
                 self.fire_event(
                     "house_events_report",
                     cause="Wake alarm's scheduled tick never fired",
-                    effect="Watchdog re-fired the morning routine",
+                    effect="Backup heartbeat re-fired the morning routine",
                     icon="mdi:alarm-check",
                     audience="admin",
                 )
@@ -392,6 +333,7 @@ class WakeupRoutine(hass.Hass):
     def _start_media_and_volume_ramp(self):
         # Attempt 0: play as-provided
         self.media_attempt = 0
+        self._media_recheck_used = False
         self._media_fallback_reported = False
         self._media_exhausted_reported = False
         self._play_media(self.stream_id)
@@ -406,11 +348,13 @@ class WakeupRoutine(hass.Hass):
         self._set_volume(self.volume_start)
         self.volume_active = True
         self._schedule_next_volume_tick()
-        # Verify playback started; if not, try fallbacks
+        # Verify playback started; if not, try fallbacks (delays sized for HLS startup,
+        # see media_verify_* in initialize)
         try:
-            self.run_in(self._verify_media_playback, 2)
-            # Also check if playback drops shortly after start ("playing but dead" scenario)
-            self.run_in(self._verify_media_is_still_playing, 10)
+            self.run_in(self._verify_media_playback, self.media_verify_delay_sec)
+            # Also check if playback drops shortly after start ("playing but dead" scenario) -
+            # after the whole verify/recheck/fallback chain has had time to conclude
+            self.run_in(self._verify_media_is_still_playing, self.media_still_playing_check_sec)
         except Exception:
             pass
 
@@ -450,6 +394,19 @@ class WakeupRoutine(hass.Hass):
         if is_really_playing:
             return
 
+        # One free recheck per attempt before escalating: "not playing yet" at the first
+        # check is usually HLS still buffering, not a dead stream. Every observed false
+        # failover (Mar-Jul 2026) would have been absorbed here.
+        if not self._media_recheck_used:
+            self._media_recheck_used = True
+            self.log(
+                f"[wake] Playback not confirmed yet (state={state}); rechecking in "
+                f"{self.media_verify_recheck_sec}s before failover",
+                log=self.user_log,
+            )
+            self.run_in(self._verify_media_playback, self.media_verify_recheck_sec)
+            return
+
         # Build ordered candidates list: primary + configured fallback
         candidates = [self.stream_id]
         if self.fallback:
@@ -480,8 +437,9 @@ class WakeupRoutine(hass.Hass):
                     )
                 except Exception:
                     pass
+            self._media_recheck_used = False  # fresh recheck budget for the new stream
             self._play_media(next_id)
-            self.run_in(self._verify_media_playback, 2)
+            self.run_in(self._verify_media_playback, self.media_verify_delay_sec)
             return
 
         # Final attempt: nudge media_play as last resort
@@ -489,7 +447,8 @@ class WakeupRoutine(hass.Hass):
             try:
                 self.call_service("media_player/media_play", entity_id=self.master_player)
                 self.log("[wake] Final fallback: sent generic media_play command", level="WARNING", log=self.user_log)
-                self.run_in(self._verify_media_playback, 2)
+                self._media_recheck_used = False
+                self.run_in(self._verify_media_playback, self.media_verify_recheck_sec)
             except Exception:
                 pass
             return
@@ -539,10 +498,10 @@ class WakeupRoutine(hass.Hass):
                 level="WARNING",
                 log=self.user_log
             )
-            # Force escalation immediately by calling verification
-            # Reset attempt counter to allow retry of fallbacks
-            if self.media_attempt < 1:
-                self.media_attempt = 0  # Will increment to 1 on next call
+            # Restart the escalation chain from the top, skipping the buffering recheck:
+            # the stream already proved it can die, go straight to the fallback.
+            self.media_attempt = 0
+            self._media_recheck_used = True
             self._verify_media_playback(None)
 
     def _is_within_trigger_window(self, window_seconds: int) -> bool:

@@ -16,6 +16,11 @@ WakeupBedroom:
   media_content_id: "https://drliveradio2.akamaized.net/hls/live/2118698/p3/playlist-320000.m3u8"
   media_content_type: "music"
   media_fallback: "https://drliveradio2.akamaized.net/hls/live/2118698/p3/playlist-96000.m3u8"  # low-bitrate variant; old icy endpoint is dead
+  # HLS needs 3-8 s to report "playing"; the old 2 s check caused ~15 % false failovers
+  # (Mar-Jul 2026). First verify late, then one recheck per attempt before switching stream.
+  media_verify_delay_sec: 12
+  media_verify_recheck_sec: 5
+  media_still_playing_check_sec: 45
 
   volume_entities:
     - media_player.bedroom
