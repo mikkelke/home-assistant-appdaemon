@@ -3056,12 +3056,14 @@ class WasherMonitor(hass.Hass):
             # Save feedback when we arrive in Emptied directly from Running (bypassing Unemptied).
             # This covers two paths:
             #   1. "cycle finished" reason  - explicit skip-Unemptied path
-            #   2. Previous HA state is still "Running" - _transition_to_unemptied was blocked
-            #      (e.g. by a transient exception) before _transition_to_emptied was called.
+            #   2. In-memory state is still "Running" - _transition_to_unemptied was blocked
+            #      (e.g. by _should_change_state) before _transition_to_emptied was called.
             # In both cases start_time and run_minutes are still set; feedback has not been saved yet.
-            prev_ha_state = self.get_state(self.state_entity)
+            # Must check self.state, not the HA entity: right after _transition_to_unemptied the
+            # entity read can still return "Running" (set_state round trip pending), which made
+            # this guard pass again and save the same cycle twice seconds apart.
             came_from_running = (
-                prev_ha_state == "Running"
+                self.state == "Running"
                 or "cycle finished" in reason
             )
             if (
@@ -4584,6 +4586,32 @@ class WasherMonitor(hass.Hass):
             self.log(f"Feedback file will be created at: {self.feedback_file}", level="INFO")
 
         data["version"] = 2
+
+        # Idempotency guard: two cycle-end paths can fire for the same physical cycle seconds
+        # apart (e.g. a door open saving via both _transition_to_unemptied and
+        # _transition_to_emptied). A genuine next cycle must run min_cycle_minutes first, so a
+        # record this close to the previous one with the same programme and (near-)identical
+        # duration is the same cycle. Wall-clock durations grow with the detection gap, so the
+        # tolerance is the gap plus rounding slack.
+        try:
+            last = data["cycles"][-1] if data["cycles"] else None
+            if last:
+                gap_s = (self._now_utc() - datetime.fromisoformat(last["ts"])).total_seconds()
+                same_programme = (
+                    last.get("confirmed") == record["confirmed"]
+                    and last.get("confirmed_temperature") == record["confirmed_temperature"]
+                )
+                duration_close = abs(float(last["duration_min"]) - record["duration_min"]) <= gap_s / 60.0 + 0.6
+                if 0 <= gap_s <= 180 and same_programme and duration_close:
+                    self.log(
+                        f"Skipping duplicate cycle feedback: {record['confirmed']} {record['duration_min']} min "
+                        f"already recorded {gap_s:.0f}s ago (ts {last['ts']}) by another cycle-end path",
+                        level="WARNING",
+                    )
+                    return
+        except Exception as e:
+            self.log(f"Duplicate-feedback guard error (saving anyway): {e}", level="DEBUG")
+
         data["cycles"].append(record)
 
         try:
