@@ -2,8 +2,10 @@
 # Knobs you ever touch: input_boolean.smart_cooling (Arm) + input_boolean.smart_cooling_ac_removed
 # (click right before taking the unit out - whatever the clock says). No bedtime knob (removed
 # 2026-07-15): the price-optimizer shops slots up to midnight; from 23:00 the horizon never
-# shrinks below 1h, and past midnight it maintains target on a rolling 1h window until the
-# AC-removed press (raw midnight cap shut the AC off at 23:52 mid-deficit, 2026-07-15).
+# shrinks below 1h, and past midnight it rolls a 1h window until the AC-removed press (raw
+# midnight cap shut the AC off at 23:52 mid-deficit, 2026-07-15). Past midnight it also chases
+# the hardware floor rather than just the physics-minimum target (user 2026-07-17: cheap power
+# + sealing imminent = no reason to stop early), bounded by tonight's real saturation.
 # Optional default: input_number.smart_cooling_night_ceiling (23C). Depth is calculated, not set.
 # dry_run: true -> it runs, learns and publishes the plan, but every AC command is a no-op.
 

@@ -27,7 +27,10 @@ either wrong or a chore to keep updated. Two independent things used to share th
     AC-removed press the user is evidently still up, so keep improving the night against the
     wider _deadline horizon (midnight cap -- never bank on slots past it, user 2026-07-15 --
     then a rolling 1h maintenance window through 06:00; the raw midnight cap once shut the AC
-    off at 23:52 mid-deficit, hence the 1h floor).
+    off at 23:52 mid-deficit, hence the 1h floor). Past midnight the AIM also changes, not just
+    the horizon (user, 2026-07-17): 00-06 is reliably cheap and sealing is imminent, so there's
+    no daytime decay to out-leak extra depth -- chase the hardware floor, not just the physics
+    minimum, bounded only by tonight's real saturation (see _reach_target).
 
 Stall-breaker (2026-07-15): the unit regulates off its own intake sensor, which sits in its cold
 outflow pool -- it parks at ~300 W "idle" with the floor still degrees above target, and no fan
@@ -235,8 +238,9 @@ class SmartCooling(hass.Hass):
         while the user was still up (bit us 2026-07-15 23:52). Past midnight (00-06) the
         night is IN PROGRESS -- the AC still being deployed means nobody has gone to bed,
         and tomorrow's cheap midday slots are useless for tonight -- so roll a 1h
-        maintenance horizon: hold the floor at target, at the going price, until the
-        AC-removed press (or 06:00, when normal next-night planning resumes)."""
+        maintenance horizon at the going (reliably cheap) price, until the AC-removed press
+        or 06:00. See _reach_target for what this horizon aims AT past midnight -- not just
+        the physics target anymore, since the hour is cheap and sealing is imminent."""
         if now.hour < 6:
             return now + timedelta(hours=1)
         return max(self._next_midnight(now), now + timedelta(hours=1))
@@ -392,6 +396,30 @@ class SmartCooling(hass.Hass):
             self._learn_feasible(self._sat_min)
         return self._saturated
 
+    def _reach_target(self, now, target, saturated):
+        """What we actually pursue this tick. `target` is the physics-ideal minimum for
+        tonight's ceiling; this widens or tightens it against real-world limits, checked
+        in priority order:
+          1. Tonight's REAL saturation (measured, can't argue with it) -- never chase
+             past a floor we've already proven won't move.
+          2. Post-midnight bonus (user, 2026-07-17: "keep cooling if it make the room more
+             comfortable after 00:00, energy is always cheaper then"). Sealing is
+             imminent at that hour, so there's no daytime decay to out-leak the extra
+             depth, and 00-06 is reliably one of the cheapest windows of the day (see the
+             July price sweep) -- so aim for the hardware floor, not just the minimum
+             needed. The historical feasible-floor cap (next) is skipped here on purpose:
+             trying is nearly free at these prices, and that's exactly how a milder night
+             re-teaches the learner a deeper number.
+          3. The historical feasible-floor cap -- elsewhere (daytime/evening), avoid
+             paying peak prices chasing depth history says won't hold."""
+        if saturated and self._sat_min is not None:
+            return max(target, self._sat_min)
+        if now.hour < 6:
+            return self.min_temp
+        if self._feasible_floor is not None and self._feasible_samples >= self.feasible_min_samples:
+            return max(target, self._feasible_floor - 0.3)
+        return target
+
     def _learn_feasible(self, floor_min):
         """EMA the observed can't-go-lower floor across nights, so future plans stop
         promising (and pricing) depth the unit can't deliver."""
@@ -507,22 +535,15 @@ class SmartCooling(hass.Hass):
         deficit = floor - target
         floor_limited = target <= self.min_temp + 0.05  # hot night: cooling as deep as the unit allows
 
-        # Feasibility cap: schedule (and pay) only for depth the floor will actually take.
-        # `target` stays the IDEAL for display/learning; `reach_target` is what we pursue.
-        # Tonight's live evidence (saturated at _sat_min) beats the cross-night learned
-        # limit; the learned limit is probed 0.3C deep so a milder night can beat it and
-        # re-teach us, instead of the clamp becoming self-fulfilling.
+        # `target` stays the IDEAL for display/learning; `reach_target` is what we actually
+        # pursue -- widened past midnight for the cheap-power bonus, tightened by the
+        # feasibility cap when the floor has proven it won't go lower (see _reach_target).
         engaged = 0.0
         if self._last_want and self._last_eval_at is not None:
             engaged = min((now - self._last_eval_at).total_seconds() / 60.0,
                           self.interval_min * 1.5)
         saturated = self._track_progress(floor, engaged)
-        reach_target = target
-        if saturated and self._sat_min is not None:
-            reach_target = max(reach_target, self._sat_min)
-        elif (self._feasible_floor is not None
-              and self._feasible_samples >= self.feasible_min_samples):
-            reach_target = max(reach_target, self._feasible_floor - 0.3)
+        reach_target = self._reach_target(now, target, saturated)
         reach_deficit = floor - reach_target
         minutes_needed = max(0.0, reach_deficit) / self.floor_cool_cph * 60.0
 
@@ -572,14 +593,22 @@ class SmartCooling(hass.Hass):
         # decision
         if floor <= self.min_temp:
             want, reason = False, f"Floor at min ({floor:.1f}<= {self.min_temp:.1f}) -- holding"
-        elif deficit <= 0.05:
-            want, reason = False, f"On track: floor {floor:.1f}C <= target {target:.1f}C (zone {zone:.1f}, cap {ceiling:.0f})"
         elif reach_deficit <= 0.05:
-            lim = self._sat_min if saturated else self._feasible_floor
-            want, reason = False, (f"As cold as it feasibly gets: floor {floor:.1f}C, ideal "
-                                   f"{target:.1f}C, but the floor stops taking cold around "
-                                   f"{lim:.1f}C -- holding rather than paying for cooling it "
-                                   f"won't absorb")
+            # Single source of truth for "are we done" -- `target` alone would stop the
+            # post-midnight bonus (below) the moment the SHALLOW physics minimum was hit,
+            # never reaching the deeper reach_target it's actually chasing.
+            if reach_target > target + 0.05:
+                lim = self._sat_min if saturated else self._feasible_floor
+                want, reason = False, (f"As cold as it feasibly gets: floor {floor:.1f}C, ideal "
+                                       f"{target:.1f}C, but the floor stops taking cold around "
+                                       f"{lim:.1f}C -- holding rather than paying for cooling it "
+                                       f"won't absorb")
+            elif reach_target < target - 0.05:
+                want, reason = False, (f"Banked past the minimum: floor {floor:.1f}C, cheap "
+                                       f"post-midnight power got it colder than the {target:.1f}C "
+                                       f"actually needed -- holding")
+            else:
+                want, reason = False, f"On track: floor {floor:.1f}C <= target {target:.1f}C (zone {zone:.1f}, cap {ceiling:.0f})"
         elif not window_open:
             want, reason = False, "Bathroom window closed -- open it so the condenser can vent"
         elif backleak_hard:
@@ -593,6 +622,8 @@ class SmartCooling(hass.Hass):
                       + ("  [floor-limited: hottest it can do]" if floor_limited else "")
                       + (f"  [capped by feasible ~{reach_target:.1f}C, ideal {target:.1f}C]"
                          if reach_target > target + 0.05 else "")
+                      + (f"  [bonus: cheap post-midnight power, past the {target:.1f}C minimum]"
+                         if reach_target < target - 0.05 else "")
                       + (f"  [condenser room {bath:.1f}C -- pushing through the cheap slot]"
                          if bath_warm else ""))
         else:

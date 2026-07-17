@@ -311,6 +311,46 @@ class TrackProgress(unittest.TestCase):
         self.assertAlmostEqual(app._feasible_floor, 19.5, places=2)  # w=1/2 EMA
 
 
+class ReachTarget(unittest.TestCase):
+    """Post-midnight bonus (user, 2026-07-17): "keep cooling if it make the room more
+    comfortable after 00:00, energy is always cheaper then." Past midnight the aim widens
+    from the physics-minimum target to the hardware floor -- sealing is imminent (no
+    daytime decay to out-leak the extra depth) and the hour is reliably cheap -- bounded
+    only by tonight's REAL saturation, never by the historical feasible-floor cap (that
+    cap exists to avoid paying peak prices for depth history says won't hold; at these
+    prices trying is nearly free)."""
+
+    def test_daytime_unsaturated_uses_plain_target(self):
+        app = make_app()
+        now = datetime(2026, 7, 16, 14, 0)
+        self.assertEqual(app._reach_target(now, target=19.3, saturated=False), 19.3)
+
+    def test_daytime_respects_historical_feasible_cap(self):
+        app = make_app(feasible_floor=20.5, feasible_samples=3)
+        now = datetime(2026, 7, 16, 21, 0)
+        # ideal 18.3 is below the learned wall (probed 0.3C deep) -> capped warmer
+        self.assertEqual(app._reach_target(now, target=18.3, saturated=False), 20.2)
+
+    def test_past_midnight_ignores_historical_cap_aims_for_hardware_floor(self):
+        # same learned history as above, but past midnight: go for min_temp anyway --
+        # trying is cheap here, unlike the peak-price hours the historical cap guards.
+        app = make_app(feasible_floor=20.5, feasible_samples=3, min_temp=16.0)
+        now = datetime(2026, 7, 17, 1, 0)
+        self.assertEqual(app._reach_target(now, target=19.3, saturated=False), 16.0)
+
+    def test_past_midnight_still_respects_tonights_real_saturation(self):
+        # physics can't be out-cheaped: if the floor already proved it stops at 20.5
+        # TONIGHT, the bonus window doesn't get to ignore that.
+        app = make_app(sat_min=20.5)
+        now = datetime(2026, 7, 17, 2, 0)
+        self.assertEqual(app._reach_target(now, target=18.0, saturated=True), 20.5)
+
+    def test_at_six_reverts_to_daytime_rules(self):
+        app = make_app(feasible_floor=20.0, feasible_samples=2)
+        now = datetime(2026, 7, 17, 6, 0)
+        self.assertEqual(app._reach_target(now, target=18.0, saturated=False), 19.7)
+
+
 class WindowOpen(unittest.TestCase):
     """Regression for the 2026-07-16 Zigbee flaps: binary_sensor.bathroom_window_contact
     dropped off 5x that day (~70 s unavailable->unknown->on blips, battery full), and the
