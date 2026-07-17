@@ -267,6 +267,8 @@ washer_monitor:
 
   # Core entities
   power_sensor: "sensor.washer_plug_power"
+  # Grace before a plug outage force-wipes the state; HA restarts and Shelly reboots recover well inside this.
+  power_unavailable_off_after_seconds: 180
   energy_sensor: "sensor.washer_plug_energy"
   door_sensor: "binary_sensor.washer_door_contact"
   state_entity: "sensor.washer_state"

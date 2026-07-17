@@ -352,6 +352,11 @@ class WasherMonitor(hass.Hass):
         self.stop_w = float(self.args["stop_w"])
         self.run_for = int(self.args.get("run_for", 60))
         self.programs = self.args.get("programs", {})
+        # Plug/state entity unavailable: tolerate short gaps (HA restart, ESPHome OTA flash) before
+        # force-wiping a Running cycle - see dishwasher_monitor.py's power_unavailable_error_after_seconds
+        # for the same guard (2026-07-17 log investigation: dishwasher absorbs these with zero false
+        # transitions; washer used to force Off instantly and destroy cycle tracking/learning data).
+        self.power_unavailable_off_after_seconds = int(self.args.get("power_unavailable_off_after_seconds", 180))
 
         # Delayed start (Miele delay timer): a brief selection-burst power spike (up to ~60W for
         # ~15 min while the user picks a programme) trips start detection, then the machine sits
@@ -566,6 +571,7 @@ class WasherMonitor(hass.Hass):
         self.unemptied_watchdog_timer = None
         self.unemptied_door_recheck_timer = None  # Periodic door check while Unemptied (catches missed open events)
         self.emptied_watchdog_timer = None  # Auto Off after emptied_timeout_minutes if door stays open
+        self.power_unavailable_off_timer = None  # Grace period before forcing Off on plug/state dropout (2026-07-17)
         self._last_infer_start_attempt = None  # Throttle _infer_start_from_state_history
         self._last_finish_guard_info_log_at = None  # Throttle repetitive INFO finish-guard lines
 
@@ -3372,14 +3378,15 @@ class WasherMonitor(hass.Hass):
             self.log(f"Non-numeric power reading: {new}", level="WARNING")
             return
 
-        # Plug is reporting numbers again - stand down the dead-plug watchdog.
+        # Plug is reporting numbers again - stand down the dead-plug watchdog and the
+        # pending forced-Off grace.
         if self._plug_outage_push_timer:
             self._safe_cancel_timer(self._plug_outage_push_timer)
             self._plug_outage_push_timer = None
         if self._plug_outage_pushed:
             self._plug_outage_pushed = False
             self._push_mobile("Power plug is reporting again - washer monitoring resumed.")
-
+        self._cancel_power_unavailable_grace()
         current_state = self.get_state(self.state_entity)
 
         if current_state == "Running":
@@ -3799,13 +3806,41 @@ class WasherMonitor(hass.Hass):
         elif watts <= self.stop_w:
             self.log(f"Power low but waiting for confirmation (time since high: {time_since_high:.0f}s, need {confirmation_time}s)", level="DEBUG")
 
+    def _cancel_power_unavailable_grace(self):
+        """Power/state readings are valid again; cancel the pending forced-Off transition."""
+        self._safe_cancel_timer(self.power_unavailable_off_timer)
+        self.power_unavailable_off_timer = None
+
     def _handle_unavailable(self, entity, attribute, old, new, kwargs):
-        """Handle entity becoming unavailable - use the real Off transition so all
-        Running-state attributes are cleared and timers cancelled cleanly."""
-        self.log(f"{entity} became unavailable ({new}), transitioning to Off", level="WARNING")
-        self._transition_to_off(f"{entity} unavailable", force=True)
+        """Handle entity becoming unavailable - do not force-wipe an in-progress cycle on a brief
+        dropout (HA restart or ESPHome OTA flash routinely drop the plug for well under the grace
+        period - 2026-07-17 log investigation showed dishwasher_monitor.py absorbs the same outages
+        with zero false transitions). Wait for the outage to persist before forcing Off; a lasting
+        plug outage separately pages the phone (_begin_plug_outage_grace).
+        The already-running guard below also dedups the double-invocation that used to log twice
+        11 ms apart: the 'unavailable' listen_state AND the unavailable branch of _power_changed
+        both call this."""
         if entity == self.power_sensor:
             self._begin_plug_outage_grace()
+        if self.power_unavailable_off_timer and self.timer_running(self.power_unavailable_off_timer):
+            return
+        self.power_unavailable_off_timer = self.run_in(
+            self._power_unavailable_off_timeout,
+            self.power_unavailable_off_after_seconds,
+        )
+        self.log(
+            f"{entity} unavailable ({new}); waiting {self.power_unavailable_off_after_seconds}s before forcing Off "
+            f"(short dropouts - HA restart / plug OTA - are ignored)",
+            level="WARNING",
+        )
+
+    def _power_unavailable_off_timeout(self, kwargs):
+        self.power_unavailable_off_timer = None
+        ps = self.get_state(self.power_sensor)
+        if ps not in ("unknown", "unavailable", None):
+            self.log(f"Power sensor recovered before the {self.power_unavailable_off_after_seconds}s grace expired", level="INFO")
+            return
+        self._transition_to_off(f"Power sensor unavailable >= {self.power_unavailable_off_after_seconds}s", force=True)
 
     def _begin_plug_outage_grace(self):
         """Short plug dropouts are routine; only a lasting outage pages the phone."""
