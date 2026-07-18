@@ -20,9 +20,18 @@ Forecast: met.no hourly via weather.get_forecasts (raw WS envelope - dig
 result.response.<entity>.forecast; can hang -> wait_for timeout). t_max = daily
 high, t_ev = the evening 22:00 temperature.
 
-Notification policy: when the AC is not running and a projected night breaks
+Notification policy: when the AC is genuinely STORED and a projected night breaks
 the ceiling within `notify_lead_days`, notify ONCE per date (persisted).
 All-clear once the horizon is comfortably cool again after a warning.
+
+"Stored" is deliberately NOT "not running right now" (bit us 2026-07-18: the 20:30
+eval caught SmartCooling's planned evening price-hold -- unit plugged in, mode off,
+2 W -- and advised deploying the AC that was standing right there; the 12:15 eval
+nagged during the unplugged half of the DAILY overnight ritual). In active use the
+unit is plugged in by afternoon and unplugged overnight, so: suppress advice while
+the climate entity is available OR was available within `stored_hours` (default 30
+-- longer than any nightly storage, shorter than a between-spells teardown). The
+deploy stamp persists across restarts.
 """
 
 import asyncio
@@ -124,6 +133,9 @@ class DeployAdvisor(hass.Hass):
         self.state_file = a("state_file", "/conf/apps/climate/deploy_advisor_state.json")
         self.publish_entity = a("publish_entity", "sensor.bedroom_night_projection")
         self.notify_lead_days = int(a("notify_lead_days", 2))
+        # Continuous un-deployed hours before the unit counts as torn down (see module
+        # docstring): nightly-ritual storage (~18 h) must NOT re-arm deploy advice.
+        self.stored_hours = float(a("stored_hours", 30.0))
         self.notify_target = a("notify_target", "mikkel")
         self.default_rise_frac = float(a("default_rise_frac", 0.502))
         self.fit = dict(DEFAULT_FIT)
@@ -134,9 +146,23 @@ class DeployAdvisor(hass.Hass):
         # methods AD hands back a Task instead of the app instance.
         self._notifier = self.get_app("MobileNotifier")
 
+        # Stamp every deployment as it happens (any real state on the climate entity =
+        # plugged in), so the 12:15 eval knows last evening's use even though no eval
+        # ran while the unit was out.
+        self.listen_state(self._on_climate, self.ac_climate)
+
         self.run_in(lambda kw: self.create_task(self._eval()), 20)
         for hhmm in ("12:15:00", "20:30:00"):
             self.run_daily(lambda kw: self.create_task(self._eval()), hhmm)
+
+    def _on_climate(self, entity, attribute, old, new, kwargs):
+        if new not in (None, "unavailable", "unknown"):
+            self._stamp_deployed()
+
+    def _stamp_deployed(self):
+        self._advisor_state["last_deployed_at"] = datetime.now().astimezone().isoformat(
+            timespec="seconds")
+        self._save_state()
 
     # -- state persistence (which dates we already notified about)
     def _load_state(self):
@@ -144,7 +170,7 @@ class DeployAdvisor(hass.Hass):
             with open(self.state_file) as f:
                 return json.load(f)
         except Exception:
-            return {"notified_date": None, "warning_armed": False}
+            return {"notified_date": None, "warning_armed": False, "last_deployed_at": None}
 
     def _save_state(self):
         try:
@@ -204,6 +230,32 @@ class DeployAdvisor(hass.Hass):
         mode = await self.get_state(self.ac_climate)
         return power > 5.0 or mode in ("cool", "dry", "fan_only", "auto", "heat")
 
+    @staticmethod
+    def _stored(last_deployed_iso, now, stored_hours):
+        """True when the unit counts as torn down: never seen deployed, or continuously
+        un-deployed longer than stored_hours. Pure so the nightly-ritual-vs-teardown
+        boundary is unit-testable."""
+        if not last_deployed_iso:
+            return True
+        try:
+            last = datetime.fromisoformat(last_deployed_iso)
+        except ValueError:
+            return True
+        if last.tzinfo is None and now.tzinfo is not None:
+            last = last.replace(tzinfo=now.tzinfo)
+        return (now - last).total_seconds() / 3600.0 >= stored_hours
+
+    async def _in_active_use(self, now):
+        """Deployed right now (any real climate state, running or holding), or deployed
+        recently enough that the gap is just the daily overnight storage."""
+        if await self.get_state(self.ac_climate) not in (None, "unavailable", "unknown"):
+            self._stamp_deployed()
+            return True
+        if await self._ac_running():
+            return True
+        return not self._stored(self._advisor_state.get("last_deployed_at"),
+                                now, self.stored_hours)
+
     # -- main
     async def _eval(self):
         try:
@@ -259,8 +311,8 @@ class DeployAdvisor(hass.Hass):
         st = self._advisor_state
         if first_over:
             lead = (datetime.fromisoformat(first_over["date"]).date() - now.date()).days
-            if lead <= self.notify_lead_days and await self._ac_running():
-                return  # already cooling - nothing to advise
+            if lead <= self.notify_lead_days and await self._in_active_use(now):
+                return  # the unit is in daily use - nothing to advise
             if lead <= self.notify_lead_days and st.get("notified_date") != first_over["date"]:
                 st["notified_date"] = first_over["date"]
                 st["warning_armed"] = True

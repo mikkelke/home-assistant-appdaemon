@@ -94,5 +94,28 @@ class DailyFromHourly(unittest.TestCase):
         self.assertEqual(days, [])
 
 
+class StoredGate(unittest.TestCase):
+    """Regression for 2026-07-18: 'not running right now' advised deploying an AC that
+    was plugged in but price-holding (20:30), and nagged during the daily overnight
+    storage (12:15). 'Stored' = continuously un-deployed >= stored_hours."""
+
+    NOW = datetime(2026, 7, 18, 12, 15)
+
+    def test_nightly_ritual_gap_is_not_stored(self):
+        # unplugged ~22:30 last night, evaluated 12:15 next day: ~14 h < 30 h
+        last = datetime(2026, 7, 17, 22, 30).isoformat()
+        self.assertFalse(da.DeployAdvisor._stored(last, self.NOW, 30.0))
+
+    def test_real_teardown_counts_as_stored(self):
+        last = datetime(2026, 7, 15, 16, 0).isoformat()  # ~68 h ago
+        self.assertTrue(da.DeployAdvisor._stored(last, self.NOW, 30.0))
+
+    def test_never_seen_deployed_is_stored(self):
+        self.assertTrue(da.DeployAdvisor._stored(None, self.NOW, 30.0))
+
+    def test_garbage_stamp_fails_open_to_stored(self):
+        self.assertTrue(da.DeployAdvisor._stored("not-a-date", self.NOW, 30.0))
+
+
 if __name__ == "__main__":
     unittest.main()
