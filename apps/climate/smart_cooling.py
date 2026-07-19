@@ -129,6 +129,12 @@ class SmartCooling(hass.Hass):
         self.min_cycle_min = int(a("min_cycle_min", 10))
         self.status_entity = a("status_entity", "sensor.smart_cooling_status")
         self.notify_target = a("notify_target", "user")
+        # Grace period before the deploy watchdog speaks up: long enough to absorb a
+        # normal arm-before-plugging-in gap and the cloud-session blips that already
+        # self-heal in under a minute; short enough that a genuinely dead plug (2026-
+        # 07-19: physical button pressed alongside the nightly unplug) doesn't eat
+        # the whole afternoon before anyone notices.
+        self.deploy_watchdog_min = float(a("deploy_watchdog_min", 20))
         self.state_file = a("state_file", "/conf/apps/climate/smart_cooling_state.json")
 
         # --- state ---
@@ -158,6 +164,11 @@ class SmartCooling(hass.Hass):
         self._last_want = False                    # was the previous eval trying to cool?
         self._last_eval_at: Optional[datetime] = None
         self._feed_last: dict = {}                 # per-kind last feed emit (see _feed_allowed)
+        # Deploy watchdog (user, 2026-07-19: armed Cool night but the AC stayed
+        # unreachable all afternoon - their own smart-plug button got pressed
+        # alongside the nightly unplug, so "plugged in" wasn't actually powered).
+        self._not_deployed_since: Optional[datetime] = None
+        self._deploy_watchdog_notified = False
         self._was_drying = False                   # previous eval ran the dry-finish
         self._dry_date = None                      # calendar day the dry budget belongs to
         self._dry_min = 0.0                        # dry-finish minutes spent that day
@@ -472,6 +483,26 @@ class SmartCooling(hass.Hass):
         self.log(f"Lights-out {today}: floor {floor:.1f}C, equilibrium {E:.1f}C "
                  f"-> learning the rise at {end.strftime('%H:%M')}", level="INFO")
 
+    async def _check_deploy_watchdog(self, now, master_on, deployed):
+        """Notify once if Cool night is armed but the AC stays unreachable past the
+        grace period - most likely the physical plug/switch, not a code problem.
+        The streak (and the one-shot) resets the moment it deploys or gets
+        disarmed, so a later recurrence can notify again."""
+        if not master_on or deployed:
+            self._not_deployed_since = None
+            self._deploy_watchdog_notified = False
+            return
+        if self._not_deployed_since is None:
+            self._not_deployed_since = now
+            return
+        stuck_min = (now - self._not_deployed_since).total_seconds() / 60.0
+        if stuck_min >= self.deploy_watchdog_min and not self._deploy_watchdog_notified:
+            self._deploy_watchdog_notified = True
+            await self._notify(
+                f"Cool night is on but the AC hasn't been reachable for "
+                f"~{stuck_min:.0f} min -- check it's actually got power "
+                f"(plug/switch), not just plugged in.")
+
     # ---------- main ----------
     async def _evaluate(self):
         now = (await self.get_now()).replace(tzinfo=None)
@@ -480,6 +511,7 @@ class SmartCooling(hass.Hass):
         master_on = (await self._state(self.enable_entity)) == "on"
         climate_state = await self._state(self.climate_entity)
         deployed = climate_state not in (None, "unavailable", "unknown")
+        await self._check_deploy_watchdog(now, master_on, deployed)
 
         if not master_on:
             # OFF = HANDS OFF. Turn the AC off ONCE on the on->off flip, then never command it again.

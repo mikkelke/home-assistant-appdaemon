@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -435,6 +435,78 @@ class MaybeDry(unittest.TestCase):
         app = self._app(dp=None, dry_date=now.date())
         dry, _ = self._run(app, now)
         self.assertFalse(dry)
+
+
+class DeployWatchdog(unittest.TestCase):
+    """Regression for 2026-07-19: armed Cool night, but the AC's own smart plug had
+    lost power since the previous night's unplug (its button caught in the same
+    motion) - climate stayed unreachable all afternoon with no signal to the user
+    that anything was wrong. One notification once the grace period is exceeded;
+    resets on deploy or disarm so a later recurrence can notify again."""
+
+    def _app(self):
+        app = make_app()
+        app.deploy_watchdog_min = 20.0
+        app._not_deployed_since = None
+        app._deploy_watchdog_notified = False
+        app._notified = []
+        async def _notify(message):
+            app._notified.append(message)
+        app._notify = _notify
+        return app
+
+    def _run(self, app, now, master_on, deployed):
+        import asyncio
+        asyncio.run(app._check_deploy_watchdog(now, master_on, deployed))
+
+    def test_deployed_never_starts_a_streak(self):
+        app = self._app()
+        self._run(app, datetime(2026, 7, 19, 12, 0), True, True)
+        self.assertIsNone(app._not_deployed_since)
+        self.assertEqual(app._notified, [])
+
+    def test_disarmed_and_not_deployed_is_normal_storage_no_notify(self):
+        app = self._app()
+        self._run(app, datetime(2026, 7, 19, 12, 0), False, False)
+        self.assertIsNone(app._not_deployed_since)
+        self.assertEqual(app._notified, [])
+
+    def test_within_grace_period_stays_quiet(self):
+        app = self._app()
+        start = datetime(2026, 7, 19, 12, 0)
+        self._run(app, start, True, False)
+        self._run(app, start + timedelta(minutes=10), True, False)
+        self.assertEqual(app._notified, [])
+
+    def test_past_grace_period_notifies_once(self):
+        app = self._app()
+        start = datetime(2026, 7, 19, 12, 0)
+        self._run(app, start, True, False)
+        self._run(app, start + timedelta(minutes=21), True, False)
+        self._run(app, start + timedelta(minutes=36), True, False)  # still stuck
+        self.assertEqual(len(app._notified), 1)
+        self.assertIn("plug/switch", app._notified[0])
+
+    def test_recovering_then_failing_again_notifies_a_second_time(self):
+        app = self._app()
+        start = datetime(2026, 7, 19, 12, 0)
+        self._run(app, start, True, False)
+        self._run(app, start + timedelta(minutes=25), True, False)
+        self.assertEqual(len(app._notified), 1)
+        self._run(app, start + timedelta(minutes=26), True, True)   # recovers
+        self.assertIsNone(app._not_deployed_since)
+        self._run(app, start + timedelta(minutes=30), True, False)  # fails again
+        self._run(app, start + timedelta(minutes=51), True, False)
+        self.assertEqual(len(app._notified), 2)
+
+    def test_disarming_mid_streak_clears_it_without_notifying(self):
+        app = self._app()
+        start = datetime(2026, 7, 19, 12, 0)
+        self._run(app, start, True, False)
+        self._run(app, start + timedelta(minutes=10), False, False)  # disarmed before grace elapses
+        self.assertIsNone(app._not_deployed_since)
+        self._run(app, start + timedelta(minutes=40), False, False)
+        self.assertEqual(app._notified, [])
 
 
 if __name__ == "__main__":

@@ -77,6 +77,11 @@ SmartCooling:
   min_cycle_min: 10
   status_entity: sensor.smart_cooling_status
   notify_target: user
+  # Deploy watchdog (2026-07-19): armed but the AC stayed unreachable all
+  # afternoon because a smart-plug button got pressed alongside the nightly
+  # unplug -- "plugged in" wasn't actually powered. One notification after
+  # this many minutes armed-but-unreachable; resets the moment it deploys.
+  deploy_watchdog_min: 20
 
   # SAFE ROLLOUT: runs + learns + publishes the plan, but NEVER touches the AC.
   dry_run: false   # live since 2026-07-13 (user: "the automation should take care of it"); master toggle still gates everything
