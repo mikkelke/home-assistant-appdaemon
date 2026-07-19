@@ -524,5 +524,47 @@ class CoolingFan(unittest.TestCase):
         self.assertEqual(sc.SmartCooling._cooling_fan("medium", "low", True), "low")
 
 
+class CondenserHazard(unittest.TestCase):
+    """Regression for the 2026-07-17->18 incident (root-caused via deep-reasoner): the
+    bathroom hard cap lived only inside the ARMED decision chain, so a disarm (correct,
+    one-shot "AC off") followed 4s later by something OUTSIDE this app re-enabling the
+    compressor ran completely unwatched for ~9h -- bathroom hit 39.8C, nearly 7C past
+    the 33C cap, before the next armed eval's hard cap finally caught it. This predicate
+    must fire regardless of arm state whenever the unit is genuinely running hot."""
+
+    HARD_MAX = 33.0
+
+    def test_running_hot_is_a_hazard(self):
+        self.assertTrue(sc.SmartCooling._condenser_hazard(True, "cool", 39.8, self.HARD_MAX))
+
+    def test_exactly_at_cap_is_a_hazard(self):
+        self.assertTrue(sc.SmartCooling._condenser_hazard(True, "cool", 33.0, self.HARD_MAX))
+
+    def test_below_cap_is_not_a_hazard(self):
+        self.assertFalse(sc.SmartCooling._condenser_hazard(True, "cool", 32.9, self.HARD_MAX))
+
+    def test_genuinely_off_is_not_a_hazard_even_if_hot(self):
+        # nothing to force off - a hot bathroom with the unit already off isn't this guard's job
+        self.assertFalse(sc.SmartCooling._condenser_hazard(True, "off", 39.8, self.HARD_MAX))
+
+    def test_not_deployed_is_not_a_hazard(self):
+        self.assertFalse(sc.SmartCooling._condenser_hazard(False, "cool", 39.8, self.HARD_MAX))
+
+    def test_unavailable_climate_is_not_a_hazard(self):
+        self.assertFalse(sc.SmartCooling._condenser_hazard(True, "unavailable", 39.8, self.HARD_MAX))
+
+    def test_missing_bath_reading_fails_closed(self):
+        # matches the existing armed backleak_hard shape: a dropped sensor doesn't force anything
+        self.assertFalse(sc.SmartCooling._condenser_hazard(True, "cool", None, self.HARD_MAX))
+
+    def test_dry_mode_can_also_be_a_hazard(self):
+        # dry still runs the compressor/condenser, not just cool
+        self.assertTrue(sc.SmartCooling._condenser_hazard(True, "dry", 39.8, self.HARD_MAX))
+
+    def test_fan_only_can_also_be_a_hazard(self):
+        # conservative on purpose: force off rather than assume a burp explains a 39.8C reading
+        self.assertTrue(sc.SmartCooling._condenser_hazard(True, "fan_only", 39.8, self.HARD_MAX))
+
+
 if __name__ == "__main__":
     unittest.main()

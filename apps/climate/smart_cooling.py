@@ -56,9 +56,21 @@ removed. dry_run makes every AC command a no-op. The bathroom (the condenser's h
 watched price-aware: its door is kept sealed so a warm bathroom only costs condenser efficiency
 (~2-3%/C, far less than the cheap-vs-peak price spread) -- we push through warm-bathroom cheap
 slots and let venting happen in hours we'd hold anyway; only near-derate heat (hard cap) stops us.
+
+Condenser safety watchdog (found 2026-07-19, root-caused via deep-reasoner): the hard cap above
+lived ONLY inside the armed decision chain, so "OFF = HANDS OFF" accidentally meant "and stop
+watching the condenser too." Incident: disarmed correctly at 00:19:28 (2026-07-17), but 4s
+later something OUTSIDE this app put the AC back into cool; disarmed = we never touch it again,
+so nobody was watching for the ~9h it then ran into a barely-vented bathroom, which hit 39.8C
+before the next ARMED eval's hard cap finally caught it. _condenser_hazard() now fires the same
+hard cap regardless of arm state -- it only ever forces the existing 33C ceiling, never routine
+planning, so it can't fight a genuine manual session, only an actually-hazardous one. _evaluate
+is now also serialized (asyncio.Lock): the re-arm that morning triggered three concurrent
+evaluations that raced and duplicated actuation.
 """
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
+import asyncio
 from datetime import datetime, timedelta
 import json
 from typing import Optional
@@ -181,6 +193,20 @@ class SmartCooling(hass.Hass):
         # alongside the nightly unplug, so "plugged in" wasn't actually powered).
         self._not_deployed_since: Optional[datetime] = None
         self._deploy_watchdog_notified = False
+        # Condenser safety watchdog (found 2026-07-19, root-caused via deep-reasoner): a
+        # disarm at 2026-07-17 00:19:28 correctly did its one-shot "AC off" -- then 4s
+        # later something OUTSIDE this app put the AC back into cool. Disarmed = hands
+        # off = we never check anything again, so nobody watched the condenser for the
+        # ~9h it then ran unmonitored; bathroom hit 39.8C before the next ARMED eval's
+        # hard cap finally caught it. See _condenser_hazard/_evaluate.
+        self._safety_off_notified = False
+        # Serializes _evaluate(): overlapping listen_state triggers each schedule their
+        # own run_in -> create_task, so near-simultaneous triggers (confirmed 2026-07-18
+        # 09:12, three at once) can run concurrently and interleave/duplicate actuation
+        # (three "Lights-out"/"AC removed" stashes that morning). A lock doesn't dedupe
+        # the redundant runs, just makes them safely sequential -- each one alone is
+        # idempotent (repeating a toggle-off or a lightout stash is harmless).
+        self._eval_lock = asyncio.Lock()
         self._was_drying = False                   # previous eval ran the dry-finish
         self._dry_date = None                      # calendar day the dry budget belongs to
         self._dry_min = 0.0                        # dry-finish minutes spent that day
@@ -515,19 +541,55 @@ class SmartCooling(hass.Hass):
                 f"~{stuck_min:.0f} min -- check it's actually got power "
                 f"(plug/switch), not just plugged in.")
 
+    @staticmethod
+    def _condenser_hazard(deployed, climate_state, bath, hard_max):
+        """Arm-independent: is the condenser room hot enough to force the AC off right
+        now, regardless of whether Cool night is armed? Only true when the unit is
+        genuinely deployed, in a mode that can actually be running the compressor (not
+        off/unavailable/unknown), and the bathroom sensor gives a real reading at/past
+        the hard cap -- a dropped sensor fails closed here the same way the armed
+        backleak_hard check already does (None never forces anything)."""
+        return (deployed and bath is not None and bath >= hard_max
+                and climate_state not in (None, "off", "unavailable", "unknown"))
+
     # ---------- main ----------
     async def _evaluate(self):
+        async with self._eval_lock:
+            await self._evaluate_locked()
+
+    async def _evaluate_locked(self):
         now = (await self.get_now()).replace(tzinfo=None)
         await self._learn(now)   # read-only; runs regardless of arm/deploy
 
         master_on = (await self._state(self.enable_entity)) == "on"
         climate_state = await self._state(self.climate_entity)
         deployed = climate_state not in (None, "unavailable", "unknown")
+        bath = await self._num(self.bathroom_sensor, None)
         await self._check_deploy_watchdog(now, master_on, deployed)
 
         if not master_on:
-            # OFF = HANDS OFF. Turn the AC off ONCE on the on->off flip, then never command it again.
             self._mark_eval(now, False)
+            if self._condenser_hazard(deployed, climate_state, bath, self.bathroom_hard_max):
+                # "OFF = HANDS OFF" means we don't plan/optimize while disarmed, NOT
+                # that we ignore a physical hazard -- see the state-init comment for
+                # the incident that proved the gap. Only ever forces the hard cap,
+                # never routine planning, so this can't fight a genuine manual session.
+                await self._ensure_off(
+                    "off",
+                    f"SAFETY: condenser room {bath:.1f}C past the {self.bathroom_hard_max:.0f}C "
+                    f"hard cap -- forcing the AC off (disarmed, but this isn't optional)",
+                    {"deployed": deployed, "bathroom": round(bath, 1)})
+                if not self._safety_off_notified:
+                    self._safety_off_notified = True
+                    await self._notify(
+                        f"Safety: the bedroom AC was running with the bathroom at "
+                        f"{bath:.1f}C, past the {self.bathroom_hard_max:.0f}C hard cap, "
+                        f"while Cool night was off -- forced it off. Check what turned "
+                        f"it on.")
+                self._master_was_on = False
+                return
+            self._safety_off_notified = False
+            # OFF = HANDS OFF. Turn the AC off ONCE on the on->off flip, then never command it again.
             if self._master_was_on:
                 await self._ensure_off("off", "Disarmed -- AC turned off, now hands-off", {"deployed": deployed})
             else:
@@ -548,7 +610,6 @@ class SmartCooling(hass.Hass):
         mid = await self._num(self.mid_sensor, floor)
         ceil_s = await self._num(self.ceiling_sensor, None)
         ac_s = await self._num(self.ac_sensor, None)
-        bath = await self._num(self.bathroom_sensor, None)
         kitchen = await self._num(self.kitchen_sensor, None)
 
         ceiling_base = await self._num(self.night_ceiling_entity, self.default_ceiling)
