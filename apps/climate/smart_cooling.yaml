@@ -44,9 +44,17 @@ SmartCooling:
   feasible_min_samples: 1
   # Condenser room (bathroom): door kept sealed (user 2026-07-16), so a warm bathroom
   # only costs condenser efficiency (~2-3%/C) - cheaper than deferring to peak prices.
-  # Soft cap just annotates the plan; only the hard cap stops cooling (derate guard).
+  # bathroom_backleak_c just annotates the plan (soft, cosmetic). bathroom_delta_max_c
+  # is the real stop condition: how far the bathroom sits ABOVE OUTDOOR, not an
+  # absolute temperature (user 2026-07-19 - validated against 19 days of real data:
+  # legitimate operation never exceeded +9.9C above outdoor; the 2026-07-17->18
+  # incident, a barely-cracked window, was already past +11.4C within an hour and hit
+  # +21.2C at its worst). Enforced regardless of Cool night's arm state (see
+  # _condenser_hazard in smart_cooling.py) - a 2026-07-17 disarm was correctly
+  # followed 4s later by something OUTSIDE this app re-enabling the compressor, which
+  # then ran unmonitored for ~9h since the old guard only lived inside the armed path.
   bathroom_backleak_c: 30.0
-  bathroom_hard_max_c: 33.0
+  bathroom_delta_max_c: 12.0
 
   # actuation. Fan sweep 2026-07-15: fan draw is trivial (44 W even at full) and no fan
   # mode prevents the intake stall -- so fan choice is free; auto per user preference

@@ -357,7 +357,7 @@ class WindowOpen(unittest.TestCase):
     old fail-closed read (state == "on") turned each dropout into "Bathroom window closed
     -- open it" with the AC off mid-cheap-slot and a 10-min anti-short-cycle lockout on
     the way back. Only an explicit "off" may read as closed; a genuinely closed window is
-    backstopped by the bathroom_hard_max guard within minutes."""
+    backstopped by the bathroom_delta_max guard within minutes."""
 
     def test_on_is_open(self):
         self.assertTrue(sc.SmartCooling._window_open("on"))
@@ -524,46 +524,84 @@ class CoolingFan(unittest.TestCase):
         self.assertEqual(sc.SmartCooling._cooling_fan("medium", "low", True), "low")
 
 
-class CondenserHazard(unittest.TestCase):
-    """Regression for the 2026-07-17->18 incident (root-caused via deep-reasoner): the
-    bathroom hard cap lived only inside the ARMED decision chain, so a disarm (correct,
-    one-shot "AC off") followed 4s later by something OUTSIDE this app re-enabling the
-    compressor ran completely unwatched for ~9h -- bathroom hit 39.8C, nearly 7C past
-    the 33C cap, before the next armed eval's hard cap finally caught it. This predicate
-    must fire regardless of arm state whenever the unit is genuinely running hot."""
+class VentingImpaired(unittest.TestCase):
+    """Regression for the 2026-07-17->18 incident: the old absolute bathroom_hard_max
+    (33C) took ~9h to trip. Delta-above-outdoor (user, 2026-07-19: "it is all about how
+    warm it is compared to the outside temperature") is the physically-grounded signal
+    -- validated against 19 days of real data: legitimate operation (including a night
+    that intentionally ran the bathroom into the high 20s) never exceeded +9.9C above
+    outdoor, while the incident was already past +11.4C within an hour of onset and hit
+    +21.2C at its worst. DELTA_MAX (12.0) mirrors the deployed default."""
 
-    HARD_MAX = 33.0
+    DELTA_MAX = 12.0
+
+    def test_incident_peak_is_impaired(self):
+        self.assertTrue(sc.SmartCooling._venting_impaired(39.1, 17.9, self.DELTA_MAX))
+
+    def test_incident_trips_hours_before_the_old_cap_would_have(self):
+        # 23:00 the first evening, ~10h before the 39.8C peak: bath alone (32.4C) was
+        # still under the old 33C cap, but the delta (+12.7) had already crossed the
+        # new threshold -- this guard would have stopped it here, not at sunrise
+        self.assertTrue(sc.SmartCooling._venting_impaired(32.4, 19.7, self.DELTA_MAX))
+
+    def test_known_good_pushing_through_night_is_not_impaired(self):
+        # 2026-07-15 22:00: bath 28.5C, deliberately warm and fine -- delta only +7.2
+        self.assertTrue(28.5 - 21.3 < self.DELTA_MAX)
+        self.assertFalse(sc.SmartCooling._venting_impaired(28.5, 21.3, self.DELTA_MAX))
+
+    def test_exactly_at_delta_is_impaired(self):
+        self.assertTrue(sc.SmartCooling._venting_impaired(30.0, 18.0, self.DELTA_MAX))
+
+    def test_just_under_delta_is_not_impaired(self):
+        self.assertFalse(sc.SmartCooling._venting_impaired(29.9, 18.0, self.DELTA_MAX))
+
+    def test_missing_bath_fails_closed(self):
+        self.assertFalse(sc.SmartCooling._venting_impaired(None, 18.0, self.DELTA_MAX))
+
+    def test_missing_outdoor_fails_closed(self):
+        self.assertFalse(sc.SmartCooling._venting_impaired(39.8, None, self.DELTA_MAX))
+
+    def test_hot_outdoor_day_with_normal_delta_is_not_impaired(self):
+        # the point of a delta, not an absolute: a genuinely hot day shouldn't nuisance-trip
+        self.assertFalse(sc.SmartCooling._venting_impaired(35.0, 28.0, self.DELTA_MAX))
+
+
+class CondenserHazard(unittest.TestCase):
+    """Arm-independent wrapper around _venting_impaired: should we force the AC off
+    right now regardless of Cool night's arm state? Same 2026-07-17->18 incident -- the
+    guard must fire whenever the unit is genuinely running with impaired venting."""
+
+    DELTA_MAX = 12.0
 
     def test_running_hot_is_a_hazard(self):
-        self.assertTrue(sc.SmartCooling._condenser_hazard(True, "cool", 39.8, self.HARD_MAX))
+        self.assertTrue(sc.SmartCooling._condenser_hazard(True, "cool", 39.8, 17.9, self.DELTA_MAX))
 
-    def test_exactly_at_cap_is_a_hazard(self):
-        self.assertTrue(sc.SmartCooling._condenser_hazard(True, "cool", 33.0, self.HARD_MAX))
-
-    def test_below_cap_is_not_a_hazard(self):
-        self.assertFalse(sc.SmartCooling._condenser_hazard(True, "cool", 32.9, self.HARD_MAX))
+    def test_normal_delta_is_not_a_hazard(self):
+        self.assertFalse(sc.SmartCooling._condenser_hazard(True, "cool", 28.5, 21.3, self.DELTA_MAX))
 
     def test_genuinely_off_is_not_a_hazard_even_if_hot(self):
         # nothing to force off - a hot bathroom with the unit already off isn't this guard's job
-        self.assertFalse(sc.SmartCooling._condenser_hazard(True, "off", 39.8, self.HARD_MAX))
+        self.assertFalse(sc.SmartCooling._condenser_hazard(True, "off", 39.8, 17.9, self.DELTA_MAX))
 
     def test_not_deployed_is_not_a_hazard(self):
-        self.assertFalse(sc.SmartCooling._condenser_hazard(False, "cool", 39.8, self.HARD_MAX))
+        self.assertFalse(sc.SmartCooling._condenser_hazard(False, "cool", 39.8, 17.9, self.DELTA_MAX))
 
     def test_unavailable_climate_is_not_a_hazard(self):
-        self.assertFalse(sc.SmartCooling._condenser_hazard(True, "unavailable", 39.8, self.HARD_MAX))
+        self.assertFalse(sc.SmartCooling._condenser_hazard(True, "unavailable", 39.8, 17.9, self.DELTA_MAX))
 
     def test_missing_bath_reading_fails_closed(self):
-        # matches the existing armed backleak_hard shape: a dropped sensor doesn't force anything
-        self.assertFalse(sc.SmartCooling._condenser_hazard(True, "cool", None, self.HARD_MAX))
+        self.assertFalse(sc.SmartCooling._condenser_hazard(True, "cool", None, 17.9, self.DELTA_MAX))
+
+    def test_missing_outdoor_reading_fails_closed(self):
+        self.assertFalse(sc.SmartCooling._condenser_hazard(True, "cool", 39.8, None, self.DELTA_MAX))
 
     def test_dry_mode_can_also_be_a_hazard(self):
         # dry still runs the compressor/condenser, not just cool
-        self.assertTrue(sc.SmartCooling._condenser_hazard(True, "dry", 39.8, self.HARD_MAX))
+        self.assertTrue(sc.SmartCooling._condenser_hazard(True, "dry", 39.8, 17.9, self.DELTA_MAX))
 
     def test_fan_only_can_also_be_a_hazard(self):
-        # conservative on purpose: force off rather than assume a burp explains a 39.8C reading
-        self.assertTrue(sc.SmartCooling._condenser_hazard(True, "fan_only", 39.8, self.HARD_MAX))
+        # conservative on purpose: force off rather than assume a burp explains this reading
+        self.assertTrue(sc.SmartCooling._condenser_hazard(True, "fan_only", 39.8, 17.9, self.DELTA_MAX))
 
 
 if __name__ == "__main__":

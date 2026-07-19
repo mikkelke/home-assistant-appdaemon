@@ -55,15 +55,21 @@ Knobs you ever touch: Arm + max night temperature (a default is fine, depth is c
 removed. dry_run makes every AC command a no-op. The bathroom (the condenser's heat dump) is
 watched price-aware: its door is kept sealed so a warm bathroom only costs condenser efficiency
 (~2-3%/C, far less than the cheap-vs-peak price spread) -- we push through warm-bathroom cheap
-slots and let venting happen in hours we'd hold anyway; only near-derate heat (hard cap) stops us.
+slots and let venting happen in hours we'd hold anyway; only impaired venting stops us, judged
+by how far the bathroom sits ABOVE OUTDOOR (bathroom_delta_max), not an absolute temperature
+(user, 2026-07-19: "it is all about how warm it is compared to the outside temperature" --
+validated against 19 days of real data: legitimate operation never exceeded +9.9C above outdoor,
+while the incident below was already past +11.4C within an hour of onset and reached +21.2C at
+its worst).
 
-Condenser safety watchdog (found 2026-07-19, root-caused via deep-reasoner): the hard cap above
-lived ONLY inside the armed decision chain, so "OFF = HANDS OFF" accidentally meant "and stop
-watching the condenser too." Incident: disarmed correctly at 00:19:28 (2026-07-17), but 4s
+Condenser safety watchdog (found 2026-07-19, root-caused via deep-reasoner): the delta guard
+above lived ONLY inside the armed decision chain, so "OFF = HANDS OFF" accidentally meant "and
+stop watching the condenser too." Incident: disarmed correctly at 00:19:28 (2026-07-17), but 4s
 later something OUTSIDE this app put the AC back into cool; disarmed = we never touch it again,
 so nobody was watching for the ~9h it then ran into a barely-vented bathroom, which hit 39.8C
-before the next ARMED eval's hard cap finally caught it. _condenser_hazard() now fires the same
-hard cap regardless of arm state -- it only ever forces the existing 33C ceiling, never routine
+(+21.2C above outdoor) before the next ARMED eval's guard finally caught it -- 6-10h later than
+a delta check would have. _condenser_hazard() now fires the same venting-impaired check
+regardless of arm state -- it only ever forces a stop for an actual hazard, never routine
 planning, so it can't fight a genuine manual session, only an actually-hazardous one. _evaluate
 is now also serialized (asyncio.Lock): the re-arm that morning triggered three concurrent
 evaluations that raced and duplicated actuation.
@@ -87,7 +93,7 @@ class SmartCooling(hass.Hass):
         self.ac_sensor = a("ac_sensor", "sensor.air_conditioner_indoor_temperature")            # at the unit -> is cold flowing
         self.bathroom_sensor = a("bathroom_temp_sensor", "sensor.bathroom_temperature")         # condenser dump / back-leak guard
         self.kitchen_sensor = a("kitchen_sensor", "sensor.kitchen_temperature")                 # neighbour wall (headwind)
-        self.outdoor_sensor = a("outdoor_temp_sensor", "sensor.gw2000a_outdoor_temperature")    # minor (sealed/blackout)
+        self.outdoor_sensor = a("outdoor_temp_sensor", "sensor.gw2000a_outdoor_temperature")    # condenser hazard reference (see bathroom_delta_max)
         self.vent_window = a("vent_window_sensor", "binary_sensor.bathroom_window_contact")
         self.price_entity = a("price_entity", "sensor.energi_data_service")
         self.enable_entity = a("enable_entity", "input_boolean.smart_cooling")
@@ -109,10 +115,19 @@ class SmartCooling(hass.Hass):
         self.default_rise_frac = float(a("default_rise_frac", 0.7))  # conservative gap-fraction closed in the window
         # Condenser-room temps: above `bathroom_max` the condenser loses ~2-3%/C efficiency
         # (worth flagging, NOT worth skipping a cheap slot for -- door is kept sealed, so no
-        # real back-leak; user 2026-07-16). Above `bathroom_hard_max` we stop regardless of
-        # price: derate territory, extra watts stop moving heat.
+        # real back-leak; user 2026-07-16). `bathroom_delta_max` is the real stop condition:
+        # not an absolute temperature, but how far the bathroom sits ABOVE outdoor (user,
+        # 2026-07-19: "it is all about how warm it is compared to the outside temperature").
+        # An absolute number conflates "hot because summer" with "hot because venting is
+        # failing"; the delta doesn't. Validated against 19 days of real data (2026-07-19):
+        # every legitimate operating hour, including nights that intentionally ran the
+        # bathroom into the high 20s, stayed under +9.9C above outdoor; the 2026-07-17->18
+        # incident (restricted venting, see module docstring) was already past +11.4C within
+        # an hour of onset and reached +21.2C at its worst while the OLD absolute 33C cap
+        # hadn't even tripped yet. 12 gives a couple degrees of margin above the observed
+        # all-time-normal ceiling.
         self.bathroom_max = float(a("bathroom_backleak_c", 30.0))
-        self.bathroom_hard_max = float(a("bathroom_hard_max_c", 33.0))
+        self.bathroom_delta_max = float(a("bathroom_delta_max_c", 12.0))
         # --- actuation. Fan draw is trivial (44 W even at full, measured 2026-07-15 sweep;
         # the compressor is ~500-800 W) and NO fan mode prevents the intake stall below, so
         # medium is kept purely for air distribution. Low setpoint so it doesn't idle a
@@ -197,8 +212,8 @@ class SmartCooling(hass.Hass):
         # disarm at 2026-07-17 00:19:28 correctly did its one-shot "AC off" -- then 4s
         # later something OUTSIDE this app put the AC back into cool. Disarmed = hands
         # off = we never check anything again, so nobody watched the condenser for the
-        # ~9h it then ran unmonitored; bathroom hit 39.8C before the next ARMED eval's
-        # hard cap finally caught it. See _condenser_hazard/_evaluate.
+        # ~9h it then ran unmonitored; bathroom hit 39.8C (+21.2C above outdoor) before
+        # the next ARMED eval's guard finally caught it. See _condenser_hazard/_evaluate.
         self._safety_off_notified = False
         # Serializes _evaluate(): overlapping listen_state triggers each schedule their
         # own run_in -> create_task, so near-simultaneous triggers (confirmed 2026-07-18
@@ -270,8 +285,9 @@ class SmartCooling(hass.Hass):
         link-flapped 5x on 2026-07-16 (~70 s blips, battery full) and the old fail-closed
         read (state == "on") shut the AC mid-cheap-slot on every blip, each time costing
         the 10-min anti-short-cycle lockout on the way back. Fail-open is safe here: a
-        genuinely closed window pushes the unvented condenser room past bathroom_hard_max
-        within minutes, and that guard stops cooling regardless of what the contact says."""
+        genuinely closed window pushes the unvented condenser room far enough above
+        outdoor within minutes to trip bathroom_delta_max, and that guard stops cooling
+        regardless of what the contact says."""
         return state != "off"
 
     def _next_midnight(self, now):
@@ -542,15 +558,23 @@ class SmartCooling(hass.Hass):
                 f"(plug/switch), not just plugged in.")
 
     @staticmethod
-    def _condenser_hazard(deployed, climate_state, bath, hard_max):
-        """Arm-independent: is the condenser room hot enough to force the AC off right
-        now, regardless of whether Cool night is armed? Only true when the unit is
-        genuinely deployed, in a mode that can actually be running the compressor (not
-        off/unavailable/unknown), and the bathroom sensor gives a real reading at/past
-        the hard cap -- a dropped sensor fails closed here the same way the armed
-        backleak_hard check already does (None never forces anything)."""
-        return (deployed and bath is not None and bath >= hard_max
-                and climate_state not in (None, "off", "unavailable", "unknown"))
+    def _venting_impaired(bath, outdoor, delta_max):
+        """Is the condenser room running hot enough ABOVE OUTDOOR to mean venting isn't
+        keeping up -- regardless of absolute temperature? (User, 2026-07-19: "it is all
+        about how warm it is compared to the outside temperature.") An absolute number
+        conflates "hot because summer" with "hot because trapped"; the delta doesn't --
+        see bathroom_delta_max's init comment for the 19-day validation. Fails closed on
+        either missing reading, same as the old absolute check failed closed on `bath`."""
+        return bath is not None and outdoor is not None and (bath - outdoor) >= delta_max
+
+    @staticmethod
+    def _condenser_hazard(deployed, climate_state, bath, outdoor, delta_max):
+        """Arm-independent: should we force the AC off right now, regardless of whether
+        Cool night is armed? Only true when the unit is genuinely deployed, in a mode
+        that can actually be running the compressor (not off/unavailable/unknown), AND
+        venting is impaired per _venting_impaired."""
+        return (deployed and climate_state not in (None, "off", "unavailable", "unknown")
+                and SmartCooling._venting_impaired(bath, outdoor, delta_max))
 
     # ---------- main ----------
     async def _evaluate(self):
@@ -565,25 +589,28 @@ class SmartCooling(hass.Hass):
         climate_state = await self._state(self.climate_entity)
         deployed = climate_state not in (None, "unavailable", "unknown")
         bath = await self._num(self.bathroom_sensor, None)
+        outdoor = await self._num(self.outdoor_sensor, None)
         await self._check_deploy_watchdog(now, master_on, deployed)
 
         if not master_on:
             self._mark_eval(now, False)
-            if self._condenser_hazard(deployed, climate_state, bath, self.bathroom_hard_max):
+            if self._condenser_hazard(deployed, climate_state, bath, outdoor, self.bathroom_delta_max):
                 # "OFF = HANDS OFF" means we don't plan/optimize while disarmed, NOT
                 # that we ignore a physical hazard -- see the state-init comment for
                 # the incident that proved the gap. Only ever forces the hard cap,
                 # never routine planning, so this can't fight a genuine manual session.
+                delta = bath - outdoor
                 await self._ensure_off(
                     "off",
-                    f"SAFETY: condenser room {bath:.1f}C past the {self.bathroom_hard_max:.0f}C "
-                    f"hard cap -- forcing the AC off (disarmed, but this isn't optional)",
+                    f"SAFETY: condenser room {bath:.1f}C is {delta:.1f}C above outdoor "
+                    f"({outdoor:.1f}C) -- venting isn't keeping up, forcing the AC off "
+                    f"(disarmed, but this isn't optional)",
                     {"deployed": deployed, "bathroom": round(bath, 1)})
                 if not self._safety_off_notified:
                     self._safety_off_notified = True
                     await self._notify(
-                        f"Safety: the bedroom AC was running with the bathroom at "
-                        f"{bath:.1f}C, past the {self.bathroom_hard_max:.0f}C hard cap, "
+                        f"Safety: the bedroom AC was running with the bathroom "
+                        f"{delta:.1f}C above outdoor ({bath:.1f}C vs {outdoor:.1f}C) "
                         f"while Cool night was off -- forced it off. Check what turned "
                         f"it on.")
                 self._master_was_on = False
@@ -690,9 +717,9 @@ class SmartCooling(hass.Hass):
         # bathroom door (2026-07-16), so back-leak is ~nil and a warm condenser room only costs
         # efficiency (~2-3%/C). That penalty is far smaller than the cheap-vs-peak price spread,
         # so we push through warm-bathroom slots while power is cheap and let the venting happen
-        # in hours we'd hold anyway. Only the hard cap stops cooling: near condenser-derate
-        # territory more watts stop buying heat-moved at any price.
-        backleak_hard = bath is not None and bath >= self.bathroom_hard_max
+        # in hours we'd hold anyway. Only impaired venting stops cooling -- judged by how far
+        # ABOVE OUTDOOR the bathroom sits, not an absolute number (see bathroom_delta_max).
+        backleak_hard = self._venting_impaired(bath, outdoor, self.bathroom_delta_max)
         bath_warm = bath is not None and bath >= self.bathroom_max
 
         # decision
@@ -717,8 +744,9 @@ class SmartCooling(hass.Hass):
         elif not window_open:
             want, reason = False, "Bathroom window closed -- open it so the condenser can vent"
         elif backleak_hard:
-            want, reason = False, (f"Bathroom {bath:.1f}C past the {self.bathroom_hard_max:.0f}C hard cap "
-                                   f"-- venting before the condenser derates")
+            want, reason = False, (f"Bathroom {bath:.1f}C is {bath - outdoor:.1f}C above outdoor "
+                                   f"({outdoor:.1f}C) -- venting isn't keeping up, easing off "
+                                   f"before the condenser derates")
         elif cool_now:
             want = True
             reason = (f"Pre-cool floor {floor:.1f}->{reach_target:.1f}C (keep zone <= {ceiling:.0f} for "
@@ -844,7 +872,7 @@ class SmartCooling(hass.Hass):
             return "done"
         if reason.startswith("Bathroom window closed"):
             return "off_window"
-        if "hard cap" in reason:
+        if reason.startswith("SAFETY") or "venting isn't keeping up" in reason:
             return "off_hardcap"
         return None
 
