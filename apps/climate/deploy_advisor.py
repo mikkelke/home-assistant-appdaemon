@@ -152,7 +152,10 @@ class DeployAdvisor(hass.Hass):
         self.listen_state(self._on_climate, self.ac_climate)
 
         self.run_in(lambda kw: self.create_task(self._eval()), 20)
-        for hhmm in ("12:15:00", "20:30:00"):
+        # 06:15 rolls the published nights[] over shortly after each night ends -- without
+        # it, yesterday's night sat as nights[0] until 12:15 and the dashboard showed a
+        # finished night as "Tonight" all morning (user report 2026-07-19).
+        for hhmm in ("06:15:00", "12:15:00", "20:30:00"):
             self.run_daily(lambda kw: self.create_task(self._eval()), hhmm)
 
     def _on_climate(self, entity, attribute, old, new, kwargs):
