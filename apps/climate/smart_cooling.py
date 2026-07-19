@@ -37,6 +37,13 @@ outflow pool -- it parks at ~300 W "idle" with the floor still degrees above tar
 mode fixes that (low/high/full all measured stalled). When a tick sees idle + real deficit, a
 short fan_only burp lets the intake read true room air and the compressor restarts hard.
 
+Occupied quiet mode (2026-07-16/19): someone in bed changes what "gentle" means. Burps are
+skipped entirely (the silence->800W restart is the annoying part, not the parked crawl -- the
+Remove press ends the night soon anyway); active cooling switches from cool_fan_mode to the
+quieter cool_fan_quiet_mode (2026-07-19: "watching TV in bed -> cool, just less noisy" -- still
+cooling, trading some delivered rate for noise, same trade the user asked for). Same
+_bed_occupied() signal drives both.
+
 Feasibility cap (2026-07-15): the ideal target can sit below what the unit + apartment heat can
 physically deliver; an unclosable deficit would inflate minutes_needed until the scheduler goes
 time-constrained and grinds 600 W through the evening price peak chasing the impossible (user:
@@ -100,6 +107,11 @@ class SmartCooling(hass.Hass):
         # degree early. ---
         self.cool_setpoint = float(a("cool_setpoint", 17.0))
         self.cool_fan = a("cool_fan_mode", "medium")
+        # Quiet cooling (user, 2026-07-19: watching TV in bed -> cool, just less noisy):
+        # while occupied, actively-cooling ticks use this fan speed instead of cool_fan.
+        # Same _bed_occupied() signal as the burp quiet-gate below; slower airflow trades
+        # some delivered cooling rate for noise, same trade the user is explicitly asking for.
+        self.cool_fan_quiet = a("cool_fan_quiet_mode", "silent")
         self.cool_kw = float(a("cool_power_kw", 0.6))   # gentle draw, est-cost only
         # Stall-breaker: the unit regulates off its own intake sensor, which sits in its
         # cold outflow pool -- with the floor still far above target it parks itself at
@@ -822,8 +834,17 @@ class SmartCooling(hass.Hass):
             self.log(f"stall-burp failed to resume cool: {e}", level="ERROR")
 
     # ---------- actuation (gentle; respects dry_run + anti-short-cycle) ----------
+    @staticmethod
+    def _cooling_fan(cool_fan, cool_fan_quiet, occupied):
+        """Fan speed for an actively-cooling tick: the quiet speed while someone's in
+        bed (2026-07-19 -- "watching TV in bed -> cool, just less noisy"), the
+        configured cool_fan_mode otherwise."""
+        return cool_fan_quiet if occupied else cool_fan
+
     async def _apply_cool(self, reason, status, attrs, deficit, now):
         cur_mode = await self._state(self.climate_entity)
+        occupied = await self._bed_occupied()
+        fan = self._cooling_fan(self.cool_fan, self.cool_fan_quiet, occupied)
         if not self.dry_run:
             if self._burp_until is not None and now < self._burp_until:
                 await self._publish("burping", "Stall-burp in progress -- fan-only so the "
@@ -834,7 +855,7 @@ class SmartCooling(hass.Hass):
                 # Quiet gate (user, 2026-07-16): the burp's silence->800W restart is what
                 # bothers a person in bed. Someone on either bedside -> skip the burp and
                 # accept the parked crawl; the Remove press ends the night soon anyway.
-                if await self._bed_occupied():
+                if occupied:
                     await self._publish(status, reason + "  [in bed -- skipping the noisy "
                                         "compressor wake-up]", attrs)
                     return
@@ -845,7 +866,7 @@ class SmartCooling(hass.Hass):
                 return
         if self.dry_run:
             await self._publish(status, reason, attrs)
-            self.log(f"DRY-RUN would COOL ({self.cool_setpoint}C/{self.cool_fan}): {reason}")
+            self.log(f"DRY-RUN would COOL ({self.cool_setpoint}C/{fan}): {reason}")
             return
         need_mode = cur_mode != "cool"
         if need_mode and not self._can_switch(True):
@@ -863,7 +884,8 @@ class SmartCooling(hass.Hass):
             if need_mode:
                 await self.call_service("climate/set_hvac_mode", entity_id=self.climate_entity, hvac_mode="cool")
                 self._mark_switch("cool")
-                self.log(f"COOL on ({self.cool_setpoint}C/{self.cool_fan}): {reason}", level="INFO")
+                self.log(f"COOL on ({self.cool_setpoint}C/{fan}): {reason}"
+                         + ("  [quiet: in bed]" if occupied else ""), level="INFO")
                 # reason is the planner's own explanation of WHY (cheap hour, deadline, deficit...)
                 await self._report_house_event(
                     "cool_on", reason,
@@ -872,9 +894,9 @@ class SmartCooling(hass.Hass):
             if cur_temp is None or abs(float(cur_temp) - self.cool_setpoint) > 0.1:
                 await self.call_service("climate/set_temperature", entity_id=self.climate_entity, temperature=self.cool_setpoint)
             cur_fan = await self._attr(self.climate_entity, "fan_mode", None)
-            if cur_fan != self.cool_fan:
+            if cur_fan != fan:
                 try:
-                    await self.call_service("climate/set_fan_mode", entity_id=self.climate_entity, fan_mode=self.cool_fan)
+                    await self.call_service("climate/set_fan_mode", entity_id=self.climate_entity, fan_mode=fan)
                 except Exception:
                     pass
         except Exception as e:

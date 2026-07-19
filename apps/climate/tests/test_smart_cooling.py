@@ -509,5 +509,20 @@ class DeployWatchdog(unittest.TestCase):
         self.assertEqual(app._notified, [])
 
 
+class CoolingFan(unittest.TestCase):
+    """Occupied quiet cooling (user, 2026-07-19: "watching TV in bed -> cool, just
+    less noisy"): active cooling drops to the quiet fan speed while someone's in
+    bed, same signal as the burp quiet-gate, otherwise the configured cool_fan."""
+
+    def test_empty_room_uses_configured_fan(self):
+        self.assertEqual(sc.SmartCooling._cooling_fan("auto", "silent", False), "auto")
+
+    def test_occupied_uses_quiet_fan(self):
+        self.assertEqual(sc.SmartCooling._cooling_fan("auto", "silent", True), "silent")
+
+    def test_quiet_fan_is_configurable(self):
+        self.assertEqual(sc.SmartCooling._cooling_fan("medium", "low", True), "low")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -66,6 +66,12 @@ SmartCooling:
   # what bothers a person in bed; parked crawl accepted until the Remove press).
   stall_fanonly_min: 3
   stall_burp_cooldown_min: 15
+  # Occupied quiet cooling (user 2026-07-19: watching TV in bed -> cool, just less
+  # noisy): active cooling drops to this fan speed instead of cool_fan_mode while
+  # either bedside is occupied. Not measured on this unit (the 2026-07-15 sweep
+  # covered low/medium/high/full, not silent) -- tune down to "low" if it proves
+  # too weak or behaves oddly.
+  cool_fan_quiet_mode: silent
   # Dry-finish (user 2026-07-17): evening holds at-target switch to `dry` mode while the
   # air is damp -- low fan over a cold coil = more water out per kWh, quietly, right
   # before the room is sealed. A drier start delays the night's clammy crossing (the
