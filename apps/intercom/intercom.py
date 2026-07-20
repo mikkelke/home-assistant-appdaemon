@@ -206,11 +206,17 @@ class Intercom(hass.Hass):
                 # Store handle reference in a list to allow modification in closure
                 handle_ref = [None]  # Use list to allow modification in closure
 
-                # Capture loop variables in closure to avoid late binding issues
+                # Bind loop variables via default args - a plain closure over these
+                # would capture them by reference, so every callback would see the
+                # LAST iteration's values (attempt_num == unlock_repeat_count, and the
+                # last handle_ref). That mislabelled every attempt as the final one,
+                # which tripped the "last attempt failed" report on the first verify
+                # instead of after the genuine last attempt. Default args are evaluated
+                # at def time, so each callback captures its own attempt_num/handle_ref.
                 trigger_ent = entity
                 attempt_num = i + 1
 
-                def unlock_callback(kwargs_inner):
+                def unlock_callback(kwargs_inner, trigger_ent=trigger_ent, attempt_num=attempt_num, handle_ref=handle_ref):
                     # Remove handle from pending_unlocks when this timer fires
                     # This prevents "Invalid callback handle" warnings when trying to cancel
                     # an already-fired timer
