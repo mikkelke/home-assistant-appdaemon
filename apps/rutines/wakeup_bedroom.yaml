@@ -34,6 +34,8 @@ WakeupBedroom:
     bedroom: cover.bedroom_blind
     bathroom: cover.bathroom_blind
   closed_is_100: true
+  # A cover this "closed" (>= 95 normal, <= 5 inverted) gets nudged open at wake.
+  closed_threshold: 95
   bedroom_cover_target: 38
   bathroom_cover_target: 40
   # Heat-wave override (user, 2026-07-15): input_boolean.heat_wave_mode ON -> use this

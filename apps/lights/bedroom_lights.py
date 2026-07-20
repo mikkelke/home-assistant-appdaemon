@@ -1,5 +1,6 @@
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
+import cover_util
 import lighting_actions
 import room_state_darkness
 
@@ -39,6 +40,8 @@ class BedroomLights(hass.Hass):
 
         self.mikkel_sleep_entity = self.args.get("mikkel_sleep_entity")
         self.bedroom_blind_entity = self.args.get("bedroom_blind_entity")
+        # "Closed" for a low-battery blind that parks at 99%; interpreted via cover_util.
+        self.blind_closed_threshold = int(self.args.get("blind_closed_threshold", 95))
         self.room_state_text_entity = self.args.get(
             "room_state_text_entity", "sensor.room_state_bedroom_bathroom"
         )
@@ -348,15 +351,9 @@ class BedroomLights(hass.Hass):
         return False
 
     def _is_blind_closed(self) -> bool:
-        if not self.bedroom_blind_entity:
-            return False
-        try:
-            blind_pos = int(
-                self.get_state(self.bedroom_blind_entity, attribute="current_position") or 0
-            )
-            return blind_pos >= 100
-        except (ValueError, TypeError):
-            return False
+        return cover_util.is_closed(
+            self, self.bedroom_blind_entity, threshold=self.blind_closed_threshold
+        )
 
     def _on_manual_override_change(self, entity, attribute, old, new, kwargs):
         """Global mechanism: manual override toggle - pause/resume automatic lighting.

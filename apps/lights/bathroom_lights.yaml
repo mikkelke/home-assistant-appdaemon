@@ -34,8 +34,10 @@ bathroom_lights:
   manual_override_boolean: "input_boolean.bathroom_lights_manual"
 
   # --- Blind proxy (optional) ---
-  # If the bedroom blind is fully closed (100), suppress bathroom auto-on due to darkness
+  # If the bedroom blind is closed (>= blind_closed_threshold), suppress bathroom
+  # auto-on due to darkness. Threshold handles a 99% low-battery park.
   bedroom_blind_entity: "cover.bedroom_blind"
+  blind_closed_threshold: 95
 
   # Logging configuration
   verbosity_level: "normal"  # "quiet", "normal", "debug"  

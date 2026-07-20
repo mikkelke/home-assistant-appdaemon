@@ -1,5 +1,7 @@
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
+import cover_util
+
 
 class BedroomBlindControl(hass.Hass):
     """
@@ -246,10 +248,14 @@ class BedroomBlindControl(hass.Hass):
                 self.error(f"Failed to get bathroom blind position (entity={self.bathroom_blind_entity}): {e}")
                 bath_pos = None
 
-        # Evaluate closed states using threshold (handles low battery cases where blind stops at 99%)
-        # Use closed_threshold instead of exact close_position match
-        bedroom_closed = bed_pos is not None and bed_pos >= self.closed_threshold
-        bathroom_closed = bath_pos is not None and bath_pos >= self.closed_threshold
+        # Evaluate closed states via cover_util (shared threshold; handles the 99%
+        # low-battery park). bed_pos/bath_pos are still read above for logging.
+        bedroom_closed = cover_util.is_closed(
+            self, self.target_cover, threshold=self.closed_threshold
+        )
+        bathroom_closed = bool(self.bathroom_blind_entity) and cover_util.is_closed(
+            self, self.bathroom_blind_entity, threshold=self.closed_threshold
+        )
 
         # Case 1: Both closed -> open both to default positions
         if bedroom_closed and bathroom_closed:

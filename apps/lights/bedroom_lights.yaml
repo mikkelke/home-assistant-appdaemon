@@ -26,6 +26,8 @@ bedroom_lights:
   # Global mechanism: manual override toggle — ON pauses ALL automatic actions for this room
   manual_override_boolean: "input_boolean.bedroom_lights_manual"
   bedroom_blind_entity: "cover.bedroom_blind"
+  # A blind at >= this % counts as closed (99% low-battery park still reads closed)
+  blind_closed_threshold: 95
 
   verbosity_level: "normal"
   room_state_text_entity: "sensor.room_state_bedroom_bathroom"

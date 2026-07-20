@@ -1,5 +1,6 @@
 import appdaemon.plugins.hass.hassapi as hass # type: ignore
 
+import cover_util
 import lighting_actions
 import room_state_darkness
 
@@ -41,6 +42,8 @@ class BathroomLights(hass.Hass):
         self.darkness_confirmed_sensor = self.args.get("darkness_confirmed_sensor_entity")
         self.mikkel_sleep_entity = self.args.get("mikkel_sleep_entity")
         self.bedroom_blind_entity = self.args.get("bedroom_blind_entity")
+        # A closed bedroom blind is a sleep proxy; threshold handles 99% low-battery park.
+        self.blind_closed_threshold = int(self.args.get("blind_closed_threshold", 95))
         # Global mechanism: per-room manual override pauses ALL automatic light actions
         self.manual_override_entity = self.args.get("manual_override_boolean")
 
@@ -364,14 +367,11 @@ class BathroomLights(hass.Hass):
         try:
             if self.get_state(self.mikkel_sleep_entity) == "on":
                 return True
-            # Bedroom blind fully closed = sleep proxy
-            if self.bedroom_blind_entity:
-                try:
-                    blind_pos = int(self.get_state(self.bedroom_blind_entity, attribute="current_position") or 0)
-                    if blind_pos >= 100:
-                        return True
-                except (ValueError, TypeError):
-                    pass
+            # Bedroom blind closed = sleep proxy (threshold-based; 99% low-battery park counts)
+            if cover_util.is_closed(
+                self, self.bedroom_blind_entity, threshold=self.blind_closed_threshold
+            ):
+                return True
         except Exception:
             pass
         return False

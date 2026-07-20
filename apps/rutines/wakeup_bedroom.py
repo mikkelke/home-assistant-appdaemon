@@ -1,6 +1,7 @@
 import appdaemon.plugins.hass.hassapi as hass # type: ignore
 from datetime import time, timedelta
 
+import cover_util
 import room_state_darkness
 
 REQUIRED_TOP_LEVEL = [
@@ -59,6 +60,8 @@ class WakeupRoutine(hass.Hass):
         self.volume_interval_sec = int(A["volume_interval_sec"]) 
 
         self.closed_is_100 = bool(A["closed_is_100"])
+        # "Closed enough to nudge open": shared threshold (99% low-battery park counts).
+        self.closed_threshold = int(A.get("closed_threshold", 95))
         self.bedroom_cover = A["covers"]["bedroom"]
         self.bathroom_cover = A["covers"]["bathroom"]
         self.bedroom_cover_target = int(A["bedroom_cover_target"])
@@ -554,12 +557,16 @@ class WakeupRoutine(hass.Hass):
 
     # ---------- covers ----------
     def _nudge_cover_if_closed(self, entity, target_pct):
-        pos = self._cover_position(entity)
-        if pos is None:
-            if self.get_state(entity) == "closed":
-                self._set_cover_position(entity, target_pct)
+        # Closed-test centralized in cover_util (shared threshold semantics); the
+        # nudge/re-command stays local. Threshold widens the old exact-100/exact-0
+        # test so a 99% low-battery park now reads as closed.
+        if cover_util.is_closed(
+            self, entity, threshold=self.closed_threshold, closed_is_100=self.closed_is_100
+        ):
+            self._set_cover_position(entity, target_pct)
             return
-        if (self.closed_is_100 and int(pos) == 100) or ((not self.closed_is_100) and int(pos) == 0):
+        # Position unavailable: fall back to the cover's coarse state, as before.
+        if cover_util.position(self, entity) is None and self.get_state(entity) == "closed":
             self._set_cover_position(entity, target_pct)
 
     def _cover_position(self, entity):
