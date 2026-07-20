@@ -873,5 +873,247 @@ class TrackKitchenMax(unittest.TestCase):
         self.assertEqual(app._kitchen_max_date, "2026-07-20")
 
 
+class EveningRescue(unittest.TestCase):
+    """Change 2: when DISARMED in the evening and the night is genuinely at risk but still
+    rescuable, send ONE advisory (never a climate command). Fires only when every gate
+    holds; silent no-op otherwise. Uses the same _effective_ceiling / E selection /
+    _calc_target the armed path uses, so the advice matches what arming would do."""
+
+    def _run(self, coro):
+        import asyncio
+        return asyncio.run(coro)
+
+    def _app(self, ceiling=23.0, e_active=25.0, e_legacy=25.0, home="home",
+             rescue_enabled=True, from_hour=16, to_hour=23, deficit_min=0.5,
+             notified_date=None, comfort_ce=None, wm_shadow=False):
+        app = make_app(weather_model_enabled=True, wm_shadow=wm_shadow)
+        app.rescue_enabled = rescue_enabled
+        app.rescue_from_hour = from_hour
+        app.rescue_to_hour = to_hour
+        app.rescue_deficit_min = deficit_min
+        app.rescue_home_entity = "person.mikkel"
+        app.floor_cool_cph = 1.0
+        app.zone_offset = 1.0
+        app.min_temp = 16.0
+        app.night_ceiling_entity = "input_number.nc"
+        app.default_ceiling = ceiling
+        app.comfort_entity = "sensor.comfort"
+        app.comfort_max_reduction = 1.5
+        app._rescue_notified_date = notified_date
+        app._e_active = e_active
+        app._e_legacy = e_legacy
+
+        async def _num(entity, default):
+            return ceiling if entity == app.night_ceiling_entity else default
+        app._num = _num
+
+        async def get_state(entity, attribute=None):
+            return comfort_ce
+        app.get_state = get_state
+
+        async def _state(entity):
+            return home
+        app._state = _state
+
+        app._notified = []
+
+        async def _notify(msg):
+            app._notified.append(msg)
+        app._notify = _notify
+        return app
+
+    def _fire(self, app, now, floor):
+        self._run(app._maybe_evening_rescue(now, floor, app._e_legacy, app._e_active))
+
+    def test_fires_once_when_all_conditions_hold(self):
+        # floor 22.5, ceiling 23 -> cap 22; E 25 -> target 19 (r=0.5); deficit 3.5 >= 0.5;
+        # mins 210 (3.5h); 19:00 leaves (23-19)*60=240 >= 210 -> feasible; home -> fires.
+        app = self._app()
+        now = datetime(2026, 7, 20, 19, 0)
+        self._fire(app, now, floor=22.5)
+        self.assertEqual(len(app._notified), 1)
+        self.assertIn("arm Cool night", app._notified[0])
+        self.assertEqual(app._rescue_notified_date, "2026-07-20")
+        # second call the same evening is deduped
+        self._fire(app, now, floor=22.5)
+        self.assertEqual(len(app._notified), 1)
+
+    def test_disabled_never_fires(self):
+        app = self._app(rescue_enabled=False)
+        self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
+        self.assertEqual(app._notified, [])
+
+    def test_outside_hours_suppressed(self):
+        app = self._app()
+        self._fire(app, datetime(2026, 7, 20, 9, 0), floor=22.5)   # before from_hour
+        self.assertEqual(app._notified, [])
+        app2 = self._app()
+        self._fire(app2, datetime(2026, 7, 20, 23, 0), floor=22.5)  # == to_hour (exclusive)
+        self.assertEqual(app2._notified, [])
+
+    def test_deficit_below_min_suppressed(self):
+        # floor 19.1 vs target 19 -> deficit 0.1 < 0.5
+        app = self._app()
+        self._fire(app, datetime(2026, 7, 20, 19, 0), floor=19.1)
+        self.assertEqual(app._notified, [])
+
+    def test_not_feasible_suppressed(self):
+        # deep deficit but too late: floor 22.5, target 19 -> 210 min needed, but at 22:00
+        # only (23-22)*60 = 60 min remain before the cutoff.
+        app = self._app()
+        self._fire(app, datetime(2026, 7, 20, 22, 0), floor=22.5)
+        self.assertEqual(app._notified, [])
+
+    def test_home_away_suppressed(self):
+        app = self._app(home="not_home")
+        self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
+        self.assertEqual(app._notified, [])
+
+    def test_home_sensor_missing_does_not_suppress(self):
+        for missing in (None, "unknown", "unavailable"):
+            app = self._app(home=missing)
+            self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
+            self.assertEqual(len(app._notified), 1, f"missing={missing!r} should still fire")
+
+    def test_already_notified_today_suppressed(self):
+        app = self._app(notified_date="2026-07-20")
+        self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
+        self.assertEqual(app._notified, [])
+
+    def test_message_uses_weather_E_when_out_of_shadow(self):
+        # not in shadow -> E = e_active; the message quotes it.
+        app = self._app(e_active=25.0, e_legacy=99.0, wm_shadow=False)
+        self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
+        self.assertEqual(len(app._notified), 1)
+        self.assertIn("~25.0C", app._notified[0])
+
+    def test_error_is_swallowed_no_raise(self):
+        app = self._app()
+
+        async def _boom(entity, default):
+            raise RuntimeError("sensor blew up")
+        app._num = _boom  # _effective_ceiling will raise
+        # must not propagate, must not notify
+        self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
+        self.assertEqual(app._notified, [])
+
+
+class EvaluateTickWiring(unittest.TestCase):
+    """Change 1 + Change 2 wiring through _evaluate_locked: read + publish EVERY tick
+    regardless of arm/deploy state, and call the evening-rescue helper only from the
+    disarmed branch. Actuation methods are stubbed -- these assert the read-only plumbing,
+    not the (unchanged) armed decision chain."""
+
+    WM_DBG = {
+        "equilibrium_weather": 28.6, "equilibrium_legacy": 24.5,
+        "solar_mean_est": 210.0, "outdoor_max_est": 31.0,
+        "kitchen_max_pred": 28.1, "prev_kitchen_max": 27.0,
+    }
+
+    def _app(self, enable="off", climate="off", master_was_on=False,
+             kitchen=26.0, mid=25.0, floor=25.0):
+        app = make_app(weather_model_enabled=True, wm_shadow=True)
+        app.enable_entity = "en"
+        app.climate_entity = "cl"
+        app.floor_sensor = "floor"
+        app.mid_sensor = "mid"
+        app.kitchen_sensor = "kitchen"
+        app.bathroom_sensor = "bath"
+        app.outdoor_sensor = "out"
+        app.bathroom_delta_max = 12.0
+        app.person_offset = 0.5
+        app._master_was_on = master_was_on
+        app._not_deployed_since = None
+        app._deploy_watchdog_notified = False
+        app._safety_off_notified = False
+        app._kitchen_max_today = None
+        app._kitchen_max_date = None
+        app._prev_kitchen_max = None
+        app._last_eval_at = None
+        app._last_want = False
+
+        nums = {"kitchen": kitchen, "mid": mid, "floor": floor}
+        states = {"en": enable, "cl": climate}
+
+        async def get_now():
+            return datetime(2026, 7, 20, 19, 0)
+        app.get_now = get_now
+
+        async def _num(entity, default):
+            return nums.get(entity, default)   # bath/out -> None (no hazard)
+        app._num = _num
+
+        async def _state(entity):
+            return states.get(entity)
+        app._state = _state
+
+        async def _learn(now):
+            return
+        app._learn = _learn
+
+        async def _we(now, k, m, f, el):
+            return el, dict(self.WM_DBG)   # e_active == e_legacy (shadow); dbg published
+        app._weather_equilibrium = _we
+
+        async def _cdw(now, master_on, deployed):
+            return
+        app._check_deploy_watchdog = _cdw
+
+        app._rescue_calls = []
+
+        async def _rescue(now, floor, e_legacy, e_active):
+            app._rescue_calls.append((floor, e_legacy, e_active))
+        app._maybe_evening_rescue = _rescue
+
+        app._published = []
+
+        async def _publish(status, reason, attrs):
+            app._published.append((status, reason, dict(attrs)))
+        app._publish = _publish
+
+        async def _ensure_off(status, reason, attrs):
+            app._published.append((status, reason, dict(attrs)))
+        app._ensure_off = _ensure_off
+        return app
+
+    def _run(self, app):
+        import asyncio
+        asyncio.run(app._evaluate_locked())
+
+    def test_disarmed_publish_includes_weather_attrs(self):
+        app = self._app(enable="off", climate="off")
+        self._run(app)
+        self.assertEqual(len(app._published), 1)
+        status, _, attrs = app._published[0]
+        self.assertEqual(status, "off")
+        # Change 1: wm_dbg merged into the disarmed publish, existing key preserved.
+        self.assertEqual(attrs["deployed"], True)
+        self.assertIn("equilibrium_weather", attrs)
+        self.assertEqual(attrs["equilibrium_legacy"], 24.5)
+
+    def test_track_kitchen_max_runs_on_disarmed_tick(self):
+        app = self._app(enable="off", climate="off", kitchen=26.0)
+        self.assertIsNone(app._kitchen_max_today)
+        self._run(app)
+        # Change 1: measurement now happens even while disarmed.
+        self.assertEqual(app._kitchen_max_today, 26.0)
+        self.assertEqual(app._kitchen_max_date, "2026-07-20")
+
+    def test_rescue_helper_invoked_from_disarmed_branch(self):
+        app = self._app(enable="off", climate="off")
+        self._run(app)
+        self.assertEqual(len(app._rescue_calls), 1)
+
+    def test_armed_but_not_deployed_publishes_weather_and_skips_rescue(self):
+        # master on, climate unavailable -> not-deployed branch: still publishes wm_dbg,
+        # never reaches (nor calls) the disarmed-only rescue helper.
+        app = self._app(enable="on", climate="unavailable")
+        self._run(app)
+        self.assertEqual(len(app._rescue_calls), 0)
+        status, _, attrs = app._published[0]
+        self.assertEqual(status, "unit_stored")
+        self.assertIn("equilibrium_weather", attrs)
+
+
 if __name__ == "__main__":
     unittest.main()

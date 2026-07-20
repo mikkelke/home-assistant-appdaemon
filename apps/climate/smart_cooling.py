@@ -203,6 +203,17 @@ class SmartCooling(hass.Hass):
         # 07-19: physical button pressed alongside the nightly unplug) doesn't eat
         # the whole afternoon before anyone notices.
         self.deploy_watchdog_min = float(a("deploy_watchdog_min", 20))
+        # Evening rescue advisory (disarmed): if the night is genuinely at risk but still
+        # rescuable before bed, send ONE notification -- never a climate command -- so the
+        # user can arm + redeploy the unit. Gated to the evening window, a real unmet
+        # pre-cool deficit that still fits before the cutoff hour, and (optionally) the user
+        # being home. One per calendar day; the daily reset re-arms it (see
+        # _maybe_evening_rescue / _rescue_notified_date).
+        self.rescue_enabled = bool(a("rescue_enabled", True))
+        self.rescue_from_hour = int(a("rescue_from_hour", 16))
+        self.rescue_to_hour = int(a("rescue_to_hour", 23))
+        self.rescue_deficit_min = float(a("rescue_deficit_min", 0.5))
+        self.rescue_home_entity = a("rescue_home_entity", "person.mikkel")
         self.state_file = a("state_file", "/conf/apps/climate/smart_cooling_state.json")
 
         # --- state ---
@@ -244,6 +255,11 @@ class SmartCooling(hass.Hass):
         # ~9h it then ran unmonitored; bathroom hit 39.8C (+21.2C above outdoor) before
         # the next ARMED eval's guard finally caught it. See _condenser_hazard/_evaluate.
         self._safety_off_notified = False
+        # One evening-rescue advisory per calendar day (YYYY-MM-DD, or None). The rollover
+        # is implicit: a new day's date != the stored one, so the next qualifying evening
+        # re-arms without an explicit reset. Persisted so a reload/HA restart mid-evening
+        # doesn't re-notify.
+        self._rescue_notified_date: Optional[str] = None
         # Serializes _evaluate(): overlapping listen_state triggers each schedule their
         # own run_in -> create_task, so near-simultaneous triggers (confirmed 2026-07-18
         # 09:12, three at once) can run concurrently and interleave/duplicate actuation
@@ -398,6 +414,7 @@ class SmartCooling(hass.Hass):
             km = d.get("kitchen_max_today")
             self._kitchen_max_today = float(km) if km is not None else None
             self._kitchen_max_date = d.get("kitchen_max_date")
+            self._rescue_notified_date = d.get("rescue_notified_date")
         except Exception:
             pass
 
@@ -410,7 +427,8 @@ class SmartCooling(hass.Hass):
                            "feasible_samples": self._feasible_samples,
                            "prev_kitchen_max": self._prev_kitchen_max,
                            "kitchen_max_today": self._kitchen_max_today,
-                           "kitchen_max_date": self._kitchen_max_date}, f)
+                           "kitchen_max_date": self._kitchen_max_date,
+                           "rescue_notified_date": self._rescue_notified_date}, f)
         except Exception as e:
             self.log(f"state save failed ({e}) -- continuing in-memory", level="WARNING")
 
@@ -938,6 +956,71 @@ class SmartCooling(hass.Hass):
         return (deployed and climate_state not in (None, "off", "unavailable", "unknown")
                 and SmartCooling._venting_impaired(bath, outdoor, delta_max))
 
+    async def _effective_ceiling(self):
+        """Tonight's ceiling: the night-ceiling knob, optionally LOWERED by the comfort
+        middle layer on humid/two-sleeper nights -- bounded to at most comfort_max_reduction
+        below the knob, never below min_temp, never raised above the knob; any comfort-layer
+        problem falls back to the knob. Returns (ceiling, ceiling_base). Shared by the armed
+        decision path and the disarmed evening-rescue check so the two can't diverge."""
+        ceiling_base = await self._num(self.night_ceiling_entity, self.default_ceiling)
+        ceiling = ceiling_base
+        try:
+            ce = await self.get_state(self.comfort_entity, attribute="ceiling_effective")
+            if ce is not None:
+                ceiling = min(ceiling_base,
+                              max(float(ce), ceiling_base - self.comfort_max_reduction, self.min_temp))
+        except (TypeError, ValueError):
+            pass
+        return ceiling, ceiling_base
+
+    async def _maybe_evening_rescue(self, now, floor, e_legacy, e_active):
+        """Disarmed evening advisory -- NEVER a climate command. When the night is genuinely
+        at risk but still rescuable before bed, notify ONCE so the user can arm + redeploy
+        the unit. Uses the SAME ceiling (_effective_ceiling), E selection and _calc_target
+        the armed path uses, so the advice matches what arming would actually do. Fires only
+        when every gate holds: enabled, inside the evening window, an unmet pre-cool deficit
+        (floor - target >= rescue_deficit_min) that still fits before the cutoff hour, the
+        user home (or the home sensor missing), and not already sent today. Silent no-op on
+        any missing input or error -- a courtesy notification must never break the tick."""
+        try:
+            if not self.rescue_enabled:
+                return
+            if not (self.rescue_from_hour <= now.hour < self.rescue_to_hour):
+                return
+            today = now.strftime("%Y-%m-%d")
+            if self._rescue_notified_date == today:
+                return
+            if floor is None:
+                return
+            ceiling, _ = await self._effective_ceiling()
+            if ceiling is None:
+                return
+            E = e_active if (self.weather_model_enabled and not self.wm_shadow) else e_legacy
+            if E is None:
+                return
+            target = self._calc_target(E, ceiling)
+            deficit = floor - target
+            if deficit < self.rescue_deficit_min:
+                return
+            mins = deficit / self.floor_cool_cph * 60.0
+            # Still time to pre-cool the deficit away before the cutoff hour?
+            if (self.rescue_to_hour - now.hour) * 60 < mins:
+                return
+            if self.rescue_home_entity:
+                home = await self._state(self.rescue_home_entity)
+                # Fire when home, or when the sensor is simply missing/unknown -- never
+                # suppress on a dead sensor. Only a live "away" reading silences it.
+                if home not in (None, "unknown", "unavailable", "home"):
+                    return
+            await self._notify(
+                f"Tonight's looking warm: the bedroom's drifting toward ~{E:.1f}C vs the "
+                f"{ceiling:.1f}C limit and nothing's cooling it. About {mins:.0f} min of "
+                f"pre-cool would rescue it -- arm Cool night and plug the AC back in.")
+            self._rescue_notified_date = today
+            self._save_state()
+        except Exception as e:
+            self.log(f"evening rescue check failed ({e}) -- skipping", level="WARNING")
+
     # ---------- main ----------
     async def _evaluate(self):
         async with self._eval_lock:
@@ -952,6 +1035,20 @@ class SmartCooling(hass.Hass):
         deployed = climate_state not in (None, "unavailable", "unknown")
         bath = await self._num(self.bathroom_sensor, None)
         outdoor = await self._num(self.outdoor_sensor, None)
+        # Measure + model EVERY tick, regardless of arm/deploy state (read-only, NEVER
+        # actuates): the kitchen peak, the legacy proxy and the weather equilibrium are the
+        # data the shadow model most needs on exactly the cool/disarmed days that used to
+        # record nothing (the whole compute lived below the arm guard). Actuation still
+        # happens only in the armed+deployed path further down; here we only gather + publish.
+        # mid defaults to None (folded to floor in the armed path so zone/attrs are byte-
+        # identical); _equilibrium already ignores None, and floor is a member of the max
+        # either way, so e_legacy matches the old armed-path read exactly.
+        kitchen = await self._num(self.kitchen_sensor, None)
+        mid = await self._num(self.mid_sensor, None)
+        floor = await self._num(self.floor_sensor, None)
+        self._track_kitchen_max(now, kitchen)   # running daily max + midnight rollover
+        e_legacy = self._equilibrium(kitchen, mid, floor)
+        e_active, wm_dbg = await self._weather_equilibrium(now, kitchen, mid, floor, e_legacy)
         await self._check_deploy_watchdog(now, master_on, deployed)
 
         if not master_on:
@@ -967,7 +1064,7 @@ class SmartCooling(hass.Hass):
                     f"SAFETY: condenser room {bath:.1f}C is {delta:.1f}C above outdoor "
                     f"({outdoor:.1f}C) -- venting isn't keeping up, forcing the AC off "
                     f"(disarmed, but this isn't optional)",
-                    {"deployed": deployed, "bathroom": round(bath, 1)})
+                    {"deployed": deployed, "bathroom": round(bath, 1), **wm_dbg})
                 if not self._safety_off_notified:
                     self._safety_off_notified = True
                     await self._notify(
@@ -978,42 +1075,37 @@ class SmartCooling(hass.Hass):
                 self._master_was_on = False
                 return
             self._safety_off_notified = False
+            # Evening rescue advisory (never a command). Placed after the hazard handling so
+            # a genuine safety-off doesn't also nag; it only reads/notifies.
+            await self._maybe_evening_rescue(now, floor, e_legacy, e_active)
             # OFF = HANDS OFF. Turn the AC off ONCE on the on->off flip, then never command it again.
             if self._master_was_on:
-                await self._ensure_off("off", "Disarmed -- AC turned off, now hands-off", {"deployed": deployed})
+                await self._ensure_off("off", "Disarmed -- AC turned off, now hands-off",
+                                       {"deployed": deployed, **wm_dbg})
             else:
-                await self._publish("off", "Disarmed -- hands off (manual AC control)", {"deployed": deployed})
+                await self._publish("off", "Disarmed -- hands off (manual AC control)",
+                                    {"deployed": deployed, **wm_dbg})
             self._master_was_on = False
             return
         self._master_was_on = True
         if not deployed:
             self._mark_eval(now, False)
-            await self._publish("unit_stored", "AC not deployed (climate unavailable)", {})
+            await self._publish("unit_stored", "AC not deployed (climate unavailable)", dict(wm_dbg))
             return
 
-        floor = await self._num(self.floor_sensor, None)
+        # floor/mid/kitchen were read (hoisted) above; preserve the armed no_data guard.
         if floor is None:
             self._mark_eval(now, False)
-            await self._publish("no_data", "Missing bedroom floor temperature", {})
+            await self._publish("no_data", "Missing bedroom floor temperature", dict(wm_dbg))
             return
-        mid = await self._num(self.mid_sensor, floor)
+        if mid is None:
+            mid = floor   # armed-path default: mid tracks floor when its own sensor is dark
         ceil_s = await self._num(self.ceiling_sensor, None)
         ac_s = await self._num(self.ac_sensor, None)
-        kitchen = await self._num(self.kitchen_sensor, None)
-        self._track_kitchen_max(now, kitchen)   # running daily max + midnight rollover
 
-        ceiling_base = await self._num(self.night_ceiling_entity, self.default_ceiling)
-        # Comfort layer may lower the ceiling on humid/two-sleeper nights. Bounded:
-        # at most comfort_max_reduction below the knob, never below min_temp, never
-        # raised above the knob; any comfort-layer problem falls back to the knob.
-        ceiling = ceiling_base
-        try:
-            ce = await self.get_state(self.comfort_entity, attribute="ceiling_effective")
-            if ce is not None:
-                ceiling = min(ceiling_base,
-                              max(float(ce), ceiling_base - self.comfort_max_reduction, self.min_temp))
-        except (TypeError, ValueError):
-            pass
+        # Comfort layer may lower the ceiling on humid/two-sleeper nights (bounded; see
+        # _effective_ceiling). The disarmed rescue check shares the same helper.
+        ceiling, ceiling_base = await self._effective_ceiling()
         deadline = self._plan_deadline(now)
 
         pm = self._build_price_map(
@@ -1026,11 +1118,10 @@ class SmartCooling(hass.Hass):
 
         zone = round((floor + mid) / 2.0, 1)            # the floor-to-mid sleeping zone
         # Legacy proxy stays the fallback + the relief-floor anchor; the weather model is
-        # computed EVERY tick but only DRIVES actuation once it's enabled and out of shadow.
-        # While wm_shadow is true, E == e_legacy exactly (zero actuation change) and the
-        # weather value rides along on the status entity for predicted-vs-actual validation.
-        e_legacy = self._equilibrium(kitchen, mid, floor)
-        e_active, wm_dbg = await self._weather_equilibrium(now, kitchen, mid, floor, e_legacy)
+        # computed EVERY tick (hoisted above the arm guard) but only DRIVES actuation once
+        # it's enabled and out of shadow. While wm_shadow is true, E == e_legacy exactly
+        # (zero actuation change) and the weather value rides along on the status entity for
+        # predicted-vs-actual validation. e_legacy/e_active/wm_dbg were computed above.
         E = e_active if (self.weather_model_enabled and not self.wm_shadow) else e_legacy
         target = self._calc_target(E, ceiling)
         deficit = floor - target

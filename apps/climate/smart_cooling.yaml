@@ -97,6 +97,19 @@ SmartCooling:
   # this many minutes armed-but-unreachable; resets the moment it deploys.
   deploy_watchdog_min: 20
 
+  # Evening rescue advisory (DISARMED nights only): if the bedroom is drifting toward a
+  # too-warm night but there's still time to pre-cool it before bed, send ONE notification
+  # (never an AC command) so the user can arm Cool night and plug the unit back in. Gated
+  # to the evening window (rescue_from_hour..rescue_to_hour), a real unmet pre-cool deficit
+  # (floor - calculated target >= rescue_deficit_min) that still fits before the cutoff
+  # hour, and the user being home (rescue_home_entity; a missing/unknown sensor never
+  # suppresses). One per calendar day. Set rescue_enabled: false to silence entirely.
+  rescue_enabled: true
+  rescue_from_hour: 16
+  rescue_to_hour: 23
+  rescue_deficit_min: 0.5
+  rescue_home_entity: person.mikkel
+
   # SAFE ROLLOUT: runs + learns + publishes the plan, but NEVER touches the AC.
   dry_run: false   # live since 2026-07-13 (user: "the automation should take care of it"); master toggle still gates everything
 
