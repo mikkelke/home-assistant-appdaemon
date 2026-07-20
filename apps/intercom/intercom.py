@@ -246,19 +246,28 @@ class Intercom(hass.Hass):
                 handle_ref[0] = handle  # Store handle for removal in callback
                 self.pending_unlocks[entity].append(handle)
 
-        # Send TTS - combined message if auto-open enabled, otherwise just initial message
+        # Send TTS - combined message if auto-open enabled, otherwise just initial message.
+        # Offloaded to AppDaemon's executor pool (submit_to_executor): SonosNotifier.notify()
+        # ends in a blocking call_service("chime_tts/say") that waits ~5-10s on the HA
+        # websocket ack. This app is pinned to ONE thread (pin_apps default), so calling
+        # notify() inline here delayed the +1/+4/+7s unlock timers queued above until it
+        # returned - every daytime ring opened at ~ring+8s instead of ~ring+1s, and wasted
+        # attempts 1&2. notify() touches only SonosNotifier's own state + AD sync APIs (safe
+        # cross-thread), never Intercom's pending_unlocks/unlock_outcomes/last_trigger_at, so
+        # offloading it introduces no race on those dicts. The Future is AD-tracked/cancelled
+        # on reload; notify() self-logs its own errors to sonos_notifier_log.
         if self.sonos_notifier:
             try:
                 if auto_open_enabled and info.get("followup"):
                     # Combine messages: "Someone is at the front door and I opened the front door"
                     combined_message = f"{info['message']} and {info['followup']}"
-                    self.sonos_notifier.notify(message=combined_message)
-                    self.log(f"Sent combined TTS message for {entity} (auto-open enabled)", level="DEBUG")
+                    self.submit_to_executor(self.sonos_notifier.notify, message=combined_message)
+                    self.log(f"Queued combined TTS message for {entity} (auto-open enabled)", level="DEBUG")
                 else:
                     # Just send the initial message
-                    self.sonos_notifier.notify(message=info["message"])
+                    self.submit_to_executor(self.sonos_notifier.notify, message=info["message"])
             except Exception as e:
-                self.log(f"Error sending TTS for {entity}: {e}", level="ERROR")
+                self.log(f"Error queueing TTS for {entity}: {e}", level="ERROR")
         else:
             self.log("Skipping TTS; SonosNotifier unavailable.", level="ERROR")
 
