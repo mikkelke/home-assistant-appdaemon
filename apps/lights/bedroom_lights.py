@@ -138,8 +138,12 @@ class BedroomLights(hass.Hass):
             darkness_sensor=self.darkness_confirmed_sensor,
         )
 
-        # Bed-light session latch: FP300 both edges start/arm-exit the session; Withings and
-        # sleep-mode ON edges start one; a manual bed-light-on while dark also starts one.
+        # Bed-light session latch: FP300 both edges start/arm-exit the session; a transition
+        # TO "on" of any Withings bedside / sleep-mode / the bed light starts one. The start
+        # listeners filter on new="on" ONLY (not old="off"): Withings is a cloud sensor that
+        # constantly passes through unknown/unavailable, so the real getting-in-bed edge is
+        # usually unknown->on or unavailable->on, and an old="off" filter silently misses it
+        # (user-reported 2026-07-20: in bed, ceiling stayed on, session never started).
         # See class docstring and _set_session/_reconcile_session.
         if self.bedroom_presence_sensor:
             try:
@@ -149,23 +153,19 @@ class BedroomLights(hass.Hass):
 
         for ent in self.withings_in_bed_entities:
             try:
-                self.listen_state(self._on_withings_in_bed_on, ent, old="off", new="on")
+                self.listen_state(self._on_withings_in_bed_on, ent, new="on")
             except Exception as e:
                 self.log(f"Failed to listen to Withings in-bed sensor {ent}: {e}", level="ERROR")
 
         if self.mikkel_sleep_entity:
             try:
-                self.listen_state(
-                    self._on_sleep_mode_on, self.mikkel_sleep_entity, old="off", new="on"
-                )
+                self.listen_state(self._on_sleep_mode_on, self.mikkel_sleep_entity, new="on")
             except Exception as e:
                 self.log(f"Error registering sleep-mode session handler: {e}", level="ERROR")
 
         if self.bed_lights:
             try:
-                self.listen_state(
-                    self._on_bed_lights_on_manual, self.bed_lights, old="off", new="on"
-                )
+                self.listen_state(self._on_bed_lights_on_manual, self.bed_lights, new="on")
             except Exception as e:
                 self.log(f"Error registering manual bed-light session handler: {e}", level="ERROR")
 
@@ -264,7 +264,11 @@ class BedroomLights(hass.Hass):
 
     def _on_withings_in_bed_on(self, entity, attribute, old, new, kwargs):
         try:
-            self._enter_session("withings in-bed")
+            # Fires on ANY -> "on" (see listener note). Withings "on" = weight on the mat, but
+            # only start a session if the FP300 also sees someone in the room right now, so a
+            # stale cloud reconnect reporting "on" after you've left can't relight an empty bed.
+            if self._get_bedroom_presence():
+                self._enter_session("withings in-bed")
         except Exception as e:
             self.log(f"Error in withings in-bed handler: {e}", level="ERROR")
 

@@ -133,10 +133,29 @@ def make_full_app(overrides=None):
 class SessionEnter(unittest.TestCase):
     def test_enter_on_withings_on_edge(self):
         app = make_session_app(session=False, dark=True)
+        app.states[(FP300, None)] = "on"  # you're in the room when the mat reports weight
         app._on_withings_in_bed_on(LEFT, "state", "off", "on", {})
         self.assertTrue(app._session)
         app.call_service.assert_called_once_with("input_boolean/turn_on", entity_id=SESSION)
         app.turn_on.assert_called_once_with(BED)
+
+    def test_enter_on_withings_unknown_to_on_edge(self):
+        # Withings is cloud: the real getting-in-bed edge is often unknown->on (or
+        # unavailable->on), which an old="off" listener filter silently missed
+        # (user-reported 2026-07-20: in bed, ceiling stayed on, session never started).
+        app = make_session_app(session=False, dark=True)
+        app.states[(FP300, None)] = "on"
+        app._on_withings_in_bed_on(LEFT, "state", "unknown", "on", {})
+        self.assertTrue(app._session)
+
+    def test_no_enter_on_withings_when_room_empty(self):
+        # A stale cloud reconnect reporting "on" after you've left must not relight an
+        # empty bed - the FP300 presence guard blocks it.
+        app = make_session_app(session=False, dark=True)
+        app.states[(FP300, None)] = "off"
+        app._on_withings_in_bed_on(LEFT, "state", "unavailable", "on", {})
+        self.assertFalse(app._session)
+        app.call_service.assert_not_called()
 
     def test_enter_on_sleep_mode_on_edge(self):
         app = make_session_app(session=False, dark=True)
@@ -177,9 +196,10 @@ class SessionEnter(unittest.TestCase):
 
 
 class SessionListenerRegistration(unittest.TestCase):
-    """_on_withings_in_bed_on (and friends) do not themselves gate on `new` - AppDaemon's
-    own old/new filtering on listen_state is what guarantees an edge other than
-    off->on never reaches the handler at all. That registration is what this verifies."""
+    """The session-START listeners register on new="on" ONLY (no old="off" filter): Withings
+    is a cloud sensor that constantly passes through unknown/unavailable, so the real
+    getting-in-bed edge is usually unknown->on or unavailable->on. An old="off" filter would
+    silently drop it (user-reported 2026-07-20). This verifies the registration."""
 
     def setUp(self):
         self.app = make_full_app()
@@ -190,25 +210,25 @@ class SessionListenerRegistration(unittest.TestCase):
             if c.args and c.args[0] == callback
         ]
 
-    def test_withings_registered_on_edge_only(self):
+    def test_withings_registered_to_on_no_old_filter(self):
         for ent in (LEFT, RIGHT):
             calls = [c for c in self._reg(self.app._on_withings_in_bed_on) if c.args[1] == ent]
             self.assertEqual(len(calls), 1)
-            self.assertEqual(calls[0].kwargs.get("old"), "off")
+            self.assertNotIn("old", calls[0].kwargs)  # any -> on, not just off -> on
             self.assertEqual(calls[0].kwargs.get("new"), "on")
 
-    def test_sleep_mode_registered_on_edge_only(self):
+    def test_sleep_mode_registered_to_on_no_old_filter(self):
         calls = self._reg(self.app._on_sleep_mode_on)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].args[1], SLEEP)
-        self.assertEqual(calls[0].kwargs.get("old"), "off")
+        self.assertNotIn("old", calls[0].kwargs)
         self.assertEqual(calls[0].kwargs.get("new"), "on")
 
-    def test_bed_lights_manual_registered_on_edge_only(self):
+    def test_bed_lights_manual_registered_to_on_no_old_filter(self):
         calls = self._reg(self.app._on_bed_lights_on_manual)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].args[1], BED)
-        self.assertEqual(calls[0].kwargs.get("old"), "off")
+        self.assertNotIn("old", calls[0].kwargs)
         self.assertEqual(calls[0].kwargs.get("new"), "on")
 
     def test_presence_registered_both_edges(self):
