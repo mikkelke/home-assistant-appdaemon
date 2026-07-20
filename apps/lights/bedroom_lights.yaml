@@ -1,7 +1,8 @@
 # /conf/apps/lights/bedroom_lights.yaml
 #
 # Effective occupancy (vacant vs occupied gate only):
-#   bedroom PIR OR bathroom PIR when bathroom door is open OR any bedside sensor on.
+#   FP300 mmWave presence OR bathroom PIR when bathroom door is open OR an active bed-light
+#   session (see bedroom_lights.py class docstring).
 # Dark/bright from room_state_text_entity (darkness_calculator).
 
 bedroom_lights:
@@ -11,7 +12,8 @@ bedroom_lights:
 
   bed_lights: "light.bedroom_bed_lights"
   ceiling_lights: "light.bedroom_ceiling_lights"
-  in_bed_entities:
+  # Reliable ON-edge only signal to START a bed-light session; their OFF edge is ignored.
+  withings_in_bed_entities:
     - binary_sensor.left_bedside
     - binary_sensor.right_bedside
 
@@ -26,6 +28,16 @@ bedroom_lights:
   # Global mechanism: manual override toggle — ON pauses ALL automatic actions for this room
   manual_override_boolean: "input_boolean.bedroom_lights_manual"
   bedroom_blind_entity: "cover.bedroom_blind"
+  # A "closed" blind can report 98-99 instead of a clean 100 (battery/motor slack); treat
+  # >= this as closed so auto-on stays blocked. Matches wakeup_bedroom's closed_threshold.
+  blind_closed_threshold: 95
+
+  # Bed-light session latch (bed vs ceiling): reliable local FP300 mmWave presence, single
+  # source of truth mirrored to bed_session_entity and read by wakeup_bedroom for the wake
+  # ramp hand-off. See bedroom_lights.py class docstring.
+  bed_session_entity: input_boolean.bedroom_bed_session
+  bedroom_presence_sensor: binary_sensor.bedroom_presence_presence
+  session_exit_debounce_sec: 90
 
   verbosity_level: "normal"
   room_state_text_entity: "sensor.room_state_bedroom_bathroom"

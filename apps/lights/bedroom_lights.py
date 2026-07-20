@@ -1,5 +1,8 @@
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
+import datetime
+import time
+
 import lighting_actions
 import room_state_darkness
 
@@ -8,18 +11,32 @@ class BedroomLights(hass.Hass):
     Bedroom lighting with occupancy-based auto control.
 
     Effective occupancy (gate only - does not bypass bright shutoff, sleep mode, or blind-closed):
-      bedroom PIR OR bathroom PIR (when bathroom door open) OR any configured in-bed sensor.
+      FP300 mmWave presence (``bedroom_presence_sensor``) OR any ``bedroom_presence_extra`` OR
+      bathroom PIR (when bathroom door open) OR an active bed-light session (see below).
 
     Brightness: ``room_state_darkness`` (see LIGHTING_STANDARD.md) - refreshed every evaluation.
+
+    Bed-light session (bed vs ceiling): a debounced latch, ``self._session``, mirrored to the
+    HA helper ``bed_session_entity`` (single source of truth across app restarts/reloads) and
+    read by ``wakeup_bedroom`` for the wake-ramp hand-off. Withings bedside sensors
+    (``withings_in_bed_entities``) are used ONLY for their reliable ON edge to START a session -
+    their OFF edge is ignored forever (Withings misses getting-up far too often to trust for
+    ending one). A session also starts on sleep-mode ON, or on a manual bed-light-on while the
+    room is dark. It ends only once the FP300 presence sensor has read "off" continuously for
+    ``session_exit_debounce_sec`` while sleep mode is not active - the exit timer is armed on
+    presence-off and cancelled the instant presence returns, so someone moving around the bed
+    (FP300 briefly clearing) never flips the room to ceiling lights. Restart-safe:
+    ``_reconcile_session`` rebuilds ``self._session`` on init from Withings/sleep-mode/the
+    persisted helper + FP300's ``last_changed`` epoch (same pattern as
+    ``manual_override_timeout``), before the first light evaluation runs.
 
     Truth table (after the vacant/occupied gate):
       - No effective occupancy -> all lights OFF
       - Occupied + bright -> bed + ceiling OFF
       - Occupied + dark + sleep mode -> no auto-on
-      - Occupied + dark + blind fully closed -> no auto-on
-      - Occupied + dark + in_bed_entities configured + in bed -> bed ON, ceiling OFF
-      - Occupied + dark + in_bed_entities configured + not in bed -> ceiling ON, bed OFF
-      - Occupied + dark + no in_bed_entities + lights off -> bed ON (legacy fallback)
+      - Occupied + dark + blind at/above ``blind_closed_threshold`` -> no auto-on
+      - Occupied + dark + bed session active -> bed ON, ceiling OFF
+      - Occupied + dark + bed session ended -> ceiling ON, bed OFF
 
     Manual wall switch and remote are unchanged.
     """
@@ -28,12 +45,13 @@ class BedroomLights(hass.Hass):
         # --- Configuration ---
         self.bed_lights = self.args.get("bed_lights")
         self.ceiling_lights = self.args.get("ceiling_lights")
-        self.in_bed_entities = list(self.args.get("in_bed_entities") or [])
+        self.withings_in_bed_entities = list(
+            self.args.get("withings_in_bed_entities") or self.args.get("in_bed_entities") or []
+        )
 
         self.switch_device_id = self.args.get("switch_device_id")
         self.remote_device_id = self.args.get("remote_device_id")
 
-        self.raw_pir_sensor = self.args.get("raw_pir_sensor")
         self.raw_bathroom_pir_sensor = self.args.get("raw_bathroom_pir_sensor")
         self.bathroom_door_sensor = self.args.get("bathroom_door_sensor")
 
@@ -44,9 +62,22 @@ class BedroomLights(hass.Hass):
         )
         self.darkness_confirmed_sensor = self.args.get("darkness_confirmed_sensor_entity")
 
+        # Bed-light session latch (see class docstring).
+        self.bed_session_entity = self.args.get(
+            "bed_session_entity", "input_boolean.bedroom_bed_session"
+        )
+        self.bedroom_presence_sensor = self.args.get(
+            "bedroom_presence_sensor", "binary_sensor.bedroom_presence_presence"
+        )
+        self.bedroom_presence_extra = list(self.args.get("bedroom_presence_extra") or [])
+        self.session_exit_debounce_sec = int(self.args.get("session_exit_debounce_sec", 90))
+        self.blind_closed_threshold = int(self.args.get("blind_closed_threshold", 95))
+
         self.log_level = self.args.get("verbosity_level", "normal")
 
         self._last_off_is_dark: bool | None = None
+        self._session = False
+        self._session_exit_timer = None
 
         if not all(
             [
@@ -54,7 +85,7 @@ class BedroomLights(hass.Hass):
                 self.ceiling_lights,
                 self.switch_device_id,
                 self.remote_device_id,
-                self.raw_pir_sensor,
+                self.bedroom_presence_sensor,
                 self.raw_bathroom_pir_sensor,
                 self.mikkel_sleep_entity,
             ]
@@ -86,17 +117,6 @@ class BedroomLights(hass.Hass):
             value="KeyPressed",
         )
 
-        if self.raw_pir_sensor:
-            try:
-                self.listen_state(
-                    self._on_raw_bedroom_pir_on,
-                    self.raw_pir_sensor,
-                    old="off",
-                    new="on",
-                )
-            except Exception as e:
-                self.log(f"Error registering bedroom PIR handler: {e}", level="ERROR")
-
         if self.raw_bathroom_pir_sensor:
             try:
                 self.listen_state(self._on_raw_bathroom_pir_change, self.raw_bathroom_pir_sensor)
@@ -116,11 +136,36 @@ class BedroomLights(hass.Hass):
             darkness_sensor=self.darkness_confirmed_sensor,
         )
 
-        for ent in self.in_bed_entities:
+        # Bed-light session latch: FP300 both edges start/arm-exit the session; Withings and
+        # sleep-mode ON edges start one; a manual bed-light-on while dark also starts one.
+        # See class docstring and _set_session/_reconcile_session.
+        if self.bedroom_presence_sensor:
             try:
-                self.listen_state(self._on_in_bed_change, ent)
+                self.listen_state(self._on_presence_change_session, self.bedroom_presence_sensor)
             except Exception as e:
-                self.log(f"Failed to listen to in-bed sensor {ent}: {e}", level="ERROR")
+                self.log(f"Error registering bedroom presence handler: {e}", level="ERROR")
+
+        for ent in self.withings_in_bed_entities:
+            try:
+                self.listen_state(self._on_withings_in_bed_on, ent, old="off", new="on")
+            except Exception as e:
+                self.log(f"Failed to listen to Withings in-bed sensor {ent}: {e}", level="ERROR")
+
+        if self.mikkel_sleep_entity:
+            try:
+                self.listen_state(
+                    self._on_sleep_mode_on, self.mikkel_sleep_entity, old="off", new="on"
+                )
+            except Exception as e:
+                self.log(f"Error registering sleep-mode session handler: {e}", level="ERROR")
+
+        if self.bed_lights:
+            try:
+                self.listen_state(
+                    self._on_bed_lights_on_manual, self.bed_lights, old="off", new="on"
+                )
+            except Exception as e:
+                self.log(f"Error registering manual bed-light session handler: {e}", level="ERROR")
 
         # Global mechanism: per-room manual override pauses ALL automatic light actions
         self.manual_override_entity = self.args.get("manual_override_boolean")
@@ -131,6 +176,7 @@ class BedroomLights(hass.Hass):
         self.log("Bedroom: App initialized", level="INFO")
 
     def _initial_check(self, kwargs=None):
+        self._reconcile_session()
         self._evaluate_lights("INITIAL_CHECK")
 
     def _lighting_decisions(self, trigger: str = ""):
@@ -176,7 +222,7 @@ class BedroomLights(hass.Hass):
             self.turn_on(self.bed_lights)
 
     def _get_bedroom_presence(self) -> bool:
-        return self.get_state(self.raw_pir_sensor) == "on"
+        return self.get_state(self.bedroom_presence_sensor) == "on"
 
     def _is_bathroom_door_open(self) -> bool:
         if not self.bathroom_door_sensor:
@@ -188,35 +234,123 @@ class BedroomLights(hass.Hass):
             return False
         return self.get_state(self.raw_bathroom_pir_sensor) == "on"
 
-    def _anyone_in_bed(self) -> bool:
-        for ent in self.in_bed_entities:
-            try:
-                if self.get_state(ent) == "on":
-                    return True
-            except Exception:
-                pass
-        return False
-
     def _get_effective_occupancy(self) -> bool:
         return (
             self._get_bedroom_presence()
+            or any(self.get_state(e) == "on" for e in self.bedroom_presence_extra)
             or self._get_bathroom_presence()
-            or self._anyone_in_bed()
+            or self._session
         )
 
-    def _on_raw_bedroom_pir_on(self, entity, attribute, old, new, kwargs):
+    def _set_session(self, on: bool, reason: str) -> None:
+        if on == self._session:
+            return
+        self._session = on
         try:
-            self.log("Bedroom: PIR detected - fast evaluation", level="INFO")
-            self._evaluate_lights("PIR_ON")
+            self.call_service(
+                "input_boolean/turn_on" if on else "input_boolean/turn_off",
+                entity_id=self.bed_session_entity,
+            )
         except Exception as e:
-            self.log(f"Error in bedroom PIR handler: {e}", level="ERROR")
+            self.log(f"Bedroom: bed session helper mirror failed: {e}", level="WARNING")
+        self.log(f"Bedroom: bed session {'START' if on else 'END'} ({reason})", level="INFO")
+        self._evaluate_lights("SESSION_ON" if on else "SESSION_OFF")
 
-    def _on_in_bed_change(self, entity, attribute, old, new, kwargs):
+    def _enter_session(self, reason: str) -> None:
+        self._cancel_session_exit()
+        self._set_session(True, reason)
+
+    def _on_withings_in_bed_on(self, entity, attribute, old, new, kwargs):
         try:
-            self.log(f"Bedroom: In-bed state changed ({entity} {old} -> {new})", level="INFO")
-            self._evaluate_lights("IN_BED_CHANGE")
+            self._enter_session("withings in-bed")
         except Exception as e:
-            self.log(f"Error in in-bed handler: {e}", level="ERROR")
+            self.log(f"Error in withings in-bed handler: {e}", level="ERROR")
+
+    def _on_sleep_mode_on(self, entity, attribute, old, new, kwargs):
+        try:
+            self._enter_session("sleep mode on")
+        except Exception as e:
+            self.log(f"Error in sleep-mode session handler: {e}", level="ERROR")
+
+    def _on_bed_lights_on_manual(self, entity, attribute, old, new, kwargs):
+        try:
+            if self._session:
+                return
+            try:
+                _, off_d = self._lighting_decisions("BED_MANUAL")
+            except Exception:
+                return
+            if off_d.is_dark:
+                self._enter_session("manual bed light while dark")
+        except Exception as e:
+            self.log(f"Error in manual bed-light session handler: {e}", level="ERROR")
+
+    def _on_presence_change_session(self, entity, attribute, old, new, kwargs):
+        try:
+            if new == "on":
+                self._cancel_session_exit()
+                self._evaluate_lights("PRESENCE_ON")
+            elif new == "off":
+                if self._session and not self._is_sleep_mode_active():
+                    self._arm_session_exit()
+            # any other value (unavailable/unknown): no-op (hold)
+        except Exception as e:
+            self.log(f"Error in bedroom presence session handler: {e}", level="ERROR")
+
+    def _arm_session_exit(self) -> None:
+        if self._session_exit_timer is None:
+            self._session_exit_timer = self.run_in(
+                self._session_exit_fire, self.session_exit_debounce_sec
+            )
+
+    def _cancel_session_exit(self) -> None:
+        if self._session_exit_timer is not None:
+            try:
+                self.cancel_timer(self._session_exit_timer)
+            except Exception:
+                pass
+            self._session_exit_timer = None
+
+    def _session_exit_fire(self, kwargs):
+        self._session_exit_timer = None
+        if (
+            self._session
+            and self.get_state(self.bedroom_presence_sensor) != "on"
+            and not self._is_sleep_mode_active()
+        ):
+            self._set_session(False, f"presence clear {self.session_exit_debounce_sec}s")
+
+    def _reconcile_session(self) -> None:
+        """Restart-safe rebuild of ``self._session`` (see class docstring). Modeled on
+        ``manual_override_timeout._resync``'s epoch math (``last_changed`` -> elapsed)."""
+        fp300_on = self.get_state(self.bedroom_presence_sensor) == "on"
+        withings = self._withings_in_bed()
+        sleep_on = self._is_sleep_mode_active()
+        persisted = self.get_state(self.bed_session_entity) == "on"
+        if withings or sleep_on:
+            want = True
+        elif persisted and fp300_on:
+            want = True
+        elif persisted and not fp300_on:
+            clear_for = None
+            lc = self.get_state(self.bedroom_presence_sensor, attribute="last_changed")
+            if lc:
+                try:
+                    clear_for = time.time() - datetime.datetime.fromisoformat(str(lc)).timestamp()
+                except (ValueError, TypeError):
+                    clear_for = None
+            want = clear_for is not None and clear_for < self.session_exit_debounce_sec
+        else:
+            want = False
+        self._session = want
+        if (self.get_state(self.bed_session_entity) == "on") != want:
+            self.call_service(
+                "input_boolean/turn_on" if want else "input_boolean/turn_off",
+                entity_id=self.bed_session_entity,
+            )
+
+    def _withings_in_bed(self) -> bool:
+        return any(self.get_state(b) == "on" for b in self.withings_in_bed_entities)
 
     def _on_raw_bathroom_pir_change(self, entity, attribute, old, new, kwargs):
         try:
@@ -258,7 +392,6 @@ class BedroomLights(hass.Hass):
             sleep_mode = self._is_sleep_mode_active()
             blind_closed = self._is_blind_closed()
             lights_on = self._are_any_lights_on()
-            in_bed = self._anyone_in_bed()
 
             if not occupied:
                 self._turn_off_all()
@@ -281,36 +414,20 @@ class BedroomLights(hass.Hass):
                     self.log("Dark + occupied but blind closed - no auto-on", level="DEBUG")
                 return
 
-            if self.in_bed_entities:
-                if in_bed:
-                    if self.get_state(self.ceiling_lights) == "on":
-                        self.log("Bedroom: Ceiling lights OFF (someone in bed)", level="INFO")
-                        self.turn_off(self.ceiling_lights)
-                    if self.get_state(self.bed_lights) != "on":
-                        self.log(
-                            "Bedroom: Bed lights ON (dark + occupied, in bed)",
-                            level="INFO",
-                        )
-                        self.turn_on(self.bed_lights)
-                else:
-                    if self.get_state(self.bed_lights) == "on":
-                        self.log(
-                            "Bedroom: Bed lights OFF (nobody in bed, using ceiling)",
-                            level="INFO",
-                        )
-                        self.turn_off(self.bed_lights)
-                    if self.get_state(self.ceiling_lights) != "on":
-                        self.log(
-                            "Bedroom: Ceiling lights ON (dark + occupied, not in bed)",
-                            level="INFO",
-                        )
-                        self.turn_on(self.ceiling_lights)
-            elif not lights_on:
-                self.log(
-                    "Bedroom: Bed lights ON (dark + occupied, no in-bed split)",
-                    level="INFO",
-                )
-                self.turn_on(self.bed_lights)
+            if self._session:
+                if self.get_state(self.ceiling_lights) == "on":
+                    self.log("Bedroom: Ceiling OFF (bed-light session active)", level="INFO")
+                    self.turn_off(self.ceiling_lights)
+                if self.get_state(self.bed_lights) != "on":
+                    self.log("Bedroom: Bed lights ON (dark + occupied, bed session)", level="INFO")
+                    self.turn_on(self.bed_lights)
+            else:
+                if self.get_state(self.bed_lights) == "on":
+                    self.log("Bedroom: Bed lights OFF (session ended, using ceiling)", level="INFO")
+                    self.turn_off(self.bed_lights)
+                if self.get_state(self.ceiling_lights) != "on":
+                    self.log("Bedroom: Ceiling ON (dark + occupied, session ended)", level="INFO")
+                    self.turn_on(self.ceiling_lights)
 
         except Exception as e:
             self.log(f"Error in light evaluation: {e}", level="ERROR")
@@ -354,7 +471,7 @@ class BedroomLights(hass.Hass):
             blind_pos = int(
                 self.get_state(self.bedroom_blind_entity, attribute="current_position") or 0
             )
-            return blind_pos >= 100
+            return blind_pos >= self.blind_closed_threshold
         except (ValueError, TypeError):
             return False
 
