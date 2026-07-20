@@ -99,3 +99,34 @@ SmartCooling:
 
   # SAFE ROLLOUT: runs + learns + publishes the plan, but NEVER touches the AC.
   dry_run: false   # live since 2026-07-13 (user: "the automation should take care of it"); master toggle still gates everything
+
+  # --- weather-driven equilibrium estimator (verified Model D) ---
+  # Predicts the apartment's daytime peak the sealed bedroom coasts toward, from
+  # measured+forecast solar, forecast outdoor peak, a resting baseline, and one day of
+  # thermal-mass memory (yesterday's kitchen peak) -- replacing the naive
+  # max(kitchen,mid,floor) proxy so a hot sunny day pre-cools deep+early while the live
+  # kitchen is still cool, and a cool sunless day barely pre-cools. SHADOW ROLLOUT: with
+  # wm_shadow true the weather E is COMPUTED and PUBLISHED every tick (equilibrium_weather /
+  # kitchen_max_pred / solar_mean_est / outdoor_max_est on sensor.smart_cooling_status) but
+  # the LEGACY proxy still drives actuation -- zero behaviour change. Validate
+  # predicted-vs-actual for 1-2 weeks over hot AND cool days, then flip wm_shadow: false.
+  # weather_model_enabled is the instant kill-switch back to legacy. Every degradation path
+  # (missing solar, failed forecast, unseeded memory, any exception) falls back to legacy,
+  # and E is floored at legacy - wm_nowcast_relief so a broken model can't crater it.
+  # Coefficients are single-warm-season (Apr-Jul); the 24C vent knee is a conservative
+  # hand-picked constant, not a tuned parameter -- re-fit + re-shadow before off-season use.
+  weather_model_enabled: true
+  wm_shadow: true
+  wm_b0: 15.797
+  wm_b_solar: 0.0162
+  wm_b_vent: 0.198
+  wm_vent_knee: 24.0
+  wm_b_prev: 0.287
+  wm_safety_margin: 0.0     # add-on warm bias on E if shadow shows under-prediction
+  wm_nowcast_relief: 1.5    # max degrees the model may predict below the live warmest reading
+  wm_clearsky_peak: 700.0   # clear-sky half-sine amplitude (W/m2) for remaining-daylight solar
+  wm_cloud_atten: 0.75      # cloud attenuation of the clear-sky estimate
+  wm_peak_hour: 15          # before this hour a missing forecast forces legacy (hot-day guard)
+  solar_sensor: sensor.gw2000a_solar_radiation
+  weather_forecast_entity: weather.forecast_home
+  sun_entity: sun.sun

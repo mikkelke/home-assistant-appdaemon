@@ -43,6 +43,26 @@ def make_app(**overrides):
     app._feasible_floor = overrides.get("feasible_floor", None)
     app._feasible_samples = overrides.get("feasible_samples", 0)
     app._dry_min = overrides.get("dry_min", 0.0)
+    # weather-model attributes (Model D coefficients + memory + shadow flags)
+    app.person_offset = overrides.get("person_offset", 0.5)
+    app.weather_model_enabled = overrides.get("weather_model_enabled", True)
+    app.wm_shadow = overrides.get("wm_shadow", False)
+    app.wm_b0 = overrides.get("wm_b0", 15.797)
+    app.wm_b_solar = overrides.get("wm_b_solar", 0.0162)
+    app.wm_b_vent = overrides.get("wm_b_vent", 0.198)
+    app.wm_vent_knee = overrides.get("wm_vent_knee", 24.0)
+    app.wm_b_prev = overrides.get("wm_b_prev", 0.287)
+    app.wm_safety_margin = overrides.get("wm_safety_margin", 0.0)
+    app.wm_nowcast_relief = overrides.get("wm_nowcast_relief", 1.5)
+    app.wm_clearsky_peak = overrides.get("wm_clearsky_peak", 700.0)
+    app.wm_cloud_atten = overrides.get("wm_cloud_atten", 0.75)
+    app.wm_peak_hour = overrides.get("wm_peak_hour", 15)
+    app.solar_sensor = overrides.get("solar_sensor", "sensor.gw2000a_solar_radiation")
+    app._prev_kitchen_max = overrides.get("prev_kitchen_max", None)
+    app._kitchen_max_today = overrides.get("kitchen_max_today", None)
+    app._kitchen_max_date = overrides.get("kitchen_max_date", None)
+    app._fc_cache = None
+    app._fc_cache_at = None
     app._save_state = lambda: None
     app.log = lambda *a, **k: None
     return app
@@ -602,6 +622,255 @@ class CondenserHazard(unittest.TestCase):
     def test_fan_only_can_also_be_a_hazard(self):
         # conservative on purpose: force off rather than assume a burp explains this reading
         self.assertTrue(sc.SmartCooling._condenser_hazard(True, "fan_only", 39.8, 17.9, self.DELTA_MAX))
+
+
+class ClearskyWm(unittest.TestCase):
+    """Clear-sky half-sine irradiance for the remaining-daylight solar estimate: 0 outside
+    the [sunrise, sunset] window, peaking at solar noon (the window midpoint)."""
+
+    def test_zero_before_sunrise(self):
+        self.assertEqual(sc.SmartCooling._clearsky_wm(4.0, 5.0, 21.0, 700.0), 0.0)
+
+    def test_zero_at_sunrise_and_sunset_edges(self):
+        self.assertEqual(sc.SmartCooling._clearsky_wm(5.0, 5.0, 21.0, 700.0), 0.0)
+        self.assertEqual(sc.SmartCooling._clearsky_wm(21.0, 5.0, 21.0, 700.0), 0.0)
+
+    def test_zero_after_sunset(self):
+        self.assertEqual(sc.SmartCooling._clearsky_wm(22.5, 5.0, 21.0, 700.0), 0.0)
+
+    def test_peak_at_solar_noon(self):
+        # window 5..21 -> midpoint 13.0 -> sin(pi/2) = 1 -> full peak
+        self.assertAlmostEqual(sc.SmartCooling._clearsky_wm(13.0, 5.0, 21.0, 700.0),
+                               700.0, delta=1e-6)
+
+    def test_noon_exceeds_mid_morning(self):
+        noon = sc.SmartCooling._clearsky_wm(13.0, 5.0, 21.0, 700.0)
+        morning = sc.SmartCooling._clearsky_wm(8.0, 5.0, 21.0, 700.0)
+        self.assertGreater(noon, morning)
+        self.assertGreater(morning, 0.0)
+
+    def test_degenerate_window_is_zero(self):
+        self.assertEqual(sc.SmartCooling._clearsky_wm(12.0, 21.0, 5.0, 700.0), 0.0)
+
+
+class SolarMeanAssembly(unittest.TestCase):
+    """solar_mean = (measured_mean_sofar * elapsed_h + remaining-daylight clear-sky) / 24,
+    with cloud attenuation from the forecast (full clear-sky when the forecast is missing =
+    conservative/warm)."""
+
+    def _run(self, coro):
+        import asyncio
+        return asyncio.run(coro)
+
+    def _app(self, measured_mean, sun=(5.0, 21.0), forecast=None, solar_state="123"):
+        app = make_app()
+        async def _state(e):
+            return solar_state
+        app._state = _state
+        async def _htm(entity, start, end):
+            return measured_mean
+        app._history_time_mean = _htm
+        async def _sun(now):
+            return sun
+        app._sun_window = _sun
+        async def _fc(now):
+            return forecast
+        app._get_forecast = _fc
+        return app
+
+    def test_no_forecast_uses_full_clearsky(self):
+        app = self._app(measured_mean=100.0)
+        now = datetime(2026, 7, 20, 12, 0)   # elapsed 12h
+        sm = self._run(app._solar_mean_today(now))
+        exp_rem = sum(sc.SmartCooling._clearsky_wm(h + 0.5, 5.0, 21.0, 700.0)
+                      for h in range(13, 24))
+        self.assertAlmostEqual(sm, (100.0 * 12.0 + exp_rem) / 24.0, places=4)
+
+    def test_cloud_forecast_attenuates_remaining_term(self):
+        # full overcast (cloud=1.0) over every remaining hour -> each clear-sky hour times
+        # (1 - 0.75*1.0) = 0.25
+        fc = [{"dt": datetime(2026, 7, 20, h), "temp": 20.0, "cloud": 1.0}
+              for h in range(13, 24)]
+        app = self._app(measured_mean=100.0, forecast=fc)
+        now = datetime(2026, 7, 20, 12, 0)
+        sm = self._run(app._solar_mean_today(now))
+        exp_rem = sum(sc.SmartCooling._clearsky_wm(h + 0.5, 5.0, 21.0, 700.0) * 0.25
+                      for h in range(13, 24))
+        self.assertAlmostEqual(sm, (100.0 * 12.0 + exp_rem) / 24.0, places=4)
+
+    def test_missing_solar_sensor_returns_none(self):
+        app = self._app(measured_mean=100.0, solar_state="unavailable")
+        sm = self._run(app._solar_mean_today(datetime(2026, 7, 20, 12, 0)))
+        self.assertIsNone(sm)
+
+    def test_failed_history_returns_none(self):
+        app = self._app(measured_mean=None)   # history mean unavailable
+        sm = self._run(app._solar_mean_today(datetime(2026, 7, 20, 12, 0)))
+        self.assertIsNone(sm)
+
+    def test_evening_is_nearly_fully_measured(self):
+        # after sunset there is no remaining daylight, so solar_mean = measured*elapsed/24
+        app = self._app(measured_mean=250.0)
+        now = datetime(2026, 7, 20, 22, 0)   # elapsed 22h, no daylight hours left
+        sm = self._run(app._solar_mean_today(now))
+        self.assertAlmostEqual(sm, 250.0 * 22.0 / 24.0, places=4)
+
+
+class WeatherEquilibrium(unittest.TestCase):
+    """Model D equilibrium + its fallbacks and the one-sided safety floor. The method always
+    computes (shadow gating lives in _evaluate_locked); every missing input / disabled /
+    unseeded / exception path returns EXACTLY the legacy proxy."""
+
+    def _run(self, coro):
+        import asyncio
+        return asyncio.run(coro)
+
+    def _app(self, solar_mean=200.0, outdoor_max=31.0, prev=27.0, forecast=object(),
+             **ov):
+        app = make_app(prev_kitchen_max=prev, **ov)
+        async def _sm(now):
+            return solar_mean
+        app._solar_mean_today = _sm
+        async def _om(now):
+            return outdoor_max
+        app._outdoor_max_today = _om
+        async def _fc(now):
+            return forecast
+        app._get_forecast = _fc
+        return app
+
+    def test_disabled_returns_legacy(self):
+        app = self._app(weather_model_enabled=False)
+        E, dbg = self._run(app._weather_equilibrium(
+            datetime(2026, 7, 20, 9, 0), 22.0, 22.0, 22.0, e_legacy=22.5))
+        self.assertEqual(E, 22.5)
+        self.assertIsNone(dbg["equilibrium_weather"])
+        self.assertEqual(dbg["equilibrium_legacy"], 22.5)
+
+    def test_unseeded_prev_returns_legacy(self):
+        app = self._app(prev=None)
+        E, dbg = self._run(app._weather_equilibrium(
+            datetime(2026, 7, 20, 9, 0), 22.0, 22.0, 22.0, e_legacy=22.5))
+        self.assertEqual(E, 22.5)
+        self.assertIsNone(dbg["equilibrium_weather"])
+
+    def test_missing_solar_returns_legacy(self):
+        app = self._app(solar_mean=None)
+        E, dbg = self._run(app._weather_equilibrium(
+            datetime(2026, 7, 20, 9, 0), 22.0, 22.0, 22.0, e_legacy=22.5))
+        self.assertEqual(E, 22.5)
+        self.assertIsNone(dbg["equilibrium_weather"])
+
+    def test_hot_day_guard_no_forecast_before_peak_hour_returns_legacy(self):
+        app = self._app(forecast=None)   # forecast fetch failed
+        E, dbg = self._run(app._weather_equilibrium(
+            datetime(2026, 7, 20, 9, 0), 22.0, 22.0, 22.0, e_legacy=22.5))
+        self.assertEqual(E, 22.5)   # 09:00 < wm_peak_hour(15) -> legacy
+        self.assertIsNone(dbg["equilibrium_weather"])
+
+    def test_no_forecast_after_peak_hour_still_computes(self):
+        # after 15:00 a missing forecast is tolerable (peak measured); model proceeds
+        app = self._app(forecast=None, solar_mean=12.0, outdoor_max=16.0, prev=22.7)
+        E, dbg = self._run(app._weather_equilibrium(
+            datetime(2026, 7, 20, 18, 0), 22.0, 22.0, 22.0, e_legacy=23.2))
+        self.assertIsNotNone(dbg["equilibrium_weather"])
+
+    def test_active_formula_hot_day_deep_early(self):
+        # design worked example: hot day at 09:00, solar_mean~200, outdoor_max=31, prev=27
+        # E_apartment = 15.797 + 0.0162*200 + 0.198*(31-24) + 0.287*27 = 28.174
+        # E_weather = +0.5 = 28.674; e_legacy=22.5 -> max(28.67, 21.0) = 28.67
+        app = self._app(solar_mean=200.0, outdoor_max=31.0, prev=27.0)
+        E, dbg = self._run(app._weather_equilibrium(
+            datetime(2026, 7, 20, 9, 0), 22.0, 22.0, 22.0, e_legacy=22.5))
+        self.assertAlmostEqual(dbg["kitchen_max_pred"], 28.17, places=1)
+        self.assertAlmostEqual(dbg["equilibrium_weather"], 28.67, places=1)
+        self.assertAlmostEqual(E, 28.67, places=1)   # model wins the max()
+
+    def test_relief_floor_caps_how_far_below_legacy(self):
+        # cool sunless day but a warm resting kitchen reading: model predicts well below
+        # legacy, but E can't drop more than wm_nowcast_relief(1.5) under it.
+        app = self._app(solar_mean=12.0, outdoor_max=16.0, prev=22.7)
+        E, dbg = self._run(app._weather_equilibrium(
+            datetime(2026, 7, 20, 18, 0), 26.0, 26.0, 26.0, e_legacy=26.5))
+        # E_weather = 15.797 + 0.0162*12 + 0 + 0.287*22.7 + 0.5 = 23.005
+        self.assertAlmostEqual(dbg["equilibrium_weather"], 23.0, places=1)
+        self.assertAlmostEqual(E, 25.0, places=2)   # floored at 26.5 - 1.5
+
+    def test_exception_falls_back_to_legacy(self):
+        app = self._app()
+        async def _boom(now):
+            raise RuntimeError("forecast blew up")
+        app._solar_mean_today = _boom
+        E, dbg = self._run(app._weather_equilibrium(
+            datetime(2026, 7, 20, 9, 0), 22.0, 22.0, 22.0, e_legacy=22.5))
+        self.assertEqual(E, 22.5)
+        self.assertIsNone(dbg["equilibrium_weather"])
+
+    def test_shadow_selection_keeps_legacy_driving(self):
+        # the method itself always computes a real weather E; the shadow gate (in
+        # _evaluate_locked) is what keeps legacy driving. Verify both halves here.
+        app = self._app(solar_mean=200.0, outdoor_max=31.0, prev=27.0, wm_shadow=True)
+        e_legacy = 22.5
+        e_active, dbg = self._run(app._weather_equilibrium(
+            datetime(2026, 7, 20, 9, 0), 22.0, 22.0, 22.0, e_legacy=e_legacy))
+        self.assertGreater(e_active, e_legacy)                 # model computed a hotter E
+        self.assertIsNotNone(dbg["equilibrium_weather"])       # published for comparison
+        # the exact expression _evaluate_locked uses:
+        E = e_active if (app.weather_model_enabled and not app.wm_shadow) else e_legacy
+        self.assertEqual(E, e_legacy)                          # shadow -> legacy still drives
+
+    def test_not_shadow_selection_drives_weather(self):
+        app = self._app(solar_mean=200.0, outdoor_max=31.0, prev=27.0, wm_shadow=False)
+        e_legacy = 22.5
+        e_active, _ = self._run(app._weather_equilibrium(
+            datetime(2026, 7, 20, 9, 0), 22.0, 22.0, 22.0, e_legacy=e_legacy))
+        E = e_active if (app.weather_model_enabled and not app.wm_shadow) else e_legacy
+        self.assertEqual(E, e_active)
+        self.assertGreater(E, e_legacy)
+
+
+class TrackKitchenMax(unittest.TestCase):
+    """Running daily max of the kitchen temperature with a local-midnight rollover:
+    yesterday's peak becomes prev_kitchen_max (Model D's thermal-mass memory) and today's
+    max resets on the first tick of a new calendar day."""
+
+    def test_running_max_same_day(self):
+        app = make_app(kitchen_max_today=None, kitchen_max_date=None)
+        app._track_kitchen_max(datetime(2026, 7, 20, 10, 0), 24.0)
+        self.assertEqual(app._kitchen_max_today, 24.0)
+        app._track_kitchen_max(datetime(2026, 7, 20, 14, 0), 26.5)
+        self.assertEqual(app._kitchen_max_today, 26.5)
+        app._track_kitchen_max(datetime(2026, 7, 20, 16, 0), 25.0)   # not a new high
+        self.assertEqual(app._kitchen_max_today, 26.5)
+
+    def test_midnight_rollover_moves_today_to_prev(self):
+        app = make_app(kitchen_max_today=27.3, kitchen_max_date="2026-07-20",
+                       prev_kitchen_max=None)
+        app._track_kitchen_max(datetime(2026, 7, 21, 0, 15), 22.0)
+        self.assertEqual(app._prev_kitchen_max, 27.3)
+        self.assertEqual(app._kitchen_max_today, 22.0)
+        self.assertEqual(app._kitchen_max_date, "2026-07-21")
+
+    def test_multiday_gap_drops_stale_memory_instead_of_promoting(self):
+        # Stored peak is two days old (e.g. downtime): must NOT become prev_kitchen_max.
+        app = make_app(kitchen_max_today=27.3, kitchen_max_date="2026-07-18",
+                       prev_kitchen_max=25.0)
+        app._track_kitchen_max(datetime(2026, 7, 20, 0, 15), 22.0)
+        self.assertIsNone(app._prev_kitchen_max)   # stale memory dropped -> _seed rebuilds
+        self.assertEqual(app._kitchen_max_today, 22.0)
+        self.assertEqual(app._kitchen_max_date, "2026-07-20")
+
+    def test_none_reading_does_not_lower_running_max(self):
+        app = make_app(kitchen_max_today=26.0, kitchen_max_date="2026-07-20")
+        app._track_kitchen_max(datetime(2026, 7, 20, 15, 0), None)
+        self.assertEqual(app._kitchen_max_today, 26.0)
+
+    def test_first_ever_tick_seeds_today_no_prev(self):
+        app = make_app(kitchen_max_today=None, kitchen_max_date=None, prev_kitchen_max=None)
+        app._track_kitchen_max(datetime(2026, 7, 20, 9, 0), 23.4)
+        self.assertIsNone(app._prev_kitchen_max)   # nothing to roll over yet
+        self.assertEqual(app._kitchen_max_today, 23.4)
+        self.assertEqual(app._kitchen_max_date, "2026-07-20")
 
 
 if __name__ == "__main__":

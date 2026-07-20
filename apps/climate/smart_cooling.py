@@ -79,6 +79,7 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 import asyncio
 from datetime import datetime, timedelta
 import json
+import math
 from typing import Optional
 
 
@@ -113,6 +114,34 @@ class SmartCooling(hass.Hass):
         self.zone_offset = float(a("zone_offset", 1.0))           # mid wall sits ~this above the floor
         self.person_offset = float(a("person_offset", 0.5))      # sleeper lifts the equilibrium a touch
         self.default_rise_frac = float(a("default_rise_frac", 0.7))  # conservative gap-fraction closed in the window
+        # --- weather-driven equilibrium estimator (verified Model D; SHADOW rollout) ---
+        # Predicts the apartment's daytime peak the sealed room coasts toward, from
+        # measured+forecast solar, forecast outdoor peak, a resting baseline, and one day of
+        # thermal-mass memory (yesterday's kitchen peak). Ships behind two flags:
+        # weather_model_enabled is the master kill-switch back to the legacy proxy; wm_shadow
+        # computes+publishes the weather E every tick but keeps the LEGACY value DRIVING
+        # actuation, so predicted-vs-actual can be validated for 1-2 weeks before flipping.
+        # Every degradation path (missing solar, failed forecast, unseeded memory, any
+        # exception) falls back to E_legacy, and E is floored at E_legacy - wm_nowcast_relief
+        # so a broken model can never crater the equilibrium (a too-warm room is the one
+        # failure the whole system exists to prevent). Coefficients are single-warm-season
+        # (Apr-Jul); the 24C vent knee is a hand-picked CONSERVATIVE constant, not a tuned
+        # parameter -- revisit with more hot-day data. See _weather_equilibrium.
+        self.weather_model_enabled = bool(a("weather_model_enabled", False))
+        self.wm_shadow = bool(a("wm_shadow", True))
+        self.wm_b0 = float(a("wm_b0", 15.797))
+        self.wm_b_solar = float(a("wm_b_solar", 0.0162))
+        self.wm_b_vent = float(a("wm_b_vent", 0.198))
+        self.wm_vent_knee = float(a("wm_vent_knee", 24.0))
+        self.wm_b_prev = float(a("wm_b_prev", 0.287))
+        self.wm_safety_margin = float(a("wm_safety_margin", 0.0))
+        self.wm_nowcast_relief = float(a("wm_nowcast_relief", 1.5))
+        self.wm_clearsky_peak = float(a("wm_clearsky_peak", 700.0))
+        self.wm_cloud_atten = float(a("wm_cloud_atten", 0.75))
+        self.wm_peak_hour = int(a("wm_peak_hour", 15))
+        self.solar_sensor = a("solar_sensor", "sensor.gw2000a_solar_radiation")
+        self.weather_forecast_entity = a("weather_forecast_entity", "weather.forecast_home")
+        self.sun_entity = a("sun_entity", "sun.sun")
         # Condenser-room temps: above `bathroom_max` the condenser loses ~2-3%/C efficiency
         # (worth flagging, NOT worth skipping a cheap slot for -- door is kept sealed, so no
         # real back-leak; user 2026-07-16). `bathroom_delta_max` is the real stop condition:
@@ -231,6 +260,14 @@ class SmartCooling(hass.Hass):
         self._lightout: Optional[dict] = None
         self._feasible_floor: Optional[float] = None
         self._feasible_samples = 0
+        # weather-model memory: yesterday's + today's running kitchen-temperature peak
+        # (Model D's thermal-mass memory; persisted, seeded from history on cold start)
+        # plus a short forecast cache so the eval loop doesn't hit the service every tick.
+        self._prev_kitchen_max: Optional[float] = None
+        self._kitchen_max_today: Optional[float] = None
+        self._kitchen_max_date: Optional[str] = None   # ISO date the running max belongs to
+        self._fc_cache = None
+        self._fc_cache_at: Optional[datetime] = None
         self._load_state()
 
         self.mobile_notifier = None
@@ -247,6 +284,9 @@ class SmartCooling(hass.Hass):
         # interval_min minutes unless a listened entity happened to change sooner). "immediate" is
         # AppDaemon's actual keyword for "fire the first call right away".
         self.run_every(self._run_eval, "immediate", self.interval_min * 60)
+        # Seed the weather-model's kitchen-peak memory from history shortly after start,
+        # so a cold start / reload has prev_day_kitchen_max before the first real rollover.
+        self.run_in(self._seed_kitchen_max, 5)
         self.log(f"SmartCooling v2 started (dry_run={self.dry_run}, rise_frac={self._rise_frac:.2f}, "
                  f"samples={self._rise_samples})", level="INFO")
 
@@ -353,6 +393,11 @@ class SmartCooling(hass.Hass):
             ff = d.get("feasible_floor")
             self._feasible_floor = float(ff) if ff is not None else None
             self._feasible_samples = int(d.get("feasible_samples", 0))
+            pk = d.get("prev_kitchen_max")
+            self._prev_kitchen_max = float(pk) if pk is not None else None
+            km = d.get("kitchen_max_today")
+            self._kitchen_max_today = float(km) if km is not None else None
+            self._kitchen_max_date = d.get("kitchen_max_date")
         except Exception:
             pass
 
@@ -362,7 +407,10 @@ class SmartCooling(hass.Hass):
                 json.dump({"rise_frac": self._rise_frac, "rise_samples": self._rise_samples,
                            "lightout": self._lightout,
                            "feasible_floor": self._feasible_floor,
-                           "feasible_samples": self._feasible_samples}, f)
+                           "feasible_samples": self._feasible_samples,
+                           "prev_kitchen_max": self._prev_kitchen_max,
+                           "kitchen_max_today": self._kitchen_max_today,
+                           "kitchen_max_date": self._kitchen_max_date}, f)
         except Exception as e:
             self.log(f"state save failed ({e}) -- continuing in-memory", level="WARNING")
 
@@ -372,6 +420,320 @@ class SmartCooling(hass.Hass):
         reading (errs deep -> safe)."""
         vals = [v for v in (kitchen, mid, floor) if v is not None]
         return (max(vals) if vals else 24.5) + self.person_offset
+
+    # ---------- weather-driven equilibrium (verified Model D; shadow-gated) ----------
+    @staticmethod
+    def _clearsky_wm(hour, sunrise, sunset, peak):
+        """Clear-sky half-sine irradiance (W/m2) at local `hour` (float hour-of-day), 0
+        outside the [sunrise, sunset] daylight window. Pure: sunrise/sunset are float
+        local hours-of-day; peak is the clear-sky amplitude (wm_clearsky_peak)."""
+        if sunset <= sunrise or hour <= sunrise or hour >= sunset:
+            return 0.0
+        return peak * max(0.0, math.sin(math.pi * (hour - sunrise) / (sunset - sunrise)))
+
+    def _track_kitchen_max(self, now, kitchen):
+        """Running daily max of the kitchen temperature with a local-midnight rollover: on
+        the first tick of a new calendar day, the peak accumulated under the previous date
+        becomes prev_kitchen_max (Model D's thermal-mass memory) and today's max resets.
+        Only a peak from *exactly yesterday* is promoted; a stored date older than yesterday
+        (a multi-day downtime gap) drops the memory to None instead of promoting a stale peak,
+        letting _seed_kitchen_max rebuild it from history. Persisted so it survives
+        reloads/HA restarts. Called every eval tick."""
+        today = now.strftime("%Y-%m-%d")
+        if self._kitchen_max_date != today:
+            yesterday = (now.date() - timedelta(days=1)).strftime("%Y-%m-%d")
+            if self._kitchen_max_date == yesterday:
+                # Normal nightly rollover: yesterday's accumulated peak becomes the memory.
+                if self._kitchen_max_today is not None:
+                    self._prev_kitchen_max = self._kitchen_max_today
+            else:
+                # Multi-day gap (e.g. downtime): the stored peak is older than yesterday, so
+                # it can't stand in for the previous day's memory. Drop it to None so
+                # _seed_kitchen_max rebuilds from history (=> legacy fallback until then)
+                # rather than biasing the model with a stale peak.
+                self._prev_kitchen_max = None
+            self._kitchen_max_date = today
+            self._kitchen_max_today = kitchen if kitchen is not None else None
+            self._save_state()
+            return
+        if kitchen is None:
+            return
+        if self._kitchen_max_today is None or kitchen > self._kitchen_max_today:
+            self._kitchen_max_today = kitchen
+            self._save_state()
+
+    async def _seed_kitchen_max(self, kwargs):
+        """Cold-start seed: derive prev_day_kitchen_max and today's running max from ~48h of
+        kitchen-temperature history, so the weather model has its memory before the first
+        real rollover. Best-effort -- leaves values None (=> legacy fallback) on any failure,
+        and never clobbers a prev already restored from the state file."""
+        try:
+            now = (await self.get_now()).replace(tzinfo=None)
+            tz = (await self.get_now()).tzinfo
+            start = datetime(now.year, now.month, now.day) - timedelta(days=1)
+            hist = await self.get_history(entity_id=self.kitchen_sensor,
+                                          start_time=start, end_time=now)
+            series = hist[0] if hist and isinstance(hist, list) else []
+            today, yday = now.date(), (now.date() - timedelta(days=1))
+            today_max = self._kitchen_max_today
+            yday_max = None
+            for item in series:
+                v = item.get("state")
+                ts = item.get("last_changed") or item.get("last_updated")
+                if ts is None or v in (None, "unknown", "unavailable", ""):
+                    continue
+                try:
+                    t = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                    t = t.astimezone(tz).replace(tzinfo=None) if t.tzinfo else t
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    continue
+                d = t.date()
+                if d == today:
+                    today_max = fv if today_max is None else max(today_max, fv)
+                elif d == yday:
+                    yday_max = fv if yday_max is None else max(yday_max, fv)
+            changed = False
+            if yday_max is not None and self._prev_kitchen_max is None:
+                self._prev_kitchen_max = round(yday_max, 2)
+                changed = True
+            if today_max is not None:
+                self._kitchen_max_today = round(today_max, 2)
+                self._kitchen_max_date = now.strftime("%Y-%m-%d")
+                changed = True
+            if changed:
+                self._save_state()
+            self.log(f"weather-model seed: prev_kitchen_max={self._prev_kitchen_max}, "
+                     f"kitchen_max_today={self._kitchen_max_today}", level="INFO")
+        except Exception as e:
+            self.log(f"weather-model kitchen-max seed failed ({e})", level="WARNING")
+
+    async def _history_time_mean(self, entity, start, end):
+        """Time-weighted mean of a numeric sensor between start and end (naive local).
+        Returns None on empty/failed history."""
+        try:
+            hist = await self.get_history(entity_id=entity, start_time=start, end_time=end)
+        except Exception as e:
+            self.log(f"weather-model history fetch failed for {entity} ({e})", level="WARNING")
+            return None
+        series = hist[0] if hist and isinstance(hist, list) else []
+        tz = (await self.get_now()).tzinfo
+        points = []
+        for item in series:
+            try:
+                ts = item.get("last_changed") or item.get("last_updated")
+                v = item.get("state")
+                if ts is None or v in (None, "unknown", "unavailable", ""):
+                    continue
+                t = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                t = t.astimezone(tz).replace(tzinfo=None) if t.tzinfo else t
+                points.append((t, float(v)))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        if not points:
+            return None
+        points.sort(key=lambda p: p[0])
+        acc, total_w = 0.0, 0.0
+        for i, (t, v) in enumerate(points):
+            seg_start = max(t, start)
+            seg_end = end if i + 1 >= len(points) else min(points[i + 1][0], end)
+            w = (seg_end - seg_start).total_seconds()
+            if w <= 0:
+                continue
+            acc += v * w
+            total_w += w
+        if total_w <= 0:   # all points bunched at/after `end` -> simple mean
+            return sum(v for _, v in points) / len(points)
+        return acc / total_w
+
+    async def _history_max(self, entity, start, end):
+        """Max of a numeric sensor's states between start and end. None on empty/failed."""
+        try:
+            hist = await self.get_history(entity_id=entity, start_time=start, end_time=end)
+        except Exception:
+            return None
+        series = hist[0] if hist and isinstance(hist, list) else []
+        vals = []
+        for item in series:
+            v = item.get("state")
+            if v in (None, "unknown", "unavailable", ""):
+                continue
+            try:
+                vals.append(float(v))
+            except (TypeError, ValueError):
+                continue
+        return max(vals) if vals else None
+
+    async def _sun_window(self, now):
+        """Local (sunrise, sunset) as float hours-of-day from sun.sun next_rising/
+        next_setting. Only the time-of-day matters for the clear-sky window, so the events
+        being tomorrow's is fine. Returns (None, None) on any failure."""
+        try:
+            tz = (await self.get_now()).tzinfo
+            rise = await self._attr(self.sun_entity, "next_rising", None)
+            sett = await self._attr(self.sun_entity, "next_setting", None)
+            if rise is None or sett is None:
+                return None, None
+            rd = datetime.fromisoformat(str(rise).replace("Z", "+00:00")).astimezone(tz)
+            sd = datetime.fromisoformat(str(sett).replace("Z", "+00:00")).astimezone(tz)
+            return (rd.hour + rd.minute / 60.0, sd.hour + sd.minute / 60.0)
+        except Exception:
+            return None, None
+
+    async def _get_forecast(self, now):
+        """Hourly forecast as a list of {'dt': local-naive datetime, 'temp': float,
+        'cloud': fraction|None}, cached ~30 min. Returns None if the service call fails or
+        yields nothing (caller degrades to legacy / full clear-sky). Never raises, never
+        stalls the eval loop (bounded wait_for)."""
+        if (self._fc_cache is not None and self._fc_cache_at is not None
+                and (now - self._fc_cache_at).total_seconds() < 1800):
+            return self._fc_cache
+        try:
+            resp = await asyncio.wait_for(
+                self.call_service("weather/get_forecasts",
+                                  entity_id=self.weather_forecast_entity,
+                                  type="hourly", return_response=True),
+                timeout=12)
+        except Exception as e:
+            self.log(f"weather-model forecast fetch failed ({e})", level="WARNING")
+            return None
+        node = resp
+        for key in ("result", "response", self.weather_forecast_entity, "forecast"):
+            if isinstance(node, dict) and key in node:
+                node = node[key]
+        if not isinstance(node, list):   # dig for any forecast list in the envelope
+            def find(n):
+                if isinstance(n, list) and n and isinstance(n[0], dict) and "temperature" in n[0]:
+                    return n
+                if isinstance(n, dict):
+                    for v in n.values():
+                        r = find(v)
+                        if r is not None:
+                            return r
+                return None
+            node = find(resp) or []
+        tz = (await self.get_now()).tzinfo
+        out = []
+        for item in node:
+            try:
+                dt = datetime.fromisoformat(str(item["datetime"]).replace("Z", "+00:00"))
+                ldt = dt.astimezone(tz).replace(tzinfo=None)
+                temp = float(item["temperature"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            cloud = item.get("cloud_coverage")
+            try:
+                cloud = float(cloud) / 100.0 if cloud is not None else None
+            except (TypeError, ValueError):
+                cloud = None
+            out.append({"dt": ldt, "temp": temp, "cloud": cloud})
+        if not out:
+            return None
+        self._fc_cache, self._fc_cache_at = out, now
+        return out
+
+    async def _solar_mean_today(self, now):
+        """24h daily-mean solar irradiance (W/m2), assembled measured-so-far + forecast
+        remainder: measured time-weighted mean from local midnight to now, plus a clear-sky
+        half-sine * cloud attenuation over each remaining daylight hour (full clear-sky when
+        the cloud forecast is missing = conservative/warm). None on missing solar sensor or
+        failed history."""
+        st = await self._state(self.solar_sensor)
+        if st in (None, "unknown", "unavailable"):
+            return None
+        midnight = datetime(now.year, now.month, now.day)
+        elapsed_h = max(0.0, (now - midnight).total_seconds() / 3600.0)
+        measured_mean = await self._history_time_mean(self.solar_sensor, midnight, now)
+        if measured_mean is None:
+            return None
+        sunrise, sunset = await self._sun_window(now)
+        if sunrise is None or sunset is None:
+            return None
+        fc = await self._get_forecast(now)
+        cloud_by_hour = {}
+        if fc:
+            for row in fc:
+                cloud_by_hour[(row["dt"].year, row["dt"].month,
+                               row["dt"].day, row["dt"].hour)] = row["cloud"]
+        remaining = 0.0
+        for h in range(now.hour + 1, 24):
+            cs = self._clearsky_wm(h + 0.5, sunrise, sunset, self.wm_clearsky_peak)
+            if cs <= 0.0:
+                continue
+            cf = cloud_by_hour.get((now.year, now.month, now.day, h))
+            atten = (1.0 - self.wm_cloud_atten * cf) if cf is not None else 1.0
+            remaining += cs * max(0.0, atten)
+        return (measured_mean * elapsed_h + remaining) / 24.0
+
+    async def _outdoor_max_today(self, now):
+        """Today's outdoor peak: max(measured max-so-far via history, current reading, and
+        forecast temps over the remaining hours today). None only if no source yields a
+        value (=> caller degrades to legacy)."""
+        vals = []
+        midnight = datetime(now.year, now.month, now.day)
+        measured_max = await self._history_max(self.outdoor_sensor, midnight, now)
+        if measured_max is not None:
+            vals.append(measured_max)
+        cur = await self._num(self.outdoor_sensor, None)
+        if cur is not None:
+            vals.append(cur)
+        fc = await self._get_forecast(now)
+        if fc:
+            for row in fc:
+                if row["dt"].date() == now.date() and row["dt"] >= now:
+                    vals.append(row["temp"])
+        return max(vals) if vals else None
+
+    async def _weather_equilibrium(self, now, kitchen, mid, floor, e_legacy):
+        """Verified Model D equilibrium from weather (solar + outdoor peak + one day of
+        thermal-mass memory). Returns (E, dbg). Degrades to e_legacy -- EXACTLY current
+        production behaviour -- on the master kill-switch, unseeded memory, the hot-day
+        forecast guard, any missing input, or any exception. Applies the one-sided safety
+        floor E = max(E_weather, e_legacy - wm_nowcast_relief) so a broken model/forecast
+        can never drive E materially colder than the live apartment reading implies. dbg is
+        ALWAYS returned (equilibrium_weather None when it fell back) for shadow publishing.
+        This method never gates on wm_shadow -- it always computes; the shadow decision (use
+        E vs keep legacy driving) lives in _evaluate_locked."""
+        dbg = {
+            "equilibrium_weather": None,
+            "equilibrium_legacy": round(e_legacy, 2),
+            "solar_mean_est": None,
+            "outdoor_max_est": None,
+            "kitchen_max_pred": None,
+            "prev_kitchen_max": (round(self._prev_kitchen_max, 2)
+                                 if self._prev_kitchen_max is not None else None),
+        }
+        if not self.weather_model_enabled:
+            return e_legacy, dbg
+        try:
+            if self._prev_kitchen_max is None:
+                return e_legacy, dbg   # memory not seeded yet -> current behaviour
+            fc = await self._get_forecast(now)
+            # Hot-day guard: no forecast AND today's peak hasn't happened yet -> measured-
+            # so-far under-states the coming load and there's nothing to fill the gap, so
+            # fall back rather than risk the cardinal under-prediction (a too-warm room).
+            if fc is None and now.hour < self.wm_peak_hour:
+                return e_legacy, dbg
+            solar_mean = await self._solar_mean_today(now)
+            if solar_mean is None:
+                return e_legacy, dbg
+            outdoor_max = await self._outdoor_max_today(now)
+            if outdoor_max is None:
+                return e_legacy, dbg
+            e_apartment = (self.wm_b0
+                           + self.wm_b_solar * solar_mean
+                           + self.wm_b_vent * max(0.0, outdoor_max - self.wm_vent_knee)
+                           + self.wm_b_prev * self._prev_kitchen_max)
+            e_weather = e_apartment + self.person_offset + self.wm_safety_margin
+            E = max(e_weather, e_legacy - self.wm_nowcast_relief)
+            dbg["equilibrium_weather"] = round(e_weather, 2)
+            dbg["solar_mean_est"] = round(solar_mean, 1)
+            dbg["outdoor_max_est"] = round(outdoor_max, 1)
+            dbg["kitchen_max_pred"] = round(e_apartment, 2)
+            return round(E, 2), dbg
+        except Exception as e:
+            self.log(f"weather-model equilibrium failed ({e}) -- using legacy", level="WARNING")
+            return e_legacy, dbg
 
     def _calc_target(self, E, ceiling):
         """Floor target so the sleeping zone stays <= ceiling for the window. The mid wall sits
@@ -638,6 +1000,7 @@ class SmartCooling(hass.Hass):
         ceil_s = await self._num(self.ceiling_sensor, None)
         ac_s = await self._num(self.ac_sensor, None)
         kitchen = await self._num(self.kitchen_sensor, None)
+        self._track_kitchen_max(now, kitchen)   # running daily max + midnight rollover
 
         ceiling_base = await self._num(self.night_ceiling_entity, self.default_ceiling)
         # Comfort layer may lower the ceiling on humid/two-sleeper nights. Bounded:
@@ -662,7 +1025,13 @@ class SmartCooling(hass.Hass):
         window_open = self._window_open(await self._state(self.vent_window))
 
         zone = round((floor + mid) / 2.0, 1)            # the floor-to-mid sleeping zone
-        E = self._equilibrium(kitchen, mid, floor)
+        # Legacy proxy stays the fallback + the relief-floor anchor; the weather model is
+        # computed EVERY tick but only DRIVES actuation once it's enabled and out of shadow.
+        # While wm_shadow is true, E == e_legacy exactly (zero actuation change) and the
+        # weather value rides along on the status entity for predicted-vs-actual validation.
+        e_legacy = self._equilibrium(kitchen, mid, floor)
+        e_active, wm_dbg = await self._weather_equilibrium(now, kitchen, mid, floor, e_legacy)
+        E = e_active if (self.weather_model_enabled and not self.wm_shadow) else e_legacy
         target = self._calc_target(E, ceiling)
         deficit = floor - target
         floor_limited = target <= self.min_temp + 0.05  # hot night: cooling as deep as the unit allows
@@ -690,7 +1059,7 @@ class SmartCooling(hass.Hass):
                 "AC removed -- sealing the bedroom for the night.",
                 self._attrs(floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
                             ceiling, price_now, window_open, 0, None, 0.0, floor_limited,
-                            ceiling_base),
+                            ceiling_base, wm_dbg=wm_dbg),
             )
             try:
                 await self.call_service("input_boolean/turn_off", entity_id=self.ac_removed_entity)
@@ -780,7 +1149,7 @@ class SmartCooling(hass.Hass):
         self._mark_eval(now, want)
         attrs = self._attrs(floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
                             ceiling, price_now, window_open, run_min, next_start, est_cost, floor_limited,
-                            ceiling_base, reach_target=reach_target)
+                            ceiling_base, reach_target=reach_target, wm_dbg=wm_dbg)
 
         if reason != self._last_reason:
             self.log(f"PLAN {reason}", level="INFO")
@@ -803,10 +1172,10 @@ class SmartCooling(hass.Hass):
 
     def _attrs(self, floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
                ceiling, price_now, window_open, run_min, next_start, est_cost, floor_limited,
-               ceiling_base, reach_target=None):
+               ceiling_base, reach_target=None, wm_dbg=None):
         def r1(v):
             return round(v, 1) if v is not None else None
-        return {
+        out = {
             "floor": r1(floor), "mid_wall": r1(mid), "sleeping_zone": zone,
             "ceiling_delivery": r1(ceil_s), "ac_output": r1(ac_s),
             "bathroom": r1(bath), "kitchen": r1(kitchen),
@@ -824,6 +1193,14 @@ class SmartCooling(hass.Hass):
             "last_burp": self._last_burp.strftime("%H:%M") if self._last_burp else None,
             "dry_min_tonight": round(self._dry_min),
         }
+        # Weather-model shadow attributes (equilibrium_weather/legacy, solar/outdoor/kitchen
+        # estimates) for predicted-vs-actual comparison on the status entity. wm_shadow is
+        # published as a STRING to survive AppDaemon's False/0/None attribute-drop (see the
+        # _publish comment / window_open pattern) -- a raw False would vanish from the entity.
+        if wm_dbg:
+            out.update(wm_dbg)
+        out["wm_shadow"] = "true" if self.wm_shadow else "false"
+        return out
 
     # ---------- stall-breaker ----------
     def _should_burp(self, hvac_action, cur_mode, deficit, now):
