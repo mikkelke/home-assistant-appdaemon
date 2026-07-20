@@ -34,14 +34,35 @@ WakeupBedroom:
     bedroom: cover.bedroom_blind
     bathroom: cover.bathroom_blind
   closed_is_100: true
-  # A cover this "closed" (>= 95 normal, <= 5 inverted) gets nudged open at wake.
+  # A cover this "closed" gets nudged open at wake (>= 95 normal, <= 5 inverted). A "closed"
+  # blind can report 98-99 (battery/motor slack). Matches bedroom_blind_control's threshold.
   closed_threshold: 95
   bedroom_cover_target: 38
   bathroom_cover_target: 40
-  # Heat-wave override (user, 2026-07-15): input_boolean.heat_wave_mode ON -> use this
-  # instead of bedroom_cover_target at wake time (less sun/heat let in). OFF = normal 38.
+  # Heat-wave override (user, 2026-07-15): input_boolean.heat_wave_mode is now a manual
+  # FORCE-ON over the automatic heat-block decision below (sun on the window / hot forecast /
+  # already warm outside) - flip it on to force bedroom_cover_target_heat_wave regardless of
+  # those signals. Auto-cleared after use (heat_wave_manual_auto_clear) so it never lingers.
   heat_wave_entity: input_boolean.heat_wave_mode
-  bedroom_cover_target_heat_wave: 65
+  bedroom_cover_target_heat_wave: 72
+  # Automatic heat-block (see wakeup_bedroom.py _decide_bedroom_wake_target): at wake time,
+  # close the bedroom blind to bedroom_cover_target_heat_wave instead of bedroom_cover_target
+  # when direct morning sun is hitting the window, today's forecast high is hot, or it's
+  # already warm outside right now.
+  heat_auto_enable: true
+  heat_wave_manual_auto_clear: true
+  sun_entity: sun.sun
+  solar_radiation_entity: sensor.gw2000a_solar_radiation
+  window_azimuth: 70
+  az_tolerance: 55
+  min_elevation: 3
+  radiation_threshold: 250
+  outdoor_temp_entity: sensor.gw2000a_outdoor_temperature
+  live_outdoor_hot_c: 22.0
+  weather_entity: weather.forecast_home
+  forecast_high_threshold_c: 25.0
+  forecast_refresh_min: 30
+  forecast_max_age_min: 180
   # Dynamic wait after blind reaches target before deciding wake bed-light ramp.
   # Uses outdoor lux clue so dark mornings stay responsive while bright mornings avoid flash-on.
   outdoor_lux_entity: sensor.gw2000a_solar_lux
@@ -69,5 +90,11 @@ WakeupBedroom:
   ramp_step_pct: 6
   ramp_interval_sec: 60
   ramp_max_pct: 90
+
+  # Yield the wake light ramp to ceiling logic once bedroom_lights' bed-light session ends
+  # (input_boolean.bedroom_bed_session, driven by the reliable local FP300 mmWave presence) -
+  # prevents the bed lights ramping alongside the room's normal lighting and ending up with
+  # both on. See wakeup_bedroom.py _bed_session_active / _on_bed_session_change.
+  bed_session_entity: input_boolean.bedroom_bed_session
 
 

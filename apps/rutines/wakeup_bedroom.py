@@ -1,8 +1,10 @@
 import appdaemon.plugins.hass.hassapi as hass # type: ignore
+import asyncio
 from datetime import time, timedelta
 
 import cover_util
 import room_state_darkness
+import solar_window
 
 REQUIRED_TOP_LEVEL = [
     "alarm_time_entity", "alarm_enabled_entity",
@@ -60,7 +62,9 @@ class WakeupRoutine(hass.Hass):
         self.volume_interval_sec = int(A["volume_interval_sec"]) 
 
         self.closed_is_100 = bool(A["closed_is_100"])
-        # "Closed enough to nudge open": shared threshold (99% low-battery park counts).
+        # A "closed" blind can report 98-99 instead of a clean 100 (battery/motor slack),
+        # so the morning open must treat near-closed as closed - otherwise the wake nudge
+        # never fires and the room stays dark (user-reported 2026-07-20). Read via cover_util.
         self.closed_threshold = int(A.get("closed_threshold", 95))
         self.bedroom_cover = A["covers"]["bedroom"]
         self.bathroom_cover = A["covers"]["bathroom"]
@@ -71,8 +75,28 @@ class WakeupRoutine(hass.Hass):
         # (user, 2026-07-15) rather than auto-detected - simple, predictable, matches the
         # same manual-toggle pattern as the AC. Off by default = today's normal behavior.
         self.heat_wave_entity = A.get("heat_wave_entity", "input_boolean.heat_wave_mode")
-        self.bedroom_cover_target_heat_wave = int(A.get("bedroom_cover_target_heat_wave", 65))
+        self.bedroom_cover_target_heat_wave = int(A.get("bedroom_cover_target_heat_wave", 72))
         self._current_bedroom_wake_target = self.bedroom_cover_target
+        # Automatic heat-block: closes the bedroom blind to bedroom_cover_target_heat_wave
+        # instead of bedroom_cover_target at wake time when direct sun is on the window, the
+        # forecast high is hot, or it's already warm outside. heat_wave_entity above is now a
+        # manual FORCE-ON over this decision (see _decide_bedroom_wake_target).
+        self.heat_auto_enable = bool(A.get("heat_auto_enable", True))
+        self.heat_wave_manual_auto_clear = bool(A.get("heat_wave_manual_auto_clear", True))
+        self.sun_entity = A.get("sun_entity", "sun.sun")
+        self.solar_radiation_entity = A.get("solar_radiation_entity", "sensor.gw2000a_solar_radiation")
+        self.window_azimuth = float(A.get("window_azimuth", 70))
+        self.az_tolerance = float(A.get("az_tolerance", 55))
+        self.min_elevation = float(A.get("min_elevation", 3))
+        self.radiation_threshold = float(A.get("radiation_threshold", 250))
+        self.outdoor_temp_entity = A.get("outdoor_temp_entity", "sensor.gw2000a_outdoor_temperature")
+        self.live_outdoor_hot_c = float(A.get("live_outdoor_hot_c", 22.0))
+        self.weather_entity = A.get("weather_entity", "weather.forecast_home")
+        self.forecast_high_threshold_c = float(A.get("forecast_high_threshold_c", 25.0))
+        self.forecast_refresh_min = int(A.get("forecast_refresh_min", 30))
+        self.forecast_max_age_min = int(A.get("forecast_max_age_min", 180))
+        self._forecast_high_c = None
+        self._forecast_high_at = None
 
         self.bedroom_state_entity = A["bedroom_state_entity"]
         self.light_entity = A["light_entity"]
@@ -90,6 +114,12 @@ class WakeupRoutine(hass.Hass):
         self.ramp_step_pct = int(A["ramp_step_pct"])
         self.ramp_interval_sec = int(A["ramp_interval_sec"])
         self.ramp_max_pct = int(A["ramp_max_pct"])
+        # Bed-light session latch owned by bedroom_lights (input_boolean.bedroom_bed_session,
+        # driven by the reliable local FP300 mmWave presence) - the wake ramp yields to
+        # ceiling logic once the session ends, instead of tracking in-bed sensors itself.
+        # See _bed_session_active / _on_bed_session_change.
+        self.bed_session_entity = A.get("bed_session_entity", "input_boolean.bedroom_bed_session")
+        self._session_listener = None
         # The bedroom lights' manual-override toggle pauses ALL automatic light actions -
         # including this wake ramp (user hit exactly this 2026-07-16: override on + lights
         # manually off, and a stale ramp turned them back on). Blinds/media still run; the
@@ -154,6 +184,12 @@ class WakeupRoutine(hass.Hass):
         self.heartbeat = self.run_every(
             self._heartbeat_check, self.datetime() + timedelta(seconds=70), 60
         )
+        # Periodic forecast-high refresh feeding the heat-block decision (see
+        # _decide_bedroom_wake_target); cached with a max age so a stale forecast never
+        # silently drives the wake-time blind target.
+        self.forecast_timer = self.run_every(
+            lambda kw: self.create_task(self._refresh_forecast_high()),
+            self.datetime() + timedelta(seconds=20), self.forecast_refresh_min * 60)
 
     # ---------- scheduling ----------
     def _schedule_daily_alarm(self):
@@ -243,6 +279,59 @@ class WakeupRoutine(hass.Hass):
         except Exception as e:
             self.log(f"[wake] Heartbeat check error: {e}", level="WARNING", log=self.user_log)
 
+    # ---------- heat-block wake target ----------
+    def _num(self, entity, default):
+        try:
+            v = self.get_state(entity)
+            if v in (None, "", "unknown", "unavailable"): return default
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    def _num_attr(self, entity, attr, default):
+        try:
+            v = self.get_state(entity, attribute=attr)
+            if v in (None, "", "unknown", "unavailable"): return default
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    async def _refresh_forecast_high(self):
+        try:
+            resp = await asyncio.wait_for(
+                self.call_service("weather/get_forecasts", entity_id=self.weather_entity,
+                                  type="daily", return_response=True), timeout=12)
+            hi = solar_window.daily_high_from_forecast(resp, self.datetime().date().isoformat())
+            if hi is not None:
+                self._forecast_high_c = float(hi)
+                self._forecast_high_at = self.datetime()
+        except Exception as e:
+            self.log(f"[wake] forecast refresh failed: {e}", level="WARNING", log=self.user_log)
+
+    def _decide_bedroom_wake_target(self):
+        if self.get_state(self.heat_wave_entity) == "on":
+            if self.heat_wave_manual_auto_clear:
+                try: self.turn_off(self.heat_wave_entity)
+                except Exception: pass
+            return self.bedroom_cover_target_heat_wave, "manual force"
+        if not self.heat_auto_enable:
+            return self.bedroom_cover_target, "auto disabled"
+        az = self._num_attr(self.sun_entity, "azimuth", None)
+        elev = self._num_attr(self.sun_entity, "elevation", None)
+        rad = self._num(self.solar_radiation_entity, None)
+        if None not in (az, elev, rad) and solar_window.beam_heat(
+                az, elev, rad, self.window_azimuth, self.az_tolerance,
+                self.min_elevation, self.radiation_threshold):
+            return self.bedroom_cover_target_heat_wave, f"sun on window (rad {rad:.0f})"
+        fh, at = self._forecast_high_c, self._forecast_high_at
+        fresh = at is not None and (self.datetime() - at).total_seconds() <= self.forecast_max_age_min * 60
+        if fh is not None and fresh and fh >= self.forecast_high_threshold_c:
+            return self.bedroom_cover_target_heat_wave, f"forecast high {fh:.1f}C"
+        t = self._num(self.outdoor_temp_entity, None)
+        if t is not None and t >= self.live_outdoor_hot_c:
+            return self.bedroom_cover_target_heat_wave, f"warm now {t:.1f}C"
+        return self.bedroom_cover_target, "cool / no sun"
+
     # ---------- main alarm ----------
     def _alarm_fire(self, _):
         # Debug: confirm callback invocation regardless of gating
@@ -299,14 +388,12 @@ class WakeupRoutine(hass.Hass):
         self._attach_cancel_listeners()
         self._group_speakers()
         self._start_media_and_volume_ramp()
-        heat_wave = self.get_state(self.heat_wave_entity) == "on"
-        self._current_bedroom_wake_target = (
-            self.bedroom_cover_target_heat_wave if heat_wave else self.bedroom_cover_target
-        )
-        if heat_wave:
-            self.log(f"[wake] Heat wave mode: bedroom blind target {self._current_bedroom_wake_target} "
-                     f"instead of {self.bedroom_cover_target}", log=self.user_log)
-        self._nudge_cover_if_closed(self.bedroom_cover, self._current_bedroom_wake_target)
+        target, reason = self._decide_bedroom_wake_target()
+        self._current_bedroom_wake_target = target
+        if target != self.bedroom_cover_target:
+            self.log(f"[wake] Heat-block: bedroom blind target {target} instead of "
+                     f"{self.bedroom_cover_target} ({reason})", log=self.user_log)
+        self._nudge_cover_if_closed(self.bedroom_cover, target)
         self._nudge_cover_if_closed(self.bathroom_cover, self.bathroom_cover_target)
 
         pos = self._cover_position(self.bedroom_cover)
@@ -694,6 +781,9 @@ class WakeupRoutine(hass.Hass):
         if not self._room_dark_for_wake_light():
             self.log("[wake] Room is bright enough; skipping ramp.", log=self.user_log)
             return
+        if not self._bed_session_active():
+            self.log("[wake] Bed session not active; skipping light ramp.", log=self.user_log)
+            return
 
         # Pause Adaptive Lighting's brightness adaptation during the ramp
         self.turn_off(self.adaptive_brightness_switch)
@@ -724,6 +814,10 @@ class WakeupRoutine(hass.Hass):
         if not self.ramp_active:
             return
 
+        if not self._bed_session_active():
+            self._finish_ramp("bed session ended")
+            return
+
         target = self._read_adaptive_target_pct()
         if target is None:
             target = self.ramp_max_pct
@@ -740,6 +834,14 @@ class WakeupRoutine(hass.Hass):
             transition=int(self.ramp_interval_sec),
         )
         self._schedule_next_ramp_tick()
+
+    # ---------- bed-light session hand-off (ramp yields once the session ends) ----------
+    def _bed_session_active(self):
+        return self.get_state(self.bed_session_entity) != "off"  # None/unknown -> treat active
+
+    def _on_bed_session_change(self, entity, attr, old, new, kwargs):
+        if self.ramp_active and new == "off":
+            self._finish_ramp("bed session ended - handing bedroom to ceiling logic")
 
     def _turn_off_sleep_modes_if_on(self):
         try:
@@ -784,6 +886,11 @@ class WakeupRoutine(hass.Hass):
                 self.bedroom_state_entity,
                 attribute="pending_target",
             )
+        )
+        # Bed-light session listener has its own slot (not cancel_listeners) since it must be
+        # torn down by _stop_light_ramp specifically, same lifetime as the ramp.
+        self._session_listener = self.listen_state(
+            self._on_bed_session_change, self.bed_session_entity
         )
 
     def _on_alarm_toggle(self, entity, attr, old, new, kwargs):
@@ -835,6 +942,10 @@ class WakeupRoutine(hass.Hass):
         self.ramp_active = False
         # Do not cancel expired timer handles; just clear
         self.ramp_timer = None
+        if self._session_listener is not None:
+            try: self.cancel_listen_state(self._session_listener)
+            except Exception: pass
+            self._session_listener = None
         # Re-enable Adaptive Lighting brightness adaptation
         try:
             self.log("[wake] Restoring Adaptive Lighting brightness adaptation", log=self.user_log)
