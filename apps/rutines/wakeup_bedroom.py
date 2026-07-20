@@ -301,10 +301,14 @@ class WakeupRoutine(hass.Hass):
             resp = await asyncio.wait_for(
                 self.call_service("weather/get_forecasts", entity_id=self.weather_entity,
                                   type="daily", return_response=True), timeout=12)
-            hi = solar_window.daily_high_from_forecast(resp, self.datetime().date().isoformat())
+            # In an async AppDaemon method the sync-wrapped ADAPI calls return a Task,
+            # so datetime() must be awaited; it yields a naive local datetime that stays
+            # consistent with the naive self.datetime() used by the freshness check below.
+            now = await self.datetime()
+            hi = solar_window.daily_high_from_forecast(resp, now.date().isoformat())
             if hi is not None:
                 self._forecast_high_c = float(hi)
-                self._forecast_high_at = self.datetime()
+                self._forecast_high_at = now
         except Exception as e:
             self.log(f"[wake] forecast refresh failed: {e}", level="WARNING", log=self.user_log)
 

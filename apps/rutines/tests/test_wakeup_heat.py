@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -206,6 +207,88 @@ class NudgeCoverIfClosed(unittest.TestCase):
         app.get_state = self._get_state(2)  # <= 100-95 -> closed on a 0=closed scale
         app._nudge_cover_if_closed("cover.bedroom_blind", 38)
         app._set_cover_position.assert_called_once()
+
+
+class RefreshForecastHigh(unittest.TestCase):
+    """`_refresh_forecast_high` is an ``async`` AppDaemon method, so the sync-wrapped
+    ADAPI calls inside it (call_service, datetime) return awaitables that MUST be
+    awaited. Regression for the "'_asyncio.Task' object has no attribute 'date'"
+    failure that made every refresh log a WARNING and left _forecast_high_c stuck at
+    None -> the heat-block wake target silently fell back to the normal target."""
+
+    def _app(self):
+        app = wb.WakeupRoutine.__new__(wb.WakeupRoutine)
+        app.weather_entity = "weather.forecast_home"
+        app.user_log = "wakeup_bedroom.log"
+        app._forecast_high_c = None
+        app._forecast_high_at = None
+        app.log = MagicMock()
+
+        # datetime() defaults to aware=False -> naive local time (matches the naive
+        # self.datetime() used by _decide_bedroom_wake_target's freshness check).
+        async def fake_datetime(aware=False):
+            return NOW.replace(tzinfo=timezone.utc) if aware else NOW
+        app.datetime = fake_datetime
+
+        # get_now() defaults to aware=True. Provided so that if the code ever regresses
+        # to `await self.get_now()`, _forecast_high_at becomes tz-aware and the naive
+        # guard below trips instead of silently reintroducing an aware/naive mismatch.
+        async def fake_get_now(aware=True):
+            return NOW.replace(tzinfo=timezone.utc) if aware else NOW
+        app.get_now = fake_get_now
+
+        async def fake_call_service(service, **kw):
+            return {app.weather_entity: {"forecast": [
+                {"datetime": "2026-07-20T06:00:00+00:00", "temperature": 27.0},
+                {"datetime": "2026-07-20T15:00:00+00:00", "temperature": 24.0},
+                {"datetime": "2026-07-21T06:00:00+00:00", "temperature": 19.0},
+            ]}}
+        app.call_service = fake_call_service
+        return app
+
+    def test_sets_forecast_high_and_timestamp_without_warning(self):
+        app = self._app()
+        asyncio.run(app._refresh_forecast_high())
+        self.assertEqual(app._forecast_high_c, 27.0)   # today's max, tomorrow excluded
+        self.assertEqual(app._forecast_high_at, NOW)
+        warnings = [c for c in app.log.call_args_list if c.kwargs.get("level") == "WARNING"]
+        self.assertEqual(warnings, [], f"unexpected WARNING(s): {warnings}")
+
+    def test_timestamp_is_naive_for_freshness_subtraction(self):
+        # _decide_bedroom_wake_target does (self.datetime() - _forecast_high_at) with a
+        # naive self.datetime(); an aware _forecast_high_at would raise there.
+        app = self._app()
+        asyncio.run(app._refresh_forecast_high())
+        self.assertIsNotNone(app._forecast_high_at)
+        self.assertIsNone(app._forecast_high_at.tzinfo)
+
+    def test_refresh_feeds_decision_and_forces_heat_target(self):
+        # End-to-end: a fresh refresh must make _decide_bedroom_wake_target pick the
+        # heat-wave target. _decide_ calls self.datetime() *synchronously*, so swap in a
+        # sync clock for that half (mirrors sync_decorator adapting per call context).
+        app = self._app()
+        asyncio.run(app._refresh_forecast_high())
+        app.datetime = lambda: NOW
+        app.bedroom_cover_target = 38
+        app.bedroom_cover_target_heat_wave = 72
+        app.heat_wave_entity = "input_boolean.heat_wave_mode"
+        app.heat_auto_enable = True
+        app.sun_entity = "sun.sun"
+        app.solar_radiation_entity = "sensor.gw2000a_solar_radiation"
+        app.window_azimuth = 70.0
+        app.az_tolerance = 55.0
+        app.min_elevation = 3.0
+        app.radiation_threshold = 250.0
+        app.outdoor_temp_entity = "sensor.gw2000a_outdoor_temperature"
+        app.live_outdoor_hot_c = 22.0
+        app.forecast_high_threshold_c = 25.0
+        app.forecast_max_age_min = 180
+        states = dict(COOL_NO_SUN)
+        states[(app.heat_wave_entity, None)] = "off"
+        app.get_state = lambda entity, **kw: states.get((entity, kw.get("attribute")))
+        target, reason = app._decide_bedroom_wake_target()
+        self.assertEqual(target, 72)
+        self.assertIn("forecast high", reason)
 
 
 if __name__ == "__main__":
