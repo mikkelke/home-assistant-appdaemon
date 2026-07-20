@@ -110,6 +110,43 @@ SmartCooling:
   rescue_deficit_min: 0.5
   rescue_home_entity: person.mikkel
 
+  # Humidity-aware ceiling, computed LOCALLY (no longer read back from sensor.bedroom_comfort
+  # -- that read, plus bedroom_comfort's old state-file rise_frac read, formed a circular
+  # dependency between the two apps). These MUST MIRROR bedroom_comfort.yaml exactly: the
+  # actuation ceiling is the same effective_ceiling() fn on the same temp/RH/persons + params,
+  # so the pre-cool target stays byte-identical. If you retune one file, retune the other.
+  comfort_temp_entity: sensor.bedroom_median_temperature
+  comfort_rh_entity: sensor.bedroom_humidity
+  comfort_persons:
+    - person.mikkel
+  comfort_anchor_c: 23.0
+  comfort_dp_rate_per_sleeper_c_per_h: 0.5
+  comfort_dp_knee_c: 12.0
+  comfort_dp_penalty_per_c: 0.15
+  comfort_second_sleeper_c: 0.5
+  comfort_max_reduction: 1.5
+
+  # Sleep-plan advisory -> sensor.sleep_plan (cheapest path to a comfortable night: open
+  # windows for free vs run the AC = kWh * cheapest spot price + a fixed noise penalty).
+  # ADVISORY ONLY -- published every tick on every branch, issues NO climate command. The
+  # dashboard/bedroom_comfort read it for the verdict; read cost_label (not est_cost_kr,
+  # which drops to nothing at 0). Projected from the weather equilibrium E, not the warm
+  # kitchen proxy, so a cool sunless day with a window open no longer false-alarms "deploy AC".
+  sleep_plan_entity: sensor.sleep_plan
+  outdoor_rh_entity: sensor.gw2000a_humidity
+  ac_noise_penalty_kr: 0.5
+  # NAME=ENTITY list (NOT a dict: a new dict-valued yaml key trips AppDaemon 4.5's config
+  # scan and forces a full restart of every app; a list value reloads only SmartCooling).
+  window_contact_entities:
+    - "bedroom=binary_sensor.bedroom_window_contact"
+    - "bathroom=binary_sensor.bathroom_window_contact"
+    - "dining 1=binary_sensor.dining_room_window_1_contact"
+    - "dining 2=binary_sensor.dining_room_window_2_contact"
+    - "dining 3=binary_sensor.dining_room_window_3_contact"
+    - "kitchen=binary_sensor.kitchen_window_contact"
+    - "living room=binary_sensor.living_room_window_contact"
+    - "kristines room=binary_sensor.kristines_room_window_contact"
+
   # SAFE ROLLOUT: runs + learns + publishes the plan, but NEVER touches the AC.
   dry_run: false   # live since 2026-07-13 (user: "the automation should take care of it"); master toggle still gates everything
 

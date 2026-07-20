@@ -14,130 +14,45 @@ Key attributes:
   ceiling_base         - fixed comfort anchor (~23 C; NOT a knob - the old
                          stepper was set as a target and poisoned the math)
   ceiling_effective    - anchor lowered when the projected morning is humid and
-                         when two people share the bed; SmartCooling consumes
-                         THIS instead of any knob
-  projected_peak       - sleeping-zone peak tonight if nobody cools
-                         (SmartCooling coast law + its learned rise_frac)
-  ac_worth / verdict   - the deploy recommendation, in plain words
+                         when two people share the bed (shared climate_model fn;
+                         SmartCooling now computes its OWN copy of this rather
+                         than reading it back here -- the old cross-app cycle)
+  projected_peak / verdict / ac_worth - a thin, window-aware read of
+                         sensor.sleep_plan (SmartCooling's cheapest-path planner);
+                         the duplicate projection + verdict that used to live here
+                         are gone (superseded by that one shared planner)
   vent_helps + vent_reason - venting only helps when outdoor air is both
                          cooler AND drier than the room
   reason / source_entities / computed_at - middle-layer convention
 
-Consumers: SmartCooling (ceiling_effective), dashboard Sleep-cooling card.
+Data flow (one direction only, cycle broken): this app READS SmartCooling's
+published rise_frac (sensor.smart_cooling_status) and sensor.sleep_plan; it no
+longer opens SmartCooling's state file, and SmartCooling no longer reads this
+sensor's ceiling_effective.
+
+Consumers: dashboard Sleep-cooling card.
 """
 
-import json
-import math
 from datetime import datetime
 
 import appdaemon.plugins.hass.hassapi as hass
 
 # ---------------------------------------------------------------- pure math
-# Module-level so apps/climate/tests can exercise them without AppDaemon.
-
-def dew_point_c(t_c, rh_pct):
-    """Magnus formula dew point. Returns None on invalid input."""
-    try:
-        t = float(t_c)
-        rh = float(rh_pct)
-    except (TypeError, ValueError):
-        return None
-    if rh <= 0 or rh > 100:
-        return None
-    a, b = 17.62, 243.12
-    gamma = math.log(rh / 100.0) + a * t / (b + t)
-    return b * gamma / (a - gamma)
-
-
-def project_morning_dp(dp_now, sleepers, hours, rate_per_sleeper_c_per_h):
-    """Dew point after `hours` of sleepers adding moisture to a sealed room."""
-    if dp_now is None:
-        return None
-    hours = max(0.0, min(10.0, float(hours)))
-    return dp_now + rate_per_sleeper_c_per_h * max(0, int(sleepers)) * hours
-
-
-def effective_ceiling(base, dp_morning, sleepers, knee_c=12.0,
-                      penalty_per_c=0.15, second_sleeper_c=0.5,
-                      max_reduction_c=1.5):
-    """Night ceiling lowered for projected humidity and a second sleeper.
-    Bounded: never more than max_reduction_c below the base."""
-    reduction = 0.0
-    if dp_morning is not None:
-        reduction += penalty_per_c * max(0.0, dp_morning - knee_c)
-    if sleepers >= 2:
-        reduction += second_sleeper_c
-    reduction = min(max_reduction_c, reduction)
-    return round(base - reduction, 1), round(reduction, 2)
-
-
-def vent_helps(t_in, dp_in, t_out, dp_out):
-    """Venting helps only when outdoor air is BOTH cooler and drier.
-    2026-07-09 lesson: 16 C / DP 9 outdoor air went unused while the room
-    moistened - but on a muggy night venting would import water."""
-    if None in (t_in, dp_in, t_out, dp_out):
-        return None, "outdoor or indoor data missing"
-    if t_out >= t_in - 0.5:
-        return False, f"outdoor {t_out:.1f}C not cooler than bedroom {t_in:.1f}C"
-    if dp_out > dp_in - 1.0:
-        return False, f"outdoor dew point {dp_out:.1f}C too humid vs indoor {dp_in:.1f}C"
-    return True, (f"outdoor {t_out:.1f}C / DP {dp_out:.1f}C is cooler and drier "
-                  f"than bedroom {t_in:.1f}C / DP {dp_in:.1f}C")
-
-
-def classify(t, dp_now, ceiling_base, ceiling_eff):
-    """Human-comfort label on ABSOLUTE anchors - deliberately not the planning
-    knob: with the knob at 20 a perfectly nice 20.8 C room read as "hot"
-    (2026-07-12). The knob steers SmartCooling; this label describes the room."""
-    del ceiling_base, ceiling_eff  # planning inputs, not comfort anchors
-    if t is None:
-        return "unknown"
-    if t >= 24.5:
-        return "hot"
-    if dp_now is not None and dp_now >= 13.5:
-        return "sticky"
-    if t >= 23.0:
-        return "warm"
-    return "comfortable"
-
-
-def project_zone_peak(floor_c, kitchen_c, mid_c, rise_frac, person_offset_c=0.5,
-                      zone_offset_c=1.0):
-    """Sealed-night sleeping-zone peak if nobody cools (SmartCooling coast law:
-    the floor mass drifts toward the equilibrium E by fraction rise_frac over
-    the night; the sleeping zone rides zone_offset above the floor)."""
-    vals = [v for v in (floor_c, kitchen_c, mid_c) if v is not None]
-    if floor_c is None or not vals:
-        return None
-    equilibrium = max(vals) + person_offset_c
-    return floor_c + (equilibrium - floor_c) * rise_frac + zone_offset_c
-
-
-def ac_worth(projected_peak, ceiling_eff, dp_morning,
-             peak_margin_c=0.2, dp_oppressive_c=17.5):
-    """Deploy verdict: the projected night breaks the (humidity-adjusted)
-    tolerance ceiling, OR the moisture alone makes the night oppressive
-    (the AC is also the dehumidifier)."""
-    reasons = []
-    if projected_peak is not None and ceiling_eff is not None and \
-            projected_peak > ceiling_eff + peak_margin_c:
-        reasons.append(f"projected {projected_peak:.1f}C exceeds the "
-                       f"{ceiling_eff:.1f}C comfort ceiling")
-    if dp_morning is not None and dp_morning >= dp_oppressive_c:
-        reasons.append(f"morning dew point {dp_morning:.1f}C is oppressive "
-                       f"(only the AC dries the room)")
-    return (len(reasons) > 0), " and ".join(reasons)
-
-
-def hours_until_morning(now, morning_hour=7):
-    """Hours from `now` to the next 07:00, capped at 10 (projection horizon)."""
-    target_day = now
-    if now.hour >= morning_hour:
-        from datetime import timedelta
-        target_day = now + timedelta(days=1)
-    target = target_day.replace(hour=morning_hour, minute=0, second=0, microsecond=0)
-    hours = (target - now).total_seconds() / 3600.0
-    return max(0.0, min(10.0, hours))
+# The comfort/vent math now lives in the shared climate_model module (single source of
+# truth, unit-testable without AppDaemon). Re-exported here so the existing test surface
+# (bc.dew_point_c / project_morning_dp / effective_ceiling / hours_until_morning / classify
+# / vent_helps) and any dashboard/consumer imports keep resolving unchanged. The night
+# projection + deploy verdict that used to live here (project_zone_peak / ac_worth) are
+# GONE -- superseded by sensor.sleep_plan, which smart_cooling publishes from the same
+# shared coast/planner math; this app now just renders that plan (window-aware).
+from climate_model import (  # noqa: F401  (re-exported for tests + consumers)
+    dew_point_c,
+    project_morning_dp,
+    effective_ceiling,
+    hours_until_morning,
+    classify,
+    vent_helps,
+)
 
 
 # ---------------------------------------------------------------- the app
@@ -156,13 +71,19 @@ class BedroomComfort(hass.Hass):
         # EFFECTIVE ceiling from here. (The old stepper was set to 20.0 as a
         # *target*, which turned the effective ceiling into nonsense - knob removed.)
         self.comfort_anchor = float(a("comfort_anchor_c", 23.0))
-        # Night projection inputs (SmartCooling coast law + its learned rise_frac)
+        # Night projection is now owned by SmartCooling's cheapest-path planner
+        # (sensor.sleep_plan); this app reads that plan instead of recomputing it. The
+        # floor/mid/kitchen entities are kept only for source_entities provenance + the
+        # existing re-eval listeners.
         self.floor_entity = a("floor_entity", "sensor.bedroom_floor_thermometer_temperature")
         self.mid_entity = a("mid_entity", "sensor.bedroom_temperature")
         self.kitchen_entity = a("kitchen_entity", "sensor.kitchen_temperature")
+        # rise_frac stays LEARNED + OWNED by SmartCooling; read it from the PUBLISHED
+        # attribute on sensor.smart_cooling_status (no longer from its state file). Now a
+        # display-only passthrough (project_zone_peak is gone), kept to preserve the surface.
         self.rise_frac_fallback = float(a("rise_frac_fallback", 0.5))
-        self.smart_cooling_state_file = a("smart_cooling_state_file",
-                                          "/conf/apps/climate/smart_cooling_state.json")
+        self.status_entity = a("status_entity", "sensor.smart_cooling_status")
+        self.sleep_plan_entity = a("sleep_plan_entity", "sensor.sleep_plan")
         self.dp_rate = float(a("dp_rate_per_sleeper_c_per_h", 0.25))
         self.knee = float(a("dp_comfort_knee_c", 12.0))
         self.penalty = float(a("dp_penalty_per_c", 0.15))
@@ -189,12 +110,13 @@ class BedroomComfort(hass.Hass):
         return max(1, home)
 
     def _rise_frac(self):
-        """SmartCooling's self-learned coast fraction; fallback until it exists."""
+        """SmartCooling's self-learned coast fraction, read from its PUBLISHED attribute on
+        sensor.smart_cooling_status (not its state file -- that read was half the old
+        cross-app cycle). Fallback until the attribute exists. Display-only passthrough now."""
         try:
-            with open(self.smart_cooling_state_file) as f:
-                v = json.load(f).get("rise_frac")
-            return float(v) if v else self.rise_frac_fallback
-        except Exception:
+            v = self.get_state(self.status_entity, attribute="rise_frac")
+            return float(v) if v not in (None, "unknown", "unavailable") else self.rise_frac_fallback
+        except (TypeError, ValueError):
             return self.rise_frac_fallback
 
     # -- handlers
@@ -223,19 +145,26 @@ class BedroomComfort(hass.Hass):
             vent_ok, vent_reason = vent_helps(t_in, dp_in, t_out, dp_out)
             state = classify(t_in, dp_in, base, ceiling_eff)
 
-            floor = self._num(self.floor_entity)
-            mid = self._num(self.mid_entity)
-            kitchen = self._num(self.kitchen_entity)
-            rise = self._rise_frac()
-            peak = project_zone_peak(floor, kitchen, mid, rise)
-            worth, worth_reason = ac_worth(peak, ceiling_eff, dp_morning)
-            if worth:
-                verdict = f"AC worth deploying - {worth_reason}"
-            elif peak is None:
-                verdict = "no projection (mass sensors unavailable)"
+            rise = self._rise_frac()   # display-only passthrough of the published attribute
+
+            # projected_peak / verdict / ac_worth are now a thin, window-aware read of
+            # SmartCooling's cheapest-path planner (sensor.sleep_plan). recommendation is one
+            # of windows|ac|hybrid|nothing; headline is the plain-words verdict; projected_peak
+            # is the coast peak the planner already computed from the weather equilibrium.
+            plan_rec = self.get_state(self.sleep_plan_entity)
+            plan_headline = self.get_state(self.sleep_plan_entity, attribute="headline")
+            plan_peak = self.get_state(self.sleep_plan_entity, attribute="projected_peak")
+            ac_worth = plan_rec in ("ac", "hybrid")
+            if plan_headline not in (None, "unknown", "unavailable"):
+                verdict = plan_headline
+            elif plan_rec in (None, "unknown", "unavailable"):
+                verdict = "sleep plan pending"
             else:
-                verdict = (f"no AC needed - projected {peak:.1f}C stays under the "
-                           f"{ceiling_eff:.1f}C comfort ceiling")
+                verdict = plan_rec
+            try:
+                peak = round(float(plan_peak), 1)
+            except (TypeError, ValueError):
+                peak = None
 
             if dp_morning is not None and reduction > 0:
                 reason = (f"projected morning dew point {dp_morning:.1f}C with "
@@ -263,7 +192,7 @@ class BedroomComfort(hass.Hass):
                 "ceiling_reduction": reduction,
                 "projected_peak": None if peak is None else round(peak, 1),
                 "rise_frac": round(rise, 2),
-                "ac_worth": worth,
+                "ac_worth": ac_worth,
                 "verdict": verdict,
                 "vent_helps": vent_ok,
                 "vent_reason": vent_reason,

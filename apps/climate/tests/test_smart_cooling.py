@@ -20,6 +20,7 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     sys.modules["appdaemon.plugins.hass.hassapi"] = hassapi
 
 import smart_cooling as sc  # noqa: E402
+import climate_model as cm  # noqa: E402
 
 
 def make_app(**overrides):
@@ -99,6 +100,41 @@ class AttrsBuild(unittest.TestCase):
     def test_ceiling_source_knob_when_unadjusted(self):
         attrs = self._call(ceiling=23.0, ceiling_base=23.0)
         self.assertEqual(attrs["ceiling_source"], "knob")
+
+
+class StatusBaseRiseFrac(unittest.TestCase):
+    """rise_frac (+ rise_samples) must ride on EVERY status publish, not only the armed
+    _attrs path. The disarmed / not-deployed / no_data branches publish with replace=True,
+    so without _status_base() they'd WIPE rise_frac from sensor.smart_cooling_status on
+    every daytime/disarmed tick -- bedroom_comfort's passthrough would then fall back to its
+    0.5 default despite a learned ~0.7."""
+
+    def test_status_base_carries_learned_rise_frac(self):
+        base = make_app(rise_frac=0.71, rise_samples=6)._status_base()
+        self.assertEqual(base["rise_frac"], 0.71)
+        self.assertEqual(base["rise_samples"], 6)
+
+    def test_status_base_matches_armed_attrs_value(self):
+        # the disarmed publishes must agree with the armed _attrs on the same number
+        app = make_app(rise_frac=0.68, rise_samples=4)
+        attrs = app._attrs(
+            floor=22.0, mid=22.5, zone=22.2, ceil_s=21.0, ac_s=17.0,
+            bath=24.0, kitchen=23.0, E=24.0, target=21.5, deficit=0.5,
+            ceiling=22.0, price_now=1.2, window_open=True, run_min=45,
+            next_start=None, est_cost=1.8, floor_limited=False, ceiling_base=23.0)
+        base = app._status_base()
+        self.assertEqual(base["rise_frac"], attrs["rise_frac"])
+        self.assertEqual(base["rise_samples"], attrs["rise_samples"])
+
+    def test_merges_over_wm_dbg_without_key_collision(self):
+        # the real call sites spread {..., **self._status_base(), **wm_dbg}; the learned
+        # keys and the weather-debug keys are disjoint, so neither clobbers the other.
+        app = make_app(rise_frac=0.7, rise_samples=3)
+        wm_dbg = {"equilibrium_weather": None, "equilibrium_legacy": 24.0}
+        merged = {"deployed": True, **app._status_base(), **wm_dbg}
+        self.assertEqual(merged["rise_frac"], 0.7)
+        self.assertEqual(merged["rise_samples"], 3)
+        self.assertEqual(merged["equilibrium_legacy"], 24.0)
 
 
 class NextMidnight(unittest.TestCase):
@@ -911,6 +947,17 @@ class EveningRescue(unittest.TestCase):
             return comfort_ce
         app.get_state = get_state
 
+        # _effective_ceiling is now computed locally (signature (now)); stub it directly to
+        # return (ceiling, base) instead of stubbing the old get_state('ceiling_effective').
+        computed_ceiling = ceiling
+        if comfort_ce is not None:
+            computed_ceiling = min(ceiling, max(float(comfort_ce),
+                                                ceiling - app.comfort_max_reduction, app.min_temp))
+
+        async def _effective_ceiling(now):
+            return computed_ceiling, ceiling
+        app._effective_ceiling = _effective_ceiling
+
         async def _state(entity):
             return home
         app._state = _state
@@ -990,9 +1037,9 @@ class EveningRescue(unittest.TestCase):
     def test_error_is_swallowed_no_raise(self):
         app = self._app()
 
-        async def _boom(entity, default):
+        async def _boom(now):
             raise RuntimeError("sensor blew up")
-        app._num = _boom  # _effective_ceiling will raise
+        app._effective_ceiling = _boom  # the shared ceiling helper raises
         # must not propagate, must not notify
         self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
         self.assertEqual(app._notified, [])
@@ -1065,6 +1112,19 @@ class EvaluateTickWiring(unittest.TestCase):
             app._rescue_calls.append((floor, e_legacy, e_active))
         app._maybe_evening_rescue = _rescue
 
+        # sensor.sleep_plan publisher is called every tick BEFORE the arm gate; stub it so
+        # the wiring test asserts it's invoked (and never issues a climate command) without
+        # exercising its I/O. _effective_ceiling is also stubbed (armed branch uses it).
+        app._sleep_plan_calls = []
+
+        async def _psp(now, floor, e_active):
+            app._sleep_plan_calls.append((floor, e_active))
+        app._publish_sleep_plan = _psp
+
+        async def _eff(now):
+            return 23.0, 23.0
+        app._effective_ceiling = _eff
+
         app._published = []
 
         async def _publish(status, reason, attrs):
@@ -1104,15 +1164,136 @@ class EvaluateTickWiring(unittest.TestCase):
         self._run(app)
         self.assertEqual(len(app._rescue_calls), 1)
 
+    def test_sleep_plan_published_on_disarmed_tick(self):
+        # advisory sleep plan runs BEFORE the arm gate -> every branch, with e_active.
+        app = self._app(enable="off", climate="off", floor=25.0)
+        self._run(app)
+        self.assertEqual(len(app._sleep_plan_calls), 1)
+        floor_arg, e_active_arg = app._sleep_plan_calls[0]
+        self.assertEqual(floor_arg, 25.0)
+
     def test_armed_but_not_deployed_publishes_weather_and_skips_rescue(self):
         # master on, climate unavailable -> not-deployed branch: still publishes wm_dbg,
-        # never reaches (nor calls) the disarmed-only rescue helper.
+        # never reaches (nor calls) the disarmed-only rescue helper, but the sleep plan
+        # (before the arm gate) still runs.
         app = self._app(enable="on", climate="unavailable")
         self._run(app)
         self.assertEqual(len(app._rescue_calls), 0)
+        self.assertEqual(len(app._sleep_plan_calls), 1)
         status, _, attrs = app._published[0]
         self.assertEqual(status, "unit_stored")
         self.assertIn("equilibrium_weather", attrs)
+
+
+class GoldenModelMath(unittest.TestCase):
+    """Lock the byte-identical-actuation claim into CI: the shared climate_model fns
+    reproduce smart_cooling's FORMER inline math on a fixed grid. The `_old_*` bodies below
+    are verbatim copies of the pre-refactor inline code; every grid point must match cm.*."""
+
+    def _old_equilibrium(self, kitchen, mid, floor, person_offset):
+        vals = [v for v in (kitchen, mid, floor) if v is not None]
+        return (max(vals) if vals else 24.5) + person_offset
+
+    def _old_calc_target(self, E, ceiling, rise_frac, zone_offset, min_temp):
+        cap = ceiling - zone_offset
+        r = min(0.95, max(0.05, rise_frac))
+        if E <= cap:
+            return ceiling
+        f0 = (cap - E * r) / (1.0 - r)
+        return max(min_temp, min(ceiling, round(f0, 2)))
+
+    def _old_apartment(self, solar_mean, outdoor_max, prev, b0, bs, bv, knee, bp):
+        return b0 + bs * solar_mean + bv * max(0.0, outdoor_max - knee) + bp * prev
+
+    def test_legacy_equilibrium_grid(self):
+        for k in (None, 20.0, 24.3):
+            for m in (None, 21.5):
+                for f in (None, 19.0, 25.1):
+                    for po in (0.0, 0.5, 1.0):
+                        self.assertEqual(cm.legacy_equilibrium(k, m, f, po),
+                                         self._old_equilibrium(k, m, f, po))
+
+    def test_calc_floor_target_grid(self):
+        for E in (18.0, 21.0, 22.0, 22.05, 25.0, 25.333, 30.0, 40.0):
+            for ceiling in (21.0, 23.0):
+                for rise in (0.0, 0.05, 0.3, 0.5, 0.7, 0.95, 0.99):
+                    for zone in (0.5, 1.0):
+                        self.assertEqual(
+                            cm.calc_floor_target(E, ceiling, rise, zone, 16.0),
+                            self._old_calc_target(E, ceiling, rise, zone, 16.0),
+                            msg=f"E={E} ceil={ceiling} rise={rise} zone={zone}")
+
+    def test_model_d_apartment_grid(self):
+        coeffs = cm.ModelDCoeffs(15.797, 0.0162, 0.198, 24.0, 0.287)
+        for sm in (0.0, 50.0, 200.0, 400.0):
+            for om in (16.0, 24.0, 31.0):
+                for prev in (20.0, 27.0):
+                    self.assertEqual(
+                        cm.model_d_apartment(sm, om, prev, coeffs),
+                        self._old_apartment(sm, om, prev, 15.797, 0.0162, 0.198, 24.0, 0.287))
+
+
+class EffectiveCeilingEquivalence(unittest.TestCase):
+    """The intentional cycle-break is on the INPUT side: smart_cooling._effective_ceiling now
+    computes the ceiling locally via climate_model instead of reading sensor.bedroom_comfort.
+    Prove it is numerically the SAME value bedroom_comfort publishes (same fn, same entities,
+    same params), so the driven target stays byte-identical."""
+
+    def _app(self, t_in, rh_in, ceiling_base=23.0, persons_home=("person.mikkel",)):
+        app = make_app()
+        app.night_ceiling_entity = "input_number.nc"
+        app.default_ceiling = 23.0
+        app.comfort_temp_entity = "sensor.bedroom_median_temperature"
+        app.comfort_rh_entity = "sensor.bedroom_humidity"
+        app.comfort_persons = ["person.mikkel"]
+        app.comfort_anchor = 23.0
+        app.comfort_dp_rate = 0.5
+        app.comfort_knee = 12.0
+        app.comfort_penalty = 0.15
+        app.comfort_second_sleeper = 0.5
+        app.comfort_max_reduction = 1.5
+        app.min_temp = 16.0
+        nums = {"input_number.nc": ceiling_base,
+                "sensor.bedroom_median_temperature": t_in,
+                "sensor.bedroom_humidity": rh_in}
+
+        async def _num(entity, default):
+            return nums.get(entity, default)
+        app._num = _num
+
+        async def _state(entity):
+            return "home" if entity in persons_home else "not_home"
+        app._state = _state
+        return app
+
+    def _bedroom_comfort_ceiling(self, t_in, rh_in, now, sleepers=1,
+                                 anchor=23.0, base=23.0, max_red=1.5):
+        # exactly what bedroom_comfort computes for ceiling_effective, then the smart_cooling
+        # clamp against the knob.
+        dp = cm.dew_point_c(t_in, rh_in)
+        dp_m = cm.project_morning_dp(dp, sleepers, cm.hours_until_morning(now), 0.5)
+        ce, _ = cm.effective_ceiling(anchor, dp_m, sleepers, 12.0, 0.15, 0.5, max_red)
+        return min(base, max(ce, base - max_red, 16.0))
+
+    def test_humid_single_sleeper_matches_comfort_layer(self):
+        import asyncio
+        t_in, rh_in = 24.1, 60.0
+        now = datetime(2026, 7, 20, 23, 0)   # 8h to 07:00
+        app = self._app(t_in, rh_in)
+        ceiling, base = asyncio.run(app._effective_ceiling(now))
+        expected = self._bedroom_comfort_ceiling(t_in, rh_in, now)
+        self.assertEqual(base, 23.0)
+        self.assertEqual(ceiling, expected)
+        self.assertLess(ceiling, 23.0)   # a humid night actually lowered it (non-trivial path)
+
+    def test_dry_single_sleeper_is_the_knob(self):
+        import asyncio
+        # dry air, single sleeper (the deployed default) -> reduction 0 -> ceiling == knob
+        now = datetime(2026, 7, 20, 23, 0)
+        app = self._app(20.0, 35.0)
+        ceiling, base = asyncio.run(app._effective_ceiling(now))
+        self.assertEqual(ceiling, 23.0)
+        self.assertEqual(base, 23.0)
 
 
 if __name__ == "__main__":

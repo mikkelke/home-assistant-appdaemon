@@ -1,0 +1,341 @@
+"""
+Pure climate model -- the single source of truth for the bedroom cooling physics.
+
+ZERO AppDaemon imports: every function here is a plain, side-effect-free callable so
+both apps (smart_cooling.py the controller, bedroom_comfort.py the advisory) and the unit
+tests can import it without a running AppDaemon. The apps keep ALL I/O (sensor/forecast/
+price/history reads, service calls, publishing); this module keeps only the math.
+
+Why it exists: smart_cooling and bedroom_comfort had independently reimplemented the same
+physics (equilibrium projection, coast law, comfort limit, vent feasibility) and DRIFTED --
+the dashboard advised "deploy AC" projecting the sealed bedroom to ~23C from the warm
+kitchen while the room actually sat at 20C with a window holding it there. Promoting the
+math to one module (and driving the projection from the weather equilibrium E instead of
+the warm kitchen proxy) removes the divergence and the circular ceiling<->rise_frac
+dependency between the two apps.
+
+Contents:
+  - equilibrium: legacy_equilibrium (kitchen/mid/floor proxy) + model_d_apartment (weather)
+  - coast_peak / calc_floor_target: the sealed-zone coast law and its inverse (ONE copy)
+  - comfort limit: dew_point_c, project_morning_dp, effective_ceiling, hours_until_morning,
+    classify (moved verbatim from bedroom_comfort)
+  - free cooling: windows_can_cool (feasibility against a TARGET) + vent_helps (compat
+    wrapper) + summarize_open_windows
+  - plan_sleep: the cheapest-path planner (windows cost 0 vs AC energy*price + noise)
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+# ------------------------------------------------------------- equilibrium math
+
+def legacy_equilibrium(kitchen, mid, floor, person_offset, empty_fallback=24.5):
+    """Legacy proxy equilibrium the sealed sleeping zone drifts toward overnight.
+
+    The warmest sensible reading of the neighbour wall (kitchen), the mid wall and the
+    floor, plus the sleeper offset (errs deep -> safe). ``empty_fallback`` (24.5) is used
+    when every reading is None, so calling this with (kitchen, mid, floor, person_offset)
+    is byte-identical to smart_cooling's old inline body.
+    """
+    vals = [v for v in (kitchen, mid, floor) if v is not None]
+    return (max(vals) if vals else empty_fallback) + person_offset
+
+
+@dataclass
+class ModelDCoeffs:
+    """Coefficient bundle for the verified Model D apartment-peak predictor."""
+    b0: float
+    b_solar: float
+    b_vent: float
+    vent_knee: float
+    b_prev: float
+
+
+def model_d_apartment(solar_mean, outdoor_max, prev_kitchen_max, coeffs: ModelDCoeffs):
+    """Model D predicted apartment/kitchen daytime peak (e_apartment ONLY).
+
+    b0 + b_solar*solar_mean + b_vent*max(0, outdoor_max - vent_knee) + b_prev*prev_kitchen_max.
+    The caller (_weather_equilibrium) still composes e_weather = e_apartment + person_offset +
+    safety_margin and the E = max(e_weather, e_legacy - relief) relief floor itself.
+    """
+    return (coeffs.b0
+            + coeffs.b_solar * solar_mean
+            + coeffs.b_vent * max(0.0, outdoor_max - coeffs.vent_knee)
+            + coeffs.b_prev * prev_kitchen_max)
+
+
+# ------------------------------------------------------------- coast law (one copy)
+
+def coast_peak(floor, equilibrium, rise_frac, zone_offset) -> Optional[float]:
+    """Sealed sleeping-zone peak if nobody cools: the floor mass drifts toward the
+    equilibrium E by fraction rise_frac over the night, and the sleeping zone rides
+    zone_offset above the floor. floor + (E - floor)*rise_frac + zone_offset.
+
+    Equilibrium is an INPUT (the weather E), no longer recomputed from max(floor,kitchen,mid).
+    Returns None if floor or equilibrium is missing.
+    """
+    if floor is None or equilibrium is None:
+        return None
+    return floor + (equilibrium - floor) * rise_frac + zone_offset
+
+
+def calc_floor_target(equilibrium, ceiling, rise_frac, zone_offset, min_temp) -> float:
+    """Inverse of the coast law: the floor pre-cool target so the zone stays <= ceiling.
+
+    The mid wall sits ~zone_offset above the floor, so cap the FLOOR peak at
+    (ceiling - zone_offset). The floor rises by (E - F0)*r over the window, so
+    F0 + (E - F0)*r <= cap -> F0 = (cap - E*r)/(1 - r). Clamp to [min_temp, ceiling].
+    Byte-identical to smart_cooling's old _calc_target.
+    """
+    cap = ceiling - zone_offset
+    r = min(0.95, max(0.05, rise_frac))
+    if equilibrium <= cap:
+        return ceiling            # room won't break the ceiling on its own -> no pre-cool
+    f0 = (cap - equilibrium * r) / (1.0 - r)
+    return max(min_temp, min(ceiling, round(f0, 2)))
+
+
+# ------------------------------------------------------------- comfort limit
+# Moved verbatim from bedroom_comfort.py; this is now their single home. bedroom_comfort
+# re-exports them so its test surface (bc.dew_point_c etc.) is unchanged.
+
+def dew_point_c(t_c, rh_pct) -> Optional[float]:
+    """Magnus formula dew point. Returns None on invalid input."""
+    try:
+        t = float(t_c)
+        rh = float(rh_pct)
+    except (TypeError, ValueError):
+        return None
+    if rh <= 0 or rh > 100:
+        return None
+    a, b = 17.62, 243.12
+    gamma = math.log(rh / 100.0) + a * t / (b + t)
+    return b * gamma / (a - gamma)
+
+
+def project_morning_dp(dp_now, sleepers, hours, rate_per_sleeper_c_per_h) -> Optional[float]:
+    """Dew point after `hours` of sleepers adding moisture to a sealed room."""
+    if dp_now is None:
+        return None
+    hours = max(0.0, min(10.0, float(hours)))
+    return dp_now + rate_per_sleeper_c_per_h * max(0, int(sleepers)) * hours
+
+
+def effective_ceiling(base, dp_morning, sleepers, knee_c=12.0,
+                      penalty_per_c=0.15, second_sleeper_c=0.5,
+                      max_reduction_c=1.5):
+    """Night ceiling lowered for projected humidity and a second sleeper.
+    Bounded: never more than max_reduction_c below the base. Returns (ceiling, reduction).
+    """
+    reduction = 0.0
+    if dp_morning is not None:
+        reduction += penalty_per_c * max(0.0, dp_morning - knee_c)
+    if sleepers >= 2:
+        reduction += second_sleeper_c
+    reduction = min(max_reduction_c, reduction)
+    return round(base - reduction, 1), round(reduction, 2)
+
+
+def hours_until_morning(now, morning_hour=7) -> float:
+    """Hours from `now` to the next 07:00, capped at 10 (projection horizon)."""
+    target_day = now
+    if now.hour >= morning_hour:
+        from datetime import timedelta
+        target_day = now + timedelta(days=1)
+    target = target_day.replace(hour=morning_hour, minute=0, second=0, microsecond=0)
+    hours = (target - now).total_seconds() / 3600.0
+    return max(0.0, min(10.0, hours))
+
+
+def classify(t, dp_now, ceiling_base, ceiling_eff) -> str:
+    """Human-comfort label on ABSOLUTE anchors - deliberately not the planning
+    knob: with the knob at 20 a perfectly nice 20.8 C room read as "hot"
+    (2026-07-12). The knob steers SmartCooling; this label describes the room."""
+    del ceiling_base, ceiling_eff  # planning inputs, not comfort anchors
+    if t is None:
+        return "unknown"
+    if t >= 24.5:
+        return "hot"
+    if dp_now is not None and dp_now >= 13.5:
+        return "sticky"
+    if t >= 23.0:
+        return "warm"
+    return "comfortable"
+
+
+# ------------------------------------------------------------- free-cooling feasibility
+
+def windows_can_cool(target, outdoor_temp, outdoor_dew, indoor_dew,
+                     temp_margin=0.5, dew_margin=0.0):
+    """Would opening a window help, measured against a TARGET (the sleep limit) rather
+    than just the current indoor temperature?
+
+    True only when the outdoor air is BOTH cooler than target - temp_margin AND no more humid
+    than indoor_dew - dew_margin -- opening a warmer or muggier window imports heat/water.
+    dew_margin defaults to 0.0: veto only when outdoor is genuinely MORE humid than indoor.
+    (2026-07-20 the bedroom cooled AND dried on a window only ~0.3C drier, so the old 1C
+    drier buffer wrongly rejected a proven free-cool -- user: cool-enough-outside = window night.)
+    None on any missing input (message preserves 'dew point' for the too-humid branch, so
+    bedroom_comfort's vent_helps tests stay green). Returns (ok, reason).
+    """
+    if None in (target, outdoor_temp, outdoor_dew, indoor_dew):
+        return None, "outdoor or indoor data missing"
+    if outdoor_temp >= target - temp_margin:
+        return False, f"outdoor {outdoor_temp:.1f}C not cooler than bedroom {target:.1f}C"
+    if outdoor_dew > indoor_dew - dew_margin:
+        return False, f"outdoor dew point {outdoor_dew:.1f}C too humid vs indoor {indoor_dew:.1f}C"
+    return True, (f"outdoor {outdoor_temp:.1f}C / DP {outdoor_dew:.1f}C is cooler and drier "
+                  f"than bedroom {target:.1f}C / DP {indoor_dew:.1f}C")
+
+
+def vent_helps(t_in, dp_in, t_out, dp_out):
+    """Compatibility wrapper for bedroom_comfort's published vent_helps/vent_reason.
+
+    Venting helps only when outdoor air is BOTH cooler and drier than the CURRENT indoor
+    temperature (target = t_in). Kept as the leaf comfort read; implemented on top of
+    windows_can_cool so there is one feasibility rule.
+    """
+    return windows_can_cool(target=t_in, outdoor_temp=t_out,
+                            outdoor_dew=dp_out, indoor_dew=dp_in,
+                            temp_margin=0.0, dew_margin=0.0)
+
+
+def summarize_open_windows(contacts: dict) -> list:
+    """Given {name: contact_state}, the sorted list of names whose contact reads open.
+
+    Explicit 'on' = open (NOT the condenser fail-open rule that lives in smart_cooling):
+    a wrong 'open' here only mis-labels advice, it never actuates.
+    """
+    return sorted(name for name, state in (contacts or {}).items() if state == "on")
+
+
+# ------------------------------------------------------------- cheapest-path planner
+
+@dataclass
+class SleepPlanInputs:
+    """Plain input bundle for plan_sleep. equilibrium is the driving E the sealed room
+    coasts toward (smart_cooling passes e_active -- the weather Model D when enabled --
+    so the plan stops over-projecting from the warm kitchen). All plumbing stays in the
+    app; the planner is pure.
+    """
+    floor: Optional[float]
+    equilibrium: Optional[float]
+    rise_frac: float
+    zone_offset: float
+    comfort_limit: float
+    min_temp: float
+    floor_cool_cph: float
+    cool_power_kw: float
+    cheapest_price: Optional[float]
+    outdoor_temp: Optional[float]
+    outdoor_dew: Optional[float]
+    indoor_dew: Optional[float]
+    open_windows: list = field(default_factory=list)
+    noise_penalty_kr: float = 0.5
+    peak_margin_c: float = 0.2
+    hybrid_gap_c: float = 1.5
+
+
+def _windows_phrase(open_windows) -> str:
+    if not open_windows:
+        return "all closed"
+    return " + ".join(open_windows) + " open"
+
+
+def _cost_label(cost) -> str:
+    if cost is None:
+        return "cost unknown"
+    if cost <= 0.0:
+        return "free"
+    return f"~{cost:.1f} kr"
+
+
+def plan_sleep(inp: SleepPlanInputs) -> dict:
+    """Pure cheapest-path chooser: keep the sleeping zone under the comfort limit across
+    the night for the least money (windows cost 0, AC = energy_kWh*price + a fixed noise
+    penalty), planning the whole night rather than the current instant.
+
+    projected_peak = coast_peak(floor, equilibrium, rise_frac, zone_offset).
+      - peak within peak_margin_c of the limit           -> 'nothing' (free)
+      - else windows_can_cool(limit, outdoor...) True:
+          gap <= hybrid_gap_c                             -> 'windows' (free)
+          gap  > hybrid_gap_c                             -> 'hybrid'  (windows now + AC backup)
+      - else (warm/muggy/unknown outside)                -> 'ac'
+    Windows always beat equal-comfort AC (0 < ac_cost + penalty).
+
+    Returns a plain dict (recommendation/projected_peak/comfort_limit/est_cost_kr/
+    cost_label/headline/detail/open_windows/windows_summary). ADVISORY ONLY.
+    """
+    limit = inp.comfort_limit
+    open_windows = list(inp.open_windows or [])
+    windows_summary = _windows_phrase(open_windows)
+    projected_peak = coast_peak(inp.floor, inp.equilibrium, inp.rise_frac, inp.zone_offset)
+
+    base = {
+        "comfort_limit": round(limit, 1),
+        "open_windows": open_windows,
+        "windows_summary": windows_summary,
+    }
+
+    if projected_peak is None:
+        base.update({
+            "recommendation": "nothing",
+            "projected_peak": None,
+            "est_cost_kr": 0.0,
+            "cost_label": "free",
+            "headline": "Not enough to plan yet",
+            "detail": "Missing floor or equilibrium reading -- cannot project tonight.",
+        })
+        return base
+
+    peak_disp = round(projected_peak, 1)
+    gap = projected_peak - limit
+
+    # AC cost of pre-cooling the floor deep enough to keep the zone under the limit.
+    target = calc_floor_target(inp.equilibrium, limit, inp.rise_frac,
+                               inp.zone_offset, inp.min_temp)
+    deficit = max(0.0, inp.floor - target)
+    if inp.cheapest_price is None:
+        ac_cost = None
+    else:
+        kwh = inp.cool_power_kw * (deficit / inp.floor_cool_cph)
+        ac_cost = round(kwh * inp.cheapest_price + inp.noise_penalty_kr, 2)
+
+    if gap <= inp.peak_margin_c:
+        rec, cost = "nothing", 0.0
+        headline = "Comfortable as-is"
+        detail = (f"Projected peak {peak_disp:.1f}C stays at/under the {limit:.1f}C sleep "
+                  f"limit -- nothing needed tonight.")
+    else:
+        can_cool, why = windows_can_cool(limit, inp.outdoor_temp,
+                                         inp.outdoor_dew, inp.indoor_dew)
+        if can_cool and gap <= inp.hybrid_gap_c:
+            rec, cost = "windows", 0.0
+            headline = "Open a window"
+            detail = (f"Projected peak {peak_disp:.1f}C is {gap:.1f}C over the {limit:.1f}C "
+                      f"limit, but {why} -- a window covers it for free.")
+        elif can_cool:
+            rec, cost = "hybrid", ac_cost
+            headline = f"Open windows now, AC backup {_cost_label(ac_cost)}"
+            detail = (f"Projected peak {peak_disp:.1f}C is {gap:.1f}C over the {limit:.1f}C "
+                      f"limit -- open windows now ({why}); keep the AC ready "
+                      f"({_cost_label(ac_cost)}) if the room won't settle.")
+        else:
+            rec, cost = "ac", ac_cost
+            headline = f"Run the AC {_cost_label(ac_cost)}"
+            detail = (f"Projected peak {peak_disp:.1f}C is {gap:.1f}C over the {limit:.1f}C "
+                      f"limit and {why} -- pre-cool with the AC ({_cost_label(ac_cost)}).")
+
+    base.update({
+        "recommendation": rec,
+        "projected_peak": peak_disp,
+        "est_cost_kr": 0.0 if cost is None else cost,
+        "cost_label": _cost_label(cost),
+        "headline": headline,
+        "detail": detail,
+    })
+    return base

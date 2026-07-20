@@ -82,6 +82,8 @@ import json
 import math
 from typing import Optional
 
+import climate_model as cm  # pure math (zero appdaemon imports; import-safe from app + tests)
+
 
 class SmartCooling(hass.Hass):
     def initialize(self) -> None:
@@ -103,9 +105,51 @@ class SmartCooling(hass.Hass):
         # the clock says. Replaces the old fixed-clock bedtime cutoff entirely (see module docstring).
         self.ac_removed_entity = a("ac_removed_entity", "input_boolean.smart_cooling_ac_removed")
         self.night_ceiling_entity = a("night_ceiling_entity", "input_number.smart_cooling_night_ceiling")
-        # Humidity-aware ceiling from the comfort middle layer (sensor.bedroom_comfort).
+        # Humidity-aware ceiling. comfort_entity is still read by the dry-finish gate
+        # (_maybe_dry reads its RAW dew_point measurement -- outside the control loop). The
+        # actuation ceiling is now computed LOCALLY (see _effective_ceiling) via the shared
+        # climate_model comfort fns, so smart_cooling no longer READS ceiling_effective back
+        # from that sensor (that read + bedroom_comfort's state-file rise_frac read were the
+        # circular dependency between the two apps). These comfort_* knobs MUST MIRROR
+        # bedroom_comfort.yaml so the locally-computed ceiling is the same number the comfort
+        # sensor publishes -> byte-identical target math.
         self.comfort_entity = a("comfort_entity", "sensor.bedroom_comfort")
         self.comfort_max_reduction = float(a("comfort_max_reduction", 1.5))
+        self.comfort_temp_entity = a("comfort_temp_entity", "sensor.bedroom_median_temperature")
+        self.comfort_rh_entity = a("comfort_rh_entity", "sensor.bedroom_humidity")
+        self.comfort_persons = list(a("comfort_persons", ["person.mikkel"]))
+        self.comfort_anchor = float(a("comfort_anchor_c", 23.0))
+        self.comfort_dp_rate = float(a("comfort_dp_rate_per_sleeper_c_per_h", 0.5))
+        self.comfort_knee = float(a("comfort_dp_knee_c", 12.0))
+        self.comfort_penalty = float(a("comfort_dp_penalty_per_c", 0.15))
+        self.comfort_second_sleeper = float(a("comfort_second_sleeper_c", 0.5))
+        # --- sleep-plan advisory (sensor.sleep_plan): cheapest path to comfortable sleep.
+        # Read-only, command-free; published every tick. Windows (cost 0) vs AC (kWh * spot
+        # price + noise penalty). Outdoor humidity + the seven window contacts feed it.
+        self.outdoor_rh_entity = a("outdoor_rh_entity", "sensor.gw2000a_humidity")
+        # NAME=ENTITY strings, NOT a yaml dict: a new dict-valued key trips AppDaemon 4.5's
+        # config-scan deep_compare (KeyError -> full restart of every app); a list value is
+        # safe and reloads only this app. Parsed back into a {name: entity} map here.
+        raw_windows = a("window_contact_entities", [
+            "bedroom=binary_sensor.bedroom_window_contact",
+            "bathroom=binary_sensor.bathroom_window_contact",
+            "dining 1=binary_sensor.dining_room_window_1_contact",
+            "dining 2=binary_sensor.dining_room_window_2_contact",
+            "dining 3=binary_sensor.dining_room_window_3_contact",
+            "kitchen=binary_sensor.kitchen_window_contact",
+            "living room=binary_sensor.living_room_window_contact",
+            "kristines room=binary_sensor.kristines_room_window_contact",
+        ])
+        if isinstance(raw_windows, dict):
+            self.window_contact_entities = dict(raw_windows)   # tolerate a dict (tests/back-compat)
+        else:
+            self.window_contact_entities = {}
+            for item in raw_windows or []:
+                name, _, ent = str(item).partition("=")
+                if ent:
+                    self.window_contact_entities[name.strip()] = ent.strip()
+        self.sleep_plan_entity = a("sleep_plan_entity", "sensor.sleep_plan")
+        self.ac_noise_penalty_kr = float(a("ac_noise_penalty_kr", 0.5))
         # --- fixed params (not user-facing) ---
         self.default_ceiling = float(a("default_night_ceiling", 23.0))
         self.min_temp = float(a("min_temp", 16.0))            # hardware floor; never drive below
@@ -398,6 +442,16 @@ class SmartCooling(hass.Hass):
     def _price_for(self, pm, dt, fallback):
         return pm.get((dt.year, dt.month, dt.day, dt.hour), fallback)
 
+    def _cheapest_to(self, pm, now, deadline, fallback):
+        """Cheapest 15-min slot price between now and deadline (advisory pricing for the
+        sleep plan). Falls back to `fallback` (price_now) when no slot horizon remains."""
+        total = int((deadline - now).total_seconds() // 900)
+        if total <= 0:
+            return fallback
+        prices = [self._price_for(pm, now + timedelta(minutes=15 * k), fallback)
+                  for k in range(total)]
+        return min(prices) if prices else fallback
+
     # ---------- learned warm-up indicator ----------
     def _load_state(self):
         try:
@@ -435,9 +489,9 @@ class SmartCooling(hass.Hass):
     def _equilibrium(self, kitchen, mid, floor):
         """Where the sealed sleeping zone drifts overnight. Driven by the neighbour wall (kitchen)
         and the room's own warm baseline + the sleeper. Conservative: take the warmest sensible
-        reading (errs deep -> safe)."""
-        vals = [v for v in (kitchen, mid, floor) if v is not None]
-        return (max(vals) if vals else 24.5) + self.person_offset
+        reading (errs deep -> safe). Thin wrapper over cm.legacy_equilibrium (byte-identical:
+        empty_fallback defaults to 24.5) so every call site stays untouched."""
+        return cm.legacy_equilibrium(kitchen, mid, floor, self.person_offset)
 
     # ---------- weather-driven equilibrium (verified Model D; shadow-gated) ----------
     @staticmethod
@@ -738,10 +792,10 @@ class SmartCooling(hass.Hass):
             outdoor_max = await self._outdoor_max_today(now)
             if outdoor_max is None:
                 return e_legacy, dbg
-            e_apartment = (self.wm_b0
-                           + self.wm_b_solar * solar_mean
-                           + self.wm_b_vent * max(0.0, outdoor_max - self.wm_vent_knee)
-                           + self.wm_b_prev * self._prev_kitchen_max)
+            e_apartment = cm.model_d_apartment(
+                solar_mean, outdoor_max, self._prev_kitchen_max,
+                cm.ModelDCoeffs(self.wm_b0, self.wm_b_solar, self.wm_b_vent,
+                                self.wm_vent_knee, self.wm_b_prev))
             e_weather = e_apartment + self.person_offset + self.wm_safety_margin
             E = max(e_weather, e_legacy - self.wm_nowcast_relief)
             dbg["equilibrium_weather"] = round(e_weather, 2)
@@ -757,13 +811,9 @@ class SmartCooling(hass.Hass):
         """Floor target so the sleeping zone stays <= ceiling for the window. The mid wall sits
         ~zone_offset above the floor, so cap the FLOOR peak at (ceiling - zone_offset). The floor
         rises by (E - F0)*rise_frac over the window, so F0 + (E-F0)*r <= cap  ->
-        F0 = (cap - E*r)/(1 - r). Clamp to [min_temp, ceiling]."""
-        cap = ceiling - self.zone_offset
-        r = min(0.95, max(0.05, self._rise_frac))
-        if E <= cap:
-            return ceiling            # room won't break the ceiling on its own -> no pre-cool
-        f0 = (cap - E * r) / (1.0 - r)
-        return max(self.min_temp, min(ceiling, round(f0, 2)))
+        F0 = (cap - E*r)/(1 - r). Clamp to [min_temp, ceiling]. Thin wrapper over
+        cm.calc_floor_target (byte-identical) so the two call sites stay untouched."""
+        return cm.calc_floor_target(E, ceiling, self._rise_frac, self.zone_offset, self.min_temp)
 
     def _schedule(self, now, deadline, minutes_needed, price_at):
         """Reserve the cheapest `minutes_needed` of 15-min slots between now and deadline (midnight -
@@ -956,21 +1006,37 @@ class SmartCooling(hass.Hass):
         return (deployed and climate_state not in (None, "off", "unavailable", "unknown")
                 and SmartCooling._venting_impaired(bath, outdoor, delta_max))
 
-    async def _effective_ceiling(self):
-        """Tonight's ceiling: the night-ceiling knob, optionally LOWERED by the comfort
-        middle layer on humid/two-sleeper nights -- bounded to at most comfort_max_reduction
-        below the knob, never below min_temp, never raised above the knob; any comfort-layer
-        problem falls back to the knob. Returns (ceiling, ceiling_base). Shared by the armed
-        decision path and the disarmed evening-rescue check so the two can't diverge."""
+    async def _effective_ceiling(self, now):
+        """Tonight's ceiling: the night-ceiling knob, optionally LOWERED for a humid/two-
+        sleeper night -- bounded to at most comfort_max_reduction below the knob, never below
+        min_temp, never raised above the knob. Returns (ceiling, ceiling_base). Shared by the
+        armed decision path and the disarmed evening-rescue check so the two can't diverge.
+
+        Computed LOCALLY via the shared climate_model comfort fns on the SAME entities/params
+        bedroom_comfort uses (see the comfort_* config mirrored from bedroom_comfort.yaml) --
+        this breaks the old ceiling_effective<->rise_frac cycle: smart_cooling no longer READS
+        sensor.bedroom_comfort. Numerically identical to the value bedroom_comfort publishes
+        (same fn, same inputs), so the driven target stays byte-identical; the only difference
+        is freshness (live temp/RH here vs the comfort sensor's up-to-5-min-stale copy)."""
         ceiling_base = await self._num(self.night_ceiling_entity, self.default_ceiling)
-        ceiling = ceiling_base
         try:
-            ce = await self.get_state(self.comfort_entity, attribute="ceiling_effective")
-            if ce is not None:
-                ceiling = min(ceiling_base,
-                              max(float(ce), ceiling_base - self.comfort_max_reduction, self.min_temp))
+            t_in = await self._num(self.comfort_temp_entity, None)
+            rh_in = await self._num(self.comfort_rh_entity, None)
+            homes = 0
+            for p in self.comfort_persons:   # explicit loop: await can't live in a genexp
+                if (await self._state(p)) == "home":
+                    homes += 1
+            sleepers = max(1, homes)
+            dp = cm.dew_point_c(t_in, rh_in)
+            dp_m = cm.project_morning_dp(dp, sleepers, cm.hours_until_morning(now),
+                                         self.comfort_dp_rate)
+            ce, _ = cm.effective_ceiling(self.comfort_anchor, dp_m, sleepers,
+                                         self.comfort_knee, self.comfort_penalty,
+                                         self.comfort_second_sleeper, self.comfort_max_reduction)
+            ceiling = min(ceiling_base,
+                          max(ce, ceiling_base - self.comfort_max_reduction, self.min_temp))
         except (TypeError, ValueError):
-            pass
+            ceiling = ceiling_base
         return ceiling, ceiling_base
 
     async def _maybe_evening_rescue(self, now, floor, e_legacy, e_active):
@@ -992,7 +1058,7 @@ class SmartCooling(hass.Hass):
                 return
             if floor is None:
                 return
-            ceiling, _ = await self._effective_ceiling()
+            ceiling, _ = await self._effective_ceiling(now)
             if ceiling is None:
                 return
             E = e_active if (self.weather_model_enabled and not self.wm_shadow) else e_legacy
@@ -1020,6 +1086,70 @@ class SmartCooling(hass.Hass):
             self._save_state()
         except Exception as e:
             self.log(f"evening rescue check failed ({e}) -- skipping", level="WARNING")
+
+    async def _publish_sleep_plan(self, now, floor, e_active):
+        """Publish sensor.sleep_plan -- the cheapest-path advisory (windows vs AC) for a
+        comfortable night. ADVISORY ONLY: this issues ZERO climate/* commands. Runs every
+        tick on every branch (disarmed, not-deployed, armed), placed BEFORE the arm gate so
+        it cannot feed back into actuation. Wrapped so an advisory failure never breaks the
+        tick or delays the actuation below it.
+
+        Projects from e_active (weather Model D when live, else e_legacy) instead of the warm
+        kitchen proxy -- the fix for the reported drift (20C room, window open -> the old
+        dashboard still said 'deploy AC to ~23')."""
+        try:
+            t_in = await self._num(self.comfort_temp_entity, None)
+            rh_in = await self._num(self.comfort_rh_entity, None)
+            t_out = await self._num(self.outdoor_sensor, None)
+            rh_out = await self._num(self.outdoor_rh_entity, None)
+            indoor_dew = cm.dew_point_c(t_in, rh_in)
+            outdoor_dew = cm.dew_point_c(t_out, rh_out)
+            contacts = {}
+            for name, ent in self.window_contact_entities.items():
+                contacts[name] = await self._state(ent)
+            open_windows = cm.summarize_open_windows(contacts)
+            pm = self._build_price_map(
+                await self._attr(self.price_entity, "raw_today", []),
+                await self._attr(self.price_entity, "raw_tomorrow", []),
+            )
+            price_now = self._price_for(pm, now, await self._num(self.price_entity, 1.7))
+            cheapest = self._cheapest_to(pm, now, self._deadline(now), price_now)
+            ceiling, _ = await self._effective_ceiling(now)
+            plan = cm.plan_sleep(cm.SleepPlanInputs(
+                floor=floor, equilibrium=e_active, rise_frac=self._rise_frac,
+                zone_offset=self.zone_offset, comfort_limit=ceiling, min_temp=self.min_temp,
+                floor_cool_cph=self.floor_cool_cph, cool_power_kw=self.cool_kw,
+                cheapest_price=cheapest, outdoor_temp=t_out, outdoor_dew=outdoor_dew,
+                indoor_dew=indoor_dew, open_windows=open_windows,
+                noise_penalty_kr=self.ac_noise_penalty_kr))
+            # Load-bearing strings (cost_label/windows_summary) never rely on a 0/False/None
+            # value that AppDaemon 4.5.13 would drop; est_cost_kr==0 legitimately vanishes and
+            # the dashboard reads cost_label instead. open_windows stays a list ([] survives).
+            attrs = {
+                "friendly_name": "Sleep plan",
+                "icon": "mdi:bed-clock",
+                "recommendation": plan["recommendation"],
+                "headline": plan["headline"],
+                "detail": plan["detail"],
+                "reason": plan["detail"],
+                "comfort_limit": plan["comfort_limit"],
+                "est_cost_kr": plan["est_cost_kr"],
+                "cost_label": plan["cost_label"],
+                "open_windows": plan["open_windows"],
+                "windows_summary": plan["windows_summary"],
+                "source_entities": [self.floor_sensor, self.comfort_temp_entity,
+                                    self.comfort_rh_entity, self.outdoor_sensor,
+                                    self.outdoor_rh_entity, self.price_entity,
+                                    self.weather_forecast_entity,
+                                    *self.window_contact_entities.values()],
+                "computed_at": now.isoformat(timespec="seconds"),
+            }
+            if plan["projected_peak"] is not None:
+                attrs["projected_peak"] = plan["projected_peak"]
+            await self.set_state(self.sleep_plan_entity, state=plan["recommendation"],
+                                 replace=True, attributes=attrs)
+        except Exception as e:
+            self.log(f"sleep-plan publish failed ({e}) -- skipping", level="WARNING")
 
     # ---------- main ----------
     async def _evaluate(self):
@@ -1050,6 +1180,10 @@ class SmartCooling(hass.Hass):
         e_legacy = self._equilibrium(kitchen, mid, floor)
         e_active, wm_dbg = await self._weather_equilibrium(now, kitchen, mid, floor, e_legacy)
         await self._check_deploy_watchdog(now, master_on, deployed)
+        # Advisory sleep plan (windows vs AC) -- read-only, command-free, every branch.
+        # Placed BEFORE the arm gate so it can never feed back into actuation; projects from
+        # e_active (weather E) not the warm kitchen proxy. Self-contained try/except inside.
+        await self._publish_sleep_plan(now, floor, e_active)
 
         if not master_on:
             self._mark_eval(now, False)
@@ -1064,7 +1198,8 @@ class SmartCooling(hass.Hass):
                     f"SAFETY: condenser room {bath:.1f}C is {delta:.1f}C above outdoor "
                     f"({outdoor:.1f}C) -- venting isn't keeping up, forcing the AC off "
                     f"(disarmed, but this isn't optional)",
-                    {"deployed": deployed, "bathroom": round(bath, 1), **wm_dbg})
+                    {"deployed": deployed, "bathroom": round(bath, 1),
+                     **self._status_base(), **wm_dbg})
                 if not self._safety_off_notified:
                     self._safety_off_notified = True
                     await self._notify(
@@ -1081,22 +1216,24 @@ class SmartCooling(hass.Hass):
             # OFF = HANDS OFF. Turn the AC off ONCE on the on->off flip, then never command it again.
             if self._master_was_on:
                 await self._ensure_off("off", "Disarmed -- AC turned off, now hands-off",
-                                       {"deployed": deployed, **wm_dbg})
+                                       {"deployed": deployed, **self._status_base(), **wm_dbg})
             else:
                 await self._publish("off", "Disarmed -- hands off (manual AC control)",
-                                    {"deployed": deployed, **wm_dbg})
+                                    {"deployed": deployed, **self._status_base(), **wm_dbg})
             self._master_was_on = False
             return
         self._master_was_on = True
         if not deployed:
             self._mark_eval(now, False)
-            await self._publish("unit_stored", "AC not deployed (climate unavailable)", dict(wm_dbg))
+            await self._publish("unit_stored", "AC not deployed (climate unavailable)",
+                                {**self._status_base(), **wm_dbg})
             return
 
         # floor/mid/kitchen were read (hoisted) above; preserve the armed no_data guard.
         if floor is None:
             self._mark_eval(now, False)
-            await self._publish("no_data", "Missing bedroom floor temperature", dict(wm_dbg))
+            await self._publish("no_data", "Missing bedroom floor temperature",
+                                {**self._status_base(), **wm_dbg})
             return
         if mid is None:
             mid = floor   # armed-path default: mid tracks floor when its own sensor is dark
@@ -1105,7 +1242,7 @@ class SmartCooling(hass.Hass):
 
         # Comfort layer may lower the ceiling on humid/two-sleeper nights (bounded; see
         # _effective_ceiling). The disarmed rescue check shares the same helper.
-        ceiling, ceiling_base = await self._effective_ceiling()
+        ceiling, ceiling_base = await self._effective_ceiling(now)
         deadline = self._plan_deadline(now)
 
         pm = self._build_price_map(
@@ -1260,6 +1397,18 @@ class SmartCooling(hass.Hass):
         evaluations where we actually wanted to cool."""
         self._last_eval_at = now
         self._last_want = want
+
+    def _status_base(self):
+        """Learned attributes that must ride on EVERY status publish, armed or not. The
+        armed path folds these into _attrs, but the disarmed / not-deployed / no_data
+        branches publish with replace=True, which would otherwise WIPE rise_frac from
+        sensor.smart_cooling_status on those (daytime-dominant) ticks -- bedroom_comfort
+        reads it back as a display passthrough and would silently fall to its 0.5 fallback
+        despite a learned ~0.7. Same value the armed _attrs publishes, so the two never
+        disagree. rise_frac is a non-zero float so it survives AppDaemon 4.5.13's
+        False/0/None attribute-drop; rise_samples can be 0 (dropped then -- display only,
+        harmless)."""
+        return {"rise_frac": round(self._rise_frac, 2), "rise_samples": self._rise_samples}
 
     def _attrs(self, floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
                ceiling, price_now, window_open, run_min, next_start, est_cost, floor_limited,
