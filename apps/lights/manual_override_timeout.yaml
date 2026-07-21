@@ -9,7 +9,6 @@ manual_override_timeout:
     - input_boolean.bathroom_lights_manual
     - input_boolean.bedroom_lights_manual
     - input_boolean.guest_bathroom_lights_manual
-    - input_boolean.claudias_room_lights_manual
     - input_boolean.kitchen_lights_manual
     - input_boolean.living_room_lights_manual
     - input_boolean.dining_room_lights_manual
