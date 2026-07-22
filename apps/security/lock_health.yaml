@@ -1,0 +1,28 @@
+# /conf/apps/security/lock_health.yaml
+# Arbitrates the two Yale lock twins (lock.yale_bt local BLE, lock.yale cloud/bridge) and
+# publishes sensor.apartment_lock; heals the stale side (wake button -> integration reload
+# -> bridge power-cycle) with strict safety guards. See lock_health.py module docstring.
+
+LockHealth:
+  module: lock_health
+  class: LockHealth
+  lock_bt: lock.yale_bt
+  lock_cloud: lock.yale
+  bridge_ping: binary_sensor.yale_bridge
+  bridge_plug: switch.extender
+  wake_button: button.yale_wake
+  door_open_entity: binary_sensor.apartment_door_open
+  publish_entity: sensor.apartment_lock
+  notify_target: mikkel
+  divergence_heal_minutes: 4
+  invalid_heal_minutes: 5
+  bridge_down_heal_seconds: 90
+  settle_guard_seconds: 45
+  startup_grace_seconds: 150
+  action_cooldown_minutes: 5
+  plug_cycle_cooldown_minutes: 15
+  plug_cycle_max_per_2h: 3
+  reload_max_per_2h: 4
+  autolock_check_minutes: 4
+  wake_nudge_cooldown_minutes: 30
+  recovery_debounce_minutes: 2

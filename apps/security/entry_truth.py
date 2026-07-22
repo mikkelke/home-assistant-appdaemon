@@ -1,20 +1,27 @@
 """
 Apartment entry truth - publishes ``binary_sensor.apartment_entry_secure``.
 
-Arbitration middle layer for the front door. One physical Yale lock is exposed
-twice in HA: ``lock.yale_bt`` (local Bluetooth, authoritative) and ``lock.yale``
-(cloud twin that can miss re-lock pushes and stick "unlocked" - it did for
-1.5 h on 2026-07-12 and the user had to ask whether the door was really open).
+Thin arbitration layer for the front door, sitting ABOVE LockHealth rather than reading
+the raw lock twins directly: locks -> LockHealth (arbitrate + heal) ->
+``sensor.apartment_lock`` -> EntryTruth (+ door) -> ``binary_sensor.apartment_entry_secure``.
+LockHealth owns divergence/invalidity detection and healing entirely now (see its module
+docstring for the two incidents - 2026-07-12 cloud stuck, 2026-07-22 BLE stuck - that
+made a single hardcoded "trust BLE" rule wrong); this app no longer touches
+``lock.yale_bt``/``lock.yale`` directly except as a fallback, below.
 
-State: on  = door closed AND the BLE lock reports locked
-       off = door open, or the BLE lock reports unlocked
+State: on  = door closed AND sensor.apartment_lock reports "locked"
+       off = door open, or the arbitrated lock is not "locked"
 
-Attributes: lock_state / cloud_state / cloud_agrees, door_open, reason,
-source_entities, computed_at (middle-layer convention).
+Fallback: if sensor.apartment_lock itself is down (None/unknown/unavailable - LockHealth
+not running, mid-reload, etc.), fall back to the raw BLE entity (``lock_fallback``) so a
+down LockHealth doesn't take entry_secure down with it. ``lock_source_used`` records
+which path was used ("arbitrated" | "fallback_ble").
 
-Divergence alert: when the cloud twin disagrees with BLE continuously for
-``divergence_alert_minutes``, send ONE mobile notification naming the stale
-side, and re-arm once they agree again.
+Attributes: lock_state (the effective state entry_secure is judged on), bt_state /
+cloud_state (read from sensor.apartment_lock's own attributes when arbitrated;
+cloud_state is unknown in fallback mode - we no longer have visibility into the cloud
+twin without LockHealth), door_open, reason, lock_source_used, source_entities,
+computed_at (middle-layer convention).
 """
 
 from datetime import datetime
@@ -25,19 +32,12 @@ import appdaemon.plugins.hass.hassapi as hass
 class EntryTruth(hass.Hass):
     def initialize(self):
         a = self.args.get
-        self.lock_bt = a("lock_authoritative", "lock.yale_bt")
-        self.lock_cloud = a("lock_cloud", "lock.yale")
+        self.lock_source = a("lock_source", "sensor.apartment_lock")
+        self.lock_fallback = a("lock_fallback", "lock.yale_bt")
         self.door = a("door_open_entity", "binary_sensor.apartment_door_open")
         self.publish_entity = a("publish_entity", "binary_sensor.apartment_entry_secure")
-        self.alert_minutes = float(a("divergence_alert_minutes", 5))
-        self.notify_target = a("notify_target", "mikkel")
 
-        self._diverged_since = None
-        self._alerted = False
-        # get_app must be resolved in sync init - async context returns a Task.
-        self._notifier = self.get_app("MobileNotifier")
-
-        for ent in (self.lock_bt, self.lock_cloud, self.door):
+        for ent in (self.lock_source, self.door):
             self.listen_state(self._on_change, ent)
         self.run_every(self._tick, "now+4", 60)
 
@@ -49,28 +49,38 @@ class EntryTruth(hass.Hass):
 
     async def _eval(self):
         try:
-            bt = await self.get_state(self.lock_bt)
-            cloud = await self.get_state(self.lock_cloud)
+            lock_state = await self.get_state(self.lock_source)
             door = await self.get_state(self.door)
-
-            bt_locked = bt == "locked"
             door_open = door == "on"
-            cloud_agrees = (cloud == bt) or cloud in (None, "unknown", "unavailable")
 
-            secure = bt_locked and not door_open
+            lock_source_used = "arbitrated"
+            effective_state = lock_state
+            bt_state, cloud_state = None, None
+            if lock_state in (None, "unknown", "unavailable"):
+                lock_source_used = "fallback_ble"
+                effective_state = await self.get_state(self.lock_fallback)
+                bt_state = effective_state
+                self.log(f"sensor.apartment_lock unavailable - falling back to {self.lock_fallback}",
+                         level="DEBUG")
+            else:
+                full = await self.get_state(self.lock_source, attribute="all") or {}
+                source_attrs = full.get("attributes") or {}
+                bt_state = source_attrs.get("bt_state")
+                cloud_state = source_attrs.get("cloud_state")
+
+            locked = effective_state == "locked"
+            secure = locked and not door_open
+
             if door_open:
                 reason = "door is open"
-            elif not bt_locked:
-                reason = f"lock reports {bt or 'unknown'} (BLE)"
-            elif not cloud_agrees:
-                reason = f"locked and closed (BLE authoritative; cloud twin stale: {cloud})"
+            elif not locked:
+                reason = f"lock reports {effective_state or 'unknown'} ({lock_source_used})"
             else:
-                reason = "locked and closed"
+                reason = f"locked and closed ({lock_source_used})"
 
-            # door_open/cloud_agrees silently drop from published attributes whenever they're
-            # False (door closed / locks agree, the common case; confirmed live 2026-07-15:
-            # door_open absent right now) -- AppDaemon 4.5.13 set_state bug, not ours; see
-            # smart_cooling.py's _publish() for details.
+            # door_open silently drops from published attributes whenever it's False
+            # (door closed, the common case) -- AppDaemon 4.5.13 set_state bug, not
+            # ours; see smart_cooling.py's _publish() for details.
             await self.set_state(self.publish_entity,
                                  state="on" if secure else "off",
                                  replace=True,
@@ -78,40 +88,14 @@ class EntryTruth(hass.Hass):
                                      "friendly_name": "Apartment entry secure",
                                      "device_class": "lock",
                                      "icon": "mdi:shield-home",
-                                     "lock_state": bt,
-                                     "cloud_state": cloud,
-                                     "cloud_agrees": cloud_agrees,
+                                     "lock_state": effective_state,
+                                     "bt_state": bt_state,
+                                     "cloud_state": cloud_state,
                                      "door_open": door_open,
                                      "reason": reason,
-                                     "source_entities": [self.lock_bt, self.lock_cloud, self.door],
+                                     "lock_source_used": lock_source_used,
+                                     "source_entities": [self.lock_source, self.lock_fallback, self.door],
                                      "computed_at": datetime.now().isoformat(timespec="seconds"),
                                  })
-
-            await self._watch_divergence(bt, cloud, cloud_agrees)
         except Exception as e:
             self.log(f"entry truth eval failed: {e}", level="ERROR")
-
-    async def _watch_divergence(self, bt, cloud, cloud_agrees):
-        if cloud_agrees:
-            if self._alerted:
-                self.log("Yale cloud twin re-synced with BLE")
-            self._diverged_since = None
-            self._alerted = False
-            return
-        now = datetime.now()
-        if self._diverged_since is None:
-            self._diverged_since = now
-            return
-        minutes = (now - self._diverged_since).total_seconds() / 60.0
-        if minutes >= self.alert_minutes and not self._alerted:
-            self._alerted = True
-            self.log(f"Yale divergence {minutes:.0f} min: BLE={bt} cloud={cloud} - notifying")
-            try:
-                await self._notifier.notify(
-                    title="Front door",
-                    message=(f"Yale cloud shows '{cloud}' but the lock itself (Bluetooth) "
-                             f"says '{bt}'. Trust the lock; the cloud/app is stale."),
-                    target=self.notify_target,
-                )
-            except Exception as e:
-                self.log(f"divergence notify failed: {e}", level="WARNING")
