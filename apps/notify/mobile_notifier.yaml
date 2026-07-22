@@ -20,6 +20,8 @@ MobileNotifier:
       - "notify.mobile_app_mikkels_ofx9p"  # Mikkels Android (OFX9P)
     kristine:
       - "notify.mobile_app_kristine_iphone_2"  # Kristines iPhone
+    claudia:
+      - "notify.mobile_app_claudias_iphone"  # Claudias iPhone (companion app registered 2026-07)
 
   # Default notification service for user (for vacuum errors, etc.)
   # This will always be used when target="user"
