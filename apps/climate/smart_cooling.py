@@ -235,7 +235,7 @@ class SmartCooling(hass.Hass):
         # is occupied. The silence->800W roar cycle is what bothered a person trying to sleep;
         # a parked crawl is accepted until the Remove press ends the night anyway.
         self.bed_sensors = list(a("bed_occupancy_sensors",
-                                  ["binary_sensor.left_bedside", "binary_sensor.right_bedside"]))
+                                  ["binary_sensor.left_bedside", "binary_sensor.right_bedside_in_bed"]))
         self.dry_run = bool(a("dry_run", True))
         self.interval_min = int(a("check_interval_min", 15))
         self.min_cycle_min = int(a("min_cycle_min", 10))

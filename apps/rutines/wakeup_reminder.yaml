@@ -20,7 +20,7 @@ WakeupReminder:
 
   in_bed_entities:
     - binary_sensor.left_bedside
-    - binary_sensor.right_bedside
+    - binary_sensor.right_bedside_in_bed
 
   # Alarm enabled entity (to check if already enabled)
   alarm_enabled_entity: "input_boolean.wakeup_bedroom"

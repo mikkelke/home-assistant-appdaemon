@@ -15,7 +15,7 @@ bedroom_lights:
   # Reliable ON-edge only signal to START a bed-light session; their OFF edge is ignored.
   withings_in_bed_entities:
     - binary_sensor.left_bedside
-    - binary_sensor.right_bedside
+    - binary_sensor.right_bedside_in_bed
 
   switch_device_id: "951e07324391856c37850361629523d7"
   remote_device_id: "fde0ce72582c723f4d8b729b522fc2fa"

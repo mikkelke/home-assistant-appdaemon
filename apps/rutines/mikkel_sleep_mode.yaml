@@ -11,7 +11,7 @@ MikkelSleepMode:
   # Either bedside sensor counts as in bed (whole bed is yours now).
   in_bed_entities:
     - binary_sensor.left_bedside
-    - binary_sensor.right_bedside
+    - binary_sensor.right_bedside_in_bed
   sleep_mode_entity: input_boolean.mikkel_sleep_mode
 
   # Companion app: command_dnd (see mobile_notifier.yaml for service name)
