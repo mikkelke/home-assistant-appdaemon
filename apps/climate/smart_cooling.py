@@ -148,6 +148,11 @@ class SmartCooling(hass.Hass):
                 name, _, ent = str(item).partition("=")
                 if ent:
                     self.window_contact_entities[name.strip()] = ent.strip()
+        # The sleep-plan's reality anchor is the BEDROOM ZONE only (its floor + mid wall + the
+        # kitchen wall it conducts against), computed inline in _publish_sleep_plan. The A/C is
+        # bedroom-only and the bedroom is its OWN thermal zone (user 2026-07-22): the far side
+        # of the apartment (living/dining) can be a different temperature, so those rooms must
+        # NOT ground the bedroom's projection.
         self.sleep_plan_entity = a("sleep_plan_entity", "sensor.sleep_plan")
         self.ac_noise_penalty_kr = float(a("ac_noise_penalty_kr", 0.5))
         # --- fixed params (not user-facing) ---
@@ -180,6 +185,14 @@ class SmartCooling(hass.Hass):
         self.wm_b_prev = float(a("wm_b_prev", 0.287))
         self.wm_safety_margin = float(a("wm_safety_margin", 0.0))
         self.wm_nowcast_relief = float(a("wm_nowcast_relief", 1.5))
+        # Sleep-plan GROUNDING (advisory only -- never touches actuation; see
+        # _publish_sleep_plan / cm.grounded_equilibrium). On a cool/cooling night the sealed
+        # room drifts toward the cool night apartment, not the weather model's DAYTIME peak,
+        # so the plan caps the equilibrium at apartment_now + wm_reality_margin. A genuinely
+        # warm night (night_outdoor >= comfort_limit - wm_warm_night_margin) keeps the raw
+        # weather value so pre-cool-ahead-of-a-hot-night is preserved.
+        self.wm_reality_margin = float(a("wm_reality_margin", 1.0))
+        self.wm_warm_night_margin = float(a("wm_warm_night_margin", 1.0))
         self.wm_clearsky_peak = float(a("wm_clearsky_peak", 700.0))
         self.wm_cloud_atten = float(a("wm_cloud_atten", 0.75))
         self.wm_peak_hour = int(a("wm_peak_hour", 15))
@@ -756,6 +769,26 @@ class SmartCooling(hass.Hass):
                     vals.append(row["temp"])
         return max(vals) if vals else None
 
+    async def _night_outdoor_min(self, now):
+        """Tonight's minimum outdoor temperature (advisory grounding input for the sleep
+        plan -- see cm.grounded_equilibrium): the coldest forecast temp from now through the
+        next 07:00. Falls back to the current outdoor reading when the forecast is missing or
+        has no rows in the overnight window -- current is usually >= the overnight min, so
+        the fallback errs toward keeping the weather value (warm/safe). None only if neither
+        source yields anything."""
+        cur = await self._num(self.outdoor_sensor, None)
+        fc = await self._get_forecast(now)
+        if not fc:
+            return cur
+        morning = now.replace(hour=7, minute=0, second=0, microsecond=0)
+        if now.hour >= 7:
+            morning += timedelta(days=1)
+        temps = [row["temp"] for row in fc if now <= row["dt"] <= morning]
+        if not temps:
+            return cur
+        night_min = min(temps)
+        return night_min if cur is None else min(night_min, cur)
+
     async def _weather_equilibrium(self, now, kitchen, mid, floor, e_legacy):
         """Verified Model D equilibrium from weather (solar + outdoor peak + one day of
         thermal-mass memory). Returns (E, dbg). Degrades to e_legacy -- EXACTLY current
@@ -1096,7 +1129,15 @@ class SmartCooling(hass.Hass):
 
         Projects from e_active (weather Model D when live, else e_legacy) instead of the warm
         kitchen proxy -- the fix for the reported drift (20C room, window open -> the old
-        dashboard still said 'deploy AC to ~23')."""
+        dashboard still said 'deploy AC to ~23').
+
+        e_active is the weather model's DAYTIME apartment peak. Using it directly as the
+        overnight equilibrium is only valid on a HOT night; on a cool/cooling night the
+        sealed room drifts toward the cool NIGHT apartment, not the daytime peak, so the plan
+        would recommend cooling a flat that's already below its limit and getting colder
+        (2026-07-22: every room ~21.7C, outdoor 17->~15C, yet the plan said 'run the AC ->
+        peak 24.6C'). cm.grounded_equilibrium reality-checks e_active against apartment_now +
+        a margin unless the night stays warm enough to hold the day's heat -- see that fn."""
         try:
             t_in = await self._num(self.comfort_temp_entity, None)
             rh_in = await self._num(self.comfort_rh_entity, None)
@@ -1115,13 +1156,34 @@ class SmartCooling(hass.Hass):
             price_now = self._price_for(pm, now, await self._num(self.price_entity, 1.7))
             cheapest = self._cheapest_to(pm, now, self._deadline(now), price_now)
             ceiling, _ = await self._effective_ceiling(now)
+            # Bedroom-zone reality anchor (the A/C is bedroom-only and the bedroom is its own
+            # thermal zone -- user 2026-07-22). The sealed room can't drift materially warmer
+            # than ITS OWN zone is right now on a cool night: its floor (passed in) + mid wall +
+            # the kitchen wall it conducts against. NOT the living/dining rooms. Warmest of the
+            # three (errs deep -> safe).
+            zone_readings = [floor,
+                             await self._num(self.mid_sensor, None),
+                             await self._num(self.kitchen_sensor, None)]
+            zone_vals = [v for v in zone_readings if v is not None]
+            bedroom_zone_now = max(zone_vals) if zone_vals else None
+            night_outdoor = await self._night_outdoor_min(now)
+            plan_equilibrium = cm.grounded_equilibrium(
+                e_active, bedroom_zone_now, night_outdoor, ceiling,
+                self.wm_reality_margin, self.wm_warm_night_margin)
+            grounded = (plan_equilibrium is not None and e_active is not None
+                        and plan_equilibrium < e_active - 0.05)
             plan = cm.plan_sleep(cm.SleepPlanInputs(
-                floor=floor, equilibrium=e_active, rise_frac=self._rise_frac,
+                floor=floor, equilibrium=plan_equilibrium, rise_frac=self._rise_frac,
                 zone_offset=self.zone_offset, comfort_limit=ceiling, min_temp=self.min_temp,
                 floor_cool_cph=self.floor_cool_cph, cool_power_kw=self.cool_kw,
                 cheapest_price=cheapest, outdoor_temp=t_out, outdoor_dew=outdoor_dew,
                 indoor_dew=indoor_dew, open_windows=open_windows,
                 noise_penalty_kr=self.ac_noise_penalty_kr))
+            detail = plan["detail"]
+            if grounded:
+                detail += (f" (Grounded on reality: the bedroom zone is ~{bedroom_zone_now:.1f}C "
+                           f"now and tonight's low is ~{night_outdoor:.1f}C, so the sealed room "
+                           f"drifts toward that, not the daytime peak {e_active:.1f}C.)")
             # Load-bearing strings (cost_label/windows_summary) never rely on a 0/False/None
             # value that AppDaemon 4.5.13 would drop; est_cost_kr==0 legitimately vanishes and
             # the dashboard reads cost_label instead. open_windows stays a list ([] survives).
@@ -1130,22 +1192,36 @@ class SmartCooling(hass.Hass):
                 "icon": "mdi:bed-clock",
                 "recommendation": plan["recommendation"],
                 "headline": plan["headline"],
-                "detail": plan["detail"],
-                "reason": plan["detail"],
+                "detail": detail,
+                "reason": detail,
                 "comfort_limit": plan["comfort_limit"],
                 "est_cost_kr": plan["est_cost_kr"],
                 "cost_label": plan["cost_label"],
                 "open_windows": plan["open_windows"],
                 "windows_summary": plan["windows_summary"],
-                "source_entities": [self.floor_sensor, self.comfort_temp_entity,
+                "source_entities": [self.floor_sensor, self.mid_sensor, self.kitchen_sensor,
+                                    self.comfort_temp_entity,
                                     self.comfort_rh_entity, self.outdoor_sensor,
                                     self.outdoor_rh_entity, self.price_entity,
                                     self.weather_forecast_entity,
                                     *self.window_contact_entities.values()],
                 "computed_at": now.isoformat(timespec="seconds"),
+                # Transparency: the raw weather peak, the reality anchors, and the grounded
+                # value actually projected. All non-zero floats/strings so AppDaemon 4.5.13's
+                # False/0/None drop can't silently strip a load-bearing one; grounded is a
+                # STRING ("true"/"false") for the same reason (a raw False would vanish).
+                "grounded": "true" if grounded else "false",
             }
             if plan["projected_peak"] is not None:
                 attrs["projected_peak"] = plan["projected_peak"]
+            if e_active is not None:
+                attrs["equilibrium_weather"] = round(e_active, 1)
+            if plan_equilibrium is not None:
+                attrs["equilibrium_planned"] = round(plan_equilibrium, 1)
+            if bedroom_zone_now is not None:
+                attrs["bedroom_zone_now"] = round(bedroom_zone_now, 1)
+            if night_outdoor is not None:
+                attrs["night_outdoor_min"] = round(night_outdoor, 1)
             await self.set_state(self.sleep_plan_entity, state=plan["recommendation"],
                                  replace=True, attributes=attrs)
         except Exception as e:

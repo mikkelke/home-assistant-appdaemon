@@ -41,6 +41,53 @@ class ModelDApartment(unittest.TestCase):
         self.assertEqual(below, at)
 
 
+class GroundedEquilibrium(unittest.TestCase):
+    """Reality-check for the ADVISORY sleep plan: the sealed room can't drift materially
+    warmer than the apartment is right now UNLESS the night stays warm enough to hold the
+    day's heat. Cool night -> cap at apartment_now + margin; warm night -> raw weather value."""
+
+    def test_cool_night_grounds_to_apartment_plus_margin(self):
+        # THE 2026-07-22 case: weather peak 24.7, whole flat ~21.7C, outdoor low ~15C,
+        # limit 22.5. warm-night threshold = 22.5 - 1.0 = 21.5; 15 < 21.5 -> cool night ->
+        # min(24.7, 21.7 + 1.0) = 22.7 (well below the daytime peak).
+        self.assertAlmostEqual(
+            cm.grounded_equilibrium(24.7, 21.7, 15.0, 22.5), 22.7, places=6)
+
+    def test_cool_night_but_weather_already_below_anchor_keeps_weather(self):
+        # weather already cooler than apartment_now + margin -> min() keeps the weather value
+        self.assertAlmostEqual(
+            cm.grounded_equilibrium(21.0, 21.7, 15.0, 22.5), 21.0, places=6)
+
+    def test_warm_night_returns_weather_unchanged(self):
+        # night_outdoor 22 >= 22.5 - 1.0 = 21.5 -> genuinely warm night: preserve the raw
+        # weather peak so pre-cool-ahead-of-a-hot-night is NOT grounded away.
+        self.assertEqual(cm.grounded_equilibrium(24.7, 21.7, 22.0, 22.5), 24.7)
+
+    def test_warm_night_boundary_is_inclusive(self):
+        # exactly at comfort_limit - warm_night_margin counts as warm (>=)
+        self.assertEqual(cm.grounded_equilibrium(26.0, 20.0, 21.5, 22.5), 26.0)
+        # just below the boundary is a cool night -> grounds
+        self.assertAlmostEqual(
+            cm.grounded_equilibrium(26.0, 20.0, 21.49, 22.5), 21.0, places=6)
+
+    def test_none_apartment_falls_back_to_weather(self):
+        self.assertEqual(cm.grounded_equilibrium(24.7, None, 15.0, 22.5), 24.7)
+
+    def test_none_night_outdoor_falls_back_to_weather(self):
+        self.assertEqual(cm.grounded_equilibrium(24.7, 21.7, None, 22.5), 24.7)
+
+    def test_none_weather_returned_as_is(self):
+        self.assertIsNone(cm.grounded_equilibrium(None, 21.7, 15.0, 22.5))
+
+    def test_custom_margins(self):
+        # reality_margin 0.5 -> min(24.7, 21.7 + 0.5) = 22.2; warm_night_margin 2.0 ->
+        # threshold 22.5 - 2.0 = 20.5, and 15 < 20.5 so still a cool night
+        self.assertAlmostEqual(
+            cm.grounded_equilibrium(24.7, 21.7, 15.0, 22.5,
+                                    reality_margin=0.5, warm_night_margin=2.0),
+            22.2, places=6)
+
+
 class CoastPeak(unittest.TestCase):
     def test_forward_law(self):
         self.assertAlmostEqual(cm.coast_peak(20.0, 25.0, 0.5, 1.0), 23.5)
@@ -223,6 +270,22 @@ class PlanSleep(unittest.TestCase):
         # gap big, but outside is humid -> opening a window imports water -> 'ac'
         plan = cm.plan_sleep(self._inp(floor=24.0, equilibrium=26.0, comfort_limit=23.0,
                                        outdoor_temp=15.0, outdoor_dew=18.0, indoor_dew=12.0,
+                                       cheapest_price=2.0))
+        self.assertEqual(plan["recommendation"], "ac")
+
+    def test_cool_but_barely_humid_is_windows_not_ac(self):
+        # 2026-07-22 knife-edge: cool outside, outdoor dew a hair ABOVE indoor -> a window
+        # still COOLS, so it must NOT flip to 'ac' on a humidity tie.
+        plan = cm.plan_sleep(self._inp(floor=22.0, equilibrium=22.7, comfort_limit=22.5,
+                                       outdoor_temp=15.0, outdoor_dew=13.7, indoor_dew=13.6,
+                                       cheapest_price=1.6))
+        self.assertNotEqual(plan["recommendation"], "ac")
+
+    def test_cool_but_genuinely_muggy_is_ac(self):
+        # Cool outside but the outdoor air is MEANINGFULLY muggier (dew +3.5 over indoor) ->
+        # opening a window imports real moisture -> 'ac' still wins.
+        plan = cm.plan_sleep(self._inp(floor=24.0, equilibrium=26.0, comfort_limit=23.0,
+                                       outdoor_temp=15.0, outdoor_dew=15.5, indoor_dew=12.0,
                                        cheapest_price=2.0))
         self.assertEqual(plan["recommendation"], "ac")
 

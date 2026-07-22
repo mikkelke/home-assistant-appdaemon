@@ -1185,6 +1185,130 @@ class EvaluateTickWiring(unittest.TestCase):
         self.assertIn("equilibrium_weather", attrs)
 
 
+class PublishSleepPlanGrounding(unittest.TestCase):
+    """End-to-end _publish_sleep_plan for the 2026-07-22 drift: the weather model's DAYTIME
+    peak (e_active ~24.7) fed straight into the plan recommended cooling a flat that's already
+    ~21.7C on a cool (~15C) night. Grounding caps the projected equilibrium at bedroom_zone_now
+    + margin, so the plan flips OFF the AC. Exercises the real grounding math + bedroom-zone anchor
+    + _night_outdoor_min; only the leaf I/O (_num/_state/_attr/_get_forecast/_effective_ceiling/
+    set_state) is stubbed. ADVISORY ONLY -- asserts NO climate command is ever issued."""
+
+    NOW = datetime(2026, 7, 22, 12, 0)
+
+    def _app(self, e_active=24.7, floor=22.0, warm_night_margin=1.0):
+        app = make_app(rise_frac=0.5)
+        app.comfort_temp_entity = "sensor.bed_temp"
+        app.comfort_rh_entity = "sensor.bed_rh"
+        app.outdoor_sensor = "sensor.outdoor"
+        app.outdoor_rh_entity = "sensor.outdoor_rh"
+        app.mid_sensor = "sensor.mid"
+        app.kitchen_sensor = "sensor.kitchen"
+        app.floor_sensor = "sensor.floor"
+        app.price_entity = "sensor.price"
+        app.weather_forecast_entity = "weather.forecast_home"
+        app.sleep_plan_entity = "sensor.sleep_plan"
+        app.window_contact_entities = {"bedroom": "binary_sensor.bedroom_window"}
+        app.zone_offset = 1.0
+        app.floor_cool_cph = 1.0
+        app.cool_kw = 0.5
+        app.ac_noise_penalty_kr = 0.5
+        app.wm_reality_margin = 1.0
+        app.wm_warm_night_margin = warm_night_margin
+
+        # Bedroom zone ~21.7-22.0C now (floor 22.0 arg, mid 21.7, kitchen 21.9); outdoor 15C.
+        nums = {"sensor.bed_temp": 21.7, "sensor.bed_rh": 60.0,
+                "sensor.outdoor": 15.0, "sensor.outdoor_rh": 60.0,
+                "sensor.mid": 21.7, "sensor.kitchen": 21.9,
+                "sensor.price": 1.7}
+
+        async def _num(entity, default):
+            return nums.get(entity, default)
+        app._num = _num
+
+        async def _state(entity):
+            return "on" if entity == "binary_sensor.bedroom_window" else None
+        app._state = _state
+
+        async def _attr(entity, key, default=None):
+            return default   # no price arrays -> empty price map, cheapest = price_now
+        app._attr = _attr
+
+        async def _fc(now):
+            return [{"dt": datetime(2026, 7, 22, 20, 0), "temp": 16.0, "cloud": None},
+                    {"dt": datetime(2026, 7, 23, 3, 0), "temp": 15.0, "cloud": None},
+                    {"dt": datetime(2026, 7, 23, 6, 0), "temp": 15.5, "cloud": None}]
+        app._get_forecast = _fc
+
+        async def _eff(now):
+            return 22.5, 23.0   # comfort-lowered ceiling tonight
+        app._effective_ceiling = _eff
+
+        app._set_state_calls = []
+
+        async def set_state(entity, **kw):
+            app._set_state_calls.append((entity, kw))
+        app.set_state = set_state
+        app._e_active = e_active
+        app._floor = floor
+        return app
+
+    def _run(self, app):
+        import asyncio
+        asyncio.run(app._publish_sleep_plan(self.NOW, app._floor, app._e_active))
+        self.assertEqual(len(app._set_state_calls), 1)
+        entity, kw = app._set_state_calls[0]
+        self.assertEqual(entity, "sensor.sleep_plan")
+        return kw["state"], kw["attributes"]
+
+    def test_cool_apartment_cool_night_flips_off_ac(self):
+        app = self._app()
+        state, attrs = self._run(app)
+        # THE fix: grounded -> no AC. Not 'ac', not 'hybrid' (both involve the compressor).
+        self.assertIn(state, ("nothing", "windows"))
+        self.assertNotIn(state, ("ac", "hybrid"))
+        self.assertEqual(attrs["recommendation"], state)
+        # transparency attrs: raw weather peak vs the grounded value actually projected
+        self.assertEqual(attrs["grounded"], "true")
+        self.assertEqual(attrs["equilibrium_weather"], 24.7)
+        self.assertEqual(attrs["equilibrium_planned"], 23.0)   # min(24.7, 22.0 + 1.0)
+        self.assertEqual(attrs["bedroom_zone_now"], 22.0)      # max of floor/mid/kitchen
+        self.assertEqual(attrs["night_outdoor_min"], 15.0)
+        self.assertIn("Grounded on reality", attrs["detail"])
+
+    def test_grounding_is_what_flips_it_warm_night_still_wants_ac(self):
+        # Same cool flat, but force the "warm night" branch (huge warm_night_margin) so the
+        # raw daytime peak 24.7 drives the plan -> the AC is back in the recommendation.
+        app = self._app(warm_night_margin=100.0)
+        state, attrs = self._run(app)
+        self.assertEqual(attrs["grounded"], "false")
+        self.assertIn(state, ("ac", "hybrid"))          # AC involved without grounding
+        self.assertEqual(attrs["equilibrium_planned"], 24.7)   # ungrounded = raw weather peak
+
+    def test_advisory_only_issues_no_climate_command(self):
+        # The publisher must touch ONLY set_state(sensor.sleep_plan); assert it never calls
+        # call_service (a climate command would be a hard bug -- this sensor is advisory).
+        app = self._app()
+        app._called_services = []
+
+        async def call_service(*a, **k):
+            app._called_services.append((a, k))
+        app.call_service = call_service
+        self._run(app)
+        self.assertEqual(app._called_services, [])
+
+    def test_missing_zone_sensors_fall_back_to_raw_weather(self):
+        # If every bedroom-zone reading is None AND floor is None, bedroom_zone_now is None ->
+        # grounding can't anchor -> raw e_active is used (None-safe, errs warm).
+        app = self._app(floor=None)
+
+        async def _num_none(entity, default):
+            return default   # all temp sensors missing (default None); price keeps its 1.7
+        app._num = _num_none
+        state, attrs = self._run(app)
+        self.assertEqual(attrs["grounded"], "false")
+        self.assertNotIn("bedroom_zone_now", attrs)   # None-valued attrs are omitted
+
+
 class GoldenModelMath(unittest.TestCase):
     """Lock the byte-identical-actuation claim into CI: the shared climate_model fns
     reproduce smart_cooling's FORMER inline math on a fixed grid. The `_old_*` bodies below

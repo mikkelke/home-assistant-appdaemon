@@ -68,6 +68,39 @@ def model_d_apartment(solar_mean, outdoor_max, prev_kitchen_max, coeffs: ModelDC
             + coeffs.b_prev * prev_kitchen_max)
 
 
+def grounded_equilibrium(e_weather, apartment_now, night_outdoor, comfort_limit,
+                         reality_margin=1.0, warm_night_margin=1.0):
+    """Reality-check the weather equilibrium before it drives the ADVISORY sleep plan.
+
+    ``e_weather`` is the weather model's DAYTIME apartment-peak prediction. Feeding that
+    straight into the coast law treats the daytime peak as the overnight equilibrium the
+    sealed room drifts toward -- correct only on a HOT night, when the day's heat is still
+    in the mass and the outdoor air holds it there. On a COOL/cooling night the sealed room
+    drifts toward the cool NIGHT apartment (a few degrees below the daytime peak), not the
+    peak, so projecting from ``e_weather`` over-predicts and false-alarms "run the AC" while
+    every room already sits degrees below its own limit.
+
+    Rule:
+      - Warm night (``night_outdoor >= comfort_limit - warm_night_margin``): the night will
+        hold the daytime heat, so pre-cool-ahead-of-a-hot-night is real -> return
+        ``e_weather`` unchanged (the weather model's own value).
+      - Cool/cooling night: the sealed room can't drift materially warmer than the apartment
+        is right now -> return ``min(e_weather, apartment_now + reality_margin)``.
+
+    Pure and None-safe: if ``apartment_now`` or ``night_outdoor`` is missing there's no
+    trustworthy reality anchor, so fall back to ``e_weather`` (errs warm/safe -- keeps the
+    weather value). A None ``e_weather`` is returned as-is (the coast law already treats a
+    missing equilibrium as "cannot project").
+    """
+    if e_weather is None:
+        return e_weather
+    if apartment_now is None or night_outdoor is None:
+        return e_weather
+    if night_outdoor >= comfort_limit - warm_night_margin:
+        return e_weather
+    return min(e_weather, apartment_now + reality_margin)
+
+
 # ------------------------------------------------------------- coast law (one copy)
 
 def coast_peak(floor, equilibrium, rise_frac, zone_offset) -> Optional[float]:
@@ -238,6 +271,8 @@ class SleepPlanInputs:
     noise_penalty_kr: float = 0.5
     peak_margin_c: float = 0.2
     hybrid_gap_c: float = 1.5
+    temp_margin_c: float = 0.5      # outdoor must be at least this far below the limit to cool
+    muggy_slack_c: float = 2.0      # outdoor dew this much above indoor before it's "too muggy"
 
 
 def _windows_phrase(open_windows) -> str:
@@ -261,11 +296,12 @@ def plan_sleep(inp: SleepPlanInputs) -> dict:
 
     projected_peak = coast_peak(floor, equilibrium, rise_frac, zone_offset).
       - peak within peak_margin_c of the limit           -> 'nothing' (free)
-      - else windows_can_cool(limit, outdoor...) True:
+      - else cooler outside (temp) AND not meaningfully muggier than indoors:
           gap <= hybrid_gap_c                             -> 'windows' (free)
           gap  > hybrid_gap_c                             -> 'hybrid'  (windows now + AC backup)
-      - else (warm/muggy/unknown outside)                -> 'ac'
-    Windows always beat equal-comfort AC (0 < ac_cost + penalty).
+      - else (too WARM, or genuinely MUGGY, outside)      -> 'ac'
+    A window cools whenever it's cooler outside; humidity merely level with indoors is a note,
+    NOT a reason to run the compressor. Windows always beat equal-comfort AC (0 < ac_cost + pen).
 
     Returns a plain dict (recommendation/projected_peak/comfort_limit/est_cost_kr/
     cost_label/headline/detail/open_windows/windows_summary). ADVISORY ONLY.
@@ -311,24 +347,36 @@ def plan_sleep(inp: SleepPlanInputs) -> dict:
         detail = (f"Projected peak {peak_disp:.1f}C stays at/under the {limit:.1f}C sleep "
                   f"limit -- nothing needed tonight.")
     else:
-        can_cool, why = windows_can_cool(limit, inp.outdoor_temp,
-                                         inp.outdoor_dew, inp.indoor_dew)
-        if can_cool and gap <= inp.hybrid_gap_c:
-            rec, cost = "windows", 0.0
-            headline = "Open a window"
-            detail = (f"Projected peak {peak_disp:.1f}C is {gap:.1f}C over the {limit:.1f}C "
-                      f"limit, but {why} -- a window covers it for free.")
-        elif can_cool:
-            rec, cost = "hybrid", ac_cost
-            headline = f"Open windows now, AC backup {_cost_label(ac_cost)}"
-            detail = (f"Projected peak {peak_disp:.1f}C is {gap:.1f}C over the {limit:.1f}C "
-                      f"limit -- open windows now ({why}); keep the AC ready "
-                      f"({_cost_label(ac_cost)}) if the room won't settle.")
+        # A window COOLS whenever it's cooler outside than the target -- humidity is a separate
+        # comfort question, not a reason to burn the compressor. Only run the AC when a window
+        # genuinely can't do the job: too WARM outside, OR the outdoor air is meaningfully
+        # MUGGIER than indoors (opening it imports real moisture -- not a knife-edge tie).
+        cool_enough = (inp.outdoor_temp is not None
+                       and inp.outdoor_temp < limit - inp.temp_margin_c)
+        too_muggy = (inp.outdoor_dew is not None and inp.indoor_dew is not None
+                     and inp.outdoor_dew - inp.indoor_dew > inp.muggy_slack_c)
+        if cool_enough and not too_muggy:
+            humid_note = ("" if (inp.outdoor_dew is None or inp.indoor_dew is None
+                                 or inp.outdoor_dew <= inp.indoor_dew)
+                          else " (it won't lower the humidity, but a window still cools it)")
+            if gap <= inp.hybrid_gap_c:
+                rec, cost = "windows", 0.0
+                headline = "Open a window"
+                detail = (f"Projected peak {peak_disp:.1f}C is {gap:.1f}C over the {limit:.1f}C "
+                          f"limit, and it's cooler outside -- a window covers it for free.{humid_note}")
+            else:
+                rec, cost = "hybrid", ac_cost
+                headline = f"Open windows now, AC backup {_cost_label(ac_cost)}"
+                detail = (f"Projected peak {peak_disp:.1f}C is {gap:.1f}C over the {limit:.1f}C "
+                          f"limit -- open windows now (cooler outside); keep the AC ready "
+                          f"({_cost_label(ac_cost)}) if the room won't settle.{humid_note}")
         else:
             rec, cost = "ac", ac_cost
             headline = f"Run the AC {_cost_label(ac_cost)}"
+            reason = ("it's not cool enough outside to open a window" if not cool_enough
+                      else "opening a window would import muggy outdoor air")
             detail = (f"Projected peak {peak_disp:.1f}C is {gap:.1f}C over the {limit:.1f}C "
-                      f"limit and {why} -- pre-cool with the AC ({_cost_label(ac_cost)}).")
+                      f"limit and {reason} -- pre-cool with the AC ({_cost_label(ac_cost)}).")
 
     base.update({
         "recommendation": rec,

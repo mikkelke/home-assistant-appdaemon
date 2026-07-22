@@ -146,6 +146,9 @@ SmartCooling:
     - "kitchen=binary_sensor.kitchen_window_contact"
     - "living room=binary_sensor.living_room_window_contact"
     - "kristines room=binary_sensor.kristines_room_window_contact"
+  # The sleep-plan reality anchor is the BEDROOM ZONE only (floor + mid + the kitchen wall it
+  # conducts against), computed inline -- the bedroom is its own thermal zone, so far rooms
+  # (living/dining) must not ground it (user 2026-07-22).
 
   # SAFE ROLLOUT: runs + learns + publishes the plan, but NEVER touches the AC.
   dry_run: false   # live since 2026-07-13 (user: "the automation should take care of it"); master toggle still gates everything
@@ -174,6 +177,15 @@ SmartCooling:
   wm_b_prev: 0.287
   wm_safety_margin: 0.0     # add-on warm bias on E if shadow shows under-prediction
   wm_nowcast_relief: 1.5    # max degrees the model may predict below the live warmest reading
+  # Sleep-plan grounding (ADVISORY ONLY -- sensor.sleep_plan, never actuation). e_active is
+  # the weather model's DAYTIME apartment peak; a cool/cooling night sees the sealed room
+  # drift toward the cool NIGHT apartment instead, so the plan caps the projected equilibrium
+  # at apartment_now + wm_reality_margin. A genuinely warm night (tonight's outdoor low >=
+  # comfort_limit - wm_warm_night_margin) keeps the raw daytime value so a real pre-cool-
+  # ahead-of-a-hot-night still fires. Fixes 2026-07-22 (whole flat ~21.7C, outdoor 17->15C,
+  # yet the plan said "run the AC -> peak 24.6C").
+  wm_reality_margin: 1.0
+  wm_warm_night_margin: 1.0
   wm_clearsky_peak: 700.0   # clear-sky half-sine amplitude (W/m2) for remaining-daylight solar
   wm_cloud_atten: 0.75      # cloud attenuation of the clear-sky estimate
   wm_peak_hour: 15          # before this hour a missing forecast forces legacy (hot-day guard)
