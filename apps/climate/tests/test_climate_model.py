@@ -11,6 +11,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import climate_model as cm  # noqa: E402
 
 
+class ParseForecastEnvelope(unittest.TestCase):
+    """smart_cooling and deploy_advisor's shared weather.get_forecasts envelope digger."""
+
+    ENTITY = "weather.forecast_home"
+    ITEMS = [{"datetime": "2026-07-22T00:00:00+00:00", "temperature": 20.0},
+             {"datetime": "2026-07-22T01:00:00+00:00", "temperature": 19.5}]
+
+    def test_standard_envelope(self):
+        resp = {"result": {"response": {self.ENTITY: {"forecast": self.ITEMS}}}}
+        self.assertEqual(cm.parse_forecast_envelope(resp, self.ENTITY), self.ITEMS)
+
+    def test_recursive_find_fallback(self):
+        # the digging chain doesn't land on a list (shape drifted / wrong entity key) ->
+        # fall back to searching the whole envelope for the first forecast-shaped list.
+        resp = {"result": {"response": {"weather.some_other_entity": {"forecast": self.ITEMS}}}}
+        self.assertEqual(cm.parse_forecast_envelope(resp, self.ENTITY), self.ITEMS)
+
+    def test_garbage_returns_empty_list(self):
+        self.assertEqual(cm.parse_forecast_envelope(None, self.ENTITY), [])
+        self.assertEqual(cm.parse_forecast_envelope("not a dict", self.ENTITY), [])
+        self.assertEqual(cm.parse_forecast_envelope({"nothing": "useful"}, self.ENTITY), [])
+
+
 class LegacyEquilibrium(unittest.TestCase):
     def test_all_none_uses_fallback_plus_offset(self):
         self.assertEqual(cm.legacy_equilibrium(None, None, None, 0.5), 25.0)
@@ -293,6 +316,32 @@ class PlanSleep(unittest.TestCase):
         plan = cm.plan_sleep(self._inp(open_windows=[]))
         self.assertEqual(plan["windows_summary"], "all closed")
         self.assertEqual(plan["open_windows"], [])
+
+
+class NightPeakCoastLawEquivalence(unittest.TestCase):
+    """deploy_advisor's night_peak used to inline f + (e-f)*r + zone_uplift; it is now
+    expressed through the shared coast_peak. Locks the re-expression: same numbers."""
+
+    C = {"zone_uplift": 1.5}
+
+    @staticmethod
+    def _old_inline_formula(f, k, b, r, c):
+        e = (k + b + f) / 3.0
+        return f + (e - f) * r + c["zone_uplift"]
+
+    def test_matches_old_inline_formula_on_value_grids(self):
+        grid = [
+            (23.0, 24.5, 24.0, 0.502),   # typical mild night
+            (20.0, 25.0, 22.0, 0.7),     # deep learned rise_frac
+            (18.5, 18.5, 18.5, 0.3),     # everything equal -> no equilibrium pull
+            (16.0, 30.0, 20.0, 0.05),    # clamped-low rise_frac, hot kitchen
+        ]
+        for f, k, b, r in grid:
+            with self.subTest(f=f, k=k, b=b, r=r):
+                self.assertAlmostEqual(
+                    cm.night_peak(f, k, b, r, self.C),
+                    self._old_inline_formula(f, k, b, r, self.C),
+                    places=9)
 
 
 if __name__ == "__main__":

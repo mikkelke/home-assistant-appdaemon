@@ -682,21 +682,7 @@ class SmartCooling(hass.Hass):
         except Exception as e:
             self.log(f"weather-model forecast fetch failed ({e})", level="WARNING")
             return None
-        node = resp
-        for key in ("result", "response", self.weather_forecast_entity, "forecast"):
-            if isinstance(node, dict) and key in node:
-                node = node[key]
-        if not isinstance(node, list):   # dig for any forecast list in the envelope
-            def find(n):
-                if isinstance(n, list) and n and isinstance(n[0], dict) and "temperature" in n[0]:
-                    return n
-                if isinstance(n, dict):
-                    for v in n.values():
-                        r = find(v)
-                        if r is not None:
-                            return r
-                return None
-            node = find(resp) or []
+        node = cm.parse_forecast_envelope(resp, self.weather_forecast_entity)
         tz = (await self.get_now()).tzinfo
         out = []
         for item in node:

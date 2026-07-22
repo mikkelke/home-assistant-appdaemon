@@ -14,7 +14,8 @@ agent; chained 7-day validation peak MAE 0.46 C, target was 0.5):
   bedroom 23:00 aux:      B' = 1.062*F' + 0.063*K' - 2.918
   sealed-night coast:     floor_peak = F + (E - F) * r,  E = mean(K, B, F)
                           zone_peak  = floor_peak + zone_uplift (1.5 C)
-  r (rise_frac) is self-learned by SmartCooling (smart_cooling_state.json).
+  r (rise_frac) is self-learned by SmartCooling, read live from its published
+  sensor.smart_cooling_status attribute (no longer a cross-app state-file read).
 
 Forecast: met.no hourly via weather.get_forecasts (raw WS envelope - dig
 result.response.<entity>.forecast; can hang -> wait_for timeout). t_max = daily
@@ -41,77 +42,20 @@ from datetime import datetime, timedelta
 
 import appdaemon.plugins.hass.hassapi as hass
 
+import climate_model as cm  # pure math (zero appdaemon imports; import-safe from app + tests)
+
 # ---------------------------------------------------------------- pure model
-# A1 fit constants (2026-07-09). Overridable from yaml `fit:` block.
-DEFAULT_FIT = {
-    "k_tmax": 0.137,
-    "k_ev": 0.508,
-    "k_const": 0.799,
-    "comfort_floor": 22.25,
-    "f_k": 0.634,
-    "f_ev": 0.138,
-    "f_const": 0.472,
-    "b_f": 1.062,
-    "b_k": 0.063,
-    "b_const": -2.918,
-    "zone_uplift": 1.5,
-}
-
-
-def kitchen_chain(k, t_max, t_ev, c):
-    return (k + c["k_tmax"] * max(0.0, t_max - k)
-            + c["k_ev"] * (max(c["comfort_floor"], t_ev) - k) + c["k_const"])
-
-
-def floor_chain(f, k_next, t_ev, c):
-    return f + c["f_k"] * (k_next - f) + c["f_ev"] * min(0.0, t_ev - f) + c["f_const"]
-
-
-def b23_aux(f_next, k_next, c):
-    return c["b_f"] * f_next + c["b_k"] * k_next + c["b_const"]
-
-
-def night_peak(f, k, b, rise_frac, c):
-    e = (k + b + f) / 3.0
-    return f + (e - f) * rise_frac + c["zone_uplift"]
-
-
-def project_nights(k0, f0, b0, days, rise_frac, c):
-    """days = [{'date', 't_max', 't_ev'}, ...]; day 0 = tonight (anchors are
-    today's measured state, so tonight uses them directly). Returns one dict
-    per night with the projected sleeping-zone peak at ~07:00."""
-    out = []
-    k, f, b = k0, f0, b0
-    for i, d in enumerate(days):
-        if i > 0:  # chain today's state forward through day i's weather
-            k_next = kitchen_chain(k, d["t_max"], d["t_ev"], c)
-            f = floor_chain(f, k_next, d["t_ev"], c)
-            k = k_next
-            b = b23_aux(f, k, c)
-        peak = night_peak(f, k, b, rise_frac, c)
-        out.append({"date": d["date"], "t_max": round(d["t_max"], 1),
-                    "t_ev": round(d["t_ev"], 1), "kitchen": round(k, 1),
-                    "floor": round(f, 1), "peak": round(peak, 1)})
-    return out
-
-
-def daily_from_hourly(hourly, today):
-    """hourly = [(local_dt, temp)]; group into calendar days with t_max
-    (06-23h high) and t_ev (22:00, fallback 21/23h). Skips incomplete days."""
-    days = {}
-    for dt, temp in hourly:
-        days.setdefault(dt.date(), []).append((dt.hour, temp))
-    out = []
-    for date in sorted(days):
-        if date < today:
-            continue
-        hours = dict(days[date])
-        t_ev = hours.get(22, hours.get(21, hours.get(23)))
-        daytime = [t for h, t in hours.items() if 6 <= h <= 23]
-        if t_ev is None or not daytime:
-            continue
-        out.append({"date": date.isoformat(), "t_max": max(daytime), "t_ev": t_ev})
-    return out
+# The A1-fit multi-night chain now lives in climate_model.py (single source of truth,
+# shared with the rest of the coast-law math) -- these are compatibility aliases so this
+# module's existing name surface (and test_deploy_advisor.py, which imports them off
+# `da.`) keeps working unchanged.
+DEFAULT_FIT = cm.A1_FIT
+kitchen_chain = cm.kitchen_chain
+floor_chain = cm.floor_chain
+b23_aux = cm.b23_aux
+night_peak = cm.night_peak
+project_nights = cm.project_nights
+daily_from_hourly = cm.daily_from_hourly
 
 
 # ---------------------------------------------------------------- the app
@@ -129,7 +73,7 @@ class DeployAdvisor(hass.Hass):
         self.advise_ceiling = float(a("advise_ceiling", 23.0))
         self.ac_climate = a("ac_climate_entity", "climate.air_conditioner_thermostat")
         self.ac_power = a("ac_power_entity", "sensor.air_conditioner_real_time_power")
-        self.sc_state_file = a("smart_cooling_state_file", "/conf/apps/climate/smart_cooling_state.json")
+        self.sc_status_entity = a("smart_cooling_status_entity", "sensor.smart_cooling_status")
         self.state_file = a("state_file", "/conf/apps/climate/deploy_advisor_state.json")
         self.publish_entity = a("publish_entity", "sensor.bedroom_night_projection")
         self.notify_lead_days = int(a("notify_lead_days", 2))
@@ -190,11 +134,13 @@ class DeployAdvisor(hass.Hass):
         except (TypeError, ValueError):
             return default
 
-    def _rise_frac(self):
+    async def _rise_frac(self):
+        """rise_frac from SmartCooling's published status attribute (it is published on
+        every tick, armed or not) -- the state-file read was a cross-app coupling."""
         try:
-            with open(self.sc_state_file) as f:
-                return float(json.load(f).get("rise_frac", self.default_rise_frac))
-        except Exception:
+            v = await self.get_state(self.sc_status_entity, attribute="rise_frac")
+            return float(v) if v is not None else self.default_rise_frac
+        except (TypeError, ValueError):
             return self.default_rise_frac
 
     async def _hourly_forecast(self):
@@ -203,21 +149,7 @@ class DeployAdvisor(hass.Hass):
             self.call_service("weather/get_forecasts", entity_id=self.weather_entity,
                               type="hourly", return_response=True),
             timeout=12)
-        node = resp
-        for key in ("result", "response", self.weather_entity, "forecast"):
-            if isinstance(node, dict) and key in node:
-                node = node[key]
-        if not isinstance(node, list):  # fallback: recurse for any forecast list
-            def find(n):
-                if isinstance(n, list) and n and isinstance(n[0], dict) and "temperature" in n[0]:
-                    return n
-                if isinstance(n, dict):
-                    for v in n.values():
-                        r = find(v)
-                        if r is not None:
-                            return r
-                return None
-            node = find(resp) or []
+        node = cm.parse_forecast_envelope(resp, self.weather_entity)
         now = await self.get_now()
         out = []
         for item in node:
@@ -269,7 +201,7 @@ class DeployAdvisor(hass.Hass):
                 await self._publish("unknown", "kitchen/floor sensor unavailable", [])
                 return
             ceiling = self.advise_ceiling
-            rise = self._rise_frac()
+            rise = await self._rise_frac()
 
             hourly = await self._hourly_forecast()
             now = await self.get_now()
