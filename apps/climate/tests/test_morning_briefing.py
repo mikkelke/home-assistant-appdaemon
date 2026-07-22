@@ -46,32 +46,33 @@ class ComposeBriefingRecommendationBranches(unittest.TestCase):
     """Message rules per recommendation, per the deployed/armed permutations that change
     the wording (see morning_briefing.compose_briefing docstring)."""
 
-    def test_titles_carry_the_verdict(self):
-        # Verdict-in-title: the lock-screen glance answers the question. Fallback keeps
-        # the generic title. Cost lives in the body, never the title.
+    def test_titles_are_decided_verdicts(self):
+        # The title IS the instruction (user: "A/C not needed - Keep windows open") --
+        # one advice, no hedging; a changed situation later gets a NEW advice via the
+        # evening rescue. hybrid deliberately collapses into the windows verdict, and
+        # the ac title names the one action the current deploy/arm state actually needs.
         self.assertEqual(mb.compose_briefing("windows", _attrs(), {}, False, False)[0],
-                         "Window night")
-        self.assertEqual(mb.compose_briefing("nothing", _attrs(), {}, False, False)[0],
-                         "Nothing needed")
+                         "AC not needed")
         self.assertEqual(mb.compose_briefing("hybrid", _attrs(), {}, False, False)[0],
-                         "Windows first")
+                         "AC not needed")
+        self.assertEqual(mb.compose_briefing("nothing", _attrs(), {}, False, False)[0],
+                         "Nothing to do")
         self.assertEqual(mb.compose_briefing("ac", _attrs(), {}, False, False)[0],
-                         "AC tonight")
-        self.assertEqual(mb.compose_briefing("ac", _attrs(cost_label=None), {}, False, False)[0],
-                         "AC tonight")
+                         "Deploy the AC")
+        self.assertEqual(mb.compose_briefing("ac", _attrs(), {}, True, False)[0],
+                         "Arm the AC")
+        self.assertEqual(mb.compose_briefing("ac", _attrs(), {}, True, True)[0],
+                         "AC handles tonight")
         self.assertEqual(mb.compose_briefing("weird_future_value", _attrs(), {}, False, False)[0],
                          "Morning climate")
 
     def test_windows_not_deployed(self):
         _, message = mb.compose_briefing("windows", _attrs(), {}, False, False)
-        self.assertIn("Open windows do the cooling tonight", message)
-        self.assertIn("The AC stays stored", message)
-        self.assertNotIn("plugged in", message)
+        self.assertEqual(message, "Keep windows open.")
 
     def test_windows_deployed_adds_stow_hint(self):
         _, message = mb.compose_briefing("windows", _attrs(), {}, True, False)
-        self.assertIn("still plugged in", message)
-        self.assertIn("you can stow it", message)
+        self.assertEqual(message, "Keep windows open. You can stow the AC.")
 
     def test_windows_deployed_armed_state_does_not_change_wording(self):
         # armed is irrelevant to the windows branch -- only ac_deployed matters.
@@ -81,70 +82,55 @@ class ComposeBriefingRecommendationBranches(unittest.TestCase):
 
     def test_nothing(self):
         _, message = mb.compose_briefing("nothing", _attrs(comfort_limit=22.5), {}, False, False)
-        self.assertIn("stays comfortable on its own", message)
-        # No limit jargon in the push -- the number belongs on the dashboard.
-        self.assertNotIn("22.5", message)
+        self.assertEqual(message, "The bedroom stays cool on its own.")
 
-    def test_ac_not_deployed_asks_to_deploy_and_arm(self):
+    def test_ac_not_deployed_bare_instruction_with_cost(self):
         _, message = mb.compose_briefing("ac", _attrs(), {}, False, False)
-        self.assertIn("deploy and arm the AC before you leave", message)
-        self.assertIn("about 1.8 kr", message)
-        self.assertIn("reach 25° tonight", message)
+        self.assertEqual(message, "Before you leave. About 1.8 kr.")
 
-    def test_ac_armed_but_not_deployed_still_asks_to_deploy_and_arm(self):
-        # an unusual state (armed with nothing plugged in) -- ac_deployed is what gates
-        # the two override sentences, so this still falls through to the default.
-        _, message = mb.compose_briefing("ac", _attrs(), {}, False, True)
-        self.assertIn("deploy and arm the AC", message)
+    def test_ac_armed_but_not_deployed_still_the_deploy_instruction(self):
+        # an unusual state (armed with nothing plugged in) -- ac_deployed is what picks
+        # the verdict, so this still reads as the deploy instruction.
+        title, message = mb.compose_briefing("ac", _attrs(), {}, False, True)
+        self.assertEqual(title, "Deploy the AC")
+        self.assertEqual(message, "Before you leave. About 1.8 kr.")
 
     def test_ac_deployed_but_not_armed(self):
         _, message = mb.compose_briefing("ac", _attrs(), {}, True, False)
-        self.assertIn("arm Cool night and the AC handles the rest", message)
-        self.assertNotIn("deploy and arm", message)
+        self.assertEqual(message, "Just arm Cool night.")
 
     def test_ac_deployed_and_armed(self):
         _, message = mb.compose_briefing("ac", _attrs(), {}, True, True)
-        self.assertIn("armed and will handle it", message)
-        self.assertIn("about 1.8 kr", message)
-        self.assertNotIn("deploy and arm", message)
-        self.assertNotIn("Cool night", message)
+        self.assertEqual(message, "Already armed. About 1.8 kr.")
 
-    def test_ac_without_cost_or_peak_still_reads_clean(self):
+    def test_ac_without_cost_still_reads_clean(self):
         _, message = mb.compose_briefing("ac", _attrs(cost_label=None, projected_peak=None),
                                          {}, False, False)
-        self.assertIn("A warm night is coming", message)
-        self.assertIn("deploy and arm the AC", message)
-        self.assertNotIn("about", message)
-        self.assertNotIn("None", message)
+        self.assertEqual(message, "Before you leave.")
+        _, message = mb.compose_briefing("ac", _attrs(cost_label=None), {}, True, True)
+        self.assertEqual(message, "Already armed.")
 
-    def test_hybrid_is_windows_first_not_deploy(self):
-        # user 2026-07-22: hybrid's priority is the free lever -- it must lead with
-        # windows and only mention the AC as backup, never "deploy".
+    def test_hybrid_is_the_same_decided_windows_advice(self):
+        # user 2026-07-22 ("make it more decided"): one advice, no hedging -- hybrid
+        # reads exactly like a windows night. No backup talk, no deploy; if the evening
+        # turns, the rescue advisory issues the NEW advice.
         _, message = mb.compose_briefing("hybrid", _attrs(), {}, False, False)
-        self.assertIn("Start with open windows tonight", message)
-        self.assertIn("the AC can back it up for about 1.8 kr", message)
-        self.assertNotIn("deploy", message)
-        self.assertNotIn("warm night", message.lower())
+        self.assertEqual(message, "Keep windows open.")
 
-    def test_hybrid_deployed_and_armed_backup_ready(self):
+    def test_hybrid_deployed_never_advises_stowing(self):
+        # The stow hint is windows-only: on hybrid the unit may still be wanted by
+        # evening, so "pack it away" would be bad advice even though tonight's verdict
+        # is windows.
         _, message = mb.compose_briefing("hybrid", _attrs(), {}, True, True)
-        self.assertIn("Start with open windows", message)
-        self.assertIn("already armed as backup", message)
+        self.assertEqual(message, "Keep windows open.")
 
-    def test_hybrid_deployed_not_armed_suggests_arming(self):
-        _, message = mb.compose_briefing("hybrid", _attrs(), {}, True, False)
-        self.assertIn("Start with open windows", message)
-        self.assertIn("arm Cool night and the AC takes over", message)
-
-    def test_unknown_recommendation_falls_back_to_headline_and_detail_first_sentence(self):
+    def test_unknown_recommendation_falls_back_to_headline_only(self):
         _, message = mb.compose_briefing(
             "weird_future_value",
             _attrs(headline="Comfortable as-is",
                   detail="Projected peak 22.0C stays under the limit. Extra detail sentence."),
             {}, False, False)
-        self.assertIn("Comfortable as-is", message)
-        self.assertIn("Projected peak 22.0C stays under the limit", message)
-        self.assertNotIn("Extra detail sentence", message)
+        self.assertEqual(message, "Comfortable as-is.")
 
     def test_unknown_recommendation_missing_headline_and_detail_does_not_raise(self):
         title, message = mb.compose_briefing("weird_future_value", {}, {}, False, False)
@@ -152,31 +138,14 @@ class ComposeBriefingRecommendationBranches(unittest.TestCase):
         self.assertEqual(message, "")
 
 
-class ComposeBriefingDayOutlook(unittest.TestCase):
-    """The day's outlook CLOSES the message (action first, context last)."""
-
-    def test_both_present_adds_closing_outlook(self):
-        _, message = mb.compose_briefing(
-            "nothing", _attrs(), {"kitchen_max_pred": 27.6, "outdoor_max_est": 31.2}, False, False)
-        self.assertTrue(message.endswith("Today around 31° out, 28° inside."))
-
-    def test_missing_outdoor_omits_outlook(self):
-        _, message = mb.compose_briefing(
-            "nothing", _attrs(), {"kitchen_max_pred": 27.6}, False, False)
-        self.assertNotIn("Today around", message)
-
-    def test_missing_kitchen_omits_outlook(self):
-        _, message = mb.compose_briefing(
-            "nothing", _attrs(), {"outdoor_max_est": 31.2}, False, False)
-        self.assertNotIn("Today around", message)
-
-    def test_empty_status_attrs_omits_outlook(self):
-        _, message = mb.compose_briefing("nothing", _attrs(), {}, False, False)
-        self.assertNotIn("Today around", message)
-
-    def test_none_status_attrs_does_not_raise(self):
-        _, message = mb.compose_briefing("nothing", _attrs(), None, False, False)
-        self.assertNotIn("Today around", message)
+class ComposeBriefingNoDayOutlook(unittest.TestCase):
+    def test_status_attrs_are_ignored_entirely(self):
+        # "Still too chatty" (user 2026-07-22): the day-outlook line was cut. status_attrs
+        # stays in the signature for call-site stability but must never leak into the copy,
+        # and a None value must not raise.
+        for status in ({"kitchen_max_pred": 27.6, "outdoor_max_est": 31.2}, {}, None):
+            _, message = mb.compose_briefing("nothing", _attrs(), status, False, False)
+            self.assertEqual(message, "The bedroom stays cool on its own.")
 
 
 class ComposeBriefingNoWindowInventory(unittest.TestCase):

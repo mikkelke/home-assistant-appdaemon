@@ -60,80 +60,48 @@ def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed):
     plan_state is the sleep-plan RECOMMENDATION ("windows"|"ac"|"hybrid"|"nothing" -- the
     sensor's own state string; see SmartCooling._publish_sleep_plan). An unrecognised
     value (defensive only -- plan_sleep never actually emits one) falls back to the
-    plan's own headline + the first sentence of its detail, so a future recommendation
-    type still produces a sane message instead of silence.
-
-    status_attrs' kitchen_max_pred/outdoor_max_est (the weather model's predicted
-    apartment/outdoor daytime peaks) are published as a pair -- see
-    SmartCooling._weather_equilibrium, which only ever sets both or neither -- so the
-    closing day-outlook line is added only when both are present, omitted otherwise.
+    plan's own headline, so a future recommendation type still produces a sane message
+    instead of silence. status_attrs is accepted for call-site stability but currently
+    unused -- the day-outlook line was cut ("still too chatty").
     """
     plan_attrs = dict(plan_attrs or {})
-    status_attrs = dict(status_attrs or {})
-    # Copy style (user 2026-07-22, "like Apple made it"): the title IS the verdict, the
-    # body is one short human sentence leading with the action, the day's outlook closes
-    # it as quiet context. Real em-dashes and degree signs; no unit soup, no comfort-limit
-    # jargon, no window inventory (that's dashboard material, not notification material).
+    # Copy style (user 2026-07-22, three rounds: "like Apple made it" -> "more decided"
+    # -> "still too chatty"): title = the verdict, body = the bare instruction, nothing
+    # else. No explanations, no day outlook, no numbers except the cost when money is
+    # being asked for — every reason lives on the dashboard. One advice; if conditions
+    # change later, the evening rescue issues the NEW advice. hybrid deliberately
+    # collapses into the windows verdict (the AC-backup nuance is dashboard + rescue
+    # material). status_attrs is accepted but unused since the day-outlook line was cut.
     title = "Morning climate"
-    sentences = []
+    body = ""
 
     cost = _nice_cost(plan_attrs.get("cost_label"))
-    projected_peak = plan_attrs.get("projected_peak")
 
-    if plan_state == "windows":
-        title = "Window night"
-        chunk = "Open windows do the cooling tonight — free and silent. The AC stays stored."
-        if ac_deployed:
-            chunk += " It's still plugged in — you can stow it."
-        sentences.append(chunk)
+    if plan_state in ("windows", "hybrid"):
+        title = "AC not needed"
+        body = "Keep windows open."
+        # Stow advice only on a confident windows night: on hybrid the unit may still be
+        # wanted as backup by evening, so "pack it away" would be bad advice.
+        if ac_deployed and plan_state == "windows":
+            body += " You can stow the AC."
     elif plan_state == "nothing":
-        title = "Nothing needed"
-        sentences.append("The bedroom stays comfortable on its own tonight.")
-    elif plan_state == "hybrid":
-        # Windows FIRST (user 2026-07-22): hybrid's priority is the free lever; the AC is
-        # only the safety net and must never lead with "deploy".
-        title = "Windows first"
-        if ac_deployed and armed:
-            backup = "the AC is already armed as backup"
-        elif ac_deployed:
-            backup = "arm Cool night and the AC takes over"
-        else:
-            backup = "the AC can back it up" + (f" for {cost}" if cost else "")
-        sentences.append(f"Start with open windows tonight — if the room won't settle, {backup}.")
+        title = "Nothing to do"
+        body = "The bedroom stays cool on its own."
     elif plan_state == "ac":
-        title = "AC tonight"
-        lead = (f"The bedroom would reach {projected_peak:g}° tonight"
-                if projected_peak is not None else "A warm night is coming")
         if ac_deployed and armed:
-            action = "the AC is armed and will handle it" + (f" for {cost}" if cost else "")
+            title = "AC handles tonight"
+            body = "Already armed." + (f" {cost[0].upper()}{cost[1:]}." if cost else "")
         elif ac_deployed:
-            action = "arm Cool night and the AC handles the rest"
+            title = "Arm the AC"
+            body = "Just arm Cool night."
         else:
-            action = ("deploy and arm the AC before you leave and it pre-cools on cheap power"
-                      + (f" for {cost}" if cost else ""))
-        sentences.append(f"{lead} — {action}.")
+            title = "Deploy the AC"
+            body = "Before you leave." + (f" {cost[0].upper()}{cost[1:]}." if cost else "")
     else:
         headline = (plan_attrs.get("headline") or "").strip()
-        detail = (plan_attrs.get("detail") or "").strip()
-        # Split on ". " (period + space), not a bare ".", so a decimal like "22.0C" in the
-        # first sentence doesn't get cut in half.
-        first = detail.split(". ")[0].strip()
-        if first.endswith("."):
-            first = first[:-1]
-        if headline and first:
-            sentences.append(f"{headline} — {first}.")
-        elif headline:
-            sentences.append(f"{headline}.")
-        elif first:
-            sentences.append(f"{first}.")
+        body = f"{headline}." if headline else ""
 
-    # Action first, context last: the day's outlook closes the message.
-    kitchen_max_pred = status_attrs.get("kitchen_max_pred")
-    outdoor_max_est = status_attrs.get("outdoor_max_est")
-    if kitchen_max_pred is not None and outdoor_max_est is not None:
-        sentences.append(f"Today around {outdoor_max_est:.0f}° out, {kitchen_max_pred:.0f}° inside.")
-
-    return title, " ".join(sentences)
+    return title, body
 
 
 class MorningBriefing(hass.Hass):
