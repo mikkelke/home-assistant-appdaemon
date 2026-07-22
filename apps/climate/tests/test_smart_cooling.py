@@ -64,6 +64,19 @@ def make_app(**overrides):
     app._kitchen_max_date = overrides.get("kitchen_max_date", None)
     app._fc_cache = None
     app._fc_cache_at = None
+    # live session-cost metering (see _track_session_cost / _finalize_session /
+    # _status_base) + the sleep-plan estimator's calibration knobs
+    app.ac_energy_entity = overrides.get("ac_energy_entity", "sensor.ac_plug_energy")
+    app.session_energy_factor = overrides.get("session_energy_factor", 2.5)
+    app.est_price_slots = overrides.get("est_price_slots", 8)
+    app._session_kwh0 = overrides.get("session_kwh0", None)
+    app._session_last_counter = overrides.get("session_last_counter", None)
+    app._session_kwh = overrides.get("session_kwh", 0.0)
+    app._session_cost = overrides.get("session_cost", 0.0)
+    app._last_session_kwh = overrides.get("last_session_kwh", None)
+    app._last_session_cost = overrides.get("last_session_cost", None)
+    app._night_cost_ema = overrides.get("night_cost_ema", None)
+    app._night_cost_samples = overrides.get("night_cost_samples", 0)
     app._save_state = lambda: None
     app.log = lambda *a, **k: None
     return app
@@ -284,6 +297,114 @@ class StashLightout(unittest.TestCase):
 
         self.assertEqual(app._lightout["F0"], 21.0)
         self.assertEqual(app._lightout["E"], 25.0)
+
+
+class SessionCostTracking(unittest.TestCase):
+    """Live session-cost metering (validated 2026-07-21: the sleep-plan's AC estimate was
+    4-8x too LOW against the Shelly meter). _track_session_cost meters every tick from the
+    Shelly cumulative kWh counter; _finalize_session freezes a session into the learned
+    night_cost_ema plan_sleep prefers over the theoretical estimate."""
+
+    def test_noop_when_counter_none(self):
+        app = make_app()
+        app._track_session_cost(True, 1.5, None)
+        self.assertIsNone(app._session_kwh0)
+        self.assertEqual(app._session_kwh, 0.0)
+        self.assertEqual(app._session_cost, 0.0)
+
+    def test_session_starts_on_deployed(self):
+        app = make_app()
+        app._track_session_cost(True, 1.5, 100.0)
+        self.assertEqual(app._session_kwh0, 100.0)
+        self.assertEqual(app._session_last_counter, 100.0)
+        self.assertEqual(app._session_kwh, 0.0)
+        self.assertEqual(app._session_cost, 0.0)
+
+    def test_no_session_starts_while_not_deployed(self):
+        # the unit isn't reachable -> nothing to meter yet, even with a counter reading
+        # (e.g. a stale cached state).
+        app = make_app()
+        app._track_session_cost(False, 1.5, 100.0)
+        self.assertIsNone(app._session_kwh0)
+
+    def test_accumulates_kwh_and_cost_with_price(self):
+        app = make_app()
+        app._track_session_cost(True, 1.5, 100.0)     # start
+        app._track_session_cost(True, 2.0, 100.5)     # +0.5 kWh at 2.0 kr/kWh
+        self.assertAlmostEqual(app._session_kwh, 0.5)
+        self.assertAlmostEqual(app._session_cost, 1.0)
+        self.assertEqual(app._session_last_counter, 100.5)
+
+    def test_none_price_falls_back_to_1_7(self):
+        app = make_app()
+        app._track_session_cost(True, 1.5, 100.0)     # start
+        app._track_session_cost(True, None, 101.0)    # +1.0 kWh, price missing -> 1.7 fallback
+        self.assertAlmostEqual(app._session_kwh, 1.0)
+        self.assertAlmostEqual(app._session_cost, 1.7)
+
+    def test_counter_reset_rebaselines_without_going_negative(self):
+        # e.g. a Shelly reboot resets its cumulative counter -- must not subtract energy
+        # that was never actually used.
+        app = make_app()
+        app._track_session_cost(True, 1.5, 100.0)
+        app._track_session_cost(True, 1.5, 100.5)     # normal +0.5 kWh
+        app._track_session_cost(True, 1.5, 0.2)       # counter reset
+        self.assertAlmostEqual(app._session_kwh, 0.5)  # unchanged -- no negative delta applied
+        self.assertAlmostEqual(app._session_cost, 0.75)
+        self.assertEqual(app._session_last_counter, 0.2)  # re-baselined to the new reading
+
+    def test_flapping_deploy_keeps_metering_an_open_session(self):
+        # deployed goes False mid-session (the unit briefly drops off cloud) -- metering
+        # must keep accumulating against the still-open session, not stop or restart it.
+        app = make_app()
+        app._track_session_cost(True, 1.5, 100.0)
+        app._track_session_cost(False, 1.5, 101.0)
+        self.assertEqual(app._session_kwh0, 100.0)     # unchanged -- no new session started
+        self.assertAlmostEqual(app._session_kwh, 1.0)
+
+    def test_finalize_sets_last_and_ema_and_clears_baseline(self):
+        app = make_app()
+        app._track_session_cost(True, 1.5, 100.0)
+        app._track_session_cost(True, 1.5, 102.0)     # 2.0 kWh * 1.5 kr = 3.0 kr
+        app._finalize_session()
+        self.assertIsNone(app._session_kwh0)
+        self.assertIsNone(app._session_last_counter)
+        self.assertEqual(app._last_session_kwh, 2.0)
+        self.assertEqual(app._last_session_cost, 3.0)
+        self.assertEqual(app._night_cost_ema, 3.0)     # first sample -> EMA seeds at the value
+        self.assertEqual(app._night_cost_samples, 1)
+        # running totals stay visible for display until the next session actually starts
+        self.assertEqual(app._session_kwh, 2.0)
+        self.assertEqual(app._session_cost, 3.0)
+
+    def test_second_finalize_is_a_noop(self):
+        app = make_app()
+        app._track_session_cost(True, 1.5, 100.0)
+        app._track_session_cost(True, 1.5, 102.0)
+        app._finalize_session()
+        app._finalize_session()    # no session open -> must not touch anything again
+        self.assertEqual(app._night_cost_samples, 1)
+        self.assertEqual(app._last_session_cost, 3.0)
+
+    def test_finalize_without_a_session_is_a_noop(self):
+        app = make_app()
+        app._finalize_session()
+        self.assertIsNone(app._last_session_cost)
+        self.assertEqual(app._night_cost_samples, 0)
+
+    def test_ema_blends_across_nights_with_0_6_0_4_weights(self):
+        app = make_app(night_cost_ema=4.0, night_cost_samples=3)
+        app._track_session_cost(True, 2.0, 0.0)
+        app._track_session_cost(True, 2.0, 1.0)        # 1.0 kWh * 2.0 kr = 2.0 kr
+        app._finalize_session()
+        self.assertAlmostEqual(app._night_cost_ema, 0.6 * 4.0 + 0.4 * 2.0, places=2)  # 3.2
+        self.assertEqual(app._night_cost_samples, 4)
+
+    # The disarmed+undeployed fallback close-out (user unplugged without pressing "AC
+    # removed") lives inside _evaluate_locked, not on _track_session_cost/_finalize_session
+    # directly -- it's exercised end-to-end via the real wiring in
+    # EvaluateTickWiring.test_disarmed_undeployed_finalizes_a_dangling_session instead of
+    # duplicating that class's full evaluate-loop stub scaffolding here.
 
 
 class ShouldBurp(unittest.TestCase):
@@ -1069,6 +1190,11 @@ class EvaluateTickWiring(unittest.TestCase):
         app.outdoor_sensor = "out"
         app.bathroom_delta_max = 12.0
         app.person_offset = 0.5
+        # read every tick by the session-cost metering wiring (see _track_session_cost);
+        # neither is in `nums` below, so _num() returns its own None default for both --
+        # a real Shelly/price outage, harmlessly a no-op for _track_session_cost.
+        app.price_entity = "price"
+        app.ac_energy_entity = "ac_energy"
         app._master_was_on = master_was_on
         app._not_deployed_since = None
         app._deploy_watchdog_notified = False
@@ -1183,6 +1309,35 @@ class EvaluateTickWiring(unittest.TestCase):
         status, _, attrs = app._published[0]
         self.assertEqual(status, "unit_stored")
         self.assertIn("equilibrium_weather", attrs)
+
+    def test_disarmed_undeployed_finalizes_a_dangling_session(self):
+        # Fallback session close-out (see SessionCostTracking): the user unplugged the AC
+        # without pressing "AC removed" first, so the normal _finalize_session() call in
+        # that press's branch never ran. Disarmed + not-deployed is exactly the resting
+        # state a genuinely-ended night settles into, so that tick must close it out
+        # instead of metering a dangling session forever.
+        app = self._app(enable="off", climate="unavailable")
+        app._session_kwh0 = 10.0
+        app._session_last_counter = 10.0
+        app._session_kwh = 1.2
+        app._session_cost = 1.5
+        self._run(app)
+        self.assertIsNone(app._session_kwh0)
+        self.assertIsNone(app._session_last_counter)
+        self.assertEqual(app._last_session_cost, 1.5)
+        self.assertEqual(app._night_cost_samples, 1)
+
+    def test_deployed_and_disarmed_does_not_finalize_a_session(self):
+        # deployed (climate reachable, even if "off") -> not the fallback's trigger state;
+        # a live session must be left open for the normal AC-removed-press close-out.
+        app = self._app(enable="off", climate="off")
+        app._session_kwh0 = 10.0
+        app._session_last_counter = 10.0
+        app._session_kwh = 1.2
+        app._session_cost = 1.5
+        self._run(app)
+        self.assertEqual(app._session_kwh0, 10.0)
+        self.assertIsNone(app._last_session_cost)
 
 
 class PublishSleepPlanGrounding(unittest.TestCase):

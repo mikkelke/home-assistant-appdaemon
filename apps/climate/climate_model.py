@@ -305,6 +305,8 @@ class SleepPlanInputs:
     indoor_dew: Optional[float]
     open_windows: list = field(default_factory=list)
     noise_penalty_kr: float = 0.5
+    session_factor: float = 2.5     # theoretical-estimate multiplier for a real multi-run session
+    learned_night_cost: Optional[float] = None  # metered EMA kr/night -- preferred over theory
     peak_margin_c: float = 0.2
     hybrid_gap_c: float = 1.5
     temp_margin_c: float = 0.5      # outdoor must be at least this far below the limit to cool
@@ -327,8 +329,18 @@ def _cost_label(cost) -> str:
 
 def plan_sleep(inp: SleepPlanInputs) -> dict:
     """Pure cheapest-path chooser: keep the sleeping zone under the comfort limit across
-    the night for the least money (windows cost 0, AC = energy_kWh*price + a fixed noise
-    penalty), planning the whole night rather than the current instant.
+    the night for the least money (windows cost 0, AC = a real night's cost), planning the
+    whole night rather than the current instant.
+
+    AC cost is the LEARNED metered night cost (inp.learned_night_cost, an EMA of real
+    Shelly-metered sessions -- see SmartCooling._finalize_session) when available: it IS
+    reality, not a model of it. Until a night's been metered, it falls back to a
+    session-factor-corrected theoretical estimate -- the naive single deficit-closing run
+    priced at the single cheapest slot measured 4-8x too LOW against the meter on
+    2026-07-21, because a real session re-cools all night (re-warm top-ups, stall-burps,
+    the parked crawl, the post-midnight cheap-power chase), not just the one run the naive
+    formula prices (see inp.session_factor). noise_penalty_kr no longer inflates the
+    displayed cost -- kept only for backward-compat callers/tests.
 
     projected_peak = coast_peak(floor, equilibrium, rise_frac, zone_offset).
       - peak within peak_margin_c of the limit           -> 'nothing' (free)
@@ -337,7 +349,7 @@ def plan_sleep(inp: SleepPlanInputs) -> dict:
           gap  > hybrid_gap_c                             -> 'hybrid'  (windows now + AC backup)
       - else (too WARM, or genuinely MUGGY, outside)      -> 'ac'
     A window cools whenever it's cooler outside; humidity merely level with indoors is a note,
-    NOT a reason to run the compressor. Windows always beat equal-comfort AC (0 < ac_cost + pen).
+    NOT a reason to run the compressor. Windows always beat equal-comfort AC (0 < ac_cost).
 
     Returns a plain dict (recommendation/projected_peak/comfort_limit/est_cost_kr/
     cost_label/headline/detail/open_windows/windows_summary). ADVISORY ONLY.
@@ -367,15 +379,20 @@ def plan_sleep(inp: SleepPlanInputs) -> dict:
     peak_disp = round(projected_peak, 1)
     gap = projected_peak - limit
 
-    # AC cost of pre-cooling the floor deep enough to keep the zone under the limit.
+    # AC cost of pre-cooling the floor deep enough to keep the zone under the limit. The
+    # learned metered night cost wins when available (see the docstring); otherwise the
+    # theoretical single-run estimate is scaled by session_factor to approximate what a
+    # real multi-run session actually spends, with no separate noise-penalty add-on.
     target = calc_floor_target(inp.equilibrium, limit, inp.rise_frac,
                                inp.zone_offset, inp.min_temp)
     deficit = max(0.0, inp.floor - target)
-    if inp.cheapest_price is None:
+    if inp.learned_night_cost is not None:
+        ac_cost = round(inp.learned_night_cost, 2)
+    elif inp.cheapest_price is None:
         ac_cost = None
     else:
-        kwh = inp.cool_power_kw * (deficit / inp.floor_cool_cph)
-        ac_cost = round(kwh * inp.cheapest_price + inp.noise_penalty_kr, 2)
+        kwh = inp.cool_power_kw * (deficit / inp.floor_cool_cph) * inp.session_factor
+        ac_cost = round(kwh * inp.cheapest_price, 2)
 
     if gap <= inp.peak_margin_c:
         rec, cost = "nothing", 0.0

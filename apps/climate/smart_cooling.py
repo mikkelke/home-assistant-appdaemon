@@ -73,6 +73,20 @@ regardless of arm state -- it only ever forces a stop for an actual hazard, neve
 planning, so it can't fight a genuine manual session, only an actually-hazardous one. _evaluate
 is now also serialized (asyncio.Lock): the re-arm that morning triggered three concurrent
 evaluations that raced and duplicated actuation.
+
+Session-cost metering (2026-07-21, validated with meter data): the sleep plan's AC estimate
+was 4-8x too LOW -- it priced one deficit-closing run (~1.5 kWh) at the single cheapest 15-min
+slot (~0.7 kr), while the Shelly plug metered a real session's 3.5 kWh / ~4.2 kr spot (user's
+full tariff ~6 kr). A real session re-cools all night (re-warm top-ups, stall-burps, the parked
+~300W crawl, the deliberate post-midnight cheap-power chase), not just the one run the old
+formula priced. Fix: meter reality and learn from it. _track_session_cost accumulates every
+tick from ac_energy_entity (the Shelly cumulative kWh counter -- the only reliable AC energy
+meter in this home); _finalize_session (AC-removed press, or a disarmed+undeployed fallback)
+freezes the session and EMAs it into night_cost_ema, which then REPLACES the theoretical
+estimate in plan_sleep. Until a night's been metered, session_energy_factor scales the
+theoretical single-run number up and est_price_slots blends the k cheapest slots instead of
+pricing the whole session at the single cheapest one -- both are display/estimation only and
+never touch the armed actuation chain above.
 """
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
@@ -155,6 +169,21 @@ class SmartCooling(hass.Hass):
         # NOT ground the bedroom's projection.
         self.sleep_plan_entity = a("sleep_plan_entity", "sensor.sleep_plan")
         self.ac_noise_penalty_kr = float(a("ac_noise_penalty_kr", 0.5))
+        # --- live session-cost metering + estimator calibration (validated 2026-07-21: the
+        # sleep-plan's AC estimate was 4-8x too LOW against the Shelly meter -- it priced ONE
+        # deficit-closing run at the single cheapest slot, ~1.5 kWh/~0.7 kr, while the plug
+        # metered a real session's 3.5 kWh / ~4.2 kr spot. ac_energy_entity is the Shelly
+        # cumulative kWh counter -- the ONLY reliable AC energy meter in this home;
+        # _track_session_cost meters every real session against it every tick, and
+        # _finalize_session learns night_cost_ema (an EMA of metered kr/night) which then
+        # REPLACES the theoretical estimate in plan_sleep once available. Until a night's
+        # been metered, session_energy_factor scales the theoretical single-run estimate up
+        # for what a real session actually spends (re-warm top-ups, stall-burps, the parked
+        # crawl, the post-midnight cheap-power chase), and est_price_slots blends the k
+        # cheapest 15-min slots instead of pricing the whole session at the single cheapest.
+        self.ac_energy_entity = a("ac_energy_entity", "sensor.ac_plug_energy")
+        self.session_energy_factor = float(a("session_energy_factor", 2.5))
+        self.est_price_slots = int(a("est_price_slots", 8))
         # --- fixed params (not user-facing) ---
         self.default_ceiling = float(a("default_night_ceiling", 23.0))
         self.min_temp = float(a("min_temp", 16.0))            # hardware floor; never drive below
@@ -341,6 +370,21 @@ class SmartCooling(hass.Hass):
         self._kitchen_max_date: Optional[str] = None   # ISO date the running max belongs to
         self._fc_cache = None
         self._fc_cache_at: Optional[datetime] = None
+        # Live session-cost metering (see the ac_energy_entity/session_energy_factor/
+        # est_price_slots config block above): _session_kwh0/_session_last_counter track the
+        # Shelly counter baseline while a session is open (both None = no active session);
+        # _session_kwh/_session_cost accumulate the running totals. _last_session_kwh/
+        # _last_session_cost/_night_cost_ema/_night_cost_samples are the finalized, learned
+        # numbers plan_sleep prefers over the theoretical estimate once available. Persisted
+        # so a reload mid-session (or the learned EMA) survives an HA/AppDaemon restart.
+        self._session_kwh0: Optional[float] = None
+        self._session_last_counter: Optional[float] = None
+        self._session_kwh: float = 0.0
+        self._session_cost: float = 0.0
+        self._last_session_kwh: Optional[float] = None
+        self._last_session_cost: Optional[float] = None
+        self._night_cost_ema: Optional[float] = None
+        self._night_cost_samples: int = 0
         self._load_state()
 
         self.mobile_notifier = None
@@ -465,6 +509,24 @@ class SmartCooling(hass.Hass):
                   for k in range(total)]
         return min(prices) if prices else fallback
 
+    def _blended_cheap(self, pm, now, deadline, fallback, k):
+        """Mean of the k cheapest 15-min slot prices between now and deadline (advisory
+        pricing for the sleep plan). A real session doesn't run in a single cheapest slot --
+        it re-cools across the night (re-warm top-ups, stall-burps, the post-midnight cheap-
+        power chase) -- so blending the k cheapest slots (est_price_slots) is a closer stand-
+        in for what a real session actually pays than the single cheapest one (_cheapest_to),
+        which under-priced the 2026-07-21 session by ~2.5x on price alone. Falls back to
+        `fallback` (price_now) when no slot horizon remains. Modeled on _cheapest_to."""
+        total = int((deadline - now).total_seconds() // 900)
+        if total <= 0:
+            return fallback
+        prices = [self._price_for(pm, now + timedelta(minutes=15 * m), fallback)
+                  for m in range(total)]
+        if not prices:
+            return fallback
+        chosen = sorted(prices)[:max(1, min(k, len(prices)))]
+        return sum(chosen) / len(chosen)
+
     # ---------- learned warm-up indicator ----------
     def _load_state(self):
         try:
@@ -482,6 +544,19 @@ class SmartCooling(hass.Hass):
             self._kitchen_max_today = float(km) if km is not None else None
             self._kitchen_max_date = d.get("kitchen_max_date")
             self._rescue_notified_date = d.get("rescue_notified_date")
+            sk0 = d.get("session_kwh0")
+            self._session_kwh0 = float(sk0) if sk0 is not None else None
+            slc = d.get("session_last_counter")
+            self._session_last_counter = float(slc) if slc is not None else None
+            self._session_kwh = float(d.get("session_kwh", 0.0))
+            self._session_cost = float(d.get("session_cost", 0.0))
+            lsk = d.get("last_session_kwh")
+            self._last_session_kwh = float(lsk) if lsk is not None else None
+            lsc = d.get("last_session_cost")
+            self._last_session_cost = float(lsc) if lsc is not None else None
+            nce = d.get("night_cost_ema")
+            self._night_cost_ema = float(nce) if nce is not None else None
+            self._night_cost_samples = int(d.get("night_cost_samples", 0))
         except Exception:
             pass
 
@@ -495,7 +570,15 @@ class SmartCooling(hass.Hass):
                            "prev_kitchen_max": self._prev_kitchen_max,
                            "kitchen_max_today": self._kitchen_max_today,
                            "kitchen_max_date": self._kitchen_max_date,
-                           "rescue_notified_date": self._rescue_notified_date}, f)
+                           "rescue_notified_date": self._rescue_notified_date,
+                           "session_kwh0": self._session_kwh0,
+                           "session_last_counter": self._session_last_counter,
+                           "session_kwh": self._session_kwh,
+                           "session_cost": self._session_cost,
+                           "last_session_kwh": self._last_session_kwh,
+                           "last_session_cost": self._last_session_cost,
+                           "night_cost_ema": self._night_cost_ema,
+                           "night_cost_samples": self._night_cost_samples}, f)
         except Exception as e:
             self.log(f"state save failed ({e}) -- continuing in-memory", level="WARNING")
 
@@ -986,6 +1069,64 @@ class SmartCooling(hass.Hass):
         self.log(f"Lights-out {today}: floor {floor:.1f}C, equilibrium {E:.1f}C "
                  f"-> learning the rise at {end.strftime('%H:%M')}", level="INFO")
 
+    def _track_session_cost(self, deployed, price_now, counter):
+        """Live session-cost metering from the Shelly plug's cumulative kWh counter -- the
+        ONLY reliable AC energy meter in this home (see the ac_energy_entity config comment
+        / 2026-07-21 calibration). Runs every tick regardless of arm/deploy state (the unit
+        can flap), so a session's energy is never truncated by a brief disconnect. SYNC and
+        pure-ish (only touches _session_*/_save_state) -- unit-testable without a running
+        AppDaemon.
+
+        counter is the current cumulative kWh reading (None -- sensor unavailable -- is a
+        no-op). A session starts the moment the AC is deployed with none already open, then
+        accumulates kWh/kr from the counter's delta each tick until _finalize_session() closes
+        it out. A negative delta (counter reset, e.g. a Shelly reboot) re-baselines instead of
+        subtracting energy that was never actually used."""
+        if counter is None:
+            return
+        if deployed and self._session_kwh0 is None:
+            self._session_kwh0 = counter
+            self._session_last_counter = counter
+            self._session_kwh = 0.0
+            self._session_cost = 0.0
+            self._save_state()
+            self.log(f"AC session metering started at {counter:.3f} kWh", level="INFO")
+            return
+        if self._session_kwh0 is None:
+            return
+        delta = counter - self._session_last_counter
+        if delta < 0:            # counter reset (e.g. Shelly reboot) -- re-baseline, don't go negative
+            delta = 0.0
+        self._session_kwh += delta
+        self._session_cost += delta * (price_now if price_now is not None else 1.7)
+        self._session_last_counter = counter
+        if delta > 0:
+            self._save_state()
+
+    def _finalize_session(self):
+        """Close out the metered session -- the AC-removed press, or the disarmed+undeployed
+        fallback (user unplugged without pressing it first). Freezes the session totals as
+        last night's numbers, EMAs them (alpha 0.4) into night_cost_ema -- the learned real
+        night cost plan_sleep prefers over the theoretical estimate once available (see
+        climate_model.plan_sleep) -- and clears the session baseline so the next deploy
+        starts fresh. _session_kwh/_session_cost are deliberately left in place (not zeroed)
+        so the status entity keeps showing tonight's totals until the next session actually
+        starts. A no-op if no session is open (including a second call in the same tick)."""
+        if self._session_kwh0 is None:
+            return
+        self._last_session_kwh = round(self._session_kwh, 3)
+        self._last_session_cost = round(self._session_cost, 2)
+        ema = self._night_cost_ema
+        self._night_cost_ema = (self._last_session_cost if ema is None
+                                else round(0.6 * ema + 0.4 * self._last_session_cost, 2))
+        self._night_cost_samples += 1
+        self._session_kwh0 = None
+        self._session_last_counter = None
+        self._save_state()
+        self.log(f"Session energy: {self._last_session_kwh:.2f} kWh, "
+                 f"{self._last_session_cost:.2f} kr (night-cost EMA {self._night_cost_ema:.2f} kr, "
+                 f"n={self._night_cost_samples})", level="INFO")
+
     async def _check_deploy_watchdog(self, now, master_on, deployed):
         """Notify once if Cool night is armed but the AC stays unreachable past the
         grace period - most likely the physical plug/switch, not a code problem.
@@ -1140,7 +1281,11 @@ class SmartCooling(hass.Hass):
                 await self._attr(self.price_entity, "raw_tomorrow", []),
             )
             price_now = self._price_for(pm, now, await self._num(self.price_entity, 1.7))
-            cheapest = self._cheapest_to(pm, now, self._deadline(now), price_now)
+            # Blended over the k cheapest slots (est_price_slots), not just THE cheapest --
+            # a real session re-cools across many slots, not one (see _blended_cheap /
+            # 2026-07-21 calibration). Stops mattering once night_cost_ema is learned.
+            cheapest = self._blended_cheap(pm, now, self._deadline(now), price_now,
+                                           self.est_price_slots)
             ceiling, _ = await self._effective_ceiling(now)
             # Bedroom-zone reality anchor (the A/C is bedroom-only and the bedroom is its own
             # thermal zone -- user 2026-07-22). The sealed room can't drift materially warmer
@@ -1164,7 +1309,9 @@ class SmartCooling(hass.Hass):
                 floor_cool_cph=self.floor_cool_cph, cool_power_kw=self.cool_kw,
                 cheapest_price=cheapest, outdoor_temp=t_out, outdoor_dew=outdoor_dew,
                 indoor_dew=indoor_dew, open_windows=open_windows,
-                noise_penalty_kr=self.ac_noise_penalty_kr))
+                noise_penalty_kr=self.ac_noise_penalty_kr,
+                session_factor=self.session_energy_factor,
+                learned_night_cost=self._night_cost_ema))
             detail = plan["detail"]
             if grounded:
                 detail += (f" (Grounded on reality: the bedroom zone is ~{bedroom_zone_now:.1f}C "
@@ -1189,7 +1336,7 @@ class SmartCooling(hass.Hass):
                                     self.comfort_temp_entity,
                                     self.comfort_rh_entity, self.outdoor_sensor,
                                     self.outdoor_rh_entity, self.price_entity,
-                                    self.weather_forecast_entity,
+                                    self.weather_forecast_entity, self.ac_energy_entity,
                                     *self.window_contact_entities.values()],
                 "computed_at": now.isoformat(timespec="seconds"),
                 # Transparency: the raw weather peak, the reality anchors, and the grounded
@@ -1239,6 +1386,13 @@ class SmartCooling(hass.Hass):
         mid = await self._num(self.mid_sensor, None)
         floor = await self._num(self.floor_sensor, None)
         self._track_kitchen_max(now, kitchen)   # running daily max + midnight rollover
+        # Live session-cost metering (see the ac_energy_entity config comment): every tick,
+        # armed or not, so a flapping deploy never truncates a session. price_now here is the
+        # price sensor's own STATE (current kr/kWh) -- a plain, cheap read, independent of the
+        # armed path's price-map/fallback logic further below (which stays byte-identical).
+        energy_counter = await self._num(self.ac_energy_entity, None)
+        price_now_cheap = await self._num(self.price_entity, None)
+        self._track_session_cost(deployed, price_now_cheap, energy_counter)
         e_legacy = self._equilibrium(kitchen, mid, floor)
         e_active, wm_dbg = await self._weather_equilibrium(now, kitchen, mid, floor, e_legacy)
         await self._check_deploy_watchdog(now, master_on, deployed)
@@ -1272,6 +1426,12 @@ class SmartCooling(hass.Hass):
                 self._master_was_on = False
                 return
             self._safety_off_notified = False
+            # Fallback session close-out: the user unplugged the AC without pressing "AC
+            # removed" first (the normal close-out lives in that press's branch above), so
+            # a session left open would otherwise meter forever. Only fires disarmed+
+            # undeployed -- exactly the state a genuinely-ended night settles into.
+            if not deployed and self._session_kwh0 is not None:
+                self._finalize_session()
             # Evening rescue advisory (never a command). Placed after the hazard handling so
             # a genuine safety-off doesn't also nag; it only reads/notifies.
             await self._maybe_evening_rescue(now, floor, e_legacy, e_active)
@@ -1344,6 +1504,7 @@ class SmartCooling(hass.Hass):
         if (await self._state(self.ac_removed_entity)) == "on":
             self._mark_eval(now, False)
             self._stash_lightout(floor, E, now)
+            self._finalize_session()   # AC removed -- close out tonight's metered session
             await self._ensure_off(
                 "done_for_tonight",
                 "AC removed -- sealing the bedroom for the night.",
@@ -1469,8 +1630,23 @@ class SmartCooling(hass.Hass):
         despite a learned ~0.7. Same value the armed _attrs publishes, so the two never
         disagree. rise_frac is a non-zero float so it survives AppDaemon 4.5.13's
         False/0/None attribute-drop; rise_samples can be 0 (dropped then -- display only,
-        harmless)."""
-        return {"rise_frac": round(self._rise_frac, 2), "rise_samples": self._rise_samples}
+        harmless).
+
+        Also carries the live/learned session-cost numbers (see _track_session_cost /
+        _finalize_session): last_night_cost_kr / night_cost_ema_kr once a night's been
+        metered, and session_cost_kr / session_kwh while a session is open or has anything
+        to show. Each is included only when meaningful -- AppDaemon 4.5.13 silently drops a
+        False/0/None attribute anyway, so publishing a raw 0.0 here would be misleading
+        (looks like "metered, cost 0" rather than "nothing metered yet")."""
+        out = {"rise_frac": round(self._rise_frac, 2), "rise_samples": self._rise_samples}
+        if self._last_session_cost is not None:
+            out["last_night_cost_kr"] = self._last_session_cost
+        if self._night_cost_ema is not None:
+            out["night_cost_ema_kr"] = self._night_cost_ema
+        if self._session_kwh0 is not None or self._session_cost > 0:
+            out["session_cost_kr"] = round(self._session_cost, 2)
+            out["session_kwh"] = round(self._session_kwh, 2)
+        return out
 
     def _attrs(self, floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
                ceiling, price_now, window_open, run_min, next_start, est_cost, floor_limited,
@@ -1495,6 +1671,11 @@ class SmartCooling(hass.Hass):
             "last_burp": self._last_burp.strftime("%H:%M") if self._last_burp else None,
             "dry_min_tonight": round(self._dry_min),
         }
+        # _status_base()'s learned/session-cost keys ride on the armed publish too (e.g. a
+        # session actively metering while cooling) -- merged here rather than duplicated;
+        # its rise_frac/rise_samples recompute to the exact values already set above, so
+        # this is a no-op for those two and additive for the rest.
+        out.update(self._status_base())
         # Weather-model shadow attributes (equilibrium_weather/legacy, solar/outdoor/kitchen
         # estimates) for predicted-vs-actual comparison on the status entity. wm_shadow is
         # published as a STRING to survive AppDaemon's False/0/None attribute-drop (see the

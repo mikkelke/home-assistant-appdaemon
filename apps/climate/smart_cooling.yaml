@@ -135,6 +135,15 @@ SmartCooling:
   sleep_plan_entity: sensor.sleep_plan
   outdoor_rh_entity: sensor.gw2000a_humidity
   ac_noise_penalty_kr: 0.5
+  # Live session-cost metering + estimator calibration. 2026-07-21 session: planner
+  # estimated ~1.5 kWh at the cheapest slot (~0.7 kr); the Shelly plug metered 3.5 kWh /
+  # ~4.2 kr spot (user tariff ~6 kr). session_energy_factor covers re-warm top-ups/burps/
+  # parked crawl/post-midnight chase; est_price_slots blends the k cheapest slots instead
+  # of THE cheapest; both stop mattering once night_cost_ema is learned from real metered
+  # sessions.
+  ac_energy_entity: sensor.ac_plug_energy
+  session_energy_factor: 2.5
+  est_price_slots: 8
   # NAME=ENTITY list (NOT a dict: a new dict-valued yaml key trips AppDaemon 4.5's config
   # scan and forces a full restart of every app; a list value reloads only SmartCooling).
   window_contact_entities:

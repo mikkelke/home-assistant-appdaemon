@@ -268,12 +268,18 @@ class PlanSleep(unittest.TestCase):
         self.assertEqual(plan["windows_summary"], "bedroom + kitchen open")
 
     def test_windows_always_beat_equal_comfort_ac(self):
-        # a windows recommendation costs 0, strictly less than the cheapest possible AC run
-        # (which is at least the fixed noise penalty).
+        # a windows recommendation costs 0, strictly less than a real AC run's cost. (2026-
+        # 07-21: est_cost_kr is no longer floored by a fixed noise penalty -- see plan_sleep's
+        # docstring -- so this now compares against an actual 'ac'-branch cost instead of the
+        # old hardcoded "0 < noise_penalty_kr" constant.)
         plan = cm.plan_sleep(self._inp(floor=22.5, equilibrium=23.5, comfort_limit=23.0))
         self.assertEqual(plan["recommendation"], "windows")
         self.assertEqual(plan["est_cost_kr"], 0.0)
-        self.assertLess(0.0, 0.5)  # 0 < noise_penalty_kr -> windows win
+        ac_plan = cm.plan_sleep(self._inp(
+            floor=24.0, equilibrium=26.0, comfort_limit=23.0, outdoor_temp=24.0,
+            outdoor_dew=18.0, indoor_dew=15.0, cheapest_price=2.0))
+        self.assertEqual(ac_plan["recommendation"], "ac")
+        self.assertLess(plan["est_cost_kr"], ac_plan["est_cost_kr"])
 
     def test_within_margin_is_nothing(self):
         # peak = 21 + (21.5-21)*0.7 + 1 = 22.35, well under the 23.0 limit -> nothing
@@ -316,6 +322,48 @@ class PlanSleep(unittest.TestCase):
         plan = cm.plan_sleep(self._inp(open_windows=[]))
         self.assertEqual(plan["windows_summary"], "all closed")
         self.assertEqual(plan["open_windows"], [])
+
+    def test_learned_night_cost_wins_regardless_of_deficit(self):
+        # 2026-07-21 fix: a metered night_cost_ema (learned_night_cost) IS reality -- it
+        # replaces the theoretical estimate outright, independent of how deep the deficit
+        # (and therefore the theoretical kWh) actually is.
+        kwargs = dict(comfort_limit=23.0, outdoor_temp=24.0, outdoor_dew=18.0,
+                     indoor_dew=15.0, cheapest_price=2.0, learned_night_cost=5.2)
+        shallow = cm.plan_sleep(self._inp(floor=24.0, equilibrium=26.0, **kwargs))
+        deep = cm.plan_sleep(self._inp(floor=28.0, equilibrium=30.0, **kwargs))
+        self.assertEqual(shallow["recommendation"], "ac")
+        self.assertEqual(deep["recommendation"], "ac")
+        self.assertEqual(shallow["est_cost_kr"], 5.2)
+        self.assertEqual(deep["est_cost_kr"], 5.2)
+        self.assertEqual(shallow["cost_label"], "~5.2 kr")
+
+    def test_session_factor_scales_the_theoretical_estimate(self):
+        # Until a night's been metered (no learned_night_cost), session_factor corrects the
+        # naive single-run estimate for what a real session actually spends re-cooling all
+        # night (re-warm top-ups, stall-burps, the post-midnight chase) -- validated
+        # 2026-07-21 at ~2.5x the naive kWh alone.
+        kwargs = dict(floor=24.0, equilibrium=26.0, comfort_limit=23.0, outdoor_temp=24.0,
+                     outdoor_dew=18.0, indoor_dew=15.0, cheapest_price=2.0)
+        naive = cm.plan_sleep(self._inp(session_factor=1.0, **kwargs))
+        corrected = cm.plan_sleep(self._inp(session_factor=2.5, **kwargs))
+        self.assertEqual(naive["recommendation"], "ac")
+        self.assertEqual(corrected["recommendation"], "ac")
+        # deficit 8.0C (target floor-limited to min_temp 16.0) * 0.5 kW / 1.0 cph -> 4.0 kWh
+        # naive @ 2.0 kr/kWh = 8.0 kr; *2.5 session_factor -> 10.0 kWh -> 20.0 kr.
+        self.assertEqual(naive["est_cost_kr"], 8.0)
+        self.assertEqual(corrected["est_cost_kr"], 20.0)
+        self.assertAlmostEqual(corrected["est_cost_kr"], naive["est_cost_kr"] * 2.5, places=6)
+
+    def test_noise_penalty_no_longer_added_to_displayed_cost(self):
+        # 2026-07-21 fix: noise_penalty_kr is kept only for backward-compat (default 0.5,
+        # still accepted as a field) but no longer inflates est_cost_kr -- the theoretical
+        # formula is purely kWh * price * session_factor now.
+        kwargs = dict(floor=24.0, equilibrium=26.0, comfort_limit=23.0, outdoor_temp=24.0,
+                     outdoor_dew=18.0, indoor_dew=15.0, cheapest_price=2.0, session_factor=1.0)
+        no_penalty = cm.plan_sleep(self._inp(noise_penalty_kr=0.0, **kwargs))
+        with_penalty = cm.plan_sleep(self._inp(noise_penalty_kr=0.5, **kwargs))
+        self.assertEqual(no_penalty["est_cost_kr"], with_penalty["est_cost_kr"])
+        self.assertEqual(with_penalty["est_cost_kr"], 8.0)   # 4.0 kWh * 2.0 kr/kWh, no +0.5
 
 
 class NightPeakCoastLawEquivalence(unittest.TestCase):
