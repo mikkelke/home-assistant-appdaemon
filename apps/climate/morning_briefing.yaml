@@ -1,0 +1,36 @@
+# Morning climate briefing -- ONE phone push a day with the climate decision SmartCooling
+# has already computed (sensor.sleep_plan + sensor.smart_cooling_status): open/close
+# windows, and whether to deploy + arm the AC for tonight. Advisory only -- never calls a
+# climate/switch/cover service; its only outputs are the notification and its own logs.
+#
+# Wake trigger = first of either, after from_hour: motion_entity goes "on", or either
+# bed_entities sensor goes "off" (bed-exit fallback). motion_entity ORs raw motion with a
+# separate occupancy signal, so it can already read "on" all night while someone sleeps --
+# a pure off->on edge on it alone could never fire on an ordinary morning. Getting OUT of
+# bed is the wake edge that's always reliably there, so both bed sensors are wired to the
+# same handler too; whichever of the three fires first after from_hour wins.
+#
+# Sent at most once per calendar day (last-sent date in state_file), gated on person_entity
+# being home (suppress ONLY on a live "not_home" reading -- a dead/unknown sensor is never
+# evidence of being away) and on sleep_plan_entity actually having published data (missing/
+# unknown data does NOT mark the day as sent, so a later wake edge retries).
+
+MorningBriefing:
+  module: morning_briefing
+  class: MorningBriefing
+
+  motion_entity: binary_sensor.bedroom_pir_presence
+  bed_entities:
+    - binary_sensor.left_bedside
+    - binary_sensor.right_bedside_in_bed
+  person_entity: person.mikkel
+  from_hour: 5
+  until_hour: 12
+
+  sleep_plan_entity: sensor.sleep_plan
+  status_entity: sensor.smart_cooling_status
+  climate_entity: climate.air_conditioner_thermostat
+  enable_entity: input_boolean.smart_cooling
+
+  notify_target: user
+  state_file: /conf/apps/climate/morning_briefing_state.json
