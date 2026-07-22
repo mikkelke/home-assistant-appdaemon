@@ -42,6 +42,16 @@ import json
 from typing import Optional
 
 
+def _nice_cost(cost_label):
+    """plan_sleep's cost_label ('~1.3 kr') -> prose ('about 1.3 kr'); None for the labels
+    that shouldn't produce a cost clause at all ('free', 'cost unknown', empty)."""
+    if not cost_label or cost_label in ("free", "cost unknown"):
+        return None
+    if cost_label.startswith("~"):
+        return "about " + cost_label[1:].strip()
+    return cost_label
+
+
 def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed):
     """Pure composer: sensor.sleep_plan's state+attributes, sensor.smart_cooling_status's
     attributes, and the AC's deploy/arm state -> one short push (title, message). No I/O,
@@ -56,59 +66,52 @@ def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed):
     status_attrs' kitchen_max_pred/outdoor_max_est (the weather model's predicted
     apartment/outdoor daytime peaks) are published as a pair -- see
     SmartCooling._weather_equilibrium, which only ever sets both or neither -- so the
-    day-ahead lead line is added only when both are present, omitted otherwise.
+    closing day-outlook line is added only when both are present, omitted otherwise.
     """
     plan_attrs = dict(plan_attrs or {})
     status_attrs = dict(status_attrs or {})
-    # Verdict-in-title (user 2026-07-22, "UI/UX love"): the lock-screen glance should
-    # answer the question without expanding the notification. The channel/tag identify
-    # it as the morning briefing; the title carries the decision.
+    # Copy style (user 2026-07-22, "like Apple made it"): the title IS the verdict, the
+    # body is one short human sentence leading with the action, the day's outlook closes
+    # it as quiet context. Real em-dashes and degree signs; no unit soup, no comfort-limit
+    # jargon, no window inventory (that's dashboard material, not notification material).
     title = "Morning climate"
     sentences = []
 
-    kitchen_max_pred = status_attrs.get("kitchen_max_pred")
-    outdoor_max_est = status_attrs.get("outdoor_max_est")
-    if kitchen_max_pred is not None and outdoor_max_est is not None:
-        sentences.append(f"Day ahead: ~{kitchen_max_pred:.0f}C inside, ~{outdoor_max_est:.0f}C out.")
-
-    comfort_limit = plan_attrs.get("comfort_limit")
-    cost_label = plan_attrs.get("cost_label")
+    cost = _nice_cost(plan_attrs.get("cost_label"))
     projected_peak = plan_attrs.get("projected_peak")
 
     if plan_state == "windows":
         title = "Window night"
-        chunk = "Window night -- keep the AC stored; open windows do the cooling for free."
+        chunk = "Open windows do the cooling tonight — free and silent. The AC stays stored."
         if ac_deployed:
-            chunk += " The AC is still plugged in -- you can stow it."
+            chunk += " It's still plugged in — you can stow it."
         sentences.append(chunk)
     elif plan_state == "nothing":
-        title = "Nothing needed tonight"
-        sentences.append(
-            f"Nothing needed tonight -- the bedroom stays under {comfort_limit}C on its own.")
+        title = "Nothing needed"
+        sentences.append("The bedroom stays comfortable on its own tonight.")
     elif plan_state == "hybrid":
-        # Windows FIRST (user 2026-07-22): hybrid's actual priority is the free lever now,
-        # AC only as standby -- the old wording collapsed it into the ac branch and led
-        # with "Deploy + arm", overselling the compressor on borderline days.
-        title = "Windows first, AC on standby"
+        # Windows FIRST (user 2026-07-22): hybrid's priority is the free lever; the AC is
+        # only the safety net and must never lead with "deploy".
+        title = "Windows first"
         if ac_deployed and armed:
-            backup = f"the AC is already armed as backup ({cost_label})"
+            backup = "the AC is already armed as backup"
         elif ac_deployed:
-            backup = "the AC is plugged in -- arm Cool night if you want the backup"
+            backup = "arm Cool night and the AC takes over"
         else:
-            backup = f"keep the AC ready as backup ({cost_label}) if the room won't settle"
-        sentences.append(f"Projected {projected_peak}C vs the {comfort_limit}C limit "
-                         f"tonight. Windows first -- open them; {backup}.")
+            backup = "the AC can back it up" + (f" for {cost}" if cost else "")
+        sentences.append(f"Start with open windows tonight — if the room won't settle, {backup}.")
     elif plan_state == "ac":
-        title = f"AC tonight ({cost_label})" if cost_label else "AC tonight"
+        title = "AC tonight"
+        lead = (f"The bedroom would reach {projected_peak:g}° tonight"
+                if projected_peak is not None else "A warm night is coming")
         if ac_deployed and armed:
-            action = f"The AC is deployed and armed -- it will handle it ({cost_label})."
+            action = "the AC is armed and will handle it" + (f" for {cost}" if cost else "")
         elif ac_deployed:
-            action = "The AC is plugged in -- just arm Cool night."
+            action = "arm Cool night and the AC handles the rest"
         else:
-            action = (f"Deploy + arm the AC before you leave so it can pre-cool in the "
-                      f"cheap hours ({cost_label}).")
-        sentences.append(f"Warm night coming: projected {projected_peak}C vs the "
-                         f"{comfort_limit}C limit. {action}")
+            action = ("deploy and arm the AC before you leave and it pre-cools on cheap power"
+                      + (f" for {cost}" if cost else ""))
+        sentences.append(f"{lead} — {action}.")
     else:
         headline = (plan_attrs.get("headline") or "").strip()
         detail = (plan_attrs.get("detail") or "").strip()
@@ -118,15 +121,17 @@ def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed):
         if first.endswith("."):
             first = first[:-1]
         if headline and first:
-            sentences.append(f"{headline} -- {first}.")
+            sentences.append(f"{headline} — {first}.")
         elif headline:
             sentences.append(f"{headline}.")
         elif first:
             sentences.append(f"{first}.")
 
-    # Informational only -- the user judges rain/security themselves.
-    if plan_attrs.get("open_windows"):
-        sentences.append(f"Open now: {plan_attrs.get('windows_summary', '')}.")
+    # Action first, context last: the day's outlook closes the message.
+    kitchen_max_pred = status_attrs.get("kitchen_max_pred")
+    outdoor_max_est = status_attrs.get("outdoor_max_est")
+    if kitchen_max_pred is not None and outdoor_max_est is not None:
+        sentences.append(f"Today around {outdoor_max_est:.0f}° out, {kitchen_max_pred:.0f}° inside.")
 
     return title, " ".join(sentences)
 
@@ -152,13 +157,14 @@ class MorningBriefing(hass.Hass):
         # Push polish (Android companion-app extras; each can be set "" in yaml to disable):
         # a stable tag makes a re-send REPLACE the previous briefing instead of stacking,
         # the channel gives the briefing its own Android notification channel (per-channel
-        # sound/importance on the phone), the icon brands it, and clickAction opens the
-        # dashboard on tap (relative URL -- the companion app resolves it against its
-        # own HA server).
+        # sound/importance on the phone), the icon brands it. click_url defaults EMPTY:
+        # with no clickAction the companion app's default tap opens the HA app itself
+        # (user 2026-07-22 -- a /local/ URL opened the phone BROWSER instead). Set it to
+        # an in-app path only if a specific view should open.
         self.notify_tag = a("notify_tag", "morning_briefing")
         self.notify_channel = a("notify_channel", "Morning climate")
         self.notify_icon = a("notify_icon", "mdi:bed-clock")
-        self.click_url = a("click_url", "/local/ha-dashboard/index.html")
+        self.click_url = a("click_url", "")
         self.state_file = a("state_file", "/conf/apps/climate/morning_briefing_state.json")
 
         self._sent_date: Optional[str] = None

@@ -48,27 +48,25 @@ class ComposeBriefingRecommendationBranches(unittest.TestCase):
 
     def test_titles_carry_the_verdict(self):
         # Verdict-in-title: the lock-screen glance answers the question. Fallback keeps
-        # the generic title.
+        # the generic title. Cost lives in the body, never the title.
         self.assertEqual(mb.compose_briefing("windows", _attrs(), {}, False, False)[0],
                          "Window night")
         self.assertEqual(mb.compose_briefing("nothing", _attrs(), {}, False, False)[0],
-                         "Nothing needed tonight")
+                         "Nothing needed")
         self.assertEqual(mb.compose_briefing("hybrid", _attrs(), {}, False, False)[0],
-                         "Windows first, AC on standby")
+                         "Windows first")
         self.assertEqual(mb.compose_briefing("ac", _attrs(), {}, False, False)[0],
-                         "AC tonight (~1.8 kr)")
+                         "AC tonight")
+        self.assertEqual(mb.compose_briefing("ac", _attrs(cost_label=None), {}, False, False)[0],
+                         "AC tonight")
         self.assertEqual(mb.compose_briefing("weird_future_value", _attrs(), {}, False, False)[0],
                          "Morning climate")
 
-    def test_ac_title_without_cost_label(self):
-        self.assertEqual(mb.compose_briefing("ac", _attrs(cost_label=None), {}, False, False)[0],
-                         "AC tonight")
-
     def test_windows_not_deployed(self):
         _, message = mb.compose_briefing("windows", _attrs(), {}, False, False)
-        self.assertIn("Window night", message)
-        self.assertIn("open windows do the cooling for free", message)
-        self.assertNotIn("still plugged in", message)
+        self.assertIn("Open windows do the cooling tonight", message)
+        self.assertIn("The AC stays stored", message)
+        self.assertNotIn("plugged in", message)
 
     def test_windows_deployed_adds_stow_hint(self):
         _, message = mb.compose_briefing("windows", _attrs(), {}, True, False)
@@ -83,52 +81,60 @@ class ComposeBriefingRecommendationBranches(unittest.TestCase):
 
     def test_nothing(self):
         _, message = mb.compose_briefing("nothing", _attrs(comfort_limit=22.5), {}, False, False)
-        self.assertIn("Nothing needed tonight", message)
-        self.assertIn("22.5C", message)
+        self.assertIn("stays comfortable on its own", message)
+        # No limit jargon in the push -- the number belongs on the dashboard.
+        self.assertNotIn("22.5", message)
 
     def test_ac_not_deployed_asks_to_deploy_and_arm(self):
         _, message = mb.compose_briefing("ac", _attrs(), {}, False, False)
-        self.assertIn("Deploy + arm the AC", message)
-        self.assertIn("~1.8 kr", message)
-        self.assertIn("25.0C", message)
-        self.assertIn("23.0C", message)
+        self.assertIn("deploy and arm the AC before you leave", message)
+        self.assertIn("about 1.8 kr", message)
+        self.assertIn("reach 25° tonight", message)
 
     def test_ac_armed_but_not_deployed_still_asks_to_deploy_and_arm(self):
         # an unusual state (armed with nothing plugged in) -- ac_deployed is what gates
         # the two override sentences, so this still falls through to the default.
         _, message = mb.compose_briefing("ac", _attrs(), {}, False, True)
-        self.assertIn("Deploy + arm the AC", message)
+        self.assertIn("deploy and arm the AC", message)
 
     def test_ac_deployed_but_not_armed(self):
         _, message = mb.compose_briefing("ac", _attrs(), {}, True, False)
-        self.assertIn("just arm Cool night", message)
-        self.assertNotIn("Deploy + arm", message)
+        self.assertIn("arm Cool night and the AC handles the rest", message)
+        self.assertNotIn("deploy and arm", message)
 
     def test_ac_deployed_and_armed(self):
         _, message = mb.compose_briefing("ac", _attrs(), {}, True, True)
-        self.assertIn("deployed and armed", message)
-        self.assertIn("~1.8 kr", message)
-        self.assertNotIn("Deploy + arm", message)
-        self.assertNotIn("just arm Cool night", message)
+        self.assertIn("armed and will handle it", message)
+        self.assertIn("about 1.8 kr", message)
+        self.assertNotIn("deploy and arm", message)
+        self.assertNotIn("Cool night", message)
+
+    def test_ac_without_cost_or_peak_still_reads_clean(self):
+        _, message = mb.compose_briefing("ac", _attrs(cost_label=None, projected_peak=None),
+                                         {}, False, False)
+        self.assertIn("A warm night is coming", message)
+        self.assertIn("deploy and arm the AC", message)
+        self.assertNotIn("about", message)
+        self.assertNotIn("None", message)
 
     def test_hybrid_is_windows_first_not_deploy(self):
         # user 2026-07-22: hybrid's priority is the free lever -- it must lead with
-        # windows and only mention the AC as backup, never "Deploy + arm".
+        # windows and only mention the AC as backup, never "deploy".
         _, message = mb.compose_briefing("hybrid", _attrs(), {}, False, False)
-        self.assertIn("Windows first -- open them", message)
-        self.assertIn("keep the AC ready as backup (~1.8 kr)", message)
-        self.assertNotIn("Deploy + arm", message)
-        self.assertNotIn("Warm night coming", message)
+        self.assertIn("Start with open windows tonight", message)
+        self.assertIn("the AC can back it up for about 1.8 kr", message)
+        self.assertNotIn("deploy", message)
+        self.assertNotIn("warm night", message.lower())
 
     def test_hybrid_deployed_and_armed_backup_ready(self):
         _, message = mb.compose_briefing("hybrid", _attrs(), {}, True, True)
-        self.assertIn("Windows first", message)
-        self.assertIn("already armed as backup (~1.8 kr)", message)
+        self.assertIn("Start with open windows", message)
+        self.assertIn("already armed as backup", message)
 
     def test_hybrid_deployed_not_armed_suggests_arming(self):
         _, message = mb.compose_briefing("hybrid", _attrs(), {}, True, False)
-        self.assertIn("Windows first", message)
-        self.assertIn("arm Cool night if you want the backup", message)
+        self.assertIn("Start with open windows", message)
+        self.assertIn("arm Cool night and the AC takes over", message)
 
     def test_unknown_recommendation_falls_back_to_headline_and_detail_first_sentence(self):
         _, message = mb.compose_briefing(
@@ -146,46 +152,55 @@ class ComposeBriefingRecommendationBranches(unittest.TestCase):
         self.assertEqual(message, "")
 
 
-class ComposeBriefingDayAheadLead(unittest.TestCase):
-    def test_both_present_adds_lead(self):
+class ComposeBriefingDayOutlook(unittest.TestCase):
+    """The day's outlook CLOSES the message (action first, context last)."""
+
+    def test_both_present_adds_closing_outlook(self):
         _, message = mb.compose_briefing(
             "nothing", _attrs(), {"kitchen_max_pred": 27.6, "outdoor_max_est": 31.2}, False, False)
-        self.assertIn("Day ahead: ~28C inside, ~31C out.", message)
+        self.assertTrue(message.endswith("Today around 31° out, 28° inside."))
 
-    def test_missing_outdoor_omits_lead(self):
+    def test_missing_outdoor_omits_outlook(self):
         _, message = mb.compose_briefing(
             "nothing", _attrs(), {"kitchen_max_pred": 27.6}, False, False)
-        self.assertNotIn("Day ahead", message)
+        self.assertNotIn("Today around", message)
 
-    def test_missing_kitchen_omits_lead(self):
+    def test_missing_kitchen_omits_outlook(self):
         _, message = mb.compose_briefing(
             "nothing", _attrs(), {"outdoor_max_est": 31.2}, False, False)
-        self.assertNotIn("Day ahead", message)
+        self.assertNotIn("Today around", message)
 
-    def test_empty_status_attrs_omits_lead(self):
+    def test_empty_status_attrs_omits_outlook(self):
         _, message = mb.compose_briefing("nothing", _attrs(), {}, False, False)
-        self.assertNotIn("Day ahead", message)
+        self.assertNotIn("Today around", message)
 
     def test_none_status_attrs_does_not_raise(self):
         _, message = mb.compose_briefing("nothing", _attrs(), None, False, False)
-        self.assertNotIn("Day ahead", message)
+        self.assertNotIn("Today around", message)
 
 
-class ComposeBriefingOpenWindows(unittest.TestCase):
-    def test_open_windows_appended(self):
+class ComposeBriefingNoWindowInventory(unittest.TestCase):
+    def test_open_windows_never_listed(self):
+        # user 2026-07-22: the push is a decision, not a status report -- which windows
+        # happen to be open is dashboard material, never notification material.
         attrs = _attrs(open_windows=["bedroom", "bathroom"],
                        windows_summary="bedroom + bathroom open")
-        _, message = mb.compose_briefing("windows", attrs, {}, False, False)
-        self.assertIn("Open now: bedroom + bathroom open.", message)
+        for rec in ("windows", "nothing", "hybrid", "ac"):
+            _, message = mb.compose_briefing(rec, attrs, {}, False, False)
+            self.assertNotIn("Open now", message)
+            self.assertNotIn("bedroom + bathroom", message)
 
-    def test_no_open_windows_omits_line(self):
-        _, message = mb.compose_briefing("windows", _attrs(), {}, False, False)
-        self.assertNotIn("Open now", message)
 
-    def test_open_windows_appended_regardless_of_recommendation(self):
-        attrs = _attrs(open_windows=["kitchen"], windows_summary="kitchen open")
-        _, message = mb.compose_briefing("ac", attrs, {}, True, True)
-        self.assertIn("Open now: kitchen open.", message)
+class NiceCost(unittest.TestCase):
+    def test_tilde_label_becomes_prose(self):
+        self.assertEqual(mb._nice_cost("~1.3 kr"), "about 1.3 kr")
+
+    def test_non_cost_labels_are_dropped(self):
+        for label in (None, "", "free", "cost unknown"):
+            self.assertIsNone(mb._nice_cost(label))
+
+    def test_plain_label_passes_through(self):
+        self.assertEqual(mb._nice_cost("2 kr"), "2 kr")
 
 
 # ---------------------------------------------------------------- app-level handler

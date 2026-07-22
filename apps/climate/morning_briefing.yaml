@@ -36,9 +36,11 @@ MorningBriefing:
   # Push polish (Android companion extras; set any to "" to disable): the tag makes a
   # re-send REPLACE the previous briefing instead of stacking; the channel gives it its
   # own Android notification channel (tune sound/importance per-channel on the phone);
-  # the icon brands it; clickAction opens the dashboard on tap.
+  # the icon brands it. click_url stays EMPTY on purpose: no clickAction = tapping opens
+  # the HA app (companion default). A /local/ dashboard URL opened the phone BROWSER
+  # instead (user 2026-07-22) -- only set this if a specific in-app view should open.
   notify_tag: morning_briefing
   notify_channel: Morning climate
   notify_icon: mdi:bed-clock
-  click_url: /local/ha-dashboard/index.html
+  click_url: ""
   state_file: /conf/apps/climate/morning_briefing_state.json
