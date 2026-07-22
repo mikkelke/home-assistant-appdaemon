@@ -5,6 +5,15 @@ manual_override_timeout:
   module: manual_override_timeout
   class: ManualOverrideTimeout
   timeout_hours: 12
+  # HA account id -> display name, for residents whose person entity is NOT linked to
+  # their HA account: the primary person-entity lookup (person.X's user_id attribute)
+  # misses them, so their feed entries lose the "By <name>" line even though HA's own
+  # logbook (which resolves account names directly) shows them fine. Kristine's
+  # person.kristine has no user_id link (found 2026-07-22, account predates the link
+  # convention). Harmless to keep once the person link is made in Settings -> People -
+  # the person map is checked first and simply wins.
+  user_name_fallback:
+    5bee78148825439488b70f92565e6c26: Kristine
   booleans:
     - input_boolean.bathroom_lights_manual
     - input_boolean.bedroom_lights_manual

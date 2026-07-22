@@ -31,6 +31,14 @@ class ManualOverrideTimeout(hass.Hass):
         # "turned off" feed report in _handle_change. See _expire.
         self._self_cleared = set()
         self._person_by_user_id = {}
+        # Account-id -> name fallback for residents without a person->account link (see
+        # yaml). Keys normalized to undashed lowercase hex, matching context.user_id's
+        # own format, so a dashed id pasted into the yaml still matches.
+        self._user_name_fallback = {
+            str(uid).replace("-", "").strip().lower(): name
+            for uid, name in (self.args.get("user_name_fallback") or {}).items()
+            if isinstance(name, str) and name.strip()
+        }
         self.listen_event(self._on_state_changed, "state_changed")
         self.run_in(lambda _: self._resync_all(), 5)
         self.log(
@@ -114,13 +122,18 @@ class ManualOverrideTimeout(hass.Hass):
                 )
 
     def _person_name(self, user_id):
-        """Display name for an HA user id via person entities, or None. The map refreshes
-        lazily on an unseen id (covers accounts/persons added after app start)."""
+        """Display name for an HA user id via person entities, falling back to the
+        configured account-name map (residents whose person entity isn't linked to their
+        account - see yaml), or None. The person map refreshes lazily on an unseen id
+        (covers accounts/persons added after app start)."""
         if not user_id:
             return None
         if user_id not in self._person_by_user_id:
             self._refresh_person_map()
-        return self._person_by_user_id.get(user_id)
+        resolved = self._person_by_user_id.get(user_id)
+        if resolved:
+            return resolved
+        return self._user_name_fallback.get(str(user_id).replace("-", "").strip().lower())
 
     def _refresh_person_map(self):
         # Domain query first (attribute= is per-entity only in AppDaemon), then each
