@@ -329,25 +329,13 @@ class BathroomLights(hass.Hass):
     def _turn_off_mains(self):
         """Turn off the 5 main spots only — bath spot stays with the bath sub-logic.
 
-        Only reached from the confirmed-bright auto-off path (``turn_off_bright``), so a
-        successful off here IS the "daylight is enough" decision - reported to the Home
-        activity feed because lights going off while you're in the room is exactly the
-        kind of house action that looks like a bug until it's explained. audience=admin
-        (user 2026-07-16): this is Mikkel's own bathroom, same scoping as its overrides."""
+        Only reached from the confirmed-bright auto-off path (``turn_off_bright``). This
+        used to report to the Home activity feed; removed 2026-07-22 after it fired twice
+        in 16 minutes on an ordinary sunny morning (relight -> re-off re-reports once past
+        the feed's 5-min dup window) - a routine, self-evident action, not feed-worthy.
+        The INFO log below keeps the decision traceable."""
         try:
-            was_on = self.get_state(self.main_5_spots_group) == "on"
             self.turn_off(self.main_5_spots_group)
-            if was_on:
-                try:
-                    self.fire_event(
-                        "house_events_report",
-                        cause="Bathroom is bright from daylight",
-                        effect="Ceiling spots turned off",
-                        icon="mdi:white-balance-sunny",
-                        audience="admin",
-                    )
-                except Exception:
-                    pass
         except Exception as e:
             self.log(f"Error turning off main lights: {e}", level="ERROR")
 
