@@ -647,9 +647,10 @@ class LockHealth(hass.Hass):
         if not self._guards_ok(now):
             self._abort_ladder(issue, "guard blocked reload")
             return
-        if not self._can_heal_act(now):
-            self._abort_ladder(issue, "cooldown blocked reload")
-            return
+        # No _can_heal_act here: the global action cooldown (5 min) gates STARTING
+        # actions (ladder entry via _press_wake, nudges) - it must not gate advancing
+        # an active ladder, whose rung waits (90-120s) are deliberately shorter.
+        # Escalation is bounded by the reload/plug budgets below instead.
         if not can_act(self._reload_history, now, cooldown_s=0,
                        cap_n=self.reload_max_per_2h, cap_window_s=7200):
             self.log(f"LockHealth[{issue}]: reload budget exhausted - giving up", level="WARNING")
@@ -687,9 +688,9 @@ class LockHealth(hass.Hass):
         if not self._guards_ok(now):
             self._abort_ladder(issue, "guard blocked power-cycle")
             return
-        if not self._can_heal_act(now):
-            self._abort_ladder(issue, "cooldown blocked power-cycle")
-            return
+        # No _can_heal_act here either (see _reload_rung) - the plug has its own
+        # 15-min cooldown + rolling cap via can_act below, which also paces this
+        # rung when it is a ladder's FIRST action (bridge-down / bridge-off shortcut).
         plug_state = self.get_state(self.bridge_plug)
         if plug_state in (None, "unknown", "unavailable"):
             self._notify_plug_unavailable()
