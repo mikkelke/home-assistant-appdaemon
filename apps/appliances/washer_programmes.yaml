@@ -60,9 +60,8 @@ programmes:
     allowed_spin_speeds: ["1400 rpm", "1200 rpm", "900 rpm", "700 rpm", "No spin"]
     default_spin: "1400 rpm"
     available_options: ["water_plus", "soak"]
-    duration_min: 199   # Manual p62 at 7 kg: 3:19 (199 min); full load typical
-    max_dur_min: 235
-    max_energy_kwh: 0.78
+    # Per-temp duration/energy from Python defaults (all 3 variants - 40-60°C/40°C/60°C - seeded
+    # identically, no per-fixed-temperature data yet); YAML adds validation bands (fallback when temp unknown)
     nominal_duration_min: 199
     min_valid_duration_min: 129    # 0.65 * 199
     max_valid_duration_min: 235

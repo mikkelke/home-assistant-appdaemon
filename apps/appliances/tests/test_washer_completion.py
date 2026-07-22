@@ -2,8 +2,28 @@
 # Run from repo root: python3 -m unittest appdaemon.apps.appliances.tests.test_washer_completion
 # These tests duplicate the validation/tail-window logic so they run without the AppDaemon runtime.
 
+import sys
+import types
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# Real WasherMonitor import for TestEcoPerTemperatureLearning below. washer_monitor imports
+# cleanly standalone once appdaemon.plugins.hass.hassapi is stubbed - same trick used by
+# test_washer_unavailable_grace.py in this directory (appdaemon isn't installed in the test env).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+if "appdaemon.plugins.hass.hassapi" not in sys.modules:
+    ad = types.ModuleType("appdaemon")
+    plugins = types.ModuleType("appdaemon.plugins")
+    hassmod = types.ModuleType("appdaemon.plugins.hass")
+    hassapi = types.ModuleType("appdaemon.plugins.hass.hassapi")
+    hassapi.Hass = object
+    sys.modules["appdaemon"] = ad
+    sys.modules["appdaemon.plugins"] = plugins
+    sys.modules["appdaemon.plugins.hass"] = hassmod
+    sys.modules["appdaemon.plugins.hass.hassapi"] = hassapi
+
+import washer_monitor as wm  # noqa: E402
 
 # Test profile set (mirrors WasherMonitor _DEFAULT_PROFILES for programmes we test)
 _TEST_PROFILES = {
@@ -405,6 +425,44 @@ class TestDelayedStartSlide(unittest.TestCase):
             energy_floor_kwh=0.05, observed_heating=False, cum_energy_kwh=0.03,
         )
         self.assertEqual(new_start, start)
+
+
+class TestEcoPerTemperatureLearning(unittest.TestCase):
+    """ECO now learns duration separately per confirmed temperature (40-60°C auto / 40°C / 60°C),
+    exactly like Bomuld already does per its 6 temperatures. Exercises the REAL
+    WasherMonitor._get_profile / _programme_has_temperature (not a mirror) - washer_monitor
+    imports cleanly standalone via the appdaemon stub above."""
+
+    def setUp(self):
+        self.app = wm.WasherMonitor.__new__(wm.WasherMonitor)
+
+    def test_programme_has_temperature_true_for_eco(self):
+        self.assertTrue(self.app._programme_has_temperature("eco"))
+
+    def test_each_temperature_resolves_its_own_by_temperature_entry(self):
+        for temp in ("40-60°C", "40°C", "60°C"):
+            profile = self.app._get_profile("eco", temp)
+            self.assertEqual(profile["duration_min"], 199)
+            self.assertEqual(profile["max_energy_kwh"], 0.78)
+            self.assertEqual(profile["max_dur_min"], 235)
+            self.assertEqual(profile["stable_min"], 15)
+            self.assertTrue(profile["heats"])
+            self.assertTrue(profile["supports_anti_crease"])
+            self.assertEqual(profile["label"], "ECO")
+
+    def test_missing_temperature_falls_back_to_first_variant(self):
+        """No temperature given (e.g. unconfirmed) -> falls back to the first by_temperature
+        entry, same as bomuld's fallback behavior."""
+        profile = self.app._get_profile("eco", None)
+        self.assertEqual(profile["duration_min"], 199)
+        self.assertEqual(profile["label"], "ECO")
+
+    def test_flat_programme_unaffected(self):
+        """A programme without by_temperature (e.g. 'impraegnering') still returns its flat
+        top-level profile and does not report temperature-dependence."""
+        self.assertFalse(self.app._programme_has_temperature("impraegnering"))
+        profile = self.app._get_profile("impraegnering")
+        self.assertEqual(profile["duration_min"], 25)
 
 
 if __name__ == "__main__":

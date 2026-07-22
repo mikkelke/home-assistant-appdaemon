@@ -124,7 +124,14 @@ class WasherMonitor(hass.Hass):
             "40°C": {"duration_min": 119, "max_energy_kwh": 0.52, "heats":  True, "stable_min": 15, "max_dur_min": 140, "supports_anti_crease": True},
             "60°C": {"duration_min": 119, "max_energy_kwh": 0.52, "heats":  True, "stable_min": 15, "max_dur_min": 140, "supports_anti_crease": True},
         }},  # Manual: 60°C -> cold; intermediate temps 20–40
-        "eco":       {"label": "ECO",       "default_temp": "40-60°C", "allowed_temperatures": ["40-60°C", "40°C", "60°C"], "default_temperature": "40-60°C", "allowed_spin_speeds": _CANONICAL_SPIN, "default_spin": "1400 rpm", "available_options": ["water_plus", "soak"], "duration_min": 199, "max_energy_kwh": 0.78, "heats":  True, "stable_min": 15, "max_dur_min": 235, "supports_anti_crease": True},  # Manual p62 at 7 kg: 3:19 (199 min); full load typical
+        "eco":       {"label": "ECO",       "default_temp": "40-60°C", "allowed_temperatures": ["40-60°C", "40°C", "60°C"], "default_temperature": "40-60°C", "allowed_spin_speeds": _CANONICAL_SPIN, "default_spin": "1400 rpm", "available_options": ["water_plus", "soak"], "by_temperature": {
+            # All three variants seeded identically (Manual p62 at 7 kg: 3:19 = 199 min, for the
+            # auto 40-60°C range specifically) - no per-fixed-temperature breakdown exists yet;
+            # learning differentiates them from confirmed cycles going forward.
+            "40-60°C": {"duration_min": 199, "max_energy_kwh": 0.78, "heats":  True, "stable_min": 15, "max_dur_min": 235, "supports_anti_crease": True},
+            "40°C": {"duration_min": 199, "max_energy_kwh": 0.78, "heats":  True, "stable_min": 15, "max_dur_min": 235, "supports_anti_crease": True},
+            "60°C": {"duration_min": 199, "max_energy_kwh": 0.78, "heats":  True, "stable_min": 15, "max_dur_min": 235, "supports_anti_crease": True},
+        }},
         "morkt_denim":  {"label": "Mørkt/Denim", "default_temp": "60°C", "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C", "60°C"], "allowed_spin_speeds": _SPIN_MAX_1200, "default_temperature": "60°C", "default_spin": "1200 rpm", "available_options": ["water_plus"], "by_temperature": {
             "cold": {"duration_min":  90, "max_energy_kwh": 0.35, "heats": False, "stable_min": 12, "max_dur_min": 110, "supports_anti_crease": True},
             "20°C": {"duration_min":  90, "max_energy_kwh": 0.42, "heats":  True, "stable_min": 12, "max_dur_min": 110, "supports_anti_crease": True},
