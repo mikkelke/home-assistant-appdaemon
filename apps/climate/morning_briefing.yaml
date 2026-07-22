@@ -33,4 +33,12 @@ MorningBriefing:
   enable_entity: input_boolean.smart_cooling
 
   notify_target: user
+  # Push polish (Android companion extras; set any to "" to disable): the tag makes a
+  # re-send REPLACE the previous briefing instead of stacking; the channel gives it its
+  # own Android notification channel (tune sound/importance per-channel on the phone);
+  # the icon brands it; clickAction opens the dashboard on tap.
+  notify_tag: morning_briefing
+  notify_channel: Morning climate
+  notify_icon: mdi:bed-clock
+  click_url: /local/ha-dashboard/index.html
   state_file: /conf/apps/climate/morning_briefing_state.json

@@ -60,6 +60,9 @@ def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed):
     """
     plan_attrs = dict(plan_attrs or {})
     status_attrs = dict(status_attrs or {})
+    # Verdict-in-title (user 2026-07-22, "UI/UX love"): the lock-screen glance should
+    # answer the question without expanding the notification. The channel/tag identify
+    # it as the morning briefing; the title carries the decision.
     title = "Morning climate"
     sentences = []
 
@@ -73,14 +76,30 @@ def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed):
     projected_peak = plan_attrs.get("projected_peak")
 
     if plan_state == "windows":
+        title = "Window night"
         chunk = "Window night -- keep the AC stored; open windows do the cooling for free."
         if ac_deployed:
             chunk += " The AC is still plugged in -- you can stow it."
         sentences.append(chunk)
     elif plan_state == "nothing":
+        title = "Nothing needed tonight"
         sentences.append(
             f"Nothing needed tonight -- the bedroom stays under {comfort_limit}C on its own.")
-    elif plan_state in ("ac", "hybrid"):
+    elif plan_state == "hybrid":
+        # Windows FIRST (user 2026-07-22): hybrid's actual priority is the free lever now,
+        # AC only as standby -- the old wording collapsed it into the ac branch and led
+        # with "Deploy + arm", overselling the compressor on borderline days.
+        title = "Windows first, AC on standby"
+        if ac_deployed and armed:
+            backup = f"the AC is already armed as backup ({cost_label})"
+        elif ac_deployed:
+            backup = "the AC is plugged in -- arm Cool night if you want the backup"
+        else:
+            backup = f"keep the AC ready as backup ({cost_label}) if the room won't settle"
+        sentences.append(f"Projected {projected_peak}C vs the {comfort_limit}C limit "
+                         f"tonight. Windows first -- open them; {backup}.")
+    elif plan_state == "ac":
+        title = f"AC tonight ({cost_label})" if cost_label else "AC tonight"
         if ac_deployed and armed:
             action = f"The AC is deployed and armed -- it will handle it ({cost_label})."
         elif ac_deployed:
@@ -130,6 +149,16 @@ class MorningBriefing(hass.Hass):
         self.enable_entity = a("enable_entity", "input_boolean.smart_cooling")
         # --- notification ---
         self.notify_target = a("notify_target", "user")
+        # Push polish (Android companion-app extras; each can be set "" in yaml to disable):
+        # a stable tag makes a re-send REPLACE the previous briefing instead of stacking,
+        # the channel gives the briefing its own Android notification channel (per-channel
+        # sound/importance on the phone), the icon brands it, and clickAction opens the
+        # dashboard on tap (relative URL -- the companion app resolves it against its
+        # own HA server).
+        self.notify_tag = a("notify_tag", "morning_briefing")
+        self.notify_channel = a("notify_channel", "Morning climate")
+        self.notify_icon = a("notify_icon", "mdi:bed-clock")
+        self.click_url = a("click_url", "/local/ha-dashboard/index.html")
         self.state_file = a("state_file", "/conf/apps/climate/morning_briefing_state.json")
 
         self._sent_date: Optional[str] = None
@@ -251,6 +280,16 @@ class MorningBriefing(hass.Hass):
             self.log(f"morning briefing handler failed ({e})", level="WARNING")
 
     # ---------- notify ----------
+    def _notify_data(self):
+        """Companion-app extras for the push (tag/channel/icon/clickAction -- see the
+        initialize comment). Empty knobs are dropped; returns None when nothing is set so
+        MobileNotifier's data handling is skipped entirely."""
+        extras = {k: v for k, v in (("tag", self.notify_tag),
+                                    ("channel", self.notify_channel),
+                                    ("notification_icon", self.notify_icon),
+                                    ("clickAction", self.click_url)) if v}
+        return {"data": extras} if extras else None
+
     async def _notify(self, title, message):
         """Send via MobileNotifier; True on success. WARNING-logs and returns False on any
         failure (notifier unavailable, HA call raises) -- the caller must NOT mark the day
@@ -261,7 +300,8 @@ class MorningBriefing(hass.Hass):
             return False
         try:
             await self.mobile_notifier.notify(title=title, message=message,
-                                              target=self.notify_target)
+                                              target=self.notify_target,
+                                              data=self._notify_data())
             return True
         except Exception as e:
             self.log(f"notify failed ({e}) -- morning briefing not sent", level="WARNING")

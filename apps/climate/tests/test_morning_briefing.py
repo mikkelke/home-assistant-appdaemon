@@ -46,9 +46,23 @@ class ComposeBriefingRecommendationBranches(unittest.TestCase):
     """Message rules per recommendation, per the deployed/armed permutations that change
     the wording (see morning_briefing.compose_briefing docstring)."""
 
-    def test_title_is_always_morning_climate(self):
-        title, _ = mb.compose_briefing("nothing", _attrs(), {}, False, False)
-        self.assertEqual(title, "Morning climate")
+    def test_titles_carry_the_verdict(self):
+        # Verdict-in-title: the lock-screen glance answers the question. Fallback keeps
+        # the generic title.
+        self.assertEqual(mb.compose_briefing("windows", _attrs(), {}, False, False)[0],
+                         "Window night")
+        self.assertEqual(mb.compose_briefing("nothing", _attrs(), {}, False, False)[0],
+                         "Nothing needed tonight")
+        self.assertEqual(mb.compose_briefing("hybrid", _attrs(), {}, False, False)[0],
+                         "Windows first, AC on standby")
+        self.assertEqual(mb.compose_briefing("ac", _attrs(), {}, False, False)[0],
+                         "AC tonight (~1.8 kr)")
+        self.assertEqual(mb.compose_briefing("weird_future_value", _attrs(), {}, False, False)[0],
+                         "Morning climate")
+
+    def test_ac_title_without_cost_label(self):
+        self.assertEqual(mb.compose_briefing("ac", _attrs(cost_label=None), {}, False, False)[0],
+                         "AC tonight")
 
     def test_windows_not_deployed(self):
         _, message = mb.compose_briefing("windows", _attrs(), {}, False, False)
@@ -97,13 +111,24 @@ class ComposeBriefingRecommendationBranches(unittest.TestCase):
         self.assertNotIn("Deploy + arm", message)
         self.assertNotIn("just arm Cool night", message)
 
-    def test_hybrid_not_deployed_uses_same_branch_as_ac(self):
+    def test_hybrid_is_windows_first_not_deploy(self):
+        # user 2026-07-22: hybrid's priority is the free lever -- it must lead with
+        # windows and only mention the AC as backup, never "Deploy + arm".
         _, message = mb.compose_briefing("hybrid", _attrs(), {}, False, False)
-        self.assertIn("Deploy + arm the AC", message)
+        self.assertIn("Windows first -- open them", message)
+        self.assertIn("keep the AC ready as backup (~1.8 kr)", message)
+        self.assertNotIn("Deploy + arm", message)
+        self.assertNotIn("Warm night coming", message)
 
-    def test_hybrid_deployed_and_armed(self):
+    def test_hybrid_deployed_and_armed_backup_ready(self):
         _, message = mb.compose_briefing("hybrid", _attrs(), {}, True, True)
-        self.assertIn("deployed and armed", message)
+        self.assertIn("Windows first", message)
+        self.assertIn("already armed as backup (~1.8 kr)", message)
+
+    def test_hybrid_deployed_not_armed_suggests_arming(self):
+        _, message = mb.compose_briefing("hybrid", _attrs(), {}, True, False)
+        self.assertIn("Windows first", message)
+        self.assertIn("arm Cool night if you want the backup", message)
 
     def test_unknown_recommendation_falls_back_to_headline_and_detail_first_sentence(self):
         _, message = mb.compose_briefing(
@@ -376,6 +401,10 @@ class NotifyMethod(unittest.TestCase):
     def _app(self):
         app = mb.MorningBriefing.__new__(mb.MorningBriefing)
         app.notify_target = "user"
+        app.notify_tag = "morning_briefing"
+        app.notify_channel = "Morning climate"
+        app.notify_icon = "mdi:bed-clock"
+        app.click_url = "/local/ha-dashboard/index.html"
         app.log = lambda *a, **k: None
         return app
 
@@ -390,12 +419,30 @@ class NotifyMethod(unittest.TestCase):
         calls = []
 
         class FakeNotifier:
-            async def notify(self, title, message, target):
-                calls.append((title, message, target))
+            async def notify(self, title, message, target, data=None):
+                calls.append((title, message, target, data))
         app.mobile_notifier = FakeNotifier()
         ok = asyncio.run(app._notify("Morning climate", "msg"))
         self.assertTrue(ok)
-        self.assertEqual(calls, [("Morning climate", "msg", "user")])
+        self.assertEqual(calls, [("Morning climate", "msg", "user",
+                                  {"data": {"tag": "morning_briefing",
+                                            "channel": "Morning climate",
+                                            "notification_icon": "mdi:bed-clock",
+                                            "clickAction": "/local/ha-dashboard/index.html"}})])
+
+    def test_empty_polish_knobs_send_no_data_payload(self):
+        # All four extras disabled ("" in yaml) -> data must be None, not {"data": {}},
+        # so MobileNotifier's data handling is skipped entirely.
+        app = self._app()
+        app.notify_tag = app.notify_channel = app.notify_icon = app.click_url = ""
+        calls = []
+
+        class FakeNotifier:
+            async def notify(self, title, message, target, data=None):
+                calls.append(data)
+        app.mobile_notifier = FakeNotifier()
+        self.assertTrue(asyncio.run(app._notify("t", "m")))
+        self.assertEqual(calls, [None])
 
     def test_notifier_raises_returns_false(self):
         app = self._app()
