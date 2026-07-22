@@ -1538,8 +1538,11 @@ class SmartCooling(hass.Hass):
     # holds/resumes, target drift -- lives on the SmartCooling card; only session-level facts
     # (first cool-on of the night, sealed for the night, disarm) and actionable blockers
     # (window closed, condenser hard cap) get a feed entry, each rate-limited so a flapping
-    # bathroom window or a stop-start evening cannot flood the feed.
-    FEED_COOLDOWN_MIN = {"cool_on": 240, "off_window": 60, "off_hardcap": 120,
+    # bathroom window or a stop-start evening cannot flood the feed. cool_on's 20h window
+    # means one entry per day's session while tomorrow's still reports -- at 4h every
+    # pre-cool resume after a price hold re-reported (2026-07-22: three "cooling to 16C"
+    # entries in one day).
+    FEED_COOLDOWN_MIN = {"cool_on": 1200, "off_window": 60, "off_hardcap": 120,
                          "disarm": 0, "done": 0}
 
     def _feed_kind_for_off(self, reason):
@@ -1566,6 +1569,19 @@ class SmartCooling(hass.Hass):
             return False
         self._feed_last[kind] = now
         return True
+
+    @staticmethod
+    def _feed_cause(reason, limit=110):
+        """Feed copy of a planner reason: the feed hard-slices cause at 120 chars, which
+        showed mid-word cuts like "[capped by fea". Drop the card-facing "  [...]" fine
+        print and end on a word boundary; the card/log keep the full string."""
+        cause = reason.split(" [")[0].rstrip()
+        if len(cause) > limit:
+            cut = cause[:limit]
+            if " " in cut:
+                cut = cut.rsplit(" ", 1)[0]
+            cause = cut.rstrip(" ,;:-.") + "..."
+        return cause
 
     async def _report_house_event(self, kind, cause, effect, now):
         """Explain a session-level AC fact to the dashboard's Home activity feed (admin
@@ -1654,9 +1670,10 @@ class SmartCooling(hass.Hass):
                 self._mark_switch("cool")
                 self.log(f"COOL on ({self.cool_setpoint}C/{fan}): {reason}"
                          + ("  [quiet: in bed]" if occupied else ""), level="INFO")
-                # reason is the planner's own explanation of WHY (cheap hour, deadline, deficit...)
+                # reason is the planner's own explanation of WHY (cheap hour, deadline,
+                # deficit...); the feed gets a trimmed copy, the card/log keep it whole
                 await self._report_house_event(
-                    "cool_on", reason,
+                    "cool_on", self._feed_cause(reason),
                     f"AC cooling the bedroom to {self.cool_setpoint:g}C", now)
             cur_temp = await self._attr(self.climate_entity, "temperature", None)
             if cur_temp is None or abs(float(cur_temp) - self.cool_setpoint) > 0.1:
