@@ -464,7 +464,29 @@ washer_monitor:
   
   announce_message: "Washer is ready to be emptied"
   announce_entity: input_boolean.washer_announce   # Toggle off to silence Sonos announcements
-  
+
+  # ============================================================================
+  # PRESENCE-GATED CONFIRM PUSH
+  # ============================================================================
+  # When a cycle ends unconfirmed (Auto) but the cycle looks genuinely completed (not an
+  # abort/suspect), ask whoever is home to confirm the programme with one tap - this teaches
+  # the ETA without you having to open the app. MobileNotifier resolves who is home; if nobody
+  # is home the push is silently skipped (no presence logic needed here).
+  confirm_push_enabled: true
+  confirm_push_target: "home"   # "home" = only people currently home (see MobileNotifier)
+  confirm_push_dashboard_uri: "/local/ha-dashboard/index.html"   # "Other..." / "Choose in dashboard" button
+
+  # ============================================================================
+  # SETTLED PER-CYCLE COST
+  # ============================================================================
+  # Cost is metered every tick (30s) against the spot price and the cumulative energy sensor,
+  # so cost_kr in feedback_file reflects the real price at the time energy was actually used
+  # (not just an average). Same as duration: the standby wait of a delayed start is excluded
+  # (see DELAYED START above) - only real wash energy is charged.
+  price_entity: sensor.energi_data_service
+  price_fallback_kr: 1.7   # kr/kWh used when price_entity is unavailable/unknown
+  track_cycle_cost: true
+
   # ============================================================================
   # PROGRAMME FEEDBACK & LEARNING
   # ============================================================================

@@ -506,7 +506,12 @@ class WasherMonitor(hass.Hass):
         self.last_high_energy_at = None  # Last time energy rate was above threshold
         self.energy_check_timer = None
         self.energy_buffer = []  # Rolling window of (datetime, kWh) for aliasing-resistant implied-watts
-        
+
+        # Settled per-cycle cost tracking (dedicated vars - not shared with the energy-buffer/
+        # tail-detection vars above, which get re-seeded by unrelated paths).
+        self._session_cost_kr = 0.0
+        self._cost_prev_energy_kwh = None  # Previous tick's cumulative energy reading for cost delta
+
         # Finish confirmation flag
         self.finish_confirmed = False
         self._zero_power_since = None  # Standby backstop: when power first dropped to 0W
@@ -587,6 +592,19 @@ class WasherMonitor(hass.Hass):
         self.announce_entity = self.args.get("announce_entity")  # input_boolean to enable/disable
         # Optional: announce when door *unlocks* instead of when we enter Unemptied.
         self.door_lock_entity = self.args.get("door_lock_entity")  # e.g. lock.washer_door
+
+        # Settled per-cycle cost: meter the spot price against the cumulative energy sensor each
+        # tick (see _check_energy_finish); the standby wait of a delayed start is excluded (reset
+        # in _slide_start_for_delayed_start), same as duration.
+        self.price_entity = self.args.get("price_entity", "sensor.energi_data_service")
+        self.price_fallback_kr = float(self.args.get("price_fallback_kr", 1.7))
+        self.track_cycle_cost = bool(self.args.get("track_cycle_cost", True))
+
+        # Presence-gated confirm push: when a cycle ends unconfirmed but worth learning, ask
+        # whoever is home to confirm the programme with one tap (see _maybe_send_confirm_push).
+        self.confirm_push_enabled = bool(self.args.get("confirm_push_enabled", True))
+        self.confirm_push_target = self.args.get("confirm_push_target", "home")
+        self.confirm_push_dashboard_uri = self.args.get("confirm_push_dashboard_uri", "/local/ha-dashboard/index.html")
 
         # Get Sonos Notifier App instance
         self.sonos_notifier = None
@@ -685,6 +703,11 @@ class WasherMonitor(hass.Hass):
             self.listen_state(self._on_confirm_changed, self.confirm_entity)
         if self.temperature_entity:
             self.listen_state(self._on_confirm_changed, self.temperature_entity)
+
+        # Presence-gated confirm push: button presses on the actionable notification, and a
+        # test hook to preview the message/buttons on demand (see _send_confirm_push).
+        self.listen_event(self._on_confirm_push_action, "mobile_app_notification_action")
+        self.listen_event(self._on_test_confirm_push, "washer_test_confirm_push")
 
         # Load historical feedback and derive learned duration estimates
         self._load_and_apply_feedback()
@@ -853,6 +876,14 @@ class WasherMonitor(hass.Hass):
             if energy_at_start is not None:
                 self.energy_start = float(energy_at_start)
                 self.log(f"Restored energy_at_start: {self.energy_start}", level="DEBUG")
+        except (TypeError, ValueError, AttributeError):
+            pass
+
+        try:
+            cost_attr = self.get_state(self.state_entity, attribute="session_cost_kr")
+            if cost_attr is not None:
+                self._session_cost_kr = float(cost_attr)
+                self.log(f"Restored session_cost_kr: {self._session_cost_kr}", level="DEBUG")
         except (TypeError, ValueError, AttributeError):
             pass
 
@@ -2995,7 +3026,7 @@ class WasherMonitor(hass.Hass):
             )
             if self._delayed_start_trimmed and duration_source is None:
                 duration_source = "delayed_start_trimmed"
-            self._save_cycle_feedback(
+            saved_record = self._save_cycle_feedback(
                 predicted=final_prog,
                 predicted_temperature=final_temp,
                 confirmed=confirmed_prog,
@@ -3021,7 +3052,10 @@ class WasherMonitor(hass.Hass):
                 profile_version="1",
                 validation_version="2",
                 selected_options=self._get_selected_options(),
+                cost_kr=self._session_cost_kr if self.track_cycle_cost else None,
             )
+            if saved_record is not None:
+                self._maybe_send_confirm_push(saved_record)
 
             self.state = "Unemptied"
             confirmed_profile = self._get_profile(confirmed_prog, confirmed_temp)
@@ -3190,7 +3224,7 @@ class WasherMonitor(hass.Hass):
                         transition_path=end_reason,
                         spin_rpm=spin_rpm,
                     )
-                    self._save_cycle_feedback(
+                    saved_record = self._save_cycle_feedback(
                         predicted=final_prog,
                         predicted_temperature=final_temp,
                         confirmed=confirmed_prog,
@@ -3216,7 +3250,10 @@ class WasherMonitor(hass.Hass):
                         profile_version="1",
                         validation_version="2",
                         selected_options=self._get_selected_options(),
+                        cost_kr=self._session_cost_kr if self.track_cycle_cost else None,
                     )
+                    if saved_record is not None:
+                        self._maybe_send_confirm_push(saved_record)
                 except Exception as e:
                     self.log(f"Could not save feedback on Emptied transition: {e}", level="WARNING")
 
@@ -3278,6 +3315,8 @@ class WasherMonitor(hass.Hass):
         """Reset all cycle-related tracking variables."""
         self.start_time = None
         self.energy_start = None
+        self._session_cost_kr = 0.0
+        self._cost_prev_energy_kwh = None
         self.door_opened_time = None
         self.door_opened_during_cycle = False
         self.program_timer = None
@@ -3658,6 +3697,10 @@ class WasherMonitor(hass.Hass):
         except (ValueError, TypeError):
             self.energy_start = None
 
+        # Settled per-cycle cost: fresh accumulator + baseline for this cycle (see _check_energy_finish).
+        self._session_cost_kr = 0.0
+        self._cost_prev_energy_kwh = self.energy_start
+
         # Set state and initial attributes immediately so UI shows this cycle's start time.
         self.detected_programme = "unknown"
         self.detected_temperature = None
@@ -3678,6 +3721,7 @@ class WasherMonitor(hass.Hass):
             "programme_duration_min": profile["duration_min"],
             "delayed_start_trimmed": bool(self._delayed_start_trimmed),
             "delayed_start_waiting": bool(self._delay_waiting),
+            "session_cost_kr": round(self._session_cost_kr, 2),
         }
         if self.energy_start is not None:
             attrs["energy_at_start"] = self.energy_start
@@ -4632,6 +4676,7 @@ class WasherMonitor(hass.Hass):
         profile_version: str | None = None,
         validation_version: str | None = None,
         selected_options: dict | None = None,  # e.g. {"water_plus": "on", "soak": "off"} from option entities
+        cost_kr: float | None = None,  # Settled per-cycle cost (self._session_cost_kr); None for migration/backfill saves
     ):
         """Append one completed cycle record to the feedback JSON file (v2 format).
 
@@ -4645,6 +4690,10 @@ class WasherMonitor(hass.Hass):
         duration_source: "user_cycle_end" | "history_corrected" when we used that for duration_min.
         end_reason: "low_power_detected" | "door_opened_first" | "user_cycle_end" | "anti_crease_pattern".
         idle_min: minutes from programme end to when we recorded (door open / detection); only set when we corrected.
+
+        Returns the saved record dict, or None if the save was skipped (duplicate guard) or failed
+        (write error). Callers use the returned record to decide whether to trigger a confirm push
+        (see _maybe_send_confirm_push) - only for a genuinely new save of the live cycle.
         """
         import json
         import os
@@ -4692,6 +4741,8 @@ class WasherMonitor(hass.Hass):
             record["validation_version"] = validation_version
         if selected_options is not None and selected_options:
             record["selected_options"] = dict(selected_options)
+        if cost_kr is not None:
+            record["cost_kr"] = round(cost_kr, 2)
 
         if os.path.exists(self.feedback_file):
             try:
@@ -4779,6 +4830,181 @@ class WasherMonitor(hass.Hass):
             f"{learned_note}effective ETA {eff}min",
             level="INFO",
         )
+        return record
+
+    # =========================================================================
+    # Presence-gated confirm push (feature: ask whoever is home to confirm the
+    # programme with one tap when a cycle ends unconfirmed but worth learning)
+    # =========================================================================
+
+    @staticmethod
+    def _should_send_confirm_push(record: dict, enabled: bool) -> bool:
+        """Gate for the confirm push: only nag when enabled, the cycle actually
+        completed (not an abort/suspect), and no human has confirmed it yet
+        (checks the new programme_confirmed_by_human field and the legacy
+        programme_user_confirmed field - either being true means don't ask)."""
+        if not enabled:
+            return False
+        if record.get("programme_confirmed_by_human") or record.get("programme_user_confirmed"):
+            return False
+        if record.get("completion_class") != "completed":
+            return False
+        return True
+
+    @staticmethod
+    def _encode_confirm_action(ts: str, prog: str, temp: str | None) -> str:
+        """Build the WASHER_CONFIRM|<ts>|<prog>|<temp> action id for the confirm-push
+        button. temp must already be in storage format (e.g. '40', 'cold'); None -> '-'."""
+        return f"WASHER_CONFIRM|{ts}|{prog}|{temp if temp else '-'}"
+
+    @staticmethod
+    def _parse_confirm_action(action: str):
+        """Parse a WASHER_CONFIRM|<ts>|<prog>|<temp> action id back to (ts, prog, temp).
+        temp is storage format or None ('-' -> None). Returns None if malformed."""
+        if not action or not action.startswith("WASHER_CONFIRM|"):
+            return None
+        parts = action.split("|")
+        if len(parts) != 4:
+            return None
+        _, ts, prog, temp = parts
+        if not ts or not prog:
+            return None
+        return (ts, prog, None if temp == "-" else temp)
+
+    def _maybe_send_confirm_push(self, record: dict):
+        """Called right after a successful _save_cycle_feedback of the live cycle
+        (Unemptied / door-opened-first transitions). Sends the confirm push only
+        when _should_send_confirm_push gates it through."""
+        if not self._should_send_confirm_push(record, self.confirm_push_enabled):
+            return
+        self._send_confirm_push(record)
+
+    def _send_confirm_push(self, record: dict):
+        """Build and send the confirm-programme push for `record` (unconditional -
+        callers gate as needed; the washer_test_confirm_push test hook calls this
+        directly to preview the message/buttons). Same pattern as _push_mobile."""
+        try:
+            predicted = record.get("predicted") or ""
+            ts = record.get("ts", "")
+            title = "Washer finished"
+            if predicted and predicted != "unknown":
+                predicted_temp_storage = record.get("predicted_temperature")
+                predicted_temp = self._temp_from_storage(predicted_temp_storage)
+                profile = self._get_profile(predicted, predicted_temp)
+                label = profile.get("label", predicted)
+                temp_suffix = f" {predicted_temp}" if predicted_temp else ""
+                message = f"Was it {label}{temp_suffix}? Confirming teaches the ETA."
+                action_id = self._encode_confirm_action(ts, predicted, predicted_temp_storage)
+                actions = [
+                    {"action": action_id, "title": f"Yes, {label}{temp_suffix}"},
+                    {"action": "URI", "title": "Other...", "uri": self.confirm_push_dashboard_uri},
+                ]
+            else:
+                message = "Which programme did you run? Confirming teaches the ETA."
+                actions = [
+                    {"action": "URI", "title": "Choose in dashboard", "uri": self.confirm_push_dashboard_uri},
+                ]
+            notifier = self.get_app("MobileNotifier")
+            if notifier is None:
+                self.log("MobileNotifier app not found - cannot send confirm push", level="WARNING")
+                return
+            self.create_task(notifier.notify(
+                title=title,
+                message=message,
+                target=self.confirm_push_target,
+                data={"data": {"actions": actions, "tag": "washer_confirm"}},
+            ))
+            self.log(f"Confirm push sent for cycle ts={ts} predicted={predicted}", level="INFO")
+        except Exception as e:
+            self.log(f"Could not send confirm push: {e}", level="WARNING")
+
+    def _on_confirm_push_action(self, event_name, data, kwargs):
+        """Handle WASHER_CONFIRM|<ts>|<prog>|<temp> button presses from the confirm push
+        (see _send_confirm_push). Sync handler - this app has no async def anywhere and
+        listen_event callbacks elsewhere in this codebase (dishwasher_monitor's force-*
+        events, wakeup_reminder's notification-action handler) are plain sync methods too.
+        """
+        data = data or {}
+        action = data.get("action", "") if isinstance(data, dict) else ""
+        if not action.startswith("WASHER_CONFIRM|"):
+            return
+        parsed = self._parse_confirm_action(action)
+        if not parsed:
+            self.log(f"Malformed confirm-push action ignored: {action!r}", level="WARNING")
+            return
+        ts, prog, temp = parsed
+
+        import json
+        if not self.feedback_file or not os.path.exists(self.feedback_file):
+            self.log(f"confirm action for unknown/stale cycle ts={ts}", level="INFO")
+            return
+        try:
+            with open(self.feedback_file, "r") as f:
+                fb_data = json.load(f)
+        except Exception as e:
+            self.log(f"Could not read feedback file for confirm action: {e}", level="WARNING")
+            return
+        cycles = fb_data.get("cycles", [])
+        rec = next((c for c in cycles if c.get("ts") == ts), None)
+        if rec is None:
+            self.log(f"confirm action for unknown/stale cycle ts={ts}", level="INFO")
+            return
+        if rec.get("programme_confirmed_by_human") or rec.get("programme_user_confirmed"):
+            self.log(f"Cycle ts={ts} already confirmed, ignoring", level="INFO")
+            return
+
+        rec["confirmed"] = prog
+        rec["confirmed_temperature"] = self._temp_for_storage(temp)
+        rec["programme_confirmed_by_human"] = True
+        rec["programme_user_confirmed"] = True  # keep legacy field consistent
+        rec["programme_confirmed_via"] = "push_action"
+
+        try:
+            with open(self.feedback_file, "w") as f:
+                json.dump(fb_data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.log(f"Could not write feedback file for confirm action: {e}", level="WARNING")
+            return
+
+        # Update in-memory learned durations incrementally - same math and learn-key
+        # derivation as _save_cycle_feedback's save-time update, gated the same way the
+        # loader gates (valid_for_learning and a positive duration).
+        conf_temp_internal = self._temp_from_storage(rec.get("confirmed_temperature"))
+        learn_key = f"{prog}|{conf_temp_internal}" if (conf_temp_internal and self._programme_has_temperature(prog)) else prog
+        duration_min = rec.get("duration_min")
+        if rec.get("valid_for_learning") and isinstance(duration_min, (int, float)) and duration_min > 0:
+            prev = self._learned_durations.get(learn_key, {"n": 0, "avg": duration_min})
+            n_new = prev["n"] + 1
+            avg_new = (prev["avg"] * prev["n"] + duration_min) / n_new
+            self._learned_durations[learn_key] = {"n": n_new, "avg": avg_new}
+
+        self.log(f"Cycle {ts} confirmed as {learn_key} via push action", level="INFO")
+
+    def _on_test_confirm_push(self, event_name, data, kwargs):
+        """Test hook: washer_test_confirm_push - send the confirm push for the LAST
+        feedback record regardless of its confirmed state, so the real message/buttons
+        can be checked on the phone without waiting for a cycle to end unconfirmed."""
+        import json
+        if not self.feedback_file or not os.path.exists(self.feedback_file):
+            self.log("Test confirm push: no feedback file found", level="INFO")
+            return
+        try:
+            with open(self.feedback_file, "r") as f:
+                fb_data = json.load(f)
+        except Exception as e:
+            self.log(f"Test confirm push: could not read feedback file: {e}", level="WARNING")
+            return
+        cycles = fb_data.get("cycles", [])
+        if not cycles:
+            self.log("Test confirm push: feedback file has no cycles", level="INFO")
+            return
+        record = cycles[-1]
+        self.log(
+            f"Test confirm push: sending for last cycle ts={record.get('ts')} "
+            f"predicted={record.get('predicted')} confirmed={record.get('confirmed')}",
+            level="INFO",
+        )
+        self._send_confirm_push(record)
 
     def _update_last_feedback_user_confirmed(self, prog_key: str, temp: str | None, confirmed_by: str | None, only_if_recent: bool = False):
         """When user confirms programme (e.g. while in Unemptied/Emptied or after), mark the last feedback record as user-confirmed and re-classify.
@@ -5201,6 +5427,9 @@ class WasherMonitor(hass.Hass):
                 self.energy_buffer = []
         except (ValueError, TypeError):
             self.energy_buffer = []
+        # standby wait excluded from cost, same as duration
+        self._session_cost_kr = 0.0
+        self._cost_prev_energy_kwh = self.energy_start
         self.last_high_energy_at = resume_at
         self.energy_stable_start_time = None
         self.finish_confirmed = False
@@ -5510,6 +5739,7 @@ class WasherMonitor(hass.Hass):
         attrs["programme_confirmed_by_user"] = bool(self.programme_confirmed_by_user)
         attrs["programme_confirmed_by"] = self.confirmed_by_username or ""
         attrs["expected_dur_at_start"] = self.expected_dur_at_start if self.expected_dur_at_start is not None else ""
+        attrs["session_cost_kr"] = round(self._session_cost_kr, 2)
         # cycle_complete/heating_bursts/progress_pct/estimated_remaining_min/last_door_closed_trusted/
         # programme_confirmed_by_user/delayed_start_trimmed/delayed_start_waiting can all legitimately
         # be False/0 on a normal mid-cycle tick (still running, pre-heating, near start/end of
@@ -5589,6 +5819,26 @@ class WasherMonitor(hass.Hass):
             
             current_energy_value = float(current_energy)
             now = self._now_utc()
+
+            # Settled per-cycle cost: meter the spot price against this tick's energy delta
+            # (mirrors SmartCooling._track_session_cost). Reuses current_energy_value already
+            # read above - no extra get_state for energy. Tracked in dedicated vars (see
+            # initialize()) so unrelated energy-buffer resets elsewhere never corrupt it.
+            if self.track_cycle_cost:
+                if self._cost_prev_energy_kwh is None:
+                    # First reading since cycle start (or after a restart) - establish the
+                    # baseline only; nothing to charge for yet.
+                    self._cost_prev_energy_kwh = current_energy_value
+                else:
+                    cost_delta_kwh = current_energy_value - self._cost_prev_energy_kwh
+                    if cost_delta_kwh < 0:
+                        cost_delta_kwh = 0.0  # meter reset - never subtract
+                    try:
+                        price_now = float(self.get_state(self.price_entity))
+                    except (TypeError, ValueError):
+                        price_now = self.price_fallback_kr
+                    self._session_cost_kr += cost_delta_kwh * price_now
+                    self._cost_prev_energy_kwh = current_energy_value
 
             # Standby backstop: if instantaneous power is 0W for 3+ minutes,
             # the machine is completely off - force finish regardless of the

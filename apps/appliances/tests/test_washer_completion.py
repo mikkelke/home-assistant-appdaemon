@@ -178,6 +178,33 @@ def _build_power_samples(start_ts, segments, step_minutes=1):
     return samples
 
 
+def accumulate_session_cost(ticks, price_fallback_kr):
+    """Mirror of WasherMonitor._check_energy_finish's per-tick settled per-cycle cost
+    accumulation (self._session_cost_kr).
+
+    ticks: chronological list of (energy_kwh, price_or_none) pairs - energy_kwh is the
+    cumulative meter reading for that tick; price_or_none is None to model an
+    unavailable/unknown price_entity reading (price_fallback_kr is used instead, same tick
+    only). The first tick only establishes the energy baseline (nothing to charge yet -
+    mirrors _cost_prev_energy_kwh starting at None). A negative delta (energy meter reset)
+    is clamped to 0 rather than subtracting energy that was never actually used. Returns the
+    total accumulated cost (kr).
+    """
+    cost_kr = 0.0
+    prev_energy = None
+    for energy_kwh, price in ticks:
+        if prev_energy is None:
+            prev_energy = energy_kwh
+            continue
+        delta_kwh = energy_kwh - prev_energy
+        if delta_kwh < 0:
+            delta_kwh = 0.0
+        price_used = price if price is not None else price_fallback_kr
+        cost_kr += delta_kwh * price_used
+        prev_energy = energy_kwh
+    return cost_kr
+
+
 class TestClassifyCycleCompletion(unittest.TestCase):
     """Tests for classification (validation engine) logic."""
 
@@ -463,6 +490,101 @@ class TestEcoPerTemperatureLearning(unittest.TestCase):
         self.assertFalse(self.app._programme_has_temperature("impraegnering"))
         profile = self.app._get_profile("impraegnering")
         self.assertEqual(profile["duration_min"], 25)
+
+
+class TestSessionCostAccumulation(unittest.TestCase):
+    """Mirror tests for the settled per-cycle cost accumulation in _check_energy_finish
+    (delta vs previous tick's cumulative energy, negative-delta clamp for meter resets,
+    fallback price when the price entity is unavailable)."""
+
+    def test_normal_accumulation(self):
+        """Steady energy increase at a constant price -> cost = total delta kWh * price."""
+        ticks = [
+            (10.000, 2.0),
+            (10.100, 2.0),
+            (10.250, 2.0),
+            (10.400, 2.0),
+        ]
+        cost = accumulate_session_cost(ticks, price_fallback_kr=1.7)
+        self.assertAlmostEqual(cost, 0.400 * 2.0, places=6)
+
+    def test_meter_reset_mid_cycle_clamped_to_zero(self):
+        """A negative delta (meter reset) contributes zero cost for that tick; accumulation
+        then resumes normally from the new (lower) reading, without going negative."""
+        ticks = [
+            (10.000, 1.5),
+            (10.100, 1.5),   # +0.100 kWh -> 0.15 kr
+            (0.050, 1.5),    # meter reset (large negative delta) -> clamped to 0
+            (0.200, 1.5),    # +0.150 kWh from the post-reset baseline -> 0.225 kr
+        ]
+        cost = accumulate_session_cost(ticks, price_fallback_kr=1.7)
+        self.assertAlmostEqual(cost, 0.15 + 0.225, places=6)
+
+    def test_unavailable_price_uses_fallback(self):
+        """When the price reading is unavailable (None) for a tick, the fallback price is
+        used for that tick's delta only; other ticks keep using their own reading."""
+        ticks = [
+            (5.000, 2.0),
+            (5.050, 2.0),    # +0.050 kWh @ 2.0 -> 0.10 kr
+            (5.120, None),   # +0.070 kWh @ fallback 1.7 -> 0.119 kr
+        ]
+        cost = accumulate_session_cost(ticks, price_fallback_kr=1.7)
+        self.assertAlmostEqual(cost, 0.10 + 0.119, places=6)
+
+
+class TestConfirmPushGating(unittest.TestCase):
+    """Tests for the real WasherMonitor._should_send_confirm_push gate - a pure
+    staticmethod, so no app instance is needed."""
+
+    def test_disabled_never_sends(self):
+        record = {"completion_class": "completed", "programme_user_confirmed": False}
+        self.assertFalse(wm.WasherMonitor._should_send_confirm_push(record, False))
+
+    def test_legacy_user_confirmed_blocks(self):
+        record = {"completion_class": "completed", "programme_user_confirmed": True}
+        self.assertFalse(wm.WasherMonitor._should_send_confirm_push(record, True))
+
+    def test_new_confirmed_by_human_field_blocks(self):
+        record = {
+            "completion_class": "completed",
+            "programme_user_confirmed": False,
+            "programme_confirmed_by_human": True,
+        }
+        self.assertFalse(wm.WasherMonitor._should_send_confirm_push(record, True))
+
+    def test_non_completed_blocks(self):
+        for completion_class in ("suspect", "interrupted", None, ""):
+            record = {"completion_class": completion_class, "programme_user_confirmed": False}
+            self.assertFalse(wm.WasherMonitor._should_send_confirm_push(record, True))
+
+    def test_completed_unconfirmed_enabled_sends(self):
+        record = {"completion_class": "completed", "programme_user_confirmed": False}
+        self.assertTrue(wm.WasherMonitor._should_send_confirm_push(record, True))
+
+
+class TestConfirmActionRoundtrip(unittest.TestCase):
+    """Tests for the real WasherMonitor._encode_confirm_action / _parse_confirm_action -
+    pure staticmethods, so no app instance is needed."""
+
+    def test_roundtrip_with_temperature(self):
+        ts, prog, temp = "2026-07-23T18:02:11+02:00", "bomuld", "60"
+        action = wm.WasherMonitor._encode_confirm_action(ts, prog, temp)
+        self.assertEqual(action, "WASHER_CONFIRM|2026-07-23T18:02:11+02:00|bomuld|60")
+        self.assertEqual(wm.WasherMonitor._parse_confirm_action(action), (ts, prog, temp))
+
+    def test_roundtrip_without_temperature_uses_dash(self):
+        ts, prog, temp = "2026-07-23T09:15:00+02:00", "ekspres", None
+        action = wm.WasherMonitor._encode_confirm_action(ts, prog, temp)
+        self.assertEqual(action, "WASHER_CONFIRM|2026-07-23T09:15:00+02:00|ekspres|-")
+        self.assertEqual(wm.WasherMonitor._parse_confirm_action(action), (ts, prog, None))
+
+    def test_non_matching_action_returns_none(self):
+        self.assertIsNone(wm.WasherMonitor._parse_confirm_action("SOME_OTHER_ACTION"))
+        self.assertIsNone(wm.WasherMonitor._parse_confirm_action(""))
+
+    def test_malformed_confirm_action_returns_none(self):
+        self.assertIsNone(wm.WasherMonitor._parse_confirm_action("WASHER_CONFIRM|only|two"))
+        self.assertIsNone(wm.WasherMonitor._parse_confirm_action("WASHER_CONFIRM|||"))
 
 
 if __name__ == "__main__":
