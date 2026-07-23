@@ -110,7 +110,7 @@ class MorningBriefing(hass.Hass):
         # --- wake-trigger entities (see module docstring for the PIR/bed-exit rationale) ---
         self.motion_entity = a("motion_entity", "binary_sensor.bedroom_pir_presence")
         self.bed_entities = list(a("bed_entities",
-                                  ["binary_sensor.left_bedside", "binary_sensor.right_bedside_in_bed"]))
+                                  ["binary_sensor.left_bedside", "binary_sensor.right_bedside"]))
         # --- gates ---
         self.person_entity = a("person_entity", "person.mikkel")
         self.from_hour = int(a("from_hour", 5))

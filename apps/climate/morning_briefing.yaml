@@ -22,7 +22,7 @@ MorningBriefing:
   motion_entity: binary_sensor.bedroom_pir_presence
   bed_entities:
     - binary_sensor.left_bedside
-    - binary_sensor.right_bedside_in_bed
+    - binary_sensor.right_bedside
   person_entity: person.mikkel
   from_hour: 5
   until_hour: 12
