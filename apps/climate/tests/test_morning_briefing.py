@@ -138,6 +138,37 @@ class ComposeBriefingRecommendationBranches(unittest.TestCase):
         self.assertEqual(message, "")
 
 
+class ComposeBriefingTomorrowLeadTime(unittest.TestCase):
+    """DeployAdvisor fold (2026-07-23): its lead-time warning is a LINE here, not its own
+    push -- and only when there's something to do (unit packed away, verdict not already
+    an AC instruction)."""
+
+    def test_windows_plus_tomorrow_appends_setup_line(self):
+        _, message = mb.compose_briefing("windows", _attrs(), {}, False, False,
+                                         tomorrow_needs_ac=True)
+        self.assertEqual(message,
+                         "Keep windows open. Tomorrow needs the AC — set it up today.")
+
+    def test_nothing_plus_tomorrow_appends_setup_line(self):
+        _, message = mb.compose_briefing("nothing", _attrs(), {}, False, False,
+                                         tomorrow_needs_ac=True)
+        self.assertTrue(message.endswith("Tomorrow needs the AC — set it up today."))
+
+    def test_deployed_unit_needs_no_setup_line(self):
+        _, message = mb.compose_briefing("windows", _attrs(), {}, True, False,
+                                         tomorrow_needs_ac=True)
+        self.assertNotIn("Tomorrow", message)
+
+    def test_ac_verdict_already_instructs_no_extra_line(self):
+        _, message = mb.compose_briefing("ac", _attrs(), {}, False, False,
+                                         tomorrow_needs_ac=True)
+        self.assertNotIn("Tomorrow", message)
+
+    def test_default_is_no_line(self):
+        _, message = mb.compose_briefing("windows", _attrs(), {}, False, False)
+        self.assertEqual(message, "Keep windows open.")
+
+
 class ComposeBriefingNoDayOutlook(unittest.TestCase):
     def test_status_attrs_are_ignored_entirely(self):
         # "Still too chatty" (user 2026-07-22): the day-outlook line was cut. status_attrs

@@ -39,6 +39,7 @@ one notification and its own logs.
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 import asyncio
 import json
+from datetime import timedelta
 from typing import Optional
 
 
@@ -52,7 +53,8 @@ def _nice_cost(cost_label):
     return cost_label
 
 
-def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed):
+def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed,
+                     tomorrow_needs_ac=False):
     """Pure composer: sensor.sleep_plan's state+attributes, sensor.smart_cooling_status's
     attributes, and the AC's deploy/arm state -> one short push (title, message). No I/O,
     so every branch below is directly unit-testable.
@@ -101,6 +103,15 @@ def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed):
         headline = (plan_attrs.get("headline") or "").strip()
         body = f"{headline}." if headline else ""
 
+    # Deploy-advisor fold (user 2026-07-23, one-advice stream): the advisor's lead-time
+    # warning is a line HERE instead of its own push. A daily briefing only ever needs one
+    # day of lead -- tomorrow's too-warm night means "set the packed-away unit up today",
+    # and tomorrow's briefing takes it from there. Only when the unit isn't already out
+    # (deployed = nothing to set up) and today's verdict isn't already an AC instruction.
+    if (tomorrow_needs_ac and not ac_deployed
+            and plan_state in ("windows", "hybrid", "nothing")):
+        body += " Tomorrow needs the AC — set it up today."
+
     return title, body
 
 
@@ -120,6 +131,9 @@ class MorningBriefing(hass.Hass):
         self.status_entity = a("status_entity", "sensor.smart_cooling_status")
         self.climate_entity = a("climate_entity", "climate.air_conditioner_thermostat")
         self.enable_entity = a("enable_entity", "input_boolean.smart_cooling")
+        # DeployAdvisor's multi-night projection -- its lead-time warning is a line in
+        # THIS briefing now (one-advice stream, user 2026-07-23); its own pushes are off.
+        self.projection_entity = a("projection_entity", "sensor.bedroom_night_projection")
         # --- notification ---
         self.notify_target = a("notify_target", "user")
         # Push polish (Android companion-app extras; each can be set "" in yaml to disable):
@@ -241,8 +255,22 @@ class MorningBriefing(hass.Hass):
             ac_deployed = climate_state not in (None, "unavailable", "unknown")
             armed = (await self._state(self.enable_entity)) == "on"
 
+            # Tomorrow's night from DeployAdvisor's published projection. over_ceiling is
+            # a bool in the source but may arrive stringified -- accept both. Any failure
+            # just means no lead-time line (the projection is advisory garnish here).
+            tomorrow_needs_ac = False
+            try:
+                proj = await self._attrs(self.projection_entity)
+                tomorrow_iso = (now.date() + timedelta(days=1)).isoformat()
+                tomorrow_needs_ac = any(
+                    n.get("date") == tomorrow_iso and n.get("over_ceiling") in (True, "true")
+                    for n in (proj.get("nights") or []) if isinstance(n, dict))
+            except Exception:
+                pass
+
             title, message = compose_briefing(plan_state, plan_attrs, status_attrs,
-                                              ac_deployed, armed)
+                                              ac_deployed, armed,
+                                              tomorrow_needs_ac=tomorrow_needs_ac)
 
             if not await self._notify(title, message):
                 return

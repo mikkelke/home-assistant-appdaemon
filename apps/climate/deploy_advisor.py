@@ -81,6 +81,12 @@ class DeployAdvisor(hass.Hass):
         # docstring): nightly-ritual storage (~18 h) must NOT re-arm deploy advice.
         self.stored_hours = float(a("stored_hours", 30.0))
         self.notify_target = a("notify_target", "mikkel")
+        # One-advice stream (user 2026-07-23): this app's own pushes are OFF by default.
+        # Its lead-time signal now reaches the user as a line in the MORNING BRIEFING
+        # ("Tomorrow needs the AC -- set it up today", read from the published nights[]),
+        # tonight is the sleep plan + evening rescue's job, and the all-clear lives on
+        # the dashboard. Flip notify_enabled: true to restore the standalone pushes.
+        self.notify_enabled = bool(a("notify_enabled", False))
         self.default_rise_frac = float(a("default_rise_frac", 0.502))
         self.fit = dict(DEFAULT_FIT)
         self.fit.update(a("fit", {}) or {})
@@ -243,6 +249,8 @@ class DeployAdvisor(hass.Hass):
         })
 
     async def _maybe_notify(self, first_over, nights, ceiling, now):
+        if not self.notify_enabled:
+            return   # folded into the one-advice stream -- see the notify_enabled comment
         st = self._advisor_state
         if first_over:
             lead = (datetime.fromisoformat(first_over["date"]).date() - now.date()).days

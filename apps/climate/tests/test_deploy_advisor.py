@@ -117,5 +117,25 @@ class StoredGate(unittest.TestCase):
         self.assertTrue(da.DeployAdvisor._stored("not-a-date", self.NOW, 30.0))
 
 
+class NotifyGate(unittest.TestCase):
+    def test_disabled_notify_is_a_hard_noop(self):
+        # One-advice stream (2026-07-23): with notify_enabled False (the default), the
+        # advisor's own push path is a hard no-op -- no send, no state churn -- because
+        # its lead-time warning now rides the morning briefing instead.
+        import asyncio
+        app = da.DeployAdvisor.__new__(da.DeployAdvisor)
+        app.notify_enabled = False
+        app._advisor_state = {"notified_date": None, "warning_armed": True}
+        sent = []
+
+        async def _notify(msg):
+            sent.append(msg)
+        app._notify = _notify
+        asyncio.run(app._maybe_notify({"date": "2026-07-24", "peak": 25.0}, [], 23.0, None))
+        self.assertEqual(sent, [])
+        self.assertEqual(app._advisor_state,
+                         {"notified_date": None, "warning_armed": True})
+
+
 if __name__ == "__main__":
     unittest.main()

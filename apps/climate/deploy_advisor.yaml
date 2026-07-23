@@ -19,3 +19,6 @@ DeployAdvisor:
   state_file: /conf/apps/climate/deploy_advisor_state.json
   notify_lead_days: 2
   notify_target: mikkel
+  # One-advice stream (2026-07-23): standalone pushes OFF -- the lead-time warning is a
+  # line in the morning briefing now; tonight belongs to sleep_plan + the evening rescue.
+  notify_enabled: false
