@@ -1228,7 +1228,7 @@ class TransitAlarm(hass.Hass):
                 and "notify." not in target
             ):
                 target = [target]
-            await notifier.notify(title=title, message=message, target=target)
+            await notifier.notify(title=title, message=message, target=target, category="transit")
             self.log(f"Notification sent via MobileNotifier (target={target})", level="INFO")
             return
 

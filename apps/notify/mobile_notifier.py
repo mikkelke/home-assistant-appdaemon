@@ -25,7 +25,11 @@ class MobileNotifier(hass.Hass):
         # Device mapping: person name -> notification service(s)
         # Format: {"mikkel": ["notify.mobile_app_iphone"], "kristine": ["notify.mobile_app_android"]}
         self.device_mapping = self.args.get("device_mapping", {})
-        
+
+        # Category-scoped home-broadcast audiences: {"category": ["person", ...]}.
+        # See _filter_people_for_category for semantics (no entry for a category -> everyone).
+        self.category_audience = self.args.get("category_audience", {}) or {}
+
         # Default notification service for user (for vacuum errors, etc.)
         self.user_notification_service = self.args.get("user_notification_service")
         if not self.user_notification_service:
@@ -88,8 +92,19 @@ class MobileNotifier(hass.Hass):
                 unique_services.append(service)
         
         return unique_services
-    
-    async def notify(self, title: str, message: str, target: str = "home", data: dict = None):
+
+    @staticmethod
+    def _filter_people_for_category(people, category, category_audience):
+        """Category-scoped home-broadcasts: when a category has an audience list,
+        only those people receive it. No category / unlisted category -> everyone."""
+        if not category:
+            return people
+        audience = (category_audience or {}).get(category)
+        if audience is None:
+            return people
+        return [p for p in people if p in audience]
+
+    async def notify(self, title: str, message: str, target: str = "home", data: dict = None, category: str = None):
         """Send notification to mobile app(s).
 
         Target semantics:
@@ -103,11 +118,17 @@ class MobileNotifier(hass.Hass):
             - Any other string: Treated as a raw notification service name
               (e.g. "notify.mobile_app_iphone").
 
+        Category scoping (category=...) only restricts target="home" broadcasts (via
+        category_audience); every other target is caller-directed and always reaches
+        who it names, regardless of category.
+
         Args:
             title: Notification title
             message: Notification message
             target: Who to send to (see semantics above).
             data: Optional additional data (e.g., {"data": {"importance": "high"}})
+            category: Optional category name; scopes target="home" to category_audience[category]
+                when that category is listed (see initialize()). Ignored for other targets.
         """
         try:
             # Normalize: single person name (in device_mapping) -> list, so all callers work
@@ -149,6 +170,14 @@ class MobileNotifier(hass.Hass):
             elif target == "home":
                 # Send to people who are home
                 people_home = await self.get_people_home()
+                people_home_before_category = people_home
+                people_home = self._filter_people_for_category(people_home, category, self.category_audience)
+                if category and people_home != people_home_before_category:
+                    filtered_out = [p for p in people_home_before_category if p not in people_home]
+                    self.log(
+                        f"Category '{category}' filtered out {', '.join(filtered_out)} from this home-broadcast",
+                        level="DEBUG",
+                    )
                 if people_home:
                     services = await self.get_notification_services_for_people(people_home)
                     self.log(f"Sending notification to people at home: {', '.join(people_home)}", level="DEBUG")

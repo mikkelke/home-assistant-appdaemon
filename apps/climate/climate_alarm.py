@@ -275,6 +275,7 @@ class ClimateAlarm(hass.Hass):
                     title="Climate alarm",
                     message=message,
                     target=self.notify_target,
+                    category="heating_alarm",
                 )
                 self._last_notify_at = now
             except Exception as e:
@@ -305,6 +306,7 @@ class ClimateAlarm(hass.Hass):
                     title="Climate alarm resolved",
                     message="All rooms are above threshold.",
                     target=self.notify_target,
+                    category="heating_alarm",
                 )
             except Exception as e:
                 self.log(f"Notify (resolved) failed: {e}", level="WARNING")

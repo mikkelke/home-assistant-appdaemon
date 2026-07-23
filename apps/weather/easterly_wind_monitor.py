@@ -98,6 +98,7 @@ class EasterlyWindMonitor(hass.Hass):
                 title="[TEST] Easterly wind episode",
                 message="This is a test. Building-creak wind notifications are working.",
                 target=self.notify_target,
+                category="weather",
             )
             self.log("Test notification sent", level="INFO")
         except Exception as e:
@@ -192,6 +193,7 @@ class EasterlyWindMonitor(hass.Hass):
                         "Possible building load."
                     ),
                     target=self.notify_target,
+                    category="weather",
                 )
             except Exception as e:
                 self.log(f"Notify failed: {e}", level="WARNING")
@@ -223,6 +225,7 @@ class EasterlyWindMonitor(hass.Hass):
                     title="Easterly wind episode over",
                     message=f"Episode ended. Max gust was {self._last_gust_in_episode:.0f}{ul}.",
                     target=self.notify_target,
+                    category="weather",
                 )
             except Exception as e:
                 self.log(f"Notify (end) failed: {e}", level="WARNING")

@@ -4913,6 +4913,7 @@ class WasherMonitor(hass.Hass):
                 message=message,
                 target=self.confirm_push_target,
                 data={"data": {"actions": actions, "tag": "washer_confirm"}},
+                category="washer_confirm",
             ))
             self.log(f"Confirm push sent for cycle ts={ts} predicted={predicted}", level="INFO")
         except Exception as e:

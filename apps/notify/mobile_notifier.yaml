@@ -10,6 +10,7 @@ MobileNotifier:
   person_entities:
     - "person.mikkel"
     - "person.kristine"
+    - "person.claudia"
 
   # Device mapping: person name (lowercase) -> notification service(s)
   # Find your notification services in Home Assistant:
@@ -20,11 +21,16 @@ MobileNotifier:
       - "notify.mobile_app_mikkels_ofx9p"  # Mikkels Android (OFX9P)
     kristine:
       - "notify.mobile_app_kristine_iphone_2"  # Kristines iPhone
-    # Claudia is DELIBERATELY unmapped (user 2026-07-22): mapping her would opt her phone
-    # into every target="home" broadcast, not just the room-scoped routing - she hasn't
-    # asked for any of it. Her companion app is registered (notify.mobile_app_claudias_iphone);
-    # add the mapping only when she explicitly wants house pushes. Apps that name "claudia"
-    # in their own notify lists (heating guard) resolve to nothing and skip her - by design.
+    claudia:
+      - "notify.mobile_app_claudias_iphone"  # Claudias iPhone
+
+  # Household push tiers (owner, 2026-07-23): Mikkel gets the most (he also receives many
+  # direct-targeted maintenance pushes elsewhere, unaffected by this section); Kristine and
+  # Claudia get the same smaller set of home-broadcasts. Categories listed here restrict a
+  # target="home" broadcast to the named people; categories NOT listed here go to everyone
+  # mapped above. Senders opt in by passing category="..." to notify().
+  category_audience:
+    ac: ["mikkel"]   # A/C pushes are Mikkel-only (his bedroom's SmartCooling); no current sender yet - any future A/C push must send category="ac"
 
   # Default notification service for user (for vacuum errors, etc.)
   # This will always be used when target="user"
