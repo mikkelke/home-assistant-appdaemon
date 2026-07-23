@@ -1137,14 +1137,15 @@ class EveningRescue(unittest.TestCase):
         # from there. Suppress on a live not_home, but do NOT mark the day sent: coming
         # home while the night is still saveable delivers it on the next tick.
         app = self._app(home="not_home")
-        self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
+        # floor 20.0 -> target 19 -> deficit 1.0 (60 min): rescuable all evening.
+        self._fire(app, datetime(2026, 7, 20, 19, 0), floor=20.0)
         self.assertEqual(app._notified, [])
         self.assertIsNone(app._rescue_notified_date)
-        # ...they come home at 21:00 with the deficit still fixable -> it fires now.
+        # ...they come home at 21:00 with 120 min left for a 60-min deficit -> fires now.
         async def _state_home(entity):
             return "home"
         app._state = _state_home
-        self._fire(app, datetime(2026, 7, 20, 21, 0), floor=22.5)
+        self._fire(app, datetime(2026, 7, 20, 21, 0), floor=20.0)
         self.assertEqual(len(app._notified), 1)
         self.assertIn("arm Cool night", app._notified[0])
 
