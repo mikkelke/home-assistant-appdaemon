@@ -1205,9 +1205,12 @@ class SmartCooling(hass.Hass):
         the unit. Uses the SAME ceiling (_effective_ceiling), E selection and _calc_target
         the armed path uses, so the advice matches what arming would actually do. Fires only
         when every gate holds: enabled, inside the evening window, an unmet pre-cool deficit
-        (floor - target >= rescue_deficit_min) that still fits before the cutoff hour, the
-        user home (or the home sensor missing), and not already sent today. Silent no-op on
-        any missing input or error -- a courtesy notification must never break the tick."""
+        (floor - target >= rescue_deficit_min) that still fits before the cutoff hour, and
+        not already sent today. Being AWAY does not suppress it (user 2026-07-23: "fair,
+        but only if I'm home" -- away is exactly when the heads-up matters most); a live
+        not_home reading just switches the wording to deploy-when-you-get-home. Silent
+        no-op on any missing input or error -- a courtesy notification must never break
+        the tick."""
         try:
             if not self.rescue_enabled:
                 return
@@ -1232,16 +1235,17 @@ class SmartCooling(hass.Hass):
             # Still time to pre-cool the deficit away before the cutoff hour?
             if (self.rescue_to_hour - now.hour) * 60 < mins:
                 return
+            away = False
             if self.rescue_home_entity:
                 home = await self._state(self.rescue_home_entity)
-                # Fire when home, or when the sensor is simply missing/unknown -- never
-                # suppress on a dead sensor. Only a live "away" reading silences it.
-                if home not in (None, "unknown", "unavailable", "home"):
-                    return
+                # A live not_home reading switches the wording; a dead/unknown sensor is
+                # never treated as evidence of being away.
+                away = home not in (None, "unknown", "unavailable", "home")
+            action = ("deploy and arm the AC when you get home" if away
+                      else "plug in the AC and arm Cool night")
             await self._notify(
-                f"Tonight's looking warm: the bedroom's drifting toward ~{E:.1f}C vs the "
-                f"{ceiling:.1f}C limit and nothing's cooling it. About {mins:.0f} min of "
-                f"pre-cool would rescue it -- arm Cool night and plug the AC back in.")
+                f"Tonight needs the AC -- {action}. "
+                f"About {mins:.0f} min of pre-cool ({E:.1f}° heading vs the {ceiling:.1f}° limit).")
             self._rescue_notified_date = today
             self._save_state()
         except Exception as e:

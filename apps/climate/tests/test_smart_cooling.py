@@ -1132,10 +1132,22 @@ class EveningRescue(unittest.TestCase):
         self._fire(app, datetime(2026, 7, 20, 22, 0), floor=22.5)
         self.assertEqual(app._notified, [])
 
-    def test_home_away_suppressed(self):
+    def test_away_still_fires_with_get_home_wording(self):
+        # user 2026-07-23 ("fair, but only if I'm home"): being away must NOT silence the
+        # rescue -- away is when the heads-up matters most. The wording flips to
+        # deploy-when-you-get-home; still once per day.
         app = self._app(home="not_home")
         self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
-        self.assertEqual(app._notified, [])
+        self.assertEqual(len(app._notified), 1)
+        self.assertIn("when you get home", app._notified[0])
+        self.assertNotIn("plug in the AC and arm Cool night", app._notified[0])
+
+    def test_home_wording_is_the_immediate_instruction(self):
+        app = self._app(home="home")
+        self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
+        self.assertEqual(len(app._notified), 1)
+        self.assertIn("plug in the AC and arm Cool night", app._notified[0])
+        self.assertNotIn("when you get home", app._notified[0])
 
     def test_home_sensor_missing_does_not_suppress(self):
         for missing in (None, "unknown", "unavailable"):
@@ -1153,7 +1165,7 @@ class EveningRescue(unittest.TestCase):
         app = self._app(e_active=25.0, e_legacy=99.0, wm_shadow=False)
         self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
         self.assertEqual(len(app._notified), 1)
-        self.assertIn("~25.0C", app._notified[0])
+        self.assertIn("25.0°", app._notified[0])
 
     def test_error_is_swallowed_no_raise(self):
         app = self._app()
