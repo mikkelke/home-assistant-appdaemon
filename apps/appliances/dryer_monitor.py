@@ -141,6 +141,9 @@ class DryerMonitor(hass.Hass):
         self.last_state_change = None
         self.cooling_period = int(self.args.get("cooling_period", 600))
         self.main_cycle_power = float(self.args.get("main_cycle_power", 400))
+        # Overrun-aware ETA: once a cycle runs past its expected duration, the remaining/
+        # progress computation floors here instead of pinning at 0/100 (see _overrun_eta).
+        self.overrun_floor_min = int(self.args.get("overrun_floor_min", 10))
         self.high_power_counter = 0
         self.high_power_threshold = int(self.args.get("high_power_threshold", 5))
         self.notification_sent = False
@@ -484,6 +487,40 @@ class DryerMonitor(hass.Hass):
             return self.expected_dur_at_start
         return self._programme_max_duration_minutes(classification=tick_prog)
 
+    @staticmethod
+    def _overrun_eta(elapsed, dur, keep_fresh, current_power, main_cycle_power, overrun_floor_min):
+        """Pure overrun-aware remaining/progress/overrun computation, extracted from
+        _update_running_attributes so it is directly unit-testable without an AppDaemon app
+        instance.
+
+        Not yet overrun (dur - elapsed > 0): unchanged passthrough -- remaining is the plain
+        dur-elapsed and progress is the usual elapsed/dur percentage.
+
+        Once overrun, the old remaining=0/progress=100 was indistinguishable from "actually
+        done" and got silently dropped from the published attributes entirely (AppDaemon
+        4.5.13 set_state bug -- see the comment in _update_running_attributes). Instead, ask
+        what the dryer's own signals say:
+          - keep_fresh_detected (anti-crease/keep-fresh pattern) -> main cycle is genuinely
+            done, finish flow imminent -> remaining=2, progress=100.
+          - current_power >= main_cycle_power -> still heating/drying hard, provably not
+            done -> remaining floors at overrun_floor_min minutes, progress=99.
+          - otherwise (power low/intermittent but the keep-fresh pattern isn't confirmed yet)
+            -> remaining=5, progress=99.
+
+        Returns (remaining_min, progress_pct, overrun_min). overrun_min is always >= 0 (0
+        when not overrun).
+        """
+        raw_remaining = dur - elapsed
+        if raw_remaining > 0:
+            progress = min(100, round(100 * elapsed / dur)) if dur > 0 else 0
+            return raw_remaining, progress, 0
+        overrun = -raw_remaining
+        if keep_fresh:
+            return 2, 100, overrun
+        if current_power >= main_cycle_power:
+            return overrun_floor_min, 99, overrun
+        return 5, 99, overrun
+
     def _update_running_attributes(self):
         """Update state entity with progress/ETA attributes while Running."""
         if self.get_state(self.state_entity) not in ("Running", "Paused") or not self.start_time:
@@ -495,10 +532,18 @@ class DryerMonitor(hass.Hass):
         profile = self._get_profile(effective_key)
         label = profile.get("label", effective_key)
         dur = self._get_programme_duration(effective_key)
-        elapsed = (self._now_utc() - self.start_time).total_seconds() / 60
-        remaining = max(0, dur - elapsed)
-        progress = min(100, round(100 * elapsed / dur)) if dur > 0 else 0
-        eta = self.start_time + timedelta(minutes=dur) if dur else None
+        now = self._now_utc()
+        elapsed = (now - self.start_time).total_seconds() / 60
+        overrun = 0
+        if dur > 0:
+            current_power = self._get_current_power()
+            remaining, progress, overrun = self._overrun_eta(
+                elapsed, dur, self.keep_fresh_detected, current_power,
+                self.main_cycle_power, self.overrun_floor_min,
+            )
+            eta = (self.start_time + timedelta(minutes=dur)) if overrun <= 0 else (now + timedelta(minutes=remaining))
+        else:
+            remaining, progress, eta = 0, 0, None
         attrs = {
             "detected_programme": prog,
             "derived_programme_key": effective_key,
@@ -508,19 +553,29 @@ class DryerMonitor(hass.Hass):
             "programme_duration_min": dur,
             "elapsed_minutes": round(elapsed, 1),
             "progress_pct": progress,
-            "estimated_remaining_min": round(remaining),
+            # NEVER 0 -- see the AppDaemon 4.5.13 zero-drop note below.
+            "estimated_remaining_min": max(1, round(remaining)),
             "estimated_end_time": self._format_utc(eta) if eta else None,
             "energy_at_start": self.energy_start,
             "energy_used": round(self._get_energy_used(), 3),
         }
+        if overrun > 0:
+            attrs["overrun_min"] = round(overrun, 1)
         try:
             full = self.get_state(self.state_entity, attribute="all")
             existing = dict((full or {}).get("attributes") or {})
             existing.update(attrs)
+            if overrun <= 0:
+                # attrs merges over the previous publish, so a past overrun_min would otherwise
+                # linger after dur grows mid-cycle (selector/classification change) and leak a
+                # phantom "+X min over" into later ticks. Absent == no overrun for the card.
+                existing.pop("overrun_min", None)
             # elapsed_minutes/progress_pct/energy_used silently drop from published attributes
-            # whenever they're 0/0.0 (every cycle's first tick(s)); estimated_remaining_min drops
-            # the same way once a cycle overruns its estimate -- AppDaemon 4.5.13 set_state bug,
-            # not ours; see smart_cooling.py's _publish() for details.
+            # whenever they're 0/0.0 (every cycle's first tick(s)) -- AppDaemon 4.5.13 set_state
+            # bug, not ours; see smart_cooling.py's _publish() for details. estimated_remaining_min
+            # is now always published as max(1, ...) so it can never hit that zero-drop path, even
+            # deep into an overrun. overrun_min is only in attrs when overrun > 0 and popped from
+            # the merge otherwise, so it never depends on the zero-drop behavior at all.
             self._set_state_entity( state=self.get_state(self.state_entity), attributes=existing, replace=True)
         except Exception:
             pass
@@ -539,6 +594,7 @@ class DryerMonitor(hass.Hass):
             "programme_label": "",
             "detected_programme": "",
             "energy_at_start": None,
+            "overrun_min": None,
         }
 
     def _tick_classify(self, kwargs):
