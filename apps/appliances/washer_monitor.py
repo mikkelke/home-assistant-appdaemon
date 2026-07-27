@@ -48,6 +48,7 @@ Duration, progress, announcement:
 """
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
+import collections
 import copy
 import time
 import os
@@ -355,6 +356,23 @@ class WasherMonitor(hass.Hass):
         if not self.ui_state_select and self.state_entity and str(self.state_entity).startswith("sensor."):
             self.ui_state_select = "input_select." + str(self.state_entity).split(".", 1)[1]
         self.door_sensor_inverted = bool(self.args.get("door_sensor_inverted", False))
+
+        # Vibration telemetry (HOBEIAN Zigbee shock sensor on the side panel; see washer.yaml
+        # for the sensor rationale). TELEMETRY ONLY: nothing here may feed a state transition,
+        # classification, delayed-start, ETA, or push decision - this only collects pulse data
+        # into the per-cycle feedback record so real thresholds can be picked later. Unset/empty
+        # -> sensor.get() is None, no listener is registered, and every helper below is a no-op.
+        self.vibration_sensor = self.args.get("vibration_sensor") or None
+        self.vibration_pulse_count = 0    # ON edges while state == "Running" (current cycle)
+        self.vibration_on_seconds = 0.0   # Summed on-time for pulses that started while Running
+        self.first_vibration_at = None    # UTC; first Running-scoped pulse this cycle
+        self.last_vibration_at = None     # UTC; last Running-scoped pulse this cycle
+        self._vibration_on_started = None  # (UTC started_at, was_running) for an open ON edge, else None
+        # ALL on-edges regardless of state - survives per-cycle resets (used for the post-save
+        # unload window, which runs after the cycle has already ended).
+        self._vibration_events = collections.deque(maxlen=500)
+        self._unload_patch_timer = None   # Pending _patch_unload_vibration handle (see _schedule_vibration_unload_patch)
+
         self.start_w = float(self.args["start_w"])
         self.stop_w = float(self.args["stop_w"])
         self.run_for = int(self.args.get("run_for", 60))
@@ -703,6 +721,8 @@ class WasherMonitor(hass.Hass):
             self.listen_state(self._on_confirm_changed, self.confirm_entity)
         if self.temperature_entity:
             self.listen_state(self._on_confirm_changed, self.temperature_entity)
+        if self.vibration_sensor:
+            self.listen_state(self._vibration_changed, self.vibration_sensor)
 
         # Presence-gated confirm push: button presses on the actionable notification, and a
         # test hook to preview the message/buttons on demand (see _send_confirm_push).
@@ -3053,9 +3073,11 @@ class WasherMonitor(hass.Hass):
                 validation_version="2",
                 selected_options=self._get_selected_options(),
                 cost_kr=self._session_cost_kr if self.track_cycle_cost else None,
+                vibration=self._vibration_summary(),
             )
             if saved_record is not None:
                 self._maybe_send_confirm_push(saved_record)
+                self._schedule_vibration_unload_patch(saved_record)
 
             self.state = "Unemptied"
             confirmed_profile = self._get_profile(confirmed_prog, confirmed_temp)
@@ -3251,9 +3273,11 @@ class WasherMonitor(hass.Hass):
                         validation_version="2",
                         selected_options=self._get_selected_options(),
                         cost_kr=self._session_cost_kr if self.track_cycle_cost else None,
+                        vibration=self._vibration_summary(),
                     )
                     if saved_record is not None:
                         self._maybe_send_confirm_push(saved_record)
+                        self._schedule_vibration_unload_patch(saved_record)
                 except Exception as e:
                     self.log(f"Could not save feedback on Emptied transition: {e}", level="WARNING")
 
@@ -3657,6 +3681,14 @@ class WasherMonitor(hass.Hass):
         self._delayed_start_trimmed = False
         self._delay_waiting = False
         self._delayed_start_lead_idle_min = None
+        # Vibration telemetry is Running-scoped (see initialize()) - reset here like the other
+        # per-cycle counters above. _vibration_events is NOT reset (it survives cycle boundaries
+        # for the post-save unload window).
+        self.vibration_pulse_count = 0
+        self.vibration_on_seconds = 0.0
+        self.first_vibration_at = None
+        self.last_vibration_at = None
+        self._vibration_on_started = None
         self.start_time = self._now_utc()
         # Start time cannot be before the last door close (except in first 10 min AddLoad).
         if (
@@ -4677,6 +4709,7 @@ class WasherMonitor(hass.Hass):
         validation_version: str | None = None,
         selected_options: dict | None = None,  # e.g. {"water_plus": "on", "soak": "off"} from option entities
         cost_kr: float | None = None,  # Settled per-cycle cost (self._session_cost_kr); None for migration/backfill saves
+        vibration: dict | None = None,  # Telemetry only (see _vibration_summary); None for migration/backfill saves
     ):
         """Append one completed cycle record to the feedback JSON file (v2 format).
 
@@ -4743,6 +4776,8 @@ class WasherMonitor(hass.Hass):
             record["selected_options"] = dict(selected_options)
         if cost_kr is not None:
             record["cost_kr"] = round(cost_kr, 2)
+        if vibration is not None:
+            record["vibration"] = vibration
 
         if os.path.exists(self.feedback_file):
             try:
@@ -4830,7 +4865,119 @@ class WasherMonitor(hass.Hass):
             f"{learned_note}effective ETA {eff}min",
             level="INFO",
         )
+        if vibration:
+            self.log(
+                f"Vibration telemetry: {vibration['pulse_count']} pulses / {vibration['on_seconds']:.0f}s on during cycle "
+                f"(first {self._strftime_local(self.first_vibration_at)}, last {self._strftime_local(self.last_vibration_at)})",
+                level="INFO",
+            )
         return record
+
+    # =========================================================================
+    # Vibration telemetry (TELEMETRY ONLY - see initialize() and washer.yaml).
+    # The callback, the summary/patch helpers below, and the two live
+    # _save_cycle_feedback call sites are the ONLY consumers of these values;
+    # nothing here may influence a state transition, classification, delayed-
+    # start, ETA, or push decision.
+    # =========================================================================
+
+    def _vibration_changed(self, entity, attr, old, new, kwargs):
+        """Record pulses only - never gates anything. Wrapped defensively like the app's other
+        listen_state callbacks: a flapping battery Zigbee sensor must never break the app."""
+        try:
+            if new in ("unknown", "unavailable") or old in ("unknown", "unavailable"):
+                # Battery Zigbee devices report these often; not worth logging above DEBUG.
+                self._vibration_on_started = None
+                return
+            now = self._now_utc()
+            if new == "on":
+                self._vibration_events.append(now)
+                self._vibration_on_started = (now, self.state == "Running")
+                if self.state == "Running":
+                    self.vibration_pulse_count += 1
+                    if self.first_vibration_at is None:
+                        self.first_vibration_at = now
+                    self.last_vibration_at = now
+            elif new == "off":
+                if self._vibration_on_started is not None:
+                    started_at, was_running = self._vibration_on_started
+                    if was_running:
+                        # Cap a single pulse at 600s - sanity guard in case an off-edge was
+                        # missed (Zigbee drop) and this "pulse" is actually hours long.
+                        elapsed = min((now - started_at).total_seconds(), 600.0)
+                        self.vibration_on_seconds += elapsed
+                    self._vibration_on_started = None
+        except Exception as e:
+            self.log(f"Vibration telemetry callback error (ignored): {e}", level="DEBUG")
+
+    def _vibration_summary(self) -> dict | None:
+        """Snapshot of this cycle's vibration telemetry for the feedback record. None when
+        there is nothing to say: sensor not configured, or configured but silent all cycle -
+        most of a normal wash (fill, wash, rinse, balanced spin) is vibration-quiet, so silence
+        alone is never evidence the machine wasn't running."""
+        if not self.vibration_sensor:
+            return None
+        if self.vibration_pulse_count == 0 and self.vibration_on_seconds == 0:
+            return None
+        return {
+            "pulse_count": int(self.vibration_pulse_count),
+            "on_seconds": round(float(self.vibration_on_seconds), 1),
+            "first_at": self._format_local(self.first_vibration_at) if self.first_vibration_at else None,
+            "last_at": self._format_local(self.last_vibration_at) if self.last_vibration_at else None,
+        }
+
+    def _schedule_vibration_unload_patch(self, saved_record):
+        """10 min after a cycle's feedback is saved, count vibration pulses in that window
+        (candidate 'someone unloaded / bumped the machine' signal) and patch it onto the saved
+        record - see _patch_unload_vibration. Only one pending timer is kept; a second save
+        within the window cancels and replaces it rather than tracking both. Acceptable here
+        because this is telemetry only, not something learning/ETA logic depends on."""
+        if not self.vibration_sensor:
+            return
+        ts = (saved_record or {}).get("ts")
+        if not ts:
+            return
+        self._safe_cancel_timer(self._unload_patch_timer)
+        self._unload_patch_timer = self.run_in(
+            self._patch_unload_vibration, 600, ts=ts, save_moment=self._format_utc(self._now_utc()),
+        )
+
+    def _patch_unload_vibration(self, kwargs):
+        """Patch unload_pulse_count/unload_window_min onto the cycle record named by ts (see
+        _schedule_vibration_unload_patch). Telemetry only - gives up quietly at WARNING if the
+        file or record is gone; never worth breaking anything else over."""
+        self._unload_patch_timer = None
+        ts = kwargs.get("ts")
+        save_moment = _parse_utc(kwargs.get("save_moment"))
+        if not ts or not save_moment:
+            return
+        window_end = save_moment + timedelta(minutes=10)
+        pulse_count = sum(1 for t in self._vibration_events if save_moment <= t <= window_end)
+
+        import json
+        if not self.feedback_file or not os.path.exists(self.feedback_file):
+            self.log(f"Vibration unload patch: feedback file missing for ts={ts}", level="WARNING")
+            return
+        try:
+            with open(self.feedback_file, "r") as f:
+                data = json.load(f)
+        except Exception as e:
+            self.log(f"Vibration unload patch: could not read feedback file: {e}", level="WARNING")
+            return
+        cycles = data.get("cycles", [])
+        rec = next((c for c in cycles if c.get("ts") == ts), None)
+        if rec is None:
+            self.log(f"Vibration unload patch: cycle ts={ts} not found (skipping)", level="WARNING")
+            return
+        rec.setdefault("vibration", {})["unload_pulse_count"] = pulse_count
+        rec["vibration"]["unload_window_min"] = 10
+        try:
+            with open(self.feedback_file, "w") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.log(f"Vibration unload patch: could not write feedback file: {e}", level="WARNING")
+            return
+        self.log(f"Vibration unload patch: {pulse_count} pulse(s) in the 10 min after cycle ts={ts}", level="DEBUG")
 
     # =========================================================================
     # Presence-gated confirm push (feature: ask whoever is home to confirm the

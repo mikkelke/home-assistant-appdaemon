@@ -271,6 +271,13 @@ washer_monitor:
   power_unavailable_off_after_seconds: 180
   energy_sensor: "sensor.washer_plug_energy"
   door_sensor: "binary_sensor.washer_door_contact"
+  # Vibration sensor: HOBEIAN Zigbee shock sensor mounted on the side panel. TELEMETRY ONLY
+  # for now - we record pulse counts/durations into the per-cycle feedback file to validate
+  # detection thresholds; nothing reads it for state, classification, or ETA yet. A pulse is
+  # a discrete jolt (drum thump, door open/close, someone bumping the machine); a spin only
+  # registers on the sensor when the load is unbalanced. Never treat vibration silence as
+  # "not running" - most of a normal cycle (fill, wash, rinse, balanced spin) is vibration-quiet.
+  vibration_sensor: "binary_sensor.washer_vibration_vibration"
   state_entity: "sensor.washer_state"
   # Optional: HA input_select to mirror state for Lovelace (survives HA restart). Default: input_select.washer_state
   # ui_state_entity: "input_select.washer_state"
