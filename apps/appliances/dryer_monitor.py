@@ -175,6 +175,11 @@ class DryerMonitor(hass.Hass):
         # and can detect power drop (fixes stuck "Running" after AppDaemon restart).
         if self.state in ("Running", "Paused"):
             self._restore_running_state()
+        elif self.state == "Unemptied":
+            # Re-arm the 24h auto-clear watchdog (see _restore_unemptied_state) - unlike the
+            # door-open listener this is not persisted and would otherwise stay disarmed
+            # across every deploy.
+            self._restore_unemptied_state()
 
         # Listen for events
         self.listen_state(self._power_changed, self.power_sensor)
@@ -193,9 +198,17 @@ class DryerMonitor(hass.Hass):
         except Exception as e:
             self.log(f"WARN: Error getting SonosNotifier app: {e}", level="WARNING")
 
-        # Dead-plug watchdog: unlike the dishwasher there is no Error state here - an
-        # unavailable plug forces Off immediately (_handle_unavailable), so a dead Shelly
-        # is indistinguishable from an idle dryer. After this grace, page the phone; one
+        # Unavailable-power grace: tolerate a short power-sensor dropout (HA restart, ESPHome
+        # OTA flash - these routinely blip the plug for well under this) before wiping an
+        # in-progress cycle; see _handle_unavailable and washer_monitor.py's
+        # power_unavailable_off_after_seconds (same guard, proven there since 2026-07-17 - an
+        # instant force-Off used to destroy cycle tracking/learning data on every plug blip).
+        self.power_unavailable_off_after_seconds = int(self.args.get("power_unavailable_off_after_seconds", 180))
+        self.power_unavailable_off_timer = None
+
+        # Dead-plug watchdog: unlike the dishwasher there is no Error state here - a plug that
+        # stays unavailable past the grace above still forces Off, so a dead Shelly is
+        # indistinguishable from an idle dryer. After this grace, page the phone; one
         # push per outage + all-clear on recovery (gw2000a_watchdog policy: dead sensor =
         # maintenance to act on, not house-feed material).
         self.plug_outage_push_after_seconds = int(self.args.get("power_unavailable_push_after_seconds", 180))
@@ -249,9 +262,20 @@ class DryerMonitor(hass.Hass):
         except (ValueError, TypeError):
             return None
 
+    def _restore_remaining_seconds(self, total_seconds, since, floor_s=60):
+        """Seconds left until total_seconds have elapsed since `since` (UTC), floored at
+        floor_s so a restore never arms a timer with ~0 delay (or a negative one, if the
+        period already ran out while AppDaemon was down)."""
+        elapsed = (self._now_utc() - since).total_seconds()
+        return max(floor_s, int(total_seconds - elapsed))
+
     def _restore_running_state(self):
         """After AppDaemon restart: restore start_time and timers when state is Running/Paused.
-        Ensures we keep polling power and can detect cycle end (power drop)."""
+        Ensures we keep polling power and can detect cycle end (power drop), and re-arms the
+        watchdogs that would otherwise stay disarmed until the next full cycle: the 5h running
+        watchdog spans Running AND any Paused time within it (it is never cancelled on pause -
+        see _transition_to_paused), so both restored states re-arm it here; Paused additionally
+        re-arms its own pause timeout."""
         if self.state not in ("Running", "Paused"):
             return
         try:
@@ -285,9 +309,46 @@ class DryerMonitor(hass.Hass):
                 self.classify_timer = self.run_in(self._tick_classify, 30)
             if self.start_time:
                 self._update_running_attributes()
+                self._safe_cancel_timer(self.running_watchdog_timer)
+                remaining = self._restore_remaining_seconds(
+                    int(self.max_running_hours * 3600), self.start_time, floor_s=60
+                )
+                self.running_watchdog_timer = self.run_in(self._running_watchdog_timeout, remaining)
+            if self.state == "Paused":
+                last_changed = (full or {}).get("last_changed") or (full or {}).get("last_updated")
+                pause_started = self._parse_utc_iso(last_changed) if last_changed else None
+                total_pause_s = self.pause_timeout_minutes * 60
+                if pause_started:
+                    remaining_pause = self._restore_remaining_seconds(total_pause_s, pause_started, floor_s=60)
+                else:
+                    self.log("Restore Paused: no last_changed on entity - arming full pause timeout", level="DEBUG")
+                    remaining_pause = total_pause_s
+                self._safe_cancel_timer(self.pause_timer)
+                self.pause_timer = self.run_in(self._pause_timeout, remaining_pause)
             self.log("Restored Running state: start_time and timers resumed", level="INFO")
         except Exception as e:
             self.log(f"Restore Running state failed: {e}", level="WARNING")
+
+    def _restore_unemptied_state(self):
+        """After AppDaemon restart: re-arm the Unemptied auto-clear watchdog from the time
+        Unemptied actually began (state entity last_changed), falling back to the full period
+        when that is not derivable. Without this the watchdog fallback is lost across every
+        deploy while Unemptied (the door-open listener is unaffected and still works)."""
+        try:
+            full = self.get_state(self.state_entity, attribute="all")
+            last_changed = (full or {}).get("last_changed") or (full or {}).get("last_updated")
+            unemptied_since = self._parse_utc_iso(last_changed) if last_changed else None
+            total_s = int(self.unemptied_timeout_hours * 3600)
+            if unemptied_since:
+                remaining = self._restore_remaining_seconds(total_s, unemptied_since, floor_s=60)
+            else:
+                self.log("Restore Unemptied: no last_changed on entity - arming full unemptied watchdog", level="DEBUG")
+                remaining = total_s
+            self._safe_cancel_timer(self.unemptied_watchdog_timer)
+            self.unemptied_watchdog_timer = self.run_in(self._unemptied_watchdog_timeout, remaining)
+            self.log(f"Restored Unemptied state: watchdog re-armed ({remaining}s remaining)", level="INFO")
+        except Exception as e:
+            self.log(f"Restore Unemptied state failed: {e}", level="WARNING")
 
     def _get_current_power(self):
         """Get current power reading in watts."""
@@ -1243,13 +1304,15 @@ class DryerMonitor(hass.Hass):
             self._handle_unavailable(entity, attr, old, new, kwargs)
             return
 
-        # Plug is reporting numbers again - stand down the dead-plug watchdog.
+        # Plug is reporting numbers again - stand down the dead-plug watchdog and the
+        # pending forced-Off grace.
         if self._plug_outage_push_timer:
             self._safe_cancel_timer(self._plug_outage_push_timer)
             self._plug_outage_push_timer = None
         if self._plug_outage_pushed:
             self._plug_outage_pushed = False
             self._push_mobile("Power plug is reporting again - dryer monitoring resumed.")
+        self._cancel_power_unavailable_grace()
 
         current_state = self.get_state(self.state_entity)
 
@@ -1518,15 +1581,60 @@ class DryerMonitor(hass.Hass):
         self.low_power_timer = None
 
     def _handle_unavailable(self, entity, attribute, old, new, kwargs):
-        """Handle entity becoming unavailable"""
-        self.log(f"{entity} became unavailable ({new}), setting state to Off", level="WARNING")
+        """Handle entity becoming unavailable or unknown."""
+        if entity == self.state_entity:
+            # The dryer's own state entity dropping out (HA restart, recorder hiccup) is a
+            # UI-visibility problem, not a cycle-tracking one - never wipe cycle state for it
+            # (dishwasher_monitor.py ~2242-2246 is the same policy for its own state entity).
+            self.log(
+                f"{entity} became {new!r} - leaving cycle state untouched, UI may be stale until it is back",
+                level="WARNING",
+            )
+            return
+        if entity == self.power_sensor:
+            self._begin_plug_outage_grace()
+        self._begin_power_unavailable_off_grace(new)
+
+    def _begin_power_unavailable_off_grace(self, new_label):
+        """Tolerate a short power-sensor dropout (HA restart, ESPHome OTA flash - these
+        routinely blip the plug for well under the grace) before wiping an in-progress cycle;
+        see washer_monitor.py's power_unavailable_off_after_seconds (same guard, proven there
+        since 2026-07-17 - an instant force-Off used to destroy cycle tracking/learning data on
+        every plug blip). Only a sustained outage past the grace runs the old wipe."""
+        if self.power_unavailable_off_timer and self.timer_running(self.power_unavailable_off_timer):
+            return
+        self.power_unavailable_off_timer = self.run_in(
+            self._power_unavailable_off_timeout,
+            self.power_unavailable_off_after_seconds,
+        )
+        self.log(
+            f"{self.power_sensor} {new_label!r}; waiting {self.power_unavailable_off_after_seconds}s before "
+            f"forcing Off (short dropouts - HA restart / plug OTA - are ignored)",
+            level="WARNING",
+        )
+
+    def _cancel_power_unavailable_grace(self):
+        """Power reading is valid again; cancel the pending forced-Off transition."""
+        self._safe_cancel_timer(self.power_unavailable_off_timer)
+        self.power_unavailable_off_timer = None
+
+    def _power_unavailable_off_timeout(self, kwargs):
+        self.power_unavailable_off_timer = None
+        if self.get_state(self.power_sensor) not in ("unknown", "unavailable", None):
+            self.log(
+                f"Power sensor recovered before the {self.power_unavailable_off_after_seconds}s grace expired",
+                level="INFO",
+            )
+            return
+        self.log(
+            f"{self.power_sensor} unavailable >= {self.power_unavailable_off_after_seconds}s - setting state to Off",
+            level="WARNING",
+        )
         self.state = "Off"
         self.last_state_change = datetime.now()
         self._set_state_entity( state="Off")
         self._reset_programme_selectors_to_unconfirmed()
         self._reset_cycle_tracking()
-        if entity == self.power_sensor:
-            self._begin_plug_outage_grace()
 
     def _begin_plug_outage_grace(self):
         """Short plug dropouts are routine; only a lasting outage pages the phone."""
