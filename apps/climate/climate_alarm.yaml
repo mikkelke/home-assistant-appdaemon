@@ -11,6 +11,9 @@ ClimateAlarm:
   module: climate_alarm
   class: ClimateAlarm
   log: climate_alarm_log
+  # Restart survival (last_notify_at cooldown, snooze_until) - see climate_alarm.py's
+  # _load_state/_save_state.
+  state_file: /conf/apps/climate/climate_alarm_state.json
 
   event_active_entity: "input_boolean.climate_alarm_active"
   message_entity: "input_text.climate_alarm_message"

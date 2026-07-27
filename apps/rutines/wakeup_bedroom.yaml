@@ -3,6 +3,9 @@ WakeupBedroom:
   class: WakeupRoutine
   log: wakeup_bedroom_log
   log_level: INFO
+  # Restart survival (last_fire_date, missed-push dedup) - see wakeup_bedroom.py's
+  # _load_state/_save_state and _late_catchup_after_restart.
+  state_file: /conf/apps/rutines/wakeup_bedroom_state.json
 
   alarm_time_entity: input_datetime.wakeup_bedroom
   alarm_enabled_entity: input_boolean.wakeup_bedroom

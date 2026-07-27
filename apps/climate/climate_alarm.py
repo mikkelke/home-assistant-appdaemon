@@ -7,9 +7,12 @@ Clear button = "Recheck in 1 hour" (snooze); real completion only when all rooms
 are above threshold. Cooldown applies to push notifications only; state is always updated.
 """
 
-import appdaemon.plugins.hass.hassapi as hass  # type: ignore
-from datetime import datetime, timezone
+import json
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+
+import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
 
 def _room_name_from_entity(entity_id: str) -> str:
@@ -56,8 +59,19 @@ class ClimateAlarm(hass.Hass):
             )
             return
 
-        self._last_notify_at: Optional[datetime] = None
         self._clear_recheck_handle: Optional[str] = None
+
+        # Restart survival: last_notify_at (push cooldown) and snooze_until (the "Recheck
+        # in 1 hour" clear button) are persisted so an AD restart can't re-push during an
+        # active cooldown or void a just-pressed snooze - see _load_state/_save_state and
+        # the startup-eval gating below. Path convention: deploy_advisor.py; atomic write:
+        # house_events.py.
+        self.state_file = self.args.get(
+            "state_file", "/conf/apps/climate/climate_alarm_state.json"
+        )
+        saved_state = self._load_state()
+        self._last_notify_at: Optional[datetime] = self._parse_dt(saved_state.get("last_notify_at"))
+        self._snooze_until: Optional[datetime] = self._parse_dt(saved_state.get("snooze_until"))
 
         self.mobile_notifier = None
         try:
@@ -90,8 +104,22 @@ class ClimateAlarm(hass.Hass):
                 level="INFO",
             )
 
-        # One check on startup after a short delay
-        self.run_in(self._run_evaluate, 2)
+        # One check on startup after a short delay - unless a snooze survived the restart:
+        # an immediate re-evaluate would re-show (and, without the loaded _last_notify_at
+        # above, re-push) an alarm the user just silenced with "Recheck in 1 hour". Schedule
+        # the remaining snooze time instead; the notify cooldown itself is respected because
+        # _last_notify_at was loaded above regardless of which branch runs.
+        now = datetime.now(timezone.utc)
+        if self._snooze_until is not None and self._snooze_until > now:
+            remaining_sec = max(1, int((self._snooze_until - now).total_seconds()))
+            self._clear_recheck_handle = self.run_in(self._run_evaluate, remaining_sec)
+            self.log(
+                f"Snoozed until {self._snooze_until.isoformat()} (survived restart) - "
+                f"recheck in {remaining_sec // 60} min instead of an immediate startup eval",
+                level="INFO",
+            )
+        else:
+            self.run_in(self._run_evaluate, 2)
         self.log(
             f"Started: {len(self.climate_entities)} climate, {len(self.window_door_entities)} window/door entities",
             level="INFO",
@@ -147,6 +175,8 @@ class ClimateAlarm(hass.Hass):
         except Exception as e:
             self.log(f"Failed to clear {self.message_entity}: {e}", level="WARNING")
 
+        self._snooze_until = datetime.now(timezone.utc) + timedelta(seconds=self.clear_recheck_sec)
+        self._save_state()
         self._clear_recheck_handle = self.run_in(
             self._run_evaluate,
             self.clear_recheck_sec,
@@ -278,6 +308,7 @@ class ClimateAlarm(hass.Hass):
                     category="heating_alarm",
                 )
                 self._last_notify_at = now
+                self._save_state()
             except Exception as e:
                 self.log(f"Notify failed: {e}", level="WARNING")
 
@@ -310,3 +341,33 @@ class ClimateAlarm(hass.Hass):
                 )
             except Exception as e:
                 self.log(f"Notify (resolved) failed: {e}", level="WARNING")
+
+    # ---------- restart survival (state file) ----------
+    @staticmethod
+    def _parse_dt(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _load_state(self) -> dict:
+        try:
+            with open(self.state_file) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save_state(self) -> None:
+        data = {
+            "last_notify_at": self._last_notify_at.isoformat() if self._last_notify_at else None,
+            "snooze_until": self._snooze_until.isoformat() if self._snooze_until else None,
+        }
+        try:
+            tmp = self.state_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.state_file)
+        except Exception as e:
+            self.log(f"state save failed: {e}", level="WARNING")

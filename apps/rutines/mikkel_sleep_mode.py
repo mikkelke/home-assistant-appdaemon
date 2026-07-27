@@ -15,6 +15,9 @@ not immediately turn sleep back on while still in bed + charging until Withings 
 out of bed.
 """
 
+import json
+import os
+
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
 
@@ -53,8 +56,17 @@ class MikkelSleepMode(hass.Hass):
         )
         self._off_battery_state = self.args.get("off_battery_state", "discharging")
 
-        # After wakeup_bedroom (or manual HA) turns sleep off while sensors still say "asleep"
-        self._block_rearm_until_out_of_bed = False
+        # After wakeup_bedroom (or manual HA) turns sleep off while sensors still say "asleep".
+        # Persisted (deploy_advisor's path convention + house_events' atomic tmp+replace
+        # write - see _load_state/_save_state): an AD restart must not forget this and let
+        # sleep mode silently re-arm mid-wake-up while Withings/bedside is still "in bed".
+        self.state_file = self.args.get(
+            "state_file", "/conf/apps/rutines/mikkel_sleep_mode_state.json"
+        )
+        self._state = self._load_state()
+        self._block_rearm_until_out_of_bed = bool(
+            self._state.get("block_rearm_until_out_of_bed", False)
+        )
 
         for entity_id in (
             self.battery_entity,
@@ -70,7 +82,7 @@ class MikkelSleepMode(hass.Hass):
             if self._dnd_off_command:
                 self._send_dnd_command(self._dnd_off_command)
             if old == "on" and self._compute_want_on_raw():
-                self._block_rearm_until_out_of_bed = True
+                self._set_block_rearm_until_out_of_bed(True)
                 self.log(
                     "Sleep boolean cleared while sensors still allow sleep - "
                     "holding re-arm until out of bed (e.g. wakeup routine)",
@@ -96,8 +108,13 @@ class MikkelSleepMode(hass.Hass):
 
     def _on_relevant_change(self, entity, attribute, old, new, kwargs) -> None:
         if entity in self.in_bed_entities and new == "off" and not self._any_in_bed():
-            self._block_rearm_until_out_of_bed = False
+            self._set_block_rearm_until_out_of_bed(False)
         self._apply_sleep_mode()
+
+    def _set_block_rearm_until_out_of_bed(self, value: bool) -> None:
+        self._block_rearm_until_out_of_bed = value
+        self._state["block_rearm_until_out_of_bed"] = value
+        self._save_state()
 
     def _compute_want_on_raw(self) -> bool:
         battery = self.get_state(self.battery_entity)
@@ -159,3 +176,20 @@ class MikkelSleepMode(hass.Hass):
                 f"DND notify failed ({self._notify_service_path}, command={command!r}): {e}",
                 level="WARNING",
             )
+
+    # ---------- restart survival (state file) ----------
+    def _load_state(self):
+        try:
+            with open(self.state_file) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save_state(self):
+        try:
+            tmp = self.state_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self._state, f)
+            os.replace(tmp, self.state_file)
+        except Exception as e:
+            self.log(f"state save failed: {e}", level="WARNING")

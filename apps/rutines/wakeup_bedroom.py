@@ -1,6 +1,8 @@
 import appdaemon.plugins.hass.hassapi as hass # type: ignore
 import asyncio
-from datetime import time, timedelta
+import json
+import os
+from datetime import date, time, timedelta
 
 import cover_util
 import room_state_darkness
@@ -163,7 +165,23 @@ class WakeupRoutine(hass.Hass):
         # True only while _heartbeat_check is invoking _alarm_fire, so the rescue feed
         # entry rides an alarm that actually fired (not a gated skip)
         self._fired_via_heartbeat = False
+        # True only while _late_catchup_after_restart is invoking _alarm_fire, so that call
+        # can bypass the +/-90s trigger window below (same style as _fired_via_heartbeat)
+        self._late_catchup_in_progress = False
+
+        # Restart-survival state: small JSON file, deploy_advisor's path convention +
+        # house_events' atomic tmp+replace write (see _load_state/_save_state). An AD
+        # restart (every deploy) drops last_fire_date otherwise, which can both duplicate
+        # a wake-up that already fired and repeat a missed-alarm push on every restart.
+        self.state_file = A.get("state_file", "/conf/apps/rutines/wakeup_bedroom_state.json")
+        self._state = self._load_state()
         self.last_fire_date = None  # heartbeat duplicate guard
+        stored_fire_date = self._state.get("last_fire_date")
+        if stored_fire_date:
+            try:
+                self.last_fire_date = date.fromisoformat(stored_fire_date)
+            except (TypeError, ValueError):
+                self.last_fire_date = None
 
         # Respect per-app log_level
         self.set_log_level(self.log_level)
@@ -171,6 +189,12 @@ class WakeupRoutine(hass.Hass):
         # Schedule alarm and reschedule on time change
         self._schedule_daily_alarm()
         self.listen_state(self._on_alarm_time_changed, self.alarm_time_entity)
+        # Restart survival, init-only: reconcile Adaptive Lighting first (a late catch-up
+        # ramp turns it off itself moments later, so reconciling first never fights it),
+        # then check for a fire that fell in the gap between the 120s grace window above
+        # and the 60s heartbeat below - an AD restart can easily eat more than either.
+        self._reconcile_adaptive_lighting_after_restart()
+        self._late_catchup_after_restart()
         # Always-on minute heartbeat as the alarm's safety net. History (Sep 19 - Nov 16
         # 2025): the AppDaemon scheduler developed a constant +67 min phase shift, so the
         # run_daily callback arrived 67 minutes late every single day and was rejected by
@@ -231,7 +255,12 @@ class WakeupRoutine(hass.Hass):
             if now_dt >= today_run:
                 delta = (now_dt - today_run).total_seconds()
                 if 0 <= delta <= grace_seconds:
-                    if self.get_state(self.alarm_enabled_entity) == "on" and not self._both_away():
+                    if self.last_fire_date == now_dt.date():
+                        # Already fired today - persisted, so this also catches an AD
+                        # restart landing inside this same grace window. Refiring here
+                        # would duplicate a wake-up that already ran moments earlier.
+                        self.log(f"[wake] Time just passed {int(delta)}s ago but already fired today - not refiring", log=self.user_log)
+                    elif self.get_state(self.alarm_enabled_entity) == "on" and not self._both_away():
                         self.log(f"[wake] Time just passed {int(delta)}s ago -> firing now, and scheduled daily at {sched}", log=self.user_log)
                         self.run_in(self._alarm_fire, 1)
                         return
@@ -278,6 +307,99 @@ class WakeupRoutine(hass.Hass):
                     self._fired_via_heartbeat = False
         except Exception as e:
             self.log(f"[wake] Heartbeat check error: {e}", level="WARNING", log=self.user_log)
+
+    # ---------- restart survival (state file) ----------
+    def _load_state(self):
+        try:
+            with open(self.state_file) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save_state(self):
+        try:
+            tmp = self.state_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self._state, f)
+            os.replace(tmp, self.state_file)
+        except Exception as e:
+            self.log(f"[wake] state save failed: {e}", level="WARNING", log=self.user_log)
+
+    def _reconcile_adaptive_lighting_after_restart(self):
+        """Init-only. The ramp turns adaptive_brightness_switch off at ramp start and only
+        restores it from _stop_all/_stop_light_ramp - both die with the process on an AD
+        restart mid-ramp, leaving the switch off with nothing left to ever turn it back on.
+        ramp_active is always False this early in a fresh init, so this only ever restores a
+        switch a PAST process left off; called before _late_catchup_after_restart so a catch-up
+        ramp starting moments later still gets to turn the switch off itself (see initialize)."""
+        try:
+            if self.get_state(self.adaptive_brightness_switch) == "off" and not self.ramp_active:
+                self.turn_on(self.adaptive_brightness_switch)
+                self.log(
+                    "[wake] Adaptive Lighting brightness adaptation was off with no ramp "
+                    "running (restart mid-ramp?) - restoring it",
+                    level="INFO", log=self.user_log,
+                )
+        except Exception as e:
+            self.log(f"[wake] Adaptive Lighting reconcile failed: {e}", level="WARNING", log=self.user_log)
+
+    def _late_catchup_after_restart(self):
+        """Init-only. Covers the gap between _schedule_daily_alarm's 120s grace refire and
+        the 60s heartbeat's own [5, 90)s window: an AD restart (deploy) can easily take
+        longer than either allows for. Only fires the full routine while the in-bed signal
+        this app already trusts for the light ramp (_bed_session_active) says someone is
+        still there; past 30 min a late wake-up routine would be more startling than useful,
+        so we just push once instead of firing blind."""
+        try:
+            if self.get_state(self.alarm_enabled_entity) != "on":
+                return
+            tstr = self.get_state(self.alarm_time_entity)
+            if not tstr:
+                return
+            hh, mm, *ss = [int(x) for x in str(tstr).split(":")]
+            now_dt = self.datetime()
+            today_run = now_dt.replace(hour=hh, minute=mm, second=(ss[0] if ss else 0), microsecond=0)
+            if now_dt < today_run:
+                return
+            delta = (now_dt - today_run).total_seconds()
+            if self.last_fire_date == now_dt.date():
+                return  # already fired today - nothing to catch up on
+
+            if 120 < delta < 1800:
+                if not self._bed_session_active():
+                    self.log("[wake] Late catch-up window but bed session inactive - not firing", log=self.user_log)
+                    return
+                self.log(
+                    f"[wake] Late catch-up after restart - alarm time passed {int(delta)}s ago, "
+                    "still in bed - firing now",
+                    level="WARNING", log=self.user_log,
+                )
+                self._late_catchup_in_progress = True
+                try:
+                    self._alarm_fire(None)
+                finally:
+                    self._late_catchup_in_progress = False
+                return
+
+            if delta >= 1800:
+                today_str = now_dt.date().isoformat()
+                if self._state.get("missed_push_date") == today_str:
+                    return  # already pushed for today - don't repeat on every restart
+                self._state["missed_push_date"] = today_str
+                self._save_state()
+                self.log("[wake] Alarm missed during a restart (>=30min late, unfired) - notifying",
+                         level="WARNING", log=self.user_log)
+                try:
+                    notifier = self.get_app("MobileNotifier")
+                    self.create_task(notifier.notify(
+                        title="Wake-up alarm",
+                        message="Wakeup alarm was missed during a restart",
+                        target=self.notify_target,
+                    ))
+                except Exception as e:
+                    self.log(f"[wake] missed-alarm notify failed: {e}", level="WARNING", log=self.user_log)
+        except Exception as e:
+            self.log(f"[wake] Late catch-up check failed: {e}", level="WARNING", log=self.user_log)
 
     # ---------- heat-block wake target ----------
     def _num(self, entity, default):
@@ -343,15 +465,23 @@ class WakeupRoutine(hass.Hass):
             self.log("[wake] Callback invoked.", log=self.user_log)
         except Exception:
             pass
-        # Hard guard: only run if current time is within +/-90s of configured alarm time
+        # Hard guard: only run if current time is within +/-90s of configured alarm time.
+        # Bypassed for a late catch-up (see _late_catchup_after_restart): that fires well
+        # outside this window on purpose, through this same entry point.
         try:
-            if not self._is_within_trigger_window(90):
+            if not self._late_catchup_in_progress and not self._is_within_trigger_window(90):
                 return
         except Exception:
             pass
-        # Mark date for heartbeat duplicate suppression
+        # Mark date for heartbeat duplicate suppression; persisted so an AD restart sees
+        # today's fire too (see _load_state / _schedule_daily_alarm / _heartbeat_check /
+        # _late_catchup_after_restart).
         try:
-            self.last_fire_date = self.datetime().date()
+            fire_at = self.datetime()
+            self.last_fire_date = fire_at.date()
+            self._state["last_fire_date"] = self.last_fire_date.isoformat()
+            self._state["last_fire_at"] = fire_at.isoformat()
+            self._save_state()
         except Exception:
             pass
         if self.get_state(self.alarm_enabled_entity) != "on":

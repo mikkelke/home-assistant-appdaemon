@@ -5,6 +5,9 @@ MikkelSleepMode:
   module: mikkel_sleep_mode
   class: MikkelSleepMode
   log: mikkel_sleep_mode_log
+  # Restart survival (block_rearm_until_out_of_bed) - see mikkel_sleep_mode.py's
+  # _load_state/_save_state.
+  state_file: /conf/apps/rutines/mikkel_sleep_mode_state.json
 
   battery_entity: sensor.mikkels_ofx9p_battery_state
   person_entity: person.mikkel
