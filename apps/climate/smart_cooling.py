@@ -341,6 +341,9 @@ class SmartCooling(hass.Hass):
         # ~9h it then ran unmonitored; bathroom hit 39.8C (+21.2C above outdoor) before
         # the next ARMED eval's guard finally caught it. See _condenser_hazard/_evaluate.
         self._safety_off_notified = False
+        # Latest sleep-plan verdict (stashed by _publish_sleep_plan each tick); the evening
+        # rescue DELIVERS this instead of computing its own projection -- one brain.
+        self._last_plan = None
         # One evening-rescue advisory per calendar day (YYYY-MM-DD, or None). The rollover
         # is implicit: a new day's date != the stored one, so the next qualifying evening
         # re-arms without an explicit reset. Persisted so a reload/HA restart mid-evening
@@ -1199,19 +1202,21 @@ class SmartCooling(hass.Hass):
             ceiling = ceiling_base
         return ceiling, ceiling_base
 
-    async def _maybe_evening_rescue(self, now, floor, e_legacy, e_active):
-        """Disarmed evening advisory -- NEVER a climate command. When the night is genuinely
-        at risk but still rescuable before bed, notify ONCE so the user can arm + redeploy
-        the unit. Uses the SAME ceiling (_effective_ceiling), E selection and _calc_target
-        the armed path uses, so the advice matches what arming would actually do. Fires only
-        when every gate holds: enabled, inside the evening window, an unmet pre-cool deficit
-        (floor - target >= rescue_deficit_min) that still fits before the cutoff hour, the
-        user HOME, and not already sent today. A push while away is pure stress -- nothing
-        can be done about it from there (user 2026-07-23, firm) -- so a live not_home
-        suppresses WITHOUT consuming the day: come home while the night is still saveable
-        and the very next tick delivers it. A dead/unknown presence sensor never counts as
-        away. Silent no-op on any missing input or error -- a courtesy notification must
-        never break the tick."""
+    async def _maybe_evening_rescue(self, now, floor):
+        """Disarmed evening advisory -- NEVER a climate command, and NEVER its own brain:
+        it DELIVERS the sleep plan's verdict in the evening window, nothing more. Fires
+        only when the CURRENT plan (same tick -- _publish_sleep_plan stashes _last_plan
+        just before this runs) says "ac": a window genuinely can't fix tonight. Until
+        2026-07-23 the rescue recomputed its own projection from the un-grounded kitchen
+        proxy and pushed "deploy the AC" at a 21.6C bedroom while the plan said windows --
+        two brains contradicting through different channels; now there is one.
+
+        Remaining gates: enabled, evening window, a real pre-cool deficit (against the
+        plan's own grounded equilibrium + limit) that still fits before the cutoff, user
+        HOME, once per day. A push while away is pure stress -- nothing can be done from
+        there (user 2026-07-23, firm) -- so a live not_home suppresses WITHOUT consuming
+        the day: come home while the night is still saveable and the next tick delivers
+        it. A dead/unknown presence sensor never counts as away. Silent no-op on error."""
         try:
             if not self.rescue_enabled:
                 return
@@ -1222,11 +1227,12 @@ class SmartCooling(hass.Hass):
                 return
             if floor is None:
                 return
-            ceiling, _ = await self._effective_ceiling(now)
-            if ceiling is None:
-                return
-            E = e_active if (self.weather_model_enabled and not self.wm_shadow) else e_legacy
-            if E is None:
+            plan = self._last_plan
+            if not plan or plan.get("rec") != "ac":
+                return   # the plan's remedy is windows/nothing -> no compressor push
+            E = plan.get("equilibrium")
+            ceiling = plan.get("limit")
+            if E is None or ceiling is None:
                 return
             target = self._calc_target(E, ceiling)
             deficit = floor - target
@@ -1244,9 +1250,12 @@ class SmartCooling(hass.Hass):
                 # A dead/unknown sensor is never treated as evidence of being away.
                 if home not in (None, "unknown", "unavailable", "home"):
                     return
+            peak = plan.get("peak")
+            heading = (f"{peak:.1f}° heading vs the {ceiling:.1f}° limit" if peak is not None
+                       else f"vs the {ceiling:.1f}° limit")
             await self._notify(
                 f"Tonight needs the AC -- plug it in and arm Cool night. "
-                f"About {mins:.0f} min of pre-cool ({E:.1f}° heading vs the {ceiling:.1f}° limit).")
+                f"About {mins:.0f} min of pre-cool ({heading}).")
             self._rescue_notified_date = today
             self._save_state()
         except Exception as e:
@@ -1317,6 +1326,14 @@ class SmartCooling(hass.Hass):
                 noise_penalty_kr=self.ac_noise_penalty_kr,
                 session_factor=self.session_energy_factor,
                 learned_night_cost=self._night_cost_ema))
+            # The evening rescue's single source of truth: it DELIVERS this plan's verdict
+            # instead of recomputing its own projection (2026-07-23: the rescue still used
+            # the un-grounded kitchen proxy and pushed "deploy the AC" at a 21.6C bedroom
+            # while this very plan said windows -- one brain, two delivery moments).
+            self._last_plan = {"rec": plan["recommendation"],
+                               "equilibrium": plan_equilibrium,
+                               "limit": ceiling,
+                               "peak": plan.get("projected_peak")}
             detail = plan["detail"]
             if grounded:
                 detail += (f" (Grounded on reality: the bedroom zone is ~{bedroom_zone_now:.1f}C "
@@ -1439,7 +1456,7 @@ class SmartCooling(hass.Hass):
                 self._finalize_session()
             # Evening rescue advisory (never a command). Placed after the hazard handling so
             # a genuine safety-off doesn't also nag; it only reads/notifies.
-            await self._maybe_evening_rescue(now, floor, e_legacy, e_active)
+            await self._maybe_evening_rescue(now, floor)
             # OFF = HANDS OFF. Turn the AC off ONCE on the on->off flip, then never command it again.
             if self._master_was_on:
                 await self._ensure_off("off", "Disarmed -- AC turned off, now hands-off",

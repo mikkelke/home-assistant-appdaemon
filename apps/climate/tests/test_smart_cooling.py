@@ -1031,19 +1031,19 @@ class TrackKitchenMax(unittest.TestCase):
 
 
 class EveningRescue(unittest.TestCase):
-    """Change 2: when DISARMED in the evening and the night is genuinely at risk but still
-    rescuable, send ONE advisory (never a climate command). Fires only when every gate
-    holds; silent no-op otherwise. Uses the same _effective_ceiling / E selection /
-    _calc_target the armed path uses, so the advice matches what arming would do."""
+    """The evening rescue DELIVERS the sleep plan's verdict -- one brain (2026-07-23: it
+    used to recompute its own projection from the un-grounded kitchen proxy and pushed
+    "deploy the AC" at a 21.6C bedroom while the plan said windows). Fires only when the
+    current plan says "ac" and every gate holds; never a climate command."""
 
     def _run(self, coro):
         import asyncio
         return asyncio.run(coro)
 
-    def _app(self, ceiling=23.0, e_active=25.0, e_legacy=25.0, home="home",
+    def _app(self, plan_rec="ac", equilibrium=25.0, limit=23.0, peak=24.5, home="home",
              rescue_enabled=True, from_hour=16, to_hour=23, deficit_min=0.5,
-             notified_date=None, comfort_ce=None, wm_shadow=False):
-        app = make_app(weather_model_enabled=True, wm_shadow=wm_shadow)
+             notified_date=None, has_plan=True):
+        app = make_app(weather_model_enabled=True, wm_shadow=True)
         app.rescue_enabled = rescue_enabled
         app.rescue_from_hour = from_hour
         app.rescue_to_hour = to_hour
@@ -1052,32 +1052,9 @@ class EveningRescue(unittest.TestCase):
         app.floor_cool_cph = 1.0
         app.zone_offset = 1.0
         app.min_temp = 16.0
-        app.night_ceiling_entity = "input_number.nc"
-        app.default_ceiling = ceiling
-        app.comfort_entity = "sensor.comfort"
-        app.comfort_max_reduction = 1.5
         app._rescue_notified_date = notified_date
-        app._e_active = e_active
-        app._e_legacy = e_legacy
-
-        async def _num(entity, default):
-            return ceiling if entity == app.night_ceiling_entity else default
-        app._num = _num
-
-        async def get_state(entity, attribute=None):
-            return comfort_ce
-        app.get_state = get_state
-
-        # _effective_ceiling is now computed locally (signature (now)); stub it directly to
-        # return (ceiling, base) instead of stubbing the old get_state('ceiling_effective').
-        computed_ceiling = ceiling
-        if comfort_ce is not None:
-            computed_ceiling = min(ceiling, max(float(comfort_ce),
-                                                ceiling - app.comfort_max_reduction, app.min_temp))
-
-        async def _effective_ceiling(now):
-            return computed_ceiling, ceiling
-        app._effective_ceiling = _effective_ceiling
+        app._last_plan = ({"rec": plan_rec, "equilibrium": equilibrium,
+                           "limit": limit, "peak": peak} if has_plan else None)
 
         async def _state(entity):
             return home
@@ -1091,11 +1068,11 @@ class EveningRescue(unittest.TestCase):
         return app
 
     def _fire(self, app, now, floor):
-        self._run(app._maybe_evening_rescue(now, floor, app._e_legacy, app._e_active))
+        self._run(app._maybe_evening_rescue(now, floor))
 
     def test_fires_once_when_all_conditions_hold(self):
-        # floor 22.5, ceiling 23 -> cap 22; E 25 -> target 19 (r=0.5); deficit 3.5 >= 0.5;
-        # mins 210 (3.5h); 19:00 leaves (23-19)*60=240 >= 210 -> feasible; home -> fires.
+        # floor 22.5, limit 23 -> cap 22; E 25, r=0.5 -> target 19; deficit 3.5 >= 0.5;
+        # 210 min needed, 19:00 leaves 240 -> feasible; plan says ac; home -> fires.
         app = self._app()
         now = datetime(2026, 7, 20, 19, 0)
         self._fire(app, now, floor=22.5)
@@ -1105,6 +1082,25 @@ class EveningRescue(unittest.TestCase):
         # second call the same evening is deduped
         self._fire(app, now, floor=22.5)
         self.assertEqual(len(app._notified), 1)
+
+    def test_windows_plan_never_fires(self):
+        # THE 2026-07-23 regression: a warm-looking equilibrium but the plan's verdict is
+        # windows (bedroom 21.6C, cool night incoming) -> the rescue must stay silent.
+        app = self._app(plan_rec="windows", equilibrium=25.0)
+        self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
+        self.assertEqual(app._notified, [])
+        self.assertIsNone(app._rescue_notified_date)
+
+    def test_hybrid_and_nothing_plans_never_fire(self):
+        for rec in ("hybrid", "nothing"):
+            app = self._app(plan_rec=rec)
+            self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
+            self.assertEqual(app._notified, [], f"rec={rec} must not push")
+
+    def test_no_plan_yet_never_fires(self):
+        app = self._app(has_plan=False)
+        self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
+        self.assertEqual(app._notified, [])
 
     def test_disabled_never_fires(self):
         app = self._app(rescue_enabled=False)
@@ -1160,21 +1156,27 @@ class EveningRescue(unittest.TestCase):
         self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
         self.assertEqual(app._notified, [])
 
-    def test_message_uses_weather_E_when_out_of_shadow(self):
-        # not in shadow -> E = e_active; the message quotes it.
-        app = self._app(e_active=25.0, e_legacy=99.0, wm_shadow=False)
+    def test_message_quotes_the_plans_numbers(self):
+        app = self._app(peak=24.5, limit=23.0)
         self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
         self.assertEqual(len(app._notified), 1)
-        self.assertIn("25.0°", app._notified[0])
+        self.assertIn("24.5°", app._notified[0])
+        self.assertIn("23.0° limit", app._notified[0])
+
+    def test_peakless_plan_still_reads_clean(self):
+        app = self._app(peak=None)
+        self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
+        self.assertEqual(len(app._notified), 1)
+        self.assertNotIn("None", app._notified[0])
+        self.assertIn("vs the 23.0° limit", app._notified[0])
 
     def test_error_is_swallowed_no_raise(self):
         app = self._app()
 
-        async def _boom(now):
-            raise RuntimeError("sensor blew up")
-        app._effective_ceiling = _boom  # the shared ceiling helper raises
-        # must not propagate, must not notify
-        self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)
+        def _boom(E, ceiling):
+            raise RuntimeError("boom")
+        app._calc_target = _boom
+        self._fire(app, datetime(2026, 7, 20, 19, 0), floor=22.5)   # must not raise
         self.assertEqual(app._notified, [])
 
 
@@ -1246,8 +1248,8 @@ class EvaluateTickWiring(unittest.TestCase):
 
         app._rescue_calls = []
 
-        async def _rescue(now, floor, e_legacy, e_active):
-            app._rescue_calls.append((floor, e_legacy, e_active))
+        async def _rescue(now, floor):
+            app._rescue_calls.append(floor)
         app._maybe_evening_rescue = _rescue
 
         # sensor.sleep_plan publisher is called every tick BEFORE the arm gate; stub it so
