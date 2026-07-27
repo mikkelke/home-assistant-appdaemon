@@ -26,3 +26,5 @@ LockHealth:
   autolock_check_minutes: 4
   wake_nudge_cooldown_minutes: 30
   recovery_debounce_minutes: 2
+  bridge_settle_minutes: 10
+  cloud_action_cooldown_minutes: 20

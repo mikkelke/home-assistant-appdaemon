@@ -254,6 +254,8 @@ class LockHealth(hass.Hass):
         self.autolock_check_minutes = float(a("autolock_check_minutes", 4))
         self.wake_nudge_cooldown_minutes = float(a("wake_nudge_cooldown_minutes", 30))
         self.recovery_debounce_minutes = float(a("recovery_debounce_minutes", 2))
+        self.bridge_settle_minutes = float(a("bridge_settle_minutes", 10))
+        self.cloud_action_cooldown_minutes = float(a("cloud_action_cooldown_minutes", 20))
 
         self._state_file = Path(__file__).with_name("lock_health_state.json")
         # get_app must be resolved in sync init - async context returns a Task.
@@ -285,6 +287,8 @@ class LockHealth(hass.Hass):
         self._last_reload_at = {"ble": None, "cloud": None}
         self._last_power_cycle_at = None
         self._last_wake_nudge_at = None
+        self._last_bridge_down_at = None
+        self._last_cloud_api_at = None
 
         self._heal_stage = "idle"
         self._active_ladder = None
@@ -449,6 +453,7 @@ class LockHealth(hass.Hass):
         if state == "off":
             if self._bridge_down_since is None:
                 self._bridge_down_since = now
+            self._last_bridge_down_at = now
         else:
             self._bridge_down_since = None
         plug_state = await self._state(self.bridge_plug)
@@ -520,6 +525,27 @@ class LockHealth(hass.Hass):
         return (self._last_power_cycle_at is not None
                 and (now - self._last_power_cycle_at).total_seconds() < SELF_INDUCED_POWER_CYCLE_WINDOW_S)
 
+    def _bridge_recently_down(self, now):
+        """Bridge currently down, or back up for less than bridge_settle_minutes.
+        A cloud twin dying in that window is a CONSEQUENCE of the bridge outage
+        (2026-07-27: bridge hang -> cloud invalid -> two separate alerts for one
+        fault). The bridge ladder owns the incident; cloud-side detection waits
+        out the settle window instead of piling on."""
+        if self._bridge_down_since is not None:
+            return True
+        return (self._last_bridge_down_at is not None
+                and (now - self._last_bridge_down_at).total_seconds() < self.bridge_settle_minutes * 60)
+
+    def _cloud_api_ok(self, now):
+        """Wake presses and cloud entry reloads both spend Yale CLOUD API budget,
+        and yalexs rate-limits the whole account (observed live 2026-07-27:
+        'Rate limited, try again in 19 minutes' while our own ladder was still
+        pressing wake). Healing must never burn the allowance faster than
+        cloud_action_cooldown_minutes."""
+        if self._last_cloud_api_at is None:
+            return True
+        return (now - self._last_cloud_api_at).total_seconds() >= self.cloud_action_cooldown_minutes * 60
+
     # ---------- detection (is issue X due for healing right now) ----------
     def _divergence_due(self, now):
         if not self._currently_diverged or self._diverged_since is None:
@@ -528,6 +554,8 @@ class LockHealth(hass.Hass):
         if side is None or self._notified.get("divergence"):
             return False
         if self._reload_window_active(side, now):
+            return False
+        if side == "cloud" and self._bridge_recently_down(now):
             return False
         elapsed_min = (now - self._diverged_since).total_seconds() / 60.0
         return elapsed_min >= self.divergence_heal_minutes
@@ -541,6 +569,8 @@ class LockHealth(hass.Hass):
         if self._reload_window_active(side, now):
             return False
         if side == "cloud" and self._power_cycle_window_active(now):
+            return False
+        if side == "cloud" and self._bridge_recently_down(now):
             return False
         elapsed_min = (now - since).total_seconds() / 60.0
         return elapsed_min >= self.invalid_heal_minutes
@@ -622,7 +652,13 @@ class LockHealth(hass.Hass):
         if not self._can_heal_act(now):
             self._abort_ladder(issue, "cooldown blocked wake press")
             return
+        if not self._cloud_api_ok(now):
+            self.log(f"LockHealth[{issue}]: wake skipped (Yale cloud API cooldown) - escalating to reload",
+                     level="INFO")
+            self._reload_rung(issue, attempt=1)
+            return
         self.call_service("button/press", entity_id=self.wake_button)
+        self._last_cloud_api_at = now
         self._record_action(now)
         self._report_heal(self._ladder_cause or f"Yale {self._label(issue)} lock issue",
                            "pressed Yale wake button")
@@ -644,6 +680,11 @@ class LockHealth(hass.Hass):
         if issue == "cloud" and self.get_state(self.bridge_ping) == "off":
             self._power_cycle_rung(issue)
             return
+        if issue == "cloud" and not self._cloud_api_ok(now):
+            self.log("LockHealth[cloud]: reload skipped (Yale cloud API cooldown) - escalating to power-cycle",
+                     level="INFO")
+            self._power_cycle_rung(issue)
+            return
         if not self._guards_ok(now):
             self._abort_ladder(issue, "guard blocked reload")
             return
@@ -660,6 +701,8 @@ class LockHealth(hass.Hass):
         self.call_service("homeassistant/reload_config_entry", entity_id=entity)
         self._reload_history.append(now)
         self._last_reload_at[issue] = now
+        if issue == "cloud":
+            self._last_cloud_api_at = now
         self._record_action(now)
         self._heal_stage = "reload"
         self._report_heal(f"Yale {self._label(issue)} twin still not right after the wake press",
@@ -887,8 +930,11 @@ class LockHealth(hass.Hass):
             return
         if not self._guards_ok(now):
             return
+        if not self._cloud_api_ok(now):
+            return
         self.call_service("button/press", entity_id=self.wake_button)
         self._last_wake_nudge_at = now
+        self._last_cloud_api_at = now
         self._record_action(now)
         self._report_heal("Door closed while the lock still read unlocked with no corroborating update",
                            "pressed Yale wake button (auto-lock corroborator nudge)")
@@ -918,7 +964,10 @@ class LockHealth(hass.Hass):
         # happens right after an HA restart resets both twins' timestamps together.
         if not self._guards_ok(now, allow_in_startup_grace=True):
             return
+        if not self._cloud_api_ok(now):
+            return
         self.call_service("button/press", entity_id=self.wake_button)
+        self._last_cloud_api_at = now
         self._record_action(now)
         self._report_heal("Yale twins only agree within the tie window (likely just restarted)",
                            "pressed Yale wake button to re-establish ground truth")
@@ -963,7 +1012,6 @@ class LockHealth(hass.Hass):
                 "diverged_since": self._iso(self._diverged_since),
                 "invalid_since": {k: self._iso(v) for k, v in self._invalid_since.items()},
                 "bridge_down_since": self._iso(self._bridge_down_since),
-                "clear_since": {k: self._iso(v) for k, v in self._clear_since.items()},
                 "notified": dict(self._notified),
                 "reload_history": [self._iso(t) for t in self._reload_history],
                 "plug_cycle_history": [self._iso(t) for t in self._plug_cycle_history],
@@ -971,6 +1019,8 @@ class LockHealth(hass.Hass):
                 "last_reload_at": {k: self._iso(v) for k, v in self._last_reload_at.items()},
                 "last_power_cycle_at": self._iso(self._last_power_cycle_at),
                 "last_wake_nudge_at": self._iso(self._last_wake_nudge_at),
+                "last_bridge_down_at": self._iso(self._last_bridge_down_at),
+                "last_cloud_api_at": self._iso(self._last_cloud_api_at),
             }
             tmp = self._state_file.with_name(self._state_file.name + ".tmp")
             tmp.write_text(json.dumps(data))
@@ -992,8 +1042,11 @@ class LockHealth(hass.Hass):
         inv = data.get("invalid_since") or {}
         self._invalid_since = {"ble": self._parse_ts(inv.get("ble")), "cloud": self._parse_ts(inv.get("cloud"))}
         self._bridge_down_since = self._parse_ts(data.get("bridge_down_since"))
-        clear = data.get("clear_since") or {}
-        self._clear_since.update({k: self._parse_ts(v) for k, v in clear.items()})
+        # clear_since is deliberately NOT persisted/restored: restoring it let a
+        # pre-restart "condition clear" streak complete across a restart window and
+        # fire a premature all-clear mid-incident (2026-07-27 16:25, AD deploy in the
+        # middle of a bridge outage). The recovery debounce re-measures from scratch
+        # after every restart instead.
         notified = data.get("notified") or {}
         self._notified.update({k: bool(v) for k, v in notified.items()})
         self._reload_history = [t for t in (self._parse_ts(x) for x in data.get("reload_history") or []) if t]
@@ -1004,6 +1057,8 @@ class LockHealth(hass.Hass):
                                 "cloud": self._parse_ts(reload_at.get("cloud"))}
         self._last_power_cycle_at = self._parse_ts(data.get("last_power_cycle_at"))
         self._last_wake_nudge_at = self._parse_ts(data.get("last_wake_nudge_at"))
+        self._last_bridge_down_at = self._parse_ts(data.get("last_bridge_down_at"))
+        self._last_cloud_api_at = self._parse_ts(data.get("last_cloud_api_at"))
         # heal_stage is derived, not persisted directly: a "gave up" episode survives
         # via the notified latches (an AD reload must not silently drop the published
         # heal_stage back to "idle" while an episode is still unresolved and notified).
