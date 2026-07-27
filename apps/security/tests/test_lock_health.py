@@ -277,5 +277,24 @@ class IsValidLockStateTests(unittest.TestCase):
             self.assertFalse(lh.is_valid_lock_state(s))
 
 
+class PlugRestoreDecisionTests(unittest.TestCase):
+    # _save_state/_load_state round-trip of plug_off_at is NOT covered here: this
+    # suite only ever exercises lh's pure, module-level functions (no LockHealth
+    # instance is constructed anywhere in this file - hass.Hass is stubbed to
+    # `object`), so there is no existing pattern for testing the instance-level
+    # persistence methods. plug_restore_decision is the pure surface, tested below.
+    def test_no_marker_is_none(self):
+        self.assertEqual(lh.plug_restore_decision(None, "on"), "none")
+        self.assertEqual(lh.plug_restore_decision(None, "off"), "none")
+        self.assertEqual(lh.plug_restore_decision(None, None), "none")
+
+    def test_marker_and_plug_on_clears(self):
+        self.assertEqual(lh.plug_restore_decision(NOW, "on"), "clear")
+
+    def test_marker_and_plug_not_on_restores(self):
+        for plug_state in ("off", "unavailable", "unknown", None):
+            self.assertEqual(lh.plug_restore_decision(NOW, plug_state), "restore")
+
+
 if __name__ == "__main__":
     unittest.main()

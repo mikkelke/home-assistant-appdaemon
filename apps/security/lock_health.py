@@ -231,6 +231,26 @@ def can_act(history, now, cooldown_s, cap_n, cap_window_s):
     return True
 
 
+def plug_restore_decision(plug_off_at, plug_state):
+    """Pure decision for _restore_plug_if_interrupted (see the module docstring's
+    plug-off safety invariant): what to do about the bridge plug at LockHealth
+    startup, given the persisted "we cut it and haven't confirmed it's back" marker
+    and the plug's CURRENT read.
+
+    "none": no marker - nothing was left mid-cycle, do nothing.
+    "clear": marker set but the plug already reads "on" - a previous run (or a
+        human) restored it; just drop the marker.
+    "restore": marker set and the plug does NOT read "on" (off/unavailable/unknown/
+        None) - it may still be physically off; the caller must re-assert
+        switch/turn_on.
+    """
+    if plug_off_at is None:
+        return "none"
+    if plug_state == "on":
+        return "clear"
+    return "restore"
+
+
 class LockHealth(hass.Hass):
     def initialize(self):
         a = self.args.get
@@ -292,6 +312,10 @@ class LockHealth(hass.Hass):
         self._last_action_at = None
         self._last_reload_at = {"ble": None, "cloud": None}
         self._last_power_cycle_at = None
+        # Set immediately before switch/turn_off (see _power_cycle_rung) and cleared
+        # once the plug is confirmed back on - survives an AD restart mid-cycle so
+        # _restore_plug_if_interrupted can find and fix a plug left off.
+        self._plug_off_at = None
         self._last_wake_nudge_at = None
         self._last_bridge_down_at = None
         self._last_cloud_api_at = None
@@ -303,6 +327,7 @@ class LockHealth(hass.Hass):
         self._ladder_cause = None
 
         self._load_state()
+        self._restore_plug_if_interrupted()
 
         for ent in (self.lock_bt, self.lock_cloud):
             self.listen_state(self._on_lock_change, ent)
@@ -312,6 +337,43 @@ class LockHealth(hass.Hass):
         self.listen_state(self._on_door_closed, self.door, new="off", old="on")
         self.run_every(self._tick, "now+30", 60)
         self.log(f"LockHealth initialized - last_state={self._last_state}/{self._last_source}", level="INFO")
+
+    # ---------- startup plug restore (safety invariant: never leave the plug off) ----------
+    # Runs synchronously, directly from initialize() - before any listener can fire, and
+    # deliberately outside the heal-ladder machinery (no can_act/budgets/cooldowns/
+    # startup grace, no divergence/invalid latches): a plug left off across a restart is
+    # a standing safety problem to fix immediately, not a heal-worthy "issue" to arbitrate.
+    def _restore_plug_if_interrupted(self):
+        plug_state = self.get_state(self.bridge_plug)
+        decision = plug_restore_decision(self._plug_off_at, plug_state)
+        if decision == "none":
+            return
+        if decision == "clear":
+            self._plug_off_at = None
+            self._save_state()
+            self.log("LockHealth: plug-off marker cleared at startup - plug already reads on",
+                     level="INFO")
+            return
+        # decision == "restore": the marker survived to this restart with the plug
+        # still (or again) not reading "on" - turn it back on now, before anything else.
+        self.call_service("switch/turn_on", entity_id=self.bridge_plug)
+        if self._notified.get("bridge_down"):
+            self._notified["bridge_down"] = False
+            self._clear_since["bridge_down"] = None
+        self.run_in(self._plug_restore_confirm, 60)
+        self._save_state()  # marker stays set until _plug_restore_confirm verifies
+        self.log("LockHealth: plug was left off across a restart - restoring power and "
+                 "verifying in 60s", level="WARNING")
+
+    def _plug_restore_confirm(self, kwargs):
+        if self.get_state(self.bridge_plug) == "on":
+            self._plug_off_at = None
+            self._save_state()
+            self.log("LockHealth: startup plug restore confirmed - bridge plug back on", level="INFO")
+        else:
+            self.log("LockHealth: bridge plug still not on 60s after startup restore - forcing on "
+                     "again (never leave the bridge unpowered)", level="ERROR")
+            self.call_service("switch/turn_on", entity_id=self.bridge_plug)
 
     # ---------- listeners ----------
     def _on_lock_change(self, entity, attribute, old, new, kwargs):
@@ -465,6 +527,14 @@ class LockHealth(hass.Hass):
         plug_state = await self._state(self.bridge_plug)
         if plug_state not in (None, "unknown", "unavailable"):
             self._notified["plug_unavailable"] = False
+        # Self-heal belt: _plug_safety_check normally clears this once the plug reads
+        # "on" again, but if that callback itself never landed (e.g. an AD restart
+        # between the turn-off and its own timer firing), the marker would otherwise
+        # survive indefinitely even with the plug genuinely back on. _eval_locked
+        # saves state at the end of every tick, so no explicit save is needed here.
+        if (plug_state == "on" and self._plug_off_at is not None
+                and (now - self._plug_off_at).total_seconds() > PLUG_OFF_WAIT_S + PLUG_SAFETY_CHECK_S):
+            self._plug_off_at = None
 
     # ---------- per-side transition history (just_recovered / flapping) ----------
     def _record_transition(self, side, old, new, now):
@@ -755,6 +825,11 @@ class LockHealth(hass.Hass):
         # power meter. Both are compared after the cycle by _plug_cycle_verify.
         pre_switch_lc = self.get_state(self.bridge_plug, attribute="last_changed")
         pre_meter_lu = self.get_state(self.plug_power_entity, attribute="last_updated")
+        # Persist the off-marker BEFORE cutting power: if AD restarts/crashes with the
+        # plug off, initialize()'s _restore_plug_if_interrupted must be able to see we
+        # left it off (see the module docstring's plug-off safety invariant).
+        self._plug_off_at = now
+        self._save_state()
         self.call_service("switch/turn_off", entity_id=self.bridge_plug)
         self._plug_cycle_history.append(now)
         self._last_power_cycle_at = now
@@ -789,6 +864,9 @@ class LockHealth(hass.Hass):
             self.log("LockHealth: bridge plug still not on after power-cycle - forcing on again "
                      "(never leave the bridge unpowered)", level="ERROR")
             self.call_service("switch/turn_on", entity_id=self.bridge_plug)
+        elif self._plug_off_at is not None:
+            self._plug_off_at = None
+            self._save_state()
 
     def _plug_cycle_verify(self, kwargs):
         """Best-effort check that a power-cycle actually happened. The Z-Wave plug can
@@ -1076,6 +1154,7 @@ class LockHealth(hass.Hass):
                 "last_action_at": self._iso(self._last_action_at),
                 "last_reload_at": {k: self._iso(v) for k, v in self._last_reload_at.items()},
                 "last_power_cycle_at": self._iso(self._last_power_cycle_at),
+                "plug_off_at": self._iso(self._plug_off_at),
                 "last_wake_nudge_at": self._iso(self._last_wake_nudge_at),
                 "last_bridge_down_at": self._iso(self._last_bridge_down_at),
                 "last_cloud_api_at": self._iso(self._last_cloud_api_at),
@@ -1114,6 +1193,7 @@ class LockHealth(hass.Hass):
         self._last_reload_at = {"ble": self._parse_ts(reload_at.get("ble")),
                                 "cloud": self._parse_ts(reload_at.get("cloud"))}
         self._last_power_cycle_at = self._parse_ts(data.get("last_power_cycle_at"))
+        self._plug_off_at = self._parse_ts(data.get("plug_off_at"))
         self._last_wake_nudge_at = self._parse_ts(data.get("last_wake_nudge_at"))
         self._last_bridge_down_at = self._parse_ts(data.get("last_bridge_down_at"))
         self._last_cloud_api_at = self._parse_ts(data.get("last_cloud_api_at"))

@@ -42,3 +42,10 @@ Intercom:
   # Mobile alert target when all unlock attempts of a ring fail
   notify_target: "mikkel"
 
+  # Reboot-survival resume window (intercom_state.json): how stale a persisted
+  # "rang but auto-open unlock was never confirmed" record can be at startup and
+  # still be worth alerting on. Older than this, the visitor is long gone - alerting
+  # would just be noise, so the record is discarded silently instead. Alert-only:
+  # this never re-attempts an unlock from initialize().
+  resume_alert_max_age_s: 60
+

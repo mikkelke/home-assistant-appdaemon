@@ -1,5 +1,33 @@
-import appdaemon.plugins.hass.hassapi as hass  # type: ignore
+import json
+import os
 from datetime import datetime
+from pathlib import Path
+
+import appdaemon.plugins.hass.hassapi as hass  # type: ignore
+
+# ---------------------------------------------------------------------------
+# Pure module-level function - unit-testable without an AppDaemon runtime (see
+# tests/test_intercom.py).
+# ---------------------------------------------------------------------------
+
+
+def resume_decision(record, age_s, max_age_s):
+    """Pure decision for one persisted ring record found at Intercom startup (see
+    _resume_pending_rings). `age_s` is (now - ring_ts) in seconds, computed by the
+    caller since only it knows "now".
+
+    "discard_succeeded": the ring already confirmed an unlock before the restart -
+        nothing to report, nothing to do.
+    "discard_stale": too old to still matter, or ring_ts is somehow in the future
+        (equally untrustworthy) - stay silent, just drop it.
+    "alert": within the resume window and never confirmed - the house already
+        announced "I opened it" but we don't know that it did; tell Mikkel once.
+    """
+    if record.get("succeeded"):
+        return "discard_succeeded"
+    if age_s < 0 or age_s > max_age_s:
+        return "discard_stale"
+    return "alert"
 
 
 class Intercom(hass.Hass):
@@ -18,6 +46,11 @@ class Intercom(hass.Hass):
         self.unlock_repeat_interval_s = int(self.args.get("unlock_repeat_interval_s", 7))
         self.debounce_s = int(self.args.get("debounce_s", 5))
         self.notify_target = self.args.get("notify_target", "mikkel")
+        # How stale a persisted "rang but auto-open unlock was never confirmed"
+        # record can be at startup and still be worth alerting on - older than this
+        # and the visitor is long gone, so alerting would just be noise (see
+        # _resume_pending_rings).
+        self.resume_alert_max_age_s = int(self.args.get("resume_alert_max_age_s", 60))
 
         # Messages
         self.msg_front = self.args.get("tts_message_front", "Someone is at the front door")
@@ -31,9 +64,18 @@ class Intercom(hass.Hass):
         self.last_trigger_at = {}
         self.pending_unlocks = {}  # Track scheduled unlock callbacks by entity
         self.unlock_outcomes = {}  # Per trigger entity: did any attempt of the current ring succeed
+        self._state_file = Path(__file__).with_name("intercom_state.json")
 
         # Validate entities exist
         self._validate_entities()
+
+        # Resume any ring that was persisted but never confirmed unlocked before a
+        # restart - alert-only, see _resume_pending_rings. Must run before any
+        # listen_state registration below: ZERO lock/unlock calls from initialize -
+        # the intercom bus is SHARED across all 18-19 apartments in the building, so
+        # unlocking from here with no fresh visitor context would be a real security
+        # risk, not just a UX one.
+        self._resume_pending_rings()
 
         # Build trigger map
         self.trigger_map = {}
@@ -45,7 +87,7 @@ class Intercom(hass.Hass):
                 "door_sensor": self.front_door_sensor,
                 "ring_label": "front door",
             }
-            self.listen_state(self._handle_trigger, self.front_sensor, new="on", old="off")
+            self.listen_state(self._handle_trigger, self.front_sensor, new="on")
         if self.back_sensor:
             self.trigger_map[self.back_sensor] = {
                 "message": self.msg_back,
@@ -54,7 +96,7 @@ class Intercom(hass.Hass):
                 "door_sensor": self.back_door_sensor,
                 "ring_label": "back door",
             }
-            self.listen_state(self._handle_trigger, self.back_sensor, new="on", old="off")
+            self.listen_state(self._handle_trigger, self.back_sensor, new="on")
         if self.apt_sensor:
             self.trigger_map[self.apt_sensor] = {
                 "message": self.msg_apt,
@@ -62,7 +104,7 @@ class Intercom(hass.Hass):
                 "followup": None,
                 "ring_label": "apartment door",
             }
-            self.listen_state(self._handle_trigger, self.apt_sensor, new="on", old="off")
+            self.listen_state(self._handle_trigger, self.apt_sensor, new="on")
 
         if not self.trigger_map:
             self.log("CRITICAL: No intercom sensors configured; app will be idle.", level="ERROR")
@@ -118,12 +160,101 @@ class Intercom(hass.Hass):
             else:
                 self.log(f"Validated entity {entity_id} ({name})", level="DEBUG")
 
+    def _resume_pending_rings(self):
+        """Startup-only: alert on any ring whose auto-open outcome was never
+        confirmed before a restart (see the state schema in _persist_ring).
+        ALERT-ONLY (Option A) - this never touches lock/unlock. The intercom bus is
+        shared across every apartment in the building; issuing an unlock from here
+        with no fresh visitor context would be a real security risk, not a UX one."""
+        records = self._load_ring_state()
+        now = self.get_now()
+        pruned = {}
+        for entity, record in records.items():
+            ring_ts = self._parse_ts(record.get("ring_ts"))
+            if ring_ts is None:
+                continue  # unparseable - drop
+            self.last_trigger_at[entity] = ring_ts
+            age_s = (now - ring_ts).total_seconds()
+            decision = resume_decision(record, age_s, self.resume_alert_max_age_s)
+            if decision == "alert":
+                outcome = {
+                    "ring_ts": ring_ts,
+                    "succeeded": False,
+                    "ring_label": record.get("ring_label", "door"),
+                }
+                self.log(
+                    f"Resuming unconfirmed ring on {entity} from before restart "
+                    f"({age_s:.0f}s old) - alerting only, never unlocking from init",
+                    level="INFO",
+                )
+                self._report_auto_open_failure(entity, record.get("lock_entity"), outcome)
+            # "discard_succeeded" / "discard_stale": nothing to do. Every branch here
+            # is terminal (alert also ends by discarding, via _report_auto_open_failure
+            # below), so `pruned` never gains an entry - this always ends up writing
+            # back an empty file, which is what makes the resume pass idempotent.
+        self._save_ring_state(pruned)
+
+    # ---------- ring persistence (reboot-survival; alert-only, never unlock from init) ----------
+    def _load_ring_state(self):
+        try:
+            return json.loads(self._state_file.read_text())
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            self.log(f"intercom state load failed: {e}", level="WARNING")
+            return {}
+
+    def _save_ring_state(self, records):
+        try:
+            tmp = self._state_file.with_name(self._state_file.name + ".tmp")
+            tmp.write_text(json.dumps(records))
+            os.replace(tmp, self._state_file)
+        except Exception as e:
+            self.log(f"intercom state save failed: {e}", level="WARNING")
+
+    def _persist_ring(self, entity, ring_ts, ring_label, lock_entity):
+        """Write point (a): a ring just entered the auto-open branch. Called AFTER
+        unlock scheduling and BEFORE TTS (see _handle_trigger) so the latency-
+        sensitive unlock timers are never delayed by a disk write."""
+        records = self._load_ring_state()
+        records[entity] = {
+            "ring_ts": ring_ts.isoformat(),
+            "ring_label": ring_label,
+            "lock_entity": lock_entity,
+            "succeeded": False,
+        }
+        self._save_ring_state(records)
+
+    def _mark_ring_succeeded(self, entity):
+        """Write point (b): the first successful unlock verification of this ring."""
+        records = self._load_ring_state()
+        if entity in records:
+            records[entity]["succeeded"] = True
+            self._save_ring_state(records)
+
+    def _forget_ring(self, entity):
+        """Write point (c), terminal: all unlock attempts exhausted with no success
+        (real-time failure, or a discarded resume-time record). Idempotent - safe to
+        call even if no record exists for `entity`."""
+        records = self._load_ring_state()
+        records.pop(entity, None)
+        self._save_ring_state(records)
+
+    @staticmethod
+    def _parse_ts(raw):
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+
     def _debounced(self, entity):
         """Check if entity trigger should be debounced."""
         last_ts = self.last_trigger_at.get(entity)
         if not last_ts:
             return False
-        elapsed = (datetime.now() - last_ts).total_seconds()
+        elapsed = (self.get_now() - last_ts).total_seconds()
         return elapsed < self.debounce_s
 
     def _cancel_pending_unlocks(self, entity):
@@ -153,10 +284,16 @@ class Intercom(hass.Hass):
 
     def _handle_trigger(self, entity, attr, old, new, kwargs):
         """Handle doorbell sensor trigger."""
-        # Only process transitions from off to on
-        if old != "off" or new != "on":
-            self.log(f"Ignoring non-transition trigger from {entity} (old={old}, new={new})", level="DEBUG")
+        # Any edge landing on "on" is a ring worth announcing - including a replay
+        # from unavailable/unknown/None (e.g. a Zigbee/network blip, or an AD/HA
+        # restart replaying retained state). Only a CLEAN off->on edge is trusted
+        # enough to schedule an unlock (see clean_edge below and the auto_open_enabled
+        # gate); a replay edge still gets the TTS/house-feed announcement, just never
+        # the unlock.
+        if new != "on":
+            self.log(f"Ignoring non-'on' trigger from {entity} (old={old}, new={new})", level="DEBUG")
             return
+        clean_edge = (old == "off")
 
         info = self.trigger_map.get(entity)
         if not info:
@@ -166,17 +303,23 @@ class Intercom(hass.Hass):
             self.log(f"Debounced trigger from {entity}", level="DEBUG")
             return
 
-        self.last_trigger_at[entity] = datetime.now()
-        self.log(f"Ring detected from {entity}", level="INFO")
+        self.last_trigger_at[entity] = self.get_now()
+        self.log(f"Ring detected from {entity} (clean_edge={clean_edge}, old={old})", level="INFO")
 
         # Cancel any pending unlocks for this entity (new trigger takes precedence)
         self._cancel_pending_unlocks(entity)
 
-        # Check if auto-open is enabled before deciding which message to send
+        if not clean_edge:
+            self.log(f"Replay edge on {entity} (old={old} -> on) - announcing only, never "
+                     f"scheduling an unlock from a non-clean edge", level="INFO")
+
+        # Check if auto-open is enabled before deciding which message to send.
+        # clean_edge gates this: auto-open UNLOCK scheduling only ever happens on a
+        # genuine off->on edge (see the guard above).
         auto_open_enabled = False
         lock_entity = None
-        
-        if self.auto_open_entity and info.get("lock"):
+
+        if clean_edge and self.auto_open_entity and info.get("lock"):
             auto_open_state = self.get_state(self.auto_open_entity)
             if auto_open_state in ["on", True]:
                 lock_entity = info.get("lock")
@@ -245,6 +388,11 @@ class Intercom(hass.Hass):
                 )
                 handle_ref[0] = handle  # Store handle for removal in callback
                 self.pending_unlocks[entity].append(handle)
+
+            # Persist AFTER scheduling, BEFORE TTS (same latency-first ordering as
+            # above - see _persist_ring) so a restart before any attempt is verified
+            # can still alert on resume instead of silently forgetting the ring.
+            self._persist_ring(entity, ring_ts, info.get("ring_label", "door"), lock_entity)
 
         # Send TTS - combined message if auto-open enabled, otherwise just initial message.
         # Offloaded to AppDaemon's executor pool (submit_to_executor): SonosNotifier.notify()
@@ -383,6 +531,8 @@ class Intercom(hass.Hass):
             first_success = outcome is not None and not outcome.get("succeeded")
             if outcome is not None:
                 outcome["succeeded"] = True
+            if first_success:
+                self._mark_ring_succeeded(trigger_entity)
             self.log(f"OK: Successfully unlocked {lock_entity} (attempt {unlock_attempt})", level="INFO")
             # Check door state after unlock for additional verification
             if door_sensor:
@@ -450,6 +600,7 @@ class Intercom(hass.Hass):
         """All unlock attempts for a ring failed: log, mobile-notify, house feed."""
         ring_label = outcome.get("ring_label", "door")
         self.unlock_outcomes.pop(trigger_entity, None)
+        self._forget_ring(trigger_entity)  # write point (c), terminal - idempotent
         self.log(
             f"AUTO-OPEN FAILED: {self.unlock_repeat_count} unlock attempt(s) on {lock_entity} got no response after {ring_label} ring",
             level="ERROR",
