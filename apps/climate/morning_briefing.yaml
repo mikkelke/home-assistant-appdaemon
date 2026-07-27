@@ -18,6 +18,8 @@
 MorningBriefing:
   module: morning_briefing
   class: MorningBriefing
+  # Init-order guarantee for get_app("MobileNotifier") cached in initialize(); also reloads this app when MobileNotifier reloads.
+  dependencies: MobileNotifier
 
   motion_entity: binary_sensor.bedroom_pir_presence
   bed_entities:

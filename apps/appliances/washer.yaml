@@ -261,6 +261,8 @@ washer_monitor:
   module: washer_monitor
   class: WasherMonitor
   log: washer_monitor_log
+  # Init-order guarantee for get_app("SonosNotifier") cached in initialize(); also reloads this app when SonosNotifier reloads.
+  dependencies: SonosNotifier
 
   # Optional: timezone for timestamp attributes and logs. If unset, uses time_zone from appdaemon.yaml.
   timezone: "Europe/Copenhagen"

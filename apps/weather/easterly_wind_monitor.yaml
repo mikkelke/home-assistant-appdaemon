@@ -6,6 +6,8 @@ EasterlyWindMonitor:
   module: easterly_wind_monitor
   class: EasterlyWindMonitor
   log: easterly_wind_monitor_log
+  # Init-order guarantee for get_app("MobileNotifier") cached in initialize(); also reloads this app when MobileNotifier reloads.
+  dependencies: MobileNotifier
 
   # GW2000A sensors
   wind_direction_entity: "sensor.gw2000a_wind_direction"

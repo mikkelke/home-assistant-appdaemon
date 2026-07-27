@@ -36,6 +36,8 @@ dishwasher_monitor:
   module: dishwasher_monitor
   class: DishwasherMonitor
   log: dishwasher_monitor_log
+  # Init-order guarantee for get_app("SonosNotifier") cached in initialize(); also reloads this app when SonosNotifier reloads.
+  dependencies: SonosNotifier
 
   # Core entities (WiFi plug: AP/firmware updates can cause unavailable + delayed/bursty readings — not real load spikes)
   power_sensor: "sensor.athom_smart_plug_v3_50ec44_power"

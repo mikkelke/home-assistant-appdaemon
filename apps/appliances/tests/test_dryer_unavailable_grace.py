@@ -357,5 +357,108 @@ class RestoreReArmsWatchdogs(unittest.TestCase):
         self.assertTrue(any("unemptied watchdog" in str(a[0]).lower() for a in debug_logs))
 
 
+def make_full_init_app(sensor_state, helper_state, ui_state_entity="input_select.dryer_state"):
+    """DryerMonitor with initialize() run for real (heavier than make_app/make_restore_app
+    above, but the sensor-missing -> ui_state_select seed fallback lives inline at the top of
+    initialize(), before any restore is dispatched, so there is no smaller real entry point to
+    call directly). feedback_file/programmes_file point at nonexistent paths so initialize()
+    falls back to built-in defaults instead of touching real repo data files."""
+    app = dm.DryerMonitor.__new__(dm.DryerMonitor)
+    app.args = {
+        "power_sensor": "sensor.dryer_plug_power",
+        "energy_sensor": "sensor.dryer_plug_energy",
+        "door_sensor": "binary_sensor.dryer_door_contact",
+        "state_entity": "sensor.dryer_state",
+        "ui_state_entity": ui_state_entity,
+        "start_w": 8,
+        "stop_w": 5,
+        "run_for": 60,
+        "stop_for": 60,
+        "feedback_file": "/nonexistent/dryer_feedback_test.json",
+        "programmes_file": "/nonexistent/dryer_programmes_test.yaml",
+    }
+    app.states = {
+        "sensor.dryer_state": sensor_state,
+        # Keeps bootstrap on the simple plug-outage-grace path (avoids pulling in _power_changed).
+        "sensor.dryer_plug_power": "unavailable",
+    }
+    if ui_state_entity:
+        app.states[ui_state_entity] = helper_state
+
+    app.log_calls = []
+    app.log = lambda *a, **kw: app.log_calls.append((a, kw))
+    app.get_state = lambda entity, **kw: app.states.get(entity)
+    app.get_app = lambda name: None
+    app.listen_state = lambda *a, **kw: None
+    app.call_service = lambda *a, **kw: None
+    app.timer_running = lambda handle: False
+
+    app.scheduled = []
+
+    def run_in(cb, delay, **kw):
+        handle = object()
+        app.scheduled.append((cb, delay, kw))
+        return handle
+
+    app.run_in = run_in
+
+    app.restore_calls = []
+    app._restore_running_state = lambda: app.restore_calls.append("running")
+    app._restore_unemptied_state = lambda: app.restore_calls.append("unemptied")
+
+    app.set_state_calls = []
+
+    def set_state_entity(**kw):
+        app.set_state_calls.append(kw)
+        if "state" in kw:
+            app.states[app.state_entity] = kw["state"]
+
+    app._set_state_entity = set_state_entity
+    return app
+
+
+class StateHelperSeedFallback(unittest.TestCase):
+    """HA restarts erase the AD-store-backed state sensor but not the input_select UI mirror
+    (survives via HA's own restore_state); initialize() falls back to it when the sensor itself
+    reads None/unknown/unavailable, so a helper-seeded state still reaches the SAME restore
+    branch a real sensor read would. washer_monitor.py and dishwasher_monitor.py carry the
+    identical fallback (not separately covered here)."""
+
+    def test_missing_sensor_seeds_running_from_helper_and_invokes_restore(self):
+        app = make_full_init_app(sensor_state=None, helper_state="Running")
+        app.initialize()
+        self.assertEqual(app.state, "Running")
+        self.assertEqual(app.restore_calls, ["running"])
+        seed_logs = [
+            a for a, kw in app.log_calls
+            if kw.get("level") == "INFO" and "seeded" in str(a[0]).lower()
+        ]
+        self.assertTrue(seed_logs)
+        self.assertIn("input_select.dryer_state", str(seed_logs[0][0]))
+
+    def test_missing_sensor_seeds_unemptied_from_helper_and_invokes_restore(self):
+        app = make_full_init_app(sensor_state="unavailable", helper_state="Unemptied")
+        app.initialize()
+        self.assertEqual(app.state, "Unemptied")
+        self.assertEqual(app.restore_calls, ["unemptied"])
+
+    def test_present_sensor_ignores_helper(self):
+        """Sensor already has a valid state - the helper (even a differing one) must never
+        override it."""
+        app = make_full_init_app(sensor_state="Paused", helper_state="Running")
+        app.initialize()
+        self.assertEqual(app.state, "Paused")
+        seed_logs = [a for a, kw in app.log_calls if "seeded" in str(a[0]).lower()]
+        self.assertEqual(seed_logs, [])
+
+    def test_missing_sensor_and_invalid_helper_falls_back_to_off(self):
+        app = make_full_init_app(sensor_state="unknown", helper_state="unknown")
+        app.initialize()
+        self.assertEqual(app.state, "Off")
+        self.assertEqual(app.restore_calls, [])
+        seed_logs = [a for a, kw in app.log_calls if "seeded" in str(a[0]).lower()]
+        self.assertEqual(seed_logs, [])
+
+
 if __name__ == "__main__":
     unittest.main()

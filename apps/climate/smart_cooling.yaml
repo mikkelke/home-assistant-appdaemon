@@ -12,6 +12,8 @@
 SmartCooling:
   module: smart_cooling
   class: SmartCooling
+  # Init-order guarantee for get_app("MobileNotifier") cached in initialize(); also reloads this app when MobileNotifier reloads.
+  dependencies: MobileNotifier
 
   # entities (these match the code defaults; listed for clarity)
   climate_entity: climate.air_conditioner_thermostat

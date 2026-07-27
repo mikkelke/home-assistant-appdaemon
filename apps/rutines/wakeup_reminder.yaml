@@ -7,6 +7,8 @@ WakeupReminder:
   class: WakeupReminder
   log: wakeup_reminder_log
   log_level: INFO
+  # Init-order guarantee for get_app("MobileNotifier") cached in initialize(); also reloads this app when MobileNotifier reloads.
+  dependencies: MobileNotifier
 
   # Person entity to check
   person_mikkel: "person.mikkel"

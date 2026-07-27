@@ -6,6 +6,8 @@ rober2_control:
   log: rober2_log
   # Notifications are handled by MobileNotifier app
   # Configure MobileNotifier in apps/notify/mobile_notifier.yaml
+  # Init-order guarantee for get_app("MobileNotifier") cached in initialize(); also reloads this app when MobileNotifier reloads.
+  dependencies: MobileNotifier
   # Physical room name reported by sensor.rober2_current_room when robot is docked
   dock_room_name: "Kitchen1"
   # Master on/off for scheduled cleaning (off = automation disabled; separate from rober2_automation_paused errors)

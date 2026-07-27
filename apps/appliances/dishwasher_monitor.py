@@ -274,6 +274,14 @@ class DishwasherMonitor(hass.Hass):
         # Restore previous state
         existing = self.get_state(self.state_entity)
         valid_states = ("Running", "Unemptied", "Paused", "Emptied", "Error")
+        if existing in (None, "unknown", "unavailable") and self.ui_state_select:
+            helper_state = self.get_state(self.ui_state_select)
+            if helper_state in valid_states:
+                self.log(
+                    f"State seeded from {self.ui_state_select} - sensor was missing (HA restart?)",
+                    level="INFO",
+                )
+                existing = helper_state
         self.state = existing if existing in valid_states else "Off"
         self._set_state_entity( state=self.state)
         if self.state == "Unemptied":

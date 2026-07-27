@@ -7,6 +7,8 @@
 BedroomDoorWatch:
   module: bedroom_door_watch
   class: BedroomDoorWatch
+  # Init-order guarantee for get_app("MobileNotifier") cached in initialize(); also reloads this app when MobileNotifier reloads.
+  dependencies: MobileNotifier
   door_sensor: binary_sensor.bedroom_door_contact
   smart_cooling_entity: input_boolean.smart_cooling
   ac_climate_entity: climate.air_conditioner_thermostat

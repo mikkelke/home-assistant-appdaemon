@@ -11,6 +11,8 @@ ClimateAlarm:
   module: climate_alarm
   class: ClimateAlarm
   log: climate_alarm_log
+  # Init-order guarantee for get_app("MobileNotifier") cached in initialize(); also reloads this app when MobileNotifier reloads.
+  dependencies: MobileNotifier
   # Restart survival (last_notify_at cooldown, snooze_until) - see climate_alarm.py's
   # _load_state/_save_state.
   state_file: /conf/apps/climate/climate_alarm_state.json

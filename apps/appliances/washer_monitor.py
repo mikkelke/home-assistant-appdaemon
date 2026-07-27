@@ -650,6 +650,16 @@ class WasherMonitor(hass.Hass):
         # Restore previous state
         existing = self.get_state(self.state_entity)
         valid_states = ("Running", "Unemptied", "Paused", "Emptied")
+        seeded_from_helper = False
+        if existing in (None, "unknown", "unavailable") and self.ui_state_select:
+            helper_state = self.get_state(self.ui_state_select)
+            if helper_state in valid_states:
+                self.log(
+                    f"State seeded from {self.ui_state_select} - sensor was missing (HA restart?)",
+                    level="INFO",
+                )
+                existing = helper_state
+                seeded_from_helper = True
         self.state = existing if existing in valid_states else "Off"
         recovery_off_to_running = False
         # HA restart (or recorder glitch) can leave sensor Off while the washer is actually drawing start power.
@@ -669,7 +679,8 @@ class WasherMonitor(hass.Hass):
                 recovery_off_to_running = True
 
         # Only publish when state differs. Re-sending the same state can strip attributes on some HA/AppDaemon setups.
-        if self.state != existing:
+        # (seeded_from_helper always publishes: the state entity itself is still missing/unknown.)
+        if self.state != existing or seeded_from_helper:
             if recovery_off_to_running:
                 try:
                     full = self.get_state(self.state_entity, attribute="all") or {}

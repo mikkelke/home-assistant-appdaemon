@@ -29,6 +29,8 @@ dryer_monitor:
   module: dryer_monitor
   class: DryerMonitor
   log: dryer_monitor_log
+  # Init-order guarantee for get_app("SonosNotifier") cached in initialize(); also reloads this app when SonosNotifier reloads.
+  dependencies: SonosNotifier
 
   # Core entities
   power_sensor: "sensor.dryer_plug_power"

@@ -7,6 +7,8 @@ RadioWatchdog:
   module: radio_watchdog
   class: RadioWatchdog
   log: sonos_log
+  # Init-order guarantee for get_app("MobileNotifier") cached in initialize(); also reloads this app when MobileNotifier reloads.
+  dependencies: MobileNotifier
   players:
     - media_player.living_room_2
     - media_player.kitchen_2

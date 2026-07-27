@@ -8,6 +8,8 @@
 DeployAdvisor:
   module: deploy_advisor
   class: DeployAdvisor
+  # Init-order guarantee for get_app("MobileNotifier") cached in initialize(); also reloads this app when MobileNotifier reloads.
+  dependencies: MobileNotifier
   floor_sensor: sensor.bedroom_floor_thermometer_temperature
   mid_sensor: sensor.bedroom_temperature
   kitchen_sensor: sensor.kitchen_temperature

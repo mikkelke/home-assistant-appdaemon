@@ -4,6 +4,10 @@ Intercom:
   module: intercom
   class: Intercom
   log: intercom_log
+  # Init-order guarantee for get_app("SonosNotifier")/get_app("MobileNotifier") cached in initialize(); also reloads this app when either notifier reloads.
+  dependencies:
+    - SonosNotifier
+    - MobileNotifier
 
   # Sensors
   front_sensor: "binary_sensor.intercomproxy_doorbell_front_door"

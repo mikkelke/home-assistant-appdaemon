@@ -6,6 +6,8 @@
 LockHealth:
   module: lock_health
   class: LockHealth
+  # Init-order guarantee for get_app("MobileNotifier") cached in initialize(); also reloads this app when MobileNotifier reloads.
+  dependencies: MobileNotifier
   lock_bt: lock.yale_bt
   lock_cloud: lock.yale
   bridge_ping: binary_sensor.yale_bridge
