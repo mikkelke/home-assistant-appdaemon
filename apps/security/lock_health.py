@@ -62,6 +62,7 @@ RELOAD_WAIT_S = 120
 POWER_CYCLE_WAIT_S = 180
 PLUG_OFF_WAIT_S = 12
 PLUG_SAFETY_CHECK_S = 60
+PLUG_VERIFY_WAIT_S = 45
 
 # Self-induced suppression windows: don't let our OWN action look like fresh evidence
 # of the same problem (see the module docstring's "never leave the plug off" sibling
@@ -244,7 +245,12 @@ class LockHealth(hass.Hass):
 
         self.divergence_heal_minutes = float(a("divergence_heal_minutes", 4))
         self.invalid_heal_minutes = float(a("invalid_heal_minutes", 5))
-        self.bridge_down_heal_seconds = float(a("bridge_down_heal_seconds", 90))
+        # The bridge's own ~6-hourly reconnect blip self-heals in ~73 s (measured
+        # 07-24..07-27, post-move, WITHOUT any power-cycling) - the trigger must sit
+        # well clear of that so routine blips never earn a cycle.
+        self.bridge_down_heal_seconds = float(a("bridge_down_heal_seconds", 150))
+        self.plug_power_entity = a("plug_power_entity", "sensor.extender_electric_consumption_w")
+        self.plug_power_floor_w = float(a("plug_power_floor_w", 0.5))
         self.settle_guard_seconds = float(a("settle_guard_seconds", 45))
         self.startup_grace_seconds = float(a("startup_grace_seconds", 150))
         self.action_cooldown_minutes = float(a("action_cooldown_minutes", 5))
@@ -280,7 +286,7 @@ class LockHealth(hass.Hass):
         self._clear_since = {"divergence": None, "ble_invalid": None, "cloud_invalid": None, "bridge_down": None}
         self._notified = {"divergence": False, "ble_invalid": False, "cloud_invalid": False,
                            "bridge_down": False, "flapping_ble": False, "flapping_cloud": False,
-                           "plug_unavailable": False}
+                           "plug_unavailable": False, "plug_unresponsive": False, "plug_no_load": False}
         self._reload_history = []
         self._plug_cycle_history = []
         self._last_action_at = None
@@ -745,6 +751,10 @@ class LockHealth(hass.Hass):
             self._gave_up(issue)
             return
         self._heal_stage = "power_cycle"
+        # Snapshot the witnesses BEFORE toggling: the plug's own switch state and its
+        # power meter. Both are compared after the cycle by _plug_cycle_verify.
+        pre_switch_lc = self.get_state(self.bridge_plug, attribute="last_changed")
+        pre_meter_lu = self.get_state(self.plug_power_entity, attribute="last_updated")
         self.call_service("switch/turn_off", entity_id=self.bridge_plug)
         self._plug_cycle_history.append(now)
         self._last_power_cycle_at = now
@@ -756,6 +766,8 @@ class LockHealth(hass.Hass):
         # ladder's own progress tracking below - they must fire even if the ladder is
         # aborted/cancelled in the meantime. Never leave the bridge unpowered.
         self.run_in(self._plug_turn_on, PLUG_OFF_WAIT_S)
+        self.run_in(self._plug_cycle_verify, PLUG_VERIFY_WAIT_S,
+                    pre_switch_lc=pre_switch_lc, pre_meter_lu=pre_meter_lu)
         self._ladder_handle = self.run_in(self._after_power_cycle, POWER_CYCLE_WAIT_S, issue=issue)
 
     def _after_power_cycle(self, kwargs):
@@ -777,6 +789,52 @@ class LockHealth(hass.Hass):
             self.log("LockHealth: bridge plug still not on after power-cycle - forcing on again "
                      "(never leave the bridge unpowered)", level="ERROR")
             self.call_service("switch/turn_on", entity_id=self.bridge_plug)
+
+    def _plug_cycle_verify(self, kwargs):
+        """Best-effort check that a power-cycle actually happened. The Z-Wave plug can
+        swallow commands while HA keeps reading a stale 'on' (2026-07-27 16:02: that
+        'cycle' was a silent no-op and the ladder gave up against a bridge that was
+        never actually cycled). The plug's power meter is the one witness that cannot
+        lie about current flowing - but its Z-Wave reports are sparse, so a silent
+        meter is only damning when the switch entity ALSO never moved."""
+        try:
+            switch_moved = self.get_state(self.bridge_plug, attribute="last_changed") != kwargs.get("pre_switch_lc")
+            meter_reported = (self.get_state(self.plug_power_entity, attribute="last_updated")
+                              != kwargs.get("pre_meter_lu"))
+            watts = self._as_float(self.get_state(self.plug_power_entity))
+            if meter_reported and watts is not None and watts >= self.plug_power_floor_w:
+                self._notified["plug_unresponsive"] = False
+                self._notified["plug_no_load"] = False
+                self.log(f"LockHealth: power-cycle verified - bridge drawing {watts:.1f} W", level="INFO")
+            elif meter_reported and watts is not None:
+                self.log(f"LockHealth: plug cycled but the load draws only {watts:.1f} W", level="WARNING")
+                if not self._notified.get("plug_no_load"):
+                    self._notified["plug_no_load"] = True
+                    self.create_task(self._notify(
+                        "The Yale bridge plug power-cycled, but the bridge draws no power - its "
+                        "power adapter (or the bridge itself) may be dead."))
+            elif not switch_moved:
+                self.log("LockHealth: power-cycle left no trace - switch never changed state and the "
+                         "meter never reported; the Z-Wave plug likely swallowed the commands",
+                         level="WARNING")
+                if not self._notified.get("plug_unresponsive"):
+                    self._notified["plug_unresponsive"] = True
+                    self.create_task(self._notify(
+                        "Tried to power-cycle the Yale bridge, but the Z-Wave plug did not react - "
+                        "the cycle probably never happened. The plug may need attention."))
+            else:
+                self.log("LockHealth: power-cycle verify inconclusive (switch toggled, meter silent - "
+                         "sparse Z-Wave reporting)", level="DEBUG")
+            self._save_state()
+        except Exception as e:
+            self.log(f"plug cycle verify failed: {e}", level="DEBUG")
+
+    @staticmethod
+    def _as_float(raw):
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
 
     def _condition_active(self, issue):
         """Re-verify (never assume success) that `issue` is STILL the real problem."""

@@ -16,7 +16,9 @@ LockHealth:
   notify_target: mikkel
   divergence_heal_minutes: 4
   invalid_heal_minutes: 5
-  bridge_down_heal_seconds: 90
+  bridge_down_heal_seconds: 150
+  plug_power_entity: sensor.extender_electric_consumption_w
+  plug_power_floor_w: 0.5
   settle_guard_seconds: 45
   startup_grace_seconds: 150
   action_cooldown_minutes: 5
