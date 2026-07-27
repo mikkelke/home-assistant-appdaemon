@@ -3,6 +3,13 @@
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 import threading
 
+# Reset handshake (sonos_reset_requested/_started -> ... -> sonos_reset_completed) can wedge
+# _reset_in_progress True forever if a handshake event is lost (e.g. HA restart mid-reset). Self-heal
+# after this many seconds - see _arm_reset_wedge_timer. Same idea as the group-op (30s) and
+# family-zone-sync (15s) stuck-guards below, but this flag is only re-checked on the next event, so
+# it needs its own timer rather than a lazy elapsed-time check.
+RESET_WEDGE_TIMEOUT_S = 120
+
 class SonosGroupManager(hass.Hass):
     """
     Comprehensive Sonos group management that:
@@ -76,6 +83,8 @@ class SonosGroupManager(hass.Hass):
         self._pending_reset = None
         self._reset_resume_handle = None
         self._reset_generation = 0
+        # Guard: self-heal _reset_in_progress if the state_reset handshake wedges (RESET_WEDGE_TIMEOUT_S)
+        self._reset_wedge_timer = None
         # thread synchronization
         self.lock = threading.Lock()
         self._pending_unjoin_checks = set() # Stores entity_ids of speakers we are waiting to see become solo after an unjoin
@@ -808,6 +817,7 @@ class SonosGroupManager(hass.Hass):
         """Handle State Reset request - exclusive pause: flush queued work, block new group logic."""
         self.log("Scenario: reset_requested -> exclusive pause for group management", level="INFO")
         self._reset_in_progress = True
+        self._arm_reset_wedge_timer()
         if self._reset_resume_handle is not None:
             self._safe_cancel_timer(self._reset_resume_handle)
             self._reset_resume_handle = None
@@ -839,6 +849,7 @@ class SonosGroupManager(hass.Hass):
         """Handle State Reset starting - Ensure group management is paused"""
         self.log("Scenario: reset_started -> group management paused", level="INFO")
         self._reset_in_progress = True
+        self._arm_reset_wedge_timer()
         if self._reset_resume_handle is not None:
             self._safe_cancel_timer(self._reset_resume_handle)
             self._reset_resume_handle = None
@@ -872,6 +883,7 @@ class SonosGroupManager(hass.Hass):
             return
         self._reset_resume_handle = None
         self.log("Scenario: reset_resume -> clearing _reset_in_progress, scheduling evaluation", level="INFO")
+        self._clear_reset_wedge_timer()
         self._reset_in_progress = False
         self._pending_reset = None
         self._maybe_trigger("reset_completed_delayed", None, None, None)
@@ -895,6 +907,27 @@ class SonosGroupManager(hass.Hass):
         except Exception as e:
             self.log(f"Error checking/cancelling timer: {e}", level="DEBUG")
             return False
+
+    def _arm_reset_wedge_timer(self):
+        """Guard against a lost sonos_reset_ready/sonos_reset_completed handshake with state_reset
+        (e.g. an HA restart mid-reset) wedging _reset_in_progress True forever, which would
+        permanently block group operations, family-zone sync, and evaluation."""
+        self._clear_reset_wedge_timer()
+        self._reset_wedge_timer = self.run_in(self._on_reset_wedge_timeout, RESET_WEDGE_TIMEOUT_S)
+
+    def _clear_reset_wedge_timer(self):
+        """Cancel the wedge guard on the normal handshake path (_resume_after_reset)."""
+        if self._reset_wedge_timer is not None:
+            self._safe_cancel_timer(self._reset_wedge_timer)
+            self._reset_wedge_timer = None
+
+    def _on_reset_wedge_timeout(self, kwargs=None):
+        """Fires only if the reset handshake never completed within RESET_WEDGE_TIMEOUT_S."""
+        self._reset_wedge_timer = None
+        if self._reset_in_progress:
+            self.log("reset handshake timed out - clearing wedge", level="WARNING")
+            self._reset_in_progress = False
+            self._pending_reset = None
 
     def _maybe_trigger(self, trigger_id, entity, old=None, new=None):
         # Skip evaluation if reset is in progress

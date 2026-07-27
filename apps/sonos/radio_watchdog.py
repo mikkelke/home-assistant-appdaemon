@@ -28,6 +28,22 @@ def looks_like_radio(content_id):
     return any(m in cid for m in RADIO_MARKERS)
 
 
+def _parse_last_changed(value):
+    """Parse HA's last_changed into a naive local datetime comparable to datetime.now()
+    (mirrors the naive-local convention _playing_since already uses). Returns None if
+    value is missing or unparseable."""
+    if not value:
+        return None
+    s = str(value).strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
 class RadioWatchdog(hass.Hass):
     def initialize(self):
         a = self.args.get
@@ -46,6 +62,29 @@ class RadioWatchdog(hass.Hass):
 
         for p in self.players:
             self.listen_state(self._on_player, p, player=p)
+
+        self._seed_playing_state()
+
+    def _seed_playing_state(self):
+        """Seed _playing_since/_last_content for players already playing at app start.
+
+        Those dicts are otherwise only populated by _on_player state-change callbacks, so a
+        stream already playing across an AD restart (which kills all in-memory state but not
+        playback) has no entry - _check_dead_async then bails and the watchdog stays blind
+        until a human restarts the stream.
+        """
+        for p in self.players:
+            if self.get_state(p) != "playing":
+                continue
+            since = _parse_last_changed(self.get_state(p, attribute="last_changed")) or datetime.now()
+            self._playing_since[p] = since
+            cid = self.get_state(p, attribute="media_content_id")
+            if cid:
+                self._last_content[p] = cid
+            self.log(
+                f"seeded playing state for {p}: since={since} content={cid!r}",
+                level="DEBUG",
+            )
 
     def _on_player(self, entity, attribute, old, new, kwargs):
         player = kwargs.get("player") or entity

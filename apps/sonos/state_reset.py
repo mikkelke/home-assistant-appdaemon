@@ -2,6 +2,11 @@
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore 
 
+# Reset handshake (sonos_reset_requested -> sonos_reset_ready -> sonos_reset_completed) can wedge
+# _reset_in_progress True forever if a handshake event is lost (e.g. HA restart mid-reset). Self-heal
+# after this many seconds - see _arm_reset_wedge_timer.
+RESET_WEDGE_TIMEOUT_S = 120
+
 class SonosStateReset(hass.Hass):
     """
     AppDaemon port of the "Sonos state reset" automation:
@@ -48,6 +53,7 @@ class SonosStateReset(hass.Hass):
         self.reset_solo_poll_sec  = float(self.args.get("reset_solo_poll_seconds", 1.0))
         self.reset_solo_max_polls = int(self.args.get("reset_solo_max_poll_attempts", 15))
         self._reset_in_progress = False  # Track if a reset is in progress
+        self._reset_wedge_timer = None  # Guard: self-heal _reset_in_progress if handshake wedges (RESET_WEDGE_TIMEOUT_S)
         self._inactivity_timers = {}  # Track inactivity timers for each speaker
         # Generation counters to invalidate stale timers without cancelling (avoids invalid-handle warnings)
         self._inactivity_generation = {}
@@ -239,6 +245,28 @@ class SonosStateReset(hass.Hass):
         except Exception as e:
             self.log(f"Error checking/cancelling timer: {e}", level="DEBUG")
             return False
+
+    def _arm_reset_wedge_timer(self):
+        """Guard against a lost sonos_reset_ready/sonos_reset_completed handshake (e.g. an HA
+        restart mid-reset) wedging _reset_in_progress True forever, which would permanently skip
+        auto/manual resets and disable the immediate-unmute safety nets. Same stuck-guard idea as
+        GroupManager's group-op/family-zone-sync timeouts."""
+        self._clear_reset_wedge_timer()
+        self._reset_wedge_timer = self.run_in(self._on_reset_wedge_timeout, RESET_WEDGE_TIMEOUT_S)
+
+    def _clear_reset_wedge_timer(self):
+        """Cancel the wedge guard on the normal handshake path (ready-with-no-targets or finish)."""
+        if self._reset_wedge_timer is not None:
+            self._safe_cancel_timer(self._reset_wedge_timer)
+            self._reset_wedge_timer = None
+
+    def _on_reset_wedge_timeout(self, kwargs=None):
+        """Fires only if the reset handshake never completed within RESET_WEDGE_TIMEOUT_S."""
+        self._reset_wedge_timer = None
+        if self._reset_in_progress:
+            self.log("reset handshake timed out - clearing wedge", level="WARNING")
+            self._reset_in_progress = False
+            self._active_reset_ctx = None
 
     def _parse_muted(self, val):
         if val is None:
@@ -501,17 +529,27 @@ class SonosStateReset(hass.Hass):
 
         self.log(msg, level="INFO")
         self._reset_in_progress = True
+        self._arm_reset_wedge_timer()
         self.log("Waiting for Group Manager to pause (listening for sonos_reset_ready)...", level="INFO")
-        self.fire_event("sonos_reset_requested", 
-                       targets=targets,
-                       trigger=trigger,
-                       source=source)
+        try:
+            self.fire_event("sonos_reset_requested",
+                           targets=targets,
+                           trigger=trigger,
+                           source=source)
+        except Exception as e:
+            # Nothing will ever answer this reset - clear the wedge immediately instead of
+            # waiting the full RESET_WEDGE_TIMEOUT_S for the guard timer to catch it.
+            self.log(f"reset_phase_error -> failed to fire sonos_reset_requested: {e}", level="ERROR")
+            self._clear_reset_wedge_timer()
+            self._active_reset_ctx = None
+            self._reset_in_progress = False
 
     def _on_reset_ready(self, event_name, data, kwargs):
         """Run when Group Manager has paused and fired sonos_reset_ready. Execute reset with event data."""
         payload = data or {}
         if not payload.get("targets"):
             self.log("sonos_reset_ready received with no targets, skipping execute", level="WARNING")
+            self._clear_reset_wedge_timer()
             self._reset_in_progress = False
             return
         self.log("Received sonos_reset_ready, executing reset", level="INFO")
@@ -683,6 +721,7 @@ class SonosStateReset(hass.Hass):
             except Exception:
                 pass
         finally:
+            self._clear_reset_wedge_timer()
             self._active_reset_ctx = None
             self._reset_in_progress = False
 

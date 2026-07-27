@@ -1,6 +1,11 @@
 # /conf/apps/sonos/follow_me.py
 import appdaemon.plugins.hass.hassapi as hass   # type: ignore
 
+# Reset handshake (sonos_reset_started -> ... -> sonos_reset_completed) can wedge
+# _reset_in_progress True forever if a handshake event is lost (e.g. HA restart mid-reset). Self-heal
+# after this many seconds - see _arm_reset_wedge_timer.
+RESET_WEDGE_TIMEOUT_S = 120
+
 class SonosFollowMe(hass.Hass):
     """
     Follow-me rules engine: mute/unmute speakers by room presence.
@@ -29,6 +34,8 @@ class SonosFollowMe(hass.Hass):
         self._reset_in_progress = False
         self._reset_resume_handle = None
         self._fm_reset_generation = 0
+        # Guard: self-heal _reset_in_progress if the state_reset handshake wedges (RESET_WEDGE_TIMEOUT_S)
+        self._reset_wedge_timer = None
         
         # Track last non-zero volume per speaker for AirPlay restore
         self._last_nonzero_volume = {}
@@ -104,6 +111,26 @@ class SonosFollowMe(hass.Hass):
         except Exception as e:
             self.log(f"Error checking/cancelling timer: {e}", level="DEBUG")
             return False
+
+    def _arm_reset_wedge_timer(self):
+        """Guard against a lost sonos_reset_completed handshake with state_reset (e.g. an HA
+        restart mid-reset) wedging _reset_in_progress True forever, which would permanently pause
+        follow_me mute/unmute."""
+        self._clear_reset_wedge_timer()
+        self._reset_wedge_timer = self.run_in(self._on_reset_wedge_timeout, RESET_WEDGE_TIMEOUT_S)
+
+    def _clear_reset_wedge_timer(self):
+        """Cancel the wedge guard on the normal handshake path (_delayed_reset_sync)."""
+        if self._reset_wedge_timer is not None:
+            self._safe_cancel_timer(self._reset_wedge_timer)
+            self._reset_wedge_timer = None
+
+    def _on_reset_wedge_timeout(self, kwargs=None):
+        """Fires only if the reset handshake never completed within RESET_WEDGE_TIMEOUT_S."""
+        self._reset_wedge_timer = None
+        if self._reset_in_progress:
+            self.log("reset handshake timed out - clearing wedge", level="WARNING")
+            self._reset_in_progress = False
 
     def _on_volume_level_change(self, entity, attribute, old, new, kwargs):
         """Track last non-zero volume per speaker for AirPlay restore. When AirPlay sets volume to 0, restore it."""
@@ -912,6 +939,7 @@ class SonosFollowMe(hass.Hass):
             self._reset_resume_handle = None
         self._fm_reset_generation += 1
         self._reset_in_progress = True
+        self._arm_reset_wedge_timer()
 
     def _on_reset_completed(self, event_name, data, kwargs):
         """Hardware reset done - delay follow_me sync until Sonos/GM have settled."""
@@ -942,5 +970,6 @@ class SonosFollowMe(hass.Hass):
             return
         self._reset_resume_handle = None
         self.log("Scenario: reset_completed_delayed -> follow_me resuming", level="INFO")
+        self._clear_reset_wedge_timer()
         self._reset_in_progress = False
         self._trigger_follow_me_sync("reset_completed_delayed")
