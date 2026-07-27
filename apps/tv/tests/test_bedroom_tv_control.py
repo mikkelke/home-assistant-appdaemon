@@ -38,6 +38,9 @@ def make_app(states, reset_enabled=True, refresh_in_progress=False, power_sensor
     app._apple_refresh_in_progress = refresh_in_progress
     app.power_sensor = power_sensor
     app.power_on_watts = 25.0
+    app.power_off_confirm_seconds = 3.0
+    app._power_fired_at = None
+    app._get_lift_position = lambda: "Down"
     app._pending_raise_handle = None
     app._blip_guard_until = None
     app.blip_guard_hours = 4.0
@@ -294,6 +297,35 @@ class StartupDarkPanelArbitration(unittest.TestCase):
         app._check_initial_tv_state()
         self.assertIn(app._ensure_lift_down_if_tv_active, scheduled_callbacks(app))
         self.assertNotIn(app._raise_lift_if_still_off, scheduled_callbacks(app))
+
+
+class PowerFallBelt(unittest.TestCase):
+    """Falling watts is the belt for a LOST off event (2026-07-27 16:45: AD's
+    store dropped the off; no state event ever reached the app and the lift
+    stayed pinned Down). A >threshold -> <=threshold edge schedules the same
+    raise check the state event would have - unless one is already pending."""
+
+    def test_falling_edge_schedules_raise_check(self):
+        app = make_app({}, power_sensor=POWER_SENSOR)
+        app._on_tv_power(POWER_SENSOR, "state", "131.0", "17.7", {})
+        self.assertIn(app._raise_lift_if_still_off, scheduled_callbacks(app))
+
+    def test_no_duplicate_when_state_event_already_scheduled(self):
+        app = make_app({}, power_sensor=POWER_SENSOR)
+        app._pending_raise_handle = object()
+        app._on_tv_power(POWER_SENSOR, "state", "131.0", "17.7", {})
+        self.assertEqual(app.scheduled, [])
+
+    def test_standby_noise_is_not_an_edge(self):
+        app = make_app({}, power_sensor=POWER_SENSOR)
+        app._on_tv_power(POWER_SENSOR, "state", "17.7", "2.5", {})
+        self.assertEqual(app.scheduled, [])
+
+    def test_stowed_lift_needs_no_rescue(self):
+        app = make_app({}, power_sensor=POWER_SENSOR)
+        app._get_lift_position = lambda: "Up"
+        app._on_tv_power(POWER_SENSOR, "state", "131.0", "17.7", {})
+        self.assertEqual(app.scheduled, [])
 
 
 class EnsureDownDarkGuard(unittest.TestCase):

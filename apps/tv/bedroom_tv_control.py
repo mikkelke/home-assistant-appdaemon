@@ -131,10 +131,18 @@ class BedroomTVControl(hass.Hass):
         #     instance) - kick the integration, re-check, then power wins
         self.power_sensor = self.args.get("power_sensor")
         self.power_on_watts = float(self.args.get("power_on_watts", 25))
+        try:
+            self.power_off_confirm_seconds = float(self.args.get("power_off_confirm_seconds", 3))
+        except Exception:
+            self.power_off_confirm_seconds = 3.0
         self._power_fired_at = None
         if self.power_sensor:
             self.listen_state(self._on_tv_power, self.power_sensor)
-            self.log(f"TV power meter active: {self.power_sensor} (on > {self.power_on_watts:.0f}W)", level="INFO")
+            self.log(
+                f"TV power meter active: {self.power_sensor} (on > {self.power_on_watts:.0f}W, "
+                f"off-confirm {self.power_off_confirm_seconds:.0f}s)",
+                level="INFO",
+            )
         # Flag to track if lift actions are from our code (to avoid feedback loops)
         self._lift_action_in_progress = False
         self._lift_action_start_time = None
@@ -295,9 +303,18 @@ class BedroomTVControl(hass.Hass):
             self._last_off_at = self.datetime()
             guard_active = self._blip_guard_until is not None and self.datetime() < self._blip_guard_until
             delay = self.tv_off_blip_debounce_seconds if guard_active else self.tv_off_debounce_seconds
+            flavor = " (blip-guard active)" if guard_active else ""
+            # Power meter shortcut: the long debounce (and the blip tier) exist
+            # only because STATE flickers mid-watch. The panel's draw cannot
+            # flicker (lit >=110W, off ~17W within 1s), and any state flap with
+            # real wattage behind it is caught by the power veto at raise time
+            # - so with a meter a short physical confirm replaces both tiers.
+            # Off-to-stowed drops from ~13s to ~6s.
+            if self._panel_watts() is not None:
+                delay = self.power_off_confirm_seconds
+                flavor = " (power-confirm)"
             self.log(
-                f"TV turned OFF: scheduling lift raise in {delay:.0f}s"
-                f"{' (blip-guard active)' if guard_active else ''} "
+                f"TV turned OFF: scheduling lift raise in {delay:.0f}s{flavor} "
                 f"after Sony/Apple verification (state: '{old}' -> '{new}')",
                 level="INFO",
             )
@@ -1190,6 +1207,32 @@ class BedroomTVControl(hass.Hass):
         except (TypeError, ValueError):
             return
         if watts <= self.power_on_watts:
+            # Falling edge: the panel just went dark. Normally the state 'off'
+            # event drives the raise; this is the belt for a LOST off event
+            # (AD 4.5.13 dropped the 2026-07-27 16:45 off from its store and
+            # the lift stayed pinned Down for hours).
+            try:
+                old_watts = float(old)
+            except (TypeError, ValueError):
+                return
+            if old_watts <= self.power_on_watts:
+                return  # standby noise, not an edge
+            if self._pending_raise_handle is not None:
+                return  # the state event already scheduled the raise
+            if self._get_lift_position() == "Up":
+                return  # already stowed
+            delay = self.power_off_confirm_seconds + 2
+            self.log(
+                f"Panel power fell {old_watts:.0f}W -> {watts:.0f}W - scheduling raise check "
+                f"in {delay:.0f}s (belt for a missed off event)",
+                level="INFO",
+            )
+            try:
+                self._pending_raise_handle = self.run_in(
+                    self._raise_lift_if_still_off, delay, path_marker="power_fall")
+            except Exception as e:
+                self._pending_raise_handle = None
+                self.log(f"Error scheduling power-fall raise check: {e}", level="ERROR")
             return
         if self.get_state(self.sony_tv_entity) not in ("off", "unavailable", "unknown", "standby", None):
             return  # HA already knows

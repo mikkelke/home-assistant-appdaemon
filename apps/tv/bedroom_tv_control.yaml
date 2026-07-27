@@ -50,6 +50,10 @@ bedroom_tv_control:
   # over a panel that draws standby watts (Bravia assumed_state / AD stale store).
   power_sensor: sensor.bedroom_tv_relay_power
   power_on_watts: 25   # near-instant lower when TV turns on (an early/extra down is harmless; the raise side is the protected one)
+  # With the meter, the state-flicker debounce tiers are replaced by a short
+  # physical confirm on the off side (flaps are caught by the power veto
+  # instead - a lit panel always draws >=110W). Off-to-stowed ~6s.
+  power_off_confirm_seconds: 3
   
   # Lift command timing (to prevent conflicts and improve stability)
   min_lift_command_interval_s: 5.0  # Minimum seconds between lift commands
