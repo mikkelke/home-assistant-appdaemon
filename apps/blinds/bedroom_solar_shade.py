@@ -19,6 +19,13 @@ Logic each tick:
     plenty of light -> close a step toward the max-shade cap to block more heat.
   * Respects manual/remote moves (pauses manual_pause_min) so it never fights bedroom_blind_control.
 
+Restart-safe (2026-07-27): the manual-pause deadline and the baseline position used to
+detect a manual move are persisted to bedroom_solar_shade_state.json and reloaded at
+init, so a deploy during shading hours can't immediately re-command a hand-set blind, and
+a move right after a restart is still classified as manual even before this app has
+issued a command of its own this "session" (baseline seeded from the cover's current
+position when nothing is persisted yet).
+
 Opt-in via input_boolean.bedroom_solar_shade (OFF by default). Publishes sensor.bedroom_solar_shade_status.
 
 HA helpers (via MCP): input_boolean.bedroom_solar_shade, input_number.bedroom_solar_shade_position (max-shade cap).
@@ -30,8 +37,11 @@ most heat. Manual moves still win (checked first); the wake routine's own blind 
 apply while away either, since there's nobody to wake up.
 """
 
+import json
+import os
+
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
-from datetime import time, timedelta
+from datetime import datetime, time, timedelta
 
 
 class BedroomSolarShade(hass.Hass):
@@ -66,9 +76,21 @@ class BedroomSolarShade(hass.Hass):
         self.interval_min = int(a("check_interval_min", 10))
         self.status_entity = a("status_entity", "sensor.bedroom_solar_shade_status")
         self.dry_run = bool(a("dry_run", False))
+        self.state_file = a("state_file", "/conf/apps/blinds/bedroom_solar_shade_state.json")
 
         self._last_cmd = None
         self._override_until = None
+        self._load_state()
+        if self._last_cmd is None:
+            # No persisted baseline (fresh install, or nothing commanded yet since the
+            # last restart) - seed from the cover's CURRENT position so a manual move
+            # right after a restart is still classified as manual instead of needing
+            # this app to issue one command of its own first (deploy-during-shading bug,
+            # 2026-07-27).
+            seed = self._num_attr(self.cover, "current_position", None)
+            if seed is not None:
+                self._last_cmd = int(seed)
+                self.log(f"No persisted last_cmd - seeded from current position {self._last_cmd}%")
 
         self.listen_state(self._on_change, self.enable_entity)
         self.listen_state(self._on_change, self.position_entity)
@@ -78,6 +100,40 @@ class BedroomSolarShade(hass.Hass):
         # "now" fires at now+interval per AppDaemon's docs, not immediately - "immediate" is the real keyword; see 8666460.
         self.run_every(self._tick, "immediate", self.interval_min * 60)
         self.log(f"BedroomSolarShade started (dry_run={self.dry_run}, open/floor={self.open_pos}, window_az={self.window_az})")
+
+    # -- state persistence (manual-pause override + baseline position; survives AD
+    # restarts/deploys - see module docstring) ---------------------------------
+    def _load_state(self):
+        try:
+            with open(self.state_file) as f:
+                d = json.load(f)
+        except Exception:
+            return
+        lc = d.get("last_cmd")
+        if lc is not None:
+            try:
+                self._last_cmd = int(lc)
+            except (TypeError, ValueError):
+                pass
+        ou = d.get("override_until")
+        if ou:
+            try:
+                self._override_until = datetime.fromisoformat(ou)
+            except (TypeError, ValueError):
+                pass
+
+    def _save_state(self):
+        try:
+            data = {
+                "last_cmd": self._last_cmd,
+                "override_until": self._override_until.isoformat() if self._override_until else None,
+            }
+            tmp = self.state_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.state_file)
+        except Exception as e:
+            self.log(f"state save failed ({e}) - continuing in-memory", level="WARNING")
 
     # ---------- helpers ----------
     def _parse_hhmm(self, s, fallback):
@@ -123,6 +179,7 @@ class BedroomSolarShade(hass.Hass):
             return
         if self._last_cmd is not None and abs(pos - self._last_cmd) > self.pos_tol:
             self._override_until = self.get_now() + timedelta(minutes=self.manual_pause_min)
+            self._save_state()
             self.log(f"Manual blind move to {pos}% -> pause shading {self.manual_pause_min} min")
 
     # ---------- main ----------
@@ -164,6 +221,7 @@ class BedroomSolarShade(hass.Hass):
                 else:
                     self.call_service("cover/set_cover_position", entity_id=self.cover, position=desired)
                     self._last_cmd = desired
+                    self._save_state()
                     self.log(f"Set {self.cover} -> {desired}% ({reason})")
             return
 
@@ -208,6 +266,7 @@ class BedroomSolarShade(hass.Hass):
             return
         self.call_service("cover/set_cover_position", entity_id=self.cover, position=desired)
         self._last_cmd = desired
+        self._save_state()
         self.log(f"Set {self.cover} -> {desired}% ({reason})")
 
     def _report_house_event(self, cause, effect):

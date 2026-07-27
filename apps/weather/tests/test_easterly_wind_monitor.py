@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 import unittest
@@ -173,6 +174,154 @@ class EpisodeLifecycle(unittest.IsolatedAsyncioTestCase):
         await app._check_conditions({})
         self.assertEqual(app._last_gust_in_episode, 60.0)
         app.call_service.assert_not_awaited()
+
+
+class EpisodeConditionsNow(unittest.TestCase):
+    """_episode_conditions_now: the synchronous, init-only rehydration check."""
+
+    def _make(self, states):
+        app = ewm.EasterlyWindMonitor.__new__(ewm.EasterlyWindMonitor)
+        app.wind_dir = "sensor.gw2000a_wind_direction"
+        app.wind_gust = "sensor.gw2000a_wind_gust"
+        app.wind_speed = "sensor.gw2000a_wind_speed"
+        app.dir_min = 60.0
+        app.dir_max = 120.0
+        app.wind_speed_windy = 28.8
+        app.gust_windy = 54.0
+        app.get_state = lambda entity, **kw: states.get(entity)
+        app.log = MagicMock()
+        return app
+
+    def test_true_when_windy_and_in_band(self):
+        app = self._make(WINDY_STATES)
+        self.assertTrue(app._episode_conditions_now())
+
+    def test_false_when_calm(self):
+        app = self._make(CALM_STATES)
+        self.assertFalse(app._episode_conditions_now())
+
+    def test_none_when_direction_unavailable(self):
+        app = self._make({
+            "sensor.gw2000a_wind_direction": "unavailable",
+            "sensor.gw2000a_wind_gust": "60",
+        })
+        self.assertIsNone(app._episode_conditions_now())
+
+    def test_gust_alone_qualifies_without_mean_speed(self):
+        app = self._make({
+            "sensor.gw2000a_wind_direction": "90",
+            "sensor.gw2000a_wind_gust": "60",
+            "sensor.gw2000a_wind_speed": "unknown",
+        })
+        self.assertTrue(app._episode_conditions_now())
+
+
+class RestartRehydration(unittest.TestCase):
+    """2026-07-27: the episode helper is an HA input_boolean and survives an AD restart
+    even though _in_episode/the counters (in-memory) do not. initialize() seeds
+    _in_episode from the helper's current state and, if the helper is ON but wind has
+    already died down, immediately schedules the normal episode-end path instead of
+    leaving the helper stuck for another end_after_minutes_not_met debounce."""
+
+    def _make(self, states, args=None):
+        app = ewm.EasterlyWindMonitor.__new__(ewm.EasterlyWindMonitor)
+        app.args = dict(args or {})
+        app.get_state = lambda entity, **kw: states.get(entity)
+        app.get_app = MagicMock(return_value=None)
+        app.listen_state = MagicMock()
+        app.run_every = MagicMock()
+        app.run_in_calls = []
+        app.run_in = lambda cb, delay, **kw: app.run_in_calls.append((cb, delay))
+        app.create_task_calls = []
+        app.create_task = lambda coro: app.create_task_calls.append(coro) or coro
+        app.log = MagicMock()
+        app.initialize()
+        return app
+
+    def test_helper_off_at_startup_seeds_not_in_episode(self):
+        app = self._make({"input_boolean.easterly_wind_episode_active": "off"})
+        self.assertFalse(app._in_episode)
+        # Only the pre-existing _check_episode_entity_exists run_in - no forced end.
+        self.assertEqual(len(app.run_in_calls), 1)
+
+    def test_helper_missing_entirely_seeds_not_in_episode(self):
+        app = self._make({})  # get_state -> None for the helper (never created yet)
+        self.assertFalse(app._in_episode)
+
+    def test_helper_on_and_still_windy_stays_in_episode_without_forcing_an_end(self):
+        states = dict(WINDY_STATES, **{"input_boolean.easterly_wind_episode_active": "on"})
+        app = self._make(states)
+        self.assertTrue(app._in_episode)
+        self.assertEqual(len(app.run_in_calls), 1)  # no immediate-end scheduled
+
+    def test_helper_on_but_unavailable_reading_does_not_force_an_end(self):
+        """Inconclusive (unavailable) data at the exact restart instant must not force-end
+        a possibly-real ongoing episode - only a DEFINITE calm reading does."""
+        states = {
+            "input_boolean.easterly_wind_episode_active": "on",
+            "sensor.gw2000a_wind_direction": "unavailable",
+            "sensor.gw2000a_wind_gust": "unavailable",
+        }
+        app = self._make(states)
+        self.assertTrue(app._in_episode)
+        self.assertEqual(len(app.run_in_calls), 1)
+
+    def test_helper_on_but_calm_schedules_the_normal_end_path(self):
+        states = dict(CALM_STATES, **{"input_boolean.easterly_wind_episode_active": "on"})
+        app = self._make(states)
+
+        self.assertTrue(app._in_episode)  # rehydrated first...
+        self.assertEqual(app._condition_not_met_count, app.end_after_min)  # ...gate primed...
+        self.assertEqual(len(app.run_in_calls), 2)  # ...then deferred one tick
+        cb, delay = app.run_in_calls[-1]
+        self.assertEqual(delay, 0)
+
+        cb({})  # simulate AppDaemon firing the deferred callback
+
+        self.assertEqual(len(app.create_task_calls), 1)
+        coro = app.create_task_calls[0]
+        self.assertTrue(asyncio.iscoroutine(coro))
+        self.assertEqual(coro.cr_code.co_name, "_maybe_end_episode")
+        coro.close()
+
+
+class RestartRehydrationEndToEnd(unittest.IsolatedAsyncioTestCase):
+    """Same scenario as RestartRehydration.test_helper_on_but_calm_schedules_the_normal_
+    end_path, but actually runs the scheduled coroutine to confirm the observable effect:
+    the helper turns off (no duplicate/stuck-on state)."""
+
+    async def test_calm_at_restart_actually_turns_the_helper_off(self):
+        states = dict(CALM_STATES, **{"input_boolean.easterly_wind_episode_active": "on"})
+        app = ewm.EasterlyWindMonitor.__new__(ewm.EasterlyWindMonitor)
+        app.args = {}
+        app.get_state = lambda entity, **kw: states.get(entity)
+        app.get_app = MagicMock(return_value=None)
+        app.listen_state = MagicMock()
+        app.run_every = MagicMock()
+        app.run_in_calls = []
+        app.run_in = lambda cb, delay, **kw: app.run_in_calls.append((cb, delay))
+        app.call_service = AsyncMock()
+        app.log = MagicMock()
+
+        task_holder = {}
+
+        def create_task(coro):
+            task_holder["task"] = asyncio.ensure_future(coro)
+            return task_holder["task"]
+
+        app.create_task = create_task
+
+        app.initialize()
+        self.assertTrue(app._in_episode)
+
+        cb, _delay = app.run_in_calls[-1]
+        cb({})
+        await task_holder["task"]
+
+        self.assertFalse(app._in_episode)
+        app.call_service.assert_awaited_once_with(
+            "input_boolean/turn_off", entity_id=app.episode_entity,
+        )
 
 
 if __name__ == "__main__":

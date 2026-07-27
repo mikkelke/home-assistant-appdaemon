@@ -8,6 +8,16 @@ Condition: easterly direction (defaults 60-120 deg), "windy" when
 Sustained for sustained_minutes (consecutive checks; ~minutes when interval is 60s).
 
 Sets input_boolean.easterly_wind_episode_active and sends notification via MobileNotifier.
+
+Restart survival (2026-07-27): the episode helper is an HA input_boolean, so it survives
+an AD restart even though ``_in_episode``/the sustained-count counters (in-memory) do not.
+initialize() seeds ``_in_episode`` from the helper's current state so a restart mid-episode
+doesn't duplicate the start notification. If the helper is ON but the wind has already died
+down by the time we come back up, waiting through another full end_after_minutes_not_met
+debounce would leave the helper stuck ON for no reason (we have no idea how long it's
+actually been calm) - a one-time definite reading at init instead runs the normal
+episode-end path (turn the helper off + end notification) immediately. No state file: the
+helper IS the persisted truth for episode-active/not.
 """
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
@@ -34,7 +44,15 @@ class EasterlyWindMonitor(hass.Hass):
         self.notify_target = self.args.get("notify_target", "home")
         self.notify_on_end = self.args.get("notify_on_episode_end", False)
 
-        self._in_episode = False
+        # Rehydrate across restarts (2026-07-27): the helper is an HA input_boolean and
+        # survives AD restarts/deploys even though these counters do not - see module
+        # docstring. If it doesn't exist yet, get_state returns None -> not "on" -> False,
+        # same as the old hardcoded default.
+        try:
+            self._in_episode = self.get_state(self.episode_entity) == "on"
+        except Exception as e:
+            self.log(f"Could not read {self.episode_entity} at startup: {e}", level="WARNING")
+            self._in_episode = False
         self._condition_met_count = 0
         self._condition_not_met_count = 0
         self._last_gust_in_episode = 0.0
@@ -63,6 +81,53 @@ class EasterlyWindMonitor(hass.Hass):
             self.log("Test notification scheduled in 3s", level="INFO")
 
         self.run_in(self._check_episode_entity_exists, 2)
+
+        if self._in_episode and self._episode_conditions_now() is False:
+            # Rehydrated an active episode (helper ON) but a definite current reading
+            # says the wind has already died down - don't wait through another
+            # end_after_minutes_not_met debounce with no idea how long it's actually
+            # been calm. Prime the gate and run the normal (async) end path so the
+            # helper turn-off + end notification stay in one place. Deferred one tick
+            # so initialize() is guaranteed to have fully returned first.
+            self.log(
+                f"{self.episode_entity} is ON at startup but conditions have already "
+                "ended - closing the episode out now instead of leaving it stuck",
+                level="INFO",
+            )
+            self._condition_not_met_count = self.end_after_min
+            self.run_in(lambda kw: self.create_task(self._maybe_end_episode()), 0)
+
+    def _episode_conditions_now(self):
+        """Synchronous point-in-time read of the same easterly+windy test _check_conditions
+        applies, used ONLY for the init-time rehydration check above (initialize() is not
+        async). Returns True/False, or None when a reading is unavailable/unparseable -
+        inconclusive, so the normal debounced loop is left to handle it once real data
+        returns; only a DEFINITE calm reading justifies skipping the debounce at restart."""
+        try:
+            dir_raw = self.get_state(self.wind_dir)
+            gust_raw = self.get_state(self.wind_gust)
+            speed_raw = self.get_state(self.wind_speed)
+        except Exception as e:
+            self.log(f"get_state failed during rehydration check: {e}", level="WARNING")
+            return None
+
+        if dir_raw in (None, "unknown", "unavailable") or gust_raw in (None, "unknown", "unavailable"):
+            return None
+        try:
+            direction = float(dir_raw)
+            gust_ha = float(gust_raw)
+        except (TypeError, ValueError):
+            return None
+
+        speed = None
+        if speed_raw not in (None, "unknown", "unavailable"):
+            try:
+                speed = float(speed_raw)
+            except (TypeError, ValueError):
+                speed = None
+
+        windy = gust_ha >= self.gust_windy or (speed is not None and speed >= self.wind_speed_windy)
+        return self.dir_min <= direction <= self.dir_max and windy
 
     async def _check_episode_entity_exists(self, kwargs):
         """Warn if the episode tracking entity is missing in HA."""

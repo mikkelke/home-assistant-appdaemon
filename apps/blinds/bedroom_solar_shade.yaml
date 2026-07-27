@@ -50,3 +50,5 @@ BedroomSolarShade:
   check_interval_min: 10
   status_entity: sensor.bedroom_solar_shade_status
   dry_run: false
+  # manual-pause override + baseline position survive AD restarts/deploys (2026-07-27)
+  state_file: /conf/apps/blinds/bedroom_solar_shade_state.json
