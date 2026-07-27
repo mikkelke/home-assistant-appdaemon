@@ -141,6 +141,8 @@
 #     last_door_closed_at  ISO datetime in your timezone (optional anchor for restore/clamp)
 #     last_door_closed_trusted  bool — if false, last_door_closed_at is ignored for clamps (e.g. after Off or infer-only)
 #     last_off_at          ISO datetime in your timezone, when we last went to Off (for restore/clamp)
+#     started_by           Lowercase person key (e.g. "mikkel") who loaded the machine, or "" if not resolvable (ActorAttribution)
+#     started_by_method    How started_by was resolved: "sole_occupant" | "unknown" (see ActorAttribution)
 #
 #   When state = Off: progress attributes above are cleared (null). last_door_closed_at and
 #   last_off_at are kept; last_door_closed_trusted is false so a restart does not treat a stale
@@ -157,6 +159,7 @@
 #     spin_rpm             User-selected spin from spin entity (optional)
 #     end_reason           How we knew the cycle ended: low_power_detected | door_opened_first | user_cycle_end
 #     idle_min             When we corrected from history: minutes from programme end to when we recorded (optional)
+#     started_by           Carried over from Running - see above
 #     (Progress attributes are cleared so do not show "Started … Done …" for Unemptied.)
 #
 #   When state = Emptied, attributes:
@@ -165,6 +168,7 @@
 #     energy_used          kWh (optional)
 #     end_reason           Preserved from Unemptied when present (optional)
 #     idle_min             Preserved from Unemptied when present (optional)
+#     emptied_by           Lowercase person key who was observed emptying it, or "" if not resolvable (ActorAttribution)
 #     (Progress attributes are cleared.)
 #
 # HELPERS — Do we need HA helpers (input_number, input_text, etc.)?
@@ -483,6 +487,12 @@ washer_monitor:
   # is home the push is silently skipped (no presence logic needed here).
   confirm_push_enabled: true
   confirm_push_target: "home"   # "home" = only people currently home (see MobileNotifier)
+  # When the saved cycle record names who started the wash (started_by - see ActorAttribution /
+  # _attribute in washer_monitor.py), target that person directly instead of the "home" broadcast
+  # above - MobileNotifier list-targets bypass category_audience and reach them even after they've
+  # left (apps/notify/mobile_notifier.py). Set to false to revert to the plain broadcast without a
+  # code change.
+  confirm_push_target_actor: true
   confirm_push_dashboard_uri: "/local/ha-dashboard/index.html"   # "Other..." / "Choose in dashboard" button
 
   # ============================================================================

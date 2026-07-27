@@ -441,6 +441,8 @@ class WasherMonitor(hass.Hass):
         # State tracking
         self.program_timer = None
         self.start_time = None
+        self._cycle_actor = None  # Who started the current cycle - see _attribute() / ActorAttribution app
+        self._last_saved_record_ts = None  # ts of the last-saved feedback record - see _patch_cycle_record
         self.energy_start = None
         self.poll_timer = None
         self.history_poll_timer = None  # Periodic power-history check to catch missed heating
@@ -622,6 +624,11 @@ class WasherMonitor(hass.Hass):
         # whoever is home to confirm the programme with one tap (see _maybe_send_confirm_push).
         self.confirm_push_enabled = bool(self.args.get("confirm_push_enabled", True))
         self.confirm_push_target = self.args.get("confirm_push_target", "home")
+        # When the saved cycle record names who started it, target them directly instead of the
+        # "home" broadcast (see _send_confirm_push) - MobileNotifier list-targets bypass
+        # category_audience and reach them even after they've left. Flag-gated so this is
+        # revertible without a code change.
+        self.confirm_push_target_actor = bool(self.args.get("confirm_push_target_actor", True))
         self.confirm_push_dashboard_uri = self.args.get("confirm_push_dashboard_uri", "/local/ha-dashboard/index.html")
 
         # Get Sonos Notifier App instance
@@ -907,6 +914,20 @@ class WasherMonitor(hass.Hass):
             if energy_at_start is not None:
                 self.energy_start = float(energy_at_start)
                 self.log(f"Restored energy_at_start: {self.energy_start}", level="DEBUG")
+        except (TypeError, ValueError, AttributeError):
+            pass
+
+        # Restore who started this cycle (see _begin_running_cycle / _attribute): an AppDaemon
+        # reload mid-Running never re-runs _begin_running_cycle, so without this self._cycle_actor
+        # would fall back to unknown even though we captured it before the restart.
+        try:
+            started_by = self.get_state(self.state_entity, attribute="started_by")
+            started_by_method = self.get_state(self.state_entity, attribute="started_by_method")
+            self._cycle_actor = self._cycle_actor_from_state_attrs(
+                {"started_by": started_by, "started_by_method": started_by_method}
+            )
+            if self._cycle_actor.get("person"):
+                self.log(f"Restored started_by: {self._cycle_actor['person']}", level="DEBUG")
         except (TypeError, ValueError, AttributeError):
             pass
 
@@ -2367,6 +2388,10 @@ class WasherMonitor(hass.Hass):
         current_state = self.get_state(self.state_entity)
         if current_state == "Unemptied":
             self.log(f"WATCHDOG: Unemptied for {self.unemptied_timeout_hours}h - assuming emptied", level="WARNING")
+            # Goes straight to Off, bypassing _transition_to_emptied entirely - no door event was
+            # ever seen, so there is nothing to patch emptied_by/emptied_ts onto. The saved
+            # record's emptied_by stays whatever it was at Unemptied-save time (never observed):
+            # correct, since nobody was actually seen emptying it.
             self._transition_to_off(f"Watchdog: unemptied timeout ({self.unemptied_timeout_hours}h)")
         self.unemptied_watchdog_timer = None
         self._safe_cancel_timer(self.unemptied_door_recheck_timer)
@@ -2499,6 +2524,10 @@ class WasherMonitor(hass.Hass):
                 "programme_confirmed_by_user": False,
                 "programme_confirmed_by": "",
                 "expected_dur_at_start": "",
+                # Cleared every time a cycle ends, same as the confirmation flags above - the
+                # next cycle's _begin_running_cycle re-attributes from scratch.
+                "started_by": "",
+                "started_by_method": "",
                 # Persist so after restart we can clamp restored start_time (no start before last Off/door close)
                 "last_door_closed_at": self._format_local(self.last_door_closed_at) if self.last_door_closed_at else "",
                 "last_door_closed_trusted": False,
@@ -2850,6 +2879,9 @@ class WasherMonitor(hass.Hass):
             self._restore_heating_from_power_history()
         self.programme_confirmed_by_user = bool(attrs.get("programme_confirmed_by_user"))
         self.confirmed_by_username = attrs.get("programme_confirmed_by") or None
+        # This path reverts to Running without going through _begin_running_cycle, so
+        # self._cycle_actor must be rebuilt from the entity the same way a restart restore does.
+        self._cycle_actor = self._cycle_actor_from_state_attrs(attrs)
         self.expected_dur_at_start = None
         # Prefer selector (manual duration) - never use stale/wrong expected_dur from entity.
         if self.confirm_entity:
@@ -3085,10 +3117,12 @@ class WasherMonitor(hass.Hass):
                 selected_options=self._get_selected_options(),
                 cost_kr=self._session_cost_kr if self.track_cycle_cost else None,
                 vibration=self._vibration_summary(),
+                actor_start=self._cycle_actor,
             )
             if saved_record is not None:
                 self._maybe_send_confirm_push(saved_record)
                 self._schedule_vibration_unload_patch(saved_record)
+                self._last_saved_record_ts = saved_record.get("ts")
 
             self.state = "Unemptied"
             confirmed_profile = self._get_profile(confirmed_prog, confirmed_temp)
@@ -3112,6 +3146,11 @@ class WasherMonitor(hass.Hass):
                 "energy_at_start": None,
                 "last_high_energy_at": None,
             }
+            # Dashboard visibility for who loaded the machine (see _begin_running_cycle /
+            # _attribute); merge-not-replace set_state already carries this over from the
+            # Running publish, but writing it explicitly here keeps it correct even after a
+            # _recover_from_false_unemptied revert re-seeded self._cycle_actor mid-cycle.
+            attributes["started_by"] = (self._cycle_actor or {}).get("person") or ""
             if energy_used > 0:
                 attributes["energy_used"] = round(energy_used, 3)
             if spin_rpm is not None:
@@ -3195,6 +3234,9 @@ class WasherMonitor(hass.Hass):
     def _transition_to_emptied(self, reason):
         """Transition to Emptied state (door open, user is emptying)."""
         if self._should_change_state("Emptied", force=True):  # Door event bypasses cooling
+            # Attribution: captured as "now" - unlike the start anchor (which clamps back to
+            # door-close, see _begin_running_cycle), emptying is observed as it happens.
+            actor_empty = self._attribute("washer_emptied")
             energy_used = self._get_energy_used()
             run_minutes = self._get_run_duration_minutes()
 
@@ -3285,18 +3327,34 @@ class WasherMonitor(hass.Hass):
                         selected_options=self._get_selected_options(),
                         cost_kr=self._session_cost_kr if self.track_cycle_cost else None,
                         vibration=self._vibration_summary(),
+                        actor_start=self._cycle_actor,
+                        actor_empty=actor_empty,
                     )
                     if saved_record is not None:
                         self._maybe_send_confirm_push(saved_record)
                         self._schedule_vibration_unload_patch(saved_record)
+                        self._last_saved_record_ts = saved_record.get("ts")
                 except Exception as e:
                     self.log(f"Could not save feedback on Emptied transition: {e}", level="WARNING")
+            elif not came_from_running:
+                # Path B (the canonical "someone emptied it"): the record was already written
+                # by _transition_to_unemptied, possibly long before this door event - patch
+                # emptied_by/emptied_ts onto it instead of guessing at a duplicate save.
+                # self._last_saved_record_ts names it (set at both live _save_cycle_feedback
+                # sites); _patch_cycle_record tolerates it being stale/absent.
+                self._patch_cycle_record(self._last_saved_record_ts, {
+                    "emptied_by": (actor_empty or {}).get("person"),
+                    "emptied_ts": self._format_local(self._now_utc()),
+                    "attribution": {"empty": actor_empty},
+                })
 
             self.state = "Emptied"
             attributes = {
                 "reason": reason,
                 "run_time_minutes": round(run_minutes, 1) if run_minutes > 0 else None
             }
+            # Dashboard visibility for who emptied the machine (see _attribute above).
+            attributes["emptied_by"] = (actor_empty or {}).get("person") or ""
             if energy_used > 0:
                 attributes["energy_used"] = round(energy_used, 3)
             # Preserve run_time_minutes, end_reason, idle_min from entity when coming from Unemptied
@@ -3349,6 +3407,7 @@ class WasherMonitor(hass.Hass):
     def _reset_cycle_tracking(self):
         """Reset all cycle-related tracking variables."""
         self.start_time = None
+        self._cycle_actor = None
         self.energy_start = None
         self._session_cost_kr = 0.0
         self._cost_prev_energy_kwh = None
@@ -3700,6 +3759,26 @@ class WasherMonitor(hass.Hass):
         self.first_vibration_at = None
         self.last_vibration_at = None
         self._vibration_on_started = None
+        # Attribution anchor: the moment the human LOADED the machine, not when the motor
+        # starts - a Miele delayed start can defer the motor by hours (see DELAYED START in
+        # washer.yaml), which would otherwise point ActorAttribution at whoever was home hours
+        # later. Reuses the same trust/freshness bar as the start_time door-close clamp below
+        # (~3705-3714): only a recent (<=12h), trusted door close that isn't stale from a
+        # PREVIOUS cycle (before last Off) counts; otherwise fall back to now.
+        attribution_anchor = self._now_utc()
+        if self.last_door_closed_trusted and self.last_door_closed_at:
+            door_age_s = (attribution_anchor - self.last_door_closed_at).total_seconds()
+            last_off_at = None
+            try:
+                last_off_str = self.get_state(self.state_entity, attribute="last_off_at")
+                if last_off_str:
+                    last_off_at = _parse_utc(last_off_str)
+            except (TypeError, ValueError, AttributeError):
+                last_off_at = None
+            not_before_off = last_off_at is None or self.last_door_closed_at >= last_off_at
+            if 0 <= door_age_s <= 12 * 3600 and not_before_off:
+                attribution_anchor = self.last_door_closed_at
+        self._cycle_actor = self._attribute("washer_start", at=attribution_anchor)
         self.start_time = self._now_utc()
         # Start time cannot be before the last door close (except in first 10 min AddLoad).
         if (
@@ -3766,6 +3845,11 @@ class WasherMonitor(hass.Hass):
             "delayed_start_waiting": bool(self._delay_waiting),
             "session_cost_kr": round(self._session_cost_kr, 2),
         }
+        # Use "" not None - AppDaemon 4.5.13 drops attributes equal to None/False/0 (see
+        # smart_cooling.py's _publish() for details); "unknown" mirrors detected_programme's
+        # own placeholder above.
+        attrs["started_by"] = self._cycle_actor.get("person") or ""
+        attrs["started_by_method"] = self._cycle_actor.get("method") or "unknown"
         if self.energy_start is not None:
             attrs["energy_at_start"] = self.energy_start
         if self.last_door_closed_at:
@@ -4721,6 +4805,8 @@ class WasherMonitor(hass.Hass):
         selected_options: dict | None = None,  # e.g. {"water_plus": "on", "soak": "off"} from option entities
         cost_kr: float | None = None,  # Settled per-cycle cost (self._session_cost_kr); None for migration/backfill saves
         vibration: dict | None = None,  # Telemetry only (see _vibration_summary); None for migration/backfill saves
+        actor_start: dict | None = None,  # Who loaded the machine (self._cycle_actor; see _attribute); None for migration/backfill saves
+        actor_empty: dict | None = None,  # Who emptied it - ONLY when observed in this same save (Running direct to Emptied); the Unemptied-first path patches emptied_by later via _patch_cycle_record
     ):
         """Append one completed cycle record to the feedback JSON file (v2 format).
 
@@ -4734,6 +4820,15 @@ class WasherMonitor(hass.Hass):
         duration_source: "user_cycle_end" | "history_corrected" when we used that for duration_min.
         end_reason: "low_power_detected" | "door_opened_first" | "user_cycle_end" | "anti_crease_pattern".
         idle_min: minutes from programme end to when we recorded (door open / detection); only set when we corrected.
+
+        actor_start/actor_empty: ActorAttribution results (see _attribute) for who loaded / who
+        emptied the machine. started_by and attribution.start are written on every save from here
+        on - an absent key on an old record just means it predates this feature - and a plain
+        JSON null is fine when unknown (the AppDaemon 4.5.13 None-dropping bug only applies to
+        HA entity attributes, not this file). emptied_by/emptied_ts/attribution.empty are only
+        written when actor_empty is given (the machine went Running straight to Emptied, so both
+        are known at save time); the far more common Unemptied-first path saves without them and
+        _patch_cycle_record fills them in later when the door actually opens.
 
         Returns the saved record dict, or None if the save was skipped (duplicate guard) or failed
         (write error). Callers use the returned record to decide whether to trigger a confirm push
@@ -4789,6 +4884,14 @@ class WasherMonitor(hass.Hass):
             record["cost_kr"] = round(cost_kr, 2)
         if vibration is not None:
             record["vibration"] = vibration
+        # started_by/attribution.start: written unconditionally (plain null when unknown is
+        # correct JSON, unlike the entity-attribute None-dropping bug noted above).
+        record["started_by"] = (actor_start or {}).get("person")
+        record["attribution"] = {"start": actor_start}
+        if actor_empty is not None:
+            record["emptied_by"] = (actor_empty or {}).get("person")
+            record["emptied_ts"] = self._format_local(self._now_utc())
+            record["attribution"]["empty"] = actor_empty
 
         if os.path.exists(self.feedback_file):
             try:
@@ -4990,6 +5093,80 @@ class WasherMonitor(hass.Hass):
             return
         self.log(f"Vibration unload patch: {pulse_count} pulse(s) in the 10 min after cycle ts={ts}", level="DEBUG")
 
+    def _patch_cycle_record(self, ts, updates: dict):
+        """Patch `updates` onto the feedback record named by ts (see _schedule_vibration_unload_patch
+        / _patch_unload_vibration, which this mirrors). A dict value is merged into any existing
+        dict at that key instead of replacing it wholesale - e.g. an "attribution" patch adds
+        "empty" alongside the "start" key written at save time, rather than erasing it.
+
+        Used for the Unemptied-first emptying path (_transition_to_emptied "Path B"): the record
+        was already written by _transition_to_unemptied before anyone touched the door, so who
+        emptied it can only be added after the fact. Best-effort enrichment of a record that may
+        not exist - never core cycle logic.
+
+        Two robustness rules, both learned from this codebase's recurring restart theme:
+
+        * No ts -> patch the NEWEST record. Unemptied routinely outlives the process (it lasts
+          until a human walks over, and this box gets redeployed constantly), so
+          self._last_saved_record_ts is None for most real emptyings. The newest record is
+          provably the right target: a later cycle cannot have completed while the machine sat
+          Unemptied, because emptying it is the very event being recorded. Same pattern the
+          dishwasher has always used (_mark_last_cycle_emptied patches cycles[-1]).
+        * Never re-stamp an already-emptied record. self._last_saved_record_ts is only assigned
+          when a save actually returns a record, so a failed save leaves the PREVIOUS cycle's ts
+          in place - patching that would credit this emptying to an older cycle. An existing
+          emptied_ts is the tell, and the same guard makes a repeated door-open idempotent."""
+        import json
+        if not self.feedback_file or not os.path.exists(self.feedback_file):
+            self.log(f"Cycle record patch: feedback file missing for ts={ts}", level="DEBUG")
+            return
+        try:
+            with open(self.feedback_file, "r") as f:
+                data = json.load(f)
+        except Exception as e:
+            self.log(f"Cycle record patch: could not read feedback file: {e}", level="DEBUG")
+            return
+        cycles = data.get("cycles", [])
+        if ts:
+            rec = next((c for c in cycles if c.get("ts") == ts), None)
+            if rec is None:
+                # A ts we were given but cannot find is genuinely odd (it came from a save that
+                # reported success), so this one is worth seeing in the log.
+                self.log(f"Cycle record patch: cycle ts={ts} not found (skipping)", level="WARNING")
+                return
+        else:
+            rec = cycles[-1] if cycles else None
+            if rec is None:
+                self.log("Cycle record patch: no ts and no records to patch (skipping)", level="DEBUG")
+                return
+            self.log(
+                f"Cycle record patch: no ts in memory (restart while Unemptied) - falling back "
+                f"to the newest record ts={rec.get('ts')}",
+                level="INFO",
+            )
+        if "emptied_ts" in updates and rec.get("emptied_ts"):
+            self.log(
+                f"Cycle record patch: record ts={rec.get('ts')} is already marked emptied "
+                f"({rec.get('emptied_ts')}) - not re-stamping",
+                level="DEBUG",
+            )
+            return
+        for key, value in updates.items():
+            if isinstance(value, dict) and isinstance(rec.get(key), dict):
+                rec[key].update(value)
+            else:
+                rec[key] = value
+        try:
+            with open(self.feedback_file, "w") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.log(f"Cycle record patch: could not write feedback file: {e}", level="WARNING")
+            return
+        self.log(
+            f"Cycle record patch: updated {list(updates.keys())} on ts={rec.get('ts')}",
+            level="DEBUG",
+        )
+
     # =========================================================================
     # Presence-gated confirm push (feature: ask whoever is home to confirm the
     # programme with one tap when a cycle ends unconfirmed but worth learning)
@@ -5037,10 +5214,83 @@ class WasherMonitor(hass.Hass):
             return
         self._send_confirm_push(record)
 
+    # =========================================================================
+    # Actor attribution ("who started this wash / who emptied it") via the shared
+    # ActorAttribution app. Its API is frozen: get_app("ActorAttribution") is resolved
+    # LAZILY on every call, never cached at initialize - see 4086e2e: dependencies: is
+    # only for get_app results cached at initialize; declaring one here would reload this
+    # monitor (discarding live cycle state) every time ActorAttribution changes.
+    # =========================================================================
+
+    def _unknown_actor(self, reason: str, at=None) -> dict:
+        """Build an unknown-attribution dict in the exact shape ActorAttribution.attribute()
+        documents (all keys present), so a resolution failure never causes a downstream
+        KeyError - see _attribute()."""
+        now = self._now_utc()
+        anchor = at if at is not None else now
+        return {
+            "person": None,
+            "method": "unknown",
+            "reason": reason,
+            "people_home": [],
+            "anchor": self._format_utc(anchor) if hasattr(anchor, "astimezone") else (anchor or ""),
+            "evaluated_at": self._format_utc(now),
+            "version": 1,
+        }
+
+    def _cycle_actor_from_state_attrs(self, attrs: dict) -> dict:
+        """Rebuild a _cycle_actor-shaped dict from started_by/started_by_method persisted on
+        the state entity. Used when a cycle resumes without re-invoking _begin_running_cycle -
+        an AppDaemon reload mid-Running restore (_restore_running_state), or
+        _recover_from_false_unemptied reverting a false finish - so self._cycle_actor would
+        otherwise fall back to unknown even though we captured it before. "" is AppDaemon
+        4.5.13 dropping a None/False/0-valued attribute (see smart_cooling.py's _publish()),
+        not a real value - treated the same as missing, like every other restore field here."""
+        person = attrs.get("started_by") or None
+        method = attrs.get("started_by_method") or None
+        result = self._unknown_actor("restored_from_entity")
+        result["person"] = person
+        result["method"] = method or "unknown"
+        return result
+
+    def _attribute(self, event, at=None) -> dict:
+        """Resolve who performed a physical action via the ActorAttribution app.
+
+        Lazy get_app per call (no dependencies: entry - see the section banner above). Never
+        lets an attribution problem break a cycle: any failure returns the unknown dict, in the
+        same shape as a real result, so callers can always do result.get("person") /
+        result.get("method") without a KeyError.
+        """
+        try:
+            app = self.get_app("ActorAttribution")
+        except Exception as e:
+            self.log(f"Could not resolve ActorAttribution app for event={event!r}: {e}", level="WARNING")
+            return self._unknown_actor("attribution_error", at)
+        if app is None:
+            self.log(f"ActorAttribution app not found - cannot attribute event={event!r}", level="WARNING")
+            return self._unknown_actor("attribution_app_missing", at)
+        try:
+            result = app.attribute(event, at=at)
+            if not isinstance(result, dict):
+                self.log(
+                    f"ActorAttribution.attribute returned {type(result).__name__}, expected dict, for event={event!r}",
+                    level="WARNING",
+                )
+                return self._unknown_actor("attribution_error", at)
+            return result
+        except Exception as e:
+            self.log(f"ActorAttribution.attribute raised for event={event!r}: {e}", level="WARNING")
+            return self._unknown_actor("attribution_error", at)
+
     def _send_confirm_push(self, record: dict):
         """Build and send the confirm-programme push for `record` (unconditional -
         callers gate as needed; the washer_test_confirm_push test hook calls this
-        directly to preview the message/buttons). Same pattern as _push_mobile."""
+        directly to preview the message/buttons). Same pattern as _push_mobile.
+
+        Targets the person who started the wash (started_by on the record) directly when
+        confirm_push_target_actor is set and one is known - MobileNotifier's list-target
+        semantics bypass category_audience and reach them even after they've left home
+        (apps/notify/mobile_notifier.py); otherwise falls back to the usual broadcast target."""
         try:
             predicted = record.get("predicted") or ""
             ts = record.get("ts", "")
@@ -5066,14 +5316,16 @@ class WasherMonitor(hass.Hass):
             if notifier is None:
                 self.log("MobileNotifier app not found - cannot send confirm push", level="WARNING")
                 return
+            started_by = record.get("started_by")
+            target = [started_by] if (self.confirm_push_target_actor and started_by) else self.confirm_push_target
             self.create_task(notifier.notify(
                 title=title,
                 message=message,
-                target=self.confirm_push_target,
+                target=target,
                 data={"data": {"actions": actions, "tag": "washer_confirm"}},
                 category="washer_confirm",
             ))
-            self.log(f"Confirm push sent for cycle ts={ts} predicted={predicted}", level="INFO")
+            self.log(f"Confirm push sent for cycle ts={ts} predicted={predicted} target={target}", level="INFO")
         except Exception as e:
             self.log(f"Could not send confirm push: {e}", level="WARNING")
 
@@ -5570,6 +5822,9 @@ class WasherMonitor(hass.Hass):
         lead_min = (resume_at - old_start).total_seconds() / 60
         self._delayed_start_lead_idle_min = round(lead_min, 1)
         self.start_time = resume_at
+        # self._cycle_actor is NOT recomputed here - attribution anchors to when the machine was
+        # LOADED (door close, see _begin_running_cycle), not when the motor actually starts;
+        # sliding start_time for a delayed start must not change who gets credit for the load.
         self._delayed_start_trimmed = True
         self._delay_plateau_start = None
         self._delay_waiting = False

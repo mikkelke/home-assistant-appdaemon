@@ -1,0 +1,34 @@
+# /conf/apps/presence/actor_attribution.yaml
+# Answers "who was home at time T, if exactly one person was" so appliance monitors
+# (washer/dishwasher/dryer) can attribute a physical button press to a person - physical
+# presses carry no HA context_user_id, so sole-occupancy is the only free signal today.
+# NEVER GUESS: ambiguous presence always returns unknown (see actor_attribution.py's
+# module docstring for the full seven-rule decision table). A wrong attribution poisons
+# an appliance's per-person history/learning forever; a missing one is just a blank, and
+# recoverable the next time the signal is clean.
+#
+# Phase 2 seam: attribute() is a thin dispatcher today (self._by_sole_occupancy(...));
+# a future BLE-presence signal slots in ahead of it with
+# `self._by_ble(...) or self._by_sole_occupancy(...)` - callers (appliance monitors)
+# never change.
+#
+# Known residual: an untracked human physically in the flat (a guest, a cleaner, a kid's
+# friend, or one of the three people below without their phone/location on) is invisible
+# to person.* state and can produce a false sole-occupant verdict. Not closed by this app.
+#
+# No `dependencies:` key on purpose - appliance monitors resolve this app lazily per call
+# via get_app(), not at their own initialize() time, so init order relative to this app
+# does not matter.
+
+ActorAttribution:
+  module: actor_attribution
+  class: ActorAttribution
+  person_entities:
+    - person.mikkel
+    - person.kristine
+    - person.claudia
+  door_entity: binary_sensor.apartment_door_open
+  stability_seconds: 600
+  door_settle_seconds: 300
+  retention_hours: 26
+  publish_sensor: sensor.household_actor
