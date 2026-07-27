@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as _dt
 import sys
 import types
 import unittest
@@ -21,15 +22,32 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
 import bedroom_tv_control as btc  # noqa: E402
 
 
-def make_app(states, reset_enabled=True, refresh_in_progress=False):
+POWER_SENSOR = "sensor.bedroom_tv_relay_power"
+
+
+def make_app(states, reset_enabled=True, refresh_in_progress=False, power_sensor=None):
     """BedroomTVControl with fake get_state/call_service/run_in, without
-    running AppDaemon's initialize()."""
+    running AppDaemon's initialize(). Pass power_sensor=POWER_SENSOR (and a
+    watts string under that key in `states`) to exercise the power-meter
+    arbitration; the default None mirrors a meterless config."""
     app = btc.BedroomTVControl.__new__(btc.BedroomTVControl)
     app.tv_entity = "media_player.bedroom_tv"
     app.sony_tv_entity = "media_player.bedroom_sony_tv"
     app.apple_tv_entity = "media_player.bedroom_apple_tv"
     app.apple_tv_reset_enabled = reset_enabled
     app._apple_refresh_in_progress = refresh_in_progress
+    app.power_sensor = power_sensor
+    app.power_on_watts = 25.0
+    app._pending_raise_handle = None
+    app._blip_guard_until = None
+    app.blip_guard_hours = 4.0
+    app.lift_command_timeout_s = 4.0
+    app._lift_action_in_progress = False
+    app._lift_action_start_time = None
+    app._last_lift_command_time = None
+    app._reset_lift_action_flag = lambda: None
+    app._start_periodic_verification = lambda: None
+    app.datetime = lambda: _dt.datetime(2026, 7, 27, 12, 0, 0)
     app.get_state = lambda entity, **kw: states.get(entity)
     app.log = lambda *a, **kw: None
     app.service_calls = []
@@ -136,6 +154,163 @@ class StartupStaleAppleTvHeal(unittest.TestCase):
         self.assertEqual(app.service_calls, [])
         self.assertIn(app._raise_lift_after_stop, scheduled_callbacks(app))
         self.assertNotIn(app._raise_after_apple_refresh, scheduled_callbacks(app))
+
+
+class DarkPanelArbitration(unittest.TestCase):
+    """2026-07-27: the Shelly PM Mini proved every state source can lie 'on'
+    over a dark panel (Bravia post-off rebound at the debounce check; AD 4.5.13
+    serving a stale store 'on' even to a freshly restarted app, unhealable by
+    update_entity because HA-side state was already off = no event). A panel
+    drawing <= power_on_watts cannot be lit (idle floor ~2.5W, warm post-off
+    ~17W vs >=110W lit, >=30W booting), so power arbitrates: kick + bounded
+    re-checks, then the raise proceeds anyway."""
+
+    STALE_ON = {
+        "media_player.bedroom_tv": "on",
+        "media_player.bedroom_sony_tv": "on",
+        "media_player.bedroom_apple_tv": "off",
+        POWER_SENSOR: "15.7",
+    }
+
+    def test_first_dark_check_kicks_integration_and_reschedules(self):
+        app = make_app(dict(self.STALE_ON), power_sensor=POWER_SENSOR)
+        app._raise_lift_if_still_off({"path_marker": "tv_off"})
+        self.assertIn(
+            ("homeassistant/update_entity", {"entity_id": "media_player.bedroom_sony_tv"}),
+            app.service_calls,
+        )
+        recheck = [(cb, kw) for cb, _d, kw in app.scheduled if cb == app._raise_lift_if_still_off]
+        self.assertEqual(len(recheck), 1)
+        self.assertEqual(recheck[0][1].get("dark_panel_attempts"), 1)
+        # no raise yet: the stop-then-raise sequence must not have started
+        self.assertNotIn(
+            ("script/turn_on", {"entity_id": "script.bedroom_tv_lift_stop"}),
+            app.service_calls,
+        )
+
+    def test_exhausted_dark_checks_mean_power_wins_and_lift_raises(self):
+        app = make_app(dict(self.STALE_ON), power_sensor=POWER_SENSOR)
+        app._raise_lift_if_still_off({"path_marker": "dark_panel", "dark_panel_attempts": 3})
+        self.assertIn(
+            ("script/turn_on", {"entity_id": "script.bedroom_tv_lift_stop"}),
+            app.service_calls,
+        )
+        self.assertIn(app._raise_lift_after_stop, scheduled_callbacks(app))
+
+    def test_playing_apple_tv_blocks_dark_arbitration(self):
+        # 2026-06-23 rule holds even against the meter: never raise over playback.
+        states = dict(self.STALE_ON, **{"media_player.bedroom_apple_tv": "playing"})
+        app = make_app(states, power_sensor=POWER_SENSOR)
+        app._raise_lift_if_still_off({"path_marker": "tv_off", "dark_panel_attempts": 3})
+        self.assertEqual(app.service_calls, [])
+        self.assertNotIn(app._raise_lift_after_stop, scheduled_callbacks(app))
+
+    def test_lit_panel_states_on_is_a_genuine_skip(self):
+        states = dict(self.STALE_ON, **{POWER_SENSOR: "130.0"})
+        app = make_app(states, power_sensor=POWER_SENSOR)
+        app._raise_lift_if_still_off({"path_marker": "tv_off"})
+        self.assertEqual(app.service_calls, [])
+        self.assertEqual(app.scheduled, [])
+
+    def test_meterless_config_keeps_the_old_skip_behavior(self):
+        states = {k: v for k, v in self.STALE_ON.items() if k != POWER_SENSOR}
+        app = make_app(states)
+        app._raise_lift_if_still_off({"path_marker": "tv_off"})
+        self.assertEqual(app.service_calls, [])
+        self.assertEqual(app.scheduled, [])
+
+    def test_dark_panel_lets_apple_heal_run_despite_stale_sony_on(self):
+        # Compound lie: AD-stale 'on' for universal+sony while the Apple TV is
+        # genuinely paused and the panel is dark -> the paused-abandoned cure
+        # (sleep + re-check) applies, not a force-raise over paused content.
+        states = dict(self.STALE_ON, **{"media_player.bedroom_apple_tv": "paused"})
+        app = make_app(states, power_sensor=POWER_SENSOR)
+        app._raise_lift_if_still_off({"path_marker": "tv_off"})
+        self.assertIn(
+            ("remote/turn_off", {"entity_id": "remote.bedroom_apple_tv"}),
+            app.service_calls,
+        )
+        self.assertIn(app._raise_after_apple_refresh, scheduled_callbacks(app))
+
+
+class PowerVetoRetries(unittest.TestCase):
+    """A real off with lingering draw must not strand the lift: the veto now
+    re-checks (bounded) instead of bare-returning. Measured decay is
+    off -> ~17W within 1s, so in practice retries fire only on true blips."""
+
+    GLOWING = {
+        "media_player.bedroom_tv": "off",
+        "media_player.bedroom_sony_tv": "off",
+        "media_player.bedroom_apple_tv": "off",
+        POWER_SENSOR: "45.0",
+    }
+
+    def test_veto_reschedules_and_arms_blip_guard(self):
+        app = make_app(dict(self.GLOWING), power_sensor=POWER_SENSOR)
+        app._raise_lift_if_still_off({"path_marker": "tv_off"})
+        self.assertIsNotNone(app._blip_guard_until)
+        recheck = [(cb, kw) for cb, _d, kw in app.scheduled if cb == app._raise_lift_if_still_off]
+        self.assertEqual(len(recheck), 1)
+        self.assertEqual(recheck[0][1].get("power_veto_retries"), 1)
+        self.assertNotIn(
+            ("script/turn_on", {"entity_id": "script.bedroom_tv_lift_stop"}),
+            app.service_calls,
+        )
+
+    def test_veto_gives_up_after_three_retries(self):
+        app = make_app(dict(self.GLOWING), power_sensor=POWER_SENSOR)
+        app._raise_lift_if_still_off({"path_marker": "power_veto_retry", "power_veto_retries": 3})
+        self.assertEqual(app.scheduled, [])
+        self.assertNotIn(
+            ("script/turn_on", {"entity_id": "script.bedroom_tv_lift_stop"}),
+            app.service_calls,
+        )
+
+
+class StartupDarkPanelArbitration(unittest.TestCase):
+    """2026-07-27, 16:51: a freshly restarted app read AD's stale 'on' for
+    Sony + universal and re-lowered the lift over a 15.7W panel. The startup
+    check must route a state-claims-on/panel-dark contradiction to the OFF-path
+    arbitration instead of trusting the claim."""
+
+    def test_stale_on_with_dark_panel_arbitrates_instead_of_lowering(self):
+        app = make_app({
+            "media_player.bedroom_tv": "on",
+            "media_player.bedroom_sony_tv": "on",
+            "media_player.bedroom_apple_tv": "off",
+            POWER_SENSOR: "15.7",
+        }, power_sensor=POWER_SENSOR)
+        app._check_initial_tv_state()
+        self.assertIn(app._raise_lift_if_still_off, scheduled_callbacks(app))
+        self.assertNotIn(app._ensure_lift_down_if_tv_active, scheduled_callbacks(app))
+
+    def test_lit_panel_keeps_the_normal_startup_lower(self):
+        app = make_app({
+            "media_player.bedroom_tv": "on",
+            "media_player.bedroom_sony_tv": "on",
+            "media_player.bedroom_apple_tv": "off",
+            POWER_SENSOR: "130.0",
+        }, power_sensor=POWER_SENSOR)
+        app._check_initial_tv_state()
+        self.assertIn(app._ensure_lift_down_if_tv_active, scheduled_callbacks(app))
+        self.assertNotIn(app._raise_lift_if_still_off, scheduled_callbacks(app))
+
+
+class EnsureDownDarkGuard(unittest.TestCase):
+    """Periodic verification / ensure-down must never hold a lift DOWN over a
+    dark panel - that is how the 07-27 stale store pinned the lift all
+    afternoon. Deliberate ON transitions bypass (boot draw lags ~1s)."""
+
+    def test_dark_panel_blocks_a_stateless_ensure_down(self):
+        app = make_app({
+            "media_player.bedroom_tv": "on",
+            "media_player.bedroom_sony_tv": "on",
+            "media_player.bedroom_apple_tv": "off",
+            POWER_SENSOR: "2.5",
+        }, power_sensor=POWER_SENSOR)
+        app._get_lift_position = lambda: self.fail("dark guard must return before touching the lift")
+        app._ensure_lift_down_if_tv_active({})
+        self.assertEqual(app.service_calls, [])
 
 
 if __name__ == "__main__":

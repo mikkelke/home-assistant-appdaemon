@@ -42,11 +42,14 @@ bedroom_tv_control:
   sony_probe_port: 80
   sony_probe_interval_seconds: 4
 
-  # TV power meter (Shelly PM Mini, planned) - uncomment when installed and the
-  # entity exists. Becomes the truth source: instant lift-lower on real watts,
-  # and a veto against raising the lift over a glowing panel (Bravia off-blips).
-  # power_sensor: sensor.bedroom_tv_power
-  # power_on_watts: 25   # near-instant lower when TV turns on (an early/extra down is harmless; the raise side is the protected one)
+  # TV power meter (Shelly PM Mini, installed 2026-07-27) - measured: lit >=110W
+  # (steady ~130W), boot 30-50W for ~45s pre-panel, off->~17W within 1s, deep
+  # standby floor ~2.5W. 25W threshold clears all of it with margin. The truth
+  # source: instant lift-lower on real watts, veto against raising over a
+  # glowing panel, and dark-panel arbitration when state sources claim 'on'
+  # over a panel that draws standby watts (Bravia assumed_state / AD stale store).
+  power_sensor: sensor.bedroom_tv_relay_power
+  power_on_watts: 25   # near-instant lower when TV turns on (an early/extra down is harmless; the raise side is the protected one)
   
   # Lift command timing (to prevent conflicts and improve stability)
   min_lift_command_interval_s: 5.0  # Minimum seconds between lift commands

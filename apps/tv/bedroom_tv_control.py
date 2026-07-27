@@ -114,13 +114,21 @@ class BedroomTVControl(hass.Hass):
         except Exception:
             self.tv_on_debounce_seconds = 1.0
 
-        # TV power meter (Shelly PM Mini planned 2026-07-14) - THE truth source
-        # once installed. Set `power_sensor` in yaml to activate:
+        # TV power meter (Shelly PM Mini, installed 2026-07-27) - THE truth
+        # source. Measured on this Bravia: lit panel >=110W (steady ~130W),
+        # boot draw 30-50W for ~45s before the panel lights, warm post-off
+        # ~17W decaying to a ~2.5W deep-standby floor; off->17W happens
+        # within one second (no slow decay). Roles:
         #   - watts above `power_on_watts` while HA says off = the panel is ON:
         #     lower the lift instantly + kick the integration (beats both the
         #     state lag and the network probe's ~25 s network-boot wait)
         #   - watts above `power_on_watts` at raise time = VETO: the state is
         #     lying (Bravia off-blip) - never raise a lift over a glowing TV
+        #   - state claims on while watts <= `power_on_watts` = the claim is
+        #     disproven (dark panel): every state source can lie 'on' (Bravia
+        #     assumed_state; AD 4.5.13 dropped a state-store update 2026-07-27
+        #     and served an 11s-to-minutes stale 'on' even to a fresh app
+        #     instance) - kick the integration, re-check, then power wins
         self.power_sensor = self.args.get("power_sensor")
         self.power_on_watts = float(self.args.get("power_on_watts", 25))
         self._power_fired_at = None
@@ -407,6 +415,24 @@ class BedroomTVControl(hass.Hass):
                     except Exception as e:
                         self._apple_refresh_in_progress = False
                         self.log(f"Error sleeping Apple TV for refresh: {e}", level="ERROR")
+                    return
+                # Dark-panel arbitration (2026-07-27: AD's state store served a
+                # stale 'on' for Sony + universal even to a freshly restarted
+                # app, so this branch re-lowered the lift over a 16W panel).
+                # A dark panel disproves the 'on' claim - route to the OFF-path
+                # arbitration (kick + re-check + power-wins raise) instead of
+                # trusting it.
+                watts = self._panel_watts()
+                if watts is not None and watts <= self.power_on_watts and apple_state != "playing":
+                    self.log(
+                        f"Initial state check: state claims on (universal='{tv_state}', sony='{sony_state}') "
+                        f"but the panel draws {watts:.1f}W (dark) - arbitrating via power instead of lowering",
+                        level="WARNING",
+                    )
+                    try:
+                        self.run_in(self._raise_lift_if_still_off, 2, path_marker="initial_dark")
+                    except Exception as e:
+                        self.log(f"Error scheduling initial dark-panel arbitration: {e}", level="WARNING")
                     return
                 self.log(f"Initial state check: TV is on (state: '{tv_state}') - lowering lift to DOWN position", level="INFO")
                 # TV is on at startup - ensure lift is down
@@ -699,13 +725,17 @@ class BedroomTVControl(hass.Hass):
             tv_state = self.get_state(self.tv_entity)
             sony_state = self.get_state(self.sony_tv_entity)
             apple_state = self.get_state(self.apple_tv_entity)
+            watts = self._panel_watts()
+            panel_dark = watts is not None and watts <= self.power_on_watts
             # Auto-heal: the screen (Sony) and the universal player read off, but the Apple TV
             # was left active (e.g. paused) and is blocking the raise. Sony state is unreliable,
             # so refresh via the Apple TV remote - sleeping it (remote.turn_off) clears the stale
-            # active state - then raise the lift once it reports off.
-            sony_off = sony_state in ("off", "unavailable", "unknown", "standby", None)
+            # active state - then raise the lift once it reports off. A dark panel per the power
+            # meter disproves any 'on' claim, so it counts as off for this decision.
+            sony_off = sony_state in ("off", "unavailable", "unknown", "standby", None) or panel_dark
             apple_active = apple_state in ("paused", "idle", "on")  # NOT "playing": genuine playback must never be slept/refreshed/raised
-            if tv_state == "off" and sony_off and apple_active and self.apple_tv_reset_enabled and not self._apple_refresh_in_progress:
+            if (tv_state == "off" or panel_dark) and sony_off and apple_active \
+                    and self.apple_tv_reset_enabled and not self._apple_refresh_in_progress:
                 self._apple_refresh_in_progress = True
                 self.log(
                     f"TV OFF but Apple TV still active (sony='{sony_state}', apple='{apple_state}') "
@@ -719,25 +749,73 @@ class BedroomTVControl(hass.Hass):
                     self._apple_refresh_in_progress = False
                     self.log(f"Error sleeping Apple TV for refresh: {e}", level="ERROR")
                 return
-            self.log(
-                f"TV OFF debounce complete but TV still active "
-                f"(universal='{tv_state}', sony='{sony_state}', apple='{apple_state}') - skipping lift raise",
-                level="INFO",
-            )
-            return
+            # Dark-panel arbitration: state sources can all lie 'on' (Bravia
+            # assumed_state; AD 4.5.13 served a stale store 'on' for 6+ min on
+            # 2026-07-27 while HA itself was off the whole time) but a panel
+            # drawing <= power_on_watts cannot be lit. Kick the integration so
+            # a fresh state event flushes the lie, re-check a few times, and
+            # if the claim never corrects, power wins and the lift raises.
+            if panel_dark and apple_state != "playing":
+                attempt = int(kwargs.get("dark_panel_attempts", 0))
+                if attempt < 3:
+                    self.log(
+                        f"State claims on (universal='{tv_state}', sony='{sony_state}') but the panel "
+                        f"draws {watts:.1f}W (dark) - kicking integration, re-check {attempt + 1}/3 in 20s",
+                        level="WARNING",
+                    )
+                    try:
+                        self.call_service("homeassistant/update_entity", entity_id=self.sony_tv_entity)
+                    except Exception as e:
+                        self.log(f"dark-panel update_entity kick failed: {e}", level="WARNING")
+                    try:
+                        self._pending_raise_handle = self.run_in(
+                            self._raise_lift_if_still_off, 20,
+                            path_marker="dark_panel", dark_panel_attempts=attempt + 1)
+                    except Exception as e:
+                        self.log(f"Error scheduling dark-panel re-check: {e}", level="ERROR")
+                    return
+                self.log(
+                    f"Panel dark ({watts:.1f}W) through three re-checks while state still claims on "
+                    f"(universal='{tv_state}', sony='{sony_state}', apple='{apple_state}') "
+                    "- power is truth: raising lift",
+                    level="WARNING",
+                )
+                # fall through to the raise below (dark => the power veto cannot fire)
+            else:
+                self.log(
+                    f"TV OFF debounce complete but TV still active "
+                    f"(universal='{tv_state}', sony='{sony_state}', apple='{apple_state}') - skipping lift raise",
+                    level="INFO",
+                )
+                return
 
         if self._tv_draws_power():
             # Power veto: never raise the lift over a glowing panel. A state
             # 'off' with real wattage = the Bravia integration lying again.
+            # Bounded re-checks so a real off with lingering draw cannot
+            # strand the lift down (nothing else would re-trigger the raise);
+            # measured decay is off->17W in ~1s, so retries should be rare.
             self._blip_guard_until = self.datetime() + timedelta(hours=self.blip_guard_hours)
+            retries = int(kwargs.get("power_veto_retries", 0))
+            if retries < 3:
+                try:
+                    self._pending_raise_handle = self.run_in(
+                        self._raise_lift_if_still_off, 60,
+                        path_marker="power_veto_retry", power_veto_retries=retries + 1)
+                except Exception as e:
+                    self.log(f"Error scheduling power-veto re-check: {e}", level="ERROR")
             self.log(
                 "State says off but the TV draws power - integration blip: "
-                "NOT raising (power veto), blip-guard armed",
+                "NOT raising (power veto), blip-guard armed"
+                + (f", re-check {retries + 1}/3 in 60s" if retries < 3
+                   else ", giving up until the next TV-off event"),
                 level="WARNING",
             )
             return
 
-        self.log("TV OFF verified (Sony + Apple TV): raising lift to UP position", level="INFO")
+        watts = self._panel_watts()
+        power_note = f" (panel {watts:.1f}W)" if watts is not None else ""
+        self.log(f"TV OFF verified (Sony + Apple TV): raising lift to UP position{power_note}", level="INFO")
         try:
             self._reset_lift_action_flag()
             self._lift_action_in_progress = True
@@ -768,6 +846,21 @@ class BedroomTVControl(hass.Hass):
         else:
             sony_state = self.get_state(self.sony_tv_entity)
             apple_state = self.get_state(self.apple_tv_entity)
+            watts = self._panel_watts()
+            if watts is not None and watts <= self.power_on_watts and apple_state != "playing":
+                # The refresh slept the Apple TV yet state still claims on -
+                # with the panel dark that claim is disproven: power is truth.
+                self.log(
+                    f"After Apple TV refresh state still claims on (sony='{sony_state}', "
+                    f"apple='{apple_state}') but the panel draws {watts:.1f}W (dark) "
+                    "- power is truth: raising lift",
+                    level="WARNING",
+                )
+                try:
+                    self.run_in(self._raise_lift_after_stop, 1, path_marker="apple_refresh_dark", allow_immediate_after_stop=True)
+                except Exception as e:
+                    self.log(f"Error scheduling dark-panel raise after Apple TV refresh: {e}", level="ERROR")
+                return
             self.log(
                 f"After Apple TV refresh, TV still not off (sony='{sony_state}', apple='{apple_state}') - not raising",
                 level="WARNING",
@@ -876,6 +969,20 @@ class BedroomTVControl(hass.Hass):
             # state still lags (deep-standby TVs vanish from the network; the
             # integration can need minutes to reconnect after CEC power-on).
             if self._is_tv_actually_on() or kwargs.get("probe_confirmed", False):
+                # Dark-panel guard: never lower or hold a lift down over a
+                # panel drawing <= power_on_watts - the 'on' claim is stale or
+                # lying (AD stale store / Bravia assumed_state). Deliberate ON
+                # transitions bypass: for the first ~1s of a power-on the
+                # draw hasn't ramped yet (crosses the threshold within ~1s).
+                if not kwargs.get("from_tv_on_transition", False):
+                    watts = self._panel_watts()
+                    if watts is not None and watts <= self.power_on_watts:
+                        self.log(
+                            f"Ensure-down requested while the panel draws {watts:.1f}W (dark) - "
+                            "state claim distrusted, not lowering/holding",
+                            level="WARNING",
+                        )
+                        return
                 # Check if we think lift is already down
                 current_position = self._get_lift_position()
                 self.log(f"TV is active (state: '{tv_state}'), current lift position: '{current_position}'", level="DEBUG")
@@ -1063,14 +1170,19 @@ class BedroomTVControl(hass.Hass):
         elif scene == self.button_2_property_key and value == "KeyPressed": # Volume up
             self.adjust_volume(self.volume_step)
 
+    def _panel_watts(self):
+        """Power meter reading in watts, or None when no meter / no data."""
+        if not self.power_sensor:
+            return None
+        try:
+            return float(self.get_state(self.power_sensor))
+        except (TypeError, ValueError):
+            return None
+
     def _tv_draws_power(self):
         """True when the power meter (if configured) reads the panel as ON."""
-        if not self.power_sensor:
-            return False
-        try:
-            return float(self.get_state(self.power_sensor)) > self.power_on_watts
-        except (TypeError, ValueError):
-            return False
+        watts = self._panel_watts()
+        return watts is not None and watts > self.power_on_watts
 
     def _on_tv_power(self, entity, attribute, old, new, kwargs):
         try:
