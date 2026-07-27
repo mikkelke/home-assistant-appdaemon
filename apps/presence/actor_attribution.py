@@ -88,7 +88,7 @@ _MISSING = object()
 # appended when this PAIR changes from the previous entry - e.g. person.claudia moving
 # between "not_home" and a zone name ("Gym") is still just "away" and does not grow the
 # log. Kept as an immutable tuple of these and always replaced wholesale
-# (self._log = self._log + (entry,)) - AppDaemon calls listen_state callbacks from
+# (self._snapshot_log = self._snapshot_log + (entry,)) - AppDaemon calls listen_state callbacks from
 # worker threads, so a list another thread might be iterating must never be mutated.
 _Snapshot = collections.namedtuple("_Snapshot", ("ts", "home", "unobservable"))
 
@@ -112,12 +112,20 @@ class ActorAttribution(hass.Hass):
     # initialize() has run (e.g. a call that races app startup) or on a bare test
     # double - constraint: attribute() must never raise AttributeError chasing state
     # that initialize() hasn't set yet. Everything attribute() reads lives here.
-    _log = ()                 # tuple[_Snapshot], ascending by ts, append-only
+    #
+    # NAMING LANDMINE (cost a failed deploy 2026-07-27): this must NOT be called
+    # `_log`. AppDaemon's own ADAPI.log() calls `self._log(logger, msg, level, ...)`
+    # internally, so an app attribute named `_log` shadows that method and every
+    # self.log() in this class dies with "TypeError: 'tuple' object is not callable" -
+    # including the ones inside except blocks, which turns any small failure into an
+    # unstartable app. Unit tests cannot catch it: they monkeypatch self.log.
+    _snapshot_log = ()        # tuple[_Snapshot], ascending by ts, append-only
     _door_events = ()         # tuple[datetime]: door OPEN edges only, ascending
     _door_state = None        # last known raw door_entity state (None -> unobservable)
     stability_seconds = 600
     door_settle_seconds = 300
     retention_hours = 26
+    backfill_retry_delays = (30, 60, 120, 300)
 
     def initialize(self):
         a = self.args.get
@@ -129,6 +137,9 @@ class ActorAttribution(hass.Hass):
         self.door_settle_seconds = int(a("door_settle_seconds", 300))
         self.retention_hours = float(a("retention_hours", 26))
         self.publish_sensor = a("publish_sensor", "sensor.household_actor")
+        # Backoff for re-seeding from history when the HASS websocket isn't up yet after a
+        # restart (see _schedule_backfill_retry). Spans ~9 min, well past a normal reconnect.
+        self.backfill_retry_delays = list(a("backfill_retry_delays", [30, 60, 120, 300]))
 
         self._person_state = {}  # person_key -> last known raw HA state (tick/log cache)
 
@@ -262,9 +273,9 @@ class ActorAttribution(hass.Hass):
         }
 
     def _snapshots_covering_window(self, win_start, win_end):
-        """Every self._log entry whose validity overlaps [win_start, win_end]: the entry
+        """Every self._snapshot_log entry whose validity overlaps [win_start, win_end]: the entry
         already in effect AT win_start (the "carry-in"), if any, plus every later entry
-        that starts at-or-before win_end. self._log is append-only and sorted ascending
+        that starts at-or-before win_end. self._snapshot_log is append-only and sorted ascending
         by ts, so a single forward pass suffices.
 
         Returns [] whenever there is no carry-in (no entry at or before win_start) - even
@@ -274,7 +285,7 @@ class ActorAttribution(hass.Hass):
         rule 1 ("no_history") exists to catch."""
         carry = None
         within = []
-        for entry in self._log:
+        for entry in self._snapshot_log:
             if entry.ts <= win_start:
                 carry = entry
             elif entry.ts <= win_end:
@@ -425,7 +436,7 @@ class ActorAttribution(hass.Hass):
             self.log(f"ActorAttribution tick failed: {e}", level="ERROR")
 
     def _backfill(self, kwargs):
-        """Seed self._log/_door_events/_door_state from HA history so attribute() has
+        """Seed self._snapshot_log/_door_events/_door_state from HA history so attribute() has
         real coverage as soon as live traffic starts, instead of needing
         retention_hours of fresh uptime before rule 1 ("no_history") stops firing for
         every call. Runs from the run_in(..., 5) callback armed in initialize() so
@@ -518,20 +529,54 @@ class ActorAttribution(hass.Hass):
                     last_pair = pair
 
             self._person_state = current
-            self._log = tuple(log_entries)
+            self._snapshot_log = tuple(log_entries)
             self._door_events = tuple(sorted(door_open_events))
             self._prune_log(now)
             self._prune_door_events(now)
 
             self.log(
-                f"ActorAttribution backfill complete: {len(self._log)} presence "
+                f"ActorAttribution backfill complete: {len(self._snapshot_log)} presence "
                 f"transition(s), {len(self._door_events)} door-open event(s) over the "
                 f"last {self.retention_hours:.0f}h",
                 level="INFO",
             )
             self._publish()
+            if not self._snapshot_log:
+                # Seeded nothing at all. On a full AppDaemon restart the HASS websocket is
+                # often still connecting, and get_history then raises "Unexpected result
+                # from history: None" for every entity (seen 2026-07-27 23:01). Live
+                # listen_state traffic plus _tick would eventually repopulate the log, but
+                # only from NOW - and a delayed-start anchor points at a door close hours
+                # back, which would resolve to no_history forever. So retry rather than
+                # limp along blind.
+                self._schedule_backfill_retry(kwargs)
         except Exception as e:
             self.log(f"ActorAttribution backfill failed, starting from an empty log: {e}", level="WARNING")
+            self._schedule_backfill_retry(kwargs)
+
+    def _schedule_backfill_retry(self, kwargs):
+        """Re-arm _backfill with backoff while history stays unavailable. Bounded: after
+        the last attempt the app still works, just only from live traffic onward (the
+        seven rules degrade to no_history, never to a guess)."""
+        attempt = int((kwargs or {}).get("attempt", 0)) + 1
+        delays = self.backfill_retry_delays
+        if attempt > len(delays):
+            self.log(
+                "ActorAttribution backfill: giving up after "
+                f"{len(delays)} retries - attribution will work from live traffic only "
+                "until the next restart (anchors older than that resolve to no_history)",
+                level="WARNING",
+            )
+            return
+        delay = delays[attempt - 1]
+        self.log(
+            f"ActorAttribution backfill: retrying in {delay}s (attempt {attempt}/{len(delays)})",
+            level="INFO",
+        )
+        try:
+            self.run_in(self._backfill, delay, attempt=attempt)
+        except Exception as e:
+            self.log(f"ActorAttribution backfill: could not schedule retry: {e}", level="WARNING")
 
     def _flatten_history(self, hist, entity_id=None):
         """AppDaemon get_history returns list[list[dict]] (or occasionally dict).
@@ -556,9 +601,9 @@ class ActorAttribution(hass.Hass):
         regardless of content."""
         home = frozenset(p for p, s in self._person_state.items() if s == "home")
         unobservable = frozenset(p for p, s in self._person_state.items() if s in _UNOBSERVABLE_STATES)
-        if self._log and self._log[-1].home == home and self._log[-1].unobservable == unobservable:
+        if self._snapshot_log and self._snapshot_log[-1].home == home and self._snapshot_log[-1].unobservable == unobservable:
             return False
-        self._log = self._log + (_Snapshot(ts, home, unobservable),)
+        self._snapshot_log = self._snapshot_log + (_Snapshot(ts, home, unobservable),)
         self._prune_log(ts)
         return True
 
@@ -569,16 +614,16 @@ class ActorAttribution(hass.Hass):
         cutoff must reach back that far too, or _snapshots_covering_window would
         wrongly report no_history right at the retention edge. Keeps one carry-in entry
         older than the cutoff (whatever state was already in effect going into the
-        retained span) plus everything at/after it. Always replaces self._log wholesale
+        retained span) plus everything at/after it. Always replaces self._snapshot_log wholesale
         with a new tuple - never mutates the old one in place, since AppDaemon calls
         listen_state callbacks from worker threads that might be iterating it."""
         now = now or self._now_utc()
         cutoff = now - timedelta(hours=self.retention_hours) - timedelta(seconds=self.stability_seconds)
-        kept = tuple(e for e in self._log if e.ts >= cutoff)
-        older = [e for e in self._log if e.ts < cutoff]
+        kept = tuple(e for e in self._snapshot_log if e.ts >= cutoff)
+        older = [e for e in self._snapshot_log if e.ts < cutoff]
         if older:
             kept = (older[-1],) + kept
-        self._log = kept
+        self._snapshot_log = kept
 
     def _prune_door_events(self, now=None):
         """Same reasoning as _prune_log but for door_settle_seconds instead of
@@ -600,7 +645,7 @@ class ActorAttribution(hass.Hass):
                 state = verdict["person"]
             else:
                 state = _REASON_TO_STATE.get(verdict["reason"], "unobservable")
-            stable_since = self._log[-1].ts if self._log else None
+            stable_since = self._snapshot_log[-1].ts if self._snapshot_log else None
             last_door_open = self._door_events[-1] if self._door_events else None
             self.set_state(
                 self.publish_sensor,

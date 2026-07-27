@@ -51,7 +51,7 @@ def make_app(person_entities=None, door_entity="binary_sensor.apartment_door_ope
 
     app._person_state = {}
     app._door_state = door_state
-    app._log = ()
+    app._snapshot_log = ()
     app._door_events = ()
 
     app.log_calls = []
@@ -74,7 +74,7 @@ class SoleOccupantAndMultiOccupantTests(unittest.TestCase):
     def test_rule7_exactly_one_person_home_is_attributed(self):
         app = make_app()
         app._now_utc = lambda: BASE
-        app._log = (snap(BASE - timedelta(seconds=900), home=("claudia",)),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("claudia",)),)
 
         result = app.attribute("dryer_empty")
 
@@ -89,7 +89,7 @@ class SoleOccupantAndMultiOccupantTests(unittest.TestCase):
     def test_rule6_two_people_home_is_multi_occupant(self):
         app = make_app()
         app._now_utc = lambda: BASE
-        app._log = (snap(BASE - timedelta(seconds=900), home=("mikkel", "kristine")),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel", "kristine")),)
 
         result = app.attribute("washer_start")
 
@@ -106,7 +106,7 @@ class NobodyHomeTests(unittest.TestCase):
     def test_rule5_empty_home_set_is_nobody_home_and_logs_info(self):
         app = make_app()
         app._now_utc = lambda: BASE
-        app._log = (snap(BASE - timedelta(seconds=900), home=()),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=()),)
 
         result = app.attribute("washer_start")
 
@@ -123,7 +123,7 @@ class PresenceUnstableTests(unittest.TestCase):
     def test_rule3_home_set_change_inside_window_is_unstable(self):
         app = make_app()  # stability_seconds=600
         app._now_utc = lambda: BASE
-        app._log = (
+        app._snapshot_log = (
             snap(BASE - timedelta(seconds=900), home=("mikkel",)),               # before window
             snap(BASE - timedelta(seconds=200), home=("mikkel", "kristine")),    # inside window
         )
@@ -136,7 +136,7 @@ class PresenceUnstableTests(unittest.TestCase):
     def test_single_stable_entry_spanning_the_whole_window_is_not_unstable(self):
         app = make_app()
         app._now_utc = lambda: BASE
-        app._log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
 
         result = app.attribute("washer_start")
 
@@ -153,7 +153,7 @@ class PresenceUnobservableTests(unittest.TestCase):
         app._now_utc = lambda: BASE
         # kristine unobservable while mikkel is (otherwise) alone - home-set itself never
         # changes (only the unobservable set gains kristine), isolating rule 2 from rule 3.
-        app._log = (snap(BASE - timedelta(seconds=900), home=("mikkel",), unobs=("kristine",)),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel",), unobs=("kristine",)),)
 
         result = app.attribute("washer_start")
 
@@ -169,7 +169,7 @@ class PresenceUnobservableTests(unittest.TestCase):
         app._now_utc = lambda: BASE
         # kristine's raw state was "Work" at the moment this snapshot was taken; she
         # never appears in home nor unobservable - mikkel is the clean sole occupant.
-        app._log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
 
         result = app.attribute("washer_start")
 
@@ -183,7 +183,7 @@ class DoorEventRecentTests(unittest.TestCase):
     def test_rule4_door_open_within_settle_window_before_anchor_blocks_attribution(self):
         app = make_app()
         app._now_utc = lambda: BASE
-        app._log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
         app._door_events = (BASE - timedelta(seconds=60),)  # opened 1 min ago, settle=300s
 
         result = app.attribute("washer_start")
@@ -194,7 +194,7 @@ class DoorEventRecentTests(unittest.TestCase):
     def test_door_open_after_anchor_does_not_block_backward_looking_only(self):
         app = make_app()
         app._now_utc = lambda: BASE
-        app._log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
         app._door_events = (BASE + timedelta(seconds=10),)  # opens AFTER the anchor
 
         result = app.attribute("washer_start")
@@ -205,7 +205,7 @@ class DoorEventRecentTests(unittest.TestCase):
     def test_door_open_outside_settle_window_before_anchor_does_not_block(self):
         app = make_app()
         app._now_utc = lambda: BASE
-        app._log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
         app._door_events = (BASE - timedelta(seconds=301),)  # 1s outside the 300s settle window
 
         result = app.attribute("washer_start")
@@ -233,7 +233,7 @@ class NoHistoryTests(unittest.TestCase):
         # Only entry is INSIDE the window (100s ago); nothing at or before win_start
         # (600s ago) - there is no carry-in, so the first 500s of the window is a blind
         # spot we cannot vouch for.
-        app._log = (snap(BASE - timedelta(seconds=100), home=("mikkel",)),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=100), home=("mikkel",)),)
 
         result = app.attribute("washer_start")
 
@@ -244,7 +244,7 @@ class NoHistoryTests(unittest.TestCase):
         app = make_app(retention_hours=1)
         app._now_utc = lambda: BASE
         old_anchor = BASE - timedelta(hours=2)  # older than retention_hours=1
-        app._log = (snap(old_anchor - timedelta(seconds=900), home=("mikkel",)),)
+        app._snapshot_log = (snap(old_anchor - timedelta(seconds=900), home=("mikkel",)),)
 
         result = app.attribute("washer_start", at=old_anchor)
 
@@ -269,7 +269,7 @@ class RetentionPruningBoundaryTests(unittest.TestCase):
         # Newer than (retention cutoff 11:00 - stability_seconds 10min = 10:50), but
         # still older than the plain retention cutoff (11:00) itself.
         e2 = datetime(2026, 7, 27, 10, 55, 0, tzinfo=timezone.utc)
-        app._log = (snap(e1, home=("mikkel",)), snap(e2, home=("mikkel",)))
+        app._snapshot_log = (snap(e1, home=("mikkel",)), snap(e2, home=("mikkel",)))
         app._prune_log(now)
 
         anchor = datetime(2026, 7, 27, 11, 0, 0, tzinfo=timezone.utc)  # now - retention_hours
@@ -287,7 +287,7 @@ class DoorGuardHealthNoteTests(unittest.TestCase):
     def test_reason_note_present_when_door_entity_is_unobservable(self):
         app = make_app()
         app._now_utc = lambda: BASE
-        app._log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
         app._door_state = "unavailable"
 
         result = app.attribute("washer_start")
@@ -298,7 +298,7 @@ class DoorGuardHealthNoteTests(unittest.TestCase):
     def test_reason_note_absent_when_door_entity_observable(self):
         app = make_app()
         app._now_utc = lambda: BASE
-        app._log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
         app._door_state = "off"
 
         result = app.attribute("washer_start")
@@ -326,7 +326,7 @@ class NeverRaisesTests(unittest.TestCase):
 
     def test_corrupted_log_and_missing_log_method_falls_back_safely(self):
         app = aa.ActorAttribution.__new__(aa.ActorAttribution)
-        app._log = ("not-a-snapshot",)  # real entries are _Snapshot namedtuples
+        app._snapshot_log = ("not-a-snapshot",)  # real entries are _Snapshot namedtuples
         # app.log is deliberately left unset, exercising attribute()'s own
         # try/except-around-self.log fallback (self.log missing entirely is exactly the
         # pre-initialize() shape in production too - see class docstring).
@@ -343,7 +343,7 @@ class NeverRaisesTests(unittest.TestCase):
     def test_non_numeric_config_falls_back_safely(self):
         app = make_app()
         app._now_utc = lambda: BASE
-        app._log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
         app.stability_seconds = "not-a-number"  # corrupt config value
 
         try:
@@ -360,7 +360,7 @@ class ProbeTests(unittest.TestCase):
     def test_probe_returns_well_formed_dict_anchored_at_now(self):
         app = make_app()
         app._now_utc = lambda: BASE
-        app._log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
 
         result = app.probe()
 
@@ -408,8 +408,8 @@ class LiveListenerTests(unittest.TestCase):
 
         app._on_person_change("person.mikkel", "state", "not_home", "home", {"person": "mikkel"})
 
-        self.assertEqual(len(app._log), 1)
-        self.assertEqual(app._log[-1].home, frozenset({"mikkel"}))
+        self.assertEqual(len(app._snapshot_log), 1)
+        self.assertEqual(app._snapshot_log[-1].home, frozenset({"mikkel"}))
         self.assertEqual(len(app.set_state_calls), 1)
         self.assertEqual(app.set_state_calls[0][0], "sensor.household_actor")
 
@@ -418,12 +418,12 @@ class LiveListenerTests(unittest.TestCase):
         app._now_utc = lambda: BASE
         app.set_state = lambda *a, **kw: None
         app._person_state = {"mikkel": "not_home"}
-        app._log = (snap(BASE - timedelta(seconds=10)),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=10)),)
 
         # "not_home" -> "Gym": both classify as "away", not a real transition.
         app._on_person_change("person.mikkel", "state", "not_home", "Gym", {"person": "mikkel"})
 
-        self.assertEqual(len(app._log), 1)
+        self.assertEqual(len(app._snapshot_log), 1)
 
     def test_door_open_edge_is_recorded_once(self):
         app = make_app()
@@ -480,14 +480,14 @@ class TickReconcileTests(unittest.TestCase):
         self.assertEqual(app._person_state["mikkel"], "home")
         warnings = logged_at(app, "WARNING")
         self.assertTrue(any("person.mikkel" in str(a) for a in warnings))
-        self.assertEqual(len(app._log), 1)
-        self.assertEqual(app._log[-1].home, frozenset({"mikkel"}))
+        self.assertEqual(len(app._snapshot_log), 1)
+        self.assertEqual(app._snapshot_log[-1].home, frozenset({"mikkel"}))
 
     def test_tick_with_no_disagreement_does_not_grow_log_or_warn(self):
         app = make_app()
         app._now_utc = lambda: BASE
         app._person_state = {"mikkel": "home", "kristine": "not_home", "claudia": "not_home"}
-        app._log = (snap(BASE - timedelta(seconds=10), home=("mikkel",)),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=10), home=("mikkel",)),)
         states = {
             "person.mikkel": "home",
             "person.kristine": "not_home",
@@ -499,7 +499,7 @@ class TickReconcileTests(unittest.TestCase):
 
         app._tick({})
 
-        self.assertEqual(len(app._log), 1)
+        self.assertEqual(len(app._snapshot_log), 1)
         self.assertEqual(logged_at(app, "WARNING"), [])
 
     def test_tick_treats_a_freshly_discovered_open_door_as_an_edge(self):
@@ -572,10 +572,10 @@ class BackfillTests(unittest.TestCase):
 
         app._backfill({})
 
-        self.assertTrue(app._log)
-        self.assertIn("mikkel", app._log[-1].home)
-        self.assertIn("kristine", app._log[-1].unobservable)
-        self.assertEqual(app._log[0].ts, window_start)  # clamped up to the window start
+        self.assertTrue(app._snapshot_log)
+        self.assertIn("mikkel", app._snapshot_log[-1].home)
+        self.assertIn("kristine", app._snapshot_log[-1].unobservable)
+        self.assertEqual(app._snapshot_log[0].ts, window_start)  # clamped up to the window start
         self.assertEqual(len(app._door_events), 1)
         self.assertEqual(app._door_state, "on")
         self.assertTrue(logged_at(app, "WARNING"))  # kristine's missing history is flagged
@@ -595,7 +595,7 @@ class BackfillTests(unittest.TestCase):
         except Exception as e:  # pragma: no cover
             self.fail(f"_backfill raised: {e}")
 
-        self.assertEqual(app._log, ())
+        self.assertEqual(app._snapshot_log, ())
         self.assertEqual(app._door_events, ())
         result = app.attribute("washer_start")
         self.assertEqual(result["reason"], "no_history")
@@ -618,7 +618,7 @@ class BackfillTests(unittest.TestCase):
 
         app._backfill({})
 
-        self.assertEqual(app._log[0].ts, first_seen)  # NOT clamped down to window_start
+        self.assertEqual(app._snapshot_log[0].ts, first_seen)  # NOT clamped down to window_start
 
 
 class PublishTests(unittest.TestCase):
@@ -650,7 +650,7 @@ class PublishTests(unittest.TestCase):
     def test_publish_state_is_the_persons_key_when_attributed(self):
         app = make_app()
         app._now_utc = lambda: BASE
-        app._log = (snap(BASE - timedelta(seconds=900), home=("kristine",)),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("kristine",)),)
         calls = []
         app.set_state = lambda entity, **kw: calls.append((entity, kw))
 
@@ -664,13 +664,49 @@ class PublishTests(unittest.TestCase):
         app._now_utc = lambda: BASE
         calls = []
         app.set_state = lambda entity, **kw: calls.append((entity, kw))
-        app._log = (snap(BASE - timedelta(seconds=900), home=("mikkel", "kristine")),)
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel", "kristine")),)
 
         app._publish()
 
         state = calls[-1][1]["state"]
         self.assertTrue(state)
         self.assertEqual(state, "multi")
+
+
+class NoAppDaemonInternalShadowing(unittest.TestCase):
+    """Regression guard for the 2026-07-27 failed deploy: an instance attribute named
+    `_log` shadowed AppDaemon's own ADAPI._log method (which ADAPI.log calls internally),
+    so every self.log() in the app raised "TypeError: 'tuple' object is not callable" -
+    including the ones inside except blocks, making the app unstartable.
+
+    The unit suite could not catch it because every test monkeypatches self.log. This
+    test works structurally instead: no class-level attribute may collide with a
+    non-callable shadow of an ADAPI member."""
+
+    # ADAPI internals that apps must never shadow with data attributes. Kept explicit
+    # rather than introspected, so this test stays meaningful without AppDaemon installed.
+    RESERVED = {"_log", "log", "error", "args", "name", "AD", "logger", "set_state",
+                "get_state", "listen_state", "listen_event", "run_in", "run_every",
+                "get_history", "create_task", "call_service", "get_app"}
+
+    def test_no_class_attribute_shadows_an_adapi_member(self):
+        offenders = []
+        for name, value in vars(aa.ActorAttribution).items():
+            if name in self.RESERVED and not callable(value):
+                offenders.append(name)
+        self.assertEqual(offenders, [], f"class attributes shadow AppDaemon internals: {offenders}")
+
+    def test_no_instance_attribute_assigned_in_source_shadows_an_adapi_member(self):
+        # Catches `self._log = ...` anywhere in the module, not just class-level defaults.
+        import ast
+        src = Path(aa.__file__).read_text()
+        assigned = set()
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store):
+                if isinstance(node.value, ast.Name) and node.value.id == "self":
+                    assigned.add(node.attr)
+        clashes = sorted(assigned & self.RESERVED)
+        self.assertEqual(clashes, [], f"self.<attr> assignments shadow AppDaemon internals: {clashes}")
 
 
 if __name__ == "__main__":
