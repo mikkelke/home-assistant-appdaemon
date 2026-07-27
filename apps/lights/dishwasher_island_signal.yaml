@@ -5,6 +5,7 @@
 # Unemptied + kitchen PIR + dark: full group off; light.island_lights_sg on + island_light_1 green.
 # Unemptied, no kitchen PIR: all signal lights off, both AL off (presence required to light).
 # Not Unemptied: main AL on, SG AL off.
+# Leaving Unemptied while bright (door opened to empty): all signal lights OFF, no AL hand-back.
 DishwasherIslandSignal:
   module: dishwasher_island_signal
   class: DishwasherIslandSignal

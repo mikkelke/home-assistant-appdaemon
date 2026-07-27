@@ -6,7 +6,9 @@ elsewhere - this app is the **only** place that uses ``island_lights_sg`` + ``is
 
 Prefer **in-place color/power** via ``turn_on`` (brightness + ``hs_color``) when lights are already on - avoid ``turn_off``/``turn_on`` churn when switching dishwasher *mode* or when the island was already lit by family room lighting. Hue/ZHA often map ``rgb_color`` to ``color_temp`` in HA state while the lamp still looks chromatic; ``hs_color`` keeps entity state aligned with what you see.
 
-When not Unemptied, cleanup runs when **leaving** Unemptied (see ``_sync_signal``). **Startup:** if HA already says not Unemptied but AL switches are still in the dishwasher layout (anything other than main-on/SG-off), we run the same cleanup so a missed transition or AD restart cannot leave island light 1 green while ``sensor.dishwasher_state`` is Off.
+When not Unemptied, cleanup runs when **leaving** Unemptied (see ``_sync_signal``). Leaving while the
+bright full-group signal was active (or the room reads confirmed bright) ends with **everything off** -
+the AL ``turn_on_lights`` hand-back only runs in the dark path, where bulb1 rejoins the lit island. **Startup:** if HA already says not Unemptied but AL switches are still in the dishwasher layout (anything other than main-on/SG-off), we run the same cleanup so a missed transition or AD restart cannot leave island light 1 green while ``sensor.dishwasher_state`` is Off.
 
 **Unemptied with no kitchen PIR:** all island signal lights off and both AL switches off. Lights are only driven while ``kitchen_pir`` is on (bright green or dark solo). Enabling the SG AL switch during "idle" previously caused Adaptive Lighting to power bulbs with nobody present.
 
@@ -277,8 +279,21 @@ class DishwasherIslandSignal(hass.Hass):
     def _sync_signal(self, leaving_unemptied=False):
         if not self._is_unemptied():
             if leaving_unemptied:
-                self._clear_full_island_if_on()
+                was_bright_full_signal = self._dishwasher_full_island_active
                 self._dishwasher_full_island_active = False
+                if was_bright_full_signal or self._is_family_room_bright():
+                    # Emptied while bright: signal job done, island ends OFF. The
+                    # turn_on_lights applies below must not run here - right after
+                    # turn_off(full group) get_state(bulb1) still reads "on" for a
+                    # beat, and the hand-back re-lights the island white in a room
+                    # that wants no light (2026-07-24 19:10: on for ~6 min after
+                    # the door opened).
+                    self._release_dark_solo_manual_control()
+                    self._clear_manual_main_signal_bulb()
+                    self._all_signal_lights_off()
+                    self._set_al_not_unemptied()
+                    return
+                self._clear_full_island_if_on()
                 self._clear_dark_solo_signal()
                 self._clear_manual_main_signal_bulb()
                 if self._island_sg_light:
