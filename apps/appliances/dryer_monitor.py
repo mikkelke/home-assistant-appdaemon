@@ -168,14 +168,27 @@ class DryerMonitor(hass.Hass):
         # Restore previous state
         existing = self.get_state(self.state_entity)
         valid_states = ("Running", "Unemptied", "Paused", "Emptied")
+        # Only states that carry no cycle clock may be seeded from the mirror. Running/Paused live off
+        # cycle_start_time, which lived in the erased sensor's attributes and is gone with it: seeding
+        # them yields Running with start_time None, and the watchdog re-arm plus finish detection are
+        # gated on start_time, so the dryer would sit in Running forever (_confirm_finished sees
+        # run_min 0 and blocks on the 80% guard on every poll). Falling through to Off is the older,
+        # working behaviour - _power_changed re-detects a dryer that is genuinely still running.
+        seedable_states = ("Unemptied", "Emptied")
         if existing in (None, "unknown", "unavailable") and self.ui_state_select:
             helper_state = self.get_state(self.ui_state_select)
-            if helper_state in valid_states:
+            if helper_state in seedable_states:
                 self.log(
                     f"State seeded from {self.ui_state_select} - sensor was missing (HA restart?)",
                     level="INFO",
                 )
                 existing = helper_state
+            elif helper_state in valid_states:
+                self.log(
+                    f"{self.ui_state_select} says {helper_state} but the sensor is gone with its cycle "
+                    f"clock - not seeding; power detection re-establishes a dryer that is still running",
+                    level="INFO",
+                )
         self.state = existing if existing in valid_states else "Off"
         self._set_state_entity( state=self.state)
 

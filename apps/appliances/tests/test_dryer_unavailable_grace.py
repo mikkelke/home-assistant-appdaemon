@@ -424,17 +424,22 @@ class StateHelperSeedFallback(unittest.TestCase):
     branch a real sensor read would. washer_monitor.py and dishwasher_monitor.py carry the
     identical fallback (not separately covered here)."""
 
-    def test_missing_sensor_seeds_running_from_helper_and_invokes_restore(self):
+    def test_missing_sensor_does_not_seed_running_from_helper(self):
+        """Running/Paused are NOT seedable: cycle_start_time lived in the erased sensor's
+        attributes, so a seeded Running would have start_time None - and the watchdog re-arm and
+        finish detection are both gated on start_time, which left the dryer in Running forever
+        (run_min 0 blocks the 80% guard on every poll). Off is the older, working behaviour:
+        _power_changed re-detects a dryer that is genuinely still running."""
         app = make_full_init_app(sensor_state=None, helper_state="Running")
         app.initialize()
-        self.assertEqual(app.state, "Running")
-        self.assertEqual(app.restore_calls, ["running"])
-        seed_logs = [
+        self.assertEqual(app.state, "Off")
+        self.assertEqual(app.restore_calls, [])
+        skipped = [
             a for a, kw in app.log_calls
-            if kw.get("level") == "INFO" and "seeded" in str(a[0]).lower()
+            if kw.get("level") == "INFO" and "not seeding" in str(a[0]).lower()
         ]
-        self.assertTrue(seed_logs)
-        self.assertIn("input_select.dryer_state", str(seed_logs[0][0]))
+        self.assertTrue(skipped, "expected an INFO explaining why the Running mirror was not seeded")
+        self.assertIn("input_select.dryer_state", str(skipped[0][0]))
 
     def test_missing_sensor_seeds_unemptied_from_helper_and_invokes_restore(self):
         app = make_full_init_app(sensor_state="unavailable", helper_state="Unemptied")
@@ -462,3 +467,41 @@ class StateHelperSeedFallback(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StateHelperSeedIsClockFreeOnly(unittest.TestCase):
+    """The mirror may only reseed states that do not depend on cycle_start_time.
+
+    4086e2e seeded Running/Paused too; because initialize() republishes the erased sensor with no
+    attributes BEFORE the restore branch reads cycle_start_time back off it, start_time stayed None
+    and every timer that could end the cycle is gated on start_time - the machine sat in Running
+    forever with no announcement and no feedback record. Seeding only the clock-free states makes
+    that unreachable by construction.
+    """
+
+    def test_paused_mirror_is_not_seeded(self):
+        app = make_full_init_app(sensor_state=None, helper_state="Paused")
+        app.initialize()
+        self.assertEqual(app.state, "Off")
+        self.assertEqual(app.restore_calls, [])
+
+    def test_emptied_mirror_is_still_seeded(self):
+        app = make_full_init_app(sensor_state=None, helper_state="Emptied")
+        app.initialize()
+        self.assertEqual(app.state, "Emptied")
+
+    def test_unemptied_mirror_still_reaches_its_restore_branch(self):
+        """The case the mirror exists for: the empty-me reminder survives an HA restart."""
+        app = make_full_init_app(sensor_state=None, helper_state="Unemptied")
+        app.initialize()
+        self.assertEqual(app.state, "Unemptied")
+        self.assertEqual(app.restore_calls, ["unemptied"])
+
+    def test_unseedable_mirror_never_writes_the_helper_back(self):
+        """A rejected seed must stay read-only: writing Off back through _sync_ui_select would
+        destroy the only surviving evidence of the cycle."""
+        app = make_full_init_app(sensor_state=None, helper_state="Running")
+        app.initialize()
+        published = [kw.get("state") for kw in app.set_state_calls if "state" in kw]
+        self.assertNotIn("Running", published)
+        self.assertEqual(app.states.get("input_select.dryer_state"), "Running")

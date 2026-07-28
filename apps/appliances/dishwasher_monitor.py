@@ -274,14 +274,28 @@ class DishwasherMonitor(hass.Hass):
         # Restore previous state
         existing = self.get_state(self.state_entity)
         valid_states = ("Running", "Unemptied", "Paused", "Emptied", "Error")
+        # Only states that carry no cycle clock may be seeded from the mirror. Running/Paused live off
+        # cycle_start_time, which lived in the erased sensor's attributes and is gone with it: seeding
+        # them yields Running with start_time None, and poll_timer, classify_timer and the running
+        # watchdog are all gated on start_time - the dishwasher would end up with no timers at all and
+        # sit in Running forever (_confirm_finished sees run_min 0 and blocks on the 95% guard).
+        # Falling through to Off is the older, working behaviour - the bootstrap _power_changed
+        # re-detects a dishwasher that is genuinely still running.
+        seedable_states = ("Unemptied", "Emptied", "Error")
         if existing in (None, "unknown", "unavailable") and self.ui_state_select:
             helper_state = self.get_state(self.ui_state_select)
-            if helper_state in valid_states:
+            if helper_state in seedable_states:
                 self.log(
                     f"State seeded from {self.ui_state_select} - sensor was missing (HA restart?)",
                     level="INFO",
                 )
                 existing = helper_state
+            elif helper_state in valid_states:
+                self.log(
+                    f"{self.ui_state_select} says {helper_state} but the sensor is gone with its cycle "
+                    f"clock - not seeding; power detection re-establishes a cycle that is still running",
+                    level="INFO",
+                )
         self.state = existing if existing in valid_states else "Off"
         self._set_state_entity( state=self.state)
         if self.state == "Unemptied":
