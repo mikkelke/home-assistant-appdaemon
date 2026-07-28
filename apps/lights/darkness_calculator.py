@@ -45,10 +45,18 @@ Publish contract (unchanged from the previous implementation):
 Restart survival (2026-07-27): an HA restart erases every set_state-created entity above,
 but _publish_one only re-writes an entity when its snapshot tuple changed - if nothing
 environmental moved meanwhile, a restart-erased entity could stay missing for hours
-(consumers fall back to default_dark). Two layers close the gap: (a) the "plugin_started"
-event (fired on every HASS reconnect, not just AppDaemon's own boot) clears the snapshot
-cache and forces a full republish; (b) belt-and-braces, each periodic tick spot-checks one
-published entity in rotation and self-heals the same way if HA doesn't have it.
+(consumers fall back to default_dark). Two layers close the gap:
+  (a) an HA restart always re-runs initialize(): AD 4.5.13 terminates every app in the
+      namespace when the HASS plugin drops (notify_plugin_stopped -> check_app_updates
+      PLUGIN_FAILED) and only re-creates them after the reconnect (PLUGIN_RESTART), so the
+      app comes back with an empty snapshot cache and its own initial recompute republishes
+      everything. That is the primary heal - and it is the ONLY one available for this case:
+      a "plugin_started" event listener cannot work, because AD fires that event during the
+      reconnect while the apps are still torn down (plugin_management.py fires it at :166
+      and only schedules the app restart at :197), so no app callback exists to receive it.
+  (b) for the case where an entity disappears WITHOUT an app restart, each periodic tick
+      spot-checks one published entity in rotation and republishes everything if HA doesn't
+      have it (see _spotcheck_republish).
 """
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
@@ -190,16 +198,10 @@ class DarknessCalculator(hass.Hass):
                 self.log(f"[{zone}] restored {prev} from HA", level="INFO")
 
     def _register_listeners(self):
-        # AD 4.5.13 fires "plugin_started" on every HASS plugin (re)connect, not just
-        # AppDaemon's own boot - including the reconnect after an HA restart (same event
-        # AppDaemon's own conf/example_apps/switch_reset.py uses to detect "Home Assistant
-        # restart"; confirmed against the 4.5.13 source, plugin_management.py/hassplugin.py
-        # - there is no "plugin_restarted" event). An HA restart wipes every set_state
-        # entity this app owns, so the snapshot cache is left lying about what is actually
-        # published; clear it and force a full republish rather than waiting on the next
-        # environmental nudge (could otherwise be hours - see _spotcheck_republish for the
-        # belt-and-braces path covering whatever timing gap remains).
-        self.listen_event(self._on_plugin_started, "plugin_started")
+        # No HASS-reconnect event listener here on purpose: AD 4.5.13 tears every app in
+        # the namespace down while the plugin is disconnected and fires "plugin_started"
+        # before re-creating them, so such a listener never receives it. The post-restart
+        # republish is initialize()'s own recompute - see the module docstring.
         self.listen_state(self._on_outdoor, self.outdoor_sensor)
         if self.rain_sensor:
             self.listen_state(self._on_rain, self.rain_sensor)
@@ -460,12 +462,12 @@ class DarknessCalculator(hass.Hass):
 
     def _spotcheck_republish(self):
         """Cheap self-heal (2026-07-27): _publish_one's snapshot diff can skip set_state
-        entirely when nothing environmental changed, so an HA restart that wipes the
-        entity between recomputes can go unnoticed by the normal diff path even though
-        _on_plugin_started already covers the common case. Rotate through the published
-        entities one at a time (one get_state per tick - cheap) and if HA doesn't have an
-        entity this app believes it published, the cache is stale: drop it all and
-        republish everything."""
+        entirely when nothing environmental changed, so an entity that vanishes from HA
+        without this app restarting (the restart case is already covered by initialize())
+        goes unnoticed by the normal diff path. Rotate through the published entities one
+        at a time (one get_state per tick - cheap) and if HA doesn't have an entity this
+        app believes it published, the cache is stale: drop it all and republish
+        everything."""
         names = list(self._publish_snapshots.keys())
         if not names:
             return
@@ -516,15 +518,6 @@ class DarknessCalculator(hass.Hass):
     def _on_presence(self, entity, attribute, old, new, kwargs):
         """Occupancy only changes room_state labels, never the dark/bright classification."""
         self.run_in(lambda _: self._recompute_all(), 0)
-
-    def _on_plugin_started(self, event_name, data, kwargs):
-        """See _register_listeners: fires on every HASS (re)connect, including post-HA-
-        restart. Reuse the periodic safety net's re-pull-then-recompute path rather than
-        a bare recompute, so caches fed only by listen_state (which may not have replayed
-        yet) get a fresh get_state pull too."""
-        self.log("HA plugin (re)connected - clearing publish cache and forcing a full republish", level="INFO")
-        self._publish_snapshots.clear()
-        self._periodic()
 
     def _debounced_recompute_zone(self, zone):
         if not zone:

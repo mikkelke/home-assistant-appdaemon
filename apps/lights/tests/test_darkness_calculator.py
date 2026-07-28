@@ -37,8 +37,8 @@ ROOM_ENT = "sensor.room_state_testzone"
 def make_app(states=None, attrs=None, args=None):
     """DarknessCalculator built via the REAL initialize() against a fully faked AD
     surface (listen_state/listen_event/run_every/run_in are no-ops - nothing is
-    auto-invoked, so tests call _recompute_all/_periodic/_on_plugin_started/
-    _spotcheck_republish directly for full control)."""
+    auto-invoked, so tests call _recompute_all/_periodic/_spotcheck_republish
+    directly for full control)."""
     app = dc.DarknessCalculator.__new__(dc.DarknessCalculator)
     app.args = dict(args if args is not None else {"zones": ZONES})
 
@@ -69,37 +69,25 @@ def calls_for(app, entity):
     return [c for c in app.set_state_calls if c[0] == entity]
 
 
-class PluginStartedRegistration(unittest.TestCase):
-    """AD 4.5.13's real event is "plugin_started" (confirmed against the 4.5.13 source
-    and its own conf/example_apps/switch_reset.py) - there is no "plugin_restarted"."""
+class PostRestartRepublish(unittest.TestCase):
+    """An HA restart tears this app down and re-creates it: AD 4.5.13 terminates every app
+    in the namespace when the HASS plugin drops and only restarts them after the reconnect.
+    So the heal for restart-wiped entities is initialize()'s own recompute against an empty
+    snapshot cache. A "plugin_started" listener cannot serve that role - AD fires that event
+    while the apps are still terminated - hence no reconnect-event listener may be added."""
 
-    def test_registers_on_plugin_started(self):
+    def test_no_reconnect_event_listener_is_registered(self):
         app = make_app()
-        self.assertIn("plugin_started", app._event_listeners)
-        self.assertEqual(app._event_listeners["plugin_started"], app._on_plugin_started)
+        self.assertEqual(app._event_listeners, {})
 
-
-class OnPluginStarted(unittest.TestCase):
-    def test_clears_cache_and_forces_a_republish_of_the_diff_gated_entities(self):
-        app = make_app()
-        app._recompute_all()  # first-ever publish
-        self.assertEqual(len(calls_for(app, BIN_ENT)), 1)
-
-        # Baseline: nothing changed environmentally, so the snapshot-diff gate skips a
-        # re-write of bin/darkness (this is the bug: an HA-restart-wiped entity would
-        # stay missing here for as long as nothing environmental moves).
-        app._recompute_all()
-        self.assertEqual(len(calls_for(app, BIN_ENT)), 1)
-
-        # Isolate _on_plugin_started's own effect from the periodic spot-check it also
-        # triggers (via _periodic) by making every entity look present to that check.
-        app._states[BIN_ENT] = "on"
-        app._states[ROOM_ENT] = "Empty (Dark)"
-
-        # plugin_started must force a republish regardless of the unchanged snapshot.
-        app._on_plugin_started("plugin_started", {}, {})
-        self.assertEqual(len(calls_for(app, BIN_ENT)), 2)
-        self.assertEqual(len(calls_for(app, SEN_ENT)), 2)
+    def test_fresh_init_republishes_every_entity_even_when_ha_still_has_them(self):
+        # Entities present in HA (i.e. nothing environmental will look "changed" either):
+        # the first recompute after initialize() must still write all three, because the
+        # snapshot cache a restart starts with is empty.
+        app = make_app(states={BIN_ENT: "on", SEN_ENT: "dark", ROOM_ENT: "Empty (Dark)"})
+        app._recompute_all()  # the run_in(..., 2) that initialize() schedules
+        for ent in (BIN_ENT, SEN_ENT, ROOM_ENT):
+            self.assertEqual(len(calls_for(app, ent)), 1, ent)
 
 
 class SpotcheckRepublish(unittest.TestCase):

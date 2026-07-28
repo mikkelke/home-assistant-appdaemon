@@ -46,11 +46,14 @@ def make_app(states=None, **overrides):
     app.sustained_min = overrides.get("sustained_min", 5)
     app.end_after_min = overrides.get("end_after_min", 10)
     app.notify_target = "mikkel"
-    app.notify_on_end = False
+    app.notify_on_end = overrides.get("notify_on_end", False)
     app._in_episode = overrides.get("in_episode", False)
     app._condition_met_count = overrides.get("condition_met_count", 0)
     app._condition_not_met_count = overrides.get("condition_not_met_count", 0)
     app._last_gust_in_episode = overrides.get("last_gust_in_episode", 0.0)
+    # Default True: in_episode=True here stands for an episode this instance started.
+    # A rehydrated one (helper ON at startup, peak before the restart unknown) passes False.
+    app._peak_from_episode_start = overrides.get("peak_from_episode_start", True)
     app.mobile_notifier = overrides.get("mobile_notifier", None)
     app.get_state = _states_getter(states or {})
     app.call_service = AsyncMock()
@@ -176,6 +179,76 @@ class EpisodeLifecycle(unittest.IsolatedAsyncioTestCase):
         app.call_service.assert_not_awaited()
 
 
+class EpisodeEndPeakReporting(unittest.IsolatedAsyncioTestCase):
+    """The end message's gust figure. An episode this instance started has a real peak; a
+    rehydrated one (helper survived, the pre-restart peak did not) knows only what has been
+    measured since the restart - and possibly nothing at all, which must never be reported
+    as a peak of 0."""
+
+    @staticmethod
+    def _notifier():
+        return MagicMock(notify=AsyncMock())
+
+    @staticmethod
+    def _end_log(app):
+        return [c.args[0] for c in app.log.call_args_list if "Episode END" in str(c.args[0])][0]
+
+    async def test_own_episode_reports_the_measured_peak(self):
+        notifier = self._notifier()
+        app = make_app(
+            CALM_STATES, in_episode=True, end_after_min=1, last_gust_in_episode=62.0,
+            notify_on_end=True, mobile_notifier=notifier,
+        )
+        await app._check_conditions({})
+        self.assertFalse(app._in_episode)
+        self.assertIn("Max gust was 62 km/h.", notifier.notify.await_args.kwargs["message"])
+        self.assertIn("max gust in episode: 62.0 km/h", self._end_log(app))
+
+    async def test_rehydrated_episode_without_a_windy_reading_reports_unknown_not_zero(self):
+        notifier = self._notifier()
+        app = make_app(
+            CALM_STATES, in_episode=True, peak_from_episode_start=False, end_after_min=1,
+            notify_on_end=True, mobile_notifier=notifier,
+        )
+        await app._check_conditions({})
+        self.assertFalse(app._in_episode)
+
+        message = notifier.notify.await_args.kwargs["message"]
+        self.assertIn("unknown", message.lower())
+        self.assertNotIn("0 km/h", message)
+        end_log = self._end_log(app)
+        self.assertIn("unknown", end_log.lower())
+        self.assertNotIn("0.0 km/h", end_log)
+
+    async def test_rehydrated_episode_qualifies_a_post_restart_peak(self):
+        notifier = self._notifier()
+        app = make_app(
+            CALM_STATES, in_episode=True, peak_from_episode_start=False, end_after_min=1,
+            last_gust_in_episode=45.0, notify_on_end=True, mobile_notifier=notifier,
+        )
+        await app._check_conditions({})
+
+        message = notifier.notify.await_args.kwargs["message"]
+        self.assertIn("45 km/h", message)
+        self.assertIn("since AppDaemon restarted", message)
+        self.assertIn("since restart: 45.0 km/h", self._end_log(app))
+
+    async def test_the_flag_is_reset_for_the_next_episode(self):
+        app = make_app(CALM_STATES, in_episode=True, peak_from_episode_start=False, end_after_min=1)
+        await app._check_conditions({})
+        self.assertTrue(app._peak_from_episode_start)
+        self.assertEqual(app._last_gust_in_episode, 0.0)
+
+    async def test_a_started_episode_owns_its_peak(self):
+        app = make_app(
+            WINDY_STATES, sustained_min=1, peak_from_episode_start=False,  # stale from before
+        )
+        await app._check_conditions({})
+        self.assertTrue(app._in_episode)
+        self.assertTrue(app._peak_from_episode_start)
+        self.assertEqual(app._last_gust_in_episode, 60.0)
+
+
 class EpisodeConditionsNow(unittest.TestCase):
     """_episode_conditions_now: the synchronous, init-only rehydration check."""
 
@@ -241,6 +314,7 @@ class RestartRehydration(unittest.TestCase):
     def test_helper_off_at_startup_seeds_not_in_episode(self):
         app = self._make({"input_boolean.easterly_wind_episode_active": "off"})
         self.assertFalse(app._in_episode)
+        self.assertTrue(app._peak_from_episode_start)  # next episode starts here
         # Only the pre-existing _check_episode_entity_exists run_in - no forced end.
         self.assertEqual(len(app.run_in_calls), 1)
 
@@ -252,6 +326,9 @@ class RestartRehydration(unittest.TestCase):
         states = dict(WINDY_STATES, **{"input_boolean.easterly_wind_episode_active": "on"})
         app = self._make(states)
         self.assertTrue(app._in_episode)
+        # The pre-restart peak is gone with the process - anything measured from here on
+        # covers only part of the episode.
+        self.assertFalse(app._peak_from_episode_start)
         self.assertEqual(len(app.run_in_calls), 1)  # no immediate-end scheduled
 
     def test_helper_on_but_unavailable_reading_does_not_force_an_end(self):

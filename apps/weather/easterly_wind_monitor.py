@@ -17,7 +17,10 @@ down by the time we come back up, waiting through another full end_after_minutes
 debounce would leave the helper stuck ON for no reason (we have no idea how long it's
 actually been calm) - a one-time definite reading at init instead runs the normal
 episode-end path (turn the helper off + end notification) immediately. No state file: the
-helper IS the persisted truth for episode-active/not.
+helper IS the persisted truth for episode-active/not. What the helper canNOT carry is the
+episode's peak gust: a rehydrated episode only knows what this instance has measured since
+the restart, so its end message qualifies that figure (or omits it entirely when nothing
+windy was seen) rather than reporting a peak that was never measured.
 """
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
@@ -56,6 +59,9 @@ class EasterlyWindMonitor(hass.Hass):
         self._condition_met_count = 0
         self._condition_not_met_count = 0
         self._last_gust_in_episode = 0.0
+        # False whenever the running episode began before this instance did: the gust peak
+        # then covers only the post-restart part of it and must be reported as such.
+        self._peak_from_episode_start = not self._in_episode
 
         self.mobile_notifier = None
         try:
@@ -231,9 +237,32 @@ class EasterlyWindMonitor(hass.Hass):
         mean_part = f", mean {mean:.1f}{suf}" if mean is not None else ""
         return f"gust up to {gust:.0f}{suf}{mean_part}"
 
+    def _episode_peak_text(self, ul: str) -> tuple[str, str]:
+        """(log phrase, notification phrase) for the ending episode's peak gust. A rehydrated
+        episode's true peak is unknowable - only what this instance measured after the restart
+        is - so it is never presented as the episode peak, and a rehydrated episode that ends
+        without a single windy reading reports no figure at all instead of a fabricated 0."""
+        if self._peak_from_episode_start:
+            return (
+                f"max gust in episode: {self._last_gust_in_episode:.1f}{ul}",
+                f"Max gust was {self._last_gust_in_episode:.0f}{ul}.",
+            )
+        if self._last_gust_in_episode <= 0.0:
+            return (
+                "max gust unknown - the episode started before this AppDaemon restart",
+                "Max gust unknown: the episode started before AppDaemon restarted.",
+            )
+        return (
+            f"max gust since restart: {self._last_gust_in_episode:.1f}{ul} "
+            "(episode started earlier, true peak unknown)",
+            f"Max gust since AppDaemon restarted was {self._last_gust_in_episode:.0f}{ul} "
+            "(the episode started earlier, so its true peak is unknown).",
+        )
+
     async def _start_episode(self, current_gust: float, speed: float | None):
         self._in_episode = True
         self._last_gust_in_episode = current_gust
+        self._peak_from_episode_start = True
 
         try:
             await self.call_service(
@@ -279,8 +308,9 @@ class EasterlyWindMonitor(hass.Hass):
         except Exception as e:
             self.log(f"Failed to turn off {self.episode_entity}: {e}. Create this helper in HA.", level="ERROR")
         ul = f" {self.wind_unit_label}" if self.wind_unit_label else ""
+        log_peak, notify_peak = self._episode_peak_text(ul)
         self.log(
-            f"Episode END (max gust in episode: {self._last_gust_in_episode:.1f}{ul})",
+            f"Episode END ({log_peak})",
             level="INFO",
         )
 
@@ -288,7 +318,7 @@ class EasterlyWindMonitor(hass.Hass):
             try:
                 await self.mobile_notifier.notify(
                     title="Easterly wind episode over",
-                    message=f"Episode ended. Max gust was {self._last_gust_in_episode:.0f}{ul}.",
+                    message=f"Episode ended. {notify_peak}",
                     target=self.notify_target,
                     category="weather",
                 )
@@ -296,3 +326,4 @@ class EasterlyWindMonitor(hass.Hass):
                 self.log(f"Notify (end) failed: {e}", level="WARNING")
 
         self._last_gust_in_episode = 0.0
+        self._peak_from_episode_start = True
