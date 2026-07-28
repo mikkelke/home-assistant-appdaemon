@@ -25,7 +25,13 @@ bedroom_blind_control:
   # Delay for sequential state checking to avoid race conditions (seconds)
   state_check_delay: 0.1
   # Delay before verifying position after service call (seconds)
-  verification_delay: 2.0
+  # Seconds to wait before checking the blind actually reached the commanded
+  # position. Measured 2026-07-27: this motor travels ~0.6 s per percent (38% ->
+  # 100% took 37 s), so the old 2.0 s fired while the blind was still moving and
+  # reported "low battery or motor issue" on EVERY full close - 99 false warnings
+  # in the logs, which is exactly how a real motor fault would get ignored. Must
+  # exceed the full-range travel time (~60 s) with margin.
+  verification_delay: 70.0
 
   # Target cover entity
   target_cover: "cover.bedroom_blind"
