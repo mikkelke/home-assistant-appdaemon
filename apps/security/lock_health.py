@@ -356,10 +356,14 @@ class LockHealth(hass.Hass):
             return
         # decision == "restore": the marker survived to this restart with the plug
         # still (or again) not reading "on" - turn it back on now, before anything else.
+        # Power is ALL this path touches: the notified latches stay exactly as loaded.
+        # Re-arming bridge_down here would re-run the whole bridge ladder after the
+        # startup grace and push a byte-identical second "still unreachable" alert (plus
+        # burn another plug-cycle slot) on every restart, for an incident the user has
+        # already been told about - and, because _check_all_clear only closes keys whose
+        # latch is still set, would also swallow that incident's all-clear. The bridge
+        # coming back is what ends the episode, not us restoring its power.
         self.call_service("switch/turn_on", entity_id=self.bridge_plug)
-        if self._notified.get("bridge_down"):
-            self._notified["bridge_down"] = False
-            self._clear_since["bridge_down"] = None
         self.run_in(self._plug_restore_confirm, 60)
         self._save_state()  # marker stays set until _plug_restore_confirm verifies
         self.log("LockHealth: plug was left off across a restart - restoring power and "
