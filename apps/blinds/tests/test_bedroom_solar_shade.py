@@ -97,8 +97,21 @@ def make_init_app(states=None, attrs=None, args=None):
         app._tick_cb = cb
 
     app.run_every = run_every
-    app.run_in = lambda cb, delay, **kw: None
-    app.log = lambda *a, **kw: None
+    # Real AppDaemon run_in returns a truthy handle; returning None here used to hide
+    # timer-handle logic from every test that relied on it.
+    app.scheduled = []
+
+    def run_in(cb, delay, **kw):
+        handle = object()
+        app.scheduled.append((cb, delay, kw, handle))
+        return handle
+
+    app.run_in = run_in
+    app.timer_running = lambda h: any(h is s[3] for s in app.scheduled)
+    app.cancel_timer = lambda h: app.scheduled.__setitem__(
+        slice(None), [s for s in app.scheduled if s[3] is not h])
+    app.log_calls = []
+    app.log = lambda *a, **kw: app.log_calls.append((a, kw))
     app.fire_event = lambda *a, **kw: None
     app.set_state_calls = []
     app.set_state = lambda entity, **kw: app.set_state_calls.append((entity, kw))
@@ -266,6 +279,92 @@ class OverrideSurvivesRestart(unittest.TestCase):
 
         last_entity, last_kwargs = app_after.set_state_calls[-1]
         self.assertNotEqual(last_kwargs.get("state"), "manual")
+
+
+class ManualMoveIsOneEpisode(unittest.TestCase):
+    """2026-07-27 22:28: one close of the bedroom curtain (38% -> 100%, 37 s) arrived as
+    SEVEN position callbacks about 5 s apart, and each was treated as its own manual move -
+    seven identical "pause shading 120 min" lines and seven state writes for a single
+    human action. The pause was correct; the bookkeeping was not."""
+
+    STEPS = ["47", "56", "65", "74", "83", "92", "100"]
+
+    def _app(self):
+        path = _fresh_state_path()
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        app = make_init_app(
+            states={"input_boolean.bedroom_solar_shade": "off"},
+            attrs={"cover.bedroom_blind": {"current_position": 38}},
+            args={"state_file": path},
+        )
+        app._now = datetime(2026, 7, 27, 20, 28, 0, tzinfo=timezone.utc)
+        app.get_now = lambda: app._now
+        app.log_calls = []          # drop init chatter
+        app.scheduled = []
+        return app
+
+    def _travel(self, app):
+        """Replay the real 5s-apart position reports of one close."""
+        for i, pos in enumerate(app_steps := self.STEPS):
+            app._now = datetime(2026, 7, 27, 20, 28, i * 5, tzinfo=timezone.utc)
+            app._on_cover_change("cover.bedroom_blind", "current_position", None, pos, {})
+        return app_steps
+
+    def _settle(self, app):
+        pending = [s for s in app.scheduled if s[0] == app._manual_move_settled]
+        self.assertEqual(len(pending), 1, "exactly one settle timer should be armed")
+        cb, _delay, kw, _h = pending[-1]
+        app._now = app._now + timedelta(seconds=app.manual_settle_s)
+        cb(kw)
+
+    def test_seven_reports_produce_one_log_line(self):
+        app = self._app()
+        self._travel(app)
+        # Nothing logged while the motor is still moving...
+        self.assertEqual(app.log_calls, [])
+        self._settle(app)
+        # ...and exactly one line once it stops, naming where it went.
+        self.assertEqual(len(app.log_calls), 1)
+        msg = str(app.log_calls[0])
+        self.assertIn("38%", msg)
+        self.assertIn("100%", msg)
+
+    def test_pause_runs_from_the_end_of_the_travel_not_the_start(self):
+        app = self._app()
+        self._travel(app)
+        # last step was at +30s, so the 120 min pause must expire 120 min after THAT
+        self.assertEqual(
+            app._override_until,
+            datetime(2026, 7, 27, 20, 28, 30, tzinfo=timezone.utc) + timedelta(minutes=120),
+        )
+
+    def test_pause_is_persisted_immediately_not_only_at_settle(self):
+        # An AppDaemon restart mid-travel must still know a manual move happened.
+        app = self._app()
+        app._now = datetime(2026, 7, 27, 20, 28, 0, tzinfo=timezone.utc)
+        app._on_cover_change("cover.bedroom_blind", "current_position", None, "47", {})
+        with open(app.state_file) as f:
+            self.assertIsNotNone(json.load(f).get("override_until"))
+
+    def test_a_later_separate_move_is_its_own_episode(self):
+        app = self._app()
+        self._travel(app)
+        self._settle(app)
+        app.log_calls = []
+        app.scheduled = []
+        # Hours later, a genuinely separate move must log again.
+        app._now = datetime(2026, 7, 28, 6, 0, 0, tzinfo=timezone.utc)
+        app._last_cmd = 100
+        app._on_cover_change("cover.bedroom_blind", "current_position", None, "38", {})
+        self._settle(app)
+        self.assertEqual(len(app.log_calls), 1)
+
+    def test_reports_within_tolerance_are_ignored_entirely(self):
+        app = self._app()
+        app._on_cover_change("cover.bedroom_blind", "current_position", None, "40", {})  # 38 -> 40
+        self.assertEqual(app.scheduled, [])
+        self.assertEqual(app.log_calls, [])
+        self.assertIsNone(app._override_until)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,27 @@
+# ============================================================================
+# READ THIS FIRST - the position numbers here are INVERTED vs Home Assistant.
+#
+# cover.bedroom_blind ("Bedroom curtain") is a BOTTOM-UP blackout curtain: dark
+# textile on the inside of the window that travels from the bottom edge upward.
+# Fully extended (fabric all the way up) = window COVERED = position 100.
+# Retracted at the bottom = window CLEAR = position 0.
+#
+# Home Assistant's cover convention is the opposite (0 = closed, 100 = open) and
+# it computes is_closed as "position == 0". So while the curtain is fully drawn,
+# HA reports  state: "open", current_position: 100.  That is not a bug and it is
+# not stale - it is the device's frame of reference disagreeing with HA's.
+#
+# Consequences when reading history or debugging:
+#   * NEVER conclude "the curtain was never closed" from state == "open".
+#     Read current_position and the DIRECTION of travel instead.
+#   * 38 -> 100 means closing.  100 -> 38 means opening to the partial position.
+#   * The state string literally cannot change here: this curtain never parks at
+#     0, so it reads "open" 24/7.
+#
+# Cost of forgetting: 2026-07-28, an investigation of "did the curtain close at
+# bedtime?" concluded it had not, because HA said "open" all night. It had - at
+# 22:28, 38% -> 100% over 37 s, via a held wall-remote button.
+# ============================================================================
 bedroom_blind_control:
   module: bedroom_blind_control
   class: BedroomBlindControl

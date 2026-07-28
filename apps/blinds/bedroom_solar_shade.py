@@ -19,6 +19,16 @@ Logic each tick:
     plenty of light -> close a step toward the max-shade cap to block more heat.
   * Respects manual/remote moves (pauses manual_pause_min) so it never fights bedroom_blind_control.
 
+POSITIONS ARE INVERTED vs Home Assistant's convention - read this before debugging.
+cover.bedroom_blind ("Bedroom curtain") is a BOTTOM-UP blackout curtain: dark textile
+inside the window travelling from the bottom edge upward. Fully extended (covered) = 100,
+retracted (window clear) = 0. HA's convention is the opposite and it derives is_closed from
+"position == 0", so while the curtain is fully drawn HA reports state: "open",
+current_position: 100. Every number in this app - the 38 privacy floor, "close a step",
+max-shade cap - is in the DEVICE's frame: higher = more covered. Never reason about this
+curtain from the state string; use current_position and direction of travel.
+See the banner in bedroom_blind_control.yaml for the incident this cost.
+
 Restart-safe (2026-07-27): the manual-pause deadline and the baseline position used to
 detect a manual move are persisted to bedroom_solar_shade_state.json and reloaded at
 init, so a deploy during shading hours can't immediately re-command a hand-set blind, and
@@ -78,8 +88,16 @@ class BedroomSolarShade(hass.Hass):
         self.dry_run = bool(a("dry_run", False))
         self.state_file = a("state_file", "/conf/apps/blinds/bedroom_solar_shade_state.json")
 
+        # Seconds of position-report silence that mean the motor has stopped. Must exceed
+        # the ~5 s it leaves between steps while travelling (measured 2026-07-27), and stay
+        # well under any sensible manual_pause_min.
+        self.manual_settle_s = float(a("manual_settle_seconds", 12))
+
         self._last_cmd = None
         self._override_until = None
+        # Manual-move episode tracking - see _on_cover_change / _manual_move_settled.
+        self._manual_settle_handle = None
+        self._manual_from_pos = None
         self._load_state()
         if self._last_cmd is None:
             # No persisted baseline (fresh install, or nothing commanded yet since the
@@ -173,14 +191,64 @@ class BedroomSolarShade(hass.Hass):
         return True
 
     def _on_cover_change(self, entity, attribute, old, new, kwargs):
+        """One hand/remote move is ONE manual move, however many position reports it emits.
+
+        This motor reports its position roughly every 5 s while travelling, so the single
+        close on 2026-07-27 22:28 (38% -> 100%, 37 s) arrived as SEVEN separate callbacks
+        and produced seven identical "pause shading 120 min" log lines and seven state
+        writes. The pause itself was right - it just said so seven times.
+
+        So: push the pause out on every step (it must run from the END of the travel, not
+        the start), persist immediately on the first step so an AppDaemon restart mid-travel
+        still knows a manual move happened, then log exactly once when the motor settles."""
         try:
             pos = int(float(new))
         except (TypeError, ValueError):
             return
-        if self._last_cmd is not None and abs(pos - self._last_cmd) > self.pos_tol:
-            self._override_until = self.get_now() + timedelta(minutes=self.manual_pause_min)
+        if self._last_cmd is None or abs(pos - self._last_cmd) <= self.pos_tol:
+            return
+
+        now = self.get_now()
+        self._override_until = now + timedelta(minutes=self.manual_pause_min)
+
+        if self._manual_settle_handle is None:
+            # First step of a new episode: remember where it started and persist now.
+            self._manual_from_pos = self._last_cmd
             self._save_state()
-            self.log(f"Manual blind move to {pos}% -> pause shading {self.manual_pause_min} min")
+        else:
+            self._safe_cancel_timer(self._manual_settle_handle)
+
+        try:
+            self._manual_settle_handle = self.run_in(self._manual_move_settled, self.manual_settle_s, pos=pos)
+        except Exception as e:
+            # Never let the settle timer swallow the move: fall back to the old
+            # log-immediately behaviour rather than losing the record entirely.
+            self._manual_settle_handle = None
+            self._save_state()
+            self.log(
+                f"Manual blind move to {pos}% -> pause shading {self.manual_pause_min} min "
+                f"(settle timer failed: {e})",
+                level="WARNING",
+            )
+
+    def _manual_move_settled(self, kwargs):
+        """The motor stopped reporting for manual_settle_s - the move is over."""
+        self._manual_settle_handle = None
+        pos = kwargs.get("pos")
+        frm = self._manual_from_pos
+        self._manual_from_pos = None
+        self._save_state()  # persist the final (latest) override_until
+        span = f"{frm}% -> {pos}%" if frm is not None else f"to {pos}%"
+        until = self._override_until.strftime("%H:%M") if self._override_until else "?"
+        self.log(f"Manual blind move {span} -> pause shading {self.manual_pause_min} min (until {until})")
+
+    def _safe_cancel_timer(self, handle):
+        """Cancel a timer only if still running (avoids invalid-handle warnings)."""
+        try:
+            if handle and self.timer_running(handle):
+                self.cancel_timer(handle)
+        except Exception:
+            pass
 
     # ---------- main ----------
     def _tick(self, kwargs=None):
