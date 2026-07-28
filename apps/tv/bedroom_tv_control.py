@@ -114,23 +114,38 @@ class BedroomTVControl(hass.Hass):
         except Exception:
             self.tv_on_debounce_seconds = 1.0
 
-        # TV power meter (Shelly PM Mini, installed 2026-07-27) - THE truth
-        # source. Measured on this Bravia: lit panel >=110W (steady ~130W),
-        # boot draw 30-50W for ~45s before the panel lights, warm post-off
-        # ~17W decaying to a ~2.5W deep-standby floor; off->17W happens
-        # within one second (no slow decay). Roles:
-        #   - watts above `power_on_watts` while HA says off = the panel is ON:
-        #     lower the lift instantly + kick the integration (beats both the
-        #     state lag and the network probe's ~25 s network-boot wait)
-        #   - watts above `power_on_watts` at raise time = VETO: the state is
-        #     lying (Bravia off-blip) - never raise a lift over a glowing TV
-        #   - state claims on while watts <= `power_on_watts` = the claim is
-        #     disproven (dark panel): every state source can lie 'on' (Bravia
-        #     assumed_state; AD 4.5.13 dropped a state-store update 2026-07-27
-        #     and served an 11s-to-minutes stale 'on' even to a fresh app
-        #     instance) - kick the integration, re-check, then power wins
+        # TV power meter (Shelly PM Mini, installed 2026-07-27) - THE truth source.
+        # Measured on this Bravia over a full 2 h viewing session (21:20-23:20 on
+        # 2026-07-27), which corrected the first day's numbers:
+        #   viewing   ~50W mean, ~55-60W typical peak, dipping to 24.9-27W on dark
+        #             scenes. The initial "lit >=110W, steady ~130W" reading was one
+        #             bright-content sample and is NOT representative.
+        #   boot      30-50W for ~45s before the panel lights (one ~100W spike)
+        #   standby   15-18W immediately after off, settling to ~0-2.5W
+        # Two thresholds, because the on-floor and the standby-ceiling are only ~8W
+        # apart and a single line cannot serve both directions:
+        #   - watts above `power_on_watts` (25) while HA says off = the panel is ON:
+        #     lower the lift instantly + kick the integration (beats both the state
+        #     lag and the network probe's ~25 s network-boot wait). Must clear standby.
+        #   - watts at or below `power_dark_watts` (20) = the panel is DARK. Must sit
+        #     UNDER the viewing dip floor, or a dark scene disarms the veto mid-movie.
+        #     Used by: the raise VETO (never raise over a glowing panel when state
+        #     lies 'off'), the dark-panel arbitration (state claims 'on' over a dark
+        #     panel = the claim is disproven - Bravia assumed_state, or AD 4.5.13
+        #     serving a stale store 'on' as it did on 2026-07-27 - so kick, re-check,
+        #     then power wins), the ensure-down guard, and the falling-edge belt.
         self.power_sensor = self.args.get("power_sensor")
         self.power_on_watts = float(self.args.get("power_on_watts", 25))
+        # Separate, LOWER line for "the panel is dark". Measured over a real 2 h viewing
+        # session 2026-07-27 21:20-23:20: normal viewing sits at ~50W mean (NOT the ~130W
+        # the first bright-content sample suggested) and dips to 24.9-27W several times per
+        # 5 min on dark scenes, while standby is 15-18W settling to ~0-2.5W. A single
+        # threshold at 25W therefore reads "dark" mid-movie: it would silently disarm the
+        # raise veto and feed the dark-panel arbitration during genuine viewing - the exact
+        # "lift goes up during a movie" class this whole system exists to prevent. So:
+        # on-detection stays at power_on_watts (must clear standby), dark-detection uses
+        # this lower line (must sit under the viewing floor).
+        self.power_dark_watts = float(self.args.get("power_dark_watts", 20))
         try:
             self.power_off_confirm_seconds = float(self.args.get("power_off_confirm_seconds", 3))
         except Exception:
@@ -440,7 +455,7 @@ class BedroomTVControl(hass.Hass):
                 # arbitration (kick + re-check + power-wins raise) instead of
                 # trusting it.
                 watts = self._panel_watts()
-                if watts is not None and watts <= self.power_on_watts and apple_state != "playing":
+                if watts is not None and watts <= self.power_dark_watts and apple_state != "playing":
                     self.log(
                         f"Initial state check: state claims on (universal='{tv_state}', sony='{sony_state}') "
                         f"but the panel draws {watts:.1f}W (dark) - arbitrating via power instead of lowering",
@@ -743,7 +758,7 @@ class BedroomTVControl(hass.Hass):
             sony_state = self.get_state(self.sony_tv_entity)
             apple_state = self.get_state(self.apple_tv_entity)
             watts = self._panel_watts()
-            panel_dark = watts is not None and watts <= self.power_on_watts
+            panel_dark = watts is not None and watts <= self.power_dark_watts
             # Auto-heal: the screen (Sony) and the universal player read off, but the Apple TV
             # was left active (e.g. paused) and is blocking the raise. Sony state is unreliable,
             # so refresh via the Apple TV remote - sleeping it (remote.turn_off) clears the stale
@@ -864,7 +879,7 @@ class BedroomTVControl(hass.Hass):
             sony_state = self.get_state(self.sony_tv_entity)
             apple_state = self.get_state(self.apple_tv_entity)
             watts = self._panel_watts()
-            if watts is not None and watts <= self.power_on_watts and apple_state != "playing":
+            if watts is not None and watts <= self.power_dark_watts and apple_state != "playing":
                 # The refresh slept the Apple TV yet state still claims on -
                 # with the panel dark that claim is disproven: power is truth.
                 self.log(
@@ -993,7 +1008,7 @@ class BedroomTVControl(hass.Hass):
                 # draw hasn't ramped yet (crosses the threshold within ~1s).
                 if not kwargs.get("from_tv_on_transition", False):
                     watts = self._panel_watts()
-                    if watts is not None and watts <= self.power_on_watts:
+                    if watts is not None and watts <= self.power_dark_watts:
                         self.log(
                             f"Ensure-down requested while the panel draws {watts:.1f}W (dark) - "
                             "state claim distrusted, not lowering/holding",
@@ -1199,7 +1214,7 @@ class BedroomTVControl(hass.Hass):
     def _tv_draws_power(self):
         """True when the power meter (if configured) reads the panel as ON."""
         watts = self._panel_watts()
-        return watts is not None and watts > self.power_on_watts
+        return watts is not None and watts > self.power_dark_watts
 
     def _on_tv_power(self, entity, attribute, old, new, kwargs):
         try:
@@ -1215,7 +1230,7 @@ class BedroomTVControl(hass.Hass):
                 old_watts = float(old)
             except (TypeError, ValueError):
                 return
-            if old_watts <= self.power_on_watts:
+            if old_watts <= self.power_dark_watts:
                 return  # standby noise, not an edge
             if self._pending_raise_handle is not None:
                 return  # the state event already scheduled the raise

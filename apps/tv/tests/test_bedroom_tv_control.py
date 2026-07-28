@@ -38,6 +38,7 @@ def make_app(states, reset_enabled=True, refresh_in_progress=False, power_sensor
     app._apple_refresh_in_progress = refresh_in_progress
     app.power_sensor = power_sensor
     app.power_on_watts = 25.0
+    app.power_dark_watts = 20.0
     app.power_off_confirm_seconds = 3.0
     app._power_fired_at = None
     app._get_lift_position = lambda: "Down"
@@ -159,14 +160,66 @@ class StartupStaleAppleTvHeal(unittest.TestCase):
         self.assertNotIn(app._raise_after_apple_refresh, scheduled_callbacks(app))
 
 
+class ViewingDipIsNotDarkness(unittest.TestCase):
+    """The threshold split, added after measuring a real 2 h viewing session
+    (2026-07-27 21:20-23:20): viewing averages ~50W but dips to 24.9-27W on dark
+    scenes, while standby is 15-18W. The first day's "lit >=110W" figure came from
+    one bright-content sample and was not representative.
+
+    With a single 25W line those dips read as "dark", which would disarm the raise
+    veto and feed the dark-panel arbitration MID-MOVIE - reintroducing the exact
+    "lift goes up while watching" failure this system was built to stop. Dark
+    detection therefore uses the lower power_dark_watts (20W)."""
+
+    WATCHING_DARK_SCENE = {
+        "media_player.bedroom_tv": "on",
+        "media_player.bedroom_sony_tv": "on",
+        "media_player.bedroom_apple_tv": "off",
+        POWER_SENSOR: "24.9",  # the lowest value actually recorded while watching
+    }
+
+    def test_dark_scene_dip_still_counts_as_drawing_power(self):
+        app = make_app(dict(self.WATCHING_DARK_SCENE), power_sensor=POWER_SENSOR)
+        self.assertTrue(app._tv_draws_power(), "24.9W is a dark scene, not a dark panel")
+
+    def test_dark_scene_dip_does_not_trigger_arbitration_or_raise(self):
+        app = make_app(dict(self.WATCHING_DARK_SCENE), power_sensor=POWER_SENSOR)
+        app._raise_lift_if_still_off({"path_marker": "tv_off"})
+        # No integration kick, no re-check, and above all no lift movement.
+        self.assertEqual(app.service_calls, [])
+        self.assertEqual(app.scheduled, [])
+
+    def test_dark_scene_dip_does_not_block_a_periodic_ensure_down(self):
+        # The ensure-down dark guard must not fire mid-movie either, or periodic
+        # verification would stop holding the lift down during dark scenes.
+        app = make_app(dict(self.WATCHING_DARK_SCENE), power_sensor=POWER_SENSOR)
+        seen = []
+        app._get_lift_position = lambda: seen.append(1) or "Down"
+        app._ensure_lift_down_if_tv_active({})
+        self.assertTrue(seen, "dark guard wrongly short-circuited a 24.9W viewing dip")
+
+    def test_standby_is_still_dark(self):
+        # The other side of the split: 17W post-off standby must still read dark,
+        # otherwise the arbitration that fixed the 07-27 stale-store strand stops working.
+        states = dict(self.WATCHING_DARK_SCENE, **{POWER_SENSOR: "17.3"})
+        app = make_app(states, power_sensor=POWER_SENSOR)
+        self.assertFalse(app._tv_draws_power())
+        app._raise_lift_if_still_off({"path_marker": "tv_off"})
+        self.assertIn(
+            ("homeassistant/update_entity", {"entity_id": "media_player.bedroom_sony_tv"}),
+            app.service_calls,
+        )
+
+
 class DarkPanelArbitration(unittest.TestCase):
     """2026-07-27: the Shelly PM Mini proved every state source can lie 'on'
     over a dark panel (Bravia post-off rebound at the debounce check; AD 4.5.13
     serving a stale store 'on' even to a freshly restarted app, unhealable by
-    update_entity because HA-side state was already off = no event). A panel
-    drawing <= power_on_watts cannot be lit (idle floor ~2.5W, warm post-off
-    ~17W vs >=110W lit, >=30W booting), so power arbitrates: kick + bounded
-    re-checks, then the raise proceeds anyway."""
+    update_entity because HA-side state was already off = no event). A panel at or
+    below power_dark_watts (20W) cannot be in use - standby is 15-18W settling to
+    ~0-2.5W, while even a dark viewing scene stays at 24.9W+ (see
+    ViewingDipIsNotDarkness) - so power arbitrates: kick + bounded re-checks, then
+    the raise proceeds anyway."""
 
     STALE_ON = {
         "media_player.bedroom_tv": "on",

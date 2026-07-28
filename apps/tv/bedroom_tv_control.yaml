@@ -42,17 +42,23 @@ bedroom_tv_control:
   sony_probe_port: 80
   sony_probe_interval_seconds: 4
 
-  # TV power meter (Shelly PM Mini, installed 2026-07-27) - measured: lit >=110W
-  # (steady ~130W), boot 30-50W for ~45s pre-panel, off->~17W within 1s, deep
-  # standby floor ~2.5W. 25W threshold clears all of it with margin. The truth
-  # source: instant lift-lower on real watts, veto against raising over a
-  # glowing panel, and dark-panel arbitration when state sources claim 'on'
-  # over a panel that draws standby watts (Bravia assumed_state / AD stale store).
+  # TV power meter (Shelly PM Mini, installed 2026-07-27). Corrected against a full
+  # 2h viewing session: viewing ~50W mean dipping to 24.9-27W on dark scenes (the
+  # first day's "lit >=110W / ~130W" was one bright-content sample, NOT typical),
+  # boot 30-50W for ~45s pre-panel, standby 15-18W settling to ~0-2.5W. The truth
+  # source: instant lift-lower on real watts, veto against raising over a glowing
+  # panel, and dark-panel arbitration when state sources claim 'on' over a dark
+  # panel (Bravia assumed_state / AD stale store).
   power_sensor: sensor.bedroom_tv_relay_power
-  power_on_watts: 25   # near-instant lower when TV turns on (an early/extra down is harmless; the raise side is the protected one)
+  power_on_watts: 25   # ON-detection: must clear standby (15-18W). Near-instant lower when the TV turns on (an early/extra down is harmless; the raise side is the protected one)
+  # DARK-detection, deliberately LOWER than power_on_watts. Real viewing measured
+  # 2026-07-27 21:20-23:20 runs ~50W mean but dips to 24.9-27W on dark scenes, so a
+  # 25W dark line would read "dark" mid-movie and disarm the raise veto. Keep this
+  # under the viewing dip floor and above standby.
+  power_dark_watts: 20
   # With the meter, the state-flicker debounce tiers are replaced by a short
   # physical confirm on the off side (flaps are caught by the power veto
-  # instead - a lit panel always draws >=110W). Off-to-stowed ~6s.
+  # instead - a panel in use never sits under power_dark_watts). Off-to-stowed ~6s.
   power_off_confirm_seconds: 3
   
   # Lift command timing (to prevent conflicts and improve stability)
