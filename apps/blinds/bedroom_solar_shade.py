@@ -27,6 +27,9 @@ retracted (window clear) = 0. HA's convention is the opposite and it derives is_
 current_position: 100. Every number in this app - the 38 privacy floor, "close a step",
 max-shade cap - is in the DEVICE's frame: higher = more covered. Never reason about this
 curtain from the state string; use current_position and direction of travel.
+Since 2026-07-28 a template entity cover.bedroom_curtain presents the TRUE orientation
+(0 = covered = "closed") for humans, dashboards and voice - this app deliberately keeps
+commanding the raw entity, because that is the frame every number here is written in.
 See the banner in bedroom_blind_control.yaml for the incident this cost.
 
 Restart-safe (2026-07-27): the manual-pause deadline and the baseline position used to
