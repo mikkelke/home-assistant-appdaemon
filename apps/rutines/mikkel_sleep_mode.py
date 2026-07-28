@@ -67,6 +67,12 @@ class MikkelSleepMode(hass.Hass):
         self._block_rearm_until_out_of_bed = bool(
             self._state.get("block_rearm_until_out_of_bed", False)
         )
+        # A restored hold must be reconciled against the bed right now: its clear path is
+        # a live off edge, and Mikkel routinely gets out of bed while AD is down (deploy,
+        # HA restart). Without this the hold outlives the night it belongs to. Only an
+        # explicit "off" on every bedside releases it here - at init the cloud bedsides are
+        # regularly unavailable/loading, and that must keep the hold, not clear it.
+        self._release_rearm_hold_if_out_of_bed("restored at startup")
 
         for entity_id in (
             self.battery_entity,
@@ -106,10 +112,38 @@ class MikkelSleepMode(hass.Hass):
                 pass
         return False
 
+    def _bed_reads_empty(self) -> bool:
+        """Every bedside explicitly "off" - an EXPLICIT negative, never merely "not on".
+        The Withings bedsides are cloud-backed: unknown/unavailable/None is what they read
+        while HA restarts or the integration reloads, which is exactly when this app
+        re-initializes. Treating that as "he got up" would drop the hold at the one moment
+        it is needed most."""
+        if not self.in_bed_entities:
+            return False
+        for ent in self.in_bed_entities:
+            try:
+                if self.get_state(ent) != "off":
+                    return False
+            except Exception:
+                return False
+        return True
+
     def _on_relevant_change(self, entity, attribute, old, new, kwargs) -> None:
-        if entity in self.in_bed_entities and new == "off" and not self._any_in_bed():
-            self._set_block_rearm_until_out_of_bed(False)
         self._apply_sleep_mode()
+
+    def _release_rearm_hold_if_out_of_bed(self, context: str) -> None:
+        """The hold only means "do not re-arm while he is still lying there", so any read of
+        an explicitly empty bed releases it. Not tied to an off EDGE on purpose: the cloud
+        bedsides pass off->unknown->on, so the edge is routinely lost and a hold that waits
+        for one would block sleep mode plus phone DND indefinitely. Not tied to "not in bed"
+        either - see _bed_reads_empty; an unreadable bed leaves the hold exactly as it is."""
+        if not self._block_rearm_until_out_of_bed or not self._bed_reads_empty():
+            return
+        self._set_block_rearm_until_out_of_bed(False)
+        self.log(
+            f"Bed reads empty - releasing the sleep-mode re-arm hold ({context})",
+            level="INFO",
+        )
 
     def _set_block_rearm_until_out_of_bed(self, value: bool) -> None:
         self._block_rearm_until_out_of_bed = value
@@ -129,6 +163,10 @@ class MikkelSleepMode(hass.Hass):
         )
 
     def _apply_sleep_mode(self) -> None:
+        # Before anything is decided, so a hold surviving a lost off edge self-heals on
+        # the next callback instead of on the next restart.
+        self._release_rearm_hold_if_out_of_bed("live re-check")
+
         battery = self.get_state(self.battery_entity)
         person = self.get_state(self.person_entity)
         in_bed = self._any_in_bed()
