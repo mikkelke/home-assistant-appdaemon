@@ -189,6 +189,11 @@ class WakeupRoutine(hass.Hass):
         # Schedule alarm and reschedule on time change
         self._schedule_daily_alarm()
         self.listen_state(self._on_alarm_time_changed, self.alarm_time_entity)
+        # "Wake up now" (user 2026-07-29): a dashboard button press starts the sequence
+        # THIS moment -- the press IS the alarm. Optional knob; listener only when set.
+        self.wake_now_entity = self.args.get("wake_now_entity", "input_button.wake_up_now")
+        if self.wake_now_entity:
+            self.listen_state(self._on_wake_now, self.wake_now_entity)
         # Restart survival, init-only: reconcile Adaptive Lighting first (a late catch-up
         # ramp turns it off itself moments later, so reconciling first never fights it),
         # then check for a fire that fell in the gap between the 120s grace window above
@@ -272,6 +277,19 @@ class WakeupRoutine(hass.Hass):
             pass
 
         self.log(f"[wake] Scheduled daily at {sched}", log=self.user_log)
+
+    def _on_wake_now(self, entity, attr, old, new, kwargs):
+        """input_button.wake_up_now pressed: run the wake sequence immediately. Reuses the
+        late-catchup bypass so the +/-90s alarm-window guard in _alarm_fire doesn't swallow
+        a press at any other time of day; the flag is read ONLY by that guard."""
+        if new in (None, "unknown", "unavailable"):
+            return
+        self.log("[wake] Wake up now pressed -- starting the sequence", log=self.user_log)
+        self._late_catchup_in_progress = True
+        try:
+            self._alarm_fire({})
+        finally:
+            self._late_catchup_in_progress = False
 
     def _on_alarm_time_changed(self, entity, attr, old, new, kwargs):
         self._schedule_daily_alarm()

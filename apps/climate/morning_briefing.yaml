@@ -31,6 +31,8 @@ MorningBriefing:
   # No alarm set -> the briefing lands at the day-type fallback (user 2026-07-29).
   fallback_time_workday: "07:00:00"
   fallback_time_weekend: "09:00:00"
+  # "Wake up now" press = the wake moment: the briefing sends right then (2026-07-29).
+  wake_now_entity: input_button.wake_up_now
   person_entity: person.mikkel
   from_hour: 5
   until_hour: 12

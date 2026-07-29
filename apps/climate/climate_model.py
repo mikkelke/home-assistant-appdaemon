@@ -551,9 +551,13 @@ def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed,
         headline = (plan_attrs.get("headline") or "").strip()
         body = f"{headline}." if headline else ""
 
+    # Informational ONLY (user 2026-07-29): the indoor unit is pulled out of the bedroom
+    # EVERY day and stored behind the bathroom door -- a day-ahead "set it up today" would
+    # park two units in the middle of the bathroom. Tomorrow's own briefing carries the
+    # deploy instruction when the morning it applies to actually arrives.
     if (tomorrow_needs_ac and not ac_deployed
             and plan_state in ("windows", "hybrid", "nothing")):
-        body += " Tomorrow needs the AC — set it up today."
+        body += " Tomorrow looks like an AC night."
 
     return title, body
 

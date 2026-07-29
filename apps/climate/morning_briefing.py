@@ -133,6 +133,12 @@ class MorningBriefing(hass.Hass):
         # Alarm turned off mid-morning (woke early / cancelled) -> send right now instead of
         # waiting for the fallback -- still gated to the sanity window (see the callback).
         self.listen_state(self._on_alarm_enabled_change, self.alarm_enabled_entity, new="off")
+        # "Wake up now" button (user 2026-07-29): the press IS the wake moment -- deliver
+        # the briefing right then. All the usual gates (window, once/day, home, data)
+        # still apply inside _handle_wake.
+        self.wake_now_entity = a("wake_now_entity", "input_button.wake_up_now")
+        if self.wake_now_entity:
+            self.listen_state(self._on_wake_now, self.wake_now_entity)
 
         self.log(f"MorningBriefing started (window {self.from_hour}-{self.until_hour}, "
                  f"fallback {self.fallback_workday} workdays / {self.fallback_weekend} "
@@ -227,6 +233,11 @@ class MorningBriefing(hass.Hass):
         so the once-per-day/home/data gates never need duplicating (see module docstring)."""
         self.log(f"Wake trigger: {source}", level="DEBUG")
         self.create_task(self._handle_wake())
+
+    def _on_wake_now(self, entity, attribute, old, new, kwargs):
+        if new in (None, "unknown", "unavailable"):
+            return
+        self._fire_wake("wake up now button")
 
     def _on_alarm_fire(self, kwargs):
         self._fire_wake("alarm time")

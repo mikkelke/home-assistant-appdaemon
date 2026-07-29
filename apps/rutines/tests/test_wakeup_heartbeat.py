@@ -183,5 +183,41 @@ class MediaVerifyRecheck(unittest.TestCase):
         self.assertEqual(play_calls[0][1]["media_content_id"], app.fallback)
 
 
+class WakeNowButton(unittest.TestCase):
+    """The dashboard's Wake-up-now press runs the sequence immediately: it must bypass the
+    +/-90s alarm-window guard (via the late-catchup flag) and always restore the flag."""
+
+    def _app(self):
+        app = wb.WakeupRoutine.__new__(wb.WakeupRoutine)
+        app.user_log = "log"
+        app.log = lambda *a, **k: None
+        app._late_catchup_in_progress = False
+        app._fired = []
+        app._alarm_fire = lambda _=None: app._fired.append(app._late_catchup_in_progress)
+        return app
+
+    def test_press_fires_with_window_bypass_and_restores_flag(self):
+        app = self._app()
+        app._on_wake_now("input_button.wake_up_now", None, "unknown",
+                         "2026-07-29T16:30:00+00:00", {})
+        self.assertEqual(app._fired, [True])            # guard bypass active during fire
+        self.assertFalse(app._late_catchup_in_progress)  # ...and restored after
+
+    def test_flag_restored_even_when_sequence_raises(self):
+        app = self._app()
+        def boom(_=None):
+            raise RuntimeError("boom")
+        app._alarm_fire = boom
+        with self.assertRaises(RuntimeError):
+            app._on_wake_now("e", None, None, "2026-07-29T16:30:00+00:00", {})
+        self.assertFalse(app._late_catchup_in_progress)
+
+    def test_unavailable_states_ignored(self):
+        app = self._app()
+        for bad in (None, "unknown", "unavailable"):
+            app._on_wake_now("e", None, None, bad, {})
+        self.assertEqual(app._fired, [])
+
+
 if __name__ == "__main__":
     unittest.main()

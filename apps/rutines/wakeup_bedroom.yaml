@@ -9,6 +9,8 @@ WakeupBedroom:
 
   alarm_time_entity: input_datetime.wakeup_bedroom
   alarm_enabled_entity: input_boolean.wakeup_bedroom
+  # Dashboard "Wake up now" button: press = run the sequence immediately (2026-07-29).
+  wake_now_entity: input_button.wake_up_now
 
   presence_persons:
     - person.mikkel

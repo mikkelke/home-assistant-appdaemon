@@ -160,12 +160,12 @@ class ComposeBriefingTomorrowLeadTime(unittest.TestCase):
         _, message = mb.compose_briefing("windows", _attrs(), {}, False, False,
                                          tomorrow_needs_ac=True)
         self.assertEqual(message,
-                         "Keep windows open. Tomorrow needs the AC — set it up today.")
+                         "Keep windows open. Tomorrow looks like an AC night.")
 
     def test_nothing_plus_tomorrow_appends_setup_line(self):
         _, message = mb.compose_briefing("nothing", _attrs(), {}, False, False,
                                          tomorrow_needs_ac=True)
-        self.assertTrue(message.endswith("Tomorrow needs the AC — set it up today."))
+        self.assertTrue(message.endswith("Tomorrow looks like an AC night."))
 
     def test_deployed_unit_needs_no_setup_line(self):
         _, message = mb.compose_briefing("windows", _attrs(), {}, True, False,
@@ -710,6 +710,24 @@ class FallbackDayTyping(unittest.TestCase):
         app._alarm_pending_today = lambda: True
         app._on_fallback_fire({"day_type": "workday"})
         self.assertEqual(app._fired, [])
+
+
+class WakeNowButton(unittest.TestCase):
+    def test_press_fires_wake(self):
+        app = mb.MorningBriefing.__new__(mb.MorningBriefing)
+        fired = []
+        app._fire_wake = lambda source: fired.append(source)
+        app._on_wake_now("input_button.wake_up_now", None, "unknown",
+                         "2026-07-29T16:30:00+00:00", {})
+        self.assertEqual(fired, ["wake up now button"])
+
+    def test_unavailable_states_ignored(self):
+        app = mb.MorningBriefing.__new__(mb.MorningBriefing)
+        fired = []
+        app._fire_wake = lambda source: fired.append(source)
+        for bad in (None, "unknown", "unavailable"):
+            app._on_wake_now("input_button.wake_up_now", None, None, bad, {})
+        self.assertEqual(fired, [])
 
 
 if __name__ == "__main__":
