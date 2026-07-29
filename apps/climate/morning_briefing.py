@@ -50,7 +50,7 @@ one notification and its own logs.
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 import asyncio
 import json
-from datetime import time, timedelta
+from datetime import time
 from typing import Optional
 
 
@@ -83,9 +83,6 @@ class MorningBriefing(hass.Hass):
         self.status_entity = a("status_entity", "sensor.smart_cooling_status")
         self.climate_entity = a("climate_entity", "climate.air_conditioner_thermostat")
         self.enable_entity = a("enable_entity", "input_boolean.smart_cooling")
-        # DeployAdvisor's multi-night projection -- its lead-time warning is a line in
-        # THIS briefing now (one-advice stream, user 2026-07-23); its own pushes are off.
-        self.projection_entity = a("projection_entity", "sensor.bedroom_night_projection")
         # --- notification ---
         self.notify_target = a("notify_target", "user")
         # Push polish (Android companion-app extras; each can be set "" in yaml to disable):
@@ -309,22 +306,8 @@ class MorningBriefing(hass.Hass):
             ac_deployed = climate_state not in (None, "unavailable", "unknown")
             armed = (await self._state(self.enable_entity)) == "on"
 
-            # Tomorrow's night from DeployAdvisor's published projection. over_ceiling is
-            # a bool in the source but may arrive stringified -- accept both. Any failure
-            # just means no lead-time line (the projection is advisory garnish here).
-            tomorrow_needs_ac = False
-            try:
-                proj = await self._attrs(self.projection_entity)
-                tomorrow_iso = (now.date() + timedelta(days=1)).isoformat()
-                tomorrow_needs_ac = any(
-                    n.get("date") == tomorrow_iso and n.get("over_ceiling") in (True, "true")
-                    for n in (proj.get("nights") or []) if isinstance(n, dict))
-            except Exception:
-                pass
-
             title, message = compose_briefing(plan_state, plan_attrs, status_attrs,
-                                              ac_deployed, armed,
-                                              tomorrow_needs_ac=tomorrow_needs_ac)
+                                              ac_deployed, armed)
 
             if not await self._notify(title, message):
                 return

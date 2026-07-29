@@ -151,35 +151,16 @@ class ComposeBriefingRecommendationBranches(unittest.TestCase):
         self.assertEqual(message, "")
 
 
-class ComposeBriefingTomorrowLeadTime(unittest.TestCase):
-    """DeployAdvisor fold (2026-07-23): its lead-time warning is a LINE here, not its own
-    push -- and only when there's something to do (unit packed away, verdict not already
-    an AC instruction)."""
-
-    def test_windows_plus_tomorrow_appends_setup_line(self):
-        _, message = mb.compose_briefing("windows", _attrs(), {}, False, False,
-                                         tomorrow_needs_ac=True)
-        self.assertEqual(message,
-                         "Keep windows open. Tomorrow looks like an AC night.")
-
-    def test_nothing_plus_tomorrow_appends_setup_line(self):
-        _, message = mb.compose_briefing("nothing", _attrs(), {}, False, False,
-                                         tomorrow_needs_ac=True)
-        self.assertTrue(message.endswith("Tomorrow looks like an AC night."))
-
-    def test_deployed_unit_needs_no_setup_line(self):
-        _, message = mb.compose_briefing("windows", _attrs(), {}, True, False,
-                                         tomorrow_needs_ac=True)
-        self.assertNotIn("Tomorrow", message)
-
-    def test_ac_verdict_already_instructs_no_extra_line(self):
-        _, message = mb.compose_briefing("ac", _attrs(), {}, False, False,
-                                         tomorrow_needs_ac=True)
-        self.assertNotIn("Tomorrow", message)
-
-    def test_default_is_no_line(self):
-        _, message = mb.compose_briefing("windows", _attrs(), {}, False, False)
-        self.assertEqual(message, "Keep windows open.")
+class ComposeBriefingTodayOnly(unittest.TestCase):
+    def test_push_never_mentions_tomorrow(self):
+        # user 2026-07-29: "I just need to know what to do today... Nothing about
+        # tomorrow." The multi-day outlook lives on the card's day strip, never in the
+        # sentence -- for ANY verdict or deploy/arm state.
+        for rec in ("windows", "hybrid", "nothing", "ac"):
+            for dep in (False, True):
+                for armed in (False, True):
+                    _, message = mb.compose_briefing(rec, _attrs(), {}, dep, armed)
+                    self.assertNotIn("omorrow", message, f"{rec}/{dep}/{armed}")
 
 
 class ComposeBriefingNoDayOutlook(unittest.TestCase):

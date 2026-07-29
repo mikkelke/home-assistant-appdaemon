@@ -503,8 +503,7 @@ def nice_cost(cost_label):
     return cost_label
 
 
-def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed,
-                     tomorrow_needs_ac=False):
+def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed):
     """The ONE voice: title = the verdict, body = the bare instruction (user 2026-07-22,
     three copy rounds: "like Apple made it" -> "more decided" -> "still too chatty").
     Moved here from morning_briefing so the push, the card and any future surface render
@@ -513,7 +512,10 @@ def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed,
     plan_state is sleep_plan's recommendation ("windows"|"ac"|"hybrid"|"nothing"); an
     unrecognised value falls back to the plan's own headline. status_attrs is accepted
     for call-site stability but unused (the day-outlook line was cut). hybrid rounds
-    toward ACTION (user 2026-07-29: forgetting to deploy is the expensive failure)."""
+    toward ACTION (user 2026-07-29: forgetting to deploy is the expensive failure).
+    TODAY only, by design (user 2026-07-29: "I just need to know what to do today...
+    Nothing about tomorrow") -- the multi-day outlook lives on the card's day strip,
+    never in the sentence."""
     plan_attrs = dict(plan_attrs or {})
     title = "Morning climate"
     body = ""
@@ -550,14 +552,6 @@ def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed,
     else:
         headline = (plan_attrs.get("headline") or "").strip()
         body = f"{headline}." if headline else ""
-
-    # Informational ONLY (user 2026-07-29): the indoor unit is pulled out of the bedroom
-    # EVERY day and stored behind the bathroom door -- a day-ahead "set it up today" would
-    # park two units in the middle of the bathroom. Tomorrow's own briefing carries the
-    # deploy instruction when the morning it applies to actually arrives.
-    if (tomorrow_needs_ac and not ac_deployed
-            and plan_state in ("windows", "hybrid", "nothing")):
-        body += " Tomorrow looks like an AC night."
 
     return title, body
 
