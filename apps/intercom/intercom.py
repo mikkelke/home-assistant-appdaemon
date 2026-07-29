@@ -584,17 +584,10 @@ class Intercom(hass.Hass):
             except Exception as e:
                 self.log(f"Auto-open success notification failed: {e}", level="WARNING")
 
-        # House feed entry for the CONFIRMED unlock - distinct from the optimistic
-        # ring-time "opening the door" line fired in _handle_trigger before verification.
-        try:
-            self.fire_event(
-                "house_events_report",
-                cause=f"Someone rang the {ring_label}",
-                effect="Auto-open confirmed unlocked",
-                icon="mdi:lock-open-variant",
-            )
-        except Exception as e:
-            self.log(f"house_events_report failed: {e}", level="DEBUG")
+        # No feed entry for a CONFIRMED auto-open (removed 2026-07-24): the ring-time
+        # "Announcing on the speakers and opening the door" line already told the story,
+        # and success is the expected outcome. Only FAILURE is feed-worthy - see
+        # _report_auto_open_failure, which has its own entry.
 
     def _report_auto_open_failure(self, trigger_entity, lock_entity, outcome):
         """All unlock attempts for a ring failed: log, mobile-notify, house feed."""

@@ -123,34 +123,28 @@ def _first_name_if_resident(who):
 
 
 def lock_event(name, old, new, changed_by):
-    """Event tuple (icon, text, by) for a lock transition, or None.
+    """Event tuple (icon, text, by) for a lock transition worth telling humans about, or None.
 
-    `changed_by` is best-effort attribution (the cloud twin's attribute, already
-    freshness-checked by the caller): a person name lands in the separate `by`
-    field (v4 - the dashboard renders it as its own muted "By <name>" line,
-    resident full names trimmed to first name), the integration's literal
-    "Auto Lock" reads "automatically" inside the text, and no/stale attribution
-    just states the fact - a wrong name is worse than no name.
+    v6 (user 2026-07-24, after one ordinary day put 16 routine lock lines in the 40-entry
+    feed and drowned everything else): only a NAMED unlock is news - "who came in while I
+    wasn't looking" (a resident by name, first-name-trimmed, or a lock user like Cleaning).
+    Everything else is just the door being used:
+    - locking (manual or auto) is the steady state the lock always returns to - never logged;
+    - "Manual Unlock" is the physical thumb-turn - whoever turned it is standing at the door;
+    - an unattributed unlock tells nobody anything they can act on.
+    Lock FAILURES are lock_health's job (phone push + its own admin feed entries), not this
+    observer's.
     """
     if old in (None, "unavailable", "unknown") or new == old:
         return None
-    if new == "unlocked":
-        verb = "unlocked"
-        icon = "mdi:lock-open-variant"
-    elif new == "locked":
-        verb = "locked"
-        icon = "mdi:lock"
-    else:
-        return None  # jammed/opening/unavailable - not a human-meaningful milestone
-    text = f"{name} {verb}"
-    by = None
-    if isinstance(changed_by, str) and changed_by.strip():
-        who = changed_by.strip()[:MAX_TEXT_LEN]
-        if who == "Auto Lock":
-            text = f"{text} automatically"
-        else:
-            by = _first_name_if_resident(who)
-    return icon, text, by
+    if new != "unlocked":
+        return None
+    if not isinstance(changed_by, str) or not changed_by.strip():
+        return None
+    who = changed_by.strip()[:MAX_TEXT_LEN]
+    if who in ("Auto Lock", "Manual Unlock"):
+        return None
+    return "mdi:lock-open-variant", f"{name} unlocked", _first_name_if_resident(who)
 
 
 def build_report_event(data):

@@ -84,49 +84,47 @@ class SanitizeFeedTests(unittest.TestCase):
 
 
 class LockEventTests(unittest.TestCase):
-    # v4: lock_event returns (icon, text, by) - the person travels in `by`, never in text.
+    # v6: only NAMED unlocks are events - locking (manual or auto), thumb-turn "Manual
+    # Unlock", and unattributed unlocks are the door simply being used, never feed-worthy
+    # (2026-07-24: 16 routine lock lines in one day drowned the 40-entry feed).
     def test_unlocked_with_name(self):
         icon, text, by = house_events.lock_event("Front door", "locked", "unlocked", "Mikkel")
         self.assertEqual(icon, "mdi:lock-open-variant")
         self.assertEqual(text, "Front door unlocked")
         self.assertEqual(by, "Mikkel")
 
-    def test_auto_lock_reads_automatically(self):
-        icon, text, by = house_events.lock_event("Front door", "unlocked", "locked", "Auto Lock")
-        self.assertEqual(icon, "mdi:lock")
-        self.assertEqual(text, "Front door locked automatically")
-        self.assertIsNone(by)
-
     def test_resident_full_name_trimmed_to_first_name(self):
         _, _, by = house_events.lock_event("Front door", "locked", "unlocked", "Mikkel Eskildsen")
         self.assertEqual(by, "Mikkel")
 
     def test_non_resident_names_never_clipped(self):
-        # Lock code users and unknown values keep their full wording - clipping
-        # "Cleaning Service" to "Cleaning" is fine, but "Keypad Code 3" to "Keypad"
-        # would mislead, so only known resident first names trim.
+        # Lock code users keep their full wording - "Cleaning" stays valuable and intact.
         _, _, by = house_events.lock_event("Front door", "locked", "unlocked", "Cleaning")
         self.assertEqual(by, "Cleaning")
         _, _, by = house_events.lock_event("Front door", "locked", "unlocked", "Keypad Code 3")
         self.assertEqual(by, "Keypad Code 3")
 
-    def test_no_attribution_states_the_fact(self):
-        _, text, by = house_events.lock_event("Front door", "locked", "unlocked", None)
-        self.assertEqual(text, "Front door unlocked")
-        self.assertIsNone(by)
+    def test_locking_is_never_an_event(self):
+        # The steady state the lock always returns to - auto, manual, or named.
+        self.assertIsNone(house_events.lock_event("Front door", "unlocked", "locked", "Auto Lock"))
+        self.assertIsNone(house_events.lock_event("Front door", "unlocked", "locked", "Mikkel"))
+        self.assertIsNone(house_events.lock_event("Front door", "unlocked", "locked", None))
 
-    def test_blank_attribution_ignored(self):
-        _, text, by = house_events.lock_event("Front door", "locked", "unlocked", "   ")
-        self.assertEqual(text, "Front door unlocked")
-        self.assertIsNone(by)
+    def test_thumb_turn_unlock_suppressed(self):
+        # "Manual Unlock" = someone physically at the door - not news to anyone.
+        self.assertIsNone(house_events.lock_event("Front door", "locked", "unlocked", "Manual Unlock"))
+
+    def test_unattributed_unlock_suppressed(self):
+        self.assertIsNone(house_events.lock_event("Front door", "locked", "unlocked", None))
+        self.assertIsNone(house_events.lock_event("Front door", "locked", "unlocked", "   "))
 
     def test_restart_replay_suppressed(self):
-        self.assertIsNone(house_events.lock_event("Front door", None, "locked", None))
-        self.assertIsNone(house_events.lock_event("Front door", "unavailable", "locked", None))
+        self.assertIsNone(house_events.lock_event("Front door", None, "unlocked", "Mikkel"))
+        self.assertIsNone(house_events.lock_event("Front door", "unavailable", "unlocked", "Mikkel"))
 
     def test_non_milestone_states_suppressed(self):
-        self.assertIsNone(house_events.lock_event("Front door", "locked", "jammed", None))
-        self.assertIsNone(house_events.lock_event("Front door", "locked", "locked", None))
+        self.assertIsNone(house_events.lock_event("Front door", "locked", "jammed", "Mikkel"))
+        self.assertIsNone(house_events.lock_event("Front door", "locked", "locked", "Mikkel"))
 
     def test_attribution_length_capped(self):
         _, _, by = house_events.lock_event("Front door", "locked", "unlocked", "x" * 500)
