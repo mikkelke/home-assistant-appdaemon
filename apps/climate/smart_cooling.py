@@ -1172,12 +1172,16 @@ class SmartCooling(hass.Hass):
         promising (and pricing) depth the unit can't deliver.
 
         The 1/min(6, n+1) weight averages the first six observations and then settles into a
-        stable 1/6 EMA -- deliberately a CENTRAL tendency, never a chase of the deepest night.
-        That matters here: across 12 measured nights the achieved minimum spread 19.2-21.2C,
-        but the user reports the deep nights feel no colder than the typical ones (2026-07-29),
-        so the extra degree is the sensor's sheltered corner behind the AC pooling, not the
-        room. Targeting the deepest reading would buy compressor time that changes nothing
-        anyone can feel."""
+        stable 1/6 EMA -- a CENTRAL tendency across the 19.2-21.2C spread of achieved minima,
+        which keeps the planner from sizing every night against a lucky-night depth it usually
+        can't reach (over-asking inflates minutes_needed and drags expensive slots into the
+        plan -- the failure feasible_floor exists to prevent).
+
+        NOTE (2026-07-29): a deeper seal is NOT comfort-neutral -- measured across 11
+        bed-occupancy nights, 1C deeper at seal buys 0.73C cooler sleeping-zone air at wake
+        (0.48C on the floor, R2 0.63). So the central tendency trades real morning comfort for
+        scheduling safety; whether to bias this toward the achievable depth instead is the
+        user's call, not an assumption to bake in."""
         n = self._feasible_samples
         w = 1.0 / min(6, n + 1)
         self._feasible_floor = round(

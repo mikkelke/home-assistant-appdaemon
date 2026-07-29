@@ -69,7 +69,12 @@ SmartCooling:
   # the intake sensor must read 1C colder before the compressor parks = fewer stall-burps.
   cool_setpoint: 16.0
   cool_fan_mode: auto
-  cool_power_kw: 0.5      # measured engaged average 2026-07-15 (was 0.6 guess); est-cost only
+  # Engaged average draw, re-measured 2026-07-29: 866 W over a 1.0 h time-weighted engaged
+  # window (peak 1095 W). The old 0.5 dated from 2026-07-15, BEFORE the setpoint-16 fix --
+  # back then the unit spent much of its "on" time parked/modulating at ~300 W, so the
+  # average was genuinely lower. Running at 0.5 made every scheduler cost estimate ~1.7x
+  # too cheap (the "~0.7 kr tonight" the user flagged).
+  cool_power_kw: 0.87
   # Stall-breaker: idle-with-deficit -> fan_only burp so the intake reads room air,
   # then cooling restarts hard (parks at ~300 W otherwise, cooling nothing).
   # Quiet gate: no burps while either bedside is occupied (the silence->800W roar is
