@@ -361,9 +361,16 @@ class SmartCooling(hass.Hass):
         self.sat_engaged_min = float(a("sat_engaged_min", 90))    # floor sensor reports ~hourly
         self.sat_reset_rise = float(a("sat_reset_rise", 0.5))     # warmed this much above the low -> new situation
         self.feasible_min_samples = int(a("feasible_min_samples", 2))
+        # Learn the achieved floor minimum from EVERY night with at least this much
+        # engaged time (see _finalize_night); shorter runs bottom out on the clock,
+        # not on capacity, and would teach a falsely shallow floor.
+        self.feasible_learn_min_engaged = float(a("feasible_learn_min_engaged", 120))
         self._sat_min: Optional[float] = None      # session floor minimum while pursuing
         self._sat_noprog_min = 0.0                 # engaged minutes without a new minimum
         self._saturated = False
+        self._night_floor_min: Optional[float] = None   # tonight's deepest floor while engaged
+        self._night_engaged_min = 0.0                   # tonight's engaged minutes
+        self._learned_tonight = False                   # saturation already taught tonight
         self._last_want = False                    # was the previous eval trying to cool?
         self._last_eval_at: Optional[datetime] = None
         # Learned cooling rate (C/h) + its accumulator. The floor sensor only reports every
@@ -591,6 +598,10 @@ class SmartCooling(hass.Hass):
             with open(self.state_file) as f:
                 d = json.load(f)
             self._rise_frac = float(d.get("rise_frac", self._rise_frac))
+            nfm = d.get("night_floor_min")
+            self._night_floor_min = float(nfm) if nfm is not None else None
+            self._night_engaged_min = float(d.get("night_engaged_min", 0.0))
+            self._learned_tonight = bool(d.get("learned_tonight", False))
             cc = d.get("cool_cph")
             self._cool_cph = float(cc) if cc is not None else None
             self._cool_cph_samples = int(d.get("cool_cph_samples", 0))
@@ -628,6 +639,9 @@ class SmartCooling(hass.Hass):
         try:
             with open(self.state_file, "w") as f:
                 json.dump({"rise_frac": self._rise_frac, "rise_samples": self._rise_samples,
+                           "night_floor_min": self._night_floor_min,
+                           "night_engaged_min": round(self._night_engaged_min, 1),
+                           "learned_tonight": self._learned_tonight,
                            "cool_cph": self._cool_cph,
                            "cool_cph_samples": self._cool_cph_samples,
                            "lightout": self._lightout,
@@ -1153,19 +1167,51 @@ class SmartCooling(hass.Hass):
             return max(target, self._feasible_floor - 0.3)
         return target
 
-    def _learn_feasible(self, floor_min):
+    def _learn_feasible(self, floor_min, why="saturated"):
         """EMA the observed can't-go-lower floor across nights, so future plans stop
-        promising (and pricing) depth the unit can't deliver."""
+        promising (and pricing) depth the unit can't deliver.
+
+        The 1/min(6, n+1) weight averages the first six observations and then settles into a
+        stable 1/6 EMA -- deliberately a CENTRAL tendency, never a chase of the deepest night.
+        That matters here: across 12 measured nights the achieved minimum spread 19.2-21.2C,
+        but the user reports the deep nights feel no colder than the typical ones (2026-07-29),
+        so the extra degree is the sensor's sheltered corner behind the AC pooling, not the
+        room. Targeting the deepest reading would buy compressor time that changes nothing
+        anyone can feel."""
         n = self._feasible_samples
         w = 1.0 / min(6, n + 1)
         self._feasible_floor = round(
             floor_min if self._feasible_floor is None
             else (1 - w) * self._feasible_floor + w * floor_min, 2)
         self._feasible_samples = n + 1
+        self._learned_tonight = True
         self._save_state()
-        self.log(f"Feasible floor tonight: {floor_min:.1f}C after {self._sat_noprog_min:.0f} "
-                 f"engaged min without progress; learned limit now {self._feasible_floor:.1f}C "
-                 f"(n={self._feasible_samples})", level="INFO")
+        self.log(f"Feasible floor tonight: {floor_min:.1f}C ({why}); learned limit now "
+                 f"{self._feasible_floor:.1f}C (n={self._feasible_samples})", level="INFO")
+
+    def _finalize_night(self):
+        """Learn from EVERY cooling night's achieved floor minimum, not only from the rare
+        saturation event.
+
+        Why (2026-07-29): _track_progress only calls _learn_feasible after sat_engaged_min
+        (90) engaged minutes with no new minimum, which had fired exactly ONCE in three weeks
+        -- so the planner was sizing and pricing every night off a single stale sample (20.5)
+        while the history held 12 perfectly good nights (mean 20.27). Closing out a night with
+        real engaged time is itself evidence of how deep this unit gets.
+
+        Skipped when the night barely ran (feasible_learn_min_engaged) -- a short run's minimum
+        is bounded by the clock, not by capacity, and would teach a falsely shallow floor -- and
+        when saturation already learned tonight, so one night never counts twice."""
+        floor_min, engaged = self._night_floor_min, self._night_engaged_min
+        self._night_floor_min = None
+        self._night_engaged_min = 0.0
+        learned = self._learned_tonight
+        self._learned_tonight = False
+        if learned or floor_min is None or engaged < self.feasible_learn_min_engaged:
+            self._save_state()
+            return
+        self._learn_feasible(floor_min, why=f"{engaged:.0f} engaged min tonight")
+        self._learned_tonight = False        # the night is over either way
 
     async def _maybe_dry(self, now, floor):
         """Whether a held (at-target) evening eval should run the dry-finish instead of
@@ -1655,6 +1701,7 @@ class SmartCooling(hass.Hass):
             # undeployed -- exactly the state a genuinely-ended night settles into.
             if not deployed and self._session_kwh0 is not None:
                 self._finalize_session()
+                self._finalize_night()
             # Evening rescue advisory (never a command). Placed after the hazard handling so
             # a genuine safety-off doesn't also nag; it only reads/notifies.
             await self._maybe_evening_rescue(now, floor)
@@ -1720,6 +1767,11 @@ class SmartCooling(hass.Hass):
         # Learn how fast the floor ACTUALLY drops while engaged (see _track_cool_rate);
         # everything downstream sizes its minutes off _cool_rate(), not the seed.
         self._track_cool_rate(floor, engaged, self._last_want)
+        # Tonight's achieved depth + engaged time -> _finalize_night learns from it.
+        if engaged > 0 and floor is not None:
+            self._night_engaged_min += engaged
+            self._night_floor_min = (floor if self._night_floor_min is None
+                                     else min(self._night_floor_min, floor))
         reach_target = self._reach_target(now, target, saturated)
         reach_deficit = floor - reach_target
         minutes_needed = max(0.0, reach_deficit) / self._cool_rate() * 60.0
@@ -1731,6 +1783,7 @@ class SmartCooling(hass.Hass):
             self._mark_eval(now, False)
             self._stash_lightout(floor, E, now)
             self._finalize_session()   # AC removed -- close out tonight's metered session
+            self._finalize_night()     # ...and learn how deep the room actually got
             await self._ensure_off(
                 "done_for_tonight",
                 "AC removed -- sealing the bedroom for the night.",

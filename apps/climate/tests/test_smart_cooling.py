@@ -53,6 +53,11 @@ def make_app(**overrides):
     app.cool_cph_min = overrides.get("cool_cph_min", 0.3)
     app.cool_cph_max = overrides.get("cool_cph_max", 4.0)
     app.cool_rate_min_engaged = overrides.get("cool_rate_min_engaged", 20.0)
+    # per-night achieved-depth learning (see _finalize_night)
+    app.feasible_learn_min_engaged = overrides.get("feasible_learn_min_engaged", 120.0)
+    app._night_floor_min = overrides.get("night_floor_min", None)
+    app._night_engaged_min = overrides.get("night_engaged_min", 0.0)
+    app._learned_tonight = overrides.get("learned_tonight", False)
     app.commit_price_margin = overrides.get("commit_price_margin", 0.15)
     app.cool_kw = overrides.get("cool_kw", 0.5)          # _schedule's est-cost term
     # weather-model attributes (Model D coefficients + memory + shadow flags)
@@ -1953,6 +1958,73 @@ class PlanFloorLimit(unittest.TestCase):
         self.assertLess(ideal, capped)                      # ideal digs deeper
         self.assertAlmostEqual(capped, 20.2, places=6)      # capped stops at the real floor
         self.assertGreater((23.6 - ideal) - (23.6 - capped), 3.0)   # >3C of phantom job
+
+
+class FinalizeNightFeasible(unittest.TestCase):
+    """Learn the achieved floor minimum from EVERY cooling night, not only the rare
+    saturation event (2026-07-29: saturation had fired ONCE in three weeks, so the planner
+    sized every night off a single stale 20.5 while history held 12 good nights ~20.27)."""
+
+    def _app(self, **kw):
+        app = make_app(**kw)
+        app._save_state = lambda: None
+        app.log = lambda *a, **k: None
+        return app
+
+    def test_learns_from_a_normal_night(self):
+        app = self._app(feasible_floor=None, feasible_samples=0,
+                        night_floor_min=20.1, night_engaged_min=300.0)
+        app._finalize_night()
+        self.assertEqual(app._feasible_floor, 20.1)
+        self.assertEqual(app._feasible_samples, 1)
+        self.assertIsNone(app._night_floor_min)
+        self.assertEqual(app._night_engaged_min, 0.0)
+
+    def test_short_night_teaches_nothing(self):
+        # 48 engaged min bottoms out on the clock, not on capacity
+        app = self._app(feasible_floor=20.5, feasible_samples=1,
+                        night_floor_min=21.4, night_engaged_min=48.0)
+        app._finalize_night()
+        self.assertEqual(app._feasible_floor, 20.5)
+        self.assertEqual(app._feasible_samples, 1)
+
+    def test_saturation_already_learned_tonight_is_not_double_counted(self):
+        app = self._app(feasible_floor=20.5, feasible_samples=1,
+                        night_floor_min=20.0, night_engaged_min=300.0,
+                        learned_tonight=True)
+        app._finalize_night()
+        self.assertEqual(app._feasible_samples, 1)      # unchanged
+        self.assertFalse(app._learned_tonight)          # reset for the next night
+
+    def test_missing_reading_is_safe(self):
+        app = self._app(night_floor_min=None, night_engaged_min=300.0)
+        app._finalize_night()                            # must not raise
+        self.assertEqual(app._night_engaged_min, 0.0)
+
+    def test_converges_to_the_typical_night_not_the_deepest(self):
+        # the real 12-night spread; the user reports the deep nights feel no colder, so the
+        # learner must land on the central value, never chase 19.2.
+        nights = [21.0, 20.3, 21.2, 19.6, 19.9, 20.4, 20.0, 19.9, 20.2, 19.2]
+        app = self._app(feasible_floor=None, feasible_samples=0)
+        for fm in nights:
+            app._night_floor_min = fm
+            app._night_engaged_min = 300.0
+            app._learned_tonight = False
+            app._finalize_night()
+        self.assertEqual(app._feasible_samples, len(nights))
+        self.assertGreater(app._feasible_floor, 19.8)    # well above the deepest 19.2
+        self.assertLess(app._feasible_floor, 20.8)       # and below the shallowest 21.2
+
+    def test_tick_accumulates_only_engaged_time(self):
+        app = self._app(night_floor_min=None, night_engaged_min=0.0)
+        # mimic the eval-loop accumulation
+        for floor, engaged in ((22.0, 15.0), (21.0, 15.0), (20.5, 0.0), (24.0, 15.0)):
+            if engaged > 0 and floor is not None:
+                app._night_engaged_min += engaged
+                app._night_floor_min = (floor if app._night_floor_min is None
+                                        else min(app._night_floor_min, floor))
+        self.assertEqual(app._night_engaged_min, 45.0)   # the 0-engaged tick didn't count
+        self.assertEqual(app._night_floor_min, 21.0)     # and the warm tick didn't raise it
 
 
 if __name__ == "__main__":
