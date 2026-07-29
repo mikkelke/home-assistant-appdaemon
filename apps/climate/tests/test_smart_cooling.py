@@ -1923,5 +1923,37 @@ class ScheduleCommitment(unittest.TestCase):
         self.assertEqual((ns_cold, run_cold, est_cold), (ns_hot, run_hot, est_hot))
 
 
+class PlanFloorLimit(unittest.TestCase):
+    """The advisory must price the job the unit can ACTUALLY do. 2026-07-29: the plan sized a
+    run down to min_temp 16C while the learned feasible floor was 20.5, showing "Run the AC
+    ~12.5 kr" for a job the controller was really running to 20.2C (~5 kr)."""
+
+    def test_falls_back_to_min_temp_without_enough_samples(self):
+        app = make_app(feasible_floor=20.5, feasible_samples=1, feasible_min_samples=2)
+        self.assertEqual(app._plan_floor_limit(), 16.0)
+
+    def test_uses_the_learned_feasible_floor_with_the_probe(self):
+        app = make_app(feasible_floor=20.5, feasible_samples=2, feasible_min_samples=2)
+        self.assertAlmostEqual(app._plan_floor_limit(), 20.2, places=6)
+
+    def test_never_below_min_temp(self):
+        app = make_app(feasible_floor=15.0, feasible_samples=2, feasible_min_samples=2)
+        self.assertEqual(app._plan_floor_limit(), 16.0)
+
+    def test_no_learned_floor_uses_min_temp(self):
+        app = make_app(feasible_floor=None, feasible_samples=0)
+        self.assertEqual(app._plan_floor_limit(), 16.0)
+
+    def test_capped_depth_shrinks_the_priced_deficit(self):
+        # the real numbers: floor 23.6, E 26.6, limit 22.5, rise 0.59
+        app = make_app(rise_frac=0.59, feasible_floor=20.5, feasible_samples=2,
+                       feasible_min_samples=2)
+        ideal = cm.calc_floor_target(26.6, 22.5, 0.59, 1.0, 16.0)
+        capped = cm.calc_floor_target(26.6, 22.5, 0.59, 1.0, app._plan_floor_limit())
+        self.assertLess(ideal, capped)                      # ideal digs deeper
+        self.assertAlmostEqual(capped, 20.2, places=6)      # capped stops at the real floor
+        self.assertGreater((23.6 - ideal) - (23.6 - capped), 3.0)   # >3C of phantom job
+
+
 if __name__ == "__main__":
     unittest.main()

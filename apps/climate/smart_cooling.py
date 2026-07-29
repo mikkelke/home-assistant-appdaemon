@@ -1090,6 +1090,16 @@ class SmartCooling(hass.Hass):
                  f"{window:.0f} engaged min); rate now {self._cool_cph:.2f} C/h "
                  f"(n={self._cool_cph_samples})", level="INFO")
 
+    def _plan_floor_limit(self):
+        """The deepest floor the ADVISORY plan should assume (and price). Mirrors
+        _reach_target's historical feasible-floor cap so sensor.sleep_plan sizes the same
+        job the controller will actually run; without it the plan priced a run to min_temp
+        that the floor has demonstrably never reached."""
+        if (self._feasible_floor is not None
+                and self._feasible_samples >= self.feasible_min_samples):
+            return max(self.min_temp, self._feasible_floor - 0.3)
+        return self.min_temp
+
     # ---------- feasibility (how low can the floor actually go) ----------
     def _track_progress(self, floor, engaged_min):
         """Feed each evaluation's floor reading + how many minutes we've been TRYING to
@@ -1489,8 +1499,17 @@ class SmartCooling(hass.Hass):
             # job actually needs, from the same calc_floor_target/deficit math plan_sleep
             # itself runs on the same inputs -- est_price_slots is only the fallback k for
             # when the deficit can't be computed yet (missing floor or equilibrium).
+            # Price the job the unit can ACTUALLY do: cap the advisory's depth at the learned
+            # feasible floor exactly as _reach_target caps the armed path. Without this the
+            # plan sized (and charged for) a run down to min_temp 16C while the floor has
+            # proven it stops around 20.5 -- 2026-07-29 that phantom ~4C showed up as
+            # "Run the AC ~12.5 kr" against a real ~5 kr job the controller was already
+            # running to 20.2C.
+            plan_min = self._plan_floor_limit()
             if plan_equilibrium is not None and floor is not None:
-                pricing_target = self._calc_target(plan_equilibrium, ceiling)
+                pricing_target = cm.calc_floor_target(plan_equilibrium, ceiling,
+                                                      self._rise_frac, self.zone_offset,
+                                                      plan_min)
                 pricing_deficit = max(0.0, floor - pricing_target)
                 minutes_needed = pricing_deficit / self._cool_rate() * 60.0
                 price_slots = max(1, math.ceil(minutes_needed / 15.0))
@@ -1499,7 +1518,7 @@ class SmartCooling(hass.Hass):
             cheapest = self._blended_cheap(pm, now, self._deadline(now), price_now, price_slots)
             plan = cm.plan_sleep(cm.SleepPlanInputs(
                 floor=floor, equilibrium=plan_equilibrium, rise_frac=self._rise_frac,
-                zone_offset=self.zone_offset, comfort_limit=ceiling, min_temp=self.min_temp,
+                zone_offset=self.zone_offset, comfort_limit=ceiling, min_temp=plan_min,
                 floor_cool_cph=self._cool_rate(), cool_power_kw=self.cool_kw,
                 cheapest_price=cheapest, outdoor_temp=t_out, outdoor_dew=outdoor_dew,
                 indoor_dew=indoor_dew, open_windows=open_windows,
