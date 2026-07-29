@@ -55,6 +55,7 @@ def make_app(**overrides):
     app.cool_rate_min_engaged = overrides.get("cool_rate_min_engaged", 20.0)
     # per-night achieved-depth learning (see _finalize_night)
     app.feasible_learn_min_engaged = overrides.get("feasible_learn_min_engaged", 120.0)
+    app.feasible_probe_c = overrides.get("feasible_probe_c", 1.0)
     app._night_floor_min = overrides.get("night_floor_min", None)
     app._night_engaged_min = overrides.get("night_engaged_min", 0.0)
     app._learned_tonight = overrides.get("learned_tonight", False)
@@ -627,8 +628,8 @@ class ReachTarget(unittest.TestCase):
     def test_daytime_respects_historical_feasible_cap(self):
         app = make_app(feasible_floor=20.5, feasible_samples=3)
         now = datetime(2026, 7, 16, 21, 0)
-        # ideal 18.3 is below the learned wall (probed 0.3C deep) -> capped warmer
-        self.assertEqual(app._reach_target(now, target=18.3, saturated=False), 20.2)
+        # ideal 18.3 is below the learned wall (probed feasible_probe_c=1.0 deep) -> capped
+        self.assertEqual(app._reach_target(now, target=18.3, saturated=False), 19.5)
 
     def test_past_midnight_ignores_historical_cap_aims_for_hardware_floor(self):
         # same learned history as above, but past midnight: go for min_temp anyway --
@@ -647,7 +648,7 @@ class ReachTarget(unittest.TestCase):
     def test_at_six_reverts_to_daytime_rules(self):
         app = make_app(feasible_floor=20.0, feasible_samples=2)
         now = datetime(2026, 7, 17, 6, 0)
-        self.assertEqual(app._reach_target(now, target=18.0, saturated=False), 19.7)
+        self.assertEqual(app._reach_target(now, target=18.0, saturated=False), 19.0)
 
 
 class WindowOpen(unittest.TestCase):
@@ -1939,7 +1940,7 @@ class PlanFloorLimit(unittest.TestCase):
 
     def test_uses_the_learned_feasible_floor_with_the_probe(self):
         app = make_app(feasible_floor=20.5, feasible_samples=2, feasible_min_samples=2)
-        self.assertAlmostEqual(app._plan_floor_limit(), 20.2, places=6)
+        self.assertAlmostEqual(app._plan_floor_limit(), 19.5, places=6)
 
     def test_never_below_min_temp(self):
         app = make_app(feasible_floor=15.0, feasible_samples=2, feasible_min_samples=2)
@@ -1956,7 +1957,7 @@ class PlanFloorLimit(unittest.TestCase):
         ideal = cm.calc_floor_target(26.6, 22.5, 0.59, 1.0, 16.0)
         capped = cm.calc_floor_target(26.6, 22.5, 0.59, 1.0, app._plan_floor_limit())
         self.assertLess(ideal, capped)                      # ideal digs deeper
-        self.assertAlmostEqual(capped, 20.2, places=6)      # capped stops at the real floor
+        self.assertAlmostEqual(capped, 19.5, places=6)      # capped stops at the probed floor
         self.assertGreater((23.6 - ideal) - (23.6 - capped), 3.0)   # >3C of phantom job
 
 
@@ -2025,6 +2026,42 @@ class FinalizeNightFeasible(unittest.TestCase):
                                         else min(app._night_floor_min, floor))
         self.assertEqual(app._night_engaged_min, 45.0)   # the 0-engaged tick didn't count
         self.assertEqual(app._night_floor_min, 21.0)     # and the warm tick didn't raise it
+
+
+class FeasibleProbe(unittest.TestCase):
+    """Probe depth below the learned feasible floor (user 2026-07-29: "probe deeper... but
+    balance it"). Balanced by construction -- max(physics target, feasible - probe) means the
+    probe can only chase depth the night ACTUALLY needs."""
+
+    def _app(self, **kw):
+        app = make_app(**kw)
+        app.log = lambda *a, **k: None
+        return app
+
+    def test_probe_reaches_below_the_learned_floor(self):
+        app = self._app(feasible_floor=20.3, feasible_samples=6, feasible_probe_c=1.0)
+        # hot night: physics wants 16.0, so the probe governs -> 20.3 - 1.0
+        got = app._reach_target(datetime(2026, 7, 29, 20, 0), 16.0, False)
+        self.assertAlmostEqual(got, 19.3, places=6)
+
+    def test_probe_never_chases_depth_the_night_does_not_need(self):
+        # THE balance guarantee: a mild night whose physics target is 21.5 stops at 21.5,
+        # never at the deeper 19.3 the probe would allow.
+        app = self._app(feasible_floor=20.3, feasible_samples=6, feasible_probe_c=1.0)
+        got = app._reach_target(datetime(2026, 7, 29, 20, 0), 21.5, False)
+        self.assertAlmostEqual(got, 21.5, places=6)
+
+    def test_saturation_still_wins(self):
+        # priority 1: a floor proven not to move tonight overrides the probe
+        app = self._app(feasible_floor=20.3, feasible_samples=6, feasible_probe_c=1.0)
+        app._sat_min = 20.8
+        got = app._reach_target(datetime(2026, 7, 29, 20, 0), 16.0, True)
+        self.assertAlmostEqual(got, 20.8, places=6)
+
+    def test_plan_floor_limit_uses_the_same_probe(self):
+        # the advisory plan must size the same job the controller will run
+        app = self._app(feasible_floor=20.3, feasible_samples=6, feasible_probe_c=1.0)
+        self.assertAlmostEqual(app._plan_floor_limit(), 19.3, places=6)
 
 
 if __name__ == "__main__":

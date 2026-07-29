@@ -44,6 +44,17 @@ SmartCooling:
   # to prevent (user). The -0.3C probe below the learned limit still lets milder nights
   # re-teach a deeper value, so a one-night fluke self-corrects.
   feasible_min_samples: 1
+  # How far below the learned feasible floor a night may probe (widened 0.3 -> 1.0,
+  # user 2026-07-29 "probe deeper... but balance it"). Measured over 11 bed-occupancy
+  # nights: 1C deeper at seal buys 0.73C cooler sleeping-zone air at WAKE (0.48C floor,
+  # R2 0.63), so the old 0.3 left real morning comfort unclaimed. Balanced by
+  # construction -- _reach_target takes max(physics target, feasible - probe), so the
+  # probe only ever chases depth the night actually needs (a mild night targeting 21.5
+  # still stops at 21.5), and tonight's measured saturation overrides it entirely.
+  feasible_probe_c: 1.0
+  # Learn the achieved floor minimum from EVERY night with at least this much engaged
+  # time (see _finalize_night); shorter runs bottom out on the clock, not on capacity.
+  feasible_learn_min_engaged: 120
   # Condenser room (bathroom): door kept sealed (user 2026-07-16), so a warm bathroom
   # only costs condenser efficiency (~2-3%/C) - cheaper than deferring to peak prices.
   # bathroom_backleak_c just annotates the plan (soft, cosmetic). bathroom_delta_max_c

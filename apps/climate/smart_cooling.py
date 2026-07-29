@@ -365,6 +365,15 @@ class SmartCooling(hass.Hass):
         # engaged time (see _finalize_night); shorter runs bottom out on the clock,
         # not on capacity, and would teach a falsely shallow floor.
         self.feasible_learn_min_engaged = float(a("feasible_learn_min_engaged", 120))
+        # How far BELOW the learned feasible floor a night may probe. Widened 0.3 -> 1.0
+        # (user 2026-07-29, "probe deeper... but balance it"): measured over 11 nights, 1C
+        # deeper at seal buys 0.73C cooler sleeping-zone air at wake, so the old 0.3 was
+        # leaving real morning comfort unclaimed. Balanced by construction -- _reach_target
+        # takes max(physics target, feasible - probe), so a probe can only ever chase depth
+        # the night ACTUALLY needs, never depth for its own sake; a mild night whose target
+        # is 21.5 still stops at 21.5. Saturation (priority 1) pulls back the nights the
+        # room genuinely will not go there, and re-teaches the learner.
+        self.feasible_probe_c = float(a("feasible_probe_c", 1.0))
         self._sat_min: Optional[float] = None      # session floor minimum while pursuing
         self._sat_noprog_min = 0.0                 # engaged minutes without a new minimum
         self._saturated = False
@@ -1111,7 +1120,7 @@ class SmartCooling(hass.Hass):
         that the floor has demonstrably never reached."""
         if (self._feasible_floor is not None
                 and self._feasible_samples >= self.feasible_min_samples):
-            return max(self.min_temp, self._feasible_floor - 0.3)
+            return max(self.min_temp, self._feasible_floor - self.feasible_probe_c)
         return self.min_temp
 
     # ---------- feasibility (how low can the floor actually go) ----------
@@ -1157,14 +1166,17 @@ class SmartCooling(hass.Hass):
              needed. The historical feasible-floor cap (next) is skipped here on purpose:
              trying is nearly free at these prices, and that's exactly how a milder night
              re-teaches the learner a deeper number.
-          3. The historical feasible-floor cap -- elsewhere (daytime/evening), avoid
-             paying peak prices chasing depth history says won't hold."""
+          3. The historical feasible-floor cap, minus feasible_probe_c -- elsewhere
+             (daytime/evening), avoid paying peak prices chasing depth history says won't
+             hold, while still probing a little past it because a deeper seal measurably
+             improves the WAKE temperature (see feasible_probe_c). max(target, ...) keeps
+             this honest: the probe can only chase depth the night actually needs."""
         if saturated and self._sat_min is not None:
             return max(target, self._sat_min)
         if now.hour < 6:
             return self.min_temp
         if self._feasible_floor is not None and self._feasible_samples >= self.feasible_min_samples:
-            return max(target, self._feasible_floor - 0.3)
+            return max(target, self._feasible_floor - self.feasible_probe_c)
         return target
 
     def _learn_feasible(self, floor_min, why="saturated"):
