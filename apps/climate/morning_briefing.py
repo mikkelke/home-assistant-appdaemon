@@ -17,7 +17,8 @@ flipping itself to "ac" by 10:00 once the day's real numbers rolled in). Now:
   - Alarm ENABLED (input_boolean.wakeup_bedroom) -> send at the alarm time
     (input_datetime.wakeup_bedroom), rescheduled via listen_state whenever that datetime
     changes.
-  - Alarm DISABLED -> send at fallback_time instead (default 07:00).
+  - Alarm DISABLED -> send at the day-type fallback instead: 07:00 on workdays,
+    09:00 on weekends (user 2026-07-29).
   - Alarm turned OFF DURING the morning window (woke early / cancelled the alarm) -> send
     immediately, at that moment -- but only inside [from_hour, until_hour); disabling it the
     night before must not send.
@@ -53,91 +54,12 @@ from datetime import time, timedelta
 from typing import Optional
 
 
-def _nice_cost(cost_label):
-    """plan_sleep's cost_label ('~1.3 kr') -> prose ('about 1.3 kr'); None for the labels
-    that shouldn't produce a cost clause at all ('free', 'cost unknown', empty)."""
-    if not cost_label or cost_label in ("free", "cost unknown"):
-        return None
-    if cost_label.startswith("~"):
-        return "about " + cost_label[1:].strip()
-    return cost_label
+import climate_model as cm  # the one-voice copy + wake resolution live in the shared model
 
-
-def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed,
-                     tomorrow_needs_ac=False):
-    """Pure composer: sensor.sleep_plan's state+attributes, sensor.smart_cooling_status's
-    attributes, and the AC's deploy/arm state -> one short push (title, message). No I/O,
-    so every branch below is directly unit-testable.
-
-    plan_state is the sleep-plan RECOMMENDATION ("windows"|"ac"|"hybrid"|"nothing" -- the
-    sensor's own state string; see SmartCooling._publish_sleep_plan). An unrecognised
-    value (defensive only -- plan_sleep never actually emits one) falls back to the
-    plan's own headline, so a future recommendation type still produces a sane message
-    instead of silence. status_attrs is accepted for call-site stability but currently
-    unused -- the day-outlook line was cut ("still too chatty").
-    """
-    plan_attrs = dict(plan_attrs or {})
-    # Copy style (user 2026-07-22, three rounds: "like Apple made it" -> "more decided"
-    # -> "still too chatty"): title = the verdict, body = the bare instruction, nothing
-    # else. No explanations, no day outlook, no numbers except the cost when money is
-    # being asked for — every reason lives on the dashboard. One advice; if conditions
-    # change later, the evening rescue issues the NEW advice. hybrid rounds toward ACTION
-    # (deploy/arm the AC) rather than collapsing into the windows verdict -- see the
-    # 2026-07-29 rationale below. status_attrs is accepted but unused since the day-outlook
-    # line was cut.
-    title = "Morning climate"
-    body = ""
-
-    cost = _nice_cost(plan_attrs.get("cost_label"))
-
-    if plan_state == "windows":
-        title = "AC not needed"
-        body = "Keep windows open."
-        if ac_deployed:
-            body += " You can stow the AC."
-    elif plan_state == "hybrid":
-        # Rounds toward ACTION, not the windows verdict (user 2026-07-29): forgetting to
-        # deploy the AC before a hybrid night is the expensive failure (windows alone
-        # weren't enough and there's no backup ready); deploying it unnecessarily costs all
-        # of two minutes. So hybrid nudges toward having the unit ready rather than reading
-        # as a confident windows-only night.
-        title = "Set up the AC"
-        body = "Windows may not be enough tonight."
-        if ac_deployed and armed:
-            body += " The AC is armed if needed."
-        elif ac_deployed:
-            body += " Arm it if you want the AC ready."
-        else:
-            body += " Put it up before you leave."
-            if cost:
-                body += f" {cost[0].upper()}{cost[1:]}."
-    elif plan_state == "nothing":
-        title = "Nothing to do"
-        body = "The bedroom stays cool on its own."
-    elif plan_state == "ac":
-        if ac_deployed and armed:
-            title = "AC handles tonight"
-            body = "Already armed." + (f" {cost[0].upper()}{cost[1:]}." if cost else "")
-        elif ac_deployed:
-            title = "Arm the AC"
-            body = "Just arm Cool night."
-        else:
-            title = "Deploy the AC"
-            body = "Before you leave." + (f" {cost[0].upper()}{cost[1:]}." if cost else "")
-    else:
-        headline = (plan_attrs.get("headline") or "").strip()
-        body = f"{headline}." if headline else ""
-
-    # Deploy-advisor fold (user 2026-07-23, one-advice stream): the advisor's lead-time
-    # warning is a line HERE instead of its own push. A daily briefing only ever needs one
-    # day of lead -- tomorrow's too-warm night means "set the packed-away unit up today",
-    # and tomorrow's briefing takes it from there. Only when the unit isn't already out
-    # (deployed = nothing to set up) and today's verdict isn't already an AC instruction.
-    if (tomorrow_needs_ac and not ac_deployed
-            and plan_state in ("windows", "hybrid", "nothing")):
-        body += " Tomorrow needs the AC — set it up today."
-
-    return title, body
+# Compatibility aliases: the pure copy moved to climate_model (2026-07-29) so the push,
+# the Tonight card and any future surface render the SAME words from the SAME function.
+_nice_cost = cm.nice_cost
+compose_briefing = cm.compose_briefing
 
 
 class MorningBriefing(hass.Hass):
@@ -146,7 +68,12 @@ class MorningBriefing(hass.Hass):
         # --- alarm-based trigger (see module docstring) ---
         self.alarm_time_entity = a("alarm_time_entity", "input_datetime.wakeup_bedroom")
         self.alarm_enabled_entity = a("alarm_enabled_entity", "input_boolean.wakeup_bedroom")
-        self.fallback_time = a("fallback_time", "07:00:00")
+        # Weekday-aware fallback (user 2026-07-29): with no alarm set the briefing lands
+        # 07:00 on workdays, 09:00 on weekends. A legacy single `fallback_time` (if present)
+        # seeds both so old configs keep their behavior.
+        legacy_fb = a("fallback_time", None)
+        self.fallback_workday = a("fallback_time_workday", legacy_fb or "07:00:00")
+        self.fallback_weekend = a("fallback_time_weekend", legacy_fb or "09:00:00")
         # --- gates ---
         self.person_entity = a("person_entity", "person.mikkel")
         self.from_hour = int(a("from_hour", 5))
@@ -191,10 +118,14 @@ class MorningBriefing(hass.Hass):
         except Exception as e:
             self.log(f"MobileNotifier not available: {e}", level="WARNING")
 
-        # Fallback run: always scheduled, but defers to a still-pending alarm (see
-        # _on_fallback_fire / _alarm_pending_today).
-        fallback_sched = self._parse_hms(self.fallback_time) or time(7, 0, 0)
-        self.run_daily(self._on_fallback_fire, fallback_sched)
+        # Fallback runs: one per day-type (workday 07:00 / weekend 09:00); each fires only
+        # on its own day-type and defers to a still-pending alarm (see _on_fallback_fire /
+        # _alarm_pending_today). Both may target the same time -- the once-per-day gate
+        # dedupes.
+        fb_work = self._parse_hms(self.fallback_workday) or time(7, 0, 0)
+        fb_week = self._parse_hms(self.fallback_weekend) or time(9, 0, 0)
+        self.run_daily(self._on_fallback_fire, fb_work, day_type="workday")
+        self.run_daily(self._on_fallback_fire, fb_week, day_type="weekend")
         # Alarm run: (re)scheduled now and whenever the alarm datetime changes.
         self._alarm_timer = None
         self._schedule_alarm_run()
@@ -204,7 +135,8 @@ class MorningBriefing(hass.Hass):
         self.listen_state(self._on_alarm_enabled_change, self.alarm_enabled_entity, new="off")
 
         self.log(f"MorningBriefing started (window {self.from_hour}-{self.until_hour}, "
-                 f"fallback {self.fallback_time}, sent_date={self._sent_date})", level="INFO")
+                 f"fallback {self.fallback_workday} workdays / {self.fallback_weekend} "
+                 f"weekends, sent_date={self._sent_date})", level="INFO")
 
     # ---------- state ----------
     def _load_state(self):
@@ -300,6 +232,14 @@ class MorningBriefing(hass.Hass):
         self._fire_wake("alarm time")
 
     def _on_fallback_fire(self, kwargs):
+        # Each fallback run only owns its own day-type (workday run is silent on
+        # weekends and vice versa); with no day_type it covers every day.
+        day_type = (kwargs or {}).get("day_type")
+        is_weekend = self.datetime().weekday() >= 5
+        if day_type == "workday" and is_weekend:
+            return
+        if day_type == "weekend" and not is_weekend:
+            return
         if self._alarm_pending_today():
             self.log("Fallback fire skipped -- alarm is enabled and still pending today",
                      level="DEBUG")

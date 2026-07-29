@@ -153,6 +153,13 @@ SmartCooling:
   sleep_plan_entity: sensor.sleep_plan
   outdoor_rh_entity: sensor.gw2000a_humidity
   ac_noise_penalty_kr: 0.5
+  # Wake-time display for the Tonight card + verdict copy (user 2026-07-29): the enabled
+  # alarm wins, else 07:00 workdays / 09:00 weekends. Display only -- actuation still
+  # plans against sleep_hours, never the clock. Mirrors morning_briefing.yaml.
+  alarm_time_entity: input_datetime.wakeup_bedroom
+  alarm_enabled_entity: input_boolean.wakeup_bedroom
+  fallback_time_workday: "07:00:00"
+  fallback_time_weekend: "09:00:00"
   # Live session-cost metering + estimator calibration (rebuilt 2026-07-29 -- see
   # smart_cooling.py's module docstring): kwh_per_deg (kWh spent per degree C of pre-cool
   # deficit closed) replaces the old flat night_cost_ema EMA, which 3 finalized 0.00 kWh

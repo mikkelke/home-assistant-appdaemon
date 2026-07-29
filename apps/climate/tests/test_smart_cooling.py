@@ -56,6 +56,11 @@ def make_app(**overrides):
     # per-night achieved-depth learning (see _finalize_night)
     app.feasible_learn_min_engaged = overrides.get("feasible_learn_min_engaged", 120.0)
     app.feasible_probe_c = overrides.get("feasible_probe_c", 1.0)
+    # wake display knobs (resolve_wake inputs; display-only)
+    app.alarm_time_entity = "input_datetime.wakeup_bedroom"
+    app.alarm_enabled_entity = "input_boolean.wakeup_bedroom"
+    app.fallback_workday = "07:00:00"
+    app.fallback_weekend = "09:00:00"
     app._night_floor_min = overrides.get("night_floor_min", None)
     app._night_engaged_min = overrides.get("night_engaged_min", 0.0)
     app._learned_tonight = overrides.get("learned_tonight", False)
@@ -1500,6 +1505,8 @@ class PublishSleepPlanGrounding(unittest.TestCase):
         app.weather_forecast_entity = "weather.forecast_home"
         app.sleep_plan_entity = "sensor.sleep_plan"
         app.window_contact_entities = {"bedroom": "binary_sensor.bedroom_window"}
+        app.climate_entity = "climate.ac"
+        app.enable_entity = "input_boolean.smart_cooling"
         app.zone_offset = 1.0
         app.floor_cool_cph = 1.0
         app.cool_kw = 0.5

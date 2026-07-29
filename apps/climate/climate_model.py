@@ -23,6 +23,10 @@ Contents:
   - free cooling: windows_can_cool (feasibility against a TARGET) + vent_helps (compat
     wrapper) + summarize_open_windows
   - plan_sleep: the cheapest-path planner (windows cost 0 vs AC energy*price + noise)
+  - compose_briefing / nice_cost: the ONE-VOICE verdict copy (title + bare instruction)
+    shared by the morning push, the evening rescue framing and the Tonight card
+  - resolve_wake: the next wake moment (enabled alarm, else 07:00 workdays /
+    09:00 weekends -- user 2026-07-29)
   - multi-night storage-advisor chain (A1 fit): DeployAdvisor's separate night-ahead
     apartment-mass projector (kitchen_chain/floor_chain/b23_aux/night_peak/project_nights)
 """
@@ -31,6 +35,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from datetime import datetime, time as dtime, timedelta
 from typing import Optional
 
 
@@ -484,6 +489,110 @@ def plan_sleep(inp: SleepPlanInputs) -> dict:
         "deficit": round(deficit, 2),
     })
     return base
+
+
+# ------------------------------------------------------------- one-voice verdict copy
+
+def nice_cost(cost_label):
+    """plan_sleep's cost_label ('~1.3 kr') -> prose ('about 1.3 kr'); None for the labels
+    that shouldn't produce a cost clause at all ('free', 'cost unknown', empty)."""
+    if not cost_label or cost_label in ("free", "cost unknown"):
+        return None
+    if cost_label.startswith("~"):
+        return "about " + cost_label[1:].strip()
+    return cost_label
+
+
+def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed,
+                     tomorrow_needs_ac=False):
+    """The ONE voice: title = the verdict, body = the bare instruction (user 2026-07-22,
+    three copy rounds: "like Apple made it" -> "more decided" -> "still too chatty").
+    Moved here from morning_briefing so the push, the card and any future surface render
+    the SAME words from the SAME function -- copy can no longer drift between channels.
+
+    plan_state is sleep_plan's recommendation ("windows"|"ac"|"hybrid"|"nothing"); an
+    unrecognised value falls back to the plan's own headline. status_attrs is accepted
+    for call-site stability but unused (the day-outlook line was cut). hybrid rounds
+    toward ACTION (user 2026-07-29: forgetting to deploy is the expensive failure)."""
+    plan_attrs = dict(plan_attrs or {})
+    title = "Morning climate"
+    body = ""
+
+    cost = nice_cost(plan_attrs.get("cost_label"))
+
+    if plan_state == "windows":
+        title = "AC not needed"
+        body = "Keep windows open."
+        if ac_deployed:
+            body += " You can stow the AC."
+    elif plan_state == "nothing":
+        title = "Nothing to do"
+        body = "The bedroom stays cool on its own."
+    elif plan_state == "hybrid":
+        title = "Set up the AC"
+        if ac_deployed and armed:
+            body = "Windows may not be enough tonight. The AC is armed if needed."
+        elif ac_deployed:
+            body = "Windows may not be enough tonight. Arm it if you want the AC ready."
+        else:
+            body = ("Windows may not be enough tonight. Put it up before you leave."
+                    + (f" {cost[0].upper()}{cost[1:]}." if cost else ""))
+    elif plan_state == "ac":
+        if ac_deployed and armed:
+            title = "AC handles tonight"
+            body = "Already armed." + (f" {cost[0].upper()}{cost[1:]}." if cost else "")
+        elif ac_deployed:
+            title = "Arm the AC"
+            body = "Just arm Cool night."
+        else:
+            title = "Deploy the AC"
+            body = "Before you leave." + (f" {cost[0].upper()}{cost[1:]}." if cost else "")
+    else:
+        headline = (plan_attrs.get("headline") or "").strip()
+        body = f"{headline}." if headline else ""
+
+    if (tomorrow_needs_ac and not ac_deployed
+            and plan_state in ("windows", "hybrid", "nothing")):
+        body += " Tomorrow needs the AC — set it up today."
+
+    return title, body
+
+
+# ------------------------------------------------------------- wake time
+
+def resolve_wake(now, alarm_hms, alarm_enabled,
+                 workday_hms="07:00:00", weekend_hms="09:00:00"):
+    """The next wake moment after ``now`` (naive local datetime in, naive out).
+
+    The enabled alarm wins; with no alarm the fallback is day-typed: 07:00 on workdays,
+    09:00 on weekends (user 2026-07-29), resolved against the day the wake actually lands
+    on -- Friday evening resolves to Saturday 09:00, Sunday evening to Monday 07:00.
+    Returns None when nothing parses (callers omit the wake display rather than guess)."""
+    def _hms(v):
+        try:
+            parts = [int(x) for x in str(v).strip().split(":")]
+        except (TypeError, ValueError):
+            return None
+        if not 1 <= len(parts) <= 3:
+            return None
+        parts += [0] * (3 - len(parts))
+        try:
+            return dtime(parts[0], parts[1], parts[2])
+        except ValueError:
+            return None
+
+    for offset in (0, 1):
+        day = now.date() + timedelta(days=offset)
+        if alarm_enabled:
+            t = _hms(alarm_hms)
+        else:
+            t = _hms(weekend_hms if day.weekday() >= 5 else workday_hms)
+        if t is None:
+            return None
+        cand = datetime.combine(day, t)
+        if cand > now:
+            return cand
+    return None
 
 
 # ------------------------------------------------------------- multi-night storage-advisor chain (A1 fit 2026-07-09)

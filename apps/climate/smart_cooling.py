@@ -182,6 +182,13 @@ class SmartCooling(hass.Hass):
         # NOT ground the bedroom's projection.
         self.sleep_plan_entity = a("sleep_plan_entity", "sensor.sleep_plan")
         self.ac_noise_penalty_kr = float(a("ac_noise_penalty_kr", 0.5))
+        # Wake-time display (Tonight card + push copy): the enabled alarm, else the
+        # day-type fallback (07:00 workdays / 09:00 weekends -- user 2026-07-29). Display
+        # only; actuation still plans against sleep_hours, never against the clock.
+        self.alarm_time_entity = a("alarm_time_entity", "input_datetime.wakeup_bedroom")
+        self.alarm_enabled_entity = a("alarm_enabled_entity", "input_boolean.wakeup_bedroom")
+        self.fallback_workday = a("fallback_time_workday", "07:00:00")
+        self.fallback_weekend = a("fallback_time_weekend", "09:00:00")
         # --- live session-cost metering + estimator calibration (validated 2026-07-21: the
         # sleep-plan's AC estimate was 4-8x too LOW against the Shelly meter -- it priced ONE
         # deficit-closing run at the single cheapest slot, ~1.5 kWh/~0.7 kr, while the plug
@@ -1602,6 +1609,27 @@ class SmartCooling(hass.Hass):
                 detail += (f" (Grounded on reality: the bedroom zone is ~{bedroom_zone_now:.1f}C "
                            f"now and tonight's low is ~{night_outdoor:.1f}C, so the sealed room "
                            f"drifts toward that, not the daytime peak {e_active:.1f}C.)")
+            # Wake display for the Tonight card: WHEN you wake (alarm else day-type
+            # fallback via cm.resolve_wake) and what you'll wake TO. On an AC/hybrid plan
+            # the promise assumes the pre-cool lands (coast from the priced target);
+            # otherwise it's the plan's own no-AC coast peak. Display only.
+            alarm_t = await self._state(self.alarm_time_entity)
+            alarm_on = (await self._state(self.alarm_enabled_entity)) == "on"
+            wake_dt = cm.resolve_wake(now, alarm_t, alarm_on,
+                                      self.fallback_workday, self.fallback_weekend)
+            wake_proj = plan.get("projected_peak")
+            if (plan["recommendation"] in ("ac", "hybrid")
+                    and plan_equilibrium is not None and floor is not None):
+                wp = cm.coast_peak(pricing_target, plan_equilibrium,
+                                   self._rise_frac, self.zone_offset)
+                if wp is not None:
+                    wake_proj = round(min(wp, plan.get("projected_peak") or wp), 1)
+            # One voice: the card renders the same verdict the push composes.
+            v_deployed = (await self._state(self.climate_entity)) not in (
+                None, "unavailable", "unknown")
+            v_armed = (await self._state(self.enable_entity)) == "on"
+            v_title, v_text = cm.compose_briefing(
+                plan["recommendation"], plan, {}, v_deployed, v_armed)
             # Load-bearing strings (cost_label/windows_summary) never rely on a 0/False/None
             # value that AppDaemon 4.5.13 would drop; est_cost_kr==0 legitimately vanishes and
             # the dashboard reads cost_label instead. open_windows stays a list ([] survives).
@@ -1640,6 +1668,14 @@ class SmartCooling(hass.Hass):
                 attrs["bedroom_zone_now"] = round(bedroom_zone_now, 1)
             if night_outdoor is not None:
                 attrs["night_outdoor_min"] = round(night_outdoor, 1)
+            if wake_dt is not None:
+                attrs["wake_at"] = wake_dt.strftime("%H:%M")
+            if wake_proj is not None:
+                attrs["wake_projection"] = wake_proj
+            if v_title:
+                attrs["verdict_title"] = v_title
+            if v_text:
+                attrs["verdict_text"] = v_text
             await self.set_state(self.sleep_plan_entity, state=plan["recommendation"],
                                  replace=True, attributes=attrs)
         except Exception as e:

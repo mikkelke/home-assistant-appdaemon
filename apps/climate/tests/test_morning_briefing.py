@@ -665,5 +665,52 @@ class AlarmTimeReschedule(unittest.TestCase):
         self.assertTrue(_logged(app, "no valid time"))
 
 
+class FallbackDayTyping(unittest.TestCase):
+    """The workday fallback run is silent on weekends and vice versa (user 2026-07-29:
+    07:00 workdays / 09:00 weekends)."""
+
+    def _app(self, weekday):
+        import datetime as _dt
+        app = mb.MorningBriefing.__new__(mb.MorningBriefing)
+        app.log = lambda *a, **k: None
+        app.datetime = lambda: _dt.datetime(2026, 8, 3 + (weekday - 0), 7, 0)  # Mon=0 base
+        app._fired = []
+        app._fire_wake = lambda source: app._fired.append(source)
+        app._alarm_pending_today = lambda: False
+        return app
+
+    def test_workday_run_fires_on_monday(self):
+        app = self._app(weekday=0)      # 2026-08-03 is a Monday
+        app._on_fallback_fire({"day_type": "workday"})
+        self.assertEqual(len(app._fired), 1)
+
+    def test_workday_run_silent_on_saturday(self):
+        app = self._app(weekday=5)      # 2026-08-08 is a Saturday
+        app._on_fallback_fire({"day_type": "workday"})
+        self.assertEqual(app._fired, [])
+
+    def test_weekend_run_fires_on_saturday(self):
+        app = self._app(weekday=5)
+        app._on_fallback_fire({"day_type": "weekend"})
+        self.assertEqual(len(app._fired), 1)
+
+    def test_weekend_run_silent_on_wednesday(self):
+        app = self._app(weekday=2)      # 2026-08-05 is a Wednesday
+        app._on_fallback_fire({"day_type": "weekend"})
+        self.assertEqual(app._fired, [])
+
+    def test_untyped_run_covers_any_day(self):
+        for wd in (0, 5):
+            app = self._app(weekday=wd)
+            app._on_fallback_fire({})
+            self.assertEqual(len(app._fired), 1, f"weekday={wd}")
+
+    def test_still_defers_to_pending_alarm(self):
+        app = self._app(weekday=0)
+        app._alarm_pending_today = lambda: True
+        app._on_fallback_fire({"day_type": "workday"})
+        self.assertEqual(app._fired, [])
+
+
 if __name__ == "__main__":
     unittest.main()

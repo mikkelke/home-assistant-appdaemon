@@ -7,7 +7,7 @@
 # fired as early as 05:30 and misled the sleep plan's own window-feasibility test):
 #   - Alarm enabled (input_boolean.wakeup_bedroom) -> send at the alarm time
 #     (input_datetime.wakeup_bedroom), rescheduled whenever that datetime changes.
-#   - Alarm disabled -> send at fallback_time instead.
+#   - Alarm disabled -> send at the day-type fallback: 07:00 workdays, 09:00 weekends.
 #   - Alarm turned off DURING the morning window (woke early / cancelled) -> send
 #     immediately -- but disabling it the night before must not send (still gated to
 #     from_hour..until_hour).
@@ -28,7 +28,9 @@ MorningBriefing:
 
   alarm_time_entity: input_datetime.wakeup_bedroom
   alarm_enabled_entity: input_boolean.wakeup_bedroom
-  fallback_time: "07:00:00"
+  # No alarm set -> the briefing lands at the day-type fallback (user 2026-07-29).
+  fallback_time_workday: "07:00:00"
+  fallback_time_weekend: "09:00:00"
   person_entity: person.mikkel
   from_hour: 5
   until_hour: 12

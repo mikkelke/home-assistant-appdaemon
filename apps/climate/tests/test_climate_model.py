@@ -508,5 +508,49 @@ class NightPeakCoastLawEquivalence(unittest.TestCase):
                     places=9)
 
 
+class ResolveWake(unittest.TestCase):
+    """Next wake moment: enabled alarm wins; else 07:00 workdays / 09:00 weekends
+    (user 2026-07-29), resolved against the day the wake actually lands on."""
+
+    def test_enabled_alarm_later_today(self):
+        got = cm.resolve_wake(datetime(2026, 7, 29, 5, 0), "08:00:00", True)
+        self.assertEqual(got, datetime(2026, 7, 29, 8, 0))
+
+    def test_enabled_alarm_already_rang_rolls_to_tomorrow(self):
+        got = cm.resolve_wake(datetime(2026, 7, 29, 21, 0), "08:00:00", True)
+        self.assertEqual(got, datetime(2026, 7, 30, 8, 0))
+
+    def test_friday_evening_no_alarm_lands_saturday_0900(self):
+        # 2026-07-31 is a Friday: the wake lands on SATURDAY -> weekend fallback.
+        got = cm.resolve_wake(datetime(2026, 7, 31, 22, 0), None, False)
+        self.assertEqual(got, datetime(2026, 8, 1, 9, 0))
+
+    def test_sunday_evening_no_alarm_lands_monday_0700(self):
+        # 2026-08-02 is a Sunday: the wake lands on MONDAY -> workday fallback.
+        got = cm.resolve_wake(datetime(2026, 8, 2, 22, 0), None, False)
+        self.assertEqual(got, datetime(2026, 8, 3, 7, 0))
+
+    def test_saturday_early_morning_no_alarm_is_same_day_0900(self):
+        got = cm.resolve_wake(datetime(2026, 8, 1, 5, 30), None, False)
+        self.assertEqual(got, datetime(2026, 8, 1, 9, 0))
+
+    def test_garbage_alarm_returns_none(self):
+        self.assertIsNone(cm.resolve_wake(datetime(2026, 7, 29, 5, 0), "not-a-time", True))
+
+    def test_custom_fallbacks(self):
+        got = cm.resolve_wake(datetime(2026, 7, 29, 22, 0), None, False,
+                              workday_hms="06:30:00", weekend_hms="10:00:00")
+        self.assertEqual(got, datetime(2026, 7, 30, 6, 30))   # Thursday = workday
+
+
+class ComposeBriefingSharedHome(unittest.TestCase):
+    def test_moved_verbatim_and_reexported(self):
+        # one voice, one function: morning_briefing's compose is THIS function.
+        import morning_briefing as mb
+        self.assertIs(mb.compose_briefing, cm.compose_briefing)
+        title, body = cm.compose_briefing("windows", {"cost_label": "~1.7 kr"}, {}, False, False)
+        self.assertEqual((title, body), ("AC not needed", "Keep windows open."))
+
+
 if __name__ == "__main__":
     unittest.main()
