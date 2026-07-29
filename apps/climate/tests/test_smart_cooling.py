@@ -61,6 +61,7 @@ def make_app(**overrides):
     app.alarm_enabled_entity = "input_boolean.wakeup_bedroom"
     app.fallback_workday = "07:00:00"
     app.fallback_weekend = "09:00:00"
+    app._last_wake_floor = overrides.get("last_wake_floor", None)
     app._night_floor_min = overrides.get("night_floor_min", None)
     app._night_engaged_min = overrides.get("night_engaged_min", 0.0)
     app._learned_tonight = overrides.get("learned_tonight", False)

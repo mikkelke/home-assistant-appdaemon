@@ -413,6 +413,7 @@ class SmartCooling(hass.Hass):
         # Latest sleep-plan verdict (stashed by _publish_sleep_plan each tick); the evening
         # rescue DELIVERS this instead of computing its own projection -- one brain.
         self._last_plan = None
+        self._last_wake_floor = None  # last coast-learn's end floor -- the morning receipt
         # One evening-rescue advisory per calendar day (YYYY-MM-DD, or None). The rollover
         # is implicit: a new day's date != the stored one, so the next qualifying evening
         # re-arms without an explicit reset. Persisted so a reload/HA restart mid-evening
@@ -614,6 +615,8 @@ class SmartCooling(hass.Hass):
             with open(self.state_file) as f:
                 d = json.load(f)
             self._rise_frac = float(d.get("rise_frac", self._rise_frac))
+            lwf = d.get("last_wake_floor")
+            self._last_wake_floor = float(lwf) if lwf is not None else None
             nfm = d.get("night_floor_min")
             self._night_floor_min = float(nfm) if nfm is not None else None
             self._night_engaged_min = float(d.get("night_engaged_min", 0.0))
@@ -655,6 +658,7 @@ class SmartCooling(hass.Hass):
         try:
             with open(self.state_file, "w") as f:
                 json.dump({"rise_frac": self._rise_frac, "rise_samples": self._rise_samples,
+                           "last_wake_floor": self._last_wake_floor,
                            "night_floor_min": self._night_floor_min,
                            "night_engaged_min": round(self._night_engaged_min, 1),
                            "learned_tonight": self._learned_tonight,
@@ -1062,6 +1066,8 @@ class SmartCooling(hass.Hass):
         F0, E = lo["F0"], lo["E"]
         rise, gap = floor - F0, E - F0
         self._lightout = None
+        # The morning receipt: what the floor actually woke at (coast-window end ~= wake).
+        self._last_wake_floor = round(floor, 1)
         if gap > 0.5 and rise > 0:
             r_obs = max(0.05, min(0.98, rise / gap))
             n = self._rise_samples
@@ -1983,6 +1989,12 @@ class SmartCooling(hass.Hass):
                "cool_cph_samples": self._cool_cph_samples}
         if self._last_session_cost is not None:
             out["last_night_cost_kr"] = self._last_session_cost
+        if self._last_session_kwh:
+            out["last_night_kwh"] = self._last_session_kwh
+        if self._last_wake_floor is not None:
+            out["last_night_wake_temp"] = self._last_wake_floor
+        if self._feasible_floor is not None:
+            out["feasible_floor"] = self._feasible_floor
         if self._night_cost_ema is not None:
             out["night_cost_ema_kr"] = self._night_cost_ema
         if self._session_kwh0 is not None or self._session_cost > 0:
