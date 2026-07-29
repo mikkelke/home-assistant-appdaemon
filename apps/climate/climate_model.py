@@ -305,12 +305,26 @@ class SleepPlanInputs:
     indoor_dew: Optional[float]
     open_windows: list = field(default_factory=list)
     noise_penalty_kr: float = 0.5
-    session_factor: float = 2.5     # theoretical-estimate multiplier for a real multi-run session
-    learned_night_cost: Optional[float] = None  # metered EMA kr/night -- preferred over theory
+    # DEPRECATED/UNUSED (2026-07-29 cost-model rebuild -- see kwh_per_deg below): kept only
+    # so old callers/tests that still pass them don't break the constructor. plan_sleep no
+    # longer reads either.
+    session_factor: float = 2.5
+    learned_night_cost: Optional[float] = None
     peak_margin_c: float = 0.2
     hybrid_gap_c: float = 1.5
+    # Hard bound on the windows/hybrid bucket (2026-07-29): a gap this large is a heat-soaked
+    # MASS, not merely warm air, and venting cannot rescue that no matter how cool the outside
+    # air is -- see plan_sleep's docstring for the incident this fixes.
+    windows_max_gap_c: float = 2.5
     temp_margin_c: float = 0.5      # outdoor must be at least this far below the limit to cool
     muggy_slack_c: float = 2.0      # outdoor dew this much above indoor before it's "too muggy"
+    # The temperature judged for window feasibility WHEN the cooling would actually happen
+    # (overnight), not right now -- see plan_sleep's docstring for why this matters. None
+    # falls back to outdoor_temp (the old behaviour).
+    night_outdoor: Optional[float] = None
+    # kWh spent per degree (C) of pre-cool deficit closed -- learned from real metered
+    # sessions (SmartCooling._finalize_session); see plan_sleep's docstring for provenance.
+    kwh_per_deg: float = 1.6
 
 
 def _windows_phrase(open_windows) -> str:
@@ -332,27 +346,45 @@ def plan_sleep(inp: SleepPlanInputs) -> dict:
     the night for the least money (windows cost 0, AC = a real night's cost), planning the
     whole night rather than the current instant.
 
-    AC cost is the LEARNED metered night cost (inp.learned_night_cost, an EMA of real
-    Shelly-metered sessions -- see SmartCooling._finalize_session) when available: it IS
-    reality, not a model of it. Until a night's been metered, it falls back to a
-    session-factor-corrected theoretical estimate -- the naive single deficit-closing run
-    priced at the single cheapest slot measured 4-8x too LOW against the meter on
-    2026-07-21, because a real session re-cools all night (re-warm top-ups, stall-burps,
-    the parked crawl, the post-midnight cheap-power chase), not just the one run the naive
-    formula prices (see inp.session_factor). noise_penalty_kr no longer inflates the
-    displayed cost -- kept only for backward-compat callers/tests.
+    AC cost is a SCALING model, kWh spent per degree (C) of pre-cool deficit closed
+    (inp.kwh_per_deg): kwh = deficit * kwh_per_deg; ac_cost = kwh * cheapest_price. This
+    replaced a flat learned-kr-per-night EMA (inp.learned_night_cost) on 2026-07-29: that
+    EMA was poisoned by 3 finalized 0.00 kWh sessions (armed+deployed nights the compressor
+    never actually ran) dragging it down to 0.36 kr while 15 metered days (2026-07-10..29)
+    actually averaged 4.50 kr -- see SmartCooling.session_min_kwh, which now excludes those
+    trivial sessions from every learned value. kwh_per_deg is itself learned the same way
+    (SmartCooling._finalize_session: session_kwh / the deficit captured at session start),
+    seeded at kwh_per_deg_default (1.6) from that same 15-day window -- genuine cooling
+    nights ran 2.7-7.4 kWh for ~3-4C deficits (e.g. 2026-07-17: 6.27 kWh / 10.61 kr).
+    inp.session_factor/inp.learned_night_cost are DEPRECATED and no longer read (kept only
+    so old callers/tests don't break the constructor); noise_penalty_kr likewise no longer
+    inflates the displayed cost -- both kept only for backward-compat.
 
-    projected_peak = coast_peak(floor, equilibrium, rise_frac, zone_offset).
+    projected_peak = coast_peak(floor, equilibrium, rise_frac, zone_offset). cool_enough
+    (whether a window could do the job) is judged against inp.night_outdoor -- the
+    temperature expected WHEN the cooling would actually happen, overnight -- falling back
+    to inp.outdoor_temp only if that's unavailable. This fixes the 2026-07-29 case: at
+    05:30 the CURRENT outdoor reading is the day's daily minimum, so judging feasibility
+    against it made a window look sufficient every single morning, even projecting a
+    25.9C peak against a 22.5C limit ("AC not needed" at 05:55; the plan itself flipped to
+    'ac' by 10:00 once the day's real numbers were in).
       - peak within peak_margin_c of the limit           -> 'nothing' (free)
-      - else cooler outside (temp) AND not meaningfully muggier than indoors:
-          gap <= hybrid_gap_c                             -> 'windows' (free)
-          gap  > hybrid_gap_c                             -> 'hybrid'  (windows now + AC backup)
+      - else cool_enough AND not meaningfully muggier than indoors:
+          gap <= hybrid_gap_c                             -> 'windows'  (free)
+          gap <= windows_max_gap_c                        -> 'hybrid'  (windows now + AC backup)
+          gap  > windows_max_gap_c                        -> 'ac'      (too big for venting alone)
       - else (too WARM, or genuinely MUGGY, outside)      -> 'ac'
+    The windows_max_gap_c bound (2026-07-29) exists because the hybrid bucket used to be
+    unbounded: any gap above hybrid_gap_c with cool-enough air read as 'hybrid', which
+    compose_briefing then reported as "AC not needed" -- reported live with a 3.4C gap
+    (projected peak 25.9C vs a 22.5C limit) that should have been an unambiguous 'ac'. A
+    heat-soaked thermal mass cannot be rescued by venting no matter how cool the air
+    outside is; past windows_max_gap_c a window is no longer credible.
     A window cools whenever it's cooler outside; humidity merely level with indoors is a note,
     NOT a reason to run the compressor. Windows always beat equal-comfort AC (0 < ac_cost).
 
     Returns a plain dict (recommendation/projected_peak/comfort_limit/est_cost_kr/
-    cost_label/headline/detail/open_windows/windows_summary). ADVISORY ONLY.
+    cost_label/headline/detail/open_windows/windows_summary/deficit). ADVISORY ONLY.
     """
     limit = inp.comfort_limit
     open_windows = list(inp.open_windows or [])
@@ -379,19 +411,15 @@ def plan_sleep(inp: SleepPlanInputs) -> dict:
     peak_disp = round(projected_peak, 1)
     gap = projected_peak - limit
 
-    # AC cost of pre-cooling the floor deep enough to keep the zone under the limit. The
-    # learned metered night cost wins when available (see the docstring); otherwise the
-    # theoretical single-run estimate is scaled by session_factor to approximate what a
-    # real multi-run session actually spends, with no separate noise-penalty add-on.
+    # AC cost of pre-cooling the floor deep enough to keep the zone under the limit: the
+    # scaling model (see the docstring), kWh = deficit(C) * kwh_per_deg.
     target = calc_floor_target(inp.equilibrium, limit, inp.rise_frac,
                                inp.zone_offset, inp.min_temp)
     deficit = max(0.0, inp.floor - target)
-    if inp.learned_night_cost is not None:
-        ac_cost = round(inp.learned_night_cost, 2)
-    elif inp.cheapest_price is None:
+    if inp.cheapest_price is None:
         ac_cost = None
     else:
-        kwh = inp.cool_power_kw * (deficit / inp.floor_cool_cph) * inp.session_factor
+        kwh = deficit * inp.kwh_per_deg
         ac_cost = round(kwh * inp.cheapest_price, 2)
 
     if gap <= inp.peak_margin_c:
@@ -404,8 +432,14 @@ def plan_sleep(inp: SleepPlanInputs) -> dict:
         # comfort question, not a reason to burn the compressor. Only run the AC when a window
         # genuinely can't do the job: too WARM outside, OR the outdoor air is meaningfully
         # MUGGIER than indoors (opening it imports real moisture -- not a knife-edge tie).
-        cool_enough = (inp.outdoor_temp is not None
-                       and inp.outdoor_temp < limit - inp.temp_margin_c)
+        #
+        # cool_enough is judged against night_outdoor (the temperature overnight, when the
+        # cooling would actually happen) when known, falling back to the current outdoor_temp
+        # reading only if it's missing -- see the docstring for why the current reading alone
+        # is unsafe (it's the daily minimum at 05:30, every single morning).
+        night_temp = inp.night_outdoor if inp.night_outdoor is not None else inp.outdoor_temp
+        cool_enough = (night_temp is not None
+                       and night_temp < limit - inp.temp_margin_c)
         too_muggy = (inp.outdoor_dew is not None and inp.indoor_dew is not None
                      and inp.outdoor_dew - inp.indoor_dew > inp.muggy_slack_c)
         if cool_enough and not too_muggy:
@@ -417,12 +451,21 @@ def plan_sleep(inp: SleepPlanInputs) -> dict:
                 headline = "Open a window"
                 detail = (f"Projected peak {peak_disp:.1f}C is {gap:.1f}C over the {limit:.1f}C "
                           f"limit, and it's cooler outside -- a window covers it for free.{humid_note}")
-            else:
+            elif gap <= inp.windows_max_gap_c:
                 rec, cost = "hybrid", ac_cost
                 headline = f"Open windows now, AC backup {_cost_label(ac_cost)}"
                 detail = (f"Projected peak {peak_disp:.1f}C is {gap:.1f}C over the {limit:.1f}C "
                           f"limit -- open windows now (cooler outside); keep the AC ready "
                           f"({_cost_label(ac_cost)}) if the room won't settle.{humid_note}")
+            else:
+                # Gap too large for venting alone even though the air outside is cool -- a
+                # heat-soaked mass, not a hot-air problem (2026-07-29: a 3.4C gap here used
+                # to read as 'hybrid'/"AC not needed" before this bound existed).
+                rec, cost = "ac", ac_cost
+                headline = f"Run the AC {_cost_label(ac_cost)}"
+                detail = (f"Projected peak {peak_disp:.1f}C is {gap:.1f}C over the {limit:.1f}C "
+                          f"limit -- too big a gap for a window alone, even with cool air "
+                          f"outside -- pre-cool with the AC ({_cost_label(ac_cost)}).")
         else:
             rec, cost = "ac", ac_cost
             headline = f"Run the AC {_cost_label(ac_cost)}"
@@ -438,6 +481,7 @@ def plan_sleep(inp: SleepPlanInputs) -> dict:
         "cost_label": _cost_label(cost),
         "headline": headline,
         "detail": detail,
+        "deficit": round(deficit, 2),
     })
     return base
 

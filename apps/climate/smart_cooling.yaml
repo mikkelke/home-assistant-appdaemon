@@ -137,15 +137,25 @@ SmartCooling:
   sleep_plan_entity: sensor.sleep_plan
   outdoor_rh_entity: sensor.gw2000a_humidity
   ac_noise_penalty_kr: 0.5
-  # Live session-cost metering + estimator calibration. 2026-07-21 session: planner
-  # estimated ~1.5 kWh at the cheapest slot (~0.7 kr); the Shelly plug metered 3.5 kWh /
-  # ~4.2 kr spot (user tariff ~6 kr). session_energy_factor covers re-warm top-ups/burps/
-  # parked crawl/post-midnight chase; est_price_slots blends the k cheapest slots instead
-  # of THE cheapest; both stop mattering once night_cost_ema is learned from real metered
-  # sessions.
+  # Live session-cost metering + estimator calibration (rebuilt 2026-07-29 -- see
+  # smart_cooling.py's module docstring): kwh_per_deg (kWh spent per degree C of pre-cool
+  # deficit closed) replaces the old flat night_cost_ema EMA, which 3 finalized 0.00 kWh
+  # sessions had poisoned down to 0.36 kr while 15 metered days (2026-07-10..29) actually
+  # averaged 4.50 kr. kwh_per_deg_default seeds it (genuine cooling nights ran 2.7-7.4 kWh
+  # for ~3-4C deficits, e.g. 2026-07-17: 6.27 kWh / 10.61 kr) and is overwritten by the
+  # learned EMA once a night's been metered. session_min_kwh excludes trivial/no-op
+  # sessions (armed+deployed but the compressor never actually ran) from EVERY learned
+  # value -- they carry no signal about what cooling costs, only noise.
+  # session_energy_factor is no longer read by plan_sleep (kept for any other caller);
+  # est_price_slots is now the pricing k FLOOR/fallback for when the deficit isn't known
+  # yet -- the estimate otherwise prices the k = ceil(minutes_needed/15) slots the job will
+  # actually occupy (real blended price paid across those 15 days was 1.39-1.52 kr/kWh vs
+  # the ~0.5 kr/kWh the old single-cheapest-slot code produced).
   ac_energy_entity: sensor.ac_plug_energy
   session_energy_factor: 2.5
   est_price_slots: 8
+  kwh_per_deg_default: 1.6
+  session_min_kwh: 0.5
   # NAME=ENTITY list (NOT a dict: a new dict-valued yaml key trips AppDaemon 4.5's config
   # scan and forces a full restart of every app; a list value reloads only SmartCooling).
   window_contact_entities:

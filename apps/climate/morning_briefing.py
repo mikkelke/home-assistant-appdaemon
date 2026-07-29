@@ -8,25 +8,35 @@ is manual by design -- this app is purely advisory (see below). It composes the 
 from what's already published (sensor.sleep_plan + sensor.smart_cooling_status); no new
 projection logic lives here.
 
-Wake signal = first of either, after from_hour:
-  - motion_entity (binary_sensor.bedroom_pir_presence) transitions to "on", or
-  - either bed_entities sensor transitions to "off" (bed-exit fallback).
-motion_entity ORs raw motion with a separate occupancy signal, so it can already read
-"on" all night while someone sleeps -- a pure off->on edge on it alone could never fire
-on an ordinary morning. Getting OUT of bed is the wake edge that's always reliably
-there, so both bed sensors are wired to the same handler too; whichever of the three
-edges happens first after from_hour wins, and the once-per-day gate silences the rest.
+Trigger = the alarm, not motion (2026-07-29 fix): the briefing used to fire on the first
+PIR/bed-exit edge after from_hour, and an early riser (or an early wake-up in general) sent
+it at 05:30 -- the coldest, most misleading moment of the day for the sleep plan's own
+window-feasibility test (see climate_model.plan_sleep's night_outdoor grounding: "AC not
+needed" at 05:55 while the plan's own projected peak was already 3.4C over the limit,
+flipping itself to "ac" by 10:00 once the day's real numbers rolled in). Now:
+  - Alarm ENABLED (input_boolean.wakeup_bedroom) -> send at the alarm time
+    (input_datetime.wakeup_bedroom), rescheduled via listen_state whenever that datetime
+    changes.
+  - Alarm DISABLED -> send at fallback_time instead (default 07:00).
+  - Alarm turned OFF DURING the morning window (woke early / cancelled the alarm) -> send
+    immediately, at that moment -- but only inside [from_hour, until_hour); disabling it the
+    night before must not send.
+The fallback run never pre-empts a still-pending alarm: if the alarm is enabled and its
+time hasn't happened yet today, the fallback silently defers to it (see
+_alarm_pending_today). All three trigger paths funnel into the same _handle_wake() -- one
+set of gates, never duplicated.
 
 Gates, checked in this order inside an asyncio.Lock (the sent-date is re-checked INSIDE
-the lock so two near-simultaneous edges -- e.g. motion and a bed-exit within the same
-second -- can't both slip past the once-per-day check and double-send):
+the lock so two near-simultaneous triggers -- e.g. the alarm firing right as the fallback's
+own pre-empt check is mid-flight -- can't both slip past the once-per-day check and
+double-send):
   1. Local hour in [from_hour, until_hour) -- outside it, ignore silently.
   2. Once per day -- last-sent date persisted to state_file.
   3. Home (person_entity) -- suppress ONLY on a live "not_home" reading; a dead/unknown/
      unavailable sensor is never evidence of being away (same semantics as SmartCooling's
      rescue_home_entity gate).
   4. Data -- sensor.sleep_plan must have a real state and non-empty attributes. Missing/
-     unknown data does NOT mark the day as sent, so a later wake edge (e.g. after an HA
+     unknown data does NOT mark the day as sent, so a later trigger (e.g. after an HA
      restart delays the plan's first publish) retries.
 
 compose_briefing() is a pure function (plan/status data in, (title, message) out), so the
@@ -39,7 +49,7 @@ one notification and its own logs.
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 import asyncio
 import json
-from datetime import timedelta
+from datetime import time, timedelta
 from typing import Optional
 
 
@@ -71,21 +81,36 @@ def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed,
     # -> "still too chatty"): title = the verdict, body = the bare instruction, nothing
     # else. No explanations, no day outlook, no numbers except the cost when money is
     # being asked for — every reason lives on the dashboard. One advice; if conditions
-    # change later, the evening rescue issues the NEW advice. hybrid deliberately
-    # collapses into the windows verdict (the AC-backup nuance is dashboard + rescue
-    # material). status_attrs is accepted but unused since the day-outlook line was cut.
+    # change later, the evening rescue issues the NEW advice. hybrid rounds toward ACTION
+    # (deploy/arm the AC) rather than collapsing into the windows verdict -- see the
+    # 2026-07-29 rationale below. status_attrs is accepted but unused since the day-outlook
+    # line was cut.
     title = "Morning climate"
     body = ""
 
     cost = _nice_cost(plan_attrs.get("cost_label"))
 
-    if plan_state in ("windows", "hybrid"):
+    if plan_state == "windows":
         title = "AC not needed"
         body = "Keep windows open."
-        # Stow advice only on a confident windows night: on hybrid the unit may still be
-        # wanted as backup by evening, so "pack it away" would be bad advice.
-        if ac_deployed and plan_state == "windows":
+        if ac_deployed:
             body += " You can stow the AC."
+    elif plan_state == "hybrid":
+        # Rounds toward ACTION, not the windows verdict (user 2026-07-29): forgetting to
+        # deploy the AC before a hybrid night is the expensive failure (windows alone
+        # weren't enough and there's no backup ready); deploying it unnecessarily costs all
+        # of two minutes. So hybrid nudges toward having the unit ready rather than reading
+        # as a confident windows-only night.
+        title = "Set up the AC"
+        body = "Windows may not be enough tonight."
+        if ac_deployed and armed:
+            body += " The AC is armed if needed."
+        elif ac_deployed:
+            body += " Arm it if you want the AC ready."
+        else:
+            body += " Put it up before you leave."
+            if cost:
+                body += f" {cost[0].upper()}{cost[1:]}."
     elif plan_state == "nothing":
         title = "Nothing to do"
         body = "The bedroom stays cool on its own."
@@ -118,10 +143,10 @@ def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed,
 class MorningBriefing(hass.Hass):
     def initialize(self) -> None:
         a = self.args.get
-        # --- wake-trigger entities (see module docstring for the PIR/bed-exit rationale) ---
-        self.motion_entity = a("motion_entity", "binary_sensor.bedroom_pir_presence")
-        self.bed_entities = list(a("bed_entities",
-                                  ["binary_sensor.left_bedside", "binary_sensor.right_bedside"]))
+        # --- alarm-based trigger (see module docstring) ---
+        self.alarm_time_entity = a("alarm_time_entity", "input_datetime.wakeup_bedroom")
+        self.alarm_enabled_entity = a("alarm_enabled_entity", "input_boolean.wakeup_bedroom")
+        self.fallback_time = a("fallback_time", "07:00:00")
         # --- gates ---
         self.person_entity = a("person_entity", "person.mikkel")
         self.from_hour = int(a("from_hour", 5))
@@ -151,10 +176,11 @@ class MorningBriefing(hass.Hass):
 
         self._sent_date: Optional[str] = None
         self._load_state()
-        # Serializes _handle_wake(): the three wake listeners can each schedule their own
-        # create_task on near-simultaneous edges (e.g. motion + a bed-exit within the same
-        # second); the once-per-day date is re-checked INSIDE the lock so only the first to
-        # get there actually sends (see _handle_wake_locked).
+        # Serializes _handle_wake(): the alarm/fallback/alarm-disabled triggers can each
+        # schedule their own create_task on near-simultaneous events (e.g. the fallback's
+        # own pre-empt check racing the alarm's fire); the once-per-day date is re-checked
+        # INSIDE the lock so only the first to get there actually sends (see
+        # _handle_wake_locked).
         self._wake_lock = asyncio.Lock()
 
         # get_app must be resolved in the sync init context -- inside async methods
@@ -165,12 +191,20 @@ class MorningBriefing(hass.Hass):
         except Exception as e:
             self.log(f"MobileNotifier not available: {e}", level="WARNING")
 
-        self.listen_state(self._on_wake_trigger, self.motion_entity, new="on", source="motion")
-        for ent in self.bed_entities:
-            self.listen_state(self._on_wake_trigger, ent, new="off", source="bed_exit")
+        # Fallback run: always scheduled, but defers to a still-pending alarm (see
+        # _on_fallback_fire / _alarm_pending_today).
+        fallback_sched = self._parse_hms(self.fallback_time) or time(7, 0, 0)
+        self.run_daily(self._on_fallback_fire, fallback_sched)
+        # Alarm run: (re)scheduled now and whenever the alarm datetime changes.
+        self._alarm_timer = None
+        self._schedule_alarm_run()
+        self.listen_state(self._on_alarm_time_changed, self.alarm_time_entity)
+        # Alarm turned off mid-morning (woke early / cancelled) -> send right now instead of
+        # waiting for the fallback -- still gated to the sanity window (see the callback).
+        self.listen_state(self._on_alarm_enabled_change, self.alarm_enabled_entity, new="off")
 
         self.log(f"MorningBriefing started (window {self.from_hour}-{self.until_hour}, "
-                 f"sent_date={self._sent_date})", level="INFO")
+                 f"fallback {self.fallback_time}, sent_date={self._sent_date})", level="INFO")
 
     # ---------- state ----------
     def _load_state(self):
@@ -205,11 +239,80 @@ class MorningBriefing(hass.Hass):
         except Exception:
             return {}
 
+    # ---------- alarm scheduling ----------
+    @staticmethod
+    def _parse_hms(tstr):
+        """'HH:MM[:SS]' -> datetime.time, or None on any missing/malformed input."""
+        if not tstr:
+            return None
+        try:
+            hh, mm, *ss = [int(x) for x in str(tstr).split(":")]
+            return time(hh, mm, ss[0] if ss else 0)
+        except Exception:
+            return None
+
+    def _schedule_alarm_run(self):
+        """(Re)schedule the daily alarm-time run -- called at init and whenever
+        alarm_time_entity changes. Cancel/reschedule safely: only cancel a timer AppDaemon
+        still considers running (same guard wakeup_bedroom.py's _schedule_daily_alarm uses),
+        to avoid an 'Invalid callback handle' warning on a timer that already fired or was
+        never set."""
+        if self._alarm_timer is not None:
+            try:
+                if self.timer_running(self._alarm_timer):
+                    self.cancel_timer(self._alarm_timer)
+            except Exception:
+                pass
+            self._alarm_timer = None
+        sched = self._parse_hms(self.get_state(self.alarm_time_entity))
+        if sched is None:
+            self.log(f"{self.alarm_time_entity} has no valid time yet -- alarm run not "
+                     f"scheduled (fallback at {self.fallback_time} still covers today)",
+                     level="WARNING")
+            return
+        self._alarm_timer = self.run_daily(self._on_alarm_fire, sched)
+        self.log(f"Morning briefing alarm run scheduled at {sched}", level="INFO")
+
+    def _on_alarm_time_changed(self, entity, attribute, old, new, kwargs):
+        self._schedule_alarm_run()
+
+    def _alarm_pending_today(self):
+        """True when the alarm is enabled and its configured time hasn't happened yet
+        today. Used ONLY by the fallback run (_on_fallback_fire) so it never pre-empts a
+        still-pending alarm -- e.g. fallback_time 07:00 with the alarm enabled for 08:00
+        must wait for the alarm, not fire early with the wrong (fallback) advice."""
+        if self.get_state(self.alarm_enabled_entity) != "on":
+            return False
+        sched = self._parse_hms(self.get_state(self.alarm_time_entity))
+        if sched is None:
+            return False
+        return self.datetime().time() < sched
+
     # ---------- trigger ----------
-    def _on_wake_trigger(self, entity, attribute, old, new, kwargs):
-        self.log(f"Wake trigger: {kwargs.get('source', entity)} ({entity} {old}->{new})",
-                 level="DEBUG")
+    def _fire_wake(self, source):
+        """Sync trigger -> async handler: every trigger path (alarm, fallback, alarm
+        disabled mid-window) funnels through the same asyncio.Lock-guarded _handle_wake(),
+        so the once-per-day/home/data gates never need duplicating (see module docstring)."""
+        self.log(f"Wake trigger: {source}", level="DEBUG")
         self.create_task(self._handle_wake())
+
+    def _on_alarm_fire(self, kwargs):
+        self._fire_wake("alarm time")
+
+    def _on_fallback_fire(self, kwargs):
+        if self._alarm_pending_today():
+            self.log("Fallback fire skipped -- alarm is enabled and still pending today",
+                     level="DEBUG")
+            return
+        self._fire_wake("fallback time")
+
+    def _on_alarm_enabled_change(self, entity, attribute, old, new, kwargs):
+        now = self.datetime()
+        if not (self.from_hour <= now.hour < self.until_hour):
+            self.log(f"Alarm disabled outside the {self.from_hour}-{self.until_hour} window "
+                     f"(hour={now.hour}) -- not sending instantly", level="DEBUG")
+            return
+        self._fire_wake("alarm disabled mid-window")
 
     async def _handle_wake(self):
         async with self._wake_lock:

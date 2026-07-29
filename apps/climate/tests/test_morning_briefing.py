@@ -4,8 +4,9 @@ import asyncio
 import sys
 import types
 import unittest
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
+from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -49,12 +50,13 @@ class ComposeBriefingRecommendationBranches(unittest.TestCase):
     def test_titles_are_decided_verdicts(self):
         # The title IS the instruction (user: "A/C not needed - Keep windows open") --
         # one advice, no hedging; a changed situation later gets a NEW advice via the
-        # evening rescue. hybrid deliberately collapses into the windows verdict, and
-        # the ac title names the one action the current deploy/arm state actually needs.
+        # evening rescue. hybrid rounds toward ACTION (user 2026-07-29: forgetting to
+        # deploy is the expensive failure), and the ac title names the one action the
+        # current deploy/arm state actually needs.
         self.assertEqual(mb.compose_briefing("windows", _attrs(), {}, False, False)[0],
                          "AC not needed")
         self.assertEqual(mb.compose_briefing("hybrid", _attrs(), {}, False, False)[0],
-                         "AC not needed")
+                         "Set up the AC")
         self.assertEqual(mb.compose_briefing("nothing", _attrs(), {}, False, False)[0],
                          "Nothing to do")
         self.assertEqual(mb.compose_briefing("ac", _attrs(), {}, False, False)[0],
@@ -110,19 +112,30 @@ class ComposeBriefingRecommendationBranches(unittest.TestCase):
         _, message = mb.compose_briefing("ac", _attrs(cost_label=None), {}, True, True)
         self.assertEqual(message, "Already armed.")
 
-    def test_hybrid_is_the_same_decided_windows_advice(self):
-        # user 2026-07-22 ("make it more decided"): one advice, no hedging -- hybrid
-        # reads exactly like a windows night. No backup talk, no deploy; if the evening
-        # turns, the rescue advisory issues the NEW advice.
-        _, message = mb.compose_briefing("hybrid", _attrs(), {}, False, False)
-        self.assertEqual(message, "Keep windows open.")
+    def test_hybrid_not_deployed_instructs_deploying_with_cost(self):
+        # user 2026-07-29: hybrid rounds toward ACTION -- forgetting to deploy the AC before
+        # a hybrid night is the expensive failure, deploying unnecessarily costs two
+        # minutes. Not deployed -> the same "before you leave" urgency + cost clause style
+        # as the ac branch.
+        title, message = mb.compose_briefing("hybrid", _attrs(), {}, False, False)
+        self.assertEqual(title, "Set up the AC")
+        self.assertEqual(message, "Windows may not be enough tonight. Put it up before "
+                                  "you leave. About 1.8 kr.")
 
-    def test_hybrid_deployed_never_advises_stowing(self):
-        # The stow hint is windows-only: on hybrid the unit may still be wanted by
-        # evening, so "pack it away" would be bad advice even though tonight's verdict
-        # is windows.
+    def test_hybrid_not_deployed_without_cost_still_reads_clean(self):
+        _, message = mb.compose_briefing("hybrid", _attrs(cost_label=None), {}, False, False)
+        self.assertEqual(message, "Windows may not be enough tonight. Put it up before you leave.")
+
+    def test_hybrid_deployed_but_not_armed_offers_to_arm(self):
+        _, message = mb.compose_briefing("hybrid", _attrs(), {}, True, False)
+        self.assertEqual(message, "Windows may not be enough tonight. Arm it if you want "
+                                  "the AC ready.")
+
+    def test_hybrid_deployed_and_armed_acknowledges_instead_of_deploying(self):
+        # Already deployed+armed -> acknowledge that instead of telling them to deploy
+        # (there's nothing left to set up).
         _, message = mb.compose_briefing("hybrid", _attrs(), {}, True, True)
-        self.assertEqual(message, "Keep windows open.")
+        self.assertEqual(message, "Windows may not be enough tonight. The AC is armed if needed.")
 
     def test_unknown_recommendation_falls_back_to_headline_only(self):
         _, message = mb.compose_briefing(
@@ -468,6 +481,188 @@ class NotifyMethod(unittest.TestCase):
         app.mobile_notifier = BoomNotifier()
         ok = asyncio.run(app._notify("Morning climate", "msg"))
         self.assertFalse(ok)
+
+
+# ---------------------------------------------------------------- alarm-based trigger (2026-07-29)
+
+def _sched_app(now, states, *, alarm_timer=None, from_hour=5, until_hour=12,
+              fallback_time="07:00:00"):
+    """MorningBriefing instance for the SYNC alarm-scheduling side (_schedule_alarm_run /
+    _alarm_pending_today / _on_fallback_fire / _on_alarm_fire / _on_alarm_enabled_change) --
+    distinct from _make_app (which exercises the async _handle_wake_locked gate chain).
+    Same __new__ + monkeypatched-callables trick as
+    apps/rutines/tests/test_wakeup_restart_survival.py's make_app(). states maps entity_id
+    -> state string (get_state has no attribute lookups here, so kw is ignored)."""
+    app = mb.MorningBriefing.__new__(mb.MorningBriefing)
+    app.alarm_time_entity = "input_datetime.wakeup_bedroom"
+    app.alarm_enabled_entity = "input_boolean.wakeup_bedroom"
+    app.fallback_time = fallback_time
+    app.from_hour = from_hour
+    app.until_hour = until_hour
+    app._alarm_timer = alarm_timer
+    app.log_calls = []
+    app.log = lambda *a, **kw: app.log_calls.append((a, kw))
+    app.get_state = lambda entity, **kw: states.get(entity)
+    app.datetime = lambda: now
+    app.timer_running = lambda handle: handle is not None
+    app.cancel_timer = MagicMock()
+    app.run_daily = MagicMock(return_value="daily-handle")
+    # _fire_wake is stubbed directly (rather than create_task/_handle_wake) so these tests
+    # assert the SCHEDULING/gating decision -- which trigger source fires, if any -- without
+    # touching asyncio at all; _handle_wake_locked's own gates are covered by
+    # OncePerDayGuard/HourWindowGate/HomeGate/DataGate above.
+    app.woken = []
+    app._fire_wake = lambda source: app.woken.append(source)
+    return app
+
+
+def _logged(app, needle):
+    return any(needle in str(a) for a, kw in app.log_calls)
+
+
+class ParseHms(unittest.TestCase):
+    def test_hh_mm_ss(self):
+        self.assertEqual(mb.MorningBriefing._parse_hms("08:15:30"), time(8, 15, 30))
+
+    def test_hh_mm_defaults_seconds_to_zero(self):
+        self.assertEqual(mb.MorningBriefing._parse_hms("08:15"), time(8, 15, 0))
+
+    def test_none_empty_and_malformed_return_none(self):
+        for bad in (None, "", "not-a-time", "08"):
+            self.assertIsNone(mb.MorningBriefing._parse_hms(bad))
+
+
+class AlarmPendingToday(unittest.TestCase):
+    """_alarm_pending_today: the fallback run's sole pre-empt check."""
+
+    NOW = datetime(2026, 7, 29, 7, 0)
+
+    def test_enabled_and_time_in_the_future_is_pending(self):
+        app = _sched_app(self.NOW, {"input_boolean.wakeup_bedroom": "on",
+                                    "input_datetime.wakeup_bedroom": "08:00:00"})
+        self.assertTrue(app._alarm_pending_today())
+
+    def test_enabled_but_time_already_passed_is_not_pending(self):
+        app = _sched_app(self.NOW, {"input_boolean.wakeup_bedroom": "on",
+                                    "input_datetime.wakeup_bedroom": "06:00:00"})
+        self.assertFalse(app._alarm_pending_today())
+
+    def test_disabled_is_never_pending_regardless_of_time(self):
+        app = _sched_app(self.NOW, {"input_boolean.wakeup_bedroom": "off",
+                                    "input_datetime.wakeup_bedroom": "08:00:00"})
+        self.assertFalse(app._alarm_pending_today())
+
+    def test_enabled_but_no_valid_time_is_not_pending(self):
+        app = _sched_app(self.NOW, {"input_boolean.wakeup_bedroom": "on",
+                                    "input_datetime.wakeup_bedroom": "unknown"})
+        self.assertFalse(app._alarm_pending_today())
+
+
+class FallbackDoesNotPreemptPendingAlarm(unittest.TestCase):
+    """The fallback run (_on_fallback_fire) must defer to a still-pending alarm -- e.g.
+    fallback_time 07:00 with the alarm enabled for 08:00 must NOT send at 07:00 with the
+    (wrong) fallback advice; the alarm's own run_daily handles 08:00 instead."""
+
+    NOW = datetime(2026, 7, 29, 7, 0)
+
+    def test_pending_alarm_defers_and_does_not_fire(self):
+        app = _sched_app(self.NOW, {"input_boolean.wakeup_bedroom": "on",
+                                    "input_datetime.wakeup_bedroom": "08:00:00"})
+        app._on_fallback_fire({})
+        self.assertEqual(app.woken, [])
+        self.assertTrue(_logged(app, "pending"))
+
+    def test_alarm_disabled_fires_the_fallback(self):
+        app = _sched_app(self.NOW, {"input_boolean.wakeup_bedroom": "off",
+                                    "input_datetime.wakeup_bedroom": "08:00:00"})
+        app._on_fallback_fire({})
+        self.assertEqual(app.woken, ["fallback time"])
+
+    def test_alarm_enabled_but_already_passed_still_fires_as_a_safety_net(self):
+        # the alarm's own run_daily should have already handled 06:00 (and _handle_wake_
+        # locked's once-per-day gate makes a redundant fallback attempt a harmless no-op) --
+        # but if it somehow didn't (e.g. a reload landed in between), the fallback must not
+        # stay silent forever just because the alarm is enabled.
+        app = _sched_app(self.NOW, {"input_boolean.wakeup_bedroom": "on",
+                                    "input_datetime.wakeup_bedroom": "06:00:00"})
+        app._on_fallback_fire({})
+        self.assertEqual(app.woken, ["fallback time"])
+
+
+class AlarmDisabledInstantPath(unittest.TestCase):
+    """Alarm turned off DURING the morning window (woke early / cancelled) -> send right
+    now; disabling it outside the window (e.g. the night before) must NOT send."""
+
+    def _fire(self, now, from_hour=5, until_hour=12):
+        app = _sched_app(now, {}, from_hour=from_hour, until_hour=until_hour)
+        app._on_alarm_enabled_change("input_boolean.wakeup_bedroom", None, "on", "off", {})
+        return app
+
+    def test_inside_the_window_fires_immediately(self):
+        app = self._fire(datetime(2026, 7, 29, 6, 30))
+        self.assertEqual(app.woken, ["alarm disabled mid-window"])
+
+    def test_at_from_hour_boundary_fires(self):
+        app = self._fire(datetime(2026, 7, 29, 5, 0))
+        self.assertEqual(app.woken, ["alarm disabled mid-window"])
+
+    def test_before_from_hour_does_not_fire(self):
+        # e.g. cancelled the night before at 23:00 -- must not send at that moment.
+        app = self._fire(datetime(2026, 7, 28, 23, 0))
+        self.assertEqual(app.woken, [])
+
+    def test_at_until_hour_boundary_does_not_fire(self):
+        app = self._fire(datetime(2026, 7, 29, 12, 0))
+        self.assertEqual(app.woken, [])
+
+    def test_after_until_hour_does_not_fire(self):
+        app = self._fire(datetime(2026, 7, 29, 18, 0))
+        self.assertEqual(app.woken, [])
+
+
+class AlarmTimeReschedule(unittest.TestCase):
+    """_schedule_alarm_run (called at init and on every alarm_time_entity change via
+    _on_alarm_time_changed) safely cancels any running timer and reschedules a fresh
+    run_daily at the new time -- same cancel/reschedule guard wakeup_bedroom.py uses."""
+
+    NOW = datetime(2026, 7, 29, 6, 0)
+
+    def test_schedules_run_daily_at_the_configured_time(self):
+        app = _sched_app(self.NOW, {"input_datetime.wakeup_bedroom": "08:00:00"})
+        app._schedule_alarm_run()
+        app.run_daily.assert_called_once_with(app._on_alarm_fire, time(8, 0, 0))
+        self.assertEqual(app._alarm_timer, "daily-handle")
+
+    def test_reschedule_cancels_a_running_previous_timer(self):
+        app = _sched_app(self.NOW, {"input_datetime.wakeup_bedroom": "08:00:00"},
+                        alarm_timer="old-handle")
+        app._schedule_alarm_run()
+        app.cancel_timer.assert_called_once_with("old-handle")
+        app.run_daily.assert_called_once_with(app._on_alarm_fire, time(8, 0, 0))
+
+    def test_reschedule_does_not_cancel_an_already_expired_timer(self):
+        # timer_running() False -> the old handle is stale; cancelling it would only log an
+        # AppDaemon "Invalid callback handle" warning (see wakeup_bedroom.py's own guard).
+        app = _sched_app(self.NOW, {"input_datetime.wakeup_bedroom": "08:00:00"},
+                        alarm_timer="stale-handle")
+        app.timer_running = lambda handle: False
+        app._schedule_alarm_run()
+        app.cancel_timer.assert_not_called()
+
+    def test_on_alarm_time_changed_reschedules(self):
+        app = _sched_app(self.NOW, {"input_datetime.wakeup_bedroom": "08:00:00"},
+                        alarm_timer="old-handle")
+        app._on_alarm_time_changed("input_datetime.wakeup_bedroom", None,
+                                   "07:00:00", "08:00:00", {})
+        app.cancel_timer.assert_called_once_with("old-handle")
+        app.run_daily.assert_called_once_with(app._on_alarm_fire, time(8, 0, 0))
+
+    def test_no_valid_time_yet_does_not_schedule_and_does_not_raise(self):
+        app = _sched_app(self.NOW, {"input_datetime.wakeup_bedroom": "unknown"})
+        app._schedule_alarm_run()
+        app.run_daily.assert_not_called()
+        self.assertIsNone(app._alarm_timer)
+        self.assertTrue(_logged(app, "no valid time"))
 
 
 if __name__ == "__main__":

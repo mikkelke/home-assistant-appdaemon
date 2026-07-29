@@ -3,17 +3,22 @@
 # windows, and whether to deploy + arm the AC for tonight. Advisory only -- never calls a
 # climate/switch/cover service; its only outputs are the notification and its own logs.
 #
-# Wake trigger = first of either, after from_hour: motion_entity goes "on", or either
-# bed_entities sensor goes "off" (bed-exit fallback). motion_entity ORs raw motion with a
-# separate occupancy signal, so it can already read "on" all night while someone sleeps --
-# a pure off->on edge on it alone could never fire on an ordinary morning. Getting OUT of
-# bed is the wake edge that's always reliably there, so both bed sensors are wired to the
-# same handler too; whichever of the three fires first after from_hour wins.
+# Trigger = the alarm (2026-07-29 fix -- replaces the old PIR/bed-exit motion trigger, which
+# fired as early as 05:30 and misled the sleep plan's own window-feasibility test):
+#   - Alarm enabled (input_boolean.wakeup_bedroom) -> send at the alarm time
+#     (input_datetime.wakeup_bedroom), rescheduled whenever that datetime changes.
+#   - Alarm disabled -> send at fallback_time instead.
+#   - Alarm turned off DURING the morning window (woke early / cancelled) -> send
+#     immediately -- but disabling it the night before must not send (still gated to
+#     from_hour..until_hour).
+# The fallback run never pre-empts a still-pending alarm (see morning_briefing.py's
+# _alarm_pending_today). All three trigger paths funnel into the same once-per-day/home/
+# data gates.
 #
 # Sent at most once per calendar day (last-sent date in state_file), gated on person_entity
 # being home (suppress ONLY on a live "not_home" reading -- a dead/unknown sensor is never
 # evidence of being away) and on sleep_plan_entity actually having published data (missing/
-# unknown data does NOT mark the day as sent, so a later wake edge retries).
+# unknown data does NOT mark the day as sent, so a later trigger retries).
 
 MorningBriefing:
   module: morning_briefing
@@ -21,10 +26,9 @@ MorningBriefing:
   # Init-order guarantee for get_app("MobileNotifier") cached in initialize(); also reloads this app when MobileNotifier reloads.
   dependencies: MobileNotifier
 
-  motion_entity: binary_sensor.bedroom_pir_presence
-  bed_entities:
-    - binary_sensor.left_bedside
-    - binary_sensor.right_bedside
+  alarm_time_entity: input_datetime.wakeup_bedroom
+  alarm_enabled_entity: input_boolean.wakeup_bedroom
+  fallback_time: "07:00:00"
   person_entity: person.mikkel
   from_hour: 5
   until_hour: 12

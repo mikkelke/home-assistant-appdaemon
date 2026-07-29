@@ -44,6 +44,17 @@ def make_app(**overrides):
     app._feasible_floor = overrides.get("feasible_floor", None)
     app._feasible_samples = overrides.get("feasible_samples", 0)
     app._dry_min = overrides.get("dry_min", 0.0)
+    # learned cooling rate (C/h) + scheduler commitment slack
+    app.floor_cool_cph = overrides.get("floor_cool_cph", 1.0)
+    app._cool_cph = overrides.get("cool_cph", None)
+    app._cool_cph_samples = overrides.get("cool_cph_samples", 0)
+    app._rate_ref_floor = overrides.get("rate_ref_floor", None)
+    app._rate_engaged_min = overrides.get("rate_engaged_min", 0.0)
+    app.cool_cph_min = overrides.get("cool_cph_min", 0.3)
+    app.cool_cph_max = overrides.get("cool_cph_max", 4.0)
+    app.cool_rate_min_engaged = overrides.get("cool_rate_min_engaged", 20.0)
+    app.commit_price_margin = overrides.get("commit_price_margin", 0.15)
+    app.cool_kw = overrides.get("cool_kw", 0.5)          # _schedule's est-cost term
     # weather-model attributes (Model D coefficients + memory + shadow flags)
     app.person_offset = overrides.get("person_offset", 0.5)
     app.weather_model_enabled = overrides.get("weather_model_enabled", True)
@@ -77,6 +88,14 @@ def make_app(**overrides):
     app._last_session_cost = overrides.get("last_session_cost", None)
     app._night_cost_ema = overrides.get("night_cost_ema", None)
     app._night_cost_samples = overrides.get("night_cost_samples", 0)
+    # kwh_per_deg scaling model (2026-07-29 rebuild -- replaces the flat night_cost_ema
+    # preference in plan_sleep) + the trivial-session guard + the sleep plan's own stashed
+    # verdict _track_session_cost reads the pre-cool deficit from at session start.
+    app.session_min_kwh = overrides.get("session_min_kwh", 0.5)
+    app._session_deficit0 = overrides.get("session_deficit0", None)
+    app._kwh_per_deg = overrides.get("kwh_per_deg", 1.6)
+    app._kwh_per_deg_samples = overrides.get("kwh_per_deg_samples", 0)
+    app._last_plan = overrides.get("last_plan", None)
     app._save_state = lambda: None
     app.log = lambda *a, **k: None
     return app
@@ -327,6 +346,27 @@ class SessionCostTracking(unittest.TestCase):
         app._track_session_cost(False, 1.5, 100.0)
         self.assertIsNone(app._session_kwh0)
 
+    def test_session_start_captures_deficit0_from_last_plan(self):
+        # kwh_per_deg learning anchor (2026-07-29): the deficit the sleep plan last
+        # published, stashed the moment the session opens.
+        app = make_app(last_plan={"rec": "ac", "deficit": 3.2})
+        app._track_session_cost(True, 1.5, 100.0)
+        self.assertEqual(app._session_deficit0, 3.2)
+
+    def test_session_start_with_no_plan_yet_leaves_deficit0_none(self):
+        app = make_app(last_plan=None)
+        app._track_session_cost(True, 1.5, 100.0)
+        self.assertIsNone(app._session_deficit0)
+
+    def test_deficit0_is_not_recaptured_mid_session(self):
+        # only the session-START tick reads _last_plan -- later ticks (the plan re-
+        # publishes every ~15 min) must not overwrite the anchor mid-session.
+        app = make_app(last_plan={"deficit": 3.2})
+        app._track_session_cost(True, 1.5, 100.0)      # session starts
+        app._last_plan = {"deficit": 0.1}               # plan re-published since
+        app._track_session_cost(True, 1.5, 100.5)       # same open session, not a new start
+        self.assertEqual(app._session_deficit0, 3.2)
+
     def test_accumulates_kwh_and_cost_with_price(self):
         app = make_app()
         app._track_session_cost(True, 1.5, 100.0)     # start
@@ -405,6 +445,83 @@ class SessionCostTracking(unittest.TestCase):
     # directly -- it's exercised end-to-end via the real wiring in
     # EvaluateTickWiring.test_disarmed_undeployed_finalizes_a_dangling_session instead of
     # duplicating that class's full evaluate-loop stub scaffolding here.
+
+
+class KwhPerDegLearning(unittest.TestCase):
+    """2026-07-29 cost-model rebuild: kwh_per_deg (kWh spent per degree C of pre-cool
+    deficit closed) replaces the flat night_cost_ema EMA plan_sleep used to prefer -- that
+    EMA was poisoned by 3 finalized 0.00 kWh sessions (armed+deployed nights the compressor
+    never actually ran) dragging it to 0.36 kr against a real ~4.50 kr metered average.
+    session_min_kwh excludes those trivial sessions from EVERY learned value; kwh_per_deg
+    itself is learned from session_kwh / the deficit captured at session start (see
+    SessionCostTracking.test_session_start_captures_deficit0_from_last_plan)."""
+
+    def _run_session(self, app, kwh, price=1.5, deficit0=None):
+        """Open + accumulate exactly `kwh` kWh against a fresh session, then finalize."""
+        if deficit0 is not None:
+            app._last_plan = {"deficit": deficit0}
+        app._track_session_cost(True, price, 100.0)
+        app._track_session_cost(True, price, 100.0 + kwh)
+        app._finalize_session()
+
+    def test_trivial_session_is_skipped_entirely(self):
+        # 0.1 kWh < session_min_kwh (0.5 default) -- a night the compressor barely/never
+        # ran. deficit0 is deliberately large enough to otherwise qualify, proving the skip
+        # is driven by session_min_kwh, not the deficit gate.
+        app = make_app(night_cost_ema=4.0, night_cost_samples=2,
+                       kwh_per_deg=1.8, kwh_per_deg_samples=3)
+        self._run_session(app, kwh=0.1, deficit0=3.0)
+        self.assertIsNone(app._session_kwh0)          # baseline still clears
+        self.assertEqual(app._last_session_kwh, 0.1)  # _last_session_* still set
+        # nothing learned: every value unchanged from its pre-session seed
+        self.assertEqual(app._night_cost_ema, 4.0)
+        self.assertEqual(app._night_cost_samples, 2)
+        self.assertEqual(app._kwh_per_deg, 1.8)
+        self.assertEqual(app._kwh_per_deg_samples, 3)
+
+    def test_trivial_session_is_logged_as_skipped(self):
+        app = make_app()
+        logged = []
+        app.log = lambda *a, **k: logged.append(a)
+        self._run_session(app, kwh=0.1, deficit0=3.0)
+        self.assertTrue(any("skip" in str(a).lower() for a in logged))
+
+    def test_qualifying_session_first_sample_seeds_kwh_per_deg(self):
+        app = make_app(kwh_per_deg_samples=0)
+        self._run_session(app, kwh=3.0, deficit0=2.0)   # obs = 3.0 / 2.0 = 1.5
+        self.assertAlmostEqual(app._kwh_per_deg, 1.5, places=6)
+        self.assertEqual(app._kwh_per_deg_samples, 1)
+
+    def test_qualifying_session_blends_subsequent_samples(self):
+        app = make_app(kwh_per_deg=1.6, kwh_per_deg_samples=1)
+        self._run_session(app, kwh=3.0, deficit0=1.0)   # obs = 3.0 / 1.0 = 3.0
+        self.assertAlmostEqual(app._kwh_per_deg, 0.6 * 1.6 + 0.4 * 3.0, places=6)  # 2.16
+        self.assertEqual(app._kwh_per_deg_samples, 2)
+
+    def test_deficit_exactly_at_threshold_qualifies(self):
+        app = make_app(kwh_per_deg_samples=0)
+        self._run_session(app, kwh=1.0, deficit0=0.5)   # obs = 1.0 / 0.5 = 2.0
+        self.assertAlmostEqual(app._kwh_per_deg, 2.0, places=6)
+        self.assertEqual(app._kwh_per_deg_samples, 1)
+
+    def test_missing_deficit_skips_kwh_per_deg_but_still_learns_night_cost_ema(self):
+        # no plan had published a deficit when the session opened -- can't attribute the
+        # energy to a degree of deficit, so kwh_per_deg is skipped, but night_cost_ema
+        # (independent of deficit) still EMAs normally.
+        app = make_app(kwh_per_deg=1.6, kwh_per_deg_samples=1,
+                       night_cost_ema=4.0, night_cost_samples=2)
+        self._run_session(app, kwh=3.0, deficit0=None)
+        self.assertEqual(app._kwh_per_deg, 1.6)
+        self.assertEqual(app._kwh_per_deg_samples, 1)
+        self.assertNotEqual(app._night_cost_ema, 4.0)
+
+    def test_shallow_deficit_skips_kwh_per_deg_but_still_learns_night_cost_ema(self):
+        app = make_app(kwh_per_deg=1.6, kwh_per_deg_samples=1,
+                       night_cost_ema=4.0, night_cost_samples=2)
+        self._run_session(app, kwh=3.0, deficit0=0.3)   # under the 0.5C attribution floor
+        self.assertEqual(app._kwh_per_deg, 1.6)
+        self.assertEqual(app._kwh_per_deg_samples, 1)
+        self.assertNotEqual(app._night_cost_ema, 4.0)
 
 
 class ShouldBurp(unittest.TestCase):
@@ -1478,6 +1595,107 @@ class PublishSleepPlanGrounding(unittest.TestCase):
         self.assertNotIn("bedroom_zone_now", attrs)   # None-valued attrs are omitted
 
 
+class PublishSleepPlanPricing(unittest.TestCase):
+    """2026-07-29: pricing must blend over the slots the job will ACTUALLY occupy
+    (k = ceil(minutes_needed / 15), minutes_needed = deficit / floor_cool_cph * 60), not a
+    fixed est_price_slots or the single cheapest slot -- real blended price paid across 15
+    metered days (2026-07-10..29) was 1.39-1.52 kr/kWh vs the ~0.5 kr/kWh the old
+    single-cheapest-slot code produced. est_price_slots remains the fallback k for when the
+    deficit can't be computed (missing floor or equilibrium)."""
+
+    NOW = datetime(2026, 7, 29, 12, 0)
+
+    def _app(self, floor):
+        app = make_app(rise_frac=0.5)
+        app.comfort_temp_entity = "t"
+        app.comfort_rh_entity = "rh"
+        app.outdoor_sensor = "out"
+        app.outdoor_rh_entity = "out_rh"
+        app.mid_sensor = "mid"
+        app.kitchen_sensor = "kitchen"
+        app.floor_sensor = "floor"
+        app.price_entity = "price"
+        app.weather_forecast_entity = "wx"
+        app.sleep_plan_entity = "sensor.sleep_plan"
+        app.window_contact_entities = {}
+        app.zone_offset = 1.0
+        app.floor_cool_cph = 1.0
+        app.cool_kw = 0.5
+        app.ac_noise_penalty_kr = 0.5
+        app.wm_reality_margin = 1.0
+        # Huge margin -> grounded_equilibrium's "warm night" branch always wins, so
+        # plan_equilibrium == e_active (26.0) exactly and the target/deficit math below is
+        # easy to hand-check (equally true via the apartment_now-None fallback when floor
+        # is None -- either way plan_equilibrium stays the raw e_active).
+        app.wm_warm_night_margin = 100.0
+        app.est_price_slots = 8
+
+        nums = {"t": 22.0, "rh": 50.0, "out": 15.0, "out_rh": 50.0,
+               "mid": floor, "kitchen": floor, "price": 1.5}
+
+        async def _num(entity, default):
+            return nums.get(entity, default)
+        app._num = _num
+
+        async def _state(entity):
+            return None
+        app._state = _state
+
+        async def _attr(entity, key, default=None):
+            return default   # no price arrays -> empty price map, cheapest = price_now
+        app._attr = _attr
+
+        async def _fc(now):
+            return []
+        app._get_forecast = _fc
+
+        async def _eff(now):
+            return 22.5, 22.5   # ceiling, ceiling_base
+        app._effective_ceiling = _eff
+
+        app._set_state_calls = []
+
+        async def set_state(entity, **kw):
+            app._set_state_calls.append((entity, kw))
+        app.set_state = set_state
+
+        # Spy on the real _blended_cheap so k is captured without faking the pricing math.
+        real_blended_cheap = app._blended_cheap
+        app._blended_calls = []
+
+        def _blended_cheap_spy(pm, now, deadline, fallback, k):
+            app._blended_calls.append(k)
+            return real_blended_cheap(pm, now, deadline, fallback, k)
+        app._blended_cheap = _blended_cheap_spy
+
+        app._floor = floor
+        app._e_active = 26.0
+        return app
+
+    def _run(self, app):
+        import asyncio
+        asyncio.run(app._publish_sleep_plan(self.NOW, app._floor, app._e_active))
+
+    def test_k_sized_from_the_deficit_not_the_fixed_fallback(self):
+        # target 17.0 (calc_floor_target: cap 21.5, r 0.5, E 26.0), deficit 24.0-17.0=7.0C
+        # -> 420 min -> ceil(420/15) = 28 slots, not the fixed est_price_slots (8).
+        app = self._app(floor=24.0)
+        self._run(app)
+        self.assertEqual(app._blended_calls, [28])
+
+    def test_small_deficit_still_prices_at_least_one_slot(self):
+        # deficit 0.1C -> 6 min -> ceil(6/15) = 1, floored at 1 (never 0 slots).
+        app = self._app(floor=17.1)
+        self._run(app)
+        self.assertEqual(app._blended_calls, [1])
+
+    def test_unknown_deficit_falls_back_to_est_price_slots(self):
+        # floor missing -> the deficit can't be computed -> est_price_slots is the k floor.
+        app = self._app(floor=None)
+        self._run(app)
+        self.assertEqual(app._blended_calls, [8])
+
+
 class GoldenModelMath(unittest.TestCase):
     """Lock the byte-identical-actuation claim into CI: the shared climate_model fns
     reproduce smart_cooling's FORMER inline math on a fixed grid. The `_old_*` bodies below
@@ -1587,6 +1805,122 @@ class EffectiveCeilingEquivalence(unittest.TestCase):
         ceiling, base = asyncio.run(app._effective_ceiling(now))
         self.assertEqual(ceiling, 23.0)
         self.assertEqual(base, 23.0)
+
+
+class CoolRateLearning(unittest.TestCase):
+    """The floor sensor only reports every ~30 min, so the rate is learned by accumulating
+    engaged minutes against a reference reading and observing when the reading actually
+    moves. 2026-07-29: a 1.0 C/h seed vs a real ~1.9 C/h made every plan ask double the
+    minutes, over-booking price slots (the 11:00-start/11:31-stop the user asked about)."""
+
+    def _app(self, **kw):
+        app = make_app(**kw)
+        app._save_state = lambda: None
+        app.log = lambda *a, **k: None
+        return app
+
+    def test_seed_used_until_something_is_learned(self):
+        app = self._app()
+        self.assertEqual(app._cool_rate(), 1.0)
+
+    def test_learns_the_real_rate_from_an_engaged_window(self):
+        # the real incident: 24.6 -> 23.6 over ~31 engaged minutes = 1.94 C/h
+        app = self._app()
+        app._track_cool_rate(24.6, 0.0, True)      # sets the reference
+        app._track_cool_rate(24.6, 15.0, True)     # no movement yet
+        app._track_cool_rate(23.6, 16.0, True)     # 1.0C over 31 min
+        self.assertAlmostEqual(app._cool_cph, 1.0 / (31.0 / 60.0), places=2)
+        self.assertEqual(app._cool_cph_samples, 1)
+        self.assertGreater(app._cool_rate(), 1.8)
+
+    def test_window_shorter_than_minimum_does_not_learn(self):
+        # a coarse sensor step divided by a tiny window would wildly overstate the rate
+        app = self._app()
+        app._track_cool_rate(24.6, 0.0, True)
+        app._track_cool_rate(23.6, 5.0, True)      # 1.0C but only 5 engaged min
+        self.assertIsNone(app._cool_cph)
+
+    def test_not_cooling_resets_the_accumulator(self):
+        # coast minutes mixed into the window would understate the rate
+        app = self._app()
+        app._track_cool_rate(24.6, 0.0, True)
+        app._track_cool_rate(24.6, 15.0, True)
+        app._track_cool_rate(24.4, 15.0, False)    # holding -> reset
+        self.assertIsNone(app._rate_ref_floor)
+        self.assertEqual(app._rate_engaged_min, 0.0)
+        self.assertIsNone(app._cool_cph)
+
+    def test_warming_past_the_reference_restarts_without_learning(self):
+        app = self._app()
+        app._track_cool_rate(23.0, 0.0, True)
+        app._track_cool_rate(24.0, 30.0, True)     # warmed 1.0C above the reference
+        self.assertIsNone(app._cool_cph)
+        self.assertEqual(app._rate_ref_floor, 24.0)
+        self.assertEqual(app._rate_engaged_min, 0.0)
+
+    def test_observation_is_clamped_and_emad(self):
+        app = self._app(cool_cph=2.0, cool_cph_samples=1)
+        app._track_cool_rate(24.0, 0.0, True)
+        app._track_cool_rate(20.0, 30.0, True)     # 8 C/h raw -> clamped to 4.0
+        # EMA: 0.6*2.0 + 0.4*4.0 = 2.8
+        self.assertAlmostEqual(app._cool_cph, 2.8, places=3)
+
+    def test_none_floor_is_safe(self):
+        app = self._app()
+        app._track_cool_rate(None, 15.0, True)
+        self.assertIsNone(app._cool_cph)
+
+
+class ScheduleCommitment(unittest.TestCase):
+    """Once cooling, don't abandon the run because the shrinking requirement dropped the
+    slot we're running in out of the strict cheapest-N set (user 2026-07-29)."""
+
+    NOW = datetime(2026, 7, 29, 11, 0)
+    DEADLINE = datetime(2026, 7, 30, 0, 0)
+
+    def _prices(self):
+        # 11:00 hour is the marginal one: pricier than everything from 12:00 on.
+        def price_at(dt):
+            return 0.64 if dt.hour == 11 else 0.50
+        return price_at
+
+    def test_marginal_slot_is_dropped_when_not_already_cooling(self):
+        app = make_app()
+        # small need -> only the cheap 12:00+ slots are chosen, 11:00 is not
+        cool_now, next_start, _, _ = app._schedule(
+            self.NOW, self.DEADLINE, 60.0, self._prices(), already_cooling=False)
+        self.assertFalse(cool_now)
+        self.assertGreaterEqual(next_start.hour, 12)
+
+    def test_same_situation_keeps_going_when_already_cooling(self):
+        app = make_app()
+        cool_now, _, _, _ = app._schedule(
+            self.NOW, self.DEADLINE, 60.0, self._prices(), already_cooling=True)
+        self.assertTrue(cool_now)
+
+    def test_commitment_does_not_hold_through_a_genuinely_pricey_slot(self):
+        # 11:00 at 1.50 vs 0.50 chosen -> far outside the margin -> stop and wait
+        def pricey(dt):
+            return 1.50 if dt.hour == 11 else 0.50
+        app = make_app()
+        cool_now, _, _, _ = app._schedule(
+            self.NOW, self.DEADLINE, 60.0, pricey, already_cooling=True)
+        self.assertFalse(cool_now)
+
+    def test_zero_margin_turns_the_hysteresis_off(self):
+        app = make_app(commit_price_margin=0.0)
+        cool_now, _, _, _ = app._schedule(
+            self.NOW, self.DEADLINE, 60.0, self._prices(), already_cooling=True)
+        self.assertFalse(cool_now)
+
+    def test_chosen_plan_is_unaffected_by_the_slack(self):
+        # next_start/run_min still describe the STRICT cheapest-N plan
+        app = make_app()
+        _, ns_cold, run_cold, est_cold = app._schedule(
+            self.NOW, self.DEADLINE, 60.0, self._prices(), already_cooling=False)
+        _, ns_hot, run_hot, est_hot = app._schedule(
+            self.NOW, self.DEADLINE, 60.0, self._prices(), already_cooling=True)
+        self.assertEqual((ns_cold, run_cold, est_cold), (ns_hot, run_hot, est_hot))
 
 
 if __name__ == "__main__":

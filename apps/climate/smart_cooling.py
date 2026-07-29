@@ -74,19 +74,32 @@ planning, so it can't fight a genuine manual session, only an actually-hazardous
 is now also serialized (asyncio.Lock): the re-arm that morning triggered three concurrent
 evaluations that raced and duplicated actuation.
 
-Session-cost metering (2026-07-21, validated with meter data): the sleep plan's AC estimate
-was 4-8x too LOW -- it priced one deficit-closing run (~1.5 kWh) at the single cheapest 15-min
-slot (~0.7 kr), while the Shelly plug metered a real session's 3.5 kWh / ~4.2 kr spot (user's
-full tariff ~6 kr). A real session re-cools all night (re-warm top-ups, stall-burps, the parked
-~300W crawl, the deliberate post-midnight cheap-power chase), not just the one run the old
-formula priced. Fix: meter reality and learn from it. _track_session_cost accumulates every
-tick from ac_energy_entity (the Shelly cumulative kWh counter -- the only reliable AC energy
-meter in this home); _finalize_session (AC-removed press, or a disarmed+undeployed fallback)
-freezes the session and EMAs it into night_cost_ema, which then REPLACES the theoretical
-estimate in plan_sleep. Until a night's been metered, session_energy_factor scales the
-theoretical single-run number up and est_price_slots blends the k cheapest slots instead of
-pricing the whole session at the single cheapest one -- both are display/estimation only and
-never touch the armed actuation chain above.
+Session-cost metering (2026-07-21, validated with meter data; cost MODEL rebuilt 2026-07-29):
+the sleep plan's AC estimate was 4-8x too LOW -- it priced one deficit-closing run (~1.5 kWh)
+at the single cheapest 15-min slot (~0.7 kr), while the Shelly plug metered a real session's
+3.5 kWh / ~4.2 kr spot (user's full tariff ~6 kr). A real session re-cools all night (re-warm
+top-ups, stall-burps, the parked ~300W crawl, the deliberate post-midnight cheap-power chase),
+not just the one run the old formula priced. Fix: meter reality and learn from it.
+_track_session_cost accumulates every tick from ac_energy_entity (the Shelly cumulative kWh
+counter -- the only reliable AC energy meter in this home); _finalize_session (AC-removed
+press, or a disarmed+undeployed fallback) freezes the session totals.
+
+The first cut of this (2026-07-21) EMA'd the session's flat kr cost into night_cost_ema, which
+then REPLACED plan_sleep's theoretical estimate outright. That went stale fast: 3 finalized
+0.00 kWh sessions (Cool night armed+deployed but the compressor never actually ran that night)
+dragged night_cost_ema down to 0.36 kr while 15 metered days (2026-07-10..29) actually averaged
+4.50 kr. The 2026-07-29 rebuild replaces it with a SCALING model instead of a flat number:
+kwh_per_deg (kWh spent per degree C of pre-cool deficit closed), EMA'd from
+session_kwh / deficit0 -- the deficit the sleep plan had published the moment the session
+opened -- and seeded at kwh_per_deg_default from that same 15-day window. session_min_kwh
+excludes trivial/no-op sessions from EVERY learned value (they carry no signal about what
+cooling costs, only noise), and pricing itself is now deficit-sized: _publish_sleep_plan blends
+the price over the k = ceil(minutes_needed / 15) slots the job will actually occupy instead of
+a fixed est_price_slots count (real blended price paid across those 15 days was
+1.39-1.52 kr/kWh vs the ~0.5 kr/kWh the old single-cheapest-slot pricing produced).
+night_cost_ema/last_session_cost etc. are still learned and published (the live/display
+metering readout is still correct) -- they just no longer drive the estimate. None of this
+touches the armed actuation chain above; it is display/estimation only.
 """
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
@@ -174,21 +187,46 @@ class SmartCooling(hass.Hass):
         # deficit-closing run at the single cheapest slot, ~1.5 kWh/~0.7 kr, while the plug
         # metered a real session's 3.5 kWh / ~4.2 kr spot. ac_energy_entity is the Shelly
         # cumulative kWh counter -- the ONLY reliable AC energy meter in this home;
-        # _track_session_cost meters every real session against it every tick, and
-        # _finalize_session learns night_cost_ema (an EMA of metered kr/night) which then
-        # REPLACES the theoretical estimate in plan_sleep once available. Until a night's
-        # been metered, session_energy_factor scales the theoretical single-run estimate up
-        # for what a real session actually spends (re-warm top-ups, stall-burps, the parked
-        # crawl, the post-midnight cheap-power chase), and est_price_slots blends the k
-        # cheapest 15-min slots instead of pricing the whole session at the single cheapest.
+        # _track_session_cost meters every real session against it every tick.
+        # session_energy_factor/est_price_slots remain as the pre-metering theoretical-estimate
+        # knobs (session_energy_factor is no longer read by plan_sleep -- see kwh_per_deg below
+        # -- kept for any other caller; est_price_slots is now the pricing FLOOR/fallback when
+        # the deficit isn't known yet, see _publish_sleep_plan).
         self.ac_energy_entity = a("ac_energy_entity", "sensor.ac_plug_energy")
         self.session_energy_factor = float(a("session_energy_factor", 2.5))
         self.est_price_slots = int(a("est_price_slots", 8))
+        # Scaling cost model (2026-07-29 rebuild -- replaces the flat night_cost_ema EMA,
+        # which 3 finalized 0.00 kWh sessions had poisoned down to 0.36 kr while 15 metered
+        # days, 2026-07-10..29, actually averaged 4.50 kr). kwh_per_deg is kWh spent per
+        # degree (C) of pre-cool deficit closed, learned from real sessions
+        # (_finalize_session) and seeded from that same 15-day window: genuine cooling
+        # nights ran 2.7-7.4 kWh for ~3-4C deficits (e.g. 2026-07-17: 6.27 kWh / 10.61 kr).
+        # session_min_kwh excludes trivial/no-op sessions (armed+deployed but the compressor
+        # never actually ran) from EVERY learned value -- they carry no signal about what
+        # cooling costs, only noise.
+        self.kwh_per_deg_default = float(a("kwh_per_deg_default", 1.6))
+        self.session_min_kwh = float(a("session_min_kwh", 0.5))
         # --- fixed params (not user-facing) ---
         self.default_ceiling = float(a("default_night_ceiling", 23.0))
         self.min_temp = float(a("min_temp", 16.0))            # hardware floor; never drive below
         self.sleep_hours = float(a("sleep_hours", 8.0))
-        self.floor_cool_cph = float(a("floor_cool_cph", 1.0))     # measured ~1 C/h floor/mass cool rate
+        # Seed cool rate; the REAL rate is learned per run into self._cool_cph (see
+        # _track_cool_rate). 2026-07-29 measured 1.0C in 31 engaged min = ~1.9 C/h against
+        # this 1.0 default, so every plan asked for ~2x the minutes it needed -- which
+        # over-booked slots, dragged a marginal expensive hour into the run, and then
+        # dropped it again mid-run when reality closed the deficit faster (the "start 11:00,
+        # stop 11:31, wait for 12:00" the user asked about).
+        self.floor_cool_cph = float(a("floor_cool_cph", 1.0))     # seed only; learned at runtime
+        self.cool_cph_min = float(a("cool_cph_min", 0.3))         # sanity band for a learned rate
+        self.cool_cph_max = float(a("cool_cph_max", 4.0))
+        self.cool_rate_min_engaged = float(a("cool_rate_min_engaged_min", 20.0))
+        # Commitment hysteresis: while ALREADY cooling, keep going if the current slot costs
+        # no more than the priciest slot we DID choose, plus this margin (kr/kWh). Rank slack
+        # is useless here -- with a flat cheap evening the current slot ranks behind dozens of
+        # equally-cheap ones -- but price proximity is exactly the question: don't abandon a
+        # run to chase a saving of pennies (2026-07-29: 0.64 vs 0.50 kr/kWh = 0.02 kr for the
+        # slot), while still stopping for a genuinely expensive stretch.
+        self.commit_price_margin = float(a("commit_price_margin", 0.15))
         self.zone_offset = float(a("zone_offset", 1.0))           # mid wall sits ~this above the floor
         self.person_offset = float(a("person_offset", 0.5))      # sleeper lifts the equilibrium a touch
         self.default_rise_frac = float(a("default_rise_frac", 0.7))  # conservative gap-fraction closed in the window
@@ -328,6 +366,14 @@ class SmartCooling(hass.Hass):
         self._saturated = False
         self._last_want = False                    # was the previous eval trying to cool?
         self._last_eval_at: Optional[datetime] = None
+        # Learned cooling rate (C/h) + its accumulator. The floor sensor only reports every
+        # ~30 min, so a per-tick delta is mostly zeros punctuated by a big step: accumulate
+        # engaged minutes against a reference reading and learn when the reading actually
+        # moves. Persisted like rise_frac / feasible_floor.
+        self._cool_cph: Optional[float] = None
+        self._cool_cph_samples = 0
+        self._rate_ref_floor: Optional[float] = None
+        self._rate_engaged_min = 0.0
         self._feed_last: dict = {}                 # per-kind last feed emit (see _feed_allowed)
         # Deploy watchdog (user, 2026-07-19: armed Cool night but the AC stayed
         # unreachable all afternoon - their own smart-plug button got pressed
@@ -373,13 +419,14 @@ class SmartCooling(hass.Hass):
         self._kitchen_max_date: Optional[str] = None   # ISO date the running max belongs to
         self._fc_cache = None
         self._fc_cache_at: Optional[datetime] = None
-        # Live session-cost metering (see the ac_energy_entity/session_energy_factor/
-        # est_price_slots config block above): _session_kwh0/_session_last_counter track the
-        # Shelly counter baseline while a session is open (both None = no active session);
-        # _session_kwh/_session_cost accumulate the running totals. _last_session_kwh/
-        # _last_session_cost/_night_cost_ema/_night_cost_samples are the finalized, learned
-        # numbers plan_sleep prefers over the theoretical estimate once available. Persisted
-        # so a reload mid-session (or the learned EMA) survives an HA/AppDaemon restart.
+        # Live session-cost metering (see the ac_energy_entity/session_min_kwh/
+        # kwh_per_deg_default config block above): _session_kwh0/_session_last_counter track
+        # the Shelly counter baseline while a session is open (both None = no active
+        # session); _session_kwh/_session_cost accumulate the running totals.
+        # _last_session_kwh/_last_session_cost/_night_cost_ema/_night_cost_samples are the
+        # finalized, live/display readout (night_cost_ema no longer drives plan_sleep's
+        # estimate -- see kwh_per_deg below). Persisted so a reload mid-session (or a
+        # learned value) survives an HA/AppDaemon restart.
         self._session_kwh0: Optional[float] = None
         self._session_last_counter: Optional[float] = None
         self._session_kwh: float = 0.0
@@ -388,6 +435,14 @@ class SmartCooling(hass.Hass):
         self._last_session_cost: Optional[float] = None
         self._night_cost_ema: Optional[float] = None
         self._night_cost_samples: int = 0
+        # Pre-cool deficit (C) captured the moment a session opens (see _track_session_cost),
+        # from the sleep plan's own last-published verdict -- the anchor kwh_per_deg is
+        # learned against. self._kwh_per_deg starts at the seeded default and is overwritten
+        # by the learned EMA once a qualifying session has been metered (see
+        # _finalize_session); _kwh_per_deg_samples counts those qualifying sessions.
+        self._session_deficit0: Optional[float] = None
+        self._kwh_per_deg: float = self.kwh_per_deg_default
+        self._kwh_per_deg_samples: int = 0
         self._load_state()
 
         self.mobile_notifier = None
@@ -536,6 +591,9 @@ class SmartCooling(hass.Hass):
             with open(self.state_file) as f:
                 d = json.load(f)
             self._rise_frac = float(d.get("rise_frac", self._rise_frac))
+            cc = d.get("cool_cph")
+            self._cool_cph = float(cc) if cc is not None else None
+            self._cool_cph_samples = int(d.get("cool_cph_samples", 0))
             self._rise_samples = int(d.get("rise_samples", 0))
             self._lightout = d.get("lightout")
             ff = d.get("feasible_floor")
@@ -560,6 +618,9 @@ class SmartCooling(hass.Hass):
             nce = d.get("night_cost_ema")
             self._night_cost_ema = float(nce) if nce is not None else None
             self._night_cost_samples = int(d.get("night_cost_samples", 0))
+            kpd = d.get("kwh_per_deg")
+            self._kwh_per_deg = float(kpd) if kpd is not None else self._kwh_per_deg
+            self._kwh_per_deg_samples = int(d.get("kwh_per_deg_samples", self._kwh_per_deg_samples))
         except Exception:
             pass
 
@@ -567,6 +628,8 @@ class SmartCooling(hass.Hass):
         try:
             with open(self.state_file, "w") as f:
                 json.dump({"rise_frac": self._rise_frac, "rise_samples": self._rise_samples,
+                           "cool_cph": self._cool_cph,
+                           "cool_cph_samples": self._cool_cph_samples,
                            "lightout": self._lightout,
                            "feasible_floor": self._feasible_floor,
                            "feasible_samples": self._feasible_samples,
@@ -581,7 +644,9 @@ class SmartCooling(hass.Hass):
                            "last_session_kwh": self._last_session_kwh,
                            "last_session_cost": self._last_session_cost,
                            "night_cost_ema": self._night_cost_ema,
-                           "night_cost_samples": self._night_cost_samples}, f)
+                           "night_cost_samples": self._night_cost_samples,
+                           "kwh_per_deg": self._kwh_per_deg,
+                           "kwh_per_deg_samples": self._kwh_per_deg_samples}, f)
         except Exception as e:
             self.log(f"state save failed ({e}) -- continuing in-memory", level="WARNING")
 
@@ -920,10 +985,18 @@ class SmartCooling(hass.Hass):
         cm.calc_floor_target (byte-identical) so the two call sites stay untouched."""
         return cm.calc_floor_target(E, ceiling, self._rise_frac, self.zone_offset, self.min_temp)
 
-    def _schedule(self, now, deadline, minutes_needed, price_at):
+    def _schedule(self, now, deadline, minutes_needed, price_at, already_cooling=False):
         """Reserve the cheapest `minutes_needed` of 15-min slots between now and deadline (midnight -
         see _next_midnight). Cool NOW if the current slot is one of them, or if there isn't time left
-        to wait. Returns (cool_now, next_start, run_min, est_cost)."""
+        to wait. Returns (cool_now, next_start, run_min, est_cost).
+
+        COMMITMENT (user 2026-07-29, "why start at 11:00 for 30 min then wait for 12:00?"): the
+        plan is re-solved from scratch every tick, so as cooling closes the deficit the
+        requirement shrinks and the slot we are CURRENTLY RUNNING IN can drop out of the
+        cheapest set -- stopping mid-run to wait for a slot barely cheaper. While already
+        cooling we therefore keep going when the current slot costs no more than the priciest
+        chosen slot + commit_price_margin. `chosen` (and so next_start/run_min/est) still
+        reflects the strict cheapest-N plan; only the keep-going decision gets the slack."""
         total = int((deadline - now).total_seconds() // 900)
         if total <= 0 or minutes_needed <= 0:
             return False, None, 0, 0.0
@@ -932,6 +1005,9 @@ class SmartCooling(hass.Hass):
         order = sorted(range(total), key=lambda k: price_at(slots[k]))
         chosen = sorted(order[:need])
         cool_now = (0 in chosen) or (need >= total)
+        if not cool_now and already_cooling and chosen:
+            worst_chosen = max(price_at(slots[k]) for k in chosen)
+            cool_now = price_at(slots[0]) <= worst_chosen + self.commit_price_margin
         next_start = slots[chosen[0]] if chosen else None
         est = sum(self.cool_kw * 0.25 * price_at(slots[k]) for k in chosen)
         return cool_now, next_start, need * 15, round(est, 2)
@@ -966,6 +1042,53 @@ class SmartCooling(hass.Hass):
                      f"(rose {rise:.1f} of {gap:.1f} gap) r={r_obs:.2f}; "
                      f"rise_frac now {self._rise_frac:.2f} (n={self._rise_samples})", level="INFO")
         self._save_state()
+
+    # ---------- learned cooling rate (how FAST the floor actually drops) ----------
+    def _cool_rate(self):
+        """The rate to plan with: the learned C/h once we have a sample, else the seed."""
+        return self._cool_cph if self._cool_cph else self.floor_cool_cph
+
+    def _track_cool_rate(self, floor, engaged_min, cooling):
+        """Learn the real floor cool rate (C/h) from engaged cooling time.
+
+        The floor sensor only reports every ~30 min, so per-tick deltas are mostly zero with
+        an occasional big step. Accumulate engaged minutes against a reference reading and
+        learn only when the reading actually moves, requiring cool_rate_min_engaged minutes
+        so a coarse step isn't divided by a tiny window. Any non-cooling tick resets the
+        accumulator (coast time mixed into the window would understate the rate), as does the
+        floor warming above the reference.
+
+        Why it matters (2026-07-29): a 1.0 C/h seed against a real ~1.9 C/h made every plan
+        ask for double the minutes, which over-booked price slots -- see the floor_cool_cph
+        init comment. EMA alpha 0.4, clamped to [cool_cph_min, cool_cph_max]."""
+        if floor is None or not cooling:
+            self._rate_ref_floor = floor if cooling else None
+            self._rate_engaged_min = 0.0
+            return
+        if self._rate_ref_floor is None:
+            self._rate_ref_floor = floor
+            self._rate_engaged_min = 0.0
+            return
+        self._rate_engaged_min += max(0.0, engaged_min)
+        drop = self._rate_ref_floor - floor
+        if drop <= 0.05:
+            if drop < -self.sat_reset_rise:      # warmed well past the reference -> restart
+                self._rate_ref_floor = floor
+                self._rate_engaged_min = 0.0
+            return
+        if self._rate_engaged_min < self.cool_rate_min_engaged:
+            return                                # too short a window to divide by
+        window = self._rate_engaged_min
+        obs = max(self.cool_cph_min, min(self.cool_cph_max, drop / (window / 60.0)))
+        self._cool_cph = obs if self._cool_cph is None else round(
+            0.6 * self._cool_cph + 0.4 * obs, 3)
+        self._cool_cph_samples += 1
+        self._rate_ref_floor = floor
+        self._rate_engaged_min = 0.0
+        self._save_state()
+        self.log(f"Learned cool rate: {obs:.2f} C/h observed ({drop:.1f}C in "
+                 f"{window:.0f} engaged min); rate now {self._cool_cph:.2f} C/h "
+                 f"(n={self._cool_cph_samples})", level="INFO")
 
     # ---------- feasibility (how low can the floor actually go) ----------
     def _track_progress(self, floor, engaged_min):
@@ -1084,7 +1207,15 @@ class SmartCooling(hass.Hass):
         no-op). A session starts the moment the AC is deployed with none already open, then
         accumulates kWh/kr from the counter's delta each tick until _finalize_session() closes
         it out. A negative delta (counter reset, e.g. a Shelly reboot) re-baselines instead of
-        subtracting energy that was never actually used."""
+        subtracting energy that was never actually used.
+
+        Session start also captures _session_deficit0 -- the pre-cool deficit (C) the sleep
+        plan last published (self._last_plan, stashed by _publish_sleep_plan each tick) --
+        the anchor kwh_per_deg learning divides the metered kWh by (see _finalize_session).
+        Reading it here rather than threading a fresh deficit argument through this call site
+        is simpler and just as robust: the plan publishes every tick, so this is always the
+        freshest deficit known at the moment cooling actually starts. None if no plan has
+        published yet (e.g. right after a cold start)."""
         if counter is None:
             return
         if deployed and self._session_kwh0 is None:
@@ -1092,6 +1223,7 @@ class SmartCooling(hass.Hass):
             self._session_last_counter = counter
             self._session_kwh = 0.0
             self._session_cost = 0.0
+            self._session_deficit0 = (self._last_plan or {}).get("deficit")
             self._save_state()
             self.log(f"AC session metering started at {counter:.3f} kWh", level="INFO")
             return
@@ -1109,26 +1241,55 @@ class SmartCooling(hass.Hass):
     def _finalize_session(self):
         """Close out the metered session -- the AC-removed press, or the disarmed+undeployed
         fallback (user unplugged without pressing it first). Freezes the session totals as
-        last night's numbers, EMAs them (alpha 0.4) into night_cost_ema -- the learned real
-        night cost plan_sleep prefers over the theoretical estimate once available (see
-        climate_model.plan_sleep) -- and clears the session baseline so the next deploy
-        starts fresh. _session_kwh/_session_cost are deliberately left in place (not zeroed)
-        so the status entity keeps showing tonight's totals until the next session actually
-        starts. A no-op if no session is open (including a second call in the same tick)."""
+        last night's numbers (_last_session_kwh/_last_session_cost -- still published, still
+        the correct live/most-recent-night readout) and clears the session baseline so the
+        next deploy starts fresh. A no-op if no session is open (including a second call in
+        the same tick).
+
+        Trivial sessions (armed+deployed but the compressor barely/never actually ran --
+        session_min_kwh, default 0.5 kWh) are excluded from EVERY learned value: 3 finalized
+        0.00 kWh sessions once dragged night_cost_ema down to 0.36 kr against a real ~4.50 kr
+        metered average (2026-07-10..29) -- a trivial session carries no signal about what
+        cooling actually costs, only noise. _last_session_kwh/_last_session_cost are still
+        set and the baseline still clears, but neither learned value updates and neither
+        sample count increments.
+
+        On a qualifying session, night_cost_ema still EMAs (kept for the live/display
+        readout -- see the module docstring) but plan_sleep no longer uses it to drive the
+        estimate; kwh_per_deg (kWh spent per degree of pre-cool deficit closed) is what does
+        now, EMA'd (alpha 0.4) from session_kwh / deficit0 -- the deficit captured at session
+        START (see _track_session_cost/_session_deficit0). Skipped (not learned) if that
+        deficit is missing or under 0.5C: too shallow to attribute the session's energy to
+        reliably."""
         if self._session_kwh0 is None:
             return
         self._last_session_kwh = round(self._session_kwh, 3)
         self._last_session_cost = round(self._session_cost, 2)
+        session_kwh = self._session_kwh
+        deficit0 = self._session_deficit0
+        self._session_kwh0 = None
+        self._session_last_counter = None
+        self._session_deficit0 = None
+        if session_kwh < self.session_min_kwh:
+            self._save_state()
+            self.log(f"Session skipped ({session_kwh:.3f} kWh < {self.session_min_kwh:.1f} "
+                     f"kWh min -- trivial/no-op night) -- not learning from it", level="INFO")
+            return
         ema = self._night_cost_ema
         self._night_cost_ema = (self._last_session_cost if ema is None
                                 else round(0.6 * ema + 0.4 * self._last_session_cost, 2))
         self._night_cost_samples += 1
-        self._session_kwh0 = None
-        self._session_last_counter = None
+        if deficit0 is not None and deficit0 >= 0.5:
+            obs = session_kwh / deficit0
+            self._kwh_per_deg = round(
+                obs if self._kwh_per_deg_samples == 0
+                else 0.6 * self._kwh_per_deg + 0.4 * obs, 3)
+            self._kwh_per_deg_samples += 1
         self._save_state()
         self.log(f"Session energy: {self._last_session_kwh:.2f} kWh, "
                  f"{self._last_session_cost:.2f} kr (night-cost EMA {self._night_cost_ema:.2f} kr, "
-                 f"n={self._night_cost_samples})", level="INFO")
+                 f"n={self._night_cost_samples}; kwh/deg {self._kwh_per_deg:.3f}, "
+                 f"n={self._kwh_per_deg_samples})", level="INFO")
 
     async def _check_deploy_watchdog(self, now, master_on, deployed):
         """Notify once if Cool night is armed but the AC stays unreachable past the
@@ -1238,7 +1399,7 @@ class SmartCooling(hass.Hass):
             deficit = floor - target
             if deficit < self.rescue_deficit_min:
                 return
-            mins = deficit / self.floor_cool_cph * 60.0
+            mins = deficit / self._cool_rate() * 60.0
             # Still time to pre-cool the deficit away before the cutoff hour?
             if (self.rescue_to_hour - now.hour) * 60 < mins:
                 return
@@ -1278,7 +1439,19 @@ class SmartCooling(hass.Hass):
         would recommend cooling a flat that's already below its limit and getting colder
         (2026-07-22: every room ~21.7C, outdoor 17->~15C, yet the plan said 'run the AC ->
         peak 24.6C'). cm.grounded_equilibrium reality-checks e_active against apartment_now +
-        a margin unless the night stays warm enough to hold the day's heat -- see that fn."""
+        a margin unless the night stays warm enough to hold the day's heat -- see that fn.
+        night_outdoor (tonight's forecast low) is ALSO passed into the plan as
+        SleepPlanInputs.night_outdoor (2026-07-29): plan_sleep judges window feasibility
+        against it instead of the live outdoor reading, which is the day's minimum at 05:30
+        and made a window look sufficient every single morning -- see plan_sleep's docstring.
+
+        Pricing is deficit-sized (2026-07-29): the estimate blends the price over the slots
+        the job will ACTUALLY occupy (k = ceil(minutes_needed / 15), from the SAME
+        target/deficit math plan_sleep itself runs on the same inputs), not a fixed
+        est_price_slots or the single cheapest slot -- real blended price paid across 15
+        metered days (2026-07-10..29) was 1.39-1.52 kr/kWh vs the ~0.5 kr/kWh the old
+        single-cheapest-slot code produced. est_price_slots remains the floor/fallback k for
+        when the deficit can't be computed yet (missing floor or equilibrium)."""
         try:
             t_in = await self._num(self.comfort_temp_entity, None)
             rh_in = await self._num(self.comfort_rh_entity, None)
@@ -1295,11 +1468,6 @@ class SmartCooling(hass.Hass):
                 await self._attr(self.price_entity, "raw_tomorrow", []),
             )
             price_now = self._price_for(pm, now, await self._num(self.price_entity, 1.7))
-            # Blended over the k cheapest slots (est_price_slots), not just THE cheapest --
-            # a real session re-cools across many slots, not one (see _blended_cheap /
-            # 2026-07-21 calibration). Stops mattering once night_cost_ema is learned.
-            cheapest = self._blended_cheap(pm, now, self._deadline(now), price_now,
-                                           self.est_price_slots)
             ceiling, _ = await self._effective_ceiling(now)
             # Bedroom-zone reality anchor (the A/C is bedroom-only and the bedroom is its own
             # thermal zone -- user 2026-07-22). The sealed room can't drift materially warmer
@@ -1317,23 +1485,37 @@ class SmartCooling(hass.Hass):
                 self.wm_reality_margin, self.wm_warm_night_margin)
             grounded = (plan_equilibrium is not None and e_active is not None
                         and plan_equilibrium < e_active - 0.05)
+            # Deficit-sized pricing (see the docstring): k is the number of 15-min slots the
+            # job actually needs, from the same calc_floor_target/deficit math plan_sleep
+            # itself runs on the same inputs -- est_price_slots is only the fallback k for
+            # when the deficit can't be computed yet (missing floor or equilibrium).
+            if plan_equilibrium is not None and floor is not None:
+                pricing_target = self._calc_target(plan_equilibrium, ceiling)
+                pricing_deficit = max(0.0, floor - pricing_target)
+                minutes_needed = pricing_deficit / self._cool_rate() * 60.0
+                price_slots = max(1, math.ceil(minutes_needed / 15.0))
+            else:
+                price_slots = self.est_price_slots
+            cheapest = self._blended_cheap(pm, now, self._deadline(now), price_now, price_slots)
             plan = cm.plan_sleep(cm.SleepPlanInputs(
                 floor=floor, equilibrium=plan_equilibrium, rise_frac=self._rise_frac,
                 zone_offset=self.zone_offset, comfort_limit=ceiling, min_temp=self.min_temp,
-                floor_cool_cph=self.floor_cool_cph, cool_power_kw=self.cool_kw,
+                floor_cool_cph=self._cool_rate(), cool_power_kw=self.cool_kw,
                 cheapest_price=cheapest, outdoor_temp=t_out, outdoor_dew=outdoor_dew,
                 indoor_dew=indoor_dew, open_windows=open_windows,
                 noise_penalty_kr=self.ac_noise_penalty_kr,
-                session_factor=self.session_energy_factor,
-                learned_night_cost=self._night_cost_ema))
+                night_outdoor=night_outdoor, kwh_per_deg=self._kwh_per_deg))
             # The evening rescue's single source of truth: it DELIVERS this plan's verdict
             # instead of recomputing its own projection (2026-07-23: the rescue still used
             # the un-grounded kitchen proxy and pushed "deploy the AC" at a 21.6C bedroom
-            # while this very plan said windows -- one brain, two delivery moments).
+            # while this very plan said windows -- one brain, two delivery moments). deficit
+            # is ALSO the anchor _track_session_cost captures at session start for
+            # kwh_per_deg learning (see _finalize_session).
             self._last_plan = {"rec": plan["recommendation"],
                                "equilibrium": plan_equilibrium,
                                "limit": ceiling,
-                               "peak": plan.get("projected_peak")}
+                               "peak": plan.get("projected_peak"),
+                               "deficit": plan.get("deficit")}
             detail = plan["detail"]
             if grounded:
                 detail += (f" (Grounded on reality: the bedroom zone is ~{bedroom_zone_now:.1f}C "
@@ -1516,9 +1698,12 @@ class SmartCooling(hass.Hass):
             engaged = min((now - self._last_eval_at).total_seconds() / 60.0,
                           self.interval_min * 1.5)
         saturated = self._track_progress(floor, engaged)
+        # Learn how fast the floor ACTUALLY drops while engaged (see _track_cool_rate);
+        # everything downstream sizes its minutes off _cool_rate(), not the seed.
+        self._track_cool_rate(floor, engaged, self._last_want)
         reach_target = self._reach_target(now, target, saturated)
         reach_deficit = floor - reach_target
-        minutes_needed = max(0.0, reach_deficit) / self.floor_cool_cph * 60.0
+        minutes_needed = max(0.0, reach_deficit) / self._cool_rate() * 60.0
 
         # user says they're removing the AC now -> this IS lights-out: stash the coast baseline,
         # graceful compressor stop (they unplug right after -- better than yanking power
@@ -1552,7 +1737,8 @@ class SmartCooling(hass.Hass):
                 self.log(f"failed to disarm after AC-removed: {e}", level="WARNING")
             return
 
-        cool_now, next_start, run_min, est_cost = self._schedule(now, deadline, minutes_needed, price_at)
+        cool_now, next_start, run_min, est_cost = self._schedule(
+            now, deadline, minutes_needed, price_at, already_cooling=self._last_want)
         slots_left = int((deadline - now).total_seconds() // 900)
         time_constrained = run_min >= max(1, slots_left) * 15
         # Bathroom heat is the condenser's own dump, not a bedroom threat: the user seals the
@@ -1659,8 +1845,18 @@ class SmartCooling(hass.Hass):
         metered, and session_cost_kr / session_kwh while a session is open or has anything
         to show. Each is included only when meaningful -- AppDaemon 4.5.13 silently drops a
         False/0/None attribute anyway, so publishing a raw 0.0 here would be misleading
-        (looks like "metered, cost 0" rather than "nothing metered yet")."""
-        out = {"rise_frac": round(self._rise_frac, 2), "rise_samples": self._rise_samples}
+        (looks like "metered, cost 0" rather than "nothing metered yet").
+
+        kwh_per_deg rides unconditionally like rise_frac -- it always has a non-zero value
+        (the seeded default or a real EMA, never legitimately 0) so the attribute-drop bug
+        never bites it; kwh_per_deg_samples can be 0 (dropped then -- display only, same as
+        rise_samples)."""
+        out = {"rise_frac": round(self._rise_frac, 2), "rise_samples": self._rise_samples,
+               "kwh_per_deg": round(self._kwh_per_deg, 3),
+               "kwh_per_deg_samples": self._kwh_per_deg_samples,
+               # planning rate: learned C/h once sampled, else the seed (never 0)
+               "cool_cph": round(self._cool_rate(), 2),
+               "cool_cph_samples": self._cool_cph_samples}
         if self._last_session_cost is not None:
             out["last_night_cost_kr"] = self._last_session_cost
         if self._night_cost_ema is not None:

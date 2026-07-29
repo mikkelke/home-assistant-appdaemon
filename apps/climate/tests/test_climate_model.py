@@ -250,10 +250,16 @@ class PlanSleep(unittest.TestCase):
         self.assertEqual(plan["est_cost_kr"], 0.0)
         self.assertEqual(plan["cost_label"], "free")
 
-    def test_large_gap_cool_dry_outside_is_hybrid(self):
+    def test_very_large_gap_cool_dry_outside_is_ac_not_hybrid(self):
+        # THE reported 2026-07-29 bug: this is the exact 3.4C gap (projected peak 25.9C-class
+        # vs a 22.5C-class limit) that used to fall into the unbounded 'hybrid' bucket and
+        # get reported by the morning briefing as "AC not needed" at 05:55, while the plan
+        # itself flipped to 'ac' by 10:00 once the day's real numbers were in. Past
+        # windows_max_gap_c (2.5 default) a heat-soaked mass can't be rescued by venting no
+        # matter how cool the air outside is -- must be 'ac', not 'hybrid'.
         plan = cm.plan_sleep(self._inp(floor=24.0, equilibrium=26.0, comfort_limit=23.0,
                                        outdoor_temp=14.0, outdoor_dew=7.0, cheapest_price=2.0))
-        self.assertEqual(plan["recommendation"], "hybrid")
+        self.assertEqual(plan["recommendation"], "ac")
         self.assertGreater(plan["est_cost_kr"], 0.0)
 
     def test_free_case_has_cost_label_and_open_windows(self):
@@ -323,47 +329,157 @@ class PlanSleep(unittest.TestCase):
         self.assertEqual(plan["windows_summary"], "all closed")
         self.assertEqual(plan["open_windows"], [])
 
-    def test_learned_night_cost_wins_regardless_of_deficit(self):
-        # 2026-07-21 fix: a metered night_cost_ema (learned_night_cost) IS reality -- it
-        # replaces the theoretical estimate outright, independent of how deep the deficit
-        # (and therefore the theoretical kWh) actually is.
-        kwargs = dict(comfort_limit=23.0, outdoor_temp=24.0, outdoor_dew=18.0,
-                     indoor_dew=15.0, cheapest_price=2.0, learned_night_cost=5.2)
-        shallow = cm.plan_sleep(self._inp(floor=24.0, equilibrium=26.0, **kwargs))
-        deep = cm.plan_sleep(self._inp(floor=28.0, equilibrium=30.0, **kwargs))
-        self.assertEqual(shallow["recommendation"], "ac")
-        self.assertEqual(deep["recommendation"], "ac")
-        self.assertEqual(shallow["est_cost_kr"], 5.2)
-        self.assertEqual(deep["est_cost_kr"], 5.2)
-        self.assertEqual(shallow["cost_label"], "~5.2 kr")
-
-    def test_session_factor_scales_the_theoretical_estimate(self):
-        # Until a night's been metered (no learned_night_cost), session_factor corrects the
-        # naive single-run estimate for what a real session actually spends re-cooling all
-        # night (re-warm top-ups, stall-burps, the post-midnight chase) -- validated
-        # 2026-07-21 at ~2.5x the naive kWh alone.
+    def test_deprecated_learned_night_cost_is_ignored(self):
+        # 2026-07-29 rebuild: the flat night_cost_ema EMA that learned_night_cost used to
+        # feed was poisoned by 3 finalized 0.00 kWh sessions (dragged it to 0.36 kr against
+        # a real ~4.50 kr metered average) -- it no longer wins over (or influences at all)
+        # the kwh_per_deg-scaled estimate. The field is kept only so an old caller/test
+        # passing it doesn't break the constructor.
         kwargs = dict(floor=24.0, equilibrium=26.0, comfort_limit=23.0, outdoor_temp=24.0,
                      outdoor_dew=18.0, indoor_dew=15.0, cheapest_price=2.0)
-        naive = cm.plan_sleep(self._inp(session_factor=1.0, **kwargs))
-        corrected = cm.plan_sleep(self._inp(session_factor=2.5, **kwargs))
-        self.assertEqual(naive["recommendation"], "ac")
-        self.assertEqual(corrected["recommendation"], "ac")
-        # deficit 8.0C (target floor-limited to min_temp 16.0) * 0.5 kW / 1.0 cph -> 4.0 kWh
-        # naive @ 2.0 kr/kWh = 8.0 kr; *2.5 session_factor -> 10.0 kWh -> 20.0 kr.
-        self.assertEqual(naive["est_cost_kr"], 8.0)
-        self.assertEqual(corrected["est_cost_kr"], 20.0)
-        self.assertAlmostEqual(corrected["est_cost_kr"], naive["est_cost_kr"] * 2.5, places=6)
+        without = cm.plan_sleep(self._inp(**kwargs))
+        with_learned = cm.plan_sleep(self._inp(learned_night_cost=5.2, **kwargs))
+        self.assertEqual(without["recommendation"], "ac")
+        self.assertEqual(with_learned["recommendation"], "ac")
+        self.assertEqual(without["est_cost_kr"], with_learned["est_cost_kr"])
+        self.assertNotEqual(with_learned["est_cost_kr"], 5.2)
+
+    def test_deprecated_session_factor_is_ignored(self):
+        # session_factor no longer scales (or influences at all) the estimate -- kwh_per_deg
+        # replaces its role (2026-07-29 rebuild). Kept only for constructor back-compat.
+        kwargs = dict(floor=24.0, equilibrium=26.0, comfort_limit=23.0, outdoor_temp=24.0,
+                     outdoor_dew=18.0, indoor_dew=15.0, cheapest_price=2.0)
+        low_factor = cm.plan_sleep(self._inp(session_factor=1.0, **kwargs))
+        high_factor = cm.plan_sleep(self._inp(session_factor=99.0, **kwargs))
+        self.assertEqual(low_factor["est_cost_kr"], high_factor["est_cost_kr"])
+
+    def test_kwh_per_deg_scales_the_cost_estimate(self):
+        # kwh_per_deg (kWh spent per degree C of pre-cool deficit closed) is what scales the
+        # theoretical estimate now, learned from real metered sessions (see
+        # SmartCooling._finalize_session) and seeded at 1.6 -- see plan_sleep's docstring
+        # for the 2026-07-10..29 calibration provenance.
+        kwargs = dict(floor=24.0, equilibrium=26.0, comfort_limit=23.0, outdoor_temp=24.0,
+                     outdoor_dew=18.0, indoor_dew=15.0, cheapest_price=2.0)
+        low = cm.plan_sleep(self._inp(kwh_per_deg=1.0, **kwargs))
+        high = cm.plan_sleep(self._inp(kwh_per_deg=2.0, **kwargs))
+        self.assertEqual(low["recommendation"], "ac")
+        self.assertEqual(high["recommendation"], "ac")
+        # deficit 8.0C (target floor-limited to min_temp 16.0): 8.0*1.0 kWh/C=8.0 kWh @
+        # 2.0 kr/kWh = 16.0 kr; 8.0*2.0 kWh/C=16.0 kWh @ 2.0 kr/kWh = 32.0 kr.
+        self.assertEqual(low["est_cost_kr"], 16.0)
+        self.assertEqual(high["est_cost_kr"], 32.0)
+        self.assertAlmostEqual(high["est_cost_kr"], low["est_cost_kr"] * 2.0, places=6)
 
     def test_noise_penalty_no_longer_added_to_displayed_cost(self):
-        # 2026-07-21 fix: noise_penalty_kr is kept only for backward-compat (default 0.5,
-        # still accepted as a field) but no longer inflates est_cost_kr -- the theoretical
-        # formula is purely kWh * price * session_factor now.
+        # 2026-07-21 fix (still true post-2026-07-29 rebuild): noise_penalty_kr is kept only
+        # for backward-compat (default 0.5, still accepted as a field) but no longer
+        # inflates est_cost_kr -- the formula is purely deficit * kwh_per_deg * price.
         kwargs = dict(floor=24.0, equilibrium=26.0, comfort_limit=23.0, outdoor_temp=24.0,
-                     outdoor_dew=18.0, indoor_dew=15.0, cheapest_price=2.0, session_factor=1.0)
+                     outdoor_dew=18.0, indoor_dew=15.0, cheapest_price=2.0, kwh_per_deg=1.6)
         no_penalty = cm.plan_sleep(self._inp(noise_penalty_kr=0.0, **kwargs))
         with_penalty = cm.plan_sleep(self._inp(noise_penalty_kr=0.5, **kwargs))
         self.assertEqual(no_penalty["est_cost_kr"], with_penalty["est_cost_kr"])
-        self.assertEqual(with_penalty["est_cost_kr"], 8.0)   # 4.0 kWh * 2.0 kr/kWh, no +0.5
+        self.assertEqual(with_penalty["est_cost_kr"], 25.6)  # 8.0C * 1.6 kWh/C * 2.0 kr/kWh
+
+
+class HybridBucketBounded(unittest.TestCase):
+    """2026-07-29 fix: windows_max_gap_c bounds the hybrid bucket so a large gap with
+    cool-enough air can no longer read as 'hybrid' -- the incident this fixes was reported
+    live as "AC not needed" at 05:55 on a 3.4C gap (projected peak ~25.9C vs a ~22.5C
+    limit) that the plan itself flipped to 'ac' by 10:00. All four cases below share the
+    same cool/dry outdoor reading (temp_margin/muggy_slack both pass) so only the gap
+    itself drives the bucket -- equilibrium is the only thing that varies."""
+
+    def _inp(self, **ov):
+        base = dict(
+            floor=20.0, rise_frac=0.5, zone_offset=1.0, comfort_limit=20.5, min_temp=16.0,
+            floor_cool_cph=1.0, cool_power_kw=0.5, cheapest_price=1.5,
+            outdoor_temp=15.0, outdoor_dew=8.0, indoor_dew=11.0, open_windows=["bedroom"],
+        )
+        base.update(ov)
+        return cm.SleepPlanInputs(**base)
+
+    def test_gap_within_peak_margin_is_nothing(self):
+        # peak = 21 + (19.2-20)*0.5 = 20.6; gap = 0.1 <= peak_margin_c (0.2)
+        plan = cm.plan_sleep(self._inp(equilibrium=19.2))
+        self.assertEqual(plan["recommendation"], "nothing")
+
+    def test_moderate_gap_is_windows(self):
+        # peak = 21 + (21.0-20)*0.5 = 21.5; gap = 1.0, within hybrid_gap_c (1.5)
+        plan = cm.plan_sleep(self._inp(equilibrium=21.0))
+        self.assertEqual(plan["recommendation"], "windows")
+        self.assertEqual(plan["est_cost_kr"], 0.0)
+
+    def test_windows_hybrid_boundary_is_still_windows(self):
+        # peak = 21 + (22.0-20)*0.5 = 22.0; gap = 1.5, exactly at hybrid_gap_c (inclusive)
+        plan = cm.plan_sleep(self._inp(equilibrium=22.0))
+        self.assertEqual(plan["recommendation"], "windows")
+
+    def test_large_gap_is_hybrid(self):
+        # peak = 21 + (23.0-20)*0.5 = 22.5; gap = 2.0, between hybrid_gap_c and
+        # windows_max_gap_c (2.5)
+        plan = cm.plan_sleep(self._inp(equilibrium=23.0))
+        self.assertEqual(plan["recommendation"], "hybrid")
+        self.assertGreater(plan["est_cost_kr"], 0.0)
+
+    def test_hybrid_ac_boundary_is_still_hybrid(self):
+        # peak = 21 + (24.0-20)*0.5 = 23.0; gap = 2.5, exactly at windows_max_gap_c (inclusive)
+        plan = cm.plan_sleep(self._inp(equilibrium=24.0))
+        self.assertEqual(plan["recommendation"], "hybrid")
+
+    def test_gap_over_windows_max_is_ac_not_hybrid(self):
+        # peak = 21 + (25.8-20)*0.5 = 23.9; gap = 3.4 (THE reported incident's own number),
+        # over windows_max_gap_c -> 'ac', not 'hybrid': a heat-soaked mass can't be rescued
+        # by venting no matter how cool the air outside is.
+        plan = cm.plan_sleep(self._inp(equilibrium=25.8))
+        self.assertEqual(plan["recommendation"], "ac")
+        self.assertGreater(plan["est_cost_kr"], 0.0)
+
+    def test_custom_windows_max_gap_c_is_respected(self):
+        # a tighter bound (1.5) turns the same 2.0C-gap case that reads 'hybrid' by default
+        # into 'ac'.
+        plan = cm.plan_sleep(self._inp(equilibrium=23.0, windows_max_gap_c=1.5))
+        self.assertEqual(plan["recommendation"], "ac")
+
+
+class NightOutdoorDrivesCoolEnough(unittest.TestCase):
+    """2026-07-29 fix: window feasibility (cool_enough) is judged against night_outdoor (the
+    temperature when the cooling would actually happen) instead of the live outdoor_temp
+    reading, which at 05:30 is the day's daily minimum and made a window look sufficient
+    every single morning regardless of what the day would go on to do."""
+
+    def _inp(self, **ov):
+        base = dict(
+            floor=20.0, rise_frac=0.5, zone_offset=1.0, comfort_limit=20.5, min_temp=16.0,
+            floor_cool_cph=1.0, cool_power_kw=0.5, cheapest_price=1.5,
+            equilibrium=21.0, outdoor_dew=8.0, indoor_dew=11.0, open_windows=["bedroom"],
+        )
+        base.update(ov)
+        return cm.SleepPlanInputs(**base)
+
+    def test_cool_now_but_warm_at_night_is_ac(self):
+        # gap = 1.0 (see HybridBucketBounded.test_moderate_gap_is_windows) -- cool_enough by
+        # the CURRENT reading (15.0C) alone would say 'windows', but the night stays warm
+        # (21.0C, not below limit(20.5) - temp_margin(0.5) = 20.0), so it must be 'ac'.
+        without_night = cm.plan_sleep(self._inp(outdoor_temp=15.0))
+        with_night = cm.plan_sleep(self._inp(outdoor_temp=15.0, night_outdoor=21.0))
+        self.assertEqual(without_night["recommendation"], "windows")
+        self.assertEqual(with_night["recommendation"], "ac")
+
+    def test_missing_night_outdoor_falls_back_to_current_reading(self):
+        # None (not passed / sensor missing) -> same result as the old outdoor_temp-only
+        # behaviour, so a caller upgrading to pass night_outdoor never regresses when it's
+        # unavailable.
+        plan = cm.plan_sleep(self._inp(outdoor_temp=15.0, night_outdoor=None))
+        self.assertEqual(plan["recommendation"], "windows")
+
+    def test_warm_now_but_cool_at_night_is_still_windows(self):
+        # the reverse direction: outdoor_temp(21.0) alone reads "not cool enough" (limit
+        # 20.5 - temp_margin 0.5 = 20.0), but the night genuinely cools to 15.0C -- night_
+        # outdoor is used INSTEAD OF outdoor_temp when known, not merely as an extra veto,
+        # so this must be 'windows', not 'ac'.
+        plan = cm.plan_sleep(self._inp(outdoor_temp=21.0, night_outdoor=15.0))
+        self.assertEqual(plan["recommendation"], "windows")
 
 
 class NightPeakCoastLawEquivalence(unittest.TestCase):
