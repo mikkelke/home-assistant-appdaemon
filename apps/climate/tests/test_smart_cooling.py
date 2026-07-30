@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
 import sys
+import tempfile
 import types
 import unittest
 from datetime import datetime, timedelta
@@ -73,6 +76,7 @@ def make_app(**overrides):
     app.person_offset = overrides.get("person_offset", 0.5)
     app.weather_model_enabled = overrides.get("weather_model_enabled", True)
     app.wm_shadow = overrides.get("wm_shadow", False)
+    app.wm_forecast_reuse_h = overrides.get("wm_forecast_reuse_h", 6.0)
     app.wm_b0 = overrides.get("wm_b0", 15.797)
     app.wm_b_solar = overrides.get("wm_b_solar", 0.0162)
     app.wm_b_vent = overrides.get("wm_b_vent", 0.198)
@@ -89,6 +93,9 @@ def make_app(**overrides):
     app._kitchen_max_date = overrides.get("kitchen_max_date", None)
     app._fc_cache = None
     app._fc_cache_at = None
+    app._fc_fail_at = None
+    app._fc_warned_at = None
+    app._fc_served_age_min = None
     # live session-cost metering (see _track_session_cost / _finalize_session /
     # _status_base) + the sleep-plan estimator's calibration knobs
     app.ac_energy_entity = overrides.get("ac_energy_entity", "sensor.ac_plug_energy")
@@ -110,6 +117,9 @@ def make_app(**overrides):
     app._kwh_per_deg = overrides.get("kwh_per_deg", 1.6)
     app._kwh_per_deg_samples = overrides.get("kwh_per_deg_samples", 0)
     app._last_plan = overrides.get("last_plan", None)
+    # day-history for the dashboard bar (see _track_cool_intervals / _publish)
+    app._cool_intervals = overrides.get("cool_intervals", [])
+    app._last_pub_status = overrides.get("last_pub_status", None)
     app._save_state = lambda: None
     app.log = lambda *a, **k: None
     return app
@@ -2112,6 +2122,319 @@ class CoolRateHeadroomGate(unittest.TestCase):
         app._track_cool_rate(20.8, 0.0, True)
         app._track_cool_rate(20.2, 40.0, True)     # 0.6C in 40 min ~ 0.9 C/h, allowed
         self.assertEqual(app._cool_cph_samples, 2)
+
+
+class GetForecastStaleReuse(unittest.TestCase):
+    """weather.get_forecasts intermittently returns an empty payload with NO error at all
+    (found 2026-07-30: the weather model published no prediction on 7 of 11 mornings).
+    _get_forecast now treats an empty parse exactly like a fetch exception: both mark
+    _fc_fail_at and reuse the last good forecast (while under wm_forecast_reuse_h old)
+    instead of a hard None, backed by a 120s fail-backoff (one broken tick can't fire
+    repeated service calls -- 4+ methods call this every eval tick) and a 30-min rate
+    limit on the empty-payload WARNING (energidataservice's "empty dataset!" log spam is
+    the cautionary tale)."""
+
+    EMPTY_RESP = {"result": {"response": {"weather.forecast_home": {"forecast": []}}}}
+    GOOD_RESP = {"result": {"response": {"weather.forecast_home": {"forecast": [
+        {"datetime": "2026-07-30T08:00:00+00:00", "temperature": 20.0, "cloud_coverage": 10},
+        {"datetime": "2026-07-30T09:00:00+00:00", "temperature": 21.0, "cloud_coverage": 20},
+    ]}}}}
+
+    def _app(self, reuse_h=6.0, responses=()):
+        """responses: successive call_service return values, consumed one per real
+        service call (never re-used, so a test can assert exactly how many were made)."""
+        app = make_app()
+        app.weather_forecast_entity = "weather.forecast_home"
+        app.wm_forecast_reuse_h = reuse_h
+        app._queue = list(responses)
+        app._service_calls = []
+
+        async def call_service(service, **kw):
+            app._service_calls.append((service, kw))
+            return app._queue.pop(0)
+        app.call_service = call_service
+
+        async def get_now():
+            return datetime(2026, 7, 30, 8, 0)
+        app.get_now = get_now
+
+        app._log_calls = []
+
+        def log(msg, level="INFO"):
+            app._log_calls.append((msg, level))
+        app.log = log
+        return app
+
+    @staticmethod
+    def _warnings(app):
+        return [msg for msg, level in app._log_calls if level == "WARNING"]
+
+    @staticmethod
+    def _run(app, now):
+        import asyncio
+        return asyncio.run(app._get_forecast(now))
+
+    def test_empty_payload_reuses_cache_within_reuse_window(self):
+        now = datetime(2026, 7, 30, 8, 0)
+        app = self._app(reuse_h=6.0, responses=[self.EMPTY_RESP])
+        stale = [{"dt": datetime(2026, 7, 30, 6, 0), "temp": 19.0, "cloud": None}]
+        app._fc_cache = stale
+        app._fc_cache_at = now - timedelta(hours=2)   # stale but within the 6h reuse window
+
+        result = self._run(app, now)
+
+        self.assertEqual(result, stale)
+        self.assertEqual(app._fc_served_age_min, 120)
+        self.assertEqual(len(app._service_calls), 1)
+        warnings = self._warnings(app)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("reusing forecast from 120 min ago", warnings[0])
+        self.assertEqual(app._fc_fail_at, now)
+
+    def test_empty_payload_past_reuse_window_returns_none(self):
+        now = datetime(2026, 7, 30, 8, 0)
+        app = self._app(reuse_h=6.0, responses=[self.EMPTY_RESP])
+        app._fc_cache = [{"dt": datetime(2026, 7, 29, 12, 0), "temp": 18.0, "cloud": None}]
+        app._fc_cache_at = now - timedelta(hours=7)   # older than the 6h reuse window
+
+        result = self._run(app, now)
+
+        self.assertIsNone(result)
+        self.assertIsNone(app._fc_served_age_min)
+        warnings = self._warnings(app)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("no cached forecast to reuse", warnings[0])
+
+    def test_backoff_skips_the_service_call_within_120s(self):
+        now0 = datetime(2026, 7, 30, 8, 0)
+        app = self._app(reuse_h=6.0, responses=[self.EMPTY_RESP])
+        self._run(app, now0)   # first (real) failure -- one service call, one warning
+        self.assertEqual(len(app._service_calls), 1)
+        self.assertEqual(len(self._warnings(app)), 1)
+
+        # 30s later -- well within the 120s backoff: must not call the service again.
+        result = self._run(app, now0 + timedelta(seconds=30))
+
+        self.assertEqual(len(app._service_calls), 1)     # unchanged -- no new call at all
+        self.assertIsNone(result)                          # nothing cached to reuse either
+        self.assertEqual(len(self._warnings(app)), 1)      # backoff path stays silent
+
+    def test_warning_rate_limited_across_repeated_empty_fetches(self):
+        now0 = datetime(2026, 7, 30, 8, 0)
+        app = self._app(reuse_h=6.0, responses=[self.EMPTY_RESP, self.EMPTY_RESP])
+        self._run(app, now0)
+        self.assertEqual(len(app._service_calls), 1)
+        self.assertEqual(len(self._warnings(app)), 1)
+
+        # 5 min later: past the 120s backoff, so a real second fetch IS attempted...
+        result = self._run(app, now0 + timedelta(minutes=5))
+
+        self.assertEqual(len(app._service_calls), 2)       # backoff had already expired
+        self.assertIsNone(result)
+        # ...but the 30-min rate limit still suppresses a second WARNING.
+        self.assertEqual(len(self._warnings(app)), 1)
+
+    def test_successful_fetch_resets_failure_state_and_caches(self):
+        now = datetime(2026, 7, 30, 8, 0)
+        app = self._app(responses=[self.GOOD_RESP])
+        # Outside the 120s backoff window -- a real fetch must still be attempted, not
+        # short-circuited by the backoff skip (that's a separate behaviour, covered by
+        # test_backoff_skips_the_service_call_within_120s).
+        app._fc_fail_at = now - timedelta(minutes=10)
+        app._fc_warned_at = now - timedelta(minutes=10)
+
+        result = self._run(app, now)
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(app._fc_served_age_min, 0)
+        self.assertIsNone(app._fc_fail_at)
+        self.assertIsNone(app._fc_warned_at)
+        self.assertEqual(app._fc_cache_at, now)
+
+
+class CoolIntervalsToday(unittest.TestCase):
+    """Day-history for the dashboard bar (2026-07-30): which stretches the AC actually
+    spent ENGAGED today (cooling or stall-burping), tracked from a status TRANSITION at
+    the single publish site (_publish) against the previously PUBLISHED status
+    (_last_pub_status), not the internal want/decision."""
+
+    def test_engaged_statuses_are_exactly_cooling_and_burping(self):
+        # Locks the dashboard's running definition -- dry_run's "cooling_dryrun" is
+        # deliberately excluded (a rehearsal run is not a real-run history entry).
+        self.assertEqual(sc.SmartCooling.ENGAGED_STATUSES, {"cooling", "burping"})
+
+    def _app(self, now):
+        app = make_app()
+        app.status_entity = "sensor.smart_cooling_status"
+        app._set_state_calls = []
+
+        async def set_state(entity, **kw):
+            app._set_state_calls.append((entity, kw))
+        app.set_state = set_state
+
+        async def get_now():
+            return now
+        app.get_now = get_now
+        return app
+
+    @staticmethod
+    def _publish(app, status, now):
+        import asyncio
+
+        async def get_now():
+            return now
+        app.get_now = get_now
+        asyncio.run(app._publish(status, "reason", {}))
+        return app._set_state_calls[-1][1]["attributes"]["cool_intervals_today"]
+
+    def test_transition_into_engaged_opens_an_interval(self):
+        app = self._app(datetime(2026, 7, 30, 10, 0))
+        self._publish(app, "idle", datetime(2026, 7, 30, 10, 0))
+        self.assertEqual(app._cool_intervals, [])
+
+        now2 = datetime(2026, 7, 30, 10, 15)
+        self._publish(app, "cooling", now2)
+        self.assertEqual(app._cool_intervals, [[now2.isoformat(), None]])
+
+    def test_transition_out_of_engaged_closes_the_interval(self):
+        app = self._app(datetime(2026, 7, 30, 10, 0))
+        now = datetime(2026, 7, 30, 10, 0)
+        self._publish(app, "cooling", now)
+        now2 = datetime(2026, 7, 30, 10, 30)
+        self._publish(app, "idle", now2)
+        self.assertEqual(app._cool_intervals, [[now.isoformat(), now2.isoformat()]])
+
+    def test_repeated_engaged_status_does_not_fragment_the_interval(self):
+        app = self._app(datetime(2026, 7, 30, 10, 0))
+        now = datetime(2026, 7, 30, 10, 0)
+        self._publish(app, "cooling", now)
+        self._publish(app, "burping", now + timedelta(minutes=5))
+        self._publish(app, "cooling", now + timedelta(minutes=8))
+        self.assertEqual(len(app._cool_intervals), 1)
+        self.assertEqual(app._cool_intervals[0][0], now.isoformat())
+        self.assertIsNone(app._cool_intervals[0][1])
+
+    def test_self_heals_a_dangling_open_interval(self):
+        # An app/AppDaemon restart mid-run: _last_pub_status resets to None on startup,
+        # but a reloaded _cool_intervals can still have last night's run left open.
+        now = datetime(2026, 7, 30, 10, 0)
+        app = self._app(now)
+        app._cool_intervals = [["2026-07-29T23:00:00", None]]
+        app._last_pub_status = None
+        self._publish(app, "idle", now)
+        self.assertEqual(app._cool_intervals, [["2026-07-29T23:00:00", now.isoformat()]])
+
+    def test_restart_while_still_engaged_does_not_stack_a_second_open_interval(self):
+        # Same restart, but the very next tick is STILL "cooling" -- must not fragment the
+        # already-open interval into two simultaneously-open entries.
+        now = datetime(2026, 7, 30, 10, 0)
+        app = self._app(now)
+        app._cool_intervals = [["2026-07-29T23:00:00", None]]
+        app._last_pub_status = None
+        self._publish(app, "cooling", now)
+        self.assertEqual(app._cool_intervals, [["2026-07-29T23:00:00", None]])
+
+    def test_open_interval_survives_the_24h_prune(self):
+        now = datetime(2026, 7, 30, 10, 0)
+        app = self._app(now)
+        old_open = ["2026-07-27T10:00:00", None]
+        app._cool_intervals = [old_open]
+        app._last_pub_status = "cooling"
+        self._publish(app, "cooling", now)   # still engaged -- no transition either way
+        self.assertEqual(app._cool_intervals, [old_open])
+
+    def test_closed_intervals_older_than_24h_are_pruned(self):
+        now = datetime(2026, 7, 30, 10, 0)
+        app = self._app(now)
+        stale_closed = ["2026-07-28T10:00:00", "2026-07-28T10:30:00"]    # end >24h old
+        recent_closed = ["2026-07-29T20:00:00", "2026-07-29T20:30:00"]   # end <24h old
+        app._cool_intervals = [stale_closed, recent_closed]
+        app._last_pub_status = "idle"
+        self._publish(app, "idle", now)
+        self.assertEqual(app._cool_intervals, [recent_closed])
+
+    def test_published_attribute_matches_internal_state(self):
+        now = datetime(2026, 7, 30, 10, 0)
+        app = self._app(now)
+        published = self._publish(app, "cooling", now)
+        self.assertEqual(published, app._cool_intervals)
+
+
+class CoolIntervalsPersistence(unittest.TestCase):
+    """cool_intervals round-trips through the real _save_state/_load_state; the loader
+    validates the shape (2-item [start, end_or_None] lists, ISO-parseable) and drops
+    anything malformed rather than crash, mirroring the defensive style _load_state
+    already uses for its other fields."""
+
+    def _real_state_app(self, state_file):
+        app = make_app()
+        app.state_file = state_file
+        # _save_state/_load_state also touch these two; make_app doesn't set them (only
+        # tests that exercise lightout/rescue directly do), so supply them here.
+        app._lightout = None
+        app._rescue_notified_date = None
+        del app._save_state   # make_app stubs this to a no-op -- restore the real method
+        return app
+
+    def _write(self, path, data):
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    def _tmp_path(self):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        return path
+
+    def test_round_trips_through_save_and_load(self):
+        path = self._tmp_path()
+        app = self._real_state_app(path)
+        app._cool_intervals = [["2026-07-29T22:00:00+02:00", "2026-07-30T00:15:00+02:00"],
+                               ["2026-07-30T09:00:00+02:00", None]]
+        app._save_state()
+
+        app2 = self._real_state_app(path)
+        app2._cool_intervals = []
+        app2._load_state()
+
+        self.assertEqual(app2._cool_intervals, app._cool_intervals)
+
+    def test_missing_key_keeps_the_pre_load_default(self):
+        path = self._tmp_path()
+        self._write(path, {})
+        app = self._real_state_app(path)
+        app._cool_intervals = []
+        app._load_state()
+        self.assertEqual(app._cool_intervals, [])
+
+    def test_malformed_entries_are_dropped_not_crashed(self):
+        path = self._tmp_path()
+        self._write(path, {"cool_intervals": [
+            ["2026-07-29T22:00:00+02:00", "2026-07-30T00:15:00+02:00"],   # valid, closed
+            ["2026-07-30T09:00:00+02:00", None],                          # valid, open
+            ["not-a-date", None],                                         # bad start
+            ["2026-07-30T09:00:00+02:00", "not-a-date"],                  # bad end
+            ["2026-07-30T09:00:00+02:00"],                                # wrong length
+            "not-a-list",                                                 # wrong type
+            {"start": "x"},                                               # wrong type
+        ]})
+        app = self._real_state_app(path)
+        app._cool_intervals = []
+
+        app._load_state()
+
+        self.assertEqual(app._cool_intervals, [
+            ["2026-07-29T22:00:00+02:00", "2026-07-30T00:15:00+02:00"],
+            ["2026-07-30T09:00:00+02:00", None],
+        ])
+
+    def test_non_list_value_drops_to_empty(self):
+        path = self._tmp_path()
+        self._write(path, {"cool_intervals": "not-a-list-at-all"})
+        app = self._real_state_app(path)
+        app._cool_intervals = ["should be replaced"]
+        app._load_state()
+        self.assertEqual(app._cool_intervals, [])
 
 
 if __name__ == "__main__":

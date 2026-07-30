@@ -262,6 +262,11 @@ class SmartCooling(hass.Hass):
         # parameter -- revisit with more hot-day data. See _weather_equilibrium.
         self.weather_model_enabled = bool(a("weather_model_enabled", False))
         self.wm_shadow = bool(a("wm_shadow", True))
+        # get_forecasts flaps empty around HA restarts with no error (found 2026-07-30:
+        # the model published no prediction on 7 of 11 mornings) -- reuse a stale forecast
+        # for up to this many hours rather than fall back to the legacy kitchen proxy;
+        # yesterday-evening physics beats that proxy for ~6h (see _get_forecast).
+        self.wm_forecast_reuse_h = float(a("wm_forecast_reuse_h", 6.0))
         self.wm_b0 = float(a("wm_b0", 15.797))
         self.wm_b_solar = float(a("wm_b_solar", 0.0162))
         self.wm_b_vent = float(a("wm_b_vent", 0.198))
@@ -453,6 +458,17 @@ class SmartCooling(hass.Hass):
         self._kitchen_max_date: Optional[str] = None   # ISO date the running max belongs to
         self._fc_cache = None
         self._fc_cache_at: Optional[datetime] = None
+        # Fail handling (found 2026-07-30: weather.get_forecasts intermittently returns an
+        # empty payload with NO error, blind on 7 of 11 mornings -- see _get_forecast).
+        # _fc_fail_at backs off repeat service calls for 120s after ANY failure (fetch
+        # exception or empty parse); _fc_warned_at rate-limits the empty-payload WARNING to
+        # once per 30 min so a ticking eval loop can't spam the log; _fc_served_age_min is
+        # the whole-minute age of whatever _get_forecast last actually served (0-ish when
+        # fresh, up to wm_forecast_reuse_h*60 when stale, None when nothing was served) --
+        # published on the status entity for visibility (see _attrs).
+        self._fc_fail_at: Optional[datetime] = None
+        self._fc_warned_at: Optional[datetime] = None
+        self._fc_served_age_min: Optional[int] = None
         # Live session-cost metering (see the ac_energy_entity/session_min_kwh/
         # kwh_per_deg_default config block above): _session_kwh0/_session_last_counter track
         # the Shelly counter baseline while a session is open (both None = no active
@@ -477,6 +493,15 @@ class SmartCooling(hass.Hass):
         self._session_deficit0: Optional[float] = None
         self._kwh_per_deg: float = self.kwh_per_deg_default
         self._kwh_per_deg_samples: int = 0
+        # Day-history for the dashboard bar (2026-07-30): which stretches the AC actually
+        # spent ENGAGED today (cooling or stall-burping), so the Tonight card can draw what
+        # actually happened, not just the current status. Tracked from a status TRANSITION
+        # at the one publish site (_publish), compared against the previously PUBLISHED
+        # status (_last_pub_status) rather than the internal want/decision -- see
+        # _track_cool_intervals. Persisted (see _load_state/_save_state) so a reload mid-run
+        # doesn't lose the open interval's start.
+        self._cool_intervals: list = []
+        self._last_pub_status: Optional[str] = None
         self._load_state()
 
         self.mobile_notifier = None
@@ -661,8 +686,39 @@ class SmartCooling(hass.Hass):
             kpd = d.get("kwh_per_deg")
             self._kwh_per_deg = float(kpd) if kpd is not None else self._kwh_per_deg
             self._kwh_per_deg_samples = int(d.get("kwh_per_deg_samples", self._kwh_per_deg_samples))
+            raw_intervals = d.get("cool_intervals", self._cool_intervals)
+            if isinstance(raw_intervals, list):
+                self._cool_intervals = [v for v in
+                                        (self._valid_cool_interval(x) for x in raw_intervals)
+                                        if v is not None]
+            else:
+                self._cool_intervals = []
         except Exception:
             pass
+
+    @staticmethod
+    def _valid_cool_interval(item):
+        """One cool_intervals_today entry, defensively validated on load: a 2-item
+        list/tuple whose start parses as ISO and whose end is None or itself
+        ISO-parseable. Returns the normalized [start, end] list, or None to drop a
+        malformed entry rather than let one bad line crash the whole state load."""
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            return None
+        start, end = item
+        if not isinstance(start, str):
+            return None
+        try:
+            datetime.fromisoformat(start)
+        except (TypeError, ValueError):
+            return None
+        if end is not None:
+            if not isinstance(end, str):
+                return None
+            try:
+                datetime.fromisoformat(end)
+            except (TypeError, ValueError):
+                return None
+        return [start, end]
 
     def _save_state(self):
         try:
@@ -690,7 +746,8 @@ class SmartCooling(hass.Hass):
                            "night_cost_ema": self._night_cost_ema,
                            "night_cost_samples": self._night_cost_samples,
                            "kwh_per_deg": self._kwh_per_deg,
-                           "kwh_per_deg_samples": self._kwh_per_deg_samples}, f)
+                           "kwh_per_deg_samples": self._kwh_per_deg_samples,
+                           "cool_intervals": self._cool_intervals}, f)
         except Exception as e:
             self.log(f"state save failed ({e}) -- continuing in-memory", level="WARNING")
 
@@ -863,11 +920,25 @@ class SmartCooling(hass.Hass):
     async def _get_forecast(self, now):
         """Hourly forecast as a list of {'dt': local-naive datetime, 'temp': float,
         'cloud': fraction|None}, cached ~30 min. Returns None if the service call fails or
-        yields nothing (caller degrades to legacy / full clear-sky). Never raises, never
-        stalls the eval loop (bounded wait_for)."""
+        yields nothing and there's no stale forecast left to reuse (caller degrades to
+        legacy / full clear-sky). Never raises, never stalls the eval loop (bounded
+        wait_for).
+
+        weather.get_forecasts intermittently returns an empty payload with NO error at all
+        (found 2026-07-30: the weather model published no prediction on 7 of 11 mornings) --
+        an empty parse is now treated exactly like a fetch exception: both mark
+        _fc_fail_at and fall through to STALE reuse (the last good forecast, while under
+        wm_forecast_reuse_h old) instead of the caller's hard None degradation --
+        yesterday-evening physics beats the legacy kitchen proxy for a few hours. A short
+        fail-backoff (120s) then keeps one broken tick from firing repeated service calls:
+        4+ methods (_solar_mean_today, _outdoor_max_today, _night_outdoor_min,
+        _weather_equilibrium) call this every eval tick."""
         if (self._fc_cache is not None and self._fc_cache_at is not None
                 and (now - self._fc_cache_at).total_seconds() < 1800):
+            self._fc_served_age_min = int((now - self._fc_cache_at).total_seconds() // 60)
             return self._fc_cache
+        if self._fc_fail_at is not None and (now - self._fc_fail_at).total_seconds() < 120:
+            return self._serve_stale_forecast(now, warn=False)
         try:
             resp = await asyncio.wait_for(
                 self.call_service("weather/get_forecasts",
@@ -876,7 +947,8 @@ class SmartCooling(hass.Hass):
                 timeout=12)
         except Exception as e:
             self.log(f"weather-model forecast fetch failed ({e})", level="WARNING")
-            return None
+            self._fc_fail_at = now
+            return self._serve_stale_forecast(now, warn=False)
         node = cm.parse_forecast_envelope(resp, self.weather_forecast_entity)
         tz = (await self.get_now()).tzinfo
         out = []
@@ -894,9 +966,43 @@ class SmartCooling(hass.Hass):
                 cloud = None
             out.append({"dt": ldt, "temp": temp, "cloud": cloud})
         if not out:
-            return None
+            self._fc_fail_at = now
+            return self._serve_stale_forecast(now, warn=True)
         self._fc_cache, self._fc_cache_at = out, now
+        self._fc_fail_at = None
+        self._fc_warned_at = None
+        self._fc_served_age_min = 0
         return out
+
+    def _serve_stale_forecast(self, now, warn):
+        """Common tail for _get_forecast's failure paths (fetch exception, empty parse, or
+        a fail-backoff skip): reuse the last good forecast while it's under
+        wm_forecast_reuse_h old, else degrade to None -- the legacy (pre-2026-07-30)
+        behaviour. Always sets _fc_served_age_min (see its init comment for the
+        0-ish/up-to-360/None ranges). `warn` is only set by the empty-parse path -- a fetch
+        exception already logs its own message, and a backoff skip deliberately stays
+        silent, since it didn't even attempt a fetch -- and is itself rate-limited to one
+        WARNING per 30 min (_fc_warned_at) so a ticking eval loop can't spam the log the
+        way energidataservice's "empty dataset!" once did."""
+        age_min = ((now - self._fc_cache_at).total_seconds() / 60.0
+                   if self._fc_cache_at is not None else None)
+        stale_ok = age_min is not None and age_min <= self.wm_forecast_reuse_h * 60.0
+        if warn and (self._fc_warned_at is None
+                     or (now - self._fc_warned_at).total_seconds() >= 1800):
+            self._fc_warned_at = now
+            if stale_ok:
+                self.log(f"weather-model forecast returned an empty payload "
+                         f"({self.weather_forecast_entity}); reusing forecast from "
+                         f"{age_min:.0f} min ago", level="WARNING")
+            else:
+                self.log(f"weather-model forecast returned an empty payload "
+                         f"({self.weather_forecast_entity}); no cached forecast to reuse",
+                         level="WARNING")
+        if stale_ok:
+            self._fc_served_age_min = int(age_min)
+            return self._fc_cache
+        self._fc_served_age_min = None
+        return None
 
     async def _solar_mean_today(self, now):
         """24h daily-mean solar irradiance (W/m2), assembled measured-so-far + forecast
@@ -2064,6 +2170,12 @@ class SmartCooling(hass.Hass):
         if wm_dbg:
             out.update(wm_dbg)
         out["wm_shadow"] = "true" if self.wm_shadow else "false"
+        # Forecast staleness (see _get_forecast/_fc_served_age_min): omitted when nothing
+        # has been served yet (mirrors the equilibrium_weather/bedroom_zone_now "only when
+        # meaningful" pattern above). Published as a float so a genuinely-fresh 0 survives
+        # AppDaemon 4.5.13's False/0/None attribute-drop (the bug hits int 0/False).
+        if self._fc_served_age_min is not None:
+            out["wm_forecast_age_min"] = float(self._fc_served_age_min)
         return out
 
     # ---------- stall-breaker ----------
@@ -2322,11 +2434,71 @@ class SmartCooling(hass.Hass):
             self.log(f"notify failed: {e}", level="WARNING")
 
     # ---------- publish ----------
+    # Day-history for the dashboard bar (2026-07-30): the dashboard's own definition of
+    # "actively cooling" -- must match this exact pair (dry_run's "cooling_dryrun" is
+    # deliberately NOT included; the day bar is a real-run history, not a rehearsal one).
+    ENGAGED_STATUSES = {"cooling", "burping"}
+
+    def _track_cool_intervals(self, status, now):
+        """Update self._cool_intervals from a status TRANSITION, compared against the
+        previously PUBLISHED status (_last_pub_status -- what the entity actually said,
+        not the internal want/decision), so a re-publish of the same status is a no-op.
+        On entering ENGAGED_STATUSES with nothing already open, append [now_iso, None];
+        whenever the current status ISN'T engaged and an interval is left open, close it
+        with now_iso -- this single check covers both the ordinary transition-out AND the
+        self-heal case (an app/AppDaemon restart mid-run: _last_pub_status resets to None,
+        so the next non-engaged tick wouldn't otherwise read as a was-engaged->false
+        transition, but a reloaded _cool_intervals can still have that run left open, and
+        an OPEN interval is exempt from the 24h prune below so left alone it would linger
+        on the dashboard bar forever). Symmetrically, never stack a second open interval on
+        top of one already open (e.g. that same restart, landing on a still-engaged tick).
+        now must be tz-aware (see _publish) -- published intervals carry a UTC offset."""
+        now_iso = now.isoformat()
+        is_engaged = status in self.ENGAGED_STATUSES
+        was_engaged = self._last_pub_status in self.ENGAGED_STATUSES
+        has_open = bool(self._cool_intervals) and self._cool_intervals[-1][1] is None
+        changed = False
+        if is_engaged and not was_engaged and not has_open:
+            self._cool_intervals.append([now_iso, None])
+            changed = True
+        elif not is_engaged and has_open:
+            self._cool_intervals[-1][1] = now_iso
+            changed = True
+        before = len(self._cool_intervals)
+        self._prune_cool_intervals(now)
+        changed = changed or len(self._cool_intervals) != before
+        self._last_pub_status = status
+        if changed:
+            self._save_state()
+
+    def _prune_cool_intervals(self, now):
+        """Drop CLOSED intervals whose end is >24h old -- the dashboard bar only spans
+        ~10:00 today through wake+1h tomorrow, so nothing older is ever drawn. An open
+        interval (end None) is always kept regardless of how old its start is. Defensive
+        against an unparseable end (shouldn't happen post-_valid_cool_interval, but
+        pruning must never be what crashes the eval loop): dropped rather than kept."""
+        cutoff = now - timedelta(hours=24)
+        kept = []
+        for iv in self._cool_intervals:
+            end = iv[1]
+            if end is None:
+                kept.append(iv)
+                continue
+            try:
+                if datetime.fromisoformat(end) >= cutoff:
+                    kept.append(iv)
+            except (TypeError, ValueError):
+                continue
+        self._cool_intervals = kept
+
     async def _publish(self, status, reason, attrs):
         a = dict(attrs or {})
         a["reason"] = reason
         a["friendly_name"] = "Smart cooling status"
         a["icon"] = "mdi:snowflake-thermometer"
+        now = await self.get_now()
+        self._track_cool_intervals(status, now)
+        a["cool_intervals_today"] = list(self._cool_intervals)
         try:
             # AppDaemon 4.5.13 bug, not ours: every set_state() HTTP publish runs through
             # appdaemon.utils.clean_http_kwargs -> remove_literals(val, (None, False)), which
