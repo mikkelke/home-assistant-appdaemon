@@ -34,7 +34,7 @@ programmes:
   uld:
     label: "Uld"
     allowed_temperatures: ["Cold", "20°C", "30°C", "40°C"]
-    allowed_spin_speeds: ["1200 rpm", "900 rpm", "700 rpm", "No spin"]   # Manual: max 1200
+    allowed_spin_speeds: ["1200 rpm", "900 rpm", "600 rpm", "No spin"]   # Manual: max 1200
     default_temperature: "30°C"
     default_spin: "1200 rpm"
     available_options: []
@@ -57,7 +57,7 @@ programmes:
     label: "ECO"
     allowed_temperatures: ["40-60°C", "40°C", "60°C"]
     default_temperature: "40-60°C"
-    allowed_spin_speeds: ["1400 rpm", "1200 rpm", "900 rpm", "700 rpm", "No spin"]
+    allowed_spin_speeds: ["1400 rpm", "1200 rpm", "900 rpm", "600 rpm", "No spin"]
     default_spin: "1400 rpm"
     available_options: ["water_plus", "soak"]
     # Per-temp duration/energy from Python defaults (all 3 variants - 40-60°C/40°C/60°C - seeded
@@ -77,7 +77,7 @@ programmes:
   strygelet:
     label: "Strygelet"
     allowed_temperatures: ["Cold", "20°C", "30°C", "40°C", "60°C"]   # Manual: 60°C → cold
-    allowed_spin_speeds: ["1200 rpm", "900 rpm", "700 rpm", "No spin"]   # Manual: max 1200
+    allowed_spin_speeds: ["1200 rpm", "900 rpm", "600 rpm", "No spin"]   # Manual: max 1200
     default_temperature: "30°C"
     default_spin: "1200 rpm"
     available_options: ["water_plus", "soak"]
@@ -99,7 +99,7 @@ programmes:
   finvask:
     label: "Finvask"
     allowed_temperatures: ["Cold", "20°C", "30°C", "40°C"]
-    allowed_spin_speeds: ["900 rpm", "700 rpm", "No spin"]   # Manual: max 900
+    allowed_spin_speeds: ["900 rpm", "600 rpm", "No spin"]   # Manual: max 900
     default_temperature: "40°C"
     default_spin: "900 rpm"
     available_options: ["water_plus", "soak"]
@@ -121,7 +121,7 @@ programmes:
   ekspres:
     label: "Ekspres"
     allowed_temperatures: ["Cold", "20°C", "30°C", "40°C"]
-    allowed_spin_speeds: ["1200 rpm", "900 rpm", "700 rpm", "No spin"]   # Manual: max 1200
+    allowed_spin_speeds: ["1200 rpm", "900 rpm", "600 rpm", "No spin"]   # Manual: max 1200
     default_temperature: "40°C"
     default_spin: "1200 rpm"
     available_options: ["short"]
@@ -143,7 +143,7 @@ programmes:
   bomuld:
     label: "Bomuld"
     allowed_temperatures: ["Cold", "20°C", "30°C", "40°C", "60°C", "90°C"]
-    allowed_spin_speeds: ["1400 rpm", "1200 rpm", "900 rpm", "700 rpm", "No spin"]
+    allowed_spin_speeds: ["1400 rpm", "1200 rpm", "900 rpm", "600 rpm", "No spin"]
     default_temperature: "40°C"
     default_spin: "1400 rpm"
     available_options: ["water_plus", "soak", "prewash"]
@@ -176,7 +176,7 @@ programmes:
   morkt_denim:
     label: "Mørkt/Denim"
     allowed_temperatures: ["Cold", "20°C", "30°C", "40°C", "60°C"]   # Manual: 60°C → cold
-    allowed_spin_speeds: ["1200 rpm", "900 rpm", "700 rpm", "No spin"]   # Manual: max 1200
+    allowed_spin_speeds: ["1200 rpm", "900 rpm", "600 rpm", "No spin"]   # Manual: max 1200
     default_temperature: "60°C"
     default_spin: "1200 rpm"
     available_options: ["water_plus"]
@@ -198,7 +198,7 @@ programmes:
   outdoor:
     label: "Outdoor"
     allowed_temperatures: ["Cold", "20°C", "30°C", "40°C"]   # Manual: 40°C → cold
-    allowed_spin_speeds: ["900 rpm", "700 rpm", "No spin"]   # Manual: max 900
+    allowed_spin_speeds: ["900 rpm", "600 rpm", "No spin"]   # Manual: max 900
     default_temperature: "40°C"
     default_spin: "900 rpm"
     available_options: ["water_plus"]
@@ -221,7 +221,7 @@ programmes:
     label: "Imprægnering"
     allowed_temperatures: []
     default_temperature: null
-    allowed_spin_speeds: ["1200 rpm", "900 rpm", "700 rpm", "No spin"]   # Manual: max 1200
+    allowed_spin_speeds: ["1200 rpm", "900 rpm", "600 rpm", "No spin"]   # Manual: max 1200
     default_spin: "1200 rpm"
     available_options: []
     duration_min: 25
@@ -243,7 +243,7 @@ programmes:
     label: "Pumpe/Centrifugering"
     allowed_temperatures: []
     default_temperature: null
-    allowed_spin_speeds: ["1400 rpm", "1200 rpm", "900 rpm", "700 rpm", "No spin"]   # Manual: max 1400
+    allowed_spin_speeds: ["1400 rpm", "1200 rpm", "900 rpm", "600 rpm", "No spin"]   # Manual: max 1400
     default_spin: "1400 rpm"
     available_options: []
     duration_min: 10
@@ -265,7 +265,7 @@ programmes:
     label: "Kun skyl/stivelse"
     allowed_temperatures: []
     default_temperature: null
-    allowed_spin_speeds: ["1400 rpm", "1200 rpm", "900 rpm", "700 rpm", "No spin"]   # Manual: max 1400
+    allowed_spin_speeds: ["1400 rpm", "1200 rpm", "900 rpm", "600 rpm", "No spin"]   # Manual: max 1400
     default_spin: "1400 rpm"
     available_options: []
     duration_min: 30
