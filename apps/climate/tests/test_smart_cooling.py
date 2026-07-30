@@ -2072,5 +2072,45 @@ class FeasibleProbe(unittest.TestCase):
         self.assertAlmostEqual(app._plan_floor_limit(), 19.3, places=6)
 
 
+class CoolRateHeadroomGate(unittest.TestCase):
+    """Crawl segments near the feasible limit measure the WALL, not the machine
+    (2026-07-29: they dragged the learned rate 1.68 -> 0.44 C/h and the next morning a
+    4.4C job priced as ~600 min, forcing a run through morning prices)."""
+
+    def _app(self):
+        app = make_app(feasible_floor=20.3, feasible_samples=6)
+        app.rate_learn_min_headroom = 0.7
+        app._cool_cph = 1.68
+        app._cool_cph_samples = 1
+        app._rate_ref_floor = None
+        app._rate_engaged_min = 0.0
+        app._save_state = lambda: None
+        app.log = lambda *a, **k: None
+        return app
+
+    def test_crawl_near_the_limit_teaches_nothing(self):
+        app = self._app()
+        # floor 20.8 is only 0.5 above the 20.3 limit -> every sample skipped
+        app._track_cool_rate(20.8, 0.0, True)     # anchor attempt
+        for _ in range(4):
+            app._track_cool_rate(20.7, 60.0, True)
+        self.assertEqual(app._cool_cph, 1.68)      # unchanged
+        self.assertEqual(app._cool_cph_samples, 1)
+
+    def test_far_from_the_limit_still_learns(self):
+        app = self._app()
+        app._track_cool_rate(23.5, 0.0, True)      # anchor (3.2 above limit)
+        app._track_cool_rate(22.6, 32.0, True)     # 0.9C in 32 min ~ 1.69 C/h
+        self.assertEqual(app._cool_cph_samples, 2)
+        self.assertGreater(app._cool_cph, 1.5)
+
+    def test_no_learned_floor_keeps_old_behavior(self):
+        app = self._app()
+        app._feasible_floor = None
+        app._track_cool_rate(20.8, 0.0, True)
+        app._track_cool_rate(20.2, 40.0, True)     # 0.6C in 40 min ~ 0.9 C/h, allowed
+        self.assertEqual(app._cool_cph_samples, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

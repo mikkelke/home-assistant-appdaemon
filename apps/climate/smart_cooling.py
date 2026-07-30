@@ -227,6 +227,13 @@ class SmartCooling(hass.Hass):
         self.cool_cph_min = float(a("cool_cph_min", 0.3))         # sanity band for a learned rate
         self.cool_cph_max = float(a("cool_cph_max", 4.0))
         self.cool_rate_min_engaged = float(a("cool_rate_min_engaged_min", 20.0))
+        # Only learn the rate while the floor still has real headroom above the learned
+        # feasible limit. Near the limit the floor crawls (0.2-0.3C/h) because of the WALL,
+        # not the machine -- 2026-07-29 those crawl segments dragged the learned rate
+        # 1.68 -> 0.44 C/h overnight, so the next morning a 4.4C job priced as ~600 min
+        # and the planner (correctly, given the false belief) ran from 08:38 through
+        # morning prices instead of waiting for the cheap afternoon.
+        self.rate_learn_min_headroom = float(a("rate_learn_min_headroom", 0.7))
         # Commitment hysteresis: while ALREADY cooling, keep going if the current slot costs
         # no more than the priciest slot we DID choose, plus this margin (kr/kWh). Rank slack
         # is useless here -- with a flat cheap evening the current slot ranks behind dozens of
@@ -1102,6 +1109,13 @@ class SmartCooling(hass.Hass):
             self._rate_engaged_min = 0.0
             return
         if self._rate_ref_floor is None:
+            self._rate_ref_floor = floor
+            self._rate_engaged_min = 0.0
+            return
+        # Near the feasible limit the drop measures the wall, not the machine: skip the
+        # sample entirely (and re-anchor) so crawl segments can't teach a false slow rate.
+        if (self._feasible_floor is not None
+                and floor - self._feasible_floor < self.rate_learn_min_headroom):
             self._rate_ref_floor = floor
             self._rate_engaged_min = 0.0
             return
