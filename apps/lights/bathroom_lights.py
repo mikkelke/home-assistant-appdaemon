@@ -286,18 +286,6 @@ class BathroomLights(hass.Hass):
                     if not bath_spot_on:
                         self.log("Bathroom: Bath spot ON (bright room, dark corner)", level="INFO")
                         self.turn_on(self.bath_spot_light)
-                        # audience=admin (user 2026-07-16): this is Mikkel's own bathroom - the
-                        # housemates use the guest bathroom, so its hidden-logic moments are his.
-                        try:
-                            self.fire_event(
-                                "house_events_report",
-                                cause="Bright room, darker shower corner",
-                                effect="Bath spot turned on",
-                                icon="mdi:shower-head",
-                                audience="admin",
-                            )
-                        except Exception:
-                            pass
                 else:
                     # No one in shower corner -> turn off bath spot
                     if bath_spot_on:
