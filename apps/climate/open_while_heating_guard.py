@@ -96,7 +96,9 @@ class OpenWhileHeatingGuard(hass.Hass):
             self.fire_event(
                 "house_events_report",
                 cause=f"{label} {opening} open {self.grace_min:.0f}+ min with heating on",
-                effect=f"Radiator is heating past an open {opening} - close it when you can",
+                # Reader-neutral wording (user 2026-07-30): the log is read by anybody, so no
+                # "you" - the phone push keeps its personal phrasing, this entry does not.
+                effect=f"Radiator is heating past an open {opening} - worth closing it soon",
                 icon="mdi:window-open-variant",
             )
             self._push(room, cfg, label, opening)
