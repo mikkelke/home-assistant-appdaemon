@@ -139,6 +139,15 @@ class DishwasherMonitor(hass.Hass):
         self.fill_window_minutes = int(self.args.get("fill_window_minutes", 74))
         self.pause_timeout_minutes = int(self.args.get("pause_timeout_minutes", 5))
 
+        # Finish guard: fraction of the guard duration that must elapse before accepting 0W as
+        # done (see _get_guard_duration / _confirm_finished). Once a programme has enough
+        # confirmed cycles, anchor the guard duration to what the machine actually does instead
+        # of always trusting the profile's nominal figure (e.g. ECO nominal 234 vs learned
+        # avg ~218-224 meant genuinely-finished cycles sat blocked for minutes).
+        self.finish_guard_fraction = float(self.args.get("finish_guard_fraction", 0.95))
+        self.finish_guard_use_learned = bool(self.args.get("finish_guard_use_learned", True))
+        self.finish_guard_min_learned_n = int(self.args.get("finish_guard_min_learned_n", 5))
+
         # History correction: threshold for "high power" in energy series (W)
         self.energy_active_watts = float(self.args.get("energy_active_watts", 100.0))
 
@@ -361,7 +370,7 @@ class DishwasherMonitor(hass.Hass):
                             classified = self._classify_programme()
                             display_prog = self._get_programme_for_display()
                             guard_dur = self._get_guard_duration(tick_prog=display_prog)
-                            if run_min >= guard_dur * 0.95:
+                            if run_min >= guard_dur * self.finish_guard_fraction:
                                 self.log(f"Self-heal: Running with 0W for {run_min:.0f}min - forcing Unemptied", level="INFO")
                                 run_minutes, duration_source = self._correct_duration(run_min)
                                 self._transition_to_unemptied(skip_announce=False, run_minutes=run_minutes, energy_used=energy_used)
@@ -622,24 +631,44 @@ class DishwasherMonitor(hass.Hass):
     def _get_guard_duration(self, tick_prog=None):
         """Duration for finish guard: require run >= this before accepting 0 W as cycle finished.
         For ECO: use full duration (e.g. 227 min) unless user explicitly set short=Yes - never use classifier's
-        detected_short for the guard, or we'd allow 'finished' when power drops to 0 during drying (~1h40)."""
+        detected_short for the guard, or we'd allow 'finished' when power drops to 0 during drying (~1h40).
+
+        Once finish_guard_use_learned is on and the programme's learned duration has enough
+        confirmed cycles (n >= finish_guard_min_learned_n), anchor the guard to that learned
+        average instead of the profile's nominal figure - floored at 75% of nominal so a
+        polluted/short learning history can never collapse the guard to something unsafe. The
+        learn key (eco/eco_short/quick_short) always matches whichever nominal branch (short vs
+        full) was just selected above - never the classifier's detected_short, for the same
+        reason the nominal branch itself avoids it.
+        """
         if tick_prog and tick_prog != "unknown":
             profile = self._get_profile(tick_prog)
             if tick_prog == "eco":
                 # Only use short duration for guard if user explicitly chose short=Yes
                 if self.short_entity and self.get_state(self.short_entity) == "Yes":
                     d = profile.get("duration_short_min", 74)
+                    learn_key = "eco_short"
                 else:
                     d = profile.get("duration_min", 227)
+                    learn_key = "eco"
             elif tick_prog == "quick":
                 if self.short_entity and self.get_state(self.short_entity) == "Yes":
                     d = profile.get("duration_short_min", 14)
+                    learn_key = "quick_short"
                 else:
                     d = profile.get("duration_min", 58)
+                    learn_key = "quick"
             else:
                 d = profile.get("duration_min", 180)
+                learn_key = tick_prog
             if d:
-                return int(d)
+                nominal = int(d)
+                if self.finish_guard_use_learned:
+                    learned = self._learned_durations.get(learn_key)
+                    if learned and learned.get("n", 0) >= self.finish_guard_min_learned_n:
+                        floor = 0.75 * nominal  # protect against a polluted/short learning history
+                        return round(max(learned["avg"], floor))
+                return nominal
         if self.expected_dur_at_start is not None:
             return self.expected_dur_at_start
         return self._programme_max_duration_minutes(classification=tick_prog)
@@ -2217,12 +2246,14 @@ class DishwasherMonitor(hass.Hass):
             classified = self._classify_programme()
             display_prog = self._get_programme_for_display()
             guard_dur = self._get_guard_duration(tick_prog=display_prog)
-            # ECO has a long drying phase (0–3 W) before the real end. Require at least 95% of programme
-            # duration so we don't trigger during drying; allow real finishes that end a few min early (e.g. 230 vs 234).
-            min_run_to_accept = guard_dur * 0.95
+            # ECO has a long drying phase (0–3 W) before the real end. Require at least
+            # finish_guard_fraction (default 95%) of the guard duration so we don't trigger during
+            # drying; allow real finishes that end a few min early (e.g. 230 vs 234).
+            min_run_to_accept = guard_dur * self.finish_guard_fraction
             if run_min < min_run_to_accept:
                 self.log(
-                    f"Power-based: run {run_min:.0f}min < {min_run_to_accept:.0f}min (95% of {guard_dur:.0f}min) - blocking (drying phase)",
+                    f"Power-based: run {run_min:.0f}min < {min_run_to_accept:.0f}min "
+                    f"({self.finish_guard_fraction*100:.0f}% of {guard_dur:.0f}min) - blocking (drying phase)",
                     level="INFO",
                 )
                 self.low_power_timer = None

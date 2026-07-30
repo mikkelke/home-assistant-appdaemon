@@ -127,6 +127,36 @@ def detect_anti_crease_pattern_from_points(watts_list, tail_max_mean_w, tail_min
     return (ok, mean_w, std_w, peak_w)
 
 
+def anti_crease_past_expected_finish(run_min, guard_dur, announce_past_expected, is_valid_completed_cycle):
+    """Mirror of the new fast-finish decision added to WasherMonitor._check_energy_finish's
+    anti-crease handling block (2026-07-30): once _detect_anti_crease_pattern() succeeds (tail_ok),
+    this decides whether to skip FinishingTail/_try_finish_via_standby entirely and call
+    _transition_to_unemptied() directly. guard_dur is the same expected-duration source
+    _meets_finish_time_guards compares against - run_min must be STRICTLY past it, not merely
+    within anti_crease_near_end_minutes (that near-but-not-past case is _is_post_end_tail_window's
+    job, already satisfied by the caller before this decision runs)."""
+    if not announce_past_expected:
+        return False
+    if not guard_dur or run_min < guard_dur:
+        return False
+    return bool(is_valid_completed_cycle)
+
+
+def zero_power_reset_tolerated(current_power, run_min, guard_dur, announce_past_expected, anti_crease_pattern_ok):
+    """Mirror of the new zero-power-backstop reset tolerance added to
+    WasherMonitor._check_energy_finish's standby-backstop 'else' branch (2026-07-30): a brief
+    anti-crease tumble (< 120W) must not reset _zero_power_since once run_min is past guard_dur
+    and the anti-crease pattern is currently confirmed - it is post-end activity, not cycle
+    activity. Returns True when the reset should be skipped (tolerated)."""
+    if not announce_past_expected:
+        return False
+    if current_power >= 120.0:
+        return False
+    if not guard_dur or run_min < guard_dur:
+        return False
+    return bool(anti_crease_pattern_ok)
+
+
 def slide_start_if_delayed(
     samples, start_ts, delay_plateau_minutes, start_w, energy_floor_kwh,
     observed_heating, cum_energy_kwh, heating_onset_ts=None,
@@ -340,6 +370,93 @@ class TestDetectAntiCreasePattern(unittest.TestCase):
         )
         self.assertFalse(ok)
         self.assertLess(std_w or 0, 6.0)
+
+
+class TestAntiCreasePastExpectedFinish(unittest.TestCase):
+    """Tests for the new past-expected-end fast-finish decision (2026-07-30): once a confirmed
+    anti-crease pattern is seen STRICTLY past the expected duration, announce immediately instead
+    of waiting through FinishingTail's tail-pulse-timeout quiesce (mirrors the dryer's keep-fresh
+    transition). Near-but-not-past-end and flag-off must keep the old FinishingTail path."""
+
+    def test_past_expected_and_valid_transitions_directly(self):
+        ok = anti_crease_past_expected_finish(
+            run_min=170.0, guard_dur=159.0, announce_past_expected=True, is_valid_completed_cycle=True,
+        )
+        self.assertTrue(ok)
+
+    def test_near_but_not_past_keeps_old_path(self):
+        """Within anti_crease_near_end_minutes of expected end but NOT past guard_dur -> old FinishingTail path."""
+        ok = anti_crease_past_expected_finish(
+            run_min=140.0, guard_dur=159.0, announce_past_expected=True, is_valid_completed_cycle=True,
+        )
+        self.assertFalse(ok)
+
+    def test_exactly_at_expected_end_transitions_directly(self):
+        """run_min == guard_dur counts as past (>=), matching _meets_finish_time_guards' own >= semantics."""
+        ok = anti_crease_past_expected_finish(
+            run_min=159.0, guard_dur=159.0, announce_past_expected=True, is_valid_completed_cycle=True,
+        )
+        self.assertTrue(ok)
+
+    def test_flag_off_keeps_old_path_even_past_expected(self):
+        ok = anti_crease_past_expected_finish(
+            run_min=170.0, guard_dur=159.0, announce_past_expected=False, is_valid_completed_cycle=True,
+        )
+        self.assertFalse(ok)
+
+    def test_past_expected_but_invalid_cycle_keeps_old_path(self):
+        ok = anti_crease_past_expected_finish(
+            run_min=170.0, guard_dur=159.0, announce_past_expected=True, is_valid_completed_cycle=False,
+        )
+        self.assertFalse(ok)
+
+    def test_missing_guard_dur_keeps_old_path(self):
+        """guard_dur falsy (None/0, e.g. undetermined) -> never trigger the fast path."""
+        ok = anti_crease_past_expected_finish(
+            run_min=170.0, guard_dur=0, announce_past_expected=True, is_valid_completed_cycle=True,
+        )
+        self.assertFalse(ok)
+
+
+class TestZeroPowerBackstopTumbleTolerance(unittest.TestCase):
+    """Tests for the zero-power-backstop reset tolerance (2026-07-30): once past expected end
+    with a confirmed anti-crease pattern, a brief tumble must not reset _zero_power_since (every
+    tumble would otherwise push the 3/5-minute backstop thresholds back out indefinitely)."""
+
+    def test_past_expected_pattern_confirmed_low_tumble_tolerated(self):
+        ok = zero_power_reset_tolerated(
+            current_power=60.0, run_min=170.0, guard_dur=159.0,
+            announce_past_expected=True, anti_crease_pattern_ok=True,
+        )
+        self.assertTrue(ok)
+
+    def test_tumble_at_or_above_120w_not_tolerated(self):
+        ok = zero_power_reset_tolerated(
+            current_power=120.0, run_min=170.0, guard_dur=159.0,
+            announce_past_expected=True, anti_crease_pattern_ok=True,
+        )
+        self.assertFalse(ok)
+
+    def test_not_past_expected_end_not_tolerated(self):
+        ok = zero_power_reset_tolerated(
+            current_power=60.0, run_min=140.0, guard_dur=159.0,
+            announce_past_expected=True, anti_crease_pattern_ok=True,
+        )
+        self.assertFalse(ok)
+
+    def test_pattern_not_confirmed_not_tolerated(self):
+        ok = zero_power_reset_tolerated(
+            current_power=60.0, run_min=170.0, guard_dur=159.0,
+            announce_past_expected=True, anti_crease_pattern_ok=False,
+        )
+        self.assertFalse(ok)
+
+    def test_flag_off_not_tolerated(self):
+        ok = zero_power_reset_tolerated(
+            current_power=60.0, run_min=170.0, guard_dur=159.0,
+            announce_past_expected=False, anti_crease_pattern_ok=True,
+        )
+        self.assertFalse(ok)
 
 
 class TestDelayedStartSlide(unittest.TestCase):

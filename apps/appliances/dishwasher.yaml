@@ -113,7 +113,15 @@ dishwasher_monitor:
   fill_window_minutes: 74   # Door open before this = adding dishes
   min_cycle_minutes: 74     # Reject rinse; accept Eco short as minimum valid
   min_energy_kwh: 0.4
-  
+
+  # Finish guard: the guard now anchors to the machine's own learned duration once a programme
+  # has n>=5 confirmed cycles, instead of always trusting the profile's nominal figure (nominal
+  # ECO 234 vs learned ~218-224 meant genuinely-finished cycles sat blocked for 4-15 min).
+  finish_guard_fraction: 0.95        # Fraction of the guard duration required before accepting 0W as done
+  finish_guard_use_learned: true     # Use the learned average once enough confirmed cycles exist
+  finish_guard_min_learned_n: 5      # Minimum confirmed cycles before trusting the learned average
+  # Learned average is floored at 75% of nominal regardless, to protect against a polluted/short learning history.
+
   # Pause timeout - if door stays open while adding dishes
   pause_timeout_minutes: 5
   

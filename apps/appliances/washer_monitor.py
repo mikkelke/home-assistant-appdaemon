@@ -482,6 +482,12 @@ class WasherMonitor(hass.Hass):
         self.anti_crease_max_duty_above_active = float(self.args.get("anti_crease_max_duty_above_active", 0.15))
         self.anti_crease_near_end_minutes = float(self.args.get("anti_crease_near_end_minutes", 25))
         self.anti_crease_min_runtime_minutes = float(self.args.get("anti_crease_min_runtime_minutes", 60))  # When programme unknown
+        # Once run_min is STRICTLY past guard_dur (the same expected-duration source
+        # _meets_finish_time_guards uses - not merely within anti_crease_near_end_minutes of it),
+        # a confirmed anti-crease pattern IS the end signal: skip FinishingTail's tail-pulse wait
+        # and announce immediately, mirroring the dryer's keep-fresh transition (~4 min detections).
+        # Near-but-not-past-end still goes through the slower FinishingTail/_try_finish_via_standby path unchanged.
+        self.anti_crease_announce_past_expected = bool(self.args.get("anti_crease_announce_past_expected", True))
         self.finish_debug_window_minutes = float(self.args.get("finish_debug_window_minutes", 25))  # When to emit finish/anti-crease debug logs
         # Stricter finish guards to stop false announcements when guard_dur is underestimated.
         self.finish_guard_fraction = float(self.args.get("finish_guard_fraction", 0.92))  # Require 92% of expected (was 85%)
@@ -6217,6 +6223,27 @@ class WasherMonitor(hass.Hass):
                 elif self._meets_finish_time_guards(run_min, guard_dur or 0) and self._is_post_end_tail_window(run_min, guard_dur, _tick_prog) and not self._recent_true_activity_block():
                     tail_ok, tail_mean, tail_std, tail_peak = self._detect_anti_crease_pattern()
                     if tail_ok:
+                        if (
+                            self.anti_crease_announce_past_expected
+                            and guard_dur
+                            and run_min >= guard_dur  # STRICTLY past expected end, not merely near it
+                            and self._is_valid_completed_cycle()
+                        ):
+                            # Past expected end with a confirmed anti-crease pattern: the pattern IS
+                            # the end signal here (mirrors the dryer's keep-fresh transition, ~4 min
+                            # detections) - skip FinishingTail's slower tail-pulse-timeout wait and
+                            # announce now. _transition_to_unemptied() still runs
+                            # _power_looks_like_cycle_end() for this end_reason (that gate is only
+                            # skipped for tail_to_standby/tail_pattern_break) so the mid-cycle-rinse
+                            # sanity check is not bypassed - just not duplicated here.
+                            self._pending_end_reason = "anti_crease_pattern"
+                            self.log(
+                                f"Anti-crease pattern past expected end (run={run_min:.0f}min >= expected={guard_dur:.0f}min, "
+                                f"tail mean={tail_mean:.1f}W std={tail_std:.1f}W peak={tail_peak:.1f}W) - announcing immediately",
+                                level="INFO",
+                            )
+                            self._transition_to_unemptied()
+                            return
                         if not self.in_finishing_tail:
                             self.in_finishing_tail = True
                             self.in_finishing_tail_entered_at = now
@@ -6302,7 +6329,19 @@ class WasherMonitor(hass.Hass):
                         return
                     self.log("Standby backstop but cycle validation failed - keep checking", level="WARNING")
             else:
-                self._zero_power_since = None
+                # Anti-crease tumbles are post-end activity, not cycle activity: once past
+                # expected end with the pattern currently confirmed, a brief tumble (< 120W)
+                # must not reset the zero-power clock, or every tumble would keep pushing the
+                # 3/5-minute thresholds back out - the exact lag the rest of this fix removes.
+                tumble_tolerated = False
+                if self.anti_crease_announce_past_expected and current_power < 120.0 and self.start_time:
+                    tumble_run_min = (now - self.start_time).total_seconds() / 60
+                    tumble_guard_dur = self._get_guard_duration(_tick_prog, _tick_temp, _tick_class)
+                    if tumble_guard_dur and tumble_run_min >= tumble_guard_dur:
+                        tail_ok, tail_mean, tail_std, tail_peak = self._detect_anti_crease_pattern()
+                        tumble_tolerated = tail_ok
+                if not tumble_tolerated:
+                    self._zero_power_since = None
 
             # Rolling-buffer implied-watts calculation.
             #

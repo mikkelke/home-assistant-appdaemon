@@ -408,6 +408,11 @@ washer_monitor:
   anti_crease_max_duty_above_active: 0.15
   anti_crease_near_end_minutes: 25
   anti_crease_min_runtime_minutes: 60   # When programme unknown
+  # Past the expected duration, a confirmed anti-crease pattern IS the end signal - announce
+  # immediately instead of waiting through FinishingTail's tail-pulse-timeout quiesce (the dryer
+  # already works this way, ~4 min detections). A false positive here costs one announcement and
+  # auto-reverts via the false-Unemptied recovery. Flip to false to restore the old wait-for-quiesce behavior.
+  anti_crease_announce_past_expected: true
   finish_debug_window_minutes: 25       # When to emit finish/anti-crease debug logs
 
   # Stricter finish guards (stop false announcements when expected duration is wrong)
