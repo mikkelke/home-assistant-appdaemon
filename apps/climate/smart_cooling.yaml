@@ -36,7 +36,9 @@ SmartCooling:
 
   default_night_ceiling: 23.0
   min_temp: 16.0          # hardware floor; never drive the room below
-  sleep_hours: 8.0
+  # 9h protects 22:00->07:00 (user 2026-07-30): the hour before sleep is wind-down IN the
+  # room, so cooling must be finished and the coast judged from 22:00, not 23:00.
+  sleep_hours: 9.0
   # Trust the learned feasible floor from the FIRST night (default 2): with n=1 (20.5C,
   # 2026-07-15) still untrusted, the planner spent 2026-07-16 evening asking ~255 min
   # toward an ideal 16.8C the floor demonstrably won't reach, which forced it into the
