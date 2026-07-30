@@ -1821,6 +1821,10 @@ class SmartCooling(hass.Hass):
                 attrs["night_outdoor_min"] = round(night_outdoor, 1)
             if wake_dt is not None:
                 attrs["wake_at"] = wake_dt.strftime("%H:%M")
+                # The moment the plan actually protects from: wake minus the sleep window.
+                # Published so the dashboard's bedtime boundary is THIS number, never a
+                # card-side constant (user 2026-07-30: bar and schedule disagreed on it).
+                attrs["bedtime_at"] = (wake_dt - timedelta(hours=self.sleep_hours)).strftime("%H:%M")
             if wake_proj is not None:
                 attrs["wake_projection"] = wake_proj
             if v_title:

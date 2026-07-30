@@ -71,6 +71,7 @@ def make_app(**overrides):
     app._night_engaged_min = overrides.get("night_engaged_min", 0.0)
     app._learned_tonight = overrides.get("learned_tonight", False)
     app.commit_price_margin = overrides.get("commit_price_margin", 0.15)
+    app.sleep_hours = overrides.get("sleep_hours", 8.0)
     app.cool_kw = overrides.get("cool_kw", 0.5)          # _schedule's est-cost term
     # weather-model attributes (Model D coefficients + memory + shadow flags)
     app.person_offset = overrides.get("person_offset", 0.5)
@@ -1607,6 +1608,15 @@ class PublishSleepPlanGrounding(unittest.TestCase):
         app.call_service = call_service
         self._run(app)
         self.assertEqual(app._called_services, [])
+
+    def test_bedtime_at_is_wake_minus_sleep_window(self):
+        # The dashboard's bedtime boundary must be THIS published number, never a card-side
+        # constant (2026-07-30: the bar's hardcoded 23:00 and the schedule list drifted apart
+        # in the user's reading). Harness NOW is a Wednesday noon -> fallback wake 07:00.
+        app = self._app()
+        _, attrs = self._run(app)
+        self.assertEqual(attrs["wake_at"], "07:00")
+        self.assertEqual(attrs["bedtime_at"], "23:00")
 
     def test_missing_zone_sensors_fall_back_to_raw_weather(self):
         # If every bedroom-zone reading is None AND floor is None, bedroom_zone_now is None ->
