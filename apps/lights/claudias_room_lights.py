@@ -15,12 +15,14 @@ class ClaudiasRoomLights(hass.Hass):
     goes home -> away) with a light still on, that light is turned off - unless the
     room still reads occupied (PIR), so a sibling left behind keeps their light.
 
-    Switch map: ``press_1`` toggles the ceiling light, ``press_3`` toggles the floor light.
+    Switch map: ``press_1`` toggles the ceiling light. ``press_3`` belonged to the
+    floor lamp, which left the room (2026-07, same decision that delisted it from the
+    dashboard) - the button is deliberately a no-op now, kept mapped-but-ignored so a
+    future lamp only needs the wiring restored here and in the yaml.
     """
 
     def initialize(self):
         self.ceiling_light = self.args["ceiling_light"]
-        self.floor_light = self.args["floor_light"]
         self.presence_entity = self.args.get("presence_entity")
         self.pir_sensor = self.args.get("pir_sensor")
         self.log_level = self.args.get("verbosity_level", "normal")
@@ -46,10 +48,9 @@ class ClaudiasRoomLights(hass.Hass):
             if self.pir_sensor and self.get_state(self.pir_sensor) == "on":
                 self.log("Claudias Room: Claudia left but room still occupied - leaving lights on", level="INFO")
                 return
-            for light, label in ((self.ceiling_light, "ceiling"), (self.floor_light, "floor")):
-                if self.get_state(light) == "on":
-                    self.turn_off(light)
-                    self._log_action("OFF", f"{label} - Claudia left home")
+            if self.get_state(self.ceiling_light) == "on":
+                self.turn_off(self.ceiling_light)
+                self._log_action("OFF", "ceiling - Claudia left home")
         except Exception as e:
             self.log(f"Error in leave-home handler: {e}", level="ERROR")
 
@@ -64,12 +65,9 @@ class ClaudiasRoomLights(hass.Hass):
                     self.turn_off(self.ceiling_light)
                     self._log_action("OFF", "ceiling switch")
             elif event_type == "press_3":
-                if self.get_state(self.floor_light) == "off":
-                    self.turn_on(self.floor_light)
-                    self._log_action("ON", "floor switch")
-                else:
-                    self.turn_off(self.floor_light)
-                    self._log_action("OFF", "floor switch")
+                # Floor-lamp button: the lamp left the room (2026-07). Deliberate no-op -
+                # logged at debug so a puzzled press is traceable without spamming INFO.
+                self.log("Claudias Room: floor-lamp button pressed - lamp no longer in the room, ignoring", level="DEBUG")
         except Exception as e:
             self.log(f"Error in switch event handler: {e}", level="ERROR")
 
