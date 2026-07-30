@@ -234,6 +234,9 @@ class SmartCooling(hass.Hass):
         # and the planner (correctly, given the false belief) ran from 08:38 through
         # morning prices instead of waiting for the cheap afternoon.
         self.rate_learn_min_headroom = float(a("rate_learn_min_headroom", 0.7))
+        # Crawl-regime rate for PRICING the last stretch above the wall (measured 0.2-0.5
+        # C/h on 2026-07-29; the knee is the same rate_learn_min_headroom boundary).
+        self.crawl_rate_cph = float(a("crawl_rate_cph", 0.4))
         # Commitment hysteresis: while ALREADY cooling, keep going if the current slot costs
         # no more than the priciest slot we DID choose, plus this margin (kr/kWh). Rank slack
         # is useless here -- with a flat cheap evening the current slot ranks behind dozens of
@@ -1091,6 +1094,16 @@ class SmartCooling(hass.Hass):
         """The rate to plan with: the learned C/h once we have a sample, else the seed."""
         return self._cool_cph if self._cool_cph else self.floor_cool_cph
 
+    def _cooling_minutes(self, floor, target):
+        """Two-regime engaged-minutes estimate (see cm.cooling_minutes): fast rate down to
+        the knee (learned wall + headroom), crawl rate below it. The wall only counts once
+        it is trusted (feasible_min_samples), mirroring _reach_target/_plan_floor_limit."""
+        wall = (self._feasible_floor
+                if self._feasible_floor is not None
+                and self._feasible_samples >= self.feasible_min_samples else None)
+        return cm.cooling_minutes(floor, target, self._cool_rate(), wall,
+                                  self.rate_learn_min_headroom, self.crawl_rate_cph)
+
     def _track_cool_rate(self, floor, engaged_min, cooling):
         """Learn the real floor cool rate (C/h) from engaged cooling time.
 
@@ -1498,7 +1511,7 @@ class SmartCooling(hass.Hass):
             deficit = floor - target
             if deficit < self.rescue_deficit_min:
                 return
-            mins = deficit / self._cool_rate() * 60.0
+            mins = self._cooling_minutes(floor, target)
             # Still time to pre-cool the deficit away before the cutoff hour?
             if (self.rescue_to_hour - now.hour) * 60 < mins:
                 return
@@ -1600,7 +1613,7 @@ class SmartCooling(hass.Hass):
                                                       self._rise_frac, self.zone_offset,
                                                       plan_min)
                 pricing_deficit = max(0.0, floor - pricing_target)
-                minutes_needed = pricing_deficit / self._cool_rate() * 60.0
+                minutes_needed = self._cooling_minutes(floor, pricing_target)
                 price_slots = max(1, math.ceil(minutes_needed / 15.0))
             else:
                 price_slots = self.est_price_slots
@@ -1846,7 +1859,7 @@ class SmartCooling(hass.Hass):
                                      else min(self._night_floor_min, floor))
         reach_target = self._reach_target(now, target, saturated)
         reach_deficit = floor - reach_target
-        minutes_needed = max(0.0, reach_deficit) / self._cool_rate() * 60.0
+        minutes_needed = self._cooling_minutes(floor, reach_target)
 
         # user says they're removing the AC now -> this IS lights-out: stash the coast baseline,
         # graceful compressor stop (they unplug right after -- better than yanking power

@@ -56,6 +56,8 @@ def make_app(**overrides):
     # per-night achieved-depth learning (see _finalize_night)
     app.feasible_learn_min_engaged = overrides.get("feasible_learn_min_engaged", 120.0)
     app.feasible_probe_c = overrides.get("feasible_probe_c", 1.0)
+    app.rate_learn_min_headroom = overrides.get("rate_learn_min_headroom", 0.7)
+    app.crawl_rate_cph = overrides.get("crawl_rate_cph", 0.4)
     # wake display knobs (resolve_wake inputs; display-only)
     app.alarm_time_entity = "input_datetime.wakeup_bedroom"
     app.alarm_enabled_entity = "input_boolean.wakeup_bedroom"

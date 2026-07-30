@@ -173,6 +173,33 @@ def calc_floor_target(equilibrium, ceiling, rise_frac, zone_offset, min_temp) ->
     return max(min_temp, min(ceiling, round(f0, 2)))
 
 
+# ------------------------------------------------------------- cooling time (two regimes)
+
+def cooling_minutes(floor, target, fast_rate, wall=None,
+                    crawl_headroom=0.7, crawl_rate=0.4):
+    """Engaged minutes to take the floor from ``floor`` down to ``target``, honoring the
+    unit's two cooling regimes (2026-07-30): above ``wall + crawl_headroom`` the machine
+    runs at its measured fast rate (~1.7 C/h); below that knee the floor crawls toward the
+    feasible wall at ~0.2-0.5 C/h regardless of the machine. Pricing a whole descent at the
+    fast rate booked a 4.4C job as 165 min when the meter said the real shape of such a day
+    is ~6 engaged hours -- so the scheduler bought too few cheap slots and topped up at
+    worse prices later.
+
+    With no learned wall the whole descent prices at the fast rate (old behavior). Returns
+    0.0 when there is nothing to cool. Same knee constant as the rate learner's headroom
+    gate, so "where we stop learning speed" and "where we start pricing crawl" agree."""
+    if floor is None or target is None or floor <= target:
+        return 0.0
+    fast_rate = max(0.05, fast_rate)
+    crawl_rate = max(0.05, crawl_rate)
+    if wall is None:
+        return (floor - target) / fast_rate * 60.0
+    knee = wall + crawl_headroom
+    fast_part = max(0.0, floor - max(target, knee))
+    crawl_part = max(0.0, min(floor, knee) - target)
+    return (fast_part / fast_rate + crawl_part / crawl_rate) * 60.0
+
+
 # ------------------------------------------------------------- comfort limit
 # Moved verbatim from bedroom_comfort.py; this is now their single home. bedroom_comfort
 # re-exports them so its test surface (bc.dew_point_c etc.) is unchanged.

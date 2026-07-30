@@ -552,5 +552,32 @@ class ComposeBriefingSharedHome(unittest.TestCase):
         self.assertEqual((title, body), ("AC not needed", "Keep windows open."))
 
 
+class CoolingMinutes(unittest.TestCase):
+    """Two-regime descent pricing (2026-07-30): fast rate above the knee (wall+headroom),
+    crawl below -- a 4.4C job priced 165 min linear vs ~6 engaged hours metered."""
+
+    def test_todays_job_prices_like_the_meter_says(self):
+        # floor 23.7 -> 19.3, wall 20.33, fast 1.68, crawl 0.4:
+        # fast 23.7-21.03 = 2.67C @1.68 ~ 95min; crawl 21.03-19.3 = 1.73C @0.4 ~ 259min
+        got = cm.cooling_minutes(23.7, 19.3, 1.68, wall=20.33)
+        self.assertAlmostEqual(got, 95.4 + 259.5, delta=2.0)
+
+    def test_no_wall_is_linear(self):
+        self.assertAlmostEqual(cm.cooling_minutes(23.0, 20.0, 1.5), 120.0, places=3)
+
+    def test_all_above_knee_is_pure_fast(self):
+        got = cm.cooling_minutes(24.0, 22.0, 2.0, wall=20.0)   # knee 20.7, target above it
+        self.assertAlmostEqual(got, 60.0, places=3)
+
+    def test_all_below_knee_is_pure_crawl(self):
+        got = cm.cooling_minutes(20.5, 20.0, 2.0, wall=20.0)   # knee 20.7, floor below it
+        self.assertAlmostEqual(got, 0.5 / 0.4 * 60.0, places=3)
+
+    def test_nothing_to_cool_is_zero(self):
+        self.assertEqual(cm.cooling_minutes(20.0, 20.0, 1.7, wall=20.0), 0.0)
+        self.assertEqual(cm.cooling_minutes(19.0, 20.0, 1.7, wall=20.0), 0.0)
+        self.assertEqual(cm.cooling_minutes(None, 20.0, 1.7), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
