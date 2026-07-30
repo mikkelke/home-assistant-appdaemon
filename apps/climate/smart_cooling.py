@@ -1138,7 +1138,8 @@ class SmartCooling(hass.Hass):
     def _schedule(self, now, deadline, minutes_needed, price_at, already_cooling=False):
         """Reserve the cheapest `minutes_needed` of 15-min slots between now and deadline (midnight -
         see _next_midnight). Cool NOW if the current slot is one of them, or if there isn't time left
-        to wait. Returns (cool_now, next_start, run_min, est_cost).
+        to wait. Returns (cool_now, next_start, run_min, est_cost, windows) -- windows being the
+        chosen set merged into [[start, end], ...] wall-clock stretches for the dashboard bar.
 
         COMMITMENT (user 2026-07-29, "why start at 11:00 for 30 min then wait for 12:00?"): the
         plan is re-solved from scratch every tick, so as cooling closes the deficit the
@@ -1149,7 +1150,7 @@ class SmartCooling(hass.Hass):
         reflects the strict cheapest-N plan; only the keep-going decision gets the slack."""
         total = int((deadline - now).total_seconds() // 900)
         if total <= 0 or minutes_needed <= 0:
-            return False, None, 0, 0.0
+            return False, None, 0, 0.0, []
         need = min(total, int((minutes_needed + 14.999) // 15))
         slots = [now + timedelta(minutes=15 * k) for k in range(total)]
         order = sorted(range(total), key=lambda k: price_at(slots[k]))
@@ -1160,7 +1161,18 @@ class SmartCooling(hass.Hass):
             cool_now = price_at(slots[0]) <= worst_chosen + self.commit_price_margin
         next_start = slots[chosen[0]] if chosen else None
         est = sum(self.cool_kw * 0.25 * price_at(slots[k]) for k in chosen)
-        return cool_now, next_start, need * 15, round(est, 2)
+        # The chosen set as merged wall-clock windows, so the dashboard can draw the actual
+        # run / hold-for-price / resume plan instead of projecting one contiguous block from
+        # now (user 2026-07-30: the bar showed cooling straight through the 19-21 price peak
+        # this very set was skipping).
+        windows = []
+        for k in chosen:
+            start, end = slots[k], slots[k] + timedelta(minutes=15)
+            if windows and windows[-1][1] == start:
+                windows[-1][1] = end
+            else:
+                windows.append([start, end])
+        return cool_now, next_start, need * 15, round(est, 2), windows
 
     async def _learn(self, now):
         """Runs every tick (any arm/deploy state, read-only): once a stashed lights-out window
@@ -2000,7 +2012,7 @@ class SmartCooling(hass.Hass):
                 self.log(f"failed to disarm after AC-removed: {e}", level="WARNING")
             return
 
-        cool_now, next_start, run_min, est_cost = self._schedule(
+        cool_now, next_start, run_min, est_cost, plan_windows = self._schedule(
             now, deadline, minutes_needed, price_at, already_cooling=self._last_want)
         slots_left = int((deadline - now).total_seconds() // 900)
         time_constrained = run_min >= max(1, slots_left) * 15
@@ -2071,7 +2083,8 @@ class SmartCooling(hass.Hass):
         self._mark_eval(now, want)
         attrs = self._attrs(floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
                             ceiling, price_now, window_open, run_min, next_start, est_cost, floor_limited,
-                            ceiling_base, reach_target=reach_target, wm_dbg=wm_dbg)
+                            ceiling_base, reach_target=reach_target, wm_dbg=wm_dbg,
+                            plan_windows=plan_windows)
 
         if reason != self._last_reason:
             self.log(f"PLAN {reason}", level="INFO")
@@ -2137,7 +2150,7 @@ class SmartCooling(hass.Hass):
 
     def _attrs(self, floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
                ceiling, price_now, window_open, run_min, next_start, est_cost, floor_limited,
-               ceiling_base, reach_target=None, wm_dbg=None):
+               ceiling_base, reach_target=None, wm_dbg=None, plan_windows=()):
         def r1(v):
             return round(v, 1) if v is not None else None
         out = {
@@ -2154,6 +2167,9 @@ class SmartCooling(hass.Hass):
             "rise_frac": round(self._rise_frac, 2), "rise_samples": self._rise_samples,
             "price_now": round(price_now, 2), "window_open": window_open,
             "minutes_needed": run_min, "next_start": next_start.strftime("%H:%M") if next_start else None,
+            # The scheduler's actual chosen stretches (ISO pairs, no Nones -- safe from the
+            # 4.5.13 publish strip). The card draws these instead of projecting now+minutes.
+            "planned_cool_windows": [[w[0].isoformat(), w[1].isoformat()] for w in plan_windows],
             "est_cost_kr": est_cost, "dry_run": self.dry_run,
             "last_burp": self._last_burp.strftime("%H:%M") if self._last_burp else None,
             "dry_min_tonight": round(self._dry_min),

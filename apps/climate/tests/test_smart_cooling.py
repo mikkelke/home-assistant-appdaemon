@@ -257,7 +257,7 @@ class Deadline(unittest.TestCase):
         app = make_app()
         app.cool_kw = 0.5
         now = datetime(2026, 7, 15, 23, 52)
-        cool_now, _, run_min, _ = app._schedule(
+        cool_now, _, run_min, _, _ = app._schedule(
             now, app._deadline(now), 90, lambda dt: 1.97)
         self.assertTrue(cool_now)
         self.assertGreater(run_min, 0)
@@ -304,7 +304,7 @@ class PlanDeadline(unittest.TestCase):
         app.cool_kw = 0.5
         now = datetime(2026, 7, 16, 21, 13)
         prices = {21: 2.8, 22: 2.3, 23: 2.05}
-        cool_now, _, _, _ = app._schedule(
+        cool_now, _, _, _, _ = app._schedule(
             now, app._plan_deadline(now), 48, lambda dt: prices.get(dt.hour, 2.5))
         self.assertTrue(cool_now)
 
@@ -1913,14 +1913,14 @@ class ScheduleCommitment(unittest.TestCase):
     def test_marginal_slot_is_dropped_when_not_already_cooling(self):
         app = make_app()
         # small need -> only the cheap 12:00+ slots are chosen, 11:00 is not
-        cool_now, next_start, _, _ = app._schedule(
+        cool_now, next_start, _, _, _ = app._schedule(
             self.NOW, self.DEADLINE, 60.0, self._prices(), already_cooling=False)
         self.assertFalse(cool_now)
         self.assertGreaterEqual(next_start.hour, 12)
 
     def test_same_situation_keeps_going_when_already_cooling(self):
         app = make_app()
-        cool_now, _, _, _ = app._schedule(
+        cool_now, _, _, _, _ = app._schedule(
             self.NOW, self.DEADLINE, 60.0, self._prices(), already_cooling=True)
         self.assertTrue(cool_now)
 
@@ -1929,24 +1929,58 @@ class ScheduleCommitment(unittest.TestCase):
         def pricey(dt):
             return 1.50 if dt.hour == 11 else 0.50
         app = make_app()
-        cool_now, _, _, _ = app._schedule(
+        cool_now, _, _, _, _ = app._schedule(
             self.NOW, self.DEADLINE, 60.0, pricey, already_cooling=True)
         self.assertFalse(cool_now)
 
     def test_zero_margin_turns_the_hysteresis_off(self):
         app = make_app(commit_price_margin=0.0)
-        cool_now, _, _, _ = app._schedule(
+        cool_now, _, _, _, _ = app._schedule(
             self.NOW, self.DEADLINE, 60.0, self._prices(), already_cooling=True)
         self.assertFalse(cool_now)
 
     def test_chosen_plan_is_unaffected_by_the_slack(self):
         # next_start/run_min still describe the STRICT cheapest-N plan
         app = make_app()
-        _, ns_cold, run_cold, est_cold = app._schedule(
+        _, ns_cold, run_cold, est_cold, _ = app._schedule(
             self.NOW, self.DEADLINE, 60.0, self._prices(), already_cooling=False)
-        _, ns_hot, run_hot, est_hot = app._schedule(
+        _, ns_hot, run_hot, est_hot, _ = app._schedule(
             self.NOW, self.DEADLINE, 60.0, self._prices(), already_cooling=True)
         self.assertEqual((ns_cold, run_cold, est_cold), (ns_hot, run_hot, est_hot))
+
+
+class SchedulePlannedWindows(unittest.TestCase):
+    """The chosen set is published as merged wall-clock windows so the dashboard bar can
+    draw the real run / hold-for-price / resume plan (user 2026-07-30: the bar projected
+    one contiguous block straight through the 19-21 peak the plan was skipping)."""
+
+    NOW = datetime(2026, 7, 30, 17, 0)
+
+    def test_contiguous_chosen_slots_merge_and_gaps_split(self):
+        # 6 slots; cheapest three are k=0,1 (1.0) and k=4 (1.2) -> two windows with the
+        # expensive 17:30-18:00 stretch held out between them.
+        deadline = self.NOW + timedelta(minutes=90)
+        prices = [1.0, 1.0, 5.0, 5.0, 1.2, 5.0]
+
+        def price_at(dt):
+            return prices[int((dt - self.NOW).total_seconds() // 900)]
+
+        app = make_app()
+        cool_now, next_start, run_min, _, windows = app._schedule(
+            self.NOW, deadline, 45.0, price_at)
+        self.assertTrue(cool_now)
+        self.assertEqual(next_start, self.NOW)
+        self.assertEqual(run_min, 45)
+        self.assertEqual(windows, [
+            [self.NOW, self.NOW + timedelta(minutes=30)],
+            [self.NOW + timedelta(minutes=60), self.NOW + timedelta(minutes=75)],
+        ])
+
+    def test_no_work_publishes_no_windows(self):
+        app = make_app()
+        _, _, _, _, windows = app._schedule(
+            self.NOW, self.NOW + timedelta(minutes=90), 0.0, lambda dt: 1.0)
+        self.assertEqual(windows, [])
 
 
 class PlanFloorLimit(unittest.TestCase):
