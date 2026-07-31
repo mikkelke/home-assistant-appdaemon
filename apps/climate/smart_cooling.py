@@ -491,6 +491,7 @@ class SmartCooling(hass.Hass):
         # by the learned EMA once a qualifying session has been metered (see
         # _finalize_session); _kwh_per_deg_samples counts those qualifying sessions.
         self._session_deficit0: Optional[float] = None
+        self._session_started_at: Optional[str] = None
         self._kwh_per_deg: float = self.kwh_per_deg_default
         self._kwh_per_deg_samples: int = 0
         # Day-history for the dashboard bar (2026-07-30): which stretches the AC actually
@@ -674,6 +675,8 @@ class SmartCooling(hass.Hass):
             self._session_kwh0 = float(sk0) if sk0 is not None else None
             slc = d.get("session_last_counter")
             self._session_last_counter = float(slc) if slc is not None else None
+            ssa = d.get("session_started_at")
+            self._session_started_at = str(ssa) if ssa is not None else None
             self._session_kwh = float(d.get("session_kwh", 0.0))
             self._session_cost = float(d.get("session_cost", 0.0))
             lsk = d.get("last_session_kwh")
@@ -739,6 +742,7 @@ class SmartCooling(hass.Hass):
                            "rescue_notified_date": self._rescue_notified_date,
                            "session_kwh0": self._session_kwh0,
                            "session_last_counter": self._session_last_counter,
+                           "session_started_at": self._session_started_at,
                            "session_kwh": self._session_kwh,
                            "session_cost": self._session_cost,
                            "last_session_kwh": self._last_session_kwh,
@@ -1454,6 +1458,7 @@ class SmartCooling(hass.Hass):
             self._session_kwh = 0.0
             self._session_cost = 0.0
             self._session_deficit0 = (self._last_plan or {}).get("deficit")
+            self._session_started_at = datetime.now().astimezone().isoformat()
             self._save_state()
             self.log(f"AC session metering started at {counter:.3f} kWh", level="INFO")
             return
@@ -1500,6 +1505,7 @@ class SmartCooling(hass.Hass):
         self._session_kwh0 = None
         self._session_last_counter = None
         self._session_deficit0 = None
+        self._session_started_at = None
         if session_kwh < self.session_min_kwh:
             self._save_state()
             self.log(f"Session skipped ({session_kwh:.3f} kWh < {self.session_min_kwh:.1f} "
@@ -2150,6 +2156,10 @@ class SmartCooling(hass.Hass):
         if self._session_kwh0 is not None or self._session_cost > 0:
             out["session_cost_kr"] = round(self._session_cost, 2)
             out["session_kwh"] = round(self._session_kwh, 2)
+        # Plug-in moment of the open session -- the dashboard bar opens here ("on duty"
+        # starts at the plug, not at the first compressor start; user 2026-07-31).
+        if self._session_started_at is not None:
+            out["session_started_at"] = self._session_started_at
         return out
 
     def _attrs(self, floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,

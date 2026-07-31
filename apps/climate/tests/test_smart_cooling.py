@@ -115,6 +115,7 @@ def make_app(**overrides):
     # verdict _track_session_cost reads the pre-cool deficit from at session start.
     app.session_min_kwh = overrides.get("session_min_kwh", 0.5)
     app._session_deficit0 = overrides.get("session_deficit0", None)
+    app._session_started_at = overrides.get("session_started_at", None)
     app._kwh_per_deg = overrides.get("kwh_per_deg", 1.6)
     app._kwh_per_deg_samples = overrides.get("kwh_per_deg_samples", 0)
     app._last_plan = overrides.get("last_plan", None)
