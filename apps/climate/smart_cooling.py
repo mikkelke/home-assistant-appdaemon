@@ -511,8 +511,11 @@ class SmartCooling(hass.Hass):
         except Exception as e:
             self.log(f"MobileNotifier not available: {e}", level="WARNING")
 
+        # Alarm entities included (2026-07-31): wake_at/bedtime_at derive from the alarm, so
+        # moving it must reshape the plan and the card NOW, not on the next 15-min tick.
         for ent in (self.enable_entity, self.price_entity,
-                    self.night_ceiling_entity, self.vent_window, self.ac_removed_entity):
+                    self.night_ceiling_entity, self.vent_window, self.ac_removed_entity,
+                    self.alarm_time_entity, self.alarm_enabled_entity):
             self.listen_state(self._on_trigger, ent)
         # "now" is documented to mean "first call at now + interval", not immediately - found
         # 2026-07-15 chasing a stale post-reload status (every deploy left the AC blind for up to
