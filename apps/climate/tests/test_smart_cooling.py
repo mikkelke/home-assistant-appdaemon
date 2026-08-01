@@ -1527,6 +1527,7 @@ class PublishSleepPlanGrounding(unittest.TestCase):
         app.cool_kw = 0.5
         app.ac_noise_penalty_kr = 0.5
         app.wm_reality_margin = 1.0
+        app.vent_tau_h = 7.0
         app.wm_warm_night_margin = warm_night_margin
 
         # Bedroom zone ~21.7-22.0C now (floor 22.0 arg, mid 21.7, kitchen 21.9); outdoor 15C.
@@ -1584,8 +1585,12 @@ class PublishSleepPlanGrounding(unittest.TestCase):
         # transparency attrs: raw weather peak vs the grounded value actually projected
         self.assertEqual(attrs["grounded"], "true")
         self.assertEqual(attrs["equilibrium_weather"], 24.7)
-        self.assertEqual(attrs["equilibrium_planned"], 23.0)   # min(24.7, 22.0 + 1.0)
+        # The anchor is the zone AT BEDTIME, not the reading at plan time: this harness has
+        # windows open and cool air outside, so the zone vents down before the room is sealed
+        # (2026-08-01). equilibrium_planned therefore sits below the old zone_now + 1.0 = 23.0.
+        self.assertLess(attrs["equilibrium_planned"], 23.0)
         self.assertEqual(attrs["bedroom_zone_now"], 22.0)      # max of floor/mid/kitchen
+        self.assertLess(attrs["zone_at_bedtime"], 22.0)        # projected forward, published
         self.assertEqual(attrs["night_outdoor_min"], 15.0)
         self.assertIn("Grounded on reality", attrs["detail"])
 
@@ -1660,6 +1665,7 @@ class PublishSleepPlanPricing(unittest.TestCase):
         app.cool_kw = 0.5
         app.ac_noise_penalty_kr = 0.5
         app.wm_reality_margin = 1.0
+        app.vent_tau_h = 7.0
         # Huge margin -> grounded_equilibrium's "warm night" branch always wins, so
         # plan_equilibrium == e_active (26.0) exactly and the target/deficit math below is
         # easy to hand-check (equally true via the apartment_now-None fallback when floor

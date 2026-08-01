@@ -142,6 +142,35 @@ def grounded_equilibrium(e_weather, apartment_now, night_outdoor, comfort_limit,
     return min(e_weather, apartment_now + reality_margin)
 
 
+def vented_zone_at(zone_now, vent_temp, hours, tau_h=7.0, min_gap_c=1.5):
+    """Where the bedroom zone lands after ``hours`` of FREE VENTING toward ``vent_temp``.
+
+    The advisory anchors "reality" on the zone temperature, but the room is not sealed until
+    bedtime -- so anchoring on the reading taken NOW treats a morning still holding yesterday's
+    heat as if it were tonight's starting point. On 2026-08-01 that produced "Set up the AC" at
+    08:34 with the zone at 23.4C, 6 windows open and 16C outside: by bedtime the room could not
+    possibly still be at 23.4C. Same class of mistake as the 2026-07-29 streak (judging window
+    feasibility on the dawn minimum) -- an advisory about TONIGHT must be evaluated on tonight's
+    conditions, not on the instant it happens to run.
+
+    Newton cooling toward the venting air: tau ~7 h for this bedroom with a window open,
+    from the measured 2026-07-20 free-cool (22->20C in 3 h against ~16C outdoor => gap x0.67,
+    tau = 3/ln(1.5) ~ 7.4 h). Deliberately conservative in the warm direction:
+      - no benefit claimed unless the air is at least ``min_gap_c`` cooler than the zone;
+      - the result never drops below ``vent_temp + 1`` (a vented room approaches outdoor, it
+        does not beat it);
+      - caller must only pass venting hours it believes will actually happen (windows open).
+    None-safe and monotonic: bad/missing inputs return ``zone_now`` unchanged (today's
+    behaviour), so a failure here can only make the plan warmer/safer, never cooler.
+    """
+    if zone_now is None or vent_temp is None or hours is None:
+        return zone_now
+    if hours <= 0 or zone_now - vent_temp < min_gap_c:
+        return zone_now
+    settled = vent_temp + (zone_now - vent_temp) * math.exp(-hours / max(0.5, tau_h))
+    return max(settled, vent_temp + 1.0)
+
+
 # ------------------------------------------------------------- coast law (one copy)
 
 def coast_peak(floor, equilibrium, rise_frac, zone_offset) -> Optional[float]:

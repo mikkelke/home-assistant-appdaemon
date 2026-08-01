@@ -281,6 +281,9 @@ class SmartCooling(hass.Hass):
         # warm night (night_outdoor >= comfort_limit - wm_warm_night_margin) keeps the raw
         # weather value so pre-cool-ahead-of-a-hot-night is preserved.
         self.wm_reality_margin = float(a("wm_reality_margin", 1.0))
+        # Free-cool time constant for the bedroom with a window open (measured 2026-07-20:
+        # 22->20C in 3 h against ~16C outdoor). Used to project the zone forward to bedtime.
+        self.vent_tau_h = float(a("vent_tau_h", 7.0))
         self.wm_warm_night_margin = float(a("wm_warm_night_margin", 1.0))
         self.wm_clearsky_peak = float(a("wm_clearsky_peak", 700.0))
         self.wm_cloud_atten = float(a("wm_cloud_atten", 0.75))
@@ -1718,9 +1721,30 @@ class SmartCooling(hass.Hass):
                              await self._num(self.kitchen_sensor, None)]
             zone_vals = [v for v in zone_readings if v is not None]
             bedroom_zone_now = max(zone_vals) if zone_vals else None
+            # Wake time is needed BEFORE the grounding below (bedtime = wake - sleep window),
+            # not only for the card's display line further down.
+            alarm_t = await self._state(self.alarm_time_entity)
+            alarm_on = (await self._state(self.alarm_enabled_entity)) == "on"
+            wake_dt = cm.resolve_wake(now, alarm_t, alarm_on,
+                                      self.fallback_workday, self.fallback_weekend)
             night_outdoor = await self._night_outdoor_min(now)
+            # The room is not sealed until BEDTIME, so anchor reality on where the zone will
+            # be THEN, not on this instant's reading (user 2026-08-01: "Set up the AC" at
+            # 08:34 with 6 windows open, 16C outside and a zone still holding yesterday's
+            # heat). Only claimed while windows are actually open and the air outside is
+            # genuinely cooler - otherwise the anchor stays exactly as it was.
+            zone_anchor = bedroom_zone_now
+            vent_hours = None
+            if wake_dt is not None and bedroom_zone_now is not None and open_windows:
+                bedtime_dt = wake_dt - timedelta(hours=self.sleep_hours)
+                vent_hours = max(0.0, (bedtime_dt - now).total_seconds() / 3600.0)
+                # Venting air over that stretch: the WARMER of outside-now and tonight's low,
+                # so a warm afternoon can't be modelled as if the night air were already here.
+                vent_air = max([v for v in (t_out, night_outdoor) if v is not None], default=None)
+                zone_anchor = cm.vented_zone_at(bedroom_zone_now, vent_air, vent_hours,
+                                                self.vent_tau_h)
             plan_equilibrium = cm.grounded_equilibrium(
-                e_active, bedroom_zone_now, night_outdoor, ceiling,
+                e_active, zone_anchor, night_outdoor, ceiling,
                 self.wm_reality_margin, self.wm_warm_night_margin)
             grounded = (plan_equilibrium is not None and e_active is not None
                         and plan_equilibrium < e_active - 0.05)
@@ -1773,10 +1797,6 @@ class SmartCooling(hass.Hass):
             # fallback via cm.resolve_wake) and what you'll wake TO. On an AC/hybrid plan
             # the promise assumes the pre-cool lands (coast from the priced target);
             # otherwise it's the plan's own no-AC coast peak. Display only.
-            alarm_t = await self._state(self.alarm_time_entity)
-            alarm_on = (await self._state(self.alarm_enabled_entity)) == "on"
-            wake_dt = cm.resolve_wake(now, alarm_t, alarm_on,
-                                      self.fallback_workday, self.fallback_weekend)
             wake_proj = plan.get("projected_peak")
             if (plan["recommendation"] in ("ac", "hybrid")
                     and plan_equilibrium is not None and floor is not None):
@@ -1826,6 +1846,8 @@ class SmartCooling(hass.Hass):
                 attrs["equilibrium_planned"] = round(plan_equilibrium, 1)
             if bedroom_zone_now is not None:
                 attrs["bedroom_zone_now"] = round(bedroom_zone_now, 1)
+            if zone_anchor is not None and bedroom_zone_now is not None and zone_anchor < bedroom_zone_now - 0.05:
+                attrs["zone_at_bedtime"] = round(zone_anchor, 1)
             if night_outdoor is not None:
                 attrs["night_outdoor_min"] = round(night_outdoor, 1)
             if wake_dt is not None:

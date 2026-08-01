@@ -581,3 +581,38 @@ class CoolingMinutes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VentedZoneAt(unittest.TestCase):
+    """Projecting the bedroom zone forward to bedtime while windows are open (2026-08-01)."""
+
+    def test_morning_heat_does_not_survive_a_vented_day(self):
+        # The 2026-08-01 case: zone 23.4 at 08:34, 16.3 outside, bedtime 15 h away.
+        settled = cm.vented_zone_at(23.4, 16.3, 15.2, 7.0)
+        self.assertLess(settled, 19.0)
+        self.assertGreater(settled, 16.3)
+
+    def test_never_beats_the_outside_air(self):
+        self.assertGreaterEqual(cm.vented_zone_at(30.0, 15.0, 48.0, 7.0), 16.0)
+
+    def test_no_benefit_when_outside_is_not_cooler(self):
+        self.assertEqual(cm.vented_zone_at(23.0, 22.5, 10.0, 7.0), 23.0)
+        self.assertEqual(cm.vented_zone_at(23.0, 25.0, 10.0, 7.0), 23.0)
+
+    def test_no_time_left_means_no_change(self):
+        self.assertEqual(cm.vented_zone_at(23.4, 16.0, 0.0, 7.0), 23.4)
+        self.assertEqual(cm.vented_zone_at(23.4, 16.0, -3.0, 7.0), 23.4)
+
+    def test_none_inputs_fall_back_to_the_reading(self):
+        self.assertIsNone(cm.vented_zone_at(None, 16.0, 5.0))
+        self.assertEqual(cm.vented_zone_at(23.4, None, 5.0), 23.4)
+        self.assertEqual(cm.vented_zone_at(23.4, 16.0, None), 23.4)
+
+    def test_monotonic_in_time(self):
+        a = cm.vented_zone_at(24.0, 15.0, 2.0, 7.0)
+        b = cm.vented_zone_at(24.0, 15.0, 8.0, 7.0)
+        self.assertLess(b, a)
+
+    def test_hot_night_case_is_untouched_by_grounding(self):
+        # A warm night keeps the weather peak regardless of any venting projection.
+        self.assertEqual(cm.grounded_equilibrium(26.0, 18.0, 22.0, 22.5), 26.0)
