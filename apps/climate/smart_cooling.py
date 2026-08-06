@@ -1637,12 +1637,19 @@ class SmartCooling(hass.Hass):
             ceiling = plan.get("limit")
             if E is None or ceiling is None:
                 return
-            target = self._calc_target(E, ceiling)
+            # Sized on what the unit can ACTUALLY do (house rule): cap the target at the
+            # plan's feasible floor, and gate the "still fits" check on reaching the learned
+            # WALL, not on crawling below it. Found 2026-08-06: the uncapped target plus the
+            # two-regime minutes (crawl 0.4C/h under the wall) made this gate mathematically
+            # unpassable every evening - the rescue had been silent since Jul 27 while four
+            # straight nights broke the ceiling (23.8/24.0/24.0/25.0).
+            target = max(self._calc_target(E, ceiling), self._plan_floor_limit())
             deficit = floor - target
             if deficit < self.rescue_deficit_min:
                 return
-            mins = self._cooling_minutes(floor, target)
-            # Still time to pre-cool the deficit away before the cutoff hour?
+            reachable = max(target, self._feasible_floor) if self._feasible_floor is not None else target
+            mins = self._cooling_minutes(floor, reachable)
+            # Still time to pre-cool meaningfully before the cutoff hour?
             if (self.rescue_to_hour - now.hour) * 60 < mins:
                 return
             if self.rescue_home_entity:
@@ -1738,11 +1745,26 @@ class SmartCooling(hass.Hass):
             if wake_dt is not None and bedroom_zone_now is not None and open_windows:
                 bedtime_dt = wake_dt - timedelta(hours=self.sleep_hours)
                 vent_hours = max(0.0, (bedtime_dt - now).total_seconds() / 3600.0)
-                # Venting air over that stretch: the WARMER of outside-now and tonight's low,
-                # so a warm afternoon can't be modelled as if the night air were already here.
-                vent_air = max([v for v in (t_out, night_outdoor) if v is not None], default=None)
-                zone_anchor = cm.vented_zone_at(bedroom_zone_now, vent_air, vent_hours,
-                                                self.vent_tau_h)
+                # Hour-by-hour against the FORECAST (2026-08-06): the scalar version vented
+                # toward "outdoor now", which at a morning plan time is the day's minimum -
+                # 15 h of dawn air that only exists for two. Warm midday hours now credit
+                # nothing, so the anchor stops promising a cool evening the day won't deliver.
+                fc = await self._get_forecast(now)
+                hourly_temps = []
+                if fc:
+                    now_naive = now.replace(tzinfo=None)
+                    bed_naive = bedtime_dt.replace(tzinfo=None)
+                    hourly_temps = [h["temp"] for h in fc
+                                    if h.get("temp") is not None
+                                    and now_naive <= h["dt"] <= bed_naive]
+                if hourly_temps:
+                    zone_anchor = cm.vented_zone_hours(bedroom_zone_now, hourly_temps,
+                                                       self.vent_tau_h)
+                else:
+                    # No forecast to walk: the old scalar heuristic, warmer-of-two air.
+                    vent_air = max([v for v in (t_out, night_outdoor) if v is not None], default=None)
+                    zone_anchor = cm.vented_zone_at(bedroom_zone_now, vent_air, vent_hours,
+                                                    self.vent_tau_h)
             plan_equilibrium = cm.grounded_equilibrium(
                 e_active, zone_anchor, night_outdoor, ceiling,
                 self.wm_reality_margin, self.wm_warm_night_margin)

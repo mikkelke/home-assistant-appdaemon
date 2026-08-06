@@ -1226,6 +1226,38 @@ class EveningRescue(unittest.TestCase):
         self._fire(app, now, floor=22.5)
         self.assertEqual(len(app._notified), 1)
 
+    def test_aug_2026_silence_regression_deep_target_no_longer_blocks(self):
+        # The Aug 2-5 2026 silence: E 26 with a trusted feasible floor 20.33 gave an
+        # uncapped target ~19, and the crawl regime (0.4C/h under the wall) priced the
+        # deficit at ~6h -- more evening than exists, so the gate never passed while four
+        # straight nights broke the ceiling. Capped target + wall-gated minutes must fire.
+        app = self._app(equilibrium=26.0, limit=23.0)
+        app._feasible_floor = 20.33
+        app._feasible_samples = 5
+        app.feasible_min_samples = 2
+        app.feasible_probe_c = 1.0
+        app._cool_cph = 1.2
+        app.cool_cph_min, app.cool_cph_max = 0.3, 4.0
+        app.rate_learn_min_headroom = 0.7
+        app.crawl_rate_cph = 0.4
+        now = datetime(2026, 8, 4, 18, 30)
+        self._fire(app, now, floor=23.8)
+        self.assertEqual(len(app._notified), 1)
+
+    def test_still_blocks_when_even_the_wall_cannot_be_reached_in_time(self):
+        # 22:40: twenty minutes of window left cannot pre-cool a 3.5C deficit - stay silent.
+        app = self._app(equilibrium=26.0, limit=23.0)
+        app._feasible_floor = 20.33
+        app._feasible_samples = 5
+        app.feasible_min_samples = 2
+        app.feasible_probe_c = 1.0
+        app._cool_cph = 1.2
+        app.cool_cph_min, app.cool_cph_max = 0.3, 4.0
+        app.rate_learn_min_headroom = 0.7
+        app.crawl_rate_cph = 0.4
+        self._fire(app, datetime(2026, 8, 4, 22, 40), floor=23.8)
+        self.assertEqual(app._notified, [])
+
     def test_windows_plan_never_fires(self):
         # THE 2026-07-23 regression: a warm-looking equilibrium but the plan's verdict is
         # windows (bedroom 21.6C, cool night incoming) -> the rescue must stay silent.

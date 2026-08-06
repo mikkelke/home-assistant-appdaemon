@@ -616,3 +616,31 @@ class VentedZoneAt(unittest.TestCase):
     def test_hot_night_case_is_untouched_by_grounding(self):
         # A warm night keeps the weather peak regardless of any venting projection.
         self.assertEqual(cm.grounded_equilibrium(26.0, 18.0, 22.0, 22.5), 26.0)
+
+
+class VentedZoneHours(unittest.TestCase):
+    """Hourly venting walk (2026-08-06): warm midday hours credit nothing, so a morning
+    plan can no longer treat dawn air as the whole day's venting supply."""
+
+    DAWN_TRAP_DAY = [17.5, 18.0, 19.5, 21.5, 23.5, 25.0, 26.0, 26.0, 25.5, 24.0, 22.0, 20.0, 18.5, 17.5, 17.0]
+
+    def test_midday_heat_blocks_the_dawn_optimism(self):
+        hours = cm.vented_zone_hours(23.4, self.DAWN_TRAP_DAY, 7.0)
+        scalar = cm.vented_zone_at(23.4, 17.5, len(self.DAWN_TRAP_DAY), 7.0)
+        self.assertGreater(hours, scalar)   # strictly less optimistic than dawn-air-all-day
+        self.assertGreater(hours, 18.5)     # does not promise the flat beats the day
+
+    def test_cool_evening_hours_still_pull_it_down(self):
+        hours = cm.vented_zone_hours(23.4, self.DAWN_TRAP_DAY, 7.0)
+        self.assertLess(hours, 23.4)
+
+    def test_all_warm_hours_change_nothing(self):
+        self.assertEqual(cm.vented_zone_hours(23.0, [24.0, 26.0, 25.0], 7.0), 23.0)
+
+    def test_never_beats_the_coolest_credited_hour(self):
+        self.assertGreaterEqual(cm.vented_zone_hours(30.0, [15.0] * 48, 7.0), 16.0)
+
+    def test_empty_or_none_inputs_fall_back(self):
+        self.assertEqual(cm.vented_zone_hours(23.0, [], 7.0), 23.0)
+        self.assertIsNone(cm.vented_zone_hours(None, [17.0], 7.0))
+        self.assertEqual(cm.vented_zone_hours(23.0, [None, None], 7.0), 23.0)

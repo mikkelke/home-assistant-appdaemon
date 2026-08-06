@@ -171,6 +171,40 @@ def vented_zone_at(zone_now, vent_temp, hours, tau_h=7.0, min_gap_c=1.5):
     return max(settled, vent_temp + 1.0)
 
 
+def vented_zone_hours(zone_now, hourly_temps, tau_h=7.0, min_gap_c=1.5):
+    """Hour-by-hour version of vented_zone_at: walk the venting window one hour at a time,
+    cooling toward THAT hour's forecast outdoor temp, and crediting only hours genuinely
+    cooler than the zone (min_gap_c). Warm hours change nothing - no cooling credit, and no
+    heating either (the household closes windows when it's hotter outside, and day-heat is
+    already the weather model's job).
+
+    Why not the scalar version: it vented toward max(outdoor-now, night-low) for the WHOLE
+    window, and a plan computed at 08:30 reads the day's minimum as "outdoor-now" - so a
+    15 h projection cooled toward dawn air that only exists for two of those hours. That
+    made the mornings of 2026-08-03/05 say windows/nothing while the flat heat-soaked into
+    24.0C and 25.0C nights. Feeding the actual forecast hours kills the dawn optimism: the
+    22-26C midday hours credit nothing, and only the genuinely cool evening hours pull the
+    anchor down.
+
+    None-safe and conservative: no/empty forecast returns zone_now unchanged (the caller
+    falls back to the scalar heuristic or the raw reading); the result never drops below
+    the coolest credited hour + 1 (venting approaches outdoor, it does not beat it)."""
+    if zone_now is None or not hourly_temps:
+        return zone_now
+    zone = zone_now
+    floor_seen = None
+    for temp in hourly_temps:
+        if temp is None:
+            continue
+        if zone - temp < min_gap_c:
+            continue
+        zone = temp + (zone - temp) * math.exp(-1.0 / max(0.5, tau_h))
+        floor_seen = temp if floor_seen is None else min(floor_seen, temp)
+    if floor_seen is not None:
+        zone = max(zone, floor_seen + 1.0)
+    return zone
+
+
 # ------------------------------------------------------------- coast law (one copy)
 
 def coast_peak(floor, equilibrium, rise_frac, zone_offset) -> Optional[float]:
