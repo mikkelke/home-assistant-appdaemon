@@ -4,7 +4,7 @@ import asyncio
 import sys
 import types
 import unittest
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -254,6 +254,19 @@ def _make_app(now=datetime(2026, 7, 22, 6, 0), from_hour=5, until_hour=12,
         app._notified.append((title, message))
         return True
     app._notify = _notify
+
+    # Stability guard + stand-down state (2026-08-06); run_in captured for assertions.
+    app.stability_min = 15
+    app.stability_retry_min = 10
+    app._stability_retry_date = None
+    app.stand_down_enabled = True
+    app._sent_rec = None
+    app._stand_down_date = None
+    app._run_in_calls = []
+
+    def run_in(cb, delay, **kw):
+        app._run_in_calls.append((cb, delay))
+    app.run_in = run_in
 
     return app
 
@@ -713,3 +726,92 @@ class WakeNowButton(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StabilityGuard(unittest.TestCase):
+    """Gate 5 (2026-08-06): a briefing must not compose mid-flap. Aug 3 it pushed
+    "Deploy the AC 6.3 kr" at 08:14, minutes before the plan flipped to windows."""
+
+    def _attrs_with_rec_since(self, minutes_old):
+        a = dict(PLAN_ATTRS)
+        a["rec_since"] = (datetime(2026, 7, 22, 6, 0) - timedelta(minutes=minutes_old)).isoformat()
+        return a
+
+    def test_fresh_flip_holds_once_and_schedules_a_retry(self):
+        app = _make_app(plan_attrs=self._attrs_with_rec_since(5))
+        _run(app)
+        self.assertEqual(app._notified, [])
+        self.assertEqual(len(app._run_in_calls), 1)
+        self.assertEqual(app._run_in_calls[0][1], 600)
+        self.assertIsNone(app._sent_date)   # the day is NOT consumed
+
+    def test_retry_sends_even_if_still_flapping(self):
+        app = _make_app(plan_attrs=self._attrs_with_rec_since(5))
+        _run(app)            # holds
+        _run(app)            # the retry: retried-today marker set -> sends regardless
+        self.assertEqual(len(app._notified), 1)
+
+    def test_stable_rec_sends_immediately(self):
+        app = _make_app(plan_attrs=self._attrs_with_rec_since(45))
+        _run(app)
+        self.assertEqual(len(app._notified), 1)
+        self.assertEqual(app._run_in_calls, [])
+
+    def test_missing_rec_since_sends_immediately(self):
+        app = _make_app(plan_attrs=PLAN_ATTRS)
+        _run(app)
+        self.assertEqual(len(app._notified), 1)
+
+    def test_sent_rec_is_recorded_for_the_stand_down(self):
+        app = _make_app(plan_state="ac", plan_attrs=PLAN_ATTRS)
+        _run(app)
+        self.assertEqual(app._sent_rec, "ac")
+
+
+class StandDown(unittest.TestCase):
+    """The rescue's inverse: morning said set-up/deploy/arm, evening plan says windows/
+    nothing -> one push so the unit isn't carried in for a night that sorted itself."""
+
+    def _app(self, sent_rec="ac", sent_date="2026-07-22", plan_state="windows",
+             person="home", stand_down_date=None):
+        app = _make_app(person=person, plan_state=plan_state, plan_attrs=PLAN_ATTRS)
+        app._sent_date = sent_date
+        app._sent_rec = sent_rec
+        app._stand_down_date = stand_down_date
+        return app
+
+    def _check(self, app):
+        asyncio.run(app._maybe_stand_down())
+
+    def test_downgrade_fires_once(self):
+        app = self._app()
+        self._check(app)
+        self.assertEqual(len(app._notified), 1)
+        self.assertEqual(app._notified[0][0], "AC not needed after all")
+        self.assertEqual(app._stand_down_date, "2026-07-22")
+        self._check(app)
+        self.assertEqual(len(app._notified), 1)
+
+    def test_morning_windows_never_fires(self):
+        app = self._app(sent_rec="windows")
+        self._check(app)
+        self.assertEqual(app._notified, [])
+
+    def test_evening_still_ac_never_fires(self):
+        app = self._app(plan_state="ac")
+        self._check(app)
+        self.assertEqual(app._notified, [])
+
+    def test_away_suppresses_without_consuming(self):
+        app = self._app(person="not_home")
+        self._check(app)
+        self.assertEqual(app._notified, [])
+        self.assertIsNone(app._stand_down_date)
+        app._states[app.person_entity] = "home"
+        self._check(app)
+        self.assertEqual(len(app._notified), 1)
+
+    def test_no_briefing_today_never_fires(self):
+        app = self._app(sent_date="2026-07-21")
+        self._check(app)
+        self.assertEqual(app._notified, [])

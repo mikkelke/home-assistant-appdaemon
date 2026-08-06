@@ -51,6 +51,7 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 import asyncio
 import json
 from datetime import time
+from datetime import datetime
 from typing import Optional
 
 
@@ -97,8 +98,22 @@ class MorningBriefing(hass.Hass):
         self.notify_icon = a("notify_icon", "mdi:bed-clock")
         self.click_url = a("click_url", "")
         self.state_file = a("state_file", "/conf/apps/climate/morning_briefing_state.json")
+        # Send-time stability (2026-08-06): if the plan's recommendation changed within the
+        # last stability_min minutes, hold ONE retry of stability_retry_min before composing.
+        # Aug 3 the briefing pushed "Deploy the AC 6.3 kr" at 08:14, minutes before the plan
+        # flipped -- the phone and the dashboard disagreed within the hour.
+        self.stability_min = int(a("stability_min", 15))
+        self.stability_retry_min = int(a("stability_retry_min", 10))
+        # Evening stand-down (2026-08-06): when the morning said set-up/deploy/arm and the
+        # plan has downgraded to windows/nothing by evening, say so ONCE -- the inverse of
+        # SmartCooling's rescue, riding the same once-per-day + home-suppression rules.
+        self.stand_down_enabled = bool(a("stand_down_enabled", True))
+        self.stand_down_times = a("stand_down_times", ["18:00:00", "20:30:00"])
 
         self._sent_date: Optional[str] = None
+        self._sent_rec: Optional[str] = None
+        self._stand_down_date: Optional[str] = None
+        self._stability_retry_date: Optional[str] = None
         self._load_state()
         # Serializes _handle_wake(): the alarm/fallback/alarm-disabled triggers can each
         # schedule their own create_task on near-simultaneous events (e.g. the fallback's
@@ -126,6 +141,9 @@ class MorningBriefing(hass.Hass):
         # Alarm run: (re)scheduled now and whenever the alarm datetime changes.
         self._alarm_timer = None
         self._schedule_alarm_run()
+        if self.stand_down_enabled:
+            for t in self.stand_down_times:
+                self.run_daily(self._on_stand_down_fire, t)
         self.listen_state(self._on_alarm_time_changed, self.alarm_time_entity)
         # Alarm turned off mid-morning (woke early / cancelled) -> send right now instead of
         # waiting for the fallback -- still gated to the sanity window (see the callback).
@@ -147,13 +165,17 @@ class MorningBriefing(hass.Hass):
             with open(self.state_file) as f:
                 d = json.load(f)
             self._sent_date = d.get("sent_date")
+            self._sent_rec = d.get("sent_rec")
+            self._stand_down_date = d.get("stand_down_date")
         except Exception:
             pass
 
     def _save_state(self):
         try:
             with open(self.state_file, "w") as f:
-                json.dump({"sent_date": self._sent_date}, f)
+                json.dump({"sent_date": self._sent_date,
+                           "sent_rec": self._sent_rec,
+                           "stand_down_date": self._stand_down_date}, f)
         except Exception as e:
             self.log(f"state save failed ({e}) -- continuing in-memory", level="WARNING")
 
@@ -301,6 +323,25 @@ class MorningBriefing(hass.Hass):
                          f"skipping (will retry on the next wake trigger)", level="WARNING")
                 return
 
+            # Gate 5 (2026-08-06): don't compose mid-flap. If the recommendation is
+            # younger than stability_min, hold ONE retry -- a briefing too late is worse
+            # than one mid-flap, so the retry always sends whatever stands then.
+            today_retry = now.strftime("%Y-%m-%d")
+            rec_since_raw = plan_attrs.get("rec_since")
+            if rec_since_raw and self._stability_retry_date != today_retry:
+                age_min = None
+                try:
+                    since = datetime.fromisoformat(str(rec_since_raw)).replace(tzinfo=None)
+                    age_min = (now - since).total_seconds() / 60.0
+                except ValueError:
+                    pass
+                if age_min is not None and 0 <= age_min < self.stability_min:
+                    self._stability_retry_date = today_retry
+                    self.run_in(self._on_stability_retry, self.stability_retry_min * 60)
+                    self.log(f"plan flipped {age_min:.0f} min ago -- holding the briefing "
+                             f"{self.stability_retry_min} min for stability", level="INFO")
+                    return
+
             status_attrs = await self._attrs(self.status_entity)
             climate_state = await self._state(self.climate_entity)
             ac_deployed = climate_state not in (None, "unavailable", "unknown")
@@ -313,10 +354,48 @@ class MorningBriefing(hass.Hass):
                 return
 
             self._sent_date = today
+            self._sent_rec = plan_state
             self._save_state()
             self.log(f"Morning briefing sent -- {title}: {message}", level="INFO")
         except Exception as e:
             self.log(f"morning briefing handler failed ({e})", level="WARNING")
+
+    def _on_stability_retry(self, kwargs):
+        self._fire_wake("stability retry")
+
+    def _on_stand_down_fire(self, kwargs):
+        self.create_task(self._maybe_stand_down())
+
+    async def _maybe_stand_down(self):
+        """The rescue's inverse (2026-08-06): the morning said set-up/deploy/arm, the plan
+        has since downgraded to windows/nothing -- say so once, in the evening, so the unit
+        never gets carried in for a night that sorted itself. Same manners as the rescue:
+        a live not_home suppresses WITHOUT consuming the day; once per calendar day."""
+        try:
+            if not self.stand_down_enabled:
+                return
+            now = (await self.get_now()).replace(tzinfo=None)
+            today = now.strftime("%Y-%m-%d")
+            if self._stand_down_date == today:
+                return
+            if self._sent_date != today or self._sent_rec not in ("ac", "hybrid"):
+                return
+            plan_state = await self._state(self.sleep_plan_entity)
+            if plan_state not in ("windows", "nothing"):
+                return
+            person = await self._state(self.person_entity)
+            if person == "not_home":
+                return
+            body = "Skip the AC. Keep windows open." if plan_state == "windows" else \
+                "Skip the AC. The bedroom stays cool on its own."
+            if not await self._notify("AC not needed after all", body):
+                return
+            self._stand_down_date = today
+            self._save_state()
+            self.log(f"Stand-down sent -- morning said {self._sent_rec}, plan now {plan_state}",
+                     level="INFO")
+        except Exception as e:
+            self.log(f"stand-down check failed ({e}) -- skipping", level="WARNING")
 
     # ---------- notify ----------
     def _notify_data(self):

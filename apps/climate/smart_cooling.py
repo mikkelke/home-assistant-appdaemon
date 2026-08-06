@@ -284,6 +284,11 @@ class SmartCooling(hass.Hass):
         # Free-cool time constant for the bedroom with a window open (measured 2026-07-20:
         # 22->20C in 3 h against ~16C outdoor). Used to project the zone forward to bedtime.
         self.vent_tau_h = float(a("vent_tau_h", 7.0))
+        # ONE REALITY for actuation (user 2026-08-06 "do all three"): the armed controller's
+        # equilibrium is capped at the sleep plan's grounded value from the same tick, so the
+        # compressor can't chase the raw kitchen-proxy E through a night the plan itself
+        # called mild (Fri Jul 31: 594 engaged min / 4.5 kWh for a 22.3C-peak night).
+        self.ground_actuation = bool(a("ground_actuation", True))
         self.wm_warm_night_margin = float(a("wm_warm_night_margin", 1.0))
         self.wm_clearsky_peak = float(a("wm_clearsky_peak", 700.0))
         self.wm_cloud_atten = float(a("wm_cloud_atten", 0.75))
@@ -431,6 +436,11 @@ class SmartCooling(hass.Hass):
         # Latest sleep-plan verdict (stashed by _publish_sleep_plan each tick); the evening
         # rescue DELIVERS this instead of computing its own projection -- one brain.
         self._last_plan = None
+        self._last_ground_logged: Optional[float] = None
+        # Advisory-recommendation stability tracking, published as rec_since for the
+        # briefing's send-time guard (2026-08-06).
+        self._plan_rec_prev: Optional[str] = None
+        self._plan_rec_since = None
         self._last_wake_floor = None  # last coast-learn's end floor -- the morning receipt
         # One evening-rescue advisory per calendar day (YYYY-MM-DD, or None). The rollover
         # is implicit: a new day's date != the stored one, so the next qualifying evening
@@ -1137,6 +1147,30 @@ class SmartCooling(hass.Hass):
             self.log(f"weather-model equilibrium failed ({e}) -- using legacy", level="WARNING")
             return e_legacy, dbg
 
+    def _actuation_equilibrium(self, e_active, e_legacy, now):
+        """The equilibrium the ARMED controller pursues. Shadow semantics unchanged (the
+        weather model only drives when out of shadow) -- but ONE REALITY (user 2026-08-06):
+        the result is capped at the sleep plan's grounded equilibrium from this tick, so
+        actuation and advisory can never disagree about how warm tonight is. Cap only,
+        never deepen; a missing or stale plan stash leaves E exactly as before, and
+        ground_actuation: false restores the old behaviour entirely."""
+        E = e_active if (self.weather_model_enabled and not self.wm_shadow) else e_legacy
+        if not self.ground_actuation or E is None:
+            return E
+        plan = self._last_plan
+        if not plan or plan.get("equilibrium") is None:
+            return E
+        at = plan.get("at")
+        if at is None or (now - at).total_seconds() > self.interval_min * 90:
+            return E
+        capped = min(E, plan["equilibrium"])
+        if capped < E - 0.05 and (self._last_ground_logged is None
+                                  or abs(capped - self._last_ground_logged) > 0.3):
+            self.log(f"actuation equilibrium grounded {E:.1f} -> {capped:.1f}C "
+                     f"(one reality with the sleep plan)", level="INFO")
+            self._last_ground_logged = capped
+        return capped
+
     def _calc_target(self, E, ceiling):
         """Floor target so the sleeping zone stays <= ceiling for the window. The mid wall sits
         ~zone_offset above the floor, so cap the FLOOR peak at (ceiling - zone_offset). The floor
@@ -1809,7 +1843,11 @@ class SmartCooling(hass.Hass):
                                "equilibrium": plan_equilibrium,
                                "limit": ceiling,
                                "peak": plan.get("projected_peak"),
-                               "deficit": plan.get("deficit")}
+                               "deficit": plan.get("deficit"),
+                               "at": now}
+            if plan["recommendation"] != self._plan_rec_prev:
+                self._plan_rec_prev = plan["recommendation"]
+                self._plan_rec_since = now
             detail = plan["detail"]
             if grounded:
                 detail += (f" (Grounded on reality: the bedroom zone is ~{bedroom_zone_now:.1f}C "
@@ -1866,6 +1904,10 @@ class SmartCooling(hass.Hass):
                 attrs["equilibrium_weather"] = round(e_active, 1)
             if plan_equilibrium is not None:
                 attrs["equilibrium_planned"] = round(plan_equilibrium, 1)
+            if self._plan_rec_since is not None:
+                # For the briefing's mid-flap guard: how long the current recommendation
+                # has stood (2026-08-06; Aug 3 pushed "Deploy 6.3 kr" minutes before a flip).
+                attrs["rec_since"] = self._plan_rec_since.isoformat()
             if bedroom_zone_now is not None:
                 attrs["bedroom_zone_now"] = round(bedroom_zone_now, 1)
             if zone_anchor is not None and bedroom_zone_now is not None and zone_anchor < bedroom_zone_now - 0.05:
@@ -2011,7 +2053,7 @@ class SmartCooling(hass.Hass):
         # it's enabled and out of shadow. While wm_shadow is true, E == e_legacy exactly
         # (zero actuation change) and the weather value rides along on the status entity for
         # predicted-vs-actual validation. e_legacy/e_active/wm_dbg were computed above.
-        E = e_active if (self.weather_model_enabled and not self.wm_shadow) else e_legacy
+        E = self._actuation_equilibrium(e_active, e_legacy, now)
         target = self._calc_target(E, ceiling)
         deficit = floor - target
         floor_limited = target <= self.min_temp + 0.05  # hot night: cooling as deep as the unit allows

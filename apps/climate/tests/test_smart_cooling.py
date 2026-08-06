@@ -61,6 +61,10 @@ def make_app(**overrides):
     app.feasible_probe_c = overrides.get("feasible_probe_c", 1.0)
     app.rate_learn_min_headroom = overrides.get("rate_learn_min_headroom", 0.7)
     app.crawl_rate_cph = overrides.get("crawl_rate_cph", 0.4)
+    app.ground_actuation = overrides.get("ground_actuation", True)
+    app._last_ground_logged = None
+    app._plan_rec_prev = None
+    app._plan_rec_since = None
     # wake display knobs (resolve_wake inputs; display-only)
     app.alarm_time_entity = "input_datetime.wakeup_bedroom"
     app.alarm_enabled_entity = "input_boolean.wakeup_bedroom"
@@ -2522,3 +2526,50 @@ class CoolIntervalsPersistence(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ActuationGrounding(unittest.TestCase):
+    """One reality (2026-08-06): the armed controller's equilibrium is capped at the sleep
+    plan's grounded value. Fri Jul 31 the plan said windows/nothing all evening while the
+    armed path burned 594 engaged minutes chasing the raw kitchen-proxy E."""
+
+    def _app(self, **kw):
+        app = make_app(**kw)
+        app.interval_min = 15
+        # Pin the live configuration: model computes in SHADOW, so actuation E = e_legacy.
+        app.weather_model_enabled = True
+        app.wm_shadow = True
+        return app
+
+    def test_fresh_plan_caps_the_legacy_equilibrium(self):
+        app = self._app()
+        now = datetime(2026, 7, 31, 18, 0)
+        app._last_plan = {"rec": "windows", "equilibrium": 22.6, "at": now}
+        self.assertAlmostEqual(app._actuation_equilibrium(26.0, 24.5, now), 22.6)
+
+    def test_never_deepens_a_cooler_raw_equilibrium(self):
+        app = self._app()
+        now = datetime(2026, 7, 31, 18, 0)
+        app._last_plan = {"rec": "ac", "equilibrium": 26.0, "at": now}
+        self.assertAlmostEqual(app._actuation_equilibrium(27.0, 23.0, now), 23.0)
+
+    def test_stale_stash_leaves_e_untouched(self):
+        app = self._app()
+        now = datetime(2026, 7, 31, 18, 0)
+        app._last_plan = {"rec": "windows", "equilibrium": 20.0,
+                          "at": now - timedelta(minutes=60)}
+        self.assertAlmostEqual(app._actuation_equilibrium(26.0, 24.5, now), 24.5)
+
+    def test_kill_switch_restores_old_behaviour(self):
+        app = self._app(ground_actuation=False)
+        now = datetime(2026, 7, 31, 18, 0)
+        app._last_plan = {"rec": "windows", "equilibrium": 20.0, "at": now}
+        self.assertAlmostEqual(app._actuation_equilibrium(26.0, 24.5, now), 24.5)
+
+    def test_shadow_off_grounds_the_weather_equilibrium_too(self):
+        app = self._app()
+        app.weather_model_enabled = True
+        app.wm_shadow = False
+        now = datetime(2026, 7, 31, 18, 0)
+        app._last_plan = {"rec": "windows", "equilibrium": 22.0, "at": now}
+        self.assertAlmostEqual(app._actuation_equilibrium(26.0, 24.5, now), 22.0)
