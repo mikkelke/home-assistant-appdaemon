@@ -289,6 +289,15 @@ class SmartCooling(hass.Hass):
         # compressor can't chase the raw kitchen-proxy E through a night the plan itself
         # called mild (Fri Jul 31: 594 engaged min / 4.5 kWh for a 22.3C-peak night).
         self.ground_actuation = bool(a("ground_actuation", True))
+        # Venting-path awareness (user 2026-08-07): the 7 h venting constant was measured
+        # with the bedroom window open AND the curtain aside. With the curtain across (they
+        # close it to sleep; 25C at wake beside a fully open window) or the bedroom window
+        # shut, the zone only cools indirectly through the rest of the flat - half speed.
+        # cover.bedroom_blind is bottom-up and INVERTED: position 100 = closed.
+        self.curtain_entity = a("curtain_entity", "cover.bedroom_blind")
+        self.curtain_open_max_pos = float(a("curtain_open_max_pos", 30))
+        self.bedroom_window_name = a("bedroom_window_name", "bedroom")
+        self.vent_tau_indirect_h = float(a("vent_tau_indirect_h", 14.0))
         self.wm_warm_night_margin = float(a("wm_warm_night_margin", 1.0))
         self.wm_clearsky_peak = float(a("wm_clearsky_peak", 700.0))
         self.wm_cloud_atten = float(a("wm_cloud_atten", 0.75))
@@ -1147,6 +1156,16 @@ class SmartCooling(hass.Hass):
             self.log(f"weather-model equilibrium failed ({e}) -- using legacy", level="WARNING")
             return e_legacy, dbg
 
+    def _vent_tau(self, bedroom_window_open, curtain_pos):
+        """Venting speed for the zone-at-bedtime projection. Direct (measured 7 h,
+        2026-07-20 free-cool) needs the bedroom window open AND the curtain genuinely
+        aside; anything else vents the bedroom only through the rest of the flat, taken as
+        half speed. An unreadable curtain position counts as closed - erring warm/safe."""
+        if (bedroom_window_open and curtain_pos is not None
+                and curtain_pos <= self.curtain_open_max_pos):
+            return self.vent_tau_h
+        return self.vent_tau_indirect_h
+
     def _actuation_equilibrium(self, e_active, e_legacy, now):
         """The equilibrium the ARMED controller pursues. Shadow semantics unchanged (the
         weather model only drives when out of shadow) -- but ONE REALITY (user 2026-08-06):
@@ -1783,6 +1802,13 @@ class SmartCooling(hass.Hass):
                 # toward "outdoor now", which at a morning plan time is the day's minimum -
                 # 15 h of dawn air that only exists for two. Warm midday hours now credit
                 # nothing, so the anchor stops promising a cool evening the day won't deliver.
+                curtain_pos_raw = await self._attr(self.curtain_entity, "current_position", None)
+                try:
+                    curtain_pos = float(curtain_pos_raw) if curtain_pos_raw is not None else None
+                except (TypeError, ValueError):
+                    curtain_pos = None
+                bedroom_open = contacts.get(self.bedroom_window_name) == "on"
+                vent_tau = self._vent_tau(bedroom_open, curtain_pos)
                 fc = await self._get_forecast(now)
                 hourly_temps = []
                 if fc:
@@ -1793,12 +1819,12 @@ class SmartCooling(hass.Hass):
                                     and now_naive <= h["dt"] <= bed_naive]
                 if hourly_temps:
                     zone_anchor = cm.vented_zone_hours(bedroom_zone_now, hourly_temps,
-                                                       self.vent_tau_h)
+                                                       vent_tau)
                 else:
                     # No forecast to walk: the old scalar heuristic, warmer-of-two air.
                     vent_air = max([v for v in (t_out, night_outdoor) if v is not None], default=None)
                     zone_anchor = cm.vented_zone_at(bedroom_zone_now, vent_air, vent_hours,
-                                                    self.vent_tau_h)
+                                                    vent_tau)
             plan_equilibrium = cm.grounded_equilibrium(
                 e_active, zone_anchor, night_outdoor, ceiling,
                 self.wm_reality_margin, self.wm_warm_night_margin)
@@ -1912,6 +1938,7 @@ class SmartCooling(hass.Hass):
                 attrs["bedroom_zone_now"] = round(bedroom_zone_now, 1)
             if zone_anchor is not None and bedroom_zone_now is not None and zone_anchor < bedroom_zone_now - 0.05:
                 attrs["zone_at_bedtime"] = round(zone_anchor, 1)
+                attrs["vent_mode"] = "direct" if vent_tau == self.vent_tau_h else "indirect"
             if night_outdoor is not None:
                 attrs["night_outdoor_min"] = round(night_outdoor, 1)
             if wake_dt is not None:

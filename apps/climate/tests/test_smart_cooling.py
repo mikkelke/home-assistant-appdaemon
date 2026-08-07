@@ -62,6 +62,11 @@ def make_app(**overrides):
     app.rate_learn_min_headroom = overrides.get("rate_learn_min_headroom", 0.7)
     app.crawl_rate_cph = overrides.get("crawl_rate_cph", 0.4)
     app.ground_actuation = overrides.get("ground_actuation", True)
+    app.vent_tau_h = overrides.get("vent_tau_h", 7.0)
+    app.curtain_entity = "cover.bedroom_blind"
+    app.curtain_open_max_pos = 30.0
+    app.bedroom_window_name = "bedroom"
+    app.vent_tau_indirect_h = overrides.get("vent_tau_indirect_h", 14.0)
     app._last_ground_logged = None
     app._plan_rec_prev = None
     app._plan_rec_since = None
@@ -2573,3 +2578,27 @@ class ActuationGrounding(unittest.TestCase):
         now = datetime(2026, 7, 31, 18, 0)
         app._last_plan = {"rec": "windows", "equilibrium": 22.0, "at": now}
         self.assertAlmostEqual(app._actuation_equilibrium(26.0, 24.5, now), 22.0)
+
+
+class VentTauSelection(unittest.TestCase):
+    """Direct venting (measured 7 h) needs the bedroom window open AND the curtain aside;
+    everything else is the indirect half-speed path (user 2026-08-07: 25C at wake beside a
+    fully open window, curtain across)."""
+
+    def test_open_window_and_open_curtain_is_direct(self):
+        app = make_app()
+        self.assertEqual(app._vent_tau(True, 0.0), app.vent_tau_h)
+        self.assertEqual(app._vent_tau(True, 30.0), app.vent_tau_h)
+
+    def test_solar_shade_position_counts_as_closed(self):
+        # The shade parks at 77 (bottom-up, inverted: 100 = closed) - that chokes airflow.
+        app = make_app()
+        self.assertEqual(app._vent_tau(True, 77.0), app.vent_tau_indirect_h)
+
+    def test_shut_bedroom_window_is_indirect_regardless(self):
+        app = make_app()
+        self.assertEqual(app._vent_tau(False, 0.0), app.vent_tau_indirect_h)
+
+    def test_unreadable_curtain_errs_warm(self):
+        app = make_app()
+        self.assertEqual(app._vent_tau(True, None), app.vent_tau_indirect_h)
