@@ -437,6 +437,7 @@ def make_full_init_app(sensor_state, helper_state=None, ui_state_entity="input_s
     app.get_state = lambda entity, **kw: app.states.get(entity)
     app.get_app = lambda name: None
     app.listen_state = lambda *a, **kw: None
+    app.listen_event = lambda *a, **kw: None
     app.call_service = lambda *a, **kw: None
     app.timer_running = lambda handle: False
 
