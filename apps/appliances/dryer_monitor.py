@@ -969,15 +969,20 @@ class DryerMonitor(hass.Hass):
         self.log(f"Feedback saved: {confirmed} duration {duration_min:.0f}min energy {energy_kwh:.2f}kWh", level="INFO")
 
     def _should_change_state(self, new_state, force=False):
-        """Check if we should allow a state change."""
+        """Check if we should allow a state change.
+
+        The clock is UTC, never local wall time: at the October DST fall-back local time
+        repeats an hour, so a naive datetime.now() makes the delta negative for that hour
+        and every un-forced transition gets refused - the swallow that wedged Paused and
+        Emptied, but house-wide and for a whole hour. Washer already reads UTC here.
+        """
         if self.get_state(self.state_entity) == new_state:
             return False
-        if not force:
-            now = datetime.now()
-            if self.last_state_change and (now - self.last_state_change).total_seconds() < self.cooling_period:
-                self.log(f"In cooling period", level="DEBUG")
-                return False
-        self.last_state_change = datetime.now()
+        now = self._now_utc()
+        if not force and self.last_state_change and (now - self.last_state_change).total_seconds() < self.cooling_period:
+            self.log(f"In cooling period", level="DEBUG")
+            return False
+        self.last_state_change = now
         return True
 
     def _record_power_reading(self, watts):
@@ -1738,7 +1743,8 @@ class DryerMonitor(hass.Hass):
             level="WARNING",
         )
         self.state = "Off"
-        self.last_state_change = datetime.now()
+        # UTC, to stay comparable with _should_change_state's clock (see its docstring).
+        self.last_state_change = self._now_utc()
         self._set_state_entity( state="Off")
         self._reset_programme_selectors_to_unconfirmed()
         self._reset_cycle_tracking()

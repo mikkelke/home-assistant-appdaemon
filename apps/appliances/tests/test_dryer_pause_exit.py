@@ -20,7 +20,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -137,7 +137,7 @@ class DoorClosedFromPausedBypassesCoolingPeriod(unittest.TestCase):
         app = make_app()
         app.states[app.state_entity] = "Paused"
         app.state = "Paused"
-        app.last_state_change = datetime.now()  # inside the 600s cooling window
+        app.last_state_change = app._now_utc()  # inside the 600s cooling window
         return app
 
     def test_low_power_invalid_cycle_transitions_to_off_despite_cooling_period(self):
@@ -174,7 +174,7 @@ class PollPowerPausedDoorReconciler(unittest.TestCase):
         app = make_app()
         app.states[app.state_entity] = "Paused"
         app.state = "Paused"
-        app.last_state_change = datetime.now()  # inside the 600s cooling window
+        app.last_state_change = app._now_utc()  # inside the 600s cooling window
         if door_state is not None:
             app.states[app.door_sensor] = door_state
         # Reached only when the reconciler condition is False (falls through to the regular
@@ -245,7 +245,7 @@ class UnforcedTransitionsStillRefuseInsideCoolingPeriod(unittest.TestCase):
         app = make_app()
         app.states[app.state_entity] = "Paused"
         app.state = "Paused"
-        app.last_state_change = datetime.now()  # inside the 600s cooling window
+        app.last_state_change = app._now_utc()  # inside the 600s cooling window
         app._transition_to_off("some reason")
         self.assertEqual(app.state, "Paused")
         self.assertEqual(app.set_state_calls, [])
@@ -254,7 +254,7 @@ class UnforcedTransitionsStillRefuseInsideCoolingPeriod(unittest.TestCase):
         app = make_app()
         app.states[app.state_entity] = "Paused"
         app.state = "Paused"
-        app.last_state_change = datetime.now()  # inside the 600s cooling window
+        app.last_state_change = app._now_utc()  # inside the 600s cooling window
         app._transition_to_unemptied()
         self.assertEqual(app.state, "Paused")
         self.assertEqual(app.set_state_calls, [])
