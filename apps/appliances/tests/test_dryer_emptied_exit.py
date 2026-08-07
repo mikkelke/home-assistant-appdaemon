@@ -171,7 +171,7 @@ def make_emptied_app():
     app = make_app()
     app.states[app.state_entity] = "Emptied"
     app.state = "Emptied"
-    app.last_state_change = datetime.now()
+    app.last_state_change = app._now_utc()
     return app
 
 
