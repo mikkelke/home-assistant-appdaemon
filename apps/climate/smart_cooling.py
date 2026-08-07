@@ -295,9 +295,16 @@ class SmartCooling(hass.Hass):
         # shut, the zone only cools indirectly through the rest of the flat - half speed.
         # cover.bedroom_blind is bottom-up and INVERTED: position 100 = closed.
         self.curtain_entity = a("curtain_entity", "cover.bedroom_blind")
-        self.curtain_open_max_pos = float(a("curtain_open_max_pos", 30))
+        # 38 is this blind's FULLY-OPEN park position (user 2026-08-07: the openable
+        # part of the window is uncovered there) - hence 45, not a tighter guess.
+        self.curtain_open_max_pos = float(a("curtain_open_max_pos", 45))
         self.bedroom_window_name = a("bedroom_window_name", "bedroom")
         self.vent_tau_indirect_h = float(a("vent_tau_indirect_h", 14.0))
+        # Middle tier (user 2026-08-07): an open BEDROOM DOOR connects the room to the
+        # vented flat - faster than conduction-only, slower than its own window. The
+        # bathroom path flows through the bedroom door too, so that door is the one gate.
+        self.bedroom_door_entity = a("bedroom_door_entity", "binary_sensor.bedroom_door_contact")
+        self.vent_tau_door_h = float(a("vent_tau_door_h", 10.0))
         self.wm_warm_night_margin = float(a("wm_warm_night_margin", 1.0))
         self.wm_clearsky_peak = float(a("wm_clearsky_peak", 700.0))
         self.wm_cloud_atten = float(a("wm_cloud_atten", 0.75))
@@ -1156,14 +1163,17 @@ class SmartCooling(hass.Hass):
             self.log(f"weather-model equilibrium failed ({e}) -- using legacy", level="WARNING")
             return e_legacy, dbg
 
-    def _vent_tau(self, bedroom_window_open, curtain_pos):
-        """Venting speed for the zone-at-bedtime projection. Direct (measured 7 h,
-        2026-07-20 free-cool) needs the bedroom window open AND the curtain genuinely
-        aside; anything else vents the bedroom only through the rest of the flat, taken as
-        half speed. An unreadable curtain position counts as closed - erring warm/safe."""
+    def _vent_tau(self, bedroom_window_open, curtain_pos, bedroom_door_open):
+        """Venting speed for the zone-at-bedtime projection, by the bedroom's actual air
+        path. Direct (measured 7 h, 2026-07-20 free-cool): its own window open AND the
+        curtain genuinely aside. Door tier: bedroom door open to a vented flat - real
+        airflow, slower than its own window. Otherwise conduction-only half speed. An
+        unreadable curtain position counts as closed - erring warm/safe."""
         if (bedroom_window_open and curtain_pos is not None
                 and curtain_pos <= self.curtain_open_max_pos):
             return self.vent_tau_h
+        if bedroom_door_open:
+            return self.vent_tau_door_h
         return self.vent_tau_indirect_h
 
     def _actuation_equilibrium(self, e_active, e_legacy, now):
@@ -1808,7 +1818,8 @@ class SmartCooling(hass.Hass):
                 except (TypeError, ValueError):
                     curtain_pos = None
                 bedroom_open = contacts.get(self.bedroom_window_name) == "on"
-                vent_tau = self._vent_tau(bedroom_open, curtain_pos)
+                door_open = (await self._state(self.bedroom_door_entity)) == "on"
+                vent_tau = self._vent_tau(bedroom_open, curtain_pos, door_open)
                 fc = await self._get_forecast(now)
                 hourly_temps = []
                 if fc:
@@ -1938,7 +1949,9 @@ class SmartCooling(hass.Hass):
                 attrs["bedroom_zone_now"] = round(bedroom_zone_now, 1)
             if zone_anchor is not None and bedroom_zone_now is not None and zone_anchor < bedroom_zone_now - 0.05:
                 attrs["zone_at_bedtime"] = round(zone_anchor, 1)
-                attrs["vent_mode"] = "direct" if vent_tau == self.vent_tau_h else "indirect"
+                attrs["vent_mode"] = ("direct" if vent_tau == self.vent_tau_h
+                                      else "door" if vent_tau == self.vent_tau_door_h
+                                      else "indirect")
             if night_outdoor is not None:
                 attrs["night_outdoor_min"] = round(night_outdoor, 1)
             if wake_dt is not None:

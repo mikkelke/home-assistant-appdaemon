@@ -64,9 +64,11 @@ def make_app(**overrides):
     app.ground_actuation = overrides.get("ground_actuation", True)
     app.vent_tau_h = overrides.get("vent_tau_h", 7.0)
     app.curtain_entity = "cover.bedroom_blind"
-    app.curtain_open_max_pos = 30.0
+    app.curtain_open_max_pos = 45.0
     app.bedroom_window_name = "bedroom"
     app.vent_tau_indirect_h = overrides.get("vent_tau_indirect_h", 14.0)
+    app.bedroom_door_entity = "binary_sensor.bedroom_door_contact"
+    app.vent_tau_door_h = overrides.get("vent_tau_door_h", 10.0)
     app._last_ground_logged = None
     app._plan_rec_prev = None
     app._plan_rec_since = None
@@ -2587,18 +2589,24 @@ class VentTauSelection(unittest.TestCase):
 
     def test_open_window_and_open_curtain_is_direct(self):
         app = make_app()
-        self.assertEqual(app._vent_tau(True, 0.0), app.vent_tau_h)
-        self.assertEqual(app._vent_tau(True, 30.0), app.vent_tau_h)
+        self.assertEqual(app._vent_tau(True, 0.0, False), app.vent_tau_h)
+        # 38 is this blind's fully-open park position (user 2026-08-07) - inside the 45 line.
+        self.assertEqual(app._vent_tau(True, 38.0, False), app.vent_tau_h)
 
     def test_solar_shade_position_counts_as_closed(self):
         # The shade parks at 77 (bottom-up, inverted: 100 = closed) - that chokes airflow.
         app = make_app()
-        self.assertEqual(app._vent_tau(True, 77.0), app.vent_tau_indirect_h)
+        self.assertEqual(app._vent_tau(True, 77.0, False), app.vent_tau_indirect_h)
 
-    def test_shut_bedroom_window_is_indirect_regardless(self):
+    def test_open_door_is_the_middle_tier(self):
         app = make_app()
-        self.assertEqual(app._vent_tau(False, 0.0), app.vent_tau_indirect_h)
+        self.assertEqual(app._vent_tau(False, 0.0, True), app.vent_tau_door_h)
+        self.assertEqual(app._vent_tau(True, 77.0, True), app.vent_tau_door_h)
+
+    def test_all_shut_is_conduction_only(self):
+        app = make_app()
+        self.assertEqual(app._vent_tau(False, 0.0, False), app.vent_tau_indirect_h)
 
     def test_unreadable_curtain_errs_warm(self):
         app = make_app()
-        self.assertEqual(app._vent_tau(True, None), app.vent_tau_indirect_h)
+        self.assertEqual(app._vent_tau(True, None, False), app.vent_tau_indirect_h)
