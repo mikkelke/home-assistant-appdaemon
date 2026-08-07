@@ -1356,15 +1356,24 @@ class DishwasherMonitor(hass.Hass):
         return is_valid
 
     def _should_change_state(self, new_state, force=False):
-        """Check if we should allow a state change."""
+        """Check if we should allow a state change.
+
+        UTC, never naive local time. At the October DST fall-back the local clock jumps an hour
+        BACKWARDS, so a naive `now - last_state_change` goes negative for the whole repeated hour
+        - and a negative delta is trivially < cooling_period, which refuses every un-forced
+        transition until the hour is out. Same silent-refusal wedge the dryer door paths were
+        fixed for, except it hits every un-forced path at once, once a year.
+
+        Every writer of last_state_change must stay on _now_utc() for the same reason the
+        comparison does: mixing a naive stamp with an aware `now` raises TypeError on the
+        subtraction. See washer_monitor.py's _should_change_state, which has always been UTC."""
         if self.get_state(self.state_entity) == new_state:
             return False
-        if not force:
-            now = datetime.now()
-            if self.last_state_change and (now - self.last_state_change).total_seconds() < self.cooling_period:
-                self.log(f"In cooling period", level="DEBUG")
-                return False
-        self.last_state_change = datetime.now()
+        now = self._now_utc()
+        if not force and self.last_state_change and (now - self.last_state_change).total_seconds() < self.cooling_period:
+            self.log(f"In cooling period", level="DEBUG")
+            return False
+        self.last_state_change = now
         return True
 
     def _record_power_reading(self, watts):
