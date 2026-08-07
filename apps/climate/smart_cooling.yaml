@@ -192,6 +192,11 @@ SmartCooling:
     - "kitchen=binary_sensor.kitchen_window_contact"
     - "living room=binary_sensor.living_room_window_contact"
     - "kristines room=binary_sensor.kristines_room_window_contact"
+    # Terrace DOORS (2026-08-07): every window in the flat only opens its SMALL pane, so
+    # these two doors are by far the largest venting openings the flat has -- an open
+    # terrace door outweighs any window for whole-flat flushing.
+    - "terrace door 1=binary_sensor.rooftop_door_1_contact"
+    - "terrace door 2=binary_sensor.rooftop_door_2_contact"
   # The sleep-plan reality anchor is the BEDROOM ZONE only (floor + mid + the kitchen wall it
   # conducts against), computed inline -- the bedroom is its own thermal zone, so far rooms
   # (living/dining) must not ground it (user 2026-07-22).
