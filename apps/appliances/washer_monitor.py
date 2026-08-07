@@ -5344,7 +5344,7 @@ class WasherMonitor(hass.Hass):
                     {"action": "URI", "title": "Other...", "uri": self.confirm_push_dashboard_uri},
                 ]
             else:
-                message = "Which programme did you run? Confirming teaches the ETA."
+                message = "Which program did you run? Confirming teaches the ETA."
                 actions = [
                     {"action": "URI", "title": "Choose in dashboard", "uri": self.confirm_push_dashboard_uri},
                 ]
