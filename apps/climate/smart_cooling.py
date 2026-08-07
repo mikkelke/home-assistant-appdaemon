@@ -1777,7 +1777,7 @@ class SmartCooling(hass.Hass):
             zone_anchor = bedroom_zone_now
             vent_hours = None
             if wake_dt is not None and bedroom_zone_now is not None and open_windows:
-                bedtime_dt = wake_dt - timedelta(hours=self.sleep_hours)
+                bedtime_dt = cm.next_bedtime(now, wake_dt, self.sleep_hours)
                 vent_hours = max(0.0, (bedtime_dt - now).total_seconds() / 3600.0)
                 # Hour-by-hour against the FORECAST (2026-08-06): the scalar version vented
                 # toward "outdoor now", which at a morning plan time is the day's minimum -

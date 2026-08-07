@@ -171,6 +171,19 @@ def vented_zone_at(zone_now, vent_temp, hours, tau_h=7.0, min_gap_c=1.5):
     return max(settled, vent_temp + 1.0)
 
 
+def next_bedtime(now, wake_dt, sleep_hours):
+    """TONIGHT's bedtime. Before the morning wake, wake - sleep_hours is LAST night's
+    bedtime (in the past): venting-window math anchored on it collapses to zero hours, the
+    warm sealed room anchors the plan, and the briefing over-calls (2026-08-07: "Set up the
+    AC" at 06:35, plan said "nothing" at 06:48 once the wake rolled over). Roll a past
+    bedtime one day forward during the morning; an evening past bedtime stays put - the
+    night underway is sealed, and zero venting is then the truth."""
+    bedtime = wake_dt - timedelta(hours=sleep_hours)
+    if bedtime <= now and now.hour < 12:
+        bedtime += timedelta(hours=24)
+    return bedtime
+
+
 def vented_zone_hours(zone_now, hourly_temps, tau_h=7.0, min_gap_c=1.5):
     """Hour-by-hour version of vented_zone_at: walk the venting window one hour at a time,
     cooling toward THAT hour's forecast outdoor temp, and crediting only hours genuinely

@@ -644,3 +644,25 @@ class VentedZoneHours(unittest.TestCase):
         self.assertEqual(cm.vented_zone_hours(23.0, [], 7.0), 23.0)
         self.assertIsNone(cm.vented_zone_hours(None, [17.0], 7.0))
         self.assertEqual(cm.vented_zone_hours(23.0, [None, None], 7.0), 23.0)
+
+
+class NextBedtime(unittest.TestCase):
+    """Pre-wake mornings roll a past bedtime to TONIGHT (2026-08-07: zero venting hours
+    made the 06:35 briefing say set-up while 06:48's plan said nothing)."""
+
+    def test_before_wake_rolls_to_tonight(self):
+        now = datetime(2026, 8, 7, 6, 35)
+        wake = datetime(2026, 8, 7, 7, 35)
+        bed = cm.next_bedtime(now, wake, 9.0)
+        self.assertEqual(bed, datetime(2026, 8, 7, 22, 35))
+
+    def test_after_wake_is_untouched(self):
+        now = datetime(2026, 8, 7, 8, 30)
+        wake = datetime(2026, 8, 8, 7, 35)     # resolve_wake already rolled to tomorrow
+        self.assertEqual(cm.next_bedtime(now, wake, 9.0), datetime(2026, 8, 7, 22, 35))
+
+    def test_late_evening_past_bedtime_stays_put(self):
+        # 23:50, in bed: the night underway is sealed - zero venting is the truth.
+        now = datetime(2026, 8, 7, 23, 50)
+        wake = datetime(2026, 8, 8, 7, 35)
+        self.assertEqual(cm.next_bedtime(now, wake, 9.0), datetime(2026, 8, 7, 22, 35))

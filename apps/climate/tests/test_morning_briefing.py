@@ -260,6 +260,7 @@ def _make_app(now=datetime(2026, 7, 22, 6, 0), from_hour=5, until_hour=12,
     app.stability_retry_min = 10
     app._stability_retry_date = None
     app.stand_down_enabled = True
+    app.stand_down_settle_min = 20
     app._sent_rec = None
     app._stand_down_date = None
     app._run_in_calls = []
@@ -815,3 +816,20 @@ class StandDown(unittest.TestCase):
         app = self._app(sent_date="2026-07-21")
         self._check(app)
         self.assertEqual(app._notified, [])
+
+
+class StandDownFlipListener(unittest.TestCase):
+    """2026-08-07: the 06:35 briefing said set-up, the plan said nothing at 06:48 - a
+    downgrade schedules a settle-delayed check instead of waiting for the 18:00 slot."""
+
+    def test_downgrade_schedules_a_settled_check(self):
+        app = _make_app(plan_attrs=PLAN_ATTRS)
+        app._on_plan_state_change("sensor.sleep_plan", "state", "hybrid", "nothing", {})
+        self.assertEqual(len(app._run_in_calls), 1)
+        self.assertEqual(app._run_in_calls[0][1], 1200)
+
+    def test_other_transitions_are_ignored(self):
+        app = _make_app(plan_attrs=PLAN_ATTRS)
+        for old, new in (("windows", "nothing"), ("nothing", "ac"), ("ac", "hybrid"), (None, "windows")):
+            app._on_plan_state_change("sensor.sleep_plan", "state", old, new, {})
+        self.assertEqual(app._run_in_calls, [])

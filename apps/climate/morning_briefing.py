@@ -109,6 +109,11 @@ class MorningBriefing(hass.Hass):
         # SmartCooling's rescue, riding the same once-per-day + home-suppression rules.
         self.stand_down_enabled = bool(a("stand_down_enabled", True))
         self.stand_down_times = a("stand_down_times", ["18:00:00", "20:30:00"])
+        # Event-driven stand-down (2026-08-07): a downgrade minutes AFTER the briefing must
+        # not wait for 18:00 - the 06:35 "Set up the AC" aged out at 06:48 and the user
+        # would have carried the unit in. On an ac/hybrid -> windows/nothing flip, wait
+        # stand_down_settle_min for the flip to hold, then run the same once-a-day check.
+        self.stand_down_settle_min = int(a("stand_down_settle_min", 20))
 
         self._sent_date: Optional[str] = None
         self._sent_rec: Optional[str] = None
@@ -144,6 +149,7 @@ class MorningBriefing(hass.Hass):
         if self.stand_down_enabled:
             for t in self.stand_down_times:
                 self.run_daily(self._on_stand_down_fire, t)
+            self.listen_state(self._on_plan_state_change, self.sleep_plan_entity)
         self.listen_state(self._on_alarm_time_changed, self.alarm_time_entity)
         # Alarm turned off mid-morning (woke early / cancelled) -> send right now instead of
         # waiting for the fallback -- still gated to the sanity window (see the callback).
@@ -362,6 +368,13 @@ class MorningBriefing(hass.Hass):
 
     def _on_stability_retry(self, kwargs):
         self._fire_wake("stability retry")
+
+    def _on_plan_state_change(self, entity, attribute, old, new, kwargs):
+        """An ac/hybrid -> windows/nothing downgrade schedules a settle-delayed stand-down
+        check; every other transition is ignored. The check itself re-reads the live plan,
+        so a flip-back inside the settle window ends silent."""
+        if old in ("ac", "hybrid") and new in ("windows", "nothing"):
+            self.run_in(self._on_stand_down_fire, self.stand_down_settle_min * 60)
 
     def _on_stand_down_fire(self, kwargs):
         self.create_task(self._maybe_stand_down())
