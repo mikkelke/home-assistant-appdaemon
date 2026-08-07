@@ -1031,9 +1031,11 @@ class DryerMonitor(hass.Hass):
             current_power = self._get_current_power()
 
             if current_power >= self.start_w:
-                self._transition_to_running_from_pause()
+                # Door-close from Paused is authoritative and may happen seconds after
+                # Paused was entered; bypass cooling so we don't get stuck in Paused.
+                self._transition_to_running_from_pause(force=True)
             else:
-                self._evaluate_pause_exit()
+                self._evaluate_pause_exit(force=True)
         
         elif current_state == "Emptied":
             # Door closed after emptying - cycle complete, go to Off
@@ -1095,9 +1097,9 @@ class DryerMonitor(hass.Hass):
             self._transition_to_off(f"Watchdog: unemptied timeout ({self.unemptied_timeout_hours}h)")
         self.unemptied_watchdog_timer = None
 
-    def _transition_to_running_from_pause(self):
+    def _transition_to_running_from_pause(self, force=False):
         """Resume Running state after pause."""
-        if self._should_change_state("Running"):
+        if self._should_change_state("Running", force=force):
             self.state = "Running"
             self._set_state_entity( state="Running")
             self.door_opened_time = None
@@ -1106,7 +1108,7 @@ class DryerMonitor(hass.Hass):
             if not self.poll_timer:
                 self.poll_timer = self.run_in(self._poll_power, 60)
 
-    def _evaluate_pause_exit(self):
+    def _evaluate_pause_exit(self, force=False):
         """Determine whether to go to Unemptied or Off when exiting Paused state."""
         if self._is_valid_completed_cycle():
             run_minutes_wall = self._get_run_duration_minutes()
@@ -1114,7 +1116,7 @@ class DryerMonitor(hass.Hass):
             idle_min = run_minutes_wall - run_minutes if duration_source and run_minutes_wall > run_minutes else None
             energy_kwh = self._get_energy_used()
             prog = self._classify_programme()
-            self._transition_to_unemptied(skip_announce=False, run_minutes=run_minutes, energy_used=energy_kwh)
+            self._transition_to_unemptied(skip_announce=False, run_minutes=run_minutes, energy_used=energy_kwh, force=force)
             confirmed, is_human = self._get_confirmed_from_selector(prog)
             self._save_cycle_feedback(
                 predicted=prog,
@@ -1128,7 +1130,7 @@ class DryerMonitor(hass.Hass):
                 idle_min=idle_min,
             )
         else:
-            self._transition_to_off("Cycle interrupted or incomplete")
+            self._transition_to_off("Cycle interrupted or incomplete", force=force)
 
     def _reset_programme_selectors_to_unconfirmed(self):
         """Set programme / dryness / Skåne+ / time to idle defaults (user must confirm next cycle)."""
@@ -1159,22 +1161,22 @@ class DryerMonitor(hass.Hass):
         except Exception as e:
             self.log(f"Could not reset programme selectors: {e}", level="WARNING")
 
-    def _transition_to_off(self, reason):
+    def _transition_to_off(self, reason, force=False):
         """Transition to Off state."""
-        if self._should_change_state("Off"):
+        if self._should_change_state("Off", force=force):
             self.state = "Off"
             self._set_state_entity( state="Off")
             self.log(f"State -> Off ({reason})", level="INFO")
             self._reset_programme_selectors_to_unconfirmed()
             self._reset_cycle_tracking()
 
-    def _transition_to_unemptied(self, skip_announce=False, run_minutes=None, energy_used=None):
+    def _transition_to_unemptied(self, skip_announce=False, run_minutes=None, energy_used=None, force=False):
         """Transition to Unemptied state (cycle done, door still closed, waiting for user).
 
         skip_announce: If True, do not send the "dryer ready to empty" notification.
         run_minutes, energy_used: Optional corrected values (from history correction).
         """
-        if self._should_change_state("Unemptied"):
+        if self._should_change_state("Unemptied", force=force):
             run_minutes = run_minutes if run_minutes is not None else self._get_run_duration_minutes()
             energy_used = energy_used if energy_used is not None else self._get_energy_used()
 
@@ -1468,6 +1470,18 @@ class DryerMonitor(hass.Hass):
             if self.poll_timer:
                 self._safe_cancel_timer(self.poll_timer)
                 self.poll_timer = None
+            return
+
+        if current_state == "Paused" and self.get_state(self.door_sensor) == "off":
+            self.log("Poll: state Paused but door is closed - applying pause-exit handling", level="INFO")
+            # This timer has already fired, so drop the dead handle before transitioning:
+            # _transition_to_running_from_pause only re-arms polling when poll_timer is None,
+            # and the Off/Unemptied paths cancel it themselves via _reset_cycle_tracking.
+            self.poll_timer = None
+            if self._get_current_power() >= self.start_w:
+                self._transition_to_running_from_pause(force=True)
+            else:
+                self._evaluate_pause_exit(force=True)
             return
 
         current_power_state = self.get_state(self.power_sensor)
