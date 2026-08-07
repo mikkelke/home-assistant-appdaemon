@@ -217,6 +217,8 @@ class DryerMonitor(hass.Hass):
         self.listen_state(self._door_state_changed, self.door_sensor)
         self.listen_state(self._handle_unavailable, self.state_entity, new="unavailable")
         self.listen_state(self._handle_unavailable, self.power_sensor, new="unavailable")
+        # Dashboard "Emptied" button (2026-08-07) - same convention as dishwasher_force_emptied.
+        self.listen_event(self._handle_force_emptied, "dryer_force_emptied")
 
         # Get Sonos Notifier App instance
         self.sonos_notifier = None
@@ -1301,6 +1303,21 @@ class DryerMonitor(hass.Hass):
                     self.notification_sent = True
                 except Exception as e:
                     self.log(f"Error sending notification: {e}", level="ERROR")
+
+    def _handle_force_emptied(self, event_name, data, kwargs):
+        """dryer_force_emptied (dashboard Emptied button): the drum is empty but the door
+        contact never saw the emptying. Only honored from Unemptied - any earlier state may
+        still be a live cycle."""
+        data = data or {}
+        if self.state != "Unemptied":
+            self.log(
+                f"Force Emptied ignored from state {self.state!r} (only valid from Unemptied)",
+                level="WARNING",
+            )
+            return
+        reason = data.get("reason") or "Forced via event"
+        self.log(f"Force Emptied via event ({reason})", level="INFO")
+        self._transition_to_emptied(f"Forced emptied ({reason})")
 
     def _transition_to_emptied(self, reason):
         """Transition to Emptied state (door open, user is emptying)."""

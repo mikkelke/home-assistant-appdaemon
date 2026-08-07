@@ -765,6 +765,8 @@ class WasherMonitor(hass.Hass):
         # test hook to preview the message/buttons on demand (see _send_confirm_push).
         self.listen_event(self._on_confirm_push_action, "mobile_app_notification_action")
         self.listen_event(self._on_test_confirm_push, "washer_test_confirm_push")
+        # Dashboard "Emptied" button (2026-08-07) - same convention as dishwasher_force_emptied.
+        self.listen_event(self._handle_force_emptied, "washer_force_emptied")
 
         # Load historical feedback and derive learned duration estimates
         self._load_and_apply_feedback()
@@ -3249,6 +3251,21 @@ class WasherMonitor(hass.Hass):
                     self.notification_sent = True
                 except Exception as e:
                     self.log(f"Error sending notification: {e}", level="ERROR")
+
+    def _handle_force_emptied(self, event_name, data, kwargs):
+        """washer_force_emptied (dashboard Emptied button): the drum is empty but the door
+        contact never saw the emptying. Only honored from Unemptied - any earlier state may
+        still be a live cycle, and _transition_to_emptied would save its feedback too soon."""
+        data = data or {}
+        if self.state != "Unemptied":
+            self.log(
+                f"Force Emptied ignored from state {self.state!r} (only valid from Unemptied)",
+                level="WARNING",
+            )
+            return
+        reason = data.get("reason") or "Forced via event"
+        self.log(f"Force Emptied via event ({reason})", level="INFO")
+        self._transition_to_emptied(f"Forced emptied ({reason})")
 
     def _transition_to_emptied(self, reason):
         """Transition to Emptied state (door open, user is emptying)."""
