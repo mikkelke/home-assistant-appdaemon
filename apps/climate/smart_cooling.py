@@ -295,8 +295,9 @@ class SmartCooling(hass.Hass):
         # shut, the zone only cools indirectly through the rest of the flat - half speed.
         # cover.bedroom_blind is bottom-up and INVERTED: position 100 = closed.
         self.curtain_entity = a("curtain_entity", "cover.bedroom_blind")
-        # 38 is this blind's FULLY-OPEN park position (user 2026-08-07: the openable
-        # part of the window is uncovered there) - hence 45, not a tighter guess.
+        # 38 is this blind's park position and the point where the OPENABLE pane is fully
+        # uncovered; below 38 only fixed glass gets exposed, so venting is binary - pane
+        # clear or pane covered (user 2026-08-07). 45 = 38 plus slack for motor reporting.
         self.curtain_open_max_pos = float(a("curtain_open_max_pos", 45))
         self.bedroom_window_name = a("bedroom_window_name", "bedroom")
         self.vent_tau_indirect_h = float(a("vent_tau_indirect_h", 14.0))
