@@ -123,6 +123,11 @@ class DryerMonitor(hass.Hass):
         # Safety watchdogs - prevent stuck states
         self.max_running_hours = float(self.args.get("max_running_hours", 5))
         self.unemptied_timeout_hours = float(self.args.get("unemptied_timeout_hours", 24))
+        # Emptied is the only state with no power- or timer-driven exit of its own: it is left
+        # solely by the door closing. Back it with a watchdog (washer/dishwasher both have one)
+        # so a missed door-close edge cannot make Emptied terminal - start detection is gated
+        # on state == "Off", so a stuck Emptied also blocks the NEXT cycle.
+        self.emptied_timeout_minutes = float(self.args.get("emptied_timeout_minutes", 30))
 
         # State tracking
         self.low_power_timer = None
@@ -156,6 +161,7 @@ class DryerMonitor(hass.Hass):
         # Watchdog timers
         self.running_watchdog_timer = None
         self.unemptied_watchdog_timer = None
+        self.emptied_watchdog_timer = None
 
         # Programme classification and guard
         self.expected_dur_at_start = None
@@ -201,6 +207,10 @@ class DryerMonitor(hass.Hass):
             # door-open listener this is not persisted and would otherwise stay disarmed
             # across every deploy.
             self._restore_unemptied_state()
+        elif self.state == "Emptied":
+            # Same reasoning as Unemptied, and more urgent: Emptied's only exit is the door
+            # closing, so a deploy landing while Emptied would leave it with no backstop at all.
+            self._restore_emptied_state()
 
         # Listen for events
         self.listen_state(self._power_changed, self.power_sensor)
@@ -370,6 +380,28 @@ class DryerMonitor(hass.Hass):
             self.log(f"Restored Unemptied state: watchdog re-armed ({remaining}s remaining)", level="INFO")
         except Exception as e:
             self.log(f"Restore Unemptied state failed: {e}", level="WARNING")
+
+    def _restore_emptied_state(self):
+        """After AppDaemon restart: re-arm the Emptied auto-clear watchdog from the time Emptied
+        actually began (state entity last_changed), falling back to the full period when that is
+        not derivable. Mirrors _restore_unemptied_state. AppDaemon restarts on every deploy, and
+        Emptied is only ever left by a door-close event, so without this re-arm a deploy that
+        lands while Emptied leaves the state with no timer and no way out."""
+        try:
+            full = self.get_state(self.state_entity, attribute="all")
+            last_changed = (full or {}).get("last_changed") or (full or {}).get("last_updated")
+            emptied_since = self._parse_utc_iso(last_changed) if last_changed else None
+            total_s = int(self.emptied_timeout_minutes * 60)
+            if emptied_since:
+                remaining = self._restore_remaining_seconds(total_s, emptied_since, floor_s=60)
+            else:
+                self.log("Restore Emptied: no last_changed on entity - arming full emptied watchdog", level="DEBUG")
+                remaining = total_s
+            self._safe_cancel_timer(self.emptied_watchdog_timer)
+            self.emptied_watchdog_timer = self.run_in(self._emptied_watchdog_timeout, remaining)
+            self.log(f"Restored Emptied state: watchdog re-armed ({remaining}s remaining)", level="INFO")
+        except Exception as e:
+            self.log(f"Restore Emptied state failed: {e}", level="WARNING")
 
     def _get_current_power(self):
         """Get current power reading in watts."""
@@ -1040,7 +1072,12 @@ class DryerMonitor(hass.Hass):
         elif current_state == "Emptied":
             # Door closed after emptying - cycle complete, go to Off
             self.log(f"Door closed after emptying -> Off", level="INFO")
-            self._transition_to_off("Door closed - emptying complete")
+            # _transition_to_emptied stamped the cooling clock seconds ago (it forces its own
+            # transition), so the door-close that follows almost always lands inside the 600s
+            # window: 52 of 92 of these since January were silently refused, leaving Emptied
+            # terminal and blocking the next cycle (start detection requires "Off").
+            # A door event is discrete and physical - never what cooling_period protects against.
+            self._transition_to_off("Door closed - emptying complete", force=True)
             now = self._now_utc()
             self.door_fast_start_armed_until = now + timedelta(seconds=self.door_close_fast_start_window_s)
 
@@ -1096,6 +1133,26 @@ class DryerMonitor(hass.Hass):
             self.log(f"WATCHDOG: Unemptied for {self.unemptied_timeout_hours}h - assuming emptied", level="WARNING")
             self._transition_to_off(f"Watchdog: unemptied timeout ({self.unemptied_timeout_hours}h)")
         self.unemptied_watchdog_timer = None
+
+    def _emptied_watchdog_timeout(self, kwargs):
+        """Safety watchdog - Emptied too long, the door-close that should have ended the cycle
+        was never seen (missed Zigbee edge, or the user left the door open to air the drum).
+
+        Cleared before the transition so _reset_cycle_tracking does not try to cancel the very
+        handle that is firing. force=True because a backstop that its own cooling period can
+        swallow is not a backstop: this is the last line of defence for a state whose only other
+        exit is a door event that, by the time we get here, demonstrably did not arrive."""
+        self.emptied_watchdog_timer = None
+        current_state = self.get_state(self.state_entity)
+        if current_state == "Emptied":
+            self.log(
+                f"WATCHDOG: Emptied for {self.emptied_timeout_minutes:.0f} min - assuming the "
+                f"door-close was missed, forcing Off",
+                level="WARNING",
+            )
+            self._transition_to_off(
+                f"Watchdog: emptied timeout ({self.emptied_timeout_minutes:.0f} min)", force=True
+            )
 
     def _transition_to_running_from_pause(self, force=False):
         """Resume Running state after pause."""
@@ -1261,6 +1318,15 @@ class DryerMonitor(hass.Hass):
             self._safe_cancel_timer(self.unemptied_watchdog_timer)
             self.unemptied_watchdog_timer = None
 
+            # Arm the emptied watchdog: from here the only exit is the door closing, so this is
+            # the sole backstop if that edge is missed. Cancelled in _reset_cycle_tracking once
+            # a transition to Off actually lands.
+            self._safe_cancel_timer(self.emptied_watchdog_timer)
+            self.emptied_watchdog_timer = self.run_in(
+                self._emptied_watchdog_timeout,
+                int(self.emptied_timeout_minutes * 60),
+            )
+
             # Re-enable announce toggle for next cycle (match washer)
             if self.announce_entity:
                 try:
@@ -1311,6 +1377,12 @@ class DryerMonitor(hass.Hass):
         if self.unemptied_watchdog_timer:
             self._safe_cancel_timer(self.unemptied_watchdog_timer)
             self.unemptied_watchdog_timer = None
+        # Cancelled here rather than at the call site, so it is only ever dropped once a
+        # transition to Off has actually landed. Cancelling a backstop BEFORE attempting the
+        # transition it backs is the exact shape of the 34h Paused wedge (see _handle_door_closed).
+        if self.emptied_watchdog_timer:
+            self._safe_cancel_timer(self.emptied_watchdog_timer)
+            self.emptied_watchdog_timer = None
 
         if self.start_confirm_timer:
             self._safe_cancel_timer(self.start_confirm_timer)

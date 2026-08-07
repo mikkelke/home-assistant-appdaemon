@@ -101,6 +101,10 @@ dryer_monitor:
   # Safety watchdogs - prevent stuck states
   max_running_hours: 5
   unemptied_timeout_hours: 24
+  # Emptied is left only by the door closing. If that edge is missed the state is terminal and
+  # blocks the next cycle (start detection requires Off), so back it with a watchdog like the
+  # washer and dishwasher have. Door-close normally follows within seconds; 30 min is slack.
+  emptied_timeout_minutes: 30
 
   # History correction: threshold for "high power" in energy series (W)
   energy_active_watts: 100.0
