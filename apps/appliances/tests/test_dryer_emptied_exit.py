@@ -34,7 +34,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
