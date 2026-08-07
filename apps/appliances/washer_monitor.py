@@ -49,11 +49,20 @@ Duration, progress, announcement:
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 import collections
-import copy
 import time
 import os
 import yaml
 from datetime import datetime, timedelta, timezone
+
+# Sibling modules in this same app directory (AppDaemon puts app dirs on sys.path;
+# same flat-import style as apps/climate/smart_cooling.py's `import climate_model as cm`).
+# These hold the pure parts - tables, signal maths, classification, feedback shaping -
+# while every stateful, AppDaemon-coupled method stays on WasherMonitor below.
+import washer_classify as wcls
+import washer_feedback as wfb
+import washer_history as whist
+import washer_power as wpow
+import washer_profiles as wp
 
 try:
     from zoneinfo import ZoneInfo
@@ -61,22 +70,9 @@ except ImportError:
     ZoneInfo = None  # type: ignore
 
 
-def _parse_utc(s: str):
-    """Parse ISO timestamp to timezone-aware UTC datetime. Handles 'Z' and no suffix."""
-    if not s:
-        return None
-    s = str(s).strip().replace("Z", "+00:00")
-    if s.endswith("+00:00") or s.endswith("Z"):
-        pass
-    elif "+" not in s[-7:] and "-" not in s[-7:]:
-        s = s + "+00:00"  # assume UTC if no offset
-    try:
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except (ValueError, TypeError):
-        return None
+# Kept as a module-level name so the many `_parse_utc(...)` call sites below,
+# and anything importing it from this module, stay unchanged.
+_parse_utc = whist.parse_utc
 
 
 class WasherMonitor(hass.Hass):
@@ -84,101 +80,23 @@ class WasherMonitor(hass.Hass):
     # Programme and temperature are independent dimensions.  For "bomuld",
     # the profile depends on the selected temperature (by_temperature dict).
     # UI matrix: allowed_temperatures, allowed_spin_speeds, default_temperature, default_spin, available_options (canonical values only).
-    _PROGRAMME_DISPLAY_ORDER = [
-        "ekspres", "uld", "bomuld", "finvask", "strygelet", "eco",
-        "morkt_denim", "outdoor", "impraegnering", "pumpe_centrifugering", "kun_skyl_stivelse",
-    ]
-    _CANONICAL_SPIN = ["1400 rpm", "1200 rpm", "900 rpm", "700 rpm", "No spin"]
-    _SPIN_MAX_1200 = ["1200 rpm", "900 rpm", "700 rpm", "No spin"]   # Manual: Strygelet, Uld, Ekspres, Mørkt/Denim, Imprægnering
-    _SPIN_MAX_900 = ["900 rpm", "700 rpm", "No spin"]                 # Manual: Finvask, Outdoor
-    _DEFAULT_PROFILES = {
-        "ekspres":   {"label": "Ekspres",   "default_temp": None,   "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C"], "allowed_spin_speeds": _SPIN_MAX_1200, "default_temperature": "40°C", "default_spin": "1200 rpm", "available_options": ["short"], "by_temperature": {
-            "cold": {"duration_min": 20, "max_energy_kwh": 0.25, "heats": False, "stable_min":  8, "max_dur_min": 30, "supports_anti_crease": True},
-            "20°C": {"duration_min": 20, "max_energy_kwh": 0.40, "heats":  True, "stable_min":  8, "max_dur_min": 30, "supports_anti_crease": True},
-            "30°C": {"duration_min": 20, "max_energy_kwh": 0.40, "heats":  True, "stable_min":  8, "max_dur_min": 30, "supports_anti_crease": True},
-            "40°C": {"duration_min": 20, "max_energy_kwh": 0.40, "heats":  True, "stable_min":  8, "max_dur_min": 30, "supports_anti_crease": True},
-        }},
-        "uld":       {"label": "Uld",       "default_temp": "30°C", "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C"], "allowed_spin_speeds": _SPIN_MAX_1200, "default_temperature": "30°C", "default_spin": "1200 rpm", "available_options": [], "by_temperature": {
-            "cold": {"duration_min":  39, "max_energy_kwh": 0.22, "heats": False, "stable_min": 10, "max_dur_min":  55, "supports_anti_crease": False},
-            "20°C": {"duration_min":  39, "max_energy_kwh": 0.26, "heats":  True, "stable_min": 10, "max_dur_min":  55, "supports_anti_crease": False},
-            "30°C": {"duration_min":  39, "max_energy_kwh": 0.28, "heats":  True, "stable_min": 10, "max_dur_min":  55, "supports_anti_crease": False},
-            "40°C": {"duration_min":  39, "max_energy_kwh": 0.28, "heats":  True, "stable_min": 10, "max_dur_min":  55, "supports_anti_crease": False},
-        }},  # Manual: Uld 40°C -> cold; max spin 1200 rpm
-        "bomuld":    {"label": "Bomuld",    "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C", "60°C", "90°C"], "allowed_spin_speeds": _CANONICAL_SPIN, "default_temperature": "40°C", "default_spin": "1400 rpm", "available_options": ["water_plus", "soak", "prewash"], "by_temperature": {
-            "cold": {"duration_min": 159, "max_energy_kwh": 0.35, "heats": False, "stable_min": 10, "max_dur_min": 185, "supports_anti_crease": True},
-            "20°C": {"duration_min": 159, "max_energy_kwh": 0.55, "heats":  True, "stable_min": 15, "max_dur_min": 185, "supports_anti_crease": True},
-            "30°C": {"duration_min": 159, "max_energy_kwh": 0.75, "heats":  True, "stable_min": 15, "max_dur_min": 185, "supports_anti_crease": True},
-            "40°C": {"duration_min": 175, "max_energy_kwh": 0.90, "heats":  True, "stable_min": 15, "max_dur_min": 210, "supports_anti_crease": True},
-            "60°C": {"duration_min": 149, "max_energy_kwh": 1.40, "heats":  True, "stable_min": 15, "max_dur_min": 175, "supports_anti_crease": True},
-            "90°C": {"duration_min": 160, "max_energy_kwh": 2.20, "heats":  True, "stable_min": 15, "max_dur_min": 195, "supports_anti_crease": True},
-        }},
-        "finvask":   {"label": "Finvask",   "default_temp": "40°C", "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C"], "allowed_spin_speeds": _SPIN_MAX_900, "default_temperature": "40°C", "default_spin": "900 rpm", "available_options": ["water_plus", "soak"], "by_temperature": {
-            "cold": {"duration_min":  65, "max_energy_kwh": 0.25, "heats": False, "stable_min": 10, "max_dur_min":  90, "supports_anti_crease": True},
-            "20°C": {"duration_min":  65, "max_energy_kwh": 0.35, "heats":  True, "stable_min": 10, "max_dur_min":  90, "supports_anti_crease": True},
-            "30°C": {"duration_min":  65, "max_energy_kwh": 0.38, "heats":  True, "stable_min": 10, "max_dur_min":  90, "supports_anti_crease": True},
-            "40°C": {"duration_min":  65, "max_energy_kwh": 0.40, "heats":  True, "stable_min": 10, "max_dur_min":  90, "supports_anti_crease": True},
-        }},  # Manual: 40°C -> cold; allows all lower temps (Cold, 20, 30, 40)
-        "strygelet": {"label": "Strygelet", "default_temp": "30°C", "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C", "60°C"], "allowed_spin_speeds": _SPIN_MAX_1200, "default_temperature": "30°C", "default_spin": "1200 rpm", "available_options": ["water_plus", "soak"], "by_temperature": {
-            "cold": {"duration_min": 119, "max_energy_kwh": 0.35, "heats": False, "stable_min": 15, "max_dur_min": 140, "supports_anti_crease": True},
-            "20°C": {"duration_min": 119, "max_energy_kwh": 0.45, "heats":  True, "stable_min": 15, "max_dur_min": 140, "supports_anti_crease": True},
-            "30°C": {"duration_min": 119, "max_energy_kwh": 0.52, "heats":  True, "stable_min": 15, "max_dur_min": 140, "supports_anti_crease": True},
-            "40°C": {"duration_min": 119, "max_energy_kwh": 0.52, "heats":  True, "stable_min": 15, "max_dur_min": 140, "supports_anti_crease": True},
-            "60°C": {"duration_min": 119, "max_energy_kwh": 0.52, "heats":  True, "stable_min": 15, "max_dur_min": 140, "supports_anti_crease": True},
-        }},  # Manual: 60°C -> cold; intermediate temps 20–40
-        "eco":       {"label": "ECO",       "default_temp": "40-60°C", "allowed_temperatures": ["40-60°C", "40°C", "60°C"], "default_temperature": "40-60°C", "allowed_spin_speeds": _CANONICAL_SPIN, "default_spin": "1400 rpm", "available_options": ["water_plus", "soak"], "by_temperature": {
-            # All three variants seeded identically (Manual p62 at 7 kg: 3:19 = 199 min, for the
-            # auto 40-60°C range specifically) - no per-fixed-temperature breakdown exists yet;
-            # learning differentiates them from confirmed cycles going forward.
-            "40-60°C": {"duration_min": 199, "max_energy_kwh": 0.78, "heats":  True, "stable_min": 15, "max_dur_min": 235, "supports_anti_crease": True},
-            "40°C": {"duration_min": 199, "max_energy_kwh": 0.78, "heats":  True, "stable_min": 15, "max_dur_min": 235, "supports_anti_crease": True},
-            "60°C": {"duration_min": 199, "max_energy_kwh": 0.78, "heats":  True, "stable_min": 15, "max_dur_min": 235, "supports_anti_crease": True},
-        }},
-        "morkt_denim":  {"label": "Mørkt/Denim", "default_temp": "60°C", "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C", "60°C"], "allowed_spin_speeds": _SPIN_MAX_1200, "default_temperature": "60°C", "default_spin": "1200 rpm", "available_options": ["water_plus"], "by_temperature": {
-            "cold": {"duration_min":  90, "max_energy_kwh": 0.35, "heats": False, "stable_min": 12, "max_dur_min": 110, "supports_anti_crease": True},
-            "20°C": {"duration_min":  90, "max_energy_kwh": 0.42, "heats":  True, "stable_min": 12, "max_dur_min": 110, "supports_anti_crease": True},
-            "30°C": {"duration_min":  90, "max_energy_kwh": 0.48, "heats":  True, "stable_min": 12, "max_dur_min": 110, "supports_anti_crease": True},
-            "40°C": {"duration_min":  90, "max_energy_kwh": 0.52, "heats":  True, "stable_min": 12, "max_dur_min": 110, "supports_anti_crease": True},
-            "60°C": {"duration_min":  90, "max_energy_kwh": 0.55, "heats":  True, "stable_min": 12, "max_dur_min": 110, "supports_anti_crease": True},
-        }},  # Manual: 60°C -> cold; intermediate temps 20–40
-        "outdoor":   {"label": "Outdoor",   "default_temp": "40°C", "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C"], "allowed_spin_speeds": _SPIN_MAX_900, "default_temperature": "40°C", "default_spin": "900 rpm", "available_options": ["water_plus"], "by_temperature": {
-            "cold": {"duration_min":  50, "max_energy_kwh": 0.25, "heats": False, "stable_min": 10, "max_dur_min":  65, "supports_anti_crease": True},
-            "20°C": {"duration_min":  50, "max_energy_kwh": 0.32, "heats":  True, "stable_min": 10, "max_dur_min":  65, "supports_anti_crease": True},
-            "30°C": {"duration_min":  50, "max_energy_kwh": 0.36, "heats":  True, "stable_min": 10, "max_dur_min":  65, "supports_anti_crease": True},
-            "40°C": {"duration_min":  50, "max_energy_kwh": 0.40, "heats":  True, "stable_min": 10, "max_dur_min":  65, "supports_anti_crease": True},
-        }},  # Manual: 40°C -> cold; max spin 900 rpm
-        "impraegnering": {"label": "Imprægnering", "default_temp": None, "allowed_temperatures": [], "default_temperature": None, "allowed_spin_speeds": _SPIN_MAX_1200, "default_spin": "1200 rpm", "available_options": [], "duration_min":  25, "max_energy_kwh": 0.15, "heats": False, "stable_min":  8, "max_dur_min":  35, "supports_anti_crease": True},
-        "pumpe_centrifugering": {"label": "Pumpe/Centrifugering", "default_temp": None, "allowed_temperatures": [], "default_temperature": None, "allowed_spin_speeds": _CANONICAL_SPIN, "default_spin": "1400 rpm", "available_options": [], "duration_min":  10, "max_energy_kwh": 0.08, "heats": False, "stable_min":  5, "max_dur_min":  20, "supports_anti_crease": False},
-        "kun_skyl_stivelse": {"label": "Kun skyl/stivelse", "default_temp": None, "allowed_temperatures": [], "default_temperature": None, "allowed_spin_speeds": _CANONICAL_SPIN, "default_spin": "1400 rpm", "available_options": [], "duration_min":  30, "max_energy_kwh": 0.12, "heats": False, "stable_min":  8, "max_dur_min":  45, "supports_anti_crease": True},
-        "unknown":   {"label": "Unknown",   "default_temp": None,   "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C", "60°C", "90°C"], "allowed_spin_speeds": _CANONICAL_SPIN, "default_temperature": None, "default_spin": "1400 rpm", "available_options": [], "duration_min": 180, "max_energy_kwh": 2.50, "heats":  None, "stable_min": 15, "max_dur_min": 240, "supports_anti_crease": True},
-    }
-    PROGRAMME_PROFILES = dict(_DEFAULT_PROFILES)
+    # Tables live in washer_profiles.py; aliased here so existing self._NAME call
+    # sites and any external reader keep working unchanged.
+    _PROGRAMME_DISPLAY_ORDER = wp.PROGRAMME_DISPLAY_ORDER
+    _CANONICAL_SPIN = wp.CANONICAL_SPIN
+    _DEFAULT_PROFILES = wp.DEFAULT_PROFILES
+    PROGRAMME_PROFILES = dict(wp.DEFAULT_PROFILES)
 
 
     def _get_profile(self, programme: str, temperature=None):
         """Return the flat profile dict for a programme + optional temperature.
-
-        For 'bomuld' with by_temperature, resolves to the matching sub-profile.
-        Falls back to the first sub-profile if temperature is missing/unknown.
-        For other programmes, returns the top-level profile directly.
-        """
-        prof = self.PROGRAMME_PROFILES.get(programme, self.PROGRAMME_PROFILES.get("unknown", {}))
-        if "by_temperature" in prof:
-            temps = prof["by_temperature"]
-            if temperature and temperature in temps:
-                p = dict(temps[temperature])
-                p["label"] = prof.get("label", programme)
-                return p
-            first = next(iter(temps.values()))
-            p = dict(first)
-            p["label"] = prof.get("label", programme)
-            return p
-        return prof
+        See washer_profiles.get_profile; bound here to the live PROGRAMME_PROFILES."""
+        return wp.get_profile(self.PROGRAMME_PROFILES, programme, temperature)
 
     def _programme_has_temperature(self, programme: str) -> bool:
         """Return True if this programme has temperature-dependent profiles (e.g. bomuld).
         Only then do we persist/learn temperature; otherwise learn_key is just programme."""
-        prof = self.PROGRAMME_PROFILES.get(programme, self.PROGRAMME_PROFILES.get("unknown", {}))
-        return isinstance(prof, dict) and "by_temperature" in prof
+        return wp.programme_has_temperature(self.PROGRAMME_PROFILES, programme)
 
     def _load_programme_profiles(self):
         """Load programme profiles from washer_programmes.yaml if present. Merge with defaults
@@ -194,46 +112,10 @@ class WasherMonitor(hass.Hass):
             order = data.get("programme_display_order")
             self._programme_display_order = order if isinstance(order, list) and order else list(self._PROGRAMME_DISPLAY_ORDER)
             if profiles:
-                merged = copy.deepcopy(self._DEFAULT_PROFILES)
-                for key, val in profiles.items():
-                    if not isinstance(val, dict):
-                        merged[key] = val
-                        continue
-                    if key in merged and "by_temperature" in merged.get(key, {}):
-                        # Merge by_temperature so YAML can override a subset of temps
-                        base = merged[key]
-                        for t, p in val.get("by_temperature", {}).items():
-                            base["by_temperature"][t] = {**base["by_temperature"].get(t, {}), **p}
-                        for k, v in val.items():
-                            if k != "by_temperature":
-                                base[k] = v
-                    else:
-                        merged[key] = {**merged.get(key, {}), **val}
-                # ECO: ensure temperature options are always 40-60, 40, 60
-                if "eco" in merged and isinstance(merged["eco"], dict):
-                    eco_at = merged["eco"].get("allowed_temperatures") or []
-                    if set(eco_at) != {"40-60°C", "40°C", "60°C"}:
-                        merged["eco"]["allowed_temperatures"] = ["40-60°C", "40°C", "60°C"]
-                        if not merged["eco"].get("default_temperature"):
-                            merged["eco"]["default_temperature"] = "40-60°C"
-                if "unknown" not in merged:
-                    merged["unknown"] = copy.deepcopy(self._DEFAULT_PROFILES["unknown"])
+                merged = wp.merge_profiles(profiles)
                 WasherMonitor.PROGRAMME_PROFILES = merged
                 # Build label -> key from profiles and stable display order (so new YAML programmes appear)
-                label_to_key = {}
-                for key in self._programme_display_order:
-                    if key in merged:
-                        label = merged[key].get("label", key)
-                        label_to_key[label] = key
-                if "unknown" in merged:
-                    label_to_key[merged["unknown"].get("label", "Unknown")] = "unknown"
-                # Legacy options with temperature suffix (backwards compatibility)
-                for leg_label, leg_key in [
-                    ("Ekspres 20", "ekspres"), ("Uld 30", "uld"), ("Bomuld 20", "bomuld"), ("Bomuld 60", "bomuld"),
-                    ("Finvask 40", "finvask"), ("Strygelet 30", "strygelet"), ("ECO 40-60", "eco"),
-                ]:
-                    label_to_key[leg_label] = leg_key
-                WasherMonitor._LABEL_TO_KEY = label_to_key
+                WasherMonitor._LABEL_TO_KEY = wp.build_label_to_key(merged, self._programme_display_order)
                 self.log(f"Loaded {len(profiles)} programme profiles from {prog_file}", level="INFO")
             else:
                 self.log(f"No 'programmes' key in {prog_file} - using defaults", level="WARNING")
@@ -285,12 +167,8 @@ class WasherMonitor(hass.Hass):
             return ""
         return dt.astimezone(self._local_tz()).strftime(fmt)
 
-    @staticmethod
-    def _log_safe(s):
-        """Return string safe for log output (avoids encoding errors with ° in some environments)."""
-        if s is None:
-            return ""
-        return str(s).replace("\u00b0", " ").replace("\u00c2\u00b0", " ")
+    # Strips the degree sign so log output can't hit an encoding error.
+    _log_safe = staticmethod(wcls.log_safe)
 
     def _attr_bool_true(self, val) -> bool:
         """HA/AppDaemon entity attributes may be bool or string."""
@@ -1122,37 +1000,13 @@ class WasherMonitor(hass.Hass):
                 end_time=end_time,
             )
             hist = self._flatten_history(hist, self.power_sensor)
-            points = []
-            for entry in hist:
-                try:
-                    ts = entry.get("last_changed") or entry.get("last_updated")
-                    if not ts:
-                        continue
-                    t = _parse_utc(ts)
-                    if t is None:
-                        continue
-                    s = entry.get("state")
-                    if s is None or s in ("unknown", "unavailable", ""):
-                        continue
-                    points.append((t, float(s)))
-                except (ValueError, TypeError, AttributeError):
-                    continue
+            points = whist.parse_power_points(hist)
             if len(points) < 2:
                 return None
             points.sort(key=lambda x: x[0])
-            for i, (t0, w0) in enumerate(points):
-                if w0 < self.start_w:
-                    continue
-                highs = 1
-                for j in range(i + 1, len(points)):
-                    t1, w1 = points[j]
-                    if (t1 - t0).total_seconds() > 25 * 60:
-                        break
-                    if w1 >= self.start_w:
-                        highs += 1
-                        if highs >= 2:
-                            return t0
-            return None
+            return wpow.find_first_sustained_high(
+                points, self.start_w, window_seconds=25 * 60, needed=2
+            )
         except Exception as e:
             self.log(f"Could not infer start from power history: {e}", level="DEBUG")
             return None
@@ -1189,16 +1043,7 @@ class WasherMonitor(hass.Hass):
 
     def _flatten_history(self, hist, entity_id=None):
         """AppDaemon get_history returns list[list[dict]] (or occasionally dict). Normalize to list[dict]."""
-        if isinstance(hist, dict):
-            if entity_id is not None:
-                hist = hist.get(entity_id, []) or hist.get("history", [])
-            else:
-                hist = next(iter(hist.values()), [])
-        if isinstance(hist, list):
-            if hist and isinstance(hist[0], list):
-                return hist[0]
-            return hist
-        return []
+        return whist.flatten_history(hist, entity_id)
 
     def _infer_start_from_state_history(self):
         """Infer cycle start from state entity history: when did we transition to Running from Off/Emptied?
@@ -1254,55 +1099,14 @@ class WasherMonitor(hass.Hass):
             hist = self._flatten_history(hist, self.power_sensor)
             if len(hist) < 3:
                 return None
-            points = []
-            for entry in hist:
-                try:
-                    ts = entry.get("last_changed") or entry.get("last_updated")
-                    if not ts:
-                        continue
-                    t = _parse_utc(ts)
-                    if t is None:
-                        continue
-                    s = entry.get("state")
-                    if s is None or s in ("unknown", "unavailable", ""):
-                        continue
-                    points.append((t, float(s)))
-                except (ValueError, TypeError, AttributeError):
-                    continue
+            points = whist.parse_power_points(hist)
             if len(points) < 3:
                 return None
             points.sort(key=lambda x: x[0])
-            gap_min_seconds = self.restore_start_gap_minutes * 60
-            # Find first gap after from_time: continuous period >= gap_min_seconds with all power < start_w
-            gap_start = None
-            for i, (t, power) in enumerate(points):
-                if t < from_time:
-                    continue
-                if power < self.start_w:
-                    if gap_start is None:
-                        gap_start = t
-                else:
-                    if gap_start is not None:
-                        gap_len = (t - gap_start).total_seconds()
-                        if gap_len >= gap_min_seconds:
-                            # Found a long gap; first sustained high power after this is at t (current point)
-                            # Require at least one more high reading soon after to be sure it's sustained
-                            sustained_count = 1
-                            for j in range(i + 1, len(points)):
-                                if (points[j][0] - t).total_seconds() > 300:
-                                    break
-                                if points[j][1] >= self.start_w:
-                                    sustained_count += 1
-                                    if sustained_count >= 2:
-                                        return t
-                            if sustained_count >= 1:
-                                return t
-                        gap_start = None
-            # Check if gap runs to end of window (still in gap at to_time)
-            if gap_start is not None and (to_time - gap_start).total_seconds() >= gap_min_seconds:
-                # Gap extends to now; no "after gap" high power in window - don't infer
-                return None
-            return None
+            return wpow.find_start_after_gap(
+                points, from_time, to_time, self.start_w,
+                gap_min_seconds=self.restore_start_gap_minutes * 60,
+            )
         except Exception as e:
             self.log(f"Could not infer cycle start from power history: {e}", level="DEBUG")
             return None
@@ -1325,37 +1129,12 @@ class WasherMonitor(hass.Hass):
             hist = self._flatten_history(hist, self.power_sensor)
             if len(hist) < 2:
                 return False
-            points = []
-            for entry in hist:
-                try:
-                    ts = entry.get("last_changed") or entry.get("last_updated")
-                    if not ts:
-                        continue
-                    t = _parse_utc(ts)
-                    if t is None:
-                        continue
-                    s = entry.get("state")
-                    if s is None or s in ("unknown", "unavailable", ""):
-                        continue
-                    points.append((t, float(s)))
-                except (ValueError, TypeError, AttributeError):
-                    continue
+            points = whist.parse_power_points(hist)
             if len(points) < 2:
                 return False
             points.sort(key=lambda x: x[0])
-            bursts = 0
-            in_burst = False
-            max_w = self.max_power_seen
-            for t, w in points:
-                if w > max_w:
-                    max_w = w
-                if w > 1000:
-                    if not in_burst:
-                        in_burst = True
-                        bursts += 1
-                elif w < 500:
-                    in_burst = False
-            if bursts > 0 or max_w > 1000:
+            bursts, max_w = wpow.count_heating_bursts(points, self.max_power_seen)
+            if bursts > 0 or max_w > wpow.BURST_ON_WATTS:
                 self.observed_heating = True
                 self.heating_phase_count = max(self.heating_phase_count, bursts)
                 self.max_power_seen = max(self.max_power_seen, max_w)
@@ -1384,37 +1163,11 @@ class WasherMonitor(hass.Hass):
             hist = self._flatten_history(hist, self.power_sensor)
             if len(hist) < 2:
                 return (None, None)
-            points = []
-            for entry in hist:
-                try:
-                    ts = entry.get("last_changed") or entry.get("last_updated")
-                    if not ts:
-                        continue
-                    t = _parse_utc(ts)
-                    if t is None:
-                        continue
-                    s = entry.get("state")
-                    if s is None or s in ("unknown", "unavailable", ""):
-                        continue
-                    points.append((t, float(s)))
-                except (ValueError, TypeError, AttributeError):
-                    continue
+            points = whist.parse_power_points(hist)
             if len(points) < 2:
                 return (None, None)
             points.sort(key=lambda x: x[0])
-            bursts = 0
-            in_burst = False
-            max_w = 0.0
-            for _t, w in points:
-                if w > max_w:
-                    max_w = w
-                if w > 1000:
-                    if not in_burst:
-                        in_burst = True
-                        bursts += 1
-                elif w < 500:
-                    in_burst = False
-            return (bursts, max_w)
+            return wpow.count_heating_bursts(points, 0.0)
         except Exception as e:
             self.log(f"Could not backfill heating from history for feedback: {e}", level="DEBUG")
             return (None, None)
@@ -1456,21 +1209,7 @@ class WasherMonitor(hass.Hass):
             if len(hist) < 2:
                 self.log("Not enough energy history to restore buffer", level="DEBUG")
                 return False
-            points = []
-            for entry in hist:
-                try:
-                    ts = entry.get("last_changed") or entry.get("last_updated")
-                    if not ts:
-                        continue
-                    t = _parse_utc(ts)
-                    if t is None:
-                        continue
-                    s = entry.get("state")
-                    if s is None or s in ("unknown", "unavailable", ""):
-                        continue
-                    points.append((t, float(s)))
-                except (ValueError, TypeError, AttributeError):
-                    continue
+            points = whist.parse_power_points(hist)
             if len(points) < 2:
                 return False
             points.sort(key=lambda x: x[0])
@@ -1479,16 +1218,8 @@ class WasherMonitor(hass.Hass):
             self.last_energy_value = points[-1][1]
             self.last_energy_time = points[-1][0]
             # Last time we saw implied watts above threshold (cycle was still consuming)
-            self.last_high_energy_at = None
-            for i in range(1, len(points)):
-                t1, e1 = points[i - 1]
-                t2, e2 = points[i]
-                delta_s = (t2 - t1).total_seconds()
-                if delta_s < 10:
-                    continue
-                implied_w = ((e2 - e1) * 1000) / (delta_s / 3600)
-                if implied_w > self.energy_active_watts:
-                    self.last_high_energy_at = t2
+            high_ends = wpow.high_power_end_times(points, self.energy_active_watts)
+            self.last_high_energy_at = high_ends[-1] if high_ends else None
             if self.last_high_energy_at is None:
                 self.last_high_energy_at = self.start_time
             self.energy_stable_start_time = None
@@ -1527,21 +1258,7 @@ class WasherMonitor(hass.Hass):
             if len(hist) < 2:
                 self.log("Cycle end from history: not enough history points", level="DEBUG")
                 return None
-            points = []
-            for entry in hist:
-                try:
-                    ts = entry.get("last_changed") or entry.get("last_updated")
-                    if not ts:
-                        continue
-                    t = _parse_utc(ts)
-                    if t is None:
-                        continue
-                    s = entry.get("state")
-                    if s is None or s in ("unknown", "unavailable", ""):
-                        continue
-                    points.append((t, float(s)))
-                except (ValueError, TypeError, AttributeError):
-                    continue
+            points = whist.parse_power_points(hist)
             if len(points) < 2:
                 self.log("Cycle end from history: not enough valid energy points", level="DEBUG")
                 return None
@@ -1549,16 +1266,7 @@ class WasherMonitor(hass.Hass):
             run_minutes_max = (end_time - self.start_time).total_seconds() / 60
 
             # Collect all timestamps that are "end of a high-power period" (implied watts above threshold).
-            high_end_candidates = []
-            for i in range(1, len(points)):
-                t1, e1 = points[i - 1]
-                t2, e2 = points[i]
-                delta_s = (t2 - t1).total_seconds()
-                if delta_s < 10:
-                    continue
-                implied_w = ((e2 - e1) * 1000) / (delta_s / 3600)
-                if implied_w > self.energy_active_watts:
-                    high_end_candidates.append(t2)
+            high_end_candidates = wpow.high_power_end_times(points, self.energy_active_watts)
 
             if not high_end_candidates:
                 self.log("Cycle end from history: no high-power end candidates in energy series", level="DEBUG")
@@ -1568,16 +1276,10 @@ class WasherMonitor(hass.Hass):
                 # User-confirmed (or hinted) programme: pick the high-end that gives duration
                 # closest to expected, within valid range. This avoids picking a late spike or
                 # early heating end when the real cycle end is around expected_duration.
-                best_end = None
-                best_diff = float("inf")
-                for t in high_end_candidates:
-                    dur = (t - self.start_time).total_seconds() / 60
-                    if dur < self.min_cycle_minutes or dur > run_minutes_max:
-                        continue
-                    diff = abs(dur - expected_duration_min)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best_end = t
+                best_end = wpow.end_closest_to_expected(
+                    high_end_candidates, self.start_time, expected_duration_min,
+                    self.min_cycle_minutes, run_minutes_max,
+                )
                 if best_end is not None:
                     for t, _ in points:
                         if t > best_end:
@@ -1616,30 +1318,18 @@ class WasherMonitor(hass.Hass):
             hist = self._flatten_history(hist, self.power_sensor)
             if len(hist) < 6:
                 return False
-            points = []
-            for entry in hist:
-                try:
-                    ts = entry.get("last_changed") or entry.get("last_updated")
-                    if not ts:
-                        continue
-                    t = _parse_utc(ts)
-                    if t is None:
-                        continue
-                    s = entry.get("state")
-                    if s is None or s in ("unknown", "unavailable", ""):
-                        continue
-                    points.append((t, float(s)))
-                except (ValueError, TypeError, AttributeError):
-                    continue
+            points = whist.parse_power_points(hist)
             if len(points) < 6:
                 return False
             points.sort(key=lambda x: x[0])
             watts = [w for _, w in points]
-            mean_w = sum(watts) / len(watts)
-            variance = sum((w - mean_w) ** 2 for w in watts) / len(watts)
-            std_w = variance ** 0.5
-            if (self.post_cycle_pattern_mean_low <= mean_w <= self.post_cycle_pattern_mean_high and
-                    std_w >= self.post_cycle_pattern_min_std):
+            mean_w, std_w = wpow.mean_and_std(watts)
+            if wpow.slow_spin_pattern_ok(
+                mean_w, std_w,
+                self.post_cycle_pattern_mean_low,
+                self.post_cycle_pattern_mean_high,
+                self.post_cycle_pattern_min_std,
+            ):
                 self.log(
                     f"Post-cycle slow-spin pattern detected (power mean={mean_w:.1f}W std={std_w:.1f}W over {len(points)} points)",
                     level="DEBUG",
@@ -1673,21 +1363,7 @@ class WasherMonitor(hass.Hass):
                 end_time=end_time,
             )
             hist = self._flatten_history(hist, self.power_sensor)
-            points = []
-            for entry in hist:
-                try:
-                    ts_str = entry.get("last_changed") or entry.get("last_updated")
-                    if not ts_str:
-                        continue
-                    t = _parse_utc(ts_str)
-                    if t is None:
-                        continue
-                    s = entry.get("state")
-                    if s is None or s in ("unknown", "unavailable", ""):
-                        continue
-                    points.append((t, float(s)))
-                except (ValueError, TypeError, AttributeError):
-                    continue
+            points = whist.parse_power_points(hist)
             points.sort(key=lambda x: x[0])
             return points
         except Exception as e:
@@ -1701,34 +1377,7 @@ class WasherMonitor(hass.Hass):
         points = self._get_recent_power_history(window_minutes)
         if len(points) < 5:
             return (None, None, None, None)
-        now = self._now_utc()
-        total_seconds = 0.0
-        weighted_sum = 0.0
-        weighted_sq_sum = 0.0
-        duty_above = 0.0
-        peak_w = 0.0
-        active_w = self.energy_active_watts
-        for i, (t, w) in enumerate(points):
-            if w > peak_w:
-                peak_w = w
-            if i + 1 < len(points):
-                dt = (points[i + 1][0] - t).total_seconds()
-            else:
-                dt = (now - t).total_seconds()
-            if dt <= 0:
-                continue
-            total_seconds += dt
-            weighted_sum += w * dt
-            weighted_sq_sum += w * w * dt
-            if w > active_w:
-                duty_above += dt
-        if total_seconds <= 0:
-            return (None, None, None, None)
-        mean_w = weighted_sum / total_seconds
-        variance = (weighted_sq_sum / total_seconds) - (mean_w * mean_w)
-        std_w = (variance ** 0.5) if variance > 0 else 0.0
-        duty_above_frac = duty_above / total_seconds
-        return (mean_w, std_w, peak_w, duty_above_frac)
+        return wpow.time_weighted_stats(points, self._now_utc(), self.energy_active_watts)
 
     def _tail_pulse_reset_threshold_watts(self) -> float:
         """Threshold for resetting last_tail_pulse_at. In FinishingTail use finishing_tail_pulse_reset_watts
@@ -1741,13 +1390,7 @@ class WasherMonitor(hass.Hass):
         """Return the time of the most recent power history point above tail reset threshold, or None."""
         thr = self._tail_pulse_reset_threshold_watts()
         points = self._get_recent_power_history(2.0)  # last 2 min
-        if not points:
-            return None
-        last_t = None
-        for t, w in points:
-            if w > thr:
-                last_t = t
-        return last_t
+        return wpow.last_time_above(points, thr)
 
     def _refresh_tail_pulse_tracking(self):
         """While in FinishingTail, merge last_tail_pulse_at with recorder history (missed live callbacks)
@@ -1784,34 +1427,15 @@ class WasherMonitor(hass.Hass):
         if len(points) < 3:
             return False
         cutoff = self._now_utc() - timedelta(seconds=self.tail_idle_confirm_seconds)
-        watts = [w for t, w in points if t >= cutoff]
-        if len(watts) < 3:
-            watts = [w for _, w in points]
-        if not watts:
-            return False
-        peak_w = max(watts)
-        mean_w = sum(watts) / len(watts)
-        return (
-            peak_w <= self.tail_idle_peak_max_watts
-            and mean_w <= self.post_cycle_idle_watts
+        return wpow.tail_idle_ok(
+            points, cutoff, self.tail_idle_peak_max_watts, self.post_cycle_idle_watts
         )
 
     def _extract_tail_pulse_times(self, points):
         """Extract pulse timestamps from power points using an edge detector with gap de-duplication."""
-        if not points:
-            return []
-        pulse_times = []
-        in_pulse = False
-        thr = self.tail_pattern_pulse_threshold_watts
-        for t, w in points:
-            if w >= thr:
-                if not in_pulse:
-                    if not pulse_times or (t - pulse_times[-1]).total_seconds() >= self.tail_pattern_min_gap_seconds:
-                        pulse_times.append(t)
-                    in_pulse = True
-            elif w <= max(0.0, thr * 0.5):
-                in_pulse = False
-        return pulse_times
+        return wpow.extract_pulse_times(
+            points, self.tail_pattern_pulse_threshold_watts, self.tail_pattern_min_gap_seconds
+        )
 
     def _update_tail_pattern_lock(self):
         """Lock to repeatable anti-crease/spin pulse cadence while in FinishingTail."""
@@ -1825,21 +1449,14 @@ class WasherMonitor(hass.Hass):
         pulse_times = self._extract_tail_pulse_times(points)
         if pulse_times:
             self.tail_pattern_last_pulse_at = pulse_times[-1]
-        if len(pulse_times) < self.tail_pattern_lock_min_pulses:
-            return
-        gaps = []
-        for i in range(1, len(pulse_times)):
-            gap_s = (pulse_times[i] - pulse_times[i - 1]).total_seconds()
-            if self.tail_pattern_min_gap_seconds <= gap_s <= self.tail_pattern_max_gap_seconds:
-                gaps.append(gap_s)
-        if len(gaps) < max(3, self.tail_pattern_lock_min_pulses - 1):
-            return
-        gaps_sorted = sorted(gaps)
-        med_gap = gaps_sorted[len(gaps_sorted) // 2]
-        if med_gap <= 0:
-            return
-        max_dev = max(abs(g - med_gap) for g in gaps)
-        if (max_dev / med_gap) > self.tail_pattern_max_jitter_fraction:
+        med_gap = wpow.pulse_cadence(
+            pulse_times,
+            self.tail_pattern_min_gap_seconds,
+            self.tail_pattern_max_gap_seconds,
+            self.tail_pattern_lock_min_pulses,
+            self.tail_pattern_max_jitter_fraction,
+        )
+        if med_gap is None:
             return
         newly_locked = not self.tail_pattern_locked
         self.tail_pattern_locked = True
@@ -1925,18 +1542,12 @@ class WasherMonitor(hass.Hass):
         mean_w, std_w, peak_w, duty_above = self._get_tail_stats_time_weighted(w)
         if mean_w is None:
             points = self._get_recent_power_history(w)
-            if not points:
-                return False
-            active_w = self.energy_active_watts
-            above_active = sum(1 for _, p in points if p > active_w)
-            if above_active / max(1, len(points)) > self.anti_crease_max_duty_above_active:
-                return True
-            if any(p > 500 for _, p in points):
-                return True
-            return False
+            return wpow.activity_from_point_counts(
+                points, self.energy_active_watts, self.anti_crease_max_duty_above_active
+            )
         if duty_above > self.anti_crease_max_duty_above_active:
             return True
-        if peak_w > 500:
+        if peak_w > wpow.HEATING_BURST_WATTS:
             return True
         return False
 
@@ -1948,37 +1559,23 @@ class WasherMonitor(hass.Hass):
             mean_w, std_w, peak_w, duty_above = self._get_tail_stats_time_weighted(self.anti_crease_window_minutes)
             if mean_w is None:
                 return (False, None, None, None)
-            ok = (
-                mean_w <= self.anti_crease_tail_max_mean_w
-                and std_w >= self.anti_crease_tail_min_std_w
-                and duty_above <= self.anti_crease_max_duty_above_active
-                and peak_w <= 500  # No heating burst in window
+            ok = wpow.anti_crease_ok_from_stats(
+                mean_w, std_w, peak_w, duty_above,
+                self.anti_crease_tail_max_mean_w,
+                self.anti_crease_tail_min_std_w,
+                self.anti_crease_max_duty_above_active,
+                self.anti_crease_tail_max_peak_w,
             )
-            if ok and self.anti_crease_tail_max_peak_w is not None:
-                ok = peak_w <= self.anti_crease_tail_max_peak_w
             return (ok, mean_w, std_w, peak_w)
         points = self._get_recent_power_history(self.anti_crease_window_minutes)
-        if len(points) < 5:
-            return (False, None, None, None)
-        watts = [p for _, p in points]
-        import statistics
-        mean_w = statistics.mean(watts)
-        try:
-            std_w = statistics.stdev(watts)
-        except statistics.StatisticsError:
-            std_w = 0.0
-        peak_w = max(watts)
-        active_w = self.energy_active_watts
-        duty_above = sum(1 for w in watts if w > active_w) / len(watts)
-        ok = (
-            mean_w <= self.anti_crease_tail_max_mean_w
-            and std_w >= self.anti_crease_tail_min_std_w
-            and duty_above <= self.anti_crease_max_duty_above_active
-            and not any(w > 500 for w in watts)
+        return wpow.anti_crease_from_points(
+            points,
+            self.energy_active_watts,
+            self.anti_crease_tail_max_mean_w,
+            self.anti_crease_tail_min_std_w,
+            self.anti_crease_max_duty_above_active,
+            self.anti_crease_tail_max_peak_w,
         )
-        if ok and self.anti_crease_tail_max_peak_w is not None:
-            ok = peak_w <= self.anti_crease_tail_max_peak_w
-        return (ok, mean_w, std_w, peak_w)
 
     def _power_looks_like_cycle_end(self, window_minutes: float | None = None) -> tuple[bool, float | None, float | None]:
         """True only if recent power pattern looks like real cycle end (anti-crease or machine off), not mid-cycle rinse.
@@ -1986,19 +1583,13 @@ class WasherMonitor(hass.Hass):
         Returns (ok, mean_w, peak_w) for logging."""
         w = window_minutes or self.anti_crease_window_minutes
         points = self._get_recent_power_history(w)
-        if len(points) < 5:
-            return (False, None, None)
-        watts = [p for _, p in points]
-        import statistics
-        mean_w = statistics.mean(watts)
-        peak_w = max(watts)
-        # Real anti-crease or gentle tail: low mean, no high spikes (we saw mean ~18–20W, peak 47W).
-        if mean_w <= self.finish_power_gate_max_mean_w and peak_w <= self.finish_power_gate_max_peak_w:
-            return (True, mean_w, peak_w)
-        # Machine fully off: flat idle (manual: 0–2.8W; allow a bit of sensor noise).
-        if mean_w <= self.finish_power_gate_off_max_mean_w and peak_w <= self.finish_power_gate_off_max_peak_w:
-            return (True, mean_w, peak_w)
-        return (False, mean_w, peak_w)
+        return wpow.looks_like_cycle_end(
+            points,
+            self.finish_power_gate_max_mean_w,
+            self.finish_power_gate_max_peak_w,
+            self.finish_power_gate_off_max_mean_w,
+            self.finish_power_gate_off_max_peak_w,
+        )
 
     def _get_run_duration_minutes(self):
         """Get how long the current cycle has been running in minutes."""
@@ -2047,71 +1638,25 @@ class WasherMonitor(hass.Hass):
         user_confirmed_override: bool | None = None,  # For migration: use rec's programme_user_confirmed
     ):
         """Classify a completed cycle for learning quality. Returns completion_class, valid_for_learning, validation_flags, end_reason.
-        Finish detection decides UI state; validation only classifies the saved record."""
-        flags = []
-        profile = self._get_profile(confirmed, confirmed_temperature)
-        nominal_dur = profile.get("duration_min") or profile.get("nominal_duration_min") or 180
-        max_dur = profile.get("max_dur_min") or profile.get("max_valid_duration_min") or int(nominal_dur * 1.2)
+        Finish detection decides UI state; validation only classifies the saved record.
+
+        heating_bursts / max_power_w / predicted / predicted_temperature / spin_rpm are
+        accepted but not consulted - kept in the signature because every caller passes
+        them by keyword and the record shape they belong to is written elsewhere.
+        """
         user_conf = user_confirmed_override if user_confirmed_override is not None else self.programme_confirmed_by_user
-        frac = self.completion_guard_fraction_user_confirmed if user_conf else self.completion_guard_fraction
-        min_valid_dur = max(frac * nominal_dur, self.min_cycle_minutes)
-        min_energy = profile.get("min_valid_energy_kwh") or self.min_energy_kwh
-        if min_energy is None:
-            min_energy = self.min_energy_kwh
-        max_energy = profile.get("max_valid_energy_kwh") or profile.get("max_energy_kwh") or 3.0
-
-        # A. Duration too short
-        if run_minutes < min_valid_dur:
-            flags.append("runtime_too_short")
-        if run_minutes > max_dur:
-            flags.append("duration_too_long")
-        # B. Energy
-        if energy_kwh < min_energy:
-            flags.append("energy_too_low")
-        if energy_kwh > max_energy:
-            flags.append("energy_too_high")
-        # C. Door-open-first: do not assume valid; only completed + valid_for_learning if guards pass
-        if transition_path == "door_opened_first":
-            flags.append("door_opened_first")
-        if transition_path == "unknown_programme" or (confirmed in ("unknown", "") or not confirmed):
-            flags.append("unknown_programme")
-
-        if "runtime_too_short" in flags and run_minutes < self.min_cycle_minutes:
-            completion_class = "interrupted"
-        elif "runtime_too_short" in flags or "energy_too_low" in flags or "energy_too_high" in flags:
-            # User-confirmed programme: trust their selection; allow learning even if energy is above profile max.
-            if user_conf and set(flags) <= {"energy_too_high"}:
-                completion_class = "completed"
-            else:
-                completion_class = "suspect"
-        elif transition_path == "door_opened_first" and ("runtime_too_short" in flags or "energy_too_low" in flags):
-            completion_class = "suspect"
-        else:
-            completion_class = "completed"
-
-        # D. Duration too long (e.g. a delayed-start wait that slipped past the trim guards) -
-        # never trust it for learning, even if it otherwise looked "completed".
-        if "duration_too_long" in flags and completion_class != "interrupted":
-            completion_class = "suspect"
-
-        valid_for_learning = (
-            completion_class == "completed"
-            and "runtime_too_short" not in flags
-            and "energy_too_low" not in flags
-            and "unknown_programme" not in flags
+        return wcls.classify_cycle_completion(
+            run_minutes=run_minutes,
+            energy_kwh=energy_kwh,
+            confirmed=confirmed,
+            transition_path=transition_path,
+            profile=self._get_profile(confirmed, confirmed_temperature),
+            user_conf=user_conf,
+            guard_fraction=(self.completion_guard_fraction_user_confirmed if user_conf else self.completion_guard_fraction),
+            min_cycle_minutes=self.min_cycle_minutes,
+            min_energy_kwh=self.min_energy_kwh,
+            validation_key=wp.learn_key_for(self.PROGRAMME_PROFILES, confirmed, confirmed_temperature),
         )
-        if transition_path == "door_opened_first" and completion_class != "completed":
-            valid_for_learning = False
-        if "duration_too_long" in flags:
-            valid_for_learning = False
-
-        return {
-            "completion_class": completion_class,
-            "valid_for_learning": valid_for_learning,
-            "validation_flags": flags,
-            "end_reason": transition_path,
-            "programme_key_used_for_validation": f"{confirmed}|{confirmed_temperature}" if (confirmed_temperature and self._programme_has_temperature(confirmed)) else confirmed,
-        }
 
     def _should_change_state(self, new_state, force=False):
         """Check if we should allow a state change.
@@ -2828,27 +2373,14 @@ class WasherMonitor(hass.Hass):
         duration_min = removed.get("duration_min", 0)
         energy_kwh = removed.get("energy_kwh", 0)
         heating_bursts = removed.get("heating_bursts", 0)
-        learn_key = f"{confirmed}|{confirmed_temp}" if (confirmed_temp and self._programme_has_temperature(confirmed)) else confirmed
-        if learn_key in self._learned_durations:
-            old = self._learned_durations[learn_key]
-            n = old["n"] - 1
-            if n <= 0:
-                del self._learned_durations[learn_key]
-            else:
-                avg_new = (old["avg"] * old["n"] - duration_min) / n
-                self._learned_durations[learn_key] = {"n": n, "avg": avg_new}
-        if learn_key in self._history_centroids and duration_min and duration_min > 0:
-            old = self._history_centroids[learn_key]
-            n = old["n"] - 1
-            if n <= 0:
-                del self._history_centroids[learn_key]
-            else:
-                rate_removed = energy_kwh / duration_min
-                self._history_centroids[learn_key] = {
-                    "rate": (old["rate"] * old["n"] - rate_removed) / n,
-                    "heating_bursts": (old["heating_bursts"] * old["n"] - heating_bursts) / n,
-                    "n": n,
-                }
+        wfb.remove_learned_sample(
+            self._learned_durations,
+            self._history_centroids,
+            wp.learn_key_for(self.PROGRAMME_PROFILES, confirmed, confirmed_temp),
+            duration_min,
+            energy_kwh,
+            heating_bursts,
+        )
         try:
             with open(self.feedback_file, "w") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -4146,142 +3678,11 @@ class WasherMonitor(hass.Hass):
             return []
 
     def _identify_cycles_from_history(self, energy_hist, door_hist, power_hist, state_hist):
-        """Identify individual cycles from history data.
-        
-        Uses POWER-BASED detection: cycle starts when power goes high (>=start_w),
-        cycle ends when power drops low (<=stop_w) and stays low.
-        This is the correct approach as it reflects actual washer operation, not user timing.
-        """
-        cycles = []
-        running_periods = []
-        
-        # Primary method: Use POWER to identify actual cycle boundaries
-        # Cycle starts: Power goes from low (<start_w) to high (>=start_w)
-        # Cycle ends: Power drops from high to low (<=stop_w) and stays low
-        if power_hist and len(power_hist) > 0:
-            # Sort power readings by timestamp
-            power_readings = []
-            for entry in power_hist:
-                try:
-                    timestamp_str = entry.get("last_changed", "")
-                    timestamp = _parse_utc(timestamp_str)
-                    if timestamp is None:
-                        continue
-                    power_str = entry.get("state", "0")
-                    if power_str not in ["unknown", "unavailable", None]:
-                        power = float(power_str)
-                        power_readings.append((timestamp, power))
-                except (ValueError, AttributeError, TypeError):
-                    continue
-            
-            power_readings.sort(key=lambda x: x[0])
-            
-            # Detect cycle boundaries based on power thresholds
-            current_start = None
-            low_power_count = 0
-            high_power_count = 0
-            low_power_start_time = None  # Track when low power period started
-            
-            for idx, (timestamp, power) in enumerate(power_readings):
-                # Cycle start detection: power goes from low to high
-                if current_start is None:
-                    if power >= self.start_w:
-                        high_power_count += 1
-                        if high_power_count >= self.high_power_threshold:
-                            # Confirmed cycle start - use first high power reading
-                            start_idx = max(0, idx - self.high_power_threshold + 1)
-                            current_start = power_readings[start_idx][0]
-                            high_power_count = 0
-                            low_power_count = 0
-                            low_power_start_time = None
-                    else:
-                        high_power_count = 0
-                
-                # Cycle end detection: power drops and stays low
-                elif current_start is not None:
-                    if power <= self.stop_w:
-                        if low_power_start_time is None:
-                            low_power_start_time = timestamp
-                        low_power_count += 1
-                        
-                        # Check if we've had enough consecutive low readings
-                        if low_power_count >= self.low_power_threshold:
-                            # Confirmed cycle end - use when low power period started
-                            cycle_end = low_power_start_time
-                            running_periods.append((current_start, cycle_end, "Off"))
-                            current_start = None
-                            low_power_count = 0
-                            high_power_count = 0
-                            low_power_start_time = None
-                    else:
-                        # Power recovered above stop_w - reset low power tracking
-                        low_power_count = 0
-                        low_power_start_time = None
-        
-        # Fallback: Use state transitions if power data insufficient
-        if not running_periods and state_hist:
-            current_start = None
-            for entry in state_hist:
-                state = entry.get("state", "")
-                timestamp_str = entry.get("last_changed", "")
-                try:
-                    timestamp = _parse_utc(timestamp_str)
-                    if timestamp is None:
-                        continue
-                    if state == "Running" and current_start is None:
-                        current_start = timestamp
-                    elif state in ("Off", "Unemptied") and current_start is not None:
-                        running_periods.append((current_start, timestamp, state))
-                        current_start = None
-                except (ValueError, AttributeError):
-                    continue
-        
-        # For each running period, calculate energy and duration
-        for start, end, end_state in running_periods:
-            # Find energy at start and end
-            # Energy is cumulative, so we need the reading closest to each timestamp
-            start_energy = None
-            end_energy = None
-            start_energy_time = None
-            end_energy_time = None
-            
-            if energy_hist:
-                for entry in energy_hist:
-                    try:
-                        timestamp = _parse_utc(entry.get("last_changed", ""))
-                        if timestamp is None:
-                            continue
-                        energy = float(entry.get("state", 0))
-                        
-                        # Find energy reading closest to start time (within 10 minutes)
-                        if abs((timestamp - start).total_seconds()) <= 600:  # 10 minutes
-                            if start_energy is None or abs((timestamp - start).total_seconds()) < abs((start_energy_time - start).total_seconds()):
-                                start_energy = energy
-                                start_energy_time = timestamp
-                        
-                        # Find energy reading closest to end time (within 10 minutes)
-                        if abs((timestamp - end).total_seconds()) <= 600:  # 10 minutes
-                            if end_energy is None or abs((timestamp - end).total_seconds()) < abs((end_energy_time - end).total_seconds()):
-                                end_energy = energy
-                                end_energy_time = timestamp
-                    except (ValueError, AttributeError, TypeError):
-                        continue
-            
-            if start_energy is not None and end_energy is not None:
-                energy_used = end_energy - start_energy
-                duration_min = (end - start).total_seconds() / 60
-                
-                cycles.append({
-                    "start": start,
-                    "end": end,
-                    "duration_minutes": duration_min,
-                    "energy_kwh": energy_used,
-                    "end_state": end_state,
-                    "start_energy": start_energy,
-                    "end_energy": end_energy
-                })
-        
-        return cycles
+        """Identify individual cycles from history data. See washer_history.identify_cycles."""
+        return whist.identify_cycles(
+            energy_hist, door_hist, power_hist, state_hist,
+            self.start_w, self.stop_w, self.high_power_threshold, self.low_power_threshold,
+        )
 
     def _classify_programme(self, energy_signature_only: bool = False):
         """Classify the running programme from power signature, energy, and runtime.
@@ -4399,38 +3800,14 @@ class WasherMonitor(hass.Hass):
         try:
             val = self.get_state(self.temperature_entity)
             if val and val not in ("unknown", "unavailable"):
-                # "—" (em dash) = no choice made; "Cold" = cold/snowflake (no heating)
-                if val.strip() in ("—", "–", "-"):
-                    return None
-                if val.strip().lower() == "cold":
-                    return "cold"
-                return val if "°" in val else f"{val}°C"
+                return wcls.normalize_selector_temperature(val)
         except Exception:
             pass
         return None
 
-    @staticmethod
-    def _temp_for_storage(temp):
-        """Return temperature for JSON storage (no degree symbol). '40°C' -> '40'; 'cold' -> 'cold'; None/empty -> None."""
-        if not temp or not isinstance(temp, str):
-            return None
-        s = temp.strip()
-        if s.lower() == "cold":
-            return "cold"
-        s = s.replace("°C", "").replace("°", "").strip()
-        return s if s else None
-
-    @staticmethod
-    def _temp_from_storage(s):
-        """Return temperature for internal use (e.g. profile lookup). '40' or '40°C' -> '40°C'; 'cold' -> 'cold'; None/empty -> None."""
-        if s is None or (isinstance(s, str) and not s.strip()):
-            return None
-        s = str(s).strip()
-        if s.lower() == "cold":
-            return "cold"
-        if "°" in s:
-            return s
-        return f"{s}°C" if s else None
+    # JSON storage codec for temperature: '40°C' <-> '40', 'cold' passes through.
+    _temp_for_storage = staticmethod(wcls.temp_for_storage)
+    _temp_from_storage = staticmethod(wcls.temp_from_storage)
 
     def _classify_from_history(self, run_min: float, energy_used: float, heating_bursts: int):
         """Use power-pattern match to historical confirmed cycles when ambiguous.
@@ -4438,19 +3815,10 @@ class WasherMonitor(hass.Hass):
         Centroids are keyed by "prog|temp" strings.
         Returns (programme, temperature) tuple or None.
         """
-        if not self._history_centroids or run_min < 5:
-            return None
-        rate_curr = energy_used / run_min
-        best_key = None
-        best_dist = float("inf")
-        for key, c in self._history_centroids.items():
-            rate_dist = 500 * abs(rate_curr - c["rate"])
-            burst_dist = 0.5 * abs(heating_bursts - c["heating_bursts"])
-            dist = rate_dist + burst_dist
-            if dist < best_dist:
-                best_dist = dist
-                best_key = key
-        if best_key is None or best_dist > 2.0:
+        best_key = wcls.classify_from_history(
+            self._history_centroids, run_min, energy_used, heating_bursts
+        )
+        if best_key is None:
             return None
         parts = best_key.split("|", 1)
         prog = parts[0]
@@ -4566,28 +3934,7 @@ class WasherMonitor(hass.Hass):
     # spin_entity). Align HA helpers via MCP (ha_config_set_helper) or UI so the
     # dropdowns match; the app can call input_select.set_options at startup to
     # re-apply programme options if the helper was reverted.
-    _LABEL_TO_KEY = {
-        # Current HA input_select options (short names, no temperature suffix)
-        "Ekspres":   "ekspres",
-        "Uld":       "uld",
-        "Bomuld":    "bomuld",
-        "Finvask":   "finvask",
-        "Strygelet": "strygelet",
-        "ECO":       "eco",
-        "Mørkt/Denim": "morkt_denim",
-        "Outdoor":   "outdoor",
-        "Imprægnering": "impraegnering",
-        "Pumpe/Centrifugering": "pumpe_centrifugering",
-        "Kun skyl/stivelse": "kun_skyl_stivelse",
-        # Legacy options with temperature suffix (backwards compatibility)
-        "Ekspres 20":   "ekspres",
-        "Uld 30":       "uld",
-        "Bomuld 20":    "bomuld",
-        "Bomuld 60":    "bomuld",
-        "Finvask 40":   "finvask",
-        "Strygelet 30": "strygelet",
-        "ECO 40-60":    "eco",
-    }
+    _LABEL_TO_KEY = dict(wp.LABEL_TO_KEY)
 
     def _get_programme_duration(self, prog: str, temperature=None, use_learned: bool = True) -> int:
         """Return the effective expected duration for a programme (minutes).
@@ -4604,19 +3951,7 @@ class WasherMonitor(hass.Hass):
         if not use_learned:
             return manual
         learn_key = f"{prog}|{temperature}" if temperature else prog
-        learned = self._learned_durations.get(learn_key)
-        if learned is None:
-            return manual
-        n = learned["n"]
-        if n < 1:
-            return manual
-        avg = learned["avg"]
-        if n == 1:
-            return round(0.30 * avg + 0.70 * manual)
-        if n == 2:
-            return round(0.50 * avg + 0.50 * manual)
-        alpha = min(0.9, 0.6 + (n - 3) * (0.30 / 7))
-        return round(alpha * avg + (1 - alpha) * manual)
+        return wp.blend_learned_duration(manual, self._learned_durations.get(learn_key))
 
     def _load_and_apply_feedback(self):
         """Load washer_feedback.json and apply learned programme data.
@@ -4653,59 +3988,8 @@ class WasherMonitor(hass.Hass):
         if not cycles:
             return
 
-        buckets: dict = {}   # {"prog|temp": {"durations": [], "correct": int, "total": int}}
-        signatures = []      # (learn_key, rate kWh/min, heating_bursts)
-        skipped_unconfirmed = 0
-
-        for rec in cycles:
-            confirmed = rec.get("confirmed", "")
-            predicted = rec.get("predicted", "")
-            conf_temp = self._temp_from_storage(rec.get("confirmed_temperature"))
-            pred_temp = self._temp_from_storage(rec.get("predicted_temperature"))
-            dur = rec.get("duration_min")
-            user_confirmed = rec.get("programme_user_confirmed", rec.get("user_confirmed", False))
-            valid_for_learning = rec.get("valid_for_learning", False)  # Only learn from validated cycles
-
-            if not confirmed or not isinstance(dur, (int, float)):
-                continue
-            # Only use user-confirmed cycles for learning - unconfirmed (guessed) programmes
-            # can be wrong (e.g. false finishes with wrong duration).
-            if not user_confirmed:
-                skipped_unconfirmed += 1
-                continue
-            # Only use records with valid_for_learning == True for learned durations and centroids.
-            if not valid_for_learning:
-                continue
-
-            learn_key = f"{confirmed}|{conf_temp}" if (conf_temp and self._programme_has_temperature(confirmed)) else confirmed
-            pred_key = f"{predicted}|{pred_temp}" if (pred_temp and self._programme_has_temperature(predicted)) else predicted
-
-            if learn_key not in buckets:
-                buckets[learn_key] = {"durations": [], "correct": 0, "total": 0, "prog": confirmed, "temp": conf_temp}
-            buckets[learn_key]["durations"].append(dur)
-            buckets[learn_key]["total"] += 1
-            if learn_key == pred_key:
-                buckets[learn_key]["correct"] += 1
-
-            profile = self._get_profile(confirmed, conf_temp)
-            if profile.get("heats") and dur and dur > 0:
-                energy_kwh = rec.get("energy_kwh")
-                bursts = rec.get("heating_bursts")
-                if isinstance(energy_kwh, (int, float)) and energy_kwh >= 0:
-                    rate = energy_kwh / dur
-                    signatures.append((learn_key, rate, bursts if isinstance(bursts, (int, float)) else 0))
-
-        # Build history centroids keyed by "prog|temp"
-        sig_by_key: dict = {}
-        for key, rate, bursts in signatures:
-            sig_by_key.setdefault(key, []).append((rate, bursts))
-        for key, pts in sig_by_key.items():
-            n = len(pts)
-            self._history_centroids[key] = {
-                "rate": sum(r for r, _ in pts) / n,
-                "heating_bursts": sum(b for _, b in pts) / n,
-                "n": n,
-            }
+        buckets, centroids, skipped_unconfirmed = wfb.aggregate_cycles(cycles, self.PROGRAMME_PROFILES)
+        self._history_centroids = centroids
 
         self.log("=== Washer programme feedback summary ===", level="INFO")
         if skipped_unconfirmed:
@@ -4749,49 +4033,11 @@ class WasherMonitor(hass.Hass):
         cycles = data.get("cycles", [])
         if not cycles:
             return
-        profile_version = "1"
-        validation_version = "2"
-        counts = {"completed": 0, "interrupted": 0, "suspect": 0, "learnable": 0, "quarantined": 0, "unchanged": 0}
-        for rec in cycles:
-            if rec.get("completion_class") and rec.get("valid_for_learning") is not None:
-                if rec.get("profile_version") == profile_version and rec.get("validation_version") == validation_version:
-                    counts["unchanged"] += 1
-                    continue
-            dur = rec.get("duration_min")
-            if not isinstance(dur, (int, float)):
-                continue
-            confirmed = rec.get("confirmed", "")
-            conf_temp = self._temp_from_storage(rec.get("confirmed_temperature"))
-            pred = rec.get("predicted", "")
-            pred_temp = self._temp_from_storage(rec.get("predicted_temperature"))
-            transition_path = rec.get("end_reason") or rec.get("transition_path") or "low_power_detected"
-            if transition_path not in ("user_cycle_end", "anti_crease_pattern", "low_power_detected", "door_opened_first", "tail_to_standby", "tail_pattern_break"):
-                transition_path = "low_power_detected"
-            classification = self._classify_cycle_completion(
-                run_minutes=float(dur),
-                energy_kwh=float(rec.get("energy_kwh", 0) or 0),
-                heating_bursts=int(rec.get("heating_bursts", 0) or 0),
-                max_power_w=float(rec.get("max_power_w", 0) or 0),
-                predicted=pred,
-                predicted_temperature=pred_temp,
-                confirmed=confirmed,
-                confirmed_temperature=conf_temp,
-                transition_path=transition_path,
-                spin_rpm=rec.get("spin_rpm"),
-                user_confirmed_override=rec.get("programme_user_confirmed", rec.get("user_confirmed", False)),
-            )
-            rec["completion_class"] = classification["completion_class"]
-            rec["valid_for_learning"] = classification["valid_for_learning"]
-            rec["validation_flags"] = classification["validation_flags"]
-            rec["transition_path"] = classification["end_reason"]
-            rec["programme_key_used_for_validation"] = classification.get("programme_key_used_for_validation", "")
-            rec["profile_version"] = profile_version
-            rec["validation_version"] = validation_version
-            counts[classification["completion_class"]] = counts.get(classification["completion_class"], 0) + 1
-            if classification["valid_for_learning"]:
-                counts["learnable"] += 1
-            else:
-                counts["quarantined"] += 1
+        profile_version = wfb.PROFILE_VERSION
+        validation_version = wfb.VALIDATION_VERSION
+        counts = wfb.migrate_records(
+            cycles, self._classify_cycle_completion, profile_version, validation_version
+        )
         if dry_run:
             self.log(
                 f"Feedback migration dry-run: completed={counts.get('completed', 0)} interrupted={counts.get('interrupted', 0)} "
@@ -4873,61 +4119,39 @@ class WasherMonitor(hass.Hass):
         import json
         import os
 
-        record = {
-            "ts": self._format_local(self._now_utc()),
-            "duration_min": round(duration_min, 1),
-            "energy_kwh": round(energy_kwh, 3),
-            "heating_bursts": heating_bursts,
-            "max_power_w": round(max_power_w, 0),
-            "predicted": predicted,
-            "predicted_temperature": self._temp_for_storage(predicted_temperature),
-            "confirmed": confirmed,
-            "confirmed_temperature": self._temp_for_storage(confirmed_temperature),
-            "programme_user_confirmed": user_confirmed,
-            "spin_user_confirmed": spin_user_confirmed,
-        }
-        if confirmed_by:
-            record["confirmed_by"] = confirmed_by
-        if spin_rpm is not None:
-            record["spin_rpm"] = spin_rpm
-        if duration_source:
-            record["duration_source"] = duration_source
-        if end_reason:
-            record["end_reason"] = end_reason
-        if idle_min is not None and idle_min >= 0:
-            record["idle_min"] = round(idle_min, 1)
-        if effective_end_at:
-            record["effective_end_at"] = effective_end_at
-        if detected_at:
-            record["detected_at"] = detected_at
-        if completion_class:
-            record["completion_class"] = completion_class
-        if valid_for_learning is not None:
-            record["valid_for_learning"] = valid_for_learning
-        if validation_flags is not None:
-            record["validation_flags"] = list(validation_flags)
-        if transition_path:
-            record["transition_path"] = transition_path
-        if programme_key_used_for_validation:
-            record["programme_key_used_for_validation"] = programme_key_used_for_validation
-        if profile_version:
-            record["profile_version"] = profile_version
-        if validation_version:
-            record["validation_version"] = validation_version
-        if selected_options is not None and selected_options:
-            record["selected_options"] = dict(selected_options)
-        if cost_kr is not None:
-            record["cost_kr"] = round(cost_kr, 2)
-        if vibration is not None:
-            record["vibration"] = vibration
-        # started_by/attribution.start: written unconditionally (plain null when unknown is
-        # correct JSON, unlike the entity-attribute None-dropping bug noted above).
-        record["started_by"] = (actor_start or {}).get("person")
-        record["attribution"] = {"start": actor_start}
-        if actor_empty is not None:
-            record["emptied_by"] = (actor_empty or {}).get("person")
-            record["emptied_ts"] = self._format_local(self._now_utc())
-            record["attribution"]["empty"] = actor_empty
+        record = wfb.build_cycle_record(
+            ts=self._format_local(self._now_utc()),
+            predicted=predicted,
+            predicted_temperature=predicted_temperature,
+            confirmed=confirmed,
+            confirmed_temperature=confirmed_temperature,
+            duration_min=duration_min,
+            energy_kwh=energy_kwh,
+            heating_bursts=heating_bursts,
+            max_power_w=max_power_w,
+            spin_rpm=spin_rpm,
+            user_confirmed=user_confirmed,
+            spin_user_confirmed=spin_user_confirmed,
+            duration_source=duration_source,
+            end_reason=end_reason,
+            idle_min=idle_min,
+            confirmed_by=confirmed_by,
+            effective_end_at=effective_end_at,
+            detected_at=detected_at,
+            completion_class=completion_class,
+            valid_for_learning=valid_for_learning,
+            validation_flags=validation_flags,
+            transition_path=transition_path,
+            programme_key_used_for_validation=programme_key_used_for_validation,
+            profile_version=profile_version,
+            validation_version=validation_version,
+            selected_options=selected_options,
+            cost_kr=cost_kr,
+            vibration=vibration,
+            actor_start=actor_start,
+            actor_empty=actor_empty,
+            emptied_ts=(self._format_local(self._now_utc()) if actor_empty is not None else None),
+        )
 
         if os.path.exists(self.feedback_file):
             try:
@@ -4951,12 +4175,7 @@ class WasherMonitor(hass.Hass):
             last = data["cycles"][-1] if data["cycles"] else None
             if last:
                 gap_s = (self._now_utc() - datetime.fromisoformat(last["ts"])).total_seconds()
-                same_programme = (
-                    last.get("confirmed") == record["confirmed"]
-                    and last.get("confirmed_temperature") == record["confirmed_temperature"]
-                )
-                duration_close = abs(float(last["duration_min"]) - record["duration_min"]) <= gap_s / 60.0 + 0.6
-                if 0 <= gap_s <= 180 and same_programme and duration_close:
+                if wfb.is_duplicate_cycle(last, record, gap_s):
                     self.log(
                         f"Skipping duplicate cycle feedback: {record['confirmed']} {record['duration_min']} min "
                         f"already recorded {gap_s:.0f}s ago (ts {last['ts']}) by another cycle-end path",
@@ -4978,26 +4197,15 @@ class WasherMonitor(hass.Hass):
         # Update in-memory learned durations and centroids only when valid for learning
         avg_new = None
         if valid_for_learning:
-            learn_key = f"{confirmed}|{confirmed_temperature}" if (confirmed_temperature and self._programme_has_temperature(confirmed)) else confirmed
-            prev = self._learned_durations.get(learn_key, {"n": 0, "avg": duration_min})
-            n_new = prev["n"] + 1
-            avg_new = (prev["avg"] * prev["n"] + duration_min) / n_new
-            self._learned_durations[learn_key] = {"n": n_new, "avg": avg_new}
-
-            profile = self._get_profile(confirmed, confirmed_temperature)
-            if profile.get("heats") and duration_min and duration_min > 0:
-                centroid_key = learn_key
-                rate_new = energy_kwh / duration_min
-                if centroid_key not in self._history_centroids:
-                    self._history_centroids[centroid_key] = {"rate": rate_new, "heating_bursts": float(heating_bursts), "n": 1}
-                else:
-                    old = self._history_centroids[centroid_key]
-                    n = old["n"] + 1
-                    self._history_centroids[centroid_key] = {
-                        "rate": (old["rate"] * old["n"] + rate_new) / n,
-                        "heating_bursts": (old["heating_bursts"] * old["n"] + heating_bursts) / n,
-                        "n": n,
-                    }
+            avg_new = wfb.apply_learned_sample(
+                self._learned_durations,
+                self._history_centroids,
+                wp.learn_key_for(self.PROGRAMME_PROFILES, confirmed, confirmed_temperature),
+                duration_min,
+                energy_kwh,
+                heating_bursts,
+                self._get_profile(confirmed, confirmed_temperature).get("heats"),
+            )
 
         match = "OK" if predicted == confirmed else f"corrected (predicted {predicted})"
         source = "user confirmed" if user_confirmed else "calculated"
@@ -5208,39 +4416,10 @@ class WasherMonitor(hass.Hass):
     # programme with one tap when a cycle ends unconfirmed but worth learning)
     # =========================================================================
 
-    @staticmethod
-    def _should_send_confirm_push(record: dict, enabled: bool) -> bool:
-        """Gate for the confirm push: only nag when enabled, the cycle actually
-        completed (not an abort/suspect), and no human has confirmed it yet
-        (checks the new programme_confirmed_by_human field and the legacy
-        programme_user_confirmed field - either being true means don't ask)."""
-        if not enabled:
-            return False
-        if record.get("programme_confirmed_by_human") or record.get("programme_user_confirmed"):
-            return False
-        if record.get("completion_class") != "completed":
-            return False
-        return True
-
-    @staticmethod
-    def _encode_confirm_action(ts: str, prog: str, temp: str | None) -> str:
-        """Build the WASHER_CONFIRM|<ts>|<prog>|<temp> action id for the confirm-push
-        button. temp must already be in storage format (e.g. '40', 'cold'); None -> '-'."""
-        return f"WASHER_CONFIRM|{ts}|{prog}|{temp if temp else '-'}"
-
-    @staticmethod
-    def _parse_confirm_action(action: str):
-        """Parse a WASHER_CONFIRM|<ts>|<prog>|<temp> action id back to (ts, prog, temp).
-        temp is storage format or None ('-' -> None). Returns None if malformed."""
-        if not action or not action.startswith("WASHER_CONFIRM|"):
-            return None
-        parts = action.split("|")
-        if len(parts) != 4:
-            return None
-        _, ts, prog, temp = parts
-        if not ts or not prog:
-            return None
-        return (ts, prog, None if temp == "-" else temp)
+    # Confirm-push gate and the WASHER_CONFIRM|<ts>|<prog>|<temp> action codec.
+    _should_send_confirm_push = staticmethod(wfb.should_send_confirm_push)
+    _encode_confirm_action = staticmethod(wfb.encode_confirm_action)
+    _parse_confirm_action = staticmethod(wfb.parse_confirm_action)
 
     def _maybe_send_confirm_push(self, record: dict):
         """Called right after a successful _save_cycle_feedback of the live cycle
@@ -5531,18 +4710,7 @@ class WasherMonitor(hass.Hass):
 
     def _parse_spin_rpm(self, value: str) -> int | None:
         """Parse spin speed from input_select state. Returns rpm (0 = no spin) or None."""
-        if not value or value.strip() in ("—", ""):
-            return None
-        value = value.strip().lower()
-        if "no spin" in value or "flydeslut" in value:
-            return 0
-        import re
-        m = re.search(r"(\d+)\s*rpm", value)
-        if m:
-            return int(m.group(1))
-        if value.isdigit():
-            return int(value)
-        return None
+        return wcls.parse_spin_rpm(value)
 
     def _build_user_id_cache(self):
         """Build a {user_id: display_name} map from HA person.* entities.
