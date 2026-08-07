@@ -5,6 +5,12 @@ WeatherOpeningAlert:
   module: weather_opening_alert
   class: WeatherOpeningAlert
   log: weather_opening_alert_log
+  # Init-order guarantee for get_app("SonosNotifier")/get_app("MobileNotifier") cached
+  # in initialize() (rooftop-rain announce + push); also reloads this app when either
+  # notifier reloads.
+  dependencies:
+    - SonosNotifier
+    - MobileNotifier
 
   rain_rate_entity: sensor.gw2000a_rain_rate_piezo
   wind_speed_entity: sensor.gw2000a_wind_speed
@@ -67,11 +73,15 @@ WeatherOpeningAlert:
       bearing: 335
       rooftop: false
       area: kristines_room
+    # name: spoken/pushed as-is when this door is open in rain (user 2026-08-07:
+    # door 1 = living room, door 2 = Claudia's).
     - entity_id: binary_sensor.rooftop_door_1_contact
       bearing: 245
       rooftop: true
       area: rooftop
+      name: the living room terrace door
     - entity_id: binary_sensor.rooftop_door_2_contact
       bearing: 245
       rooftop: true
       area: rooftop
+      name: Claudia's terrace door

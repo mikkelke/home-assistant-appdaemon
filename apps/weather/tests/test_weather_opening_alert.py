@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 import unittest
@@ -40,6 +41,7 @@ def make_app(args):
     app.run_every = MagicMock()
     app.run_in = MagicMock()
     app.log = MagicMock()
+    app.get_app = MagicMock(return_value=None)
     return app
 
 
@@ -163,6 +165,101 @@ class AreaLabel(unittest.TestCase):
 
     def test_empty_string(self):
         self.assertEqual(woa._area_label(""), "")
+
+
+class RooftopPhrasing(unittest.TestCase):
+    """Announcement copy names WHICH terrace door is open (user 2026-08-07), mirroring
+    the dashboard's red alert row; grammar flexes for one vs both doors."""
+
+    def test_single_named_door_tts(self):
+        self.assertEqual(
+            woa.rooftop_tts_message(["the living room terrace door"]),
+            "Rain detected and the living room terrace door is open. Please close it.",
+        )
+
+    def test_single_named_door_push_capitalized(self):
+        self.assertEqual(
+            woa.rooftop_push_message(["the living room terrace door"]),
+            "The living room terrace door is open. Please close it.",
+        )
+
+    def test_both_doors(self):
+        self.assertEqual(
+            woa.rooftop_tts_message(["the living room terrace door", "Claudia's terrace door"]),
+            "Rain detected and both terrace doors are open. Please close them.",
+        )
+
+    def test_unnamed_door_falls_back(self):
+        self.assertEqual(
+            woa.rooftop_tts_message([""]),
+            "Rain detected and a terrace door is open. Please close it.",
+        )
+
+
+class RooftopNotifyEdge(unittest.TestCase):
+    """The announcement fires exactly once per rooftop episode: rising edge only,
+    silent while latched (rain dips do not re-announce), re-armed once the alert
+    clears so a genuinely new episode announces again."""
+
+    def _app(self):
+        app = woa.WeatherOpeningAlert.__new__(woa.WeatherOpeningAlert)
+        app._rooftop_notified = False
+        return app
+
+    def test_fires_once_then_rearms_after_clear(self):
+        app = self._app()
+        self.assertTrue(app._rooftop_notify_due(True))
+        self.assertFalse(app._rooftop_notify_due(True))
+        self.assertFalse(app._rooftop_notify_due(False))
+        self.assertTrue(app._rooftop_notify_due(True))
+
+    def test_inactive_never_fires(self):
+        app = self._app()
+        self.assertFalse(app._rooftop_notify_due(False))
+        self.assertFalse(app._rooftop_notify_due(False))
+
+
+class RooftopNotifyWiring(unittest.TestCase):
+    """initialize() must survive missing notifier apps (get_app -> None), and
+    _notify_rooftop must log-and-skip in that state, never crash the evaluate loop."""
+
+    def test_initialize_without_notifiers(self):
+        app = make_app(VALID_ARGS)
+        app.initialize()
+        self.assertIsNone(app.sonos_notifier)
+        self.assertIsNone(app.mobile_notifier)
+
+    def test_notify_without_notifiers_does_not_raise(self):
+        app = make_app(VALID_ARGS)
+        app.initialize()
+        asyncio.run(app._notify_rooftop({"open_names": ["the living room terrace door"]}))
+
+    def test_notify_dispatches_sonos_and_push(self):
+        app = make_app(VALID_ARGS)
+        app.initialize()
+        app.sonos_notifier = MagicMock()
+        app.submit_to_executor = MagicMock()
+        push_calls = []
+
+        async def push(**kwargs):
+            push_calls.append(kwargs)
+
+        app.mobile_notifier = types.SimpleNamespace(notify=push)
+        asyncio.run(app._notify_rooftop({"open_names": ["Claudia's terrace door"]}))
+
+        app.submit_to_executor.assert_called_once()
+        _, sonos_kwargs = app.submit_to_executor.call_args
+        self.assertEqual(
+            sonos_kwargs["message"],
+            "Rain detected and Claudia's terrace door is open. Please close it.",
+        )
+        self.assertEqual(len(push_calls), 1)
+        self.assertEqual(push_calls[0]["target"], "all")
+        self.assertEqual(push_calls[0]["title"], "Rain on the roof")
+        self.assertEqual(
+            push_calls[0]["message"],
+            "Claudia's terrace door is open. Please close it.",
+        )
 
 
 if __name__ == "__main__":

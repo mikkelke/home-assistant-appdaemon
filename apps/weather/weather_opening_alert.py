@@ -1,6 +1,9 @@
 """
 Weather opening alert: rooftop rain + wind-driven window rain.
 Publishes weather_opening_alert_* entities via set_state for dashboards (e.g. Home Pulse).
+A NEW rooftop-rain episode also announces over Sonos and pushes to every phone,
+naming which terrace door is open (user 2026-08-07: the terrace doors must not
+stand open in rain).
 """
 
 from __future__ import annotations
@@ -40,6 +43,26 @@ def wind_in_band(wind_deg: float, bearing: float, half_band: float) -> bool:
 
 def _area_label(area_key: str) -> str:
     return area_key.replace("_", " ").strip().title() if area_key else ""
+
+
+def _rooftop_phrase(open_names: list[str]) -> tuple[str, str, str]:
+    """(label, is/are, it/them) for however many terrace doors are open. Names come
+    from the openings config ("the living room terrace door" / "Claudia's terrace
+    door"); an unnamed rooftop opening falls back to a generic label."""
+    if len(open_names) >= 2:
+        return "both terrace doors", "are", "them"
+    named = [n for n in open_names if n]
+    return (named[0] if named else "a terrace door"), "is", "it"
+
+
+def rooftop_tts_message(open_names: list[str]) -> str:
+    label, verb, obj = _rooftop_phrase(open_names)
+    return f"Rain detected and {label} {verb} open. Please close {obj}."
+
+
+def rooftop_push_message(open_names: list[str]) -> str:
+    label, verb, obj = _rooftop_phrase(open_names)
+    return f"{label[0].upper()}{label[1:]} {verb} open. Please close {obj}."
 
 
 def _wind_scalar_to_kmh(value: float, uom: Optional[str]) -> float:
@@ -102,6 +125,7 @@ class WeatherOpeningAlert(hass.Hass):
                     "bearing": float(o.get("bearing", 0)),
                     "rooftop": bool(o.get("rooftop", False)),
                     "area": str(o.get("area", "unknown")),
+                    "name": str(o.get("name", "")),
                 }
             )
 
@@ -118,6 +142,13 @@ class WeatherOpeningAlert(hass.Hass):
         # Rooftop alert stays on through brief rain dips until rain below threshold
         # for rooftop_rain_clear_minutes (see _evaluate).
         self._rooftop_latched: bool = False
+
+        # Sonos + push channel for rooftop rain. get_app must run in sync
+        # initialize - from async it returns a dead Task (see intercom.py).
+        self.sonos_notifier = self._get_helper_app("SonosNotifier")
+        self.mobile_notifier = self._get_helper_app("MobileNotifier")
+        # True once the current rooftop episode has been announced; re-arms on clear.
+        self._rooftop_notified: bool = False
 
         # Window clear hysteresis
         self._window_false_since: Optional[datetime] = None
@@ -148,6 +179,15 @@ class WeatherOpeningAlert(hass.Hass):
             f"Started: {len(self.openings)} openings, debounce {self.evaluate_debounce_s}s, run_every 60s",
             level="INFO",
         )
+
+    def _get_helper_app(self, name: str):
+        try:
+            appobj = self.get_app(name)
+        except Exception:
+            appobj = None
+        if appobj is None:
+            self.log(f"{name} unavailable - rooftop-rain alerts will skip that channel", level="WARNING")
+        return appobj
 
     def _on_change(
         self,
@@ -262,6 +302,7 @@ class WeatherOpeningAlert(hass.Hass):
 
         # --- Per-opening open timestamps ---
         any_rooftop_open = False
+        rooftop_open_names: list[str] = []
         for o in self.openings:
             eid = o["entity_id"]
             try:
@@ -271,6 +312,7 @@ class WeatherOpeningAlert(hass.Hass):
             open_now = st == "on"
             if o["rooftop"] and open_now:
                 any_rooftop_open = True
+                rooftop_open_names.append(o["name"])
 
             if open_now:
                 if eid not in self._opened_since:
@@ -316,10 +358,12 @@ class WeatherOpeningAlert(hass.Hass):
 
         rooftop_active = self._rooftop_latched
 
+        label, verb, _ = _rooftop_phrase(rooftop_open_names)
         rooftop_result = {
             "active": rooftop_active,
-            "reason": "Rain is falling and a rooftop door is open.",
+            "reason": f"Rain is falling and {label} {verb} open.",
             "target_area": "rooftop",
+            "open_names": rooftop_open_names,
         }
 
         # --- Window rain qualifiers ---
@@ -414,6 +458,37 @@ class WeatherOpeningAlert(hass.Hass):
 
         await self._publish(priority, rooftop_result, window_result)
 
+    def _rooftop_notify_due(self, rooftop_active: bool) -> bool:
+        """Edge-trigger: True exactly once per rooftop episode; re-arms when the
+        alert clears (door closed, or rain gone for rooftop_rain_clear_minutes)."""
+        if rooftop_active and not self._rooftop_notified:
+            self._rooftop_notified = True
+            return True
+        if not rooftop_active:
+            self._rooftop_notified = False
+        return False
+
+    async def _notify_rooftop(self, rooftop: dict[str, Any]) -> None:
+        """Sonos announcement, then a phone push (user 2026-08-07). Sonos speaks to
+        whoever is home (SonosNotifier itself honors quiet hours / sleep mode); the
+        push goes to ALL phones, not just people home - an open terrace door in rain
+        matters most when nobody is home to hear the speakers."""
+        names = list(rooftop.get("open_names", []))
+        if self.sonos_notifier is not None:
+            try:
+                self.submit_to_executor(self.sonos_notifier.notify, message=rooftop_tts_message(names))
+            except Exception as e:
+                self.log(f"Sonos announce failed: {e}", level="WARNING")
+        if self.mobile_notifier is not None:
+            try:
+                await self.mobile_notifier.notify(
+                    title="Rain on the roof",
+                    message=rooftop_push_message(names),
+                    target="all",
+                )
+            except Exception as e:
+                self.log(f"Mobile push failed: {e}", level="WARNING")
+
     def _eval_priority(
         self,
         rooftop: dict[str, Any],
@@ -460,6 +535,11 @@ class WeatherOpeningAlert(hass.Hass):
             except Exception:
                 pass
         self._last_feed_key = feed_key
+
+        # Sonos + push once per NEW rooftop episode (edge-triggered: the latch keeps
+        # this quiet through brief rain dips; a genuinely new episode announces again).
+        if self._rooftop_notify_due(bool(rooftop.get("active"))):
+            await self._notify_rooftop(rooftop)
 
         common = {"friendly_name": "Weather opening alert"}
 
