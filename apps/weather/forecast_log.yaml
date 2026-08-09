@@ -11,7 +11,10 @@
 ForecastLog:
   module: forecast_log
   class: ForecastLog
-  log: forecast_log_log
+  # No custom `log:` stream on purpose: those must be declared in appdaemon.yaml, which lives
+  # only on the box and is not in this repo, so a custom stream here would be an invisible
+  # dependency that fails instantiation on a fresh deploy (it did, 2026-08-09). This app is
+  # quiet - one DEBUG line an hour - so the main log is the right home.
 
   weather_entity: weather.forecast_home
 
