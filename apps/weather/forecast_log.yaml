@@ -1,0 +1,30 @@
+# Forecast log - hourly snapshots of what the forecast predicted, so the dashboard can score
+# it against what the rooftop station actually measured (2026-08-07).
+#
+# HA keeps no history of past forecasts: get_forecasts only returns the future, and the
+# recorder stores the weather entity's CURRENT attributes, not yesterday's predictions. Without
+# this, "how accurate is the 24 h forecast?" is unanswerable. Pure logger - decides nothing.
+#
+# Output: /www/forecast_log/forecast_log.json inside the container == /data/homeassistant/www/
+# forecast_log/forecast_log.json on the box, fetched by the dashboard at /local/forecast_log/.
+
+ForecastLog:
+  module: forecast_log
+  class: ForecastLog
+  log: forecast_log_log
+
+  weather_entity: weather.forecast_home
+
+  # Hourly is the natural cadence: met.no publishes on that scale, and a finer interval would
+  # mostly store re-runs of the same numbers.
+  interval_minutes: 60
+  # How far ahead to keep per snapshot. 24 h covers the questions actually asked of this card
+  # ("what will tonight/tomorrow be like") without storing a week of low-confidence tail.
+  horizon_hours: 24
+  # Retention bounds the file the phone downloads. 14 days is enough to score a 24 h lead time
+  # across a fortnight of weather; at ~24 entries/snapshot this stays well under a megabyte.
+  retain_days: 14
+
+  output_dir: /www/forecast_log
+  output_file: forecast_log.json
+  fetch_timeout_seconds: 12
