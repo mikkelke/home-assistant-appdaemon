@@ -168,6 +168,11 @@ class WakeupRoutine(hass.Hass):
         # True only while _late_catchup_after_restart is invoking _alarm_fire, so that call
         # can bypass the +/-90s trigger window below (same style as _fired_via_heartbeat)
         self._late_catchup_in_progress = False
+        # True only while _on_wake_now is invoking _alarm_fire: a manual "Wake up now" press
+        # must always run, whether or not input_boolean.wakeup_bedroom is armed (user,
+        # 2026-08-10 - 3 of 4 presses that morning died in _alarm_fire's toggle guard). Read
+        # by the trigger-window guard, the toggle guard, and _attach_cancel_listeners below.
+        self._manual_fire_in_progress = False
 
         # Restart-survival state: small JSON file, deploy_advisor's path convention +
         # house_events' atomic tmp+replace write (see _load_state/_save_state). An AD
@@ -279,17 +284,57 @@ class WakeupRoutine(hass.Hass):
         self.log(f"[wake] Scheduled daily at {sched}", log=self.user_log)
 
     def _on_wake_now(self, entity, attr, old, new, kwargs):
-        """input_button.wake_up_now pressed: run the wake sequence immediately. Reuses the
-        late-catchup bypass so the +/-90s alarm-window guard in _alarm_fire doesn't swallow
-        a press at any other time of day; the flag is read ONLY by that guard."""
+        """input_button.wake_up_now pressed: run the wake sequence immediately, no matter
+        whether input_boolean.wakeup_bedroom is armed (user, 2026-08-10: "wake up now" must
+        always work). Sets _manual_fire_in_progress instead of reusing the late-catchup
+        flag - that flag's own docstring says it is read ONLY by the trigger-window guard,
+        but a manual press also needs to bypass _alarm_fire's toggle guard and suppress the
+        toggle-off cancel listener in _attach_cancel_listeners, so it gets a dedicated flag
+        that all three now honour."""
         if new in (None, "unknown", "unavailable"):
             return
         self.log("[wake] Wake up now pressed -- starting the sequence", log=self.user_log)
-        self._late_catchup_in_progress = True
+        self._manual_fire_in_progress = True
         try:
+            # Fire FIRST, set the alarm time SECOND - this order is load-bearing.
+            # _alarm_fire sets self.last_fire_date = today near its top, before any early
+            # return. Writing the alarm time afterwards triggers _on_alarm_time_changed ->
+            # _schedule_daily_alarm, whose "time just passed -> fire now" grace window only
+            # refires when last_fire_date != today. Firing first means that guard already
+            # sees today's date and stays a no-op; firing second would double-fire the whole
+            # wake sequence a moment later.
             self._alarm_fire({})
+            self._set_alarm_time_to_now_slot()
         finally:
-            self._late_catchup_in_progress = False
+            self._manual_fire_in_progress = False
+
+    def _set_alarm_time_to_now_slot(self):
+        """After a manual "Wake up now" press, snap the configured alarm time to the
+        current 5-minute slot (user, 2026-08-10: "the press will set the alarm to the time
+        XX:X0 or XX:X5 ... for the current time on click"). Never touches
+        input_boolean.wakeup_bedroom - the user keeps it off deliberately; only the time
+        changes. Must never raise: a failure here must not break the wake sequence that
+        already ran above."""
+        try:
+            now = self.datetime()
+            # Floor, never round up. A slot in the future would make _schedule_daily_alarm
+            # (via the _on_alarm_time_changed listener this triggers) arm a fresh one-shot
+            # run_at(self._alarm_fire, today_run) for later today - and unlike the grace
+            # refire / heartbeat paths, _alarm_fire itself is NOT guarded by last_fire_date,
+            # so that one-shot would fire the whole sequence again a few minutes from now. A
+            # floored slot is already in the past, where the last_fire_date guard set by the
+            # _alarm_fire call above already covers it.
+            slot_min = (now.minute // 5) * 5
+            hhmmss = "%02d:%02d:00" % (now.hour, slot_min)
+            current = str(self.get_state(self.alarm_time_entity) or "")[:5]
+            if current == hhmmss[:5]:
+                return  # already at this slot - avoid pointless churn and a needless reschedule
+            self.call_service(
+                "input_datetime/set_datetime", entity_id=self.alarm_time_entity, time=hhmmss
+            )
+            self.log(f"[wake] Wake up now: alarm time set to {hhmmss[:5]}", log=self.user_log)
+        except Exception as e:
+            self.log(f"[wake] Wake up now: failed to set alarm time: {e}", level="WARNING", log=self.user_log)
 
     def _on_alarm_time_changed(self, entity, attr, old, new, kwargs):
         self._schedule_daily_alarm()
@@ -484,10 +529,12 @@ class WakeupRoutine(hass.Hass):
         except Exception:
             pass
         # Hard guard: only run if current time is within +/-90s of configured alarm time.
-        # Bypassed for a late catch-up (see _late_catchup_after_restart): that fires well
-        # outside this window on purpose, through this same entry point.
+        # Bypassed for a late catch-up (see _late_catchup_after_restart) or a manual
+        # "Wake up now" press (see _on_wake_now) - both fire well outside this window on
+        # purpose, through this same entry point.
         try:
-            if not self._late_catchup_in_progress and not self._is_within_trigger_window(90):
+            if (not self._late_catchup_in_progress and not self._manual_fire_in_progress
+                    and not self._is_within_trigger_window(90)):
                 return
         except Exception:
             pass
@@ -502,7 +549,11 @@ class WakeupRoutine(hass.Hass):
             self._save_state()
         except Exception:
             pass
-        if self.get_state(self.alarm_enabled_entity) != "on":
+        # A manual press is an explicit command to run now; the toggle only arms the
+        # *scheduled* alarm, so a manual fire skips this check entirely instead of reading
+        # the toggle at all (user, 2026-08-10 - this is the guard that killed 3 of 4
+        # "Wake up now" presses that morning).
+        if not self._manual_fire_in_progress and self.get_state(self.alarm_enabled_entity) != "on":
             self.log("[wake] Toggle off; skipping.", log=self.user_log); return
         if self._both_away():
             self.log("[wake] Both away; skipping.", log=self.user_log); return
@@ -1024,8 +1075,13 @@ class WakeupRoutine(hass.Hass):
         # Presence watchers (stop media & lights if both leave)
         for p in self.persons:
             self.cancel_listeners.append(self.listen_state(self._on_presence_change, p))
-        # Alarm toggle off stops the whole routine
-        self.cancel_listeners.append(self.listen_state(self._on_alarm_toggle, self.alarm_enabled_entity))
+        # Alarm toggle off stops the whole routine - but only for a SCHEDULED fire. For a
+        # manual "Wake up now" run the toggle is not the arming state (see the toggle guard
+        # in _alarm_fire), so an off-edge here must not _stop_all a run the user explicitly
+        # asked for. This is exactly what killed the run this morning at 07:46:54
+        # (2026-08-10). Presence listeners above still apply either way.
+        if not self._manual_fire_in_progress:
+            self.cancel_listeners.append(self.listen_state(self._on_alarm_toggle, self.alarm_enabled_entity))
 
     def _attach_cancel_listeners_light(self):
         # Stop the ramp when darkness logic says bright (state, pending_target, lux - same as bedroom_lights)

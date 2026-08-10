@@ -184,24 +184,36 @@ class MediaVerifyRecheck(unittest.TestCase):
 
 
 class WakeNowButton(unittest.TestCase):
-    """The dashboard's Wake-up-now press runs the sequence immediately: it must bypass the
-    +/-90s alarm-window guard (via the late-catchup flag) and always restore the flag."""
+    """The dashboard's Wake-up-now press runs the sequence immediately, toggle armed or
+    not (user, 2026-08-10). _on_wake_now now sets its own _manual_fire_in_progress flag
+    (not the late-catchup flag - that one's docstring says it's read ONLY by the trigger-
+    window guard) and always restores it; _alarm_fire must run before the alarm time is
+    rewritten (see the load-bearing-order comment on _on_wake_now)."""
 
     def _app(self):
         app = wb.WakeupRoutine.__new__(wb.WakeupRoutine)
         app.user_log = "log"
         app.log = lambda *a, **k: None
-        app._late_catchup_in_progress = False
+        app._manual_fire_in_progress = False
+        app._late_catchup_in_progress = False  # _on_wake_now must never touch this flag
         app._fired = []
-        app._alarm_fire = lambda _=None: app._fired.append(app._late_catchup_in_progress)
+        app._order = []
+
+        def fire(_=None):
+            app._order.append("alarm_fire")
+            app._fired.append(app._manual_fire_in_progress)
+
+        app._alarm_fire = fire
+        app._set_alarm_time_to_now_slot = lambda: app._order.append("set_alarm_time")
         return app
 
     def test_press_fires_with_window_bypass_and_restores_flag(self):
         app = self._app()
         app._on_wake_now("input_button.wake_up_now", None, "unknown",
                          "2026-07-29T16:30:00+00:00", {})
-        self.assertEqual(app._fired, [True])            # guard bypass active during fire
-        self.assertFalse(app._late_catchup_in_progress)  # ...and restored after
+        self.assertEqual(app._fired, [True])              # manual bypass active during fire
+        self.assertFalse(app._manual_fire_in_progress)     # ...and restored after
+        self.assertFalse(app._late_catchup_in_progress)    # ...and never touched at all
 
     def test_flag_restored_even_when_sequence_raises(self):
         app = self._app()
@@ -210,13 +222,169 @@ class WakeNowButton(unittest.TestCase):
         app._alarm_fire = boom
         with self.assertRaises(RuntimeError):
             app._on_wake_now("e", None, None, "2026-07-29T16:30:00+00:00", {})
-        self.assertFalse(app._late_catchup_in_progress)
+        self.assertFalse(app._manual_fire_in_progress)
 
     def test_unavailable_states_ignored(self):
         app = self._app()
         for bad in (None, "unknown", "unavailable"):
             app._on_wake_now("e", None, None, bad, {})
         self.assertEqual(app._fired, [])
+
+    def test_alarm_fire_runs_before_alarm_time_is_written(self):
+        app = self._app()
+        app._on_wake_now("input_button.wake_up_now", None, "unknown",
+                         "2026-07-29T16:30:00+00:00", {})
+        self.assertEqual(app._order, ["alarm_fire", "set_alarm_time"])
+
+
+class ManualFireBypassesToggleGuard(unittest.TestCase):
+    """_alarm_fire's toggle guard bailed on 3 of 4 "Wake up now" presses on 2026-08-10
+    because input_boolean.wakeup_bedroom was off. A manual fire must get all the way
+    through it; a non-manual call with the toggle off must still bail there, same as
+    before. Drives the REAL _alarm_fire (module make_app above stubs it out for the other
+    classes in this file), stubbing only what it calls once past the guards it's testing."""
+
+    ALARM_TIME = "06:15:00"
+
+    def _real_alarm_fire_app(self, manual_flag):
+        # "now" matches ALARM_TIME closely so the +/-90s trigger-window guard passes on its
+        # own merits either way, isolating the toggle guard as the only thing that differs
+        # between the manual and non-manual runs below.
+        now = datetime(2026, 8, 10, 6, 15, 10)
+        states = {
+            ("input_boolean.wakeup_bedroom", None): "off",
+            ("input_datetime.wakeup_bedroom", None): self.ALARM_TIME,
+        }
+        app = make_app(now, states)
+        del app._alarm_fire  # use the real method instead of module make_app's stub
+        app._manual_fire_in_progress = manual_flag
+        app._late_catchup_in_progress = False
+        app._state = {}
+        app._save_state = lambda: None
+        app._both_away = lambda: False
+        app._current_bedroom_wake_target = None
+        app.bedroom_cover = "cover.bedroom"
+        app.bathroom_cover = "cover.bathroom"
+        app.bedroom_cover_target = 38
+        app.bathroom_cover_target = 20
+        app._decide_bedroom_wake_target = lambda: (app.bedroom_cover_target, "test")
+        app._cover_position = lambda entity: app.bedroom_cover_target
+        app._nudge_cover_if_closed = lambda entity, target: None
+        app._maybe_start_light_ramp = lambda: None
+        app.attach_calls = []
+        app._attach_cancel_listeners = lambda: app.attach_calls.append(True)
+        app._group_speakers = lambda: None
+        app._start_media_and_volume_ramp = lambda: None
+        app.log_calls = []
+        app.log = lambda *a, **kw: app.log_calls.append(a[0] if a else "")
+        return app
+
+    def test_manual_fire_reaches_alarm_firing_with_toggle_off(self):
+        app = self._real_alarm_fire_app(manual_flag=True)
+        app._alarm_fire({})
+        self.assertIn("[wake] Alarm firing.", app.log_calls)
+        self.assertEqual(app.attach_calls, [True])
+
+    def test_non_manual_fire_still_bails_on_toggle_off(self):
+        app = self._real_alarm_fire_app(manual_flag=False)
+        app._alarm_fire({})
+        self.assertNotIn("[wake] Alarm firing.", app.log_calls)
+        self.assertIn("[wake] Toggle off; skipping.", app.log_calls)
+        self.assertEqual(app.attach_calls, [])
+
+
+class AttachCancelListenersManualBypass(unittest.TestCase):
+    """_attach_cancel_listeners must not arm the toggle-off cancel listener for a manual
+    "Wake up now" run (2026-08-10): the toggle is not the arming state for a manual fire,
+    so an off-edge must not _stop_all a run the user explicitly asked for - this is what
+    killed the run at 07:46:54 this morning. Presence listeners are unaffected either way."""
+
+    def _app(self, manual_flag):
+        app = wb.WakeupRoutine.__new__(wb.WakeupRoutine)
+        app.persons = ["person.mikkel", "person.kristine"]
+        app.alarm_enabled_entity = "input_boolean.wakeup_bedroom"
+        app.cancel_listeners = []
+        app._manual_fire_in_progress = manual_flag
+        app.listen_state_calls = []
+
+        def listen_state(cb, entity, **kw):
+            app.listen_state_calls.append(entity)
+            return object()
+
+        app.listen_state = listen_state
+        return app
+
+    def test_omits_toggle_listener_when_manual_fire_in_progress(self):
+        app = self._app(manual_flag=True)
+        app._attach_cancel_listeners()
+        self.assertNotIn(app.alarm_enabled_entity, app.listen_state_calls)
+        self.assertEqual(app.listen_state_calls, ["person.mikkel", "person.kristine"])
+        self.assertEqual(len(app.cancel_listeners), 2)
+
+    def test_includes_toggle_listener_for_a_scheduled_fire(self):
+        app = self._app(manual_flag=False)
+        app._attach_cancel_listeners()
+        self.assertEqual(
+            app.listen_state_calls,
+            ["person.mikkel", "person.kristine", app.alarm_enabled_entity],
+        )
+        self.assertEqual(len(app.cancel_listeners), 3)
+
+
+class SetAlarmTimeToNowSlot(unittest.TestCase):
+    """Manual "Wake up now" (user, 2026-08-10): the press also snaps the configured alarm
+    time to the current 5-minute slot, floored - never rounded up - so it lands in the past
+    where last_fire_date already guards against a second fire (see _on_wake_now and the
+    floor-not-round comment on _set_alarm_time_to_now_slot)."""
+
+    def _app(self, now, current_time_state):
+        app = wb.WakeupRoutine.__new__(wb.WakeupRoutine)
+        app.alarm_time_entity = "input_datetime.wakeup_bedroom"
+        app.user_log = "test_log"
+        app.datetime = lambda: now
+        app.get_state = lambda entity, **kw: current_time_state
+        app.log_calls = []
+        app.log = lambda *a, **kw: app.log_calls.append((a, kw))
+        app.service_calls = []
+        app.call_service = lambda service, **kw: app.service_calls.append((service, kw))
+        return app
+
+    def test_floors_07_46_to_07_45(self):
+        app = self._app(datetime(2026, 8, 10, 7, 46, 0), "07:00:00")
+        app._set_alarm_time_to_now_slot()
+        self.assertEqual(len(app.service_calls), 1)
+        service, kw = app.service_calls[0]
+        self.assertEqual(service, "input_datetime/set_datetime")
+        self.assertEqual(kw["entity_id"], app.alarm_time_entity)
+        self.assertEqual(kw["time"], "07:45:00")
+
+    def test_07_45_already_set_skips_call(self):
+        app = self._app(datetime(2026, 8, 10, 7, 45, 40), "07:45:00")
+        app._set_alarm_time_to_now_slot()
+        self.assertEqual(app.service_calls, [])
+
+    def test_floors_07_49_to_07_45(self):
+        app = self._app(datetime(2026, 8, 10, 7, 49, 59), "06:00:00")
+        app._set_alarm_time_to_now_slot()
+        self.assertEqual(app.service_calls[0][1]["time"], "07:45:00")
+
+    def test_07_50_is_its_own_slot(self):
+        app = self._app(datetime(2026, 8, 10, 7, 50, 0), "06:00:00")
+        app._set_alarm_time_to_now_slot()
+        self.assertEqual(app.service_calls[0][1]["time"], "07:50:00")
+
+    def test_floors_00_03_to_00_00(self):
+        app = self._app(datetime(2026, 8, 10, 0, 3, 0), "06:00:00")
+        app._set_alarm_time_to_now_slot()
+        self.assertEqual(app.service_calls[0][1]["time"], "00:00:00")
+
+    def test_swallows_a_raising_call_service(self):
+        app = self._app(datetime(2026, 8, 10, 7, 46, 0), "07:00:00")
+        def boom(service, **kw):
+            raise RuntimeError("boom")
+        app.call_service = boom
+        app._set_alarm_time_to_now_slot()  # must not raise
+        self.assertTrue(any(kw.get("level") == "WARNING" for a, kw in app.log_calls))
 
 
 if __name__ == "__main__":
