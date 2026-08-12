@@ -11,7 +11,9 @@
 AbbWelcomeBridge:
   module: abb_welcome_bridge
   class: AbbWelcomeBridge
-  log: abb_welcome_bridge_log
+  # No custom `log:` stream on purpose: those must be declared in appdaemon.yaml, which lives
+  # only on the box and is not in this repo - an undeclared stream fails instantiation on a
+  # fresh deploy (it did, 2026-08-12, same trap as forecast_log three days earlier).
   # Only the notifier: intercom.py deliberately has NO dependency on this app
   # (an AppDaemon dependency would stop the doorbell app from loading if this
   # one broke), and this app resolves the notifier the same way intercom does.
