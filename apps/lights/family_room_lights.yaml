@@ -119,8 +119,15 @@ FamilyRoomLights:
              , "light.island_lights"
              , "light.hallway_lights" ]
 
-  # Sleep modes (if any of these are "on", on-trigger only island_lights)
+  # Sleep modes (if any of these are "on", on-trigger only island_lights).
+  # house_night_mode is the load-bearing one (2026-08-12): it LATCHES for the whole night,
+  # so one person leaving their bed - the 2026-08-07 04:14 incident, nine full-brightness
+  # cycles for a bathroom trip - no longer flips the family room to "no one sleeping".
+  # The per-person booleans still contribute (evening: first sleeper dims the room before
+  # the latch engages at their edge), and Claudia finally has one at all.
   sleep_mode_booleans:
+    - "input_boolean.house_night_mode"
     - "input_boolean.kristine_sleep_mode"
+    - "input_boolean.claudia_sleep_mode"
     - "input_boolean.mikkel_sleep_mode"
 # reload-nudge 2026-07-06 per-zone overrides

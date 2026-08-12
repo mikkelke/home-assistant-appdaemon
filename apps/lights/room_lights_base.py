@@ -47,7 +47,8 @@ class RoomLightsBase(hass.Hass):
         # Sleep mode entities
         self.sleep_mode_entities = self.args.get("sleep_mode_entities", [
             "input_boolean.mikkel_sleep_mode",
-            "input_boolean.kristine_sleep_mode"
+            "input_boolean.kristine_sleep_mode",
+            "input_boolean.claudia_sleep_mode",
         ])
         
         # Home lighting mode (centralized)
@@ -305,6 +306,9 @@ class RoomLightsBase(hass.Hass):
         mapping = {
             "person.kristine": "input_boolean.kristine_sleep_mode",
             "person.mikkel": "input_boolean.mikkel_sleep_mode",
+            # Added 2026-08-12 with housemate_sleep_mode: before this, a sleeping Claudia
+            # never counted toward "everyone home is sleeping" anywhere in the house.
+            "person.claudia": "input_boolean.claudia_sleep_mode",
         }
         return mapping.get(person)
 
