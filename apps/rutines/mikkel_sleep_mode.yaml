@@ -17,8 +17,20 @@ MikkelSleepMode:
 
   battery_entity: sensor.mikkels_ofx9p_battery_state
   person_entity: person.mikkel
-  # Either bedside sensor counts as in bed (whole bed is yours now).
+  # OR list - any "on" counts as in bed (whole bed is yours now). Only an exact "on"
+  # arms; unavailable/unknown are inert, so an offline witness can never hold sleep
+  # mode on or block another witness from arming it.
+  # The ESPHome pressure strip (installed/calibrated 2026-08-12, zero nights of track
+  # record) is an ADDITIONAL WITNESS only - Withings stays authoritative until
+  # sensor.bed_presence_agreement (bed_presence_compare) has ~5 good nights.
   in_bed_entities:
+    - binary_sensor.left_bedside
+    - binary_sensor.right_bedside
+    - binary_sensor.bed_presence_6b9c94_bed_occupied_left
+  # Only the proven mats may release the post-wakeup re-arm hold ("every sensor reads
+  # explicitly off"). Listing the strip here would let a stuck-on/offline strip keep
+  # the hold forever and block all future arming - see _bed_reads_empty.
+  bed_empty_entities:
     - binary_sensor.left_bedside
     - binary_sensor.right_bedside
   sleep_mode_entity: input_boolean.mikkel_sleep_mode

@@ -6,6 +6,18 @@ Sleep mode ON: person.mikkel is home, any configured bedside in-bed sensor is on
 sensor.mikkels_ofx9p_battery_state is charging or not_charging, AND the night gate is
 open: the bedroom blind covers the window OR the clock is inside 21:00-04:00.
 
+In-bed witnesses (2026-08-12): in_bed_entities is an OR list - the two Withings
+mats plus the new ESPHome pressure strip (binary_sensor.bed_presence_6b9c94_
+bed_occupied_left, hours old, zero nights of track record). Only an exact "on"
+counts, so an offline/unavailable strip can never hold sleep mode on nor stop a
+mat from arming it. The strip is an ADDITIONAL WITNESS only: bed_empty_entities
+(the mats) is what _bed_reads_empty consults, so the unproven strip can neither
+release the re-arm hold early (strip false-off) nor deadlock it (strip stuck-on
+or offline would otherwise block "every sensor reads off" forever, and with it
+every future arming). Withings stays authoritative until
+sensor.bed_presence_agreement (apps/presence/bed_presence_compare.py) shows the
+strip earning promotion.
+
 The blind gate (2026-08-12, Mikkel's own words: "if I lay in bed and connect a charger
 my phone will go to DND, that is mostly fine, but if the curtain is not up it does not
 make sense"): cover.bedroom_blind is BOTTOM-UP - current_position 100 means fully
@@ -66,6 +78,9 @@ class MikkelSleepMode(hass.Hass):
     blind_covering_min = 95.0
     night_window = None
     house_night_entity = None
+    # None -> _bed_reads_empty falls back to in_bed_entities (legacy behaviour and
+    # the bare __new__() test instances). The real yaml sets it to the mats only.
+    bed_empty_entities = None
     out_of_bed_clear_seconds = 12 * 60
     discharging_clear_seconds = 5 * 60
     _out_of_bed_since = None
@@ -84,6 +99,10 @@ class MikkelSleepMode(hass.Hass):
                 "in_bed_entity", "binary_sensor.left_bedside"
             )
             self.in_bed_entities = [legacy] if legacy else []
+        # The subset whose EXPLICIT "off" may release the re-arm hold (the proven
+        # Withings mats). Unset -> all of in_bed_entities, the pre-strip behaviour.
+        raw_empty = self.args.get("bed_empty_entities")
+        self.bed_empty_entities = list(raw_empty) if raw_empty else None
         self.sleep_mode_entity = self.args.get(
             "sleep_mode_entity", "input_boolean.mikkel_sleep_mode"
         )
@@ -195,14 +214,21 @@ class MikkelSleepMode(hass.Hass):
         return False
 
     def _bed_reads_empty(self) -> bool:
-        """Every bedside explicitly "off" - an EXPLICIT negative, never merely "not on".
-        The Withings bedsides are cloud-backed: unknown/unavailable/None is what they read
-        while HA restarts or the integration reloads, which is exactly when this app
-        re-initializes. Treating that as "he got up" would drop the hold at the one moment
-        it is needed most."""
-        if not self.in_bed_entities:
+        """Every bedside in bed_empty_entities explicitly "off" - an EXPLICIT negative,
+        never merely "not on". The Withings bedsides are cloud-backed: unknown/
+        unavailable/None is what they read while HA restarts or the integration reloads,
+        which is exactly when this app re-initializes. Treating that as "he got up"
+        would drop the hold at the one moment it is needed most.
+
+        Deliberately NOT the full in_bed_entities list: the ESPHome strip is an arm-only
+        witness there. Requiring the strip to read "off" too would let a stuck-on or
+        offline strip hold "every sensor reads off" false forever - and the hold with it,
+        which blocks all future arming (the mat could never arm sleep mode again until a
+        human noticed). The proven mats alone decide "he got up"."""
+        ents = self.bed_empty_entities or self.in_bed_entities
+        if not ents:
             return False
-        for ent in self.in_bed_entities:
+        for ent in ents:
             try:
                 if self.get_state(ent) != "off":
                     return False

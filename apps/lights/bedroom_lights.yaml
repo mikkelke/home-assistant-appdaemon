@@ -13,9 +13,14 @@ bedroom_lights:
   bed_lights: "light.bedroom_bed_lights"
   ceiling_lights: "light.bedroom_ceiling_lights"
   # Reliable ON-edge only signal to START a bed-light session; their OFF edge is ignored.
+  # Third entry (2026-08-12): the ESPHome pressure strip as an additional witness - local
+  # and fast where Withings is cloud-lagged. Session start stays FP300-gated, and only an
+  # exact "on" counts anywhere this list is read, so an unavailable strip is inert.
+  # Withings stays authoritative until bed_presence_compare has ~5 good nights.
   withings_in_bed_entities:
     - binary_sensor.left_bedside
     - binary_sensor.right_bedside
+    - binary_sensor.bed_presence_6b9c94_bed_occupied_left
 
   switch_device_id: "951e07324391856c37850361629523d7"
   remote_device_id: "fde0ce72582c723f4d8b729b522fc2fa"
