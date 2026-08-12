@@ -30,6 +30,7 @@ KNOWN_TRANSITION_PATHS = (
     "door_opened_first",
     "tail_to_standby",
     "tail_pattern_break",
+    "standby_backstop",  # 5+ min hard 0W on a heated cycle whose finish guards never opened
 )
 
 # Values an input_select shows when no choice has been made.
@@ -91,6 +92,82 @@ def parse_spin_rpm(value: str):
     if value.isdigit():
         return int(value)
     return None
+
+
+def resolve_guard_bar(
+    bar_min,
+    bar_max_energy_kwh,
+    live_dur_min,
+    live_max_energy_kwh,
+    live_stable_minutes,
+    energy_used_kwh,
+    lower_stable_minutes,
+    disproof_margin: float = 1.10,
+):
+    """Decide the finish-guard duration bar from the live classification.
+
+    Returns (new_bar_min, action) where action is one of None (keep), "freeze"
+    (first classification of the cycle), "raise", "lower", or "rekey" (bar value
+    unchanged but the caller should adopt the live key as the bar's programme,
+    e.g. after a restart restored the bar as a bare number).
+
+    History behind the rules (2026-08-11 incident, washer_monitor.log):
+
+    The bar (expected_dur_at_start) used to freeze at the FIRST non-unknown
+    classification and only a human confirmation could move it. That froze
+    'eco' (199 min) over what ended as a ~180 min run: the guards demanded
+    92% of 199 = 183 min right up to the standby backstop, which then forced
+    a silent Off - 12 real washes dropped that way since 2026-03. So the bar
+    must be able to follow later, better classification.
+
+    But it must not simply follow it. The same tape shows why each guard here
+    exists:
+
+    * RAISE is always accepted: a higher bar can only delay the announcement
+      (and the standby-backstop net converts a delayed finish into a late
+      Unemptied, never a silent Off). This also fixes the old Ekspres-frozen-
+      under-Bomuld-60 false-finish class without requiring a human upgrade.
+
+    * LOWER is the dangerous direction - it is exactly what the original
+      freeze was built to prevent. In the incident, 'finvask' (65 min) was
+      classified STABLY for 64 minutes (13:01-14:05) during a mid-cycle soak,
+      because a soak both starves the energy rate (which drives the centroid
+      match toward short programmes) and looks power-quiet (which arms the
+      energy-stable finish path). Any plain "stable for N minutes" rule with
+      N <= 64 would have false-announced a drum full of water at run ~100 min.
+      Quiet-correlated evidence can therefore never lower the bar. What CAN is
+      cumulative energy: it is monotone and a soak adds none of it. The bar
+      may only come down once the bar's own programme has been physically
+      DISPROVEN - the cycle has already used more energy than that programme
+      can (bar_max_energy_kwh * disproof_margin) - and the shorter live key
+      both explains the energy and has held stable for lower_stable_minutes
+      (so boundary jitter, e.g. eco<->bomuld60 flapping at the 0.85 kWh gate
+      every 30 s in the same tape, cannot bounce the bar).
+
+    The finish decision cannot oscillate: raising never un-blocks a finish,
+    and lowering requires evidence (energy) that only accumulates.
+    """
+    if not live_dur_min:
+        return (bar_min, None)
+    if bar_min is None:
+        return (live_dur_min, "freeze")
+    if live_dur_min > bar_min:
+        return (live_dur_min, "raise")
+    if live_dur_min == bar_min:
+        # Same duration, possibly restored without a programme key: adopt the live
+        # key so energy disproof works for the rest of the cycle.
+        return (bar_min, "rekey" if bar_max_energy_kwh is None else None)
+    # live_dur_min < bar_min: only allowed once the bar's programme is energy-disproven.
+    if bar_max_energy_kwh is None:
+        return (bar_min, None)
+    if energy_used_kwh <= bar_max_energy_kwh * disproof_margin:
+        return (bar_min, None)
+    if (live_stable_minutes or 0) < lower_stable_minutes:
+        return (bar_min, None)
+    if live_max_energy_kwh is not None and energy_used_kwh > live_max_energy_kwh * disproof_margin:
+        # The shorter key cannot explain the observed energy either - misclassification.
+        return (bar_min, None)
+    return (live_dur_min, "lower")
 
 
 def classify_from_history(centroids, run_min: float, energy_used: float, heating_bursts: int):

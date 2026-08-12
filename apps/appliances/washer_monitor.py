@@ -472,7 +472,18 @@ class WasherMonitor(hass.Hass):
         self.programme_confirmed_by_user = False  # True when user manually picked a programme
         self.confirmed_by_username: str | None = None  # HA person name who confirmed the programme (empty if UI gave no user_id)
         self._skip_next_confirm = False  # True when app is about to set confirm_entity (so we don't treat it as user confirmation)
-        self.expected_dur_at_start: float | None = None  # Frozen when programme first classified; used in guards
+        # Finish-guard duration bar. Seeded ("frozen") at the first confident classification,
+        # then evidence-following: raises to any longer live classification, lowers only after
+        # energy disproof + live-key stability (see wcls.resolve_guard_bar and _update_guard_bar;
+        # 2026-08-11 silent-Off incident). Attribute name kept for entity-attr compatibility.
+        self.expected_dur_at_start: float | None = None
+        self._guard_bar_class: tuple | None = None  # (prog, temp) behind expected_dur_at_start; None = unknown (lower disabled)
+        self._live_class_key: str | None = None     # "prog|temp" of the current live classification streak
+        self._live_class_since = None               # UTC datetime when that streak began
+        # Minutes the live classification must hold one key before it may LOWER the guard bar.
+        self.guard_reclass_stable_minutes = float(self.args.get("guard_reclass_stable_minutes", 15.0))
+        # Cumulative energy must exceed the bar programme's max energy by this factor to disprove it.
+        self.guard_energy_disproof_margin = float(self.args.get("guard_energy_disproof_margin", 1.10))
         self._learned_durations: dict = {}        # {prog_key: avg_duration_min} from confirmed history
         self._history_centroids: dict = {}        # {prog_key: {rate, heating_bursts, n}} for pattern matching
         self._user_id_to_name: dict = {}          # {ha_user_id: person_name} built from person.* entities
@@ -878,6 +889,7 @@ class WasherMonitor(hass.Hass):
                         dur = self._get_programme_duration(prog, temp, use_learned=False)
                         if dur:
                             self.expected_dur_at_start = dur
+                            self._guard_bar_class = (prog, temp)
                             self.log(f"Restored expected_dur_at_start from selector: {dur:.0f} min", level="DEBUG")
             except Exception:
                 pass
@@ -886,6 +898,13 @@ class WasherMonitor(hass.Hass):
                 v = self.get_state(self.state_entity, attribute="expected_dur_at_start")
                 if v not in (None, "", "unknown", "unavailable"):
                     self.expected_dur_at_start = float(v)
+                    # Bar programme key persisted alongside (see the Running publish) so the
+                    # energy-disproof lowering keeps working across the frequent mid-cycle
+                    # app restarts; stays None on older entities (lowering disabled until
+                    # the live classification re-keys it).
+                    self._guard_bar_class = self._parse_guard_bar_key(
+                        self.get_state(self.state_entity, attribute="expected_dur_key")
+                    )
                     self.log(f"Restored expected_dur_at_start from entity: {self.expected_dur_at_start:.0f} min", level="DEBUG")
             except (TypeError, ValueError, AttributeError):
                 pass
@@ -1027,6 +1046,7 @@ class WasherMonitor(hass.Hass):
             dur = self._get_programme_duration(prog, temp, use_learned=False)
             if dur:
                 self.expected_dur_at_start = float(dur)
+                self._guard_bar_class = (prog, temp)
             self.log(
                 f"Recovery: selector shows '{label}' with active wash but programme_confirmed was false "
                 f"— restoring confirmation for ETA/guards",
@@ -1037,6 +1057,7 @@ class WasherMonitor(hass.Hass):
             attrs["programme_confirmed_by_user"] = True
             attrs["programme_confirmed_by"] = self.confirmed_by_username or ""
             attrs["expected_dur_at_start"] = self.expected_dur_at_start if self.expected_dur_at_start is not None else ""
+            attrs["expected_dur_key"] = self._guard_bar_key_str()
             self._set_state_entity( state="Running", attributes=attrs, replace=True)
         except Exception as e:
             self.log(f"Recovery sync programme from selector failed: {e}", level="DEBUG")
@@ -2090,6 +2111,7 @@ class WasherMonitor(hass.Hass):
                 "programme_confirmed_by_user": False,
                 "programme_confirmed_by": "",
                 "expected_dur_at_start": "",
+                "expected_dur_key": "",
                 # Cleared every time a cycle ends, same as the confirmation flags above - the
                 # next cycle's _begin_running_cycle re-attributes from scratch.
                 "started_by": "",
@@ -2436,6 +2458,9 @@ class WasherMonitor(hass.Hass):
         # self._cycle_actor must be rebuilt from the entity the same way a restart restore does.
         self._cycle_actor = self._cycle_actor_from_state_attrs(attrs)
         self.expected_dur_at_start = None
+        self._guard_bar_class = None
+        self._live_class_key = None
+        self._live_class_since = None
         # Prefer selector (manual duration) - never use stale/wrong expected_dur from entity.
         if self.confirm_entity:
             try:
@@ -2445,12 +2470,16 @@ class WasherMonitor(hass.Hass):
                     temp = self._read_temperature_selector() if self._programme_has_temperature(prog) else None
                     if prog and prog != "unknown":
                         self.expected_dur_at_start = self._get_programme_duration(prog, temp, use_learned=False)
+                        if self.expected_dur_at_start:
+                            self._guard_bar_class = (prog, temp)
             except Exception:
                 pass
         if self.expected_dur_at_start is None and self.detected_programme and self.detected_programme != "unknown":
             self.expected_dur_at_start = self._get_programme_duration(
                 self.detected_programme, self.detected_temperature, use_learned=False
             )
+            if self.expected_dur_at_start:
+                self._guard_bar_class = (self.detected_programme, self.detected_temperature)
         if self.expected_dur_at_start is None:
             self.expected_dur_at_start = self._get_guard_duration(
                 self.detected_programme, self.detected_temperature, (self.detected_programme, self.detected_temperature)
@@ -2510,6 +2539,7 @@ class WasherMonitor(hass.Hass):
             "programme_confirmed_by_user": self.programme_confirmed_by_user,
             "programme_confirmed_by": self.confirmed_by_username or "",
             "expected_dur_at_start": self.expected_dur_at_start or "",
+            "expected_dur_key": self._guard_bar_key_str(),
         }
         if self.energy_start is not None:
             run_attrs["energy_at_start"] = self.energy_start
@@ -2551,8 +2581,9 @@ class WasherMonitor(hass.Hass):
         self.tail_pattern_last_pulse_at = None
         self.tail_pattern_locked_at = None
         # Gate: only allow transition when recent power looks like real cycle end (anti-crease or off), not mid-cycle rinse.
-        # Skip when user opened door first (skip_announce) or when we already verified standby/cadence break.
-        if not skip_announce and self._pending_end_reason not in ("tail_to_standby", "tail_pattern_break"):
+        # Skip when user opened door first (skip_announce) or when we already verified standby/cadence break
+        # (standby_backstop = 5+ min of hard 0W - stronger evidence than the power-pattern gate itself).
+        if not skip_announce and self._pending_end_reason not in ("tail_to_standby", "tail_pattern_break", "standby_backstop"):
             ok, mean_w, peak_w = self._power_looks_like_cycle_end()
             if not ok:
                 if mean_w is not None and peak_w is not None:
@@ -2730,6 +2761,7 @@ class WasherMonitor(hass.Hass):
             attributes["programme_confirmed_by_user"] = False
             attributes["programme_confirmed_by"] = ""
             attributes["expected_dur_at_start"] = ""
+            attributes["expected_dur_key"] = ""
 
             # programme_confirmed_by_user is always False here (cleared for next load);
             # heating_bursts/last_door_closed_trusted can also be 0/False (cold programme,
@@ -2740,6 +2772,9 @@ class WasherMonitor(hass.Hass):
             self.programme_confirmed_by_user = False
             self.confirmed_by_username = None
             self.expected_dur_at_start = None
+            self._guard_bar_class = None
+            self._live_class_key = None
+            self._live_class_since = None
             self._set_programme_helpers_default()
 
             if self.poll_timer:
@@ -2999,6 +3034,9 @@ class WasherMonitor(hass.Hass):
         self.programme_confirmed_by_user = False
         self.confirmed_by_username = None
         self.expected_dur_at_start = None
+        self._guard_bar_class = None
+        self._live_class_key = None
+        self._live_class_since = None
         self.in_finishing_tail = False
         self.in_finishing_tail_entered_at = None
         self.last_tail_pulse_at = None
@@ -3315,6 +3353,9 @@ class WasherMonitor(hass.Hass):
         self.last_high_energy_at = None
         self._zero_power_since = None
         self.expected_dur_at_start = None
+        self._guard_bar_class = None
+        self._live_class_key = None
+        self._live_class_since = None
         self._delay_plateau_start = None
         self._delayed_start_trimmed = False
         self._delay_waiting = False
@@ -3452,12 +3493,15 @@ class WasherMonitor(hass.Hass):
                 dur = self._get_programme_duration(prog, temp, use_learned=False)
                 if dur:
                     self.expected_dur_at_start = float(dur)
+                    self._guard_bar_class = (prog, temp)
                     attrs["expected_dur_at_start"] = self.expected_dur_at_start
+                    attrs["expected_dur_key"] = self._guard_bar_key_str()
                     self.log(f"Expected duration set from confirmed programme: {self.expected_dur_at_start:.0f} min", level="DEBUG")
             except Exception:
                 pass
         if self.expected_dur_at_start is None:
             attrs["expected_dur_at_start"] = ""
+            attrs["expected_dur_key"] = ""
         # elapsed_minutes/progress_pct/heating_bursts/max_power_w are always 0/0.0 at cycle start
         # (just reset); last_door_closed_trusted/programme_confirmed_by_user/delayed_start_trimmed/
         # delayed_start_waiting are commonly False too (no trusted door-close yet, Auto-mode default,
@@ -3835,8 +3879,114 @@ class WasherMonitor(hass.Hass):
             return profile["max_dur_min"]
         return int(self.max_running_hours * 60)
 
+    def _note_live_classification(self, prog, temp):
+        """Track how long the live classification has continuously held one programme+temperature.
+
+        Called once per _check_energy_finish tick. Feeds the stability requirement in
+        _update_guard_bar: only a classification that has stopped flip-flopping may lower
+        the finish-guard bar (the 2026-08-11 tape flapped eco<->bomuld60 every 30 s at the
+        0.85 kWh gate). In-memory only - after an app restart the streak restarts, which
+        just delays a possible lowering by guard_reclass_stable_minutes (conservative)."""
+        if not prog or prog == "unknown":
+            self._live_class_key = None
+            self._live_class_since = None
+            return
+        key = f"{prog}|{temp or ''}"
+        if key != self._live_class_key:
+            self._live_class_key = key
+            self._live_class_since = self._now_utc()
+
+    def _live_class_stable_minutes(self, prog, temp) -> float:
+        """Minutes the live classification has continuously been (prog, temp); 0 when it just changed."""
+        key = f"{prog}|{temp or ''}"
+        if self._live_class_key != key or self._live_class_since is None:
+            return 0.0
+        return (self._now_utc() - self._live_class_since).total_seconds() / 60
+
+    def _guard_bar_key_str(self) -> str:
+        """Serialize _guard_bar_class for entity-attr persistence ("prog|temp", temp may be empty)."""
+        if not self._guard_bar_class:
+            return ""
+        prog, temp = self._guard_bar_class
+        return f"{prog}|{temp or ''}"
+
+    @staticmethod
+    def _parse_guard_bar_key(s):
+        """Parse a persisted "prog|temp" bar key back to (prog, temp) or None."""
+        if not s or not isinstance(s, str) or s in ("unknown", "unavailable"):
+            return None
+        parts = s.split("|", 1)
+        prog = parts[0].strip()
+        if not prog or prog == "unknown":
+            return None
+        temp = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+        return (prog, temp)
+
+    def _update_guard_bar(self, new_prog, new_temp):
+        """Freeze/raise/lower expected_dur_at_start from this tick's live classification.
+
+        The decision itself is pure (wcls.resolve_guard_bar - see its docstring for the
+        2026-08-11 incident rationale); this method feeds it live durations, the bar
+        programme's max plausible energy, cumulative cycle energy and the stability streak,
+        then applies + logs the result. Runs on every Running energy tick, before the
+        finish paths of the same tick consult _get_guard_duration."""
+        if not new_prog or new_prog == "unknown":
+            return
+        live_dur = self._get_programme_duration(new_prog, new_temp, use_learned=False)
+        if not live_dur:
+            return
+        bar_profile = self._get_profile(*self._guard_bar_class) if self._guard_bar_class else None
+        live_profile = self._get_profile(new_prog, new_temp)
+        bar_max_energy = None
+        if bar_profile:
+            bar_max_energy = bar_profile.get("max_valid_energy_kwh") or bar_profile.get("max_energy_kwh")
+        live_max_energy = None
+        if live_profile:
+            live_max_energy = live_profile.get("max_valid_energy_kwh") or live_profile.get("max_energy_kwh")
+        energy_used = self._get_energy_used()
+        new_bar, action = wcls.resolve_guard_bar(
+            bar_min=self.expected_dur_at_start,
+            bar_max_energy_kwh=bar_max_energy,
+            live_dur_min=live_dur,
+            live_max_energy_kwh=live_max_energy,
+            live_stable_minutes=self._live_class_stable_minutes(new_prog, new_temp),
+            energy_used_kwh=energy_used,
+            lower_stable_minutes=self.guard_reclass_stable_minutes,
+            disproof_margin=self.guard_energy_disproof_margin,
+        )
+        if action is None:
+            return
+        old = self.expected_dur_at_start
+        self.expected_dur_at_start = new_bar
+        self._guard_bar_class = (new_prog, new_temp)
+        temp_str = f" {new_temp}" if new_temp else ""
+        if action == "freeze":
+            self.log(f"Frozen expected_dur_at_start: {new_bar:.0f} min", level="DEBUG")
+        elif action == "raise":
+            self.log(
+                f"Raised expected_dur_at_start: {old:.0f} -> {new_bar:.0f} min "
+                f"(classified '{new_prog}'{self._log_safe(temp_str)})",
+                level="INFO",
+            )
+        elif action == "lower":
+            self.log(
+                f"Lowered expected_dur_at_start: {old:.0f} -> {new_bar:.0f} min "
+                f"('{new_prog}'{self._log_safe(temp_str)} stable "
+                f"{self._live_class_stable_minutes(new_prog, new_temp):.0f}min, energy "
+                f"{energy_used:.2f}kWh disproves previous programme, max {bar_max_energy or 0:.2f}kWh)",
+                level="INFO",
+            )
+        else:  # rekey - bar value unchanged, programme key adopted (e.g. after restart restore)
+            self.log(
+                f"Guard bar programme adopted from live classification: '{new_prog}'{self._log_safe(temp_str)} "
+                f"({new_bar:.0f} min)",
+                level="DEBUG",
+            )
+
     def _get_guard_duration(self, tick_prog=None, tick_temp=None, tick_class=None):
-        """Best duration for 85% guards: prefer user-confirmed selector, else frozen, else classified, else max.
+        """Best duration for 85% guards: prefer user-confirmed selector, else the guard bar
+        (expected_dur_at_start - seeded at first classification, then evidence-following via
+        _update_guard_bar), else this tick's classification, else programme max.
         Only trust confirm_entity when programme_confirmed_by_user is True; otherwise the selector may hold
         an auto-filled prediction and must not drive finish guards."""
         if self.programme_confirmed_by_user and self.confirm_entity:
@@ -4840,6 +4990,7 @@ class WasherMonitor(hass.Hass):
                 if user_dur and (self.expected_dur_at_start is None or user_dur > self.expected_dur_at_start):
                     old = self.expected_dur_at_start
                     self.expected_dur_at_start = user_dur
+                    self._guard_bar_class = (prog_key, temp)
                     self.log(f"Upgraded expected_dur_at_start: {old} -> {user_dur:.0f} min (user confirmed {new})", level="INFO")
         elif entity == self.temperature_entity:
             by_str = f" by {self.confirmed_by_username}" if self.confirmed_by_username else ""
@@ -4853,6 +5004,7 @@ class WasherMonitor(hass.Hass):
                 if user_dur and (self.expected_dur_at_start is None or user_dur > self.expected_dur_at_start):
                     old = self.expected_dur_at_start
                     self.expected_dur_at_start = user_dur
+                    self._guard_bar_class = (prog_key, temp)
                     self.log(f"Upgraded expected_dur_at_start: {old} -> {user_dur:.0f} min (user set temp {new})", level="INFO")
 
     def _push_running_eta_attributes(self):
@@ -4884,6 +5036,7 @@ class WasherMonitor(hass.Hass):
             attrs["programme_confirmed_by"] = self.confirmed_by_username or ""
             if self.expected_dur_at_start is not None:
                 attrs["expected_dur_at_start"] = self.expected_dur_at_start
+                attrs["expected_dur_key"] = self._guard_bar_key_str()
             attrs["predicted_programme"] = ""
             attrs["predicted_programme_label"] = ""
             attrs["predicted_temperature"] = ""
@@ -5055,6 +5208,9 @@ class WasherMonitor(hass.Hass):
 
         # Re-freeze expected duration from the real wash (was frozen from the bogus start tick).
         self.expected_dur_at_start = None
+        self._guard_bar_class = None
+        self._live_class_key = None
+        self._live_class_since = None
 
         # Re-arm the max-running-hours watchdog from the real start.
         self._safe_cancel_timer(self.running_watchdog_timer)
@@ -5070,6 +5226,74 @@ class WasherMonitor(hass.Hass):
             level="INFO",
         )
 
+    def _standby_backstop_tick(self, now, tick_prog, tick_temp, tick_class) -> bool:
+        """Zero-power standby backstop: decide what to do after sustained hard 0W.
+
+        Called from _check_energy_finish when instantaneous power is <= 0W. Returns True
+        when it transitioned the state (caller must stop the tick), False to keep checking.
+
+        Ladder (all thresholds unchanged from the original inline block):
+          * 0W >= 3 min + finish guards met + valid cycle    -> Unemptied (normal finish).
+          * 0W >= 5 min + heated + real energy + warm floor  -> Unemptied via safety net (below).
+          * 0W >= 5 min otherwise                            -> forced Off (false start / ghost Running).
+
+        The safety net (2026-08-11): a cycle that demonstrably heated water
+        (observed_heating) and consumed at least min_energy_kwh is a REAL wash even when
+        the finish-time guards never opened - a wrong-long guard bar (eco 199 min frozen
+        over an actual ~180 min run -> needing 92% = 183 min) blocked them right up to
+        this point. Forcing Off here ended 12 real washes silently since 2026-03: no
+        announcement, no Unemptied on the dashboard, no learning record. Publishing
+        Unemptied instead is safe because the existing protections still hold: the
+        finish_min_run_minutes_warm floor (100 min) and 5 minutes of hard 0W (anti-crease
+        tumbles reset the zero-power clock, so a mid-cycle soak never gets here)."""
+        if self._zero_power_since is None:
+            self._zero_power_since = now
+        zero_min = (now - self._zero_power_since).total_seconds() / 60
+        if zero_min < 3.0:
+            return False
+        run_min = (now - self.start_time).total_seconds() / 60 if self.start_time else 0
+        guard_dur = self._get_guard_duration(tick_prog, tick_temp, tick_class)
+        if self._meets_finish_time_guards(run_min, guard_dur or 0):
+            self.log(
+                f"Standby backstop: power 0W for {zero_min:.1f}min - machine is off",
+                level="INFO",
+            )
+            if self._is_valid_completed_cycle():
+                self._transition_to_unemptied()
+                return True
+        else:
+            self.log(
+                f"Standby backstop: 0W for {zero_min:.1f}min but finish time guards not met (run {run_min:.0f}min) - skipping",
+                level="DEBUG",
+            )
+        # Invalid cycle (e.g. false-start or ghost Running state) with sustained
+        # zero power - machine is clearly off, go directly to Off.
+        if zero_min >= 5.0:
+            energy_used = self._get_energy_used()
+            if (
+                self.observed_heating
+                and energy_used >= self.min_energy_kwh
+                and run_min >= self.finish_min_run_minutes_warm
+            ):
+                self.log(
+                    f"Standby backstop net: 0W for {zero_min:.1f}min on a heated cycle "
+                    f"(run {run_min:.0f}min, energy {energy_used:.2f}kWh) with finish guards "
+                    f"never met (guard {guard_dur or 0:.0f}min) - publishing Unemptied instead "
+                    f"of silently forcing Off",
+                    level="WARNING",
+                )
+                self._pending_end_reason = "standby_backstop"
+                self._transition_to_unemptied()
+                return True
+            self.log(
+                f"Standby backstop: cycle invalid + 0W for {zero_min:.1f}min - forcing Off",
+                level="WARNING",
+            )
+            self._transition_to_off("Standby backstop: invalid cycle with sustained zero power")
+            return True
+        self.log("Standby backstop but cycle validation failed - keep checking", level="WARNING")
+        return False
+
     def _check_energy_finish(self, kwargs):
         """Check if energy consumption has stopped (cycle finished)."""
         current_state = self.get_state(self.state_entity)
@@ -5084,6 +5308,10 @@ class WasherMonitor(hass.Hass):
         _tick_prog, _tick_temp = self._classify_programme()
         _pred_prog, _pred_temp = self._classify_programme(energy_signature_only=True)
         _tick_class = (_tick_prog, _tick_temp)
+        # Track classification stability + evolve the guard bar BEFORE any finish path of this
+        # tick consults _get_guard_duration (freeze/raise/lower - see _update_guard_bar).
+        self._note_live_classification(_tick_prog, _tick_temp)
+        self._update_guard_bar(_tick_prog, _tick_temp)
 
         run_min = (self._now_utc() - self.start_time).total_seconds() / 60 if self.start_time else 0
         guard_dur = self._get_guard_duration(_tick_prog, _tick_temp, _tick_class)
@@ -5238,15 +5466,14 @@ class WasherMonitor(hass.Hass):
                 f"max power: {self.max_power_seen:.0f}W)",
                 level="INFO",
             )
-        # Freeze expected duration at first confident classification so mid-cycle
-        # selector changes can never weaken the too-early guard. Placed outside the
-        # "changed" block so it also fires when restore pre-set detected_programme
-        # to the same value (no change event) but expected_dur_at_start was lost.
+        # Guard bar upkeep happens in _update_guard_bar (called at the top of this tick):
+        # seeded at the first confident classification so mid-cycle selector changes can
+        # never weaken the too-early guard, raised freely, lowered only after energy
+        # disproof + stability. This second call is belt-and-braces for the restore case
+        # the old freeze handled here: restore pre-set detected_programme to the same
+        # value (no change event) but expected_dur_at_start was lost.
         if new_prog != "unknown" and self.expected_dur_at_start is None:
-            dur = self._get_programme_duration(new_prog, new_temp, use_learned=False)
-            if dur:
-                self.expected_dur_at_start = dur
-                self.log(f"Frozen expected_dur_at_start: {dur:.0f} min", level="DEBUG")
+            self._update_guard_bar(new_prog, new_temp)
 
         # ETA: use selector only when user actually confirmed (_on_confirm_changed set the flag).
         # Do not trust the selector alone - it may be stale or out of sync with Auto.
@@ -5357,6 +5584,7 @@ class WasherMonitor(hass.Hass):
         attrs["programme_confirmed_by_user"] = bool(self.programme_confirmed_by_user)
         attrs["programme_confirmed_by"] = self.confirmed_by_username or ""
         attrs["expected_dur_at_start"] = self.expected_dur_at_start if self.expected_dur_at_start is not None else ""
+        attrs["expected_dur_key"] = self._guard_bar_key_str()
         attrs["session_cost_kr"] = round(self._session_cost_kr, 2)
         # cycle_complete/heating_bursts/progress_pct/estimated_remaining_min/last_door_closed_trusted/
         # programme_confirmed_by_user/delayed_start_trimmed/delayed_start_waiting can all legitimately
@@ -5484,35 +5712,8 @@ class WasherMonitor(hass.Hass):
             # rolling energy window (which lags due to REF_WINDOW_S).
             current_power = self._get_current_power()
             if current_power <= 0.0:
-                if self._zero_power_since is None:
-                    self._zero_power_since = now
-                zero_min = (now - self._zero_power_since).total_seconds() / 60
-                if zero_min >= 3.0:
-                    run_min = (now - self.start_time).total_seconds() / 60 if self.start_time else 0
-                    guard_dur = self._get_guard_duration(_tick_prog, _tick_temp, _tick_class)
-                    if self._meets_finish_time_guards(run_min, guard_dur or 0):
-                        self.log(
-                            f"Standby backstop: power 0W for {zero_min:.1f}min - machine is off",
-                            level="INFO",
-                        )
-                        if self._is_valid_completed_cycle():
-                            self._transition_to_unemptied()
-                            return
-                    else:
-                        self.log(
-                            f"Standby backstop: 0W for {zero_min:.1f}min but finish time guards not met (run {run_min:.0f}min) - skipping",
-                            level="DEBUG",
-                        )
-                    # Invalid cycle (e.g. false-start or ghost Running state) with sustained
-                    # zero power - machine is clearly off, go directly to Off.
-                    if zero_min >= 5.0:
-                        self.log(
-                            f"Standby backstop: cycle invalid + 0W for {zero_min:.1f}min - forcing Off",
-                            level="WARNING",
-                        )
-                        self._transition_to_off("Standby backstop: invalid cycle with sustained zero power")
-                        return
-                    self.log("Standby backstop but cycle validation failed - keep checking", level="WARNING")
+                if self._standby_backstop_tick(now, _tick_prog, _tick_temp, _tick_class):
+                    return
             else:
                 # Anti-crease tumbles are post-end activity, not cycle activity: once past
                 # expected end with the pattern currently confirmed, a brief tumble (< 120W)
