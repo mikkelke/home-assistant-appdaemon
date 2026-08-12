@@ -237,7 +237,22 @@ SmartCooling:
   # yet the plan said "run the AC -> peak 24.6C").
   wm_reality_margin: 1.0
   wm_warm_night_margin: 1.0
-  wm_clearsky_peak: 700.0   # clear-sky half-sine amplitude (W/m2) for remaining-daylight solar
+  # Clear-sky half-sine amplitude (W/m2) for the remaining-daylight half of _solar_mean_today.
+  # RECALIBRATED 700 -> 475 (2026-08-12). The measured half of that blend comes from
+  # sensor.gw2000a_solar_radiation, whose sky view is obstructed below roughly 20 deg elevation
+  # in the east and 35 deg in the west (proven by clearness index binned on azimuth: at the SAME
+  # 20-28 deg elevation the east reads kt 0.50-0.59 and the west 0.24-0.31 - a cosine error would
+  # be symmetric, an obstruction is not). So the forecast half was modelling an unobstructed sky
+  # while the measured half reported an obstructed one, and the estimate of a single fixed day's
+  # mean drifted with the time of asking: on 2026-07-10 it read 314 W/m2 at 04:07 and 207 at
+  # 22:07 - the day actually delivered 207, so the morning estimate was +52% (~+1.7C on the
+  # predicted equilibrium via b_solar). 475 = 700 x 0.68, the measured-mean/model ratio over the
+  # five clearest days in a 22-day record (individually 0.65-0.72); with it the 04:07 estimate
+  # for that day becomes 213 against an actual 207. This re-points the model at the quantity the
+  # sensor actually reports, which is what b_solar was fitted against. It matters beyond the AC:
+  # _publish_sleep_plan runs on the weather E regardless of wm_shadow, and the wake routine now
+  # reads sensor.sleep_plan to decide whether the blind must open for venting.
+  wm_clearsky_peak: 475.0
   wm_cloud_atten: 0.75      # cloud attenuation of the clear-sky estimate
   wm_peak_hour: 15          # before this hour a missing forecast forces legacy (hot-day guard)
   solar_sensor: sensor.gw2000a_solar_radiation

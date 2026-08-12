@@ -1065,6 +1065,19 @@ class SmartCooling(hass.Hass):
                 cloud_by_hour[(row["dt"].year, row["dt"].month,
                                row["dt"].day, row["dt"].hour)] = row["cloud"]
         remaining = 0.0
+        # The measured mean covers midnight->now and the loop below starts at the NEXT whole
+        # hour, so the slice from now to the top of this hour used to be credited to nothing
+        # (found 2026-08-12). Sawtooth error: zero at hh:59, worst at hh:00 - measured at up
+        # to 25.7 W/m2 around midday on 2026-07-10, ~0.42C of equilibrium under-prediction.
+        part_left = 1.0 - (now.minute / 60.0)
+        if part_left > 0.0:
+            # Sample the half-sine at the midpoint of the remaining fraction, then weight it
+            # by that fraction - same shape as the whole-hour terms below.
+            cs_now = self._clearsky_wm(now.hour + 1.0 - part_left / 2.0, sunrise, sunset, self.wm_clearsky_peak)
+            if cs_now > 0.0:
+                cf_now = cloud_by_hour.get((now.year, now.month, now.day, now.hour))
+                atten_now = (1.0 - self.wm_cloud_atten * cf_now) if cf_now is not None else 1.0
+                remaining += cs_now * max(0.0, atten_now) * part_left
         for h in range(now.hour + 1, 24):
             cs = self._clearsky_wm(h + 0.5, sunrise, sunset, self.wm_clearsky_peak)
             if cs <= 0.0:

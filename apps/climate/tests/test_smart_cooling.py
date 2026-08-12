@@ -993,20 +993,23 @@ class SolarMeanAssembly(unittest.TestCase):
         app = self._app(measured_mean=100.0)
         now = datetime(2026, 7, 20, 12, 0)   # elapsed 12h
         sm = self._run(app._solar_mean_today(now))
+        # From 12:00 the remaining daylight is hours 12..23 - hour 12 has NOT elapsed yet
+        # (elapsed_h=12 covers 00:00-12:00). The old expectation started at 13 and so encoded
+        # the dropped-partial-hour bug fixed 2026-08-12.
         exp_rem = sum(sc.SmartCooling._clearsky_wm(h + 0.5, 5.0, 21.0, 700.0)
-                      for h in range(13, 24))
+                      for h in range(12, 24))
         self.assertAlmostEqual(sm, (100.0 * 12.0 + exp_rem) / 24.0, places=4)
 
     def test_cloud_forecast_attenuates_remaining_term(self):
         # full overcast (cloud=1.0) over every remaining hour -> each clear-sky hour times
         # (1 - 0.75*1.0) = 0.25
         fc = [{"dt": datetime(2026, 7, 20, h), "temp": 20.0, "cloud": 1.0}
-              for h in range(13, 24)]
+              for h in range(12, 24)]
         app = self._app(measured_mean=100.0, forecast=fc)
         now = datetime(2026, 7, 20, 12, 0)
         sm = self._run(app._solar_mean_today(now))
         exp_rem = sum(sc.SmartCooling._clearsky_wm(h + 0.5, 5.0, 21.0, 700.0) * 0.25
-                      for h in range(13, 24))
+                      for h in range(12, 24))
         self.assertAlmostEqual(sm, (100.0 * 12.0 + exp_rem) / 24.0, places=4)
 
     def test_missing_solar_sensor_returns_none(self):
@@ -2610,3 +2613,56 @@ class VentTauSelection(unittest.TestCase):
     def test_unreadable_curtain_errs_warm(self):
         app = make_app()
         self.assertEqual(app._vent_tau(True, None, False), app.vent_tau_indirect_h)
+
+
+class SolarMeanPartialHour(unittest.TestCase):
+    """2026-08-12: elapsed_h ran midnight->now while the remaining-daylight loop started at the
+    NEXT whole hour, so the slice from now to the top of the current hour was credited to
+    neither half. Sawtooth: zero at hh:59, worst at hh:00 - up to 25.7 W/m2 (~0.42C of
+    equilibrium) around midday. This matters beyond the AC: _publish_sleep_plan runs on the
+    weather E regardless of wm_shadow, and the wake routine now reads sensor.sleep_plan."""
+
+    def _run(self, coro):
+        import asyncio
+        return asyncio.run(coro)
+
+    def _app(self, measured_mean=100.0, sun=(5.0, 21.0)):
+        app = make_app()
+        async def _state(e):
+            return "123"
+        app._state = _state
+        async def _htm(entity, start, end):
+            return measured_mean
+        app._history_time_mean = _htm
+        async def _sun(now):
+            return sun
+        app._sun_window = _sun
+        async def _fc(now):
+            return None
+        app._get_forecast = _fc
+        return app
+
+    def _expected(self, hour, minute, elapsed_h):
+        part_left = 1.0 - minute / 60.0
+        rem = sc.SmartCooling._clearsky_wm(hour + 1.0 - part_left / 2.0, 5.0, 21.0, 700.0) * part_left
+        rem += sum(sc.SmartCooling._clearsky_wm(h + 0.5, 5.0, 21.0, 700.0) for h in range(hour + 1, 24))
+        return (100.0 * elapsed_h + rem) / 24.0
+
+    def test_half_past_credits_half_the_current_hour(self):
+        app = self._app()
+        sm = self._run(app._solar_mean_today(datetime(2026, 7, 20, 12, 30)))
+        self.assertAlmostEqual(sm, self._expected(12, 30, 12.5), places=4)
+
+    def test_the_sawtooth_is_gone_across_one_hour(self):
+        """The estimate of a fixed day must not jump as the clock crosses an hour boundary.
+        Sampling 11:59 and 12:01 with a flat measured mean should differ only marginally."""
+        app = self._app()
+        a = self._run(app._solar_mean_today(datetime(2026, 7, 20, 11, 59)))
+        b = self._run(app._solar_mean_today(datetime(2026, 7, 20, 12, 1)))
+        self.assertLess(abs(a - b), 1.0)
+
+    def test_night_hour_adds_nothing(self):
+        """Before sunrise the partial term is zero, so the old and new results agree."""
+        app = self._app()
+        sm = self._run(app._solar_mean_today(datetime(2026, 7, 20, 3, 30)))
+        self.assertAlmostEqual(sm, self._expected(3, 30, 3.5), places=4)
