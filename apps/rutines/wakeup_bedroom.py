@@ -85,6 +85,12 @@ class WakeupRoutine(hass.Hass):
         self.closed_threshold = int(A.get("closed_threshold", 95))
         self.bedroom_cover = A["covers"]["bedroom"]
         self.bathroom_cover = A["covers"]["bathroom"]
+        # The single owner of the bedroom blind (apps/blinds/bedroom_blind_owner.py).
+        # The wake submits its blind request there; a manual hold outranking it means
+        # the blind stays where the human put it AND the light ramp still runs (see
+        # _set_cover_position / _blind_wait_complete). Looked up lazily per use, and
+        # every failure shape degrades to the direct write - this is the alarm.
+        self.owner_app = A.get("owner_app", "BedroomBlindOwner")
         self.bedroom_cover_target = int(A["bedroom_cover_target"])
         self.bathroom_cover_target = int(A["bathroom_cover_target"])
         # Heat-wave override: the normal wake nudge (38, i.e. mostly open) floods a hot
@@ -546,12 +552,17 @@ class WakeupRoutine(hass.Hass):
         module docstring for the 2026-08-09 incident that put it there.
         """
         target, reason = self._decide_bedroom_wake_target_raw()
+        # Stash which SOURCE the winning target belongs to ("vent" or "wake") so the
+        # blind-owner request below can claim the right rank - additive only, the
+        # (position, reason) return shape is pinned by test_wakeup_heat.
+        self._current_bedroom_wake_source = getattr(blind_arbiter, "SOURCE_WAKE", "wake") if blind_arbiter else "wake"
         if target == self.bedroom_cover_target or not self._venting_tonight():
             return target, reason
         vent_reason = f"venting tonight, window must open (was: {reason})"
         if blind_arbiter is None:
             # Fail-safe: the shared layer is gone, so apply the same rule locally rather
             # than let a hot morning park the blind where the window cannot open.
+            self._current_bedroom_wake_source = "vent"
             return self.bedroom_cover_target, vent_reason
         winner = blind_arbiter.arbitrate([
             blind_arbiter.BlindRequest(
@@ -560,6 +571,7 @@ class WakeupRoutine(hass.Hass):
         ])
         if winner is None:
             return target, reason
+        self._current_bedroom_wake_source = winner.source
         return winner.position, winner.reason
 
     def _decide_bedroom_wake_target_raw(self):
@@ -658,6 +670,8 @@ class WakeupRoutine(hass.Hass):
         self._start_media_and_volume_ramp()
         target, reason = self._decide_bedroom_wake_target()
         self._current_bedroom_wake_target = target
+        self._current_bedroom_wake_reason = reason
+        self._wake_blind_outcome = None  # set by _set_cover_position when the owner answers
         if target != self.bedroom_cover_target:
             self.log(f"[wake] Heat-block: bedroom blind target {target} instead of "
                      f"{self.bedroom_cover_target} ({reason})", log=self.user_log)
@@ -667,6 +681,18 @@ class WakeupRoutine(hass.Hass):
         pos = self._cover_position(self.bedroom_cover)
         if pos is not None and int(pos) == self._current_bedroom_wake_target:
             self._maybe_start_light_ramp()
+        elif self._wake_blind_outcome == "refused" or self._owner_manual_hold_active():
+            # A manual hold outranks the wake target (owner said so, or a hold is
+            # already active). The blind stays where the human put it - and the
+            # morning must not wait for a target that will never arrive, so the
+            # blind wait completes NOW through the same settle path as an arrival
+            # and the light ramp still gets its chance.
+            self.log(
+                "[wake] Manual blind hold outranks the wake target - leaving the "
+                "blind and starting the light decision without it",
+                log=self.user_log,
+            )
+            self._blind_wait_complete("Bedroom blind left to the manual hold")
         else:
             if self.cover_listener:
                 self.cancel_listen_state(self.cover_listener)
@@ -675,6 +701,8 @@ class WakeupRoutine(hass.Hass):
             )
             # Hard deadline: a listener that never fires (blind never hits the exact
             # target) must not stay armed into the day - see wake_light_window_min.
+            # This is also the bounded backstop for the manual-yield below: if every
+            # earlier detection misses, the wait still ends here.
             self.run_in(self._expire_cover_listener, self.wake_light_window_min * 60)
             self.log("[wake] Waiting for bedroom blind target to start light ramp...", log=self.user_log)
 
@@ -930,17 +958,73 @@ class WakeupRoutine(hass.Hass):
         except Exception:
             return None
 
-    def _set_cover_position(self, entity, pct):
-        """Hand the move to the shared blind owner (blind_arbiter.command).
+    def _blind_owner(self):
+        """The single blind owner (apps/blinds/bedroom_blind_owner.py), or None.
 
-        The wake's write is deliberately NOT gated on arbitration here. The light ramp
-        waits for this cover to REACH its target before it starts (_on_bedroom_position),
-        so a write silently dropped at this point would strand the whole morning - blind
-        shut, no ramp, alarm half-run. Everything that legitimately outranks the wake is
-        resolved earlier, in _decide_bedroom_wake_target, where losing costs a position
-        and not the wake-up.
+        Every failure shape - arg missing, app not loaded, half-loaded without its
+        API - returns None, and None always means "the pre-owner behaviour", never
+        a skipped write. This is the alarm; degrading costs the house a layer,
+        never the wake-up."""
+        try:
+            name = getattr(self, "owner_app", None)
+            if not name:
+                return None
+            app = self.get_app(name)
+        except Exception:
+            return None
+        if app is None or not hasattr(app, "request"):
+            return None
+        return app
+
+    def _owner_manual_hold_active(self):
+        """True when the blind owner says a human's move is holding the blind.
+        False on ANY failure - without a definite answer the wake keeps waiting for
+        its target exactly as it did before the owner existed."""
+        owner = self._blind_owner()
+        if owner is None:
+            return False
+        try:
+            return bool(owner.manual_hold_active())
+        except Exception:
+            return False
+
+    def _set_cover_position(self, entity, pct):
+        """Hand the move to the blind owner; direct write when it is absent.
+
+        The BEDROOM cover routes through the owner so a manual hold can outrank the
+        wake - and a refusal is handled, not silent: _alarm_fire sees the outcome
+        and completes the blind wait through _blind_wait_complete, so the ramp
+        still runs (blind where the human put it, morning not stranded). The
+        bathroom cover is not owned and keeps the pre-owner write. Fallback for a
+        missing/broken owner is byte-identical to the pre-owner behaviour, where
+        the wake write is deliberately NOT gated on arbitration: everything that
+        legitimately outranks the wake is resolved in _decide_bedroom_wake_target,
+        where losing costs a position and not the wake-up.
         """
         self.log(f"[wake] Setting {entity} -> {pct}%", log=self.user_log)
+        if entity == getattr(self, "bedroom_cover", None):
+            owner = self._blind_owner()
+            if owner is not None:
+                try:
+                    source = getattr(self, "_current_bedroom_wake_source", None) or (
+                        blind_arbiter.SOURCE_WAKE if blind_arbiter is not None else "wake")
+                    reason = getattr(self, "_current_bedroom_wake_reason", "") or "morning open"
+                    res = owner.request(source, int(pct), reason=reason)
+                    if res and res.get("granted"):
+                        self._wake_blind_outcome = "granted"
+                    else:
+                        self._wake_blind_outcome = "refused"
+                        self.log(
+                            f"[wake] Blind held by {(res or {}).get('winner')} - leaving it "
+                            "where the human put it",
+                            log=self.user_log,
+                        )
+                    return
+                except Exception as e:
+                    self.log(
+                        f"[wake] Blind owner request failed ({e}) - direct write",
+                        level="WARNING", log=self.user_log,
+                    )
         if blind_arbiter is None:
             self.call_service("cover/set_cover_position", entity_id=entity, position=int(pct))
             return
@@ -981,37 +1065,59 @@ class WakeupRoutine(hass.Hass):
         except Exception:
             return
         if pos == self._current_bedroom_wake_target:
-            if self.cover_listener:
-                self.cancel_listen_state(self.cover_listener)
-                self.cover_listener = None
-            # Allow sensor lag to catch up, then recompute darkness and decide.
-            def _delayed_decide(_):
-                try:
-                    self.fire_event("darkness_recompute", zone="bedroom")
-                except Exception:
-                    pass
-                # Check current room state to decide whether to start the ramp
-                try:
-                    if self._room_dark_for_wake_light():
-                        self._maybe_start_light_ramp()
-                    else:
-                        self.log("[wake] Room already bright after blinds; skipping ramp.", log=self.user_log)
-                except Exception:
-                    # If uncertain, proceed with ramp conservatively
-                    self._maybe_start_light_ramp()
+            self._blind_wait_complete("Bedroom blind reached target")
+            return
+        # The blind is moving but NOT toward our number: if the owner says a human
+        # took it (wall press / hand on the remote after the wake command), the
+        # target will never arrive. Yield now - blind stays where the human put it,
+        # and the wait completes through the same settle path as an arrival so the
+        # light ramp still runs. A manual takeover mid-wait always produces position
+        # reports (the blind moves), so this check is guaranteed a trigger; the
+        # wake_light_window_min expiry in _alarm_fire stays the bounded backstop.
+        if self.cover_listener and self._owner_manual_hold_active():
+            self.log(
+                "[wake] Manual move took the blind mid-wait - yielding and starting "
+                "the light decision without it",
+                log=self.user_log,
+            )
+            self._blind_wait_complete("Bedroom blind yielded to a manual move")
 
-            delay, outdoor_lux = self._compute_post_blind_settle_delay()
-            if outdoor_lux is None:
-                self.log(
-                    f"[wake] Bedroom blind reached target; waiting {delay}s before darkness check (outdoor lux unavailable).",
-                    log=self.user_log,
-                )
-            else:
-                self.log(
-                    f"[wake] Bedroom blind reached target; outdoor {outdoor_lux:.0f}lx -> wait {delay}s before darkness check.",
-                    log=self.user_log,
-                )
-            self.run_in(_delayed_decide, delay)
+    def _blind_wait_complete(self, headline="Bedroom blind reached target"):
+        """The blind phase of the morning is over - by arrival at the wake target or
+        by yielding to a manual hold. Either way the ramp decision runs on the same
+        settle timing (post_blind_settle_*), so the blind->ramp handshake is one
+        path with two entrances, not two paths."""
+        if self.cover_listener:
+            self.cancel_listen_state(self.cover_listener)
+            self.cover_listener = None
+        # Allow sensor lag to catch up, then recompute darkness and decide.
+        def _delayed_decide(_):
+            try:
+                self.fire_event("darkness_recompute", zone="bedroom")
+            except Exception:
+                pass
+            # Check current room state to decide whether to start the ramp
+            try:
+                if self._room_dark_for_wake_light():
+                    self._maybe_start_light_ramp()
+                else:
+                    self.log("[wake] Room already bright after blinds; skipping ramp.", log=self.user_log)
+            except Exception:
+                # If uncertain, proceed with ramp conservatively
+                self._maybe_start_light_ramp()
+
+        delay, outdoor_lux = self._compute_post_blind_settle_delay()
+        if outdoor_lux is None:
+            self.log(
+                f"[wake] {headline}; waiting {delay}s before darkness check (outdoor lux unavailable).",
+                log=self.user_log,
+            )
+        else:
+            self.log(
+                f"[wake] {headline}; outdoor {outdoor_lux:.0f}lx -> wait {delay}s before darkness check.",
+                log=self.user_log,
+            )
+        self.run_in(_delayed_decide, delay)
 
     # ---------- light ramp ----------
     def _room_dark_for_wake_light(self):

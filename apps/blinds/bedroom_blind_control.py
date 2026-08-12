@@ -22,6 +22,12 @@ class BedroomBlindControl(hass.Hass):
         self.target_cover = self.args.get("target_cover")
         # Optional: bathroom blind for linked action
         self.bathroom_blind_entity = self.args.get("bathroom_blind_entity")
+        # The single blind owner (apps/blinds/bedroom_blind_owner.py). A wall
+        # gesture is the "manual" rank there - it always wins AND it starts the one
+        # shared manual pause. Looked up lazily per press; when the owner is
+        # missing/broken the write below stays exactly what it was before the owner
+        # existed (the bathroom blind is not owned and is always written directly).
+        self.owner_app = self.args.get("owner_app", "BedroomBlindOwner")
 
         if not self.device_id:
             self.error("'device_id' is missing in configuration. App will not listen to events.")
@@ -322,8 +328,43 @@ class BedroomBlindControl(hass.Hass):
             level="INFO",
         )
 
+    def _blind_owner(self):
+        """The blind-owner app, or None - and None must degrade, never skip."""
+        try:
+            name = getattr(self, "owner_app", None)
+            if not name:
+                return None
+            app = self.get_app(name)
+        except Exception:
+            return None
+        if app is None or not hasattr(app, "request"):
+            return None
+        return app
+
     def _set_cover_position(self, position, reason=""):
-        """Set cover position and verify after delay."""
+        """Set cover position and verify after delay.
+
+        Routed through the blind owner when it is loaded: a held wall button is a
+        person in the room saying what they want, so it ranks "manual" - nothing
+        automatic outranks it, and the owner starts the shared manual pause from
+        it. The owner also verifies arrival, so the local verification below only
+        runs on the fallback path. Fallback body is byte-identical to pre-owner."""
+        owner = self._blind_owner()
+        if owner is not None:
+            try:
+                res = owner.request("manual", int(position), reason=reason or "wall press")
+                granted = bool(res and res.get("granted"))
+                self.log(
+                    f"Asked blind owner: {self.target_cover} -> {position}% ({reason}); "
+                    f"granted={granted}",
+                    level="INFO",
+                )
+                return
+            except Exception as e:
+                self.log(
+                    f"Blind owner request failed ({e}) - falling back to the direct write",
+                    level="WARNING",
+                )
         try:
             # Get current position for context in logs
             current_pos = None

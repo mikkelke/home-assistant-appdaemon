@@ -1,0 +1,66 @@
+# The single owner of cover.bedroom_blind: every writer (wall remote, wake routine,
+# solar shade) asks this app (get_app("BedroomBlindOwner").request(...)) instead of
+# calling cover/set_cover_position itself. Precedence is blind_arbiter's:
+# manual > vent > wake > shade. The owner also holds the ONE manual-pause notion
+# (wall gestures + uncommanded moves) that used to exist three times.
+#
+# FAIL-SAFE: every caller keeps its old direct write for when this app is missing
+# or raises - deleting this file (or the .py) degrades the house to the pre-owner
+# behaviour, it never breaks the wake-up alarm.
+#
+# POSITIONS ARE INVERTED vs Home Assistant - 100 = risen = covering the window.
+# Read the banner in bedroom_blind_control.yaml first.
+BedroomBlindOwner:
+  module: bedroom_blind_owner
+  class: BedroomBlindOwner
+  log: bedroom_blind_control_log
+
+  cover_entity: cover.bedroom_blind
+
+  # This install's AppDaemon user id - state changes whose context.user_id equals it
+  # are service calls from our own apps (e.g. a caller's fail-safe direct write),
+  # never a human. A person's user id means a dashboard/UI move -> manual. Same
+  # knob and value as family_room_lights.yaml; never hardcoded in the app.
+  appdaemon_user_id: "f4fda494358943beaf8ad2c70db099f8"
+
+  # THE unified manual pause: a wall gesture or an uncommanded move holds all
+  # automation off this blind for this long (was bedroom_solar_shade's
+  # manual_pause_min; the shade now asks here instead of keeping its own).
+  manual_pause_min: 120
+
+  # Claim lifetimes (minutes). wake/vent match bedroom_solar_shade's wake_grace_min
+  # so the shade starts winning arbitration exactly when its own gates open; shade
+  # outlives one of its 10-min ticks so a standing claim can't lapse mid-cycle.
+  wake_ttl_min: 20
+  vent_ttl_min: 20
+  shade_ttl_min: 15
+
+  # Same numbers as bedroom_solar_shade so moving the detection here cannot change
+  # what counts as "a move" (tolerance) or "stopped" (settle: the motor reports
+  # ~every 5 s while travelling - measured 2026-07-27).
+  position_tolerance: 6
+  manual_settle_seconds: 12
+  # A commanded move may keep producing reports this long before an off-target
+  # settle stops counting as our own travel (~60 s full range at ~0.6 s/percent).
+  own_move_window_sec: 90
+
+  # Post-write arrival check, moved here from bedroom_blind_control with the write
+  # itself. Must exceed full-range travel (~60 s): a short delay fired mid-travel
+  # and produced 99 false "motor issue" warnings (2026-07-27).
+  verification_delay: 70.0
+  verification_tolerance: 5
+
+  # Transparency + dashboard feed. FIXED CONTRACT (the hakit dashboard reads it):
+  # state = winning source key (manual|vent|wake|shade|idle); attributes =
+  # position (number), manual_pause_until (ISO string or ""), claims (list of
+  # {source, position} for non-winning requests), reason (one sentence),
+  # friendly_name. See _publish's docstring before changing anything here.
+  status_entity: sensor.bedroom_blind_owner
+
+  # Claims (incl. the manual hold), baseline and any in-flight command survive an
+  # AppDaemon restart. On the first start this app also adopts an in-flight manual
+  # pause from bedroom_solar_shade's pre-owner state file (read-only, one-time).
+  state_file: /conf/apps/blinds/bedroom_blind_owner_state.json
+  shade_state_file: /conf/apps/blinds/bedroom_solar_shade_state.json
+
+  dry_run: false

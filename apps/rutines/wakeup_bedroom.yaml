@@ -38,6 +38,13 @@ WakeupBedroom:
   covers:
     bedroom: cover.bedroom_blind
     bathroom: cover.bathroom_blind
+  # Single blind owner (apps/blinds/bedroom_blind_owner.yaml): the wake submits its
+  # bedroom-blind request there. A manual hold outranking it means the blind stays
+  # where the human put it AND the light ramp still runs (the wait completes through
+  # the same settle path as an arrival). Owner absent/broken -> the pre-owner direct
+  # write, so the alarm can never lose its blind to a missing helper app. The
+  # bathroom blind is not owned and is always written directly.
+  owner_app: BedroomBlindOwner
   closed_is_100: true
   # A cover this "closed" gets nudged open at wake (>= 95 normal, <= 5 inverted). A "closed"
   # blind can report 98-99 (battery/motor slack). Matches bedroom_blind_control's threshold.

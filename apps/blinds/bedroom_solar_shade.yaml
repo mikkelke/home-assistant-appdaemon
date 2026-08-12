@@ -50,5 +50,11 @@ BedroomSolarShade:
   check_interval_min: 10
   status_entity: sensor.bedroom_solar_shade_status
   dry_run: false
-  # manual-pause override + baseline position survive AD restarts/deploys (2026-07-27)
+  # manual-pause override + baseline position survive AD restarts/deploys (2026-07-27).
+  # With the blind owner loaded this file is the FALLBACK record only - the owner
+  # holds the live manual pause and adopts an in-flight one from here at first start.
   state_file: /conf/apps/blinds/bedroom_solar_shade_state.json
+  # Single blind owner (bedroom_blind_owner.yaml): shading asks it instead of
+  # writing the cover, and asks it about manual pauses instead of keeping its own.
+  # Absent/broken owner -> this app's pre-owner behaviour, unchanged.
+  owner_app: BedroomBlindOwner

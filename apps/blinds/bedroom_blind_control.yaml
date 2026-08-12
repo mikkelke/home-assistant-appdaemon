@@ -87,4 +87,10 @@ bedroom_blind_control:
   # Optional: also close bathroom blind when bedroom blind is already at 100 and close-hold is triggered
   bathroom_blind_entity: "cover.bathroom_blind"
 
+  # Bedroom-blind writes route through the single owner (bedroom_blind_owner.yaml)
+  # as the "manual" rank - always wins, and starts the shared manual pause. When
+  # the owner app is missing/broken this app writes directly, exactly as before.
+  # The bathroom blind is not owned and is always written directly.
+  owner_app: BedroomBlindOwner
+
 

@@ -39,6 +39,14 @@ a move right after a restart is still classified as manual even before this app 
 issued a command of its own this "session" (baseline seeded from the cover's current
 position when nothing is persisted yet).
 
+Since the blind owner (apps/blinds/bedroom_blind_owner.py) exists, this app's private
+manual detection and pause are the FALLBACK, not the mechanism: with the owner loaded,
+_on_cover_change defers to the owner's episode machine, _manual_pause_active asks the
+owner (the single holder of "a human moved this blind, hold off until <t>"), and
+_command_blind submits a "shade" request instead of writing the cover itself. The state
+file, its schema and the local detection all stay exactly as they were - remove the
+owner and this app degrades to the pre-owner behaviour on the next callback.
+
 Opt-in via input_boolean.bedroom_solar_shade (OFF by default). Publishes sensor.bedroom_solar_shade_status.
 
 HA helpers (via MCP): input_boolean.bedroom_solar_shade, input_number.bedroom_solar_shade_position (max-shade cap).
@@ -99,6 +107,9 @@ class BedroomSolarShade(hass.Hass):
         self.status_entity = a("status_entity", "sensor.bedroom_solar_shade_status")
         self.dry_run = bool(a("dry_run", False))
         self.state_file = a("state_file", "/conf/apps/blinds/bedroom_solar_shade_state.json")
+        # The single blind owner; looked up lazily so a partial deploy (owner yaml
+        # without module, or vice versa) just means "absent" and the fallbacks run.
+        self.owner_app = a("owner_app", "BedroomBlindOwner")
 
         # Seconds of position-report silence that mean the motor has stopped. Must exceed
         # the ~5 s it leaves between steps while travelling (measured 2026-07-27), and stay
@@ -205,6 +216,11 @@ class BedroomSolarShade(hass.Hass):
     def _on_cover_change(self, entity, attribute, old, new, kwargs):
         """One hand/remote move is ONE manual move, however many position reports it emits.
 
+        With the blind owner loaded this whole machine stands down: the owner watches
+        the cover itself, holds the single manual pause, and can tell our own writes
+        from a hand by context user id - which this app never could. The detection
+        below is the FALLBACK for when the owner is absent.
+
         This motor reports its position roughly every 5 s while travelling, so the single
         close on 2026-07-27 22:28 (38% -> 100%, 37 s) arrived as SEVEN separate callbacks
         and produced seven identical "pause shading 120 min" log lines and seven state
@@ -213,6 +229,8 @@ class BedroomSolarShade(hass.Hass):
         So: push the pause out on every step (it must run from the END of the travel, not
         the start), persist immediately on the first step so an AppDaemon restart mid-travel
         still knows a manual move happened, then log exactly once when the motor settles."""
+        if self._owner() is not None:
+            return
         try:
             pos = int(float(new))
         except (TypeError, ValueError):
@@ -259,6 +277,23 @@ class BedroomSolarShade(hass.Hass):
     # These two predicates are the single source of truth for "am I outranked": the
     # status gates in _tick and the arbitration at the write sites both read them, so
     # the two can no longer drift apart the way three private manual-pause notions did.
+    def _owner(self):
+        """The blind-owner app (apps/blinds/bedroom_blind_owner.py), or None.
+
+        Deliberately paranoid: a missing arg, a missing get_app, a half-loaded app
+        without the request method - every failure shape returns None, and None
+        means "run the pre-owner behaviour", never "skip the move"."""
+        try:
+            name = getattr(self, "owner_app", None)
+            if not name:
+                return None
+            app = self.get_app(name)
+        except Exception:
+            return None
+        if app is None or not hasattr(app, "request"):
+            return None
+        return app
+
     def _wake_owns_blind(self, now):
         """True while the morning routine owns the blind: asleep, or before the alarm
         time plus its grace. Leaves the night/wake position alone."""
@@ -267,8 +302,30 @@ class BedroomSolarShade(hass.Hass):
         return asleep or now.time() < self._add_min(wake, self.wake_grace_min), wake, asleep
 
     def _manual_pause_active(self, now):
-        """True while a hand/remote move is still holding this app off."""
+        """True while a hand/remote move is still holding this app off.
+
+        The owner is the single holder of that fact when it is loaded (wall
+        gestures and uncommanded moves both land there); this app's own persisted
+        deadline is the fallback."""
+        owner = self._owner()
+        if owner is not None:
+            try:
+                return bool(owner.manual_hold_active())
+            except Exception:
+                pass
         return self._override_until is not None and now < self._override_until
+
+    def _manual_pause_until(self):
+        """The pause deadline for the status entity - owner's when available."""
+        owner = self._owner()
+        if owner is not None:
+            try:
+                until = owner.manual_hold_until()
+                if until is not None:
+                    return until
+            except Exception:
+                pass
+        return self._override_until
 
     def _blind_requests(self, now, desired, reason, *, wake_owns=None):
         """This app's view of the whole claim set, highest rank first.
@@ -312,7 +369,31 @@ class BedroomSolarShade(hass.Hass):
         return False
 
     def _command_blind(self, desired, reason):
-        """The one place this app writes the cover (blind_arbiter.command)."""
+        """The one place this app writes the cover.
+
+        Normal operation: submit a "shade" request to the blind owner - the lowest
+        rank asks, the owner decides and moves. The owner can still refuse (a wake
+        or vent claim this app's own gates can't see), which costs a move, not the
+        app. Fallback (owner absent or raising): exactly the pre-owner behaviour,
+        blind_arbiter.command or the raw service call."""
+        owner = self._owner()
+        if owner is not None:
+            try:
+                source = blind_arbiter.SOURCE_SHADE if blind_arbiter is not None else "shade"
+                res = owner.request(source, int(desired), reason=reason)
+                if res and res.get("granted"):
+                    self._last_cmd = int(desired)
+                    self._save_state()
+                    self.log(f"Set {self.cover} -> {desired}% ({reason})")
+                else:
+                    winner = (res or {}).get("winner")
+                    self.log(f"Not moving the blind - owner gave it to {winner} ({reason})")
+                return
+            except Exception as e:
+                self.log(
+                    f"Blind owner request failed ({e}) - falling back to the direct write",
+                    level="WARNING",
+                )
         if blind_arbiter is None:
             self.call_service("cover/set_cover_position", entity_id=self.cover, position=int(desired))
         else:
@@ -358,7 +439,12 @@ class BedroomSolarShade(hass.Hass):
             )
             return
         if self._manual_pause_active(now):
-            self._publish("manual", f"Paused after a manual move until {self._override_until.strftime('%H:%M')}", {})
+            until = self._manual_pause_until()
+            self._publish(
+                "manual",
+                f"Paused after a manual move until {until.strftime('%H:%M') if until else '?'}",
+                {},
+            )
             return
 
         if self._everyone_away():
