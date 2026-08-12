@@ -173,3 +173,71 @@ class RoomStateAlwaysIncludesState(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# Real-shaped zone (the family room's live numbers) so _decide runs its actual branches
+# rather than the always_dark short-circuit the older tests use.
+BAND_ZONE = {
+    "familyish": {
+        "sensors": ["sensor.a_illuminance"],
+        "outdoor_dark": 2500,
+        "outdoor_bright": 8000,
+        "indoor_min_bright": 280,
+    }
+}
+
+
+def make_band_app(outdoor_lux, indoor_daylight, factor=None):
+    """App whose only live inputs are the smoothed outdoor lux and the zone's indoor daylight.
+    _gloomy and the sun gate are neutralised so the outdoor-band branch is what is under test."""
+    args = {"zones": dict(BAND_ZONE)}
+    if factor is not None:
+        args["indoor_band_bright_factor"] = factor
+    app = make_app(args=args)
+    app._sun_elevation = lambda: 30.0          # well clear of the dusk cut-off
+    app._outdoor_smoothed = lambda: outdoor_lux
+    app._outdoor_valid = lambda: True
+    app._gloomy = lambda out=None, elev=None: (False, "")
+    app._zone_daylight = lambda zone: indoor_daylight
+    return app
+
+
+class OutdoorBandRoomDecides(unittest.TestCase):
+    """2026-08-12: at 06:20 the pyranometer-derived "outdoor lux" read 3037 - inside the
+    2500-8000 hold band - so the zone stayed DARK from the night and every family-room lamp
+    came on, while the room's own meters measured 500-650lx against a 280lx bar. The sky gate
+    is least trustworthy exactly there (a horizontal pyranometer collapses with a low sun), so
+    a room that is clearly bright gets the casting vote."""
+
+    def _decide(self, app):
+        return app._decide("familyish")
+
+    def test_incident_replay_band_with_bright_room_goes_bright(self):
+        target, reason = self._decide(make_band_app(3037, 573))
+        self.assertEqual(target, dc.BRIGHT)
+        self.assertIn("room decides", reason)
+
+    def test_band_with_dim_room_still_holds(self):
+        """Just over the bare bar is not enough - the margin exists to stop edge flapping."""
+        target, _ = self._decide(make_band_app(3037, 300))
+        self.assertIsNone(target)
+
+    def test_band_with_dark_room_still_holds(self):
+        target, reason = self._decide(make_band_app(3037, 50))
+        self.assertIsNone(target)
+        self.assertIn("holding", reason)
+
+    def test_below_dark_threshold_is_untouched(self):
+        """A genuinely dark sky must still win regardless of the indoor reading."""
+        target, _ = self._decide(make_band_app(500, 900))
+        self.assertEqual(target, dc.DARK)
+
+    def test_factor_is_configurable(self):
+        target, _ = self._decide(make_band_app(3037, 300, factor=1.0))
+        self.assertEqual(target, dc.BRIGHT)
+
+    def test_no_indoor_data_holds_as_before(self):
+        app = make_band_app(3037, None)
+        target, reason = app._decide("familyish")
+        self.assertIsNone(target)
+        self.assertIn("holding", reason)

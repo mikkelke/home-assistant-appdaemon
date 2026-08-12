@@ -1052,6 +1052,15 @@ class WakeupRoutine(hass.Hass):
             self._finish_ramp("bed session ended")
             return
 
+        # Daylight can overtake the ramp: the pre-check only runs once, right after the blind
+        # moves, and a summer sunrise gains thousands of lux over the ramp's lifetime. Without
+        # this the ramp commits at the alarm and drives to full brightness in a room that no
+        # longer needs it (2026-08-12: started 05:50 at 1%, reached 90% at 06:06 with the sky
+        # climbing the whole way). Same test as the pre-check, so the two cannot disagree.
+        if not self._room_dark_for_wake_light():
+            self._finish_ramp("daylight took over")
+            return
+
         target = self._read_adaptive_target_pct()
         if target is None:
             target = self.ramp_max_pct

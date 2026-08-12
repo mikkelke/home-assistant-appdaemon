@@ -99,6 +99,15 @@ class DarknessCalculator(hass.Hass):
         # Indoor bright-bar scaling is part of the shared mechanism (zones may override).
         self.indoor_min_scales_default = bool(a.get("indoor_min_scales_with_outdoor", True))
         self.indoor_min_floor_fraction_default = float(a.get("indoor_min_floor_fraction", 0.25))
+        # Inside the outdoor hold band the ROOM's own meters may still promote to BRIGHT
+        # (2026-08-12). The "outdoor lux" sensor is not a photometer: sensor.gw2000a_solar_lux
+        # is sensor.gw2000a_solar_radiation x 126.6 (verified - the ratio is exactly 127 at
+        # every sample), i.e. a horizontal pyranometer. It therefore collapses with the cosine
+        # of a low sun, so a brilliant clear dawn reads ~3000lx while horizontal beam light
+        # floods the rooms. That morning the family room measured 500-650lx indoors against a
+        # 280lx bar, yet every lamp came on because the sky gate said "hold". A margin above
+        # indoor_min (not the bare bar) keeps this from flapping at the edge.
+        self.indoor_band_bright_factor = float(a.get("indoor_band_bright_factor", 1.5))
 
         self.debounce_s = float(a.get("sensor_debounce_seconds", 2.0))
         self.periodic_s = float(a.get("periodic_recompute_seconds", 90))
@@ -390,6 +399,20 @@ class DarknessCalculator(hass.Hass):
                 f"{indoor_dark_floor:.0f}-{indoor_min:.0f}lx band - holding"
             )
 
+        # Outdoor is in the hold band. The sky gate is least trustworthy exactly here (low sun
+        # on a horizontal pyranometer), so give the room's own meters the casting vote when
+        # they are clearly above the bar. Lamp light is already subtracted by _zone_daylight,
+        # so this cannot latch on its own lamps.
+        band_daylight = self._zone_daylight(zone)
+        band_indoor_min = float(zcfg.get("indoor_min_bright", 0))
+        band_factor = float(zcfg.get("indoor_band_bright_factor", self.indoor_band_bright_factor))
+        if band_daylight is not None and band_indoor_min > 0 and band_factor > 0:
+            band_bar = band_indoor_min * band_factor
+            if band_daylight >= band_bar:
+                return BRIGHT, (
+                    f"outdoor {out:.0f}lx in {outdoor_dark:.0f}-{outdoor_bright:.0f}lx band, "
+                    f"but indoor daylight {band_daylight:.0f}lx >= {band_bar:.0f}lx (room decides)"
+                )
         return None, f"outdoor {out:.0f}lx in {outdoor_dark:.0f}-{outdoor_bright:.0f}lx band - holding"
 
     def _hold_needed(self, current, target):

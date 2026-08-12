@@ -52,6 +52,9 @@ def make_ramp_app(session, ramp_active=True, session_listener=None, current_pct=
     app._schedule_next_ramp_tick = MagicMock()
     app._finish_ramp = MagicMock()
     app.call_service = MagicMock()
+    # Existing tests predate the daylight abort; default to "still dark" so they exercise the
+    # ramp path they were written for.
+    app._room_dark_for_wake_light = lambda: getattr(app, "_dark", True)
     return app
 
 
@@ -173,3 +176,35 @@ class MaybeStartLightRamp(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DaylightAbortsTheRamp(unittest.TestCase):
+    """2026-08-12: the ramp's brightness check only ran once, right after the blind moved, so a
+    ramp that started at 05:50 in a dim room drove on to 90% by 06:06 while the sun came up.
+    A summer sunrise gains thousands of lux inside a single ramp, so the tick has to re-ask."""
+
+    def test_bright_room_finishes_the_ramp(self):
+        app = make_ramp_app(session="on", current_pct=30)
+        app._dark = False
+        app._ramp_tick(None)
+        app._finish_ramp.assert_called_once()
+        self.assertIn("daylight", app._finish_ramp.call_args.args[0])
+        # and it must not keep stepping the lights up
+        app.call_service.assert_not_called()
+        app._schedule_next_ramp_tick.assert_not_called()
+
+    def test_dark_room_keeps_ramping(self):
+        app = make_ramp_app(session="on", current_pct=30)
+        app._dark = True
+        app._ramp_tick(None)
+        app._finish_ramp.assert_not_called()
+        app.call_service.assert_called_once()
+        app._schedule_next_ramp_tick.assert_called_once()
+
+    def test_bed_session_still_wins_over_the_daylight_check(self):
+        """Order matters: a session that ended must report that reason, not "daylight"."""
+        app = make_ramp_app(session="off", current_pct=30)
+        app._dark = False
+        app._ramp_tick(None)
+        app._finish_ramp.assert_called_once()
+        self.assertIn("bed session", app._finish_ramp.call_args.args[0])
