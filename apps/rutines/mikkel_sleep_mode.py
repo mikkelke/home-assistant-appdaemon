@@ -1,10 +1,29 @@
 """
-Mikkel sleep mode - Withings in-bed + phone battery + home.
+Mikkel sleep mode - Withings in-bed + phone battery + home, gated by the bedroom
+actually being in sleep configuration.
 
-Sleep mode ON: person.mikkel is home, any configured bedside in-bed sensor is on, and
-sensor.mikkels_ofx9p_battery_state is charging or not_charging.
+Sleep mode ON: person.mikkel is home, any configured bedside in-bed sensor is on,
+sensor.mikkels_ofx9p_battery_state is charging or not_charging, AND the night gate is
+open: the bedroom blind covers the window OR the clock is inside 21:00-04:00.
 
-Sleep mode OFF: battery state is discharging, or the ON conditions are not met.
+The blind gate (2026-08-12, Mikkel's own words: "if I lay in bed and connect a charger
+my phone will go to DND, that is mostly fine, but if the curtain is not up it does not
+make sense"): cover.bedroom_blind is BOTTOM-UP - current_position 100 means fully
+risen = COVERING the window = sleep configuration; ~38 is parked open. HA's open/
+closed wording is inverted for it, so only current_position is trusted (>= 95 counts
+as covering). A daytime in-bed charge with the blind parked open no longer flips
+sleep mode + DND. The gate only arms ON; it never clears an already-on sleep mode
+(the window ending at 04:00 must not wake the phone while he is still in bed).
+
+Sleep mode OFF:
+- While input_boolean.house_night_mode is ON (see apps/presence/house_night_mode.py):
+  only three paths clear it, each explicit - out of bed sustained >= 12 min (bathroom
+  trips are shorter: on 2026-08-07 he was out 04:14-04:44 and the instant clear
+  cascaded into the whole house leaving night mode), battery discharging sustained
+  >= 5 min, or person.mikkel explicitly away. Sensor dropouts (cloud bedsides,
+  companion battery) hold state instead of clearing it.
+- Otherwise (daytime): today's immediate behaviour, unchanged - discharging or any
+  ON condition not met clears at once.
 
 When sleep mode turns on/off, sends Companion command_dnd via notify.mobile_app_*
 (HA Mobile App: https://companion.home-assistant.io/docs/notifications/notification-commands).
@@ -17,11 +36,41 @@ out of bed.
 
 import json
 import os
+from datetime import datetime, time as dtime
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
 
+def _in_window(t, start, end):
+    """True when time-of-day t lies in [start, end), handling windows that wrap
+    midnight (21:00-04:00)."""
+    if start <= end:
+        return start <= t < end
+    return t >= start or t < end
+
+
+def _parse_hhmm(value, fallback):
+    try:
+        parts = [int(p) for p in str(value).split(":")]
+        return dtime(parts[0], parts[1] if len(parts) > 1 else 0)
+    except (ValueError, IndexError, TypeError):
+        return fallback
+
+
 class MikkelSleepMode(hass.Hass):
+    # Class-level defaults so bare __new__() test instances (the harness the older
+    # tests in tests/test_mikkel_sleep_mode.py use) keep the legacy behaviour:
+    # blind_entity/night_window None -> the ON gate is open, house_night_entity
+    # None -> OFF stays immediate. initialize() sets the real values.
+    blind_entity = None
+    blind_covering_min = 95.0
+    night_window = None
+    house_night_entity = None
+    out_of_bed_clear_seconds = 12 * 60
+    discharging_clear_seconds = 5 * 60
+    _out_of_bed_since = None
+    _discharging_since = None
+
     def initialize(self) -> None:
         self.battery_entity = self.args.get(
             "battery_entity", "sensor.mikkels_ofx9p_battery_state"
@@ -56,6 +105,27 @@ class MikkelSleepMode(hass.Hass):
         )
         self._off_battery_state = self.args.get("off_battery_state", "discharging")
 
+        # Night gate: ON requires the blind covering (bottom-up: position 100 =
+        # covering) OR the clock inside the night window. See module docstring.
+        self.blind_entity = self.args.get("blind_entity", "cover.bedroom_blind")
+        self.blind_covering_min = float(self.args.get("blind_covering_min", 95))
+        self.night_window = (
+            _parse_hhmm(self.args.get("night_window_start", "21:00"), dtime(21, 0)),
+            _parse_hhmm(self.args.get("night_window_end", "04:00"), dtime(4, 0)),
+        )
+        # OFF-debounce while the house is in night mode. See module docstring.
+        self.house_night_entity = self.args.get(
+            "house_night_entity", "input_boolean.house_night_mode"
+        )
+        self.out_of_bed_clear_seconds = int(
+            self.args.get("out_of_bed_clear_minutes", 12)
+        ) * 60
+        self.discharging_clear_seconds = int(
+            self.args.get("discharging_clear_minutes", 5)
+        ) * 60
+        self._out_of_bed_since = None
+        self._discharging_since = None
+
         # After wakeup_bedroom (or manual HA) turns sleep off while sensors still say "asleep".
         # Persisted (deploy_advisor's path convention + house_events' atomic tmp+replace
         # write - see _load_state/_save_state): an AD restart must not forget this and let
@@ -80,6 +150,18 @@ class MikkelSleepMode(hass.Hass):
             *self.in_bed_entities,
         ):
             self.listen_state(self._on_relevant_change, entity_id)
+        # The gate/debounce inputs must also trigger re-evaluation: the blind rising
+        # at 20:45 or house night mode ending must not wait for a bed/battery event.
+        if self.blind_entity:
+            self.listen_state(
+                self._on_relevant_change, self.blind_entity, attribute="current_position"
+            )
+        if self.house_night_entity:
+            self.listen_state(self._on_relevant_change, self.house_night_entity)
+        # Minutely tick: crossing 21:00 opens the gate and the night OFF-debounce
+        # clocks expire with no state change to ride on (same pattern as
+        # actor_attribution's reconcile tick).
+        self.run_every(self._tick, "now+30", 60)
 
         # Nested callback so a partial deploy cannot reference a missing class method
         def _on_sleep_boolean_change(entity, attribute, old, new, kwargs):
@@ -131,6 +213,12 @@ class MikkelSleepMode(hass.Hass):
     def _on_relevant_change(self, entity, attribute, old, new, kwargs) -> None:
         self._apply_sleep_mode()
 
+    def _tick(self, kwargs) -> None:
+        try:
+            self._apply_sleep_mode()
+        except Exception as e:
+            self.log(f"tick failed: {e}", level="ERROR")
+
     def _release_rearm_hold_if_out_of_bed(self, context: str) -> None:
         """The hold only means "do not re-arm while he is still lying there", so any read of
         an explicitly empty bed releases it. Not tied to an off EDGE on purpose: the cloud
@@ -162,6 +250,38 @@ class MikkelSleepMode(hass.Hass):
             and battery in self._on_battery_states
         )
 
+    def _night_gate_open(self) -> bool:
+        """ON-arming gate: the bedroom must be in sleep configuration - blind
+        covering the window (bottom-up: current_position >= blind_covering_min) OR
+        the clock inside the night window. Bare test instances with neither
+        configured keep the legacy always-open gate. An unreadable blind position
+        counts as not covering: only the time window can open the gate then."""
+        if self.blind_entity is None and self.night_window is None:
+            return True
+        if self.night_window is not None and _in_window(
+            self._local_time(), *self.night_window
+        ):
+            return True
+        if self.blind_entity is not None:
+            try:
+                pos = self.get_state(self.blind_entity, attribute="current_position")
+            except Exception:
+                pos = None
+            if pos is not None:
+                try:
+                    return float(pos) >= self.blind_covering_min
+                except (TypeError, ValueError):
+                    return False
+        return False
+
+    def _night_debounce_active(self) -> bool:
+        if not self.house_night_entity:
+            return False
+        try:
+            return self.get_state(self.house_night_entity) == "on"
+        except Exception:
+            return False
+
     def _apply_sleep_mode(self) -> None:
         # Before anything is decided, so a hold surviving a lost off edge self-heals on
         # the next callback instead of on the next restart.
@@ -172,29 +292,108 @@ class MikkelSleepMode(hass.Hass):
         in_bed = self._any_in_bed()
 
         want_on_raw = self._compute_want_on_raw()
-        want_on = want_on_raw and not self._block_rearm_until_out_of_bed
-
         current = self.get_state(self.sleep_mode_entity)
-        desired = "on" if want_on else "off"
 
-        if current == desired:
+        if current != "on":
+            # The debounce clocks only ever run while sleep mode is on.
+            self._out_of_bed_since = None
+            self._discharging_since = None
+            if (
+                want_on_raw
+                and not self._block_rearm_until_out_of_bed
+                and self._night_gate_open()
+            ):
+                self.call_service(
+                    "input_boolean/turn_on", entity_id=self.sleep_mode_entity
+                )
+                self.log(
+                    f"Sleep mode ON (battery={battery!r}, person={person!r}, in_bed={in_bed})",
+                    level="INFO",
+                )
+                self._send_dnd_command(self._dnd_on_command)
             return
 
-        if want_on:
-            self.call_service("input_boolean/turn_on", entity_id=self.sleep_mode_entity)
-            self.log(
-                f"Sleep mode ON (battery={battery!r}, person={person!r}, in_bed={in_bed})",
-                level="INFO",
-            )
-            self._send_dnd_command(self._dnd_on_command)
+        # Sleep mode is currently on.
+        if want_on_raw:
+            self._out_of_bed_since = None
+            self._discharging_since = None
+            return
+
+        if not self._night_debounce_active():
+            # Daytime: today's immediate behaviour, unchanged.
+            self._turn_off_sleep(battery, person, in_bed, "immediate (house not in night mode)")
+            return
+
+        # House night mode: only three OFF paths, each explicit. Everything else
+        # (cloud bedside dropouts, companion battery unknown/unavailable) holds.
+        if person not in ("home", "unknown", "unavailable", None):
+            self._turn_off_sleep(battery, person, in_bed, f"left home ({person!r})")
+            return
+
+        now = self._now_local()
+        if battery == self._off_battery_state:
+            if self._discharging_since is None:
+                self._discharging_since = now
+                self.log(
+                    f"Discharging during house night mode - sleep mode clears in "
+                    f">={self.discharging_clear_seconds // 60} min unless charging resumes",
+                    level="INFO",
+                )
         else:
-            self.call_service(
-                "input_boolean/turn_off", entity_id=self.sleep_mode_entity
+            self._discharging_since = None
+
+        if not in_bed:
+            if self._out_of_bed_since is None:
+                self._out_of_bed_since = now
+                self.log(
+                    f"Out of bed during house night mode - sleep mode clears in "
+                    f">={self.out_of_bed_clear_seconds // 60} min unless he returns "
+                    f"(bathroom trips are shorter - 2026-08-07 04:14)",
+                    level="INFO",
+                )
+        else:
+            self._out_of_bed_since = None
+
+        if (
+            self._discharging_since is not None
+            and (now - self._discharging_since).total_seconds()
+            >= self.discharging_clear_seconds
+        ):
+            self._turn_off_sleep(
+                battery, person, in_bed,
+                f"discharging sustained >={self.discharging_clear_seconds // 60} min",
             )
-            self.log(
-                f"Sleep mode OFF (battery={battery!r}, person={person!r}, in_bed={in_bed})",
-                level="INFO",
+        elif (
+            self._out_of_bed_since is not None
+            and (now - self._out_of_bed_since).total_seconds()
+            >= self.out_of_bed_clear_seconds
+        ):
+            self._turn_off_sleep(
+                battery, person, in_bed,
+                f"out of bed sustained >={self.out_of_bed_clear_seconds // 60} min",
             )
+        # else: hold ON through the blip.
+
+    def _turn_off_sleep(self, battery, person, in_bed, reason: str) -> None:
+        self._out_of_bed_since = None
+        self._discharging_since = None
+        self.call_service("input_boolean/turn_off", entity_id=self.sleep_mode_entity)
+        self.log(
+            f"Sleep mode OFF - {reason} (battery={battery!r}, person={person!r}, "
+            f"in_bed={in_bed})",
+            level="INFO",
+        )
+
+    def _now_local(self):
+        """Naive local datetime (repo idiom). Falls back to datetime.now() on a
+        bare test instance."""
+        try:
+            return self.datetime()
+        except Exception:
+            return datetime.now()
+
+    def _local_time(self):
+        return self._now_local().time()
 
     def _send_dnd_command(self, command: str) -> None:
         if not command:

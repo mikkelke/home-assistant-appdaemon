@@ -1,0 +1,39 @@
+# /conf/apps/presence/house_night_mode.yaml
+# One latched household-level night boolean, input_boolean.house_night_mode, for the
+# lighting stack to consume INSTEAD of input_boolean.mikkel_sleep_mode. The 2026-08-07
+# 04:14 incident: Mikkel's 4 a.m. trip out of bed cleared his personal sleep boolean,
+# the lighting stack read that as "household awake", and the family room went full
+# "turn on all" - nine on/off cycles until he was back in bed at 04:44.
+#
+# Latch ON at the first sleeper (any of the three sleep booleans) inside 20:00-04:00,
+# plus anyone already asleep when 20:00 arrives. Clear when Mikkel's sleep mode has
+# been off >= 15 min counted inside 04:30-12:00, or hard at 09:30, whichever first.
+# Manual flips of the boolean are respected until the next natural latch/clear
+# boundary (a manual OFF holds for the rest of that night; a manual ON gets a fresh
+# 15-min clock and falls at the next natural clear).
+#
+# The helper is created by this app at startup if missing (WebSocket API - REST
+# /api/config has no input_boolean route).
+#
+# Consumption is a separate step: the family-room app gets pointed at
+# house_night_mode afterwards, deliberately, not by this app.
+
+HouseNightMode:
+  module: house_night_mode
+  class: HouseNightMode
+
+  house_entity: input_boolean.house_night_mode
+  helper_name: "House night mode"
+  sleep_entities:
+    - input_boolean.mikkel_sleep_mode
+    - input_boolean.kristine_sleep_mode
+    - input_boolean.claudia_sleep_mode
+  mikkel_sleep_entity: input_boolean.mikkel_sleep_mode
+
+  latch_window_start: "20:00"
+  latch_window_end: "04:00"
+  clear_window_start: "04:30"
+  clear_window_end: "12:00"
+  clear_sustain_minutes: 15
+  hard_clear_time: "09:30"
+  tick_seconds: 60

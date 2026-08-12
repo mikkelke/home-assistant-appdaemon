@@ -261,6 +261,7 @@ class RestartSurvival(unittest.TestCase):
         app = msm.MikkelSleepMode.__new__(msm.MikkelSleepMode)
         app.args = self._args(path)
         app.listen_state = MagicMock()
+        app.run_every = MagicMock()  # initialize() arms a minutely tick since the night gate
         app.log = MagicMock()
         app.get_state = lambda entity, **kw: (states or {}).get(entity)
         return app

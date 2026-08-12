@@ -1,0 +1,45 @@
+# /conf/apps/presence/housemate_sleep_mode.yaml
+# Server-side sleep booleans for the housemates, from signals HA can see itself
+# (person.*, companion battery_state, room PIR) - no phone-side automations, which is
+# exactly what broke Kristine's old setup: her HA automation ("Kristine sleep mode
+# control") only reacts to input_boolean.kristines_iphone_charging, which her iPhone's
+# own iOS Shortcuts write; on 2026-08-06 the phone posted turn_on + turn_off 19 ms
+# apart and her sleep mode read OFF all night while the phone charged.
+#
+# DEPLOY STEP (manual, by Mikkel): disable automation.kristine_sleep_mode_control in
+# HA. Until then this app tolerates it (foreign writes are adopted, last-writer-wins).
+#
+# input_boolean.claudia_sleep_mode is created by this app at startup if missing
+# (create-if-missing via the HA WebSocket API - REST /api/config has no input_boolean
+# route). input_boolean.kristine_sleep_mode already exists.
+#
+# ON:  home + battery Charging/Full + inside 21:00-10:00 + room PIR quiet >= 10 min.
+# OFF: unplugged >= 5 min, or away >= leave-grace, or hard end at 10:00. Nothing else
+# clears it - sensor dropouts hold state. Kristine's tracker flaps at the home-zone
+# boundary (see presence-tracker-quality notes), hence her explicit leave grace.
+
+HousemateSleepMode:
+  module: housemate_sleep_mode
+  class: HousemateSleepMode
+
+  night_window_start: "21:00"
+  night_window_end: "10:00"
+  quiet_minutes: 10
+  unplug_minutes: 5
+  leave_grace_minutes: 10
+  tick_seconds: 60
+
+  people:
+    - name: kristine
+      person_entity: person.kristine
+      battery_entity: sensor.kristine_iphone_2_battery_state
+      pir_entity: binary_sensor.kristines_room_pir_presence
+      sleep_entity: input_boolean.kristine_sleep_mode
+      helper_name: "Kristine sleep mode"
+      leave_grace_minutes: 10
+    - name: claudia
+      person_entity: person.claudia
+      battery_entity: sensor.claudias_iphone_battery_state
+      pir_entity: binary_sensor.claudias_room_pir_presence
+      sleep_entity: input_boolean.claudia_sleep_mode
+      helper_name: "Claudia sleep mode"

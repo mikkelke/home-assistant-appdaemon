@@ -1,5 +1,11 @@
-# Mikkel sleep mode: home + Withings in bed + phone charging or not_charging -> sleep on.
-# Phone discharging -> sleep off (also off if home / in-bed / battery combo no longer matches).
+# Mikkel sleep mode: home + Withings in bed + phone charging or not_charging -> sleep on,
+# gated by the bedroom being in sleep configuration (bottom-up blind risen >= 95 =
+# covering the window, OR inside 21:00-04:00) so a daytime in-bed charge with the blind
+# parked open no longer flips sleep + DND (2026-08-12).
+# Phone discharging -> sleep off (also off if home / in-bed / battery combo no longer
+# matches) - immediately by day; while input_boolean.house_night_mode is on, out-of-bed
+# needs >= 12 min sustained (2026-08-07 04:14: a 30-min bathroom-plus trip cascaded into
+# the whole house leaving night mode) and discharging >= 5 min sustained.
 
 MikkelSleepMode:
   module: mikkel_sleep_mode
@@ -22,6 +28,19 @@ MikkelSleepMode:
   dnd_on_command: priority_only
   # Clear DND when sleep mode ends; must be quoted — bare `off` is YAML boolean false and skips the notify
   dnd_off_command: "off"
+
+  # Night gate: cover.bedroom_blind is BOTTOM-UP - current_position 100 = fully risen =
+  # COVERING the window ("curtain up" = sleep configuration); ~38 = parked open. Do not
+  # trust HA's open/closed word for it, only the position.
+  blind_entity: cover.bedroom_blind
+  blind_covering_min: 95
+  night_window_start: "21:00"
+  night_window_end: "04:00"
+
+  # OFF-debounce while the house is in night mode (apps/presence/house_night_mode.py).
+  house_night_entity: input_boolean.house_night_mode
+  out_of_bed_clear_minutes: 12
+  discharging_clear_minutes: 5
 
   # Optional overrides if HA uses different state strings:
   # on_battery_states: [charging, not_charging]
