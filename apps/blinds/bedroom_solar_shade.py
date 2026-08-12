@@ -56,6 +56,15 @@ import os
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 from datetime import datetime, time, timedelta
 
+# Shared precedence for cover.bedroom_blind. This app is the LOWEST rank by design: it
+# re-evaluates every few minutes, so it is the one writer that can quietly undo any of
+# the others. Imported defensively - losing the shared layer must cost the ranking, not
+# the shading (see _may_move_blind / _command_blind).
+try:
+    import blind_arbiter
+except Exception:  # pragma: no cover - exercised via the None-module tests
+    blind_arbiter = None
+
 
 class BedroomSolarShade(hass.Hass):
     def initialize(self):
@@ -245,6 +254,74 @@ class BedroomSolarShade(hass.Hass):
         until = self._override_until.strftime("%H:%M") if self._override_until else "?"
         self.log(f"Manual blind move {span} -> pause shading {self.manual_pause_min} min (until {until})")
 
+    # ---------- shared blind precedence ----------
+    # manual wall press > venting need > wake target > solar shade (blind_arbiter).
+    # These two predicates are the single source of truth for "am I outranked": the
+    # status gates in _tick and the arbitration at the write sites both read them, so
+    # the two can no longer drift apart the way three private manual-pause notions did.
+    def _wake_owns_blind(self, now):
+        """True while the morning routine owns the blind: asleep, or before the alarm
+        time plus its grace. Leaves the night/wake position alone."""
+        wake = self._parse_hhmm(self.get_state(self.alarm_time_entity), self.fallback_wake)
+        asleep = self.get_state(self.sleep_entity) == "on"
+        return asleep or now.time() < self._add_min(wake, self.wake_grace_min), wake, asleep
+
+    def _manual_pause_active(self, now):
+        """True while a hand/remote move is still holding this app off."""
+        return self._override_until is not None and now < self._override_until
+
+    def _blind_requests(self, now, desired, reason, *, wake_owns=None):
+        """This app's view of the whole claim set, highest rank first.
+
+        The higher ranks are position-less: they are vetoes, not proposals. Shading does
+        not need to know where the wake routine wants the blind - only that it must not
+        move it while someone else outranks it.
+        """
+        if blind_arbiter is None:
+            return []
+        if wake_owns is None:
+            wake_owns = self._wake_owns_blind(now)[0]
+        return [
+            blind_arbiter.BlindRequest(
+                blind_arbiter.SOURCE_MANUAL, None, "paused after a manual move",
+                active=self._manual_pause_active(now)),
+            blind_arbiter.BlindRequest(
+                blind_arbiter.SOURCE_WAKE, None, "wake routine owns the blind",
+                active=bool(wake_owns)),
+            blind_arbiter.BlindRequest(blind_arbiter.SOURCE_SHADE, int(desired), reason),
+        ]
+
+    def _may_move_blind(self, now, desired, reason, *, wake_owns=None):
+        """Ask the shared arbitration whether shading gets this move.
+
+        Fail-safe: with no shared layer, fall back to this app's own gates (which the
+        callers have already applied), so a missing module degrades to the pre-arbiter
+        behaviour instead of freezing the blind.
+        """
+        if blind_arbiter is None:
+            return True
+        requests = self._blind_requests(now, desired, reason, wake_owns=wake_owns)
+        if blind_arbiter.may_write(blind_arbiter.SOURCE_SHADE, requests):
+            return True
+        blocker = blind_arbiter.blocked_by(blind_arbiter.SOURCE_SHADE, requests)
+        if blocker is not None:
+            self.log(
+                f"Not moving the blind - outranked by {blocker.source} ({blocker.reason}); "
+                f"claims: {blind_arbiter.describe(requests)}"
+            )
+        return False
+
+    def _command_blind(self, desired, reason):
+        """The one place this app writes the cover (blind_arbiter.command)."""
+        if blind_arbiter is None:
+            self.call_service("cover/set_cover_position", entity_id=self.cover, position=int(desired))
+        else:
+            blind_arbiter.command(
+                self, self.cover, desired, source=blind_arbiter.SOURCE_SHADE, reason=reason)
+        self._last_cmd = int(desired)
+        self._save_state()
+        self.log(f"Set {self.cover} -> {desired}% ({reason})")
+
     def _safe_cancel_timer(self, handle):
         """Cancel a timer only if still running (avoids invalid-handle warnings)."""
         try:
@@ -267,17 +344,20 @@ class BedroomSolarShade(hass.Hass):
             return
 
         # Collaborate with the morning alarm: stay out of it until you're actually up.
-        wake = self._parse_hhmm(self.get_state(self.alarm_time_entity), self.fallback_wake)
-        active_after = self._add_min(wake, self.wake_grace_min)
-        asleep = self.get_state(self.sleep_entity) == "on"
-        if asleep or now.time() < active_after:
+        # These two gates ARE the shared precedence seen from the bottom rank - the wake
+        # routine and a manual press both outrank shading, so either one ends the tick.
+        # The order is the pre-arbiter one on purpose: when a manual pause and the wake
+        # window overlap, this sensor keeps reporting waiting_wake. Neither writes, so
+        # which of the two is named is a label, not a decision.
+        wake_owns, wake, asleep = self._wake_owns_blind(now)
+        if wake_owns:
             self._publish(
                 "waiting_wake",
                 f"Leaving the blind to the wake routine (wake {wake.strftime('%H:%M')}, asleep={asleep})",
                 {"wake": wake.strftime("%H:%M")},
             )
             return
-        if self._override_until is not None and now < self._override_until:
+        if self._manual_pause_active(now):
             self._publish("manual", f"Paused after a manual move until {self._override_until.strftime('%H:%M')}", {})
             return
 
@@ -289,11 +369,8 @@ class BedroomSolarShade(hass.Hass):
             if cur is None or abs(cur - desired) > self.pos_tol:
                 if self.dry_run:
                     self.log(f"DRY-RUN would set {self.cover} -> {desired}% ({reason})")
-                else:
-                    self.call_service("cover/set_cover_position", entity_id=self.cover, position=desired)
-                    self._last_cmd = desired
-                    self._save_state()
-                    self.log(f"Set {self.cover} -> {desired}% ({reason})")
+                elif self._may_move_blind(now, desired, reason, wake_owns=False):
+                    self._command_blind(desired, reason)
             return
 
         rad = self._num(self.radiation_sensor, 0.0)
@@ -335,10 +412,11 @@ class BedroomSolarShade(hass.Hass):
         if self.dry_run:
             self.log(f"DRY-RUN would set {self.cover} -> {desired}% ({reason})")
             return
-        self.call_service("cover/set_cover_position", entity_id=self.cover, position=desired)
-        self._last_cmd = desired
-        self._save_state()
-        self.log(f"Set {self.cover} -> {desired}% ({reason})")
+        # wake_owns=False: the gate above already established the wake routine is done
+        # with the blind this morning - no need to re-read the alarm entities for it.
+        if not self._may_move_blind(now, desired, reason, wake_owns=False):
+            return
+        self._command_blind(desired, reason)
 
     def _report_house_event(self, cause, effect):
         """Explain a shade decision to the dashboard's Home activity feed. Fire-and-forget:

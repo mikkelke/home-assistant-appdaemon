@@ -8,6 +8,21 @@ import cover_util
 import room_state_darkness
 import solar_window
 
+# Shared layers this routine ORCHESTRATES rather than reimplements: who owns the
+# bedroom blind (apps/blinds/blind_arbiter.py) and how a room is faded up
+# (apps/lights/light_ramp.py). Imported defensively on purpose - this is the alarm
+# that wakes a real person, so a missing or broken shared module must cost the house
+# a layer, never the wake-up. Every use site below falls back to the direct service
+# call this app made before the split; see _set_cover_position / _ramp_tick.
+try:
+    import blind_arbiter
+except Exception:  # pragma: no cover - exercised via the None-module tests
+    blind_arbiter = None
+try:
+    import light_ramp
+except Exception:  # pragma: no cover - exercised via the None-module tests
+    light_ramp = None
+
 REQUIRED_TOP_LEVEL = [
     "alarm_time_entity", "alarm_enabled_entity",
     "presence_persons",
@@ -521,12 +536,31 @@ class WakeupRoutine(hass.Hass):
         return str(state).strip().lower() in self.vent_plan_states
 
     def _decide_bedroom_wake_target(self):
+        """Where this routine wants the blind at the alarm - resolved through the shared
+        precedence in blind_arbiter instead of a private if-statement.
+
+        The raw heat decision still runs FIRST and unconditionally: it carries the manual
+        force flag's auto-clear side effect, and skipping it would leave a stale force
+        armed for the next morning (pinned by test_wakeup_heat.VentingBeatsShading).
+        Venting outranks every heat reason, manual force included - see blind_arbiter's
+        module docstring for the 2026-08-09 incident that put it there.
+        """
         target, reason = self._decide_bedroom_wake_target_raw()
-        # Venting overrides every heat reason, including the manual force - the raw decision
-        # still runs first so the manual flag's auto-clear side effect is not skipped.
-        if target != self.bedroom_cover_target and self._venting_tonight():
-            return self.bedroom_cover_target, f"venting tonight, window must open (was: {reason})"
-        return target, reason
+        if target == self.bedroom_cover_target or not self._venting_tonight():
+            return target, reason
+        vent_reason = f"venting tonight, window must open (was: {reason})"
+        if blind_arbiter is None:
+            # Fail-safe: the shared layer is gone, so apply the same rule locally rather
+            # than let a hot morning park the blind where the window cannot open.
+            return self.bedroom_cover_target, vent_reason
+        winner = blind_arbiter.arbitrate([
+            blind_arbiter.BlindRequest(
+                blind_arbiter.SOURCE_VENT, self.bedroom_cover_target, vent_reason),
+            blind_arbiter.BlindRequest(blind_arbiter.SOURCE_WAKE, target, reason),
+        ])
+        if winner is None:
+            return target, reason
+        return winner.position, winner.reason
 
     def _decide_bedroom_wake_target_raw(self):
         if self.get_state(self.heat_wave_entity) == "on":
@@ -897,8 +931,20 @@ class WakeupRoutine(hass.Hass):
             return None
 
     def _set_cover_position(self, entity, pct):
+        """Hand the move to the shared blind owner (blind_arbiter.command).
+
+        The wake's write is deliberately NOT gated on arbitration here. The light ramp
+        waits for this cover to REACH its target before it starts (_on_bedroom_position),
+        so a write silently dropped at this point would strand the whole morning - blind
+        shut, no ramp, alarm half-run. Everything that legitimately outranks the wake is
+        resolved earlier, in _decide_bedroom_wake_target, where losing costs a position
+        and not the wake-up.
+        """
         self.log(f"[wake] Setting {entity} -> {pct}%", log=self.user_log)
-        self.call_service("cover/set_cover_position", entity_id=entity, position=int(pct))
+        if blind_arbiter is None:
+            self.call_service("cover/set_cover_position", entity_id=entity, position=int(pct))
+            return
+        blind_arbiter.command(self, entity, pct, source=blind_arbiter.SOURCE_WAKE)
 
     def _read_outdoor_lux_for_settle(self):
         """Read outdoor lux clue for dynamic post-blind settle time."""
@@ -1019,16 +1065,15 @@ class WakeupRoutine(hass.Hass):
             self.log("[wake] Bed session not active; skipping light ramp.", log=self.user_log)
             return
 
-        # Pause Adaptive Lighting's brightness adaptation during the ramp
-        self.turn_off(self.adaptive_brightness_switch)
-
-        self.current_pct = max(1, int(self.ramp_start_pct))
-        self.call_service(
-            "light/turn_on",
-            entity_id=self.light_entity,
-            brightness_pct=self.current_pct,
-            transition=int(self.ramp_interval_sec),
-        )
+        # Everything from here down is "how the room gets lit", which belongs to the
+        # shared lighting layer (apps/lights/light_ramp.py) - pausing Adaptive Lighting's
+        # brightness adaptation for the duration, and the actual brightness command. This
+        # app's job was the decision above: that a ramp should start, now.
+        if light_ramp is not None:
+            light_ramp.pause_adaptive_brightness(self, self.adaptive_brightness_switch)
+        else:
+            self.turn_off(self.adaptive_brightness_switch)
+        self.current_pct = self._set_light_pct(self._ramp_start_pct())
         self.ramp_active = True
         self._attach_cancel_listeners_light()
         self._schedule_next_ramp_tick()
@@ -1061,22 +1106,70 @@ class WakeupRoutine(hass.Hass):
             self._finish_ramp("daylight took over")
             return
 
-        target = self._read_adaptive_target_pct()
-        if target is None:
-            target = self.ramp_max_pct
-        target = min(int(target), int(self.ramp_max_pct))
-
+        target = self._ramp_target_pct()
         if self.current_pct >= target:
             self._finish_ramp(f"Reached target {target}%"); return
 
-        self.current_pct = min(self.current_pct + int(self.ramp_step_pct), target)
+        self.current_pct = self._set_light_pct(self._ramp_next_pct(target))
+        self._schedule_next_ramp_tick()
+
+    # ---------- shared lighting layer (with a direct fallback) ----------
+    # Four thin adapters, each doing exactly what this app did inline before the split
+    # when light_ramp is unavailable. The fallback is not defensive decoration: an
+    # alarm that silently stops lighting the room because a helper module failed to
+    # import would be a worse bug than the duplication it removed.
+    def _ramp_start_pct(self):
+        if light_ramp is not None:
+            return light_ramp.start_pct(self.ramp_start_pct)
+        return max(1, int(self.ramp_start_pct))
+
+    def _ramp_target_pct(self):
+        """Adaptive Lighting's current idea of the right brightness, capped by our own
+        ceiling; the ceiling alone when AL has nothing to say."""
+        adaptive = self._read_adaptive_target_pct()
+        if light_ramp is not None:
+            return light_ramp.resolve_target(adaptive, self.ramp_max_pct)
+        if adaptive is None:
+            return int(self.ramp_max_pct)
+        return min(int(adaptive), int(self.ramp_max_pct))
+
+    def _ramp_next_pct(self, target):
+        if light_ramp is not None:
+            return light_ramp.next_pct(self.current_pct, self.ramp_step_pct, target)
+        return min(self.current_pct + int(self.ramp_step_pct), target)
+
+    def _set_light_pct(self, pct):
+        if light_ramp is not None:
+            return light_ramp.set_brightness(
+                self, self.light_entity, pct, transition=self.ramp_interval_sec
+            )
+        pct = max(1, min(100, int(pct)))
         self.call_service(
             "light/turn_on",
             entity_id=self.light_entity,
-            brightness_pct=self.current_pct,
+            brightness_pct=pct,
             transition=int(self.ramp_interval_sec),
         )
-        self._schedule_next_ramp_tick()
+        return pct
+
+    def _resume_adaptive_brightness(self):
+        """Give brightness back to Adaptive Lighting. Runs from teardown paths, so it
+        must never raise - an exception here strands the switch off with nothing left
+        to restore it (exactly the state an AD restart mid-ramp leaves behind, which
+        _reconcile_adaptive_lighting_after_restart then has to clean up next boot)."""
+        def _log(msg):
+            self.log(f"[wake] {msg}", log=self.user_log)
+
+        if light_ramp is not None:
+            light_ramp.resume_adaptive_brightness(
+                self, self.adaptive_brightness_switch, log_fn=_log
+            )
+            return
+        try:
+            _log("Restoring Adaptive Lighting brightness adaptation")
+            self.turn_on(self.adaptive_brightness_switch)
+        except Exception:
+            pass
 
     # ---------- bed-light session hand-off (ramp yields once the session ends) ----------
     def _bed_session_active(self):
@@ -1164,11 +1257,7 @@ class WakeupRoutine(hass.Hass):
         self.log(f"[wake] Stopping routine: {reason}", log=self.user_log)
         self._stop_media()
         # Always restore Adaptive Lighting brightness adaptation even if ramp never started
-        try:
-            self.log("[wake] Restoring Adaptive Lighting brightness adaptation", log=self.user_log)
-            self.turn_on(self.adaptive_brightness_switch)
-        except Exception:
-            pass
+        self._resume_adaptive_brightness()
         self._stop_light_ramp()
         self._cleanup_listeners()
 
@@ -1195,11 +1284,7 @@ class WakeupRoutine(hass.Hass):
             except Exception: pass
             self._session_listener = None
         # Re-enable Adaptive Lighting brightness adaptation
-        try:
-            self.log("[wake] Restoring Adaptive Lighting brightness adaptation", log=self.user_log)
-            self.turn_on(self.adaptive_brightness_switch)
-        except Exception:
-            pass
+        self._resume_adaptive_brightness()
 
     def _cleanup_listeners(self):
         if self.cover_listener:
