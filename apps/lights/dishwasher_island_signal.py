@@ -16,10 +16,16 @@ the AL ``turn_on_lights`` hand-back only runs in the dark path, where bulb1 rejo
 had turned the full group on (bright + Unemptied green). In dark-solo mode the full group is already off;
 ``FamilyRoomLights`` may turn it on in the same tick - an unconditional clear would wipe that and leave
 only ``island_light_1`` from the dark-solo cleanup path.
+
+**Presence trust:** kitchen mmWave-only presence while the kitchen speaker plays is SUSPECT
+(``presence_trust.py``) - the signal is never *applied* on ghost presence (no green lights for
+nobody), but an already-applied signal is held untouched: suspect still counts as presence for
+the off-hold, and the real clear paths (composite off / leaving Unemptied) are unchanged.
 """
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
+import presence_trust
 import room_state_darkness
 
 
@@ -46,6 +52,8 @@ class DishwasherIslandSignal(hass.Hass):
         # True only while _apply_bright_full_signal has the full group on (green). Used so PIR-off does not
         # turn_off(light.island_lights) when dark-solo left the group off and FamilyRoomLights just turned it on.
         self._dishwasher_full_island_active = False
+        # presence_trust duration knob (minutes); None -> helper default.
+        self._suspect_after_minutes = self.args.get("presence_suspect_after_minutes")
 
         self.listen_state(self._on_dishwasher_state, self._dishwasher)
         self.listen_state(self._on_pir, self._pir)
@@ -79,6 +87,18 @@ class DishwasherIslandSignal(hass.Hass):
 
     def _pir_on(self):
         return self.get_state(self._pir) == "on"
+
+    def _kitchen_presence_suspect(self):
+        """Ghost check on the raw kitchen composite (see presence_trust.py). Never raises."""
+        try:
+            return presence_trust.presence_suspect(
+                self,
+                "kitchen",
+                self._pir,
+                suspect_after_minutes=getattr(self, "_suspect_after_minutes", None),
+            ).suspect
+        except Exception:
+            return False
 
     def _is_family_room_bright(self):
         if not self._room_state:
@@ -322,6 +342,16 @@ class DishwasherIslandSignal(hass.Hass):
             self._release_dark_solo_manual_control()
             self._all_signal_lights_off()
             self._both_al_off()
+            return
+
+        if self._kitchen_presence_suspect():
+            # Asymmetric trust: ghost presence must not light the signal (no apply);
+            # an already-applied signal is held as-is - suspect still counts as
+            # presence, so only the real clear paths above may turn things off.
+            self.log(
+                "kitchen presence SUSPECT (mmWave-only + speaker playing) - holding island signal state",
+                level="DEBUG",
+            )
             return
 
         if self._is_family_room_bright():

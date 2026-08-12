@@ -4,6 +4,7 @@ import re
 import time
 
 import lighting_actions
+import presence_trust
 import room_state_darkness
 
 class FamilyRoomLights(hass.Hass):
@@ -23,6 +24,18 @@ class FamilyRoomLights(hass.Hass):
     - Optional ``family_presence_room_keys`` selects which ``raw_pir_sensors`` count as "family zone" (OR).
       **No extra delay in this app** - occupancy matches those HA entities so dashboards and troubleshooting
       stay aligned; tune hold/decay only in the sensor / AOD / device layer.
+    - Presence trust (``presence_trust.py``): when the ONLY presenting room is SUSPECT (kitchen
+      mmWave-only for >= ``presence_suspect_after_minutes`` with the PIR silent while the kitchen
+      speaker plays), the tree returns ``preserve_current_state`` - ghost presence never turns
+      lights ON, but still counts as presence so lights already on are never turned off under a
+      possibly-real, motionless person.
+
+    Manual bright detection:
+    - ``context.user_id`` on a watched light equals ``appdaemon_user_id`` (this install's AppDaemon
+      token user) -> it is this app's own service call reporting back, never a human. Zigbee/Hue
+      state reports lag the service call (measured p50 2.82 s / p90 5.71 s / max 9.98 s), so the
+      echo window alone cannot catch them all - the id check is the primary defence, the
+      ``manual_bright_echo_suppress_seconds`` window (8 s) the fallback for context-less echoes.
 
     Presence source note:
     This app expects boolean on/off "presence" entities. In this setup we point those at
@@ -166,8 +179,27 @@ class FamilyRoomLights(hass.Hass):
             self.manual_bright_listen_groups = list(
                 self.args.get("manual_bright_listen_groups") or ["living", "dining"]
             )
+            # 8 s covers the measured Zigbee/Hue state-report lag (p50 2.82 s, p90 5.71 s,
+            # max 9.98 s on this install); the appdaemon_user_id check catches the tail.
             self._manual_bright_echo_seconds = float(
-                self.args.get("manual_bright_echo_suppress_seconds", 1.5)
+                self.args.get("manual_bright_echo_suppress_seconds", 8)
+            )
+            # This install's AppDaemon token user id (yaml knob - never hardcoded here).
+            # Light contexts carrying it are this app's own service calls, not a human.
+            self._appdaemon_user_id = (
+                str(self.args.get("appdaemon_user_id") or "").strip() or None
+            )
+            if not self._appdaemon_user_id:
+                self.log(
+                    "appdaemon_user_id not configured - own service calls may be "
+                    "mistaken for manual bright actions when state reports lag "
+                    "past the echo window",
+                    level="WARNING",
+                )
+            # presence_trust: minutes of mmWave-only presence (interferer active,
+            # PIR silent) before a room's presence is SUSPECT. None -> helper default.
+            self._presence_suspect_after_minutes = self.args.get(
+                "presence_suspect_after_minutes"
             )
             self._door_arrival_latch = False
             self._latch_zone_persons_snapshot = None
@@ -605,13 +637,42 @@ class FamilyRoomLights(hass.Hass):
             pass
         return False
 
-    def _scan_raw_main_presence(self):
-        """True if any PIR in ``_family_presence_sensors`` is ``on`` - same OR as the dashboard binaries."""
+    def _family_presence_rooms_on(self):
+        """All family-zone rooms whose composite currently reads ``on``."""
+        rooms = []
         for room, sensor in self._family_presence_sensors.items():
             st = self._safe_get_state(sensor, default="off", timeout_warning=False)
             if st == "on":
-                return True, room
+                rooms.append(room)
+        return rooms
+
+    def _scan_raw_main_presence(self):
+        """True if any PIR in ``_family_presence_sensors`` is ``on`` - same OR as the dashboard binaries."""
+        rooms = self._family_presence_rooms_on()
+        if rooms:
+            return True, rooms[0]
         return False, None
+
+    def _presence_suspect_only(self, rooms_on):
+        """
+        True when EVERY presenting family-zone room is SUSPECT per ``presence_trust``
+        (in practice: kitchen mmWave-only + speaker playing, no other room on).
+        Rooms without a distrust rule are never suspect, so any real room keeps
+        this False and normal behavior applies.
+        """
+        if not rooms_on:
+            return False
+        for room in rooms_on:
+            res = presence_trust.presence_suspect(
+                self,
+                room,
+                self._family_presence_sensors[room],
+                suspect_after_minutes=self._presence_suspect_after_minutes,
+            )
+            if not res.suspect:
+                return False
+            self.log(f"Presence in {room} is SUSPECT: {res.reason}", level="DEBUG")
+        return True
 
     def _is_dishwasher_unemptied(self):
         if not getattr(self, "_dishwasher_state_entity", None):
@@ -1222,6 +1283,7 @@ class FamilyRoomLights(hass.Hass):
             "is_dark_for_auto_on": context.get("is_dark_for_auto_on") if context else None,
             "is_confirmed_bright": context.get("is_confirmed_bright") if context else None,
             "family_presence": context.get("family_presence") if context else None,
+            "presence_suspect_only": context.get("presence_suspect_only") if context else None,
             "updated": datetime.datetime.now().isoformat(),
             "friendly_name": "Family room lights diagnostics",
             "icon": "mdi:chart-box-outline",
@@ -1244,6 +1306,15 @@ class FamilyRoomLights(hass.Hass):
                 return
             uid = self._get_light_context_user_id(entity)
             if not uid:
+                return
+            if self._appdaemon_user_id and uid == self._appdaemon_user_id:
+                # Our own service call reporting back. Zigbee/Hue state reports lag
+                # the call by seconds (measured up to 9.98 s), so the echo window
+                # alone cannot suppress them - the service-account id can.
+                self.log(
+                    f"Ignoring own service-call echo on {entity} (AppDaemon user context)",
+                    level="DEBUG",
+                )
                 return
             if not self._has_family_room_presence():
                 return
@@ -1280,12 +1351,16 @@ class FamilyRoomLights(hass.Hass):
             'other_lights_on': False,
             'offline_sensors': [],
             'apartment_entry_active': False,
+            'presence_suspect_only': False,
         }
-        
-        raw_on, pres_room = self._scan_raw_main_presence()
-        context['family_presence'] = raw_on
-        if pres_room:
-            context['presence_room'] = pres_room
+
+        rooms_on = self._family_presence_rooms_on()
+        context['family_presence'] = bool(rooms_on)
+        if rooms_on:
+            context['presence_room'] = rooms_on[0]
+        # presence_trust: ghost presence (kitchen mmWave-only + speaker playing)
+        # must never auto-on, but still counts as presence for the off-hold.
+        context['presence_suspect_only'] = self._presence_suspect_only(rooms_on)
 
         # Check adjacent doors with presence - optimized with safe wrapper
         if self.doors and self.adjacent_presence:
@@ -1463,6 +1538,19 @@ class FamilyRoomLights(hass.Hass):
                     'action': 'turn_off_all',
                     'reason': 'family_presence_bright',
                     'details': 'Family presence but bright - no need for lights',
+                }
+            # presence_trust: the only presence is SUSPECT (kitchen mmWave-only while the
+            # speaker plays, PIR silent - see presence_trust.py). Never auto-on for a ghost;
+            # never auto-off either, since a real person standing still must not be plunged
+            # into darkness. Real presence in any room, or vacancy, resumes normal rules.
+            if context.get('presence_suspect_only'):
+                return {
+                    'action': 'preserve_current_state',
+                    'reason': 'presence_suspect_hold',
+                    'details': (
+                        'Only SUSPECT presence (mmWave-only + interferer active) - '
+                        'no auto-on, holding current lights until real presence or vacancy'
+                    ),
                 }
             # If sleep mode was activated during this continuous presence session,
             # preserve the current lighting until presence is lost (dark only; bright handled above).

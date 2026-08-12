@@ -1,6 +1,8 @@
 # /conf/apps/sonos/follow_me.py
 import appdaemon.plugins.hass.hassapi as hass   # type: ignore
 
+import presence_trust  # apps/lights - AppDaemon puts every app dir on sys.path
+
 # Reset handshake (sonos_reset_started -> ... -> sonos_reset_completed) can wedge
 # _reset_in_progress True forever if a handshake event is lost (e.g. HA restart mid-reset). Self-heal
 # after this many seconds - see _arm_reset_wedge_timer.
@@ -12,6 +14,9 @@ class SonosFollowMe(hass.Hass):
     • Follow-me runs whenever relevant (grouped or solo), with rules: living_room, kristines_room, and sometimes rooftop do not activate follow-me when solo.
     • desired_mute = not present (unmute if someone in room, mute if not). Only applies to speakers that are actually playing.
     • Kitchen uses kitchen OR hallway presence; rooftop undocked is always present, docked follows living_room.
+    • Kitchen presence trust (presence_trust.py): mmWave-only kitchen presence while the kitchen speaker
+      plays is SUSPECT - _is_present returns None (indeterminate), so every caller skips the mute change:
+      a ghost can never unmute (the ON trigger), and a possibly-real still person is never muted either.
     • During reset, mute/unmute is paused; after reset, state is re-synced.
     """
 
@@ -312,6 +317,24 @@ class SonosFollowMe(hass.Hass):
             if k_unknown and h_unknown:
                 self.log(f"Scenario: kitchen_presence -> both_unknown (kitchen:{kitchen_state} hallway:{hallway_state}), ignoring", level="WARNING")
                 return None
+            # presence_trust: kitchen mmWave-only presence while the kitchen speaker plays
+            # is SUSPECT (cone micro-motion ghost). Where presence triggers something ON
+            # (unmute), suspect-only kitchen reads as indeterminate: every caller skips the
+            # mute change, so a ghost never unmutes a muted speaker and a possibly-real
+            # still person is never muted. A known hallway presence still wins as real.
+            if k_present and not h_present:
+                trust = presence_trust.presence_suspect(
+                    self,
+                    "kitchen",
+                    self.room_map["kitchen"],
+                    suspect_after_minutes=self.args.get("presence_suspect_after_minutes"),
+                )
+                if trust.suspect:
+                    self.log(
+                        f"Scenario: kitchen_presence -> SUSPECT ({trust.reason}) - holding current mute state",
+                        level="INFO",
+                    )
+                    return None
             # Otherwise, presence is true if any known sensor is present
             result = k_present or h_present
             self.log(f"Scenario: kitchen_presence -> kitchen:{kitchen_state} hallway:{hallway_state} result:{result}", level="INFO")

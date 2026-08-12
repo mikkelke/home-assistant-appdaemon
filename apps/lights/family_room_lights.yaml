@@ -46,7 +46,18 @@ FamilyRoomLights:
   manual_bright_listen_groups:
     - living
     - dining
-  manual_bright_echo_suppress_seconds: 1.5
+  # Zigbee/Hue state reports lag this app's own service calls (measured 2026-07-22..08-12:
+  # p50 2.82 s, p90 5.71 s, max 9.98 s). 1.5 s let 188 own echoes latch "manual bright" in
+  # 3 weeks; 8 s covers p90 with margin - the appdaemon_user_id check below catches the tail.
+  manual_bright_echo_suppress_seconds: 8
+  # This install's AppDaemon token user. Every service call from AppDaemon carries this
+  # context.user_id; a watched light turning on with it is this app's own command reporting
+  # back - automation, never a human "manual bright".
+  appdaemon_user_id: "f4fda494358943beaf8ad2c70db099f8"
+  # presence_trust (apps/lights/presence_trust.py): kitchen mmWave-only presence for this many
+  # minutes with the PIR silent, while the kitchen speaker plays, is SUSPECT - it blocks
+  # auto-on but still holds auto-off (a still person is never plunged into darkness).
+  presence_suspect_after_minutes: 10
 
   # Illuminance sensors by room
   illuminance_sensors:

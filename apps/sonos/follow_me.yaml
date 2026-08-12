@@ -61,6 +61,11 @@ SonosFollowMe:
 
   # raw_pir_sensors removed: room_presence_map now uses PIR presence (same as lights), so one source for both state and immediate response
 
+  # presence_trust (apps/lights/presence_trust.py): kitchen mmWave-only presence for this many
+  # minutes with the PIR silent, while the kitchen speaker plays, is SUSPECT - kitchen presence
+  # then reads indeterminate: no unmute on a ghost, no mute on a possibly-real still person.
+  presence_suspect_after_minutes: 10
+
   # Special conditions for room presence
   special_conditions:
     kitchen_or_hallway: true   # Kitchen should unmute if either kitchen or hallway has presence

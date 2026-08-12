@@ -28,3 +28,8 @@ DishwasherIslandSignal:
   signal_brightness_pct: 100
   # hs_color [hue 0-360, sat 0-100]: saturated green. Prefer over rgb_color on Hue so HA state matches the lamp.
   signal_hs: [120, 100]
+
+  # presence_trust (apps/lights/presence_trust.py): kitchen mmWave-only presence for this many
+  # minutes with the PIR silent, while the kitchen speaker plays, is SUSPECT - the signal is
+  # never applied on ghost presence; an already-applied signal is held (off-hold unchanged).
+  presence_suspect_after_minutes: 10

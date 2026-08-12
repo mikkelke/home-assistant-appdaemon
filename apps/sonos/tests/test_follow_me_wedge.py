@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# follow_me imports presence_trust from apps/lights (AppDaemon puts every app dir on sys.path).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lights"))
 
 if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     ad = types.ModuleType("appdaemon")
