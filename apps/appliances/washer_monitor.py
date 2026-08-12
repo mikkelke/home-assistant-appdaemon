@@ -279,6 +279,10 @@ class WasherMonitor(hass.Hass):
         self.addload_window_minutes = int(self.args.get("addload_window_minutes", 5))  # AddLoad only at start
         self.pause_window_minutes = int(self.args.get("pause_window_minutes", 3))  # Paused only relevant in first 3 min
         self.restore_start_gap_minutes = int(self.args.get("restore_start_gap_minutes", 15))  # min continuous low power after restored start to treat as stale and re-infer from history
+        # Restore anchors this close to the app's own init are the restart re-creating the
+        # entity, not information (2026-08-12: entity last_changed 13:24 after an HA restart
+        # dragged a real 11:41 cycle start to 13:24). See _restore_running_state.
+        self.restore_wipe_anchor_grace_s = int(self.args.get("restore_wipe_anchor_grace_s", 300))
 
         # Local timezone for attributes and logs - use app timezone if set, else AppDaemon's time_zone (appdaemon.yaml)
         tz_name = self.args.get("timezone") or getattr(self.AD, "time_zone", None) or "Europe/Copenhagen"
@@ -786,15 +790,32 @@ class WasherMonitor(hass.Hass):
                     if last_changed_str:
                         last_changed_dt = _parse_utc(str(last_changed_str))
                         if last_changed_dt and self.start_time < last_changed_dt:
-                            gap_seconds = (last_changed_dt - self.start_time).total_seconds()
-                            if gap_seconds >= self.pause_window_minutes * 60:
+                            # 2026-08-12: an HA restart wipes and re-creates this entity, so
+                            # right after a restart last_changed is merely the moment the
+                            # entity was re-published - NOT when the cycle went Running. The
+                            # "cycle 2" correction below took that wipe artifact at face value
+                            # and dragged a real 11:41 start to 13:24. Any restore anchor
+                            # within a few minutes of the app's own init time is the wipe, not
+                            # information - keep the attribute-restored start_time instead.
+                            wipe_grace_s = getattr(self, "restore_wipe_anchor_grace_s", 300)
+                            anchor_age_s = (self._now_utc() - last_changed_dt).total_seconds()
+                            if abs(anchor_age_s) <= wipe_grace_s:
                                 self.log(
-                                    f"Restore: correcting start_time to entity last_changed (cycle 2) "
-                                    f"(was {self._strftime_local(self.start_time)}, now {self._strftime_local(last_changed_dt)})",
+                                    f"Restore: entity last_changed {self._strftime_local(last_changed_dt)} is within "
+                                    f"{wipe_grace_s}s of app init - restart artifact, keeping start_time "
+                                    f"{self._strftime_local(self.start_time)}",
                                     level="INFO",
                                 )
-                                self.start_time = last_changed_dt
-                                self._push_corrected_start_time_to_entity()
+                            else:
+                                gap_seconds = (last_changed_dt - self.start_time).total_seconds()
+                                if gap_seconds >= self.pause_window_minutes * 60:
+                                    self.log(
+                                        f"Restore: correcting start_time to entity last_changed (cycle 2) "
+                                        f"(was {self._strftime_local(self.start_time)}, now {self._strftime_local(last_changed_dt)})",
+                                        level="INFO",
+                                    )
+                                    self.start_time = last_changed_dt
+                                    self._push_corrected_start_time_to_entity()
         except (TypeError, ValueError, AttributeError):
             pass
 

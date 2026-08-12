@@ -34,6 +34,11 @@ import time
 import yaml
 from datetime import datetime, timedelta, timezone
 
+# Pure history/power-signal helpers shared with the washer (sibling-import modules; AppDaemon
+# puts app dirs on sys.path — same precedent washer_monitor.py already relies on).
+import washer_history as whist
+import washer_power as wpow
+
 
 def _parse_utc(s: str):
     """Parse ISO timestamp to timezone-aware UTC datetime."""
@@ -151,6 +156,20 @@ class DishwasherMonitor(hass.Hass):
         # History correction: threshold for "high power" in energy series (W)
         self.energy_active_watts = float(self.args.get("energy_active_watts", 100.0))
 
+        # Restart-safe cycle reconstruction (2026-08-12): when the state entity is missing/Off
+        # at init, ask the recorder for the last N hours of plug history before believing the
+        # instantaneous power read - ECO's passive AutoOpen dry draws 0.0 W for >1 h while the
+        # machine is still running. Window must cover the longest programme incl. its dry tail.
+        self.restore_history_window_hours = float(self.args.get("restore_history_window_hours", 5.0))
+        # Genuine cycle signature: at least this many >1 kW heater bursts in the window
+        # (or energy >= min_energy_kwh; either alone qualifies).
+        self.restore_min_heater_bursts = int(self.args.get("restore_min_heater_bursts", 3))
+        # Resume only while the finish decision could still be pending: past
+        # guards + dry tail + this grace, the cycle is treated as concluded (someone may
+        # already have emptied it unseen; re-announcing a stale cycle beats nothing, but a
+        # false Unemptied card does not).
+        self.restore_conclude_grace_minutes = int(self.args.get("restore_conclude_grace_minutes", 15))
+
         # Start candidate: HA stays Off/Unemptied until power evidence proves a real start (blocks plug blips / door-arm single-sample false starts).
         self.start_candidate_window_s = int(
             self.args.get("start_validation_window_s", self.args.get("start_candidate_window_s", 180))
@@ -256,6 +275,13 @@ class DishwasherMonitor(hass.Hass):
         self.max_power_w = 0.0
         self._last_high_power_time = None  # Last time power was high (e.g. >50 W); used to detect drying phase
 
+        # Dry tail (2026-08-12): when the finish guards + energy idle are met, the Unemptied
+        # transition (and its announcement) is deferred until the machine's own programme end
+        # (guard-open + per-programme dry_tail_minutes). The stash holds the feedback values
+        # computed at guard time so the learned-duration series never absorbs the tail.
+        self.dry_tail_timer = None
+        self._dry_tail_pending = None
+
         # Pause state tracking
         self.pause_timer = None
         self.pause_finish_timer = None
@@ -291,8 +317,12 @@ class DishwasherMonitor(hass.Hass):
         # Falling through to Off is the older, working behaviour - the bootstrap _power_changed
         # re-detects a dishwasher that is genuinely still running.
         seedable_states = ("Unemptied", "Emptied", "Error")
+        # Capture the mirror BEFORE any publish below syncs our own state into it - the
+        # history-resume check needs the pre-restart value ("was a cycle live at the wipe?"),
+        # and _sync_ui_select would overwrite it with "Off" first.
+        helper_state = self.get_state(self.ui_state_select) if self.ui_state_select else None
+        self._ui_helper_at_init = helper_state
         if existing in (None, "unknown", "unavailable") and self.ui_state_select:
-            helper_state = self.get_state(self.ui_state_select)
             if helper_state in seedable_states:
                 self.log(
                     f"State seeded from {self.ui_state_select} - sensor was missing (HA restart?)",
@@ -319,6 +349,16 @@ class DishwasherMonitor(hass.Hass):
                     "Startup: Error persists while power sensor still unavailable — fix plug/HA or dishwasher_force_off",
                     level="WARNING",
                 )
+
+        # Restart-safe cycle reconstruction (2026-08-12): an HA restart wipes set_state
+        # entities, and the old restore looked only at instantaneous power - 0.0 W during
+        # ECO's passive AutoOpen dry - and concluded "nothing running", so the 11:38 cycle
+        # ended silently in Off. Ask the recorder instead of the plug's current reading.
+        if self.state == "Off":
+            try:
+                self._maybe_resume_cycle_from_history()
+            except Exception as e:
+                self.log(f"History resume check failed: {e}", level="WARNING")
 
         # Restore cycle tracking for Running/Paused so duration, energy, and pause-exit logic work after AD restart
         if self.state in ("Running", "Paused"):
@@ -358,7 +398,10 @@ class DishwasherMonitor(hass.Hass):
         elif self.state not in ("Error",):
             self._begin_power_unavailable_grace(current_power_state or "unavailable")
 
-        # Self-heal: if we're still Running but power is 0 and we're way past expected duration, force Unemptied now
+        # Self-heal: if we're still Running but power is 0 and we're way past expected duration,
+        # confirm the finish now - through the dry-tail scheduler, so an app restart landing
+        # mid-dry still announces at the machine's own end, not at init (already-elapsed tail
+        # transitions immediately, matching the old behaviour for anything truly stale).
         if self.state == "Running" and self.start_time and current_power_state not in ["unknown", "unavailable"]:
             try:
                 watts = float(current_power_state or 0)
@@ -371,18 +414,17 @@ class DishwasherMonitor(hass.Hass):
                             display_prog = self._get_programme_for_display()
                             guard_dur = self._get_guard_duration(tick_prog=display_prog)
                             if run_min >= guard_dur * self.finish_guard_fraction:
-                                self.log(f"Self-heal: Running with 0W for {run_min:.0f}min - forcing Unemptied", level="INFO")
+                                self.log(f"Self-heal: Running with 0W for {run_min:.0f}min - confirming finish", level="INFO")
                                 run_minutes, duration_source = self._correct_duration(run_min)
-                                self._transition_to_unemptied(skip_announce=False, run_minutes=run_minutes, energy_used=energy_used)
-                                confirmed, is_human = self._get_confirmed_from_selector(classified)
-                                self._save_cycle_feedback(
-                                    predicted=classified,
-                                    confirmed=confirmed,
-                                    duration_min=run_minutes,
-                                    energy_kwh=energy_used,
-                                    max_power_w=self.max_power_w or 0,
-                                    programme_confirmed_by_human=is_human,
+                                idle_min = run_min - run_minutes if duration_source and run_min > run_minutes else None
+                                self._finish_with_dry_tail(
+                                    classified=classified,
+                                    display_prog=display_prog,
+                                    guard_dur=guard_dur,
+                                    run_minutes=run_minutes,
                                     duration_source=duration_source,
+                                    idle_min=idle_min,
+                                    energy_used=energy_used,
                                     end_reason="low_power_detected",
                                 )
             except Exception as e:
@@ -425,6 +467,315 @@ class DishwasherMonitor(hass.Hass):
             self.pause_from_low_power = bool(attrs.get("pause_from_low_power"))
         except Exception as e:
             self.log(f"Could not restore cycle tracking: {e}", level="DEBUG")
+
+    # ------------------------------------------------------------------
+    # Restart-safe cycle reconstruction (2026-08-12 incident)
+    # ------------------------------------------------------------------
+    def _energy_history_around(self, window_start, now, at_time):
+        """(energy_at, delta) from the energy sensor's recorder history: the cumulative
+        reading at/just before at_time (fallback: first reading within 10 min after it),
+        and the rise from there to the last reading in the window. (None, None) when the
+        history is unusable."""
+        try:
+            hist = self.get_history(entity_id=self.energy_sensor, start_time=window_start, end_time=now)
+        except Exception as e:
+            self.log(f"History resume: could not read energy history: {e}", level="DEBUG")
+            return (None, None)
+        pts = whist.parse_power_points(self._flatten_history(hist, self.energy_sensor))
+        if len(pts) < 2:
+            return (None, None)
+        pts.sort(key=lambda x: x[0])
+        before = [e for t, e in pts if t <= at_time]
+        if before:
+            e_at = before[-1]
+        else:
+            soon = [e for t, e in pts if t <= at_time + timedelta(minutes=10)]
+            e_at = soon[0] if soon else None
+        if e_at is None:
+            return (None, None)
+        return (e_at, pts[-1][1] - e_at)
+
+    def _maybe_resume_cycle_from_history(self) -> bool:
+        """Rebuild a wiped-out Running state from the plug's recorded history.
+
+        HA restarts erase set_state entities, and this app used to restore by looking at
+        instantaneous power only. The G5050's ECO ends with a PASSIVE AutoOpen drying phase
+        that draws 0.0 W for over an hour while the machine's display still counts down -
+        so a restart in that window concluded "nothing running" and the cycle ended
+        silently in Off (2026-08-12: three HA restarts 13:19-14:37 lost the 11:38 ECO).
+
+        Truth comes from the recorder, never from the entity: query the last
+        restore_history_window_hours of power (and energy) history; a genuine cycle
+        signature is heater bursts (>1 kW) or >= min_energy_kwh of energy over the
+        activity cluster. The cycle start is the FIRST SAMPLE of that cluster - never the
+        entity's last_changed, which right after a wipe is merely the restart re-creating
+        the entity (the washer's 13:24 mis-anchor from today: a real 11:41 start was
+        "corrected" to the 13:24 restart moment).
+
+        The app has no persistent record after a wipe, so "was the cycle already
+        concluded?" is decided from the history shape alone: resume only while the finish
+        decision (duration guards + dry tail + a grace) could still be pending. Beyond
+        that point someone may already have emptied the machine unseen, and a false
+        Unemptied card is worse than staying Off.
+
+        Returns True when state was switched to Running (cycle tracking seeded from history).
+        """
+        if self.get_state(self.state_entity) != "Off":
+            return False
+        helper = getattr(self, "_ui_helper_at_init", None)
+        if helper in ("Off", "Unemptied", "Emptied", "Error"):
+            # The input_select mirror survives HA restarts (captured in initialize BEFORE our
+            # own Off publish syncs into it). A definitive post-cycle state there means a live
+            # app already concluded (or never started) this cycle - the wiped sensor's Off is
+            # then information, not artifact, and resuming would risk re-announcing a wash
+            # somebody already emptied. Today's incident had the mirror still saying
+            # "Running": exactly the case this method exists for.
+            return False
+        now = self._now_utc()
+        window_start = now - timedelta(hours=self.restore_history_window_hours)
+        try:
+            hist = self.get_history(entity_id=self.power_sensor, start_time=window_start, end_time=now)
+        except Exception as e:
+            self.log(f"History resume: could not read power history: {e}", level="WARNING")
+            return False
+        points = whist.parse_power_points(self._flatten_history(hist, self.power_sensor))
+        if len(points) < 3:
+            return False
+        points.sort(key=lambda x: x[0])
+
+        inferred_start = wpow.find_first_sustained_high(points, self.start_w, 300, 2)
+        if inferred_start is None:
+            return False
+        # A cluster already active at the window edge belongs to a cycle older than the
+        # window: its true start is unknowable from this query and its guards+tail are long
+        # past anyway. Require the recorder to have seen the machine idle before the start.
+        if not any(t < inferred_start and w < self.start_w for t, w in points):
+            self.log("History resume: activity truncated by window edge - not resuming", level="DEBUG")
+            return False
+
+        active_ts = [t for t, w in points if w > self.stop_w]
+        last_activity = max(active_ts) if active_ts else inferred_start
+        bursts, max_w = wpow.count_heating_bursts(points)
+        energy_at_start, energy_delta = self._energy_history_around(window_start, now, inferred_start)
+        if bursts < self.restore_min_heater_bursts and (energy_delta is None or energy_delta < self.min_energy_kwh):
+            self.log(
+                f"History resume: activity since {self._format_local(inferred_start)} lacks a cycle signature "
+                f"({bursts} heater bursts < {self.restore_min_heater_bursts}, "
+                f"energy {energy_delta if energy_delta is not None else 0:.2f} kWh < {self.min_energy_kwh}) - not resuming",
+                level="DEBUG",
+            )
+            return False
+
+        # Seed cycle tracking from history so the real classifier and guards can run.
+        self.start_time = inferred_start
+        self.energy_start = energy_at_start
+        self.max_power_w = float(max_w or 0.0)
+        high_ts = [t for t, w in points if w >= 50]
+        self._last_high_power_time = max(high_ts) if high_ts else last_activity
+
+        classified = self._classify_programme()
+        display_prog = self._get_programme_for_display()
+        guard_dur = self._get_guard_duration(tick_prog=display_prog)
+        tail_min = self._get_dry_tail_minutes(display_prog)
+        guard_open = inferred_start + timedelta(minutes=float(guard_dur) * self.finish_guard_fraction)
+        anchor = max(guard_open, last_activity)
+        conclude_deadline = anchor + timedelta(minutes=tail_min + self.restore_conclude_grace_minutes)
+        if now > conclude_deadline:
+            self.log(
+                f"History resume: cycle (start {self._format_local(inferred_start)}, last activity "
+                f"{self._format_local(last_activity)}) is past guards+dry+grace "
+                f"({self._format_local(conclude_deadline)}) - treating as concluded, staying Off",
+                level="INFO",
+            )
+            self.start_time = None
+            self.energy_start = None
+            self.max_power_w = 0.0
+            self._last_high_power_time = None
+            self.detected_short = False
+            self.detected_quick_short = False
+            return False
+
+        self.state = "Running"
+        self.detected_programme = display_prog
+        self.expected_dur_at_start = guard_dur
+        self.notification_sent = False
+        self.door_opened_during_cycle = False
+        self._strict_start_until_door_or_sustain = False
+        self._sustain_start_begin = None
+        attrs = {
+            "cycle_start_time": self._format_utc(inferred_start),
+            "started_at_display": self._format_local(inferred_start),
+            "detected_programme": display_prog,
+            "restored_from": "power_history",
+        }
+        if self.energy_start is not None:
+            attrs["energy_at_start"] = self.energy_start
+        self._set_state_entity(state="Running", attributes=attrs, replace=True)
+        # Watchdog counts from the inferred start, not from init - a resumed 3h-old cycle
+        # must not get a fresh full budget. last_state_change stays untouched so the finish
+        # transition that may be due within minutes is not refused by the cooling period.
+        elapsed_s = (now - inferred_start).total_seconds()
+        self._safe_cancel_timer(self.running_watchdog_timer)
+        self.running_watchdog_timer = self.run_in(
+            self._running_watchdog_timeout,
+            max(60, int(self.max_running_hours * 3600 - elapsed_s)),
+        )
+        self.log(
+            f"Restart-safe resume: power history shows a cycle started {self._format_local(inferred_start)} "
+            f"({bursts} heater bursts, {energy_delta if energy_delta is not None else 0:.2f} kWh, "
+            f"last activity {self._format_local(last_activity)}); instantaneous power is quiet "
+            f"(passive dry phase, not idle) - resuming Running from history",
+            level="INFO",
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    # Dry tail: "finished" means the MACHINE is finished (2026-08-12)
+    # ------------------------------------------------------------------
+    def _get_dry_tail_minutes(self, prog) -> float:
+        """Per-programme passive-dry tail from dishwasher_programmes.yaml.
+
+        The duration guards open at ~92-95% of the LEARNED duration - for ECO that is
+        mid-dry, ~30-40 min before the machine's own countdown reaches zero, every run.
+        Explicit short=Yes uses dry_tail_short_minutes (unmeasured, default 0) - the same
+        explicit-Yes-only rule _get_guard_duration applies, never the classifier's
+        detected_short."""
+        profile = self._get_profile(prog)
+        if prog in ("eco", "quick") and self.short_entity and self.get_state(self.short_entity) == "Yes":
+            return float(profile.get("dry_tail_short_minutes", 0) or 0)
+        return float(profile.get("dry_tail_minutes", 0) or 0)
+
+    def _dry_tail_target(self, display_prog, guard_dur):
+        """When Unemptied should actually land: the machine's own programme end, modelled as
+        max(guard-open moment, last main activity) + dry_tail. The anchor is derived from
+        start_time and the power record - never from evaluation time - so a late evaluation
+        (app restart after the machine already finished) sees an already-elapsed tail and
+        transitions immediately. None when the programme has no measured tail."""
+        tail_min = self._get_dry_tail_minutes(display_prog)
+        if tail_min <= 0 or not self.start_time:
+            return None
+        anchor = self.start_time + timedelta(minutes=float(guard_dur) * self.finish_guard_fraction)
+        if self._last_high_power_time and self._last_high_power_time > anchor:
+            anchor = self._last_high_power_time
+        return anchor + timedelta(minutes=tail_min)
+
+    def _finish_with_dry_tail(
+        self,
+        *,
+        classified,
+        display_prog,
+        guard_dur,
+        run_minutes,
+        duration_source,
+        idle_min,
+        energy_used,
+        end_reason,
+    ):
+        """Finish conditions (guards + energy idle) are met: either transition now (no tail /
+        tail already elapsed) or defer Unemptied + announcement to the machine's own end.
+
+        run_minutes / duration_source / energy_used were computed by the caller at guard
+        time and are stashed as-is: the feedback record and the learned-duration series must
+        record the SAME run_minutes they do today, never silently absorb the tail (a learned
+        average that grew by the tail would push next run's guard later, which would push the
+        tail later - a ratchet)."""
+        target = self._dry_tail_target(display_prog, guard_dur)
+        now = self._now_utc()
+        if target is None or target <= now:
+            # Zero-tail programme (unchanged behaviour), or the tail already elapsed at
+            # guard time (late evaluation, e.g. restart after the machine's own end).
+            self._transition_to_unemptied(skip_announce=False, run_minutes=run_minutes, energy_used=energy_used)
+            if self.get_state(self.state_entity) != "Unemptied":
+                # Cooling period (or similar) refused the transition; the 60s poll retries
+                # the whole finish evaluation - do not save feedback for a state that never
+                # landed, or the retry would duplicate the record.
+                self.log("Finish transition refused (cooling?) - poll will retry", level="DEBUG")
+                return
+            confirmed, is_human = self._get_confirmed_from_selector(classified)
+            self._save_cycle_feedback(
+                predicted=classified,
+                confirmed=confirmed,
+                duration_min=run_minutes,
+                energy_kwh=energy_used,
+                max_power_w=self.max_power_w or 0,
+                programme_confirmed_by_human=is_human,
+                duration_source=duration_source,
+                end_reason=end_reason,
+                idle_min=idle_min,
+            )
+            return
+        self._dry_tail_pending = {
+            "target": target,
+            "classified": classified,
+            "run_minutes": run_minutes,
+            "duration_source": duration_source,
+            "idle_min": idle_min,
+            "energy_used": energy_used,
+            "end_reason": end_reason,
+        }
+        delay_s = max(1, int(round((target - now).total_seconds())))
+        self._safe_cancel_timer(self.dry_tail_timer)
+        self.dry_tail_timer = self.run_in(self._dry_tail_elapsed, delay_s)
+        self.log(
+            f"Finish guards met at {run_minutes:.0f}min, but {display_prog} dries passively past the guard - "
+            f"holding Running until {self._format_local(target)} (machine's own end); "
+            f"the announcement moves with the transition",
+            level="INFO",
+        )
+
+    def _dry_tail_elapsed(self, kwargs):
+        """The machine's own programme end has been reached: publish Unemptied and announce."""
+        self.dry_tail_timer = None
+        pending = self._dry_tail_pending
+        self._dry_tail_pending = None
+        if pending is None:
+            return
+        if self.get_state(self.state_entity) != "Running":
+            # A door event or force path resolved the cycle during the tail; its own
+            # transition already superseded this one.
+            self.log("Dry tail elapsed but state moved on - skipping", level="DEBUG")
+            return
+        watts = self._get_current_power()
+        if watts > self.stop_w:
+            # Power recovery normally cancels the pending tail; this is the belt to that
+            # suspender (e.g. a reading raced the timer).
+            self.log(
+                f"Dry tail elapsed but power is {watts:.1f}W - cycle still active, not finishing",
+                level="WARNING",
+            )
+            return
+        self.log("Dry tail elapsed - machine's own programme end reached", level="INFO")
+        self._transition_to_unemptied(
+            skip_announce=False,
+            run_minutes=pending["run_minutes"],
+            energy_used=pending["energy_used"],
+        )
+        if self.get_state(self.state_entity) != "Unemptied":
+            self.log("Dry-tail transition refused (cooling?) - poll will retry the finish", level="DEBUG")
+            return
+        # Selector is read at transition time on purpose: the 30+ min tail is exactly when
+        # a human plausibly confirms the programme on the card.
+        confirmed, is_human = self._get_confirmed_from_selector(pending["classified"])
+        self._save_cycle_feedback(
+            predicted=pending["classified"],
+            confirmed=confirmed,
+            duration_min=pending["run_minutes"],  # guard-time value; the tail is NOT learned
+            energy_kwh=pending["energy_used"],
+            max_power_w=self.max_power_w or 0,
+            programme_confirmed_by_human=is_human,
+            duration_source=pending["duration_source"],
+            end_reason=pending["end_reason"],
+            idle_min=pending["idle_min"],
+        )
+
+    def _cancel_dry_tail(self, reason, level="INFO"):
+        """Drop a pending dry-tail transition (power returned, door event took over, reset)."""
+        had_any = getattr(self, "dry_tail_timer", None) is not None or getattr(self, "_dry_tail_pending", None) is not None
+        self._safe_cancel_timer(getattr(self, "dry_tail_timer", None))
+        self.dry_tail_timer = None
+        self._dry_tail_pending = None
+        if had_any:
+            self.log(f"Dry tail cancelled: {reason}", level=level)
 
     def _local_tz(self):
         return getattr(self, "_local_tz_obj", None) or timezone.utc
@@ -1283,6 +1634,16 @@ class DishwasherMonitor(hass.Hass):
             "energy_at_start": self.energy_start,
             "energy_used": round(self._get_energy_used(), 3),
         }
+        pending = getattr(self, "_dry_tail_pending", None)
+        if pending and pending.get("target"):
+            # Wash phase over, machine still drying (AutoOpen): show the machine's own end
+            # instead of a learned-duration ETA that has already run out.
+            target = pending["target"]
+            tail_remaining = max(0, (target - self._now_utc()).total_seconds() / 60)
+            attrs["estimated_remaining_min"] = round(tail_remaining)
+            attrs["estimated_end_time"] = self._format_utc(target)
+            attrs["progress_pct"] = min(99, progress if progress else 99)
+            attrs["drying_tail"] = True
         try:
             full = self.get_state(self.state_entity, attribute="all")
             existing = dict((full or {}).get("attributes") or {})
@@ -1541,6 +1902,10 @@ class DishwasherMonitor(hass.Hass):
 
     def _transition_to_paused(self, low_power=False):
         """Transition to Paused when door opens during Running (add dishes or Miele door-pause)."""
+        # A paused machine is by definition not finished - drop any pending dry-tail finish.
+        # (Door events keep their existing immediate semantics; the tail never delays them.)
+        if getattr(self, "dry_tail_timer", None) is not None or getattr(self, "_dry_tail_pending", None) is not None:
+            self._cancel_dry_tail("door opened - Paused", level="DEBUG")
         self.pause_from_low_power = bool(low_power)
         if self._should_change_state("Paused", force=True):
             self.state = "Paused"
@@ -1754,6 +2119,15 @@ class DishwasherMonitor(hass.Hass):
         force: If True, bypass cooling period (e.g. dishwasher_force_unemptied).
         """
         if self._should_change_state("Unemptied", force=force):
+            # Whoever is transitioning now (dry-tail callback, door open, force event,
+            # watchdog) supersedes a pending dry-tail transition: cancel its timer and drop
+            # the stash so the deferred callback can never double-fire or double-save.
+            # (_dry_tail_elapsed clears its own handle/stash before calling here, so for the
+            # tail's own transition this is a no-op.)
+            self._safe_cancel_timer(getattr(self, "dry_tail_timer", None))
+            self.dry_tail_timer = None
+            self._dry_tail_pending = None
+
             run_minutes = run_minutes if run_minutes is not None else self._get_run_duration_minutes()
             energy_used = energy_used if energy_used is not None else self._get_energy_used()
 
@@ -1996,6 +2370,10 @@ class DishwasherMonitor(hass.Hass):
             self._safe_cancel_timer(self.low_power_timer)
             self.low_power_timer = None
 
+        self._safe_cancel_timer(getattr(self, "dry_tail_timer", None))
+        self.dry_tail_timer = None
+        self._dry_tail_pending = None
+
         if self.running_watchdog_timer:
             self._safe_cancel_timer(self.running_watchdog_timer)
             self.running_watchdog_timer = None
@@ -2170,6 +2548,10 @@ class DishwasherMonitor(hass.Hass):
                 self._safe_cancel_timer(self.low_power_timer)
                 self.low_power_timer = None
                 self.log(f"Power recovered to {watts}W, cancelled finish timer", level="DEBUG")
+            # Power during the dry-tail wait means the guards were premature (machine still
+            # active) - drop the pending finish; detection restarts from the live signal.
+            if getattr(self, "dry_tail_timer", None) is not None or getattr(self, "_dry_tail_pending", None) is not None:
+                self._cancel_dry_tail(f"power {watts:.1f}W during dry tail - cycle still active")
 
     def _poll_power(self, kwargs):
         """Conditional polling"""
@@ -2239,6 +2621,14 @@ class DishwasherMonitor(hass.Hass):
             self.low_power_timer = None
             return
 
+        if getattr(self, "dry_tail_timer", None) is not None:
+            # Finish already confirmed; the dry-tail transition is scheduled. The 60s poll
+            # keeps re-arming the low-power timer during the passive dry, so this re-entry
+            # is routine - never re-confirm or double-schedule.
+            self.log("_confirm_finished: dry tail already pending - skipping", level="DEBUG")
+            self.low_power_timer = None
+            return
+
         current_power_state = self.get_state(self.power_sensor)
         if current_power_state in ["unknown", "unavailable"]:
             self._handle_unavailable(self.power_sensor, None, None, current_power_state, {})
@@ -2272,18 +2662,18 @@ class DishwasherMonitor(hass.Hass):
                 run_minutes, duration_source = self._correct_duration(run_minutes_wall)
                 idle_min = run_minutes_wall - run_minutes if duration_source and run_minutes_wall > run_minutes else None
                 energy_kwh = self._get_energy_used()
-                self._transition_to_unemptied(skip_announce=False, run_minutes=run_minutes, energy_used=energy_kwh)
-                confirmed, is_human = self._get_confirmed_from_selector(classified)
-                self._save_cycle_feedback(
-                    predicted=classified,
-                    confirmed=confirmed,
-                    duration_min=run_minutes,
-                    energy_kwh=energy_kwh,
-                    max_power_w=self.max_power_w,
-                    programme_confirmed_by_human=is_human,
+                # Do not transition immediately: programmes with a measured dry tail keep
+                # Running until the machine's own end (see _finish_with_dry_tail); zero-tail
+                # programmes and already-elapsed tails transition right here as before.
+                self._finish_with_dry_tail(
+                    classified=classified,
+                    display_prog=display_prog,
+                    guard_dur=guard_dur,
+                    run_minutes=run_minutes,
                     duration_source=duration_source,
-                    end_reason="low_power_detected",
                     idle_min=idle_min,
+                    energy_used=energy_kwh,
+                    end_reason="low_power_detected",
                 )
             else:
                 run_min = self._get_run_duration_minutes()

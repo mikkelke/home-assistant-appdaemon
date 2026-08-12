@@ -5,6 +5,14 @@
 # ECO has two durations: full (manual 3:47) or short when "short" (Express) = Yes.
 # QuickPowerWash with short = Yes is the machine rinse (salt/maintenance), ~14 min — not a separate programme.
 # Shortest real wash programme: ECO with short = 74 min (fill window, min_cycle_minutes).
+#
+# dry_tail_minutes: passive drying that continues AFTER the finish guards open. The guard
+# anchors to ~92–95% of the LEARNED duration, which for programmes with a long 0 W drying
+# phase is mid-dry — the machine's own display still counts down. "Finished" on the card
+# must mean the machine's countdown reached zero, so the Unemptied transition (and its
+# Sonos/push announcement) waits until guard-open + dry_tail_minutes.
+# A value of 0 means UNMEASURED, not "no tail" — set it only from an observed
+# guard-open-vs-machine-display gap, like eco's was.
 
 programmes:
   quick:
@@ -12,24 +20,33 @@ programmes:
     duration_min: 58
     duration_short_min: 14   # QuickPowerWash with short = Yes (rinse/salt cycle)
     max_energy_kwh: 1.2
+    dry_tail_minutes: 0      # unmeasured
 
   gentle:
     label: "Gentle"
     duration_min: 149
     max_energy_kwh: 1.1
+    dry_tail_minutes: 0      # unmeasured
 
   eco:
     label: "ECO"
     duration_min: 234
     duration_short_min: 74   # when short = Yes (Express option)
     max_energy_kwh: 0.95
+    # 2026-08-12: guard opened ~14:55 (92% of learned 214 min after an 11:38 start) while
+    # the machine's own display ran to ~15:26 — ECO ends with a passive AutoOpen dry that
+    # draws literally 0 W for over an hour.
+    dry_tail_minutes: 35
+    dry_tail_short_minutes: 0  # Express dry, unmeasured
 
   auto:
     label: "Auto"
     duration_min: 108
     max_energy_kwh: 1.45
+    dry_tail_minutes: 0      # unmeasured
 
   intensive:
     label: "Intensive"
     duration_min: 150
     max_energy_kwh: 1.2
+    dry_tail_minutes: 0      # unmeasured

@@ -122,6 +122,28 @@ dishwasher_monitor:
   finish_guard_min_learned_n: 5      # Minimum confirmed cycles before trusting the learned average
   # Learned average is floored at 75% of nominal regardless, to protect against a polluted/short learning history.
 
+  # ============================================================================
+  # RESTART-SAFE RESTORE & DRY TAIL (2026-08-12)
+  # ============================================================================
+  # HA restarts wipe sensor.dishwasher_state. On init with the entity missing/Off the app
+  # reconstructs a lost cycle from the plug's recorder HISTORY instead of the instantaneous
+  # power read: ECO ends with a passive AutoOpen dry that draws 0.0 W for over an hour while
+  # the machine's display still counts down, so "power is 0 now" proves nothing. The cycle
+  # start is inferred from the first sample of the activity cluster in history - never from
+  # entity last_changed (after a wipe that is just the restart re-creating the entity).
+  # Window must cover the longest programme incl. its dry (ECO ~4 h).
+  restore_history_window_hours: 5
+  # Cycle signature: at least this many >1 kW heater bursts in the window (or energy >= min_energy_kwh).
+  restore_min_heater_bursts: 3
+  # Resume only while the finish decision could still be pending (guards + dry tail + this
+  # grace); past that the cycle is treated as concluded - someone may have emptied it unseen.
+  restore_conclude_grace_minutes: 15
+  # Per-programme dry_tail_minutes lives in dishwasher_programmes.yaml (eco: 35). When the
+  # finish guards + energy idle are met, Unemptied and its Sonos/push announcement wait
+  # until guard-open + dry_tail, so "finished" means the MACHINE is finished. Door opens
+  # keep their immediate semantics, and feedback still records the guard-time run_minutes -
+  # the learned-duration series must not absorb the tail.
+
   # Pause timeout - if door stays open while adding dishes
   pause_timeout_minutes: 5
   
