@@ -61,6 +61,11 @@ class Intercom(hass.Hass):
 
         self.sonos_notifier = self._get_notifier()
         self.mobile_notifier = self._get_mobile_notifier()
+        # Optional ABB Welcome bridge (apps/intercom/abb_welcome_bridge.py) for
+        # attaching the doorbell snapshot to pushes. Resolved LAZILY at push time
+        # (see _abb_ring_attachment), never via yaml dependencies: a broken/missing
+        # bridge must cost the photo, never this app's load or its unlock path.
+        self.abb_bridge = None
         self.last_trigger_at = {}
         self.pending_unlocks = {}  # Track scheduled unlock callbacks by entity
         self.unlock_outcomes = {}  # Per trigger entity: did any attempt of the current ring succeed
@@ -132,6 +137,24 @@ class Intercom(hass.Hass):
         except Exception as e:
             self.log(f"Error getting MobileNotifier app: {e}. Failure alerts will only be logged.", level="WARNING")
             return None
+
+    def _abb_ring_attachment(self):
+        """Optional doorbell-snapshot payload for mobile pushes, from the ABB
+        Welcome bridge app. STRICTLY ADDITIVE: returns None on ANY problem
+        (bridge app absent, not loaded yet, or throwing), and the callers pass
+        the result straight through as MobileNotifier's `data=` argument -
+        data=None is byte-for-byte today's push. Never raises."""
+        try:
+            if self.abb_bridge is None:
+                self.abb_bridge = self.get_app("AbbWelcomeBridge")
+            if self.abb_bridge:
+                return self.abb_bridge.ring_attachment_data()
+        except Exception as e:
+            try:
+                self.log(f"ABB snapshot attachment unavailable: {e}", level="DEBUG")
+            except Exception:
+                pass
+        return None
 
     def _validate_entities(self):
         """Validate that configured entities exist in Home Assistant."""
@@ -575,11 +598,16 @@ class Intercom(hass.Hass):
         )
 
         if self.mobile_notifier:
+            # ABB doorbell snapshot, if the bridge can offer one - computed OUTSIDE
+            # the try so a (impossible-by-contract) failure could never skip the
+            # push itself; None simply reproduces today's text-only notification.
+            attachment = self._abb_ring_attachment()
             try:
                 self.create_task(self.mobile_notifier.notify(
                     title="Intercom auto-opened",
                     message=f"Someone rang the {ring_label} and the door was unlocked automatically.",
                     target=self.notify_target,
+                    data=attachment,
                 ))
             except Exception as e:
                 self.log(f"Auto-open success notification failed: {e}", level="WARNING")
@@ -600,6 +628,8 @@ class Intercom(hass.Hass):
         )
 
         if self.mobile_notifier:
+            # Same strictly-additive ABB snapshot as the success push (None = today's push).
+            attachment = self._abb_ring_attachment()
             try:
                 self.create_task(self.mobile_notifier.notify(
                     title="Intercom auto-open failed",
@@ -608,6 +638,7 @@ class Intercom(hass.Hass):
                         f"{self.unlock_repeat_count} unlock attempts got no response from the intercom."
                     ),
                     target=self.notify_target,
+                    data=attachment,
                 ))
             except Exception as e:
                 self.log(f"Auto-open failure notification failed: {e}", level="WARNING")

@@ -1,0 +1,64 @@
+# /conf/apps/intercom/abb_welcome_bridge.yaml
+#
+# Additive observer for the ABB Welcome integration - missed-call pushes with
+# doorbell snapshots, the ring image archive, and the ABB/ESP ring comparator
+# that gathers the phase-2 (ESP replacement) evidence. READ-ONLY against the
+# ABB device: this app never presses buttons, toggles switches, or touches
+# locks. The ESP intercom app (intercom.yaml) stays authoritative for the
+# doorbell and does NOT depend on this app - if this app dies, the house loses
+# features, never the doorbell.
+
+AbbWelcomeBridge:
+  module: abb_welcome_bridge
+  class: AbbWelcomeBridge
+  log: abb_welcome_bridge_log
+  # Only the notifier: intercom.py deliberately has NO dependency on this app
+  # (an AppDaemon dependency would stop the doorbell app from loading if this
+  # one broke), and this app resolves the notifier the same way intercom does.
+  dependencies:
+    - MobileNotifier
+
+  # --- ABB entities (read-only) ---
+  abb_event_entity: "event.abb_welcome_gateway_intercom"           # cloud-polled portal events (30 s interval)
+  abb_ringing_sensor: "binary_sensor.abb_welcome_gateway_intercom_ringing"  # realtime SIP ring, 5 s hold
+  abb_image_entity: "image.abb_welcome_gateway_latest_screenshot"  # gateway snapshot, poll-lagged 7-32 s after the ring
+  abb_ring_bus_event: "abb_welcome_ring"                           # realtime HA bus event from the integration's SIP listener
+
+  # --- ESP side (observed only - never actuated from here) ---
+  esp_door_sensors:
+    binary_sensor.intercomproxy_doorbell_front_door: "front door"
+    binary_sensor.intercomproxy_doorbell_back_door: "back door"
+  esp_lock_doors:
+    lock.intercomproxy_front_door: "front door"
+    lock.intercomproxy_back_door: "back door"
+  auto_open_boolean: "input_boolean.auto_open_intercom"
+
+  # Station -> door mapping. Evidence (2026-08-12, two independent ring
+  # correlations against the ESP sensors; see abb_welcome_bridge.py header):
+  #   14:24:44Z back-door ESP ring  <-> station 100000001 "Outdoor Station 1-1"
+  #   16:35:28Z front-door ESP ring <-> station 100000002 "Outdoor Station 2-1"
+  # Labels only - the comparator's station_door_matrix keeps re-verifying this.
+  station_doors:
+    "100000001": "back door"
+    "100000002": "front door"
+
+  # --- timing knobs (defaults shown; all measured 2026-08-12) ---
+  pair_window_s: 10            # ESP and ABB rings ~50 ms apart when both work; 10 s is generous
+  debounce_s: 5                # per-side re-ring fold, matches intercom.py + the ABB 5 s ring hold
+  episode_close_s: 75          # classification final: unlock by +9 s, missed/screenshot by ~+35 s (30 s poll)
+  suppress_window_s: 30        # unlock within +/-30 s of the ring = the house answered; not a real miss
+  missed_decision_delay_s: 15  # wait for unlock evidence (lands ~ring+9 s) before pushing "missed"
+  missed_max_age_s: 900        # ignore replayed/stale portal events (HA restart restores the last one)
+  snapshot_probe_s: 6          # early snapshot probe; the normal capture is event-driven off the image entity
+
+  # Missed-call push audience: everyone home, no category restriction.
+  notify_target: "home"
+
+  # --- ring image archive (same exposure model as the vacuum's rober2_maps:
+  # /www inside the container = /data/homeassistant/www on the box, served
+  # unauthenticated on LAN at /local/abb_doorbell/) ---
+  archive_dir: "/www/abb_doorbell"
+  archive_url_prefix: "/local/abb_doorbell"
+  retain_days: 90              # prune snapshots older than this on every write
+  max_files: 2000              # and never keep more than this many
+  archive_warn_mb: 500         # WARNING in the log above this directory size
