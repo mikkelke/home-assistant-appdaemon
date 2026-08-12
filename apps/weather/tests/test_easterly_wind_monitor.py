@@ -35,6 +35,9 @@ def make_app(states=None, **overrides):
     get_state faked from a plain dict and call_service captured via AsyncMock."""
     app = ewm.EasterlyWindMonitor.__new__(ewm.EasterlyWindMonitor)
     app.wind_dir = "sensor.gw2000a_wind_direction"
+    # Mirrors initialize(): unset means "instantaneous vane only", the pre-2026-08-12
+    # behaviour every test below was written against. WindDirectionSource opts in.
+    app.wind_dir_mean = overrides.get("wind_dir_mean", None)
     app.wind_gust = "sensor.gw2000a_wind_gust"
     app.wind_speed = "sensor.gw2000a_wind_speed"
     app.episode_entity = "input_boolean.easterly_wind_episode_active"
@@ -252,9 +255,10 @@ class EpisodeEndPeakReporting(unittest.IsolatedAsyncioTestCase):
 class EpisodeConditionsNow(unittest.TestCase):
     """_episode_conditions_now: the synchronous, init-only rehydration check."""
 
-    def _make(self, states):
+    def _make(self, states, wind_dir_mean=None):
         app = ewm.EasterlyWindMonitor.__new__(ewm.EasterlyWindMonitor)
         app.wind_dir = "sensor.gw2000a_wind_direction"
+        app.wind_dir_mean = wind_dir_mean   # mirrors initialize(); None = vane only
         app.wind_gust = "sensor.gw2000a_wind_gust"
         app.wind_speed = "sensor.gw2000a_wind_speed"
         app.dir_min = 60.0
@@ -399,6 +403,92 @@ class RestartRehydrationEndToEnd(unittest.IsolatedAsyncioTestCase):
         app.call_service.assert_awaited_once_with(
             "input_boolean/turn_off", entity_id=app.episode_entity,
         )
+
+
+MEAN_ENT = "sensor.gw2000a_wind_direction_10m_avg"
+
+
+class WindDirectionSource(unittest.TestCase):
+    """"Easterly wind" means the MEAN flow is easterly, so the 60-120 deg test runs on the
+    station's 10-minute mean, not the instantaneous vane (2026-08-12).
+
+    WHY IT MATTERS: this app's whole premise is a SUSTAINED pattern - it wants the condition
+    on 5 consecutive checks before it will tell Mikkel the building is under easterly load,
+    and any single sample that falls out of the band resets _condition_met_count to zero. The
+    vane cannot carry that: measured over the 60 days to 2026-08-12 it sat a median 26 deg
+    from the station's own 10-minute mean (p90 114 deg), and given it is inside the 60-120 deg
+    band now it is still inside it four minutes later only 65% of the time.
+
+    Replayed against the recorder over the windy months 2026-01-01..2026-03-01, there were 89
+    minutes in which the 10-minute mean said easterly-and-windy while the vane's instantaneous
+    reading knocked the run back to zero. On the vane the app would have raised 4 episodes
+    totalling 1.0 h; on the mean, 6 episodes totalling 2.2 h. The two extra are real
+    building-load events that were never reported - 2026-02-16 11:54-12:36 (42 minutes) in
+    full, and 2026-02-01's episode started 14 minutes late."""
+
+    def test_mean_is_preferred_over_the_vane(self):
+        self.assertEqual(ewm.EasterlyWindMonitor._pick_direction("95", "300"), (95.0, "mean"))
+
+    def test_vane_excursion_no_longer_breaks_a_sustained_easterly(self):
+        """The concrete failure mode: mean flow easterly at 95 deg, vane momentarily at
+        300 deg. On the vane that check fails the band test and the 5-check run restarts."""
+        app = make_app({
+            "sensor.gw2000a_wind_direction": "300",
+            MEAN_ENT: "95",
+            "sensor.gw2000a_wind_gust": "60",
+            "sensor.gw2000a_wind_speed": "30",
+        }, wind_dir_mean=MEAN_ENT, condition_met_count=4)
+        asyncio.run(app._check_conditions({}))
+        self.assertTrue(app._in_episode, "a single vane excursion cancelled a real episode")
+
+    def test_the_same_reading_on_the_vane_alone_cancels_the_run(self):
+        """Same data, mean not configured: this is what the app used to do, and why the
+        2026-02-16 easterly was never reported."""
+        app = make_app({
+            "sensor.gw2000a_wind_direction": "300",
+            MEAN_ENT: "95",
+            "sensor.gw2000a_wind_gust": "60",
+            "sensor.gw2000a_wind_speed": "30",
+        }, condition_met_count=4)
+        asyncio.run(app._check_conditions({}))
+        self.assertFalse(app._in_episode)
+        self.assertEqual(app._condition_met_count, 0, "the run must have been reset")
+
+    def test_falls_back_to_the_vane_when_the_mean_is_unavailable(self):
+        self.assertEqual(
+            ewm.EasterlyWindMonitor._pick_direction("unavailable", "95"), (95.0, "vane"))
+
+    def test_falls_back_when_the_mean_is_absent(self):
+        self.assertEqual(ewm.EasterlyWindMonitor._pick_direction(None, "95"), (95.0, "vane"))
+
+    def test_both_unusable_is_inconclusive_not_zero_degrees(self):
+        """Returning 0.0 would read as "north" and quietly end episodes; the caller needs
+        None so it keeps its existing inconclusive handling."""
+        self.assertEqual(
+            ewm.EasterlyWindMonitor._pick_direction("unknown", "unavailable"), (None, None))
+        self.assertEqual(ewm.EasterlyWindMonitor._pick_direction("n/a", "junk"), (None, None))
+
+    def test_rehydration_check_uses_the_mean_too(self):
+        """_episode_conditions_now decides at startup whether a helper left ON should be
+        closed out immediately. Reading a different instrument there than the running loop
+        does would make the restart path disagree with itself."""
+        app = ewm.EasterlyWindMonitor.__new__(ewm.EasterlyWindMonitor)
+        app.wind_dir = "sensor.gw2000a_wind_direction"
+        app.wind_dir_mean = MEAN_ENT
+        app.wind_gust = "sensor.gw2000a_wind_gust"
+        app.wind_speed = "sensor.gw2000a_wind_speed"
+        app.dir_min, app.dir_max = 60.0, 120.0
+        app.wind_speed_windy, app.gust_windy = 28.8, 54.0
+        states = {
+            "sensor.gw2000a_wind_direction": "300",
+            MEAN_ENT: "95",
+            "sensor.gw2000a_wind_gust": "60",
+            "sensor.gw2000a_wind_speed": "30",
+        }
+        app.get_state = lambda entity, **kw: states.get(entity)
+        app.log = MagicMock()
+        self.assertTrue(app._episode_conditions_now(),
+                        "the vane's excursion would have force-ended a live episode")
 
 
 if __name__ == "__main__":

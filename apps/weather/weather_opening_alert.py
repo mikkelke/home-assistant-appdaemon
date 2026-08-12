@@ -92,6 +92,9 @@ class WeatherOpeningAlert(hass.Hass):
         self.wind_speed_entity = self.args.get("wind_speed_entity", "sensor.gw2000a_wind_speed")
         self.wind_gust_entity = self.args.get("wind_gust_entity", "sensor.gw2000a_wind_gust")
         self.wind_dir_entity = self.args.get("wind_direction_entity", "sensor.gw2000a_wind_direction")
+        # The facade test wants the MEAN flow, not one sample of a turbulent vane - see
+        # _facade_wind_direction. Unset = legacy behaviour (instantaneous vane only).
+        self.wind_dir_mean_entity = self.args.get("wind_direction_mean_entity")
 
         self.rain_min = float(self.args.get("rain_rate_min_mmh", 0.5))
         self.wind_speed_min = float(self.args.get("wind_speed_min_kmh", 5))
@@ -165,6 +168,8 @@ class WeatherOpeningAlert(hass.Hass):
             self.wind_gust_entity,
             self.wind_dir_entity,
         ]
+        if self.wind_dir_mean_entity:
+            weather_entities.append(self.wind_dir_mean_entity)
         for eid in weather_entities:
             self.listen_state(self._on_change, eid)
 
@@ -254,11 +259,40 @@ class WeatherOpeningAlert(hass.Hass):
             uom = None
         return _wind_scalar_to_kmh(val, uom if isinstance(uom, str) else None)
 
+    async def _facade_wind_direction(self) -> tuple[Optional[float], str]:
+        """Which direction the +/-30 deg facade bands are tested against, and where it came from.
+
+        "The wind is from the SSE" is a statement about the MEAN flow - meteorologically a
+        10-minute mean, which is also the scale the +/-30 deg bands in apartment_wind_exposure.md
+        were drawn for ("wind will be deflected by nearby buildings"). The instantaneous vane is
+        one sample of a turbulent field: measured over the 60 days to 2026-08-12 it sits a median
+        26 deg away from the station's own 10-minute mean, p90 114 deg - wider than the whole
+        band. Given the vane is inside a band now, it is still inside it 4 minutes later only
+        21-65% of the time (SSE worst); the 10-minute mean manages 38-85%. That 4 minutes is
+        exactly what window_rain_sustain_minutes demands, and any single out-of-band sample pops
+        _wind_ok_since and restarts the clock - so the sustain filter was rejecting turbulence,
+        not weather.
+
+        Replaying the 60 days: on the mean, the ENE facade accumulates 92 qualifying minutes
+        against the vane's 50, alerts land up to 12 min earlier (2026-07-26 22:10 vs 22:22), and
+        two episodes the vane never caught at all appear (2026-06-28 07:28, 2026-07-20 08:14).
+        It is not simply more sensitive: on the rarely-blowing SSE/NNW sectors the mean gives
+        FEWER in-band minutes, because it drops the spurious excursions that a single sample
+        wanders into.
+
+        Falls back to the vane when the mean is missing/unavailable - the station publishes both
+        or neither, and the vane is better than nothing."""
+        if self.wind_dir_mean_entity:
+            mean = await self._parse_numeric_state(self.wind_dir_mean_entity)
+            if mean is not None:
+                return mean, "mean"
+        return await self._parse_numeric_state(self.wind_dir_entity), "vane"
+
     async def _evaluate(self) -> None:
         now = datetime.now(timezone.utc)
 
         rain_rate = await self._parse_numeric_state(self.rain_entity)
-        wind_dir = await self._parse_numeric_state(self.wind_dir_entity)
+        wind_dir, wind_dir_src = await self._facade_wind_direction()
         speed_kmh = await self._wind_speed_kmh()
         gust_kmh = await self._wind_gust_kmh()
 
@@ -296,7 +330,9 @@ class WeatherOpeningAlert(hass.Hass):
 
         # last_changed only used in seed max() when that sensor's value currently
         # satisfies the corresponding part of the wind condition (plan: no mis-seed).
-        lc_dir = await self._get_lc(self.wind_dir_entity) if wind_dir_ok else None
+        # Seed from whichever direction entity actually supplied the reading.
+        _dir_ent = (self.wind_dir_mean_entity if wind_dir_src == "mean" else self.wind_dir_entity)
+        lc_dir = await self._get_lc(_dir_ent) if wind_dir_ok else None
         lc_sp = await self._get_lc(self.wind_speed_entity) if speed_qualifies else None
         lc_gu = await self._get_lc(self.wind_gust_entity) if gust_qualifies else None
 

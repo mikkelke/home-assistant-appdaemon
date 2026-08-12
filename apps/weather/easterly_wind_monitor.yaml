@@ -11,6 +11,13 @@ EasterlyWindMonitor:
 
   # GW2000A sensors
   wind_direction_entity: "sensor.gw2000a_wind_direction"
+  # The 60-120 deg test runs on the station's 10-MINUTE MEAN direction, not the instantaneous
+  # vane (2026-08-12): "easterly wind" is a statement about the mean flow, and this app then
+  # asks for it to hold across 5 consecutive checks. Replayed over 2026-01-01..2026-03-01 the
+  # vane would have raised 4 episodes / 1.0 h and the mean 6 / 2.2 h - the 42-minute easterly
+  # of 2026-02-16 11:54 was never reported at all, because single out-of-band vane samples
+  # (89 such minutes in that window) kept resetting the sustained counter. Vane = fallback.
+  wind_direction_mean_entity: "sensor.gw2000a_wind_direction_10m_avg"
   wind_speed_entity: "sensor.gw2000a_wind_speed"
   wind_gust_entity: "sensor.gw2000a_wind_gust"
 

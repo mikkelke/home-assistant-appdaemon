@@ -16,7 +16,18 @@ WeatherOpeningAlert:
   wind_speed_entity: sensor.gw2000a_wind_speed
   wind_gust_entity: sensor.gw2000a_wind_gust
   wind_direction_entity: sensor.gw2000a_wind_direction
+  # The facade bands below are tested against the station's 10-MINUTE MEAN direction, not the
+  # instantaneous vane (2026-08-12). Over the previous 60 days the vane sat a median 26 deg
+  # from that mean and p90 114 deg - wider than a whole +/-30 band - so requiring 4 unbroken
+  # minutes in-band filtered turbulence rather than weather. Replayed on the mean, the ENE
+  # facade gets 92 qualifying minutes instead of 50, alerts land up to 12 min earlier, two
+  # missed episodes appear, and the rarely-blowing SSE/NNW sectors get FEWER in-band minutes
+  # (spurious single-sample excursions drop out). The vane stays as the fallback.
+  wind_direction_mean_entity: sensor.gw2000a_wind_direction_10m_avg
 
+  # 0.5 mm/h is "any measurable rain": the piezo rate quantises in 0.6 mm/h steps, and unlike
+  # binary_sensor.gw2000a_rain_state_piezo (an impact detector - see darkness_calculator.yaml)
+  # every non-zero rate reading in 60 days was corroborated by the rain accumulator.
   rain_rate_min_mmh: 0.5
   wind_speed_min_kmh: 5
   wind_gust_min_kmh: 10

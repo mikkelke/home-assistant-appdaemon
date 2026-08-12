@@ -31,6 +31,7 @@ Anti-flap:
   - "Lamp daylight": if any configured zone light is on, ``light_on_lux_offset`` is
     subtracted from indoor lux before the BRIGHT check, so the lamp's own contribution
     can never classify the room as bright.
+  - "Raining" requires MEASURED water, not just the piezo contact - see _apply_rain.
 
 Publish contract (unchanged from the previous implementation):
   - ``binary_sensor.dark_<name>``  on/off        (confirmed only)
@@ -74,7 +75,11 @@ class DarknessCalculator(hass.Hass):
 
         # Global signals
         self.outdoor_sensor = a.get("outdoor_sensor", "sensor.gw2000a_solar_lux")
-        self.rain_sensor = a.get("rain_sensor")  # binary_sensor, on = raining
+        self.rain_sensor = a.get("rain_sensor")  # binary_sensor: the piezo CONTACT, not rain
+        # The piezo contact alone is not a rain sensor - it is an impact detector, so it must
+        # be corroborated by measured water before it may darken the apartment (see _apply_rain).
+        self.rain_rate_sensor = a.get("rain_rate_sensor")   # sensor, mm/h; None = legacy behaviour
+        self.rain_rate_min = float(a.get("rain_rate_min_mmh", 0.5))
         self.sun_entity = a.get("sun_entity", "sun.sun")
         self.dusk_elevation = float(a.get("dusk_elevation", 3.0))
 
@@ -127,6 +132,8 @@ class DarknessCalculator(hass.Hass):
         self._outdoor_last = None
         self._outdoor_ts = None
         self._raining = False
+        self._rain_contact = False    # the piezo binary as-is
+        self._rain_confirmed = False  # measured water seen in the CURRENT contact episode
         self._rain_ended_at = 0.0
 
         # Per-zone state machine
@@ -152,7 +159,9 @@ class DarknessCalculator(hass.Hass):
 
         self.log(
             f"Darkness Calculator (streamlined): {len(self.zones)} zones, "
-            f"outdoor={self.outdoor_sensor}, rain={self.rain_sensor}, "
+            f"outdoor={self.outdoor_sensor}, rain={self.rain_sensor} "
+            f"(confirmed by {self.rain_rate_sensor or 'nothing - contact only'} "
+            f">= {self.rain_rate_min:g} mm/h), "
             f"holds {self.hold_bright_to_dark_s:.0f}s/{self.hold_dark_to_bright_s:.0f}s "
             f"(x{self.rain_hold_multiplier:.1f} around rain), "
             f"smoothing {self.smoothing_s:.0f}s, gloomy x{self.gloomy_dark_multiplier:.1f} "
@@ -190,7 +199,7 @@ class DarknessCalculator(hass.Hass):
             self._outdoor_ts = time.time()
             self._outdoor_samples.append((time.time(), v))
         if self.rain_sensor:
-            self._raining = self._get_raw(self.rain_sensor) == "on"
+            self._apply_rain(self._get_raw(self.rain_sensor) == "on", self._rain_rate_now())
         for zcfg in self.zones.values():
             for s in self._zone_sensor_list(zcfg):
                 val = self._get_float(s)
@@ -214,6 +223,8 @@ class DarknessCalculator(hass.Hass):
         self.listen_state(self._on_outdoor, self.outdoor_sensor)
         if self.rain_sensor:
             self.listen_state(self._on_rain, self.rain_sensor)
+        if self.rain_rate_sensor:
+            self.listen_state(self._on_rain_rate, self.rain_rate_sensor)
 
         presence_entities = set()
         for zone, zcfg in self.zones.items():
@@ -272,6 +283,61 @@ class DarknessCalculator(hass.Hass):
             return True
         ts = self._outdoor_ts
         return ts is not None and (time.time() - ts) < max(900.0, self.smoothing_s)
+
+    def _rain_rate_now(self):
+        return self._get_float(self.rain_rate_sensor) if self.rain_rate_sensor else None
+
+    def _apply_rain(self, contact_on, rate):
+        """Fold the piezo CONTACT and the piezo RATE into one honest "is it raining".
+
+        binary_sensor.gw2000a_rain_state_piezo is not a rain sensor. The WS90's piezo plate
+        reports an impact - a fly, a leaf, a bird, the mount shaking - and HA publishes that
+        as a rain binary. Measured over the 60 days to 2026-08-12: it went ON 375 times for
+        142 h total, and in 298 of those episodes the rain RATE never left 0.0 mm/h AND the
+        rain accumulator never moved a single 0.1 mm tick - zero water. 60 of those phantom
+        onsets happened under more than 200 W/m2 of sunshine, and their median relative
+        humidity was 77% with a 4.1 K dew-point spread, so they are not dew either.
+
+        That matters here because rain is one of the two gloomy triggers: while "raining",
+        family_room's DARK bar goes 2500 -> 5500 lx (gloomy_dark_multiplier) and the
+        dark->bright hold doubles. The other trigger (overcast) already covers a dim sky with
+        the sun above 20 deg, so the phantom's own damage lands BELOW that - mornings,
+        evenings, winter, exactly when the lamps matter. Over those same 60 days it put 7.3 h
+        of daylight across 14 days into DARK, worst 113 min on 2026-06-17 - lamps on in a room
+        the sky was lighting perfectly well, because something tapped the plate.
+
+        The rate sensor is the instrument that actually measures water: it quantises to
+        0.6 mm/h, and every non-zero reading was corroborated by the accumulator. It also
+        catches rain the contact misses - 12.6% of measurable-rate samples arrived while the
+        contact said "off", including 22.2 mm/h on 2026-06-27.
+
+        So: measured rate wins outright, and the contact may only extend an episode that the
+        rate has already confirmed (a real shower's rate dips to 0 mid-episode, and the sky
+        stays wet and grey after the last measurable tick - median 2 min, p90 60 min). An
+        unconfirmed contact is ignored. Confirmation costs ~1 min: across the 77 real
+        episodes the rate crossed the bar a median 1.0 min after the contact closed.
+
+        Replaying THIS function over those 60 days of recorded piezo history: 142.1 h of
+        contact-on becomes 44.4 h of rain, all 77 real episodes survive (none lost), 99.6 h
+        of phantom is dropped, and four short stretches of rate-only rain that the contact
+        never reported at all are gained.
+
+        With no rain_rate_sensor configured this degrades to the old contact-only behaviour.
+        """
+        contact_on = bool(contact_on)
+        if not self.rain_rate_sensor:
+            raining = contact_on
+        else:
+            measurable = rate is not None and rate >= self.rain_rate_min
+            if measurable:
+                self._rain_confirmed = True
+            elif not contact_on:
+                self._rain_confirmed = False
+            raining = measurable or (contact_on and self._rain_confirmed)
+        if self._raining and not raining:
+            self._rain_ended_at = time.time()
+        self._raining = raining
+        self._rain_contact = contact_on
 
     def _rain_active_or_recent(self):
         if self._raining:
@@ -471,10 +537,7 @@ class DarknessCalculator(hass.Hass):
             self._outdoor_ts = time.time()
             self._outdoor_samples.append((time.time(), v))
         if self.rain_sensor:
-            raining = self._get_raw(self.rain_sensor) == "on"
-            if self._raining and not raining:
-                self._rain_ended_at = time.time()
-            self._raining = raining
+            self._apply_rain(self._get_raw(self.rain_sensor) == "on", self._rain_rate_now())
         for zcfg in self.zones.values():
             for s in self._zone_sensor_list(zcfg):
                 val = self._get_float(s)
@@ -521,10 +584,17 @@ class DarknessCalculator(hass.Hass):
         self._debounced_recompute_all()
 
     def _on_rain(self, entity, attribute, old, new, kwargs):
-        raining = new == "on"
-        if self._raining and not raining:
-            self._rain_ended_at = time.time()
-        self._raining = raining
+        self._apply_rain(new == "on", self._rain_rate_now())
+        self._debounced_recompute_all()
+
+    def _on_rain_rate(self, entity, attribute, old, new, kwargs):
+        """A rate tick can confirm (or start) an episode on its own - the contact misses
+        real rain 12.6% of the time, see _apply_rain."""
+        try:
+            rate = float(new)
+        except (TypeError, ValueError):
+            rate = None
+        self._apply_rain(self._get_raw(self.rain_sensor) == "on" if self.rain_sensor else False, rate)
         self._debounced_recompute_all()
 
     def _on_indoor(self, entity, attribute, old, new, kwargs):
@@ -602,6 +672,10 @@ class DarknessCalculator(hass.Hass):
             "outdoor_smoothed_lux": round(out_smooth, 1),
             "outdoor_valid": self._outdoor_valid(),
             "raining": self._raining,
+            # _rain_contact (the raw piezo binary) is deliberately NOT published: it is not in
+            # _publish_one's snapshot key, so it would sit stale for hours on a calm day, and a
+            # diagnostic that lies is worse than none. The contact entity is visible in HA
+            # directly, and the init log names the confirmation rule.
             "rain_recent": self._rain_active_or_recent(),
             "gloomy": gloomy,
             "gloomy_reason": gloomy_why,

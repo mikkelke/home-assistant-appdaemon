@@ -29,6 +29,8 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 class EasterlyWindMonitor(hass.Hass):
     def initialize(self):
         self.wind_dir = self.args.get("wind_direction_entity", "sensor.gw2000a_wind_direction")
+        # Preferred direction source - see _pick_direction. Unset = instantaneous vane only.
+        self.wind_dir_mean = self.args.get("wind_direction_mean_entity")
         self.wind_speed = self.args.get("wind_speed_entity", "sensor.gw2000a_wind_speed")
         self.wind_gust = self.args.get("wind_gust_entity", "sensor.gw2000a_wind_gust")
         self.episode_entity = self.args.get("episode_active_entity", "input_boolean.easterly_wind_episode_active")
@@ -103,6 +105,35 @@ class EasterlyWindMonitor(hass.Hass):
             self._condition_not_met_count = self.end_after_min
             self.run_in(lambda kw: self.create_task(self._maybe_end_episode()), 0)
 
+    @staticmethod
+    def _pick_direction(mean_raw, vane_raw):
+        """(direction_deg, source) from the 10-minute mean, falling back to the vane.
+
+        "Easterly wind" is a statement about the MEAN flow - meteorologically a 10-minute
+        mean - and this app then asks for it to hold across 5 consecutive checks. The
+        instantaneous vane cannot carry that question: over the 60 days to 2026-08-12 it sat
+        a median 26 deg from the station's own 10-minute mean (p90 114 deg), and given it is
+        inside the 60-120 deg band now it is still inside it 4 minutes later only 65% of the
+        time. Because a single out-of-band sample resets _condition_met_count to zero, that
+        jitter silently cancels episodes.
+
+        Measured on the windy months (2026-01-01..2026-03-01), where 89 minutes had the mean
+        easterly-and-windy while the vane knocked the run back to zero: on the vane the app
+        would have raised 4 episodes / 1.0 h, on the mean 6 episodes / 2.2 h. The two extra
+        are real building-load events it never reported - 2026-02-16 11:54-12:36 (42 min) in
+        full, and 2026-02-01's start 14 min late.
+
+        Returns (None, None) when neither reading is usable, so the caller keeps its
+        existing "inconclusive" handling."""
+        for raw, src in ((mean_raw, "mean"), (vane_raw, "vane")):
+            if raw in (None, "unknown", "unavailable"):
+                continue
+            try:
+                return float(raw), src
+            except (TypeError, ValueError):
+                continue
+        return None, None
+
     def _episode_conditions_now(self):
         """Synchronous point-in-time read of the same easterly+windy test _check_conditions
         applies, used ONLY for the init-time rehydration check above (initialize() is not
@@ -111,16 +142,17 @@ class EasterlyWindMonitor(hass.Hass):
         returns; only a DEFINITE calm reading justifies skipping the debounce at restart."""
         try:
             dir_raw = self.get_state(self.wind_dir)
+            mean_raw = self.get_state(self.wind_dir_mean) if self.wind_dir_mean else None
             gust_raw = self.get_state(self.wind_gust)
             speed_raw = self.get_state(self.wind_speed)
         except Exception as e:
             self.log(f"get_state failed during rehydration check: {e}", level="WARNING")
             return None
 
-        if dir_raw in (None, "unknown", "unavailable") or gust_raw in (None, "unknown", "unavailable"):
+        direction, _src = self._pick_direction(mean_raw, dir_raw)
+        if direction is None or gust_raw in (None, "unknown", "unavailable"):
             return None
         try:
-            direction = float(dir_raw)
             gust_ha = float(gust_raw)
         except (TypeError, ValueError):
             return None
@@ -178,13 +210,15 @@ class EasterlyWindMonitor(hass.Hass):
     async def _check_conditions(self, kwargs):
         try:
             dir_raw = await self.get_state(self.wind_dir)
+            mean_raw = await self.get_state(self.wind_dir_mean) if self.wind_dir_mean else None
             gust_raw = await self.get_state(self.wind_gust)
             speed_raw = await self.get_state(self.wind_speed)
         except Exception as e:
             self.log(f"get_state failed: {e}", level="WARNING")
             return
 
-        if dir_raw in (None, "unknown", "unavailable") or gust_raw in (None, "unknown", "unavailable"):
+        direction, _src = self._pick_direction(mean_raw, dir_raw)
+        if direction is None or gust_raw in (None, "unknown", "unavailable"):
             self._condition_not_met_count += 1
             if self._in_episode:
                 await self._maybe_end_episode()
@@ -193,7 +227,6 @@ class EasterlyWindMonitor(hass.Hass):
             return
 
         try:
-            direction = float(dir_raw)
             gust_ha = float(gust_raw)
         except (TypeError, ValueError):
             self._condition_not_met_count += 1

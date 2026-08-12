@@ -28,7 +28,18 @@ darkness_calculator:
 
   # Global signals
   outdoor_sensor: sensor.gw2000a_solar_lux
+  # The piezo "rain state" is an IMPACT detector, not a rain sensor: over the 60 days to
+  # 2026-08-12 it went on 375 times (142 h) and 298 of those episodes produced 0.0 mm/h and
+  # not one 0.1 mm accumulator tick - zero water; 60 of them started under >200 W/m2 of sun.
+  # Rain is a gloomy trigger here (dark bar x2.2, dark->bright hold x2), so those phantoms
+  # put 7.3 h of daylight across 14 days into DARK - all of it below 20 deg sun elevation,
+  # since above that the overcast trigger covers the same minutes. The RATE sensor is what
+  # actually measures water (quantised to 0.6 mm/h, every non-zero reading corroborated by the
+  # accumulator), so the contact only counts once the rate has confirmed the episode - and a
+  # rate tick alone is enough, since the contact misses 12.6% of real rain. See _apply_rain.
   rain_sensor: binary_sensor.gw2000a_rain_state_piezo
+  rain_rate_sensor: sensor.gw2000a_rain_rate_piezo
+  rain_rate_min_mmh: 0.5       # the sensor steps in 0.6 mm/h, so this is "any measurable rain"
   sun_entity: sun.sun
   dusk_elevation: 3.0            # below this sun elevation a zone is always DARK
 
