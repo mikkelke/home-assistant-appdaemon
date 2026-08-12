@@ -74,6 +74,20 @@ except ImportError:
 # and anything importing it from this module, stay unchanged.
 _parse_utc = whist.parse_utc
 
+# Provenance ranking for self.start_time: lower = more trustworthy. entity_last_changed
+# (rank 6) is the weakest signal - after an HA restart erases and recreates the AppDaemon
+# state entity, its last_changed means "we just recreated this", not a real cycle-2 start.
+# Ranking lets that heuristic defer to anything a stronger source already claimed instead of
+# overwriting it every few minutes. See _start_time_rank().
+_START_TIME_SOURCE_RANK = {
+    "door_close_trusted": 1,
+    "live": 2,
+    "durable_store": 3,  # not used yet - reserved for a later step
+    "state_history": 4,
+    "power_history": 5,
+    "entity_last_changed": 6,
+}
+
 
 class WasherMonitor(hass.Hass):
     # Programme profiles loaded from washer_programmes.yaml at startup.
@@ -166,6 +180,12 @@ class WasherMonitor(hass.Hass):
         if dt is None:
             return ""
         return dt.astimezone(self._local_tz()).strftime(fmt)
+
+    def _start_time_rank(self):
+        """Trust rank of self.start_time's current provenance (lower = more trustworthy).
+        Unclaimed provenance (self._start_time_source is None) ranks weakest (99) so existing
+        behaviour is unchanged wherever nothing has claimed it yet."""
+        return _START_TIME_SOURCE_RANK.get(self._start_time_source, 99)
 
     # Strips the degree sign so log output can't hit an encoding error.
     _log_safe = staticmethod(wcls.log_safe)
@@ -323,6 +343,7 @@ class WasherMonitor(hass.Hass):
         # State tracking
         self.program_timer = None
         self.start_time = None
+        self._start_time_source = None  # provenance of self.start_time - see _START_TIME_SOURCE_RANK / _start_time_rank()
         self._cycle_actor = None  # Who started the current cycle - see _attribute() / ActorAttribution app
         self._last_saved_record_ts = None  # ts of the last-saved feedback record - see _patch_cycle_record
         self.energy_start = None
@@ -331,6 +352,7 @@ class WasherMonitor(hass.Hass):
         self.last_state_change = None
         self.last_door_closed_at = None  # Last time door was closed (start time cannot be before this, except AddLoad)
         self.last_door_closed_trusted = False  # True only after a real door close (not stale entity / infer-only)
+        self._entity_recreated_at = None  # UTC; stamped below when HA erased state_entity and we're about to recreate it
         self.door_close_fast_start_window_s = int(self.args.get("door_close_fast_start_window_s", 600))
         self.door_fast_start_armed_until = None  # UTC; armed only after close from Off/Emptied (not Paused)
         self.cooling_period = int(self.args.get("cooling_period", 300))
@@ -555,6 +577,13 @@ class WasherMonitor(hass.Hass):
 
         # Restore previous state
         existing = self.get_state(self.state_entity)
+        if existing in (None, "unknown", "unavailable"):
+            # HA erased this AppDaemon set_state entity (restart) and we're about to recreate
+            # it below (directly, or seeded from ui_state_select). Once recreated, its
+            # last_changed means "AppDaemon recreated this", not a real cycle transition -
+            # stamp the time so later start_time corrections can tell the two apart (see the
+            # _entity_recreated_at guard around the "entity last_changed" heuristic).
+            self._entity_recreated_at = self._now_utc()
         valid_states = ("Running", "Unemptied", "Paused", "Emptied")
         # Only states that carry no cycle clock may be seeded from the mirror. Running/Paused live off
         # cycle_start_time, which lived in the erased sensor's attributes and is gone with it: seeding
@@ -808,13 +837,19 @@ class WasherMonitor(hass.Hass):
                                 )
                             else:
                                 gap_seconds = (last_changed_dt - self.start_time).total_seconds()
-                                if gap_seconds >= self.pause_window_minutes * 60:
+                                # entity_last_changed is the weakest provenance we have (rank 6).
+                                # The wipe grace above catches the restart artifact; this rank gate
+                                # covers the rest - it must never overwrite a clock a stronger
+                                # source already vouched for, above all one restored from the
+                                # durable store (rank 3), which outlives the entity entirely.
+                                if gap_seconds >= self.pause_window_minutes * 60 and self._start_time_rank() >= 6:
                                     self.log(
                                         f"Restore: correcting start_time to entity last_changed (cycle 2) "
                                         f"(was {self._strftime_local(self.start_time)}, now {self._strftime_local(last_changed_dt)})",
                                         level="INFO",
                                     )
                                     self.start_time = last_changed_dt
+                                    self._start_time_source = "entity_last_changed"
                                     self._push_corrected_start_time_to_entity()
         except (TypeError, ValueError, AttributeError):
             pass
@@ -834,6 +869,7 @@ class WasherMonitor(hass.Hass):
                             level="INFO",
                         )
                         self.start_time = inferred
+                        self._start_time_source = "power_history"
                         self._push_corrected_start_time_to_entity()
                         if self.use_energy_detection:
                             self._restore_energy_state_from_history()
@@ -3031,6 +3067,7 @@ class WasherMonitor(hass.Hass):
     def _reset_cycle_tracking(self):
         """Reset all cycle-related tracking variables."""
         self.start_time = None
+        self._start_time_source = None  # must not leak into the next cycle's block C rank gate
         self._cycle_actor = None
         self.energy_start = None
         self._session_cost_kr = 0.0
@@ -3410,6 +3447,8 @@ class WasherMonitor(hass.Hass):
                 attribution_anchor = self.last_door_closed_at
         self._cycle_actor = self._attribute("washer_start", at=attribution_anchor)
         self.start_time = self._now_utc()
+        self._start_time_source = "live"  # directly observed the start - see _START_TIME_SOURCE_RANK
+        self._entity_recreated_at = None  # observed a real start; any earlier recreation stamp is now irrelevant
         # Start time cannot be before the last door close (except in first 10 min AddLoad).
         if (
             self.last_door_closed_trusted
@@ -5411,6 +5450,7 @@ class WasherMonitor(hass.Hass):
                     level="INFO",
                 )
                 self.start_time = last_door
+                self._start_time_source = "door_close_trusted"
                 self._push_corrected_start_time_to_entity()
         # Fallback when last_door_closed_at is missing (e.g. lost during bad recovery): infer from
         # state entity history - when did we first go to Running? That's the cycle start.
@@ -5432,6 +5472,7 @@ class WasherMonitor(hass.Hass):
                     self.start_time = inferred
                     self.last_door_closed_at = inferred
                     self.last_door_closed_trusted = False
+                    self._start_time_source = "state_history"
                     self._push_corrected_start_time_to_entity()
         # Also clamp to last_off_at: never show a start time from before we last went Off (fixes second cycle showing first cycle start).
         try:
@@ -5465,12 +5506,27 @@ class WasherMonitor(hass.Hass):
                     if last_changed_dt and self.start_time < last_changed_dt:
                         gap_seconds = (last_changed_dt - self.start_time).total_seconds()
                         if gap_seconds >= self.pause_window_minutes * 60:
-                            self.log(
-                                f"Correcting start_time to entity last_changed (cycle 2 start) "
-                                f"(was {self._strftime_local(self.start_time)}, now {self._strftime_local(last_changed_dt)})",
-                                level="INFO",
-                            )
-                            self.start_time = last_changed_dt
+                            # After an HA restart erases and recreates state_entity, its
+                            # last_changed is OUR recreation, not a real cycle-2 transition -
+                            # do not let it masquerade as one. Bounded window (not an open-ended
+                            # >=): a genuine cycle-2 start hours after the restart must still
+                            # fall through to the rank gate below, not be silenced forever by a
+                            # stamp that is never cleared on its own.
+                            if (self._entity_recreated_at is not None
+                                    and abs((last_changed_dt - self._entity_recreated_at).total_seconds()) <= 5):
+                                self.log(
+                                    f"Ignoring entity last_changed {self._strftime_local(last_changed_dt)} "
+                                    f"- our own post-restart recreation, not a cycle-2 start",
+                                    level="DEBUG",
+                                )
+                            elif self._start_time_rank() >= 6:
+                                self.log(
+                                    f"Correcting start_time to entity last_changed (cycle 2 start) "
+                                    f"(was {self._strftime_local(self.start_time)}, now {self._strftime_local(last_changed_dt)})",
+                                    level="INFO",
+                                )
+                                self.start_time = last_changed_dt
+                                self._start_time_source = "entity_last_changed"
         except (TypeError, ValueError, AttributeError):
             pass
 
