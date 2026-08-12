@@ -55,6 +55,13 @@ WakeupBedroom:
   # when direct morning sun is hitting the window, today's forecast high is hot, or it's
   # already warm outside right now.
   heat_auto_enable: true
+  # Venting outranks shading (user 2026-08-09): on a night the planner is not calling for AC,
+  # the blind lands on bedroom_cover_target whatever the sun is doing, because the openable
+  # pane is only clear there - a shaded window is a window you cannot open. Applies to the
+  # manual heat_wave force too (which still auto-clears). An unknown/missing plan keeps the
+  # old heat-block behaviour.
+  sleep_plan_entity: sensor.sleep_plan
+  vent_plan_states: ["windows", "nothing"]
   heat_wave_manual_auto_clear: true
   sun_entity: sun.sun
   solar_radiation_entity: sensor.gw2000a_solar_radiation

@@ -29,7 +29,7 @@ NOW = datetime(2026, 7, 20, 6, 15, 0)
 
 
 def make_app(states, *, heat_wave_on=False, heat_auto_enable=True, auto_clear=True,
-             forecast_high=None, forecast_at=None):
+             forecast_high=None, forecast_at=None, sleep_plan=None):
     """WakeupRoutine with just the state _decide_bedroom_wake_target needs, without
     running AppDaemon's initialize()."""
     app = wb.WakeupRoutine.__new__(wb.WakeupRoutine)
@@ -50,10 +50,13 @@ def make_app(states, *, heat_wave_on=False, heat_auto_enable=True, auto_clear=Tr
     app.forecast_max_age_min = 180
     app._forecast_high_c = forecast_high
     app._forecast_high_at = forecast_at
+    app.sleep_plan_entity = "sensor.sleep_plan"
+    app.vent_plan_states = {"windows", "nothing"}
     app.datetime = lambda: NOW
 
     all_states = dict(states)
     all_states[(app.heat_wave_entity, None)] = "on" if heat_wave_on else "off"
+    all_states[(app.sleep_plan_entity, None)] = sleep_plan
     app.get_state = lambda entity, **kw: all_states.get((entity, kw.get("attribute")))
     app.turn_off = MagicMock()
     return app
@@ -293,3 +296,54 @@ class RefreshForecastHigh(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# Sun beating on the ENE window - every automatic heat reason as well as the manual force
+# resolves to the heat-block target on its own.
+SUN_ON_WINDOW = {
+    ("sun.sun", "azimuth"): 70.0,
+    ("sun.sun", "elevation"): 20.0,
+    ("sensor.gw2000a_solar_radiation", None): 600.0,
+    ("sensor.gw2000a_outdoor_temperature", None): 18.0,
+}
+
+
+class VentingBeatsShading(unittest.TestCase):
+    """2026-08-09: the planner said "windows", the wake routine parked the blind at 72 for
+    heat, and the openable pane is only clear at 38 - so the window could not be opened at all,
+    and the sealed dark room kept the lights on until the blind finally moved. Venting is the
+    cooling method actually in use on those nights, so it outranks shading."""
+
+    def test_sun_on_window_yields_to_venting(self):
+        app = make_app(SUN_ON_WINDOW, sleep_plan="windows")
+        target, reason = app._decide_bedroom_wake_target()
+        self.assertEqual(target, 38)
+        self.assertIn("venting tonight", reason)
+        self.assertIn("sun on window", reason)  # the overridden reason is preserved
+
+    def test_manual_force_also_yields_but_still_clears_the_toggle(self):
+        app = make_app(SUN_ON_WINDOW, heat_wave_on=True, sleep_plan="nothing")
+        target, _ = app._decide_bedroom_wake_target()
+        self.assertEqual(target, 38)
+        # The flag must still be consumed, or a stale manual force survives to the next wake.
+        app.turn_off.assert_called_once_with(app.heat_wave_entity)
+
+    def test_ac_night_keeps_shading(self):
+        for plan in ("ac", "hybrid"):
+            with self.subTest(plan=plan):
+                app = make_app(SUN_ON_WINDOW, sleep_plan=plan)
+                self.assertEqual(app._decide_bedroom_wake_target()[0], 72)
+
+    def test_unknown_plan_keeps_shading(self):
+        """No positive venting signal -> old behaviour. A hot sealed room is a worse failure
+        than an un-openable window."""
+        for plan in (None, "unknown", "unavailable", ""):
+            with self.subTest(plan=plan):
+                app = make_app(SUN_ON_WINDOW, sleep_plan=plan)
+                self.assertEqual(app._decide_bedroom_wake_target()[0], 72)
+
+    def test_venting_does_not_disturb_an_already_default_target(self):
+        app = make_app(COOL_NO_SUN, sleep_plan="windows")
+        target, reason = app._decide_bedroom_wake_target()
+        self.assertEqual(target, 38)
+        self.assertNotIn("venting tonight", reason)  # nothing was overridden

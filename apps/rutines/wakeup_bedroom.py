@@ -85,6 +85,16 @@ class WakeupRoutine(hass.Hass):
         # manual FORCE-ON over this decision (see _decide_bedroom_wake_target).
         self.heat_auto_enable = bool(A.get("heat_auto_enable", True))
         self.heat_wave_manual_auto_clear = bool(A.get("heat_wave_manual_auto_clear", True))
+        # Venting beats shading (user 2026-08-09). The openable pane is only clear at
+        # bedroom_cover_target (38); every heat-block position leaves the window physically
+        # unopenable. So when the planner is NOT calling for AC, the blind must land on the
+        # default whatever the sun is doing - shading a room we intend to ventilate trades away
+        # the one cooling method actually in use for the one that is not. Incident 2026-08-09:
+        # plan said "windows", the wake routine parked the blind at 72, the window could not be
+        # opened, and the sealed dark room then also kept the lights on until 08:44.
+        self.sleep_plan_entity = A.get("sleep_plan_entity", "sensor.sleep_plan")
+        raw_vent = A.get("vent_plan_states", ["windows", "nothing"])
+        self.vent_plan_states = {str(s).strip().lower() for s in raw_vent} if isinstance(raw_vent, list) else set()
         self.sun_entity = A.get("sun_entity", "sun.sun")
         self.solar_radiation_entity = A.get("solar_radiation_entity", "sensor.gw2000a_solar_radiation")
         self.window_azimuth = float(A.get("window_azimuth", 70))
@@ -497,7 +507,28 @@ class WakeupRoutine(hass.Hass):
         except Exception as e:
             self.log(f"[wake] forecast refresh failed: {e}", level="WARNING", log=self.user_log)
 
+    def _venting_tonight(self):
+        """True when the sleep planner is NOT calling for AC, i.e. the room is meant to be
+        cooled by opening the window. Unknown/missing plan returns False: without a positive
+        signal the old heat-block behaviour stands, because a hot sealed room is a worse
+        failure than an un-openable one."""
+        try:
+            state = self.get_state(self.sleep_plan_entity)
+        except Exception:
+            return False
+        if state in (None, "", "unknown", "unavailable"):
+            return False
+        return str(state).strip().lower() in self.vent_plan_states
+
     def _decide_bedroom_wake_target(self):
+        target, reason = self._decide_bedroom_wake_target_raw()
+        # Venting overrides every heat reason, including the manual force - the raw decision
+        # still runs first so the manual flag's auto-clear side effect is not skipped.
+        if target != self.bedroom_cover_target and self._venting_tonight():
+            return self.bedroom_cover_target, f"venting tonight, window must open (was: {reason})"
+        return target, reason
+
+    def _decide_bedroom_wake_target_raw(self):
         if self.get_state(self.heat_wave_entity) == "on":
             if self.heat_wave_manual_auto_clear:
                 try: self.turn_off(self.heat_wave_entity)
