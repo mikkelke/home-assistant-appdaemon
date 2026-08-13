@@ -1,12 +1,14 @@
 # /conf/apps/intercom/abb_welcome_bridge.yaml
 #
 # Additive observer for the ABB Welcome integration - missed-call pushes with
-# doorbell snapshots, the ring image archive, and the ABB/ESP ring comparator
-# that gathers the phase-2 (ESP replacement) evidence. READ-ONLY against the
-# ABB device: this app never presses buttons, toggles switches, or touches
-# locks. The ESP intercom app (intercom.yaml) stays authoritative for the
-# doorbell and does NOT depend on this app - if this app dies, the house loses
-# features, never the doorbell.
+# doorbell snapshots, the ring image/clip archive, the announce-after-unlock
+# voice, and the ABB/ESP ring comparator that gathers the phase-2 (ESP
+# replacement) evidence. This app never presses buttons, toggles switches, or
+# touches locks on the ABB device; since 2026-08-13 it DOES use the media
+# capabilities (announce TTS, arm_streaming + camera.record for ring clips),
+# which dial the station but cannot open anything. The ESP intercom app
+# (intercom.yaml) stays authoritative for the doorbell and does NOT depend on
+# this app - if this app dies, the house loses features, never the doorbell.
 
 AbbWelcomeBridge:
   module: abb_welcome_bridge
@@ -66,6 +68,23 @@ AbbWelcomeBridge:
   announce_message: "The door is open."
   announce_cooldown_s: 90
   announce_ring_window_s: 60
+
+  # --- ring video clips (2026-08-13, "thumbnail and opening that give the video") ---
+  # HA's native camera.record against the integration, probe-verified: h264 640x480,
+  # ~450 KB per 10 s, needs arm_streaming first. Announce and record are mutually
+  # exclusive per station (probed live: announce mid-record fails AND kills the
+  # clip's video), so recording starts clip_delay_s after the ring - after any
+  # auto-open announce finished talking - and slips 5 s more if the announce just
+  # spoke. FRONT ONLY, same rule and same verification path as the announce:
+  # recording DIALS the station over SIP, and the back door's unverified built-in
+  # voice might answer that dial audibly. A manual unlock landing mid-recording
+  # loses only the announce (integration refuses it, WARNING in the log) - the
+  # door still opens. Clips prune with their photos (retain_days/max_files).
+  clip_cameras:
+    front door: camera.abb_welcome_gateway_outdoor_station_2_1
+  clip_seconds: 10
+  clip_delay_s: 8
+  clip_record_dir: "/config/www/abb_doorbell"  # archive_dir as HA's container sees it
 
   # --- ring image archive (same exposure model as the vacuum's rober2_maps:
   # /www inside the container = /data/homeassistant/www on the box, served

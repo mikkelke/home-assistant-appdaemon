@@ -98,6 +98,11 @@ def _bare_bridge(tmpdir, clock):
     app.announce_message = "The door is open."
     app.announce_cooldown_s = 90
     app.announce_ring_window_s = 60
+    app.clip_cameras = {"front door": "camera.abb_front"}
+    app.clip_seconds = 10
+    app.clip_delay_s = 8
+    app.clip_record_dir = "/config/www/abb_doorbell"
+    app.station_by_door = {"back door": "100000001", "front door": "100000002"}
     app._state_file = tmp / "abb_welcome_bridge_state.json"
     app.counters = {"rings_both": 0, "rings_esp_only": 0, "rings_abb_only": 0}
     app.lag_stats = {"sum_ms": 0.0, "n": 0, "last_ms": None}
@@ -146,16 +151,21 @@ def _bare_bridge(tmpdir, clock):
 
 
 def _run_scheduled(app, callback_name):
-    """Run (and consume) every captured run_in call bound to the given method."""
+    """Run (and consume) every captured run_in call bound to the given method.
+    Snapshots the pending list first: a callback that re-schedules itself (the
+    clip's announce-collision defer) must land in run_in_calls for a LATER pass,
+    not execute in this one."""
+    pending = app.run_in_calls
+    app.run_in_calls = []
     ran = 0
     remaining = []
-    for callback, delay, kwargs in app.run_in_calls:
+    for callback, delay, kwargs in pending:
         if getattr(callback, "__name__", "") == callback_name:
             callback(kwargs)
             ran += 1
         else:
             remaining.append((callback, delay, kwargs))
-    app.run_in_calls = remaining
+    app.run_in_calls = remaining + app.run_in_calls
     return ran
 
 
@@ -646,3 +656,119 @@ class AnnounceAfterUnlock(unittest.TestCase):
         self.app.call_service = boom
         self.app._on_lock_activity("lock.intercomproxy_front_door", "state", "locked", "unlocking", {})
         self.assertTrue(any("Announce failed" in m for _, m in self.app.logs))
+
+
+class RingClipTests(unittest.TestCase):
+    """Ring video clips (2026-08-13, "thumbnail and opening that give the video"):
+    arm + camera.record at ring+clip_delay_s, never overlapping the announce
+    (probed live: they refuse each other station-side), clip attached to the
+    index entry at episode close only if the mp4 actually landed."""
+
+    def setUp(self):
+        self.clock = Clock(datetime(2026, 8, 13, 10, 0, 0, tzinfo=timezone.utc))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.app = _bare_bridge(self.tmp.name, self.clock)
+
+    def _clip_calls(self):
+        return [c for c in self.app.service_calls
+                if c[0] in ("abb_welcome/arm_streaming", "camera/record")]
+
+    def test_ring_schedules_clip_start(self):
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        scheduled = [(cb.__name__, delay) for cb, delay, _ in self.app.run_in_calls]
+        self.assertIn(("_start_clip", 8), scheduled)
+
+    def test_no_clip_cameras_schedules_nothing(self):
+        self.app.clip_cameras = {}
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        scheduled = [cb.__name__ for cb, _, _ in self.app.run_in_calls]
+        self.assertNotIn("_start_clip", scheduled)
+
+    def test_start_clip_arms_station_then_records(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        self.clock.at += timedelta(seconds=8)
+        _run_scheduled(self.app, "_start_clip")
+        calls = self._clip_calls()
+        self.assertEqual(calls[0][0], "abb_welcome/arm_streaming")
+        self.assertEqual(calls[0][1]["station_id"], "100000002")
+        self.assertEqual(calls[0][1]["duration"], 35)  # clip_seconds + 25 arm margin
+        self.assertEqual(calls[1][0], "camera/record")
+        self.assertEqual(calls[1][1]["entity_id"], "camera.abb_front")
+        self.assertEqual(calls[1][1]["duration"], 10)
+        self.assertTrue(calls[1][1]["filename"].startswith("/config/www/abb_doorbell/abb_clip_"))
+        self.assertTrue(calls[1][1]["filename"].endswith("_front.mp4"))
+        self.assertEqual(episode["clip_filename"], calls[1][1]["filename"].rsplit("/", 1)[1])
+
+    def test_unmapped_door_records_nothing(self):
+        self.app._open_episode("back door", "100000001", self.clock.now())
+        self.clock.at += timedelta(seconds=8)
+        _run_scheduled(self.app, "_start_clip")
+        self.assertEqual(self._clip_calls(), [])
+
+    def test_fresh_announce_defers_recording_once(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        self.clock.at += timedelta(seconds=8)
+        # The announce spoke 3 s ago (auto-open unlock at +5 s): recording now would
+        # collide station-side, so the start slips 5 s instead.
+        self.app._last_announce_at["front door"] = self.clock.at - timedelta(seconds=3)
+        _run_scheduled(self.app, "_start_clip")
+        self.assertEqual(self._clip_calls(), [])
+        retry = [(cb, delay, kw) for cb, delay, kw in self.app.run_in_calls
+                 if cb.__name__ == "_start_clip"]
+        self.assertEqual(len(retry), 1)
+        self.assertEqual(retry[0][1], 5)
+        self.assertTrue(retry[0][2].get("retried"))
+        # The retried run records even though the announce timestamp is still recent.
+        self.clock.at += timedelta(seconds=5)
+        _run_scheduled(self.app, "_start_clip")
+        self.assertEqual(len(self._clip_calls()), 2)
+        self.assertIsNotNone(episode["clip_filename"])
+
+    def test_clip_service_failure_is_logged_never_raised(self):
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        def boom(service, **kwargs):
+            raise RuntimeError("stream in use")
+        self.app.call_service = boom
+        self.clock.at += timedelta(seconds=8)
+        _run_scheduled(self.app, "_start_clip")
+        self.assertTrue(any("Clip start failed" in m for _, m in self.app.logs))
+
+    def test_archive_entry_gains_clip_only_when_file_landed(self):
+        self.app.archive_dir.mkdir(parents=True, exist_ok=True)
+        (self.app.archive_dir / "abb_clip_x_front.mp4").write_bytes(b"mp4data")
+        self.app._archive_write(JPEG, RING_ESP.isoformat(), "100000002", "front door",
+                                "ring_auto_opened", "abb_clip_x_front.mp4")
+        entry = self.app._load_index()[0]
+        self.assertEqual(entry["clip_filename"], "abb_clip_x_front.mp4")
+        self.assertEqual(entry["clip_url"], "/local/abb_doorbell/abb_clip_x_front.mp4")
+        # Missing file: photo-only entry, no clip keys at all.
+        self.app._archive_write(JPEG, (RING_ESP + timedelta(minutes=1)).isoformat(),
+                                "100000002", "front door", "ring", "abb_clip_gone.mp4")
+        entry = self.app._load_index()[0]
+        self.assertNotIn("clip_url", entry)
+        self.assertNotIn("clip_filename", entry)
+
+    def test_empty_clip_turd_is_removed(self):
+        self.app.archive_dir.mkdir(parents=True, exist_ok=True)
+        turd = self.app.archive_dir / "abb_clip_dead_front.mp4"
+        turd.write_bytes(b"")
+        self.app._archive_write(JPEG, RING_ESP.isoformat(), "100000002", "front door",
+                                "ring", "abb_clip_dead_front.mp4")
+        self.assertFalse(turd.exists())
+        self.assertNotIn("clip_url", self.app._load_index()[0])
+
+    def test_prune_removes_clip_with_its_photo(self):
+        self.app.archive_dir.mkdir(parents=True, exist_ok=True)
+        old_ring = RING_ESP - timedelta(days=100)
+        old_entry = bridge_mod.build_index_entry(old_ring, "", "front door", "ring",
+                                                 "old.jpg", "/local/abb_doorbell")
+        old_entry["clip_filename"] = "old_clip.mp4"
+        old_entry["clip_url"] = "/local/abb_doorbell/old_clip.mp4"
+        (self.app.archive_dir / "old.jpg").write_bytes(JPEG)
+        (self.app.archive_dir / "old_clip.mp4").write_bytes(b"mp4data")
+        index_file = self.app.archive_dir / "index.json"
+        index_file.write_text(json.dumps({"version": 1, "updated": "x", "images": [old_entry]}))
+        self.app._archive_write(JPEG, RING_ESP.isoformat(), "100000002", "front door", "ring")
+        self.assertFalse((self.app.archive_dir / "old.jpg").exists())
+        self.assertFalse((self.app.archive_dir / "old_clip.mp4").exists())

@@ -214,6 +214,22 @@ class AbbWelcomeBridge(hass.Hass):
         self.announce_cooldown_s = int(self.args.get("announce_cooldown_s", 90))
         self.announce_ring_window_s = int(self.args.get("announce_ring_window_s", 60))
 
+        # --- ring clip knobs (2026-08-13, "thumbnail and opening that give the video") ---
+        # HA's native camera.record works against the integration's RTSP layer, but ONLY
+        # while arm_streaming is active, and announce/record are mutually exclusive on the
+        # station (probed live 2026-08-13 08:20: announce mid-record raised "an RTSP camera
+        # stream is already in use" AND the recording lost its video). So the clip starts
+        # clip_delay_s after the ring - by then an auto-open announce (unlock at ring+1-2 s,
+        # ~4 s of TTS) has finished talking - and slips once more if the announce just spoke.
+        raw_clip = self.args.get("clip_cameras", {}) or {}
+        self.clip_cameras = {str(k): str(v) for k, v in raw_clip.items()} if isinstance(raw_clip, dict) else {}
+        self.clip_seconds = int(self.args.get("clip_seconds", 10))
+        self.clip_delay_s = int(self.args.get("clip_delay_s", 8))
+        # archive_dir as HA's own container sees it: the record service writes there,
+        # this app (whose /www is the same directory) stats the result at episode close.
+        self.clip_record_dir = str(self.args.get("clip_record_dir", "/config/www/abb_doorbell")).rstrip("/")
+        self.station_by_door = {v: k for k, v in self.station_doors.items()}
+
         # --- archive knobs ---
         self.archive_dir = Path(self.args.get("archive_dir", "/www/abb_doorbell"))
         self.archive_url_prefix = self.args.get("archive_url_prefix", "/local/abb_doorbell")
@@ -421,6 +437,7 @@ class AbbWelcomeBridge(hass.Hass):
             "push_sent": False,
             "scored": False,
             "snapshot": None,  # {"bytes","captured_at","event_id"}
+            "clip_filename": None,  # set by _start_clip once a recording was requested
             "closed": False,
         }
         self.episodes[episode_id] = episode
@@ -428,6 +445,8 @@ class AbbWelcomeBridge(hass.Hass):
             self.run_in(self._pair_check, self.pair_window_s, episode_id=episode_id)
             self.run_in(self._probe_snapshot, self.snapshot_probe_s, episode_id=episode_id)
             self.run_in(self._close_episode, self.episode_close_s, episode_id=episode_id)
+            if self.clip_cameras and self.clip_seconds > 0:
+                self.run_in(self._start_clip, self.clip_delay_s, episode_id=episode_id)
         except Exception as e:
             self.log(f"Episode timers failed for {episode_id}: {e}", level="WARNING")
         return episode
@@ -660,6 +679,49 @@ class AbbWelcomeBridge(hass.Hass):
         except Exception as e:
             self.log(f"Announce failed for {door}: {e}", level="WARNING")
 
+    def _start_clip(self, kwargs):
+        """clip_delay_s after the ring: pull a short mp4 of the visitor via HA's native
+        camera.record (probe-verified 2026-08-13: h264 640x480, needs arm_streaming
+        first). Best-effort by design - the PHOTO is the guaranteed artifact and the
+        clip only ever adds; every failure path is a log line, never a lost photo.
+        Never runs while the announce could still be talking: announce and record
+        refuse each other station-side, so a fresh announcement pushes the recording
+        back once instead of losing both. The reverse race (a manual unlock landing
+        mid-recording) costs only that announce - the door itself still opens."""
+        episode = self.episodes.get(kwargs.get("episode_id"))
+        if episode is None or episode["closed"] or episode.get("clip_filename"):
+            return
+        try:
+            door = episode["door"]
+            camera = self.clip_cameras.get(door)
+            if not camera:
+                return
+            last_spoken = self._last_announce_at.get(door)
+            if (last_spoken is not None and not kwargs.get("retried")
+                    and (self.get_now() - last_spoken).total_seconds() < 8):
+                self.run_in(self._start_clip, 5, episode_id=episode["id"], retried=True)
+                return
+            stamp = episode["started_at"].astimezone().strftime("%Y%m%d_%H%M%S")
+            filename = f"abb_clip_{stamp}_{door_slug(door, episode['station_id'])}.mp4"
+            arm = {"duration": self.clip_seconds + 25}
+            station = episode["station_id"] or self.station_by_door.get(door)
+            if station:
+                # Restrict the armed window to this station so a HomeKit/Scrypted
+                # probe cannot ride it into a call at the other door (schema warning).
+                arm["station_id"] = station
+            self.call_service("abb_welcome/arm_streaming", **arm)
+            self.call_service(
+                "camera/record",
+                entity_id=camera,
+                filename=f"{self.clip_record_dir}/{filename}",
+                duration=self.clip_seconds,
+                lookback=0,
+            )
+            episode["clip_filename"] = filename
+            self.log(f"CLIP-START door={door} file={filename} ({self.clip_seconds}s)")
+        except Exception as e:
+            self.log(f"Clip start failed for {episode.get('id')}: {e}", level="WARNING")
+
     def _send_missed_push(self, door, station_id, ring_at):
         label = door or (f"station {station_id}" if station_id else "door")
         message = f"Someone rang the {label} and nobody answered."
@@ -816,6 +878,7 @@ class AbbWelcomeBridge(hass.Hass):
                     episode["station_id"],
                     episode["door"],
                     event_type,
+                    episode.get("clip_filename"),
                 )
             else:
                 self.log(f"EPISODE-CLOSE id={episode['id']}: no fresh snapshot arrived - nothing archived", level="WARNING")
@@ -844,7 +907,7 @@ class AbbWelcomeBridge(hass.Hass):
             self.log(f"Standalone missed fetch failed: {e}", level="WARNING")
 
     # --- disk layer (executor thread; blocking IO stays off the callback threads) ---
-    def _archive_write(self, raw, ring_iso, station_id, door, event_type):
+    def _archive_write(self, raw, ring_iso, station_id, door, event_type, clip_filename=None):
         try:
             ring_at = parse_iso_ts(ring_iso) or datetime.now(timezone.utc)
             self.archive_dir.mkdir(parents=True, exist_ok=True)
@@ -854,9 +917,28 @@ class AbbWelcomeBridge(hass.Hass):
             tmp = path.with_name(path.name + ".tmp")
             tmp.write_bytes(raw)
             os.replace(tmp, path)
-            self._update_index(build_index_entry(ring_at, station_id, door, event_type,
-                                                 filename, self.archive_url_prefix))
-            self.log(f"ARCHIVE saved {filename} ({len(raw)} bytes)", level="INFO")
+            entry = build_index_entry(ring_at, station_id, door, event_type,
+                                      filename, self.archive_url_prefix)
+            if clip_filename:
+                # The recording was requested at ring+clip_delay_s and runs clip_seconds;
+                # episode close (75 s) is long after HA finalized the mp4, so a single
+                # stat decides. A missing or empty file means the record failed
+                # (e.g. the station delivered no video, seen live 2026-08-13) - the
+                # entry stays photo-only and any 0-byte turd is removed.
+                clip_path = self.archive_dir / clip_filename
+                try:
+                    clip_ok = clip_path.stat().st_size > 0
+                except OSError:
+                    clip_ok = False
+                if clip_ok:
+                    entry["clip_filename"] = clip_filename
+                    entry["clip_url"] = f"{self.archive_url_prefix.rstrip('/')}/{clip_filename}"
+                else:
+                    clip_path.unlink(missing_ok=True)
+                    self.log(f"Clip {clip_filename} never landed - photo-only entry", level="INFO")
+            self._update_index(entry)
+            self.log(f"ARCHIVE saved {filename} ({len(raw)} bytes)"
+                     + (f" + clip {clip_filename}" if entry.get("clip_url") else ""), level="INFO")
         except Exception as e:
             self.log(f"Archive write failed: {e}", level="WARNING")
 
@@ -885,6 +967,8 @@ class AbbWelcomeBridge(hass.Hass):
         for stale in drop:
             try:
                 (self.archive_dir / str(stale.get("filename", ""))).unlink(missing_ok=True)
+                if stale.get("clip_filename"):
+                    (self.archive_dir / str(stale["clip_filename"])).unlink(missing_ok=True)
             except Exception as e:
                 self.log(f"Prune failed for {stale.get('filename')}: {e}", level="DEBUG")
         index_file = self.archive_dir / "index.json"
@@ -900,7 +984,8 @@ class AbbWelcomeBridge(hass.Hass):
 
     def _check_archive_size(self):
         try:
-            total = sum(f.stat().st_size for f in self.archive_dir.glob("abb_ring_*.jpg"))
+            total = sum(f.stat().st_size for f in self.archive_dir.glob("abb_*")
+                        if f.suffix in (".jpg", ".mp4"))
             if total > self.archive_warn_mb * 1024 * 1024:
                 self.log(
                     f"Doorbell archive is {total / 1024 / 1024:.0f} MB "
