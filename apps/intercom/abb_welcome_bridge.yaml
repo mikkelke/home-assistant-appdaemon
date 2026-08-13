@@ -2,13 +2,17 @@
 #
 # Additive observer for the ABB Welcome integration - missed-call pushes with
 # doorbell snapshots, the ring image/clip archive, the announce-after-unlock
-# voice, and the ABB/ESP ring comparator that gathers the phase-2 (ESP
-# replacement) evidence. This app never presses buttons, toggles switches, or
-# touches locks on the ABB device; since 2026-08-13 it DOES use the media
-# capabilities (announce TTS, arm_streaming + camera.record for ring clips),
-# which dial the station but cannot open anything. The ESP intercom app
-# (intercom.yaml) stays authoritative for the doorbell and does NOT depend on
-# this app - if this app dies, the house loses features, never the doorbell.
+# voice, the auto-open-off Open/Reject ring push with door voices, and the
+# ABB/ESP comparators (rings + door-opens) that gather the phase-2 (ESP
+# replacement) evidence. This app never presses buttons or toggles switches on
+# the ABB device. Since 2026-08-13 it DOES use the media capabilities (announce
+# TTS, arm_streaming + camera.record for ring clips), which dial the station
+# but cannot open anything - and it unlocks a door in EXACTLY one case: a human
+# pressed Open on the ring push, executed via the ESP lock entity, the same
+# path as the dashboard's door buttons. Never on its own judgment. The ESP
+# intercom app (intercom.yaml) stays authoritative for the doorbell and does
+# NOT depend on this app - if this app dies, the house loses features, never
+# the doorbell.
 
 AbbWelcomeBridge:
   module: abb_welcome_bridge
@@ -85,6 +89,24 @@ AbbWelcomeBridge:
   clip_seconds: 10
   clip_delay_s: 8
   clip_record_dir: "/config/www/abb_doorbell"  # archive_dir as HA's container sees it
+
+  # --- auto-open-OFF ring fallback (2026-08-13, Mikkel: "The notification if auto
+  # is not on should be with open or reject", door voices for wait/no-answer/reject).
+  # With auto-open ON none of this runs. With it OFF: first ring of an episode ->
+  # actionable push to everyone home (Open buzzes via the ESP lock, same path as the
+  # dashboard buttons; Reject speaks reject_message at the door), the door hears
+  # ring_ack_message ~2 s in, and no_answer_after_s of silence speaks
+  # no_answer_message and withdraws the push. Any unlock (auto, dashboard, push)
+  # kills the pending buttons everywhere so a late press cannot re-buzz. Voices go
+  # only to doors in announce_after_unlock (back door still pending verification);
+  # the push itself works for both doors. Set a message to "" to disable that voice.
+  # The portal's own call-missed push is suppressed for these rings - the house
+  # already saw them, and after a Reject "missed" would be plain wrong.
+  ring_ack_message: "One moment, please."
+  no_answer_message: "Sorry, no one can answer the door right now."
+  reject_message: "Sorry, we cannot open the door right now."
+  no_answer_after_s: 45     # < episode_close_s so the episode is still tracked
+  ring_action_window_s: 180 # Open/Reject pressed later than this is ignored
 
   # --- integration health watchdog (2026-08-13, found live during the feature audit:
   # leaked stream-worker retries from failed camera.record attempts flipped the front

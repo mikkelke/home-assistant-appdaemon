@@ -90,6 +90,7 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 EVENT_RING = "ring"
 EVENT_MISSED = "call-missed"
 EVENT_ANSWERED = "call-answered"
+EVENT_DOOR_OPEN = "door-open"
 
 INDEX_VERSION = 1
 JPEG_MAGIC = b"\xff\xd8"
@@ -261,6 +262,25 @@ class AbbWelcomeBridge(hass.Hass):
         self._self_call_until = {}
         self._ignore_abb_rings_until = None
 
+        # --- auto-open-OFF ring fallback (2026-08-13, user: "The notification if auto
+        # is not on should be with open or reject" + door voices for wait/no-answer/
+        # reject). Policy: with auto-open on, none of this runs - the door opens and
+        # announces as before. With auto-open off, the first ring of an episode sends
+        # everyone home an actionable push (Open / Reject), the door hears a short
+        # acknowledgment, and whichever comes first wins: Open unlocks via the ESP
+        # lock (the SAME path as the dashboard's door buttons - never the ABB button
+        # entities), Reject speaks reject_message, silence for no_answer_after_s
+        # speaks no_answer_message. Any voice knob set to "" disables that voice.
+        self.ring_ack_message = str(self.args.get("ring_ack_message", "One moment, please."))
+        self.no_answer_message = str(self.args.get(
+            "no_answer_message", "Sorry, no one can answer the door right now."))
+        self.reject_message = str(self.args.get(
+            "reject_message", "Sorry, we cannot open the door right now."))
+        self.no_answer_after_s = int(self.args.get("no_answer_after_s", 45))
+        self.ring_action_window_s = int(self.args.get("ring_action_window_s", 180))
+        self.lock_by_door = {v: k for k, v in self.esp_lock_doors.items()}
+        self._pending_actions = {}  # action id -> shared entry (open+reject ids share one)
+
         # --- archive knobs ---
         self.archive_dir = Path(self.args.get("archive_dir", "/www/abb_doorbell"))
         self.archive_url_prefix = self.args.get("archive_url_prefix", "/local/abb_doorbell")
@@ -277,6 +297,9 @@ class AbbWelcomeBridge(hass.Hass):
         self._state_file = Path(__file__).with_name("abb_welcome_bridge_state.json")
         persisted = self._load_state()
         self.counters = persisted.get("counters", {"rings_both": 0, "rings_esp_only": 0, "rings_abb_only": 0})
+        # Door-open comparator keys (2026-08-13) - older state files predate them.
+        for key in ("door_opens_both", "door_opens_abb_only"):
+            self.counters.setdefault(key, 0)
         self.lag_stats = persisted.get("lag", {"sum_ms": 0.0, "n": 0, "last_ms": None})
         self.processed_missed_ids = list(persisted.get("processed_missed_ids", []))[-MAX_PROCESSED_IDS:]
         self.station_door_matrix = persisted.get("station_door_matrix", {})
@@ -315,6 +338,11 @@ class AbbWelcomeBridge(hass.Hass):
                 self.listen_state(self._on_lock_activity, lock_entity)
             except Exception as e:
                 self.log(f"Lock listener failed for {lock_entity}: {e}", level="WARNING")
+
+        try:
+            self.listen_event(self._on_notification_action, "mobile_app_notification_action")
+        except Exception as e:
+            self.log(f"Notification action listener failed: {e}", level="WARNING")
 
         try:
             self.archive_dir.mkdir(parents=True, exist_ok=True)
@@ -425,6 +453,7 @@ class AbbWelcomeBridge(hass.Hass):
         episode = self._match_episode(side_key, door, at)
         if episode is None:
             episode = self._open_episode(door, station_id, at)
+            self._maybe_ring_fallback(episode)
         if episode[side_key] is not None:
             # Same side again while the episode is open: the same visitor bouncing
             # the button (or the ringing-sensor backup echoing the bus event) -
@@ -485,6 +514,9 @@ class AbbWelcomeBridge(hass.Hass):
             "scored": False,
             "snapshot": None,  # {"bytes","captured_at","event_id"}
             "clip_filename": None,  # set by _start_clip once a recording was requested
+            "action_push_sent": False,  # auto-open-off Open/Reject push went out
+            "rejected": False,  # a human pressed Reject on that push
+            "no_answer_spoken": False,  # the door already got the no-answer message
             "closed": False,
         }
         self.episodes[episode_id] = episode
@@ -567,6 +599,8 @@ class AbbWelcomeBridge(hass.Hass):
                     "last_lag_ms": self.lag_stats["last_ms"],
                     "lag_samples": self.lag_stats["n"],
                     "lag_convention": "positive = ABB after ESP",
+                    "door_opens_both": self.counters.get("door_opens_both", 0),
+                    "door_opens_abb_only": self.counters.get("door_opens_abb_only", 0),
                     "station_door_matrix": self.station_door_matrix,
                 },
                 replace=True,
@@ -596,6 +630,17 @@ class AbbWelcomeBridge(hass.Hass):
                         self.log(f"Ignoring call-answered from our own dial ({episode['door']})", level="INFO")
                         return
                     episode["answered"] = True
+            elif event_type == EVENT_DOOR_OPEN:
+                # Door-open comparator: does ABB's portal see the openings the ESP
+                # performs? The ESP unlock always precedes the portal report (it IS
+                # the opener), so pairing against recent unlock evidence at arrival
+                # time is sound. Phase-2 evidence alongside the ring comparator.
+                at = parse_iso_ts(attrs.get("timestamp")) or self.get_now()
+                paired = any(abs((at - t).total_seconds()) <= 45
+                             for t in self.last_unlock_at.values())
+                self.counters["door_opens_both" if paired else "door_opens_abb_only"] += 1
+                self._save_state()
+                self._publish_agreement()
             # ring events also arrive here (poll-lagged); the realtime intake
             # already covers them, and a 7-32 s late duplicate would misread as
             # a re-ring, so they are deliberately NOT registered.
@@ -664,6 +709,15 @@ class AbbWelcomeBridge(hass.Hass):
                     f"event_id={kwargs.get('event_id')}", level="INFO",
                 )
                 return
+            if episode is not None and (episode.get("rejected") or episode.get("action_push_sent")):
+                # The Open/Reject push already put this ring in front of everyone
+                # home - a second "missed" push would be noise, and after a Reject
+                # it would be plain wrong (the house DID answer, with a no).
+                self.log(
+                    f"MISSED-SUPPRESSED door={door or '?'} - handled by the ring push "
+                    f"(rejected={episode.get('rejected')})", level="INFO",
+                )
+                return
             if episode is not None:
                 if episode["push_sent"]:
                     return
@@ -695,6 +749,14 @@ class AbbWelcomeBridge(hass.Hass):
             if new in ("unlocking", "unlocked"):
                 door = self.esp_lock_doors.get(entity, entity)
                 self.last_unlock_at[door] = self.get_now()
+                # The door opened by SOME path (auto-open, dashboard, push action):
+                # a still-pending Open/Reject push is resolved - kill its buttons
+                # everywhere so a late press cannot buzz the door a second time.
+                stale = [aid for aid, e in self._pending_actions.items() if e["door"] == door]
+                for aid in stale:
+                    self._pending_actions.pop(aid, None)
+                if stale:
+                    self._clear_ring_push(door)
                 self._maybe_announce(door)
         except Exception as e:
             self.log(f"Lock activity handling failed: {e}", level="WARNING")
@@ -779,6 +841,162 @@ class AbbWelcomeBridge(hass.Hass):
             self.log(f"CLIP-START door={door} file={filename} ({self.clip_seconds}s)")
         except Exception as e:
             self.log(f"Clip start failed for {episode.get('id')}: {e}", level="WARNING")
+
+    # ------------------------------------------------------------------
+    # Auto-open-OFF ring fallback: Open/Reject push + door voices
+    # ------------------------------------------------------------------
+    def _auto_open_on(self):
+        try:
+            return self.get_state(self.auto_open_entity) == "on"
+        except Exception:
+            return False  # unreadable -> treat as off; the push is the safe default
+
+    def _ring_push_tag(self, door):
+        return f"abb_ring_{door_slug(door, '')}"
+
+    def _maybe_ring_fallback(self, episode):
+        """First ring of a fresh episode with auto-open OFF: everyone home gets an
+        actionable push (Open / Reject), the door hears a short acknowledgment, and
+        whichever comes first resolves it - Open unlocks via the ESP lock (the same
+        path as the dashboard's door buttons, never the ABB button entities), Reject
+        speaks reject_message, sustained silence speaks no_answer_message. Voices go
+        only to doors in announce_cameras (back door pending its voice verification);
+        the push works for both doors either way."""
+        try:
+            door = episode["door"]
+            if not door or self._auto_open_on():
+                return
+            # Only a DELIVERED push may later suppress the missed-call push: with no
+            # notifier the household saw nothing, and the miss must still be a miss.
+            episode["action_push_sent"] = bool(self.mobile_notifier)
+            entry = {
+                "door": door,
+                "episode_id": episode["id"],
+                "until": episode["started_at"] + timedelta(seconds=self.ring_action_window_s),
+                "open_id": f"ABB_RING_OPEN_{episode['id']}",
+                "reject_id": f"ABB_RING_REJECT_{episode['id']}",
+                "consumed": False,
+            }
+            self._pending_actions[entry["open_id"]] = entry
+            self._pending_actions[entry["reject_id"]] = entry
+            if self.mobile_notifier:
+                self.create_task(self.mobile_notifier.notify(
+                    title=f"Someone is ringing the {door}",
+                    message="Auto-open is off - open for them?",
+                    target=self.notify_target,
+                    data={
+                        "tag": self._ring_push_tag(door),
+                        "actions": [
+                            {"action": entry["open_id"], "title": "Open"},
+                            {"action": entry["reject_id"], "title": "Reject"},
+                        ],
+                    },
+                ))
+                self.log(f"RING-PUSH door={door} episode={episode['id']} (auto-open off)", level="INFO")
+            if self.ring_ack_message and self.announce_cameras.get(door):
+                self.run_in(self._ring_ack, 2, episode_id=episode["id"])
+            if self.no_answer_message and self.announce_cameras.get(door):
+                self.run_in(self._ring_no_answer, self.no_answer_after_s, episode_id=episode["id"])
+        except Exception as e:
+            self.log(f"Ring fallback failed for {episode.get('id')}: {e}", level="WARNING")
+
+    def _ring_ack(self, kwargs):
+        """ring+2s: tell the visitor they were heard while the humans decide.
+        Unverified whether the announce dial succeeds while the station is still
+        ringing - _door_voice retries once, and by +8 s the ring hold is over."""
+        episode = self.episodes.get(kwargs.get("episode_id"))
+        if episode is None or episode["closed"] or episode.get("rejected") or episode["answered"]:
+            return
+        if self._unlock_near(episode["door"], episode["started_at"]) is not None:
+            return  # somebody already buzzed them in; the unlock announce speaks
+        if self._auto_open_on():
+            return
+        self._door_voice(episode["door"], self.ring_ack_message)
+
+    def _ring_no_answer(self, kwargs):
+        """no_answer_after_s after the ring: nobody pressed anything, nobody opened,
+        nobody picked up - the door says so and the stale push is cleared."""
+        episode = self.episodes.get(kwargs.get("episode_id"))
+        if episode is None or episode.get("rejected") or episode["answered"]:
+            return
+        if self._unlock_near(episode["door"], episode["started_at"]) is not None:
+            return
+        episode["no_answer_spoken"] = True
+        self._door_voice(episode["door"], self.no_answer_message)
+        self._clear_ring_push(episode["door"])
+
+    def _door_voice(self, door, message, allow_retry=True):
+        """Speak at a door's station, best-effort. Sets the self-call window (the
+        portal logs our dial as call-answered) and the announce timestamp (so a
+        pending clip start defers instead of colliding). One retry, because a live
+        clip recording or the still-ringing call can hold the station."""
+        camera = self.announce_cameras.get(door)
+        if not camera or not message:
+            return
+        now = self.get_now()
+        self._last_announce_at[door] = now
+        self._self_call_until[door] = now + timedelta(seconds=20)
+        try:
+            self.call_service("abb_welcome/announce", entity_id=camera, message=message)
+            self.log(f"DOOR-VOICE door={door} message={message!r}", level="INFO")
+        except Exception as e:
+            if allow_retry:
+                self.log(f"Door voice busy for {door} ({e}) - retrying in 6s", level="INFO")
+                try:
+                    self.run_in(self._door_voice_retry, 6, door=door, message=message)
+                except Exception:
+                    pass
+            else:
+                self.log(f"Door voice failed for {door}: {e}", level="WARNING")
+
+    def _door_voice_retry(self, kwargs):
+        self._door_voice(kwargs.get("door"), kwargs.get("message"), allow_retry=False)
+
+    def _on_notification_action(self, event_name, data, kwargs):
+        try:
+            action = (data or {}).get("action") or ""
+            entry = self._pending_actions.get(action)
+            if entry is None:
+                return
+            # One decision per ring: both buttons die together.
+            self._pending_actions.pop(entry["open_id"], None)
+            self._pending_actions.pop(entry["reject_id"], None)
+            door = entry["door"]
+            if entry["consumed"] or self.get_now() > entry["until"]:
+                self.log(f"RING-ACTION ignored (expired/duplicate) door={door}", level="INFO")
+                return
+            entry["consumed"] = True
+            episode = self.episodes.get(entry["episode_id"])
+            if action == entry["open_id"]:
+                lock = self.lock_by_door.get(door)
+                if lock:
+                    self.log(f"RING-ACTION OPEN door={door} via {lock}", level="INFO")
+                    self.call_service("lock/unlock", entity_id=lock)
+                else:
+                    self.log(f"RING-ACTION OPEN door={door}: no ESP lock mapped", level="WARNING")
+            else:
+                self.log(f"RING-ACTION REJECT door={door}", level="INFO")
+                if episode is not None:
+                    episode["rejected"] = True
+                self._door_voice(door, self.reject_message)
+            self._clear_ring_push(door)
+        except Exception as e:
+            self.log(f"Ring action handling failed: {e}", level="WARNING")
+
+    def _clear_ring_push(self, door):
+        """Withdraw the Open/Reject push from every phone once the ring is resolved
+        (companion convention: message "clear_notification" + the same tag)."""
+        if not self.mobile_notifier or not door:
+            return
+        try:
+            self.create_task(self.mobile_notifier.notify(
+                title="clear",
+                message="clear_notification",
+                target=self.notify_target,
+                data={"tag": self._ring_push_tag(door)},
+            ))
+        except Exception as e:
+            self.log(f"Ring push clear failed: {e}", level="DEBUG")
 
     # ------------------------------------------------------------------
     # Integration health watchdog (self-healing; see the init comment)

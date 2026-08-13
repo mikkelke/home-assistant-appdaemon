@@ -112,8 +112,17 @@ def _bare_bridge(tmpdir, clock):
     app._health_healing = False
     app._self_call_until = {}
     app._ignore_abb_rings_until = None
+    app.ring_ack_message = "One moment, please."
+    app.no_answer_message = "Sorry, no one can answer the door right now."
+    app.reject_message = "Sorry, we cannot open the door right now."
+    app.no_answer_after_s = 45
+    app.ring_action_window_s = 180
+    app.lock_by_door = {"front door": "lock.intercomproxy_front_door",
+                        "back door": "lock.intercomproxy_back_door"}
+    app._pending_actions = {}
     app._state_file = tmp / "abb_welcome_bridge_state.json"
-    app.counters = {"rings_both": 0, "rings_esp_only": 0, "rings_abb_only": 0}
+    app.counters = {"rings_both": 0, "rings_esp_only": 0, "rings_abb_only": 0,
+                    "door_opens_both": 0, "door_opens_abb_only": 0}
     app.lag_stats = {"sum_ms": 0.0, "n": 0, "last_ms": None}
     app.processed_missed_ids = []
     app.station_door_matrix = {}
@@ -239,6 +248,10 @@ class MissedCallTests(unittest.TestCase):
         self.addCleanup(tmpdir.cleanup)
         self.clock = Clock(RING_ABB)
         self.app = _bare_bridge(tmpdir.name, self.clock)
+        # The 14:24 fixture day ran with auto-open ON (that is what answered the
+        # door) - so the auto-open-off ring fallback stays out of these replays,
+        # and the missed push keeps its original role as the auto-open safety net.
+        self.app.states[("input_boolean.auto_open_intercom", None)] = "on"
 
     def _ring_and_missed(self):
         """Replay the 14:24 sequence up to the missed event's arrival."""
@@ -938,3 +951,144 @@ class SelfEvidenceGuardTests(unittest.TestCase):
         self.app._health_tick({})
         self.assertIsNotNone(self.app._ignore_abb_rings_until)
         self.assertEqual((self.app._ignore_abb_rings_until - self.clock.at).total_seconds(), 90)
+
+
+class RingFallbackTests(unittest.TestCase):
+    """Auto-open-OFF fallback (2026-08-13): Open/Reject push, ack voice, no-answer
+    voice, reject voice, and the guarantee that any unlock kills stale buttons."""
+
+    def setUp(self):
+        self.clock = Clock(datetime(2026, 8, 13, 14, 0, 0, tzinfo=timezone.utc))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.app = _bare_bridge(self.tmp.name, self.clock)
+        self.app.states[("input_boolean.auto_open_intercom", None)] = "off"
+
+    def _ring(self, door="front door"):
+        self.app._register_ring("esp", door, "", self.clock.at, "esp:test")
+        return next(iter(self.app.episodes.values()))
+
+    def _announces(self):
+        return [c[1]["message"] for c in self.app.service_calls if c[0] == "abb_welcome/announce"]
+
+    def _entry(self, episode):
+        return self.app._pending_actions[f"ABB_RING_OPEN_{episode['id']}"]
+
+    def _press(self, action_id):
+        self.app._on_notification_action("mobile_app_notification_action", {"action": action_id}, {})
+
+    def test_ring_with_auto_open_off_pushes_open_reject(self):
+        episode = self._ring()
+        self.assertTrue(episode["action_push_sent"])
+        self.assertEqual(len(self.app.pushes), 1)
+        push = self.app.pushes[0]
+        self.assertEqual(push["target"], "home")
+        actions = push["data"]["actions"]
+        self.assertEqual([a["title"] for a in actions], ["Open", "Reject"])
+        self.assertEqual(push["data"]["tag"], "abb_ring_front")
+        scheduled = [cb.__name__ for cb, _, _ in self.app.run_in_calls]
+        self.assertIn("_ring_ack", scheduled)
+        self.assertIn("_ring_no_answer", scheduled)
+
+    def test_ring_with_auto_open_on_stays_quiet(self):
+        self.app.states[("input_boolean.auto_open_intercom", None)] = "on"
+        episode = self._ring()
+        self.assertFalse(episode["action_push_sent"])
+        self.assertEqual(self.app.pushes, [])
+
+    def test_re_ring_folds_without_second_push(self):
+        self._ring()
+        self.clock.at += timedelta(seconds=3)
+        self.app._register_ring("esp", "front door", "", self.clock.at, "esp:test")
+        self.assertEqual(len(self.app.episodes), 1)
+        self.assertEqual(len(self.app.pushes), 1)
+
+    def test_ack_speaks_unless_already_buzzed(self):
+        self._ring()
+        self.clock.at += timedelta(seconds=2)
+        _run_scheduled(self.app, "_ring_ack")
+        self.assertEqual(self._announces(), ["One moment, please."])
+        # Second ring at another time, but the door was already buzzed open.
+        self.app.episodes.clear()
+        self.clock.at += timedelta(seconds=300)
+        self._ring()
+        self.app.last_unlock_at["front door"] = self.clock.at + timedelta(seconds=1)
+        self.clock.at += timedelta(seconds=2)
+        _run_scheduled(self.app, "_ring_ack")
+        self.assertEqual(len(self._announces()), 1)  # no second ack
+
+    def test_open_action_unlocks_via_esp_lock_and_clears(self):
+        episode = self._ring()
+        entry = self._entry(episode)
+        self.clock.at += timedelta(seconds=20)
+        self._press(entry["open_id"])
+        unlocks = [c for c in self.app.service_calls if c[0] == "lock/unlock"]
+        self.assertEqual(unlocks, [("lock/unlock", {"entity_id": "lock.intercomproxy_front_door"})])
+        self.assertEqual(self.app.pushes[-1]["message"], "clear_notification")
+        # The sibling Reject button died with it.
+        self._press(entry["reject_id"])
+        self.assertNotIn("Sorry, we cannot open the door right now.", self._announces())
+
+    def test_reject_action_speaks_and_silences_everything_after(self):
+        episode = self._ring()
+        entry = self._entry(episode)
+        self.clock.at += timedelta(seconds=15)
+        self._press(entry["reject_id"])
+        self.assertTrue(episode["rejected"])
+        self.assertIn("Sorry, we cannot open the door right now.", self._announces())
+        self.assertEqual(self.app.pushes[-1]["message"], "clear_notification")
+        # The no-answer timer fires later and must stay silent.
+        self.clock.at += timedelta(seconds=30)
+        _run_scheduled(self.app, "_ring_no_answer")
+        self.assertNotIn("Sorry, no one can answer the door right now.", self._announces())
+
+    def test_expired_action_is_ignored(self):
+        episode = self._ring()
+        entry = self._entry(episode)
+        self.clock.at += timedelta(seconds=181)
+        self._press(entry["open_id"])
+        self.assertEqual([c for c in self.app.service_calls if c[0] == "lock/unlock"], [])
+
+    def test_no_answer_speaks_and_withdraws_push(self):
+        self._ring()
+        self.clock.at += timedelta(seconds=45)
+        _run_scheduled(self.app, "_ring_no_answer")
+        self.assertIn("Sorry, no one can answer the door right now.", self._announces())
+        self.assertEqual(self.app.pushes[-1]["message"], "clear_notification")
+
+    def test_unlock_by_any_path_kills_pending_buttons(self):
+        episode = self._ring()
+        entry = self._entry(episode)
+        self.clock.at += timedelta(seconds=10)
+        self.app._on_lock_activity("lock.intercomproxy_front_door", "state", "locked", "unlocking", {})
+        self.assertEqual(self.app._pending_actions, {})
+        self.assertEqual(self.app.pushes[-1]["message"], "clear_notification")
+        self._press(entry["open_id"])
+        self.assertEqual([c for c in self.app.service_calls if c[0] == "lock/unlock"], [])
+
+    def test_missed_push_suppressed_when_ring_push_handled_it(self):
+        episode = self._ring()
+        self.clock.at += timedelta(seconds=20)
+        self.app._decide_missed({"episode_id": episode["id"], "event_id": "x",
+                                 "anchor_iso": self.clock.at.isoformat()})
+        missed = [p for p in self.app.pushes if "nobody answered" in str(p.get("message", ""))]
+        self.assertEqual(missed, [])
+        self.assertTrue(any("MISSED-SUPPRESSED" in m for _, m in self.app.logs))
+
+    def test_door_open_comparator_counts(self):
+        # Paired: the ESP unlocked 5 s before the portal reports door-open.
+        self.app.last_unlock_at["front door"] = self.clock.at
+        self.app._on_abb_event("event.abb", "all", None, {"attributes": {
+            "event_type": "door-open",
+            "timestamp": (self.clock.at + timedelta(seconds=5)).isoformat(),
+        }}, {})
+        self.assertEqual(self.app.counters["door_opens_both"], 1)
+        # Unpaired: a portal door-open with no ESP unlock anywhere near.
+        self.app._on_abb_event("event.abb", "all", None, {"attributes": {
+            "event_type": "door-open",
+            "timestamp": (self.clock.at + timedelta(seconds=500)).isoformat(),
+        }}, {})
+        self.assertEqual(self.app.counters["door_opens_abb_only"], 1)
+        published = dict(self.app.published)["sensor.abb_esp_ring_agreement"]
+        self.assertEqual(published["attributes"]["door_opens_both"], 1)
+        self.assertEqual(published["attributes"]["door_opens_abb_only"], 1)
