@@ -20,9 +20,16 @@ WakeupReminder:
   # Door closed = "off", door open = "on"
   bedroom_door_entity: "binary_sensor.bedroom_door_contact"
 
+  # OR-list, exact "on" only - an offline strip can never fake "in bed". The ESPHome
+  # pressure strip (2026-08-13) is an ARM-ONLY witness here like everywhere else:
+  # it can fire the reminder faster than the cloud mats, and the worst it can do
+  # wrong is one harmless push. Withings stays authoritative until
+  # sensor.bed_presence_agreement has ~5 good nights. Mikkel sleeps LEFT, and the
+  # reminder is his - so only the strip's left half joins.
   in_bed_entities:
     - binary_sensor.left_bedside
     - binary_sensor.right_bedside
+    - binary_sensor.bed_presence_6b9c94_bed_occupied_left
 
   # Alarm enabled entity (to check if already enabled)
   alarm_enabled_entity: "input_boolean.wakeup_bedroom"
