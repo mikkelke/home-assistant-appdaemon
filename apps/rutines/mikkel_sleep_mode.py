@@ -142,6 +142,11 @@ class MikkelSleepMode(hass.Hass):
         self.discharging_clear_seconds = int(
             self.args.get("discharging_clear_minutes", 5)
         ) * 60
+        # Fast clear when unplug + out-of-bed agree (seconds, not minutes - just enough
+        # to ride out charging<->discharging flapping during the physical detach).
+        self.discharging_up_clear_seconds = int(
+            self.args.get("discharging_up_clear_seconds", 20)
+        )
         self._out_of_bed_since = None
         self._discharging_since = None
 
@@ -380,14 +385,24 @@ class MikkelSleepMode(hass.Hass):
         else:
             self._out_of_bed_since = None
 
+        # Unplugged AND out of bed is decisively "up for the day" - the two signals
+        # cross-confirm, so only a token debounce applies. The 5-min rule exists for one
+        # case only: a cable popping out while he is STILL IN BED asleep, where an instant
+        # clear would drop DND and let notifications wake him. Keeping the 5-min wait for
+        # the getting-up case meant he beat the automation by hand every morning
+        # (2026-08-13: unplug 06:48:25, HIS thumb killed DND at 06:48:43, our command
+        # arrived uselessly at 06:53:36).
+        discharge_clear_s = (
+            self.discharging_up_clear_seconds if not in_bed else self.discharging_clear_seconds
+        )
         if (
             self._discharging_since is not None
-            and (now - self._discharging_since).total_seconds()
-            >= self.discharging_clear_seconds
+            and (now - self._discharging_since).total_seconds() >= discharge_clear_s
         ):
             self._turn_off_sleep(
                 battery, person, in_bed,
-                f"discharging sustained >={self.discharging_clear_seconds // 60} min",
+                f"discharging sustained >={discharge_clear_s} s"
+                + (" while out of bed" if not in_bed else ""),
             )
         elif (
             self._out_of_bed_since is not None
