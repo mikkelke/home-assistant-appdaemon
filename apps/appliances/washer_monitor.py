@@ -67,6 +67,17 @@ import washer_power as wpow
 import washer_profiles as wp
 import cycle_store as cystore
 
+# Shared save/restore-snapshot/staleness-check plumbing for the on-disk store above - see
+# cycle_persistence.py's module docstring for the split between what it owns and what stays
+# here (boot resolution policy, detection/guard/classification logic). Imported defensively,
+# same shape as dryer_monitor.py's cycle_store import, so it resolves under AppDaemon's loader.
+try:
+    from cycle_persistence import CyclePersistenceMixin
+except ImportError:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from cycle_persistence import CyclePersistenceMixin
+
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -92,7 +103,7 @@ _START_TIME_SOURCE_RANK = {
 }
 
 
-class WasherMonitor(hass.Hass):
+class WasherMonitor(CyclePersistenceMixin, hass.Hass):
     # Programme profiles loaded from washer_programmes.yaml at startup.
     # Programme and temperature are independent dimensions.  For "bomuld",
     # the profile depends on the selected temperature (by_temperature dict).
@@ -212,197 +223,122 @@ class WasherMonitor(hass.Hass):
         except Exception as e:
             self.log(f"ui_state_select sync failed ({sel!r} -> {state_str}): {e}", level="DEBUG")
 
-    def _set_state_entity(self, **kwargs):
-        """Publish to sensor.*_state and sync input_select.* when state changes."""
-        self._maybe_persist_cycle_state(kwargs.get("state"))
-        self.set_state(self.state_entity, **kwargs)
-        st = kwargs.get("state")
-        if st is not None:
-            self._sync_ui_select(st)
+    # _set_state_entity / _save_cycle_state / _build_cycle_store_payload are inherited from
+    # CyclePersistenceMixin - see cycle_persistence.py for the shared mechanism (throttle,
+    # Off-clears only once self.state itself agrees, CycleStore.save() gating). Only what is
+    # genuinely washer-specific is supplied below: the on-disk shape predates that refactor and
+    # differs from the dryer's/dishwasher's in four small, deliberate respects - "" instead of
+    # null for an unset optional field, and state_since/cycle_id living under their own
+    # underscore-prefixed attribute names rather than state_since/cycle_id directly.
+    _cycle_store_empty_value = ""
+    # Unlike the dryer/dishwasher, washer can reach a store write with a PUBLISHED state that
+    # disagrees with self.state (_on_confirm_changed republishes a value read back from HA, not
+    # self.state - see _save_cycle_state's own docstring in the mixin) - an Off publish must
+    # only clear the durable store when self.state is genuinely Off too.
+    _cycle_store_off_requires_live_state = True
 
-    def _maybe_persist_cycle_state(self, state_str):
-        """Store-write hook for _set_state_entity - called before self.set_state() on every
-        publish, so the on-disk copy of an in-progress cycle (see cycle_store.py) survives an
-        HA restart that erases state_entity, taking its attributes (the cycle clock) with it.
+    def _cycle_store_state_since(self):
+        return self._store_state_since
 
-        Self-throttled: _check_energy_finish republishes "Running" every
-        energy_check_interval_s (30s default), and every other tick-driven publish is just as
-        frequent - a disk write on every one of those would be pure waste. A transition (state
-        differs from the last write) or a change in any of the fields below forces an
-        immediate write regardless of the throttle; otherwise a write only happens once
-        store_min_write_interval_s has elapsed since the last one, which doubles as a
-        heartbeat so the on-disk copy is never more than that many seconds stale.
+    def _cycle_store_cycle_id(self):
+        return self._cycle_id
 
-        state_str is the state actually being PUBLISHED (the state= kwarg _set_state_entity
-        received), not self.state - most callers keep the two in lockstep by assigning
-        self.state before publishing, but e.g. _on_confirm_changed republishes
-        state=self.get_state(state_entity) (a value read back from HA, not self.state), which
-        can disagree with self.state (documented AD 4.5.13 stale-get_state behaviour, or the
-        entity being erased at that exact moment). Threaded through to _save_cycle_state /
-        _cycle_store_payload below so the disk record always matches what HA was actually just
-        told, never a stale self.state.
+    def _cycle_store_before_save(self, state, state_changed, now):
+        """state_since is stamped the moment the persisted state STRING changes (never on a
+        change to any of the other trigger fields below), BEFORE the payload is built - so the
+        very save that records a transition also records the correct entry time for it, rather
+        than lagging one save behind (a save right after a transition would otherwise persist
+        the PREVIOUS state's state_since alongside the NEW state)."""
+        if state_changed:
+            self._store_state_since = now
 
-        Off clears the store instead of writing it (see cycle_store.py's module docstring) -
-        a cleared store is the normal steady state between cycles, not an error - but only when
-        self.state itself is also Off: a publish that merely claims Off while self.state still
-        holds a live cycle (the same state_str/self.state disagreement as above) must never
-        destroy that cycle's durable clock.
+    def _cycle_store_trigger_fields(self):
+        """Beyond the state string (always checked), a change to any of these forces an
+        immediate write rather than waiting out store_min_write_interval_s - _check_energy_finish
+        republishes "Running" every energy_check_interval_s (30s default), and every other
+        tick-driven publish is just as frequent, so a disk write on every one of those would be
+        pure waste; these are the fields whose staleness would otherwise matter within that
+        window."""
+        return (
+            lambda: self.start_time,
+            lambda: bool(self.notification_sent),
+            lambda: self.detected_programme,
+            lambda: self.detected_temperature,
+            lambda: self.expected_dur_at_start,
+            lambda: self._guard_bar_class,
+            lambda: bool(self.programme_confirmed_by_user),
+            lambda: self.last_door_closed_at,
+        )
 
-        Wrapped in a broad except so a store failure (or, in tests, a WasherMonitor.__new__
-        fixture that never ran initialize() and so has none of the attributes this touches)
-        can never turn a state publish into a crash - every store interaction is non-fatal.
-        """
+    def _cycle_store_last_off_at(self):
+        # A live read (not a self.* attribute like every other field below) - wrapped in its
+        # own try/except so a failure here can never take the whole payload build down with it.
         try:
-            store = getattr(self, "_cycle_store", None)
-            if store is None:
-                return
-            if state_str is None:
-                state_str = self.state
-            if state_str == "Off":
-                if self.state != "Off":
-                    self._safe_log_store(
-                        f"_set_state_entity published Off but self.state is {self.state!r} - "
-                        f"not clearing the durable store for a live cycle"
-                    )
-                    return
-                store.clear()
-                self._store_last_state = "Off"
-                self._store_last_write_at = self._now_utc()
-                return
-
-            force = (
-                state_str != self._store_last_state
-                or self.start_time != self._store_last_start_time
-                or bool(self.notification_sent) != bool(self._store_last_notification_sent)
-                or self.detected_programme != self._store_last_detected_programme
-                or self.detected_temperature != self._store_last_detected_temperature
-                or self.expected_dur_at_start != self._store_last_expected_dur_at_start
-                or self._guard_bar_class != self._store_last_guard_bar_class
-                or bool(self.programme_confirmed_by_user) != bool(self._store_last_programme_confirmed_by_user)
-                or self.last_door_closed_at != self._store_last_door_closed_at
-            )
-            if not force and self._store_last_write_at is not None:
-                elapsed = (self._now_utc() - self._store_last_write_at).total_seconds()
-                if elapsed < self.store_min_write_interval_s:
-                    return
-            self._save_cycle_state(state_str)
-        except Exception as e:
-            self._safe_log_store(f"Cycle store write hook failed: {e}")
-
-    def _safe_log_store(self, message):
-        # A broken self.log (or a fixture that never set one up) must never escalate a store
-        # problem into a test/app crash - mirrors CycleStore._safe_log's own stance.
-        try:
-            self.log(message, level="WARNING")
+            return self.get_state(self.state_entity, attribute="last_off_at") or ""
         except Exception:
-            pass
+            return ""
 
-    def _cycle_store_payload(self, state_str) -> dict:
-        """Build the on-disk payload for `state_str` (the state actually being published - see
-        _maybe_persist_cycle_state) plus live self.* state for everything else - the single
-        source of truth for both the explicit post-restore save (_save_cycle_state, called once
-        at the end of initialize()'s boot resolution) and the throttled per-publish hook above.
-
-        Deliberately excluded (see the restart-survival work item for the full rationale):
-        last_state_change (the cooling-period clock - None after every restart today, which is
-        what *permits* the first post-restart transition; persisting it would newly let the
-        cooling period swallow a restore-time transition), timer handles, power_readings,
-        energy_buffer (_restore_energy_state_from_history re-derives it), the vibration
-        counters (telemetry-only by contract), and _last_infer_start_attempt (a throttle).
-        The delayed-start machine (_delay_waiting / _delay_plateau_start) is also left out
-        deliberately - see the comment on delayed_start_trimmed below.
-        """
-        last_off_at = None
-        try:
-            last_off_at = self.get_state(self.state_entity, attribute="last_off_at")
-        except Exception:
-            pass
-        actor = self._cycle_actor or {}
+    def _cycle_store_field_map(self):
+        """Non-envelope fields for the on-disk payload - the common envelope (state,
+        state_since, cycle_id, entity_recreated_at) is handled once, in the mixin. Deliberately
+        excludes last_state_change (see cycle_persistence.py's _build_cycle_store_payload for
+        why), timer handles, power_readings, energy_buffer
+        (_restore_energy_state_from_history re-derives it), the vibration counters
+        (telemetry-only by contract), and _last_infer_start_attempt (a throttle). The
+        delayed-start machine (_delay_waiting / _delay_plateau_start) is also left out
+        deliberately - see the comment on delayed_start_trimmed below."""
         return {
-            "state": state_str,
-            "state_since": cystore.format_utc(self._store_state_since) if self._store_state_since else "",
-            "cycle_id": self._cycle_id,
-            "entity_recreated_at": cystore.format_utc(self._entity_recreated_at) if self._entity_recreated_at else "",
-            "start_time": cystore.format_utc(self.start_time) if self.start_time else "",
-            "last_door_closed_at": cystore.format_utc(self.last_door_closed_at) if self.last_door_closed_at else "",
-            "last_door_closed_trusted": bool(self.last_door_closed_trusted),
-            "last_off_at": last_off_at or "",
-            "energy_at_start": self.energy_start,
-            "started_by": actor.get("person") or "",
-            "started_by_method": actor.get("method") or "unknown",
-            "session_cost_kr": self._session_cost_kr,
-            "detected_programme": self.detected_programme,
-            "detected_temperature": self.detected_temperature,
-            "observed_heating": bool(self.observed_heating),
-            "heating_phase_count": self.heating_phase_count,
-            "max_power_seen": self.max_power_seen,
-            "expected_dur_at_start": self.expected_dur_at_start,
-            "expected_dur_key": self._guard_bar_key_str(),
-            "programme_confirmed_by_user": bool(self.programme_confirmed_by_user),
-            "programme_confirmed_by": self.confirmed_by_username or "",
+            "start_time": lambda: cystore.format_utc(self.start_time) if self.start_time else "",
+            "last_door_closed_at": (
+                lambda: cystore.format_utc(self.last_door_closed_at) if self.last_door_closed_at else ""
+            ),
+            "last_door_closed_trusted": lambda: bool(self.last_door_closed_trusted),
+            "last_off_at": self._cycle_store_last_off_at,
+            "energy_at_start": lambda: self.energy_start,
+            "started_by": lambda: (self._cycle_actor or {}).get("person") or "",
+            "started_by_method": lambda: (self._cycle_actor or {}).get("method") or "unknown",
+            "session_cost_kr": lambda: self._session_cost_kr,
+            "detected_programme": lambda: self.detected_programme,
+            "detected_temperature": lambda: self.detected_temperature,
+            "observed_heating": lambda: bool(self.observed_heating),
+            "heating_phase_count": lambda: self.heating_phase_count,
+            "max_power_seen": lambda: self.max_power_seen,
+            "expected_dur_at_start": lambda: self.expected_dur_at_start,
+            "expected_dur_key": lambda: self._guard_bar_key_str(),
+            "programme_confirmed_by_user": lambda: bool(self.programme_confirmed_by_user),
+            "programme_confirmed_by": lambda: self.confirmed_by_username or "",
             # Deliberately deferred: _delay_waiting / _delay_plateau_start interact with
             # _slide_start_for_delayed_start in ways needing separate study - only the
             # already-applied outcome (delayed_start_trimmed) is persisted.
-            "delayed_start_trimmed": bool(self._delayed_start_trimmed),
-            "last_high_energy_at": cystore.format_utc(self.last_high_energy_at) if self.last_high_energy_at else "",
-            "notification_sent": bool(self.notification_sent),
-            "finish_confirmed": bool(self.finish_confirmed),
-            "in_finishing_tail": bool(self.in_finishing_tail),
+            "delayed_start_trimmed": lambda: bool(self._delayed_start_trimmed),
+            "last_high_energy_at": (
+                lambda: cystore.format_utc(self.last_high_energy_at) if self.last_high_energy_at else ""
+            ),
+            "notification_sent": lambda: bool(self.notification_sent),
+            "finish_confirmed": lambda: bool(self.finish_confirmed),
+            "in_finishing_tail": lambda: bool(self.in_finishing_tail),
             "in_finishing_tail_entered_at": (
-                cystore.format_utc(self.in_finishing_tail_entered_at) if self.in_finishing_tail_entered_at else ""
+                lambda: cystore.format_utc(self.in_finishing_tail_entered_at)
+                if self.in_finishing_tail_entered_at else ""
             ),
-            "last_tail_pulse_at": cystore.format_utc(self.last_tail_pulse_at) if self.last_tail_pulse_at else "",
-            "tail_pattern_locked": bool(self.tail_pattern_locked),
-            "tail_pattern_cycle_seconds": self.tail_pattern_cycle_seconds,
+            "last_tail_pulse_at": (
+                lambda: cystore.format_utc(self.last_tail_pulse_at) if self.last_tail_pulse_at else ""
+            ),
+            "tail_pattern_locked": lambda: bool(self.tail_pattern_locked),
+            "tail_pattern_cycle_seconds": lambda: self.tail_pattern_cycle_seconds,
             "tail_pattern_last_pulse_at": (
-                cystore.format_utc(self.tail_pattern_last_pulse_at) if self.tail_pattern_last_pulse_at else ""
+                lambda: cystore.format_utc(self.tail_pattern_last_pulse_at) if self.tail_pattern_last_pulse_at else ""
             ),
-            "tail_pattern_locked_at": cystore.format_utc(self.tail_pattern_locked_at) if self.tail_pattern_locked_at else "",
-            "door_opened_during_cycle": bool(self.door_opened_during_cycle),
+            "tail_pattern_locked_at": (
+                lambda: cystore.format_utc(self.tail_pattern_locked_at) if self.tail_pattern_locked_at else ""
+            ),
+            "door_opened_during_cycle": lambda: bool(self.door_opened_during_cycle),
         }
 
-    def _save_cycle_state(self, state_str=None):
-        """Persist `state_str` (the state actually being published; defaults to self.state,
-        used by the explicit post-restore call below where self.state IS already the
-        fully-resolved boot state) to disk unconditionally (no throttle) and refresh the
-        write-hook's shadow bookkeeping above - but only once the write actually succeeds
-        (CycleStore.save() returns True): a failed write must not be mistaken for an
-        up-to-date one and left unretried for up to store_min_write_interval_s.
-
-        state_since is stamped BEFORE the payload is built (not after saving), so the very
-        save that records a transition also records the correct entry time for it, rather
-        than lagging one save behind (a save right after a transition would otherwise persist
-        the PREVIOUS state's state_since alongside the NEW state).
-
-        Called once right after initialize() finishes restoring a Running/Paused cycle - the
-        very first _set_state_entity publish during boot happens before _restore_running_state
-        has populated energy/programme/etc., so relying on that publish's own (correctly
-        throttled) write would leave an incomplete snapshot on disk until the next natural
-        tick; this makes it complete immediately. Also used by the throttled hook once it has
-        decided a write is due.
-        """
-        if state_str is None:
-            state_str = self.state
-        now = self._now_utc()
-        if state_str != self._store_last_state:
-            self._store_state_since = now
-        try:
-            saved = self._cycle_store.save(self._cycle_store_payload(state_str))
-        except Exception as e:
-            self._safe_log_store(f"Could not save cycle state to disk: {e}")
-            saved = False
-        if not saved:
-            return
-        self._store_last_write_at = now
-        self._store_last_state = state_str
-        self._store_last_start_time = self.start_time
-        self._store_last_notification_sent = bool(self.notification_sent)
-        self._store_last_detected_programme = self.detected_programme
-        self._store_last_detected_temperature = self.detected_temperature
-        self._store_last_expected_dur_at_start = self.expected_dur_at_start
-        self._store_last_guard_bar_class = self._guard_bar_class
-        self._store_last_programme_confirmed_by_user = bool(self.programme_confirmed_by_user)
-        self._store_last_door_closed_at = self.last_door_closed_at
+    def _cycle_store_payload(self, state_str) -> dict:
+        """Historical name, kept as a thin alias so existing references (including this test
+        suite's own comments) keep resolving - see _build_cycle_store_payload (mixin)."""
+        return self._build_cycle_store_payload(state_str)
 
     def _push_corrected_start_time_to_entity(self):
         """Push current self.start_time to the state entity (cycle_start_time, cycle_start_time_local, started_at_display). Preserves other attributes."""
@@ -770,12 +706,13 @@ class WasherMonitor(hass.Hass):
         # on every HA core restart, taking the cycle clock in its attributes with it; this
         # on-disk shadow copy survives that (see cycle_store.py's module docstring). Filename
         # MUST end in _state.json - .gitignore excludes *_state.json and deploy.sh only rsyncs
-        # git-tracked files, so a runtime cycle-state file can never become tracked.
-        store_path = self.args.get("state_file") or Path(__file__).with_name("washer_cycle_state.json")
-        self._cycle_store = cystore.CycleStore(store_path, "washer", log=self.log)
-        # How long a store write may be throttled before we force one anyway (heartbeat) - see
-        # _maybe_persist_cycle_state.
-        self.store_min_write_interval_s = int(self.args.get("store_min_write_interval_s", 300))
+        # git-tracked files, so a runtime cycle-state file can never become tracked. See
+        # cycle_persistence.py's _init_cycle_store for why the default path is built here, not
+        # there.
+        self._init_cycle_store(
+            appliance="washer",
+            default_path=Path(__file__).with_name("washer_cycle_state.json"),
+        )
         # Reject a stored Running/Paused whose save is older than this - AppDaemon (or the box)
         # was down long enough that trusting a frozen clock is riskier than the normal
         # power-based re-detection (see the boot-resolution staleness check below).
@@ -785,25 +722,18 @@ class WasherMonitor(hass.Hass):
         # minutes ahead of "now" is tolerated; anything further ahead is rejected outright.
         self.store_future_skew_minutes = float(self.args.get("store_future_skew_minutes", 5))
         self._cycle_id = None  # uuid4, minted below/in _begin_running_cycle - notification_sent's own scoping is on _start_time_source == "durable_store", see _finalize_restored_cycle_identity
-        # Store-write throttle bookkeeping (see _maybe_persist_cycle_state) - shadow copies of
-        # the fields last written to disk, so a routine 30s republish with nothing semantically
-        # new does not hammer the disk, while any of these listed changes still writes
-        # immediately. _store_state_since is deliberately its own field, not last_state_change -
-        # see _cycle_store_payload's docstring for why last_state_change itself is never persisted.
-        self._store_last_write_at = None
-        self._store_last_state = None
+        # state_since for the durable store - deliberately its own field, not last_state_change -
+        # see cycle_persistence.py's _build_cycle_store_payload for why last_state_change itself
+        # is never persisted.
         self._store_state_since = None
-        self._store_last_start_time = None
-        self._store_last_notification_sent = None
-        self._store_last_detected_programme = None
-        self._store_last_detected_temperature = None
-        self._store_last_expected_dur_at_start = None
-        self._store_last_guard_bar_class = None
-        self._store_last_programme_confirmed_by_user = None
-        self._store_last_door_closed_at = None
 
-        # Restore previous state
-        existing = self.get_state(self.state_entity)                                          # A
+        # Restore previous state. Read the entity's bare state, its full attribute snapshot,
+        # and the on-disk store ALL ONCE, here, before any write - _set_state_entity below is
+        # the first write this boot, and on 2026-07-27 a restore read the entity back AFTER
+        # that write had already recreated it with no attributes, so cycle_start_time read back
+        # as None forever - see cycle_persistence.py's _capture_cycle_store_boot_snapshot.
+        existing, boot_full, store_data = self._capture_cycle_store_boot_snapshot()            # A/B/C
+        boot_full = boot_full or {}
         entity_missing = existing in (None, "unknown", "unavailable")
         if entity_missing:
             # HA erased this AppDaemon set_state entity (restart) and we're about to recreate
@@ -813,20 +743,8 @@ class WasherMonitor(hass.Hass):
             # apart (see the _entity_recreated_at guard around the "entity last_changed"
             # heuristic).
             self._entity_recreated_at = self._now_utc()
-        # Single snapshot of the entity's attributes (+ last_changed/last_updated), taken ONCE,
-        # before the first _set_state_entity call below. 2026-07-27 shipped a version that
-        # recreated this (now erased) entity with empty attributes and THEN read
-        # cycle_start_time back from that same just-created entity - every read below must come
-        # from this snapshot (or the durable store), never a fresh get_state call, until every
-        # write for this boot is done.
-        boot_full = self.get_state(self.state_entity, attribute="all") or {}                   # B
         boot_attrs = dict(boot_full.get("attributes") or {})
         boot_last_changed = boot_full.get("last_changed") or boot_full.get("last_updated")
-        try:
-            store_data = self._cycle_store.load()                                              # C
-        except Exception as e:
-            self.log(f"CycleStore load raised unexpectedly: {e} - ignoring store", level="WARNING")
-            store_data = None
 
         valid_states = ("Running", "Unemptied", "Paused", "Emptied")
         entity_trusted = existing in valid_states
@@ -975,17 +893,18 @@ class WasherMonitor(hass.Hass):
             restore_attrs["cycle_start_time_local"] = self._format_local(self.start_time)
             restore_attrs["started_at_display"] = self.start_time.astimezone(self._local_tz()).strftime("%H:%M")
 
-        # Restore _store_state_since (see _cycle_store_payload's docstring) so it survives
-        # multiple consecutive restarts instead of resetting to "now" every boot: prefer the
-        # entity's own last_changed when it is itself live (AD-only reload - boot_last_changed
-        # is always None after a HA-restart erasure, so this is meaningless there), else the
-        # store's own state_since when THIS boot's resolution actually came from the store
-        # (store_used - never from an unrelated store record that lost out to the mirror or was
-        # rejected as stale). Only when a real value is found is _store_last_state also set to
-        # the resolved self.state, so the imminent first write below does not mistake this
-        # restart for a fresh transition and re-stamp state_since to "now" anyway; when nothing
-        # restorable is found, _store_last_state is left alone and that first write's own
-        # "now" stamp (the pre-existing behaviour) stands, same as it always has.
+        # Restore _store_state_since (see the mixin's _build_cycle_store_payload docstring) so
+        # it survives multiple consecutive restarts instead of resetting to "now" every boot:
+        # prefer the entity's own last_changed when it is itself live (AD-only reload -
+        # boot_last_changed is always None after a HA-restart erasure, so this is meaningless
+        # there), else the store's own state_since when THIS boot's resolution actually came
+        # from the store (store_used - never from an unrelated store record that lost out to
+        # the mirror or was rejected as stale). Only when a real value is found is
+        # _store_last_written_state also set to the resolved self.state, so the imminent first
+        # write below does not mistake this restart for a fresh transition and re-stamp
+        # state_since to "now" anyway (see _cycle_store_before_save); when nothing restorable is
+        # found, _store_last_written_state is left alone and that first write's own "now" stamp
+        # (the pre-existing behaviour) stands, same as it always has.
         if self.state != "Off":
             restored_since = None
             if entity_trusted and boot_last_changed:
@@ -994,7 +913,7 @@ class WasherMonitor(hass.Hass):
                 restored_since = cystore.parse_utc(store_data.get("state_since"))
             if restored_since is not None:
                 self._store_state_since = restored_since
-                self._store_last_state = self.state
+                self._store_last_written_state = self.state
 
         # Only publish when state differs. Re-sending the same state can strip attributes on
         # some HA/AppDaemon setups. (seeded_from_helper/store_used always publish: the state
@@ -1029,7 +948,12 @@ class WasherMonitor(hass.Hass):
                 self._transition_to_off("Restore: lost start_time during restore", force=True)
             else:
                 self._finalize_restored_cycle_identity(store_data if store_used else None)
-                self._save_cycle_state()                                                        # J
+                # force=True: unconditional, matching this call's original always-write
+                # behaviour (see the mixin's _save_cycle_state) - the FIRST write this boot (a
+                # few lines up) necessarily persisted a snapshot from before this restore
+                # dispatch populated start_time/energy_start/etc, so this makes the on-disk
+                # payload complete immediately rather than waiting for a naturally-throttled one.
+                self._save_cycle_state(force=True)                                              # J
         elif self.state == "Unemptied":
             # Restart door-recheck and watchdog timers so we don't get stuck in Unemptied after
             # an app reload (the timers are not persisted across restarts).
@@ -1055,6 +979,13 @@ class WasherMonitor(hass.Hass):
                     self._emptied_watchdog_timeout,
                     int(self.emptied_timeout_minutes * 60),
                 )
+
+        # Boot-only snapshot: drop it now so any future call to a restore-flavoured helper
+        # falls back to a live read instead of replaying this boot's stale snapshot - see
+        # cycle_persistence.py's _boot_full_state_snapshot. Nothing in this file currently
+        # reads it back (unlike dishwasher_monitor.py's _handle_force_emptied), but dropping it
+        # here keeps that guarantee mechanical rather than incidental for this monitor too.
+        self._drop_cycle_store_boot_snapshot()
 
         # Listen for events
         self.listen_state(self._handle_unavailable, self.state_entity, new="unavailable")
@@ -1135,49 +1066,31 @@ class WasherMonitor(hass.Hass):
         else - missing, some other state (Unemptied/Emptied/Off - out of scope here; a
         store-only Unemptied/Emptied is instead resolved by a sibling branch in initialize(),
         since neither needs a clock), an unparsable clock, a start_time implausibly in the
-        future (see below), or stale by either downtime measure below. Each rejection logs
+        future, or stale by either downtime measure - see
+        cycle_persistence.py's _cycle_store_validate_running_candidate, which does the actual
+        staleness/future-clock check shared with the dryer and dishwasher. Each rejection logs
         exactly one WARNING. Never raises.
         """
         if not store_data or store_data.get("state") not in ("Running", "Paused"):
             return None, None
         state = store_data.get("state")
         start_time = cystore.parse_utc(store_data.get("start_time"))
-        if start_time is None:
-            self.log(f"Boot: durable store has {state} with no usable start_time - ignoring", level="WARNING")
-            return None, None
         now = self._now_utc()
-        age_hours = (now - start_time).total_seconds() / 3600
-        if age_hours < -(self.store_future_skew_minutes / 60):
-            # A start_time after "now" (beyond a small skew allowance) is not just stale, it is
-            # impossible - most likely the box's clock was behind real time when this was saved
-            # (NTP not yet synced at boot). Trusting it would restore Running with every
-            # duration guard comparing against a negative run length, which can never pass -
-            # a permanently wedged Running that this rejection avoids the same way the "too old"
-            # rejection below avoids a genuinely-stuck one.
-            self.log(
-                f"Boot: durable store's {state} start_time is "
-                f"{abs(age_hours) * 60:.0f}min in the future (box clock behind real time at "
-                f"save time?) - ignoring, falling through",
-                level="WARNING",
-            )
-            return None, None
-        if age_hours > self.max_running_hours:
-            self.log(
-                f"Boot: durable store's {state} start_time is {age_hours:.1f}h old (> "
-                f"max_running_hours {self.max_running_hours:.0f}h) - ignoring, falling through",
-                level="WARNING",
-            )
-            return None, None
         saved_at = cystore.parse_utc(store_data.get("saved_at"))
-        if saved_at is not None:
-            downtime_hours = (now - saved_at).total_seconds() / 3600
-            if downtime_hours > self.store_max_downtime_hours:
-                self.log(
-                    f"Boot: durable store was last saved {downtime_hours:.1f}h ago (> "
-                    f"store_max_downtime_hours {self.store_max_downtime_hours:.0f}h) - ignoring",
-                    level="WARNING",
-                )
-                return None, None
+        ok = self._cycle_store_validate_running_candidate(
+            state=state,
+            start_time=start_time,
+            saved_at=saved_at,
+            now=now,
+            # store_future_skew_minutes (not boot_future_start_skew_s, dryer/dishwasher's own
+            # arg name/unit) - a real difference in tolerance (5min default here vs. 60s there),
+            # not just spelling, so converted to seconds here rather than normalised away.
+            future_skew_s=self.store_future_skew_minutes * 60,
+            max_running_hours=self.max_running_hours,
+            max_downtime_hours=self.store_max_downtime_hours,
+        )
+        if not ok:
+            return None, None
         return state, start_time
 
     def _infer_boot_start_time_from_history(self):
