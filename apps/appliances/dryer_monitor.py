@@ -297,12 +297,20 @@ class DryerMonitor(hass.Hass):
         # Cycle identity / observability - part of the on-disk store's "common envelope" (see
         # _build_cycle_store_payload). cycle_id is minted fresh only when a NEW Running cycle
         # begins (_confirm_running); restoring a cycle always carries forward whatever value the
-        # store/entity already had, never mints a new one. Diagnostic only, currently: nothing
-        # reads it back to gate a decision (notification_sent is restored and trusted on its
-        # own, not scoped to a matching cycle_id) - it exists so a human correlating log lines /
-        # feedback records / the on-disk store across a restart can tell "same physical cycle"
-        # from "a new one started right after."
+        # store/entity already had, never mints a new one. Originally diagnostic only (nothing
+        # read it back to gate a decision); as of the 2026-08-12 finish_uld duplicate-feedback
+        # fix it is ALSO the key for _save_cycle_feedback's per-cycle duplicate guard just below -
+        # a human correlating log lines / feedback records / the on-disk store across a restart
+        # can still tell "same physical cycle" from "a new one started right after" from it too.
         self.cycle_id = None
+        # Guard for _save_cycle_feedback: the cycle_id (above) that most recently had a feedback
+        # record written for it, so a second write for the SAME cycle is refused even if some
+        # call site forgets to gate on _transition_to_unemptied's return value (defence in depth
+        # - the primary fix is that gate; see _transition_to_unemptied's docstring for the bug
+        # this backstops). Reset alongside cycle_id itself, in _confirm_running, when a genuinely
+        # new cycle begins - deliberately never touched by _reset_cycle_tracking, matching
+        # cycle_id's own lifecycle (both carry forward, unreset, across a transition to Off).
+        self._feedback_saved_cycle_id = None
         self._entity_recreated_at = None
 
         # Durable on-disk shadow of this cycle's state - survives what sensor.dryer_state
@@ -654,21 +662,22 @@ class DryerMonitor(hass.Hass):
                                 if duration_source and run_minutes_wall > run_minutes else None
                             )
                             energy_kwh = self._get_energy_used()
-                            self._transition_to_unemptied(
+                            became_unemptied = self._transition_to_unemptied(
                                 skip_announce=False, run_minutes=run_minutes, energy_used=energy_kwh
                             )
-                            confirmed, is_human = self._get_confirmed_from_selector(prog)
-                            self._save_cycle_feedback(
-                                predicted=prog,
-                                confirmed=confirmed,
-                                duration_min=run_minutes,
-                                energy_kwh=energy_kwh,
-                                max_power_w=self.max_power_w,
-                                programme_confirmed_by_human=is_human,
-                                duration_source=duration_source,
-                                end_reason="boot_self_heal",
-                                idle_min=idle_min,
-                            )
+                            if became_unemptied:
+                                confirmed, is_human = self._get_confirmed_from_selector(prog)
+                                self._save_cycle_feedback(
+                                    predicted=prog,
+                                    confirmed=confirmed,
+                                    duration_min=run_minutes,
+                                    energy_kwh=energy_kwh,
+                                    max_power_w=self.max_power_w,
+                                    programme_confirmed_by_human=is_human,
+                                    duration_source=duration_source,
+                                    end_reason="boot_self_heal",
+                                    idle_min=idle_min,
+                                )
                 except Exception as e:
                     self.log(f"Boot self-heal check failed: {e}", level="DEBUG")
 
@@ -1410,7 +1419,28 @@ class DryerMonitor(hass.Hass):
         end_reason: str | None = None,
         idle_min: float | None = None,
     ):
-        """Append one cycle record to dryer_feedback.json."""
+        """Append one cycle record to dryer_feedback.json.
+
+        Defence in depth (2026-08-12 finish_uld duplicate-feedback bug): every call site already
+        gates this call on _transition_to_unemptied's return value, but this second, independent
+        check refuses a second save for the SAME cycle_id even if some future call site forgets
+        that gate. cycle_id is minted fresh only when a new Running cycle actually begins
+        (_confirm_running) and otherwise carried forward untouched - see its own comment - so
+        equality here means "this exact physical cycle already has a record."
+        """
+        # getattr, not a direct attribute read: some callers - this repo's own lighter-weight
+        # test harnesses among them (test_dryer_pause_exit.py's make_app never runs the real
+        # initialize()) - construct a DryerMonitor with cycle_id never set at all. Falling back
+        # to None there just degrades to "no guard" for that instance, exactly how every call
+        # site behaved before this fix existed - never a new way for this method to raise.
+        current_cycle_id = getattr(self, "cycle_id", None)
+        if current_cycle_id is not None and current_cycle_id == getattr(self, "_feedback_saved_cycle_id", None):
+            self.log(
+                f"Duplicate _save_cycle_feedback refused for cycle_id {current_cycle_id} - a "
+                f"record was already saved for this cycle",
+                level="DEBUG",
+            )
+            return
         import json
         record = {
             "ts": self._format_local(self._now_utc()),
@@ -1442,6 +1472,7 @@ class DryerMonitor(hass.Hass):
         except Exception as e:
             self.log(f"Could not write feedback {self.feedback_file}: {e}", level="WARNING")
             return
+        self._feedback_saved_cycle_id = current_cycle_id  # mark this cycle done - see the guard above
         if programme_confirmed_by_human:
             prev = self._learned_durations.get(confirmed, {"n": 0, "avg": duration_min})
             n_new = prev["n"] + 1
@@ -1516,19 +1547,20 @@ class DryerMonitor(hass.Hass):
                         run_minutes, duration_source = self._correct_duration(run_minutes_wall, log_prefix="Door-open ")
                         idle_min = run_minutes_wall - run_minutes if duration_source and run_minutes_wall > run_minutes else None
                         energy_kwh = self._get_energy_used()
-                        self._transition_to_unemptied(skip_announce=True, run_minutes=run_minutes, energy_used=energy_kwh)
-                        confirmed, is_human = self._get_confirmed_from_selector(prog)
-                        self._save_cycle_feedback(
-                            predicted=prog,
-                            confirmed=confirmed,
-                            duration_min=run_minutes,
-                            energy_kwh=energy_kwh,
-                            max_power_w=self.max_power_w,
-                            programme_confirmed_by_human=is_human,
-                            duration_source=duration_source,
-                            end_reason="door_opened_first",
-                            idle_min=idle_min,
-                        )
+                        became_unemptied = self._transition_to_unemptied(skip_announce=True, run_minutes=run_minutes, energy_used=energy_kwh)
+                        if became_unemptied:
+                            confirmed, is_human = self._get_confirmed_from_selector(prog)
+                            self._save_cycle_feedback(
+                                predicted=prog,
+                                confirmed=confirmed,
+                                duration_min=run_minutes,
+                                energy_kwh=energy_kwh,
+                                max_power_w=self.max_power_w,
+                                programme_confirmed_by_human=is_human,
+                                duration_source=duration_source,
+                                end_reason="door_opened_first",
+                                idle_min=idle_min,
+                            )
                         self._transition_to_emptied("Door opened after cycle complete - emptying")
             else:
                 # Power is HIGH - user is checking laundry mid-cycle
@@ -1577,7 +1609,12 @@ class DryerMonitor(hass.Hass):
             self.door_fast_start_armed_until = now + timedelta(seconds=self.door_close_fast_start_window_s)
 
     def _transition_to_paused(self):
-        """Transition to Paused state when door opens during Running with high power."""
+        """Transition to Paused state when door opens during Running with high power.
+
+        Returns True/False from _should_change_state - same silent-refusal shape as
+        _transition_to_unemptied (see its docstring for why that return value matters there);
+        no caller here currently needs it.
+        """
         if self._should_change_state("Paused"):
             self.state = "Paused"
             # keep_fresh_detected silently drops from published attributes whenever it's False
@@ -1599,6 +1636,8 @@ class DryerMonitor(hass.Hass):
                 self._pause_timeout,
                 self.pause_timeout_minutes * 60
             )
+            return True
+        return False
 
     def _pause_timeout(self, kwargs):
         """Called when door has been open for too long during a pause."""
@@ -1646,7 +1685,12 @@ class DryerMonitor(hass.Hass):
             )
 
     def _transition_to_running_from_pause(self, force=False):
-        """Resume Running state after pause."""
+        """Resume Running state after pause.
+
+        Returns True/False from _should_change_state - same silent-refusal shape as
+        _transition_to_unemptied (see its docstring for why that return value matters there);
+        no caller here currently needs it.
+        """
         if self._should_change_state("Running", force=force):
             self.state = "Running"
             self._set_state_entity( state="Running")
@@ -1655,6 +1699,8 @@ class DryerMonitor(hass.Hass):
 
             if not self.poll_timer:
                 self.poll_timer = self.run_in(self._poll_power, 60)
+            return True
+        return False
 
     def _evaluate_pause_exit(self, force=False):
         """Determine whether to go to Unemptied or Off when exiting Paused state."""
@@ -1664,19 +1710,20 @@ class DryerMonitor(hass.Hass):
             idle_min = run_minutes_wall - run_minutes if duration_source and run_minutes_wall > run_minutes else None
             energy_kwh = self._get_energy_used()
             prog = self._classify_programme()
-            self._transition_to_unemptied(skip_announce=False, run_minutes=run_minutes, energy_used=energy_kwh, force=force)
-            confirmed, is_human = self._get_confirmed_from_selector(prog)
-            self._save_cycle_feedback(
-                predicted=prog,
-                confirmed=confirmed,
-                duration_min=run_minutes,
-                energy_kwh=energy_kwh,
-                max_power_w=self.max_power_w,
-                programme_confirmed_by_human=is_human,
-                duration_source=duration_source,
-                end_reason="low_power_detected",
-                idle_min=idle_min,
-            )
+            became_unemptied = self._transition_to_unemptied(skip_announce=False, run_minutes=run_minutes, energy_used=energy_kwh, force=force)
+            if became_unemptied:
+                confirmed, is_human = self._get_confirmed_from_selector(prog)
+                self._save_cycle_feedback(
+                    predicted=prog,
+                    confirmed=confirmed,
+                    duration_min=run_minutes,
+                    energy_kwh=energy_kwh,
+                    max_power_w=self.max_power_w,
+                    programme_confirmed_by_human=is_human,
+                    duration_source=duration_source,
+                    end_reason="low_power_detected",
+                    idle_min=idle_min,
+                )
         else:
             self._transition_to_off("Cycle interrupted or incomplete", force=force)
 
@@ -1710,19 +1757,35 @@ class DryerMonitor(hass.Hass):
             self.log(f"Could not reset programme selectors: {e}", level="WARNING")
 
     def _transition_to_off(self, reason, force=False):
-        """Transition to Off state."""
+        """Transition to Off state.
+
+        Returns True/False from _should_change_state - same silent-refusal shape as
+        _transition_to_unemptied (see its docstring for why that return value matters there);
+        no caller here currently needs it.
+        """
         if self._should_change_state("Off", force=force):
             self.state = "Off"
             self._set_state_entity( state="Off")
             self.log(f"State -> Off ({reason})", level="INFO")
             self._reset_programme_selectors_to_unconfirmed()
             self._reset_cycle_tracking()
+            return True
+        return False
 
     def _transition_to_unemptied(self, skip_announce=False, run_minutes=None, energy_used=None, force=False):
         """Transition to Unemptied state (cycle done, door still closed, waiting for user).
 
         skip_announce: If True, do not send the "dryer ready to empty" notification.
         run_minutes, energy_used: Optional corrected values (from history correction).
+
+        Returns True when the transition actually happened, False when _should_change_state
+        refused it (already Unemptied, or still inside cooling_period). Every caller that saves
+        a _save_cycle_feedback record right after calling this MUST gate that save on the return
+        value - the low-power finish path (_confirm_finished) re-polls roughly every stop_for/60s
+        while watts stays low, and without the gate it kept re-entering here (refused, since
+        cooling_period had not yet elapsed) while still unconditionally saving a fresh feedback
+        record on every refused re-entry: nine junk finish_uld records in two bursts on
+        2026-08-12, one per ~60s poll, each with a longer duration_min than the last.
         """
         if self._should_change_state("Unemptied", force=force):
             run_minutes = run_minutes if run_minutes is not None else self._get_run_duration_minutes()
@@ -1784,6 +1847,9 @@ class DryerMonitor(hass.Hass):
                 except Exception as e:
                     self.log(f"Error sending notification: {e}", level="ERROR")
 
+            return True
+        return False
+
     def _handle_force_emptied(self, event_name, data, kwargs):
         """dryer_force_emptied (dashboard Emptied button): the drum is empty but the door
         contact never saw the emptying. Only honored from Unemptied - any earlier state may
@@ -1800,7 +1866,12 @@ class DryerMonitor(hass.Hass):
         self._transition_to_emptied(f"Forced emptied ({reason})")
 
     def _transition_to_emptied(self, reason):
-        """Transition to Emptied state (door open, user is emptying)."""
+        """Transition to Emptied state (door open, user is emptying).
+
+        Returns True/False from _should_change_state - same silent-refusal shape as
+        _transition_to_unemptied (see its docstring for why that return value matters there);
+        no caller here currently needs it.
+        """
         if self._should_change_state("Emptied", force=True):  # Door event bypasses cooling
             energy_used = self._get_energy_used()
             run_minutes = self._get_run_duration_minutes()
@@ -1842,6 +1913,8 @@ class DryerMonitor(hass.Hass):
                     self.log(f"Could not reset announce toggle: {e}", level="WARNING")
 
             self.log(f"State -> Emptied ({reason})", level="INFO")
+            return True
+        return False
 
     def _reset_cycle_tracking(self):
         """Reset all cycle-related tracking variables."""
@@ -2020,19 +2093,20 @@ class DryerMonitor(hass.Hass):
                         run_minutes, duration_source = self._correct_duration(run_minutes_wall, log_prefix="Keep-fresh ")
                         idle_min = run_minutes_wall - run_minutes if duration_source and run_minutes_wall > run_minutes else None
                         energy_kwh = self._get_energy_used()
-                        self._transition_to_unemptied(skip_announce=False, run_minutes=run_minutes, energy_used=energy_kwh)
-                        confirmed, is_human = self._get_confirmed_from_selector(prog)
-                        self._save_cycle_feedback(
-                            predicted=prog,
-                            confirmed=confirmed,
-                            duration_min=run_minutes,
-                            energy_kwh=energy_kwh,
-                            max_power_w=self.max_power_w,
-                            programme_confirmed_by_human=is_human,
-                            duration_source=duration_source,
-                            end_reason="keep_fresh_detected",
-                            idle_min=idle_min,
-                        )
+                        became_unemptied = self._transition_to_unemptied(skip_announce=False, run_minutes=run_minutes, energy_used=energy_kwh)
+                        if became_unemptied:
+                            confirmed, is_human = self._get_confirmed_from_selector(prog)
+                            self._save_cycle_feedback(
+                                predicted=prog,
+                                confirmed=confirmed,
+                                duration_min=run_minutes,
+                                energy_kwh=energy_kwh,
+                                max_power_w=self.max_power_w,
+                                programme_confirmed_by_human=is_human,
+                                duration_source=duration_source,
+                                end_reason="keep_fresh_detected",
+                                idle_min=idle_min,
+                            )
                 if self.pattern_check_timer:
                     self._safe_cancel_timer(self.pattern_check_timer)
                     self.pattern_check_timer = None
@@ -2103,6 +2177,7 @@ class DryerMonitor(hass.Hass):
                 self.state = "Running"
                 self.start_time = self._now_utc()
                 self.cycle_id = uuid.uuid4().hex  # fresh identity for a genuinely new cycle
+                self._feedback_saved_cycle_id = None  # new cycle - clear the duplicate-save guard
                 self.keep_fresh_detected = False
                 self.power_readings = []
                 self.notification_sent = False
@@ -2173,19 +2248,28 @@ class DryerMonitor(hass.Hass):
                 run_minutes, duration_source = self._correct_duration(run_minutes_wall)
                 idle_min = run_minutes_wall - run_minutes if duration_source and run_minutes_wall > run_minutes else None
                 energy_kwh = self._get_energy_used()
-                self._transition_to_unemptied(skip_announce=skip_announce, run_minutes=run_minutes, energy_used=energy_kwh)
-                confirmed, is_human = self._get_confirmed_from_selector(prog)
-                self._save_cycle_feedback(
-                    predicted=prog,
-                    confirmed=confirmed,
-                    duration_min=run_minutes,
-                    energy_kwh=energy_kwh,
-                    max_power_w=self.max_power_w,
-                    programme_confirmed_by_human=is_human,
-                    duration_source=duration_source,
-                    end_reason="low_power_detected",
-                    idle_min=idle_min,
-                )
+                became_unemptied = self._transition_to_unemptied(skip_announce=skip_announce, run_minutes=run_minutes, energy_used=energy_kwh)
+                if became_unemptied:
+                    # Gated on the transition actually landing: _should_change_state refuses a
+                    # repeat call once already Unemptied or still inside cooling_period, and this
+                    # low-power path is re-entered roughly every stop_for/60s for as long as watts
+                    # stays <= stop_w (finish_uld is_real: False, so skip_announce hides the
+                    # repetition from notifications entirely). Before this gate, every refused
+                    # re-entry still saved a fresh feedback record regardless: nine junk finish_uld
+                    # records in two bursts on 2026-08-12, one per ~60s poll, duration_min growing
+                    # each time - see _transition_to_unemptied's docstring.
+                    confirmed, is_human = self._get_confirmed_from_selector(prog)
+                    self._save_cycle_feedback(
+                        predicted=prog,
+                        confirmed=confirmed,
+                        duration_min=run_minutes,
+                        energy_kwh=energy_kwh,
+                        max_power_w=self.max_power_w,
+                        programme_confirmed_by_human=is_human,
+                        duration_source=duration_source,
+                        end_reason="low_power_detected",
+                        idle_min=idle_min,
+                    )
                 if self.pattern_check_timer:
                     self._safe_cancel_timer(self.pattern_check_timer)
                     self.pattern_check_timer = None
