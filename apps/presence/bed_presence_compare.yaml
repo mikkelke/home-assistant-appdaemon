@@ -16,7 +16,8 @@
 BedPresenceCompare:
   module: bed_presence_compare
   class: BedPresenceCompare
-  log: bed_presence_compare_log
+  # No custom `log:` stream - those must be declared in appdaemon.yaml, which lives only on
+  # the box; an undeclared stream instantiation-crashes the app (third occurrence 2026-08-13).
 
   pairs:
     left:

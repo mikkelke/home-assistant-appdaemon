@@ -45,6 +45,23 @@ echo "unit tests OK"
 # 2b. speaker registry drift guard
 python3 scripts/check_speakers.py
 
+# 2c. undeclared log-stream guard. Custom `log:` streams must be declared in appdaemon.yaml,
+# which lives ONLY on the box - an app yaml naming an undeclared stream instantiation-crashes
+# that app on deploy (AppInstantiationError: User defined log ... not found). Bit three times
+# in five days (ForecastLog 08-09, AbbWelcomeBridge 08-12, BedPresenceCompare 08-13), each a
+# new app copying the pattern from a neighbour whose stream pre-exists. Compare against the
+# box's live declarations so the failure happens HERE, before the sync.
+declared=$(ssh mke@10.21.0.5 "grep -oE '^  [a-z_]+_log:' /data/appdaemon/appdaemon.yaml" | tr -d ' :')
+used=$(grep -rhE '^  log: *[a-z_]+ *$' apps/*/*.yaml | sed 's/.*log: *//' | sort -u)
+for stream in $used; do
+  if ! echo "$declared" | grep -qx "$stream"; then
+    echo "FATAL: apps yaml references log stream '$stream' not declared in the box appdaemon.yaml" >&2
+    grep -rln "log: *$stream" apps/*/*.yaml >&2
+    exit 1
+  fi
+done
+echo "log-stream guard OK"
+
 # 3. sync only tracked files
 # STAMP must be in the AppDaemon log's timezone (Europe/Copenhagen), not the box
 # clock (UTC): a UTC stamp sits 2h behind the log in summer, so the verify window
