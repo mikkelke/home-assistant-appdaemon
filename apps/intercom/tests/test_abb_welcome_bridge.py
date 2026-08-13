@@ -93,6 +93,11 @@ def _bare_bridge(tmpdir, clock):
     app.episodes = {}
     app._episode_seq = 0
     app.last_unlock_at = {}
+    app._last_announce_at = {}
+    app.announce_cameras = {"front door": "camera.abb_front"}
+    app.announce_message = "The door is open."
+    app.announce_cooldown_s = 90
+    app.announce_ring_window_s = 60
     app._state_file = tmp / "abb_welcome_bridge_state.json"
     app.counters = {"rings_both": 0, "rings_esp_only": 0, "rings_abb_only": 0}
     app.lag_stats = {"sum_ms": 0.0, "n": 0, "last_ms": None}
@@ -135,6 +140,8 @@ def _bare_bridge(tmpdir, clock):
     app.fire_event = lambda event, **kwargs: app.fired_events.append((event, kwargs))
     app.published = []
     app.set_state = lambda entity, **kwargs: app.published.append((entity, kwargs))
+    app.service_calls = []
+    app.call_service = lambda service, **kwargs: app.service_calls.append((service, kwargs))
     return app
 
 
@@ -582,3 +589,60 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnnounceAfterUnlock(unittest.TestCase):
+    """Restored 2026-08-13 (the 2026-08-12 box-direct deploy of this policy was wiped by a
+    repo sync): when the house answers a ring by opening the door, the door tells the
+    visitor. Front only, physical-unlock-gated, ring-gated, one sentence per visitor."""
+
+    def setUp(self):
+        self.clock = Clock(datetime(2026, 8, 13, 7, 40, 0))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.app = _bare_bridge(self.tmp.name, self.clock)
+
+    def _advance(self, seconds):
+        self.clock.at = self.clock.at + timedelta(seconds=seconds)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _ring(self, door="front door"):
+        self.app._open_episode(door, "100000002" if door == "front door" else "100000001", self.clock.now())
+
+    def test_front_unlock_after_ring_announces_once(self):
+        self._ring()
+        self._advance(9)
+        self.app._on_lock_activity("lock.intercomproxy_front_door", "state", "locked", "unlocking", {})
+        self._advance(2)
+        self.app._on_lock_activity("lock.intercomproxy_front_door", "state", "unlocking", "unlocked", {})
+        announces = [c for c in self.app.service_calls if c[0] == "abb_welcome/announce"]
+        self.assertEqual(len(announces), 1)
+        self.assertEqual(announces[0][1]["entity_id"], "camera.abb_front")
+        self.assertEqual(announces[0][1]["message"], "The door is open.")
+
+    def test_unlock_without_ring_stays_silent(self):
+        """A dashboard unlock with nobody outside must not talk to the street."""
+        self.app._on_lock_activity("lock.intercomproxy_front_door", "state", "locked", "unlocking", {})
+        self.assertEqual([c for c in self.app.service_calls if c[0] == "abb_welcome/announce"], [])
+
+    def test_back_door_not_configured_stays_silent(self):
+        self._ring("back door")
+        self._advance(5)
+        self.app._on_lock_activity("lock.intercomproxy_back_door", "state", "locked", "unlocking", {})
+        self.assertEqual([c for c in self.app.service_calls if c[0] == "abb_welcome/announce"], [])
+
+    def test_ring_window_expiry_stays_silent(self):
+        self._ring()
+        self._advance(120)
+        self.app._on_lock_activity("lock.intercomproxy_front_door", "state", "locked", "unlocking", {})
+        self.assertEqual([c for c in self.app.service_calls if c[0] == "abb_welcome/announce"], [])
+
+    def test_announce_failure_never_raises(self):
+        self._ring()
+        self._advance(5)
+        def boom(service, **kwargs):
+            raise RuntimeError("SIP busy")
+        self.app.call_service = boom
+        self.app._on_lock_activity("lock.intercomproxy_front_door", "state", "locked", "unlocking", {})
+        self.assertTrue(any("Announce failed" in m for _, m in self.app.logs))

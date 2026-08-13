@@ -200,6 +200,20 @@ class AbbWelcomeBridge(hass.Hass):
         self.snapshot_probe_s = int(self.args.get("snapshot_probe_s", 6))  # early probe; the poll usually beats it by lagging
         self.notify_target = self.args.get("notify_target", "home")
 
+        # --- announce-after-unlock knobs (user + integration agreement 2026-08-12) ---
+        # When the house auto-opens for a ring, tell the person at the door. Policy lives
+        # HERE, capability lives in the integration (abb_welcome.announce, unattended TTS).
+        # Front door only for now: the back door reportedly has a built-in voice of its own,
+        # unverified - two overlapping voices would be worse than none. The gate is the
+        # PHYSICAL unlock edge (lock.intercomproxy_* -> unlocking/unlocked), not the unlock
+        # request: speak only when the door demonstrably opened. Ring-gated so a dashboard
+        # unlock with nobody outside never talks to the street.
+        raw_announce = self.args.get("announce_after_unlock", {}) or {}
+        self.announce_cameras = {str(k): str(v) for k, v in raw_announce.items()} if isinstance(raw_announce, dict) else {}
+        self.announce_message = str(self.args.get("announce_message", "The door is open."))
+        self.announce_cooldown_s = int(self.args.get("announce_cooldown_s", 90))
+        self.announce_ring_window_s = int(self.args.get("announce_ring_window_s", 60))
+
         # --- archive knobs ---
         self.archive_dir = Path(self.args.get("archive_dir", "/www/abb_doorbell"))
         self.archive_url_prefix = self.args.get("archive_url_prefix", "/local/abb_doorbell")
@@ -211,6 +225,7 @@ class AbbWelcomeBridge(hass.Hass):
         self.episodes = {}  # stable episode id -> episode dict (open episodes only)
         self._episode_seq = 0
         self.last_unlock_at = {}  # door label -> datetime of last unlocking/unlocked edge
+        self._last_announce_at = {}  # door label -> datetime of last spoken announcement
         self.mobile_notifier = self._get_mobile_notifier()
         self._state_file = Path(__file__).with_name("abb_welcome_bridge_state.json")
         persisted = self._load_state()
@@ -603,9 +618,47 @@ class AbbWelcomeBridge(hass.Hass):
     def _on_lock_activity(self, entity, attribute, old, new, kwargs):
         try:
             if new in ("unlocking", "unlocked"):
-                self.last_unlock_at[self.esp_lock_doors.get(entity, entity)] = self.get_now()
+                door = self.esp_lock_doors.get(entity, entity)
+                self.last_unlock_at[door] = self.get_now()
+                self._maybe_announce(door)
         except Exception as e:
             self.log(f"Lock activity handling failed: {e}", level="WARNING")
+
+    def _maybe_announce(self, door):
+        """Speak "the door is open" at the door that was just unlocked for a ring.
+
+        Fires only when ALL of: the door has an announce camera configured (front only
+        today - the back door's own built-in voice is unverified, and two overlapping
+        voices are worse than none); a ring EPISODE for that door started within
+        announce_ring_window_s (a dashboard unlock with nobody outside must not talk to
+        the street); and the per-door cooldown has passed (the ESP fires unlocking AND
+        unlocked edges seconds apart - one visitor, one sentence). Failure costs the
+        sentence, never the unlock: this runs strictly after the lock command."""
+        try:
+            camera = self.announce_cameras.get(door)
+            if not camera:
+                return
+            now = self.get_now()
+            ring_recent = any(
+                ep.get("door") == door
+                and not ep.get("closed")
+                and (now - ep["started_at"]).total_seconds() <= self.announce_ring_window_s
+                for ep in self.episodes.values()
+            )
+            if not ring_recent:
+                return
+            last = self._last_announce_at.get(door)
+            if last is not None and (now - last).total_seconds() < self.announce_cooldown_s:
+                return
+            self._last_announce_at[door] = now
+            self.call_service(
+                "abb_welcome/announce",
+                entity_id=camera,
+                message=self.announce_message,
+            )
+            self.log(f"ANNOUNCE door={door} camera={camera} message={self.announce_message!r}")
+        except Exception as e:
+            self.log(f"Announce failed for {door}: {e}", level="WARNING")
 
     def _send_missed_push(self, door, station_id, ring_at):
         label = door or (f"station {station_id}" if station_id else "door")

@@ -56,6 +56,17 @@ AbbWelcomeBridge:
   # Missed-call push audience: everyone home, no category restriction.
   notify_target: "home"
 
+  # Announce after auto-open (2026-08-13, restoring the policy agreed 2026-08-12 whose
+  # box-direct deploy was lost to a repo sync): when a ring is answered by the house
+  # opening the door, the door tells the visitor. FRONT ONLY - the back door reportedly
+  # has a built-in voice, unverified; two overlapping voices are worse than none. Add
+  # "back door" here only after standing at it during an auto-open.
+  announce_after_unlock:
+    front door: camera.abb_welcome_gateway_outdoor_station_2_1
+  announce_message: "The door is open."
+  announce_cooldown_s: 90
+  announce_ring_window_s: 60
+
   # --- ring image archive (same exposure model as the vacuum's rober2_maps:
   # /www inside the container = /data/homeassistant/www on the box, served
   # unauthenticated on LAN at /local/abb_doorbell/) ---
