@@ -86,6 +86,20 @@ AbbWelcomeBridge:
   clip_delay_s: 8
   clip_record_dir: "/config/www/abb_doorbell"  # archive_dir as HA's container sees it
 
+  # --- integration health watchdog (2026-08-13, found live during the feature audit:
+  # leaked stream-worker retries from failed camera.record attempts flipped the front
+  # camera unavailable for 90 minutes; one reload_config_entry cured it). A dead SIP
+  # listener means ABB is deaf while the ESP still hears - the comparator counts that
+  # as rings_esp_only and phase 2 stalls on bad evidence. Self-heals by reloading the
+  # ABB config entry after health_unhealthy_s of sustained trouble, at most once per
+  # health_heal_cooldown_s, pushing Mikkel on each heal and on recovery. Explicit bad
+  # states only - unreadable sensors hold, they never trigger a reload. The ESP
+  # doorbell does not depend on any of this.
+  health_sip_entity: "sensor.abb_welcome_gateway_sip_listener"
+  health_unhealthy_s: 600
+  health_heal_cooldown_s: 3600
+  health_notify: ["mikkel"]
+
   # --- ring image archive (same exposure model as the vacuum's rober2_maps:
   # /www inside the container = /data/homeassistant/www on the box, served
   # unauthenticated on LAN at /local/abb_doorbell/) ---

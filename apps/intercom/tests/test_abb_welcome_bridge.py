@@ -103,6 +103,13 @@ def _bare_bridge(tmpdir, clock):
     app.clip_delay_s = 8
     app.clip_record_dir = "/config/www/abb_doorbell"
     app.station_by_door = {"back door": "100000001", "front door": "100000002"}
+    app.health_sip_entity = "sensor.abb_sip"
+    app.health_unhealthy_s = 600
+    app.health_heal_cooldown_s = 3600
+    app.health_notify = ["mikkel"]
+    app._health_bad_since = None
+    app._health_last_heal = None
+    app._health_healing = False
     app._state_file = tmp / "abb_welcome_bridge_state.json"
     app.counters = {"rings_both": 0, "rings_esp_only": 0, "rings_abb_only": 0}
     app.lag_stats = {"sum_ms": 0.0, "n": 0, "last_ms": None}
@@ -772,3 +779,91 @@ class RingClipTests(unittest.TestCase):
         self.app._archive_write(JPEG, RING_ESP.isoformat(), "100000002", "front door", "ring")
         self.assertFalse((self.app.archive_dir / "old.jpg").exists())
         self.assertFalse((self.app.archive_dir / "old_clip.mp4").exists())
+
+
+class HealthWatchdogTests(unittest.TestCase):
+    """Self-healing ABB health watchdog (2026-08-13, built after the feature audit
+    caught the front camera unavailable for 90 minutes: stream workers leaked by
+    failed camera.record attempts, cured by one reload_config_entry)."""
+
+    def setUp(self):
+        self.clock = Clock(datetime(2026, 8, 13, 11, 0, 0, tzinfo=timezone.utc))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.app = _bare_bridge(self.tmp.name, self.clock)
+        self.app.states[("sensor.abb_sip", None)] = "registered"
+        self.app.states[("camera.abb_front", None)] = "idle"
+
+    def _reloads(self):
+        return [c for c in self.app.service_calls if c[0] == "homeassistant/reload_config_entry"]
+
+    def _tick(self, advance_s=0):
+        self.clock.at += timedelta(seconds=advance_s)
+        self.app._health_tick({})
+
+    def test_healthy_does_nothing(self):
+        self._tick()
+        self._tick(60)
+        self.assertEqual(self._reloads(), [])
+        self.assertEqual(self.app.pushes, [])
+        self.assertIsNone(self.app._health_bad_since)
+
+    def test_sustained_sip_failure_reloads_and_pages_mikkel(self):
+        self.app.states[("sensor.abb_sip", None)] = "error"
+        self._tick()                      # degraded noticed, no action yet
+        self.assertEqual(self._reloads(), [])
+        self._tick(300)                   # still inside the grace window
+        self.assertEqual(self._reloads(), [])
+        self._tick(301)                   # 601 s bad -> heal
+        self.assertEqual(len(self._reloads()), 1)
+        self.assertEqual(self._reloads()[0][1]["entity_id"], "sensor.abb_sip")
+        self.assertEqual(len(self.app.pushes), 1)
+        self.assertEqual(self.app.pushes[0]["target"], ["mikkel"])
+        self.assertIn("SIP listener 'error'", self.app.pushes[0]["message"])
+
+    def test_camera_unavailable_alone_triggers(self):
+        self.app.states[("camera.abb_front", None)] = "unavailable"
+        self._tick()
+        self._tick(601)
+        self.assertEqual(len(self._reloads()), 1)
+        self.assertIn("camera.abb_front unavailable", self.app.pushes[0]["message"])
+
+    def test_heal_cooldown_limits_reloads_and_pages(self):
+        self.app.states[("sensor.abb_sip", None)] = "error"
+        self._tick()
+        self._tick(601)
+        self.assertEqual(len(self._reloads()), 1)
+        self._tick(60)                    # still down right after the heal
+        self._tick(600)
+        self.assertEqual(len(self._reloads()), 1)   # cooldown holds
+        self.assertEqual(len(self.app.pushes), 1)
+        self._tick(3600)                  # cooldown lapsed, still down -> heal again
+        self.assertEqual(len(self._reloads()), 2)
+        self.assertEqual(len(self.app.pushes), 2)
+
+    def test_recovery_after_heal_pushes_and_resets(self):
+        self.app.states[("sensor.abb_sip", None)] = "error"
+        self._tick()
+        self._tick(601)
+        self.app.states[("sensor.abb_sip", None)] = "registered"
+        self._tick(60)
+        self.assertEqual(len(self.app.pushes), 2)
+        self.assertEqual(self.app.pushes[1]["title"], "ABB intercom recovered")
+        self.assertIsNone(self.app._health_bad_since)
+        self.assertFalse(self.app._health_healing)
+
+    def test_blip_that_recovers_stays_silent(self):
+        self.app.states[("sensor.abb_sip", None)] = "error"
+        self._tick()
+        self.app.states[("sensor.abb_sip", None)] = "registered"
+        self._tick(120)
+        self.assertEqual(self._reloads(), [])
+        self.assertEqual(self.app.pushes, [])
+
+    def test_unreadable_sensor_is_not_evidence(self):
+        del self.app.states[("sensor.abb_sip", None)]     # get_state -> None
+        self.app.states[("camera.abb_front", None)] = "idle"
+        self._tick()
+        self._tick(601)
+        self.assertEqual(self._reloads(), [])
+        self.assertIsNone(self.app._health_bad_since)

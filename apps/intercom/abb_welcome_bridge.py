@@ -230,6 +230,27 @@ class AbbWelcomeBridge(hass.Hass):
         self.clip_record_dir = str(self.args.get("clip_record_dir", "/config/www/abb_doorbell")).rstrip("/")
         self.station_by_door = {v: k for k, v in self.station_doors.items()}
 
+        # --- integration health watchdog (2026-08-13, found live during the feature
+        # audit: stream workers leaked by failed camera.record attempts retried 404s
+        # for 90 minutes and flipped the front camera unavailable; one
+        # homeassistant.reload_config_entry cured it). SIP listener not "registered"
+        # or a policy camera unavailable, sustained health_unhealthy_s, means ABB is
+        # deaf while the ESP still hears - exactly the silent divergence the
+        # comparator cannot afford. Self-heal by reloading the config entry (LockHealth
+        # pattern: act, verify, page), at most once per health_heal_cooldown_s, with a
+        # push to Mikkel on every heal attempt and on recovery. The ESP doorbell is
+        # untouched by all of this - reloading ABB can never cost a ring.
+        self.health_sip_entity = self.args.get(
+            "health_sip_entity", "sensor.abb_welcome_gateway_sip_listener"
+        )
+        self.health_unhealthy_s = int(self.args.get("health_unhealthy_s", 600))
+        self.health_heal_cooldown_s = int(self.args.get("health_heal_cooldown_s", 3600))
+        raw_health_notify = self.args.get("health_notify", ["mikkel"])
+        self.health_notify = list(raw_health_notify) if isinstance(raw_health_notify, (list, tuple)) else [str(raw_health_notify)]
+        self._health_bad_since = None
+        self._health_last_heal = None
+        self._health_healing = False
+
         # --- archive knobs ---
         self.archive_dir = Path(self.args.get("archive_dir", "/www/abb_doorbell"))
         self.archive_url_prefix = self.args.get("archive_url_prefix", "/local/abb_doorbell")
@@ -289,6 +310,13 @@ class AbbWelcomeBridge(hass.Hass):
             self.archive_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             self.log(f"Archive dir {self.archive_dir} unavailable: {e} - archiving disabled until it appears", level="WARNING")
+
+        # Health watchdog tick. Minutely like the other reconcile ticks; the state
+        # machine inside is cheap (two get_states and a couple of datetimes).
+        try:
+            self.run_every(self._health_tick, "now+90", 60)
+        except Exception as e:
+            self.log(f"Health tick failed to schedule: {e}", level="WARNING")
 
         self._publish_agreement()
         self.log(
@@ -721,6 +749,80 @@ class AbbWelcomeBridge(hass.Hass):
             self.log(f"CLIP-START door={door} file={filename} ({self.clip_seconds}s)")
         except Exception as e:
             self.log(f"Clip start failed for {episode.get('id')}: {e}", level="WARNING")
+
+    # ------------------------------------------------------------------
+    # Integration health watchdog (self-healing; see the init comment)
+    # ------------------------------------------------------------------
+    def _health_problems(self):
+        """Current list of ABB health complaints - empty means healthy. Only
+        EXPLICIT bad states count: an unreadable sensor or a missing entity is
+        no-evidence and must not trigger a reload (arbitration rule of the
+        house: dropouts hold state, they never act)."""
+        problems = []
+        if self.health_sip_entity:
+            try:
+                sip = self.get_state(self.health_sip_entity)
+            except Exception:
+                sip = None
+            if sip is not None and sip not in ("registered", "unknown"):
+                problems.append(f"SIP listener {sip!r}")
+        for camera in sorted(set(self.announce_cameras.values()) | set(self.clip_cameras.values())):
+            try:
+                cam_state = self.get_state(camera)
+            except Exception:
+                cam_state = None
+            if cam_state == "unavailable":
+                problems.append(f"{camera} unavailable")
+        return problems
+
+    def _health_tick(self, kwargs):
+        try:
+            now = self.get_now()
+            problems = self._health_problems()
+            if not problems:
+                if self._health_bad_since is not None:
+                    down_s = int((now - self._health_bad_since).total_seconds())
+                    self.log(f"ABB health recovered after {down_s}s", level="INFO")
+                    if self._health_healing:
+                        self._health_push("ABB intercom recovered",
+                                          "The ABB integration is healthy again after the reload.")
+                self._health_bad_since = None
+                self._health_healing = False
+                return
+            if self._health_bad_since is None:
+                self._health_bad_since = now
+                self.log(f"ABB health degraded: {'; '.join(problems)} - "
+                         f"reload in {self.health_unhealthy_s}s unless it recovers", level="WARNING")
+                return
+            if (now - self._health_bad_since).total_seconds() < self.health_unhealthy_s:
+                return
+            if (self._health_last_heal is not None
+                    and (now - self._health_last_heal).total_seconds() < self.health_heal_cooldown_s):
+                return  # one heal (and one page) per cooldown while it stays down
+            self._health_last_heal = now
+            self._health_healing = True
+            detail = "; ".join(problems)
+            self.log(f"ABB unhealthy for {int((now - self._health_bad_since).total_seconds())}s "
+                     f"({detail}) - reloading the config entry", level="WARNING")
+            self.call_service("homeassistant/reload_config_entry",
+                              entity_id=self.health_sip_entity)
+            self._health_push(
+                "ABB intercom went deaf",
+                f"{detail}. Reloaded the integration; the ESP doorbell is unaffected either way.",
+            )
+        except Exception as e:
+            self.log(f"Health tick failed: {e}", level="WARNING")
+
+    def _health_push(self, title, message):
+        if not self.mobile_notifier:
+            self.log(f"Health push skipped (no notifier): {message}", level="WARNING")
+            return
+        try:
+            self.create_task(self.mobile_notifier.notify(
+                title=title, message=message, target=self.health_notify,
+            ))
+        except Exception as e:
+            self.log(f"Health push failed: {e}", level="WARNING")
 
     def _send_missed_push(self, door, station_id, ring_at):
         label = door or (f"station {station_id}" if station_id else "door")
