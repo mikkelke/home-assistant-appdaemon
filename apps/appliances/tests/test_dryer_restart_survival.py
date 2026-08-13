@@ -934,5 +934,55 @@ class HelperSeededUnemptiedGetsAStateSinceAcrossTwoRestarts(unittest.TestCase):
             self.assertAlmostEqual(delay, 4 * 3600, delta=5)
 
 
+class TheRealUnloadAfterRestartKeepsTheReminder(unittest.TestCase):
+    """Replay of an observed loss, 2026-08-12 17:33-18:12 (old code, box logs).
+
+    A dryer had been running for hours when HA restarted. The entity was erased, the app fell
+    to Off, and power re-detection then started a FRESH clock at 17:34. When the load was
+    actually taken out at 18:12, that fresh clock read only 37 min - inside fill_window_minutes
+    (60) - so the unload was misread as "add laundry":
+
+        Door opened with low power before 60min - Off (add laundry/interrupted)
+        State -> Off (Door opened before fill window - add laundry or interrupted)
+
+    No empty-me reminder, and the cycle was recorded as interrupted. Removing the helper's
+    `initial: 'Off'` was NOT sufficient here: the helper carried "Running" correctly by then,
+    but a helper has no clock, so the old code still refused to seed it. Only the durable
+    store's clock makes the door-open read as the unload it actually was.
+    """
+
+    def test_restored_clock_turns_the_unload_into_unemptied_not_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Energy meter reads 10.0 kWh; the real ~3h cycle had consumed ~1.5, so it began
+            # at 8.5 - without a persisted energy_at_start the cycle fails _is_valid_completed_
+            # cycle's energy floor and lands on Off for an entirely different reason.
+            app, entities = make_app(
+                tmp, sensor_state=None, helper_state="Running", power_w="300", energy_kwh="10.0",
+            )
+            now = app._now_utc()
+            seed_store(tmp, "dryer", {
+                "state": "Running",
+                "cycle_start_time": cs.format_utc(now - timedelta(minutes=185)),
+                "energy_at_start": 8.5,
+                "detected_programme": "bomuld__ekstra_toert",
+                "programme_duration_min": 165,
+            })
+
+            app.initialize()
+            self.assertEqual(app.state, "Running")
+            self.assertAlmostEqual(app._get_run_duration_minutes(), 185, delta=1)
+
+            # The human opens the door to unload, exactly as at 18:12.
+            entities[POWER_SENSOR]["state"] = "0.0"
+            app._door_state_changed(DOOR_SENSOR, None, "off", "on", {})
+
+            # Unemptied then Emptied is the correct front-loader path; the bug produced Off.
+            self.assertIn(app.state, ("Unemptied", "Emptied"))
+            self.assertFalse(
+                any("add laundry" in str(a[0]) for a, _kw in app.log_calls),
+                "the unload must not be misread as an add-laundry interruption again",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
