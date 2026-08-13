@@ -29,11 +29,13 @@ sleep mode + DND. The gate only arms ON; it never clears an already-on sleep mod
 
 Sleep mode OFF:
 - While input_boolean.house_night_mode is ON (see apps/presence/house_night_mode.py):
-  only three paths clear it, each explicit - out of bed sustained >= 12 min (bathroom
+  three paths clear it, each explicit - out of bed sustained >= 12 min (bathroom
   trips are shorter: on 2026-08-07 he was out 04:14-04:44 and the instant clear
-  cascaded into the whole house leaving night mode), battery discharging sustained
-  >= 5 min, or person.mikkel explicitly away. Sensor dropouts (cloud bedsides,
-  companion battery) hold state instead of clearing it.
+  cascaded into the whole house leaving night mode), battery DISCHARGING (instant -
+  user 2026-08-13: "the anti pop is not needed"; a 03:00 cable pop clears, replugging
+  re-arms automatically, and the old 5-min wait just lost a race against his own thumb
+  every morning), or person.mikkel explicitly away. Sensor dropouts (cloud bedsides,
+  companion battery unknown/unavailable) hold state instead of clearing it.
 - Otherwise (daytime): today's immediate behaviour, unchanged - discharging or any
   ON condition not met clears at once.
 
@@ -82,9 +84,7 @@ class MikkelSleepMode(hass.Hass):
     # the bare __new__() test instances). The real yaml sets it to the mats only.
     bed_empty_entities = None
     out_of_bed_clear_seconds = 12 * 60
-    discharging_clear_seconds = 5 * 60
     _out_of_bed_since = None
-    _discharging_since = None
 
     def initialize(self) -> None:
         self.battery_entity = self.args.get(
@@ -139,16 +139,7 @@ class MikkelSleepMode(hass.Hass):
         self.out_of_bed_clear_seconds = int(
             self.args.get("out_of_bed_clear_minutes", 12)
         ) * 60
-        self.discharging_clear_seconds = int(
-            self.args.get("discharging_clear_minutes", 5)
-        ) * 60
-        # Fast clear when unplug + out-of-bed agree (seconds, not minutes - just enough
-        # to ride out charging<->discharging flapping during the physical detach).
-        self.discharging_up_clear_seconds = int(
-            self.args.get("discharging_up_clear_seconds", 20)
-        )
         self._out_of_bed_since = None
-        self._discharging_since = None
 
         # After wakeup_bedroom (or manual HA) turns sleep off while sensors still say "asleep".
         # Persisted (deploy_advisor's path convention + house_events' atomic tmp+replace
@@ -328,7 +319,6 @@ class MikkelSleepMode(hass.Hass):
         if current != "on":
             # The debounce clocks only ever run while sleep mode is on.
             self._out_of_bed_since = None
-            self._discharging_since = None
             if (
                 want_on_raw
                 and not self._block_rearm_until_out_of_bed
@@ -347,7 +337,6 @@ class MikkelSleepMode(hass.Hass):
         # Sleep mode is currently on.
         if want_on_raw:
             self._out_of_bed_since = None
-            self._discharging_since = None
             return
 
         if not self._night_debounce_active():
@@ -362,16 +351,15 @@ class MikkelSleepMode(hass.Hass):
             return
 
         now = self._now_local()
+        # Unplugging clears INSTANTLY, day or night (user 2026-08-13: "the anti pop is not
+        # needed - even if it disables it should just enable again when connected"). A cable
+        # popping out at 03:00 clears sleep mode and DND; plugging back in re-arms both
+        # automatically (bed + charging + night gate), so the failure is self-healing and
+        # symmetric. The debounce it replaces cost him a five-minute race against his own
+        # thumb every morning (06:48:43 vs our 06:53:36 on 2026-08-13).
         if battery == self._off_battery_state:
-            if self._discharging_since is None:
-                self._discharging_since = now
-                self.log(
-                    f"Discharging during house night mode - sleep mode clears in "
-                    f">={self.discharging_clear_seconds // 60} min unless charging resumes",
-                    level="INFO",
-                )
-        else:
-            self._discharging_since = None
+            self._turn_off_sleep(battery, person, in_bed, "unplugged (instant, user 2026-08-13)")
+            return
 
         if not in_bed:
             if self._out_of_bed_since is None:
@@ -385,26 +373,7 @@ class MikkelSleepMode(hass.Hass):
         else:
             self._out_of_bed_since = None
 
-        # Unplugged AND out of bed is decisively "up for the day" - the two signals
-        # cross-confirm, so only a token debounce applies. The 5-min rule exists for one
-        # case only: a cable popping out while he is STILL IN BED asleep, where an instant
-        # clear would drop DND and let notifications wake him. Keeping the 5-min wait for
-        # the getting-up case meant he beat the automation by hand every morning
-        # (2026-08-13: unplug 06:48:25, HIS thumb killed DND at 06:48:43, our command
-        # arrived uselessly at 06:53:36).
-        discharge_clear_s = (
-            self.discharging_up_clear_seconds if not in_bed else self.discharging_clear_seconds
-        )
         if (
-            self._discharging_since is not None
-            and (now - self._discharging_since).total_seconds() >= discharge_clear_s
-        ):
-            self._turn_off_sleep(
-                battery, person, in_bed,
-                f"discharging sustained >={discharge_clear_s} s"
-                + (" while out of bed" if not in_bed else ""),
-            )
-        elif (
             self._out_of_bed_since is not None
             and (now - self._out_of_bed_since).total_seconds()
             >= self.out_of_bed_clear_seconds

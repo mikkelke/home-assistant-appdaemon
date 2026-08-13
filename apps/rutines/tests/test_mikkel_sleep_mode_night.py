@@ -54,10 +54,7 @@ def make_app(states, *, now, blind_position=None, block_rearm=False):
     app.night_window = (dtime(21, 0), dtime(4, 0))
     app.house_night_entity = "input_boolean.house_night_mode"
     app.out_of_bed_clear_seconds = 12 * 60
-    app.discharging_clear_seconds = 5 * 60
-    app.discharging_up_clear_seconds = 20
     app._out_of_bed_since = None
-    app._discharging_since = None
 
     clock = {"now": now}
     app._clock = clock
@@ -209,31 +206,31 @@ class NightModeOffDebounce(unittest.TestCase):
         self.assertEqual(turn_offs(app), [])
         self.assertIsNone(app._out_of_bed_since)
 
-    def test_discharging_clears_after_5_minutes_not_immediately(self):
-        t0 = datetime(2026, 8, 7, 3, 0)
+    def test_discharging_clears_instantly(self):
+        """User 2026-08-13: no anti-cable-pop debounce - unplug means clear, NOW. A 03:00
+        cable pop clears sleep mode and DND; replugging re-arms both automatically, so the
+        failure is self-healing. The old 5-min wait only ever lost a race against his own
+        thumb every morning (his 06:48:43 vs our 06:53:36 on 2026-08-13)."""
+        t0 = datetime(2026, 8, 13, 3, 0)
         app, states = self._night_app(t0)
         states["sensor.mikkels_ofx9p_battery_state"] = "discharging"
-
-        app._apply_sleep_mode()
-        app._clock["now"] = t0 + timedelta(minutes=3)
-        app._apply_sleep_mode()
-        self.assertEqual(turn_offs(app), [])
-        app._clock["now"] = t0 + timedelta(minutes=5)
         app._apply_sleep_mode()
         self.assertEqual(len(turn_offs(app)), 1)
 
-    def test_charging_again_within_5_minutes_cancels_the_discharge_clear(self):
-        t0 = datetime(2026, 8, 7, 3, 0)
+    def test_replug_after_cable_pop_re_arms(self):
+        """The symmetry that makes the instant clear safe: back on the charger, in bed,
+        inside the night window - sleep mode arms again on the next evaluation."""
+        t0 = datetime(2026, 8, 13, 3, 0)
         app, states = self._night_app(t0)
         states["sensor.mikkels_ofx9p_battery_state"] = "discharging"
+        app._apply_sleep_mode()
+        self.assertEqual(len(turn_offs(app)), 1)
 
-        app._apply_sleep_mode()
-        app._clock["now"] = t0 + timedelta(minutes=3)
+        states["input_boolean.mikkel_sleep_mode"] = "off"
         states["sensor.mikkels_ofx9p_battery_state"] = "charging"
+        app._clock["now"] = t0 + timedelta(minutes=2)
         app._apply_sleep_mode()
-        app._clock["now"] = t0 + timedelta(minutes=10)
-        app._apply_sleep_mode()
-        self.assertEqual(turn_offs(app), [])
+        self.assertEqual(len(turn_ons(app)), 1)
 
     def test_battery_unavailable_at_night_holds_sleep_mode(self):
         # The companion sensor goes stale exactly when the phone sleeps - that is
@@ -274,56 +271,8 @@ class NightModeOffDebounce(unittest.TestCase):
         states["input_boolean.mikkel_sleep_mode"] = "off"
         app._apply_sleep_mode()
         self.assertIsNone(app._out_of_bed_since)
-        self.assertIsNone(app._discharging_since)
 
 
 if __name__ == "__main__":
     unittest.main()
 
-
-class UnplugWhileUpClearsFast(unittest.TestCase):
-    """2026-08-13: unplugging while already OUT of bed is decisively "up for the day", yet
-    the 5-min anti-cable-pop debounce still applied - so Mikkel killed DND by thumb 18 s
-    after unplugging (06:48:43) while the app's command trailed uselessly at 06:53:36. The
-    two signals cross-confirm, so a token 20 s debounce is enough. The 5-min rule stays for
-    the one case it protects: a cable popping out while he is STILL asleep in bed."""
-
-    def _up_and_unplugged(self, t0):
-        states = dict(IN_BED_CHARGING)
-        states["input_boolean.mikkel_sleep_mode"] = "on"
-        states["input_boolean.house_night_mode"] = "on"
-        states["binary_sensor.left_bedside"] = "off"
-        states["sensor.mikkels_ofx9p_battery_state"] = "discharging"
-        app = make_app(states, now=t0, blind_position=100)
-        return app, states
-
-    def test_unplugged_and_out_of_bed_clears_after_token_debounce(self):
-        t0 = datetime(2026, 8, 13, 6, 48, 25)
-        app, states = self._up_and_unplugged(t0)
-        app._apply_sleep_mode()  # starts both clocks
-        app._clock["now"] = t0 + timedelta(seconds=25)
-        app._apply_sleep_mode()
-        self.assertEqual(len(turn_offs(app)), 1)
-
-    def test_holds_within_the_token_debounce(self):
-        t0 = datetime(2026, 8, 13, 6, 48, 25)
-        app, states = self._up_and_unplugged(t0)
-        app._apply_sleep_mode()
-        app._clock["now"] = t0 + timedelta(seconds=10)
-        app._apply_sleep_mode()
-        self.assertEqual(turn_offs(app), [])
-
-    def test_cable_pop_while_asleep_keeps_the_five_minute_rule(self):
-        t0 = datetime(2026, 8, 13, 3, 0)
-        states = dict(IN_BED_CHARGING)
-        states["input_boolean.mikkel_sleep_mode"] = "on"
-        states["input_boolean.house_night_mode"] = "on"
-        states["sensor.mikkels_ofx9p_battery_state"] = "discharging"  # still IN bed
-        app = make_app(states, now=t0, blind_position=100)
-        app._apply_sleep_mode()
-        app._clock["now"] = t0 + timedelta(minutes=4)
-        app._apply_sleep_mode()
-        self.assertEqual(turn_offs(app), [])
-        app._clock["now"] = t0 + timedelta(minutes=5, seconds=5)
-        app._apply_sleep_mode()
-        self.assertEqual(len(turn_offs(app)), 1)
