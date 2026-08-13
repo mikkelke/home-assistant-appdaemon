@@ -250,6 +250,16 @@ class AbbWelcomeBridge(hass.Hass):
         self._health_bad_since = None
         self._health_last_heal = None
         self._health_healing = False
+        # Our own outbound SIP activity, seen back through ABB's own reporting, must
+        # never count as visitor evidence. Two windows guard that:
+        # - _self_call_until[door]: an announce or clip record is dialing that door's
+        #   station; the portal logs OUR call as call-answered (gateway answers
+        #   instantly), which would flip an ignored ring from missed to answered.
+        # - _ignore_abb_rings_until: a watchdog config-entry reload bounces the
+        #   ringing sensor into one phantom, unattributed ring (seen live 08:46:01
+        #   today: door=? station=? -> rings_abb_only polluted by the heal itself).
+        self._self_call_until = {}
+        self._ignore_abb_rings_until = None
 
         # --- archive knobs ---
         self.archive_dir = Path(self.args.get("archive_dir", "/www/abb_doorbell"))
@@ -402,6 +412,15 @@ class AbbWelcomeBridge(hass.Hass):
         door-label match. That is what lets the comparator accumulate
         station<->door mapping evidence even for unmapped stations.
         """
+        if (side == "abb" and not door and not station_id
+                and self._ignore_abb_rings_until is not None
+                and at <= self._ignore_abb_rings_until):
+            # A watchdog reload bounces the ringing sensor into exactly this shape:
+            # unattributed (door=? station=?), moments after the reload. A REAL ring
+            # in the grace window still counts - the bus event carries its station
+            # and the ESP side is untouched by the reload.
+            self.log(f"Ignoring unattributed ABB ring during post-reload grace ({source})", level="INFO")
+            return
         side_key = f"{side}_at"
         episode = self._match_episode(side_key, door, at)
         if episode is None:
@@ -565,8 +584,17 @@ class AbbWelcomeBridge(hass.Hass):
             if event_type == EVENT_MISSED:
                 self._handle_missed(attrs)
             elif event_type == EVENT_ANSWERED:
-                episode = self._episode_near(parse_iso_ts(attrs.get("timestamp")) or self.get_now())
+                at = parse_iso_ts(attrs.get("timestamp")) or self.get_now()
+                episode = self._episode_near(at)
                 if episode:
+                    # Our own dials (announce TTS, clip record) also show up here as
+                    # call-answered - the gateway answers us instantly. Counting that
+                    # would flip an ignored ring from missed to answered and swallow
+                    # the missed push, so evidence inside a self-call window is ours.
+                    until = self._self_call_until.get(episode["door"])
+                    if until is not None and at <= until:
+                        self.log(f"Ignoring call-answered from our own dial ({episode['door']})", level="INFO")
+                        return
                     episode["answered"] = True
             # ring events also arrive here (poll-lagged); the realtime intake
             # already covers them, and a 7-32 s late duplicate would misread as
@@ -698,6 +726,7 @@ class AbbWelcomeBridge(hass.Hass):
             if last is not None and (now - last).total_seconds() < self.announce_cooldown_s:
                 return
             self._last_announce_at[door] = now
+            self._self_call_until[door] = now + timedelta(seconds=20)
             self.call_service(
                 "abb_welcome/announce",
                 entity_id=camera,
@@ -746,6 +775,7 @@ class AbbWelcomeBridge(hass.Hass):
                 lookback=0,
             )
             episode["clip_filename"] = filename
+            self._self_call_until[door] = self.get_now() + timedelta(seconds=self.clip_seconds + 20)
             self.log(f"CLIP-START door={door} file={filename} ({self.clip_seconds}s)")
         except Exception as e:
             self.log(f"Clip start failed for {episode.get('id')}: {e}", level="WARNING")
@@ -804,6 +834,10 @@ class AbbWelcomeBridge(hass.Hass):
             detail = "; ".join(problems)
             self.log(f"ABB unhealthy for {int((now - self._health_bad_since).total_seconds())}s "
                      f"({detail}) - reloading the config entry", level="WARNING")
+            # The reload bounces the ringing sensor into one phantom, unattributed
+            # ring (live 08:46:01 today) - grace-drop those so the heal cannot
+            # pollute the comparator it exists to protect.
+            self._ignore_abb_rings_until = now + timedelta(seconds=90)
             self.call_service("homeassistant/reload_config_entry",
                               entity_id=self.health_sip_entity)
             self._health_push(

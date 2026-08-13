@@ -110,6 +110,8 @@ def _bare_bridge(tmpdir, clock):
     app._health_bad_since = None
     app._health_last_heal = None
     app._health_healing = False
+    app._self_call_until = {}
+    app._ignore_abb_rings_until = None
     app._state_file = tmp / "abb_welcome_bridge_state.json"
     app.counters = {"rings_both": 0, "rings_esp_only": 0, "rings_abb_only": 0}
     app.lag_stats = {"sum_ms": 0.0, "n": 0, "last_ms": None}
@@ -867,3 +869,72 @@ class HealthWatchdogTests(unittest.TestCase):
         self._tick(601)
         self.assertEqual(self._reloads(), [])
         self.assertIsNone(self.app._health_bad_since)
+
+
+class SelfEvidenceGuardTests(unittest.TestCase):
+    """Our own outbound SIP activity must never count as visitor evidence
+    (2026-08-13: the watchdog's reload bounced the ringing sensor into a phantom
+    unattributed ring at 08:46:01 and polluted rings_abb_only; the portal logs
+    our announce/record dials as call-answered)."""
+
+    def setUp(self):
+        self.clock = Clock(datetime(2026, 8, 13, 12, 0, 0, tzinfo=timezone.utc))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.app = _bare_bridge(self.tmp.name, self.clock)
+
+    def test_reload_grace_drops_only_unattributed_abb_rings(self):
+        self.app._ignore_abb_rings_until = self.clock.at + timedelta(seconds=90)
+        self.app._register_ring("abb", None, "", self.clock.at, "abb:sensor")
+        self.assertEqual(self.app.episodes, {})           # phantom dropped
+        self.app._register_ring("abb", "front door", "100000002", self.clock.at, "abb:bus")
+        self.assertEqual(len(self.app.episodes), 1)       # a real, attributed ring counts
+        # ESP rings are untouched by the grace window.
+        self.clock.at += timedelta(seconds=200)
+        self.app.episodes.clear()
+        self.app._ignore_abb_rings_until = self.clock.at + timedelta(seconds=90)
+        self.app._register_ring("esp", "front door", "", self.clock.at, "esp:test")
+        self.assertEqual(len(self.app.episodes), 1)
+
+    def test_grace_expires(self):
+        self.app._ignore_abb_rings_until = self.clock.at - timedelta(seconds=1)
+        self.app._register_ring("abb", None, "", self.clock.at, "abb:sensor")
+        self.assertEqual(len(self.app.episodes), 1)
+
+    def test_answered_inside_self_call_window_is_ignored(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.at)
+        self.app._self_call_until["front door"] = self.clock.at + timedelta(seconds=30)
+        answered_at = self.clock.at + timedelta(seconds=10)
+        self.app._on_abb_event("event.abb", "all", None, {"attributes": {
+            "event_type": bridge_mod.EVENT_ANSWERED, "timestamp": answered_at.isoformat(),
+        }}, {})
+        self.assertFalse(episode["answered"])
+        # Outside the window the same event counts.
+        late_at = self.clock.at + timedelta(seconds=45)
+        self.app._on_abb_event("event.abb", "all", None, {"attributes": {
+            "event_type": bridge_mod.EVENT_ANSWERED, "timestamp": late_at.isoformat(),
+        }}, {})
+        self.assertTrue(episode["answered"])
+
+    def test_clip_start_opens_self_call_window(self):
+        self.app._open_episode("front door", "100000002", self.clock.at)
+        self.clock.at += timedelta(seconds=8)
+        _run_scheduled(self.app, "_start_clip")
+        until = self.app._self_call_until.get("front door")
+        self.assertIsNotNone(until)
+        self.assertEqual((until - self.clock.at).total_seconds(), 30)  # clip 10 s + 20 s margin
+
+    def test_announce_opens_self_call_window(self):
+        self.app._open_episode("front door", "100000002", self.clock.at)
+        self.clock.at += timedelta(seconds=5)
+        self.app._on_lock_activity("lock.intercomproxy_front_door", "state", "locked", "unlocking", {})
+        self.assertIn("front door", self.app._self_call_until)
+
+    def test_watchdog_heal_opens_ring_grace(self):
+        self.app.states[("sensor.abb_sip", None)] = "error"
+        self.app.states[("camera.abb_front", None)] = "idle"
+        self.app._health_tick({})
+        self.clock.at += timedelta(seconds=601)
+        self.app._health_tick({})
+        self.assertIsNotNone(self.app._ignore_abb_rings_until)
+        self.assertEqual((self.app._ignore_abb_rings_until - self.clock.at).total_seconds(), 90)
