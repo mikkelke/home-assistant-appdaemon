@@ -51,8 +51,10 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 import collections
 import time
 import os
+import uuid
 import yaml
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 # Sibling modules in this same app directory (AppDaemon puts app dirs on sys.path;
 # same flat-import style as apps/climate/smart_cooling.py's `import climate_model as cm`).
@@ -63,6 +65,7 @@ import washer_feedback as wfb
 import washer_history as whist
 import washer_power as wpow
 import washer_profiles as wp
+import cycle_store as cystore
 
 try:
     from zoneinfo import ZoneInfo
@@ -82,7 +85,7 @@ _parse_utc = whist.parse_utc
 _START_TIME_SOURCE_RANK = {
     "door_close_trusted": 1,
     "live": 2,
-    "durable_store": 3,  # not used yet - reserved for a later step
+    "durable_store": 3,  # restored from cycle_store.py - see initialize()'s boot resolution
     "state_history": 4,
     "power_history": 5,
     "entity_last_changed": 6,
@@ -183,9 +186,12 @@ class WasherMonitor(hass.Hass):
 
     def _start_time_rank(self):
         """Trust rank of self.start_time's current provenance (lower = more trustworthy).
-        Unclaimed provenance (self._start_time_source is None) ranks weakest (99) so existing
-        behaviour is unchanged wherever nothing has claimed it yet."""
-        return _START_TIME_SOURCE_RANK.get(self._start_time_source, 99)
+        Unclaimed provenance ranks weakest (99) so existing behaviour is unchanged wherever
+        nothing has claimed it yet. getattr, not a bare attribute read: the callers sit inside
+        `except (TypeError, ValueError, AttributeError)` blocks, so on an instance that never
+        ran initialize() an AttributeError here would not surface - it would silently skip the
+        whole surrounding correction, which is exactly how it slipped past a green test run."""
+        return _START_TIME_SOURCE_RANK.get(getattr(self, "_start_time_source", None), 99)
 
     # Strips the degree sign so log output can't hit an encoding error.
     _log_safe = staticmethod(wcls.log_safe)
@@ -208,10 +214,195 @@ class WasherMonitor(hass.Hass):
 
     def _set_state_entity(self, **kwargs):
         """Publish to sensor.*_state and sync input_select.* when state changes."""
+        self._maybe_persist_cycle_state(kwargs.get("state"))
         self.set_state(self.state_entity, **kwargs)
         st = kwargs.get("state")
         if st is not None:
             self._sync_ui_select(st)
+
+    def _maybe_persist_cycle_state(self, state_str):
+        """Store-write hook for _set_state_entity - called before self.set_state() on every
+        publish, so the on-disk copy of an in-progress cycle (see cycle_store.py) survives an
+        HA restart that erases state_entity, taking its attributes (the cycle clock) with it.
+
+        Self-throttled: _check_energy_finish republishes "Running" every
+        energy_check_interval_s (30s default), and every other tick-driven publish is just as
+        frequent - a disk write on every one of those would be pure waste. A transition (state
+        differs from the last write) or a change in any of the fields below forces an
+        immediate write regardless of the throttle; otherwise a write only happens once
+        store_min_write_interval_s has elapsed since the last one, which doubles as a
+        heartbeat so the on-disk copy is never more than that many seconds stale.
+
+        state_str is the state actually being PUBLISHED (the state= kwarg _set_state_entity
+        received), not self.state - most callers keep the two in lockstep by assigning
+        self.state before publishing, but e.g. _on_confirm_changed republishes
+        state=self.get_state(state_entity) (a value read back from HA, not self.state), which
+        can disagree with self.state (documented AD 4.5.13 stale-get_state behaviour, or the
+        entity being erased at that exact moment). Threaded through to _save_cycle_state /
+        _cycle_store_payload below so the disk record always matches what HA was actually just
+        told, never a stale self.state.
+
+        Off clears the store instead of writing it (see cycle_store.py's module docstring) -
+        a cleared store is the normal steady state between cycles, not an error - but only when
+        self.state itself is also Off: a publish that merely claims Off while self.state still
+        holds a live cycle (the same state_str/self.state disagreement as above) must never
+        destroy that cycle's durable clock.
+
+        Wrapped in a broad except so a store failure (or, in tests, a WasherMonitor.__new__
+        fixture that never ran initialize() and so has none of the attributes this touches)
+        can never turn a state publish into a crash - every store interaction is non-fatal.
+        """
+        try:
+            store = getattr(self, "_cycle_store", None)
+            if store is None:
+                return
+            if state_str is None:
+                state_str = self.state
+            if state_str == "Off":
+                if self.state != "Off":
+                    self._safe_log_store(
+                        f"_set_state_entity published Off but self.state is {self.state!r} - "
+                        f"not clearing the durable store for a live cycle"
+                    )
+                    return
+                store.clear()
+                self._store_last_state = "Off"
+                self._store_last_write_at = self._now_utc()
+                return
+
+            force = (
+                state_str != self._store_last_state
+                or self.start_time != self._store_last_start_time
+                or bool(self.notification_sent) != bool(self._store_last_notification_sent)
+                or self.detected_programme != self._store_last_detected_programme
+                or self.detected_temperature != self._store_last_detected_temperature
+                or self.expected_dur_at_start != self._store_last_expected_dur_at_start
+                or self._guard_bar_class != self._store_last_guard_bar_class
+                or bool(self.programme_confirmed_by_user) != bool(self._store_last_programme_confirmed_by_user)
+                or self.last_door_closed_at != self._store_last_door_closed_at
+            )
+            if not force and self._store_last_write_at is not None:
+                elapsed = (self._now_utc() - self._store_last_write_at).total_seconds()
+                if elapsed < self.store_min_write_interval_s:
+                    return
+            self._save_cycle_state(state_str)
+        except Exception as e:
+            self._safe_log_store(f"Cycle store write hook failed: {e}")
+
+    def _safe_log_store(self, message):
+        # A broken self.log (or a fixture that never set one up) must never escalate a store
+        # problem into a test/app crash - mirrors CycleStore._safe_log's own stance.
+        try:
+            self.log(message, level="WARNING")
+        except Exception:
+            pass
+
+    def _cycle_store_payload(self, state_str) -> dict:
+        """Build the on-disk payload for `state_str` (the state actually being published - see
+        _maybe_persist_cycle_state) plus live self.* state for everything else - the single
+        source of truth for both the explicit post-restore save (_save_cycle_state, called once
+        at the end of initialize()'s boot resolution) and the throttled per-publish hook above.
+
+        Deliberately excluded (see the restart-survival work item for the full rationale):
+        last_state_change (the cooling-period clock - None after every restart today, which is
+        what *permits* the first post-restart transition; persisting it would newly let the
+        cooling period swallow a restore-time transition), timer handles, power_readings,
+        energy_buffer (_restore_energy_state_from_history re-derives it), the vibration
+        counters (telemetry-only by contract), and _last_infer_start_attempt (a throttle).
+        The delayed-start machine (_delay_waiting / _delay_plateau_start) is also left out
+        deliberately - see the comment on delayed_start_trimmed below.
+        """
+        last_off_at = None
+        try:
+            last_off_at = self.get_state(self.state_entity, attribute="last_off_at")
+        except Exception:
+            pass
+        actor = self._cycle_actor or {}
+        return {
+            "state": state_str,
+            "state_since": cystore.format_utc(self._store_state_since) if self._store_state_since else "",
+            "cycle_id": self._cycle_id,
+            "entity_recreated_at": cystore.format_utc(self._entity_recreated_at) if self._entity_recreated_at else "",
+            "start_time": cystore.format_utc(self.start_time) if self.start_time else "",
+            "last_door_closed_at": cystore.format_utc(self.last_door_closed_at) if self.last_door_closed_at else "",
+            "last_door_closed_trusted": bool(self.last_door_closed_trusted),
+            "last_off_at": last_off_at or "",
+            "energy_at_start": self.energy_start,
+            "started_by": actor.get("person") or "",
+            "started_by_method": actor.get("method") or "unknown",
+            "session_cost_kr": self._session_cost_kr,
+            "detected_programme": self.detected_programme,
+            "detected_temperature": self.detected_temperature,
+            "observed_heating": bool(self.observed_heating),
+            "heating_phase_count": self.heating_phase_count,
+            "max_power_seen": self.max_power_seen,
+            "expected_dur_at_start": self.expected_dur_at_start,
+            "expected_dur_key": self._guard_bar_key_str(),
+            "programme_confirmed_by_user": bool(self.programme_confirmed_by_user),
+            "programme_confirmed_by": self.confirmed_by_username or "",
+            # Deliberately deferred: _delay_waiting / _delay_plateau_start interact with
+            # _slide_start_for_delayed_start in ways needing separate study - only the
+            # already-applied outcome (delayed_start_trimmed) is persisted.
+            "delayed_start_trimmed": bool(self._delayed_start_trimmed),
+            "last_high_energy_at": cystore.format_utc(self.last_high_energy_at) if self.last_high_energy_at else "",
+            "notification_sent": bool(self.notification_sent),
+            "finish_confirmed": bool(self.finish_confirmed),
+            "in_finishing_tail": bool(self.in_finishing_tail),
+            "in_finishing_tail_entered_at": (
+                cystore.format_utc(self.in_finishing_tail_entered_at) if self.in_finishing_tail_entered_at else ""
+            ),
+            "last_tail_pulse_at": cystore.format_utc(self.last_tail_pulse_at) if self.last_tail_pulse_at else "",
+            "tail_pattern_locked": bool(self.tail_pattern_locked),
+            "tail_pattern_cycle_seconds": self.tail_pattern_cycle_seconds,
+            "tail_pattern_last_pulse_at": (
+                cystore.format_utc(self.tail_pattern_last_pulse_at) if self.tail_pattern_last_pulse_at else ""
+            ),
+            "tail_pattern_locked_at": cystore.format_utc(self.tail_pattern_locked_at) if self.tail_pattern_locked_at else "",
+            "door_opened_during_cycle": bool(self.door_opened_during_cycle),
+        }
+
+    def _save_cycle_state(self, state_str=None):
+        """Persist `state_str` (the state actually being published; defaults to self.state,
+        used by the explicit post-restore call below where self.state IS already the
+        fully-resolved boot state) to disk unconditionally (no throttle) and refresh the
+        write-hook's shadow bookkeeping above - but only once the write actually succeeds
+        (CycleStore.save() returns True): a failed write must not be mistaken for an
+        up-to-date one and left unretried for up to store_min_write_interval_s.
+
+        state_since is stamped BEFORE the payload is built (not after saving), so the very
+        save that records a transition also records the correct entry time for it, rather
+        than lagging one save behind (a save right after a transition would otherwise persist
+        the PREVIOUS state's state_since alongside the NEW state).
+
+        Called once right after initialize() finishes restoring a Running/Paused cycle - the
+        very first _set_state_entity publish during boot happens before _restore_running_state
+        has populated energy/programme/etc., so relying on that publish's own (correctly
+        throttled) write would leave an incomplete snapshot on disk until the next natural
+        tick; this makes it complete immediately. Also used by the throttled hook once it has
+        decided a write is due.
+        """
+        if state_str is None:
+            state_str = self.state
+        now = self._now_utc()
+        if state_str != self._store_last_state:
+            self._store_state_since = now
+        try:
+            saved = self._cycle_store.save(self._cycle_store_payload(state_str))
+        except Exception as e:
+            self._safe_log_store(f"Could not save cycle state to disk: {e}")
+            saved = False
+        if not saved:
+            return
+        self._store_last_write_at = now
+        self._store_last_state = state_str
+        self._store_last_start_time = self.start_time
+        self._store_last_notification_sent = bool(self.notification_sent)
+        self._store_last_detected_programme = self.detected_programme
+        self._store_last_detected_temperature = self.detected_temperature
+        self._store_last_expected_dur_at_start = self.expected_dur_at_start
+        self._store_last_guard_bar_class = self._guard_bar_class
+        self._store_last_programme_confirmed_by_user = bool(self.programme_confirmed_by_user)
+        self._store_last_door_closed_at = self.last_door_closed_at
 
     def _push_corrected_start_time_to_entity(self):
         """Push current self.start_time to the state entity (cycle_start_time, cycle_start_time_local, started_at_display). Preserves other attributes."""
@@ -575,74 +766,270 @@ class WasherMonitor(hass.Hass):
 
         self._build_user_id_cache()
 
+        # Durable cycle store: HA erases sensor.washer_state (an AppDaemon set_state entity)
+        # on every HA core restart, taking the cycle clock in its attributes with it; this
+        # on-disk shadow copy survives that (see cycle_store.py's module docstring). Filename
+        # MUST end in _state.json - .gitignore excludes *_state.json and deploy.sh only rsyncs
+        # git-tracked files, so a runtime cycle-state file can never become tracked.
+        store_path = self.args.get("state_file") or Path(__file__).with_name("washer_cycle_state.json")
+        self._cycle_store = cystore.CycleStore(store_path, "washer", log=self.log)
+        # How long a store write may be throttled before we force one anyway (heartbeat) - see
+        # _maybe_persist_cycle_state.
+        self.store_min_write_interval_s = int(self.args.get("store_min_write_interval_s", 300))
+        # Reject a stored Running/Paused whose save is older than this - AppDaemon (or the box)
+        # was down long enough that trusting a frozen clock is riskier than the normal
+        # power-based re-detection (see the boot-resolution staleness check below).
+        self.store_max_downtime_hours = float(self.args.get("store_max_downtime_hours", 12))
+        # Small clock-skew allowance for the future-start_time rejection (see
+        # _resolve_store_candidate) - NTP may not have synced yet at boot, so a start_time a few
+        # minutes ahead of "now" is tolerated; anything further ahead is rejected outright.
+        self.store_future_skew_minutes = float(self.args.get("store_future_skew_minutes", 5))
+        self._cycle_id = None  # uuid4, minted below/in _begin_running_cycle - notification_sent's own scoping is on _start_time_source == "durable_store", see _finalize_restored_cycle_identity
+        # Store-write throttle bookkeeping (see _maybe_persist_cycle_state) - shadow copies of
+        # the fields last written to disk, so a routine 30s republish with nothing semantically
+        # new does not hammer the disk, while any of these listed changes still writes
+        # immediately. _store_state_since is deliberately its own field, not last_state_change -
+        # see _cycle_store_payload's docstring for why last_state_change itself is never persisted.
+        self._store_last_write_at = None
+        self._store_last_state = None
+        self._store_state_since = None
+        self._store_last_start_time = None
+        self._store_last_notification_sent = None
+        self._store_last_detected_programme = None
+        self._store_last_detected_temperature = None
+        self._store_last_expected_dur_at_start = None
+        self._store_last_guard_bar_class = None
+        self._store_last_programme_confirmed_by_user = None
+        self._store_last_door_closed_at = None
+
         # Restore previous state
-        existing = self.get_state(self.state_entity)
-        if existing in (None, "unknown", "unavailable"):
+        existing = self.get_state(self.state_entity)                                          # A
+        entity_missing = existing in (None, "unknown", "unavailable")
+        if entity_missing:
             # HA erased this AppDaemon set_state entity (restart) and we're about to recreate
-            # it below (directly, or seeded from ui_state_select). Once recreated, its
-            # last_changed means "AppDaemon recreated this", not a real cycle transition -
-            # stamp the time so later start_time corrections can tell the two apart (see the
-            # _entity_recreated_at guard around the "entity last_changed" heuristic).
+            # it below (directly, or seeded from ui_state_select/the durable store). Once
+            # recreated, its last_changed means "AppDaemon recreated this", not a real cycle
+            # transition - stamp the time so later start_time corrections can tell the two
+            # apart (see the _entity_recreated_at guard around the "entity last_changed"
+            # heuristic).
             self._entity_recreated_at = self._now_utc()
+        # Single snapshot of the entity's attributes (+ last_changed/last_updated), taken ONCE,
+        # before the first _set_state_entity call below. 2026-07-27 shipped a version that
+        # recreated this (now erased) entity with empty attributes and THEN read
+        # cycle_start_time back from that same just-created entity - every read below must come
+        # from this snapshot (or the durable store), never a fresh get_state call, until every
+        # write for this boot is done.
+        boot_full = self.get_state(self.state_entity, attribute="all") or {}                   # B
+        boot_attrs = dict(boot_full.get("attributes") or {})
+        boot_last_changed = boot_full.get("last_changed") or boot_full.get("last_updated")
+        try:
+            store_data = self._cycle_store.load()                                              # C
+        except Exception as e:
+            self.log(f"CycleStore load raised unexpectedly: {e} - ignoring store", level="WARNING")
+            store_data = None
+
         valid_states = ("Running", "Unemptied", "Paused", "Emptied")
-        # Only states that carry no cycle clock may be seeded from the mirror. Running/Paused live off
-        # cycle_start_time, which lived in the erased sensor's attributes and is gone with it: seeding
-        # them yields Running with start_time None, and every timer that could end the cycle is gated on
-        # start_time, so the machine would sit in Running forever with finish detection blocked
-        # (_confirm_finished sees run_minutes 0 and never clears the duration guards). Falling through to
-        # Off is the older, working behaviour - the boot power check below re-detects a live wash.
-        seedable_states = ("Unemptied", "Emptied")
+        entity_trusted = existing in valid_states
+        # Any valid state may now be seeded from the mirror. Previously only the clock-free
+        # states (Unemptied/Emptied) were seedable: Running/Paused live off cycle_start_time,
+        # which lived in the erased sensor's attributes and was gone with it, so seeding them
+        # used to yield Running with start_time None - every timer that could end the cycle is
+        # gated on start_time, so the machine sat in Running forever (_confirm_finished saw
+        # run_minutes 0 and never cleared the duration guards). The durable store (and, failing
+        # that, a power+history recovery below) now gives Running/Paused an independent clock,
+        # so the restriction is replaced by a mechanically-checkable invariant instead:
+        # self.state is only ever left as Running/Paused in a branch that already holds a
+        # non-None start_time (see the gate below) - if no trustworthy start_time is
+        # recoverable from any source, we fall through to Off, exactly like an unseedable state
+        # always did.
+        seedable_states = valid_states
         seeded_from_helper = False
-        if existing in (None, "unknown", "unavailable") and self.ui_state_select:
-            helper_state = self.get_state(self.ui_state_select)
-            if helper_state in seedable_states:
-                self.log(
-                    f"State seeded from {self.ui_state_select} - sensor was missing (HA restart?)",
-                    level="INFO",
-                )
-                existing = helper_state
-                seeded_from_helper = True
-            elif helper_state in valid_states:
-                self.log(
-                    f"{self.ui_state_select} says {helper_state} but the sensor is gone with its cycle "
-                    f"clock - not seeding; power detection re-establishes a wash that is still running",
-                    level="INFO",
-                )
-        self.state = existing if existing in valid_states else "Off"
-        recovery_off_to_running = False
-        # HA restart (or recorder glitch) can leave sensor Off while the washer is actually drawing start power.
-        # If we skip restore and bootstrap calls _confirm_running, we wipe start_time and user context.
-        if self.state == "Off":
+        helper_state = None
+        if entity_missing and self.ui_state_select:
+            helper_state = self.get_state(self.ui_state_select)                                # D
+
+        try:
+            boot_watts = float(self.get_state(self.power_sensor) or 0)                         # E
+        except (ValueError, TypeError):
+            boot_watts = 0.0
+
+        # ----- F: resolve state name + start_time + fields (pure - no entity writes yet) -----
+        # Precedence when the entity itself has nothing usable: durable store, then the mirror,
+        # then Off. Store beats helper because the write order is store -> entity -> helper (see
+        # _maybe_persist_cycle_state / _save_cycle_state) - by the time the mirror could reflect
+        # a DIFFERENT state, the store write for the entity's actual state already happened.
+        resolved_state = existing if entity_trusted else None
+        start_time = None
+        store_used = False
+        restore_attrs = None
+        restore_last_changed = boot_last_changed if entity_trusted else None
+        if not entity_trusted:
             try:
-                boot_watts = float(self.get_state(self.power_sensor) or 0)
-            except (ValueError, TypeError):
-                boot_watts = 0.0
-            if boot_watts >= self.start_w:
+                store_state, store_start = self._resolve_store_candidate(store_data)
+                if store_state is not None:
+                    resolved_state = store_state
+                    start_time = store_start
+                    store_used = True
+                    self._start_time_source = "durable_store"
+                    restore_attrs = self._store_data_to_entity_attrs(store_data)
+                    if helper_state in valid_states and helper_state != store_state:
+                        self.log(
+                            f"Boot: durable store says {store_state!r} but {self.ui_state_select} "
+                            f"says {helper_state!r} - store wins (write order is store -> "
+                            f"entity -> helper)",
+                            level="WARNING",
+                        )
+                elif store_data and store_data.get("state") in ("Unemptied", "Emptied"):
+                    # Clock-free states: _resolve_store_candidate above only ever validates
+                    # Running/Paused (they need a start_time; these two don't), so a store
+                    # record for either lands here instead. Resolving the bare name is all that
+                    # is needed - the "elif self.state == 'Unemptied'/'Emptied'" branches below
+                    # already re-arm their own watchdogs unconditionally on self.state, exactly
+                    # as they already do for an AD-only reload or a helper-seed. No staleness
+                    # gate (unlike Running/Paused's start_time/saved_at checks above): these
+                    # states carry no clock to go stale, matching today's unconditional
+                    # helper-seed for the very same two states. Without this branch, a
+                    # store-only Unemptied/Emptied (mirror missing or disagreeing) fell through
+                    # all the way to Off, and that Off's own publish then cleared the very
+                    # record it had just failed to use.
+                    resolved_state = store_data.get("state")
+                    store_used = True
+                    if helper_state in valid_states and helper_state != resolved_state:
+                        self.log(
+                            f"Boot: durable store says {resolved_state!r} but {self.ui_state_select} "
+                            f"says {helper_state!r} - store wins (write order is store -> "
+                            f"entity -> helper)",
+                            level="WARNING",
+                        )
+                elif helper_state in seedable_states:
+                    resolved_state = helper_state
+                    seeded_from_helper = True
+                    self.log(
+                        f"State seeded from {self.ui_state_select} - sensor was missing (HA restart?)",
+                        level="INFO",
+                    )
+                    if resolved_state in ("Running", "Paused") and boot_watts >= self.start_w:
+                        # No durable clock for this seed - last resort: the same state/power
+                        # history the legacy power-is-truth recovery below uses, run early
+                        # enough to inform the gate (start_time must already be known before
+                        # _restore_running_state is even called - see the ordering rule above).
+                        start_time, source = self._infer_boot_start_time_from_history()
+                        if start_time is not None:
+                            self._start_time_source = source
+                elif helper_state in valid_states:
+                    self.log(
+                        f"{self.ui_state_select} says {helper_state} but the sensor is gone with its cycle "
+                        f"clock - not seeding; power detection re-establishes a wash that is still running",
+                        level="INFO",
+                    )
+            except Exception as e:
+                # Every store interaction (and the boot resolution hanging off it) must be
+                # non-fatal - a corrupt store degrades to today's plain restore, never kills
+                # the app.
+                self.log(f"Boot resolve raised unexpectedly: {e} - falling back to plain restore", level="WARNING")
+                resolved_state = None
+                start_time = None
+                store_used = False
+                restore_attrs = None
+
+        self.state = resolved_state if resolved_state in valid_states else "Off"
+
+        # Legacy power-is-truth recovery: entity/store/helper all landed on "Off" but power
+        # says the machine is actively drawing start current. If we skip restore and bootstrap
+        # calls _confirm_running, we wipe start_time and user context.
+        if self.state == "Off" and boot_watts >= self.start_w:
+            self.log(
+                f"Initialize: {self.state_entity} is Off but power is {boot_watts:.0f}W "
+                f"(>= {self.start_w:.0f}W) - treating as restart during an active wash; forcing Running",
+                level="WARNING",
+            )
+            self.state = "Running"
+            if start_time is None:
+                start_time, source = self._infer_boot_start_time_from_history()
+                if start_time is not None:
+                    self._start_time_source = source
+
+        # ----- G: gate -----
+        if not entity_trusted and self.state in ("Running", "Paused") and start_time is None:
+            self.log(
+                f"Initialize: resolved {self.state} with no recoverable start_time (no live "
+                f"entity clock, no usable durable store, no power/history corroboration) - "
+                f"falling through to Off rather than leaving finish detection permanently gated",
+                level="WARNING",
+            )
+            self.state = "Off"
+            store_used = False
+            restore_attrs = None
+            seeded_from_helper = False
+            self._start_time_source = None
+        elif not entity_trusted and self.state in ("Running", "Paused"):
+            self.start_time = start_time
+            if restore_attrs is None:
+                # Helper-seeded + inferred, or the legacy power-is-truth recovery: preserve
+                # whatever the (non-erased, literally "Off") entity's attributes already
+                # carried (e.g. last_off_at, last_door_closed_at from a real previous Off) -
+                # same idea as the old recovery_off_to_running merge - and stamp in the clock
+                # just resolved above.
+                restore_attrs = dict(boot_attrs)
+            restore_attrs["cycle_start_time"] = self._format_utc(self.start_time)
+            restore_attrs["cycle_start_time_local"] = self._format_local(self.start_time)
+            restore_attrs["started_at_display"] = self.start_time.astimezone(self._local_tz()).strftime("%H:%M")
+
+        # Restore _store_state_since (see _cycle_store_payload's docstring) so it survives
+        # multiple consecutive restarts instead of resetting to "now" every boot: prefer the
+        # entity's own last_changed when it is itself live (AD-only reload - boot_last_changed
+        # is always None after a HA-restart erasure, so this is meaningless there), else the
+        # store's own state_since when THIS boot's resolution actually came from the store
+        # (store_used - never from an unrelated store record that lost out to the mirror or was
+        # rejected as stale). Only when a real value is found is _store_last_state also set to
+        # the resolved self.state, so the imminent first write below does not mistake this
+        # restart for a fresh transition and re-stamp state_since to "now" anyway; when nothing
+        # restorable is found, _store_last_state is left alone and that first write's own
+        # "now" stamp (the pre-existing behaviour) stands, same as it always has.
+        if self.state != "Off":
+            restored_since = None
+            if entity_trusted and boot_last_changed:
+                restored_since = cystore.parse_utc(boot_last_changed)
+            elif store_used and store_data:
+                restored_since = cystore.parse_utc(store_data.get("state_since"))
+            if restored_since is not None:
+                self._store_state_since = restored_since
+                self._store_last_state = self.state
+
+        # Only publish when state differs. Re-sending the same state can strip attributes on
+        # some HA/AppDaemon setups. (seeded_from_helper/store_used always publish: the state
+        # entity itself is still missing/unknown, or literally disagreed with what we resolved.)
+        if self.state != existing or seeded_from_helper:                                       # H
+            if self.state in ("Running", "Paused"):
+                self._set_state_entity(state=self.state, attributes=restore_attrs, replace=True)
+            else:
+                self._set_state_entity(state=self.state)
+
+        # Restore in-memory state from persisted attributes so ETA, energy-used, "user
+        # confirmed programme", etc. survive an app reload, an HA restart (durable store), or a
+        # missed transition (power-is-truth). Paused now shares this path with Running - both
+        # read from the SAME attrs snapshot below, and the 5h running watchdog spans Paused
+        # time too (never cancelled on pause - see _transition_to_paused), so a restored Paused
+        # needs the same timer re-arm Running always got; previously it got none at all.
+        if self.state in ("Running", "Paused"):
+            self._restore_running_state(                                                       # I
+                attrs=restore_attrs if restore_attrs is not None else boot_attrs,
+                last_changed=restore_last_changed,
+            )
+            # Post-condition safety net on top of the gate above: _restore_running_state's
+            # correction paths are complex enough, and shared with the live-tick code, that a
+            # defensive last-resort is worth more here than treating "unreachable" as a promise
+            # (e.g. a corrupt cycle_start_time on an otherwise-trusted live entity).
+            if self.start_time is None:
                 self.log(
-                    f"Initialize: {self.state_entity} is Off but power is {boot_watts:.0f}W "
-                    f"(>= {self.start_w:.0f}W) - treating as restart during an active wash; forcing Running",
+                    "Initialize: start_time was lost while restoring - falling through to Off "
+                    "rather than leaving finish detection permanently gated",
                     level="WARNING",
                 )
-                self.state = "Running"
-                recovery_off_to_running = True
-
-        # Only publish when state differs. Re-sending the same state can strip attributes on some HA/AppDaemon setups.
-        # (seeded_from_helper always publishes: the state entity itself is still missing/unknown.)
-        if self.state != existing or seeded_from_helper:
-            if recovery_off_to_running:
-                try:
-                    full = self.get_state(self.state_entity, attribute="all") or {}
-                    keep = dict((full.get("attributes") or {}))
-                    self._set_state_entity( state="Running", attributes=keep, replace=True)
-                except Exception:
-                    self._set_state_entity( state=self.state)
+                self._transition_to_off("Restore: lost start_time during restore", force=True)
             else:
-                self._set_state_entity( state=self.state)
-
-        # If we were Running before restart, restore in-memory state from persisted attributes
-        # so ETA, energy-used, and "user confirmed programme" survive app reloads.
-        if self.state == "Running":
-            self._restore_running_state()
+                self._finalize_restored_cycle_identity(store_data if store_used else None)
+                self._save_cycle_state()                                                        # J
         elif self.state == "Unemptied":
             # Restart door-recheck and watchdog timers so we don't get stuck in Unemptied after
             # an app reload (the timers are not persisted across restarts).
@@ -741,17 +1128,180 @@ class WasherMonitor(hass.Hass):
 
         self.log(f"WasherMonitor (Miele WEA 035 WCS) initialized - state: {self.state}", level="INFO")
 
-    def _restore_running_state(self):
-        """Restore in-memory state when we were Running before an app restart.
+    def _resolve_store_candidate(self, store_data):
+        """Validate a loaded CycleStore payload as a boot-time Running/Paused candidate.
 
-        Reads cycle_start_time, energy_at_start, detected_programme from the
-        state entity attributes (we persist these while Running). Also sets
-        programme_confirmed_by_user if the user had selected a programme in the
-        confirm dropdown. Restarts energy-check and watchdog timers so finish
-        detection continues.
+        Returns (state, start_time) for a fresh, plausible record; (None, None) for anything
+        else - missing, some other state (Unemptied/Emptied/Off - out of scope here; a
+        store-only Unemptied/Emptied is instead resolved by a sibling branch in initialize(),
+        since neither needs a clock), an unparsable clock, a start_time implausibly in the
+        future (see below), or stale by either downtime measure below. Each rejection logs
+        exactly one WARNING. Never raises.
         """
+        if not store_data or store_data.get("state") not in ("Running", "Paused"):
+            return None, None
+        state = store_data.get("state")
+        start_time = cystore.parse_utc(store_data.get("start_time"))
+        if start_time is None:
+            self.log(f"Boot: durable store has {state} with no usable start_time - ignoring", level="WARNING")
+            return None, None
+        now = self._now_utc()
+        age_hours = (now - start_time).total_seconds() / 3600
+        if age_hours < -(self.store_future_skew_minutes / 60):
+            # A start_time after "now" (beyond a small skew allowance) is not just stale, it is
+            # impossible - most likely the box's clock was behind real time when this was saved
+            # (NTP not yet synced at boot). Trusting it would restore Running with every
+            # duration guard comparing against a negative run length, which can never pass -
+            # a permanently wedged Running that this rejection avoids the same way the "too old"
+            # rejection below avoids a genuinely-stuck one.
+            self.log(
+                f"Boot: durable store's {state} start_time is "
+                f"{abs(age_hours) * 60:.0f}min in the future (box clock behind real time at "
+                f"save time?) - ignoring, falling through",
+                level="WARNING",
+            )
+            return None, None
+        if age_hours > self.max_running_hours:
+            self.log(
+                f"Boot: durable store's {state} start_time is {age_hours:.1f}h old (> "
+                f"max_running_hours {self.max_running_hours:.0f}h) - ignoring, falling through",
+                level="WARNING",
+            )
+            return None, None
+        saved_at = cystore.parse_utc(store_data.get("saved_at"))
+        if saved_at is not None:
+            downtime_hours = (now - saved_at).total_seconds() / 3600
+            if downtime_hours > self.store_max_downtime_hours:
+                self.log(
+                    f"Boot: durable store was last saved {downtime_hours:.1f}h ago (> "
+                    f"store_max_downtime_hours {self.store_max_downtime_hours:.0f}h) - ignoring",
+                    level="WARNING",
+                )
+                return None, None
+        return state, start_time
+
+    def _infer_boot_start_time_from_history(self):
+        """Pure variant of _infer_wash_start_time_when_missing: same two-step fallback chain
+        (state-entity transition history, then sustained high power in the power sensor's own
+        history), but returns the candidate instead of assigning it to self.start_time and
+        pushing it to the entity. Used during initialize()'s boot resolution, before
+        self.start_time is known - the ordering rule at the top of initialize() forbids any
+        entity write until every boot-resolution read is done, and
+        _infer_wash_start_time_when_missing writes immediately on success.
+
+        Returns (start_time, source) - source is "state_history" or "power_history", matching
+        the _START_TIME_SOURCE_RANK keys those two signals already use elsewhere in this file -
+        or (None, None) when neither finds anything.
+        """
+        inferred = self._infer_start_from_state_history()
+        if inferred is not None:
+            return inferred, "state_history"
+        inferred = self._infer_first_sustained_high_power_start(hours=8)
+        if inferred is not None:
+            return inferred, "power_history"
+        return None, None
+
+    def _store_data_to_entity_attrs(self, store_data) -> dict:
+        """Translate a durable-store payload into the entity-attribute shape
+        _restore_running_state already knows how to read (e.g. start_time -> cycle_start_time,
+        heating_phase_count -> heating_bursts), so the store-restore path reuses that
+        function's existing logic byte-for-byte instead of a second, parallel implementation.
+        cycle_start_time itself is added by the caller once self.start_time is finalized.
+        """
+        attrs = {}
+        for store_key, attr_key in (
+            ("last_door_closed_at", "last_door_closed_at"),
+            ("last_door_closed_trusted", "last_door_closed_trusted"),
+            ("last_off_at", "last_off_at"),
+            ("energy_at_start", "energy_at_start"),
+            ("started_by", "started_by"),
+            ("started_by_method", "started_by_method"),
+            ("session_cost_kr", "session_cost_kr"),
+            ("detected_programme", "detected_programme"),
+            ("detected_temperature", "detected_temperature"),
+            ("expected_dur_at_start", "expected_dur_at_start"),
+            ("expected_dur_key", "expected_dur_key"),
+            ("programme_confirmed_by_user", "programme_confirmed_by_user"),
+            ("programme_confirmed_by", "programme_confirmed_by"),
+            ("delayed_start_trimmed", "delayed_start_trimmed"),
+            ("last_high_energy_at", "last_high_energy_at"),
+            ("heating_phase_count", "heating_bursts"),
+        ):
+            value = store_data.get(store_key)
+            if value not in (None, ""):
+                attrs[attr_key] = value
+        return attrs
+
+    def _finalize_restored_cycle_identity(self, store_data):
+        """Resolve _cycle_id / notification_sent - and the store-only per-cycle counters
+        _restore_running_state never reads (heating_phase_count, max_power_seen,
+        finish_confirmed, in_finishing_tail and its tail-pulse/tail-pattern fields,
+        door_opened_during_cycle) - once start_time is finally settled, right after
+        _restore_running_state returns.
+
+        store_data is the durable-store payload IF this boot restored from it, else None
+        (AD-reload, helper-seed+inference, or the legacy power-is-truth recovery - none of
+        those have a prior cycle identity to inherit). When store_data is given, it is only
+        trusted while self._start_time_source is still "durable_store": the power-history
+        cross-check inside _restore_running_state (unconditional, no rank gate - see
+        _start_time_rank) may have judged the store's clock too stale and corrected it to a
+        later, inferred start ("previous-cycle contamination"). At that point the store was
+        tracking a DIFFERENT cycle than the one actually being restored, and none of its
+        per-cycle counters may carry over: a stale notification_sent=True must never suppress a
+        real announcement for what is, in every way that matters, a new cycle.
+        """
+        if store_data is not None and self._start_time_source == "durable_store":
+            self._cycle_id = store_data.get("cycle_id") or str(uuid.uuid4())
+            self.notification_sent = bool(store_data.get("notification_sent"))
+            self.heating_phase_count = int(store_data.get("heating_phase_count") or 0)
+            self.max_power_seen = float(store_data.get("max_power_seen") or 0.0)
+            if store_data.get("observed_heating"):
+                self.observed_heating = True
+            self.finish_confirmed = bool(store_data.get("finish_confirmed"))
+            self.in_finishing_tail = bool(store_data.get("in_finishing_tail"))
+            self.in_finishing_tail_entered_at = cystore.parse_utc(store_data.get("in_finishing_tail_entered_at"))
+            self.last_tail_pulse_at = cystore.parse_utc(store_data.get("last_tail_pulse_at"))
+            self.tail_pattern_locked = bool(store_data.get("tail_pattern_locked"))
+            self.tail_pattern_cycle_seconds = store_data.get("tail_pattern_cycle_seconds")
+            self.tail_pattern_last_pulse_at = cystore.parse_utc(store_data.get("tail_pattern_last_pulse_at"))
+            self.tail_pattern_locked_at = cystore.parse_utc(store_data.get("tail_pattern_locked_at"))
+            self.door_opened_during_cycle = bool(store_data.get("door_opened_during_cycle"))
+        else:
+            if store_data is not None:
+                self.log(
+                    "Restore: power/history evidence moved the stored start_time - treating this "
+                    "as a fresh cycle identity (heating/tail/notification counters not carried over)",
+                    level="INFO",
+                )
+            self._cycle_id = str(uuid.uuid4())
+            self.notification_sent = False
+
+    def _restore_running_state(self, attrs=None, last_changed=None):
+        """Restore in-memory state when we were Running or Paused before a restart.
+
+        Every read below comes from `attrs` (a snapshot of the state entity's attributes -
+        either the still-live entity for an AppDaemon-only reload, or synthesized from the
+        durable store when HA erased the entity - see initialize()'s boot resolution) and
+        `last_changed`, never a fresh get_state() call: 2026-07-27 shipped a version that
+        recreated the erased entity first and then read cycle_start_time back from that same
+        just-created (attribute-less) entity, so start_time stayed None and every timer that
+        could end the cycle was gated on it forever. When called with attrs=None (e.g. a
+        standalone call in a test), both default to a fresh snapshot of the entity, matching
+        the old always-read-live behaviour exactly.
+
+        Reads cycle_start_time, energy_at_start, detected_programme from that snapshot (we
+        persist these while Running/Paused). Also sets programme_confirmed_by_user if the user
+        had selected a programme in the confirm dropdown. Restarts energy-check and watchdog
+        timers so finish detection continues.
+        """
+        if attrs is None:
+            full = self.get_state(self.state_entity, attribute="all") or {}
+            attrs = full.get("attributes") or {}
+            if last_changed is None:
+                last_changed = full.get("last_changed") or full.get("last_updated")
+
         try:
-            start_str = self.get_state(self.state_entity, attribute="cycle_start_time")
+            start_str = attrs.get("cycle_start_time")
             if start_str:
                 self.start_time = _parse_utc(start_str)
                 if self.start_time:
@@ -762,9 +1312,9 @@ class WasherMonitor(hass.Hass):
         # last_door_closed_at on the entity may be from before we stored trust, or wrong; only use when trusted.
         self.last_door_closed_trusted = False
         try:
-            trusted_attr = self.get_state(self.state_entity, attribute="last_door_closed_trusted")
+            trusted_attr = attrs.get("last_door_closed_trusted")
             trusted = self._attr_bool_true(trusted_attr)
-            last_door_str_entity = self.get_state(self.state_entity, attribute="last_door_closed_at")
+            last_door_str_entity = attrs.get("last_door_closed_at")
             if trusted and last_door_str_entity:
                 ld = _parse_utc(last_door_str_entity)
                 if ld:
@@ -782,7 +1332,7 @@ class WasherMonitor(hass.Hass):
         # If we restored an old cycle_start_time (e.g. HA hadn't applied our set_state before restart),
         # clamp to after last Off / last trusted door close so we never show a start time from a previous cycle.
         try:
-            last_off_str = self.get_state(self.state_entity, attribute="last_off_at")
+            last_off_str = attrs.get("last_off_at")
             if self.start_time:
                 clamp_to = None
                 if last_off_str:
@@ -812,45 +1362,40 @@ class WasherMonitor(hass.Hass):
         # Restore: if start_time is still before when we went to Running (entity last_changed), use last_changed.
         # Skip when we have a trusted door time - last_changed can be from recovery, not real cycle start.
         try:
-            if self.start_time and not self.last_door_closed_trusted:
-                full = self.get_state(self.state_entity, attribute="all")
-                if full and isinstance(full, dict):
-                    last_changed_str = full.get("last_changed") or full.get("last_updated")
-                    if last_changed_str:
-                        last_changed_dt = _parse_utc(str(last_changed_str))
-                        if last_changed_dt and self.start_time < last_changed_dt:
-                            # 2026-08-12: an HA restart wipes and re-creates this entity, so
-                            # right after a restart last_changed is merely the moment the
-                            # entity was re-published - NOT when the cycle went Running. The
-                            # "cycle 2" correction below took that wipe artifact at face value
-                            # and dragged a real 11:41 start to 13:24. Any restore anchor
-                            # within a few minutes of the app's own init time is the wipe, not
-                            # information - keep the attribute-restored start_time instead.
-                            wipe_grace_s = getattr(self, "restore_wipe_anchor_grace_s", 300)
-                            anchor_age_s = (self._now_utc() - last_changed_dt).total_seconds()
-                            if abs(anchor_age_s) <= wipe_grace_s:
-                                self.log(
-                                    f"Restore: entity last_changed {self._strftime_local(last_changed_dt)} is within "
-                                    f"{wipe_grace_s}s of app init - restart artifact, keeping start_time "
-                                    f"{self._strftime_local(self.start_time)}",
-                                    level="INFO",
-                                )
-                            else:
-                                gap_seconds = (last_changed_dt - self.start_time).total_seconds()
-                                # entity_last_changed is the weakest provenance we have (rank 6).
-                                # The wipe grace above catches the restart artifact; this rank gate
-                                # covers the rest - it must never overwrite a clock a stronger
-                                # source already vouched for, above all one restored from the
-                                # durable store (rank 3), which outlives the entity entirely.
-                                if gap_seconds >= self.pause_window_minutes * 60 and self._start_time_rank() >= 6:
-                                    self.log(
-                                        f"Restore: correcting start_time to entity last_changed (cycle 2) "
-                                        f"(was {self._strftime_local(self.start_time)}, now {self._strftime_local(last_changed_dt)})",
-                                        level="INFO",
-                                    )
-                                    self.start_time = last_changed_dt
-                                    self._start_time_source = "entity_last_changed"
-                                    self._push_corrected_start_time_to_entity()
+            if self.start_time and not self.last_door_closed_trusted and last_changed:
+                last_changed_dt = _parse_utc(str(last_changed))
+                if last_changed_dt and self.start_time < last_changed_dt:
+                    # An HA restart wipes and re-creates this entity, so right after a restart
+                    # last_changed is merely the moment the entity was re-published - NOT when
+                    # the cycle went Running. The "cycle 2" correction below took that wipe
+                    # artifact at face value and dragged a real 11:41 start to 13:24. Any
+                    # restore anchor within a few minutes of the app's own init time is the
+                    # wipe, not information - keep the restored start_time instead.
+                    wipe_grace_s = getattr(self, "restore_wipe_anchor_grace_s", 300)
+                    anchor_age_s = (self._now_utc() - last_changed_dt).total_seconds()
+                    if abs(anchor_age_s) <= wipe_grace_s:
+                        self.log(
+                            f"Restore: entity last_changed {self._strftime_local(last_changed_dt)} is within "
+                            f"{wipe_grace_s}s of app init - restart artifact, keeping start_time "
+                            f"{self._strftime_local(self.start_time)}",
+                            level="INFO",
+                        )
+                    else:
+                        gap_seconds = (last_changed_dt - self.start_time).total_seconds()
+                        # entity_last_changed is the weakest provenance we have (rank 6). The
+                        # wipe grace above catches the restart artifact; this rank gate covers
+                        # the rest - it must never overwrite a clock a stronger source already
+                        # vouched for, above all one restored from the durable store (rank 3),
+                        # which outlives the entity entirely.
+                        if gap_seconds >= self.pause_window_minutes * 60 and self._start_time_rank() >= 6:
+                            self.log(
+                                f"Restore: correcting start_time to entity last_changed (cycle 2) "
+                                f"(was {self._strftime_local(self.start_time)}, now {self._strftime_local(last_changed_dt)})",
+                                level="INFO",
+                            )
+                            self.start_time = last_changed_dt
+                            self._start_time_source = "entity_last_changed"
+                            self._push_corrected_start_time_to_entity()
         except (TypeError, ValueError, AttributeError):
             pass
 
@@ -877,7 +1422,7 @@ class WasherMonitor(hass.Hass):
                 self.log(f"Could not validate/correct start_time from power history: {e}", level="DEBUG")
 
         try:
-            energy_at_start = self.get_state(self.state_entity, attribute="energy_at_start")
+            energy_at_start = attrs.get("energy_at_start")
             if energy_at_start is not None:
                 self.energy_start = float(energy_at_start)
                 self.log(f"Restored energy_at_start: {self.energy_start}", level="DEBUG")
@@ -888,8 +1433,8 @@ class WasherMonitor(hass.Hass):
         # reload mid-Running never re-runs _begin_running_cycle, so without this self._cycle_actor
         # would fall back to unknown even though we captured it before the restart.
         try:
-            started_by = self.get_state(self.state_entity, attribute="started_by")
-            started_by_method = self.get_state(self.state_entity, attribute="started_by_method")
+            started_by = attrs.get("started_by")
+            started_by_method = attrs.get("started_by_method")
             self._cycle_actor = self._cycle_actor_from_state_attrs(
                 {"started_by": started_by, "started_by_method": started_by_method}
             )
@@ -899,7 +1444,7 @@ class WasherMonitor(hass.Hass):
             pass
 
         try:
-            cost_attr = self.get_state(self.state_entity, attribute="session_cost_kr")
+            cost_attr = attrs.get("session_cost_kr")
             if cost_attr is not None:
                 self._session_cost_kr = float(cost_attr)
                 self.log(f"Restored session_cost_kr: {self._session_cost_kr}", level="DEBUG")
@@ -907,9 +1452,9 @@ class WasherMonitor(hass.Hass):
             pass
 
         try:
-            prog = self.get_state(self.state_entity, attribute="detected_programme")
+            prog = attrs.get("detected_programme")
             if prog and prog != "unknown":
-                restored_temp = self.get_state(self.state_entity, attribute="detected_temperature")
+                restored_temp = attrs.get("detected_temperature")
                 if restored_temp and restored_temp not in ("unknown", "unavailable", ""):
                     self.detected_temperature = restored_temp
                 self.detected_programme = prog
@@ -923,7 +1468,7 @@ class WasherMonitor(hass.Hass):
         # Restore heating from power history when entity has heating_bursts=0 (e.g. false finish, restart).
         # Graph shows 2000W+ at 14:02 but we may have missed the callback - history has the truth.
         try:
-            hb = self.get_state(self.state_entity, attribute="heating_bursts")
+            hb = attrs.get("heating_bursts")
             if (hb is None or int(hb or 0) == 0) and not self.observed_heating:
                 self._restore_heating_from_power_history()
         except (TypeError, ValueError, AttributeError):
@@ -932,7 +1477,7 @@ class WasherMonitor(hass.Hass):
         # Restore expected_dur_at_start from selector only when user had confirmed (entity attribute).
         # Otherwise the selector may hold an auto-filled prediction from a previous run.
         try:
-            confirmed_attr = self.get_state(self.state_entity, attribute="programme_confirmed_by_user")
+            confirmed_attr = attrs.get("programme_confirmed_by_user")
             user_confirmed = confirmed_attr is True or confirmed_attr == "true" or confirmed_attr == "True"
         except Exception:
             user_confirmed = False
@@ -952,16 +1497,14 @@ class WasherMonitor(hass.Hass):
                 pass
         if self.expected_dur_at_start is None:
             try:
-                v = self.get_state(self.state_entity, attribute="expected_dur_at_start")
+                v = attrs.get("expected_dur_at_start")
                 if v not in (None, "", "unknown", "unavailable"):
                     self.expected_dur_at_start = float(v)
                     # Bar programme key persisted alongside (see the Running publish) so the
                     # energy-disproof lowering keeps working across the frequent mid-cycle
                     # app restarts; stays None on older entities (lowering disabled until
                     # the live classification re-keys it).
-                    self._guard_bar_class = self._parse_guard_bar_key(
-                        self.get_state(self.state_entity, attribute="expected_dur_key")
-                    )
+                    self._guard_bar_class = self._parse_guard_bar_key(attrs.get("expected_dur_key"))
                     self.log(f"Restored expected_dur_at_start from entity: {self.expected_dur_at_start:.0f} min", level="DEBUG")
             except (TypeError, ValueError, AttributeError):
                 pass
@@ -970,7 +1513,7 @@ class WasherMonitor(hass.Hass):
         # in _check_energy_finish) so a start_time we already slid past door-close is not dragged
         # back to it.
         try:
-            trimmed_attr = self.get_state(self.state_entity, attribute="delayed_start_trimmed")
+            trimmed_attr = attrs.get("delayed_start_trimmed")
             self._delayed_start_trimmed = self._attr_bool_true(trimmed_attr)
         except (TypeError, ValueError, AttributeError):
             pass
@@ -993,10 +1536,10 @@ class WasherMonitor(hass.Hass):
                 # Restore from the persisted state entity attribute, not from the dropdown.
                 # The dropdown can be set by auto-detection (via select_option), so reading
                 # it here would incorrectly mark auto-detected programmes as user-confirmed.
-                confirmed_attr = self.get_state(self.state_entity, attribute="programme_confirmed_by_user")
+                confirmed_attr = attrs.get("programme_confirmed_by_user")
                 if confirmed_attr is True or confirmed_attr == "true" or confirmed_attr == "True":
                     self.programme_confirmed_by_user = True
-                    by_attr = self.get_state(self.state_entity, attribute="programme_confirmed_by") or ""
+                    by_attr = attrs.get("programme_confirmed_by") or ""
                     self.confirmed_by_username = by_attr if by_attr else None
                     label = self.get_state(self.confirm_entity)
                     by_str = f" by {self.confirmed_by_username}" if self.confirmed_by_username else ""
@@ -1026,7 +1569,7 @@ class WasherMonitor(hass.Hass):
             self.history_poll_timer = self.run_in(self._periodic_check_power_history, interval)
         # Restore last_high_energy_at from state entity if we didn't get it from history.
         try:
-            last_high_str = self.get_state(self.state_entity, attribute="last_high_energy_at")
+            last_high_str = attrs.get("last_high_energy_at")
             if last_high_str and self.last_high_energy_at is None:
                 self.last_high_energy_at = _parse_utc(last_high_str)
                 if self.last_high_energy_at:
@@ -3068,6 +3611,7 @@ class WasherMonitor(hass.Hass):
         """Reset all cycle-related tracking variables."""
         self.start_time = None
         self._start_time_source = None  # must not leak into the next cycle's block C rank gate
+        self._cycle_id = None  # the store is already cleared by now (Off just called _set_state_entity)
         self._cycle_actor = None
         self.energy_start = None
         self._session_cost_kr = 0.0
@@ -3476,6 +4020,12 @@ class WasherMonitor(hass.Hass):
         except (TypeError, ValueError, AttributeError):
             pass
         self.notification_sent = False
+        # Fresh identity for this NEW cycle, paired with notification_sent=False just above -
+        # both reset together whenever a cycle actually (re)starts live. On restore, by
+        # contrast, notification_sent is decided by self._start_time_source == "durable_store",
+        # not by comparing cycle_id values - see _finalize_restored_cycle_identity; cycle_id
+        # there is only carried alongside that same decision, never itself the discriminator.
+        self._cycle_id = str(uuid.uuid4())
         self.door_opened_during_cycle = False
         self.low_power_counter = 0
         self.low_power_start_time = None

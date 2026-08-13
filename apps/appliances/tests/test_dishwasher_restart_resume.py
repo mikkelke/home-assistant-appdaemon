@@ -149,6 +149,12 @@ def make_incident_app(tmpdir, *, init_at=INIT_AT, helper_state="Running",
         # checked-in file, not a fixture copy.
         "programmes_file": str(REPO_APPLIANCES / "dishwasher_programmes.yaml"),
         "feedback_file": feedback_path,
+        # Scope the durable cycle store to tmpdir like feedback_file above. Without this the
+        # app defaults to apps/appliances/dishwasher_cycle_state.json - a REAL file next to the
+        # source - so one run left a store behind that the next run's boot resolution then read
+        # back, making these tests order-dependent and failing five of them. Harmless before
+        # the store existed; load-bearing now that it sits in the resolution path.
+        "state_file": str(Path(tmpdir) / "dishwasher_cycle_state.json"),
     }
 
     app.now = init_at
