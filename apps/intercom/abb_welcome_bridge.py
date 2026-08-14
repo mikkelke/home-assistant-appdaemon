@@ -136,7 +136,10 @@ def build_index_entry(ring_at, station_id, door, event_type, filename, url_prefi
     """One index.json row - the exact shape the dashboard gallery will consume:
     {"ts","datetime","station","door","event_type","filename","url"}.
     ts = epoch seconds of the ring (sortable int); datetime = the same instant
-    as a local-time ISO string (human-facing, like the archive filenames)."""
+    as a local-time ISO string (human-facing, like the archive filenames).
+    filename may be "" for a clip-only entry (ring whose snapshot never arrived
+    but whose recording did): url must then be "" too, never a bare directory
+    URL the dashboard would try to <img> render."""
     return {
         "ts": int(ring_at.timestamp()),
         "datetime": ring_at.astimezone().isoformat(timespec="seconds"),
@@ -144,7 +147,7 @@ def build_index_entry(ring_at, station_id, door, event_type, filename, url_prefi
         "door": door or "",
         "event_type": event_type,
         "filename": filename,
-        "url": f"{url_prefix.rstrip('/')}/{filename}",
+        "url": f"{url_prefix.rstrip('/')}/{filename}" if filename else "",
     }
 
 
@@ -1234,6 +1237,20 @@ class AbbWelcomeBridge(hass.Hass):
                     event_type,
                     episode.get("clip_filename"),
                 )
+            elif episode.get("clip_filename"):
+                # No snapshot, but a recording was requested: the clip must not die
+                # with the photo. The 2026-08-13 13:06 front ring did exactly this -
+                # the gateway never produced a screenshot, so the 378 KB clip sat
+                # orphaned on disk and the ring never reached the gallery at all.
+                self.submit_to_executor(
+                    self._archive_write,
+                    None,
+                    episode["started_at"].isoformat(),
+                    episode["station_id"],
+                    episode["door"],
+                    event_type,
+                    episode["clip_filename"],
+                )
             else:
                 self.log(f"EPISODE-CLOSE id={episode['id']}: no fresh snapshot arrived - nothing archived", level="WARNING")
         except Exception as e:
@@ -1262,15 +1279,21 @@ class AbbWelcomeBridge(hass.Hass):
 
     # --- disk layer (executor thread; blocking IO stays off the callback threads) ---
     def _archive_write(self, raw, ring_iso, station_id, door, event_type, clip_filename=None):
+        """raw=None means clip-only: no photo arrived for the episode, so no jpg is
+        written and the entry carries filename=""/url="" (the gallery renders a
+        video placeholder tile). If the clip then turns out missing/empty too,
+        there is nothing to show and no entry is written at all."""
         try:
             ring_at = parse_iso_ts(ring_iso) or datetime.now(timezone.utc)
             self.archive_dir.mkdir(parents=True, exist_ok=True)
             stamp = ring_at.astimezone().strftime("%Y%m%d_%H%M%S")
-            filename = f"abb_ring_{stamp}_{door_slug(door, station_id)}_{event_type}.jpg"
-            path = self.archive_dir / filename
-            tmp = path.with_name(path.name + ".tmp")
-            tmp.write_bytes(raw)
-            os.replace(tmp, path)
+            filename = ""
+            if raw is not None:
+                filename = f"abb_ring_{stamp}_{door_slug(door, station_id)}_{event_type}.jpg"
+                path = self.archive_dir / filename
+                tmp = path.with_name(path.name + ".tmp")
+                tmp.write_bytes(raw)
+                os.replace(tmp, path)
             entry = build_index_entry(ring_at, station_id, door, event_type,
                                       filename, self.archive_url_prefix)
             if clip_filename:
@@ -1290,9 +1313,13 @@ class AbbWelcomeBridge(hass.Hass):
                 else:
                     clip_path.unlink(missing_ok=True)
                     self.log(f"Clip {clip_filename} never landed - photo-only entry", level="INFO")
+            if not filename and not entry.get("clip_url"):
+                self.log("Neither photo nor clip survived for this ring - nothing archived", level="WARNING")
+                return
             self._update_index(entry)
-            self.log(f"ARCHIVE saved {filename} ({len(raw)} bytes)"
-                     + (f" + clip {clip_filename}" if entry.get("clip_url") else ""), level="INFO")
+            what = f"{filename} ({len(raw)} bytes)" if filename else f"clip-only {clip_filename}"
+            self.log(f"ARCHIVE saved {what}"
+                     + (f" + clip {clip_filename}" if filename and entry.get("clip_url") else ""), level="INFO")
         except Exception as e:
             self.log(f"Archive write failed: {e}", level="WARNING")
 
@@ -1312,19 +1339,29 @@ class AbbWelcomeBridge(hass.Hass):
     def _update_index(self, entry):
         """Read-modify-write of index.json + retention pruning. Atomic (tmp +
         os.replace) because the dashboard may fetch mid-write - same contract as
-        forecast_log/rober2 maps. Executor thread only."""
-        images = [i for i in self._load_index() if i.get("filename") != entry["filename"]]
+        forecast_log/rober2 maps. Executor thread only.
+
+        The dedup key is filename-or-clip: a clip-only entry has filename "",
+        and deduping on bare filename would make every new clip-only entry
+        swallow all previous ones."""
+        entry_key = entry.get("filename") or entry.get("clip_filename") or ""
+        images = [
+            i for i in self._load_index()
+            if (i.get("filename") or i.get("clip_filename") or "") != entry_key
+        ]
         images.insert(0, entry)
         images.sort(key=lambda i: i.get("ts", 0), reverse=True)
         now_ts = datetime.now(timezone.utc).timestamp()
         keep, drop = prune_images(images, now_ts, self.retain_days, self.max_files)
         for stale in drop:
             try:
-                (self.archive_dir / str(stale.get("filename", ""))).unlink(missing_ok=True)
+                if stale.get("filename"):
+                    (self.archive_dir / str(stale["filename"])).unlink(missing_ok=True)
                 if stale.get("clip_filename"):
                     (self.archive_dir / str(stale["clip_filename"])).unlink(missing_ok=True)
             except Exception as e:
                 self.log(f"Prune failed for {stale.get('filename')}: {e}", level="DEBUG")
+        self._sweep_orphans(keep, now_ts)
         index_file = self.archive_dir / "index.json"
         tmp = index_file.with_name(index_file.name + ".tmp")
         payload = {
@@ -1335,6 +1372,28 @@ class AbbWelcomeBridge(hass.Hass):
         tmp.write_text(json.dumps(payload))
         os.replace(tmp, index_file)
         self._check_archive_size()
+
+    def _sweep_orphans(self, keep, now_ts):
+        """Unlink bridge-named archive files (abb_*.jpg/.mp4) referenced by NO index
+        entry once they are a day old. Retention pruning only ever deletes files its
+        dropped entries point at, so a file that never got an entry (the pre-fix
+        clip-orphan path, a crash between file write and index write) lived forever.
+        Only abb_* names are candidates - anything a human parked in the directory
+        is not ours to delete - and the 24 h grace covers any in-flight recording.
+        Executor thread only (called from _update_index)."""
+        try:
+            referenced = {i.get("filename") for i in keep} | {i.get("clip_filename") for i in keep}
+            for f in self.archive_dir.glob("abb_*"):
+                if f.suffix not in (".jpg", ".mp4") or f.name in referenced:
+                    continue
+                try:
+                    if now_ts - f.stat().st_mtime > 86400:
+                        f.unlink()
+                        self.log(f"Pruned orphan {f.name} (never indexed)", level="INFO")
+                except OSError:
+                    pass
+        except Exception as e:
+            self.log(f"Orphan sweep failed: {e}", level="DEBUG")
 
     def _check_archive_size(self):
         try:

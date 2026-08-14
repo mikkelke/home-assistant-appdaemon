@@ -12,6 +12,7 @@
 # history while building this app - see abb_welcome_bridge.py's header.
 
 import json
+import os
 import sys
 import tempfile
 import types
@@ -794,6 +795,65 @@ class RingClipTests(unittest.TestCase):
         self.app._archive_write(JPEG, RING_ESP.isoformat(), "100000002", "front door", "ring")
         self.assertFalse((self.app.archive_dir / "old.jpg").exists())
         self.assertFalse((self.app.archive_dir / "old_clip.mp4").exists())
+
+    def test_clip_survives_a_ring_with_no_snapshot(self):
+        # The 2026-08-13 13:06 front ring: recording landed, gateway screenshot
+        # never arrived. The old close path archived NOTHING - clip orphaned on
+        # disk, ring invisible in the gallery. Now: a clip-only index entry.
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        episode["clip_filename"] = "abb_clip_t_front.mp4"
+        self.app.archive_dir.mkdir(parents=True, exist_ok=True)
+        (self.app.archive_dir / "abb_clip_t_front.mp4").write_bytes(b"mp4data")
+        self.clock.at += timedelta(seconds=76)
+        _run_scheduled(self.app, "_close_episode")
+        entry = self.app._load_index()[0]
+        self.assertEqual(entry["filename"], "")
+        self.assertEqual(entry["url"], "")
+        self.assertEqual(entry["clip_url"], "/local/abb_doorbell/abb_clip_t_front.mp4")
+        self.assertEqual(entry["door"], "front door")
+        self.assertEqual(list(self.app.archive_dir.glob("*.jpg")), [])
+
+    def test_no_snapshot_and_no_clip_file_archives_nothing(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        episode["clip_filename"] = "abb_clip_gone_front.mp4"  # record failed: file never appeared
+        self.clock.at += timedelta(seconds=76)
+        _run_scheduled(self.app, "_close_episode")
+        self.assertFalse((self.app.archive_dir / "index.json").exists())
+        self.assertTrue(any("Neither photo nor clip" in m for _, m in self.app.logs))
+
+    def test_two_clip_only_entries_coexist(self):
+        # Dedup keys on filename-or-clip: with bare filenames ("" for clip-only),
+        # every new clip-only entry would swallow all previous ones.
+        self.app.archive_dir.mkdir(parents=True, exist_ok=True)
+        (self.app.archive_dir / "abb_clip_a_front.mp4").write_bytes(b"a")
+        (self.app.archive_dir / "abb_clip_b_front.mp4").write_bytes(b"b")
+        self.app._archive_write(None, RING_ESP.isoformat(), "100000002", "front door",
+                                "ring_auto_opened", "abb_clip_a_front.mp4")
+        self.app._archive_write(None, (RING_ESP + timedelta(minutes=1)).isoformat(),
+                                "100000002", "front door", "ring_auto_opened", "abb_clip_b_front.mp4")
+        clips = [e.get("clip_filename") for e in self.app._load_index()]
+        self.assertEqual(clips, ["abb_clip_b_front.mp4", "abb_clip_a_front.mp4"])
+
+    def test_orphan_sweep_removes_never_indexed_files(self):
+        self.app.archive_dir.mkdir(parents=True, exist_ok=True)
+        day_plus = RING_ESP.timestamp() - 2 * 86400
+        old_orphan = self.app.archive_dir / "abb_clip_orphan_front.mp4"
+        old_orphan.write_bytes(b"mp4data")
+        os.utime(old_orphan, (day_plus, day_plus))
+        fresh_orphan = self.app.archive_dir / "abb_clip_inflight_front.mp4"
+        fresh_orphan.write_bytes(b"recording")  # mtime now: could be an in-flight record
+        foreign = self.app.archive_dir / "concurrency_test.mp4"
+        foreign.write_bytes(b"not ours")
+        os.utime(foreign, (day_plus, day_plus))
+        referenced_clip = self.app.archive_dir / "abb_clip_kept_front.mp4"
+        referenced_clip.write_bytes(b"mp4data")
+        os.utime(referenced_clip, (day_plus, day_plus))
+        self.app._archive_write(JPEG, RING_ESP.isoformat(), "100000002", "front door",
+                                "ring_auto_opened", "abb_clip_kept_front.mp4")
+        self.assertFalse(old_orphan.exists())          # old + never indexed: swept
+        self.assertTrue(fresh_orphan.exists())         # young: grace for in-flight recordings
+        self.assertTrue(foreign.exists())              # not abb_*: never ours to delete
+        self.assertTrue(referenced_clip.exists())      # indexed: kept
 
 
 class HealthWatchdogTests(unittest.TestCase):
