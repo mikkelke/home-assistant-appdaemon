@@ -2191,6 +2191,7 @@ class SmartCooling(hass.Hass):
                 self._attrs(floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
                             ceiling, price_now, window_open, 0, None, 0.0, floor_limited,
                             ceiling_base, wm_dbg=wm_dbg),
+                force=True,  # a human is standing next to the condenser; the stop cannot queue
             )
             return
 
@@ -2624,7 +2625,13 @@ class SmartCooling(hass.Hass):
             return False
         return True
 
-    async def _ensure_off(self, status, reason, attrs):
+    async def _ensure_off(self, status, reason, attrs, force=False):
+        """force=True bypasses the anti-short-cycle guard for the OFF only. The guard
+        protects the compressor from rapid alternation, and the restart side still
+        enforces the full rest (_can_switch(True) after the forced off's _mark_switch).
+        Proven necessary live (2026-08-15 15:03): the shower-pause tap landed 3.2 min
+        after a compressor start, the off was deferred, and the AC blew hot exhaust at
+        the person the pause exists for - a human-priority stop must not queue."""
         self._burp_until = None   # plan flipped to off mid-burp: the burp is moot
         await self._publish(status, reason, attrs)
         cur_mode = await self._state(self.climate_entity)
@@ -2633,7 +2640,7 @@ class SmartCooling(hass.Hass):
             if not already_off:
                 self.log(f"DRY-RUN would turn AC OFF: {reason}")
             return
-        if already_off or not self._can_switch(False):
+        if already_off or (not force and not self._can_switch(False)):
             return
         try:
             await self.call_service("climate/set_hvac_mode", entity_id=self.climate_entity, hvac_mode="off")

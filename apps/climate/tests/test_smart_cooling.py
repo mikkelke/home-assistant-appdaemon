@@ -2744,3 +2744,40 @@ class ShowerPause(unittest.TestCase):
         app = self._app()
         app.shower_pause_entity = None
         self.assertFalse(self._run(app, datetime(2026, 8, 14, 7, 30)))
+
+    def test_force_off_bypasses_anti_short_cycle(self):
+        # 2026-08-15 15:03 live: the pause tap landed 3.2 min after a compressor start
+        # and _ensure_off deferred the off ("Anti-short-cycle: 3.2<10 min, defer off")
+        # while hot exhaust kept blowing at the person the pause exists for. force=True
+        # stops the unit NOW; the restart side still honours the full rest.
+        app = self._app()
+        app.dry_run = False
+        app.climate_entity = "cl"
+        app.min_cycle_min = 10
+        app._last_switch = datetime.now()   # switched moments ago -> guard would defer
+        app._last_action = "cool"
+        app._burp_until = None
+
+        async def _state_fn(entity):
+            return "cool"
+
+        async def _publish(status, reason, attrs):
+            pass
+
+        async def get_now():
+            return datetime.now()
+
+        async def _rhe(kind, reason, effect, now):
+            pass
+
+        app._state = _state_fn
+        app._publish = _publish
+        app.get_now = get_now
+        app._report_house_event = _rhe
+
+        import asyncio
+        asyncio.run(app._ensure_off("shower_pause", "Shower pause -- test", {}))
+        self.assertEqual(app.service_calls, [])   # unforced: guard defers, nothing sent
+        asyncio.run(app._ensure_off("shower_pause", "Shower pause -- test", {}, force=True))
+        self.assertEqual(app.service_calls,
+                         [("climate/set_hvac_mode", {"entity_id": "cl", "hvac_mode": "off"})])
