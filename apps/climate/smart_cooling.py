@@ -131,6 +131,13 @@ class SmartCooling(hass.Hass):
         # Click right before physically removing the AC - the true lights-out moment, whatever
         # the clock says. Replaces the old fixed-clock bedtime cutoff entirely (see module docstring).
         self.ac_removed_entity = a("ac_removed_entity", "input_boolean.smart_cooling_ac_removed")
+        # Shower pause (2026-08-15): the condenser stands IN the bathroom, so a planner
+        # start mid-shower means hot exhaust in the room he's showering in. One tap holds
+        # the AC off for shower_pause_minutes, then planning resumes on its own - no
+        # disarm to forget to undo. See _shower_pause_active for the lifecycle.
+        self.shower_pause_entity = a("shower_pause_entity", "input_boolean.smart_cooling_shower_pause")
+        self.shower_pause_min = int(a("shower_pause_minutes", 30))
+        self._shower_pause_started = None
         self.night_ceiling_entity = a("night_ceiling_entity", "input_number.smart_cooling_night_ceiling")
         # Humidity-aware ceiling. comfort_entity is still read by the dry-finish gate
         # (_maybe_dry reads its RAW dew_point measurement -- outside the control loop). The
@@ -545,6 +552,7 @@ class SmartCooling(hass.Hass):
         # moving it must reshape the plan and the card NOW, not on the next 15-min tick.
         for ent in (self.enable_entity, self.price_entity,
                     self.night_ceiling_entity, self.vent_window, self.ac_removed_entity,
+                    self.shower_pause_entity,
                     self.alarm_time_entity, self.alarm_enabled_entity):
             self.listen_state(self._on_trigger, ent)
         # "now" is documented to mean "first call at now + interval", not immediately - found
@@ -1993,6 +2001,10 @@ class SmartCooling(hass.Hass):
     async def _evaluate_locked(self):
         now = (await self.get_now()).replace(tzinfo=None)
         await self._learn(now)   # read-only; runs regardless of arm/deploy
+        # Lifecycle every tick, whatever the arm/deploy state, so a pause pressed while
+        # disarmed/stored still expires instead of lying in wait. Actuation on it happens
+        # only in the armed+deployed path below.
+        shower_paused = await self._shower_pause_active(now)
 
         master_on = (await self._state(self.enable_entity)) == "on"
         climate_state = await self._state(self.climate_entity)
@@ -2163,6 +2175,23 @@ class SmartCooling(hass.Hass):
                          level="INFO")
             except Exception as e:
                 self.log(f"failed to disarm after AC-removed: {e}", level="WARNING")
+            return
+
+        # Shower pause: hold the compressor off and skip planning until the window ends.
+        # Below ac_removed on purpose (removal is the stronger intent and must close out
+        # the night even mid-pause); _ensure_off is idempotent, so re-publishing every
+        # tick while paused costs nothing.
+        if shower_paused:
+            self._mark_eval(now, False)
+            resume_at = (self._shower_pause_started
+                         + timedelta(minutes=self.shower_pause_min)).strftime("%H:%M")
+            await self._ensure_off(
+                "shower_pause",
+                f"Shower pause -- AC held off until ~{resume_at}, resumes on its own",
+                self._attrs(floor, mid, zone, ceil_s, ac_s, bath, kitchen, E, target, deficit,
+                            ceiling, price_now, window_open, 0, None, 0.0, floor_limited,
+                            ceiling_base, wm_dbg=wm_dbg),
+            )
             return
 
         cool_now, next_start, run_min, est_cost, plan_windows = self._schedule(
@@ -2562,6 +2591,38 @@ class SmartCooling(hass.Hass):
             if (await self._state(s)) == "on":
                 return True
         return False
+
+    async def _shower_pause_active(self, now):
+        """Shower-pause lifecycle, called once per eval tick (plus the toggle's own
+        listen_state trigger, so a tap reacts within ~1 s, not the 15-min tick).
+
+        ON: the first sighting stamps the start; after shower_pause_minutes the boolean
+        is turned back off here and planning resumes - the user never has to remember
+        anything. OFF (manual untap included): the stamp clears immediately.
+
+        The stamp is deliberately NOT persisted: an AppDaemon restart mid-pause re-stamps
+        on the next tick, extending the pause up to one full window from the restart -
+        bounded, rare, and errs toward the shower, never toward surprise hot exhaust."""
+        if not self.shower_pause_entity:
+            return False
+        if (await self._state(self.shower_pause_entity)) != "on":
+            self._shower_pause_started = None
+            return False
+        if self._shower_pause_started is None:
+            self._shower_pause_started = now
+            self.log(f"Shower pause ON - holding the AC for {self.shower_pause_min} min",
+                     level="INFO")
+        elapsed_min = (now - self._shower_pause_started).total_seconds() / 60.0
+        if elapsed_min >= self.shower_pause_min:
+            self._shower_pause_started = None
+            try:
+                await self.call_service("input_boolean/turn_off",
+                                        entity_id=self.shower_pause_entity)
+                self.log("Shower pause expired - resuming normal planning", level="INFO")
+            except Exception as e:
+                self.log(f"failed to clear the shower pause toggle: {e}", level="WARNING")
+            return False
+        return True
 
     async def _ensure_off(self, status, reason, attrs):
         self._burp_until = None   # plan flipped to off mid-burp: the burp is moot

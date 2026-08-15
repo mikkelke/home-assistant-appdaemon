@@ -1398,6 +1398,11 @@ class EvaluateTickWiring(unittest.TestCase):
         # a real Shelly/price outage, harmlessly a no-op for _track_session_cost.
         app.price_entity = "price"
         app.ac_energy_entity = "ac_energy"
+        # shower pause: not in `states` below -> _state() returns None -> never active;
+        # the dedicated ShowerPause class covers its lifecycle.
+        app.shower_pause_entity = "shower_pause"
+        app.shower_pause_min = 30
+        app._shower_pause_started = None
         app._master_was_on = master_was_on
         app._not_deployed_since = None
         app._deploy_watchdog_notified = False
@@ -2666,3 +2671,76 @@ class SolarMeanPartialHour(unittest.TestCase):
         app = self._app()
         sm = self._run(app._solar_mean_today(datetime(2026, 7, 20, 3, 30)))
         self.assertAlmostEqual(sm, self._expected(3, 30, 3.5), places=4)
+
+
+class ShowerPause(unittest.TestCase):
+    """Shower pause (2026-08-15): one tap holds the compressor off for
+    shower_pause_minutes - the condenser stands IN the bathroom - and the app
+    clears the toggle itself when the window ends, so there is nothing for the
+    user to remember. _shower_pause_active owns the whole lifecycle."""
+
+    def _app(self, state="on", minutes=30):
+        app = make_app()
+        app.shower_pause_entity = "input_boolean.smart_cooling_shower_pause"
+        app.shower_pause_min = minutes
+        app._shower_pause_started = None
+        app.service_calls = []
+
+        async def _state_fn(entity):
+            return state
+
+        async def call_service(service, **kwargs):
+            app.service_calls.append((service, kwargs))
+
+        app._state = _state_fn
+        app.call_service = call_service
+        return app
+
+    def _run(self, app, now):
+        import asyncio
+        return asyncio.run(app._shower_pause_active(now))
+
+    def test_tap_starts_the_pause(self):
+        app = self._app()
+        now = datetime(2026, 8, 14, 7, 30)
+        self.assertTrue(self._run(app, now))
+        self.assertEqual(app._shower_pause_started, now)
+        self.assertEqual(app.service_calls, [])
+
+    def test_pause_holds_inside_the_window(self):
+        app = self._app()
+        start = datetime(2026, 8, 14, 7, 30)
+        app._shower_pause_started = start
+        self.assertTrue(self._run(app, start + timedelta(minutes=29)))
+        self.assertEqual(app.service_calls, [])
+
+    def test_expiry_clears_the_toggle_and_resumes(self):
+        app = self._app()
+        start = datetime(2026, 8, 14, 7, 30)
+        app._shower_pause_started = start
+        self.assertFalse(self._run(app, start + timedelta(minutes=30)))
+        self.assertIsNone(app._shower_pause_started)
+        self.assertEqual(app.service_calls,
+                         [("input_boolean/turn_off",
+                           {"entity_id": "input_boolean.smart_cooling_shower_pause"})])
+
+    def test_manual_untap_clears_immediately(self):
+        app = self._app(state="off")
+        app._shower_pause_started = datetime(2026, 8, 14, 7, 30)
+        self.assertFalse(self._run(app, datetime(2026, 8, 14, 7, 35)))
+        self.assertIsNone(app._shower_pause_started)
+        self.assertEqual(app.service_calls, [])
+
+    def test_restart_mid_pause_restamps_bounded(self):
+        # AppDaemon restart loses the stamp; the boolean still on means the next tick
+        # re-stamps, extending the pause up to one window from the restart - the
+        # documented, bounded, err-toward-the-shower behaviour.
+        app = self._app()
+        now = datetime(2026, 8, 14, 7, 45)
+        self.assertTrue(self._run(app, now))
+        self.assertEqual(app._shower_pause_started, now)
+
+    def test_unconfigured_entity_never_pauses(self):
+        app = self._app()
+        app.shower_pause_entity = None
+        self.assertFalse(self._run(app, datetime(2026, 8, 14, 7, 30)))

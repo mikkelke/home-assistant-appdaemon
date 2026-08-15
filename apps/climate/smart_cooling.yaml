@@ -33,6 +33,13 @@ SmartCooling:
   # compressor gracefully ahead of the power pull, auto-resets, and DISARMS the master for
   # the night (user 2026-07-17) - arm again when redeploying next day.
   ac_removed_entity: input_boolean.smart_cooling_ac_removed
+  # Shower pause (2026-08-15): the condenser stands IN the bathroom, so a planner start
+  # mid-shower blows hot exhaust into the room he's showering in. One tap on the AC card
+  # holds the compressor off for shower_pause_minutes, then planning resumes by itself
+  # (the app turns the boolean back off). Untap early to resume immediately. Never
+  # disarms the master and never blocks the ac_removed close-out or the SAFETY hard cap.
+  shower_pause_entity: input_boolean.smart_cooling_shower_pause
+  shower_pause_minutes: 30
 
   default_night_ceiling: 23.0
   min_temp: 16.0          # hardware floor; never drive the room below
