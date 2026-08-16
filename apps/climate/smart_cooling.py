@@ -412,6 +412,7 @@ class SmartCooling(hass.Hass):
         # means the next tick finds fan_only and sets cool again -- self-healing)
         self._burp_until: Optional[datetime] = None
         self._last_burp: Optional[datetime] = None
+        self._burp_recheck_at: Optional[datetime] = None
         # --- feasibility (user, 2026-07-15: "we might have a limit on how low the cooling
         # can feasibly get... if we keep doing 600+W in the expensive hours don't we lose
         # some of what we wanted?"). The ideal target can sit below what the unit + the
@@ -564,6 +565,14 @@ class SmartCooling(hass.Hass):
                     self.shower_pause_entity,
                     self.alarm_time_entity, self.alarm_enabled_entity):
             self.listen_state(self._on_trigger, ent)
+        # Park detection must not wait for the 15-min tick: the unit parks (~300 W,
+        # hvac_action idle) 5-10 min after every burp, and on 2026-08-15 each park then
+        # sat 11-19 min for the next tick before the burp could even be CONSIDERED - 52%
+        # of powered cool-mode time parked (225 min parked vs 206 engaged, plug-power
+        # trace). A sustained idle edge now triggers an eval within ~2 min; the tick
+        # stays as the backstop (a frozen integration produces no edges).
+        self.listen_state(self._on_trigger, self.climate_entity,
+                          attribute="hvac_action", new="idle", duration=120)
         # "now" is documented to mean "first call at now + interval", not immediately - found
         # 2026-07-15 chasing a stale post-reload status (every deploy left the AC blind for up to
         # interval_min minutes unless a listened entity happened to change sooner). "immediate" is
@@ -2558,6 +2567,18 @@ class SmartCooling(hass.Hass):
                                     f"-- fan-only {self.stall_fanonly_min} min to wake the "
                                     f"compressor", attrs)
                 return
+            if (action == "idle" and cur_mode == "cool"
+                    and deficit >= self.stall_deficit_min and self._last_burp is not None):
+                # Parked but still inside the burp cooldown. The idle EDGE already fired
+                # its one listener event, so nothing else will re-check while it stays
+                # parked - book the eval for the moment the cooldown opens instead of
+                # leaving it to the next 15-min tick.
+                remaining = (self.stall_burp_cooldown_min * 60
+                             - (now - self._last_burp).total_seconds())
+                if remaining > 0 and (self._burp_recheck_at is None
+                                      or self._burp_recheck_at <= now):
+                    self._burp_recheck_at = now + timedelta(seconds=remaining + 5)
+                    self.run_in(self._run_eval, int(remaining) + 5)
         if self.dry_run:
             await self._publish(status, reason, attrs)
             self.log(f"DRY-RUN would COOL ({self.cool_setpoint}C/{fan}): {reason}")

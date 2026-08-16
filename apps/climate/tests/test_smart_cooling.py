@@ -2802,3 +2802,77 @@ class ShowerPause(unittest.TestCase):
         asyncio.run(app._ensure_off("shower_pause", "Shower pause -- test", {}, force=True))
         self.assertEqual(app.service_calls,
                          [("climate/set_hvac_mode", {"entity_id": "cl", "hvac_mode": "off"})])
+
+
+class BurpCooldownRecheck(unittest.TestCase):
+    """Parked inside the burp cooldown: the idle EDGE already fired its one event, so
+    _apply_cool books a one-shot eval for cooldown expiry instead of leaving the parked
+    unit to the next 15-min tick (2026-08-15: that wait parked it 11-19 min per cycle,
+    52% of powered cool-mode time)."""
+
+    def _app(self, last_burp_min_ago, now):
+        app = make_app()
+        app.dry_run = False
+        app.climate_entity = "cl"
+        app.cool_setpoint = 16.0
+        app.cool_fan = "auto"
+        app.cool_fan_quiet = "silent"
+        app.bed_sensors = []
+        app.stall_deficit_min = 0.3
+        app.stall_burp_cooldown_min = 8
+        app.stall_fanonly_min = 3
+        app._burp_recheck_at = None
+        app._burp_until = None
+        app._last_burp = now - timedelta(minutes=last_burp_min_ago)
+        app._last_switch = None
+        app._last_action = None
+        app.min_cycle_min = 10
+        app.mobile_notifier = None
+        app.run_in_calls = []
+        app.run_in = lambda cb, delay, **kw: app.run_in_calls.append((cb, delay))
+        app._run_eval = lambda kwargs=None: None
+        app.service_calls = []
+
+        async def _state(entity):
+            return "cool"
+
+        async def _attr(entity, key, default=None):
+            return {"hvac_action": "idle", "temperature": 16.0, "fan_mode": "auto"}.get(key, default)
+
+        async def _publish(status, reason, attrs):
+            pass
+
+        async def call_service(service, **kwargs):
+            app.service_calls.append((service, kwargs))
+
+        app._state = _state
+        app._attr = _attr
+        app._publish = _publish
+        app.call_service = call_service
+        return app
+
+    def _run(self, app, now):
+        import asyncio
+        asyncio.run(app._apply_cool("test reason", "cooling", {}, 1.0, now))
+
+    def test_parked_under_cooldown_books_expiry_recheck(self):
+        now = datetime(2026, 8, 16, 22, 0)
+        app = self._app(last_burp_min_ago=5, now=now)   # 3 min of cooldown left
+        self._run(app, now)
+        self.assertEqual(len(app.run_in_calls), 1)
+        _, delay = app.run_in_calls[0]
+        self.assertEqual(delay, 3 * 60 + 5)
+        self.assertEqual(app._burp_recheck_at, now + timedelta(seconds=3 * 60 + 5))
+
+    def test_second_tick_while_recheck_pending_books_nothing(self):
+        now = datetime(2026, 8, 16, 22, 0)
+        app = self._app(last_burp_min_ago=5, now=now)
+        self._run(app, now)
+        self._run(app, now + timedelta(minutes=1))
+        self.assertEqual(len(app.run_in_calls), 1)
+
+    def test_cooldown_open_burps_instead_of_scheduling(self):
+        now = datetime(2026, 8, 16, 22, 0)
+        app = self._app(last_burp_min_ago=9, now=now)   # cooldown (8) passed
+        self._run(app, now)
+        self.assertEqual(app.run_in_calls[0][1] if False else len([c for c in app.service_calls if c[0] == "climate/set_hvac_mode" and c[1].get("hvac_mode") == "fan_only"]), 1)

@@ -111,8 +111,16 @@ SmartCooling:
   # then cooling restarts hard (parks at ~300 W otherwise, cooling nothing).
   # Quiet gate: no burps while either bedside is occupied (the silence->800W roar is
   # what bothers a person in bed; parked crawl accepted until the Remove press).
+  # Cooldown 15 -> 8 (2026-08-16): the unit re-stalls 5-10 min after every burp, so a
+  # 15-min cooldown GUARANTEED 5-10 parked minutes per cycle; with tick-quantized
+  # detection on top, 2026-08-15 spent 52% of powered cool-mode time parked (225 min
+  # parked / 206 engaged, plug trace, ~1.8 kr that night). Detection is now also
+  # event-driven (sustained hvac_action idle edge + a cooldown-expiry re-check), so 8
+  # bounds compressor starts at ~5-6/h during active blocks - a couple hundred extra
+  # starts per cooling season, inverter-rated in the 100k class - while parked time per
+  # cycle drops to ~0-3 min.
   stall_fanonly_min: 3
-  stall_burp_cooldown_min: 15
+  stall_burp_cooldown_min: 8
   # Bed witnesses for the quiet gate (_bed_occupied: any exact "on" = occupied, so an
   # unavailable sensor is inert). Was the code default of the two Withings mats; now
   # also the ESPHome strip's either-side sensor (added 2026-08-12, zero nights of
