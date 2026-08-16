@@ -110,7 +110,8 @@ def model_d_apartment(solar_mean, outdoor_max, prev_kitchen_max, coeffs: ModelDC
 
 
 def grounded_equilibrium(e_weather, apartment_now, night_outdoor, comfort_limit,
-                         reality_margin=1.0, warm_night_margin=1.0):
+                         reality_margin=1.0, warm_night_margin=1.0,
+                         cold_front_out_max=None, cold_front_anchor_offset=6.5):
     """Reality-check the weather equilibrium before it drives the ADVISORY sleep plan.
 
     ``e_weather`` is the weather model's DAYTIME apartment-peak prediction. Feeding that
@@ -127,6 +128,14 @@ def grounded_equilibrium(e_weather, apartment_now, night_outdoor, comfort_limit,
         ``e_weather`` unchanged (the weather model's own value).
       - Cool/cooling night: the sealed room can't drift materially warmer than the apartment
         is right now -> return ``min(e_weather, apartment_now + reality_margin)``.
+      - COLD FRONT (``night_outdoor < cold_front_out_max``, disabled when None): "right
+        now" is itself a stale anchor -- the whole flat drains overnight. Night of
+        2026-08-15: kitchen 28.4 at noon -> 20.4 at 01:00 while outdoor fell to 13.6; the
+        anchor was 2C+ colder by 03:00 than at the 21:00 tick, so the plan pre-cooled
+        against warmth that never survived the night (and the post-midnight tier ran on
+        top). The flat bottoms near the night's outdoor minimum plus a building offset
+        (measured 6.8C that night), so additionally cap at
+        ``night_outdoor + cold_front_anchor_offset``.
 
     Pure and None-safe: if ``apartment_now`` or ``night_outdoor`` is missing there's no
     trustworthy reality anchor, so fall back to ``e_weather`` (errs warm/safe -- keeps the
@@ -139,7 +148,10 @@ def grounded_equilibrium(e_weather, apartment_now, night_outdoor, comfort_limit,
         return e_weather
     if night_outdoor >= comfort_limit - warm_night_margin:
         return e_weather
-    return min(e_weather, apartment_now + reality_margin)
+    e = min(e_weather, apartment_now + reality_margin)
+    if cold_front_out_max is not None and night_outdoor < cold_front_out_max:
+        e = min(e, night_outdoor + cold_front_anchor_offset)
+    return e
 
 
 def vented_zone_at(zone_now, vent_temp, hours, tau_h=7.0, min_gap_c=1.5):

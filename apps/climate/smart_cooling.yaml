@@ -40,6 +40,18 @@ SmartCooling:
   # disarms the master and never blocks the ac_removed close-out or the SAFETY hard cap.
   shower_pause_entity: input_boolean.smart_cooling_shower_pause
   shower_pause_minutes: 30
+  # Cold-front brake (2026-08-16, from the 2026-08-15 night: outdoor crashed 24.5->13.6,
+  # kitchen 28.4->20.4, yet the planner pre-cooled against a 22.5-23.7 equilibrium and the
+  # post-midnight tier chased the hardware floor on top - ~3 kr of the night's 7.18 kr
+  # bought margin the cold front provided free). When tonight's forecast outdoor minimum
+  # is below cold_front_brake_out_max: grounded_equilibrium additionally caps at
+  # (night outdoor min + cold_front_anchor_offset) - the level the draining flat bottoms
+  # at (measured offset 6.8C that night) - giving shallower targets in BOTH the advisory
+  # and the actuation (one-reality cap), and _reach_target skips the post-midnight
+  # hardware-floor tier. Forecast unreadable -> brake off (fail toward normal planning).
+  # Set 0 to disable.
+  cold_front_brake_out_max: 17.0
+  cold_front_anchor_offset: 6.5
 
   default_night_ceiling: 23.0
   min_temp: 16.0          # hardware floor; never drive the room below

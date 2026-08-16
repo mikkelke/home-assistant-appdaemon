@@ -81,6 +81,12 @@ def make_app(**overrides):
     app._night_floor_min = overrides.get("night_floor_min", None)
     app._night_engaged_min = overrides.get("night_engaged_min", 0.0)
     app._learned_tonight = overrides.get("learned_tonight", False)
+    # cold-front brake: disabled by default in the factory so every pre-brake test's
+    # grounding numbers stay byte-identical; brake tests opt in explicitly.
+    app.brake_out_max = overrides.get("brake_out_max", 0.0)
+    app.brake_anchor_offset = overrides.get("brake_anchor_offset", 6.5)
+    app._night_brake = overrides.get("night_brake", False)
+    app._night_brake_logged = None
     app.commit_price_margin = overrides.get("commit_price_margin", 0.15)
     app.sleep_hours = overrides.get("sleep_hours", 8.0)
     app.cool_kw = overrides.get("cool_kw", 0.5)          # _schedule's est-cost term
@@ -673,6 +679,21 @@ class ReachTarget(unittest.TestCase):
         # physics can't be out-cheaped: if the floor already proved it stops at 20.5
         # TONIGHT, the bonus window doesn't get to ignore that.
         app = make_app(sat_min=20.5)
+        now = datetime(2026, 7, 17, 2, 0)
+        self.assertEqual(app._reach_target(now, target=18.0, saturated=True), 20.5)
+
+    def test_night_brake_kills_the_post_midnight_tier(self):
+        # Cold-front night (2026-08-15): the 23:54-02:16 hardware-floor chase bought
+        # margin the draining flat provided free. Braked, past midnight falls through
+        # to the same feasible-cap rule as the evening.
+        app = make_app(feasible_floor=20.5, feasible_samples=3, min_temp=16.0)
+        app._night_brake = True
+        now = datetime(2026, 7, 17, 1, 0)
+        self.assertEqual(app._reach_target(now, target=19.3, saturated=False), 19.5)
+
+    def test_night_brake_still_respects_saturation_first(self):
+        app = make_app(sat_min=20.5)
+        app._night_brake = True
         now = datetime(2026, 7, 17, 2, 0)
         self.assertEqual(app._reach_target(now, target=18.0, saturated=True), 20.5)
 

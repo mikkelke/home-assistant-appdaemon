@@ -102,6 +102,31 @@ class GroundedEquilibrium(unittest.TestCase):
     def test_none_weather_returned_as_is(self):
         self.assertIsNone(cm.grounded_equilibrium(None, 21.7, 15.0, 22.5))
 
+    def test_cold_front_caps_at_night_outdoor_plus_offset(self):
+        # THE 2026-08-15 night: weather-ish E 23.5, apartment_now 22.7 (still falling),
+        # forecast night min 16.1, limit 23. Old grounding: min(23.5, 22.7+1) = 23.5.
+        # Cold-front tier (16.1 < 17): additionally cap at 16.1 + 6.5 = 22.6 - the level
+        # the draining flat actually bottomed at (kitchen hit 20.4 + morning recovery).
+        self.assertAlmostEqual(
+            cm.grounded_equilibrium(23.5, 22.7, 16.1, 23.0, cold_front_out_max=17.0),
+            22.6, places=6)
+
+    def test_cool_but_not_cold_front_keeps_apartment_cap(self):
+        # night min 18 >= 17 threshold: ordinary cool-night grounding only.
+        self.assertAlmostEqual(
+            cm.grounded_equilibrium(24.7, 21.7, 18.0, 23.0, cold_front_out_max=17.0),
+            22.7, places=6)
+
+    def test_cold_front_disabled_by_none_is_byte_identical(self):
+        self.assertAlmostEqual(
+            cm.grounded_equilibrium(23.5, 22.7, 16.1, 23.0), 23.5, places=6)
+
+    def test_cold_front_never_deepens_a_shallow_weather_value(self):
+        # weather already below the cold-front cap -> min() keeps the weather value.
+        self.assertAlmostEqual(
+            cm.grounded_equilibrium(21.0, 22.7, 16.1, 23.0, cold_front_out_max=17.0),
+            21.0, places=6)
+
     def test_custom_margins(self):
         # reality_margin 0.5 -> min(24.7, 21.7 + 0.5) = 22.2; warm_night_margin 2.0 ->
         # threshold 22.5 - 2.0 = 20.5, and 15 < 20.5 so still a cool night

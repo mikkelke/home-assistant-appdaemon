@@ -138,6 +138,15 @@ class SmartCooling(hass.Hass):
         self.shower_pause_entity = a("shower_pause_entity", "input_boolean.smart_cooling_shower_pause")
         self.shower_pause_min = int(a("shower_pause_minutes", 30))
         self._shower_pause_started = None
+        # Cold-front brake (2026-08-16, from the 2026-08-15 night autopsy): when tonight's
+        # forecast outdoor minimum is below cold_front_brake_out_max, the flat will drain
+        # overnight - grounded_equilibrium gets the cold-front cap (shallower targets,
+        # advisory and actuation through the same one-reality point) and _reach_target
+        # skips the post-midnight hardware-floor tier. 0 disables.
+        self.brake_out_max = float(a("cold_front_brake_out_max", 17.0))
+        self.brake_anchor_offset = float(a("cold_front_anchor_offset", 6.5))
+        self._night_brake = False
+        self._night_brake_logged = None
         self.night_ceiling_entity = a("night_ceiling_entity", "input_number.smart_cooling_night_ceiling")
         # Humidity-aware ceiling. comfort_entity is still read by the dry-finish gate
         # (_maybe_dry reads its RAW dew_point measurement -- outside the control loop). The
@@ -1426,7 +1435,11 @@ class SmartCooling(hass.Hass):
              this honest: the probe can only chase depth the night actually needs."""
         if saturated and self._sat_min is not None:
             return max(target, self._sat_min)
-        if now.hour < 6:
+        # Cold-front brake kills the bonus tier: on a draining night the extra depth buys
+        # margin the flat provides free (2026-08-15: the 23:54-02:16 block chased the
+        # hardware floor while the kitchen anchor fell to 20.4 on its own). getattr so the
+        # bare test instances without initialize() keep the legacy always-on tier.
+        if now.hour < 6 and not getattr(self, "_night_brake", False):
             return self.min_temp
         if self._feasible_floor is not None and self._feasible_samples >= self.feasible_min_samples:
             return max(target, self._feasible_floor - self.feasible_probe_c)
@@ -1860,7 +1873,9 @@ class SmartCooling(hass.Hass):
                                                     vent_tau)
             plan_equilibrium = cm.grounded_equilibrium(
                 e_active, zone_anchor, night_outdoor, ceiling,
-                self.wm_reality_margin, self.wm_warm_night_margin)
+                self.wm_reality_margin, self.wm_warm_night_margin,
+                cold_front_out_max=self.brake_out_max or None,
+                cold_front_anchor_offset=self.brake_anchor_offset)
             grounded = (plan_equilibrium is not None and e_active is not None
                         and plan_equilibrium < e_active - 0.05)
             # Deficit-sized pricing (see the docstring): k is the number of 15-min slots the
@@ -2140,6 +2155,24 @@ class SmartCooling(hass.Hass):
             self._night_engaged_min += engaged
             self._night_floor_min = (floor if self._night_floor_min is None
                                      else min(self._night_floor_min, floor))
+        # Cold-front brake flag for tonight. Forecast-driven; _night_outdoor_min rides the
+        # same 30-min forecast cache the sleep plan already filled this tick, so this is
+        # a cache hit. Unreadable forecast -> brake off: fail toward legacy behaviour,
+        # never toward under-cooling a genuinely hot night on missing data.
+        night_out = await self._night_outdoor_min(now)
+        self._night_brake = (self.brake_out_max > 0 and night_out is not None
+                             and night_out < self.brake_out_max)
+        wm_dbg["night_brake"] = "on" if self._night_brake else "off"
+        if night_out is not None:
+            wm_dbg["night_outdoor_min"] = round(night_out, 1)
+        if self._night_brake and self._night_brake_logged is not True:
+            self.log(f"NIGHT-BRAKE ON: forecast night outdoor min {night_out:.1f}C < "
+                     f"{self.brake_out_max:.1f}C - shallower targets, no post-midnight tier",
+                     level="INFO")
+        elif not self._night_brake and self._night_brake_logged is True:
+            self.log("NIGHT-BRAKE off - normal night planning", level="INFO")
+        self._night_brake_logged = self._night_brake
+
         reach_target = self._reach_target(now, target, saturated)
         reach_deficit = floor - reach_target
         minutes_needed = self._cooling_minutes(floor, reach_target)
