@@ -711,7 +711,8 @@ class GroundedEquilibriumColdFront(unittest.TestCase):
     the plan pre-cooled against warmth that never survived the night. The extra cap is
     night_outdoor + cold_front_anchor_offset, applied ONLY below cold_front_out_max."""
 
-    # Friday's real inputs: weather model 27.47, zone anchor 22.1, forecast night min 15.8.
+    # The 2026-08-15 (Saturday) night's real inputs: weather model 27.47, zone anchor 22.1,
+    # forecast night min 15.8.
     FRI = dict(e_weather=27.47, apartment_now=22.1, night_outdoor=15.8, comfort_limit=23.0)
 
     def test_cold_front_caps_at_night_min_plus_offset(self):
