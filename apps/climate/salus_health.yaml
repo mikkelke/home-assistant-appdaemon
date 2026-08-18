@@ -1,0 +1,23 @@
+# /conf/apps/climate/salus_health.yaml
+# Watchdog for the Salus iT600 heating gear itself (thermostats + the Control
+# Centre wiring centre): connectivity dropouts, fault registers, low battery.
+# Admin-class information, so it goes to Mikkel only - see module docstring.
+
+SalusHealth:
+  module: salus_health
+  class: SalusHealth
+  # Init-order guarantee for get_app("MobileNotifier") cached in initialize(); also reloads this app when MobileNotifier reloads.
+  dependencies: MobileNotifier
+  # Substrings that identify Salus diagnostic entities among ALL binary_sensor/sensor
+  # entities in HA - entities are discovered by these markers, not hardcoded per room.
+  thermostat_marker: thermostat
+  controller_marker: control_centre
+  # How long a connectivity binary_sensor must read "off" continuously before alerting.
+  offline_minutes: 10
+  # Raw 0-5 battery scale (5 = full); alert at or below this level, then again only on
+  # a further drop (2 -> 1 alerts again; staying at 2 does not re-nag).
+  battery_warn_level: 2
+  notify_target: mikkel
+  # Entity ids to skip even if they match the markers above.
+  exclude_entities: []
+  state_file: /conf/apps/climate/salus_health_state.json
