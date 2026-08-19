@@ -154,6 +154,13 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
         # Announce when finished (match washer): toggle off to silence; app resets to on when Emptied
         self.announce_entity = self.args.get("announce_entity")
         self.announce_message = self.args.get("announce_message", "Dryer is ready to be emptied")
+        # Boot self-heal announce gate ONLY (see the self-heal block in initialize(), below the
+        # boot state resolution) - if the boot self-heal's history-estimated finish is this many
+        # minutes stale, send a mobile push ("finished ~N min ago") instead of a Sonos
+        # announcement. Unlike washer_monitor.py's identically-named knob this does NOT gate the
+        # live finish-detection paths (door-open, low-power finish, keep-fresh) - those still
+        # announce immediately, exactly as before this fix.
+        self.announce_freshness_minutes = float(self.args.get("announce_freshness_minutes", 20))
 
         # Programmes from YAML (replaces programs/power_range for classification)
         self._load_programme_profiles()
@@ -580,9 +587,58 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
                                 if duration_source and run_minutes_wall > run_minutes else None
                             )
                             energy_kwh = self._get_energy_used()
-                            became_unemptied = self._transition_to_unemptied(
-                                skip_announce=False, run_minutes=run_minutes, energy_used=energy_kwh
+
+                            # FIX (2026-08-19 hotfix): a boot-time hypothesis used to always
+                            # fire the full Sonos announcement here (skip_announce=False),
+                            # gated only by notification_sent restored from the store - which
+                            # is False precisely when the dryer finished AND was emptied during
+                            # an outage that also outlasted the last store write. Estimate when
+                            # the cycle actually ended from recorder history (existing
+                            # machinery, reused as-is; falls back to "now" - 0 min latency, i.e.
+                            # today's behavior - when history has nothing usable, so this can
+                            # only fail open to announcing, never to silence). A door-open edge
+                            # after that estimate means the user already emptied it during the
+                            # outage - converge straight to Emptied with no notification at all.
+                            # Otherwise gate on how stale the detection is: past
+                            # announce_freshness_minutes, a Sonos blast about a load emptied
+                            # hours ago is worse than a quiet mobile push; within it (e.g. HA
+                            # restarted mid-finish), behave exactly as before. Scoped to this
+                            # boot self-heal only - _transition_to_unemptied's other callers
+                            # (door-open, low-power finish, keep-fresh) are unchanged.
+                            end_estimate = self._estimate_cycle_end_from_history(
+                                expected_duration_min=self._get_programme_duration_hint_for_history()
+                            ) or self._now_utc()
+                            door_edge = self._door_open_edge_since(end_estimate)
+                            latency_min = (self._now_utc() - end_estimate).total_seconds() / 60
+                            if door_edge:
+                                gate = "door-edge"
+                                skip_announce = True
+                            elif latency_min > self.announce_freshness_minutes:
+                                gate = "late-push"
+                                skip_announce = True
+                            else:
+                                gate = "fresh-announce"
+                                skip_announce = False
+                            self.log(
+                                f"Boot self-heal announce gate: {gate} (end_estimate="
+                                f"{self._format_utc(end_estimate)}, door_edge={door_edge}, "
+                                f"latency={latency_min:.0f}min, freshness_threshold="
+                                f"{self.announce_freshness_minutes:.0f}min)",
+                                level="INFO",
                             )
+                            became_unemptied = self._transition_to_unemptied(
+                                skip_announce=skip_announce, run_minutes=run_minutes, energy_used=energy_kwh
+                            )
+                            if gate == "door-edge":
+                                self._transition_to_emptied(
+                                    "Door opened during the outage - already emptied"
+                                )
+                            elif gate == "late-push" and became_unemptied:
+                                self._push_mobile(
+                                    f"Dryer finished about {latency_min:.0f} min ago (late "
+                                    f"detection) - ready to empty."
+                                )
+                                self.notification_sent = True
                             if became_unemptied:
                                 confirmed, is_human = self._get_confirmed_from_selector(prog)
                                 self._save_cycle_feedback(
@@ -1184,6 +1240,38 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
         except Exception as e:
             self.log(f"Could not estimate cycle end from history: {e}", level="DEBUG")
             return None
+
+    def _door_open_edge_since(self, since_dt) -> bool:
+        """True if the recorder shows the door open at any moment strictly after since_dt.
+
+        Boot self-heal support (see the self-heal block in initialize()): the recorder, not
+        get_state, is the arbiter here - a live get_state read only shows the CURRENT contact
+        position, not whether it was opened and closed again (ajar) somewhere in the downtime
+        window. Standard dryer door contact (device_class: door, see dryer.yaml): "on"/"open" =
+        door open - unlike washer_monitor.py's equivalent, this appliance's contact has only
+        ever been wired one way, so there is no inversion knob to consult. Entries with a
+        missing/unknown/unavailable state are skipped; any history failure (including since_dt
+        itself missing) returns False, never raises - a broken recorder lookup must fail OPEN
+        to the boot self-heal's normal announcement, never SUPPRESS it by accident."""
+        if not self.door_sensor or since_dt is None:
+            return False
+        try:
+            hist = self.get_history(
+                entity_id=self.door_sensor, start_time=since_dt, end_time=self._now_utc(),
+            )
+            for entry in self._flatten_history(hist, self.door_sensor):
+                state = entry.get("state")
+                if state in (None, "unknown", "unavailable"):
+                    continue
+                t = self._parse_utc(entry.get("last_changed") or entry.get("last_updated"))
+                if t is None or t <= since_dt:
+                    continue
+                if state in ("on", "open"):
+                    return True
+            return False
+        except Exception as e:
+            self.log(f"Door-open history check failed: {e}", level="DEBUG")
+            return False
 
     def _parse_utc(self, s: str):
         """Parse ISO timestamp to timezone-aware UTC datetime."""

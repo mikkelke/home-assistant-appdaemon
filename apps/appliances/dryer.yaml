@@ -130,3 +130,12 @@ dryer_monitor:
   # ============================================================================
   announce_message: "Dryer is ready to be emptied"
   announce_entity: "input_boolean.dryer_announce"   # Toggle off to silence; app resets to on when Emptied
+
+  # Boot self-heal ONLY (2026-08-19 hotfix - see dryer_monitor.py's initialize()): if a restored
+  # Running cycle is found already finished at boot, and recorder history says that finish
+  # happened more than this many minutes ago, send a mobile push ("finished ~N min ago") instead
+  # of the normal Sonos announcement - a loud announcement about a load that finished (and may
+  # already be emptied) hours into an outage is worse than a quiet push. Does not affect the
+  # live finish-detection paths (door-open, low-power finish, keep-fresh), which still announce
+  # immediately as before.
+  announce_freshness_minutes: 20
