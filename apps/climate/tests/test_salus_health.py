@@ -41,7 +41,7 @@ def _base_app():
     per-entity state dicts set directly, matching the make_app() helpers in the
     sibling test files."""
     app = sh.SalusHealth.__new__(sh.SalusHealth)
-    app.thermostat_marker = "thermostat"
+    app.entity_markers = ["thermostat", "control_centre", "salus_"]
     app.controller_marker = "control_centre"
     app.offline_minutes = 10
     app.battery_warn_percent = 40
@@ -112,6 +112,59 @@ class DiscoverEntities(unittest.TestCase):
         connectivity, _, _ = app._discover_entities()
         self.assertEqual(set(connectivity), {CONTROLLER_CONN})
 
+    def test_finds_salus_gateway_diagnostics_connectivity_and_problem_in_sensor_domain(self):
+        # salus_gateway_diagnostics.py can't create real binary_sensors - its
+        # connectivity/problem entities live under sensor.* instead. Slugs already
+        # contain "thermostat"/"control_centre" (the gateway's own device names), so
+        # even the pre-existing markers alone would catch these; "salus_" additionally
+        # guards devices whose gateway name doesn't happen to contain those words.
+        sensors = {
+            "sensor.salus_bedroom_thermostat_connectivity": "on",
+            "sensor.salus_bedroom_thermostat_problem": "off",
+            "sensor.salus_control_centre_connectivity": "on",
+            "sensor.unrelated_thing_connectivity": "on",  # no marker match
+        }
+        app = self._app({}, sensors)
+        connectivity, problem, _ = app._discover_entities()
+        self.assertEqual(
+            set(connectivity),
+            {"sensor.salus_bedroom_thermostat_connectivity", "sensor.salus_control_centre_connectivity"},
+        )
+        self.assertEqual(set(problem), {"sensor.salus_bedroom_thermostat_problem"})
+
+    def test_salus_marker_alone_catches_a_slug_without_thermostat_or_control_centre(self):
+        sensors = {"sensor.salus_guest_room_connectivity": "on"}
+        app = self._app({}, sensors)
+        app.entity_markers = ["salus_"]
+        connectivity, _, _ = app._discover_entities()
+        self.assertEqual(set(connectivity), {"sensor.salus_guest_room_connectivity"})
+
+    def test_finds_salus_gateway_diagnostics_battery_suffix(self):
+        sensors = {
+            "sensor.salus_bedroom_thermostat_battery": "80",
+            THERMOSTAT_BATTERY: "80",  # integration's own _battery_level suffix, unaffected
+        }
+        app = self._app({}, sensors)
+        _, _, battery = app._discover_entities()
+        self.assertEqual(
+            set(battery),
+            {"sensor.salus_bedroom_thermostat_battery", THERMOSTAT_BATTERY},
+        )
+
+    def test_both_sources_discovered_together_during_a_migration(self):
+        binary_sensors = {THERMOSTAT_CONN: "on", CONTROLLER_CONN: "on"}
+        sensors = {
+            "sensor.salus_bedroom_thermostat_connectivity": "on",
+            "sensor.salus_control_centre_connectivity": "on",
+        }
+        app = self._app(binary_sensors, sensors)
+        connectivity, _, _ = app._discover_entities()
+        self.assertEqual(
+            set(connectivity),
+            {THERMOSTAT_CONN, CONTROLLER_CONN,
+             "sensor.salus_bedroom_thermostat_connectivity", "sensor.salus_control_centre_connectivity"},
+        )
+
 
 class RoomLabelAndController(unittest.TestCase):
     def test_thermostat_label_strips_suffix_and_thermostat_word(self):
@@ -132,6 +185,27 @@ class RoomLabelAndController(unittest.TestCase):
         app = _base_app()
         self.assertTrue(app._is_controller(CONTROLLER_CONN))
         self.assertFalse(app._is_controller(THERMOSTAT_CONN))
+
+    def test_salus_gateway_diagnostics_labels_match_the_integration_exactly(self):
+        # Same label either source publishes for the SAME physical device - a user
+        # must never notice which one is currently running.
+        app = _base_app()
+        self.assertEqual(
+            app._room_label("sensor.salus_bedroom_thermostat_connectivity"), "Bedroom"
+        )
+        self.assertEqual(
+            app._room_label("sensor.salus_claudias_room_thermostat_problem"), "Claudias Room"
+        )
+        self.assertEqual(
+            app._room_label("sensor.salus_bedroom_thermostat_battery"), "Bedroom"
+        )
+        self.assertEqual(
+            app._room_label("sensor.salus_control_centre_connectivity"), "Control Centre"
+        )
+
+    def test_is_controller_matches_salus_gateway_diagnostics_entity_too(self):
+        app = _base_app()
+        self.assertTrue(app._is_controller("sensor.salus_control_centre_connectivity"))
 
 
 class OfflineArmDisarm(unittest.TestCase):

@@ -1,0 +1,39 @@
+# /conf/apps/climate/salus_gateway_diagnostics.yaml
+# Reads the Salus iT600 gateway DIRECTLY (its local encrypted API) and republishes
+# battery/RSSI/LQI/connectivity/problem as sensor.salus_<slug>_* entities, independent
+# of whichever HA integration (if any) is installed - see salus_gateway_diagnostics.py's
+# module docstring for the full why. READ-ONLY: never writes to the gateway.
+#
+# No `dependencies: MobileNotifier` - this app only publishes state, it never notifies.
+# salus_health.py is the one that watches these entities and alerts.
+
+SalusGatewayDiagnostics:
+  module: salus_gateway_diagnostics
+  class: SalusGatewayDiagnostics
+
+  # --- credentials - fill in on the box only, never commit real values here ---
+  # Both values live in Home Assistant's OWN salus config entry:
+  #   /config/.storage/core.config_entries -> the entry with "domain": "salus" ->
+  #   its "data" -> "host" (the gateway's LAN IP) and "token" (the 16-char EUID).
+  # Leave both blank (the committed default) and this app logs once at startup and
+  # sits idle - it will NOT hammer a placeholder host every poll cycle.
+  host: ""
+  euid: ""
+  # Once you've added salus_gateway_host/salus_gateway_euid to
+  # /data/appdaemon/secrets.yaml (see this repo's README, "Secrets"), you can replace
+  # the two lines above with the usual convention instead of editing this file in
+  # place on the box:
+  #   host: !secret salus_gateway_host
+  #   euid: !secret salus_gateway_euid
+  # (Only do that once the secrets file actually has both keys - a !secret reference
+  # to a key that doesn't exist yet raises and this whole yaml fails to load.)
+  port: 80
+
+  # How often to poll. The gateway serves ONE request at a time and Home Assistant's
+  # own salus integration already polls it roughly every 30s - concurrent reads have
+  # caused HA-side timeouts and once left every thermostat unavailable. Keep this well
+  # above that; the code also refuses anything below 60s regardless of this value.
+  poll_minutes: 5
+  # Generous on purpose - a slow/contended gateway should time out and skip a cycle
+  # quietly, never retry in a loop.
+  request_timeout: 20

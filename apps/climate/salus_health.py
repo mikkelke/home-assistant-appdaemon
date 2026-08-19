@@ -14,9 +14,19 @@ This is admin-class information - nobody needs to know their thermostat's
 battery reads 2/5 or that a Zigbee hop dropped - so every push goes to
 Mikkel only, unlike the household-wide notify tiers used elsewhere.
 
-Entities are discovered by naming convention (thermostat_marker /
-controller_marker), not hardcoded per room, so adding, renaming or removing
-a thermostat needs no code or yaml change here.
+Entities are discovered by naming convention (entity_markers), not hardcoded
+per room, so adding, renaming or removing a thermostat needs no code or yaml
+change here.
+
+Source-independent: entity_markers matches EITHER the salus HA integration's
+own entities (binary_sensor.*_connectivity/_problem, sensor.*_battery_level)
+or salus_gateway_diagnostics.py's directly-published ones
+(sensor.*_connectivity/_problem/_battery - that app can't create real
+binary_sensors, see its module docstring), so this watchdog keeps working
+across an integration swap, or with both sources running at once during a
+migration. controller_marker is unchanged either way: the wiring centre's
+device name ("Control Centre") comes from the gateway itself, not from
+whichever integration is installed, so both sources agree on it.
 """
 
 import json
@@ -28,7 +38,8 @@ import appdaemon.plugins.hass.hassapi as hass
 class SalusHealth(hass.Hass):
     def initialize(self):
         a = self.args.get
-        self.thermostat_marker = a("thermostat_marker", "thermostat")
+        entity_markers = a("entity_markers", ["thermostat", "control_centre", "salus_"])
+        self.entity_markers = list(entity_markers) if isinstance(entity_markers, list) else [entity_markers]
         self.controller_marker = a("controller_marker", "control_centre")
         self.offline_minutes = float(a("offline_minutes", 10))
         self.battery_warn_percent = int(a("battery_warn_percent", 40))
@@ -71,30 +82,35 @@ class SalusHealth(hass.Hass):
 
     def _discover_entities(self):
         """Find Salus diagnostic entities by naming convention rather than a
-        hardcoded per-room list - see module docstring."""
+        hardcoded per-room list - see module docstring.
 
-        def matches(entity_id, suffix):
+        Connectivity/problem are looked for in BOTH binary_sensor (the salus
+        integration's own entities) and sensor (salus_gateway_diagnostics.py's -
+        it cannot create real binary_sensors) domains; battery accepts either
+        suffix each source uses (_battery_level vs _battery). Whatever matches
+        one of entity_markers, in either source, is in scope."""
+
+        def matches(entity_id, suffixes):
             if entity_id in self.exclude_entities:
                 return False
-            if not entity_id.endswith(suffix):
+            if not entity_id.endswith(suffixes):
                 return False
-            return self.thermostat_marker in entity_id or self.controller_marker in entity_id
+            return any(marker in entity_id for marker in self.entity_markers)
 
-        try:
-            binary_sensors = self.get_state("binary_sensor") or {}
-        except Exception as e:
-            self.log(f"binary_sensor discovery failed: {e}", level="WARNING")
-            binary_sensors = {}
+        def states_for(domain):
+            try:
+                return self.get_state(domain) or {}
+            except Exception as e:
+                self.log(f"{domain} discovery failed: {e}", level="WARNING")
+                return {}
 
-        try:
-            sensors = self.get_state("sensor") or {}
-        except Exception as e:
-            self.log(f"sensor discovery failed: {e}", level="WARNING")
-            sensors = {}
+        binary_sensors = states_for("binary_sensor")
+        sensors = states_for("sensor")
+        connectivity_candidates = list(binary_sensors) + list(sensors)
 
-        connectivity = sorted(e for e in binary_sensors if matches(e, "_connectivity"))
-        problem = sorted(e for e in binary_sensors if matches(e, "_problem"))
-        battery = sorted(e for e in sensors if matches(e, "_battery_level"))
+        connectivity = sorted(e for e in connectivity_candidates if matches(e, "_connectivity"))
+        problem = sorted(e for e in connectivity_candidates if matches(e, "_problem"))
+        battery = sorted(e for e in sensors if matches(e, ("_battery_level", "_battery")))
         return connectivity, problem, battery
 
     def _is_controller(self, entity_id):
@@ -104,12 +120,17 @@ class SalusHealth(hass.Hass):
         """Derive a short room/device label from a discovered entity_id - same
         string-manipulation convention as climate_alarm.py's
         _room_name_from_entity. Naturally yields "Control Centre" for the
-        controller's own entities without any special-casing here."""
+        controller's own entities without any special-casing here. Also strips
+        a leading "salus_" prefix, so salus_gateway_diagnostics.py's
+        sensor.salus_bedroom_thermostat_connectivity reads identically to the
+        integration's own binary_sensor.bedroom_thermostat_connectivity."""
         part = entity_id.split(".", 1)[-1]
-        for suffix in ("_connectivity", "_problem", "_battery_level"):
+        for suffix in ("_connectivity", "_problem", "_battery_level", "_battery"):
             if part.endswith(suffix):
                 part = part[: -len(suffix)]
                 break
+        if part.startswith("salus_"):
+            part = part[len("salus_"):]
         part = part.replace("_thermostat", "")
         part = part.replace("_", " ").strip()
         return part.title() if part else entity_id

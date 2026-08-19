@@ -10,7 +10,15 @@ SalusHealth:
   dependencies: MobileNotifier
   # Substrings that identify Salus diagnostic entities among ALL binary_sensor/sensor
   # entities in HA - entities are discovered by these markers, not hardcoded per room.
-  thermostat_marker: thermostat
+  # "thermostat"/"control_centre" match the salus HA integration's own entities;
+  # "salus_" additionally matches salus_gateway_diagnostics.py's directly-published
+  # ones (sensor.salus_<slug>_*), so this watchdog keeps working across an integration
+  # swap, or with both sources running at once during a migration. Trim this list to
+  # just the source(s) you actually have installed if you'd rather be strict.
+  entity_markers: [thermostat, control_centre, salus_]
+  # Which of the discovered entities is "the controller" (wording only - "affects ALL
+  # room heating" vs a single thermostat). The wiring centre's device name ("Control
+  # Centre") comes from the gateway itself, so this is the same regardless of source.
   controller_marker: control_centre
   # How long a connectivity binary_sensor must read "off" continuously before alerting.
   offline_minutes: 10
