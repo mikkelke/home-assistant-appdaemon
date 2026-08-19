@@ -135,8 +135,48 @@ fi
 echo "synced (tracked files only): $CHANGED file(s) changed on the box"
 
 # 4. verify reload
+
+# post-deploy content verification: confirm the box now holds exactly the
+# bytes we just sent, not just that rsync's own checksum agreed mid-transfer.
+# Anything else touching /data/appdaemon between the sync and this check
+# means the box isn't running what we think we shipped - the same class of
+# silent failure behind the 08-13/08-19 drift incident. Called from every
+# exit path below (this no-change short circuit, the crash-recovery success
+# arm, and the normal flow-through at the end) so none of them can skip it.
+verify_box_content() {
+  if [ "${#TRACKED[@]}" -gt 0 ]; then
+    BOXHASHES2=$(printf '%s\n' "${TRACKED[@]}" | ssh -o BatchMode=yes "$HOST" '
+      cd /data/appdaemon || exit 1
+      while IFS= read -r f; do
+        if [ -f "$f" ]; then sha256sum -- "$f"; fi
+      done')
+    WTHASHES2=$(sha256sum -- "${TRACKED[@]}") || true
+
+    declare -A BOXMAP2 WTMAP2
+    while read -r h p; do if [ -n "$p" ]; then BOXMAP2["$p"]="$h"; fi; done <<< "$BOXHASHES2"
+    while read -r h p; do if [ -n "$p" ]; then WTMAP2["$p"]="$h"; fi; done <<< "$WTHASHES2"
+
+    mismatched=()
+    for f in "${TRACKED[@]}"; do
+      if [ "${BOXMAP2[$f]:-}" != "${WTMAP2[$f]:-}" ]; then
+        mismatched+=("$f")
+      fi
+    done
+
+    if [ "${#mismatched[@]}" -gt 0 ]; then
+      echo "FAIL: ${#mismatched[@]} file(s) on the box do not match what was just deployed:"
+      for f in "${mismatched[@]}"; do
+        echo "  FAIL: $f"
+      done
+      exit 1
+    fi
+    echo "OK: post-deploy verification - ${#TRACKED[@]} file(s) confirmed on the box"
+  fi
+}
+
 if [ "$CHANGED" -eq 0 ] && [ "$rc" -eq 0 ]; then
   echo "OK: no content changes - AppDaemon untouched, nothing to reload"
+  verify_box_content
   exit 0
 fi
 sleep 12
@@ -162,6 +202,7 @@ if [ "${CRASHES:-0}" -gt 0 ]; then
     echo "ERROR: appdaemon still unhealthy after restart (inits=$RELOADS2, crashes=$CRASHES2) - check $LOG"
     exit 1
   fi
+  verify_box_content
   exit 0
 fi
 
@@ -173,36 +214,7 @@ else
   echo "OK: $RELOADS app initialization(s) observed"
 fi
 
-# 5. post-deploy content verification: confirm the box now holds exactly the
-# bytes we just sent, not just that rsync's own checksum agreed mid-transfer.
-# Anything else touching /data/appdaemon between the sync and this check
-# means the box isn't running what we think we shipped - the same class of
-# silent failure behind the 08-13/08-19 drift incident.
-if [ "${#TRACKED[@]}" -gt 0 ]; then
-  BOXHASHES2=$(printf '%s\n' "${TRACKED[@]}" | ssh -o BatchMode=yes "$HOST" '
-    cd /data/appdaemon || exit 1
-    while IFS= read -r f; do
-      if [ -f "$f" ]; then sha256sum -- "$f"; fi
-    done')
-  WTHASHES2=$(sha256sum -- "${TRACKED[@]}") || true
-
-  declare -A BOXMAP2 WTMAP2
-  while read -r h p; do if [ -n "$p" ]; then BOXMAP2["$p"]="$h"; fi; done <<< "$BOXHASHES2"
-  while read -r h p; do if [ -n "$p" ]; then WTMAP2["$p"]="$h"; fi; done <<< "$WTHASHES2"
-
-  mismatched=()
-  for f in "${TRACKED[@]}"; do
-    if [ "${BOXMAP2[$f]:-}" != "${WTMAP2[$f]:-}" ]; then
-      mismatched+=("$f")
-    fi
-  done
-
-  if [ "${#mismatched[@]}" -gt 0 ]; then
-    echo "FAIL: ${#mismatched[@]} file(s) on the box do not match what was just deployed:"
-    for f in "${mismatched[@]}"; do
-      echo "  FAIL: $f"
-    done
-    exit 1
-  fi
-  echo "OK: post-deploy verification - ${#TRACKED[@]} file(s) confirmed on the box"
-fi
+# 5. post-deploy content verification (normal flow-through path; see
+# verify_box_content above - also called from the no-change short circuit
+# in step 4 and from the crash-recovery success arm above)
+verify_box_content
