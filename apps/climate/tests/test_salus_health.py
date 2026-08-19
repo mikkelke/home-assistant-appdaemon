@@ -44,7 +44,7 @@ def _base_app():
     app.thermostat_marker = "thermostat"
     app.controller_marker = "control_centre"
     app.offline_minutes = 10
-    app.battery_warn_level = 2
+    app.battery_warn_percent = 40
     app.notify_target = "mikkel"
     app.exclude_entities = set()
     app._offline_timer_handles = {}
@@ -396,47 +396,74 @@ class ProblemNotifyWording(unittest.IsolatedAsyncioTestCase):
 
 
 class BatteryAlerting(unittest.TestCase):
-    def _app(self):
-        return _base_app()
+    """The entity's state is percent now (5=100%, 4=80%, ... see sensor.py's
+    SalusClimateBatterySensor); battery_warn_percent (default 40, exactly
+    old raw level 2) is compared against it. The hysteresis level stored in
+    _battery_alerted_level stays on the 0-5 scale, read from the raw_level
+    attribute - _app(raw_level=...) stubs get_state to supply it."""
+
+    def _app(self, raw_level=None):
+        app = _base_app()
+        app.get_state = lambda entity, **kw: raw_level
+        return app
 
     def test_fires_once_at_threshold(self):
-        app = self._app()
-        app._check_battery(THERMOSTAT_BATTERY, "2")
+        app = self._app(raw_level=2)
+        app._check_battery(THERMOSTAT_BATTERY, "40")
         app.create_task.assert_called_once()
         self.assertEqual(app._battery_alerted_level[THERMOSTAT_BATTERY], 2)
 
     def test_staying_at_the_same_level_does_not_renag(self):
-        app = self._app()
-        app._check_battery(THERMOSTAT_BATTERY, "2")
-        app._check_battery(THERMOSTAT_BATTERY, "2")
+        app = self._app(raw_level=2)
+        app._check_battery(THERMOSTAT_BATTERY, "40")
+        app._check_battery(THERMOSTAT_BATTERY, "40")
         app.create_task.assert_called_once()
 
     def test_further_drop_alerts_again(self):
-        app = self._app()
-        app._check_battery(THERMOSTAT_BATTERY, "2")
-        app._check_battery(THERMOSTAT_BATTERY, "1")
+        app = self._app(raw_level=2)
+        app._check_battery(THERMOSTAT_BATTERY, "40")
+        app.get_state = lambda entity, **kw: 1
+        app._check_battery(THERMOSTAT_BATTERY, "20")
         self.assertEqual(app.create_task.call_count, 2)
         self.assertEqual(app._battery_alerted_level[THERMOSTAT_BATTERY], 1)
 
     def test_above_threshold_never_alerts(self):
-        app = self._app()
-        app._check_battery(THERMOSTAT_BATTERY, "5")
+        app = self._app(raw_level=5)
+        app._check_battery(THERMOSTAT_BATTERY, "100")
         app.create_task.assert_not_called()
         self.assertEqual(app._battery_alerted_level, {})
 
     def test_recovery_above_threshold_rearms_for_a_future_drop(self):
-        app = self._app()
-        app._check_battery(THERMOSTAT_BATTERY, "2")  # first low -> alert
-        app._check_battery(THERMOSTAT_BATTERY, "5")  # battery replaced
-        app._check_battery(THERMOSTAT_BATTERY, "2")  # drops again later -> alert again
+        app = self._app(raw_level=2)
+        app._check_battery(THERMOSTAT_BATTERY, "40")  # first low -> alert
+        app.get_state = lambda entity, **kw: 5
+        app._check_battery(THERMOSTAT_BATTERY, "100")  # battery replaced
+        app.get_state = lambda entity, **kw: 2
+        app._check_battery(THERMOSTAT_BATTERY, "40")  # drops again later -> alert again
         self.assertEqual(app.create_task.call_count, 2)
 
     def test_unknown_unavailable_and_none_never_alert(self):
-        app = self._app()
+        app = self._app(raw_level=2)
         for raw in ("unknown", "unavailable", None):
             app._check_battery(THERMOSTAT_BATTERY, raw)
         app.create_task.assert_not_called()
         self.assertEqual(app._battery_alerted_level, {})
+
+    def test_missing_raw_level_attribute_falls_back_to_percent_derived_level(self):
+        """No raw_level attribute available -> the 0-5 level is derived from
+        percent // 20, which is exact since percent is always a multiple of
+        20 by construction."""
+        app = self._app(raw_level=None)
+        app._check_battery(THERMOSTAT_BATTERY, "40")
+        app.create_task.assert_called_once()
+        self.assertEqual(app._battery_alerted_level[THERMOSTAT_BATTERY], 2)
+
+    def test_prefers_raw_level_attribute_over_percent_derived_value(self):
+        """Contrived mismatch (attribute says 1, percent//20 would say 2) to
+        prove the raw_level attribute wins when present."""
+        app = self._app(raw_level=1)
+        app._check_battery(THERMOSTAT_BATTERY, "40")
+        self.assertEqual(app._battery_alerted_level[THERMOSTAT_BATTERY], 1)
 
 
 class ParseBatteryLevel(unittest.TestCase):

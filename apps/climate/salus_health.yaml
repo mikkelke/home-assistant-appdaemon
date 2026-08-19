@@ -14,9 +14,11 @@ SalusHealth:
   controller_marker: control_centre
   # How long a connectivity binary_sensor must read "off" continuously before alerting.
   offline_minutes: 10
-  # Raw 0-5 battery scale (5 = full); alert at or below this level, then again only on
-  # a further drop (2 -> 1 alerts again; staying at 2 does not re-nag).
-  battery_warn_level: 2
+  # The battery sensor reports percent, quantized in 20-point steps because the gateway
+  # only ever sends a raw 0-5 level underneath (5 = full = 100%, so 2 = 40%). Alert at or
+  # below this percent, then again only on a further drop (40% -> 20% alerts again;
+  # staying at 40% does not re-nag).
+  battery_warn_percent: 40
   notify_target: mikkel
   # Entity ids to skip even if they match the markers above.
   exclude_entities: []

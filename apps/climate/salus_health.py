@@ -31,7 +31,7 @@ class SalusHealth(hass.Hass):
         self.thermostat_marker = a("thermostat_marker", "thermostat")
         self.controller_marker = a("controller_marker", "control_centre")
         self.offline_minutes = float(a("offline_minutes", 10))
-        self.battery_warn_level = int(a("battery_warn_level", 2))
+        self.battery_warn_percent = int(a("battery_warn_percent", 40))
         self.notify_target = a("notify_target", "mikkel")
         self.state_file = a("state_file", "/conf/apps/climate/salus_health_state.json")
 
@@ -252,11 +252,22 @@ class SalusHealth(hass.Hass):
         self._check_battery(entity, new)
 
     def _check_battery(self, entity_id, raw_value):
-        level = self._parse_battery_level(raw_value)
-        if level is None:
+        """raw_value is now the entity's PERCENT state (see sensor.py's
+        SalusClimateBatterySensor), compared against battery_warn_percent.
+        The alerted/hysteresis level itself stays on the original 0-5 scale
+        - the raw_level attribute when present, else percent // 20, which
+        is exact because the percent state is always a multiple of 20 -
+        so it never mixes units across calls and the notify wording below
+        can keep saying "X/5" unchanged.
+        """
+        percent = self._parse_battery_level(raw_value)
+        if percent is None:
             return  # unknown/unavailable/unparseable -> hold, not evidence of anything.
 
-        if level <= self.battery_warn_level:
+        if percent <= self.battery_warn_percent:
+            level = self._raw_battery_level(entity_id)
+            if level is None:
+                level = percent // 20
             last_alerted = self._battery_alerted_level.get(entity_id)
             if last_alerted is None or level < last_alerted:
                 self._battery_alerted_level[entity_id] = level
@@ -266,6 +277,13 @@ class SalusHealth(hass.Hass):
             # Recovered above the threshold (replaced) - re-arm for a future drop.
             del self._battery_alerted_level[entity_id]
             self._save_state()
+
+    def _raw_battery_level(self, entity_id):
+        """Best-effort read of the raw_level attribute behind the percent
+        state (see sensor.py's SalusClimateBatterySensor) - the unrounded
+        0-5 truth the percentage was derived from. None if missing, so the
+        caller can derive an equivalent value from percent instead."""
+        return self._parse_battery_level(self.get_state(entity_id, attribute="raw_level"))
 
     @staticmethod
     def _parse_battery_level(value):
