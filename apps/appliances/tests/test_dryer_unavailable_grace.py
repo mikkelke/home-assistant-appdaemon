@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import types
 import unittest
 from datetime import timedelta
@@ -357,12 +358,16 @@ class RestoreReArmsWatchdogs(unittest.TestCase):
         self.assertTrue(any("unemptied watchdog" in str(a[0]).lower() for a in debug_logs))
 
 
-def make_full_init_app(sensor_state, helper_state, ui_state_entity="input_select.dryer_state"):
+def make_full_init_app(tmpdir, sensor_state, helper_state, ui_state_entity="input_select.dryer_state"):
     """DryerMonitor with initialize() run for real (heavier than make_app/make_restore_app
     above, but the sensor-missing -> ui_state_select seed fallback lives inline at the top of
     initialize(), before any restore is dispatched, so there is no smaller real entry point to
     call directly). feedback_file/programmes_file point at nonexistent paths so initialize()
-    falls back to built-in defaults instead of touching real repo data files."""
+    falls back to built-in defaults instead of touching real repo data files. state_file is
+    tmpdir-scoped the same way test_dryer_restart_survival.py's make_app does it, so a
+    durable-store write triggered by any of these tests lands in a throwaway file, never the
+    real apps/appliances/dryer_cycle_state.json next to the source (see cycle_persistence.py's
+    _init_cycle_store: self.args["state_file"] overrides the default path when present)."""
     app = dm.DryerMonitor.__new__(dm.DryerMonitor)
     app.args = {
         "power_sensor": "sensor.dryer_plug_power",
@@ -376,6 +381,7 @@ def make_full_init_app(sensor_state, helper_state, ui_state_entity="input_select
         "stop_for": 60,
         "feedback_file": "/nonexistent/dryer_feedback_test.json",
         "programmes_file": "/nonexistent/dryer_programmes_test.yaml",
+        "state_file": str(Path(tmpdir) / "dryer_cycle_state.json"),
     }
     app.states = {
         "sensor.dryer_state": sensor_state,
@@ -431,39 +437,43 @@ class StateHelperSeedFallback(unittest.TestCase):
         finish detection are both gated on start_time, which left the dryer in Running forever
         (run_min 0 blocks the 80% guard on every poll). Off is the older, working behaviour:
         _power_changed re-detects a dryer that is genuinely still running."""
-        app = make_full_init_app(sensor_state=None, helper_state="Running")
-        app.initialize()
-        self.assertEqual(app.state, "Off")
-        self.assertEqual(app.restore_calls, [])
-        skipped = [
-            a for a, kw in app.log_calls
-            if kw.get("level") == "INFO" and "not seeding" in str(a[0]).lower()
-        ]
-        self.assertTrue(skipped, "expected an INFO explaining why the Running mirror was not seeded")
-        self.assertIn("input_select.dryer_state", str(skipped[0][0]))
+        with tempfile.TemporaryDirectory() as tmp:
+            app = make_full_init_app(tmp, sensor_state=None, helper_state="Running")
+            app.initialize()
+            self.assertEqual(app.state, "Off")
+            self.assertEqual(app.restore_calls, [])
+            skipped = [
+                a for a, kw in app.log_calls
+                if kw.get("level") == "INFO" and "not seeding" in str(a[0]).lower()
+            ]
+            self.assertTrue(skipped, "expected an INFO explaining why the Running mirror was not seeded")
+            self.assertIn("input_select.dryer_state", str(skipped[0][0]))
 
     def test_missing_sensor_seeds_unemptied_from_helper_and_invokes_restore(self):
-        app = make_full_init_app(sensor_state="unavailable", helper_state="Unemptied")
-        app.initialize()
-        self.assertEqual(app.state, "Unemptied")
-        self.assertEqual(app.restore_calls, ["unemptied"])
+        with tempfile.TemporaryDirectory() as tmp:
+            app = make_full_init_app(tmp, sensor_state="unavailable", helper_state="Unemptied")
+            app.initialize()
+            self.assertEqual(app.state, "Unemptied")
+            self.assertEqual(app.restore_calls, ["unemptied"])
 
     def test_present_sensor_ignores_helper(self):
         """Sensor already has a valid state - the helper (even a differing one) must never
         override it."""
-        app = make_full_init_app(sensor_state="Paused", helper_state="Running")
-        app.initialize()
-        self.assertEqual(app.state, "Paused")
-        seed_logs = [a for a, kw in app.log_calls if "seeded" in str(a[0]).lower()]
-        self.assertEqual(seed_logs, [])
+        with tempfile.TemporaryDirectory() as tmp:
+            app = make_full_init_app(tmp, sensor_state="Paused", helper_state="Running")
+            app.initialize()
+            self.assertEqual(app.state, "Paused")
+            seed_logs = [a for a, kw in app.log_calls if "seeded" in str(a[0]).lower()]
+            self.assertEqual(seed_logs, [])
 
     def test_missing_sensor_and_invalid_helper_falls_back_to_off(self):
-        app = make_full_init_app(sensor_state="unknown", helper_state="unknown")
-        app.initialize()
-        self.assertEqual(app.state, "Off")
-        self.assertEqual(app.restore_calls, [])
-        seed_logs = [a for a, kw in app.log_calls if "seeded" in str(a[0]).lower()]
-        self.assertEqual(seed_logs, [])
+        with tempfile.TemporaryDirectory() as tmp:
+            app = make_full_init_app(tmp, sensor_state="unknown", helper_state="unknown")
+            app.initialize()
+            self.assertEqual(app.state, "Off")
+            self.assertEqual(app.restore_calls, [])
+            seed_logs = [a for a, kw in app.log_calls if "seeded" in str(a[0]).lower()]
+            self.assertEqual(seed_logs, [])
 
 
 if __name__ == "__main__":
@@ -481,28 +491,32 @@ class StateHelperSeedIsClockFreeOnly(unittest.TestCase):
     """
 
     def test_paused_mirror_is_not_seeded(self):
-        app = make_full_init_app(sensor_state=None, helper_state="Paused")
-        app.initialize()
-        self.assertEqual(app.state, "Off")
-        self.assertEqual(app.restore_calls, [])
+        with tempfile.TemporaryDirectory() as tmp:
+            app = make_full_init_app(tmp, sensor_state=None, helper_state="Paused")
+            app.initialize()
+            self.assertEqual(app.state, "Off")
+            self.assertEqual(app.restore_calls, [])
 
     def test_emptied_mirror_is_still_seeded(self):
-        app = make_full_init_app(sensor_state=None, helper_state="Emptied")
-        app.initialize()
-        self.assertEqual(app.state, "Emptied")
+        with tempfile.TemporaryDirectory() as tmp:
+            app = make_full_init_app(tmp, sensor_state=None, helper_state="Emptied")
+            app.initialize()
+            self.assertEqual(app.state, "Emptied")
 
     def test_unemptied_mirror_still_reaches_its_restore_branch(self):
         """The case the mirror exists for: the empty-me reminder survives an HA restart."""
-        app = make_full_init_app(sensor_state=None, helper_state="Unemptied")
-        app.initialize()
-        self.assertEqual(app.state, "Unemptied")
-        self.assertEqual(app.restore_calls, ["unemptied"])
+        with tempfile.TemporaryDirectory() as tmp:
+            app = make_full_init_app(tmp, sensor_state=None, helper_state="Unemptied")
+            app.initialize()
+            self.assertEqual(app.state, "Unemptied")
+            self.assertEqual(app.restore_calls, ["unemptied"])
 
     def test_unseedable_mirror_never_writes_the_helper_back(self):
         """A rejected seed must stay read-only: writing Off back through _sync_ui_select would
         destroy the only surviving evidence of the cycle."""
-        app = make_full_init_app(sensor_state=None, helper_state="Running")
-        app.initialize()
-        published = [kw.get("state") for kw in app.set_state_calls if "state" in kw]
-        self.assertNotIn("Running", published)
-        self.assertEqual(app.states.get("input_select.dryer_state"), "Running")
+        with tempfile.TemporaryDirectory() as tmp:
+            app = make_full_init_app(tmp, sensor_state=None, helper_state="Running")
+            app.initialize()
+            published = [kw.get("state") for kw in app.set_state_calls if "state" in kw]
+            self.assertNotIn("Running", published)
+            self.assertEqual(app.states.get("input_select.dryer_state"), "Running")

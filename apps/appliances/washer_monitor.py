@@ -750,6 +750,13 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # D1 (2026-08-19): set only for the duration of _restore_reconcile's own transition call -
         # see _finish_anchor and _restore_reconcile's docstring invariant. None everywhere else.
         self._finish_anchor_override = None
+        # D2 (2026-08-19 adversarial pass follow-up): set only for the duration of
+        # _restore_reconcile's own transition call, same lifecycle as _finish_anchor_override
+        # above - forces the announce block's push branch explicitly, rather than relying on the
+        # freshness-latency arithmetic to always exceed announce_freshness_minutes (it doesn't,
+        # once the yaml knobs are retuned - see _restore_reconcile's docstring). False everywhere
+        # else.
+        self._announce_force_push = False
 
         # Restore previous state. Read the entity's bare state, its full attribute snapshot,
         # and the on-disk store ALL ONCE, here, before any write - _set_state_entity below is
@@ -1282,11 +1289,19 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         _finish_anchor_override pins the finish anchor to start_time + addload_window_minutes -
         never last_high_energy_at, which on this path may be a synthetic boot-seeded placeholder
         (not a fact of when the wash actually finished) or explicitly distrusted (code-fingerprint
-        mismatch). start_time is guaranteed non-None by the gate above. That floor makes freshness
-        latency (>= run_minutes - addload_window_minutes, and run_minutes >= min_cycle_minutes
-        here) always exceed announce_freshness_minutes for any cycle that reaches this method, so
-        Sonos is STRUCTURALLY IMPOSSIBLE on the reconcile path - only the door-gate (Emptied,
-        silent) or the freshness gate (mobile push) can fire."""
+        mismatch). start_time is guaranteed non-None by the gate above.
+
+        D2 invariant (2026-08-19 adversarial pass follow-up): the "never Sonos" guarantee on this
+        path used to rest on arithmetic alone - freshness latency (>= run_minutes -
+        addload_window_minutes, and run_minutes >= min_cycle_minutes here) happened to always
+        exceed announce_freshness_minutes only because the three yaml knobs' *default* values
+        satisfy min_cycle_minutes - addload_window_minutes >= announce_freshness_minutes. Retuning
+        any one of them breaks that inequality and silently re-enables Sonos on a boot-time
+        conclusion. _announce_force_push below removes the reliance on arithmetic: it is set True
+        for the duration of the transition call (same lifecycle as _finish_anchor_override) and
+        makes the announce block's push branch fire unconditionally, so Sonos is impossible on the
+        reconcile path by construction - only the door-gate (Emptied, silent) or the forced push
+        gate (mobile push) can fire, regardless of how the knobs are tuned."""
         self._restore_reconcile_timer = None
         if not self.restored_uncorroborated:
             return
@@ -1322,10 +1337,15 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # invariant above. Cleared in finally so a later, genuinely-live finish is never anchored
         # to this boot-time value.
         self._finish_anchor_override = self.start_time + timedelta(minutes=self.addload_window_minutes)
+        # D2: force the announce block's push branch explicitly, rather than trusting the
+        # freshness-latency arithmetic to always win - see the docstring invariant above. Cleared
+        # in finally, same lifecycle as _finish_anchor_override.
+        self._announce_force_push = True
         try:
             self._transition_to_unemptied(force=True)
         finally:
             self._finish_anchor_override = None
+            self._announce_force_push = False
 
     def _restore_running_state(self, attrs=None, last_changed=None):
         """Restore in-memory state when we were Running or Paused before a restart.
@@ -3614,16 +3634,28 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 # than a quiet mobile push. notification_sent still gates against a double-notify.
                 latency_min = self._finish_detection_latency_minutes()
                 freshness_min = getattr(self, "announce_freshness_minutes", 20)
-                if latency_min > freshness_min:
+                # D2 (2026-08-19 adversarial pass follow-up): _restore_reconcile sets this for the
+                # duration of its own transition call - an explicit guarantee that path can never
+                # reach Sonos, instead of relying on the freshness-latency arithmetic to always
+                # exceed freshness_min (see _restore_reconcile's docstring).
+                force_push = getattr(self, "_announce_force_push", False)
+                if latency_min > freshness_min or force_push:
                     self._push_mobile(
                         f"Washer finished about {latency_min:.0f} min ago (late detection) - "
                         f"ready to empty."
                     )
-                    self.log(
-                        f"Finish detected {latency_min:.0f} min late (> {freshness_min:.0f} min) "
-                        f"- mobile push instead of Sonos announcement",
-                        level="INFO",
-                    )
+                    if latency_min > freshness_min:
+                        self.log(
+                            f"Finish detected {latency_min:.0f} min late (> {freshness_min:.0f} min) "
+                            f"- mobile push instead of Sonos announcement",
+                            level="INFO",
+                        )
+                    if force_push:
+                        self.log(
+                            "Push forced by the restore reconcile - never Sonos on a "
+                            "boot-time conclusion, regardless of freshness timing",
+                            level="INFO",
+                        )
                     self.notification_sent = True
                 else:
                     try:
@@ -3868,6 +3900,8 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # D1: belt-and-braces - _restore_reconcile's own finally already clears this, but a cycle
         # ending must never carry a stale override into the next one under any path.
         self._finish_anchor_override = None
+        # D2: same belt-and-braces as D1 above, for the force-push flag.
+        self._announce_force_push = False
         self._reset_input_selectors()
 
     def _set_programme_helpers_default(self):

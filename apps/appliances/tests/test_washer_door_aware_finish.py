@@ -21,6 +21,10 @@
 #          - so a door edge that predates the add-load window is excluded, one that postdates it
 #          is caught even with sparse power history, and Sonos is structurally impossible (the
 #          override always makes freshness latency huge).
+#   D2     (2026-08-19 adversarial pass follow-up) that "always" above was arithmetic, not a
+#          guarantee: retuning announce_freshness_minutes/min_cycle_minutes/addload_window_minutes
+#          could re-enable Sonos on this path. _announce_force_push now makes the reconcile's
+#          push branch explicit, independent of the freshness-latency numbers.
 #
 # Only the AppDaemon surface and the feedback/notify/classify LEAVES are faked; every door /
 # freshness / reconcile decision runs for real. Any state_file stays in a tmpdir (none is needed
@@ -134,6 +138,8 @@ def make_finish_app(
     app.addload_window_minutes = 5
     app._finish_anchor_override = None
     app._store_state_since = None
+    # ---- D2 attribute (2026-08-19 adversarial pass follow-up) ----
+    app._announce_force_push = False
 
     # ---- entities ----
     app.state_entity = "sensor.washer_state"
@@ -411,6 +417,74 @@ class Fix1bRestoreReconcile(unittest.TestCase):
         self.assertEqual(app.sonos_calls, [])
         self.assertEqual(len(app.mobile_calls), 1)
         self.assertEqual(len(app.saved_feedback), 1)
+
+    def test_retuned_knobs_that_break_old_arithmetic_still_push_never_sonos(self):
+        """D2 (2026-08-19 adversarial pass follow-up): the old "Sonos structurally impossible"
+        claim was arithmetic (latency = run - addload always > freshness because
+        min_cycle_minutes - addload_window_minutes happened to be >= announce_freshness_minutes
+        by default). Retune the knobs so that inequality no longer holds - freshness=30 vs a
+        30min run/5min addload/25min min_cycle gives latency ~= run - addload = 23min, which is
+        NOT > 30 - the old code would take the Sonos branch here. The explicit
+        _announce_force_push flag must still force the push and Sonos must never fire."""
+        start = NOW - timedelta(minutes=28)  # run ~28min: past the retuned min_cycle_minutes (25)
+        app = make_finish_app(
+            state="Running",
+            restored_uncorroborated=True,
+            start=start,
+            last_high_energy_at=None,
+            door_now="off",
+            door_history=[],
+            power_history=[{"state": "0.0", "last_changed": _iso(NOW - timedelta(minutes=m))}
+                           for m in (9, 6, 3, 1)],
+        )
+        app.min_cycle_minutes = 25
+        app.addload_window_minutes = 5
+        app.announce_freshness_minutes = 30  # old floor (25-5=20) is now well under this
+        app._restore_reconcile({})
+        self.assertEqual(app.state, "Unemptied")
+        self.assertEqual(app.sonos_calls, [])
+        self.assertEqual(len(app.mobile_calls), 1)
+        self.assertTrue(app.notification_sent)
+        self.assertTrue(logged(app, "Push forced by the restore reconcile"))
+
+    def test_force_push_flag_clears_after_reconcile_then_normal_finish_still_sonos(self):
+        """D2: _announce_force_push is scoped to the single _restore_reconcile transition call,
+        exactly like _finish_anchor_override - it must not leak into a later, genuinely-live
+        finish on the same app instance. Once the reconcile concludes (push, no Sonos), the flag
+        is False again, and a subsequent normal (fresh, untouched-door) finish on the same app
+        still reaches Sonos, exactly as the REGRESSION GUARD case."""
+        start = NOW - timedelta(hours=6)
+        app = make_finish_app(
+            state="Running",
+            restored_uncorroborated=True,
+            start=start,
+            last_high_energy_at=NOW - timedelta(hours=4),
+            power_history=[{"state": "0.0", "last_changed": _iso(NOW - timedelta(minutes=m))}
+                           for m in (9, 6, 3, 1)],
+        )
+        app._restore_reconcile({})
+        self.assertEqual(app.state, "Unemptied")
+        self.assertEqual(app.sonos_calls, [])
+        self.assertEqual(len(app.mobile_calls), 1)
+        self.assertFalse(app._announce_force_push)  # cleared by _restore_reconcile's finally
+
+        # A later, genuinely-live finish on a fresh cycle (as _reset_cycle_tracking /
+        # _begin_running_cycle would leave things between cycles) - untouched door, detected on
+        # time, so this must reach Sonos exactly like before the reconcile ever ran.
+        app.state = "Running"
+        app.notification_sent = False
+        app.restored_uncorroborated = False
+        app._pending_end_reason = "standby_backstop"
+        app.start_time = NOW - timedelta(minutes=45)
+        app.last_high_energy_at = NOW  # fresh - detected on time
+        app.sonos_calls.clear()
+        app.mobile_calls.clear()
+        app.saved_feedback.clear()
+
+        app._transition_to_unemptied(force=True)
+        self.assertEqual(app.state, "Unemptied")
+        self.assertEqual(app.sonos_calls, ["Washer is ready to be emptied"])
+        self.assertEqual(app.mobile_calls, [])
 
 
 class Fix4UnemptiedReconciler(unittest.TestCase):
