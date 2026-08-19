@@ -1,17 +1,21 @@
 # tests/test_appliance_cooling_dst.py - DST fall-back regression for _should_change_state's
-# cooling-period comparison, covering both DryerMonitor and DishwasherMonitor.
+# cooling-period comparison, covering DryerMonitor, DishwasherMonitor, and WasherMonitor.
 # Run from repo root: python3 -m unittest discover -s apps/appliances/tests -q
 #
 # The incident: _should_change_state compared naive datetime.now() against last_state_change. At
 # the Europe/Copenhagen October DST fall-back the local clock jumps an hour BACKWARDS (03:00 CEST
 # -> 02:00 CET), so `now - last_state_change` goes negative for the whole repeated hour - and a
 # negative delta is trivially < cooling_period, which silently refuses every un-forced transition
-# until the hour is out. Both DryerMonitor._should_change_state and
-# DishwasherMonitor._should_change_state now compare self._now_utc() (aware UTC) instead - see the
-# docstring on each. Every writer of last_state_change must stay on _now_utc() too, or the
-# subtraction raises TypeError on mixed naive/aware operands the moment the two disagree; the
-# dryer's other writer (_power_unavailable_off_timeout) is exercised below for exactly that
-# reason.
+# until the hour is out. DryerMonitor._should_change_state and DishwasherMonitor._should_change_state
+# now compare self._now_utc() (aware UTC) instead - see the docstring on each. Every writer of
+# last_state_change must stay on _now_utc() too, or the subtraction raises TypeError on mixed
+# naive/aware operands the moment the two disagree; the dryer's other writer
+# (_power_unavailable_off_timeout) is exercised below for exactly that reason.
+#
+# WasherMonitor._should_change_state (washer_monitor.py ~line 2195) has compared self._now_utc()
+# since the method was first introduced - never had the naive-datetime bug to begin with - but had
+# no pinning test of its own here. Covered below purely to pin the invariant (aware stamp in, aware
+# comparison out) against a future regression; no washer_monitor.py behaviour changed.
 #
 # Per this repo's incident history, stubbing out the very function whose interaction with its
 # caller IS the bug would hide it again - so every test below calls the real
@@ -49,6 +53,7 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
 
 import dishwasher_monitor  # noqa: E402
 import dryer_monitor  # noqa: E402
+import washer_monitor  # noqa: E402
 
 # See the module docstring above for what each looks like in naive Europe/Copenhagen local time.
 FALL_BACK_STAMP_UTC = datetime(2026, 10, 25, 0, 55, 0, tzinfo=timezone.utc)          # 02:55 CEST
@@ -132,6 +137,28 @@ def make_dishwasher_app():
 
     app.state_entity = "sensor.dishwasher_state"
     app.cooling_period = 300
+
+    app.state = "Off"
+    app.states = {}
+    app.last_state_change = None
+
+    app.log_calls = []
+    app.log = lambda *a, **kw: app.log_calls.append((a, kw))
+    app.get_state = lambda entity, **kw: app.states.get(entity)
+
+    return app
+
+
+def make_washer_app():
+    """WasherMonitor built with __new__, holding only the attributes _should_change_state
+    touches. cooling_period is set to 600 here (not washer_monitor.py's own configurable
+    default of 300 from args) purely so the same FALL_BACK_INSIDE_COOLING_UTC /
+    FALL_BACK_PAST_COOLING_UTC instants used for the dryer above land on the same two sides of
+    the boundary - the invariant under test does not depend on the specific value."""
+    app = washer_monitor.WasherMonitor.__new__(washer_monitor.WasherMonitor)
+
+    app.state_entity = "sensor.washer_state"
+    app.cooling_period = 600
 
     app.state = "Off"
     app.states = {}
@@ -236,6 +263,49 @@ class DishwasherLastStateChangeStaysAwareAfterAnAcceptedTransition(unittest.Test
 
     def test_accepted_transition_stamps_an_aware_utc_datetime(self):
         app = make_dishwasher_app()
+        app.states[app.state_entity] = "Off"
+        app._now_utc = lambda: FALL_BACK_STAMP_UTC
+
+        self.assertTrue(app._should_change_state("Running"))
+        self.assertIsNotNone(app.last_state_change.tzinfo)
+        self.assertEqual(app.last_state_change.utcoffset(), timedelta(0))
+
+
+class WasherCoolingCheckCrossesTheFallBackBoundary(unittest.TestCase):
+    """Same regression shape as the dryer's (see that class's docstring above), mirrored for
+    WasherMonitor. WasherMonitor._should_change_state has always compared self._now_utc() - this
+    pins that invariant rather than proving a fix, since there was never a naive-datetime bug
+    here to begin with."""
+
+    def test_past_cooling_period_across_fall_back_is_allowed(self):
+        """720 real seconds have elapsed (past the 600s cooling_period). A naive-clock
+        implementation would see local time go from 02:55 CEST to 02:07 CET - a -48 minute
+        delta, which is < 600 and would wrongly refuse this transition."""
+        app = make_washer_app()
+        app.states[app.state_entity] = "Off"
+        app.last_state_change = FALL_BACK_STAMP_UTC
+        app._now_utc = lambda: FALL_BACK_PAST_COOLING_UTC
+
+        self.assertTrue(app._should_change_state("Running"))
+
+    def test_inside_cooling_period_across_fall_back_is_still_refused(self):
+        """Only 300 real seconds have elapsed (still inside the 600s cooling_period) - the
+        cooling check must keep working across the DST boundary, not just stop mattering."""
+        app = make_washer_app()
+        app.states[app.state_entity] = "Off"
+        app.last_state_change = FALL_BACK_STAMP_UTC
+        app._now_utc = lambda: FALL_BACK_INSIDE_COOLING_UTC
+
+        self.assertFalse(app._should_change_state("Running"))
+
+
+class WasherLastStateChangeStaysAwareAfterAnAcceptedTransition(unittest.TestCase):
+    """Same invariant as the dryer's/dishwasher's: last_state_change must stay an aware UTC
+    datetime, or the very next cooling-period comparison raises TypeError on a naive/aware
+    subtraction instead of returning a bool."""
+
+    def test_accepted_transition_stamps_an_aware_utc_datetime(self):
+        app = make_washer_app()
         app.states[app.state_entity] = "Off"
         app._now_utc = lambda: FALL_BACK_STAMP_UTC
 

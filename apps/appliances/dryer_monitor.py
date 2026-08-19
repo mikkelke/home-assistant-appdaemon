@@ -1551,11 +1551,20 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
             self._transition_to_off("Door open too long during pause")
 
     def _running_watchdog_timeout(self, kwargs):
-        """Safety watchdog - cycle running too long indicates sensor issue."""
+        """Safety watchdog - cycle running too long indicates sensor issue.
+
+        Spans Running AND Paused: this timer is armed once, in _confirm_running, and is
+        deliberately never cancelled by _transition_to_paused (see that method's docstring and
+        _restore_running_state's - both restored states re-arm the SAME watchdog), so a cycle
+        that got stuck in Paused (e.g. a missed door-close edge) must be cleared by the same
+        backstop as a stuck Running, not silently ignored because the state string moved on.
+        Un-forced on purpose, same as the Running case: max_running_hours is measured in hours
+        and cooling_period in seconds, so this backstop is never actually blocked by cooling in
+        practice - force=True is not needed here the way it is for e.g. _emptied_watchdog_timeout."""
         current_state = self.get_state(self.state_entity)
-        if current_state == "Running":
+        if current_state in ("Running", "Paused"):
             run_hours = self._get_run_duration_minutes() / 60
-            self.log(f"WATCHDOG: Running for {run_hours:.1f}h exceeds max {self.max_running_hours}h - forcing Off", level="WARNING")
+            self.log(f"WATCHDOG: {current_state} for {run_hours:.1f}h exceeds max {self.max_running_hours}h - forcing Off", level="WARNING")
             self._transition_to_off(f"Watchdog: ran {run_hours:.1f}h (max {self.max_running_hours}h)")
         self.running_watchdog_timer = None
 
