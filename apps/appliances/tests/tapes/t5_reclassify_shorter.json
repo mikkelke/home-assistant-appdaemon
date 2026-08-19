@@ -1,0 +1,74 @@
+{
+  "meta": {
+    "appliance": "dryer",
+    "source": "synthetic",
+    "captured_at": "2026-03-05T08:00:00+00:00",
+    "notes": "Pins G_past_guard's anti-regression rule (spec 4.1: guard_dur anchored to the restored/started programme, never a live re-classify to a shorter profile; test_dryer_restart_survival.py:643-687). Restores live (AD-only reload - entity and attrs both present, trusted outright, no hypothesis involved) into a Running cycle classified as a 150-min programme (guard_dur = 0.8*150 = 120min) already 65 minutes in. At t=5 power drops (arms finish-confirm); by the time it is due (~t=65) only ~66 minutes have elapsed since start_time - correctly still short of the 120-min guard for the RESTORED programme, so the table's 'NOT G_past_guard' row must block the finish (log + cancel, back to RUNNING). THE BUG this guards against: if guard_dur were instead derived from a live re-classify against only the ~66 minutes of runtime observed so far (which could plausibly look like a much shorter ~60-min programme, guard_dur=48min), 66 >= 48 would wrongly declare past-guard and finish early. The sole assertion is negative: expect[] contains ONLY the initial Running entry - Unemptied must never appear anywhere in this tape's trace, proving the guard stayed anchored to the restored 150-min programme."
+  },
+  "args": {
+    "start_w": 8,
+    "stop_w": 5,
+    "run_for": 60,
+    "stop_for": 60,
+    "main_cycle_power": 400,
+    "fill_window_minutes": 60,
+    "min_cycle_minutes": 60,
+    "min_energy_kwh": 0.05,
+    "pause_timeout_minutes": 10,
+    "max_running_hours": 5,
+    "unemptied_timeout_hours": 24,
+    "emptied_timeout_minutes": 30,
+    "cooling_period": 600,
+    "restore_corroboration_window_minutes": 10,
+    "announce_freshness_minutes": 20
+  },
+  "initial": {
+    "entity_state": "Running",
+    "entity_attrs": {
+      "start_time": "2026-03-05T06:55:00+00:00",
+      "energy_start": 0.0,
+      "detected_programme": "Ekstra tort",
+      "programme_duration_min": 150,
+      "max_power_w": 650,
+      "cycle_id": "cyc-t5-reclassify"
+    },
+    "helper_state": "Running",
+    "store": {
+      "state": "Running",
+      "start_time": "2026-03-05T06:55:00+00:00",
+      "energy_at_start": 0.0,
+      "detected_programme": "Ekstra tort",
+      "programme_duration_min": 150,
+      "state_since": "2026-03-05T06:55:00+00:00",
+      "notification_sent": false,
+      "cycle_id": "cyc-t5-reclassify",
+      "code_fingerprint": "t5fingerprint"
+    }
+  },
+  "events": [
+    {
+      "t": 0,
+      "kind": "restart"
+    },
+    {
+      "t": 5,
+      "kind": "power",
+      "watts": 3
+    },
+    {
+      "t": 70,
+      "kind": "tick"
+    },
+    {
+      "t": 75,
+      "kind": "power",
+      "watts": 300
+    }
+  ],
+  "expect": [
+    {
+      "t_approx": 0,
+      "published": "Running"
+    }
+  ]
+}

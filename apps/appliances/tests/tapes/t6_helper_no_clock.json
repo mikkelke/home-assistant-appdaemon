@@ -1,0 +1,43 @@
+{
+  "meta": {
+    "appliance": "dryer",
+    "source": "synthetic",
+    "captured_at": "2026-04-12T07:30:00+00:00",
+    "notes": "Pins the helper-only boot floor (spec 4.3's precedence chain; test_dryer_restart_survival.py:364-377). Full HA restart: entity_state is null (HA lost the AppDaemon-owned sensor.dryer_state), and there is no durable store (first boot / store lost). Only input_select.dryer_state (helper_state) still says 'Running' - a bare label with no start_time, no clock, nothing a watchdog could arm against. Per spec 4.3, a helper-only Running carries no clock and 'can only seed clock-free states', so it falls through past Running all the way to Off rather than resurrecting a clockless Running - which would otherwise violate the fuzz invariant (spec 11.2) that Running/Paused/Ending must never exist without a start_time and an armed running-watchdog."
+  },
+  "args": {
+    "start_w": 8,
+    "stop_w": 5,
+    "run_for": 60,
+    "stop_for": 60,
+    "main_cycle_power": 400,
+    "fill_window_minutes": 60,
+    "min_cycle_minutes": 60,
+    "min_energy_kwh": 0.05,
+    "pause_timeout_minutes": 10,
+    "max_running_hours": 5,
+    "unemptied_timeout_hours": 24,
+    "emptied_timeout_minutes": 30,
+    "cooling_period": 600,
+    "restore_corroboration_window_minutes": 10,
+    "announce_freshness_minutes": 20
+  },
+  "initial": {
+    "entity_state": null,
+    "entity_attrs": {},
+    "helper_state": "Running",
+    "store": null
+  },
+  "events": [
+    {
+      "t": 0,
+      "kind": "restart"
+    }
+  ],
+  "expect": [
+    {
+      "t_approx": 0,
+      "published": "Off"
+    }
+  ]
+}

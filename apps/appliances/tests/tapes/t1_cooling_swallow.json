@@ -1,0 +1,59 @@
+{
+  "meta": {
+    "appliance": "dryer",
+    "source": "synthetic",
+    "captured_at": "2026-02-01T20:00:00+00:00",
+    "notes": "Pins the 34h Emptied->Off wedge fix (dryer_monitor.py:1498-1506): 52 of 92 door-closes since January were refused because the old code ran DOOR_CLOSED from Emptied through the SAME unforced cooling check as everything else. The engine's cooling matrix (spec 3.3) makes EventClass.PHYSICAL unconditionally BYPASS cooling, so a door-close arriving well inside cooling_period must still land. This tape enters Emptied 5s before boot (state_since = anchor - 5s) and closes the door only 5s after that (t=5, cooling_period=600s) - a naive unforced gate would refuse this outright; the bypass must let it through immediately."
+  },
+  "args": {
+    "start_w": 8,
+    "stop_w": 5,
+    "run_for": 60,
+    "stop_for": 60,
+    "main_cycle_power": 400,
+    "fill_window_minutes": 60,
+    "min_cycle_minutes": 60,
+    "min_energy_kwh": 0.05,
+    "pause_timeout_minutes": 10,
+    "max_running_hours": 5,
+    "unemptied_timeout_hours": 24,
+    "emptied_timeout_minutes": 30,
+    "cooling_period": 600,
+    "restore_corroboration_window_minutes": 10,
+    "announce_freshness_minutes": 20
+  },
+  "initial": {
+    "entity_state": "Emptied",
+    "entity_attrs": {},
+    "helper_state": null,
+    "store": {
+      "state": "Emptied",
+      "state_since": "2026-02-01T19:59:55+00:00",
+      "start_time": "2026-02-01T18:25:00+00:00",
+      "notification_sent": true,
+      "cycle_id": "cyc-t1-emptied",
+      "code_fingerprint": "t1fingerprint"
+    }
+  },
+  "events": [
+    {
+      "t": 0,
+      "kind": "restart"
+    },
+    {
+      "t": 5,
+      "kind": "door",
+      "state": "off"
+    }
+  ],
+  "expect": [
+    {
+      "t_approx": 0,
+      "published": "Emptied"
+    },
+    {
+      "t_approx": 5,
+      "published": "Off"
+    }
+  ]
+}

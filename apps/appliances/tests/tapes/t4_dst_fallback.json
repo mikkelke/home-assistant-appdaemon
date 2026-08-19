@@ -1,0 +1,66 @@
+{
+  "meta": {
+    "appliance": "dryer",
+    "source": "synthetic",
+    "captured_at": "2026-10-25T00:55:00+00:00",
+    "notes": "Pins the DST fall-back cooling regression (dryer_monitor.py:1386-1397; ported by test_appliance_cooling_dst.py's DryerCoolingCheckCrossesTheFallBackBoundary). Real Europe/Copenhagen 2026-10-25 fall-back: 00:55:00Z = 02:55 CEST (anchor, t=0) to 01:07:00Z = 02:07 CET (t=720) - a naive LOCAL-time implementation sees local clock run backward 48 minutes there, making `now - last_state_change` negative, which is trivially < cooling_period and would wrongly refuse the transition. The engine's Clock is UTC-aware only (spec 3.1, 3.3) so this is structurally impossible: boots straight into Running with state_since=anchor, then a DOOR_OPENED-while-high-power at t=720 (RESPECT-gated per 3.3, real elapsed 720s > cooling_period=600s) must be ALLOWED, landing Paused."
+  },
+  "args": {
+    "start_w": 8,
+    "stop_w": 5,
+    "run_for": 60,
+    "stop_for": 60,
+    "main_cycle_power": 400,
+    "fill_window_minutes": 60,
+    "min_cycle_minutes": 60,
+    "min_energy_kwh": 0.05,
+    "pause_timeout_minutes": 10,
+    "max_running_hours": 5,
+    "unemptied_timeout_hours": 24,
+    "emptied_timeout_minutes": 30,
+    "cooling_period": 600,
+    "restore_corroboration_window_minutes": 10,
+    "announce_freshness_minutes": 20
+  },
+  "initial": {
+    "entity_state": "Running",
+    "entity_attrs": {},
+    "helper_state": null,
+    "store": {
+      "state": "Running",
+      "start_time": "2026-10-25T00:55:00+00:00",
+      "energy_at_start": 0.0,
+      "detected_programme": "unknown",
+      "state_since": "2026-10-25T00:55:00+00:00",
+      "notification_sent": false,
+      "cycle_id": "cyc-t4-dst",
+      "code_fingerprint": "t4fingerprint"
+    }
+  },
+  "events": [
+    {
+      "t": 0,
+      "kind": "restart"
+    },
+    {
+      "t": 710,
+      "kind": "power",
+      "watts": 300
+    },
+    {
+      "t": 720,
+      "kind": "door",
+      "state": "on"
+    }
+  ],
+  "expect": [
+    {
+      "t_approx": 0,
+      "published": "Running"
+    },
+    {
+      "t_approx": 720,
+      "published": "Paused"
+    }
+  ]
+}

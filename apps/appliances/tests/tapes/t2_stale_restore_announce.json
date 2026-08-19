@@ -1,0 +1,78 @@
+{
+  "meta": {
+    "appliance": "dryer",
+    "source": "synthetic",
+    "captured_at": "2026-08-19T09:00:00+00:00",
+    "notes": "Pins F2 (dryer_monitor.py:550-600,1745-1760), the dryer side of the washer 2026-08-19 stale-restore-announce incident (washer_monitor.py:991-1017, 3607-3634). Boot restores Running from the durable store only (entity_state is null - HA restarted, not just AD): start_time 3h ago, last_high_energy_at 170min ago (outside restore_corroboration_window_minutes=10) and live power reads 0W - uncorroborated. MUST NOT announce; MUST set hypothesis=true and schedule a one-shot RECONCILE (spec 8). ~60s later RECONCILE concludes quietly (run_min=180 >= min_cycle_minutes=60, power stayed <= stop_w throughout): finish_anchor_override = start_time + fill_window_minutes puts finish_detection_latency far past announce_freshness_minutes=20, so the conclusion downgrades to a mobile push, never Sonos, and hypothesis clears. NOTE: this tape does not exercise the companion 'door-open edge in history -> route EMPTIED silently' branch of spec 8 - that branch is arbitrated from HA recorder history (F7), which this harness's Replay.entities snapshot does not model (see replay.py's documented 'Known limitation'); it needs ctx.get_history wiring, not yet built."
+  },
+  "args": {
+    "start_w": 8,
+    "stop_w": 5,
+    "run_for": 60,
+    "stop_for": 60,
+    "main_cycle_power": 400,
+    "fill_window_minutes": 60,
+    "min_cycle_minutes": 60,
+    "min_energy_kwh": 0.05,
+    "pause_timeout_minutes": 10,
+    "max_running_hours": 5,
+    "unemptied_timeout_hours": 24,
+    "emptied_timeout_minutes": 30,
+    "cooling_period": 600,
+    "restore_corroboration_window_minutes": 10,
+    "announce_freshness_minutes": 20
+  },
+  "initial": {
+    "entity_state": null,
+    "entity_attrs": {},
+    "helper_state": null,
+    "store": {
+      "state": "Running",
+      "start_time": "2026-08-19T06:00:00+00:00",
+      "energy_at_start": 0.05,
+      "detected_programme": "Skjorter",
+      "programme_duration_min": 65,
+      "state_since": "2026-08-19T06:00:00+00:00",
+      "last_high_energy_at": "2026-08-19T06:10:00+00:00",
+      "notification_sent": false,
+      "cycle_id": "cyc-t2-stale",
+      "code_fingerprint": "t2fingerprint"
+    }
+  },
+  "events": [
+    {
+      "t": 0,
+      "kind": "restart"
+    },
+    {
+      "t": 10,
+      "kind": "power",
+      "watts": 0
+    },
+    {
+      "t": 40,
+      "kind": "power",
+      "watts": 0
+    },
+    {
+      "t": 65,
+      "kind": "tick"
+    }
+  ],
+  "expect": [
+    {
+      "t_approx": 0,
+      "published": "Running",
+      "hypothesis": true,
+      "announced": false,
+      "pushed": false
+    },
+    {
+      "t_approx": 65,
+      "published": "Unemptied",
+      "hypothesis": false,
+      "announced": false,
+      "pushed": true
+    }
+  ]
+}
