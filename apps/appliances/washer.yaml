@@ -456,6 +456,17 @@ washer_monitor:
   unemptied_timeout_hours: 12   # Wet laundry - shorter timeout (12h)
 
   # ============================================================================
+  # RESTART / RESTORE CORROBORATION
+  # ============================================================================
+  # After a HA restart, a Running/Paused state restored from a NON-live source (durable store,
+  # helper+history) is only a hypothesis until a live signal backs it. It counts as corroborated
+  # if current power is above finish_standby_max_watts, or last_high_energy_at is within this
+  # window of now; otherwise the announcement is suppressed and a one-shot reconcile ~60s later
+  # concludes the cycle quietly if the machine has stayed at standby the whole window. A fresh
+  # power sample >= start_w clears the suppression and the cycle continues as normal Running.
+  restore_corroboration_window_minutes: 10
+
+  # ============================================================================
   # TIMING THRESHOLDS
   # ============================================================================
   
@@ -482,6 +493,13 @@ washer_monitor:
   
   announce_message: "Washer is ready to be emptied"
   announce_entity: input_boolean.washer_announce   # Toggle off to silence Sonos announcements
+  # If the finish is only detected this many minutes after it actually happened (finish anchor =
+  # last_high_energy_at), a Sonos blast about a wash you emptied long ago is worse than a quiet
+  # mobile push - send "finished ~N min ago" to the phone instead. notification_sent still gates
+  # against a double-notify. 20, not 15: the non-near-end finish path detects at ~16min
+  # (energy_stable_minutes 15 + slack) and must stay on Sonos; genuinely-late detections are
+  # 30+ min (restart storms, guard-blocked finishes, the reconcile path).
+  announce_freshness_minutes: 20
 
   # ============================================================================
   # PRESENCE-GATED CONFIRM PUSH

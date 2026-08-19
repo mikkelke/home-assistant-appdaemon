@@ -413,6 +413,14 @@ class TestUnemptiedTransitionForReal(unittest.TestCase):
         app = make_app()
         tick(app, 8.2, "eco", None, 0.55)
         app.now = app.start_time + timedelta(minutes=179.97)
+        # A real backstop-driven finish always has a recent last_high_energy_at - power was last
+        # significant ~5 min before "now" (the backstop's own 5-min hard-0W requirement is why it
+        # fires at all). Missing here previously only by harness omission; D1's finish-anchor
+        # fallback chain (washer_monitor.py's _finish_anchor) now falls through this harness's gap
+        # to start_time+addload_window_minutes when unset, which is ~175min "late" for this tick
+        # and wrongly downgrades the announcement to a mobile push - not a real behavior change,
+        # just this test's setup catching up to what the anchor now actually needs.
+        app.last_high_energy_at = app.now - timedelta(minutes=5)
 
         # ---- _transition_to_unemptied surface ----
         app.in_finishing_tail = False

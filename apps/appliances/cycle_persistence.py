@@ -40,10 +40,12 @@ the classes that mix it in (self.log, self.get_state, self.args, ...) - see each
 docstring for exactly what it expects to find on self.
 """
 
+import hashlib
+import sys
+
 try:
     from cycle_store import CycleStore, format_utc
 except ImportError:
-    import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from cycle_store import CycleStore, format_utc
@@ -90,6 +92,27 @@ class CyclePersistenceMixin:
         self._store_last_write_at = None
         self._store_last_fingerprint = None
         self._store_last_written_state = None
+        # md5 of this monitor's own source file, stamped into every payload as code_fingerprint
+        # (see _cycle_store_envelope). A restore can then tell whether the payload was written by
+        # the same monitor code it is being restored into; washer treats a mismatch as an
+        # uncorroborated restore (see its initialize() corroboration). dryer/dishwasher only
+        # stamp it - they never read it back, so their restore stays unchanged. Computed once
+        # here, best-effort, never fatal.
+        self._code_fingerprint = self._compute_code_fingerprint()
+
+    def _compute_code_fingerprint(self):
+        """md5 hexdigest of this monitor's own .py file, or None if it cannot be read.
+        type(self).__module__ resolves to the concrete monitor module (washer_monitor,
+        dryer_monitor, dishwasher_monitor), so each appliance fingerprints its own code."""
+        try:
+            module = sys.modules.get(type(self).__module__)
+            path = getattr(module, "__file__", None)
+            if not path:
+                return None
+            with open(path, "rb") as f:
+                return hashlib.md5(f.read()).hexdigest()
+        except Exception:
+            return None
 
     # ----- Boot-time snapshot: read once, before the first write, expose to restore code -----
 
@@ -256,6 +279,9 @@ class CyclePersistenceMixin:
             "state_since": format_utc(state_since) if state_since else empty,
             "cycle_id": self._cycle_store_cycle_id(),
             "entity_recreated_at": format_utc(entity_recreated_at) if entity_recreated_at else empty,
+            # See _init_cycle_store: lets a restore tell whether this payload was written by the
+            # same monitor code. Additive - dryer/dishwasher carry it but never read it back.
+            "code_fingerprint": getattr(self, "_code_fingerprint", None),
         }
 
     def _build_cycle_store_payload(self, state):

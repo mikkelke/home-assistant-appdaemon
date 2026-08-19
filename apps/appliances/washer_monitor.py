@@ -658,6 +658,12 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # Notification
         self.announce_message = self.args.get("announce_message", "Washer is ready to be emptied")
         self.announce_entity = self.args.get("announce_entity")  # input_boolean to enable/disable
+        # If we only detect the finish this many minutes after it actually happened (finish
+        # anchor = last_high_energy_at), a Sonos announcement is too late to be useful - send a
+        # quieter mobile push ("finished ~N min ago") instead. See _transition_to_unemptied.
+        # 20, not 15: the non-near-end finish path detects at ~16min (energy_stable_minutes 15 +
+        # slack) and must stay on Sonos; genuinely-late detections run 30+min.
+        self.announce_freshness_minutes = float(self.args.get("announce_freshness_minutes", 20))
         # Optional: announce when door *unlocks* instead of when we enter Unemptied.
         self.door_lock_entity = self.args.get("door_lock_entity")  # e.g. lock.washer_door
 
@@ -721,11 +727,29 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # _resolve_store_candidate) - NTP may not have synced yet at boot, so a start_time a few
         # minutes ahead of "now" is tolerated; anything further ahead is rejected outright.
         self.store_future_skew_minutes = float(self.args.get("store_future_skew_minutes", 5))
+        # A Running/Paused state restored from a NON-live source (durable store, helper+history)
+        # counts as corroborated only if current power is above finish_standby_max_watts or
+        # last_high_energy_at is within this window of now; otherwise the announcement is
+        # suppressed and a one-shot reconcile runs ~60s later (see the restore corroboration
+        # below, _restore_reconcile and _power_changed's clear).
+        self.restore_corroboration_window_minutes = float(self.args.get("restore_corroboration_window_minutes", 10))
         self._cycle_id = None  # uuid4, minted below/in _begin_running_cycle - notification_sent's own scoping is on _start_time_source == "durable_store", see _finalize_restored_cycle_identity
         # state_since for the durable store - deliberately its own field, not last_state_change -
         # see cycle_persistence.py's _build_cycle_store_payload for why last_state_change itself
         # is never persisted.
         self._store_state_since = None
+        # FIX 1 (2026-08-19): set True when a Running/Paused restore came from a non-live source
+        # and no live signal corroborated it yet - suppresses announcements until either a fresh
+        # power sample above start_w clears it (_power_changed) or the one-shot reconcile
+        # concludes the cycle quietly (_restore_reconcile). Default False on every other path.
+        self.restored_uncorroborated = False
+        self._restore_reconcile_timer = None
+        # Rate-limits the Unemptied door-history reconciler (FIX 4) to ~5 min between recorder
+        # queries rather than one per 60s tick - see _unemptied_door_recheck.
+        self._unemptied_last_history_check_at = None
+        # D1 (2026-08-19): set only for the duration of _restore_reconcile's own transition call -
+        # see _finish_anchor and _restore_reconcile's docstring invariant. None everywhere else.
+        self._finish_anchor_override = None
 
         # Restore previous state. Read the entity's bare state, its full attribute snapshot,
         # and the on-disk store ALL ONCE, here, before any write - _set_state_entity below is
@@ -834,12 +858,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                         start_time, source = self._infer_boot_start_time_from_history()
                         if start_time is not None:
                             self._start_time_source = source
-                elif helper_state in valid_states:
-                    self.log(
-                        f"{self.ui_state_select} says {helper_state} but the sensor is gone with its cycle "
-                        f"clock - not seeding; power detection re-establishes a wash that is still running",
-                        level="INFO",
-                    )
+                # No "elif helper_state in valid_states" here: seedable_states IS valid_states
+                # (see above), so the seedable branch already covers every valid helper_state -
+                # the old "not seeding, power detection re-establishes it" branch was dead.
             except Exception as e:
                 # Every store interaction (and the boot resolution hanging off it) must be
                 # non-fatal - a corrupt store degrades to today's plain restore, never kills
@@ -954,6 +975,46 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 # dispatch populated start_time/energy_start/etc, so this makes the on-disk
                 # payload complete immediately rather than waiting for a naturally-throttled one.
                 self._save_cycle_state(force=True)                                              # J
+                # FIX 1 (2026-08-19): a Running/Paused restored from a NON-live source (durable
+                # store, helper+history inference) is only a HYPOTHESIS until a live signal backs
+                # it. The 2026-08-19 incident restored a stale Running record onto a machine that
+                # had already finished and been emptied, at 0W, then announced Unemptied minutes
+                # after the user emptied it. Corroborate: current power above the standby ceiling,
+                # or last_high_energy_at within restore_corroboration_window_minutes of now. A
+                # store payload written by a DIFFERENT code fingerprint is treated as
+                # uncorroborated too (its semantic fields may no longer mean the same thing). The
+                # live-entity path (entity_trusted) and the legacy power-is-truth force path are
+                # corroborated by construction - power there is >= start_w > the ceiling - so they
+                # never trip this. Uncorroborated: keep the state and clock (quiet mid-cycle
+                # phases are real - do NOT drop to Off), but suppress announcements and schedule a
+                # one-shot reconcile (_restore_reconcile); a fresh sample >= start_w clears it.
+                if not entity_trusted:
+                    recent_high = (
+                        self.last_high_energy_at is not None
+                        and (self._now_utc() - self.last_high_energy_at)
+                        <= timedelta(minutes=self.restore_corroboration_window_minutes)
+                    )
+                    power_ok = boot_watts > self.finish_standby_max_watts
+                    stored_fp = (store_data or {}).get("code_fingerprint") if store_used else None
+                    fingerprint_mismatch = (
+                        stored_fp is not None
+                        and getattr(self, "_code_fingerprint", None) is not None
+                        and stored_fp != self._code_fingerprint
+                    )
+                    if (power_ok or recent_high) and not fingerprint_mismatch:
+                        self.restored_uncorroborated = False
+                    else:
+                        self.restored_uncorroborated = True
+                        why = "store code fingerprint changed" if fingerprint_mismatch else (
+                            f"power {boot_watts:.0f}W <= {self.finish_standby_max_watts:.0f}W and no "
+                            f"high-energy sample within {self.restore_corroboration_window_minutes:.0f}min"
+                        )
+                        self.log(
+                            f"Restore: {self.state} from a non-live source is UNCORROBORATED "
+                            f"({why}) - suppressing announcements, reconciling in 60s",
+                            level="WARNING",
+                        )
+                        self._restore_reconcile_timer = self.run_in(self._restore_reconcile, 60)
         elif self.state == "Unemptied":
             # Restart door-recheck and watchdog timers so we don't get stuck in Unemptied after
             # an app reload (the timers are not persisted across restarts).
@@ -964,6 +1025,22 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                     self._unemptied_watchdog_timeout,
                     int(self.unemptied_timeout_hours * 3600),
                 )
+            # D1 (2026-08-19 adversarial pass): restore last_high_energy_at and start_time from
+            # the store so _finish_anchor() has a real floor for the FIX-4 door-history recheck,
+            # instead of collapsing to "now - anti_crease_window_minutes" (8min) and missing an
+            # older ajar emptying. Scoped to exactly these two fields - no other Running-side
+            # restore logic runs for Unemptied. Only when THIS boot's Unemptied resolution
+            # actually came from the store (store_used - never from an unrelated/stale record,
+            # matching the same guard the Running/Paused branch above uses). When the payload
+            # lacks them, _finish_anchor()'s _store_state_since fallback (step c, restored
+            # separately just above) still covers it.
+            if store_used and store_data:
+                restored_high = cystore.parse_utc(store_data.get("last_high_energy_at"))
+                if restored_high is not None:
+                    self.last_high_energy_at = restored_high
+                restored_start = cystore.parse_utc(store_data.get("start_time"))
+                if restored_start is not None:
+                    self.start_time = restored_start
         elif self.state == "Emptied":
             # Check if power is already 0W - machine is off, go directly to Off.
             try:
@@ -1188,6 +1265,67 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 )
             self._cycle_id = str(uuid.uuid4())
             self.notification_sent = False
+
+    def _restore_reconcile(self, kwargs):
+        """One-shot ~60s after an uncorroborated Running/Paused restore (FIX 1b; scheduled in
+        initialize()). If the machine has stayed at/below standby the whole visible window and
+        the run is already a real cycle length, the wash ended while we were down - conclude it:
+        _correct_duration + a single feedback save, routed to Emptied if the door came into play
+        (FIX 2) or Unemptied announced by the FRESHNESS gate only (the flag is cleared below, so
+        the huge detection latency downgrades Sonos to a mobile push - wet laundry must be late
+        but never silent). Otherwise leave it Running - a fresh
+        sample >= start_w (_power_changed) clears the flag and the cycle continues normally, and
+        a genuine later finish announces then. Concludes on evidence only: absent power history
+        is never taken as proof the machine is off.
+
+        D1 invariant (2026-08-19 adversarial pass): while the transition below runs,
+        _finish_anchor_override pins the finish anchor to start_time + addload_window_minutes -
+        never last_high_energy_at, which on this path may be a synthetic boot-seeded placeholder
+        (not a fact of when the wash actually finished) or explicitly distrusted (code-fingerprint
+        mismatch). start_time is guaranteed non-None by the gate above. That floor makes freshness
+        latency (>= run_minutes - addload_window_minutes, and run_minutes >= min_cycle_minutes
+        here) always exceed announce_freshness_minutes for any cycle that reaches this method, so
+        Sonos is STRUCTURALLY IMPOSSIBLE on the reconcile path - only the door-gate (Emptied,
+        silent) or the freshness gate (mobile push) can fire."""
+        self._restore_reconcile_timer = None
+        if not self.restored_uncorroborated:
+            return
+        if self.state not in ("Running", "Paused"):
+            return
+        if self.start_time is None:
+            return
+        run_minutes = (self._now_utc() - self.start_time).total_seconds() / 60
+        if run_minutes < self.min_cycle_minutes:
+            return
+        points = self._get_recent_power_history(self.restore_corroboration_window_minutes)
+        if not points:
+            return
+        if any(w > self.finish_standby_max_watts for _, w in points):
+            return
+        self.log(
+            f"Restore reconcile: uncorroborated {self.state} has stayed <= "
+            f"{self.finish_standby_max_watts:.0f}W for the last "
+            f"{self.restore_corroboration_window_minutes:.0f}min (run {run_minutes:.0f}min) - "
+            f"cycle ended while we were down; concluding quietly",
+            level="INFO",
+        )
+        # standby_backstop (a known transition path that also skips the power-pattern gate): the
+        # reconcile has itself verified sustained standby, so this is a boot-time variant of the
+        # same "finished on sustained 0W" ending.
+        self._pending_end_reason = "standby_backstop"
+        # The reconcile IS the detection event: clear the suppression so the announce gate runs.
+        # The door-gate (FIX 2) still routes to Emptied silently when someone already emptied;
+        # otherwise the freshness gate sees the large latency and sends the mobile push, never
+        # Sonos. Without this, a wash finishing during an HA outage ended in total silence.
+        self.restored_uncorroborated = False
+        # D1: pin the finish anchor for the duration of this transition only - see the docstring
+        # invariant above. Cleared in finally so a later, genuinely-live finish is never anchored
+        # to this boot-time value.
+        self._finish_anchor_override = self.start_time + timedelta(minutes=self.addload_window_minutes)
+        try:
+            self._transition_to_unemptied(force=True)
+        finally:
+            self._finish_anchor_override = None
 
     def _restore_running_state(self, attrs=None, last_changed=None):
         """Restore in-memory state when we were Running or Paused before a restart.
@@ -2236,6 +2374,106 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             return door_state in ("off", "open")
         return door_state in ("on", "open")
 
+    def _finish_anchor(self):
+        """When the wash actually finished, used as the floor for the door-history and
+        announce-freshness windows. Preference order (D1, 2026-08-19 adversarial pass - the
+        plain last_high_energy_at fallback used to collapse to "now - anti_crease_window_minutes"
+        (8min) whenever last_high was None or boot-seeded, silently excluding an older door edge
+        or deflating freshness latency):
+          (a) self._finish_anchor_override, if set - the reconcile path's structural guarantee
+              that Sonos can never fire on a boot-time conclusion (see _restore_reconcile).
+          (b) last_high_energy_at, as before - stamped on every high-power sample, so at a real
+              finish it is the end-of-programme marker.
+          (c) while Unemptied/Emptied, self._store_state_since - the moment we entered that
+              state is itself a post-finish marker, so any door edge after it is definitely an
+              emptying. Covers a restored Unemptied whose store payload lacked last_high_energy_at
+              (see the Unemptied boot branch in initialize(), which restores last_high_energy_at
+              AND start_time from the store when present - this is the fallback for when it
+              wasn't).
+          (d) start_time + addload_window_minutes - physics: the drum door is interlocked shut
+              past the add-load window, so any recorded open after that moment means the machine
+              had finished (or was aborted). This also inflates freshness latency enough that a
+              None/boot-recent last_high_energy_at can never fire Sonos, only push.
+          (e) last resort: now - max(anti_crease_window_minutes, restore_corroboration_window_minutes)
+              - only reached with no override, no last_high, no state marker and no start_time at
+              all.
+        Robust to a partially-initialised app throughout (getattr defaults) - production always
+        has these set."""
+        override = getattr(self, "_finish_anchor_override", None)
+        if override is not None:
+            return override
+        anchor = getattr(self, "last_high_energy_at", None)
+        if anchor is not None:
+            return anchor
+        if getattr(self, "state", None) in ("Unemptied", "Emptied"):
+            since = getattr(self, "_store_state_since", None)
+            if since is not None:
+                return since
+        start_time = getattr(self, "start_time", None)
+        if start_time is not None:
+            addload = getattr(self, "addload_window_minutes", 5) or 5
+            return start_time + timedelta(minutes=addload)
+        window = max(
+            getattr(self, "anti_crease_window_minutes", 8) or 8,
+            getattr(self, "restore_corroboration_window_minutes", 10) or 10,
+        )
+        return self._now_utc() - timedelta(minutes=window)
+
+    def _door_open_edge_since(self, since_dt) -> bool:
+        """True if the recorder shows the door OPEN at any moment strictly after since_dt.
+
+        The recorder, not get_state, is the arbiter here: AD 4.5.13 can serve minutes-stale
+        live state, but history is durable. During a wash the door is interlocked shut, so any
+        open reading logged after the finish anchor is a fresh open edge (the human), never a
+        leftover from before the cycle - and it is caught even if the contact has since read
+        closed again (the ajar-door case). Best-effort: any history failure returns False."""
+        if not getattr(self, "door_sensor", None) or since_dt is None:
+            return False
+        try:
+            hist = self.get_history(
+                entity_id=self.door_sensor,
+                start_time=since_dt,
+                end_time=self._now_utc(),
+            )
+            for entry in self._flatten_history(hist, self.door_sensor):
+                state = entry.get("state")
+                if state in (None, "unknown", "unavailable"):
+                    continue
+                t = whist.parse_utc(entry.get("last_changed") or entry.get("last_updated"))
+                if t is None or t <= since_dt:
+                    continue
+                is_open = state in ("off", "open") if self.door_sensor_inverted else state in ("on", "open")
+                if is_open:
+                    return True
+            return False
+        except Exception as e:
+            self.log(f"Door-open history check failed: {e}", level="DEBUG")
+            return False
+
+    def _finish_route_to_emptied(self) -> bool:
+        """At a power/timer/backstop-driven finish (skip_announce=False), decide whether the
+        human is already at/done with the machine so we go straight to Emptied and never
+        announce: True if the door is physically open right now, or the recorder shows a
+        door-open edge since the finish anchor. Never raises - degrades to False (announce as
+        before) on any missing-attribute/IO problem."""
+        try:
+            if self._door_is_physically_open():
+                return True
+            return self._door_open_edge_since(self._finish_anchor())
+        except Exception as e:
+            self.log(f"Finish door-route check failed: {e}", level="DEBUG")
+            return False
+
+    def _finish_detection_latency_minutes(self) -> float:
+        """Minutes between when the wash actually finished (the finish anchor) and now - how
+        late this finish was detected. Feeds the announce freshness gate (FIX 3). 0.0 on any
+        problem, so a broken clock never suppresses a real announcement."""
+        try:
+            anchor = self._finish_anchor()
+            return (self._now_utc() - anchor).total_seconds() / 60 if anchor else 0.0
+        except Exception:
+            return 0.0
+
     def _door_state_changed(self, entity, attr, old, new, kwargs):
         """Handle door open and close events.
         Standard door contact (HA device_class: door): open door = "on", closed door = "off".
@@ -2279,6 +2517,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         if self.state != "Unemptied":
             return
         if self.notification_sent:
+            return
+        # FIX 1a: stay silent while a restore is still uncorroborated (see initialize()).
+        if getattr(self, "restored_uncorroborated", False):
             return
         announce_enabled = True
         if self.announce_entity:
@@ -2530,6 +2771,24 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.log("Door recheck: door is open while Unemptied -> Emptied (recovered missed event)", level="INFO")
             self._transition_to_emptied("Door opened - emptying (recheck)")
             return
+        # FIX 4 (2026-08-19): the door may have been opened AND closed again (ajar) while we were
+        # slow, so the live contact reads closed now but the human already emptied - the exact
+        # wedge from the 2026-08-19 incident, where Unemptied's only exits needed a door-open edge
+        # the ajar contact never produced. Ask the recorder (durable, unlike AD's stale live
+        # state) for a door-open edge since the finish anchor. Rate-limited to ~5 min so this is
+        # not a history call on every 60s tick.
+        now = self._now_utc()
+        last_check = self._unemptied_last_history_check_at
+        if last_check is None or (now - last_check).total_seconds() >= 300:
+            self._unemptied_last_history_check_at = now
+            if self._door_open_edge_since(self._finish_anchor()):
+                self.log(
+                    "Door recheck: recorder shows a door-open edge since finish (contact reads "
+                    "closed now - ajar) -> Emptied",
+                    level="INFO",
+                )
+                self._transition_to_emptied("Door opened - emptying (history recheck)")
+                return
         self.unemptied_door_recheck_timer = self.run_in(self._unemptied_door_recheck, 60)
 
     def _transition_to_running_from_pause(self, force=False):
@@ -3106,6 +3365,25 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                         level="INFO",
                     )
                 return
+        # FIX 2 (2026-08-19): door-aware finish. This is a power/timer/backstop-driven finish
+        # (skip_announce=False; the door-driven paths pass skip_announce=True and handle the door
+        # themselves in _handle_door_opened). If the human is already at the machine - door open
+        # now, or a recorder door-open edge since the finish anchor (the ajar case: opened while
+        # we were slow, reads closed again now) - they have emptied it: go straight to Emptied
+        # and never announce. Feedback is still saved exactly once, by _transition_to_emptied
+        # while self.state is still Running (its came_from_running save). Cancel the running
+        # watchdog here since we skip _transition_to_unemptied's own teardown.
+        if not skip_announce and self._finish_route_to_emptied():
+            self.log(
+                "Finish with door already open (or a door-open edge since the finish anchor) - "
+                "routing to Emptied instead of announcing Unemptied",
+                level="INFO",
+            )
+            self._pending_end_reason = None
+            self._safe_cancel_timer(self.running_watchdog_timer)
+            self.running_watchdog_timer = None
+            self._transition_to_emptied("cycle finished (door already open at finish)")
+            return
         if self._should_change_state("Unemptied", force=force):
             # History backstop: if delayed-start detection never caught the wait live (e.g. the
             # live gate closed before a resume tick, or the app restarted mid-wait), check power
@@ -3305,6 +3583,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 self._unemptied_watchdog_timeout,
                 int(self.unemptied_timeout_hours * 3600)
             )
+            # Reset the door-history rate-limiter so the first recheck after entry (~60s) does
+            # a recorder lookback for an ajar-door edge (FIX 4), not just a live-contact peek.
+            self._unemptied_last_history_check_at = None
             self.unemptied_door_recheck_timer = self.run_in(self._unemptied_door_recheck, 60)
 
             self.log(
@@ -3323,14 +3604,34 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                     announce_enabled = self.get_state(self.announce_entity) == "on"
                 except Exception:
                     pass
+            # FIX 1a: an uncorroborated restore stays silent until a live signal confirms the
+            # cycle (see initialize()'s restore corroboration / _restore_reconcile).
             if (not skip_announce and not self.door_lock_entity and self.sonos_notifier
-                    and not self.notification_sent and announce_enabled):
-                try:
-                    self.sonos_notifier.notify(message=self.announce_message)
-                    self.log("[TAIL] Washer announcement sent", level="INFO")
+                    and not self.notification_sent and announce_enabled
+                    and not getattr(self, "restored_uncorroborated", False)):
+                # FIX 3: if we only detected the finish long after it happened (e.g. a restart
+                # storm delayed detection), a Sonos blast about a wash emptied long ago is worse
+                # than a quiet mobile push. notification_sent still gates against a double-notify.
+                latency_min = self._finish_detection_latency_minutes()
+                freshness_min = getattr(self, "announce_freshness_minutes", 20)
+                if latency_min > freshness_min:
+                    self._push_mobile(
+                        f"Washer finished about {latency_min:.0f} min ago (late detection) - "
+                        f"ready to empty."
+                    )
+                    self.log(
+                        f"Finish detected {latency_min:.0f} min late (> {freshness_min:.0f} min) "
+                        f"- mobile push instead of Sonos announcement",
+                        level="INFO",
+                    )
                     self.notification_sent = True
-                except Exception as e:
-                    self.log(f"Error sending notification: {e}", level="ERROR")
+                else:
+                    try:
+                        self.sonos_notifier.notify(message=self.announce_message)
+                        self.log("[TAIL] Washer announcement sent", level="INFO")
+                        self.notification_sent = True
+                    except Exception as e:
+                        self.log(f"Error sending notification: {e}", level="ERROR")
 
     def _handle_force_emptied(self, event_name, data, kwargs):
         """washer_force_emptied (dashboard Emptied button): the drum is empty but the door
@@ -3560,6 +3861,13 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self._delayed_start_trimmed = False
         self._delay_waiting = False
         self._delayed_start_lead_idle_min = None
+        # A finished/off cycle can never be an uncorroborated restore of a live one - clear the
+        # flag (and its rate-limiter) so it never leaks into the next cycle (FIX 1).
+        self.restored_uncorroborated = False
+        self._unemptied_last_history_check_at = None
+        # D1: belt-and-braces - _restore_reconcile's own finally already clears this, but a cycle
+        # ending must never carry a stale override into the next one under any path.
+        self._finish_anchor_override = None
         self._reset_input_selectors()
 
     def _set_programme_helpers_default(self):
@@ -3648,6 +3956,22 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self._plug_outage_pushed = False
             self._push_mobile("Power plug is reporting again - washer monitoring resumed.")
         self._cancel_power_unavailable_grace()
+
+        # FIX 1c: a fresh sample at/above start current corroborates a restored Running/Paused
+        # whose clock came from a non-live source (see initialize()'s restore corroboration) -
+        # the machine is demonstrably drawing, so drop the "uncorroborated" suppression, cancel
+        # the pending reconcile, and let the real finish announce normally.
+        if getattr(self, "restored_uncorroborated", False) and watts >= self.start_w:
+            self.restored_uncorroborated = False
+            if self._restore_reconcile_timer:
+                self._safe_cancel_timer(self._restore_reconcile_timer)
+                self._restore_reconcile_timer = None
+            self.log(
+                f"Restore corroborated by live power {watts:.0f}W (>= {self.start_w:.0f}W) - "
+                f"clearing uncorroborated flag; cycle continues as normal Running",
+                level="INFO",
+            )
+
         current_state = self.get_state(self.state_entity)
 
         if current_state == "Running":
@@ -3867,6 +4191,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.energy_stable_start_time = None
         self.last_high_energy_at = None
         self._zero_power_since = None
+        # A freshly (re)started cycle is live by definition - never carry a prior restore's
+        # uncorroborated suppression into it (FIX 1).
+        self.restored_uncorroborated = False
         self.expected_dur_at_start = None
         self._guard_bar_class = None
         self._live_class_key = None
