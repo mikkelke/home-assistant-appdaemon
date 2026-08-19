@@ -1,0 +1,83 @@
+# /conf/apps/appliances/dryer_shadow.yaml
+#
+# Shadow-mode host for the engine (appliance_fsm.py + dryer_policy.py) - spec section 7. Reads
+# the SAME physical sensors as dryer_monitor.py (dryer.yaml), read-only; never writes
+# sensor.dryer_state, input_select.dryer_state, any selector, or any notifier. Publishes its own
+# sensor.dryer_state_v2 and keeps its own on-disk cycle store (dryer_shadow_state.json - ends
+# `_state.json`, so .gitignore/deploy.sh already treat it like every other runtime cycle file).
+#
+# Cutover checklist (spec section 12) is NOT executed by adding this file - this app only
+# observes and compares; it has no path to a real Sonos/Mobile notifier at all (spec 7.2).
+
+dryer_shadow:
+  module: dryer_shadow
+  class: DryerShadow
+  log: dryer_shadow_log
+
+  # Same physical entities dryer_monitor.py listens to (dryer.yaml) - read-only here.
+  power_sensor: "sensor.dryer_plug_power"
+  energy_sensor: "sensor.dryer_plug_energy"
+  door_sensor: "binary_sensor.dryer_door_contact"
+
+  # live_state_entity is READ-ONLY, for divergence compare only (spec 7.4) - never restored from,
+  # never written to. state_entity is this app's OWN output (spec 7.3).
+  live_state_entity: "sensor.dryer_state"
+  state_entity: "sensor.dryer_state_v2"
+
+  # Same split selectors as dryer.yaml, read-only (confirmed-key derivation, spec section 4.1).
+  programme_entity: "input_select.dryer_programme"
+  dryness_entity: "input_select.dryer_dryness"
+  skane_plus_entity: "input_boolean.dryer_skane_plus"
+  time_minutes_entity: "input_select.dryer_time_minutes"
+  # announce_entity is read (the toggle gate still applies to whether ShadowActions.announce is
+  # even attempted) but ShadowActions ignores the outcome either way - no notifier exists to reach.
+  announce_entity: "input_boolean.dryer_announce"
+  announce_message: "Dryer is ready to be emptied"
+
+  # ============================================================================
+  # POWER THRESHOLDS + CYCLE VALIDATION (mirrors dryer.yaml's live values - shadow parity depends
+  # on matching thresholds, or every divergence would just be knob drift, not engine correctness)
+  # ============================================================================
+  start_w: 8
+  stop_w: 5
+  run_for: 60
+  stop_for: 60
+  main_cycle_power: 400
+  door_close_fast_start_window_s: 600
+  door_close_fast_confirm_s: 12
+  fill_window_minutes: 60
+  min_cycle_minutes: 60
+  min_energy_kwh: 0.05
+  pause_timeout_minutes: 10
+  max_running_hours: 5
+  unemptied_timeout_hours: 24
+  emptied_timeout_minutes: 30
+  energy_active_watts: 100.0
+  overrun_floor_min: 10
+  cooling_period: 600
+
+  # ============================================================================
+  # RESTORE + RECONCILE (spec section 8 - the F2 fix, engine-native here)
+  # ============================================================================
+  store_max_downtime_hours: 12
+  boot_future_start_skew_s: 60
+  restore_corroboration_window_minutes: 10
+  announce_freshness_minutes: 20
+
+  # Merged per spec section 9 (was power_unavailable_off_after_seconds +
+  # power_unavailable_push_after_seconds, both 180 by default and meaning the same "how long to
+  # tolerate a dead plug").
+  power_unavailable_grace_s: 180
+
+  # selectors: sub-block (spec section 9) - UI-label config, not behavior.
+  selectors:
+    programme_unconfirmed_option: "Auto (unconfirmed)"
+    dryness_unselected_option: "—"
+    time_minutes_idle_default: "20"
+
+  # ============================================================================
+  # SHADOW-ONLY
+  # ============================================================================
+  programmes_file: /conf/apps/appliances/dryer_programmes.yaml
+  state_file: /conf/apps/appliances/dryer_shadow_state.json
+  divergence_debounce_s: 90
