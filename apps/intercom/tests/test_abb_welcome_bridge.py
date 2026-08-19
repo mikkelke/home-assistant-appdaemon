@@ -101,7 +101,8 @@ def _bare_bridge(tmpdir, clock):
     app.announce_ring_window_s = 60
     app.clip_cameras = {"front door": "camera.abb_front"}
     app.clip_seconds = 10
-    app.clip_delay_s = 8
+    app.clip_delay_s = 3
+    app.clip_announce_clear_s = 5
     app.clip_record_dir = "/config/www/abb_doorbell"
     app.station_by_door = {"back door": "100000001", "front door": "100000002"}
     app.health_sip_entity = "sensor.abb_sip"
@@ -700,7 +701,7 @@ class RingClipTests(unittest.TestCase):
     def test_ring_schedules_clip_start(self):
         self.app._open_episode("front door", "100000002", self.clock.now())
         scheduled = [(cb.__name__, delay) for cb, delay, _ in self.app.run_in_calls]
-        self.assertIn(("_start_clip", 8), scheduled)
+        self.assertIn(("_start_clip", 3), scheduled)
 
     def test_no_clip_cameras_schedules_nothing(self):
         self.app.clip_cameras = {}
@@ -723,6 +724,19 @@ class RingClipTests(unittest.TestCase):
         self.assertTrue(calls[1][1]["filename"].endswith("_front.mp4"))
         self.assertEqual(episode["clip_filename"], calls[1][1]["filename"].rsplit("/", 1)[1])
 
+    def test_no_announce_door_records_without_deferral(self):
+        # The back door has no announce voice, so _last_announce_at never holds it
+        # and the dial starts at clip_delay_s flat - the whole point of enabling
+        # back-door clips (user 2026-08-19).
+        self.app.clip_cameras = {"back door": "camera.abb_back"}
+        self.app._open_episode("back door", "100000001", self.clock.now())
+        self.clock.at += timedelta(seconds=3)
+        _run_scheduled(self.app, "_start_clip")
+        calls = self._clip_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][1]["entity_id"], "camera.abb_back")
+        self.assertTrue(calls[1][1]["filename"].endswith("_back.mp4"))
+
     def test_unmapped_door_records_nothing(self):
         self.app._open_episode("back door", "100000001", self.clock.now())
         self.clock.at += timedelta(seconds=8)
@@ -731,19 +745,19 @@ class RingClipTests(unittest.TestCase):
 
     def test_fresh_announce_defers_recording_once(self):
         episode = self.app._open_episode("front door", "100000002", self.clock.now())
-        self.clock.at += timedelta(seconds=8)
-        # The announce spoke 3 s ago (auto-open unlock at +5 s): recording now would
-        # collide station-side, so the start slips 5 s instead.
-        self.app._last_announce_at["front door"] = self.clock.at - timedelta(seconds=3)
+        self.clock.at += timedelta(seconds=3)
+        # The announce spoke 2 s ago (auto-open unlock at ~+1 s): recording now would
+        # collide station-side (< clip_announce_clear_s), so the start slips 3 s.
+        self.app._last_announce_at["front door"] = self.clock.at - timedelta(seconds=2)
         _run_scheduled(self.app, "_start_clip")
         self.assertEqual(self._clip_calls(), [])
         retry = [(cb, delay, kw) for cb, delay, kw in self.app.run_in_calls
                  if cb.__name__ == "_start_clip"]
         self.assertEqual(len(retry), 1)
-        self.assertEqual(retry[0][1], 5)
+        self.assertEqual(retry[0][1], 3)
         self.assertTrue(retry[0][2].get("retried"))
         # The retried run records even though the announce timestamp is still recent.
-        self.clock.at += timedelta(seconds=5)
+        self.clock.at += timedelta(seconds=3)
         _run_scheduled(self.app, "_start_clip")
         self.assertEqual(len(self._clip_calls()), 2)
         self.assertIsNotNone(episode["clip_filename"])

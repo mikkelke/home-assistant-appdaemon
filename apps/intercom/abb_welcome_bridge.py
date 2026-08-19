@@ -227,8 +227,13 @@ class AbbWelcomeBridge(hass.Hass):
         # ~4 s of TTS) has finished talking - and slips once more if the announce just spoke.
         raw_clip = self.args.get("clip_cameras", {}) or {}
         self.clip_cameras = {str(k): str(v) for k, v in raw_clip.items()} if isinstance(raw_clip, dict) else {}
-        self.clip_seconds = int(self.args.get("clip_seconds", 10))
-        self.clip_delay_s = int(self.args.get("clip_delay_s", 8))
+        self.clip_seconds = int(self.args.get("clip_seconds", 15))
+        self.clip_delay_s = int(self.args.get("clip_delay_s", 3))
+        # How recently the door may have spoken before a recording dial is allowed
+        # (announce and record refuse each other station-side). Only doors in
+        # announce_after_unlock ever have an announce timestamp, so the back door
+        # records at clip_delay_s flat.
+        self.clip_announce_clear_s = int(self.args.get("clip_announce_clear_s", 5))
         # archive_dir as HA's own container sees it: the record service writes there,
         # this app (whose /www is the same directory) stats the result at episode close.
         self.clip_record_dir = str(self.args.get("clip_record_dir", "/config/www/abb_doorbell")).rstrip("/")
@@ -820,8 +825,8 @@ class AbbWelcomeBridge(hass.Hass):
                 return
             last_spoken = self._last_announce_at.get(door)
             if (last_spoken is not None and not kwargs.get("retried")
-                    and (self.get_now() - last_spoken).total_seconds() < 8):
-                self.run_in(self._start_clip, 5, episode_id=episode["id"], retried=True)
+                    and (self.get_now() - last_spoken).total_seconds() < self.clip_announce_clear_s):
+                self.run_in(self._start_clip, 3, episode_id=episode["id"], retried=True)
                 return
             stamp = episode["started_at"].astimezone().strftime("%Y%m%d_%H%M%S")
             filename = f"abb_clip_{stamp}_{door_slug(door, episode['station_id'])}.mp4"
