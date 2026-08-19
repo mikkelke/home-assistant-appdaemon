@@ -142,6 +142,54 @@ class FlapsAndFinishReuseOrClearAnchor(unittest.TestCase):
             self.assertAlmostEqual(last_delay(reborn), 1200, delta=0.01)
 
 
+def make_auto_app():
+    """A fuller fake app for exercising _auto_reset's stale-generation guard, with _do_reset
+    stubbed to a recorder so we observe only whether the guard let the reset through."""
+    app = sr.SonosStateReset.__new__(sr.SonosStateReset)
+    app.speaker_volumes = {}
+    app.default_volume = 0.18
+    app.inactivity_sec = 1200
+    app._reset_in_progress = False
+    app._inactivity_generation = {}
+    app._inactivity_timers = {}
+    app._inactive_since = {}
+    app.log = lambda m, level="INFO": None
+    # state (attribute=None) -> "idle" (not playing); any attribute -> None (solo, no group)
+    app.get_state = lambda e, attribute=None, **k: "idle" if attribute is None else None
+    app.reset_calls = []
+    app._do_reset = lambda targets, trigger, source=None: app.reset_calls.append((list(targets), trigger, source))
+    return app
+
+
+class BootstrapArmedTimerFires(unittest.TestCase):
+    def test_gen_zero_with_absent_generation_key_still_fires(self):
+        # Bootstrap arms a timer WITHOUT going through _invalidate_timer_for, so the entity is
+        # absent from _inactivity_generation and the captured gen is 0. _auto_reset must NOT treat
+        # that as stale. Pre-fix bug: `.get(entity)` was None, `0 != None` -> silent early return,
+        # so any speaker already idle/paused when AppDaemon reloaded (every HA restart/deploy)
+        # never auto-reset. Observed live 2026-08-19: kristines_room re-armed 5s after a reload and
+        # never fired.
+        app = make_auto_app()
+        app._auto_reset({"entity": "media_player.kitchen", "state": "idle", "gen": 0})
+        self.assertEqual(
+            app.reset_calls,
+            [(["media_player.kitchen"], "auto_trigger", "media_player.kitchen")],
+        )
+
+    def test_genuinely_stale_callback_is_still_rejected(self):
+        # A timer superseded by later invalidations (gen 1 vs current 3) must still be dropped.
+        app = make_auto_app()
+        app._inactivity_generation = {"media_player.kitchen": 3}
+        app._auto_reset({"entity": "media_player.kitchen", "state": "idle", "gen": 1})
+        self.assertEqual(app.reset_calls, [])
+
+    def test_matching_generation_fires(self):
+        app = make_auto_app()
+        app._inactivity_generation = {"media_player.kitchen": 2}
+        app._auto_reset({"entity": "media_player.kitchen", "state": "idle", "gen": 2})
+        self.assertEqual(len(app.reset_calls), 1)
+
+
 class LoadIsForgiving(unittest.TestCase):
     def test_missing_file_loads_empty_without_logging(self):
         with tempfile.TemporaryDirectory() as d:

@@ -563,8 +563,12 @@ class SonosStateReset(hass.Hass):
         entity = kwargs.get("entity")
         state = kwargs.get("state")
         gen = kwargs.get("gen")
-        # If this callback is stale (generation changed), ignore
-        if gen is not None and gen != self._inactivity_generation.get(entity):
+        # If this callback is stale (generation changed), ignore. Default the lookup to 0 to match
+        # the gen captured at arm time (_start_inactivity_timer also reads `.get(entity, 0)`): a
+        # bootstrap-armed timer (speaker already idle/paused at reload) never goes through
+        # _invalidate_timer_for, so the entity is absent here. Without the 0 default this read None,
+        # `0 != None` was True, and the reset was silently dropped after every HA restart/deploy.
+        if gen is not None and gen != self._inactivity_generation.get(entity, 0):
             return
         
         # Only run reset if still not playing (paused/idle/standby/etc.)
