@@ -105,13 +105,40 @@ if [ "${#TRACKED[@]}" -gt 0 ]; then
     fi
   done
 
-  if [ "${#drifted[@]}" -gt 0 ]; then
+  # A box file that merely lags HEAD (matches an older commit of that file) is the NORMAL
+  # pre-deploy state, not drift - warning on it every deploy would teach everyone to ignore
+  # the block. Second pass, drifted candidates only: match the box hash against the file's
+  # last 20 historical blobs; a hit downgrades to one quiet "behind" line. Only content
+  # matching NO recent commit keeps the loud warning.
+  behind=()
+  true_drift=()
+  for f in "${drifted[@]}"; do
+    match=""
+    for c in $(git log -20 --format=%H -- "$f"); do
+      hh=$(git show "${c}:${f}" 2>/dev/null | sha256sum) || continue
+      if [ "${hh%% *}" = "${BOXMAP[$f]}" ]; then match="$c"; break; fi
+    done
+    if [ -n "$match" ]; then
+      behind+=("$f ($(git rev-parse --short "$match"))")
+    else
+      true_drift+=("$f")
+    fi
+  done
+
+  if [ "${#behind[@]}" -gt 0 ]; then
+    echo "box behind (older commit content, will be updated): ${#behind[@]} file(s)"
+    for f in "${behind[@]}"; do
+      echo "  behind: $f"
+    done
+  fi
+  if [ "${#true_drift[@]}" -gt 0 ]; then
     echo ""
     echo "=================================================================="
-    echo "WARNING: box content drift detected - ${#drifted[@]} file(s) match"
-    echo "         neither git HEAD nor the working tree about to be deployed:"
-    for f in "${drifted[@]}"; do
-      echo "  DRIFT: $f on box matches neither working tree nor HEAD"
+    echo "WARNING: box content drift detected - ${#true_drift[@]} file(s) match"
+    echo "         neither the working tree, HEAD, nor any of the last 20"
+    echo "         commits of that file (stale sibling-worktree deploy?):"
+    for f in "${true_drift[@]}"; do
+      echo "  DRIFT: $f"
     done
     echo "=================================================================="
     echo ""
