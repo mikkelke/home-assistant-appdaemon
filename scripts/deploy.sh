@@ -70,6 +70,54 @@ STAMP=$(ssh -o BatchMode=yes "$HOST" "TZ=Europe/Copenhagen date '+%Y-%m-%d %H:%M
 LIST=$(mktemp)
 ITEMS=$(mktemp)
 git ls-files apps > "$LIST"
+mapfile -t TRACKED < "$LIST"
+
+# 3a. pre-deploy drift guard: every tracked file on the box should currently
+# match either the last commit or the working tree we're about to send. A
+# file matching neither means an earlier deploy (e.g. a stale sibling
+# worktree) silently reverted it - undetected on the box 08-13 through 08-19
+# until it caused a production incident. This never aborts: deploying is
+# exactly what fixes drift. It only makes drift loud instead of silent.
+if [ "${#TRACKED[@]}" -gt 0 ]; then
+  BOXHASHES=$(printf '%s\n' "${TRACKED[@]}" | ssh -o BatchMode=yes "$HOST" '
+    cd /data/appdaemon || exit 1
+    while IFS= read -r f; do
+      if [ -f "$f" ]; then sha256sum -- "$f"; fi
+    done')
+  WTHASHES=$(sha256sum -- "${TRACKED[@]}") || true
+  HEADHASHES=""
+  for f in "${TRACKED[@]}"; do
+    hh=$(git show "HEAD:$f" 2>/dev/null | sha256sum) || continue
+    HEADHASHES+="${hh%% *}  $f"$'\n'
+  done
+
+  declare -A BOXMAP WTMAP HEADMAP
+  while read -r h p; do if [ -n "$p" ]; then BOXMAP["$p"]="$h"; fi; done <<< "$BOXHASHES"
+  while read -r h p; do if [ -n "$p" ]; then WTMAP["$p"]="$h"; fi; done <<< "$WTHASHES"
+  while read -r h p; do if [ -n "$p" ]; then HEADMAP["$p"]="$h"; fi; done <<< "$HEADHASHES"
+
+  drifted=()
+  for f in "${TRACKED[@]}"; do
+    b="${BOXMAP[$f]:-}"
+    if [ -z "$b" ]; then continue; fi  # not on the box yet: a new file, not drift
+    if [ "$b" != "${WTMAP[$f]:-}" ] && [ "$b" != "${HEADMAP[$f]:-}" ]; then
+      drifted+=("$f")
+    fi
+  done
+
+  if [ "${#drifted[@]}" -gt 0 ]; then
+    echo ""
+    echo "=================================================================="
+    echo "WARNING: box content drift detected - ${#drifted[@]} file(s) match"
+    echo "         neither git HEAD nor the working tree about to be deployed:"
+    for f in "${drifted[@]}"; do
+      echo "  DRIFT: $f on box matches neither working tree nor HEAD"
+    done
+    echo "=================================================================="
+    echo ""
+  fi
+fi
+
 # apps.yaml on the box was root-owned until 2026-07-16 (chowned to mke since).
 # Keep tolerating an attrs-only rsync failure (exit 23): it must not kill the
 # deploy before the reload check. Any other rsync error still aborts.
@@ -123,4 +171,38 @@ if [ "${RELOADS:-0}" -eq 0 ]; then
   echo "         Force with: ssh $HOST 'docker restart appdaemon'"
 else
   echo "OK: $RELOADS app initialization(s) observed"
+fi
+
+# 5. post-deploy content verification: confirm the box now holds exactly the
+# bytes we just sent, not just that rsync's own checksum agreed mid-transfer.
+# Anything else touching /data/appdaemon between the sync and this check
+# means the box isn't running what we think we shipped - the same class of
+# silent failure behind the 08-13/08-19 drift incident.
+if [ "${#TRACKED[@]}" -gt 0 ]; then
+  BOXHASHES2=$(printf '%s\n' "${TRACKED[@]}" | ssh -o BatchMode=yes "$HOST" '
+    cd /data/appdaemon || exit 1
+    while IFS= read -r f; do
+      if [ -f "$f" ]; then sha256sum -- "$f"; fi
+    done')
+  WTHASHES2=$(sha256sum -- "${TRACKED[@]}") || true
+
+  declare -A BOXMAP2 WTMAP2
+  while read -r h p; do if [ -n "$p" ]; then BOXMAP2["$p"]="$h"; fi; done <<< "$BOXHASHES2"
+  while read -r h p; do if [ -n "$p" ]; then WTMAP2["$p"]="$h"; fi; done <<< "$WTHASHES2"
+
+  mismatched=()
+  for f in "${TRACKED[@]}"; do
+    if [ "${BOXMAP2[$f]:-}" != "${WTMAP2[$f]:-}" ]; then
+      mismatched+=("$f")
+    fi
+  done
+
+  if [ "${#mismatched[@]}" -gt 0 ]; then
+    echo "FAIL: ${#mismatched[@]} file(s) on the box do not match what was just deployed:"
+    for f in "${mismatched[@]}"; do
+      echo "  FAIL: $f"
+    done
+    exit 1
+  fi
+  echo "OK: post-deploy verification - ${#TRACKED[@]} file(s) confirmed on the box"
 fi
