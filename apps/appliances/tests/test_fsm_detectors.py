@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from appliance_fsm import Evidence, EvidenceType, State  # noqa: E402
+from appliance_fsm import Evidence, EvidenceType, State, SubmitResult  # noqa: E402
 from appliance_detectors import (  # noqa: E402
     BootRestoreProvider,
     DoorEdgeDetector,
@@ -95,6 +95,10 @@ class FakeCtx:
         self.emitted = []
         self.pushed = []
         self.subscriptions = []
+        # FIFO queue of (matched, refused) a test preloads to control what emit() reports back -
+        # only WatchdogTimer._fire() inspects the return value today; every other detector
+        # discards it, so the default (matched, not refused) below is invisible to their tests.
+        self.emit_results = []
 
     def now(self):
         return self._clock.now()
@@ -114,7 +118,10 @@ class FakeCtx:
 
     def emit(self, evidence):
         self.emitted.append(evidence)
-        return evidence
+        matched, refused = self.emit_results.pop(0) if self.emit_results else (True, False)
+        # from_state/to_state/published are placeholders (S.OFF/"Off") - no detector test reads
+        # them; only .matched/.refused are ever inspected (WatchdogTimer._fire()'s retry gate).
+        return SubmitResult(S.OFF, S.OFF, "Off", matched=matched, refused=refused)
 
     def push_mobile(self, message, **kw):
         self.pushed.append(message)
@@ -402,6 +409,69 @@ class WatchdogTimerTests(unittest.TestCase):
         wd.arm_remaining(ctx, since, floor_s=60)
         delay = (sched.pending()[0][0] - clock.now()).total_seconds()
         self.assertGreaterEqual(delay, 60)
+
+    # --- refused-fire retry (appliance_detectors.py upstream fix; was a dryer_policy.py-local
+    # _RetryingWatchdogTimer subclass before this landed in the shared class) ---
+
+    def test_refused_fire_reschedules_and_eventually_lands(self):
+        """A cooling-REFUSED fire (the table row matched but the gate blocked it) must not be
+        treated as done - it reschedules retry_delay_s later, and once cooling has lapsed (a
+        later attempt reports matched, not refused) the watchdog finally lands and clears."""
+        ctx, clock, sched = self._ctx()
+        wd = WatchdogTimer("running", 300, retry_delay_s=90)
+        ctx.emit_results = [(True, True), (True, True), (True, False)]  # refused, refused, lands
+        wd.arm(ctx)
+
+        sched.advance(300)  # first attempt: refused
+        self.assertEqual(len(ctx.emitted), 1)
+        self.assertTrue(wd.armed, "a refused fire must reschedule, not give up")
+        self.assertEqual(sched.pending()[0][0], clock.now() + timedelta(seconds=90))
+
+        sched.advance(90)  # second attempt: refused again
+        self.assertEqual(len(ctx.emitted), 2)
+        self.assertTrue(wd.armed)
+        self.assertEqual(sched.pending()[0][0], clock.now() + timedelta(seconds=90))
+
+        sched.advance(90)  # third attempt: cooling has lapsed - lands
+        self.assertEqual(len(ctx.emitted), 3)
+        self.assertFalse(wd.armed, "a landed retry must clear the handle like any other landing")
+        self.assertEqual(sched.pending(), [])
+
+    def test_landed_fire_clears_handle_no_retry(self):
+        ctx, clock, sched = self._ctx()
+        wd = WatchdogTimer("running", 300)
+        ctx.emit_results = [(True, False)]  # matched, not refused
+        wd.arm(ctx)
+        sched.advance(300)
+        self.assertEqual(len(ctx.emitted), 1)
+        self.assertFalse(wd.armed)
+        self.assertEqual(sched.pending(), [])
+        sched.advance(1000)  # nothing left to fire - no retry loop
+        self.assertEqual(len(ctx.emitted), 1)
+
+    def test_unmatched_fire_clears_handle_no_retry(self):
+        """Unmatched (the current state has no row for this WD_* type - the DEBUG no-op case,
+        e.g. the machine moved on before the watchdog got a chance to fire) clears exactly like a
+        landed fire - only a REFUSED result retries."""
+        ctx, clock, sched = self._ctx()
+        wd = WatchdogTimer("unemptied", 300)
+        ctx.emit_results = [(False, False)]  # unmatched, not refused
+        wd.arm(ctx)
+        sched.advance(300)
+        self.assertEqual(len(ctx.emitted), 1)
+        self.assertFalse(wd.armed)
+        self.assertEqual(sched.pending(), [])
+        sched.advance(1000)
+        self.assertEqual(len(ctx.emitted), 1)
+
+    def test_retry_delay_s_is_configurable_and_backward_compatible_default(self):
+        """The two-positional-arg WatchdogTimer(kind, duration_s) call every existing site uses
+        keeps working unchanged (retry_delay_s defaults to 90); a caller that wants a different
+        retry cadence can still pass it explicitly."""
+        wd_default = WatchdogTimer("running", 300)
+        self.assertEqual(wd_default.retry_delay_s, 90.0)
+        wd_custom = WatchdogTimer("running", 300, retry_delay_s=30)
+        self.assertEqual(wd_custom.retry_delay_s, 30.0)
 
 
 # --- PlugOutageDetector ---

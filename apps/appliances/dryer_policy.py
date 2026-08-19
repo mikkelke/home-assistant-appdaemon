@@ -516,30 +516,6 @@ class KeepFreshDetector(Detector):
             ))
 
 
-class _RetryingWatchdogTimer(WatchdogTimer):
-    """appliance_detectors.WatchdogTimer._fire() unconditionally clears its own handle once it
-    fires, regardless of whether the resulting evidence actually landed - its own docstring's
-    "never a wedge" claim covers the UNLISTED-pair case (state moved on to somewhere with no WD_*
-    row) but not this one: WD_RUNNING is RESPECT-cooling (spec 3.3), so a fire that lands within
-    cooling_period of the last transition is REFUSED, not unlisted - and a refused-then-abandoned
-    watchdog leaves that state with NO backstop at all for the rest of the episode (found via
-    test_fsm_fuzz.py's restart-storm sweep - a fair chance of the running watchdog firing exactly
-    inside a RESPECT-cooling window, given a large enough sample of restarts/interruptions).
-
-    Retries with a fixed short backoff on a refused fire rather than giving up - a local override
-    here, not a change to the shared appliance_detectors.py (outside this phase's file ownership;
-    every OTHER appliance reusing WatchdogTimer is unaffected). 90s is comfortably shorter than
-    every cooling_period this repo uses (300-600s) without being so short it spams retries."""
-
-    _REFUSED_RETRY_S = 90
-
-    def _fire(self, ctx):
-        self._handle = None
-        result = ctx.emit(Evidence.make(self._evtype, ctx.now(), self.name))
-        if result.refused:
-            self._handle = ctx.schedule(self._REFUSED_RETRY_S, lambda: self._fire(ctx))
-
-
 # ---------------------------------------------------------------------------------------------
 # DryerPolicy: stateful glue (physics attributes) + guards/actions/table for TransitionTable.
 # ---------------------------------------------------------------------------------------------
@@ -579,11 +555,13 @@ class DryerPolicy:
         # Spec 4.2's four watchdogs. Held here (not in `detectors=`, WatchdogTimer's own docstring:
         # "does not wire or tick") - armed/cancelled from actions below and from
         # sync_watchdogs_on_publish (cancel-only, keyed on the landed state - see its docstring).
+        # WatchdogTimer._fire() itself retries on a cooling-REFUSED fire (appliance_detectors.py,
+        # upstream fix - was a local _RetryingWatchdogTimer subclass here before that landed).
         self.watchdogs = {
-            "running": _RetryingWatchdogTimer("running", self.cfg["max_running_hours"] * 3600),
-            "pause": _RetryingWatchdogTimer("pause", self.cfg["pause_timeout_minutes"] * 60),
-            "unemptied": _RetryingWatchdogTimer("unemptied", self.cfg["unemptied_timeout_hours"] * 3600),
-            "emptied": _RetryingWatchdogTimer("emptied", self.cfg["emptied_timeout_minutes"] * 60),
+            "running": WatchdogTimer("running", self.cfg["max_running_hours"] * 3600),
+            "pause": WatchdogTimer("pause", self.cfg["pause_timeout_minutes"] * 60),
+            "unemptied": WatchdogTimer("unemptied", self.cfg["unemptied_timeout_hours"] * 3600),
+            "emptied": WatchdogTimer("emptied", self.cfg["emptied_timeout_minutes"] * 60),
         }
 
         self.guards = {

@@ -22,7 +22,7 @@ Emissions + knobs by detector:
   PowerEndDetector   : POWER_LOW, POWER_END_CONFIRMED, POWER_RECOVERED | stop_w, stop_for, power_sensor
   DoorEdgeDetector   : DOOR_OPENED, DOOR_CLOSED (power snapshot in payload) | door_sensor, power_sensor,
                        door_sensor_inverted (optional)
-  WatchdogTimer      : WD_RUNNING|WD_PAUSE|WD_UNEMPTIED|WD_EMPTIED | (duration passed at construction)
+  WatchdogTimer      : WD_RUNNING|WD_PAUSE|WD_UNEMPTIED|WD_EMPTIED | (duration, retry_delay_s at construction)
   PlugOutageDetector : PLUG_OUTAGE (+ ActionSink pushes) | power_sensor, power_unavailable_grace_s,
                        appliance_label (optional)
   BootRestoreProvider: BOOT_RESTORE (init only) | (snapshot handed in; reads no HA)
@@ -197,10 +197,17 @@ class DoorEdgeDetector(Detector):
 class WatchdogTimer(Detector):
     """Parameterized safety timer, kind in {running, pause, unemptied, emptied}. It does not wire or
     tick - the policy holds a reference and calls arm()/cancel()/arm_remaining() on state entry/exit
-    (spec 4.2). When it fires it emits the matching WD_* Evidence; the table routes it, and if the
-    state has moved on the (state, WD_*) pair is unlisted and the engine logs a DEBUG no-op - so a
-    fired-but-late backstop is harmless, never a wedge. arm_remaining floors the delay at 60s so a
-    restore never arms ~0 or negative seconds (dryer_monitor.py:634-639)."""
+    (spec 4.2). When it fires it emits the matching WD_* Evidence via ctx.emit and inspects the
+    returned SubmitResult: a LANDED fire (matched, not refused) or an UNMATCHED one (this evidence
+    type has no row for the current state - the state has moved on) both clear the handle, done -
+    a fired-but-late backstop hitting an unlisted pair is harmless, never a wedge. A REFUSED fire
+    (the table row matched but the cooling gate blocked it - WD_RUNNING is RESPECT-cooling, spec
+    3.3) instead reschedules itself `retry_delay_s` later rather than giving up: a watchdog that
+    happens to fire inside a cooling window is not evidence the backstop is no longer needed, and
+    silently abandoning it would leave that state with NO backstop for the rest of the episode -
+    a real wedge, found via test_fsm_fuzz.py's restart-storm sweep (seed 84 reproduces it against
+    an unpatched _fire). arm_remaining floors the delay at 60s so a restore never arms ~0 or
+    negative seconds (dryer_monitor.py:634-639)."""
 
     _EVTYPE = {
         "running": EvidenceType.WD_RUNNING,
@@ -209,13 +216,17 @@ class WatchdogTimer(Detector):
         "emptied": EvidenceType.WD_EMPTIED,
     }
 
-    def __init__(self, kind: str, duration_s: float) -> None:
+    def __init__(self, kind: str, duration_s: float, retry_delay_s: float = 90.0) -> None:
         if kind not in self._EVTYPE:
             raise ValueError(f"unknown watchdog kind {kind!r}")
         self.kind = kind
         self.name = f"watchdog_{kind}"
         self._evtype = self._EVTYPE[kind]
         self.duration_s = float(duration_s)
+        # New, optional, defaulted - existing WatchdogTimer(kind, duration_s) call sites are
+        # unaffected (backward compatible). Comfortably shorter than every cooling_period this
+        # repo uses (300-600s) without being so short a still-refused retry spams the log.
+        self.retry_delay_s = float(retry_delay_s)
         self._handle: Any = None
 
     @property
@@ -241,7 +252,9 @@ class WatchdogTimer(Detector):
 
     def _fire(self, ctx: Any) -> None:
         self._handle = None
-        ctx.emit(Evidence.make(self._evtype, ctx.now(), self.name))
+        result = ctx.emit(Evidence.make(self._evtype, ctx.now(), self.name))
+        if result.refused:
+            self._handle = ctx.schedule(self.retry_delay_s, lambda: self._fire(ctx))
 
 
 class PlugOutageDetector(Detector):

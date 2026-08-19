@@ -386,6 +386,15 @@ class RestartStormFuzz(unittest.TestCase):
     def test_seed_42_reproducible_restart_storm(self):
         self._run(42)
 
+    def test_seed_84_running_watchdog_refused_fire_no_longer_wedges(self):
+        """The exact seed that originally caught the WatchdogTimer refused-fire wedge (a running
+        watchdog firing inside a RESPECT-cooling window used to clear its own handle and give up,
+        leaving that RUNNING/PAUSED episode with no backstop for the rest of its life - reproduced
+        deterministically at seed=84 against the pre-fix _fire()). Now pinned as a permanent
+        regression: appliance_detectors.WatchdogTimer._fire() retries on a refused result (the
+        upstream fix), so I2/I3 (never a wedge) must hold here same as any other seed."""
+        self._run(84)
+
     def test_seed_1_produces_at_least_one_full_cycle_and_one_restart(self):
         """A fuzz run that never actually reaches FINISHED/restarts would pass I1-I4 vacuously -
         this pins that the generator is exercising the interesting paths, not just idling at Off."""
