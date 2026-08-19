@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import enum
 import json
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -261,7 +262,8 @@ class Replay:
         for ev in sorted(self.tape["events"], key=lambda e: e["t"]):
             self.scheduler.advance_to(self.anchor + timedelta(seconds=ev["t"]))
             self._dispatch(engine, ev)
-            published = getattr(engine, "published", None)  # NOTE(integration): attr name TBD
+            published = getattr(engine, "published", None)  # NOTE(integration): confirmed - real
+            # ApplianceFSM.published is a plain property; _RealEngineHandle below mirrors it 1:1.
             if published is not None and published != last_published:
                 trace.append({"t": self.offset(), "published": published})
                 last_published = published
@@ -294,7 +296,10 @@ class Replay:
         elif kind == "energy":
             self.entities["energy_kwh"] = float(ev["kwh"])
         elif kind == "restart":
-            engine.initialize()  # NOTE(integration): re-resolve boot state from current entity+store
+            # NOTE(integration): confirmed - real ApplianceFSM has no bare initialize(); this
+            # rebuilds engine+policy from the store file (dryer_shadow.py's boot sequence,
+            # mirrored by _RealEngineHandle.initialize() below), never a method on the raw FSM.
+            engine.initialize()
         elif kind == "force_emptied":
             ev2 = Evidence(EvidenceType.FORCE_EMPTIED, EventClass.PHYSICAL, now, "replay.force_emptied", True, {})
             engine.submit(ev2)
@@ -302,23 +307,303 @@ class Replay:
             pass  # advance_to() above already did the only thing a bare tick needs to do
 
 
-def build_engine_adapter(tape, clock, scheduler):
-    """TODO(integration): the ONLY function in this module allowed to reference
-    ApplianceFSM's real constructor. Everything else here (FakeClock, FakeScheduler,
-    Evidence, the tape loader, Replay itself) is final and unaffected when this lands -
-    Replay.run(engine) already accepts any object exposing submit()/initialize()/published.
+# Must equal build_synthetic_tapes.py's REPLAY_FINGERPRINT so corroborate_restore's fingerprint
+# check never fires by accident - each store-sourced restore tape then exercises only the
+# power/energy-timing reasoning it was designed around, not an incidental mismatch.
+_ADAPTER_FINGERPRINT = "replay-fixed-fingerprint"
 
-    Sketch (fill in once appliance_fsm.py/dryer_policy.py land; adjust only the marked line
-    and the `published`/ctx.get_state wiring noted in the module docstring):
-        from appliance_fsm import ApplianceFSM
-        sink = RecordingActionSink()
-        engine = ApplianceFSM(                                # <-- constructor TBD
-            appliance=tape.get("meta", {}).get("appliance", "dryer"), args=tape.get("args", {}),
-            clock=clock, scheduler=scheduler, actions=sink,
-        )
-        return engine, sink
+# Fixed placeholder entity IDs this adapter wires the real policy's power/door/energy config
+# knobs to; get_state/get_history below recognize exactly these three strings.
+_POWER_SENSOR = "sensor.dryer_plug_power"
+_DOOR_SENSOR = "binary_sensor.dryer_door_contact"
+_ENERGY_SENSOR = "sensor.dryer_plug_energy"
+
+
+class _RealEngineHandle:
+    """Built ONLY by build_engine_adapter(); wraps a real ApplianceFSM so it satisfies exactly
+    the surface Replay.run() touches (submit/initialize/published - see the module docstring's
+    integration-seams note). Everything engine-specific lives here, never in Replay itself.
+
+    Two structural gaps this class closes between Replay's simplified event model and the real
+    engine's detector-driven one:
+      1. submit() does NOT forward Replay's raw POWER_HIGH/POWER_LOW/DOOR_OPENED/DOOR_CLOSED
+         straight to fsm.submit() - the real confirm-timer/keep-fresh logic lives entirely
+         inside appliance_detectors.py's Detector.on_state callbacks, which only fire off a
+         subscribed sensor CHANGE, never off a pre-classified Evidence. So submit() instead
+         replays the underlying sensor change through this adapter's own subscribe() registry
+         (exactly what a real listen_state firing would do), letting the real detectors decide
+         what evidence (if any) to emit. FORCE_EMPTIED is the one type with no detector at all
+         (dryer_shadow.py submits it directly too) - forwarded straight to fsm.submit().
+      2. get_state/get_history are pure functions of (tape, clock.now()) - no separate mutable
+         sensor dict to keep in sync - so history-arbitrated routing (door-edge checks,
+         RECONCILE's power-history window) sees exactly the tape's own event series.
     """
-    raise NotImplementedError(
-        "TODO(integration): appliance_fsm.ApplianceFSM is not landed yet - construct an "
-        "engine exposing submit()/initialize()/published and pass it to Replay.run(engine)."
-    )
+
+    def __init__(self, tape, clock, fake_scheduler):
+        # Defensive sibling import, same shape as dryer_monitor.py:45-60 / dryer_shadow.py's own
+        # imports - apps/appliances/ is normally on sys.path (AppDaemon) or already inserted by
+        # the caller's own test harness; this covers the case where neither has happened yet.
+        try:
+            from appliance_fsm import ApplianceFSM, RESTORE_STATE_OF, State
+        except ImportError:
+            import sys
+
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+            from appliance_fsm import ApplianceFSM, RESTORE_STATE_OF, State
+        from appliance_detectors import DoorEdgeDetector, PlugOutageDetector, PowerEndDetector, PowerStartDetector
+        import dryer_policy as policy_mod
+        from cycle_store import CycleStore, parse_utc
+
+        self._ApplianceFSM = ApplianceFSM
+        self._RESTORE_STATE_OF = RESTORE_STATE_OF
+        self._State = State
+        self._detector_classes = (PowerStartDetector, PowerEndDetector, DoorEdgeDetector, PlugOutageDetector)
+        self._policy_mod = policy_mod
+        self._parse_utc = parse_utc
+
+        self.tape = tape
+        self.anchor = _parse_anchor(tape)
+        self.clock = clock
+        self._scheduler = _FakeSchedulerToRealAdapter(fake_scheduler)
+        self._events = sorted(tape.get("events", []), key=lambda e: e["t"])
+        self._args = tape.get("args") or {}
+
+        self._tmpdir = tempfile.TemporaryDirectory(prefix="replay_dryer_store_")
+        store_path = Path(self._tmpdir.name) / "dryer_replay_state.json"
+        self._store = CycleStore(store_path, "dryer_shadow", log=self._log)
+        self._code_fingerprint = _ADAPTER_FINGERPRINT
+        self._programmes_file = str(Path(__file__).resolve().parents[1] / "dryer_programmes.yaml")
+
+        self.actions = RecordingActionSink()  # spec 7.2 ActionSink protocol - already matches
+        self.log_calls = []
+        self._subscribers: dict = {}
+        self._boot_count = 0
+        self._fsm = None
+        self._policy = None
+
+        # Deliberately NOT self-booting here: every one of this harness's tapes already opens
+        # with its own {"t":0,"kind":"restart"} event (spec 10.2's documented convention for
+        # "run initialize() against current entity+store"), which - like a real AppDaemon app -
+        # IS the first boot. Eagerly initializing here too would double-boot on every tape (the
+        # tape's own t=0 restart landing as boot_count==1, wrongly simulating "entity lost" for
+        # what is actually the very first boot). published/submit()/tick() lazily self-boot as a
+        # safety net only for a (currently nonexistent) tape that omits the t=0 restart.
+
+    def _ensure_booted(self):
+        if self._fsm is None:
+            self.initialize()
+
+    # ---- the three touchpoints Replay.run()/_dispatch() use --------------------------------
+
+    @property
+    def published(self):
+        self._ensure_booted()
+        return self._fsm.published
+
+    def submit(self, evidence):
+        from appliance_fsm import Evidence as RealEvidence, EvidenceType as RealEvidenceType
+
+        self._ensure_booted()
+        if evidence.type is EvidenceType.FORCE_EMPTIED:
+            self._fsm.submit(RealEvidence.make(RealEvidenceType.FORCE_EMPTIED, self.clock.now(), evidence.source))
+            return
+        watts = (evidence.payload or {}).get("watts")
+        if evidence.type in (EvidenceType.POWER_HIGH, EvidenceType.POWER_LOW):
+            self._fire_state_change(_POWER_SENSOR, watts)
+        elif evidence.type is EvidenceType.DOOR_OPENED:
+            self._fire_state_change(_DOOR_SENSOR, "on")
+        elif evidence.type is EvidenceType.DOOR_CLOSED:
+            self._fire_state_change(_DOOR_SENSOR, "off")
+
+    def initialize(self):
+        """Rebuild engine+policy from the store file + simulated entity-survival semantics,
+        mirroring dryer_shadow.py's initialize() minus the AppDaemon host (spec section 7.1).
+        Boot 0 (the tape's own `initial` block) models whatever entity/helper survival that
+        tape was authored around; every later boot (real_03's restart storm) simulates a full
+        HA restart - entity_state/helper_state lost, only the durable store (this adapter's own
+        prior publish()es) can carry Running/Paused across it, exactly the scenario spec F2's
+        corroboration machinery exists to arbitrate."""
+        policy_mod = self._policy_mod
+        State = self._state_or_off = self._State  # local alias, readability only
+
+        cfg = dict(policy_mod.DEFAULTS)
+        for key in cfg:
+            if key in self._args and key != "selectors":
+                cfg[key] = self._args[key]
+        if "selectors" in self._args:
+            cfg["selectors"] = {**cfg["selectors"], **self._args["selectors"]}
+        cfg.update({
+            "power_sensor": _POWER_SENSOR, "door_sensor": _DOOR_SENSOR, "energy_sensor": _ENERGY_SENSOR,
+            "programme_entity": None, "dryness_entity": None, "skane_plus_entity": None,
+            "time_minutes_entity": None, "announce_entity": None, "appliance_label": "dryer",
+            "announce_message": self._args.get("announce_message", cfg["announce_message"]),
+        })
+
+        profiles = policy_mod.load_programme_profiles(self._programmes_file, log=self._log)
+        policy = policy_mod.DryerPolicy(config=cfg, profiles=profiles)
+
+        initial = self.tape.get("initial") or {}
+        boot_now = self.clock.now()
+        if self._boot_count == 0:
+            entity_state = initial.get("entity_state")
+            seed_store = initial.get("store")
+            if seed_store:
+                self._store.save(dict(seed_store))
+            entity_last_changed = (seed_store or {}).get("state_since") or self.anchor.isoformat()
+            helper_state = initial.get("helper_state")
+        else:
+            entity_state, entity_last_changed, helper_state = None, None, None  # full HA restart
+
+        try:
+            store_data = self._store.load()
+        except Exception:
+            store_data = None
+
+        snap = policy_mod.resolve_boot_snapshot(
+            entity_state=entity_state, entity_attrs={}, entity_last_changed=entity_last_changed,
+            store_data=store_data, helper_state=helper_state, now=boot_now, cfg=policy.cfg,
+        )
+
+        initial_state, hypothesis, cycle_id, state_since = State.OFF, False, None, None
+        if snap is not None:
+            initial_state = self._RESTORE_STATE_OF.get(snap["state"], State.OFF)
+            policy.restore_from(snap["store_fields"])
+            cycle_id = snap["cycle_id"]
+            state_since = self._parse_utc(snap["state_since"]) if snap["state_since"] else None
+            if initial_state in (State.RUNNING, State.PAUSED) and snap["source"] != "entity":
+                hypothesis, why = policy_mod.corroborate_restore(
+                    boot_watts=self._live_watts(), last_high_energy_at=policy.last_high_energy_at, now=boot_now,
+                    cfg=policy.cfg, code_fingerprint=self._code_fingerprint, stored_fingerprint=snap["code_fingerprint"],
+                )
+                if hypothesis:
+                    self._log(f"Restore: {initial_state.name} from {snap['source']} UNCORROBORATED ({why})")
+
+        self._subscribers = {}
+        detectors = [cls() for cls in self._detector_classes] + [policy_mod.KeepFreshDetector()]
+        fsm = self._ApplianceFSM(
+            policy, self.actions, self.clock, self._scheduler, self._publish, self._log,
+            config=policy.cfg, get_state=self._get_state, get_history=self._get_history,
+            subscribe=self._subscribe, detectors=detectors,
+            cooling_period=policy.cfg["cooling_period"], initial_state=State.OFF,
+        )
+        self._fsm = fsm
+        self._policy = policy
+
+        fsm.enter_state_silently(initial_state, state_since=state_since, hypothesis=hypothesis, cycle_id=cycle_id)
+        if policy.last_feedback_cycle_id is not None:
+            fsm.mark_fed_back(policy.last_feedback_cycle_id)
+        policy.rearm_watchdogs_after_restore(fsm.ctx, initial_state, state_since)
+        if hypothesis:
+            policy.arm_reconcile(fsm.ctx)
+            policy.try_conclude_at_boot(fsm.ctx)
+
+        fsm.wire_detectors()  # do NOT arm the tick loop here - "tick" tape events do that (below)
+        self._boot_count += 1
+
+    # ---- sensor-change fan-out (bridges Replay's raw evidence to real Detector.on_state) ----
+
+    def _subscribe(self, entity, handler):
+        self._subscribers.setdefault(entity, []).append(handler)
+
+    def _fire_state_change(self, entity, new_value):
+        for handler in list(self._subscribers.get(entity, ())):
+            handler(entity, None, new_value, self._fsm.ctx)
+
+    def tick(self):
+        """Tape 'tick' events drive the engine's own 60s detector-tick loop (KeepFreshDetector
+        etc. have none today, but future detectors' tick() must still be reachable) without
+        this adapter self-arming a real recurring timer Replay does not know how to cancel."""
+        if self._fsm is not None:
+            self._fsm.tick()
+
+    # ---- get_state/get_history: pure functions of (tape, clock.now()) ----------------------
+
+    def _offset_now(self):
+        return (self.clock.now() - self.anchor).total_seconds()
+
+    def _last_value(self, kind, field, at_t, default):
+        value = default
+        for ev in self._events:
+            if ev["t"] > at_t:
+                break
+            if ev["kind"] == kind:
+                value = ev[field]
+        return value
+
+    def _get_state(self, entity, **kwargs):
+        at_t = self._offset_now()
+        if entity == _POWER_SENSOR:
+            return self._last_value("power", "watts", at_t, 0.0)
+        if entity == _DOOR_SENSOR:
+            return self._last_value("door", "state", at_t, "off")
+        if entity == _ENERGY_SENSOR:
+            return self._last_value("energy", "kwh", at_t, None)
+        return None  # UI selectors (programme/dryness/...) are not wired in this harness
+
+    def _live_watts(self):
+        v = self._get_state(_POWER_SENSOR)
+        return float(v) if isinstance(v, (int, float)) else 0.0
+
+    def _get_history(self, entity, start_time=None, end_time=None, **kwargs):
+        kind_field = {_POWER_SENSOR: "watts", _DOOR_SENSOR: "state", _ENERGY_SENSOR: "kwh"}
+        kind = {_POWER_SENSOR: "power", _DOOR_SENSOR: "door", _ENERGY_SENSOR: "energy"}.get(entity)
+        if kind is None:
+            return [[]]
+        field = kind_field[entity]
+        lo = (start_time - self.anchor).total_seconds() if start_time else float("-inf")
+        hi = (end_time - self.anchor).total_seconds() if end_time else float("inf")
+        entries = []
+        for ev in self._events:
+            if ev["kind"] == kind and lo <= ev["t"] <= hi:
+                ts = self.anchor + timedelta(seconds=ev["t"])
+                entries.append({"state": str(ev[field]), "last_changed": ts.isoformat()})
+        return [entries]
+
+    # ---- publish + durable store (mirrors dryer_shadow.py's _publish/_save_store) ----------
+
+    def _publish(self, published, *, internal, store_only, attrs):
+        self._policy.sync_watchdogs_on_publish(self._fsm.ctx, internal)
+        payload = {
+            "state": self._fsm.published,
+            "state_since": self._fsm.state_since.isoformat() if self._fsm.state_since else None,
+            "cycle_id": self._fsm.cycle_id, "code_fingerprint": self._code_fingerprint,
+            **self._policy.to_store_fields(),
+        }
+        if self._fsm.published == "Off":
+            self._store.clear()
+        else:
+            self._store.save(payload)
+
+    def _log(self, message, level="INFO"):
+        self.log_calls.append((level, message))
+
+
+class _FakeSchedulerToRealAdapter:
+    """Wraps this harness's FakeScheduler (run_in(cb, delay_s, **kwargs), dict-kwarg callback -
+    spec 10.1, unchanged) into appliance_fsm.Scheduler's protocol (run_in(delay_s, cb), zero-arg
+    callback) - the same shape as dryer_shadow.py's own _SchedulerAdapter, wrapping AppDaemon's
+    run_in instead. FakeScheduler itself is untouched; this is purely an integration-time seam."""
+
+    def __init__(self, fake_scheduler):
+        self._sched = fake_scheduler
+
+    def run_in(self, delay_s, cb):
+        return self._sched.run_in(lambda kwargs: cb(), delay_s)
+
+    def cancel(self, handle):
+        self._sched.cancel(handle)
+
+
+def build_engine_adapter(tape, clock, scheduler):
+    """The ONLY function in this module allowed to reference ApplianceFSM's real constructor
+    (integration-time; see the module docstring's seam #1). `clock`/`scheduler` must be the
+    SAME FakeClock/FakeScheduler instances the caller's Replay(tape) uses, so that
+    Replay.run()'s own scheduler.advance_to() calls fire the real detectors' confirm-timers -
+    typical use: `r = Replay(tape); engine = build_engine_adapter(tape, r.clock, r.scheduler);
+    result = r.run(engine)`. Returns a _RealEngineHandle satisfying submit()/initialize()/
+    published/tick() - .actions (a RecordingActionSink) and .log_calls are exposed for
+    assertions. tick() is exposed for a caller wanting to drive the engine's own detector-tick
+    loop explicitly; a tape's "tick" event only advances the clock (Replay's own job) - it does
+    NOT call this, since none of the current detectors need the periodic tick to behave
+    correctly under replay (KeepFreshDetector reacts on every sample, not on a timer)."""
+    return _RealEngineHandle(tape, clock, scheduler)

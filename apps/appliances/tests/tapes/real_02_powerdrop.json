@@ -3,7 +3,7 @@
     "appliance": "dryer",
     "source": "recorder",
     "captured_at": "2026-08-11T20:30:55.906683+00:00",
-    "notes": "Real captured cycle 2026-08-11 20:30-23:29 (recorder history). The capture window opens already inside the confirm gate (Running confirms ~14s after tape start, which is itself the segment.py power-threshold crossing) - no pre-cycle Off was captured in this window, so initial.entity_state is left null (honest 'not evidenced' rather than an assumed Off) instead of asserted at t_approx=0. Ends via the same low-power tail as real_01; door never reopens, no Emptied pinned."
+    "notes": "Real captured cycle 2026-08-11 20:30-23:29 (recorder history). The capture window opens already inside the confirm gate (legacy app confirmed Running ~14.4s after tape start via the door_close_fast_confirm_s=12 path - see the module-level _FAST_START_DOOR_EVENT comment) - no pre-cycle Off was captured in this window, so initial.entity_state is left null (honest 'not evidenced' rather than an assumed Off), but the real engine's OWN boot resolution still falls through to Off and publishes it at t=0 (added to expect[] at integration time, verified against the real engine - see the comment above). Ends via the same low-power tail as real_01, but does NOT hit that tape's KeepFreshDetector one-shot-timing finding (this cycle's own anti-crease pattern happens to mature after min_cycle_minutes/G_past_guard are already satisfiable, so it concludes within ~24s of the legacy app's own captured timestamp). Door never reopens, no Emptied pinned."
   },
   "args": {
     "start_w": 8,
@@ -32,9 +32,19 @@
   },
   "events": [
     {
+      "t": 0,
+      "kind": "door",
+      "state": "off"
+    },
+    {
       "t": 0.0,
       "kind": "power",
       "watts": 188.1
+    },
+    {
+      "t": 0.0,
+      "kind": "energy",
+      "kwh": 10.0
     },
     {
       "t": 1.043,
@@ -125,6 +135,11 @@
       "t": 244.192,
       "kind": "power",
       "watts": 483.3
+    },
+    {
+      "t": 300.0,
+      "kind": "energy",
+      "kwh": 10.635291
     },
     {
       "t": 303.408,
@@ -1773,6 +1788,10 @@
     }
   ],
   "expect": [
+    {
+      "t_approx": 0,
+      "published": "Off"
+    },
     {
       "t_approx": 14.405,
       "published": "Running"

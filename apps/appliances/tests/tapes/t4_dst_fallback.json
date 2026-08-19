@@ -28,13 +28,13 @@
     "helper_state": null,
     "store": {
       "state": "Running",
-      "start_time": "2026-10-25T00:55:00+00:00",
+      "cycle_start_time": "2026-10-25T00:55:00+00:00",
       "energy_at_start": 0.0,
       "detected_programme": "unknown",
       "state_since": "2026-10-25T00:55:00+00:00",
       "notification_sent": false,
       "cycle_id": "cyc-t4-dst",
-      "code_fingerprint": "t4fingerprint"
+      "code_fingerprint": "replay-fixed-fingerprint"
     }
   },
   "events": [

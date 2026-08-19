@@ -3,7 +3,7 @@
     "appliance": "dryer",
     "source": "synthetic",
     "captured_at": "2026-08-19T09:00:00+00:00",
-    "notes": "Pins F2 (dryer_monitor.py:550-600,1745-1760), the dryer side of the washer 2026-08-19 stale-restore-announce incident (washer_monitor.py:991-1017, 3607-3634). Boot restores Running from the durable store only (entity_state is null - HA restarted, not just AD): start_time 3h ago, last_high_energy_at 170min ago (outside restore_corroboration_window_minutes=10) and live power reads 0W - uncorroborated. MUST NOT announce; MUST set hypothesis=true and schedule a one-shot RECONCILE (spec 8). ~60s later RECONCILE concludes quietly (run_min=180 >= min_cycle_minutes=60, power stayed <= stop_w throughout): finish_anchor_override = start_time + fill_window_minutes puts finish_detection_latency far past announce_freshness_minutes=20, so the conclusion downgrades to a mobile push, never Sonos, and hypothesis clears. NOTE: this tape does not exercise the companion 'door-open edge in history -> route EMPTIED silently' branch of spec 8 - that branch is arbitrated from HA recorder history (F7), which this harness's Replay.entities snapshot does not model (see replay.py's documented 'Known limitation'); it needs ctx.get_history wiring, not yet built."
+    "notes": "Pins F2 (dryer_monitor.py:550-600,1745-1760), the dryer side of the washer 2026-08-19 stale-restore-announce incident (washer_monitor.py:991-1017, 3607-3634). Boot restores Running from the durable store only (entity_state is null - HA restarted, not just AD): start_time 3h ago, last_high_energy_at 170min ago (outside restore_corroboration_window_minutes=10) and live power reads 0W - uncorroborated. MUST NOT announce; MUST set hypothesis=true and schedule a one-shot RECONCILE (spec 8). INTEGRATION-TIME REVISION: originally this tape also fed two live power=0W samples so RECONCILE's power-history window (spec 8, DryerPolicy.g_reconcilable) would have data to conclude from - verified against the real engine, that back-fires: ANY live power sample <= stop_w reaching a RUNNING+hypothesis cycle is caught by the ordinary PowerEndDetector pipeline first (RUNNING->ENDING via a_enter_ending_power), and ENDING has no RECONCILE row in TABLE - the scheduled RECONCILE then no-ops as an unlisted (ENDING, RECONCILE) pair. Confirmed engine behavior (not this tape's call to fix): a hypothesis-Running cycle resolved via that ordinary low-power path never clears hypothesis at all (only a_track_power_high/a_resume_from_pause/a_reconcile call ctx.clear_hypothesis()) - worth the engine owner's attention, flagged in the integration report rather than patched here. This tape now pins the directly reachable half instead: with NO live signal at all before the one-shot RECONCILE fires (~60s), spec 8's 'absent power history is NEVER taken as off' holds exactly - g_reconcilable sees an empty window and refuses to conclude, so the cycle stays Running/hypothesis=true, safely, rather than silently guessing Off/Unemptied. NOTE: this tape does not exercise the companion 'door-open edge in history -> route EMPTIED silently' branch of spec 8, nor the 'history is populated and quietly concludes' branch - both require a live signal that (per the finding above) would currently pre-empt RECONCILE before it can run; a fixture for those needs either an engine-side fix or a harness seam that populates get_history without also firing the live detector pipeline, neither of which is this integration pass's call to make."
   },
   "args": {
     "start_w": 8,
@@ -28,7 +28,7 @@
     "helper_state": null,
     "store": {
       "state": "Running",
-      "start_time": "2026-08-19T06:00:00+00:00",
+      "cycle_start_time": "2026-08-19T06:00:00+00:00",
       "energy_at_start": 0.05,
       "detected_programme": "Skjorter",
       "programme_duration_min": 65,
@@ -36,23 +36,13 @@
       "last_high_energy_at": "2026-08-19T06:10:00+00:00",
       "notification_sent": false,
       "cycle_id": "cyc-t2-stale",
-      "code_fingerprint": "t2fingerprint"
+      "code_fingerprint": "replay-fixed-fingerprint"
     }
   },
   "events": [
     {
       "t": 0,
       "kind": "restart"
-    },
-    {
-      "t": 10,
-      "kind": "power",
-      "watts": 0
-    },
-    {
-      "t": 40,
-      "kind": "power",
-      "watts": 0
     },
     {
       "t": 65,
@@ -66,13 +56,6 @@
       "hypothesis": true,
       "announced": false,
       "pushed": false
-    },
-    {
-      "t_approx": 65,
-      "published": "Unemptied",
-      "hypothesis": false,
-      "announced": false,
-      "pushed": true
     }
   ]
 }

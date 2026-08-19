@@ -342,11 +342,12 @@ class ReplayDrivesADispatchLoopEndToEnd(unittest.TestCase):
         self.assertEqual(evidence.ts, replay.anchor)
 
 
-class BuildEngineAdapterIsAnExplicitPlaceholder(unittest.TestCase):
-    def test_raises_not_implemented_with_a_todo_integration_marker(self):
-        with self.assertRaises(NotImplementedError) as ctx:
-            rp.build_engine_adapter({}, rp.FakeClock(_dt()), None)
-        self.assertIn("TODO(integration)", str(ctx.exception))
+# BuildEngineAdapterIsAnExplicitPlaceholder (asserting build_engine_adapter raised
+# NotImplementedError) removed at integration time: appliance_fsm.py/dryer_policy.py have
+# landed and build_engine_adapter now constructs a real engine (see _RealEngineHandle in
+# replay.py) - that placeholder behavior no longer exists to test. Its replacement lives in
+# the new tests/test_replay_integration.py, which - unlike this file - is allowed to import
+# the real engine.
 
 
 if __name__ == "__main__":

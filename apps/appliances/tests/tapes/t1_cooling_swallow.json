@@ -29,10 +29,10 @@
     "store": {
       "state": "Emptied",
       "state_since": "2026-02-01T19:59:55+00:00",
-      "start_time": "2026-02-01T18:25:00+00:00",
+      "cycle_start_time": "2026-02-01T18:25:00+00:00",
       "notification_sent": true,
       "cycle_id": "cyc-t1-emptied",
-      "code_fingerprint": "t1fingerprint"
+      "code_fingerprint": "replay-fixed-fingerprint"
     }
   },
   "events": [
