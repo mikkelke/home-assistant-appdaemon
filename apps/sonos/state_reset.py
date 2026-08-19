@@ -1,11 +1,20 @@
 # /conf/apps/sonos/state_reset.py
 
-import appdaemon.plugins.hass.hassapi as hass  # type: ignore 
+import json
+import os
+import time
+from pathlib import Path
+
+import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
 # Reset handshake (sonos_reset_requested -> sonos_reset_ready -> sonos_reset_completed) can wedge
 # _reset_in_progress True forever if a handshake event is lost (e.g. HA restart mid-reset). Self-heal
 # after this many seconds - see _arm_reset_wedge_timer.
 RESET_WEDGE_TIMEOUT_S = 120
+
+# Reload-proof inactivity clock lives here (next to this .py, box-local). The *_state.json suffix is
+# gitignored and never deployed, so a runtime value can neither be committed nor shipped as a seed.
+STATE_FILE = "sonos_state_reset_state.json"
 
 class SonosStateReset(hass.Hass):
     """
@@ -58,6 +67,19 @@ class SonosStateReset(hass.Hass):
         # Generation counters to invalidate stale timers without cancelling (avoids invalid-handle warnings)
         self._inactivity_generation = {}
         self._active_reset_ctx = None  # Context dict while phased reset runs
+        # Smallest delay a (re)armed timer may use, so a clock that is already blown at reload
+        # time still fires a few seconds out (past the fragile HA-reconnect window), never inside
+        # the arming callback itself.
+        self._min_reset_delay = float(self.args.get("min_reset_delay_seconds", 5))
+        # Reload-proof inactivity clock: a per-coordinator "inactive since" epoch, persisted to
+        # disk. AppDaemon re-inits every app whenever the HA websocket drops (it was dropping every
+        # ~15-20 min), and each re-init used to re-arm a FRESH full-length timer for any speaker
+        # already paused/idle - silently restarting the countdown so a genuinely idle group could
+        # dodge reset indefinitely. Anchoring the countdown to a persisted wall-clock timestamp
+        # makes elapsed time survive both AppDaemon reloads and HA restarts; only real playback
+        # (or a completed reset) clears it. See _ensure_inactive_since / _start_inactivity_timer.
+        self._state_path = Path(__file__).with_name(STATE_FILE)
+        self._inactive_since = self._load_inactive_since()
 
         # Debug log initialization
         self.log(f"SonosStateReset initialized with {len(self.speakers)} speakers", level="INFO")
@@ -309,6 +331,11 @@ class SonosStateReset(hass.Hass):
             self._invalidate_timer_for(timer_entity)
             self._start_inactivity_timer(timer_entity, new)
         else:
+            # Real playback ends the idle stretch: drop the persisted anchor so the next pause
+            # starts a fresh full-length countdown. Other non-idle states (unknown/buffering) are
+            # left alone - they must NOT reset a clock that should survive an HA blip.
+            if new is not None and str(new).lower() == "playing":
+                self._clear_inactive_since(self._get_timer_entity(entity))
             self._invalidate_timer_for(entity)
             self.log(f"Speaker {entity} is {new} - no timer needed", level="DEBUG")
 
@@ -358,22 +385,111 @@ class SonosStateReset(hass.Hass):
         if timer_key in self._inactivity_timers:
             del self._inactivity_timers[timer_key]
 
+    def _now_ts(self):
+        """Wall-clock epoch seconds. Prefers AppDaemon's scheduler clock (get_now), falls back to
+        time.time() so the persistence helpers stay usable in the plain-stdlib test harness."""
+        try:
+            return self.get_now().timestamp()
+        except Exception:
+            return time.time()
+
+    def _load_inactive_since(self):
+        """Load the persisted {coordinator_entity: inactive_since_epoch} map. Returns {} for a
+        missing/unreadable/malformed file - never raises. A missing file is the normal first-boot
+        state and logs nothing."""
+        try:
+            with open(self._state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            self.log(f"state_reset: could not read inactivity store, starting fresh: {e}", level="WARNING")
+            return {}
+        raw = data.get("inactive_since") if isinstance(data, dict) else None
+        if not isinstance(raw, dict):
+            return {}
+        out = {}
+        for k, v in raw.items():
+            try:
+                out[str(k)] = float(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _persist_inactive_since(self):
+        """Atomically write the inactivity clock to disk (tmp + fsync + os.replace), so a crash
+        mid-write can't leave a truncated file. No-op (and never raises) when uninitialised, e.g.
+        under the unit tests that build the app via __new__."""
+        path = getattr(self, "_state_path", None)
+        store = getattr(self, "_inactive_since", None)
+        if path is None or store is None:
+            return
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"inactive_since": store}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except Exception as e:
+            self.log(f"state_reset: failed to persist inactivity store: {e}", level="WARNING")
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+
+    def _ensure_inactive_since(self, timer_entity):
+        """Return the epoch this coordinator's current idle stretch began, creating and persisting
+        it on first sight. Re-arms and paused<->idle flaps reuse the SAME anchor, so the countdown
+        never restarts short of real playback. Returns 'now' (unpersisted) when uninitialised."""
+        store = getattr(self, "_inactive_since", None)
+        if store is None:
+            return self._now_ts()
+        ts = store.get(timer_entity)
+        if ts is None:
+            ts = self._now_ts()
+            store[timer_entity] = ts
+            self._persist_inactive_since()
+        return ts
+
+    def _clear_inactive_since(self, timer_entity):
+        """Drop this coordinator's idle anchor (speaker played again, or its reset finished). No-op
+        when the key is absent or the app is uninitialised."""
+        store = getattr(self, "_inactive_since", None)
+        if store is None:
+            return
+        if timer_entity in store:
+            del store[timer_entity]
+            self._persist_inactive_since()
+
     def _start_inactivity_timer(self, timer_entity, state):
-        """Start inactivity timer keyed by group coordinator (or solo speaker). Caller must pass that id."""
+        """Start inactivity timer keyed by group coordinator (or solo speaker). Caller must pass that id.
+
+        The countdown is anchored to a persisted 'inactive since' epoch (_ensure_inactive_since), not
+        to the moment this timer is armed: after an AppDaemon reload the remaining time reflects how
+        long the speaker has ACTUALLY been idle, rather than restarting a fresh full-length window."""
         if self.get_state(timer_entity) == "unavailable":
             return
         if timer_entity in self._inactivity_timers:
             return
+        inactive_since = self._ensure_inactive_since(timer_entity)
+        elapsed = max(0.0, self._now_ts() - inactive_since)
+        remaining = max(self._min_reset_delay, self.inactivity_sec - elapsed)
         try:
             current_gen = self._inactivity_generation.get(timer_entity, 0)
             self._inactivity_timers[timer_entity] = self.run_in(
                 self._auto_reset,
-                self.inactivity_sec,
+                remaining,
                 entity=timer_entity,
                 state=state,
                 gen=current_gen
             )
-            self.log(f"Starting {self.inactivity_sec}s inactivity timer for {timer_entity} (state={state})", level="INFO")
+            self.log(
+                f"Arming inactivity timer for {timer_entity} (state={state}): {remaining:.0f}s left "
+                f"of {self.inactivity_sec}s (idle {elapsed:.0f}s already)",
+                level="INFO",
+            )
         except Exception as e:
             self.log(f"Error starting timer for {timer_entity}: {e}", level="ERROR")
             self._inactivity_timers[timer_entity] = None
@@ -455,16 +571,20 @@ class SonosStateReset(hass.Hass):
         current_state = self.get_state(entity)
         if current_state == "playing":
             self.log(f"Speaker {entity} is now playing - skipping auto-reset", level="DEBUG")
+            self._clear_inactive_since(entity)
             return
 
-        # Prevent auto-reset if a manual reset is in progress
+        # Prevent auto-reset if a manual reset is in progress. Leave the anchor in place: a later
+        # re-arm (post-reset group_change) re-evaluates against the real elapsed time.
         if self._reset_in_progress:
             self.log(f"Reset already in progress - skipping auto-reset for {entity}", level="DEBUG")
             return
-            
-        self.log(f"Auto-reset triggered for {entity} after {self.inactivity_sec}s in {state} state", level="INFO")
+
+        self.log(f"Auto-reset triggered for {entity} after {self.inactivity_sec}s inactivity window (state={state})", level="INFO")
         if entity in self._inactivity_timers:
             del self._inactivity_timers[entity]
+        # This idle stretch is being handled now - drop its anchor so it can't fire twice.
+        self._clear_inactive_since(entity)
 
         group = self._ha_sonos_group_entity_ids(entity)
 
@@ -724,6 +844,11 @@ class SonosStateReset(hass.Hass):
             self._clear_reset_wedge_timer()
             self._active_reset_ctx = None
             self._reset_in_progress = False
+            # Reset put these speakers back to default (solo, unmuted, default volume); drop any
+            # idle anchors so a leftover timestamp can't schedule a redundant no-op reset later.
+            if isinstance(targets, (list, tuple)):
+                for t in targets:
+                    self._clear_inactive_since(t)
 
     @staticmethod
     def _speaker_room_label(entity):

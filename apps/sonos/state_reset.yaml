@@ -5,8 +5,16 @@ SonosStateReset:
   class: SonosStateReset
   log: sonos_log
 
-  # How long "paused"/"idle" must persist before auto-reset (seconds). 300 = 5 min; use 600 for 10 min.
-  inactivity_seconds: 300
+  # How long "paused"/"idle" must persist before auto-reset (seconds). 1200 = 20 min.
+  # Raised from 300 (5 min) on 2026-08-19: a pause-for-a-call plus reconnecting Spotify and
+  # re-grouping easily exceeds 5 min, and the reset was tearing the group down mid-setup.
+  # The countdown is anchored to a persisted timestamp (state_reset.py), so it now measures real
+  # elapsed idle time and survives AppDaemon/HA reloads instead of restarting on each one.
+  inactivity_seconds: 1200
+
+  # Floor for a (re)armed timer, seconds. After a reload where the clock is already blown, fire this
+  # far out rather than instantly inside the HA-reconnect window. Optional; default 5.
+  min_reset_delay_seconds: 5
 
   # Follow-me flag (will be turned off on any reset)
   follow_me_flag: "input_boolean.follow_me"
