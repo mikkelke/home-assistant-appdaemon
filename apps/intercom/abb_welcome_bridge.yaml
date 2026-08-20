@@ -70,6 +70,10 @@ AbbWelcomeBridge:
   announce_after_unlock:
     front door: camera.abb_welcome_gateway_outdoor_station_2_1
   announce_message: "The door is open."
+  # Voices during a recording go THROUGH the recording's call (play_audio into the
+  # open stream's talkback leg) using this TTS engine - so video and voice run
+  # together instead of the voice being skipped. "" disables in-recording voices.
+  voice_tts_entity: "tts.piper"
   announce_cooldown_s: 90
   announce_ring_window_s: 60
 

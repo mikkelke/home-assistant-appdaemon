@@ -98,6 +98,7 @@ def _bare_bridge(tmpdir, clock):
     app.announce_cameras = {"front door": "camera.abb_front"}
     app.announce_message = "The door is open."
     app.announce_cooldown_s = 90
+    app.voice_tts_entity = "tts.piper"
     app.announce_ring_window_s = 60
     app.clip_cameras = {"front door": "camera.abb_front"}
     app.clip_seconds = 10
@@ -742,17 +743,34 @@ class RingClipTests(unittest.TestCase):
         _run_scheduled(self.app, "_start_clip")
         self.assertEqual(self._clip_calls(), [])
 
-    def test_voices_yield_while_recording(self):
-        # Video outranks the voice (user 2026-08-19): with a recording in flight,
-        # both the auto-open announce and the fallback door voices are skipped.
+    def test_voices_go_through_the_recording_call(self):
+        # Video and voice together (user 2026-08-20): with a recording in flight,
+        # announce and door voices are injected into the recording's own call via
+        # play_audio - never a second dial, which would kill the clip's video.
+        self.app.voice_tts_entity = "tts.piper"
         episode = self.app._open_episode("front door", "100000002", self.clock.now())
         _run_scheduled(self.app, "_start_clip")
         self.assertIsNotNone(episode["clip_started_at"])
         n_calls = len(self.app.service_calls)
         self.app._maybe_announce("front door")
         self.app._door_voice("front door", "One moment, please.")
-        self.assertEqual(len(self.app.service_calls), n_calls)  # nothing dialed
-        self.assertTrue(any("recording in flight" in m for _, m in self.app.logs))
+        new_calls = self.app.service_calls[n_calls:]
+        self.assertEqual([c[0] for c in new_calls],
+                         ["abb_welcome/play_audio", "abb_welcome/play_audio"])
+        media = new_calls[0][1]["media"]["media_content_id"]
+        self.assertIn("media-source://tts/tts.piper", media)
+        self.assertIn("The%20door%20is%20open.", media)
+        # and crucially: no announce (temporary-call) service went out
+        self.assertNotIn("abb_welcome/announce", [c[0] for c in new_calls])
+
+    def test_disabled_tts_keeps_voices_silent_while_recording(self):
+        self.app.voice_tts_entity = ""
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        _run_scheduled(self.app, "_start_clip")
+        n_calls = len(self.app.service_calls)
+        self.app._maybe_announce("front door")
+        self.app._door_voice("front door", "One moment, please.")
+        self.assertEqual(len(self.app.service_calls), n_calls)
 
     def test_voice_allowed_after_recording_window(self):
         # clip_seconds 10 + 5 margin: 16 s after the dial the slot is free again,

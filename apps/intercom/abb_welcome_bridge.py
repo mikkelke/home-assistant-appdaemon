@@ -216,6 +216,10 @@ class AbbWelcomeBridge(hass.Hass):
         self.announce_cameras = {str(k): str(v) for k, v in raw_announce.items()} if isinstance(raw_announce, dict) else {}
         self.announce_message = str(self.args.get("announce_message", "The door is open."))
         self.announce_cooldown_s = int(self.args.get("announce_cooldown_s", 90))
+        # TTS engine for speaking THROUGH a live recording (media-source URL fed to
+        # abb_welcome/play_audio, which injects into the open stream's talkback leg
+        # instead of dialing its own call). Empty disables in-recording voices.
+        self.voice_tts_entity = str(self.args.get("voice_tts_entity", "tts.piper"))
         self.announce_ring_window_s = int(self.args.get("announce_ring_window_s", 60))
 
         # --- ring clip knobs (2026-08-13, "thumbnail and opening that give the video") ---
@@ -800,7 +804,15 @@ class AbbWelcomeBridge(hass.Hass):
             # the sentence is skipped for this ring. The visitor was buzzed in; the
             # clip of who they are matters more than telling them so.
             if self._recording_in_flight(door, now):
-                self.log(f"ANNOUNCE skipped for {door} - recording in flight", level="INFO")
+                # Speak THROUGH the recording's own call: play_audio injects PCM into
+                # the open stream's talkback leg (integration requires talkback_ready,
+                # i.e. exactly this situation), so voice and video run together (user
+                # 2026-08-20: "so we cannot run and send a message voice/sound?" - we
+                # can, this way). Best-effort: any failure is a log line and the ring
+                # keeps its video; never fall back to the temporary-call announce here,
+                # THAT is the collision that kills the clip.
+                self._voice_into_recording(door, camera, self.announce_message)
+                self._last_announce_at[door] = now
                 return
             ring_recent = any(
                 ep.get("door") == door
@@ -837,6 +849,27 @@ class AbbWelcomeBridge(hass.Hass):
             if started is not None and (now - started).total_seconds() < self.clip_seconds + margin:
                 return True
         return False
+
+    def _voice_into_recording(self, door, camera, message):
+        """Inject a spoken sentence into the LIVE recording call via play_audio's
+        talkback leg. The media id is HA's TTS media-source URL; the integration
+        resolves it to PCM and writes it into the already-open stream, so no second
+        SIP call exists and the clip's video survives. Failure costs the sentence
+        only - logged, never raised, and never retried with the temporary-call
+        announce (that second call is what kills the video)."""
+        if not self.voice_tts_entity:
+            return
+        try:
+            from urllib.parse import quote
+            media_id = f"media-source://tts/{self.voice_tts_entity}?message={quote(message)}"
+            self.call_service(
+                "abb_welcome/play_audio",
+                entity_id=camera,
+                media={"media_content_id": media_id},
+            )
+            self.log(f"VOICE-IN-RECORDING door={door} message={message!r}", level="INFO")
+        except Exception as e:
+            self.log(f"Voice-into-recording failed for {door} ({message!r}): {e}", level="INFO")
 
     def _start_clip(self, kwargs):
         """Start recording AT the ring (user 2026-08-19: who they are outranks every
@@ -1003,7 +1036,8 @@ class AbbWelcomeBridge(hass.Hass):
             return
         now = self.get_now()
         if self._recording_in_flight(door, now):
-            self.log(f"DOOR-VOICE skipped for {door} - recording in flight", level="INFO")
+            self._voice_into_recording(door, camera, message)
+            self._last_announce_at[door] = now
             return
         self._last_announce_at[door] = now
         self._self_call_until[door] = now + timedelta(seconds=20)
