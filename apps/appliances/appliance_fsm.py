@@ -10,7 +10,12 @@ were hand-copied per call site before (each omission caused a real incident clas
   2. EXACTLY-ONCE feedback: save only when a transition lands AND the cycle_id was not already fed
      back (nine junk records, 2026-08-12, F3). See _request_feedback.
   3. HYPOTHESIS gate: a restored-uncorroborated state cannot notify - announce/push refused
-     unconditionally at the engine boundary (washer 2026-08-19, F2). See _user_action.
+     unconditionally at the engine boundary (washer 2026-08-19, F2). See _user_action. The engine
+     also auto-clears hypothesis the moment ANY live POWER/PHYSICAL evidence lands a transition
+     (matched, not cooling-refused) - a live signal that successfully drove the table is itself
+     corroboration, so no single policy action has to remember to clear it (silent-finish class:
+     a mid-power tumble that never hits a POWER_HIGH >= start_w could otherwise ride all the way
+     to FINISHED still "hypothesis", permanently suppressing that cycle's announce). See submit().
   4. Time/scheduling ONLY via injected Clock/Scheduler seams (R4); the engine never calls
      datetime.now or an AppDaemon timer, so fuzz/replay stay deterministic.
 
@@ -19,13 +24,19 @@ lives in a POLICY object; the engine resolves guards/actions BY NAME against it.
 app) supplies the I/O seams (get_state, publish, scheduler, ActionSink).
 
 Policy contract (duck-typed, validated at construction):
-  policy.table   : dict[State, dict[EvidenceType, list[Row | dict]]]  - transition table (data).
-  policy.guards  : Mapping[str, Callable[[Ctx], bool]]                - named pure predicates.
-  policy.actions : Mapping[str, Callable[[Ctx], None]]               - named side-effecting actions.
+  policy.table         : dict[State, dict[EvidenceType, list[Row | dict]]] - transition table (data).
+  policy.guards        : Mapping[str, Callable[[Ctx], bool]]               - named pure predicates.
+  policy.actions       : Mapping[str, Callable[[Ctx], None]]              - named side-effecting actions.
+  policy.before_guards : Optional[Callable[[Ctx], None]]  - OPTIONAL; if present, submit() calls it
+                          for every evidence, before rows are even looked up. Lets a guard's own
+                          short-circuit depend on state the evidence itself just set, unconditionally,
+                          regardless of which row (if any) ends up consuming it (a matched physical
+                          pattern is itself proof - see dryer_policy.py's keep-fresh short-circuit).
 An action runs with ctx.state == the FROM state (the engine applies the target AFTER it returns,
-per the pipeline lookup->guards->cooling->action->publish). It may call ctx.announce/push_mobile/
-select_option/reset_selectors (announce/push hypothesis-gated), ctx.request_feedback (exactly-once),
-ctx.mint_cycle_id/set_hypothesis, ctx.schedule. Pure stdlib, Python 3.12+, ASCII-only logs.
+per the pipeline before_guards->lookup->guards->cooling->action->publish). It may call
+ctx.announce/push_mobile/select_option/reset_selectors (announce/push hypothesis-gated),
+ctx.request_feedback (exactly-once), ctx.mint_cycle_id/set_hypothesis, ctx.schedule. Pure stdlib,
+Python 3.12+, ASCII-only logs.
 """
 
 from __future__ import annotations
@@ -468,6 +479,15 @@ class ApplianceFSM:
         self._table = TransitionTable(
             getattr(policy, "table", {}) or {}, list(self._guards), list(self._actions_map)
         )
+        # Optional, duck-typed lifecycle hook (same pattern as guards/actions/table): if the
+        # policy defines before_guards(ctx), submit() calls it for EVERY evidence, before any
+        # guard runs - lets a guard's OWN short-circuit condition (e.g. "this cycle is valid
+        # because a keep-fresh pattern was just recognized") depend on state set as a direct,
+        # unconditional side effect of the evidence arriving, matching a physical signal that is
+        # itself proof (spec: a matched keep-fresh pattern is the appliance signaling completion),
+        # regardless of which state's table row ends up consuming it or whether any row matches at
+        # all. The engine stays policy-agnostic - it does not know what the hook does.
+        self._before_guards: Optional[Callable[[Ctx], None]] = getattr(policy, "before_guards", None)
 
         self._state = initial_state
         self._published = PUBLISHED[initial_state]
@@ -528,6 +548,11 @@ class ApplianceFSM:
         prev_ev = self._ctx._evidence
         self._ctx._evidence = evidence
         try:
+            # Fires unconditionally, for every evidence, before rows are even looked up - see the
+            # docstring on self._before_guards in __init__ for why this must precede everything
+            # else, including the "no row in table" / "no guard combo matched" early returns.
+            if self._before_guards:
+                self._before_guards(self._ctx)
             if not rows:
                 self._log(f"no-op ({state.name}/{evidence.type.name}): no row in table", level="DEBUG")
                 return SubmitResult(state, state, self._published)
@@ -546,6 +571,25 @@ class ApplianceFSM:
                 return SubmitResult(
                     state, target, self._published, matched=True, refused=True, action=row.action
                 )
+
+            # Hypothesis corroboration (spec section 8, engine rule): a LANDED (matched, not
+            # cooling-refused) transition driven by LIVE evidence of class POWER or PHYSICAL is
+            # itself corroboration - the truth hierarchy is door/physical > power > clock > stored,
+            # so a live signal that successfully drove the table beats a stale boot guess,
+            # regardless of which specific row it hit. Engine-owned, not another per-action policy
+            # call site to remember: the alternative - every policy action that could be the FIRST
+            # live signal after an uncorroborated restore having to remember to clear it - is
+            # exactly the silent-finish class this project exists to kill (a mid-power tumble that
+            # never triggers a >= start_w POWER_HIGH can ride POWER_LOW/POWER_END_CONFIRMED all the
+            # way to FINISHED with hypothesis never cleared, permanently suppressing that cycle's
+            # announce/push). Runs BEFORE the action dispatches below, so an action's own
+            # ctx.announce/push_mobile (e.g. the finish bundle) sees the already-cleared hypothesis,
+            # not the stale True. CLOCK/RESTORE evidence (RECONCILE, BOOT_RESTORE) is deliberately
+            # excluded - RECONCILE keeps clearing hypothesis via its own policy action, on its own
+            # terms (spec section 8's reconcile flow); WATCHDOG is excluded too (a watchdog firing
+            # is not evidence the machine is genuinely running).
+            if evidence.live and evidence.event_class in (EventClass.POWER, EventClass.PHYSICAL):
+                self.set_hypothesis(False)
 
             acted = False
             if row.action:

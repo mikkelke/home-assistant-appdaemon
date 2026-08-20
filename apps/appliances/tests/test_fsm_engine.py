@@ -375,10 +375,20 @@ class PublishMapping(unittest.TestCase):
 
 
 class HypothesisGate(unittest.TestCase):
+    """Isolates the _user_action gate itself (call ctx.announce/push_mobile/select_option
+    directly) from evidence routing - since the engine now ALSO auto-clears hypothesis on any
+    landed live POWER/PHYSICAL transition (see HypothesisAutoClearOnLiveLanding below), driving
+    these through fsm.submit(ev(E.FORCE_EMPTIED, ...)) would clear hypothesis (FORCE_EMPTIED is
+    live PHYSICAL evidence, and TestPolicy's RUNNING/FORCE_EMPTIED row lands trivially - no target,
+    so no cooling check at all) BEFORE a_notify's own ctx.announce ran, which is the CORRECT new
+    behavior, just not what these three tests are meant to isolate."""
+
     def test_announce_and_push_refused_selectors_not_gated(self):
         fsm, policy, clock, sched, sink, log, pub = make_engine(state=S.RUNNING)
         fsm.set_hypothesis(True)
-        fsm.submit(ev(E.FORCE_EMPTIED, clock))  # a_notify: announce + push + select_option
+        fsm.ctx.announce("done")
+        fsm.ctx.push_mobile("done")
+        fsm.ctx.select_option("input_select.x", "Y")
         self.assertEqual(sink.announces, [])
         self.assertEqual(sink.pushes, [])
         self.assertEqual(sink.selects, [("input_select.x", "Y")])  # select_option is NOT gated
@@ -389,7 +399,8 @@ class HypothesisGate(unittest.TestCase):
         fsm, policy, clock, sched, sink, log, pub = make_engine(state=S.RUNNING)
         fsm.set_hypothesis(True)
         fsm.set_hypothesis(False)
-        fsm.submit(ev(E.FORCE_EMPTIED, clock))
+        fsm.ctx.announce("done")
+        fsm.ctx.push_mobile("done")
         self.assertEqual(sink.announces, ["done"])
         self.assertEqual(sink.pushes, ["done"])
 
@@ -403,8 +414,147 @@ class HypothesisGate(unittest.TestCase):
         self.assertTrue(fsm.hypothesis)
         self.assertEqual(fsm.cycle_id, "abc")
         # An announce from a hypothesis state is refused.
-        fsm.submit(ev(E.FORCE_EMPTIED, clock))
+        fsm.ctx.announce("done")
         self.assertEqual(sink.announces, [])
+
+
+# --- hypothesis auto-clear on a landed live POWER/PHYSICAL transition (spec section 8, the
+# integration-found gap: only a_track_power_high/a_resume_from_pause/a_reconcile explicitly
+# cleared hypothesis in dryer_policy.py, so a restored-uncorroborated cycle that tumbles at
+# mid-power - above stop_w, below start_w, so PowerStartDetector never emits POWER_HIGH and that
+# explicit clear never runs - could ride POWER_LOW -> ENDING -> POWER_END_CONFIRMED all the way to
+# FINISHED with hypothesis still True, permanently suppressing that cycle's announce/push: the
+# silent-finish class this whole project exists to kill) ---
+
+
+class _HypothesisPolicy:
+    """A second, minimal policy for the tests below, kept separate from TestPolicy above so
+    RECONCILE can have a real declining guard (mirrors 'history ambiguous, declines to conclude')
+    without touching TestPolicy's own unconditional RUNNING/RECONCILE row that other tests in this
+    file already depend on."""
+
+    def __init__(self):
+        self.ran = []
+        self.reconcilable = False
+        self.guards = {"g_reconcilable": lambda ctx: self.reconcilable}
+        self.actions = {"a_reconcile_clears": self._a_reconcile_clears, "a_finish": self._a_finish}
+        self.table = {
+            S.RUNNING: {
+                E.POWER_LOW: [Row(target=S.ENDING)],
+                E.RECONCILE: [Row(guards=("g_reconcilable",), action="a_reconcile_clears", target=S.FINISHED)],
+            },
+            S.ENDING: {
+                E.POWER_END_CONFIRMED: [Row(action="a_finish", target=S.FINISHED)],
+            },
+            S.FINISHED: {},
+        }
+
+    def _a_reconcile_clears(self, ctx):
+        self.ran.append("a_reconcile_clears")
+        ctx.clear_hypothesis()
+        ctx.request_feedback({"end_reason": "reconcile", "cycle_id": ctx.cycle_id})
+
+    def _a_finish(self, ctx):
+        self.ran.append("a_finish")
+        ctx.request_feedback({"end_reason": "finish", "cycle_id": ctx.cycle_id})
+        ctx.announce("ready")
+
+
+class HypothesisAutoClearOnLiveLanding(unittest.TestCase):
+    def test_mid_power_tumble_clears_hypothesis_before_finish_lands_announce_fires(self):
+        """(a) The exact reachable failure: uncorroborated restored Running, RECONCILE declines to
+        conclude (guard fails - 'history ambiguous'), the machine tumbles at mid-power (never
+        triggers a >= start_w POWER_HIGH, so a_track_power_high's explicit clear never runs), then
+        finishes via the normal POWER_LOW -> ENDING -> POWER_END_CONFIRMED route. The engine's own
+        rule (not a policy action) must clear hypothesis the moment POWER_LOW lands - well before
+        FINISHED - so the finish bundle's announce is never gated."""
+        policy = _HypothesisPolicy()
+        fsm, policy, clock, sched, sink, log, pub = make_engine(state=S.RUNNING, cooling_period=0, policy=policy)
+        fsm.set_hypothesis(True)
+        fsm.set_cycle_id("mid-power")
+
+        # RECONCILE declines - guard fails, no landing, hypothesis untouched.
+        res = fsm.submit(ev(E.RECONCILE, clock, live=False))
+        self.assertFalse(res.matched)
+        self.assertTrue(fsm.hypothesis)
+
+        # Mid-power tumble: no detector ever emits in this range (above stop_w, below start_w) -
+        # nothing submitted here, matching the reachable failure exactly.
+
+        # Genuine finish: POWER_LOW lands RUNNING -> ENDING (store-only) - hypothesis must clear
+        # here, not later.
+        fsm.submit(ev(E.POWER_LOW, clock, watts=3))
+        self.assertEqual(fsm.state, S.ENDING)
+        self.assertFalse(fsm.hypothesis, "a landed live POWER transition must clear hypothesis immediately")
+
+        fsm.submit(ev(E.POWER_END_CONFIRMED, clock, watts=3))
+        self.assertEqual(fsm.state, S.FINISHED)
+        self.assertFalse(fsm.hypothesis)
+        self.assertEqual(sink.announces, ["ready"], "announce must fire - hypothesis was already clear")
+
+    def test_reconcile_landing_still_governs_its_own_hypothesis_handling(self):
+        """(b) RECONCILE (CLOCK class) is excluded from the new engine rule by design - a landed
+        RECONCILE transition clears hypothesis ONLY because its own policy action still calls
+        ctx.clear_hypothesis(), exactly as before this fix."""
+        policy = _HypothesisPolicy()
+        policy.reconcilable = True
+        fsm, policy, clock, sched, sink, log, pub = make_engine(state=S.RUNNING, cooling_period=0, policy=policy)
+        fsm.set_hypothesis(True)
+        fsm.set_cycle_id("reconcile-case")
+
+        res = fsm.submit(ev(E.RECONCILE, clock, live=False))
+        self.assertTrue(res.matched)
+        self.assertEqual(fsm.state, S.FINISHED)
+        self.assertFalse(fsm.hypothesis)  # cleared by a_reconcile_clears, not the engine rule
+        self.assertIn("a_reconcile_clears", policy.ran)
+
+    def test_clock_class_landing_without_an_explicit_clear_leaves_hypothesis_true(self):
+        """(b), the other half: prove the engine rule really excludes CLOCK - using TestPolicy's
+        own unconditional RUNNING/RECONCILE row (no action at all), a landed CLOCK-class transition
+        must NOT auto-clear hypothesis the way a POWER/PHYSICAL landing would."""
+        fsm, policy, clock, sched, sink, log, pub = make_engine(state=S.RUNNING)
+        fsm.set_hypothesis(True)
+        res = fsm.submit(ev(E.RECONCILE, clock, live=False))  # TestPolicy: RUNNING/RECONCILE -> OFF, no action
+        self.assertTrue(res.matched)
+        self.assertEqual(fsm.state, S.OFF)
+        self.assertTrue(fsm.hypothesis, "CLOCK-class landing must not be auto-corroboration")
+
+    def test_refused_live_transition_does_not_clear_hypothesis(self):
+        """(c) A live POWER transition that the table WOULD have taken, but the cooling gate
+        blocked, is not corroboration - nothing actually landed."""
+        policy = _HypothesisPolicy()
+        fsm, policy, clock, sched, sink, log, pub = make_engine(state=S.ENDING, cooling_period=600, policy=policy)
+        fsm.set_hypothesis(True)
+        fsm.set_cycle_id("refused-case")
+        fsm._last_state_change = clock.now()  # simulate a transition that just landed moments ago
+
+        res = fsm.submit(ev(E.POWER_END_CONFIRMED, clock, watts=3))  # POWER, RESPECT, elapsed 0 < 600
+        self.assertTrue(res.refused)
+        self.assertEqual(fsm.state, S.ENDING)
+        self.assertTrue(fsm.hypothesis, "a cooling-refused transition must not clear hypothesis")
+
+    def test_unmatched_live_evidence_does_not_clear_hypothesis(self):
+        """Belt: an UNLISTED or guard-unmatched live POWER/PHYSICAL submission (nothing in the
+        table for it, or it matched no guard combo) must not clear hypothesis either - only a
+        genuine landing (matched AND not refused) counts, matching this file's own TableInterpreter
+        matched/refused vocabulary."""
+        fsm, policy, clock, sched, sink, log, pub = make_engine(state=S.OFF)
+        fsm.set_hypothesis(True)
+        res = fsm.submit(ev(E.DOOR_OPENED, clock))  # OFF has no DOOR_OPENED row in TestPolicy
+        self.assertFalse(res.matched)
+        self.assertTrue(fsm.hypothesis)
+
+    def test_physical_landing_also_clears_hypothesis(self):
+        """The rule covers PHYSICAL, not just POWER - reusing TestPolicy's own RUNNING/FORCE_EMPTIED
+        row (a_notify: announce+push+select_option) directly demonstrates why
+        HypothesisGate's three tests had to stop routing through this exact evidence: a landed live
+        PHYSICAL transition is real corroboration, so the announce/push inside a_notify now fire."""
+        fsm, policy, clock, sched, sink, log, pub = make_engine(state=S.RUNNING)
+        fsm.set_hypothesis(True)
+        fsm.submit(ev(E.FORCE_EMPTIED, clock))
+        self.assertFalse(fsm.hypothesis)
+        self.assertEqual(sink.announces, ["done"])
+        self.assertEqual(sink.pushes, ["done"])
 
 
 # --- exactly-once feedback (spec section 6) ---
@@ -504,6 +654,52 @@ class TableInterpreter(unittest.TestCase):
             TransitionTable({S.OFF: {E.POWER_HIGH: [Row(action="does_not_exist")]}}, [], [])
         with self.assertRaises(ValueError):
             TransitionTable({S.OFF: {E.POWER_HIGH: [Row(guards=("nope",))]}}, [], [])
+
+
+# --- policy.before_guards: the optional, generic pre-guard hook (dryer_policy.py's keep-fresh
+# short-circuit ordering fix is the motivating case, but the mechanism itself is policy-agnostic -
+# the engine never references keep_fresh_detected or anything dryer-specific) ---
+
+
+class _BeforeGuardsPolicy:
+    """Deliberately minimal: a guard that only passes once before_guards has run, proving the
+    hook fires - and mutates policy state - strictly before _match() evaluates any guard."""
+
+    def __init__(self):
+        self.armed = False
+        self.calls = []
+        self.guards = {"g_armed": lambda ctx: self.armed}
+        self.actions = {}
+        self.table = {S.RUNNING: {E.POWER_HIGH: [Row(guards=("g_armed",), target=S.OFF)]}}
+
+    def before_guards(self, ctx):
+        self.calls.append(ctx.evidence.type)
+        if ctx.evidence.type == E.POWER_HIGH:
+            self.armed = True
+
+
+class BeforeGuardsHook(unittest.TestCase):
+    def test_hook_fires_before_guard_evaluation(self):
+        fsm, policy, clock, sched, sink, log, pub = make_engine(state=S.RUNNING, policy=_BeforeGuardsPolicy())
+        self.assertFalse(policy.armed)
+        res = fsm.submit(ev(E.POWER_HIGH, clock, watts=10))
+        self.assertTrue(res.matched)
+        self.assertEqual(fsm.state, S.OFF)  # only reachable if g_armed saw armed=True already
+
+    def test_hook_fires_even_when_no_row_matches_or_exists(self):
+        """Unconditional, regardless of outcome - matches the KEEP_FRESH motivating case, where
+        the flag must set even on a declined (unmatched-guard) submission."""
+        policy = _BeforeGuardsPolicy()
+        fsm, policy, clock, sched, sink, log, pub = make_engine(state=S.OFF, policy=policy)  # OFF has no POWER_HIGH row here
+        fsm.submit(ev(E.POWER_HIGH, clock, watts=10))
+        self.assertIn(E.POWER_HIGH, policy.calls)
+
+    def test_hook_is_optional_and_backward_compatible(self):
+        # TestPolicy never defines before_guards - exercised by every other test in this file;
+        # this just pins that the engine tolerates its absence rather than erroring.
+        fsm, policy, clock, sched, sink, log, pub = make_engine(state=S.RUNNING)
+        self.assertIsNone(fsm._before_guards)
+        fsm.submit(ev(E.POWER_HIGH, clock, watts=500))  # must not raise
 
 
 if __name__ == "__main__":

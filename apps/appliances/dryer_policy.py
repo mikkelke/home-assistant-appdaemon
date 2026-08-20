@@ -469,16 +469,30 @@ def build_feedback_record(*, ts_local, predicted, confirmed, duration_min, energ
 # is first seen") rather than a separate 15s run_every loop - a deliberate, documented adaptation
 # to the engine's simpler event model (spec 5.1 tick cadence is a generic 60s backstop, not a
 # per-detector custom-interval loop); the DETECTION MATH (ring buffer stats + thresholds) is
-# unchanged. Emits KEEP_FRESH once per cycle (mirrors the live app's own self-cancel-on-detect).
+# unchanged. Self-cancels (mirrors the live app) only once a detection actually LANDS (matched,
+# not cooling-refused) - a declined attempt (refused, or no guard combo matched - e.g. still short
+# of min_cycle_minutes) keeps sampling and retries at most every retry_interval_s, so a pattern
+# match that arrives before the cycle is old enough is not lost forever the moment the gate opens.
 # ---------------------------------------------------------------------------------------------
 
 class KeepFreshDetector(Detector):
     name = "keep_fresh"
 
-    def __init__(self, pattern_window=10):
+    def __init__(self, pattern_window=10, retry_interval_s=60.0):
         self.pattern_window = pattern_window
+        # A refused (cooling) or unmatched-guard (e.g. G_valid_cycle not past min_cycle_minutes
+        # yet) KEEP_FRESH submission is NOT the pattern ending - the legacy _check_power_pattern
+        # polled every 15s continuously (dryer_monitor.py:1950-1954) and would re-detect right
+        # after the gate opened; a one-shot self-cancel here instead stranded the finish behind
+        # the slow POWER_LOW/POWER_END_CONFIRMED path until the pattern happened to re-form on its
+        # own - a porting regression found via test_replay_integration.py's real_01 tape (~17min
+        # later than the legacy app). retry_interval_s throttles RE-attempts only (the first
+        # detection still fires immediately); real hardware settles into anti-crease slowly enough
+        # that 60s is not a meaningfully slower reaction than the legacy 15s poll in practice.
+        self.retry_interval_s = retry_interval_s
         self._readings = []
         self._done = False
+        self._last_attempt_at = None
 
     def wire(self, ctx):
         ctx.subscribe(ctx.config["power_sensor"], self.on_state)
@@ -487,6 +501,7 @@ class KeepFreshDetector(Detector):
         if ctx.state not in (State.RUNNING, State.ENDING):
             self._readings = []
             self._done = False
+            self._last_attempt_at = None
             return
         try:
             watts = float(new)
@@ -497,6 +512,9 @@ class KeepFreshDetector(Detector):
             self._readings.pop(0)
         if ctx.state != State.ENDING or self._done or len(self._readings) < self.pattern_window:
             return
+        now = ctx.now()
+        if self._last_attempt_at is not None and (now - self._last_attempt_at).total_seconds() < self.retry_interval_s:
+            return  # a recent attempt was refused/unmatched - keep sampling, do not spam retries
         mean_power = statistics.mean(self._readings)
         max_power = max(self._readings)
         min_power = min(self._readings)
@@ -509,11 +527,15 @@ class KeepFreshDetector(Detector):
             mean_power < 250 and max_power < main_cycle_power and stdev > 50
         )
         if main_cycle_done:
-            self._done = True
-            ctx.emit(Evidence.make(
-                E.KEEP_FRESH, ctx.now(), self.name,
+            self._last_attempt_at = now
+            result = ctx.emit(Evidence.make(
+                E.KEEP_FRESH, now, self.name,
                 payload={"mean": mean_power, "peak": max_power, "stdev": stdev},
             ))
+            if result.matched and not result.refused:
+                self._done = True
+            # else: declined (cooling-refused or no guard combo matched yet) - self._done stays
+            # False, so the NEXT sample past retry_interval_s tries again instead of giving up.
 
 
 # ---------------------------------------------------------------------------------------------
@@ -595,6 +617,30 @@ class DryerPolicy:
             "a_reconcile": self.a_reconcile,
         }
         self.table = TABLE
+
+    # ---- pre-guard hook (appliance_fsm.py's optional policy.before_guards) ----
+
+    def before_guards(self, ctx):
+        """Called by the engine for EVERY evidence submission, before any guard runs (see
+        appliance_fsm.py's ApplianceFSM.__init__/submit() docstrings for the generic mechanism).
+
+        KEEP_FRESH specifically: mirrors dryer_monitor.py's _check_power_pattern, which sets
+        self.keep_fresh_detected = True the INSTANT the anti-crease pattern is recognized -
+        unconditionally, before its own _is_valid_completed_cycle() call (:1988-1990/:2077-2079
+        shape). A matched keep-fresh pattern is the Miele itself signaling programme completion,
+        so it is corroboration regardless of which state's table row ends up consuming this
+        evidence: RUNNING's own KEEP_FRESH row (a_enter_ending_keep_fresh, no guards - always
+        lands) never needed this hook, but ENDING's KEEP_FRESH row (G_past_guard, G_valid_cycle,
+        G_is_real) evaluates its guards BEFORE any action could set the flag - so without this
+        hook, a cycle recognized as keep-fresh only after already entering ENDING via POWER_LOW
+        could never benefit from G_valid_cycle's own keep-fresh short-circuit at all, forcing it
+        through the strict min_cycle_minutes/min_energy_kwh floor instead - a systematic ~13min
+        divergence from the legacy app on every keep-fresh finish that starts this way (found via
+        test_replay_integration.py's real_01 tape). G_past_guard and G_is_real are untouched by
+        this - they gate exactly as before; only G_valid_cycle's own pre-existing short-circuit
+        (dryer_policy.py's is_valid_completed_cycle) now actually gets a chance to apply."""
+        if ctx.evidence is not None and ctx.evidence.type == E.KEEP_FRESH:
+            self.keep_fresh_detected = True
 
     # ---- guards (spec 4.1) ----
 
@@ -757,8 +803,9 @@ class DryerPolicy:
         self._ending_since = ctx.now()
 
     def a_enter_ending_keep_fresh(self, ctx):
-        """RUNNING/KEEP_FRESH -> ENDING (dryer_monitor.py:1988-1990 shape)."""
-        self.keep_fresh_detected = True
+        """RUNNING/KEEP_FRESH -> ENDING (dryer_monitor.py:1988-1990 shape). keep_fresh_detected is
+        already True by the time this runs - before_guards sets it unconditionally, for every
+        KEEP_FRESH submission, before this action (or any guard) ever gets a chance to run."""
         self._ending_since = ctx.now()
 
     def a_door_high_pause(self, ctx):

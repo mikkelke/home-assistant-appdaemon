@@ -36,6 +36,7 @@ CFG = {
     "fill_window_minutes": 60, "max_running_hours": 5, "pause_timeout_minutes": 10,
     "unemptied_timeout_hours": 24, "emptied_timeout_minutes": 30,
     "restore_corroboration_window_minutes": 10, "announce_freshness_minutes": 20,
+    "main_cycle_power": 400,  # KeepFreshDetector's own band threshold (matches DEFAULTS)
 }
 
 
@@ -523,6 +524,168 @@ class EndingRows(unittest.TestCase):
         self._to_ending(h)
         res = h.fsm.submit(h.ev(E.WD_RUNNING))
         self.assertTrue(res.refused)
+
+
+# --- KeepFreshDetector: a declined (not landed) attempt must not be treated as final (GAP 2,
+# integration-found via test_replay_integration.py's real_01 tape: a one-shot self-cancel on the
+# FIRST pattern match, refused by G_valid_cycle because the cycle was not yet past
+# min_cycle_minutes, stranded the finish behind the slow POWER_LOW/POWER_END_CONFIRMED path ~17min
+# later than the legacy app, which polled every 15s continuously and re-detected right after the
+# gate opened). Exercises the real dryer_policy.KeepFreshDetector directly (not just the table
+# row, already covered by EndingRows.test_keep_fresh_past_guard_real_finishes_announced above). ---
+
+
+class KeepFreshDetectorRetriesOnDecline(unittest.TestCase):
+    def _feed(self, det, h, watts):
+        det.on_state(CFG["power_sensor"], "0", str(watts), h.fsm.ctx)
+
+    def test_declined_attempt_keeps_sampling_and_relands_after_retry_interval(self):
+        h = Harness(state=S.OFF, cooling_period=0, cfg_overrides={"min_cycle_minutes": 60, "min_energy_kwh": 0.01})
+        h.enter_running()
+        h.enter_ending(watts=2)
+        self.assertEqual(h.fsm.state, S.ENDING)
+        h.states[CFG["energy_sensor"]] = "10.5"  # 0.5 kWh used - clears min_energy_kwh regardless
+
+        det = dp.KeepFreshDetector(pattern_window=10, retry_interval_s=60)
+        # Anti-crease band: intermittent zero periods + a moderate spike, mean well under
+        # main_cycle_power/3 - matches main_cycle_done's first band (dryer_policy.py's own
+        # has_zero_periods/has_moderate_spikes/not_main_cycle check).
+        readings = [0, 0, 150, 0, 0, 150, 0, 0, 150, 0]
+
+        # First attempt: only 10 minutes elapsed - well short of the 60min min_cycle_minutes (and
+        # the 96min 80%-of-120min-fallback past_guard), so G_valid_cycle/G_past_guard decline
+        # (matched=False). The detector must NOT self-cancel on a declined attempt.
+        h.policy.start_time = h.clock.now() - timedelta(minutes=10)
+        for w in readings:
+            self._feed(det, h, w)
+        self.assertFalse(det._done, "a declined attempt must not self-cancel")
+        self.assertEqual(h.fsm.state, S.ENDING)
+        self.assertEqual(h.sink.announces, [])
+
+        # Still within retry_interval_s (30s later) - even though the guards would NOW pass
+        # (elapsed pushed comfortably past both thresholds), the detector's OWN rate limit must
+        # still hold it back: no second attempt fires yet.
+        h.clock.advance(30)
+        h.policy.start_time = h.clock.now() - timedelta(minutes=100)
+        self._feed(det, h, 150)
+        self.assertFalse(det._done, "rate limit must hold even though the guards would now pass")
+        self.assertEqual(h.fsm.state, S.ENDING)
+        self.assertEqual(h.sink.announces, [])
+
+        # Past retry_interval_s since the FIRST attempt (30s + 31s = 61s total) - a fresh attempt
+        # fires and lands (guards now pass).
+        h.clock.advance(31)
+        self._feed(det, h, 150)
+        self.assertTrue(det._done)
+        self.assertEqual(h.fsm.state, S.FINISHED)
+        self.assertEqual(h.sink.announces, ["Dryer is ready to be emptied"])
+
+    def test_landed_attempt_self_cancels_no_further_emits(self):
+        """Unchanged half of the contract: once an attempt actually lands, the detector stops for
+        good (matches the live app's own self-cancel-on-detect) - no retries after a landing."""
+        h = Harness(state=S.OFF, cooling_period=0, cfg_overrides={"min_cycle_minutes": 1, "min_energy_kwh": 0.01})
+        h.enter_running()
+        h.enter_ending(watts=2)
+        h.states[CFG["energy_sensor"]] = "10.5"
+        h.policy.start_time = h.clock.now() - timedelta(minutes=200)  # comfortably past every guard
+
+        det = dp.KeepFreshDetector(pattern_window=10, retry_interval_s=60)
+        readings = [0, 0, 150, 0, 0, 150, 0, 0, 150, 0]
+        for w in readings:
+            self._feed(det, h, w)
+        self.assertTrue(det._done)
+        self.assertEqual(h.fsm.state, S.FINISHED)
+        self.assertEqual(len(h.sink.announces), 1)
+
+        # Further samples (even well past retry_interval_s) must not re-emit or re-finish.
+        h.clock.advance(120)
+        self._feed(det, h, 150)
+        self.assertEqual(len(h.sink.announces), 1)
+
+
+# --- keep_fresh_detected set BEFORE guard evaluation (the real_01 ordering fix): mirrors legacy
+# _check_power_pattern's unconditional set-then-check, so G_valid_cycle's own pre-existing
+# keep-fresh short-circuit applies regardless of which state's row consumes the KEEP_FRESH
+# evidence (previously only RUNNING's unconditional row set the flag, via its action, which runs
+# AFTER guards - too late for ENDING's OWN guarded row to ever benefit). G_past_guard and G_is_real
+# are untouched by this fix and must keep gating exactly as before. ---
+
+
+class KeepFreshDetectedSetBeforeGuards(unittest.TestCase):
+    def test_past_guard_but_under_min_cycle_finishes_immediately(self):
+        """(a) The real_01 shape: ENDING entered via POWER_LOW (keep_fresh_detected still False),
+        then KEEP_FRESH arrives past the 80% guard but still short of min_cycle_minutes - the
+        short-circuit must let G_valid_cycle pass anyway and land immediately."""
+        h = Harness(state=S.OFF, cooling_period=0, cfg_overrides={"min_cycle_minutes": 60, "min_energy_kwh": 0.01})
+        h.enter_running()
+        h.enter_ending(watts=2)
+        self.assertEqual(h.fsm.state, S.ENDING)
+        h.states[CFG["energy_sensor"]] = "10.5"
+        # A short "unknown"-fallback duration (default profiles resolve everything non-"unknown"
+        # to the SAME 120min fallback via get_profile - see this module's own DEFAULTS reasoning)
+        # so 80% of it (48min) is reachable while still comfortably under min_cycle_minutes (60).
+        h.policy.profiles = {
+            "unknown": {"label": "Unknown", "duration_min": 60, "max_energy_kwh": 2.0},
+            "finish_uld": {"label": "Finish uld", "duration_min": 5, "max_energy_kwh": 0.02, "is_real": False},
+        }
+        h.policy.start_time = h.clock.now() - timedelta(minutes=50)  # past 80%*60=48min, short of 60min
+        self.assertFalse(h.policy.keep_fresh_detected)
+
+        res = h.fsm.submit(h.ev(E.KEEP_FRESH, {"mean": 100, "peak": 200, "stdev": 60}))
+        self.assertTrue(res.matched)
+        self.assertFalse(res.refused)
+        self.assertEqual(h.fsm.state, S.FINISHED)
+        self.assertTrue(h.policy.keep_fresh_detected)
+        self.assertEqual(len(h.sink.feedbacks), 1)
+
+    def test_before_past_guard_still_refused(self):
+        """(b) G_past_guard is untouched by the fix - even though keep_fresh_detected gets set
+        (unconditionally, matching legacy), a submission before the 80% guard elapses is still
+        refused; only G_valid_cycle's own pre-existing short-circuit changed."""
+        h = Harness(state=S.OFF, cooling_period=0, cfg_overrides={"min_cycle_minutes": 60, "min_energy_kwh": 0.01})
+        h.enter_running()
+        h.enter_ending(watts=2)
+        h.states[CFG["energy_sensor"]] = "10.5"
+        h.policy.profiles = {
+            "unknown": {"label": "Unknown", "duration_min": 60, "max_energy_kwh": 2.0},
+            "finish_uld": {"label": "Finish uld", "duration_min": 5, "max_energy_kwh": 0.02, "is_real": False},
+        }
+        h.policy.start_time = h.clock.now() - timedelta(minutes=30)  # well short of 80%*60=48min
+
+        res = h.fsm.submit(h.ev(E.KEEP_FRESH, {"mean": 100, "peak": 200, "stdev": 60}))
+        self.assertFalse(res.matched)
+        self.assertEqual(h.fsm.state, S.ENDING)
+        self.assertTrue(h.policy.keep_fresh_detected, "the flag itself still sets - only this ROW's own guard declines")
+        self.assertEqual(h.sink.feedbacks, [])
+
+    def test_non_real_programme_keep_fresh_finish_still_skips_announcement(self):
+        """(c) G_is_real is untouched too - it gates ONLY the announcement, via
+        a_finish_skip_if_not_real's own internal check (not row-matching, unlike the KEEP_FRESH
+        row's own G_is_real guard): a keep-fresh-corroborated finish_uld-shaped finish (reached
+        here via the POWER_END_CONFIRMED route, after an earlier KEEP_FRESH submission already set
+        the flag) still lands and saves feedback, but the announcement is skipped."""
+        h = Harness(state=S.OFF, cooling_period=0, cfg_overrides={"min_cycle_minutes": 60, "min_energy_kwh": 0.01})
+        h.enter_running()
+        h.enter_ending(watts=2)
+        h.states[CFG["energy_sensor"]] = "10.02"  # ~0.02 kWh - matches finish_uld's own band
+
+        # An earlier KEEP_FRESH submission sets keep_fresh_detected=True regardless of whether ITS
+        # OWN row lands (here it does not - not yet past the "unknown"-fallback 80% guard).
+        h.policy.start_time = h.clock.now() - timedelta(minutes=1)
+        res1 = h.fsm.submit(h.ev(E.KEEP_FRESH, {"mean": 100, "peak": 200, "stdev": 60}))
+        self.assertFalse(res1.matched)
+        self.assertEqual(h.fsm.state, S.ENDING)
+        self.assertTrue(h.policy.keep_fresh_detected)
+
+        # finish_uld's OWN 80% guard (duration_min=5 -> 4min) now clears via POWER_END_CONFIRMED;
+        # G_valid_cycle short-circuits (well under the 60min min_cycle_minutes floor); G_is_real
+        # fails internally (finish_uld's is_real=False) - lands, but skips the announcement.
+        h.policy.start_time = h.clock.now() - timedelta(minutes=6)
+        res2 = h.fsm.submit(h.ev(E.POWER_END_CONFIRMED, {"watts": 2}))
+        self.assertTrue(res2.matched)
+        self.assertEqual(h.fsm.state, S.FINISHED)
+        self.assertEqual(h.sink.announces, [], "non-real programme (finish_uld) must skip the announcement")
+        self.assertEqual(len(h.sink.feedbacks), 1, "the finish/feedback itself still lands")
 
 
 # --- FINISHED ---

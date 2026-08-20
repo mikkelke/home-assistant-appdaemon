@@ -140,41 +140,69 @@ class RealRestartStormEngineOutperformsLegacy(_ReplayIntegrationCase):
     unknown->off, the HA-restart signature) fragmented into FOUR Running blocks in the LEGACY
     app's own sensor.dryer_state history (tape['expect'] below, preserved unedited as that
     historical record - see real_03_restartstorm.json's meta.notes) - the exact class of bug
-    F2's restore-corroboration machinery exists to close.
+    F2's restore-corroboration machinery exists to close. The legacy app never recovered from
+    that fragmentation: it has no Unemptied/Emptied anywhere in its own history for this cycle,
+    so it never announced the finish either.
 
-    Verified outcome against the real engine: it does NOT reproduce the legacy fragmentation.
-    Every one of the three simulated restarts finds the durable CycleStore's Running record
-    corroborated immediately (live power is still ~600-700W at each restart instant, matching
-    physical reality) - never even entering the hypothesis state, let alone a false Off. The
-    published trace has exactly THREE entries (Off, Running, Off) where the legacy app's has
-    NINE. The single cycle_id minted at the genuine start (t=60.9s) is carried, unchanged,
-    through all three restarts via the store round-trip (verified directly against
-    engine.cycle_id below) - never re-minted, so F3's exactly-once-feedback guard is never
-    even tested by a duplicate here. The final Off, at t=11969.3s, lands within ~0.7s of the
-    legacy app's own final Off (t_approx=11970.0) - both conclude via the same RUNNING+
-    DOOR_OPENED+low-power+fill_window "interrupt" table row (no Unemptied/Emptied for either),
-    since the door opened only ~42s after power finally settled and neither app's low-power
-    finish-confirm had fired yet. This is intentionally asserted against the engine's OWN
-    actual sequence, NOT tape['expect'] (which stays the legacy differential-oracle baseline
-    the divergence is measured against, per this test class's own docstring)."""
+    Verified outcome against the real engine (current code, incl. the keep-fresh short-circuit
+    -ordering fix that landed after this test file was first written - see the trace below):
+    it does NOT reproduce the legacy fragmentation. Every one of the three simulated restarts
+    finds the durable CycleStore's Running record corroborated immediately (live power is still
+    ~600-700W at each restart instant, matching physical reality) - never even entering the
+    hypothesis state, let alone a false Off. The single cycle_id minted at the genuine start
+    (t=60.9s) is carried, unchanged, through all three restarts via the store round-trip
+    (verified directly against engine.cycle_id below) - never re-minted.
 
-    def test_engine_stays_running_through_all_three_restarts_legacy_did_not_survive(self):
+    Beyond just surviving the restarts, the engine now ALSO correctly finishes the cycle: the
+    real anti-crease power pattern is detected via keep-fresh at t=5762.2s (~96min in),
+    landing Unemptied and sending the ONE real announce ('Dryer is ready to be emptied') this
+    cycle ever gets - the legacy app never sent it at all. The door then genuinely opens (this
+    tape's own captured door-open/door-close pair) at t=11969.3s (Emptied) and closes at
+    t=12208.4s (Off) - a real ~239s Emptied dwell, which is why the final Off now lands ~238s
+    AFTER the legacy app's own final Off (t_approx=11970.0), not within ~1s of it as it did
+    before the finish was detected: the legacy app's Off at that timestamp was a coincidence of
+    both apps reacting to the same door-open edge from RUNNING; the engine's Off three entries
+    later is a different event (the door closing on an already-Emptied cycle). So the full
+    story is: the engine held ONE cycle through three restarts AND correctly finished and
+    announced it - two things the legacy app got wrong for this exact real capture. This is
+    intentionally asserted against the engine's OWN actual sequence, NOT tape['expect'] (which
+    stays the legacy differential-oracle baseline the divergence is measured against, per this
+    docstring)."""
+
+    def test_engine_completes_and_announces_the_cycle_the_legacy_app_never_recovered_from(self):
         tape, replay, engine, result = _run("real_03_restartstorm.json")
         legacy_sequence = _sequence(tape["expect"], "published")
         engine_sequence = _sequence(result.trace, "published")
 
         self.assertEqual(legacy_sequence, ["Off", "Running", "Off", "Running", "Off", "Running", "Off", "Running", "Off"])
-        self.assertEqual(engine_sequence, ["Off", "Running", "Off"])
+        self.assertEqual(engine_sequence, ["Off", "Running", "Unemptied", "Emptied", "Off"])
         self.assertNotEqual(engine_sequence, legacy_sequence)  # the divergence itself, explicit
 
-        # The final Off lands within a few seconds of the legacy app's own - both conclude via
-        # the same door-open interrupt route, not a restart artifact.
-        self.assertLess(abs(result.trace[-1]["t"] - tape["expect"][-1]["t_approx"]), 5.0)
+        # Each of these is a directly-modeled discrete event (keep-fresh finish; this tape's own
+        # captured door-open; this tape's own captured door-close) rather than a confirm-timer
+        # whose fire time could be attributed to a later tape event - so unlike
+        # assertTraceMatchesExpect's generous _TRACE_TOLERANCE_S, a tight delta here is the
+        # right check, calibrated to the actual measured values (see the class docstring).
+        measured_t = [e["t"] for e in result.trace]
+        self.assertAlmostEqual(measured_t[2], 5762.234, delta=5.0)   # Unemptied: keep-fresh finish
+        self.assertAlmostEqual(measured_t[3], 11969.299, delta=5.0)  # Emptied: door opens
+        self.assertAlmostEqual(measured_t[4], 12208.360, delta=5.0)  # Off: door closes
+        # The ~239s(!) gap from the legacy app's own final Off is real, not a harness artifact -
+        # see the class docstring for why it is no longer the ~1s this test used to assert.
+        self.assertAlmostEqual(result.trace[-1]["t"] - tape["expect"][-1]["t_approx"], 238.3, delta=5.0)
 
-    def test_no_hypothesis_ever_and_no_announce_or_push_across_the_whole_tape(self):
+    def test_hypothesis_never_true_and_exactly_one_announce_no_pushes(self):
         tape, replay, engine, result = _run("real_03_restartstorm.json")
+        # Claim 1, unchanged by the keep-fresh fix: never a hypothesis state anywhere in the run.
         self.assertFalse(engine._fsm.hypothesis)
-        self.assertEqual([a for a in engine.actions.calls if a["kind"] in ("announce", "push_mobile")], [])
+        # Claim 2, changed by the fix: the cycle now finishes, so it gets exactly the one real
+        # announce it earned - not "no announce" (this test's pre-fix claim, when the cycle
+        # never finished at all) and not more than one (F3's exactly-once invariant).
+        announces = [a for a in engine.actions.calls if a["kind"] == "announce"]
+        pushes = [a for a in engine.actions.calls if a["kind"] == "push_mobile"]
+        self.assertEqual(len(announces), 1)
+        self.assertEqual(announces[0]["message"], "Dryer is ready to be emptied")
+        self.assertEqual(pushes, [])
 
     def test_cycle_id_minted_once_and_survives_every_restart_unminted_again(self):
         tape, replay, engine, result = _run("real_03_restartstorm.json")
