@@ -1,0 +1,126 @@
+{
+  "meta": {
+    "appliance": "dryer",
+    "source": "synthetic",
+    "captured_at": "2026-05-20T14:00:00+00:00",
+    "notes": "Pins F3, the engine-native exactly-once-feedback invariant (spec 6; old dup guard dryer_monitor.py:1339-1346,1378; return-gate :2164-2184) - the class of bug that produced 9 junk finish_uld records on 2026-08-12 when a call site forgot the guard. A cycle starts normally, runs a generously long main cycle (145 min, safely past any plausible 0.8*programme_duration guard so this tape does not also couple to G_past_guard specifics - that is T5's job), then a noisy near-stop_w tail (mirrors the real anti-crease tail seen in real_01/02/03) before settling low for good. TODAY this harness can only assert the published-state trace shows exactly ONE Unemptied entry (no flapping) - the tape schema has no feedback-count field. The deeper invariant (exactly one RecordingActionSink 'save_feedback' call for cycle_id 'cyc-t3-feedback') is for a future engine-integrated test to check against ReplayResult.actions once appliance_fsm.py lands (see replay.py's documented 'Known limitation' for why raw power events alone cannot force the detector-internal POWER_RECOVERED/POWER_END_CONFIRMED sequencing that produced the original bug - only the resulting once-guard invariant is pinned here)."
+  },
+  "args": {
+    "start_w": 8,
+    "stop_w": 5,
+    "run_for": 60,
+    "stop_for": 60,
+    "main_cycle_power": 400,
+    "fill_window_minutes": 60,
+    "min_cycle_minutes": 60,
+    "min_energy_kwh": 0.05,
+    "pause_timeout_minutes": 10,
+    "max_running_hours": 5,
+    "unemptied_timeout_hours": 24,
+    "emptied_timeout_minutes": 30,
+    "cooling_period": 600,
+    "restore_corroboration_window_minutes": 10,
+    "announce_freshness_minutes": 20
+  },
+  "initial": {
+    "entity_state": "Off",
+    "entity_attrs": {},
+    "helper_state": null,
+    "store": null
+  },
+  "events": [
+    {
+      "t": 0,
+      "kind": "restart"
+    },
+    {
+      "t": 0,
+      "kind": "energy",
+      "kwh": 10.0
+    },
+    {
+      "t": 1,
+      "kind": "power",
+      "watts": 300
+    },
+    {
+      "t": 61,
+      "kind": "power",
+      "watts": 480
+    },
+    {
+      "t": 120,
+      "kind": "energy",
+      "kwh": 10.02
+    },
+    {
+      "t": 4350,
+      "kind": "power",
+      "watts": 510
+    },
+    {
+      "t": 8000,
+      "kind": "energy",
+      "kwh": 10.35
+    },
+    {
+      "t": 8700,
+      "kind": "power",
+      "watts": 495
+    },
+    {
+      "t": 8710,
+      "kind": "power",
+      "watts": 3
+    },
+    {
+      "t": 8720,
+      "kind": "power",
+      "watts": 220
+    },
+    {
+      "t": 8790,
+      "kind": "power",
+      "watts": 3
+    },
+    {
+      "t": 8800,
+      "kind": "power",
+      "watts": 200
+    },
+    {
+      "t": 8870,
+      "kind": "power",
+      "watts": 3
+    },
+    {
+      "t": 9000,
+      "kind": "power",
+      "watts": 2
+    },
+    {
+      "t": 9200,
+      "kind": "power",
+      "watts": 2
+    },
+    {
+      "t": 9300,
+      "kind": "energy",
+      "kwh": 10.42
+    }
+  ],
+  "expect": [
+    {
+      "t_approx": 0,
+      "published": "Off"
+    },
+    {
+      "t_approx": 61,
+      "published": "Running"
+    },
+    {
+      "t_approx": 8770,
+      "published": "Unemptied"
+    }
+  ]
+}

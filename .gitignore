@@ -24,3 +24,6 @@ __pycache__/
 
 # Logs
 *.log
+
+# Test tapes are fixtures, not runtime state - re-include them past the runtime-file patterns above
+!apps/appliances/tests/tapes/*.json
