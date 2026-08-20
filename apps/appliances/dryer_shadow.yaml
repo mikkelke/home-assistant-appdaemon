@@ -12,7 +12,9 @@
 dryer_shadow:
   module: dryer_shadow
   class: DryerShadow
-  log: dryer_shadow_log
+  # log: dryer_shadow_log   # enable once dryer_shadow_log is defined in the box appdaemon.yaml
+  # (logs: section, same shape as washer_monitor_log; needs an AD restart to take). Until then the
+  # shadow logs to main_log - grep appdaemon.log for "dryer_shadow" to read it in isolation.
 
   # Same physical entities dryer_monitor.py listens to (dryer.yaml) - read-only here.
   power_sensor: "sensor.dryer_plug_power"
