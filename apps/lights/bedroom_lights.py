@@ -34,6 +34,10 @@ class BedroomLights(hass.Hass):
     Truth table (after the vacant/occupied gate):
       - No effective occupancy -> all lights OFF
       - Occupied + bright -> bed + ceiling OFF
+      - Occupied + dark + bed session active + ceiling already on -> ceiling OFF, bed ON
+        (applies even under sleep mode / blind closed below - an ALREADY-LIT room
+        follows you to bed; this re-points existing light, it never conjures new
+        light in a dark/private room - see _evaluate_lights)
       - Occupied + dark + sleep mode -> no auto-on
       - Occupied + dark + blind at/above ``blind_closed_threshold`` -> no auto-on
       - Occupied + dark + bed session active -> bed ON, ceiling OFF
@@ -411,6 +415,21 @@ class BedroomLights(hass.Hass):
                     )
                     self.turn_off(self.bed_lights)
                     self.turn_off(self.ceiling_lights)
+                return
+
+            # An already-lit ceiling always follows you to bed once the session is
+            # active - this re-points EXISTING light, it doesn't conjure new light in
+            # a dark/private room, so it applies even though the gates below would
+            # otherwise block a fresh auto-on. Fixes the case where sleep mode
+            # auto-arms in the same instant a body sensor starts the session (e.g.
+            # phone already charging at bedtime): the ceiling was on from getting
+            # ready, and simply stranding it there instead of following you to the
+            # bed light is never what's wanted (user-reported 2026-08-20).
+            if self._session and self.get_state(self.ceiling_lights) == "on":
+                self.log("Bedroom: Ceiling -> Bed (in bed, ceiling was already on)", level="INFO")
+                self.turn_off(self.ceiling_lights)
+                if self.get_state(self.bed_lights) != "on":
+                    self.turn_on(self.bed_lights)
                 return
 
             if sleep_mode or blind_closed or not on_d.is_dark:

@@ -327,6 +327,54 @@ class LightDecision(unittest.TestCase):
         app._evaluate_lights("TEST")
         app.turn_on.assert_called_once_with(CEILING)
 
+    def test_ceiling_already_on_follows_to_bed_despite_sleep_mode(self):
+        # 2026-08-20: sleep mode can auto-arm in the SAME instant a body sensor
+        # starts the session (phone already charging at bedtime) - the ceiling was
+        # already lit from getting ready, and the sleep-mode no-auto-on gate below
+        # must not strand it there. Re-pointing existing light is not the same as
+        # conjuring new light in a dark/private room.
+        app = make_session_app(session=True, dark=True)
+        app.states[(CEILING, None)] = "on"
+        app.states[(SLEEP, None)] = "on"
+        app._evaluate_lights("TEST")
+        app.turn_off.assert_called_once_with(CEILING)
+        app.turn_on.assert_called_once_with(BED)
+
+    def test_ceiling_already_on_follows_to_bed_despite_blind_closed(self):
+        app = make_session_app(session=True, dark=True)
+        app.states[(CEILING, None)] = "on"
+        app.states[(BLIND, "current_position")] = 100
+        app._evaluate_lights("TEST")
+        app.turn_off.assert_called_once_with(CEILING)
+        app.turn_on.assert_called_once_with(BED)
+
+    def test_no_swap_when_ceiling_already_off_and_sleep_mode_on(self):
+        # The fix only re-points an ALREADY-LIT room. With the ceiling already off,
+        # sleep mode's no-auto-on gate must still hold - no new light from darkness.
+        app = make_session_app(session=True, dark=True)
+        app.states[(SLEEP, None)] = "on"
+        app._evaluate_lights("TEST")
+        app.turn_on.assert_not_called()
+        app.turn_off.assert_not_called()
+
+    def test_no_swap_when_session_not_active_even_if_ceiling_on_and_sleep_mode(self):
+        app = make_session_app(session=False, dark=True)
+        app.states[(FP300, None)] = "on"
+        app.states[(CEILING, None)] = "on"
+        app.states[(SLEEP, None)] = "on"
+        app._evaluate_lights("TEST")
+        app.turn_on.assert_not_called()
+        app.turn_off.assert_not_called()
+
+    def test_ceiling_swap_does_not_redundantly_call_turn_on_if_bed_already_on(self):
+        app = make_session_app(session=True, dark=True)
+        app.states[(CEILING, None)] = "on"
+        app.states[(BED, None)] = "on"
+        app.states[(SLEEP, None)] = "on"
+        app._evaluate_lights("TEST")
+        app.turn_off.assert_called_once_with(CEILING)
+        app.turn_on.assert_not_called()
+
 
 class BlindClosedThreshold(unittest.TestCase):
     def test_pos_99_with_threshold_95_is_closed(self):
