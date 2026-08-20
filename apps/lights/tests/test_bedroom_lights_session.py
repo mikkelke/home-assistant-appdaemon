@@ -56,6 +56,8 @@ def make_session_app(session=False, dark=True, session_exit_timer=None):
     app.bedroom_presence_extra = []
     app.bed_session_entity = SESSION
     app.session_exit_debounce_sec = 90
+    app.bathroom_door_close_grace_sec = 5
+    app._vacancy_grace_timer = None
     app.blind_closed_threshold = 95
     app.bedroom_blind_entity = BLIND
     app.mikkel_sleep_entity = SLEEP
@@ -374,6 +376,47 @@ class LightDecision(unittest.TestCase):
         app._evaluate_lights("TEST")
         app.turn_off.assert_called_once_with(CEILING)
         app.turn_on.assert_not_called()
+
+
+class BathroomDoorGrace(unittest.TestCase):
+    # 2026-08-20: closing the bathroom door dropped bathroom-PIR's contribution to
+    # occupancy instantly; if FP300 hadn't yet confirmed bedroom presence, occupancy
+    # fell to zero and both lights died in the same second - observed 4x on 08-19.
+
+    def test_close_with_no_other_occupancy_arms_grace_not_immediate_off(self):
+        app = make_session_app(session=False, dark=True)
+        app.states[(CEILING, None)] = "on"  # would be killed immediately pre-fix
+        app._on_bathroom_door_change(BATH_DOOR, "state", "on", "off", {})
+        app.run_in.assert_called_once()
+        app.turn_off.assert_not_called()
+
+    def test_close_with_fp300_still_on_evaluates_normally_no_grace(self):
+        app = make_session_app(session=False, dark=True)
+        app.states[(FP300, None)] = "on"
+        app._on_bathroom_door_change(BATH_DOOR, "state", "on", "off", {})
+        app.run_in.assert_not_called()
+
+    def test_grace_fire_confirms_vacancy_turns_off(self):
+        app = make_session_app(session=False, dark=True)
+        app.states[(CEILING, None)] = "on"
+        app._arm_vacancy_grace()
+        app._vacancy_grace_fire({})
+        app.turn_off.assert_any_call(CEILING)
+
+    def test_grace_fire_noop_if_fp300_recovered_before_it_fires(self):
+        app = make_session_app(session=False, dark=True)
+        app.states[(CEILING, None)] = "on"
+        app._arm_vacancy_grace()
+        app.states[(FP300, None)] = "on"  # confirmed before the timer fires
+        app._vacancy_grace_fire({})
+        app.turn_off.assert_not_called()
+
+    def test_door_reopen_cancels_pending_grace(self):
+        app = make_session_app(session=False, dark=True)
+        app._vacancy_grace_timer = "pending-handle"
+        app._on_bathroom_door_change(BATH_DOOR, "state", "off", "on", {})
+        app.cancel_timer.assert_called_once_with("pending-handle")
+        self.assertIsNone(app._vacancy_grace_timer)
 
 
 class BlindClosedThreshold(unittest.TestCase):

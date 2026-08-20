@@ -15,6 +15,14 @@ class BedroomLights(hass.Hass):
       FP300 mmWave presence (``bedroom_presence_sensor``) OR any ``bedroom_presence_extra`` OR
       bathroom PIR (when bathroom door open) OR an active bed-light session (see below).
 
+      A bathroom-door CLOSE that would drop occupancy to zero (the door-open bathroom-PIR
+      path was the only thing propping it up) gets ``bathroom_door_close_grace_sec`` before
+      the lights actually go out - FP300 gets a moment to confirm you're still in the
+      bedroom (you may have just shut the door for privacy without leaving). A real exit
+      still ends up dark, just a few seconds later. See _on_bathroom_door_change /
+      _arm_vacancy_grace. (user-reported 2026-08-20: 4 same-second false-negatives
+      observed 08-19, each closing the door instantly killed both lights.)
+
     Brightness: ``room_state_darkness`` (see LIGHTING_STANDARD.md) - refreshed every evaluation.
 
     Bed-light session (bed vs ceiling): a debounced latch, ``self._session``, mirrored to the
@@ -78,12 +86,16 @@ class BedroomLights(hass.Hass):
         )
         self.bedroom_presence_extra = list(self.args.get("bedroom_presence_extra") or [])
         self.session_exit_debounce_sec = int(self.args.get("session_exit_debounce_sec", 90))
+        # Grace before a bathroom-door close (that would drop occupancy to zero) actually
+        # kills the lights - see class docstring / _arm_vacancy_grace.
+        self.bathroom_door_close_grace_sec = int(self.args.get("bathroom_door_close_grace_sec", 5))
 
         self.log_level = self.args.get("verbosity_level", "normal")
 
         self._last_off_is_dark: bool | None = None
         self._session = False
         self._session_exit_timer = None
+        self._vacancy_grace_timer = None
 
         if not all(
             [
@@ -376,9 +388,41 @@ class BedroomLights(hass.Hass):
         try:
             state = "opened" if new == "on" else "closed"
             self.log(f"Bedroom: Bathroom door {state}", level="INFO")
-            self._evaluate_lights("BATHROOM_DOOR")
+            if new == "off":  # closed
+                self._cancel_vacancy_grace()
+                if self._get_effective_occupancy():
+                    # Something besides the door-open bathroom-PIR path already
+                    # confirms occupancy (FP300, session, extra sensor) - normal.
+                    self._evaluate_lights("BATHROOM_DOOR")
+                else:
+                    # The bathroom-PIR path (now gone) was the only thing propping
+                    # occupancy up. Closing the door is often just shutting it for
+                    # privacy while still standing in the bedroom - FP300 may simply
+                    # not have caught up yet. See class docstring.
+                    self._arm_vacancy_grace()
+            else:  # opened
+                self._cancel_vacancy_grace()
+                self._evaluate_lights("BATHROOM_DOOR")
         except Exception as e:
             self.log(f"Error in bathroom door handler: {e}", level="ERROR")
+
+    def _arm_vacancy_grace(self) -> None:
+        if self._vacancy_grace_timer is None:
+            self._vacancy_grace_timer = self.run_in(
+                self._vacancy_grace_fire, self.bathroom_door_close_grace_sec
+            )
+
+    def _cancel_vacancy_grace(self) -> None:
+        if self._vacancy_grace_timer is not None:
+            try:
+                self.cancel_timer(self._vacancy_grace_timer)
+            except Exception:
+                pass
+            self._vacancy_grace_timer = None
+
+    def _vacancy_grace_fire(self, kwargs):
+        self._vacancy_grace_timer = None
+        self._evaluate_lights("BATHROOM_DOOR_GRACE_EXPIRED")
 
     def _on_room_state_push(self, entity, attribute, old, new, kwargs):
         try:
