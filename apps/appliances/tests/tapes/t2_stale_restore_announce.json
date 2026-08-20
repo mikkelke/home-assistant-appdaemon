@@ -3,7 +3,7 @@
     "appliance": "dryer",
     "source": "synthetic",
     "captured_at": "2026-08-19T09:00:00+00:00",
-    "notes": "Pins F2 (dryer_monitor.py:550-600,1745-1760), the dryer side of the washer 2026-08-19 stale-restore-announce incident (washer_monitor.py:991-1017, 3607-3634). Boot restores Running from the durable store only (entity_state is null - HA restarted, not just AD): start_time 3h ago, last_high_energy_at 170min ago (outside restore_corroboration_window_minutes=10) and live power reads 0W - uncorroborated. MUST NOT announce; MUST set hypothesis=true and schedule a one-shot RECONCILE (spec 8). INTEGRATION-TIME REVISION: originally this tape also fed two live power=0W samples so RECONCILE's power-history window (spec 8, DryerPolicy.g_reconcilable) would have data to conclude from - verified against the real engine, that back-fires: ANY live power sample <= stop_w reaching a RUNNING+hypothesis cycle is caught by the ordinary PowerEndDetector pipeline first (RUNNING->ENDING via a_enter_ending_power), and ENDING has no RECONCILE row in TABLE - the scheduled RECONCILE then no-ops as an unlisted (ENDING, RECONCILE) pair. Confirmed engine behavior (not this tape's call to fix): a hypothesis-Running cycle resolved via that ordinary low-power path never clears hypothesis at all (only a_track_power_high/a_resume_from_pause/a_reconcile call ctx.clear_hypothesis()) - worth the engine owner's attention, flagged in the integration report rather than patched here. This tape now pins the directly reachable half instead: with NO live signal at all before the one-shot RECONCILE fires (~60s), spec 8's 'absent power history is NEVER taken as off' holds exactly - g_reconcilable sees an empty window and refuses to conclude, so the cycle stays Running/hypothesis=true, safely, rather than silently guessing Off/Unemptied. NOTE: this tape does not exercise the companion 'door-open edge in history -> route EMPTIED silently' branch of spec 8, nor the 'history is populated and quietly concludes' branch - both require a live signal that (per the finding above) would currently pre-empt RECONCILE before it can run; a fixture for those needs either an engine-side fix or a harness seam that populates get_history without also firing the live detector pipeline, neither of which is this integration pass's call to make."
+    "notes": "Pins F2 (dryer_monitor.py:550-600,1745-1760) AND the FIX-3 announce_freshness_minutes gate (dryer_policy.py's _finish, mirroring washer_monitor.py:3635-3656) - the dryer side of the washer 2026-08-19 stale-restore-announce incident (washer_monitor.py:991-1017, 3607-3634), now replayed end to end through the real post-boot pipeline rather than stopping at the boot snapshot. Boot restores Running from the durable store only (entity_state is null - HA restarted, not just AD): start_time 3h ago, last_high_energy_at 170min ago (outside restore_corroboration_window_minutes=10) and live power reads 0W - uncorroborated. hypothesis=true at t=0; the synchronous try_conclude_at_boot RECONCILE sees an empty trailing power-history window (spec 8: absent history is NEVER taken as off) and correctly refuses to conclude - the cycle stays Running/hypothesis=true, unchanged from before this revision. REVISION (2026-08-20, closes the defect this tape's own previously-vacuous assertions had hidden): the tape now continues past boot with a live low-power+energy sample at t=5, mirroring the incident's own trigger - a live POWER_LOW sample reaching a RUNNING+hypothesis cycle is caught by the ordinary PowerEndDetector pipeline first (RUNNING->ENDING via a_enter_ending_power), landing before the scheduled RECONCILE fires at t=60 (which then correctly no-ops as an unlisted (ENDING, RECONCILE) pair - unchanged from the earlier finding). What WAS wrong, and is now fixed: the engine's own landed-live-evidence rule (appliance_fsm.py submit(), spec 8) clears hypothesis on that RUNNING->ENDING landing - this tape's prior revision of these notes claimed the opposite ('a hypothesis-Running cycle resolved via that ordinary low-power path never clears hypothesis at all'), which was true only until that auto-clear rule was added elsewhere in this build; that claim is superseded, and the gap between it and current engine behavior is part of what let this incident shape go undetected here. With hypothesis silently cleared and (until this revision) no gate in dryer_policy.py's _finish reading announce_freshness_minutes, the ENDING/POWER_END_CONFIRMED confirm at t=65 used to announce over Sonos raw, 181 minutes after the fact, for a load that may already be sitting emptied. _finish now computes latency against last_high_energy_at and force_pushes instead once past the freshness knob - this tape's second expect[] entry (Unemptied, hypothesis=false) pins exactly that outcome: zero Sonos announce, exactly one late-detection mobile push, checked against real engine.actions.calls in test_replay_integration.py, not against this tape's own expect[] literals. The companion 'door-open edge in history -> route EMPTIED silently' branch of spec 8 is covered instead by test_dryer_shadow.py's AnnounceFreshnessGateAfterStaleRestore class: this harness's get_history is a pure function of tape power/door/energy events, not a separately injectable recorder snapshot, so a synthetic door edge here would also need to arrive as a live tape event and would pre-empt RECONCILE the same way the power sample above does - redundant with that suite's own direct coverage of the same branch."
   },
   "args": {
     "start_w": 8,
@@ -45,7 +45,17 @@
       "kind": "restart"
     },
     {
-      "t": 65,
+      "t": 5,
+      "kind": "energy",
+      "kwh": 0.5
+    },
+    {
+      "t": 5,
+      "kind": "power",
+      "watts": 0
+    },
+    {
+      "t": 70,
       "kind": "tick"
     }
   ],
@@ -56,6 +66,13 @@
       "hypothesis": true,
       "announced": false,
       "pushed": false
+    },
+    {
+      "t_approx": 70,
+      "published": "Unemptied",
+      "hypothesis": false,
+      "announced": false,
+      "pushed": true
     }
   ]
 }

@@ -860,6 +860,22 @@ class DryerPolicy:
         # the most recently attempted cycle - see mark_fed_back's own docstring for why an
         # already-fed-back cycle_id here is exactly what a restore needs to replay.
         self.last_feedback_cycle_id = ctx.cycle_id
+        # Freshness gate (FIX-3, washer_monitor.py:3635-3656) - the dead announce_freshness_minutes
+        # knob (spec section 9), now actually read: a finish detected long after the fact (an
+        # uncorroborated restore whose boot RECONCILE could not conclude - empty trailing history
+        # - survives to a live 0W sample, which the engine's own auto-clear rule then treats as
+        # corroboration) must never blast Sonos about a load that may already be sitting emptied.
+        # Structural, not a per-row special case: EVERY _finish caller goes through this same
+        # check, so a stale reconcile, ENDING power-drop, keep-fresh, or pause-exit finish are all
+        # covered alike - force_push, once True (whether from here or an explicit caller like
+        # a_reconcile), never gets reset back to False. Anchored to last_high_energy_at (the last
+        # live proof of genuine activity) falling back to start_time - matches repro_B2.py's
+        # verifier-validated shape exactly.
+        anchor_dt = self.last_high_energy_at or self.start_time
+        if anchor_dt is not None:
+            latency_min = (ctx.now() - anchor_dt).total_seconds() / 60
+            if latency_min > self.cfg["announce_freshness_minutes"]:
+                force_push = True
         if not skip_announce and not self.notification_sent:
             announce_entity = self.cfg.get("announce_entity")
             enabled = ctx.get_state(announce_entity) == "on" if announce_entity else True

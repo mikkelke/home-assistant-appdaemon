@@ -71,18 +71,27 @@ class SyntheticRegressionTapesMatchExpect(_ReplayIntegrationCase):
         self.assertEqual(engine.actions.calls, [])
 
     def test_t2_stale_restore_sets_hypothesis_and_never_announces(self):
+        """Was vacuous (asserted tape["expect"][0]'s own literals against themselves - see this
+        tape's own meta.notes for how that hid the 2026-08-19 incident shape on this engine).
+        Now drives the real post-boot pipeline past the boot snapshot: the tape's live low-power
+        sample at t=5 lands RUNNING->ENDING and auto-clears hypothesis (engine's own landed-live-
+        evidence rule, spec 8) before the scheduled RECONCILE ever fires; the stop_for confirm
+        then finishes through dryer_policy.py's _finish freshness gate (FIX-3) - every assertion
+        below reads real engine/action state, never tape["expect"] literals."""
         tape, replay, engine, result = _run("t2_stale_restore_announce.json")
         self.assertTraceMatchesExpect(result.trace, tape["expect"])
-        exp = tape["expect"][0]
-        self.assertTrue(exp["hypothesis"])
-        self.assertFalse(exp["announced"])
-        self.assertFalse(exp["pushed"])
-        # Absent power history (spec 8) must never be silently taken as "off": hypothesis stays
-        # set and nothing gets published a second time, all the way through the one-shot
-        # RECONCILE's scheduled fire at t=60 (see this tape's own meta.notes for the traced
-        # reason a populated-history RECONCILE conclusion is not reachable through this harness).
-        self.assertTrue(engine._fsm.hypothesis)
-        self.assertEqual(engine.actions.calls, [])
+        self.assertEqual(_sequence(result.trace, "published"), ["Running", "Unemptied"])
+
+        self.assertFalse(engine._fsm.hypothesis, "a landed live low-power sample must clear hypothesis")
+        self.assertEqual(engine._fsm.state.name, "FINISHED")
+
+        announces = [a for a in engine.actions.calls if a["kind"] == "announce"]
+        pushes = [a for a in engine.actions.calls if a["kind"] == "push_mobile"]
+        feedback = [a for a in engine.actions.calls if a["kind"] == "save_feedback"]
+        self.assertEqual(announces, [], "a stale, uncorroborated-restore finish must never use Sonos")
+        self.assertEqual(len(pushes), 1)
+        self.assertIn("late detection", pushes[0]["message"])
+        self.assertEqual(len(feedback), 1)
 
     def test_t3_feedback_saved_exactly_once_despite_the_noisy_tail(self):
         tape, replay, engine, result = _run("t3_feedback_once.json")

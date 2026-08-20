@@ -40,6 +40,7 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     sys.modules["appdaemon.plugins.hass.hassapi"] = hassapi
 
 import dryer_shadow as ds  # noqa: E402
+from appliance_fsm import Evidence, EvidenceType  # noqa: E402
 from cycle_store import CycleStore, format_utc  # noqa: E402
 
 V2 = "sensor.dryer_state_v2"
@@ -369,6 +370,182 @@ class BootRestoreHypothesisAndReconcile(unittest.TestCase):
             self.assertEqual(app_b.fsm.state.name, "FINISHED")
             self.assertEqual(app_b.fsm.cycle_id, cid)
             self.assertEqual(app_b._actions.feedback, [], "a silent restore into FINISHED must never re-save")
+
+
+# --- freshness gate (FIX-3): a stale, uncorroborated-restore finish must push, never announce ---
+
+
+class AnnounceFreshnessGateAfterStaleRestore(unittest.TestCase):
+    """dryer_policy.py's _finish reads announce_freshness_minutes (spec section 9) to downgrade a
+    stale finish's notification from Sonos to a mobile push - the 2026-08-19 incident shape: boot
+    RECONCILE cannot conclude on an empty trailing history (a long HA outage), the restore
+    hypothesis survives boot, and the FIRST live evidence after boot (of POWER or PHYSICAL class)
+    auto-clears it via the engine's own landed-transition rule (spec 8) before the finish itself
+    lands. Covers every _finish call site: POWER_END_CONFIRMED off a stale RUNNING restore (a,
+    plus its door-edge/EMPTIED sibling), PAUSED/DOOR_CLOSED (b), ENDING/KEEP_FRESH (c, previously
+    untested), and a fresh, non-stale finish as the regression guard that the gate does not fire
+    when it should not (d)."""
+
+    def _seed_running_store(self, tmp, *, minutes_ago=180, cycle_id="cid-fresh-a"):
+        import datetime as dtmod
+
+        state_file = str(Path(tmp) / "dryer_shadow_state.json")
+        now = dtmod.datetime.now(dtmod.timezone.utc)
+        start = now - timedelta(minutes=minutes_ago)
+        store = CycleStore(state_file, "dryer_shadow")
+        ok = store.save({
+            "state": "Running", "state_since": format_utc(start), "cycle_id": cycle_id,
+            "cycle_start_time": format_utc(start), "energy_at_start": 10.0,
+            "detected_programme": "unknown", "programme_duration_min": 120, "max_power_w": 600.0,
+            "last_high_energy_at": format_utc(start),
+        })
+        self.assertTrue(ok)
+        return state_file
+
+    def _seed_paused_store(self, tmp, *, minutes_ago=180, cycle_id="cid-fresh-b"):
+        import datetime as dtmod
+
+        state_file = str(Path(tmp) / "dryer_shadow_state.json")
+        now = dtmod.datetime.now(dtmod.timezone.utc)
+        start = now - timedelta(minutes=minutes_ago)
+        store = CycleStore(state_file, "dryer_shadow")
+        ok = store.save({
+            "state": "Paused", "state_since": format_utc(start), "cycle_id": cycle_id,
+            "cycle_start_time": format_utc(start), "energy_at_start": 10.0,
+            "detected_programme": "unknown", "programme_duration_min": 120, "max_power_w": 600.0,
+            "last_high_energy_at": format_utc(start),
+        })
+        self.assertTrue(ok)
+        return state_file
+
+    def test_stale_running_restore_live_0w_confirms_pushes_not_announces(self):
+        """(a) repro_B.py's exact shape through the real shadow: boot RECONCILE cannot conclude
+        (absent trailing history - the outage swallowed it), hypothesis survives boot; the FIRST
+        live power sample (0W) auto-clears hypothesis via the engine's own landed-POWER-evidence
+        rule, landing RUNNING->ENDING; POWER_END_CONFIRMED then finishes through _finish's
+        freshness gate - anchored on last_high_energy_at (180min stale, restored from the store),
+        this must push, never announce."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = self._seed_running_store(tmp)
+            app, entities, calls = make_shadow(
+                tmp, state_file=state_file, power_w="0", live_state="Running",
+                extra_args={"min_cycle_minutes": 1, "restore_corroboration_window_minutes": 10, "cooling_period": 0},
+            )
+            app.initialize()
+            self.assertTrue(app.fsm.hypothesis, "absent history - boot RECONCILE must not conclude")
+            self.assertEqual(app._actions.announced, [])
+
+            entities[ENERGY]["state"] = "10.5"
+            push_power(app, entities, "0")  # live 0W - lands RUNNING->ENDING, auto-clears hypothesis
+            self.assertFalse(app.fsm.hypothesis, "a landed live POWER transition clears the hypothesis")
+            self.assertEqual(app.fsm.state.name, "ENDING")
+            fire_shortest(app)  # PowerEndDetector's stop_for confirm -> POWER_END_CONFIRMED
+
+            self.assertEqual(app.fsm.state.name, "FINISHED")
+            self.assertEqual(app._actions.announced, [], "must never announce a stale finish")
+            self.assertEqual(len(app._actions.pushed), 1)
+            self.assertIn("late detection", app._actions.pushed[0])
+            self.assertEqual(len(app._actions.feedback), 1)
+
+    def test_stale_running_restore_door_open_at_confirm_routes_emptied_silent(self):
+        """(a), door-edge sibling: G_door_edge's live check (door open right now at confirm time)
+        routes ENDING/POWER_END_CONFIRMED to a_finish_silent -> EMPTIED - skip_announce=True
+        already makes this totally silent regardless of the freshness gate; asserted here so both
+        outcomes the verifier named ("push, or silent EMPTIED if a door edge exists") are
+        covered."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = self._seed_running_store(tmp)
+            app, entities, calls = make_shadow(
+                tmp, state_file=state_file, power_w="0", live_state="Running",
+                extra_args={"min_cycle_minutes": 1, "restore_corroboration_window_minutes": 10, "cooling_period": 0},
+            )
+            app.initialize()
+            self.assertTrue(app.fsm.hypothesis)
+
+            entities[ENERGY]["state"] = "10.5"
+            push_power(app, entities, "0")
+            self.assertFalse(app.fsm.hypothesis)
+            entities[DOOR]["state"] = "on"  # door open right now at confirm time (no detector edge needed)
+            fire_shortest(app)
+
+            self.assertEqual(app.fsm.state.name, "EMPTIED")
+            self.assertEqual(app._actions.announced, [])
+            self.assertEqual(app._actions.pushed, [], "door-edge route is silent regardless of freshness")
+            self.assertEqual(len(app._actions.feedback), 1)
+
+    def test_stale_paused_restore_door_closed_low_power_pushes_not_announces(self):
+        """(b) repro_B2.py's PAUSED/DOOR_CLOSED variant through the real shadow: restored PAUSED,
+        hypothesis survives boot (absent history); the user closes the door with power still low -
+        PAUSED/DOOR_CLOSED's a_finish_announce goes through the SAME _finish freshness gate as (a)
+        - must push, never announce."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = self._seed_paused_store(tmp)
+            app, entities, calls = make_shadow(
+                tmp, state_file=state_file, power_w="0", door_state="on", live_state="Paused",
+                extra_args={"min_cycle_minutes": 1, "restore_corroboration_window_minutes": 10, "cooling_period": 0},
+            )
+            app.initialize()
+            self.assertTrue(app.fsm.hypothesis, "absent history - boot RECONCILE must not conclude")
+            self.assertEqual(app.fsm.state.name, "PAUSED")
+
+            entities[ENERGY]["state"] = "10.5"
+            push_door(app, entities, "off")  # door closes at low power -> a_finish_announce
+
+            self.assertEqual(app.fsm.state.name, "FINISHED")
+            self.assertFalse(app.fsm.hypothesis, "a landed live PHYSICAL transition clears the hypothesis")
+            self.assertEqual(app._actions.announced, [], "must never announce a stale finish")
+            self.assertEqual(len(app._actions.pushed), 1)
+            self.assertIn("late detection", app._actions.pushed[0])
+
+    def test_stale_ending_keep_fresh_finish_pushes_not_announces(self):
+        """(c) ENDING/KEEP_FRESH shares _finish too (verifier flagged this path as previously
+        untested) - KEEP_FRESH is itself POWER-class (live), so the first submission both lands
+        RUNNING->ENDING and clears the hypothesis; the second submission's row (guarded on
+        G_past_guard/G_valid_cycle/G_is_real) lands the finish and must push, not announce."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = self._seed_running_store(tmp)
+            app, entities, calls = make_shadow(
+                tmp, state_file=state_file, power_w="0", live_state="Running",
+                extra_args={"min_cycle_minutes": 1, "restore_corroboration_window_minutes": 10, "cooling_period": 0},
+            )
+            app.initialize()
+            self.assertTrue(app.fsm.hypothesis, "absent history - boot RECONCILE must not conclude")
+
+            entities[ENERGY]["state"] = "10.5"
+            kf_payload = {"mean": 100, "peak": 200, "stdev": 60}
+            app.fsm.submit(Evidence.make(EvidenceType.KEEP_FRESH, app.fsm.ctx.now(), "test", live=True, payload=kf_payload))
+            self.assertEqual(app.fsm.state.name, "ENDING")
+            self.assertFalse(app.fsm.hypothesis, "a landed live KEEP_FRESH (POWER-class) clears the hypothesis")
+
+            app.fsm.submit(Evidence.make(EvidenceType.KEEP_FRESH, app.fsm.ctx.now(), "test", live=True, payload=kf_payload))
+
+            self.assertEqual(app.fsm.state.name, "FINISHED")
+            self.assertEqual(app._actions.announced, [], "must never announce a stale finish")
+            self.assertEqual(len(app._actions.pushed), 1)
+            self.assertIn("late detection", app._actions.pushed[0])
+
+    def test_fresh_finish_still_announces_once_zero_pushes(self):
+        """(d) regression guard: a genuine, fresh finish (latency well under the freshness knob,
+        since last_high_energy_at is set moments before the finish, unlike start_time which this
+        test backdates only to satisfy the duration guard) must still announce over Sonos exactly
+        once, never push - the freshness gate must not degrade the ordinary happy path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            app, entities, calls = make_shadow(tmp)
+            app.initialize()
+            self.assertEqual(app.fsm.state.name, "OFF")
+
+            push_power(app, entities, "620")
+            fire_shortest(app)  # start-confirm -> RUNNING
+            self.assertEqual(app.fsm.state.name, "RUNNING")
+
+            entities[ENERGY]["state"] = "10.5"
+            push_power(app, entities, "2")
+            app._policy.start_time = app._policy.start_time - timedelta(minutes=130)
+            fire_shortest(app)  # end-confirm -> FINISHED
+
+            self.assertEqual(app.fsm.state.name, "FINISHED")
+            self.assertEqual(app._actions.announced, ["Dryer is ready to be emptied"])
+            self.assertEqual(app._actions.pushed, [], "a fresh finish must never push")
 
 
 # --- 11.5: shadow-cannot-notify (structural, not merely behavioral) ---
