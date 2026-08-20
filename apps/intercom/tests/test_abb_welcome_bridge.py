@@ -101,8 +101,7 @@ def _bare_bridge(tmpdir, clock):
     app.announce_ring_window_s = 60
     app.clip_cameras = {"front door": "camera.abb_front"}
     app.clip_seconds = 10
-    app.clip_delay_s = 3
-    app.clip_announce_clear_s = 5
+    app.clip_delay_s = 0
     app.clip_record_dir = "/config/www/abb_doorbell"
     app.station_by_door = {"back door": "100000001", "front door": "100000002"}
     app.health_sip_entity = "sensor.abb_sip"
@@ -701,7 +700,7 @@ class RingClipTests(unittest.TestCase):
     def test_ring_schedules_clip_start(self):
         self.app._open_episode("front door", "100000002", self.clock.now())
         scheduled = [(cb.__name__, delay) for cb, delay, _ in self.app.run_in_calls]
-        self.assertIn(("_start_clip", 3), scheduled)
+        self.assertIn(("_start_clip", 0), scheduled)
 
     def test_no_clip_cameras_schedules_nothing(self):
         self.app.clip_cameras = {}
@@ -743,24 +742,54 @@ class RingClipTests(unittest.TestCase):
         _run_scheduled(self.app, "_start_clip")
         self.assertEqual(self._clip_calls(), [])
 
-    def test_fresh_announce_defers_recording_once(self):
+    def test_voices_yield_while_recording(self):
+        # Video outranks the voice (user 2026-08-19): with a recording in flight,
+        # both the auto-open announce and the fallback door voices are skipped.
         episode = self.app._open_episode("front door", "100000002", self.clock.now())
-        self.clock.at += timedelta(seconds=3)
-        # The announce spoke 2 s ago (auto-open unlock at ~+1 s): recording now would
-        # collide station-side (< clip_announce_clear_s), so the start slips 3 s.
-        self.app._last_announce_at["front door"] = self.clock.at - timedelta(seconds=2)
         _run_scheduled(self.app, "_start_clip")
-        self.assertEqual(self._clip_calls(), [])
-        retry = [(cb, delay, kw) for cb, delay, kw in self.app.run_in_calls
-                 if cb.__name__ == "_start_clip"]
-        self.assertEqual(len(retry), 1)
-        self.assertEqual(retry[0][1], 3)
-        self.assertTrue(retry[0][2].get("retried"))
-        # The retried run records even though the announce timestamp is still recent.
-        self.clock.at += timedelta(seconds=3)
+        self.assertIsNotNone(episode["clip_started_at"])
+        n_calls = len(self.app.service_calls)
+        self.app._maybe_announce("front door")
+        self.app._door_voice("front door", "One moment, please.")
+        self.assertEqual(len(self.app.service_calls), n_calls)  # nothing dialed
+        self.assertTrue(any("recording in flight" in m for _, m in self.app.logs))
+
+    def test_voice_allowed_after_recording_window(self):
+        # clip_seconds 10 + 5 margin: 16 s after the dial the slot is free again,
+        # so the no-answer message (fires at +45 s) always gets through.
+        self.app._open_episode("front door", "100000002", self.clock.now())
         _run_scheduled(self.app, "_start_clip")
-        self.assertEqual(len(self._clip_calls()), 2)
+        self.clock.at += timedelta(seconds=16)
+        n_calls = len(self.app.service_calls)
+        self.app._door_voice("front door", "Sorry, no one can answer.")
+        self.assertEqual(len(self.app.service_calls), n_calls + 1)
+
+    def test_refused_dial_retries_once_after_confirm(self):
+        # The station's own ring call can refuse the first dial SILENTLY - the
+        # camera never enters "recording". The confirm check clears the claim and
+        # redials once; a confirmed recording is left alone.
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        _run_scheduled(self.app, "_start_clip")
+        first = len(self._clip_calls())
+        self.assertEqual(first, 2)  # arm + record went out
+        # the fake get_state keys plain-state reads on (entity, None)
+        self.app.states[("camera.abb_front", None)] = "idle"  # refusal: stream never opened
+        self.clock.at += timedelta(seconds=3)
+        _run_scheduled(self.app, "_confirm_clip_recording")
+        self.assertIsNone(episode["clip_filename"])   # claim cleared
+        _run_scheduled(self.app, "_start_clip")       # the redial
+        self.assertEqual(len(self._clip_calls()), 4)
         self.assertIsNotNone(episode["clip_filename"])
+        # confirmed recording: another confirm invocation must change nothing
+        self.app.states[("camera.abb_front", None)] = "recording"
+        self.app._confirm_clip_recording({"episode_id": episode["id"]})
+        self.assertIsNotNone(episode["clip_filename"])
+        self.assertEqual(len(self._clip_calls()), 4)
+        # and a refusal AFTER the one retry stays retried=False-free: redial was
+        # issued with retried=True, which schedules no further confirm
+        confirm_pending = [cb for cb, _, _ in self.app.run_in_calls
+                           if cb.__name__ == "_confirm_clip_recording"]
+        self.assertEqual(confirm_pending, [])
 
     def test_clip_service_failure_is_logged_never_raised(self):
         self.app._open_episode("front door", "100000002", self.clock.now())

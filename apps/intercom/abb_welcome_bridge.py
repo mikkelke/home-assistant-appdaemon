@@ -228,14 +228,15 @@ class AbbWelcomeBridge(hass.Hass):
         raw_clip = self.args.get("clip_cameras", {}) or {}
         self.clip_cameras = {str(k): str(v) for k, v in raw_clip.items()} if isinstance(raw_clip, dict) else {}
         self.clip_seconds = int(self.args.get("clip_seconds", 15))
-        self.clip_delay_s = int(self.args.get("clip_delay_s", 3))
-        # How recently the door may have spoken before a recording dial is allowed
-        # (announce and record refuse each other station-side). Only doors in
-        # announce_after_unlock ever have an announce timestamp, so the back door
-        # records at clip_delay_s flat.
-        self.clip_announce_clear_s = int(self.args.get("clip_announce_clear_s", 5))
-        # archive_dir as HA's own container sees it: the record service writes there,
-        # this app (whose /www is the same directory) stats the result at episode close.
+        # Record AT the ring (user 2026-08-19): the dial goes out immediately for
+        # every clip door, and all voices yield to it (_recording_in_flight). The
+        # station's own ~5 s ring call may refuse the first dial - a refusal is
+        # silent (camera.record succeeds as a command, the stream never opens), so
+        # _confirm_clip_recording checks the camera entered "recording" at +3 s and
+        # redials once. Worst case the clip starts ~+4-5 s; best case ~+1-2
+        # (dial + stream-open is the physical floor - there is no pre-ring buffer).
+        self.clip_delay_s = int(self.args.get("clip_delay_s", 0))
+
         self.clip_record_dir = str(self.args.get("clip_record_dir", "/config/www/abb_doorbell")).rstrip("/")
         self.station_by_door = {v: k for k, v in self.station_doors.items()}
 
@@ -522,6 +523,7 @@ class AbbWelcomeBridge(hass.Hass):
             "scored": False,
             "snapshot": None,  # {"bytes","captured_at","event_id"}
             "clip_filename": None,  # set by _start_clip once a recording was requested
+            "clip_started_at": None,  # when the record dial went out (voices yield until it ends)
             "action_push_sent": False,  # auto-open-off Open/Reject push went out
             "rejected": False,  # a human pressed Reject on that push
             "no_answer_spoken": False,  # the door already got the no-answer message
@@ -532,7 +534,16 @@ class AbbWelcomeBridge(hass.Hass):
             self.run_in(self._pair_check, self.pair_window_s, episode_id=episode_id)
             self.run_in(self._probe_snapshot, self.snapshot_probe_s, episode_id=episode_id)
             self.run_in(self._close_episode, self.episode_close_s, episode_id=episode_id)
-            if self.clip_cameras and self.clip_seconds > 0:
+            if self.clip_seconds > 0 and self.clip_cameras.get(door):
+                # RECORD AT THE RING (user 2026-08-19: "as soon as someone rings we
+                # start the recording - we want to look at who they are no matter
+                # what path we continue in"). Video outranks the voice: while a
+                # recording is in flight the announce/ack are SKIPPED (they share
+                # the station's single call slot, and speaking over a recording
+                # kills its video - probed 2026-08-13). The station may refuse a
+                # record dial while its own ring call is still active, so
+                # _confirm_clip_recording checks the camera actually entered
+                # "recording" and retries once if not.
                 self.run_in(self._start_clip, self.clip_delay_s, episode_id=episode_id)
         except Exception as e:
             self.log(f"Episode timers failed for {episode_id}: {e}", level="WARNING")
@@ -784,6 +795,13 @@ class AbbWelcomeBridge(hass.Hass):
             if not camera:
                 return
             now = self.get_now()
+            # Video first (user 2026-08-19): a recording in flight owns the station's
+            # one call slot - speaking now would fail AND kill the clip's video, so
+            # the sentence is skipped for this ring. The visitor was buzzed in; the
+            # clip of who they are matters more than telling them so.
+            if self._recording_in_flight(door, now):
+                self.log(f"ANNOUNCE skipped for {door} - recording in flight", level="INFO")
+                return
             ring_recent = any(
                 ep.get("door") == door
                 and not ep.get("closed")
@@ -806,15 +824,30 @@ class AbbWelcomeBridge(hass.Hass):
         except Exception as e:
             self.log(f"Announce failed for {door}: {e}", level="WARNING")
 
+    def _recording_in_flight(self, door, now):
+        """True while a ring episode for this door has a recording underway - from the
+        camera.record dial until clip_seconds (+ a teardown margin) have passed. Used
+        to make every voice yield to the video: the station has ONE call slot, and the
+        clip wins it (user 2026-08-19)."""
+        margin = 5
+        for ep in self.episodes.values():
+            if ep.get("door") != door or ep.get("closed"):
+                continue
+            started = ep.get("clip_started_at")
+            if started is not None and (now - started).total_seconds() < self.clip_seconds + margin:
+                return True
+        return False
+
     def _start_clip(self, kwargs):
-        """clip_delay_s after the ring: pull a short mp4 of the visitor via HA's native
-        camera.record (probe-verified 2026-08-13: h264 640x480, needs arm_streaming
-        first). Best-effort by design - the PHOTO is the guaranteed artifact and the
-        clip only ever adds; every failure path is a log line, never a lost photo.
-        Never runs while the announce could still be talking: announce and record
-        refuse each other station-side, so a fresh announcement pushes the recording
-        back once instead of losing both. The reverse race (a manual unlock landing
-        mid-recording) costs only that announce - the door itself still opens."""
+        """Start recording AT the ring (user 2026-08-19: who they are outranks every
+        other path). Pull a short mp4 via HA's native camera.record (probe-verified
+        2026-08-13: h264 640x480, needs arm_streaming first). Best-effort by design -
+        the PHOTO is the guaranteed artifact and the clip only ever adds; every
+        failure path is a log line, never a lost photo. Voices no longer precede the
+        recording - they YIELD to it (_recording_in_flight) - so the old
+        announce-clearance defer is gone. The station may refuse the record dial
+        while its own ring call is still up: _confirm_clip_recording re-checks the
+        camera actually entered "recording" and retries once."""
         episode = self.episodes.get(kwargs.get("episode_id"))
         if episode is None or episode["closed"] or episode.get("clip_filename"):
             return
@@ -822,11 +855,6 @@ class AbbWelcomeBridge(hass.Hass):
             door = episode["door"]
             camera = self.clip_cameras.get(door)
             if not camera:
-                return
-            last_spoken = self._last_announce_at.get(door)
-            if (last_spoken is not None and not kwargs.get("retried")
-                    and (self.get_now() - last_spoken).total_seconds() < self.clip_announce_clear_s):
-                self.run_in(self._start_clip, 3, episode_id=episode["id"], retried=True)
                 return
             stamp = episode["started_at"].astimezone().strftime("%Y%m%d_%H%M%S")
             filename = f"abb_clip_{stamp}_{door_slug(door, episode['station_id'])}.mp4"
@@ -845,10 +873,41 @@ class AbbWelcomeBridge(hass.Hass):
                 lookback=0,
             )
             episode["clip_filename"] = filename
+            episode["clip_started_at"] = self.get_now()
             self._self_call_until[door] = self.get_now() + timedelta(seconds=self.clip_seconds + 20)
-            self.log(f"CLIP-START door={door} file={filename} ({self.clip_seconds}s)")
+            self.log(f"CLIP-START door={door} file={filename} ({self.clip_seconds}s)"
+                     + ("  [retry]" if kwargs.get("retried") else ""))
+            if not kwargs.get("retried"):
+                self.run_in(self._confirm_clip_recording, 3, episode_id=episode["id"])
         except Exception as e:
             self.log(f"Clip start failed for {episode.get('id')}: {e}", level="WARNING")
+
+    def _confirm_clip_recording(self, kwargs):
+        """3 s after the record dial: is the camera actually recording? At-the-ring
+        starts race the station's own ring call for its single call slot, and a
+        refused dial fails SILENTLY (camera.record succeeds as a command; the stream
+        just never opens). The camera entity flips to "recording" when the stream is
+        real - if it has not, clear the claim and dial once more, now that the ring
+        call has had time to clear. One retry only: a second refusal means the
+        station is genuinely busy (someone answered the call) and the photo carries
+        the episode."""
+        episode = self.episodes.get(kwargs.get("episode_id"))
+        if episode is None or episode["closed"] or not episode.get("clip_filename"):
+            return
+        try:
+            camera = self.clip_cameras.get(episode["door"])
+            if not camera:
+                return
+            state = self.get_state(camera)
+            if state == "recording":
+                return
+            self.log(f"CLIP-RETRY door={episode['door']} - camera state {state!r} 3 s "
+                     f"after the dial (station busy with its own ring call?)", level="INFO")
+            episode["clip_filename"] = None
+            episode["clip_started_at"] = None
+            self.run_in(self._start_clip, 1, episode_id=episode["id"], retried=True)
+        except Exception as e:
+            self.log(f"Clip confirm failed for {episode.get('id')}: {e}", level="WARNING")
 
     # ------------------------------------------------------------------
     # Auto-open-OFF ring fallback: Open/Reject push + door voices
@@ -935,13 +994,17 @@ class AbbWelcomeBridge(hass.Hass):
 
     def _door_voice(self, door, message, allow_retry=True):
         """Speak at a door's station, best-effort. Sets the self-call window (the
-        portal logs our dial as call-answered) and the announce timestamp (so a
-        pending clip start defers instead of colliding). One retry, because a live
-        clip recording or the still-ringing call can hold the station."""
+        portal logs our dial as call-answered). One retry, because the still-ringing
+        call can hold the station. Yields entirely to a live recording (user
+        2026-08-19: video outranks every voice) - speaking over one kills its video.
+        The no-answer message at +45 s lands after the clip ends, so it still works."""
         camera = self.announce_cameras.get(door)
         if not camera or not message:
             return
         now = self.get_now()
+        if self._recording_in_flight(door, now):
+            self.log(f"DOOR-VOICE skipped for {door} - recording in flight", level="INFO")
+            return
         self._last_announce_at[door] = now
         self._self_call_until[door] = now + timedelta(seconds=20)
         try:

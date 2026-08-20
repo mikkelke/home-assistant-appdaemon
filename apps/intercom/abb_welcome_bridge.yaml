@@ -73,36 +73,24 @@ AbbWelcomeBridge:
   announce_cooldown_s: 90
   announce_ring_window_s: 60
 
-  # --- ring video clips (2026-08-13, "thumbnail and opening that give the video") ---
-  # HA's native camera.record against the integration, probe-verified: h264 640x480,
-  # ~450 KB per 10 s, needs arm_streaming first. Announce and record are mutually
-  # exclusive per station (probed live: announce mid-record fails AND kills the
-  # clip's video), so recording waits for a fresh announce to clear
-  # (clip_announce_clear_s) and retries once shortly after.
+  # --- ring video clips ---
+  # RECORD AT THE RING (user 2026-08-19: "as soon as someone rings we start the
+  # recording - we want to look at who they are no matter what path we continue
+  # in"). The dial goes out the moment the episode opens, for BOTH doors, and
+  # every voice (announce, ring-ack, reject) YIELDS while a recording is in
+  # flight - the station has one call slot and speaking over a recording kills
+  # its video (probed 2026-08-13). The no-answer message at +45 s is unaffected.
   #
-  # TIMING PHYSICS (user 2026-08-19: "the video is not from the ring, it's after -
-  # often no person"): the station only streams WHILE DIALED, so there is no
-  # pre-ring buffer for camera.record's lookback to reach into - video from before
-  # the recording call CANNOT exist. With auto-open buzzing people in at ~+2 s,
-  # a clip starting later often shows an empty doorway; the RING-MOMENT artifact
-  # is the gateway SNAPSHOT (captured by the station at the ring itself), which
-  # the gallery now shows first. Mitigation here: start the dial as early as the
-  # announce allows (delay 8 s -> 3; back door has no announce, so it records
-  # from ~+3 s) and record longer (10 s -> 15) to catch late arrivals/leavers.
-  #
-  # BACK DOOR ENABLED (user 2026-08-19: "the backdoor does not save video").
-  # Residual unknown carried over from the announce work: dialing the station
-  # MIGHT make the back unit beep/speak on its own - never verified. If anyone
-  # reports the back door making sounds ~3 s after a ring, remove it here.
-  # A manual unlock landing mid-recording loses only the announce (integration
-  # refuses it, WARNING in the log) - the door still opens. Clips prune with
-  # their photos (retain_days/max_files).
+  # The station's own ~5 s ring call can silently refuse the first record dial,
+  # so the bridge confirms the camera actually entered "recording" at +3 s and
+  # redials once. Physical floor: dial + stream-open ~1-2 s; nothing before the
+  # dial can ever be on video - the RING-MOMENT artifact is the gateway snapshot,
+  # which the gallery pairs with the clip.
   clip_cameras:
     front door: camera.abb_welcome_gateway_outdoor_station_2_1
     back door: camera.abb_welcome_gateway_outdoor_station_1_1
   clip_seconds: 15
-  clip_delay_s: 3
-  clip_announce_clear_s: 5   # a front announce younger than this defers the dial once (+3 s)
+  clip_delay_s: 0
   clip_record_dir: "/config/www/abb_doorbell"  # archive_dir as HA's container sees it
 
   # --- auto-open-OFF ring fallback (2026-08-13, Mikkel: "The notification if auto
