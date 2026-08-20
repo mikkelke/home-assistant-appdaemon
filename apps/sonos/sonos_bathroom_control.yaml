@@ -17,7 +17,7 @@ sonos_bathroom_control:
 
   bath_presence_sensor: "binary_sensor.bathroom_bath_presence_presence"
   bath_presence_volume_boost: 0.1 # Volume change on bath presence
-  presence_on_max_volume: 0.35
+  presence_on_max_volume: 0.45
   # plugin: HASS # AppDaemon usually infers this, but uncomment if your setup requires explicit plugin declaration for HASS
 
   entity_friendly_name_map:
