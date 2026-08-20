@@ -228,6 +228,13 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         # already have emptied it unseen; re-announcing a stale cycle beats nothing, but a
         # false Unemptied card does not).
         self.restore_conclude_grace_minutes = int(self.args.get("restore_conclude_grace_minutes", 15))
+        # Boot self-heal announce staleness (2026-08-20): a restored-Running cycle that the
+        # boot self-heal concludes as finished is a boot-time HYPOTHESIS, not a live edge. When
+        # the machine's estimated end (last high-power + dry tail - never raw 0W idleness) is
+        # older than this, a full Sonos blast about a load done long ago is downgraded to a
+        # quiet mobile push; a door-open edge since that end (emptied during the outage)
+        # suppresses it entirely. See _finish_with_dry_tail's boot_self_heal branch.
+        self.announce_freshness_minutes = float(self.args.get("announce_freshness_minutes", 20))
 
         # Start candidate: HA stays Off/Unemptied until power evidence proves a real start (blocks plug blips / door-arm single-sample false starts).
         self.start_candidate_window_s = int(
@@ -714,6 +721,11 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
                                 self.log(f"Self-heal: Running with 0W for {run_min:.0f}min - confirming finish", level="INFO")
                                 run_minutes, duration_source = self._correct_duration(run_min)
                                 idle_min = run_min - run_minutes if duration_source and run_min > run_minutes else None
+                                # boot_self_heal=True routes the immediate-finish branch through the
+                                # 3-way announce gate (door-edge / late-push / fresh). A restored
+                                # Running cycle emptied during the outage must not Sonos-blast an
+                                # already-empty machine; the dry-tail DEFERRAL branch (machine still
+                                # drying) is unaffected and still announces at the real end.
                                 self._finish_with_dry_tail(
                                     classified=classified,
                                     display_prog=display_prog,
@@ -723,6 +735,7 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
                                     idle_min=idle_min,
                                     energy_used=energy_used,
                                     end_reason="low_power_detected",
+                                    boot_self_heal=True,
                                 )
             except Exception as e:
                 self.log(f"Self-heal check failed: {e}", level="DEBUG")
@@ -1045,6 +1058,54 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             anchor = self._last_high_power_time
         return anchor + timedelta(minutes=tail_min)
 
+    def _boot_finish_end_estimate(self, guard_dur, target):
+        """The machine's own programme end for a boot-self-heal finish, feeding the announce
+        staleness gate. When the programme has a measured dry tail the deferral logic has
+        already handed us its target (max(guard-open, last high-power) + tail); reuse it. For a
+        zero-tail programme (target is None) the end is that same anchor with no tail - the last
+        high-power activity, or guard-open - NEVER the raw 0W idle stretch after it (0W is not a
+        finish for this machine). Falls back to now when no clock is recoverable, so the gate
+        fails toward 'fresh' (announcing), never toward silence."""
+        if target is not None:
+            return target
+        anchor = None
+        if self.start_time:
+            anchor = self.start_time + timedelta(minutes=float(guard_dur) * self.finish_guard_fraction)
+        if self._last_high_power_time and (anchor is None or self._last_high_power_time > anchor):
+            anchor = self._last_high_power_time
+        return anchor or self._now_utc()
+
+    def _door_open_edge_since(self, since_dt) -> bool:
+        """True if the recorder shows the door open at any moment strictly after since_dt.
+
+        Boot self-heal support (see _finish_with_dry_tail): the recorder, not get_state, is the
+        arbiter - a live read only shows the CURRENT contact position, not whether the door was
+        opened and closed again (emptied) somewhere in the downtime window. Standard dishwasher
+        door contact (binary_sensor.dishwasher_door_contact, see dishwasher.yaml): 'on'/'open' =
+        door open; this contact has only ever been wired one way, so there is no inversion knob.
+        Entries with a missing/unknown/unavailable state are skipped; any history failure
+        (including since_dt itself missing) returns False, never raises - a broken recorder must
+        fail OPEN to the normal announcement, never SUPPRESS it by accident."""
+        if not self.door_sensor or since_dt is None:
+            return False
+        try:
+            hist = self.get_history(
+                entity_id=self.door_sensor, start_time=since_dt, end_time=self._now_utc(),
+            )
+            for entry in self._flatten_history(hist, self.door_sensor):
+                state = entry.get("state")
+                if state in (None, "unknown", "unavailable"):
+                    continue
+                t = _parse_utc(entry.get("last_changed") or entry.get("last_updated"))
+                if t is None or t <= since_dt:
+                    continue
+                if state in ("on", "open"):
+                    return True
+            return False
+        except Exception as e:
+            self.log(f"Door-open history check failed: {e}", level="DEBUG")
+            return False
+
     def _finish_with_dry_tail(
         self,
         *,
@@ -1056,9 +1117,15 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         idle_min,
         energy_used,
         end_reason,
+        boot_self_heal=False,
     ):
         """Finish conditions (guards + energy idle) are met: either transition now (no tail /
         tail already elapsed) or defer Unemptied + announcement to the machine's own end.
+
+        boot_self_heal: when True the caller is the init-time self-heal (a restored Running
+        cycle found already finished), so the IMMEDIATE-transition branch runs the 3-way
+        announce gate (see below) before announcing. The DEFERRED branch (machine still drying)
+        is identical either way - it announces at the real end, never from a boot hypothesis.
 
         run_minutes / duration_source / energy_used were computed by the caller at guard
         time and are stashed as-is: the feedback record and the learned-duration series must
@@ -1070,7 +1137,39 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         if target is None or target <= now:
             # Zero-tail programme (unchanged behaviour), or the tail already elapsed at
             # guard time (late evaluation, e.g. restart after the machine's own end).
-            self._transition_to_unemptied(skip_announce=False, run_minutes=run_minutes, energy_used=energy_used)
+            #
+            # FIX (2026-08-20): from the boot self-heal this immediate branch used to always
+            # fire the full Sonos announcement (skip_announce=False), gated only by
+            # notification_sent restored from the store - which is False precisely when the
+            # machine finished AND was emptied during an outage that also outlasted the last
+            # store write, so an already-empty dishwasher would still blast "ready to empty" at
+            # boot, possibly hours late. Estimate the machine's REAL end (last high-power + this
+            # programme's dry tail - never raw 0W idleness, per the house rule that 0W is not a
+            # finish for this machine), check for a door-open edge since then (emptied during
+            # the outage -> converge silently to Emptied), else gate on staleness (past
+            # announce_freshness_minutes -> quiet mobile push instead of a Sonos blast; within
+            # it -> announce exactly as before). Any history failure fails OPEN (door_edge False)
+            # to announcing, never to silence. Live callers (boot_self_heal=False) are unchanged.
+            if boot_self_heal:
+                end_estimate = self._boot_finish_end_estimate(guard_dur, target)
+                door_edge = self._door_open_edge_since(end_estimate)
+                latency_min = (now - end_estimate).total_seconds() / 60
+                if door_edge:
+                    gate, skip_announce = "door-edge", True
+                elif latency_min > self.announce_freshness_minutes:
+                    gate, skip_announce = "late-push", True
+                else:
+                    gate, skip_announce = "fresh-announce", False
+                self.log(
+                    f"Boot self-heal announce gate: {gate} (end_estimate="
+                    f"{self._format_utc(end_estimate)}, door_edge={door_edge}, "
+                    f"latency={latency_min:.0f}min, freshness_threshold="
+                    f"{self.announce_freshness_minutes:.0f}min)",
+                    level="INFO",
+                )
+            else:
+                gate, skip_announce = None, False
+            self._transition_to_unemptied(skip_announce=skip_announce, run_minutes=run_minutes, energy_used=energy_used)
             if self.get_state(self.state_entity) != "Unemptied":
                 # Cooling period (or similar) refused the transition; the 60s poll retries
                 # the whole finish evaluation - do not save feedback for a state that never
@@ -1089,6 +1188,15 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
                 end_reason=end_reason,
                 idle_min=idle_min,
             )
+            if gate == "door-edge":
+                # Already emptied during the outage - move straight to Emptied (no reminder).
+                self._transition_to_emptied("Door opened during the outage - already emptied")
+            elif gate == "late-push":
+                self._push_mobile(
+                    f"Dishwasher finished about {latency_min:.0f} min ago (late detection) - "
+                    f"ready to empty."
+                )
+                self.notification_sent = True
             return
         self._dry_tail_pending = {
             "target": target,

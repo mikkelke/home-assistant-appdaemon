@@ -138,6 +138,13 @@ dishwasher_monitor:
   # Resume only while the finish decision could still be pending (guards + dry tail + this
   # grace); past that the cycle is treated as concluded - someone may have emptied it unseen.
   restore_conclude_grace_minutes: 15
+  # Boot self-heal announce staleness (2026-08-20): when the boot self-heal concludes a
+  # restored-Running cycle as finished, the machine's estimated end is last high-power + dry
+  # tail (never raw 0W idleness). If that end is older than this many minutes, a full Sonos
+  # blast about a load done long ago is downgraded to a quiet mobile push; a door-open edge
+  # since that end (emptied during the outage) suppresses the reminder entirely. The DEFERRED
+  # dry-tail path (machine still drying) is unaffected - it announces at the real end.
+  announce_freshness_minutes: 20
   # Per-programme dry_tail_minutes lives in dishwasher_programmes.yaml (eco: 35). When the
   # finish guards + energy idle are met, Unemptied and its Sonos/push announcement wait
   # until guard-open + dry_tail, so "finished" means the MACHINE is finished. Door opens
