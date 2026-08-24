@@ -897,12 +897,21 @@ class AbbWelcomeBridge(hass.Hass):
         """True while a ring episode for this door has a recording underway - from the
         camera.record dial until clip_seconds (+ a teardown margin) have passed. Used
         to make every voice yield to the video: the station has ONE call slot, and the
-        clip wins it (user 2026-08-19)."""
+        clip wins it (user 2026-08-19).
+
+        native_ring_clips: the integration answers and records the ring call from
+        ~ring+0.3 s, and may hold a continuation dial after it - but this bridge only
+        learns of any of that when the finished mp4's event lands, so clip_started_at
+        is still None while the recording is actually live. Count the window as busy
+        from the RING itself then, or _door_voice's ack at +2 s would dial a second
+        call straight into the recorder's."""
         margin = 5
         for ep in self.episodes.values():
             if ep.get("door") != door or ep.get("closed"):
                 continue
             started = ep.get("clip_started_at")
+            if started is None and self.native_ring_clips and self.clip_cameras.get(door):
+                started = ep.get("started_at")
             if started is not None and (now - started).total_seconds() < self.clip_seconds + margin:
                 return True
         return False
