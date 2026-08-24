@@ -233,16 +233,27 @@ class AbbWelcomeBridge(hass.Hass):
         self.clip_cameras = {str(k): str(v) for k, v in raw_clip.items()} if isinstance(raw_clip, dict) else {}
         self.clip_seconds = int(self.args.get("clip_seconds", 15))
         # Record AT the ring (user 2026-08-19): the dial goes out immediately for
-        # every clip door, and all voices yield to it (_recording_in_flight). The
-        # station's own ~5 s ring call may refuse the first dial - a refusal is
-        # silent (camera.record succeeds as a command, the stream never opens), so
-        # _confirm_clip_recording checks the camera entered "recording" at +3 s and
-        # redials once. Worst case the clip starts ~+4-5 s; best case ~+1-2
-        # (dial + stream-open is the physical floor - there is no pre-ring buffer).
+        # every clip door (native_ring_clips=false only - see _open_episode), and
+        # all voices yield to it (_recording_in_flight). The station's own ~5 s
+        # ring call may refuse the first dial - a refusal is silent (camera.record
+        # succeeds as a command, the stream never opens), so _confirm_clip_recording
+        # checks the camera entered "recording" at +10 s (anchored to the dial, not
+        # to the now-offloaded call returning - see _start_clip) and redials once.
+        # Worst case the clip starts ~+11-12 s; best case ~+1-2 (dial + stream-open
+        # is the physical floor - there is no pre-ring buffer).
         self.clip_delay_s = int(self.args.get("clip_delay_s", 0))
 
         self.clip_record_dir = str(self.args.get("clip_record_dir", "/config/www/abb_doorbell")).rstrip("/")
         self.station_by_door = {v: k for k, v in self.station_doors.items()}
+
+        # Native ring-clip recorder (2026-08-24, integration-side change landing
+        # alongside this one - see abb_welcome_ring_clip below). true = the
+        # integration itself records the ring call and fires that event once the
+        # mp4 lands; _start_clip is never scheduled and every native-only branch
+        # below activates instead. false (the default when this key is absent, so
+        # a code deploy that lands ahead of the integration change is a no-op) =
+        # the app behaves EXACTLY as it does today.
+        self.native_ring_clips = bool(self.args.get("native_ring_clips", False))
 
         # --- integration health watchdog (2026-08-13, found live during the feature
         # audit: stream workers leaked by failed camera.record attempts retried 404s
@@ -332,6 +343,14 @@ class AbbWelcomeBridge(hass.Hass):
             self.listen_event(self._on_abb_bus_ring, self.abb_ring_bus_event)
         except Exception as e:
             self.log(f"ABB bus-ring listener failed: {e}", level="WARNING")
+        try:
+            # Fired by the integration's native ring-clip recorder once its mp4 is
+            # finalized (native_ring_clips knob; see _on_native_ring_clip). Always
+            # registered - the handler itself no-ops when the knob is off, so a
+            # stray event before the flag flips can never touch episode state.
+            self.listen_event(self._on_native_ring_clip, "abb_welcome_ring_clip")
+        except Exception as e:
+            self.log(f"Native ring-clip listener failed: {e}", level="WARNING")
         try:
             # Backup intake only: the bus event and this sensor share one SIP
             # trigger, so _register_ring's per-side fold absorbs the duplicate.
@@ -526,8 +545,10 @@ class AbbWelcomeBridge(hass.Hass):
             "push_sent": False,
             "scored": False,
             "snapshot": None,  # {"bytes","captured_at","event_id"}
-            "clip_filename": None,  # set by _start_clip once a recording was requested
+            "clip_filename": None,  # set by _start_clip (or _on_native_ring_clip) once a clip exists
             "clip_started_at": None,  # when the record dial went out (voices yield until it ends)
+            "voice_spoken": False,  # one "the door is open" sentence per episode (native + legacy dedup)
+            "voice_dispatched": False,  # a native voice retry chain already started (2nd unlock confirm must not start another)
             "action_push_sent": False,  # auto-open-off Open/Reject push went out
             "rejected": False,  # a human pressed Reject on that push
             "no_answer_spoken": False,  # the door already got the no-answer message
@@ -538,7 +559,16 @@ class AbbWelcomeBridge(hass.Hass):
             self.run_in(self._pair_check, self.pair_window_s, episode_id=episode_id)
             self.run_in(self._probe_snapshot, self.snapshot_probe_s, episode_id=episode_id)
             self.run_in(self._close_episode, self.episode_close_s, episode_id=episode_id)
-            if self.clip_seconds > 0 and self.clip_cameras.get(door):
+            if self.native_ring_clips and self.clip_cameras.get(door):
+                # The integration's own recorder handles the ring clip end-to-end
+                # (see _on_native_ring_clip) - this bridge places no dial of its
+                # own. It DOES place a continuation dial ~2.5 s after the ring call
+                # ends (to film the visitor entering), which the ABB portal logs as
+                # call-answered; open the self-call window NOW, at the ring, since
+                # (unlike the fallback below) there is no later dial of ours to
+                # anchor it to.
+                self._self_call_until[door] = at + timedelta(seconds=45)
+            elif self.clip_seconds > 0 and self.clip_cameras.get(door):
                 # RECORD AT THE RING (user 2026-08-19: "as soon as someone rings we
                 # start the recording - we want to look at who they are no matter
                 # what path we continue in"). Video outranks the voice: while a
@@ -793,12 +823,32 @@ class AbbWelcomeBridge(hass.Hass):
         announce_ring_window_s (a dashboard unlock with nobody outside must not talk to
         the street); and the per-door cooldown has passed (the ESP fires unlocking AND
         unlocked edges seconds apart - one visitor, one sentence). Failure costs the
-        sentence, never the unlock: this runs strictly after the lock command."""
+        sentence, never the unlock: this runs strictly after the lock command.
+
+        native_ring_clips=true takes a wholly different branch below: it never places
+        the temporary-call dial (announce OR the in-recording play_audio single-shot) -
+        see _native_voice_retry."""
         try:
             camera = self.announce_cameras.get(door)
             if not camera:
                 return
             now = self.get_now()
+            if self.native_ring_clips:
+                # The integration's own recorder owns the station's one call slot
+                # from the ring call through its continuation dial - a second dial
+                # here (the temporary-call announce) would collide with either, so
+                # it is never placed while a ring for this door is still open.
+                # Instead play_audio is retried into whichever of those two calls
+                # happens to be open (_native_voice_retry). voice_spoken/
+                # voice_dispatched (set on the episode) keep this to one spoken
+                # sentence even though two unlock attempts can both confirm and
+                # call this method for the same ring.
+                episode = self._latest_open_episode(door, now, self.announce_ring_window_s)
+                if episode is None:
+                    return
+                self.run_in(self._native_voice_retry, 0, episode_id=episode["id"], door=door,
+                            camera=camera, message=self.announce_message, attempt=1)
+                return
             # Video first (user 2026-08-19): a recording in flight owns the station's
             # one call slot - speaking now would fail AND kill the clip's video, so
             # the sentence is skipped for this ring. The visitor was buzzed in; the
@@ -810,8 +860,15 @@ class AbbWelcomeBridge(hass.Hass):
                 # 2026-08-20: "so we cannot run and send a message voice/sound?" - we
                 # can, this way). Best-effort: any failure is a log line and the ring
                 # keeps its video; never fall back to the temporary-call announce here,
-                # THAT is the collision that kills the clip.
-                self._voice_into_recording(door, camera, self.announce_message)
+                # THAT is the collision that kills the clip. voice_spoken caps it at
+                # one sentence per episode - two unlock attempts can both confirm and
+                # land here (2026-08-24: that used to double-fire, since this branch
+                # alone skipped the cooldown check below).
+                episode = self._latest_open_episode(door, now)
+                if episode is not None and episode.get("voice_spoken"):
+                    return
+                if self._voice_into_recording(door, camera, self.announce_message) and episode is not None:
+                    episode["voice_spoken"] = True
                 self._last_announce_at[door] = now
                 return
             ring_recent = any(
@@ -856,9 +913,11 @@ class AbbWelcomeBridge(hass.Hass):
         resolves it to PCM and writes it into the already-open stream, so no second
         SIP call exists and the clip's video survives. Failure costs the sentence
         only - logged, never raised, and never retried with the temporary-call
-        announce (that second call is what kills the video)."""
+        announce (that second call is what kills the video). Returns True/False
+        (2026-08-24: the native retry path needs to know whether to try again -
+        see _native_voice_retry)."""
         if not self.voice_tts_entity:
-            return
+            return False
         try:
             from urllib.parse import quote
             media_id = f"media-source://tts/{self.voice_tts_entity}?message={quote(message)}"
@@ -868,19 +927,34 @@ class AbbWelcomeBridge(hass.Hass):
                 media={"media_content_id": media_id},
             )
             self.log(f"VOICE-IN-RECORDING door={door} message={message!r}", level="INFO")
+            return True
         except Exception as e:
             self.log(f"Voice-into-recording failed for {door} ({message!r}): {e}", level="INFO")
+            return False
 
     def _start_clip(self, kwargs):
-        """Start recording AT the ring (user 2026-08-19: who they are outranks every
-        other path). Pull a short mp4 via HA's native camera.record (probe-verified
-        2026-08-13: h264 640x480, needs arm_streaming first). Best-effort by design -
-        the PHOTO is the guaranteed artifact and the clip only ever adds; every
-        failure path is a log line, never a lost photo. Voices no longer precede the
-        recording - they YIELD to it (_recording_in_flight) - so the old
-        announce-clearance defer is gone. The station may refuse the record dial
-        while its own ring call is still up: _confirm_clip_recording re-checks the
-        camera actually entered "recording" and retries once."""
+        """FALLBACK PATH ONLY (native_ring_clips=false - see _open_episode, which
+        never schedules this at all when the integration's own recorder is doing
+        the job). Start recording AT the ring (user 2026-08-19: who they are
+        outranks every other path). Pull a short mp4 via HA's native camera.record
+        (probe-verified 2026-08-13: h264 640x480, needs arm_streaming first).
+        Best-effort by design - the PHOTO is the guaranteed artifact and the clip
+        only ever adds; every failure path is a log line, never a lost photo.
+        Voices no longer precede the recording - they YIELD to it
+        (_recording_in_flight) - so the old announce-clearance defer is gone. The
+        station may refuse the record dial while its own ring call is still up:
+        _confirm_clip_recording re-checks the camera actually entered "recording"
+        and retries once.
+
+        The arm_streaming + camera.record pair is offloaded to the executor
+        (2026-08-24, measured live: camera/record is a BLOCKING call_service that
+        returns only when the recording itself finishes or fails, ~23-29 s -
+        every other ring callback on this pinned thread queued up behind it, and
+        _confirm_clip_recording never got a fair look at the camera until the dial
+        was long over). Episode/self-call bookkeeping is claimed BEFORE the dial
+        goes out - that state stays pinned-thread-owned - and _confirm_clip_recording
+        is scheduled right here too, anchored to the DIAL, not to whenever the
+        (now backgrounded) calls happen to return."""
         episode = self.episodes.get(kwargs.get("episode_id"))
         if episode is None or episode["closed"] or episode.get("clip_filename"):
             return
@@ -897,7 +971,26 @@ class AbbWelcomeBridge(hass.Hass):
                 # Restrict the armed window to this station so a HomeKit/Scrypted
                 # probe cannot ride it into a call at the other door (schema warning).
                 arm["station_id"] = station
-            self.call_service("abb_welcome/arm_streaming", **arm)
+            episode["clip_filename"] = filename
+            episode["clip_started_at"] = self.get_now()
+            self._self_call_until[door] = self.get_now() + timedelta(seconds=self.clip_seconds + 20)
+            self.log(f"CLIP-START door={door} file={filename} ({self.clip_seconds}s) {self._ring_rel(episode)}"
+                     + ("  [retry]" if kwargs.get("retried") else ""))
+            self.submit_to_executor(self._dial_clip, arm, camera, filename)
+            if not kwargs.get("retried"):
+                self.run_in(self._confirm_clip_recording, 10, episode_id=episode["id"])
+        except Exception as e:
+            self.log(f"Clip start failed for {episode.get('id')}: {e} {self._ring_rel(episode)}", level="WARNING")
+
+    def _dial_clip(self, arm_kwargs, camera, filename):
+        """Executor-thread body of the fallback record dial: arm_streaming then
+        camera.record, in that order, exactly as _start_clip always did - just off
+        the pinned thread now (see its comment: camera.record blocks ~23-29 s).
+        Self-logs any failure, the same pattern intercom.py's sonos_notifier.notify()
+        offload uses - once submitted, this runs detached from _start_clip's own
+        try/except, so nothing else would ever see or log an exception raised here."""
+        try:
+            self.call_service("abb_welcome/arm_streaming", **arm_kwargs)
             self.call_service(
                 "camera/record",
                 entity_id=camera,
@@ -905,25 +998,20 @@ class AbbWelcomeBridge(hass.Hass):
                 duration=self.clip_seconds,
                 lookback=0,
             )
-            episode["clip_filename"] = filename
-            episode["clip_started_at"] = self.get_now()
-            self._self_call_until[door] = self.get_now() + timedelta(seconds=self.clip_seconds + 20)
-            self.log(f"CLIP-START door={door} file={filename} ({self.clip_seconds}s)"
-                     + ("  [retry]" if kwargs.get("retried") else ""))
-            if not kwargs.get("retried"):
-                self.run_in(self._confirm_clip_recording, 3, episode_id=episode["id"])
         except Exception as e:
-            self.log(f"Clip start failed for {episode.get('id')}: {e}", level="WARNING")
+            self.log(f"Clip dial failed for {filename}: {e}", level="WARNING")
 
     def _confirm_clip_recording(self, kwargs):
-        """3 s after the record dial: is the camera actually recording? At-the-ring
-        starts race the station's own ring call for its single call slot, and a
-        refused dial fails SILENTLY (camera.record succeeds as a command; the stream
-        just never opens). The camera entity flips to "recording" when the stream is
-        real - if it has not, clear the claim and dial once more, now that the ring
-        call has had time to clear. One retry only: a second refusal means the
-        station is genuinely busy (someone answered the call) and the photo carries
-        the episode."""
+        """10 s after the record dial went out (anchored to the dial itself, not to
+        when the now-offloaded arm+record calls return - see _start_clip): is the
+        camera actually recording? At-the-ring starts race the station's own ring
+        call for its single call slot, and a refused dial fails SILENTLY
+        (camera.record succeeds as a command; the stream just never opens). The
+        camera entity flips to "recording" when the stream is real - if it has
+        not, clear the claim and dial once more, now that the ring call has had
+        time to clear. One retry only: a second refusal means the station is
+        genuinely busy (someone answered the call) and the photo carries the
+        episode."""
         episode = self.episodes.get(kwargs.get("episode_id"))
         if episode is None or episode["closed"] or not episode.get("clip_filename"):
             return
@@ -934,13 +1022,133 @@ class AbbWelcomeBridge(hass.Hass):
             state = self.get_state(camera)
             if state == "recording":
                 return
-            self.log(f"CLIP-RETRY door={episode['door']} - camera state {state!r} 3 s "
-                     f"after the dial (station busy with its own ring call?)", level="INFO")
+            self.log(f"CLIP-RETRY door={episode['door']} - camera state {state!r} 10 s "
+                     f"after the dial (station busy with its own ring call?) {self._ring_rel(episode)}",
+                     level="INFO")
             episode["clip_filename"] = None
             episode["clip_started_at"] = None
             self.run_in(self._start_clip, 1, episode_id=episode["id"], retried=True)
         except Exception as e:
-            self.log(f"Clip confirm failed for {episode.get('id')}: {e}", level="WARNING")
+            self.log(f"Clip confirm failed for {episode.get('id')}: {e} {self._ring_rel(episode)}", level="WARNING")
+
+    def _ring_rel(self, episode, at=None):
+        """`+X.Xs` since episode["started_at"] (the ring) - cheap ring-relative
+        timing for clip-path log lines, since those are exactly what raced the
+        blocked-thread bug this whole file of comments is about."""
+        try:
+            return f"+{((at or self.get_now()) - episode['started_at']).total_seconds():.1f}s"
+        except Exception:
+            return "+?s"
+
+    def _latest_open_episode(self, door, now=None, window_s=None):
+        """Most recently opened, still-OPEN episode for a door - optionally bounded
+        to the last window_s of now. Used both by the native ring-clip event
+        (any open episode; the mp4 can land up to ~40 s after the ring) and by
+        the native voice gate (bounded to announce_ring_window_s, same as the
+        legacy ring_recent check it replaces)."""
+        candidates = [ep for ep in self.episodes.values()
+                      if ep.get("door") == door and not ep.get("closed")]
+        if window_s is not None:
+            now = now or self.get_now()
+            candidates = [ep for ep in candidates
+                          if (now - ep["started_at"]).total_seconds() <= window_s]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda e: e["started_at"])
+
+    def _on_native_ring_clip(self, event_name, data, kwargs):
+        """native_ring_clips=true: the integration's own ring-clip recorder fires
+        this once per ring, after its mp4 is finalized - anywhere from ~10 to
+        ~40 s after the ring, always before the episode closes (episode_close_s
+        defaults to 75 s). Attaches straight onto the matching open episode; the
+        existing episode-close/ARCHIVE code (_close_episode/_archive_write) needs
+        nothing more than clip_filename set - it already just stats
+        self.archive_dir/clip_filename, and that is the SAME directory the
+        integration writes to (clip_record_dir/archive_dir are two container
+        mount aliases for one host path, exactly as they already are for the
+        fallback dial's own file)."""
+        try:
+            if not self.native_ring_clips:
+                return  # defense in depth: a stray event must never touch state when off
+            data = data or {}
+            if data.get("reason") != "ring":
+                return  # a "service" clip (manual arm/record) is not a ring artifact
+            station_id = str(data.get("station_id", "") or "")
+            door = self.station_doors.get(station_id)
+            episode = self._latest_open_episode(door) if door else None
+            ok = bool(data.get("ok"))
+            if episode is None or not ok:
+                self.log(
+                    f"CLIP-NATIVE dropped station={station_id or '?'} door={door or '?'} "
+                    f"ok={ok} episode={'none' if episode is None else episode['id']}", level="INFO",
+                )
+                return
+            filename = data.get("filename") or ""
+            started_at = parse_iso_ts(data.get("started_at")) or episode["started_at"]
+            episode["clip_filename"] = filename
+            episode["clip_started_at"] = started_at
+            self.log(
+                f"CLIP-NATIVE door={door} file={filename} duration={data.get('duration_s')}s "
+                f"frames={data.get('frames')} segments={data.get('segments')} {self._ring_rel(episode)}",
+                level="INFO",
+            )
+        except Exception as e:
+            self.log(f"Native ring-clip handling failed: {e}", level="WARNING")
+
+    def _native_voice_retry(self, kwargs):
+        """native_ring_clips=true voice path: retry play_audio into whichever call
+        happens to be open, since this bridge places no dial of its own anymore.
+        play_audio only works while a station call with talkback is open; the
+        ring call's own media ends ~+3 s after the ring and the integration's
+        continuation dial has no media until ~+8 s, so most attempts in between
+        fail harmlessly. Attempt 1 is scheduled at delay=0 by _maybe_announce,
+        then every 2 s, 5 attempts total, stopping on the first success.
+
+        Each attempt's call_service is offloaded to the executor via
+        _native_voice_attempt so it never blocks this pinned thread (same pattern
+        as intercom.py's sonos_notifier offload in _handle_trigger). This method
+        itself only ever runs ON the pinned thread (it is a run_in callback), so
+        the next attempt is always scheduled here, UNCONDITIONALLY - an executor
+        Future's result cannot drive scheduling from the worker thread, so every
+        attempt just re-checks voice_spoken and no-ops once it is true.
+
+        voice_dispatched is a SEPARATE guard from voice_spoken: a ring episode can
+        trigger _maybe_announce more than once (two unlock attempts both
+        confirming - the exact double-fire this flag pair exists to close), so
+        only the FIRST call may start a chain. voice_spoken alone cannot do that
+        job too: it has to stay false through up to 4 failing attempts for the
+        retry to have any point."""
+        episode = self.episodes.get(kwargs.get("episode_id"))
+        if episode is None or episode["closed"] or episode.get("voice_spoken"):
+            return
+        attempt = kwargs.get("attempt", 1)
+        door = kwargs.get("door")
+        if attempt == 1:
+            if episode.get("voice_dispatched"):
+                return
+            episode["voice_dispatched"] = True
+        try:
+            self.submit_to_executor(self._native_voice_attempt, episode["id"], door,
+                                    kwargs.get("camera"), kwargs.get("message"), attempt)
+        except Exception as e:
+            self.log(f"Native voice dispatch failed for {door} (attempt {attempt}): {e}", level="WARNING")
+        if attempt < 5:
+            try:
+                self.run_in(self._native_voice_retry, 2, episode_id=episode["id"], door=door,
+                            camera=kwargs.get("camera"), message=kwargs.get("message"), attempt=attempt + 1)
+            except Exception as e:
+                self.log(f"Native voice retry scheduling failed for {door}: {e}", level="WARNING")
+
+    def _native_voice_attempt(self, episode_id, door, camera, message, attempt):
+        """Executor-thread body of one native-voice attempt (see _native_voice_retry
+        for why this is offloaded). On success, flips this episode's voice_spoken
+        flag directly - a bool dict-item write, safe cross-thread the same way
+        _capture_for_episode's snapshot write already is."""
+        if self._voice_into_recording(door, camera, message):
+            episode = self.episodes.get(episode_id)
+            if episode is not None:
+                episode["voice_spoken"] = True
+            self.log(f"VOICE-NATIVE door={door} attempt={attempt}/5 succeeded", level="INFO")
 
     # ------------------------------------------------------------------
     # Auto-open-OFF ring fallback: Open/Reject push + door voices

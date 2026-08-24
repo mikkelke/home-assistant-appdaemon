@@ -103,6 +103,7 @@ def _bare_bridge(tmpdir, clock):
     app.clip_cameras = {"front door": "camera.abb_front"}
     app.clip_seconds = 10
     app.clip_delay_s = 0
+    app.native_ring_clips = False
     app.clip_record_dir = "/config/www/abb_doorbell"
     app.station_by_door = {"back door": "100000001", "front door": "100000002"}
     app.health_sip_entity = "sensor.abb_sip"
@@ -810,13 +811,18 @@ class RingClipTests(unittest.TestCase):
         self.assertEqual(confirm_pending, [])
 
     def test_clip_service_failure_is_logged_never_raised(self):
+        # The dial itself is offloaded (submit_to_executor - see _start_clip), so a
+        # call_service failure surfaces from _dial_clip's own try/except, not
+        # _start_clip's (which has already returned by the time a REAL executor
+        # thread would hit this - the test fixture's inline executor just makes it
+        # observable synchronously).
         self.app._open_episode("front door", "100000002", self.clock.now())
         def boom(service, **kwargs):
             raise RuntimeError("stream in use")
         self.app.call_service = boom
         self.clock.at += timedelta(seconds=8)
         _run_scheduled(self.app, "_start_clip")
-        self.assertTrue(any("Clip start failed" in m for _, m in self.app.logs))
+        self.assertTrue(any("Clip dial failed" in m for _, m in self.app.logs))
 
     def test_archive_entry_gains_clip_only_when_file_landed(self):
         self.app.archive_dir.mkdir(parents=True, exist_ok=True)
@@ -1213,3 +1219,219 @@ class RingFallbackTests(unittest.TestCase):
         published = dict(self.app.published)["sensor.abb_esp_ring_agreement"]
         self.assertEqual(published["attributes"]["door_opens_both"], 1)
         self.assertEqual(published["attributes"]["door_opens_abb_only"], 1)
+
+
+class NativeRingClipTests(unittest.TestCase):
+    """native_ring_clips=true (2026-08-24): the integration's own recorder owns
+    the ring clip end-to-end - this bridge only listens for its bus event and
+    retries a voice into whichever call is open, in place of dialing anything
+    itself. With the knob off, every one of these paths must be a no-op and the
+    app must behave exactly as the RingClipTests above already verify."""
+
+    def setUp(self):
+        self.clock = Clock(datetime(2026, 8, 24, 9, 0, 0, tzinfo=timezone.utc))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.app = _bare_bridge(self.tmp.name, self.clock)
+        self.app.native_ring_clips = True
+
+    def _clip_dial_calls(self):
+        return [c for c in self.app.service_calls
+                if c[0] in ("abb_welcome/arm_streaming", "camera/record")]
+
+    def _native_clip_event(self, **overrides):
+        payload = {
+            "station_id": "100000002",
+            "filename": "abb_ringclip_20260824_090010_100000002.mp4",
+            "path": "/config/www/abb_doorbell/abb_ringclip_20260824_090010_100000002.mp4",
+            "url": "/local/abb_doorbell/abb_ringclip_20260824_090010_100000002.mp4",
+            "duration_s": 12.5,
+            "frames": 300,
+            "segments": 2,
+            "started_at": self.clock.at.isoformat(),
+            "reason": "ring",
+            "ok": True,
+        }
+        payload.update(overrides)
+        self.app._on_native_ring_clip("abb_welcome_ring_clip", payload, {})
+        return payload
+
+    # --- native gate (item 1: off means exactly as today) ---
+
+    def test_native_off_schedules_start_clip(self):
+        self.app.native_ring_clips = False
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        scheduled = [cb.__name__ for cb, _, _ in self.app.run_in_calls]
+        self.assertIn("_start_clip", scheduled)
+
+    def test_native_on_never_schedules_start_clip(self):
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        scheduled = [cb.__name__ for cb, _, _ in self.app.run_in_calls]
+        self.assertNotIn("_start_clip", scheduled)
+
+    def test_native_on_opens_self_call_window_at_episode_open(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        until = self.app._self_call_until.get("front door")
+        self.assertIsNotNone(until)
+        self.assertEqual((until - episode["started_at"]).total_seconds(), 45)
+
+    def test_no_clip_camera_door_opens_no_self_call_window(self):
+        self.app.clip_cameras = {}
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.assertNotIn("front door", self.app._self_call_until)
+
+    def test_native_off_ignores_the_event_entirely(self):
+        self.app.native_ring_clips = False
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        self._native_clip_event()
+        self.assertIsNone(episode["clip_filename"])
+
+    # --- event -> episode clip attachment ---
+
+    def test_matching_ring_event_attaches_clip(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        self.clock.at += timedelta(seconds=15)
+        payload = self._native_clip_event()
+        self.assertEqual(episode["clip_filename"], payload["filename"])
+        self.assertEqual(episode["clip_started_at"], bridge_mod.parse_iso_ts(payload["started_at"]))
+        self.assertTrue(any("CLIP-NATIVE" in m for _, m in self.app.logs))
+        self.assertEqual(self._clip_dial_calls(), [])  # never dials itself
+
+    def test_service_reason_is_ignored(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        self._native_clip_event(reason="service")
+        self.assertIsNone(episode["clip_filename"])
+
+    def test_ok_false_is_dropped(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        self._native_clip_event(ok=False)
+        self.assertIsNone(episode["clip_filename"])
+        self.assertTrue(any("CLIP-NATIVE dropped" in m for _, m in self.app.logs))
+
+    def test_no_open_episode_is_dropped(self):
+        self._native_clip_event()  # nothing open for that station's door
+        self.assertTrue(any("CLIP-NATIVE dropped" in m for _, m in self.app.logs))
+
+    def test_unmapped_station_is_dropped(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        self._native_clip_event(station_id="999999999")
+        self.assertIsNone(episode["clip_filename"])
+
+    def test_clip_attaches_to_the_matching_door_only(self):
+        front = self.app._open_episode("front door", "100000002", self.clock.now())
+        self.clock.at += timedelta(seconds=2)
+        back = self.app._open_episode("back door", "100000001", self.clock.now())
+        self._native_clip_event(station_id="100000001", filename="abb_ringclip_back.mp4")
+        self.assertIsNone(front["clip_filename"])
+        self.assertEqual(back["clip_filename"], "abb_ringclip_back.mp4")
+
+    def test_native_clip_archives_like_the_fallback_clip(self):
+        # The existing close/archive path needs nothing more than clip_filename -
+        # same directory the fallback dial already wrote into.
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.app.archive_dir.mkdir(parents=True, exist_ok=True)
+        payload = self._native_clip_event()
+        (self.app.archive_dir / payload["filename"]).write_bytes(b"mp4data")
+        self.clock.at += timedelta(seconds=76)
+        _run_scheduled(self.app, "_close_episode")
+        entry = self.app._load_index()[0]
+        self.assertEqual(entry["clip_filename"], payload["filename"])
+        self.assertEqual(entry["clip_url"], f"/local/abb_doorbell/{payload['filename']}")
+
+    # --- native voice retry ---
+
+    def test_native_voice_never_dials_announce(self):
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.app._maybe_announce("front door")
+        _run_scheduled(self.app, "_native_voice_retry")
+        self.assertEqual([c for c in self.app.service_calls if c[0] == "abb_welcome/announce"], [])
+        self.assertTrue(any(c[0] == "abb_welcome/play_audio" for c in self.app.service_calls))
+
+    def test_native_voice_retries_until_success(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        calls = {"n": 0}
+
+        def flaky(service, **kwargs):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RuntimeError("no talkback yet")
+        self.app.call_service = flaky
+        self.app._maybe_announce("front door")
+        for _ in range(5):
+            _run_scheduled(self.app, "_native_voice_retry")
+        self.assertEqual(calls["n"], 3)
+        self.assertTrue(episode["voice_spoken"])
+        # idempotent: running any further pending attempts changes nothing
+        _run_scheduled(self.app, "_native_voice_retry")
+        self.assertEqual(calls["n"], 3)
+
+    def test_native_voice_gives_up_after_five_failures(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+
+        def boom(service, **kwargs):
+            raise RuntimeError("still no talkback")
+        self.app.call_service = boom
+        self.app._maybe_announce("front door")
+        attempts = 0
+        for _ in range(6):
+            attempts += _run_scheduled(self.app, "_native_voice_retry")
+        self.assertEqual(attempts, 5)
+        self.assertFalse(episode["voice_spoken"])
+
+    def test_no_open_ring_stays_silent(self):
+        self.app._maybe_announce("front door")  # no episode at all
+        self.assertEqual(self.app.run_in_calls, [])
+
+    def test_ring_outside_announce_window_stays_silent(self):
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.clock.at += timedelta(seconds=self.app.announce_ring_window_s + 1)
+        self.app._maybe_announce("front door")
+        pending = [cb.__name__ for cb, _, _ in self.app.run_in_calls]
+        self.assertNotIn("_native_voice_retry", pending)
+
+    # --- voice dedup (one spoken sentence per episode, both paths) ---
+
+    def test_two_unlock_confirms_speak_once_native(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        self.app._maybe_announce("front door")               # unlock attempt 1 confirms
+        _run_scheduled(self.app, "_native_voice_retry")       # attempt 1 succeeds
+        self.assertTrue(episode["voice_spoken"])
+        n_before = len([c for c in self.app.service_calls if c[0] == "abb_welcome/play_audio"])
+        self.assertEqual(n_before, 1)
+        self.app._maybe_announce("front door")               # unlock attempt 3 confirms
+        _run_scheduled(self.app, "_native_voice_retry")
+        n_after = len([c for c in self.app.service_calls if c[0] == "abb_welcome/play_audio"])
+        self.assertEqual(n_after, 1)  # unchanged - no second sentence
+
+    def test_reentrant_maybe_announce_does_not_start_a_second_chain(self):
+        # Two unlock attempts BOTH confirm before either has actually succeeded in
+        # speaking - the exact double-fire scenario. voice_spoken alone cannot
+        # guard this (it must stay false through several failing attempts for the
+        # retry to have a point), so voice_dispatched stops the SECOND
+        # _maybe_announce call from starting an independent chain of its own.
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        calls = {"n": 0}
+
+        def boom(service, **kwargs):
+            calls["n"] += 1
+            raise RuntimeError("no talkback yet")
+        self.app.call_service = boom
+        self.app._maybe_announce("front door")  # unlock attempt 1 confirms
+        self.app._maybe_announce("front door")  # unlock attempt 3 confirms, moments later
+        for _ in range(6):
+            _run_scheduled(self.app, "_native_voice_retry")
+        self.assertEqual(calls["n"], 5)  # one chain's worth of dial attempts, not two
+        self.assertFalse(episode["voice_spoken"])
+
+    def test_two_unlock_confirms_speak_once_legacy_in_recording(self):
+        # The pre-existing (native off) in-recording branch had the actual bug:
+        # unlike the plain announce dial below it, it skipped the cooldown check
+        # entirely, so two confirms fired two sentences.
+        self.app.native_ring_clips = False
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        episode["clip_started_at"] = self.clock.at  # a recording is "in flight"
+        self.app._maybe_announce("front door")  # unlock attempt 1 confirms
+        self.app._maybe_announce("front door")  # unlock attempt 3 confirms
+        calls = [c for c in self.app.service_calls if c[0] == "abb_welcome/play_audio"]
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(episode["voice_spoken"])

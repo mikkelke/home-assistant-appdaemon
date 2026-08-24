@@ -86,10 +86,34 @@ AbbWelcomeBridge:
   # its video (probed 2026-08-13). The no-answer message at +45 s is unaffected.
   #
   # The station's own ~5 s ring call can silently refuse the first record dial,
-  # so the bridge confirms the camera actually entered "recording" at +3 s and
-  # redials once. Physical floor: dial + stream-open ~1-2 s; nothing before the
-  # dial can ever be on video - the RING-MOMENT artifact is the gateway snapshot,
-  # which the gallery pairs with the clip.
+  # so the bridge confirms the camera actually entered "recording" at +10 s
+  # (anchored to the dial, since the dial itself is offloaded to the executor -
+  # camera.record blocks for the recording's own duration) and redials once.
+  # Physical floor: dial + stream-open ~1-2 s; nothing before the dial can ever
+  # be on video - the RING-MOMENT artifact is the gateway snapshot, which the
+  # gallery pairs with the clip. (native_ring_clips=false / fallback path only.)
+  #
+  # native_ring_clips (2026-08-24): the ABB Welcome integration itself now records
+  # the ring call video (from ~ring+0.3 s) and fires abb_welcome_ring_clip once the
+  # mp4 is finalized (10-40 s after the ring; episode_close_s=75 above always
+  # outlasts it). true = this bridge NEVER dials arm_streaming/camera.record
+  # itself (the clip_cameras/clip_seconds/clip_delay_s keys below still
+  # configure WHICH cameras/doors get clips and how they are named, just not
+  # dialed) - it only listens for that event and attaches clip_filename to the
+  # matching open episode. It also opens the self-call window at episode open
+  # instead of at a dial WE placed, because the integration may place its own
+  # continuation dial ~2.5 s after the ring call ends (to film the visitor
+  # entering) - that shows up in the ABB portal as call-answered and must not be
+  # misread as a real answer. The announce voice never places its own
+  # temporary-call dial in this mode either (it would collide with the ring call
+  # or the continuation dial) - it retries play_audio into whichever of those two
+  # is open instead (up to 5 attempts, 2 s apart). false = every behaviour above
+  # is exactly today's (the arm_streaming + camera.record fallback in
+  # _start_clip, the temporary-call announce). Ships false-safe: absent this key
+  # the code defaults to false, so a code deploy landing ahead of the
+  # integration-side change is a no-op; set true only once that has actually
+  # shipped (both land in the same deploy here).
+  native_ring_clips: true
   clip_cameras:
     front door: camera.abb_welcome_gateway_outdoor_station_2_1
     back door: camera.abb_welcome_gateway_outdoor_station_1_1
