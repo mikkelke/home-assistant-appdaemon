@@ -80,8 +80,14 @@ Intercom:
   # registrations, no new branch touched by _handle_trigger. Enabling this for a
   # door changes how a shared street door opens for every apartment on the
   # building's intercom bus, not just this flat - flip it deliberately.
-  abb_unlock_doors: {}
-  # front door: "button.abb_welcome_gateway_outdoor_station_2_1"
+  # ENABLED 2026-08-25 for the supervised trial: Mikkel tests on arrival by pressing
+  # Open on the dashboard (which now presses this same button) and by ringing his own
+  # doorbell. Front door ONLY - station 100000002 takes the integration's "fast" unlock
+  # route (a standalone SIP MESSAGE, no second call), while the back door's "standard"
+  # route places its OWN INVITE and would kill an in-progress ring recording.
+  # Set back to {} to return to ESP-only opening.
+  abb_unlock_doors:
+    front door: "button.abb_welcome_gateway_outdoor_station_2_1"
 
   # How long to wait for the ESP lock's own unlocking/unlocked ack after an ABB
   # button press before giving up on it and falling back to the ESP sequence.
