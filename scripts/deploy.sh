@@ -206,7 +206,13 @@ if [ "$CHANGED" -eq 0 ] && [ "$rc" -eq 0 ]; then
   verify_box_content
   exit 0
 fi
-sleep 12
+# Must outlast appdaemon.yaml's utility_delay (15 s) plus the import/init that follows:
+# AppDaemon only notices changed files on a utility-loop pass, and that loop was
+# deliberately slowed because check_app_updates() ast.parse()s every app .py (2.76 MB,
+# ~2.2 s) on the event loop EVERY pass - blocking 86% of it and pinning a core
+# (upstream issue #2599). Too short a wait here only produces the spurious
+# "content changed but AppDaemon reloaded nothing" warning below.
+sleep 25
 RELOADS=$(ssh -o BatchMode=yes "$HOST" "awk -v d=\"$STAMP\" '\$0 >= d' $LOG | grep -c 'Calling initialize' || true")
 ssh -o BatchMode=yes "$HOST" "awk -v d=\"$STAMP\" '\$0 >= d' $LOG | grep -E 'Calling initialize|ERROR' | tail -15" || true
 
