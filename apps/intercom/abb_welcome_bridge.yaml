@@ -161,3 +161,22 @@ AbbWelcomeBridge:
   retain_days: 90              # prune snapshots older than this on every write
   max_files: 2000              # and never keep more than this many
   archive_warn_mb: 500         # WARNING in the log above this directory size
+
+  # --- street-door open feed (2026-08-25) ---
+  # The ESP bus tap is the ONLY device that sees the door controller's own
+  # acknowledgement that a street door physically opened, whoever commanded it.
+  # The ABB cloud has never once reported a door-open event of its own (the
+  # door-open comparator above has counted door_opens_both=0 and
+  # door_opens_abb_only=0 since it started) - it only learns of opens made
+  # through ABB's own channels, and every open so far has been the ESP acting
+  # on the bus. Meanwhile nothing logs street-door openings to the house feed
+  # at all, so a housemate letting someone in from the physical handset was
+  # invisible to the whole system. This reports every ESP unlock edge
+  # (_on_lock_activity) to the feed, classified by whether a ring episode for
+  # that door was open (a visitor was let in - routine wording) or not
+  # (someone opened the door with nobody ringing - noteworthy but not
+  # alarming, usually a housemate buzzing in a friend who called ahead or
+  # testing; feed only, never a push).
+  door_open_feed: true          # master on/off; false reproduces today's behaviour exactly
+  door_open_fold_s: 20          # fold unlocking/unlocked + auto-open retry edges for one visitor into one report
+  door_open_ring_window_s: 90   # ring counts as "present" up to this long after it started (episode_close_s=75 always closes first)

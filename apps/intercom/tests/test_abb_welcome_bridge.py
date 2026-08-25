@@ -95,6 +95,11 @@ def _bare_bridge(tmpdir, clock):
     app._episode_seq = 0
     app.unlock_events = {}
     app._last_announce_at = {}
+    app.door_open_feed = True
+    app.door_open_fold_s = 20
+    app.door_open_ring_window_s = 90
+    app._last_door_open_edge_at = {}
+    app._last_ring_closed_at = {}
     app.announce_cameras = {"front door": "camera.abb_front"}
     app.announce_message = "The door is open."
     app.announce_cooldown_s = 90
@@ -1564,3 +1569,93 @@ class NativeRingClipTests(unittest.TestCase):
         calls = [c for c in self.app.service_calls if c[0] == "abb_welcome/play_audio"]
         self.assertEqual(len(calls), 1)
         self.assertTrue(episode["voice_spoken"])
+
+
+class DoorOpenFeedTests(unittest.TestCase):
+    """Street-door open feed (2026-08-25, module docstring item 5): every ESP
+    unlock edge reports ONE house_events_report, classified by whether a ring
+    was present, with same-visitor edges folded into a single report."""
+
+    def setUp(self):
+        self.clock = Clock(datetime(2026, 8, 25, 9, 0, 0, tzinfo=timezone.utc))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.app = _bare_bridge(self.tmp.name, self.clock)
+
+    def _door_open_reports(self):
+        return [kwargs for name, kwargs in self.app.fired_events if name == "house_events_report"]
+
+    def _unlock(self, entity="lock.intercomproxy_front_door", old="locked", new="unlocking"):
+        self.app._on_lock_activity(entity, "state", old, new, {})
+
+    def test_opening_during_a_ring_emits_ring_wording(self):
+        self.app._register_ring("esp", "front door", "", self.clock.at, "esp:test")
+        self.clock.at += timedelta(seconds=5)
+        self._unlock()
+        reports = self._door_open_reports()
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0]["cause"], "Someone rang the front door")
+        self.assertEqual(reports[0]["effect"], "The door was opened for them")
+        self.assertEqual(reports[0]["icon"], "mdi:door-open")
+
+    def test_opening_with_no_ring_emits_no_ring_wording(self):
+        self._unlock()
+        reports = self._door_open_reports()
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0]["cause"], "The front door was opened with nobody ringing")
+        self.assertEqual(reports[0]["effect"],
+                         "Possibly a buzz-in for someone who called ahead, or a test")
+        self.assertEqual(reports[0]["icon"], "mdi:door-open")
+
+    def test_edges_inside_fold_window_emit_one_report(self):
+        self._unlock(new="unlocking")
+        self.clock.at += timedelta(seconds=5)
+        self._unlock(old="unlocking", new="unlocked")
+        self.clock.at += timedelta(seconds=10)  # +15s from the 1st edge, +10s from the 2nd: inside fold_s=20
+        self._unlock(new="unlocking")  # an auto-open retry
+        self.assertEqual(len(self._door_open_reports()), 1)
+
+    def test_edges_outside_fold_window_emit_two(self):
+        self._unlock(new="unlocking")
+        self.clock.at += timedelta(seconds=25)  # outside door_open_fold_s=20
+        self._unlock(new="unlocking")
+        self.assertEqual(len(self._door_open_reports()), 2)
+
+    def test_feed_disabled_emits_nothing(self):
+        self.app.door_open_feed = False
+        self._unlock()
+        self.clock.at += timedelta(seconds=30)
+        self._unlock()
+        self.assertEqual(self._door_open_reports(), [])
+
+    def test_opening_shortly_after_ring_closed_still_counts_as_ring(self):
+        # episode_close_s (75s, default) pops the episode out of self.episodes
+        # entirely - door_open_ring_window_s (90s) must still find the ring via
+        # _last_ring_closed_at.
+        self.app._register_ring("esp", "front door", "", self.clock.at, "esp:test")
+        self.clock.at += timedelta(seconds=76)
+        _run_scheduled(self.app, "_close_episode")
+        self.clock.at += timedelta(seconds=10)  # ring+86s, inside the 90s window
+        self._unlock()
+        self.assertEqual(self._door_open_reports()[0]["cause"], "Someone rang the front door")
+
+    def test_opening_long_after_ring_closed_no_longer_counts(self):
+        self.app._register_ring("esp", "front door", "", self.clock.at, "esp:test")
+        self.clock.at += timedelta(seconds=76)
+        _run_scheduled(self.app, "_close_episode")
+        self.clock.at += timedelta(seconds=20)  # ring+96s, outside the 90s window
+        self._unlock()
+        self.assertEqual(self._door_open_reports()[0]["cause"],
+                         "The front door was opened with nobody ringing")
+
+    def test_fire_event_exception_is_swallowed_and_announce_still_runs(self):
+        self.app._open_episode("front door", "100000002", self.clock.at)
+        self.clock.at += timedelta(seconds=5)
+
+        def boom(event, **kwargs):
+            raise RuntimeError("feed down")
+        self.app.fire_event = boom
+        self._unlock()
+        announces = [c for c in self.app.service_calls if c[0] == "abb_welcome/announce"]
+        self.assertEqual(len(announces), 1)
+        self.assertTrue(any("Door-open feed report failed" in m for _, m in self.app.logs))

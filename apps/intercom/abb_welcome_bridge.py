@@ -65,6 +65,26 @@ Features:
    (previous visitor) are never archived - a missing photo is honest, the wrong
    person is misleading. Retention: retain_days / max_files pruned on every
    write, WARNING above archive_warn_mb.
+5. STREET-DOOR OPEN FEED (2026-08-25) - the ESP is the ONLY witness that a
+   street door physically opened, whoever commanded it: the ABB cloud only
+   ever learns of opens made through its OWN channels (the door-open
+   comparator above has read door_opens_abb_only=0 since it started - every
+   open so far came from the ESP acting on the bus), and nothing else logs a
+   street-door opening to the house feed at all. Every ESP lock
+   unlocking/unlocked edge (_on_lock_activity) reports ONE house_events_report
+   per physical opening via _report_door_open - edges for the same door within
+   door_open_fold_s (default 20 s) of the PREVIOUS edge fold into that
+   opening's report, since the ESP's own unlocking->unlocked pair plus
+   intercom.py's auto-open retries would otherwise spam the feed for one
+   visitor. Classified by whether a ring episode for that door was open, or
+   had closed within door_open_ring_window_s (default 90 s - longer than
+   episode_close_s so the classification survives the episode's own teardown;
+   see _door_had_ring): a ring present means a visitor was let in (routine,
+   low-key wording); no ring means someone opened the street door with nobody
+   ringing - the genuinely new signal this app exists to surface, worded as
+   noteworthy but never alarming (usually a housemate buzzing in a friend who
+   called ahead, or a test) and never pushed as a notification - feed only.
+   door_open_feed=false reproduces today's behaviour exactly.
 
 Nothing here depends on intercom.py, and intercom.py's only dependency on this
 app is an optional, lazily-resolved, exception-swallowed attachment lookup.
@@ -307,6 +327,12 @@ class AbbWelcomeBridge(hass.Hass):
         self.lock_by_door = {v: k for k, v in self.esp_lock_doors.items()}
         self._pending_actions = {}  # action id -> shared entry (open+reject ids share one)
 
+        # --- street-door open feed (2026-08-25, see the module docstring's item 5
+        # for the full ESP-is-the-only-witness rationale) ---
+        self.door_open_feed = bool(self.args.get("door_open_feed", True))
+        self.door_open_fold_s = int(self.args.get("door_open_fold_s", 20))
+        self.door_open_ring_window_s = int(self.args.get("door_open_ring_window_s", 90))
+
         # --- archive knobs ---
         self.archive_dir = Path(self.args.get("archive_dir", "/www/abb_doorbell"))
         self.archive_url_prefix = self.args.get("archive_url_prefix", "/local/abb_doorbell")
@@ -319,6 +345,8 @@ class AbbWelcomeBridge(hass.Hass):
         self._episode_seq = 0
         self.unlock_events = {}  # door label -> list[datetime] of recent unlocking/unlocked edges (pruned/capped in _remember_unlock)
         self._last_announce_at = {}  # door label -> datetime of last spoken announcement
+        self._last_door_open_edge_at = {}  # door label -> datetime of the last folded unlock edge (_report_door_open dedup)
+        self._last_ring_closed_at = {}  # door label -> started_at of the most recently CLOSED ring episode (_door_had_ring fallback)
         self.mobile_notifier = self._get_mobile_notifier()
         self._state_file = Path(__file__).with_name("abb_welcome_bridge_state.json")
         persisted = self._load_state()
@@ -851,6 +879,7 @@ class AbbWelcomeBridge(hass.Hass):
             if new in ("unlocking", "unlocked"):
                 door = self.esp_lock_doors.get(entity, entity)
                 self._remember_unlock(door, entity)
+                self._report_door_open(door)
                 # The door opened by SOME path (auto-open, dashboard, push action):
                 # a still-pending Open/Reject push is resolved - kill its buttons
                 # everywhere so a late press cannot buzz the door a second time.
@@ -862,6 +891,64 @@ class AbbWelcomeBridge(hass.Hass):
                 self._maybe_announce(door)
         except Exception as e:
             self.log(f"Lock activity handling failed: {e}", level="WARNING")
+
+    def _door_had_ring(self, door, now):
+        """True if a ring episode for `door` is still open, or closed within the
+        last door_open_ring_window_s - lets _report_door_open tell "a visitor was
+        let in" (a ring was present) from "someone opened the street door with
+        nobody ringing". Reuses _latest_open_episode for the still-open case; a
+        closed episode is popped out of self.episodes entirely (see
+        _close_episode), so the fallback checks _last_ring_closed_at, populated
+        with the ring's own started_at when its episode closes - the window
+        (default 90 s) is deliberately longer than episode_close_s (75 s) so the
+        classification survives that teardown instead of racing it."""
+        if self._latest_open_episode(door, now, self.door_open_ring_window_s) is not None:
+            return True
+        closed_at = self._last_ring_closed_at.get(door)
+        return closed_at is not None and (now - closed_at).total_seconds() <= self.door_open_ring_window_s
+
+    def _report_door_open(self, door, now=None):
+        """House-feed report for a physical street-door opening (2026-08-25 - see
+        the module docstring's item 5): the ESP is the only witness that a street
+        door actually opened, whoever commanded it, so this is the one place that
+        can tell the house feed "the street door just opened".
+
+        De-duplicated: the ESP fires unlocking then unlocked for one physical
+        open, and an auto-open retry chain (intercom.py's ring+1/4/7 s attempts)
+        can add a few more edges seconds apart for the SAME visitor. This uses a
+        SLIDING fold window: an edge within door_open_fold_s of the PREVIOUS edge
+        for that door folds into the opening already reported (and itself
+        becomes the new "previous edge", pushing the deadline out) - only an
+        edge arriving later than that starts a new, separately reported opening.
+
+        Classified by _door_had_ring: a ring present means a visitor was let in
+        (routine, low-key wording); no ring means the door opened with nobody
+        ringing - the genuinely new signal (usually a housemate buzzing in
+        someone who called ahead, or a test) - worded as noteworthy, never
+        alarming, and never pushed as a notification (feed only).
+
+        Best-effort and strictly additive, like every other emitter in this
+        file: any failure here is logged and must never touch the
+        unlock/announce/comparator paths in _on_lock_activity.
+        """
+        try:
+            if not self.door_open_feed:
+                return
+            now = now or self.get_now()
+            last_edge = self._last_door_open_edge_at.get(door)
+            self._last_door_open_edge_at[door] = now
+            if last_edge is not None and (now - last_edge).total_seconds() <= self.door_open_fold_s:
+                return  # same opening as the previous edge - already reported
+            label = door or "door"
+            if self._door_had_ring(door, now):
+                cause = f"Someone rang the {label}"
+                effect = "The door was opened for them"
+            else:
+                cause = f"The {label} was opened with nobody ringing"
+                effect = "Possibly a buzz-in for someone who called ahead, or a test"
+            self.fire_event("house_events_report", cause=cause, effect=effect, icon="mdi:door-open")
+        except Exception as e:
+            self.log(f"Door-open feed report failed for {door}: {e}", level="DEBUG")
 
     def _maybe_announce(self, door):
         """Speak "the door is open" at the door that was just unlocked for a ring.
@@ -1584,6 +1671,12 @@ class AbbWelcomeBridge(hass.Hass):
         if episode is None or episode["closed"]:
             return
         episode["closed"] = True
+        if episode.get("door"):
+            # Feeds _door_had_ring's lookback: the episode is about to vanish
+            # from self.episodes entirely, but a door-open edge landing shortly
+            # after close (still inside door_open_ring_window_s) must still find
+            # this ring.
+            self._last_ring_closed_at[episode["door"]] = episode["started_at"]
         try:
             unlock_at = self._unlock_near(episode["door"], episode["started_at"])
             event_type = classify_episode(unlock_at is not None,
