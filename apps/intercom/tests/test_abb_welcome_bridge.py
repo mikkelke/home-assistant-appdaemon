@@ -93,7 +93,7 @@ def _bare_bridge(tmpdir, clock):
     # state
     app.episodes = {}
     app._episode_seq = 0
-    app.last_unlock_at = {}
+    app.unlock_events = {}
     app._last_announce_at = {}
     app.announce_cameras = {"front door": "camera.abb_front"}
     app.announce_message = "The door is open."
@@ -331,6 +331,135 @@ class MissedCallTests(unittest.TestCase):
         _run_scheduled(self.app, "_decide_missed")
         self.assertEqual(self.app.pushes, [])
         self.assertTrue(any("MISSED-SUPPRESSED" in msg for _, msg in self.app.logs))
+
+
+class UnlockEvidenceTests(unittest.TestCase):
+    """Per-door unlock evidence (2026-08-24 fix): a LIST of recent unlock
+    timestamps per door, not a single last-writer-wins slot, and last_changed
+    preferred over processing time so a blocked pinned thread cannot mis-stamp
+    a real unlock outside suppress_window_s."""
+
+    def setUp(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        self.clock = Clock(datetime(2026, 8, 24, 18, 11, 0, tzinfo=timezone.utc))
+        self.app = _bare_bridge(tmpdir.name, self.clock)
+
+    def test_five_ring_visitor_still_classifies_auto_opened(self):
+        # Real 2026-08-24 18:11 case: ring, then unlocks at +6.1/+20.5/+23.7/
+        # +31.8 s. The first three are in-window (suppress_window_s=30); a
+        # single-slot store used to keep only the last (+31.8 s, out of
+        # window) and archive this as "ring_missed" even though the door
+        # opened fine.
+        ring_at = self.clock.at
+        self.app._register_ring("esp", "front door", "", ring_at, "esp:test")
+        for offset in (6.1, 20.5, 23.7, 31.8):
+            self.clock.at = ring_at + timedelta(seconds=offset)
+            self.app._on_lock_activity("lock.intercomproxy_front_door", "state",
+                                       "locked", "unlocking", {})
+        unlock_at = self.app._unlock_near("front door", ring_at)
+        self.assertIsNotNone(unlock_at)
+        self.assertAlmostEqual((unlock_at - ring_at).total_seconds(), 6.1, places=2)
+        event_type = bridge_mod.classify_episode(unlock_at is not None, False, False)
+        self.assertEqual(event_type, "ring_auto_opened")
+
+    def test_unlock_near_returns_closest_in_window_and_none_when_all_outside(self):
+        ring_at = self.clock.at
+        self.app.unlock_events["front door"] = [
+            ring_at + timedelta(seconds=-25),
+            ring_at + timedelta(seconds=12),
+            ring_at + timedelta(seconds=3),
+        ]
+        # Closest to ring_at among the in-window ones is +3 s - not the first
+        # stored entry (-25 s) and not the largest in-window one (+12 s).
+        self.assertEqual(self.app._unlock_near("front door", ring_at),
+                         ring_at + timedelta(seconds=3))
+        self.app.unlock_events["front door"] = [
+            ring_at + timedelta(seconds=-45),
+            ring_at + timedelta(seconds=40),
+        ]
+        self.assertIsNone(self.app._unlock_near("front door", ring_at))
+
+    def test_unlock_near_door_filter_ignores_other_doors(self):
+        ring_at = self.clock.at
+        self.app.unlock_events["back door"] = [ring_at + timedelta(seconds=2)]
+        self.assertIsNone(self.app._unlock_near("front door", ring_at))
+        self.assertEqual(self.app._unlock_near("back door", ring_at),
+                         ring_at + timedelta(seconds=2))
+        self.assertEqual(self.app._unlock_near(None, ring_at),
+                         ring_at + timedelta(seconds=2))  # falsy door = any lock counts
+
+    def test_last_changed_preferred_when_sane(self):
+        changed_at = self.clock.at - timedelta(seconds=5)  # true edge, 5 s before we process it
+        self.app.states[("lock.intercomproxy_front_door", "last_changed")] = changed_at.isoformat()
+        self.app._on_lock_activity("lock.intercomproxy_front_door", "state",
+                                   "locked", "unlocking", {})
+        self.assertEqual(self.app.unlock_events["front door"], [changed_at])
+
+    def test_last_changed_missing_falls_back_to_now(self):
+        self.app._on_lock_activity("lock.intercomproxy_front_door", "state",
+                                   "locked", "unlocking", {})
+        self.assertEqual(self.app.unlock_events["front door"], [self.clock.at])
+
+    def test_last_changed_unparseable_falls_back_to_now(self):
+        self.app.states[("lock.intercomproxy_front_door", "last_changed")] = "not-a-timestamp"
+        self.app._on_lock_activity("lock.intercomproxy_front_door", "state",
+                                   "locked", "unlocking", {})
+        self.assertEqual(self.app.unlock_events["front door"], [self.clock.at])
+
+    def test_last_changed_in_future_falls_back_to_now(self):
+        future = self.clock.at + timedelta(seconds=5)
+        self.app.states[("lock.intercomproxy_front_door", "last_changed")] = future.isoformat()
+        self.app._on_lock_activity("lock.intercomproxy_front_door", "state",
+                                   "locked", "unlocking", {})
+        self.assertEqual(self.app.unlock_events["front door"], [self.clock.at])
+
+    def test_last_changed_too_old_falls_back_to_now(self):
+        stale = self.clock.at - timedelta(seconds=601)
+        self.app.states[("lock.intercomproxy_front_door", "last_changed")] = stale.isoformat()
+        self.app._on_lock_activity("lock.intercomproxy_front_door", "state",
+                                   "locked", "unlocking", {})
+        self.assertEqual(self.app.unlock_events["front door"], [self.clock.at])
+
+    def test_last_changed_lookup_exception_falls_back_to_now(self):
+        def boom(entity, attribute=None):
+            raise RuntimeError("cache miss")
+        self.app.get_state = boom
+        self.app._on_lock_activity("lock.intercomproxy_front_door", "state",
+                                   "locked", "unlocking", {})
+        self.assertEqual(self.app.unlock_events["front door"], [self.clock.at])
+        self.assertTrue(any("last_changed lookup failed" in m for _, m in self.app.logs))
+
+    def test_list_pruned_by_age_and_capped_in_length(self):
+        door = "front door"
+        base = self.clock.at
+        # An entry well past UNLOCK_EVENT_TTL_S (600 s) must not survive a new append.
+        self.app.unlock_events[door] = [base - timedelta(seconds=700)]
+        self.app._on_lock_activity("lock.intercomproxy_front_door", "state",
+                                   "locked", "unlocking", {})
+        self.assertEqual(self.app.unlock_events[door], [base])
+        # Cap: appending onto a list already at/over the cap keeps only the newest.
+        self.app.unlock_events[door] = [base + timedelta(seconds=i) for i in range(25)]
+        self.clock.at = base + timedelta(seconds=25)
+        self.app._on_lock_activity("lock.intercomproxy_front_door", "state",
+                                   "unlocking", "unlocked", {})
+        self.assertEqual(len(self.app.unlock_events[door]), bridge_mod.UNLOCK_EVENT_MAX_PER_DOOR)
+        self.assertEqual(self.app.unlock_events[door][-1], base + timedelta(seconds=25))
+
+    def test_door_open_comparator_pairs_against_any_stored_unlock(self):
+        ring_at = self.clock.at
+        # Two doors, several entries each; only one entry is close enough to pair.
+        self.app.unlock_events["back door"] = [ring_at - timedelta(seconds=100)]
+        self.app.unlock_events["front door"] = [
+            ring_at - timedelta(seconds=200),
+            ring_at + timedelta(seconds=40),  # the one that should pair
+        ]
+        self.app._on_abb_event("event.abb", "all", None, {"attributes": {
+            "event_type": "door-open",
+            "timestamp": (ring_at + timedelta(seconds=45)).isoformat(),
+        }}, {})
+        self.assertEqual(self.app.counters["door_opens_both"], 1)
+        self.assertEqual(self.app.counters["door_opens_abb_only"], 0)
 
 
 class ComparatorTests(unittest.TestCase):
@@ -1139,7 +1268,7 @@ class RingFallbackTests(unittest.TestCase):
         self.app.episodes.clear()
         self.clock.at += timedelta(seconds=300)
         self._ring()
-        self.app.last_unlock_at["front door"] = self.clock.at + timedelta(seconds=1)
+        self.app.unlock_events["front door"] = [self.clock.at + timedelta(seconds=1)]
         self.clock.at += timedelta(seconds=2)
         _run_scheduled(self.app, "_ring_ack")
         self.assertEqual(len(self._announces()), 1)  # no second ack
@@ -1204,7 +1333,7 @@ class RingFallbackTests(unittest.TestCase):
 
     def test_door_open_comparator_counts(self):
         # Paired: the ESP unlocked 5 s before the portal reports door-open.
-        self.app.last_unlock_at["front door"] = self.clock.at
+        self.app.unlock_events["front door"] = [self.clock.at]
         self.app._on_abb_event("event.abb", "all", None, {"attributes": {
             "event_type": "door-open",
             "timestamp": (self.clock.at + timedelta(seconds=5)).isoformat(),

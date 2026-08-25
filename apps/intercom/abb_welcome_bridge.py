@@ -96,6 +96,8 @@ INDEX_VERSION = 1
 JPEG_MAGIC = b"\xff\xd8"
 MAX_IMAGE_BYTES = 5 * 1024 * 1024  # sanity cap on a single doorbell frame
 MAX_PROCESSED_IDS = 50  # missed-call event_id dedupe ring buffer
+UNLOCK_EVENT_TTL_S = 600  # prune bound for stored unlock timestamps, and the sanity bound on a last_changed reading in _unlock_edge_at (get_state can serve a stale value - see the appdaemon-stale-state-store gotcha)
+UNLOCK_EVENT_MAX_PER_DOOR = 20  # cap so a long uptime with many rings/re-rings cannot grow a door's unlock list unbounded
 
 
 def classify_episode(unlock_seen, missed_seen, answered_seen):
@@ -315,7 +317,7 @@ class AbbWelcomeBridge(hass.Hass):
         # --- state ---
         self.episodes = {}  # stable episode id -> episode dict (open episodes only)
         self._episode_seq = 0
-        self.last_unlock_at = {}  # door label -> datetime of last unlocking/unlocked edge
+        self.unlock_events = {}  # door label -> list[datetime] of recent unlocking/unlocked edges (pruned/capped in _remember_unlock)
         self._last_announce_at = {}  # door label -> datetime of last spoken announcement
         self.mobile_notifier = self._get_mobile_notifier()
         self._state_file = Path(__file__).with_name("abb_welcome_bridge_state.json")
@@ -690,7 +692,7 @@ class AbbWelcomeBridge(hass.Hass):
                 # time is sound. Phase-2 evidence alongside the ring comparator.
                 at = parse_iso_ts(attrs.get("timestamp")) or self.get_now()
                 paired = any(abs((at - t).total_seconds()) <= 45
-                             for t in self.last_unlock_at.values())
+                             for events in self.unlock_events.values() for t in events)
                 self.counters["door_opens_both" if paired else "door_opens_abb_only"] += 1
                 self._save_state()
                 self._publish_agreement()
@@ -788,20 +790,67 @@ class AbbWelcomeBridge(hass.Hass):
             self.log(f"Missed-call decision failed: {e}", level="WARNING")
 
     def _unlock_near(self, door, ring_at):
-        """Unlock evidence within +/- suppress_window_s of the ring; a door label
-        narrows it to that door's lock, otherwise any lock counts."""
-        for lock_door, at in self.last_unlock_at.items():
+        """Unlock evidence within +/- suppress_window_s of the ring, CLOSEST to
+        the ring itself (not merely the first match); a door label narrows it to
+        that door's lock, otherwise any lock counts. Scans every stored
+        timestamp: a visitor who rings and is buzzed at repeatedly can leave
+        several in-window unlocks followed by a later, out-of-window one (real
+        case, 2026-08-24 18:11, 5 rings: unlocks at ring+6.1/+20.5/+23.7/+31.8 s)
+        - remembering only the newest per door used to make that a false
+        "ring_missed" (and a false missed-call push, via _decide_missed)."""
+        best, best_age = None, None
+        for lock_door, events in self.unlock_events.items():
             if door and lock_door != door:
                 continue
-            if abs((at - ring_at).total_seconds()) <= self.suppress_window_s:
-                return at
-        return None
+            for at in events:
+                age = abs((at - ring_at).total_seconds())
+                if age <= self.suppress_window_s and (best_age is None or age < best_age):
+                    best, best_age = at, age
+        return best
+
+    def _unlock_edge_at(self, entity):
+        """Best timestamp for an unlock edge: the lock's OWN last_changed when
+        it is sane, else our processing time (get_now()).
+
+        last_changed is preferred because the callback itself can run late -
+        measured live 2026-08-24: the pinned thread was blocked ~29 s behind a
+        camera.record dial, so a real unlock at ring+4.9 s got stamped at
+        ring+31.1 s (processing time), landing just outside suppress_window_s
+        and archiving a ring that auto-opened fine as "ring_missed". But
+        AppDaemon 4.5.13's get_state can itself serve a stale cached value (see
+        the appdaemon-stale-state-store gotcha), so last_changed is trusted only
+        when it parses, is not in the future, and is no more than
+        UNLOCK_EVENT_TTL_S old - any other outcome, including an exception from
+        the lookup itself, falls back to get_now() and never breaks the unlock
+        path."""
+        now = self.get_now()
+        try:
+            changed = parse_iso_ts(self.get_state(entity, attribute="last_changed"))
+            if changed is not None:
+                age = (now - changed).total_seconds()
+                if 0 <= age <= UNLOCK_EVENT_TTL_S:
+                    return changed
+        except Exception as e:
+            self.log(f"last_changed lookup failed for {entity}: {e}", level="DEBUG")
+        return now
+
+    def _remember_unlock(self, door, entity):
+        """Append an unlock edge for `door` and prune the list: drop anything
+        older than UNLOCK_EVENT_TTL_S and cap it at UNLOCK_EVENT_MAX_PER_DOOR so
+        a long uptime with many rings can never grow this unbounded. A LIST, not
+        a single timestamp - see _unlock_near's docstring for why one timestamp
+        per door used to lose real in-window unlocks."""
+        at = self._unlock_edge_at(entity)
+        events = self.unlock_events.setdefault(door, [])
+        events.append(at)
+        cutoff = self.get_now() - timedelta(seconds=UNLOCK_EVENT_TTL_S)
+        events[:] = [t for t in events if t >= cutoff][-UNLOCK_EVENT_MAX_PER_DOOR:]
 
     def _on_lock_activity(self, entity, attribute, old, new, kwargs):
         try:
             if new in ("unlocking", "unlocked"):
                 door = self.esp_lock_doors.get(entity, entity)
-                self.last_unlock_at[door] = self.get_now()
+                self._remember_unlock(door, entity)
                 # The door opened by SOME path (auto-open, dashboard, push action):
                 # a still-pending Open/Reject push is resolved - kill its buttons
                 # everywhere so a late press cannot buzz the door a second time.
