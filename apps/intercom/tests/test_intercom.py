@@ -11,7 +11,7 @@ import sys
 import tempfile
 import types
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Stub appdaemon.plugins.hass.hassapi before importing the app module.
@@ -140,6 +140,7 @@ def _fake_handle_trigger_app(state_file, states):
     app.last_trigger_at = {}
     app.pending_unlocks = {}
     app.unlock_outcomes = {}
+    app.abb_unlock_doors = {}  # unconfigured (default) - _handle_trigger's ABB branch must be a no-op
     app.auto_open_entity = "input_boolean.auto_open"
     app.debounce_s = 5
     app.unlock_delay_s = 1
@@ -191,6 +192,243 @@ class HandleTriggerEdgeTests(unittest.TestCase):
         self.app._handle_trigger("binary_sensor.front", "state", "on", "off", {})
         self.assertEqual(self.app.run_in_calls, [])
         self.assertFalse(self.state_file.exists())
+
+
+# ---------------------------------------------------------------------------
+# ABB-native unlock experiment (see abb_unlock_doors in intercom.yaml).
+#
+# Unlike _fake_handle_trigger_app above (which only inspects what
+# _handle_trigger decides to schedule/persist), these tests need to actually
+# fire the captured run_in callbacks - the ack watchdog's timeout, and the ESP
+# ladder's unlock_callback/_verify_unlock chain it can fall back to - so the
+# fixture mirrors test_abb_welcome_bridge.py's Clock + capture-and-replay
+# run_in pattern instead.
+# ---------------------------------------------------------------------------
+
+
+class Clock:
+    def __init__(self, at):
+        self.at = at
+
+    def now(self):
+        return self.at
+
+
+def _run_scheduled(app, callback_name):
+    """Run (and consume) every currently-captured run_in call bound to the
+    given function name - mirrors test_abb_welcome_bridge.py's helper of the
+    same name/contract. A callback that schedules more work of a DIFFERENT
+    name (e.g. the timeout scheduling the ESP ladder) lands in run_in_calls
+    for a later pass, not this one."""
+    pending = app.run_in_calls
+    app.run_in_calls = []
+    ran = 0
+    remaining = []
+    for callback, delay, kwargs in pending:
+        if getattr(callback, "__name__", "") == callback_name:
+            callback(kwargs)
+            ran += 1
+        else:
+            remaining.append((callback, delay, kwargs))
+    app.run_in_calls = remaining + app.run_in_calls
+    return ran
+
+
+def _fake_abb_app(tmpdir, clock, states, abb_unlock_doors=None):
+    """A bare Intercom instance with the full duck-typed AD surface the
+    ABB-native unlock path touches: run_in is captured AND replayable (see
+    _run_scheduled), submit_to_executor runs inline (so _press_abb_button's
+    call_service is recorded synchronously), and call_service/create_task are
+    recorded - enough to exercise the ring path, the ack-timeout ESP fallback,
+    and the external-press watchdog end to end."""
+    app = intercom.Intercom.__new__(intercom.Intercom)
+    tmp = Path(tmpdir)
+    app._state_file = tmp / "intercom_state.json"
+    app.trigger_map = {
+        "binary_sensor.front": {
+            "message": "Someone is at the front door",
+            "lock": "lock.front",
+            "followup": "I opened the front door",
+            "door_sensor": None,
+            "ring_label": "front door",
+        }
+    }
+    app.door_lock_info = {"front door": {"lock": "lock.front", "door_sensor": None}}
+    app.abb_unlock_doors = dict(abb_unlock_doors or {})
+    app.abb_button_to_door = {v: k for k, v in app.abb_unlock_doors.items()}
+    app.abb_unlock_ack_timeout_s = 2.5
+    app._abb_watchdogs = {}
+    app._own_abb_press_at = {}
+
+    app.last_trigger_at = {}
+    app.pending_unlocks = {}
+    app.unlock_outcomes = {}
+    app.auto_open_entity = "input_boolean.auto_open"
+    app.debounce_s = 5
+    app.unlock_delay_s = 1
+    app.unlock_repeat_count = 2
+    app.unlock_repeat_interval_s = 7
+    app.sonos_notifier = None  # skip TTS - not under test here
+    app.notify_target = "mikkel"
+    app.abb_bridge = None
+
+    app.get_now = clock.now
+    app.logs = []
+    app.log = lambda msg, level="INFO": app.logs.append((level, msg))
+    app.get_state = lambda entity, attribute=None: states.get(entity)
+    app.fire_event = lambda *a, **kw: None
+    app.timer_running = lambda handle: False
+    app.cancel_timer = lambda handle: None
+
+    app.run_in_calls = []
+
+    def fake_run_in(callback, delay, **kwargs):
+        app.run_in_calls.append((callback, delay, kwargs))
+        return f"handle-{len(app.run_in_calls)}"
+    app.run_in = fake_run_in
+
+    def inline_executor(fn, *args, **kwargs):
+        fn(*args, **kwargs)
+    app.submit_to_executor = inline_executor
+
+    app.service_calls = []
+    app.call_service = lambda service, **kwargs: app.service_calls.append((service, kwargs))
+
+    app.pushes = []
+
+    class FakeNotifier:
+        def notify(self, **kwargs):  # plain callable: Intercom wraps it in create_task
+            app.pushes.append(kwargs)
+            return None
+    app.mobile_notifier = FakeNotifier()
+    app.created_tasks = []
+    app.create_task = lambda x: app.created_tasks.append(x)
+    return app
+
+
+class AbbNativeUnlockTests(unittest.TestCase):
+    def setUp(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        self.tmpdir = tmpdir.name
+        self.clock = Clock(NOW)
+        self.states = {"input_boolean.auto_open": "on", "lock.front": "locked"}
+
+    def _app(self, abb_unlock_doors=None):
+        return _fake_abb_app(self.tmpdir, self.clock, self.states, abb_unlock_doors)
+
+    def test_abb_ack_in_time_succeeds_without_esp_unlock(self):
+        app = self._app({"front door": "button.abb_front"})
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+
+        # Pressed the ABB button (not the ESP lock), armed exactly the ack
+        # watchdog, and scheduled NO ESP unlock_callback attempts.
+        self.assertEqual(app.service_calls, [("button/press", {"entity_id": "button.abb_front"})])
+        self.assertIn("front door", app._abb_watchdogs)
+        scheduled = [cb.__name__ for cb, _, _ in app.run_in_calls]
+        self.assertEqual(scheduled, ["on_timeout"])
+
+        # ESP lock reports the physical ack 0.8s later.
+        self.clock.at = NOW + timedelta(seconds=0.8)
+        self.states["lock.front"] = "unlocking"
+        app._on_esp_lock_ack("lock.front", "state", "locked", "unlocking", {"door_label": "front door"})
+
+        self.assertNotIn("front door", app._abb_watchdogs)
+        self.assertTrue(any("ABB-UNLOCK ok door=front door" in msg for _, msg in app.logs))
+        self.assertEqual(len(app.pushes), 1)
+        self.assertEqual(app.pushes[0]["title"], "Intercom auto-opened")
+        on_disk = json.loads((Path(self.tmpdir) / "intercom_state.json").read_text())
+        self.assertTrue(on_disk["binary_sensor.front"]["succeeded"])
+
+        # A later ack for the same, already-resolved watchdog must not double-report.
+        app._on_esp_lock_ack("lock.front", "state", "unlocking", "unlocked", {"door_label": "front door"})
+        self.assertEqual(len(app.pushes), 1)
+        # The ESP ladder itself was never touched.
+        self.assertEqual(app.service_calls, [("button/press", {"entity_id": "button.abb_front"})])
+
+    def test_abb_ack_timeout_falls_back_to_esp_success_reports_once(self):
+        app = self._app({"front door": "button.abb_front"})
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+        self.assertEqual(_run_scheduled(app, "on_timeout"), 1)
+        self.assertTrue(any(
+            level == "WARNING" and "ABB-UNLOCK timeout door=front door" in msg for level, msg in app.logs
+        ))
+        self.assertNotIn("front door", app._abb_watchdogs)
+
+        # Falls through to the UNCHANGED ESP ladder: unlock_repeat_count attempts.
+        scheduled = [cb.__name__ for cb, _, _ in app.run_in_calls]
+        self.assertEqual(scheduled, ["unlock_callback"] * app.unlock_repeat_count)
+
+        _run_scheduled(app, "unlock_callback")
+        self.assertIn(("lock/unlock", {"entity_id": "lock.front"}), app.service_calls)
+        self.states["lock.front"] = "unlocking"  # ESP's physical ack, before either verify runs
+        _run_scheduled(app, "_verify_unlock")
+
+        titles = [p["title"] for p in app.pushes]
+        self.assertEqual(titles, ["Intercom auto-opened"])  # exactly once, not once per attempt
+
+    def test_abb_ack_timeout_then_esp_failure_reports_once(self):
+        app = self._app({"front door": "button.abb_front"})
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+        _run_scheduled(app, "on_timeout")
+        _run_scheduled(app, "unlock_callback")
+        # Lock state never changes - every attempt fails to verify.
+        _run_scheduled(app, "_verify_unlock")
+
+        titles = [p["title"] for p in app.pushes]
+        self.assertEqual(titles, ["Intercom auto-open failed"])  # exactly once
+
+    def test_unconfigured_abb_unlock_doors_is_a_no_op(self):
+        app = self._app(abb_unlock_doors={})
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+
+        self.assertEqual(app.service_calls, [])  # no ABB button ever pressed
+        self.assertEqual(app._abb_watchdogs, {})
+        scheduled = [cb.__name__ for cb, _, _ in app.run_in_calls]
+        self.assertEqual(scheduled, ["unlock_callback"] * app.unlock_repeat_count)
+
+    def test_external_press_arms_watchdog_and_falls_back(self):
+        app = self._app({"front door": "button.abb_front"})
+        app._on_abb_button_state("button.abb_front", "state", "2020-01-01T00:00:00+00:00", NOW.isoformat(), {})
+
+        self.assertIn("front door", app._abb_watchdogs)
+        self.assertIsNone(app._abb_watchdogs["front door"]["trigger_entity"])
+        scheduled = [cb.__name__ for cb, _, _ in app.run_in_calls]
+        self.assertEqual(scheduled, ["on_timeout"])
+        self.assertTrue(any(
+            "ABB-UNLOCK external press detected door=front door" in msg for _, msg in app.logs
+        ))
+
+        _run_scheduled(app, "on_timeout")
+        self.assertNotIn("front door", app._abb_watchdogs)
+        scheduled = [cb.__name__ for cb, _, _ in app.run_in_calls]
+        self.assertEqual(scheduled, ["unlock_callback"] * app.unlock_repeat_count)
+
+        # No ring context - the ESP fallback runs, but there is no ring to
+        # report on, success or failure.
+        _run_scheduled(app, "unlock_callback")
+        self.states["lock.front"] = "unlocking"
+        _run_scheduled(app, "_verify_unlock")
+        self.assertEqual(app.pushes, [])
+
+    def test_own_press_does_not_arm_second_watchdog(self):
+        app = self._app({"front door": "button.abb_front"})
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+        self.assertEqual(len(app.run_in_calls), 1)  # the one watchdog _start_abb_unlock armed
+
+        # The state change our own press causes arrives back at the button entity.
+        app._on_abb_button_state("button.abb_front", "state", "unknown", NOW.isoformat(), {})
+
+        self.assertEqual(len(app.run_in_calls), 1)  # unchanged - no second watchdog armed
+
+    def test_stale_button_timestamp_is_ignored(self):
+        app = self._app({"front door": "button.abb_front"})
+        stale = (NOW - timedelta(hours=2)).isoformat()
+        app._on_abb_button_state("button.abb_front", "state", "unknown", stale, {})
+
+        self.assertEqual(app._abb_watchdogs, {})
+        self.assertEqual(app.run_in_calls, [])
+        self.assertTrue(any("stale" in msg.lower() for _, msg in app.logs))
 
 
 if __name__ == "__main__":

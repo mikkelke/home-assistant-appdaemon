@@ -53,3 +53,37 @@ Intercom:
   # this never re-attempts an unlock from initialize().
   resume_alert_max_age_s: 60
 
+  # --- ABB-native unlock experiment (2026-08-25) -----------------------------
+  # Today the street door is opened by the ESP32 bus module (front_lock/back_lock
+  # above). This lets HA open it instead, via the ABB Welcome integration's own
+  # button entity - HA is already the answering party on the SIP call, so it MIGHT
+  # keep the call up instead of the ~0.25s-later hangup the ESP's bus-level open
+  # causes today (which cuts the ring video recording short). Unproven - this is
+  # the experiment. abb_unlock_doors maps a door label (must match one of the
+  # ring_label values built into trigger_map above, e.g. "front door") to the ABB
+  # button entity to press INSTEAD of the ESP unlock sequence for that door; the
+  # ESP stays the fallback - and the ONLY physical confirmation a door actually
+  # opened (the ABB portal has never once reported a door-open event) - via an ack
+  # watchdog: if the ESP lock does not publish unlocking/unlocked within
+  # abb_unlock_ack_timeout_s of the ABB press, intercom.py falls through to the
+  # unchanged ESP retry ladder. Net effect of an ABB failure: the visitor waits
+  # ~abb_unlock_ack_timeout_s longer; they are never locked out.
+  #
+  # FRONT DOOR ONLY. button.abb_welcome_gateway_outdoor_station_2_1 (front door,
+  # station 100000002) takes the integration's "fast" unlock route - a standalone
+  # SIP MESSAGE, no second call, so it cannot collide with a ring recording.
+  # button.abb_welcome_gateway_outdoor_station_1_1 (back door, station 100000001)
+  # takes the "standard" route instead, which places its OWN SIP INVITE - a second
+  # call that WOULD kill the recording. Do not add the back door here.
+  #
+  # Default {} = exactly today's behaviour, a no-op: no extra listen_state
+  # registrations, no new branch touched by _handle_trigger. Enabling this for a
+  # door changes how a shared street door opens for every apartment on the
+  # building's intercom bus, not just this flat - flip it deliberately.
+  abb_unlock_doors: {}
+  # front door: "button.abb_welcome_gateway_outdoor_station_2_1"
+
+  # How long to wait for the ESP lock's own unlocking/unlocked ack after an ABB
+  # button press before giving up on it and falling back to the ESP sequence.
+  abb_unlock_ack_timeout_s: 2.5
+

@@ -5,6 +5,16 @@ from pathlib import Path
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
+# How recent a `button` entity's state (an ISO timestamp - HA reports the last
+# press time as the button's state) must be, relative to our own clock, to
+# count as a live press happening right now. Generous enough to absorb normal
+# HA/AppDaemon dispatch jitter; short enough to reject the classic restart/
+# restore replay of a stale last-pressed timestamp (typically minutes to hours
+# old, not seconds). Used by _on_abb_button_state for both freshness checks:
+# "is this a live press at all" and "is it OUR own press" (see
+# _own_abb_press_at).
+ABB_PRESS_FRESHNESS_S = 10
+
 # ---------------------------------------------------------------------------
 # Pure module-level function - unit-testable without an AppDaemon runtime (see
 # tests/test_intercom.py).
@@ -52,6 +62,21 @@ class Intercom(hass.Hass):
         # _resume_pending_rings).
         self.resume_alert_max_age_s = int(self.args.get("resume_alert_max_age_s", 60))
 
+        # ABB-native unlock experiment (see abb_unlock_doors in intercom.yaml):
+        # door label -> ABB Welcome button entity to press INSTEAD of starting
+        # the ESP unlock sequence for that door. Default {} - unconfigured is a
+        # no-op, byte-for-byte today's behaviour (see _handle_trigger below and
+        # the door_lock_info/abb_button_to_door wiring further down).
+        raw_abb_unlock_doors = self.args.get("abb_unlock_doors", {}) or {}
+        self.abb_unlock_doors = (
+            {str(k): str(v) for k, v in raw_abb_unlock_doors.items()}
+            if isinstance(raw_abb_unlock_doors, dict) else {}
+        )
+        # How long to wait for the ESP lock's own unlocking/unlocked ack after
+        # an ABB press before giving up on it and falling back to the ESP
+        # sequence (see _arm_abb_watchdog).
+        self.abb_unlock_ack_timeout_s = float(self.args.get("abb_unlock_ack_timeout_s", 2.5))
+
         # Messages
         self.msg_front = self.args.get("tts_message_front", "Someone is at the front door")
         self.msg_back = self.args.get("tts_message_back", "Someone is at the back door")
@@ -69,6 +94,8 @@ class Intercom(hass.Hass):
         self.last_trigger_at = {}
         self.pending_unlocks = {}  # Track scheduled unlock callbacks by entity
         self.unlock_outcomes = {}  # Per trigger entity: did any attempt of the current ring succeed
+        self._abb_watchdogs = {}  # door label -> pending ABB-ack watchdog record (see _arm_abb_watchdog)
+        self._own_abb_press_at = {}  # ABB button entity -> when WE last pressed it (see _start_abb_unlock)
         self._state_file = Path(__file__).with_name("intercom_state.json")
 
         # Validate entities exist
@@ -116,6 +143,30 @@ class Intercom(hass.Hass):
         else:
             sensors = ", ".join(self.trigger_map.keys())
             self.log(f"Intercom initialized; listening for rings on: {sensors}", level="INFO")
+
+        # ABB-native unlock wiring (see abb_unlock_doors in intercom.yaml), built
+        # from trigger_map so it only ever wires up doors that already have a
+        # configured ESP lock. Empty abb_unlock_doors (the default) means none of
+        # this runs: no extra listen_state registrations, no new branch touched by
+        # _handle_trigger below - today's behaviour, byte for byte.
+        self.door_lock_info = {}
+        for trig_info in self.trigger_map.values():
+            label = trig_info.get("ring_label")
+            if label and trig_info.get("lock"):
+                self.door_lock_info[label] = {"lock": trig_info["lock"], "door_sensor": trig_info.get("door_sensor")}
+        self.abb_button_to_door = {}
+        for door_label, abb_button in self.abb_unlock_doors.items():
+            lock_info = self.door_lock_info.get(door_label)
+            if not lock_info:
+                self.log(
+                    f"WARNING: abb_unlock_doors has {door_label!r} but no matching door/lock "
+                    f"is configured for it - ignoring", level="WARNING",
+                )
+                continue
+            self.abb_button_to_door[abb_button] = door_label
+            self.listen_state(self._on_esp_lock_ack, lock_info["lock"], door_label=door_label)
+            self.listen_state(self._on_abb_button_state, abb_button)
+            self.log(f"ABB-native unlock enabled for {door_label} via {abb_button}", level="INFO")
 
     def _get_notifier(self):
         try:
@@ -175,6 +226,8 @@ class Intercom(hass.Hass):
             entities_to_check.append(("back_door_sensor", self.back_door_sensor))
         if self.auto_open_entity:
             entities_to_check.append(("auto_open_boolean", self.auto_open_entity))
+        for door_label, abb_button in self.abb_unlock_doors.items():
+            entities_to_check.append((f"abb_unlock_doors[{door_label}]", abb_button))
 
         for name, entity_id in entities_to_check:
             state = self.get_state(entity_id)
@@ -305,6 +358,65 @@ class Intercom(hass.Hass):
                 self.log(f"Skipped {invalid_count} already-fired timer(s) for {entity}", level="DEBUG")
             del self.pending_unlocks[entity]
 
+    def _schedule_esp_unlock_sequence(self, entity, lock_entity, ring_ts, door_sensor):
+        """The original (pre-ABB) unlock ladder: unlock_repeat_count attempts,
+        unlock_delay_s then +unlock_repeat_interval_s apart, each verified 2s
+        later by _verify_unlock. No follow-up TTS needed since the ring-time
+        combined message already covers it (see _handle_trigger).
+
+        Used both directly (no abb_unlock_doors entry for this door) and as the
+        ABB-ack-timeout fallback (see _arm_abb_watchdog) - unchanged either way:
+        same retries, same verification, same failure alerting. `entity` is the
+        key into pending_unlocks/unlock_outcomes: the ring's own sensor entity
+        for a real ring, or a synthetic per-door key for an externally observed
+        ABB button press with no ring context (see _on_abb_button_state) - in
+        which case unlock_outcomes has no entry for it and _verify_unlock's
+        notification/house-feed branches simply stay dark, by design.
+        """
+        self.pending_unlocks[entity] = []
+        for i in range(self.unlock_repeat_count):
+            delay = self.unlock_delay_s + i * self.unlock_repeat_interval_s
+
+            # Store handle reference in a list to allow modification in closure
+            handle_ref = [None]  # Use list to allow modification in closure
+
+            # Bind loop variables via default args - a plain closure over these
+            # would capture them by reference, so every callback would see the
+            # LAST iteration's values (attempt_num == unlock_repeat_count, and the
+            # last handle_ref). That mislabelled every attempt as the final one,
+            # which tripped the "last attempt failed" report on the first verify
+            # instead of after the genuine last attempt. Default args are evaluated
+            # at def time, so each callback captures its own attempt_num/handle_ref.
+            trigger_ent = entity
+            attempt_num = i + 1
+
+            def unlock_callback(kwargs_inner, trigger_ent=trigger_ent, attempt_num=attempt_num, handle_ref=handle_ref):
+                # Remove handle from pending_unlocks when this timer fires
+                # This prevents "Invalid callback handle" warnings when trying to cancel
+                # an already-fired timer
+                if trigger_ent in self.pending_unlocks and handle_ref[0]:
+                    try:
+                        self.pending_unlocks[trigger_ent].remove(handle_ref[0])
+                        if not self.pending_unlocks[trigger_ent]:
+                            del self.pending_unlocks[trigger_ent]
+                    except (ValueError, KeyError):
+                        pass  # Handle already removed or doesn't exist
+                # Call the actual unlock function
+                kwargs_inner["trigger_entity"] = trigger_ent
+                kwargs_inner["unlock_attempt"] = attempt_num
+                self._perform_unlock(kwargs_inner)
+
+            handle = self.run_in(
+                unlock_callback,
+                delay,
+                lock_entity=lock_entity,
+                followup=None,
+                door_sensor=door_sensor,
+                ring_ts=ring_ts,
+            )
+            handle_ref[0] = handle  # Store handle for removal in callback
+            self.pending_unlocks[entity].append(handle)
+
     def _handle_trigger(self, entity, attr, old, new, kwargs):
         """Handle doorbell sensor trigger."""
         # Any edge landing on "on" is a ring worth announcing - including a replay
@@ -356,8 +468,6 @@ class Intercom(hass.Hass):
         # quiet-hours ring, where notify() returns early, buzzed in 2.0s).
         # The visitor is already standing at the door - open first, talk after.
         if auto_open_enabled:
-            # No follow-up TTS needed since the combined message covers it
-            self.pending_unlocks[entity] = []
             # Track whether ANY attempt of THIS ring succeeds; ring_ts guards
             # against a stale verify from a cancelled ring escalating falsely.
             ring_ts = self.last_trigger_at[entity]
@@ -366,51 +476,18 @@ class Intercom(hass.Hass):
                 "succeeded": False,
                 "ring_label": info.get("ring_label", "door"),
             }
-            for i in range(self.unlock_repeat_count):
-                delay = self.unlock_delay_s + i * self.unlock_repeat_interval_s
-
-                # Store handle reference in a list to allow modification in closure
-                handle_ref = [None]  # Use list to allow modification in closure
-
-                # Bind loop variables via default args - a plain closure over these
-                # would capture them by reference, so every callback would see the
-                # LAST iteration's values (attempt_num == unlock_repeat_count, and the
-                # last handle_ref). That mislabelled every attempt as the final one,
-                # which tripped the "last attempt failed" report on the first verify
-                # instead of after the genuine last attempt. Default args are evaluated
-                # at def time, so each callback captures its own attempt_num/handle_ref.
-                trigger_ent = entity
-                attempt_num = i + 1
-
-                def unlock_callback(kwargs_inner, trigger_ent=trigger_ent, attempt_num=attempt_num, handle_ref=handle_ref):
-                    # Remove handle from pending_unlocks when this timer fires
-                    # This prevents "Invalid callback handle" warnings when trying to cancel
-                    # an already-fired timer
-                    if trigger_ent in self.pending_unlocks and handle_ref[0]:
-                        try:
-                            self.pending_unlocks[trigger_ent].remove(handle_ref[0])
-                            if not self.pending_unlocks[trigger_ent]:
-                                del self.pending_unlocks[trigger_ent]
-                        except (ValueError, KeyError):
-                            pass  # Handle already removed or doesn't exist
-                    # Call the actual unlock function
-                    kwargs_inner["trigger_entity"] = trigger_ent
-                    kwargs_inner["unlock_attempt"] = attempt_num
-                    self._perform_unlock(kwargs_inner)
-
-                # Get door sensor for this trigger
-                door_sensor = info.get("door_sensor") if info else None
-
-                handle = self.run_in(
-                    unlock_callback,
-                    delay,
-                    lock_entity=lock_entity,
-                    followup=None,
-                    door_sensor=door_sensor,
-                    ring_ts=ring_ts,
-                )
-                handle_ref[0] = handle  # Store handle for removal in callback
-                self.pending_unlocks[entity].append(handle)
+            door_sensor = info.get("door_sensor")
+            abb_button = self.abb_unlock_doors.get(info.get("ring_label"))
+            if abb_button:
+                # ABB-native unlock experiment (see abb_unlock_doors in
+                # intercom.yaml): press the integration's button INSTEAD of
+                # starting the ESP ladder below, then watch for the ESP lock's
+                # own ack. Ack in time -> reported exactly like an ESP success.
+                # No ack in time -> falls through to the unchanged ESP sequence
+                # (see _arm_abb_watchdog's timeout closure).
+                self._start_abb_unlock(entity, ring_ts, lock_entity, door_sensor, info.get("ring_label"), abb_button)
+            else:
+                self._schedule_esp_unlock_sequence(entity, lock_entity, ring_ts, door_sensor)
 
             # Persist AFTER scheduling, BEFORE TTS (same latency-first ordering as
             # above - see _persist_ring) so a restart before any attempt is verified
@@ -454,6 +531,163 @@ class Intercom(hass.Hass):
             )
         except Exception as e:
             self.log(f"house_events_report failed: {e}", level="DEBUG")
+
+    def _start_abb_unlock(self, entity, ring_ts, lock_entity, door_sensor, door_label, abb_button):
+        """Ring-triggered ABB-native unlock (see abb_unlock_doors in
+        intercom.yaml): press `abb_button` INSTEAD of starting the ESP unlock
+        ladder, then arm the ack watchdog (_arm_abb_watchdog).
+
+        The press itself is offloaded to the executor exactly like
+        sonos_notifier.notify() above (see that comment): button/press is a
+        network round trip into the ABB integration's SIP client with no
+        measured latency bound from this app's point of view, and this app is
+        pinned to ONE thread - a blocking call_service here would stall the
+        watchdog's own timeout timer and every other Intercom callback. The
+        self-press marker (_own_abb_press_at) is written HERE, on the pinned
+        thread, BEFORE the offloaded call goes out, so _on_abb_button_state can
+        never observe the resulting state change before knowing to ignore it.
+        """
+        press_ts = self.get_now()
+        self._own_abb_press_at[abb_button] = press_ts
+        self._arm_abb_watchdog(door_label, lock_entity, door_sensor, press_ts, trigger_entity=entity, ring_ts=ring_ts)
+        self.log(
+            f"ABB-UNLOCK attempt door={door_label} button={abb_button} "
+            f"(ack timeout {self.abb_unlock_ack_timeout_s}s)", level="INFO",
+        )
+        self.submit_to_executor(self._press_abb_button, abb_button)
+
+    def _press_abb_button(self, abb_button):
+        """Executor-thread body of the ABB button press (see _start_abb_unlock) -
+        self-logs any failure, the same self-contained pattern
+        sonos_notifier.notify() and abb_welcome_bridge.py's _dial_clip use for
+        their own offloaded call_service calls."""
+        try:
+            self.call_service("button/press", entity_id=abb_button)
+        except Exception as e:
+            self.log(f"ABB-UNLOCK press failed for {abb_button}: {e}", level="ERROR")
+
+    def _arm_abb_watchdog(self, door_label, lock_entity, door_sensor, press_ts, trigger_entity=None, ring_ts=None):
+        """Arm the ack-timeout-then-ESP-fallback machinery for one ABB press on
+        `door_label`, superseding any watchdog already pending for it. Shared by
+        the app's own auto-open press (_start_abb_unlock) and an externally
+        observed one (_on_abb_button_state, called when the wall dashboard
+        presses the same button directly).
+
+        trigger_entity/ring_ts identify the ring this press belongs to, or are
+        None for a press with no ring context (a dashboard press with nobody
+        having rung) - in which case _on_esp_lock_ack's success bookkeeping and
+        _schedule_esp_unlock_sequence's failure bookkeeping both stay dark
+        (unlock_outcomes has no entry to update), since there is no ring to
+        report on. debounce_s normally keeps two presses on the same door far
+        enough apart that only one watchdog is ever pending at a time (it is
+        bigger than abb_unlock_ack_timeout_s by default) - the identity check in
+        on_timeout below keeps this correct even if that invariant is ever
+        misconfigured.
+        """
+        watchdog = {
+            "press_ts": press_ts,
+            "lock_entity": lock_entity,
+            "door_sensor": door_sensor,
+            "trigger_entity": trigger_entity,
+            "ring_ts": ring_ts,
+        }
+        self._abb_watchdogs[door_label] = watchdog
+
+        def on_timeout(kwargs_inner, door_label=door_label, watchdog=watchdog):
+            if self._abb_watchdogs.get(door_label) is not watchdog:
+                return  # already resolved (ack) or superseded by a newer press
+            del self._abb_watchdogs[door_label]
+            self.log(
+                f"ABB-UNLOCK timeout door={door_label} - no ESP ack within "
+                f"{self.abb_unlock_ack_timeout_s}s, falling back to ESP unlock sequence",
+                level="WARNING",
+            )
+            fallback_entity = watchdog["trigger_entity"] or f"abb_manual:{door_label}"
+            self._schedule_esp_unlock_sequence(
+                fallback_entity, watchdog["lock_entity"], watchdog["ring_ts"], watchdog["door_sensor"]
+            )
+
+        watchdog["timeout_handle"] = self.run_in(on_timeout, self.abb_unlock_ack_timeout_s)
+
+    def _on_esp_lock_ack(self, entity, attribute, old, new, kwargs):
+        """Permanent listener (one per abb_unlock_doors-configured lock, see
+        initialize) for the ESP's own unlocking/unlocked ack - the only
+        physical confirmation a door actually opened. Resolves a pending ABB
+        watchdog for that door as a success, reported exactly like an ESP
+        success (see _verify_unlock's own success branch, mirrored here)."""
+        try:
+            if new not in ("unlocking", "unlocked"):
+                return
+            door_label = kwargs.get("door_label")
+            watchdog = self._abb_watchdogs.get(door_label)
+            if watchdog is None:
+                return  # no pending ABB attempt for this door right now
+            del self._abb_watchdogs[door_label]
+            try:
+                handle = watchdog.get("timeout_handle")
+                if handle and self.timer_running(handle):
+                    self.cancel_timer(handle)
+            except Exception as e:
+                self.log(f"Unexpected error cancelling ABB watchdog timer for {door_label}: {e}", level="DEBUG")
+
+            elapsed = (self.get_now() - watchdog["press_ts"]).total_seconds()
+            self.log(f"ABB-UNLOCK ok door={door_label} +{elapsed:.1f}s", level="INFO")
+
+            trigger_entity = watchdog.get("trigger_entity")
+            ring_ts = watchdog.get("ring_ts")
+            # Same outcome bookkeeping as _verify_unlock's success branch, so the
+            # ABB path reports EXACTLY like an ESP success - one report per ring,
+            # regardless of which side opened the door. trigger_entity is None
+            # for an externally observed press with no ring context, so outcome
+            # stays None and nothing is reported (there is no ring to report on).
+            outcome = self.unlock_outcomes.get(trigger_entity) if trigger_entity else None
+            if outcome is not None and ring_ts is not None and outcome.get("ring_ts") != ring_ts:
+                outcome = None
+            first_success = outcome is not None and not outcome.get("succeeded")
+            if outcome is not None:
+                outcome["succeeded"] = True
+            if first_success:
+                self._mark_ring_succeeded(trigger_entity)
+                self._report_auto_open_success(trigger_entity, watchdog["lock_entity"], outcome, "abb")
+        except Exception as e:
+            self.log(f"ABB unlock ack handling failed for {entity}: {e}", level="WARNING")
+
+    def _on_abb_button_state(self, entity, attribute, old, new, kwargs):
+        """Fires on every press of a configured abb_unlock_doors button - ours
+        (via _start_abb_unlock) or external (the wall dashboard is expected to
+        press this same button directly). HA `button` entities report an ISO
+        timestamp as their state, so ANY press is a state change - including:
+        - our own: _start_abb_unlock already armed a watchdog for that press
+          directly; recognized here via _own_abb_press_at and ignored, or this
+          would arm a second, redundant watchdog for the same underlying press.
+        - a restart/restore replaying a stale last-pressed timestamp: rejected
+          by the freshness check below (ABB_PRESS_FRESHNESS_S), same reasoning
+          as the replay-edge guard in _handle_trigger.
+        Anything else is a genuine external press: arm the SAME ack watchdog +
+        ESP fallback as the app's own auto-open path, just with no ring context
+        to report against (see _arm_abb_watchdog).
+        """
+        try:
+            press_ts = self._parse_ts(new)
+            if press_ts is None:
+                self.log(f"Ignoring unparseable state on ABB button {entity}: {new!r}", level="DEBUG")
+                return
+            now = self.get_now()
+            age_s = (now - press_ts).total_seconds()
+            if age_s < 0 or age_s > ABB_PRESS_FRESHNESS_S:
+                self.log(f"Ignoring stale ABB button state on {entity}: {new} ({age_s:.1f}s old)", level="DEBUG")
+                return
+            own_press_at = self._own_abb_press_at.get(entity)
+            if own_press_at is not None and abs((now - own_press_at).total_seconds()) <= ABB_PRESS_FRESHNESS_S:
+                return  # our own press - _start_abb_unlock already armed its watchdog
+            door_label = self.abb_button_to_door.get(entity)
+            lock_info = self.door_lock_info.get(door_label) if door_label else None
+            if not lock_info:
+                return
+            self.log(f"ABB-UNLOCK external press detected door={door_label} button={entity}", level="INFO")
+            self._arm_abb_watchdog(door_label, lock_info["lock"], lock_info.get("door_sensor"), press_ts)
+        except Exception as e:
+            self.log(f"ABB button state handling failed for {entity}: {e}", level="WARNING")
 
     def _is_door_open(self, door_sensor):
         """Check if door is physically open based on door sensor."""
