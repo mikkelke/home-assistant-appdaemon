@@ -1481,6 +1481,38 @@ class NativeRingClipTests(unittest.TestCase):
         self.assertEqual([c for c in self.app.service_calls if c[0] == "abb_welcome/announce"], [])
         self.assertTrue(any(c[0] == "abb_welcome/play_audio" for c in self.app.service_calls))
 
+    def test_play_audio_payload_carries_media_content_type(self):
+        """REGRESSION 2026-08-25: the payload must satisfy the integration's schema.
+
+        abb_welcome/play_audio declares `vol.Required("media"): MediaSelector(...)`,
+        which requires BOTH media_content_id and media_content_type. We sent only
+        the id, so HA rejected every call with
+        `invalid_format: required key not provided @ data['media']['media_content_type']`
+        - and because AppDaemon 4.5.13's HASS plugin exposes no return_result, the
+        rejection arrived asynchronously as a websocket warning the app never saw.
+        Five days of silent doors (2026-08-20 .. 08-25) reported as "succeeded".
+        """
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.app._maybe_announce("front door")
+        _run_scheduled(self.app, "_native_voice_retry")
+
+        plays = [c for c in self.app.service_calls if c[0] == "abb_welcome/play_audio"]
+        self.assertTrue(plays, "expected at least one play_audio call")
+        for _service, kwargs in plays:
+            media = kwargs.get("media")
+            self.assertIsInstance(media, dict)
+            self.assertIn("media_content_id", media)
+            self.assertIn(
+                "media_content_type",
+                media,
+                "play_audio without media_content_type is rejected by the "
+                "integration and the rejection is invisible to this app",
+            )
+            self.assertTrue(str(media["media_content_type"]).strip())
+            self.assertTrue(
+                str(media["media_content_id"]).startswith("media-source://tts/")
+            )
+
     def test_native_voice_retries_until_success(self):
         episode = self.app._open_episode("front door", "100000002", self.clock.now())
         calls = {"n": 0}

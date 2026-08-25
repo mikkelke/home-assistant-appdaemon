@@ -1069,8 +1069,23 @@ class AbbWelcomeBridge(hass.Hass):
             self.call_service(
                 "abb_welcome/play_audio",
                 entity_id=camera,
-                media={"media_content_id": media_id},
+                # media_content_type is REQUIRED by the integration's
+                # MediaSelector schema - omitting it rejects the whole call
+                # with invalid_format. The handler itself only ever reads
+                # media_content_id, so the type only has to be present and
+                # well-formed. Leaving it out cost five days of silent doors
+                # (2026-08-20 to 08-25): the call was rejected every time and
+                # nothing here ever saw it, because AppDaemon 4.5.13's HASS
+                # plugin has no return_result (checked in hassplugin.py) - the
+                # rejection lands asynchronously as a websocket warning this
+                # thread never observes.
+                media={
+                    "media_content_id": media_id,
+                    "media_content_type": "music",
+                },
             )
+            # DISPATCHED, not spoken: see above, the result is unobservable
+            # from here. Do not upgrade this wording without a real signal.
             self.log(f"VOICE-IN-RECORDING door={door} message={message!r}", level="INFO")
             return True
         except Exception as e:
@@ -1293,7 +1308,11 @@ class AbbWelcomeBridge(hass.Hass):
             episode = self.episodes.get(episode_id)
             if episode is not None:
                 episode["voice_spoken"] = True
-            self.log(f"VOICE-NATIVE door={door} attempt={attempt}/5 succeeded", level="INFO")
+            # "dispatched", not "succeeded" - _voice_into_recording cannot
+            # observe whether HA accepted the call, let alone whether audio
+            # reached the door. Claiming success here is what hid the
+            # malformed-payload bug for five days.
+            self.log(f"VOICE-NATIVE door={door} attempt={attempt}/5 dispatched", level="INFO")
 
     # ------------------------------------------------------------------
     # Auto-open-OFF ring fallback: Open/Reject push + door voices
