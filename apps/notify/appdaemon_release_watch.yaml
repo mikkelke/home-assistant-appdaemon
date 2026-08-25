@@ -1,0 +1,38 @@
+# /conf/apps/notify/appdaemon_release_watch.yaml
+# Weekly tripwire: is it worth revisiting the check_app_updates() workaround?
+#
+# AppDaemon 4.5.13's check_app_updates() re-ast.parse()s every app .py file on the
+# event loop on EVERY utility-loop pass (~2.2s, 86% of the event loop blocked, a core
+# pinned - upstream issue #2599, AppDaemon/appdaemon, still unfixed on `dev`, no
+# released fix). The box's appdaemon.yaml now carries utility_delay: 15 /
+# max_utility_skew: 30 to cope (costs app-reload detection latency, ~1s -> ~17s - see
+# scripts/deploy.sh's `sleep 25`), and the docker image is pinned by digest in
+# /data/docker-compose.yaml, so upgrading is a deliberate act. This app polls the
+# public GitHub API (no auth) once a week for the latest AppDaemon/appdaemon release
+# and issue #2599's state, and pushes Mikkel a notification only when either actually
+# changed since the last check (see appdaemon_release_watch.py's module docstring for
+# the seeding behaviour on the very first run).
+
+AppdaemonReleaseWatch:
+  module: appdaemon_release_watch
+  class: AppdaemonReleaseWatch
+  # Init-order guarantee for get_app("MobileNotifier") cached in initialize(); also reloads this app when MobileNotifier reloads.
+  dependencies: MobileNotifier
+
+  # Version currently pinned (by digest) in /data/docker-compose.yaml - named in the
+  # notification so it's obvious how far behind a newly announced release is.
+  pinned_version: "4.5.13"
+
+  github_repo: "AppDaemon/appdaemon"
+  issue_number: 2599
+  request_timeout_seconds: 10
+
+  # Weekly check: check_day is a weekday name (monday..sunday), check_time is HH:MM:SS
+  # local. Plus a one-off check shortly after startup so a restart near the weekly slot
+  # can't silently skip a whole week.
+  check_day: "monday"
+  check_time: "09:00:00"
+  startup_check_delay_seconds: 90
+
+  notify_target: mikkel
+  state_file: /conf/apps/notify/appdaemon_release_watch_state.json
