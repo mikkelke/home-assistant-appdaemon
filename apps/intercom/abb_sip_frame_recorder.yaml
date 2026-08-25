@@ -1,0 +1,27 @@
+# /conf/apps/intercom/abb_sip_frame_recorder.yaml
+#
+# Diagnostic-only observer: does the ABB Welcome gateway ever send an INBOUND SIP
+# MESSAGE (some gateways use that for door-open broadcasts)? Log-level investigation
+# was inconclusive - the integration's own debug logging for this sits on paths that
+# were never exercised while watching logs live. The integration instead fires an
+# `abb_welcome_sip_frame` HA event for every SIP frame in both directions; this app
+# just counts them and remembers the one fact that matters (see
+# abb_sip_frame_recorder.py's module docstring). Purely additive and read-only: no
+# dependency on, or interaction with, abb_welcome_bridge.yaml / intercom.yaml - it
+# never calls a service.
+
+AbbSipFrameRecorder:
+  module: abb_sip_frame_recorder
+  class: AbbSipFrameRecorder
+  # No custom `log:` stream on purpose - see abb_welcome_bridge.yaml's comment: a
+  # stream not already declared in the box's appdaemon.yaml (outside this repo)
+  # instantiation-crashes the app on a fresh deploy.
+
+  sip_frame_event: "abb_welcome_sip_frame"
+
+  # Rolling buffer of the most recent frames - bounded so a chatty gateway (e.g.
+  # periodic SIP OPTIONS keepalives) cannot grow this without limit.
+  buffer_size: 200
+
+  summary_entity: "sensor.abb_sip_frame_recorder"
+  state_file: /conf/apps/intercom/abb_sip_frame_recorder_state.json
