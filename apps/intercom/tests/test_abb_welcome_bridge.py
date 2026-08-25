@@ -1513,6 +1513,40 @@ class NativeRingClipTests(unittest.TestCase):
                 str(media["media_content_id"]).startswith("media-source://tts/")
             )
 
+    def test_play_audio_rejection_is_seen_and_not_reported_as_spoken(self):
+        """A rejected service call must not count as a spoken sentence.
+
+        AppDaemon returns Home Assistant's whole websocket response from
+        call_service - hassplugin.receive_result() resolves the future with
+        `resp` before logging its own warning - so a rejection is visible here
+        as {"success": False, "error": {...}}. Throwing that away is what let
+        the 2026-08-20 malformed payload report "succeeded" for five days.
+        """
+        self.app.call_service = lambda service, **kwargs: {
+            "id": 154,
+            "type": "result",
+            "success": False,
+            "error": {"code": "invalid_format", "message": "required key not provided"},
+            "ad_status": "OK",
+        }
+        spoken = self.app._voice_into_recording(
+            "front door", "camera.abb_welcome_gateway_outdoor_station_2_1", "The door is open."
+        )
+        self.assertFalse(spoken, "a rejected play_audio must return False so the retry fires")
+
+    def test_play_audio_success_counts_as_spoken(self):
+        self.app.call_service = lambda service, **kwargs: {
+            "id": 155,
+            "type": "result",
+            "success": True,
+            "result": None,
+            "ad_status": "OK",
+        }
+        spoken = self.app._voice_into_recording(
+            "front door", "camera.abb_welcome_gateway_outdoor_station_2_1", "The door is open."
+        )
+        self.assertTrue(spoken)
+
     def test_native_voice_retries_until_success(self):
         episode = self.app._open_episode("front door", "100000002", self.clock.now())
         calls = {"n": 0}

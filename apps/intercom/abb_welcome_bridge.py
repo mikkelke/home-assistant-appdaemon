@@ -1066,7 +1066,7 @@ class AbbWelcomeBridge(hass.Hass):
         try:
             from urllib.parse import quote
             media_id = f"media-source://tts/{self.voice_tts_entity}?message={quote(message)}"
-            self.call_service(
+            result = self.call_service(
                 "abb_welcome/play_audio",
                 entity_id=camera,
                 # media_content_type is REQUIRED by the integration's
@@ -1074,18 +1074,27 @@ class AbbWelcomeBridge(hass.Hass):
                 # with invalid_format. The handler itself only ever reads
                 # media_content_id, so the type only has to be present and
                 # well-formed. Leaving it out cost five days of silent doors
-                # (2026-08-20 to 08-25): the call was rejected every time and
-                # nothing here ever saw it, because AppDaemon 4.5.13's HASS
-                # plugin has no return_result (checked in hassplugin.py) - the
-                # rejection lands asynchronously as a websocket warning this
-                # thread never observes.
+                # (2026-08-20 to 08-25).
                 media={
                     "media_content_id": media_id,
                     "media_content_type": "music",
                 },
             )
-            # DISPATCHED, not spoken: see above, the result is unobservable
-            # from here. Do not upgrade this wording without a real signal.
+            # CHECK THE RESULT. AppDaemon hands back Home Assistant's whole
+            # websocket response: hassplugin.receive_result() resolves the
+            # request future with `resp` and only THEN logs its own warning, so
+            # a rejected call arrives here as
+            # {"success": False, "error": {"code": ..., "message": ...}}.
+            # Discarding it is the only reason the malformed payload above
+            # survived five days while every attempt logged "succeeded".
+            if isinstance(result, dict) and result.get("success") is False:
+                err = result.get("error") or {}
+                self.log(
+                    f"VOICE-REJECTED door={door} camera={camera} "
+                    f"{err.get('code')}: {err.get('message')}",
+                    level="WARNING",
+                )
+                return False
             self.log(f"VOICE-IN-RECORDING door={door} message={message!r}", level="INFO")
             return True
         except Exception as e:
@@ -1308,11 +1317,12 @@ class AbbWelcomeBridge(hass.Hass):
             episode = self.episodes.get(episode_id)
             if episode is not None:
                 episode["voice_spoken"] = True
-            # "dispatched", not "succeeded" - _voice_into_recording cannot
-            # observe whether HA accepted the call, let alone whether audio
-            # reached the door. Claiming success here is what hid the
+            # "accepted" = HA ran the service without raising, which for
+            # play_audio means the PCM was written into the open talkback leg.
+            # _voice_into_recording now checks the websocket result, so this is
+            # a real signal rather than the unchecked claim that hid the
             # malformed-payload bug for five days.
-            self.log(f"VOICE-NATIVE door={door} attempt={attempt}/5 dispatched", level="INFO")
+            self.log(f"VOICE-NATIVE door={door} attempt={attempt}/5 accepted", level="INFO")
 
     # ------------------------------------------------------------------
     # Auto-open-OFF ring fallback: Open/Reject push + door voices
