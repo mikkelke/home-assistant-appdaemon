@@ -141,6 +141,10 @@ def _fake_handle_trigger_app(state_file, states):
     app.pending_unlocks = {}
     app.unlock_outcomes = {}
     app.abb_unlock_doors = {}  # unconfigured (default) - _handle_trigger's ABB branch must be a no-op
+    app.voice_before_unlock = {}  # unconfigured: unlock dispatches immediately
+    app.voice_before_unlock_message = "Door is opening."
+    app.voice_before_unlock_tts = "tts.piper"
+    app.voice_before_unlock_wait_s = 2.5
     app.auto_open_entity = "input_boolean.auto_open"
     app.debounce_s = 5
     app.unlock_delay_s = 1
@@ -234,7 +238,7 @@ def _run_scheduled(app, callback_name):
     return ran
 
 
-def _fake_abb_app(tmpdir, clock, states, abb_unlock_doors=None):
+def _fake_abb_app(tmpdir, clock, states, abb_unlock_doors=None, voice_before_unlock=None):
     """A bare Intercom instance with the full duck-typed AD surface the
     ABB-native unlock path touches: run_in is captured AND replayable (see
     _run_scheduled), submit_to_executor runs inline (so _press_abb_button's
@@ -257,6 +261,10 @@ def _fake_abb_app(tmpdir, clock, states, abb_unlock_doors=None):
     app.abb_unlock_doors = dict(abb_unlock_doors or {})
     app.abb_button_to_door = {v: k for k, v in app.abb_unlock_doors.items()}
     app.abb_unlock_ack_timeout_s = 2.5
+    app.voice_before_unlock = dict(voice_before_unlock or {})
+    app.voice_before_unlock_message = "Door is opening."
+    app.voice_before_unlock_tts = "tts.piper"
+    app.voice_before_unlock_wait_s = 2.5
     app._abb_watchdogs = {}
     app._own_abb_press_at = {}
 
@@ -314,8 +322,94 @@ class AbbNativeUnlockTests(unittest.TestCase):
         self.clock = Clock(NOW)
         self.states = {"input_boolean.auto_open": "on", "lock.front": "locked"}
 
-    def _app(self, abb_unlock_doors=None):
-        return _fake_abb_app(self.tmpdir, self.clock, self.states, abb_unlock_doors)
+    def _app(self, abb_unlock_doors=None, voice_before_unlock=None):
+        return _fake_abb_app(self.tmpdir, self.clock, self.states, abb_unlock_doors, voice_before_unlock)
+
+    # --- voice_before_unlock: ring -> recording -> announcement -> unlock ---
+
+    def test_voice_before_unlock_defers_the_unlock_and_speaks_first(self):
+        """The visitor is only in frame until the door opens, and this gateway
+        needs ~2s for a first video frame while the unlock fires at ~+0.45s -
+        so opening immediately guarantees an empty clip."""
+        app = self._app(
+            {"front door": "button.abb_front"},
+            voice_before_unlock={"front door": "camera.abb_front"},
+        )
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+
+        # Spoke, and did NOT press the button yet.
+        self.assertTrue(
+            any(c[0] == "abb_welcome/play_audio" for c in app.service_calls),
+            "should have spoken before unlocking",
+        )
+        self.assertEqual(
+            [c for c in app.service_calls if c[0] == "button/press"], []
+        )
+        self.assertIn("_deferred_unlock", [cb.__name__ for cb, _, _ in app.run_in_calls])
+
+        # ...and the unlock happens once the wait elapses.
+        _run_scheduled(app, "_deferred_unlock")
+        self.assertEqual(
+            [c for c in app.service_calls if c[0] == "button/press"],
+            [("button/press", {"entity_id": "button.abb_front"})],
+        )
+
+    def test_unlock_still_happens_when_the_voice_is_rejected(self):
+        """SAFETY: the announcement can never gate the door.
+
+        play_audio has been rejected outright and has sent zero packets on live
+        rings, so a voice failure must cost the wait and nothing else.
+        """
+        app = self._app(
+            {"front door": "button.abb_front"},
+            voice_before_unlock={"front door": "camera.abb_front"},
+        )
+
+        def reject(service, **kwargs):
+            app.service_calls.append((service, kwargs))
+            if service == "abb_welcome/play_audio":
+                return {"success": False, "error": {"code": "x", "message": "in use"}}
+            return None
+
+        app.call_service = reject
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+        _run_scheduled(app, "_deferred_unlock")
+        self.assertEqual(
+            [c for c in app.service_calls if c[0] == "button/press"],
+            [("button/press", {"entity_id": "button.abb_front"})],
+        )
+
+    def test_unlock_still_happens_when_the_voice_raises(self):
+        """A hung or throwing announcement must not leave the door shut."""
+        app = self._app(
+            {"front door": "button.abb_front"},
+            voice_before_unlock={"front door": "camera.abb_front"},
+        )
+
+        def boom(service, **kwargs):
+            if service == "abb_welcome/play_audio":
+                raise RuntimeError("tts exploded")
+            app.service_calls.append((service, kwargs))
+
+        app.call_service = boom
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+        _run_scheduled(app, "_deferred_unlock")
+        self.assertEqual(
+            [c for c in app.service_calls if c[0] == "button/press"],
+            [("button/press", {"entity_id": "button.abb_front"})],
+        )
+
+    def test_unconfigured_door_unlocks_immediately_as_before(self):
+        """No voice configured -> unchanged behaviour, no deferral."""
+        app = self._app({"front door": "button.abb_front"})
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+        self.assertEqual(
+            [c for c in app.service_calls if c[0] == "button/press"],
+            [("button/press", {"entity_id": "button.abb_front"})],
+        )
+        self.assertNotIn(
+            "_deferred_unlock", [cb.__name__ for cb, _, _ in app.run_in_calls]
+        )
 
     def test_abb_ack_in_time_succeeds_without_esp_unlock(self):
         app = self._app({"front door": "button.abb_front"})

@@ -101,3 +101,20 @@ Intercom:
   # button press before giving up on it and falling back to the ESP sequence.
   abb_unlock_ack_timeout_s: 2.5
 
+  # ring -> recording -> announcement -> unlock. The visitor stands in front of
+  # the intercom only until the door opens; this gateway needs ~2 s to produce
+  # a first video frame while the unlock used to fire at ~+0.45 s, so opening
+  # immediately guaranteed a clip of an empty doorstep - the original complaint
+  # that started this whole project. Speaking first buys the recording the
+  # seconds it needs. Against the 15-30 s a human answering the intercom would
+  # have taken, this is invisible to the visitor.
+  voice_before_unlock:
+    front door: "camera.abb_welcome_gateway_outdoor_station_2_1"
+  voice_before_unlock_message: "Door is opening."
+  voice_before_unlock_tts: "tts.piper"
+  # HARD bound, not a tuned delay. The unlock is scheduled at this value
+  # unconditionally and the voice runs alongside it, so a rejected, silent or
+  # hung announcement can never leave the door shut - it costs these seconds
+  # and nothing else. There is exactly one unlock path either way.
+  voice_before_unlock_wait_s: 2.5
+

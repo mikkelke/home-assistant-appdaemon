@@ -96,6 +96,26 @@ class Intercom(hass.Hass):
         self.unlock_outcomes = {}  # Per trigger entity: did any attempt of the current ring succeed
         self._abb_watchdogs = {}  # door label -> pending ABB-ack watchdog record (see _arm_abb_watchdog)
         self._own_abb_press_at = {}  # ABB button entity -> when WE last pressed it (see _start_abb_unlock)
+        # ring -> recording -> announcement -> unlock (Mikkel 2026-08-26). The
+        # visitor is only in front of the camera until the door opens, and this
+        # gateway needs ~2 s to produce its first video frame while the unlock
+        # fires at ~+0.45 s - so opening immediately guarantees an empty clip.
+        # Speaking first buys the recording the seconds it needs, and a couple
+        # of seconds is invisible against the 15-30 s a human answering would
+        # have taken. NOT a tuned delay: it is what the sequence costs.
+        raw_voice = self.args.get("voice_before_unlock", {}) or {}
+        self.voice_before_unlock = (
+            {str(k): str(v) for k, v in raw_voice.items()} if isinstance(raw_voice, dict) else {}
+        )
+        self.voice_before_unlock_message = str(
+            self.args.get("voice_before_unlock_message", "Door is opening.")
+        )
+        self.voice_before_unlock_tts = str(self.args.get("voice_before_unlock_tts", "tts.piper"))
+        # Hard bound. The unlock is scheduled at this delay UNCONDITIONALLY and
+        # the voice runs alongside it, so a rejected, silent or hung
+        # announcement can never leave the door shut - it costs these seconds
+        # and nothing else. There is exactly one unlock path either way.
+        self.voice_before_unlock_wait_s = float(self.args.get("voice_before_unlock_wait_s", 2.5))
         self._state_file = Path(__file__).with_name("intercom_state.json")
 
         # Validate entities exist
@@ -477,22 +497,42 @@ class Intercom(hass.Hass):
                 "ring_label": info.get("ring_label", "door"),
             }
             door_sensor = info.get("door_sensor")
-            abb_button = self.abb_unlock_doors.get(info.get("ring_label"))
-            if abb_button:
-                # ABB-native unlock experiment (see abb_unlock_doors in
-                # intercom.yaml): press the integration's button INSTEAD of
-                # starting the ESP ladder below, then watch for the ESP lock's
-                # own ack. Ack in time -> reported exactly like an ESP success.
-                # No ack in time -> falls through to the unchanged ESP sequence
-                # (see _arm_abb_watchdog's timeout closure).
-                self._start_abb_unlock(entity, ring_ts, lock_entity, door_sensor, info.get("ring_label"), abb_button)
+            ring_label = info.get("ring_label")
+            voice_camera = self.voice_before_unlock.get(ring_label)
+            if voice_camera:
+                # Speak first, then unlock. The unlock is scheduled here and
+                # cannot be cancelled by anything the voice does.
+                try:
+                    self.submit_to_executor(
+                        self._speak_before_unlock, ring_label, voice_camera
+                    )
+                except Exception as e:
+                    self.log(
+                        f"VOICE-BEFORE-UNLOCK dispatch failed for {ring_label}: {e}",
+                        level="WARNING",
+                    )
+                self.log(
+                    f"VOICE-BEFORE-UNLOCK door={ring_label} camera={voice_camera} "
+                    f"- unlock scheduled in {self.voice_before_unlock_wait_s}s",
+                    level="INFO",
+                )
+                self.run_in(
+                    self._deferred_unlock,
+                    self.voice_before_unlock_wait_s,
+                    entity=entity,
+                    ring_ts=ring_ts,
+                    lock_entity=lock_entity,
+                    door_sensor=door_sensor,
+                    ring_label=ring_label,
+                )
             else:
-                self._schedule_esp_unlock_sequence(entity, lock_entity, ring_ts, door_sensor)
+                self._dispatch_unlock(entity, ring_ts, lock_entity, door_sensor, ring_label)
 
             # Persist AFTER scheduling, BEFORE TTS (same latency-first ordering as
             # above - see _persist_ring) so a restart before any attempt is verified
             # can still alert on resume instead of silently forgetting the ring.
             self._persist_ring(entity, ring_ts, info.get("ring_label", "door"), lock_entity)
+
 
         # Send TTS - combined message if auto-open enabled, otherwise just initial message.
         # Offloaded to AppDaemon's executor pool (submit_to_executor): SonosNotifier.notify()
@@ -531,6 +571,92 @@ class Intercom(hass.Hass):
             )
         except Exception as e:
             self.log(f"house_events_report failed: {e}", level="DEBUG")
+
+    def _dispatch_unlock(self, entity, ring_ts, lock_entity, door_sensor, ring_label):
+        """Start the actual unlock: ABB button if this door has one, else ESP.
+
+        Extracted so it can run either immediately or after the door voice has
+        had its say - the two callers must not drift apart, because this is the
+        only code path that opens a door on a ring.
+        """
+        abb_button = self.abb_unlock_doors.get(ring_label)
+        if abb_button:
+            # ABB-native unlock (see abb_unlock_doors in intercom.yaml): press
+            # the integration's button INSTEAD of starting the ESP ladder, then
+            # watch for the ESP lock's own ack. Ack in time -> reported exactly
+            # like an ESP success. No ack in time -> falls through to the
+            # unchanged ESP sequence (see _arm_abb_watchdog's timeout closure).
+            self._start_abb_unlock(
+                entity, ring_ts, lock_entity, door_sensor, ring_label, abb_button
+            )
+        else:
+            self._schedule_esp_unlock_sequence(entity, lock_entity, ring_ts, door_sensor)
+
+    def _deferred_unlock(self, kwargs):
+        """Unlock after the door voice (see voice_before_unlock).
+
+        Scheduled unconditionally at ring time and never cancelled: whatever
+        the announcement did - rejected, silent, hung, or fine - the door still
+        opens here. Failure costs the wait and nothing else.
+        """
+        try:
+            self._dispatch_unlock(
+                kwargs.get("entity"),
+                kwargs.get("ring_ts"),
+                kwargs.get("lock_entity"),
+                kwargs.get("door_sensor"),
+                kwargs.get("ring_label"),
+            )
+        except Exception as e:
+            self.log(
+                f"Deferred unlock failed for {kwargs.get('ring_label')}: {e}",
+                level="ERROR",
+            )
+
+    def _speak_before_unlock(self, ring_label, camera):
+        """Executor-thread body: say the line into the station's OWN ring call.
+
+        Runs on the executor because call_service blocks (sync_decorator) and
+        this app is pinned to one thread. It deliberately cannot influence the
+        unlock - _deferred_unlock is already scheduled - so nothing here needs
+        to be fast or even to succeed.
+
+        Uses play_audio rather than announce: at this moment the station is in
+        a call with US, and announce dials a NEW call, which the gateway's one
+        call slot refuses. Whether the station renders audio on a call it
+        originated is exactly the open question (2026-08-26: 55 clean packets,
+        nothing audible), so this may be silent - the recording benefit of the
+        sequence stands either way.
+        """
+        try:
+            from urllib.parse import quote
+
+            media_id = (
+                f"media-source://tts/{self.voice_before_unlock_tts}"
+                f"?message={quote(self.voice_before_unlock_message)}"
+            )
+            result = self.call_service(
+                "abb_welcome/play_audio",
+                entity_id=camera,
+                media={"media_content_id": media_id, "media_content_type": "music"},
+            )
+            if isinstance(result, dict) and result.get("success") is False:
+                err = result.get("error") or {}
+                self.log(
+                    f"VOICE-BEFORE-UNLOCK REJECTED door={ring_label} "
+                    f"{err.get('code')}: {err.get('message')}",
+                    level="WARNING",
+                )
+                return
+            self.log(
+                f"VOICE-BEFORE-UNLOCK accepted door={ring_label} "
+                f"message={self.voice_before_unlock_message!r}",
+                level="INFO",
+            )
+        except Exception as e:
+            self.log(
+                f"VOICE-BEFORE-UNLOCK failed for {ring_label}: {e}", level="WARNING"
+            )
 
     def _start_abb_unlock(self, entity, ring_ts, lock_entity, door_sensor, door_label, abb_button):
         """Ring-triggered ABB-native unlock (see abb_unlock_doors in
