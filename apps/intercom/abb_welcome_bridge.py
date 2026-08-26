@@ -1323,6 +1323,35 @@ class AbbWelcomeBridge(hass.Hass):
             # a real signal rather than the unchecked claim that hid the
             # malformed-payload bug for five days.
             self.log(f"VOICE-NATIVE door={door} attempt={attempt}/5 accepted", level="INFO")
+            # DIAGNOSTIC (2026-08-26): HA accepts the call but nothing is
+            # audible at the street. Sample the station camera's talkback
+            # counters while the call is still up - they are reset on teardown,
+            # so reading them afterwards only ever shows zeros. Non-zero
+            # talkback_voice_packets means audio really was sent and the
+            # station simply did not render it; all-zero means our write path
+            # never produced anything. Those need different fixes, and this is
+            # the only thing that tells them apart. Two samples because the
+            # first can land before the sender has started.
+            for delay in (2, 5):
+                self.run_in(self._log_talkback_stats, delay, camera=camera,
+                            door=door, at=delay)
+
+    def _log_talkback_stats(self, kwargs):
+        """Log the station camera's live talkback counters (see caller)."""
+        camera = kwargs.get("camera")
+        door = kwargs.get("door")
+        at = kwargs.get("at")
+        try:
+            state = self.get_state(camera, attribute="all") or {}
+            attrs = state.get("attributes", {}) if isinstance(state, dict) else {}
+            stats = {
+                key: value
+                for key, value in attrs.items()
+                if key.startswith("talkback_")
+            }
+            self.log(f"VOICE-STATS door={door} +{at}s {stats}", level="INFO")
+        except Exception as e:
+            self.log(f"VOICE-STATS door={door} +{at}s read failed: {e}", level="INFO")
 
     # ------------------------------------------------------------------
     # Auto-open-OFF ring fallback: Open/Reject push + door voices
