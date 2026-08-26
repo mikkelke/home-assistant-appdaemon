@@ -102,6 +102,8 @@ def _bare_bridge(tmpdir, clock):
     app._last_ring_closed_at = {}
     app.announce_cameras = {"front door": "camera.abb_front"}
     app.announce_message = "The door is open."
+    app.announce_after_clip = True
+    app.announce_after_clip_delay_s = 1.0
     app.announce_cooldown_s = 90
     app.voice_tts_entity = "tts.piper"
     app.announce_ring_window_s = 60
@@ -1546,6 +1548,48 @@ class NativeRingClipTests(unittest.TestCase):
             "front door", "camera.abb_welcome_gateway_outdoor_station_2_1", "The door is open."
         )
         self.assertTrue(spoken)
+
+    def test_announce_after_clip_dials_once_the_clip_is_done(self):
+        """The audible path: dial after the clip has released the call slot.
+
+        play_audio into the station's own ring call reaches the wire (measured
+        55 voice packets, 0 send errors) and is still inaudible at the street;
+        dialling the station on demand works. Dialling BEFORE the clip finishes
+        is what used to kill the video, so this must wait for CLIP-NATIVE.
+        """
+        self.app.native_ring_clips = True
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        self.app._on_native_ring_clip(
+            "abb_welcome_ring_clip",
+            {
+                "reason": "ring",
+                "station_id": "100000002",
+                "ok": True,
+                "filename": "clip.mp4",
+                "duration_s": 8.3,
+                "frames": 53,
+                "segments": 1,
+            },
+            {},
+        )
+        _run_scheduled(self.app, "_announce_after_clip")
+        announces = [c for c in self.app.service_calls if c[0] == "abb_welcome/announce"]
+        self.assertEqual(len(announces), 1)
+        self.assertEqual(announces[0][1].get("message"), self.app.announce_message)
+
+    def test_announce_after_clip_is_skipped_for_a_dropped_clip(self):
+        """No clip means the call slot story is unknown - do not dial blind."""
+        self.app.native_ring_clips = True
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.app._on_native_ring_clip(
+            "abb_welcome_ring_clip",
+            {"reason": "ring", "station_id": "100000002", "ok": False},
+            {},
+        )
+        _run_scheduled(self.app, "_announce_after_clip")
+        self.assertEqual(
+            [c for c in self.app.service_calls if c[0] == "abb_welcome/announce"], []
+        )
 
     def test_native_voice_retries_until_success(self):
         episode = self.app._open_episode("front door", "100000002", self.clock.now())
