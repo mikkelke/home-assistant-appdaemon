@@ -88,6 +88,12 @@ Intercom:
   # Set back to {} to return to ESP-only opening.
   abb_unlock_doors:
     front door: "button.abb_welcome_gateway_outdoor_station_2_1"
+    # Back door added 2026-08-26 after two clean front-door runs (+0.3s, +0.4s).
+    # It was held back only to keep the first trial to one door, not for any
+    # property of this station. Also the sharpest test available for why the
+    # back-door ring call dies at 1.43s with zero RTP while the front door's
+    # lives ~8s: the unlock path was the one real difference between them.
+    back door: "button.abb_welcome_gateway_outdoor_station_1_1"
 
   # How long to wait for the ESP lock's own unlocking/unlocked ack after an ABB
   # button press before giving up on it and falling back to the ESP sequence.
