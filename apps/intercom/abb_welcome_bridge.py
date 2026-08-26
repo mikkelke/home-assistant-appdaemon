@@ -236,7 +236,7 @@ class AbbWelcomeBridge(hass.Hass):
         # unlock with nobody outside never talks to the street.
         raw_announce = self.args.get("announce_after_unlock", {}) or {}
         self.announce_cameras = {str(k): str(v) for k, v in raw_announce.items()} if isinstance(raw_announce, dict) else {}
-        self.announce_message = str(self.args.get("announce_message", "The door is open."))
+        self.announce_message = str(self.args.get("announce_message", "Door is opening."))
         self.announce_cooldown_s = int(self.args.get("announce_cooldown_s", 90))
         # TTS engine for speaking THROUGH a live recording (media-source URL fed to
         # abb_welcome/play_audio, which injects into the open stream's talkback leg

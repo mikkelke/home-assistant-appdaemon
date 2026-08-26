@@ -69,7 +69,13 @@ AbbWelcomeBridge:
   # "back door" here only after standing at it during an auto-open.
   announce_after_unlock:
     front door: camera.abb_welcome_gateway_outdoor_station_2_1
-  announce_message: "The door is open."
+  # "opening", not "open": there is a real gap between the sentence and the
+  # click - the announcement has to finish, the unlock has to travel, and the
+  # person then has to reach for the door. "The door is open." said before the
+  # click is simply wrong, and said after it is a log entry read aloud. This
+  # also matches what the back door's own hardware voice module says, so the
+  # two doors tell the household the same thing in the same words.
+  announce_message: "Door is opening."
   # Voices during a recording go THROUGH the recording's call (play_audio into the
   # open stream's talkback leg) using this TTS engine - so video and voice run
   # together instead of the voice being skipped. "" disables in-recording voices.
