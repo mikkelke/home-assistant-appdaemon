@@ -104,6 +104,8 @@ def _bare_bridge(tmpdir, clock):
     app.announce_message = "The door is open."
     app.announce_after_clip = True
     app.announce_after_clip_delay_s = 1.0
+    app.announce_after_clip_attempts = 5
+    app.announce_after_clip_retry_s = 6.0
     app.announce_cooldown_s = 90
     app.voice_tts_entity = "tts.piper"
     app.announce_ring_window_s = 60
@@ -1576,6 +1578,60 @@ class NativeRingClipTests(unittest.TestCase):
         announces = [c for c in self.app.service_calls if c[0] == "abb_welcome/announce"]
         self.assertEqual(len(announces), 1)
         self.assertEqual(announces[0][1].get("message"), self.app.announce_message)
+
+    def test_announce_after_clip_retries_while_the_station_is_in_use(self):
+        """The first attempt is refused: our own capture is still tearing down.
+
+        Measured 2026-08-26 18:55 - rejected at ring+16 s with "the selected
+        station may already be in use". One attempt lost the announcement to a
+        race, so it must keep trying until the station frees up.
+        """
+        self.app.native_ring_clips = True
+        calls = {"n": 0}
+
+        def busy_then_free(service, **kwargs):
+            self.app.service_calls.append((service, kwargs))
+            calls["n"] += 1
+            if calls["n"] < 3:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "home_assistant_error",
+                        "message": "the selected station may already be in use",
+                    },
+                }
+            return {"success": True}
+
+        self.app.call_service = busy_then_free
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.app._on_native_ring_clip(
+            "abb_welcome_ring_clip",
+            {"reason": "ring", "station_id": "100000002", "ok": True,
+             "filename": "clip.mp4", "duration_s": 8.3, "frames": 53, "segments": 1},
+            {},
+        )
+        for _ in range(5):
+            _run_scheduled(self.app, "_announce_after_clip")
+        self.assertEqual(calls["n"], 3, "should stop at the first accepted attempt")
+
+    def test_announce_after_clip_stops_at_the_attempt_cap(self):
+        """A station that never frees up must not retry forever."""
+        self.app.native_ring_clips = True
+        self.app.call_service = lambda service, **kwargs: (
+            self.app.service_calls.append((service, kwargs))
+            or {"success": False, "error": {"code": "x", "message": "in use"}}
+        )
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.app._on_native_ring_clip(
+            "abb_welcome_ring_clip",
+            {"reason": "ring", "station_id": "100000002", "ok": True,
+             "filename": "clip.mp4", "duration_s": 8.3, "frames": 53, "segments": 1},
+            {},
+        )
+        for _ in range(10):
+            _run_scheduled(self.app, "_announce_after_clip")
+        announces = [c for c in self.app.service_calls if c[0] == "abb_welcome/announce"]
+        self.assertEqual(len(announces), self.app.announce_after_clip_attempts)
 
     def test_announce_after_clip_is_skipped_for_a_dropped_clip(self):
         """No clip means the call slot story is unknown - do not dial blind."""
