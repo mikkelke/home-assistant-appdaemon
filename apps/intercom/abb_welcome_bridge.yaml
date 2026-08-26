@@ -88,12 +88,14 @@ AbbWelcomeBridge:
   announce_after_clip: true
   announce_after_clip_delay_s: 1
   # The first attempt is refused while our own capture tears the call down, so
-  # keep trying: 1 s after the clip, then every 6 s, 5 attempts. Worst case the
+  # keep trying: 1 s after the clip, then every 2 s, 12 attempts. Polling tightly
+  # matters: the station frees up at some unknown moment during teardown and a
+  # coarse interval just adds dead waiting to whoever is standing at the door.
   # voice lands ~+40 s after the ring - useless as a greeting, but this is
   # currently a DIAGNOSTIC: it answers whether the station renders our audio at
   # all, and every attempt logs its accept/reject reason.
-  announce_after_clip_attempts: 5
-  announce_after_clip_retry_s: 6
+  announce_after_clip_attempts: 12
+  announce_after_clip_retry_s: 2
   announce_cooldown_s: 90
   announce_ring_window_s: 60
 

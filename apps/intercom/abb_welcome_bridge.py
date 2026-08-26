@@ -255,8 +255,8 @@ class AbbWelcomeBridge(hass.Hass):
         # in use" - at clip completion our own capture is still tearing the call
         # down (measured 2026-08-26 18:55: rejected at ring+16 s). Retry until
         # the station frees up rather than losing the announcement to a race.
-        self.announce_after_clip_attempts = int(self.args.get("announce_after_clip_attempts", 5))
-        self.announce_after_clip_retry_s = float(self.args.get("announce_after_clip_retry_s", 6.0))
+        self.announce_after_clip_attempts = int(self.args.get("announce_after_clip_attempts", 12))
+        self.announce_after_clip_retry_s = float(self.args.get("announce_after_clip_retry_s", 2.0))
 
         # --- ring clip knobs (2026-08-13, "thumbnail and opening that give the video") ---
         # HA's native camera.record works against the integration's RTSP layer, but ONLY
