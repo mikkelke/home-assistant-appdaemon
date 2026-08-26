@@ -88,12 +88,14 @@ Intercom:
   # Set back to {} to return to ESP-only opening.
   abb_unlock_doors:
     front door: "button.abb_welcome_gateway_outdoor_station_2_1"
-    # Back door added 2026-08-26 after two clean front-door runs (+0.3s, +0.4s).
-    # It was held back only to keep the first trial to one door, not for any
-    # property of this station. Also the sharpest test available for why the
-    # back-door ring call dies at 1.43s with zero RTP while the front door's
-    # lives ~8s: the unlock path was the one real difference between them.
-    back door: "button.abb_welcome_gateway_outdoor_station_1_1"
+    # NO back door. Tried 2026-08-26 18:57 and REVERTED the same evening: the
+    # ABB button for station 1-1 never produces an unlock - both rings timed out
+    # after the full 2.5s ack window - and on the first ring all three ESP
+    # fallback attempts then failed too, so the door did not open at all
+    # (AUTO-OPEN FAILED). The front door's button works (+0.3s, +0.4s); this one
+    # does not. Do not re-enable without evidence that the button actually
+    # drives that lock - the suspicion is that pressing it leaves the station or
+    # the bus busy and breaks the ESP unlock that would otherwise have worked.
 
   # How long to wait for the ESP lock's own unlocking/unlocked ack after an ABB
   # button press before giving up on it and falling back to the ESP sequence.
