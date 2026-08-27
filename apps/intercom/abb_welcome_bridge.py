@@ -243,20 +243,6 @@ class AbbWelcomeBridge(hass.Hass):
         # instead of dialing its own call). Empty disables in-recording voices.
         self.voice_tts_entity = str(self.args.get("voice_tts_entity", "tts.piper"))
         self.announce_ring_window_s = int(self.args.get("announce_ring_window_s", 60))
-        # Speak again over a dial of OUR own once the ring clip is finished.
-        # Measured 2026-08-26: play_audio into the station's own ring call puts
-        # audio on the wire (55 voice packets, 0 send errors) yet nothing is
-        # audible at the street, while dialling the station on demand works.
-        # By clip-completion the station's single call slot is free, so this
-        # cannot collide with the recording the way the old pre-clip announce did.
-        self.announce_after_clip = bool(self.args.get("announce_after_clip", True))
-        self.announce_after_clip_delay_s = float(self.args.get("announce_after_clip_delay_s", 1.0))
-        # The first attempt is refused with "the selected station may already be
-        # in use" - at clip completion our own capture is still tearing the call
-        # down (measured 2026-08-26 18:55: rejected at ring+16 s). Retry until
-        # the station frees up rather than losing the announcement to a race.
-        self.announce_after_clip_attempts = int(self.args.get("announce_after_clip_attempts", 12))
-        self.announce_after_clip_retry_s = float(self.args.get("announce_after_clip_retry_s", 2.0))
 
         # --- ring clip knobs (2026-08-13, "thumbnail and opening that give the video") ---
         # HA's native camera.record works against the integration's RTSP layer, but ONLY
@@ -1275,68 +1261,8 @@ class AbbWelcomeBridge(hass.Hass):
                 f"frames={data.get('frames')} segments={data.get('segments')} {self._ring_rel(episode)}",
                 level="INFO",
             )
-            if self.announce_after_clip and self.announce_cameras.get(door):
-                self.run_in(
-                    self._announce_after_clip,
-                    self.announce_after_clip_delay_s,
-                    door=door,
-                    attempt=1,
-                )
         except Exception as e:
             self.log(f"Native ring-clip handling failed: {e}", level="WARNING")
-
-    def _announce_after_clip(self, kwargs):
-        """Say the announce message over our own dial, after the clip is done.
-
-        The in-recording play_audio path demonstrably reaches the wire and is
-        demonstrably inaudible, so this speaks over a temporary call instead -
-        the same path that predates native ring clips. Safe to dial here
-        precisely because the clip has finished and released the station's one
-        call slot; doing it any earlier is what used to kill the video.
-
-        Checks the websocket result rather than assuming, for the same reason
-        the malformed play_audio payload went unnoticed for five days.
-        """
-        door = kwargs.get("door")
-        attempt = int(kwargs.get("attempt", 1))
-        camera = self.announce_cameras.get(door)
-        if not camera:
-            return
-        try:
-            now = self.get_now()
-            # The integration's own continuation dial already shows in the ABB
-            # portal as call-answered; mask this one the same way so it is not
-            # misread as a human answering.
-            self._self_call_until[door] = now + timedelta(seconds=20)
-            result = self.call_service(
-                "abb_welcome/announce",
-                entity_id=camera,
-                message=self.announce_message,
-            )
-            if isinstance(result, dict) and result.get("success") is False:
-                err = result.get("error") or {}
-                self.log(
-                    f"ANNOUNCE-AFTER-CLIP REJECTED door={door} "
-                    f"attempt={attempt}/{self.announce_after_clip_attempts} "
-                    f"{err.get('code')}: {err.get('message')}",
-                    level="WARNING",
-                )
-                if attempt < self.announce_after_clip_attempts:
-                    self.run_in(
-                        self._announce_after_clip,
-                        self.announce_after_clip_retry_s,
-                        door=door,
-                        attempt=attempt + 1,
-                    )
-                return
-            self.log(
-                f"ANNOUNCE-AFTER-CLIP door={door} camera={camera} "
-                f"attempt={attempt}/{self.announce_after_clip_attempts} "
-                f"message={self.announce_message!r} accepted",
-                level="INFO",
-            )
-        except Exception as e:
-            self.log(f"Announce-after-clip failed for {door}: {e}", level="WARNING")
 
     def _native_voice_retry(self, kwargs):
         """native_ring_clips=true voice path: retry play_audio into whichever call
