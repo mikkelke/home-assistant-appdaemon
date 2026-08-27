@@ -51,8 +51,8 @@ Features:
    lag used to make that photo one visitor stale at push time, every time
    (measured +24.6 s on the 2026-08-27 18:57 ring against a push at +3.8 s);
    since then the attachment is freshness-gated on the same rule as the archive,
-   _nudge_screenshot_poll pulls the frame forward to ~ring+6 s, and
-   defer_ring_push holds the push ring_push_photo_wait_s so it can carry it.
+   and defer_ring_push holds the push ring_push_photo_wait_s so it carries this
+   ring's own frame instead.
 3. RING COMPARATOR - phase-2 evidence. Every ring seen by either side is paired
    within pair_window_s; results are counted (rings_both / rings_esp_only /
    rings_abb_only + lag stats), logged grep-friendly ("RING-CMP ..."), published
@@ -227,15 +227,12 @@ class AbbWelcomeBridge(hass.Hass):
         self.missed_decision_delay_s = int(self.args.get("missed_decision_delay_s", 15))  # unlock evidence lands by ring+9 s (measured); wait it out
         self.missed_max_age_s = int(self.args.get("missed_max_age_s", 900))  # ignore replayed/stale portal events
         self.snapshot_probe_s = int(self.args.get("snapshot_probe_s", 6))  # early probe; the poll usually beats it by lagging
-        # Pull the gateway screenshot forward instead of waiting out the poll cycle
-        # (_nudge_screenshot_poll). Empty list = exactly the old timing.
-        self.screenshot_poll_nudges_s = [
-            float(v) for v in self.args.get("screenshot_poll_nudges_s", [4, 9, 16])
-        ]
         # How long the auto-open push is held waiting for THIS ring's photo
-        # (defer_ring_push). 0 = send immediately, i.e. today's behaviour minus
-        # the stale image. Must stay well under episode_close_s.
-        self.ring_push_photo_wait_s = float(self.args.get("ring_push_photo_wait_s", 15))
+        # (defer_ring_push). Sized from six measured rings 2026-08-25..27, whose
+        # ring->photo lag ran 18.0-24.6 s; 30 leaves margin and stays well under
+        # episode_close_s. 0 = send immediately, i.e. today's behaviour minus the
+        # stale image.
+        self.ring_push_photo_wait_s = float(self.args.get("ring_push_photo_wait_s", 30))
         self.notify_target = self.args.get("notify_target", "home")
 
         # --- announce-after-unlock knobs (user + integration agreement 2026-08-12) ---
@@ -529,9 +526,22 @@ class AbbWelcomeBridge(hass.Hass):
         automatically"), not an alert - the Sonos announcement is what tells the
         house in real time. Waiting a few seconds for the gateway's screenshot
         turns a notification showing the previous visitor into one showing this
-        one. _nudge_screenshot_poll pulls that screenshot forward to ~ring+6 s,
-        and ring_push_photo_wait_s caps the wait so a poll that never lands
-        costs the photo and not the push."""
+        one - measured 18.0-24.6 s across six rings 2026-08-25..27, against a
+        push that goes out at ~ring+4 s.
+
+        The wait cannot be designed away: an early poll finds nothing. The lag
+        has a hard floor near 18 s (six samples, none faster) rather than the
+        uniform 0-30 s spread a poll-phase explanation would produce, so most of
+        it is the gateway's own upload to the ABB cloud, not the integration's
+        poll cycle. homeassistant/update_entity is no lever either - the image
+        entity is a plain ImageEntity listening to the coordinator, not a
+        CoordinatorEntity, so update_entity does not reach async_request_refresh
+        at all (tried and verified inert, 2026-08-27). If this ever needs to be
+        faster it takes a refresh service on the integration side AND the cloud
+        actually having the frame by then; neither is true today.
+
+        ring_push_photo_wait_s caps the wait, so a photo that never lands costs
+        the photo and not the push."""
         try:
             if not self.mobile_notifier:
                 return False
@@ -735,32 +745,9 @@ class AbbWelcomeBridge(hass.Hass):
                 # "recording" and retries once if not.
                 self.run_in(self._start_clip, self.clip_delay_s, episode_id=episode_id)
             self._arm_ring_voice(episode)
-            for offset in self.screenshot_poll_nudges_s:
-                self.run_in(self._nudge_screenshot_poll, offset, at=offset)
         except Exception as e:
             self.log(f"Episode timers failed for {episode_id}: {e}", level="WARNING")
         return episode
-
-    def _nudge_screenshot_poll(self, kwargs):
-        """Ask HA to poll the gateway now instead of waiting for the next cycle.
-
-        The gateway shoots its screenshot 1-3 s after a ring, but the integration
-        drives its own poll loop, so the frame usually surfaced 7-32 s later
-        (measured +24.6 s on the 2026-08-27 18:57 ring) - long after the auto-open
-        push and well into the visitor's walk upstairs. homeassistant/update_entity
-        on the image entity goes through the coordinator's own
-        async_request_refresh, which is debounced upstream, so a handful of these
-        is cheap and cannot stampede the cloud API.
-
-        Everything downstream is freshness-gated already, so an early poll that
-        returns nothing new is simply a no-op: this changes WHEN the right frame
-        arrives, never WHICH frame is accepted."""
-        try:
-            self.call_service("homeassistant/update_entity",
-                              entity_id=self.abb_image_entity)
-        except Exception as e:
-            self.log(f"Screenshot poll nudge at +{kwargs.get('at')}s failed: {e}",
-                     level="DEBUG")
 
     def _arm_ring_voice(self, episode):
         """Start the door sentence at the RING, not after the unlock.

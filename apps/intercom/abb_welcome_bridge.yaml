@@ -29,7 +29,7 @@ AbbWelcomeBridge:
   # --- ABB entities (read-only) ---
   abb_event_entity: "event.abb_welcome_gateway_intercom"           # cloud-polled portal events (30 s interval)
   abb_ringing_sensor: "binary_sensor.abb_welcome_gateway_intercom_ringing"  # realtime SIP ring, 5 s hold
-  abb_image_entity: "image.abb_welcome_gateway_latest_screenshot"  # gateway snapshot, poll-lagged 7-32 s after the ring
+  abb_image_entity: "image.abb_welcome_gateway_latest_screenshot"  # gateway snapshot, reaches HA 18-25 s after the ring (6 samples, 2026-08-25..27)
   abb_ring_bus_event: "abb_welcome_ring"                           # realtime HA bus event from the integration's SIP listener
 
   # --- ESP side (observed only - never actuated from here) ---
@@ -63,28 +63,26 @@ AbbWelcomeBridge:
   # in the notifcation is at least a image delayed - the current notification
   # have the ring before that") ---
   #
-  # The gateway shoots its screenshot 1-3 s after a ring, but the integration
-  # polls for it on its own cycle, so the frame surfaced 7-32 s later (+24.6 s on
-  # the 18:57 ring that evening) - long after the auto-open push at ~ring+4 s.
-  # Every one of those pushes therefore carried the PREVIOUS visitor. Two knobs
-  # fix it from both ends:
+  # The auto-open push goes out at ~ring+4 s; this ring's own gateway screenshot
+  # reaches HA 18.0-24.6 s after the ring (six measured rings 2026-08-25..27), so
+  # every push carried the PREVIOUS visitor. The attachment is now freshness-
+  # gated on the same rule the archive has always used - a missing photo is
+  # honest, the wrong person is misleading - and the push waits for the real one.
   #
-  # screenshot_poll_nudges_s: seconds after the ring at which to ask HA to poll
-  # the gateway now (homeassistant/update_entity -> the coordinator's own
-  # debounced async_request_refresh, so extra nudges are cheap and cannot
-  # stampede the cloud API). Brings the frame in around ring+6 s. This changes
-  # only WHEN the right frame arrives - every consumer is freshness-gated, so an
-  # early poll that returns nothing new is a no-op. [] = the old timing.
-  screenshot_poll_nudges_s: [4, 9, 16]
   # ring_push_photo_wait_s: how long intercom.py's auto-open push is held waiting
-  # for THIS ring's photo before going out text-only. The push is a record, not
-  # an alert - the Sonos announcement is what tells the house in real time - so a
-  # few seconds cost nothing and buy the right face. Must stay well under
-  # episode_close_s (75). 0 = send immediately, i.e. today's behaviour minus the
-  # stale image: the attachment is freshness-gated either way now, on the same
-  # rule the archive has always used (a missing photo is honest, the wrong
-  # person is misleading).
-  ring_push_photo_wait_s: 15
+  # for that photo before going out text-only. The push is a RECORD ("the door
+  # was unlocked automatically"), not an alert - the Sonos announcement is what
+  # tells the house in real time - so ~22 s buys the right face at no cost that
+  # matters. Must stay well under episode_close_s (75). 0 = send immediately,
+  # which is today's behaviour minus the stale image.
+  #
+  # Not tunable from here: the lag has a hard floor near 18 s across all six
+  # samples, so it is mostly the gateway's upload to the ABB cloud rather than
+  # the integration's poll cycle - an earlier poll would find nothing. And
+  # homeassistant/update_entity is not even a lever: the image entity is a plain
+  # ImageEntity listening to the coordinator, not a CoordinatorEntity, so it
+  # never reaches async_request_refresh (tried and verified inert 2026-08-27).
+  ring_push_photo_wait_s: 30
 
   # Missed-call push audience: everyone home, no category restriction.
   notify_target: "home"

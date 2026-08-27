@@ -100,8 +100,7 @@ def _bare_bridge(tmpdir, clock):
     app.door_open_ring_window_s = 90
     app._last_door_open_edge_at = {}
     app._last_ring_closed_at = {}
-    app.screenshot_poll_nudges_s = [4.0, 9.0, 16.0]
-    app.ring_push_photo_wait_s = 15.0
+    app.ring_push_photo_wait_s = 30.0
     app.announce_cameras = {"front door": "camera.abb_front"}
     app.announce_message = "The door is open."
     app.announce_cooldown_s = 90
@@ -905,25 +904,6 @@ class RingPushPhotoTests(unittest.TestCase):
         self.app.run_in_calls = []  # the deadline timer never fires
         self.app._close_episode({"episode_id": episode["id"]})
         self.assertEqual(len(self.pushes), 1)
-
-    # --- poll nudge ---
-
-    def test_ring_nudges_the_screenshot_poll(self):
-        self.app._open_episode("front door", "100000002", self.clock.now())
-        delays = sorted(delay for cb, delay, _kw in self.app.run_in_calls
-                        if cb.__name__ == "_nudge_screenshot_poll")
-        self.assertEqual(delays, [4.0, 9.0, 16.0])
-        _run_scheduled(self.app, "_nudge_screenshot_poll")
-        updates = [c for c in self.app.service_calls
-                   if c[0] == "homeassistant/update_entity"]
-        self.assertEqual(len(updates), 3)
-        self.assertEqual(updates[0][1]["entity_id"], self.app.abb_image_entity)
-
-    def test_nudges_can_be_switched_off(self):
-        self.app.screenshot_poll_nudges_s = []
-        self.app._open_episode("front door", "100000002", self.clock.now())
-        self.assertEqual([cb.__name__ for cb, _, _ in self.app.run_in_calls
-                          if cb.__name__ == "_nudge_screenshot_poll"], [])
 
 
 if __name__ == "__main__":
