@@ -85,10 +85,21 @@ AbbWelcomeBridge:
   # three human nulls at the door) but DOES on a call HA dialled. The
   # integration's continuation dial fires ~ring+8 s with media ~+10 s, so wait
   # for the ring call to be gone and let the attempts land there instead.
-  # We now DIAL on a ring instead of answering, so our own call has media at
-  # ~+2 s and the sentence can land before the door opens - which is the only
-  # time it is worth anything.
-  voice_start_delay_s: 2.5
+  # We answer the ring again, now that the answer negotiates AVPF like our own
+  # working dial does - static analysis of the official app showed its "open
+  # speak" is exactly that and nothing more. The answered call's talkback leg is
+  # ready within ~0.03 s (measured 18:57:30.652 accept -> .676 leg ready), so
+  # speak early; the retry chain covers the cases where it is not up yet.
+  #
+  # ANCHORED TO THE RING since 2026-08-27 (_arm_ring_voice), not to the unlock.
+  # This delay used to be measured from the lock's own unlocking/unlocked edge,
+  # which is the only thing that ever called _maybe_announce - so the sentence
+  # could not physically start until after the door had already opened. That
+  # ring: door open at +3.9 s, sentence dispatched at +7.0 s, and the station
+  # hung up at +9.0 s. intercom.py's 3.5 s hold bought nothing at all. From the
+  # ring the order is finally the one asked for: answer+record at +0.03 s,
+  # sentence at +1.5 s (a short line runs ~1.5 s), unlock at +3.5 s.
+  voice_start_delay_s: 1.5
   announce_cooldown_s: 90
   announce_ring_window_s: 60
 

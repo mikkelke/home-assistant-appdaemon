@@ -1660,6 +1660,80 @@ class NativeRingClipTests(unittest.TestCase):
         self.assertTrue(episode["voice_spoken"])
 
 
+class RingArmedVoiceTests(unittest.TestCase):
+    """The sentence starts at the RING, not after the unlock (2026-08-27).
+
+    Mikkel's sequence is recording -> announcement -> unlock, and intercom.py
+    already holds the unlock voice_before_unlock_wait_s to make room for it. But
+    the sentence hung off _maybe_announce, whose only trigger is the lock's own
+    unlocking/unlocked edge, so it could not physically start until AFTER the door
+    had opened. Measured on the 18:57 front-door ring that evening: door open at
+    ring+3.9 s, sentence dispatched at ring+7.0 s. The hold bought nothing.
+    """
+
+    def setUp(self):
+        self.clock = Clock(datetime(2026, 8, 27, 18, 57, 30, tzinfo=timezone.utc))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.app = _bare_bridge(self.tmp.name, self.clock)
+        self.app.native_ring_clips = True
+        self.app.voice_start_delay_s = 1.5
+        self.app.states[("input_boolean.auto_open_intercom", None)] = "on"
+
+    def _voice_delays(self):
+        return [delay for cb, delay, _kw in self.app.run_in_calls
+                if cb.__name__ == "_native_voice_retry"]
+
+    def test_ring_arms_the_voice_before_the_unlock_lands(self):
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        # voice_before_unlock_wait_s is 3.5 s in intercom.yaml; the sentence has
+        # to be dispatched strictly before that or it is an after-the-fact log
+        # entry read aloud at the street.
+        self.assertEqual(self._voice_delays(), [1.5])
+
+    def test_armed_chain_and_a_later_unlock_confirm_speak_once(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        _run_scheduled(self.app, "_native_voice_retry")   # the ring-armed attempt 1
+        self.assertTrue(episode["voice_spoken"])
+        self.app._maybe_announce("front door")            # unlock edge, moments later
+        _run_scheduled(self.app, "_native_voice_retry")
+        calls = [c for c in self.app.service_calls if c[0] == "abb_welcome/play_audio"]
+        self.assertEqual(len(calls), 1)
+
+    def test_auto_open_off_leaves_the_unlock_trigger_in_charge(self):
+        # Nobody has promised the door will open yet - a human still has to press
+        # Open on the ring push. Announcing "Door is opening." at the ring would
+        # be a lie the house cannot keep.
+        self.app.states[("input_boolean.auto_open_intercom", None)] = "off"
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.assertEqual(self._voice_delays(), [])
+
+    def test_door_without_an_announce_camera_stays_silent(self):
+        # The back door has its own hardware voice module; two overlapping
+        # voices are worse than none.
+        self.app._open_episode("back door", "100000001", self.clock.now())
+        self.assertEqual(self._voice_delays(), [])
+
+    def test_native_off_does_not_arm_at_the_ring(self):
+        # The legacy path dials a temporary call for the announce and must keep
+        # yielding to the recording exactly as before.
+        self.app.native_ring_clips = False
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.assertEqual(self._voice_delays(), [])
+
+    def test_empty_announce_message_arms_nothing(self):
+        self.app.announce_message = ""
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.assertEqual(self._voice_delays(), [])
+
+    def test_unreadable_auto_open_stays_silent(self):
+        # _auto_open_on() treats unreadable as off; arming on a door that may
+        # never open is the one failure mode that reaches the street.
+        self.app.states.pop(("input_boolean.auto_open_intercom", None), None)
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.assertEqual(self._voice_delays(), [])
+
+
 class DoorOpenFeedTests(unittest.TestCase):
     """Street-door open feed (2026-08-25, module docstring item 5): every ESP
     unlock edge reports ONE house_events_report, classified by whether a ring

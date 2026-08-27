@@ -620,9 +620,44 @@ class AbbWelcomeBridge(hass.Hass):
                 # _confirm_clip_recording checks the camera actually entered
                 # "recording" and retries once if not.
                 self.run_in(self._start_clip, self.clip_delay_s, episode_id=episode_id)
+            self._arm_ring_voice(episode)
         except Exception as e:
             self.log(f"Episode timers failed for {episode_id}: {e}", level="WARNING")
         return episode
+
+    def _arm_ring_voice(self, episode):
+        """Start the door sentence at the RING, not after the unlock.
+
+        The sequence Mikkel asked for is recording -> announcement -> unlock, and
+        intercom.py already holds the unlock voice_before_unlock_wait_s to make
+        room for it. The sentence itself, though, hung off _maybe_announce, whose
+        only trigger is the lock's own unlocking/unlocked edge - so it could not
+        physically start until after the door had opened. Measured on the
+        2026-08-27 18:57 front-door ring: door open at ring+3.9 s, sentence
+        dispatched at ring+7.0 s, i.e. the whole 3.5 s hold bought nothing and the
+        announcement landed where Mikkel has said repeatedly it has no value.
+
+        Anchored here it runs at ring+voice_start_delay_s (1.5 s), inside the
+        answered ring call - which the integration accepts within ~0.03 s and the
+        station tears down at ~ring+9 s - and finishes before the unlock at +3.5 s.
+
+        Only with auto-open ON: then the door WILL open (intercom.py schedules that
+        unconditionally at ring time), so promising it is truthful. With auto-open
+        OFF a human still has to press Open, and the existing post-unlock path in
+        _maybe_announce stays the trigger - the episode's voice_dispatched flag
+        keeps the two from both speaking.
+        """
+        door = episode.get("door")
+        if not (self.native_ring_clips and self.announce_message):
+            return
+        camera = self.announce_cameras.get(door)
+        if not camera or not self._auto_open_on():
+            return
+        self.run_in(self._native_voice_retry, self.voice_start_delay_s,
+                    episode_id=episode["id"], door=door,
+                    camera=camera, message=self.announce_message, attempt=1)
+        self.log(f"VOICE-ARMED door={door} camera={camera} at ring+{self.voice_start_delay_s}s",
+                 level="INFO")
 
     # ------------------------------------------------------------------
     # Comparator (phase-2 evidence machine)
