@@ -628,6 +628,12 @@ class Intercom(hass.Hass):
         nothing audible), so this may be silent - the recording benefit of the
         sequence stands either way.
         """
+        if not self.voice_before_unlock_message:
+            # Empty message = hold the door but say nothing here. The bridge
+            # owns the sentence now: it speaks into the call HA dialled, which
+            # is the only one the station renders. Two speakers would either
+            # collide on the single call slot or talk over each other.
+            return
         try:
             from urllib.parse import quote
 

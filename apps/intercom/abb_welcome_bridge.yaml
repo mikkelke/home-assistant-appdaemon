@@ -85,7 +85,10 @@ AbbWelcomeBridge:
   # three human nulls at the door) but DOES on a call HA dialled. The
   # integration's continuation dial fires ~ring+8 s with media ~+10 s, so wait
   # for the ring call to be gone and let the attempts land there instead.
-  voice_start_delay_s: 9
+  # We now DIAL on a ring instead of answering, so our own call has media at
+  # ~+2 s and the sentence can land before the door opens - which is the only
+  # time it is worth anything.
+  voice_start_delay_s: 2.5
   announce_cooldown_s: 90
   announce_ring_window_s: 60
 

@@ -110,11 +110,17 @@ Intercom:
   # have taken, this is invisible to the visitor.
   voice_before_unlock:
     front door: "camera.abb_welcome_gateway_outdoor_station_2_1"
-  voice_before_unlock_message: "Door is opening."
+  # EMPTY on purpose: intercom.py holds the door, the bridge says the sentence.
+  # The bridge speaks into the call HA dialled (the only one the station
+  # renders); intercom.py could only speak into the station's own ring call,
+  # which is provably silent. Two speakers would collide on the single call slot.
+  voice_before_unlock_message: ""
   voice_before_unlock_tts: "tts.piper"
   # HARD bound, not a tuned delay. The unlock is scheduled at this value
   # unconditionally and the voice runs alongside it, so a rejected, silent or
   # hung announcement can never leave the door shut - it costs these seconds
   # and nothing else. There is exactly one unlock path either way.
-  voice_before_unlock_wait_s: 2.5
+  # Long enough for the bridge's sentence to finish: our dial gets media at
+  # ~+2 s, the bridge speaks at +2.5 s, a short line runs ~1.5 s.
+  voice_before_unlock_wait_s: 4.5
 
