@@ -14,6 +14,10 @@ class SonosFollowMe(hass.Hass):
     • Follow-me runs whenever relevant (grouped or solo), with rules: living_room, kristines_room, and sometimes rooftop do not activate follow-me when solo.
     • desired_mute = not present (unmute if someone in room, mute if not). Only applies to speakers that are actually playing.
     • Kitchen uses kitchen OR hallway presence; rooftop undocked is always present, docked follows living_room.
+    • Bedroom (special_conditions.bedroom_with_bed_session) is present if the PIR group OR the
+      bed-session latch (input_boolean.bedroom_bed_session, bedroom_lights' 90s-debounced
+      multi-witness signal) is on. The raw group flickers off for 30-90s while someone lies
+      still; the session is additive only - it can only ADD presence, never remove it.
     • Kitchen presence trust (presence_trust.py): mmWave-only kitchen presence while the kitchen speaker
       plays is SUSPECT - _is_present returns None (indeterminate), so every caller skips the mute change:
       a ghost can never unmute (the ON trigger), and a possibly-real still person is never muted either.
@@ -29,6 +33,8 @@ class SonosFollowMe(hass.Hass):
         self.settle      = float(self.args.get("settle_seconds", 2))
         self.reset_resume_delay = float(self.args.get("reset_resume_delay", 2.5))
         self.special     = self.args.get("special_conditions", {})
+        # Bed-session latch owned by bedroom_lights (same key name as bedroom_lights.yaml / wakeup_bedroom.yaml)
+        self.bed_session_entity = self.args.get("bed_session_entity", "input_boolean.bedroom_bed_session")
         self.entity_friendly_name_map = self.args.get("entity_friendly_name_map", {})
         self._friendly_to_entity_map = {v: k for k, v in self.entity_friendly_name_map.items()}
         self._last       = {}      # now a dict: room -> last timestamp
@@ -92,6 +98,11 @@ class SonosFollowMe(hass.Hass):
         if "living_room" in self.room_map and self.special.get("rooftop_with_living_room"):
             self.listen_state(self._on_living_room_presence_change,
                              self.room_map["living_room"])
+
+        # Bedroom counts the bed-session latch as an extra presence witness (see class
+        # docstring); session edges re-evaluate the bedroom through the normal machinery.
+        if "bedroom" in self.room_map and self.special.get("bedroom_with_bed_session"):
+            self.listen_state(self._presence_changed, self.bed_session_entity, room="bedroom")
 
         # NEW CODE: Listen for direct group update events from GroupManager
         self.listen_event(self._on_sonos_group_update, "sonos_group_update")
@@ -340,6 +351,30 @@ class SonosFollowMe(hass.Hass):
             self.log(f"Scenario: kitchen_presence -> kitchen:{kitchen_state} hallway:{hallway_state} result:{result}", level="INFO")
             return result
             
+        # Special case for bedroom - the raw group (zero-debounce OR) flickers off for
+        # 30-90s stretches while someone lies still, so the bed-session latch
+        # (input_boolean.bedroom_bed_session, bedroom_lights' 90s-debounced multi-witness
+        # signal) counts as an additional witness. Additive OR only: the session can make
+        # the bedroom read MORE present, never less - a real group ON always still wins.
+        if room == "bedroom" and self.special.get("bedroom_with_bed_session"):
+            group_state = self.get_state(self.room_map["bedroom"])
+            session_state = self.get_state(self.bed_session_entity)
+            present_values = ["on", "home", "detected", "present", "occupied", "true", "yes"]
+            # Determine known/unknown
+            g_raw = None if group_state is None else str(group_state).lower()
+            s_raw = None if session_state is None else str(session_state).lower()
+            g_unknown = (g_raw is None) or (g_raw in ["unknown", "unavailable"])
+            s_unknown = (s_raw is None) or (s_raw in ["unknown", "unavailable"])
+            g_present = (not g_unknown) and (g_raw in present_values)
+            s_present = (not s_unknown) and (s_raw in present_values)
+            # If both are unknown, we cannot decide
+            if g_unknown and s_unknown:
+                self.log(f"Scenario: bedroom_presence -> both_unknown (group:{group_state} session:{session_state}), ignoring", level="WARNING")
+                return None
+            result = g_present or s_present
+            self.log(f"Scenario: bedroom_presence -> group:{group_state} session:{session_state} result:{result}", level="INFO")
+            return result
+
         # Handle regular rooms (entity may be a HA template that already combines motion + presence, etc.)
         sensor = self.room_map.get(room)
         if not sensor:
@@ -560,7 +595,8 @@ class SonosFollowMe(hass.Hass):
         present = None
         # Use _is_present for special cases with derived logic
         if (room == "rooftop" or speaker_entity.endswith("rooftop") or
-            (room == "kitchen" and self.special.get("kitchen_or_hallway"))):
+            (room == "kitchen" and self.special.get("kitchen_or_hallway")) or
+            (room == "bedroom" and self.special.get("bedroom_with_bed_session"))):
             present = self._is_present(room, speaker_entity)
             self.log(f"Scenario: presence_calculation -> {room} presence: {present}", level="INFO")
         else:

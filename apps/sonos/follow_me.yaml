@@ -66,7 +66,13 @@ SonosFollowMe:
   # then reads indeterminate: no unmute on a ghost, no mute on a possibly-real still person.
   presence_suspect_after_minutes: 10
 
+  # Bed-session latch owned by bedroom_lights (90s-debounced, multi-witness "in bed" signal,
+  # exits only 90s after FP300 presence clears). The raw bedroom group above is a zero-debounce
+  # OR that flickers off for 30-90s stretches while someone lies still, muting the room mid-use.
+  bed_session_entity: input_boolean.bedroom_bed_session
+
   # Special conditions for room presence
   special_conditions:
     kitchen_or_hallway: true   # Kitchen should unmute if either kitchen or hallway has presence
     rooftop_with_living_room: true  # Rooftop should only unmute with living room presence + charging
+    bedroom_with_bed_session: true  # Bedroom is present if the PIR group OR the bed-session latch is on (additive only)

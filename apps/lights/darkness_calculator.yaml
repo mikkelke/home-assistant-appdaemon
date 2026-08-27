@@ -143,12 +143,18 @@ darkness_calculator:
       light_on_lux_offset: 700   # measured ~750 lx at the sensor with hallway lights on
 
   # Occupied|Empty in room_state_* labels only (dark/bright ignores these).
+  # bedroom also counts input_boolean.bedroom_bed_session (bedroom_lights' 90s-debounced
+  # in-bed latch): the raw group flickers off while someone lies still, flipping the label
+  # to Empty mid-sleep. Label-only - bedroom_lights derives its own occupancy, no loop.
   presence_sensors:
     bedroom_bathroom:
       - binary_sensor.bedroom_pir_presence
       - binary_sensor.bathroom_pir_presence
+      - input_boolean.bedroom_bed_session
     bathroom: binary_sensor.bathroom_pir_presence
-    bedroom: binary_sensor.bedroom_pir_presence
+    bedroom:
+      - binary_sensor.bedroom_pir_presence
+      - input_boolean.bedroom_bed_session
     family_room:
       - binary_sensor.kitchen_pir_presence
       - binary_sensor.living_room_pir_presence
