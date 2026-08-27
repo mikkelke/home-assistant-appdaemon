@@ -104,6 +104,7 @@ def _bare_bridge(tmpdir, clock):
     app.announce_message = "The door is open."
     app.announce_cooldown_s = 90
     app.voice_tts_entity = "tts.piper"
+    app.voice_start_delay_s = 9.0
     app.announce_ring_window_s = 60
     app.clip_cameras = {"front door": "camera.abb_front"}
     app.clip_seconds = 10
@@ -1473,6 +1474,28 @@ class NativeRingClipTests(unittest.TestCase):
         self.assertEqual(entry["clip_url"], f"/local/abb_doorbell/{payload['filename']}")
 
     # --- native voice retry ---
+
+    def test_voice_chain_starts_after_the_ring_call_is_gone(self):
+        """The sentence must land on the continuation dial, not the ring call.
+
+        The station does not render audio on its own ring call (114 clean
+        packets, three human nulls) but does on a call HA dialled. Starting at
+        delay 0 meant play_audio was ACCEPTED by the ring call and the chain
+        stopped on that silent success, never reaching the audible one.
+        """
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.app._maybe_announce("front door")
+        delays = [
+            delay
+            for cb, delay, _kw in self.app.run_in_calls
+            if cb.__name__ == "_native_voice_retry"
+        ]
+        self.assertTrue(delays, "expected a voice chain to be scheduled")
+        self.assertGreaterEqual(
+            delays[0],
+            self.app.voice_start_delay_s,
+            "first attempt must wait for the ring call to end",
+        )
 
     def test_native_voice_never_dials_announce(self):
         self.app._open_episode("front door", "100000002", self.clock.now())

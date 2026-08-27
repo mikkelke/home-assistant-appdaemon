@@ -80,6 +80,12 @@ AbbWelcomeBridge:
   # open stream's talkback leg) using this TTS engine - so video and voice run
   # together instead of the voice being skipped. "" disables in-recording voices.
   voice_tts_entity: "tts.piper"
+  # Which call the sentence lands in decides whether anyone hears it. The
+  # station does NOT render audio on its own ring call (114 clean packets,
+  # three human nulls at the door) but DOES on a call HA dialled. The
+  # integration's continuation dial fires ~ring+8 s with media ~+10 s, so wait
+  # for the ring call to be gone and let the attempts land there instead.
+  voice_start_delay_s: 9
   announce_cooldown_s: 90
   announce_ring_window_s: 60
 

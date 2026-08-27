@@ -242,6 +242,17 @@ class AbbWelcomeBridge(hass.Hass):
         # abb_welcome/play_audio, which injects into the open stream's talkback leg
         # instead of dialing its own call). Empty disables in-recording voices.
         self.voice_tts_entity = str(self.args.get("voice_tts_entity", "tts.piper"))
+        # WHICH CALL the sentence lands in decides whether anyone hears it.
+        # The station does NOT render audio on its own ring call - 114 clean
+        # packets, zero send errors, three separate human nulls at the door.
+        # It DOES render on a call HA dialled: Codex got intelligible speech out
+        # of this exact station on 2026-08-12 that way. The integration's
+        # continuation dial (~ring+8 s, media ~+10 s) is such a call, so start
+        # the chain after the ring call is gone and let every attempt land on
+        # the continuation instead. Starting at 0 was the bug: play_audio is
+        # ACCEPTED by the ring call, the chain stops on that silent "success",
+        # and it never reaches the call that would have been audible.
+        self.voice_start_delay_s = float(self.args.get("voice_start_delay_s", 9.0))
         self.announce_ring_window_s = int(self.args.get("announce_ring_window_s", 60))
 
         # --- ring clip knobs (2026-08-13, "thumbnail and opening that give the video") ---
@@ -982,7 +993,8 @@ class AbbWelcomeBridge(hass.Hass):
                 episode = self._latest_open_episode(door, now, self.announce_ring_window_s)
                 if episode is None:
                     return
-                self.run_in(self._native_voice_retry, 0, episode_id=episode["id"], door=door,
+                self.run_in(self._native_voice_retry, self.voice_start_delay_s,
+                            episode_id=episode["id"], door=door,
                             camera=camera, message=self.announce_message, attempt=1)
                 return
             # Video first (user 2026-08-19): a recording in flight owns the station's
