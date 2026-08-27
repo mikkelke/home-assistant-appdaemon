@@ -59,6 +59,33 @@ AbbWelcomeBridge:
   missed_max_age_s: 900        # ignore replayed/stale portal events (HA restart restores the last one)
   snapshot_probe_s: 6          # early snapshot probe; the normal capture is event-driven off the image entity
 
+  # --- doorbell photo timing (2026-08-27, Mikkel: "the image that is included
+  # in the notifcation is at least a image delayed - the current notification
+  # have the ring before that") ---
+  #
+  # The gateway shoots its screenshot 1-3 s after a ring, but the integration
+  # polls for it on its own cycle, so the frame surfaced 7-32 s later (+24.6 s on
+  # the 18:57 ring that evening) - long after the auto-open push at ~ring+4 s.
+  # Every one of those pushes therefore carried the PREVIOUS visitor. Two knobs
+  # fix it from both ends:
+  #
+  # screenshot_poll_nudges_s: seconds after the ring at which to ask HA to poll
+  # the gateway now (homeassistant/update_entity -> the coordinator's own
+  # debounced async_request_refresh, so extra nudges are cheap and cannot
+  # stampede the cloud API). Brings the frame in around ring+6 s. This changes
+  # only WHEN the right frame arrives - every consumer is freshness-gated, so an
+  # early poll that returns nothing new is a no-op. [] = the old timing.
+  screenshot_poll_nudges_s: [4, 9, 16]
+  # ring_push_photo_wait_s: how long intercom.py's auto-open push is held waiting
+  # for THIS ring's photo before going out text-only. The push is a record, not
+  # an alert - the Sonos announcement is what tells the house in real time - so a
+  # few seconds cost nothing and buy the right face. Must stay well under
+  # episode_close_s (75). 0 = send immediately, i.e. today's behaviour minus the
+  # stale image: the attachment is freshness-gated either way now, on the same
+  # rule the archive has always used (a missing photo is honest, the wrong
+  # person is misleading).
+  ring_push_photo_wait_s: 15
+
   # Missed-call push audience: everyone home, no category restriction.
   notify_target: "home"
 

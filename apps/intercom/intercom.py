@@ -209,23 +209,48 @@ class Intercom(hass.Hass):
             self.log(f"Error getting MobileNotifier app: {e}. Failure alerts will only be logged.", level="WARNING")
             return None
 
-    def _abb_ring_attachment(self):
+    def _abb_ring_attachment(self, ring_label=None):
         """Optional doorbell-snapshot payload for mobile pushes, from the ABB
         Welcome bridge app. STRICTLY ADDITIVE: returns None on ANY problem
         (bridge app absent, not loaded yet, or throwing), and the callers pass
         the result straight through as MobileNotifier's `data=` argument -
-        data=None is byte-for-byte today's push. Never raises."""
+        data=None is byte-for-byte today's push. Never raises.
+
+        ring_label lets the bridge check the photo is THIS visitor's rather than
+        the last one's; omitting it keeps the old unchecked behaviour for callers
+        that have no door in hand."""
         try:
             if self.abb_bridge is None:
                 self.abb_bridge = self.get_app("AbbWelcomeBridge")
             if self.abb_bridge:
-                return self.abb_bridge.ring_attachment_data()
+                return self.abb_bridge.ring_attachment_data(ring_label)
         except Exception as e:
             try:
                 self.log(f"ABB snapshot attachment unavailable: {e}", level="DEBUG")
             except Exception:
                 pass
         return None
+
+    def _abb_defer_ring_push(self, ring_label, title, message):
+        """Hand the auto-open push to the ABB bridge so it can wait for a photo.
+
+        True means the bridge OWNS the push and this app must not send it; False
+        means send it now, exactly as before. Same contract as
+        _abb_ring_attachment: any problem at all is a False, because a household
+        that loses the notification is worse off than one that gets it without a
+        picture. Never raises."""
+        try:
+            if self.abb_bridge is None:
+                self.abb_bridge = self.get_app("AbbWelcomeBridge")
+            if self.abb_bridge:
+                return bool(self.abb_bridge.defer_ring_push(
+                    ring_label, title, message, self.notify_target))
+        except Exception as e:
+            try:
+                self.log(f"ABB deferred ring push unavailable: {e}", level="DEBUG")
+            except Exception:
+                pass
+        return False
 
     def _validate_entities(self):
         """Validate that configured entities exist in Home Assistant."""
@@ -964,19 +989,28 @@ class Intercom(hass.Hass):
         )
 
         if self.mobile_notifier:
-            # ABB doorbell snapshot, if the bridge can offer one - computed OUTSIDE
-            # the try so a (impossible-by-contract) failure could never skip the
-            # push itself; None simply reproduces today's text-only notification.
-            attachment = self._abb_ring_attachment()
-            try:
-                self.create_task(self.mobile_notifier.notify(
-                    title="Intercom auto-opened",
-                    message=f"Someone rang the {ring_label} and the door was unlocked automatically.",
-                    target=self.notify_target,
-                    data=attachment,
-                ))
-            except Exception as e:
-                self.log(f"Auto-open success notification failed: {e}", level="WARNING")
+            title = "Intercom auto-opened"
+            message = f"Someone rang the {ring_label} and the door was unlocked automatically."
+            # Offer the push to the ABB bridge first: it can hold it the few
+            # seconds the gateway needs to produce THIS visitor's photo, instead
+            # of sending now with the previous visitor's (Mikkel, 2026-08-27).
+            # Strictly additive - a bridge that is absent, reloading or broken
+            # declines, and the immediate push below is byte-for-byte today's.
+            if not self._abb_defer_ring_push(ring_label, title, message):
+                # ABB doorbell snapshot, if the bridge can offer one - computed
+                # OUTSIDE the try so a (impossible-by-contract) failure could never
+                # skip the push itself; None simply reproduces today's text-only
+                # notification.
+                attachment = self._abb_ring_attachment(ring_label)
+                try:
+                    self.create_task(self.mobile_notifier.notify(
+                        title=title,
+                        message=message,
+                        target=self.notify_target,
+                        data=attachment,
+                    ))
+                except Exception as e:
+                    self.log(f"Auto-open success notification failed: {e}", level="WARNING")
 
         # No feed entry for a CONFIRMED auto-open (removed 2026-07-24): the ring-time
         # "Announcing on the speakers and opening the door" line already told the story,

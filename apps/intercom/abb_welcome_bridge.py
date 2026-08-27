@@ -47,9 +47,12 @@ Features:
    companion-app image payload for its existing auto-open pushes. The image URL
    is the image entity's entity_picture (token-signed /api/image_proxy/... path,
    verified to serve the JPEG without other auth; relative URLs resolve through
-   the companion app's own HA connection, so they render off-LAN too). Because
-   of the poll lag the photo can be one visitor stale at push time - accepted
-   and documented; the missed-call push and the archive use freshness checks.
+   the companion app's own HA connection, so they render off-LAN too). The poll
+   lag used to make that photo one visitor stale at push time, every time
+   (measured +24.6 s on the 2026-08-27 18:57 ring against a push at +3.8 s);
+   since then the attachment is freshness-gated on the same rule as the archive,
+   _nudge_screenshot_poll pulls the frame forward to ~ring+6 s, and
+   defer_ring_push holds the push ring_push_photo_wait_s so it can carry it.
 3. RING COMPARATOR - phase-2 evidence. Every ring seen by either side is paired
    within pair_window_s; results are counted (rings_both / rings_esp_only /
    rings_abb_only + lag stats), logged grep-friendly ("RING-CMP ..."), published
@@ -224,6 +227,15 @@ class AbbWelcomeBridge(hass.Hass):
         self.missed_decision_delay_s = int(self.args.get("missed_decision_delay_s", 15))  # unlock evidence lands by ring+9 s (measured); wait it out
         self.missed_max_age_s = int(self.args.get("missed_max_age_s", 900))  # ignore replayed/stale portal events
         self.snapshot_probe_s = int(self.args.get("snapshot_probe_s", 6))  # early probe; the poll usually beats it by lagging
+        # Pull the gateway screenshot forward instead of waiting out the poll cycle
+        # (_nudge_screenshot_poll). Empty list = exactly the old timing.
+        self.screenshot_poll_nudges_s = [
+            float(v) for v in self.args.get("screenshot_poll_nudges_s", [4, 9, 16])
+        ]
+        # How long the auto-open push is held waiting for THIS ring's photo
+        # (defer_ring_push). 0 = send immediately, i.e. today's behaviour minus
+        # the stale image. Must stay well under episode_close_s.
+        self.ring_push_photo_wait_s = float(self.args.get("ring_push_photo_wait_s", 15))
         self.notify_target = self.args.get("notify_target", "home")
 
         # --- announce-after-unlock knobs (user + integration agreement 2026-08-12) ---
@@ -450,20 +462,29 @@ class AbbWelcomeBridge(hass.Hass):
     # Public seam for intercom.py (called cross-thread from its sync
     # callbacks; must stay fast, sync, and non-raising).
     # ------------------------------------------------------------------
-    def ring_attachment_data(self):
+    def ring_attachment_data(self, door=None):
         """Companion-app image payload for a ring push, or None.
 
         Returns {"data": {"image": <entity_picture>}} - MobileNotifier merges the
         inner dict into the notify service's data, which is the documented
         companion-app attachment syntax for both Android and iOS. The URL is
         relative, so the app fetches it over its own HA connection (works
-        off-LAN). Freshness caveat: the gateway's screenshot arrives on a 30 s
-        cloud poll (measured 7-32 s after today's rings), so at auto-open push
-        time (~ring+3-10 s) this usually still shows the PREVIOUS visitor.
-        Attached anyway - a slightly stale doorbell photo beats none - and the
-        missed-call push + archive (which can wait) apply real freshness checks.
-        """
+        off-LAN).
+
+        FRESHNESS GATE (2026-08-27, Mikkel: "the image that is included in the
+        notification is at least a image delayed - the current notification have
+        the ring before that"). The gateway's screenshot arrives on a cloud poll
+        7-32 s after the ring, while the auto-open push goes out at ~ring+4 s, so
+        this used to attach the PREVIOUS visitor essentially every time. The
+        archive has always refused a stale frame on the grounds that "a missing
+        photo is honest, the wrong person is misleading"; the push now applies
+        exactly the same rule (same 3 s clock slack) instead of contradicting it.
+
+        No photo here is not the end of it: defer_ring_push holds the push for a
+        few seconds so the real one can land - see there."""
         try:
+            if door is not None and not self._screenshot_is_fresh_for(door):
+                return None
             url = self.get_state(self.abb_image_entity, attribute="entity_picture")
             if url:
                 return {"data": {"image": url}}
@@ -473,6 +494,97 @@ class AbbWelcomeBridge(hass.Hass):
             except Exception:
                 pass
         return None
+
+    def _screenshot_is_fresh_for(self, door):
+        """True when the image entity currently holds THIS ring's frame.
+
+        Same rule and the same 3 s clock slack the archive's _try_capture uses:
+        captured at or after the ring means it is this visitor, earlier means it
+        is the last one. No open episode for the door -> nothing to be fresh
+        relative to, so no photo."""
+        episode = self._latest_open_episode(door, self.get_now(),
+                                            self.door_open_ring_window_s)
+        if episode is None:
+            return False
+        snap = episode.get("snapshot")
+        if snap is not None:
+            return True  # already captured and freshness-checked for this episode
+        captured_at = parse_iso_ts(
+            self.get_state(self.abb_image_entity, attribute="captured_at"))
+        if captured_at is None:
+            return False
+        return captured_at >= episode["started_at"] - timedelta(seconds=3)
+
+    def defer_ring_push(self, door, title, message, target):
+        """Take ownership of intercom.py's auto-open push so it can carry a photo.
+
+        Returns True when this app has accepted the push (intercom.py must then
+        not send it) and False for every "not my problem" case - no episode open
+        for that door, no notifier - where intercom.py sends it immediately,
+        exactly as before. Never raises: intercom.py deliberately has no
+        dependency on this app, and a bridge that is absent, reloading or broken
+        must cost the household a photo, never the notification.
+
+        Why hold it at all: the push is a RECORD ("the door was unlocked
+        automatically"), not an alert - the Sonos announcement is what tells the
+        house in real time. Waiting a few seconds for the gateway's screenshot
+        turns a notification showing the previous visitor into one showing this
+        one. _nudge_screenshot_poll pulls that screenshot forward to ~ring+6 s,
+        and ring_push_photo_wait_s caps the wait so a poll that never lands
+        costs the photo and not the push."""
+        try:
+            if not self.mobile_notifier:
+                return False
+            episode = self._latest_open_episode(door, self.get_now(),
+                                                self.door_open_ring_window_s)
+            if episode is None:
+                return False
+            if episode.get("push_pending") or episode.get("push_flushed"):
+                return True  # already ours; never two pushes for one ring
+            episode["push_pending"] = {"title": title, "message": message,
+                                       "target": target, "door": door}
+            if episode.get("snapshot") is not None:
+                self._flush_ring_push(episode, "photo-ready")
+            else:
+                self.run_in(self._ring_push_due, self.ring_push_photo_wait_s,
+                            episode_id=episode["id"], reason="deadline")
+            return True
+        except Exception as e:
+            try:
+                self.log(f"defer_ring_push failed for {door}: {e}", level="WARNING")
+            except Exception:
+                pass
+            return False
+
+    def _ring_push_due(self, kwargs):
+        """Scheduled release of a held push: either this ring's photo arrived, or
+        ring_push_photo_wait_s elapsed without one and it goes out text-only."""
+        episode = self.episodes.get(kwargs.get("episode_id"))
+        if episode is not None:
+            self._flush_ring_push(episode, kwargs.get("reason", "deadline"))
+
+    def _flush_ring_push(self, episode, reason):
+        """Send the held auto-open push exactly once, with a photo if one exists."""
+        pending = episode.get("push_pending")
+        if not pending or episode.get("push_flushed"):
+            return
+        episode["push_flushed"] = True
+        episode["push_pending"] = None
+        data = {"tag": f"abb_autoopen_{door_slug(pending['door'], '')}"}
+        if episode.get("snapshot") is not None:
+            url = self.get_state(self.abb_image_entity, attribute="entity_picture")
+            if url:
+                data["image"] = url
+        try:
+            self.create_task(self.mobile_notifier.notify(
+                title=pending["title"], message=pending["message"],
+                target=pending["target"], data=data,
+            ))
+            waited = (self.get_now() - episode["started_at"]).total_seconds()
+            self.log(f"RING-PUSH-PHOTO door={pending['door']} episode={episode['id']} "
+                     f"reason={reason} photo={'image' in data} +{waited:.1f}s", level="INFO")
+        except Exception as e:
+            self.log(f"Deferred ring push failed for {pending['door']}: {e}", level="WARNING")
 
     # ------------------------------------------------------------------
     # Ring intake (three sources -> one _register_ring)
@@ -590,6 +702,8 @@ class AbbWelcomeBridge(hass.Hass):
             "clip_started_at": None,  # when the record dial went out (voices yield until it ends)
             "voice_spoken": False,  # one "the door is open" sentence per episode (native + legacy dedup)
             "voice_dispatched": False,  # a native voice retry chain already started (2nd unlock confirm must not start another)
+            "push_pending": None,  # intercom.py's auto-open push, held for a photo (defer_ring_push)
+            "push_flushed": False,  # ...and sent - exactly once per ring, photo or not
             "action_push_sent": False,  # auto-open-off Open/Reject push went out
             "rejected": False,  # a human pressed Reject on that push
             "no_answer_spoken": False,  # the door already got the no-answer message
@@ -621,9 +735,32 @@ class AbbWelcomeBridge(hass.Hass):
                 # "recording" and retries once if not.
                 self.run_in(self._start_clip, self.clip_delay_s, episode_id=episode_id)
             self._arm_ring_voice(episode)
+            for offset in self.screenshot_poll_nudges_s:
+                self.run_in(self._nudge_screenshot_poll, offset, at=offset)
         except Exception as e:
             self.log(f"Episode timers failed for {episode_id}: {e}", level="WARNING")
         return episode
+
+    def _nudge_screenshot_poll(self, kwargs):
+        """Ask HA to poll the gateway now instead of waiting for the next cycle.
+
+        The gateway shoots its screenshot 1-3 s after a ring, but the integration
+        drives its own poll loop, so the frame usually surfaced 7-32 s later
+        (measured +24.6 s on the 2026-08-27 18:57 ring) - long after the auto-open
+        push and well into the visitor's walk upstairs. homeassistant/update_entity
+        on the image entity goes through the coordinator's own
+        async_request_refresh, which is debounced upstream, so a handful of these
+        is cheap and cannot stampede the cloud API.
+
+        Everything downstream is freshness-gated already, so an early poll that
+        returns nothing new is simply a no-op: this changes WHEN the right frame
+        arrives, never WHICH frame is accepted."""
+        try:
+            self.call_service("homeassistant/update_entity",
+                              entity_id=self.abb_image_entity)
+        except Exception as e:
+            self.log(f"Screenshot poll nudge at +{kwargs.get('at')}s failed: {e}",
+                     level="DEBUG")
 
     def _arm_ring_voice(self, episode):
         """Start the door sentence at the RING, not after the unlock.
@@ -1738,6 +1875,13 @@ class AbbWelcomeBridge(hass.Hass):
                 "event_id": event_id,
             }
             self.log(f"Snapshot captured for episode {episode_id} ({len(raw)} bytes, event {event_id})", level="INFO")
+            # This ring's own photo now exists: release the held auto-open push so
+            # it carries the visitor who just rang, not the one before them. Hop
+            # back to the app's own thread first - this body runs on the executor
+            # (see the caller) and everything it does today is a plain dict write,
+            # which sending a notification is not.
+            self.run_in(self._ring_push_due, 0, episode_id=episode_id,
+                        reason="photo-arrived")
         except Exception as e:
             self.log(f"Snapshot capture failed for {episode_id}: {e}", level="WARNING")
 
@@ -1776,6 +1920,10 @@ class AbbWelcomeBridge(hass.Hass):
         if episode is None or episode["closed"]:
             return
         episode["closed"] = True
+        # Belt and braces: ring_push_photo_wait_s is well under episode_close_s, so
+        # a held push has normally gone out long before this. If anything ate that
+        # timer, the household still gets the notification here rather than never.
+        self._flush_ring_push(episode, "episode-close")
         if episode.get("door"):
             # Feeds _door_had_ring's lookback: the episode is about to vanish
             # from self.episodes entirely, but a door-open edge landing shortly

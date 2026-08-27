@@ -100,6 +100,8 @@ def _bare_bridge(tmpdir, clock):
     app.door_open_ring_window_s = 90
     app._last_door_open_edge_at = {}
     app._last_ring_closed_at = {}
+    app.screenshot_poll_nudges_s = [4.0, 9.0, 16.0]
+    app.ring_push_photo_wait_s = 15.0
     app.announce_cameras = {"front door": "camera.abb_front"}
     app.announce_message = "The door is open."
     app.announce_cooldown_s = 90
@@ -710,12 +712,50 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
         payload = {"data": {"image": "/api/image_proxy/image.x?token=t"}}
 
         class FakeBridge:
-            def ring_attachment_data(self):
+            def ring_attachment_data(self, door=None):
                 return payload
+
+            def defer_ring_push(self, door, title, message, target):
+                return False  # declines: intercom sends it itself
         app.get_app = lambda name: FakeBridge()
         app._report_auto_open_success("binary_sensor.front", "lock.front",
                                       {"ring_label": "front door"}, 1)
         self.assertEqual(app.pushes[0]["data"], payload)
+
+    def test_bridge_taking_the_push_stops_intercom_sending_it(self):
+        # Exactly one notification per ring: when the bridge holds the push to
+        # wait for this visitor's photo, intercom must not also send its own.
+        app = self._bare_intercom()
+        taken = {}
+
+        class FakeBridge:
+            def ring_attachment_data(self, door=None):
+                raise AssertionError("must not be consulted once the push is deferred")
+
+            def defer_ring_push(self, door, title, message, target):
+                taken.update(door=door, title=title, message=message, target=target)
+                return True
+        app.get_app = lambda name: FakeBridge()
+        app._report_auto_open_success("binary_sensor.front", "lock.front",
+                                      {"ring_label": "front door"}, 1)
+        self.assertEqual(app.pushes, [])
+        self.assertEqual(taken["door"], "front door")
+        self.assertEqual(taken["target"], "mikkel")
+        self.assertIn("front door", taken["message"])
+
+    def test_bridge_declining_the_defer_still_pushes_immediately(self):
+        app = self._bare_intercom()
+
+        class FakeBridge:
+            def ring_attachment_data(self, door=None):
+                return None
+
+            def defer_ring_push(self, door, title, message, target):
+                raise RuntimeError("bridge mid-reload")
+        app.get_app = lambda name: FakeBridge()
+        app._report_auto_open_success("binary_sensor.front", "lock.front",
+                                      {"ring_label": "front door"}, 1)
+        self.assertEqual(len(app.pushes), 1)
 
     def test_bridge_absent_push_goes_out_as_today(self):
         app = self._bare_intercom()
@@ -740,10 +780,10 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
         app = self._bare_intercom()
 
         class BadBridge:
-            def ring_attachment_data(self):
+            def ring_attachment_data(self, door=None):
                 raise ValueError("no image for you")
         app.get_app = lambda name: BadBridge()
-        self.assertIsNone(app._abb_ring_attachment())
+        self.assertIsNone(app._abb_ring_attachment("front door"))
 
     def test_bridge_ring_attachment_data_never_raises(self):
         # the bridge side of the same contract
@@ -755,6 +795,135 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
             raise RuntimeError("HA is down")
         bridge.get_state = broken_get_state
         self.assertIsNone(bridge.ring_attachment_data())
+
+
+class RingPushPhotoTests(unittest.TestCase):
+    """The push must show THIS visitor (2026-08-27, Mikkel: "the image that is
+    included in the notification is at least a image delayed - the current
+    notification have the ring before that").
+
+    Measured that evening: ring 18:57:30.8, auto-open push 18:57:34.6, and the
+    gateway's screenshot for that ring only surfaced at 18:57:55.4 - 20.7 s later.
+    Every auto-open push carried the previous visitor. The archive has always
+    refused a stale frame ("a missing photo is honest, the wrong person is
+    misleading"); the push now agrees with it, and waits a few seconds rather
+    than settling for nothing."""
+
+    def setUp(self):
+        self.clock = Clock(datetime(2026, 8, 27, 18, 57, 30, tzinfo=timezone.utc))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.app = _bare_bridge(self.tmp.name, self.clock)
+        self.pushes = []
+
+        class FakeNotifier:
+            def notify(inner, **kwargs):
+                self.pushes.append(kwargs)
+        self.app.mobile_notifier = FakeNotifier()
+        self.app.create_task = lambda coro: None
+
+    def _set_screenshot(self, captured_at):
+        key = (self.app.abb_image_entity, "captured_at")
+        self.app.states[key] = captured_at.isoformat() if captured_at else None
+        self.app.states[(self.app.abb_image_entity, "entity_picture")] = \
+            "/api/image_proxy/image.abb?token=t"
+
+    # --- freshness gate on the immediate (undeferred) attachment ---
+
+    def test_screenshot_older_than_the_ring_is_not_attached(self):
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self._set_screenshot(self.clock.now() - timedelta(seconds=40))  # last visitor
+        self.assertIsNone(self.app.ring_attachment_data("front door"))
+
+    def test_screenshot_from_this_ring_is_attached(self):
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self._set_screenshot(self.clock.now() + timedelta(seconds=2))
+        data = self.app.ring_attachment_data("front door")
+        self.assertEqual(data["data"]["image"], "/api/image_proxy/image.abb?token=t")
+
+    def test_no_open_ring_means_no_photo(self):
+        self._set_screenshot(self.clock.now())
+        self.assertIsNone(self.app.ring_attachment_data("front door"))
+
+    def test_omitting_the_door_keeps_the_old_unchecked_behaviour(self):
+        self._set_screenshot(self.clock.now() - timedelta(seconds=40))
+        self.assertIsNotNone(self.app.ring_attachment_data())
+
+    # --- deferred push ---
+
+    def test_push_is_held_until_the_photo_arrives(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        self.assertTrue(self.app.defer_ring_push(
+            "front door", "Intercom auto-opened", "Someone rang.", "mikkel"))
+        self.assertEqual(self.pushes, [])  # nothing yet - no photo of this visitor
+        self._set_screenshot(self.clock.now() + timedelta(seconds=6))
+        episode["snapshot"] = {"bytes": b"jpeg", "captured_at": self.clock.now(),
+                               "event_id": "e1"}
+        _run_scheduled(self.app, "_ring_push_due")
+        self.assertEqual(len(self.pushes), 1)
+        self.assertEqual(self.pushes[0]["data"]["image"], "/api/image_proxy/image.abb?token=t")
+
+    def test_push_goes_out_text_only_when_no_photo_ever_lands(self):
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.app.defer_ring_push("front door", "Intercom auto-opened", "Someone rang.", "mikkel")
+        _run_scheduled(self.app, "_ring_push_due")  # the deadline fires
+        self.assertEqual(len(self.pushes), 1)
+        self.assertNotIn("image", self.pushes[0]["data"])
+
+    def test_exactly_one_push_even_if_photo_and_deadline_both_fire(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        self.app.defer_ring_push("front door", "Intercom auto-opened", "Someone rang.", "mikkel")
+        episode["snapshot"] = {"bytes": b"jpeg", "captured_at": self.clock.now(),
+                               "event_id": "e1"}
+        self._set_screenshot(self.clock.now())
+        for _ in range(3):
+            _run_scheduled(self.app, "_ring_push_due")
+        self.app._close_episode({"episode_id": episode["id"]})
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_photo_already_present_sends_immediately(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        episode["snapshot"] = {"bytes": b"jpeg", "captured_at": self.clock.now(),
+                               "event_id": "e1"}
+        self._set_screenshot(self.clock.now())
+        self.app.defer_ring_push("front door", "Intercom auto-opened", "Someone rang.", "mikkel")
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_no_open_episode_declines_so_intercom_pushes_itself(self):
+        self.assertFalse(self.app.defer_ring_push(
+            "front door", "Intercom auto-opened", "Someone rang.", "mikkel"))
+
+    def test_no_notifier_declines(self):
+        self.app.mobile_notifier = None
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.assertFalse(self.app.defer_ring_push(
+            "front door", "Intercom auto-opened", "Someone rang.", "mikkel"))
+
+    def test_close_flushes_a_push_whose_timer_was_lost(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        self.app.defer_ring_push("front door", "Intercom auto-opened", "Someone rang.", "mikkel")
+        self.app.run_in_calls = []  # the deadline timer never fires
+        self.app._close_episode({"episode_id": episode["id"]})
+        self.assertEqual(len(self.pushes), 1)
+
+    # --- poll nudge ---
+
+    def test_ring_nudges_the_screenshot_poll(self):
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        delays = sorted(delay for cb, delay, _kw in self.app.run_in_calls
+                        if cb.__name__ == "_nudge_screenshot_poll")
+        self.assertEqual(delays, [4.0, 9.0, 16.0])
+        _run_scheduled(self.app, "_nudge_screenshot_poll")
+        updates = [c for c in self.app.service_calls
+                   if c[0] == "homeassistant/update_entity"]
+        self.assertEqual(len(updates), 3)
+        self.assertEqual(updates[0][1]["entity_id"], self.app.abb_image_entity)
+
+    def test_nudges_can_be_switched_off(self):
+        self.app.screenshot_poll_nudges_s = []
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.assertEqual([cb.__name__ for cb, _, _ in self.app.run_in_calls
+                          if cb.__name__ == "_nudge_screenshot_poll"], [])
 
 
 if __name__ == "__main__":
