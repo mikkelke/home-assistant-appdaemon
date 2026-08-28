@@ -626,8 +626,12 @@ def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed):
 
     plan_state is sleep_plan's recommendation ("windows"|"ac"|"hybrid"|"nothing"); an
     unrecognised value falls back to the plan's own headline. status_attrs is accepted
-    for call-site stability but unused (the day-outlook line was cut). hybrid rounds
-    toward ACTION (user 2026-07-29: forgetting to deploy is the expensive failure).
+    for call-site stability but unused (the day-outlook line was cut). hybrid and ac render
+    IDENTICAL copy (2026-08-28, user: "there is not control on window?" -- windows are a
+    read-only contact sensor, never an actuator, so the AC is the only lever anyone can act
+    on; hybrid vs ac only says how much of the gap the AC needs to cover, not what to do
+    about it). plan_sleep still tracks the three-way split for its own reasoning/detail
+    text and the dashboard's day strip -- only this ONE-voice verdict collapses it.
     TODAY only, by design (user 2026-07-29: "I just need to know what to do today...
     Nothing about tomorrow") -- the multi-day outlook lives on the card's day strip,
     never in the sentence."""
@@ -645,16 +649,13 @@ def compose_briefing(plan_state, plan_attrs, status_attrs, ac_deployed, armed):
     elif plan_state == "nothing":
         title = "Nothing to do"
         body = "The bedroom stays cool on its own."
-    elif plan_state == "hybrid":
-        title = "Set up the AC"
-        if ac_deployed and armed:
-            body = "Windows may not be enough tonight. The AC is armed if needed."
-        elif ac_deployed:
-            body = "Windows may not be enough tonight. Arm it if you want the AC ready."
-        else:
-            body = ("Windows may not be enough tonight. Put it up before you leave."
-                    + (f" {cost[0].upper()}{cost[1:]}." if cost else ""))
-    elif plan_state == "ac":
+    elif plan_state in ("hybrid", "ac"):
+        # Windows have no control lever (contact-sensor status only, never an actuator) --
+        # the AC is the only decision anyone can actually act on, so hybrid (windows likely
+        # won't fully close the gap) and ac (windows definitely won't) must read as the
+        # identical instruction: get the AC ready. hybrid used to hedge with "windows may
+        # not be enough tonight" wording, which just asked the user to weigh a lever they
+        # don't have (user 2026-08-28: "I need to know what to do. You guide me.").
         if ac_deployed and armed:
             title = "AC handles tonight"
             body = "Already armed." + (f" {cost[0].upper()}{cost[1:]}." if cost else "")

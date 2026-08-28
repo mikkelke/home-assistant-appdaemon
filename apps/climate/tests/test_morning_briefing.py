@@ -50,13 +50,13 @@ class ComposeBriefingRecommendationBranches(unittest.TestCase):
     def test_titles_are_decided_verdicts(self):
         # The title IS the instruction (user: "A/C not needed - Keep windows open") --
         # one advice, no hedging; a changed situation later gets a NEW advice via the
-        # evening rescue. hybrid rounds toward ACTION (user 2026-07-29: forgetting to
-        # deploy is the expensive failure), and the ac title names the one action the
-        # current deploy/arm state actually needs.
+        # evening rescue. hybrid renders the identical title as ac (2026-08-28: windows
+        # have no control lever, so the AC is the only actionable decision) -- the ac
+        # title names the one action the current deploy/arm state actually needs.
         self.assertEqual(mb.compose_briefing("windows", _attrs(), {}, False, False)[0],
                          "AC not needed")
         self.assertEqual(mb.compose_briefing("hybrid", _attrs(), {}, False, False)[0],
-                         "Set up the AC")
+                         "Deploy the AC")
         self.assertEqual(mb.compose_briefing("nothing", _attrs(), {}, False, False)[0],
                          "Nothing to do")
         self.assertEqual(mb.compose_briefing("ac", _attrs(), {}, False, False)[0],
@@ -112,30 +112,18 @@ class ComposeBriefingRecommendationBranches(unittest.TestCase):
         _, message = mb.compose_briefing("ac", _attrs(cost_label=None), {}, True, True)
         self.assertEqual(message, "Already armed.")
 
-    def test_hybrid_not_deployed_instructs_deploying_with_cost(self):
-        # user 2026-07-29: hybrid rounds toward ACTION -- forgetting to deploy the AC before
-        # a hybrid night is the expensive failure, deploying unnecessarily costs two
-        # minutes. Not deployed -> the same "before you leave" urgency + cost clause style
-        # as the ac branch.
-        title, message = mb.compose_briefing("hybrid", _attrs(), {}, False, False)
-        self.assertEqual(title, "Set up the AC")
-        self.assertEqual(message, "Windows may not be enough tonight. Put it up before "
-                                  "you leave. About 1.8 kr.")
-
-    def test_hybrid_not_deployed_without_cost_still_reads_clean(self):
-        _, message = mb.compose_briefing("hybrid", _attrs(cost_label=None), {}, False, False)
-        self.assertEqual(message, "Windows may not be enough tonight. Put it up before you leave.")
-
-    def test_hybrid_deployed_but_not_armed_offers_to_arm(self):
-        _, message = mb.compose_briefing("hybrid", _attrs(), {}, True, False)
-        self.assertEqual(message, "Windows may not be enough tonight. Arm it if you want "
-                                  "the AC ready.")
-
-    def test_hybrid_deployed_and_armed_acknowledges_instead_of_deploying(self):
-        # Already deployed+armed -> acknowledge that instead of telling them to deploy
-        # (there's nothing left to set up).
-        _, message = mb.compose_briefing("hybrid", _attrs(), {}, True, True)
-        self.assertEqual(message, "Windows may not be enough tonight. The AC is armed if needed.")
+    def test_hybrid_produces_identical_copy_to_ac(self):
+        # 2026-08-28 (user: "there is not control on window? ... I need to know what to
+        # do. You guide me."): windows are a read-only contact sensor, never an actuator,
+        # so the AC is the only lever anyone can act on. hybrid and ac must therefore read
+        # as the exact same instruction for every deploy/armed permutation -- no separate
+        # "windows may not be enough tonight" hedge asking the user to weigh a lever they
+        # don't have.
+        for dep in (False, True):
+            for armed in (False, True):
+                self.assertEqual(mb.compose_briefing("hybrid", _attrs(), {}, dep, armed),
+                                 mb.compose_briefing("ac", _attrs(), {}, dep, armed),
+                                 f"dep={dep} armed={armed}")
 
     def test_unknown_recommendation_falls_back_to_headline_only(self):
         _, message = mb.compose_briefing(
