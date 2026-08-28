@@ -356,13 +356,21 @@ class MorningBriefing(hass.Hass):
             title, message = compose_briefing(plan_state, plan_attrs, status_attrs,
                                               ac_deployed, armed)
 
-            if not await self._notify(title, message):
-                return
+            # Only "ac"/"hybrid" need a push -- "windows"/"nothing" are a silent default,
+            # but the day is still marked handled so a later trigger (fallback run, wake-now
+            # button, alarm-disabled-mid-window) doesn't re-evaluate, and _maybe_stand_down's
+            # own gate (self._sent_rec not in ("ac", "hybrid")) keeps working unchanged.
+            if plan_state in ("ac", "hybrid"):
+                if not await self._notify(title, message):
+                    return
+                self.log(f"Morning briefing sent -- {title}: {message}", level="INFO")
+            else:
+                self.log(f"Morning briefing: no AC action needed ({plan_state}) -- "
+                         f"push suppressed", level="INFO")
 
             self._sent_date = today
             self._sent_rec = plan_state
             self._save_state()
-            self.log(f"Morning briefing sent -- {title}: {message}", level="INFO")
         except Exception as e:
             self.log(f"morning briefing handler failed ({e})", level="WARNING")
 

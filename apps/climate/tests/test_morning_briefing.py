@@ -200,11 +200,14 @@ class NiceCost(unittest.TestCase):
 # ---------------------------------------------------------------- app-level handler
 
 def _make_app(now=datetime(2026, 7, 22, 6, 0), from_hour=5, until_hour=12,
-             sent_date=None, person="home", plan_state="nothing",
+             sent_date=None, person="home", plan_state="ac",
              plan_attrs=None, status_attrs=None, climate="off", enable="off"):
     """MorningBriefing instance without running AppDaemon's initialize() -- _state/_attrs/
     get_now/_notify/_save_state are stubbed so the gate logic in _handle_wake_locked runs
-    for real against plain dicts, mirroring test_smart_cooling.py's EveningRescue pattern."""
+    for real against plain dicts, mirroring test_smart_cooling.py's EveningRescue pattern.
+    plan_state defaults to "ac" (not "nothing") -- since 2026-08-28 only "ac"/"hybrid" push,
+    and most gate tests here use len(_notified) == 1 purely to confirm the handler proceeded
+    past the gates, independent of AC-need content."""
     app = mb.MorningBriefing.__new__(mb.MorningBriefing)
     app.from_hour = from_hour
     app.until_hour = until_hour
@@ -398,7 +401,9 @@ class DataGate(unittest.TestCase):
         self.assertIsNone(app._sent_date)
 
         # the plan publishes later the same morning -- a later wake edge retries
-        app._states[app.sleep_plan_entity] = "nothing"
+        # ("ac" here, not "nothing" -- this test is about the retry gate, not AC-need
+        # content, so it needs a plan_state that actually pushes).
+        app._states[app.sleep_plan_entity] = "ac"
         _run(app)
         self.assertEqual(len(app._notified), 1)
         self.assertEqual(app._sent_date, "2026-07-22")
@@ -415,6 +420,54 @@ class NotifierUnavailable(unittest.TestCase):
         _run(app)
         self.assertIsNone(app._sent_date)
         self.assertEqual(app._save_calls, 0)
+
+
+class PushSuppressionForNoActionPlans(unittest.TestCase):
+    """2026-08-28: only "ac"/"hybrid" push -- "windows"/"nothing" are a silent default (no
+    push at all). The day is still marked handled (sent_date/sent_rec/save_state) so a later
+    trigger the same day (fallback run, wake-now button, alarm-disabled-mid-window) doesn't
+    re-evaluate and re-notify, and so _maybe_stand_down's own gate
+    (self._sent_rec not in ("ac", "hybrid")) keeps working unchanged."""
+
+    def test_windows_sends_no_push_but_still_marks_the_day_handled(self):
+        app = _make_app(plan_state="windows", plan_attrs=PLAN_ATTRS)
+        _run(app)
+        self.assertEqual(app._notified, [])
+        self.assertEqual(app._sent_date, "2026-07-22")
+        self.assertEqual(app._sent_rec, "windows")
+        self.assertEqual(app._save_calls, 1)
+
+    def test_nothing_sends_no_push_but_still_marks_the_day_handled(self):
+        app = _make_app(plan_state="nothing", plan_attrs=PLAN_ATTRS)
+        _run(app)
+        self.assertEqual(app._notified, [])
+        self.assertEqual(app._sent_date, "2026-07-22")
+        self.assertEqual(app._sent_rec, "nothing")
+        self.assertEqual(app._save_calls, 1)
+
+    def test_ac_still_sends_a_push(self):
+        app = _make_app(plan_state="ac", plan_attrs=PLAN_ATTRS)
+        _run(app)
+        self.assertEqual(len(app._notified), 1)
+        self.assertEqual(app._sent_rec, "ac")
+
+    def test_hybrid_still_sends_a_push(self):
+        app = _make_app(plan_state="hybrid", plan_attrs=PLAN_ATTRS)
+        _run(app)
+        self.assertEqual(len(app._notified), 1)
+        self.assertEqual(app._sent_rec, "hybrid")
+
+    def test_silent_windows_morning_still_gates_once_per_day(self):
+        # a later wake edge the same morning (fallback run, wake-now button) must not
+        # re-save just because no push went out on the first, suppressed run.
+        app = _make_app(plan_state="windows", plan_attrs=PLAN_ATTRS)
+        _run(app)
+        self.assertEqual(app._notified, [])
+        self.assertEqual(app._save_calls, 1)
+
+        _run(app)   # a second wake edge later the same morning
+        self.assertEqual(app._notified, [])
+        self.assertEqual(app._save_calls, 1)
 
 
 class NotifyMethod(unittest.TestCase):
