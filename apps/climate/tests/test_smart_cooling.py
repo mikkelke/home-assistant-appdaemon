@@ -1594,6 +1594,10 @@ class PublishSleepPlanGrounding(unittest.TestCase):
         app.window_contact_entities = {"bedroom": "binary_sensor.bedroom_window"}
         app.climate_entity = "climate.ac"
         app.enable_entity = "input_boolean.smart_cooling"
+        # No season-off override in play here -- season_active_entity resolves to None via
+        # the _state stub below (fail-open, same as "on"; see PublishSleepPlanSeasonOff for
+        # the dedicated coverage of the override itself).
+        app.season_active_entity = "input_boolean.smart_cooling_season_active"
         app.zone_offset = 1.0
         app.floor_cool_cph = 1.0
         app.cool_kw = 0.5
@@ -1709,6 +1713,132 @@ class PublishSleepPlanGrounding(unittest.TestCase):
         self.assertNotIn("bedroom_zone_now", attrs)   # None-valued attrs are omitted
 
 
+class PublishSleepPlanSeasonOff(unittest.TestCase):
+    """Season-off override (2026-08-28): input_boolean.smart_cooling_season_active OFF means
+    the AC is packed away in storage for the rest of the season, so _publish_sleep_plan must
+    downgrade an ac/hybrid verdict to windows-only regardless of the computed gap, before any
+    downstream consumer (rec/cost/headline/detail all overridden together, one source of
+    truth). Suppress ONLY on an explicit "off" -- missing/unknown/unavailable/"on" must fail
+    open to normal in-season behaviour, matching this codebase's convention elsewhere (e.g.
+    morning_briefing.py's home-suppression gate: a dead/unknown sensor is never evidence of
+    the special case). Same harness as PublishSleepPlanGrounding, extended with a
+    season_active_entity stub."""
+
+    NOW = datetime(2026, 7, 22, 12, 0)
+
+    def _app(self, e_active=24.7, floor=22.0, warm_night_margin=1.0, season_state="on"):
+        app = make_app(rise_frac=0.5)
+        app.comfort_temp_entity = "sensor.bed_temp"
+        app.comfort_rh_entity = "sensor.bed_rh"
+        app.outdoor_sensor = "sensor.outdoor"
+        app.outdoor_rh_entity = "sensor.outdoor_rh"
+        app.mid_sensor = "sensor.mid"
+        app.kitchen_sensor = "sensor.kitchen"
+        app.floor_sensor = "sensor.floor"
+        app.price_entity = "sensor.price"
+        app.weather_forecast_entity = "weather.forecast_home"
+        app.sleep_plan_entity = "sensor.sleep_plan"
+        app.window_contact_entities = {"bedroom": "binary_sensor.bedroom_window"}
+        app.climate_entity = "climate.ac"
+        app.enable_entity = "input_boolean.smart_cooling"
+        app.season_active_entity = "input_boolean.smart_cooling_season_active"
+        app.zone_offset = 1.0
+        app.floor_cool_cph = 1.0
+        app.cool_kw = 0.5
+        app.ac_noise_penalty_kr = 0.5
+        app.wm_reality_margin = 1.0
+        app.vent_tau_h = 7.0
+        app.wm_warm_night_margin = warm_night_margin
+
+        # Bedroom zone ~21.7-22.0C now (floor 22.0 arg, mid 21.7, kitchen 21.9); outdoor 15C.
+        nums = {"sensor.bed_temp": 21.7, "sensor.bed_rh": 60.0,
+                "sensor.outdoor": 15.0, "sensor.outdoor_rh": 60.0,
+                "sensor.mid": 21.7, "sensor.kitchen": 21.9,
+                "sensor.price": 1.7}
+
+        async def _num(entity, default):
+            return nums.get(entity, default)
+        app._num = _num
+
+        async def _state(entity):
+            # Same bedroom-window-contact stub as PublishSleepPlanGrounding, extended with
+            # the new season toggle -- everything else stays None (unknown).
+            if entity == "binary_sensor.bedroom_window":
+                return "on"
+            if entity == app.season_active_entity:
+                return season_state
+            return None
+        app._state = _state
+
+        async def _attr(entity, key, default=None):
+            return default   # no price arrays -> empty price map, cheapest = price_now
+        app._attr = _attr
+
+        async def _fc(now):
+            return [{"dt": datetime(2026, 7, 22, 20, 0), "temp": 16.0, "cloud": None},
+                    {"dt": datetime(2026, 7, 23, 3, 0), "temp": 15.0, "cloud": None},
+                    {"dt": datetime(2026, 7, 23, 6, 0), "temp": 15.5, "cloud": None}]
+        app._get_forecast = _fc
+
+        async def _eff(now):
+            return 22.5, 23.0   # comfort-lowered ceiling tonight
+        app._effective_ceiling = _eff
+
+        app._set_state_calls = []
+
+        async def set_state(entity, **kw):
+            app._set_state_calls.append((entity, kw))
+        app.set_state = set_state
+        app._e_active = e_active
+        app._floor = floor
+        return app
+
+    def _run(self, app):
+        import asyncio
+        asyncio.run(app._publish_sleep_plan(self.NOW, app._floor, app._e_active))
+        self.assertEqual(len(app._set_state_calls), 1)
+        entity, kw = app._set_state_calls[0]
+        self.assertEqual(entity, "sensor.sleep_plan")
+        return kw["state"], kw["attributes"]
+
+    def test_season_off_downgrades_ac_to_windows(self):
+        # Base case (warm_night_margin=100.0) is the same scenario as
+        # test_grounding_is_what_flips_it_warm_night_still_wants_ac, which produces ac/hybrid.
+        # Season off must downgrade it to windows, for free, with the override copy.
+        app = self._app(warm_night_margin=100.0, season_state="off")
+        state, attrs = self._run(app)
+        self.assertEqual(state, "windows")
+        self.assertNotIn(state, ("ac", "hybrid"))
+        self.assertEqual(attrs["recommendation"], "windows")
+        self.assertEqual(attrs["cost_label"], "free")
+        self.assertEqual(attrs["est_cost_kr"], 0.0)
+        self.assertIn("season", attrs["headline"].lower())
+        self.assertIn("season", attrs["detail"].lower())
+
+    def test_missing_or_unknown_season_state_fails_open_to_ac(self):
+        # Only an explicit "off" suppresses. An unknown/missing reading must leave the plan
+        # exactly as unaffected as if season_active_entity didn't exist at all -- i.e. the
+        # same ac/hybrid outcome as test_grounding_is_what_flips_it_warm_night_still_wants_ac.
+        app = self._app(warm_night_margin=100.0, season_state="unknown")
+        state, attrs = self._run(app)
+        self.assertIn(state, ("ac", "hybrid"))
+        self.assertEqual(attrs["grounded"], "false")
+        self.assertEqual(attrs["equilibrium_planned"], 24.7)
+
+    def test_season_off_is_a_noop_when_recommendation_already_windows(self):
+        # Cool apartment / cool night (default _app(), no warm_night_margin override) already
+        # produces windows/nothing on its own (see test_cool_apartment_cool_night_flips_off_ac)
+        # -- turning the season switch off must not touch headline/detail/cost when there was
+        # nothing to override.
+        app = self._app(season_state="off")
+        state, attrs = self._run(app)
+        self.assertIn(state, ("nothing", "windows"))
+        self.assertNotIn(state, ("ac", "hybrid"))
+        self.assertEqual(attrs["cost_label"], "free")
+        self.assertNotIn("season", attrs["headline"].lower())
+        self.assertNotIn("season", attrs["detail"].lower())
+
+
 class PublishSleepPlanPricing(unittest.TestCase):
     """2026-07-29: pricing must blend over the slots the job will ACTUALLY occupy
     (k = ceil(minutes_needed / 15), minutes_needed = deficit / floor_cool_cph * 60), not a
@@ -1732,6 +1862,9 @@ class PublishSleepPlanPricing(unittest.TestCase):
         app.weather_forecast_entity = "wx"
         app.sleep_plan_entity = "sensor.sleep_plan"
         app.window_contact_entities = {}
+        # Not exercised here (the _state stub below returns None for every entity, which
+        # fails open to "on" -- see PublishSleepPlanSeasonOff for the override's coverage).
+        app.season_active_entity = "input_boolean.smart_cooling_season_active"
         app.zone_offset = 1.0
         app.floor_cool_cph = 1.0
         app.cool_kw = 0.5

@@ -131,6 +131,13 @@ class SmartCooling(hass.Hass):
         # Click right before physically removing the AC - the true lights-out moment, whatever
         # the clock says. Replaces the old fixed-clock bedtime cutoff entirely (see module docstring).
         self.ac_removed_entity = a("ac_removed_entity", "input_boolean.smart_cooling_ac_removed")
+        # Season off (2026-08-28): a PERSISTENT toggle (survives restarts, no nightly reset --
+        # unlike ac_removed_entity's one-shot "unplugging right now" pulse above). OFF means
+        # the AC is physically stowed in storage for the rest of the season, so the sleep plan
+        # must never recommend ac/hybrid regardless of the computed gap (see the override in
+        # _publish_sleep_plan) -- windows-only advice until flipped back ON when the unit comes
+        # out of storage next year. No code change needed for that.
+        self.season_active_entity = a("season_active_entity", "input_boolean.smart_cooling_season_active")
         # Shower pause (2026-08-15): the condenser stands IN the bathroom, so a planner
         # start mid-shower means hot exhaust in the room he's showering in. One tap holds
         # the AC off for shower_pause_minutes, then planning resumes on its own - no
@@ -562,7 +569,7 @@ class SmartCooling(hass.Hass):
         # moving it must reshape the plan and the card NOW, not on the next 15-min tick.
         for ent in (self.enable_entity, self.price_entity,
                     self.night_ceiling_entity, self.vent_window, self.ac_removed_entity,
-                    self.shower_pause_entity,
+                    self.shower_pause_entity, self.season_active_entity,
                     self.alarm_time_entity, self.alarm_enabled_entity):
             self.listen_state(self._on_trigger, ent)
         # Park detection must not wait for the 15-min tick: the unit parks (~300 W,
@@ -1916,6 +1923,22 @@ class SmartCooling(hass.Hass):
                 indoor_dew=indoor_dew, open_windows=open_windows,
                 noise_penalty_kr=self.ac_noise_penalty_kr,
                 night_outdoor=night_outdoor, kwh_per_deg=self._kwh_per_deg))
+            # Season off (2026-08-28): the AC is physically stowed for the rest of the season --
+            # downgrade an ac/hybrid verdict to windows-only right here, before ANYTHING
+            # downstream reads plan[...] (the rescue's _last_plan below, the published sensor
+            # attrs, and the compose_briefing() verdict text further down all key off this same
+            # dict -- one source of truth, not a patch applied at each consumer). Suppress ONLY
+            # on an explicit "off"; a missing/unknown/unavailable sensor (or "on") is never
+            # treated as evidence the season ended (same fail-open semantics as
+            # rescue_home_entity's gate above).
+            season_active = (await self._state(self.season_active_entity)) != "off"
+            if not season_active and plan["recommendation"] in ("ac", "hybrid"):
+                plan["recommendation"] = "windows"
+                plan["est_cost_kr"] = 0.0
+                plan["cost_label"] = "free"
+                plan["headline"] = "Windows only -- AC stored for the season"
+                plan["detail"] = (plan["detail"] + " The AC is packed away for the season, so windows "
+                                  "are the plan regardless of the gap above.")
             # The evening rescue's single source of truth: it DELIVERS this plan's verdict
             # instead of recomputing its own projection (2026-07-23: the rescue still used
             # the un-grounded kitchen proxy and pushed "deploy the AC" at a 21.6C bedroom

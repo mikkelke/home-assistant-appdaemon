@@ -33,6 +33,11 @@ SmartCooling:
   # compressor gracefully ahead of the power pull, auto-resets, and DISARMS the master for
   # the night (user 2026-07-17) - arm again when redeploying next day.
   ac_removed_entity: input_boolean.smart_cooling_ac_removed
+  # Season off (2026-08-28): persistent toggle (survives restarts, no nightly reset) for
+  # storing the AC over the off-season. OFF suppresses ac/hybrid sleep-plan recommendations
+  # to windows-only regardless of the computed gap; see the override in _publish_sleep_plan.
+  # Flip back on when the unit comes out of storage next year -- no code change needed.
+  season_active_entity: input_boolean.smart_cooling_season_active
   # Shower pause (2026-08-15): the condenser stands IN the bathroom, so a planner start
   # mid-shower blows hot exhaust into the room he's showering in. One tap on the AC card
   # holds the compressor off for shower_pause_minutes, then planning resumes by itself
