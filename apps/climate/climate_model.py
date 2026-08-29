@@ -21,7 +21,8 @@ Contents:
   - comfort limit: dew_point_c, project_morning_dp, effective_ceiling, hours_until_morning,
     classify (moved verbatim from bedroom_comfort)
   - free cooling: windows_can_cool (feasibility against a TARGET) + vent_helps (compat
-    wrapper) + summarize_open_windows
+    wrapper) + summarize_open_windows + vent_feasibility (plan_sleep's own cool/muggy
+    gate, promoted so smart_cooling's grounding step can reuse it verbatim)
   - plan_sleep: the cheapest-path planner (windows cost 0 vs AC energy*price + noise)
   - compose_briefing / nice_cost: the ONE-VOICE verdict copy (title + bare instruction)
     shared by the morning push, the evening rescue framing and the Tonight card
@@ -402,6 +403,23 @@ def summarize_open_windows(contacts: dict) -> list:
     return sorted(name for name, state in (contacts or {}).items() if state == "on")
 
 
+def vent_feasibility(comfort_limit, night_outdoor, outdoor_temp, outdoor_dew, indoor_dew,
+                     temp_margin_c=0.5, muggy_slack_c=2.0):
+    """(cool_enough, too_muggy) -- would opening a window actually help TONIGHT?
+
+    This is plan_sleep's own feasibility gate, promoted to a standalone helper so the
+    reality-anchor grounding step in smart_cooling (whether to assume venting will happen
+    before it's observed) and plan_sleep's verdict (windows/hybrid/ac) can never disagree
+    about whether tonight is a window night. Defaults mirror SleepPlanInputs.temp_margin_c
+    / muggy_slack_c exactly -- keep them in sync if either changes.
+    """
+    night_temp = night_outdoor if night_outdoor is not None else outdoor_temp
+    cool_enough = (night_temp is not None and night_temp < comfort_limit - temp_margin_c)
+    too_muggy = (outdoor_dew is not None and indoor_dew is not None
+                 and outdoor_dew - indoor_dew > muggy_slack_c)
+    return cool_enough, too_muggy
+
+
 # ------------------------------------------------------------- cheapest-path planner
 
 @dataclass
@@ -557,11 +575,9 @@ def plan_sleep(inp: SleepPlanInputs) -> dict:
         # cooling would actually happen) when known, falling back to the current outdoor_temp
         # reading only if it's missing -- see the docstring for why the current reading alone
         # is unsafe (it's the daily minimum at 05:30, every single morning).
-        night_temp = inp.night_outdoor if inp.night_outdoor is not None else inp.outdoor_temp
-        cool_enough = (night_temp is not None
-                       and night_temp < limit - inp.temp_margin_c)
-        too_muggy = (inp.outdoor_dew is not None and inp.indoor_dew is not None
-                     and inp.outdoor_dew - inp.indoor_dew > inp.muggy_slack_c)
+        cool_enough, too_muggy = vent_feasibility(limit, inp.night_outdoor, inp.outdoor_temp,
+                                                   inp.outdoor_dew, inp.indoor_dew,
+                                                   inp.temp_margin_c, inp.muggy_slack_c)
         if cool_enough and not too_muggy:
             humid_note = ("" if (inp.outdoor_dew is None or inp.indoor_dew is None
                                  or inp.outdoor_dew <= inp.indoor_dew)

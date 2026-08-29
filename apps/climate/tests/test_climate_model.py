@@ -214,6 +214,38 @@ class WindowsCanCool(unittest.TestCase):
         self.assertTrue(cm.windows_can_cool(23.0, 15.0, 12.0, 12.0)[0])
 
 
+class VentFeasibility(unittest.TestCase):
+    """plan_sleep's own cool/muggy gate, promoted to a standalone helper (2026-08-29) so
+    smart_cooling's grounding step -- crediting venting before a window is observed open --
+    can never disagree with plan_sleep's own windows/hybrid/ac verdict about whether
+    tonight is a window night."""
+
+    def test_cool_and_dry_true(self):
+        self.assertEqual(cm.vent_feasibility(23.0, 15.0, 15.0, 8.0, 11.0), (True, False))
+
+    def test_warm_night_not_cool_enough(self):
+        # night_outdoor 23.0 is above comfort_limit(23.0) - temp_margin_c(0.5) = 22.5
+        cool, _ = cm.vent_feasibility(23.0, 23.0, 15.0, 8.0, 11.0)
+        self.assertFalse(cool)
+
+    def test_muggy_night_true(self):
+        # outdoor_dew - indoor_dew = 3.0 > muggy_slack_c default (2.0)
+        _, muggy = cm.vent_feasibility(23.0, 15.0, 15.0, 14.0, 11.0)
+        self.assertTrue(muggy)
+
+    def test_none_night_outdoor_falls_back_to_outdoor_temp(self):
+        via_none = cm.vent_feasibility(23.0, None, 15.0, 8.0, 11.0)
+        via_outdoor_temp = cm.vent_feasibility(23.0, 15.0, 15.0, 8.0, 11.0)
+        self.assertEqual(via_none, via_outdoor_temp)
+        # and the warm case falls back the same way, not just the cool one
+        self.assertFalse(cm.vent_feasibility(23.0, None, 23.0, 8.0, 11.0)[0])
+
+    def test_missing_dew_reading_is_not_muggy(self):
+        # matches plan_sleep's existing behaviour: missing dew data never trips the veto
+        self.assertFalse(cm.vent_feasibility(23.0, 15.0, 15.0, None, 11.0)[1])
+        self.assertFalse(cm.vent_feasibility(23.0, 15.0, 15.0, 8.0, None)[1])
+
+
 class SummarizeOpenWindows(unittest.TestCase):
     def test_only_on_is_open_sorted(self):
         got = cm.summarize_open_windows({"kitchen": "on", "bedroom": "on",

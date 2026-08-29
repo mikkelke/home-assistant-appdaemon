@@ -1852,11 +1852,27 @@ class SmartCooling(hass.Hass):
             # The room is not sealed until BEDTIME, so anchor reality on where the zone will
             # be THEN, not on this instant's reading (user 2026-08-01: "Set up the AC" at
             # 08:34 with 6 windows open, 16C outside and a zone still holding yesterday's
-            # heat). Only claimed while windows are actually open and the air outside is
-            # genuinely cooler - otherwise the anchor stays exactly as it was.
+            # heat). The household opens windows at bedtime by DEFAULT, so a contact reading
+            # closed at the instant this tick runs is not evidence tonight will stay sealed
+            # (user 2026-08-29: all 10 contacts closed at 21:00 -> "hybrid"/deploy-the-AC push;
+            # one bathroom window open at 07:19 on the identical weather -> "windows"). Same
+            # class of mistake as the 2026-07-29 fix that moved cool_enough off the live
+            # outdoor reading, so credit venting whenever it is WORTH doing tonight
+            # (cm.vent_feasibility -- plan_sleep's own gate) even before it's observed, OR
+            # when it's already observed open. Observation still counts on its own even on a
+            # muggy night: an open window moves heat regardless of dew point, and
+            # vented_zone_hours/vented_zone_at only model temperature -- too_muggy only vetoes
+            # the ASSUMPTION, because muggy air is when nobody would choose to open one.
+            # _vent_tau below stays keyed on live contact/door/curtain state either way, so an
+            # all-closed flat still gets the slow "indirect" 14 h constant (conduction through
+            # a vented flat), not the fast 7 h "direct" one -- that halves the assumed credit
+            # and is the right conservative default until this is observed to actually happen.
             zone_anchor = bedroom_zone_now
             vent_hours = None
-            if wake_dt is not None and bedroom_zone_now is not None and open_windows:
+            vent_cool, vent_muggy = cm.vent_feasibility(
+                ceiling, night_outdoor, t_out, outdoor_dew, indoor_dew)
+            if (wake_dt is not None and bedroom_zone_now is not None
+                    and (open_windows or (vent_cool and not vent_muggy))):
                 bedtime_dt = cm.next_bedtime(now, wake_dt, self.sleep_hours)
                 vent_hours = max(0.0, (bedtime_dt - now).total_seconds() / 3600.0)
                 # Hour-by-hour against the FORECAST (2026-08-06): the scalar version vented
@@ -2021,6 +2037,10 @@ class SmartCooling(hass.Hass):
                 attrs["vent_mode"] = ("direct" if vent_tau == self.vent_tau_h
                                       else "door" if vent_tau == self.vent_tau_door_h
                                       else "indirect")
+                # "true" = credited on the feasibility assumption alone (no window observed
+                # open yet); "false" = a contact was actually observed open. String, not bool
+                # -- AppDaemon 4.5.13 drops a raw False (same reason `grounded` is a string).
+                attrs["vent_assumed"] = "false" if open_windows else "true"
             if night_outdoor is not None:
                 attrs["night_outdoor_min"] = round(night_outdoor, 1)
             if wake_dt is not None:

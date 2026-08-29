@@ -1944,6 +1944,116 @@ class PublishSleepPlanPricing(unittest.TestCase):
         self.assertEqual(app._blended_calls, [8])
 
 
+class PublishSleepPlanAssumedVenting(unittest.TestCase):
+    """2026-08-29 fix: crediting venting toward the projected sleep-plan peak must not
+    depend on a contact reading 'open' at the INSTANT the tick runs -- opening a window
+    before bed is the household's default action (user 2026-08-29: all 10 contacts closed
+    at 21:00 still pushed "hybrid"/deploy-the-AC; one bathroom window open at 07:19 on the
+    identical weather read "windows"). Same harness/numbers as PublishSleepPlanGrounding's
+    cool-apartment-cool-night case (bedroom_zone_now 22.0, outdoor/night_outdoor 15.0,
+    ceiling 22.5) -- only the bedroom contact state and humidity vary here, isolating
+    cm.vent_feasibility (cool + not muggy) as the thing that must now also grant a credit."""
+
+    NOW = datetime(2026, 7, 22, 12, 0)
+
+    def _app(self, contact_state="off", outdoor_rh=60.0, bed_rh=60.0, warm_night_margin=1.0):
+        app = make_app(rise_frac=0.5)
+        app.comfort_temp_entity = "sensor.bed_temp"
+        app.comfort_rh_entity = "sensor.bed_rh"
+        app.outdoor_sensor = "sensor.outdoor"
+        app.outdoor_rh_entity = "sensor.outdoor_rh"
+        app.mid_sensor = "sensor.mid"
+        app.kitchen_sensor = "sensor.kitchen"
+        app.floor_sensor = "sensor.floor"
+        app.price_entity = "sensor.price"
+        app.weather_forecast_entity = "weather.forecast_home"
+        app.sleep_plan_entity = "sensor.sleep_plan"
+        app.window_contact_entities = {"bedroom": "binary_sensor.bedroom_window"}
+        app.climate_entity = "climate.ac"
+        app.enable_entity = "input_boolean.smart_cooling"
+        app.season_active_entity = "input_boolean.smart_cooling_season_active"
+        app.zone_offset = 1.0
+        app.floor_cool_cph = 1.0
+        app.cool_kw = 0.5
+        app.ac_noise_penalty_kr = 0.5
+        app.wm_reality_margin = 1.0
+        app.vent_tau_h = 7.0
+        app.wm_warm_night_margin = warm_night_margin
+
+        # Bedroom zone ~21.7-22.0C now (floor 22.0, mid 21.7, kitchen 21.9); outdoor 15.0C --
+        # identical to PublishSleepPlanGrounding's cool-night case. Only outdoor/bed RH vary
+        # (dry vs muggy) and the bedroom contact state varies (off vs on) across the tests.
+        nums = {"sensor.bed_temp": 21.7, "sensor.bed_rh": bed_rh,
+                "sensor.outdoor": 15.0, "sensor.outdoor_rh": outdoor_rh,
+                "sensor.mid": 21.7, "sensor.kitchen": 21.9,
+                "sensor.price": 1.7}
+
+        async def _num(entity, default):
+            return nums.get(entity, default)
+        app._num = _num
+
+        async def _state(entity):
+            return contact_state if entity == "binary_sensor.bedroom_window" else None
+        app._state = _state
+
+        async def _attr(entity, key, default=None):
+            return default   # no price arrays -> empty price map, cheapest = price_now
+        app._attr = _attr
+
+        async def _fc(now):
+            return []   # no forecast rows -> _night_outdoor_min falls back to outdoor_sensor
+        app._get_forecast = _fc
+
+        async def _eff(now):
+            return 22.5, 23.0   # comfort-lowered ceiling tonight
+        app._effective_ceiling = _eff
+
+        app._set_state_calls = []
+
+        async def set_state(entity, **kw):
+            app._set_state_calls.append((entity, kw))
+        app.set_state = set_state
+        app._e_active = 24.7
+        app._floor = 22.0
+        return app
+
+    def _run(self, app):
+        import asyncio
+        asyncio.run(app._publish_sleep_plan(self.NOW, app._floor, app._e_active))
+        self.assertEqual(len(app._set_state_calls), 1)
+        entity, kw = app._set_state_calls[0]
+        self.assertEqual(entity, "sensor.sleep_plan")
+        return kw["state"], kw["attributes"]
+
+    def test_no_contact_open_but_feasible_still_credits(self):
+        # All window/door contacts read "off" -- nothing is observed open -- but it's cool
+        # and dry outside, so venting is WORTH doing tonight: a credit must still apply.
+        app = self._app(contact_state="off", outdoor_rh=60.0, bed_rh=60.0)
+        _, attrs = self._run(app)
+        self.assertIn("zone_at_bedtime", attrs)
+        self.assertLess(attrs["zone_at_bedtime"], attrs["bedroom_zone_now"])
+        self.assertEqual(attrs["vent_assumed"], "true")
+
+    def test_muggy_night_no_contact_open_no_credit(self):
+        # Same cool temperatures, but outdoor is far muggier than indoors (outdoor_dew -
+        # indoor_dew ~10.8C, over muggy_slack_c's 2.0) -- nobody would choose to open a
+        # window, so the assumption must NOT grant a credit (today's HEAD behaviour, and it
+        # must stay that way: no over-crediting on a muggy night).
+        app = self._app(contact_state="off", outdoor_rh=95.0, bed_rh=30.0)
+        _, attrs = self._run(app)
+        self.assertNotIn("zone_at_bedtime", attrs)
+        self.assertNotIn("vent_assumed", attrs)
+
+    def test_muggy_night_but_contact_open_still_credits(self):
+        # Same muggy air as above, but a contact IS observed open -- observation overrides
+        # the muggy veto: an open window moves heat regardless of dew point, so the credit
+        # must still apply, and vent_assumed must say it was OBSERVED, not assumed.
+        app = self._app(contact_state="on", outdoor_rh=95.0, bed_rh=30.0)
+        _, attrs = self._run(app)
+        self.assertIn("zone_at_bedtime", attrs)
+        self.assertEqual(attrs["vent_assumed"], "false")
+
+
 class GoldenModelMath(unittest.TestCase):
     """Lock the byte-identical-actuation claim into CI: the shared climate_model fns
     reproduce smart_cooling's FORMER inline math on a fixed grid. The `_old_*` bodies below
