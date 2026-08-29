@@ -1849,30 +1849,41 @@ class SmartCooling(hass.Hass):
             wake_dt = cm.resolve_wake(now, alarm_t, alarm_on,
                                       self.fallback_workday, self.fallback_weekend)
             night_outdoor = await self._night_outdoor_min(now)
+            # Season off (2026-08-28): read up here (rather than only below, where it also
+            # downgrades an ac/hybrid verdict) so the vent-feasibility ASSUMPTION just below
+            # can be gated on it too -- "open by default, closed for sleeping" (user
+            # 2026-08-29) is a SUMMER default; in winter the default flips ("In winter can be
+            # closed" -- user 2026-08-29), so assuming a window will get opened whenever it's
+            # merely cool-and-dry enough would be wrong once the season is off. An actually
+            # OPEN contact still counts regardless of season below -- if it's really open,
+            # it's really venting; only the ASSUMPTION is seasonal.
+            season_active = (await self._state(self.season_active_entity)) != "off"
             # The room is not sealed until BEDTIME, so anchor reality on where the zone will
             # be THEN, not on this instant's reading (user 2026-08-01: "Set up the AC" at
             # 08:34 with 6 windows open, 16C outside and a zone still holding yesterday's
-            # heat). The household opens windows at bedtime by DEFAULT, so a contact reading
-            # closed at the instant this tick runs is not evidence tonight will stay sealed
-            # (user 2026-08-29: all 10 contacts closed at 21:00 -> "hybrid"/deploy-the-AC push;
-            # one bathroom window open at 07:19 on the identical weather -> "windows"). Same
-            # class of mistake as the 2026-07-29 fix that moved cool_enough off the live
-            # outdoor reading, so credit venting whenever it is WORTH doing tonight
-            # (cm.vent_feasibility -- plan_sleep's own gate) even before it's observed, OR
-            # when it's already observed open. Observation still counts on its own even on a
-            # muggy night: an open window moves heat regardless of dew point, and
-            # vented_zone_hours/vented_zone_at only model temperature -- too_muggy only vetoes
-            # the ASSUMPTION, because muggy air is when nobody would choose to open one.
-            # _vent_tau below stays keyed on live contact/door/curtain state either way, so an
-            # all-closed flat still gets the slow "indirect" 14 h constant (conduction through
-            # a vented flat), not the fast 7 h "direct" one -- that halves the assumed credit
-            # and is the right conservative default until this is observed to actually happen.
+            # heat). The household opens windows at bedtime by DEFAULT (in season -- see
+            # season_active above), so a contact reading closed at the instant this tick runs
+            # is not evidence tonight will stay sealed (user 2026-08-29: all 10 contacts
+            # closed at 21:00 -> "hybrid"/deploy-the-AC push; one bathroom window open at
+            # 07:19 on the identical weather -> "windows"). Same class of mistake as the
+            # 2026-07-29 fix that moved cool_enough off the live outdoor reading, so credit
+            # venting whenever it is WORTH doing tonight (cm.vent_feasibility -- plan_sleep's
+            # own gate) even before it's observed, OR when it's already observed open.
+            # Observation still counts on its own even on a muggy night or in winter: an open
+            # window moves heat regardless of dew point or season, and
+            # vented_zone_hours/vented_zone_at only model temperature -- too_muggy and
+            # season-off only veto the ASSUMPTION, because those are when nobody would choose
+            # to open one. _vent_tau below stays keyed on live contact/door/curtain state
+            # either way, so an all-closed flat still gets the slow "indirect" 14 h constant
+            # (conduction through a vented flat), not the fast 7 h "direct" one -- that halves
+            # the assumed credit and is the right conservative default until this is observed
+            # to actually happen.
             zone_anchor = bedroom_zone_now
             vent_hours = None
             vent_cool, vent_muggy = cm.vent_feasibility(
                 ceiling, night_outdoor, t_out, outdoor_dew, indoor_dew)
             if (wake_dt is not None and bedroom_zone_now is not None
-                    and (open_windows or (vent_cool and not vent_muggy))):
+                    and (open_windows or (season_active and vent_cool and not vent_muggy))):
                 bedtime_dt = cm.next_bedtime(now, wake_dt, self.sleep_hours)
                 vent_hours = max(0.0, (bedtime_dt - now).total_seconds() / 3600.0)
                 # Hour-by-hour against the FORECAST (2026-08-06): the scalar version vented
@@ -1946,8 +1957,8 @@ class SmartCooling(hass.Hass):
             # dict -- one source of truth, not a patch applied at each consumer). Suppress ONLY
             # on an explicit "off"; a missing/unknown/unavailable sensor (or "on") is never
             # treated as evidence the season ended (same fail-open semantics as
-            # rescue_home_entity's gate above).
-            season_active = (await self._state(self.season_active_entity)) != "off"
+            # rescue_home_entity's gate above). season_active itself was read earlier (see the
+            # vent-feasibility block above, which needs it too) -- reused here, not re-fetched.
             if not season_active and plan["recommendation"] in ("ac", "hybrid"):
                 plan["recommendation"] = "windows"
                 plan["est_cost_kr"] = 0.0

@@ -1951,12 +1951,15 @@ class PublishSleepPlanAssumedVenting(unittest.TestCase):
     at 21:00 still pushed "hybrid"/deploy-the-AC; one bathroom window open at 07:19 on the
     identical weather read "windows"). Same harness/numbers as PublishSleepPlanGrounding's
     cool-apartment-cool-night case (bedroom_zone_now 22.0, outdoor/night_outdoor 15.0,
-    ceiling 22.5) -- only the bedroom contact state and humidity vary here, isolating
-    cm.vent_feasibility (cool + not muggy) as the thing that must now also grant a credit."""
+    ceiling 22.5) -- only the bedroom contact state, humidity and season vary here, isolating
+    cm.vent_feasibility (cool + not muggy) and season_active as the things that must now also
+    gate the credit -- the "opens by default" assumption is a SUMMER default (2026-08-29:
+    "In winter can be closed"), so it additionally requires season_active."""
 
     NOW = datetime(2026, 7, 22, 12, 0)
 
-    def _app(self, contact_state="off", outdoor_rh=60.0, bed_rh=60.0, warm_night_margin=1.0):
+    def _app(self, contact_state="off", outdoor_rh=60.0, bed_rh=60.0, warm_night_margin=1.0,
+             season_state="on"):
         app = make_app(rise_frac=0.5)
         app.comfort_temp_entity = "sensor.bed_temp"
         app.comfort_rh_entity = "sensor.bed_rh"
@@ -1993,7 +1996,11 @@ class PublishSleepPlanAssumedVenting(unittest.TestCase):
         app._num = _num
 
         async def _state(entity):
-            return contact_state if entity == "binary_sensor.bedroom_window" else None
+            if entity == "binary_sensor.bedroom_window":
+                return contact_state
+            if entity == "input_boolean.smart_cooling_season_active":
+                return season_state
+            return None
         app._state = _state
 
         async def _attr(entity, key, default=None):
@@ -2049,6 +2056,24 @@ class PublishSleepPlanAssumedVenting(unittest.TestCase):
         # the muggy veto: an open window moves heat regardless of dew point, so the credit
         # must still apply, and vent_assumed must say it was OBSERVED, not assumed.
         app = self._app(contact_state="on", outdoor_rh=95.0, bed_rh=30.0)
+        _, attrs = self._run(app)
+        self.assertIn("zone_at_bedtime", attrs)
+        self.assertEqual(attrs["vent_assumed"], "false")
+
+    def test_season_off_no_contact_open_no_credit(self):
+        # 2026-08-29: "In winter can be closed" -- the "opens by default" assumption is a
+        # SUMMER default; cool+dry alone must not grant a credit once the season is off,
+        # even though the exact same conditions credit one in test_no_contact_open_but_
+        # feasible_still_credits above (season defaults to "on" there).
+        app = self._app(contact_state="off", outdoor_rh=60.0, bed_rh=60.0, season_state="off")
+        _, attrs = self._run(app)
+        self.assertNotIn("zone_at_bedtime", attrs)
+        self.assertNotIn("vent_assumed", attrs)
+
+    def test_season_off_but_contact_open_still_credits(self):
+        # Season off, but a contact IS observed open -- observation overrides season same as
+        # it overrides mugginess: an actually open window still actually vents in winter.
+        app = self._app(contact_state="on", outdoor_rh=60.0, bed_rh=60.0, season_state="off")
         _, attrs = self._run(app)
         self.assertIn("zone_at_bedtime", attrs)
         self.assertEqual(attrs["vent_assumed"], "false")
