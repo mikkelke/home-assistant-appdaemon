@@ -54,4 +54,5 @@ SonosGroupManager:
     - media_player.kitchen
     - media_player.dining_room
   rooftop_entity: media_player.rooftop
-  rooftop_charging_sensor: binary_sensor.rooftop_charging 
+  rooftop_charging_sensor: binary_sensor.rooftop_charging
+  family_zone_auto_group_entity: "input_boolean.family_zone_auto_group_music" 

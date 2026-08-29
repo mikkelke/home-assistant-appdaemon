@@ -50,6 +50,9 @@ class SonosGroupManager(hass.Hass):
         self.family_zone_speakers = self.args.get("family_zone_speakers", [])
         self.rooftop_entity = self.args.get("rooftop_entity", "media_player.rooftop")
         self.rooftop_charging_sensor = self.args.get("rooftop_charging_sensor", "binary_sensor.rooftop_charging")
+        self.family_zone_auto_group_entity = self.args.get(
+            "family_zone_auto_group_entity", "input_boolean.family_zone_auto_group_music"
+        )
         self._family_zone_sync_in_progress = False
         self._family_zone_sync_start_time = None  # Track when sync started for stuck detection
         self._family_zone_sync_timeout_s = 15  # Auto-reset if stuck longer than this
@@ -227,6 +230,14 @@ class SonosGroupManager(hass.Hass):
     def _on_state_change(self, entity, attribute, old, new, kwargs):
         """Handle speaker state changes"""
         self.log(f"State change detected: {entity} from {old} to {new}", level="DEBUG")
+
+        # Family Zone auto-group: a family speaker starting playback (solo or not)
+        # is itself a trigger to pull the rest of the Family Zone together, on top
+        # of the existing "external group detected" path below. Rooftop counts too
+        # while docked - see _current_family_zone_members.
+        if new == "playing" and old != "playing" and entity in self._current_family_zone_members():
+            self.run_in(self._check_family_zone_synchronization, 0.5)
+
         self._maybe_trigger("state_change", entity, old, new)
 
     def _on_group_change(self, entity, attribute, old, new, kwargs):
@@ -413,9 +424,11 @@ class SonosGroupManager(hass.Hass):
 
     def _find_family_zone_group_anchor(self, current_family_zone):
         """
-        Find a family-zone speaker in an active multi-speaker group to use as join anchor.
-        Prefers a playing/paused family member; falls back to any grouped family member
-        when the group still has active audio (covers Spotify join races).
+        Find a family-zone speaker to use as join anchor.
+        Prefers a playing/paused family member already in a multi-speaker group; falls
+        back to any grouped family member when the group still has active audio (covers
+        Spotify join races); finally, falls back to a solo family member that just started
+        playing, so a single speaker starting music pulls the rest of the Family Zone in too.
         """
         grouped_family = []
         for member in current_family_zone:
@@ -423,9 +436,6 @@ class SonosGroupManager(hass.Hass):
             if not isinstance(members, list) or len(members) <= 1:
                 continue
             grouped_family.append((member, members))
-
-        if not grouped_family:
-            return None, None, []
 
         # Prefer family member with its own active playback
         for member, members in grouped_family:
@@ -437,6 +447,14 @@ class SonosGroupManager(hass.Hass):
             if self._family_group_has_active_audio(members):
                 return member, members, "group_active"
 
+        # No family member is already grouped - a solo family speaker that is playing
+        # is its own one-speaker seed group; the rest of the Family Zone joins it.
+        for member in current_family_zone:
+            members = self.get_state(member, attribute="group_members")
+            is_solo = not isinstance(members, list) or len(members) <= 1
+            if is_solo and self.get_state(member) == "playing":
+                return member, [member], "solo_playing"
+
         return None, None, []
 
     def _resolve_group_master(self, anchor_member, group_members):
@@ -447,16 +465,39 @@ class SonosGroupManager(hass.Hass):
             return group_members[0]
         return anchor_member
 
+    def _family_zone_auto_group_enabled(self):
+        """True unless the family-zone auto-group toggle is explicitly off. Defaults to
+        on (for music) so a missing/unavailable helper does not silently disable grouping."""
+        state = self._safe_get_state(self.family_zone_auto_group_entity, default="on")
+        return state not in ("off",)
+
+    def _current_family_zone_members(self):
+        """Family-zone speakers (living room, kitchen, dining room) plus the rooftop
+        speaker when it is currently docked/charging - it counts as a family-room
+        speaker only while docked."""
+        current_family_zone = list(self.family_zone_speakers)
+        try:
+            is_docked = self.get_state(self.rooftop_charging_sensor) == "on"
+            if is_docked and self.rooftop_entity and self.rooftop_entity not in current_family_zone:
+                current_family_zone.append(self.rooftop_entity)
+        except Exception:
+            pass  # Ignore if sensor missing
+        return current_family_zone
+
     def _check_family_zone_synchronization(self, kwargs=None):
         """
         Auto-group family-zone speakers (kitchen, dining, living, docked rooftop) when
-        any of them is in a multi-speaker group with active audio.
+        any of them is playing - either already in a multi-speaker group with active
+        audio, or playing solo (see _find_family_zone_group_anchor).
 
-        Skips while living room TV is on. Requires active audio in the group so we do not
-        pull speakers together during idle ungroup/reset flows.
+        Skips while living room TV is on, or while family_zone_auto_group_entity is off.
         """
         if self._reset_in_progress:
             self.log("Scenario: skip_family_zone_sync_during_reset", level="DEBUG")
+            return
+
+        if not self._family_zone_auto_group_enabled():
+            self.log("Family Zone Auto-Group: disabled via toggle, skipping", level="DEBUG")
             return
         # Avoid re-entry loops if we are the ones triggering the join
         # But also detect and reset stuck flags
@@ -501,17 +542,8 @@ class SonosGroupManager(hass.Hass):
         
         try:
             # 1. Determine current Family Zone membership
-            current_family_zone = list(self.family_zone_speakers)
-            
-            # Check Rooftop status
-            try:
-                is_docked = self.get_state(self.rooftop_charging_sensor) == "on"
-                if is_docked and self.rooftop_entity:
-                    if self.rooftop_entity not in current_family_zone:
-                        current_family_zone.append(self.rooftop_entity)
-            except Exception:
-                pass # Ignore if sensor missing
-                
+            current_family_zone = self._current_family_zone_members()
+
             anchor_member, target_group, anchor_reason = self._find_family_zone_group_anchor(
                 current_family_zone
             )
