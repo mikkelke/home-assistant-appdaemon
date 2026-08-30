@@ -1442,14 +1442,19 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         return bool(self.detected_quick_short)
 
     def _get_programme_duration(self, prog: str, use_learned: bool = True) -> int:
-        """Expected duration in minutes. ECO/quick use duration_short_min when short=Yes (or detected)."""
+        """Expected duration in minutes. ECO/quick use duration_short_min only when the user has
+        explicitly set short=Yes - never from the classifier's detected_short/detected_quick_short,
+        which is just a same-energy-band guess and reads as 'short' for the first ~100-120 min of
+        every full cycle too. Trusting it here pinned the live estimate to the short duration (and
+        estimated_remaining_min to 0) for over an hour into genuine full ECO washes. See
+        _get_guard_duration for the same reasoning, already applied there."""
         profile = self._get_profile(prog)
         if prog == "eco":
-            use_short = self._eco_short_active()
+            use_short = bool(self.short_entity and self.get_state(self.short_entity) == "Yes")
             manual = profile.get("duration_short_min", 74) if use_short else profile.get("duration_min", 265)
             learn_key = "eco_short" if use_short else "eco"
         elif prog == "quick":
-            use_short = self._quick_short_active()
+            use_short = bool(self.short_entity and self.get_state(self.short_entity) == "Yes")
             manual = profile.get("duration_short_min", 14) if use_short else profile.get("duration_min", 58)
             learn_key = "quick_short" if use_short else "quick"
         else:
