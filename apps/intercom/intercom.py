@@ -111,11 +111,20 @@ class Intercom(hass.Hass):
             self.args.get("voice_before_unlock_message", "Door is opening.")
         )
         self.voice_before_unlock_tts = str(self.args.get("voice_before_unlock_tts", "tts.piper"))
-        # Hard bound. The unlock is scheduled at this delay UNCONDITIONALLY and
-        # the voice runs alongside it, so a rejected, silent or hung
-        # announcement can never leave the door shut - it costs these seconds
-        # and nothing else. There is exactly one unlock path either way.
-        self.voice_before_unlock_wait_s = float(self.args.get("voice_before_unlock_wait_s", 2.5))
+        # CEILING, not the schedule. The door opens when the bridge reports the
+        # sentence has finished playing; this timer only fires when that report
+        # never comes - the station's talkback never became ready and every
+        # retry failed - so a rejected, silent or hung announcement still
+        # cannot leave the door shut. It costs these seconds and nothing else,
+        # and there is exactly one unlock path either way.
+        self.voice_before_unlock_ceiling_s = float(
+            self.args.get("voice_before_unlock_ceiling_s", 8.0)
+        )
+        # ring_label -> the ring whose door is being held for the sentence.
+        # Both releasers (the announcement event and the ceiling timer) run on
+        # this app's pinned thread, so the dict pop below IS the interlock:
+        # whichever arrives first takes the record, the other finds nothing.
+        self._voice_unlock_pending = {}
         self._state_file = Path(__file__).with_name("intercom_state.json")
 
         # Validate entities exist
@@ -187,6 +196,12 @@ class Intercom(hass.Hass):
             self.listen_state(self._on_esp_lock_ack, lock_info["lock"], door_label=door_label)
             self.listen_state(self._on_abb_button_state, abb_button)
             self.log(f"ABB-native unlock enabled for {door_label} via {abb_button}", level="INFO")
+
+        # The bridge speaks the door sentence into the call HA dialled and fires
+        # this the instant play_audio returns - which the integration only does
+        # once the last 20 ms frame has been sent. Registered unconditionally:
+        # an event for a door we are not holding is simply dropped.
+        self.listen_event(self._on_announcement_spoken, "abb_announcement_spoken")
 
     def _get_notifier(self):
         try:
@@ -536,20 +551,32 @@ class Intercom(hass.Hass):
                         f"VOICE-BEFORE-UNLOCK dispatch failed for {ring_label}: {e}",
                         level="WARNING",
                     )
+                unlock_args = {
+                    "entity": entity,
+                    "ring_ts": ring_ts,
+                    "lock_entity": lock_entity,
+                    "door_sensor": door_sensor,
+                    "ring_label": ring_label,
+                }
                 self.log(
                     f"VOICE-BEFORE-UNLOCK door={ring_label} camera={voice_camera} "
-                    f"- unlock scheduled in {self.voice_before_unlock_wait_s}s",
+                    f"- unlock waits for the sentence, ceiling "
+                    f"{self.voice_before_unlock_ceiling_s}s",
                     level="INFO",
                 )
-                self.run_in(
+                # Arm the ceiling FIRST, then record the hold: if run_in were to
+                # raise, the door must not be left waiting on an event with no
+                # backstop behind it.
+                handle = self.run_in(
                     self._deferred_unlock,
-                    self.voice_before_unlock_wait_s,
-                    entity=entity,
-                    ring_ts=ring_ts,
-                    lock_entity=lock_entity,
-                    door_sensor=door_sensor,
-                    ring_label=ring_label,
+                    self.voice_before_unlock_ceiling_s,
+                    **unlock_args,
                 )
+                self._voice_unlock_pending[ring_label] = {
+                    "ring_ts": ring_ts,
+                    "handle": handle,
+                    "args": unlock_args,
+                }
             else:
                 self._dispatch_unlock(entity, ring_ts, lock_entity, door_sensor, ring_label)
 
@@ -617,26 +644,63 @@ class Intercom(hass.Hass):
         else:
             self._schedule_esp_unlock_sequence(entity, lock_entity, ring_ts, door_sensor)
 
-    def _deferred_unlock(self, kwargs):
-        """Unlock after the door voice (see voice_before_unlock).
+    def _on_announcement_spoken(self, event_name, data, kwargs):
+        """The bridge finished playing the door sentence - open the door now.
 
-        Scheduled unconditionally at ring time and never cancelled: whatever
-        the announcement did - rejected, silent, hung, or fine - the door still
-        opens here. Failure costs the wait and nothing else.
+        Carries no ring_ts: it means "whatever ring is currently holding this
+        door, its sentence is done", which is the only ring that can be waiting
+        on this door at this moment.
         """
+        door = str((data or {}).get("door") or "")
+        self._release_voice_unlock(door, "announcement")
+
+    def _deferred_unlock(self, kwargs):
+        """Ceiling for a held door (see voice_before_unlock_ceiling_s).
+
+        Fires only when the announcement never reported finishing - the station
+        never became ready, or every attempt failed. Whatever the announcement
+        did, the door still opens here; failure costs the wait and nothing else.
+        """
+        self._release_voice_unlock(
+            kwargs.get("ring_label"), "ceiling", ring_ts=kwargs.get("ring_ts")
+        )
+
+    def _release_voice_unlock(self, ring_label, reason, ring_ts=None):
+        """Open a door that was being held for its sentence, exactly once.
+
+        The announcement and the ceiling race by design, and both land on this
+        app's pinned thread, so popping the record IS the interlock - no lock
+        needed, and the loser simply finds nothing.
+
+        ring_ts guards a stale ceiling: if a second ring replaced the record
+        while the first one's timer was still armed, that timer must not open
+        the door on behalf of a ring that is no longer being held. The newer
+        ring has its own ceiling and its own sentence.
+        """
+        record = self._voice_unlock_pending.get(ring_label)
+        if record is None:
+            return
+        if ring_ts is not None and record.get("ring_ts") != ring_ts:
+            return  # A newer ring took this door; that ring's own hold applies.
+        self._voice_unlock_pending.pop(ring_label, None)
+        handle = record.get("handle")
+        if handle is not None:
+            try:
+                self.cancel_timer(handle)
+            except Exception:
+                pass  # Already fired, or gone with a restart - either is fine.
+        self.log(f"VOICE-UNLOCK door={ring_label} released by {reason}", level="INFO")
+        args = record.get("args", {})
         try:
             self._dispatch_unlock(
-                kwargs.get("entity"),
-                kwargs.get("ring_ts"),
-                kwargs.get("lock_entity"),
-                kwargs.get("door_sensor"),
-                kwargs.get("ring_label"),
+                args.get("entity"),
+                args.get("ring_ts"),
+                args.get("lock_entity"),
+                args.get("door_sensor"),
+                args.get("ring_label"),
             )
         except Exception as e:
-            self.log(
-                f"Deferred unlock failed for {kwargs.get('ring_label')}: {e}",
-                level="ERROR",
-            )
+            self.log(f"Deferred unlock failed for {ring_label}: {e}", level="ERROR")
 
     def _speak_before_unlock(self, ring_label, camera):
         """Executor-thread body: say the line into the station's OWN ring call.

@@ -753,17 +753,19 @@ class AbbWelcomeBridge(hass.Hass):
         """Start the door sentence at the RING, not after the unlock.
 
         The sequence Mikkel asked for is recording -> announcement -> unlock, and
-        intercom.py already holds the unlock voice_before_unlock_wait_s to make
-        room for it. The sentence itself, though, hung off _maybe_announce, whose
-        only trigger is the lock's own unlocking/unlocked edge - so it could not
-        physically start until after the door had opened. Measured on the
-        2026-08-27 18:57 front-door ring: door open at ring+3.9 s, sentence
-        dispatched at ring+7.0 s, i.e. the whole 3.5 s hold bought nothing and the
+        intercom.py holds the door for it. The sentence itself, though, hung off
+        _maybe_announce, whose only trigger is the lock's own unlocking/unlocked
+        edge - so it could not physically start until after the door had opened.
+        Measured on the 2026-08-27 18:57 front-door ring: door open at ring+3.9 s,
+        sentence dispatched at ring+7.0 s, i.e. the hold bought nothing and the
         announcement landed where Mikkel has said repeatedly it has no value.
 
         Anchored here it runs at ring+voice_start_delay_s (1.5 s), inside the
         answered ring call - which the integration accepts within ~0.03 s and the
-        station tears down at ~ring+9 s - and finishes before the unlock at +3.5 s.
+        station tears down at ~ring+9 s. The door then follows the sentence's own
+        ending rather than a timer: _publish_voice_spoken fires the moment
+        play_audio returns, and intercom.py opens on that (see its
+        _release_voice_unlock).
 
         Only with auto-open ON: then the door WILL open (intercom.py schedules that
         unconditionally at ring time), so promising it is truthful. With auto-open
@@ -1488,12 +1490,21 @@ class AbbWelcomeBridge(hass.Hass):
             episode = self.episodes.get(episode_id)
             if episode is not None:
                 episode["voice_spoken"] = True
-            # "accepted" = HA ran the service without raising, which for
-            # play_audio means the PCM was written into the open talkback leg.
-            # _voice_into_recording now checks the websocket result, so this is
-            # a real signal rather than the unchecked claim that hid the
+            # "accepted" is the sentence ENDING, not starting: the integration's
+            # play_audio paces 20 ms frames through a bounded queue and then
+            # drains that queue to empty before returning (media_pipeline
+            # _play_talkback_frames), so the service only comes back once the
+            # last packet has left, to within the station's jitter buffer.
+            # _voice_into_recording checks the websocket result, so this is a
+            # real signal rather than the unchecked claim that hid the
             # malformed-payload bug for five days.
             self.log(f"VOICE-NATIVE door={door} attempt={attempt}/5 accepted", level="INFO")
+            # Publish that instant so intercom.py can open the door on the
+            # sentence actually finishing instead of on a timer that only
+            # guesses at it. run_in(0) hops back to the pinned app thread - this
+            # body runs on the executor, the same hop _capture_for_episode
+            # already uses to flush the ring push.
+            self.run_in(self._publish_voice_spoken, 0, door=door)
             # DIAGNOSTIC (2026-08-26): HA accepts the call but nothing is
             # audible at the street. Sample the station camera's talkback
             # counters while the call is still up - they are reset on teardown,
@@ -1506,6 +1517,21 @@ class AbbWelcomeBridge(hass.Hass):
             for delay in (2, 5):
                 self.run_in(self._log_talkback_stats, delay, camera=camera,
                             door=door, at=delay)
+
+    def _publish_voice_spoken(self, kwargs):
+        """Tell the house that the door sentence has finished playing.
+
+        intercom.py holds the unlock for exactly this (see its
+        _release_voice_unlock). Strictly additive and never raises: if this
+        event is lost the door still opens, just on intercom.py's ceiling
+        timer instead - the same fail-open bargain the hold has always made.
+        """
+        door = kwargs.get("door")
+        try:
+            self.fire_event("abb_announcement_spoken", door=door)
+            self.log(f"VOICE-SPOKEN door={door}", level="INFO")
+        except Exception as e:
+            self.log(f"Voice-spoken publish failed for {door}: {e}", level="WARNING")
 
     def _log_talkback_stats(self, kwargs):
         """Log the station camera's live talkback counters (see caller)."""

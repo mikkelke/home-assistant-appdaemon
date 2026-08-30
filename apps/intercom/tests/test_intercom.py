@@ -144,7 +144,8 @@ def _fake_handle_trigger_app(state_file, states):
     app.voice_before_unlock = {}  # unconfigured: unlock dispatches immediately
     app.voice_before_unlock_message = "Door is opening."
     app.voice_before_unlock_tts = "tts.piper"
-    app.voice_before_unlock_wait_s = 2.5
+    app.voice_before_unlock_ceiling_s = 8.0
+    app._voice_unlock_pending = {}
     app.auto_open_entity = "input_boolean.auto_open"
     app.debounce_s = 5
     app.unlock_delay_s = 1
@@ -264,7 +265,8 @@ def _fake_abb_app(tmpdir, clock, states, abb_unlock_doors=None, voice_before_unl
     app.voice_before_unlock = dict(voice_before_unlock or {})
     app.voice_before_unlock_message = "Door is opening."
     app.voice_before_unlock_tts = "tts.piper"
-    app.voice_before_unlock_wait_s = 2.5
+    app.voice_before_unlock_ceiling_s = 8.0
+    app._voice_unlock_pending = {}
     app._abb_watchdogs = {}
     app._own_abb_press_at = {}
 
@@ -378,6 +380,93 @@ class AbbNativeUnlockTests(unittest.TestCase):
             [c for c in app.service_calls if c[0] == "button/press"],
             [("button/press", {"entity_id": "button.abb_front"})],
         )
+
+    # --- the door opens on the sentence ending, not on a timer ---
+
+    def _press(self, app):
+        return [c for c in app.service_calls if c[0] == "button/press"]
+
+    def test_announcement_finishing_opens_the_door_without_waiting_for_the_ceiling(self):
+        """The whole point: play_audio returns only once the last 20 ms frame
+        has been sent, so the bridge's event IS the sentence ending - the door
+        follows it instead of a timer that guesses when it will be."""
+        app = self._app(
+            {"front door": "button.abb_front"},
+            voice_before_unlock={"front door": "camera.abb_front"},
+        )
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+        self.assertEqual(self._press(app), [], "must not open before the sentence")
+
+        app._on_announcement_spoken("abb_announcement_spoken", {"door": "front door"}, {})
+        self.assertEqual(
+            self._press(app),
+            [("button/press", {"entity_id": "button.abb_front"})],
+        )
+
+    def test_ceiling_cannot_open_the_door_a_second_time(self):
+        """The announcement and the ceiling race by design. Exactly one wins -
+        a door that opens twice would re-buzz whoever is standing there."""
+        app = self._app(
+            {"front door": "button.abb_front"},
+            voice_before_unlock={"front door": "camera.abb_front"},
+        )
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+        app._on_announcement_spoken("abb_announcement_spoken", {"door": "front door"}, {})
+        _run_scheduled(app, "_deferred_unlock")  # the ceiling fires late anyway
+
+        self.assertEqual(len(self._press(app)), 1)
+
+    def test_ceiling_still_opens_the_door_when_the_sentence_never_plays(self):
+        """SAFETY, unchanged: the station's talkback can refuse every attempt,
+        and then no event ever comes. The door must still open."""
+        app = self._app(
+            {"front door": "button.abb_front"},
+            voice_before_unlock={"front door": "camera.abb_front"},
+        )
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+        _run_scheduled(app, "_deferred_unlock")
+
+        self.assertEqual(
+            self._press(app),
+            [("button/press", {"entity_id": "button.abb_front"})],
+        )
+
+    def test_announcement_for_a_door_we_are_not_holding_is_ignored(self):
+        """The bridge speaks at the back door too; nothing is waiting there."""
+        app = self._app(
+            {"front door": "button.abb_front"},
+            voice_before_unlock={"front door": "camera.abb_front"},
+        )
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+        app._on_announcement_spoken("abb_announcement_spoken", {"door": "back door"}, {})
+
+        self.assertEqual(self._press(app), [], "another door must not open ours")
+
+    def test_a_stale_ceiling_does_not_open_the_door_for_a_superseded_ring(self):
+        """A second ring replaces the hold on that door. The first ring's timer
+        is still armed and must not act for a ring nobody is holding any more -
+        the newer ring carries its own sentence and its own ceiling."""
+        app = self._app(
+            {"front door": "button.abb_front"},
+            voice_before_unlock={"front door": "camera.abb_front"},
+        )
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+        stale_cb, stale_kwargs = [
+            (cb, kw)
+            for cb, _, kw in app.run_in_calls
+            if getattr(cb, "__name__", "") == "_deferred_unlock"
+        ][0]
+
+        # A newer ring takes the door over, with its own ring_ts.
+        app._voice_unlock_pending["front door"] = {
+            "ring_ts": stale_kwargs["ring_ts"] + timedelta(seconds=99),
+            "handle": "handle-newer",
+            "args": dict(stale_kwargs),
+        }
+        stale_cb(stale_kwargs)  # the first ring's ceiling fires late
+
+        self.assertEqual(self._press(app), [], "stale ceiling must not open the door")
+        self.assertIn("front door", app._voice_unlock_pending, "newer hold survives")
 
     def test_unlock_still_happens_when_the_voice_raises(self):
         """A hung or throwing announcement must not leave the door shut."""

@@ -116,11 +116,17 @@ Intercom:
   # which is provably silent. Two speakers would collide on the single call slot.
   voice_before_unlock_message: ""
   voice_before_unlock_tts: "tts.piper"
-  # HARD bound, not a tuned delay. The unlock is scheduled at this value
-  # unconditionally and the voice runs alongside it, so a rejected, silent or
-  # hung announcement can never leave the door shut - it costs these seconds
-  # and nothing else. There is exactly one unlock path either way.
-  # Long enough for the bridge's sentence to finish: it speaks at +1.5 s into
-  # the answered ring call and a short line runs ~1.5 s.
-  voice_before_unlock_wait_s: 3.5
+  # CEILING, not a delay - the door opens when the sentence actually ends.
+  # The bridge fires abb_announcement_spoken the instant play_audio returns,
+  # and the integration only returns from it once the last 20 ms frame has left
+  # (media_pipeline _play_talkback_frames paces the queue, then drains it).
+  # This value is only reached when that never happens: the station's talkback
+  # never became ready and all five attempts failed. A rejected, silent or hung
+  # announcement therefore still cannot leave the door shut.
+  # 8 s clears the worst observed sentence (it ended at ring+3.1 s on
+  # 2026-08-30, and would land ~+5 s if attempt 1 fails and attempt 2 carries
+  # it), and is still far under the 15-30 s a human answering would have taken.
+  # Replaced voice_before_unlock_wait_s (3.5 s), a fixed timer that happened to
+  # land 0.8-1.7 s after the sentence - correct ordering by luck, not by rule.
+  voice_before_unlock_ceiling_s: 8.0
 

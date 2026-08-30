@@ -1813,7 +1813,7 @@ class RingArmedVoiceTests(unittest.TestCase):
     """The sentence starts at the RING, not after the unlock (2026-08-27).
 
     Mikkel's sequence is recording -> announcement -> unlock, and intercom.py
-    already holds the unlock voice_before_unlock_wait_s to make room for it. But
+    holds the door for it. But
     the sentence hung off _maybe_announce, whose only trigger is the lock's own
     unlocking/unlocked edge, so it could not physically start until AFTER the door
     had opened. Measured on the 18:57 front-door ring that evening: door open at
@@ -1835,9 +1835,9 @@ class RingArmedVoiceTests(unittest.TestCase):
 
     def test_ring_arms_the_voice_before_the_unlock_lands(self):
         self.app._open_episode("front door", "100000002", self.clock.now())
-        # voice_before_unlock_wait_s is 3.5 s in intercom.yaml; the sentence has
-        # to be dispatched strictly before that or it is an after-the-fact log
-        # entry read aloud at the street.
+        # The door now waits on the sentence's own ending, but the sentence
+        # must still be dispatched inside the answered ring call (torn down at
+        # ~ring+9 s) or there is no call left to speak into.
         self.assertEqual(self._voice_delays(), [1.5])
 
     def test_armed_chain_and_a_later_unlock_confirm_speak_once(self):
@@ -1848,6 +1848,42 @@ class RingArmedVoiceTests(unittest.TestCase):
         _run_scheduled(self.app, "_native_voice_retry")
         calls = [c for c in self.app.service_calls if c[0] == "abb_welcome/play_audio"]
         self.assertEqual(len(calls), 1)
+
+    def _spoken_events(self):
+        return [kw for name, kw in self.app.fired_events
+                if name == "abb_announcement_spoken"]
+
+    def test_a_spoken_sentence_publishes_its_own_ending(self):
+        """play_audio returns only after the integration has paced out every
+        20 ms frame and drained the queue, so that return IS the sentence
+        ending. intercom.py holds the door for exactly this event - without it
+        the door falls back to a ceiling timer and the ordering is luck."""
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        _run_scheduled(self.app, "_native_voice_retry")
+        _run_scheduled(self.app, "_publish_voice_spoken")
+
+        self.assertEqual(self._spoken_events(), [{"door": "front door"}])
+
+    def test_a_refused_sentence_publishes_nothing(self):
+        """A door held on an event that never comes must fall to the ceiling,
+        not be released by a sentence nobody heard."""
+        self.app.call_service = lambda service, **kw: {
+            "success": False,
+            "error": {"code": "x", "message": "in use"},
+        }
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        _run_scheduled(self.app, "_native_voice_retry")
+        _run_scheduled(self.app, "_publish_voice_spoken")
+
+        self.assertEqual(self._spoken_events(), [])
+
+    def test_publishing_the_ending_never_raises(self):
+        """Strictly additive, like every other emitter here: a lost event costs
+        the ceiling wait, never the door."""
+        def boom(*a, **kw):
+            raise RuntimeError("event bus down")
+        self.app.fire_event = boom
+        self.app._publish_voice_spoken({"door": "front door"})  # must not raise
 
     def test_auto_open_off_leaves_the_unlock_trigger_in_charge(self):
         # Nobody has promised the door will open yet - a human still has to press
