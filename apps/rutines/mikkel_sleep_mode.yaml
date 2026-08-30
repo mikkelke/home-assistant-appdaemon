@@ -23,10 +23,12 @@ MikkelSleepMode:
   # The ESPHome pressure strip (installed/calibrated 2026-08-12, zero nights of track
   # record) is an ADDITIONAL WITNESS only - Withings stays authoritative until
   # sensor.bed_presence_agreement (bed_presence_compare) has ~5 good nights.
+  # Uses _either (2026-08-30, was _left): the sole occupant does not always sleep on
+  # the left side, so the strip must arm from whichever half is occupied.
   in_bed_entities:
     - binary_sensor.left_bedside
     - binary_sensor.right_bedside
-    - binary_sensor.bed_presence_6b9c94_bed_occupied_left
+    - binary_sensor.bed_presence_6b9c94_bed_occupied_either
   # Only the proven mats may release the post-wakeup re-arm hold ("every sensor reads
   # explicitly off"). Listing the strip here would let a stuck-on/offline strip keep
   # the hold forever and block all future arming - see _bed_reads_empty.
