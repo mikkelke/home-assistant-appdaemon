@@ -1921,6 +1921,18 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             except Exception as e:
                 self.log(f"Could not reset programme selector: {e}", level="DEBUG")
 
+        # Reset short_entity too - normal full ECO is most of our cycles, so a "Yes" left over
+        # from a rare Express wash must not leak into the next (usually full) cycle's estimate.
+        if self.reset_programme_selector_on_start and self.short_entity:
+            try:
+                self.call_service(
+                    "input_select/select_option",
+                    entity_id=self.short_entity,
+                    option="—",
+                )
+            except Exception as e:
+                self.log(f"Could not reset short selector: {e}", level="DEBUG")
+
         if not self.poll_timer:
             self.poll_timer = self.run_in(self._poll_power, 60)
         if not self.classify_timer:
