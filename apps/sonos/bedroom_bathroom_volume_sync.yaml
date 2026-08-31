@@ -1,0 +1,15 @@
+# /conf/apps/sonos/bedroom_bathroom_volume_sync.yaml
+#
+# While the bathroom door is open 2+ minutes, the bedroom speaker's volume tracks the
+# bathroom speaker's (bathroom leads, bedroom follows, never reverse) - only while both
+# are actively playing. See bedroom_bathroom_volume_sync.py class docstring.
+
+BedroomBathroomVolumeSync:
+  module: bedroom_bathroom_volume_sync
+  class: BedroomBathroomVolumeSync
+  log: sonos_log
+
+  bathroom_door_sensor: binary_sensor.bathroom_door_contact
+  bathroom_speaker: media_player.bathroom
+  bedroom_speaker: media_player.bedroom
+  door_open_debounce_sec: 120
