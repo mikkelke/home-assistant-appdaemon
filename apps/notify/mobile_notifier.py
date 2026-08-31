@@ -104,6 +104,82 @@ class MobileNotifier(hass.Hass):
             return people
         return [p for p in people if p in audience]
 
+    async def _resolve_services(self, target, category: str = None):
+        """Resolve a `target` (see notify()'s docstring) to a list of notify service
+        names. Shared by notify() and clear_notification() so both use identical
+        targeting semantics. Returns [] (and logs) when nothing resolves."""
+        # Normalize: single person name (in device_mapping) -> list, so all callers work
+        if isinstance(target, str) and target not in ("home", "user", "all"):
+            if not target.startswith("notify.") and target in self.device_mapping:
+                target = [target]
+
+        if target == "user":
+            if self.user_notification_service:
+                if isinstance(self.user_notification_service, str):
+                    return [self.user_notification_service]
+                return list(self.user_notification_service)
+            self.log("WARNING: user_notification_service not configured, cannot resolve target", level="WARNING")
+            return []
+
+        if target == "home":
+            people_home = await self.get_people_home()
+            people_home_before_category = people_home
+            people_home = self._filter_people_for_category(people_home, category, self.category_audience)
+            if category and people_home != people_home_before_category:
+                filtered_out = [p for p in people_home_before_category if p not in people_home]
+                self.log(
+                    f"Category '{category}' filtered out {', '.join(filtered_out)} from this home-broadcast",
+                    level="DEBUG",
+                )
+            if not people_home:
+                self.log("No one is home, skipping", level="DEBUG")
+                return []
+            return await self.get_notification_services_for_people(people_home)
+
+        if target == "all":
+            all_services = []
+            for person_devices in self.device_mapping.values():
+                if isinstance(person_devices, str):
+                    all_services.append(person_devices)
+                else:
+                    all_services.extend(person_devices)
+            if self.user_notification_service:
+                if isinstance(self.user_notification_service, str):
+                    all_services.append(self.user_notification_service)
+                else:
+                    all_services.extend(self.user_notification_service)
+            return list(set(all_services))
+
+        if isinstance(target, list):
+            return await self.get_notification_services_for_people(target)
+
+        if isinstance(target, str):
+            return [target]
+
+        return []
+
+    async def clear_notification(self, tag: str, target: str = "home", category: str = None):
+        """Dismiss a previously sent notification on-device by tag.
+
+        Uses the same target resolution as notify(), so pass the identical `target`
+        (and `category`, if any) that the original notify() call used, and every
+        device that received it will have it dismissed - including devices where
+        the recipient never interacted with it.
+        """
+        try:
+            services = await self._resolve_services(target, category)
+            if not services:
+                return
+            for service in services:
+                try:
+                    service_path = service.replace("notify.", "notify/", 1) if service.startswith("notify.") else service
+                    await self.call_service(service_path, message="clear_notification", data={"tag": tag})
+                    self.log(f"Cleared notification tag={tag!r} on {service_path}", level="DEBUG")
+                except Exception as e:
+                    self.log(f"Failed to clear notification tag={tag!r} on {service}: {e}", level="WARNING")
+        except Exception as e:
+            self.log(f"Error clearing notification tag={tag!r}: {e}", level="ERROR")
+
     async def notify(self, title: str, message: str, target: str = "home", data: dict = None, category: str = None):
         """Send notification to mobile app(s).
 
@@ -131,15 +207,11 @@ class MobileNotifier(hass.Hass):
                 when that category is listed (see initialize()). Ignored for other targets.
         """
         try:
-            # Normalize: single person name (in device_mapping) -> list, so all callers work
-            if isinstance(target, str) and target not in ("home", "user", "all"):
-                if not target.startswith("notify.") and target in self.device_mapping:
-                    target = [target]
             notification_data = {
                 "title": title,
                 "message": message,
             }
-            
+
             # Add optional data
             # If data contains a "data" key, merge it properly for Home Assistant
             # Home Assistant expects: {"data": {"actions": [...]}}
@@ -152,68 +224,15 @@ class MobileNotifier(hass.Hass):
                 else:
                     # Otherwise, merge normally
                     notification_data.update(data)
-            
+
             # Determine target services
-            services = []
-            
-            if target == "user":
-                # Always send to user (for vacuum errors, etc.)
-                if self.user_notification_service:
-                    if isinstance(self.user_notification_service, str):
-                        services = [self.user_notification_service]
-                    else:
-                        services = self.user_notification_service
-                else:
-                    self.log("WARNING: user_notification_service not configured, cannot send notification", level="WARNING")
-                    return
-                    
-            elif target == "home":
-                # Send to people who are home
-                people_home = await self.get_people_home()
-                people_home_before_category = people_home
-                people_home = self._filter_people_for_category(people_home, category, self.category_audience)
-                if category and people_home != people_home_before_category:
-                    filtered_out = [p for p in people_home_before_category if p not in people_home]
-                    self.log(
-                        f"Category '{category}' filtered out {', '.join(filtered_out)} from this home-broadcast",
-                        level="DEBUG",
-                    )
-                if people_home:
-                    services = await self.get_notification_services_for_people(people_home)
-                    self.log(f"Sending notification to people at home: {', '.join(people_home)}", level="DEBUG")
-                else:
-                    self.log("No one is home, skipping notification", level="DEBUG")
-                    return
-                    
-            elif target == "all":
-                # Send to all configured devices
-                all_services = []
-                for person_devices in self.device_mapping.values():
-                    if isinstance(person_devices, str):
-                        all_services.append(person_devices)
-                    else:
-                        all_services.extend(person_devices)
-                # Add user service if configured
-                if self.user_notification_service:
-                    if isinstance(self.user_notification_service, str):
-                        all_services.append(self.user_notification_service)
-                    else:
-                        all_services.extend(self.user_notification_service)
-                services = list(set(all_services))  # Remove duplicates
-                
-            elif isinstance(target, list):
-                # Send to specific people
-                services = await self.get_notification_services_for_people(target)
-                
-            elif isinstance(target, str):
-                # Assume it's a notification service name
-                services = [target]
-            
+            services = await self._resolve_services(target, category)
+
             # Check if no services found
             if not services:
                 self.log(f"No notification services found for target '{target}'", level="WARNING")
                 return
-            
+
             # Send to all target services
             success_count = 0
             for service in services:

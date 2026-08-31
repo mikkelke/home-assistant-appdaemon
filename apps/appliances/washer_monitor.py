@@ -577,6 +577,11 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self._pending_tail_mean_w = None
         self._pending_tail_std_w = None
         self._pending_tail_peak_w = None
+        # Stashed just before _transition_to_unemptied wipes confirmation (entity attrs +
+        # confirm_entity selector) for "next load" - lets _recover_from_false_unemptied restore
+        # this cycle's real confirmation if the Unemptied turns out to be false.
+        self._pending_confirmed_by_user = None
+        self._pending_confirmed_by = None
 
         # Delayed start (Miele delay timer) state - see detect_delayed_start config above
         self._delay_plateau_start = None       # UTC when current sub-start_w plateau began
@@ -3244,8 +3249,16 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # False finish may have persisted heating_bursts=0 - infer from power history (graph shows 2000W+).
         if self.heating_phase_count == 0:
             self._restore_heating_from_power_history()
-        self.programme_confirmed_by_user = bool(attrs.get("programme_confirmed_by_user"))
-        self.confirmed_by_username = attrs.get("programme_confirmed_by") or None
+        if self._pending_confirmed_by_user is not None:
+            # entity attrs were already wiped by _transition_to_unemptied's "clear for next
+            # load" step before this recovery ran - restore from the pre-clear stash instead.
+            self.programme_confirmed_by_user = self._pending_confirmed_by_user
+            self.confirmed_by_username = self._pending_confirmed_by
+        else:
+            self.programme_confirmed_by_user = bool(attrs.get("programme_confirmed_by_user"))
+            self.confirmed_by_username = attrs.get("programme_confirmed_by") or None
+        self._pending_confirmed_by_user = None
+        self._pending_confirmed_by = None
         # This path reverts to Running without going through _begin_running_cycle, so
         # self._cycle_actor must be rebuilt from the entity the same way a restart restore does.
         self._cycle_actor = self._cycle_actor_from_state_attrs(attrs)
@@ -3569,6 +3582,11 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 self._pending_tail_peak_w = None
 
             # Next load: clear confirmation + HA helpers now (was only cleared at Off before).
+            # Stash the pre-clear value first: if this Unemptied turns out to be false (machine
+            # still running), _recover_from_false_unemptied needs the real confirmation back, and
+            # by then both the entity attrs and the confirm_entity selector are already wiped.
+            self._pending_confirmed_by_user = self.programme_confirmed_by_user
+            self._pending_confirmed_by = self.confirmed_by_username
             attributes["programme_confirmed_by_user"] = False
             attributes["programme_confirmed_by"] = ""
             attributes["expected_dur_at_start"] = ""
@@ -5565,8 +5583,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             if notifier is None:
                 self.log("MobileNotifier app not found - cannot send confirm push", level="WARNING")
                 return
-            started_by = record.get("started_by")
-            target = [started_by] if (self.confirm_push_target_actor and started_by) else self.confirm_push_target
+            target = self._confirm_push_target_for(record)
             self.create_task(notifier.notify(
                 title=title,
                 message=message,
@@ -5577,6 +5594,26 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.log(f"Confirm push sent for cycle ts={ts} predicted={predicted} target={target}", level="INFO")
         except Exception as e:
             self.log(f"Could not send confirm push: {e}", level="WARNING")
+
+    def _confirm_push_target_for(self, record: dict):
+        """Same target resolution _send_confirm_push uses, so a dismiss (clear_notification)
+        reaches the same device(s) the original confirm push was sent to."""
+        started_by = record.get("started_by")
+        return [started_by] if (self.confirm_push_target_actor and started_by) else self.confirm_push_target
+
+    def _dismiss_confirm_push(self, record: dict):
+        """Clear an already-delivered confirm push once the cycle gets confirmed by any
+        route (push button, dashboard picker, or Off-state confirm) - otherwise it just
+        sits on-device looking unresolved even though the backend now considers it
+        confirmed. Safe to call even if no push was ever sent (no-op on the device)."""
+        try:
+            notifier = self.get_app("MobileNotifier")
+            if notifier is None:
+                return
+            target = self._confirm_push_target_for(record)
+            self.create_task(notifier.clear_notification(tag="washer_confirm", target=target, category="washer_confirm"))
+        except Exception as e:
+            self.log(f"Could not dismiss confirm push: {e}", level="DEBUG")
 
     def _on_confirm_push_action(self, event_name, data, kwargs):
         """Handle WASHER_CONFIRM|<ts>|<prog>|<temp> button presses from the confirm push
@@ -5625,6 +5662,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         except Exception as e:
             self.log(f"Could not write feedback file for confirm action: {e}", level="WARNING")
             return
+        self._dismiss_confirm_push(rec)
 
         # Update in-memory learned durations incrementally - same math and learn-key
         # derivation as _save_cycle_feedback's save-time update, gated the same way the
@@ -5736,6 +5774,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         except Exception as e:
             self.log(f"Could not write feedback after user-confirm update: {e}", level="WARNING")
             return
+        self._dismiss_confirm_push(rec)
         label = self._get_profile(prog_key, conf_temp).get("label", prog_key)
         self.log(
             f"Updated last feedback: programme_user_confirmed=True, valid_for_learning={classification['valid_for_learning']} ({label})",
