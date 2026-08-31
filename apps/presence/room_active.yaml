@@ -1,0 +1,76 @@
+# /conf/apps/presence/room_active.yaml
+# Wave 1 of the room-active presence-unification plan (shadow-only, zero consumers): publishes
+# binary_sensor.<zone>_active for every zone below by unioning a small tiered witness list
+# (room mmWave presence, spot sensors, bed mats/strip, raw PIR/motion channels) - see
+# room_active.py's module docstring for the state/timing/publish-contract rules in full, and
+# room_active_read.py for the paired reader helper (active()/explicitly_inactive(), plain
+# functions, no yaml, no app registration).
+#
+# Every witness entity_id below was verified live against this HA instance's
+# .storage/core.entity_registry on 2026-08-31 - all present exactly as written, including
+# binary_sensor.bed_presence_6b9c94_bed_occupied_either (a real distinct entity alongside
+# _bed_occupied_left/_right/_both, not a typo). Each zone's witness list was also
+# cross-checked against its existing binary_sensor.<zone>_pir_presence composite (HA
+# group/template helper) for completeness/naming - all matched exactly except bathroom,
+# which is intentionally a SUPERSET here: the existing "Bathroom pir presence" template only
+# ORs bathroom_presence_presence + bathroom_presence_motion_state, it was never updated to
+# include the bath/shower spot sensor (bathroom_bath_presence_presence /
+# bathroom_bath_presence_motion_state) that this zone's witness list adds as tier: spot /
+# channel. Flagging, not silently reconciling either direction.
+#
+# log: room_active_log is a NEW named stream - must be declared in appdaemon.yaml (box-only,
+# not in this repo) before this app is deployed, or it instantiation-crashes
+# (AppInstantiationError: User defined log ... not found - bit ForecastLog/AbbWelcomeBridge/
+# BedPresenceCompare already, see appdaemon-deploy memory). Declare the stream on the box
+# first.
+
+RoomActive:
+  module: room_active
+  class: RoomActive
+  log: room_active_log
+  settle_off_sec: 15
+  heartbeat_sec: 60
+  republish_after_sec: 120
+  zones:
+    bedroom:
+      witnesses:
+        - { entity: binary_sensor.bedroom_presence_presence,               tier: room }
+        - { entity: binary_sensor.bedroom_presence_pir_detection,          tier: channel }
+        - { entity: binary_sensor.left_bedside,                            tier: bed }
+        - { entity: binary_sensor.right_bedside,                           tier: bed }
+        - { entity: binary_sensor.bed_presence_6b9c94_bed_occupied_either, tier: bed }
+    kitchen:
+      witnesses:
+        - { entity: binary_sensor.kitchen_presence_presence,      tier: room }
+        - { entity: binary_sensor.kitchen_presence_pir_detection, tier: channel }
+    living_room:
+      witnesses:
+        - { entity: binary_sensor.living_room_presence_presence,      tier: room }
+        - { entity: binary_sensor.living_room_presence_pir_detection, tier: channel }
+    dining_room:
+      witnesses:
+        - { entity: binary_sensor.dining_room_presence_presence,      tier: room }
+        - { entity: binary_sensor.dining_room_presence_pir_detection, tier: channel }
+    claudias_room:
+      witnesses:
+        - { entity: binary_sensor.claudias_room_presence_presence,      tier: room }
+        - { entity: binary_sensor.claudias_room_presence_pir_detection, tier: channel }
+    kristines_room:
+      witnesses:
+        - { entity: binary_sensor.kristines_room_presence_presence,      tier: room }
+        - { entity: binary_sensor.kristines_room_desk_presence_presence, tier: spot }
+        - { entity: sensor.kristines_room_presence_motion_state, tier: channel, on_states: [large, small] }
+    bathroom:
+      witnesses:
+        - { entity: binary_sensor.bathroom_presence_presence,      tier: room }
+        - { entity: binary_sensor.bathroom_bath_presence_presence, tier: spot }
+        - { entity: sensor.bathroom_presence_motion_state,      tier: channel, on_states: [large, small] }
+        - { entity: sensor.bathroom_bath_presence_motion_state, tier: channel, on_states: [large, small] }
+    guest_bathroom:
+      witnesses:
+        - { entity: binary_sensor.guest_bathroom_presence_presence, tier: room }
+        - { entity: sensor.guest_bathroom_presence_motion_state, tier: channel, on_states: [large, small] }
+    hallway:
+      witnesses:
+        - { entity: binary_sensor.hallway_presence_presence, tier: room }
+        - { entity: sensor.hallway_presence_motion_state, tier: channel, on_states: [large, small] }
