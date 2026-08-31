@@ -18,6 +18,11 @@ _BLINDS_DIR = Path(__file__).resolve().parents[2] / "blinds"
 if str(_BLINDS_DIR) not in sys.path:
     sys.path.insert(0, str(_BLINDS_DIR))
 
+# bedroom_lights imports room_active_read, which lives in apps/presence
+_PRESENCE_DIR = Path(__file__).resolve().parents[2] / "presence"
+if str(_PRESENCE_DIR) not in sys.path:
+    sys.path.insert(0, str(_PRESENCE_DIR))
+
 if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     ad = types.ModuleType("appdaemon")
     plugins = types.ModuleType("appdaemon.plugins")
@@ -33,7 +38,10 @@ import bedroom_lights  # noqa: E402
 
 LEFT = "binary_sensor.left_bedside"
 RIGHT = "binary_sensor.right_bedside"
-FP300 = "binary_sensor.bedroom_presence_presence"
+# Published by room_active.py (apps/presence) - unions FP300 + PIR channel + bed witnesses
+# with a 15s settle-off. See room_active_read.active()'s own test suite for the union/settle
+# behavior itself; here it's read through room_active_read exactly as bedroom_lights.py does.
+ROOM_ACTIVE = "binary_sensor.bedroom_active"
 SLEEP = "input_boolean.mikkel_sleep_mode"
 SESSION = "input_boolean.bedroom_bed_session"
 BED = "light.bedroom_bed_lights"
@@ -45,14 +53,21 @@ BATH_PIR = "binary_sensor.bathroom_pir_presence"
 BATH_DOOR = "binary_sensor.bathroom_door_contact"
 
 
-def make_session_app(session=False, dark=True, session_exit_timer=None, session_exit_armed_at=None):
+def _fresh_computed_at() -> str:
+    """room_active_read._age_seconds compares against real wall-clock time (not the
+    bedroom_lights module's own pinned `time.time()`), so the fixture's computed_at must be a
+    genuinely current timestamp for the primary (non-fallback) read path to be taken."""
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def make_session_app(session=False, dark=True, session_exit_timer=None):
     """BedroomLights with just the state the session-machinery / decision / occupancy /
     blind methods need, without running AppDaemon's initialize()."""
     app = bedroom_lights.BedroomLights.__new__(bedroom_lights.BedroomLights)
     app.bed_lights = BED
     app.ceiling_lights = CEILING
     app.withings_in_bed_entities = [LEFT, RIGHT]
-    app.bedroom_presence_sensor = FP300
+    app.bedroom_active_entity = ROOM_ACTIVE
     app.bedroom_presence_extra = []
     app.bed_session_entity = SESSION
     app.session_exit_debounce_sec = 90
@@ -70,11 +85,10 @@ def make_session_app(session=False, dark=True, session_exit_timer=None, session_
     app._session = session
     app._session_exit_timer = session_exit_timer
     app._last_off_is_dark = None
-    app._session_exit_armed_at = session_exit_armed_at
-    app.session_hold_bed_max_sec = 1800
 
     app.states = {
-        (FP300, None): "off",
+        (ROOM_ACTIVE, None): "off",
+        (ROOM_ACTIVE, "computed_at"): _fresh_computed_at(),
         (LEFT, None): "off",
         (RIGHT, None): "off",
         (SLEEP, None): "off",
@@ -111,7 +125,6 @@ BASE_ARGS = {
     "room_state_text_entity": ROOM_STATE,
     "darkness_confirmed_sensor_entity": DARK_SENSOR,
     "bed_session_entity": SESSION,
-    "bedroom_presence_sensor": FP300,
     "verbosity_level": "normal",
 }
 
@@ -137,7 +150,7 @@ def make_full_app(overrides=None):
 class SessionEnter(unittest.TestCase):
     def test_enter_on_withings_on_edge(self):
         app = make_session_app(session=False, dark=True)
-        app.states[(FP300, None)] = "on"  # you're in the room when the mat reports weight
+        app.states[(ROOM_ACTIVE, None)] = "on"  # you're in the room when the mat reports weight
         app._on_withings_in_bed_on(LEFT, "state", "off", "on", {})
         self.assertTrue(app._session)
         app.call_service.assert_called_once_with("input_boolean/turn_on", entity_id=SESSION)
@@ -148,15 +161,15 @@ class SessionEnter(unittest.TestCase):
         # unavailable->on), which an old="off" listener filter silently missed
         # (user-reported 2026-07-20: in bed, ceiling stayed on, session never started).
         app = make_session_app(session=False, dark=True)
-        app.states[(FP300, None)] = "on"
+        app.states[(ROOM_ACTIVE, None)] = "on"
         app._on_withings_in_bed_on(LEFT, "state", "unknown", "on", {})
         self.assertTrue(app._session)
 
     def test_no_enter_on_withings_when_room_empty(self):
         # A stale cloud reconnect reporting "on" after you've left must not relight an
-        # empty bed - the FP300 presence guard blocks it.
+        # empty bed - the room-active presence guard blocks it.
         app = make_session_app(session=False, dark=True)
-        app.states[(FP300, None)] = "off"
+        app.states[(ROOM_ACTIVE, None)] = "off"
         app._on_withings_in_bed_on(LEFT, "state", "unavailable", "on", {})
         self.assertFalse(app._session)
         app.call_service.assert_not_called()
@@ -188,11 +201,12 @@ class SessionEnter(unittest.TestCase):
 
     def test_withings_off_alone_does_not_end_active_session(self):
         """Withings' OFF edge is ignored forever - nothing in the running state machine
-        reacts to it. FP300 still "on" holds occupancy independent of the session too."""
+        reacts to it. Room-active presence "on" holds occupancy independent of the session
+        too."""
         app = make_session_app(session=True, dark=True)
         app.states[(LEFT, None)] = "off"
         app.states[(RIGHT, None)] = "off"
-        app.states[(FP300, None)] = "on"
+        app.states[(ROOM_ACTIVE, None)] = "on"
         app.call_service.reset_mock()
         app._evaluate_lights("NEUTRAL")
         self.assertTrue(app._session)
@@ -238,40 +252,40 @@ class SessionListenerRegistration(unittest.TestCase):
     def test_presence_registered_both_edges(self):
         calls = self._reg(self.app._on_presence_change_session)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0].args[1], FP300)
+        self.assertEqual(calls[0].args[1], ROOM_ACTIVE)
         self.assertNotIn("old", calls[0].kwargs)
         self.assertNotIn("new", calls[0].kwargs)
 
 
 class SessionExit(unittest.TestCase):
-    def test_fp300_off_arms_exit_timer_when_session_active(self):
+    def test_room_active_off_arms_exit_timer_when_session_active(self):
         app = make_session_app(session=True)
-        app._on_presence_change_session(FP300, "state", "on", "off", {})
+        app._on_presence_change_session(ROOM_ACTIVE, "state", "on", "off", {})
         app.run_in.assert_called_once_with(app._session_exit_fire, 90)
         self.assertEqual(app._session_exit_timer, "exit-timer-handle")
 
-    def test_fp300_off_no_timer_when_session_inactive(self):
+    def test_room_active_off_no_timer_when_session_inactive(self):
         app = make_session_app(session=False)
-        app._on_presence_change_session(FP300, "state", "on", "off", {})
+        app._on_presence_change_session(ROOM_ACTIVE, "state", "on", "off", {})
         app.run_in.assert_not_called()
         self.assertIsNone(app._session_exit_timer)
 
-    def test_fp300_off_while_sleep_on_no_timer(self):
+    def test_room_active_off_while_sleep_on_no_timer(self):
         app = make_session_app(session=True)
         app.states[(SLEEP, None)] = "on"
-        app._on_presence_change_session(FP300, "state", "on", "off", {})
+        app._on_presence_change_session(ROOM_ACTIVE, "state", "on", "off", {})
         app.run_in.assert_not_called()
         self.assertIsNone(app._session_exit_timer)
 
-    def test_fp300_unavailable_no_timer(self):
+    def test_room_active_unavailable_no_timer(self):
         app = make_session_app(session=True)
-        app._on_presence_change_session(FP300, "state", "on", "unavailable", {})
+        app._on_presence_change_session(ROOM_ACTIVE, "state", "on", "unavailable", {})
         app.run_in.assert_not_called()
         self.assertIsNone(app._session_exit_timer)
 
     def test_timer_fire_ends_session_when_still_clear(self):
         app = make_session_app(session=True, session_exit_timer="handle")
-        app.states[(FP300, None)] = "off"
+        app.states[(ROOM_ACTIVE, None)] = "off"
         app._session_exit_fire({})
         self.assertIsNone(app._session_exit_timer)
         self.assertFalse(app._session)
@@ -279,135 +293,66 @@ class SessionExit(unittest.TestCase):
 
     def test_presence_returns_before_fire_cancels_and_holds(self):
         app = make_session_app(session=True, session_exit_timer="handle")
-        app._on_presence_change_session(FP300, "state", "off", "on", {})
+        app._on_presence_change_session(ROOM_ACTIVE, "state", "off", "on", {})
         app.cancel_timer.assert_called_once_with("handle")
         self.assertIsNone(app._session_exit_timer)
         self.assertTrue(app._session)
 
     def test_fire_is_noop_if_presence_already_returned(self):
+        # Also covers what the old capped live-witness hold used to protect against: a bed
+        # witness reads "on" here would mean binary_sensor.bedroom_active reads "on" too (it
+        # unions the bed witnesses in - see room_active.py), so presence is already back and
+        # the fire is a no-op regardless of how it got here.
         app = make_session_app(session=True, session_exit_timer="handle")
-        app.states[(FP300, None)] = "on"  # presence came back, timer just never got cancelled
+        app.states[(ROOM_ACTIVE, None)] = "on"  # presence came back, timer just never got cancelled
         app._session_exit_fire({})
         self.assertTrue(app._session)
         app.call_service.assert_not_called()
 
     def test_fire_is_noop_if_sleep_mode_started(self):
         app = make_session_app(session=True, session_exit_timer="handle")
-        app.states[(FP300, None)] = "off"
+        app.states[(ROOM_ACTIVE, None)] = "off"
         app.states[(SLEEP, None)] = "on"
         app._session_exit_fire({})
         self.assertTrue(app._session)
         app.call_service.assert_not_called()
 
 
-class SessionExitHold(unittest.TestCase):
-    """_session_hold_reason: capped, independent witnesses that extend the exit debounce
-    instead of ending the session outright when the timer fires."""
-
-    def setUp(self):
-        self._real_time = bedroom_lights.time
-        bedroom_lights.time = types.SimpleNamespace(time=lambda: FIXED_NOW)
-        self.addCleanup(self._restore_time)
-
-    def _restore_time(self):
-        bedroom_lights.time = self._real_time
-
-    def test_no_hold_when_armed_at_is_none(self):
-        # Existing behaviour preserved: a test that never went through _arm_session_exit
-        # (armed_at defaults to None) must not hold, even with a mat "on".
-        app = make_session_app(session=True, session_exit_timer="handle")
-        app.states[(LEFT, None)] = "on"
-        app.states[(FP300, None)] = "off"
-        app._session_exit_fire({})
-        self.assertFalse(app._session)
-        app.call_service.assert_called_once_with("input_boolean/turn_off", entity_id=SESSION)
-
-    def test_bed_witness_holds_and_rearms(self):
-        app = make_session_app(
-            session=True, session_exit_timer="handle", session_exit_armed_at=FIXED_NOW - 100
-        )
-        app.states[(FP300, None)] = "off"
-        app.states[(LEFT, None)] = "on"  # live witness despite FP300 being off
-        app._session_exit_fire({})
-        self.assertTrue(app._session)
-        app.call_service.assert_not_called()
-        app.run_in.assert_called_once_with(app._session_exit_fire, app.session_exit_debounce_sec)
-        self.assertIsNotNone(app._session_exit_timer)
-
-    def test_bed_witness_hold_expires_past_cap(self):
-        app = make_session_app(
-            session=True,
-            session_exit_timer="handle",
-            session_exit_armed_at=FIXED_NOW - 1801,
-        )
-        app.states[(FP300, None)] = "off"
-        app.states[(LEFT, None)] = "on"  # witness still "on", but past the 1800s cap
-        app._session_exit_fire({})
-        self.assertFalse(app._session)
-        app.call_service.assert_called_once_with("input_boolean/turn_off", entity_id=SESSION)
-
-    def test_arm_session_exit_records_armed_at(self):
-        app = make_session_app(session=True)
-        app._arm_session_exit()
-        self.assertEqual(app._session_exit_armed_at, FIXED_NOW)
-
-    def test_cancel_session_exit_clears_armed_at(self):
-        app = make_session_app(session=True, session_exit_timer="handle", session_exit_armed_at=FIXED_NOW - 5)
-        app._cancel_session_exit()
-        self.assertIsNone(app._session_exit_armed_at)
-
-    def test_rearm_on_hold_does_not_reset_armed_at(self):
-        # The cap is measured from the FIRST arm, not extended on every hold.
-        armed_at = FIXED_NOW - 100
-        app = make_session_app(session=True, session_exit_timer="handle", session_exit_armed_at=armed_at)
-        app.states[(FP300, None)] = "off"
-        app.states[(LEFT, None)] = "on"
-        app._session_exit_fire({})
-        self.assertEqual(app._session_exit_armed_at, armed_at)
-
-
 class SessionEntryArmsExitIfPresenceAlreadyClear(unittest.TestCase):
-    """Latent-bug fix: a session started while FP300 is already not "on" (sleep-mode-on,
-    or a reconciled session at restart) must arm its own exit timer immediately - otherwise
-    no future off-edge will ever arrive to arm one, and the session could never end."""
+    """Latent-bug fix: a session started while presence is already not present
+    (sleep-mode-on, or a reconciled session at restart) must arm its own exit timer
+    immediately - otherwise no future off-edge will ever arrive to arm one, and the session
+    could never end."""
 
-    def setUp(self):
-        self._real_time = bedroom_lights.time
-        bedroom_lights.time = types.SimpleNamespace(time=lambda: FIXED_NOW)
-        self.addCleanup(self._restore_time)
-
-    def _restore_time(self):
-        bedroom_lights.time = self._real_time
-
-    def test_sleep_mode_on_with_fp300_already_off_arms_exit(self):
+    def test_sleep_mode_on_with_presence_already_off_arms_exit(self):
         app = make_session_app(session=False, dark=True)
-        app.states[(FP300, None)] = "off"
+        app.states[(ROOM_ACTIVE, None)] = "off"
         app._on_sleep_mode_on(SLEEP, "state", "off", "on", {})
         self.assertTrue(app._session)
         app.run_in.assert_called_once_with(app._session_exit_fire, app.session_exit_debounce_sec)
         self.assertIsNotNone(app._session_exit_timer)
 
-    def test_sleep_mode_on_with_fp300_on_does_not_arm_exit(self):
+    def test_sleep_mode_on_with_presence_on_does_not_arm_exit(self):
         app = make_session_app(session=False, dark=True)
-        app.states[(FP300, None)] = "on"
+        app.states[(ROOM_ACTIVE, None)] = "on"
         app._on_sleep_mode_on(SLEEP, "state", "off", "on", {})
         self.assertTrue(app._session)
         app.run_in.assert_not_called()
         self.assertIsNone(app._session_exit_timer)
 
-    def test_reconcile_with_withings_and_fp300_off_arms_exit(self):
+    def test_reconcile_with_withings_and_presence_off_arms_exit(self):
         app = make_session_app(session=False)
         app.states[(SESSION, None)] = "off"
-        app.states[(FP300, None)] = "off"
+        app.states[(ROOM_ACTIVE, None)] = "off"
         app.states[(LEFT, None)] = "on"
         app._reconcile_session()
         self.assertTrue(app._session)
         app.run_in.assert_called_once_with(app._session_exit_fire, app.session_exit_debounce_sec)
 
-    def test_reconcile_with_fp300_on_does_not_arm_exit(self):
+    def test_reconcile_with_presence_on_does_not_arm_exit(self):
         app = make_session_app(session=False)
         app.states[(SESSION, None)] = "off"
-        app.states[(FP300, None)] = "on"
+        app.states[(ROOM_ACTIVE, None)] = "on"
         app.states[(LEFT, None)] = "on"
         app._reconcile_session()
         self.assertTrue(app._session)
@@ -417,7 +362,7 @@ class SessionEntryArmsExitIfPresenceAlreadyClear(unittest.TestCase):
         # sleep_on already blocks the exit path entirely (_is_sleep_mode_active), no timer needed.
         app = make_session_app(session=False)
         app.states[(SESSION, None)] = "off"
-        app.states[(FP300, None)] = "off"
+        app.states[(ROOM_ACTIVE, None)] = "off"
         app.states[(SLEEP, None)] = "on"
         app._reconcile_session()
         self.assertTrue(app._session)
@@ -434,7 +379,7 @@ class LightDecision(unittest.TestCase):
 
     def test_session_ended_turns_ceiling_on_bed_off(self):
         app = make_session_app(session=False, dark=True)
-        app.states[(FP300, None)] = "on"  # occupied without relying on the session itself
+        app.states[(ROOM_ACTIVE, None)] = "on"  # occupied without relying on the session itself
         app.states[(BED, None)] = "on"
         app._evaluate_lights("TEST")
         app.turn_off.assert_called_once_with(BED)
@@ -442,7 +387,7 @@ class LightDecision(unittest.TestCase):
 
     def test_blind_closed_at_99_blocks_auto_on(self):
         app = make_session_app(session=False, dark=True)
-        app.states[(FP300, None)] = "on"
+        app.states[(ROOM_ACTIVE, None)] = "on"
         app.states[(BLIND, "current_position")] = 99
         app._evaluate_lights("TEST")
         app.turn_on.assert_not_called()
@@ -450,7 +395,7 @@ class LightDecision(unittest.TestCase):
 
     def test_blind_at_94_does_not_block_auto_on(self):
         app = make_session_app(session=False, dark=True)
-        app.states[(FP300, None)] = "on"
+        app.states[(ROOM_ACTIVE, None)] = "on"
         app.states[(BLIND, "current_position")] = 94
         app._evaluate_lights("TEST")
         app.turn_on.assert_called_once_with(CEILING)
@@ -487,7 +432,7 @@ class LightDecision(unittest.TestCase):
 
     def test_no_swap_when_session_not_active_even_if_ceiling_on_and_sleep_mode(self):
         app = make_session_app(session=False, dark=True)
-        app.states[(FP300, None)] = "on"
+        app.states[(ROOM_ACTIVE, None)] = "on"
         app.states[(CEILING, None)] = "on"
         app.states[(SLEEP, None)] = "on"
         app._evaluate_lights("TEST")
@@ -506,8 +451,8 @@ class LightDecision(unittest.TestCase):
 
 class BathroomDoorGrace(unittest.TestCase):
     # 2026-08-20: closing the bathroom door dropped bathroom-PIR's contribution to
-    # occupancy instantly; if FP300 hadn't yet confirmed bedroom presence, occupancy
-    # fell to zero and both lights died in the same second - observed 4x on 08-19.
+    # occupancy instantly; if room-active presence hadn't yet confirmed bedroom presence,
+    # occupancy fell to zero and both lights died in the same second - observed 4x on 08-19.
 
     def test_close_with_no_other_occupancy_arms_grace_not_immediate_off(self):
         app = make_session_app(session=False, dark=True)
@@ -516,9 +461,9 @@ class BathroomDoorGrace(unittest.TestCase):
         app.run_in.assert_called_once()
         app.turn_off.assert_not_called()
 
-    def test_close_with_fp300_still_on_evaluates_normally_no_grace(self):
+    def test_close_with_presence_still_on_evaluates_normally_no_grace(self):
         app = make_session_app(session=False, dark=True)
-        app.states[(FP300, None)] = "on"
+        app.states[(ROOM_ACTIVE, None)] = "on"
         app._on_bathroom_door_change(BATH_DOOR, "state", "on", "off", {})
         app.run_in.assert_not_called()
 
@@ -529,11 +474,11 @@ class BathroomDoorGrace(unittest.TestCase):
         app._vacancy_grace_fire({})
         app.turn_off.assert_any_call(CEILING)
 
-    def test_grace_fire_noop_if_fp300_recovered_before_it_fires(self):
+    def test_grace_fire_noop_if_presence_recovered_before_it_fires(self):
         app = make_session_app(session=False, dark=True)
         app.states[(CEILING, None)] = "on"
         app._arm_vacancy_grace()
-        app.states[(FP300, None)] = "on"  # confirmed before the timer fires
+        app.states[(ROOM_ACTIVE, None)] = "on"  # confirmed before the timer fires
         app._vacancy_grace_fire({})
         app.turn_off.assert_not_called()
 
@@ -558,9 +503,9 @@ class BlindClosedThreshold(unittest.TestCase):
 
 
 class EffectiveOccupancy(unittest.TestCase):
-    def test_true_via_fp300(self):
+    def test_true_via_room_active(self):
         app = make_session_app(session=False)
-        app.states[(FP300, None)] = "on"
+        app.states[(ROOM_ACTIVE, None)] = "on"
         self.assertTrue(app._get_effective_occupancy())
 
     def test_true_via_bathroom(self):
@@ -576,6 +521,20 @@ class EffectiveOccupancy(unittest.TestCase):
     def test_false_when_all_clear(self):
         app = make_session_app(session=False)
         self.assertFalse(app._get_effective_occupancy())
+
+    def test_true_when_room_active_read_has_no_opinion(self):
+        # room_active_read.active() returns None when the published entity is missing/stale
+        # AND the fallback recompute can't determine anything either - bedroom_lights biases
+        # that toward "occupied" (never toward "empty"), same philosophy as the reader itself.
+        app = make_session_app(session=False)
+        del app.states[(ROOM_ACTIVE, None)]
+        del app.states[(ROOM_ACTIVE, "computed_at")]
+
+        def get_app(name):
+            return None  # RoomActive not loaded -> _fallback also returns None
+
+        app.get_app = get_app
+        self.assertTrue(app._get_effective_occupancy())
 
 
 FIXED_NOW = 1_800_000_000.0
@@ -600,48 +559,48 @@ class ReconcileSession(unittest.TestCase):
     def _restore_time(self):
         bedroom_lights.time = self._real_time
 
-    def _app(self, *, persisted, fp300_on, withings=False, sleep_on=False, last_changed=None):
+    def _app(self, *, persisted, room_on, withings=False, sleep_on=False, last_changed=None):
         app = make_session_app(session=False)
         app.states[(SESSION, None)] = "on" if persisted else "off"
-        app.states[(FP300, None)] = "on" if fp300_on else "off"
+        app.states[(ROOM_ACTIVE, None)] = "on" if room_on else "off"
         app.states[(LEFT, None)] = "on" if withings else "off"
         app.states[(SLEEP, None)] = "on" if sleep_on else "off"
         if last_changed is not None:
-            app.states[(FP300, "last_changed")] = last_changed
+            app.states[(ROOM_ACTIVE, "last_changed")] = last_changed
         return app
 
-    def test_persisted_on_fp300_on_stays_on(self):
-        app = self._app(persisted=True, fp300_on=True)
+    def test_persisted_on_room_active_on_stays_on(self):
+        app = self._app(persisted=True, room_on=True)
         app._reconcile_session()
         self.assertTrue(app._session)
         app.call_service.assert_not_called()
 
-    def test_persisted_on_fp300_off_beyond_debounce_goes_off(self):
-        app = self._app(persisted=True, fp300_on=False, last_changed=_iso(200))
+    def test_persisted_on_room_active_off_beyond_debounce_goes_off(self):
+        app = self._app(persisted=True, room_on=False, last_changed=_iso(200))
         app._reconcile_session()
         self.assertFalse(app._session)
         app.call_service.assert_called_once_with("input_boolean/turn_off", entity_id=SESSION)
 
-    def test_persisted_on_fp300_off_recent_stays_on(self):
-        app = self._app(persisted=True, fp300_on=False, last_changed=_iso(10))
+    def test_persisted_on_room_active_off_recent_stays_on(self):
+        app = self._app(persisted=True, room_on=False, last_changed=_iso(10))
         app._reconcile_session()
         self.assertTrue(app._session)
         app.call_service.assert_not_called()
 
     def test_persisted_off_sleep_on_turns_on(self):
-        app = self._app(persisted=False, fp300_on=False, sleep_on=True)
+        app = self._app(persisted=False, room_on=False, sleep_on=True)
         app._reconcile_session()
         self.assertTrue(app._session)
         app.call_service.assert_called_once_with("input_boolean/turn_on", entity_id=SESSION)
 
     def test_persisted_off_withings_on_turns_on(self):
-        app = self._app(persisted=False, fp300_on=False, withings=True)
+        app = self._app(persisted=False, room_on=False, withings=True)
         app._reconcile_session()
         self.assertTrue(app._session)
         app.call_service.assert_called_once_with("input_boolean/turn_on", entity_id=SESSION)
 
     def test_all_clear_stays_off(self):
-        app = self._app(persisted=False, fp300_on=False)
+        app = self._app(persisted=False, room_on=False)
         app._reconcile_session()
         self.assertFalse(app._session)
         app.call_service.assert_not_called()

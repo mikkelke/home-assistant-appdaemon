@@ -1,8 +1,8 @@
 # /conf/apps/lights/bedroom_lights.yaml
 #
 # Effective occupancy (vacant vs occupied gate only):
-#   FP300 mmWave presence OR bathroom PIR when bathroom door is open OR an active bed-light
-#   session (see bedroom_lights.py class docstring).
+#   binary_sensor.bedroom_active (apps/presence/room_active.py) OR bathroom PIR when bathroom
+#   door is open OR an active bed-light session (see bedroom_lights.py class docstring).
 # Dark/bright from room_state_text_entity (darkness_calculator).
 
 bedroom_lights:
@@ -13,8 +13,10 @@ bedroom_lights:
   bed_lights: "light.bedroom_bed_lights"
   ceiling_lights: "light.bedroom_ceiling_lights"
   # Reliable ON-edge only signal to START a bed-light session; their OFF edge is ignored.
+  # Read directly here, not through binary_sensor.bedroom_active - this decision wants the
+  # bed specifically, not the room (same as smart_cooling.yaml/bed_presence_compare.yaml).
   # Third entry (2026-08-12): the ESPHome pressure strip as an additional witness - local
-  # and fast where Withings is cloud-lagged. Session start stays FP300-gated, and only an
+  # and fast where Withings is cloud-lagged. Session start stays presence-gated, and only an
   # exact "on" counts anywhere this list is read, so an unavailable strip is inert.
   # Uses _either (2026-08-30, was _left): the sole occupant does not always sleep on the
   # left side, so the strip must arm from whichever half is occupied - same pattern as
@@ -27,7 +29,6 @@ bedroom_lights:
   switch_device_id: "951e07324391856c37850361629523d7"
   remote_device_id: "fde0ce72582c723f4d8b729b522fc2fa"
 
-  raw_pir_sensor: "binary_sensor.bedroom_pir_presence"
   raw_bathroom_pir_sensor: "binary_sensor.bathroom_pir_presence"
   bathroom_door_sensor: "binary_sensor.bathroom_door_contact"
 
@@ -39,22 +40,16 @@ bedroom_lights:
   # >= this as closed so auto-on stays blocked. Matches wakeup_bedroom's closed_threshold.
   blind_closed_threshold: 95
 
-  # Bed-light session latch (bed vs ceiling): reliable local FP300 mmWave presence, single
-  # source of truth mirrored to bed_session_entity and read by wakeup_bedroom for the wake
-  # ramp hand-off. See bedroom_lights.py class docstring.
+  # Bed-light session latch (bed vs ceiling): single source of truth mirrored to
+  # bed_session_entity and read by wakeup_bedroom for the wake ramp hand-off. Presence for
+  # arming/cancelling the exit timer comes from binary_sensor.bedroom_active (room_active.py) -
+  # since that primitive already unions the bed witnesses in with FP300/PIR, it cannot read
+  # "not present" while a bed witness is asserting, so no separate live-witness hold is needed
+  # on top of the exit debounce below (bedroom_lights carried one standalone through
+  # 2026-08-31, before the primitive existed - see git history for that mechanism). See
+  # bedroom_lights.py class docstring.
   bed_session_entity: input_boolean.bedroom_bed_session
-  bedroom_presence_sensor: binary_sensor.bedroom_presence_presence
-  # Raised 90->300s (2026-08-31): FP300 mmWave can lose a dead-still occupant for 90s+
-  # even though they never left (2 real incidents in 2 days: 2026-08-30, 2026-08-31;
-  # 08-31's real gap was ~25 min, well beyond even the sensor's own 300s-max
-  # absence_delay_timer). The capped hold below extends further while
-  # withings_in_bed_entities still shows someone there - capped so a stuck/offline
-  # witness can delay the end but never block it forever. Movement itself re-triggers
-  # FP300 reliably (only a dead-still body gets lost), so a TV-power witness isn't
-  # needed on top of the bed witness. See bedroom_lights.py's _session_hold_reason /
-  # _session_exit_fire.
   session_exit_debounce_sec: 300
-  session_hold_bed_max_sec: 1800
 
   verbosity_level: "normal"
   room_state_text_entity: "sensor.room_state_bedroom_bathroom"
