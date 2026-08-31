@@ -29,12 +29,17 @@ MikkelSleepMode:
     - binary_sensor.left_bedside
     - binary_sensor.right_bedside
     - binary_sensor.bed_presence_6b9c94_bed_occupied_either
-  # Only the proven mats may release the post-wakeup re-arm hold ("every sensor reads
-  # explicitly off"). Listing the strip here would let a stuck-on/offline strip keep
-  # the hold forever and block all future arming - see _bed_reads_empty.
+  # Every configured bed witness (mats AND strip) must read explicitly "off" to release
+  # the post-wakeup re-arm hold ("every sensor reads explicitly off"). The strip is local
+  # ESPHome with sub-second updates and measured near-zero unavailability, unlike the
+  # cloud-polled Withings mats' documented multi-hour outages; an unreadable witness is
+  # already inert under _bed_reads_empty's own logic (unavailable/unknown is not an
+  # explicit "off", so it can't complete the all-off condition regardless), so listing
+  # the strip here does not introduce a new deadlock risk - see _bed_reads_empty.
   bed_empty_entities:
     - binary_sensor.left_bedside
     - binary_sensor.right_bedside
+    - binary_sensor.bed_presence_6b9c94_bed_occupied_either
   sleep_mode_entity: input_boolean.mikkel_sleep_mode
 
   # Companion app: command_dnd (see mobile_notifier.yaml for service name)

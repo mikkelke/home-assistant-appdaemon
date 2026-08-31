@@ -10,13 +10,13 @@ In-bed witnesses (2026-08-12): in_bed_entities is an OR list - the two Withings
 mats plus the new ESPHome pressure strip (binary_sensor.bed_presence_6b9c94_
 bed_occupied_left, hours old, zero nights of track record). Only an exact "on"
 counts, so an offline/unavailable strip can never hold sleep mode on nor stop a
-mat from arming it. The strip is an ADDITIONAL WITNESS only: bed_empty_entities
-(the mats) is what _bed_reads_empty consults, so the unproven strip can neither
-release the re-arm hold early (strip false-off) nor deadlock it (strip stuck-on
-or offline would otherwise block "every sensor reads off" forever, and with it
-every future arming). Withings stays authoritative until
-sensor.bed_presence_agreement (apps/presence/bed_presence_compare.py) shows the
-strip earning promotion.
+mat from arming it. bed_empty_entities (2026-08-31: mats AND strip, see
+_bed_reads_empty) is what the release side consults - every configured witness
+must read explicitly "off" before the re-arm hold clears; the strip's local,
+sub-second, near-zero-unavailability profile means listing it there does not
+reintroduce the deadlock risk a cloud-polled mat outage could. Withings stays
+authoritative until sensor.bed_presence_agreement
+(apps/presence/bed_presence_compare.py) shows the strip earning promotion.
 
 The blind gate (2026-08-12, Mikkel's own words: "if I lay in bed and connect a charger
 my phone will go to DND, that is mostly fine, but if the curtain is not up it does not
@@ -216,11 +216,15 @@ class MikkelSleepMode(hass.Hass):
         which is exactly when this app re-initializes. Treating that as "he got up"
         would drop the hold at the one moment it is needed most.
 
-        Deliberately NOT the full in_bed_entities list: the ESPHome strip is an arm-only
-        witness there. Requiring the strip to read "off" too would let a stuck-on or
-        offline strip hold "every sensor reads off" false forever - and the hold with it,
-        which blocks all future arming (the mat could never arm sleep mode again until a
-        human noticed). The proven mats alone decide "he got up"."""
+        bed_empty_entities now includes the ESPHome strip alongside the two mats
+        (2026-08-31): every configured bed witness, mats AND strip, must read
+        explicitly "off" before the hold releases. The strip is local ESPHome with
+        sub-second updates and measured near-zero unavailability, unlike the
+        cloud-polled Withings mats' documented multi-hour outages - an unreadable
+        witness is already inert under this method's own logic (unavailable/unknown
+        is not an explicit "off", so it can't complete the all-off condition
+        regardless, mats included). Adding the strip here does not introduce a new
+        deadlock risk; it removes an asymmetry that was pointing at the wrong sensor."""
         ents = self.bed_empty_entities or self.in_bed_entities
         if not ents:
             return False
