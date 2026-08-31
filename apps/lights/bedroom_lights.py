@@ -39,14 +39,14 @@ class BedroomLights(hass.Hass):
     ``_enter_session``/``_reconcile_session``) and cancelled the instant presence returns, so
     someone moving around the bed (FP300 briefly clearing) never flips the room to ceiling
     lights. FP300 can also lose a dead-still occupant outright (2026-08-31: caught twice in two
-    days) - when the timer fires, ``_session_hold_reason`` checks two capped, independent
-    witnesses before actually ending the session: any ``withings_in_bed_entities`` reading
-    exactly "on" (capped at ``session_hold_bed_max_sec``, since mats/strip are unreadable a
-    large fraction of the time and must never become a hard gate), or the bedroom TV's power
-    meter reading over ``session_hold_power_watts`` (capped at ``session_hold_power_max_sec``,
-    mirroring ``bedroom_tv_control``'s proven threshold). Either cap is measured from when the
-    exit timer was FIRST armed, not reset on re-arm, so a stuck witness can delay the end but
-    never block it forever.
+    days, the second a continuous 25min drop - well beyond even the device's own 300s-max
+    absence_delay_timer) - when the timer fires, ``_session_hold_reason`` checks whether any
+    ``withings_in_bed_entities`` still reads exactly "on" before actually ending the session,
+    capped at ``session_hold_bed_max_sec`` (mats/strip are unreadable a large fraction of the
+    time and must never become a hard gate). The cap is measured from when the exit timer was
+    FIRST armed, not reset on re-arm, so a stuck witness can delay the end but never block it
+    forever. No other witness is needed on top - any real movement re-triggers FP300 reliably,
+    it only loses a genuinely still body.
 
     Restart-safe: ``_reconcile_session`` rebuilds ``self._session`` on init from
     Withings/sleep-mode/the persisted helper + FP300's ``last_changed`` epoch (same pattern as
@@ -101,12 +101,9 @@ class BedroomLights(hass.Hass):
         )
         self.bedroom_presence_extra = list(self.args.get("bedroom_presence_extra") or [])
         self.session_exit_debounce_sec = int(self.args.get("session_exit_debounce_sec", 90))
-        # Capped exit-holds (see class docstring / _session_hold_reason). Each cap is
-        # measured independently from when the exit timer was FIRST armed.
+        # Capped exit-hold (see class docstring / _session_hold_reason), measured from
+        # when the exit timer was FIRST armed.
         self.session_hold_bed_max_sec = int(self.args.get("session_hold_bed_max_sec", 1800))
-        self.session_hold_power_entity = self.args.get("session_hold_power_entity")
-        self.session_hold_power_watts = float(self.args.get("session_hold_power_watts", 20))
-        self.session_hold_power_max_sec = int(self.args.get("session_hold_power_max_sec", 21600))
         # Grace before a bathroom-door close (that would drop occupancy to zero) actually
         # kills the lights - see class docstring / _arm_vacancy_grace.
         self.bathroom_door_close_grace_sec = int(self.args.get("bathroom_door_close_grace_sec", 5))
@@ -382,10 +379,12 @@ class BedroomLights(hass.Hass):
         self._set_session(False, f"presence clear {self.session_exit_debounce_sec}s")
 
     def _session_hold_reason(self) -> str | None:
-        """While the exit timer is armed, a live witness may hold the session a bit longer
-        instead of ending it outright - each capped independently from when the timer was
+        """While the exit timer is armed, a live bed witness may hold the session a bit
+        longer instead of ending it outright - capped independently from when the timer was
         FIRST armed (self._session_exit_armed_at, never reset by a hold's own re-arm), so a
-        stuck/offline witness can delay the end but never block it forever."""
+        stuck/offline witness can delay the end but never block it forever. Movement itself
+        re-triggers FP300 reliably (only a dead-still body gets lost), so this is the only
+        witness needed - no TV-power/other proxy on top."""
         armed_at = self._session_exit_armed_at
         if armed_at is None:
             return None
@@ -394,13 +393,6 @@ class BedroomLights(hass.Hass):
             self.get_state(e) == "on" for e in self.withings_in_bed_entities
         ):
             return "bed witness"
-        if self.session_hold_power_entity and elapsed < self.session_hold_power_max_sec:
-            try:
-                watts = float(self.get_state(self.session_hold_power_entity))
-            except (TypeError, ValueError):
-                watts = None
-            if watts is not None and watts > self.session_hold_power_watts:
-                return "TV power"
         return None
 
     def _reconcile_session(self) -> None:

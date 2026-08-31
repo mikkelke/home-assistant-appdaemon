@@ -45,16 +45,16 @@ bedroom_lights:
   bed_session_entity: input_boolean.bedroom_bed_session
   bedroom_presence_sensor: binary_sensor.bedroom_presence_presence
   # Raised 90->300s (2026-08-31): FP300 mmWave can lose a dead-still occupant for 90s+
-  # even though they never left (2 real incidents in 2 days: 2026-08-30, 2026-08-31).
-  # The capped holds below extend further while withings_in_bed_entities or the TV
-  # power meter still shows someone there - capped independently so a stuck/offline
-  # witness can delay the end but never block it forever. See bedroom_lights.py's
-  # _session_hold_reason / _session_exit_fire.
+  # even though they never left (2 real incidents in 2 days: 2026-08-30, 2026-08-31;
+  # 08-31's real gap was ~25 min, well beyond even the sensor's own 300s-max
+  # absence_delay_timer). The capped hold below extends further while
+  # withings_in_bed_entities still shows someone there - capped so a stuck/offline
+  # witness can delay the end but never block it forever. Movement itself re-triggers
+  # FP300 reliably (only a dead-still body gets lost), so a TV-power witness isn't
+  # needed on top of the bed witness. See bedroom_lights.py's _session_hold_reason /
+  # _session_exit_fire.
   session_exit_debounce_sec: 300
   session_hold_bed_max_sec: 1800
-  session_hold_power_entity: sensor.bedroom_tv_relay_power
-  session_hold_power_watts: 20
-  session_hold_power_max_sec: 21600
 
   verbosity_level: "normal"
   room_state_text_entity: "sensor.room_state_bedroom_bathroom"

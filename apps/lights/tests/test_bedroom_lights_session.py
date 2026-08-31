@@ -43,7 +43,6 @@ DARK_SENSOR = "sensor.darkness_bedroom_bathroom"
 ROOM_STATE = "sensor.room_state_bedroom_bathroom"
 BATH_PIR = "binary_sensor.bathroom_pir_presence"
 BATH_DOOR = "binary_sensor.bathroom_door_contact"
-TV_POWER = "sensor.bedroom_tv_relay_power"
 
 
 def make_session_app(session=False, dark=True, session_exit_timer=None, session_exit_armed_at=None):
@@ -73,9 +72,6 @@ def make_session_app(session=False, dark=True, session_exit_timer=None, session_
     app._last_off_is_dark = None
     app._session_exit_armed_at = session_exit_armed_at
     app.session_hold_bed_max_sec = 1800
-    app.session_hold_power_entity = "sensor.bedroom_tv_relay_power"
-    app.session_hold_power_watts = 20
-    app.session_hold_power_max_sec = 21600
 
     app.states = {
         (FP300, None): "off",
@@ -87,7 +83,6 @@ def make_session_app(session=False, dark=True, session_exit_timer=None, session_
         (BATH_DOOR, None): "off",
         (BLIND, "current_position"): 0,
         (DARK_SENSOR, None): "dark" if dark else "bright",
-        (TV_POWER, None): "0",
     }
 
     def get_state(entity, **kw):
@@ -350,47 +345,6 @@ class SessionExitHold(unittest.TestCase):
         app._session_exit_fire({})
         self.assertFalse(app._session)
         app.call_service.assert_called_once_with("input_boolean/turn_off", entity_id=SESSION)
-
-    def test_tv_power_holds_and_rearms(self):
-        app = make_session_app(
-            session=True, session_exit_timer="handle", session_exit_armed_at=FIXED_NOW - 100
-        )
-        app.states[(FP300, None)] = "off"
-        app.states[(TV_POWER, None)] = "45.0"  # above the 20W threshold
-        app._session_exit_fire({})
-        self.assertTrue(app._session)
-        app.call_service.assert_not_called()
-
-    def test_tv_power_at_or_below_threshold_does_not_hold(self):
-        app = make_session_app(
-            session=True, session_exit_timer="handle", session_exit_armed_at=FIXED_NOW - 100
-        )
-        app.states[(FP300, None)] = "off"
-        app.states[(TV_POWER, None)] = "20.0"
-        app._session_exit_fire({})
-        self.assertFalse(app._session)
-
-    def test_tv_power_hold_expires_past_cap(self):
-        app = make_session_app(
-            session=True,
-            session_exit_timer="handle",
-            session_exit_armed_at=FIXED_NOW - 21600 - 1,
-        )
-        app.states[(FP300, None)] = "off"
-        app.states[(TV_POWER, None)] = "45.0"
-        app._session_exit_fire({})
-        self.assertFalse(app._session)
-
-    def test_unreadable_power_sensor_does_not_hold(self):
-        app = make_session_app(
-            session=True, session_exit_timer="handle", session_exit_armed_at=FIXED_NOW - 100
-        )
-        app.states[(FP300, None)] = "off"
-        app.states[(LEFT, None)] = "off"
-        app.states[(RIGHT, None)] = "off"
-        app.states[(TV_POWER, None)] = "unavailable"
-        app._session_exit_fire({})
-        self.assertFalse(app._session)
 
     def test_arm_session_exit_records_armed_at(self):
         app = make_session_app(session=True)
