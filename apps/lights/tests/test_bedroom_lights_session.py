@@ -43,9 +43,10 @@ DARK_SENSOR = "sensor.darkness_bedroom_bathroom"
 ROOM_STATE = "sensor.room_state_bedroom_bathroom"
 BATH_PIR = "binary_sensor.bathroom_pir_presence"
 BATH_DOOR = "binary_sensor.bathroom_door_contact"
+TV_POWER = "sensor.bedroom_tv_relay_power"
 
 
-def make_session_app(session=False, dark=True, session_exit_timer=None):
+def make_session_app(session=False, dark=True, session_exit_timer=None, session_exit_armed_at=None):
     """BedroomLights with just the state the session-machinery / decision / occupancy /
     blind methods need, without running AppDaemon's initialize()."""
     app = bedroom_lights.BedroomLights.__new__(bedroom_lights.BedroomLights)
@@ -70,6 +71,11 @@ def make_session_app(session=False, dark=True, session_exit_timer=None):
     app._session = session
     app._session_exit_timer = session_exit_timer
     app._last_off_is_dark = None
+    app._session_exit_armed_at = session_exit_armed_at
+    app.session_hold_bed_max_sec = 1800
+    app.session_hold_power_entity = "sensor.bedroom_tv_relay_power"
+    app.session_hold_power_watts = 20
+    app.session_hold_power_max_sec = 21600
 
     app.states = {
         (FP300, None): "off",
@@ -81,6 +87,7 @@ def make_session_app(session=False, dark=True, session_exit_timer=None):
         (BATH_DOOR, None): "off",
         (BLIND, "current_position"): 0,
         (DARK_SENSOR, None): "dark" if dark else "bright",
+        (TV_POWER, None): "0",
     }
 
     def get_state(entity, **kw):
@@ -296,6 +303,171 @@ class SessionExit(unittest.TestCase):
         app._session_exit_fire({})
         self.assertTrue(app._session)
         app.call_service.assert_not_called()
+
+
+class SessionExitHold(unittest.TestCase):
+    """_session_hold_reason: capped, independent witnesses that extend the exit debounce
+    instead of ending the session outright when the timer fires."""
+
+    def setUp(self):
+        self._real_time = bedroom_lights.time
+        bedroom_lights.time = types.SimpleNamespace(time=lambda: FIXED_NOW)
+        self.addCleanup(self._restore_time)
+
+    def _restore_time(self):
+        bedroom_lights.time = self._real_time
+
+    def test_no_hold_when_armed_at_is_none(self):
+        # Existing behaviour preserved: a test that never went through _arm_session_exit
+        # (armed_at defaults to None) must not hold, even with a mat "on".
+        app = make_session_app(session=True, session_exit_timer="handle")
+        app.states[(LEFT, None)] = "on"
+        app.states[(FP300, None)] = "off"
+        app._session_exit_fire({})
+        self.assertFalse(app._session)
+        app.call_service.assert_called_once_with("input_boolean/turn_off", entity_id=SESSION)
+
+    def test_bed_witness_holds_and_rearms(self):
+        app = make_session_app(
+            session=True, session_exit_timer="handle", session_exit_armed_at=FIXED_NOW - 100
+        )
+        app.states[(FP300, None)] = "off"
+        app.states[(LEFT, None)] = "on"  # live witness despite FP300 being off
+        app._session_exit_fire({})
+        self.assertTrue(app._session)
+        app.call_service.assert_not_called()
+        app.run_in.assert_called_once_with(app._session_exit_fire, app.session_exit_debounce_sec)
+        self.assertIsNotNone(app._session_exit_timer)
+
+    def test_bed_witness_hold_expires_past_cap(self):
+        app = make_session_app(
+            session=True,
+            session_exit_timer="handle",
+            session_exit_armed_at=FIXED_NOW - 1801,
+        )
+        app.states[(FP300, None)] = "off"
+        app.states[(LEFT, None)] = "on"  # witness still "on", but past the 1800s cap
+        app._session_exit_fire({})
+        self.assertFalse(app._session)
+        app.call_service.assert_called_once_with("input_boolean/turn_off", entity_id=SESSION)
+
+    def test_tv_power_holds_and_rearms(self):
+        app = make_session_app(
+            session=True, session_exit_timer="handle", session_exit_armed_at=FIXED_NOW - 100
+        )
+        app.states[(FP300, None)] = "off"
+        app.states[(TV_POWER, None)] = "45.0"  # above the 20W threshold
+        app._session_exit_fire({})
+        self.assertTrue(app._session)
+        app.call_service.assert_not_called()
+
+    def test_tv_power_at_or_below_threshold_does_not_hold(self):
+        app = make_session_app(
+            session=True, session_exit_timer="handle", session_exit_armed_at=FIXED_NOW - 100
+        )
+        app.states[(FP300, None)] = "off"
+        app.states[(TV_POWER, None)] = "20.0"
+        app._session_exit_fire({})
+        self.assertFalse(app._session)
+
+    def test_tv_power_hold_expires_past_cap(self):
+        app = make_session_app(
+            session=True,
+            session_exit_timer="handle",
+            session_exit_armed_at=FIXED_NOW - 21600 - 1,
+        )
+        app.states[(FP300, None)] = "off"
+        app.states[(TV_POWER, None)] = "45.0"
+        app._session_exit_fire({})
+        self.assertFalse(app._session)
+
+    def test_unreadable_power_sensor_does_not_hold(self):
+        app = make_session_app(
+            session=True, session_exit_timer="handle", session_exit_armed_at=FIXED_NOW - 100
+        )
+        app.states[(FP300, None)] = "off"
+        app.states[(LEFT, None)] = "off"
+        app.states[(RIGHT, None)] = "off"
+        app.states[(TV_POWER, None)] = "unavailable"
+        app._session_exit_fire({})
+        self.assertFalse(app._session)
+
+    def test_arm_session_exit_records_armed_at(self):
+        app = make_session_app(session=True)
+        app._arm_session_exit()
+        self.assertEqual(app._session_exit_armed_at, FIXED_NOW)
+
+    def test_cancel_session_exit_clears_armed_at(self):
+        app = make_session_app(session=True, session_exit_timer="handle", session_exit_armed_at=FIXED_NOW - 5)
+        app._cancel_session_exit()
+        self.assertIsNone(app._session_exit_armed_at)
+
+    def test_rearm_on_hold_does_not_reset_armed_at(self):
+        # The cap is measured from the FIRST arm, not extended on every hold.
+        armed_at = FIXED_NOW - 100
+        app = make_session_app(session=True, session_exit_timer="handle", session_exit_armed_at=armed_at)
+        app.states[(FP300, None)] = "off"
+        app.states[(LEFT, None)] = "on"
+        app._session_exit_fire({})
+        self.assertEqual(app._session_exit_armed_at, armed_at)
+
+
+class SessionEntryArmsExitIfPresenceAlreadyClear(unittest.TestCase):
+    """Latent-bug fix: a session started while FP300 is already not "on" (sleep-mode-on,
+    or a reconciled session at restart) must arm its own exit timer immediately - otherwise
+    no future off-edge will ever arrive to arm one, and the session could never end."""
+
+    def setUp(self):
+        self._real_time = bedroom_lights.time
+        bedroom_lights.time = types.SimpleNamespace(time=lambda: FIXED_NOW)
+        self.addCleanup(self._restore_time)
+
+    def _restore_time(self):
+        bedroom_lights.time = self._real_time
+
+    def test_sleep_mode_on_with_fp300_already_off_arms_exit(self):
+        app = make_session_app(session=False, dark=True)
+        app.states[(FP300, None)] = "off"
+        app._on_sleep_mode_on(SLEEP, "state", "off", "on", {})
+        self.assertTrue(app._session)
+        app.run_in.assert_called_once_with(app._session_exit_fire, app.session_exit_debounce_sec)
+        self.assertIsNotNone(app._session_exit_timer)
+
+    def test_sleep_mode_on_with_fp300_on_does_not_arm_exit(self):
+        app = make_session_app(session=False, dark=True)
+        app.states[(FP300, None)] = "on"
+        app._on_sleep_mode_on(SLEEP, "state", "off", "on", {})
+        self.assertTrue(app._session)
+        app.run_in.assert_not_called()
+        self.assertIsNone(app._session_exit_timer)
+
+    def test_reconcile_with_withings_and_fp300_off_arms_exit(self):
+        app = make_session_app(session=False)
+        app.states[(SESSION, None)] = "off"
+        app.states[(FP300, None)] = "off"
+        app.states[(LEFT, None)] = "on"
+        app._reconcile_session()
+        self.assertTrue(app._session)
+        app.run_in.assert_called_once_with(app._session_exit_fire, app.session_exit_debounce_sec)
+
+    def test_reconcile_with_fp300_on_does_not_arm_exit(self):
+        app = make_session_app(session=False)
+        app.states[(SESSION, None)] = "off"
+        app.states[(FP300, None)] = "on"
+        app.states[(LEFT, None)] = "on"
+        app._reconcile_session()
+        self.assertTrue(app._session)
+        app.run_in.assert_not_called()
+
+    def test_reconcile_with_sleep_on_does_not_arm_exit(self):
+        # sleep_on already blocks the exit path entirely (_is_sleep_mode_active), no timer needed.
+        app = make_session_app(session=False)
+        app.states[(SESSION, None)] = "off"
+        app.states[(FP300, None)] = "off"
+        app.states[(SLEEP, None)] = "on"
+        app._reconcile_session()
+        self.assertTrue(app._session)
+        app.run_in.assert_not_called()
 
 
 class LightDecision(unittest.TestCase):

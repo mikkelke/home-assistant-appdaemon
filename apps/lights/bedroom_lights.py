@@ -27,17 +27,32 @@ class BedroomLights(hass.Hass):
 
     Bed-light session (bed vs ceiling): a debounced latch, ``self._session``, mirrored to the
     HA helper ``bed_session_entity`` (single source of truth across app restarts/reloads) and
-    read by ``wakeup_bedroom`` for the wake-ramp hand-off. Withings bedside sensors
-    (``withings_in_bed_entities``) are used ONLY for their reliable ON edge to START a session -
-    their OFF edge is ignored forever (Withings misses getting-up far too often to trust for
-    ending one). A session also starts on sleep-mode ON, or on a manual bed-light-on while the
-    room is dark. It ends only once the FP300 presence sensor has read "off" continuously for
-    ``session_exit_debounce_sec`` while sleep mode is not active - the exit timer is armed on
-    presence-off and cancelled the instant presence returns, so someone moving around the bed
-    (FP300 briefly clearing) never flips the room to ceiling lights. Restart-safe:
-    ``_reconcile_session`` rebuilds ``self._session`` on init from Withings/sleep-mode/the
-    persisted helper + FP300's ``last_changed`` epoch (same pattern as
-    ``manual_override_timeout``), before the first light evaluation runs.
+    read by ``wakeup_bedroom`` for the wake-ramp hand-off. Withings bedside sensors and the
+    ESPHome strip (``withings_in_bed_entities``) are used ONLY for their reliable ON edge to
+    START a session - their OFF edge is ignored forever (the mats miss getting-up far too often
+    to trust for ending one). A session also starts on sleep-mode ON, or on a manual bed-light-on
+    while the room is dark.
+
+    It ends once the FP300 presence sensor has read "off" continuously for
+    ``session_exit_debounce_sec`` (300s) while sleep mode is not active - the exit timer is armed
+    on presence-off (or immediately at session-start if presence is already off, see
+    ``_enter_session``/``_reconcile_session``) and cancelled the instant presence returns, so
+    someone moving around the bed (FP300 briefly clearing) never flips the room to ceiling
+    lights. FP300 can also lose a dead-still occupant outright (2026-08-31: caught twice in two
+    days) - when the timer fires, ``_session_hold_reason`` checks two capped, independent
+    witnesses before actually ending the session: any ``withings_in_bed_entities`` reading
+    exactly "on" (capped at ``session_hold_bed_max_sec``, since mats/strip are unreadable a
+    large fraction of the time and must never become a hard gate), or the bedroom TV's power
+    meter reading over ``session_hold_power_watts`` (capped at ``session_hold_power_max_sec``,
+    mirroring ``bedroom_tv_control``'s proven threshold). Either cap is measured from when the
+    exit timer was FIRST armed, not reset on re-arm, so a stuck witness can delay the end but
+    never block it forever.
+
+    Restart-safe: ``_reconcile_session`` rebuilds ``self._session`` on init from
+    Withings/sleep-mode/the persisted helper + FP300's ``last_changed`` epoch (same pattern as
+    ``manual_override_timeout``), before the first light evaluation runs, and arms the exit timer
+    immediately if the rebuilt session starts with FP300 already not "on" (same reasoning as
+    ``_enter_session``).
 
     Truth table (after the vacant/occupied gate):
       - No effective occupancy -> all lights OFF
@@ -86,6 +101,12 @@ class BedroomLights(hass.Hass):
         )
         self.bedroom_presence_extra = list(self.args.get("bedroom_presence_extra") or [])
         self.session_exit_debounce_sec = int(self.args.get("session_exit_debounce_sec", 90))
+        # Capped exit-holds (see class docstring / _session_hold_reason). Each cap is
+        # measured independently from when the exit timer was FIRST armed.
+        self.session_hold_bed_max_sec = int(self.args.get("session_hold_bed_max_sec", 1800))
+        self.session_hold_power_entity = self.args.get("session_hold_power_entity")
+        self.session_hold_power_watts = float(self.args.get("session_hold_power_watts", 20))
+        self.session_hold_power_max_sec = int(self.args.get("session_hold_power_max_sec", 21600))
         # Grace before a bathroom-door close (that would drop occupancy to zero) actually
         # kills the lights - see class docstring / _arm_vacancy_grace.
         self.bathroom_door_close_grace_sec = int(self.args.get("bathroom_door_close_grace_sec", 5))
@@ -95,6 +116,7 @@ class BedroomLights(hass.Hass):
         self._last_off_is_dark: bool | None = None
         self._session = False
         self._session_exit_timer = None
+        self._session_exit_armed_at: float | None = None
         self._vacancy_grace_timer = None
 
         if not all(
@@ -277,6 +299,11 @@ class BedroomLights(hass.Hass):
     def _enter_session(self, reason: str) -> None:
         self._cancel_session_exit()
         self._set_session(True, reason)
+        # If presence is already not "on" at entry (e.g. sleep-mode armed while FP300 had
+        # already lost a dead-still occupant), no future off-edge will ever arrive to arm
+        # the exit timer - arm it right now instead of leaving the session stuck forever.
+        if self.get_state(self.bedroom_presence_sensor) != "on" and not self._is_sleep_mode_active():
+            self._arm_session_exit()
 
     def _on_withings_in_bed_on(self, entity, attribute, old, new, kwargs):
         try:
@@ -321,6 +348,7 @@ class BedroomLights(hass.Hass):
 
     def _arm_session_exit(self) -> None:
         if self._session_exit_timer is None:
+            self._session_exit_armed_at = time.time()
             self._session_exit_timer = self.run_in(
                 self._session_exit_fire, self.session_exit_debounce_sec
             )
@@ -332,15 +360,48 @@ class BedroomLights(hass.Hass):
             except Exception:
                 pass
             self._session_exit_timer = None
+        self._session_exit_armed_at = None
 
     def _session_exit_fire(self, kwargs):
         self._session_exit_timer = None
-        if (
+        if not (
             self._session
             and self.get_state(self.bedroom_presence_sensor) != "on"
             and not self._is_sleep_mode_active()
         ):
-            self._set_session(False, f"presence clear {self.session_exit_debounce_sec}s")
+            self._session_exit_armed_at = None
+            return
+        hold = self._session_hold_reason()
+        if hold:
+            self.log(f"Bedroom: bed session hold ({hold}), extending exit debounce", level="INFO")
+            self._session_exit_timer = self.run_in(
+                self._session_exit_fire, self.session_exit_debounce_sec
+            )
+            return
+        self._session_exit_armed_at = None
+        self._set_session(False, f"presence clear {self.session_exit_debounce_sec}s")
+
+    def _session_hold_reason(self) -> str | None:
+        """While the exit timer is armed, a live witness may hold the session a bit longer
+        instead of ending it outright - each capped independently from when the timer was
+        FIRST armed (self._session_exit_armed_at, never reset by a hold's own re-arm), so a
+        stuck/offline witness can delay the end but never block it forever."""
+        armed_at = self._session_exit_armed_at
+        if armed_at is None:
+            return None
+        elapsed = time.time() - armed_at
+        if elapsed < self.session_hold_bed_max_sec and any(
+            self.get_state(e) == "on" for e in self.withings_in_bed_entities
+        ):
+            return "bed witness"
+        if self.session_hold_power_entity and elapsed < self.session_hold_power_max_sec:
+            try:
+                watts = float(self.get_state(self.session_hold_power_entity))
+            except (TypeError, ValueError):
+                watts = None
+            if watts is not None and watts > self.session_hold_power_watts:
+                return "TV power"
+        return None
 
     def _reconcile_session(self) -> None:
         """Restart-safe rebuild of ``self._session`` (see class docstring). Modeled on
@@ -365,6 +426,10 @@ class BedroomLights(hass.Hass):
         else:
             want = False
         self._session = want
+        # Same reasoning as _enter_session: if the rebuilt session starts with FP300 already
+        # not "on", no future off-edge will ever arrive to arm the exit timer on its own.
+        if want and not fp300_on and not sleep_on:
+            self._arm_session_exit()
         if (self.get_state(self.bed_session_entity) == "on") != want:
             self.call_service(
                 "input_boolean/turn_on" if want else "input_boolean/turn_off",
