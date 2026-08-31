@@ -8,16 +8,18 @@ SonosFollowMe:
   # Core settings
   follow_me_flag:   "input_boolean.follow_me"
   room_presence_map:
-    # Template/combined presence per room (e.g. bedroom_pir_presence already ORs motion + occupancy in HA).
-    bathroom:       "binary_sensor.bathroom_pir_presence"
-    bedroom:        "binary_sensor.bedroom_pir_presence"
-    guest_bathroom: "binary_sensor.guest_bathroom_pir_presence"
-    claudias_room:  "binary_sensor.claudias_room_pir_presence"
-    living_room:    "binary_sensor.living_room_pir_presence"
-    dining_room:    "binary_sensor.dining_room_pir_presence"
-    hallway:        "binary_sensor.hallway_pir_presence"
-    kitchen:        "binary_sensor.kitchen_pir_presence"
-    kristines_room: "binary_sensor.kristines_room_pir_presence"
+    # Per-room union presence published by RoomActive (apps/presence/room_active.py) -
+    # binary_sensor.<zone>_active already ORs each zone's full witness tier (room mmWave, spot
+    # sensors, bed mats/strip, PIR/motion channels), including bedroom's bed-session witness.
+    bathroom:       "binary_sensor.bathroom_active"
+    bedroom:        "binary_sensor.bedroom_active"
+    guest_bathroom: "binary_sensor.guest_bathroom_active"
+    claudias_room:  "binary_sensor.claudias_room_active"
+    living_room:    "binary_sensor.living_room_active"
+    dining_room:    "binary_sensor.dining_room_active"
+    hallway:        "binary_sensor.hallway_active"
+    kitchen:        "binary_sensor.kitchen_active"
+    kristines_room: "binary_sensor.kristines_room_active"
     rooftop_charging: "binary_sensor.rooftop_charging"  # Detects if rooftop speaker is docked (only follows when docked)
   all_speakers:
     - media_player.bathroom
@@ -59,25 +61,15 @@ SonosFollowMe:
     media_player.claudias_room: "Claudias Room"
     media_player.rooftop: "Rooftop"
 
-  # raw_pir_sensors removed: room_presence_map now uses PIR presence (same as lights), so one source for both state and immediate response
+  # raw_pir_sensors removed historically in favor of PIR presence; room_presence_map now points
+  # at RoomActive's binary_sensor.<zone>_active (apps/presence/room_active.py) instead.
 
   # presence_trust (apps/lights/presence_trust.py): kitchen mmWave-only presence for this many
   # minutes with the PIR silent, while the kitchen speaker plays, is SUSPECT - kitchen presence
   # then reads indeterminate: no unmute on a ghost, no mute on a possibly-real still person.
   presence_suspect_after_minutes: 10
 
-  # Bed-session latch owned by bedroom_lights (own debounced, multi-witness "in bed" signal).
-  # The raw bedroom group above is a zero-debounce OR that flickers off for a few seconds to
-  # 30-90s while someone lies still, muting the room mid-use. bedroom_mute_grace_sec (below)
-  # covers the residual case where the group AND the session both read off for one tick.
-  bed_session_entity: input_boolean.bedroom_bed_session
-  # Grace before actually muting the bedroom (only) - re-checks presence after this many
-  # seconds instead of muting on the first instant "absent" reading. Unmute is never delayed.
-  # 8s matches the worst multi-sensor coincidence blip observed 2026-08-31.
-  bedroom_mute_grace_sec: 8
-
   # Special conditions for room presence
   special_conditions:
     kitchen_or_hallway: true   # Kitchen should unmute if either kitchen or hallway has presence
     rooftop_with_living_room: true  # Rooftop should only unmute with living room presence + charging
-    bedroom_with_bed_session: true  # Bedroom is present if the PIR group OR the bed-session latch is on (additive only)

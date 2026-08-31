@@ -8,25 +8,16 @@ import presence_trust  # apps/lights - AppDaemon puts every app dir on sys.path
 # after this many seconds - see _arm_reset_wedge_timer.
 RESET_WEDGE_TIMEOUT_S = 120
 
-# Bedroom mute grace (2026-08-31): the raw group + session can both read "off" for a single
-# few-second tick (coincidental multi-sensor blip) even though nobody left - mirrors the
-# worst blip observed that day (8s). Only the MUTE direction is graced; unmute always applies
-# instantly. See _apply_follow_me_mute / _bedroom_mute_grace_fire.
-BEDROOM_MUTE_GRACE_S = 8
-
 class SonosFollowMe(hass.Hass):
     """
     Follow-me rules engine: mute/unmute speakers by room presence.
     • Follow-me runs whenever relevant (grouped or solo), with rules: living_room, kristines_room, and sometimes rooftop do not activate follow-me when solo.
     • desired_mute = not present (unmute if someone in room, mute if not). Only applies to speakers that are actually playing.
     • Kitchen uses kitchen OR hallway presence; rooftop undocked is always present, docked follows living_room.
-    • Bedroom (special_conditions.bedroom_with_bed_session) is present if the PIR group OR the
-      bed-session latch (input_boolean.bedroom_bed_session, bedroom_lights' own debounced
-      multi-witness signal) is on. The raw group flickers off for a few seconds to 30-90s while
-      someone lies still; the session is additive only - it can only ADD presence, never remove
-      it. Even so, both can briefly read off at once - the bedroom's MUTE direction (only) is
-      further graced by BEDROOM_MUTE_GRACE_S before actually applying, re-checking presence at
-      fire time; unmute always applies instantly. See _apply_follow_me_mute.
+    • Bedroom is a generic room like bathroom/guest_bathroom/etc.: room_presence_map["bedroom"]
+      already points at binary_sensor.bedroom_active (apps/presence/room_active.py), whose own
+      union of witnesses (room mmWave, bed mats/strip, PIR) includes the bed-session signal
+      server-side with a 15s settle-off - no app-level special case or mute grace needed here.
     • Kitchen presence trust (presence_trust.py): mmWave-only kitchen presence while the kitchen speaker
       plays is SUSPECT - _is_present returns None (indeterminate), so every caller skips the mute change:
       a ghost can never unmute (the ON trigger), and a possibly-real still person is never muted either.
@@ -42,8 +33,6 @@ class SonosFollowMe(hass.Hass):
         self.settle      = float(self.args.get("settle_seconds", 2))
         self.reset_resume_delay = float(self.args.get("reset_resume_delay", 2.5))
         self.special     = self.args.get("special_conditions", {})
-        # Bed-session latch owned by bedroom_lights (same key name as bedroom_lights.yaml / wakeup_bedroom.yaml)
-        self.bed_session_entity = self.args.get("bed_session_entity", "input_boolean.bedroom_bed_session")
         self.entity_friendly_name_map = self.args.get("entity_friendly_name_map", {})
         self._friendly_to_entity_map = {v: k for k, v in self.entity_friendly_name_map.items()}
         self._last       = {}      # now a dict: room -> last timestamp
@@ -56,9 +45,6 @@ class SonosFollowMe(hass.Hass):
         self._fm_reset_generation = 0
         # Guard: self-heal _reset_in_progress if the state_reset handshake wedges (RESET_WEDGE_TIMEOUT_S)
         self._reset_wedge_timer = None
-        # Bedroom mute grace (see BEDROOM_MUTE_GRACE_S / _apply_follow_me_mute).
-        self.bedroom_mute_grace_sec = float(self.args.get("bedroom_mute_grace_sec", BEDROOM_MUTE_GRACE_S))
-        self._bedroom_mute_grace_timer = None
 
         # Track last non-zero volume per speaker for AirPlay restore
         self._last_nonzero_volume = {}
@@ -110,11 +96,6 @@ class SonosFollowMe(hass.Hass):
         if "living_room" in self.room_map and self.special.get("rooftop_with_living_room"):
             self.listen_state(self._on_living_room_presence_change,
                              self.room_map["living_room"])
-
-        # Bedroom counts the bed-session latch as an extra presence witness (see class
-        # docstring); session edges re-evaluate the bedroom through the normal machinery.
-        if "bedroom" in self.room_map and self.special.get("bedroom_with_bed_session"):
-            self.listen_state(self._presence_changed, self.bed_session_entity, room="bedroom")
 
         # NEW CODE: Listen for direct group update events from GroupManager
         self.listen_event(self._on_sonos_group_update, "sonos_group_update")
@@ -363,30 +344,6 @@ class SonosFollowMe(hass.Hass):
             self.log(f"Scenario: kitchen_presence -> kitchen:{kitchen_state} hallway:{hallway_state} result:{result}", level="INFO")
             return result
             
-        # Special case for bedroom - the raw group (zero-debounce OR) flickers off for
-        # 30-90s stretches while someone lies still, so the bed-session latch
-        # (input_boolean.bedroom_bed_session, bedroom_lights' 90s-debounced multi-witness
-        # signal) counts as an additional witness. Additive OR only: the session can make
-        # the bedroom read MORE present, never less - a real group ON always still wins.
-        if room == "bedroom" and self.special.get("bedroom_with_bed_session"):
-            group_state = self.get_state(self.room_map["bedroom"])
-            session_state = self.get_state(self.bed_session_entity)
-            present_values = ["on", "home", "detected", "present", "occupied", "true", "yes"]
-            # Determine known/unknown
-            g_raw = None if group_state is None else str(group_state).lower()
-            s_raw = None if session_state is None else str(session_state).lower()
-            g_unknown = (g_raw is None) or (g_raw in ["unknown", "unavailable"])
-            s_unknown = (s_raw is None) or (s_raw in ["unknown", "unavailable"])
-            g_present = (not g_unknown) and (g_raw in present_values)
-            s_present = (not s_unknown) and (s_raw in present_values)
-            # If both are unknown, we cannot decide
-            if g_unknown and s_unknown:
-                self.log(f"Scenario: bedroom_presence -> both_unknown (group:{group_state} session:{session_state}), ignoring", level="WARNING")
-                return None
-            result = g_present or s_present
-            self.log(f"Scenario: bedroom_presence -> group:{group_state} session:{session_state} result:{result}", level="INFO")
-            return result
-
         # Handle regular rooms (entity may be a HA template that already combines motion + presence, etc.)
         sensor = self.room_map.get(room)
         if not sensor:
@@ -607,8 +564,7 @@ class SonosFollowMe(hass.Hass):
         present = None
         # Use _is_present for special cases with derived logic
         if (room == "rooftop" or speaker_entity.endswith("rooftop") or
-            (room == "kitchen" and self.special.get("kitchen_or_hallway")) or
-            (room == "bedroom" and self.special.get("bedroom_with_bed_session"))):
+            (room == "kitchen" and self.special.get("kitchen_or_hallway"))):
             present = self._is_present(room, speaker_entity)
             self.log(f"Scenario: presence_calculation -> {room} presence: {present}", level="INFO")
         else:
@@ -760,52 +716,7 @@ class SonosFollowMe(hass.Hass):
         return self._parse_muted(self.get_state(entity_id, attribute="is_volume_muted"))
 
     def _apply_follow_me_mute(self, speaker_entity, desired_mute, room=None, master=None):
-        """Canonical entry point. Bedroom's MUTE direction (only) is graced by
-        BEDROOM_MUTE_GRACE_S before actually applying - re-checks presence at fire time so a
-        momentary multi-sensor coincidence never cuts the music (2026-08-31: observed 2-8s
-        blips where the raw group AND the session both happened to read "off" for one tick
-        despite nobody leaving). Unmute always applies instantly - a pending grace is cancelled
-        the moment presence is confirmed, same "safe direction wins fast" rule as everywhere
-        else in this file. Every other room/direction is unaffected."""
-        if room == "bedroom":
-            self._cancel_bedroom_mute_grace()
-            if desired_mute:
-                self._arm_bedroom_mute_grace(speaker_entity, master)
-                return
-        self._apply_follow_me_mute_now(speaker_entity, desired_mute, room=room, master=master)
-
-    def _arm_bedroom_mute_grace(self, speaker_entity, master):
-        self._bedroom_mute_grace_timer = self.run_in(
-            self._bedroom_mute_grace_fire,
-            self.bedroom_mute_grace_sec,
-            speaker_entity=speaker_entity,
-            master=master,
-        )
-
-    def _cancel_bedroom_mute_grace(self):
-        if self._bedroom_mute_grace_timer is not None:
-            self._safe_cancel_timer(self._bedroom_mute_grace_timer)
-            self._bedroom_mute_grace_timer = None
-
-    def _bedroom_mute_grace_fire(self, kwargs):
-        self._bedroom_mute_grace_timer = None
-        speaker_entity = kwargs.get("speaker_entity")
-        master = kwargs.get("master")
-        present = self._is_present("bedroom", speaker_entity)
-        if present:
-            self.log(
-                f"Scenario: bedroom_mute_grace -> presence returned within {self.bedroom_mute_grace_sec}s, holding unmuted",
-                level="INFO",
-            )
-            return
-        self.log(
-            f"Scenario: bedroom_mute_grace -> still absent after {self.bedroom_mute_grace_sec}s, muting",
-            level="INFO",
-        )
-        self._apply_follow_me_mute_now(speaker_entity, True, room="bedroom", master=master)
-
-    def _apply_follow_me_mute_now(self, speaker_entity, desired_mute, room=None, master=None):
-        """The actual immediate apply, previously named _apply_follow_me_mute. Skips if room
+        """Canonical entry point: apply the desired mute state immediately. Skips if room
         excluded, speaker not playing, or reset in progress. Uses _is_muted for current state."""
         if room is not None and self._is_room_excluded_from_follow_me(room):
             return

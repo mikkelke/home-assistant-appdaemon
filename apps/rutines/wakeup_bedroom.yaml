@@ -95,10 +95,9 @@ WakeupBedroom:
   bedroom_state_entity: sensor.room_state_bedroom_bathroom
   light_entity: light.bedroom_bed_lights
 
-  # Optional presence for media unmute behavior when room is empty
-  # Use AOD occupancy output (more reliable than raw presence)
-  # FP300 occupancy (area_occupancy entity was removed from HA)
-  bedroom_presence_entity: binary_sensor.bedroom_presence_presence
+  # Optional presence for media unmute behavior when room is empty. Now RoomActive's unioned
+  # zone presence (apps/presence/room_active.py) instead of the raw FP300 sensor alone.
+  bedroom_presence_entity: binary_sensor.bedroom_active
 
   adaptive_main_switch: switch.adaptive_lighting_bedroom
   adaptive_brightness_switch: switch.adaptive_lighting_adapt_brightness_bedroom_bed_lights

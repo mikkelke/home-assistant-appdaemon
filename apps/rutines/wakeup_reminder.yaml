@@ -27,6 +27,7 @@ WakeupReminder:
   # sensor.bed_presence_agreement has ~5 good nights. Uses _either (2026-08-30, was
   # _left): the "always sleeps left" assumption broke and caused a missed detection,
   # so the reminder now arms from whichever side is occupied.
+  # Deferred: repoint to binary_sensor.bedroom_bed_active once that sub-zone is published by RoomActive (later phase) - it does not exist yet, so this list stays as-is.
   in_bed_entities:
     - binary_sensor.left_bedside
     - binary_sensor.right_bedside
