@@ -66,10 +66,15 @@ SonosFollowMe:
   # then reads indeterminate: no unmute on a ghost, no mute on a possibly-real still person.
   presence_suspect_after_minutes: 10
 
-  # Bed-session latch owned by bedroom_lights (90s-debounced, multi-witness "in bed" signal,
-  # exits only 90s after FP300 presence clears). The raw bedroom group above is a zero-debounce
-  # OR that flickers off for 30-90s stretches while someone lies still, muting the room mid-use.
+  # Bed-session latch owned by bedroom_lights (own debounced, multi-witness "in bed" signal).
+  # The raw bedroom group above is a zero-debounce OR that flickers off for a few seconds to
+  # 30-90s while someone lies still, muting the room mid-use. bedroom_mute_grace_sec (below)
+  # covers the residual case where the group AND the session both read off for one tick.
   bed_session_entity: input_boolean.bedroom_bed_session
+  # Grace before actually muting the bedroom (only) - re-checks presence after this many
+  # seconds instead of muting on the first instant "absent" reading. Unmute is never delayed.
+  # 8s matches the worst multi-sensor coincidence blip observed 2026-08-31.
+  bedroom_mute_grace_sec: 8
 
   # Special conditions for room presence
   special_conditions:

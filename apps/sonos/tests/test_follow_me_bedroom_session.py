@@ -78,6 +78,15 @@ def make_app(states, special=None):
 
     app.get_state = get_state
     app.call_service = MagicMock()
+    app.bedroom_mute_grace_sec = 8
+    app._bedroom_mute_grace_timer = None
+    app.run_in = MagicMock(return_value="grace-timer-handle")
+    app.cancel_timer = MagicMock()
+    app.timer_running = MagicMock(return_value=True)
+    app._is_speaker_playing = lambda entity: app.states.get(entity, {}).get("state") == "playing"
+    app._is_room_excluded_from_follow_me = lambda room: False
+    app._get_current_coordinator = lambda: BEDROOM_SPEAKER
+    app._restore_volume_if_airplay = MagicMock()
     return app
 
 
@@ -136,6 +145,82 @@ class MuteActionsWithSession(unittest.TestCase):
         app.call_service.assert_called_once_with(
             "media_player/volume_mute",
             entity_id=BEDROOM_SPEAKER,
+            is_volume_muted=True,
+        )
+
+
+class BedroomMuteGrace(unittest.TestCase):
+    """_apply_follow_me_mute: bedroom's MUTE direction is graced BEDROOM_MUTE_GRACE_S before
+    actually applying, re-checking presence at fire time. Unmute always applies instantly."""
+
+    def _wire(self, app):
+        app._should_follow_me_be_active = lambda: True
+        return app
+
+    def test_mute_is_deferred_not_immediate(self):
+        app = self._wire(make_app(bedroom_states(group="off", session="off")))
+        app._apply_follow_me_mute(BEDROOM_SPEAKER, True, room="bedroom", master=BEDROOM_SPEAKER)
+        app.call_service.assert_not_called()
+        app.run_in.assert_called_once_with(
+            app._bedroom_mute_grace_fire,
+            app.bedroom_mute_grace_sec,
+            speaker_entity=BEDROOM_SPEAKER,
+            master=BEDROOM_SPEAKER,
+        )
+
+    def test_grace_fire_still_absent_mutes(self):
+        app = self._wire(make_app(bedroom_states(group="off", session="off")))
+        app._bedroom_mute_grace_fire({"speaker_entity": BEDROOM_SPEAKER, "master": BEDROOM_SPEAKER})
+        app.call_service.assert_called_once_with(
+            "media_player/volume_mute",
+            entity_id=BEDROOM_SPEAKER,
+            is_volume_muted=True,
+        )
+
+    def test_grace_fire_presence_returned_holds_unmuted(self):
+        # Presence recovered by the time the grace timer fires (e.g. group or session back on).
+        app = self._wire(make_app(bedroom_states(group="on", session="off")))
+        app._bedroom_mute_grace_fire({"speaker_entity": BEDROOM_SPEAKER, "master": BEDROOM_SPEAKER})
+        app.call_service.assert_not_called()
+
+    def test_unmute_is_never_deferred(self):
+        app = self._wire(make_app(bedroom_states(group="on", session="on")))
+        app.states[BEDROOM_SPEAKER]["attributes"]["is_volume_muted"] = True
+        app._apply_follow_me_mute(BEDROOM_SPEAKER, False, room="bedroom", master=BEDROOM_SPEAKER)
+        app.run_in.assert_not_called()
+        app.call_service.assert_called_once_with(
+            "media_player/volume_mute",
+            entity_id=BEDROOM_SPEAKER,
+            is_volume_muted=False,
+        )
+
+    def test_unmute_cancels_pending_mute_grace(self):
+        app = self._wire(make_app(bedroom_states(group="off", session="off")))
+        app._bedroom_mute_grace_timer = "pending-handle"
+        app.states[BEDROOM_SPEAKER]["attributes"]["is_volume_muted"] = True
+        app._apply_follow_me_mute(BEDROOM_SPEAKER, False, room="bedroom", master=BEDROOM_SPEAKER)
+        app.cancel_timer.assert_called_once_with("pending-handle")
+        self.assertIsNone(app._bedroom_mute_grace_timer)
+
+    def test_new_mute_request_replaces_pending_grace_timer(self):
+        app = self._wire(make_app(bedroom_states(group="off", session="off")))
+        app._bedroom_mute_grace_timer = "stale-handle"
+        app._apply_follow_me_mute(BEDROOM_SPEAKER, True, room="bedroom", master=BEDROOM_SPEAKER)
+        app.cancel_timer.assert_called_once_with("stale-handle")
+        app.run_in.assert_called_once()
+        self.assertEqual(app._bedroom_mute_grace_timer, "grace-timer-handle")
+
+    def test_other_room_mute_is_never_deferred(self):
+        app = self._wire(make_app(bedroom_states()))
+        app.states["media_player.bathroom"] = {
+            "state": "playing",
+            "attributes": {"group_members": [], "is_volume_muted": False},
+        }
+        app._apply_follow_me_mute("media_player.bathroom", True, room="bathroom", master="media_player.bathroom")
+        app.run_in.assert_not_called()
+        app.call_service.assert_called_once_with(
+            "media_player/volume_mute",
+            entity_id="media_player.bathroom",
             is_volume_muted=True,
         )
 
