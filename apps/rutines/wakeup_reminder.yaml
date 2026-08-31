@@ -13,8 +13,9 @@ WakeupReminder:
   # Person entity to check
   person_mikkel: "person.mikkel"
 
-  # Bedroom occupancy (FP300); old area_occupancy entity no longer exists in HA
-  bedroom_presence_entity: "binary_sensor.bedroom_presence_presence"
+  # Bedroom occupancy: RoomActive's unioned zone presence (apps/presence/room_active.py)
+  # instead of the raw FP300 sensor alone - old area_occupancy entity no longer exists in HA.
+  bedroom_presence_entity: "binary_sensor.bedroom_active"
 
   # Bedroom door sensor (must be closed for notification)
   # Door closed = "off", door open = "on"
