@@ -1,14 +1,14 @@
 """
-RoomActive (Wave 1, shadow-only) - publishes binary_sensor.<zone>_active per configured
-zone, unioning a small set of tiered "witness" entities (room mmWave, spot sensors, bed
-mats/strip, PIR/motion channels) into one occupancy signal per zone.
+RoomActive - publishes binary_sensor.<zone>_active per configured zone, unioning a small
+set of tiered "witness" entities (room mmWave, spot sensors, bed mats/strip, PIR/motion
+channels) into one occupancy signal per zone.
 
-This is the first of two Wave-1 pieces in the room-active presence-unification plan: this
-app publishes, room_active_read.py reads (with its own live-recompute fallback). Nothing in
-the existing codebase consumes binary_sensor.<zone>_active yet - zero repoints, purely
-additive - so this can run side by side with every existing composite (binary_sensor.
-<zone>_pir_presence groups/templates) and presence_model.py's binary_sensor.presence_<room>
-shadow for as long as needed before any consumer is repointed.
+This app publishes, room_active_read.py reads (with its own live-recompute fallback). Every
+lighting/sleep-mode/music/wake-routine consumer that previously read a raw composite
+(binary_sensor.<zone>_pir_presence) or presence_model.py's now-retired shadow
+(binary_sensor.presence_<room>) has been repointed here - see git history for the
+room-active-presence-unification migration. The nine *_pir_presence composites themselves
+are kept indefinitely as the reader helper's in-process fallback source.
 
 self.zones (dict[str, list[dict]], zone -> list of {"entity", "tier", "on_states"}) is the
 single source of truth for zone membership - room_active_read.py's fallback path introspects
