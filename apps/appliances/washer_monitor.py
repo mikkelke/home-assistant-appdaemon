@@ -595,6 +595,10 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.low_power_start_time = None  # Track when low power period started
         self.last_significant_power_at = None
         self.notification_sent = False
+        # Consecutive >=start_w samples seen by _unemptied_door_recheck while Unemptied. A lone
+        # sample isn't enough: Miele anti-crease nudges peak 10-55W (see washer.yaml), well above
+        # start_w=18, so a single high reading is a nudge, not the machine actually resuming.
+        self._unemptied_recheck_high_counter = 0
 
         # Programme classification (for adaptive finish detection)
         self.max_power_seen = 0.0         # Peak wattage observed during the current cycle
@@ -2788,8 +2792,22 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             if pw not in (None, "unknown", "unavailable"):
                 watts = float(pw or 0)
                 if watts >= self.start_w:
-                    self._recover_from_false_unemptied(watts)
-                    return
+                    self._unemptied_recheck_high_counter += 1
+                    # Require sustained power across consecutive 60s rechecks (same bar as the
+                    # Running-side high_power_threshold) before concluding the machine actually
+                    # resumed - one nudge-sized reading alone is indistinguishable from anti-crease.
+                    if self._unemptied_recheck_high_counter >= self.high_power_threshold:
+                        self._unemptied_recheck_high_counter = 0
+                        self._recover_from_false_unemptied(watts)
+                        return
+                    self.log(
+                        f"Door recheck: power {watts:.1f}W >= start_w while Unemptied "
+                        f"({self._unemptied_recheck_high_counter}/{self.high_power_threshold}) - "
+                        f"could be an anti-crease nudge, not recovering yet",
+                        level="DEBUG",
+                    )
+                else:
+                    self._unemptied_recheck_high_counter = 0
         except (ValueError, TypeError):
             pass
         if self._door_is_physically_open():
@@ -3624,6 +3642,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             # Reset the door-history rate-limiter so the first recheck after entry (~60s) does
             # a recorder lookback for an ajar-door edge (FIX 4), not just a live-contact peek.
             self._unemptied_last_history_check_at = None
+            self._unemptied_recheck_high_counter = 0
             self.unemptied_door_recheck_timer = self.run_in(self._unemptied_door_recheck, 60)
 
             self.log(
