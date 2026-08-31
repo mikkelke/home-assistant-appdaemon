@@ -147,26 +147,30 @@ darkness_calculator:
   # in-bed latch): the raw group flickers off while someone lies still, flipping the label
   # to Empty mid-sleep. Label-only - bedroom_lights derives its own occupancy, no loop.
   presence_sensors:
+    # bedroom_bathroom is a combined grouping (not one of the 9 RoomActive zones) -
+    # left on the raw PIR composites, not migrated.
     bedroom_bathroom:
       - binary_sensor.bedroom_pir_presence
       - binary_sensor.bathroom_pir_presence
       - input_boolean.bedroom_bed_session
-    bathroom: binary_sensor.bathroom_pir_presence
-    bedroom:
-      - binary_sensor.bedroom_pir_presence
-      - input_boolean.bedroom_bed_session
+    bathroom: binary_sensor.bathroom_active
+    # binary_sensor.bedroom_active already ORs in the bed-session tier server-side,
+    # so the separate bedroom_bed_session entry is no longer needed here.
+    bedroom: binary_sensor.bedroom_active
+    # family_room is a combined grouping (not one of the 9 RoomActive zones) - left
+    # on the raw PIR composites, not migrated.
     family_room:
       - binary_sensor.kitchen_pir_presence
       - binary_sensor.living_room_pir_presence
       - binary_sensor.dining_room_pir_presence
       - binary_sensor.hallway_pir_presence   # hallway is an area of the same big room
-    guest_bathroom: binary_sensor.guest_bathroom_pir_presence
-    kitchen: binary_sensor.kitchen_pir_presence
-    living_room: binary_sensor.living_room_pir_presence
-    dining_room: binary_sensor.dining_room_pir_presence
-    claudias_room: binary_sensor.claudias_room_pir_presence
-    hallway: binary_sensor.hallway_pir_presence
-    kristines_room: binary_sensor.kristines_room_pir_presence   # template: room mmWave OR desk sensor OR motion large/small
+    guest_bathroom: binary_sensor.guest_bathroom_active
+    kitchen: binary_sensor.kitchen_active
+    living_room: binary_sensor.living_room_active
+    dining_room: binary_sensor.dining_room_active
+    claudias_room: binary_sensor.claudias_room_active
+    hallway: binary_sensor.hallway_active
+    kristines_room: binary_sensor.kristines_room_active   # template: room mmWave OR desk sensor OR motion large/small
 
   # input_text helpers (e.g. HA Kit): same label as sensor.room_state_<name>.
   room_state_helpers:

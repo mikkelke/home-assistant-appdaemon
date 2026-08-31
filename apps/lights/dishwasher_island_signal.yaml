@@ -12,7 +12,7 @@ DishwasherIslandSignal:
   log: dishwasher_island_signal_log
 
   dishwasher_state_entity: "sensor.dishwasher_state"
-  kitchen_pir_entity: "binary_sensor.kitchen_pir_presence"
+  kitchen_pir_entity: "binary_sensor.kitchen_active"
   room_state_text_entity: "sensor.room_state_family_room"
   darkness_confirmed_sensor_entity: "sensor.darkness_family_room"
 

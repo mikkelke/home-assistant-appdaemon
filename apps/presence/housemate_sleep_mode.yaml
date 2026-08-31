@@ -33,13 +33,13 @@ HousemateSleepMode:
     - name: kristine
       person_entity: person.kristine
       battery_entity: sensor.kristine_iphone_2_battery_state
-      pir_entity: binary_sensor.kristines_room_pir_presence
+      pir_entity: binary_sensor.kristines_room_active
       sleep_entity: input_boolean.kristine_sleep_mode
       helper_name: "Kristine sleep mode"
       leave_grace_minutes: 10
     - name: claudia
       person_entity: person.claudia
       battery_entity: sensor.claudias_iphone_battery_state
-      pir_entity: binary_sensor.claudias_room_pir_presence
+      pir_entity: binary_sensor.claudias_room_active
       sleep_entity: input_boolean.claudia_sleep_mode
       helper_name: "Claudia sleep mode"

@@ -19,7 +19,7 @@ bathroom_lights:
   bath_spot_light: "light.bathroom_bath_light"      
 
   # --- Presence Sensors ---
-  raw_pir_sensor: "binary_sensor.bathroom_pir_presence"
+  raw_pir_sensor: "binary_sensor.bathroom_active"
 
   # Door between bathroom and bedroom — opening triggers bathroom lights (entering from bedroom)
   bathroom_door_sensor: "binary_sensor.bathroom_door_contact"

@@ -8,10 +8,10 @@ FamilyRoomLights:
 
   # PIR/presence sensors by room
   raw_pir_sensors:
-    kitchen:       "binary_sensor.kitchen_pir_presence"
-    dining_room:   "binary_sensor.dining_room_pir_presence"
-    hallway:       "binary_sensor.hallway_pir_presence"
-    living_room:   "binary_sensor.living_room_pir_presence"
+    kitchen:       "binary_sensor.kitchen_active"
+    dining_room:   "binary_sensor.dining_room_active"
+    hallway:       "binary_sensor.hallway_active"
+    living_room:   "binary_sensor.living_room_active"
 
   # Which raw_pir_sensors are OR’d for “family zone” presence (same binaries as the dashboard — no extra delay in the app).
   # Add or remove keys (e.g. hallway) to match how you want the zone defined; tune hold/decay only in HA/sensors.
@@ -22,6 +22,9 @@ FamilyRoomLights:
     - hallway        # same big open room — walking in lights the family zone (sleep modes still degrade to island-only + hallway light stays suppressed while Mikkel sleeps)
 
   raw_adjacent_pir_sensors:
+    # Deliberately NOT migrated to binary_sensor.bedroom_active: that entity is
+    # stickier than the raw PIR composite (it includes the bed tier), so migrating
+    # it would make the hallway read "bedroom active" all night while someone sleeps.
     bedroom:            "binary_sensor.bedroom_pir_presence"
     kristines_room:     "binary_sensor.kristines_room_pir_presence"
     claudias_room:             "binary_sensor.claudias_room_pir_presence"

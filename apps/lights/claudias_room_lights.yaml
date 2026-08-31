@@ -18,6 +18,6 @@ claudias_room_lights:
   # Safety-off: turn the room's lights off if this person leaves the apartment,
   # but only when the room is empty (skip if the PIR still reads occupied)
   presence_entity:     "person.claudia"
-  pir_sensor:          "binary_sensor.claudias_room_pir_presence"
+  pir_sensor:          "binary_sensor.claudias_room_active"
 
   verbosity_level: "normal"  # "quiet", "normal", "debug"
