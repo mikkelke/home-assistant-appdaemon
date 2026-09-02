@@ -681,6 +681,12 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # in _slide_start_for_delayed_start), same as duration.
         self.price_entity = self.args.get("price_entity", "sensor.energi_data_service")
         self.price_fallback_kr = float(self.args.get("price_fallback_kr", 1.7))
+        # Sanity ceiling for a single price_entity reading (kr/kWh). Real Danish retail prices,
+        # even at worst-case ToU peak plus a spot spike, don't get near this - it exists purely to
+        # catch a glitched upstream reading (e.g. 2026-09-02: sensor.energi_data_service briefly
+        # published 109.57 for one 15-min refresh, ~83x the real 1.32, which got metered straight
+        # into session_cost_kr with no defense). A rejected reading falls back to price_fallback_kr.
+        self.price_sanity_ceiling_kr = float(self.args.get("price_sanity_ceiling_kr", 15.0))
         self.track_cycle_cost = bool(self.args.get("track_cycle_cost", True))
 
         # Presence-gated confirm push: when a cycle ends unconfirmed but worth learning, ask
@@ -6670,6 +6676,13 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                         cost_delta_kwh = 0.0  # meter reset - never subtract
                     try:
                         price_now = float(self.get_state(self.price_entity))
+                        if price_now <= 0 or price_now > self.price_sanity_ceiling_kr:
+                            self.log(
+                                f"Rejected implausible {self.price_entity} reading {price_now:.2f} kr/kWh "
+                                f"(ceiling {self.price_sanity_ceiling_kr:.2f}) - using fallback {self.price_fallback_kr:.2f}",
+                                level="WARNING",
+                            )
+                            price_now = self.price_fallback_kr
                     except (TypeError, ValueError):
                         price_now = self.price_fallback_kr
                     self._session_cost_kr += cost_delta_kwh * price_now
