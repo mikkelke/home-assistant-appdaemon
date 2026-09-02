@@ -5964,11 +5964,20 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             effective_dur = self._get_programme_duration(eta_prog, eta_temp, use_learned=False)
             if not effective_dur:
                 return
+            # Sync the classifier's own state too, not just the published attrs -- other call
+            # sites (e.g. _get_programme_duration_hint_for_history, line ~3057) read
+            # self.detected_programme directly and would otherwise keep using the stale
+            # auto-detected (or "unknown") value even though the user just confirmed one.
+            self.detected_programme = eta_prog
+            self.detected_temperature = eta_temp
             elapsed_min = (self._now_utc() - self.start_time).total_seconds() / 60
             remaining = max(0, round(effective_dur - elapsed_min))
             est_end = self.start_time + timedelta(minutes=effective_dur)
             full = self.get_state(self.state_entity, attribute="all") or {}
             attrs = dict((full.get("attributes") or {}))
+            attrs["detected_programme"] = eta_prog
+            attrs["detected_temperature"] = eta_temp or ""
+            attrs["programme_label"] = label
             attrs["programme_duration_min"] = effective_dur
             attrs["estimated_remaining_min"] = remaining
             attrs["estimated_end_time"] = est_end.astimezone(self._local_tz()).strftime("%H:%M")
