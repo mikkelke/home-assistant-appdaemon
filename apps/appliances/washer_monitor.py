@@ -189,6 +189,16 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         utc = dt.astimezone(timezone.utc)
         return utc.isoformat(timespec="seconds").replace("+00:00", "Z")
 
+    def _falsy_drop_safe(self, value):
+        """AppDaemon 4.5.13 silently drops any set_state attribute whose value == False
+        (covers int/float 0 too, since 0 == False in Python) before the /api/states POST
+        body is built -- see appdaemon-deploy memory / smart_cooling.py's _publish(). A
+        genuinely-zero estimated_remaining_min (cycle at/past expected end) was vanishing
+        from sensor.washer_state entirely instead of showing "0 min left". Only exactly 0
+        needs the workaround: None must pass through unchanged (it means "blank the ETA",
+        e.g. during a suspected delayed start, and is a deliberate different case)."""
+        return "0" if value == 0 else value
+
     def _strftime_local(self, dt, fmt="%H:%M"):
         """Format a datetime in local time for logs / speaking in your timezone."""
         if dt is None:
@@ -3362,7 +3372,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             "started_at_display": self.start_time.astimezone(self._local_tz()).strftime("%H:%M"),
             "elapsed_minutes": round(elapsed, 1),
             "progress_pct": min(100, max(0, round(100 * elapsed / guard_dur))) if guard_dur else 0,
-            "estimated_remaining_min": remaining,
+            "estimated_remaining_min": self._falsy_drop_safe(remaining),
             "estimated_end_time": est_end.astimezone(self._local_tz()).strftime("%H:%M"),
             "programme_duration_min": guard_dur,
             "programme_confirmed_by_user": self.programme_confirmed_by_user,
@@ -4374,7 +4384,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             "started_at_display": self.start_time.astimezone(self._local_tz()).strftime("%H:%M"),
             "elapsed_minutes": 0,
             "progress_pct": 0,
-            "estimated_remaining_min": profile["duration_min"],
+            "estimated_remaining_min": self._falsy_drop_safe(profile["duration_min"]),
             "estimated_end_time": (self.start_time + timedelta(minutes=profile["duration_min"])).astimezone(self._local_tz()).strftime("%H:%M"),
             "programme_duration_min": profile["duration_min"],
             "delayed_start_trimmed": bool(self._delayed_start_trimmed),
@@ -5985,7 +5995,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             attrs["detected_temperature"] = eta_temp or ""
             attrs["programme_label"] = label
             attrs["programme_duration_min"] = effective_dur
-            attrs["estimated_remaining_min"] = remaining
+            attrs["estimated_remaining_min"] = self._falsy_drop_safe(remaining)
             attrs["estimated_end_time"] = est_end.astimezone(self._local_tz()).strftime("%H:%M")
             attrs["elapsed_minutes"] = round(elapsed_min, 1)
             attrs["progress_pct"] = min(100, max(0, round(100 * elapsed_min / effective_dur))) if effective_dur else 0
@@ -6534,7 +6544,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             elapsed_min = (self._now_utc() - self.start_time).total_seconds() / 60
             remaining = max(0, round(effective_dur - elapsed_min))
             est_end = self.start_time + timedelta(minutes=effective_dur)
-            attrs["estimated_remaining_min"] = remaining
+            attrs["estimated_remaining_min"] = self._falsy_drop_safe(remaining)
             attrs["estimated_end_time"] = est_end.astimezone(self._local_tz()).strftime("%H:%M")
             attrs["elapsed_minutes"] = round(elapsed_min, 1)
             attrs["progress_pct"] = min(100, max(0, round(100 * elapsed_min / effective_dur))) if effective_dur else 0
