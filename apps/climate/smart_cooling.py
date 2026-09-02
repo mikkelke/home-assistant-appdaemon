@@ -126,6 +126,10 @@ class SmartCooling(hass.Hass):
         self.outdoor_sensor = a("outdoor_temp_sensor", "sensor.gw2000a_outdoor_temperature")    # condenser hazard reference (see bathroom_delta_max)
         self.vent_window = a("vent_window_sensor", "binary_sensor.bathroom_window_contact")
         self.price_entity = a("price_entity", "sensor.energi_data_service")
+        # Sanity ceiling for a single price_entity reading (kr/kWh) -- see _num_price. Same
+        # protection added to washer_monitor.py 2026-09-02 after sensor.energi_data_service
+        # briefly published 109.57 (an ~83x glitch) for one 15-min refresh.
+        self.price_sanity_ceiling_kr = float(a("price_sanity_ceiling_kr", 15.0))
         self.enable_entity = a("enable_entity", "input_boolean.smart_cooling")
         # --- the only user knobs: Arm (above) + AC removed; max temperature is an optional default ---
         # Click right before physically removing the AC - the true lights-out moment, whatever
@@ -604,6 +608,21 @@ class SmartCooling(hass.Hass):
             return float(await self.get_state(entity))
         except (TypeError, ValueError):
             return default
+
+    async def _num_price(self, entity, default):
+        """Like _num, but rejects an implausible kr/kWh reading (<=0 or above
+        price_sanity_ceiling_kr) and falls back instead -- guards live price_now reads
+        against a glitched upstream sensor.energi_data_service value (see price_sanity_ceiling_kr)."""
+        ceiling = getattr(self, "price_sanity_ceiling_kr", 15.0)
+        value = await self._num(entity, default)
+        if value is not None and (value <= 0 or value > ceiling):
+            self.log(
+                f"Rejected implausible {entity} reading {value:.2f} kr/kWh "
+                f"(ceiling {ceiling:.2f}) - using fallback {default!r}",
+                level="WARNING",
+            )
+            return default
+        return value
 
     async def _state(self, entity):
         try:
@@ -1830,7 +1849,7 @@ class SmartCooling(hass.Hass):
                 await self._attr(self.price_entity, "raw_today", []),
                 await self._attr(self.price_entity, "raw_tomorrow", []),
             )
-            price_now = self._price_for(pm, now, await self._num(self.price_entity, 1.7))
+            price_now = self._price_for(pm, now, await self._num_price(self.price_entity, 1.7))
             ceiling, _ = await self._effective_ceiling(now)
             # Bedroom-zone reality anchor (the A/C is bedroom-only and the bedroom is its own
             # thermal zone -- user 2026-07-22). The sealed room can't drift materially warmer
@@ -2106,7 +2125,7 @@ class SmartCooling(hass.Hass):
         # price sensor's own STATE (current kr/kWh) -- a plain, cheap read, independent of the
         # armed path's price-map/fallback logic further below (which stays byte-identical).
         energy_counter = await self._num(self.ac_energy_entity, None)
-        price_now_cheap = await self._num(self.price_entity, None)
+        price_now_cheap = await self._num_price(self.price_entity, None)
         self._track_session_cost(deployed, price_now_cheap, energy_counter)
         e_legacy = self._equilibrium(kitchen, mid, floor)
         e_active, wm_dbg = await self._weather_equilibrium(now, kitchen, mid, floor, e_legacy)
@@ -2187,7 +2206,7 @@ class SmartCooling(hass.Hass):
             await self._attr(self.price_entity, "raw_today", []),
             await self._attr(self.price_entity, "raw_tomorrow", []),
         )
-        price_now = self._price_for(pm, now, await self._num(self.price_entity, 1.7))
+        price_now = self._price_for(pm, now, await self._num_price(self.price_entity, 1.7))
         price_at = lambda dt: self._price_for(pm, dt, price_now)
         window_open = self._window_open(await self._state(self.vent_window))
 
