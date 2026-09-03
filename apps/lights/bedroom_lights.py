@@ -338,8 +338,15 @@ class BedroomLights(hass.Hass):
                 self._cancel_session_exit()
                 self._evaluate_lights("PRESENCE_ON")
             elif new == "off":
-                if self._session and not self._is_sleep_mode_active():
-                    self._arm_session_exit()
+                if self._session:
+                    if not self._is_sleep_mode_active():
+                        self._arm_session_exit()
+                else:
+                    # No bed session to exit (e.g. ceiling-only, sessionless occupancy) -
+                    # the vacancy check only runs on specific triggers, so without this the
+                    # room can go fully empty and the ceiling just stays lit forever
+                    # (user-reported 2026-09-03: light stayed on ~1h after leaving).
+                    self._evaluate_lights("PRESENCE_OFF")
             # any other value (unavailable/unknown): no-op (hold)
         except Exception as e:
             self.log(f"Error in bedroom presence session handler: {e}", level="ERROR")
