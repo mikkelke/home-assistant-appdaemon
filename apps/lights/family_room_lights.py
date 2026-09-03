@@ -228,13 +228,28 @@ class FamilyRoomLights(hass.Hass):
             
             # Illuminance: still read for minor hysteresis and freshness only
             self.illuminance_hysteresis = float(self.args.get("illuminance_hysteresis", 50))
-            
+
             # Check current states instead of blindly turning off lights
             # Removed verbose initialization message for streamlined logging
             self.run_in(self._check_lights, self.initial_check_delay)  # Run light check after delay to allow all states to load
-            
-            # No periodic check needed - we have state listeners on all sensors (presence, doors, illuminance, etc.)
-            # State changes will trigger evaluations via _schedule_evaluation()
+
+            # Boot catch-up (2026-09-03): after an HA/AppDaemon restart, zigbee2mqtt entities
+            # keep trickling from unavailable to their real value for 20-30s past the single
+            # initial_check_delay check above (observed live: FamilyRoomLights initialized at
+            # T+0, one check at T+5s, but presence/light state churn continued to T+34s). A
+            # per-sensor listen_state edge landing mid-trickle can settle on a stale read for
+            # another zone with no follow-up - this app deliberately has no steady-state
+            # periodic recheck (see note below), so a boot-only bounded catch-up closes that
+            # window without polling forever. Reuses check_interval as the spacing.
+            self._boot_recheck_remaining = 2
+            self.run_in(
+                self._boot_catchup_check,
+                self.initial_check_delay + self.check_interval,
+            )
+
+            # No steady-state periodic check needed beyond the boot catch-up above - we have
+            # state listeners on all sensors (presence, doors, illuminance, etc.). State
+            # changes will trigger evaluations via _schedule_evaluation()
             # This eliminates unnecessary CPU usage when room is empty and nothing is changing
             
             if self.raw_pir_sensors:
@@ -970,6 +985,16 @@ class FamilyRoomLights(hass.Hass):
             self.log(f"Error checking family room presence: {e} - defaulting to 'no presence'", level="ERROR")
             return False
     
+    def _boot_catchup_check(self, kwargs):
+        """Bounded post-restart re-evaluation - see the boot catch-up note in initialize()."""
+        try:
+            self._schedule_evaluation(immediate=True)
+        except Exception as e:
+            self.log(f"Boot catch-up check failed: {e}", level="ERROR")
+        if self._boot_recheck_remaining > 0:
+            self._boot_recheck_remaining -= 1
+            self.run_in(self._boot_catchup_check, self.check_interval)
+
     def _schedule_evaluation(self, immediate=False):
         """
         Schedule a debounced evaluation. Supersedes any previous pending evaluation via _eval_token
