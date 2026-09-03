@@ -56,6 +56,11 @@ class SonosGroupManager(hass.Hass):
         self._family_zone_sync_in_progress = False
         self._family_zone_sync_start_time = None  # Track when sync started for stuck detection
         self._family_zone_sync_timeout_s = 15  # Auto-reset if stuck longer than this
+        # A trigger that arrives while a sync is already running is otherwise dropped
+        # silently - if it's a real "state settled, group now formable" signal (e.g. the
+        # 2nd of two playing-transitions from a Spotify handoff blip within ~3s of each
+        # other), remember it and re-run once the in-flight sync's flag clears.
+        self._family_zone_recheck_pending = False
         
         # Operation queue for serializing group operations
         self._group_operation_queue = []  # Queue of pending group operations
@@ -515,12 +520,14 @@ class SonosGroupManager(hass.Hass):
                             "Cleared a stuck sync guard to resume grouping",
                         )
                     else:
-                        self.log(f"Family Zone sync already in progress for {elapsed:.1f}s, skipping", level="DEBUG")
+                        self.log(f"Family Zone sync already in progress for {elapsed:.1f}s, queueing recheck", level="DEBUG")
+                        self._family_zone_recheck_pending = True
                         return
                 except Exception:
                     pass
             else:
-                self.log("Family Zone sync in progress, skipping", level="DEBUG")
+                self.log("Family Zone sync in progress, queueing recheck", level="DEBUG")
+                self._family_zone_recheck_pending = True
                 return
 
         if not self.family_zone_speakers:
@@ -592,6 +599,9 @@ class SonosGroupManager(hass.Hass):
         """Reset the family zone sync flag after operations complete"""
         self._family_zone_sync_in_progress = False
         self._family_zone_sync_start_time = None
+        if self._family_zone_recheck_pending:
+            self._family_zone_recheck_pending = False
+            self.run_in(self._check_family_zone_synchronization, 0)
 
     def _report_stuck_guard_reset(self, guard, cause, effect):
         """One admin feed line when a stuck guard flag had to be force-cleared. The

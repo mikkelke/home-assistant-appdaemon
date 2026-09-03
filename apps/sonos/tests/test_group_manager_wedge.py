@@ -53,6 +53,7 @@ def make_app():
     app._group_changes = []
     app._family_zone_sync_in_progress = False
     app._family_zone_sync_start_time = None
+    app._family_zone_recheck_pending = False
 
     app.log_calls = []      # (level, message)
     app.scheduled = []      # (callback, delay, kwargs, handle)
@@ -169,6 +170,36 @@ class NormalCompletionCancelsWedgeTimer(unittest.TestCase):
         self.assertIn(handle, app.canceled_timers)
         self.assertIsNone(app._reset_wedge_timer)
         self.assertFalse(app._reset_in_progress)
+
+
+class FamilyZoneSyncGuardQueuesRecheck(unittest.TestCase):
+    """A Spotify handoff can bounce a speaker through idle->playing->paused->playing
+    within a couple seconds. The second playing transition retriggers
+    _check_family_zone_synchronization while the first invocation's in-progress guard
+    is still held (it clears 3s after each run) - that retrigger must not be dropped,
+    or a real "go group now" signal is silently lost and speakers never join."""
+
+    def test_reset_flag_reruns_sync_when_recheck_was_queued(self):
+        app = make_app()
+        app._family_zone_sync_in_progress = True
+        app._family_zone_recheck_pending = True
+
+        app._reset_family_zone_sync_flag()
+
+        self.assertFalse(app._family_zone_sync_in_progress)
+        self.assertFalse(app._family_zone_recheck_pending)
+        rerun = [(cb, delay) for cb, delay, _kw, _h in app.scheduled if cb == app._check_family_zone_synchronization]
+        self.assertEqual(rerun, [(app._check_family_zone_synchronization, 0)])
+
+    def test_reset_flag_is_a_noop_when_no_recheck_was_queued(self):
+        app = make_app()
+        app._family_zone_sync_in_progress = True
+        app._family_zone_recheck_pending = False
+
+        app._reset_family_zone_sync_flag()
+
+        self.assertFalse(app._family_zone_sync_in_progress)
+        self.assertEqual(app.scheduled, [])
 
 
 if __name__ == "__main__":
