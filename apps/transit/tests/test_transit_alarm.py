@@ -144,5 +144,42 @@ class TestUnrescuedCancellationHelper(unittest.TestCase):
         self.assertEqual(len(ta.TransitAlarm._unrescued_cancellations(cands, 5)), 3)
 
 
+class TestRescueWindowResolution(unittest.TestCase):
+    """_rescue_window_for is the single source of truth: the evaluators use it AND it is published
+    on the sensor, so the dashboard cannot drift from this yaml."""
+
+    def test_high_frequency_defaults_to_five(self):
+        route = {"evaluation_mode": "high_frequency"}
+        self.assertEqual(ta.TransitAlarm._rescue_window_for(route), 5)
+
+    def test_explicit_yaml_value_wins(self):
+        route = {"evaluation_mode": "high_frequency", "rescue_window_min": 3}
+        self.assertEqual(ta.TransitAlarm._rescue_window_for(route), 3)
+
+    def test_passenger_impact_defaults_to_the_delay_threshold(self):
+        route = {"evaluation_mode": "passenger_impact", "delay_threshold_min": 10}
+        self.assertEqual(ta.TransitAlarm._rescue_window_for(route), 10)
+
+    def test_passenger_impact_explicit_window_beats_delay_threshold(self):
+        route = {"evaluation_mode": "passenger_impact", "delay_threshold_min": 10, "rescue_window_min": 5}
+        self.assertEqual(ta.TransitAlarm._rescue_window_for(route), 5)
+
+    def test_infrequent_strict_has_no_window(self):
+        """An hourly line has no alternative departure to be rescued by."""
+        route = {"evaluation_mode": "infrequent_strict", "delay_threshold_min": 10}
+        self.assertIsNone(ta.TransitAlarm._rescue_window_for(route))
+
+    def test_narrowing_the_window_in_yaml_changes_the_verdict(self):
+        """Proves the published value is the one that actually drives evaluation."""
+        app = ta.TransitAlarm.__new__(ta.TransitAlarm)
+        board = [dep(2), dep(4, cancelled=True), dep(7), dep(9, cancelled=True), dep(12)]
+
+        wide = dict(METRO_ROUTE, rescue_window_min=5)
+        self.assertEqual(app._evaluate(board, wide, 5, "Metro M3")["severity"], 0)
+
+        narrow = dict(METRO_ROUTE, rescue_window_min=2)
+        self.assertEqual(app._evaluate(board, narrow, 5, "Metro M3")["severity"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

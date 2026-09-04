@@ -718,6 +718,11 @@ class TransitAlarm(hass.Hass):
                     "departures":     res.get("departures", []),
                     "issues":         res.get("issues", []),
                     "lines":          lines_str,
+                    # Evaluation settings the frontend must agree with - it derives line status from
+                    # `departures` as the clock moves past this poll, so it needs OUR thresholds, not
+                    # a hardcoded guess. Absent (never 0) => frontend keeps its documented fallback.
+                    "rescue_window_min":  self._rescue_window_for(route),
+                    "delay_threshold_min": int(route.get("delay_threshold_min", 5)),
                     "last_checked":   now_str,
                     "data_as_of":     data_as_of_iso,  # ISO timestamp; UI should hide departures before current time
                 },
@@ -996,6 +1001,21 @@ class TransitAlarm(hass.Hass):
         }
 
     @staticmethod
+    def _rescue_window_for(route: dict) -> Optional[int]:
+        """Minutes within which a following departure absorbs a cancellation.
+
+        Single source of truth: the evaluators use it AND it is published on the route's sensor so
+        the dashboard applies the same window instead of a hardcoded copy that silently drifts when
+        this yaml changes.  None for infrequent_strict - on an hourly line there is no alternative
+        to be rescued by, so the concept does not apply.
+        """
+        mode = route.get("evaluation_mode")
+        if mode == "infrequent_strict":
+            return None
+        default = int(route.get("delay_threshold_min", 5)) if mode == "passenger_impact" else 5
+        return int(route.get("rescue_window_min", default))
+
+    @staticmethod
     def _unrescued_cancellations(candidates: list[dict], rescue_window: int) -> list[dict]:
         """Cancellations that actually cost the traveller waiting time: no viable (non-cancelled)
         departure follows within rescue_window minutes.  A train leaving BEFORE the cancelled one
@@ -1021,7 +1041,7 @@ class TransitAlarm(hass.Hass):
         keeps the dashboard's high-frequency rule (which applies the same window) in agreement."""
         issues: list[str] = []
         severity = 0
-        rescue_window = int(route.get("rescue_window_min", 5))
+        rescue_window = self._rescue_window_for(route)
 
         cancelled_count = sum(1 for n in future_only if n["cancelled"] and n["effective"])
         unrescued = self._unrescued_cancellations(future_only, rescue_window)
@@ -1076,7 +1096,7 @@ class TransitAlarm(hass.Hass):
     ) -> tuple[list[str], int]:
         issues: list[str] = []
         severity = 0
-        rescue_window = int(route.get("rescue_window_min", delay_thr))
+        rescue_window = self._rescue_window_for(route)
 
         if not future_only:
             return issues, severity
