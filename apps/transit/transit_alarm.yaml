@@ -75,6 +75,9 @@ TransitStatus:
       lines:
         - "M3"
       evaluation_mode: high_frequency
+      # 2-4 min headway: a cancellation the next train picks up this soon costs no
+      # real waiting time, so it must not count toward the >=2 "Disrupted" threshold.
+      rescue_window_min: 5
 
     # ── S-tog: Carlsberg → KBH H (Mikkel + Kristine) ─────────────────────
     - sensor_id: "carlsberg_stog_kbh"
@@ -151,6 +154,9 @@ TransitMikkel:
       lines:
         - "M3"
       evaluation_mode: high_frequency
+      # 2-4 min headway: a cancellation the next train picks up this soon costs no
+      # real waiting time, so it must not count toward the >=2 "Disrupted" threshold.
+      rescue_window_min: 5
 
     - sensor_id: "carlsberg_stog_kbh"
       transport_name: "S-tog -> KBH H"

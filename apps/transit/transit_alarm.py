@@ -995,22 +995,50 @@ class TransitAlarm(hass.Hass):
             "departures":       departures_out,
         }
 
-    def _evaluate_high_frequency(self, normalized: list, name: str, now: datetime) -> tuple[list[str], int]:
+    @staticmethod
+    def _unrescued_cancellations(candidates: list[dict], rescue_window: int) -> list[dict]:
+        """Cancellations that actually cost the traveller waiting time: no viable (non-cancelled)
+        departure follows within rescue_window minutes.  A train leaving BEFORE the cancelled one
+        does not rescue it - you cannot travel back in time to catch it."""
+        viable = [n["effective"] for n in candidates if not n["cancelled"] and n["effective"]]
+        window = timedelta(minutes=rescue_window)
+        unrescued: list[dict] = []
+        for n in candidates:
+            if not n["cancelled"] or not n["effective"]:
+                continue
+            t = n["effective"]
+            if any(v >= t and (v - t) < window for v in viable):
+                continue
+            unrescued.append(n)
+        return unrescued
+
+    def _evaluate_high_frequency(
+        self, future_only: list, route: dict, name: str
+    ) -> tuple[list[str], int]:
+        """M3-style headways (a train every 2-4 min): a cancellation that the next departure
+        absorbs within rescue_window_min costs almost no waiting time, so only UNRESCUED
+        cancellations count toward the >=2 threshold.  Mirrors _evaluate_passenger_impact, and
+        keeps the dashboard's high-frequency rule (which applies the same window) in agreement."""
         issues: list[str] = []
         severity = 0
-        cancellations: list[str] = []
-        for n in normalized:
-            if not n["effective"]:
-                continue
-            if n["cancelled"]:
+        rescue_window = int(route.get("rescue_window_min", 5))
+
+        cancelled_count = sum(1 for n in future_only if n["cancelled"] and n["effective"])
+        unrescued = self._unrescued_cancellations(future_only, rescue_window)
+
+        if len(unrescued) >= 2:
+            for n in unrescued:
                 if n["line"]:
-                    msg = f"{name}: ({n['line']}) departure at {n['time_label']} is cancelled"
+                    issues.append(f"{name}: ({n['line']}) departure at {n['time_label']} is cancelled")
                 else:
-                    msg = f"{name}: departure at {n['time_label']} is cancelled"
-                cancellations.append(msg)
-        if len(cancellations) >= 2:
-            issues.extend(cancellations)
+                    issues.append(f"{name}: departure at {n['time_label']} is cancelled")
             severity = max(severity, 3)
+        elif cancelled_count:
+            rescued = cancelled_count - len(unrescued)
+            if rescued:
+                issues.append(
+                    f"{name}: {rescued} cancellation(s) absorbed by following departures"
+                )
         return issues, severity
 
     def _evaluate_infrequent_strict(
@@ -1105,7 +1133,7 @@ class TransitAlarm(hass.Hass):
 
         mode = route["evaluation_mode"]
         if mode == "high_frequency":
-            issues, severity = self._evaluate_high_frequency(normalized, name, now)
+            issues, severity = self._evaluate_high_frequency(future_only, route, name)
             max_deps = 6
         elif mode == "passenger_impact":
             issues, severity = self._evaluate_passenger_impact(future_only, route, delay_thr, name)
