@@ -106,6 +106,8 @@ def _bare_bridge(tmpdir, clock):
     app.announce_cooldown_s = 90
     app.voice_tts_entity = "tts.piper"
     app.voice_start_delay_s = 9.0
+    app.voice_retry_interval_s = 1.0
+    app.voice_retry_attempts = 10
     app.announce_ring_window_s = 60
     app.clip_cameras = {"front door": "camera.abb_front"}
     app.clip_seconds = 10
@@ -1646,6 +1648,24 @@ class NativeRingClipTests(unittest.TestCase):
             "first attempt must wait for the ring call to end",
         )
 
+    def test_native_voice_retry_delay_uses_configured_interval(self):
+        """The gap between attempts must come from voice_retry_interval_s,
+        not a hardcoded 2 s - a small slip in the redial hold used to cost a
+        whole 2 s slot, which is exactly what a configurable, tighter cadence
+        is meant to fix."""
+        self.app.voice_retry_interval_s = 0.4
+        self.app.voice_retry_attempts = 3
+
+        def boom(service, **kwargs):
+            raise RuntimeError("still no talkback")
+        self.app.call_service = boom
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.app._maybe_announce("front door")
+        _run_scheduled(self.app, "_native_voice_retry")  # attempt 1 fails
+        delays = [delay for cb, delay, _kw in self.app.run_in_calls
+                  if cb.__name__ == "_native_voice_retry"]
+        self.assertEqual(delays, [0.4])
+
     def test_native_voice_never_dials_announce(self):
         self.app._open_episode("front door", "100000002", self.clock.now())
         self.app._maybe_announce("front door")
@@ -1737,7 +1757,7 @@ class NativeRingClipTests(unittest.TestCase):
         _run_scheduled(self.app, "_native_voice_retry")
         self.assertEqual(calls["n"], 3)
 
-    def test_native_voice_gives_up_after_five_failures(self):
+    def test_native_voice_gives_up_after_all_configured_attempts_fail(self):
         episode = self.app._open_episode("front door", "100000002", self.clock.now())
 
         def boom(service, **kwargs):
@@ -1745,9 +1765,9 @@ class NativeRingClipTests(unittest.TestCase):
         self.app.call_service = boom
         self.app._maybe_announce("front door")
         attempts = 0
-        for _ in range(6):
+        for _ in range(self.app.voice_retry_attempts + 1):
             attempts += _run_scheduled(self.app, "_native_voice_retry")
-        self.assertEqual(attempts, 5)
+        self.assertEqual(attempts, self.app.voice_retry_attempts)
         self.assertFalse(episode["voice_spoken"])
 
     def test_no_open_ring_stays_silent(self):
@@ -1790,9 +1810,10 @@ class NativeRingClipTests(unittest.TestCase):
         self.app.call_service = boom
         self.app._maybe_announce("front door")  # unlock attempt 1 confirms
         self.app._maybe_announce("front door")  # unlock attempt 3 confirms, moments later
-        for _ in range(6):
+        for _ in range(self.app.voice_retry_attempts + 1):
             _run_scheduled(self.app, "_native_voice_retry")
-        self.assertEqual(calls["n"], 5)  # one chain's worth of dial attempts, not two
+        # one chain's worth of dial attempts, not two
+        self.assertEqual(calls["n"], self.app.voice_retry_attempts)
         self.assertFalse(episode["voice_spoken"])
 
     def test_two_unlock_confirms_speak_once_legacy_in_recording(self):

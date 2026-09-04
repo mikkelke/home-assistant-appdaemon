@@ -262,6 +262,13 @@ class AbbWelcomeBridge(hass.Hass):
         # ACCEPTED by the ring call, the chain stops on that silent "success",
         # and it never reaches the call that would have been audible.
         self.voice_start_delay_s = float(self.args.get("voice_start_delay_s", 9.0))
+        # Retry cadence for the chain below (2026-09-03, measured design review):
+        # the integration's redial makes the continuation call audible around
+        # ring+6.25 s, so a coarse retry spacing can cost a whole slot to a small
+        # timing slip in that hold. 1 s keeps the miss small; 10 attempts covers
+        # roughly the same ~10 s window the old 2 s x 5 attempts did.
+        self.voice_retry_interval_s = float(self.args.get("voice_retry_interval_s", 1.0))
+        self.voice_retry_attempts = int(self.args.get("voice_retry_attempts", 10))
         self.announce_ring_window_s = int(self.args.get("announce_ring_window_s", 60))
 
         # --- ring clip knobs (2026-08-13, "thumbnail and opening that give the video") ---
@@ -1474,9 +1481,10 @@ class AbbWelcomeBridge(hass.Hass):
                                     kwargs.get("camera"), kwargs.get("message"), attempt)
         except Exception as e:
             self.log(f"Native voice dispatch failed for {door} (attempt {attempt}): {e}", level="WARNING")
-        if attempt < 5:
+        if attempt < self.voice_retry_attempts:
             try:
-                self.run_in(self._native_voice_retry, 2, episode_id=episode["id"], door=door,
+                self.run_in(self._native_voice_retry, self.voice_retry_interval_s,
+                            episode_id=episode["id"], door=door,
                             camera=kwargs.get("camera"), message=kwargs.get("message"), attempt=attempt + 1)
             except Exception as e:
                 self.log(f"Native voice retry scheduling failed for {door}: {e}", level="WARNING")
@@ -1498,7 +1506,7 @@ class AbbWelcomeBridge(hass.Hass):
             # _voice_into_recording checks the websocket result, so this is a
             # real signal rather than the unchecked claim that hid the
             # malformed-payload bug for five days.
-            self.log(f"VOICE-NATIVE door={door} attempt={attempt}/5 accepted", level="INFO")
+            self.log(f"VOICE-NATIVE door={door} attempt={attempt}/{self.voice_retry_attempts} accepted", level="INFO")
             # Publish that instant so intercom.py can open the door on the
             # sentence actually finishing instead of on a timer that only
             # guesses at it. run_in(0) hops back to the pinned app thread - this

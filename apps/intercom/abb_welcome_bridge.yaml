@@ -125,6 +125,10 @@ AbbWelcomeBridge:
   # ring the order is finally the one asked for: answer+record at +0.03 s,
   # sentence at +1.5 s (a short line runs ~1.5 s), unlock at +3.5 s.
   voice_start_delay_s: 1.5
+  # Retry spacing for the chain above: paces the wait for a Home Assistant-dialled call that can actually be heard at the door.
+  voice_retry_interval_s: 1.0
+  # Retry attempt ceiling for the chain above: paces the wait for a Home Assistant-dialled call that can actually be heard at the door.
+  voice_retry_attempts: 10
   announce_cooldown_s: 90
   announce_ring_window_s: 60
 

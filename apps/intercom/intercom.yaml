@@ -121,12 +121,16 @@ Intercom:
   # and the integration only returns from it once the last 20 ms frame has left
   # (media_pipeline _play_talkback_frames paces the queue, then drains it).
   # This value is only reached when that never happens: the station's talkback
-  # never became ready and all five attempts failed. A rejected, silent or hung
-  # announcement therefore still cannot leave the door shut.
-  # 8 s clears the worst observed sentence (it ended at ring+3.1 s on
-  # 2026-08-30, and would land ~+5 s if attempt 1 fails and attempt 2 carries
-  # it), and is still far under the 15-30 s a human answering would have taken.
+  # never became ready and every retry attempt failed. A rejected, silent or
+  # hung announcement therefore still cannot leave the door shut.
+  # 12 s derivation (2026-09-03): the station's own ring call cannot carry
+  # audio, so a companion integration change now hangs it up ~3 s in and
+  # redials before the sentence can be heard at all. glare hold 3.0 + redial
+  # settle 2.5 + call establish 0.45 + one refused redial 2.0 + sentence 1.35
+  # + margin 2.7 = 12.0 s. Nominal time-to-open therefore rises from ~3.4 s to
+  # ~8 s - the price of a sentence that can actually be heard - still far
+  # under the 15-30 s a human answering the intercom would have taken.
   # Replaced voice_before_unlock_wait_s (3.5 s), a fixed timer that happened to
   # land 0.8-1.7 s after the sentence - correct ordering by luck, not by rule.
-  voice_before_unlock_ceiling_s: 8.0
+  voice_before_unlock_ceiling_s: 12.0
 
