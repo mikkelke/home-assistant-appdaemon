@@ -125,10 +125,15 @@ AbbWelcomeBridge:
   # ring the order is finally the one asked for: answer+record at +0.03 s,
   # sentence at +1.5 s (a short line runs ~1.5 s), unlock at +3.5 s.
   voice_start_delay_s: 1.5
-  # Retry spacing for the chain above: paces the wait for a Home Assistant-dialled call that can actually be heard at the door.
-  voice_retry_interval_s: 1.0
-  # Retry attempt ceiling for the chain above: paces the wait for a Home Assistant-dialled call that can actually be heard at the door.
-  voice_retry_attempts: 10
+  # Retry cadence for the chain above. The sentence can only be heard on a call
+  # HA dialled, and that call exists only after the integration hangs up the
+  # station's own silent ring call and redials (~ring+2.3 s after the 09-07
+  # retune). Each poll before that is refused and costs nothing, so poll often:
+  # 0.5 s halves the average wait of a 1 s cadence (measured 09-07: the call
+  # came up at +7.8 s, the next 1 s poll caught it at +8.5 s). 20 x 0.5 s keeps
+  # the same 10 s window.
+  voice_retry_interval_s: 0.5
+  voice_retry_attempts: 20
   announce_cooldown_s: 90
   announce_ring_window_s: 60
 

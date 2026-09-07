@@ -1269,10 +1269,21 @@ class AbbWelcomeBridge(hass.Hass):
             # survived five days while every attempt logged "succeeded".
             if isinstance(result, dict) and result.get("success") is False:
                 err = result.get("error") or {}
+                message_text = str(err.get("message") or "")
+                # Two refusals are the NORMAL state of a ring while the chain
+                # waits for the integration to hang up the station's silent
+                # call and redial (2026-09-07): "does not render audio on a
+                # call it originated" and "Talkback is not ready". At a 0.5 s
+                # cadence that is ~10 lines per ring - expected, so INFO. Any
+                # other refusal is still a WARNING.
+                expected = (
+                    "call it originated" in message_text
+                    or "Talkback is not ready" in message_text
+                )
                 self.log(
                     f"VOICE-REJECTED door={door} camera={camera} "
-                    f"{err.get('code')}: {err.get('message')}",
-                    level="WARNING",
+                    f"{err.get('code')}: {message_text}",
+                    level="INFO" if expected else "WARNING",
                 )
                 return False
             self.log(f"VOICE-IN-RECORDING door={door} message={message!r}", level="INFO")
