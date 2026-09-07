@@ -132,6 +132,9 @@ def make_shadow(tmpdir, *, v2_state=None, v2_attrs=None, v2_last_changed=None, l
         "power_sensor": POWER, "energy_sensor": ENERGY, "door_sensor": DOOR,
         "live_state_entity": LIVE, "state_entity": V2,
         "state_file": state_file or str(Path(tmpdir) / "dryer_shadow_state.json"),
+        # Keep the cutover-evidence file in the tmpdir too: the app's default sits next to
+        # dryer_shadow.py, so an unset one would leak progress between tests AND into the repo.
+        "progress_file": str(Path(tmpdir) / "dryer_shadow_progress_state.json"),
         "programmes_file": str(Path(tmpdir) / "dryer_programmes_missing.yaml"),
         "start_w": 8, "stop_w": 5, "run_for": 5, "stop_for": 5,
         "min_cycle_minutes": 1, "min_energy_kwh": 0.01, "fill_window_minutes": 1,

@@ -4,7 +4,9 @@ dryer_shadow.py - AppDaemon app hosting the engine (appliance_fsm + dryer_policy
 wires AppDaemon I/O to the injected seams, tracks divergence against the live app, and publishes
 `sensor.dryer_state_v2`. It never writes `sensor.dryer_state`, the live cycle store, or any
 selector/announce entity - own listen_state on the same physical sensors, own store file
-(`dryer_shadow_state.json`), own log (`dryer_shadow_log`), zero contamination either direction.
+(`dryer_shadow_state.json`), own cutover-evidence file (`dryer_shadow_progress_state.json` - the
+cycle store is cleared on every Off, so the clean_cycles counter cannot live there), own log
+(`dryer_shadow_log`), zero contamination either direction.
 
 Structural notify-incapability (spec 7.2, two independent barriers):
   1. ShadowActions.announce/push_mobile are no-ops that only append to a local list and log -
@@ -22,6 +24,8 @@ sys.path; the except covers any context where that has not happened yet).
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 from pathlib import Path
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
@@ -148,6 +152,13 @@ class DryerShadow(hass.Hass):
         state_file = self.args.get("state_file") or Path(__file__).with_name("dryer_shadow_state.json")
         self._store = CycleStore(state_file, "dryer_shadow", log=self.log)
         self._code_fingerprint = self._compute_fingerprint()
+        # Cutover evidence lives on its OWN file: _save_store clears the cycle store on every Off,
+        # which is exactly the transition that increments clean_cycles, so the cycle store can
+        # never hold it. Name ends in _state.json so .gitignore keeps it untracked and deploy.sh
+        # (tracked files only) never ships or clobbers it.
+        self._progress_file = Path(
+            self.args.get("progress_file") or Path(__file__).with_name("dryer_shadow_progress_state.json")
+        )
 
         actions = ShadowActions(self.log)
         clock = SystemClock()
@@ -175,6 +186,22 @@ class DryerShadow(hass.Hass):
         except Exception as e:
             self.log(f"CycleStore load raised: {e} - ignoring store this boot", level="WARNING")
             store_data = None
+
+        progress = policy_mod.resolve_shadow_progress(
+            file_data=self._load_progress(), entity_attrs=entity_attrs,
+            code_fingerprint=self._code_fingerprint,
+        )
+        self._clean_cycles = progress["clean_cycles"]
+        self._divergence_count = progress["divergence_count"]
+        self._divergence_count_at_last_off = progress["divergence_count_at_last_off"]
+        if progress["reset_reason"]:
+            self.log(f"Cutover evidence starts at 0 - {progress['reset_reason']}", level="INFO")
+        else:
+            self.log(
+                f"Cutover evidence restored from {progress['source']}: {self._clean_cycles} clean cycle(s), "
+                f"{self._divergence_count} divergence(s)",
+                level="INFO",
+            )
 
         snap = policy_mod.resolve_boot_snapshot(
             entity_state=existing, entity_attrs=entity_attrs, entity_last_changed=entity_last_changed,
@@ -266,6 +293,7 @@ class DryerShadow(hass.Hass):
                 self._clean_cycles = 0
             self._divergence_count_at_last_off = self._divergence_count
         self._prev_internal = internal
+        self._save_progress()
 
         self._save_store(store_only=store_only)
         if store_only:
@@ -298,6 +326,37 @@ class DryerShadow(hass.Hass):
         else:
             self._store.save(payload)
 
+    def _load_progress(self):
+        """Read the persisted cutover evidence; None when absent or unreadable (never raises)."""
+        try:
+            with open(self._progress_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            self.log(f"Cutover evidence load failed: {e} - starting from 0", level="WARNING")
+            return None
+
+    def _save_progress(self):
+        """Write the cutover evidence atomically. Best-effort: a failure here must never break a
+        transition, so it warns and returns rather than propagating into the engine."""
+        payload = {
+            "clean_cycles": self._clean_cycles,
+            "divergence_count": self._divergence_count,
+            "divergence_count_at_last_off": self._divergence_count_at_last_off,
+            "code_fingerprint": self._code_fingerprint,
+        }
+        fsm = getattr(self, "fsm", None)
+        if fsm is not None:
+            payload["saved_at"] = format_utc(fsm.ctx.now())
+        tmp = self._progress_file.with_name(self._progress_file.name + ".tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(tmp, self._progress_file)
+        except Exception as e:
+            self.log(f"Cutover evidence save failed: {e}", level="WARNING")
+
     # ---- divergence detection (spec 7.4) ----
 
     def _check_divergence(self):
@@ -322,6 +381,7 @@ class DryerShadow(hass.Hass):
             self._divergence_count += 1
             self._clean_cycles = 0
             self._last_divergence = {"text": f"{v2} vs live {live}", "at": now, "kind": "state_mismatch"}
+            self._save_progress()
             self.log(
                 f"Divergence #{self._divergence_count}: v2={v2!r} vs live={live!r} "
                 f"(persisted >= {self.divergence_debounce_s:.0f}s)",

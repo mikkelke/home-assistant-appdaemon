@@ -1070,6 +1070,51 @@ class DryerPolicy:
 VALID_STATES = ("Running", "Unemptied", "Paused", "Emptied")
 
 
+def _coerce_counter(value):
+    """Non-negative int, or None when the stored value is missing/garbage."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_shadow_progress(*, file_data, entity_attrs, code_fingerprint):
+    """Restore the shadow's cutover evidence across an app reload (spec section 7.4's counter).
+
+    `clean_cycles` counts consecutive divergence-free cycles and is the gate for promoting the
+    engine over the live monitor. It used to live only in memory, so every AppDaemon reload reset
+    it: against ~0.8 dryer cycles a day and 37 re-inits in the retained logs, the gate could never
+    be reached (found 2026-09-07, counter sitting at 0 after weeks of clean running). Persisting
+    it is what makes the gate reachable; invalidating it on a code change is what keeps it
+    meaningful - clean cycles observed on other code say nothing about the code running now.
+
+    Precedence: the progress file (written on every landed transition) beats the v2 entity's own
+    attributes, which survive an AppDaemon reload but are wiped by an HA restart - they are the
+    fallback for the first boot after this change, when no file exists yet. A stored counter
+    without a fingerprint has unknowable provenance and is refused rather than trusted.
+    """
+    zero = {"clean_cycles": 0, "divergence_count": 0, "divergence_count_at_last_off": 0}
+    for source, data in (("file", file_data), ("entity", entity_attrs)):
+        if not isinstance(data, dict):
+            continue
+        clean = _coerce_counter(data.get("clean_cycles"))
+        if clean is None:
+            continue
+        stored_fingerprint = data.get("code_fingerprint")
+        if not stored_fingerprint:
+            return {**zero, "source": source, "reset_reason": "stored progress carries no fingerprint"}
+        if code_fingerprint and stored_fingerprint != code_fingerprint:
+            return {**zero, "source": source, "reset_reason": "engine code changed since it was recorded"}
+        return {
+            "clean_cycles": clean,
+            "divergence_count": _coerce_counter(data.get("divergence_count")) or 0,
+            "divergence_count_at_last_off": _coerce_counter(data.get("divergence_count_at_last_off")) or 0,
+            "source": source,
+            "reset_reason": None,
+        }
+    return {**zero, "source": None, "reset_reason": "no stored progress"}
+
+
 def resolve_boot_snapshot(*, entity_state, entity_attrs, entity_last_changed, store_data, helper_state,
                            now, cfg):
     """dryer_monitor.py:292-428's precedence (entity -> store -> helper -> Off), minus the
