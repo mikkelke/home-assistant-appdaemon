@@ -108,6 +108,7 @@ def _bare_bridge(tmpdir, clock):
     app.voice_start_delay_s = 9.0
     app.voice_retry_interval_s = 1.0
     app.voice_retry_attempts = 10
+    app.voice_unlock_lead_s = 0.3
     app.announce_ring_window_s = 60
     app.clip_cameras = {"front door": "camera.abb_front"}
     app.clip_seconds = 10
@@ -115,6 +116,10 @@ def _bare_bridge(tmpdir, clock):
     app.native_ring_clips = False
     app.clip_record_dir = "/config/www/abb_doorbell"
     app.station_by_door = {"back door": "100000001", "front door": "100000002"}
+    app._camera_doors = {}
+    for _door_camera_map in (app.clip_cameras, app.announce_cameras):
+        for _door, _camera in _door_camera_map.items():
+            app._camera_doors[_camera] = _door
     app.health_sip_entity = "sensor.abb_sip"
     app.health_unhealthy_s = 600
     app.health_heal_cooldown_s = 3600
@@ -204,6 +209,23 @@ def _missed_attrs(event_id=MISSED_ID, timestamp=MISSED_TS):
             "station_id": "", "station": ""}
 
 
+def _yaml_scalar_line(text, key):
+    """Best-effort, PyYAML-free extraction of a top-level `key: <value>` line's
+    value - this suite's uvx pytest sandbox has no PyYAML installed. Returns
+    None when the key is missing or nothing follows the colon on its own
+    line, which is the exact shape of a DICT-valued key (children indented on
+    later lines) rather than a scalar. That distinction is the whole point:
+    AppDaemon 4.5.x's deploy-time deep_compare does data[k] and raises
+    KeyError the moment a yaml gains a new dict-valued key (scripts/deploy.sh),
+    so a new knob here has to stay a plain scalar."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(f"{key}:"):
+            value = stripped[len(key) + 1:].split("#", 1)[0].strip()
+            return value or None
+    return None
+
+
 class PureHelperTests(unittest.TestCase):
     def test_classify_unlock_beats_missed(self):
         # The 14:24 reality: door opened by auto-open, portal still said missed.
@@ -252,6 +274,18 @@ class PureHelperTests(unittest.TestCase):
                          datetime(2026, 8, 12, 14, 24, 47, tzinfo=timezone.utc))
         self.assertIsNone(bridge_mod.parse_iso_ts(None))
         self.assertIsNone(bridge_mod.parse_iso_ts("garbage"))
+
+
+class YamlKnobTests(unittest.TestCase):
+    """voice_unlock_lead_s must stay a plain scalar - see _yaml_scalar_line's
+    docstring for why a dict-valued key crashes AppDaemon's deploy-time
+    deep_compare."""
+
+    def test_voice_unlock_lead_s_is_a_float_scalar(self):
+        yaml_path = Path(__file__).resolve().parent.parent / "abb_welcome_bridge.yaml"
+        value = _yaml_scalar_line(yaml_path.read_text(), "voice_unlock_lead_s")
+        self.assertIsNotNone(value, "voice_unlock_lead_s must sit on one line, not a nested block")
+        self.assertEqual(float(value), 0.3)
 
 
 class MissedCallTests(unittest.TestCase):
@@ -1781,6 +1815,25 @@ class NativeRingClipTests(unittest.TestCase):
         pending = [cb.__name__ for cb, _, _ in self.app.run_in_calls]
         self.assertNotIn("_native_voice_retry", pending)
 
+    # --- voice_in_flight guard (2026-09: the call-ready edge can now dial
+    # ahead of this poll, so a scheduled attempt must never dial a SECOND,
+    # overlapping play_audio while one is already underway) ---
+
+    def test_retry_skips_dispatch_while_voice_in_flight_but_still_reschedules(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        self.app._maybe_announce("front door")  # schedules attempt 1
+        episode["voice_in_flight"] = True  # e.g. the call-ready edge is mid-dial
+        ran = _run_scheduled(self.app, "_native_voice_retry")
+        self.assertEqual(ran, 1)
+        self.assertEqual(
+            [c for c in self.app.service_calls if c[0] == "abb_welcome/play_audio"], [],
+            "a play in flight must not be dialed over",
+        )
+        delays = [delay for cb, delay, _kw in self.app.run_in_calls
+                  if cb.__name__ == "_native_voice_retry"]
+        self.assertEqual(delays, [self.app.voice_retry_interval_s], "the next attempt must still be scheduled")
+        self.assertTrue(any("VOICE-SKIP" in m for _, m in self.app.logs))
+
     # --- voice dedup (one spoken sentence per episode, both paths) ---
 
     def test_two_unlock_confirms_speak_once_native(self):
@@ -1938,6 +1991,145 @@ class RingArmedVoiceTests(unittest.TestCase):
         self.app.states.pop(("input_boolean.auto_open_intercom", None), None)
         self.app._open_episode("front door", "100000002", self.clock.now())
         self.assertEqual(self._voice_delays(), [])
+
+
+class CallReadyVoiceTests(unittest.TestCase):
+    """abb_welcome_talkback_playing and the talkback_audible edge (2026-09):
+    the door no longer has to wait for play_audio's own return (the sentence
+    ending PLUS ~0.17 s of service-call lag) or for the chain's next scheduled
+    poll (up to voice_retry_interval_s late) - it reacts to the companion
+    integration's own signals instead. See abb_welcome_bridge.yaml's
+    voice_unlock_lead_s comment for the measured press->unlock timing this is
+    built around."""
+
+    def setUp(self):
+        self.clock = Clock(datetime(2026, 9, 8, 18, 15, 0, tzinfo=timezone.utc))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.app = _bare_bridge(self.tmp.name, self.clock)
+        self.app.native_ring_clips = True
+
+    def _armed_episode(self, door="front door", station="100000002"):
+        """An episode whose native voice chain has already been dispatched -
+        the state both new handlers expect to find (normally reached via
+        _native_voice_retry's attempt-1 dispatch)."""
+        episode = self.app._open_episode(door, station, self.clock.now())
+        episode["voice_dispatched"] = True
+        episode["voice_camera"] = "camera.abb_front"
+        episode["voice_message"] = "Door is opening."
+        return episode
+
+    def _publish_calls(self):
+        return [(delay, kw) for cb, delay, kw in self.app.run_in_calls
+                if cb.__name__ == "_publish_voice_spoken"]
+
+    def _plays(self):
+        return [c for c in self.app.service_calls if c[0] == "abb_welcome/play_audio"]
+
+    # --- abb_welcome_talkback_playing (last-word release) ---
+
+    def test_playing_event_schedules_publish_at_duration_minus_lead(self):
+        episode = self._armed_episode()
+        self.app._on_talkback_playing(
+            "abb_welcome_talkback_playing",
+            {"entity_id": "camera.abb_front", "duration_ms": 1180,
+             "media_content_id": "media-source://tts/x"},
+            {},
+        )
+        calls = self._publish_calls()
+        self.assertEqual(len(calls), 1)
+        delay, kwargs = calls[0]
+        self.assertAlmostEqual(delay, 0.88, places=6)
+        self.assertEqual(kwargs, {"door": "front door", "episode_id": episode["id"], "source": "playing"})
+
+    def test_playing_event_floors_delay_at_zero_when_duration_below_lead(self):
+        self._armed_episode()
+        self.app._on_talkback_playing(
+            "abb_welcome_talkback_playing",
+            {"entity_id": "camera.abb_front", "duration_ms": 100},
+            {},
+        )
+        delays = [delay for delay, _kw in self._publish_calls()]
+        self.assertEqual(delays, [0.0])
+
+    def test_playing_event_ignores_camera_with_no_open_episode(self):
+        # camera.abb_front maps to a real door, but nothing is open for it.
+        self.app._on_talkback_playing(
+            "abb_welcome_talkback_playing",
+            {"entity_id": "camera.abb_front", "duration_ms": 1180},
+            {},
+        )
+        self.assertEqual(self._publish_calls(), [])
+
+    def test_playing_event_ignores_an_unmapped_camera(self):
+        self._armed_episode()
+        self.app._on_talkback_playing(
+            "abb_welcome_talkback_playing",
+            {"entity_id": "camera.someone_elses_station", "duration_ms": 1180},
+            {},
+        )
+        self.assertEqual(self._publish_calls(), [])
+
+    # --- _publish_voice_spoken idempotency ---
+
+    def _spoken_events(self):
+        return [kw for name, kw in self.app.fired_events if name == "abb_announcement_spoken"]
+
+    def test_two_publishes_for_one_episode_fire_once(self):
+        episode = self._armed_episode()
+        self.app._publish_voice_spoken({"door": "front door", "episode_id": episode["id"], "source": "playing"})
+        self.app._publish_voice_spoken({"door": "front door", "episode_id": episode["id"], "source": "return"})
+        self.assertEqual(self._spoken_events(), [{"door": "front door"}])
+        self.assertTrue(episode["voice_published"])
+        self.assertEqual(
+            len([m for _, m in self.app.logs if m.startswith("VOICE-SPOKEN")]), 1,
+            "the second, already-published call must not log either",
+        )
+
+    def test_publish_logs_which_source_won(self):
+        episode = self._armed_episode()
+        self.app._publish_voice_spoken({"door": "front door", "episode_id": episode["id"], "source": "playing"})
+        self.assertTrue(any("VOICE-SPOKEN door=front door via playing" in m for _, m in self.app.logs))
+
+    def test_publish_falls_back_to_the_open_episode_without_an_episode_id(self):
+        episode = self._armed_episode()
+        self.app._publish_voice_spoken({"door": "front door", "source": "return"})
+        self.assertTrue(episode["voice_published"])
+        self.app._publish_voice_spoken({"door": "front door", "source": "return"})
+        self.assertEqual(self._spoken_events(), [{"door": "front door"}])
+
+    # --- talkback_audible call-ready edge ---
+
+    def test_audible_edge_speaks_immediately(self):
+        episode = self._armed_episode()
+        self.app._on_talkback_audible("camera.abb_front", "talkback_audible", False, True, {})
+        self.assertEqual(len(self._plays()), 1)
+        self.assertTrue(episode["voice_spoken"])
+        self.assertTrue(any("VOICE-EDGE door=front door" in m for _, m in self.app.logs))
+
+    def test_audible_edge_does_nothing_while_voice_in_flight(self):
+        episode = self._armed_episode()
+        episode["voice_in_flight"] = True
+        self.app._on_talkback_audible("camera.abb_front", "talkback_audible", False, True, {})
+        self.assertEqual(self._plays(), [])
+
+    def test_audible_edge_does_nothing_once_already_spoken(self):
+        episode = self._armed_episode()
+        episode["voice_spoken"] = True
+        self.app._on_talkback_audible("camera.abb_front", "talkback_audible", False, True, {})
+        self.assertEqual(self._plays(), [])
+
+    def test_audible_edge_ignores_an_unmapped_camera(self):
+        self._armed_episode()
+        self.app._on_talkback_audible("camera.someone_elses_station", "talkback_audible", False, True, {})
+        self.assertEqual(self._plays(), [])
+
+    def test_audible_edge_ignores_a_door_with_no_dispatched_chain(self):
+        # Ring just opened; _arm_ring_voice's own delayed attempt 1 has not
+        # run yet, so voice_dispatched is still False - nothing to speak.
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.app._on_talkback_audible("camera.abb_front", "talkback_audible", False, True, {})
+        self.assertEqual(self._plays(), [])
 
 
 class DoorOpenFeedTests(unittest.TestCase):

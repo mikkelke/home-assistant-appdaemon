@@ -270,6 +270,13 @@ class AbbWelcomeBridge(hass.Hass):
         self.voice_retry_interval_s = float(self.args.get("voice_retry_interval_s", 1.0))
         self.voice_retry_attempts = int(self.args.get("voice_retry_attempts", 10))
         self.announce_ring_window_s = int(self.args.get("announce_ring_window_s", 60))
+        # How long before play_audio's own last frame to release the door hold,
+        # once abb_welcome_talkback_playing (companion integration change) tells
+        # this app the sentence's exact duration (_on_talkback_playing below).
+        # The ABB press->unlock is a measured +0.3 s on every ring, so this is
+        # how far ahead of the last packet the unlock event has to fire to land
+        # right as the sentence ends instead of after it.
+        self.voice_unlock_lead_s = float(self.args.get("voice_unlock_lead_s", 0.3))
 
         # --- ring clip knobs (2026-08-13, "thumbnail and opening that give the video") ---
         # HA's native camera.record works against the integration's RTSP layer, but ONLY
@@ -294,6 +301,15 @@ class AbbWelcomeBridge(hass.Hass):
 
         self.clip_record_dir = str(self.args.get("clip_record_dir", "/config/www/abb_doorbell")).rstrip("/")
         self.station_by_door = {v: k for k, v in self.station_doors.items()}
+        # Camera entity -> door label, the reverse of announce_cameras/clip_cameras
+        # (both door -> camera). abb_welcome_talkback_playing and the
+        # talkback_audible attribute only ever carry the camera entity_id, so this
+        # is the only way back to a door for both (_on_talkback_playing,
+        # _on_talkback_audible below).
+        self._camera_doors = {}
+        for door_camera_map in (self.clip_cameras, self.announce_cameras):
+            for door, camera in door_camera_map.items():
+                self._camera_doors[camera] = door
 
         # Native ring-clip recorder (2026-08-24, integration-side change landing
         # alongside this one - see abb_welcome_ring_clip below). true = the
@@ -409,6 +425,14 @@ class AbbWelcomeBridge(hass.Hass):
         except Exception as e:
             self.log(f"Native ring-clip listener failed: {e}", level="WARNING")
         try:
+            # Companion integration change (2026-09, separate repo): fires the
+            # instant a talkback play_audio call actually starts, carrying the
+            # clip's own duration - see _on_talkback_playing for why that lets
+            # the door open on the sentence's last word instead of ~0.5 s late.
+            self.listen_event(self._on_talkback_playing, "abb_welcome_talkback_playing")
+        except Exception as e:
+            self.log(f"Talkback-playing listener failed: {e}", level="WARNING")
+        try:
             # Backup intake only: the bus event and this sensor share one SIP
             # trigger, so _register_ring's per-side fold absorbs the duplicate.
             self.listen_state(self._on_abb_ringing_edge, self.abb_ringing_sensor, new="on", attribute="all")
@@ -427,6 +451,14 @@ class AbbWelcomeBridge(hass.Hass):
                 self.listen_state(self._on_lock_activity, lock_entity)
             except Exception as e:
                 self.log(f"Lock listener failed for {lock_entity}: {e}", level="WARNING")
+        for camera in sorted(set(self.clip_cameras.values())):
+            try:
+                # new=True ONLY, never old= - this codebase has a documented
+                # gotcha (see the ESP ring listener above) that an old= filter
+                # can silently miss a cloud-backed attribute's edge.
+                self.listen_state(self._on_talkback_audible, camera, attribute="talkback_audible", new=True)
+            except Exception as e:
+                self.log(f"Talkback-audible listener failed for {camera}: {e}", level="WARNING")
 
         try:
             self.listen_event(self._on_notification_action, "mobile_app_notification_action")
@@ -719,6 +751,10 @@ class AbbWelcomeBridge(hass.Hass):
             "clip_started_at": None,  # when the record dial went out (voices yield until it ends)
             "voice_spoken": False,  # one "the door is open" sentence per episode (native + legacy dedup)
             "voice_dispatched": False,  # a native voice retry chain already started (2nd unlock confirm must not start another)
+            "voice_in_flight": False,  # a play_audio call is actually underway - the poll chain must not dial over it (_native_voice_attempt)
+            "voice_published": False,  # abb_announcement_spoken already fired for this episode (_publish_voice_spoken dedup: playing event + on-return can both fire)
+            "voice_camera": None,  # camera the native chain is speaking into, stashed at dispatch so the call-ready edge can reuse it without redoing _maybe_announce's lookup
+            "voice_message": None,  # ...and the sentence itself, same reason
             "push_pending": None,  # intercom.py's auto-open push, held for a photo (defer_ring_push)
             "push_flushed": False,  # ...and sent - exactly once per ring, photo or not
             "action_push_sent": False,  # auto-open-off Open/Reject push went out
@@ -1477,26 +1513,44 @@ class AbbWelcomeBridge(hass.Hass):
         confirming - the exact double-fire this flag pair exists to close), so
         only the FIRST call may start a chain. voice_spoken alone cannot do that
         job too: it has to stay false through up to 4 failing attempts for the
-        retry to have any point."""
+        retry to have any point.
+
+        voice_in_flight (2026-09) is a THIRD guard, for a different collision:
+        the call-ready edge (_on_talkback_audible) can now dial ahead of this
+        poll, and this poll must never dial a second, overlapping play_audio
+        into the same call while that one is still underway - so a scheduled
+        attempt that finds voice_in_flight true skips its OWN dial but still
+        schedules the next one, exactly as a normal failed attempt would."""
         episode = self.episodes.get(kwargs.get("episode_id"))
         if episode is None or episode["closed"] or episode.get("voice_spoken"):
             return
         attempt = kwargs.get("attempt", 1)
         door = kwargs.get("door")
+        camera = kwargs.get("camera")
+        message = kwargs.get("message")
         if attempt == 1:
             if episode.get("voice_dispatched"):
                 return
             episode["voice_dispatched"] = True
-        try:
-            self.submit_to_executor(self._native_voice_attempt, episode["id"], door,
-                                    kwargs.get("camera"), kwargs.get("message"), attempt)
-        except Exception as e:
-            self.log(f"Native voice dispatch failed for {door} (attempt {attempt}): {e}", level="WARNING")
+            # Stashed here, at the one place the chain is guaranteed to start
+            # exactly once per episode, so the call-ready edge handler can
+            # reuse them without redoing _maybe_announce's own lookup.
+            episode["voice_camera"] = camera
+            episode["voice_message"] = message
+        if episode.get("voice_in_flight"):
+            self.log(f"VOICE-SKIP door={door} attempt={attempt}/{self.voice_retry_attempts} play in flight",
+                     level="INFO")
+        else:
+            try:
+                self.submit_to_executor(self._native_voice_attempt, episode["id"], door,
+                                        camera, message, attempt)
+            except Exception as e:
+                self.log(f"Native voice dispatch failed for {door} (attempt {attempt}): {e}", level="WARNING")
         if attempt < self.voice_retry_attempts:
             try:
                 self.run_in(self._native_voice_retry, self.voice_retry_interval_s,
                             episode_id=episode["id"], door=door,
-                            camera=kwargs.get("camera"), message=kwargs.get("message"), attempt=attempt + 1)
+                            camera=camera, message=message, attempt=attempt + 1)
             except Exception as e:
                 self.log(f"Native voice retry scheduling failed for {door}: {e}", level="WARNING")
 
@@ -1504,38 +1558,59 @@ class AbbWelcomeBridge(hass.Hass):
         """Executor-thread body of one native-voice attempt (see _native_voice_retry
         for why this is offloaded). On success, flips this episode's voice_spoken
         flag directly - a bool dict-item write, safe cross-thread the same way
-        _capture_for_episode's snapshot write already is."""
-        if self._voice_into_recording(door, camera, message):
+        _capture_for_episode's snapshot write already is.
+
+        voice_in_flight brackets the WHOLE call, success or failure, the same
+        way - true for exactly as long as play_audio is actually dialing, so
+        the poll chain (_native_voice_retry) and the call-ready edge
+        (_on_talkback_audible) can never both be mid-dial into the same call.
+        `attempt` is only ever interpolated into the log line below, so the
+        call-ready edge is free to pass the string "edge" here instead of a
+        number."""
+        episode = self.episodes.get(episode_id)
+        if episode is not None:
+            episode["voice_in_flight"] = True
+        try:
+            if self._voice_into_recording(door, camera, message):
+                episode = self.episodes.get(episode_id)
+                if episode is not None:
+                    episode["voice_spoken"] = True
+                # "accepted" is the sentence ENDING, not starting: the integration's
+                # play_audio paces 20 ms frames through a bounded queue and then
+                # drains that queue to empty before returning (media_pipeline
+                # _play_talkback_frames), so the service only comes back once the
+                # last packet has left, to within the station's jitter buffer.
+                # _voice_into_recording checks the websocket result, so this is a
+                # real signal rather than the unchecked claim that hid the
+                # malformed-payload bug for five days.
+                self.log(f"VOICE-NATIVE door={door} attempt={attempt}/{self.voice_retry_attempts} accepted", level="INFO")
+                # Publish that instant so intercom.py can open the door on the
+                # sentence actually finishing instead of on a timer that only
+                # guesses at it. run_in(0) hops back to the pinned app thread - this
+                # body runs on the executor, the same hop _capture_for_episode
+                # already uses to flush the ring push. source="return" marks this
+                # as the BACKSTOP: abb_welcome_talkback_playing (_on_talkback_playing)
+                # normally already released the hold, on the sentence's last word,
+                # before play_audio even returns - _publish_voice_spoken's own
+                # voice_published guard makes whichever call lands first the one
+                # that counts.
+                self.run_in(self._publish_voice_spoken, 0, door=door, episode_id=episode_id, source="return")
+                # DIAGNOSTIC (2026-08-26): HA accepts the call but nothing is
+                # audible at the street. Sample the station camera's talkback
+                # counters while the call is still up - they are reset on teardown,
+                # so reading them afterwards only ever shows zeros. Non-zero
+                # talkback_voice_packets means audio really was sent and the
+                # station simply did not render it; all-zero means our write path
+                # never produced anything. Those need different fixes, and this is
+                # the only thing that tells them apart. Two samples because the
+                # first can land before the sender has started.
+                for delay in (2, 5):
+                    self.run_in(self._log_talkback_stats, delay, camera=camera,
+                                door=door, at=delay)
+        finally:
             episode = self.episodes.get(episode_id)
             if episode is not None:
-                episode["voice_spoken"] = True
-            # "accepted" is the sentence ENDING, not starting: the integration's
-            # play_audio paces 20 ms frames through a bounded queue and then
-            # drains that queue to empty before returning (media_pipeline
-            # _play_talkback_frames), so the service only comes back once the
-            # last packet has left, to within the station's jitter buffer.
-            # _voice_into_recording checks the websocket result, so this is a
-            # real signal rather than the unchecked claim that hid the
-            # malformed-payload bug for five days.
-            self.log(f"VOICE-NATIVE door={door} attempt={attempt}/{self.voice_retry_attempts} accepted", level="INFO")
-            # Publish that instant so intercom.py can open the door on the
-            # sentence actually finishing instead of on a timer that only
-            # guesses at it. run_in(0) hops back to the pinned app thread - this
-            # body runs on the executor, the same hop _capture_for_episode
-            # already uses to flush the ring push.
-            self.run_in(self._publish_voice_spoken, 0, door=door)
-            # DIAGNOSTIC (2026-08-26): HA accepts the call but nothing is
-            # audible at the street. Sample the station camera's talkback
-            # counters while the call is still up - they are reset on teardown,
-            # so reading them afterwards only ever shows zeros. Non-zero
-            # talkback_voice_packets means audio really was sent and the
-            # station simply did not render it; all-zero means our write path
-            # never produced anything. Those need different fixes, and this is
-            # the only thing that tells them apart. Two samples because the
-            # first can land before the sender has started.
-            for delay in (2, 5):
-                self.run_in(self._log_talkback_stats, delay, camera=camera,
-                            door=door, at=delay)
+                episode["voice_in_flight"] = False
 
     def _publish_voice_spoken(self, kwargs):
         """Tell the house that the door sentence has finished playing.
@@ -1544,13 +1619,117 @@ class AbbWelcomeBridge(hass.Hass):
         _release_voice_unlock). Strictly additive and never raises: if this
         event is lost the door still opens, just on intercom.py's ceiling
         timer instead - the same fail-open bargain the hold has always made.
+
+        IDEMPOTENT PER EPISODE (2026-09): two independent callers can now race
+        to publish for the same ring - the duration-based release
+        (_on_talkback_playing, source="playing") and play_audio's own return
+        (_native_voice_attempt, source="return") - and only the first may
+        actually fire the event; a second would tell intercom.py to open a
+        door that is either already open or about to be for an unrelated
+        reason. The episode is looked up by episode_id when the caller has
+        one, else by door (kept for the pre-2026-09 caller shape and any
+        caller too old to have an episode handy) - either way, once found and
+        already voice_published, this returns without firing OR logging.
         """
         door = kwargs.get("door")
+        source = kwargs.get("source", "return")
+        episode_id = kwargs.get("episode_id")
+        episode = self.episodes.get(episode_id) if episode_id is not None else None
+        if episode is None:
+            episode = self._latest_open_episode(door)
+        if episode is not None:
+            if episode.get("voice_published"):
+                return
+            episode["voice_published"] = True
         try:
             self.fire_event("abb_announcement_spoken", door=door)
-            self.log(f"VOICE-SPOKEN door={door}", level="INFO")
+            self.log(f"VOICE-SPOKEN door={door} via {source}", level="INFO")
         except Exception as e:
             self.log(f"Voice-spoken publish failed for {door}: {e}", level="WARNING")
+
+    def _voice_waiting_episode(self, door, require_idle=False):
+        """Most recently opened, still-open episode for door whose native voice
+        chain has been dispatched but has not yet spoken - the shared lookup
+        for the call-ready edge (_on_talkback_audible) and the playing event
+        (_on_talkback_playing). require_idle additionally demands
+        voice_in_flight is False: the edge handler must never dial over a
+        play_audio call the poll chain already has underway (that collision is
+        exactly what voice_in_flight exists to close), while the playing event
+        only ever fires FOR the call already in flight, so it has no need for
+        that extra check."""
+        candidates = [
+            ep for ep in self.episodes.values()
+            if ep.get("door") == door and not ep.get("closed")
+            and ep.get("voice_dispatched") and not ep.get("voice_spoken")
+            and (not require_idle or not ep.get("voice_in_flight"))
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda e: e["started_at"])
+
+    def _on_talkback_playing(self, event_name, data, kwargs):
+        """Companion ABB Welcome integration change (2026-09, separate repo):
+        fires the instant a play_audio call's talkback actually starts,
+        carrying the clip's own duration_ms - so the door hold can be released
+        to land on the sentence's LAST WORD instead of after it.
+
+        Measured 2026-09-08 18:15: "Door is opening." plays for 1.18 s, the
+        play_audio service call returns ~0.17 s after the last frame, and
+        intercom.py's own press then adds a further measured +0.3 s before the
+        lock actually opens - all of it stacking up AFTER the sentence had
+        already finished. voice_unlock_lead_s is that press-to-unlock time, so
+        firing the release this far before the clip ends should land the
+        click right as the sound stops instead of ~0.5 s later.
+
+        Silently ignored when the camera or door has nothing waiting - this
+        event fires for every talkback play, not just ones this bridge's
+        native voice chain started."""
+        try:
+            data = data or {}
+            door = self._camera_doors.get(data.get("entity_id"))
+            if not door:
+                return
+            episode = self._voice_waiting_episode(door)
+            if episode is None:
+                return
+            duration_s = float(data.get("duration_ms") or 0) / 1000.0
+            delay = max(0.0, duration_s - self.voice_unlock_lead_s)
+            self.run_in(self._publish_voice_spoken, delay, door=door,
+                        episode_id=episode["id"], source="playing")
+            self.log(f"VOICE-PLAYING door={door} duration={duration_s:.2f}s unlock in {delay:.2f}s",
+                     level="INFO")
+        except Exception as e:
+            self.log(f"Talkback-playing handling failed: {e}", level="WARNING")
+
+    def _on_talkback_audible(self, entity, attribute, old, new, kwargs):
+        """The call-ready edge (2026-09): the station camera's talkback_audible
+        attribute flips true the instant the redialled call can actually be
+        heard, closing the gap the 0.5 s poll otherwise pays (up to half a
+        cadence late, on top of however long the redial itself took). Speaks
+        immediately instead of waiting for the chain's next scheduled attempt;
+        the poll chain (_native_voice_retry) stays armed as the backstop for a
+        ring whose edge this handler misses.
+
+        voice_camera/voice_message come off the episode (stashed by
+        _native_voice_retry the moment its chain was dispatched) rather than
+        being re-resolved here, so this never has to duplicate
+        _maybe_announce's own camera/message lookup. require_idle=True on the
+        episode lookup keeps this from ever dialing over a play_audio call the
+        poll chain already has in flight."""
+        try:
+            door = self._camera_doors.get(entity)
+            if not door:
+                return
+            episode = self._voice_waiting_episode(door, require_idle=True)
+            if episode is None:
+                return
+            self.submit_to_executor(
+                self._native_voice_attempt, episode["id"], door,
+                episode.get("voice_camera"), episode.get("voice_message"), "edge",
+            )
+            self.log(f"VOICE-EDGE door={door} talkback audible, speaking now", level="INFO")
+        except Exception as e:
+            self.log(f"Talkback-audible handling failed for {entity}: {e}", level="WARNING")
 
     def _log_talkback_stats(self, kwargs):
         """Log the station camera's live talkback counters (see caller)."""

@@ -134,6 +134,17 @@ AbbWelcomeBridge:
   # the same 10 s window.
   voice_retry_interval_s: 0.5
   voice_retry_attempts: 20
+  # How long before play_audio's OWN last frame to release the door hold, once
+  # abb_welcome_talkback_playing (companion integration change, landing
+  # separately) tells this app the sentence's exact duration. The ABB
+  # press->unlock is a measured +0.3 s on every ring, so releasing the hold
+  # this far before the last packet puts the door open right as the sound
+  # ends, instead of the ~0.5 s AFTER it that the play_audio-return signal
+  # alone produces (measured 2026-09-08 18:15: 1.18 s of TTS, +0.17 s for the
+  # service call to return, +0.3 s press->unlock - all landing after the
+  # sentence had already finished). The polling chain's own on-return publish
+  # stays the backstop for a ring this event never arrives for.
+  voice_unlock_lead_s: 0.3
   announce_cooldown_s: 90
   announce_ring_window_s: 60
 
