@@ -110,6 +110,11 @@ class FamilyRoomLights(hass.Hass):
             self._action_log_count = 0  # Add missing initialization
             # Tracks if sleep mode was activated during an ongoing family-room presence session
             self._sleep_activated_during_presence = False
+            # Epoch time the current family-room presence session started (None when no
+            # session is active). Lets the latch above be derived from timestamps instead of
+            # relying on listen_state callback order, which can race - see
+            # _sleep_started_during_presence_session.
+            self._presence_session_started_at = None
 
             # Diagnostics sensor (thresholds + toggle / evaluation counters)
             self._diag_sensor = self.args.get("diagnostics_sensor_entity") or None
@@ -426,6 +431,8 @@ class FamilyRoomLights(hass.Hass):
         try:
             room = kwargs.get("room", "unknown")
             self.log(f"Family room: PIR on in {room} - immediate evaluation", level="INFO")
+            if getattr(self, "_presence_session_started_at", None) is None:
+                self._presence_session_started_at = time.time()
             self._schedule_evaluation(immediate=True)
         except Exception as e:
             self.log(f"Error in PIR on handler: {e}", level="ERROR")
@@ -438,6 +445,7 @@ class FamilyRoomLights(hass.Hass):
             if not self._has_family_room_presence():
                 self._clear_door_arrival_latch("all family PIR off")
                 self._sleep_activated_during_presence = False
+                self._presence_session_started_at = None
             # Kitchen off: evaluate immediately so island handoff from dishwasher_island_signal (dark solo
             # cleanup) is not delayed behind debounce while another app may have left only island_light_1 on.
             self._schedule_evaluation(immediate=(room == "kitchen"))
@@ -575,6 +583,37 @@ class FamilyRoomLights(hass.Hass):
                 'people_home': [],
                 'people_sleeping': []
             }
+
+    def _sleep_started_during_presence_session(self, sleep_status):
+        """True if a currently-sleeping person's sleep-mode boolean flipped on at/after the
+        start of the current family-room presence session (1s tolerance for clock/dispatch
+        skew), derived from ``last_changed`` timestamps rather than trusting that boolean's
+        own ``listen_state`` callback has already run and set ``_sleep_activated_during_presence``
+        - that callback can race an evaluation triggered by the same wall-clock event (measured
+        2026-09-09: a PIR-on evaluation read the boolean as already "on" 0.968s before its own
+        listen_state callback fired and set the latch).
+        """
+        if not getattr(self, "_presence_session_started_at", None):
+            return False
+        try:
+            threshold = self._presence_session_started_at - 1.0
+            for person in sleep_status.get('people_sleeping', []):
+                sleep_entity = self._get_sleep_entity_for_person(person)
+                if not sleep_entity:
+                    continue
+                last_changed = self.get_state(sleep_entity, attribute="last_changed")
+                if not last_changed:
+                    continue
+                try:
+                    changed_at = datetime.datetime.fromisoformat(str(last_changed)).timestamp()
+                except (ValueError, TypeError):
+                    continue
+                if changed_at >= threshold:
+                    return True
+            return False
+        except Exception as e:
+            self.log(f"Error checking sleep-started-during-presence session: {e}", level="ERROR")
+            return False
 
     def _is_dark_enough(self):
         """Committed dark only - same as ``sensor.darkness_*`` / ``(Dark)`` label (not ``pending_*``)."""
@@ -787,6 +826,7 @@ class FamilyRoomLights(hass.Hass):
             self._clear_door_arrival_latch("presence lost handler")
             # Presence session ended; allow sleep mode rules to take effect next time
             self._sleep_activated_during_presence = False
+            self._presence_session_started_at = None
             # Always defer to the unified decision tree for consistent, race-free behavior
             self.log("Presence lost - using decision tree", level="INFO")
             self._schedule_evaluation()
@@ -1383,6 +1423,10 @@ class FamilyRoomLights(hass.Hass):
         context['family_presence'] = bool(rooms_on)
         if rooms_on:
             context['presence_room'] = rooms_on[0]
+        if context['family_presence'] and getattr(self, "_presence_session_started_at", None) is None:
+            # Covers boot / missed PIR-on edges: presence is already true here but no
+            # session start was recorded (e.g. app restarted mid-session).
+            self._presence_session_started_at = time.time()
         # presence_trust: ghost presence (kitchen mmWave-only + speaker playing)
         # must never auto-on, but still counts as presence for the off-hold.
         context['presence_suspect_only'] = self._presence_suspect_only(rooms_on)
@@ -1425,6 +1469,25 @@ class FamilyRoomLights(hass.Hass):
         
         # Get sleep status
         context['sleep_status'] = self._get_sleep_mode_status()
+
+        # Derive the presence-session latch from timestamps rather than trusting that the
+        # sleep-mode listen_state callback has already run: a PIR-on evaluation triggered by
+        # the same wall-clock event can read the boolean as already "on" via get_state before
+        # its own callback (which normally sets the latch) fires - see
+        # _sleep_started_during_presence_session (measured 2026-09-09 incident).
+        if (
+            context['sleep_status']['anyone_sleeping']
+            and not self._sleep_activated_during_presence
+            and context['family_presence']
+            and self._sleep_started_during_presence_session(context['sleep_status'])
+        ):
+            self._sleep_activated_during_presence = True
+            sleeping_now = ', '.join(context['sleep_status']['people_sleeping']) or 'unknown'
+            self.log(
+                f"Sleep mode turned on during this presence session ({sleeping_now}) - "
+                "preserving current lighting until presence is lost",
+                level="INFO",
+            )
         
         # Committed dark/bright from darkness_calculator for auto-on and auto-off.
         context['is_dark'] = self._is_dark_enough()
