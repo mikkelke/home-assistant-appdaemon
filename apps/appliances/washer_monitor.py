@@ -601,6 +601,11 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
 
         # Counters
         self.high_power_counter = 0
+        # UTC of the first sample in the current high_power_counter streak (push-driven route -
+        # _power_changed fires on every sensor update, not a fixed poll, so the raw count alone
+        # can be satisfied by a Miele anti-crease tumble lasting a few seconds; see the Unemptied
+        # branch below for the sustained-duration bar this pairs with).
+        self._high_power_streak_started_at = None
         self.low_power_counter = 0
         self.low_power_start_time = None  # Track when low power period started
         self.last_significant_power_at = None
@@ -1941,6 +1946,10 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 self.last_high_energy_at = self.start_time
             self.energy_stable_start_time = None
             self.finish_confirmed = False
+            # Boot restore can reach this method twice in the same pass (the power-history
+            # start-gap correction above, then unconditionally again later) - cancel any handle
+            # already armed before arming a new one, or both tick loops run concurrently forever.
+            self._safe_cancel_timer(self.energy_check_timer)
             self.energy_check_timer = self.run_in(self._check_energy_finish, self.energy_check_interval)
             self.log(
                 f"Restored energy state from HA history: {len(self.energy_buffer)} points, "
@@ -2238,7 +2247,10 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 level="INFO",
             )
         self._transition_to_unemptied()
-        return True
+        # The transition can still be refused (e.g. cooling period) - only report success (and
+        # let the caller stop its tick) when it actually landed, so a refusal falls through to
+        # the tick's normal reschedule instead of silently going unarmed while still Running.
+        return self.state == "Unemptied"
 
     def _is_post_end_tail_window(self, run_min: float, expected_dur: float, programme: str) -> bool:
         """True when run time is within anti_crease_near_end_minutes of expected end, or past it; or when programme unknown, past anti_crease_min_runtime_minutes."""
@@ -2879,6 +2891,15 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             if not self.poll_timer:
                 poll_interval = int(self.args.get("poll_interval_s", 60))
                 self.poll_timer = self.run_in(self._poll_power, poll_interval)
+            # An AddLoad pause leaves energy_check_timer nulled (the tick's own early-return for
+            # non-Running states) but this resume path used to only ever re-arm poll_timer -
+            # unlike _begin_running_cycle / _restore_running_state, which both call
+            # _start_energy_detection() - permanently killing energy-based finish detection for
+            # the rest of the cycle. Cancel any stale handle first, then re-seed and re-arm.
+            if self.use_energy_detection:
+                self._safe_cancel_timer(self.energy_check_timer)
+                self.energy_check_timer = None
+                self._start_energy_detection()
 
     def _evaluate_pause_exit(self, force=False):
         """Determine whether to go to Unemptied or Off when exiting Paused state."""
@@ -3431,6 +3452,10 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                         f"(mean={mean_w:.1f}W peak={peak_w:.1f}W; need mean≤{self.finish_power_gate_max_mean_w:.0f}W peak≤{self.finish_power_gate_max_peak_w:.0f}W or mean≤{self.finish_power_gate_off_max_mean_w:.0f}W peak≤{self.finish_power_gate_off_max_peak_w:.0f}W)",
                         level="INFO",
                     )
+                # A refused transition must not leave a stale end-reason hint behind for a later,
+                # unrelated attempt to trust (see the mid-cycle-rinse gate above, which skips this
+                # very check when _pending_end_reason already holds strong evidence).
+                self._pending_end_reason = None
                 return
         # FIX 2 (2026-08-19): door-aware finish. This is a power/timer/backstop-driven finish
         # (skip_announce=False; the door-driven paths pass skip_announce=True and handle the door
@@ -3659,6 +3684,10 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             # a recorder lookback for an ajar-door edge (FIX 4), not just a live-contact peek.
             self._unemptied_last_history_check_at = None
             self._unemptied_recheck_high_counter = 0
+            # A high-power streak carried over from the tail end of Running must not count
+            # towards the push-driven false-recovery gate in _power_changed - start it fresh.
+            self.high_power_counter = 0
+            self._high_power_streak_started_at = None
             self.unemptied_door_recheck_timer = self.run_in(self._unemptied_door_recheck, 60)
 
             self.log(
@@ -3717,6 +3746,10 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                         self.notification_sent = True
                     except Exception as e:
                         self.log(f"Error sending notification: {e}", level="ERROR")
+        else:
+            # Refused (e.g. cooling period, or already Unemptied) - do not leave a stale
+            # end-reason hint behind for a later, unrelated transition attempt to trust.
+            self._pending_end_reason = None
 
     def _handle_force_emptied(self, event_name, data, kwargs):
         """washer_force_emptied (dashboard Emptied button): the drum is empty but the door
@@ -3921,6 +3954,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.low_power_counter = 0
         self.low_power_start_time = None
         self.high_power_counter = 0
+        self._high_power_streak_started_at = None
         self.last_significant_power_at = None
         self.power_readings = []
         self.finish_confirmed = False
@@ -3955,6 +3989,10 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self._finish_anchor_override = None
         # D2: same belt-and-braces as D1 above, for the force-push flag.
         self._announce_force_push = False
+        # A cycle ending (via any path) must never carry a stale finish-evidence hint into the
+        # next one - see _transition_to_unemptied's mid-cycle-rinse gate, which trusts
+        # tail_to_standby/tail_pattern_break/standby_backstop to skip that gate entirely.
+        self._pending_end_reason = None
         self._reset_input_selectors()
 
     def _set_programme_helpers_default(self):
@@ -4110,6 +4148,8 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
 
         # High power branch (start detection)
         if watts >= self.start_w:
+            if self.high_power_counter == 0:
+                self._high_power_streak_started_at = self._now_utc()
             self.high_power_counter += 1
             self.low_power_counter = 0
 
@@ -4123,10 +4163,25 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
 
             if self.high_power_counter >= effective_threshold:
                 if current_state == "Unemptied":
-                    # False finish: we declared done but the machine is still running.
-                    # Recover to Running so the UI shows correct state and we can detect real finish.
-                    self._recover_from_false_unemptied(watts)
-                    return
+                    # False finish: we declared done but the machine is still running - EXCEPT a
+                    # single Miele anti-crease tumble (40-80W for a few seconds) can satisfy this
+                    # same raw count just as fast, since this route fires on every power push, not
+                    # a fixed poll (unlike _unemptied_door_recheck's sibling counter, hardened
+                    # 2026-08-19, whose 60s-apart samples make its threshold imply real elapsed
+                    # minutes). Require the same sustained-time bar here before recovering.
+                    streak_started = self._high_power_streak_started_at or now
+                    streak_seconds = (now - streak_started).total_seconds()
+                    min_sustained_s = max(0, self.high_power_threshold - 1) * 60
+                    if streak_seconds >= min_sustained_s:
+                        # Recover to Running so the UI shows correct state and we can detect real finish.
+                        self._recover_from_false_unemptied(watts)
+                        return
+                    self.log(
+                        f"Power push while Unemptied: {watts:.1f}W high for {streak_seconds:.0f}s "
+                        f"(need {min_sustained_s:.0f}s sustained) - could be an anti-crease nudge, "
+                        f"not recovering yet",
+                        level="DEBUG",
+                    )
                 if current_state == "Off":
                     self._confirm_running(kwargs={})
                 elif current_state == "Emptied":
@@ -4157,6 +4212,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                     self.log(f"Power high while Paused ({watts:.1f}W)", level="DEBUG")
         else:
             self.high_power_counter = 0
+            self._high_power_streak_started_at = None
 
         # Emptied + 0W: machine is fully off - no need to wait for door close or watchdog timer.
         if current_state == "Emptied" and watts <= 0:
@@ -4278,6 +4334,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.energy_stable_start_time = None
         self.last_high_energy_at = None
         self._zero_power_since = None
+        # A fresh (or resumed) cycle must never carry a stale finish-evidence hint into itself -
+        # see _transition_to_unemptied's mid-cycle-rinse gate at the top of that function.
+        self._pending_end_reason = None
         # A freshly (re)started cycle is live by definition - never carry a prior restore's
         # uncorroborated suppression into it (FIX 1).
         self.restored_uncorroborated = False
@@ -5281,9 +5340,14 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.log(f"Could not write feedback file {self.feedback_file}: {e}", level="WARNING")
             return
 
-        # Update in-memory learned durations and centroids only when valid for learning
+        # Update in-memory learned durations and centroids only when valid for learning AND
+        # user-confirmed - matching washer_feedback.aggregate_cycles' reload-time gate exactly.
+        # An unconfirmed cycle is instead folded in later, exactly once, by
+        # _on_confirm_push_action if/when the user taps the confirm push; applying it here too
+        # double-counted it (n=1 at save, n=2 after the push confirmed it, n=1 again on the next
+        # reload) since aggregate_cycles only ever counts a record once it is user-confirmed.
         avg_new = None
-        if valid_for_learning:
+        if valid_for_learning and user_confirmed:
             avg_new = wfb.apply_learned_sample(
                 self._learned_durations,
                 self._history_centroids,
@@ -6076,7 +6140,10 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 self.energy_buffer = [(self.last_energy_time, self.last_energy_value)]
                 self._zero_power_since = None
 
-                # Start checking energy periodically
+                # Start checking energy periodically - cancel any handle already armed first
+                # (a caller reaching this a second time in the same pass must not end up with two
+                # concurrent tick loops; see _restore_energy_state_from_history's sibling guard).
+                self._safe_cancel_timer(self.energy_check_timer)
                 self.energy_check_timer = self.run_in(self._check_energy_finish, self.energy_check_interval)
                 self.log("Energy-based finish detection started", level="DEBUG")
         except (ValueError, TypeError):
@@ -6640,6 +6707,11 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                                 level="INFO",
                             )
                             self._transition_to_unemptied()
+                            if self.state == "Running":
+                                # Transition was refused (e.g. cooling period) - this is a
+                                # mid-function return, not the bottom-of-tick reschedule, so the
+                                # tick must re-arm itself here or the loop dies while still Running.
+                                self.energy_check_timer = self.run_in(self._check_energy_finish, self.energy_check_interval)
                             return
                         if not self.in_finishing_tail:
                             self.in_finishing_tail = True
@@ -6651,7 +6723,10 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                             )
                         if self._try_finish_via_standby(run_min, guard_dur, _tick_prog, _tick_temp, _tick_class):
                             return
-                        return  # Stay in Running until standby detected
+                        # Stay in Running until standby detected - re-arm here since this is a
+                        # mid-function return, not the bottom-of-tick reschedule.
+                        self.energy_check_timer = self.run_in(self._check_energy_finish, self.energy_check_interval)
+                        return
                 # If already in FinishingTail (e.g. from energy path), try standby transition
                 if self.in_finishing_tail and self._try_finish_via_standby(run_min, guard_dur, _tick_prog, _tick_temp, _tick_class):
                     return
