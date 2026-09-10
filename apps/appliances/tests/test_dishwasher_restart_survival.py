@@ -602,8 +602,11 @@ class RestoredRunningBelowFinishGuardStaysRunning(unittest.TestCase):
             )
             now = app._now_utc()
             seed_store(tmp, "dishwasher", {
-                # 220 min > 0.95 * 227 min (~215.65 min) - past the finish guard.
-                "cycle_start_time": cs.format_utc(now - timedelta(minutes=220)),
+                # 260 min > 0.95 * 234 min (~222.3 min, the in-code defaults' eco nominal - see
+                # 2026-09 audit FLAW 5, which corrected these defaults to mirror
+                # dishwasher_programmes.yaml exactly, including eco's dry_tail_minutes: 35) plus
+                # that 35-min dry tail (~257.3 min) - past both the finish guard AND the tail.
+                "cycle_start_time": cs.format_utc(now - timedelta(minutes=260)),
                 "state": "Running",
                 "energy_at_start": "9.60",
                 "detected_programme": "eco",
@@ -622,15 +625,21 @@ class UnemptiedStateSinceSurvivesAcrossRestartsFromTheStore(unittest.TestCase):
     dishwasher_monitor.py - it would let the cooling period swallow the very first
     post-restart transition).
 
-    Unlike the dryer, the dishwasher's Unemptied watchdog is disabled by default
-    (unemptied_timeout_hours=0) and initialize() has no restore-time re-arm for it at all
-    (unemptied_watchdog_timer is only ever armed from a live _transition_to_unemptied /
-    _revert_emptied_to_unemptied, never from initialize()'s restore dispatch) - a pre-existing
-    gap, not something this fix introduces or is asked to close. So this pins the mechanism at
-    the level the dishwasher actually has: self.state_since must resolve to the store's
-    carried-forward 20h-old timestamp, not a fresh "now", which is exactly what a future
-    watchdog re-arm (or anything else keyed off "how long has this state been true") would
-    need to be correct."""
+    Unlike the dryer, the dishwasher's Unemptied watchdog (unemptied_watchdog_timer) is
+    disabled by default (unemptied_timeout_hours=0) and initialize() still has no restore-time
+    re-arm for THAT specific timer (it is only ever armed from a live _transition_to_unemptied
+    / _revert_emptied_to_unemptied) - moot while the watchdog stays disabled by default, and
+    not something this fix is asked to close.
+
+    The poll-timer reconciler is a separate mechanism and is NO LONGER a gap: initialize() now
+    arms self.poll_timer on a boot that resolves directly into Unemptied too (2026-09 audit,
+    FLAW 6 closed out), specifically so _poll_power's own missed-door-edge check - which reads
+    self.state_since, not the watchdog - gets a chance to run after a restart, not only after
+    a live transition (every deploy here IS an AppDaemon restart, so "only after a live
+    transition" left it unreachable in the common case). So this pins the mechanism at the
+    level the dishwasher actually has: self.state_since must resolve to the store's
+    carried-forward 20h-old timestamp, not a fresh "now", which is exactly what that
+    poll-timer reconciler (and any future watchdog re-arm) needs to be correct."""
 
     def test_20h_old_state_since_is_carried_forward_not_reset(self):
         with tempfile.TemporaryDirectory() as tmp:

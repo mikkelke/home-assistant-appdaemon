@@ -471,6 +471,16 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         helper_state = self.get_state(self.ui_state_select) if self.ui_state_select else None
         self._ui_helper_at_init = helper_state
 
+        # FLAW 1 (2026-09 audit): a Running/Paused store candidate rejected below (stale
+        # start_time, future clock, ...) must not come back from the dead a few lines further
+        # down in initialize() - _restore_cycle_tracking_from_entity used to read the SAME raw,
+        # unvalidated store payload unconditionally, so a store rejected here for e.g. a 20h-old
+        # start_time was still applied verbatim once _maybe_resume_cycle_from_history (invoked
+        # later, once self.state is "Off") separately re-established Running from the plug's
+        # actual recorder history. Recorded here so that later restore call can treat the store
+        # as absent instead.
+        boot_store_rejected = False
+
         try:
             if entity_sourced:
                 # AD-only reload: the live entity is the most-trusted signal there is - trust
@@ -498,6 +508,8 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
                         max_running_hours=self.max_running_hours,
                         max_downtime_hours=self.store_max_downtime_hours,
                     )
+                    if not store_ok:
+                        boot_store_rejected = True
                 if store_ok:
                     resolved_state = store_state
                     gate_start_time = store_start
@@ -610,7 +622,11 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         # otherwise be lost by the time self-heal runs (FIX 1, 2026-08-12 review).
         restored_detected_programme = None
         if self.state in ("Running", "Paused"):
-            self._restore_cycle_tracking_from_entity()
+            # FLAW 1 (2026-09 audit): when the store's Running/Paused candidate was rejected
+            # above (and this Running/Paused came from _maybe_resume_cycle_from_history instead),
+            # the store must be treated as absent here - its raw, unvalidated payload must not
+            # overwrite what history resume just correctly established.
+            self._restore_cycle_tracking_from_entity(use_store=not boot_store_rejected)
             if self.state == "Running":
                 restored_detected_programme = self.detected_programme
                 if self.start_time and not self.poll_timer:
@@ -626,6 +642,15 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
                     self._update_running_attributes()
             elif self.state == "Paused" and self.start_time and not self.poll_timer:
                 self.poll_timer = self.run_in(self._poll_power, 60)
+        elif self.state == "Unemptied" and not self.poll_timer:
+            # FLAW 6 (2026-09 audit, closed out): boot resolving directly into Unemptied (live
+            # entity or store) used to arm no timer at all, so _poll_power's missed-door-edge
+            # reconciler (see its own Unemptied branch) could only ever run after a LIVE
+            # _transition_to_unemptied - never for a machine that was ALREADY Unemptied before
+            # this restart. Every deploy here is an AppDaemon restart, so that left the
+            # reconciler unreachable across most restarts, not just an edge case. Arm the same
+            # poll loop Running/Paused already get above.
+            self.poll_timer = self.run_in(self._poll_power, 60)
 
         # The FIRST write above (_set_state_entity a few lines up) necessarily persisted a
         # store payload from BEFORE the restore dispatch populated start_time/energy_start/etc,
@@ -709,17 +734,49 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
                             if restored_detected_programme and restored_detected_programme != "unknown":
                                 classified = restored_detected_programme
                                 display_prog = restored_detected_programme
+                                guard_dur = (
+                                    self.expected_dur_at_start
+                                    if self.expected_dur_at_start is not None
+                                    else self._get_guard_duration(tick_prog=restored_detected_programme)
+                                )
+                                # FLAW 2 (2026-09 audit): expected_dur_at_start can still be
+                                # EXACTLY the 180-min UNKNOWN_FALLBACK stamped once at cycle
+                                # start (before the classifier had enough runtime to leave
+                                # "unknown") and never refreshed since - trusting that verbatim
+                                # sentinel here would announce a real, longer programme's finish
+                                # up to tens of minutes early. Detect that specific stuck-sentinel
+                                # case and reclassify for the NOW-KNOWN restored programme
+                                # instead; a store/entity anchor that is merely a little lower
+                                # than a freshly-derived nominal (e.g. an older, still-plausible
+                                # figure) is left alone - only the known-bogus placeholder is
+                                # ever replaced, never any other stored value.
+                                if abs(guard_dur - DishwasherMonitor._UNKNOWN_FALLBACK["duration_min"]) < 0.5:
+                                    guard_dur = self._get_guard_duration(tick_prog=restored_detected_programme)
                             else:
                                 classified = self._classify_programme()
                                 display_prog = self._get_programme_for_display()
-                            guard_dur = (
-                                self.expected_dur_at_start
-                                if self.expected_dur_at_start is not None
-                                else self._get_guard_duration(tick_prog=display_prog)
-                            )
+                                guard_dur = (
+                                    self.expected_dur_at_start
+                                    if self.expected_dur_at_start is not None
+                                    else self._get_guard_duration(tick_prog=display_prog)
+                                )
                             if run_min >= guard_dur * self.finish_guard_fraction:
                                 self.log(f"Self-heal: Running with 0W for {run_min:.0f}min - confirming finish", level="INFO")
                                 run_minutes, duration_source = self._correct_duration(run_min)
+                                # FLAW 4 (2026-09 audit): a restart landing INSIDE the dry tail
+                                # (guard already open, machine still passively drying) must not
+                                # feed the elapsed tail into the learned duration -
+                                # _correct_duration cannot rescue this (the tail draws no power
+                                # at all past the last real heating burst, so history has nothing
+                                # above the 85%-of-wall-clock floor to latch onto and falls back
+                                # to the tail-inflated wall-clock run_min). Cap at guard-open - the
+                                # SAME anchor the live dry-tail path already uses as its learning
+                                # value (see _finish_with_dry_tail's own docstring) - so a restart
+                                # mid-tail records the same duration a normal finish would have.
+                                guard_open_min = guard_dur * self.finish_guard_fraction
+                                if run_minutes > guard_open_min:
+                                    run_minutes = guard_open_min
+                                    duration_source = duration_source or "guard_open_capped"
                                 idle_min = run_min - run_minutes if duration_source and run_min > run_minutes else None
                                 # boot_self_heal=True routes the immediate-finish branch through the
                                 # 3-way announce gate (door-edge / late-push / fresh). A restored
@@ -769,7 +826,7 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
     # calls _boot_full_state_snapshot() well after boot, once the snapshot has been dropped -
     # it correctly falls back to a live read, per that method's own docstring.)
 
-    def _restore_cycle_tracking_from_entity(self):
+    def _restore_cycle_tracking_from_entity(self, use_store=True):
         """Restore start_time / energy_start / etc. from persisted sensor attributes (Running
         or Paused). Entity attributes win when present (AD-only-reload path, unchanged); the
         on-disk store (cycle_store.py) fills anything the entity does not have - which, after
@@ -778,11 +835,18 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         strict_start_until_door_or_sustain, last_high_power_time, notification_sent) is always
         true, since those are never published to the entity at all. Also called, later, from
         _handle_force_emptied at runtime - see _boot_full_state_snapshot for why that still
-        gets a live read rather than a stale boot snapshot."""
+        gets a live read rather than a stale boot snapshot.
+
+        use_store=False (FLAW 1, 2026-09 audit) treats the on-disk store as absent: the one
+        boot-time caller that needs this is initialize()'s post-history-resume dispatch, when
+        the store's own Running/Paused candidate was just rejected as stale/future-dated - its
+        raw payload must not be applied anyway just because a DIFFERENT signal (history) landed
+        on the same state name. Every other caller (the normal boot path, and the later runtime
+        call from _handle_force_emptied) keeps the default and is unaffected."""
         try:
             full = self._boot_full_state_snapshot()
             attrs = (full.get("attributes") or {}) if isinstance(full, dict) else {}
-            store = self._boot_store_snapshot()
+            store = self._boot_store_snapshot() if use_store else {}
 
             start_str = attrs.get("cycle_start_time") or store.get("cycle_start_time")
             if start_str:
@@ -1297,12 +1361,23 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         prog_file = self.args.get("programmes_file") or os.path.join(
             os.path.dirname(__file__), "dishwasher_programmes.yaml"
         )
+        # FLAW 5 (2026-09 audit): kept drifted from dishwasher_programmes.yaml (eco 227/0.94 vs
+        # the real 234/0.95, auto 160 vs the real 108, quick's 1.55 vs the real 1.2, and no
+        # dry_tail_minutes at all - silently 0/unmeasured instead of eco's real 35) - mirrored
+        # here exactly so a missing/corrupt YAML falls back to the SAME numbers the checked-in
+        # file actually has, not a stale guess from whenever these were last hand-copied.
         defaults = {
-            "quick": {"label": "QuickPowerWash", "duration_min": 58, "duration_short_min": 14, "max_energy_kwh": 1.55},
-            "gentle": {"label": "Gentle", "duration_min": 149, "max_energy_kwh": 1.2},
-            "eco": {"label": "ECO", "duration_min": 227, "duration_short_min": 74, "max_energy_kwh": 0.94},
-            "auto": {"label": "Auto", "duration_min": 160, "max_energy_kwh": 1.45},
-            "intensive": {"label": "Intensive", "duration_min": 150, "max_energy_kwh": 1.2},
+            "quick": {
+                "label": "QuickPowerWash", "duration_min": 58, "duration_short_min": 14,
+                "max_energy_kwh": 1.2, "dry_tail_minutes": 0,
+            },
+            "gentle": {"label": "Gentle", "duration_min": 149, "max_energy_kwh": 1.1, "dry_tail_minutes": 0},
+            "eco": {
+                "label": "ECO", "duration_min": 234, "duration_short_min": 74,
+                "max_energy_kwh": 0.95, "dry_tail_minutes": 35, "dry_tail_short_minutes": 0,
+            },
+            "auto": {"label": "Auto", "duration_min": 108, "max_energy_kwh": 1.45, "dry_tail_minutes": 0},
+            "intensive": {"label": "Intensive", "duration_min": 150, "max_energy_kwh": 1.2, "dry_tail_minutes": 0},
         }
         try:
             with open(prog_file, "r") as f:
@@ -1323,6 +1398,21 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         except Exception as exc:
             DishwasherMonitor.PROGRAMME_PROFILES = defaults
             self.log(f"Failed to load {prog_file}: {exc} - using defaults", level="ERROR")
+
+    def _learn_key(self, confirmed: str, short) -> str:
+        """Learned-duration series key for a confirmed programme + its short flag.
+
+        FLAW 7 (2026-09 audit): _save_cycle_feedback used to credit
+        _learned_durations[confirmed] directly while this method (and only this method) applied
+        the eco_short/quick_short split - so the in-memory key right after a save and the key
+        the SAME record keyed to after a reload could diverge. One derivation, used by every
+        site that reads or writes _learned_durations (here, _save_cycle_feedback, and
+        _remove_last_cycle_feedback), so they can never disagree again."""
+        if confirmed == "eco" and short:
+            return "eco_short"
+        if confirmed == "quick" and short:
+            return "quick_short"
+        return confirmed
 
     def _load_and_apply_feedback(self):
         """Load dishwasher_feedback.json and apply learned programme data. Only confirmed cycles."""
@@ -1346,12 +1436,7 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             if dur is None or dur <= 0:
                 continue
             # ECO with short=Yes learns as eco_short; QuickPowerWash with short=Yes learns as quick_short
-            if prog == "eco" and c.get("short"):
-                key = "eco_short"
-            elif prog == "quick" and c.get("short"):
-                key = "quick_short"
-            else:
-                key = prog
+            key = self._learn_key(prog, c.get("short"))
             prev = self._learned_durations.get(key, {"n": 0, "avg": float(dur)})
             n_new = prev["n"] + 1
             avg_new = (prev["avg"] * prev["n"] + float(dur)) / n_new
@@ -1386,27 +1471,56 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.detected_quick_short = False
             return "unknown"
         in_drying = self._in_eco_drying_phase(run_min)
+
+        # FLAW 5 (2026-09 audit): these bands used to be hardcoded literals (0.9 / 1.2 / 1.4)
+        # that had drifted from dishwasher_programmes.yaml's real max_energy_kwh ratings - eco's
+        # real ceiling is 0.95, not 0.9, so a genuine ECO wash whose energy crept past 0.9
+        # misclassified as "gentle" (149 min guard vs ECO's 234), and anything above the 1.4
+        # catch-all was force-classified "quick" (58 min guard) even when it was really an Auto
+        # cycle (real ceiling 1.45, 108 min) - auto/intensive were unreachable by energy alone.
+        # Derived from PROGRAMME_PROFILES now, preserving the existing band STRUCTURE (rinse /
+        # eco / gentle / runtime-disambiguated-ambiguous / quick-catchall) exactly - only the
+        # boundary values move to match whatever is actually loaded (YAML or its defaults
+        # fallback, now also mirrored to the YAML - see _load_programme_profiles). Reads
+        # PROGRAMME_PROFILES directly (never via _get_profile, whose _UNKNOWN_FALLBACK exists
+        # for a genuinely unclassifiable programme and would otherwise hand this derivation an
+        # oversized 2.0 kWh ceiling for any profile set that simply omits a name entirely).
+        def _rated_max_energy_kwh(name, fallback):
+            profile = DishwasherMonitor.PROGRAMME_PROFILES.get(name)
+            if not isinstance(profile, dict):
+                return fallback
+            return float(profile.get("max_energy_kwh") or fallback)
+
+        eco_max = _rated_max_energy_kwh("eco", 0.9)
+        gentle_max = _rated_max_energy_kwh("gentle", 1.2)
+        # Auto is the one concretely documented case of a legitimate higher-energy programme
+        # the old hardcoded 1.4 catch-all swallowed into "quick" (58-min guard vs Auto's 108) -
+        # raise the catch-all to at least cover it. Floored at the original 1.4 literal (never
+        # shrunk below it) so a profile set that does not define "auto" at all - e.g. a partial
+        # test double - keeps exactly today's catch-all threshold.
+        upper_ceiling = max(1.4, _rated_max_energy_kwh("auto", 1.4))
+
         # QuickPowerWash with short = rinse/salt cycle (< 0.2 kWh, < 20 min)
         if energy < 0.2 and run_min < 20:
             self.detected_short = False
             self.detected_quick_short = True
             return "quick"
-        # ECO: 0.4–0.9 kWh; short = Yes when runtime suggests short run (~74 min)
+        # ECO: 0.4 kWh up to its own rated ceiling; short = Yes when runtime suggests short run (~74 min)
         # If we're in the long drying phase (past 100 min, low power), treat as ECO full.
-        if 0.4 <= energy <= 0.9:
+        if 0.4 <= energy <= eco_max:
             self.detected_quick_short = False
             if run_min < 120 and not in_drying:
                 self.detected_short = True
                 return "eco"
             self.detected_short = False
             return "eco"
-        # Gentle: 0.9–1.2 kWh (manual)
-        if 0.9 < energy <= 1.2:
+        # Gentle: up to its own rated ceiling (manual)
+        if eco_max < energy <= gentle_max:
             self.detected_short = False
             self.detected_quick_short = False
             return "gentle"
-        # Quick: > 1.4 kWh (full QuickPowerWash)
-        if energy > 1.4:
+        # Quick: above every known programme's ceiling (full QuickPowerWash)
+        if energy > upper_ceiling:
             self.detected_short = False
             self.detected_quick_short = False
             return "quick"
@@ -1694,10 +1808,13 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.log(f"Could not write feedback to {path}: {e}", level="WARNING")
             return
         if programme_confirmed_by_human:
-            prev = self._learned_durations.get(confirmed, {"n": 0, "avg": duration_min})
+            # FLAW 7 (2026-09 audit): must use the SAME eco_short/quick_short derivation
+            # _load_and_apply_feedback uses on reload - see _learn_key.
+            key = self._learn_key(confirmed, record.get("short", False))
+            prev = self._learned_durations.get(key, {"n": 0, "avg": duration_min})
             n_new = prev["n"] + 1
             avg_new = (prev["avg"] * prev["n"] + duration_min) / n_new
-            self._learned_durations[confirmed] = {"n": n_new, "avg": avg_new}
+            self._learned_durations[key] = {"n": n_new, "avg": avg_new}
         status = "confirmed" if programme_confirmed_by_human else "unconfirmed"
         self.log(f"Feedback saved: {confirmed} ({status}) duration {duration_min:.0f}min energy {energy_kwh:.2f}kWh", level="INFO")
 
@@ -1717,14 +1834,25 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         removed = cycles.pop()
         confirmed = removed.get("confirmed", "")
         duration_min = removed.get("duration_min", 0)
-        if confirmed and duration_min and confirmed in self._learned_durations:
-            old = self._learned_durations[confirmed]
-            n = old["n"] - 1
-            if n <= 0:
-                del self._learned_durations[confirmed]
-            else:
-                avg_new = (old["avg"] * old["n"] - duration_min) / n
-                self._learned_durations[confirmed] = {"n": n, "avg": avg_new}
+        # FLAW 7 (2026-09 audit): this used to decrement _learned_durations[confirmed]
+        # unconditionally, regardless of whether the popped record had ever been confirmed by a
+        # human (and therefore whether _save_cycle_feedback had ever credited it at all) - and
+        # keyed on the bare "confirmed" string, never eco_short/quick_short (see _learn_key), so
+        # it could decrement the WRONG series too. Gate on the record's own
+        # programme_confirmed_by_human, and derive the key the same way every other site does.
+        was_confirmed_by_human = removed.get(
+            "programme_confirmed_by_human", removed.get("programme_user_confirmed", False)
+        )
+        if was_confirmed_by_human and confirmed and duration_min:
+            key = self._learn_key(confirmed, removed.get("short", False))
+            old = self._learned_durations.get(key)
+            if old:
+                n = old["n"] - 1
+                if n <= 0:
+                    del self._learned_durations[key]
+                else:
+                    avg_new = (old["avg"] * old["n"] - duration_min) / n
+                    self._learned_durations[key] = {"n": n, "avg": avg_new}
         try:
             with open(self.feedback_file, "w") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -2522,7 +2650,19 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             self._evaluate_pause_exit(force=True)
 
     def _evaluate_pause_exit(self, force=False):
-        """Determine whether to go to Unemptied or Off when exiting Paused state."""
+        """Determine whether to go to Unemptied or Off when exiting Paused state.
+
+        FLAW 3 (2026-09 audit): force used to be accepted but never threaded into the
+        transitions below, so a door-close within ~210s of the pause (cooling_period 300 -
+        stop_for 90) was silently refused by the cooling period and the machine sat in Paused
+        forever - _poll_power does nothing for Paused at 0W and there is no other reconciler.
+        skip_announce was also always False (Sonos-blasting the person who just opened the
+        door - the door-first path a few lines up in _handle_door_opened correctly uses
+        skip_announce=True for the same reason), and the feedback save ran unconditionally,
+        even when the transition above was refused - a phantom/duplicate record for one wash.
+        Both transitions now take force, the save is gated on the transition actually landing
+        (mirrors _finish_with_dry_tail's own landing check), and the announcement is skipped
+        whenever a door opening caused this pause in the first place."""
         self._safe_cancel_timer(self.pause_finish_timer)
         self.pause_finish_timer = None
         if self._is_valid_completed_cycle():
@@ -2531,7 +2671,18 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             idle_min = run_minutes_wall - run_minutes if duration_source and run_minutes_wall > run_minutes else None
             energy_kwh = self._get_energy_used()
             prog = self._classify_programme()
-            self._transition_to_unemptied(skip_announce=False, run_minutes=run_minutes, energy_used=energy_kwh)
+            self._transition_to_unemptied(
+                skip_announce=self.door_opened_during_cycle,
+                run_minutes=run_minutes,
+                energy_used=energy_kwh,
+                force=force,
+            )
+            if self.get_state(self.state_entity) != "Unemptied":
+                # Cooling period (or similar) refused the transition; a later door-close /
+                # pause-finish retry re-evaluates - do not save feedback for a state that never
+                # landed, or the retry would duplicate the record.
+                self.log("Pause-exit transition refused (cooling?) - will retry", level="DEBUG")
+                return
             confirmed, is_human = self._get_confirmed_from_selector(prog)
             self._save_cycle_feedback(
                 predicted=prog,
@@ -2545,7 +2696,7 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
                 idle_min=idle_min,
             )
         else:
-            self._transition_to_off("Cycle interrupted or incomplete")
+            self._transition_to_off("Cycle interrupted or incomplete", force=force)
 
     def _off_merged_attributes(self, reason):
         """Merge Off transition into existing sensor attributes so stale Running fields disappear in HA."""
@@ -2651,9 +2802,15 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
                 replace=True,
             )
 
-            if self.poll_timer:
-                self._safe_cancel_timer(self.poll_timer)
-                self.poll_timer = None
+            # FLAW 6 (2026-09 audit): Unemptied has no clock-driven exit of its own - the
+            # watchdog below is disabled by default (unemptied_timeout_hours: 0) and the only
+            # other exit is a door-open edge that _door_state_changed can miss (HA restart
+            # racing the event, a dropped listener, ...). Keep the poll loop alive (instead of
+            # cancelling it) so _poll_power's reconciler can notice a missed edge from the
+            # recorder and self-heal to Emptied - see _poll_power's own Unemptied branch. Never
+            # infer emptied from power alone: 0W is the NORMAL steady state here, not evidence.
+            self._safe_cancel_timer(self.poll_timer)
+            self.poll_timer = self.run_in(self._poll_power, 60)
 
             # Cancel running watchdog; start unemptied watchdog only if timeout > 0 (0 = can stay Unemptied indefinitely)
             self._safe_cancel_timer(self.running_watchdog_timer)
@@ -3069,6 +3226,25 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
     def _poll_power(self, kwargs):
         """Conditional polling"""
         current_state = self.get_state(self.state_entity)
+
+        if current_state == "Unemptied":
+            # FLAW 6 (2026-09 audit): reconciler for a missed door-open edge - the unemptied
+            # watchdog is disabled by default (dishwasher.yaml: unemptied_timeout_hours: 0), so
+            # without this a missed edge left the machine wedged in Unemptied forever. The
+            # recorder, not power, is the arbiter: 0W here is the NORMAL steady state (a
+            # finished, unemptied dishwasher), never evidence of anything on its own.
+            if self._door_open_edge_since(self.state_since):
+                self.log(
+                    "Poll: Unemptied door-open edge found in history since state_since - "
+                    "a door event was missed",
+                    level="INFO",
+                )
+                self._transition_to_emptied("Door opened (missed edge, found by poll)")
+                return
+            # Each check is a recorder history query; Unemptied can last a day, so poll
+            # every 5 min here - a missed edge is not latency-critical.
+            self.poll_timer = self.run_in(self._poll_power, 300)
+            return
 
         if current_state not in ("Running", "Paused"):
             if self.poll_timer:
