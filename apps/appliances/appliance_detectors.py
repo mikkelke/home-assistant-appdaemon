@@ -22,6 +22,8 @@ Emissions + knobs by detector:
   PowerEndDetector   : POWER_LOW, POWER_END_CONFIRMED, POWER_RECOVERED | stop_w, stop_for, power_sensor
   DoorEdgeDetector   : DOOR_OPENED, DOOR_CLOSED (power snapshot in payload) | door_sensor, power_sensor,
                        door_sensor_inverted (optional)
+  PausedExitReconciler: DOOR_CLOSED (tick-only, PAUSED with door already reading closed) | door_sensor,
+                       power_sensor
   WatchdogTimer      : WD_RUNNING|WD_PAUSE|WD_UNEMPTIED|WD_EMPTIED | (duration, retry_delay_s at construction)
   PlugOutageDetector : PLUG_OUTAGE (+ ActionSink pushes) | power_sensor, power_unavailable_grace_s,
                        appliance_label (optional)
@@ -192,6 +194,34 @@ class DoorEdgeDetector(Detector):
             ctx.emit(Evidence.make(EvidenceType.DOOR_OPENED, ctx.now(), self.name, payload=payload))
         elif _door_closed(new, ctx):
             ctx.emit(Evidence.make(EvidenceType.DOOR_CLOSED, ctx.now(), self.name, payload=payload))
+
+
+class PausedExitReconciler(Detector):
+    """Periodic backstop for a PAUSED that never gets a fresh door-close EDGE to react to (2026-09
+    audit F1b): a restart while paused with the door already shut (or any other missed-Zigbee-edge
+    case) leaves PAUSED with no exit route at all until the pause watchdog's force-Off timeout,
+    which then wipes an in-progress cycle that may still genuinely be running.
+    dryer_monitor.py's own fix is `_poll_power` re-arming itself every 60s while Running/Paused and,
+    when Paused with the door reading off, running the SAME ">= start_w -> resume / else ->
+    pause-exit evaluation" split a real door-close event would (dryer_monitor.py:2127-2136). tick()
+    is the engine-native equivalent: it does not decide anything itself - it only re-emits the same
+    DOOR_CLOSED evidence DoorEdgeDetector would have emitted for a real edge (with a fresh power
+    snapshot), so the ordinary PAUSED/DOOR_CLOSED table rows resolve it, within one tick interval
+    rather than waiting out the full pause timeout."""
+
+    name = "paused_exit_reconciler"
+
+    def tick(self, ctx: Any) -> None:
+        if ctx.state != State.PAUSED:
+            return
+        door = ctx.config.get("door_sensor")
+        if door is None or not _door_closed(ctx.get_state(door), ctx):
+            return
+        watts = _parse_watts(ctx.get_state(ctx.config["power_sensor"]))
+        ctx.emit(Evidence.make(
+            EvidenceType.DOOR_CLOSED, ctx.now(), self.name,
+            payload={"power_w": watts if watts is not None else 0.0},
+        ))
 
 
 class WatchdogTimer(Detector):

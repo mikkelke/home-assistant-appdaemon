@@ -679,11 +679,20 @@ class ApplianceFSM:
 
     # exactly-once feedback (spec section 6)
     def _request_feedback(self, record: dict) -> None:
-        """Called from a landing FINISHED action via ctx.request_feedback. Saves iff a cycle_id is
-        set AND not already fed back, then stamps it - so a re-entered finish path (nine junk
-        records, 2026-08-12, F3) can never save twice for one cycle."""
+        """Called from a landing FINISHED action via ctx.request_feedback. Saves iff not already
+        fed back for this cycle_id, then stamps it - so a re-entered finish path (nine junk
+        records, 2026-08-12, F3) can never save twice for one cycle.
+
+        A None cycle_id degrades to "no guard" and always saves (dryer_monitor.py's own
+        _save_cycle_feedback docstring: "Falling back to None there just degrades to 'no guard'
+        for that instance... never a new way for this method to raise") rather than dropping the
+        record outright - reachable when a host restores an active cycle with no store to carry a
+        cycle_id (2026-09 audit F5: the v2 entity says Running/Paused but the on-disk store is
+        missing/unreadable). The host is still expected to mint a real cycle_id on every such
+        restore (dryer_shadow.py's initialize()) so this fallback only ever covers ONE finish, not
+        every re-entry of an indefinitely id-less cycle."""
         cid = self._cycle_id
-        if cid is not None and cid != self._last_feedback_cycle_id:
+        if cid is None or cid != self._last_feedback_cycle_id:
             self._actions.save_feedback(record)
             self._last_feedback_cycle_id = cid
         else:

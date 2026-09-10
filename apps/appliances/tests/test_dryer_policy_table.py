@@ -201,9 +201,10 @@ class TableRowCoverage(unittest.TestCase):
     def test_row_count_matches_spec_shape(self):
         # Documents the table's size so a silent row deletion/addition is visible in a diff -
         # spec section 4's ~36 canonical rows plus RECONCILE (engine-native, section 8) on
-        # RUNNING+PAUSED.
+        # RUNNING+PAUSED, plus three rows added by the 2026-09 audit (test_dryer_shadow_audit_
+        # 2026_09.py): PAUSED/POWER_HIGH (F1a) and PLUG_OUTAGE on both ENDING and PAUSED (F6).
         total = sum(len(rows) for by_ev in dp.TABLE.values() for rows in by_ev.values())
-        self.assertEqual(total, 42)
+        self.assertEqual(total, 45)
 
 
 EXERCISED = set()

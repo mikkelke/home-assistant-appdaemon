@@ -872,19 +872,31 @@ class DryerPolicy:
         # live proof of genuine activity) falling back to start_time - matches repro_B2.py's
         # verifier-validated shape exactly.
         anchor_dt = self.last_high_energy_at or self.start_time
-        if anchor_dt is not None:
-            latency_min = (ctx.now() - anchor_dt).total_seconds() / 60
-            if latency_min > self.cfg["announce_freshness_minutes"]:
-                force_push = True
+        # Computed unconditionally (0.0 when there is no anchor at all) - 2026-09 audit F3: this
+        # used to live inside `if anchor_dt is not None:` and was discarded the moment force_push
+        # was decided, so the push message a few lines below fell back to `run_min` (elapsed since
+        # cycle START, not since it actually stopped) - "finished about 130 min ago" for a load
+        # that stopped drawing power 4 min ago. latency_min IS that "min ago" figure; run_min never
+        # was.
+        latency_min = (ctx.now() - anchor_dt).total_seconds() / 60 if anchor_dt is not None else 0.0
+        if latency_min > self.cfg["announce_freshness_minutes"]:
+            force_push = True
         if not skip_announce and not self.notification_sent:
-            announce_entity = self.cfg.get("announce_entity")
-            enabled = ctx.get_state(announce_entity) == "on" if announce_entity else True
-            if enabled:
-                if force_push:
-                    ctx.push_mobile(f"Dryer finished about {run_min:.0f} min ago (late detection) - ready to empty.")
-                else:
-                    ctx.announce(self.cfg["announce_message"])
+            if force_push:
+                # Mobile push is the late-detection FALLBACK channel - never gated behind the
+                # Sonos announce_entity toggle (2026-09 audit F4; dryer_monitor.py's boot self-heal
+                # "late-push" branch, :636-641, pushes unconditionally, unlike the Sonos call a few
+                # lines above it at :1834-1841, which the toggle DOES gate). Silencing Sonos must
+                # never also silence the one channel that exists precisely because Sonos might be
+                # missed.
+                ctx.push_mobile(f"Dryer finished about {latency_min:.0f} min ago (late detection) - ready to empty.")
                 self.notification_sent = True
+            else:
+                announce_entity = self.cfg.get("announce_entity")
+                enabled = ctx.get_state(announce_entity) == "on" if announce_entity else True
+                if enabled:
+                    ctx.announce(self.cfg["announce_message"])
+                    self.notification_sent = True
         if lands_on == "FINISHED":
             self.watchdogs["unemptied"].arm(ctx)
         elif lands_on == "EMPTIED":
@@ -1013,15 +1025,78 @@ class DryerPolicy:
                 wd.cancel(ctx)
             self._reset_cycle_physics()
 
+    def sync_selectors_on_publish(self, ctx, state):
+        """OFF/EMPTIED-landing UI housekeeping (2026-09 audit F4), centralized the exact same way
+        sync_watchdogs_on_publish is (see its own docstring) - a dozen scattered per-action calls
+        (a_force_off/a_plug_outage_wipe/a_door_emptied_close on OFF; a_door_emptying/a_finish_
+        silent/a_door_emptying_from_finished/a_force_emptied/a_reconcile's door-edge branch on
+        EMPTIED) could each forget one, exactly the class of bug sync_watchdogs_on_publish already
+        exists to close for watchdogs.
+
+        OFF mirrors dryer_monitor.py:1730-1758's _reset_programme_selectors_to_unconfirmed, called
+        unconditionally from every _transition_to_off regardless of `reason` (:1770, :2336) - reset
+        the programme/dryness/Skane+/time-minutes selectors to their idle defaults so the NEXT
+        cycle's get_confirmed_programme_key() reads fresh input, not the previous cycle's choice
+        (which otherwise gets attributed to the new cycle's programme, poisoning the learned EMA).
+        EMPTIED mirrors :1907-1913 - re-enable the announce toggle for next cycle.
+
+        Routed through ctx.select_option/reset_selectors, never ctx.announce/push_mobile - neither
+        is hypothesis-gated (ActionSink's own docstring: "select_option/reset_selectors mirror UI
+        helpers, not gated") - an idle reset or an announce-toggle re-arm is not itself a
+        notification, so even an uncorroborated restore landing on OFF/EMPTIED must still perform
+        it. The shadow's ShadowActions implementation of both is an inert recorder (spec 7.2) -
+        this can only ever produce a record, never a real service call."""
+        if state == State.OFF:
+            if not self.cfg["reset_programme_on_idle"]:
+                return
+            selectors = self.cfg.get("selectors", {})
+            reset = {}
+            programme_entity = self.cfg.get("programme_entity")
+            if programme_entity:
+                option = selectors.get("programme_unconfirmed_option", "Auto (unconfirmed)")
+                ctx.select_option(programme_entity, option)
+                reset["programme"] = option
+            dryness_entity = self.cfg.get("dryness_entity")
+            if dryness_entity:
+                option = selectors.get("dryness_unselected_option", "-")
+                ctx.select_option(dryness_entity, option)
+                reset["dryness"] = option
+            skane_entity = self.cfg.get("skane_plus_entity")
+            if skane_entity:
+                ctx.select_option(skane_entity, "off")
+                reset["skane_plus"] = "off"
+            time_entity = self.cfg.get("time_minutes_entity")
+            if self.cfg["reset_time_minutes_on_idle"] and time_entity:
+                option = selectors.get("time_minutes_idle_default", "20")
+                ctx.select_option(time_entity, option)
+                reset["time_minutes"] = option
+            ctx.reset_selectors(**reset)
+        elif state == State.EMPTIED:
+            announce_entity = self.cfg.get("announce_entity")
+            if announce_entity:
+                ctx.select_option(announce_entity, "on")
+
     def rearm_watchdogs_after_restore(self, ctx, state, since):
         """Restart re-arm (spec 4.2's own column): floored remaining time from `since` (state_since
         - falls back to ctx.now(), i.e. a full period, when the restore had none), never a fresh
         full-duration arm - dryer_shadow.py calls this once, right after enter_state_silently, for
         RUNNING/PAUSED/FINISHED/EMPTIED. RUNNING+PAUSED both re-arm "running" (spans both, spec
-        4.2); PAUSED additionally re-arms "pause"."""
+        4.2); PAUSED additionally re-arms "pause".
+
+        The "running" watchdog specifically anchors to self.start_time when available, NOT
+        `since` (2026-09 audit F7a; dryer_monitor.py:783-786's _restore_running_state anchors its
+        own running-watchdog re-arm to self.start_time, never to state_since/last_changed - only
+        the PAUSE watchdog uses that, :788-791). By the time this is called, policy.restore_from()
+        has already populated start_time from the store (called first in both dryer_shadow.py's
+        initialize() and tests/replay.py). Anchoring "running" to `since` instead used the state's
+        own last-changed instant - which for a restored RUNNING/PAUSED can be minutes younger than
+        the cycle's true start (e.g. a restart while Paused re-stamps state_since, even though the
+        cycle itself started hours earlier) - and re-armed a near-FULL max_running_hours period
+        every time instead of the true remainder (observed: a 4h-old cycle got a fresh ~5h running
+        re-arm instead of the ~1h actually left)."""
         since = since or ctx.now()
         if state in (State.RUNNING, State.PAUSED):
-            self.watchdogs["running"].arm_remaining(ctx, since)
+            self.watchdogs["running"].arm_remaining(ctx, self.start_time or since)
         if state == State.PAUSED:
             self.watchdogs["pause"].arm_remaining(ctx, since)
         elif state == State.FINISHED:
@@ -1103,8 +1178,16 @@ def resolve_shadow_progress(*, file_data, entity_attrs, code_fingerprint):
         stored_fingerprint = data.get("code_fingerprint")
         if not stored_fingerprint:
             return {**zero, "source": source, "reset_reason": "stored progress carries no fingerprint"}
-        if code_fingerprint and stored_fingerprint != code_fingerprint:
-            return {**zero, "source": source, "reset_reason": "engine code changed since it was recorded"}
+        # A None LIVE fingerprint (this boot could not hash the engine files - see
+        # DryerShadow._compute_fingerprint) must NOT silently pass a stored counter through: with
+        # the old `if code_fingerprint and ...` guard, a falsy current fingerprint short-circuited
+        # the whole comparison to False, accepting counters we have no way to prove came from this
+        # engine (2026-09 audit F2). Treated exactly like a mismatch - reset, not trusted.
+        if code_fingerprint is None or stored_fingerprint != code_fingerprint:
+            return {
+                **zero, "source": source,
+                "reset_reason": "engine code changed since it was recorded (or its current fingerprint is unavailable)",
+            }
         return {
             "clean_cycles": clean,
             "divergence_count": _coerce_counter(data.get("divergence_count")) or 0,
@@ -1129,7 +1212,12 @@ def resolve_boot_snapshot(*, entity_state, entity_attrs, entity_last_changed, st
     restore needed at all)."""
     entity_sourced = entity_state in VALID_STATES
     if entity_sourced:
-        state_since = entity_last_changed
+        # Falls back to the store's own state_since when the entity carries none (2026-09 audit
+        # F7b; dryer_monitor.py:790's `boot_last_changed or store_data.get("state_since")` has
+        # always had this fallback - a v2 entity with no last_changed left state_since as None
+        # here, which rearm_watchdogs_after_restore then treated as "now", arming a FULL watchdog
+        # period for a pause/finish/emptied that may already be most of the way through its own).
+        state_since = entity_last_changed or (store_data or {}).get("state_since")
         return {
             "state": entity_state, "source": "entity", "state_since": state_since,
             "cycle_id": (store_data or {}).get("cycle_id"), "code_fingerprint": (store_data or {}).get("code_fingerprint"),
@@ -1235,12 +1323,28 @@ TABLE = {
     S.PAUSED: {
         E.DOOR_CLOSED: [
             Row(guards=("G_power_high_live",), action="a_resume_from_pause", target=S.RUNNING, cooling=BYPASS),
-            Row(guards=("G_power_low_live", "G_valid_cycle"), action="a_finish_announce", target=S.FINISHED, cooling=BYPASS),
-            Row(guards=("G_power_low_live",), target=S.OFF, cooling=BYPASS),
+            # Unguarded "else" from here down (2026-09 audit F1a) - mirrors dryer_monitor.py:
+            # 1579-1584's exact split (`>= start_w` -> resume, `else` -> _evaluate_pause_exit,
+            # :1705-1728, which never re-checks watts at all) instead of the previous G_power_
+            # low_live<=stop_w guard, which left 5W < live power < 8W matching NO row at all -
+            # PAUSED with no announce and no feedback, forever (or until the pause watchdog wipes
+            # a cycle that may still be running).
+            Row(guards=("G_valid_cycle",), action="a_finish_announce", target=S.FINISHED, cooling=BYPASS),
+            Row(target=S.OFF, cooling=BYPASS),
         ],
+        # A live POWER_HIGH sample is unconditional proof the cycle is genuinely running
+        # (PowerStartDetector emits it on any sample >= start_w regardless of state) - previously
+        # unlisted here, so it was silently dropped while Paused (F1a). Same action/target/cooling
+        # as DOOR_CLOSED's own high-power row above - both are "a live signal already proves
+        # Running", just reached via a different evidence type.
+        E.POWER_HIGH: [Row(guards=("G_power_high_live",), action="a_resume_from_pause", target=S.RUNNING, cooling=BYPASS)],
         E.WD_PAUSE: [Row(target=S.OFF, cooling=BYPASS)],
         E.WD_RUNNING: [Row(action="a_force_off", target=S.OFF, cooling=RESPECT)],
         E.DOOR_OPENED: [Row(action="a_door_pause_track")],
+        # F6: a dead power plug must force Off from Paused too (dryer_monitor.py:2319-2337 forces
+        # Off from EVERY state) - previously only RUNNING had this row, so ENDING/PAUSED published
+        # a live state against a plug that had gone dark until the (much slower) 5h watchdog.
+        E.PLUG_OUTAGE: [Row(action="a_plug_outage_wipe", target=S.OFF)],
         E.RECONCILE: [
             Row(guards=("G_reconcilable", "G_door_edge"), action="a_reconcile", target=S.EMPTIED),
             Row(guards=("G_reconcilable",), action="a_reconcile", target=S.FINISHED),
@@ -1261,6 +1365,10 @@ TABLE = {
             Row(target=S.OFF, cooling=BYPASS),
         ],
         E.WD_RUNNING: [Row(action="a_force_off", target=S.OFF, cooling=RESPECT)],
+        # F6, see PAUSED's own PLUG_OUTAGE row above. FINISHED/EMPTIED deliberately do NOT get one
+        # (per the audit's own note): their watchdogs (unemptied/emptied) already backstop a dead
+        # plug, and neither state holds a live in-progress cycle a dark plug could corrupt.
+        E.PLUG_OUTAGE: [Row(action="a_plug_outage_wipe", target=S.OFF)],
     },
     S.FINISHED: {
         E.DOOR_OPENED: [Row(action="a_door_emptying_from_finished", target=S.EMPTIED, cooling=BYPASS)],

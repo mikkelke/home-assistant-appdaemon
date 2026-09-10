@@ -39,12 +39,16 @@ except ImportError:
     from appliance_fsm import ApplianceFSM, Evidence, EvidenceType, RESTORE_STATE_OF, State, SystemClock
 
 try:
-    from appliance_detectors import DoorEdgeDetector, PlugOutageDetector, PowerEndDetector, PowerStartDetector
+    from appliance_detectors import (
+        DoorEdgeDetector, PausedExitReconciler, PlugOutageDetector, PowerEndDetector, PowerStartDetector,
+    )
 except ImportError:
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from appliance_detectors import DoorEdgeDetector, PlugOutageDetector, PowerEndDetector, PowerStartDetector
+    from appliance_detectors import (
+        DoorEdgeDetector, PausedExitReconciler, PlugOutageDetector, PowerEndDetector, PowerStartDetector,
+    )
 
 try:
     import dryer_policy as policy_mod
@@ -64,6 +68,30 @@ except ImportError:
 
 E = EvidenceType
 _UNAVAILABLE = (None, "unknown", "unavailable")
+
+# The engine IS these four files together, not just this host (2026-09 audit F2):
+# _compute_fingerprint used to hash only dryer_shadow.py, so a change to the policy, the
+# transition table, a guard/action body, or a detector went completely undetected -
+# resolve_shadow_progress would keep trusting a stored clean_cycles count, and corroborate_restore
+# would keep trusting a stored code_fingerprint, that both actually describe a DIFFERENT engine.
+# Sorted (already alphabetical here) so the hash is stable regardless of how this tuple is written.
+_FINGERPRINT_MODULES = ("appliance_detectors.py", "appliance_fsm.py", "dryer_policy.py", "dryer_shadow.py")
+
+
+def _hash_engine_files(directory):
+    """The sorted-concatenation hash itself, pulled out of _compute_fingerprint so it can be
+    exercised directly against a tmpdir of stand-in files (test_dryer_shadow_audit_2026_09.py)
+    without needing to mutate the real sibling source files. Returns None on ANY read failure -
+    resolve_shadow_progress/corroborate_restore both already treat a None fingerprint as
+    untrustworthy, never as a free pass."""
+    h = hashlib.md5()
+    try:
+        for name in sorted(_FINGERPRINT_MODULES):
+            with open(Path(directory) / name, "rb") as f:
+                h.update(f.read())
+    except Exception:
+        return None
+    return h.hexdigest()
 
 
 class ShadowActions:
@@ -165,7 +193,7 @@ class DryerShadow(hass.Hass):
         scheduler = _SchedulerAdapter(self)
         detectors = [
             PowerStartDetector(), PowerEndDetector(), DoorEdgeDetector(), PlugOutageDetector(),
-            policy_mod.KeepFreshDetector(),
+            PausedExitReconciler(), policy_mod.KeepFreshDetector(),
         ]
 
         self._divergence_count = 0
@@ -236,6 +264,20 @@ class DryerShadow(hass.Hass):
         self._policy = policy
         self._actions = actions
 
+        if initial_state in (State.RUNNING, State.PAUSED) and cycle_id is None:
+            # 2026-09 audit F5: the entity branch takes cycle_id from store_data (resolve_boot_
+            # snapshot), which is None whenever the store is missing/unreadable even though the
+            # v2 entity itself says Running/Paused - an active cycle restored with NO identity at
+            # all. mint_cycle_id() also resets the engine's own exactly-once guard, so a later
+            # finish for THIS freshly-minted id still dedupes correctly against any re-entry,
+            # rather than leaving cycle_id permanently None (which _request_feedback's own "no
+            # guard" fallback would otherwise re-save on every single re-entry, forever).
+            cycle_id = self.fsm.mint_cycle_id()
+            self.log(
+                "Boot restore had no cycle_id (store missing/unreadable) - minted a fresh one so "
+                "feedback stays well-defined for this cycle",
+                level="INFO",
+            )
         self.fsm.enter_state_silently(initial_state, state_since=state_since, hypothesis=hypothesis, cycle_id=cycle_id)
         self._prev_internal = initial_state
         if policy.last_feedback_cycle_id is not None:
@@ -258,11 +300,7 @@ class DryerShadow(hass.Hass):
     # ---- fingerprint (mirrors cycle_persistence.py's _compute_code_fingerprint, own module) ----
 
     def _compute_fingerprint(self):
-        try:
-            with open(__file__, "rb") as f:
-                return hashlib.md5(f.read()).hexdigest()
-        except Exception:
-            return None
+        return _hash_engine_files(Path(__file__).resolve().parent)
 
     def _live_watts(self):
         v = self.get_state(self.power_sensor)
@@ -285,6 +323,7 @@ class DryerShadow(hass.Hass):
         landed transition passes through, so watchdog cancel-sync and divergence tracking cannot
         be missed by a future table row (see dryer_policy.sync_watchdogs_on_publish)."""
         self._policy.sync_watchdogs_on_publish(self.fsm.ctx, internal)
+        self._policy.sync_selectors_on_publish(self.fsm.ctx, internal)
 
         if internal == State.OFF and self._prev_internal == State.EMPTIED:
             if self._divergence_count == self._divergence_count_at_last_off:
