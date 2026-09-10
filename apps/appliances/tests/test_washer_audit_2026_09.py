@@ -38,6 +38,13 @@
 #           start-gap-correction branch and the unconditional restore call right after it both
 #           call _restore_energy_state_from_history(), which armed energy_check_timer without
 #           cancelling any handle already running.
+#   FLAW 7  (2026-09-10 follow-up) _standby_backstop_tick had the same "reports success
+#           unconditionally" defect as FLAW 2's _try_finish_via_standby: its three
+#           _transition_to_unemptied()/_transition_to_off() calls all returned True regardless
+#           of whether the transition actually landed, so a refused zero-power finish made
+#           _check_energy_finish's caller stop the tick without re-arming it (the caller's own
+#           fallthrough to the bottom-of-tick reschedule - already fixed under FLAW 2 - covers
+#           the False case once the return value is honest).
 
 from __future__ import annotations
 
@@ -470,6 +477,57 @@ class Flaw6BootRestoreArmsOnlyOneEnergyTickLoop(unittest.TestCase):
         live_tick_handles = [h for h in tick_handles if h in app._live_handles]
         self.assertEqual(len(live_tick_handles), 1, app.scheduled)
         self.assertIn(app.energy_check_timer, app._live_handles)
+
+
+# =============================================================================
+# FLAW 7 (follow-up) - _standby_backstop_tick must report whether its transition landed
+# =============================================================================
+
+class Flaw7StandbyBackstopRearmsWhenItsTransitionIsRefused(unittest.TestCase):
+    """_check_energy_finish's zero-power branch (if self._standby_backstop_tick(...): return)
+    relies on a True return meaning "the cycle actually finished, stop the tick". A refused
+    _transition_to_unemptied() used to still report True, so the caller returned without
+    re-arming - same defect class as FLAW 2's _try_finish_via_standby."""
+
+    def test_refused_zero_power_finish_rearms_the_tick(self):
+        NOW = trs.NOW
+        start = NOW - timedelta(minutes=125)  # past strygelet's 119 min guard_dur
+        app = trs.make_full_init_app(
+            sensor_state=None,
+            helper_state=None,
+            power_watts=0,
+            now=NOW,
+            extra_args={"confirm_entity": "input_select.washer_confirmed_programme"},
+        )
+        app.states[app.confirm_entity] = "Strygelet"
+        app.programme_confirmed_by_user = True
+        app.state = "Running"
+        app.states[app.state_entity] = "Running"
+        app.start_time = start
+        app.notification_sent = False
+        app.last_door_closed_trusted = False
+        app.energy_start = 0.0
+        app.states[app.energy_sensor] = 0.35  # keeps classification off the no-anti-crease "uld" branch
+        app.states[app.power_sensor] = "0.0"
+        # Only 4 points (< 5): washer_power.looks_like_cycle_end's own documented fail-safe
+        # ("not enough data") refuses _power_looks_like_cycle_end deterministically, which
+        # refuses _transition_to_unemptied inside _standby_backstop_tick - the exact "attempted
+        # but refused" shape this flaw is about, regardless of which of _transition_to_unemptied's
+        # own gates does the refusing.
+        app._history[app.power_sensor] = [
+            {"state": "0.0", "last_changed": trs._iso(NOW - timedelta(minutes=m))} for m in (9, 6, 3, 1)
+        ]
+        # Sustained hard 0W for 4 min (>= the 3.0 min normal-finish threshold).
+        app._zero_power_since = NOW - timedelta(minutes=4)
+
+        before = len(app.scheduled)
+        app._check_energy_finish({})
+
+        # The refused transition must leave the cycle Running, not silently "finished".
+        self.assertEqual(app.state, "Running")
+        self.assertIsNotNone(app.energy_check_timer)
+        new_ticks = [c for c in app.scheduled[before:] if c[0] == app._check_energy_finish]
+        self.assertEqual(len(new_ticks), 1, app.scheduled[before:])
 
 
 if __name__ == "__main__":

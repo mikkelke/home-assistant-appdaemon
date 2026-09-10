@@ -6263,8 +6263,11 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
     def _standby_backstop_tick(self, now, tick_prog, tick_temp, tick_class) -> bool:
         """Zero-power standby backstop: decide what to do after sustained hard 0W.
 
-        Called from _check_energy_finish when instantaneous power is <= 0W. Returns True
-        when it transitioned the state (caller must stop the tick), False to keep checking.
+        Called from _check_energy_finish when instantaneous power is <= 0W. Returns True only
+        when a transition actually landed (caller must stop the tick); False to keep checking,
+        including when a transition was attempted but refused (e.g. cooling period) - the
+        caller's own fallthrough re-arms the tick in that case, exactly as a False here always
+        implied "not finished yet".
 
         Ladder (all thresholds unchanged from the original inline block):
           * 0W >= 3 min + finish guards met + valid cycle    -> Unemptied (normal finish).
@@ -6294,7 +6297,11 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             )
             if self._is_valid_completed_cycle():
                 self._transition_to_unemptied()
-                return True
+                # The transition can still be refused (e.g. cooling period) - only report
+                # success (and let the caller stop its tick) when it actually landed, so a
+                # refusal falls through to the tick's normal reschedule instead of the caller
+                # wrongly believing the cycle finished and skipping its own re-arm.
+                return self.state == "Unemptied"
         else:
             self.log(
                 f"Standby backstop: 0W for {zero_min:.1f}min but finish time guards not met (run {run_min:.0f}min) - skipping",
@@ -6318,13 +6325,17 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 )
                 self._pending_end_reason = "standby_backstop"
                 self._transition_to_unemptied()
-                return True
+                # See the normal-finish branch above: report success only when the transition
+                # actually landed.
+                return self.state == "Unemptied"
             self.log(
                 f"Standby backstop: cycle invalid + 0W for {zero_min:.1f}min - forcing Off",
                 level="WARNING",
             )
             self._transition_to_off("Standby backstop: invalid cycle with sustained zero power")
-            return True
+            # Same rationale as the Unemptied branches above: only report success when the
+            # transition actually landed (force=False here, so cooling period can refuse it).
+            return self.state == "Off"
         self.log("Standby backstop but cycle validation failed - keep checking", level="WARNING")
         return False
 

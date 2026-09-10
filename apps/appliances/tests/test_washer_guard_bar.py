@@ -73,6 +73,7 @@ def make_app(start=CYCLE_START):
     app.guard_energy_disproof_margin = 1.10
 
     # Cycle state
+    app.state = "Running"
     app.start_time = start
     app.energy_used = 0.0
     app._get_energy_used = lambda: app.energy_used
@@ -97,8 +98,21 @@ def make_app(start=CYCLE_START):
     app.off_calls = []
     app.log = lambda *a, **kw: app.log_calls.append((a, kw))
     app.get_state = lambda entity, **kw: app.states.get(entity)
-    app._transition_to_unemptied = lambda **kw: app.unemptied_calls.append(dict(kw))
-    app._transition_to_off = lambda reason, force=False: app.off_calls.append((reason, force))
+
+    # Real _transition_to_unemptied/_transition_to_off always land here (no cooling-period/
+    # gate logic to simulate in this fixture) - update app.state to match, since
+    # _standby_backstop_tick's return value now reflects whether the transition actually
+    # changed state (see FLAW 7, 2026-09-10).
+    def _stub_transition_to_unemptied(**kw):
+        app.unemptied_calls.append(dict(kw))
+        app.state = "Unemptied"
+
+    def _stub_transition_to_off(reason, force=False):
+        app.off_calls.append((reason, force))
+        app.state = "Off"
+
+    app._transition_to_unemptied = _stub_transition_to_unemptied
+    app._transition_to_off = _stub_transition_to_off
     return app
 
 
