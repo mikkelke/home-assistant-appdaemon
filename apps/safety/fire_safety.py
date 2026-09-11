@@ -31,6 +31,7 @@ every AppDaemon API call made from inside an async method is awaited, including 
 coroutine that never fires).
 """
 
+import asyncio
 import json
 import os
 from datetime import datetime, timedelta, timezone, time
@@ -323,6 +324,14 @@ class FireSafety(hass.Hass):
     # ---------- main evaluation loop ----------
 
     async def _evaluate(self):
+        # smoke and siren_state update in the same instant, so two listener tasks race here;
+        # serialise or both see the old phase and each enters alarm (double push, 2026-09-11).
+        if not hasattr(self, "_eval_lock"):
+            self._eval_lock = asyncio.Lock()
+        async with self._eval_lock:
+            await self._evaluate_locked()
+
+    async def _evaluate_locked(self):
         try:
             now = self._now()
             smoke = await self._read_state(self.smoke_entity)
@@ -732,7 +741,7 @@ class FireSafety(hass.Hass):
             for boolean in self.alarm_light_manual_booleans:
                 await self.call_service("input_boolean/turn_on", entity_id=boolean)
             if self.alarm_lights:
-                await self.call_service("light/turn_on", entity_id=self.alarm_lights, brightness_pct=100, kelvin=4000)
+                await self.call_service("light/turn_on", entity_id=self.alarm_lights, brightness_pct=100)
         except Exception as e:
             self.log(f"alarm lights on failed: {e}", level="WARNING")
 
