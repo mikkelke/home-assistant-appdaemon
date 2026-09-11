@@ -31,6 +31,7 @@ MobileNotifier:
   # mapped above. Senders opt in by passing category="..." to notify().
   category_audience:
     ac: ["mikkel"]   # A/C pushes are Mikkel-only (his bedroom's SmartCooling); no current sender yet - any future A/C push must send category="ac"
+    fire_health: ["mikkel"]   # FireSafety self-tests only; real fire alarms use an unlisted category so they broadcast to everyone
 
   # Default notification service for user (for vacuum errors, etc.)
   # This will always be used when target="user"

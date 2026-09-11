@@ -107,14 +107,25 @@ class SonosNotifier(hass.Hass):
         except Exception:
             return list(entities) if isinstance(entities, list) else []
 
-    def notify(self, message, chime_path=None, target_speakers=None, **kwargs):
+    def notify(
+        self,
+        message,
+        chime_path=None,
+        target_speakers=None,
+        override_quiet_hours: bool = False,
+        volume_level: float | None = None,
+        **kwargs,
+    ):
         """
         Sends a TTS notification to Sonos speakers, respecting configured sleep modes and time constraints.
 
         Args:
             message (str): The message to be spoken.
-            chime_path (str, optional): Path to the chime sound file. 
+            chime_path (str, optional): Path to the chime sound file.
                                       Defaults to 'default_chime_path' from config.
+            override_quiet_hours (bool, optional): Skip the quiet-hours check and announce
+                anyway. For life-safety callers only. Defaults to False.
+            volume_level (float, optional): Passed through to chime_tts/say when given.
             **kwargs: Placeholder for future arguments.
         """
         if not message:
@@ -127,7 +138,9 @@ class SonosNotifier(hass.Hass):
         #     pass # Bypass the actual time check logic below
         # elif self.time_constraints_enabled:
         # END TEMPORARY BYPASS
-        if self.time_constraints_enabled: # Restored this line
+        if override_quiet_hours:
+            self.log(f"override_quiet_hours=True: bypassing quiet-hours check for '{message}'.", level="WARNING")
+        elif self.time_constraints_enabled: # Restored this line
             quiet_hours_end = self._get_time_from_entity(self.quiet_hours_end_entity)
             quiet_hours_start = self._get_time_from_entity(self.quiet_hours_start_entity)
 
@@ -227,6 +240,8 @@ class SonosNotifier(hass.Hass):
             }
             if tts_platform_to_use:
                 service_data["tts_platform"] = tts_platform_to_use
+            if volume_level is not None:
+                service_data["volume_level"] = volume_level
 
             self.call_service(
                 "chime_tts/say",

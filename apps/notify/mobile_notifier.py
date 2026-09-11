@@ -7,6 +7,8 @@ Keep device mapping in this app's device_mapping; avoid putting raw notify.*
 service names in other apps' configs.
 """
 
+from typing import Callable
+
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
 class MobileNotifier(hass.Hass):
@@ -29,6 +31,9 @@ class MobileNotifier(hass.Hass):
         # Category-scoped home-broadcast audiences: {"category": ["person", ...]}.
         # See _filter_people_for_category for semantics (no entry for a category -> everyone).
         self.category_audience = self.args.get("category_audience", {}) or {}
+
+        # Per-service platform override; unlisted services fall back to name-based inference.
+        self.platform_map = self.args.get("platform_map", {}) or {}
 
         # Default notification service for user (for vacuum errors, etc.)
         self.user_notification_service = self.args.get("user_notification_service")
@@ -103,6 +108,23 @@ class MobileNotifier(hass.Hass):
         if audience is None:
             return people
         return [p for p in people if p in audience]
+
+    def _platform_for_service(self, service: str) -> str:
+        """ios if platform_map says so or the service name looks like one, else android."""
+        override = self.platform_map.get(service)
+        if override in ("ios", "android"):
+            return override
+        lowered = service.lower()
+        return "ios" if ("iphone" in lowered or "ipad" in lowered) else "android"
+
+    def _person_for_service(self, service: str):
+        """Reverse-lookup of device_mapping; None if the service belongs to no known person."""
+        for person, services in self.device_mapping.items():
+            if isinstance(services, str):
+                services = [services]
+            if service in services:
+                return person
+        return None
 
     async def _resolve_services(self, target, category: str = None):
         """Resolve a `target` (see notify()'s docstring) to a list of notify service
@@ -180,7 +202,18 @@ class MobileNotifier(hass.Hass):
         except Exception as e:
             self.log(f"Error clearing notification tag={tag!r}: {e}", level="ERROR")
 
-    async def notify(self, title: str, message: str, target: str = "home", data: dict = None, category: str = None):
+    async def notify(
+        self,
+        title: str,
+        message: str,
+        target: str = "home",
+        data: dict = None,
+        category: str = None,
+        critical: bool = False,
+        channel: str = "Fire alarm",
+        per_person_actions: Callable[[str], list[dict]] | None = None,
+        test_audience: list[str] | None = None,
+    ):
         """Send notification to mobile app(s).
 
         Target semantics:
@@ -205,6 +238,14 @@ class MobileNotifier(hass.Hass):
             data: Optional additional data (e.g., {"data": {"importance": "high"}})
             category: Optional category name; scopes target="home" to category_audience[category]
                 when that category is listed (see initialize()). Ignored for other targets.
+            critical: When True, layer a platform-appropriate critical-alert payload (iOS
+                interruption-level/critical sound, Android max-priority channel) onto each
+                service's data; caller-supplied data keys win over these defaults.
+            channel: Android notification channel name used when critical=True.
+            per_person_actions: Optional callable(person_key) -> actions list, applied per
+                service (so action IDs can be person-scoped) when the service maps to a person.
+            test_audience: Optional list of person keys; when given, only those people
+                receive the push regardless of target/category.
         """
         try:
             notification_data = {
@@ -228,6 +269,17 @@ class MobileNotifier(hass.Hass):
             # Determine target services
             services = await self._resolve_services(target, category)
 
+            if test_audience is not None:
+                before = services
+                services = [s for s in services if self._person_for_service(s) in test_audience]
+                excluded = [s for s in before if s not in services]
+                if excluded:
+                    self.log(
+                        f"test_audience={test_audience} narrowed this push from {len(before)} to "
+                        f"{len(services)} service(s); excluded {excluded}",
+                        level="INFO",
+                    )
+
             # Check if no services found
             if not services:
                 self.log(f"No notification services found for target '{target}'", level="WARNING")
@@ -244,8 +296,44 @@ class MobileNotifier(hass.Hass):
                         service_path = service.replace("notify.", "notify/", 1)
                     else:
                         service_path = service
-                    
-                    await self.call_service(service_path, **notification_data)
+
+                    service_data = notification_data
+                    if critical or per_person_actions is not None:
+                        service_data = dict(notification_data)
+                        inner = dict(service_data.get("data", {}))
+                        person = self._person_for_service(service)
+
+                        if critical:
+                            if self._platform_for_service(service) == "ios":
+                                defaults = {
+                                    "push": {
+                                        "interruption-level": "critical",
+                                        "sound": {"name": "default", "critical": 1, "volume": 1.0},
+                                    }
+                                }
+                            else:
+                                defaults = {
+                                    "channel": channel,
+                                    "importance": "max",
+                                    "priority": "high",
+                                    "ttl": 0,
+                                    "persistent": True,
+                                    "sticky": True,
+                                }
+                            inner = {**defaults, **inner}
+
+                        if per_person_actions is not None:
+                            if person is not None:
+                                inner["actions"] = per_person_actions(person)
+                            else:
+                                self.log(
+                                    f"per_person_actions given but {service} maps to no known person; leaving actions as-is",
+                                    level="DEBUG",
+                                )
+
+                        service_data["data"] = inner
+
+                    await self.call_service(service_path, **service_data)
                     self.log(f"Sent notification to {service_path} (original: {service}): {title}", level="INFO")
                     success_count += 1
                 except Exception as e:
