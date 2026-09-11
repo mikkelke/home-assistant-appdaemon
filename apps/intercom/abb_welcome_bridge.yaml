@@ -100,7 +100,7 @@ AbbWelcomeBridge:
   # click is simply wrong, and said after it is a log entry read aloud. This
   # also matches what the back door's own hardware voice module says, so the
   # two doors tell the household the same thing in the same words.
-  announce_message: "Opening."
+  announce_message: "Door is opening."
   # Voices during a recording go THROUGH the recording's call (play_audio into the
   # open stream's talkback leg) using this TTS engine - so video and voice run
   # together instead of the voice being skipped. "" disables in-recording voices.
