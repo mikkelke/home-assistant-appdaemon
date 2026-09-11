@@ -61,11 +61,11 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 from climate_model import dew_point_c
 
 _COMFORT_DETAIL = {
-    "cold": "Cold",
+    "cold": "Cold — heating should catch up",
     "cool": "A bit cool",
-    "comfortable": "Comfortable",
-    "warm": "Warm",
-    "hot": "Hot",
+    "comfortable": "Nothing to do",
+    "warm": "A bit warm",
+    "hot": "Hot — shade or airing helps",
 }
 
 
