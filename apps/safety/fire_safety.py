@@ -557,6 +557,7 @@ class FireSafety(hass.Hass):
         self.off_since = None
         self._save_state()
         await self._report_feed("cooldown", by=by)
+        await self._clear_lights()
 
     async def _enter_clear(self, now):
         was_active = self.episode_id is not None
