@@ -416,6 +416,9 @@ class FireSafety(hass.Hass):
         await self._assert_lights(now)
         self.last_push_at = now
         self.last_lights_assert_at = now
+        if new_episode:
+            # The t+2s delayed announce is the first one; stop the tick cadence pre-empting it.
+            self.last_announce_at = now
         self._save_state()
         if new_episode:
             await self.run_in(self._delayed_pause_media, 1)
@@ -796,6 +799,9 @@ class FireSafety(hass.Hass):
         elif phase == "offline":
             cause, effect = "Kitchen smoke alarm stopped reporting", f"Marked offline after {self.offline_after_min} minutes"
         else:
+            return
+        if self.dry_run:
+            self.log(f"[dry-run] would report to feed: {cause} -> {effect}")
             return
         try:
             await self.fire_event("house_events_report", cause=cause, effect=effect, icon=icon, by=by)
