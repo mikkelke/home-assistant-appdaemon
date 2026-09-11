@@ -527,6 +527,11 @@ class RoomFeel(hass.Hass):
         source_entities = [e for e in source_entities if e and not (e in seen or seen.add(e))]
 
         attributes = {
+            "friendly_name": f"{room_key.replace('_', ' ').title()} feel",
+            "icon": "mdi:home-thermometer-outline",
+            "unit_of_measurement": "°C",
+            "device_class": "temperature",
+            "state_class": "measurement",
             "temp_c": temp_c,
             "rh": rh,
             "dew_point_c": dp,
@@ -557,6 +562,11 @@ class RoomFeel(hass.Hass):
         val, reason = self._read(self.supply_air_source)
         state = "unavailable" if val is None else round(val, 1)
         attributes = {
+            "friendly_name": "Bedroom supply air temperature",
+            "icon": "mdi:air-conditioner",
+            "unit_of_measurement": "°C",
+            "device_class": "temperature",
+            "state_class": "measurement",
             "reason": f"mirror of {self.supply_air_source}",
             "source_entities": [self.supply_air_source],
             "excluded": ["<none>"] if reason is None else [f"{self.supply_air_source}: {reason}"],
