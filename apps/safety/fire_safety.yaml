@@ -61,7 +61,7 @@ FireSafety:
   max_hushes_per_episode: 2
   pre_alarm_timeout_min: 10
   cooldown_confirm_s: 60
-  cooldown_clear_min: 15
+  cooldown_clear_min: 5
   offline_after_min: 30
   cooking_mode_minutes: 45
   self_test_window_min: 6
