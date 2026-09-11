@@ -19,7 +19,7 @@ FireSafety:
     - MobileNotifier
     - SonosNotifier
 
-  dry_run: true
+  dry_run: false
   test_audience: ["mikkel"]
 
   state_file: /conf/apps/safety/fire_safety_state.json
