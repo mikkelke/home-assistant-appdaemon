@@ -173,6 +173,8 @@ def _make_app(**overrides):
     app.unavailable_since = None
     app.off_since = None
     app.last_fault_push_at = {}
+    app.light_snapshot = {}
+    app.light_snapshot_episode = None
 
     for key, value in overrides.items():
         setattr(app, key, value)
@@ -586,6 +588,106 @@ class HushBehavior(_FrozenTimeTestCase):
         self.assertEqual(app.ack_by, "Kristine")
 
 
+class AlarmLightSnapshot(_FrozenTimeTestCase):
+    async def test_snapshot_taken_once_per_episode_not_on_repeat_assert(self):
+        app = _make_app(phase="alarm", episode_id="E1")
+        app.states["light.hallway_lights"] = {"state": "off", "attributes": {}}
+        reads = []
+        underlying = app.get_state
+
+        async def counting_get_state(entity_id, attribute=None):
+            if attribute == "all":
+                reads.append(entity_id)
+            return await underlying(entity_id, attribute=attribute)
+
+        app.get_state = counting_get_state
+        await app._assert_lights(FIXED_NOW)
+        await app._assert_lights(FIXED_NOW)
+        self.assertEqual(reads.count("light.hallway_lights"), 1)
+        self.assertEqual(app.light_snapshot_episode, "E1")
+
+    async def test_restore_turns_off_what_was_off_and_reapplies_brightness(self):
+        app = _make_app(
+            phase="cooldown", episode_id="E1",
+            light_snapshot={
+                "light.hallway_lights": {"state": "off", "brightness": None},
+                "light.kitchen_lights": {"state": "on", "brightness": 128},
+            },
+            light_snapshot_episode="E1",
+        )
+        await app._clear_lights()
+        off_calls = [c for c in app.call_service.call_args_list if c.args[0] == "light/turn_off"]
+        on_calls = [c for c in app.call_service.call_args_list if c.args[0] == "light/turn_on"]
+        self.assertEqual(len(off_calls), 1)
+        self.assertEqual(off_calls[0].kwargs.get("entity_id"), ["light.hallway_lights"])
+        self.assertEqual(len(on_calls), 1)
+        self.assertEqual(on_calls[0].kwargs.get("entity_id"), ["light.kitchen_lights"])
+        self.assertEqual(on_calls[0].kwargs.get("brightness"), 128)
+
+    async def test_booleans_cleared_after_restore(self):
+        app = _make_app(
+            phase="cooldown", episode_id="E1",
+            light_snapshot={"light.hallway_lights": {"state": "on", "brightness": None}},
+            light_snapshot_episode="E1",
+        )
+        await app._clear_lights()
+        boolean_calls = [c for c in app.call_service.call_args_list if c.args[0] == "input_boolean/turn_off"]
+        self.assertEqual(len(boolean_calls), 1)
+        self.assertEqual(boolean_calls[0].kwargs.get("entity_id"), app.alarm_light_manual_booleans[0])
+        turn_on_index = next(i for i, c in enumerate(app.call_service.call_args_list) if c.args[0] == "light/turn_on")
+        boolean_index = next(i for i, c in enumerate(app.call_service.call_args_list) if c.args[0] == "input_boolean/turn_off")
+        self.assertLess(turn_on_index, boolean_index)
+        self.assertEqual(app.light_snapshot, {})
+        self.assertIsNone(app.light_snapshot_episode)
+
+    async def test_no_snapshot_falls_back_to_booleans_off_only(self):
+        app = _make_app(phase="cooldown", episode_id="E1", light_snapshot={}, light_snapshot_episode=None)
+        await app._clear_lights()
+        light_calls = [c for c in app.call_service.call_args_list if c.args[0].startswith("light/")]
+        self.assertEqual(light_calls, [])
+        boolean_calls = [c for c in app.call_service.call_args_list if c.args[0] == "input_boolean/turn_off"]
+        self.assertEqual(len(boolean_calls), 1)
+        warnings = [a for a, kw in app.log_calls if kw.get("level") == "WARNING"]
+        self.assertTrue(any("snapshot" in str(a[0]).lower() for a in warnings))
+
+    async def test_dry_run_assert_lights_takes_no_snapshot_and_zero_calls(self):
+        app = _make_app(dry_run=True, phase="alarm", episode_id="E1")
+        await app._assert_lights(FIXED_NOW)
+        app.call_service.assert_not_called()
+        self.assertEqual(app.light_snapshot, {})
+        self.assertIsNone(app.light_snapshot_episode)
+
+    async def test_dry_run_clear_lights_makes_zero_calls(self):
+        app = _make_app(
+            dry_run=True, phase="cooldown", episode_id="E1",
+            light_snapshot={"light.hallway_lights": {"state": "on", "brightness": 200}},
+            light_snapshot_episode="E1",
+        )
+        await app._clear_lights()
+        app.call_service.assert_not_called()
+        self.assertEqual(app.light_snapshot, {"light.hallway_lights": {"state": "on", "brightness": 200}})
+
+    async def test_snapshot_survives_save_load_round_trip(self):
+        app = _make_app(
+            phase="alarm", episode_id="E1",
+            light_snapshot={"light.hallway_lights": {"state": "on", "brightness": 77}},
+            light_snapshot_episode="E1",
+        )
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        app.state_file = path
+        app.since = FIXED_NOW
+        app._save_state()
+
+        reloaded = fs.FireSafety.__new__(fs.FireSafety)
+        reloaded.state_file = path
+        reloaded.log = lambda *a, **kw: None
+        reloaded._load_state()
+        self.assertEqual(reloaded.light_snapshot, {"light.hallway_lights": {"state": "on", "brightness": 77}})
+        self.assertEqual(reloaded.light_snapshot_episode, "E1")
+
+
 class RepeatCadence(_FrozenTimeTestCase):
     async def test_repush_fires_once_interval_elapsed(self):
         app = _make_app(
@@ -867,6 +969,8 @@ class PersistenceRoundTrip(unittest.TestCase):
         app.unavailable_since = None
         app.off_since = None
         app.last_fault_push_at = {"battery_low": app.since}
+        app.light_snapshot = {"light.hallway_lights": {"state": "on", "brightness": 128}}
+        app.light_snapshot_episode = "20260911201000"
         app._save_state()
 
         reloaded = self._app(path)
@@ -879,6 +983,8 @@ class PersistenceRoundTrip(unittest.TestCase):
         self.assertEqual(reloaded.since, app.since)
         self.assertEqual(reloaded.hushed_until, app.hushed_until)
         self.assertEqual(reloaded.last_fault_push_at["battery_low"], app.since)
+        self.assertEqual(reloaded.light_snapshot, app.light_snapshot)
+        self.assertEqual(reloaded.light_snapshot_episode, "20260911201000")
 
     def test_missing_file_defaults_to_clear(self):
         app = self._app("/nonexistent/dir/fire_safety_state.json")
@@ -886,6 +992,8 @@ class PersistenceRoundTrip(unittest.TestCase):
         self.assertEqual(app.phase, "clear")
         self.assertEqual(app.hush_count, 0)
         self.assertEqual(app.last_fault_push_at, {})
+        self.assertEqual(app.light_snapshot, {})
+        self.assertIsNone(app.light_snapshot_episode)
 
     def test_save_leaves_no_tmp_file_behind(self):
         fd, path = tempfile.mkstemp(suffix=".json")
@@ -911,6 +1019,8 @@ class PersistenceRoundTrip(unittest.TestCase):
         app.unavailable_since = None
         app.off_since = None
         app.last_fault_push_at = {}
+        app.light_snapshot = {}
+        app.light_snapshot_episode = None
         app._save_state()
         self.assertFalse(os.path.exists(path + ".tmp"))
 

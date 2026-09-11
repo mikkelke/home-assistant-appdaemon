@@ -738,6 +738,8 @@ class FireSafety(hass.Hass):
         if self.dry_run:
             self.log(f"[dry-run] would turn on alarm lights: {self.alarm_lights}")
             return
+        if self.light_snapshot_episode != self.episode_id:
+            await self._snapshot_lights()
         try:
             for boolean in self.alarm_light_manual_booleans:
                 await self.call_service("input_boolean/turn_on", entity_id=boolean)
@@ -746,15 +748,56 @@ class FireSafety(hass.Hass):
         except Exception as e:
             self.log(f"alarm lights on failed: {e}", level="WARNING")
 
+    async def _snapshot_lights(self):
+        snapshot = {}
+        for entity in self.alarm_lights:
+            try:
+                obj = await self.get_state(entity, attribute="all")
+            except Exception as e:
+                self.log(f"light snapshot read failed for {entity}: {e}", level="WARNING")
+                obj = None
+            obj = obj or {}
+            state = obj.get("state")
+            attrs = obj.get("attributes") or {}
+            if state == "on":
+                snapshot[entity] = {"state": "on", "brightness": attrs.get("brightness")}
+            else:
+                snapshot[entity] = {"state": "off", "brightness": None}
+        self.light_snapshot = snapshot
+        self.light_snapshot_episode = self.episode_id
+        self._save_state()
+
     async def _clear_lights(self):
         if self.dry_run:
-            self.log("[dry-run] would release alarm-light manual overrides")
+            self.log("[dry-run] would restore alarm lights and release manual overrides")
             return
         try:
+            if self.light_snapshot:
+                await self._restore_lights(self.light_snapshot)
+            elif self.alarm_lights and self.episode_id is not None:
+                self.log("No light snapshot for this episode - falling back to booleans-off only", level="WARNING")
             for boolean in self.alarm_light_manual_booleans:
                 await self.call_service("input_boolean/turn_off", entity_id=boolean)
         except Exception as e:
             self.log(f"alarm lights release failed: {e}", level="WARNING")
+        self.light_snapshot = {}
+        self.light_snapshot_episode = None
+        self._save_state()
+
+    async def _restore_lights(self, snapshot):
+        off_entities = [entity for entity, v in snapshot.items() if v.get("state") != "on"]
+        if off_entities:
+            await self.call_service("light/turn_off", entity_id=off_entities)
+        groups = {}
+        for entity, v in snapshot.items():
+            if v.get("state") != "on":
+                continue
+            groups.setdefault(v.get("brightness"), []).append(entity)
+        for brightness, entities in groups.items():
+            kwargs = {"entity_id": entities}
+            if brightness is not None:
+                kwargs["brightness"] = brightness
+            await self.call_service("light/turn_on", **kwargs)
 
     async def _pause_media(self):
         if not self.media_pause_players:
@@ -1007,6 +1050,8 @@ class FireSafety(hass.Hass):
         self.unavailable_since = self._parse_dt(data.get("unavailable_since"))
         self.off_since = self._parse_dt(data.get("off_since"))
         self.last_fault_push_at = {k: self._parse_dt(v) for k, v in (data.get("last_fault_push_at") or {}).items()}
+        self.light_snapshot = data.get("light_snapshot") or {}
+        self.light_snapshot_episode = data.get("light_snapshot_episode")
 
     def _save_state(self):
         data = {
@@ -1029,6 +1074,8 @@ class FireSafety(hass.Hass):
             "unavailable_since": self.unavailable_since.isoformat() if self.unavailable_since else None,
             "off_since": self.off_since.isoformat() if self.off_since else None,
             "last_fault_push_at": {k: v.isoformat() for k, v in self.last_fault_push_at.items() if v},
+            "light_snapshot": self.light_snapshot,
+            "light_snapshot_episode": self.light_snapshot_episode,
         }
         try:
             tmp = self.state_file + ".tmp"
