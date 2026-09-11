@@ -12,7 +12,9 @@ RoomFeel:
   module: room_feel
   class: RoomFeel
 
-  stale_minutes: 45
+  # Air sensors report on change only: FP300 ~every 50 min, Salus ~every 90 min in a
+  # steady room - 45 min flagged healthy rooms as "Reading is old" (2026-09-11).
+  stale_minutes: 180
 
   comfort_bands:
     cold_max_c: 18.0
