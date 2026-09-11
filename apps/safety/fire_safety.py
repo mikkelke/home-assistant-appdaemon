@@ -43,6 +43,7 @@ except ImportError:  # pragma: no cover - stdlib always has it on supported Pyth
     ZoneInfo = None
 
 UNAVAILABLE_STATES = (None, "unknown", "unavailable")
+SIREN_BURGLAR = "burglar"
 
 PHASE_ICONS = {
     "clear": "mdi:smoke-detector-variant",
@@ -57,13 +58,20 @@ IAQ_BREAKPOINTS = [(50, "fresh"), (100, "good"), (200, "stuffy")]
 ECO2_BREAKPOINTS = [(800, "fresh"), (1200, "good"), (2000, "stuffy")]
 
 
-def _matches_any(text, values):
-    """Case-insensitive substring match of `text` against any of `values` - the siren_state
-    strings are unverified, so this is deliberately loose rather than an exact-value match."""
-    if not text or not values:
+def _normalize_siren(value):
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text or None
+
+
+def _siren_matches(value, values):
+    """Case-insensitive, trimmed, exact match - siren_state is a verified fixed vocabulary
+    (clear/pre_alarm/fire/silenced/self_test/burglar), not free text to substring-scan."""
+    norm = _normalize_siren(value)
+    if norm is None or not values:
         return False
-    lowered = str(text).lower()
-    return any(str(v).lower() in lowered for v in values)
+    return any(norm == str(v).strip().lower() for v in values)
 
 
 def _band(value, breakpoints):
@@ -89,13 +97,24 @@ class FireSafety(hass.Hass):
         self.alarm_select_entity = a("alarm_select_entity", "select.kitchen_smoke_alarm_alarm")
         self.self_test_switch_entity = a("self_test_switch_entity", "switch.kitchen_smoke_alarm_self_test")
 
-        self.siren_alarm_values = a("siren_alarm_values", ["fire", "alarm", "smoke"])
-        self.siren_pre_alarm_values = a("siren_pre_alarm_values", ["pre_alarm", "pre-alarm", "prealarm"])
+        self.siren_alarm_values = a("siren_alarm_values", ["fire"])
+        self.siren_pre_alarm_values = a("siren_pre_alarm_values", ["pre_alarm"])
+        self.siren_silenced_values = a("siren_silenced_values", ["silenced"])
+        self.siren_self_test_values = a("siren_self_test_values", ["self_test"])
 
         self.hush_button_entity = a("hush_button_entity", "input_button.fire_safety_hush")
         self.clear_button_entity = a("clear_button_entity", "input_button.fire_safety_clear")
         self.test_button_entity = a("test_button_entity", "input_button.fire_safety_test")
         self.cooking_mode_entity = a("cooking_mode_entity", "input_boolean.kitchen_cooking_mode")
+
+        # Button-press attribution (mirrors manual_override_timeout.py: context.user_id ->
+        # person entity -> this fallback map); unresolved ids keep "the dashboard".
+        self.user_name_fallback = {
+            str(uid).replace("-", "").strip().lower(): name
+            for uid, name in (a("user_name_fallback") or {}).items()
+            if isinstance(name, str) and name.strip()
+        }
+        self._person_by_user_id = {}
 
         self.publish_entity = a("publish_entity", "sensor.fire_safety")
         self.state_file = a("state_file", "/conf/apps/safety/fire_safety_state.json")
@@ -110,7 +129,7 @@ class FireSafety(hass.Hass):
         self.cooldown_clear_min = int(a("cooldown_clear_min", 15))
         self.offline_after_min = int(a("offline_after_min", 30))
         self.cooking_mode_minutes = int(a("cooking_mode_minutes", 45))
-        self.self_test_window_min = int(a("self_test_window_min", 3))
+        self.self_test_window_min = int(a("self_test_window_min", 6))
         self.reannounce_interval_s = int(a("reannounce_interval_s", 45))
         self.repush_interval_s = int(a("repush_interval_s", 120))
         self.repush_interval_acked_s = int(a("repush_interval_acked_s", 180))
@@ -165,8 +184,7 @@ class FireSafety(hass.Hass):
 
         self.listen_state(self._on_smoke_change, self.smoke_entity)
         self.listen_state(self._on_siren_change, self.siren_state_entity)
-        self.listen_state(self._on_hush_button, self.hush_button_entity)
-        self.listen_state(self._on_clear_button, self.clear_button_entity)
+        self.listen_event(self._on_button_state_changed, "state_changed")
         self.listen_state(self._on_test_button, self.test_button_entity)
         self.listen_state(self._on_cooking_on, self.cooking_mode_entity, new="on")
         self.listen_state(self._on_cooking_off, self.cooking_mode_entity, new="off")
@@ -192,15 +210,53 @@ class FireSafety(hass.Hass):
     def _on_siren_change(self, entity, attribute, old, new, kwargs):
         self.create_task(self._evaluate())
 
-    def _on_hush_button(self, entity, attribute, old, new, kwargs):
-        if new in UNAVAILABLE_STATES:
+    def _on_button_state_changed(self, event_name, data, kwargs):
+        """Raw state_changed (not listen_state) so HA's context - and with it
+        context.user_id, the human behind the tap - survives; see _resolve_actor."""
+        data = data or {}
+        entity = data.get("entity_id")
+        if entity not in (self.hush_button_entity, self.clear_button_entity):
             return
-        self.create_task(self._hush(self._now(), "the dashboard"))
+        new_state = data.get("new_state") or {}
+        old_state = data.get("old_state") or {}
+        new = new_state.get("state")
+        old = old_state.get("state")
+        if new == old or new in UNAVAILABLE_STATES:
+            return
+        user_id = (new_state.get("context") or {}).get("user_id")
+        self.create_task(self._handle_button_press(entity, user_id))
 
-    def _on_clear_button(self, entity, attribute, old, new, kwargs):
-        if new in UNAVAILABLE_STATES:
-            return
-        self.create_task(self._on_clear_pressed())
+    async def _handle_button_press(self, entity, user_id):
+        by_text = await self._resolve_actor(user_id) or "the dashboard"
+        if entity == self.hush_button_entity:
+            await self._hush(self._now(), by_text)
+        else:
+            await self._on_clear_pressed(by_text)
+
+    async def _resolve_actor(self, user_id):
+        if not user_id:
+            return None
+        if user_id not in self._person_by_user_id:
+            await self._refresh_person_map()
+        resolved = self._person_by_user_id.get(user_id)
+        if resolved:
+            return resolved
+        return self.user_name_fallback.get(str(user_id).replace("-", "").strip().lower())
+
+    async def _refresh_person_map(self):
+        try:
+            persons = await self.get_state("person") or {}
+            for ent in persons:
+                try:
+                    obj = await self.get_state(ent, attribute="all") or {}
+                except Exception:
+                    continue
+                attrs = obj.get("attributes") or {}
+                uid = attrs.get("user_id")
+                if uid:
+                    self._person_by_user_id[uid] = attrs.get("friendly_name") or ent.split(".", 1)[-1].capitalize()
+        except Exception as e:
+            self.log(f"person map refresh failed: {e}", level="WARNING")
 
     def _on_test_button(self, entity, attribute, old, new, kwargs):
         if new in UNAVAILABLE_STATES:
@@ -283,20 +339,33 @@ class FireSafety(hass.Hass):
 
             await self._maybe_expire_self_test(now)
             await self._maybe_expire_cooking_mode(now)
+            self._maybe_log_burglar(prev_siren, siren)
 
-            siren_suppressed = self.self_test_until is not None and now < self.self_test_until and smoke == "off"
-            # "pre_alarm" contains the substring "alarm" - a pre-alarm match must win that
-            # overlap, since siren_alarm_values/siren_pre_alarm_values are matched as
-            # case-insensitive substrings (spec'd, not exact-value).
-            pre_alarm_siren_match = _matches_any(siren, self.siren_pre_alarm_values)
-            alarm_siren_match = _matches_any(siren, self.siren_alarm_values) and not pre_alarm_siren_match
-            alarm_condition = smoke == "on" or (not siren_suppressed and alarm_siren_match)
-            pre_alarm_condition = (
-                smoke == "off"
-                and not siren_suppressed
-                and not self._cooking_active(now)
-                and pre_alarm_siren_match
+            in_pre_alarm = _siren_matches(siren, self.siren_pre_alarm_values)
+            in_alarm = _siren_matches(siren, self.siren_alarm_values)
+            in_silenced = _siren_matches(siren, self.siren_silenced_values)
+            in_self_test = _siren_matches(siren, self.siren_self_test_values)
+            prev_in_alarm = _siren_matches(prev_siren, self.siren_alarm_values)
+            prev_in_self_test = _siren_matches(prev_siren, self.siren_self_test_values)
+
+            if in_self_test and not prev_in_self_test:
+                self.last_self_test_at = now
+
+            # self_test_until is a floor under _run_self_test's own trigger, for the gap
+            # before the device's live siren_state actually reports self_test; excluded
+            # once smoke=="on" so a real fire during that window is never masked.
+            floor_suppressed = (
+                self.self_test_until is not None and now < self.self_test_until and smoke != "on"
             )
+            siren_suppressed = in_self_test or floor_suppressed
+
+            pre_alarm_condition = (
+                in_pre_alarm and not siren_suppressed and not self._cooking_active(now)
+            )
+            smoke_fallback = (
+                smoke == "on" and not in_pre_alarm and not in_silenced and not in_self_test
+            )
+            alarm_condition = (in_alarm and not siren_suppressed) or smoke_fallback
 
             if self.phase == "clear":
                 if alarm_condition:
@@ -305,16 +374,13 @@ class FireSafety(hass.Hass):
                     await self._enter_pre_alarm(now)
 
             elif self.phase == "pre_alarm":
-                if smoke == "on":
+                if alarm_condition:
                     await self._enter_alarm(now)
-                elif (
-                    not _matches_any(siren, self.siren_pre_alarm_values)
-                    or (now - self.since) >= timedelta(minutes=self.pre_alarm_timeout_min)
-                ):
+                elif not in_pre_alarm or (now - self.since) >= timedelta(minutes=self.pre_alarm_timeout_min):
                     await self._enter_clear(now)
 
             elif self.phase == "alarm":
-                if self._physical_hush_signal(prev_siren, siren, smoke):
+                if self._physical_hush_signal(prev_siren, siren):
                     await self._hush(now, "the button on the alarm")
                 elif smoke == "off":
                     self.off_since = self.off_since or now
@@ -327,9 +393,10 @@ class FireSafety(hass.Hass):
                     await self._maybe_repeat_alarm_actions(now)
 
             elif self.phase == "hushed":
-                new_edge = prev_smoke == "off" and smoke == "on"
+                new_smoke_edge = prev_smoke == "off" and smoke == "on"
+                siren_realarm_edge = in_alarm and not prev_in_alarm
                 expired_still_on = self.hushed_until is not None and now >= self.hushed_until and smoke == "on"
-                if new_edge or expired_still_on:
+                if new_smoke_edge or siren_realarm_edge or expired_still_on:
                     await self._enter_alarm(now)
                 elif smoke == "off":
                     self.off_since = self.off_since or now
@@ -337,14 +404,18 @@ class FireSafety(hass.Hass):
                         await self._enter_cooldown(now)
 
             elif self.phase == "cooldown":
-                if smoke == "on":
+                if alarm_condition:
                     await self._enter_alarm(now)
+                elif pre_alarm_condition:
+                    await self._enter_pre_alarm(now)
                 elif (now - self.since) >= timedelta(minutes=self.cooldown_clear_min):
                     await self._enter_clear(now)
 
             elif self.phase == "offline":
-                if smoke == "on":
+                if alarm_condition:
                     await self._enter_alarm(now)
+                elif pre_alarm_condition:
+                    await self._enter_pre_alarm(now)
                 else:
                     await self._enter_clear(now)
 
@@ -355,18 +426,18 @@ class FireSafety(hass.Hass):
         except Exception as e:
             self.log(f"evaluate failed: {e}", level="ERROR")
 
-    def _physical_hush_signal(self, prev_siren, siren, smoke):
-        """The device's own mute button silences the siren without clearing smoke - infer
-        that from an EDGE (siren_state WAS reading an alarm value and just became clear)
-        rather than a level check. siren_state's alarm-value semantics are unverified (see
-        module docstring / yaml comments), so a level check ("doesn't currently match")
-        would misfire on every tick if the real device simply never reports an alarm-list
-        value at all while genuinely blaring."""
-        if smoke != "on" or siren is None:
-            return False
-        was_alarming = _matches_any(prev_siren, self.siren_alarm_values)
-        now_clear = not _matches_any(siren, self.siren_alarm_values) and not _matches_any(siren, self.siren_pre_alarm_values)
-        return was_alarming and now_clear
+    def _maybe_log_burglar(self, prev_siren, siren):
+        is_burglar = _normalize_siren(siren) == SIREN_BURGLAR
+        was_burglar = _normalize_siren(prev_siren) == SIREN_BURGLAR
+        if is_burglar and not was_burglar:
+            self.log(f"{self.siren_state_entity} reports burglar - ignored for fire phases", level="INFO")
+
+    def _physical_hush_signal(self, prev_siren, siren):
+        """The device's own mute button - detected as an EDGE into the silenced set (not a
+        level check), so a siren stuck reporting silenced doesn't repeatedly re-fire."""
+        now_silenced = _siren_matches(siren, self.siren_silenced_values)
+        was_silenced = _siren_matches(prev_siren, self.siren_silenced_values)
+        return now_silenced and not was_silenced
 
     async def _handle_unavailable(self, now):
         if self.unavailable_since is None:
@@ -471,12 +542,12 @@ class FireSafety(hass.Hass):
         self._save_state()
         self.log(f"{person} acknowledged the fire alarm", level="INFO")
 
-    async def _enter_cooldown(self, now):
+    async def _enter_cooldown(self, now, by=None):
         self.phase = "cooldown"
         self.since = now
         self.off_since = None
         self._save_state()
-        await self._report_feed("cooldown")
+        await self._report_feed("cooldown", by=by)
 
     async def _enter_clear(self, now):
         was_active = self.episode_id is not None
@@ -505,7 +576,7 @@ class FireSafety(hass.Hass):
         self._save_state()
         await self._report_feed("offline")
 
-    async def _on_clear_pressed(self):
+    async def _on_clear_pressed(self, by_text=None):
         now = self._now()
         smoke = await self._read_state(self.smoke_entity)
         if smoke != "off":
@@ -513,7 +584,7 @@ class FireSafety(hass.Hass):
             return
         if self.phase == "clear":
             return
-        await self._enter_cooldown(now)
+        await self._enter_cooldown(now, by=by_text)
 
     # ---------- self-test ----------
 
@@ -793,7 +864,8 @@ class FireSafety(hass.Hass):
         elif phase == "hushed":
             cause, effect = f"{by} silenced the kitchen alarm", f"Re-arms at {self._fmt(self.hushed_until)}"
         elif phase == "cooldown":
-            cause, effect = "Kitchen smoke cleared", "Confirming the kitchen alarm is over"
+            cause = f"{by} confirmed the kitchen alarm is clear" if by else "Kitchen smoke cleared"
+            effect = "Confirming the kitchen alarm is over"
         elif phase == "clear":
             cause, effect = "Kitchen alarm confirmed clear", "Lights and overrides released"
         elif phase == "offline":

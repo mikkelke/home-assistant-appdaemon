@@ -110,12 +110,16 @@ def _make_app(**overrides):
     app.aqi_entity = "sensor.kitchen_smoke_alarm_aqi"
     app.alarm_select_entity = "select.kitchen_smoke_alarm_alarm"
     app.self_test_switch_entity = "switch.kitchen_smoke_alarm_self_test"
-    app.siren_alarm_values = ["fire", "alarm", "smoke"]
-    app.siren_pre_alarm_values = ["pre_alarm", "pre-alarm", "prealarm"]
+    app.siren_alarm_values = ["fire"]
+    app.siren_pre_alarm_values = ["pre_alarm"]
+    app.siren_silenced_values = ["silenced"]
+    app.siren_self_test_values = ["self_test"]
     app.hush_button_entity = "input_button.fire_safety_hush"
     app.clear_button_entity = "input_button.fire_safety_clear"
     app.test_button_entity = "input_button.fire_safety_test"
     app.cooking_mode_entity = "input_boolean.kitchen_cooking_mode"
+    app.user_name_fallback = {}
+    app._person_by_user_id = {}
     app.publish_entity = "sensor.fire_safety"
     app.dry_run = False
     app.test_audience = ["mikkel"]
@@ -126,7 +130,7 @@ def _make_app(**overrides):
     app.cooldown_clear_min = 15
     app.offline_after_min = 30
     app.cooking_mode_minutes = 45
-    app.self_test_window_min = 3
+    app.self_test_window_min = 6
     app.reannounce_interval_s = 45
     app.repush_interval_s = 120
     app.repush_interval_acked_s = 180
@@ -185,12 +189,14 @@ class _FrozenTimeTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class PureHelpers(unittest.TestCase):
-    def test_matches_any_case_insensitive_substring(self):
-        self.assertTrue(fs._matches_any("Pre_Alarm", ["pre_alarm"]))
-        self.assertTrue(fs._matches_any("FIRE DETECTED", ["fire"]))
-        self.assertFalse(fs._matches_any("clear", ["fire", "alarm"]))
-        self.assertFalse(fs._matches_any(None, ["fire"]))
-        self.assertFalse(fs._matches_any("fire", None))
+    def test_siren_matches_case_insensitive_exact_trimmed(self):
+        self.assertTrue(fs._siren_matches("Fire", ["fire"]))
+        self.assertTrue(fs._siren_matches("  pre_alarm  ", ["pre_alarm"]))
+        self.assertFalse(fs._siren_matches("fire_alarm", ["fire"]))
+        self.assertFalse(fs._siren_matches("clear", ["fire", "pre_alarm"]))
+        self.assertFalse(fs._siren_matches(None, ["fire"]))
+        self.assertFalse(fs._siren_matches("fire", None))
+        self.assertFalse(fs._siren_matches("fire", []))
 
     def test_band_iaq_breakpoints(self):
         self.assertEqual(fs._band(None, fs.IAQ_BREAKPOINTS), "unknown")
@@ -240,12 +246,56 @@ class TransitionTable(_FrozenTimeTestCase):
         await app._evaluate()
         self.assertEqual(app.phase, "clear")
 
-    async def test_pre_alarm_to_alarm_on_smoke(self):
+    async def test_pre_alarm_stays_pre_alarm_when_smoke_on_and_siren_still_pre_alarm(self):
+        # Twinguard's own smoke bit is SET during a real pre_alarm (verified against
+        # bosch.js), so smoke=="on" must NOT alone escalate - only the siren value can.
         app = _make_app(phase="pre_alarm", since=FIXED_NOW)
         app.states[app.smoke_entity] = "on"
         app.states[app.siren_state_entity] = "pre_alarm"
         await app._evaluate()
+        self.assertEqual(app.phase, "pre_alarm")
+        self.assertEqual(app.mobile_notifier.calls, [])
+
+    async def test_pre_alarm_to_alarm_on_siren_fire(self):
+        app = _make_app(phase="pre_alarm", since=FIXED_NOW, last_siren="pre_alarm", last_smoke="on")
+        app.states[app.smoke_entity] = "on"
+        app.states[app.siren_state_entity] = "fire"
+        await app._evaluate()
         self.assertEqual(app.phase, "alarm")
+
+    async def test_clear_to_pre_alarm_when_smoke_already_on(self):
+        app = _make_app(phase="clear")
+        app.states[app.smoke_entity] = "on"
+        app.states[app.siren_state_entity] = "pre_alarm"
+        await app._evaluate()
+        self.assertEqual(app.phase, "pre_alarm")
+        self.assertEqual(app.mobile_notifier.calls, [])
+
+    async def test_smoke_on_with_siren_none_is_alarm_fallback(self):
+        app = _make_app(phase="clear")
+        app.states[app.smoke_entity] = "on"
+        await app._evaluate()
+        self.assertEqual(app.phase, "alarm")
+
+    async def test_burglar_siren_ignored_for_phases(self):
+        app = _make_app(phase="clear")
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "burglar"
+        await app._evaluate()
+        self.assertEqual(app.phase, "clear")
+
+    async def test_burglar_edge_logs_once_at_info(self):
+        app = _make_app(phase="clear", last_siren="clear")
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "burglar"
+        await app._evaluate()
+        await app._evaluate()
+
+        def is_burglar_info(call):
+            args, kw = call
+            return kw.get("level") == "INFO" and "burglar" in args[0].lower()
+
+        self.assertEqual(len(list(filter(is_burglar_info, app.log_calls))), 1)
 
     async def test_pre_alarm_to_clear_on_siren_clear(self):
         app = _make_app(phase="pre_alarm", since=FIXED_NOW)
@@ -442,30 +492,71 @@ class HushBehavior(_FrozenTimeTestCase):
         self.assertEqual(len(light_calls), 1)
 
     async def test_physical_button_inferred_hush(self):
-        # Edge, not level: siren_state must have PREVIOUSLY read an alarm value and now
-        # read clear while smoke stays on - see _physical_hush_signal's docstring.
+        # Edge into the verified "silenced" siren value - see _physical_hush_signal.
         app = _make_app(phase="alarm", episode_id="E1", hush_count=0, last_siren="fire")
         app.states[app.smoke_entity] = "on"
-        app.states[app.siren_state_entity] = "clear"
+        app.states[app.siren_state_entity] = "silenced"
         await app._evaluate()
         self.assertEqual(app.phase, "hushed")
         self.assertEqual(app.hushed_by, "the button on the alarm")
 
-    async def test_siren_reading_clear_without_prior_alarm_reading_is_not_inferred_hush(self):
-        # last_siren defaults to None (never observed as alarming) - must NOT misfire just
-        # because siren_state doesn't currently read as an alarm value (unverified mapping).
-        app = _make_app(phase="alarm", episode_id="E1", hush_count=0)
+    async def test_siren_clear_while_alarming_is_not_inferred_hush(self):
+        # "clear" is not "silenced" - must not misfire on any non-silenced reading.
+        app = _make_app(phase="alarm", episode_id="E1", hush_count=0, last_siren="fire")
         app.states[app.smoke_entity] = "on"
         app.states[app.siren_state_entity] = "clear"
         await app._evaluate()
         self.assertEqual(app.phase, "alarm")
 
+    def _button_press_data(self, entity, user_id=None):
+        return {
+            "entity_id": entity,
+            "old_state": {"state": "2026-09-11T17:00:00+00:00"},
+            "new_state": {
+                "state": "2026-09-11T18:00:00+00:00",
+                "context": {"user_id": user_id} if user_id else {},
+            },
+        }
+
     async def test_hush_button_press_wiring(self):
         app = _make_app(phase="alarm", episode_id="E1")
-        app._on_hush_button(app.hush_button_entity, None, "2026-09-11T18:00:00", "2026-09-11T18:00:01", {})
+        app._on_button_state_changed(
+            "state_changed", self._button_press_data(app.hush_button_entity), {}
+        )
         await asyncio.gather(*app._test_tasks)
         self.assertEqual(app.phase, "hushed")
         self.assertEqual(app.hushed_by, "the dashboard")
+
+    async def test_hush_button_resolves_actor_from_person_entity(self):
+        app = _make_app(phase="alarm", episode_id="E1")
+        app.states["person"] = ["person.kristine"]
+        app.states["person.kristine"] = {"attributes": {"user_id": "uid-123", "friendly_name": "Kristine"}}
+        app._on_button_state_changed(
+            "state_changed", self._button_press_data(app.hush_button_entity, "uid-123"), {}
+        )
+        await asyncio.gather(*app._test_tasks)
+        self.assertEqual(app.phase, "hushed")
+        self.assertEqual(app.hushed_by, "Kristine")
+
+    async def test_hush_button_resolves_actor_from_fallback_map(self):
+        app = _make_app(phase="alarm", episode_id="E1", user_name_fallback={"uid456": "Claudia"})
+        app._on_button_state_changed(
+            "state_changed", self._button_press_data(app.hush_button_entity, "uid-456"), {}
+        )
+        await asyncio.gather(*app._test_tasks)
+        self.assertEqual(app.hushed_by, "Claudia")
+
+    async def test_clear_button_resolves_actor_and_reports_it(self):
+        app = _make_app(phase="alarm", episode_id="E1")
+        app.states[app.smoke_entity] = "off"
+        app.states["person"] = ["person.mikkel"]
+        app.states["person.mikkel"] = {"attributes": {"user_id": "uid-999", "friendly_name": "Mikkel"}}
+        app._on_button_state_changed(
+            "state_changed", self._button_press_data(app.clear_button_entity, "uid-999"), {}
+        )
+        await asyncio.gather(*app._test_tasks)
+        self.assertEqual(app.phase, "cooldown")
+        self.assertEqual(app.fire_event.call_args.kwargs.get("by"), "Mikkel")
 
     async def test_notification_hush_action_for_current_episode(self):
         app = _make_app(phase="alarm", episode_id="20260911180000")
@@ -607,6 +698,22 @@ class SelfTestSuppression(_FrozenTimeTestCase):
         await app._evaluate()
         self.assertEqual(app.phase, "alarm")
         self.assertIsNone(app.self_test_until)
+
+    async def test_live_self_test_sets_last_self_test_at_and_suppresses(self):
+        app = _make_app(phase="clear", last_siren="clear", last_self_test_at=None)
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "self_test"
+        await app._evaluate()
+        self.assertEqual(app.phase, "clear")
+        self.assertEqual(app.last_self_test_at, FIXED_NOW)
+
+    async def test_live_self_test_does_not_reset_last_self_test_at_every_tick(self):
+        earlier = FIXED_NOW - timedelta(minutes=1)
+        app = _make_app(phase="clear", last_siren="self_test", last_self_test_at=earlier)
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "self_test"
+        await app._evaluate()
+        self.assertEqual(app.last_self_test_at, earlier)
 
 
 class CookingModeSuppression(_FrozenTimeTestCase):

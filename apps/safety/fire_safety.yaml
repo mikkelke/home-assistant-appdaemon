@@ -35,16 +35,26 @@ FireSafety:
   alarm_select_entity: select.kitchen_smoke_alarm_alarm
   self_test_switch_entity: switch.kitchen_smoke_alarm_self_test
 
-  # siren_state text is UNVERIFIED beyond "clear" - case-insensitive substring match,
-  # corroborating witness only (smoke binary_sensor is the primary truth).
-  siren_alarm_values: ["fire", "alarm", "smoke"]
-  siren_pre_alarm_values: ["pre_alarm", "pre-alarm", "prealarm"]
+  # siren_state is an EXACT value (case-insensitive, trimmed) from zigbee-herdsman-
+  # converters' Bosch Twinguard status word: clear, pre_alarm, fire, silenced, self_test,
+  # burglar - verified against bosch.js and a recorded self_test cycle. The device's own
+  # smoke bit is SET during both pre_alarm and fire, CLEAR during silenced/self_test - see
+  # fire_safety.py's _evaluate for how that keeps pre_alarm from being read as alarm.
+  siren_alarm_values: ["fire"]
+  siren_pre_alarm_values: ["pre_alarm"]
+  siren_silenced_values: ["silenced"]
+  siren_self_test_values: ["self_test"]
 
   # --- Helpers ---
   hush_button_entity: input_button.fire_safety_hush
   clear_button_entity: input_button.fire_safety_clear
   test_button_entity: input_button.fire_safety_test
   cooking_mode_entity: input_boolean.kitchen_cooking_mode
+
+  # HA account id -> display name, for a hush/clear presser whose person entity isn't
+  # linked to their HA account (see manual_override_timeout.yaml) - empty until that
+  # gap is found here too. Person-entity lookup is checked first and wins.
+  user_name_fallback: {}
 
   # --- Timing ---
   hush_minutes: 10
@@ -54,7 +64,7 @@ FireSafety:
   cooldown_clear_min: 15
   offline_after_min: 30
   cooking_mode_minutes: 45
-  self_test_window_min: 3
+  self_test_window_min: 6
   reannounce_interval_s: 45
   repush_interval_s: 120
   repush_interval_acked_s: 180
