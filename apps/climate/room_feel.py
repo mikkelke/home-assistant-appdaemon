@@ -526,7 +526,24 @@ class RoomFeel(hass.Hass):
         seen: set = set()
         source_entities = [e for e in source_entities if e and not (e in seen or seen.add(e))]
 
+        # Where a chart should read this room's temperature from before sensor.<room>_feel
+        # itself has enough recorded history: the first air source still in play, preferring a
+        # plain sensor (whose state IS the temperature) over a climate entity (whose state is
+        # the hvac mode, so its history needs the attribute).
+        history_entity = None
+        history_attribute = None
+        for entry in valid:
+            src = entry["src"]
+            if src["entity"].startswith("sensor."):
+                history_entity, history_attribute = src["entity"], src["attribute"]
+                break
+        if history_entity is None and valid:
+            src = valid[0]["src"]
+            history_entity, history_attribute = src["entity"], src["attribute"] or "current_temperature"
+
         attributes = {
+            "history_entity": history_entity,
+            "history_attribute": history_attribute,
             "friendly_name": f"{room_key.replace('_', ' ').title()} feel",
             "icon": "mdi:home-thermometer-outline",
             "unit_of_measurement": "°C",
