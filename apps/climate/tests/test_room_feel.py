@@ -183,6 +183,38 @@ class TimeWindow(unittest.TestCase):
         self.assertFalse(rf.in_time_window(dtime(8, 0), "garbage", "10:00"))
 
 
+class RenderHeadlineDetailOpening(unittest.TestCase):
+    def test_names_rooftop_door_when_cool_and_open(self):
+        _, detail = rf.render_headline_detail(
+            19.0, "cool", "good", True, None, "n/a", 2.0, ["rooftop door"])
+        self.assertEqual(detail, "Rooftop door open")
+
+    def test_names_window_when_cold_and_open(self):
+        _, detail = rf.render_headline_detail(
+            17.0, "cold", "good", True, None, "n/a", 2.0, ["window"])
+        self.assertEqual(detail, "Window open")
+
+    def test_mould_risk_still_wins_over_named_opening(self):
+        _, detail = rf.render_headline_detail(
+            17.0, "cold", "good", True, None, "high", 2.0, ["window"])
+        self.assertEqual(detail, "Mould risk — dry it out")
+
+    def test_named_opening_precedes_floor_still_cold(self):
+        _, detail = rf.render_headline_detail(
+            17.0, "cold", "good", True, 2.5, "n/a", 2.0, ["window"])
+        self.assertEqual(detail, "Window open")
+
+    def test_floor_still_cold_when_window_closed(self):
+        _, detail = rf.render_headline_detail(
+            17.0, "cold", "good", False, 2.5, "n/a", 2.0, [])
+        self.assertEqual(detail, "Floor still cold")
+
+    def test_comfortable_room_does_not_name_opening(self):
+        _, detail = rf.render_headline_detail(
+            22.0, "comfortable", "good", True, None, "n/a", 2.0, ["window"])
+        self.assertEqual(detail, "Nothing to do")
+
+
 BEDROOM_CFG = {
     "air_sources": [
         {"entity": "climate.bedroom_thermostat", "attribute": "current_temperature",
@@ -443,6 +475,75 @@ class WindowOpenOr(unittest.TestCase):
         a = app._captured["sensor.dining_room_feel"]["attrs"]
         self.assertEqual(a["window_open"], "false")
 
+    def test_unavailable_contact_is_treated_as_closed(self):
+        app = _make_app({"dining_room": DINING_CFG}, plain={
+            "sensor.dining_room_presence_temperature": "20.0",
+            "sensor.dining_room_presence_humidity": "45",
+            "climate.family_room_thermostat": "off",
+            "binary_sensor.dining_room_window_1_contact": "unavailable",
+            "binary_sensor.dining_room_window_2_contact": "off",
+            "binary_sensor.dining_room_window_3_contact": "off",
+        }, attrs={
+            ("climate.family_room_thermostat", "current_temperature"): 20.0,
+            ("climate.family_room_thermostat", "current_humidity"): 45,
+        })
+        app._evaluate_room("dining_room")
+        a = app._captured["sensor.dining_room_feel"]["attrs"]
+        self.assertEqual(a["window_open"], "false")
+        self.assertEqual(a["open_labels"], ["<none>"])
+
+
+class OpenLabels(unittest.TestCase):
+    LIVING_ROOM_CFG = {
+        "air_sources": [
+            {"entity": "sensor.living_room_presence_temperature",
+             "rh_entity": "sensor.living_room_presence_humidity", "label": "fp300"},
+        ],
+        "window_contacts": [
+            "binary_sensor.living_room_window_contact",
+            {"entity": "binary_sensor.rooftop_door_1_contact", "label": "rooftop door"},
+        ],
+    }
+
+    def test_ordered_labels_of_open_contacts(self):
+        app = _make_app({"living_room": self.LIVING_ROOM_CFG}, plain={
+            "sensor.living_room_presence_temperature": "20.0",
+            "sensor.living_room_presence_humidity": "45",
+            "binary_sensor.living_room_window_contact": "on",
+            "binary_sensor.rooftop_door_1_contact": "on",
+        })
+        app._evaluate_room("living_room")
+        a = app._captured["sensor.living_room_feel"]["attrs"]
+        self.assertEqual(a["open_labels"], ["window", "rooftop door"])
+
+    def test_none_sentinel_when_all_closed(self):
+        app = _make_app({"living_room": self.LIVING_ROOM_CFG}, plain={
+            "sensor.living_room_presence_temperature": "20.0",
+            "sensor.living_room_presence_humidity": "45",
+            "binary_sensor.living_room_window_contact": "off",
+            "binary_sensor.rooftop_door_1_contact": "off",
+        })
+        app._evaluate_room("living_room")
+        a = app._captured["sensor.living_room_feel"]["attrs"]
+        self.assertEqual(a["open_labels"], ["<none>"])
+
+    def test_duplicate_labels_deduplicated(self):
+        cfg = {
+            "air_sources": [{"entity": "sensor.x"}],
+            "window_contacts": [
+                {"entity": "binary_sensor.c1", "label": "rooftop door"},
+                {"entity": "binary_sensor.c2", "label": "rooftop door"},
+            ],
+        }
+        app = _make_app({"room": cfg}, plain={
+            "sensor.x": "20.0",
+            "binary_sensor.c1": "on",
+            "binary_sensor.c2": "on",
+        })
+        app._evaluate_room("room")
+        a = app._captured["sensor.room_feel"]["attrs"]
+        self.assertEqual(a["open_labels"], ["rooftop door"])
+
 
 class AiringHelpsIntegration(unittest.TestCase):
     def test_room_marks_airing_helps_when_outdoor_drier(self):
@@ -645,6 +746,19 @@ class ParseRoomDefaults(unittest.TestCase):
         self.assertEqual(cfg["window_contacts"], [])
         self.assertEqual(cfg["air_sources"][0]["sun_flag"], False)
         self.assertEqual(cfg["air_sources"][0]["offset_c"], 0.0)
+
+    def test_mixed_string_and_dict_window_contacts(self):
+        cfg = rf.RoomFeel._parse_room({
+            "air_sources": [{"entity": "sensor.x"}],
+            "window_contacts": [
+                "binary_sensor.a_contact",
+                {"entity": "binary_sensor.b_contact", "label": "rooftop door"},
+            ],
+        })
+        self.assertEqual(cfg["window_contacts"], [
+            {"entity": "binary_sensor.a_contact", "label": "window"},
+            {"entity": "binary_sensor.b_contact", "label": "rooftop door"},
+        ])
 
 
 if __name__ == "__main__":

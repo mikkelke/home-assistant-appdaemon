@@ -29,11 +29,12 @@ Publish contract: one direction, no consumers read this app's own output back in
 (window_open/sun_hit/airing_helps/stale) are published as the literal strings "true"/"false"
 rather than Python bools - AppDaemon 4.5.13's set_state silently drops an attribute whose
 value is exactly False (see room_active.py's module docstring for the reference incident);
-`sources`/`excluded` use a ["<none>"] sentinel rather than [] for the same reason. Optional
-numeric attributes (floor_temp_c etc.) are still passed as plain None on a missing reading,
-matching bedroom_comfort.py's precedent - a real 0.0/None reading is rare enough there that
-working around the same set_state quirk for every numeric field is not worth it, and the
-numbers rule below is the real safety net: nothing here is ever a fabricated 0.
+`sources`/`excluded`/`open_labels` use a ["<none>"] sentinel rather than [] for the same
+reason. Optional numeric attributes (floor_temp_c etc.) are still passed as plain None on a
+missing reading, matching bedroom_comfort.py's precedent - a real 0.0/None reading is rare
+enough there that working around the same set_state quirk for every numeric field is not
+worth it, and the numbers rule below is the real safety net: nothing here is ever a
+fabricated 0.
 
 Numbers rule: unavailable/unknown/non-numeric readings are excluded with a reason and never
 enter the median as a 0. A room left with zero readable air source falls back to
@@ -163,7 +164,7 @@ def in_time_window(now_time, start_hms, end_hms):
 
 
 def render_headline_detail(temp_c, word, air_band, window_open, floor_spread_c,
-                            mould_risk, floor_cold_spread_c):
+                            mould_risk, floor_cold_spread_c, open_labels=None):
     """Plain-English headline/detail for housemates - see the app docstring's contract."""
     if temp_c is None:
         return "No reading", "Check the room's sensors."
@@ -172,6 +173,9 @@ def render_headline_detail(temp_c, word, air_band, window_open, floor_spread_c,
         detail = "Mould risk — dry it out"
     elif air_band in ("stuffy", "poor") and not window_open:
         detail = "Stuffy — open a window"
+    elif window_open and word in ("cool", "cold") and open_labels:
+        opening = open_labels[0]
+        detail = f"{opening[:1].upper()}{opening[1:]} open"
     elif floor_spread_c is not None and floor_spread_c >= floor_cold_spread_c:
         detail = "Floor still cold"
     else:
@@ -235,7 +239,7 @@ class RoomFeel(hass.Hass):
             register(cfg["floor_entity"], room)
             register(cfg["floor_rh_entity"], room)
             for contact in cfg["window_contacts"]:
-                register(contact, room)
+                register(contact["entity"], room)
             if cfg["air_quality"]:
                 register(cfg["air_quality"]["aqi_entity"], room)
                 register(cfg["air_quality"]["eco2_entity"], room)
@@ -273,6 +277,12 @@ class RoomFeel(hass.Hass):
         }
 
     @staticmethod
+    def _parse_window_contact(raw):
+        if isinstance(raw, dict):
+            return {"entity": raw["entity"], "label": raw.get("label", "window")}
+        return {"entity": raw, "label": "window"}
+
+    @staticmethod
     def _parse_room(raw):
         raw = raw or {}
 
@@ -298,7 +308,7 @@ class RoomFeel(hass.Hass):
             "air_sources": [RoomFeel._parse_source(s) for s in (raw.get("air_sources") or [])],
             "floor_entity": raw.get("floor_entity"),
             "floor_rh_entity": raw.get("floor_rh_entity"),
-            "window_contacts": list(raw.get("window_contacts") or []),
+            "window_contacts": [RoomFeel._parse_window_contact(c) for c in (raw.get("window_contacts") or [])],
             "air_quality": air_quality_cfg,
             "sun_hit": sun_hit_cfg,
             "mould_risk": bool(raw.get("mould_risk", False)),
@@ -469,7 +479,15 @@ class RoomFeel(hass.Hass):
         else:
             air_band = "unknown"
 
-        window_open = any(self.get_state(c) == "on" for c in cfg["window_contacts"])
+        open_labels = []
+        seen_labels: set = set()
+        for contact in cfg["window_contacts"]:
+            if self.get_state(contact["entity"]) != "on":
+                continue
+            if contact["label"] not in seen_labels:
+                seen_labels.add(contact["label"])
+                open_labels.append(contact["label"])
+        window_open = bool(open_labels)
 
         outdoor_t, outdoor_t_reason = self._read(self.outdoor_temp_entity)
         outdoor_rh, outdoor_rh_reason = self._read(self.outdoor_rh_entity)
@@ -485,7 +503,8 @@ class RoomFeel(hass.Hass):
         stale = stale_age is not None and stale_age > self.stale_minutes
 
         headline, detail = render_headline_detail(
-            temp_c, word, air_band, window_open, floor_spread_c, mould, self.floor_cold_spread_c)
+            temp_c, word, air_band, window_open, floor_spread_c, mould, self.floor_cold_spread_c,
+            open_labels)
 
         source_entities = []
         for src in cfg["air_sources"]:
@@ -495,7 +514,7 @@ class RoomFeel(hass.Hass):
         for ent in (cfg["floor_entity"], cfg["floor_rh_entity"]):
             if ent:
                 source_entities.append(ent)
-        source_entities.extend(cfg["window_contacts"])
+        source_entities.extend(c["entity"] for c in cfg["window_contacts"])
         if cfg["air_quality"]:
             for ent in (cfg["air_quality"]["aqi_entity"], cfg["air_quality"]["eco2_entity"]):
                 if ent:
@@ -516,6 +535,7 @@ class RoomFeel(hass.Hass):
             "floor_spread_c": floor_spread_c,
             "air_band": air_band,
             "window_open": "true" if window_open else "false",
+            "open_labels": open_labels or ["<none>"],
             "sun_hit": "true" if sun_hit else "false",
             "airing_helps": "true" if helps else "false",
             "mould_risk": mould,

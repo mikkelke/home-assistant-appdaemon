@@ -74,7 +74,9 @@ RoomFeel:
           label: salus_family
       floor_entity: sensor.living_room_floor_thermometer_temperature
       floor_rh_entity: sensor.living_room_floor_thermometer_humidity
-      window_contacts: [binary_sensor.living_room_window_contact]
+      window_contacts:
+        - binary_sensor.living_room_window_contact
+        - {entity: binary_sensor.rooftop_door_1_contact, label: rooftop door}
 
     kitchen:
       air_sources:
@@ -119,6 +121,8 @@ RoomFeel:
           label: salus_family
       floor_entity: sensor.dining_room_floor_thermometer_temperature
       floor_rh_entity: sensor.dining_room_floor_thermometer_humidity
+      # binary_sensor.dining_room_window_1_contact is currently unavailable in HA (dead
+      # contact) - excluded from the window_open OR while it stays unavailable.
       window_contacts:
         - binary_sensor.dining_room_window_1_contact
         - binary_sensor.dining_room_window_2_contact
@@ -160,7 +164,7 @@ RoomFeel:
       floor_rh_entity: sensor.claudias_room_floor_thermometer_humidity
       # Her only outward opening is the rooftop door (open_while_heating_guard.yaml) -
       # the room has no window contact of its own.
-      window_contacts: [binary_sensor.rooftop_door_2_contact]
+      window_contacts: [{entity: binary_sensor.rooftop_door_2_contact, label: rooftop door}]
 
     kristines_room:
       air_sources:
