@@ -1,0 +1,215 @@
+# /conf/apps/climate/room_feel.yaml
+# RoomFeel - one sensor.<room>_feel per room (the fused "how does this room feel" reading),
+# plus sensor.bedroom_supply_air_temperature and sensor.technical_room_feel. See
+# room_feel.py's module docstring for the sensor-placement facts this fusion respects.
+#
+# Entity ids marked UNVERIFIED below were not found by grepping this repo or the
+# hakit-dashboard entities.ts (box unreachable while writing this) - stated directly by
+# Mikkel on 2026-09-11 (sensor-placement memory) or inferred from an established per-room
+# naming pattern. Left yaml-configurable on purpose; fix here if any turn out wrong.
+
+RoomFeel:
+  module: room_feel
+  class: RoomFeel
+
+  stale_minutes: 45
+
+  comfort_bands:
+    cold_max_c: 18.0
+    cool_max_c: 20.0
+    comfortable_max_c: 24.0
+    warm_max_c: 26.0
+
+  air_quality_bands:
+    iaq_fresh_max: 50
+    iaq_good_max: 100
+    iaq_stuffy_max: 200
+    eco2_fresh_max: 800
+    eco2_good_max: 1200
+    eco2_stuffy_max: 2000
+
+  mould_risk_bands:
+    high_gap_c: 1.0
+    watch_gap_c: 3.0
+
+  floor_cold_spread_c: 2.0
+
+  outdoor_temperature_entity: sensor.gw2000a_outdoor_temperature
+  outdoor_humidity_entity: sensor.gw2000a_humidity
+  airing_dew_margin_c: 1.0
+  airing_rh_min: 60
+
+  # sensor.ventilation_thermometer_temperature: UNVERIFIED (no grep hit anywhere) - stated
+  # by Mikkel 2026-09-11 as the Zigbee sensor lying inside the bedroom supply-air duct.
+  supply_air:
+    source_entity: sensor.ventilation_thermometer_temperature
+    publish_entity: sensor.bedroom_supply_air_temperature
+
+  rooms:
+    bedroom:
+      air_sources:
+        - entity: climate.bedroom_thermostat
+          attribute: current_temperature
+          rh_entity: sensor.bedroom_humidity
+          label: salus
+        - entity: sensor.bedroom_presence_temperature
+          rh_entity: sensor.bedroom_presence_humidity
+          label: fp300
+      floor_entity: sensor.bedroom_floor_thermometer_temperature
+      # sensor.bedroom_floor_thermometer_humidity: UNVERIFIED (only the _temperature side
+      # is read anywhere else in this repo; SNZB-02P is a combo temp+humidity sensor so the
+      # channel likely exists under this name).
+      floor_rh_entity: sensor.bedroom_floor_thermometer_humidity
+      window_contacts: [binary_sensor.bedroom_window_contact]
+
+    living_room:
+      air_sources:
+        - entity: sensor.living_room_presence_temperature
+          rh_entity: sensor.living_room_presence_humidity
+          label: fp300
+        - entity: climate.family_room_thermostat
+          attribute: current_temperature
+          rh_entity: climate.family_room_thermostat
+          rh_attribute: current_humidity
+          label: salus_family
+      floor_entity: sensor.living_room_floor_thermometer_temperature
+      floor_rh_entity: sensor.living_room_floor_thermometer_humidity
+      window_contacts: [binary_sensor.living_room_window_contact]
+
+    kitchen:
+      air_sources:
+        - entity: sensor.kitchen_presence_temperature
+          rh_entity: sensor.kitchen_presence_humidity
+          label: fp300
+          sun_flag: true
+        - entity: climate.family_room_thermostat
+          attribute: current_temperature
+          rh_entity: climate.family_room_thermostat
+          rh_attribute: current_humidity
+          label: salus_family
+        - entity: sensor.kitchen_smoke_alarm_temperature
+          rh_entity: sensor.kitchen_smoke_alarm_humidity
+          label: ceiling
+          offset_c: -1.5
+          offset_rh: 6.5
+      # No floor thermometer in the kitchen (task's floor-sensor room list excludes it).
+      window_contacts: [binary_sensor.kitchen_window_contact]
+      air_quality:
+        aqi_entity: sensor.kitchen_smoke_alarm_aqi
+        eco2_entity: sensor.kitchen_smoke_alarm_eco2
+      # Threshold/window UNVERIFIED - no calibration data available; tune once the box is
+      # reachable. Kitchen's FP300 is on the window frame by the island, later morning sun
+      # than dining's (memory: "dining leads the room by ~1h in the morning").
+      sun_hit:
+        radiation_entity: sensor.gw2000a_solar_radiation
+        threshold_w_m2: 150
+        start: "07:30"
+        end: "10:00"
+
+    dining_room:
+      air_sources:
+        - entity: sensor.dining_room_presence_temperature
+          rh_entity: sensor.dining_room_presence_humidity
+          label: fp300
+          sun_flag: true
+        - entity: climate.family_room_thermostat
+          attribute: current_temperature
+          rh_entity: climate.family_room_thermostat
+          rh_attribute: current_humidity
+          label: salus_family
+      floor_entity: sensor.dining_room_floor_thermometer_temperature
+      floor_rh_entity: sensor.dining_room_floor_thermometer_humidity
+      window_contacts:
+        - binary_sensor.dining_room_window_1_contact
+        - binary_sensor.dining_room_window_2_contact
+        - binary_sensor.dining_room_window_3_contact
+      air_quality:
+        aqi_entity: sensor.kitchen_smoke_alarm_aqi
+        eco2_entity: sensor.kitchen_smoke_alarm_eco2
+      # Threshold/window UNVERIFIED - see kitchen's note; dining leads by ~1h per memory.
+      sun_hit:
+        radiation_entity: sensor.gw2000a_solar_radiation
+        threshold_w_m2: 150
+        start: "06:30"
+        end: "09:00"
+
+    hallway:
+      air_sources:
+        - entity: climate.family_room_thermostat
+          attribute: current_temperature
+          rh_entity: climate.family_room_thermostat
+          rh_attribute: current_humidity
+          label: salus_family
+      # No hallway floor thermometer and no known exterior window/door contact (interior
+      # corridor) - window_contacts intentionally empty.
+      window_contacts: []
+      air_quality:
+        aqi_entity: sensor.kitchen_smoke_alarm_aqi
+        eco2_entity: sensor.kitchen_smoke_alarm_eco2
+
+    claudias_room:
+      air_sources:
+        - entity: sensor.claudias_room_presence_temperature
+          rh_entity: sensor.claudias_room_presence_humidity
+          label: fp300
+        - entity: climate.claudias_room_thermostat
+          attribute: current_temperature
+          rh_entity: sensor.claudias_room_humidity
+          label: salus
+      floor_entity: sensor.claudias_room_floor_thermometer_temperature
+      floor_rh_entity: sensor.claudias_room_floor_thermometer_humidity
+      # Her only outward opening is the rooftop door (open_while_heating_guard.yaml) -
+      # the room has no window contact of its own.
+      window_contacts: [binary_sensor.rooftop_door_2_contact]
+
+    kristines_room:
+      air_sources:
+        # No FP300 in Kristine's room (task spec) - Salus is the sole/primary source.
+        - entity: climate.kristines_room_thermostat
+          attribute: current_temperature
+          # sensor.kristines_room_humidity: UNVERIFIED (pattern-inferred from
+          # sensor.bedroom_humidity/sensor.claudias_room_humidity, not grepped directly).
+          rh_entity: sensor.kristines_room_humidity
+          label: salus
+      floor_entity: sensor.kristines_room_floor_thermometer_temperature
+      floor_rh_entity: sensor.kristines_room_floor_thermometer_humidity
+      window_contacts: [binary_sensor.kristines_room_window_contact]
+
+    bathroom:
+      air_sources:
+        - entity: climate.bathroom_thermostat
+          attribute: current_temperature
+          # sensor.bathroom_humidity: UNVERIFIED (pattern-inferred, not grepped directly).
+          rh_entity: sensor.bathroom_humidity
+          label: salus
+      floor_entity: sensor.bathroom_floor_thermometer_temperature
+      floor_rh_entity: sensor.bathroom_floor_thermometer_humidity
+      window_contacts: [binary_sensor.bathroom_window_contact]
+      mould_risk: true
+
+    guest_bathroom:
+      air_sources:
+        - entity: climate.guest_bathroom_thermostat
+          attribute: current_temperature
+          # sensor.guest_bathroom_humidity: UNVERIFIED (pattern-inferred, not grepped
+          # directly).
+          rh_entity: sensor.guest_bathroom_humidity
+          label: salus
+      floor_entity: sensor.guest_bathroom_floor_thermometer_temperature
+      floor_rh_entity: sensor.guest_bathroom_floor_thermometer_humidity
+      # Only a door contact is known here (binary_sensor.guest_bathroom_door_contact, an
+      # interior door - not counted, see open_while_heating_guard.yaml's convention); no
+      # known exterior window contact.
+      window_contacts: []
+      mould_risk: true
+
+    # sensor.ecowitt_temperature_indoor / sensor.ecowitt_humidity_humidityin: UNVERIFIED
+    # (no grep hit anywhere) - stated by Mikkel 2026-09-11 as the Ecowitt gateway's own
+    # indoor channel (the gateway lives in this technical room). Publishes
+    # sensor.technical_room_feel via the standard sensor.<room>_feel naming.
+    technical_room:
+      air_sources:
+        - entity: sensor.ecowitt_temperature_indoor
+          rh_entity: sensor.ecowitt_humidity_humidityin
+          label: ecowitt
+      window_contacts: []
