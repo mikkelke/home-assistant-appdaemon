@@ -1,0 +1,102 @@
+# Fire Safety - Bosch Twinguard (kitchen ceiling, zigbee2mqtt) phase machine.
+# See fire_safety.py's module docstring for the phase table and design notes.
+#
+# HA helpers (created via MCP, not by this app): input_button.fire_safety_hush,
+#   input_button.fire_safety_clear, input_button.fire_safety_test,
+#   input_boolean.kitchen_cooking_mode
+#
+# dry_run: true is a FULL gate - zero call_service, zero MobileNotifier/SonosNotifier
+# notify() calls; everything is logged with a "[dry-run]" prefix instead. Flip to false
+# only once the phase machine has been watched against real device data. test_audience
+# narrows real pushes to Mikkel independently of dry_run; set to null for everyone once trusted.
+
+FireSafety:
+  module: fire_safety
+  class: FireSafety
+  # Init-order guarantee for get_app("MobileNotifier")/get_app("SonosNotifier") cached in
+  # initialize(); also reloads this app when either notifier reloads.
+  dependencies:
+    - MobileNotifier
+    - SonosNotifier
+
+  dry_run: true
+  test_audience: ["mikkel"]
+
+  state_file: /conf/apps/safety/fire_safety_state.json
+  publish_entity: sensor.fire_safety
+  timezone: "Europe/Copenhagen"
+
+  # --- Device (Bosch Twinguard, zigbee2mqtt, kitchen ceiling) ---
+  smoke_entity: binary_sensor.kitchen_smoke_alarm_smoke
+  siren_state_entity: sensor.kitchen_smoke_alarm_siren_state
+  battery_entity: sensor.kitchen_smoke_alarm_battery
+  eco2_entity: sensor.kitchen_smoke_alarm_eco2
+  aqi_entity: sensor.kitchen_smoke_alarm_aqi
+  alarm_select_entity: select.kitchen_smoke_alarm_alarm
+  self_test_switch_entity: switch.kitchen_smoke_alarm_self_test
+
+  # siren_state text is UNVERIFIED beyond "clear" - case-insensitive substring match,
+  # corroborating witness only (smoke binary_sensor is the primary truth).
+  siren_alarm_values: ["fire", "alarm", "smoke"]
+  siren_pre_alarm_values: ["pre_alarm", "pre-alarm", "prealarm"]
+
+  # --- Helpers ---
+  hush_button_entity: input_button.fire_safety_hush
+  clear_button_entity: input_button.fire_safety_clear
+  test_button_entity: input_button.fire_safety_test
+  cooking_mode_entity: input_boolean.kitchen_cooking_mode
+
+  # --- Timing ---
+  hush_minutes: 10
+  max_hushes_per_episode: 2
+  pre_alarm_timeout_min: 10
+  cooldown_confirm_s: 60
+  cooldown_clear_min: 15
+  offline_after_min: 30
+  cooking_mode_minutes: 45
+  self_test_window_min: 3
+  reannounce_interval_s: 45
+  repush_interval_s: 120
+  repush_interval_acked_s: 180
+  relights_interval_s: 60
+  tick_interval_s: 5
+
+  # --- Health thresholds ---
+  battery_low_pct: 20
+  test_overdue_days: 35
+  fault_push_throttle_hours: 48
+  fault_check_time: "09:00:00"
+  monthly_test_time: "11:00:00"
+
+  # --- Notifications ---
+  push_tag: fire_alarm
+  push_category: fire_alarm
+  health_category: fire_health   # category_audience in mobile_notifier.yaml already restricts this to mikkel
+  health_notify_target: "home"
+
+  # --- Sonos ---
+  sonos_kitchen_entity: media_player.kitchen
+  sonos_all_entity: media_player.sonos_tts_all
+  sonos_kitchen_volume: 0.15
+  sonos_alarm_volume: 0.7
+
+  # --- Lights: family-room/hallway zone (apps/lights/family_room_lights.yaml's "all" group) ---
+  alarm_lights:
+    - light.living_room_corner_light
+    - light.living_room_window_light
+    - light.living_room_wall_lights
+    - light.dining_room_lights
+    - light.kitchen_counter_lights
+    - light.island_lights
+    - light.hallway_lights
+  alarm_light_manual_booleans:
+    - input_boolean.living_room_lights_manual
+    - input_boolean.dining_room_lights_manual
+    - input_boolean.kitchen_lights_manual
+    - input_boolean.hallway_lights_manual
+
+  # --- Media pause targets ---
+  media_pause_players:
+    - media_player.sonos_tts_all
+    - media_player.living_room_tv
+    - media_player.bedroom_tv
