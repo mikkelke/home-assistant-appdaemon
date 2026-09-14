@@ -2,33 +2,25 @@
 Fire Safety - Bosch Twinguard (kitchen ceiling, zigbee2mqtt) phase machine.
 
 Publishes ``sensor.fire_safety`` (state = phase). Six phases: clear, pre_alarm, alarm,
-hushed, cooldown, offline - see the transition table in the module's design doc. Health
-(battery/self-test/offline) rides as attributes and a throttled daily push; it never
-becomes a phase of its own except "offline" (device itself unreachable > 30 min).
+hushed, cooldown, offline. Health (battery/self-test/offline) rides as attributes and a
+throttled daily push; it never becomes a phase of its own except "offline" (device itself
+unreachable > 30 min).
 
-Owner constraints (hard): never touches locks/burglar features, never writes
-sensitivity/pre_alarm on the device's own select - only ever writes "stop". False alarms
-and night wake-ups are the worst outcome, so pre_alarm NEVER pushes (kitchen-only Sonos
-chime, suppressed entirely while input_boolean.kitchen_cooking_mode is active) and hush is
-bounded (hush_minutes, max_hushes_per_episode).
+Never touches locks or burglar features, and never writes anything to the device's own
+alarm select besides "stop". pre_alarm never pushes - only a kitchen-only Sonos chime,
+suppressed while input_boolean.kitchen_cooking_mode is active. dry_run is a full gate:
+while on, no call_service or notifier call reaches the outside world; every action is
+logged with a "[dry-run]" prefix instead. test_audience narrows real pushes once dry_run
+is off.
 
-dry_run (default True) is a full gate: while on, this app calls precisely nothing on the
-outside world (no call_service, no MobileNotifier/SonosNotifier notify) - every action is
-logged with a "[dry-run]" prefix instead, mirroring this codebase's shadow-mode apps
-(dryer_shadow.py). test_audience (default ["mikkel"]) narrows real pushes once dry_run is
-off, independent of dry_run.
+Phase/episode state persists to a JSON file (tmp + os.replace), so an ordinary tick
+re-derives the phase from the live smoke/siren reading rather than needing special
+resume-on-restart logic.
 
-Restart survival: phase/since/episode fields persist to a JSON state file (tmp + os.replace,
-see house_events.py / climate_alarm.py). No special "resume alarm on init" code exists - the
-ordinary tick evaluates persisted phase against the live smoke reading and re-derives alarm
-from scratch if smoke is already on, which also means a crash-and-restart mid-alarm resumes
-the repeat cadence from the persisted last_push_at/last_announce_at instead of re-spamming.
-
-Async convention (matches climate_alarm.py/entry_truth.py/lock_health.py): listen_state/
-listen_event/run_daily callbacks are plain sync methods that create_task() the real work;
-every AppDaemon API call made from inside an async method is awaited, including run_in
-(lock_health.py's documented gotcha - an unawaited call from the event loop is a dead
-coroutine that never fires).
+listen_state/listen_event/run_daily callbacks are plain sync methods that create_task()
+the real work; every AppDaemon API call made from inside an async method must be awaited,
+including run_in - an unawaited call from the event loop is a dead coroutine that never
+fires.
 """
 
 import asyncio
@@ -58,12 +50,12 @@ PHASE_ICONS = {
 IAQ_BREAKPOINTS = [(50, "fresh"), (100, "good"), (200, "stuffy")]
 ECO2_BREAKPOINTS = [(800, "fresh"), (1200, "good"), (2000, "stuffy")]
 
-# Fix 7: how many consecutive failed light-restore attempts (one per cooldown/clear tick)
-# before giving up and dropping the snapshot rather than retrying forever.
+# How many consecutive failed light-restore attempts (one per cooldown/clear tick) before
+# giving up and dropping the snapshot rather than retrying forever.
 LIGHT_RESTORE_MAX_ATTEMPTS = 5
 
-# Third review: while a hush's siren/smoke reading is unknown (not a known negative), retry
-# the confirmation check this often instead of a single now-or-never decision.
+# While a hush's siren/smoke reading is unknown (not a known negative), retry the
+# confirmation check this often instead of a single now-or-never decision.
 HUSH_UNKNOWN_RETRY_S = 5
 
 
@@ -75,7 +67,7 @@ def _normalize_siren(value):
 
 
 def _siren_matches(value, values):
-    """Case-insensitive, trimmed, exact match - siren_state is a verified fixed vocabulary
+    """Case-insensitive, trimmed, exact match - siren_state is a fixed vocabulary
     (clear/pre_alarm/fire/silenced/self_test/burglar), not free text to substring-scan."""
     norm = _normalize_siren(value)
     if norm is None or not values:
@@ -134,12 +126,12 @@ class FireSafety(hass.Hass):
         self.hush_minutes = int(a("hush_minutes", 10))
         self.max_hushes_per_episode = int(a("max_hushes_per_episode", 2))
         # Remote hush sends "stop" then waits this long before checking whether the siren/
-        # smoke actually corroborate it worked (fix 2) - a failed/ignored stop must not be
-        # reported to the household as a successful hush.
+        # smoke actually corroborate it worked - a failed/ignored stop must not be reported
+        # to the household as a successful hush.
         self.hush_confirm_s = int(a("hush_confirm_s", 20))
-        # Third review: total time since the press an unknown/unavailable siren or smoke
-        # reading may keep rescheduling the confirmation check before giving up and
-        # reporting "couldn't silence" - unknown must never itself confirm a hush.
+        # Total time since the press an unknown/unavailable siren or smoke reading may
+        # keep rescheduling the confirmation check before giving up and reporting
+        # "couldn't silence" - unknown must never itself confirm a hush.
         self.hush_confirm_max_s = int(a("hush_confirm_max_s", 120))
         self.pre_alarm_timeout_min = int(a("pre_alarm_timeout_min", 10))
         self.cooldown_confirm_s = int(a("cooldown_confirm_s", 60))
@@ -147,12 +139,12 @@ class FireSafety(hass.Hass):
         self.offline_after_min = int(a("offline_after_min", 30))
         self.cooking_mode_minutes = int(a("cooking_mode_minutes", 45))
         # Floor under _run_self_test's own trigger, for the gap before the device's live
-        # siren_state actually reports self_test (fix 3: seconds, not minutes - a stuck/
-        # accidental self-test must only mask a real fire for a short bounded window).
+        # siren_state actually reports self_test - seconds, not minutes, since a stuck or
+        # accidental self-test must only mask a real fire for a short bounded window.
         self.self_test_floor_s = int(a("self_test_floor_s", 60))
         # If the siren has continuously reported self_test for longer than this, treat it as
         # NOT self-test for smoke_fallback purposes - a device stuck/faulty in self_test must
-        # not suppress smoke_fallback forever (fix 3).
+        # not suppress smoke_fallback forever.
         self.self_test_max_min = int(a("self_test_max_min", 10))
         self.reannounce_interval_s = int(a("reannounce_interval_s", 45))
         self.repush_interval_s = int(a("repush_interval_s", 120))
@@ -178,15 +170,15 @@ class FireSafety(hass.Hass):
         self.push_tag = a("push_tag", "fire_alarm")
         self.push_category = a("push_category", "fire_alarm")
         self.health_category = a("health_category", "fire_health")
-        # A specific person list (not "home") so health pushes reach Mikkel even while
-        # he's away - target="home" would resolve to nobody and silently vanish (2026-09-14).
+        # A specific person list, not "home" - target="home" resolves to whoever is
+        # physically home right now and would silently drop the push if everyone is away.
         self.health_notify_target = a("health_notify_target", ["mikkel"])
 
         self.alarm_always_notify = list(a("alarm_always_notify", ["mikkel"]))
         self.alarm_notify_if_home = dict(a("alarm_notify_if_home", {"kristine": "person.kristine", "claudia": "person.claudia"}) or {})
         self.alarm_nobody_home = a("alarm_nobody_home", "always_only")
 
-        # Monthly self-test (fix 10): who counts as "someone home" for the auto-skip.
+        # Who counts as "someone home" for the automatic monthly self-test's auto-skip.
         self.monthly_test_person_entities = list(
             a("monthly_test_person_entities", ["person.mikkel", "person.kristine", "person.claudia"])
         )
@@ -246,8 +238,8 @@ class FireSafety(hass.Hass):
         self.run_daily(self._on_fault_check_tick, time(*self._parse_hms(self.fault_check_time)))
         self.run_daily(self._on_monthly_test_tick, time(*self._parse_hms(self.monthly_test_time)))
 
-        # Single schedule: first tick at +2s (covers "smoke already on at boot" - see module
-        # docstring), then every tick_interval_s for the time-based transitions/repeats.
+        # First tick at +2s (covers smoke already being on at boot), then every
+        # tick_interval_s afterward for the time-based transitions/repeats.
         self.run_every(self._tick_cb, "now+2", self.tick_interval_s)
 
         self._maybe_resume_pending_hush()
@@ -284,8 +276,8 @@ class FireSafety(hass.Hass):
         """Raw state_changed (not listen_state) so HA's context - and with it
         context.user_id, the human behind the tap - survives; see _resolve_actor.
 
-        Fix 1: after an HA restart, input_button.* goes unavailable then RESTORES its last
-        press timestamp - that restore is a state_changed event too (old="unavailable",
+        After an HA restart, input_button.* goes unavailable then restores its last press
+        timestamp - that restore is a state_changed event too (old="unavailable",
         new=<old timestamp>), and must never be read as a fresh press."""
         data = data or {}
         entity = data.get("entity_id")
@@ -336,10 +328,10 @@ class FireSafety(hass.Hass):
             self.log(f"person map refresh failed: {e}", level="WARNING")
 
     def _on_test_button(self, entity, attribute, old, new, kwargs):
-        # Fix 1: same restored-press guard as _on_button_state_changed, adapted to
-        # listen_state's old/new pair instead of a raw state_changed event. Third review
-        # (fix 6): no freshness window - a legitimate press delayed past it must still run;
-        # this old/new-unavailable check is the only restart-restore protection needed.
+        # Same restored-press guard as _on_button_state_changed, adapted to listen_state's
+        # old/new pair instead of a raw state_changed event. No freshness window - a
+        # legitimate press delayed past one must still run; this old/new-unavailable check
+        # is the only restart-restore protection needed.
         if new in UNAVAILABLE_STATES or old in UNAVAILABLE_STATES:
             return
         self.create_task(self._run_self_test(self._now()))
@@ -404,18 +396,17 @@ class FireSafety(hass.Hass):
     # ---------- main evaluation loop ----------
 
     async def _evaluate(self):
-        # smoke and siren_state update in the same instant, so two listener tasks race here;
-        # serialise or both see the old phase and each enters alarm (double push, 2026-09-11).
+        # smoke and siren_state update in the same instant, so two listener tasks can race
+        # here; without serialising, both would see the old phase and each enter alarm.
         async with self._eval_lock:
             await self._evaluate_locked()
 
     async def _evaluate_locked(self):
         try:
             now = self._now()
-            # Fix 3: read siren BEFORE the smoke-unknown early return - an explicit siren
-            # "fire" is independent evidence and must raise/keep an alarm even while the
-            # smoke entity itself is unavailable, instead of being swallowed by the outage
-            # branch below.
+            # Read siren BEFORE the smoke-unknown early return - an explicit siren "fire" is
+            # independent evidence and must raise/keep an alarm even while the smoke entity
+            # itself is unavailable, instead of being swallowed by the outage branch below.
             smoke = await self._read_state(self.smoke_entity)
             siren = await self._read_state(self.siren_state_entity)
             siren_fire = _siren_matches(siren, self.siren_alarm_values)
@@ -427,9 +418,9 @@ class FireSafety(hass.Hass):
                 self.smoke_fallback_since = None
                 self.off_since = None
                 if not siren_fire:
-                    # Third review: an unknown reading must never linger as a stale prior
-                    # value - otherwise a later return to "fire" can look like "still fire"
-                    # (no edge) instead of the fresh evidence it actually is.
+                    # An unknown reading must never linger as a stale prior value -
+                    # otherwise a later return to "fire" can look like "still fire" (no
+                    # edge) instead of the fresh evidence it actually is.
                     if siren is None:
                         self.last_siren = None
                     self.last_smoke = None
@@ -461,20 +452,21 @@ class FireSafety(hass.Hass):
                 self.last_self_test_at = now
 
             if not in_pre_alarm:
-                # The siren has left pre_alarm at least once - lifts the fix-8 loop guard.
+                # The siren has left pre_alarm at least once - lifts the stuck-pre_alarm
+                # loop guard.
                 self.pre_alarm_stuck = False
 
             # self_test_until is a floor under _run_self_test's own trigger, for the gap
             # before the device's live siren_state actually reports self_test; only applies
-            # when smoke positively confirms "off" (fix 3) - smoke=="on" OR unknown must
-            # never be masked, so a real fire (or one coinciding with a smoke-entity outage)
-            # during that window is never suppressed by a recent self-test.
+            # when smoke positively confirms "off" - smoke=="on" OR unknown must never be
+            # masked, so a real fire (or one coinciding with a smoke-entity outage) during
+            # that window is never suppressed by a recent self-test.
             floor_suppressed = (
                 self.self_test_until is not None and now < self.self_test_until and smoke == "off"
             )
-            # Fix 3: bound how long a continuously-reported self_test can suppress
-            # smoke_fallback - a device stuck/faulty in self_test must eventually let a real,
-            # uncorroborated smoke reading raise an alarm again.
+            # Bound how long a continuously-reported self_test can suppress smoke_fallback -
+            # a device stuck/faulty in self_test must eventually let a real, uncorroborated
+            # smoke reading raise an alarm again.
             self_test_expired = (
                 in_self_test and self.last_self_test_at is not None
                 and (now - self.last_self_test_at) >= timedelta(minutes=self.self_test_max_min)
@@ -519,15 +511,15 @@ class FireSafety(hass.Hass):
                 elif not in_pre_alarm:
                     await self._enter_clear(now)
                 elif (now - self.since) >= timedelta(minutes=self.pre_alarm_timeout_min):
-                    # Still reporting pre_alarm past our timeout - clear anyway (fix 8), but
-                    # remember it's stuck so we don't re-chime every tick until it truly clears.
+                    # Still reporting pre_alarm past our timeout - clear anyway, but remember
+                    # it's stuck so we don't re-chime every tick until it truly clears.
                     self.pre_alarm_stuck = True
                     await self._enter_clear(now)
 
             elif self.phase == "alarm":
                 if self._physical_hush_signal(prev_siren, siren):
                     # The device's own button already silenced it - confirmed by definition,
-                    # commit immediately without the remote send-stop-and-wait dance (fix 2).
+                    # commit immediately without the remote send-stop-and-wait dance.
                     await self._hush_locked(now, "the button on the alarm", physically_confirmed=True)
                 elif smoke == "off":
                     self.off_since = self.off_since or now
@@ -547,9 +539,9 @@ class FireSafety(hass.Hass):
                 if siren_realarm_edge or smoke_fallback:
                     await self._enter_alarm(now)
                 elif self.hushed_until is not None and now >= self.hushed_until:
-                    # Fix 4: qualified predicate - smoke=="on" alone must NOT re-arm into a
-                    # full critical alarm, since it's also the steady state of pre_alarm
-                    # (the device's own smoke bit is set in both pre_alarm and fire).
+                    # Qualified predicate - smoke=="on" alone must NOT re-arm into a full
+                    # critical alarm, since it's also the steady state of pre_alarm (the
+                    # device's own smoke bit is set in both pre_alarm and fire).
                     if in_alarm or smoke_fallback:
                         await self._enter_alarm(now)
                     elif in_pre_alarm:
@@ -596,20 +588,20 @@ class FireSafety(hass.Hass):
         return now_silenced and not was_silenced
 
     def _clear_pending_hush(self):
-        """Fix 4: any phase change invalidates an in-flight remote hush confirmation."""
+        """Any phase change invalidates an in-flight remote hush confirmation."""
         self.pending_hush = None
 
     def _push_still_valid(self, episode, generation, expected_phase=None):
-        """Fix 3: a detached push (dispatched with a snapshot of episode_id/generation)
-        must re-check right before actually notifying - the episode may have moved on
+        """A detached push (dispatched with a snapshot of episode_id/generation) must
+        re-check right before actually notifying - the episode may have moved on
         (hushed/re-alarmed/cleared) while it was in flight."""
         if self.episode_id != episode or self.generation != generation:
             return False
         return expected_phase is None or self.phase == expected_phase
 
     def _all_clear_still_valid(self, generation):
-        """All-clear's episode_id is intentionally None by the time this fires (fix 2) - so
-        validity is generation+phase only, not an episode_id match."""
+        """All-clear's episode_id is intentionally None by the time this fires, so validity
+        is generation+phase only, not an episode_id match."""
         return self.phase == "clear" and self.generation == generation
 
     async def _handle_unavailable(self, now):
@@ -627,14 +619,14 @@ class FireSafety(hass.Hass):
         self._save_state()
 
     async def _stale_mid_alarm(self, now):
-        """Fix 1: device stopped reporting mid-episode - stop repeats (already implicit,
+        """Device stopped reporting mid-episode - stop repeats (already implicit,
         _evaluate_locked returns before the repeat cadence whenever smoke reads None),
         send exactly one non-critical notice, and mark it so Clear can end the episode
         (see _on_clear_pressed) even though smoke never reported "off".
 
-        Fix 9: stale_alarm_notified is persisted, so this only ever fires once per episode
-        even across an AppDaemon restart. Set it BEFORE dispatching (fix 6: the push itself
-        must not hold _eval_lock) so a slow send can't cause a duplicate on the next tick."""
+        stale_alarm_notified is persisted, so this only ever fires once per episode even
+        across an AppDaemon restart. Set it before dispatching the push itself (which must
+        not hold _eval_lock) so a slow send can't cause a duplicate on the next tick."""
         self.stale_alarm_notified = True
         self._save_state()
         self.create_task(self._send_stale_notice(now, self.episode_id, self.generation))
@@ -695,8 +687,8 @@ class FireSafety(hass.Hass):
     async def _enter_alarm(self, now):
         self._clear_pending_hush()
         # Continuation (not a new episode) whenever an episode is already open (offline
-        # entered from alarm/hushed/cooldown keeps episode_id - fix 7), or a fresh alarm
-        # lands within episode_reuse_min of the last clear (fix 4).
+        # entered from alarm/hushed/cooldown keeps episode_id), or a fresh alarm lands
+        # within episode_reuse_min of the last clear.
         resumed_continuous = self.episode_id is not None
         reused_recent = False
         if not resumed_continuous:
@@ -715,9 +707,9 @@ class FireSafety(hass.Hass):
             self.episode_notified = None
             self.hush_limit_notified = False
         elif reused_recent:
-            # Fix 7: episode reuse carries over hush accounting only - NOT the audience
-            # list (episode_notified) or a light snapshot, both of which must start fresh
-            # for this new alarm rather than resurrecting stale history/state.
+            # Episode reuse carries over hush accounting only - NOT the audience list
+            # (episode_notified) or a light snapshot, both of which must start fresh for
+            # this new alarm rather than resurrecting stale history/state.
             prev = self.last_episode or {}
             self.episode_id = prev.get("episode_id") or now.strftime("%Y%m%d%H%M%S")
             self.episode_started_at = now
@@ -736,8 +728,8 @@ class FireSafety(hass.Hass):
             self.last_announce_at = now
         self._save_state()
 
-        # Lights/media/announcement must not wait on the push (fix 5) - a hanging notifier
-        # would otherwise hold _eval_lock and block a concurrent hush/clear press.
+        # Lights/media/announcement must not wait on the push - a hanging notifier would
+        # otherwise hold _eval_lock and block a concurrent hush/clear press.
         await self._report_feed("alarm")
         await self._assert_lights(now)
         self.last_lights_assert_at = now
@@ -748,13 +740,13 @@ class FireSafety(hass.Hass):
             await self.run_in(self._delayed_announce, 2, episode_id=self.episode_id)
         else:
             # Escalation from hushed/cooldown/offline within the same episode: re-announce
-            # now instead of waiting out the ordinary 45s cadence.
+            # now instead of waiting out the ordinary reannounce_interval_s cadence.
             await self._announce_alarm(now)
             self.last_announce_at = now
             self._save_state()
 
-        # Snapshot episode_id/generation synchronously (fix 6) - the push itself runs
-        # detached from _eval_lock, so it must not blindly trust live self.* once it resumes.
+        # Snapshot episode_id/generation synchronously - the push itself runs detached from
+        # _eval_lock, so it must not blindly trust live self.* once it resumes.
         self.create_task(self._push_alarm(now, self.episode_id, self.generation))
         self.last_push_at = now
         self._save_state()
@@ -783,8 +775,8 @@ class FireSafety(hass.Hass):
         directly from _evaluate_locked (the physical-hush-button path), which already
         holds the lock; asyncio.Lock isn't reentrant so that path must not re-acquire it.
 
-        Fix 2: a remote hush is NOT trusted just because the select call was accepted - it
-        sends "stop", then waits hush_confirm_s before checking the siren/smoke actually
+        A remote hush is NOT trusted just because the select call was accepted - it sends
+        "stop", then waits hush_confirm_s before checking the siren/smoke actually
         corroborate it worked. hush_count/phase are only committed on confirmation, so a
         silently-ignored remote hush never reports success or eats a hush attempt. The
         physical button (physically_confirmed=True) is confirmed by definition already."""
@@ -804,8 +796,8 @@ class FireSafety(hass.Hass):
         if physically_confirmed:
             await self._commit_hush(now, by_text)
             return
-        # Third review: only one remote hush attempt in flight at a time - a second press
-        # while one is already awaiting confirmation is ignored, not queued.
+        # Only one remote hush attempt in flight at a time - a second press while one is
+        # already awaiting confirmation is ignored, not queued.
         if self.pending_hush is not None:
             self.log("Hush already pending confirmation - second press ignored", level="DEBUG")
             return
@@ -829,10 +821,10 @@ class FireSafety(hass.Hass):
             await self._confirm_hush_locked(episode_id, by_text)
 
     async def _confirm_hush_locked(self, episode_id, by_text):
-        """Third review (P1): confirmed only on POSITIVE evidence - siren known and in
-        {clear, silenced}, or smoke known "off". An unknown/unavailable reading (e.g. the
-        ~65s post-restart gap) must never itself confirm a hush - reschedule instead, up to
-        hush_confirm_max_s total since the original press."""
+        """Confirmed only on POSITIVE evidence - siren known and in {clear, silenced}, or
+        smoke known "off". An unknown/unavailable reading (e.g. the ~65s post-restart gap)
+        must never itself confirm a hush - reschedule instead, up to hush_confirm_max_s
+        total since the original press."""
         pending = self.pending_hush
         if (
             self.phase != "alarm"
@@ -861,7 +853,7 @@ class FireSafety(hass.Hass):
     async def _commit_hush(self, now, by_text):
         self.pending_hush = None
         if self.hush_count >= self.max_hushes_per_episode:
-            # Fix 4: re-check at commit time too - a confirmation that took a while (unknown
+            # Re-check at commit time too - a confirmation that took a while (unknown
             # retries) could otherwise land after some other path already used up the limit.
             self.log(f"Hush limit reached at commit time for episode {self.episode_id} - not hushing", level="WARNING")
             if not self.hush_limit_notified:
@@ -880,7 +872,7 @@ class FireSafety(hass.Hass):
         self.off_since = None
         self._save_state()
         await self._report_feed("hushed", by=by_text)
-        # Push detached from _eval_lock (fix 6); announce stays awaited (ordering unchanged).
+        # Push detached from _eval_lock; announce stays awaited (ordering unchanged).
         self.create_task(self._push_hushed(now, self.episode_id, self.generation, self.hushed_by, self.hushed_until))
         await self._announce_hushed(now)
 
@@ -909,7 +901,7 @@ class FireSafety(hass.Hass):
         if was_active and self.episode_started_at:
             duration_min = max(0, int((now - self.episode_started_at).total_seconds() // 60))
         if was_active:
-            # Stashed for episode reuse (fix 4) before the fields below are wiped.
+            # Stashed for episode reuse before the fields below are wiped.
             self.last_clear_at = now
             self.last_episode = {
                 "episode_id": self.episode_id,
@@ -918,10 +910,10 @@ class FireSafety(hass.Hass):
                 "light_snapshot": self.light_snapshot,
                 "light_snapshot_episode": self.light_snapshot_episode,
             }
-        # Fix 2/3: the all-clear push now runs detached, so it must not rely on live
+        # The all-clear push runs detached, so it must not rely on live
         # self.episode_id/episode_notified once it actually fires - both are about to be
-        # wiped below. Snapshot them (and the new generation) synchronously instead, so a
-        # departed housemate recorded on this episode still receives the all-clear.
+        # wiped below. Snapshot them (and the new generation) synchronously instead, so
+        # anyone recorded on this episode still receives the all-clear.
         cleared_episode_id = self.episode_id
         notified_snapshot = self.episode_notified
         self.phase = "clear"
@@ -982,10 +974,10 @@ class FireSafety(hass.Hass):
             self._save_state()
 
     async def _run_self_test(self, now, automatic=False):
-        """Fix 1: refuse unless the alarm is idle and the device itself is clear - a
-        self-test sounds the siren, so it must never fire mid-episode or onto ambiguous
-        device state. The automatic monthly run additionally refuses unless every
-        housemate is CONFIRMED not_home (unknown/unavailable presence counts as home)."""
+        """Refuse unless the alarm is idle and the device itself is clear - a self-test
+        sounds the siren, so it must never fire mid-episode or onto ambiguous device state.
+        The automatic monthly run additionally refuses unless everyone tracked is CONFIRMED
+        not_home (unknown/unavailable presence counts as home)."""
         async with self._eval_lock:
             if not await self._self_test_ready(automatic):
                 self.log("Self-test refused - alarm not idle, device not clear, or presence unclear", level="WARNING")
@@ -999,8 +991,8 @@ class FireSafety(hass.Hass):
             # can fail or the device can ignore it, so only the confirmed edge counts.
             self.self_test_until = now + timedelta(seconds=self.self_test_floor_s)
             self._save_state()
-            # Fix 2: detached - this runs under _eval_lock, and a slow health push must not
-            # block a concurrent hush/clear press.
+            # Detached - this runs under _eval_lock, and a slow health push must not block
+            # a concurrent hush/clear press.
             self.create_task(self._push_health(now, "Kitchen smoke alarm self-test ran."))
             return True
 
@@ -1018,8 +1010,8 @@ class FireSafety(hass.Hass):
         return True
 
     async def _anyone_home(self):
-        """Fix 1: unknown/unavailable presence counts as "home" for this gate - a
-        self-test sounds the siren, so an unclear reading must never read as "away"."""
+        """Unknown/unavailable presence counts as "home" for this gate - a self-test
+        sounds the siren, so an unclear reading must never read as "away"."""
         for entity in self.monthly_test_person_entities:
             if await self._read_state(entity) != "not_home":
                 return True
@@ -1027,8 +1019,8 @@ class FireSafety(hass.Hass):
 
     async def _maybe_run_monthly_test(self, now):
         """Automatic monthly self-test: only while no one is home (a self-test sounds the
-        siren). Retries daily at monthly_test_time through day monthly_test_max_retry_days;
-        if nobody's ever away by then, give up for the month with a Mikkel-only push."""
+        siren). Retries daily at monthly_test_time through day monthly_test_max_retry_days,
+        then gives up for the month and sends a health push instead."""
         if now.day > self.monthly_test_max_retry_days:
             return
         month_key = now.strftime("%Y-%m")
@@ -1095,8 +1087,8 @@ class FireSafety(hass.Hass):
             last = self.last_fault_push_at.get(key)
             if last and (now - last) < throttle:
                 continue
-            # Fix 2: detached - the throttle stamp is applied inside the task itself (only
-            # on a real send), since a create_task() here can't be awaited for its result.
+            # Detached - the throttle stamp is applied inside the task itself (only on a
+            # real send), since a create_task() here can't be awaited for its result.
             self.create_task(self._send_fault_push(now, key, message))
 
     async def _send_fault_push(self, now, key, message):
@@ -1109,10 +1101,10 @@ class FireSafety(hass.Hass):
 
     async def _maybe_repeat_alarm_actions(self, now):
         if self.last_push_at is None or (now - self.last_push_at) >= self._repush_interval():
-            # Fix 6: detached from _eval_lock - a hanging repeat push must not block a
-            # concurrent hush/clear press. Third review (fix 5): a repeat's own targeting
-            # still ignores history (include_history=False inside _push_alarm), but every
-            # recipient it actually reaches is unioned into episode_notified afterward.
+            # Detached from _eval_lock - a hanging repeat push must not block a concurrent
+            # hush/clear press. A repeat's own targeting still ignores history
+            # (include_history=False inside _push_alarm), but every recipient it actually
+            # reaches is unioned into episode_notified afterward.
             self.create_task(self._push_alarm(now, self.episode_id, self.generation))
             self.last_push_at = now
             self._save_state()
@@ -1133,8 +1125,8 @@ class FireSafety(hass.Hass):
 
     async def _call(self, dry_run_desc, service, **kwargs):
         """Shared dry_run gate + error handling for a single call_service - see module
-        docstring on dry_run being a full gate, never partial. Returns True/False (fix 2)
-        so a caller like the remote hush path knows whether the call itself failed."""
+        docstring on dry_run being a full gate, never partial. Returns True/False so a
+        caller like the remote hush path knows whether the call itself failed."""
         if self.dry_run:
             self.log(f"[dry-run] would {dry_run_desc}")
             return True
@@ -1159,10 +1151,10 @@ class FireSafety(hass.Hass):
         """Returns True on success (or a simulated dry-run success) so callers that must
         only stamp bookkeeping on a real send (e.g. the fault throttle) can check it.
 
-        Fix 5: MobileNotifier.notify returns the number of services it actually delivered
-        to (0 when none) - success here means that count is a positive int, not merely
-        that the coroutine didn't raise (a notifier that resolved zero services previously
-        looked identical to a real send)."""
+        MobileNotifier.notify returns the number of services it actually delivered to (0
+        when none) - success here means that count is a positive int, not merely that the
+        coroutine didn't raise, since a notifier that resolves zero services must not be
+        read as a successful send."""
         if self.dry_run:
             self.log(f"[dry-run] would push: {dry_run_desc}")
             return True
@@ -1195,8 +1187,8 @@ class FireSafety(hass.Hass):
         if self.dry_run:
             self.log(f"[dry-run] would turn on alarm lights: {self.alarm_lights}")
             return
-        # Fix 7: never take a new snapshot while a previous one is still un-restored -
-        # otherwise a failed restore's target values would be lost forever.
+        # Never take a new snapshot while a previous one is still un-restored - otherwise
+        # a failed restore's target values would be lost forever.
         if self.light_snapshot_episode != self.episode_id and not self.light_snapshot:
             await self._snapshot_lights()
         try:
@@ -1228,7 +1220,7 @@ class FireSafety(hass.Hass):
         self._save_state()
 
     async def _clear_lights(self):
-        """Fix 7: only drop the snapshot once every restore call in it actually succeeded;
+        """Only drop the snapshot once every restore call in it actually succeeded;
         otherwise keep it and let the caller retry on a later tick (see
         _maybe_retry_light_restore), giving up after LIGHT_RESTORE_MAX_ATTEMPTS."""
         if self.dry_run:
@@ -1271,8 +1263,8 @@ class FireSafety(hass.Hass):
             await self.call_service("input_boolean/turn_off", entity_id=boolean)
 
     async def _restore_lights(self, snapshot):
-        """Returns True only if every call_service in the restore succeeded (fix 7) -
-        a partial failure must not be reported as a completed restore."""
+        """Returns True only if every call_service in the restore succeeded - a partial
+        failure must not be reported as a completed restore."""
         ok = True
         off_entities = [entity for entity, v in snapshot.items() if v.get("state") != "on"]
         if off_entities:
@@ -1306,18 +1298,18 @@ class FireSafety(hass.Hass):
         )
 
     async def _episode_audience(self, now, include_history, history_override=None):
-        """Owner rule (2026-09-14): Mikkel always, each housemate only while home.
+        """alarm_always_notify is always included; each entry in alarm_notify_if_home only
+        while home.
 
-        Fix 8: the "nobody home -> everyone" fallback only applies once every housemate is
+        The "nobody home -> everyone" fallback only applies once every tracked person is
         CONFIRMED not_home - an unknown/unavailable presence is ambiguous, not evidence of
-        absence, so that housemate is simply left out rather than triggering "everyone".
+        absence, so that person is simply left out rather than triggering "everyone".
 
-        Third review (fix 5): include_history=False (initial alarm + repeats) computes
-        "always ∪ home now" only; include_history=True (hush/hush-unconfirmed/hush-limit/
-        stale/all-clear) also ∪'s in episode_notified - anyone already recorded for this
-        episode keeps getting THOSE pushes even after they leave. history_override lets a
-        caller pass a pre-reset snapshot once self.episode_notified has already been wiped
-        (see _enter_clear)."""
+        include_history=False (initial alarm + repeats) computes "always ∪ home now" only;
+        include_history=True (hush/hush-unconfirmed/hush-limit/stale/all-clear) also ∪'s in
+        episode_notified - anyone already recorded for this episode keeps getting THOSE
+        pushes even after they leave. history_override lets a caller pass a pre-reset
+        snapshot once self.episode_notified has already been wiped (see _enter_clear)."""
         home = set()
         all_confirmed_away = True
         for person, entity in self.alarm_notify_if_home.items():
@@ -1335,10 +1327,10 @@ class FireSafety(hass.Hass):
         return sorted(audience)
 
     async def _push_alarm(self, now, episode, generation):
-        """episode/generation are a snapshot taken synchronously by the caller (fix 6) -
-        this push runs detached from _eval_lock, so it must not trust a live self.* read
-        mid-flight. Every recipient of ANY alarm push (initial or repeat) is unioned into
-        episode_notified (fix 5) - only the push's OWN targeting ignores history."""
+        """episode/generation are a snapshot taken synchronously by the caller - this push
+        runs detached from _eval_lock, so it must not trust a live self.* read mid-flight.
+        Every recipient of ANY alarm push (initial or repeat) is unioned into
+        episode_notified - only the push's OWN targeting ignores history."""
         audience = await self._episode_audience(now, include_history=False)
         self.log(f"Fire alarm push audience: {audience}", level="INFO")
 
@@ -1386,8 +1378,8 @@ class FireSafety(hass.Hass):
             self.episode_notified = audience
 
     async def _push_hush_unconfirmed(self, now, episode, generation):
-        """Fix 2: sent both when the remote "stop" call itself failed and when it was
-        accepted but the device never corroborated it within hush_confirm_max_s - from the
+        """Sent both when the remote "stop" call itself failed and when it was accepted
+        but the device never corroborated it within hush_confirm_max_s - from the
         household's perspective these are the same outcome (the alarm is not silenced)."""
         audience = await self._episode_audience(now, include_history=True)
         if not self._push_still_valid(episode, generation):
@@ -1576,17 +1568,17 @@ class FireSafety(hass.Hass):
             "computed_at": now.isoformat(timespec="seconds"),
             "dry_run": self.dry_run,
         }
-        # Recorder-spam guard (fix 11): only write when something besides computed_at
-        # actually changed, plus a 5-minute heartbeat (and always on the first call after
-        # init, since _last_published_state starts None) so the entity still looks alive.
+        # Recorder-spam guard: only write when something besides computed_at actually
+        # changed, plus a 5-minute heartbeat (and always on the first call after init,
+        # since _last_published_state starts None) so the entity still looks alive.
         comparable = {k: v for k, v in attributes.items() if k != "computed_at"}
         unchanged = self._last_published_state == self.phase and self._last_published_attrs == comparable
         heartbeat_due = (
             self._last_published_at is None or (now - self._last_published_at) >= timedelta(minutes=5)
         )
         if unchanged and not heartbeat_due:
-            # Fix 10: HA may have lost our published entity (e.g. an HA-core restart wiped
-            # it while AppDaemon kept running) - don't wait out the 5-minute heartbeat to
+            # HA may have lost our published entity (e.g. an HA-core restart wiped it
+            # while AppDaemon kept running) - don't wait out the 5-minute heartbeat to
             # notice, republish immediately once we see it's gone.
             live = await self._read_state(self.publish_entity)
             if live is not None:
@@ -1670,16 +1662,16 @@ class FireSafety(hass.Hass):
         self.hush_limit_notified = bool(data.get("hush_limit_notified") or False)
         self.monthly_test_month_key = data.get("monthly_test_month_key")
         self.monthly_test_resolved = bool(data.get("monthly_test_resolved") or False)
-        # Fix 9: persisted (not transient) so an AppDaemon restart mid-alarm doesn't repeat
-        # the once-only house-wide stale announcement; _enter_clear resets it per episode.
+        # Persisted (not transient) so an AppDaemon restart mid-alarm doesn't repeat the
+        # once-only house-wide stale announcement; _enter_clear resets it per episode.
         self.stale_alarm_notified = bool(data.get("stale_alarm_notified") or False)
-        # Third review: bumped on every phase change so a detached push can tell whether
-        # the episode has moved on since it was dispatched (fix 3).
+        # Bumped on every phase change so a detached push can tell whether the episode has
+        # moved on since it was dispatched.
         self.generation = int(data.get("generation") or 0)
         self.pending_hush = self._parse_pending_hush(data.get("pending_hush"))
 
-        # Transient (never persisted): safe/desirable to reset every process start - see
-        # each fix's rationale (fallback debounce, loop guard, heartbeat).
+        # Transient (never persisted): safe/desirable to reset every process start
+        # (fallback debounce, loop guard, heartbeat).
         self.smoke_fallback_since = None
         self.pre_alarm_stuck = False
         self._last_published_state = None

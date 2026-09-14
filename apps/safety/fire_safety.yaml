@@ -8,7 +8,8 @@
 # dry_run: true is a FULL gate - zero call_service, zero MobileNotifier/SonosNotifier
 # notify() calls; everything is logged with a "[dry-run]" prefix instead. Flip to false
 # only once the phase machine has been watched against real device data. test_audience
-# narrows real pushes to Mikkel independently of dry_run; set to null for everyone once trusted.
+# narrows real pushes to whoever it lists, independently of dry_run; set to null for
+# everyone once trusted.
 
 FireSafety:
   module: fire_safety
@@ -37,9 +38,9 @@ FireSafety:
 
   # siren_state is an EXACT value (case-insensitive, trimmed) from zigbee-herdsman-
   # converters' Bosch Twinguard status word: clear, pre_alarm, fire, silenced, self_test,
-  # burglar - verified against bosch.js and a recorded self_test cycle. The device's own
-  # smoke bit is SET during both pre_alarm and fire, CLEAR during silenced/self_test - see
-  # fire_safety.py's _evaluate for how that keeps pre_alarm from being read as alarm.
+  # burglar. The device's own smoke bit is SET during both pre_alarm and fire, CLEAR
+  # during silenced/self_test - see fire_safety.py's _evaluate for how that keeps
+  # pre_alarm from being read as alarm.
   siren_alarm_values: ["fire"]
   siren_pre_alarm_values: ["pre_alarm"]
   siren_silenced_values: ["silenced"]
@@ -60,11 +61,11 @@ FireSafety:
   hush_minutes: 10
   max_hushes_per_episode: 2
   # Remote hush sends "stop" then waits this long before checking the siren/smoke actually
-  # corroborate it worked (fix 2) - a failed/ignored stop is never reported as a success.
+  # corroborate it worked - a failed/ignored stop is never reported as a success.
   hush_confirm_s: 20
   # Total time since the press an unknown/unavailable siren or smoke reading may keep
   # rescheduling that check (every 5s) before giving up and reporting "couldn't silence" -
-  # unknown must never itself confirm a hush (third review).
+  # unknown must never itself confirm a hush.
   hush_confirm_max_s: 120
   pre_alarm_timeout_min: 10
   cooldown_confirm_s: 60
@@ -72,7 +73,7 @@ FireSafety:
   offline_after_min: 30
   cooking_mode_minutes: 45
   # Floor under _run_self_test's own trigger, for the gap before the device's live
-  # siren_state actually reports self_test (fix 3: seconds, not minutes).
+  # siren_state actually reports self_test - seconds, not minutes.
   self_test_floor_s: 60
   # If the siren has continuously reported self_test longer than this, stop treating it as
   # self-test for smoke_fallback purposes - a stuck/faulty device must not mask a real fire.
@@ -103,13 +104,14 @@ FireSafety:
   # --- Notifications ---
   push_tag: fire_alarm
   push_category: fire_alarm
-  health_category: fire_health   # category_audience in mobile_notifier.yaml already restricts this to mikkel
-  # A specific person, not "home" - target="home" resolves to whoever's physically home
-  # and would silently drop the push if Mikkel is away (fixed 2026-09-14).
+  health_category: fire_health   # category_audience in mobile_notifier.yaml further restricts the actual recipients
+  # A specific person list, not "home" - target="home" resolves to whoever's physically
+  # home and would silently drop the push if the configured recipient is away.
   health_notify_target: ["mikkel"]
 
-  # Episode push audience (owner rule, 2026-09-14): Mikkel always, each housemate only
-  # while home. test_audience above stays the override - non-null wins over this entirely.
+  # Episode push audience: alarm_always_notify always gets it, each alarm_notify_if_home
+  # entry only while home. test_audience above stays the override - non-null wins over
+  # this entirely.
   alarm_always_notify: ["mikkel"]
   alarm_notify_if_home:
     kristine: person.kristine
