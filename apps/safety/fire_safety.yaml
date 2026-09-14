@@ -84,6 +84,15 @@ FireSafety:
   health_category: fire_health   # category_audience in mobile_notifier.yaml already restricts this to mikkel
   health_notify_target: "home"
 
+  # Episode push audience (owner rule, 2026-09-14): Mikkel always, each housemate only
+  # while home. test_audience above stays the override - non-null wins over this entirely.
+  alarm_always_notify: ["mikkel"]
+  alarm_notify_if_home:
+    kristine: person.kristine
+    claudia: person.claudia
+  # who else gets the push when none of alarm_notify_if_home is home: "always_only" or "everyone"
+  alarm_nobody_home: everyone
+
   # --- Sonos ---
   sonos_kitchen_entity: media_player.kitchen
   sonos_all_entity: media_player.sonos_tts_all

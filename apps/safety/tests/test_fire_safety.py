@@ -143,6 +143,9 @@ def _make_app(**overrides):
     app.push_category = "fire_alarm"
     app.health_category = "fire_health"
     app.health_notify_target = "home"
+    app.alarm_always_notify = ["mikkel"]
+    app.alarm_notify_if_home = {"kristine": "person.kristine", "claudia": "person.claudia"}
+    app.alarm_nobody_home = "always_only"
     app.sonos_kitchen_entity = "media_player.kitchen"
     app.sonos_all_entity = "media_player.sonos_tts_all"
     app.sonos_kitchen_volume = 0.15
@@ -175,6 +178,7 @@ def _make_app(**overrides):
     app.last_fault_push_at = {}
     app.light_snapshot = {}
     app.light_snapshot_episode = None
+    app.episode_notified = None
 
     for key, value in overrides.items():
         setattr(app, key, value)
@@ -760,6 +764,92 @@ class TestAudiencePassthrough(_FrozenTimeTestCase):
         await app._run_self_test(FIXED_NOW)
         self.assertEqual(app.mobile_notifier.calls[0]["test_audience"], ["mikkel"])
 
+    async def test_non_null_test_audience_overrides_computed_audience(self):
+        # Kristine is home (would join the computed audience) but the override still wins.
+        app = _make_app(test_audience=["mikkel"])
+        app.states[app.smoke_entity] = "on"
+        app.states[app.siren_state_entity] = "clear"
+        app.states["person.kristine"] = "home"
+        await app._evaluate()
+        self.assertEqual(app.mobile_notifier.calls[0]["test_audience"], ["mikkel"])
+
+
+class AlarmAudience(_FrozenTimeTestCase):
+    async def test_mikkel_always_included(self):
+        app = _make_app()
+        app.states["person.kristine"] = "not_home"
+        app.states["person.claudia"] = "not_home"
+        audience = await app._episode_audience(FIXED_NOW)
+        self.assertEqual(audience, ["mikkel"])
+
+    async def test_housemate_home_is_included(self):
+        app = _make_app()
+        app.states["person.kristine"] = "home"
+        app.states["person.claudia"] = "not_home"
+        audience = await app._episode_audience(FIXED_NOW)
+        self.assertEqual(audience, ["kristine", "mikkel"])
+
+    async def test_housemate_not_home_or_unavailable_excluded(self):
+        app = _make_app()
+        app.states["person.kristine"] = "not_home"
+        app.states["person.claudia"] = "unavailable"
+        audience = await app._episode_audience(FIXED_NOW)
+        self.assertEqual(audience, ["mikkel"])
+
+    async def test_nobody_home_always_only_yields_mikkel_only(self):
+        app = _make_app(alarm_nobody_home="always_only")
+        app.states["person.kristine"] = "not_home"
+        app.states["person.claudia"] = "not_home"
+        audience = await app._episode_audience(FIXED_NOW)
+        self.assertEqual(audience, ["mikkel"])
+
+    async def test_nobody_home_everyone_yields_all_three(self):
+        app = _make_app(alarm_nobody_home="everyone")
+        app.states["person.kristine"] = "not_home"
+        app.states["person.claudia"] = "not_home"
+        audience = await app._episode_audience(FIXED_NOW)
+        self.assertEqual(audience, ["claudia", "kristine", "mikkel"])
+
+    async def test_departed_housemate_kept_via_episode_notified(self):
+        app = _make_app(episode_notified=["mikkel", "kristine"])
+        app.states["person.kristine"] = "not_home"
+        app.states["person.claudia"] = "not_home"
+        audience = await app._episode_audience(FIXED_NOW)
+        self.assertEqual(audience, ["kristine", "mikkel"])
+
+    async def test_alarm_push_sets_episode_notified(self):
+        app = _make_app(test_audience=None)
+        app.states[app.smoke_entity] = "on"
+        app.states[app.siren_state_entity] = "clear"
+        app.states["person.kristine"] = "home"
+        await app._evaluate()
+        self.assertEqual(app.episode_notified, ["kristine", "mikkel"])
+        self.assertEqual(app.mobile_notifier.calls[0]["test_audience"], ["kristine", "mikkel"])
+
+    async def test_departed_housemate_still_gets_all_clear_push(self):
+        app = _make_app(
+            test_audience=None,
+            phase="cooldown", since=FIXED_NOW - timedelta(minutes=16),
+            episode_id="E1", episode_started_at=FIXED_NOW - timedelta(minutes=20),
+            episode_notified=["mikkel", "kristine"],
+        )
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
+        app.states["person.kristine"] = "not_home"
+        app.states["person.claudia"] = "not_home"
+        await app._evaluate()
+        self.assertEqual(app.phase, "clear")
+        push = app.mobile_notifier.calls[-1]
+        self.assertEqual(push["test_audience"], ["kristine", "mikkel"])
+        self.assertIsNone(app.episode_notified)
+
+    async def test_episode_notified_reset_on_new_episode(self):
+        app = _make_app(test_audience=None, episode_notified=["mikkel", "kristine", "claudia"])
+        app.states[app.smoke_entity] = "on"
+        app.states[app.siren_state_entity] = "clear"
+        await app._evaluate()
+        self.assertEqual(app.episode_notified, ["mikkel"])
+
 
 class PushPayloadShape(_FrozenTimeTestCase):
     async def test_alarm_push_payload_shape(self):
@@ -971,6 +1061,7 @@ class PersistenceRoundTrip(unittest.TestCase):
         app.last_fault_push_at = {"battery_low": app.since}
         app.light_snapshot = {"light.hallway_lights": {"state": "on", "brightness": 128}}
         app.light_snapshot_episode = "20260911201000"
+        app.episode_notified = ["mikkel", "kristine"]
         app._save_state()
 
         reloaded = self._app(path)
@@ -985,6 +1076,7 @@ class PersistenceRoundTrip(unittest.TestCase):
         self.assertEqual(reloaded.last_fault_push_at["battery_low"], app.since)
         self.assertEqual(reloaded.light_snapshot, app.light_snapshot)
         self.assertEqual(reloaded.light_snapshot_episode, "20260911201000")
+        self.assertEqual(reloaded.episode_notified, ["mikkel", "kristine"])
 
     def test_missing_file_defaults_to_clear(self):
         app = self._app("/nonexistent/dir/fire_safety_state.json")
@@ -994,6 +1086,7 @@ class PersistenceRoundTrip(unittest.TestCase):
         self.assertEqual(app.last_fault_push_at, {})
         self.assertEqual(app.light_snapshot, {})
         self.assertIsNone(app.light_snapshot_episode)
+        self.assertIsNone(app.episode_notified)
 
     def test_save_leaves_no_tmp_file_behind(self):
         fd, path = tempfile.mkstemp(suffix=".json")
@@ -1021,6 +1114,7 @@ class PersistenceRoundTrip(unittest.TestCase):
         app.last_fault_push_at = {}
         app.light_snapshot = {}
         app.light_snapshot_episode = None
+        app.episode_notified = None
         app._save_state()
         self.assertFalse(os.path.exists(path + ".tmp"))
 

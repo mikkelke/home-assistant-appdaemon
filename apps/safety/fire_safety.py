@@ -148,6 +148,10 @@ class FireSafety(hass.Hass):
         self.health_category = a("health_category", "fire_health")
         self.health_notify_target = a("health_notify_target", "home")
 
+        self.alarm_always_notify = list(a("alarm_always_notify", ["mikkel"]))
+        self.alarm_notify_if_home = dict(a("alarm_notify_if_home", {"kristine": "person.kristine", "claudia": "person.claudia"}) or {})
+        self.alarm_nobody_home = a("alarm_nobody_home", "always_only")
+
         self.sonos_kitchen_entity = a("sonos_kitchen_entity", "media_player.kitchen")
         self.sonos_all_entity = a("sonos_all_entity", "media_player.sonos_tts_all")
         self.sonos_kitchen_volume = float(a("sonos_kitchen_volume", 0.15))
@@ -488,6 +492,7 @@ class FireSafety(hass.Hass):
             self.episode_started_at = now
             self.hush_count = 0
             self.ack_by = None
+            self.episode_notified = None
         self.phase = "alarm"
         self.since = now
         self.off_since = None
@@ -578,6 +583,7 @@ class FireSafety(hass.Hass):
             await self._clear_lights()
             await self._push_all_clear(now, duration_min or 0)
             await self._announce_all_clear(now)
+        self.episode_notified = None
         self._save_state()
 
     async def _enter_offline(self, now):
@@ -807,8 +813,22 @@ class FireSafety(hass.Hass):
             "media_player/media_pause", entity_id=self.media_pause_players,
         )
 
+    async def _episode_audience(self, now):
+        """Owner rule (2026-09-14): Mikkel always, each housemate only while home; anyone
+        already recorded for this episode keeps getting pushes even after they leave."""
+        home = set()
+        for person, entity in self.alarm_notify_if_home.items():
+            if await self._read_state(entity) == "home":
+                home.add(person)
+        if not home and self.alarm_nobody_home == "everyone":
+            home = set(self.alarm_notify_if_home.keys())
+        audience = set(self.alarm_always_notify) | home | set(self.episode_notified or [])
+        return sorted(audience)
+
     async def _push_alarm(self, now):
         episode = self.episode_id
+        audience = await self._episode_audience(now)
+        self.log(f"Fire alarm push audience: {audience}", level="INFO")
 
         def actions_for(person):
             return [
@@ -827,11 +847,13 @@ class FireSafety(hass.Hass):
             critical=True,
             channel="Fire alarm",
             per_person_actions=actions_for,
-            test_audience=self.test_audience,
+            test_audience=self.test_audience if self.test_audience is not None else audience,
         )
+        self.episode_notified = audience
 
     async def _push_hushed(self, now):
         rearm = self._fmt(self.hushed_until)
+        audience = await self._episode_audience(now)
         await self._notify(
             "hush confirmation",
             title="Smoke in the kitchen",
@@ -839,10 +861,11 @@ class FireSafety(hass.Hass):
             target="all",
             data={"data": {"tag": self.push_tag}},
             category=self.push_category,
-            test_audience=self.test_audience,
+            test_audience=self.test_audience if self.test_audience is not None else audience,
         )
 
     async def _push_hush_limit(self, now):
+        audience = await self._episode_audience(now)
         await self._notify(
             "hush-limit-reached notice",
             title="Fire alarm",
@@ -850,10 +873,11 @@ class FireSafety(hass.Hass):
             target="all",
             data={"data": {"tag": f"{self.push_tag}_hush_limit"}},
             category=self.push_category,
-            test_audience=self.test_audience,
+            test_audience=self.test_audience if self.test_audience is not None else audience,
         )
 
     async def _push_all_clear(self, now, duration_min):
+        audience = await self._episode_audience(now)
         await self._notify(
             "all-clear",
             title="Fire alarm",
@@ -861,7 +885,7 @@ class FireSafety(hass.Hass):
             target="all",
             data={"data": {"tag": self.push_tag}},
             category=self.push_category,
-            test_audience=self.test_audience,
+            test_audience=self.test_audience if self.test_audience is not None else audience,
         )
 
     async def _push_health(self, now, message):
@@ -1052,6 +1076,7 @@ class FireSafety(hass.Hass):
         self.last_fault_push_at = {k: self._parse_dt(v) for k, v in (data.get("last_fault_push_at") or {}).items()}
         self.light_snapshot = data.get("light_snapshot") or {}
         self.light_snapshot_episode = data.get("light_snapshot_episode")
+        self.episode_notified = data.get("episode_notified") or None
 
     def _save_state(self):
         data = {
@@ -1076,6 +1101,7 @@ class FireSafety(hass.Hass):
             "last_fault_push_at": {k: v.isoformat() for k, v in self.last_fault_push_at.items() if v},
             "light_snapshot": self.light_snapshot,
             "light_snapshot_episode": self.light_snapshot_episode,
+            "episode_notified": self.episode_notified,
         }
         try:
             tmp = self.state_file + ".tmp"
