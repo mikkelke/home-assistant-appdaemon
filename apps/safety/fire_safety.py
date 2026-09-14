@@ -136,6 +136,15 @@ class FireSafety(hass.Hass):
         self.repush_interval_acked_s = int(a("repush_interval_acked_s", 180))
         self.relights_interval_s = int(a("relights_interval_s", 60))
         self.tick_interval_s = int(a("tick_interval_s", 5))
+        # Device unavailable/unknown mid-episode (alarm/hushed) longer than this -> one
+        # non-critical push+announce, then Clear can end the episode without smoke=="off".
+        self.stale_grace_s = int(a("stale_grace_s", 120))
+        # smoke_fallback (smoke on, siren not corroborating) must hold continuously this
+        # long before it alone raises an alarm; siren=="fire" always bypasses this.
+        self.smoke_fallback_s = int(a("smoke_fallback_s", 30))
+        # A new alarm starting within this many minutes of the previous clear reuses that
+        # episode's id/hush-count/audience/light-snapshot instead of starting fresh.
+        self.episode_reuse_min = int(a("episode_reuse_min", 30))
 
         self.battery_low_pct = float(a("battery_low_pct", 20))
         self.test_overdue_days = int(a("test_overdue_days", 35))
@@ -146,11 +155,19 @@ class FireSafety(hass.Hass):
         self.push_tag = a("push_tag", "fire_alarm")
         self.push_category = a("push_category", "fire_alarm")
         self.health_category = a("health_category", "fire_health")
-        self.health_notify_target = a("health_notify_target", "home")
+        # A specific person list (not "home") so health pushes reach Mikkel even while
+        # he's away - target="home" would resolve to nobody and silently vanish (2026-09-14).
+        self.health_notify_target = a("health_notify_target", ["mikkel"])
 
         self.alarm_always_notify = list(a("alarm_always_notify", ["mikkel"]))
         self.alarm_notify_if_home = dict(a("alarm_notify_if_home", {"kristine": "person.kristine", "claudia": "person.claudia"}) or {})
         self.alarm_nobody_home = a("alarm_nobody_home", "always_only")
+
+        # Monthly self-test (fix 10): who counts as "someone home" for the auto-skip.
+        self.monthly_test_person_entities = list(
+            a("monthly_test_person_entities", ["person.mikkel", "person.kristine", "person.claudia"])
+        )
+        self.monthly_test_max_retry_days = int(a("monthly_test_max_retry_days", 7))
 
         self.sonos_kitchen_entity = a("sonos_kitchen_entity", "media_player.kitchen")
         self.sonos_all_entity = a("sonos_all_entity", "media_player.sonos_tts_all")
@@ -176,6 +193,11 @@ class FireSafety(hass.Hass):
 
         self._load_state()
 
+        # Single lock shared by evaluate() and every external entry point (hush/clear/ack/
+        # self-test/cooking) so a slow push can never block a concurrent button press.
+        # Created here (not lazily) so it exists before any listener can possibly fire.
+        self._eval_lock = asyncio.Lock()
+
         self.mobile_notifier = None
         try:
             self.mobile_notifier = self.get_app("MobileNotifier")
@@ -189,7 +211,10 @@ class FireSafety(hass.Hass):
 
         self.listen_state(self._on_smoke_change, self.smoke_entity)
         self.listen_state(self._on_siren_change, self.siren_state_entity)
-        self.listen_event(self._on_button_state_changed, "state_changed")
+        # One listener per button entity (AD filters on event data) instead of a single
+        # house-wide state_changed subscription that fires for every entity in HA.
+        self.listen_event(self._on_button_state_changed, "state_changed", entity_id=self.hush_button_entity)
+        self.listen_event(self._on_button_state_changed, "state_changed", entity_id=self.clear_button_entity)
         self.listen_state(self._on_test_button, self.test_button_entity)
         self.listen_state(self._on_cooking_on, self.cooking_mode_entity, new="on")
         self.listen_state(self._on_cooking_off, self.cooking_mode_entity, new="off")
@@ -278,9 +303,7 @@ class FireSafety(hass.Hass):
         self.create_task(self._check_faults(self._now()))
 
     def _on_monthly_test_tick(self, kwargs):
-        if self._now().day != 1:
-            return
-        self.create_task(self._run_self_test(self._now()))
+        self.create_task(self._maybe_run_monthly_test(self._now()))
 
     def _on_notification_action(self, event_name, data, kwargs):
         data = data or {}
@@ -330,8 +353,6 @@ class FireSafety(hass.Hass):
     async def _evaluate(self):
         # smoke and siren_state update in the same instant, so two listener tasks race here;
         # serialise or both see the old phase and each enters alarm (double push, 2026-09-11).
-        if not hasattr(self, "_eval_lock"):
-            self._eval_lock = asyncio.Lock()
         async with self._eval_lock:
             await self._evaluate_locked()
 
@@ -345,6 +366,7 @@ class FireSafety(hass.Hass):
                 return
             if self.unavailable_since is not None:
                 self.unavailable_since = None
+                self.stale_alarm_notified = False
 
             siren = await self._read_state(self.siren_state_entity)
             prev_smoke = self.last_smoke
@@ -364,6 +386,10 @@ class FireSafety(hass.Hass):
             if in_self_test and not prev_in_self_test:
                 self.last_self_test_at = now
 
+            if not in_pre_alarm:
+                # The siren has left pre_alarm at least once - lifts the fix-8 loop guard.
+                self.pre_alarm_stuck = False
+
             # self_test_until is a floor under _run_self_test's own trigger, for the gap
             # before the device's live siren_state actually reports self_test; excluded
             # once smoke=="on" so a real fire during that window is never masked.
@@ -372,11 +398,26 @@ class FireSafety(hass.Hass):
             )
             siren_suppressed = in_self_test or floor_suppressed
 
+            # smoke_fallback: smoke on but the siren doesn't corroborate any known state
+            # (not pre_alarm/silenced/self_test/fire - fire alarms immediately via in_alarm
+            # below). Debounced: must hold continuously for smoke_fallback_s before it alone
+            # raises an alarm, so a momentary cross-entity read race doesn't false-alarm.
+            smoke_fallback_raw = (
+                smoke == "on" and not in_pre_alarm and not in_silenced and not in_self_test and not in_alarm
+            )
+            if smoke_fallback_raw:
+                if self.smoke_fallback_since is None:
+                    self.smoke_fallback_since = now
+            else:
+                self.smoke_fallback_since = None
+            smoke_fallback = (
+                self.smoke_fallback_since is not None
+                and (now - self.smoke_fallback_since) >= timedelta(seconds=self.smoke_fallback_s)
+            )
+
             pre_alarm_condition = (
                 in_pre_alarm and not siren_suppressed and not self._cooking_active(now)
-            )
-            smoke_fallback = (
-                smoke == "on" and not in_pre_alarm and not in_silenced and not in_self_test
+                and not self.pre_alarm_stuck
             )
             alarm_condition = (in_alarm and not siren_suppressed) or smoke_fallback
 
@@ -389,12 +430,17 @@ class FireSafety(hass.Hass):
             elif self.phase == "pre_alarm":
                 if alarm_condition:
                     await self._enter_alarm(now)
-                elif not in_pre_alarm or (now - self.since) >= timedelta(minutes=self.pre_alarm_timeout_min):
+                elif not in_pre_alarm:
+                    await self._enter_clear(now)
+                elif (now - self.since) >= timedelta(minutes=self.pre_alarm_timeout_min):
+                    # Still reporting pre_alarm past our timeout - clear anyway (fix 8), but
+                    # remember it's stuck so we don't re-chime every tick until it truly clears.
+                    self.pre_alarm_stuck = True
                     await self._enter_clear(now)
 
             elif self.phase == "alarm":
                 if self._physical_hush_signal(prev_siren, siren):
-                    await self._hush(now, "the button on the alarm")
+                    await self._hush_locked(now, "the button on the alarm")
                 elif smoke == "off":
                     self.off_since = self.off_since or now
                     if (now - self.off_since) >= timedelta(seconds=self.cooldown_confirm_s):
@@ -406,14 +452,16 @@ class FireSafety(hass.Hass):
                     await self._maybe_repeat_alarm_actions(now)
 
             elif self.phase == "hushed":
-                new_smoke_edge = prev_smoke == "off" and smoke == "on"
+                # Regardless of the smoke bit (silenced/self_test clear it on the device
+                # itself, so it's not evidence of anything while hushed) - hold until
+                # hushed_until, leaving early only on a real re-alarm signal.
                 siren_realarm_edge = in_alarm and not prev_in_alarm
-                expired_still_on = self.hushed_until is not None and now >= self.hushed_until and smoke == "on"
-                if new_smoke_edge or siren_realarm_edge or expired_still_on:
+                if siren_realarm_edge or smoke_fallback:
                     await self._enter_alarm(now)
-                elif smoke == "off":
-                    self.off_since = self.off_since or now
-                    if (now - self.off_since) >= timedelta(seconds=self.cooldown_confirm_s):
+                elif self.hushed_until is not None and now >= self.hushed_until:
+                    if in_alarm or smoke == "on":
+                        await self._enter_alarm(now)
+                    else:
                         await self._enter_cooldown(now)
 
             elif self.phase == "cooldown":
@@ -455,9 +503,41 @@ class FireSafety(hass.Hass):
     async def _handle_unavailable(self, now):
         if self.unavailable_since is None:
             self.unavailable_since = now
-        elif self.phase != "offline" and (now - self.unavailable_since) >= timedelta(minutes=self.offline_after_min):
+        stale_duration = now - self.unavailable_since
+        if (
+            self.phase in ("alarm", "hushed")
+            and not self.stale_alarm_notified
+            and stale_duration >= timedelta(seconds=self.stale_grace_s)
+        ):
+            await self._stale_mid_alarm(now)
+        if self.phase != "offline" and stale_duration >= timedelta(minutes=self.offline_after_min):
             await self._enter_offline(now)
         self._save_state()
+
+    async def _stale_mid_alarm(self, now):
+        """Fix 1: device stopped reporting mid-episode - stop repeats (already implicit,
+        _evaluate_locked returns before the repeat cadence whenever smoke reads None),
+        send exactly one non-critical notice, and mark it so Clear can end the episode
+        (see _on_clear_pressed) even though smoke never reported "off"."""
+        message = "Kitchen smoke alarm stopped reporting during the alarm — check the kitchen"
+        audience = await self._episode_audience(now)
+        await self._notify(
+            "stale-during-alarm notice",
+            title="Fire alarm",
+            message=message,
+            target="all",
+            data={"data": {"tag": self.push_tag}},
+            category=self.push_category,
+            test_audience=self.test_audience if self.test_audience is not None else audience,
+        )
+        self._announce(
+            "stale-during-alarm over Sonos",
+            message=message,
+            target_speakers=[self.sonos_all_entity],
+            override_quiet_hours=True,
+            volume_level=self.sonos_alarm_volume,
+        )
+        self.stale_alarm_notified = True
 
     async def _read_state(self, entity_id):
         try:
@@ -486,34 +566,66 @@ class FireSafety(hass.Hass):
         await self._chime_pre_alarm(now)
 
     async def _enter_alarm(self, now):
-        new_episode = self.phase not in ("alarm", "hushed", "cooldown")
-        if new_episode:
+        # Continuation (not a new episode) whenever an episode is already open (offline
+        # entered from alarm/hushed/cooldown keeps episode_id - fix 7), or a fresh alarm
+        # lands within episode_reuse_min of the last clear (fix 4).
+        resumed_continuous = self.episode_id is not None
+        reused_recent = False
+        if not resumed_continuous:
+            reused_recent = (
+                self.last_episode is not None
+                and self.last_clear_at is not None
+                and (now - self.last_clear_at) <= timedelta(minutes=self.episode_reuse_min)
+            )
+        fresh_start = not resumed_continuous and not reused_recent
+
+        if fresh_start:
             self.episode_id = now.strftime("%Y%m%d%H%M%S")
             self.episode_started_at = now
             self.hush_count = 0
             self.ack_by = None
             self.episode_notified = None
+            self.hush_limit_notified = False
+        elif reused_recent:
+            prev = self.last_episode or {}
+            self.episode_id = prev.get("episode_id") or now.strftime("%Y%m%d%H%M%S")
+            self.episode_started_at = now
+            self.hush_count = int(prev.get("hush_count") or 0)
+            self.ack_by = None
+            self.episode_notified = prev.get("episode_notified")
+            self.light_snapshot = prev.get("light_snapshot") or {}
+            self.light_snapshot_episode = prev.get("light_snapshot_episode")
+            self.hush_limit_notified = False
+
         self.phase = "alarm"
         self.since = now
         self.off_since = None
-        await self._report_feed("alarm")
-        await self._push_alarm(now)
-        await self._assert_lights(now)
-        self.last_push_at = now
-        self.last_lights_assert_at = now
-        if new_episode:
+        is_new_cycle = fresh_start or reused_recent
+        if is_new_cycle:
             # The t+2s delayed announce is the first one; stop the tick cadence pre-empting it.
             self.last_announce_at = now
         self._save_state()
-        if new_episode:
+
+        # Lights/media/announcement must not wait on the push (fix 5) - a hanging notifier
+        # would otherwise hold _eval_lock and block a concurrent hush/clear press.
+        await self._report_feed("alarm")
+        await self._assert_lights(now)
+        self.last_lights_assert_at = now
+
+        if is_new_cycle:
+            self._save_state()
             await self.run_in(self._delayed_pause_media, 1)
             await self.run_in(self._delayed_announce, 2, episode_id=self.episode_id)
         else:
-            # Escalation from hushed/cooldown within the same episode: re-announce now
-            # instead of waiting out the ordinary 45s cadence.
+            # Escalation from hushed/cooldown/offline within the same episode: re-announce
+            # now instead of waiting out the ordinary 45s cadence.
             await self._announce_alarm(now)
             self.last_announce_at = now
             self._save_state()
+
+        self.create_task(self._push_alarm(now))
+        self.last_push_at = now
+        self._save_state()
 
     def _delayed_pause_media(self, kwargs):
         self.create_task(self._pause_media())
@@ -522,20 +634,31 @@ class FireSafety(hass.Hass):
         self.create_task(self._announce_after_delay(kwargs.get("episode_id")))
 
     async def _announce_after_delay(self, episode_id):
-        if self.phase != "alarm" or self.episode_id != episode_id:
-            return  # superseded (hushed/cleared) before the t+2s announce fired
-        now = self._now()
-        await self._announce_alarm(now)
-        self.last_announce_at = now
-        self._save_state()
+        async with self._eval_lock:
+            if self.phase != "alarm" or self.episode_id != episode_id:
+                return  # superseded (hushed/cleared) before the t+2s announce fired
+            now = self._now()
+            await self._announce_alarm(now)
+            self.last_announce_at = now
+            self._save_state()
 
     async def _hush(self, now, by_text):
+        async with self._eval_lock:
+            await self._hush_locked(now, by_text)
+
+    async def _hush_locked(self, now, by_text):
+        """Core hush logic, lock-free - called both by _hush() (acquires _eval_lock) and
+        directly from _evaluate_locked (the physical-hush-button path), which already
+        holds the lock; asyncio.Lock isn't reentrant so that path must not re-acquire it."""
         if self.phase != "alarm":
             self.log(f"Hush ignored - phase is {self.phase}, not alarm", level="DEBUG")
             return
         if self.hush_count >= self.max_hushes_per_episode:
             self.log(f"Hush limit ({self.max_hushes_per_episode}) reached for episode {self.episode_id}", level="WARNING")
-            await self._push_hush_limit(now)
+            if not self.hush_limit_notified:
+                await self._push_hush_limit(now)
+                self.hush_limit_notified = True
+                self._save_state()
             return
         self.hush_count += 1
         self.hushed_by = by_text
@@ -543,18 +666,19 @@ class FireSafety(hass.Hass):
         self.phase = "hushed"
         self.since = now
         self.off_since = None
+        self._save_state()
         await self._write_alarm_stop(now)
         await self._report_feed("hushed", by=by_text)
         await self._push_hushed(now)
         await self._announce_hushed(now)
-        self._save_state()
 
     async def _ack(self, person):
-        if self.phase not in ("alarm", "hushed"):
-            return
-        self.ack_by = person
-        self._save_state()
-        self.log(f"{person} acknowledged the fire alarm", level="INFO")
+        async with self._eval_lock:
+            if self.phase not in ("alarm", "hushed"):
+                return
+            self.ack_by = person
+            self._save_state()
+            self.log(f"{person} acknowledged the fire alarm", level="INFO")
 
     async def _enter_cooldown(self, now, by=None):
         self.phase = "cooldown"
@@ -569,6 +693,16 @@ class FireSafety(hass.Hass):
         duration_min = None
         if was_active and self.episode_started_at:
             duration_min = max(0, int((now - self.episode_started_at).total_seconds() // 60))
+        if was_active:
+            # Stashed for episode reuse (fix 4) before the fields below are wiped.
+            self.last_clear_at = now
+            self.last_episode = {
+                "episode_id": self.episode_id,
+                "hush_count": self.hush_count,
+                "episode_notified": self.episode_notified,
+                "light_snapshot": self.light_snapshot,
+                "light_snapshot_episode": self.light_snapshot_episode,
+            }
         self.phase = "clear"
         self.since = now
         self.episode_id = None
@@ -578,9 +712,14 @@ class FireSafety(hass.Hass):
         self.hushed_until = None
         self.ack_by = None
         self.off_since = None
+        self.hush_limit_notified = False
+        self.stale_alarm_notified = False
+        self._save_state()
         await self._report_feed("clear")
         if was_active:
             await self._clear_lights()
+            # episode_notified reset happens AFTER the push (below) so a departed
+            # housemate recorded on this episode still receives the all-clear.
             await self._push_all_clear(now, duration_min or 0)
             await self._announce_all_clear(now)
         self.episode_notified = None
@@ -593,14 +732,24 @@ class FireSafety(hass.Hass):
         await self._report_feed("offline")
 
     async def _on_clear_pressed(self, by_text=None):
-        now = self._now()
-        smoke = await self._read_state(self.smoke_entity)
-        if smoke != "off":
+        async with self._eval_lock:
+            now = self._now()
+            smoke = await self._read_state(self.smoke_entity)
+            if smoke == "off":
+                if self.phase == "clear":
+                    return
+                await self._enter_cooldown(now, by=by_text)
+                return
+            stale_mid_episode = (
+                smoke is None
+                and self.phase in ("alarm", "hushed", "offline")
+                and self.unavailable_since is not None
+                and (now - self.unavailable_since) >= timedelta(seconds=self.stale_grace_s)
+            )
+            if stale_mid_episode:
+                await self._enter_clear(now)
+                return
             self.log("Clear button pressed but smoke is still on - ignoring", level="WARNING")
-            return
-        if self.phase == "clear":
-            return
-        await self._enter_cooldown(now, by=by_text)
 
     # ---------- self-test ----------
 
@@ -610,25 +759,61 @@ class FireSafety(hass.Hass):
             self._save_state()
 
     async def _run_self_test(self, now):
-        await self._call(
-            f"switch/turn_on {self.self_test_switch_entity}",
-            "switch/turn_on", entity_id=self.self_test_switch_entity,
-        )
-        self.self_test_until = now + timedelta(minutes=self.self_test_window_min)
-        self.last_self_test_at = now
-        self._save_state()
-        await self._push_health(now, "Kitchen smoke alarm self-test ran.")
+        async with self._eval_lock:
+            await self._call(
+                f"switch/turn_on {self.self_test_switch_entity}",
+                "switch/turn_on", entity_id=self.self_test_switch_entity,
+            )
+            # last_self_test_at is stamped only from the observed siren edge into self_test
+            # (see _evaluate_locked), not from triggering the switch here - the switch call
+            # can fail or the device can ignore it, so only the confirmed edge counts.
+            self.self_test_until = now + timedelta(minutes=self.self_test_window_min)
+            self._save_state()
+            await self._push_health(now, "Kitchen smoke alarm self-test ran.")
+
+    async def _anyone_home(self):
+        for entity in self.monthly_test_person_entities:
+            if await self._read_state(entity) == "home":
+                return True
+        return False
+
+    async def _maybe_run_monthly_test(self, now):
+        """Automatic monthly self-test: only while no one is home (a self-test sounds the
+        siren). Retries daily at monthly_test_time through day monthly_test_max_retry_days;
+        if nobody's ever away by then, give up for the month with a Mikkel-only push."""
+        if now.day > self.monthly_test_max_retry_days:
+            return
+        month_key = now.strftime("%Y-%m")
+        if self.monthly_test_month_key != month_key:
+            self.monthly_test_month_key = month_key
+            self.monthly_test_resolved = False
+            self._save_state()
+        if self.monthly_test_resolved:
+            return
+        if not await self._anyone_home():
+            await self._run_self_test(now)
+            self.monthly_test_resolved = True
+            self._save_state()
+            return
+        if now.day >= self.monthly_test_max_retry_days:
+            self.monthly_test_resolved = True
+            self._save_state()
+            await self._push_health(
+                now, "Monthly smoke alarm test skipped — someone was home; run it from the dashboard"
+            )
 
     # ---------- cooking mode ----------
 
     async def _start_cooking(self):
-        now = self._now()
-        self.cooking_until = now + timedelta(minutes=self.cooking_mode_minutes)
-        self._save_state()
+        async with self._eval_lock:
+            now = self._now()
+            self.cooking_until = now + timedelta(minutes=self.cooking_mode_minutes)
+            self._save_state()
 
     async def _stop_cooking(self):
-        self.cooking_until = None
-        self._save_state()
+        async with self._eval_lock:
+            self.cooking_until = None
+            self._save_state()
 
     async def _maybe_expire_cooking_mode(self, now):
         if not self.cooking_until or now < self.cooking_until:
@@ -664,9 +849,10 @@ class FireSafety(hass.Hass):
             last = self.last_fault_push_at.get(key)
             if last and (now - last) < throttle:
                 continue
-            await self._push_health(now, message)
-            self.last_fault_push_at[key] = now
-            changed = True
+            sent = await self._push_health(now, message)
+            if sent:
+                self.last_fault_push_at[key] = now
+                changed = True
         if changed:
             self._save_state()
 
@@ -714,16 +900,20 @@ class FireSafety(hass.Hass):
         return self.sonos_notifier
 
     async def _notify(self, dry_run_desc, **kwargs):
+        """Returns True on success (or a simulated dry-run success) so callers that must
+        only stamp bookkeeping on a real send (e.g. the fault throttle) can check it."""
         if self.dry_run:
             self.log(f"[dry-run] would push: {dry_run_desc}")
-            return
+            return True
         notifier = self._get_notifier()
         if notifier is None:
-            return
+            return False
         try:
             await notifier.notify(**kwargs)
+            return True
         except Exception as e:
             self.log(f"push failed ({dry_run_desc}): {e}", level="WARNING")
+            return False
 
     def _announce(self, dry_run_desc, **kwargs):
         if self.dry_run:
@@ -889,7 +1079,7 @@ class FireSafety(hass.Hass):
         )
 
     async def _push_health(self, now, message):
-        await self._notify(
+        return await self._notify(
             f"fire_health: {message}",
             title="Fire safety",
             message=message,
@@ -1002,39 +1192,48 @@ class FireSafety(hass.Hass):
         battery_low = battery is not None and battery < self.battery_low_pct
         test_overdue = self.last_self_test_at is None or (now - self.last_self_test_at) > timedelta(days=self.test_overdue_days)
         headline, detail = self._headline_detail()
+        attributes = {
+            "friendly_name": "Fire safety",
+            "icon": PHASE_ICONS.get(self.phase, "mdi:smoke-detector-variant"),
+            "since": self.since.isoformat() if self.since else None,
+            "episode_id": self.episode_id,
+            "hushed_until": self.hushed_until.isoformat() if self.hushed_until else None,
+            "hushed_by": self.hushed_by,
+            "hush_count": self.hush_count,
+            "ack_by": self.ack_by,
+            "last_smoke": self.last_smoke,
+            "battery": battery,
+            "battery_low": battery_low,
+            "last_test": self.last_self_test_at.isoformat() if self.last_self_test_at else None,
+            "test_overdue": test_overdue,
+            "device_available": smoke is not None,
+            "cooking_until": self.cooking_until.isoformat() if self.cooking_until else None,
+            "iaq": iaq,
+            "iaq_band": _band(iaq, IAQ_BREAKPOINTS),
+            "eco2": eco2,
+            "eco2_band": _band(eco2, ECO2_BREAKPOINTS),
+            "headline": headline,
+            "detail": detail,
+            "reason": self._reason(smoke, siren),
+            "source_entities": self._source_entities,
+            "computed_at": now.isoformat(timespec="seconds"),
+            "dry_run": self.dry_run,
+        }
+        # Recorder-spam guard (fix 11): only write when something besides computed_at
+        # actually changed, plus a 5-minute heartbeat (and always on the first call after
+        # init, since _last_published_state starts None) so the entity still looks alive.
+        comparable = {k: v for k, v in attributes.items() if k != "computed_at"}
+        unchanged = self._last_published_state == self.phase and self._last_published_attrs == comparable
+        heartbeat_due = (
+            self._last_published_at is None or (now - self._last_published_at) >= timedelta(minutes=5)
+        )
+        if unchanged and not heartbeat_due:
+            return
         try:
-            await self.set_state(
-                self.publish_entity,
-                state=self.phase,
-                replace=True,
-                attributes={
-                    "friendly_name": "Fire safety",
-                    "icon": PHASE_ICONS.get(self.phase, "mdi:smoke-detector-variant"),
-                    "since": self.since.isoformat() if self.since else None,
-                    "episode_id": self.episode_id,
-                    "hushed_until": self.hushed_until.isoformat() if self.hushed_until else None,
-                    "hushed_by": self.hushed_by,
-                    "hush_count": self.hush_count,
-                    "ack_by": self.ack_by,
-                    "last_smoke": self.last_smoke,
-                    "battery": battery,
-                    "battery_low": battery_low,
-                    "last_test": self.last_self_test_at.isoformat() if self.last_self_test_at else None,
-                    "test_overdue": test_overdue,
-                    "device_available": smoke is not None,
-                    "cooking_until": self.cooking_until.isoformat() if self.cooking_until else None,
-                    "iaq": iaq,
-                    "iaq_band": _band(iaq, IAQ_BREAKPOINTS),
-                    "eco2": eco2,
-                    "eco2_band": _band(eco2, ECO2_BREAKPOINTS),
-                    "headline": headline,
-                    "detail": detail,
-                    "reason": self._reason(smoke, siren),
-                    "source_entities": self._source_entities,
-                    "computed_at": now.isoformat(timespec="seconds"),
-                    "dry_run": self.dry_run,
-                },
-            )
+            await self.set_state(self.publish_entity, state=self.phase, replace=True, attributes=attributes)
+            self._last_published_state = self.phase
+            self._last_published_attrs = comparable
+            self._last_published_at = now
         except Exception as e:
             self.log(f"publish failed: {e}", level="WARNING")
 
@@ -1077,6 +1276,20 @@ class FireSafety(hass.Hass):
         self.light_snapshot = data.get("light_snapshot") or {}
         self.light_snapshot_episode = data.get("light_snapshot_episode")
         self.episode_notified = data.get("episode_notified") or None
+        self.last_clear_at = self._parse_dt(data.get("last_clear_at"))
+        self.last_episode = data.get("last_episode") or None
+        self.hush_limit_notified = bool(data.get("hush_limit_notified") or False)
+        self.monthly_test_month_key = data.get("monthly_test_month_key")
+        self.monthly_test_resolved = bool(data.get("monthly_test_resolved") or False)
+
+        # Transient (never persisted): safe/desirable to reset every process start - see
+        # each fix's rationale (stale-push once, fallback debounce, loop guard, heartbeat).
+        self.stale_alarm_notified = False
+        self.smoke_fallback_since = None
+        self.pre_alarm_stuck = False
+        self._last_published_state = None
+        self._last_published_attrs = None
+        self._last_published_at = None
 
     def _save_state(self):
         data = {
@@ -1102,6 +1315,11 @@ class FireSafety(hass.Hass):
             "light_snapshot": self.light_snapshot,
             "light_snapshot_episode": self.light_snapshot_episode,
             "episode_notified": self.episode_notified,
+            "last_clear_at": self.last_clear_at.isoformat() if self.last_clear_at else None,
+            "last_episode": self.last_episode,
+            "hush_limit_notified": self.hush_limit_notified,
+            "monthly_test_month_key": self.monthly_test_month_key,
+            "monthly_test_resolved": self.monthly_test_resolved,
         }
         try:
             tmp = self.state_file + ".tmp"

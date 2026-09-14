@@ -70,6 +70,16 @@ FireSafety:
   repush_interval_acked_s: 180
   relights_interval_s: 60
   tick_interval_s: 5
+  # Device unavailable/unknown mid-episode (alarm/hushed) longer than this -> one
+  # non-critical push+announce, then Clear can end the episode without smoke=="off".
+  # Kept well above a normal HA-restart blip (~65s, both entities briefly unknown).
+  stale_grace_s: 120
+  # smoke_fallback (smoke on, siren not corroborating pre_alarm/silenced/self_test/fire)
+  # must hold continuously this long before it alone raises an alarm; siren=="fire" bypasses.
+  smoke_fallback_s: 30
+  # A new alarm within this many minutes of the previous clear reuses that episode's
+  # id/hush-count/audience/light-snapshot instead of starting fresh.
+  episode_reuse_min: 30
 
   # --- Health thresholds ---
   battery_low_pct: 20
@@ -82,7 +92,9 @@ FireSafety:
   push_tag: fire_alarm
   push_category: fire_alarm
   health_category: fire_health   # category_audience in mobile_notifier.yaml already restricts this to mikkel
-  health_notify_target: "home"
+  # A specific person, not "home" - target="home" resolves to whoever's physically home
+  # and would silently drop the push if Mikkel is away (fixed 2026-09-14).
+  health_notify_target: ["mikkel"]
 
   # Episode push audience (owner rule, 2026-09-14): Mikkel always, each housemate only
   # while home. test_audience above stays the override - non-null wins over this entirely.
@@ -92,6 +104,14 @@ FireSafety:
     claudia: person.claudia
   # who else gets the push when none of alarm_notify_if_home is home: "always_only" or "everyone"
   alarm_nobody_home: everyone
+
+  # Monthly self-test (11:00 on the 1st, retried daily up to 7 days) only runs while none
+  # of these are home; gives up for the month if someone's always home within the window.
+  monthly_test_person_entities:
+    - person.mikkel
+    - person.kristine
+    - person.claudia
+  monthly_test_max_retry_days: 7
 
   # --- Sonos ---
   sonos_kitchen_entity: media_player.kitchen
