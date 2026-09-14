@@ -31,6 +31,6 @@ SonosNotifier:
   quiet_hours_start_entity: "input_datetime.quiet_hours_start"  # e.g., when notifications should STOP (22:00)
 
   # Fail-safe defaults used only when the helpers above are unavailable/unparseable
-  # (e.g. ~1 min after every HA restart). Values match the live helper states read on 2026-09-14.
+  # (e.g. briefly after every HA restart).
   default_quiet_hours_start: "22:00"
   default_quiet_hours_end: "07:00" 

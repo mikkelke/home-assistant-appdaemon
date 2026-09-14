@@ -249,8 +249,7 @@ class MobileNotifier(hass.Hass):
 
         Returns:
             The number of services actually delivered to (0 when none, e.g. no service
-            resolved for the target or every send raised). Existing callers ignore the
-            return value, so this is backward compatible.
+            resolved for the target or every send raised).
         """
         success_count = 0
         try:

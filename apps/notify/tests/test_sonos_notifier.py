@@ -198,7 +198,7 @@ class QuietHoursHelperFailSafe(unittest.TestCase):
 
 class SleepModeEntityFailSafe(unittest.TestCase):
     """An unavailable sleep-mode entity is only assumed 'sleeping' while inside quiet
-    hours; outside quiet hours it must keep prior (not-sleeping) behaviour."""
+    hours; outside quiet hours it is treated as not sleeping."""
 
     def test_unavailable_sleep_entity_at_night_treated_as_sleeping(self):
         app = _new_app(

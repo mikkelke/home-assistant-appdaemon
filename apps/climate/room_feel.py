@@ -2,7 +2,7 @@
 RoomFeel - publishes sensor.<room>_feel per room: the household's single "how does this
 room feel" reality, fused from the sensors that actually measure air where people sit,
 with slab (floor) sensors, the kitchen ceiling unit and window-side units treated for what
-they physically are (see sensor-placement memory, 2026-09-11).
+they physically are.
 
 Physical facts this fusion respects:
   - Salus wall thermostats (climate.<room>_thermostat, ~1.5 m) and FP300 mmWave presence

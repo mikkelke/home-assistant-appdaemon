@@ -3,17 +3,16 @@
 # plus sensor.bedroom_supply_air_temperature and sensor.technical_room_feel. See
 # room_feel.py's module docstring for the sensor-placement facts this fusion respects.
 #
-# Entity ids marked UNVERIFIED below were not found by grepping this repo or the
-# hakit-dashboard entities.ts (box unreachable while writing this) - stated directly by
-# Mikkel on 2026-09-11 (sensor-placement memory) or inferred from an established per-room
-# naming pattern. Left yaml-configurable on purpose; fix here if any turn out wrong.
+# Entity ids marked UNVERIFIED below are not confirmed against this repo or the
+# hakit-dashboard entities.ts; they follow an established per-room naming pattern instead.
+# Left yaml-configurable on purpose - fix here if any turn out wrong.
 
 RoomFeel:
   module: room_feel
   class: RoomFeel
 
-  # Air sensors report on change only: FP300 ~every 50 min, Salus ~every 90 min in a
-  # steady room - 45 min flagged healthy rooms as "Reading is old" (2026-09-11).
+  # Air sensors report on state change only, not on a fixed interval, so a short
+  # staleness window flags healthy rooms as stale.
   stale_minutes: 180
 
   comfort_bands:
@@ -41,8 +40,8 @@ RoomFeel:
   airing_dew_margin_c: 1.0
   airing_rh_min: 60
 
-  # sensor.ventilation_thermometer_temperature: UNVERIFIED (no grep hit anywhere) - stated
-  # by Mikkel 2026-09-11 as the Zigbee sensor lying inside the bedroom supply-air duct.
+  # sensor.ventilation_thermometer_temperature: UNVERIFIED - the Zigbee sensor inside the
+  # bedroom supply-air duct; not confirmed against this repo.
   supply_air:
     source_entity: sensor.ventilation_thermometer_temperature
     publish_entity: sensor.bedroom_supply_air_temperature
@@ -96,18 +95,14 @@ RoomFeel:
           label: ceiling
           offset_c: -1.5
           offset_rh: 6.5
-      # No floor thermometer in the kitchen (task's floor-sensor room list excludes it).
+      # No floor thermometer in the kitchen.
       window_contacts: [binary_sensor.kitchen_window_contact]
       air_quality:
         aqi_entity: sensor.kitchen_smoke_alarm_aqi
         eco2_entity: sensor.kitchen_smoke_alarm_eco2
-      # Calibrated 2026-09-14 from 60 days of recorder data (2026-07-16..2026-09-14):
-      # excess = kitchen FP300 - median(living-room FP300, family Salus). Direct sun hits
-      # the window frame from mid-morning through mid-afternoon, not just early morning as
-      # first guessed - median excess crosses +0.5 C around 175-200 W/m2 and stays >0.5 C
-      # from 08:30 to 14:45 across the full span (narrows to ~09:15-14:15 in the most
-      # recent 30 days as the sun angle drops into autumn - if a housemate reports a false
-      # "sun_hit" miss in October, narrow this window rather than widen it).
+      # Kitchen's FP300 sits window-adjacent; direct sun reaches the window frame from
+      # mid-morning through mid-afternoon, not just early morning, so the exclusion window
+      # is wide enough to cover that whole span.
       sun_hit:
         radiation_entity: sensor.gw2000a_solar_radiation
         threshold_w_m2: 175
@@ -127,8 +122,6 @@ RoomFeel:
           label: salus_family
       floor_entity: sensor.dining_room_floor_thermometer_temperature
       floor_rh_entity: sensor.dining_room_floor_thermometer_humidity
-      # binary_sensor.dining_room_window_1_contact is currently unavailable in HA (dead
-      # contact) - excluded from the window_open OR while it stays unavailable.
       window_contacts:
         - binary_sensor.dining_room_window_1_contact
         - binary_sensor.dining_room_window_2_contact
@@ -136,11 +129,8 @@ RoomFeel:
       air_quality:
         aqi_entity: sensor.kitchen_smoke_alarm_aqi
         eco2_entity: sensor.kitchen_smoke_alarm_eco2
-      # Calibrated 2026-09-14 from 60 days of recorder data (2026-07-16..2026-09-14) - see
-      # kitchen's note for method. Dining's FP300 leads kitchen's by ~45 min (confirms the
-      # "dining leads by ~1h" placement note); median excess crosses +0.5 C around the same
-      # 175-200 W/m2 and stays >0.5 C from 07:45 to 14:45, narrowing toward 09:15-14:00 in
-      # the most recent 30 days.
+      # Dining room's FP300 is also window-adjacent, and leads the kitchen unit's sun
+      # exposure earlier in the morning.
       sun_hit:
         radiation_entity: sensor.gw2000a_solar_radiation
         threshold_w_m2: 175
@@ -178,7 +168,7 @@ RoomFeel:
 
     kristines_room:
       air_sources:
-        # No FP300 in Kristine's room (task spec) - Salus is the sole/primary source.
+        # No FP300 in Kristine's room - Salus is the sole/primary source.
         - entity: climate.kristines_room_thermostat
           attribute: current_temperature
           # sensor.kristines_room_humidity: UNVERIFIED (pattern-inferred from
@@ -217,10 +207,9 @@ RoomFeel:
       window_contacts: []
       mould_risk: true
 
-    # sensor.ecowitt_temperature_indoor / sensor.ecowitt_humidity_humidityin: UNVERIFIED
-    # (no grep hit anywhere) - stated by Mikkel 2026-09-11 as the Ecowitt gateway's own
-    # indoor channel (the gateway lives in this technical room). Publishes
-    # sensor.technical_room_feel via the standard sensor.<room>_feel naming.
+    # sensor.ecowitt_temperature_indoor / sensor.ecowitt_humidity_humidityin: UNVERIFIED -
+    # the Ecowitt gateway's own indoor channel (the gateway lives in this technical room).
+    # Publishes sensor.technical_room_feel via the standard sensor.<room>_feel naming.
     technical_room:
       air_sources:
         - entity: sensor.ecowitt_temperature_indoor

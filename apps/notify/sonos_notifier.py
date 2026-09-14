@@ -106,7 +106,7 @@ class SonosNotifier(hass.Hass):
     @staticmethod
     def _resolve_sleeping(state, in_quiet_hours_now):
         """An unavailable/unknown sleep-mode entity is assumed sleeping only while inside
-        quiet hours (fail-safe); outside quiet hours this matches prior behaviour."""
+        quiet hours (fail-safe); otherwise sleeping requires state == "on"."""
         if state in (None, "unknown", "unavailable"):
             return in_quiet_hours_now
         return state == "on"

@@ -99,9 +99,9 @@ def _make_notifier(**overrides):
 
 
 class TestNotifyReturnValue(unittest.IsolatedAsyncioTestCase):
-    """Fix 5: notify() must return the number of services actually delivered to (an int,
-    0 when none), not None - callers (e.g. FireSafety's fault-push throttle) need to tell
-    "silently reached nobody" apart from "actually sent"."""
+    """notify() returns the number of services actually delivered to (an int, 0 when none),
+    not None - callers (e.g. FireSafety's fault-push throttle) need to tell "silently
+    reached nobody" apart from "actually sent"."""
 
     async def test_returns_zero_when_no_services_resolve(self):
         app = _make_notifier(device_mapping={})
