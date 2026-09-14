@@ -29,6 +29,12 @@ class SonosNotifier(hass.Hass):
         self.quiet_hours_end_entity = self.args.get("quiet_hours_end_entity")
         self.quiet_hours_start_entity = self.args.get("quiet_hours_start_entity")
 
+        # Fallback defaults for when the helpers above are unavailable/unparseable, so an
+        # outage fails SAFE (quiet) instead of open (loud, house-wide) - see notify().
+        self._default_quiet_hours_start = self._parse_time_str(self.args.get("default_quiet_hours_start")) or time(22, 0)
+        self._default_quiet_hours_end = self._parse_time_str(self.args.get("default_quiet_hours_end")) or time(7, 0)
+        self._quiet_hours_fallback_active = False
+
         if self.quiet_hours_end_entity and self.quiet_hours_start_entity:
             self.time_constraints_enabled = True
             self.log(f"Time constraints enabled. Using {self.quiet_hours_end_entity} and {self.quiet_hours_start_entity}.", level="INFO")
@@ -65,24 +71,45 @@ class SonosNotifier(hass.Hass):
         )
         self.log(f"Default Chime Path: {self.default_chime_path}", level="DEBUG")
 
+    @staticmethod
+    def _parse_time_str(state_str):
+        """Parse an HH:MM or HH:MM:SS string into a time object, or None if invalid."""
+        if not state_str:
+            return None
+        try:
+            if len(state_str) == 8: # HH:MM:SS
+                return datetime.strptime(state_str, "%H:%M:%S").time()
+            elif len(state_str) == 5: # HH:MM
+                return datetime.strptime(state_str, "%H:%M").time()
+        except ValueError:
+            return None
+        return None
+
     def _get_time_from_entity(self, entity_id):
         """Safely gets and parses time from an input_datetime entity state."""
         state_str = self.get_state(entity_id)
         if state_str is None or state_str in ["unknown", "unavailable"]:
             self.log(f"ERROR: Entity {entity_id} for time constraint is unavailable or state is unknown ('{state_str}').", level="ERROR")
             return None
-        try:
-            # input_datetime state is usually HH:MM:SS or HH:MM
-            if len(state_str) == 8: # HH:MM:SS
-                return datetime.strptime(state_str, "%H:%M:%S").time()
-            elif len(state_str) == 5: # HH:MM
-                return datetime.strptime(state_str, "%H:%M").time()
-            else:
-                self.log(f"ERROR: Invalid time format '{state_str}' from entity {entity_id}. Expected HH:MM:SS or HH:MM.", level="ERROR")
-                return None
-        except ValueError as e:
-            self.log(f"ERROR: Could not parse time from entity {entity_id} (state: '{state_str}'). Error: {e}", level="ERROR")
-            return None
+        parsed = self._parse_time_str(state_str)
+        if parsed is None:
+            self.log(f"ERROR: Invalid/unparseable time format '{state_str}' from entity {entity_id}. Expected HH:MM:SS or HH:MM.", level="ERROR")
+        return parsed
+
+    @staticmethod
+    def _is_quiet_hours_now(current_time_obj, quiet_hours_start, quiet_hours_end):
+        """True when current_time_obj falls inside the [start, end) quiet-hours window."""
+        if quiet_hours_end < quiet_hours_start:
+            return not (current_time_obj >= quiet_hours_end and current_time_obj < quiet_hours_start)
+        return current_time_obj >= quiet_hours_start or current_time_obj < quiet_hours_end
+
+    @staticmethod
+    def _resolve_sleeping(state, in_quiet_hours_now):
+        """An unavailable/unknown sleep-mode entity is assumed sleeping only while inside
+        quiet hours (fail-safe); outside quiet hours this matches prior behaviour."""
+        if state in (None, "unknown", "unavailable"):
+            return in_quiet_hours_now
+        return state == "on"
 
     def _normalize_sonos_entity(self, entity_id):
         """Normalize Sonos entity IDs from legacy cloud suffix to direct entity.
@@ -138,34 +165,36 @@ class SonosNotifier(hass.Hass):
         #     pass # Bypass the actual time check logic below
         # elif self.time_constraints_enabled:
         # END TEMPORARY BYPASS
+        in_quiet_hours_now = False
+        if self.time_constraints_enabled:
+            raw_quiet_hours_end = self._get_time_from_entity(self.quiet_hours_end_entity)
+            raw_quiet_hours_start = self._get_time_from_entity(self.quiet_hours_start_entity)
+            helpers_ok = raw_quiet_hours_end is not None and raw_quiet_hours_start is not None
+
+            if not helpers_ok and not self._quiet_hours_fallback_active:
+                self._quiet_hours_fallback_active = True
+                self.log(
+                    "Quiet-hours helper(s) unavailable/unparseable. Falling back to configured defaults "
+                    f"({self._default_quiet_hours_start.strftime('%H:%M')}-{self._default_quiet_hours_end.strftime('%H:%M')}) "
+                    "until helpers recover.",
+                    level="WARNING",
+                )
+            elif helpers_ok and self._quiet_hours_fallback_active:
+                self._quiet_hours_fallback_active = False
+                self.log("Quiet-hours helpers are readable again. Resuming normal quiet-hours checks.", level="INFO")
+
+            # Fall back per-entity: an outage on one helper doesn't have to blind the other.
+            quiet_hours_end = raw_quiet_hours_end if raw_quiet_hours_end is not None else self._default_quiet_hours_end
+            quiet_hours_start = raw_quiet_hours_start if raw_quiet_hours_start is not None else self._default_quiet_hours_start
+            current_time_obj = self.datetime().time()
+            in_quiet_hours_now = self._is_quiet_hours_now(current_time_obj, quiet_hours_start, quiet_hours_end)
+
         if override_quiet_hours:
             self.log(f"override_quiet_hours=True: bypassing quiet-hours check for '{message}'.", level="WARNING")
-        elif self.time_constraints_enabled: # Restored this line
-            quiet_hours_end = self._get_time_from_entity(self.quiet_hours_end_entity)
-            quiet_hours_start = self._get_time_from_entity(self.quiet_hours_start_entity)
-
-            if quiet_hours_end is None or quiet_hours_start is None:
-                self.log("ERROR: Could not determine quiet hours from Home Assistant entities. Skipping time check for this notification to be safe. Please check entity states.", level="ERROR")
-            else:
-                current_time_obj = self.datetime().time()
-                # Assuming quiet_hours_start is like '22:00' and quiet_hours_end is like '07:30'
-                # Notification is allowed if current_time >= quiet_hours_end AND current_time < quiet_hours_start (for a non-overnight period)
-                # Or if quiet_hours_start < quiet_hours_end (overnight period, e.g. 22:00 to 07:30)
-                #   then allowed if current_time >= quiet_hours_end OR current_time < quiet_hours_start
-                
-                # Normal day: quiet_hours_end (07:30) < quiet_hours_start (22:00)
-                # Allowed if current_time is BETWEEN end and start
-                if quiet_hours_end < quiet_hours_start: 
-                    if not (current_time_obj >= quiet_hours_end and current_time_obj < quiet_hours_start):
-                        self.log(f"Notification for '{message}' skipped. Current time {current_time_obj.strftime('%H:%M:%S')} is within quiet hours ({quiet_hours_end.strftime('%H:%M:%S')} - {quiet_hours_start.strftime('%H:%M:%S')}).", level="INFO")
-                        return
-                # Overnight quiet hours: quiet_hours_end (e.g. 07:30) > quiet_hours_start (e.g. 07:00, meaning quiet hours are 22:00 to 07:00 from previous example)
-                # This logic means quiet hours are from quiet_hours_start (e.g. 22:00 previous day) to quiet_hours_end (e.g. 07:30 current day)
-                # So, notification is NOT allowed if current_time >= quiet_hours_start OR current_time < quiet_hours_end
-                else: # quiet_hours_end >= quiet_hours_start (implies overnight quiet period)
-                    if (current_time_obj >= quiet_hours_start or current_time_obj < quiet_hours_end):
-                        self.log(f"Notification for '{message}' skipped. Current time {current_time_obj.strftime('%H:%M:%S')} is within quiet hours (overnight: from {quiet_hours_start.strftime('%H:%M:%S')} to {quiet_hours_end.strftime('%H:%M:%S')}).", level="INFO")
-                        return
+        elif self.time_constraints_enabled:
+            if in_quiet_hours_now:
+                self.log(f"Notification for '{message}' skipped. Current time {current_time_obj.strftime('%H:%M:%S')} is within quiet hours ({quiet_hours_start.strftime('%H:%M:%S')} - {quiet_hours_end.strftime('%H:%M:%S')}).", level="INFO")
+                return
         else:
             self.log("Time constraints are disabled (YAML config missing). Proceeding with notification.", level="DEBUG")
 
@@ -177,8 +206,9 @@ class SonosNotifier(hass.Hass):
             kristine_sleep_state = self.get_state(self.kristine_sleep_mode_entity) if self.kristine_sleep_mode_entity else "off"
             mikkel_sleep_state = self.get_state(self.mikkel_sleep_mode_entity) if self.mikkel_sleep_mode_entity else "off"
 
-            kristine_sleeping = kristine_sleep_state == "on"
-            mikkel_sleeping = mikkel_sleep_state == "on"
+            # Unavailable/unknown -> assume sleeping only inside quiet hours (fail-safe).
+            kristine_sleeping = self._resolve_sleeping(kristine_sleep_state, in_quiet_hours_now)
+            mikkel_sleeping = self._resolve_sleeping(mikkel_sleep_state, in_quiet_hours_now)
             everyone_sleeping = kristine_sleeping and mikkel_sleeping
 
             if everyone_sleeping:

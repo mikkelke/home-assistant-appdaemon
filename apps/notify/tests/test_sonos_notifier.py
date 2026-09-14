@@ -6,7 +6,7 @@
 import sys
 import types
 import unittest
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -47,6 +47,9 @@ def _new_app(state=None, now=None, time_constraints_enabled=True):
     app.time_constraints_enabled = time_constraints_enabled
     app.quiet_hours_end_entity = "input_datetime.quiet_hours_end"
     app.quiet_hours_start_entity = "input_datetime.quiet_hours_start"
+    app._default_quiet_hours_start = time(22, 0)
+    app._default_quiet_hours_end = time(7, 0)
+    app._quiet_hours_fallback_active = False
 
     states = dict(QUIET_HOURS_STATE)
     states.update(state or {})
@@ -133,6 +136,89 @@ class LegacyCallUnchanged(unittest.TestCase):
                 "tts_platform": "piper",
             },
         )
+
+
+class QuietHoursHelperFailSafe(unittest.TestCase):
+    """When the quiet-hours helpers are unavailable/unparseable, fall back to configured
+    defaults (22:00-07:00) instead of failing open (playing house-wide at night)."""
+
+    UNAVAILABLE = {
+        "input_datetime.quiet_hours_start": "unavailable",
+        "input_datetime.quiet_hours_end": "unavailable",
+    }
+
+    def test_helpers_unavailable_at_2330_suppressed(self):
+        app = _new_app(state=self.UNAVAILABLE, now=datetime(2026, 9, 11, 23, 30, 0))
+        app.notify("Doorbell", target_speakers=["media_player.explicit"])
+        self.assertEqual(app.calls, [])
+        self.assertTrue(_logged(app, "skipped"))
+
+    def test_helpers_unavailable_at_1400_plays_normally(self):
+        app = _new_app(state=self.UNAVAILABLE, now=datetime(2026, 9, 11, 14, 0, 0))
+        app.notify("Doorbell", target_speakers=["media_player.explicit"])
+        self.assertEqual(len(app.calls), 1)
+
+    def test_unparseable_helper_value_uses_default(self):
+        app = _new_app(
+            state={"input_datetime.quiet_hours_start": "not-a-time"},
+            now=datetime(2026, 9, 11, 23, 0, 0),
+        )
+        app.notify("Doorbell", target_speakers=["media_player.explicit"])
+        self.assertEqual(app.calls, [])
+        self.assertTrue(_logged(app, "skipped"))
+
+    def test_warning_logged_once_across_two_announcements(self):
+        app = _new_app(state=self.UNAVAILABLE, now=datetime(2026, 9, 11, 23, 30, 0))
+        app.notify("First", target_speakers=["media_player.explicit"])
+        app.notify("Second", target_speakers=["media_player.explicit"])
+        warnings = [1 for a, kw in app.log_calls if "Falling back" in str(a)]
+        self.assertEqual(len(warnings), 1)
+
+    def test_recovery_logs_info_once_and_does_not_repeat(self):
+        app = _new_app(state=self.UNAVAILABLE, now=datetime(2026, 9, 11, 23, 30, 0))
+        app.notify("First", target_speakers=["media_player.explicit"])
+        app.get_state = lambda entity_id: dict(QUIET_HOURS_STATE).get(entity_id, "off")
+        app.notify("Second", target_speakers=["media_player.explicit"])
+        app.notify("Third", target_speakers=["media_player.explicit"])
+        recoveries = [1 for a, kw in app.log_calls if "readable again" in str(a)]
+        self.assertEqual(len(recoveries), 1)
+
+    def test_override_quiet_hours_plays_despite_unavailable_helpers_at_night(self):
+        app = _new_app(state=self.UNAVAILABLE, now=datetime(2026, 9, 11, 23, 30, 0))
+        app.notify("Fire!", target_speakers=["media_player.explicit"], override_quiet_hours=True)
+        self.assertEqual(len(app.calls), 1)
+
+    def test_healthy_helpers_unchanged_no_fallback_logging(self):
+        app = _new_app(now=datetime(2026, 9, 11, 12, 0, 0))
+        app.notify("Hello", target_speakers=["media_player.explicit"])
+        self.assertEqual(len(app.calls), 1)
+        self.assertFalse(_logged(app, "Falling back"))
+        self.assertFalse(_logged(app, "readable again"))
+
+
+class SleepModeEntityFailSafe(unittest.TestCase):
+    """An unavailable sleep-mode entity is only assumed 'sleeping' while inside quiet
+    hours; outside quiet hours it must keep prior (not-sleeping) behaviour."""
+
+    def test_unavailable_sleep_entity_at_night_treated_as_sleeping(self):
+        app = _new_app(
+            state={"input_boolean.kristine_sleep_mode": "unavailable", "input_boolean.mikkel_sleep_mode": "off"},
+            now=datetime(2026, 9, 11, 3, 0, 0),
+        )
+        app.notify("Doorbell", override_quiet_hours=True)
+        self.assertEqual(len(app.calls), 1)
+        _, kwargs = app.calls[0]
+        self.assertEqual(kwargs["entity_id"], [app.tts_group_family_rooms, app.tts_group_ms])
+
+    def test_unavailable_sleep_entity_during_day_unchanged(self):
+        app = _new_app(
+            state={"input_boolean.kristine_sleep_mode": "unavailable", "input_boolean.mikkel_sleep_mode": "off"},
+            now=datetime(2026, 9, 11, 12, 0, 0),
+        )
+        app.notify("Doorbell")
+        self.assertEqual(len(app.calls), 1)
+        _, kwargs = app.calls[0]
+        self.assertEqual(kwargs["entity_id"], [app.tts_group_all])
 
 
 if __name__ == "__main__":
