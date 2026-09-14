@@ -62,6 +62,10 @@ FireSafety:
   # Remote hush sends "stop" then waits this long before checking the siren/smoke actually
   # corroborate it worked (fix 2) - a failed/ignored stop is never reported as a success.
   hush_confirm_s: 20
+  # Total time since the press an unknown/unavailable siren or smoke reading may keep
+  # rescheduling that check (every 5s) before giving up and reporting "couldn't silence" -
+  # unknown must never itself confirm a hush (third review).
+  hush_confirm_max_s: 120
   pre_alarm_timeout_min: 10
   cooldown_confirm_s: 60
   cooldown_clear_min: 5

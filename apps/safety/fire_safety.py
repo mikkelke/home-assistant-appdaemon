@@ -62,6 +62,10 @@ ECO2_BREAKPOINTS = [(800, "fresh"), (1200, "good"), (2000, "stuffy")]
 # before giving up and dropping the snapshot rather than retrying forever.
 LIGHT_RESTORE_MAX_ATTEMPTS = 5
 
+# Third review: while a hush's siren/smoke reading is unknown (not a known negative), retry
+# the confirmation check this often instead of a single now-or-never decision.
+HUSH_UNKNOWN_RETRY_S = 5
+
 
 def _normalize_siren(value):
     if value is None:
@@ -133,6 +137,10 @@ class FireSafety(hass.Hass):
         # smoke actually corroborate it worked (fix 2) - a failed/ignored stop must not be
         # reported to the household as a successful hush.
         self.hush_confirm_s = int(a("hush_confirm_s", 20))
+        # Third review: total time since the press an unknown/unavailable siren or smoke
+        # reading may keep rescheduling the confirmation check before giving up and
+        # reporting "couldn't silence" - unknown must never itself confirm a hush.
+        self.hush_confirm_max_s = int(a("hush_confirm_max_s", 120))
         self.pre_alarm_timeout_min = int(a("pre_alarm_timeout_min", 10))
         self.cooldown_confirm_s = int(a("cooldown_confirm_s", 60))
         self.cooldown_clear_min = int(a("cooldown_clear_min", 15))
@@ -242,7 +250,24 @@ class FireSafety(hass.Hass):
         # docstring), then every tick_interval_s for the time-based transitions/repeats.
         self.run_every(self._tick_cb, "now+2", self.tick_interval_s)
 
+        self._maybe_resume_pending_hush()
+
         self.log(f"FireSafety initialized - phase={self.phase}, dry_run={self.dry_run}", level="INFO")
+
+    def _maybe_resume_pending_hush(self):
+        """A pending remote hush survives an AppDaemon restart (persisted) - if we're still
+        in the same alarm episode, resume its confirmation loop instead of losing it."""
+        pending = self.pending_hush
+        if pending and self.phase == "alarm" and pending.get("episode") == self.episode_id:
+            self.create_task(self._resume_pending_hush())
+
+    async def _resume_pending_hush(self):
+        pending = self.pending_hush
+        if not pending:
+            return
+        await self.run_in(
+            self._delayed_hush_confirm, 2, episode_id=pending.get("episode"), by_text=pending.get("by")
+        )
 
     # ---------- scheduling glue (sync callbacks -> create_task) ----------
 
@@ -274,8 +299,6 @@ class FireSafety(hass.Hass):
         if new == old or new in UNAVAILABLE_STATES:
             return
         if old_state_raw is None or old in UNAVAILABLE_STATES:
-            return
-        if not self._is_recent_press(new):
             return
         user_id = (new_state.get("context") or {}).get("user_id")
         self.create_task(self._handle_button_press(entity, user_id))
@@ -314,22 +337,12 @@ class FireSafety(hass.Hass):
 
     def _on_test_button(self, entity, attribute, old, new, kwargs):
         # Fix 1: same restored-press guard as _on_button_state_changed, adapted to
-        # listen_state's old/new pair instead of a raw state_changed event.
+        # listen_state's old/new pair instead of a raw state_changed event. Third review
+        # (fix 6): no freshness window - a legitimate press delayed past it must still run;
+        # this old/new-unavailable check is the only restart-restore protection needed.
         if new in UNAVAILABLE_STATES or old in UNAVAILABLE_STATES:
             return
-        if not self._is_recent_press(new):
-            return
         self.create_task(self._run_self_test(self._now()))
-
-    def _is_recent_press(self, value):
-        """input_button's state is an ISO timestamp of the last press; a value restored
-        after an HA restart is stale, not a fresh tap - require it within 60s of now."""
-        ts = self._parse_dt(value)
-        if ts is None:
-            return False
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        return abs((self._now() - ts).total_seconds()) <= 60
 
     def _on_cooking_on(self, entity, attribute, old, new, kwargs):
         self.create_task(self._start_cooking())
@@ -414,6 +427,12 @@ class FireSafety(hass.Hass):
                 self.smoke_fallback_since = None
                 self.off_since = None
                 if not siren_fire:
+                    # Third review: an unknown reading must never linger as a stale prior
+                    # value - otherwise a later return to "fire" can look like "still fire"
+                    # (no edge) instead of the fresh evidence it actually is.
+                    if siren is None:
+                        self.last_siren = None
+                    self.last_smoke = None
                     await self._handle_unavailable(now)
                     await self._publish(now, None, siren)
                     return
@@ -576,6 +595,23 @@ class FireSafety(hass.Hass):
         was_silenced = _siren_matches(prev_siren, self.siren_silenced_values)
         return now_silenced and not was_silenced
 
+    def _clear_pending_hush(self):
+        """Fix 4: any phase change invalidates an in-flight remote hush confirmation."""
+        self.pending_hush = None
+
+    def _push_still_valid(self, episode, generation, expected_phase=None):
+        """Fix 3: a detached push (dispatched with a snapshot of episode_id/generation)
+        must re-check right before actually notifying - the episode may have moved on
+        (hushed/re-alarmed/cleared) while it was in flight."""
+        if self.episode_id != episode or self.generation != generation:
+            return False
+        return expected_phase is None or self.phase == expected_phase
+
+    def _all_clear_still_valid(self, generation):
+        """All-clear's episode_id is intentionally None by the time this fires (fix 2) - so
+        validity is generation+phase only, not an episode_id match."""
+        return self.phase == "clear" and self.generation == generation
+
     async def _handle_unavailable(self, now):
         if self.unavailable_since is None:
             self.unavailable_since = now
@@ -601,11 +637,14 @@ class FireSafety(hass.Hass):
         must not hold _eval_lock) so a slow send can't cause a duplicate on the next tick."""
         self.stale_alarm_notified = True
         self._save_state()
-        self.create_task(self._send_stale_notice(now, self.episode_id))
+        self.create_task(self._send_stale_notice(now, self.episode_id, self.generation))
 
-    async def _send_stale_notice(self, now, episode_id):
+    async def _send_stale_notice(self, now, episode_id, generation):
         message = "Kitchen smoke alarm stopped reporting during the alarm — check the kitchen"
-        audience = await self._episode_audience(now)
+        audience = await self._episode_audience(now, include_history=True)
+        if not self._push_still_valid(episode_id, generation):
+            self.log(f"Dropping stale mid-alarm notice for episode {episode_id}", level="DEBUG")
+            return
         await self._notify(
             "stale-during-alarm notice",
             title="Fire alarm",
@@ -645,13 +684,16 @@ class FireSafety(hass.Hass):
     # ---------- phase transitions ----------
 
     async def _enter_pre_alarm(self, now):
+        self._clear_pending_hush()
         self.phase = "pre_alarm"
+        self.generation += 1
         self.since = now
         self._save_state()
         await self._report_feed("pre_alarm")
         await self._chime_pre_alarm(now)
 
     async def _enter_alarm(self, now):
+        self._clear_pending_hush()
         # Continuation (not a new episode) whenever an episode is already open (offline
         # entered from alarm/hushed/cooldown keeps episode_id - fix 7), or a fresh alarm
         # lands within episode_reuse_min of the last clear (fix 4).
@@ -685,6 +727,7 @@ class FireSafety(hass.Hass):
             self.hush_limit_notified = False
 
         self.phase = "alarm"
+        self.generation += 1
         self.since = now
         self.off_since = None
         is_new_cycle = fresh_start or reused_recent
@@ -710,9 +753,9 @@ class FireSafety(hass.Hass):
             self.last_announce_at = now
             self._save_state()
 
-        # Snapshot episode_id synchronously (fix 6) - the push itself runs detached from
-        # _eval_lock, so it must not blindly trust self.episode_id once it later resumes.
-        self.create_task(self._push_alarm(now, self.episode_id, record_audience=True))
+        # Snapshot episode_id/generation synchronously (fix 6) - the push itself runs
+        # detached from _eval_lock, so it must not blindly trust live self.* once it resumes.
+        self.create_task(self._push_alarm(now, self.episode_id, self.generation))
         self.last_push_at = now
         self._save_state()
 
@@ -754,19 +797,28 @@ class FireSafety(hass.Hass):
         if self.hush_count >= self.max_hushes_per_episode:
             self.log(f"Hush limit ({self.max_hushes_per_episode}) reached for episode {self.episode_id}", level="WARNING")
             if not self.hush_limit_notified:
-                await self._push_hush_limit(now)
                 self.hush_limit_notified = True
                 self._save_state()
+                self.create_task(self._push_hush_limit(now, self.episode_id, self.generation))
             return
         if physically_confirmed:
             await self._commit_hush(now, by_text)
+            return
+        # Third review: only one remote hush attempt in flight at a time - a second press
+        # while one is already awaiting confirmation is ignored, not queued.
+        if self.pending_hush is not None:
+            self.log("Hush already pending confirmation - second press ignored", level="DEBUG")
             return
         ok = await self._write_alarm_stop(now)
         if not ok:
             # The service call itself failed - treat as unconfirmed immediately, no need to
             # wait out hush_confirm_s for a call we already know didn't go through.
-            self.create_task(self._push_hush_unconfirmed(now, self.episode_id))
+            self.create_task(self._push_hush_unconfirmed(now, self.episode_id, self.generation))
             return
+        self.pending_hush = {
+            "requested_at": now, "by": by_text, "episode": self.episode_id, "generation": self.generation,
+        }
+        self._save_state()
         await self.run_in(self._delayed_hush_confirm, self.hush_confirm_s, episode_id=self.episode_id, by_text=by_text)
 
     def _delayed_hush_confirm(self, kwargs):
@@ -774,28 +826,62 @@ class FireSafety(hass.Hass):
 
     async def _confirm_hush(self, episode_id, by_text):
         async with self._eval_lock:
-            if self.phase != "alarm" or self.episode_id != episode_id:
-                return  # superseded (hushed some other way, escalated, or cleared) already
-            now = self._now()
-            siren = await self._read_state(self.siren_state_entity)
-            smoke = await self._read_state(self.smoke_entity)
-            left_fire = not _siren_matches(siren, self.siren_alarm_values)
-            if left_fire or smoke == "off":
-                await self._commit_hush(now, by_text)
-            else:
-                self.create_task(self._push_hush_unconfirmed(now, episode_id))
+            await self._confirm_hush_locked(episode_id, by_text)
+
+    async def _confirm_hush_locked(self, episode_id, by_text):
+        """Third review (P1): confirmed only on POSITIVE evidence - siren known and in
+        {clear, silenced}, or smoke known "off". An unknown/unavailable reading (e.g. the
+        ~65s post-restart gap) must never itself confirm a hush - reschedule instead, up to
+        hush_confirm_max_s total since the original press."""
+        pending = self.pending_hush
+        if (
+            self.phase != "alarm"
+            or self.episode_id != episode_id
+            or pending is None
+            or pending.get("episode") != episode_id
+            or pending.get("generation") != self.generation
+        ):
+            return  # superseded (hushed some other way, a newer press, escalated, or cleared)
+        now = self._now()
+        siren = await self._read_state(self.siren_state_entity)
+        smoke = await self._read_state(self.smoke_entity)
+        siren_positive = _normalize_siren(siren) == "clear" or _siren_matches(siren, self.siren_silenced_values)
+        smoke_positive = smoke == "off"
+        if siren_positive or smoke_positive:
+            await self._commit_hush(now, by_text)
+            return
+        requested_at = pending.get("requested_at") or now
+        if (siren is None or smoke is None) and (now - requested_at) < timedelta(seconds=self.hush_confirm_max_s):
+            await self.run_in(self._delayed_hush_confirm, HUSH_UNKNOWN_RETRY_S, episode_id=episode_id, by_text=by_text)
+            return
+        self.pending_hush = None
+        self._save_state()
+        self.create_task(self._push_hush_unconfirmed(now, episode_id, self.generation))
 
     async def _commit_hush(self, now, by_text):
+        self.pending_hush = None
+        if self.hush_count >= self.max_hushes_per_episode:
+            # Fix 4: re-check at commit time too - a confirmation that took a while (unknown
+            # retries) could otherwise land after some other path already used up the limit.
+            self.log(f"Hush limit reached at commit time for episode {self.episode_id} - not hushing", level="WARNING")
+            if not self.hush_limit_notified:
+                self.hush_limit_notified = True
+                self._save_state()
+                self.create_task(self._push_hush_limit(now, self.episode_id, self.generation))
+            else:
+                self._save_state()
+            return
         self.hush_count += 1
         self.hushed_by = by_text
         self.hushed_until = now + timedelta(minutes=self.hush_minutes)
         self.phase = "hushed"
+        self.generation += 1
         self.since = now
         self.off_since = None
         self._save_state()
         await self._report_feed("hushed", by=by_text)
         # Push detached from _eval_lock (fix 6); announce stays awaited (ordering unchanged).
-        self.create_task(self._push_hushed(now, self.episode_id, self.hushed_by, self.hushed_until))
+        self.create_task(self._push_hushed(now, self.episode_id, self.generation, self.hushed_by, self.hushed_until))
         await self._announce_hushed(now)
 
     async def _ack(self, person):
@@ -807,7 +893,9 @@ class FireSafety(hass.Hass):
             self.log(f"{person} acknowledged the fire alarm", level="INFO")
 
     async def _enter_cooldown(self, now, by=None):
+        self._clear_pending_hush()
         self.phase = "cooldown"
+        self.generation += 1
         self.since = now
         self.off_since = None
         self._save_state()
@@ -815,6 +903,7 @@ class FireSafety(hass.Hass):
         await self._clear_lights()
 
     async def _enter_clear(self, now):
+        self._clear_pending_hush()
         was_active = self.episode_id is not None
         duration_min = None
         if was_active and self.episode_started_at:
@@ -829,7 +918,14 @@ class FireSafety(hass.Hass):
                 "light_snapshot": self.light_snapshot,
                 "light_snapshot_episode": self.light_snapshot_episode,
             }
+        # Fix 2/3: the all-clear push now runs detached, so it must not rely on live
+        # self.episode_id/episode_notified once it actually fires - both are about to be
+        # wiped below. Snapshot them (and the new generation) synchronously instead, so a
+        # departed housemate recorded on this episode still receives the all-clear.
+        cleared_episode_id = self.episode_id
+        notified_snapshot = self.episode_notified
         self.phase = "clear"
+        self.generation += 1
         self.since = now
         self.episode_id = None
         self.episode_started_at = None
@@ -840,19 +936,20 @@ class FireSafety(hass.Hass):
         self.off_since = None
         self.hush_limit_notified = False
         self.stale_alarm_notified = False
+        self.episode_notified = None
         self._save_state()
         await self._report_feed("clear")
         if was_active:
             await self._clear_lights()
-            # episode_notified reset happens AFTER the push (below) so a departed
-            # housemate recorded on this episode still receives the all-clear.
-            await self._push_all_clear(now, duration_min or 0)
+            self.create_task(
+                self._push_all_clear(now, cleared_episode_id, self.generation, duration_min or 0, notified_snapshot)
+            )
             await self._announce_all_clear(now)
-        self.episode_notified = None
-        self._save_state()
 
     async def _enter_offline(self, now):
+        self._clear_pending_hush()
         self.phase = "offline"
+        self.generation += 1
         self.since = now
         self._save_state()
         await self._report_feed("offline")
@@ -902,7 +999,9 @@ class FireSafety(hass.Hass):
             # can fail or the device can ignore it, so only the confirmed edge counts.
             self.self_test_until = now + timedelta(seconds=self.self_test_floor_s)
             self._save_state()
-            await self._push_health(now, "Kitchen smoke alarm self-test ran.")
+            # Fix 2: detached - this runs under _eval_lock, and a slow health push must not
+            # block a concurrent hush/clear press.
+            self.create_task(self._push_health(now, "Kitchen smoke alarm self-test ran."))
             return True
 
     async def _self_test_ready(self, automatic):
@@ -946,9 +1045,9 @@ class FireSafety(hass.Hass):
         if now.day >= self.monthly_test_max_retry_days:
             self.monthly_test_resolved = True
             self._save_state()
-            await self._push_health(
+            self.create_task(self._push_health(
                 now, "Monthly smoke alarm test skipped — someone was home; run it from the dashboard"
-            )
+            ))
 
     # ---------- cooking mode ----------
 
@@ -992,16 +1091,18 @@ class FireSafety(hass.Hass):
             faults["offline"] = "Kitchen smoke alarm has stopped reporting."
 
         throttle = timedelta(hours=self.fault_push_throttle_hours)
-        changed = False
         for key, message in faults.items():
             last = self.last_fault_push_at.get(key)
             if last and (now - last) < throttle:
                 continue
-            sent = await self._push_health(now, message)
-            if sent:
-                self.last_fault_push_at[key] = now
-                changed = True
-        if changed:
+            # Fix 2: detached - the throttle stamp is applied inside the task itself (only
+            # on a real send), since a create_task() here can't be awaited for its result.
+            self.create_task(self._send_fault_push(now, key, message))
+
+    async def _send_fault_push(self, now, key, message):
+        sent = await self._push_health(now, message)
+        if sent:
+            self.last_fault_push_at[key] = now
             self._save_state()
 
     # ---------- repeat cadence (alarm phase only) ----------
@@ -1009,10 +1110,10 @@ class FireSafety(hass.Hass):
     async def _maybe_repeat_alarm_actions(self, now):
         if self.last_push_at is None or (now - self.last_push_at) >= self._repush_interval():
             # Fix 6: detached from _eval_lock - a hanging repeat push must not block a
-            # concurrent hush/clear press. Fix 8: repeats never persist into
-            # episode_notified (record_audience=False) - only hush/hush-failed/stale/
-            # all-clear pushes do.
-            self.create_task(self._push_alarm(now, self.episode_id, record_audience=False))
+            # concurrent hush/clear press. Third review (fix 5): a repeat's own targeting
+            # still ignores history (include_history=False inside _push_alarm), but every
+            # recipient it actually reaches is unioned into episode_notified afterward.
+            self.create_task(self._push_alarm(now, self.episode_id, self.generation))
             self.last_push_at = now
             self._save_state()
         if self.last_announce_at is None or (now - self.last_announce_at) >= timedelta(seconds=self.reannounce_interval_s):
@@ -1204,13 +1305,19 @@ class FireSafety(hass.Hass):
             "media_player/media_pause", entity_id=self.media_pause_players,
         )
 
-    async def _episode_audience(self, now):
-        """Owner rule (2026-09-14): Mikkel always, each housemate only while home; anyone
-        already recorded for this episode keeps getting pushes even after they leave.
+    async def _episode_audience(self, now, include_history, history_override=None):
+        """Owner rule (2026-09-14): Mikkel always, each housemate only while home.
 
         Fix 8: the "nobody home -> everyone" fallback only applies once every housemate is
         CONFIRMED not_home - an unknown/unavailable presence is ambiguous, not evidence of
-        absence, so that housemate is simply left out rather than triggering "everyone"."""
+        absence, so that housemate is simply left out rather than triggering "everyone".
+
+        Third review (fix 5): include_history=False (initial alarm + repeats) computes
+        "always ∪ home now" only; include_history=True (hush/hush-unconfirmed/hush-limit/
+        stale/all-clear) also ∪'s in episode_notified - anyone already recorded for this
+        episode keeps getting THOSE pushes even after they leave. history_override lets a
+        caller pass a pre-reset snapshot once self.episode_notified has already been wiped
+        (see _enter_clear)."""
         home = set()
         all_confirmed_away = True
         for person, entity in self.alarm_notify_if_home.items():
@@ -1221,16 +1328,18 @@ class FireSafety(hass.Hass):
                 all_confirmed_away = False
         if not home and all_confirmed_away and self.alarm_nobody_home == "everyone":
             home = set(self.alarm_notify_if_home.keys())
-        audience = set(self.alarm_always_notify) | home | set(self.episode_notified or [])
+        audience = set(self.alarm_always_notify) | home
+        if include_history:
+            history = self.episode_notified if history_override is None else history_override
+            audience |= set(history or [])
         return sorted(audience)
 
-    async def _push_alarm(self, now, episode, record_audience):
-        """episode is a snapshot taken synchronously by the caller (fix 6) - this push may
-        run detached from _eval_lock, so it must not trust a live self.episode_id read
-        mid-flight. record_audience is False for the periodic repeat cadence (fix 8):
-        repeats must not persist into episode_notified, only hush/hush-failed/stale/
-        all-clear pushes do."""
-        audience = await self._episode_audience(now)
+    async def _push_alarm(self, now, episode, generation):
+        """episode/generation are a snapshot taken synchronously by the caller (fix 6) -
+        this push runs detached from _eval_lock, so it must not trust a live self.* read
+        mid-flight. Every recipient of ANY alarm push (initial or repeat) is unioned into
+        episode_notified (fix 5) - only the push's OWN targeting ignores history."""
+        audience = await self._episode_audience(now, include_history=False)
         self.log(f"Fire alarm push audience: {audience}", level="INFO")
 
         def actions_for(person):
@@ -1240,6 +1349,9 @@ class FireSafety(hass.Hass):
                 {"action": "URI", "title": "Call 112", "uri": "tel:112"},
             ]
 
+        if not self._push_still_valid(episode, generation, expected_phase="alarm"):
+            self.log(f"Dropping stale alarm push for episode {episode}", level="DEBUG")
+            return
         await self._notify(
             f"alarm push (episode={episode}) tag={self.push_tag}",
             title="Smoke in the kitchen",
@@ -1252,12 +1364,15 @@ class FireSafety(hass.Hass):
             per_person_actions=actions_for,
             test_audience=self.test_audience if self.test_audience is not None else audience,
         )
-        if record_audience and self.episode_id == episode:
-            self.episode_notified = audience
+        if self.episode_id == episode:
+            self.episode_notified = sorted(set(self.episode_notified or []) | set(audience))
 
-    async def _push_hushed(self, now, episode, hushed_by, hushed_until):
+    async def _push_hushed(self, now, episode, generation, hushed_by, hushed_until):
         rearm = self._fmt(hushed_until)
-        audience = await self._episode_audience(now)
+        audience = await self._episode_audience(now, include_history=True)
+        if not self._push_still_valid(episode, generation, expected_phase="hushed"):
+            self.log(f"Dropping stale hush-confirmation push for episode {episode}", level="DEBUG")
+            return
         await self._notify(
             "hush confirmation",
             title="Smoke in the kitchen",
@@ -1270,11 +1385,14 @@ class FireSafety(hass.Hass):
         if self.episode_id == episode:
             self.episode_notified = audience
 
-    async def _push_hush_unconfirmed(self, now, episode):
+    async def _push_hush_unconfirmed(self, now, episode, generation):
         """Fix 2: sent both when the remote "stop" call itself failed and when it was
-        accepted but the device never corroborated it within hush_confirm_s - from the
+        accepted but the device never corroborated it within hush_confirm_max_s - from the
         household's perspective these are the same outcome (the alarm is not silenced)."""
-        audience = await self._episode_audience(now)
+        audience = await self._episode_audience(now, include_history=True)
+        if not self._push_still_valid(episode, generation):
+            self.log(f"Dropping stale hush-unconfirmed push for episode {episode}", level="DEBUG")
+            return
         await self._notify(
             "hush-unconfirmed notice",
             title="Fire alarm",
@@ -1287,8 +1405,11 @@ class FireSafety(hass.Hass):
         if self.episode_id == episode:
             self.episode_notified = audience
 
-    async def _push_hush_limit(self, now):
-        audience = await self._episode_audience(now)
+    async def _push_hush_limit(self, now, episode, generation):
+        audience = await self._episode_audience(now, include_history=True)
+        if not self._push_still_valid(episode, generation):
+            self.log(f"Dropping stale hush-limit push for episode {episode}", level="DEBUG")
+            return
         await self._notify(
             "hush-limit-reached notice",
             title="Fire alarm",
@@ -1299,8 +1420,11 @@ class FireSafety(hass.Hass):
             test_audience=self.test_audience if self.test_audience is not None else audience,
         )
 
-    async def _push_all_clear(self, now, duration_min):
-        audience = await self._episode_audience(now)
+    async def _push_all_clear(self, now, episode, generation, duration_min, notified_snapshot):
+        audience = await self._episode_audience(now, include_history=True, history_override=notified_snapshot)
+        if not self._all_clear_still_valid(generation):
+            self.log(f"Dropping stale all-clear push for episode {episode}", level="DEBUG")
+            return
         await self._notify(
             "all-clear",
             title="Fire alarm",
@@ -1486,6 +1610,32 @@ class FireSafety(hass.Hass):
         except (TypeError, ValueError):
             return None
 
+    @classmethod
+    def _parse_pending_hush(cls, value):
+        if not value:
+            return None
+        requested_at = cls._parse_dt(value.get("requested_at"))
+        if requested_at is None:
+            return None
+        return {
+            "requested_at": requested_at,
+            "by": value.get("by"),
+            "episode": value.get("episode"),
+            "generation": int(value.get("generation") or 0),
+        }
+
+    @staticmethod
+    def _dump_pending_hush(value):
+        if not value:
+            return None
+        requested_at = value.get("requested_at")
+        return {
+            "requested_at": requested_at.isoformat() if requested_at else None,
+            "by": value.get("by"),
+            "episode": value.get("episode"),
+            "generation": value.get("generation"),
+        }
+
     def _load_state(self):
         try:
             with open(self.state_file) as f:
@@ -1523,6 +1673,10 @@ class FireSafety(hass.Hass):
         # Fix 9: persisted (not transient) so an AppDaemon restart mid-alarm doesn't repeat
         # the once-only house-wide stale announcement; _enter_clear resets it per episode.
         self.stale_alarm_notified = bool(data.get("stale_alarm_notified") or False)
+        # Third review: bumped on every phase change so a detached push can tell whether
+        # the episode has moved on since it was dispatched (fix 3).
+        self.generation = int(data.get("generation") or 0)
+        self.pending_hush = self._parse_pending_hush(data.get("pending_hush"))
 
         # Transient (never persisted): safe/desirable to reset every process start - see
         # each fix's rationale (fallback debounce, loop guard, heartbeat).
@@ -1563,6 +1717,8 @@ class FireSafety(hass.Hass):
             "monthly_test_month_key": self.monthly_test_month_key,
             "monthly_test_resolved": self.monthly_test_resolved,
             "stale_alarm_notified": self.stale_alarm_notified,
+            "generation": self.generation,
+            "pending_hush": self._dump_pending_hush(self.pending_hush),
         }
         try:
             tmp = self.state_file + ".tmp"
