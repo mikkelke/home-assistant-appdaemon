@@ -20,7 +20,7 @@ FireSafety:
     - SonosNotifier
 
   dry_run: false
-  test_audience: ["mikkel"]
+  test_audience: null
 
   state_file: /conf/apps/safety/fire_safety_state.json
   publish_entity: sensor.fire_safety
