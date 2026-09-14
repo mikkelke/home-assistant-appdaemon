@@ -10,6 +10,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 if "appdaemon.plugins.hass.hassapi" not in sys.modules:
@@ -79,6 +80,59 @@ class TestGetNotificationServicesForPeople(unittest.TestCase):
             result,
             ["notify.mobile_app_mikkels_ofx9p", "notify.mobile_app_claudias_iphone"],
         )
+
+
+def _make_notifier(**overrides):
+    """A minimal real MobileNotifier - call_service is mocked, everything else is real."""
+    app = mn.MobileNotifier.__new__(mn.MobileNotifier)
+    app.log_calls = []
+    app.log = lambda *a, **kw: app.log_calls.append((a, kw))
+    app.call_service = AsyncMock()
+    app.person_entities = []
+    app.device_mapping = {}
+    app.category_audience = {}
+    app.platform_map = {}
+    app.user_notification_service = None
+    for key, value in overrides.items():
+        setattr(app, key, value)
+    return app
+
+
+class TestNotifyReturnValue(unittest.IsolatedAsyncioTestCase):
+    """Fix 5: notify() must return the number of services actually delivered to (an int,
+    0 when none), not None - callers (e.g. FireSafety's fault-push throttle) need to tell
+    "silently reached nobody" apart from "actually sent"."""
+
+    async def test_returns_zero_when_no_services_resolve(self):
+        app = _make_notifier(device_mapping={})
+        result = await app.notify(title="t", message="m", target=["mikkel"])
+        self.assertEqual(result, 0)
+        app.call_service.assert_not_called()
+
+    async def test_returns_zero_when_every_send_fails(self):
+        app = _make_notifier(device_mapping={"mikkel": ["notify.mobile_app_mikkels_phone"]})
+        app.call_service = AsyncMock(side_effect=RuntimeError("boom"))
+        result = await app.notify(title="t", message="m", target=["mikkel"])
+        self.assertEqual(result, 0)
+
+    async def test_returns_success_count_when_some_succeed(self):
+        app = _make_notifier(device_mapping={
+            "mikkel": ["notify.mobile_app_mikkels_phone"],
+            "kristine": ["notify.mobile_app_kristines_phone"],
+        })
+
+        async def call_service(service_path, **kwargs):
+            if service_path == "notify/mobile_app_kristines_phone":
+                raise RuntimeError("boom")
+
+        app.call_service = AsyncMock(side_effect=call_service)
+        result = await app.notify(title="t", message="m", target=["mikkel", "kristine"])
+        self.assertEqual(result, 1)
+
+    async def test_returns_full_count_when_all_succeed(self):
+        app = _make_notifier(device_mapping={"mikkel": ["notify.mobile_app_mikkels_phone"]})
+        result = await app.notify(title="t", message="m", target=["mikkel"])
+        self.assertEqual(result, 1)
 
 
 if __name__ == "__main__":

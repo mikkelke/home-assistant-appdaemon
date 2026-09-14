@@ -59,12 +59,20 @@ FireSafety:
   # --- Timing ---
   hush_minutes: 10
   max_hushes_per_episode: 2
+  # Remote hush sends "stop" then waits this long before checking the siren/smoke actually
+  # corroborate it worked (fix 2) - a failed/ignored stop is never reported as a success.
+  hush_confirm_s: 20
   pre_alarm_timeout_min: 10
   cooldown_confirm_s: 60
   cooldown_clear_min: 5
   offline_after_min: 30
   cooking_mode_minutes: 45
-  self_test_window_min: 6
+  # Floor under _run_self_test's own trigger, for the gap before the device's live
+  # siren_state actually reports self_test (fix 3: seconds, not minutes).
+  self_test_floor_s: 60
+  # If the siren has continuously reported self_test longer than this, stop treating it as
+  # self-test for smoke_fallback purposes - a stuck/faulty device must not mask a real fire.
+  self_test_max_min: 10
   reannounce_interval_s: 45
   repush_interval_s: 120
   repush_interval_acked_s: 180

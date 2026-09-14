@@ -246,7 +246,13 @@ class MobileNotifier(hass.Hass):
                 service (so action IDs can be person-scoped) when the service maps to a person.
             test_audience: Optional list of person keys; when given, only those people
                 receive the push regardless of target/category.
+
+        Returns:
+            The number of services actually delivered to (0 when none, e.g. no service
+            resolved for the target or every send raised). Existing callers ignore the
+            return value, so this is backward compatible.
         """
+        success_count = 0
         try:
             notification_data = {
                 "title": title,
@@ -283,10 +289,9 @@ class MobileNotifier(hass.Hass):
             # Check if no services found
             if not services:
                 self.log(f"No notification services found for target '{target}'", level="WARNING")
-                return
+                return success_count
 
             # Send to all target services
-            success_count = 0
             for service in services:
                 try:
                     # Convert service name from notify.mobile_app_xxx to notify/mobile_app_xxx format
@@ -343,7 +348,9 @@ class MobileNotifier(hass.Hass):
                 self.log(f"Failed to send notification to any service", level="ERROR")
             elif success_count < len(services):
                 self.log(f"Sent notification to {success_count}/{len(services)} services", level="WARNING")
-                
+
+            return success_count
         except Exception as e:
             self.log(f"Error sending notification: {e}", level="ERROR")
+            return success_count
 

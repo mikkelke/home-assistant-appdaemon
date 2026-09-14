@@ -15,6 +15,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# apps/notify - so NotifierDeliveryResult can exercise the REAL MobileNotifier (fix 5),
+# not a fake that would hide a "delivered to nobody" bug.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "notify"))
 
 if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     ad = types.ModuleType("appdaemon")
@@ -28,6 +31,7 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     sys.modules["appdaemon.plugins.hass.hassapi"] = hassapi
 
 import fire_safety as fs  # noqa: E402
+import mobile_notifier as mn  # noqa: E402
 
 FIXED_NOW = datetime(2026, 9, 11, 18, 0, 0, tzinfo=timezone.utc)
 
@@ -48,6 +52,7 @@ class FakeMobileNotifier:
 
     async def notify(self, **kwargs):
         self.calls.append(kwargs)
+        return 1  # simulates one service delivered - see the real MobileNotifier (fix 5)
 
     async def clear_notification(self, **kwargs):
         pass
@@ -74,7 +79,13 @@ def _make_app(**overrides):
     app.log_calls = []
     app.log = lambda *a, **kw: app.log_calls.append((a, kw))
     app.call_service = AsyncMock()
-    app.set_state = AsyncMock()
+
+    async def _set_state(entity_id, state=None, **kw):
+        # Mirrors real HA: a set_state() makes that state visible to a later get_state()
+        # (fix 10's "is the published entity still there" check relies on this).
+        app.states[entity_id] = state
+
+    app.set_state = AsyncMock(side_effect=_set_state)
     app.fire_event = AsyncMock()
     app.run_in = AsyncMock(return_value="handle")
     app.run_every = MagicMock()
@@ -127,12 +138,14 @@ def _make_app(**overrides):
     app.test_audience = None
     app.hush_minutes = 10
     app.max_hushes_per_episode = 2
+    app.hush_confirm_s = 20
     app.pre_alarm_timeout_min = 10
     app.cooldown_confirm_s = 60
     app.cooldown_clear_min = 5
     app.offline_after_min = 30
     app.cooking_mode_minutes = 45
-    app.self_test_window_min = 6
+    app.self_test_floor_s = 60
+    app.self_test_max_min = 10
     app.reannounce_interval_s = 45
     app.repush_interval_s = 120
     app.repush_interval_acked_s = 180
@@ -185,6 +198,7 @@ def _make_app(**overrides):
     app.last_fault_push_at = {}
     app.light_snapshot = {}
     app.light_snapshot_episode = None
+    app.light_restore_attempts = 0
     app.episode_notified = None
     app.last_clear_at = None
     app.last_episode = None
@@ -208,6 +222,33 @@ async def _tick(app):
     fix-5 backgrounded alarm push) so assertions can see the resulting side effects."""
     await app._evaluate()
     await asyncio.gather(*app._test_tasks)
+
+
+async def _confirm_pending_hush(app):
+    """Fix 2: a remote hush schedules its confirmation check via run_in (mocked in tests,
+    so it never fires on its own) - extract that scheduled call and run it to completion,
+    mirroring what AppDaemon would do once hush_confirm_s elapses."""
+    args, callback_kwargs = app.run_in.call_args
+    callback = args[0]
+    callback(callback_kwargs)
+    await asyncio.gather(*app._test_tasks)
+
+
+def _make_real_mobile_notifier(**overrides):
+    """A real (not faked) MobileNotifier for NotifierDeliveryResult - the review noted a
+    fake notify() can hide a "delivered to nobody" bug that only the real resolve/send
+    path would surface."""
+    notifier = mn.MobileNotifier.__new__(mn.MobileNotifier)
+    notifier.log = lambda *a, **kw: None
+    notifier.call_service = AsyncMock()
+    notifier.person_entities = []
+    notifier.device_mapping = {}
+    notifier.category_audience = {}
+    notifier.platform_map = {}
+    notifier.user_notification_service = None
+    for key, value in overrides.items():
+        setattr(notifier, key, value)
+    return notifier
 
 
 class _FrozenTimeTestCase(unittest.IsolatedAsyncioTestCase):
@@ -367,14 +408,31 @@ class TransitionTable(_FrozenTimeTestCase):
         self.assertEqual(app.phase, "alarm")
 
     async def test_hushed_to_alarm_on_expiry_while_smoke_still_on(self):
+        # Fix 4: hush expiry now uses the debounced smoke_fallback (like everywhere else)
+        # instead of a raw, immediate smoke=="on" check - pre-seed the debounce so this
+        # still exercises "smoke corroborated on for a while -> alarm".
         app = _make_app(
             phase="hushed", episode_id="X", hush_count=1, last_smoke="on",
             hushed_until=FIXED_NOW - timedelta(seconds=1),
+            smoke_fallback_since=FIXED_NOW - timedelta(seconds=31),
         )
         app.states[app.smoke_entity] = "on"
         app.states[app.siren_state_entity] = "clear"
         await _tick(app)
         self.assertEqual(app.phase, "alarm")
+
+    async def test_hushed_expiry_with_pre_alarm_siren_goes_to_pre_alarm_not_alarm(self):
+        """Fix 4: smoke=="on" is also the steady state of pre_alarm (the device's own bit
+        is set in both) - hush expiry must not read that alone as a full critical alarm."""
+        app = _make_app(
+            phase="hushed", episode_id="X", hush_count=1, last_smoke="on",
+            hushed_until=FIXED_NOW - timedelta(seconds=1),
+        )
+        app.states[app.smoke_entity] = "on"
+        app.states[app.siren_state_entity] = "pre_alarm"
+        await _tick(app)
+        self.assertEqual(app.phase, "pre_alarm")
+        self.assertEqual(app.mobile_notifier.calls, [])
 
     async def test_hushed_expiry_goes_to_cooldown_when_clear(self):
         app = _make_app(
@@ -520,6 +578,66 @@ class SmokeFallbackDebounce(_FrozenTimeTestCase):
         self.assertEqual(app.phase, "alarm")
 
 
+class IndependentEvidence(_FrozenTimeTestCase):
+    """Fix 3: siren=="fire" is independent evidence and must raise/keep an alarm even
+    while the smoke entity itself is unavailable; an outage must not corrupt the
+    smoke_fallback/off debounce; the self-test floor/window must never mask it."""
+
+    async def test_siren_fire_with_smoke_unknown_raises_alarm(self):
+        app = _make_app(phase="clear")
+        app.states[app.siren_state_entity] = "fire"
+        # smoke_entity intentionally left unset - unknown/unavailable this tick.
+        await _tick(app)
+        self.assertEqual(app.phase, "alarm")
+        self.assertIsNotNone(app.episode_id)
+        self.assertEqual(len(app.mobile_notifier.calls), 1)
+        self.assertIsNone(app.unavailable_since)
+
+    async def test_smoke_fallback_debounce_resets_across_an_outage(self):
+        app = _make_app(phase="clear", smoke_fallback_since=FIXED_NOW - timedelta(seconds=31))
+        app.states[app.smoke_entity] = None
+        app.states[app.siren_state_entity] = "clear"
+        await _tick(app)
+        self.assertIsNone(app.smoke_fallback_since)
+        self.assertEqual(app.phase, "clear")
+
+        app.states[app.smoke_entity] = "on"
+        await _tick(app)
+        # Must NOT alarm instantly off the stale pre-outage elapsed time - the debounce
+        # restarted at the outage and hasn't held smoke_fallback_s again yet.
+        self.assertEqual(app.phase, "clear")
+        self.assertEqual(app.smoke_fallback_since, FIXED_NOW)
+
+    async def test_floor_never_masks_fire_when_smoke_not_confirmed_off(self):
+        app = _make_app(phase="clear", self_test_until=FIXED_NOW + timedelta(seconds=30))
+        app.states[app.siren_state_entity] = "fire"
+        # smoke_entity left unset - unknown, not a positive "off" corroborating the floor.
+        await _tick(app)
+        self.assertEqual(app.phase, "alarm")
+
+    async def test_self_test_suppression_expires_after_max_min_allows_smoke_fallback(self):
+        app = _make_app(
+            phase="clear", last_siren="self_test",
+            last_self_test_at=FIXED_NOW - timedelta(minutes=11),
+            smoke_fallback_since=FIXED_NOW - timedelta(seconds=31),
+        )
+        app.states[app.smoke_entity] = "on"
+        app.states[app.siren_state_entity] = "self_test"
+        await _tick(app)
+        self.assertEqual(app.phase, "alarm")
+
+    async def test_self_test_suppression_still_applies_within_max_min(self):
+        app = _make_app(
+            phase="clear", last_siren="self_test",
+            last_self_test_at=FIXED_NOW - timedelta(minutes=5),
+            smoke_fallback_since=FIXED_NOW - timedelta(seconds=31),
+        )
+        app.states[app.smoke_entity] = "on"
+        app.states[app.siren_state_entity] = "self_test"
+        await _tick(app)
+        self.assertEqual(app.phase, "clear")
+
+
 class PreAlarmLoopGuard(_FrozenTimeTestCase):
     """Fix 8: once a pre_alarm timeout forces a clear while the siren is still reporting
     pre_alarm, don't re-chime every tick - wait for the siren to actually leave pre_alarm."""
@@ -630,6 +748,50 @@ class EpisodeReuseAndOfflineContinuity(_FrozenTimeTestCase):
         self.assertEqual(app.hush_count, 1)
         self.assertEqual(app.light_snapshot_episode, "OLDEP")
 
+    async def test_reuse_keeps_hush_count_but_starts_audience_fresh(self):
+        """Fix 7: episode reuse carries over hush accounting only - not the audience
+        list. alarm_nobody_home="always_only" isolates the effect (no "everyone"
+        fallback muddying the result)."""
+        app = _make_app(
+            phase="clear", alarm_nobody_home="always_only",
+            last_clear_at=FIXED_NOW - timedelta(minutes=10),
+            last_episode={
+                "episode_id": "OLDEP",
+                "hush_count": 1,
+                "episode_notified": ["mikkel", "kristine"],
+                "light_snapshot": {"light.hallway_lights": {"state": "on", "brightness": 50}},
+                "light_snapshot_episode": "OLDEP",
+            },
+        )
+        app.states[app.smoke_entity] = "on"
+        app.states[app.siren_state_entity] = "fire"
+        await _tick(app)
+        self.assertEqual(app.phase, "alarm")
+        self.assertEqual(app.episode_id, "OLDEP")
+        self.assertEqual(app.hush_count, 1)
+        self.assertEqual(app.episode_notified, ["mikkel"])
+
+    async def test_reuse_does_not_resurrect_stale_light_snapshot_contents(self):
+        """Fix 7: episode reuse must not reuse a light snapshot - a fresh one is taken
+        from CURRENT light state, not the stale values stashed at the last clear."""
+        app = _make_app(
+            phase="clear",
+            last_clear_at=FIXED_NOW - timedelta(minutes=10),
+            last_episode={
+                "episode_id": "OLDEP", "hush_count": 0, "episode_notified": None,
+                "light_snapshot": {"light.hallway_lights": {"state": "on", "brightness": 50}},
+                "light_snapshot_episode": "OLDEP",
+            },
+        )
+        app.states[app.smoke_entity] = "on"
+        app.states[app.siren_state_entity] = "fire"
+        app.states["light.hallway_lights"] = {"state": "off", "attributes": {}}
+        await _tick(app)
+        self.assertEqual(app.phase, "alarm")
+        self.assertEqual(
+            app.light_snapshot, {"light.hallway_lights": {"state": "off", "brightness": None}}
+        )
+
     async def test_alarm_outside_reuse_window_starts_fresh_episode(self):
         app = _make_app(
             phase="clear",
@@ -715,15 +877,70 @@ class OfflineHandling(_FrozenTimeTestCase):
 
 
 class HushBehavior(_FrozenTimeTestCase):
-    async def test_hush_from_alarm_transitions_and_writes_stop_once(self):
+    async def test_hush_from_alarm_sends_stop_then_confirms_via_siren_leaving_fire(self):
+        # Fix 2: a remote hush is not trusted just because the select call was accepted -
+        # it sends "stop", stays "alarm" and doesn't consume hush_count until confirmed.
         app = _make_app(phase="alarm", episode_id="E1", hush_count=0)
+        app.states[app.siren_state_entity] = "silenced"
+        app.states[app.smoke_entity] = "on"
         await app._hush(FIXED_NOW, "the dashboard")
-        self.assertEqual(app.phase, "hushed")
-        self.assertEqual(app.hush_count, 1)
-        self.assertEqual(app.hushed_by, "the dashboard")
+        self.assertEqual(app.phase, "alarm")
+        self.assertEqual(app.hush_count, 0)
         stop_calls = [c for c in app.call_service.call_args_list if c.args[0] == "select/select_option"]
         self.assertEqual(len(stop_calls), 1)
         self.assertEqual(stop_calls[0].kwargs.get("option"), "stop")
+        self.assertEqual(app.run_in.call_args.kwargs.get("episode_id"), "E1")
+
+        await _confirm_pending_hush(app)
+        self.assertEqual(app.phase, "hushed")
+        self.assertEqual(app.hush_count, 1)
+        self.assertEqual(app.hushed_by, "the dashboard")
+        # Confirmation itself must not send a second "stop".
+        stop_calls = [c for c in app.call_service.call_args_list if c.args[0] == "select/select_option"]
+        self.assertEqual(len(stop_calls), 1)
+
+    async def test_hush_confirmed_when_siren_leaves_fire_for_clear(self):
+        app = _make_app(phase="alarm", episode_id="E1", hush_count=0)
+        app.states[app.siren_state_entity] = "fire"
+        app.states[app.smoke_entity] = "on"
+        await app._hush(FIXED_NOW, "the dashboard")
+        self.assertEqual(app.phase, "alarm")
+
+        app.states[app.siren_state_entity] = "clear"
+        app.states[app.smoke_entity] = "off"
+        await _confirm_pending_hush(app)
+        self.assertEqual(app.phase, "hushed")
+        self.assertEqual(app.hush_count, 1)
+
+    async def test_hush_with_failed_stop_call_stays_alarm_and_pushes_failure_once(self):
+        app = _make_app(phase="alarm", episode_id="E1", hush_count=0)
+
+        async def failing_call_service(service, **kwargs):
+            if service == "select/select_option":
+                raise RuntimeError("boom")
+
+        app.call_service = AsyncMock(side_effect=failing_call_service)
+        await app._hush(FIXED_NOW, "the dashboard")
+        await asyncio.gather(*app._test_tasks)
+
+        self.assertEqual(app.phase, "alarm")
+        self.assertEqual(app.hush_count, 0)
+        app.run_in.assert_not_called()
+        self.assertEqual(len(app.mobile_notifier.calls), 1)
+        self.assertIn("Couldn't silence", app.mobile_notifier.calls[0]["message"])
+
+    async def test_hush_unconfirmed_after_timeout_stays_alarm_and_pushes_once(self):
+        app = _make_app(phase="alarm", episode_id="E1", hush_count=0)
+        app.states[app.siren_state_entity] = "fire"
+        app.states[app.smoke_entity] = "on"
+        await app._hush(FIXED_NOW, "the dashboard")
+
+        # Neither siren nor smoke corroborate the hush by the time it's checked.
+        await _confirm_pending_hush(app)
+        self.assertEqual(app.phase, "alarm")
+        self.assertEqual(app.hush_count, 0)
+        self.assertEqual(len(app.mobile_notifier.calls), 1)
+        self.assertIn("Couldn't silence", app.mobile_notifier.calls[0]["message"])
 
     async def test_hush_ignored_outside_alarm_phase(self):
         app = _make_app(phase="clear")
@@ -746,9 +963,12 @@ class HushBehavior(_FrozenTimeTestCase):
         self.assertEqual(len(app.mobile_notifier.calls), 1)
         self.assertTrue(app.hush_limit_notified)
 
-    async def test_second_hush_within_limit_succeeds(self):
+    async def test_second_hush_within_limit_succeeds_once_confirmed(self):
         app = _make_app(phase="alarm", episode_id="E1", hush_count=1, max_hushes_per_episode=2)
+        app.states[app.siren_state_entity] = "clear"
+        app.states[app.smoke_entity] = "off"
         await app._hush(FIXED_NOW, "the dashboard")
+        await _confirm_pending_hush(app)
         self.assertEqual(app.phase, "hushed")
         self.assertEqual(app.hush_count, 2)
 
@@ -756,6 +976,7 @@ class HushBehavior(_FrozenTimeTestCase):
         app = _make_app(
             phase="hushed", episode_id="E1", hush_count=1, last_smoke="on",
             hushed_until=FIXED_NOW - timedelta(seconds=1),
+            smoke_fallback_since=FIXED_NOW - timedelta(seconds=31),
         )
         app.states[app.smoke_entity] = "on"
         app.states[app.siren_state_entity] = "clear"
@@ -798,30 +1019,39 @@ class HushBehavior(_FrozenTimeTestCase):
 
     async def test_hush_button_press_wiring(self):
         app = _make_app(phase="alarm", episode_id="E1")
+        app.states[app.siren_state_entity] = "clear"
+        app.states[app.smoke_entity] = "off"
         app._on_button_state_changed(
             "state_changed", self._button_press_data(app.hush_button_entity), {}
         )
         await asyncio.gather(*app._test_tasks)
+        await _confirm_pending_hush(app)
         self.assertEqual(app.phase, "hushed")
         self.assertEqual(app.hushed_by, "the dashboard")
 
     async def test_hush_button_resolves_actor_from_person_entity(self):
         app = _make_app(phase="alarm", episode_id="E1")
+        app.states[app.siren_state_entity] = "clear"
+        app.states[app.smoke_entity] = "off"
         app.states["person"] = ["person.kristine"]
         app.states["person.kristine"] = {"attributes": {"user_id": "uid-123", "friendly_name": "Kristine"}}
         app._on_button_state_changed(
             "state_changed", self._button_press_data(app.hush_button_entity, "uid-123"), {}
         )
         await asyncio.gather(*app._test_tasks)
+        await _confirm_pending_hush(app)
         self.assertEqual(app.phase, "hushed")
         self.assertEqual(app.hushed_by, "Kristine")
 
     async def test_hush_button_resolves_actor_from_fallback_map(self):
         app = _make_app(phase="alarm", episode_id="E1", user_name_fallback={"uid456": "Claudia"})
+        app.states[app.siren_state_entity] = "clear"
+        app.states[app.smoke_entity] = "off"
         app._on_button_state_changed(
             "state_changed", self._button_press_data(app.hush_button_entity, "uid-456"), {}
         )
         await asyncio.gather(*app._test_tasks)
+        await _confirm_pending_hush(app)
         self.assertEqual(app.hushed_by, "Claudia")
 
     async def test_clear_button_resolves_actor_and_reports_it(self):
@@ -838,14 +1068,34 @@ class HushBehavior(_FrozenTimeTestCase):
 
     async def test_notification_hush_action_for_current_episode(self):
         app = _make_app(phase="alarm", episode_id="20260911180000")
+        app.states[app.siren_state_entity] = "clear"
+        app.states[app.smoke_entity] = "off"
         app._on_notification_action(
             "mobile_app_notification_action",
             {"action": "FIRE_HUSH_20260911180000_mikkel"},
             {},
         )
         await asyncio.gather(*app._test_tasks)
+        await _confirm_pending_hush(app)
         self.assertEqual(app.phase, "hushed")
         self.assertEqual(app.hushed_by, "Mikkel")
+
+    async def test_notification_hush_action_revalidated_at_lock_time(self):
+        """Fix 2: the episode id travels with the task and is rechecked once the lock is
+        actually acquired, not just at event-handling time - a new episode could start
+        (still phase=="alarm") before the queued hush task actually runs."""
+        app = _make_app(phase="alarm", episode_id="20260911180000")
+        app._on_notification_action(
+            "mobile_app_notification_action",
+            {"action": "FIRE_HUSH_20260911180000_mikkel"},
+            {},
+        )
+        # A new alarm episode replaces this one before the queued hush task runs.
+        app.episode_id = "20260911190000"
+        await asyncio.gather(*app._test_tasks)
+        self.assertEqual(app.phase, "alarm")
+        self.assertIsNone(app.hushed_by)
+        app.run_in.assert_not_called()
 
     async def test_notification_hush_action_stale_episode_ignored(self):
         app = _make_app(phase="alarm", episode_id="20260911180000")
@@ -862,6 +1112,108 @@ class HushBehavior(_FrozenTimeTestCase):
         app._on_notification_action("mobile_app_notification_action", {"action": "FIRE_ACK_E1_kristine"}, {})
         await asyncio.gather(*app._test_tasks)
         self.assertEqual(app.ack_by, "Kristine")
+
+
+class ButtonRestoreGuard(_FrozenTimeTestCase):
+    """Fix 1: after an HA restart, input_button.* goes unavailable then RESTORES its last
+    press timestamp - that restore must never be read as a fresh press."""
+
+    async def test_restored_hush_press_after_unavailable_is_ignored(self):
+        app = _make_app(phase="alarm", episode_id="E1")
+        data = {
+            "entity_id": app.hush_button_entity,
+            "old_state": {"state": "unavailable"},
+            "new_state": {"state": "2026-09-11T18:00:00+00:00", "context": {}},
+        }
+        app._on_button_state_changed("state_changed", data, {})
+        self.assertEqual(app._test_tasks, [])
+        self.assertEqual(app.phase, "alarm")
+        self.assertEqual(app.hush_count, 0)
+
+    async def test_missing_old_state_is_ignored(self):
+        app = _make_app(phase="alarm", episode_id="E1")
+        data = {
+            "entity_id": app.hush_button_entity,
+            "new_state": {"state": "2026-09-11T18:00:00+00:00", "context": {}},
+        }
+        app._on_button_state_changed("state_changed", data, {})
+        self.assertEqual(app._test_tasks, [])
+        self.assertEqual(app.phase, "alarm")
+
+    async def test_stale_timestamp_press_is_ignored(self):
+        app = _make_app(phase="alarm", episode_id="E1")
+        data = {
+            "entity_id": app.hush_button_entity,
+            "old_state": {"state": "2026-09-11T16:00:00+00:00"},
+            "new_state": {"state": "2026-09-11T17:58:00+00:00", "context": {}},  # 2 min old
+        }
+        app._on_button_state_changed("state_changed", data, {})
+        self.assertEqual(app._test_tasks, [])
+        self.assertEqual(app.phase, "alarm")
+
+    def test_test_button_restored_after_unavailable_is_ignored(self):
+        app = _make_app(phase="clear")
+        app._on_test_button(
+            app.test_button_entity, None, "unavailable", "2026-09-11T18:00:00+00:00", {}
+        )
+        self.assertEqual(app._test_tasks, [])
+
+    def test_test_button_stale_timestamp_is_ignored(self):
+        app = _make_app(phase="clear")
+        app._on_test_button(
+            app.test_button_entity, None, "2026-09-11T16:00:00+00:00",
+            "2026-09-11T17:58:00+00:00", {},
+        )
+        self.assertEqual(app._test_tasks, [])
+
+
+class SelfTestGuardConditions(_FrozenTimeTestCase):
+    """Fix 1: _run_self_test refuses unless the alarm is idle and the device itself is
+    clear - a self-test sounds the siren, so it must never fire mid-episode or onto
+    ambiguous device state."""
+
+    async def test_refused_when_phase_not_clear(self):
+        app = _make_app(phase="alarm", episode_id="E1")
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
+        ran = await app._run_self_test(FIXED_NOW)
+        self.assertFalse(ran)
+        self.assertIsNone(app.self_test_until)
+        app.call_service.assert_not_called()
+
+    async def test_refused_when_smoke_not_off(self):
+        app = _make_app(phase="clear")
+        app.states[app.smoke_entity] = "on"
+        app.states[app.siren_state_entity] = "clear"
+        ran = await app._run_self_test(FIXED_NOW)
+        self.assertFalse(ran)
+        self.assertIsNone(app.self_test_until)
+
+    async def test_refused_when_siren_not_clear(self):
+        app = _make_app(phase="clear")
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "pre_alarm"
+        ran = await app._run_self_test(FIXED_NOW)
+        self.assertFalse(ran)
+        self.assertIsNone(app.self_test_until)
+
+    async def test_manual_test_allowed_regardless_of_presence(self):
+        app = _make_app(phase="clear")
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
+        app.states["person.mikkel"] = "home"
+        ran = await app._run_self_test(FIXED_NOW)
+        self.assertTrue(ran)
+        self.assertIsNotNone(app.self_test_until)
+
+    async def test_automatic_test_refused_while_someone_home(self):
+        app = _make_app(phase="clear")
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
+        app.states["person.mikkel"] = "home"
+        ran = await app._run_self_test(FIXED_NOW, automatic=True)
+        self.assertFalse(ran)
+        self.assertIsNone(app.self_test_until)
 
 
 class AlarmLightSnapshot(_FrozenTimeTestCase):
@@ -964,6 +1316,80 @@ class AlarmLightSnapshot(_FrozenTimeTestCase):
         self.assertEqual(reloaded.light_snapshot_episode, "E1")
 
 
+class LightRestoreDurability(_FrozenTimeTestCase):
+    """Fix 7: only drop the snapshot once every restore call in it succeeded; otherwise
+    keep it and retry on a later cooldown/clear tick, giving up after 5 attempts."""
+
+    async def test_failed_restore_keeps_snapshot_and_retries_next_tick(self):
+        app = _make_app(
+            phase="cooldown", since=FIXED_NOW - timedelta(minutes=1), episode_id="E1",
+            light_snapshot={"light.hallway_lights": {"state": "on", "brightness": 80}},
+            light_snapshot_episode="E1",
+        )
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
+
+        async def failing_call_service(service, **kwargs):
+            if service == "light/turn_on":
+                raise RuntimeError("boom")
+
+        app.call_service = AsyncMock(side_effect=failing_call_service)
+
+        await _tick(app)
+        self.assertEqual(app.phase, "cooldown")
+        self.assertEqual(app.light_snapshot, {"light.hallway_lights": {"state": "on", "brightness": 80}})
+        self.assertEqual(app.light_restore_attempts, 1)
+
+        await _tick(app)
+        self.assertEqual(app.light_restore_attempts, 2)
+        self.assertTrue(app.light_snapshot)
+
+    async def test_gives_up_after_max_attempts(self):
+        app = _make_app(
+            phase="cooldown", since=FIXED_NOW - timedelta(minutes=1), episode_id="E1",
+            light_snapshot={"light.hallway_lights": {"state": "on", "brightness": 80}},
+            light_snapshot_episode="E1",
+            light_restore_attempts=fs.LIGHT_RESTORE_MAX_ATTEMPTS - 1,
+        )
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
+
+        async def failing_call_service(service, **kwargs):
+            if service == "light/turn_on":
+                raise RuntimeError("boom")
+
+        app.call_service = AsyncMock(side_effect=failing_call_service)
+
+        await _tick(app)
+        self.assertEqual(app.light_snapshot, {})
+        self.assertIsNone(app.light_snapshot_episode)
+        self.assertEqual(app.light_restore_attempts, 0)
+        warnings = [a for a, kw in app.log_calls if kw.get("level") == "WARNING"]
+        self.assertTrue(any("giving up" in str(a[0]).lower() for a in warnings))
+
+    async def test_successful_restore_resets_attempts_counter(self):
+        app = _make_app(
+            phase="cooldown", episode_id="E1",
+            light_snapshot={"light.hallway_lights": {"state": "off", "brightness": None}},
+            light_snapshot_episode="E1",
+            light_restore_attempts=2,
+        )
+        await app._clear_lights()
+        self.assertEqual(app.light_snapshot, {})
+        self.assertEqual(app.light_restore_attempts, 0)
+
+    async def test_no_new_snapshot_taken_while_unrestored_snapshot_pending(self):
+        app = _make_app(
+            phase="alarm", episode_id="E2",
+            light_snapshot={"light.hallway_lights": {"state": "on", "brightness": 40}},
+            light_snapshot_episode="E1",  # stale, from a previous un-restored episode
+        )
+        app.states["light.hallway_lights"] = {"state": "off", "attributes": {}}
+        await app._assert_lights(FIXED_NOW)
+        self.assertEqual(app.light_snapshot, {"light.hallway_lights": {"state": "on", "brightness": 40}})
+        self.assertEqual(app.light_snapshot_episode, "E1")
+
+
 class RepeatCadence(_FrozenTimeTestCase):
     async def test_repush_fires_once_interval_elapsed(self):
         app = _make_app(
@@ -999,6 +1425,86 @@ class RepeatCadence(_FrozenTimeTestCase):
         self.assertEqual(len(app.mobile_notifier.calls), 0)  # 130s < 180s acked interval
 
 
+class PushLockNonBlocking(_FrozenTimeTestCase):
+    """Fix 6: repeat/hush-confirmation/stale pushes run detached from _eval_lock (via
+    create_task with a snapshot), so a slow send can never block a concurrent hush/clear,
+    and a push that resolves after the episode has moved on must not mutate state."""
+
+    async def test_slow_repeat_push_does_not_block_a_concurrent_hush(self):
+        app = _make_app(
+            phase="alarm", episode_id="E1",
+            last_push_at=FIXED_NOW - timedelta(seconds=121),
+            last_announce_at=FIXED_NOW, last_lights_assert_at=FIXED_NOW,
+        )
+        app.states[app.smoke_entity] = "on"
+        app.states[app.siren_state_entity] = "clear"
+
+        push_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_notify(**kwargs):
+            push_started.set()
+            await release.wait()
+            return 1
+
+        app.mobile_notifier.notify = slow_notify
+
+        # The repeat push must be dispatched (create_task) and _evaluate() must return
+        # promptly - it must NOT await the slow notify while holding _eval_lock.
+        await asyncio.wait_for(app._evaluate(), timeout=1)
+        await asyncio.wait_for(push_started.wait(), timeout=1)
+
+        # The lock must already be free - a hush must not have to wait on the push.
+        await asyncio.wait_for(app._hush(FIXED_NOW, "the dashboard"), timeout=1)
+
+        release.set()
+        await asyncio.gather(*app._test_tasks)
+
+    async def test_push_completing_after_clear_does_not_touch_episode_notified(self):
+        app = _make_app(phase="clear")
+        app.states[app.smoke_entity] = "on"
+        app.states[app.siren_state_entity] = "fire"
+
+        push_started = asyncio.Event()
+        release = asyncio.Event()
+        call_count = 0
+
+        async def slow_notify(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                push_started.set()
+                await release.wait()
+            return 1
+
+        app.mobile_notifier.notify = slow_notify
+
+        await asyncio.wait_for(app._evaluate(), timeout=1)  # enters alarm; initial push pending
+        self.assertEqual(app.phase, "alarm")
+        self.assertIsNone(app.episode_notified)
+        # Make sure the initial push has actually started (and is now parked on release)
+        # before moving the episode on - otherwise it may not run until later, landing
+        # its call_count==1 branch on the all-clear push instead.
+        await asyncio.wait_for(push_started.wait(), timeout=1)
+
+        # Smoke clears and stays off long enough to fall through cooldown into clear,
+        # all before the original alarm push's notify() resolves.
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
+        app.off_since = FIXED_NOW - timedelta(seconds=61)
+        await asyncio.wait_for(app._evaluate(), timeout=1)
+        self.assertEqual(app.phase, "cooldown")
+        app.since = FIXED_NOW - timedelta(minutes=10)  # force the cooldown_clear_min timeout
+        await asyncio.wait_for(app._evaluate(), timeout=1)
+        self.assertEqual(app.phase, "clear")
+        self.assertIsNone(app.episode_id)
+
+        release.set()
+        await asyncio.gather(*app._test_tasks)
+        # The stale initial push must not resurrect episode_notified for a cleared episode.
+        self.assertIsNone(app.episode_notified)
+
+
 class DryRunGating(_FrozenTimeTestCase):
     async def test_dry_run_alarm_makes_zero_call_service_and_zero_notify(self):
         app = _make_app(dry_run=True)
@@ -1012,12 +1518,20 @@ class DryRunGating(_FrozenTimeTestCase):
 
     async def test_dry_run_hush_makes_zero_call_service(self):
         app = _make_app(phase="alarm", episode_id="E1", dry_run=True)
+        app.states[app.siren_state_entity] = "clear"
+        app.states[app.smoke_entity] = "off"
         await app._hush(FIXED_NOW, "the dashboard")
+        app.call_service.assert_not_called()
+        self.assertEqual(app.phase, "alarm")  # dry-run still waits for confirmation
+
+        await _confirm_pending_hush(app)
         app.call_service.assert_not_called()
         self.assertEqual(app.phase, "hushed")
 
     async def test_dry_run_self_test_makes_zero_call_service_and_zero_notify(self):
         app = _make_app(dry_run=True)
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
         await app._run_self_test(FIXED_NOW)
         app.call_service.assert_not_called()
         self.assertEqual(app.mobile_notifier.calls, [])
@@ -1033,6 +1547,8 @@ class TestAudiencePassthrough(_FrozenTimeTestCase):
 
     async def test_health_push_carries_test_audience(self):
         app = _make_app(test_audience=["mikkel"])
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
         await app._run_self_test(FIXED_NOW)
         self.assertEqual(app.mobile_notifier.calls[0]["test_audience"], ["mikkel"])
 
@@ -1082,6 +1598,16 @@ class AlarmAudience(_FrozenTimeTestCase):
         audience = await app._episode_audience(FIXED_NOW)
         self.assertEqual(audience, ["claudia", "kristine", "mikkel"])
 
+    async def test_unknown_presence_does_not_trigger_everyone_fallback(self):
+        """Fix 8: "everyone" only applies once every housemate is CONFIRMED not_home -
+        an unknown/unavailable reading is ambiguous, not evidence of absence, so that
+        housemate is simply left out rather than pulling in the whole household."""
+        app = _make_app(alarm_nobody_home="everyone")
+        app.states["person.kristine"] = "not_home"
+        # person.claudia left unset - unknown/unavailable, not confirmed away.
+        audience = await app._episode_audience(FIXED_NOW)
+        self.assertEqual(audience, ["mikkel"])
+
     async def test_departed_housemate_kept_via_episode_notified(self):
         app = _make_app(alarm_nobody_home="always_only", episode_notified=["mikkel", "kristine"])
         app.states["person.kristine"] = "not_home"
@@ -1124,6 +1650,30 @@ class AlarmAudience(_FrozenTimeTestCase):
         app.states[app.siren_state_entity] = "fire"
         await _tick(app)
         self.assertEqual(app.episode_notified, ["mikkel"])
+
+    async def test_repeat_audience_does_not_persist_transient_home_presence(self):
+        """Fix 8: repeats recompute alarm_always_notify ∪ housemates home NOW but must
+        NOT persist that into episode_notified - only hush/hush-failed/stale/all-clear
+        pushes do. A housemate only ever seen "home" during a repeat isn't sticky."""
+        app = _make_app(
+            test_audience=None, alarm_nobody_home="always_only",
+            phase="alarm", episode_id="E1", episode_notified=["mikkel"],
+            last_push_at=FIXED_NOW - timedelta(seconds=121),
+            last_announce_at=FIXED_NOW, last_lights_assert_at=FIXED_NOW,
+        )
+        app.states[app.smoke_entity] = "on"
+        app.states[app.siren_state_entity] = "fire"
+        app.states["person.kristine"] = "home"
+        await _tick(app)
+        push = app.mobile_notifier.calls[-1]
+        self.assertEqual(push["test_audience"], ["kristine", "mikkel"])
+        self.assertEqual(app.episode_notified, ["mikkel"])  # NOT persisted by the repeat
+
+        app.states["person.kristine"] = "not_home"
+        app.last_push_at = FIXED_NOW - timedelta(seconds=121)
+        await _tick(app)
+        push2 = app.mobile_notifier.calls[-1]
+        self.assertEqual(push2["test_audience"], ["mikkel"])  # not resurrected
 
 
 class PushPayloadShape(_FrozenTimeTestCase):
@@ -1186,6 +1736,8 @@ class SelfTestSuppression(_FrozenTimeTestCase):
         # Fix 2: only the observed siren edge into self_test stamps last_self_test_at -
         # triggering the switch here is not itself confirmation the device actually ran it.
         app = _make_app(last_self_test_at=None)
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
         await app._run_self_test(FIXED_NOW)
         self.assertIsNone(app.last_self_test_at)
 
@@ -1269,6 +1821,26 @@ class FaultThrottle(_FrozenTimeTestCase):
         self.assertEqual(len(app.mobile_notifier.calls), 1)
         self.assertIn("battery_low", app.last_fault_push_at)
 
+    async def test_throttle_not_stamped_when_real_notifier_delivers_to_nobody(self):
+        """Fix 5: MobileNotifier.notify() returning 0 (delivered to nobody) must be
+        treated as a failure by _notify/the throttle - using the REAL notifier here
+        (not a fake) so a "resolved zero services" bug can't hide behind a mock that
+        always reports success."""
+        app = _make_app(last_self_test_at=FIXED_NOW - timedelta(days=1))
+        app.states[app.battery_entity] = "10"
+        app.mobile_notifier = _make_real_mobile_notifier(device_mapping={})
+        await app._check_faults(FIXED_NOW)
+        self.assertEqual(app.last_fault_push_at, {})
+
+    async def test_throttle_stamped_when_real_notifier_delivers(self):
+        app = _make_app(last_self_test_at=FIXED_NOW - timedelta(days=1))
+        app.states[app.battery_entity] = "10"
+        app.mobile_notifier = _make_real_mobile_notifier(
+            device_mapping={"mikkel": ["notify.mobile_app_mikkels_phone"]}
+        )
+        await app._check_faults(FIXED_NOW)
+        self.assertIn("battery_low", app.last_fault_push_at)
+
 
 class MonthlySelfTest(_FrozenTimeTestCase):
     """Fix 10: automatic monthly self-test only while nobody's home, retried daily through
@@ -1276,12 +1848,32 @@ class MonthlySelfTest(_FrozenTimeTestCase):
 
     async def test_runs_when_nobody_home(self):
         app = _make_app()
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
+        app.states["person.mikkel"] = "not_home"
+        app.states["person.kristine"] = "not_home"
+        app.states["person.claudia"] = "not_home"
         now = datetime(2026, 9, 1, 11, 0, tzinfo=timezone.utc)
         await app._maybe_run_monthly_test(now)
         self.assertIsNotNone(app.self_test_until)
         self.assertTrue(app.monthly_test_resolved)
         messages = [c["message"] for c in app.mobile_notifier.calls]
         self.assertTrue(any("self-test ran" in m for m in messages))
+
+    async def test_refused_when_presence_unknown_even_if_nobody_confirmed_home(self):
+        """Fix 1: unknown/unavailable presence counts as "home" for this gate - a
+        self-test sounds the siren, so an unclear reading must never read as "away"."""
+        app = _make_app()
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
+        app.states["person.kristine"] = "not_home"
+        app.states["person.claudia"] = "not_home"
+        # person.mikkel left unset - unknown/unavailable.
+        now = datetime(2026, 9, 1, 11, 0, tzinfo=timezone.utc)
+        await app._maybe_run_monthly_test(now)
+        self.assertIsNone(app.self_test_until)
+        self.assertFalse(app.monthly_test_resolved)
+        self.assertEqual(app.mobile_notifier.calls, [])
 
     async def test_skips_and_retries_while_someone_home(self):
         app = _make_app()
@@ -1312,6 +1904,11 @@ class MonthlySelfTest(_FrozenTimeTestCase):
 
     async def test_new_month_resets_resolution(self):
         app = _make_app(monthly_test_month_key="2026-08", monthly_test_resolved=True)
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
+        app.states["person.mikkel"] = "not_home"
+        app.states["person.kristine"] = "not_home"
+        app.states["person.claudia"] = "not_home"
         now = datetime(2026, 9, 1, 11, 0, tzinfo=timezone.utc)
         await app._maybe_run_monthly_test(now)
         self.assertEqual(app.monthly_test_month_key, "2026-09")
@@ -1358,6 +1955,19 @@ class PublishAttributes(_FrozenTimeTestCase):
         self.assertEqual(app.set_state.call_count, 1)
         await _tick(app)
         self.assertEqual(app.set_state.call_count, 1)
+
+    async def test_republishes_immediately_when_published_entity_missing(self):
+        """Fix 10: HA may lose our published entity (e.g. an HA-core restart wiped it
+        while AppDaemon kept running) - don't wait out the 5-minute heartbeat to notice."""
+        app = _make_app(phase="clear")
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
+        await _tick(app)
+        self.assertEqual(app.set_state.call_count, 1)
+
+        app.states[app.publish_entity] = None
+        await _tick(app)
+        self.assertEqual(app.set_state.call_count, 2)
 
     async def test_heartbeat_republishes_after_5_minutes_unchanged(self):
         app = _make_app(phase="clear")
@@ -1494,12 +2104,14 @@ class PersistenceRoundTrip(unittest.TestCase):
         app.last_fault_push_at = {"battery_low": app.since}
         app.light_snapshot = {"light.hallway_lights": {"state": "on", "brightness": 128}}
         app.light_snapshot_episode = "20260911201000"
+        app.light_restore_attempts = 2
         app.episode_notified = ["mikkel", "kristine"]
         app.last_clear_at = datetime(2026, 9, 11, 19, 40, tzinfo=timezone.utc)
         app.last_episode = {"episode_id": "20260911193000", "hush_count": 2}
         app.hush_limit_notified = True
         app.monthly_test_month_key = "2026-09"
         app.monthly_test_resolved = True
+        app.stale_alarm_notified = True
         app._save_state()
 
         reloaded = self._app(path)
@@ -1514,14 +2126,16 @@ class PersistenceRoundTrip(unittest.TestCase):
         self.assertEqual(reloaded.last_fault_push_at["battery_low"], app.since)
         self.assertEqual(reloaded.light_snapshot, app.light_snapshot)
         self.assertEqual(reloaded.light_snapshot_episode, "20260911201000")
+        self.assertEqual(reloaded.light_restore_attempts, 2)
         self.assertEqual(reloaded.episode_notified, ["mikkel", "kristine"])
         self.assertEqual(reloaded.last_clear_at, app.last_clear_at)
         self.assertEqual(reloaded.last_episode, app.last_episode)
         self.assertTrue(reloaded.hush_limit_notified)
         self.assertEqual(reloaded.monthly_test_month_key, "2026-09")
         self.assertTrue(reloaded.monthly_test_resolved)
-        # Transient fields never round-trip - always fresh on process start.
-        self.assertFalse(reloaded.stale_alarm_notified)
+        # Fix 9: stale_alarm_notified now persists (an AppDaemon restart mid-alarm must not
+        # repeat the once-only stale announcement) - unlike the truly transient fields below.
+        self.assertTrue(reloaded.stale_alarm_notified)
         self.assertIsNone(reloaded.smoke_fallback_since)
         self.assertFalse(reloaded.pre_alarm_stuck)
 
@@ -1539,6 +2153,8 @@ class PersistenceRoundTrip(unittest.TestCase):
         self.assertFalse(app.hush_limit_notified)
         self.assertIsNone(app.monthly_test_month_key)
         self.assertFalse(app.monthly_test_resolved)
+        self.assertEqual(app.light_restore_attempts, 0)
+        self.assertFalse(app.stale_alarm_notified)
 
     def test_save_leaves_no_tmp_file_behind(self):
         fd, path = tempfile.mkstemp(suffix=".json")
@@ -1566,12 +2182,14 @@ class PersistenceRoundTrip(unittest.TestCase):
         app.last_fault_push_at = {}
         app.light_snapshot = {}
         app.light_snapshot_episode = None
+        app.light_restore_attempts = 0
         app.episode_notified = None
         app.last_clear_at = None
         app.last_episode = None
         app.hush_limit_notified = False
         app.monthly_test_month_key = None
         app.monthly_test_resolved = False
+        app.stale_alarm_notified = False
         app._save_state()
         self.assertFalse(os.path.exists(path + ".tmp"))
 
