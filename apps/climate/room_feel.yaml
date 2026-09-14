@@ -101,14 +101,18 @@ RoomFeel:
       air_quality:
         aqi_entity: sensor.kitchen_smoke_alarm_aqi
         eco2_entity: sensor.kitchen_smoke_alarm_eco2
-      # Threshold/window UNVERIFIED - no calibration data available; tune once the box is
-      # reachable. Kitchen's FP300 is on the window frame by the island, later morning sun
-      # than dining's (memory: "dining leads the room by ~1h in the morning").
+      # Calibrated 2026-09-14 from 60 days of recorder data (2026-07-16..2026-09-14):
+      # excess = kitchen FP300 - median(living-room FP300, family Salus). Direct sun hits
+      # the window frame from mid-morning through mid-afternoon, not just early morning as
+      # first guessed - median excess crosses +0.5 C around 175-200 W/m2 and stays >0.5 C
+      # from 08:30 to 14:45 across the full span (narrows to ~09:15-14:15 in the most
+      # recent 30 days as the sun angle drops into autumn - if a housemate reports a false
+      # "sun_hit" miss in October, narrow this window rather than widen it).
       sun_hit:
         radiation_entity: sensor.gw2000a_solar_radiation
-        threshold_w_m2: 150
-        start: "07:30"
-        end: "10:00"
+        threshold_w_m2: 175
+        start: "08:30"
+        end: "15:00"
 
     dining_room:
       air_sources:
@@ -132,12 +136,16 @@ RoomFeel:
       air_quality:
         aqi_entity: sensor.kitchen_smoke_alarm_aqi
         eco2_entity: sensor.kitchen_smoke_alarm_eco2
-      # Threshold/window UNVERIFIED - see kitchen's note; dining leads by ~1h per memory.
+      # Calibrated 2026-09-14 from 60 days of recorder data (2026-07-16..2026-09-14) - see
+      # kitchen's note for method. Dining's FP300 leads kitchen's by ~45 min (confirms the
+      # "dining leads by ~1h" placement note); median excess crosses +0.5 C around the same
+      # 175-200 W/m2 and stays >0.5 C from 07:45 to 14:45, narrowing toward 09:15-14:00 in
+      # the most recent 30 days.
       sun_hit:
         radiation_entity: sensor.gw2000a_solar_radiation
-        threshold_w_m2: 150
-        start: "06:30"
-        end: "09:00"
+        threshold_w_m2: 175
+        start: "07:45"
+        end: "14:45"
 
     hallway:
       air_sources:
