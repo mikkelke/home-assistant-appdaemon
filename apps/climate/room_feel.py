@@ -22,13 +22,13 @@ Physical facts this fusion respects:
   - The kitchen Twinguard ceiling unit is a THIRD source for kitchen only, offset-corrected
     (it reads warm/dry vs the wall units) and never used alone.
   - kitchen/dining_room FP300s sit window-adjacent (sun/draft biased); when the rooftop
-    solar sensor is over threshold during that room's own morning window, that FP300 is
+    solar sensor is over threshold during that room's configured sun window, that FP300 is
     dropped from the median as long as another air source still reads.
 
 Publish contract: one direction, no consumers read this app's own output back in. Booleans
 (window_open/sun_hit/airing_helps/stale) are published as the literal strings "true"/"false"
 rather than Python bools - AppDaemon 4.5.13's set_state silently drops an attribute whose
-value is exactly False (see room_active.py's module docstring for the reference incident);
+value is exactly False;
 `sources`/`excluded`/`open_labels` use a ["<none>"] sentinel rather than [] for the same
 reason. Optional numeric attributes (floor_temp_c etc.) are still passed as plain None on a
 missing reading, matching bedroom_comfort.py's precedent - a real 0.0/None reading is rare
@@ -154,7 +154,7 @@ def airing_helps(indoor_dp_c, indoor_rh, outdoor_dp_c, margin_c, rh_min):
 
 def in_time_window(now_time, start_hms, end_hms):
     """Whether a plain datetime.time falls in [start_hms, end_hms) (\"HH:MM\" strings,
-    non-wrapping - every configured window here is a single morning span)."""
+    non-wrapping - every configured window here is a single daytime span)."""
     try:
         sh, sm = (int(x) for x in str(start_hms).split(":")[:2])
         eh, em = (int(x) for x in str(end_hms).split(":")[:2])
