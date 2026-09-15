@@ -1022,6 +1022,43 @@ class HushBehavior(_FrozenTimeTestCase):
         self.assertEqual(app.phase, "hushed")
         self.assertEqual(app.hushed_by, "the button on the alarm")
 
+    async def test_physical_hush_credits_pending_remote_requester(self):
+        # The siren edge is the device echoing the remote hush already in flight for this
+        # episode/generation - credit goes to that requester, not "the button".
+        app = _make_app(phase="alarm", episode_id="E1", generation=0, hush_count=0, last_siren="fire")
+        app.states[app.siren_state_entity] = "fire"
+        app.states[app.smoke_entity] = "on"
+        await app._hush(FIXED_NOW, "Mikkel")
+        self.assertEqual(app.phase, "alarm")
+
+        app.states[app.siren_state_entity] = "silenced"
+        app.states[app.smoke_entity] = "off"
+        await _tick(app)
+        self.assertEqual(app.phase, "hushed")
+        self.assertEqual(app.hushed_by, "Mikkel")
+        self.assertEqual(app.hush_count, 1)
+        self.assertIsNone(app.pending_hush)
+
+        # The original press's own confirmation timer must see nothing pending anymore
+        # and must not commit a second time.
+        await _confirm_pending_hush(app)
+        self.assertEqual(app.hush_count, 1)
+        self.assertEqual(app.hushed_by, "Mikkel")
+
+    async def test_physical_hush_with_stale_generation_pending_credits_button(self):
+        # A pending remote hush left over from an earlier generation of the same episode
+        # (a re-alarm/escalation happened before it confirmed) is stale, not the actor.
+        app = _make_app(
+            phase="alarm", episode_id="E1", generation=1, hush_count=0, last_siren="fire",
+            pending_hush={"requested_at": FIXED_NOW, "by": "OldRequester", "episode": "E1", "generation": 0},
+        )
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "silenced"
+        await _tick(app)
+        self.assertEqual(app.phase, "hushed")
+        self.assertEqual(app.hushed_by, "the button on the alarm")
+        self.assertEqual(app.hush_count, 1)
+
     async def test_siren_clear_while_alarming_is_not_inferred_hush(self):
         # "clear" is not "silenced" - must not misfire on any non-silenced reading.
         app = _make_app(phase="alarm", episode_id="E1", hush_count=0, last_siren="fire")

@@ -519,8 +519,19 @@ class FireSafety(hass.Hass):
             elif self.phase == "alarm":
                 if self._physical_hush_signal(prev_siren, siren):
                     # The device's own button already silenced it - confirmed by definition,
-                    # commit immediately without the remote send-stop-and-wait dance.
-                    await self._hush_locked(now, "the button on the alarm", physically_confirmed=True)
+                    # commit immediately without the remote send-stop-and-wait dance. A
+                    # matching in-flight remote hush is credited to its requester, not the
+                    # button that merely echoed it.
+                    pending = self.pending_hush
+                    if (
+                        pending is not None
+                        and pending.get("episode") == self.episode_id
+                        and pending.get("generation") == self.generation
+                    ):
+                        by_text = pending["by"]
+                    else:
+                        by_text = "the button on the alarm"
+                    await self._hush_locked(now, by_text, physically_confirmed=True)
                 elif smoke == "off":
                     self.off_since = self.off_since or now
                     if (now - self.off_since) >= timedelta(seconds=self.cooldown_confirm_s):
