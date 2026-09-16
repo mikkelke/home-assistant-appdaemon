@@ -79,9 +79,16 @@ def make_finish_app(
     restored_uncorroborated=False,
     now=NOW,
     start=START,
+    anti_crease_tail_since=None,
+    app_started_at=None,
+    start_time_source=None,
 ):
     """A Running (or Unemptied) WasherMonitor wired so the real finish/door/reconcile logic runs;
-    only leaves (feedback save, classify, programme resolve, notifiers) are faked."""
+    only leaves (feedback save, classify, programme resolve, notifiers) are faked.
+
+    anti_crease_tail_since / app_started_at / start_time_source drive the anti-crease tail
+    floor (see _trusted_anti_crease_tail_since); the defaults leave it inert. app_started_at
+    None means "this boot is now"."""
     app = wm.WasherMonitor.__new__(wm.WasherMonitor)
     app.args = {}
     app.now = now
@@ -124,6 +131,17 @@ def make_finish_app(
     app.tail_pattern_cycle_seconds = None
     app.tail_pattern_last_pulse_at = None
     app.tail_pattern_locked_at = None
+    # ---- anti-crease tail floor (test_washer_dwell_finish_anchor.py) ----
+    app._anti_crease_tail_since = anti_crease_tail_since
+    app._app_started_at = app_started_at if app_started_at is not None else now
+    app._start_time_source = start_time_source
+    # Power-pattern finish gate + energy-history end estimate knobs (washer.yaml values) -
+    # only reached by end reasons that don't skip the gate / by a non-empty energy history.
+    app.finish_power_gate_max_mean_w = 45.0
+    app.finish_power_gate_max_peak_w = 120.0
+    app.finish_power_gate_off_max_mean_w = 12.0
+    app.finish_power_gate_off_max_peak_w = 25.0
+    app.energy_active_watts = 100.0
 
     # ---- Phase-1 attributes under test ----
     app.last_high_energy_at = last_high_energy_at

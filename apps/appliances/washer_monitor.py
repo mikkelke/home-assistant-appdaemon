@@ -331,6 +331,10 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 lambda: cystore.format_utc(self.in_finishing_tail_entered_at)
                 if self.in_finishing_tail_entered_at else ""
             ),
+            "anti_crease_tail_since": (
+                lambda: cystore.format_utc(self._anti_crease_tail_since)
+                if self._anti_crease_tail_since else ""
+            ),
             "last_tail_pulse_at": (
                 lambda: cystore.format_utc(self.last_tail_pulse_at) if self.last_tail_pulse_at else ""
             ),
@@ -481,6 +485,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.program_timer = None
         self.start_time = None
         self._start_time_source = None  # provenance of self.start_time - see _START_TIME_SOURCE_RANK / _start_time_rank()
+        self._app_started_at = self._now_utc()  # UTC of this boot - see _trusted_anti_crease_tail_since
         self._cycle_actor = None  # Who started the current cycle - see _attribute() / ActorAttribution app
         self._last_saved_record_ts = None  # ts of the last-saved feedback record - see _patch_cycle_record
         self.energy_start = None
@@ -562,6 +567,11 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.tail_pattern_break_confirm_seconds = float(self.args.get("tail_pattern_break_confirm_seconds", 18.0))
         self.in_finishing_tail = False  # True when tail pattern or energy-stable detected; transition when tail-pulse timeout
         self.in_finishing_tail_entered_at = None
+        # UTC of the first tick this cycle on which the anti-crease tail pattern was confirmed
+        # (_check_energy_finish) - live evidence of the finish that, unlike last_high_energy_at,
+        # does not go stale across a sub-energy_active_watts dwell phase. Latched per cycle and
+        # persisted; read only through _trusted_anti_crease_tail_since.
+        self._anti_crease_tail_since = None
         self.last_tail_pulse_at = None  # Last time power went above _tail_pulse_reset_threshold_watts while in FinishingTail
         self.tail_pattern_locked = False
         self.tail_pattern_cycle_seconds = None
@@ -1262,9 +1272,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
     def _finalize_restored_cycle_identity(self, store_data):
         """Resolve _cycle_id / notification_sent - and the store-only per-cycle counters
         _restore_running_state never reads (heating_phase_count, max_power_seen,
-        finish_confirmed, in_finishing_tail and its tail-pulse/tail-pattern fields,
-        door_opened_during_cycle) - once start_time is finally settled, right after
-        _restore_running_state returns.
+        finish_confirmed, in_finishing_tail and its tail-pulse/tail-pattern fields, the
+        anti-crease tail stamp, door_opened_during_cycle) - once start_time is finally settled,
+        right after _restore_running_state returns.
 
         store_data is the durable-store payload IF this boot restored from it, else None
         (AD-reload, helper-seed+inference, or the legacy power-is-truth recovery - none of
@@ -1287,6 +1297,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.finish_confirmed = bool(store_data.get("finish_confirmed"))
             self.in_finishing_tail = bool(store_data.get("in_finishing_tail"))
             self.in_finishing_tail_entered_at = cystore.parse_utc(store_data.get("in_finishing_tail_entered_at"))
+            self._anti_crease_tail_since = cystore.parse_utc(store_data.get("anti_crease_tail_since"))
             self.last_tail_pulse_at = cystore.parse_utc(store_data.get("last_tail_pulse_at"))
             self.tail_pattern_locked = bool(store_data.get("tail_pattern_locked"))
             self.tail_pattern_cycle_seconds = store_data.get("tail_pattern_cycle_seconds")
@@ -2521,12 +2532,37 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.log(f"Finish door-route check failed: {e}", level="DEBUG")
             return False
 
+    def _trusted_anti_crease_tail_since(self):
+        """_anti_crease_tail_since when it is live evidence rather than a restore artifact:
+        trusted while start_time itself is live-observed ("live" / "door_close_trusted"), or
+        when the stamp predates this boot (it came back from the durable store, so it was
+        observed before any restore uncertainty could apply). None otherwise. getattr
+        throughout - see _start_time_rank for why a bare attribute read is unsafe here."""
+        stamp = getattr(self, "_anti_crease_tail_since", None)
+        if stamp is None:
+            return None
+        if getattr(self, "_start_time_source", None) in ("live", "door_close_trusted"):
+            return stamp
+        app_started_at = getattr(self, "_app_started_at", None)
+        if app_started_at is not None and stamp <= app_started_at:
+            return stamp
+        return None
+
     def _finish_detection_latency_minutes(self) -> float:
-        """Minutes between when the wash actually finished (the finish anchor) and now - how
-        late this finish was detected. Feeds the announce freshness gate (FIX 3). 0.0 on any
-        problem, so a broken clock never suppresses a real announcement."""
+        """Minutes between when the wash actually finished and now - how late this finish was
+        detected. Feeds the announce freshness gate (FIX 3). _finish_anchor() is deliberately
+        early (last_high_energy_at only moves on samples above energy_active_watts, so a long
+        sub-threshold dwell phase leaves it hours behind the real end - the safe side for the
+        door-edge lookback, but for freshness it turns an on-time detection into a false late
+        push), so a trusted anti-crease tail observation floors it here. The reconcile override
+        (D1) is never floored: _finish_anchor_override must keep that path off Sonos. 0.0 on
+        any problem, so a broken clock never suppresses a real announcement."""
         try:
             anchor = self._finish_anchor()
+            if anchor and getattr(self, "_finish_anchor_override", None) is None:
+                trusted_stamp = self._trusted_anti_crease_tail_since()
+                if trusted_stamp is not None:
+                    anchor = max(anchor, trusted_stamp)
             return (self._now_utc() - anchor).total_seconds() / 60 if anchor else 0.0
         except Exception:
             return 0.0
@@ -2870,6 +2906,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.door_opened_time = None
             self.in_finishing_tail = False
             self.in_finishing_tail_entered_at = None
+            self._anti_crease_tail_since = None
             self.last_tail_pulse_at = None
             self.tail_pattern_locked = False
             self.tail_pattern_cycle_seconds = None
@@ -3160,6 +3197,22 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             pass
         return None
 
+    def _floor_cycle_end_at_anti_crease_tail(self, end, pfx=""):
+        """Floor an energy-derived cycle-end estimate at the trusted anti-crease tail
+        observation. Both estimates in _correct_duration key off the last sample above
+        energy_active_watts, which a long sub-threshold dwell phase (e.g. Eco) leaves hours
+        before the real end; the tail was seen live, so the programme ran until shortly before
+        that moment."""
+        stamp = self._trusted_anti_crease_tail_since()
+        if end is None or stamp is None or stamp <= end:
+            return end
+        self.log(
+            f"{pfx}Cycle end from energy history {self._strftime_local(end)} predates the "
+            f"anti-crease tail seen at {self._strftime_local(stamp)} - using the tail as cycle end",
+            level="INFO",
+        )
+        return stamp
+
     def _correct_duration(self, run_minutes_wall: float, log_prefix: str = "") -> tuple:
         """Correct wall-clock run duration using user cycle end time or HA history.
 
@@ -3197,6 +3250,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             duration_hint = self._get_programme_duration_hint_for_history()
             actual_end = self._estimate_cycle_end_from_history(expected_duration_min=duration_hint)
             if actual_end is not None and self.start_time is not None:
+                actual_end = self._floor_cycle_end_at_anti_crease_tail(actual_end, pfx)
                 run_minutes_actual = (actual_end - self.start_time).total_seconds() / 60
                 if run_minutes_actual >= self.min_cycle_minutes and run_minutes_actual <= run_minutes:
                     delta = run_minutes - run_minutes_actual
@@ -3210,7 +3264,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                     run_minutes = run_minutes_actual
                     duration_source = "history_corrected"
             elif self.start_time is not None and self.last_high_energy_at is not None:
-                estimated_end = self.last_high_energy_at + timedelta(minutes=2)
+                estimated_end = self._floor_cycle_end_at_anti_crease_tail(
+                    self.last_high_energy_at + timedelta(minutes=2), pfx
+                )
                 if estimated_end <= self._now_utc():
                     run_minutes_actual = (estimated_end - self.start_time).total_seconds() / 60
                     if run_minutes_actual >= self.min_cycle_minutes and run_minutes_actual <= run_minutes:
@@ -3358,6 +3414,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.low_power_start_time = None
         self.energy_stable_start_time = None
         self.last_high_energy_at = now
+        self._anti_crease_tail_since = None
         self._zero_power_since = None
         # Reset so we can announce when the cycle truly finishes (the previous was a false finish).
         self.notification_sent = False
@@ -3974,6 +4031,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self._live_class_since = None
         self.in_finishing_tail = False
         self.in_finishing_tail_entered_at = None
+        self._anti_crease_tail_since = None
         self.last_tail_pulse_at = None
         self.door_fast_start_armed_until = None
         self._delay_plateau_start = None
@@ -4324,6 +4382,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.state = "Running"
         self.in_finishing_tail = False
         self.in_finishing_tail_entered_at = None
+        self._anti_crease_tail_since = None
         self.last_tail_pulse_at = None
         # Reset all per-cycle counters so stale data from a previous cycle never bleeds through.
         self.max_power_seen = 0.0
@@ -6698,6 +6757,8 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 elif self._meets_finish_time_guards(run_min, guard_dur or 0) and self._is_post_end_tail_window(run_min, guard_dur, _tick_prog) and not self._recent_true_activity_block():
                     tail_ok, tail_mean, tail_std, tail_peak = self._detect_anti_crease_pattern()
                     if tail_ok:
+                        if self._anti_crease_tail_since is None:
+                            self._anti_crease_tail_since = now
                         if (
                             self.anti_crease_announce_past_expected
                             and guard_dur
