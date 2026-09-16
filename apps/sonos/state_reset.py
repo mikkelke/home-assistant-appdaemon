@@ -578,10 +578,24 @@ class SonosStateReset(hass.Hass):
             self._clear_inactive_since(entity)
             return
 
-        # Prevent auto-reset if a manual reset is in progress. Leave the anchor in place: a later
-        # re-arm (post-reset group_change) re-evaluates against the real elapsed time.
+        # Defer auto-reset if another reset is in progress - do not drop it. A concurrent reset can
+        # legitimately overlap this timer's expiry (e.g. two speakers idle out within the same
+        # minute); without a re-arm here the entity falls out of _inactivity_timers with nothing
+        # left to re-add it (only a play/pause transition does), so it would never reset again
+        # until someone plays music there. Bounded by RESET_WEDGE_TIMEOUT_S: if _reset_in_progress
+        # ever wedges true, that guard clears it and this retry loop then succeeds.
         if self._reset_in_progress:
-            self.log(f"Reset already in progress - skipping auto-reset for {entity}", level="DEBUG")
+            self.log(f"Reset already in progress - deferring auto-reset for {entity}", level="INFO")
+            if entity in self._inactivity_timers:
+                del self._inactivity_timers[entity]
+            current_gen = self._inactivity_generation.get(entity, 0)
+            self._inactivity_timers[entity] = self.run_in(
+                self._auto_reset,
+                self._min_reset_delay,
+                entity=entity,
+                state=state,
+                gen=current_gen,
+            )
             return
 
         self.log(f"Auto-reset triggered for {entity} after {self.inactivity_sec}s inactivity window (state={state})", level="INFO")
