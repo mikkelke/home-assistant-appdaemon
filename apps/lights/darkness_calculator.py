@@ -18,7 +18,10 @@ The whole decision, per zone (4 rules + asymmetric holds):
                                                          the lamp cannot feed back)
      ... but indoor daylight < indoor_min_bright * indoor_dark_fraction -> DARK
          (bright sky, dim room: blinds closed or sun not on this facade)
-  otherwise                                   -> hold current state (true hysteresis)
+  otherwise (outdoor in the hold band)        -> the room's own meters decide: lamp-corrected
+                                                  daylight >= indoor_min_bright * indoor_band_bright_factor
+                                                  -> BRIGHT; raw indoor < indoor_min_bright *
+                                                  indoor_band_dark_fraction -> DARK; between -> hold
 
 Anti-flap:
   - Outdoor lux is a rolling median over ``outdoor_smoothing_seconds`` (~10 min):
@@ -125,6 +128,16 @@ class DarknessCalculator(hass.Hass):
         self.room_state_helpers = a.get("room_state_helpers") or {}
 
         self.zones = a.get("zones", {})
+
+        # Inside the band the room may also demote to DARK. The vote reads the RAW indoor
+        # mean (lamp offset not subtracted): a lamp can neither prove bright nor help prove dark.
+        self.indoor_band_dark_fraction = float(a.get("indoor_band_dark_fraction", 0.6))
+        for _z, _zc in self.zones.items():
+            _bf = float(_zc.get("indoor_band_bright_factor", self.indoor_band_bright_factor))
+            _df = float(_zc.get("indoor_band_dark_fraction", self.indoor_band_dark_fraction))
+            if _df > 0 and _bf > 0 and _bf <= _df:
+                self.log(f"[{_z}] indoor_band_bright_factor {_bf:g} <= indoor_band_dark_fraction {_df:g}: "
+                         f"votes overlap, BRIGHT wins", level="WARNING")
 
         # Caches (event-fed; the periodic recompute re-pulls as a safety net)
         self._indoor = {}            # sensor entity -> float lux
@@ -465,19 +478,27 @@ class DarknessCalculator(hass.Hass):
                 f"{indoor_dark_floor:.0f}-{indoor_min:.0f}lx band - holding"
             )
 
-        # Outdoor is in the hold band. The sky gate is least trustworthy exactly here (low sun
-        # on a horizontal pyranometer), so give the room's own meters the casting vote when
-        # they are clearly above the bar. Lamp light is already subtracted by _zone_daylight,
-        # so this cannot latch on its own lamps.
+        # Outdoor is in the hold band, where the sky gate is least trustworthy (low sun on a
+        # horizontal pyranometer), so the room's own meters decide in both directions. BRIGHT
+        # needs lamp-corrected daylight well above the bar; DARK needs the RAW indoor mean under
+        # the floor, so a lamp's offset can never manufacture a dark room. Between: hold.
         band_daylight = self._zone_daylight(zone)
         band_indoor_min = float(zcfg.get("indoor_min_bright", 0))
-        band_factor = float(zcfg.get("indoor_band_bright_factor", self.indoor_band_bright_factor))
-        if band_daylight is not None and band_indoor_min > 0 and band_factor > 0:
+        if band_daylight is not None and band_indoor_min > 0:
+            band_factor = float(zcfg.get("indoor_band_bright_factor", self.indoor_band_bright_factor))
             band_bar = band_indoor_min * band_factor
-            if band_daylight >= band_bar:
+            if band_factor > 0 and band_daylight >= band_bar:
                 return BRIGHT, (
                     f"outdoor {out:.0f}lx in {outdoor_dark:.0f}-{outdoor_bright:.0f}lx band, "
                     f"but indoor daylight {band_daylight:.0f}lx >= {band_bar:.0f}lx (room decides)"
+                )
+            band_dark_fraction = float(zcfg.get("indoor_band_dark_fraction", self.indoor_band_dark_fraction))
+            band_floor = band_indoor_min * band_dark_fraction
+            band_raw = self._zone_indoor(zone)
+            if band_dark_fraction > 0 and band_raw is not None and band_raw < band_floor:
+                return DARK, (
+                    f"outdoor {out:.0f}lx in {outdoor_dark:.0f}-{outdoor_bright:.0f}lx band, "
+                    f"but indoor {band_raw:.0f}lx < {band_floor:.0f}lx (room decides)"
                 )
         return None, f"outdoor {out:.0f}lx in {outdoor_dark:.0f}-{outdoor_bright:.0f}lx band - holding"
 

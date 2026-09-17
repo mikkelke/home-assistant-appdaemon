@@ -57,7 +57,8 @@ def make_app(states=None, attrs=None, args=None):
     app.timer_running = lambda handle: False
     app.cancel_timer = lambda handle: None
 
-    app.log = lambda *a, **kw: None
+    app.log_calls = []
+    app.log = lambda msg, *a, **kw: app.log_calls.append((msg, kw))
     app.set_state_calls = []
     app.set_state = lambda entity, **kw: app.set_state_calls.append((entity, kw))
 
@@ -171,10 +172,6 @@ class RoomStateAlwaysIncludesState(unittest.TestCase):
         self.assertEqual(second[-1][1].get("state"), "Empty (Dark)")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 # Real-shaped zone (the family room's live numbers) so _decide runs its actual branches
 # rather than the always_dark short-circuit the older tests use.
 BAND_ZONE = {
@@ -187,18 +184,26 @@ BAND_ZONE = {
 }
 
 
-def make_band_app(outdoor_lux, indoor_daylight, factor=None):
-    """App whose only live inputs are the smoothed outdoor lux and the zone's indoor daylight.
-    _gloomy and the sun gate are neutralised so the outdoor-band branch is what is under test."""
+def make_band_app(outdoor_lux, indoor_daylight, factor=None, raw=None, dark_fraction=None,
+                   gloomy=(False, ""), extra_args=None):
+    """App whose only live inputs are the smoothed outdoor lux and the zone's indoor
+    daylight/raw lux. _gloomy and the sun gate are neutralised so the outdoor-band branch is
+    what is under test. ``raw`` (the lamp-uncorrected indoor mean fed to the DARK vote)
+    defaults to ``indoor_daylight`` when not given, so existing calls are unaffected."""
     args = {"zones": dict(BAND_ZONE)}
     if factor is not None:
         args["indoor_band_bright_factor"] = factor
+    if dark_fraction is not None:
+        args["indoor_band_dark_fraction"] = dark_fraction
+    if extra_args:
+        args.update(extra_args)
     app = make_app(args=args)
     app._sun_elevation = lambda: 30.0          # well clear of the dusk cut-off
     app._outdoor_smoothed = lambda: outdoor_lux
     app._outdoor_valid = lambda: True
-    app._gloomy = lambda out=None, elev=None: (False, "")
+    app._gloomy = lambda out=None, elev=None: gloomy
     app._zone_daylight = lambda zone: indoor_daylight
+    app._zone_indoor = lambda zone: indoor_daylight if raw is None else raw
     return app
 
 
@@ -207,7 +212,13 @@ class OutdoorBandRoomDecides(unittest.TestCase):
     2500-8000 hold band - so the zone stayed DARK from the night and every family-room lamp
     came on, while the room's own meters measured 500-650lx against a 280lx bar. The sky gate
     is least trustworthy exactly there (a horizontal pyranometer collapses with a low sun), so
-    a room that is clearly bright gets the casting vote."""
+    a room that is clearly bright gets the casting vote.
+
+    The mirror-image incident (2026-09): a cloudy dusk sat at 95-166lx - well under the
+    family room's 168lx dark floor - for 40+ minutes while the sky sensor lingered in-band
+    and the zone stayed "bright" from earlier in the day. The band vote now also lets a
+    clearly dark room demote to DARK, reading the RAW indoor mean (not lamp-corrected) so a
+    lamp cannot help manufacture a dark reading."""
 
     def _decide(self, app):
         return app._decide("familyish")
@@ -222,10 +233,10 @@ class OutdoorBandRoomDecides(unittest.TestCase):
         target, _ = self._decide(make_band_app(3037, 300))
         self.assertIsNone(target)
 
-    def test_band_with_dark_room_still_holds(self):
+    def test_band_with_dark_room_goes_dark(self):
         target, reason = self._decide(make_band_app(3037, 50))
-        self.assertIsNone(target)
-        self.assertIn("holding", reason)
+        self.assertEqual(target, dc.DARK)
+        self.assertIn("room decides", reason)
 
     def test_below_dark_threshold_is_untouched(self):
         """A genuinely dark sky must still win regardless of the indoor reading."""
@@ -241,3 +252,172 @@ class OutdoorBandRoomDecides(unittest.TestCase):
         target, reason = app._decide("familyish")
         self.assertIsNone(target)
         self.assertIn("holding", reason)
+
+    def test_incident_replay_cloudy_dusk_goes_dark(self):
+        """The actual 2026-09 incident numbers: outdoor 3029lx (in-band), indoor 99.7lx."""
+        target, reason = self._decide(make_band_app(3029, 99.7))
+        self.assertEqual(target, dc.DARK)
+        self.assertIn("room decides", reason)
+
+    # Boundary tests at indoor_min_bright=280: dark floor 280*0.6=168, bright bar 280*1.5=420.
+    def test_boundary_just_under_dark_floor_is_dark(self):
+        target, reason = self._decide(make_band_app(3037, 167.9))
+        self.assertEqual(target, dc.DARK)
+        self.assertIn("room decides", reason)
+
+    def test_boundary_at_dark_floor_holds(self):
+        target, _ = self._decide(make_band_app(3037, 168.0))
+        self.assertIsNone(target)
+
+    def test_boundary_mid_band_holds(self):
+        target, _ = self._decide(make_band_app(3037, 300))
+        self.assertIsNone(target)
+
+    def test_boundary_just_under_bright_bar_holds(self):
+        target, _ = self._decide(make_band_app(3037, 419.9))
+        self.assertIsNone(target)
+
+    def test_boundary_at_bright_bar_is_bright(self):
+        target, reason = self._decide(make_band_app(3037, 420.0))
+        self.assertEqual(target, dc.BRIGHT)
+        self.assertIn("room decides", reason)
+
+    # Outdoor-endpoint inclusivity: the hold band is [outdoor_dark, outdoor_bright] - both
+    # ends belong to the band vote, not to the strict outdoor_dark/outdoor_bright rules.
+    def test_outdoor_at_dark_edge_with_dim_room_goes_dark_via_band(self):
+        target, reason = self._decide(make_band_app(2500, 50))
+        self.assertEqual(target, dc.DARK)
+        self.assertIn("room decides", reason)
+
+    def test_outdoor_at_bright_edge_with_dim_room_goes_dark_via_band(self):
+        target, reason = self._decide(make_band_app(8000, 50))
+        self.assertEqual(target, dc.DARK)
+        self.assertIn("room decides", reason)
+
+    def test_outdoor_just_above_bright_edge_with_dim_room_uses_existing_facade_rule(self):
+        """Regression check: just past outdoor_bright is a different branch (the
+        indoor_dark_fraction facade check) and must keep working unchanged."""
+        target, reason = self._decide(make_band_app(8001, 50))
+        self.assertEqual(target, dc.DARK)
+        self.assertIn("blinds/facade", reason)
+
+    # Disabled votes: each fraction independently gates its own half of the vote.
+    def test_bright_vote_disabled_dark_floor_still_fires(self):
+        target, reason = self._decide(make_band_app(3037, 50, factor=0))
+        self.assertEqual(target, dc.DARK)
+        self.assertIn("room decides", reason)
+
+    def test_dark_vote_disabled_holds(self):
+        target, reason = self._decide(make_band_app(3037, 50, dark_fraction=0))
+        self.assertIsNone(target)
+        self.assertIn("holding", reason)
+
+    def test_missing_sun_elevation_still_allows_dark_vote(self):
+        """The DARK vote must not require a known sun elevation."""
+        app = make_band_app(3037, 50)
+        app._sun_elevation = lambda: None
+        target, reason = self._decide(app)
+        self.assertEqual(target, dc.DARK)
+        self.assertIn("room decides", reason)
+
+    def test_gloomy_dark_rule_takes_precedence_over_band_vote(self):
+        """Gloomy raises outdoor_dark itself (rule 3, evaluated before the band code is
+        even reached) - it must win over the band vote, not merge with it."""
+        app = make_band_app(
+            3037, 900,
+            gloomy=(True, "overcast"),
+            extra_args={"gloomy_dark_multiplier": 2.2},
+        )
+        target, reason = self._decide(app)
+        self.assertEqual(target, dc.DARK)
+        self.assertIn("[gloomy: overcast]", reason)
+        self.assertNotIn("room decides", reason)
+
+
+LAMP_BAND_ZONE = {
+    "lampish": {
+        "sensors": ["sensor.lampish_illuminance"],
+        "outdoor_dark": 2500,
+        "outdoor_bright": 8000,
+        "indoor_min_bright": 280,
+        "lights": ["light.lampish_light"],
+        "light_on_lux_offset": 120,
+    }
+}
+
+
+def make_lamp_band_app(outdoor_lux, raw_lux, light_on):
+    """Like make_band_app, but drives the REAL _zone_daylight/_zone_indoor from a cached
+    sensor reading and a light's on/off state, to prove the DARK vote reads _zone_indoor
+    (raw) rather than _zone_daylight (lamp-corrected)."""
+    states = {"light.lampish_light": "on" if light_on else "off"}
+    app = make_app(args={"zones": dict(LAMP_BAND_ZONE)}, states=states)
+    app._indoor["sensor.lampish_illuminance"] = raw_lux
+    app._sun_elevation = lambda: 30.0
+    app._outdoor_smoothed = lambda: outdoor_lux
+    app._outdoor_valid = lambda: True
+    app._gloomy = lambda out=None, elev=None: (False, "")
+    return app
+
+
+class OutdoorBandDarkVoteUsesRawIndoor(unittest.TestCase):
+    """The DARK vote must read the lamp-uncorrected indoor mean: a lamp's own contribution
+    may never help manufacture a "dark" reading."""
+
+    def test_light_off_dim_room_goes_dark(self):
+        app = make_lamp_band_app(3037, 50, light_on=False)
+        target, reason = app._decide("lampish")
+        self.assertEqual(target, dc.DARK)
+        self.assertIn("room decides", reason)
+
+    def test_light_on_lamp_corrected_daylight_low_but_raw_not_low_holds(self):
+        """raw=200 is above the 168lx dark floor; only the lamp-corrected daylight (80,
+        after subtracting the 120lx offset) is low. Must NOT go dark from this vote."""
+        app = make_lamp_band_app(3037, 200, light_on=True)
+        target, reason = app._decide("lampish")
+        self.assertIsNone(target)
+        self.assertIn("holding", reason)
+
+
+OVERLAP_ZONE = {
+    "overlapish": {
+        "sensors": ["sensor.overlapish_illuminance"],
+        "outdoor_dark": 2500,
+        "outdoor_bright": 8000,
+        "indoor_min_bright": 280,
+        "indoor_band_bright_factor": 0.5,
+        "indoor_band_dark_fraction": 0.6,
+    }
+}
+
+
+class IndoorBandOverlapWarning(unittest.TestCase):
+    """indoor_band_bright_factor <= indoor_band_dark_fraction means the two vote thresholds
+    overlap or invert (the "dark floor" would sit at or above the "bright bar"); this is a
+    misconfiguration, flagged at init rather than silently misclassifying."""
+
+    def test_overlap_logs_warning_at_init(self):
+        app = make_app(args={"zones": dict(OVERLAP_ZONE)})
+        warnings = [msg for msg, kw in app.log_calls if kw.get("level") == "WARNING"]
+        self.assertTrue(
+            any("overlapish" in msg and "votes overlap" in msg for msg in warnings),
+            warnings,
+        )
+
+    def test_overlap_bright_wins_over_dark_in_the_gap(self):
+        """bright_factor 0.5 -> bar 140; dark_fraction 0.6 -> floor 168; indoor 150 sits in
+        the inverted gap where both could theoretically fire - BRIGHT is checked first."""
+        app = make_app(args={"zones": dict(OVERLAP_ZONE)})
+        app._sun_elevation = lambda: 30.0
+        app._outdoor_smoothed = lambda: 3037
+        app._outdoor_valid = lambda: True
+        app._gloomy = lambda out=None, elev=None: (False, "")
+        app._zone_daylight = lambda zone: 150
+        app._zone_indoor = lambda zone: 150
+        target, reason = app._decide("overlapish")
+        self.assertEqual(target, dc.BRIGHT)
+        self.assertIn("room decides", reason)
+
+
+if __name__ == "__main__":
+    unittest.main()

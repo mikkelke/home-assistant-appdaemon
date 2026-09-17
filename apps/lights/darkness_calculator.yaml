@@ -50,6 +50,11 @@ darkness_calculator:
   rain_hold_multiplier: 2.0            # stretch dark->bright while raining / shortly after
   rain_grace_seconds: 1800
   indoor_dark_fraction: 0.6            # daylight < indoor_min_bright*0.6 under a bright sky -> DARK (blinds/facade)
+  # Inside the outdoor hold band the room's own meters decide both ways (per-zone override):
+  # lamp-corrected daylight >= indoor_min_bright x bright_factor -> BRIGHT; RAW indoor lux
+  # (lamp light not subtracted, so a lamp can never help prove dark) < indoor_min_bright x
+  # dark_fraction -> DARK; between -> hold. 0 disables a vote.
+  indoor_band_dark_fraction: 0.6
 
   # Gloomy sky — GLOBAL mechanism (one sky for the whole apartment).
   # gloomy = raining/recently rained OR heavy overcast (sun >= 20 deg yet outdoor
