@@ -187,6 +187,38 @@ class SleepPredatingSessionStillGoesIslandOnly(unittest.TestCase):
         assert_no_errors(self, app)
 
 
+class RestartMidSessionRecoversSessionStart(unittest.TestCase):
+    """App restarted mid-session: no recorded session start, but the presenting room has been
+    on since before the sleep boolean flipped. The start must be recovered from the room's
+    last_changed, not stamped "now" (which would route to island-only on the person sitting
+    there)."""
+
+    def test_room_on_since_before_sleep_flip_preserves_lighting(self):
+        states = base_states(
+            kristine_sleep_last_changed=SESSION_START + timedelta(minutes=60),
+            other_lights_on=True,
+        )
+        states[DPIR]["last_changed"] = iso(SESSION_START)
+        app = make_app(states, presence_session_started_at=None)
+
+        context, action = decide(app)
+
+        self.assertEqual(app._presence_session_started_at, SESSION_START.timestamp())
+        self.assertTrue(app._sleep_activated_during_presence)
+        self.assertNotEqual(action["action"], "turn_on_island_only")
+        assert_no_errors(self, app)
+
+    def test_room_without_last_changed_falls_back_to_now(self):
+        states = base_states(kristine_sleep_last_changed=SESSION_START - timedelta(seconds=600))
+        app = make_app(states, presence_session_started_at=None)
+
+        context, action = decide(app)
+
+        self.assertGreater(app._presence_session_started_at, SESSION_START.timestamp())
+        self.assertEqual(action["action"], "turn_on_island_only")
+        assert_no_errors(self, app)
+
+
 class PresenceLostResetsSessionAndLatch(unittest.TestCase):
     """(c) Losing presence must clear both the latch and the session-start timestamp, so
     the next presence session starts from a clean slate."""

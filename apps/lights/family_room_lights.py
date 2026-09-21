@@ -432,7 +432,7 @@ class FamilyRoomLights(hass.Hass):
             room = kwargs.get("room", "unknown")
             self.log(f"Family room: PIR on in {room} - immediate evaluation", level="INFO")
             if getattr(self, "_presence_session_started_at", None) is None:
-                self._presence_session_started_at = time.time()
+                self._presence_session_started_at = self._infer_presence_session_start()
             self._schedule_evaluation(immediate=True)
         except Exception as e:
             self.log(f"Error in PIR on handler: {e}", level="ERROR")
@@ -583,6 +583,25 @@ class FamilyRoomLights(hass.Hass):
                 'people_home': [],
                 'people_sleeping': []
             }
+
+    def _infer_presence_session_start(self):
+        """Epoch start for a presence session with no recorded start: the earliest
+        ``last_changed`` among family-zone rooms currently on, else now. A room that is already
+        on predates this call (app restart mid-session, missed PIR-on edge), and stamping "now"
+        would make a sleep boolean that flipped on during the session look like it predates it.
+        """
+        now = time.time()
+        earliest = now
+        for room in self._family_presence_rooms_on():
+            try:
+                last_changed = self.get_state(
+                    self._family_presence_sensors[room], attribute="last_changed"
+                )
+                changed_at = datetime.datetime.fromisoformat(str(last_changed)).timestamp()
+            except (ValueError, TypeError):
+                continue
+            earliest = min(earliest, changed_at)
+        return earliest
 
     def _sleep_started_during_presence_session(self, sleep_status):
         """True if a currently-sleeping person's sleep-mode boolean flipped on at/after the
@@ -1426,7 +1445,7 @@ class FamilyRoomLights(hass.Hass):
         if context['family_presence'] and getattr(self, "_presence_session_started_at", None) is None:
             # Covers boot / missed PIR-on edges: presence is already true here but no
             # session start was recorded (e.g. app restarted mid-session).
-            self._presence_session_started_at = time.time()
+            self._presence_session_started_at = self._infer_presence_session_start()
         # presence_trust: ghost presence (kitchen mmWave-only + speaker playing)
         # must never auto-on, but still counts as presence for the off-hold.
         context['presence_suspect_only'] = self._presence_suspect_only(rooms_on)
