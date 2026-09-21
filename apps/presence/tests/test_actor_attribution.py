@@ -53,6 +53,8 @@ def make_app(person_entities=None, door_entity="binary_sensor.apartment_door_ope
     app._door_state = door_state
     app._snapshot_log = ()
     app._door_events = ()
+    app._user_id_to_person = {}
+    app.user_id_overrides = {}
 
     app.log_calls = []
     app.log = lambda *a, **kw: app.log_calls.append((a, kw))
@@ -306,6 +308,197 @@ class DoorGuardHealthNoteTests(unittest.TestCase):
         self.assertNotIn("reason_note", result)
 
 
+class DashboardActionAttributionTests(unittest.TestCase):
+    """_by_dashboard_action: a dashboard-issued action's context.user_id resolves
+    straight to a person and BYPASSES the sole-occupancy gate entirely - the whole point
+    is that it must work even when the seven-rule table would otherwise refuse
+    (multi_occupant here included)."""
+
+    def test_resolves_mapped_id_even_with_two_people_home(self):
+        app = make_app()
+        app._now_utc = lambda: BASE
+        app._user_id_to_person = {"abc123": "kristine"}
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel", "kristine")),)
+
+        result = app.attribute("washer_emptied", user_id="abc123")
+
+        self.assertEqual(result["person"], "kristine")
+        self.assertEqual(result["method"], "dashboard_action")
+        self.assertIsNone(result["reason"])
+        self.assertEqual(result["people_home"], ["kristine", "mikkel"])
+        self.assertEqual(result["version"], 1)
+        self.assertNotIn("reason_note", result)
+
+    def test_dashed_and_undashed_id_resolve_to_the_same_person(self):
+        app = make_app()
+        app._now_utc = lambda: BASE
+        app._user_id_to_person = {"abc123def456": "claudia"}
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("claudia",)),)
+
+        dashed = app.attribute("washer_emptied", user_id="ABC123-DEF456")
+        undashed = app.attribute("washer_emptied", user_id="abc123def456")
+
+        self.assertEqual(dashed["person"], "claudia")
+        self.assertEqual(dashed["method"], "dashboard_action")
+        self.assertEqual(undashed["person"], "claudia")
+        self.assertEqual(undashed["method"], "dashboard_action")
+
+    def test_unmapped_id_falls_through_to_sole_occupancy(self):
+        """An id simply absent from the map (e.g. it belongs to a non-household person
+        entity - see UserIdMapSafetyTests for how _refresh_user_map keeps it that way)
+        is treated exactly as if no id had been given at all."""
+        app = make_app()
+        app._now_utc = lambda: BASE
+        app._user_id_to_person = {"abc123": "mikkel"}  # non-empty, but not this id
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("kristine",)),)
+
+        result = app.attribute("washer_emptied", user_id="someone-elses-id")
+
+        self.assertEqual(result["person"], "kristine")
+        self.assertEqual(result["method"], "sole_occupant")
+
+    def test_empty_map_falls_through_to_sole_occupancy(self):
+        app = make_app()
+        app._now_utc = lambda: BASE
+        app._user_id_to_person = {}
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
+
+        result = app.attribute("washer_emptied", user_id="abc123")
+
+        self.assertEqual(result["person"], "mikkel")
+        self.assertEqual(result["method"], "sole_occupant")
+
+    def test_no_user_id_falls_through_to_sole_occupancy(self):
+        app = make_app()
+        app._now_utc = lambda: BASE
+        app._user_id_to_person = {"abc123": "mikkel"}
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
+
+        result = app.attribute("washer_emptied")  # no user_id - e.g. the legacy event path
+
+        self.assertEqual(result["method"], "sole_occupant")
+
+    def test_resolved_actor_not_currently_home_sets_reason_note(self):
+        app = make_app()
+        app._now_utc = lambda: BASE
+        app._user_id_to_person = {"abc123": "kristine"}
+        # kristine pressed the button, but the home-set at the anchor is mikkel alone.
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
+
+        result = app.attribute("washer_emptied", user_id="abc123")
+
+        self.assertEqual(result["person"], "kristine")
+        self.assertEqual(result.get("reason_note"), "actor_not_home")
+
+    def test_resolved_actor_at_home_has_no_reason_note(self):
+        app = make_app()
+        app._now_utc = lambda: BASE
+        app._user_id_to_person = {"abc123": "mikkel"}
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
+
+        result = app.attribute("washer_emptied", user_id="abc123")
+
+        self.assertNotIn("reason_note", result)
+
+    def test_no_snapshot_coverage_gives_empty_people_home_but_still_resolves(self):
+        """Unlike _by_sole_occupancy's rule 1, a dashboard action does not need
+        stability_seconds of history - it bypasses that gate entirely - so an anchor with
+        zero log coverage still resolves the actor; people_home is just empty (never
+        guessed)."""
+        app = make_app()
+        app._now_utc = lambda: BASE
+        app._user_id_to_person = {"abc123": "mikkel"}
+        # no _snapshot_log at all
+
+        result = app.attribute("washer_emptied", user_id="abc123")
+
+        self.assertEqual(result["person"], "mikkel")
+        self.assertEqual(result["method"], "dashboard_action")
+        self.assertEqual(result["people_home"], [])
+        self.assertEqual(result.get("reason_note"), "actor_not_home")
+
+
+class UserIdMapSafetyTests(unittest.TestCase):
+    """_refresh_user_map must resolve user_id -> person ONLY through self.person_entities.
+    This HA instance also links other, non-household accounts (a wall-tablet kiosk user, a
+    Node-RED service account, an AppDaemon service account) to their own person.* entities
+    - a naive domain-wide scan would let a tap from any of those get misattributed to a
+    fake "person" here."""
+
+    def test_only_configured_person_entities_are_queried(self):
+        app = make_app(person_entities=["person.mikkel", "person.kristine", "person.claudia"])
+        queried = []
+        states = {
+            "person.mikkel": {"attributes": {"user_id": "mikkel-uid"}},
+            "person.kristine": {"attributes": {"user_id": "kristine-uid"}},
+            "person.claudia": {"attributes": {"user_id": "claudia-uid"}},
+            # A real entity in this HA instance, deliberately absent from person_entities
+            # (e.g. the wall-tablet kiosk account) - must never be looked up at all.
+            "person.wall_tablet_kiosk": {"attributes": {"user_id": "kiosk-uid"}},
+        }
+
+        def get_state(entity, attribute=None, **kw):
+            queried.append((entity, attribute))
+            return states.get(entity)
+
+        app.get_state = get_state
+
+        app._refresh_user_map()
+
+        self.assertEqual(sorted(e for e, _a in queried), ["person.claudia", "person.kristine", "person.mikkel"])
+        self.assertEqual(
+            app._user_id_to_person,
+            {"mikkeluid": "mikkel", "kristineuid": "kristine", "claudiauid": "claudia"},
+        )
+        self.assertNotIn("kioskuid", app._user_id_to_person)
+
+    def test_entity_with_no_user_id_is_skipped(self):
+        app = make_app(person_entities=["person.mikkel"])
+        app.get_state = lambda entity, attribute=None, **kw: {"attributes": {}}
+
+        app._refresh_user_map()
+
+        self.assertEqual(app._user_id_to_person, {})
+
+    def test_get_state_failure_for_one_entity_does_not_block_the_others(self):
+        app = make_app(person_entities=["person.mikkel", "person.kristine"])
+
+        def get_state(entity, attribute=None, **kw):
+            if entity == "person.mikkel":
+                raise RuntimeError("boom")
+            return {"attributes": {"user_id": "kristine-uid"}}
+
+        app.get_state = get_state
+
+        try:
+            app._refresh_user_map()
+        except Exception as e:  # pragma: no cover
+            self.fail(f"_refresh_user_map raised: {e}")
+
+        self.assertEqual(app._user_id_to_person, {"kristineuid": "kristine"})
+
+    def test_user_id_overrides_are_merged_in_after_and_normalized(self):
+        app = make_app(person_entities=["person.mikkel"])
+        app.get_state = lambda entity, attribute=None, **kw: {"attributes": {"user_id": "mikkel-uid"}}
+        app.user_id_overrides = {"KIOSK-UID": "mikkel"}  # dashed/uppercase on purpose
+
+        app._refresh_user_map()
+
+        self.assertEqual(app._user_id_to_person, {"mikkeluid": "mikkel", "kioskuid": "mikkel"})
+
+    def test_refresh_replaces_the_map_wholesale_not_in_place(self):
+        """Same thread-safety convention as self._snapshot_log elsewhere in this file: a
+        fresh dict object each time, never mutated in place, so a worker thread mid-
+        iteration of the old map can never observe a torn write."""
+        app = make_app(person_entities=["person.mikkel"])
+        app.get_state = lambda entity, attribute=None, **kw: {"attributes": {"user_id": "mikkel-uid"}}
+        old_map = app._user_id_to_person
+
+        app._refresh_user_map()
+
+        self.assertIsNot(app._user_id_to_person, old_map)
+
+
 class NeverRaisesTests(unittest.TestCase):
     """attribute() must never raise, even given a completely bare instance (the
     pre-initialize() case) or internally corrupted state, and even when self.log itself
@@ -371,6 +564,21 @@ class ProbeTests(unittest.TestCase):
         self.assertIsInstance(result["people_home"], list)
         self.assertIn(result["method"], ("sole_occupant", "unknown"))
         self.assertEqual(result["person"], "mikkel")
+
+    def test_probe_ignores_a_populated_user_id_map(self):
+        """probe() passes no user_id (module docstring: 'probe() stays unchanged') - a
+        populated user-id map must never change its verdict shape or resolution path."""
+        app = make_app()
+        app._now_utc = lambda: BASE
+        app._user_id_to_person = {"abc123": "kristine"}
+        app._snapshot_log = (snap(BASE - timedelta(seconds=900), home=("mikkel",)),)
+
+        result = app.probe()
+
+        self.assertEqual(result["person"], "mikkel")
+        self.assertEqual(result["method"], "sole_occupant")
+        for key in ("person", "method", "reason", "people_home", "anchor", "evaluated_at", "version"):
+            self.assertIn(key, result)
 
 
 class FlattenHistoryTests(unittest.TestCase):

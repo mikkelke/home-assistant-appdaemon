@@ -81,15 +81,18 @@ def make_washer(state):
     app.log_calls = []
     app.transitions = []
     app.log = lambda *a, **kw: app.log_calls.append((a, kw))
-    app._transition_to_emptied = lambda reason: app.transitions.append(reason)
+    app._transition_to_emptied = lambda reason, actor_user_id=None: app.transitions.append((reason, actor_user_id))
     return app
 
 
 class WasherForceEmptied(unittest.TestCase):
+    """washer_force_emptied (legacy event, kept for Developer Tools) - carries no HA
+    context, so it never threads an actor_user_id through."""
+
     def test_from_unemptied_delegates_with_reason(self):
         app = make_washer("Unemptied")
         app._handle_force_emptied("washer_force_emptied", {"reason": "Dashboard"}, {})
-        self.assertEqual(app.transitions, ["Forced emptied (Dashboard)"])
+        self.assertEqual(app.transitions, [("Forced emptied (Dashboard)", None)])
 
     def test_ignored_while_running(self):
         app = make_washer("Running")
@@ -100,7 +103,72 @@ class WasherForceEmptied(unittest.TestCase):
     def test_none_data_uses_default_reason(self):
         app = make_washer("Unemptied")
         app._handle_force_emptied("washer_force_emptied", None, {})
-        self.assertEqual(app.transitions, ["Forced emptied (Forced via event)"])
+        self.assertEqual(app.transitions, [("Forced emptied (Forced via event)", None)])
+
+
+class WasherEmptiedButton(unittest.TestCase):
+    """input_button.washer_emptied (HA-native replacement, see _on_emptied_button): the
+    HA context.user_id behind the tap must reach _transition_to_emptied as
+    actor_user_id, and a restart replaying the button's last press must never be read
+    as a fresh one."""
+
+    @staticmethod
+    def _event(old_state, new_state):
+        return {"entity_id": "input_button.washer_emptied", "old_state": old_state, "new_state": new_state}
+
+    def test_press_from_unemptied_threads_user_id(self):
+        app = make_washer("Unemptied")
+        old_state = {"state": "2026-09-20T10:00:00+00:00"}
+        new_state = {"state": "2026-09-21T09:00:00+00:00", "context": {"user_id": "abc123"}}
+        app._on_emptied_button("state_changed", self._event(old_state, new_state), {})
+        self.assertEqual(app.transitions, [("Forced emptied (Dashboard button)", "abc123")])
+
+    def test_press_with_no_context_threads_none(self):
+        app = make_washer("Unemptied")
+        old_state = {"state": "2026-09-20T10:00:00+00:00"}
+        new_state = {"state": "2026-09-21T09:00:00+00:00"}  # no "context" key at all
+        app._on_emptied_button("state_changed", self._event(old_state, new_state), {})
+        self.assertEqual(app.transitions, [("Forced emptied (Dashboard button)", None)])
+
+    def test_ignored_while_running(self):
+        app = make_washer("Running")
+        old_state = {"state": "2026-09-20T10:00:00+00:00"}
+        new_state = {"state": "2026-09-21T09:00:00+00:00", "context": {"user_id": "abc123"}}
+        app._on_emptied_button("state_changed", self._event(old_state, new_state), {})
+        self.assertEqual(app.transitions, [])
+
+    def test_first_ever_observation_with_no_old_state_is_not_a_press(self):
+        """old_state is None the very first time AppDaemon observes this entity (e.g.
+        right after this listener is registered) - never a real press."""
+        app = make_washer("Unemptied")
+        new_state = {"state": "2026-09-21T09:00:00+00:00", "context": {"user_id": "abc123"}}
+        app._on_emptied_button("state_changed", self._event(None, new_state), {})
+        self.assertEqual(app.transitions, [])
+
+    def test_restart_replaying_unavailable_to_last_press_is_not_a_fresh_press(self):
+        """After an HA/AppDaemon restart, input_button.* goes unavailable then restores
+        its last-press timestamp - both are state_changed events and neither is a fresh
+        press."""
+        app = make_washer("Unemptied")
+        went_unavailable = self._event({"state": "2026-09-20T10:00:00+00:00"}, {"state": "unavailable"})
+        app._on_emptied_button("state_changed", went_unavailable, {})
+        restored = self._event({"state": "unavailable"}, {"state": "2026-09-20T10:00:00+00:00"})
+        app._on_emptied_button("state_changed", restored, {})
+        self.assertEqual(app.transitions, [])
+
+    def test_unchanged_state_is_not_a_press(self):
+        app = make_washer("Unemptied")
+        same = {"state": "2026-09-20T10:00:00+00:00", "context": {"user_id": "abc123"}}
+        app._on_emptied_button("state_changed", self._event(same, same), {})
+        self.assertEqual(app.transitions, [])
+
+    def test_none_data_does_not_raise(self):
+        app = make_washer("Unemptied")
+        try:
+            app._on_emptied_button("state_changed", None, {})
+        except Exception as e:  # pragma: no cover
+            self.fail(f"_on_emptied_button raised: {e}")
+        self.assertEqual(app.transitions, [])
 
 
 if __name__ == "__main__":

@@ -700,6 +700,10 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.announce_freshness_minutes = float(self.args.get("announce_freshness_minutes", 20))
         # Optional: announce when door *unlocks* instead of when we enter Unemptied.
         self.door_lock_entity = self.args.get("door_lock_entity")  # e.g. lock.washer_door
+        # Dashboard "Emptied" button, HA-native (see _on_emptied_button): unlike the
+        # legacy washer_force_emptied event (fire_event, admin-only in HA 2026.9),
+        # input_button.press works for every housemate and carries context.user_id.
+        self.emptied_button_entity = self.args.get("emptied_button_entity", "input_button.washer_emptied")
 
         # Settled per-cycle cost: meter the spot price against the cumulative energy sensor each
         # tick (see _check_energy_finish); the standby wait of a delayed start is excluded (reset
@@ -1130,7 +1134,10 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.listen_event(self._on_confirm_push_action, "mobile_app_notification_action")
         self.listen_event(self._on_test_confirm_push, "washer_test_confirm_push")
         # Dashboard "Emptied" button (2026-08-07) - same convention as dishwasher_force_emptied.
+        # Kept for the Developer Tools manual test path; see _on_emptied_button for the
+        # HA-native replacement the dashboard itself now uses.
         self.listen_event(self._handle_force_emptied, "washer_force_emptied")
+        self.listen_event(self._on_emptied_button, "state_changed", entity_id=self.emptied_button_entity)
 
         # Load historical feedback and derive learned duration estimates
         self._load_and_apply_feedback()
@@ -3809,26 +3816,64 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self._pending_end_reason = None
 
     def _handle_force_emptied(self, event_name, data, kwargs):
-        """washer_force_emptied (dashboard Emptied button): the drum is empty but the door
-        contact never saw the emptying. Only honored from Unemptied - any earlier state may
-        still be a live cycle, and _transition_to_emptied would save its feedback too soon."""
+        """washer_force_emptied (legacy dashboard event, HA 2026.9+ requires admin to
+        fire_event - kept for the Developer Tools manual test path and any other caller;
+        see _on_emptied_button for the HA-native replacement every housemate can use).
+        Carries no HA context, so no actor. See _force_emptied for the shared guard."""
         data = data or {}
+        reason = data.get("reason") or "Forced via event"
+        self._force_emptied(reason)
+
+    def _on_emptied_button(self, event_name, data, kwargs):
+        """input_button.washer_emptied press (raw state_changed, not listen_state, so
+        HA's context - and with it context.user_id, the human behind the tap - survives):
+        the HA-native replacement for washer_force_emptied that works for every
+        housemate, not just admins (fire_event requires admin in HA 2026.9;
+        input_button.press does not).
+
+        Restore guard mirrors fire_safety.py's input_button handling
+        (_on_button_state_changed): after an HA/AppDaemon restart, input_button.* goes
+        unavailable then restores its last-press timestamp - that restore is a
+        state_changed event too and must never be read as a fresh press."""
+        data = data or {}
+        old_state_raw = data.get("old_state")
+        old_state = old_state_raw or {}
+        new_state = data.get("new_state") or {}
+        new = new_state.get("state")
+        old = old_state.get("state")
+        if new == old or new in (None, "unknown", "unavailable"):
+            return
+        if old_state_raw is None or old in (None, "unknown", "unavailable"):
+            return
+        user_id = (new_state.get("context") or {}).get("user_id")
+        self._force_emptied("Dashboard button", actor_user_id=user_id)
+
+    def _force_emptied(self, reason, actor_user_id=None):
+        """Shared body for both washer_force_emptied and the input_button press: the
+        drum is empty but the door contact never saw the emptying. Only honored from
+        Unemptied - any earlier state may still be a live cycle, and
+        _transition_to_emptied would save its feedback too soon."""
         if self.state != "Unemptied":
             self.log(
                 f"Force Emptied ignored from state {self.state!r} (only valid from Unemptied)",
                 level="WARNING",
             )
             return
-        reason = data.get("reason") or "Forced via event"
         self.log(f"Force Emptied via event ({reason})", level="INFO")
-        self._transition_to_emptied(f"Forced emptied ({reason})")
+        self._transition_to_emptied(f"Forced emptied ({reason})", actor_user_id=actor_user_id)
 
-    def _transition_to_emptied(self, reason):
-        """Transition to Emptied state (door open, user is emptying)."""
+    def _transition_to_emptied(self, reason, actor_user_id=None):
+        """Transition to Emptied state (door open, user is emptying).
+
+        actor_user_id: HA context.user_id from an HA-native dashboard trigger (see
+        _on_emptied_button) - passed straight through to _attribute()/ActorAttribution
+        so it can resolve the actor directly. None for every door-detected path here
+        (door events carry no HA context) and for the legacy washer_force_emptied event.
+        """
         if self._should_change_state("Emptied", force=True):  # Door event bypasses cooling
             # Attribution: captured as "now" - unlike the start anchor (which clamps back to
             # door-close, see _begin_running_cycle), emptying is observed as it happens.
-            actor_empty = self._attribute("washer_emptied")
+            actor_empty = self._attribute("washer_emptied", user_id=actor_user_id)
             energy_used = self._get_energy_used()
             run_minutes = self._get_run_duration_minutes()
 
@@ -5678,13 +5723,18 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         result["method"] = method or "unknown"
         return result
 
-    def _attribute(self, event, at=None) -> dict:
+    def _attribute(self, event, at=None, user_id=None) -> dict:
         """Resolve who performed a physical action via the ActorAttribution app.
 
         Lazy get_app per call (no dependencies: entry - see the section banner above). Never
         lets an attribution problem break a cycle: any failure returns the unknown dict, in the
         same shape as a real result, so callers can always do result.get("person") /
         result.get("method") without a KeyError.
+
+        user_id: HA context.user_id behind an HA-native dashboard trigger (e.g.
+        input_button.washer_emptied - see _on_emptied_button), so ActorAttribution can
+        resolve the actor directly instead of falling back to sole-occupancy. None for
+        every other caller (a physical/legacy trigger carries no HA context).
         """
         try:
             app = self.get_app("ActorAttribution")
@@ -5695,7 +5745,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.log(f"ActorAttribution app not found - cannot attribute event={event!r}", level="WARNING")
             return self._unknown_actor("attribution_app_missing", at)
         try:
-            result = app.attribute(event, at=at)
+            result = app.attribute(event, at=at, user_id=user_id)
             if not isinstance(result, dict):
                 self.log(
                     f"ActorAttribution.attribute returned {type(result).__name__}, expected dict, for event={event!r}",

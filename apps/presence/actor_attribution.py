@@ -1,8 +1,10 @@
 """
-ActorAttribution - answers "who was home at time T, if exactly one person was" so
-appliance monitors (washer/dishwasher/dryer) can record who started or emptied a load.
-Physical button presses carry no HA context_user_id - only app-issued service calls do -
-so sole-occupancy is the only free signal available today.
+ActorAttribution - answers "who did this" for appliance monitors (washer/dishwasher/
+dryer) recording who started or emptied a load: directly, when the action carries HA's
+own context.user_id (a dashboard-issued service call, e.g. input_button.press), else by
+falling back to "who was home at time T, if exactly one person was". Physical button
+presses carry no HA context_user_id at all - only an HA-native trigger does - so
+sole-occupancy remains the only free signal for those.
 
 NEVER GUESS. attribute() only ever names a person when the tracked home-set has held
 exactly one person, continuously and fully observable, for the whole stability_seconds
@@ -22,12 +24,17 @@ invisible to person.* state entirely, and will read as either "nobody home" or g
 into whoever else happens to be tracked as home. A "sole occupant" verdict can still be
 wrong if such a person pressed the actual button.
 
-Phase 2 seam: attribute() is a thin dispatcher today, `return self._by_sole_occupancy(...)`,
-specifically so a future BLE-presence signal can be slotted in ahead of it without
-touching any call site:
-    return self._by_ble(event, anchor) or self._by_sole_occupancy(event, anchor, evaluated_at)
-Appliance monitors only ever call attribute()/probe() - nothing else in this app's public
-surface needs to change shape for that to work.
+Phase 2 (filled): attribute() tries _by_dashboard_action() first - a dashboard-issued
+action's context.user_id resolves straight to a person via self._user_id_to_person and
+BYPASSES the sole-occupancy gate entirely, so it works even with 2+ people home (where
+_by_sole_occupancy would refuse as multi_occupant). It falls through to
+_by_sole_occupancy() whenever no user_id was given, the map is empty/unbuilt, or the id
+doesn't resolve:
+    result = self._by_dashboard_action(event, anchor, evaluated_at, user_id) or self._by_sole_occupancy(event, anchor, evaluated_at)
+A future BLE-presence signal remains a possible third method, slotted in ahead of both
+without touching any call site. Appliance monitors call attribute(event, at=..., user_id=...);
+user_id is optional and simply absent for callers with nothing to give (probe(), and any
+physical/legacy trigger with no HA context).
 
 Hard rule - zero AppDaemon API calls inside attribute() and everything it calls (no
 get_state/call_service/run_in/create_task/set_state/get_history): it reads only the
@@ -122,6 +129,7 @@ class ActorAttribution(hass.Hass):
     _snapshot_log = ()        # tuple[_Snapshot], ascending by ts, append-only
     _door_events = ()         # tuple[datetime]: door OPEN edges only, ascending
     _door_state = None        # last known raw door_entity state (None -> unobservable)
+    _user_id_to_person = {}   # {normalized_user_id: person_key}, see _refresh_user_map
     stability_seconds = 600
     door_settle_seconds = 300
     retention_hours = 26
@@ -137,6 +145,11 @@ class ActorAttribution(hass.Hass):
         self.door_settle_seconds = int(a("door_settle_seconds", 300))
         self.retention_hours = float(a("retention_hours", 26))
         self.publish_sensor = a("publish_sensor", "sensor.household_actor")
+        # HA account id -> person key, merged in after the automatic person_entities
+        # resolution (see _refresh_user_map) - a gap-filler for a resident whose
+        # person.*.user_id link is missing, same override convention as
+        # manual_override_timeout.yaml's user_name_fallback.
+        self.user_id_overrides = dict(a("user_id_overrides", {}) or {})
         # Backoff for re-seeding from history when the HASS websocket isn't up yet after a
         # restart (see _schedule_backfill_retry). Spans ~9 min, well past a normal reconnect.
         self.backfill_retry_delays = list(a("backfill_retry_delays", [30, 60, 120, 300]))
@@ -163,15 +176,15 @@ class ActorAttribution(hass.Hass):
         )
 
     # ------------------------------------------------------------------------------
-    # PURE ZONE: attribute() and everything below down to _person_key perform ZERO
-    # AppDaemon API calls (no get_state/call_service/run_in/create_task/set_state/
+    # PURE ZONE: attribute() and everything below down to _normalize_user_id perform
+    # ZERO AppDaemon API calls (no get_state/call_service/run_in/create_task/set_state/
     # get_history) and read only the in-memory state the listeners/tick/backfill below
     # maintain. See module docstring for why this boundary matters.
     # ------------------------------------------------------------------------------
 
-    def attribute(self, event: str, at=None) -> dict:
+    def attribute(self, event: str, at=None, user_id=None) -> dict:
         try:
-            return self._attribute_unsafe(event, at)
+            return self._attribute_unsafe(event, at, user_id)
         except Exception as e:
             try:
                 self.log(
@@ -188,10 +201,10 @@ class ActorAttribution(hass.Hass):
         actor_attribution_probe listen_event hook below for an on-demand log line."""
         return self.attribute("probe", at=None)
 
-    def _attribute_unsafe(self, event, at):
+    def _attribute_unsafe(self, event, at, user_id=None):
         evaluated_at = self._now_utc()
         anchor = self._coerce_utc(at) if at is not None else evaluated_at
-        result = self._by_sole_occupancy(event, anchor, evaluated_at)
+        result = self._by_dashboard_action(event, anchor, evaluated_at, user_id) or self._by_sole_occupancy(event, anchor, evaluated_at)
         if self._door_state in _UNOBSERVABLE_STATES:
             # The door guard itself is blind, so rule 4 below could have missed a real
             # open edge. Per spec we still attribute - the absence of a recorded edge is
@@ -201,10 +214,49 @@ class ActorAttribution(hass.Hass):
             result["reason_note"] = "door_guard_unavailable"
         return result
 
+    def _by_dashboard_action(self, event, anchor, evaluated_at, user_id):
+        """Resolve straight from HA's own context.user_id - a dashboard-issued service
+        call (e.g. input_button.press) carries one, unlike a physical button. No
+        occupancy reasoning at all: doesn't need stability_seconds of log coverage, and
+        is NOT blocked by multi_occupant - a tap is direct evidence of who did it,
+        stronger than any presence inference. Returns None (never "unknown") on
+        anything short of a clean resolution, so the `or self._by_sole_occupancy(...)`
+        in _attribute_unsafe takes over exactly as if this method did not exist:
+          - user_id falsy (no HA context - e.g. a physical button, or the legacy
+            washer_force_emptied event, which carries none)
+          - self._user_id_to_person empty (never refreshed yet, or nobody linked)
+          - the normalized id resolves to nobody in that map (see _refresh_user_map's
+            person_entities-only safety guard - an id outside the household resolves to
+            nothing here, by construction, never a guess)
+        """
+        if not user_id:
+            return None
+        if not self._user_id_to_person:
+            return None
+        person = self._user_id_to_person.get(self._normalize_user_id(user_id))
+        if not person:
+            return None
+        effective_home = self._home_set_at(anchor)
+        result = {
+            "person": person,
+            "method": "dashboard_action",
+            "reason": None,
+            "people_home": sorted(effective_home),
+            "anchor": self._iso(anchor),
+            "evaluated_at": self._iso(evaluated_at),
+            "version": _VERSION,
+        }
+        if person not in effective_home:
+            # Never gates/blocks - the tap itself is still the evidence - just flags that
+            # presence didn't corroborate it (mirrors the door_guard_unavailable note
+            # _attribute_unsafe adds for a different weak-evidence case).
+            result["reason_note"] = "actor_not_home"
+        return result
+
     def _by_sole_occupancy(self, event, anchor, evaluated_at):
         """The seven decision rules, evaluated in order, looking BACKWARD from anchor
-        only. Phase 2: attribute() will try _by_ble() first and only fall back to this -
-        see module docstring."""
+        only. Phase 2: attribute() tries _by_dashboard_action() first and only falls
+        back to this - see module docstring."""
         win_start = anchor - timedelta(seconds=self.stability_seconds)
         retention_cutoff = evaluated_at - timedelta(hours=self.retention_hours)
 
@@ -296,6 +348,19 @@ class ActorAttribution(hass.Hass):
             return []
         return [carry] + within
 
+    def _home_set_at(self, anchor):
+        """The home-set in effect AT anchor, straight from the snapshot log - no
+        window/stability/door reasoning at all (that's _by_sole_occupancy's job; this is
+        used only by _by_dashboard_action, which bypasses that gate on purpose). Empty
+        when the log has no entry at-or-before anchor (no coverage that far back) -
+        never guessed."""
+        home = frozenset()
+        for entry in self._snapshot_log:
+            if entry.ts > anchor:
+                break
+            home = entry.home
+        return home
+
     def _unknown(self, anchor, evaluated_at, reason, people_home=frozenset()):
         return {
             "person": None,
@@ -350,6 +415,13 @@ class ActorAttribution(hass.Hass):
         zero translation needed by callers."""
         return entity_id.replace("person.", "").lower()
 
+    @staticmethod
+    def _normalize_user_id(user_id):
+        """Undashed lowercase hex, matching HA context.user_id's own format - same
+        normalization as manual_override_timeout.py's user_name_fallback, so a dashed id
+        pasted into user_id_overrides (yaml) still matches a raw context.user_id."""
+        return str(user_id).replace("-", "").strip().lower()
+
     # ------------------------------------------------------------------------------
     # Listeners, periodic reconciliation, history backfill, publish: everything below
     # is allowed (and expected) to call AppDaemon APIs.
@@ -383,6 +455,43 @@ class ActorAttribution(hass.Hass):
             self.log(f"ActorAttribution probe: {self.probe()}", level="INFO")
         except Exception as e:
             self.log(f"ActorAttribution probe event handler failed: {e}", level="ERROR")
+
+    def _refresh_user_map(self):
+        """Rebuild self._user_id_to_person from person_entities' own user_id attribute -
+        the HA-native account link a person entity carries once linked to a real HA user
+        account (Settings -> People). Same domain-then-per-entity idiom as
+        manual_override_timeout.py's _refresh_person_map (attribute= is per-entity only
+        in AppDaemon - a domain-level get_state does not include it).
+
+        SAFETY: iterates self.person_entities ONLY, never a domain-wide person.* scan.
+        This HA instance links other, non-household accounts (a wall-tablet kiosk user,
+        a Node-RED service account, AppDaemon's own service account) to their own
+        person.* entities too - a domain-wide scan would let a tap from any of those
+        resolve to a fake household "person" here. See
+        test_actor_attribution.py::UserIdMapSafetyTests.
+
+        Always replaces self._user_id_to_person wholesale with a new dict, never
+        mutated in place - same thread-safety convention as self._snapshot_log
+        elsewhere in this file (AppDaemon calls listener/tick/backfill callbacks from
+        worker threads)."""
+        try:
+            mapping = {}
+            for entity in self.person_entities:
+                try:
+                    obj = self.get_state(entity, attribute="all")
+                except Exception as e:
+                    self.log(f"ActorAttribution: user-id map refresh failed for {entity}: {e}", level="WARNING")
+                    continue
+                attrs = (obj.get("attributes") or {}) if isinstance(obj, dict) else {}
+                uid = attrs.get("user_id")
+                if uid:
+                    mapping[self._normalize_user_id(uid)] = self._person_key(entity)
+            for uid, person in (self.user_id_overrides or {}).items():
+                if uid and person:
+                    mapping[self._normalize_user_id(uid)] = person
+            self._user_id_to_person = mapping
+        except Exception as e:
+            self.log(f"ActorAttribution: user-id map refresh failed: {e}", level="WARNING")
 
     def _tick(self, kwargs):
         """Re-read every tracked entity and reconcile against the cached view. AppDaemon
@@ -431,6 +540,7 @@ class ActorAttribution(hass.Hass):
 
             self._prune_log(now)
             self._prune_door_events(now)
+            self._refresh_user_map()
             self._publish()
         except Exception as e:
             self.log(f"ActorAttribution tick failed: {e}", level="ERROR")
@@ -540,6 +650,7 @@ class ActorAttribution(hass.Hass):
                 f"last {self.retention_hours:.0f}h",
                 level="INFO",
             )
+            self._refresh_user_map()
             self._publish()
             if not self._snapshot_log:
                 # Seeded nothing at all. On a full AppDaemon restart the HASS websocket is
@@ -641,7 +752,7 @@ class ActorAttribution(hass.Hass):
         key or one of _REASON_TO_STATE's short words."""
         try:
             verdict = self.probe()
-            if verdict["method"] == "sole_occupant":
+            if verdict["person"]:
                 state = verdict["person"]
             else:
                 state = _REASON_TO_STATE.get(verdict["reason"], "unobservable")
@@ -660,6 +771,7 @@ class ActorAttribution(hass.Hass):
                     "stable_since": self._iso(stable_since),
                     "last_door_open": self._iso(last_door_open),
                     "source_entities": list(self.person_entities) + [self.door_entity],
+                    "user_id_count": len(self._user_id_to_person),
                     "computed_at": self._iso(self._now_utc()),
                 },
             )

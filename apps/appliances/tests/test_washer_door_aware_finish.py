@@ -234,7 +234,7 @@ def make_finish_app(
     app._get_energy_used = lambda: 0.85
     app._compute_final_and_confirmed_programme = lambda run, en, update_detected=False: ("eco", None, "eco", None)
     app._get_profile = lambda prog, temp: {"label": "Eco", "heats": False}
-    app._attribute = lambda event: {"person": "mikkel", "method": "sole_occupant"}
+    app._attribute = lambda event, at=None, user_id=None: {"person": "mikkel", "method": "sole_occupant"}
     app._classify_cycle_completion = lambda **kw: {
         "completion_class": "completed",
         "valid_for_learning": True,

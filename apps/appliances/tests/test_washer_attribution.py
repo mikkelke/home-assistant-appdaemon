@@ -89,7 +89,7 @@ class AttributeAppMissingOrFailing(unittest.TestCase):
         app = _base_app()
 
         class BoomApp:
-            def attribute(self, event, at=None):
+            def attribute(self, event, at=None, user_id=None):
                 raise RuntimeError("boom")
 
         app.get_app = lambda name: BoomApp()
@@ -103,7 +103,7 @@ class AttributeAppMissingOrFailing(unittest.TestCase):
         app = _base_app()
 
         class WeirdApp:
-            def attribute(self, event, at=None):
+            def attribute(self, event, at=None, user_id=None):
                 return None  # frozen API says dict; guard against a misbehaving app anyway
 
         app.get_app = lambda name: WeirdApp()
@@ -121,15 +121,35 @@ class AttributeAppMissingOrFailing(unittest.TestCase):
         calls = []
 
         class RealApp:
-            def attribute(self, event, at=None):
-                calls.append((event, at))
+            def attribute(self, event, at=None, user_id=None):
+                calls.append((event, at, user_id))
                 return real_result
 
         app.get_app = lambda name: RealApp()
         at = datetime(2026, 7, 27, 10, 0, 0, tzinfo=timezone.utc)
         result = app._attribute("washer_start", at=at)
         self.assertIs(result, real_result)
-        self.assertEqual(calls, [("washer_start", at)])
+        self.assertEqual(calls, [("washer_start", at, None)])
+
+    def test_user_id_is_threaded_through_to_actor_attribution(self):
+        """_attribute's own user_id kwarg (see _on_emptied_button) must reach
+        ActorAttribution.attribute() unchanged - this is what lets a dashboard button
+        press resolve directly instead of falling back to sole-occupancy."""
+        app = _base_app()
+        calls = []
+
+        class RealApp:
+            def attribute(self, event, at=None, user_id=None):
+                calls.append((event, at, user_id))
+                return {
+                    "person": "kristine", "method": "dashboard_action", "reason": None,
+                    "people_home": ["kristine"], "anchor": "x", "evaluated_at": "y", "version": 1,
+                }
+
+        app.get_app = lambda name: RealApp()
+        result = app._attribute("washer_emptied", user_id="abc123")
+        self.assertEqual(result["method"], "dashboard_action")
+        self.assertEqual(calls, [("washer_emptied", None, "abc123")])
 
 
 class CycleActorFromStateAttrs(unittest.TestCase):

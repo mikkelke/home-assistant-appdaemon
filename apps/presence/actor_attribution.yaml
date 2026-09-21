@@ -1,16 +1,18 @@
 # /conf/apps/presence/actor_attribution.yaml
-# Answers "who was home at time T, if exactly one person was" so appliance monitors
-# (washer/dishwasher/dryer) can attribute a physical button press to a person - physical
-# presses carry no HA context_user_id, so sole-occupancy is the only free signal today.
-# NEVER GUESS: ambiguous presence always returns unknown (see actor_attribution.py's
-# module docstring for the full seven-rule decision table). A wrong attribution poisons
-# an appliance's per-person history/learning forever; a missing one is just a blank, and
-# recoverable the next time the signal is clean.
+# Answers "who did this" for appliance monitors (washer/dishwasher/dryer): directly, when
+# the action carries HA's own context.user_id (a dashboard-issued service call, e.g.
+# input_button.press), else "who was home at time T, if exactly one person was" - a
+# physical button press carries no HA context_user_id, so sole-occupancy is the only free
+# signal for those. NEVER GUESS: ambiguous presence always returns unknown (see
+# actor_attribution.py's module docstring for the full seven-rule decision table). A
+# wrong attribution poisons an appliance's per-person history/learning forever; a missing
+# one is just a blank, and recoverable the next time the signal is clean.
 #
-# Phase 2 seam: attribute() is a thin dispatcher today (self._by_sole_occupancy(...));
-# a future BLE-presence signal slots in ahead of it with
-# `self._by_ble(...) or self._by_sole_occupancy(...)` - callers (appliance monitors)
-# never change.
+# Phase 2 (filled): attribute() tries _by_dashboard_action() first (self._user_id_to_person,
+# built from person_entities' own user_id attribute below, plus user_id_overrides) and only
+# falls back to _by_sole_occupancy() when no id was given or it doesn't resolve - see
+# actor_attribution.py's module docstring. A future BLE-presence signal remains a possible
+# third method, slotted in ahead of both without changing any call site.
 #
 # Known residual: an untracked human physically in the flat (a guest, a cleaner, a kid's
 # friend, or one of the three people below without their phone/location on) is invisible
@@ -32,3 +34,12 @@ ActorAttribution:
   door_settle_seconds: 300
   retention_hours: 26
   publish_sensor: sensor.household_actor
+  # HA account id -> person key, for a resident whose person.*.user_id link is missing or
+  # not (yet) made in Settings -> People - same override convention as
+  # manual_override_timeout.yaml's user_name_fallback. Checked AFTER the automatic
+  # person_entities resolution, so a real person.*.user_id link always wins once made;
+  # this is only a gap-filler. Keys normalized to undashed lowercase hex, matching
+  # context.user_id's own format. Empty by default - populate only if
+  # sensor.household_actor's user_id_count attribute comes back short of the household
+  # size.
+  user_id_overrides: {}
