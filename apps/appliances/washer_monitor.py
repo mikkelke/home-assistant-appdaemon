@@ -2198,12 +2198,14 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
 
     def _tail_idle_window_ok(self) -> bool:
         """Require a short recent window to be truly quiet before declaring finished.
-        Prevents false finish during spin/anti-crease where pulses are below pulse-reset threshold."""
+        Prevents false finish during spin/anti-crease where pulses are below pulse-reset threshold.
+        The plug only reports on change, so a genuinely flat tail can land fewer than 3 points in the
+        window - sparse_tail_idle_ok covers that case instead of refusing outright."""
         lookback_min = max(1.0, self.tail_idle_confirm_seconds / 60.0)
         points = self._get_recent_power_history(lookback_min)
-        if len(points) < 3:
-            return False
         cutoff = self._now_utc() - timedelta(seconds=self.tail_idle_confirm_seconds)
+        if len(points) < 3:
+            return wpow.sparse_tail_idle_ok(points, cutoff, self.stop_w)
         return wpow.tail_idle_ok(
             points, cutoff, self.tail_idle_peak_max_watts, self.post_cycle_idle_watts
         )
@@ -5158,22 +5160,33 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
     def _get_finish_min_run_minutes(self):
         """Minimum run minutes before we may declare cycle done (avoids false finish when guard_dur is wrong).
         Use warm floor when we've seen heating, or when user has confirmed a programme that heats (so we don't
-        fire early before the first heating burst in a long warm programme)."""
-        if self.observed_heating:
-            return self.finish_min_run_minutes_warm
+        fire early before the first heating burst in a long warm programme). Exception: once a user-confirmed
+        programme that doesn't support anti-crease (e.g. Uld) has used an energy total no heavier programme
+        could explain, drop to that programme's own confirmed duration - waiting out the generic warm floor
+        would only delay an already-certain finish."""
+        floor = self.finish_min_run_minutes_warm if self.observed_heating else self.finish_min_run_minutes_cold
+        confirmed_prog, confirmed_temp, confirmed_profile = None, None, None
         if self.programme_confirmed_by_user and self.confirm_entity:
             try:
                 label = self.get_state(self.confirm_entity)
                 if label and label not in ("Auto (unconfirmed)", "unknown", "unavailable"):
                     prog = self._LABEL_TO_KEY.get(label, "unknown")
-                    temp = self._read_temperature_selector() if self._programme_has_temperature(prog) else None
                     if prog and prog != "unknown":
+                        temp = self._read_temperature_selector() if self._programme_has_temperature(prog) else None
                         profile = self._get_profile(prog, temp)
-                        if profile and profile.get("heats"):
-                            return self.finish_min_run_minutes_warm
+                        if profile:
+                            confirmed_prog, confirmed_temp, confirmed_profile = prog, temp, profile
+                            if profile.get("heats"):
+                                floor = self.finish_min_run_minutes_warm
             except Exception:
                 pass
-        return self.finish_min_run_minutes_cold
+        if confirmed_profile and confirmed_profile.get("supports_anti_crease") is False:
+            max_energy = confirmed_profile.get("max_valid_energy_kwh") or confirmed_profile.get("max_energy_kwh")
+            if not max_energy or self._get_energy_used() <= max_energy * self.guard_energy_disproof_margin:
+                nominal = self._get_programme_duration(confirmed_prog, confirmed_temp, use_learned=False)
+                if nominal:
+                    floor = min(floor, float(nominal))
+        return floor
 
     def _meets_finish_time_guards(self, run_min: float, guard_dur: float) -> bool:
         """True only if we're past the fraction of expected AND past absolute min runtime. Reduces false announcements."""

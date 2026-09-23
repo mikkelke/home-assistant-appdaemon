@@ -16,10 +16,16 @@ existing `import climate_model as cm` precedent in apps/climate/.
 """
 
 import statistics
+from datetime import timedelta
 
 # Any window containing a reading above this is treated as containing a real
 # heating burst, which disqualifies it from looking like a finished cycle.
 HEATING_BURST_WATTS = 500
+
+# Tolerance for HA's carried-in history point: a query for start_time=X returns the state
+# already in effect at X as the first row, timestamped at its own true last-changed time -
+# which can trail X by a couple of seconds without there being any real gap in coverage.
+SPARSE_TAIL_CUTOFF_SLACK_SECONDS = 5
 
 
 def time_weighted_stats(points, now, active_w):
@@ -134,6 +140,22 @@ def tail_idle_ok(points, cutoff, peak_max_w, mean_max_w):
         peak_w <= peak_max_w
         and mean_w <= mean_max_w
     )
+
+
+def sparse_tail_idle_ok(points, cutoff, stop_w):
+    """Fallback for tail_idle_ok when the window has fewer than 3 points - normal for an
+    event-driven plug on a genuinely flat tail, not missing data.
+
+    True only when there is at least one point, the earliest one reaches back to (or before)
+    `cutoff` within SPARSE_TAIL_CUTOFF_SLACK_SECONDS (so no unobserved gap sits at the start
+    of the window), and every point is at or below stop_w.
+    """
+    if not points:
+        return False
+    first_t = points[0][0]
+    if first_t > cutoff + timedelta(seconds=SPARSE_TAIL_CUTOFF_SLACK_SECONDS):
+        return False
+    return all(w <= stop_w for _, w in points)
 
 
 def anti_crease_ok_from_stats(mean_w, std_w, peak_w, duty_above,
