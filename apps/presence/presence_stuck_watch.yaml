@@ -1,34 +1,25 @@
 # /conf/apps/presence/presence_stuck_watch.yaml
-# Alerts when a room's presence sensor looks stuck ON with the room actually empty, plus a
-# presence/light on-time metric with a same-day anomaly alert. See presence_stuck_watch.py's
-# module docstring for the three stuck rules and the metrics/anomaly design in full.
+# Pushes the owner when a room's presence sensor looks stuck ON. Notify only, never controls
+# a device. One yaml instance per room - see presence_stuck_watch.py's module docstring for
+# the two stuck rules.
 #
-# No `log:` key on purpose: a named log stream must be declared in appdaemon.yaml first (box-
-# only, not in this repo) or the app instantiation-crashes on deploy - see appdaemon-deploy
-# memory / room_active.yaml's own note on the same trap.
+# No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
+# first or the app fails to instantiate.
 
 PresenceStuckWatch:
   module: presence_stuck_watch
   class: PresenceStuckWatch
-  # Init-order guarantee for get_app("MobileNotifier")/get_app("RoomActive") cached in
-  # initialize(); also reloads this app when either reloads.
   dependencies:
     - MobileNotifier
-    - RoomActive
+
+  presence: binary_sensor.bathroom_presence_presence
+  motion: sensor.bathroom_presence_motion_state   # states none/small/large; small|large = PIR motion
+  name: Bathroom
 
   persons:
     - person.mikkel
     - person.kristine
     - person.claudia
 
-  rooms:
-    bathroom:
-      presence: binary_sensor.bathroom_presence_presence
-      motion: sensor.bathroom_presence_motion_state   # states none/small/large; small|large = PIR motion
-      light: light.bathroom_lights
-      zone: bathroom            # room_active zone name of THIS room (excluded from "elsewhere")
-      ignore_zones: [guest_bathroom]
-      nobody_home_min: 5
-      elsewhere_min: 10
-      long_hold_min: 60
-      long_hold_no_motion_min: 30
+  nobody_home_min: 5
+  no_motion_min: 30
