@@ -130,7 +130,9 @@ class PresenceStuckWatch(hass.Hass):
             if away_min >= self.nobody_home_min:
                 self._alert(f"Presence on while nobody has been home for {away_min:.0f} min")
                 return
-        last_motion = self._last_motion_at if self._last_motion_at is not None else self._presence_on_since
+        # Motion from a previous session must not count: the presence on-edge arrives before
+        # its own motion event.
+        last_motion = max(self._last_motion_at or 0.0, self._presence_on_since)
         no_motion_min = (now - last_motion) / 60.0
         if no_motion_min >= self.no_motion_min:
             hold_min = (now - self._presence_on_since) / 60.0

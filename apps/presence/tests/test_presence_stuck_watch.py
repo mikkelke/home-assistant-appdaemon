@@ -233,6 +233,15 @@ class NoMotionRule(unittest.TestCase):
         app._evaluate(NOW0 + 30 * 60)
         app.create_task.assert_called_once()
 
+    def test_motion_from_previous_session_does_not_count(self):
+        app = make_app(now=NOW0)
+        app._last_motion_at = NOW0 - 270 * 60
+        app._on_presence_change(PRESENCE, "state", "off", "on", {})
+        app._evaluate(NOW0 + 29 * 60)
+        app.create_task.assert_not_called()
+        app._evaluate(NOW0 + 30 * 60)
+        app.create_task.assert_called_once()
+
 
 class OneAlertPerEpisode(unittest.TestCase):
     def test_repeated_evaluation_only_alerts_once(self):
