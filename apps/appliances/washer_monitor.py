@@ -6741,14 +6741,19 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             and self.confirm_entity
             and (self.get_state(self.confirm_entity) or "").strip() not in ("", "Auto (unconfirmed)", "unknown", "unavailable")
         )
+        # soak_prog tracks whichever programme effective_dur actually came from (not always
+        # eta_prog): the expected_dur_at_start branch below uses the frozen guard-bar programme,
+        # which can differ from this tick's own live classification (e.g. soak's near-zero power
+        # at the start of a cycle can read as a cooler programme before real heating begins).
+        soak_prog = eta_prog
         if user_has_selected:
             effective_dur = self._get_programme_duration(eta_prog, eta_temp, use_learned=False)
+        elif self.expected_dur_at_start is not None:
+            effective_dur = self.expected_dur_at_start
+            if self._guard_bar_class:
+                soak_prog = self._guard_bar_class[0]
         else:
-            effective_dur = (
-                self.expected_dur_at_start
-                if self.expected_dur_at_start is not None
-                else self._get_programme_duration(eta_prog, eta_temp, use_learned=False)
-            )
+            effective_dur = self._get_programme_duration(eta_prog, eta_temp, use_learned=False)
         # Eco/strygelet ambiguity blend when < 130 min (only when on Auto - if user selected ECO, use ECO duration)
         if eta_prog == "eco" and new_prog == "eco" and not self.programme_confirmed_by_user and not user_has_selected:
             run_min = (self._now_utc() - self.start_time).total_seconds() / 60
@@ -6761,7 +6766,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 else:
                     blend = min(1.0, run_min / 130.0)
                     effective_dur = round(strygelet_dur + blend * (eco_dur - strygelet_dur))
-        effective_dur += self._soak_bonus_minutes(eta_prog)
+        effective_dur += self._soak_bonus_minutes(soak_prog)
         # Merge new attrs into existing HA state so persisted fields
         # (programme_confirmed_by_user, programme_confirmed_by, last_off_at, etc.)
         # survive the periodic update instead of being silently wiped every tick.
@@ -6798,7 +6803,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             "max_power_w": round(self.max_power_seen, 0),
             "delayed_start_trimmed": bool(self._delayed_start_trimmed),
             "delayed_start_waiting": bool(self._delay_waiting),
-            "supports_soak": self._programme_supports_soak(eta_prog),
+            "supports_soak": self._programme_supports_soak(soak_prog),
             **pred_attrs,
         })
         if self.start_time:
