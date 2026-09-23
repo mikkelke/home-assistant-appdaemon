@@ -52,7 +52,7 @@ class PresenceStuckWatch(hass.Hass):
         self.persons = list(a.get("persons", []))
         self.nobody_home_min = float(a.get("nobody_home_min", 5))
         self.no_motion_min = float(a.get("no_motion_min", 30))
-        self.room_name = a.get("name") or "Room"
+        self.room_name = a.get("room") or "Room"
 
         self._notifier = self.get_app("MobileNotifier")
         self._nobody_home_since = None

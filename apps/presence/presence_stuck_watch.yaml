@@ -14,7 +14,7 @@ PresenceStuckWatch:
 
   presence: binary_sensor.bathroom_presence_presence
   motion: sensor.bathroom_presence_motion_state   # states none/small/large; small|large = PIR motion
-  name: Bathroom
+  room: Bathroom
 
   persons:
     - person.mikkel

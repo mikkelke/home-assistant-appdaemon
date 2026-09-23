@@ -44,7 +44,7 @@ BASE_ARGS = {
     "persons": list(PERSONS),
     "nobody_home_min": 5,
     "no_motion_min": 30,
-    "name": "Bathroom",
+    "room": "Bathroom",
 }
 
 
