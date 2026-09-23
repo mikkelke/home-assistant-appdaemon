@@ -192,7 +192,11 @@ def aggregate_cycles(cycles, profiles: dict):
 
         if learn_key not in buckets:
             buckets[learn_key] = {"durations": [], "correct": 0, "total": 0, "prog": confirmed, "temp": conf_temp}
-        buckets[learn_key]["durations"].append(dur)
+        # Soak stretches the wash well beyond the programme's normal length - counting it would
+        # drag the learned average up for every future non-soak cycle. Accuracy stats (total/
+        # correct) are unaffected by soak, so those still count this record.
+        if (rec.get("selected_options") or {}).get("soak") != "on":
+            buckets[learn_key]["durations"].append(dur)
         buckets[learn_key]["total"] += 1
         if learn_key == pred_key:
             buckets[learn_key]["correct"] += 1
@@ -222,17 +226,23 @@ def aggregate_cycles(cycles, profiles: dict):
 
 def apply_learned_sample(learned: dict, centroids: dict, learn_key: str,
                          duration_min: float, energy_kwh: float, heating_bursts,
-                         heats: bool):
+                         heats: bool, skip_duration: bool = False):
     """Fold one newly-saved cycle into the in-memory learned durations and centroids.
 
-    Mutates both dicts in place and returns the new running average duration, so the
-    caller can log it. The centroid is only touched for programmes that heat, since
-    the signature match keys off energy rate.
+    Mutates both dicts in place and returns the new running average duration (None when
+    skip_duration), so the caller can log it. The centroid is only touched for programmes
+    that heat, since the signature match keys off energy rate.
+
+    skip_duration: True when duration_min is not representative of the programme's normal
+    length (soak was selected - see washer_monitor._save_cycle_feedback). Only the duration
+    average is skipped; the centroid still learns from this cycle.
     """
-    prev = learned.get(learn_key, {"n": 0, "avg": duration_min})
-    n_new = prev["n"] + 1
-    avg_new = (prev["avg"] * prev["n"] + duration_min) / n_new
-    learned[learn_key] = {"n": n_new, "avg": avg_new}
+    avg_new = None
+    if not skip_duration:
+        prev = learned.get(learn_key, {"n": 0, "avg": duration_min})
+        n_new = prev["n"] + 1
+        avg_new = (prev["avg"] * prev["n"] + duration_min) / n_new
+        learned[learn_key] = {"n": n_new, "avg": avg_new}
 
     if heats and duration_min and duration_min > 0:
         centroid_key = learn_key
@@ -251,11 +261,15 @@ def apply_learned_sample(learned: dict, centroids: dict, learn_key: str,
 
 
 def remove_learned_sample(learned: dict, centroids: dict, learn_key: str,
-                          duration_min, energy_kwh, heating_bursts):
+                          duration_min, energy_kwh, heating_bursts, skip_duration: bool = False):
     """Back one cycle out of the in-memory learned durations and centroids, for when a
     false Unemptied is retracted. Mutates both dicts in place; drops the key entirely
-    when the last sample goes."""
-    if learn_key in learned:
+    when the last sample goes.
+
+    skip_duration: True for a cycle that apply_learned_sample never counted toward the
+    duration average (soak was selected) - must mirror that call's skip_duration so this
+    undo does not remove a sample that was never added."""
+    if not skip_duration and learn_key in learned:
         old = learned[learn_key]
         n = old["n"] - 1
         if n <= 0:

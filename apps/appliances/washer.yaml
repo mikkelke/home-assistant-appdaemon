@@ -582,7 +582,11 @@ washer_monitor:
   #
   # Optional: wash option helpers — stored with each cycle in feedback (selected_options) for audit / future ETA.
   # option_water_plus_entity: input_boolean.washer_option_water_plus
-  # option_soak_entity: input_boolean.washer_option_soak
+  # Soak (Iblødsætning): stored in feedback like the other options, and also adds
+  # soak_duration_min (washer_programmes.yaml) to the Running ETA while on, for programmes
+  # where supports_soak is true. Reset to off in _transition_to_off so the next cycle starts
+  # clean. Cycles with soak on are excluded from duration learning (see _save_cycle_feedback).
+  option_soak_entity: input_boolean.washer_option_soak
   # option_prewash_entity: input_boolean.washer_option_prewash
   # option_short_entity: input_boolean.washer_option_short
   #

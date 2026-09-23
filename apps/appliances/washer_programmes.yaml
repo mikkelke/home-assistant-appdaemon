@@ -17,6 +17,12 @@
 #   1200 = Strygelet, Uld, Ekspres, Mørkt/Denim, Imprægnering; 900 = Finvask, Outdoor.
 # available_options = UI only (which toggles to show); supports_* = backend/validation.
 
+# Iblødsætning (soak): manual states default 30 min, adjustable 30min-2h via Iblødsætningstid
+# (see docs/miele-wea035-washer.md; not exposed to HA, so the default is what we can know).
+# Added to the displayed ETA (programme_duration_min/estimated_end_time) only, for programmes
+# where supports_soak is true and option_soak_entity is on - never to guard/finish-detection duration.
+soak_duration_min: 30
+
 programme_display_order:
   - ekspres
   - uld

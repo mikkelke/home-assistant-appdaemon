@@ -126,16 +126,47 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         Only then do we persist/learn temperature; otherwise learn_key is just programme."""
         return wp.programme_has_temperature(self.PROGRAMME_PROFILES, programme)
 
+    def _programme_supports_soak(self, programme: str | None) -> bool:
+        """True if this programme's YAML profile lists soak among available_options.
+
+        Reads the top-level profile directly rather than via _get_profile: for a programme
+        with by_temperature (e.g. bomuld), _get_profile returns only that sub-profile's own
+        keys, which do not include the programme-level supports_soak/available_options.
+        """
+        if not programme:
+            return False
+        return bool(self.PROGRAMME_PROFILES.get(programme, {}).get("supports_soak"))
+
+    def _soak_bonus_minutes(self, programme: str | None) -> int:
+        """Extra ETA minutes to show while the soak option helper is on, for a programme that
+        supports it. Manual default only (soak_duration_min in washer_programmes.yaml) - the
+        machine never reports the actually-configured soak length. Display-only: does not feed
+        _get_programme_duration/_get_guard_duration, so guard/finish-detection is unaffected.
+        """
+        entity = getattr(self, "option_soak_entity", None)
+        if not entity or not self._programme_supports_soak(programme):
+            return 0
+        try:
+            if self.get_state(entity) != "on":
+                return 0
+        except Exception:
+            return 0
+        return getattr(self, "_soak_duration_min", wp.DEFAULT_SOAK_DURATION_MIN)
+
     def _load_programme_profiles(self):
         """Load programme profiles from washer_programmes.yaml if present. Merge with defaults
         so we never lose e.g. 'unknown' or any default keys; YAML overrides/extends only.
         """
+        self._soak_duration_min = wp.DEFAULT_SOAK_DURATION_MIN
         prog_file = self.args.get("programmes_file")
         if not prog_file:
             prog_file = os.path.join(os.path.dirname(__file__), "washer_programmes.yaml")
         try:
             with open(prog_file, "r") as f:
                 data = yaml.safe_load(f) or {}
+            soak_min = data.get("soak_duration_min")
+            if isinstance(soak_min, (int, float)) and soak_min > 0:
+                self._soak_duration_min = soak_min
             profiles = data.get("programmes", {})
             order = data.get("programme_display_order")
             self._programme_display_order = order if isinstance(order, list) and order else list(self._PROGRAMME_DISPLAY_ORDER)
@@ -1126,6 +1157,8 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.listen_state(self._on_confirm_changed, self.confirm_entity)
         if self.temperature_entity:
             self.listen_state(self._on_confirm_changed, self.temperature_entity)
+        if self.option_soak_entity:
+            self.listen_state(self._on_soak_option_changed, self.option_soak_entity)
         if self.vibration_sensor:
             self.listen_state(self._vibration_changed, self.vibration_sensor)
 
@@ -2996,6 +3029,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 "progress_pct": None,
                 "programme_duration_min": None,
                 "programme_label": "",
+                "supports_soak": False,
                 "detected_programme": "",
                 "detected_temperature": "",
                 "predicted_programme": "",
@@ -3023,7 +3057,15 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self._set_state_entity( state="Off", attributes=clear_attrs)
             self.last_door_closed_trusted = False
             self.log(f"State -> Off ({reason})", level="INFO")
-            
+
+            # Soak is per-cycle - reset so the next wash starts clean regardless of how this
+            # one ended (normal Unemptied -> Emptied -> Off, or a direct/aborted -> Off).
+            if self.option_soak_entity:
+                try:
+                    self.call_service("input_boolean/turn_off", entity_id=self.option_soak_entity)
+                except Exception as e:
+                    self.log(f"Could not reset {self.option_soak_entity}: {e}", level="DEBUG")
+
             # Auto-analyze after cycle completes (if enabled and we had a valid cycle)
             if self.args.get("auto_analyze_cycles", False) and had_valid_cycle:
                 self.run_in(self._auto_analyze_after_cycle, 300)  # Wait 5 min for data to settle
@@ -3310,6 +3352,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         duration_min = removed.get("duration_min", 0)
         energy_kwh = removed.get("energy_kwh", 0)
         heating_bursts = removed.get("heating_bursts", 0)
+        # Mirror _save_cycle_feedback's skip_duration: a soak cycle was never added to the
+        # duration average, so undoing it must not subtract a sample that isn't there.
+        soak_selected = (removed.get("selected_options") or {}).get("soak") == "on"
         wfb.remove_learned_sample(
             self._learned_durations,
             self._history_centroids,
@@ -3317,6 +3362,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             duration_min,
             energy_kwh,
             heating_bursts,
+            skip_duration=soak_selected,
         )
         try:
             with open(self.feedback_file, "w") as f:
@@ -5246,6 +5292,11 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.log(f"  Skipped {skipped_unconfirmed} unconfirmed cycle(s) for learning", level="INFO")
         for learn_key, bucket in sorted(buckets.items()):
             n = len(bucket["durations"])
+            if n == 0:
+                # Every confirmed cycle for this key had soak on (aggregate_cycles excludes
+                # them) - no non-soak sample yet, so ETA keeps using the manual profile.
+                self.log(f"  {learn_key}: {bucket['total']} confirmed cycle(s), all soak - no duration sample yet", level="INFO")
+                continue
             avg = sum(bucket["durations"]) / n
             correct = bucket["correct"]
             total = bucket["total"]
@@ -5450,6 +5501,10 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # _on_confirm_push_action if/when the user taps the confirm push; applying it here too
         # double-counted it (n=1 at save, n=2 after the push confirmed it, n=1 again on the next
         # reload) since aggregate_cycles only ever counts a record once it is user-confirmed.
+        # Soak stretches duration_min well beyond the programme's normal length - excluded from
+        # the learned average the same way aggregate_cycles excludes it on reload (the centroid
+        # still learns from this cycle, same as apply_learned_sample's default).
+        soak_selected = (selected_options or {}).get("soak") == "on"
         avg_new = None
         if valid_for_learning and user_confirmed:
             avg_new = wfb.apply_learned_sample(
@@ -5460,6 +5515,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 energy_kwh,
                 heating_bursts,
                 self._get_profile(confirmed, confirmed_temperature).get("heats"),
+                skip_duration=soak_selected,
             )
 
         match = "OK" if predicted == confirmed else f"corrected (predicted {predicted})"
@@ -5471,10 +5527,11 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         duration_note = f"  [duration from {duration_source}]" if duration_source else ""
         idle_note = f"  (idle {idle_min:.0f} min excluded)" if idle_min is not None and idle_min >= 0 else ""
         end_note = f"  end_reason={end_reason}" if end_reason else ""
+        soak_note = "  (soak - duration not learned)" if soak_selected else ""
         learned_note = f"learned avg now {avg_new:.1f}min  " if avg_new is not None else ""
         self.log(
             f"Feedback saved: {self._log_safe(label)}{self._log_safe(temp_str)} "
-            f"- {match}  ({source})  duration {duration_min:.0f}min  energy {energy_kwh:.2f}kWh{spin_str}{duration_note}{idle_note}{end_note}  "
+            f"- {match}  ({source})  duration {duration_min:.0f}min  energy {energy_kwh:.2f}kWh{spin_str}{duration_note}{idle_note}{end_note}{soak_note}  "
             f"{learned_note}effective ETA {eff}min",
             level="INFO",
         )
@@ -5878,7 +5935,13 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         conf_temp_internal = self._temp_from_storage(rec.get("confirmed_temperature"))
         learn_key = f"{prog}|{conf_temp_internal}" if (conf_temp_internal and self._programme_has_temperature(prog)) else prog
         duration_min = rec.get("duration_min")
-        if rec.get("valid_for_learning") and isinstance(duration_min, (int, float)) and duration_min > 0:
+        soak_selected = (rec.get("selected_options") or {}).get("soak") == "on"
+        if (
+            rec.get("valid_for_learning")
+            and isinstance(duration_min, (int, float))
+            and duration_min > 0
+            and not soak_selected
+        ):
             prev = self._learned_durations.get(learn_key, {"n": 0, "avg": duration_min})
             n_new = prev["n"] + 1
             avg_new = (prev["avg"] * prev["n"] + duration_min) / n_new
@@ -6138,6 +6201,16 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                     self._guard_bar_class = (prog_key, temp)
                     self.log(f"Upgraded expected_dur_at_start: {old} -> {user_dur:.0f} min (user set temp {new})", level="INFO")
 
+    def _on_soak_option_changed(self, entity, attribute, old, new, kwargs):
+        """Refresh the published ETA immediately when the soak option toggles during Running,
+        same as _on_confirm_changed does for programme/temperature - otherwise the dashboard
+        would wait up to poll_interval_s for the next tick to pick up _soak_bonus_minutes."""
+        if new not in ("on", "off"):
+            return
+        current_state = self.get_state(self.state_entity) or ""
+        if current_state == "Running" and self.start_time:
+            self._push_running_eta_attributes()
+
     def _push_running_eta_attributes(self):
         """Update state entity with current ETA from the selected programme. Call when user confirms programme during Running so the UI updates immediately."""
         if not self.start_time:
@@ -6153,6 +6226,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             effective_dur = self._get_programme_duration(eta_prog, eta_temp, use_learned=False)
             if not effective_dur:
                 return
+            effective_dur += self._soak_bonus_minutes(eta_prog)
             # Sync the classifier's own state too, not just the published attrs -- other call
             # sites (e.g. _get_programme_duration_hint_for_history, line ~3057) read
             # self.detected_programme directly and would otherwise keep using the stale
@@ -6172,6 +6246,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             attrs["estimated_end_time"] = est_end.astimezone(self._local_tz()).strftime("%H:%M")
             attrs["elapsed_minutes"] = round(elapsed_min, 1)
             attrs["progress_pct"] = min(100, max(0, round(100 * elapsed_min / effective_dur))) if effective_dur else 0
+            attrs["supports_soak"] = self._programme_supports_soak(eta_prog)
             attrs["programme_confirmed_by_user"] = bool(self.programme_confirmed_by_user)
             attrs["programme_confirmed_by"] = self.confirmed_by_username or ""
             if self.expected_dur_at_start is not None:
@@ -6686,6 +6761,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 else:
                     blend = min(1.0, run_min / 130.0)
                     effective_dur = round(strygelet_dur + blend * (eco_dur - strygelet_dur))
+        effective_dur += self._soak_bonus_minutes(eta_prog)
         # Merge new attrs into existing HA state so persisted fields
         # (programme_confirmed_by_user, programme_confirmed_by, last_off_at, etc.)
         # survive the periodic update instead of being silently wiped every tick.
@@ -6722,6 +6798,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             "max_power_w": round(self.max_power_seen, 0),
             "delayed_start_trimmed": bool(self._delayed_start_trimmed),
             "delayed_start_waiting": bool(self._delay_waiting),
+            "supports_soak": self._programme_supports_soak(eta_prog),
             **pred_attrs,
         })
         if self.start_time:

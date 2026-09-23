@@ -22,6 +22,9 @@ PROGRAMME_DISPLAY_ORDER = [
 CANONICAL_SPIN = ["1400 rpm", "1200 rpm", "900 rpm", "700 rpm", "No spin"]
 SPIN_MAX_1200 = ["1200 rpm", "900 rpm", "700 rpm", "No spin"]   # Manual: Strygelet, Uld, Ekspres, Mørkt/Denim, Imprægnering
 SPIN_MAX_900 = ["900 rpm", "700 rpm", "No spin"]                 # Manual: Finvask, Outdoor
+# Fallback when washer_programmes.yaml's soak_duration_min is unavailable; manual default
+# (see docs/miele-wea035-washer.md).
+DEFAULT_SOAK_DURATION_MIN = 30
 DEFAULT_PROFILES = {
     "ekspres":   {"label": "Ekspres",   "default_temp": None,   "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C"], "allowed_spin_speeds": SPIN_MAX_1200, "default_temperature": "40°C", "default_spin": "1200 rpm", "available_options": ["short"], "by_temperature": {
         "cold": {"duration_min": 20, "max_energy_kwh": 0.25, "heats": False, "stable_min":  8, "max_dur_min": 30, "supports_anti_crease": True},
