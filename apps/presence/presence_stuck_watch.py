@@ -52,7 +52,7 @@ class PresenceStuckWatch(hass.Hass):
         self.persons = list(a.get("persons", []))
         self.nobody_home_min = float(a.get("nobody_home_min", 5))
         self.no_motion_min = float(a.get("no_motion_min", 30))
-        self.name = a.get("name") or "Room"
+        self.room_name = a.get("name") or "Room"
 
         self._notifier = self.get_app("MobileNotifier")
         self._nobody_home_since = None
@@ -72,7 +72,7 @@ class PresenceStuckWatch(hass.Hass):
             self.listen_state(self._on_person_change, person)
         self.run_every(self._tick, "now+60", 60)
 
-        self.log(f"PresenceStuckWatch initialized for {self.name}", level="INFO")
+        self.log(f"PresenceStuckWatch initialized for {self.room_name}", level="INFO")
 
     def _seed(self, entity, now):
         epoch = _parse_iso_epoch(self.get_state(entity, attribute="last_changed"))
@@ -138,24 +138,24 @@ class PresenceStuckWatch(hass.Hass):
 
     def _alert(self, message):
         self._stuck = True
-        self.log(f"PresenceStuckWatch: {self.name} presence stuck - {message}", level="WARNING")
-        self.create_task(self._push(f"{self.name} presence stuck?", message))
+        self.log(f"PresenceStuckWatch: {self.room_name} presence stuck - {message}", level="WARNING")
+        self.create_task(self._push(f"{self.room_name} presence stuck?", message))
 
     async def _push(self, title, message):
         try:
             sent = await self._notifier.notify(title=title, message=message, target="user")
         except Exception as e:
-            self.log(f"PresenceStuckWatch: {self.name} notify failed: {e}", level="WARNING")
+            self.log(f"PresenceStuckWatch: {self.room_name} notify failed: {e}", level="WARNING")
             self._stuck = False
             return
         if not sent:
-            self.log(f"PresenceStuckWatch: {self.name} notify reached nobody, will retry", level="WARNING")
+            self.log(f"PresenceStuckWatch: {self.room_name} notify reached nobody, will retry", level="WARNING")
             self._stuck = False
 
     def _close_episode(self, now):
         if self._stuck and self._presence_on_since is not None:
             minutes = (now - self._presence_on_since) / 60.0
-            self.log(f"PresenceStuckWatch: {self.name} episode cleared after {minutes:.0f} min", level="INFO")
+            self.log(f"PresenceStuckWatch: {self.room_name} episode cleared after {minutes:.0f} min", level="INFO")
         self._presence_on_since = None
         self._stuck = False
 

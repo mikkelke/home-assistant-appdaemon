@@ -60,7 +60,7 @@ def make_app(states=None, now=None):
     app.persons = list(PERSONS)
     app.nobody_home_min = 5.0
     app.no_motion_min = 30.0
-    app.name = "Bathroom"
+    app.room_name = "Bathroom"
     app._notifier = MagicMock()
     app._nobody_home_since = None
     app._stuck = False
@@ -111,7 +111,7 @@ class ArgParsing(unittest.TestCase):
         self.assertEqual(app.persons, PERSONS)
         self.assertEqual(app.nobody_home_min, 5.0)
         self.assertEqual(app.no_motion_min, 30.0)
-        self.assertEqual(app.name, "Bathroom")
+        self.assertEqual(app.room_name, "Bathroom")
 
     def test_defaults_when_optional_keys_omitted(self):
         args = {"presence": PRESENCE, "motion": MOTION}
@@ -119,7 +119,7 @@ class ArgParsing(unittest.TestCase):
         self.assertEqual(app.persons, [])
         self.assertEqual(app.nobody_home_min, 5.0)
         self.assertEqual(app.no_motion_min, 30.0)
-        self.assertEqual(app.name, "Room")
+        self.assertEqual(app.room_name, "Room")
 
 
 class SeedAtStartup(unittest.TestCase):
