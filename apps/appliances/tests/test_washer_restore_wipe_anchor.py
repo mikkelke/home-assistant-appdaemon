@@ -42,6 +42,7 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     sys.modules["appdaemon.plugins.hass.hassapi"] = hassapi
 
 import washer_monitor as wm  # noqa: E402
+from washer_plug_fixture import attach_plug  # noqa: E402
 
 UTC = timezone.utc
 # Incident timestamps (local 11:41 / 13:24, stored as the UTC the entity actually carries).
@@ -64,7 +65,7 @@ def make_restore_app(*, cycle_start=CYCLE_START, last_changed=WIPE_LAST_CHANGED,
     app.energy_sensor = "sensor.washer_plug_energy"
     app.confirm_entity = None
     app.start_w = 6.0
-    app.use_energy_detection = False
+    attach_plug(app)
     app.pause_window_minutes = 3
     app.restore_start_gap_minutes = 15
     app.restore_wipe_anchor_grace_s = 300

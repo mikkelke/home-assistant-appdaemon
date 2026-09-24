@@ -13,14 +13,10 @@
 #   FLAW 1  Unemptied -> Running false recovery via the power-PUSH route (_power_changed): the
 #           Unemptied branch's high_power_counter had no time dimension, so a single Miele
 #           anti-crease tumble (a few seconds of 40-80W) tripped the same 3-sample threshold a
-#           genuine resume needs. Fixed by requiring the streak to span a real window, mirroring
-#           _unemptied_door_recheck's own 60s-apart hardening (588a879).
-#   FLAW 2  _check_energy_finish had mid-function returns that skipped the tick's own reschedule
-#           (the anti-crease "stay in Running" branch, and the past-expected "announce
-#           immediately" branch when the transition was refused) - the dead energy_check_timer
-#           handle then also fooled _confirm_finished into skipping its power fallback ("energy
-#           detection is active"). _try_finish_via_standby also reported success even when its
-#           own _transition_to_unemptied() call was refused.
+#           genuine resume needs. Recovery is now decided only by the Unemptied recheck, on a
+#           60 s window of the plug's own consecutive reads (washer_plug.resumed).
+#   FLAW 2  _check_energy_finish had mid-function returns that skipped the tick's own reschedule.
+#           The tick now re-arms in finally while Running, whatever the body does.
 #   FLAW 3  An AddLoad pause's resume (_transition_to_running_from_pause) only ever re-armed
 #           poll_timer, never the energy tick - unlike every other Running entry point - so a
 #           single door-open-during-addload event permanently killed energy-based finish
@@ -38,13 +34,7 @@
 #           start-gap-correction branch and the unconditional restore call right after it both
 #           call _restore_energy_state_from_history(), which armed energy_check_timer without
 #           cancelling any handle already running.
-#   FLAW 7  (2026-09-10 follow-up) _standby_backstop_tick had the same "reports success
-#           unconditionally" defect as FLAW 2's _try_finish_via_standby: its three
-#           _transition_to_unemptied()/_transition_to_off() calls all returned True regardless
-#           of whether the transition actually landed, so a refused zero-power finish made
-#           _check_energy_finish's caller stop the tick without re-arming it (the caller's own
-#           fallthrough to the bottom-of-tick reschedule - already fixed under FLAW 2 - covers
-#           the False case once the return value is honest).
+#   FLAW 7  (2026-09-10 follow-up) a refused finish transition must not stop the tick.
 
 from __future__ import annotations
 
@@ -75,6 +65,7 @@ import washer_feedback as wfb  # noqa: E402
 
 import test_washer_restart_survival as trs  # noqa: E402
 import test_washer_door_aware_finish as dwf  # noqa: E402
+from washer_plug_fixture import FakeClock  # noqa: E402
 
 
 # =============================================================================
@@ -102,16 +93,34 @@ class Flaw1UnemptiedFalseRecoveryRequiresSustainedPower(unittest.TestCase):
         self.assertTrue(app.notification_sent)
 
     def test_sustained_high_power_still_recovers(self):
-        """Regression guard: the fix must not disable real false-Unemptied recovery - only
-        gate it on a genuine sustained window (samples minutes apart, not seconds)."""
+        """Regression guard: real false-Unemptied recovery still works - it is decided by the
+        Unemptied recheck on the plug's own reads (60 s of reads all >= 18 W), never by HA's
+        change reports, which _power_changed no longer acts on while Unemptied."""
         app = trs.make_full_init_app(sensor_state=None, helper_state="Unemptied", power_watts=0)
         app.attrs_store.setdefault(app.state_entity, {})["run_time_minutes"] = 120
+        clock = FakeClock()
+        app._plug.clock = clock
+        for i, watts in enumerate([40.0] * 31):
+            app._plug._ring.append((i * 2.0, watts))
+        clock.t = 60.0
 
-        for watts in (22, 47, 55, 60, 58):
-            app.now = app.now + timedelta(seconds=45)
-            app._power_changed(app.power_sensor, "state", None, str(watts), {})
+        app._unemptied_door_recheck({})
 
         self.assertEqual(app.state, "Running")
+
+    def test_reads_60_s_apart_do_not_recover(self):
+        """Review round 4: two reads a minute apart used to count as a sustained window."""
+        app = trs.make_full_init_app(sensor_state=None, helper_state="Unemptied", power_watts=0)
+        app.attrs_store.setdefault(app.state_entity, {})["run_time_minutes"] = 120
+        clock = FakeClock()
+        app._plug.clock = clock
+        app._plug._ring.extend([(0.0, 40.0), (60.0, 40.0)])
+        clock.t = 60.0
+
+        app._unemptied_door_recheck({})
+
+        self.assertEqual(app.state, "Unemptied")
+        self.assertIsNotNone(app.unemptied_door_recheck_timer)
 
 
 # =============================================================================
@@ -119,53 +128,36 @@ class Flaw1UnemptiedFalseRecoveryRequiresSustainedPower(unittest.TestCase):
 # =============================================================================
 
 class Flaw2EnergyTickRearmsOnEveryRunningExit(unittest.TestCase):
-    """The anti-crease 'stay in Running until standby detected' branch is a mid-function
-    return, not the tick's bottom-of-function reschedule - it must arm the next tick itself."""
+    """The finish tick re-arms in finally while Running: neither a refused finish nor an exception
+    anywhere in the tick body may end finish detection for the cycle."""
 
-    def test_anti_crease_stay_running_branch_rearms_the_tick(self):
-        NOW = trs.NOW
-        start = NOW - timedelta(minutes=115)
-        app = trs.make_full_init_app(
-            sensor_state=None,
-            helper_state=None,
-            power_watts=0,
-            now=NOW,
-            extra_args={"confirm_entity": "input_select.washer_confirmed_programme"},
-        )
-        # User-confirmed programme makes guard_dur deterministic (strygelet = 119 min),
-        # independent of the live classifier/guard-bar evolution.
-        app.states[app.confirm_entity] = "Strygelet"
-        app.programme_confirmed_by_user = True
+    def _running_app(self):
+        app = trs.make_full_init_app(sensor_state=None, helper_state=None, power_watts=0)
         app.state = "Running"
         app.states[app.state_entity] = "Running"
-        app.start_time = start
-        app.notification_sent = False
-        app.last_door_closed_trusted = False
-        app.energy_start = 0.0
-        app.states[app.energy_sensor] = 0.35  # keeps classification off the no-anti-crease "uld" branch
+        app.start_time = trs.NOW - timedelta(minutes=90)
+        return app
 
-        # ~115/119 min: near (but strictly before) expected end - reaches the anti-crease
-        # elif but not the "past expected end, announce immediately" branch.
-        points = []
-        t = NOW - timedelta(minutes=10)
-        watt_cycle = [2.0, 2.0, 45.0, 3.0, 2.0, 45.0, 3.0, 2.0, 45.0, 3.0]
-        i = 0
-        while t < NOW - timedelta(seconds=5):
-            points.append({"state": str(watt_cycle[i % len(watt_cycle)]), "last_changed": trs._iso(t)})
-            t += timedelta(seconds=60)
-            i += 1
-        points.append({"state": "45.0", "last_changed": trs._iso(NOW - timedelta(seconds=5))})
-        app._history[app.power_sensor] = points
-        app.states[app.power_sensor] = "45.0"
+    def test_tick_rearms_when_the_body_raises(self):
+        app = self._running_app()
 
+        def boom(current_state):
+            raise TimeoutError("HA publish timed out")
+        app._finish_tick_body = boom
+
+        with self.assertRaises(TimeoutError):
+            app._check_energy_finish({})
+        self.assertIsNotNone(app.energy_check_timer)
+        self.assertEqual(app.scheduled[-1][0], app._check_energy_finish)
+
+    def test_tick_stops_once_not_running(self):
+        app = self._running_app()
+        app.state = "Unemptied"
+        app.energy_check_timer = None
         before = len(app.scheduled)
         app._check_energy_finish({})
-
-        self.assertEqual(app.state, "Running")
-        self.assertTrue(app.in_finishing_tail)
-        self.assertIsNotNone(app.energy_check_timer)
-        new_ticks = [c for c in app.scheduled[before:] if c[0] == app._check_energy_finish]
-        self.assertEqual(len(new_ticks), 1, app.scheduled[before:])
+        self.assertIsNone(app.energy_check_timer)
+        self.assertEqual(app.scheduled[before:], [])
 
 
 # =============================================================================
@@ -354,6 +346,7 @@ def _make_tracked_boot_app(store_payload, power_history, power_watts, energy_his
         "stop_w": 3.0,
         "feedback_file": "/nonexistent/washer_feedback_test.json",
         "state_file": state_file,
+        "plug_host": "plug.invalid",
     }
     app.args = args
     app.AD = None
@@ -483,47 +476,26 @@ class Flaw6BootRestoreArmsOnlyOneEnergyTickLoop(unittest.TestCase):
 # FLAW 7 (follow-up) - _standby_backstop_tick must report whether its transition landed
 # =============================================================================
 
-class Flaw7StandbyBackstopRearmsWhenItsTransitionIsRefused(unittest.TestCase):
-    """_check_energy_finish's zero-power branch (if self._standby_backstop_tick(...): return)
-    relies on a True return meaning "the cycle actually finished, stop the tick". A refused
-    _transition_to_unemptied() used to still report True, so the caller returned without
-    re-arming - same defect class as FLAW 2's _try_finish_via_standby."""
+class Flaw7RefusedFinishRearmsTheTick(unittest.TestCase):
+    """A finish decision whose transition is refused (here: the cooling period) must leave the cycle
+    Running with the tick re-armed - never "finished" without a state change."""
 
-    def test_refused_zero_power_finish_rearms_the_tick(self):
-        NOW = trs.NOW
-        start = NOW - timedelta(minutes=125)  # past strygelet's 119 min guard_dur
-        app = trs.make_full_init_app(
-            sensor_state=None,
-            helper_state=None,
-            power_watts=0,
-            now=NOW,
-            extra_args={"confirm_entity": "input_select.washer_confirmed_programme"},
-        )
-        app.states[app.confirm_entity] = "Strygelet"
-        app.programme_confirmed_by_user = True
+    def test_refused_standby_finish_rearms_the_tick(self):
+        app = trs.make_full_init_app(sensor_state=None, helper_state=None, power_watts=0)
         app.state = "Running"
         app.states[app.state_entity] = "Running"
-        app.start_time = start
-        app.notification_sent = False
-        app.last_door_closed_trusted = False
-        app.energy_start = 0.0
-        app.states[app.energy_sensor] = 0.35  # keeps classification off the no-anti-crease "uld" branch
-        app.states[app.power_sensor] = "0.0"
-        # Only 4 points (< 5): washer_power.looks_like_cycle_end's own documented fail-safe
-        # ("not enough data") refuses _power_looks_like_cycle_end deterministically, which
-        # refuses _transition_to_unemptied inside _standby_backstop_tick - the exact "attempted
-        # but refused" shape this flaw is about, regardless of which of _transition_to_unemptied's
-        # own gates does the refusing.
-        app._history[app.power_sensor] = [
-            {"state": "0.0", "last_changed": trs._iso(NOW - timedelta(minutes=m))} for m in (9, 6, 3, 1)
-        ]
-        # Sustained hard 0W for 4 min (>= the 3.0 min normal-finish threshold).
-        app._zero_power_since = NOW - timedelta(minutes=4)
+        app.start_time = trs.NOW - timedelta(minutes=125)
+        app._activity_seen = True
+        app.last_state_change = trs.NOW - timedelta(minutes=1)   # inside the cooling period
+        clock = FakeClock(1000.0)
+        app._plug.clock = clock
+        for i in range(95):
+            app._plug._ring.append((1000.0 - (94 - i) * 2.0, 2.8))
+        app._plug._last_ok = 1000.0
 
         before = len(app.scheduled)
         app._check_energy_finish({})
 
-        # The refused transition must leave the cycle Running, not silently "finished".
         self.assertEqual(app.state, "Running")
         self.assertIsNotNone(app.energy_check_timer)
         new_ticks = [c for c in app.scheduled[before:] if c[0] == app._check_energy_finish]

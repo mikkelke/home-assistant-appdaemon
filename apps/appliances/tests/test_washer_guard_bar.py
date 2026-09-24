@@ -1,28 +1,14 @@
-# tests/test_washer_guard_bar.py - the finish-guard duration bar and the standby-backstop net.
+# tests/test_washer_guard_bar.py - the expected-duration bar (ETA) and the standby finish transition.
 # Run from repo root: python3 -m unittest discover -s apps/appliances/tests -q
 #
 # 2026-08-11 incident (washer_monitor.log, local times): Running 11:56:56; first classification
 # 'eco' at 12:05:08 froze expected_dur_at_start at 199 min; the classifier then re-classified
-# 8+ times (bomuld 60 <-> eco <-> finvask 30) through 14:05; the machine stopped drawing power
-# ~14:06; the finish guards kept demanding 92% of 199 = 183 min right up to the standby
-# backstop, which at 14:56:54 ("run 179 min") forced a silent Off: no announcement, no
-# Unemptied, no learning record. 12 such endings retained since 2026-03-04 (~11% of real washes).
-#
-# Two independent fixes under test, driving the REAL WasherMonitor methods (stubbed AppDaemon
-# surface, same harness style as test_washer_unavailable_grace.py):
-#
-#  1. The guard bar (expected_dur_at_start) is no longer frozen forever at the first guess:
-#     it raises to any longer live classification, and LOWERS only once the bar's own
-#     programme is energy-disproven and the shorter live key has held stable
-#     (wcls.resolve_guard_bar). The same tape shows why plain "stable for N minutes" is NOT
-#     enough: 'finvask' (65 min) held stably for 64 minutes (13:01-14:05) during a mid-cycle
-#     soak - lowering on stability alone would have false-announced a drum full of water at
-#     run ~100 min. Energy is monotone and soak-proof; rate/centroid matches are not.
-#
-#  2. The standby-backstop net: 5+ min of hard 0W on a cycle that demonstrably heated
-#     (observed_heating) and consumed >= min_energy_kwh now publishes Unemptied (announce +
-#     feedback) instead of silently forcing Off. Existing protections stay: the
-#     finish_min_run_minutes_warm floor (100 min) and the 5-minute zero-power requirement.
+# 8+ times (bomuld 60 <-> eco <-> finvask 30) through 14:05. The bar is no longer frozen forever
+# at the first guess: it raises to any longer live classification, and LOWERS only once the bar's
+# own programme is energy-disproven and the shorter live key has held stable
+# (wcls.resolve_guard_bar). 'finvask' (65 min) held stably for 64 minutes during a mid-cycle soak,
+# which is why plain stability is not enough. The bar drives the ETA only; finish decisions read
+# the plug (washer_plug) and carry no programme-duration guards.
 
 from __future__ import annotations
 
@@ -53,9 +39,8 @@ CYCLE_START = datetime(2026, 8, 11, 9, 56, 56, tzinfo=timezone.utc)
 
 
 def make_app(start=CYCLE_START):
-    """WasherMonitor with production guard knobs and a controllable clock. All guard-bar,
-    guard-duration and standby-backstop methods run FOR REAL; only transitions, logging and
-    entity access are stubbed."""
+    """WasherMonitor with production bar knobs and a controllable clock. The guard-bar methods run
+    FOR REAL; only transitions, logging and entity access are stubbed."""
     app = wm.WasherMonitor.__new__(wm.WasherMonitor)
 
     # Controllable clock
@@ -63,9 +48,6 @@ def make_app(start=CYCLE_START):
     app._now_utc = lambda: app.now
 
     # Production defaults (washer.yaml / initialize())
-    app.finish_guard_fraction = 0.92
-    app.finish_min_run_minutes_warm = 100.0
-    app.finish_min_run_minutes_cold = 50.0
     app.min_cycle_minutes = 25
     app.min_energy_kwh = 0.2
     app.max_running_hours = 5
@@ -88,7 +70,6 @@ def make_app(start=CYCLE_START):
     app._live_class_key = None
     app._live_class_since = None
     app._learned_durations = {}
-    app._zero_power_since = None
     app._pending_end_reason = None
 
     # Stubbed surface
@@ -99,10 +80,7 @@ def make_app(start=CYCLE_START):
     app.log = lambda *a, **kw: app.log_calls.append((a, kw))
     app.get_state = lambda entity, **kw: app.states.get(entity)
 
-    # Real _transition_to_unemptied/_transition_to_off always land here (no cooling-period/
-    # gate logic to simulate in this fixture) - update app.state to match, since
-    # _standby_backstop_tick's return value now reflects whether the transition actually
-    # changed state (see FLAW 7, 2026-09-10).
+    # Transitions land here (no cooling-period/gate logic to simulate in this fixture).
     def _stub_transition_to_unemptied(**kw):
         app.unemptied_calls.append(dict(kw))
         app.state = "Unemptied"
@@ -171,9 +149,7 @@ class TestResolveGuardBar(unittest.TestCase):
 
 class TestIncidentTapeRegression(unittest.TestCase):
     """Replay of the actual 2026-08-11 log tape. Final energy stayed eco-plausible (~0.55 kWh),
-    so the guard bar correctly never lowers and the finish guards stay shut - exactly as in
-    production. The fix under test is the backstop NET: the 0W-forced ending must now publish
-    Unemptied instead of the silent Off at 14:56:54."""
+    so the bar correctly never lowers."""
 
     def replay(self):
         app = make_app()
@@ -196,49 +172,13 @@ class TestIncidentTapeRegression(unittest.TestCase):
         self.assertEqual(app.expected_dur_at_start, 199)
         self.assertFalse(logged(app, "Lowered expected_dur_at_start"))
 
-    def test_finvask_soak_cannot_false_announce(self):
-        """finvask|30 was stable 13:01->14:05 (64 min) during a power-quiet soak. At run 100-128
-        the guards must STILL be shut (a stability-only rule would have opened them at ~100)."""
-        app = self.replay()
-        # Mid-soak checkpoints: run 100 and 128 min, live key finvask stable > 15 min.
-        for run_min in (100.0, 128.0):
-            app.now = app.start_time + timedelta(minutes=run_min)
-            guard = app._get_guard_duration("finvask", "30°C", ("finvask", "30°C"))
-            self.assertEqual(guard, 199)
-            self.assertFalse(app._meets_finish_time_guards(run_min, guard))
-
-    def test_forced_off_becomes_unemptied_via_net(self):
-        """14:56:54: run 179.97 min, 0W since 14:51:48 (5.1 min), guards still shut (183 min bar).
-        Old behaviour: silent forced Off. New: Unemptied with end_reason standby_backstop."""
-        app = self.replay()
-        app.now = app.start_time + timedelta(minutes=179.97)
-        app._zero_power_since = app.now - timedelta(minutes=5.1)
-        handled = app._standby_backstop_tick(app.now, "eco", None, ("eco", None))
-        self.assertTrue(handled)
-        self.assertEqual(len(app.unemptied_calls), 1)
-        self.assertEqual(app.off_calls, [])
-        self.assertEqual(app._pending_end_reason, "standby_backstop")
-        self.assertTrue(logged(app, "Standby backstop net"))
-
-    def test_net_does_not_preempt_the_normal_finish(self):
-        """When the guards ARE met the ordinary 3-minute standby finish still wins (no
-        standby_backstop end reason)."""
-        app = self.replay()
-        # Hypothetical: guards satisfied (run past 92% of 199).
-        app.now = app.start_time + timedelta(minutes=190.0)
-        app._zero_power_since = app.now - timedelta(minutes=3.2)
-        handled = app._standby_backstop_tick(app.now, "eco", None, ("eco", None))
-        self.assertTrue(handled)
-        self.assertEqual(len(app.unemptied_calls), 1)
-        self.assertIsNone(app._pending_end_reason)
-
 
 class TestGuardFollowsCorrectedClassification(unittest.TestCase):
     """The task's hypothetical variant of 2026-08-11: the machine was really running Bomuld 60
     (nominal 149 min; the learned ~156 is deliberately NOT used for guards - use_learned=False,
     polluted learning must never shorten a guard). Once cumulative energy disproves the frozen
     eco (>{0.78*1.1:.3} kWh) and bomuld60 holds stable 15 min, the bar follows the live
-    classification and the wash announces on time through the NORMAL standby path."""
+    classification."""
 
     def build(self):
         app = make_app()
@@ -257,32 +197,9 @@ class TestGuardFollowsCorrectedClassification(unittest.TestCase):
         self.assertEqual(app._guard_bar_class, ("bomuld", "60°C"))
         self.assertTrue(logged(app, "Lowered expected_dur_at_start"))
 
-    def test_run_179_now_reaches_unemptied_and_announces(self):
-        """Run 179.97 min >= 92% of 149 (137.1) and >= 100 warm floor -> the plain 3-minute
-        standby backstop transitions to Unemptied (announce path), no net needed."""
-        app = self.build()
-        app.now = app.start_time + timedelta(minutes=179.97)
-        guard = app._get_guard_duration("bomuld", "60°C", ("bomuld", "60°C"))
-        self.assertEqual(guard, 149)
-        self.assertTrue(app._meets_finish_time_guards(179.97, guard))
-        app._zero_power_since = app.now - timedelta(minutes=3.1)
-        handled = app._standby_backstop_tick(app.now, "bomuld", "60°C", ("bomuld", "60°C"))
-        self.assertTrue(handled)
-        self.assertEqual(len(app.unemptied_calls), 1)
-        self.assertEqual(app.off_calls, [])
-        self.assertIsNone(app._pending_end_reason)  # normal finish, not the net
-
-    def test_lowered_bar_still_blocks_too_early_finish(self):
-        """The lowered 149 bar keeps blocking before 137 min - following the classification
-        must not mean announcing mid-cycle."""
-        app = self.build()
-        app.now = app.start_time + timedelta(minutes=120.0)
-        guard = app._get_guard_duration("bomuld", "60°C", ("bomuld", "60°C"))
-        self.assertFalse(app._meets_finish_time_guards(120.0, guard))
-
 
 class TestAntiFlap(unittest.TestCase):
-    """Classification bouncing between keys must never oscillate the finish decision."""
+    """Classification bouncing between keys must never oscillate the bar."""
 
     def test_boundary_flapping_never_lowers_the_bar(self):
         """eco<->bomuld60 flipping every 30 s (energy jitter at the 0.85 kWh gate, as in the
@@ -298,9 +215,6 @@ class TestAntiFlap(unittest.TestCase):
             minute += 0.5
         self.assertEqual(app.expected_dur_at_start, 199)
         self.assertFalse(logged(app, "Lowered expected_dur_at_start"))
-        # And mid-cycle the guards stay shut against either key's bar.
-        run_min = minute
-        self.assertFalse(app._meets_finish_time_guards(run_min, app._get_guard_duration("bomuld", "60°C")))
 
     def test_stability_streak_resets_on_change(self):
         app = make_app()
@@ -327,8 +241,7 @@ class TestAntiFlap(unittest.TestCase):
 
 
 class TestUserConfirmationSupremacy(unittest.TestCase):
-    """A HUMAN-confirmed programme outranks the bar and the live classification in both
-    directions, exactly as before."""
+    """A HUMAN-confirmed programme outranks the live classification."""
 
     def confirmed_app(self, label, temp_label):
         app = make_app()
@@ -336,27 +249,6 @@ class TestUserConfirmationSupremacy(unittest.TestCase):
         app.states[app.confirm_entity] = label
         app.states[app.temperature_entity] = temp_label
         return app
-
-    def test_user_programme_beats_higher_bar(self):
-        app = self.confirmed_app("Bomuld", "60°C")
-        app.expected_dur_at_start = 199  # stale frozen eco
-        app._guard_bar_class = ("eco", None)
-        self.assertEqual(app._get_guard_duration("eco", None, ("eco", None)), 149)
-
-    def test_user_programme_beats_lowered_bar_upward(self):
-        app = self.confirmed_app("ECO", "40-60°C")
-        app.expected_dur_at_start = 149
-        app._guard_bar_class = ("bomuld", "60°C")
-        self.assertEqual(app._get_guard_duration("bomuld", "60°C", ("bomuld", "60°C")), 199)
-
-    def test_unconfirmed_selector_is_ignored(self):
-        """Selector holding a value WITHOUT programme_confirmed_by_user (auto-filled
-        prediction) must not drive the guard - falls through to the bar."""
-        app = make_app()
-        app.states[app.confirm_entity] = "Ekspres"
-        app.expected_dur_at_start = 199
-        app._guard_bar_class = ("eco", None)
-        self.assertEqual(app._get_guard_duration("eco", None, ("eco", None)), 199)
 
     def test_confirmed_classification_pins_live_key(self):
         """_classify_programme returns the user's key while confirmed, so the guard-bar
@@ -367,83 +259,21 @@ class TestUserConfirmationSupremacy(unittest.TestCase):
         self.assertEqual(app._classify_programme(), ("bomuld", "60°C"))
 
 
-class TestBackstopNetGuards(unittest.TestCase):
-    """The net's own preconditions: everything outside them keeps the existing forced-Off /
-    keep-checking behaviour."""
-
-    def stuck_app(self, run_min=179.97, zero_min=5.1, energy=0.55, heated=True):
-        app = make_app()
-        tick(app, 8.2, "eco", None, 0.30)  # bar 199 -> guards shut at run 179.97
-        app.observed_heating = heated
-        app.energy_used = energy
-        app.now = app.start_time + timedelta(minutes=run_min)
-        app._zero_power_since = app.now - timedelta(minutes=zero_min)
-        return app
-
-    def test_no_heating_still_forces_off(self):
-        app = self.stuck_app(heated=False, run_min=179.97)
-        handled = app._standby_backstop_tick(app.now, "eco", None, ("eco", None))
-        self.assertTrue(handled)
-        self.assertEqual(app.unemptied_calls, [])
-        self.assertEqual(len(app.off_calls), 1)
-
-    def test_energy_below_min_still_forces_off(self):
-        app = self.stuck_app(energy=0.15)
-        handled = app._standby_backstop_tick(app.now, "eco", None, ("eco", None))
-        self.assertTrue(handled)
-        self.assertEqual(app.unemptied_calls, [])
-        self.assertEqual(len(app.off_calls), 1)
-
-    def test_run_below_warm_floor_still_forces_off(self):
-        # 100-min warm floor untouched: a heated cycle that 0W-stalls at 95 min stays Off.
-        app = self.stuck_app(run_min=95.0)
-        handled = app._standby_backstop_tick(app.now, "eco", None, ("eco", None))
-        self.assertTrue(handled)
-        self.assertEqual(app.unemptied_calls, [])
-        self.assertEqual(len(app.off_calls), 1)
-
-    def test_five_minute_zero_power_requirement_untouched(self):
-        # 4 min of 0W with guards shut: keep checking, no transition either way.
-        app = self.stuck_app(zero_min=4.0)
-        handled = app._standby_backstop_tick(app.now, "eco", None, ("eco", None))
-        self.assertFalse(handled)
-        self.assertEqual(app.unemptied_calls, [])
-        self.assertEqual(app.off_calls, [])
-
-    def test_under_three_minutes_does_nothing(self):
-        app = self.stuck_app(zero_min=2.0)
-        handled = app._standby_backstop_tick(app.now, "eco", None, ("eco", None))
-        self.assertFalse(handled)
-        self.assertFalse(logged(app, "Standby backstop"))  # not even backstop logging yet
-
-
 class TestUnemptiedTransitionForReal(unittest.TestCase):
-    """Drive the REAL _transition_to_unemptied for the net path (this repo's incident history
-    says stubbing the delegate hides caller/delegate bugs): the standby_backstop end reason
-    must skip the power-pattern gate (5 min of hard 0W is stronger evidence than the gate),
-    announce over Sonos, and save a feedback record carrying end_reason=standby_backstop."""
+    """Drive the REAL _transition_to_unemptied for a standby finish (this repo's incident history
+    says stubbing the delegate hides caller/delegate bugs): the standby end reason carries its own
+    evidence (3 min of consecutive plug reads <= 3 W after wash activity), so it skips the
+    recorder power-pattern gate, announces over Sonos, and saves one record with end_reason=standby."""
 
     def full_app(self):
         app = make_app()
         tick(app, 8.2, "eco", None, 0.55)
         app.now = app.start_time + timedelta(minutes=179.97)
-        # A real backstop-driven finish always has a recent last_high_energy_at - power was last
-        # significant ~5 min before "now" (the backstop's own 5-min hard-0W requirement is why it
-        # fires at all). Missing here previously only by harness omission; D1's finish-anchor
-        # fallback chain (washer_monitor.py's _finish_anchor) now falls through this harness's gap
-        # to start_time+addload_window_minutes when unset, which is ~175min "late" for this tick
-        # and wrongly downgrades the announcement to a mobile push - not a real behavior change,
-        # just this test's setup catching up to what the anchor now actually needs.
+        # A standby finish on time: the last high sample was minutes ago.
         app.last_high_energy_at = app.now - timedelta(minutes=5)
+        app._spin_end_at = None
 
         # ---- _transition_to_unemptied surface ----
-        app.in_finishing_tail = False
-        app.in_finishing_tail_entered_at = None
-        app.last_tail_pulse_at = None
-        app.tail_pattern_locked = False
-        app.tail_pattern_cycle_seconds = None
-        app.tail_pattern_last_pulse_at = None
-        app.tail_pattern_locked_at = None
         app.state = "Running"
         app.confirmed_by_username = None
         app.last_state_change = None
@@ -461,9 +291,6 @@ class TestUnemptiedTransitionForReal(unittest.TestCase):
         app._cycle_actor = None
         app.last_door_closed_at = None
         app.last_door_closed_trusted = False
-        app._pending_tail_mean_w = None
-        app._pending_tail_std_w = None
-        app._pending_tail_peak_w = None
         app._last_saved_record_ts = None
         app.completion_guard_fraction = 0.65
         app.completion_guard_fraction_user_confirmed = 0.60
@@ -497,7 +324,7 @@ class TestUnemptiedTransitionForReal(unittest.TestCase):
         app._compute_final_and_confirmed_programme = lambda run, en, update_detected=False: (
             "eco", None, "eco", None
         )
-        # Power gate that would REFUSE - proves the standby_backstop reason skips it.
+        # Power gate that would REFUSE - proves the standby reason skips it.
         app.gate_queries = []
         app._power_looks_like_cycle_end = lambda *a, **kw: (app.gate_queries.append(1) or (False, 200.0, 500.0))
 
@@ -507,18 +334,18 @@ class TestUnemptiedTransitionForReal(unittest.TestCase):
         app._transition_to_unemptied = lambda **kw: wm.WasherMonitor._transition_to_unemptied(app, **kw)
         return app
 
-    def test_net_end_reason_skips_gate_announces_and_saves_feedback(self):
+    def test_standby_end_reason_skips_gate_announces_and_saves_feedback(self):
         app = self.full_app()
-        app._pending_end_reason = "standby_backstop"
+        app._pending_end_reason = "standby"
         app._transition_to_unemptied()
         self.assertEqual(app.state, "Unemptied")
-        self.assertEqual(app.gate_queries, [])  # gate skipped - 0W x 5 min already verified
+        self.assertEqual(app.gate_queries, [])
         self.assertEqual(app.notifications, ["Washer is ready to be emptied"])
         self.assertEqual(len(app.saved_feedback), 1)
-        self.assertEqual(app.saved_feedback[0]["end_reason"], "standby_backstop")
+        self.assertEqual(app.saved_feedback[0]["end_reason"], "standby")
         unemptied = [c for c in app.set_state_calls if c["state"] == "Unemptied"]
         self.assertEqual(len(unemptied), 1)
-        self.assertEqual(unemptied[0]["attributes"]["end_reason"], "standby_backstop")
+        self.assertEqual(unemptied[0]["attributes"]["end_reason"], "standby")
         self.assertTrue(unemptied[0]["attributes"]["cycle_complete"])
 
     def test_plain_low_power_path_still_honours_the_gate(self):
@@ -530,9 +357,10 @@ class TestUnemptiedTransitionForReal(unittest.TestCase):
         self.assertEqual(app.notifications, [])
         self.assertEqual(app.saved_feedback, [])
 
-    def test_standby_backstop_is_a_known_transition_path(self):
-        # Feedback migration must not normalize the new end reason away.
-        self.assertIn("standby_backstop", wcls.KNOWN_TRANSITION_PATHS)
+    def test_end_reasons_are_known_transition_paths(self):
+        # Feedback migration must not normalize these away - old records carry the retired ones.
+        for reason in ("standby", "spin_end", "standby_backstop", "tail_to_standby", "anti_crease_pattern"):
+            self.assertIn(reason, wcls.KNOWN_TRANSITION_PATHS)
 
 
 class TestGuardBarKeyPersistence(unittest.TestCase):

@@ -273,8 +273,6 @@ washer_monitor:
 
   # Core entities
   power_sensor: "sensor.washer_plug_power"
-  # Grace before a plug outage force-wipes the state; HA restarts and Shelly reboots recover well inside this.
-  power_unavailable_off_after_seconds: 180
   energy_sensor: "sensor.washer_plug_energy"
   door_sensor: "binary_sensor.washer_door_contact"
   # Vibration sensor: HOBEIAN Zigbee shock sensor mounted on the side panel. TELEMETRY ONLY
@@ -333,7 +331,6 @@ washer_monitor:
   
   # Monitor energy consumption - when energy stops increasing, cycle is done
   # This is more reliable than power detection because energy doesn't have brief spikes
-  use_energy_detection: true  # Enable energy-based finish detection
   #
   # DETECTION ALGORITHM (rolling-window implied-watts + adaptive threshold):
   #   The code maintains a 20-min ring buffer of (time, kWh) readings.
@@ -361,16 +358,13 @@ washer_monitor:
   #
   # Power gate: when implied watts have been low for 15 min, we require current power
   # below post_cycle_idle_watts (80W) so post-cycle slow spin (~40W) still allows finish.
-  energy_stable_minutes: 15   # Warm programmes only (> 13 min observed soak max)
                                # Cold/Wool programmes use 5 min (hardcoded - no soaks)
   energy_check_interval_s: 30 # Check every 30s; rolling window handles sensor aliasing
-  energy_stable_watts: 30.0   # True idle (e.g. 3.8-4.2W)
   # Post-cycle slow spin: washer may keep motor at 30-80W after cycle; treat as "idle" so we finish without waiting for 0W.
   energy_active_watts: 100.0    # Above this = main cycle (heating/spin); resets the 15 min timer
   post_cycle_idle_watts: 80.0   # Below this = idle or slow spin; we can declare cycle done (power gate uses this too)
   # When run is in last hour of expected duration (or past 85%), use this many minutes of stable energy to declare finish.
   # So we transition to Unemptied BEFORE the door opens (e.g. finish ~10:52, door opens 11:05).
-  finish_stable_minutes_near_end: 5
   # Optional: detect post-cycle slow-spin by power pattern (regular ripple ~10-50W, distinct from flat idle).
   # When detected we only require post_cycle_pattern_minutes (e.g. 5) instead of 15 min to finish.
   # post_cycle_pattern_window_minutes: 10   # Fetch this many minutes of power history
@@ -388,6 +382,14 @@ washer_monitor:
   # Cold washes (20°C) use as little as 0.14 kWh over 70 min; keep floor at 0.1 kWh
   # to accept any real program while rejecting accidental spin-only (<0.05 kWh) starts.
   min_energy_kwh: 0.1
+
+  # Finish decisions read the Shelly Plug S Gen3 directly (local RPC, no auth): a missing read is an explicit gap
+  # instead of a held value. See washer_plug.py for the decision rules. The plug takes its address from DHCP, so
+  # this address must stay reserved for it (MAC D0:CF:13:C7:C9:C0).
+  plug_host: 10.21.0.90
+  plug_poll_s: 2
+  plug_unreachable_push_minutes: 10   # well past a WiFi AP reboot or plug OTA (<= 5 min); pushes once per cycle
+  wash_activity_watts: 150            # a read at or above this during the cycle is wash evidence
   completion_guard_fraction: 0.65       # Min fraction of nominal duration for valid completion
   completion_guard_fraction_user_confirmed: 0.60  # Looser when user confirmed programme
 
@@ -401,24 +403,12 @@ washer_monitor:
 
   # Anti-crease (post-end tail): very low power (idle + small tumbling). Mid-cycle rinse can look similar
   # (mean ~50W, peaks 200W+), so we require low mean and optional max peak.
-  anti_crease_window_minutes: 8
-  anti_crease_tail_max_mean_w: 40.0    # Real anti-crease is low; 55 matched false rinse phase
-  anti_crease_tail_max_peak_w: 150     # Gentle tumbling only; mid-cycle rinse spikes 200W+
-  anti_crease_tail_min_std_w: 6.0
-  anti_crease_max_duty_above_active: 0.15
-  anti_crease_near_end_minutes: 25
-  anti_crease_min_runtime_minutes: 60   # When programme unknown
   # Past the expected duration, a confirmed anti-crease pattern IS the end signal - announce
   # immediately instead of waiting through FinishingTail's tail-pulse-timeout quiesce (the dryer
   # already works this way, ~4 min detections). A false positive here costs one announcement and
   # auto-reverts via the false-Unemptied recovery. Flip to false to restore the old wait-for-quiesce behavior.
-  anti_crease_announce_past_expected: true
-  finish_debug_window_minutes: 25       # When to emit finish/anti-crease debug logs
 
   # Stricter finish guards (stop false announcements when expected duration is wrong)
-  finish_guard_fraction: 0.92          # Require 92% of expected (was 85%) before declaring done
-  finish_min_run_minutes_warm: 100      # Never declare warm cycle done before 100 min
-  finish_min_run_minutes_cold: 50       # Never declare cold/unknown done before 50 min
 
   # Power-pattern gate: only declare cycle done when recent power looks like real end (anti-crease or off), not mid-cycle rinse
   finish_power_gate_max_mean_w: 45      # Anti-crease / tail: max mean W in last 8 min
@@ -427,29 +417,12 @@ washer_monitor:
   finish_power_gate_off_max_peak_w: 25  # Machine off: max peak W
 
   # Two-stage finish: announce when the next tail pulse fails to arrive (data: 55s = 0 early triggers).
-  tail_pulse_threshold_watts: 10.0   # Outside FinishingTail / generic pulse detection
   # FinishingTail only: power above this resets the standby timer (default 80). Miele anti-crease nudges are 10–55W;
   # using 10W here prevented ever reaching tail_pulse_timeout without loosening global guards.
-  finishing_tail_pulse_reset_watts: 80.0
-  tail_pulse_timeout_seconds: 55.0   # No pulse above finishing_tail_pulse_reset_watts for this long + power ≤ finish_standby_max = announce
-  finish_standby_max_watts: 8.0      # Current power must be ≤ this to announce
   # Extra reliability gate: require a short quiet window before announcing done.
   # This blocks false finish during late spin/tail where pulses can be < finishing_tail_pulse_reset_watts.
-  tail_idle_confirm_seconds: 120.0
-  tail_idle_peak_max_watts: 18.0
   # Tail cadence lock: when anti-crease pulses are regular, lock to that rhythm and announce
   # when expected pulses stop arriving (faster + more reliable than fixed timeout alone).
-  tail_pattern_pulse_threshold_watts: 20.0
-  tail_pattern_lock_window_minutes: 8.0
-  tail_pattern_lock_min_pulses: 6
-  tail_pattern_min_gap_seconds: 8.0
-  tail_pattern_max_gap_seconds: 120.0
-  tail_pattern_max_jitter_fraction: 0.55
-  tail_pattern_break_missed_pulses: 2.2
-  tail_pattern_break_confirm_seconds: 18.0
-  standby_max_watts: 5.0             # Legacy / standby backstop
-  standby_no_pulse_above_watts: 10.0
-  standby_quiet_seconds: 25.0
 
   # Safety watchdogs - prevent stuck states
   max_running_hours: 5      # No cycle runs >5 hours
@@ -470,7 +443,6 @@ washer_monitor:
   # TIMING THRESHOLDS
   # ============================================================================
   
-  no_recent_high_s: 300   # 5 min without significant power before finish (reduced from 10 min)
   cooling_period: 300     # Prevent state oscillation
 
   # ============================================================================
@@ -479,7 +451,6 @@ washer_monitor:
   
   # Low power threshold: requires 10 readings (5 min at 30s polling) of mostly low power
   # Uses 80% tolerance - allows brief spikes during finish detection
-  low_power_threshold: 10  # Reduced from 15 - 5 min at 30s polling (was 7.5 min)
   high_power_threshold: 3
   # After door close from Off/Emptied: need 2 consecutive readings >= start_w if within window and last_door_closed_trusted; else 3. Passive arm expiry only changes threshold (no counter reset).
   door_close_fast_start_window_s: 600

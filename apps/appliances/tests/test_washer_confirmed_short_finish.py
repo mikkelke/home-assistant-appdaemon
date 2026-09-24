@@ -1,22 +1,13 @@
-# tests/test_washer_confirmed_short_finish.py - a user-confirmed programme that doesn't
-# support anti-crease (e.g. Uld) must not sit behind the generic warm floor once its own
-# energy rules out anything heavier, and a genuinely flat tail must not be refused just
-# because an event-driven plug reported too few points in the window.
+# tests/test_washer_confirmed_short_finish.py - a short confirmed wash with no anti-crease phase
+# (2026-09-23 Uld 30C, 39 min, one heating burst, 0.202 kWh) must be announced once, on time.
 # Run from repo root: python3 -m unittest discover -s apps/appliances/tests -q
 #
-# 2026-09-23: a confirmed Uld 30C wash (39 min, one heating burst, 0.202 kWh) was never
-# announced. Two independent guards blocked it: _get_finish_min_run_minutes jumped to the
-# 100min warm floor on the first heating burst and had no way back down even though Uld
-# doesn't support anti-crease and its own 39min duration had long passed; _tail_idle_window_ok
-# demanded 3+ recorder points in the tail window, but the plug only reports on change, so a
-# flat tail landed 1-2.
-#
-# TestConfirmedUldFloor/TestSparseTailIdleOk drive the real washer_monitor.py methods (via
-# test_washer_guard_bar's make_app fixture) and the new pure washer_power.sparse_tail_idle_ok
-# directly. TestConfirmedUldReplay drives the real WasherMonitor end to end
-# (make_full_init_app, see test_washer_restart_survival.py) against the actual recorded cycle
-# in tests/fixtures/washer_uld_2026_09_23.json, with a heap-timed run_in so the recurring
-# _check_energy_finish tick fires for real.
+# It was never announced at the time: a 100-minute warm floor and a 3-recorder-point tail rule
+# both blocked it. Neither exists any more - finish decisions read the plug directly and carry
+# no programme-duration guards. The replay drives the real WasherMonitor end to end
+# (make_full_init_app, see test_washer_restart_survival.py) against the recorded cycle in
+# tests/fixtures/washer_uld_2026_09_23.json, with a heap-timed run_in so the recurring
+# _check_energy_finish tick fires for real and the plug reads step-held on the 2 s grid.
 
 from __future__ import annotations
 
@@ -33,85 +24,11 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import test_washer_guard_bar as tgb  # noqa: E402  (installs the appdaemon stub; make_app fixture)
-import test_washer_restart_survival as trs  # noqa: E402
+import test_washer_restart_survival as trs  # noqa: E402  (installs the appdaemon stub)
 
-import washer_power as wpow  # noqa: E402
+import washer_plug as wplug  # noqa: E402
 
 FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "washer_uld_2026_09_23.json"
-
-
-class TestConfirmedUldFloor(unittest.TestCase):
-    """_get_finish_min_run_minutes: a confirmed no-anti-crease programme (Uld) drops the
-    floor to its own confirmed duration once energy rules out anything heavier. Programmes
-    that DO support anti-crease keep the 100min warm floor regardless of energy."""
-
-    def confirmed_app(self, label, temp_label, energy_kwh):
-        app = tgb.make_app()
-        app.observed_heating = True
-        app.programme_confirmed_by_user = True
-        app.states[app.confirm_entity] = label
-        app.states[app.temperature_entity] = temp_label
-        app.energy_used = energy_kwh
-        return app
-
-    def test_confirmed_uld_30_lowers_floor_to_its_own_duration(self):
-        app = self.confirmed_app("Uld", "30°C", 0.202)
-        self.assertEqual(app._get_finish_min_run_minutes(), 39)
-
-    def test_confirmed_uld_30_high_energy_stays_at_warm_floor(self):
-        # 0.35 kWh exceeds 0.28 * 1.10 - could be a heavier programme, so the floor must hold.
-        app = self.confirmed_app("Uld", "30°C", 0.35)
-        self.assertEqual(app._get_finish_min_run_minutes(), 100.0)
-
-    def test_unconfirmed_heated_stays_at_warm_floor(self):
-        app = tgb.make_app()
-        app.observed_heating = True
-        self.assertEqual(app._get_finish_min_run_minutes(), 100.0)
-
-    def test_confirmed_bomuld_60_stays_at_warm_floor(self):
-        app = self.confirmed_app("Bomuld", "60°C", 0.202)
-        self.assertEqual(app._get_finish_min_run_minutes(), 100.0)
-
-    def test_confirmed_finvask_30_stays_at_warm_floor(self):
-        app = self.confirmed_app("Finvask", "30°C", 0.202)
-        self.assertEqual(app._get_finish_min_run_minutes(), 100.0)
-
-    def test_guards_false_at_38_9_true_at_39_0(self):
-        app = self.confirmed_app("Uld", "30°C", 0.202)
-        guard_dur = app._get_guard_duration()
-        self.assertEqual(guard_dur, 39)
-        self.assertFalse(app._meets_finish_time_guards(38.9, guard_dur))
-        self.assertTrue(app._meets_finish_time_guards(39.0, guard_dur))
-
-
-class TestSparseTailIdleOk(unittest.TestCase):
-    """washer_power.sparse_tail_idle_ok: the < 3 point fallback _tail_idle_window_ok uses."""
-
-    NOW = datetime(2026, 9, 23, 10, 0, 0, tzinfo=timezone.utc)
-    CUTOFF = NOW - timedelta(seconds=120)
-    STOP_W = 3.0
-
-    def test_single_point_at_the_cutoff_is_ok(self):
-        points = [(self.NOW - timedelta(seconds=120), 2.8)]
-        self.assertTrue(wpow.sparse_tail_idle_ok(points, self.CUTOFF, self.STOP_W))
-
-    def test_two_points_inside_the_window_is_ok(self):
-        points = [(self.NOW - timedelta(seconds=120), 2.8), (self.NOW - timedelta(seconds=24), 2.9)]
-        self.assertTrue(wpow.sparse_tail_idle_ok(points, self.CUTOFF, self.STOP_W))
-
-    def test_power_above_stop_w_fails(self):
-        points = [(self.NOW - timedelta(seconds=120), 4.0), (self.NOW - timedelta(seconds=60), 3.9)]
-        self.assertFalse(wpow.sparse_tail_idle_ok(points, self.CUTOFF, self.STOP_W))
-
-    def test_gap_before_the_first_point_fails(self):
-        # Earliest point is only 90s back though the window opened 120s ago - the missing 30s
-        # is unobserved, not known-idle.
-        points = [(self.NOW - timedelta(seconds=90), 2.8)]
-        self.assertFalse(wpow.sparse_tail_idle_ok(points, self.CUTOFF, self.STOP_W))
-
-    def test_no_points_fails(self):
-        self.assertFalse(wpow.sparse_tail_idle_ok([], self.CUTOFF, self.STOP_W))
 
 
 def _production_args():
@@ -125,8 +42,8 @@ def _production_args():
 
 
 class TestConfirmedUldReplay(unittest.TestCase):
-    """End-to-end replay of the real 2026-09-23 Uld cycle through make_full_init_app - proves
-    both fixes together turn "never announced" into one on-time Unemptied + one Sonos call."""
+    """End-to-end replay of the real 2026-09-23 Uld cycle through make_full_init_app: one
+    on-time Unemptied (standby) and one Sonos call."""
 
     ENTITY_OF = {
         "power": "sensor.washer_plug_power",
@@ -227,6 +144,18 @@ class TestConfirmedUldReplay(unittest.TestCase):
                 app.now = due
                 cb(kw)
 
+        power = series[self.ENTITY_OF["power"]]
+
+        def read():
+            held = [s for tt, s in power if tt <= app.now]
+            if not held or held[-1] in ("unknown", "unavailable"):
+                raise TimeoutError("plug not reporting")
+            return float(held[-1])
+
+        app._plug._read = read
+        app._plug.clock = lambda: (app.now - t_start).total_seconds()
+        app._plug._last_ok = 0.0
+
         listeners = {
             self.ENTITY_OF["power"]: app._power_changed,
             self.ENTITY_OF["door"]: app._door_state_changed,
@@ -236,9 +165,17 @@ class TestConfirmedUldReplay(unittest.TestCase):
         events = sorted(
             (tt, ent, s) for ent, evs in series.items() for tt, s in evs if t_start < tt <= t_stop
         )
+        t = t_start + timedelta(seconds=wplug.POLL_S)
+        while t <= t_stop:
+            events.append((t, "__read__", None))
+            t += timedelta(seconds=wplug.POLL_S)
+        events.sort(key=lambda e: e[0])
         for tt, ent, s in events:
             fire_timers(tt)
             app.now = tt
+            if ent == "__read__":
+                app._plug.poll_once()
+                continue
             old = app.states.get(ent)
             app.states[ent] = s
             if ent in listeners and old != s:
@@ -246,12 +183,12 @@ class TestConfirmedUldReplay(unittest.TestCase):
         fire_timers(t_stop)
         return app
 
-    def test_announces_once_via_tail_to_standby_in_window(self):
+    def test_announces_once_via_standby_in_window(self):
         app = self._run()
 
         self.assertEqual(len(self.transitions), 1, self.transitions)
         transition_time, end_reason = self.transitions[0]
-        self.assertEqual(end_reason, "tail_to_standby")
+        self.assertEqual(end_reason, "standby")
 
         # 11:08:26-11:13:00 local (Europe/Copenhagen, +02) = 09:08:26-09:13:00 UTC.
         window_start = datetime(2026, 9, 23, 9, 8, 26, tzinfo=timezone.utc)

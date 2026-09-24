@@ -111,6 +111,7 @@ def make_full_init_app(
     energy_history=None,
     now=NOW,
     extra_args=None,
+    get_history_fn=None,
 ):
     """WasherMonitor with initialize() run for real, end to end - including the real
     _restore_running_state, _resolve_store_candidate, _infer_boot_start_time_from_history and
@@ -152,6 +153,7 @@ def make_full_init_app(
         "stop_w": 3.0,
         "feedback_file": "/nonexistent/washer_feedback_test.json",
         "state_file": state_file,
+        "plug_host": "plug.invalid",
     }
     if extra_args:
         args.update(extra_args)
@@ -194,6 +196,9 @@ def make_full_init_app(
         app.set_state_calls.append(
             {"entity": entity, "state": state, "attributes": attributes, "replace": replace}
         )
+        # HA semantics: last_changed moves only when the state string changes (attributes move last_updated).
+        if state is not None and app.states.get(entity) != state or entity not in app.last_changed_store:
+            app.last_changed_store[entity] = _iso(app._now_utc())
         if state is not None:
             app.states[entity] = state
         if attributes is not None:
@@ -201,7 +206,6 @@ def make_full_init_app(
                 app.attrs_store[entity] = dict(attributes)
             else:
                 app.attrs_store.setdefault(entity, {}).update(attributes)
-        app.last_changed_store[entity] = _iso(app._now_utc())
 
     app.set_state = set_state
 
@@ -225,7 +229,7 @@ def make_full_init_app(
     def get_history(entity_id=None, start_time=None, end_time=None, **kw):
         return [list(app._history.get(entity_id, []))]
 
-    app.get_history = get_history
+    app.get_history = get_history_fn or get_history
 
     app.log_calls = []
     app.log = lambda *a, **kw: app.log_calls.append((a, kw))
@@ -246,6 +250,7 @@ def make_full_init_app(
     app.get_app = lambda name: None
 
     app.initialize()
+    app._plug.start = lambda: None  # a test that runs the scheduled callbacks must never start a real read thread
     return app
 
 

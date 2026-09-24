@@ -64,6 +64,7 @@ import washer_classify as wcls
 import washer_feedback as wfb
 import washer_history as whist
 import washer_power as wpow
+import washer_plug as wplug
 import washer_profiles as wp
 import cycle_store as cystore
 
@@ -126,32 +127,132 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         Only then do we persist/learn temperature; otherwise learn_key is just programme."""
         return wp.programme_has_temperature(self.PROGRAMME_PROFILES, programme)
 
-    def _programme_supports_soak(self, programme: str | None) -> bool:
-        """True if this programme's YAML profile lists soak among available_options.
-
-        Reads the top-level profile directly rather than via _get_profile: for a programme
-        with by_temperature (e.g. bomuld), _get_profile returns only that sub-profile's own
-        keys, which do not include the programme-level supports_soak/available_options.
-        """
-        if not programme:
-            return False
-        return bool(self.PROGRAMME_PROFILES.get(programme, {}).get("supports_soak"))
-
-    def _soak_bonus_minutes(self, programme: str | None) -> int:
-        """Extra ETA minutes to show while the soak option helper is on, for a programme that
-        supports it. Manual default only (soak_duration_min in washer_programmes.yaml) - the
-        machine never reports the actually-configured soak length. Display-only: does not feed
-        _get_programme_duration/_get_guard_duration, so guard/finish-detection is unaffected.
-        """
+    def _soak_offset_minutes(self) -> int:
+        """Extra minutes the soak option adds to this cycle; the machine does not report the configured soak time."""
         entity = getattr(self, "option_soak_entity", None)
-        if not entity or not self._programme_supports_soak(programme):
+        if not entity:
             return 0
         try:
-            if self.get_state(entity) != "on":
-                return 0
+            return self._soak_duration_min if self.get_state(entity) == "on" else 0
         except Exception:
             return 0
-        return getattr(self, "_soak_duration_min", wp.DEFAULT_SOAK_DURATION_MIN)
+
+    def _start_plug_poller(self, kwargs):
+        """Started once initialize() has fully succeeded, so a failed initialize never leaves a thread behind."""
+        self._plug.start()
+
+    def terminate(self):
+        self._plug.stop()
+
+    def _wash_activity(self):
+        """Wash evidence for this cycle: restored with the cycle, or a plug read at or above wash_activity_watts since
+        the cycle started (the poller's evidence period begins at every cycle start). None (not False) while an
+        upgrade-time recorder lookup failed and has not yet been retried - see
+        _retry_activity_seen_from_recorder."""
+        if self._activity_seen is None:
+            self._retry_activity_seen_from_recorder()
+        if not self._activity_seen and self._plug.peak() >= self.wash_activity_watts:
+            self._activity_seen = True
+        return self._activity_seen
+
+    def _retry_activity_seen_from_recorder(self):
+        """Retries the _finalize_restored_cycle_identity boot lookup on later finish-decision
+        ticks: a transient recorder failure there leaves self._activity_seen as None (unknown)
+        rather than a hard False, so a wash that already happened before this boot is never
+        mistaken for a cycle that never washed (see _finish_decision_tick's hard_off backstop).
+        Throttled to at most once per history_check_interval_s; stops on its own once
+        _activity_seen resolves to True/False or the cycle ends (nothing calls _wash_activity,
+        and so this, once self.state leaves Running/Paused)."""
+        now = self._now_utc()
+        if self._activity_recorder_retry_after is not None and now < self._activity_recorder_retry_after:
+            return
+        interval_s = int(self.args.get("history_check_interval_s", 300))
+        self._activity_recorder_retry_after = now + timedelta(seconds=interval_s)
+        result = self._activity_in_recorder()
+        if result is not None:
+            self._activity_seen = result
+
+    def _activity_in_recorder(self):
+        """Restore fallback when the persisted cycle lacks wash activity (older store, a start_time that moved): did the
+        recorder see the plug at or above wash_activity_watts since the cycle started? Evidence of activity only -
+        recorder points never enter a decision window.
+
+        Returns True/False when the recorder answered (even a clean "no activity found" is a
+        real, final answer), or None when the query itself failed - a transient recorder/history
+        API problem must never be reported to the caller as "no activity" (see
+        _retry_activity_seen_from_recorder, which retries only the None case)."""
+        if not self.start_time:
+            return False
+        try:
+            hist = self._flatten_history(
+                self.get_history(entity_id=self.power_sensor, start_time=self.start_time, end_time=self._now_utc()),
+                self.power_sensor,
+            )
+            return any(w >= self.wash_activity_watts for _, w in whist.parse_power_points(hist))
+        except Exception as e:
+            self.log(f"Could not read power history for wash activity: {e}", level="DEBUG")
+            return None
+
+    def _finish_decision_tick(self, now) -> bool:
+        """The two autonomous finishes, both decided only on the plug's own reads (washer_plug.window): the
+        end-of-programme standby level after wash activity, or the final spin followed by the anti-crease nudge train.
+        A cycle that never washed and sits hard off goes to Off. Reads the plug did not answer pause all three."""
+        samples = self._plug.snapshot()
+        mono = self._plug.clock()
+        poll_s = self.plug_poll_s
+        offline_s = mono - self._plug.last_ok()
+        if (offline_s >= self.plug_unreachable_push_minutes * 60
+                and not self._plug_offline_pushed and not self._plug_outage_pushed):
+            self._plug_offline_pushed = True
+            self._push_mobile(
+                f"Washer plug has not answered for {offline_s / 60:.0f} min - finish detection is paused "
+                f"until it does; opening the door still ends the cycle."
+            )
+        if wplug.standby(samples, mono, poll_s):
+            if self._wash_activity() and self._get_run_duration_minutes() >= self.min_cycle_minutes:
+                self.log(f"Standby finish: plug <= {wplug.STANDBY_W:.1f}W for {wplug.STANDBY_S}s after a wash", level="INFO")
+                self._spin_end_at = None
+                self._pending_end_reason = "standby"
+                self._transition_to_unemptied()
+                return self.state != "Running"
+            if not self._wash_activity() and wplug.hard_off(samples, mono, poll_s):
+                self.log(f"Hard off for {wplug.HARD_OFF_S}s without a wash - Off", level="WARNING")
+                self._transition_to_off("Standby without a wash")
+                return self.state != "Running"
+            return False
+        end = wplug.spin_end(samples, mono, poll_s)
+        if end is None:
+            return False
+        self._spin_end_at = now - timedelta(seconds=mono - end)
+        self.log(f"Spin-end finish: final spin ended {self._strftime_local(self._spin_end_at)}, nudge train since", level="INFO")
+        self._pending_end_reason = "spin_end"
+        self._transition_to_unemptied()
+        if self.state == "Running":
+            self._spin_end_at = None
+        return self.state != "Running"
+
+    def _arm_finish_tick(self):
+        self._safe_cancel_timer(self.energy_check_timer)
+        self.energy_check_timer = self.run_in(self._check_energy_finish, self.energy_check_interval)
+
+    def _set_state_entity(self, *, _store_only=False, **kwargs):
+        """The mixin's publish, reordered: HA first, then the durable store. A publish that raises leaves no trace -
+        self.state and the cooling clock return to what HA last accepted, nothing is persisted, and the exception
+        reaches the caller, whose own tick retries. Internal state therefore never runs ahead of the entity."""
+        if _store_only:
+            return super()._set_state_entity(_store_only=True, **kwargs)
+        state = kwargs.get("state")
+        try:
+            self.set_state(self.state_entity, **kwargs)
+        except Exception:
+            if state is not None and getattr(self, "_published", None) is not None:
+                self.state, self.last_state_change = self._published
+            raise
+        if state is not None:
+            self._published = (state, getattr(self, "last_state_change", None))
+        self._save_cycle_state(new_state=state)
+        if state is not None:
+            self._sync_ui_select(state)
 
     def _load_programme_profiles(self):
         """Load programme profiles from washer_programmes.yaml if present. Merge with defaults
@@ -307,6 +408,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             lambda: self.detected_temperature,
             lambda: self.expected_dur_at_start,
             lambda: self._guard_bar_class,
+            lambda: bool(self._activity_seen),
             lambda: bool(self.programme_confirmed_by_user),
             lambda: self.last_door_closed_at,
         )
@@ -356,28 +458,8 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 lambda: cystore.format_utc(self.last_high_energy_at) if self.last_high_energy_at else ""
             ),
             "notification_sent": lambda: bool(self.notification_sent),
-            "finish_confirmed": lambda: bool(self.finish_confirmed),
-            "in_finishing_tail": lambda: bool(self.in_finishing_tail),
-            "in_finishing_tail_entered_at": (
-                lambda: cystore.format_utc(self.in_finishing_tail_entered_at)
-                if self.in_finishing_tail_entered_at else ""
-            ),
-            "anti_crease_tail_since": (
-                lambda: cystore.format_utc(self._anti_crease_tail_since)
-                if self._anti_crease_tail_since else ""
-            ),
-            "last_tail_pulse_at": (
-                lambda: cystore.format_utc(self.last_tail_pulse_at) if self.last_tail_pulse_at else ""
-            ),
-            "tail_pattern_locked": lambda: bool(self.tail_pattern_locked),
-            "tail_pattern_cycle_seconds": lambda: self.tail_pattern_cycle_seconds,
-            "tail_pattern_last_pulse_at": (
-                lambda: cystore.format_utc(self.tail_pattern_last_pulse_at) if self.tail_pattern_last_pulse_at else ""
-            ),
-            "tail_pattern_locked_at": (
-                lambda: cystore.format_utc(self.tail_pattern_locked_at) if self.tail_pattern_locked_at else ""
-            ),
             "door_opened_during_cycle": lambda: bool(self.door_opened_during_cycle),
+            "activity_seen": lambda: bool(self._activity_seen),
         }
 
     def _cycle_store_payload(self, state_str) -> dict:
@@ -447,11 +529,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.stop_w = float(self.args["stop_w"])
         self.run_for = int(self.args.get("run_for", 60))
         self.programs = self.args.get("programs", {})
-        # Plug/state entity unavailable: tolerate short gaps (HA restart, ESPHome OTA flash) before
-        # force-wiping a Running cycle - see dishwasher_monitor.py's power_unavailable_error_after_seconds
-        # for the same guard (2026-07-17 log investigation: dishwasher absorbs these with zero false
-        # transitions; washer used to force Off instantly and destroy cycle tracking/learning data).
-        self.power_unavailable_off_after_seconds = int(self.args.get("power_unavailable_off_after_seconds", 180))
 
         # Delayed start (Miele delay timer): a brief selection-burst power spike (up to ~60W for
         # ~15 min while the user picks a programme) trips start detection, then the machine sits
@@ -502,11 +579,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
 
         # Power thresholds
         self.significant_w = float(self.args.get("significant_w", 30))
-        self.no_recent_high_s = int(self.args.get("no_recent_high_s", 600))
 
         # Consecutive reading thresholds
         self.high_power_threshold = int(self.args.get("high_power_threshold", 3))
-        self.low_power_threshold = int(self.args.get("low_power_threshold", 15))
 
         # Power readings buffer
         self.power_readings = []
@@ -531,89 +606,56 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.cooling_period = int(self.args.get("cooling_period", 300))
         
         # Energy-based finish detection (primary method)
-        self.use_energy_detection = self.args.get("use_energy_detection", True)
-        self.energy_stable_minutes = int(self.args.get("energy_stable_minutes", 15))  # Default 15 min
-        self.energy_check_interval = int(self.args.get("energy_check_interval_s", 30))  # Check every 30 seconds
+        self.energy_check_interval = int(self.args.get("energy_check_interval_s", 30))
+        self.guard_reclass_stable_minutes = float(self.args.get("guard_reclass_stable_minutes", 15.0))
+        self.guard_energy_disproof_margin = float(self.args.get("guard_energy_disproof_margin", 1.10))
+        # The plug's own reads (washer_plug) are the only power input to finish decisions; HA's power entity still
+        # drives start detection, the recorder and the dashboard, and its outages never change the washer state.
+        self.plug_host = self.args["plug_host"]
+        self.plug_poll_s = float(self.args.get("plug_poll_s", wplug.POLL_S))
+        self._plug = wplug.PlugPoller(lambda: wplug.read_switch(self.plug_host), self.plug_poll_s)
+        self._plug_offline_pushed = False
+        self.wash_activity_watts = float(self.args.get("wash_activity_watts", wplug.ACTIVITY_W))
+        self.plug_unreachable_push_minutes = float(self.args.get("plug_unreachable_push_minutes", 10))
+        self._spin_end_at = None
+        self._activity_seen = False
+        # None (never coerced to False) while a transiently-failed recorder lookup has not yet
+        # been retried - see _retry_activity_seen_from_recorder.
+        self._activity_recorder_retry_after = None
         # Energy stability detection: use implied watts instead of fixed kWh delta
-        self.energy_stable_watts = float(self.args.get("energy_stable_watts", 30.0))  # Below this = true idle
         # Post-cycle slow spin: washer may keep motor at 30-80W after cycle; treat as "idle" so we don't wait for 0W.
         self.energy_active_watts = float(self.args.get("energy_active_watts", 100.0))   # Above this = main cycle (heating/spin)
         self.post_cycle_idle_watts = float(self.args.get("post_cycle_idle_watts", 80.0))  # Below this = idle or slow spin (can finish)
         # Post-cycle slow-spin pattern: regular low-amplitude ripple in power (distinct from flat idle).
-        self.post_cycle_pattern_window_minutes = int(self.args.get("post_cycle_pattern_window_minutes", 10))
-        self.post_cycle_pattern_minutes = int(self.args.get("post_cycle_pattern_minutes", 5))  # Required "low" time when pattern detected
-        self.post_cycle_pattern_mean_low = float(self.args.get("post_cycle_pattern_mean_low", 10.0))
-        self.post_cycle_pattern_mean_high = float(self.args.get("post_cycle_pattern_mean_high", 70.0))
-        self.post_cycle_pattern_min_std = float(self.args.get("post_cycle_pattern_min_std", 8.0))  # Ripple has elevated std vs flat idle
         # When run time is near/past expected programme duration, use shorter stable window so we declare finish BEFORE door opens (real-life: cycle ends ~10:52, door opens 11:05).
-        self.finish_stable_minutes_near_end = int(self.args.get("finish_stable_minutes_near_end", 5))
         # Anti-crease (post-end tail) detection: config-driven, raw power history as primary signal (independent from energy bookkeeping).
         self.anti_crease_window_minutes = float(self.args.get("anti_crease_window_minutes", 8))
         # Real anti-crease is very low power (idle + small tumbling bumps). Mid-cycle rinse can look similar
         # (mean ~50W, peaks 200W+) so we require low mean and optionally cap peak to avoid false positives.
-        self.anti_crease_tail_max_mean_w = float(self.args.get("anti_crease_tail_max_mean_w", 40.0))
-        self.anti_crease_tail_max_peak_w = self.args.get("anti_crease_tail_max_peak_w")  # None = disabled
-        if self.anti_crease_tail_max_peak_w is not None:
-            self.anti_crease_tail_max_peak_w = float(self.anti_crease_tail_max_peak_w)
-        self.anti_crease_tail_min_std_w = float(self.args.get("anti_crease_tail_min_std_w", 6.0))
-        self.anti_crease_max_duty_above_active = float(self.args.get("anti_crease_max_duty_above_active", 0.15))
-        self.anti_crease_near_end_minutes = float(self.args.get("anti_crease_near_end_minutes", 25))
-        self.anti_crease_min_runtime_minutes = float(self.args.get("anti_crease_min_runtime_minutes", 60))  # When programme unknown
         # Once run_min is STRICTLY past guard_dur (the same expected-duration source
         # _meets_finish_time_guards uses - not merely within anti_crease_near_end_minutes of it),
         # a confirmed anti-crease pattern IS the end signal: skip FinishingTail's tail-pulse wait
         # and announce immediately, mirroring the dryer's keep-fresh transition (~4 min detections).
         # Near-but-not-past-end still goes through the slower FinishingTail/_try_finish_via_standby path unchanged.
-        self.anti_crease_announce_past_expected = bool(self.args.get("anti_crease_announce_past_expected", True))
-        self.finish_debug_window_minutes = float(self.args.get("finish_debug_window_minutes", 25))  # When to emit finish/anti-crease debug logs
         # Stricter finish guards to stop false announcements when guard_dur is underestimated.
-        self.finish_guard_fraction = float(self.args.get("finish_guard_fraction", 0.92))  # Require 92% of expected (was 85%)
-        self.finish_min_run_minutes_warm = float(self.args.get("finish_min_run_minutes_warm", 100.0))  # Never finish warm cycle before this
-        self.finish_min_run_minutes_cold = float(self.args.get("finish_min_run_minutes_cold", 50.0))   # Never finish cold/unknown before this
         # Power-pattern gate: only allow Unemptied when recent power looks like real end (anti-crease or off), not mid-cycle rinse.
         self.finish_power_gate_max_mean_w = float(self.args.get("finish_power_gate_max_mean_w", 45.0))
         self.finish_power_gate_max_peak_w = float(self.args.get("finish_power_gate_max_peak_w", 120.0))
         self.finish_power_gate_off_max_mean_w = float(self.args.get("finish_power_gate_off_max_mean_w", 12.0))
         self.finish_power_gate_off_max_peak_w = float(self.args.get("finish_power_gate_off_max_peak_w", 25.0))
         # Two-stage finish: FinishingTail (pulsing 15–50W) vs Finished. Announce when next tail pulse fails to arrive.
-        self.standby_max_watts = float(self.args.get("standby_max_watts", 5.0))  # Power ≤ this = flat standby
-        self.standby_no_pulse_above_watts = float(self.args.get("standby_no_pulse_above_watts", 10.0))
-        self.standby_quiet_seconds = float(self.args.get("standby_quiet_seconds", 25.0))  # Legacy; tail_pulse_timeout_seconds is primary
-        self.tail_pulse_threshold_watts = float(self.args.get("tail_pulse_threshold_watts", 10.0))  # Above this = tail pulse (update last_tail_pulse_at)
         # In FinishingTail only: nudges above this reset last_tail_pulse_at (default 80). Anti-crease 10–55W does not reset.
-        self.finishing_tail_pulse_reset_watts = float(self.args.get("finishing_tail_pulse_reset_watts", 80.0))
-        self.tail_pulse_timeout_seconds = float(self.args.get("tail_pulse_timeout_seconds", 55.0))  # No pulse for this long + low power = finished (data: 55s = 0 early triggers)
         self.finish_standby_max_watts = float(self.args.get("finish_standby_max_watts", 8.0))  # Current power must be ≤ this to announce
         # Extra reliability gate for standby transition: require a recent quiet window with no spin/tail spikes.
-        self.tail_idle_confirm_seconds = float(self.args.get("tail_idle_confirm_seconds", 120.0))
-        self.tail_idle_peak_max_watts = float(self.args.get("tail_idle_peak_max_watts", 18.0))
         # Tail cadence detector: lock to anti-crease/spin pulse rhythm and finish when the rhythm breaks.
-        self.tail_pattern_pulse_threshold_watts = float(self.args.get("tail_pattern_pulse_threshold_watts", 20.0))
-        self.tail_pattern_lock_window_minutes = float(self.args.get("tail_pattern_lock_window_minutes", 8.0))
-        self.tail_pattern_lock_min_pulses = int(self.args.get("tail_pattern_lock_min_pulses", 6))
-        self.tail_pattern_min_gap_seconds = float(self.args.get("tail_pattern_min_gap_seconds", 8.0))
-        self.tail_pattern_max_gap_seconds = float(self.args.get("tail_pattern_max_gap_seconds", 120.0))
-        self.tail_pattern_max_jitter_fraction = float(self.args.get("tail_pattern_max_jitter_fraction", 0.55))
-        self.tail_pattern_break_missed_pulses = float(self.args.get("tail_pattern_break_missed_pulses", 2.2))
-        self.tail_pattern_break_confirm_seconds = float(self.args.get("tail_pattern_break_confirm_seconds", 18.0))
-        self.in_finishing_tail = False  # True when tail pattern or energy-stable detected; transition when tail-pulse timeout
-        self.in_finishing_tail_entered_at = None
         # UTC of the first tick this cycle on which the anti-crease tail pattern was confirmed
         # (_check_energy_finish) - live evidence of the finish that, unlike last_high_energy_at,
         # does not go stale across a sub-energy_active_watts dwell phase. Latched per cycle and
         # persisted; read only through _trusted_anti_crease_tail_since.
-        self._anti_crease_tail_since = None
-        self.last_tail_pulse_at = None  # Last time power went above _tail_pulse_reset_threshold_watts while in FinishingTail
-        self.tail_pattern_locked = False
-        self.tail_pattern_cycle_seconds = None
-        self.tail_pattern_last_pulse_at = None
-        self.tail_pattern_locked_at = None
         self.last_energy_value = None
         self.last_energy_time = None  # Track timestamp for watts calculation
-        self.energy_stable_start_time = None
         self.last_high_energy_at = None  # Last time energy rate was above threshold
         self.energy_check_timer = None
-        self.energy_buffer = []  # Rolling window of (datetime, kWh) for aliasing-resistant implied-watts
 
         # Settled per-cycle cost tracking (dedicated vars - not shared with the energy-buffer/
         # tail-detection vars above, which get re-seeded by unrelated paths).
@@ -621,13 +663,8 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self._cost_prev_energy_kwh = None  # Previous tick's cumulative energy reading for cost delta
 
         # Finish confirmation flag
-        self.finish_confirmed = False
-        self._zero_power_since = None  # Standby backstop: when power first dropped to 0W
         # Pending end reason when transitioning from anti-crease path (so _transition_to_unemptied can store it in feedback).
         self._pending_end_reason = None  # e.g. "anti_crease_pattern"
-        self._pending_tail_mean_w = None
-        self._pending_tail_std_w = None
-        self._pending_tail_peak_w = None
         # Stashed just before _transition_to_unemptied wipes confirmation (entity attrs +
         # confirm_entity selector) for "next load" - lets _recover_from_false_unemptied restore
         # this cycle's real confirmation if the Unemptied turns out to be false.
@@ -647,14 +684,10 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # can be satisfied by a Miele anti-crease tumble lasting a few seconds; see the Unemptied
         # branch below for the sustained-duration bar this pairs with).
         self._high_power_streak_started_at = None
-        self.low_power_counter = 0
-        self.low_power_start_time = None  # Track when low power period started
-        self.last_significant_power_at = None
         self.notification_sent = False
         # Consecutive >=start_w samples seen by _unemptied_door_recheck while Unemptied. A lone
         # sample isn't enough: Miele anti-crease nudges peak 10-55W (see washer.yaml), well above
         # start_w=18, so a single high reading is a nudge, not the machine actually resuming.
-        self._unemptied_recheck_high_counter = 0
 
         # Programme classification (for adaptive finish detection)
         self.max_power_seen = 0.0         # Peak wattage observed during the current cycle
@@ -716,9 +749,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.unemptied_watchdog_timer = None
         self.unemptied_door_recheck_timer = None  # Periodic door check while Unemptied (catches missed open events)
         self.emptied_watchdog_timer = None  # Auto Off after emptied_timeout_minutes if door stays open
-        self.power_unavailable_off_timer = None  # Grace period before forcing Off on plug/state dropout (2026-07-17)
         self._last_infer_start_attempt = None  # Throttle _infer_start_from_state_history
-        self._last_finish_guard_info_log_at = None  # Throttle repetitive INFO finish-guard lines
 
         # Notification
         self.announce_message = self.args.get("announce_message", "Washer is ready to be emptied")
@@ -771,11 +802,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         except Exception as e:
             self.log(f"WARN: Error getting SonosNotifier app: {e}", level="WARNING")
 
-        # Dead-plug watchdog: unlike the dishwasher there is no Error state here - an
-        # unavailable plug forces Off immediately (_handle_unavailable), so a dead Shelly
-        # is indistinguishable from an idle washer. After this grace, page the phone; one
-        # push per outage + all-clear on recovery (gw2000a_watchdog policy: dead sensor =
-        # maintenance to act on, not house-feed material).
+        # HA-side dead-plug watchdog: HA's power entity is what detects a new wash, so a lasting
+        # outage of it pages the phone - one push per outage + all-clear on recovery (gw2000a_watchdog
+        # policy: dead sensor = maintenance to act on, not house-feed material). It never changes state.
         self.plug_outage_push_after_seconds = int(self.args.get("power_unavailable_push_after_seconds", 180))
         self.notify_target = self.args.get("notify_target", ["mikkel"])
         self._plug_outage_push_timer = None
@@ -818,20 +847,17 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # power sample above start_w clears it (_power_changed) or the one-shot reconcile
         # concludes the cycle quietly (_restore_reconcile). Default False on every other path.
         self.restored_uncorroborated = False
-        self._restore_reconcile_timer = None
         # Rate-limits the Unemptied door-history reconciler (FIX 4) to ~5 min between recorder
         # queries rather than one per 60s tick - see _unemptied_door_recheck.
         self._unemptied_last_history_check_at = None
         # D1 (2026-08-19): set only for the duration of _restore_reconcile's own transition call -
         # see _finish_anchor and _restore_reconcile's docstring invariant. None everywhere else.
-        self._finish_anchor_override = None
         # D2 (2026-08-19 adversarial pass follow-up): set only for the duration of
         # _restore_reconcile's own transition call, same lifecycle as _finish_anchor_override
         # above - forces the announce block's push branch explicitly, rather than relying on the
         # freshness-latency arithmetic to always exceed announce_freshness_minutes (it doesn't,
         # once the yaml knobs are retuned - see _restore_reconcile's docstring). False everywhere
         # else.
-        self._announce_force_push = False
 
         # Restore previous state. Read the entity's bare state, its full attribute snapshot,
         # and the on-disk store ALL ONCE, here, before any write - _set_state_entity below is
@@ -854,6 +880,34 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
 
         valid_states = ("Running", "Unemptied", "Paused", "Emptied")
         entity_trusted = existing in valid_states
+        # Restore duplicate guard: _set_state_entity can locally "succeed" (AD accepts the
+        # set_state call, the durable store is written) while the HTTP publish to HA never
+        # lands - the entity is left showing the PREVIOUS state. If that previous state was
+        # Running and this boot's store already holds the SAME cycle (matching start_time)
+        # completed and notified, trusting "Running" here would re-run finish detection and
+        # re-announce (both the standby/spin-end path and the door-unlock announce gate on
+        # notification_sent, which a normal restore would otherwise reset to False - see
+        # _finalize_restored_cycle_identity). Only overrides on an exact start_time match; a
+        # genuinely newer Running cycle (different or later start) still restores as Running
+        # below.
+        restore_duplicate_override = False
+        if (
+            existing == "Running"
+            and store_data
+            and store_data.get("state") in ("Unemptied", "Emptied")
+            and store_data.get("notification_sent")
+        ):
+            live_start = cystore.parse_utc(boot_attrs.get("cycle_start_time"))
+            store_start = cystore.parse_utc(store_data.get("start_time"))
+            if live_start is not None and store_start is not None and live_start == store_start:
+                entity_trusted = False
+                restore_duplicate_override = True
+                self.log(
+                    f"Boot: HA still reports Running but the durable store already completed "
+                    f"this cycle ({store_data.get('state')}, notified) - trusting the store "
+                    f"instead of re-running finish detection",
+                    level="WARNING",
+                )
         # Any valid state may now be seeded from the mirror. Previously only the clock-free
         # states (Unemptied/Emptied) were seedable: Running/Paused live off cycle_start_time,
         # which lived in the erased sensor's attributes and was gone with it, so seeding them
@@ -955,6 +1009,14 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
 
         self.state = resolved_state if resolved_state in valid_states else "Off"
 
+        if restore_duplicate_override and self.state in ("Unemptied", "Emptied"):
+            # Carry the store's identity forward untouched - neither _finalize_restored_cycle_
+            # identity (Running/Paused only) nor the plain Unemptied/Emptied restore below ever
+            # touch notification_sent, so without this the door-unlock announce path would see
+            # its default (False) and re-announce a cycle that already notified.
+            self._cycle_id = store_data.get("cycle_id") or str(uuid.uuid4())
+            self.notification_sent = bool(store_data.get("notification_sent"))
+
         # Legacy power-is-truth recovery: entity/store/helper all landed on "Off" but power
         # says the machine is actively drawing start current. If we skip restore and bootstrap
         # calls _confirm_running, we wipe start_time and user context.
@@ -1027,6 +1089,8 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             else:
                 self._set_state_entity(state=self.state)
 
+        self._published = (self.state, self.last_state_change)
+
         # Restore in-memory state from persisted attributes so ETA, energy-used, "user
         # confirmed programme", etc. survive an app reload, an HA restart (durable store), or a
         # missed transition (power-is-truth). Paused now shares this path with Running - both
@@ -1096,7 +1160,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                             f"({why}) - suppressing announcements, reconciling in 60s",
                             level="WARNING",
                         )
-                        self._restore_reconcile_timer = self.run_in(self._restore_reconcile, 60)
         elif self.state == "Unemptied":
             # Restart door-recheck and watchdog timers so we don't get stuck in Unemptied after
             # an app reload (the timers are not persisted across restarts).
@@ -1147,7 +1210,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self._drop_cycle_store_boot_snapshot()
 
         # Listen for events
-        self.listen_state(self._handle_unavailable, self.state_entity, new="unavailable")
         self.listen_state(self._handle_unavailable, self.power_sensor, new="unavailable")
         self.listen_state(self._power_changed, self.power_sensor)
         self.listen_state(self._door_state_changed, self.door_sensor)
@@ -1220,6 +1282,8 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             # (no transition), so arm the dead-plug watchdog here (dishwasher does the
             # same in its bootstrap).
             self._begin_plug_outage_grace()
+
+        self.run_in(self._start_plug_poller, 0)
 
         self.log(f"WasherMonitor (Miele WEA 035 WCS) initialized - state: {self.state}", level="INFO")
 
@@ -1303,6 +1367,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             ("delayed_start_trimmed", "delayed_start_trimmed"),
             ("last_high_energy_at", "last_high_energy_at"),
             ("heating_phase_count", "heating_bursts"),
+            ("activity_seen", "activity_seen"),
         ):
             value = store_data.get(store_key)
             if value not in (None, ""):
@@ -1334,15 +1399,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.max_power_seen = float(store_data.get("max_power_seen") or 0.0)
             if store_data.get("observed_heating"):
                 self.observed_heating = True
-            self.finish_confirmed = bool(store_data.get("finish_confirmed"))
-            self.in_finishing_tail = bool(store_data.get("in_finishing_tail"))
-            self.in_finishing_tail_entered_at = cystore.parse_utc(store_data.get("in_finishing_tail_entered_at"))
-            self._anti_crease_tail_since = cystore.parse_utc(store_data.get("anti_crease_tail_since"))
-            self.last_tail_pulse_at = cystore.parse_utc(store_data.get("last_tail_pulse_at"))
-            self.tail_pattern_locked = bool(store_data.get("tail_pattern_locked"))
-            self.tail_pattern_cycle_seconds = store_data.get("tail_pattern_cycle_seconds")
-            self.tail_pattern_last_pulse_at = cystore.parse_utc(store_data.get("tail_pattern_last_pulse_at"))
-            self.tail_pattern_locked_at = cystore.parse_utc(store_data.get("tail_pattern_locked_at"))
             self.door_opened_during_cycle = bool(store_data.get("door_opened_during_cycle"))
         else:
             if store_data is not None:
@@ -1353,80 +1409,10 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 )
             self._cycle_id = str(uuid.uuid4())
             self.notification_sent = False
-
-    def _restore_reconcile(self, kwargs):
-        """One-shot ~60s after an uncorroborated Running/Paused restore (FIX 1b; scheduled in
-        initialize()). If the machine has stayed at/below standby the whole visible window and
-        the run is already a real cycle length, the wash ended while we were down - conclude it:
-        _correct_duration + a single feedback save, routed to Emptied if the door came into play
-        (FIX 2) or Unemptied announced by the FRESHNESS gate only (the flag is cleared below, so
-        the huge detection latency downgrades Sonos to a mobile push - wet laundry must be late
-        but never silent). Otherwise leave it Running - a fresh
-        sample >= start_w (_power_changed) clears the flag and the cycle continues normally, and
-        a genuine later finish announces then. Concludes on evidence only: absent power history
-        is never taken as proof the machine is off.
-
-        D1 invariant (2026-08-19 adversarial pass): while the transition below runs,
-        _finish_anchor_override pins the finish anchor to start_time + addload_window_minutes -
-        never last_high_energy_at, which on this path may be a synthetic boot-seeded placeholder
-        (not a fact of when the wash actually finished) or explicitly distrusted (code-fingerprint
-        mismatch). start_time is guaranteed non-None by the gate above.
-
-        D2 invariant (2026-08-19 adversarial pass follow-up): the "never Sonos" guarantee on this
-        path used to rest on arithmetic alone - freshness latency (>= run_minutes -
-        addload_window_minutes, and run_minutes >= min_cycle_minutes here) happened to always
-        exceed announce_freshness_minutes only because the three yaml knobs' *default* values
-        satisfy min_cycle_minutes - addload_window_minutes >= announce_freshness_minutes. Retuning
-        any one of them breaks that inequality and silently re-enables Sonos on a boot-time
-        conclusion. _announce_force_push below removes the reliance on arithmetic: it is set True
-        for the duration of the transition call (same lifecycle as _finish_anchor_override) and
-        makes the announce block's push branch fire unconditionally, so Sonos is impossible on the
-        reconcile path by construction - only the door-gate (Emptied, silent) or the forced push
-        gate (mobile push) can fire, regardless of how the knobs are tuned."""
-        self._restore_reconcile_timer = None
-        if not self.restored_uncorroborated:
-            return
-        if self.state not in ("Running", "Paused"):
-            return
-        if self.start_time is None:
-            return
-        run_minutes = (self._now_utc() - self.start_time).total_seconds() / 60
-        if run_minutes < self.min_cycle_minutes:
-            return
-        points = self._get_recent_power_history(self.restore_corroboration_window_minutes)
-        if not points:
-            return
-        if any(w > self.finish_standby_max_watts for _, w in points):
-            return
-        self.log(
-            f"Restore reconcile: uncorroborated {self.state} has stayed <= "
-            f"{self.finish_standby_max_watts:.0f}W for the last "
-            f"{self.restore_corroboration_window_minutes:.0f}min (run {run_minutes:.0f}min) - "
-            f"cycle ended while we were down; concluding quietly",
-            level="INFO",
-        )
-        # standby_backstop (a known transition path that also skips the power-pattern gate): the
-        # reconcile has itself verified sustained standby, so this is a boot-time variant of the
-        # same "finished on sustained 0W" ending.
-        self._pending_end_reason = "standby_backstop"
-        # The reconcile IS the detection event: clear the suppression so the announce gate runs.
-        # The door-gate (FIX 2) still routes to Emptied silently when someone already emptied;
-        # otherwise the freshness gate sees the large latency and sends the mobile push, never
-        # Sonos. Without this, a wash finishing during an HA outage ended in total silence.
-        self.restored_uncorroborated = False
-        # D1: pin the finish anchor for the duration of this transition only - see the docstring
-        # invariant above. Cleared in finally so a later, genuinely-live finish is never anchored
-        # to this boot-time value.
-        self._finish_anchor_override = self.start_time + timedelta(minutes=self.addload_window_minutes)
-        # D2: force the announce block's push branch explicitly, rather than trusting the
-        # freshness-latency arithmetic to always win - see the docstring invariant above. Cleared
-        # in finally, same lifecycle as _finish_anchor_override.
-        self._announce_force_push = True
-        try:
-            self._transition_to_unemptied(force=True)
-        finally:
-            self._finish_anchor_override = None
-            self._announce_force_push = False
+            if store_data is not None:
+                self._activity_seen = False
+        if not self._activity_seen:
+            self._activity_seen = self._activity_in_recorder()
 
     def _restore_running_state(self, attrs=None, last_changed=None):
         """Restore in-memory state when we were Running or Paused before a restart.
@@ -1568,8 +1554,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                         self.start_time = inferred
                         self._start_time_source = "power_history"
                         self._push_corrected_start_time_to_entity()
-                        if self.use_energy_detection:
-                            self._restore_energy_state_from_history()
+                        self._restore_energy_state_from_history()
             except Exception as e:
                 self.log(f"Could not validate/correct start_time from power history: {e}", level="DEBUG")
 
@@ -1699,11 +1684,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             except Exception:
                 pass
 
-        if self.start_time and self.use_energy_detection:
-            # Prefer loading energy buffer and last_high_energy_at from HA history so we
-            # don't lose the stable clock after a restart (no extra 15 min wait).
-            if not self._restore_energy_state_from_history():
-                self._start_energy_detection()
+        self._activity_seen = self._attr_bool_true(attrs.get("activity_seen"))
+        if self.start_time:
+            self._restore_energy_state_from_history()
         if self.start_time:
             self._safe_cancel_timer(self.running_watchdog_timer)
             self.running_watchdog_timer = self.run_in(
@@ -1968,49 +1951,20 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.history_poll_timer = self.run_in(self._periodic_check_power_history, interval)
 
     def _restore_energy_state_from_history(self) -> bool:
-        """Load energy buffer and last_high_energy_at from HA history. Returns True if usable."""
-        if not self.start_time or not self.energy_sensor:
-            return False
+        """Restore last_high_energy_at from the energy sensor's history; the decision tick is armed regardless."""
         try:
-            end_time = self._now_utc()
-            hist = self.get_history(
-                entity_id=self.energy_sensor,
-                start_time=self.start_time,
-                end_time=end_time,
-            )
-            hist = self._flatten_history(hist, self.energy_sensor)
-            if len(hist) < 2:
-                self.log("Not enough energy history to restore buffer", level="DEBUG")
-                return False
-            points = whist.parse_power_points(hist)
-            if len(points) < 2:
-                return False
-            points.sort(key=lambda x: x[0])
-            cutoff = end_time - timedelta(minutes=20)
-            self.energy_buffer = [(t, e) for t, e in points if t >= cutoff]
-            self.last_energy_value = points[-1][1]
-            self.last_energy_time = points[-1][0]
-            # Last time we saw implied watts above threshold (cycle was still consuming)
-            high_ends = wpow.high_power_end_times(points, self.energy_active_watts)
-            self.last_high_energy_at = high_ends[-1] if high_ends else None
-            if self.last_high_energy_at is None:
-                self.last_high_energy_at = self.start_time
-            self.energy_stable_start_time = None
-            self.finish_confirmed = False
-            # Boot restore can reach this method twice in the same pass (the power-history
-            # start-gap correction above, then unconditionally again later) - cancel any handle
-            # already armed before arming a new one, or both tick loops run concurrently forever.
-            self._safe_cancel_timer(self.energy_check_timer)
-            self.energy_check_timer = self.run_in(self._check_energy_finish, self.energy_check_interval)
-            self.log(
-                f"Restored energy state from HA history: {len(self.energy_buffer)} points, "
-                f"last_high_energy_at={self._strftime_local(self.last_high_energy_at, '%H:%M') if self.last_high_energy_at else None}",
-                level="INFO",
-            )
-            return True
+            if self.start_time and self.energy_sensor:
+                hist = self._flatten_history(self.get_history(entity_id=self.energy_sensor, start_time=self.start_time, end_time=self._now_utc()), self.energy_sensor)
+                points = sorted(whist.parse_power_points(hist), key=lambda x: x[0])
+                if len(points) >= 2:
+                    self.last_energy_value = points[-1][1]
+                    self.last_energy_time = points[-1][0]
+                    high_ends = wpow.high_power_end_times(points, self.energy_active_watts)
+                    self.last_high_energy_at = high_ends[-1] if high_ends else self.start_time
         except Exception as e:
             self.log(f"Could not restore energy state from history: {e}", level="DEBUG")
-            return False
+        self._arm_finish_tick()
+        return True
 
     def _estimate_cycle_end_from_history(self, expected_duration_min: float | None = None):
         """Estimate when the cycle actually ended from HA energy history.
@@ -2074,49 +2028,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.log(f"Could not estimate cycle end from history: {e}", level="DEBUG")
             return None
 
-    def _detect_post_cycle_slow_spin_pattern(self) -> bool:
-        """Detect the distinct post-cycle slow-spin pattern from power history.
-
-        After the programme ends the motor often keeps turning slowly, producing
-        regular low-amplitude oscillations (sawtooth/ripple) in power, unlike
-        true idle (flat) or mid-cycle soak. We fetch recent power readings and
-        check for: mean in 10-70W and elevated std (ripple) vs flat idle.
-        """
-        if not self.power_sensor:
-            return False
-        try:
-            end_time = self._now_utc()
-            start_time = end_time - timedelta(minutes=self.post_cycle_pattern_window_minutes)
-            hist = self.get_history(
-                entity_id=self.power_sensor,
-                start_time=start_time,
-                end_time=end_time,
-            )
-            hist = self._flatten_history(hist, self.power_sensor)
-            if len(hist) < 6:
-                return False
-            points = whist.parse_power_points(hist)
-            if len(points) < 6:
-                return False
-            points.sort(key=lambda x: x[0])
-            watts = [w for _, w in points]
-            mean_w, std_w = wpow.mean_and_std(watts)
-            if wpow.slow_spin_pattern_ok(
-                mean_w, std_w,
-                self.post_cycle_pattern_mean_low,
-                self.post_cycle_pattern_mean_high,
-                self.post_cycle_pattern_min_std,
-            ):
-                self.log(
-                    f"Post-cycle slow-spin pattern detected (power mean={mean_w:.1f}W std={std_w:.1f}W over {len(points)} points)",
-                    level="DEBUG",
-                )
-                return True
-            return False
-        except Exception as e:
-            self.log(f"Could not detect post-cycle pattern: {e}", level="DEBUG")
-            return False
-
     def _get_current_power(self):
         """Get current power reading in watts."""
         try:
@@ -2146,218 +2057,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         except Exception as e:
             self.log(f"Could not get recent power history: {e}", level="DEBUG")
             return []
-
-    def _get_tail_stats_time_weighted(self, window_minutes: float):
-        """Time-weighted mean, std, peak, duty_above for tail window. Event-driven sensors have many
-        points during low-power ripple and few during high-power; time-weighting avoids bias.
-        Returns (mean_w, std_w, peak_w, duty_above_active) or (None, None, None, None) if insufficient data."""
-        points = self._get_recent_power_history(window_minutes)
-        if len(points) < 5:
-            return (None, None, None, None)
-        return wpow.time_weighted_stats(points, self._now_utc(), self.energy_active_watts)
-
-    def _tail_pulse_reset_threshold_watts(self) -> float:
-        """Threshold for resetting last_tail_pulse_at. In FinishingTail use finishing_tail_pulse_reset_watts
-        so Miele anti-crease nudges (10–55W) do not block the tail-pulse timeout; outside tail keep 10W."""
-        if self.in_finishing_tail:
-            return self.finishing_tail_pulse_reset_watts
-        return self.tail_pulse_threshold_watts
-
-    def _get_last_tail_pulse_time(self):
-        """Return the time of the most recent power history point above tail reset threshold, or None."""
-        thr = self._tail_pulse_reset_threshold_watts()
-        points = self._get_recent_power_history(2.0)  # last 2 min
-        return wpow.last_time_above(points, thr)
-
-    def _refresh_tail_pulse_tracking(self):
-        """While in FinishingTail, merge last_tail_pulse_at with recorder history (missed live callbacks)
-        and current power so tail-pulse timeout reflects the true last pulse."""
-        if not self.in_finishing_tail:
-            return
-        now = self._now_utc()
-        hist_last = self._get_last_tail_pulse_time()
-        if hist_last and (self.last_tail_pulse_at is None or hist_last > self.last_tail_pulse_at):
-            self.last_tail_pulse_at = hist_last
-        try:
-            pw = self._get_current_power()
-            if pw is not None and pw > self._tail_pulse_reset_threshold_watts():
-                self.last_tail_pulse_at = now
-        except (TypeError, ValueError):
-            pass
-
-    def _tail_pulse_timeout_met(self) -> bool:
-        """True when we're in FinishingTail, current power is low (≤ finish_standby_max_watts), and no tail pulse
-        has occurred for at least tail_pulse_timeout_seconds. Data: 55s had 0 early triggers on long heated cycles."""
-        if not self.in_finishing_tail or self.last_tail_pulse_at is None:
-            return False
-        current_power = self._get_current_power()
-        if current_power is None or current_power > self.finish_standby_max_watts:
-            return False
-        gap = (self._now_utc() - self.last_tail_pulse_at).total_seconds()
-        return gap >= self.tail_pulse_timeout_seconds
-
-    def _tail_idle_window_ok(self) -> bool:
-        """Require a short recent window to be truly quiet before declaring finished.
-        Prevents false finish during spin/anti-crease where pulses are below pulse-reset threshold.
-        The plug only reports on change, so a genuinely flat tail can land fewer than 3 points in the
-        window - sparse_tail_idle_ok covers that case instead of refusing outright."""
-        lookback_min = max(1.0, self.tail_idle_confirm_seconds / 60.0)
-        points = self._get_recent_power_history(lookback_min)
-        cutoff = self._now_utc() - timedelta(seconds=self.tail_idle_confirm_seconds)
-        if len(points) < 3:
-            return wpow.sparse_tail_idle_ok(points, cutoff, self.stop_w)
-        return wpow.tail_idle_ok(
-            points, cutoff, self.tail_idle_peak_max_watts, self.post_cycle_idle_watts
-        )
-
-    def _extract_tail_pulse_times(self, points):
-        """Extract pulse timestamps from power points using an edge detector with gap de-duplication."""
-        return wpow.extract_pulse_times(
-            points, self.tail_pattern_pulse_threshold_watts, self.tail_pattern_min_gap_seconds
-        )
-
-    def _update_tail_pattern_lock(self):
-        """Lock to repeatable anti-crease/spin pulse cadence while in FinishingTail."""
-        if not self.in_finishing_tail:
-            self.tail_pattern_locked = False
-            self.tail_pattern_cycle_seconds = None
-            self.tail_pattern_last_pulse_at = None
-            self.tail_pattern_locked_at = None
-            return
-        points = self._get_recent_power_history(self.tail_pattern_lock_window_minutes)
-        pulse_times = self._extract_tail_pulse_times(points)
-        if pulse_times:
-            self.tail_pattern_last_pulse_at = pulse_times[-1]
-        med_gap = wpow.pulse_cadence(
-            pulse_times,
-            self.tail_pattern_min_gap_seconds,
-            self.tail_pattern_max_gap_seconds,
-            self.tail_pattern_lock_min_pulses,
-            self.tail_pattern_max_jitter_fraction,
-        )
-        if med_gap is None:
-            return
-        newly_locked = not self.tail_pattern_locked
-        self.tail_pattern_locked = True
-        self.tail_pattern_cycle_seconds = med_gap
-        self.tail_pattern_locked_at = self.tail_pattern_locked_at or self._now_utc()
-        if newly_locked:
-            self.log(
-                f"[TAIL] Tail cadence locked (cycle ~{med_gap:.1f}s, pulses={len(pulse_times)}, thr={self.tail_pattern_pulse_threshold_watts:.0f}W)",
-                level="INFO",
-            )
-
-    def _tail_pattern_break_met(self) -> bool:
-        """True when we had a locked tail cadence and enough expected pulses are now missing."""
-        if not self.in_finishing_tail:
-            return False
-        if not self.tail_pattern_locked or not self.tail_pattern_cycle_seconds or not self.tail_pattern_last_pulse_at:
-            return False
-        current_power = self._get_current_power()
-        if current_power is None or current_power > self.finish_standby_max_watts:
-            return False
-        required_gap = (
-            self.tail_pattern_cycle_seconds * self.tail_pattern_break_missed_pulses
-            + self.tail_pattern_break_confirm_seconds
-        )
-        gap = (self._now_utc() - self.tail_pattern_last_pulse_at).total_seconds()
-        return gap >= required_gap
-
-    def _try_finish_via_standby(self, run_min: float, guard_dur: float, tick_prog, tick_temp, tick_class) -> bool:
-        """If we are in FinishingTail and the next tail pulse has not arrived within timeout (power low ≥55s), transition to Unemptied (announce)."""
-        if not self.in_finishing_tail:
-            return False
-        pulse_timeout = self._tail_pulse_timeout_met()
-        pattern_break = self._tail_pattern_break_met()
-        if not pulse_timeout and not pattern_break:
-            return False
-        if not self._tail_idle_window_ok():
-            return False
-        if not self._meets_finish_time_guards(run_min, guard_dur or 0):
-            return False
-        if not self._is_valid_completed_cycle():
-            return False
-        self._pending_end_reason = "tail_pattern_break" if pattern_break else "tail_to_standby"
-        self.in_finishing_tail = False
-        self.in_finishing_tail_entered_at = None
-        self.last_tail_pulse_at = None
-        self.tail_pattern_locked = False
-        self.tail_pattern_cycle_seconds = None
-        self.tail_pattern_last_pulse_at = None
-        self.tail_pattern_locked_at = None
-        if pattern_break:
-            self.log(
-                "[TAIL] Tail cadence break (missing expected pulses after lock, power ≤{}W) - transitioning to Unemptied (announce)".format(
-                    self.finish_standby_max_watts
-                ),
-                level="INFO",
-            )
-        else:
-            self.log(
-                "[TAIL] Tail pulse timeout (no pulse >{}W for {:.0f}s, power ≤{}W) - transitioning to Unemptied (announce)".format(
-                    self.finishing_tail_pulse_reset_watts, self.tail_pulse_timeout_seconds, self.finish_standby_max_watts
-                ),
-                level="INFO",
-            )
-        self._transition_to_unemptied()
-        # The transition can still be refused (e.g. cooling period) - only report success (and
-        # let the caller stop its tick) when it actually landed, so a refusal falls through to
-        # the tick's normal reschedule instead of silently going unarmed while still Running.
-        return self.state == "Unemptied"
-
-    def _is_post_end_tail_window(self, run_min: float, expected_dur: float, programme: str) -> bool:
-        """True when run time is within anti_crease_near_end_minutes of expected end, or past it; or when programme unknown, past anti_crease_min_runtime_minutes."""
-        if programme and programme != "unknown":
-            # Near or past expected end
-            if expected_dur and run_min >= expected_dur - self.anti_crease_near_end_minutes:
-                return True
-            if expected_dur and run_min >= expected_dur:
-                return True
-            return False
-        # Programme unknown: allow after minimum runtime so we can still finish via tail pattern
-        return run_min >= self.anti_crease_min_runtime_minutes
-
-    def _recent_true_activity_block(self, window_minutes: float | None = None) -> bool:
-        """True if there was recent heating or sustained high power in the window (disqualifies anti-crease finish).
-        Uses time-weighted duty so event-heavy low-power ripple does not dominate."""
-        w = window_minutes or self.anti_crease_window_minutes
-        mean_w, std_w, peak_w, duty_above = self._get_tail_stats_time_weighted(w)
-        if mean_w is None:
-            points = self._get_recent_power_history(w)
-            return wpow.activity_from_point_counts(
-                points, self.energy_active_watts, self.anti_crease_max_duty_above_active
-            )
-        if duty_above > self.anti_crease_max_duty_above_active:
-            return True
-        if peak_w > wpow.HEATING_BURST_WATTS:
-            return True
-        return False
-
-    def _detect_anti_crease_pattern(self, time_weighted: bool = True):
-        """Detect post-end anti-crease tail (low baseline + short periodic bumps). When time_weighted
-        is True (default), stats are time-weighted to avoid event-count bias from chatty low-power ripple.
-        Returns (ok: bool, tail_mean_w, tail_std_w, tail_peak_w)."""
-        if time_weighted:
-            mean_w, std_w, peak_w, duty_above = self._get_tail_stats_time_weighted(self.anti_crease_window_minutes)
-            if mean_w is None:
-                return (False, None, None, None)
-            ok = wpow.anti_crease_ok_from_stats(
-                mean_w, std_w, peak_w, duty_above,
-                self.anti_crease_tail_max_mean_w,
-                self.anti_crease_tail_min_std_w,
-                self.anti_crease_max_duty_above_active,
-                self.anti_crease_tail_max_peak_w,
-            )
-            return (ok, mean_w, std_w, peak_w)
-        points = self._get_recent_power_history(self.anti_crease_window_minutes)
-        return wpow.anti_crease_from_points(
-            points,
-            self.energy_active_watts,
-            self.anti_crease_tail_max_mean_w,
-            self.anti_crease_tail_min_std_w,
-            self.anti_crease_max_duty_above_active,
-            self.anti_crease_tail_max_peak_w,
-        )
 
     def _power_looks_like_cycle_end(self, window_minutes: float | None = None) -> tuple[bool, float | None, float | None]:
         """True only if recent power pattern looks like real cycle end (anti-crease or machine off), not mid-cycle rinse.
@@ -2392,18 +2091,8 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         return 0
 
     def _is_valid_completed_cycle(self):
-        """Check if the cycle ran long enough and used enough energy."""
-        run_minutes = self._get_run_duration_minutes()
-        energy_used = self._get_energy_used()
-
-        is_valid = (run_minutes >= self.min_cycle_minutes and
-                    energy_used >= self.min_energy_kwh)
-
-        self.log(f"Cycle validation: {run_minutes:.1f} min (need {self.min_cycle_minutes}), "
-                 f"{energy_used:.3f} kWh (need {self.min_energy_kwh}) -> {'valid' if is_valid else 'invalid'}",
-                 level="DEBUG")
-
-        return is_valid
+        """A real wash: the plug read at or above wash_activity_watts during the cycle, and it ran min_cycle_minutes."""
+        return self._wash_activity() and self._get_run_duration_minutes() >= self.min_cycle_minutes
 
     def _classify_cycle_completion(
         self,
@@ -2418,6 +2107,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         transition_path: str,  # user_cycle_end | anti_crease_pattern | low_power_detected | door_opened_first
         spin_rpm=None,
         user_confirmed_override: bool | None = None,  # For migration: use rec's programme_user_confirmed
+        selected_options=None,
     ):
         """Classify a completed cycle for learning quality. Returns completion_class, valid_for_learning, validation_flags, end_reason.
         Finish detection decides UI state; validation only classifies the saved record.
@@ -2430,6 +2120,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         return wcls.classify_cycle_completion(
             run_minutes=run_minutes,
             energy_kwh=energy_kwh,
+            selected_options=selected_options,
             confirmed=confirmed,
             transition_path=transition_path,
             profile=self._get_profile(confirmed, confirmed_temperature),
@@ -2509,9 +2200,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
               all.
         Robust to a partially-initialised app throughout (getattr defaults) - production always
         has these set."""
-        override = getattr(self, "_finish_anchor_override", None)
-        if override is not None:
-            return override
         anchor = getattr(self, "last_high_energy_at", None)
         if anchor is not None:
             return anchor
@@ -2574,22 +2262,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.log(f"Finish door-route check failed: {e}", level="DEBUG")
             return False
 
-    def _trusted_anti_crease_tail_since(self):
-        """_anti_crease_tail_since when it is live evidence rather than a restore artifact:
-        trusted while start_time itself is live-observed ("live" / "door_close_trusted"), or
-        when the stamp predates this boot (it came back from the durable store, so it was
-        observed before any restore uncertainty could apply). None otherwise. getattr
-        throughout - see _start_time_rank for why a bare attribute read is unsafe here."""
-        stamp = getattr(self, "_anti_crease_tail_since", None)
-        if stamp is None:
-            return None
-        if getattr(self, "_start_time_source", None) in ("live", "door_close_trusted"):
-            return stamp
-        app_started_at = getattr(self, "_app_started_at", None)
-        if app_started_at is not None and stamp <= app_started_at:
-            return stamp
-        return None
-
     def _finish_detection_latency_minutes(self) -> float:
         """Minutes between when the wash actually finished and now - how late this finish was
         detected. Feeds the announce freshness gate (FIX 3). _finish_anchor() is deliberately
@@ -2600,11 +2272,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         (D1) is never floored: _finish_anchor_override must keep that path off Sonos. 0.0 on
         any problem, so a broken clock never suppresses a real announcement."""
         try:
-            anchor = self._finish_anchor()
-            if anchor and getattr(self, "_finish_anchor_override", None) is None:
-                trusted_stamp = self._trusted_anti_crease_tail_since()
-                if trusted_stamp is not None:
-                    anchor = max(anchor, trusted_stamp)
+            anchor = getattr(self, "_spin_end_at", None) or self._finish_anchor()
             return (self._now_utc() - anchor).total_seconds() / 60 if anchor else 0.0
         except Exception:
             return 0.0
@@ -2887,35 +2555,23 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self._transition_to_off(f"Emptied watchdog: door left open ({self.emptied_timeout_minutes:.0f} min)")
 
     def _unemptied_door_recheck(self, kwargs):
-        """While Unemptied, re-check door state every 60s so we don't miss an open event.
-        Also check power: if high, we falsely declared done - recover to Running."""
+        """While Unemptied, re-check door state every 60s so we don't miss an open event, and the plug's reads: a
+        machine demonstrably washing again means the Unemptied was false - recover to Running. Re-armed in finally
+        for as long as the state stays Unemptied, whatever happens inside."""
         self.unemptied_door_recheck_timer = None
-        current_state = self.get_state(self.state_entity)
-        if current_state != "Unemptied":
+        if self.state != "Unemptied":
             return
         try:
-            pw = self.get_state(self.power_sensor)
-            if pw not in (None, "unknown", "unavailable"):
-                watts = float(pw or 0)
-                if watts >= self.start_w:
-                    self._unemptied_recheck_high_counter += 1
-                    # Require sustained power across consecutive 60s rechecks (same bar as the
-                    # Running-side high_power_threshold) before concluding the machine actually
-                    # resumed - one nudge-sized reading alone is indistinguishable from anti-crease.
-                    if self._unemptied_recheck_high_counter >= self.high_power_threshold:
-                        self._unemptied_recheck_high_counter = 0
-                        self._recover_from_false_unemptied(watts)
-                        return
-                    self.log(
-                        f"Door recheck: power {watts:.1f}W >= start_w while Unemptied "
-                        f"({self._unemptied_recheck_high_counter}/{self.high_power_threshold}) - "
-                        f"could be an anti-crease nudge, not recovering yet",
-                        level="DEBUG",
-                    )
-                else:
-                    self._unemptied_recheck_high_counter = 0
-        except (ValueError, TypeError):
-            pass
+            self._unemptied_recheck_body()
+        finally:
+            if self.state == "Unemptied" and not self.unemptied_door_recheck_timer:
+                self.unemptied_door_recheck_timer = self.run_in(self._unemptied_door_recheck, 60)
+
+    def _unemptied_recheck_body(self):
+        samples = self._plug.snapshot()
+        if wplug.resumed(samples, self._plug.clock(), self.plug_poll_s):
+            self._recover_from_false_unemptied(samples[-1][1])
+            return
         if self._door_is_physically_open():
             self.log("Door recheck: door is open while Unemptied -> Emptied (recovered missed event)", level="INFO")
             self._transition_to_emptied("Door opened - emptying (recheck)")
@@ -2937,8 +2593,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                     level="INFO",
                 )
                 self._transition_to_emptied("Door opened - emptying (history recheck)")
-                return
-        self.unemptied_door_recheck_timer = self.run_in(self._unemptied_door_recheck, 60)
 
     def _transition_to_running_from_pause(self, force=False):
         """Resume Running state after pause. Push current cycle_start_time/started_at_display
@@ -2946,14 +2600,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         if self._should_change_state("Running", force=force):
             self.state = "Running"
             self.door_opened_time = None
-            self.in_finishing_tail = False
-            self.in_finishing_tail_entered_at = None
-            self._anti_crease_tail_since = None
-            self.last_tail_pulse_at = None
-            self.tail_pattern_locked = False
-            self.tail_pattern_cycle_seconds = None
-            self.tail_pattern_last_pulse_at = None
-            self.tail_pattern_locked_at = None
             # Push state and start-time attributes so UI always shows current cycle (not stale from entity)
             try:
                 full = self.get_state(self.state_entity, attribute="all")
@@ -2975,26 +2621,12 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             # unlike _begin_running_cycle / _restore_running_state, which both call
             # _start_energy_detection() - permanently killing energy-based finish detection for
             # the rest of the cycle. Cancel any stale handle first, then re-seed and re-arm.
-            if self.use_energy_detection:
-                self._safe_cancel_timer(self.energy_check_timer)
-                self.energy_check_timer = None
-                self._start_energy_detection()
+            self._start_energy_detection()
 
     def _evaluate_pause_exit(self, force=False):
         """Determine whether to go to Unemptied or Off when exiting Paused state."""
         if not self._is_valid_completed_cycle():
             self._transition_to_off("Cycle interrupted or incomplete", force=force)
-            return
-        run_min = self._get_run_duration_minutes()
-        prog, temp = self._classify_programme() if self.start_time else ("unknown", None)
-        guard_dur = self._get_guard_duration(tick_prog=prog, tick_temp=temp, tick_class=(prog, temp))
-        if not self._meets_finish_time_guards(run_min, guard_dur or 0):
-            min_run = self._get_finish_min_run_minutes()
-            self.log(
-                f"Pause exit: valid cycle but finish guards not met (run {run_min:.0f}min, need >= {min_run:.0f}min and {self.finish_guard_fraction*100:.0f}% of expected) - treating as incomplete",
-                level="INFO",
-            )
-            self._transition_to_off("Cycle incomplete (pause exit before finish time guards)", force=force)
             return
         # User opened door before we detected finish; record so feedback stores door_opened_first.
         if self.door_opened_during_cycle:
@@ -3031,7 +2663,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 "progress_pct": None,
                 "programme_duration_min": None,
                 "programme_label": "",
-                "supports_soak": False,
+                "supports_soak": bool(self.option_soak_entity),
                 "detected_programme": "",
                 "detected_temperature": "",
                 "predicted_programme": "",
@@ -3048,6 +2680,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 # next cycle's _begin_running_cycle re-attributes from scratch.
                 "started_by": "",
                 "started_by_method": "",
+                "activity_seen": "",
                 # Persist so after restart we can clamp restored start_time (no start before last Off/door close)
                 "last_door_closed_at": self._format_local(self.last_door_closed_at) if self.last_door_closed_at else "",
                 "last_door_closed_trusted": False,
@@ -3248,22 +2881,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             pass
         return None
 
-    def _floor_cycle_end_at_anti_crease_tail(self, end, pfx=""):
-        """Floor an energy-derived cycle-end estimate at the trusted anti-crease tail
-        observation. Both estimates in _correct_duration key off the last sample above
-        energy_active_watts, which a long sub-threshold dwell phase (e.g. Eco) leaves hours
-        before the real end; the tail was seen live, so the programme ran until shortly before
-        that moment."""
-        stamp = self._trusted_anti_crease_tail_since()
-        if end is None or stamp is None or stamp <= end:
-            return end
-        self.log(
-            f"{pfx}Cycle end from energy history {self._strftime_local(end)} predates the "
-            f"anti-crease tail seen at {self._strftime_local(stamp)} - using the tail as cycle end",
-            level="INFO",
-        )
-        return stamp
-
     def _correct_duration(self, run_minutes_wall: float, log_prefix: str = "") -> tuple:
         """Correct wall-clock run duration using user cycle end time or HA history.
 
@@ -3297,11 +2914,15 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             else:
                 self.log(f"{pfx}Ignoring cycle_ended_at (outside start-now window)", level="DEBUG")
 
+        if duration_source is None and getattr(self, "_spin_end_at", None) is not None and self.start_time is not None:
+            run_minutes_actual = (self._spin_end_at - self.start_time).total_seconds() / 60
+            if 0 < run_minutes_actual <= run_minutes:
+                run_minutes = run_minutes_actual
+                duration_source = "spin_end"
         if duration_source is None:
             duration_hint = self._get_programme_duration_hint_for_history()
             actual_end = self._estimate_cycle_end_from_history(expected_duration_min=duration_hint)
             if actual_end is not None and self.start_time is not None:
-                actual_end = self._floor_cycle_end_at_anti_crease_tail(actual_end, pfx)
                 run_minutes_actual = (actual_end - self.start_time).total_seconds() / 60
                 if run_minutes_actual >= self.min_cycle_minutes and run_minutes_actual <= run_minutes:
                     delta = run_minutes - run_minutes_actual
@@ -3315,9 +2936,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                     run_minutes = run_minutes_actual
                     duration_source = "history_corrected"
             elif self.start_time is not None and self.last_high_energy_at is not None:
-                estimated_end = self._floor_cycle_end_at_anti_crease_tail(
-                    self.last_high_energy_at + timedelta(minutes=2), pfx
-                )
+                estimated_end = self.last_high_energy_at + timedelta(minutes=2)
                 if estimated_end <= self._now_utc():
                     run_minutes_actual = (estimated_end - self.start_time).total_seconds() / 60
                     if run_minutes_actual >= self.min_cycle_minutes and run_minutes_actual <= run_minutes:
@@ -3354,22 +2973,11 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         duration_min = removed.get("duration_min", 0)
         energy_kwh = removed.get("energy_kwh", 0)
         heating_bursts = removed.get("heating_bursts", 0)
-        # Mirror _save_cycle_feedback's skip_duration: a soak cycle was never added to the
-        # duration average, so undoing it must not subtract a sample that isn't there.
-        soak_selected = (removed.get("selected_options") or {}).get("soak") == "on"
-        wfb.remove_learned_sample(
-            self._learned_durations,
-            self._history_centroids,
-            wp.learn_key_for(self.PROGRAMME_PROFILES, confirmed, confirmed_temp),
-            duration_min,
-            energy_kwh,
-            heating_bursts,
-            skip_duration=soak_selected,
-        )
         try:
             with open(self.feedback_file, "w") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             self.log(f"Removed false cycle from feedback (was {duration_min:.0f}min, {confirmed})", level="INFO")
+            self._reload_learning(data["cycles"])
         except Exception as e:
             self.log(f"Could not write feedback after recovery: {e}", level="WARNING")
 
@@ -3379,8 +2987,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             f"Recovering from false Unemptied: power {watts:.1f}W - machine still running, reverting to Running",
             level="WARNING",
         )
-        self._remove_last_cycle_feedback()
-
         try:
             attrs = (self.get_state(self.state_entity, attribute="all") or {}).get("attributes") or {}
         except Exception:
@@ -3432,6 +3038,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self._guard_bar_class = None
         self._live_class_key = None
         self._live_class_since = None
+        self._spin_end_at = None
+        # Unemptied is only ever reached after wash activity, so this cycle keeps it across the withdrawal.
+        self._activity_seen = True
         # Prefer selector (manual duration) - never use stale/wrong expected_dur from entity.
         if self.confirm_entity:
             try:
@@ -3451,10 +3060,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             )
             if self.expected_dur_at_start:
                 self._guard_bar_class = (self.detected_programme, self.detected_temperature)
-        if self.expected_dur_at_start is None:
-            self.expected_dur_at_start = self._get_guard_duration(
-                self.detected_programme, self.detected_temperature, (self.detected_programme, self.detected_temperature)
-            )
         try:
             energy_used = float(attrs.get("energy_used", 0) or 0)
             current_energy = self.get_state(self.energy_sensor)
@@ -3464,28 +3069,13 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 self.energy_start = None
         except (ValueError, TypeError):
             self.energy_start = None
-        self.finish_confirmed = False
-        self.low_power_counter = 0
-        self.low_power_start_time = None
-        self.energy_stable_start_time = None
         self.last_high_energy_at = now
-        self._anti_crease_tail_since = None
-        self._zero_power_since = None
         # Reset so we can announce when the cycle truly finishes (the previous was a false finish).
         self.notification_sent = False
-        self.in_finishing_tail = False
-        self.in_finishing_tail_entered_at = None
-        self.last_tail_pulse_at = None
-        self.tail_pattern_locked = False
-        self.tail_pattern_cycle_seconds = None
-        self.tail_pattern_last_pulse_at = None
-        self.tail_pattern_locked_at = None
 
         self.state = "Running"
         profile = self._get_profile(self.detected_programme, self.detected_temperature)
-        guard_dur = self._get_guard_duration(
-            self.detected_programme, self.detected_temperature, (self.detected_programme, self.detected_temperature)
-        )
+        guard_dur = self.expected_dur_at_start or self._get_programme_duration(self.detected_programme, self.detected_temperature, use_learned=False) or 180
         elapsed = (now - self.start_time).total_seconds() / 60
         remaining = max(0, round(guard_dur - elapsed))
         est_end = self.start_time + timedelta(minutes=guard_dur)
@@ -3512,6 +3102,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             "programme_confirmed_by": self.confirmed_by_username or "",
             "expected_dur_at_start": self.expected_dur_at_start or "",
             "expected_dur_key": self._guard_bar_key_str(),
+            "activity_seen": True,
         }
         if self.energy_start is not None:
             run_attrs["energy_at_start"] = self.energy_start
@@ -3523,14 +3114,15 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # (cold programme, near end-of-cycle recovery, Auto mode, no trusted door-close) --
         # AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish() for details.
         self._set_state_entity( state="Running", attributes=run_attrs)
+        self._remove_last_cycle_feedback()
+        self._plug.clear()
 
         self._safe_cancel_timer(self.unemptied_watchdog_timer)
         self.unemptied_watchdog_timer = None
         self._safe_cancel_timer(self.unemptied_door_recheck_timer)
         self.unemptied_door_recheck_timer = None
         self.running_watchdog_timer = self.run_in(self._running_watchdog_timeout, int(self.max_running_hours * 3600))
-        if self.use_energy_detection:
-            self._start_energy_detection()
+        self._start_energy_detection()
         if not self.poll_timer:
             poll_interval = int(self.args.get("poll_interval_s", 60))
             self.poll_timer = self.run_in(self._poll_power, poll_interval)
@@ -3545,17 +3137,8 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         Set when the user opened the door before we detected finish - they already know
         the cycle is done, and announcing would be redundant (we failed to notify in time).
         """
-        self.in_finishing_tail = False
-        self.in_finishing_tail_entered_at = None
-        self.last_tail_pulse_at = None
-        self.tail_pattern_locked = False
-        self.tail_pattern_cycle_seconds = None
-        self.tail_pattern_last_pulse_at = None
-        self.tail_pattern_locked_at = None
-        # Gate: only allow transition when recent power looks like real cycle end (anti-crease or off), not mid-cycle rinse.
-        # Skip when user opened door first (skip_announce) or when we already verified standby/cadence break
-        # (standby_backstop = 5+ min of hard 0W - stronger evidence than the power-pattern gate itself).
-        if not skip_announce and self._pending_end_reason not in ("tail_to_standby", "tail_pattern_break", "standby_backstop"):
+        # A decision made by _finish_decision_tick (standby / spin_end) carries its own evidence; other callers keep the rinse gate.
+        if not skip_announce and self._pending_end_reason not in ("standby", "spin_end"):
             ok, mean_w, peak_w = self._power_looks_like_cycle_end()
             if not ok:
                 if mean_w is not None and peak_w is not None:
@@ -3665,10 +3248,11 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 confirmed_temperature=confirmed_temp,
                 transition_path=end_reason,
                 spin_rpm=spin_rpm,
+                selected_options=self._get_selected_options(),
             )
             if self._delayed_start_trimmed and duration_source is None:
                 duration_source = "delayed_start_trimmed"
-            saved_record = self._save_cycle_feedback(
+            feedback = dict(
                 predicted=final_prog,
                 predicted_temperature=final_temp,
                 confirmed=confirmed_prog,
@@ -3698,10 +3282,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 vibration=self._vibration_summary(),
                 actor_start=self._cycle_actor,
             )
-            if saved_record is not None:
-                self._maybe_send_confirm_push(saved_record)
-                self._schedule_vibration_unload_patch(saved_record)
-                self._last_saved_record_ts = saved_record.get("ts")
 
             self.state = "Unemptied"
             confirmed_profile = self._get_profile(confirmed_prog, confirmed_temp)
@@ -3724,6 +3304,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 "programme_duration_min": None,
                 "energy_at_start": None,
                 "last_high_energy_at": None,
+                "activity_seen": "",
             }
             # Dashboard visibility for who loaded the machine (see _begin_running_cycle /
             # _attribute); merge-not-replace set_state already carries this over from the
@@ -3741,17 +3322,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             if self.last_door_closed_at:
                 attributes["last_door_closed_at"] = self._format_local(self.last_door_closed_at)
                 attributes["last_door_closed_trusted"] = bool(self.last_door_closed_trusted)
-            if getattr(self, "_pending_tail_mean_w", None) is not None:
-                attributes["tail_pattern_detected"] = True
-                attributes["tail_window_mean_w"] = round(self._pending_tail_mean_w, 1)
-                if getattr(self, "_pending_tail_std_w", None) is not None:
-                    attributes["tail_window_std_w"] = round(self._pending_tail_std_w, 1)
-                if getattr(self, "_pending_tail_peak_w", None) is not None:
-                    attributes["tail_window_peak_w"] = round(self._pending_tail_peak_w, 1)
-                self._pending_tail_mean_w = None
-                self._pending_tail_std_w = None
-                self._pending_tail_peak_w = None
-
             # Next load: clear confirmation + HA helpers now (was only cleared at Off before).
             # Stash the pre-clear value first: if this Unemptied turns out to be false (machine
             # still running), _recover_from_false_unemptied needs the real confirmation back, and
@@ -3768,6 +3338,12 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             # no trusted door-close) -- AppDaemon 4.5.13 set_state bug, not ours; see
             # smart_cooling.py's _publish() for details.
             self._set_state_entity( state="Unemptied", attributes=attributes)
+
+            saved_record = self._save_cycle_feedback(**feedback)
+            if saved_record is not None:
+                self._maybe_send_confirm_push(saved_record)
+                self._schedule_vibration_unload_patch(saved_record)
+                self._last_saved_record_ts = saved_record.get("ts")
 
             self.programme_confirmed_by_user = False
             self.confirmed_by_username = None
@@ -3795,7 +3371,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             # Reset the door-history rate-limiter so the first recheck after entry (~60s) does
             # a recorder lookback for an ajar-door edge (FIX 4), not just a live-contact peek.
             self._unemptied_last_history_check_at = None
-            self._unemptied_recheck_high_counter = 0
             # A high-power streak carried over from the tail end of Running must not count
             # towards the push-driven false-recovery gate in _power_changed - start it fresh.
             self.high_power_counter = 0
@@ -3821,8 +3396,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             # FIX 1a: an uncorroborated restore stays silent until a live signal confirms the
             # cycle (see initialize()'s restore corroboration / _restore_reconcile).
             if (not skip_announce and not self.door_lock_entity and self.sonos_notifier
-                    and not self.notification_sent and announce_enabled
-                    and not getattr(self, "restored_uncorroborated", False)):
+                    and not self.notification_sent and announce_enabled):
                 # FIX 3: if we only detected the finish long after it happened (e.g. a restart
                 # storm delayed detection), a Sonos blast about a wash emptied long ago is worse
                 # than a quiet mobile push. notification_sent still gates against a double-notify.
@@ -3832,7 +3406,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 # duration of its own transition call - an explicit guarantee that path can never
                 # reach Sonos, instead of relying on the freshness-latency arithmetic to always
                 # exceed freshness_min (see _restore_reconcile's docstring).
-                force_push = getattr(self, "_announce_force_push", False)
+                force_push = bool(getattr(self, "restored_uncorroborated", False))
                 if latency_min > freshness_min or force_push:
                     self._push_mobile(
                         f"Washer finished about {latency_min:.0f} min ago (late detection) - "
@@ -3938,13 +3512,30 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 self.state == "Running"
                 or "cycle finished" in reason
             )
-            if (
+            self.state = "Emptied"
+
+            # Duration correction runs BEFORE the publish below so the published
+            # run_time_minutes always matches what feedback (after the publish) records - never
+            # the uncorrected wall-clock figure. should_save_feedback also gates the feedback
+            # save itself, further down.
+            should_save_feedback = (
                 self.start_time is not None
                 and run_minutes >= self.min_cycle_minutes
                 and came_from_running
-            ):
+            )
+            run_minutes_wall = run_minutes
+            duration_source = None
+            final_prog = final_temp = confirmed_prog = confirmed_temp = None
+            spin_rpm = None
+            feedback_hb = self.heating_phase_count
+            feedback_max_w = self.max_power_seen
+            end_reason = None
+            idle_min = None
+            effective_end_at_str = None
+            detected_at_str = None
+            classification = None
+            if should_save_feedback:
                 try:
-                    run_minutes_wall = run_minutes
                     run_minutes, duration_source = self._correct_duration(run_minutes_wall, log_prefix="Door-open")
 
                     final_prog, final_temp, confirmed_prog, confirmed_temp = self._compute_final_and_confirmed_programme(
@@ -3967,7 +3558,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                         )
                     end_reason = "user_cycle_end" if duration_source == "user_cycle_end" else "door_opened_first"
                     idle_min = (run_minutes_wall - run_minutes) if (duration_source and run_minutes_wall > run_minutes) else None
-                    effective_end_at_str = None
                     detected_at_str = self._format_local(self._now_utc())
                     if self.start_time and run_minutes is not None:
                         effective_end_dt = self.start_time + timedelta(minutes=run_minutes)
@@ -3983,7 +3573,40 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                         confirmed_temperature=confirmed_temp,
                         transition_path=end_reason,
                         spin_rpm=spin_rpm,
+                        selected_options=self._get_selected_options(),
                     )
+                except Exception as e:
+                    self.log(f"Could not correct duration on Emptied transition: {e}", level="WARNING")
+                    should_save_feedback = False
+                    run_minutes = run_minutes_wall
+
+            attributes = {
+                "reason": reason,
+                "run_time_minutes": round(run_minutes, 1) if run_minutes > 0 else None
+            }
+            # Dashboard visibility for who emptied the machine (see _attribute above).
+            attributes["emptied_by"] = (actor_empty or {}).get("person") or ""
+            if energy_used > 0:
+                attributes["energy_used"] = round(energy_used, 3)
+            # Preserve run_time_minutes, end_reason, idle_min from entity when coming from Unemptied
+            # so we keep the corrected programme length in the UI instead of overwriting with wall-clock to door.
+            try:
+                full = self.get_state(self.state_entity, attribute="all")
+                attrs = (full or {}).get("attributes") or {}
+                if self.get_state(self.state_entity) == "Unemptied":
+                    if attrs.get("run_time_minutes") is not None:
+                        attributes["run_time_minutes"] = attrs["run_time_minutes"]
+                    if attrs.get("end_reason"):
+                        attributes["end_reason"] = attrs["end_reason"]
+                    if attrs.get("idle_min") is not None:
+                        attributes["idle_min"] = attrs["idle_min"]
+            except Exception:
+                pass
+
+            self._set_state_entity( state="Emptied", attributes=attributes)
+
+            if should_save_feedback:
+                try:
                     saved_record = self._save_cycle_feedback(
                         predicted=final_prog,
                         predicted_temperature=final_temp,
@@ -4033,32 +3656,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                     "attribution": {"empty": actor_empty},
                 })
 
-            self.state = "Emptied"
-            attributes = {
-                "reason": reason,
-                "run_time_minutes": round(run_minutes, 1) if run_minutes > 0 else None
-            }
-            # Dashboard visibility for who emptied the machine (see _attribute above).
-            attributes["emptied_by"] = (actor_empty or {}).get("person") or ""
-            if energy_used > 0:
-                attributes["energy_used"] = round(energy_used, 3)
-            # Preserve run_time_minutes, end_reason, idle_min from entity when coming from Unemptied
-            # so we keep the corrected programme length in the UI instead of overwriting with wall-clock to door.
-            try:
-                full = self.get_state(self.state_entity, attribute="all")
-                attrs = (full or {}).get("attributes") or {}
-                if self.get_state(self.state_entity) == "Unemptied":
-                    if attrs.get("run_time_minutes") is not None:
-                        attributes["run_time_minutes"] = attrs["run_time_minutes"]
-                    if attrs.get("end_reason"):
-                        attributes["end_reason"] = attrs["end_reason"]
-                    if attrs.get("idle_min") is not None:
-                        attributes["idle_min"] = attrs["idle_min"]
-            except Exception:
-                pass
-
-            self._set_state_entity( state="Emptied", attributes=attributes)
-            
             # Cancel unemptied watchdog since we're now emptying
             self._safe_cancel_timer(self.unemptied_watchdog_timer)
             self.unemptied_watchdog_timer = None
@@ -4091,6 +3688,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
 
     def _reset_cycle_tracking(self):
         """Reset all cycle-related tracking variables."""
+        self._spin_end_at = None
+        self._activity_seen = False
+        self._activity_recorder_retry_after = None
         self.start_time = None
         self._start_time_source = None  # must not leak into the next cycle's block C rank gate
         self._cycle_id = None  # the store is already cleared by now (Off just called _set_state_entity)
@@ -4101,14 +3701,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.door_opened_time = None
         self.door_opened_during_cycle = False
         self.program_timer = None
-        self.low_power_counter = 0
-        self.low_power_start_time = None
         self.high_power_counter = 0
         self._high_power_streak_started_at = None
-        self.last_significant_power_at = None
         self.power_readings = []
-        self.finish_confirmed = False
-        self._zero_power_since = None
         self.notification_sent = False
         self.max_power_seen = 0.0
         self.observed_heating = False
@@ -4122,10 +3717,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self._guard_bar_class = None
         self._live_class_key = None
         self._live_class_since = None
-        self.in_finishing_tail = False
-        self.in_finishing_tail_entered_at = None
-        self._anti_crease_tail_since = None
-        self.last_tail_pulse_at = None
         self.door_fast_start_armed_until = None
         self._delay_plateau_start = None
         self._delayed_start_trimmed = False
@@ -4137,9 +3728,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self._unemptied_last_history_check_at = None
         # D1: belt-and-braces - _restore_reconcile's own finally already clears this, but a cycle
         # ending must never carry a stale override into the next one under any path.
-        self._finish_anchor_override = None
         # D2: same belt-and-braces as D1 above, for the force-push flag.
-        self._announce_force_push = False
         # A cycle ending (via any path) must never carry a stale finish-evidence hint into the
         # next one - see _transition_to_unemptied's mid-cycle-rinse gate, which trusts
         # tail_to_standby/tail_pattern_break/standby_backstop to skip that gate entirely.
@@ -4187,9 +3776,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.unemptied_door_recheck_timer = None
         self.last_energy_value = None
         self.last_energy_time = None
-        self.energy_stable_start_time = None
         self.last_high_energy_at = None
-        self.energy_buffer = []
 
         if self.poll_timer:
             self._safe_cancel_timer(self.poll_timer)
@@ -4223,15 +3810,13 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.log(f"Non-numeric power reading: {new}", level="WARNING")
             return
 
-        # Plug is reporting numbers again - stand down the dead-plug watchdog and the
-        # pending forced-Off grace.
+        # Plug is reporting numbers again - stand down the dead-plug watchdog.
         if self._plug_outage_push_timer:
             self._safe_cancel_timer(self._plug_outage_push_timer)
             self._plug_outage_push_timer = None
         if self._plug_outage_pushed:
             self._plug_outage_pushed = False
             self._push_mobile("Power plug is reporting again - washer monitoring resumed.")
-        self._cancel_power_unavailable_grace()
 
         # FIX 1c: a fresh sample at/above start current corroborates a restored Running/Paused
         # whose clock came from a non-live source (see initialize()'s restore corroboration) -
@@ -4239,9 +3824,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # the pending reconcile, and let the real finish announce normally.
         if getattr(self, "restored_uncorroborated", False) and watts >= self.start_w:
             self.restored_uncorroborated = False
-            if self._restore_reconcile_timer:
-                self._safe_cancel_timer(self._restore_reconcile_timer)
-                self._restore_reconcile_timer = None
             self.log(
                 f"Restore corroborated by live power {watts:.0f}W (>= {self.start_w:.0f}W) - "
                 f"clearing uncorroborated flag; cycle continues as normal Running",
@@ -4252,8 +3834,8 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
 
         if current_state == "Running":
             self._record_power_reading(watts)
-            if self.in_finishing_tail and watts > self._tail_pulse_reset_threshold_watts():
-                self.last_tail_pulse_at = self._now_utc()
+            if watts > self.energy_active_watts:
+                self.last_high_energy_at = self._now_utc()
             # Track peak power and classify programme via heating signature.
             # The Miele WEA 035 heating element draws ~1800-2200W; any reading >1000W
             # unambiguously identifies a warm-water programme (Cotton, Eco, Synthetics).
@@ -4276,33 +3858,11 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             elif watts < 500 and self.in_heating_phase:
                 self.in_heating_phase = False  # Heating phase ended (element off / rinsing)
 
-        # Track significant power
-        # During low-power detection, ignore brief spikes to prevent resetting the finish timer
-        if watts >= self.significant_w:
-            if self.low_power_start_time is None:
-                # Not tracking low power - update normally
-                self.last_significant_power_at = self._now_utc()
-            else:
-                # We're tracking low power - check if we should ignore this spike
-                time_low = (self._now_utc() - self.low_power_start_time).total_seconds()
-                poll_interval = int(self.args.get("poll_interval_s", 60))
-                threshold_seconds = self.low_power_threshold * poll_interval
-                
-                # If we've accumulated significant low-power time (>=60% of threshold),
-                # ignore brief spikes - we're likely in finish detection phase
-                if time_low >= threshold_seconds * 0.6:
-                    # Ignore spike - we're close to finish detection
-                    self.log(f"Ignoring significant power spike ({watts:.1f}W) during finish detection (low power for {time_low:.0f}s)", level="DEBUG")
-                else:
-                    # Still early - update normally (might be inter-cycle pause)
-                    self.last_significant_power_at = self._now_utc()
-
         # High power branch (start detection)
         if watts >= self.start_w:
             if self.high_power_counter == 0:
                 self._high_power_streak_started_at = self._now_utc()
             self.high_power_counter += 1
-            self.low_power_counter = 0
 
             now = self._now_utc()
             fast_armed = (
@@ -4313,26 +3873,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             effective_threshold = 2 if fast_armed else self.high_power_threshold
 
             if self.high_power_counter >= effective_threshold:
-                if current_state == "Unemptied":
-                    # False finish: we declared done but the machine is still running - EXCEPT a
-                    # single Miele anti-crease tumble (40-80W for a few seconds) can satisfy this
-                    # same raw count just as fast, since this route fires on every power push, not
-                    # a fixed poll (unlike _unemptied_door_recheck's sibling counter, hardened
-                    # 2026-08-19, whose 60s-apart samples make its threshold imply real elapsed
-                    # minutes). Require the same sustained-time bar here before recovering.
-                    streak_started = self._high_power_streak_started_at or now
-                    streak_seconds = (now - streak_started).total_seconds()
-                    min_sustained_s = max(0, self.high_power_threshold - 1) * 60
-                    if streak_seconds >= min_sustained_s:
-                        # Recover to Running so the UI shows correct state and we can detect real finish.
-                        self._recover_from_false_unemptied(watts)
-                        return
-                    self.log(
-                        f"Power push while Unemptied: {watts:.1f}W high for {streak_seconds:.0f}s "
-                        f"(need {min_sustained_s:.0f}s sustained) - could be an anti-crease nudge, "
-                        f"not recovering yet",
-                        level="DEBUG",
-                    )
                 if current_state == "Off":
                     self._confirm_running(kwargs={})
                 elif current_state == "Emptied":
@@ -4373,61 +3913,20 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self._transition_to_off("Emptied: 0W - machine off")
             return
 
-        # Low power branch (finish detection)
-        # Use time-based approach: track how long power has been low
-        # Allow brief spikes without resetting - use 80% threshold for robustness
-        if current_state == "Running":
-            if watts <= self.stop_w:
-                # Power is low - start or continue tracking
-                if self.low_power_start_time is None:
-                    self.low_power_start_time = self._now_utc()
-                    self.low_power_counter = 1
-                else:
-                    self.low_power_counter += 1
-                
-                # Check if we've had low power long enough (with tolerance for brief spikes)
-                # Require at least 80% of readings to be low over the threshold period
-                poll_interval = int(self.args.get("poll_interval_s", 60))
-                threshold_seconds = self.low_power_threshold * poll_interval
-                time_low = (self._now_utc() - self.low_power_start_time).total_seconds()
-                
-                if time_low >= threshold_seconds * 0.8:  # 80% of threshold time
-                    # Check if majority of readings were low
-                    if self.low_power_counter >= int(self.low_power_threshold * 0.8):
-                        self._confirm_finished(kwargs={})
-            else:
-                # Power is above threshold - check if we should reset
-                if self.low_power_start_time is not None:
-                    # We've been tracking low power, but now it's high
-                    # Allow up to 20% of readings to be high (tolerance for brief spikes)
-                    # If we've accumulated enough low readings, tolerate occasional spikes
-                    poll_interval = int(self.args.get("poll_interval_s", 60))
-                    threshold_seconds = self.low_power_threshold * poll_interval
-                    time_low = (self._now_utc() - self.low_power_start_time).total_seconds()
-                    
-                    # Calculate expected readings in this period
-                    expected_readings = max(1, int(time_low / poll_interval))
-                    # If we have at least 80% low readings, this is just a spike - don't reset yet
-                    if self.low_power_counter >= int(expected_readings * 0.8):
-                        self.log(f"Power spike to {watts:.1f}W during low-power period (tolerated, {self.low_power_counter}/{expected_readings} low)", level="DEBUG")
-                    else:
-                        # Too many high readings - reset tracking
-                        self.log(f"Power recovered to {watts:.1f}W after {time_low:.0f}s - reset (only {self.low_power_counter}/{expected_readings} low)", level="DEBUG")
-                        self.low_power_counter = 0
-                        self.low_power_start_time = None
-                else:
-                    self.low_power_counter = 0
 
     def _poll_power(self, kwargs):
-        """Conditional polling"""
-        current_state = self.get_state(self.state_entity)
-
-        if current_state not in ("Running", "Paused", "Emptied", "Unemptied"):
-            if self.poll_timer:
-                self._safe_cancel_timer(self.poll_timer)
-                self.poll_timer = None
+        """Every poll_interval_s while a cycle is open: reconcile missed door events and re-feed HA's power reading.
+        Re-armed in finally for as long as the state needs it, whatever the body raises."""
+        self.poll_timer = None
+        if self.state not in ("Running", "Paused", "Emptied", "Unemptied"):
             return
+        try:
+            self._poll_power_body(self.state)
+        finally:
+            if self.state in ("Running", "Paused", "Emptied", "Unemptied") and not self.poll_timer:
+                self.poll_timer = self.run_in(self._poll_power, int(self.args.get("poll_interval_s", 60)))
 
+    def _poll_power_body(self, current_state):
         # Missed or ignored listen_state (e.g. open after old=unknown post-restart): door can be open
         # while sensor.washer_state still says Running. Reconcile like Unemptied door-recheck.
         if current_state == "Running" and self._door_is_physically_open():
@@ -4462,30 +3961,26 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
 
         self._power_changed(self.power_sensor, None, None, watts, {})
 
-        poll_interval = int(self.args.get("poll_interval_s", 60))
-        self.poll_timer = self.run_in(self._poll_power, poll_interval)
-
     def _begin_running_cycle(self, log_message="State -> Running"):
         """Reset per-cycle state and push Running attributes.
 
         Used when entering Running from Off/Emptied, or when fixing stale cycle_start_time while
         the entity already shows Running (see _power_changed start_before_off path).
         """
+        # Finish decisions for this cycle see only reads taken from here on.
+        self._plug.clear()
+        self._activity_seen = False
+        self._activity_recorder_retry_after = None
+        self._spin_end_at = None
+        self._plug_offline_pushed = False
         self.last_state_change = self._now_utc()
         self.state = "Running"
-        self.in_finishing_tail = False
-        self.in_finishing_tail_entered_at = None
-        self._anti_crease_tail_since = None
-        self.last_tail_pulse_at = None
         # Reset all per-cycle counters so stale data from a previous cycle never bleeds through.
         self.max_power_seen = 0.0
         self.observed_heating = False
         self.in_heating_phase = False
         self.heating_phase_count = 0
-        self.finish_confirmed = False
-        self.energy_stable_start_time = None
         self.last_high_energy_at = None
-        self._zero_power_since = None
         # A fresh (or resumed) cycle must never carry a stale finish-evidence hint into itself -
         # see _transition_to_unemptied's mid-cycle-rinse gate at the top of that function.
         self._pending_end_reason = None
@@ -4565,8 +4060,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # there is only carried alongside that same decision, never itself the discriminator.
         self._cycle_id = str(uuid.uuid4())
         self.door_opened_during_cycle = False
-        self.low_power_counter = 0
-        self.low_power_start_time = None
         self.power_readings = []
 
         try:
@@ -4600,6 +4093,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             "programme_duration_min": profile["duration_min"],
             "delayed_start_trimmed": bool(self._delayed_start_trimmed),
             "delayed_start_waiting": bool(self._delay_waiting),
+            "supports_soak": bool(self.option_soak_entity),
             "session_cost_kr": round(self._session_cost_kr, 2),
         }
         # Use "" not None - AppDaemon 4.5.13 drops attributes equal to None/False/0 (see
@@ -4670,8 +4164,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             int(self.max_running_hours * 3600)
         )
 
-        if self.use_energy_detection:
-            self._start_energy_detection()
+        self._start_energy_detection()
 
         if log_message:
             self.log(log_message, level="INFO")
@@ -4693,92 +4186,11 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 self._begin_running_cycle("State -> Running")
                 self.door_fast_start_armed_until = None
 
-    def _confirm_finished(self, kwargs):
-        """Confirm the cycle has finished - power dropped, door still closed.
-        Skipped when energy-based detection is active (it's more reliable for
-        machines with post-cycle pump spikes like the Miele)."""
-        current_state = self.get_state(self.state_entity)
-
-        if current_state != "Running":
-            return
-
-        if getattr(self, 'energy_check_timer', None) is not None:
-            self.log("Power-based finish skipped - energy detection is active", level="DEBUG")
-            return
-
-        current_power_state = self.get_state(self.power_sensor)
-        if current_power_state in ["unknown", "unavailable"]:
-            self._handle_unavailable(self.power_sensor, None, None, current_power_state, {})
-            return
-
-        try:
-            watts = float(current_power_state or 0)
-        except (ValueError, TypeError):
-            self._handle_unavailable(self.power_sensor, None, None, current_power_state, {})
-            return
-
-        # Check time since significant power
-        # Since we've already detected 5+ minutes of low power, we only need a short confirmation
-        # that power is still low and there's been no recent significant activity
-        time_since_high = float("inf")
-        if self.last_significant_power_at:
-            time_since_high = (self._now_utc() - self.last_significant_power_at).total_seconds()
-
-        # Reduced requirement: if we've detected low power for threshold period,
-        # we only need 1 minute (2 poll intervals) without significant power as confirmation
-        # This prevents the double-delay issue where we wait 5 min + another 5 min
-        confirmation_time = min(self.no_recent_high_s, 60)  # Max 1 minute confirmation
-        
-        if watts <= self.stop_w and time_since_high >= confirmation_time:
-            run_min = self._get_run_duration_minutes()
-            prog, temp = self._classify_programme() if self.start_time else ("unknown", None)
-            guard_dur = self._get_guard_duration(tick_prog=prog, tick_temp=temp, tick_class=(prog, temp))
-            if self._meets_finish_time_guards(run_min, guard_dur or 0) and self._is_valid_completed_cycle():
-                self.finish_confirmed = True
-                self.log("Finish confirmed (power-based detection)", level="INFO")
-                self._transition_to_unemptied()
-            elif not self._meets_finish_time_guards(run_min, guard_dur or 0):
-                self.log(f"Power-based: finish time guards not met (run {run_min:.0f}min) - blocking", level="DEBUG")
-            else:
-                self.log(f"Cycle incomplete - waiting (time since high: {time_since_high:.0f}s, need {confirmation_time}s)", level="DEBUG")
-        elif watts <= self.stop_w:
-            self.log(f"Power low but waiting for confirmation (time since high: {time_since_high:.0f}s, need {confirmation_time}s)", level="DEBUG")
-
-    def _cancel_power_unavailable_grace(self):
-        """Power/state readings are valid again; cancel the pending forced-Off transition."""
-        self._safe_cancel_timer(self.power_unavailable_off_timer)
-        self.power_unavailable_off_timer = None
-
     def _handle_unavailable(self, entity, attribute, old, new, kwargs):
-        """Handle entity becoming unavailable - do not force-wipe an in-progress cycle on a brief
-        dropout (HA restart or ESPHome OTA flash routinely drop the plug for well under the grace
-        period - 2026-07-17 log investigation showed dishwasher_monitor.py absorbs the same outages
-        with zero false transitions). Wait for the outage to persist before forcing Off; a lasting
-        plug outage separately pages the phone (_begin_plug_outage_grace).
-        The already-running guard below also dedups the double-invocation that used to log twice
-        11 ms apart: the 'unavailable' listen_state AND the unavailable branch of _power_changed
-        both call this."""
+        """HA's power entity went unavailable. It never changes the washer state - finish decisions read the plug
+        directly - but a lasting outage blinds start detection, so it pages the phone (_begin_plug_outage_grace)."""
         if entity == self.power_sensor:
             self._begin_plug_outage_grace()
-        if self.power_unavailable_off_timer and self.timer_running(self.power_unavailable_off_timer):
-            return
-        self.power_unavailable_off_timer = self.run_in(
-            self._power_unavailable_off_timeout,
-            self.power_unavailable_off_after_seconds,
-        )
-        self.log(
-            f"{entity} unavailable ({new}); waiting {self.power_unavailable_off_after_seconds}s before forcing Off "
-            f"(short dropouts - HA restart / plug OTA - are ignored)",
-            level="WARNING",
-        )
-
-    def _power_unavailable_off_timeout(self, kwargs):
-        self.power_unavailable_off_timer = None
-        ps = self.get_state(self.power_sensor)
-        if ps not in ("unknown", "unavailable", None):
-            self.log(f"Power sensor recovered before the {self.power_unavailable_off_after_seconds}s grace expired", level="INFO")
-            return
-        self._transition_to_off(f"Power sensor unavailable >= {self.power_unavailable_off_after_seconds}s", force=True)
 
     def _begin_plug_outage_grace(self):
         """Short plug dropouts are routine; only a lasting outage pages the phone."""
@@ -4796,8 +4208,8 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             return
         self._plug_outage_pushed = True
         self._push_mobile(
-            f"Power plug stopped reporting (unavailable >= {self.plug_outage_push_after_seconds}s) - "
-            f"cycle monitoring is blind and the washer just looks Off. Check the plug/WiFi."
+            f"Washer plug stopped reporting to HA (unavailable >= {self.plug_outage_push_after_seconds}s) - "
+            f"a new wash will not be detected until it is back. Check the plug/WiFi."
         )
 
     def _push_mobile(self, message):
@@ -4873,7 +4285,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         """Identify individual cycles from history data. See washer_history.identify_cycles."""
         return whist.identify_cycles(
             energy_hist, door_hist, power_hist, state_hist,
-            self.start_w, self.stop_w, self.high_power_threshold, self.low_power_threshold,
+            self.start_w, self.stop_w, self.high_power_threshold, 0,
         )
 
     def _classify_programme(self, energy_signature_only: bool = False):
@@ -5131,105 +4543,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 level="DEBUG",
             )
 
-    def _get_guard_duration(self, tick_prog=None, tick_temp=None, tick_class=None):
-        """Best duration for 85% guards: prefer user-confirmed selector, else the guard bar
-        (expected_dur_at_start - seeded at first classification, then evidence-following via
-        _update_guard_bar), else this tick's classification, else programme max.
-        Only trust confirm_entity when programme_confirmed_by_user is True; otherwise the selector may hold
-        an auto-filled prediction and must not drive finish guards."""
-        if self.programme_confirmed_by_user and self.confirm_entity:
-            try:
-                label = self.get_state(self.confirm_entity)
-                if label and label not in ("Auto (unconfirmed)", "unknown", "unavailable"):
-                    prog = self._LABEL_TO_KEY.get(label, "unknown")
-                    temp = self._read_temperature_selector() if self._programme_has_temperature(prog) else None
-                    if prog and prog != "unknown":
-                        d = self._get_programme_duration(prog, temp, use_learned=False)
-                        if d:
-                            return d
-            except Exception:
-                pass
-        if self.expected_dur_at_start is not None:
-            return self.expected_dur_at_start
-        if tick_prog and tick_prog != "unknown":
-            d = self._get_programme_duration(tick_prog, tick_temp, use_learned=False)
-            if d:
-                return d
-        return self._programme_max_duration_minutes(classification=tick_class)
-
-    def _get_finish_min_run_minutes(self):
-        """Minimum run minutes before we may declare cycle done (avoids false finish when guard_dur is wrong).
-        Use warm floor when we've seen heating, or when user has confirmed a programme that heats (so we don't
-        fire early before the first heating burst in a long warm programme). Exception: once a user-confirmed
-        programme that doesn't support anti-crease (e.g. Uld) has used an energy total no heavier programme
-        could explain, drop to that programme's own confirmed duration - waiting out the generic warm floor
-        would only delay an already-certain finish."""
-        floor = self.finish_min_run_minutes_warm if self.observed_heating else self.finish_min_run_minutes_cold
-        confirmed_prog, confirmed_temp, confirmed_profile = None, None, None
-        if self.programme_confirmed_by_user and self.confirm_entity:
-            try:
-                label = self.get_state(self.confirm_entity)
-                if label and label not in ("Auto (unconfirmed)", "unknown", "unavailable"):
-                    prog = self._LABEL_TO_KEY.get(label, "unknown")
-                    if prog and prog != "unknown":
-                        temp = self._read_temperature_selector() if self._programme_has_temperature(prog) else None
-                        profile = self._get_profile(prog, temp)
-                        if profile:
-                            confirmed_prog, confirmed_temp, confirmed_profile = prog, temp, profile
-                            if profile.get("heats"):
-                                floor = self.finish_min_run_minutes_warm
-            except Exception:
-                pass
-        if confirmed_profile and confirmed_profile.get("supports_anti_crease") is False:
-            max_energy = confirmed_profile.get("max_valid_energy_kwh") or confirmed_profile.get("max_energy_kwh")
-            if not max_energy or self._get_energy_used() <= max_energy * self.guard_energy_disproof_margin:
-                nominal = self._get_programme_duration(confirmed_prog, confirmed_temp, use_learned=False)
-                if nominal:
-                    floor = min(floor, float(nominal))
-        return floor
-
-    def _meets_finish_time_guards(self, run_min: float, guard_dur: float) -> bool:
-        """True only if we're past the fraction of expected AND past absolute min runtime. Reduces false announcements."""
-        min_run = self._get_finish_min_run_minutes()
-        if not guard_dur:
-            return run_min >= min_run
-        # When we use the warm floor, don't trust a guard_dur below it for the percentage check (avoids wrong classification).
-        effective_guard = max(guard_dur, min_run) if min_run == self.finish_min_run_minutes_warm else guard_dur
-        pct_ok = run_min >= effective_guard * self.finish_guard_fraction
-        min_ok = run_min >= min_run
-        return pct_ok and min_ok
-
-    def _effective_stable_minutes(self, classification=None):
-        """Energy-stability window appropriate for the detected programme.
-        Only use confirm_entity when programme_confirmed_by_user is True (avoids using
-        auto-filled prediction for stable window)."""
-        prog, temp = None, None
-        if self.programme_confirmed_by_user and self.confirm_entity:
-            try:
-                label = self.get_state(self.confirm_entity)
-                if label and label not in ("Auto (unconfirmed)", "unknown", "unavailable"):
-                    prog = self._LABEL_TO_KEY.get(label, "unknown")
-                    temp = self._read_temperature_selector() if prog and self._programme_has_temperature(prog) else None
-            except Exception:
-                pass
-        if not prog or prog == "unknown":
-            prog, temp = classification or self._classify_programme()
-        profile = self._get_profile(prog, temp)
-        if profile and "stable_min" in profile:
-            return profile["stable_min"]
-        return self.energy_stable_minutes
-
-    def _estimated_remaining_minutes(self):
-        """Estimate minutes remaining based on programme profile and elapsed time."""
-        if not self.start_time:
-            return None
-        prog, temp = self._classify_programme()
-        if prog == "unknown":
-            return None
-        effective_dur = self._get_programme_duration(prog, temp)
-        elapsed_min = (self._now_utc() - self.start_time).total_seconds() / 60
-        return max(0, round(effective_dur - elapsed_min))
-
     # =========================================================================
     # Programme feedback & learning
     # =========================================================================
@@ -5261,6 +4574,13 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             return manual
         learn_key = f"{prog}|{temperature}" if temperature else prog
         return wp.blend_learned_duration(manual, self._learned_durations.get(learn_key))
+
+    def _reload_learning(self, cycles) -> int:
+        """Derive learned durations and centroids from the eligible records - the only writer of both."""
+        buckets, centroids, skipped_unconfirmed = wfb.aggregate_cycles(cycles, self.PROGRAMME_PROFILES)
+        self._history_centroids = centroids
+        self._learned_durations = {k: {"n": len(b["durations"]), "avg": sum(b["durations"]) / len(b["durations"])} for k, b in buckets.items() if b["durations"]}
+        return skipped_unconfirmed
 
     def _load_and_apply_feedback(self):
         """Load washer_feedback.json and apply learned programme data.
@@ -5297,36 +4617,20 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         if not cycles:
             return
 
-        buckets, centroids, skipped_unconfirmed = wfb.aggregate_cycles(cycles, self.PROGRAMME_PROFILES)
-        self._history_centroids = centroids
-
+        counts = wfb.migrate_records(cycles, self._classify_cycle_completion)
+        if counts.get("unchanged", 0) != len(cycles):
+            try:
+                with open(path, "w") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                self.log(f"Feedback records re-validated (validation v{wfb.VALIDATION_VERSION}): {counts}", level="INFO")
+            except Exception as e:
+                self.log(f"Could not write migrated feedback file: {e}", level="WARNING")
+        skipped_unconfirmed = self._reload_learning(cycles)
         self.log("=== Washer programme feedback summary ===", level="INFO")
         if skipped_unconfirmed:
             self.log(f"  Skipped {skipped_unconfirmed} unconfirmed cycle(s) for learning", level="INFO")
-        for learn_key, bucket in sorted(buckets.items()):
-            n = len(bucket["durations"])
-            if n == 0:
-                # Every confirmed cycle for this key had soak on (aggregate_cycles excludes
-                # them) - no non-soak sample yet, so ETA keeps using the manual profile.
-                self.log(f"  {learn_key}: {bucket['total']} confirmed cycle(s), all soak - no duration sample yet", level="INFO")
-                continue
-            avg = sum(bucket["durations"]) / n
-            correct = bucket["correct"]
-            total = bucket["total"]
-            acc = f"{correct}/{total} ({100*correct//total}%)" if total else "-"
-            prog = bucket["prog"]
-            temp = bucket["temp"]
-            profile = self._get_profile(prog, temp)
-            manual = profile.get("duration_min", 180)
-            label = profile.get("label", prog)
-            temp_str = f" {temp}" if temp else ""
-            self._learned_durations[learn_key] = {"n": n, "avg": avg}
-            effective = self._get_programme_duration(prog, temp)
-            self.log(
-                f"  {self._log_safe(label)}{self._log_safe(temp_str):<14} confirmed {n:>2}x  accuracy {acc:<12} "
-                f"manual {manual:>3}min  learned {avg:>5.1f}min  effective {effective:>3}min",
-                level="INFO",
-            )
+        for learn_key, rec in sorted(self._learned_durations.items()):
+            self.log(f"  {learn_key}: confirmed {rec['n']}x  learned {rec['avg']:.1f}min", level="INFO")
         self.log("==========================================", level="INFO")
 
     def _migrate_feedback_add_completion_class(self, dry_run: bool = True):
@@ -5508,29 +4812,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.log(f"Could not write feedback file {self.feedback_file}: {e}", level="WARNING")
             return
 
-        # Update in-memory learned durations and centroids only when valid for learning AND
-        # user-confirmed - matching washer_feedback.aggregate_cycles' reload-time gate exactly.
-        # An unconfirmed cycle is instead folded in later, exactly once, by
-        # _on_confirm_push_action if/when the user taps the confirm push; applying it here too
-        # double-counted it (n=1 at save, n=2 after the push confirmed it, n=1 again on the next
-        # reload) since aggregate_cycles only ever counts a record once it is user-confirmed.
-        # Soak stretches duration_min well beyond the programme's normal length - excluded from
-        # the learned average the same way aggregate_cycles excludes it on reload (the centroid
-        # still learns from this cycle, same as apply_learned_sample's default).
-        soak_selected = (selected_options or {}).get("soak") == "on"
-        avg_new = None
-        if valid_for_learning and user_confirmed:
-            avg_new = wfb.apply_learned_sample(
-                self._learned_durations,
-                self._history_centroids,
-                wp.learn_key_for(self.PROGRAMME_PROFILES, confirmed, confirmed_temperature),
-                duration_min,
-                energy_kwh,
-                heating_bursts,
-                self._get_profile(confirmed, confirmed_temperature).get("heats"),
-                skip_duration=soak_selected,
-            )
-
+        self._reload_learning(data["cycles"])
+        learn_key = wp.learn_key_for(self.PROGRAMME_PROFILES, confirmed, confirmed_temperature)
+        avg_new = self._learned_durations.get(learn_key, {}).get("avg") if (valid_for_learning and user_confirmed) else None
         match = "OK" if predicted == confirmed else f"corrected (predicted {predicted})"
         source = "user confirmed" if user_confirmed else "calculated"
         eff = self._get_programme_duration(confirmed, confirmed_temperature)
@@ -5540,7 +4824,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         duration_note = f"  [duration from {duration_source}]" if duration_source else ""
         idle_note = f"  (idle {idle_min:.0f} min excluded)" if idle_min is not None and idle_min >= 0 else ""
         end_note = f"  end_reason={end_reason}" if end_reason else ""
-        soak_note = "  (soak - duration not learned)" if soak_selected else ""
+        soak_note = "  (soak - not learned)" if "soak_selected" in (validation_flags or []) else ""
         learned_note = f"learned avg now {avg_new:.1f}min  " if avg_new is not None else ""
         self.log(
             f"Feedback saved: {self._log_safe(label)}{self._log_safe(temp_str)} "
@@ -5933,6 +5217,19 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         rec["programme_confirmed_by_human"] = True
         rec["programme_user_confirmed"] = True  # keep legacy field consistent
         rec["programme_confirmed_via"] = "push_action"
+        # Eligibility is re-derived from the record itself (options included): confirming never makes a soak learnable.
+        classification = self._classify_cycle_completion(
+            run_minutes=float(rec.get("duration_min", 0) or 0), energy_kwh=float(rec.get("energy_kwh", 0) or 0),
+            heating_bursts=int(rec.get("heating_bursts", 0) or 0), max_power_w=float(rec.get("max_power_w", 0) or 0),
+            predicted=rec.get("predicted", ""), predicted_temperature=self._temp_from_storage(rec.get("predicted_temperature")),
+            confirmed=prog, confirmed_temperature=self._temp_from_storage(rec.get("confirmed_temperature")),
+            transition_path=rec.get("transition_path") or rec.get("end_reason") or "low_power_detected", spin_rpm=rec.get("spin_rpm"),
+            user_confirmed_override=True, selected_options=rec.get("selected_options"),
+        )
+        rec["completion_class"] = classification["completion_class"]
+        rec["valid_for_learning"] = classification["valid_for_learning"]
+        rec["validation_flags"] = classification["validation_flags"]
+        rec["validation_version"] = wfb.VALIDATION_VERSION
 
         try:
             with open(self.feedback_file, "w") as f:
@@ -5940,6 +5237,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         except Exception as e:
             self.log(f"Could not write feedback file for confirm action: {e}", level="WARNING")
             return
+        self._reload_learning(fb_data["cycles"])
         self._dismiss_confirm_push(rec)
 
         # Update in-memory learned durations incrementally - same math and learn-key
@@ -5948,17 +5246,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         conf_temp_internal = self._temp_from_storage(rec.get("confirmed_temperature"))
         learn_key = f"{prog}|{conf_temp_internal}" if (conf_temp_internal and self._programme_has_temperature(prog)) else prog
         duration_min = rec.get("duration_min")
-        soak_selected = (rec.get("selected_options") or {}).get("soak") == "on"
-        if (
-            rec.get("valid_for_learning")
-            and isinstance(duration_min, (int, float))
-            and duration_min > 0
-            and not soak_selected
-        ):
-            prev = self._learned_durations.get(learn_key, {"n": 0, "avg": duration_min})
-            n_new = prev["n"] + 1
-            avg_new = (prev["avg"] * prev["n"] + duration_min) / n_new
-            self._learned_durations[learn_key] = {"n": n_new, "avg": avg_new}
 
         self.log(f"Cycle {ts} confirmed as {learn_key} via push action", level="INFO")
 
@@ -6033,7 +5320,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         pred = rec.get("predicted", "")
         pred_temp = self._temp_from_storage(rec.get("predicted_temperature"))
         transition_path = rec.get("transition_path") or rec.get("end_reason") or "low_power_detected"
-        if transition_path not in ("user_cycle_end", "anti_crease_pattern", "low_power_detected", "door_opened_first", "tail_to_standby"):
+        if transition_path not in wcls.KNOWN_TRANSITION_PATHS:
             transition_path = "low_power_detected"
         classification = self._classify_cycle_completion(
             run_minutes=float(rec.get("duration_min", 0)),
@@ -6047,6 +5334,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             transition_path=transition_path,
             spin_rpm=rec.get("spin_rpm"),
             user_confirmed_override=True,
+            selected_options=rec.get("selected_options"),
         )
         rec["completion_class"] = classification["completion_class"]
         rec["valid_for_learning"] = classification["valid_for_learning"]
@@ -6058,6 +5346,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         except Exception as e:
             self.log(f"Could not write feedback after user-confirm update: {e}", level="WARNING")
             return
+        self._reload_learning(cycles)
         self._dismiss_confirm_push(rec)
         label = self._get_profile(prog_key, conf_temp).get("label", prog_key)
         self.log(
@@ -6239,7 +5528,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             effective_dur = self._get_programme_duration(eta_prog, eta_temp, use_learned=False)
             if not effective_dur:
                 return
-            effective_dur += self._soak_bonus_minutes(eta_prog)
+            effective_dur += self._soak_offset_minutes()
             # Sync the classifier's own state too, not just the published attrs -- other call
             # sites (e.g. _get_programme_duration_hint_for_history, line ~3057) read
             # self.detected_programme directly and would otherwise keep using the stale
@@ -6259,9 +5548,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             attrs["estimated_end_time"] = est_end.astimezone(self._local_tz()).strftime("%H:%M")
             attrs["elapsed_minutes"] = round(elapsed_min, 1)
             attrs["progress_pct"] = min(100, max(0, round(100 * elapsed_min / effective_dur))) if effective_dur else 0
-            attrs["supports_soak"] = self._programme_supports_soak(eta_prog)
             attrs["programme_confirmed_by_user"] = bool(self.programme_confirmed_by_user)
             attrs["programme_confirmed_by"] = self.confirmed_by_username or ""
+            attrs["supports_soak"] = bool(self.option_soak_entity)
             if self.expected_dur_at_start is not None:
                 attrs["expected_dur_at_start"] = self.expected_dur_at_start
                 attrs["expected_dur_key"] = self._guard_bar_key_str()
@@ -6322,29 +5611,15 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.log(f"Could not apply programme UI dropdowns for {prog_key}: {e}", level="DEBUG")
 
     def _start_energy_detection(self):
-        """Start monitoring energy consumption to detect when cycle finishes."""
-        if not self.use_energy_detection:
-            return
-        
-        # Get initial energy value
         try:
             energy = self.get_state(self.energy_sensor)
             if energy is not None and energy not in ["unknown", "unavailable"]:
                 self.last_energy_value = float(energy)
                 self.last_energy_time = self._now_utc()
-                self.energy_stable_start_time = None
-                self.last_high_energy_at = self.last_energy_time  # Seed: cycle just started = high
-                self.energy_buffer = [(self.last_energy_time, self.last_energy_value)]
-                self._zero_power_since = None
-
-                # Start checking energy periodically - cancel any handle already armed first
-                # (a caller reaching this a second time in the same pass must not end up with two
-                # concurrent tick loops; see _restore_energy_state_from_history's sibling guard).
-                self._safe_cancel_timer(self.energy_check_timer)
-                self.energy_check_timer = self.run_in(self._check_energy_finish, self.energy_check_interval)
-                self.log("Energy-based finish detection started", level="DEBUG")
+                self.last_high_energy_at = self.last_energy_time
         except (ValueError, TypeError):
-            self.log("Could not get initial energy value for detection", level="WARNING")
+            pass
+        self._arm_finish_tick()
 
     def _maybe_handle_delayed_start(self):
         """Detect a Miele delayed-start wait and slide the cycle start past it.
@@ -6424,18 +5699,12 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 self.energy_start = float(energy)
                 self.last_energy_value = self.energy_start
                 self.last_energy_time = resume_at
-                self.energy_buffer = [(resume_at, self.energy_start)]
-            else:
-                self.energy_buffer = []
         except (ValueError, TypeError):
-            self.energy_buffer = []
+            pass
         # standby wait excluded from cost, same as duration
         self._session_cost_kr = 0.0
         self._cost_prev_energy_kwh = self.energy_start
         self.last_high_energy_at = resume_at
-        self.energy_stable_start_time = None
-        self.finish_confirmed = False
-        self._zero_power_since = None
 
         # Re-freeze expected duration from the real wash (was frozen from the bogus start tick).
         self.expected_dur_at_start = None
@@ -6457,93 +5726,20 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             level="INFO",
         )
 
-    def _standby_backstop_tick(self, now, tick_prog, tick_temp, tick_class) -> bool:
-        """Zero-power standby backstop: decide what to do after sustained hard 0W.
-
-        Called from _check_energy_finish when instantaneous power is <= 0W. Returns True only
-        when a transition actually landed (caller must stop the tick); False to keep checking,
-        including when a transition was attempted but refused (e.g. cooling period) - the
-        caller's own fallthrough re-arms the tick in that case, exactly as a False here always
-        implied "not finished yet".
-
-        Ladder (all thresholds unchanged from the original inline block):
-          * 0W >= 3 min + finish guards met + valid cycle    -> Unemptied (normal finish).
-          * 0W >= 5 min + heated + real energy + warm floor  -> Unemptied via safety net (below).
-          * 0W >= 5 min otherwise                            -> forced Off (false start / ghost Running).
-
-        The safety net (2026-08-11): a cycle that demonstrably heated water
-        (observed_heating) and consumed at least min_energy_kwh is a REAL wash even when
-        the finish-time guards never opened - a wrong-long guard bar (eco 199 min frozen
-        over an actual ~180 min run -> needing 92% = 183 min) blocked them right up to
-        this point. Forcing Off here ended 12 real washes silently since 2026-03: no
-        announcement, no Unemptied on the dashboard, no learning record. Publishing
-        Unemptied instead is safe because the existing protections still hold: the
-        finish_min_run_minutes_warm floor (100 min) and 5 minutes of hard 0W (anti-crease
-        tumbles reset the zero-power clock, so a mid-cycle soak never gets here)."""
-        if self._zero_power_since is None:
-            self._zero_power_since = now
-        zero_min = (now - self._zero_power_since).total_seconds() / 60
-        if zero_min < 3.0:
-            return False
-        run_min = (now - self.start_time).total_seconds() / 60 if self.start_time else 0
-        guard_dur = self._get_guard_duration(tick_prog, tick_temp, tick_class)
-        if self._meets_finish_time_guards(run_min, guard_dur or 0):
-            self.log(
-                f"Standby backstop: power 0W for {zero_min:.1f}min - machine is off",
-                level="INFO",
-            )
-            if self._is_valid_completed_cycle():
-                self._transition_to_unemptied()
-                # The transition can still be refused (e.g. cooling period) - only report
-                # success (and let the caller stop its tick) when it actually landed, so a
-                # refusal falls through to the tick's normal reschedule instead of the caller
-                # wrongly believing the cycle finished and skipping its own re-arm.
-                return self.state == "Unemptied"
-        else:
-            self.log(
-                f"Standby backstop: 0W for {zero_min:.1f}min but finish time guards not met (run {run_min:.0f}min) - skipping",
-                level="DEBUG",
-            )
-        # Invalid cycle (e.g. false-start or ghost Running state) with sustained
-        # zero power - machine is clearly off, go directly to Off.
-        if zero_min >= 5.0:
-            energy_used = self._get_energy_used()
-            if (
-                self.observed_heating
-                and energy_used >= self.min_energy_kwh
-                and run_min >= self.finish_min_run_minutes_warm
-            ):
-                self.log(
-                    f"Standby backstop net: 0W for {zero_min:.1f}min on a heated cycle "
-                    f"(run {run_min:.0f}min, energy {energy_used:.2f}kWh) with finish guards "
-                    f"never met (guard {guard_dur or 0:.0f}min) - publishing Unemptied instead "
-                    f"of silently forcing Off",
-                    level="WARNING",
-                )
-                self._pending_end_reason = "standby_backstop"
-                self._transition_to_unemptied()
-                # See the normal-finish branch above: report success only when the transition
-                # actually landed.
-                return self.state == "Unemptied"
-            self.log(
-                f"Standby backstop: cycle invalid + 0W for {zero_min:.1f}min - forcing Off",
-                level="WARNING",
-            )
-            self._transition_to_off("Standby backstop: invalid cycle with sustained zero power")
-            # Same rationale as the Unemptied branches above: only report success when the
-            # transition actually landed (force=False here, so cooling period can refuse it).
-            return self.state == "Off"
-        self.log("Standby backstop but cycle validation failed - keep checking", level="WARNING")
-        return False
-
     def _check_energy_finish(self, kwargs):
-        """Check if energy consumption has stopped (cycle finished)."""
-        current_state = self.get_state(self.state_entity)
-
-        if current_state != "Running":
-            self.energy_check_timer = None
+        """The finish tick. Runs every energy_check_interval_s while Running and re-arms in finally, so nothing a
+        tick raises (a failed publish included) can end finish detection for the cycle."""
+        self.energy_check_timer = None
+        if self.state != "Running":
             return
+        try:
+            self._finish_tick_body("Running")
+        finally:
+            if self.state == "Running":
+                self._arm_finish_tick()
 
+    def _finish_tick_body(self, current_state):
+        self._wash_activity()
         self._maybe_handle_delayed_start()
 
         # Compute programme classification once per tick to avoid redundant get_state calls.
@@ -6555,40 +5751,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self._note_live_classification(_tick_prog, _tick_temp)
         self._update_guard_bar(_tick_prog, _tick_temp)
 
-        run_min = (self._now_utc() - self.start_time).total_seconds() / 60 if self.start_time else 0
-        guard_dur = self._get_guard_duration(_tick_prog, _tick_temp, _tick_class)
-        self._refresh_tail_pulse_tracking()
-        self._update_tail_pattern_lock()
-        # If in FinishingTail, only finish via tail-pulse timeout (same as anti-crease / energy paths).
-        if self.in_finishing_tail and self._try_finish_via_standby(run_min, guard_dur, _tick_prog, _tick_temp, _tick_class):
-            return
-
-        # --- Duration tripwire ---
-        # Past max duration + low power: enter FinishingTail only - do not bypass tail-pulse timeout.
-        if self.start_time:
-            run_min = (self._now_utc() - self.start_time).total_seconds() / 60
-            max_dur = self._programme_max_duration_minutes(classification=_tick_class)
-            past_max = run_min >= max_dur
-            meets_guards = self._meets_finish_time_guards(run_min, guard_dur or 0)
-            if past_max and meets_guards:
-                current_power = self._get_current_power()
-                if current_power < self.significant_w:
-                    self.log(
-                        f"Duration tripwire: {run_min:.0f}min >= {max_dur}min max for '{_tick_prog}' "
-                        f"(finish guards met), power {current_power:.1f}W - entering FinishingTail (tail-pulse timeout required)",
-                        level="INFO",
-                    )
-                    if not self.in_finishing_tail:
-                        self.in_finishing_tail = True
-                        self.in_finishing_tail_entered_at = self._now_utc()
-                        self.last_tail_pulse_at = self._get_last_tail_pulse_time() or self._now_utc()
-                    if current_power > self._tail_pulse_reset_threshold_watts():
-                        self.last_tail_pulse_at = self._now_utc()
-                    self._refresh_tail_pulse_tracking()
-                    self._update_tail_pattern_lock()
-                    if self._try_finish_via_standby(run_min, guard_dur, _tick_prog, _tick_temp, _tick_class):
-                        return
-                    self.log("Duration tripwire: waiting for tail-pulse timeout before Unemptied", level="DEBUG")
         # Start time cannot be before the last door close (except AddLoad first 10 min).
         # Enforces: UI must not show a start time from before the user last closed the door.
         # Only clamp when the gap is >= pause_window (10 min), so AddLoad door close doesn't change start_time.
@@ -6754,17 +5916,10 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             and self.confirm_entity
             and (self.get_state(self.confirm_entity) or "").strip() not in ("", "Auto (unconfirmed)", "unknown", "unavailable")
         )
-        # soak_prog tracks whichever programme effective_dur actually came from (not always
-        # eta_prog): the expected_dur_at_start branch below uses the frozen guard-bar programme,
-        # which can differ from this tick's own live classification (e.g. soak's near-zero power
-        # at the start of a cycle can read as a cooler programme before real heating begins).
-        soak_prog = eta_prog
         if user_has_selected:
             effective_dur = self._get_programme_duration(eta_prog, eta_temp, use_learned=False)
         elif self.expected_dur_at_start is not None:
             effective_dur = self.expected_dur_at_start
-            if self._guard_bar_class:
-                soak_prog = self._guard_bar_class[0]
         else:
             effective_dur = self._get_programme_duration(eta_prog, eta_temp, use_learned=False)
         # Eco/strygelet ambiguity blend when < 130 min (only when on Auto - if user selected ECO, use ECO duration)
@@ -6779,7 +5934,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 else:
                     blend = min(1.0, run_min / 130.0)
                     effective_dur = round(strygelet_dur + blend * (eco_dur - strygelet_dur))
-        effective_dur += self._soak_bonus_minutes(soak_prog)
+        effective_dur += self._soak_offset_minutes()
         # Merge new attrs into existing HA state so persisted fields
         # (programme_confirmed_by_user, programme_confirmed_by, last_off_at, etc.)
         # survive the periodic update instead of being silently wiped every tick.
@@ -6816,7 +5971,8 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             "max_power_w": round(self.max_power_seen, 0),
             "delayed_start_trimmed": bool(self._delayed_start_trimmed),
             "delayed_start_waiting": bool(self._delay_waiting),
-            "supports_soak": self._programme_supports_soak(soak_prog),
+            "supports_soak": bool(self.option_soak_entity),
+            "activity_seen": True if self._activity_seen else "",
             **pred_attrs,
         })
         if self.start_time:
@@ -6859,95 +6015,6 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish() for details.
         self._set_state_entity( state="Running", attributes=attrs)
 
-        # --- Finish precedence: (1) user_cycle_end, (2) anti_crease_pattern, (3) low_power_detected ---
-        # Anti-crease: use raw power history as primary signal (independent from energy bookkeeping).
-        now = self._now_utc()
-        self._in_finish_debug_window = False
-        if self.start_time:
-            run_min = (now - self.start_time).total_seconds() / 60
-            guard_dur = self._get_guard_duration(_tick_prog, _tick_temp, _tick_class)
-            # Debug logging when in final window (finish_debug_window_minutes before expected end or past)
-            in_finish_debug_window = guard_dur and (
-                run_min >= guard_dur - self.finish_debug_window_minutes or run_min >= guard_dur
-            )
-            if in_finish_debug_window:
-                tail_ok, tail_mean, tail_std, tail_peak = self._detect_anti_crease_pattern()
-                recent_activity = self._recent_true_activity_block()
-                idle_min = (now - self.last_high_energy_at).total_seconds() / 60 if self.last_high_energy_at else None
-                self.log(
-                    f"Finish debug: run_min={run_min:.1f} expected_dur={guard_dur:.0f} "
-                    f"anti_crease_candidate={tail_ok} tail_mean={tail_mean} tail_std={tail_std} tail_peak={tail_peak} "
-                    f"recent_true_activity_block={recent_activity} idle_min={idle_min} "
-                    f"last_high_energy_at={self._strftime_local(self.last_high_energy_at) if self.last_high_energy_at else None}",
-                    level="DEBUG",
-                )
-            self._in_finish_debug_window = in_finish_debug_window  # For energy-block debug log
-            # (1) user_cycle_end is handled via cycle_ended_at_entity in _correct_duration when we transition.
-            # (2) anti_crease_pattern: disable when programme known and supports_anti_crease is False (e.g. Uld per manual).
-            profile_tick = self._get_profile(_tick_prog, _tick_temp)
-            supports_anti_crease = profile_tick.get("supports_anti_crease", True) if profile_tick else True
-            if _tick_prog == "uld":
-                supports_anti_crease = False  # Manual: Uld is the exception
-            if supports_anti_crease:
-                # Stricter finish-time guard: fraction of expected + min runtime (stops false announce when guard_dur is wrong).
-                if not self._meets_finish_time_guards(run_min, guard_dur or 0):
-                    if in_finish_debug_window:
-                        min_run = self._get_finish_min_run_minutes()
-                        pct = (run_min / guard_dur) * 100 if guard_dur else 0
-                        self.log(
-                            f"Anti-crease candidate but finish guards not met: run {run_min:.0f}min "
-                            f"(need {self.finish_guard_fraction*100:.0f}% of {guard_dur:.0f}min and >= {min_run:.0f}min) - blocking",
-                            level="DEBUG",
-                        )
-                elif self._meets_finish_time_guards(run_min, guard_dur or 0) and self._is_post_end_tail_window(run_min, guard_dur, _tick_prog) and not self._recent_true_activity_block():
-                    tail_ok, tail_mean, tail_std, tail_peak = self._detect_anti_crease_pattern()
-                    if tail_ok:
-                        if self._anti_crease_tail_since is None:
-                            self._anti_crease_tail_since = now
-                        if (
-                            self.anti_crease_announce_past_expected
-                            and guard_dur
-                            and run_min >= guard_dur  # STRICTLY past expected end, not merely near it
-                            and self._is_valid_completed_cycle()
-                        ):
-                            # Past expected end with a confirmed anti-crease pattern: the pattern IS
-                            # the end signal here (mirrors the dryer's keep-fresh transition, ~4 min
-                            # detections) - skip FinishingTail's slower tail-pulse-timeout wait and
-                            # announce now. _transition_to_unemptied() still runs
-                            # _power_looks_like_cycle_end() for this end_reason (that gate is only
-                            # skipped for tail_to_standby/tail_pattern_break) so the mid-cycle-rinse
-                            # sanity check is not bypassed - just not duplicated here.
-                            self._pending_end_reason = "anti_crease_pattern"
-                            self.log(
-                                f"Anti-crease pattern past expected end (run={run_min:.0f}min >= expected={guard_dur:.0f}min, "
-                                f"tail mean={tail_mean:.1f}W std={tail_std:.1f}W peak={tail_peak:.1f}W) - announcing immediately",
-                                level="INFO",
-                            )
-                            self._transition_to_unemptied()
-                            if self.state == "Running":
-                                # Transition was refused (e.g. cooling period) - this is a
-                                # mid-function return, not the bottom-of-tick reschedule, so the
-                                # tick must re-arm itself here or the loop dies while still Running.
-                                self.energy_check_timer = self.run_in(self._check_energy_finish, self.energy_check_interval)
-                            return
-                        if not self.in_finishing_tail:
-                            self.in_finishing_tail = True
-                            self.in_finishing_tail_entered_at = now
-                            self.last_tail_pulse_at = self._get_last_tail_pulse_time() or now
-                            self.log(
-                                f"FinishingTail entered (anti-crease pattern, tail mean={tail_mean:.1f}W std={tail_std:.1f}W peak={tail_peak:.1f}W) - will announce when no pulse >{self.finishing_tail_pulse_reset_watts:.0f}W for {self.tail_pulse_timeout_seconds:.0f}s",
-                                level="INFO",
-                            )
-                        if self._try_finish_via_standby(run_min, guard_dur, _tick_prog, _tick_temp, _tick_class):
-                            return
-                        # Stay in Running until standby detected - re-arm here since this is a
-                        # mid-function return, not the bottom-of-tick reschedule.
-                        self.energy_check_timer = self.run_in(self._check_energy_finish, self.energy_check_interval)
-                        return
-                # If already in FinishingTail (e.g. from energy path), try standby transition
-                if self.in_finishing_tail and self._try_finish_via_standby(run_min, guard_dur, _tick_prog, _tick_temp, _tick_class):
-                    return
-
         # Do not write classified programme into input_select.washer_confirmed_programme.
         # That dropdown is only for *user* intent; ETA / guards use detected_programme + expected_dur_at_start
         # on the state entity when the user leaves "Auto (unconfirmed)". Mirroring prediction into the selector
@@ -6955,19 +6022,15 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
 
         try:
             current_energy = self.get_state(self.energy_sensor)
-            if current_energy is None or current_energy in ["unknown", "unavailable"]:
-                # Energy unavailable - reschedule check
-                self.energy_check_timer = self.run_in(self._check_energy_finish, self.energy_check_interval)
-                return
-            
-            current_energy_value = float(current_energy)
+            energy_readable = current_energy is not None and current_energy not in ["unknown", "unavailable"]
+            current_energy_value = float(current_energy) if energy_readable else None
             now = self._now_utc()
 
             # Settled per-cycle cost: meter the spot price against this tick's energy delta
             # (mirrors SmartCooling._track_session_cost). Reuses current_energy_value already
             # read above - no extra get_state for energy. Tracked in dedicated vars (see
             # initialize()) so unrelated energy-buffer resets elsewhere never corrupt it.
-            if self.track_cycle_cost:
+            if self.track_cycle_cost and energy_readable:
                 if self._cost_prev_energy_kwh is None:
                     # First reading since cycle start (or after a restart) - establish the
                     # baseline only; nothing to charge for yet.
@@ -6990,218 +6053,11 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                     self._session_cost_kr += cost_delta_kwh * price_now
                     self._cost_prev_energy_kwh = current_energy_value
 
-            # Standby backstop: if instantaneous power is 0W for 3+ minutes,
-            # the machine is completely off - force finish regardless of the
-            # rolling energy window (which lags due to REF_WINDOW_S).
-            current_power = self._get_current_power()
-            if current_power <= 0.0:
-                if self._standby_backstop_tick(now, _tick_prog, _tick_temp, _tick_class):
-                    return
-            else:
-                # Anti-crease tumbles are post-end activity, not cycle activity: once past
-                # expected end with the pattern currently confirmed, a brief tumble (< 120W)
-                # must not reset the zero-power clock, or every tumble would keep pushing the
-                # 3/5-minute thresholds back out - the exact lag the rest of this fix removes.
-                tumble_tolerated = False
-                if self.anti_crease_announce_past_expected and current_power < 120.0 and self.start_time:
-                    tumble_run_min = (now - self.start_time).total_seconds() / 60
-                    tumble_guard_dur = self._get_guard_duration(_tick_prog, _tick_temp, _tick_class)
-                    if tumble_guard_dur and tumble_run_min >= tumble_guard_dur:
-                        tail_ok, tail_mean, tail_std, tail_peak = self._detect_anti_crease_pattern()
-                        tumble_tolerated = tail_ok
-                if not tumble_tolerated:
-                    self._zero_power_since = None
-
-            # Rolling-buffer implied-watts calculation.
-            #
-            # Problem with comparing consecutive 30s readings: the Zigbee energy sensor
-            # updates only every ~60s. When we check at 30s intervals, every other check
-            # sees zero delta (sensor hasn't reported yet) -> spurious 0W -> false "stable"
-            # starts during active washing -> counter resets constantly -> 15+ min to confirm.
-            #
-            # Fix: always compare to the most-recent buffer entry that is ≥ REF_WINDOW_S old.
-            # This guarantees the delta spans at least one full sensor update cycle, so we
-            # never see the 0W aliasing artifact.
-            REF_WINDOW_S = 90  # Must exceed the sensor's ~60s update interval
-
-            self.energy_buffer.append((now, current_energy_value))
-            cutoff = now - timedelta(minutes=20)
-            self.energy_buffer = [(t, e) for t, e in self.energy_buffer if t >= cutoff]
-
-            # Walk the (chronological) buffer to find the most-recent entry ≥ REF_WINDOW_S old
-            ref_time, ref_energy = None, None
-            for t, e in self.energy_buffer:
-                if (now - t).total_seconds() >= REF_WINDOW_S:
-                    ref_time, ref_energy = t, e  # keep updating -> most-recent qualifying point
-
-            if ref_time is None:
-                # Buffer still warming up (< REF_WINDOW_S since cycle start) - reschedule
-                self.energy_check_timer = self.run_in(self._check_energy_finish, self.energy_check_interval)
+            now = self._now_utc()
+            if self._finish_decision_tick(now):
                 return
-
-            delta_s = (now - ref_time).total_seconds()
-            delta_kwh = current_energy_value - ref_energy
-            if delta_kwh < -0.001:
-                # Energy meter reset or sensor glitch - negative delta looks "super idle"
-                # and would immediately trigger a false finish. Reset the buffer and restart.
-                self.log(
-                    f"Energy delta negative ({delta_kwh:.4f} kWh) - sensor reset detected, "
-                    f"resetting energy buffer",
-                    level="WARNING",
-                )
-                self.energy_buffer = [(now, current_energy_value)]
-                self.last_high_energy_at = now
-                self.energy_stable_start_time = None
-                self.energy_check_timer = self.run_in(self._check_energy_finish, self.energy_check_interval)
-                return
-            delta_kwh = max(0.0, delta_kwh)
-            avg_watts = (delta_kwh * 1000) / (delta_s / 3600)
-
-            if getattr(self, "_in_finish_debug_window", False):
-                idle_min_debug = (now - self.last_high_energy_at).total_seconds() / 60 if self.last_high_energy_at else None
-                valid = self._is_valid_completed_cycle()
-                self.log(
-                    f"Finish debug (energy): avg_watts={avg_watts:.1f} current_power={current_power:.1f} "
-                    f"idle_minutes={idle_min_debug} valid_for_finish={valid}",
-                    level="DEBUG",
-                )
-
-            if avg_watts > self.energy_active_watts:
-                # Main cycle activity (heating/spin) - record the last time we saw it.
-                if (self.last_high_energy_at is None or
-                        (now - self.last_high_energy_at).total_seconds() > 60):
-                    self.log(f"Energy active ({avg_watts:.2f}W) - cycle still running", level="DEBUG")
-                self.last_high_energy_at = now
-                self.energy_stable_start_time = None
-                self.finish_confirmed = False
-            elif avg_watts <= self.post_cycle_idle_watts:
-                # Idle or post-cycle slow spin (motor at 30-80W) - count toward finish.
-                if self.last_high_energy_at is not None:
-                    idle_minutes = (now - self.last_high_energy_at).total_seconds() / 60
-                    if self.energy_stable_start_time is None:
-                        self.energy_stable_start_time = now
-                        self.log(
-                            f"Energy stable ({avg_watts:.2f}W avg over {delta_s:.0f}s window, "
-                            f"last active {idle_minutes:.1f}min ago)",
-                            level="DEBUG",
-                        )
-
-                    effective_minutes = self._effective_stable_minutes(classification=_tick_class)
-                    use_pattern = self._detect_post_cycle_slow_spin_pattern()
-                    required_minutes = self.post_cycle_pattern_minutes if use_pattern else effective_minutes
-                    # When run is near or past expected duration, use shorter window so we declare finish before door opens (~10:52 not 11:05).
-                    # Prefer user-confirmed programme for expected_dur - avoids wrong "near end" from misclassification.
-                    if self.start_time:
-                        run_min = (now - self.start_time).total_seconds() / 60
-                        expected_dur = None
-                        guard_prog, guard_temp = _tick_prog, _tick_temp
-                        if self.confirm_entity and self.programme_confirmed_by_user:
-                            try:
-                                label = self.get_state(self.confirm_entity)
-                                if label and label not in ("Auto (unconfirmed)", "unknown", "unavailable"):
-                                    p = self._LABEL_TO_KEY.get(label, "unknown")
-                                    if p and p != "unknown":
-                                        guard_prog, guard_temp = p, self._read_temperature_selector() if self._programme_has_temperature(p) else None
-                            except Exception:
-                                pass
-                        if guard_prog and guard_prog != "unknown":
-                            expected_dur = self._get_programme_duration(guard_prog, guard_temp, use_learned=False)
-                            if expected_dur:
-                                # In the last hour of expected run, or past 90%: 5 min stable is enough.
-                                # Use 90% (not 80%) to avoid false finish from mid-cycle soak (e.g. Bomuld 30°C at 82%).
-                                if run_min >= expected_dur - 60 or run_min >= 0.90 * expected_dur:
-                                    required_minutes = min(required_minutes, self.finish_stable_minutes_near_end)
-                                    if required_minutes < effective_minutes:
-                                        self.log(
-                                            f"Near end: run {run_min:.0f}min (expected ~{expected_dur}min) -> require only {required_minutes}min stable (finish before door opens)",
-                                            level="DEBUG",
-                                        )
-                                # In the last 30 min of expected run: only 3 min idle (cycle often ends a bit early, e.g. partial load).
-                                if run_min >= expected_dur - 30:
-                                    required_minutes = min(required_minutes, 3)
-                                # Past expected end: cycle may have finished early (e.g. partial load). Require only 2 min idle so we don't stay "Running" long after machine stops (user: cycle ended 13:33, UI still Running).
-                                if run_min >= expected_dur:
-                                    required_minutes = min(required_minutes, 2)
-                                    if required_minutes == 2:
-                                        self.log(
-                                            f"Past expected end: run {run_min:.0f}min >= {expected_dur}min -> require only 2min idle to finish",
-                                            level="DEBUG",
-                                        )
-                    if idle_minutes >= required_minutes:
-                        guard_dur = self._get_guard_duration(_tick_prog, _tick_temp, _tick_class)
-                        if not self._meets_finish_time_guards(run_min, guard_dur or 0):
-                            min_run = self._get_finish_min_run_minutes()
-                            # idle_minutes = time since last high *energy* (main wash activity), not "stable cycle" length
-                            msg = (
-                                f"Energy idle {idle_minutes:.0f}min (since last main activity) but finish time guards "
-                                f"not met: total run {run_min:.0f}min "
-                                f"(need >= {min_run:.0f}min and {self.finish_guard_fraction*100:.0f}% of {guard_dur:.0f}min) "
-                                f"- blocking false finish"
-                            )
-                            now = self._now_utc()
-                            throttle_s = int(self.args.get("finish_guard_log_interval_s", 600))
-                            if (
-                                self._last_finish_guard_info_log_at is None
-                                or (now - self._last_finish_guard_info_log_at).total_seconds() >= throttle_s
-                            ):
-                                self._last_finish_guard_info_log_at = now
-                                self.log(msg, level="INFO")
-                            else:
-                                self.log(msg, level="DEBUG")
-                        else:
-                            current_power = self._get_current_power()
-                            if current_power < self.post_cycle_idle_watts:
-                                self.finish_confirmed = True
-                                if not self.in_finishing_tail:
-                                    self.in_finishing_tail = True
-                                    self.in_finishing_tail_entered_at = now
-                                    self.last_tail_pulse_at = self._get_last_tail_pulse_time() or now
-                                    programme_type = "warm" if self.observed_heating else "cold/wool"
-                                    self.log(
-                                        f"FinishingTail entered (energy stable {idle_minutes:.1f}min, {programme_type}, "
-                                        f"power {current_power:.1f}W) - will announce when no pulse >{self.finishing_tail_pulse_reset_watts:.0f}W for {self.tail_pulse_timeout_seconds:.0f}s",
-                                        level="INFO",
-                                    )
-                                if current_power > self._tail_pulse_reset_threshold_watts():
-                                    self.last_tail_pulse_at = now
-                                if self.get_state(self.state_entity) == "Running":
-                                    if self._try_finish_via_standby(run_min, guard_dur, _tick_prog, _tick_temp, _tick_class):
-                                        return
-                                    self.log("Finish confirmed but tail pulse timeout not yet met - keep checking", level="DEBUG")
-                            else:
-                                self.log(
-                                    f"Energy quiet {idle_minutes:.1f}min but power still high "
-                                    f"({current_power:.1f}W >= {self.post_cycle_idle_watts:.0f}W), waiting...",
-                                    level="DEBUG",
-                                )
-                    else:
-                        programme_type = "warm" if self.observed_heating else (
-                            "cold/wool" if self.start_time and
-                            (self._now_utc() - self.start_time).total_seconds() > 600
-                            else "unclassified"
-                        )
-                        self.log(
-                            f"Energy stable {idle_minutes:.1f}/{required_minutes}min "
-                            f"({programme_type}, avg {avg_watts:.1f}W)",
-                            level="DEBUG",
-                        )
-            else:
-                # Between post_cycle_idle_watts and energy_active_watts (e.g. 80-100W).
-                # Don't reset last_high_energy_at - the Miele's post-cycle pump spikes
-                # (30-40W averaged over 90s) would perpetually delay finish detection.
-                # Only reset the stable-start counter so we require a fresh idle period.
-                if (self.last_high_energy_at is None or
-                        (now - self.last_high_energy_at).total_seconds() > 60):
-                    self.log(f"Energy medium ({avg_watts:.2f}W) - resetting stable counter but not idle timer", level="DEBUG")
-                self.energy_stable_start_time = None
-                self.finish_confirmed = False
-
-            # Schedule next check
-            self.energy_check_timer = self.run_in(self._check_energy_finish, self.energy_check_interval)
-            
         except (ValueError, TypeError) as e:
             self.log(f"Error checking energy: {e}", level="WARNING")
-            self.energy_check_timer = self.run_in(self._check_energy_finish, self.energy_check_interval)
 
     def _auto_analyze_after_cycle(self, kwargs):
         """Automatically analyze recent cycles after a cycle completes."""

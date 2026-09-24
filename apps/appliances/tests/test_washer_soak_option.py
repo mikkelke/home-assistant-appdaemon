@@ -1,6 +1,6 @@
 # tests/test_washer_soak_option.py - the Iblødsætning (soak) option: HA helper wiring,
-# supports_soak/ETA bonus, the toggle listener, the Off-transition reset, and the
-# duration-learning exclusion (a soak cycle must not pollute the learned average).
+# supports_soak/ETA offset, the toggle listener, the Off-transition reset, and the learning
+# exclusion (a soak record is never learnable, decided by classification).
 # Run from repo root: python3 -m unittest discover -s apps/appliances/tests -q
 
 import json
@@ -37,86 +37,70 @@ NOW = datetime(2026, 9, 23, 14, 41, 0, tzinfo=timezone.utc)
 # Pure functions (washer_feedback.py) - no AppDaemon/WasherMonitor involved.
 # =============================================================================
 
-class AggregateCyclesExcludesSoakDuration(unittest.TestCase):
+class SoakRecordsAreNeverLearnable(unittest.TestCase):
+    """Soak stretches a wash by an amount the machine never reports, so a soak record is never a
+    duration sample. Eligibility is decided once, by classification (options included), and
+    aggregation only ever counts eligible records."""
     _PROFILES = {"bomuld": {"label": "Bomuld", "duration_min": 159, "heats": True}}
 
-    def test_soak_cycle_excluded_from_durations_but_still_counted_for_accuracy(self):
-        cycles = [
-            {
-                "confirmed": "bomuld", "confirmed_temperature": None,
-                "predicted": "bomuld", "predicted_temperature": None,
-                "duration_min": 159.0, "programme_user_confirmed": True, "valid_for_learning": True,
-            },
-            {
-                "confirmed": "bomuld", "confirmed_temperature": None,
-                "predicted": "bomuld", "predicted_temperature": None,
-                "duration_min": 189.0, "programme_user_confirmed": True, "valid_for_learning": True,
-                "selected_options": {"soak": "on"},
-            },
-        ]
-        buckets, _centroids, skipped = wfb.aggregate_cycles(cycles, self._PROFILES)
-        bucket = buckets["bomuld"]
-        self.assertEqual(bucket["durations"], [159.0])
-        self.assertEqual(bucket["total"], 2)
-        self.assertEqual(bucket["correct"], 2)
-        self.assertEqual(skipped, 0)
+    def setUp(self):
+        self.app = wm.WasherMonitor.__new__(wm.WasherMonitor)
+        self.app.args = {}
+        self.app.log = lambda *a, **kw: None
+        self.app._load_programme_profiles()
+        self.app.programme_confirmed_by_user = True
+        self.app.completion_guard_fraction = 0.65
+        self.app.completion_guard_fraction_user_confirmed = 0.60
+        self.app.min_cycle_minutes = 25
+        self.app.min_energy_kwh = 0.1
 
-    def test_all_soak_leaves_an_empty_but_present_bucket(self):
-        cycles = [
-            {
-                "confirmed": "bomuld", "confirmed_temperature": None,
-                "predicted": "bomuld", "predicted_temperature": None,
-                "duration_min": 189.0, "programme_user_confirmed": True, "valid_for_learning": True,
-                "selected_options": {"soak": "on"},
-            },
-        ]
-        buckets, _centroids, _skipped = wfb.aggregate_cycles(cycles, self._PROFILES)
-        self.assertEqual(buckets["bomuld"]["durations"], [])
-        self.assertEqual(buckets["bomuld"]["total"], 1)
-
-
-class ApplyAndRemoveLearnedSampleSkipDuration(unittest.TestCase):
-    def test_apply_skip_duration_leaves_learned_untouched_but_updates_centroid(self):
-        learned: dict = {}
-        centroids: dict = {}
-        avg = wfb.apply_learned_sample(
-            learned, centroids, "bomuld", 189.0, 0.9, 2, heats=True, skip_duration=True,
+    def _classify(self, soak):
+        return self.app._classify_cycle_completion(
+            run_minutes=159.0, energy_kwh=0.75, heating_bursts=2, max_power_w=2000.0,
+            predicted="bomuld", predicted_temperature="30°C", confirmed="bomuld", confirmed_temperature="30°C",
+            transition_path="spin_end", selected_options={"soak": "on"} if soak else None,
         )
-        self.assertIsNone(avg)
-        self.assertNotIn("bomuld", learned)
-        self.assertIn("bomuld", centroids)
-        self.assertAlmostEqual(centroids["bomuld"]["rate"], 0.9 / 189.0)
 
-    def test_apply_without_skip_updates_both(self):
-        learned = {"bomuld": {"n": 1, "avg": 159.0}}
-        centroids: dict = {}
-        avg = wfb.apply_learned_sample(learned, centroids, "bomuld", 165.0, 0.8, 2, heats=True)
-        self.assertAlmostEqual(avg, (159.0 + 165.0) / 2)
-        self.assertEqual(learned["bomuld"]["n"], 2)
+    def test_classification_marks_soak_ineligible(self):
+        c = self._classify(soak=True)
+        self.assertFalse(c["valid_for_learning"])
+        self.assertIn("soak_selected", c["validation_flags"])
+        self.assertTrue(self._classify(soak=False)["valid_for_learning"])
 
-    def test_remove_skip_duration_leaves_learned_untouched(self):
-        learned = {"bomuld": {"n": 1, "avg": 159.0}}
-        centroids = {"bomuld": {"rate": 0.9 / 189.0, "heating_bursts": 2.0, "n": 1}}
-        wfb.remove_learned_sample(learned, centroids, "bomuld", 189.0, 0.9, 2, skip_duration=True)
-        self.assertEqual(learned["bomuld"], {"n": 1, "avg": 159.0})
-        self.assertNotIn("bomuld", centroids)  # centroid still backed out -> n dropped to 0
+    def test_migration_quarantines_an_older_soak_record_marked_eligible(self):
+        cycles = [{
+            "confirmed": "bomuld", "confirmed_temperature": "30", "predicted": "bomuld", "predicted_temperature": "30",
+            "duration_min": 189.0, "energy_kwh": 0.75, "heating_bursts": 2, "max_power_w": 2000,
+            "programme_user_confirmed": True, "valid_for_learning": True, "completion_class": "completed",
+            "profile_version": "1", "validation_version": "2", "selected_options": {"soak": "on"},
+        }]
+        wfb.migrate_records(cycles, self.app._classify_cycle_completion)
+        self.assertFalse(cycles[0]["valid_for_learning"])
+        buckets, _centroids, _skipped = wfb.aggregate_cycles(cycles, self.app.PROGRAMME_PROFILES)
+        self.assertFalse(any(b["durations"] for b in buckets.values()))
 
-    def test_remove_without_skip_backs_out_the_sample(self):
-        learned = {"bomuld": {"n": 2, "avg": (159.0 + 165.0) / 2}}
-        centroids: dict = {}
-        wfb.remove_learned_sample(learned, centroids, "bomuld", 165.0, 0.8, 2)
-        self.assertEqual(learned["bomuld"]["n"], 1)
-        self.assertAlmostEqual(learned["bomuld"]["avg"], 159.0)
+    def test_learning_is_rederived_from_the_eligible_records(self):
+        """Review round 1 #12: backing a sample out incrementally could subtract one that was
+        never added (n=2 avg 100 -> n=1 avg 20). Learning is now always a fold over the records."""
+        rec = lambda dur, valid: {
+            "confirmed": "bomuld", "predicted": "bomuld", "duration_min": dur, "energy_kwh": 0.7,
+            "heating_bursts": 2, "programme_user_confirmed": True, "valid_for_learning": valid,
+        }
+        cycles = [rec(80.0, True), rec(120.0, True), rec(180.0, False)]
+        self.app._reload_learning(cycles)
+        self.assertEqual(self.app._learned_durations["bomuld"], {"n": 2, "avg": 100.0})
+        cycles.pop()  # withdraw the ineligible record
+        self.app._reload_learning(cycles)
+        self.assertEqual(self.app._learned_durations["bomuld"], {"n": 2, "avg": 100.0})
 
 
 # =============================================================================
 # WasherMonitor helpers - real washer_programmes.yaml via _load_programme_profiles.
 # =============================================================================
 
-class ProgrammeSupportsSoakAndBonusMinutes(unittest.TestCase):
-    """Exercises the REAL WasherMonitor._programme_supports_soak/_soak_bonus_minutes against
-    the real washer_programmes.yaml, not a mirror - same pattern as
-    TestEcoPerTemperatureLearning in test_washer_completion.py."""
+class SoakOffsetMinutes(unittest.TestCase):
+    """The soak option adds the configured soak time to the ETA whenever the helper is on; the
+    machine never reports the real soak length."""
 
     def setUp(self):
         self.app = wm.WasherMonitor.__new__(wm.WasherMonitor)
@@ -127,38 +111,19 @@ class ProgrammeSupportsSoakAndBonusMinutes(unittest.TestCase):
     def test_soak_duration_min_loaded_from_yaml(self):
         self.assertEqual(self.app._soak_duration_min, 30)
 
-    def test_supports_soak_true_for_programmes_listing_it(self):
-        # Regression guard: bomuld/eco/strygelet/finvask all have by_temperature, and
-        # _get_profile would strip a programme-level supports_soak for those - this must read
-        # the top-level profile directly instead.
-        for prog in ("bomuld", "eco", "strygelet", "finvask"):
-            self.assertTrue(self.app._programme_supports_soak(prog), prog)
-
-    def test_supports_soak_false_for_others(self):
-        for prog in (
-            "uld", "ekspres", "morkt_denim", "outdoor",
-            "impraegnering", "pumpe_centrifugering", "kun_skyl_stivelse", "unknown", None,
-        ):
-            self.assertFalse(self.app._programme_supports_soak(prog), prog)
-
-    def test_bonus_zero_without_entity_configured(self):
+    def test_zero_without_entity_configured(self):
         self.app.option_soak_entity = None
-        self.assertEqual(self.app._soak_bonus_minutes("bomuld"), 0)
+        self.assertEqual(self.app._soak_offset_minutes(), 0)
 
-    def test_bonus_zero_when_helper_off(self):
+    def test_zero_when_helper_off(self):
         self.app.option_soak_entity = "input_boolean.washer_option_soak"
         self.app.get_state = lambda entity: "off"
-        self.assertEqual(self.app._soak_bonus_minutes("bomuld"), 0)
+        self.assertEqual(self.app._soak_offset_minutes(), 0)
 
-    def test_bonus_is_soak_duration_min_when_on_and_supported(self):
+    def test_soak_duration_min_when_on(self):
         self.app.option_soak_entity = "input_boolean.washer_option_soak"
         self.app.get_state = lambda entity: "on"
-        self.assertEqual(self.app._soak_bonus_minutes("bomuld"), 30)
-
-    def test_bonus_zero_when_on_but_programme_unsupported(self):
-        self.app.option_soak_entity = "input_boolean.washer_option_soak"
-        self.app.get_state = lambda entity: "on"
-        self.assertEqual(self.app._soak_bonus_minutes("uld"), 0)
+        self.assertEqual(self.app._soak_offset_minutes(), 30)
 
 
 # =============================================================================
@@ -202,14 +167,15 @@ class SoakEtaEndToEnd(unittest.TestCase):
         self.assertEqual(pub_on["programme_duration_min"] - dur_off, 30)
         self.assertTrue(pub_on["supports_soak"])
 
-    def test_soak_bonus_absent_when_programme_does_not_support_it(self):
+    def test_supports_soak_published_whenever_the_helper_exists(self):
+        """WasherCard.tsx shows the soak chip on supports_soak; it must survive every Running publish."""
         app = _running_bomuld_app()
-        app.states["input_select.washer_confirmed_programme"] = "Uld"
-        app.states["input_select.washer_temperature"] = "30°C"
-        app.states["input_boolean.washer_option_soak"] = "on"
+        app.states["input_boolean.washer_option_soak"] = "off"
         app._push_running_eta_attributes()
-        attrs = trs.last_publish(app)["attributes"]
-        self.assertFalse(attrs["supports_soak"])
+        self.assertTrue(trs.last_publish(app)["attributes"]["supports_soak"])
+        app._check_energy_finish({})
+        running = [c for c in app.set_state_calls if c["state"] == "Running"]
+        self.assertTrue(running[-1]["attributes"]["supports_soak"])
 
 
 class SoakOptionChangeListener(unittest.TestCase):
@@ -284,14 +250,23 @@ class SaveAndRemoveCycleFeedbackSoakGating(unittest.TestCase):
         )
 
     def _save(self, app, duration_min, soak=False):
+        """Save the way the Unemptied/Emptied transitions do: classify first (options included), then
+        store what the classification decided."""
+        options = {"soak": "on"} if soak else None
+        app.programme_confirmed_by_user = True
+        c = app._classify_cycle_completion(
+            run_minutes=duration_min, energy_kwh=0.75, heating_bursts=2, max_power_w=2000.0,
+            predicted="bomuld", predicted_temperature="30°C", confirmed="bomuld", confirmed_temperature="30°C",
+            transition_path="spin_end", selected_options=options,
+        )
         return app._save_cycle_feedback(
             predicted="bomuld", predicted_temperature="30°C",
             confirmed="bomuld", confirmed_temperature="30°C",
             duration_min=duration_min, energy_kwh=0.75,
             heating_bursts=2, max_power_w=2000.0,
             user_confirmed=True,
-            completion_class="completed", valid_for_learning=True, validation_flags=[],
-            selected_options={"soak": "on"} if soak else None,
+            completion_class=c["completion_class"], valid_for_learning=c["valid_for_learning"],
+            validation_flags=c["validation_flags"], selected_options=options,
         )
 
     def test_soak_cycle_does_not_join_the_learned_average(self):

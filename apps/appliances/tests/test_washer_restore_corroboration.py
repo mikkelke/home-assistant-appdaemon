@@ -6,8 +6,8 @@
 # emptied (door open 14:46). The restore had no live-signal check (0W restored as Running), and a
 # backstop then published Unemptied + a full Sonos announcement at 14:55 - 9 min AFTER the user
 # had emptied it. FIX 1 makes a restore from a NON-live source a hypothesis: corroborate against
-# live power / a recent last_high_energy_at, and if uncorroborated suppress announcements and
-# reconcile ~60s later.
+# live power / a recent last_high_energy_at, and if uncorroborated a later finish is pushed to the
+# phone, never announced on Sonos.
 #
 # These run the REAL initialize() end to end (real _restore_running_state, _resolve_store_candidate,
 # the corroboration block, _finalize_restored_cycle_identity), same boundary as
@@ -100,6 +100,7 @@ def make_init_app(*, payload=None, helper_state=None, power_watts=0.0,
         "stop_w": 3.0,
         "feedback_file": "/nonexistent/washer_feedback_test.json",
         "state_file": state_file,
+        "plug_host": "plug.invalid",
     }
     app.args = args
     app.AD = None
@@ -180,10 +181,6 @@ def make_init_app(*, payload=None, helper_state=None, power_watts=0.0,
     return app
 
 
-def scheduled_named(app, name):
-    return [(cb, delay) for cb, delay, _kw in app.scheduled if getattr(cb, "__name__", "") == name]
-
-
 class IncidentReplayConvergesToEmptied(unittest.TestCase):
     def test_corroborated_restore_never_announces_and_routes_to_emptied(self):
         """Test 1: store Running (start 168 min ago), entity gone, mirror stale, 0W, but
@@ -208,8 +205,8 @@ class IncidentReplayConvergesToEmptied(unittest.TestCase):
         self.assertFalse(app.restored_uncorroborated)
         self.assertEqual(app.sonos_calls, [])  # nothing announced during restore
 
-        # The backstop fires: the human already opened the door 3 min ago.
-        app._pending_end_reason = "standby_backstop"
+        # The standby finish fires: the human already opened the door 3 min ago.
+        app._pending_end_reason = "standby"
         app._transition_to_unemptied()
         self.assertEqual(app.state, "Emptied")
         self.assertEqual(app.sonos_calls, [])   # never announced Unemptied
@@ -219,9 +216,8 @@ class IncidentReplayConvergesToEmptied(unittest.TestCase):
 class UncorroboratedRestoreThenPowerResumes(unittest.TestCase):
     def test_flag_set_at_boot_then_cleared_by_live_power(self):
         """Test 2: store Running restored at 0W with a stale last_high (100 min ago) - no live
-        signal, so uncorroborated: a reconcile is scheduled and nothing is announced. A fresh
-        sample >= start_w then clears the flag and cancels the reconcile; a subsequent real
-        finish is allowed to announce."""
+        signal, so uncorroborated and nothing is announced. A fresh sample >= start_w then clears
+        the flag; a subsequent real finish is allowed to announce on Sonos."""
         app = make_init_app(
             payload=store_payload(
                 state="Running",
@@ -233,7 +229,6 @@ class UncorroboratedRestoreThenPowerResumes(unittest.TestCase):
         )
         self.assertEqual(app.state, "Running")
         self.assertTrue(app.restored_uncorroborated)
-        self.assertEqual(len(scheduled_named(app, "_restore_reconcile")), 1)
         self.assertEqual(app.sonos_calls, [])
 
         # Live power resumes above start current -> corroborated, flag cleared.
@@ -242,11 +237,33 @@ class UncorroboratedRestoreThenPowerResumes(unittest.TestCase):
 
         # A real finish now announces (flag no longer suppresses).
         app.last_high_energy_at = NOW
-        app._pending_end_reason = "standby_backstop"
+        app._pending_end_reason = "standby"
         app.notification_sent = False
         app._transition_to_unemptied()
         self.assertEqual(app.state, "Unemptied")
         self.assertEqual(app.sonos_calls, ["Washer is ready to be emptied"])
+
+
+class UncorroboratedRestoreFinishIsPushedNotAnnounced(unittest.TestCase):
+    def test_standby_finish_while_uncorroborated_pushes_and_never_uses_sonos(self):
+        """A restore that no live signal ever corroborated keeps its clock (quiet phases are real),
+        but if it finishes the result is a mobile push - never a Sonos blast about a wash that may
+        have ended while the app was down."""
+        app = make_init_app(
+            payload=store_payload(
+                state="Running",
+                start_time=NOW - timedelta(minutes=100),
+                last_high_energy_at=NOW - timedelta(minutes=100),
+            ),
+            helper_state="Off",
+            power_watts=0.0,
+        )
+        self.assertTrue(app.restored_uncorroborated)
+        app._pending_end_reason = "standby"
+        app._transition_to_unemptied()
+        self.assertEqual(app.state, "Unemptied")
+        self.assertEqual(app.sonos_calls, [])
+        self.assertEqual(len(app.mobile_calls), 1)
 
 
 class FingerprintMismatchForcesUncorroborated(unittest.TestCase):
@@ -265,7 +282,6 @@ class FingerprintMismatchForcesUncorroborated(unittest.TestCase):
         )
         self.assertEqual(app.state, "Running")
         self.assertTrue(app.restored_uncorroborated)
-        self.assertEqual(len(scheduled_named(app, "_restore_reconcile")), 1)
         self.assertEqual(app.sonos_calls, [])
 
     def test_matching_fingerprint_with_recent_high_is_corroborated(self):

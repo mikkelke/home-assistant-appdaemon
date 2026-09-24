@@ -30,6 +30,8 @@ KNOWN_TRANSITION_PATHS = (
     "door_opened_first",
     "tail_to_standby",
     "tail_pattern_break",
+    "standby",
+    "spin_end",
     "standby_backstop",  # 5+ min hard 0W on a heated cycle whose finish guards never opened
 )
 
@@ -206,6 +208,7 @@ def classify_cycle_completion(
     min_cycle_minutes: float,
     min_energy_kwh: float,
     validation_key: str,
+    selected_options=None,
 ):
     """Classify a completed cycle for learning quality. Returns completion_class,
     valid_for_learning, validation_flags, end_reason.
@@ -240,6 +243,8 @@ def classify_cycle_completion(
         flags.append("door_opened_first")
     if transition_path == "unknown_programme" or (confirmed in ("unknown", "") or not confirmed):
         flags.append("unknown_programme")
+    if (selected_options or {}).get("soak") == "on":
+        flags.append("soak_selected")  # soak stretches the cycle by an unreported amount: never a duration sample
 
     if "runtime_too_short" in flags and run_minutes < min_cycle_minutes:
         completion_class = "interrupted"
@@ -264,6 +269,7 @@ def classify_cycle_completion(
         and "runtime_too_short" not in flags
         and "energy_too_low" not in flags
         and "unknown_programme" not in flags
+        and "soak_selected" not in flags
     )
     if transition_path == "door_opened_first" and completion_class != "completed":
         valid_for_learning = False

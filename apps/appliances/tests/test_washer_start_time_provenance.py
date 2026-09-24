@@ -48,7 +48,8 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     sys.modules["appdaemon.plugins.hass"] = hassmod
     sys.modules["appdaemon.plugins.hass.hassapi"] = hassapi
 
-import washer_monitor as wm  # noqa: E402
+import washer_monitor as wm
+from washer_plug_fixture import attach_plug  # noqa: E402
 
 # 2026-08-12 incident times (UTC). NOW is pinned well past the 130-minute warm-programme
 # classification gate in _classify_programme (see docstring there) regardless of start_time,
@@ -135,6 +136,10 @@ def make_app(start_time, start_time_source, entity_recreated_at, entity_last_cha
     app._local_tz_obj = timezone.utc
     app.energy_check_interval = 30
     app.energy_check_timer = None
+    app.state = "Running"
+    app.option_soak_entity = None
+    app.track_cycle_cost = False
+    attach_plug(app)
 
     # Stubbed AppDaemon surface
     app.log_calls = []

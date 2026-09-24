@@ -31,7 +31,8 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     sys.modules["appdaemon.plugins.hass"] = hassmod
     sys.modules["appdaemon.plugins.hass.hassapi"] = hassapi
 
-import washer_monitor as wm  # noqa: E402
+import washer_monitor as wm
+from washer_plug_fixture import attach_plug  # noqa: E402
 
 _RESULT_KEYS = {"person", "method", "reason", "people_home", "anchor", "evaluated_at", "version"}
 
@@ -184,8 +185,7 @@ class CycleActorFromStateAttrs(unittest.TestCase):
 def _make_begin_cycle_app(now, last_door_closed_at=None, last_door_closed_trusted=False, last_off_at_str=None):
     """WasherMonitor stubbed just enough to run the real _begin_running_cycle end to end -
     everything it touches besides the attribution anchor (poll timers, energy sensor, HA
-    entity plumbing) is faked out; use_energy_detection=False so _start_energy_detection (a
-    separate concern) is never reached."""
+    entity plumbing) is faked out; the finish tick it arms is only recorded, never run."""
     app = wm.WasherMonitor.__new__(wm.WasherMonitor)
     app._now_utc = lambda: now
     app.state_entity = "sensor.washer_state"
@@ -193,8 +193,9 @@ def _make_begin_cycle_app(now, last_door_closed_at=None, last_door_closed_truste
     app.confirm_entity = None
     app.pause_window_minutes = 3
     app.max_running_hours = 5
-    app.use_energy_detection = False
     app.args = {}
+    app.option_soak_entity = None
+    attach_plug(app)
     app.last_door_closed_trusted = last_door_closed_trusted
     app.last_door_closed_at = last_door_closed_at
     app.energy_start = None  # no numeric energy_sensor reading configured in this fixture
