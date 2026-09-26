@@ -2612,7 +2612,7 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         """Resume Running state after pause. Preserve start_time and confirmed programme; refresh attributes so UI shows correct remaining time."""
         self._safe_cancel_timer(self.pause_finish_timer)
         self.pause_finish_timer = None
-        if self._should_change_state("Running"):
+        if self._should_change_state("Running", force=True):
             self.state = "Running"
             self.door_opened_time = None
             self.pause_from_low_power = False
@@ -2640,6 +2640,12 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             return
         watts = self._get_current_power()
         if watts >= self.start_w:
+            self._transition_to_running_from_pause()
+            return
+        # ECO has long 0 W soak and drying phases mid-programme; below the finish guard a quiet
+        # door-close is a peek, not an end. Hand back to Running so the power path decides.
+        guard_dur = self._get_guard_duration(tick_prog=self._get_programme_for_display())
+        if self._get_run_duration_minutes() < guard_dur:
             self._transition_to_running_from_pause()
             return
         if watts <= self.stop_w and self._is_valid_completed_cycle():

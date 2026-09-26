@@ -353,11 +353,11 @@ class BootSelfHealReclassifiesTheStaleGuardAnchor(unittest.TestCase):
 class PauseExitForceAndSkipAnnounce(unittest.TestCase):
     """Door open at 205 min with low power -> Paused (still short of the 234-min guard). Door
     closes 100s later; the pause-finish check fires 90s after that (stop_for) - only 190s since
-    the pause began, well inside the 300s cooling period. Before the fix this was refused
-    forever (no reconciler retries a refused Paused-exit) and STILL saved a phantom feedback
-    record for a wash that never actually reached Unemptied."""
+    the pause began, well inside the 300s cooling period. Below the guard a quiet ECO is a soak
+    or dry phase, so the check must hand back to Running (not wedge in Paused behind the cooling
+    period, not finish early) and must not save a feedback record."""
 
-    def test_door_close_shortly_after_pause_reaches_unemptied_without_announce_or_duplicate(self):
+    def test_door_peek_below_guard_resumes_running_without_feedback(self):
         orig_profiles = dm.DishwasherMonitor.PROGRAMME_PROFILES
         dm.DishwasherMonitor.PROGRAMME_PROFILES = {
             "eco": {"label": "ECO", "duration_min": 234, "duration_short_min": 74,
@@ -367,6 +367,7 @@ class PauseExitForceAndSkipAnnounce(unittest.TestCase):
             now = datetime(2026, 8, 12, 18, 0, 0, tzinfo=timezone.utc)
             app = make_live_app(now, start_minutes_ago=205, energy_now="1.5", energy_start=1.0)
             app.last_state_change = None
+            start_time = app.start_time
 
             with tempfile.TemporaryDirectory() as tmp:
                 app.feedback_file = os.path.join(tmp, "dishwasher_feedback.json")
@@ -374,7 +375,6 @@ class PauseExitForceAndSkipAnnounce(unittest.TestCase):
                 app.states[app.door_sensor] = "on"
                 app._handle_door_opened(app.states[app.state_entity])
                 self.assertEqual(app.states[app.state_entity], "Paused")
-                self.assertTrue(app.door_opened_during_cycle)
 
                 app.now = app.now + timedelta(seconds=100)
                 app.states[app.door_sensor] = "off"
@@ -386,29 +386,10 @@ class PauseExitForceAndSkipAnnounce(unittest.TestCase):
                 app.now = app.now + timedelta(seconds=90)  # stop_for
                 finish_cbs[0]({})
 
-                self.assertEqual(
-                    app.states[app.state_entity], "Unemptied",
-                    "door-close pause-finish must not be refused forever by the cooling period",
-                )
-                self.assertEqual(
-                    app.sonos_notifier.calls, [],
-                    "the person who just opened the door must not be Sonos-blasted",
-                )
-
-                cycles = None
-                if os.path.exists(app.feedback_file):
-                    with open(app.feedback_file) as f:
-                        cycles = json.load(f)["cycles"]
-                self.assertEqual(len(cycles or []), 1)
-
-                # A later re-open (to actually empty it) must not add a second record.
-                app.states[app.door_sensor] = "on"
-                app._handle_door_opened(app.states[app.state_entity])
-                self.assertEqual(app.states[app.state_entity], "Emptied")
-
-                with open(app.feedback_file) as f:
-                    cycles_after = json.load(f)["cycles"]
-                self.assertEqual(len(cycles_after), 1)
+                self.assertEqual(app.states[app.state_entity], "Running")
+                self.assertEqual(app.start_time, start_time, "resume must keep the original cycle start")
+                self.assertEqual(app.sonos_notifier.calls, [])
+                self.assertFalse(os.path.exists(app.feedback_file))
         finally:
             dm.DishwasherMonitor.PROGRAMME_PROFILES = orig_profiles
 
