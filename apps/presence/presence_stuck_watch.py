@@ -4,14 +4,11 @@ PresenceStuckWatch - pushes the owner when a room's presence sensor looks stuck 
 Notify only - never controls a device. One instance per room (see presence_stuck_watch.yaml,
 flat args); a second room is a second yaml instance of this same module, not a `rooms:` dict.
 
-Two independent rules, evaluated on presence/person state changes and a 60s run_every tick,
-while `presence` currently reads "on":
-  nobody_home: every configured person has read a real non-home state (anything but
-    "home"/None/"unknown"/"unavailable") continuously for >= nobody_home_min minutes. Any
-    person currently unknown/unavailable/None means "no opinion, not confirmed away" - the
-    away-since timestamp resets rather than guessing.
-  no_motion: no transition into small/large motion for >= no_motion_min minutes, falling back
-    to the presence session's own start when no motion has been seen at all this session.
+no_motion rule, evaluated on the presence on-edge and a 60s run_every tick: while
+`presence` reads "on", no transition into small/large motion for >= no_motion_min minutes,
+falling back to the presence session's own start when no motion has been seen at all this
+session.
+
 Exactly one push per stuck episode (presence turning on to it turning off again) via
 MobileNotifier, target="user" - never a repeat nag while the same episode stays stuck.
 
@@ -32,7 +29,6 @@ from datetime import datetime
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
 _MOTION_ACTIVE = ("small", "large")
-_AMBIGUOUS_OR_HOME = (None, "home", "unknown", "unavailable")
 
 
 def _parse_iso_epoch(value):
@@ -49,13 +45,10 @@ class PresenceStuckWatch(hass.Hass):
         a = self.args
         self.presence = a["presence"]
         self.motion = a["motion"]
-        self.persons = list(a.get("persons", []))
-        self.nobody_home_min = float(a.get("nobody_home_min", 5))
         self.no_motion_min = float(a.get("no_motion_min", 30))
         self.room_name = a.get("room") or "Room"
 
         self._notifier = self.get_app("MobileNotifier")
-        self._nobody_home_since = None
         self._stuck = False
         self._presence_on_since = None
         self._last_motion_at = None
@@ -68,8 +61,6 @@ class PresenceStuckWatch(hass.Hass):
 
         self.listen_state(self._on_presence_change, self.presence)
         self.listen_state(self._on_motion_change, self.motion)
-        for person in self.persons:
-            self.listen_state(self._on_person_change, person)
         self.run_every(self._tick, "now+60", 60)
 
         self.log(f"PresenceStuckWatch initialized for {self.room_name}", level="INFO")
@@ -95,27 +86,8 @@ class PresenceStuckWatch(hass.Hass):
         if new in _MOTION_ACTIVE:
             self._last_motion_at = self._now()
 
-    def _on_person_change(self, entity, attribute, old, new, kwargs):
-        now = self._now()
-        self._recompute_nobody_home(now)
-        self._evaluate(now)
-
     def _tick(self, kwargs):
-        now = self._now()
-        self._recompute_nobody_home(now)
-        self._evaluate(now)
-
-    # ---------- nobody-home tracking ----------
-
-    def _recompute_nobody_home(self, now):
-        if self._all_away():
-            if self._nobody_home_since is None:
-                self._nobody_home_since = now
-        else:
-            self._nobody_home_since = None
-
-    def _all_away(self):
-        return all(self.get_state(p) not in _AMBIGUOUS_OR_HOME for p in self.persons)
+        self._evaluate(self._now())
 
     # ---------- evaluation ----------
 
@@ -125,11 +97,6 @@ class PresenceStuckWatch(hass.Hass):
         # inventing a session that never happened.
         if self._presence_on_since is None or self._stuck:
             return
-        if self._nobody_home_since is not None:
-            away_min = (now - self._nobody_home_since) / 60.0
-            if away_min >= self.nobody_home_min:
-                self._alert(f"Presence on while nobody has been home for {away_min:.0f} min")
-                return
         # Motion from a previous session must not count: the presence on-edge arrives before
         # its own motion event.
         last_motion = max(self._last_motion_at or 0.0, self._presence_on_since)
@@ -151,7 +118,7 @@ class PresenceStuckWatch(hass.Hass):
             self._stuck = False
             return
         if not sent:
-            self.log(f"PresenceStuckWatch: {self.room_name} notify reached nobody, will retry", level="WARNING")
+            self.log(f"PresenceStuckWatch: {self.room_name} notify reached no recipients, will retry", level="WARNING")
             self._stuck = False
 
     def _close_episode(self, now):

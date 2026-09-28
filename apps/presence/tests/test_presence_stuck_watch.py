@@ -1,5 +1,5 @@
-# tests/test_presence_stuck_watch.py - PresenceStuckWatch: the two stuck rules (nobody_home,
-# no_motion), restart seeding, and the one-push-per-episode notify contract.
+# tests/test_presence_stuck_watch.py - PresenceStuckWatch: the no_motion rule, restart seeding,
+# and the one-push-per-episode notify contract.
 # Same __new__ + monkeypatched-callables harness as the other tests in this directory.
 # Run from repo root: python3 -m unittest discover -s apps/presence/tests -q
 
@@ -30,10 +30,6 @@ import presence_stuck_watch as psw  # noqa: E402
 
 PRESENCE = "binary_sensor.bathroom_presence_presence"
 MOTION = "sensor.bathroom_presence_motion_state"
-MIKKEL = "person.mikkel"
-KRISTINE = "person.kristine"
-CLAUDIA = "person.claudia"
-PERSONS = [MIKKEL, KRISTINE, CLAUDIA]
 
 NOW0_DT = datetime(2026, 9, 23, 10, 0)
 NOW0 = NOW0_DT.timestamp()
@@ -41,8 +37,6 @@ NOW0 = NOW0_DT.timestamp()
 BASE_ARGS = {
     "presence": PRESENCE,
     "motion": MOTION,
-    "persons": list(PERSONS),
-    "nobody_home_min": 5,
     "no_motion_min": 30,
     "room": "Bathroom",
 }
@@ -57,12 +51,9 @@ def make_app(states=None, now=None):
     app = psw.PresenceStuckWatch.__new__(psw.PresenceStuckWatch)
     app.presence = PRESENCE
     app.motion = MOTION
-    app.persons = list(PERSONS)
-    app.nobody_home_min = 5.0
     app.no_motion_min = 30.0
     app.room_name = "Bathroom"
     app._notifier = MagicMock()
-    app._nobody_home_since = None
     app._stuck = False
     app._presence_on_since = None
     app._last_motion_at = None
@@ -108,16 +99,12 @@ class ArgParsing(unittest.TestCase):
         app = make_full_app()
         self.assertEqual(app.presence, PRESENCE)
         self.assertEqual(app.motion, MOTION)
-        self.assertEqual(app.persons, PERSONS)
-        self.assertEqual(app.nobody_home_min, 5.0)
         self.assertEqual(app.no_motion_min, 30.0)
         self.assertEqual(app.room_name, "Bathroom")
 
     def test_defaults_when_optional_keys_omitted(self):
         args = {"presence": PRESENCE, "motion": MOTION}
         app = make_full_app(args=args)
-        self.assertEqual(app.persons, [])
-        self.assertEqual(app.nobody_home_min, 5.0)
         self.assertEqual(app.no_motion_min, 30.0)
         self.assertEqual(app.room_name, "Room")
 
@@ -154,59 +141,6 @@ class SeedAtStartup(unittest.TestCase):
         })
         app._tick({})
         app.create_task.assert_called_once()
-
-
-class NobodyHomeTracking(unittest.TestCase):
-    def test_latches_once_and_holds_while_everyone_stays_away(self):
-        app = make_app(states={(MIKKEL, None): "work", (KRISTINE, None): "not_home", (CLAUDIA, None): "not_home"})
-        app._recompute_nobody_home(NOW0)
-        self.assertEqual(app._nobody_home_since, NOW0)
-        app._recompute_nobody_home(NOW0 + 600)
-        self.assertEqual(app._nobody_home_since, NOW0)  # unmoved
-
-    def test_clears_when_someone_comes_home(self):
-        app = make_app(states={(MIKKEL, None): "home"})
-        app._nobody_home_since = NOW0 - 600
-        app._recompute_nobody_home(NOW0)
-        self.assertIsNone(app._nobody_home_since)
-
-    def test_ambiguous_person_is_no_opinion_not_away(self):
-        for ambiguous in ("unknown", "unavailable", None):
-            with self.subTest(state=ambiguous):
-                states = {(MIKKEL, None): "not_home", (CLAUDIA, None): "not_home"}
-                if ambiguous is not None:
-                    states[(KRISTINE, None)] = ambiguous
-                app = make_app(states=states)
-                app._nobody_home_since = NOW0 - 600
-                app._recompute_nobody_home(NOW0)
-                self.assertIsNone(app._nobody_home_since)
-
-
-class NobodyHomeRule(unittest.TestCase):
-    def test_fires_at_threshold_not_before(self):
-        app = make_app()
-        app._presence_on_since = NOW0
-        app._nobody_home_since = NOW0
-        app._evaluate(NOW0 + 4.9 * 60)
-        app.create_task.assert_not_called()
-        app._evaluate(NOW0 + 5 * 60)
-        app.create_task.assert_called_once()
-        self.assertTrue(app._stuck)
-
-    def test_no_fire_while_presence_session_absent(self):
-        app = make_app()
-        app._nobody_home_since = NOW0 - 3600
-        app._evaluate(NOW0)
-        app.create_task.assert_not_called()
-
-    def test_ambiguous_person_never_fires_this_rule(self):
-        app = make_app(states={(MIKKEL, None): "unknown"})
-        app._presence_on_since = NOW0
-        app._last_motion_at = NOW0 + 3600  # recent motion - isolate the nobody_home rule
-        app._clock["now"] = NOW0 + 3600
-        app._recompute_nobody_home(app._clock["now"])
-        app._evaluate(app._clock["now"])
-        app.create_task.assert_not_called()
 
 
 class NoMotionRule(unittest.TestCase):
@@ -368,15 +302,8 @@ class InitializeRegistration(unittest.TestCase):
     def _listened_entities(self):
         return {c.args[1] for c in self.app.listen_state.call_args_list if len(c.args) > 1}
 
-    def test_listens_to_presence_and_motion(self):
-        entities = self._listened_entities()
-        self.assertIn(PRESENCE, entities)
-        self.assertIn(MOTION, entities)
-
-    def test_listens_to_every_person(self):
-        entities = self._listened_entities()
-        for p in PERSONS:
-            self.assertIn(p, entities)
+    def test_listens_to_presence_and_motion_only(self):
+        self.assertEqual(self._listened_entities(), {PRESENCE, MOTION})
 
     def test_registers_60s_tick(self):
         self.app.run_every.assert_called_once()

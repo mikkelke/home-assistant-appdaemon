@@ -1,7 +1,7 @@
 # /conf/apps/presence/presence_stuck_watch.yaml
 # Pushes the owner when a room's presence sensor looks stuck ON. Notify only, never controls
 # a device. One yaml instance per room - see presence_stuck_watch.py's module docstring for
-# the two stuck rules.
+# the stuck rule.
 #
 # No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
 # first or the app fails to instantiate.
@@ -16,10 +16,4 @@ PresenceStuckWatch:
   motion: sensor.bathroom_presence_motion_state   # states none/small/large; small|large = PIR motion
   room: Bathroom
 
-  persons:
-    - person.mikkel
-    - person.kristine
-    - person.claudia
-
-  nobody_home_min: 5
   no_motion_min: 30
