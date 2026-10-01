@@ -65,12 +65,8 @@ class ClaudiasRoomLights(hass.Hass):
             self.log(f"Error in switch event handler: {e}", level="ERROR")
 
     def _toggle(self, light, label):
-        if self.get_state(light) == "on":
-            self.turn_off(light)
-            self._log_action("OFF", f"{label} switch")
-        else:
-            self.turn_on(light)
-            self._log_action("ON", f"{label} switch")
+        self.toggle(light)
+        self._log_action("TOGGLE", f"{label} switch")
 
     def _log_action(self, action, reason="", score=None):
         if self.log_level == "quiet":
