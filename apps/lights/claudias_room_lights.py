@@ -15,11 +15,8 @@ class ClaudiasRoomLights(hass.Hass):
     goes home -> away) with a light still on, that light is turned off - unless the
     room still reads occupied (PIR), so a sibling left behind keeps their light.
 
-    Switch map: ``press_1`` toggles the ceiling light, ``press_2`` the string lights.
-    ``press_3`` belonged to the
-    floor lamp, which left the room (2026-07, same decision that delisted it from the
-    dashboard) - the button is deliberately a no-op now, kept mapped-but-ignored so a
-    future lamp only needs the wiring restored here and in the yaml.
+    Switch map: ``press_1`` (top-left) toggles the ceiling light, ``press_3`` (top-right)
+    the string lights. ``press_2``/``press_4`` (bottom row) are unmapped.
     """
 
     def initialize(self):
@@ -62,12 +59,8 @@ class ClaudiasRoomLights(hass.Hass):
             event_type = new
             if event_type == "press_1":
                 self._toggle(self.ceiling_light, "ceiling")
-            elif event_type == "press_2":
-                self._toggle(self.string_light, "string lights")
             elif event_type == "press_3":
-                # Floor-lamp button: the lamp left the room (2026-07). Deliberate no-op -
-                # logged at debug so a puzzled press is traceable without spamming INFO.
-                self.log("Claudias Room: floor-lamp button pressed - lamp no longer in the room, ignoring", level="DEBUG")
+                self._toggle(self.string_light, "string lights")
         except Exception as e:
             self.log(f"Error in switch event handler: {e}", level="ERROR")
 
