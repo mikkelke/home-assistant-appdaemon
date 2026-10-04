@@ -195,8 +195,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
 
     def _finish_decision_tick(self, now) -> bool:
         """The two autonomous finishes, both decided only on the plug's own reads (washer_plug.window): the
-        end-of-programme standby level after wash activity, or the final spin followed by the anti-crease nudge train.
-        A cycle that never washed and sits hard off goes to Off. Reads the plug did not answer pause all three."""
+        end-of-programme standby level after wash activity, or the final spin followed by the anti-crease nudge train,
+        looked for on every read since the previous tick. A cycle that never washed and sits hard off goes to Off.
+        Reads the plug did not answer pause all three."""
         samples = self._plug.snapshot()
         mono = self._plug.clock()
         poll_s = self.plug_poll_s
@@ -220,7 +221,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 self._transition_to_off("Standby without a wash")
                 return self.state != "Running"
             return False
-        end = wplug.spin_end(samples, mono, poll_s)
+        since = mono - self.energy_check_interval if self._spin_end_checked_at is None else self._spin_end_checked_at
+        end = wplug.spin_end_since(samples, since, mono, poll_s)
+        self._spin_end_checked_at = mono
         if end is None:
             return False
         self._spin_end_at = now - timedelta(seconds=mono - end)
@@ -618,6 +621,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.wash_activity_watts = float(self.args.get("wash_activity_watts", wplug.ACTIVITY_W))
         self.plug_unreachable_push_minutes = float(self.args.get("plug_unreachable_push_minutes", 10))
         self._spin_end_at = None
+        self._spin_end_checked_at = None  # plug clock instant of the last spin-end decision; None = look back one tick
         self._activity_seen = False
         # None (never coerced to False) while a transiently-failed recorder lookup has not yet
         # been retried - see _retry_activity_seen_from_recorder.
@@ -3116,6 +3120,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         self._set_state_entity( state="Running", attributes=run_attrs)
         self._remove_last_cycle_feedback()
         self._plug.clear()
+        self._spin_end_checked_at = None
 
         self._safe_cancel_timer(self.unemptied_watchdog_timer)
         self.unemptied_watchdog_timer = None
@@ -3969,6 +3974,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         """
         # Finish decisions for this cycle see only reads taken from here on.
         self._plug.clear()
+        self._spin_end_checked_at = None
         self._activity_seen = False
         self._activity_recorder_retry_after = None
         self._spin_end_at = None

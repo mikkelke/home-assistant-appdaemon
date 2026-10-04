@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+import json
 import socket
 import sys
 import threading
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -36,6 +38,52 @@ def final_cycle(heat_s=0, strong_s=90, spin_w=450.0, lead_s=240, drain_s=30, tra
     while reads[-1][1] > wp.PULSE_OFF_W:
         reads.pop()
     return reads
+
+
+def brief_pass_ring():
+    """final_cycle cut after the first read at which spin_end holds, then one 12 s tumble and quiet: spin_end holds at
+    that read and at no other. Returns (reads, index of that read)."""
+    reads = final_cycle(train_s=400)
+    i0 = next(i for i in range(len(reads)) if wp.spin_end(reads[:i + 1], reads[i][0]) is not None)
+    t = reads[i0][0]
+    return reads[:i0 + 1] + [(t + k * P, 40.0) for k in range(1, 7)] + [(t + k * P, 4.0) for k in range(7, 60)], i0
+
+
+REAL_WASH = Path(__file__).resolve().parent / "fixtures" / "washer_plug_2026_10_04.json"
+TICK_S = 30
+
+
+def real_wash():
+    """The fixture wash's plug as the poller would have read it: every P s, each reported value held until the next.
+    Returns (reads, door_s, spin_end_s), seconds from the fixture's start; the door opened at door_s."""
+    with open(REAL_WASH, encoding="utf-8") as f:
+        data = json.load(f)
+    t0 = datetime.fromisoformat(data["t_start"])
+    events = [((datetime.fromisoformat(ts) - t0).total_seconds(), float(w)) for ts, w in data["events"]["power"]]
+    door_s = (datetime.fromisoformat(data["t_stop"]) - t0).total_seconds()
+    held, k, reads = float(data["initial"]["power"]), 0, []
+    for i in range(1, int(door_s / P) + 1):
+        while k < len(events) and events[k][0] <= i * P:
+            held, k = events[k][1], k + 1
+        reads.append((i * P, held))
+    last_spin = max(i for i, (_, w) in enumerate(reads) if w >= wp.SPIN_W)
+    return reads, door_s, reads[last_spin + 1][0]
+
+
+def first_fire(reads, phase, scan):
+    """The first tick (every TICK_S, offset `phase`, from 10 min in) at which the finish rule fires on the reads up to
+    it, as (tick, spin end), or None. scan: look back over the reads since the previous tick, else decide at the tick
+    instant alone."""
+    last = None
+    for i, (t, _) in enumerate(reads):
+        if t < 600 or (t - phase) % TICK_S:
+            continue
+        seen = reads[:i + 1]
+        end = wp.spin_end_since(seen, t - TICK_S if last is None else last, t) if scan else wp.spin_end(seen, t)
+        last = t
+        if end is not None:
+            return t, end
+    return None
 
 
 class WindowRule(unittest.TestCase):
@@ -125,6 +173,79 @@ class SpinEnd(unittest.TestCase):
         while reads[-1][1] <= wp.PULSE_OFF_W:
             reads.pop()
         self.assertIsNone(wp.spin_end(reads, reads[-1][0]))
+
+
+class SpinEndSince(unittest.TestCase):
+    def setUp(self):
+        self.ring, self.i0 = brief_pass_ring()
+        self.t_pass = self.ring[self.i0][0]
+        self.end = wp.spin_end(self.ring[:self.i0 + 1], self.t_pass)
+        # the tick 10 s before the pass and the one 20 s after it: the 30 s span a tick interval covers
+        self.since, self.now = self.t_pass - 10, self.t_pass + 20
+        self.seen = [r for r in self.ring if r[0] <= self.now]
+
+    def test_a_pass_that_holds_at_one_read_between_two_ticks_is_found(self):
+        holds = [t for i, (t, _) in enumerate(self.ring) if wp.spin_end(self.ring[:i + 1], t) is not None]
+        self.assertEqual(holds, [self.t_pass])
+        self.assertIsNotNone(self.end)
+        self.assertIsNone(wp.spin_end(self.seen, self.now))
+        self.assertEqual(wp.spin_end_since(self.seen, self.since, self.now), self.end)
+
+    def test_a_read_above_the_train_peak_after_the_pass_voids_it(self):
+        loud = [(t, wp.TRAIN_PEAK_W + 1 if t == self.t_pass + 14 else w) for t, w in self.seen]
+        self.assertEqual(wp.spin_end(loud[:self.i0 + 1], self.t_pass), self.end)
+        self.assertIsNone(wp.spin_end_since(loud, self.since, self.now))
+
+    def test_a_failed_read_after_the_pass_voids_it(self):
+        failed = [(t, None if t == self.t_pass + 14 else w) for t, w in self.seen]
+        self.assertIsNone(wp.spin_end_since(failed, self.since, self.now))
+
+    def test_the_newest_read_must_be_fresh(self):
+        self.assertEqual(wp.spin_end_since(self.seen, self.since, self.now + 2.9), self.end)
+        self.assertIsNone(wp.spin_end_since(self.seen, self.since, self.now + 3.1))
+
+    def test_a_pass_at_or_before_since_belongs_to_an_earlier_tick(self):
+        self.assertIsNone(wp.spin_end_since(self.seen, self.t_pass, self.now))
+        self.assertEqual(wp.spin_end_since(self.seen, self.t_pass - 0.1, self.now), self.end)
+
+    def test_the_rule_at_the_tick_instant_still_counts(self):
+        """A tick falls between two reads, and the rule holds at that instant before it holds at any read."""
+        reads = final_cycle(drain_s=24, train_s=400)
+        first = next(i for i in range(len(reads)) if wp.spin_end(reads[:i + 1], reads[i][0]) is not None)
+        seen, now = reads[:first], reads[first - 1][0] + 1.0
+        self.assertTrue(all(wp.spin_end(seen[:i + 1], t) is None for i, (t, _) in enumerate(seen)))
+        end = wp.spin_end(seen, now)
+        self.assertIsNotNone(end)
+        self.assertEqual(wp.spin_end_since(seen, now - TICK_S, now), end)
+
+    def test_no_pass_in_the_span_is_none(self):
+        heated = final_cycle(heat_s=30, strong_s=32, spin_w=300.0)
+        self.assertIsNone(wp.spin_end_since(heated, heated[0][0] - 1, heated[-1][0]))
+        quiet = grid(0, [4.0] * 300)
+        self.assertIsNone(wp.spin_end_since(quiet, quiet[0][0] - 1, quiet[-1][0]))
+
+    def test_a_span_of_one_read_is_the_rule_itself(self):
+        reads = final_cycle(train_s=400)
+        for i in range(1, len(reads)):
+            seen = reads[:i + 1]
+            self.assertEqual(wp.spin_end_since(seen, reads[i - 1][0], reads[i][0]), wp.spin_end(seen, reads[i][0]), i)
+
+
+class RealWash(unittest.TestCase):
+    """A real wash (fixtures/washer_plug_2026_10_04.json) whose final spin ended minutes before the door opened and
+    where the rule holds only on short stretches between nudges: whatever the tick phase, the finish is found after the
+    spin ended and before the door opened, and the same ticks deciding at their own instant alone miss it at some phase."""
+
+    def test_every_tick_phase_finishes_after_the_spin_and_before_the_door(self):
+        reads, door_s, spin_end_s = real_wash()
+        phases = range(0, TICK_S, int(P))
+        self.assertTrue([ph for ph in phases if first_fire(reads, ph, scan=False) is None])
+        for ph in phases:
+            with self.subTest(phase=ph):
+                tick, end = first_fire(reads, ph, scan=True)
+                self.assertEqual(end, spin_end_s)
+                self.assertGreater(tick, spin_end_s)
+                self.assertLess(tick, door_s)
 
 
 class PulseBound(unittest.TestCase):

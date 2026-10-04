@@ -30,6 +30,7 @@ def attach_plug(app, reads=(), clock=None, poll_s=wplug.POLL_S):
     app._plug_outage_pushed = getattr(app, "_plug_outage_pushed", False)
     app._activity_seen = getattr(app, "_activity_seen", False)
     app._spin_end_at = None
+    app._spin_end_checked_at = None
     app.energy_check_timer = getattr(app, "energy_check_timer", None)
     app.energy_check_interval = getattr(app, "energy_check_interval", 30)
     return clock

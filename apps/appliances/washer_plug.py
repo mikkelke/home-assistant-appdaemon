@@ -210,6 +210,24 @@ def spin_end(samples, now, poll_s=POLL_S):
     return end_ts if _is_train(seg, now - TRAIN_S, end_ts + DRAIN_S) else None
 
 
+def spin_end_since(samples, since, now, poll_s=POLL_S):
+    """spin_end decided at each read in (since, now], oldest first, then at `now` itself: the first end found, provided
+    every read after the deciding one is at or below TRAIN_PEAK_W and the reads from it to `now` are all observed and
+    fresh (window), so the train is still going at `now`. spin_end holds only on the idle reads between nudges and
+    fails for TRAIN_S after a nudge that runs long, so deciding at one instant per tick can step over every instant it
+    holds; the reads since the previous tick cannot be stepped over."""
+    for i, (t, _) in enumerate(samples):
+        if t <= since or t > now:
+            continue
+        end = spin_end(samples[:i + 1], t, poll_s)
+        if end is None:
+            continue
+        tail = window(samples, now, now - t, poll_s)
+        if tail is not None and all(w <= TRAIN_PEAK_W for _, w in tail):
+            return end
+    return spin_end(samples, now, poll_s)
+
+
 def _is_train(seg, win_start, since):
     """seg from win_start on is an anti-crease nudge train starting after `since`: peak <= TRAIN_PEAK_W, at least
     IDLE_FRAC at the idle level, >= MIN_PULSES nudges starting inside it, and every pulse touching it shorter than
