@@ -2520,7 +2520,8 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.log(f"Door closed after emptying -> Off", level="INFO")
             self._strict_start_until_door_or_sustain = False
             self._sustain_start_begin = None
-            self._transition_to_off("Door closed - emptying complete")
+            # Entering Emptied stamped the cooling clock, so an un-forced Off is refused here.
+            self._transition_to_off("Door closed - emptying complete", force=True)
             now = self._now_utc()
             self.last_door_closed_at = now
             self.door_fast_start_armed_until = now + timedelta(seconds=self.door_close_fast_start_window_s)
