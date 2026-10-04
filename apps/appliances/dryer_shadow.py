@@ -157,6 +157,7 @@ class DryerShadow(hass.Hass):
         self.door_sensor = self.args["door_sensor"]
         self.live_state_entity = self.args["live_state_entity"]  # sensor.dryer_state - READ ONLY
         self.state_entity = self.args["state_entity"]  # sensor.dryer_state_v2 - ours
+        self.emptied_button_entity = self.args.get("emptied_button_entity", "input_button.dryer_emptied")
         self.divergence_debounce_s = float(self.args.get("divergence_debounce_s", 90))
 
         cfg = dict(policy_mod.DEFAULTS)
@@ -292,6 +293,7 @@ class DryerShadow(hass.Hass):
             policy.try_conclude_at_boot(self.fsm.ctx)
 
         self.listen_event(self._on_force_emptied, "dryer_force_emptied")
+        self.listen_event(self._on_emptied_button, "state_changed", entity_id=self.emptied_button_entity)
         self.fsm.start(tick_interval_s=60)
         self._arm_divergence_tick(60)
 
@@ -316,6 +318,23 @@ class DryerShadow(hass.Hass):
 
     def _on_force_emptied(self, event_name, data, kwargs):
         self.fsm.submit(Evidence.make(E.FORCE_EMPTIED, self.fsm.ctx.now(), "dryer_force_emptied_event"))
+
+    def _on_emptied_button(self, event_name, data, kwargs):
+        """input_button.dryer_emptied press, submitted exactly like the dryer_force_emptied event
+        (the live monitor reacts to both). After an HA restart input_button.* goes unavailable,
+        then restores its last press timestamp - that restore is a state_changed event too and
+        must never be read as a fresh press."""
+        data = data or {}
+        old_state_raw = data.get("old_state")
+        old_state = old_state_raw or {}
+        new_state = data.get("new_state") or {}
+        new = new_state.get("state")
+        old = old_state.get("state")
+        if new == old or new in _UNAVAILABLE:
+            return
+        if old_state_raw is None or old in _UNAVAILABLE:
+            return
+        self._on_force_emptied(event_name, data, kwargs)
 
     def _publish(self, published, *, internal, store_only, attrs):
         """The engine's only write path (spec section 2's store-only rule: same-published-value

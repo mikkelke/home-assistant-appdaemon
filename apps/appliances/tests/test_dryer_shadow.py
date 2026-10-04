@@ -244,6 +244,92 @@ class FullCycleEndToEnd(unittest.TestCase):
             self.assertEqual(app._clean_cycles, 1)
 
 
+# --- the dashboard Emptied button reaches the engine like the legacy event does ---
+
+
+class EmptiedButtonSubmitsForceEmptied(unittest.TestCase):
+    """The live dryer_monitor reacts to both the dryer_force_emptied event and a press of
+    input_button.dryer_emptied, so the shadow has to see the same FORCE_EMPTIED evidence from
+    either - otherwise every dashboard Emptied would register as a divergence."""
+
+    BUTTON = "input_button.dryer_emptied"
+    OLD = {"state": "2026-09-20T10:00:00+00:00"}
+    NEW = {"state": "2026-09-21T09:00:00+00:00", "context": {"user_id": "abc123"}}
+
+    def _press(self, app, old_state, new_state):
+        event = {"entity_id": self.BUTTON, "old_state": old_state, "new_state": new_state}
+        app._on_emptied_button("state_changed", event, {})
+
+    def _finished_shadow(self, tmp):
+        app, entities, calls = make_shadow(tmp)
+        app.listeners = []
+        app.listen_event = lambda cb, event, **kw: app.listeners.append((cb, event, kw))
+        app.initialize()
+        push_power(app, entities, "620")
+        fire_shortest(app)  # start-confirm
+        entities[ENERGY]["state"] = "10.5"
+        push_power(app, entities, "2")
+        app._policy.start_time = app._policy.start_time - timedelta(minutes=130)
+        fire_shortest(app)  # end-confirm
+        self.assertEqual(app.fsm.state.name, "FINISHED")
+
+        app.submitted = []
+        real_submit = app.fsm.submit
+
+        def spy(evidence):
+            app.submitted.append(evidence)
+            return real_submit(evidence)
+
+        app.fsm.submit = spy
+        return app, entities
+
+    def test_subscribes_to_the_helper_and_keeps_the_legacy_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, entities = self._finished_shadow(tmp)
+            self.assertIn((app._on_emptied_button, "state_changed", {"entity_id": self.BUTTON}), app.listeners)
+            self.assertIn((app._on_force_emptied, "dryer_force_emptied", {}), app.listeners)
+
+    def test_button_press_submits_force_emptied_and_lands_emptied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, entities = self._finished_shadow(tmp)
+            self._press(app, self.OLD, self.NEW)
+            self.assertEqual([e.type for e in app.submitted], [EvidenceType.FORCE_EMPTIED])
+            self.assertEqual(app.fsm.state.name, "EMPTIED")
+            self.assertEqual(entities[V2]["state"], "Emptied")
+
+    def test_button_press_submits_the_same_evidence_as_the_legacy_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _ = self._finished_shadow(tmp)
+            app._on_force_emptied("dryer_force_emptied", {"reason": "Dashboard"}, {})
+            (legacy,) = app.submitted
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _ = self._finished_shadow(tmp)
+            self._press(app, self.OLD, self.NEW)
+            (button,) = app.submitted
+        self.assertEqual(
+            (button.type, button.event_class, button.source, button.live, button.payload),
+            (legacy.type, legacy.event_class, legacy.source, legacy.live, legacy.payload),
+        )
+
+    def test_restore_and_no_op_events_submit_nothing(self):
+        """A restart replays the helper as None/unknown/unavailable -> last-press timestamp (and
+        back); none of that is a press, nor is a state_changed with no change."""
+        with tempfile.TemporaryDirectory() as tmp:
+            app, _ = self._finished_shadow(tmp)
+            for old_state, new_state in (
+                (None, self.NEW),
+                (self.OLD, {"state": "unavailable"}),
+                ({"state": "unavailable"}, self.OLD),
+                ({"state": "unknown"}, self.NEW),
+                (self.OLD, {"state": "unknown"}),
+                (self.NEW, self.NEW),
+            ):
+                self._press(app, old_state, new_state)
+            app._on_emptied_button("state_changed", None, {})
+            self.assertEqual(app.submitted, [])
+            self.assertEqual(app.fsm.state.name, "FINISHED")
+
+
 # --- spec section 8: hypothesis + corroboration + reconcile, through real initialize() ---
 
 

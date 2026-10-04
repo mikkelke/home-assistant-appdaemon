@@ -19,6 +19,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -35,6 +36,7 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     sys.modules["appdaemon.plugins.hass.hassapi"] = hassapi
 
 import washer_monitor as wm  # noqa: E402
+from test_dishwasher_audit_2026_09 import make_live_app as make_live_dishwasher  # noqa: E402
 from test_dryer_emptied_exit import make_app  # noqa: E402
 
 
@@ -169,6 +171,166 @@ class WasherEmptiedButton(unittest.TestCase):
         except Exception as e:  # pragma: no cover
             self.fail(f"_on_emptied_button raised: {e}")
         self.assertEqual(app.transitions, [])
+
+
+def make_dishwasher(state):
+    """Real DishwasherMonitor in `state` with a cycle in progress (so _force_emptied never goes
+    looking for a cycle to restore); _transition_to_emptied runs for real."""
+    now = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    return make_live_dishwasher(now, state=state, start_minutes_ago=240, power_w="0.0")
+
+
+def make_dryer(state):
+    app = make_app()
+    app.states[app.state_entity] = state
+    app.state = state
+    app.last_state_change = app._now_utc()
+    return app
+
+
+class DishwasherForceEmptied(unittest.TestCase):
+    """dishwasher_force_emptied (legacy event, kept for Developer Tools)."""
+
+    @staticmethod
+    def _reason(app):
+        return app.attrs[app.state_entity].get("reason")
+
+    def test_from_unemptied_empties_with_the_event_reason(self):
+        app = make_dishwasher("Unemptied")
+        app._handle_force_emptied("dishwasher_force_emptied", {"reason": "Dashboard"}, {})
+        self.assertEqual(app.states[app.state_entity], "Emptied")
+        self.assertEqual(self._reason(app), "Dashboard")
+
+    def test_none_data_uses_default_reason(self):
+        app = make_dishwasher("Unemptied")
+        app._handle_force_emptied("dishwasher_force_emptied", None, {})
+        self.assertEqual(app.states[app.state_entity], "Emptied")
+        self.assertEqual(self._reason(app), "User confirmed emptied (door opened earlier)")
+
+    def test_from_paused_is_honoured(self):
+        app = make_dishwasher("Paused")
+        app._handle_force_emptied("dishwasher_force_emptied", {}, {})
+        self.assertEqual(app.states[app.state_entity], "Emptied")
+
+    def test_ignored_from_running_off_and_emptied(self):
+        for state in ("Running", "Off", "Emptied"):
+            with self.subTest(state=state):
+                app = make_dishwasher(state)
+                app._handle_force_emptied("dishwasher_force_emptied", {}, {})
+                self.assertEqual(app.states[app.state_entity], state)
+                self.assertEqual(app.set_state_calls, [])
+
+
+PRESS_OLD = {"state": "2026-09-20T10:00:00+00:00"}
+PRESS_NEW = {"state": "2026-09-21T09:00:00+00:00", "context": {"user_id": "abc123"}}
+
+
+class EmptiedButtonCases:
+    """input_button.<appliance>_emptied press-versus-restore cases shared by the dishwasher and
+    the dryer. Neither monitor resolves who tapped, so a press is judged on the state change
+    alone; a restart replaying the button's last press must never be read as a fresh one."""
+
+    ENTITY = ""
+
+    def make_app(self, state):
+        raise NotImplementedError
+
+    def emptied(self, app):
+        raise NotImplementedError
+
+    def press(self, app, old_state, new_state):
+        event = {"entity_id": self.ENTITY, "old_state": old_state, "new_state": new_state}
+        app._on_emptied_button("state_changed", event, {})
+
+    def test_press_from_unemptied_empties_it(self):
+        app = self.make_app("Unemptied")
+        self.press(app, PRESS_OLD, PRESS_NEW)
+        self.assertTrue(self.emptied(app))
+
+    def test_ignored_while_running(self):
+        app = self.make_app("Running")
+        self.press(app, PRESS_OLD, PRESS_NEW)
+        self.assertFalse(self.emptied(app))
+        self.assertEqual(app.set_state_calls, [])
+
+    def test_first_ever_observation_with_no_old_state_is_not_a_press(self):
+        """old_state is None the very first time AppDaemon observes this entity (e.g. right
+        after this listener is registered) - never a real press."""
+        app = self.make_app("Unemptied")
+        self.press(app, None, PRESS_NEW)
+        self.assertFalse(self.emptied(app))
+
+    def test_restart_replaying_unavailable_to_last_press_is_not_a_fresh_press(self):
+        """After an HA/AppDaemon restart, input_button.* goes unavailable then restores its
+        last-press timestamp - both are state_changed events and neither is a fresh press."""
+        app = self.make_app("Unemptied")
+        self.press(app, PRESS_OLD, {"state": "unavailable"})
+        self.press(app, {"state": "unavailable"}, PRESS_OLD)
+        self.assertFalse(self.emptied(app))
+
+    def test_unknown_on_either_side_is_not_a_press(self):
+        app = self.make_app("Unemptied")
+        self.press(app, {"state": "unknown"}, PRESS_NEW)
+        self.press(app, PRESS_OLD, {"state": "unknown"})
+        self.assertFalse(self.emptied(app))
+
+    def test_unchanged_state_is_not_a_press(self):
+        app = self.make_app("Unemptied")
+        self.press(app, PRESS_NEW, PRESS_NEW)
+        self.assertFalse(self.emptied(app))
+
+    def test_none_data_does_not_raise(self):
+        app = self.make_app("Unemptied")
+        try:
+            app._on_emptied_button("state_changed", None, {})
+        except Exception as e:  # pragma: no cover
+            self.fail(f"_on_emptied_button raised: {e}")
+        self.assertFalse(self.emptied(app))
+
+
+class DishwasherEmptiedButton(EmptiedButtonCases, unittest.TestCase):
+    ENTITY = "input_button.dishwasher_emptied"
+
+    def make_app(self, state):
+        return make_dishwasher(state)
+
+    def emptied(self, app):
+        return app.states[app.state_entity] == "Emptied"
+
+    def test_press_records_the_dashboard_button_reason(self):
+        app = self.make_app("Unemptied")
+        self.press(app, PRESS_OLD, PRESS_NEW)
+        self.assertEqual(app.attrs[app.state_entity]["reason"], "Dashboard button")
+
+    def test_press_from_paused_is_honoured_like_the_event(self):
+        app = self.make_app("Paused")
+        self.press(app, PRESS_OLD, PRESS_NEW)
+        self.assertTrue(self.emptied(app))
+
+    def test_ignored_when_off_or_already_emptied(self):
+        for state in ("Off", "Emptied"):
+            with self.subTest(state=state):
+                app = self.make_app(state)
+                self.press(app, PRESS_OLD, PRESS_NEW)
+                self.assertEqual(app.states[app.state_entity], state)
+                self.assertEqual(app.set_state_calls, [])
+
+
+class DryerEmptiedButton(EmptiedButtonCases, unittest.TestCase):
+    ENTITY = "input_button.dryer_emptied"
+
+    def make_app(self, state):
+        return make_dryer(state)
+
+    def emptied(self, app):
+        return app.state == "Emptied"
+
+    def test_press_records_the_dashboard_button_reason(self):
+        app = self.make_app("Unemptied")
+        self.press(app, PRESS_OLD, PRESS_NEW)
+        emptied_calls = [c for c in app.set_state_calls if c.get("state") == "Emptied"]
+        self.assertEqual(len(emptied_calls), 1)
+        self.assertEqual(emptied_calls[0]["attributes"]["reason"], "Forced emptied (Dashboard button)")
 
 
 if __name__ == "__main__":

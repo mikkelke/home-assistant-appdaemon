@@ -180,6 +180,7 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.ui_state_select = "input_select." + str(self.state_entity).split(".", 1)[1]
         self.confirmed_programme_entity = self.args.get("confirmed_programme_entity")
         self.short_entity = self.args.get("short_entity")
+        self.emptied_button_entity = self.args.get("emptied_button_entity", "input_button.dishwasher_emptied")
         # When True, reset programme selector to "—" at cycle start so user must confirm each run
         self.reset_programme_selector_on_start = self.args.get("reset_programme_selector_on_start", True)
         self.start_w = float(self.args["start_w"])
@@ -690,6 +691,9 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.listen_event(self._handle_force_off, "dishwasher_force_off")
         self.listen_event(self._handle_force_unemptied, "dishwasher_force_unemptied")
         self.listen_event(self._handle_force_emptied, "dishwasher_force_emptied")
+        # The dashboard presses this helper: input_button.press works for every housemate, while
+        # firing the event above needs an HA admin.
+        self.listen_event(self._on_emptied_button, "state_changed", entity_id=self.emptied_button_entity)
 
         # Bootstrap evaluation
         current_power_state = self.get_state(self.power_sensor)
@@ -2846,6 +2850,29 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
     def _handle_force_emptied(self, event_name, data, kwargs):
         """Handle dishwasher_force_emptied: user already opened door / is emptying; skip Unemptied wait."""
         data = data or {}
+        reason = data.get("reason") or "User confirmed emptied (door opened earlier)"
+        self._force_emptied(reason)
+
+    def _on_emptied_button(self, event_name, data, kwargs):
+        """input_button.dishwasher_emptied press: dishwasher_force_emptied for every housemate.
+
+        After an HA restart input_button.* goes unavailable, then restores its last press
+        timestamp - that restore is a state_changed event too and must never be read as a
+        fresh press."""
+        data = data or {}
+        old_state_raw = data.get("old_state")
+        old_state = old_state_raw or {}
+        new_state = data.get("new_state") or {}
+        new = new_state.get("state")
+        old = old_state.get("state")
+        if new == old or new in (None, "unknown", "unavailable"):
+            return
+        if old_state_raw is None or old in (None, "unknown", "unavailable"):
+            return
+        self._force_emptied("Dashboard button")
+
+    def _force_emptied(self, reason):
+        """Shared body for dishwasher_force_emptied and the input_button press."""
         st = self.get_state(self.state_entity)
         if st == "Emptied":
             self.log("Force Emptied ignored: already Emptied", level="DEBUG")
@@ -2861,7 +2888,6 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             return
         if not self.start_time:
             self._restore_cycle_tracking_from_entity()
-        reason = data.get("reason") or "User confirmed emptied (door opened earlier)"
         self.log(f"Force Emptied via event ({reason})", level="INFO")
         self._transition_to_emptied(reason)
 

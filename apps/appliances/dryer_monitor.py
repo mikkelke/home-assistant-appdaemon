@@ -132,6 +132,7 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
             self.ui_state_select = None
         if not self.ui_state_select and self.state_entity and str(self.state_entity).startswith("sensor."):
             self.ui_state_select = "input_select." + str(self.state_entity).split(".", 1)[1]
+        self.emptied_button_entity = self.args.get("emptied_button_entity", "input_button.dryer_emptied")
         self.start_w = float(self.args["start_w"])
         self.stop_w = float(self.args["stop_w"])
         self.run_for = int(self.args["run_for"])
@@ -489,6 +490,9 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
         self.listen_state(self._handle_unavailable, self.power_sensor, new="unavailable")
         # Dashboard "Emptied" button (2026-08-07) - same convention as dishwasher_force_emptied.
         self.listen_event(self._handle_force_emptied, "dryer_force_emptied")
+        # The dashboard presses this helper: input_button.press works for every housemate, while
+        # firing the event above needs an HA admin.
+        self.listen_event(self._on_emptied_button, "state_changed", entity_id=self.emptied_button_entity)
 
         # Get Sonos Notifier App instance
         self.sonos_notifier = None
@@ -1851,17 +1855,39 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
         return False
 
     def _handle_force_emptied(self, event_name, data, kwargs):
-        """dryer_force_emptied (dashboard Emptied button): the drum is empty but the door
-        contact never saw the emptying. Only honored from Unemptied - any earlier state may
-        still be a live cycle."""
+        """dryer_force_emptied: the drum is empty but the door contact never saw the emptying.
+        See _force_emptied for the shared guard."""
         data = data or {}
+        reason = data.get("reason") or "Forced via event"
+        self._force_emptied(reason)
+
+    def _on_emptied_button(self, event_name, data, kwargs):
+        """input_button.dryer_emptied press: dryer_force_emptied for every housemate.
+
+        After an HA restart input_button.* goes unavailable, then restores its last press
+        timestamp - that restore is a state_changed event too and must never be read as a
+        fresh press."""
+        data = data or {}
+        old_state_raw = data.get("old_state")
+        old_state = old_state_raw or {}
+        new_state = data.get("new_state") or {}
+        new = new_state.get("state")
+        old = old_state.get("state")
+        if new == old or new in (None, "unknown", "unavailable"):
+            return
+        if old_state_raw is None or old in (None, "unknown", "unavailable"):
+            return
+        self._force_emptied("Dashboard button")
+
+    def _force_emptied(self, reason):
+        """Shared body for dryer_force_emptied and the input_button press. Only honored from
+        Unemptied - any earlier state may still be a live cycle."""
         if self.state != "Unemptied":
             self.log(
                 f"Force Emptied ignored from state {self.state!r} (only valid from Unemptied)",
                 level="WARNING",
             )
             return
-        reason = data.get("reason") or "Forced via event"
         self.log(f"Force Emptied via event ({reason})", level="INFO")
         self._transition_to_emptied(f"Forced emptied ({reason})")
 
