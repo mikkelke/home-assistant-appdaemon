@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import types
 import unittest
 from datetime import datetime, timezone
@@ -36,8 +37,8 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     sys.modules["appdaemon.plugins.hass.hassapi"] = hassapi
 
 import washer_monitor as wm  # noqa: E402
-from test_dishwasher_audit_2026_09 import make_live_app as make_live_dishwasher  # noqa: E402
-from test_dryer_emptied_exit import make_app  # noqa: E402
+from test_dishwasher_audit_2026_09 import make_boot_app, make_live_app as make_live_dishwasher  # noqa: E402
+from test_dryer_emptied_exit import make_app, make_full_init_app  # noqa: E402
 
 
 def make_unemptied_dryer():
@@ -331,6 +332,37 @@ class DryerEmptiedButton(EmptiedButtonCases, unittest.TestCase):
         emptied_calls = [c for c in app.set_state_calls if c.get("state") == "Emptied"]
         self.assertEqual(len(emptied_calls), 1)
         self.assertEqual(emptied_calls[0]["attributes"]["reason"], "Forced emptied (Dashboard button)")
+
+
+class MonitorsSubscribeToTheEmptiedHelper(unittest.TestCase):
+    """initialize() has to wire the helper press next to the legacy event - the handlers above
+    never run if the subscription is missing or names the wrong entity."""
+
+    @staticmethod
+    def _record_listeners(app):
+        app.listeners = []
+        app.listen_event = lambda cb, event, **kw: app.listeners.append((cb, event, kw))
+
+    def test_dishwasher(self):
+        for override, entity in ((None, "input_button.dishwasher_emptied"), ("input_button.other", "input_button.other")):
+            with self.subTest(override=override), tempfile.TemporaryDirectory() as tmp:
+                extra = {"emptied_button_entity": override} if override else None
+                app, _entities = make_boot_app(tmp, extra_args=extra)
+                self._record_listeners(app)
+                app.initialize()
+                self.assertIn((app._on_emptied_button, "state_changed", {"entity_id": entity}), app.listeners)
+                self.assertIn((app._handle_force_emptied, "dishwasher_force_emptied", {}), app.listeners)
+
+    def test_dryer(self):
+        for override, entity in ((None, "input_button.dryer_emptied"), ("input_button.other", "input_button.other")):
+            with self.subTest(override=override):
+                app = make_full_init_app(sensor_state="Off")
+                if override:
+                    app.args["emptied_button_entity"] = override
+                self._record_listeners(app)
+                app.initialize()
+                self.assertIn((app._on_emptied_button, "state_changed", {"entity_id": entity}), app.listeners)
+                self.assertIn((app._handle_force_emptied, "dryer_force_emptied", {}), app.listeners)
 
 
 if __name__ == "__main__":
