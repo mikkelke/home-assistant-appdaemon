@@ -110,7 +110,6 @@ Intercom:
   # have taken, this is invisible to the visitor.
   voice_before_unlock:
     front door: "camera.abb_welcome_gateway_outdoor_station_2_1"
-    back door: "camera.abb_welcome_gateway_outdoor_station_1_1"
   # EMPTY on purpose: intercom.py holds the door, the bridge says the sentence.
   # The bridge speaks into the call HA dialled (the only one the station
   # renders); intercom.py could only speak into the station's own ring call,

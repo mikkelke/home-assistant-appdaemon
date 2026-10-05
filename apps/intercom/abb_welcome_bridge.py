@@ -1766,7 +1766,7 @@ class AbbWelcomeBridge(hass.Hass):
         whichever comes first resolves it - Open unlocks via the ESP lock (the same
         path as the dashboard's door buttons, never the ABB button entities), Reject
         speaks reject_message, sustained silence speaks no_answer_message. Voices go
-        only to doors in announce_cameras (both doors);
+        only to doors in announce_cameras (front door only);
         the push works for both doors either way."""
         try:
             door = episode["door"]
