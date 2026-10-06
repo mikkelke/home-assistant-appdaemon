@@ -210,9 +210,9 @@ class SpinEndSince(unittest.TestCase):
 
     def test_the_rule_at_the_tick_instant_still_counts(self):
         """A tick falls between two reads, and the rule holds at that instant before it holds at any read."""
-        reads = final_cycle(drain_s=24, train_s=400)
+        reads = final_cycle(drain_s=30, train_s=400)
         first = next(i for i in range(len(reads)) if wp.spin_end(reads[:i + 1], reads[i][0]) is not None)
-        seen, now = reads[:first], reads[first - 1][0] + 1.0
+        seen, now = reads[:first], reads[first - 1][0] + 1.5
         self.assertTrue(all(wp.spin_end(seen[:i + 1], t) is None for i, (t, _) in enumerate(seen)))
         end = wp.spin_end(seen, now)
         self.assertIsNotNone(end)

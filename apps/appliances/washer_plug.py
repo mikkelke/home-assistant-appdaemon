@@ -24,7 +24,7 @@ RING_S = 45 * 60             # the longest final spin chain seen is ~25 min; plu
 STANDBY_W = 3.0; STANDBY_S = 180
 SPIN_W = 150.0; SPIN_STRONG_W = 250.0; SPIN_STRONG_S = 60.0; SPIN_GAP_S = 180; SPIN_MAX_AGE_S = 20 * 60
 HEAT_W = 1000.0; HEAT_S = 30.0
-DRAIN_S = 45; TRAIN_S = 120; TRAIN_PEAK_W = 60.0; IDLE_W = 4.5; IDLE_FRAC = 0.30
+DRAIN_S = 30; TRAIN_S = 105; TRAIN_PEAK_W = 60.0; IDLE_W = 4.5; IDLE_FRAC = 0.30
 PULSE_ON_W = 15.0; PULSE_OFF_W = 7.5; MIN_PULSES = 4
 # A pulse is judged by the reads that bracket it (last at or below PULSE_OFF_W before, first after): an upper bound on
 # how long it really lasted. Nudges (<= 7 s) bracket at <= 10 s on the 2 s grid; the interim tumbles that must be
