@@ -446,8 +446,7 @@ class FamilyRoomLights(hass.Hass):
                 self._clear_door_arrival_latch("all family PIR off")
                 self._sleep_activated_during_presence = False
                 self._presence_session_started_at = None
-            # Kitchen off: evaluate immediately so island handoff from dishwasher_island_signal (dark solo
-            # cleanup) is not delayed behind debounce while another app may have left only island_light_1 on.
+            # Kitchen off ends dishwasher_island_signal's claim on the island: evaluate immediately, not debounced.
             self._schedule_evaluation(immediate=(room == "kitchen"))
         except Exception as e:
             self.log(f"Error in PIR off handler: {e}", level="ERROR")
@@ -797,21 +796,6 @@ class FamilyRoomLights(hass.Hass):
 
     def _on_dishwasher_state_change(self, entity, attribute, old, new, kwargs):
         try:
-            old_u = old == "Unemptied"
-            new_u = new == "Unemptied"
-            nid = self._normal_island_group_entity()
-            if old_u and not new_u and nid:
-                try:
-                    if self._safe_get_state(nid, default="off", timeout_warning=False) == "on":
-                        self._ad_turn_off(nid)
-                except Exception as ie:
-                    self.log(f"Dishwasher exit: off island group {nid}: {ie}", level="DEBUG")
-            elif new_u and not old_u and nid:
-                try:
-                    if self._safe_get_state(nid, default="off", timeout_warning=False) == "on":
-                        self._ad_turn_off(nid)
-                except Exception as ie:
-                    self.log(f"Dishwasher Unemptied: off full island {nid} for handoff: {ie}", level="DEBUG")
             self._schedule_evaluation()
         except Exception as e:
             self.log(f"_on_dishwasher_state_change: {e}", level="ERROR")

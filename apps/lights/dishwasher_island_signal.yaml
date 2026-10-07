@@ -1,11 +1,14 @@
-# ONLY this app uses island_lights_sg + island_light_1 (dishwasher Unemptied + kitchen PIR).
-# FamilyRoomLights uses light.island_lights only — never SG/bulb1.
+# ONLY this app uses island_lights_sg + island_light_1 (the dishwasher signal).
+# FamilyRoomLights uses light.island_lights only - never SG/bulb1 - and owns the island whenever the signal is not showing.
 #
-# Unemptied + kitchen PIR + bright: full light.island_lights (green), both AL off.
-# Unemptied + kitchen PIR + dark: full group off; light.island_lights_sg on + island_light_1 green.
-# Unemptied, no kitchen PIR: all signal lights off, both AL off (presence required to light).
-# Not Unemptied: main AL on, SG AL off.
-# Leaving Unemptied while bright (door opened to empty): all signal lights OFF, no AL hand-back.
+# The signal shows only while Unemptied AND the kitchen is occupied:
+#   bright: full light.island_lights (green), both AL off.
+#   dark:   full group off; light.island_lights_sg on + island_light_1 green.
+# Everywhere else (not Unemptied, or Unemptied with the kitchen empty): normal layout - main AL on, SG AL off,
+# island_light_1 manual control released - and no light is touched.
+# When the signal ends (kitchen clears, or no longer Unemptied) no light is powered on. The full group is switched
+# off only if the signal itself powered it up from off in the bright case; any other lit island bulb is recolored
+# to normal via main AL apply (turn_on_lights false) and FamilyRoomLights decides on/off.
 DishwasherIslandSignal:
   module: dishwasher_island_signal
   class: DishwasherIslandSignal

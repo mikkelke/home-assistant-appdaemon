@@ -4,7 +4,8 @@ the green signal, but an already-applied signal is held (asymmetric rule).
 Ghost fixture = the measured 2026-08-09 16:01Z episode: kitchen composite on
 via mmWave only (PIR silent since before the span) while the kitchen speaker
 plays. Unemptied + that ghost previously drove the island signal for nobody.
-The real clear paths (composite off / leaving Unemptied) stay untouched.
+The real end paths (composite off / leaving Unemptied) still hand the island
+back to FamilyRoomLights.
 """
 
 from __future__ import annotations
@@ -66,7 +67,7 @@ def make_app(states):
     app._unemptied = "Unemptied"
     app._brightness = 100
     app._hs = [120, 100]
-    app._dishwasher_full_island_active = False
+    app._island_powered_by_signal = False
     app._suspect_after_minutes = None
     app.args = {"darkness_confirmed_sensor_entity": DARK_SENSOR}
 
@@ -94,7 +95,16 @@ def make_app(states):
     app.call_service = MagicMock()
     app.turn_on = MagicMock()
     app.turn_off = MagicMock()
+    app.run_in = MagicMock()
     return app
+
+
+def settle(app):
+    """Run the hand-back timers the app scheduled with run_in (the delay itself is not simulated)."""
+    scheduled = [c.args for c in app.run_in.call_args_list]
+    app.run_in.reset_mock()
+    for callback, _delay in scheduled:
+        callback({})
 
 
 def ghost_states(pir_last_changed=utc(15, 35), signal_applied=False, dark=True):
@@ -131,7 +141,7 @@ class GhostPresenceNeverAppliesSignal(unittest.TestCase):
         app = make_app(ghost_states(dark=False))
         app._sync_signal()
         app.turn_on.assert_not_called()
-        self.assertFalse(app._dishwasher_full_island_active)
+        self.assertFalse(app._island_powered_by_signal)
 
 
 class GhostPresenceHoldsAppliedSignal(unittest.TestCase):
@@ -143,6 +153,7 @@ class GhostPresenceHoldsAppliedSignal(unittest.TestCase):
         app._sync_signal()
         app.turn_off.assert_not_called()
         app.call_service.assert_not_called()
+        app.run_in.assert_not_called()
 
 
 class RealPresenceStillDrivesSignal(unittest.TestCase):
@@ -155,16 +166,25 @@ class RealPresenceStillDrivesSignal(unittest.TestCase):
         self.assertIn(BULB1, turned_on)
 
 
-class CompositeOffClearsAsBefore(unittest.TestCase):
-    def test_pir_composite_off_clear_path_unchanged(self):
+class CompositeOffHandsTheIslandBack(unittest.TestCase):
+    def test_composite_off_restores_the_layout_without_switching_a_light_off(self):
         states = ghost_states(signal_applied=True)
         states[PIR_COMPOSITE]["state"] = "off"
         app = make_app(states)
         app._sync_signal()
+        settle(app)
+
         turned_off = [c.args[0] for c in app.turn_off.call_args_list]
-        self.assertIn(BULB1, turned_off)
-        self.assertIn(SG_LIGHT, turned_off)
-        self.assertIn(AL_SG, turned_off)
+        self.assertEqual(turned_off, [AL_SG])
+        self.assertEqual([c.args[0] for c in app.turn_on.call_args_list], [AL_MAIN])
+        applies = [
+            c for c in app.call_service.call_args_list if c.args[0] == "adaptive_lighting/apply"
+        ]
+        self.assertEqual(len(applies), 1)
+        self.assertEqual(
+            applies[0].kwargs,
+            {"entity_id": AL_MAIN, "lights": [FULL], "turn_on_lights": False},
+        )
 
 
 if __name__ == "__main__":

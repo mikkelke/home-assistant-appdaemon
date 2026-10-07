@@ -1,32 +1,40 @@
-"""Dishwasher signal **only** (Unemptied + kitchen PIR). Family room lighting uses ``light.island_lights`` only
-elsewhere - this app is the **only** place that uses ``island_lights_sg`` + ``island_light_1`` for the green signal.
+"""Dishwasher signal **only**: while the dishwasher is Unemptied **and** the kitchen is occupied, the island
+shows a green signal. Everywhere else ``light.island_lights`` belongs to ``FamilyRoomLights`` in its normal
+layout (AL main on, AL SG off, island light 1 manual control released). This app is the **only** place that
+uses ``island_lights_sg`` + ``island_light_1`` for the signal.
 
-- **Bright** (family room not dark): full ``light.island_lights`` green, both AL switches off.
+- **Bright** (family room confirmed bright): full ``light.island_lights`` green, both AL switches off.
 - **Dark**: ``light.island_lights`` off; ``light.island_lights_sg`` on (normal AL) + ``light.island_light_1`` green (manual).
 
 Prefer **in-place color/power** via ``turn_on`` (brightness + ``hs_color``) when lights are already on - avoid ``turn_off``/``turn_on`` churn when switching dishwasher *mode* or when the island was already lit by family room lighting. Hue/ZHA often map ``rgb_color`` to ``color_temp`` in HA state while the lamp still looks chromatic; ``hs_color`` keeps entity state aligned with what you see.
 
-When not Unemptied, cleanup runs when **leaving** Unemptied (see ``_sync_signal``). Leaving while the
-bright full-group signal was active (or the room reads confirmed bright) ends with **everything off** -
-the AL ``turn_on_lights`` hand-back only runs in the dark path, where bulb1 rejoins the lit island. **Startup:** if HA already says not Unemptied but AL switches are still in the dishwasher layout (anything other than main-on/SG-off), we run the same cleanup so a missed transition or AD restart cannot leave island light 1 green while ``sensor.dishwasher_state`` is Off.
+**Hand-back** (kitchen presence clears while Unemptied, or the dishwasher leaves Unemptied; see
+``_hand_back_island``): the app never powers an island light on and only powers one off when it powered the
+full group up from off itself in the bright path. Any other lit island bulb is recolored to normal with
+``adaptive_lighting/apply`` (``turn_on_lights=False``) and left to ``FamilyRoomLights``, which alone decides
+on/off. The AL layout restore and recolor run ``_HAND_BACK_SETTLE_S`` seconds later: AL only adapts lights
+HA reports as on, and HA's state for a Zigbee group trails a command, so adapting right after
+``FamilyRoomLights`` switched the island off would switch it back on.
 
-**Unemptied with no kitchen PIR:** all island signal lights off and both AL switches off. Lights are only driven while ``kitchen_pir`` is on (bright green or dark solo). Enabling the SG AL switch during "idle" previously caused Adaptive Lighting to power bulbs with nobody present.
+**Unemptied with no kitchen presence** is the normal layout: nothing is applied and no light is touched.
 
-**PIR off race:** On kitchen PIR ``off``, we must only call ``turn_off(light.island_lights)`` when this app
-had turned the full group on (bright + Unemptied green). In dark-solo mode the full group is already off;
-``FamilyRoomLights`` may turn it on in the same tick - an unconditional clear would wipe that and leave
-only ``island_light_1`` from the dark-solo cleanup path.
+**Startup:** if the AL switches are still in a signal layout (anything other than main-on/SG-off) while the
+kitchen is empty or the dishwasher is not Unemptied, the same hand-back runs, so a missed transition or AD
+restart cannot leave island light 1 green.
 
 **Presence trust:** kitchen mmWave-only presence while the kitchen speaker plays is SUSPECT
 (``presence_trust.py``) - the signal is never *applied* on ghost presence (no green lights for
 nobody), but an already-applied signal is held untouched: suspect still counts as presence for
-the off-hold, and the real clear paths (composite off / leaving Unemptied) are unchanged.
+the hold, and the real end paths (composite off / leaving Unemptied) are unchanged.
 """
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
 import presence_trust
 import room_state_darkness
+
+# Delay before the hand-back touches AL; see the module docstring.
+_HAND_BACK_SETTLE_S = 3
 
 
 class DishwasherIslandSignal(hass.Hass):
@@ -49,9 +57,10 @@ class DishwasherIslandSignal(hass.Hass):
             self._hs = [int(hs[0]), int(hs[1])]
         else:
             self._hs = [120, 100]
-        # True only while _apply_bright_full_signal has the full group on (green). Used so PIR-off does not
-        # turn_off(light.island_lights) when dark-solo left the group off and FamilyRoomLights just turned it on.
-        self._dishwasher_full_island_active = False
+        # True only while the full group is on because _apply_bright_full_signal powered it up from off. The
+        # hand-back switches the group off again in that case only; a group that was already lit (family room
+        # lighting) is never turned off by this app.
+        self._island_powered_by_signal = False
         # presence_trust duration knob (minutes); None -> helper default.
         self._suspect_after_minutes = self.args.get("presence_suspect_after_minutes")
 
@@ -173,7 +182,7 @@ class DishwasherIslandSignal(hass.Hass):
             self.log(f"clear full island: {e}", level="DEBUG")
 
     def _release_dark_solo_manual_control(self):
-        """Drop SG manual hold on bulb1 without powering lights (used when PIR clears)."""
+        """Drop SG manual hold on bulb1 without powering lights."""
         try:
             self.call_service(
                 "adaptive_lighting/set_manual_control",
@@ -184,19 +193,12 @@ class DishwasherIslandSignal(hass.Hass):
         except Exception as e:
             self.log(f"release dark solo manual: {e}", level="DEBUG")
 
-    def _clear_dark_solo_signal(self):
-        """Release dark-solo manual control and hand bulb1 back to SG AL (leaving Unemptied only)."""
-        try:
-            self._release_dark_solo_manual_control()
-            if self.get_state(self._signal_light) == "on":
-                self.call_service(
-                    "adaptive_lighting/apply",
-                    entity_id=self._al_sg,
-                    lights=[self._signal_light],
-                    turn_on_lights=True,
-                )
-        except Exception as e:
-            self.log(f"clear dark solo: {e}", level="DEBUG")
+    def _island_lit(self):
+        """True when the full group, the SG group or bulb1 reads on."""
+        for ent in (self._full_island, self._island_sg_light, self._signal_light):
+            if ent and self.get_state(ent) == "on":
+                return True
+        return False
 
     def _all_signal_lights_off(self):
         """Turn off every light this app uses for the dishwasher signal."""
@@ -240,17 +242,23 @@ class DishwasherIslandSignal(hass.Hass):
             return
         try:
             # If the full group is already on (e.g. family room lighting), only recolor - do not power-cycle.
+            # Read before anything below changes the island: only a group powered up from off is ours to switch off.
+            was_off = self.get_state(self._full_island) != "on"
             self._prep_from_dark_solo_for_bright_green()
             self._both_al_off()
             self.turn_on(self._full_island, **self._signal_light_turn_on_kwargs())
-            self._dishwasher_full_island_active = True
+            if was_off:
+                self._island_powered_by_signal = True
         except Exception as e:
             self.log(f"apply bright full signal failed: {e}", level="ERROR")
 
     def _dark_solo_layout_already_applied(self):
-        """Skip redundant reapplies when ``_sync_signal`` fires repeatedly while already in dark solo."""
+        """Skip redundant reapplies when ``_sync_signal`` fires repeatedly while already in dark solo.
+
+        Judged by the AL layout, not the full group: ``light.island_lights`` reads on whenever any member is lit.
+        """
         try:
-            if self.get_state(self._full_island) != "off":
+            if self.get_state(self._al_main) != "off" or self.get_state(self._al_sg) != "on":
                 return False
             if self.get_state(self._signal_light) != "on":
                 return False
@@ -264,9 +272,9 @@ class DishwasherIslandSignal(hass.Hass):
         if not self._is_unemptied() or not self._pir_on():
             return
         if self._dark_solo_layout_already_applied():
-            self._dishwasher_full_island_active = False
+            self._island_powered_by_signal = False
             return
-        self._dishwasher_full_island_active = False
+        self._island_powered_by_signal = False
         try:
             # Dark layout still requires the full group off; one turn_off when it was on is unavoidable.
             self._clear_full_island_if_on()
@@ -296,58 +304,62 @@ class DishwasherIslandSignal(hass.Hass):
         except Exception as e:
             self.log(f"apply dark solo signal failed: {e}", level="ERROR")
 
+    def _hand_back_island(self):
+        """End the signal: the island belongs to FamilyRoomLights again.
+
+        Never powers a light on. Only a full group this app powered up from off (bright path) is switched off
+        here; any other lit island bulb is recolored to normal by ``_restore_normal_layout`` and left to
+        FamilyRoomLights. Cheap and idempotent when no signal layout is applied.
+        """
+        try:
+            if self._island_powered_by_signal:
+                self._island_powered_by_signal = False
+                self.log("island hand-back: switching off the full group the signal powered up", level="INFO")
+                self._all_signal_lights_off()
+            self.run_in(self._restore_normal_layout, _HAND_BACK_SETTLE_S)
+        except Exception as e:
+            self.log(f"island hand-back failed: {e}", level="ERROR")
+
+    def _restore_normal_layout(self, _kwargs=None):
+        """Normal layout (AL main on, SG off, bulb1 manual control released), then recolor any lit island bulb.
+
+        No-op when the layout is already normal or the signal is showing again. Never powers a light on:
+        ``turn_on_lights=False`` makes AL skip bulbs HA reports as off.
+        """
+        try:
+            if self._is_unemptied() and self._pir_on():
+                return
+            if self._al_is_normal_not_unemptied():
+                return
+            self._release_dark_solo_manual_control()
+            self._clear_manual_main_signal_bulb()
+            self._set_al_not_unemptied()
+            recolor = self._island_lit()
+            if recolor:
+                self.call_service(
+                    "adaptive_lighting/apply",
+                    entity_id=self._al_main,
+                    lights=[self._full_island],
+                    turn_on_lights=False,
+                )
+            self.log(f"island hand-back: normal AL layout restored (recolor lit island: {recolor})", level="INFO")
+        except Exception as e:
+            self.log(f"restore normal layout failed: {e}", level="ERROR")
+
     def _sync_signal(self, leaving_unemptied=False):
         if not self._is_unemptied():
             if leaving_unemptied:
-                was_bright_full_signal = self._dishwasher_full_island_active
-                self._dishwasher_full_island_active = False
-                if was_bright_full_signal or self._is_family_room_bright():
-                    # Emptied while bright: signal job done, island ends OFF. The
-                    # turn_on_lights applies below must not run here - right after
-                    # turn_off(full group) get_state(bulb1) still reads "on" for a
-                    # beat, and the hand-back re-lights the island white in a room
-                    # that wants no light (2026-07-24 19:10: on for ~6 min after
-                    # the door opened).
-                    self._release_dark_solo_manual_control()
-                    self._clear_manual_main_signal_bulb()
-                    self._all_signal_lights_off()
-                    self._set_al_not_unemptied()
-                    return
-                self._clear_full_island_if_on()
-                self._clear_dark_solo_signal()
-                self._clear_manual_main_signal_bulb()
-                if self._island_sg_light:
-                    try:
-                        if self.get_state(self._island_sg_light) == "on":
-                            self.turn_off(self._island_sg_light)
-                    except Exception as e:
-                        self.log(f"leave unemptied: off SG light: {e}", level="DEBUG")
-                self._set_al_not_unemptied()
-                try:
-                    if self.get_state(self._signal_light) == "on":
-                        self.call_service(
-                            "adaptive_lighting/apply",
-                            entity_id=self._al_main,
-                            lights=[self._signal_light],
-                            turn_on_lights=True,
-                        )
-                except Exception as e:
-                    self.log(f"apply main after leave unemptied: {e}", level="DEBUG")
+                self._hand_back_island()
             return
 
         if not self._pir_on():
-            if self._dishwasher_full_island_active:
-                self._clear_full_island_if_on()
-            self._dishwasher_full_island_active = False
-            self._release_dark_solo_manual_control()
-            self._all_signal_lights_off()
-            self._both_al_off()
+            self._hand_back_island()
             return
 
         if self._kitchen_presence_suspect():
             # Asymmetric trust: ghost presence must not light the signal (no apply);
             # an already-applied signal is held as-is - suspect still counts as
-            # presence, so only the real clear paths above may turn things off.
+            # presence, so only the real end paths above may hand the island back.
             self.log(
                 "kitchen presence SUSPECT (mmWave-only + speaker playing) - holding island signal state",
                 level="DEBUG",
