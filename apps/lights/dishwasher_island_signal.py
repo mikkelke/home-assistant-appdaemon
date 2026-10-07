@@ -4,7 +4,8 @@ layout (AL main on, AL SG off, island light 1 manual control released). This app
 uses ``island_lights_sg`` + ``island_light_1`` for the signal.
 
 - **Bright** (family room confirmed bright): full ``light.island_lights`` green, both AL switches off.
-- **Dark**: ``light.island_lights`` off; ``light.island_lights_sg`` on (normal AL) + ``light.island_light_1`` green (manual).
+- **Dark**: main AL off; ``light.island_lights_sg`` on (SG AL) + ``light.island_light_1`` green (manual). A lit island is never
+  switched off to get there.
 
 Prefer **in-place color/power** via ``turn_on`` (brightness + ``hs_color``) when lights are already on - avoid ``turn_off``/``turn_on`` churn when switching dishwasher *mode* or when the island was already lit by family room lighting. Hue/ZHA often map ``rgb_color`` to ``color_temp`` in HA state while the lamp still looks chromatic; ``hs_color`` keeps entity state aligned with what you see.
 
@@ -276,8 +277,7 @@ class DishwasherIslandSignal(hass.Hass):
             return
         self._island_powered_by_signal = False
         try:
-            # Dark layout still requires the full group off; one turn_off when it was on is unavoidable.
-            self._clear_full_island_if_on()
+            # A lit island stays lit: SG AL takes bulbs 2-5 over from main AL and bulb1 is recolored in place.
             if self.get_state(self._al_main) == "on":
                 self.turn_off(self._al_main)
             if self.get_state(self._al_sg) != "on":

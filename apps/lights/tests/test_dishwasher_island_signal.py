@@ -198,6 +198,12 @@ class SignalOwnership(unittest.TestCase):
         app._sync_signal()
         assert_untouched(app)
 
+    def test_entering_dark_solo_never_switches_a_lit_island_off(self):
+        app = make_app(states_for(pir="on", full="on", bulb1="on", sg="on"))
+        app._sync_signal()
+        self.assertEqual(turned_off(app), [AL_MAIN])
+        self.assertIn(BULB1, turned_on(app))
+
     def test_dark_solo_from_the_bright_layout_is_applied(self):
         app = make_app(states_for(pir="on", full="on", bulb1="on", sg="on", al_main="off", al_sg="off"))
         app._sync_signal()
