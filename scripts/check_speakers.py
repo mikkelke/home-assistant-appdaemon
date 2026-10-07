@@ -11,6 +11,7 @@ Checked:
   - state_reset.yaml   speaker list + per-speaker default volumes
   - follow_me.yaml     player list (registry MA entities; extra zones allowed)
   - group_manager.yaml player list
+  - family_room_volume_sync.yaml speakers (registry MA ids with <id>_2 twins) + tv_speaker
   - audiocast_manager.yaml raw_to_base_map pairs + line-in RINCON
   - music_attribution.yaml raw_to_base_map pairs
   - dashboard (optional, if repo present): speakers.ts ids, audiocast.ts RINCON
@@ -76,6 +77,16 @@ def main():
         for p in players:
             check(p in ma or p == "media_player.rooftop",
                   f"{fname}: player {p} not in registry")
+
+    fv_fname = "apps/sonos/family_room_volume_sync.yaml"
+    fv = next(iter(load(fv_fname).values()))
+    fv_speakers = fv.get("speakers") or []
+    for s in fv_speakers:
+        check(s in ma, f"{fv_fname}: speaker {s} is not a registry Music Assistant entity")
+        check(pairs.get(f"{s}_2") == s,
+              f"{fv_fname}: speaker {s} has no registry native twin {s}_2")
+    check(fv.get("tv_speaker") in fv_speakers,
+          f"{fv_fname}: tv_speaker {fv.get('tv_speaker')} not in speakers")
 
     ac = next(iter(load("apps/sonos/audiocast_manager.yaml").values()))
     ac_map = ac.get("raw_to_base_map") or {}

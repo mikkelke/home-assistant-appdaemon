@@ -1,0 +1,22 @@
+# /conf/apps/sonos/family_room_volume_sync.yaml
+#
+# Relative volume sync for the family-room Sonos speakers: when one speaker of a group of
+# 2+ family speakers is turned up or down, the other playing members move by the same step.
+# See family_room_volume_sync.py class docstring.
+
+FamilyRoomVolumeSync:
+  module: family_room_volume_sync
+  class: FamilyRoomVolumeSync
+  log: sonos_log
+
+  speakers:
+    - media_player.rooftop
+    - media_player.living_room
+    - media_player.kitchen
+    - media_player.dining_room
+  tv_speaker: media_player.living_room
+  party_mode_entity: input_boolean.family_volume_sync_party
+  settle_seconds: 0.8
+  max_window_seconds: 5
+  echo_window_seconds: 2
+  party_mode_max_hours: 12
