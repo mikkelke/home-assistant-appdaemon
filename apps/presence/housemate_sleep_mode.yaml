@@ -27,7 +27,7 @@ HousemateSleepMode:
   night_window_end: "10:00"
   quiet_minutes: 10
   unplug_minutes: 5
-  leave_grace_minutes: 10
+  leave_grace_minutes: 5
   tick_seconds: 60
 
   people:
@@ -37,7 +37,6 @@ HousemateSleepMode:
       pir_entity: binary_sensor.kristines_room_active
       sleep_entity: input_boolean.kristine_sleep_mode
       helper_name: "Kristine sleep mode"
-      leave_grace_minutes: 10
     - name: claudia
       person_entity: person.claudia
       battery_entity: sensor.claudias_iphone_battery_state
