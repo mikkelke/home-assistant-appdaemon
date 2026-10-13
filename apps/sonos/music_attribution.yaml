@@ -1,0 +1,46 @@
+# /conf/apps/sonos/music_attribution.yaml
+# One house-feed row per music session on the Sonos speakers, naming who started it
+# (a resident, "A guest" or "Someone"). See music_attribution.py for the session rule
+# and how each source is resolved.
+
+MusicAttribution:
+  module: music_attribution
+  class: MusicAttribution
+  log: sonos_log
+
+  # Raw HA Sonos entities (state, group_members, media_content_id) -> Music Assistant twins.
+  # Service calls may target either. scripts/check_speakers.py checks this against speakers.yaml.
+  raw_to_base_map:
+    media_player.bathroom_2: media_player.bathroom
+    media_player.bedroom_2: media_player.bedroom
+    media_player.claudias_room_2: media_player.claudias_room
+    media_player.dining_room_2: media_player.dining_room
+    media_player.kitchen_2: media_player.kitchen
+    media_player.living_room_2: media_player.living_room
+    media_player.guest_bathroom_2: media_player.guest_bathroom
+    media_player.kristines_room_2: media_player.kristines_room
+    media_player.rooftop_2: media_player.rooftop
+
+  # Person display names a service call or Spotify account may name in the feed.
+  # Any other HA account reads "Someone".
+  residents: [Mikkel, Kristine, Claudia]
+
+  # HA accounts that are the house itself: the apps behind them report their own actions,
+  # so music they start gets no row.
+  house_user_ids:
+    - f4fda494358943beaf8ad2c70db099f8  # AppDaemon
+    - c297749bf4144544aac66cd639818964  # NodeRed
+
+  # Resident -> media_player of their own Spotify integration config entry. Spotify Connect
+  # starts read "Someone" while this is empty, and "A guest" needs every resident listed.
+  spotify_accounts:
+    # Mikkel: media_player.spotify_mikkel
+    # Kristine: media_player.spotify_kristine
+    # Claudia: media_player.spotify_claudia
+
+  # Same idle time as SonosStateReset's inactivity_seconds.
+  session_idle_minutes: 20
+  settle_seconds: 5
+  call_window_seconds: 30
+  spotify_wait_seconds: 60
+  spotify_poll_seconds: 5
