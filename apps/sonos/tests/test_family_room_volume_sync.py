@@ -528,7 +528,7 @@ class ProductionRegressions(unittest.TestCase):
         self.assertEqual(r.written(), {twin(ROOFTOP): 0.28, twin(LIVING): 0.29, twin(KITCHEN): 0.28})
         r.advance(0.5)
         for m in (LIVING, DINING, ROOFTOP, KITCHEN):
-            r.move(m, round(r.vol(m) - 0.05, 2), user_id=MIKKEL_ID)
+            r.move(m, round(r.vol(m) - 0.03, 2), user_id=MIKKEL_ID)
             r.advance(0.01)
         r.advance(10)
         self.assertEqual(len(r.write_log), 3)
@@ -536,7 +536,7 @@ class ProductionRegressions(unittest.TestCase):
         self.assertEqual(len(r.logs(contains="family_volume_sync_together")), 1)
         self.assertEqual(r.logs(contains="family_volume_sync_skip"), [])
         self.assertEqual(
-            (r.vol(ROOFTOP), r.vol(LIVING), r.vol(KITCHEN), r.vol(DINING)), (0.23, 0.24, 0.23, 0.19)
+            (r.vol(ROOFTOP), r.vol(LIVING), r.vol(KITCHEN), r.vol(DINING)), (0.25, 0.26, 0.25, 0.21)
         )
 
     def test_group_step_half_a_second_after_a_sync_is_not_undone_when_the_dashboard_steps_from_stale_levels(self):
@@ -562,18 +562,18 @@ class StepperBursts(unittest.TestCase):
     def test_burst_with_equal_deltas_writes_nothing(self):
         r = Rig()
         for m in FAMILY:
-            r.move(m, round(r.vol(m) + 0.05, 2))
+            r.move(m, round(r.vol(m) + 0.03, 2))
             r.advance(0.1)
         r.advance(3)
         self.assertEqual(r.write_log, [])
         lines = r.logs(contains="family_volume_sync_together")
         self.assertEqual(len(lines), 1)
-        self.assertIn("+0.05", lines[0])
+        self.assertIn("+0.03", lines[0])
         self.assertIn("nothing to follow", lines[0])
 
-    def test_burst_with_mixed_four_and_five_percent_steps_writes_nothing(self):
+    def test_burst_with_mixed_two_and_three_percent_steps_writes_nothing(self):
         r = Rig()
-        steps = {ROOFTOP: 0.04, LIVING: 0.05, KITCHEN: 0.05, DINING: 0.04}
+        steps = {ROOFTOP: 0.02, LIVING: 0.03, KITCHEN: 0.03, DINING: 0.02}
         for m in FAMILY:
             r.move(m, round(r.vol(m) + steps[m], 2))
             r.advance(0.1)
@@ -583,11 +583,11 @@ class StepperBursts(unittest.TestCase):
     def test_straddled_burst_writes_the_late_speaker_exactly_once(self):
         r = Rig()
         for m in (KITCHEN, DINING, ROOFTOP):
-            r.move(m, round(r.vol(m) + 0.05, 2))
+            r.move(m, round(r.vol(m) + 0.03, 2))
             r.advance(0.1)
         r.advance(0.75)
-        self.assertEqual(r.written(), {twin(LIVING): 0.25})
-        r.move(LIVING, 0.25)
+        self.assertEqual(r.written(), {twin(LIVING): 0.23})
+        r.move(LIVING, 0.23)
         r.advance(5)
         self.assertEqual(len(r.write_log), 1)
 
@@ -613,12 +613,12 @@ class SpeakerLiftedFromZero(unittest.TestCase):
     """A group step lifts a speaker at 0 to the first step while the others step as well. That
     speaker is active by the time the window closes, but it already took part in the move."""
 
-    STEPS = {ROOFTOP: 0.23, LIVING: 0.25, DINING: 0.23}
+    STEPS = {ROOFTOP: 0.21, LIVING: 0.23, DINING: 0.21}
 
     def group_step(self, kitchen_position):
         r = Rig({KITCHEN: 0.0})
         steps = list(self.STEPS.items())
-        steps.insert(kitchen_position, (KITCHEN, 0.05))
+        steps.insert(kitchen_position, (KITCHEN, 0.03))
         for m, volume in steps:
             r.move(m, volume)
             r.advance(0.1)
