@@ -4,13 +4,18 @@ Yale lock health - arbitrates the two HA twins of ONE physical lock and publishe
 
 The lock is exposed twice: ``lock.yale_bt`` (yalexs_ble, local Bluetooth, push) and
 ``lock.yale`` (the Yale cloud integration, reached over a Wi-Fi bridge that can itself
-go dark - ``binary_sensor.yale_bridge`` pings it, ``switch.extender`` is the Z-Wave plug
+go dark - ``binary_sensor.yale_bridge`` pings it, ``bridge_plug`` (optional) is the switch
 that powers it, ``button.yale_wake`` makes the bridge wake the lock and refresh). Either
 twin can silently miss a push and stick on a stale state: the cloud twin sat "unlocked"
 for 1.5 h on 2026-07-12 while the door was actually locked, and the BLE twin did the
 exact same thing in reverse on 2026-07-22 (stuck "unlocked" 1.5 h while the cloud twin
 correctly saw the auto-lock). Normal operation: the twins agree within ~2-5 s, and the
 lock auto-locks ~3 min after unlock (the cloud twin's ``changed_by`` reads "Auto Lock").
+
+Without a ``bridge_plug`` the heal ladder's power-cycle rung has nothing to act on: it
+gives up and notifies at that point instead, and no plug is ever touched.
+``plug_power_entity`` (the plug's power meter) is an optional extra witness that a
+power-cycle really happened.
 
 The cloud twin is PUSH-ONLY: its ``last_updated`` does not advance between real events,
 so "how old is last_updated" is not a valid staleness signal by itself - the arbitration
@@ -34,7 +39,7 @@ the request body is built. Booleans that legitimately go False often (``diverged
 real bool, and ``stale_side``/``heal_stage`` are always non-empty strings rather than
 None so they never silently vanish from the entity either.
 
-Safety invariant: the bridge's power plug must NEVER be left off. The power-cycle
+Safety invariant: a configured bridge power plug must NEVER be left off. The power-cycle
 routine always re-asserts ``switch/turn_on`` a safety-check interval after cycling and
 logs ERROR (never just retries silently) if the plug still isn't on by then.
 """
@@ -50,7 +55,7 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 # ---------------------------------------------------------------------------
 # Pure module-level constants + functions - unit-testable without an AppDaemon
 # runtime (see tests/test_lock_health.py). None of these are yaml-configurable;
-# the yaml args list in lock_health.yaml is the exhaustive set of user-facing knobs.
+# the args read in LockHealth.initialize() are the exhaustive set of user-facing knobs.
 # ---------------------------------------------------------------------------
 
 VALID_LOCK_STATES = frozenset({"locked", "unlocked", "locking", "unlocking", "jammed"})
@@ -257,7 +262,7 @@ class LockHealth(hass.Hass):
         self.lock_bt = a("lock_bt", "lock.yale_bt")
         self.lock_cloud = a("lock_cloud", "lock.yale")
         self.bridge_ping = a("bridge_ping", "binary_sensor.yale_bridge")
-        self.bridge_plug = a("bridge_plug", "switch.extender")
+        self.bridge_plug = a("bridge_plug")
         self.wake_button = a("wake_button", "button.yale_wake")
         self.door = a("door_open_entity", "binary_sensor.apartment_door_open")
         self.publish_entity = a("publish_entity", "sensor.apartment_lock")
@@ -269,7 +274,7 @@ class LockHealth(hass.Hass):
         # 07-24..07-27, post-move, WITHOUT any power-cycling) - the trigger must sit
         # well clear of that so routine blips never earn a cycle.
         self.bridge_down_heal_seconds = float(a("bridge_down_heal_seconds", 150))
-        self.plug_power_entity = a("plug_power_entity", "sensor.extender_electric_consumption_w")
+        self.plug_power_entity = a("plug_power_entity")
         self.plug_power_floor_w = float(a("plug_power_floor_w", 0.5))
         self.settle_guard_seconds = float(a("settle_guard_seconds", 45))
         self.startup_grace_seconds = float(a("startup_grace_seconds", 150))
@@ -344,6 +349,13 @@ class LockHealth(hass.Hass):
     # startup grace, no divergence/invalid latches): a plug left off across a restart is
     # a standing safety problem to fix immediately, not a heal-worthy "issue" to arbitrate.
     def _restore_plug_if_interrupted(self):
+        if not self.bridge_plug:
+            if self._plug_off_at is not None:
+                self._plug_off_at = None
+                self._save_state()
+                self.log("LockHealth: plug-off marker cleared at startup - no bridge plug configured",
+                         level="INFO")
+            return
         plug_state = self.get_state(self.bridge_plug)
         decision = plug_restore_decision(self._plug_off_at, plug_state)
         if decision == "none":
@@ -370,6 +382,8 @@ class LockHealth(hass.Hass):
                  "verifying in 60s", level="WARNING")
 
     def _plug_restore_confirm(self, kwargs):
+        if not self.bridge_plug:
+            return
         if self.get_state(self.bridge_plug) == "on":
             self._plug_off_at = None
             self._save_state()
@@ -528,6 +542,8 @@ class LockHealth(hass.Hass):
             self._last_bridge_down_at = now
         else:
             self._bridge_down_since = None
+        if not self.bridge_plug:
+            return
         plug_state = await self._state(self.bridge_plug)
         if plug_state not in (None, "unknown", "unavailable"):
             self._notified["plug_unavailable"] = False
@@ -811,6 +827,11 @@ class LockHealth(hass.Hass):
         if not self._guards_ok(now):
             self._abort_ladder(issue, "guard blocked power-cycle")
             return
+        if not self.bridge_plug:
+            self.log(f"LockHealth[{issue}]: no bridge plug configured - nothing to power-cycle, giving up",
+                     level="INFO")
+            self._gave_up(issue)
+            return
         # No _can_heal_act here either (see _reload_rung) - the plug has its own
         # 15-min cooldown + rolling cap via can_act below, which also paces this
         # rung when it is a ladder's FIRST action (bridge-down / bridge-off shortcut).
@@ -828,7 +849,7 @@ class LockHealth(hass.Hass):
         # Snapshot the witnesses BEFORE toggling: the plug's own switch state and its
         # power meter. Both are compared after the cycle by _plug_cycle_verify.
         pre_switch_lc = self.get_state(self.bridge_plug, attribute="last_changed")
-        pre_meter_lu = self.get_state(self.plug_power_entity, attribute="last_updated")
+        pre_meter_lu = self._meter_state(attribute="last_updated")
         # Persist the off-marker BEFORE cutting power: if AD restarts/crashes with the
         # plug off, initialize()'s _restore_plug_if_interrupted must be able to see we
         # left it off (see the module docstring's plug-off safety invariant).
@@ -881,9 +902,8 @@ class LockHealth(hass.Hass):
         meter is only damning when the switch entity ALSO never moved."""
         try:
             switch_moved = self.get_state(self.bridge_plug, attribute="last_changed") != kwargs.get("pre_switch_lc")
-            meter_reported = (self.get_state(self.plug_power_entity, attribute="last_updated")
-                              != kwargs.get("pre_meter_lu"))
-            watts = self._as_float(self.get_state(self.plug_power_entity))
+            meter_reported = self._meter_state(attribute="last_updated") != kwargs.get("pre_meter_lu")
+            watts = self._as_float(self._meter_state())
             if meter_reported and watts is not None and watts >= self.plug_power_floor_w:
                 self._notified["plug_unresponsive"] = False
                 self._notified["plug_no_load"] = False
@@ -910,6 +930,13 @@ class LockHealth(hass.Hass):
             self._save_state()
         except Exception as e:
             self.log(f"plug cycle verify failed: {e}", level="DEBUG")
+
+    def _meter_state(self, attribute=None):
+        # No meter configured -> reads as silent, leaving the plug switch's own
+        # last_changed as the only witness in _plug_cycle_verify.
+        if not self.plug_power_entity:
+            return None
+        return self.get_state(self.plug_power_entity, attribute=attribute)
 
     @staticmethod
     def _as_float(raw):
@@ -961,10 +988,12 @@ class LockHealth(hass.Hass):
             message = (f"Bluetooth side of the Yale lock is stuck and reloads didn't help - if this "
                        f"persists the HA box's Bluetooth adapter may be wedged. Trust '{trusted}'.")
         elif issue == "cloud":
-            message = (f"Cloud side of the Yale lock is stuck and reload/power-cycle didn't help. "
+            tried = "reload/power-cycle" if self.bridge_plug else "reload"
+            message = (f"Cloud side of the Yale lock is stuck and {tried} didn't help. "
                        f"Trust '{trusted}'.")
         else:
-            message = "Yale bridge is still unreachable after a power-cycle."
+            after = " after a power-cycle" if self.bridge_plug else ""
+            message = f"Yale bridge is still unreachable{after}."
         self._heal_stage = "gave_up"
         self._active_ladder = None
         self._ladder_handle = None

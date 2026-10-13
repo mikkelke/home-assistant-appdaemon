@@ -1,6 +1,7 @@
 # tests/test_lock_health.py - unit tests for LockHealth's pure functions
-# (classify_transition, arbitrate, can_act) plus the startup plug-restore path,
-# which is exercised on a LockHealth built with __new__ + fake AD callables.
+# (classify_transition, arbitrate, can_act) plus the startup plug-restore path and the
+# optional-bridge-plug paths, which are exercised on a LockHealth built with __new__ +
+# fake AD callables.
 # Run from repo root: python3 -m unittest discover -s apps/security/tests -q
 # Imports the real module by stubbing the appdaemon package (not installed locally),
 # so the code under test is the deployed code, not a duplicate.
@@ -298,39 +299,71 @@ class PlugRestoreDecisionTests(unittest.TestCase):
 
 
 def make_app(plug_off_at=NOW - timedelta(minutes=5), plug_state="off", bridge_down_notified=True,
-             bridge_down_since=NOW - timedelta(minutes=20)):
+             bridge_down_since=NOW - timedelta(minutes=20), bridge_plug="switch.extender",
+             plug_power_entity=None):
     """LockHealth with fake AD callables, without running initialize(). The startup
     plug restore runs synchronously from initialize() before any listener, so calling
     _restore_plug_if_interrupted() directly reproduces it exactly. Instance fields are
     seeded the way _load_state leaves them (notified latches restored from JSON,
-    heal_stage derived from them, clear_since deliberately never restored)."""
+    heal_stage derived from them, clear_since deliberately never restored). The plug
+    entity switch.extender always exists in the fake HA (reading plug_state); whether
+    the app is CONFIGURED with it is the bridge_plug argument. `queried` records every
+    entity get_state was asked for."""
     app = lh.LockHealth.__new__(lh.LockHealth)
-    app.bridge_plug = "switch.extender"
+    app.bridge_plug = bridge_plug
+    app.plug_power_entity = plug_power_entity
+    app.bridge_ping = "binary_sensor.yale_bridge"
+    app.door = "binary_sensor.apartment_door_open"
+    app.lock_bt = "lock.yale_bt"
+    app.lock_cloud = "lock.yale"
     app.bridge_down_heal_seconds = 90.0
     app.recovery_debounce_minutes = 2.0
+    app.settle_guard_seconds = 45.0
+    app.startup_grace_seconds = 150.0
+    app.plug_power_floor_w = 0.5
+    app.plug_cycle_cooldown_minutes = 15.0
+    app.plug_cycle_max_per_2h = 3
 
     app._plug_off_at = plug_off_at
     app._bridge_down_since = bridge_down_since
+    app._last_bridge_down_at = None
     app._last_power_cycle_at = None
+    app._last_action_at = None
+    app._plug_cycle_history = []
+    app._startup_at = NOW - timedelta(hours=1)
+    app._last_state = "locked"
     app._currently_diverged = False
     app._invalid_since = {"ble": None, "cloud": None}
     app._active_ladder = None
+    app._ladder_handle = None
+    app._ladder_key = None
+    app._ladder_cause = None
     app._clear_since = {"divergence": None, "ble_invalid": None, "cloud_invalid": None, "bridge_down": None}
     app._notified = {"divergence": False, "ble_invalid": False, "cloud_invalid": False,
                      "bridge_down": bridge_down_notified, "flapping_ble": False, "flapping_cloud": False,
                      "plug_unavailable": False, "plug_unresponsive": False, "plug_no_load": False}
     app._heal_stage = "gave_up" if bridge_down_notified else "idle"
 
-    app.states = {app.bridge_plug: plug_state}
+    app.states = {"switch.extender": plug_state}
+    app.queried = []
     app.service_calls = []
     app.scheduled = []
     app.notifications = []
     app.saves = []
 
     app.log = lambda *a, **kw: None
-    app.get_state = lambda entity, **kw: app.states.get(entity)
+    app.get_now = lambda: NOW
     app.call_service = lambda service, **kw: app.service_calls.append((service, kw))
+    app.fire_event = lambda *a, **kw: None
+    app.create_task = asyncio.run
     app._save_state = lambda: app.saves.append(True)
+
+    def get_state(entity, **kw):
+        app.queried.append(entity)
+        return app.states.get(entity)
+
+    async def state(entity):
+        return get_state(entity)
 
     def run_in(cb, delay, **kw):
         app.scheduled.append((cb, delay, kw))
@@ -339,6 +372,8 @@ def make_app(plug_off_at=NOW - timedelta(minutes=5), plug_state="off", bridge_do
     async def notify(message):
         app.notifications.append(message)
 
+    app.get_state = get_state
+    app._state = state
     app.run_in = run_in
     app._notify = notify
     return app
@@ -433,6 +468,83 @@ class AllClearAfterRestoreTests(unittest.TestCase):
         asyncio.run(app._check_all_clear(NOW))
         asyncio.run(app._check_all_clear(NOW + timedelta(minutes=2)))
         self.assertEqual(app.notifications, [])
+
+
+class NoBridgePlugTests(unittest.TestCase):
+    """bridge_plug is optional: without one the app never touches a plug, and the
+    ladder's power-cycle rung has nothing left to do but give up. switch.extender
+    still exists in the fake HA (reading "off"), so any stray use of it would show."""
+
+    def test_power_cycle_rung_gives_up_without_any_switch_call(self):
+        app = make_app(bridge_plug=None, plug_off_at=None, bridge_down_notified=False)
+        app._active_ladder = "bridge"
+        app._ladder_key = "bridge_down"
+        app._power_cycle_rung("bridge")
+        self.assertEqual(app.service_calls, [])
+        self.assertEqual(app.scheduled, [])
+        self.assertEqual(app.notifications, ["Yale bridge is still unreachable."])
+        self.assertTrue(app._notified["bridge_down"])
+        self.assertFalse(app._notified["plug_unavailable"])  # no "plug unavailable" alert either
+        self.assertEqual(app._heal_stage, "gave_up")
+        self.assertIsNone(app._active_ladder)
+        self.assertEqual(app._plug_cycle_history, [])
+        self.assertNotIn(None, app.queried)
+
+    def test_startup_restore_is_a_noop_and_drops_a_stale_marker(self):
+        app = make_app(bridge_plug=None, plug_state="off")  # marker set, plug entity reads off
+        app._restore_plug_if_interrupted()
+        app._plug_restore_confirm({})
+        self.assertEqual(app.service_calls, [])
+        self.assertEqual(app.scheduled, [])
+        self.assertIsNone(app._plug_off_at)
+        self.assertEqual(app.queried, [])
+        self.assertTrue(app._notified["bridge_down"])  # latches stay exactly as loaded
+
+    def test_startup_restore_without_a_marker_saves_nothing(self):
+        app = make_app(bridge_plug=None, plug_off_at=None)
+        app._restore_plug_if_interrupted()
+        self.assertEqual(app.service_calls, [])
+        self.assertEqual(app.saves, [])
+
+    def test_track_bridge_never_reads_a_plug(self):
+        app = make_app(bridge_plug=None, plug_off_at=None, bridge_down_since=None)
+        app.states["binary_sensor.yale_bridge"] = "off"
+        asyncio.run(app._track_bridge(NOW))
+        self.assertEqual(app._bridge_down_since, NOW)
+        self.assertEqual(app.queried, ["binary_sensor.yale_bridge"])
+
+    def test_gave_up_only_claims_a_power_cycle_when_there_is_a_plug(self):
+        cases = (
+            (None, "cloud", "cloud_invalid",
+             "Cloud side of the Yale lock is stuck and reload didn't help. Trust 'locked'."),
+            (None, "bridge", "bridge_down", "Yale bridge is still unreachable."),
+            ("switch.extender", "cloud", "cloud_invalid",
+             "Cloud side of the Yale lock is stuck and reload/power-cycle didn't help. Trust 'locked'."),
+            ("switch.extender", "bridge", "bridge_down",
+             "Yale bridge is still unreachable after a power-cycle."),
+        )
+        for plug, issue, key, expected in cases:
+            with self.subTest(plug=plug, issue=issue):
+                app = make_app(bridge_plug=plug, plug_off_at=None, bridge_down_notified=False)
+                app._ladder_key = key
+                app._gave_up(issue)
+                self.assertEqual(app.notifications, [expected])
+
+
+class PlugWithoutMeterTests(unittest.TestCase):
+    """plug_power_entity is optional too: a plug without a meter still power-cycles,
+    and no meter read may ever go out as get_state(None)."""
+
+    def test_power_cycle_and_verify_work_without_a_meter_entity(self):
+        app = make_app(plug_off_at=None, plug_state="on", bridge_down_notified=False)
+        app._active_ladder = "bridge"
+        app._ladder_key = "bridge_down"
+        app._power_cycle_rung("bridge")
+        self.assertEqual(app.service_calls, [("switch/turn_off", {"entity_id": "switch.extender"})])
+        self.assertEqual([delay for _cb, delay, _kw in app.scheduled],
+                         [lh.PLUG_OFF_WAIT_S, lh.PLUG_VERIFY_WAIT_S, lh.POWER_CYCLE_WAIT_S])
+        app._plug_cycle_verify({"pre_switch_lc": None, "pre_meter_lu": None})
+        self.assertNotIn(None, app.queried)
 
 
 if __name__ == "__main__":
