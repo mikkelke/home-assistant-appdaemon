@@ -332,6 +332,7 @@ class MissedCallTests(unittest.TestCase):
         push = self.app.pushes[0]
         self.assertEqual(push["target"], "home")
         self.assertEqual(push["data"], {"data": {"image": "/api/image_proxy/image.abb_screenshot?token=abc"}})
+        self.assertEqual(push["link"], f"/dashboard-rooftop/home#now=ring-{int(self.clock.at.timestamp())}")
         self.assertIn("back door", push["message"])
         self.assertEqual(len(self.app.created_tasks), 1)
         # and the house feed heard about it
@@ -1626,6 +1627,17 @@ class RealNotifierPayloadTests(unittest.TestCase):
             "title": "Intercom auto-opened",
             "message": "Someone rang.",
             "data": {"tag": "abb_autoopen_front", "image": "/api/image_proxy/image.abb?token=t"},
+        })])
+
+    def test_missed_ring_push_carries_photo_and_timeline_link(self):
+        self.app.states[(self.app.abb_image_entity, "entity_picture")] = "/api/image_proxy/image.abb?token=t"
+        self.clock.at += timedelta(seconds=16)
+        self.app._send_missed_push("back door", "100000001", self.clock.at - timedelta(seconds=16))
+        link = f"/dashboard-rooftop/home#now=ring-{int(self.clock.at.timestamp())}"
+        self.assertEqual(self.sent, [(self.PHONE, {
+            "title": "Missed doorbell ring",
+            "message": "Someone rang the back door and nobody answered.",
+            "data": {"image": "/api/image_proxy/image.abb?token=t", "url": link, "clickAction": link},
         })])
 
 

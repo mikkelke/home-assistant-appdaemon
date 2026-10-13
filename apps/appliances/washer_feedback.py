@@ -6,7 +6,7 @@ cycle, and the rolling per-programme averages and power-signature centroids
 derived from the learnable subset. Everything in this module is pure - record
 building, the duplicate-save guard, the aggregation that turns records into
 learned durations and centroids, incremental add/remove of a single sample, the
-idempotent record migration, and the confirm-push action codec.
+idempotent record migration, and the confirm-push action codec and deep link.
 
 washer_monitor.py keeps all the file I/O, the logging, the push dispatch, and
 the `self` state these functions read and write.
@@ -17,6 +17,8 @@ existing `import climate_model as cm` precedent in apps/climate/.
 Note on JSON nulls: a plain null for an unknown actor is fine in this file. The
 AppDaemon 4.5.13 None-dropping bug only applies to HA entity attributes.
 """
+
+from datetime import datetime
 
 import washer_classify as wcls
 import washer_profiles as wp
@@ -319,3 +321,14 @@ def parse_confirm_action(action: str):
     if not ts or not prog:
         return None
     return (ts, prog, None if temp == "-" else temp)
+
+
+def confirm_push_link(ts):
+    """Dashboard deep link for the confirm push of the record stamped `ts` (ISO with
+    offset): the timeline at that cycle, as #now=washer-<epoch seconds>. None when ts
+    does not parse."""
+    try:
+        epoch_s = int(datetime.fromisoformat(ts).timestamp())
+    except (TypeError, ValueError):
+        return None
+    return f"/dashboard-rooftop/home#now=washer-{epoch_s}"

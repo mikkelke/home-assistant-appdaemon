@@ -284,6 +284,7 @@ class Fix3AnnounceFreshness(unittest.TestCase):
         self.assertEqual(app.sonos_calls, [])
         self.assertEqual(len(app.mobile_calls), 1)
         self.assertIn("20 min ago", app.mobile_calls[0]["message"])
+        self.assertEqual(app.mobile_calls[0]["link"], f"/dashboard-rooftop/home#now=washer-{int(NOW.timestamp())}")
         self.assertTrue(app.notification_sent)
 
 

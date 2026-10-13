@@ -1262,7 +1262,8 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             elif gate == "late-push":
                 self._push_mobile(
                     f"Dishwasher finished about {latency_min:.0f} min ago (late detection) - "
-                    f"ready to empty."
+                    f"ready to empty.",
+                    link=f"/dashboard-rooftop/home#now=dish-{int(self._now_utc().timestamp())}",
                 )
                 self.notification_sent = True
             return
@@ -3121,14 +3122,14 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             error_key="power_sensor",
         )
 
-    def _push_mobile(self, message):
+    def _push_mobile(self, message, link=None):
         """Page the phone (plug outage / recovery) - same pattern as gw2000a_watchdog."""
         try:
             notifier = self.get_app("MobileNotifier")
             if notifier is None:
                 self.log("MobileNotifier app not found - cannot push", level="WARNING")
                 return
-            self.create_task(notifier.notify(title="Dishwasher", message=message, target=self.notify_target))
+            self.create_task(notifier.notify(title="Dishwasher", message=message, target=self.notify_target, link=link))
         except Exception as e:
             self.log(f"notify failed: {e}", level="WARNING")
 

@@ -1998,6 +1998,7 @@ class AbbWelcomeBridge(hass.Hass):
                     message=message,
                     target=self.notify_target,
                     data=attachment,
+                    link=f"/dashboard-rooftop/home#now=ring-{int(self.get_now().timestamp())}",
                 ))
             except Exception as e:
                 self.log(f"Missed-call push failed: {e}", level="WARNING")

@@ -793,7 +793,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # category_audience and reach them even after they've left. Flag-gated so this is
         # revertible without a code change.
         self.confirm_push_target_actor = bool(self.args.get("confirm_push_target_actor", True))
-        self.confirm_push_dashboard_uri = self.args.get("confirm_push_dashboard_uri", "/local/ha-dashboard/index.html")
+        self.confirm_push_dashboard_uri = self.args.get("confirm_push_dashboard_uri", "/dashboard-rooftop/home#room=guest_bathroom")
 
         # Get Sonos Notifier App instance
         self.sonos_notifier = None
@@ -3415,7 +3415,8 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 if latency_min > freshness_min or force_push:
                     self._push_mobile(
                         f"Washer finished about {latency_min:.0f} min ago (late detection) - "
-                        f"ready to empty."
+                        f"ready to empty.",
+                        link=f"/dashboard-rooftop/home#now=washer-{int(self._now_utc().timestamp())}",
                     )
                     if latency_min > freshness_min:
                         self.log(
@@ -4218,14 +4219,14 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             f"a new wash will not be detected until it is back. Check the plug/WiFi."
         )
 
-    def _push_mobile(self, message):
+    def _push_mobile(self, message, link=None):
         """Page the phone (plug outage / recovery) - same pattern as gw2000a_watchdog."""
         try:
             notifier = self.get_app("MobileNotifier")
             if notifier is None:
                 self.log("MobileNotifier app not found - cannot push", level="WARNING")
                 return
-            self.create_task(notifier.notify(title="Washer", message=message, target=self.notify_target))
+            self.create_task(notifier.notify(title="Washer", message=message, target=self.notify_target, link=link))
         except Exception as e:
             self.log(f"notify failed: {e}", level="WARNING")
 
@@ -5158,6 +5159,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 target=target,
                 data={"data": {"actions": actions, "tag": "washer_confirm"}},
                 category="washer_confirm",
+                link=wfb.confirm_push_link(ts),
             ))
             self.log(f"Confirm push sent for cycle ts={ts} predicted={predicted} target={target}", level="INFO")
         except Exception as e:

@@ -18,6 +18,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 if "appdaemon.plugins.hass.hassapi" not in sys.modules:
@@ -510,7 +512,7 @@ def _make_confirm_push_app(confirm_push_target_actor=True, confirm_push_target="
     app = _base_app()
     app.confirm_push_target_actor = confirm_push_target_actor
     app.confirm_push_target = confirm_push_target
-    app.confirm_push_dashboard_uri = "/local/ha-dashboard/index.html"
+    app.confirm_push_dashboard_uri = "/dashboard-rooftop/home#room=guest_bathroom"
     app.notify_calls = []
 
     class FakeNotifier:
@@ -550,6 +552,54 @@ class ConfirmPushTargeting(unittest.TestCase):
         record = dict(self._RECORD, started_by="mikkel")
         app._send_confirm_push(record)
         self.assertEqual(app.notify_calls[0]["target"], "home")
+
+
+class ConfirmPushLinks(unittest.TestCase):
+    """Tapping the confirm push opens the dashboard timeline at the cycle's record ts (epoch
+    seconds); its dashboard button opens the guest bathroom, where the WasherCard lives."""
+
+    ROOM_LINK = "/dashboard-rooftop/home#room=guest_bathroom"
+
+    def test_body_link_is_the_record_ts_in_epoch_seconds(self):
+        app = _make_confirm_push_app()
+        app._send_confirm_push(dict(ConfirmPushTargeting._RECORD))  # ts 2026-07-27T18:00:00+02:00
+        self.assertEqual(app.notify_calls[0]["link"], "/dashboard-rooftop/home#now=washer-1785168000")
+        self.assertEqual(app.notify_calls[0]["data"]["data"]["tag"], "washer_confirm")
+
+    def test_link_names_the_second_the_saved_record_was_stamped(self):
+        app = _make_confirm_push_app()
+        app.feedback_file = os.path.join(tempfile.mkdtemp(), "feedback.json")
+        self.addCleanup(lambda: os.path.exists(app.feedback_file) and os.remove(app.feedback_file))
+        app._learned_durations = {}
+        app._history_centroids = {}
+        app._local_tz_obj = timezone(timedelta(hours=2))
+        record = app._save_cycle_feedback(
+            predicted="bomuld", predicted_temperature="40°C", confirmed="bomuld", confirmed_temperature="40°C",
+            duration_min=159.0, energy_kwh=0.75, heating_bursts=1, max_power_w=2000.0,
+        )
+        app._send_confirm_push(record)
+        self.assertEqual(record["ts"], "2026-07-27T14:00:00+02:00")
+        self.assertEqual(app.notify_calls[0]["link"],
+                         f"/dashboard-rooftop/home#now=washer-{int(app._now_utc().timestamp())}")
+
+    def test_unparsable_ts_still_sends_the_push_without_a_link(self):
+        app = _make_confirm_push_app()
+        app._send_confirm_push(dict(ConfirmPushTargeting._RECORD, ts=""))
+        self.assertEqual(len(app.notify_calls), 1)
+        self.assertIsNone(app.notify_calls[0]["link"])
+
+    def test_dashboard_button_opens_the_washer_room_in_the_app(self):
+        with open(Path(wm.__file__).with_name("washer.yaml"), encoding="utf-8") as f:
+            uri = yaml.safe_load(f)["washer_monitor"]["confirm_push_dashboard_uri"]
+        self.assertEqual(uri, self.ROOM_LINK)
+        app = _make_confirm_push_app()
+        app.confirm_push_dashboard_uri = uri
+        app._send_confirm_push(dict(ConfirmPushTargeting._RECORD))
+        app._send_confirm_push(dict(ConfirmPushTargeting._RECORD, predicted="unknown"))
+        other = app.notify_calls[0]["data"]["data"]["actions"][1]
+        choose = app.notify_calls[1]["data"]["data"]["actions"][0]
+        self.assertEqual(other, {"action": "URI", "title": "Other...", "uri": self.ROOM_LINK})
+        self.assertEqual(choose, {"action": "URI", "title": "Choose in dashboard", "uri": self.ROOM_LINK})
 
 
 if __name__ == "__main__":

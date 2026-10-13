@@ -281,12 +281,18 @@ class LatePushInsteadOfSonosWhenStale(unittest.TestCase):
             app._history[ENERGY_SENSOR] = _energy_history_for_end(estimated_end)
             # No door history at all - _door_open_edge_since must see no edge.
 
+            sent_from = int(app._now_utc().timestamp())
             app.initialize()
+            sent_by = int(app._now_utc().timestamp())
 
             self.assertEqual(app.state, "Unemptied")
             self.assertEqual(app.sonos_calls, [])
             self.assertEqual(len(app.mobile_calls), 1)
             self.assertIn("180 min ago", app.mobile_calls[0].get("message", ""))
+            prefix = "/dashboard-rooftop/home#now=dryer-"
+            link = app.mobile_calls[0]["link"]
+            self.assertTrue(link.startswith(prefix), link)
+            self.assertTrue(sent_from <= int(link[len(prefix):]) <= sent_by, link)
             self.assertTrue(app.notification_sent)
             self.assertTrue(
                 any("late-push" in msg for msg in info_logs(app)),
