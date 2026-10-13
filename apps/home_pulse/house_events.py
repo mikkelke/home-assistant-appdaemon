@@ -8,6 +8,8 @@ things you can see/hear yourself has no value):
    "TV moving to kitchen"; "Bedroom TV turned on" -> "TV lift going down").
    Event-based on purpose: no get_app coupling, no init-order dependency - an
    emitting app just fire_event()s and never notices whether this app is running.
+   An observer app reporting a plain fact with no automation behind it sends `text`
+   alone instead ("Kristine started Spotify in Kitchen" - MusicAttribution).
 2. A small set of observed appliance milestones that carry information you can't
    see from the machine itself (finished + energy used; emptied).
 3. Observed lock activity (v3): "Front door unlocked by Mikkel" / "locked
@@ -147,25 +149,32 @@ def lock_event(name, old, new, changed_by):
     return "mdi:lock-open-variant", f"{name} unlocked", _first_name_if_resident(who)
 
 
+def _clean_str(value):
+    return value.strip()[:MAX_TEXT_LEN] if isinstance(value, str) and value.strip() else None
+
+
 def build_report_event(data):
     """Validated {icon, text, cause, effect, by} from a house_events_report payload, or None.
 
-    `cause` and `effect` are required non-empty strings (that's the entire point of a
-    report - explaining WHY); `icon` optional; `by` (v4) optional acting-person display
-    name - the dashboard renders it as its own muted "By <name>" line, so emitters keep
-    the cause/effect wording neutral instead of baking names into sentences. Length-
-    capped: a misbehaving emitter must not be able to bloat the feed entity.
+    An automation explains WHY it acted with non-empty `cause` and `effect`. An observer
+    reporting a plain fact with no automation behind it (who started the music) sends
+    `text` alone instead; cause/effect win when both are present. `icon` optional; `by`
+    (v4) optional acting-person display name - the dashboard renders it as its own muted
+    "By <name>" line, so emitters keep the cause/effect wording neutral instead of baking
+    names into sentences. Length-capped: a misbehaving emitter must not be able to bloat
+    the feed entity.
     """
     if not isinstance(data, dict):
         return None
-    cause = data.get("cause")
-    effect = data.get("effect")
-    if not isinstance(cause, str) or not cause.strip():
-        return None
-    if not isinstance(effect, str) or not effect.strip():
-        return None
-    cause = cause.strip()[:MAX_TEXT_LEN]
-    effect = effect.strip()[:MAX_TEXT_LEN]
+    cause = _clean_str(data.get("cause"))
+    effect = _clean_str(data.get("effect"))
+    if cause and effect:
+        text = f"{cause} -> {effect}"
+    else:
+        cause = effect = None
+        text = _clean_str(data.get("text"))
+        if not text:
+            return None
     icon = data.get("icon")
     if not isinstance(icon, str) or not icon.startswith("mdi:"):
         icon = "mdi:auto-fix"
@@ -193,7 +202,7 @@ def build_report_event(data):
             audience_users = cleaned or None
     return {
         "icon": icon,
-        "text": f"{cause} -> {effect}",
+        "text": text,
         "cause": cause,
         "effect": effect,
         "by": by,

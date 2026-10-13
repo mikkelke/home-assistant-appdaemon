@@ -69,6 +69,32 @@ class ReportEventTests(unittest.TestCase):
         self.assertEqual(len(event["cause"]), house_events.MAX_TEXT_LEN)
         self.assertEqual(len(event["effect"]), house_events.MAX_TEXT_LEN)
 
+    def test_text_only_report(self):
+        event = house_events.build_report_event(
+            {"text": " Kristine started Spotify in Kitchen ", "icon": "mdi:spotify", "by": "Kristine"}
+        )
+        self.assertEqual(event["text"], "Kristine started Spotify in Kitchen")
+        self.assertIsNone(event["cause"])
+        self.assertIsNone(event["effect"])
+        self.assertEqual(event["icon"], "mdi:spotify")
+        self.assertEqual(event["by"], "Kristine")
+
+    def test_text_only_needs_text(self):
+        self.assertIsNone(house_events.build_report_event({"text": "   "}))
+        self.assertIsNone(house_events.build_report_event({"text": 5}))
+        self.assertIsNone(house_events.build_report_event({"icon": "mdi:music"}))
+
+    def test_cause_effect_win_over_text(self):
+        event = house_events.build_report_event({"cause": "c", "effect": "e", "text": "t"})
+        self.assertEqual(event["text"], "c -> e")
+        half = house_events.build_report_event({"cause": "c", "text": "t"})
+        self.assertEqual(half["text"], "t")
+        self.assertIsNone(half["cause"])
+
+    def test_text_length_capped(self):
+        event = house_events.build_report_event({"text": "t" * 500})
+        self.assertEqual(len(event["text"]), house_events.MAX_TEXT_LEN)
+
 
 class SanitizeFeedTests(unittest.TestCase):
     def test_filters_and_caps(self):
