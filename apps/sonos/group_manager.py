@@ -37,7 +37,6 @@ class SonosGroupManager(hass.Hass):
         self.speakers       = self.args["all_speakers"]
         self.follow_flag    = self.args["follow_me_flag"]
         self.master_select  = self.args["master_select"]
-        self.last_ts_entity = self.args["last_ts_input"]
         self.throttle       = float(self.args.get("throttle_seconds", 2))
         self.settle_delay   = float(self.args.get("settle_seconds", 2))
         self.reset_resume_delay = float(self.args.get("reset_resume_delay", 2.5))
@@ -207,12 +206,7 @@ class SonosGroupManager(hass.Hass):
         if self._should_follow_me_be_active():
             self.log("Scenario: startup_follow_me_active -> follow_me conditions met at startup", level="INFO")
             
-            # Update timestamp
-            now = self.datetime().timestamp()
-            self._last_group_ts = now  # Update internal timestamp too
-            self._safe_call_service("input_number/set_value",
-                                  entity_id=self.last_ts_entity,
-                                  value=now)
+            self._last_group_ts = self.datetime().timestamp()
             
             # Trigger a group update to ensure mute states are correct
             unique_members = list(all_grouped_member_entities) # Use the set of all members found
@@ -330,14 +324,6 @@ class SonosGroupManager(hass.Hass):
             # Detect transition from no groups to at least one group
             if total_before == 0 and total_after > 0:
                 self.log("Scenario: multi_speaker_group_detected -> follow_me should be active", level="INFO")
-                
-                # Update timestamp (check current value first)
-                now = self.datetime().timestamp()
-                current_ts = float(self.get_state(self.last_ts_entity) or 0)
-                if now != current_ts:
-                    self._safe_call_service("input_number/set_value",
-                                          entity_id=self.last_ts_entity,
-                                          value=now)
             
             # Reset this entity's previous members to ensure consistent state for other checks
             self._prev_group_members[entity] = old_members
@@ -812,14 +798,6 @@ class SonosGroupManager(hass.Hass):
         # Update timestamp for join events (follow_me is now automatically detected)
         if service == "join":
             self.log(f"Scenario: join_service_detected -> follow_me will be active if conditions met", level="INFO")
-            
-            # Update timestamp
-            now = self.datetime().timestamp()
-            current_ts = float(self.get_state(self.last_ts_entity) or 0)
-            if now != current_ts:
-                self._safe_call_service("input_number/set_value",
-                                      entity_id=self.last_ts_entity,
-                                      value=now)
             
             # Update group timestamp since we're forming a group
             self._last_group_ts = self.datetime().timestamp()
@@ -1300,21 +1278,11 @@ class SonosGroupManager(hass.Hass):
     def _toggle_follow_me(self, action_decisions):
         """Handle follow_me state changes (now using automatic detection, no toggle management).
         
-        This method now only handles event firing and timestamp updates.
+        This method now only handles event firing.
         Follow_me state is automatically detected via _should_follow_me_be_active().
         """
-        now = self.datetime().timestamp()
-        
-        # Update timestamp when follow_me conditions change
         if action_decisions["should_enable_follow_me"]:
             self.log("Scenario: follow_me_should_be_active -> conditions met", level="INFO")
-            # Update timestamp
-            current_ts = float(self.get_state(self.last_ts_entity) or 0)
-            if now != current_ts:
-                self._safe_call_service("input_number/set_value",
-                                      entity_id=self.last_ts_entity,
-                                      value=now)
-                                  
         elif action_decisions["should_disable_follow_me"]:
             self.log("Scenario: follow_me_should_be_inactive -> conditions not met", level="INFO")
             

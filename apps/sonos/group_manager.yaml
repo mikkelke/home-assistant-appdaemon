@@ -19,7 +19,6 @@ SonosGroupManager:
 
   follow_me_flag: "input_boolean.follow_me"
   master_select: "input_select.sonos_master_speaker"
-  last_ts_input: "input_number.sonos_last_group_ts"  # Tracks when grouping last existed
   throttle_seconds: 2  # Minimum time between evaluations
   settle_seconds: 2    # Delay to let state changes settle
   reset_resume_delay: 2.5  # Same value in follow_me.yaml — delay after sonos_reset_completed before GM/FollowMe resume
