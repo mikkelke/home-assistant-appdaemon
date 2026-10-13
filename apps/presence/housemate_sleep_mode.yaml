@@ -14,9 +14,10 @@
 # route). input_boolean.kristine_sleep_mode already exists.
 #
 # ON:  home + battery Charging/Full + inside 21:00-10:00 + room PIR quiet >= 10 min.
-# OFF: unplugged >= 5 min, or away >= leave-grace, or hard end at 10:00. Nothing else
-# clears it - sensor dropouts hold state. Kristine's tracker flaps at the home-zone
-# boundary (see presence-tracker-quality notes), hence her explicit leave grace.
+# OFF: unplugged >= 5 min, or away >= leave-grace, or away and unplugged at once, or
+# hard end at 10:00. Nothing else clears it - sensor dropouts hold state. person.* is
+# UniFi WiFi presence, which can briefly report away; the grace keeps a short blip
+# from clearing the night.
 
 HousemateSleepMode:
   module: housemate_sleep_mode

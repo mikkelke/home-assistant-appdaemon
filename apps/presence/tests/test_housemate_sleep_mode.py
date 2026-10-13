@@ -3,7 +3,7 @@
 # Encodes the 2026-08-07 failure that motivated it (Kristine's phone-side helper
 # pipeline dropped one edge and her sleep mode read OFF all night while the phone
 # charged) as behaviour: the battery SENSOR is the source, dropouts hold state, and
-# her flappy tracker gets a leave grace. Same __new__ + monkeypatched-callables
+# a short away blip gets a leave grace. Same __new__ + monkeypatched-callables
 # harness as test_actor_attribution.py.
 # Run from repo root: python3 -m unittest discover -s apps/presence/tests -q
 
@@ -141,8 +141,8 @@ class TurnsOnWhenSettled(unittest.TestCase):
 
 
 class ConservativeOff(unittest.TestCase):
-    """OFF is only: unplugged >= 5 min, away >= leave-grace, or the hard morning
-    end. Dropouts and PIR activity hold state."""
+    """OFF is only: unplugged >= 5 min, away >= leave-grace, away AND unplugged at
+    once, or the hard morning end. Dropouts and PIR activity hold state."""
 
     def test_unplug_sustained_5_minutes_turns_off(self):
         p = make_person(verdict=True, battery_state="not charging",
@@ -183,8 +183,8 @@ class ConservativeOff(unittest.TestCase):
         self.assertEqual(turn_offs(app), [])
 
     def test_tracker_blip_within_grace_does_not_clear(self):
-        # Regression guard: person.kristine flaps at the home-zone boundary. A
-        # home -> not_home -> home blip inside the grace must not end her night.
+        # Regression guard: UniFi WiFi presence can briefly report away. A
+        # home -> not_home -> home blip inside the grace must not end the night.
         p = make_person(verdict=True)
         app = make_app(p)
         app._on_person(p["person_entity"], "state", "home", "not_home", {"person": p["key"]})
@@ -229,6 +229,77 @@ class ConservativeOff(unittest.TestCase):
         app._clock["now"] = NIGHT + timedelta(minutes=20)
         app._evaluate(p)
         self.assertEqual(turn_offs(app), [])
+
+
+class AwayAndUnpluggedClearsAtOnce(unittest.TestCase):
+    """Away AND observably not charging clears at once, on whichever event completes
+    the pair. Each signal alone keeps its own timer, and unknown/unavailable on
+    either entity is never evidence."""
+
+    def test_away_then_unplugged_clears_on_the_battery_event(self):
+        p = make_person(verdict=True)
+        app = make_app(p)
+        app._on_person(p["person_entity"], "state", "home", "not_home", {"person": p["key"]})
+        self.assertEqual(turn_offs(app), [])  # away alone: grace timer only
+        app._clock["now"] = NIGHT + timedelta(minutes=1)
+        app._on_battery(p["battery_entity"], "state", "Charging", "Not Charging",
+                        {"person": p["key"]})
+        self.assertEqual(len(turn_offs(app)), 1)  # on the event itself, no tick
+        self.assertFalse(p["verdict"])
+        self.assertTrue(any(
+            "left home and unplugged" in str(a) and kw.get("level") == "INFO"
+            for a, kw in app.log_calls
+        ))
+
+    def test_unplugged_then_away_clears_on_the_person_event(self):
+        p = make_person(verdict=True)
+        app = make_app(p)
+        app._on_battery(p["battery_entity"], "state", "Charging", "Not Charging",
+                        {"person": p["key"]})
+        self.assertEqual(turn_offs(app), [])  # unplugged alone: 5 min timer only
+        app._clock["now"] = NIGHT + timedelta(minutes=1)
+        app._on_person(p["person_entity"], "state", "home", "not_home", {"person": p["key"]})
+        self.assertEqual(len(turn_offs(app)), 1)
+        self.assertFalse(p["verdict"])
+
+    def test_away_while_charging_holds_until_the_grace(self):
+        p = make_person(verdict=True)
+        app = make_app(p)
+        app._on_person(p["person_entity"], "state", "home", "not_home", {"person": p["key"]})
+        app._clock["now"] = NIGHT + timedelta(minutes=9)
+        app._evaluate(p)
+        self.assertEqual(turn_offs(app), [])
+        app._clock["now"] = NIGHT + timedelta(minutes=10)
+        app._evaluate(p)
+        self.assertEqual(len(turn_offs(app)), 1)
+
+    def test_away_with_battery_unavailable_holds_until_the_grace(self):
+        p = make_person(verdict=True)
+        app = make_app(p)
+        app._on_battery(p["battery_entity"], "state", "Charging", "unavailable",
+                        {"person": p["key"]})
+        app._on_person(p["person_entity"], "state", "home", "not_home", {"person": p["key"]})
+        self.assertEqual(turn_offs(app), [])
+        app._clock["now"] = NIGHT + timedelta(minutes=9)
+        app._evaluate(p)
+        self.assertEqual(turn_offs(app), [])
+        app._clock["now"] = NIGHT + timedelta(minutes=10)
+        app._evaluate(p)
+        self.assertEqual(len(turn_offs(app)), 1)
+
+    def test_person_unavailable_with_unplugged_battery_is_not_away(self):
+        p = make_person(verdict=True)
+        app = make_app(p)
+        app._on_person(p["person_entity"], "state", "home", "unavailable", {"person": p["key"]})
+        app._on_battery(p["battery_entity"], "state", "Charging", "Not Charging",
+                        {"person": p["key"]})
+        self.assertEqual(turn_offs(app), [])
+        app._clock["now"] = NIGHT + timedelta(minutes=4)
+        app._evaluate(p)
+        self.assertEqual(turn_offs(app), [])  # only the 5 min unplug timer applies
+        app._clock["now"] = NIGHT + timedelta(minutes=5)
+        app._evaluate(p)
+        self.assertEqual(len(turn_offs(app)), 1)
 
 
 class KristineNightOf20260807(unittest.TestCase):

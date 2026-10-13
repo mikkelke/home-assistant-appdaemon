@@ -34,9 +34,11 @@ Signals (per person, config-driven):
       so a person who came home, moved around and settled satisfies it naturally.
   OFF when (deliberately simple and conservative - nothing else clears it):
       battery_state leaves Charging/Full for >= unplug_minutes (default 5), OR
-      person leaves home for >= leave_grace_minutes (default 10 - person.kristine
-      flaps at the home-zone boundary, so a short away blip must not clear her
-      night), OR the night window ends (hard morning end).
+      person leaves home for >= leave_grace_minutes (default 10 - person.* is
+      UniFi WiFi presence, which can briefly report away; the grace keeps a short
+      blip from clearing the night), OR
+      person away AND battery observably not charging at once (immediate), OR
+      the night window ends (hard morning end).
       PIR blips, door openings and sensor dropouts all HOLD state: unknown/
       unavailable on the battery or tracker is never treated as "unplugged" or
       "left" (the companion sensors go stale exactly when the phone sleeps).
@@ -245,8 +247,8 @@ class HousemateSleepMode(hass.Hass):
                 p["battery_off_since"] = None
             elif self._explicit_unplugged(p["battery_state"]) and p["battery_off_since"] is None:
                 p["battery_off_since"] = self._now_local()
-            # unknown/unavailable: hold - a phone dropping off wifi overnight must
-            # not count as unplugging, and mid-clock it must not reset the clock.
+            # unknown/unavailable: hold - a missing reading is not an unplug, and
+            # mid-clock it must not reset the clock.
             self._evaluate(p)
         except Exception as e:
             self.log(f"HousemateSleepMode battery handler failed for {entity}: {e}", level="ERROR")
@@ -321,6 +323,11 @@ class HousemateSleepMode(hass.Hass):
 
         if not _in_window(t, *self.night_window):
             self._write(p, False, "night window ended")
+        elif (
+            self._explicit_away(p["person_state"])
+            and self._explicit_unplugged(p["battery_state"])
+        ):
+            self._write(p, False, "left home and unplugged")
         elif (
             p["battery_off_since"] is not None
             and (now - p["battery_off_since"]).total_seconds() >= self.unplug_seconds
