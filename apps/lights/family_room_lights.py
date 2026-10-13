@@ -156,6 +156,8 @@ class FamilyRoomLights(hass.Hass):
             self.doors = self.args["door_sensors"]
             self.adjacent_presence = self.args.get("raw_adjacent_pir_sensors", {})
             self.adjacent_rooms = ["bedroom", "kristines_room", "claudias_room", "guest_bathroom"]
+            self._door_close_hold_seconds = float(self.args.get("door_close_hold_seconds", 10))
+            self._door_close_hold_until = 0.0
             
             # Specially handle rooftop door
             self.rooftop_door_sensor = self.args["rooftop_door_sensor"]
@@ -1569,6 +1571,19 @@ class FamilyRoomLights(hass.Hass):
             pass
         return self._dark_flag if self._dark_flag is not None else True
 
+    def _vacancy_hold_active(self, context):
+        """True while an adjacent door close defers the vacancy turn-off: dark, no family presence,
+        and a lamp this app may switch (not under a zone manual override) is on."""
+        if time.time() >= self._door_close_hold_until:
+            return False
+        if context['family_presence'] or not context['is_dark_for_auto_on']:
+            return False
+        return any(
+            self._safe_get_state(light, default="off", timeout_warning=False) == "on"
+            and not self._zone_manual_active(light)
+            for light in self._all_light_entities()
+        )
+
     def _determine_lighting_action(self, context):
         """
         Decision tree to determine what lighting action to take.
@@ -1606,6 +1621,13 @@ class FamilyRoomLights(hass.Hass):
 
         # 1. Everyone sleeping and no family room motion
         if context['sleep_status']['everyone_sleeping'] and not context['family_presence']:
+            if self._vacancy_hold_active(context):
+                self.log("Vacancy turn-off held: adjacent door closed moments ago", level="INFO")
+                return {
+                    'action': 'preserve_current_state',
+                    'reason': 'door_close_hold',
+                    'details': 'Everyone sleeping and no family room motion, but an adjacent door just closed - holding the turn-off'
+                }
             return {
                 'action': 'turn_off_all',
                 'reason': 'everyone_sleeping_no_motion',
@@ -1770,6 +1792,13 @@ class FamilyRoomLights(hass.Hass):
         
         # 7. DEFAULT: No special conditions - turn off all lights
         # This covers: someone home, no family presence, no rooftop door, no adjacent doors
+        if self._vacancy_hold_active(context):
+            self.log("Vacancy turn-off held: adjacent door closed moments ago", level="INFO")
+            return {
+                'action': 'preserve_current_state',
+                'reason': 'door_close_hold',
+                'details': 'No family presence, but an adjacent door just closed - holding the turn-off'
+            }
         return {
             'action': 'turn_off_all',
             'reason': 'no_conditions_met',
@@ -2029,6 +2058,8 @@ class FamilyRoomLights(hass.Hass):
                 self.log("Rooftop door closed", level="INFO")
             else:
                 self.log(f"Door closed: {doorroom} door changed from {old} to {new}", level="INFO")
+                self._door_close_hold_until = time.time() + self._door_close_hold_seconds
+                self.run_in(self._on_door_close_hold_expired, self._door_close_hold_seconds + 0.2)
             
             # Use unified decision tree for consistent behavior
             self.log(f"Door close trigger: using unified decision tree", level="INFO")
@@ -2036,6 +2067,13 @@ class FamilyRoomLights(hass.Hass):
         except Exception as e:
             self.log(f"Error in door close handler: {e}", level="ERROR")
     
+    def _on_door_close_hold_expired(self, kwargs):
+        """Re-evaluate once the door-close hold has lapsed; a stale call (hold extended by a later close) just preserves again."""
+        try:
+            self._schedule_evaluation(immediate=True)
+        except Exception as e:
+            self.log(f"Error in door close hold expiry: {e}", level="ERROR")
+
     def _on_illuminance_change(self, entity, attribute, old, new, kwargs):
         """Handle illuminance changes (only for minor hysteresis; darkness from helper)."""
         try:

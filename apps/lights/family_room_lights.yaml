@@ -97,6 +97,7 @@ FamilyRoomLights:
   # Timing parameters
   initial_check_delay: 5  # Seconds to wait before initial light check
   check_interval: 30  # Seconds between periodic light checks
+  door_close_hold_seconds: 10  # Seconds an adjacent door close holds the vacancy turn-off
   
   # Illuminance change hysteresis (optional; not used for darkness decisions)
   illuminance_hysteresis: 50
