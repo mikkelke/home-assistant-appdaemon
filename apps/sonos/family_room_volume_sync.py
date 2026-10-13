@@ -39,7 +39,9 @@ class FamilyRoomVolumeSync(hass.Hass):
     made while it was in the group (no rebalance on join). A change remembers the group it was
     made in, so a speaker that joined before the window closed is not written. Bursts where
     the group moves by clearly different amounts (Sonos group volume, announcements) are left
-    alone.
+    alone. A speaker whose volume moves while it is inactive (to or from 0, paused, on the TV)
+    gives up its lead in the window and cannot lead for max_window_seconds after: that is a
+    fade or a restore ramping it, not someone turning it.
 
     A speaker whose own volume changed within max_window_seconds of the sync is never written
     as a follower of it: it already took part in the move (a group step lifts a speaker from 0
@@ -65,6 +67,7 @@ class FamilyRoomVolumeSync(hass.Hass):
         self._pending = {}
         self._who = {}
         self._touched = {}
+        self._inactive_moves = {}
         self._expected = {}
         self._timer = None
         self._window_open = 0.0
@@ -230,8 +233,12 @@ class FamilyRoomVolumeSync(hass.Hass):
         if self._party_on:
             return
         self._touched[entity] = now
+        if not (self._active(entity, old) and self._active(entity, new)):
+            self._pending.pop(entity, None)
+            self._inactive_moves[entity] = now
+            return
         key = self._key(new)
-        if not (self._active(entity, old) and self._active(entity, new)) or len(key) < 2:
+        if len(key) < 2 or now - self._inactive_moves.get(entity, float("-inf")) <= self.max_window + EPS:
             return
         self._pending.setdefault(entity, [key, 0.0])[1] += nv - ov
         self._who[entity] = self._label(new)

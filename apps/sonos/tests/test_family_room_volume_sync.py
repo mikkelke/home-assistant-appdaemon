@@ -685,6 +685,58 @@ class SpeakerLiftedFromZero(unittest.TestCase):
                          {twin(KITCHEN): 0.26, twin(DINING): 0.26, twin(ROOFTOP): 0.26})
 
 
+class RampsThroughInactive(unittest.TestCase):
+    """Fades and restores step a speaker through 0 or a pause; none of those steps lead."""
+
+    def fade(self, r, volumes, gap=0.125):
+        for volume in volumes:
+            r.move(KITCHEN, volume)
+            r.advance(gap)
+
+    def test_a_fade_in_from_zero_never_leads(self):
+        r = Rig({KITCHEN: 0.0})
+        self.fade(r, (0.05, 0.10, 0.15, 0.20))
+        r.advance(10)
+        self.assertEqual(r.arm_delays, [])
+        self.assertEqual(r.write_log, [])
+
+    def test_a_volume_set_while_paused_does_not_lead_once_it_plays_again(self):
+        r = Rig()
+        r.change(KITCHEN, state="paused")
+        self.fade(r, (0.15, 0.0))
+        r.change(KITCHEN, state="playing")
+        self.fade(r, (0.05, 0.10, 0.15, 0.18))
+        r.advance(10)
+        self.assertEqual(r.write_log, [])
+
+    def test_a_speaker_that_dips_to_zero_inside_the_window_gives_up_its_lead(self):
+        r = Rig()
+        self.fade(r, (0.14, 0.09, 0.0, 0.09, 0.14))
+        r.advance(10)
+        self.assertEqual(r.write_log, [])
+
+    def test_a_speaker_leads_again_max_window_seconds_after_its_ramp(self):
+        for wait, leads in ((4.9, False), (5.1, True)):
+            with self.subTest(wait=wait):
+                r = Rig({KITCHEN: 0.0})
+                r.move(KITCHEN, 0.20)
+                r.advance(wait)
+                r.move(KITCHEN, 0.25)
+                r.advance(1)
+                expected = {twin(LIVING): 0.25, twin(DINING): 0.23, twin(ROOFTOP): 0.23} if leads else {}
+                self.assertEqual(r.written(), expected)
+
+    def test_the_other_speakers_still_lead_while_one_ramps(self):
+        r = Rig({KITCHEN: 0.0})
+        r.move(KITCHEN, 0.10)
+        r.advance(0.1)
+        r.move(LIVING, 0.25)
+        r.advance(0.1)
+        r.move(KITCHEN, 0.20)
+        r.advance(2)
+        self.assertEqual(r.written(), {twin(DINING): 0.23, twin(ROOFTOP): 0.23})
+
+
 class GroupAndSystemChanges(unittest.TestCase):
     def test_sonos_group_volume_with_different_deltas_is_skipped(self):
         r = Rig({ROOFTOP: 0.10, LIVING: 0.20, KITCHEN: 0.30, DINING: 0.40})
