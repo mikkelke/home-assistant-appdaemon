@@ -1,0 +1,34 @@
+# /conf/apps/appliances/run_profiles.yaml
+# RunProfiles - publishes sensor.appliance_run_profiles, the minute energy profile per
+# appliance programme measured from real past cycles (see run_profiles.py for the entity
+# contract and run_profile_model.py for the rules). Reads the monitors' feedback files and
+# recorder history only; writes nothing but its own cache file.
+#
+# Feedback and programme files default to the files next to the module
+# (<appliance>_feedback.json, <appliance>_programmes.yaml); override per appliance with
+# in-container paths (feedback_file / programmes_file) only if they move.
+
+run_profiles:
+  module: run_profiles
+  class: RunProfiles
+
+  entity: sensor.appliance_run_profiles
+  scan_minutes: 15
+  records_per_run: 10
+  run_budget_s: 60
+  max_payload_bytes: 8192
+
+  # onset_w matches each monitor's start_w.
+  appliances:
+    washer:
+      state_entity: sensor.washer_state
+      power_entity: sensor.washer_plug_power
+      onset_w: 18
+    dishwasher:
+      state_entity: sensor.dishwasher_state
+      power_entity: sensor.athom_smart_plug_v3_50ec44_power
+      onset_w: 8
+    dryer:
+      state_entity: sensor.dryer_state
+      power_entity: sensor.dryer_plug_power
+      onset_w: 8
