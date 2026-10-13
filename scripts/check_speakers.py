@@ -12,6 +12,7 @@ Checked:
   - follow_me.yaml     player list (registry MA entities; extra zones allowed)
   - group_manager.yaml player list
   - audiocast_manager.yaml raw_to_base_map pairs + line-in RINCON
+  - music_attribution.yaml raw_to_base_map pairs
   - dashboard (optional, if repo present): speakers.ts ids, audiocast.ts RINCON
 
 Run: python3 scripts/check_speakers.py   (deploy.sh runs it before rsync)
@@ -85,6 +86,13 @@ def main():
     uri = str(ac.get("audiocast_uri_prefix") or "")
     check(uri.endswith(linein[0]) if linein else False,
           f"audiocast URI {uri} != line_in_host rincon {linein}")
+
+    mus = next(iter(load("apps/sonos/music_attribution.yaml").values()))
+    mus_map = mus.get("raw_to_base_map") or {}
+    check(mus_map == pairs,
+          f"music_attribution raw_to_base_map drift: only-in-yaml="
+          f"{sorted(set(mus_map.items()) - set(pairs.items()))} "
+          f"missing={sorted(set(pairs.items()) - set(mus_map.items()))}")
 
     # Dashboard (best effort - skipped when the repo is not checked out here)
     sp_ts = os.path.join(DASHBOARD, "src/config/speakers.ts")
