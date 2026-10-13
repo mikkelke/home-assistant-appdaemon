@@ -2043,6 +2043,40 @@ class PushPayloadShape(_FrozenTimeTestCase):
         self.assertEqual(actions[1]["action"], f"FIRE_ACK_{app.episode_id}_mikkel")
         self.assertEqual(actions[2], {"action": "URI", "title": "Call 112", "uri": "tel:112"})
 
+    async def test_alarm_push_as_ha_receives_it_through_the_real_notifier(self):
+        app = _make_app()
+        app.mobile_notifier = _make_real_mobile_notifier(device_mapping={
+            "mikkel": ["notify.mobile_app_mikkels_ofx9p"],
+            "kristine": ["notify.mobile_app_kristine_iphone_2"],
+        })
+        app.states["person.kristine"] = "home"
+        app.states[app.smoke_entity] = "on"
+        app.states[app.siren_state_entity] = "fire"
+        await _tick(app)
+        sent = {c.args[0]: c.kwargs for c in app.mobile_notifier.call_service.await_args_list}
+        self.assertEqual(set(sent), {"notify/mobile_app_mikkels_ofx9p", "notify/mobile_app_kristine_iphone_2"})
+        episode = app.episode_id
+        for service, person in (("notify/mobile_app_mikkels_ofx9p", "mikkel"),
+                                ("notify/mobile_app_kristine_iphone_2", "kristine")):
+            payload = sent[service]
+            self.assertEqual(set(payload), {"title", "message", "data"})
+            self.assertEqual(payload["title"], "Smoke in the kitchen")
+            self.assertEqual(payload["data"]["tag"], "fire_alarm")
+            actions = payload["data"]["actions"]
+            self.assertEqual([a["action"] for a in actions],
+                             [f"FIRE_HUSH_{episode}_{person}", f"FIRE_ACK_{episode}_{person}", "URI"])
+            self.assertEqual(actions[2], {"action": "URI", "title": "Call 112", "uri": "tel:112"})
+        android = dict(sent["notify/mobile_app_mikkels_ofx9p"]["data"])
+        android.pop("tag")
+        android.pop("actions")
+        self.assertEqual(android, {"channel": "Fire alarm", "importance": "max", "priority": "high", "ttl": 0,
+                                   "persistent": True, "sticky": True})
+        ios = dict(sent["notify/mobile_app_kristine_iphone_2"]["data"])
+        ios.pop("tag")
+        ios.pop("actions")
+        self.assertEqual(ios, {"push": {"interruption-level": "critical",
+                                        "sound": {"name": "default", "critical": 1, "volume": 1.0}}})
+
 
 class SelfTestSuppression(_FrozenTimeTestCase):
     async def test_siren_alarm_value_ignored_during_window_with_smoke_off(self):

@@ -11,6 +11,7 @@
 # (auto-open answered it, ABB still logged "Call Missed") verified from HA
 # history while building this app - see abb_welcome_bridge.py's header.
 
+import asyncio
 import json
 import os
 import sys
@@ -32,8 +33,11 @@ for name, mod in (
     sys.modules.setdefault(name, mod)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# apps/notify - RealNotifierPayloadTests send through the REAL MobileNotifier.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "notify"))
 import abb_welcome_bridge as bridge_mod  # noqa: E402
 import intercom  # noqa: E402
+import mobile_notifier  # noqa: E402
 
 # The real 2026-08-12 14:24 back-door ring, from HA history (UTC):
 RING_ESP = datetime(2026, 8, 12, 14, 24, 44, 256000, tzinfo=timezone.utc)
@@ -1539,6 +1543,90 @@ class RingFallbackTests(unittest.TestCase):
         published = dict(self.app.published)["sensor.abb_esp_ring_agreement"]
         self.assertEqual(published["attributes"]["door_opens_both"], 1)
         self.assertEqual(published["attributes"]["door_opens_abb_only"], 1)
+
+
+class RealNotifierPayloadTests(unittest.TestCase):
+    """The bridge's pushes sent through the REAL MobileNotifier: the assertions are on the
+    notify service call HA receives, not on what the bridge hands the notifier."""
+
+    PHONE = "notify/mobile_app_mikkels_ofx9p"
+
+    def setUp(self):
+        self.clock = Clock(datetime(2026, 8, 13, 14, 0, 0, tzinfo=timezone.utc))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.app = _bare_bridge(self.tmp.name, self.clock)
+        self.app.states[("input_boolean.auto_open_intercom", None)] = "off"
+        self.sent = []
+
+        notifier = mobile_notifier.MobileNotifier.__new__(mobile_notifier.MobileNotifier)
+        notifier.log = lambda *a, **kw: None
+        notifier.person_entities = ["person.mikkel"]
+        notifier.device_mapping = {"mikkel": ["notify.mobile_app_mikkels_ofx9p"]}
+        notifier.category_audience = {}
+        notifier.platform_map = {}
+        notifier.user_notification_service = None
+
+        async def get_state(entity_id):
+            return "home"
+
+        async def call_service(service, **kwargs):
+            self.sent.append((service, kwargs))
+
+        notifier.get_state = get_state
+        notifier.call_service = call_service
+        self.app.mobile_notifier = notifier
+        self.app.create_task = asyncio.run
+
+    def test_open_reject_push_carries_its_actions_under_data(self):
+        self.app._register_ring("esp", "front door", "", self.clock.at, "esp:test")
+        episode = next(iter(self.app.episodes.values()))
+        self.assertEqual(self.sent, [(self.PHONE, {
+            "title": "Someone is ringing the front door",
+            "message": "Auto-open is off - open for them?",
+            "data": {
+                "tag": "abb_ring_front",
+                "actions": [
+                    {"action": f"ABB_RING_OPEN_{episode['id']}", "title": "Open"},
+                    {"action": f"ABB_RING_REJECT_{episode['id']}", "title": "Reject"},
+                ],
+            },
+        })])
+
+    def test_delivered_open_action_unlocks_and_the_clear_push_arrives(self):
+        self.app._register_ring("esp", "front door", "", self.clock.at, "esp:test")
+        open_action = self.sent[0][1]["data"]["actions"][0]["action"]
+        self.clock.at += timedelta(seconds=20)
+        self.app._on_notification_action("mobile_app_notification_action", {"action": open_action}, {})
+        unlocks = [c for c in self.app.service_calls if c[0] == "lock/unlock"]
+        self.assertEqual(unlocks, [("lock/unlock", {"entity_id": "lock.intercomproxy_front_door"})])
+        self.assertEqual(self.sent[-1], (self.PHONE, {
+            "title": "clear",
+            "message": "clear_notification",
+            "data": {"tag": "abb_ring_front"},
+        }))
+
+    def test_delivered_reject_action_rejects_without_unlocking(self):
+        self.app._register_ring("esp", "front door", "", self.clock.at, "esp:test")
+        reject_action = self.sent[0][1]["data"]["actions"][1]["action"]
+        self.clock.at += timedelta(seconds=15)
+        self.app._on_notification_action("mobile_app_notification_action", {"action": reject_action}, {})
+        self.assertEqual([c for c in self.app.service_calls if c[0] == "lock/unlock"], [])
+        self.assertTrue(next(iter(self.app.episodes.values()))["rejected"])
+        self.assertEqual(self.sent[-1][1]["message"], "clear_notification")
+
+    def test_auto_opened_push_carries_tag_and_photo_under_data(self):
+        self.app.states[("input_boolean.auto_open_intercom", None)] = "on"
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        episode["snapshot"] = {"bytes": b"jpeg", "captured_at": self.clock.now(), "event_id": "e1"}
+        self.app.states[(self.app.abb_image_entity, "entity_picture")] = "/api/image_proxy/image.abb?token=t"
+        self.assertTrue(self.app.defer_ring_push(
+            "front door", "Intercom auto-opened", "Someone rang.", "mikkel"))
+        self.assertEqual(self.sent, [(self.PHONE, {
+            "title": "Intercom auto-opened",
+            "message": "Someone rang.",
+            "data": {"tag": "abb_autoopen_front", "image": "/api/image_proxy/image.abb?token=t"},
+        })])
 
 
 class NativeRingClipTests(unittest.TestCase):

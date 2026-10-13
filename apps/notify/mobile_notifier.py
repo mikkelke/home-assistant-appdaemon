@@ -11,6 +11,10 @@ from typing import Callable
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
+# HA's notify service schema rejects the whole call on any other top-level key.
+SERVICE_TOP_LEVEL_KEYS = ("title", "message", "target", "data")
+
+
 class MobileNotifier(hass.Hass):
     """Centralized mobile app notification handler with presence detection."""
     
@@ -202,6 +206,25 @@ class MobileNotifier(hass.Hass):
         except Exception as e:
             self.log(f"Error clearing notification tag={tag!r}: {e}", level="ERROR")
 
+    @staticmethod
+    def _service_payload(title, message, data):
+        """notify()'s service-call kwargs: caller keys outside SERVICE_TOP_LEVEL_KEYS move
+        under "data", so flat (data={"tag": ...}) and nested (data={"data": {"tag": ...}})
+        payloads arrive alike; a nested key wins over the same flat key."""
+        payload = {"title": title, "message": message}
+        inner = {}
+        for key, value in (data or {}).items():
+            if key not in SERVICE_TOP_LEVEL_KEYS:
+                inner[key] = value
+            elif key != "data":
+                payload[key] = value
+        nested = (data or {}).get("data")
+        if isinstance(nested, dict):
+            inner.update(nested)
+        if inner:
+            payload["data"] = inner
+        return payload
+
     async def notify(
         self,
         title: str,
@@ -235,7 +258,8 @@ class MobileNotifier(hass.Hass):
             title: Notification title
             message: Notification message
             target: Who to send to (see semantics above).
-            data: Optional additional data (e.g., {"data": {"importance": "high"}})
+            data: Optional additional data, nested (e.g. {"data": {"importance": "high"}}) or
+                flat (e.g. {"tag": "x"}); see _service_payload.
             category: Optional category name; scopes target="home" to category_audience[category]
                 when that category is listed (see initialize()). Ignored for other targets.
             critical: When True, layer a platform-appropriate critical-alert payload (iOS
@@ -253,23 +277,7 @@ class MobileNotifier(hass.Hass):
         """
         success_count = 0
         try:
-            notification_data = {
-                "title": title,
-                "message": message,
-            }
-
-            # Add optional data
-            # If data contains a "data" key, merge it properly for Home Assistant
-            # Home Assistant expects: {"data": {"actions": [...]}}
-            if data:
-                if "data" in data and isinstance(data["data"], dict):
-                    # If data is {"data": {...}}, merge the inner dict into notification_data["data"]
-                    if "data" not in notification_data:
-                        notification_data["data"] = {}
-                    notification_data["data"].update(data["data"])
-                else:
-                    # Otherwise, merge normally
-                    notification_data.update(data)
+            notification_data = self._service_payload(title, message, data)
 
             # Determine target services
             services = await self._resolve_services(target, category)
