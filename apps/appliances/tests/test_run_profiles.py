@@ -127,6 +127,11 @@ class IntegrationTest(unittest.TestCase):
         dwh, _ = m.integrate_minutes([(0.0, 60.0)], 0.0, 600.0)
         self.assertEqual(dwh, [10] * 10)
 
+    def test_appdaemon_datetime_rows_parse_like_rest_strings(self):
+        dt = datetime(2026, 10, 1, 20, 0, tzinfo=timezone.utc)
+        rows = [{"state": "12.5", "last_changed": dt}, {"state": "unavailable", "last_changed": iso(dt.timestamp() + 60)}]
+        self.assertEqual(m.power_samples(rows), [(dt.timestamp(), 12.5), (dt.timestamp() + 60, None)])
+
     def test_window_starts_mid_reading(self):
         dwh, _ = m.integrate_minutes([(-300.0, 120.0), (60.0, 0.0)], 0.0, 120.0)
         self.assertEqual(dwh, [20, 0])
