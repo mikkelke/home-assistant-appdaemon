@@ -521,6 +521,8 @@ class FamilyRoomLights(hass.Hass):
             return "input_boolean.kristine_sleep_mode"
         elif person == "person.mikkel":
             return "input_boolean.mikkel_sleep_mode"
+        elif person == "person.claudia":
+            return "input_boolean.claudia_sleep_mode"
         return None
 
     def _get_sleep_mode_status(self):
