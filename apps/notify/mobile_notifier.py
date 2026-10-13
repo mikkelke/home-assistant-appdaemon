@@ -14,6 +14,8 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 # HA's notify service schema rejects the whole call on any other top-level key.
 SERVICE_TOP_LEVEL_KEYS = ("title", "message", "target", "data")
 
+DASHBOARD_LINK_PREFIX = "/dashboard-rooftop/home#"
+
 
 class MobileNotifier(hass.Hass):
     """Centralized mobile app notification handler with presence detection."""
@@ -236,6 +238,7 @@ class MobileNotifier(hass.Hass):
         channel: str = "Fire alarm",
         per_person_actions: Callable[[str], list[dict]] | None = None,
         test_audience: list[str] | None = None,
+        link: str | None = None,
     ):
         """Send notification to mobile app(s).
 
@@ -270,6 +273,9 @@ class MobileNotifier(hass.Hass):
                 service (so action IDs can be person-scoped) when the service maps to a person.
             test_audience: Optional list of person keys; when given, only those people
                 receive the push regardless of target/category.
+            link: Optional dashboard deep link opened by tapping the push. Must start with
+                DASHBOARD_LINK_PREFIX, anything else is dropped with a WARNING. Written to
+                data.url (iOS) and data.clickAction (Android) unless the caller set them.
 
         Returns:
             The number of services actually delivered to (0 when none, e.g. no service
@@ -278,6 +284,14 @@ class MobileNotifier(hass.Hass):
         success_count = 0
         try:
             notification_data = self._service_payload(title, message, data)
+            if link is not None:
+                if isinstance(link, str) and link.startswith(DASHBOARD_LINK_PREFIX):
+                    inner = notification_data.setdefault("data", {})
+                    inner.setdefault("url", link)
+                    inner.setdefault("clickAction", link)
+                else:
+                    self.log(f"Dropped link {link!r} from '{title}': not a {DASHBOARD_LINK_PREFIX} link",
+                             level="WARNING")
 
             # Determine target services
             services = await self._resolve_services(target, category)

@@ -145,5 +145,59 @@ class FlatKeysWithPerServiceLayers(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_sent(app, "kristine_iphone")["data"], {"tag": "x", "actions": [{"action": "ACK_KRISTINE"}]})
 
 
+LINK = "/dashboard-rooftop/home#now=washer-1760345730"
+
+
+def _warnings(app):
+    return [str(a[0]) for a, kw in app.log_calls if kw.get("level") == "WARNING"]
+
+
+class DashboardLink(unittest.IsolatedAsyncioTestCase):
+    async def test_link_sets_url_and_click_action(self):
+        app = _new_app()
+        await app.notify(title="t", message="m", target=["mikkel"], link=LINK)
+        self.assertEqual(_sent(app), {"title": "t", "message": "m", "data": {"url": LINK, "clickAction": LINK}})
+        self.assertEqual(_warnings(app), [])
+
+    async def test_link_joins_caller_data(self):
+        actions = [{"action": "URI", "title": "Other...", "uri": "/dashboard-rooftop/home#room=guest_bathroom"}]
+        app = _new_app()
+        await app.notify(title="t", message="m", target=["mikkel"],
+                         data={"data": {"actions": actions, "tag": "washer_confirm"}}, link=LINK)
+        self.assertEqual(_sent(app)["data"], {"actions": actions, "tag": "washer_confirm",
+                                              "url": LINK, "clickAction": LINK})
+
+    async def test_caller_url_and_click_action_win(self):
+        app = _new_app()
+        await app.notify(title="t", message="m", target=["mikkel"],
+                         data={"data": {"url": "/dashboard-rooftop/0#room=bedroom"}}, link=LINK)
+        self.assertEqual(_sent(app)["data"], {"url": "/dashboard-rooftop/0#room=bedroom", "clickAction": LINK})
+
+        app = _new_app()
+        await app.notify(title="t", message="m", target=["mikkel"],
+                         data={"clickAction": "/lovelace/0"}, link=LINK)
+        self.assertEqual(_sent(app)["data"], {"clickAction": "/lovelace/0", "url": LINK})
+
+    async def test_invalid_link_is_dropped_with_a_warning_and_the_push_still_goes(self):
+        for bad in ("/local/ha-dashboard/index.html", "/dashboard-rooftop", "/dashboard-rooftop/home",
+                    "/dashboard-rooftop/home?now=washer-1", "/dashboard-rooftop/0#now=washer-1",
+                    "https://ha.me2go.dk/dashboard-rooftop/home#now", "", 42):
+            with self.subTest(link=bad):
+                app = _new_app()
+                sent = await app.notify(title="t", message="m", target=["mikkel"], data={"tag": "x"}, link=bad)
+                self.assertEqual(sent, 1)
+                self.assertEqual(_sent(app), {"title": "t", "message": "m", "data": {"tag": "x"}})
+                self.assertEqual(len(_warnings(app)), 1)
+                self.assertIn(repr(bad), _warnings(app)[0])
+
+    async def test_link_reaches_every_service_through_the_per_service_layers(self):
+        app = _new_app()
+        await app.notify(title="T", message="M", target=["mikkel", "kristine"], critical=True,
+                         per_person_actions=lambda person: [{"action": f"ACK_{person.upper()}"}], link=LINK)
+        for needle in ("mikkels_ofx9p", "kristine_iphone"):
+            data = _sent(app, needle)["data"]
+            self.assertEqual((data["url"], data["clickAction"]), (LINK, LINK))
+
+
 if __name__ == "__main__":
     unittest.main()
