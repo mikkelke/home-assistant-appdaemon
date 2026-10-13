@@ -1,9 +1,11 @@
 """FamilyRoomVolumeSync: relative volume sync across the family-room Sonos group.
 
 When speakers of a Sonos group holding 2+ family speakers move by the same step, every other
-active member moves by that step. Followers are written through their native <id>_2 twin, our own
-echo is ignored for echo_window_seconds, and a party-mode helper switches the whole thing off.
-The rig below drives an initialize()d app with a fake clock, scheduler and Home Assistant state.
+active member moves by that step. Followers are written through their native <id>_2 twin and our
+own writes are recognised by value when Music Assistant reports them back; a party-mode helper
+switches the whole thing off. The rig below drives an initialize()d app with a fake clock,
+scheduler and Home Assistant state, and echoes every successful write back on the Music Assistant
+entity about 0.1 s later, the way the native twin's write is reflected there.
 """
 
 from __future__ import annotations
@@ -49,12 +51,14 @@ BASE_ARGS = {
     "party_mode_entity": PARTY,
     "settle_seconds": 0.8,
     "max_window_seconds": 5,
-    "echo_window_seconds": 2,
+    "echo_window_seconds": 10,
     "party_mode_max_hours": 12,
 }
 START_VOLUMES = {ROOFTOP: 0.18, LIVING: 0.20, KITCHEN: 0.18, DINING: 0.18}
 T0 = 1000.0
 WALL_START = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc)
+HOUR = 3600.0
+PARTY_CHECK_S = 900.0
 
 
 def twin(entity):
@@ -72,6 +76,14 @@ def speaker_state(volume, state="playing", group=None, source="Spotify", muted=F
         },
         "context": {"id": "ctx", "parent_id": None, "user_id": None},
     }
+
+
+def twin_state(volume, state="playing"):
+    return {"state": state, "attributes": {"volume_level": volume}}
+
+
+def party_state(on, since):
+    return {"state": "on" if on else "off", "attributes": {}, "last_changed": since.isoformat()}
 
 
 def raising_for(entity):
@@ -105,22 +117,31 @@ def no_result(service, data):
     return None
 
 
+def turn_offs(rig):
+    return [c for c in rig.service_calls if c[0] == "input_boolean/turn_off"]
+
+
 class Rig:
     """FamilyRoomVolumeSync with initialize() actually run and AppDaemon stubbed out."""
 
-    def __init__(self, volumes=None):
+    def __init__(self, volumes=None, auto_echo=True, echo_delay=0.1, party=None):
         self.t = T0
-        self.wall = WALL_START
         self.timers = {}
+        self.periodic = []
         self._timer_seq = 0
         self.arm_delays = []
+        self.run_every_calls = []
         self.service_calls = []
         self.write_log = []
         self.service_hook = None
-        self._echoed = 0
+        self.auto_echo = auto_echo
+        self.echo_delay = echo_delay
         vols = dict(START_VOLUMES)
         vols.update(volumes or {})
         self.states = {m: speaker_state(vols[m]) for m in FAMILY}
+        self.states.update({twin(m): twin_state(vols[m]) for m in FAMILY})
+        if party is not None:
+            self.states[PARTY] = party_state(*party)
         self.persons = {
             "person.mikkel": {"state": "home", "attributes": {"user_id": MIKKEL_ID, "friendly_name": "Mikkel"}},
             "person.kristine": {"state": "away", "attributes": {"user_id": KRISTINE_ID, "friendly_name": "Kristine"}},
@@ -132,12 +153,17 @@ class Rig:
         app.get_state = self._get_state
         app.listen_state = MagicMock()
         app.run_in = self._run_in
+        app.run_every = self._run_every
         app.call_service = self._call_service
         app.log = MagicMock()
         app._now = lambda: self.t
         app._wall_now = lambda: self.wall
         self.app = app
         app.initialize()
+
+    @property
+    def wall(self):
+        return WALL_START + timedelta(seconds=self.t - T0)
 
     def _get_state(self, entity_id=None, attribute=None, **kw):
         if entity_id == "person":
@@ -158,6 +184,15 @@ class Rig:
         self.arm_delays.append(delay)
         return handle
 
+    def _run_every(self, callback, start, interval, **kw):
+        self.run_every_calls.append((start, interval))
+        first = float(start.split("+")[1]) if "+" in start else interval
+        self.periodic.append([self.t + first, interval, callback])
+
+    def _schedule(self, delay, action):
+        self._timer_seq += 1
+        self.timers[f"rig-{self._timer_seq}"] = (self.t + delay, lambda kw: action())
+
     def _call_service(self, service, **data):
         self.service_calls.append((service, data))
         if service == "media_player/volume_set":
@@ -165,8 +200,12 @@ class Rig:
         result = {"success": True, "result": {"context": {"id": "x"}}}
         if self.service_hook is not None:
             result = self.service_hook(service, data)
-        if service == "input_boolean/turn_off" and not (isinstance(result, dict) and result.get("success") is False):
-            self.set_party(False)
+        accepted = not (isinstance(result, dict) and result.get("success") is False)
+        if accepted and service == "input_boolean/turn_off":
+            self._schedule(0.05, lambda: self.set_party(False))
+        if accepted and service == "media_player/volume_set" and self.auto_echo:
+            entity, level = data["entity_id"], data["volume_level"]
+            self._schedule(self.echo_delay, lambda: self.move(entity[: -len("_2")], level))
         return result
 
     def vol(self, entity):
@@ -200,29 +239,33 @@ class Rig:
     def advance(self, seconds):
         end = self.t + seconds
         while True:
-            due = [(when, handle) for handle, (when, _) in self.timers.items() if when <= end + 1e-9]
+            due = [(when, 0, handle) for handle, (when, _) in self.timers.items() if when <= end + 1e-9]
+            due += [(p[0], 1, i) for i, p in enumerate(self.periodic) if p[0] <= end + 1e-9]
             if not due:
                 break
-            when, handle = min(due)
-            _, callback = self.timers.pop(handle)
+            when, kind, ref = min(due)
             self.t = max(self.t, when)
-            callback({})
+            if kind == 0:
+                _, callback = self.timers.pop(ref)
+                callback({})
+            else:
+                p = self.periodic[ref]
+                p[0] += p[1]
+                p[2]({})
         self.t = end
 
     def written(self):
         return {entity: level for _, entity, level in self.write_log}
 
-    def echo(self, writes=None):
-        """Feed back the volumes our own writes set, the way Music Assistant reports them."""
-        if writes is None:
-            writes = self.write_log[self._echoed:]
-            self._echoed = len(self.write_log)
-        for _, entity, level in writes:
-            self.move(entity[: -len("_2")], level)
-
-    def set_party(self, on, since=None):
-        since = since or self.wall
-        self.states[PARTY] = {"state": "on" if on else "off", "attributes": {}, "last_changed": since.isoformat()}
+    def set_party(self, on, since=None, store=True):
+        """The helper changes in Home Assistant. store=False models AppDaemon not knowing it."""
+        old = copy.deepcopy(self.states.get(PARTY))
+        new = party_state(on, since or self.wall)
+        if store:
+            self.states[PARTY] = new
+        else:
+            self.states.pop(PARTY, None)
+        self.app._on_party(PARTY, "all", old, copy.deepcopy(new), {})
 
     def logs(self, level=None, contains=None):
         out = []
@@ -249,8 +292,8 @@ class CoreSync(unittest.TestCase):
             with self.subTest(leader=leader):
                 r = Rig()
                 r.move(leader, round(r.vol(leader) + 0.05, 2))
-                r.advance(1)
                 expected = {twin(m): round(r.vol(m) + 0.05, 2) for m in FAMILY if m != leader}
+                r.advance(1)
                 self.assertEqual(r.written(), expected)
 
     def test_writes_are_volume_set_on_native_twins_and_never_on_the_leader(self):
@@ -320,8 +363,6 @@ class CoreSync(unittest.TestCase):
             volume = round(volume + 0.01, 2)
             r.move(KITCHEN, volume)
             r.advance(0.5)
-        r.advance(0.3)
-        r.echo()
         r.advance(5)
         self.assertEqual(r.vol(KITCHEN), 0.30)
         self.assertEqual(r.written(), {twin(LIVING): 0.32, twin(DINING): 0.30, twin(ROOFTOP): 0.30})
@@ -356,82 +397,165 @@ class LoopPrevention(unittest.TestCase):
         r.move(KITCHEN, 0.23)
         r.advance(1)
         windows_before = len(r.arm_delays)
-        r.advance(0.3)
-        r.echo()
         r.advance(5)
         self.assertEqual(len(r.write_log), 3)
         self.assertEqual(len(r.arm_delays), windows_before)
-        self.assertEqual(len(r.logs(level="DEBUG", contains="inside the echo window")), 3)
+        self.assertEqual(len(r.logs(level="DEBUG", contains="is our own write")), 3)
+        self.assertEqual((r.vol(LIVING), r.vol(DINING), r.vol(ROOFTOP)), (0.25, 0.23, 0.23))
 
-    def test_stale_echo_from_an_earlier_round_is_ignored_and_the_next_round_builds_on_the_last_target(self):
-        r = Rig()
+    def test_a_late_echo_is_still_recognised_by_value_and_never_ratchets_the_volumes(self):
+        for delay in (2.1, 5.0, 9.0):
+            with self.subTest(echo_delay=delay):
+                r = Rig(echo_delay=delay)
+                r.move(KITCHEN, 0.23)
+                r.advance(60)
+                self.assertEqual(len(r.write_log), 3)
+                self.assertEqual(r.arm_delays, [0.8])
+                self.assertEqual(
+                    (r.vol(KITCHEN), r.vol(LIVING), r.vol(DINING), r.vol(ROOFTOP)), (0.23, 0.25, 0.23, 0.23)
+                )
+
+    def test_repeated_user_steps_with_late_echoes_never_run_away(self):
+        r = Rig(echo_delay=2.1)
+        for step in range(3):
+            r.move(KITCHEN, round(r.vol(KITCHEN) + 0.05, 2))
+            r.advance(10)
+        r.advance(60)
+        self.assertEqual(len(r.write_log), 9)
+        self.assertEqual(
+            (r.vol(KITCHEN), r.vol(LIVING), r.vol(DINING), r.vol(ROOFTOP)), (0.33, 0.35, 0.33, 0.33)
+        )
+
+    def test_a_write_that_never_echoes_does_not_inflate_the_next_round(self):
+        r = Rig(auto_echo=False)
         r.move(KITCHEN, 0.23)
-        r.advance(0.8)
-        round_one = list(r.write_log)
-        self.assertEqual({e: v for _, e, v in round_one}, {twin(LIVING): 0.25, twin(DINING): 0.23, twin(ROOFTOP): 0.23})
-
-        r.advance(0.2)
+        r.advance(1.0)
+        self.assertEqual(r.written(), {twin(LIVING): 0.25, twin(DINING): 0.23, twin(ROOFTOP): 0.23})
         r.move(KITCHEN, 0.28)
-        r.advance(0.8)
-        round_two = r.write_log[len(round_one):]
-        self.assertEqual({e: v for _, e, v in round_two}, {twin(LIVING): 0.30, twin(DINING): 0.28, twin(ROOFTOP): 0.28})
+        r.advance(1.0)
+        second = {e: v for _, e, v in r.write_log[3:]}
+        self.assertEqual(second, {twin(LIVING): 0.25, twin(DINING): 0.23, twin(ROOFTOP): 0.23})
 
-        r.echo(round_one)
-        r.advance(0.2)
-        r.echo(round_two)
-        r.advance(5)
-        self.assertEqual(len(r.write_log), 6)
+    def test_a_remembered_target_only_matches_until_it_expires(self):
+        for wait, ignored in ((3.0, True), (11.0, False)):
+            with self.subTest(wait=wait):
+                r = Rig(auto_echo=False)
+                r.move(KITCHEN, 0.23)
+                r.advance(wait)
+                windows = len(r.arm_delays)
+                r.move(LIVING, 0.25)
+                r.advance(2)
+                self.assertEqual(len(r.arm_delays) == windows, ignored)
+                self.assertEqual(twin(KITCHEN) in r.written(), not ignored)
 
-    def test_change_on_a_follower_after_the_echo_window_counts_as_a_new_leader(self):
+    def test_only_the_value_we_wrote_is_taken_as_the_echo(self):
+        for name, volume in (("far away", 0.40), ("one step above", 0.26), ("one step below", 0.24)):
+            with self.subTest(name):
+                r = Rig(echo_delay=5.0)
+                r.move(KITCHEN, 0.23)
+                r.advance(1.0)
+                self.assertEqual(r.written()[twin(LIVING)], 0.25)
+                windows = len(r.arm_delays)
+                r.move(LIVING, volume)
+                self.assertEqual(len(r.arm_delays), windows + 1)
+                r.advance(2)
+                self.assertIn(twin(KITCHEN), r.written())
+
+    def test_change_on_a_follower_inside_the_old_echo_window_is_a_lead(self):
         r = Rig()
         r.move(KITCHEN, 0.23)
-        r.advance(0.8)
-        r.echo()
-        r.advance(2.1)
+        r.advance(1.5)
         writes_before = len(r.write_log)
         r.move(LIVING, 0.28)
-        r.advance(1)
+        r.advance(2)
         new_writes = {e: v for _, e, v in r.write_log[writes_before:]}
         self.assertEqual(new_writes, {twin(KITCHEN): 0.26, twin(DINING): 0.26, twin(ROOFTOP): 0.26})
 
-    def test_change_on_a_follower_inside_the_echo_window_cannot_be_told_from_the_echo(self):
+    def test_user_change_on_a_follower_right_after_our_write_is_not_overwritten_by_the_next_sync(self):
         r = Rig()
+        r.move(KITCHEN, 0.23)
+        r.advance(1.2)
+        self.assertEqual(r.vol(LIVING), 0.25)
+        r.move(LIVING, 0.40)
+        r.advance(0.3)
+        r.move(KITCHEN, 0.28)
+        r.advance(5)
+        self.assertEqual([v for _, e, v in r.write_log if e == twin(LIVING)], [0.25])
+        self.assertEqual(r.vol(LIVING), 0.40)
+        self.assertEqual(len(r.write_log), 3)
+        self.assertEqual(len(r.logs(contains="family_volume_sync_skip")), 1)
+
+    def test_follower_tapped_inside_the_old_echo_window_is_a_touch_and_is_not_written(self):
+        r = Rig()
+        r.move(KITCHEN, 0.23)
+        r.advance(1.2)
+        r.move(LIVING, 0.26)
+        r.advance(0.2)
+        r.move(LIVING, 0.25)
+        r.advance(0.1)
+        r.move(KITCHEN, 0.28)
+        r.advance(5)
+        second = {e: v for _, e, v in r.write_log[3:]}
+        self.assertEqual(second, {twin(DINING): 0.28, twin(ROOFTOP): 0.28})
+        self.assertIn("touched, left alone: living_room", r.logs(contains="family_volume_sync_apply")[-1])
+
+    def test_our_own_echo_arriving_inside_the_next_window_is_not_a_touch(self):
+        r = Rig(echo_delay=0.5)
         r.move(KITCHEN, 0.23)
         r.advance(0.8)
-        r.advance(0.5)
-        r.move(LIVING, 0.28)
-        r.advance(5)
-        self.assertEqual(len(r.write_log), 3)
-
-    def test_own_echo_arriving_inside_the_next_window_is_not_a_touch(self):
-        r = Rig()
-        r.move(KITCHEN, 0.23)
-        r.advance(1.0)
+        r.advance(0.2)
         r.move(KITCHEN, 0.28)
-        r.advance(0.1)
-        r.echo()
-        r.advance(1.0)
+        r.advance(5)
         second = {e: v for _, e, v in r.write_log[3:]}
         self.assertEqual(second, {twin(LIVING): 0.30, twin(DINING): 0.28, twin(ROOFTOP): 0.28})
+        self.assertNotIn("touched", r.logs(contains="family_volume_sync_apply")[1])
 
-    def test_second_round_that_lands_on_the_stale_snapshot_is_still_written(self):
+    def test_second_round_right_after_the_first_builds_on_the_echoed_volumes(self):
         r = Rig()
         r.move(KITCHEN, 0.23)
-        r.advance(1.0)
-        r.move(KITCHEN, 0.18)
-        r.advance(1.0)
-        second = {e: v for _, e, v in r.write_log[3:]}
-        self.assertEqual(second, {twin(LIVING): 0.20, twin(DINING): 0.18, twin(ROOFTOP): 0.18})
-
-    def test_second_round_while_the_first_is_in_flight_is_not_lost(self):
-        r = Rig()
-        r.move(KITCHEN, 0.23)
-        r.advance(0.8)
-        r.advance(0.3)
+        r.advance(1.1)
         r.move(KITCHEN, 0.24)
-        r.advance(0.8)
+        r.advance(1.0)
         second = {e: v for _, e, v in r.write_log[3:]}
         self.assertEqual(second, {twin(LIVING): 0.26, twin(DINING): 0.24, twin(ROOFTOP): 0.24})
+
+
+class ProductionRegressions(unittest.TestCase):
+    def test_single_move_then_a_dashboard_group_step_is_together_and_writes_nothing_more(self):
+        r = Rig({ROOFTOP: 0.22, LIVING: 0.23, KITCHEN: 0.22, DINING: 0.18})
+        r.move(DINING, 0.24, user_id=MIKKEL_ID)
+        r.advance(0.8)
+        self.assertEqual(r.written(), {twin(ROOFTOP): 0.28, twin(LIVING): 0.29, twin(KITCHEN): 0.28})
+        r.advance(0.5)
+        for m in (LIVING, DINING, ROOFTOP, KITCHEN):
+            r.move(m, round(r.vol(m) - 0.05, 2), user_id=MIKKEL_ID)
+            r.advance(0.01)
+        r.advance(10)
+        self.assertEqual(len(r.write_log), 3)
+        self.assertEqual(len(r.logs(contains="family_volume_sync_apply")), 1)
+        self.assertEqual(len(r.logs(contains="family_volume_sync_together")), 1)
+        self.assertEqual(r.logs(contains="family_volume_sync_skip"), [])
+        self.assertEqual(
+            (r.vol(ROOFTOP), r.vol(LIVING), r.vol(KITCHEN), r.vol(DINING)), (0.23, 0.24, 0.23, 0.19)
+        )
+
+    def test_group_step_half_a_second_after_a_sync_is_not_undone_when_the_dashboard_steps_from_stale_levels(self):
+        r = Rig({ROOFTOP: 0.22, LIVING: 0.23, KITCHEN: 0.22, DINING: 0.18})
+        r.move(DINING, 0.24, user_id=MIKKEL_ID)
+        r.advance(0.8)
+        self.assertEqual(r.written(), {twin(ROOFTOP): 0.28, twin(LIVING): 0.29, twin(KITCHEN): 0.28})
+        r.advance(0.5)
+        for m, volume in ((LIVING, 0.18), (DINING, 0.19), (KITCHEN, 0.17), (ROOFTOP, 0.17)):
+            r.move(m, volume, user_id=MIKKEL_ID)
+            r.advance(0.01)
+        r.advance(10)
+        self.assertEqual(len(r.write_log), 3)
+        self.assertEqual(len(r.logs(contains="family_volume_sync_apply")), 1)
+        self.assertEqual(len(r.logs(contains="family_volume_sync_skip")), 1)
+        self.assertEqual(r.logs(level="DEBUG", contains="is our own write")[3:], [])
+        self.assertEqual(
+            (r.vol(ROOFTOP), r.vol(LIVING), r.vol(KITCHEN), r.vol(DINING)), (0.17, 0.18, 0.17, 0.19)
+        )
 
 
 class StepperBursts(unittest.TestCase):
@@ -554,11 +678,9 @@ class SpeakerLiftedFromZero(unittest.TestCase):
         r = Rig()
         r.move(KITCHEN, 0.23)
         r.advance(0.8)
-        r.echo()
         r.advance(2.1)
         r.move(LIVING, 0.28)
         r.advance(1)
-        self.assertEqual(set(r.written()), {twin(LIVING), twin(DINING), twin(ROOFTOP), twin(KITCHEN)})
         self.assertEqual({e: v for _, e, v in r.write_log[3:]},
                          {twin(KITCHEN): 0.26, twin(DINING): 0.26, twin(ROOFTOP): 0.26})
 
@@ -678,6 +800,121 @@ class GroupAndSystemChanges(unittest.TestCase):
         self.assertEqual(r.write_log, [])
 
 
+class UnavailableTwin(unittest.TestCase):
+    def test_follower_whose_native_twin_is_unavailable_is_skipped_and_named(self):
+        for name, state in (("missing", None), ("unavailable", "unavailable"), ("unknown", "unknown")):
+            with self.subTest(name):
+                r = Rig()
+                if state is None:
+                    del r.states[twin(DINING)]
+                else:
+                    r.states[twin(DINING)]["state"] = state
+                r.move(KITCHEN, 0.23)
+                r.advance(1)
+                self.assertEqual(r.written(), {twin(LIVING): 0.25, twin(ROOFTOP): 0.23})
+                lines = r.logs(contains="family_volume_sync_twin_unavailable")
+                self.assertEqual(len(lines), 1)
+                self.assertIn("media_player.dining_room_2", lines[0])
+                self.assertEqual(r.logs(level="WARNING"), [])
+                self.assertNotIn("dining_room", r.logs(contains="family_volume_sync_apply")[0].split(" | ")[1])
+
+    def test_a_skipped_twin_is_not_expected_to_echo(self):
+        r = Rig()
+        r.states[twin(DINING)]["state"] = "unavailable"
+        r.move(KITCHEN, 0.23)
+        r.advance(1)
+        windows = len(r.arm_delays)
+        r.move(DINING, 0.23)
+        r.advance(2)
+        self.assertEqual(len(r.arm_delays), windows + 1)
+
+    def test_nothing_is_written_when_every_twin_is_unavailable(self):
+        r = Rig()
+        for m in (ROOFTOP, LIVING, DINING):
+            r.states[twin(m)]["state"] = "unavailable"
+        r.move(KITCHEN, 0.23)
+        r.advance(3)
+        self.assertEqual(r.write_log, [])
+        self.assertEqual(len(r.logs(contains="family_volume_sync_twin_unavailable")), 3)
+        self.assertEqual(r.logs(contains="family_volume_sync_apply"), [])
+
+    def test_an_idle_twin_is_written(self):
+        r = Rig()
+        r.states[twin(DINING)]["state"] = "idle"
+        r.move(KITCHEN, 0.23)
+        r.advance(1)
+        self.assertIn(twin(DINING), r.written())
+
+
+class Topology(unittest.TestCase):
+    def test_speaker_grouped_with_the_leader_during_the_window_is_not_written(self):
+        r = Rig()
+        r.regroup([KITCHEN, LIVING])
+        r.change(DINING, group_members=[])
+        r.change(ROOFTOP, group_members=[])
+        r.move(KITCHEN, 0.23)
+        r.advance(0.3)
+        r.change(LIVING, group_members=[])
+        r.regroup([KITCHEN, DINING])
+        r.advance(5)
+        self.assertEqual(r.write_log, [])
+        line = r.logs(contains="family_volume_sync_together")[0]
+        self.assertIn("not in the group when it moved, left alone: dining_room", line)
+
+    def test_speaker_that_joined_the_group_during_the_window_is_not_written(self):
+        r = Rig()
+        r.regroup([KITCHEN, LIVING])
+        r.change(DINING, group_members=[])
+        r.change(ROOFTOP, group_members=[])
+        r.move(KITCHEN, 0.23)
+        r.advance(0.3)
+        r.regroup([KITCHEN, LIVING, DINING])
+        r.advance(5)
+        self.assertEqual(r.written(), {twin(LIVING): 0.25})
+        line = r.logs(contains="family_volume_sync_apply")[0]
+        self.assertIn("not in the group when it moved, left alone: dining_room", line)
+
+    def test_speaker_that_left_the_group_during_the_window_is_not_written(self):
+        r = Rig()
+        r.move(KITCHEN, 0.23)
+        r.advance(0.3)
+        r.change(DINING, group_members=[])
+        r.advance(5)
+        self.assertEqual(r.written(), {twin(LIVING): 0.25, twin(ROOFTOP): 0.23})
+
+    def test_speaker_that_joined_before_the_first_change_is_written(self):
+        r = Rig()
+        r.regroup([KITCHEN, LIVING])
+        r.regroup([KITCHEN, LIVING, DINING])
+        r.move(KITCHEN, 0.23)
+        r.advance(5)
+        self.assertEqual(r.written(), {twin(LIVING): 0.25, twin(DINING): 0.23})
+
+    def test_follower_that_was_out_of_the_group_when_one_of_the_leaders_moved_is_not_written(self):
+        r = Rig()
+        r.move(LIVING, 0.25)
+        r.advance(0.1)
+        r.regroup([ROOFTOP, LIVING, KITCHEN])
+        r.change(DINING, group_members=[])
+        r.move(KITCHEN, 0.23)
+        r.advance(0.1)
+        r.regroup(FAMILY)
+        r.advance(5)
+        self.assertEqual(r.written(), {twin(ROOFTOP): 0.23})
+
+    def test_the_group_a_change_was_made_in_is_remembered_from_its_first_change_in_the_window(self):
+        r = Rig()
+        r.regroup([KITCHEN, LIVING])
+        r.change(DINING, group_members=[])
+        r.change(ROOFTOP, group_members=[])
+        r.move(KITCHEN, 0.19)
+        r.advance(0.2)
+        r.regroup([KITCHEN, LIVING, DINING])
+        r.move(KITCHEN, 0.23)
+        r.advance(5)
+        self.assertEqual(r.written(), {twin(LIVING): 0.25})
+
+
 class SpeakersAndGroups(unittest.TestCase):
     def test_living_room_on_the_tv_source_does_not_follow(self):
         r = Rig({LIVING: 0.35})
@@ -790,14 +1027,18 @@ class SpeakersAndGroups(unittest.TestCase):
 
 
 class Initialization(unittest.TestCase):
-    def test_listens_only_on_the_music_assistant_ids_and_writes_nothing(self):
+    def test_listens_on_the_music_assistant_ids_and_the_party_helper_and_writes_nothing(self):
         r = Rig()
         calls = r.app.listen_state.call_args_list
-        self.assertEqual([c.args[1] for c in calls], FAMILY)
+        self.assertEqual([c.args[1] for c in calls], FAMILY + [PARTY])
         self.assertTrue(all(c.kwargs == {"attribute": "all"} for c in calls))
         self.assertFalse(any(c.args[1].endswith("_2") for c in calls))
         self.assertEqual(r.service_calls, [])
         self.assertEqual(r.arm_delays, [])
+
+    def test_party_expiry_is_checked_periodically(self):
+        r = Rig()
+        self.assertEqual(r.run_every_calls, [("now+60", 900)])
 
     def test_config_is_read_from_args(self):
         r = Rig()
@@ -805,7 +1046,7 @@ class Initialization(unittest.TestCase):
         self.assertEqual(app.speakers, FAMILY)
         self.assertEqual(app.tv_speaker, LIVING)
         self.assertEqual(app.party_entity, PARTY)
-        self.assertEqual((app.settle, app.max_window, app.echo_window, app.party_max_hours), (0.8, 5.0, 2.0, 12.0))
+        self.assertEqual((app.settle, app.max_window, app.echo_window, app.party_max_hours), (0.8, 5.0, 10.0, 12.0))
 
 
 class ApplyLogLine(unittest.TestCase):
@@ -853,26 +1094,29 @@ class ApplyLogLine(unittest.TestCase):
         r = Rig({ROOFTOP: 0.98})
         r.move(KITCHEN, 0.23, user_id=MIKKEL_ID)
         r.advance(1)
-        r.echo()
         for m in FAMILY:
             r.move(m, 0.40)
         r.advance(5)
         for m in FAMILY:
             r.move(m, round(r.vol(m) + 0.05, 2))
         r.advance(5)
-        r.set_party(True)
-        r.move(KITCHEN, 0.50)
-        r.set_party(True, since=r.wall - timedelta(hours=13))
+        r.states[twin(DINING)]["state"] = "unavailable"
         r.move(KITCHEN, 0.55)
+        r.advance(1)
+        r.regroup([KITCHEN, LIVING])
+        r.move(KITCHEN, 0.60)
+        r.regroup(FAMILY)
         r.advance(5)
+        r.set_party(True)
+        r.advance(13 * HOUR)
         messages = [c.args[0] for c in r.app.log.call_args_list]
-        self.assertGreater(len(messages), 5)
+        self.assertGreater(len(messages), 8)
         for message in messages:
             self.assertTrue(message.isascii(), message)
 
 
 class FailedWrites(unittest.TestCase):
-    def test_failed_write_logs_a_warning_and_is_not_marked_inflight(self):
+    def test_failed_write_logs_a_warning_and_is_not_expected_back(self):
         for name, hook, text in (
             ("exception", raising_for(twin(DINING)), "boom"),
             ("rejected result", rejecting_for(twin(DINING)), "service_validation_error nope"),
@@ -891,13 +1135,13 @@ class FailedWrites(unittest.TestCase):
                 self.assertEqual(len(apply_line), 1)
                 self.assertNotIn("dining_room", apply_line[0].split(" | ")[1])
 
-                r.advance(0.2)
-                r.move(DINING, 0.22)
-                self.assertEqual(len(r.arm_delays), 2)
                 r.service_hook = None
+                windows = len(r.arm_delays)
+                r.move(DINING, 0.23)
+                self.assertEqual(len(r.arm_delays), windows + 1)
                 r.advance(1)
                 latest = {e: v for _, e, v in r.write_log[3:]}
-                self.assertEqual(latest, {twin(KITCHEN): 0.27, twin(LIVING): 0.29, twin(ROOFTOP): 0.27})
+                self.assertEqual(latest, {twin(KITCHEN): 0.28, twin(LIVING): 0.30, twin(ROOFTOP): 0.28})
 
     def test_a_failed_write_does_not_stop_the_other_followers(self):
         r = Rig()
@@ -958,70 +1202,98 @@ class PartyMode(unittest.TestCase):
         r.set_party(False)
         for volume in (0.40, 0.45):
             r.move(KITCHEN, volume)
-            r.advance(1)
-            r.echo()
-            r.advance(2.5)
+            r.advance(3.5)
         self.assertEqual(len(r.logs(level="INFO", contains="party -> on")), 1)
         self.assertEqual(len(r.logs(level="INFO", contains="party -> off")), 1)
 
-    def test_party_older_than_the_max_hours_is_switched_off_and_the_sync_resumes(self):
+    def test_party_is_switched_off_after_the_max_hours_without_any_volume_activity(self):
         r = Rig()
-        r.set_party(True, since=r.wall - timedelta(hours=12, minutes=1))
+        r.set_party(True)
+        r.advance(12 * HOUR)
+        self.assertEqual(turn_offs(r), [])
+        r.advance(PARTY_CHECK_S)
+        self.assertEqual(turn_offs(r), [("input_boolean/turn_off", {"entity_id": PARTY})])
+        self.assertEqual(len(r.logs(level="INFO", contains="party_expired")), 1)
+        self.assertEqual(len(r.logs(level="INFO", contains="party -> off")), 1)
         r.move(KITCHEN, 0.23)
         r.advance(1)
-        self.assertEqual([c for c in r.service_calls if c[0] == "input_boolean/turn_off"],
-                         [("input_boolean/turn_off", {"entity_id": PARTY})])
-        self.assertEqual(len(r.logs(level="INFO", contains="party_expired")), 1)
         self.assertEqual(r.written(), {twin(LIVING): 0.25, twin(DINING): 0.23, twin(ROOFTOP): 0.23})
+
+    def test_party_is_not_expired_at_exactly_the_max_hours(self):
+        first_check = 60.0
+        r = Rig(party=(True, WALL_START + timedelta(seconds=first_check) - timedelta(hours=12)))
+        r.advance(first_check)
+        self.assertEqual(turn_offs(r), [])
+        r.advance(PARTY_CHECK_S)
+        self.assertEqual(len(turn_offs(r)), 1)
 
     def test_party_inside_the_max_hours_stays_on(self):
         r = Rig()
-        r.set_party(True, since=r.wall - timedelta(hours=11, minutes=59))
+        r.set_party(True)
+        r.advance(11.9 * HOUR)
+        self.assertEqual(turn_offs(r), [])
         r.move(KITCHEN, 0.23)
         r.advance(1)
-        self.assertEqual([c for c in r.service_calls if c[0] == "input_boolean/turn_off"], [])
         self.assertEqual(r.write_log, [])
 
-    def test_party_expiry_is_also_checked_when_the_timer_fires(self):
-        r = Rig()
+    def test_party_that_was_already_on_when_the_app_started_still_expires(self):
+        r = Rig(party=(True, WALL_START - timedelta(hours=11)))
+        self.assertEqual(len(r.logs(level="INFO", contains="party -> on")), 1)
         r.move(KITCHEN, 0.23)
-        r.advance(0.3)
-        r.set_party(True, since=r.wall - timedelta(hours=13))
         r.advance(1)
-        self.assertEqual([c for c in r.service_calls if c[0] == "input_boolean/turn_off"],
-                         [("input_boolean/turn_off", {"entity_id": PARTY})])
-        self.assertEqual(len(r.write_log), 3)
+        self.assertEqual(r.write_log, [])
+        r.advance(1.1 * HOUR)
+        self.assertEqual(len(turn_offs(r)), 1)
 
-    def test_failing_to_switch_the_expired_party_off_is_warned_and_does_not_block_the_sync(self):
+    def test_failing_to_switch_the_party_off_is_warned_and_retried_at_the_next_check(self):
         r = Rig()
-        r.set_party(True, since=r.wall - timedelta(hours=13))
         r.service_hook = rejecting_service("input_boolean/turn_off")
+        r.set_party(True)
+        r.advance(12 * HOUR + 2 * PARTY_CHECK_S)
+        self.assertEqual(len(turn_offs(r)), 2)
+        self.assertEqual(len(r.logs(level="WARNING", contains="input_boolean/turn_off")), 2)
         r.move(KITCHEN, 0.23)
         r.advance(1)
-        self.assertGreaterEqual(len(r.logs(level="WARNING", contains="input_boolean/turn_off")), 1)
+        self.assertEqual(r.write_log, [])
+
+    def test_helper_created_while_appdaemon_runs_is_seen_from_its_first_event(self):
+        r = Rig()
+        r.set_party(True, store=False)
+        self.assertIsNone(r._get_state(PARTY, attribute="all"))
+        r.move(KITCHEN, 0.23)
+        r.advance(5)
+        self.assertEqual(r.write_log, [])
+        self.assertEqual(len(r.logs(level="INFO", contains="party -> on")), 1)
+
+    def test_deleting_the_helper_resumes_the_sync(self):
+        r = Rig()
+        r.set_party(True)
+        r.app._on_party(PARTY, "all", copy.deepcopy(r.states[PARTY]), None, {})
+        r.move(KITCHEN, 0.23)
+        r.advance(1)
         self.assertEqual(len(r.write_log), 3)
 
     def test_missing_off_or_unavailable_helper_is_treated_as_off(self):
-        unavailable = {"state": "unavailable", "attributes": {}, "last_changed": WALL_START.isoformat()}
-        for name, helper in (("missing", None), ("off", "off"), ("unavailable", unavailable)):
+        for name in ("missing", "off", "unavailable"):
             with self.subTest(name):
                 r = Rig()
-                if helper == "off":
+                if name == "off":
                     r.set_party(False)
-                elif helper is not None:
-                    r.states[PARTY] = helper
+                elif name == "unavailable":
+                    r.app._on_party(PARTY, "all", None, party_state(False, r.wall) | {"state": "unavailable"}, {})
                 r.move(KITCHEN, 0.23)
                 r.advance(1)
                 self.assertEqual(len(r.write_log), 3)
-                self.assertEqual([c for c in r.service_calls if c[0] == "input_boolean/turn_off"], [])
+                self.assertEqual(turn_offs(r), [])
 
     def test_unreadable_last_changed_never_expires_the_party(self):
         r = Rig()
-        r.states[PARTY] = {"state": "on", "attributes": {}, "last_changed": "never"}
+        r.app._on_party(PARTY, "all", None, {"state": "on", "attributes": {}, "last_changed": "never"}, {})
+        r.advance(13 * HOUR)
+        self.assertEqual(turn_offs(r), [])
         r.move(KITCHEN, 0.23)
         r.advance(1)
         self.assertEqual(r.write_log, [])
-        self.assertEqual([c for c in r.service_calls if c[0] == "input_boolean/turn_off"], [])
 
 
 class AppYaml(unittest.TestCase):

@@ -18,5 +18,5 @@ FamilyRoomVolumeSync:
   party_mode_entity: input_boolean.family_volume_sync_party
   settle_seconds: 0.8
   max_window_seconds: 5
-  echo_window_seconds: 2
+  echo_window_seconds: 10
   party_mode_max_hours: 12
