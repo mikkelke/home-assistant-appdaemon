@@ -62,6 +62,8 @@ TransitStatus:
   status_sensor_prefix: "sensor.transit_"
   # Frontend can read this to show "Last updated X min ago" and "Updates every N min"
   last_updated_sensor: "sensor.transit_last_updated"
+  # Absolute departure times (ts) on each departure, for HouseUpcoming's train row.
+  expose_departure_ts: true
 
   routes:
     # ── Metro M3: Enghave Plads → KBH H ──────────────────────────────────
