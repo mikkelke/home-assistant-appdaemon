@@ -36,6 +36,7 @@ DEFAULT_RISE = 30
 LOW_DAYS_KEEP = 7
 DUE_TIME = time(9, 0)
 DRUM_INTERVAL = timedelta(days=30)
+DRUM_HOW = "Bomuld 90, empty + a little powder"
 PUSHED_KEEP = timedelta(days=180)
 
 ACTIONS = ("replace", "recharge", "charge")
@@ -368,16 +369,18 @@ def drum_due(last_clean, now):
 
 
 def drum_row(last_clean, now, area, start=None):
-    """Miele's monthly Bomuld 90, timed at `start` (upcoming_drum.drum_start: when and what to say)
-    when there is one. Without a confirmed clean on record the row shows but is never pushed:
-    missing evidence is not an overdue clean."""
+    """Miele's monthly drum clean: what to run, then what the start saves, timed at `start`
+    (upcoming_drum.drum_start: when, what it saves, whether that is now) when there is one. A row
+    timed at now stays out of the next chip, where it would sit for as long as now stays cheapest.
+    Without a confirmed clean on record the row shows but is never pushed: missing evidence is not
+    an overdue clean."""
     if not drum_due(last_clean, now):
         return None
     when = parse_iso(last_clean)
-    last = f"last {ddmm(when, now)}" if when else "last unknown"
-    at, detail = (start[0], fit_parts([start[1], last])) if start else (None, f"Bomuld 90 monthly, {last}")
+    at, price, at_now = start or (None, None, False)
+    detail = fit_parts([DRUM_HOW, price, f"last {ddmm(when, now)}" if when else "last unknown"])
     row = make_row("maint:washer:drum", "maint", "Washer drum clean", detail, at=at, icon="mdi:washing-machine",
-                   area=area, audience="admin")
+                   area=area, audience="admin", skip_next=at_now)
     return row, (f"washer:drum:{utc_iso(when)}" if when else None)
 
 

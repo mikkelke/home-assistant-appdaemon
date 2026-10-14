@@ -74,7 +74,7 @@ class HouseUpcoming(hass.Hass):
         self.washer_area = washer.get("area", "guest_bathroom")
         self.price_entity = washer.get("price_entity", "sensor.energi_data_service")
         self.profiles_entity = washer.get("profiles_entity", "sensor.appliance_run_profiles")
-        self.drum_programmes = tuple(washer.get("drum_programmes") or ["bomuld_90"])
+        self.drum_programmes = tuple(washer.get("drum_programmes") or ["drum_clean", "bomuld_90", "bomuld_60"])
         tr = a.get("train") or {}
         self.train_route = tr.get("route", "sensor.transit_kbh_ic_odense")
         self.train_stog = tr.get("stog_status", "input_select.transit_carlsberg_stog_kbh_status")
