@@ -10,7 +10,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "transit"))
-sys.modules.setdefault("aiohttp", types.ModuleType("aiohttp"))
+_aiohttp = types.ModuleType("aiohttp")
+_aiohttp.ClientSession = object
+sys.modules.setdefault("aiohttp", _aiohttp)
 _hassapi = types.ModuleType("appdaemon.plugins.hass.hassapi")
 _hassapi.Hass = object
 for _name, _mod in (
