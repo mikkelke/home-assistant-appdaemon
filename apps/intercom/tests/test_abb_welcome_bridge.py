@@ -1983,6 +1983,197 @@ class NativeRingClipTests(unittest.TestCase):
         self.assertTrue(episode["voice_spoken"])
 
 
+class ClipPosterTests(unittest.TestCase):
+    """The ring clip's first frame stands in as the ring photo while the
+    gateway's screenshot is missing, and gives way to it once it arrives. The
+    image entity starts out holding an older visitor, as it does whenever the
+    gateway sends nothing for a ring."""
+
+    POSTER = "abb_ringclip_20261013_174450_100000002.jpg"
+    POSTER_URL = "/local/abb_doorbell/abb_ringclip_20261013_174450_100000002.jpg"
+    CLIP = "abb_ringclip_20261013_174450_100000002.mp4"
+    STALE_PICTURE = "/api/image_proxy/image.abb_screenshot?token=stale"
+    STALE_SHOT = {"captured_at": "2026-09-11T13:27:06+00:00", "event_id": "shot-0911"}
+
+    def setUp(self):
+        self.ring = datetime(2026, 10, 13, 15, 44, 50, tzinfo=timezone.utc)
+        self.clock = Clock(self.ring)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.app = _bare_bridge(self.tmp.name, self.clock)
+        self.app.native_ring_clips = True
+        self.app.archive_dir.mkdir(parents=True, exist_ok=True)
+        self.poster_bytes = b"\xff\xd8\xff\xdb" + b"p" * 64
+        (self.app.archive_dir / self.POSTER).write_bytes(self.poster_bytes)
+        # The image entity still holds the last screenshot it ever got.
+        self._set_image(self.STALE_SHOT)
+        self.app.states[("image.abb_screenshot", "entity_picture")] = self.STALE_PICTURE
+        self.episode = self.app._open_episode("front door", "100000002", self.ring)
+
+    def _set_image(self, attrs):
+        self.app.states["image.abb_screenshot"] = {"attributes": dict(attrs)}
+        self.app.states[("image.abb_screenshot", "captured_at")] = attrs["captured_at"]
+
+    def _clip_event(self, drop=(), **overrides):
+        payload = {
+            "station_id": "100000002",
+            "filename": self.CLIP,
+            "url": f"/local/abb_doorbell/{self.CLIP}",
+            "poster_filename": self.POSTER,
+            "poster_url": self.POSTER_URL,
+            "duration_s": 4.95,
+            "frames": 32,
+            "segments": 1,
+            "started_at": (self.ring + timedelta(seconds=3.6)).isoformat(),
+            "reason": "ring",
+            "ok": True,
+        }
+        payload.update(overrides)
+        for key in drop:
+            payload.pop(key)
+        self.clock.at = self.ring + timedelta(seconds=8.8)
+        self.app._on_native_ring_clip("abb_welcome_ring_clip", payload, {})
+        return payload
+
+    def _photo_arrived(self):
+        return [(cb, delay, kw) for cb, delay, kw in self.app.run_in_calls
+                if cb.__name__ == "_ring_push_due" and kw.get("reason") == "photo-arrived"]
+
+    def _defer_push(self):
+        self.clock.at = self.ring + timedelta(seconds=3.7)
+        return self.app.defer_ring_push("front door", "Intercom auto-opened", "Someone rang.", "mikkel")
+
+    def test_poster_becomes_the_snapshot_and_releases_the_held_push(self):
+        self.assertTrue(self._defer_push())
+        self.assertEqual(self.app.pushes, [])
+        payload = self._clip_event()
+        snap = self.episode["snapshot"]
+        self.assertEqual(snap["bytes"], self.poster_bytes)
+        self.assertEqual(snap["captured_at"], bridge_mod.parse_iso_ts(payload["started_at"]))
+        self.assertEqual(snap["event_id"], f"clip:{self.POSTER}")
+        self.assertEqual(snap["url"], self.POSTER_URL)
+        released = self._photo_arrived()
+        self.assertEqual([delay for _, delay, _ in released], [0])
+        callback, _, kwargs = released[0]
+        callback(kwargs)
+        self.assertEqual(len(self.app.pushes), 1)
+        self.assertEqual(self.app.pushes[0]["data"]["image"], self.POSTER_URL)
+        self.assertTrue(any("reason=photo-arrived photo=True" in m for _, m in self.app.logs))
+        _run_scheduled(self.app, "_ring_push_due")  # the 30 s deadline still fires later
+        self.assertEqual(len(self.app.pushes), 1)
+
+    def test_poster_already_in_hand_goes_out_with_the_push_at_once(self):
+        self._clip_event()
+        self.assertTrue(self._defer_push())
+        self.assertEqual(len(self.app.pushes), 1)
+        self.assertEqual(self.app.pushes[0]["data"]["image"], self.POSTER_URL)
+
+    def test_poster_without_a_url_sends_no_photo_not_the_stale_one(self):
+        self._clip_event(poster_url="")
+        self.assertEqual(self.episode["snapshot"]["bytes"], self.poster_bytes)
+        self._defer_push()
+        self.assertEqual(len(self.app.pushes), 1)
+        self.assertNotIn("image", self.app.pushes[0]["data"])
+
+    def test_intercom_attachment_never_offers_the_stale_picture_beside_a_poster(self):
+        self._clip_event()
+        self.assertIsNone(self.app.ring_attachment_data("front door"))
+
+    def test_ring_with_only_a_poster_archives_photo_and_clip(self):
+        payload = self._clip_event()
+        (self.app.archive_dir / payload["filename"]).write_bytes(b"mp4data")
+        self.clock.at = self.ring + timedelta(seconds=76)
+        _run_scheduled(self.app, "_close_episode")
+        entry = self.app._load_index()[0]
+        self.assertTrue(entry["filename"].startswith("abb_ring_"))
+        self.assertEqual((self.app.archive_dir / entry["filename"]).read_bytes(), self.poster_bytes)
+        self.assertEqual(entry["clip_filename"], self.CLIP)
+
+    def test_later_fresh_gateway_frame_still_wins(self):
+        # Captured before the poster's own first frame, and it still wins.
+        self._clip_event()
+        self.app._fetch_image_bytes = lambda: JPEG
+        self.clock.at = self.ring + timedelta(seconds=22)
+        self._set_image({"captured_at": (self.ring + timedelta(seconds=2.5)).isoformat(),
+                         "event_id": "shot-1"})
+        self.app._on_image_update("image.abb_screenshot", "all", None,
+                                  self.app.states["image.abb_screenshot"], {})
+        snap = self.episode["snapshot"]
+        self.assertEqual(snap["event_id"], "shot-1")
+        self.assertEqual(snap["bytes"], JPEG)
+        self.assertNotIn("url", snap)
+        self.clock.at = self.ring + timedelta(seconds=76)
+        _run_scheduled(self.app, "_close_episode")
+        entry = self.app._load_index()[0]
+        self.assertEqual((self.app.archive_dir / entry["filename"]).read_bytes(), JPEG)
+
+    def test_stale_gateway_frame_never_replaces_the_poster(self):
+        self._clip_event()
+        self.app._fetch_image_bytes = lambda: JPEG
+        _run_scheduled(self.app, "_probe_snapshot")
+        self.app._on_image_update("image.abb_screenshot", "all", None,
+                                  self.app.states["image.abb_screenshot"], {})
+        self.assertEqual(self.episode["snapshot"]["event_id"], f"clip:{self.POSTER}")
+
+    def test_poster_never_replaces_a_gateway_frame_already_captured(self):
+        self.episode["snapshot"] = {"bytes": JPEG, "event_id": "shot-1",
+                                    "captured_at": self.ring + timedelta(seconds=2)}
+        self._clip_event()
+        self.assertEqual(self.episode["snapshot"]["event_id"], "shot-1")
+        self.assertEqual(self._photo_arrived(), [])
+
+    def test_gateway_frame_landing_while_the_poster_is_read_keeps_its_place(self):
+        # Dispatched on an empty snapshot, but a gateway frame got there first.
+        self.episode["snapshot"] = {"bytes": JPEG, "event_id": "shot-1",
+                                    "captured_at": self.ring + timedelta(seconds=2)}
+        self.app._capture_poster_for_episode(self.episode["id"], self.POSTER,
+                                             self.ring + timedelta(seconds=3.6), self.POSTER_URL)
+        self.assertEqual(self.episode["snapshot"]["event_id"], "shot-1")
+        self.assertEqual(self._photo_arrived(), [])
+
+    def test_no_poster_keeps_the_clip_only_archive_and_text_push(self):
+        self._defer_push()
+        payload = self._clip_event(poster_filename="", poster_url="")
+        (self.app.archive_dir / payload["filename"]).write_bytes(b"mp4data")
+        self.assertIsNone(self.episode["snapshot"])
+        self.assertEqual(self._photo_arrived(), [])
+        _run_scheduled(self.app, "_ring_push_due")  # the deadline
+        self.assertEqual(len(self.app.pushes), 1)
+        self.assertNotIn("image", self.app.pushes[0]["data"])
+        self.clock.at = self.ring + timedelta(seconds=76)
+        _run_scheduled(self.app, "_close_episode")
+        entry = self.app._load_index()[0]
+        self.assertEqual(entry["filename"], "")
+        self.assertEqual(entry["clip_filename"], self.CLIP)
+
+    def test_an_older_integration_without_poster_keys_changes_nothing(self):
+        self._clip_event(drop=("poster_filename", "poster_url"))
+        self.assertEqual(self.episode["clip_filename"], self.CLIP)
+        self.assertIsNone(self.episode["snapshot"])
+
+    def test_unusable_poster_files_are_refused(self):
+        (Path(self.tmp.name) / "outside.jpg").write_bytes(self.poster_bytes)
+        (self.app.archive_dir / "abb_ringclip_png.jpg").write_bytes(b"\x89PNG" + b"x" * 64)
+        (self.app.archive_dir / "abb_ringclip_huge.jpg").write_bytes(
+            b"\xff\xd8" + b"x" * bridge_mod.MAX_IMAGE_BYTES)
+        for name in ("abb_ringclip_missing.jpg", "abb_ringclip_png.jpg",
+                     "abb_ringclip_huge.jpg", "../outside.jpg"):
+            with self.subTest(name=name):
+                self._clip_event(poster_filename=name)
+                self.assertIsNone(self.episode["snapshot"])
+        self.assertEqual(self._photo_arrived(), [])
+
+    def test_a_poster_nobody_indexed_is_swept_after_a_day(self):
+        old_poster = self.app.archive_dir / "abb_ringclip_20261011_181153_100000002.jpg"
+        old_poster.write_bytes(self.poster_bytes)
+        day_plus = RING_ESP.timestamp() - 2 * 86400
+        os.utime(old_poster, (day_plus, day_plus))
+        self.app._archive_write(JPEG, self.ring.isoformat(), "100000002", "front door",
+                                "ring_auto_opened")
+        self.assertFalse(old_poster.exists())
+        self.assertTrue((self.app.archive_dir / self.POSTER).exists())  # young: its push may still fetch it
+
+
 class RingArmedVoiceTests(unittest.TestCase):
     """The sentence starts at the RING, not after the unlock (2026-08-27).
 

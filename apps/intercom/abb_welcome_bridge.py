@@ -543,8 +543,8 @@ class AbbWelcomeBridge(hass.Hass):
         if episode is None:
             return False
         snap = episode.get("snapshot")
-        if snap is not None:
-            return True  # already captured and freshness-checked for this episode
+        if snap is not None and "url" not in snap:
+            return True  # this ring's gateway frame, already captured and freshness-checked
         captured_at = parse_iso_ts(
             self.get_state(self.abb_image_entity, attribute="captured_at"))
         if captured_at is None:
@@ -620,8 +620,11 @@ class AbbWelcomeBridge(hass.Hass):
         episode["push_flushed"] = True
         episode["push_pending"] = None
         data = {"tag": f"abb_autoopen_{door_slug(pending['door'], '')}"}
-        if episode.get("snapshot") is not None:
-            url = self.get_state(self.abb_image_entity, attribute="entity_picture")
+        snap = episode.get("snapshot")
+        if snap is not None:
+            # A clip poster carries its own URL: the image entity then still holds an
+            # older visitor, so an empty poster URL means no photo, never that one.
+            url = snap["url"] if "url" in snap else self.get_state(self.abb_image_entity, attribute="entity_picture")
             if url:
                 data["image"] = url
         try:
@@ -746,7 +749,7 @@ class AbbWelcomeBridge(hass.Hass):
             "answered": False,
             "push_sent": False,
             "scored": False,
-            "snapshot": None,  # {"bytes","captured_at","event_id"}
+            "snapshot": None,  # {"bytes","captured_at","event_id"} (+ "url" when it is the clip poster - _capture_poster_for_episode)
             "clip_filename": None,  # set by _start_clip (or _on_native_ring_clip) once a clip exists
             "clip_started_at": None,  # when the record dial went out (voices yield until it ends)
             "voice_spoken": False,  # one "the door is open" sentence per episode (native + legacy dedup)
@@ -1462,7 +1465,9 @@ class AbbWelcomeBridge(hass.Hass):
         self.archive_dir/clip_filename, and that is the SAME directory the
         integration writes to (clip_record_dir/archive_dir are two container
         mount aliases for one host path, exactly as they already are for the
-        fallback dial's own file)."""
+        fallback dial's own file). The clip's poster, its first frame as a JPEG
+        in that same directory, stands in as the ring photo when no gateway
+        frame has arrived (_capture_poster_for_episode)."""
         try:
             if not self.native_ring_clips:
                 return  # defense in depth: a stray event must never touch state when off
@@ -1488,6 +1493,10 @@ class AbbWelcomeBridge(hass.Hass):
                 f"frames={data.get('frames')} segments={data.get('segments')} {self._ring_rel(episode)}",
                 level="INFO",
             )
+            poster_filename = data.get("poster_filename") or ""
+            if poster_filename and episode["snapshot"] is None:
+                self.submit_to_executor(self._capture_poster_for_episode, episode["id"],
+                                        poster_filename, started_at, data.get("poster_url") or "")
         except Exception as e:
             self.log(f"Native ring-clip handling failed: {e}", level="WARNING")
 
@@ -2062,7 +2071,10 @@ class AbbWelcomeBridge(hass.Hass):
             return
         episode = max(eligible, key=lambda e: e["started_at"])
         snap = episode["snapshot"]
-        if snap is not None and (snap["event_id"] == event_id or snap["captured_at"] >= captured_at):
+        # A clip poster only stands in until a fresh gateway frame arrives, whichever
+        # of the two was captured first.
+        if (snap is not None and "url" not in snap
+                and (snap["event_id"] == event_id or snap["captured_at"] >= captured_at)):
             return
         # Fetch off-thread: the HTTP read may take seconds and this app's
         # pinned thread must stay free for ring callbacks.
@@ -2096,6 +2108,35 @@ class AbbWelcomeBridge(hass.Hass):
                         reason="photo-arrived")
         except Exception as e:
             self.log(f"Snapshot capture failed for {episode_id}: {e}", level="WARNING")
+
+    def _capture_poster_for_episode(self, episode_id, filename, captured_at, url):
+        """Executor-thread twin of _capture_for_episode for the integration's clip
+        poster: read from the archive under _fetch_image_bytes' JPEG checks, and
+        only into an empty snapshot, so a gateway frame already captured keeps it.
+        url is the poster's own, "" when the integration could not serve one."""
+        try:
+            if os.path.basename(filename) != filename:
+                self.log(f"Clip poster rejected: {filename!r} is not a bare file name", level="WARNING")
+                return
+            with (self.archive_dir / filename).open("rb") as f:
+                raw = f.read(MAX_IMAGE_BYTES + 1)
+            if len(raw) > MAX_IMAGE_BYTES or not raw.startswith(JPEG_MAGIC):
+                self.log(f"Clip poster rejected (size={len(raw)}, jpeg={raw[:2] == JPEG_MAGIC})", level="WARNING")
+                return
+            episode = self.episodes.get(episode_id)
+            if episode is None or episode["closed"] or episode["snapshot"] is not None:
+                return
+            episode["snapshot"] = {
+                "bytes": raw,
+                "captured_at": captured_at,
+                "event_id": f"clip:{filename}",
+                "url": url,
+            }
+            self.log(f"Snapshot from clip poster for episode {episode_id} ({len(raw)} bytes, {filename})", level="INFO")
+            self.run_in(self._ring_push_due, 0, episode_id=episode_id,
+                        reason="photo-arrived")
+        except Exception as e:
+            self.log(f"Clip poster capture failed for {episode_id}: {e}", level="WARNING")
 
     def _fetch_image_bytes(self):
         """GET the image entity's bytes over the HA API (executor thread only).
