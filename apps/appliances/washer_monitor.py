@@ -244,6 +244,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         reaches the caller, whose own tick retries. Internal state therefore never runs ahead of the entity."""
         if _store_only:
             return super()._set_state_entity(_store_only=True, **kwargs)
+        kwargs["attributes"] = {**(kwargs.get("attributes") or {}), "last_drum_clean": self._drum_clean_attr()}
         state = kwargs.get("state")
         try:
             self.set_state(self.state_entity, **kwargs)
@@ -4582,8 +4583,37 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         learn_key = f"{prog}|{temperature}" if temperature else prog
         return wp.blend_learned_duration(manual, self._learned_durations.get(learn_key))
 
+    def _drum_clean_attr(self):
+        """last_drum_clean for the state entity: a UTC ISO time, or "" while no drum clean is on
+        record. Read from the feedback file on first use, since the restore publish runs before
+        the feedback is loaded; _reload_learning keeps it current after that."""
+        if getattr(self, "_last_drum_clean", None) is None:
+            import json
+
+            try:
+                with open(self.feedback_file, "r") as f:
+                    self._last_drum_clean = wfb.last_drum_clean(json.load(f).get("cycles"))
+            except Exception:
+                return ""
+        return self._last_drum_clean
+
+    def _republish_drum_clean(self, before):
+        """A retrospective confirmation can make or unmake a drum clean; publish it now instead of
+        at the next transition, which may be days away."""
+        if self._drum_clean_attr() == before:
+            return
+        try:
+            full = self.get_state(self.state_entity, attribute="all") or {}
+            current_state = full.get("state")
+            if current_state in (None, "unknown", "unavailable"):
+                return
+            self._set_state_entity(state=current_state, attributes=dict(full.get("attributes") or {}), replace=True)
+        except Exception as e:
+            self.log(f"Drum clean republish failed: {e}", level="WARNING")
+
     def _reload_learning(self, cycles) -> int:
         """Derive learned durations and centroids from the eligible records - the only writer of both."""
+        self._last_drum_clean = wfb.last_drum_clean(cycles)
         buckets, centroids, skipped_unconfirmed = wfb.aggregate_cycles(cycles, self.PROGRAMME_PROFILES)
         self._history_centroids = centroids
         self._learned_durations = {k: {"n": len(b["durations"]), "avg": sum(b["durations"]) / len(b["durations"])} for k, b in buckets.items() if b["durations"]}
@@ -5245,7 +5275,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         except Exception as e:
             self.log(f"Could not write feedback file for confirm action: {e}", level="WARNING")
             return
+        drum_before = self._drum_clean_attr()
         self._reload_learning(fb_data["cycles"])
+        self._republish_drum_clean(drum_before)
         self._dismiss_confirm_push(rec)
 
         # Update in-memory learned durations incrementally - same math and learn-key
@@ -5354,7 +5386,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         except Exception as e:
             self.log(f"Could not write feedback after user-confirm update: {e}", level="WARNING")
             return
+        drum_before = self._drum_clean_attr()
         self._reload_learning(cycles)
+        self._republish_drum_clean(drum_before)
         self._dismiss_confirm_push(rec)
         label = self._get_profile(prog_key, conf_temp).get("label", prog_key)
         self.log(

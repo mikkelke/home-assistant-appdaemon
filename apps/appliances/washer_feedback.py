@@ -18,7 +18,7 @@ Note on JSON nulls: a plain null for an unknown actor is fine in this file. The
 AppDaemon 4.5.13 None-dropping bug only applies to HA entity attributes.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import washer_classify as wcls
 import washer_profiles as wp
@@ -40,6 +40,29 @@ DUPLICATE_DURATION_SLACK_MIN = 0.6
 # =========================================================================
 # Record building and the duplicate-save guard
 # =========================================================================
+
+def last_drum_clean(cycles):
+    """When the newest drum clean finished, as a UTC ISO string; "" when none is on record.
+
+    Miele's monthly drum clean is a Bomuld 90 wash. Energy use cannot tell 90 from 60, so only a
+    completed cycle a person confirmed as Bomuld 90 counts, timed at its effective end.
+    """
+    newest = None
+    for rec in cycles or []:
+        if not isinstance(rec, dict) or rec.get("programme_user_confirmed") is not True:
+            continue
+        if rec.get("completion_class") != "completed" or rec.get("confirmed") != "bomuld":
+            continue
+        if wcls.temp_for_storage(rec.get("confirmed_temperature")) != "90":
+            continue
+        try:
+            ended = datetime.fromisoformat(str(rec.get("effective_end_at") or rec.get("ts")))
+        except ValueError:
+            continue
+        if ended.tzinfo is not None and (newest is None or ended > newest):
+            newest = ended
+    return newest.astimezone(timezone.utc).isoformat(timespec="seconds") if newest else ""
+
 
 def build_cycle_record(
     ts: str,
