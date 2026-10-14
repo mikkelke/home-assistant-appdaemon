@@ -5161,6 +5161,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             predicted = record.get("predicted") or ""
             ts = record.get("ts", "")
             title = "Washer finished"
+            # Energy cannot tell a drum clean from laundry, so every confirm push offers it.
+            drum_clean = {"action": self._encode_confirm_action(ts, wp.DRUM_CLEAN, None),
+                          "title": self._get_profile(wp.DRUM_CLEAN).get("label", wp.DRUM_CLEAN)}
             if predicted and predicted != "unknown":
                 predicted_temp_storage = record.get("predicted_temperature")
                 predicted_temp = self._temp_from_storage(predicted_temp_storage)
@@ -5171,11 +5174,13 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 action_id = self._encode_confirm_action(ts, predicted, predicted_temp_storage)
                 actions = [
                     {"action": action_id, "title": f"Yes, {label}{temp_suffix}"},
+                    drum_clean,
                     {"action": "URI", "title": "Other...", "uri": self.confirm_push_dashboard_uri},
                 ]
             else:
                 message = "Which program did you run? Confirming teaches the ETA."
                 actions = [
+                    drum_clean,
                     {"action": "URI", "title": "Choose in dashboard", "uri": self.confirm_push_dashboard_uri},
                 ]
             notifier = self.get_app("MobileNotifier")
@@ -5350,8 +5355,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         rec["programme_user_confirmed"] = True
         if confirmed_by:
             rec["confirmed_by"] = confirmed_by
-        # Optionally correct confirmed programme if user set something different
-        temp_stored = self._temp_for_storage(temp)
+        # Optionally correct confirmed programme if user set something different. Only programmes with a
+        # temperature dimension keep one, as on a saved record (learning and run profiles key on it).
+        temp_stored = self._temp_for_storage(temp) if self._programme_has_temperature(prog_key) else None
         if rec.get("confirmed") != prog_key or rec.get("confirmed_temperature") != temp_stored:
             rec["confirmed"] = prog_key
             rec["confirmed_temperature"] = temp_stored

@@ -303,6 +303,14 @@ class BuildTest(unittest.TestCase):
         self.assertEqual([p["key"] for p in block["programmes"]], ["typical"])
         self.assertEqual(block["profiled"], 6)
 
+    def test_the_drum_clean_gets_its_own_profile_but_is_not_a_typical_wash(self):
+        drum = [FakeCycle("washer", T0 + (10 + i) * 86400, heater_watts(base=60.0), programme="drum_clean", human=True)
+                for i in range(5)]
+        block = build("washer", self.washes(5) + drum)
+        self.assertEqual(programme(block, "drum_clean")["n"], 5)
+        self.assertEqual(programme(block, "typical")["n"], 5)
+        self.assertEqual(programme(block, "typical")["p"], programme(build("washer", self.washes(5)), "typical")["p"])
+
     def test_ordering_by_recent_use(self):
         cycles = self.washes(5) + [FakeCycle("washer", T0 + (10 + i) * 86400, heater_watts(), programme="strygelet")
                                    for i in range(7)]

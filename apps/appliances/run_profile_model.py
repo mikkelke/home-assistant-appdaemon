@@ -70,6 +70,7 @@ MIN_COMPLETIONS = 3
 USE_WINDOW_DAYS = 90
 MAX_PROGRAMMES = 7
 MAX_PAYLOAD_BYTES = 8192
+NOT_TYPICAL = ("drum_clean",)
 
 _MISSING_STATES = ("unknown", "unavailable", "none", "")
 
@@ -525,12 +526,13 @@ def build_programme(identity, label, cycles, use=0, min_cycles=MIN_CYCLES):
 def select_pools(cycles):
     """Per identity: latest MAX_PER_KEY cycles, outliers dropped within that identity only
     (so a minority programme is never filtered against a majority one). Unknown-programme
-    cycles form their own pool. Typical = latest MAX_PER_KEY of all kept cycles."""
+    cycles form their own pool. Typical = latest MAX_PER_KEY of all kept cycles except
+    NOT_TYPICAL programmes, which are machine care rather than a load."""
     by_key = {}
     for c in cycles:
         by_key.setdefault(c["key"], []).append(c)
     pools = {k: drop_outliers(latest(v)) for k, v in by_key.items()}
-    kept = [c for pool in pools.values() for c in pool]
+    kept = [c for k, pool in pools.items() if k not in NOT_TYPICAL for c in pool]
     return pools, latest(kept)
 
 
