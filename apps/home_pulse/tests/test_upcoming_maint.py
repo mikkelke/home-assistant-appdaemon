@@ -196,6 +196,16 @@ class RowTextTests(unittest.TestCase):
         self.assertEqual(row["detail"], "replace, CR2477, in since 02.06, last set 101 d")
         self.assertTrue(core.is_valid_row(row))
 
+    def test_an_offline_row_puts_the_age_of_the_cells_before_their_type(self):
+        onset = datetime(2026, 7, 12, 12, 36, 39, tzinfo=timezone.utc)
+        st = maint.step_battery(None, PARASOLL, None, onset, offline_at=onset)
+        facts = {"in_since": "2025-10-15", "last_set_days": 270}
+        self.assertEqual(row_of(PARASOLL, st, None, T0, facts)[0]["detail"],
+                         "no data since 12.07, recharge, in since 15.10.25")
+        self.assertEqual(row_of(SNZB, maint.step_battery(None, SNZB, None, onset, offline_at=onset), None, T0,
+                                {"in_since": "2026-06-02"})[0]["detail"],
+                         "no data since 12.07, in since 02.06, CR2477")
+
     def test_a_trend_shows_only_while_above_twenty(self):
         st = feed(BLIND, [(T0, 25), (T0 + 2 * HOUR, 25)])
         facts = {"in_since": "2026-06-19", "last_set_days": 191, "eta_weeks": 1}
@@ -206,7 +216,7 @@ class RowTextTests(unittest.TestCase):
 
     def test_an_older_year_is_written_out_and_long_details_drop_trailing_facts(self):
         self.assertEqual(maint.ddmm(date(2025, 10, 15), T0), "15.10.25")
-        self.assertEqual(maint.fit_parts(["a" * 50, "b" * 9, "c"]), "a" * 50)
+        self.assertEqual(maint.fit_parts(["a" * 50, "b" * 9, "c"]), "a" * 50 + ", c")
         self.assertEqual(maint.fit_parts(["a", "", None, "b"]), "a, b")
 
     def test_another_apps_conditions_get_rows_but_no_push_key(self):

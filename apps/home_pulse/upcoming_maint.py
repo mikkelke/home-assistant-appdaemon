@@ -84,15 +84,15 @@ def reading(state):
 
 
 def fit_parts(parts, limit=TEXT_MAX):
-    """Joins the non-empty parts with ", ", leaving out trailing parts that would pass `limit`."""
+    """Joins the non-empty parts, most important first, with ", ", skipping any part that would
+    take the text past `limit`."""
     text = ""
     for part in parts:
         if not part:
             continue
         candidate = f"{text}, {part}" if text else part
-        if len(candidate) > limit:
-            break
-        text = candidate
+        if len(candidate) <= limit:
+            text = candidate
     return text
 
 
@@ -286,7 +286,7 @@ def battery_row(entity, device, model, st, value, facts, now):
         if now - start >= OFFLINE_GRACE:
             offline_only = model["low"] is None and model["drop"] is None
             parts = [f"no data since {ddmm(since, now)}" if since else "offline",
-                     model["action"] if offline_only else None, model["cell"], *_age_parts(facts, now)]
+                     model["action"] if offline_only else None, *_age_parts(facts, now), model["cell"]]
             row = make_row(BATTERY_ID_PREFIX + entity, "maint", device["name"], fit_parts(parts),
                            icon=OFFLINE_ICON, area=device["area"], audience="admin")
             return row, (f"{key_base}:offline:{st['off_ep']}" if key_base else None)
