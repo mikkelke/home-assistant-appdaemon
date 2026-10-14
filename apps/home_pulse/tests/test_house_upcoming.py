@@ -1,6 +1,6 @@
 # tests/test_house_upcoming.py - HouseUpcoming end to end on a fake AppDaemon surface, with the real
 # house_upcoming.yaml: lease, state acquisition, restart behaviour, the daily push, rain fetches,
-# the history job, replace-by days and the battery inventory.
+# the drum clean's cheapest start, the history job, replace-by days and the battery inventory.
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
 import asyncio
@@ -335,6 +335,44 @@ class RainTests(unittest.TestCase):
         self.assertNotIn("rain:terrace", rows(app))
         tick(app, HOUR)
         self.assertEqual(len(app.services), 1)
+
+
+class DrumStartTests(unittest.TestCase):
+    """At 12:30 on 14.10, before and after the next day's prices are out; Bomuld 60 stands in for 90."""
+
+    PROFILES = {"schema": 1, "appliances": {"washer": {"programmes": [
+        {"key": "bomuld_60", "label": "Bomuld 60", "n": 25, "p": ",".join(["100"] * 120)}]}}}
+
+    @staticmethod
+    def prices(today, tomorrow, valid):
+        def points(day, cheap):
+            return [{"hour": datetime(2026, 10, day, hour, tzinfo=maint.HOUSE_TZ).isoformat(),
+                     "price": 0.5 if hour in cheap else 2.0} for hour in range(24)]
+        return full("2.0", {"raw_today": points(14, today), "raw_tomorrow": points(15, tomorrow),
+                            "tomorrow_valid": valid})
+
+    def test_the_row_moves_to_tomorrow_once_its_prices_are_out(self):
+        states = base_states()
+        states["sensor.washer_state"] = full("Off", {"last_drum_clean": ""})
+        states["sensor.appliance_run_profiles"] = full("x", self.PROFILES)
+        states["sensor.energi_data_service"] = self.prices({20, 21}, {3, 4}, False)
+        app = make_app(states)
+        row = rows(app)["maint:washer:drum"]
+        self.assertEqual((row["at"], row["detail"]),
+                         ("2026-10-14T18:00:00+00:00", "cheapest start 20:00 - saves 1,80 kr vs now, last unknown"))
+        self.assertIn(("sensor.energi_data_service", {"attribute": "all"}), app.listened)
+        fire(app, "sensor.energi_data_service", self.prices({20}, {3, 4}, True))
+        row = rows(app)["maint:washer:drum"]
+        self.assertEqual((row["at"], row["detail"]),
+                         ("2026-10-15T01:00:00+00:00", "cheapest start 03:00 - saves 1,80 kr vs now, last unknown"))
+
+    def test_without_prices_the_row_stays_untimed(self):
+        states = base_states()
+        states["sensor.washer_state"] = full("Off", {"last_drum_clean": ""})
+        states["sensor.appliance_run_profiles"] = full("x", self.PROFILES)
+        row = rows(make_app(states))["maint:washer:drum"]
+        self.assertEqual(row["detail"], "Bomuld 90 monthly, last unknown")
+        self.assertNotIn("at", row)
 
 
 class TrainTests(unittest.TestCase):

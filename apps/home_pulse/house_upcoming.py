@@ -1,7 +1,7 @@
 """HouseUpcoming - what is coming up in the house that only the server can know, for the dashboard's
-Now timeline: maintenance (the Rober2 parts, the washer drum clean, batteries by their replace-by
-day and offline devices; admin only), Kristine's train, and rain while a terrace door is open
-(exploratory).
+Now timeline: maintenance (the Rober2 parts, the washer drum clean at its cheapest start, batteries
+by their replace-by day and offline devices; admin only), Kristine's train, and rain while a terrace
+door is open (exploratory).
 
 Publishes sensor.house_upcoming (shape in upcoming_core.py) plus one maintenance push a day, built
 from the same conditions the rows show. The lease in `expires` is renewed every TICK_S even when
@@ -34,6 +34,7 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 import climate_model as cm  # apps/climate - AppDaemon puts every app dir on sys.path
 import upcoming_battery_age as age
 import upcoming_core as core
+import upcoming_drum as drum
 import upcoming_maint as maint
 import upcoming_rain as rain
 import upcoming_train as train
@@ -71,6 +72,9 @@ class HouseUpcoming(hass.Hass):
         washer = a.get("washer") or {}
         self.washer_entity = washer.get("entity", "sensor.washer_state")
         self.washer_area = washer.get("area", "guest_bathroom")
+        self.price_entity = washer.get("price_entity", "sensor.energi_data_service")
+        self.profiles_entity = washer.get("profiles_entity", "sensor.appliance_run_profiles")
+        self.drum_programmes = tuple(washer.get("drum_programmes") or ["bomuld_90"])
         tr = a.get("train") or {}
         self.train_route = tr.get("route", "sensor.transit_kbh_ic_odense")
         self.train_stog = tr.get("stog_status", "input_select.transit_carlsberg_stog_kbh_status")
@@ -123,7 +127,8 @@ class HouseUpcoming(hass.Hass):
 
     def _sources(self):
         sources = list(self.rober2_entities.values())
-        sources += [self.washer_entity, self.train_route, self.train_stog, self.train_person, self.rain_alert]
+        sources += [self.washer_entity, self.price_entity, self.profiles_entity, self.train_route, self.train_stog,
+                    self.train_person, self.rain_alert]
         sources += list(self.rain_doors) + list(self.inventory["devices"])
         return list(dict.fromkeys(sources))
 
@@ -137,6 +142,9 @@ class HouseUpcoming(hass.Hass):
 
     def _state_of(self, entity):
         return (self._cache.get(entity) or {}).get("state")
+
+    def _attributes(self, entity):
+        return (self._cache.get(entity) or {}).get("attributes")
 
     def _check_inventory(self):
         try:
@@ -185,10 +193,14 @@ class HouseUpcoming(hass.Hass):
         for part, entity in self.rober2_entities.items():
             self._rober2[part] = maint.step_rober2(self._rober2.get(part), maint.reading(self._state_of(entity)), now)
         found = maint.rober2_rows(self._rober2, self.rober2_area)
-        drum = ((self._cache.get(self.washer_entity) or {}).get("attributes") or {}).get("last_drum_clean")
-        if isinstance(drum, str):
-            self._drum_seen = drum
-        found.append(maint.drum_row(self._drum_seen, now, self.washer_area))
+        last_clean = (self._attributes(self.washer_entity) or {}).get("last_drum_clean")
+        if isinstance(last_clean, str):
+            self._drum_seen = last_clean
+        start = None
+        if maint.drum_due(self._drum_seen, now):
+            start = drum.drum_start(self._attributes(self.price_entity), self._attributes(self.profiles_entity),
+                                    self.drum_programmes, now)
+        found.append(maint.drum_row(self._drum_seen, now, self.washer_area, start))
         for entity, device in self.inventory["devices"].items():
             cached = self._cache.get(entity)
             if cached is None:

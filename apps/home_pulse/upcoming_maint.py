@@ -362,14 +362,21 @@ def rober2_rows(states, area):
     return out
 
 
-def drum_row(last_clean, now, area):
-    """Miele's monthly Bomuld 90. Without a confirmed clean on record the row shows but is never
-    pushed: missing evidence is not an overdue clean."""
+def drum_due(last_clean, now):
     when = parse_iso(last_clean)
-    if when is not None and now - when < DRUM_INTERVAL:
+    return when is None or now - when >= DRUM_INTERVAL
+
+
+def drum_row(last_clean, now, area, start=None):
+    """Miele's monthly Bomuld 90, timed at `start` (upcoming_drum.drum_start: when and what to say)
+    when there is one. Without a confirmed clean on record the row shows but is never pushed:
+    missing evidence is not an overdue clean."""
+    if not drum_due(last_clean, now):
         return None
-    detail = f"Bomuld 90 monthly, last {ddmm(when, now)}" if when else "Bomuld 90 monthly, last unknown"
-    row = make_row("maint:washer:drum", "maint", "Washer drum clean", detail, icon="mdi:washing-machine",
+    when = parse_iso(last_clean)
+    last = f"last {ddmm(when, now)}" if when else "last unknown"
+    at, detail = (start[0], fit_parts([start[1], last])) if start else (None, f"Bomuld 90 monthly, {last}")
+    row = make_row("maint:washer:drum", "maint", "Washer drum clean", detail, at=at, icon="mdi:washing-machine",
                    area=area, audience="admin")
     return row, (f"washer:drum:{utc_iso(when)}" if when else None)
 

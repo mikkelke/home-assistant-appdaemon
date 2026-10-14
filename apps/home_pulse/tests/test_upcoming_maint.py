@@ -318,9 +318,19 @@ class DrumTests(unittest.TestCase):
 
     def test_due_thirty_days_after_the_last_clean(self):
         self.assertIsNone(maint.drum_row(core.utc_iso(T0 - 29 * DAY), T0, "guest_bathroom"))
+        self.assertFalse(maint.drum_due(core.utc_iso(T0 - 29 * DAY), T0))
+        self.assertTrue(maint.drum_due(core.utc_iso(T0 - 30 * DAY), T0) and maint.drum_due("", T0))
         row, key = maint.drum_row("2026-09-12T11:21:30+00:00", T0, "guest_bathroom")
         self.assertEqual(row["detail"], "Bomuld 90 monthly, last 12.09")
         self.assertEqual(key, "washer:drum:2026-09-12T11:21:30+00:00")
+
+    def test_a_start_times_the_row_and_says_what_it_saves(self):
+        start = (datetime(2026, 10, 15, 0, 15, tzinfo=timezone.utc), "cheapest start 02:15 - saves 1,40 kr vs now")
+        row, key = maint.drum_row("2026-09-12T11:21:30+00:00", T0, "guest_bathroom", start)
+        self.assertEqual((row["at"], row["detail"]),
+                         ("2026-10-15T00:15:00+00:00", "cheapest start 02:15 - saves 1,40 kr vs now, last 12.09"))
+        self.assertEqual(key, "washer:drum:2026-09-12T11:21:30+00:00")
+        self.assertIsNone(maint.drum_row(core.utc_iso(T0 - DAY), T0, "guest_bathroom", start))
 
 
 class DigestTests(unittest.TestCase):
