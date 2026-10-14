@@ -260,6 +260,11 @@ class PureHelperTests(unittest.TestCase):
         self.assertEqual(entry["url"], "/media/local/abb_doorbell/f.jpg")
         self.assertEqual(entry["event_type"], "ring_auto_opened")
 
+    def test_ring_link_carries_the_archive_entry_ts(self):
+        entry = bridge_mod.build_index_entry(RING_ESP, "100000001", "back door",
+                                             "ring_auto_opened", "f.jpg", "/media/local/abb_doorbell")
+        self.assertEqual(bridge_mod.ring_link(RING_ESP), f"/dashboard-rooftop/home#now=ring-{entry['ts']}")
+
     def test_prune_by_days_and_count(self):
         now_ts = 1_000_000_000
         fresh = [{"ts": now_ts - i, "filename": f"f{i}.jpg"} for i in range(5)]
@@ -923,6 +928,35 @@ class RingPushPhotoTests(unittest.TestCase):
         self.assertEqual(len(self.pushes), 1)
         self.assertNotIn("image", self.pushes[0]["data"])
 
+    def test_held_push_links_the_ring_start_not_the_send_time(self):
+        ring_at = self.clock.now()
+        episode = self.app._open_episode("front door", "100000002", ring_at)
+        self.app.defer_ring_push("front door", "Intercom auto-opened", "Someone rang.", "mikkel")
+        self.clock.at = ring_at + timedelta(seconds=22.6)
+        self._set_screenshot(self.clock.now() - timedelta(seconds=1))
+        episode["snapshot"] = {"bytes": b"jpeg", "captured_at": self.clock.now(), "event_id": "e1"}
+        _run_scheduled(self.app, "_ring_push_due")
+        self.assertEqual(len(self.pushes), 1)
+        self.assertEqual(self.pushes[0]["link"], f"/dashboard-rooftop/home#now=ring-{int(ring_at.timestamp())}")
+        self.assertEqual(self.pushes[0]["data"]["image"], "/api/image_proxy/image.abb?token=t")
+
+    def test_last_visitors_screenshot_stays_off_a_linked_push(self):
+        ring_at = self.clock.now()
+        self.app._fetch_image_bytes = lambda: JPEG
+        self.app._open_episode("front door", "100000002", ring_at)
+        stale = ring_at - timedelta(seconds=40)
+        self._set_screenshot(stale)
+        self.app.states[self.app.abb_image_entity] = {
+            "attributes": {"captured_at": stale.isoformat(), "event_id": "last-visitor"}}
+        self.app.defer_ring_push("front door", "Intercom auto-opened", "Someone rang.", "mikkel")
+        self.clock.at = ring_at + timedelta(seconds=30)
+        self.app._try_capture("image-update")
+        self.assertIsNone(next(iter(self.app.episodes.values()))["snapshot"])
+        _run_scheduled(self.app, "_ring_push_due")
+        self.assertEqual(len(self.pushes), 1)
+        self.assertNotIn("image", self.pushes[0]["data"])
+        self.assertEqual(self.pushes[0]["link"], f"/dashboard-rooftop/home#now=ring-{int(ring_at.timestamp())}")
+
     def test_exactly_one_push_even_if_photo_and_deadline_both_fire(self):
         episode = self.app._open_episode("front door", "100000002", self.clock.now())
         self.app.defer_ring_push("front door", "Intercom auto-opened", "Someone rang.", "mikkel")
@@ -1449,8 +1483,15 @@ class RingFallbackTests(unittest.TestCase):
         push = self.app.pushes[0]
         self.assertEqual(push["target"], "home")
         actions = push["data"]["actions"]
-        self.assertEqual([a["title"] for a in actions], ["Open", "Reject"])
+        self.assertEqual(actions, [
+            {"action": f"ABB_RING_OPEN_{episode['id']}", "title": "Open"},
+            {"action": f"ABB_RING_REJECT_{episode['id']}", "title": "Reject"},
+        ])
         self.assertEqual(push["data"]["tag"], "abb_ring_front")
+        link = f"/dashboard-rooftop/home#now=ring-{int(self.clock.at.timestamp())}"
+        self.assertEqual(push["link"], link)
+        # Keyed for a tap of the push only, so iOS never opens it from Open or Reject.
+        self.assertEqual(push["data"]["url"], {"_": link})
         scheduled = [cb.__name__ for cb, _, _ in self.app.run_in_calls]
         self.assertIn("_ring_ack", scheduled)
         self.assertIn("_ring_no_answer", scheduled)
@@ -1595,6 +1636,7 @@ class RealNotifierPayloadTests(unittest.TestCase):
     def test_open_reject_push_carries_its_actions_under_data(self):
         self.app._register_ring("esp", "front door", "", self.clock.at, "esp:test")
         episode = next(iter(self.app.episodes.values()))
+        link = f"/dashboard-rooftop/home#now=ring-{int(self.clock.at.timestamp())}"
         self.assertEqual(self.sent, [(self.PHONE, {
             "title": "Someone is ringing the front door",
             "message": "Auto-open is off - open for them?",
@@ -1604,6 +1646,8 @@ class RealNotifierPayloadTests(unittest.TestCase):
                     {"action": f"ABB_RING_OPEN_{episode['id']}", "title": "Open"},
                     {"action": f"ABB_RING_REJECT_{episode['id']}", "title": "Reject"},
                 ],
+                "url": {"_": link},
+                "clickAction": link,
             },
         })])
 
@@ -1636,10 +1680,12 @@ class RealNotifierPayloadTests(unittest.TestCase):
         self.app.states[(self.app.abb_image_entity, "entity_picture")] = "/api/image_proxy/image.abb?token=t"
         self.assertTrue(self.app.defer_ring_push(
             "front door", "Intercom auto-opened", "Someone rang.", "mikkel"))
+        link = f"/dashboard-rooftop/home#now=ring-{int(self.clock.at.timestamp())}"
         self.assertEqual(self.sent, [(self.PHONE, {
             "title": "Intercom auto-opened",
             "message": "Someone rang.",
-            "data": {"tag": "abb_autoopen_front", "image": "/api/image_proxy/image.abb?token=t"},
+            "data": {"tag": "abb_autoopen_front", "image": "/api/image_proxy/image.abb?token=t",
+                     "url": link, "clickAction": link},
         })])
 
     def test_missed_ring_push_carries_photo_and_timeline_link(self):

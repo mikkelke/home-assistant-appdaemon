@@ -123,6 +123,10 @@ MAX_IMAGE_BYTES = 5 * 1024 * 1024  # sanity cap on a single doorbell frame
 MAX_PROCESSED_IDS = 50  # missed-call event_id dedupe ring buffer
 UNLOCK_EVENT_TTL_S = 600  # prune bound for stored unlock timestamps, and the sanity bound on a last_changed reading in _unlock_edge_at (get_state can serve a stale value - see the appdaemon-stale-state-store gotcha)
 UNLOCK_EVENT_MAX_PER_DOOR = 20  # cap so a long uptime with many rings/re-rings cannot grow a door's unlock list unbounded
+# iOS opens a push's string url for every action button too; a url keyed by "_"
+# opens only when the push itself is tapped. Android reads clickAction instead,
+# which only ever applies to a tap of the push.
+IOS_TAP_URL_KEY = "_"
 
 
 def classify_episode(unlock_seen, missed_seen, answered_seen):
@@ -176,6 +180,13 @@ def build_index_entry(ring_at, station_id, door, event_type, filename, url_prefi
         "filename": filename,
         "url": f"{url_prefix.rstrip('/')}/{filename}" if filename else "",
     }
+
+
+def ring_link(ring_at):
+    """Dashboard link to a ring's row on the timeline: the ring's start in whole
+    epoch seconds, the same ts its archive entry carries, so the dashboard's
+    sheet for that row finds this ring's photo and clip."""
+    return f"/dashboard-rooftop/home#now=ring-{int(ring_at.timestamp())}"
 
 
 def prune_images(entries, now_ts, retain_days, max_files):
@@ -633,6 +644,7 @@ class AbbWelcomeBridge(hass.Hass):
             self.create_task(self.mobile_notifier.notify(
                 title=pending["title"], message=pending["message"],
                 target=pending["target"], data=data,
+                link=ring_link(episode["started_at"]),
             ))
             waited = (self.get_now() - episode["started_at"]).total_seconds()
             self.log(f"RING-PUSH-PHOTO door={pending['door']} episode={episode['id']} "
@@ -1797,6 +1809,7 @@ class AbbWelcomeBridge(hass.Hass):
             self._pending_actions[entry["open_id"]] = entry
             self._pending_actions[entry["reject_id"]] = entry
             if self.mobile_notifier:
+                link = ring_link(episode["started_at"])
                 self.create_task(self.mobile_notifier.notify(
                     title=f"Someone is ringing the {door}",
                     message="Auto-open is off - open for them?",
@@ -1807,7 +1820,9 @@ class AbbWelcomeBridge(hass.Hass):
                             {"action": entry["open_id"], "title": "Open"},
                             {"action": entry["reject_id"], "title": "Reject"},
                         ],
+                        "url": {IOS_TAP_URL_KEY: link},
                     },
+                    link=link,
                 ))
                 self.log(f"RING-PUSH door={door} episode={episode['id']} (auto-open off)", level="INFO")
             if self.ring_ack_message and self.announce_cameras.get(door):
