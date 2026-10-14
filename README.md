@@ -36,6 +36,26 @@ every `.py` under the apps tree, and a failing import of a test module can abort
 loading of *other* new apps (bit us 2026-07-12: `apps/security/` never started until
 the tests dirs were excluded).
 
+## Private archives
+
+The doorbell archive (`apps/intercom/abb_welcome_bridge.*`, plus the ABB Welcome
+integration's ring clips) and the Rober2 map archive (`apps/rober2/control.py`) live
+under HA's media folder, `/data/homeassistant/media/{abb_doorbell,rober2_maps}` on the
+box, mounted at `/media` in both the HA and AppDaemon containers. HA serves it at
+`/media/local/...` to signed-in users only; the dashboard reads each `index.json`
+through a `shell_command` and signs the files it shows.
+
+- Never write either archive under `www/`: HA serves `www/` at `/local/` to anyone,
+  from the internet too.
+- Restore rule: HA backups and file copies taken before the move carry
+  `www/abb_doorbell` and `www/rober2_maps`. After restoring one, move both out of
+  `www/` straight away (to `/data/homeassistant/archive-www-backup-<date>/`), and
+  check that `/local/abb_doorbell/index.json` returns 404.
+- `scripts/cutover_private_archives.sh` moves both archives out of `www/` (`--dry-run`
+  first) and prints the rollback.
+- Both archives keep a year: `retain_days` in `abb_welcome_bridge.yaml`,
+  `map_retention_days` in `rober2.yaml`.
+
 ## Deliberately not in this repo
 
 - `apps/people/` — contains personal data of third parties.
