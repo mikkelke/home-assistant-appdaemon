@@ -1,6 +1,6 @@
 # tests/test_house_upcoming.py - HouseUpcoming end to end on a fake AppDaemon surface, with the real
 # house_upcoming.yaml: lease, state acquisition, restart behaviour, the daily push, rain fetches,
-# the history job and the battery inventory.
+# the history job, replace-by days and the battery inventory.
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
 import asyncio
@@ -9,7 +9,7 @@ import sys
 import tempfile
 import types
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -277,7 +277,7 @@ class PushTests(unittest.TestCase):
         self.push()
         self.assertEqual(len(self.app.notifier.sent), 1)
         sent = self.app.notifier.sent[0]
-        self.assertEqual((sent["title"], sent["message"]), ("Maintenance due", "Rober2 filter, Bathroom door"))
+        self.assertEqual((sent["title"], sent["message"]), ("Maintenance due", "Rober2 filter, Bathroom door battery"))
         self.assertEqual((sent["target"], sent["link"]), (["mikkel"], "/dashboard-rooftop/home#now"))
         shown = rows(self.app)
         for entity in ("sensor.kitchen_smoke_alarm_battery", "sensor.bedroom_thermostat_battery_level"):
@@ -297,7 +297,7 @@ class PushTests(unittest.TestCase):
         self.app.notifier.deliver = 1
         tick(self.app, 24 * HOUR)
         self.push()
-        self.assertEqual([s["message"] for s in self.app.notifier.sent], ["Rober2 filter, Bathroom door"] * 2)
+        self.assertEqual([s["message"] for s in self.app.notifier.sent], ["Rober2 filter, Bathroom door battery"] * 2)
 
     def test_a_new_episode_after_a_battery_change_pushes_again(self):
         self.push()
@@ -306,7 +306,7 @@ class PushTests(unittest.TestCase):
         fire(self.app, "sensor.bathroom_door_battery", full("15"))
         tick(self.app, 3 * HOUR)
         self.push()
-        self.assertEqual(self.app.notifier.sent[-1]["message"], "Bathroom door")
+        self.assertEqual(self.app.notifier.sent[-1]["message"], "Bathroom door battery")
 
 
 class RainTests(unittest.TestCase):
@@ -384,6 +384,51 @@ class HistoryTests(unittest.TestCase):
         drain(app)
         tick(app, 30 * HOUR)
         self.assertNotIn("maint:battery:sensor.dining_room_window_1_battery", rows(app))
+
+
+class ReplaceByTests(unittest.TestCase):
+    def test_the_roof_station_steps_give_its_replace_by_day(self):
+        states = base_states()
+        states["sensor.ecowitt_battery_8351"] = full("20", changed=datetime(2026, 10, 9, tzinfo=timezone.utc))
+        app = make_app(states)
+        app.history["sensor.ecowitt_battery_8351"] = [
+            {"state": "60", "last_changed": "2026-08-19T12:00:00+00:00"},
+            {"state": "40", "last_changed": "2026-09-01T04:00:00+00:00"},
+            {"state": "20", "last_changed": "2026-10-09T00:00:00+00:00"},
+        ]
+        asyncio.run(app._history_job({}))
+        drain(app)
+        row = rows(app)["maint:battery:sensor.ecowitt_battery_8351"]
+        self.assertEqual((row["title"], row["detail"]),
+                         ("Roof weather station batteries", "replace by 16.11 - 33 days, 2x AA"))
+        self.assertEqual(row["at"], "2026-11-16T08:00:00+00:00")
+        self.assertEqual(app._facts["sensor.ecowitt_battery_8351"]["basis"], "trend")
+
+    def test_the_model_median_pools_every_device_of_the_model(self):
+        app = make_app()
+        app._facts = {
+            "sensor.hallway_presence_battery": {"in_since": "2026-09-11", "lifetimes": [148, 127, 204]},
+            "sensor.kristines_room_presence_battery": {"in_since": "2026-06-02", "lifetimes": [79, 98]},
+            "sensor.guest_bathroom_presence_battery": {"in_since": "2026-09-15", "lifetimes": [335]},
+            "sensor.yale_battery": {"in_since": "2026-02-22"},
+            "sensor.dining_room_window_1_battery": {"in_since": "2026-10-14", "lifetimes": [270],
+                                                    "replace_by": "2026-10-01", "basis": "own"},
+        }
+        app._estimate_replace_by(date(2026, 10, 14))
+        due = {entity: (facts.get("replace_by"), facts.get("basis")) for entity, facts in app._facts.items()}
+        self.assertEqual(due, {
+            "sensor.hallway_presence_battery": ("2027-02-06", "own"),
+            "sensor.kristines_room_presence_battery": (None, None),
+            "sensor.guest_bathroom_presence_battery": ("2027-01-30", "model"),
+            "sensor.yale_battery": (None, None),
+            "sensor.dining_room_window_1_battery": ("2027-07-11", "model"),
+        })
+        tick(app)
+        shown = rows(app)
+        self.assertEqual(shown["maint:battery:sensor.guest_bathroom_presence_battery"]["detail"],
+                         "recharge by ~30.01.27 - 108 days, LADDA AAA NiMH")
+        self.assertNotIn("maint:battery:sensor.kristines_room_presence_battery", shown)
+        self.assertNotIn("maint:battery:sensor.yale_battery", shown)
 
 
 class InventoryTests(unittest.TestCase):

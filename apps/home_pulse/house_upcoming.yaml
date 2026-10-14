@@ -40,10 +40,14 @@ HouseUpcoming:
     # action: replace (primary cells), recharge (swappable rechargeables), charge (built in).
     # low: N opens at a reading <= N (days: K = K house days in a row); drop: N opens N points under
     # the cells' highest reading; neither = offline only. pushed_by: another app owns the push.
-    # trend: false = the percentage does not drain in a line, so no "about N weeks".
+    # trend: false = the percentage does not tell when the cells are flat, so no trend date; the
+    # replace-by day then comes from lifetimes alone. empty: N = the reading the cells die at, where
+    # the recorder shows one; default 0. No trend model had died on record by 14.10.2026: a Salus
+    # thermostat read 0 and the bedroom blind 10, and both kept reporting.
     models:
       zg204zm: {cell: LADDA AAA NiMH, action: recharge, low: 35, days: 2, trend: false}
       zg204zk: {cell: LADDA AAA NiMH, action: recharge, low: 20, trend: false}
+      # Went offline at 52 % on 12.07.2026.
       parasoll: {cell: 1x LADDA AAA NiMH, action: recharge, trend: false}
       sq610rfnh: {cell: built-in rechargeable, action: charge, low: 40, pushed_by: salus_health}
       yale: {cell: lithium AA (rechargeable), action: recharge, drop: 15, trend: false}
@@ -52,11 +56,12 @@ HouseUpcoming:
       # Whole percent readings, so <= 19 is FireSafety's battery_low_pct (< 20).
       twinguard: {cell: 6x AA alkaline, action: replace, low: 19, pushed_by: fire_safety}
       fp300: {cell: 2x CR2450, action: replace, low: 20}
-      snzb04p: {cell: CR2477, action: replace, low: 20}
+      # Five went offline for weeks in winter 2025-26 while reading 72-95, and came back at 100.
+      snzb04p: {cell: CR2477, action: replace, low: 20, trend: false}
       snzb02p: {cell: CR2477, action: replace, low: 20}
-      zg102zm: {cell: ""}
+      zg102zm: {cell: "", trend: false}
     # One line per device. history_from: a known change in how the cells behave; sets that went in
-    # before it never count as a lifetime or get a trend.
+    # before it never count as a lifetime, and a trend starts there.
     devices:
       - {entity: sensor.bathroom_presence_battery, model: zg204zm, name: Bathroom presence, area: bathroom}
       - {entity: sensor.bathroom_bath_presence_battery, model: zg204zm, name: Bathroom bath presence, area: bathroom}

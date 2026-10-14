@@ -1,6 +1,5 @@
 """Battery age facts from recorder history, for the maintenance rows: when the current cells went
-in, how long the previous set lasted, and, for cells that drain in a straight line, about how many
-weeks are left until ETA_LEVEL. Pure.
+in, how long earlier sets lasted, and the day the current cells are expected to be flat. Pure.
 
 One value per house day: the time-weighted median of the readings in effect that day. Day d is a
 battery change when the median of the next days (d included, at most 7) is CHANGE_RISE above the
@@ -11,13 +10,27 @@ before already reached the rise at its highest is dated that day. The first SKIP
 are never a change, and changes closer than MERGE_DAYS keep the first.
 
 A device's `history_from` marks a known change in how its cells behave: a set that went in before
-it is never a lifetime and never gets a trend.
+it is never a lifetime, and its trend starts at `history_from`.
+
+The trend is a straight line through the whole days after the current set's change day, or after
+`history_from` when that is later, extrapolated to the model's `empty` reading. Cells that report
+fine-grained values are fitted on their daily medians: TREND_MIN_VALUES distinct values over
+TREND_MIN_DAYS, a slope of TREND_MAX_SLOPE or steeper and an R2 of TREND_MIN_R2. Cells that report
+in coarse steps are fitted on the days the steps happened: the first day whose lowest reading
+reached a new level that the next day's lowest reading also reached, every step at least STEP_MIN,
+at least two steps TREND_MIN_DAYS apart, the same slope rule, and the R2 rule from three steps on.
+A fit that fails any rule gives no date.
+
+The replace-by day is the trend's empty day; without one, the current in-regime set's start plus
+the device's own median lifetime once it has OWN_MIN_CYCLES of them, else plus its model's median
+lifetime; a day already past is no estimate.
 """
 
+import math
 from datetime import date, datetime, time, timedelta
 from statistics import StatisticsError, correlation, linear_regression, median
 
-from upcoming_maint import ETA_LEVEL, HOUSE_TZ, house_date, reading
+from upcoming_maint import HOUSE_TZ, house_date, reading
 
 SKIP_DAYS = 7
 CHANGE_RISE = 30
@@ -28,6 +41,8 @@ TREND_MIN_DAYS = 21
 TREND_MIN_VALUES = 10
 TREND_MAX_SLOPE = -0.1
 TREND_MIN_R2 = 0.8
+STEP_MIN = 10
+OWN_MIN_CYCLES = 2
 LOW_DATES_DAYS = 7
 
 
@@ -110,45 +125,96 @@ def _set_end(days, change):
     return before[-1] if before and (change - before[-1]).days > 1 else change
 
 
-def _trend_weeks(days, start, today):
-    points = [(float((d[0] - start).days), d[1]) for d in days if d[0] > start]
-    if (today - start).days < TREND_MIN_DAYS or len({value for _, value in points}) < TREND_MIN_VALUES:
-        return None
+def _line_empty_day(points, start, today, empty, *, check_r2=True):
+    """The day a straight line through (days after `start`, reading) points reaches `empty`, when the
+    fit passes the slope rule (and the R2 rule with `check_r2`) and the day is after `today`."""
     xs, ys = [p[0] for p in points], [p[1] for p in points]
     try:
         slope, intercept = linear_regression(xs, ys)
         r2 = correlation(xs, ys) ** 2
     except StatisticsError:
         return None
-    if slope > TREND_MAX_SLOPE or r2 < TREND_MIN_R2:
+    if slope > TREND_MAX_SLOPE or (check_r2 and r2 < TREND_MIN_R2):
         return None
-    current = intercept + slope * (today - start).days
-    if current <= ETA_LEVEL:
-        return None
-    return max(1, round((current - ETA_LEVEL) / -slope / 7))
+    day = start + timedelta(days=math.floor((empty - intercept) / slope + 1e-9))
+    return day if day > today else None
 
 
-def battery_facts(days, now, *, trend=True, history_from=None):
-    """{"in_since", "last_set_days", "eta_weeks", "changes"} for one device; absent facts are left
-    out. Dates are ISO strings."""
+def step_points(days, start, today):
+    """(days after `start`, level) for each step down of a coarse reporter: the first whole day after
+    `start` whose lowest reading reached a new level that the next day's lowest reading also reached.
+    None once a step is smaller than STEP_MIN, which is how fine-grained readings show."""
+    lows = [(d[0], d[2]) for d in days if start < d[0] < today]
+    if not lows:
+        return []
+    level, points = lows[0][1], []
+    for (day, low), (_, next_low) in zip(lows, lows[1:]):
+        reached = max(low, next_low)
+        if reached < level:
+            if level - reached < STEP_MIN:
+                return None
+            points.append((float((day - start).days), reached))
+            level = reached
+    return points
+
+
+def empty_day(days, start, today, empty=0.0):
+    """The day the cells are expected to read `empty`, fitted on the whole days after `start`, or
+    None without a fit that passes every rule."""
+    medians = [(float((d[0] - start).days), d[1]) for d in days if start < d[0] < today]
+    if len({value for _, value in medians}) >= TREND_MIN_VALUES:
+        if (today - start).days < TREND_MIN_DAYS:
+            return None
+        return _line_empty_day(medians, start, today, empty)
+    steps = step_points(days, start, today)
+    if not steps or len(steps) < 2 or steps[-1][0] - steps[0][0] < TREND_MIN_DAYS:
+        return None
+    return _line_empty_day(steps, start, today, empty, check_r2=len(steps) >= 3)
+
+
+def battery_facts(days, now, *, trend=True, history_from=None, empty=0.0):
+    """{"changes", "in_since", "lifetimes", "last_set_days", "empty_on"} for one device; absent facts
+    are left out. `lifetimes` are the in-regime sets that ended, oldest first, in days. Dates are ISO
+    strings."""
     today = house_date(now)
     changes = detect_changes(days)
     facts = {"changes": [day.isoformat() for day in changes]}
-    if not changes:
-        return facts
-    current = changes[-1]
-    facts["in_since"] = current.isoformat()
-
-    def in_regime(day):
-        return history_from is None or day >= history_from
-
-    if len(changes) >= 2 and in_regime(changes[-2]):
-        facts["last_set_days"] = (_set_end(days, current) - changes[-2]).days
-    if trend and in_regime(current):
-        weeks = _trend_weeks(days, current, today)
-        if weeks:
-            facts["eta_weeks"] = weeks
+    current = changes[-1] if changes else None
+    if current:
+        facts["in_since"] = current.isoformat()
+    lifetimes = [(_set_end(days, end) - begin).days for begin, end in zip(changes, changes[1:])
+                 if history_from is None or begin >= history_from]
+    if lifetimes:
+        facts["lifetimes"] = lifetimes
+        facts["last_set_days"] = lifetimes[-1]
+    starts = [day for day in (current, history_from) if day is not None]
+    if trend and starts:
+        day = empty_day(days, max(starts), today, empty)
+        if day:
+            facts["empty_on"] = day.isoformat()
     return facts
+
+
+def replace_by(facts, model_lifetimes, today, history_from=None):
+    """(day, basis) the current cells are expected to need replacing by, or None. `basis` is
+    "trend", "own" or "model"; `model_lifetimes` are the in-regime lifetimes of every device of the
+    model."""
+    facts = facts or {}
+    day = as_date(facts.get("empty_on"))
+    basis = "trend"
+    if day is None:
+        since = as_date(facts.get("in_since"))
+        if since is None or (history_from is not None and since < history_from):
+            return None
+        own = facts.get("lifetimes") or []
+        if len(own) >= OWN_MIN_CYCLES:
+            lifetimes, basis = own, "own"
+        elif model_lifetimes:
+            lifetimes, basis = model_lifetimes, "model"
+        else:
+            return None
+        day = since + timedelta(days=int(median(lifetimes)))
+    return (day, basis) if day >= today else None
 
 
 def outage_onset(series):

@@ -1,6 +1,7 @@
-# tests/test_upcoming_battery_age.py - battery age facts: daily values, battery changes, the
-# last set's lifetime and the trend ETA, on synthetic series and on the recorder's daily values of
-# 14.10.2026 (fixtures/battery_days_2026_10_14.json, run-length encoded [day, days, median, min, max]).
+# tests/test_upcoming_battery_age.py - battery age facts: daily values, battery changes, lifetimes,
+# the trend's empty day (daily medians or the days coarse steps happened) and the replace-by day, on
+# synthetic series and on the recorder's daily values of 14.10.2026
+# (fixtures/battery_days_2026_10_14.json, run-length encoded [day, days, median, min, max]).
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
 import json
@@ -9,11 +10,15 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import upcoming_battery_age as age  # noqa: E402
+import upcoming_maint as maint  # noqa: E402
 from upcoming_maint import HOUSE_TZ  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "battery_days_2026_10_14.json"
+CONFIG = Path(__file__).resolve().parents[1] / "house_upcoming.yaml"
 DAY = timedelta(days=1)
 
 
@@ -31,6 +36,20 @@ def load_fixture():
 
 def flat(values, start=date(2026, 1, 1)):
     return [(start + i * DAY, v, v, v) for i, v in enumerate(values)]
+
+
+def noon(day):
+    return datetime.combine(day, datetime.min.time(), timezone.utc) + timedelta(hours=12)
+
+
+def stepped(start, levels):
+    """Daily values of a coarse reporter from `start`: [(days, level by day, lowest by night)]."""
+    out, day = [], start
+    for count, level, low in levels:
+        for _ in range(count):
+            out.append((day, level, low, level))
+            day += DAY
+    return out
 
 
 class DailyValueTests(unittest.TestCase):
@@ -113,23 +132,98 @@ class FactTests(unittest.TestCase):
         self.assertEqual(later["in_since"], "2026-02-22")
         self.assertNotIn("last_set_days", later)
 
-    def test_a_straight_drain_gives_weeks_to_twenty(self):
+    def test_a_straight_drain_gives_the_day_it_reads_empty(self):
         start = date(2026, 8, 1)
         days = flat([30] * 10, start=start - 10 * DAY) + [(start + i * DAY, 100 - 0.6 * i, 100 - 0.6 * i, 100 - 0.6 * i)
                                                           for i in range(60)]
-        now = datetime.combine(start + 59 * DAY, datetime.min.time(), timezone.utc) + timedelta(hours=12)
+        now = noon(start + 59 * DAY)
         facts = age.battery_facts(days, now)
         self.assertEqual(facts["in_since"], "2026-08-01")
-        self.assertEqual(facts["eta_weeks"], round((100 - 0.6 * 59 - 20) / 0.6 / 7))
-        self.assertNotIn("eta_weeks", age.battery_facts(days, now, trend=False))
+        self.assertEqual(facts["empty_on"], (start + 166 * DAY).isoformat())
+        self.assertEqual(age.battery_facts(days, now, empty=40)["empty_on"], (start + 100 * DAY).isoformat())
+        self.assertNotIn("empty_on", age.battery_facts(days, now, trend=False))
 
     def test_too_few_values_too_young_or_flat_cells_get_no_trend(self):
         start = date(2026, 9, 1)
         steps = flat([30] * 10, start=start - 10 * DAY) + flat([100] * 20 + [75] * 20, start=start)
         now = datetime(2026, 10, 14, 12, tzinfo=timezone.utc)
-        self.assertNotIn("eta_weeks", age.battery_facts(steps, now))
+        self.assertNotIn("empty_on", age.battery_facts(steps, now))
         young = flat([30] * 10, start=start - 10 * DAY) + [(start + i * DAY, 100 - i, 100 - i, 100 - i) for i in range(15)]
-        self.assertNotIn("eta_weeks", age.battery_facts(young, datetime(2026, 9, 15, 12, tzinfo=timezone.utc)))
+        self.assertNotIn("empty_on", age.battery_facts(young, datetime(2026, 9, 15, 12, tzinfo=timezone.utc)))
+
+    def test_lifetimes_are_the_in_regime_sets_that_ended(self):
+        days = flat([90] * 10 + [20] + [90] * 40 + [20] + [90] * 40 + [20] + [90] * 30)
+        facts = age.battery_facts(days, self.NOW, trend=False)
+        self.assertEqual(facts["lifetimes"], [41, 41])
+        self.assertEqual(facts["last_set_days"], 41)
+        self.assertEqual(age.battery_facts(days, self.NOW, history_from=date(2026, 2, 1))["lifetimes"], [41])
+
+
+class StepTrendTests(unittest.TestCase):
+    """The WS90's backup cells read 60, 40 or 20: a step shows first as a night's lowest reading."""
+
+    SINCE = date(2026, 8, 30)
+    NOW = datetime(2026, 10, 14, 10, 30, tzinfo=timezone.utc)
+
+    def test_the_days_the_steps_happened_give_the_empty_day(self):
+        days = stepped(date(2026, 8, 19), [(13, 60, 60), (6, 60, 40), (32, 40, 40), (6, 40, 20)])
+        self.assertEqual(age.step_points(days, self.SINCE, date(2026, 10, 14)), [(2.0, 40.0), (40.0, 20.0)])
+        self.assertEqual(age.empty_day(days, self.SINCE, date(2026, 10, 14)), date(2026, 11, 16))
+        facts = age.battery_facts(days, self.NOW, history_from=self.SINCE)
+        self.assertEqual((facts["changes"], facts["empty_on"]), ([], "2026-11-16"))
+        self.assertNotIn("empty_on", age.battery_facts(days, self.NOW))
+
+    def test_a_one_night_dip_is_no_step(self):
+        days = stepped(self.SINCE, [(10, 60, 60), (1, 60, 40), (40, 60, 60), (5, 40, 40)])
+        self.assertEqual(age.step_points(days, self.SINCE, date(2026, 10, 30)), [(51.0, 40.0)])
+
+    def test_steps_off_the_line_give_no_date(self):
+        days = stepped(self.SINCE, [(2, 80, 80), (38, 60, 60), (1, 40, 40), (5, 20, 20)])
+        points = age.step_points(days, self.SINCE, self.SINCE + 46 * DAY)
+        self.assertEqual([level for _, level in points], [60.0, 40.0, 20.0])
+        self.assertIsNone(age.empty_day(days, self.SINCE, self.SINCE + 46 * DAY))
+
+    def test_steps_closer_than_three_weeks_give_no_date(self):
+        days = stepped(self.SINCE, [(3, 80, 80), (8, 60, 60), (6, 40, 40), (4, 20, 20)])
+        self.assertIsNone(age.empty_day(days, self.SINCE, self.SINCE + 21 * DAY))
+
+    def test_small_steps_are_no_coarse_reporter(self):
+        days = stepped(self.SINCE, [(10, 100, 100), (10, 97, 97), (10, 94, 94), (10, 91, 91)])
+        self.assertIsNone(age.step_points(days, self.SINCE, self.SINCE + 40 * DAY))
+        self.assertIsNone(age.empty_day(days, self.SINCE, self.SINCE + 40 * DAY))
+
+    def test_a_trend_needs_a_start(self):
+        days = stepped(date(2026, 8, 19), [(13, 60, 60), (6, 60, 40), (32, 40, 40), (6, 40, 20)])
+        self.assertNotIn("empty_on", age.battery_facts(days, self.NOW))
+
+
+class ReplaceByTests(unittest.TestCase):
+    TODAY = date(2026, 10, 14)
+
+    def test_the_trend_comes_first(self):
+        facts = {"in_since": "2026-06-19", "lifetimes": [104, 207, 191], "empty_on": "2026-12-26"}
+        self.assertEqual(age.replace_by(facts, [100], self.TODAY), (date(2026, 12, 26), "trend"))
+
+    def test_then_the_devices_own_median_lifetime(self):
+        facts = {"in_since": "2026-09-11", "lifetimes": [148, 127, 204]}
+        self.assertEqual(age.replace_by(facts, [79, 98], self.TODAY), (date(2027, 2, 6), "own"))
+
+    def test_then_the_models_median_lifetime(self):
+        facts = {"in_since": "2026-09-15", "lifetimes": [335]}
+        model = [79, 98, 127, 148, 204, 335]
+        self.assertEqual(age.replace_by(facts, model, self.TODAY), (date(2026, 9, 15) + 137 * DAY, "model"))
+        self.assertIsNone(age.replace_by(facts, [], self.TODAY))
+
+    def test_a_day_already_past_is_no_estimate(self):
+        facts = {"in_since": "2026-06-02", "lifetimes": [79, 98]}
+        self.assertIsNone(age.replace_by(facts, [79, 98, 335], self.TODAY))
+        self.assertIsNotNone(age.replace_by({"in_since": "2026-07-18", "lifetimes": [79, 98]}, [], self.TODAY))
+
+    def test_no_basis_no_date(self):
+        yale = {"in_since": "2026-02-22", "changes": ["2025-12-31", "2026-02-22"]}
+        self.assertIsNone(age.replace_by(yale, [], self.TODAY, date(2026, 2, 22)))
+        self.assertIsNone(age.replace_by({"in_since": "2026-02-21"}, [300], self.TODAY, date(2026, 2, 22)))
+        self.assertIsNone(age.replace_by({}, [300], self.TODAY))
 
 
 class HistoryHelperTests(unittest.TestCase):
@@ -155,9 +249,19 @@ class LiveDataTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.now, cls.days = load_fixture()
+        cls.inventory = maint.parse_inventory(yaml.safe_load(CONFIG.read_text())["HouseUpcoming"]["batteries"])
 
     def facts(self, entity, **kw):
         return age.battery_facts(self.days[entity], self.now, **kw)
+
+    def inventory_facts(self):
+        out = {}
+        for entity, days in self.days.items():
+            device = self.inventory["devices"][entity]
+            model = self.inventory["models"][device["model"]]
+            out[entity] = age.battery_facts(days, self.now, trend=model["trend"], history_from=device["history_from"],
+                                            empty=model["empty"])
+        return out
 
     def test_the_battery_changes_found(self):
         expected = {
@@ -173,25 +277,46 @@ class LiveDataTests(unittest.TestCase):
             self.assertEqual(self.facts(entity)["changes"], changes, entity)
 
     def test_lifetimes_and_in_since(self):
-        self.assertEqual(self.facts("sensor.bedroom_blind_battery")["last_set_days"], 191)
+        self.assertEqual(self.facts("sensor.bedroom_blind_battery")["lifetimes"], [104, 207, 191])
         self.assertEqual(self.facts("sensor.guest_bathroom_presence_battery")["last_set_days"], 335)
-        self.assertEqual(self.facts("sensor.kristines_room_presence_battery")["last_set_days"], 98)
+        self.assertEqual(self.facts("sensor.hallway_presence_battery")["lifetimes"], [148, 127, 204])
+        self.assertEqual(self.facts("sensor.kristines_room_presence_battery")["lifetimes"], [79, 98])
         window = self.facts("sensor.dining_room_window_1_battery", trend=False)
         self.assertEqual((window["in_since"], window["last_set_days"]), ("2026-10-14", 270))
-        self.assertNotIn("eta_weeks", window)
+        self.assertNotIn("empty_on", window)
 
     def test_the_yale_shows_only_when_its_cells_went_in(self):
         yale = self.facts("sensor.yale_battery", trend=False, history_from=date(2026, 2, 22))
         self.assertEqual(yale["in_since"], "2026-02-22")
-        self.assertNotIn("last_set_days", yale)
-        self.assertNotIn("eta_weeks", yale)
+        self.assertNotIn("lifetimes", yale)
+        self.assertNotIn("empty_on", yale)
 
-    def test_only_the_blinds_drain_in_a_line(self):
-        self.assertEqual(self.facts("sensor.bedroom_blind_battery")["eta_weeks"], 6)
-        self.assertEqual(self.facts("sensor.bathroom_blind_battery")["eta_weeks"], 19)
-        for entity in self.days:
-            if "blind" not in entity:
-                self.assertNotIn("eta_weeks", self.facts(entity), entity)
+    def test_the_blinds_and_the_roof_station_get_a_trend(self):
+        trends = {entity: facts.get("empty_on") for entity, facts in self.inventory_facts().items()}
+        self.assertEqual({entity: day for entity, day in trends.items() if day}, {
+            "sensor.bedroom_blind_battery": "2026-12-26",
+            "sensor.bathroom_blind_battery": "2027-05-01",
+            "sensor.ecowitt_battery_8351": "2026-11-16",
+        })
+
+    def test_the_replace_by_days(self):
+        facts = self.inventory_facts()
+        lifetimes = {}
+        for entity, found in facts.items():
+            lifetimes.setdefault(self.inventory["devices"][entity]["model"], []).extend(found.get("lifetimes", []))
+        self.assertEqual(sorted(lifetimes["zg204zm"]), [79, 98, 127, 148, 204, 335])
+        due = {}
+        for entity, found in facts.items():
+            device = self.inventory["devices"][entity]
+            due[entity] = age.replace_by(found, lifetimes[device["model"]], date(2026, 10, 14), device["history_from"])
+        self.assertEqual({entity: day for entity, day in due.items() if day}, {
+            "sensor.bedroom_blind_battery": (date(2026, 12, 26), "trend"),
+            "sensor.bathroom_blind_battery": (date(2027, 5, 1), "trend"),
+            "sensor.ecowitt_battery_8351": (date(2026, 11, 16), "trend"),
+            "sensor.hallway_presence_battery": (date(2027, 2, 6), "own"),
+            "sensor.guest_bathroom_presence_battery": (date(2027, 1, 30), "model"),
+            "sensor.dining_room_window_1_battery": (date(2027, 7, 11), "model"),
+        })
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 # tests/test_upcoming_maint.py - maintenance rows for sensor.house_upcoming: Rober2 parts, the washer
-# drum clean, battery rules, offline devices and the daily push.
+# drum clean, battery rules, replace-by days, offline devices and the daily push.
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
 import sys
@@ -49,7 +49,8 @@ class LowRuleTests(unittest.TestCase):
         st = feed(SNZB, [(T0 + 2 * HOUR, 20)], st)
         row, key = row_of(SNZB, st, 20, T0 + 2 * HOUR)
         self.assertEqual((row["title"], row["detail"], row["icon"]),
-                         ("Dining room window 1", "replace, CR2477", "mdi:battery-alert-variant-outline"))
+                         ("Dining room window 1 battery", "replace, CR2477", "mdi:battery-alert-variant-outline"))
+        self.assertNotIn("at", row)
         self.assertEqual((row["audience"], row["area"], row["kind"]), ("admin", "dining_room", "maint"))
         self.assertEqual(key, f"battery:{ENTITY}:low:{st['low_since']}")
 
@@ -206,13 +207,58 @@ class RowTextTests(unittest.TestCase):
                                 {"in_since": "2026-06-02"})[0]["detail"],
                          "no data since 12.07, in since 02.06, CR2477")
 
-    def test_a_trend_shows_only_while_above_twenty(self):
-        st = feed(BLIND, [(T0, 25), (T0 + 2 * HOUR, 25)])
-        facts = {"in_since": "2026-06-19", "last_set_days": 191, "eta_weeks": 1}
-        self.assertEqual(row_of(BLIND, st, 25, T0 + 2 * HOUR, facts)[0]["detail"],
-                         "charge, about 1 week to 20 %, in since 19.06, last set 191 d")
-        self.assertEqual(row_of(BLIND, st, 19, T0 + 2 * HOUR, facts)[0]["detail"],
-                         "charge, in since 19.06, last set 191 d")
+    def test_an_open_condition_is_timed_at_its_replace_by_day(self):
+        st = feed(WS90, [(T0 - DAY, 20), (T0, 20)])
+        facts = {"empty_on": "2026-11-16", "replace_by": "2026-11-16", "basis": "trend"}
+        row, key = row_of(WS90, st, 20, T0, facts)
+        self.assertEqual((row["title"], row["detail"]),
+                         ("Dining room window 1 batteries", "replace by 16.11 - 33 days, 2x AA"))
+        self.assertEqual((row["at"], row["icon"]), ("2026-11-16T08:00:00+00:00", "mdi:battery-alert-variant-outline"))
+        self.assertEqual(key, f"battery:{ENTITY}:low:{st['low_since']}")
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_a_replace_by_day_alone_is_a_timed_row_that_never_pushes(self):
+        facts = {"in_since": "2026-06-19", "last_set_days": 191, "replace_by": "2026-12-26", "basis": "trend"}
+        row, key = row_of(BLIND, {}, 44, T0, facts)
+        self.assertEqual((row["title"], row["detail"]), ("Dining room window 1 battery",
+                                                         "charge by 26.12 - 73 days, in since 19.06, last set 191 d"))
+        self.assertEqual((row["at"], row["icon"], key),
+                         ("2026-12-26T08:00:00+00:00", "mdi:battery-clock-outline", None))
+        self.assertIsNone(maint.digest([(row["title"], key)], {}))
+
+    def test_a_model_lifetime_reads_as_approximate_and_the_year_shows_when_it_differs(self):
+        facts = {"in_since": "2026-09-15", "lifetimes": [335], "replace_by": "2027-01-30", "basis": "model"}
+        row, _ = row_of(PARASOLL, {}, 75, T0, facts)
+        self.assertEqual(row["detail"], "recharge by ~30.01.27 - 108 days, 1x LADDA AAA NiMH")
+        self.assertEqual(row["at"], "2027-01-30T08:00:00+00:00")
+
+    def test_one_day_and_today(self):
+        tomorrow = {"replace_by": "2026-10-15", "basis": "own"}
+        self.assertEqual(row_of(SNZB, {}, 60, T0, tomorrow)[0]["detail"], "replace by 15.10 - 1 day, CR2477")
+        self.assertEqual(row_of(SNZB, {}, 60, T0 + DAY, tomorrow)[0]["detail"], "replace by 15.10 - today, CR2477")
+
+    def test_a_day_that_has_passed_shows_nothing_and_an_open_condition_goes_untimed(self):
+        facts = {"replace_by": "2026-10-13", "basis": "own"}
+        self.assertIsNone(row_of(SNZB, {}, 60, T0, facts))
+        st = feed(SNZB, [(T0, 18), (T0 + 2 * HOUR, 18)])
+        row, _ = row_of(SNZB, st, 18, T0 + 2 * HOUR, facts)
+        self.assertEqual(row["detail"], "replace, CR2477")
+        self.assertNotIn("at", row)
+
+    def test_an_offline_row_stays_untimed_under_the_device_name(self):
+        onset = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
+        st = maint.step_battery(None, SNZB, None, onset, offline_at=onset)
+        row, _ = row_of(SNZB, st, None, T0, {"replace_by": "2026-12-01", "basis": "own"})
+        self.assertEqual((row["title"], row["detail"]), ("Dining room window 1", "no data since 12.10, CR2477"))
+        self.assertNotIn("at", row)
+
+    def test_a_model_without_an_action_gets_no_replace_by_row(self):
+        self.assertIsNone(row_of(model(cell=""), {}, 30, T0, {"replace_by": "2026-12-01", "basis": "own"}))
+
+    def test_the_title_counts_the_cells(self):
+        self.assertEqual(maint.battery_title("Roof weather station", "2x AA"), "Roof weather station batteries")
+        self.assertEqual(maint.battery_title("Window", "1x LADDA AAA NiMH"), "Window battery")
+        self.assertEqual(maint.battery_title("Bedroom blind", ""), "Bedroom blind battery")
 
     def test_an_older_year_is_written_out_and_long_details_drop_trailing_facts(self):
         self.assertEqual(maint.ddmm(date(2025, 10, 15), T0), "15.10.25")
@@ -312,6 +358,10 @@ class InventoryTests(unittest.TestCase):
                                      "excluded": ["sensor.b"]})
         self.assertEqual(maint.unlisted_batteries(["sensor.a", "sensor.b", "sensor.c"], inv), ["sensor.c"])
         self.assertEqual(inv["devices"]["sensor.a"]["history_from"], None)
+
+    def test_a_model_is_empty_at_zero_unless_it_says_otherwise(self):
+        self.assertEqual(SNZB["empty"], 0)
+        self.assertEqual(model(action="replace", empty=15)["empty"], 15)
 
 
 if __name__ == "__main__":

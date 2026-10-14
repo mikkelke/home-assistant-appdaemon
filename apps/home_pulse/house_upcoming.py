@@ -1,6 +1,7 @@
 """HouseUpcoming - what is coming up in the house that only the server can know, for the dashboard's
-Now timeline: maintenance (the Rober2 parts, the washer drum clean, batteries and offline devices;
-admin only), Kristine's train, and rain while a terrace door is open (exploratory).
+Now timeline: maintenance (the Rober2 parts, the washer drum clean, batteries by their replace-by
+day and offline devices; admin only), Kristine's train, and rain while a terrace door is open
+(exploratory).
 
 Publishes sensor.house_upcoming (shape in upcoming_core.py) plus one maintenance push a day, built
 from the same conditions the rows show. The lease in `expires` is renewed every TICK_S even when
@@ -12,6 +13,9 @@ replaced by a later read, because AppDaemon 4.5.13's state store can lag behind 
 history job refreshes battery readings from the recorder when it holds a newer one. The last drum
 clean seen is kept while washer_state is missing or lacks it. HA restarts re-run initialize, and
 plugin_started republishes.
+
+The daily history job also turns each device's recorder history into battery facts and a
+replace-by day, with the median lifetime of every device of the same model as the last resort.
 
 Latches, push keys and battery facts persist in house_upcoming_state.json next to this module; rain
 forecast fixtures go to house_upcoming_rain_fixtures.jsonl.
@@ -309,7 +313,8 @@ class HouseUpcoming(hass.Hass):
             device = self.inventory["devices"][entity]
             model = self.inventory["models"][device["model"]]
             days = age.daily_stats(series, fetched)
-            facts = age.battery_facts(days, fetched, trend=model["trend"], history_from=device["history_from"])
+            facts = age.battery_facts(days, fetched, trend=model["trend"], history_from=device["history_from"],
+                                      empty=model["empty"])
             self._facts[entity] = facts
             onset, had_reading = age.outage_onset(series)
             in_since = age.as_date(facts.get("in_since"))
@@ -322,8 +327,21 @@ class HouseUpcoming(hass.Hass):
                 peak=age.peak_since(days, in_since) if model["drop"] is not None else None,
             )
             self._refresh_from_recorder(entity, latest.get(entity))
+        self._estimate_replace_by(maint.house_date(fetched))
         self.log(f"Battery history read for {len(series_by_entity)} devices")
         self._evaluate()
+
+    def _estimate_replace_by(self, today):
+        lifetimes = {}
+        for entity, device in self.inventory["devices"].items():
+            lifetimes.setdefault(device["model"], []).extend((self._facts.get(entity) or {}).get("lifetimes") or [])
+        for entity, device in self.inventory["devices"].items():
+            facts = {k: v for k, v in (self._facts.get(entity) or {}).items() if k not in ("replace_by", "basis")}
+            due = age.replace_by(facts, lifetimes[device["model"]], today, device["history_from"])
+            if due:
+                facts.update(replace_by=due[0].isoformat(), basis=due[1])
+            if facts:
+                self._facts[entity] = facts
 
     def _refresh_from_recorder(self, entity, row):
         """The recorder's newest state wins over a cached one that is older, which is how a reading

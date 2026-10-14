@@ -13,12 +13,17 @@ lowest reading of the condition. A device without a reading for OFFLINE_GRACE is
 from the transition when it was seen live or is visible in history, else undated. An offline-only
 model's offline row carries its action, since going offline is how its cells announce they are flat.
 
+A device with a replace-by day (upcoming_battery_age) that has not passed gets a row timed at
+DUE_TIME that day, low condition or not; offline rows stay untimed. A day from the model's median
+lifetime reads as approximate.
+
 Every condition carries a push key that is unique per episode; `pushed_by` models belong to another
-app's notifications and have none.
+app's notifications and have none. A replace-by day alone is never pushed.
 """
 
 import math
-from datetime import date, datetime, timedelta
+import re
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from upcoming_core import BATTERY_ID_PREFIX, TEXT_MAX, make_row, utc_iso
@@ -29,7 +34,7 @@ OFFLINE_GRACE = timedelta(hours=24)
 CHARGE_MARGIN = 10
 DEFAULT_RISE = 30
 LOW_DAYS_KEEP = 7
-ETA_LEVEL = 20
+DUE_TIME = time(9, 0)
 DRUM_INTERVAL = timedelta(days=30)
 PUSHED_KEEP = timedelta(days=180)
 
@@ -40,6 +45,7 @@ ACTION_ICONS = {
     "charge": "mdi:battery-charging-low",
 }
 OFFLINE_ICON = "mdi:lan-disconnect"
+DUE_ICON = "mdi:battery-clock-outline"
 
 ROBER2_PARTS = (
     ("filter", "Rober2 filter", "replace"),
@@ -140,6 +146,7 @@ def parse_inventory(raw):
             "rise": float(cfg["rise"]) if cfg.get("rise") is not None else None,
             "pushed_by": cfg.get("pushed_by") or None,
             "trend": bool(cfg.get("trend", True)),
+            "empty": float(cfg.get("empty", 0)),
         }
     devices = {}
     for cfg in raw.get("devices") or []:
@@ -276,8 +283,32 @@ def _age_parts(facts, now):
     return parts
 
 
+def _replace_by(facts, model, now):
+    """(day, approximate) of the device's replace-by day while it has not passed, else None."""
+    facts = facts or {}
+    try:
+        day = date.fromisoformat(facts.get("replace_by") or "")
+    except (TypeError, ValueError):
+        return None
+    if model["action"] is None or day < house_date(now):
+        return None
+    return day, facts.get("basis") == "model"
+
+
+def _due_text(action, day, approximate, now):
+    left = (day - house_date(now)).days
+    when = "today" if left == 0 else f"{left} day{'' if left == 1 else 's'}"
+    return f"{action} by {'~' if approximate else ''}{ddmm(day, now)} - {when}"
+
+
+def battery_title(name, cell):
+    count = re.match(r"(\d+)x", cell)
+    return f"{name} {'batteries' if count and int(count.group(1)) > 1 else 'battery'}"
+
+
 def battery_row(entity, device, model, st, value, facts, now):
-    """(row, push key) for the device's open condition, or None; offline outranks low."""
+    """(row, push key) for the device, or None: an open condition, else its replace-by day. Offline
+    outranks low; a low row is timed at the replace-by day when there is one."""
     st = st or {}
     key_base = None if model["pushed_by"] else f"battery:{entity}"
     if value is None and "off_ep" in st:
@@ -290,16 +321,15 @@ def battery_row(entity, device, model, st, value, facts, now):
             row = make_row(BATTERY_ID_PREFIX + entity, "maint", device["name"], fit_parts(parts),
                            icon=OFFLINE_ICON, area=device["area"], audience="admin")
             return row, (f"{key_base}:offline:{st['off_ep']}" if key_base else None)
-    if "low_since" in st:
-        parts = [model["action"]]
-        eta = (facts or {}).get("eta_weeks")
-        if eta and value is not None and value > ETA_LEVEL:
-            parts.append(f"about {eta} week{'' if eta == 1 else 's'} to {ETA_LEVEL} %")
-        parts += [model["cell"], *_age_parts(facts, now)]
-        row = make_row(BATTERY_ID_PREFIX + entity, "maint", device["name"], fit_parts(parts),
-                       icon=ACTION_ICONS[model["action"]], area=device["area"], audience="admin")
-        return row, (f"{key_base}:low:{st['low_since']}" if key_base else None)
-    return None
+    due = _replace_by(facts, model, now)
+    low = "low_since" in st
+    if not low and due is None:
+        return None
+    parts = [_due_text(model["action"], *due, now) if due else model["action"], model["cell"], *_age_parts(facts, now)]
+    row = make_row(BATTERY_ID_PREFIX + entity, "maint", battery_title(device["name"], model["cell"]), fit_parts(parts),
+                   at=datetime.combine(due[0], DUE_TIME, HOUSE_TZ) if due else None,
+                   icon=ACTION_ICONS[model["action"]] if low else DUE_ICON, area=device["area"], audience="admin")
+    return row, (f"{key_base}:low:{st['low_since']}" if low and key_base else None)
 
 
 # ---------------------------------------------------------------- Rober2 and the washer drum
