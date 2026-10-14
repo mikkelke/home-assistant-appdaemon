@@ -75,9 +75,7 @@ HouseUpcoming:
       - {entity: sensor.yale_battery, model: yale, name: Front door lock, area: hallway, history_from: 2026-02-22}
       - {entity: sensor.bedroom_blind_battery, model: blind, name: Bedroom blind, area: bedroom}
       - {entity: sensor.bathroom_blind_battery, model: blind, name: Bathroom blind, area: bathroom}
-      # WS90 backup cells, carrying the station since its supercapacitor failed on 30.08.2026; delete
-      # this line when the permanent supply is in.
-      - {entity: sensor.ecowitt_battery_8351, model: ws90, name: Roof weather station, area: rooftop, history_from: 2026-08-30}
+      - {entity: sensor.ecowitt_battery_8351, model: ws90, name: Roof weather station, area: rooftop, history_from: 2026-08-30}  # WS90 backup cells since the supercapacitor failed; delete this line once the permanent supply is in
       - {entity: sensor.kitchen_smoke_alarm_battery, model: twinguard, name: Kitchen smoke alarm, area: kitchen}
       - {entity: sensor.bedroom_presence_battery, model: fp300, name: Bedroom presence, area: bedroom}
       - {entity: sensor.claudias_room_presence_battery, model: fp300, name: Claudias room presence, area: office}
