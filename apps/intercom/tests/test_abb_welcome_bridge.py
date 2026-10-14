@@ -1489,9 +1489,9 @@ class RingFallbackTests(unittest.TestCase):
         ])
         self.assertEqual(push["data"]["tag"], "abb_ring_front")
         link = f"/dashboard-rooftop/home#now=ring-{int(self.clock.at.timestamp())}"
-        self.assertEqual(push["link"], link)
-        # Keyed for a tap of the push only, so iOS never opens it from Open or Reject.
-        self.assertEqual(push["data"]["url"], {"_": link})
+        self.assertIsNone(push.get("link"))
+        self.assertNotIn("url", push["data"])
+        self.assertEqual(push["data"]["clickAction"], link)
         scheduled = [cb.__name__ for cb, _, _ in self.app.run_in_calls]
         self.assertIn("_ring_ack", scheduled)
         self.assertIn("_ring_no_answer", scheduled)
@@ -1646,7 +1646,6 @@ class RealNotifierPayloadTests(unittest.TestCase):
                     {"action": f"ABB_RING_OPEN_{episode['id']}", "title": "Open"},
                     {"action": f"ABB_RING_REJECT_{episode['id']}", "title": "Reject"},
                 ],
-                "url": {"_": link},
                 "clickAction": link,
             },
         })])

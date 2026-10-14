@@ -123,10 +123,6 @@ MAX_IMAGE_BYTES = 5 * 1024 * 1024  # sanity cap on a single doorbell frame
 MAX_PROCESSED_IDS = 50  # missed-call event_id dedupe ring buffer
 UNLOCK_EVENT_TTL_S = 600  # prune bound for stored unlock timestamps, and the sanity bound on a last_changed reading in _unlock_edge_at (get_state can serve a stale value - see the appdaemon-stale-state-store gotcha)
 UNLOCK_EVENT_MAX_PER_DOOR = 20  # cap so a long uptime with many rings/re-rings cannot grow a door's unlock list unbounded
-# iOS opens a push's string url for every action button too; a url keyed by "_"
-# opens only when the push itself is tapped. Android reads clickAction instead,
-# which only ever applies to a tap of the push.
-IOS_TAP_URL_KEY = "_"
 
 
 def classify_episode(unlock_seen, missed_seen, answered_seen):
@@ -1820,9 +1816,8 @@ class AbbWelcomeBridge(hass.Hass):
                             {"action": entry["open_id"], "title": "Open"},
                             {"action": entry["reject_id"], "title": "Reject"},
                         ],
-                        "url": {IOS_TAP_URL_KEY: link},
+                        "clickAction": link,
                     },
-                    link=link,
                 ))
                 self.log(f"RING-PUSH door={door} episode={episode['id']} (auto-open off)", level="INFO")
             if self.ring_ack_message and self.announce_cameras.get(door):
