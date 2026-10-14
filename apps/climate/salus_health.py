@@ -298,7 +298,7 @@ class SalusHealth(hass.Hass):
         label = self._room_label(entity_id)
         await self._safe_notify(
             "Thermostat battery low",
-            f"{label} thermostat battery is at {level}/5 - replace soon.",
+            f"{label} thermostat battery is at {level}/5 - charge soon.",
         )
 
     # ---------- notify ----------
