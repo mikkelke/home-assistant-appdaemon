@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "appliances"))
 import upcoming_drum as drum  # noqa: E402
 from upcoming_maint import HOUSE_TZ  # noqa: E402
 

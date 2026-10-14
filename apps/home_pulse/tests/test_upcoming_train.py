@@ -10,6 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "transit"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "appliances"))
 _aiohttp = types.ModuleType("aiohttp")
 _aiohttp.ClientSession = object
 sys.modules.setdefault("aiohttp", _aiohttp)

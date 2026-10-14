@@ -26,6 +26,7 @@ import re
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+import drum_clean  # apps/appliances - AppDaemon puts every app dir on sys.path
 from upcoming_core import BATTERY_ID_PREFIX, TEXT_MAX, make_row, utc_iso
 
 HOUSE_TZ = ZoneInfo("Europe/Copenhagen")
@@ -35,7 +36,6 @@ CHARGE_MARGIN = 10
 DEFAULT_RISE = 30
 LOW_DAYS_KEEP = 7
 DUE_TIME = time(9, 0)
-DRUM_INTERVAL = timedelta(days=30)
 DRUM_HOW = "Bomuld 90, empty + a little powder"
 PUSHED_KEEP = timedelta(days=180)
 
@@ -364,8 +364,7 @@ def rober2_rows(states, area):
 
 
 def drum_due(last_clean, now):
-    when = parse_iso(last_clean)
-    return when is None or now - when >= DRUM_INTERVAL
+    return drum_clean.due(parse_iso(last_clean), now)
 
 
 def drum_row(last_clean, now, area, start=None):

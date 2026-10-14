@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "appliances"))
 import upcoming_core as core  # noqa: E402
 import upcoming_maint as maint  # noqa: E402
 

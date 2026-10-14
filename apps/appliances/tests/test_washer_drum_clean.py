@@ -1,30 +1,37 @@
 # tests/test_washer_drum_clean.py - the drum clean as its own washer programme: last_drum_clean on
-# sensor.washer_state for HouseUpcoming's monthly row, the confirm push and the programme picker
-# that record one, and its place in learning.
+# sensor.washer_state for HouseUpcoming's monthly row, the confirm push button (only on Mikkel's
+# phone, only while one is due) and the programme picker that record one, and its place in learning.
 # Run from repo root: python3 -m unittest discover -s apps/appliances/tests -q
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "notify"))
 
 import test_washer_restart_survival as trs  # noqa: E402  (installs the appdaemon stub)
 
+import drum_clean  # noqa: E402
+import mobile_notifier as mn  # noqa: E402
 import washer_classify as wcls  # noqa: E402
 import washer_feedback as wfb  # noqa: E402
 import washer_profiles as wp  # noqa: E402
 
 PROGRAMMES = yaml.safe_load((Path(wfb.__file__).with_name("washer_programmes.yaml")).read_text(encoding="utf-8"))
 PROFILES = wp.merge_profiles(PROGRAMMES["programmes"])
+PROGRAMME_SELECT = "input_select.washer_confirmed_programme"
+TEMPERATURE_SELECT = "input_select.washer_temperature"
+DAY = timedelta(days=1)
 
 
 def record(ts, confirmed="drum_clean", temp=None, user=True, completion="completed", end=None,
@@ -120,27 +127,31 @@ class LaundryLearningTests(unittest.TestCase):
         self.assertEqual(wcls.classify_from_history(centroids, 140.0, 1.2, 12), "bomuld|90°C")
 
 
+def washer(cycles, sensor_state="Off", call_service_fn=None, **args):
+    """(app, feedback path): a WasherMonitor run through its real initialize() on a feedback file
+    holding `cycles`, with a MobileNotifier that records pushes in app.sent."""
+    tmpdir = tempfile.mkdtemp(prefix="washer_drum_")
+    path = os.path.join(tmpdir, "washer_feedback.json")
+    with open(path, "w") as f:
+        json.dump({"version": 2, "cycles": cycles}, f)
+    app = trs.make_full_init_app(sensor_state=sensor_state, helper_state="Off",
+                                 extra_args={"feedback_file": path, **args}, call_service_fn=call_service_fn)
+    app.sent = []
+
+    class Notifier:
+        def notify(self, **kwargs):
+            app.sent.append(kwargs)
+
+        def clear_notification(self, **kwargs):
+            return None
+
+    app.get_app = lambda name: Notifier() if name == "MobileNotifier" else None
+    app.create_task = lambda task: task
+    return app, path
+
+
 class ConfirmTests(unittest.TestCase):
     TS = trs.NOW.astimezone(timezone.utc).replace(microsecond=0).isoformat()
-
-    def _app(self, cycles, sensor_state="Off"):
-        tmpdir = tempfile.mkdtemp(prefix="washer_drum_")
-        path = os.path.join(tmpdir, "washer_feedback.json")
-        with open(path, "w") as f:
-            json.dump({"version": 2, "cycles": cycles}, f)
-        app = trs.make_full_init_app(sensor_state=sensor_state, helper_state="Off", extra_args={"feedback_file": path})
-        app.sent = []
-
-        class Notifier:
-            def notify(self, **kwargs):
-                app.sent.append(kwargs)
-
-            def clear_notification(self, **kwargs):
-                return None
-
-        app.get_app = lambda name: Notifier() if name == "MobileNotifier" else None
-        app.create_task = lambda task: task
-        return app, path
 
     def _published(self, app):
         return [c["attributes"].get("last_drum_clean") for c in app.set_state_calls
@@ -156,18 +167,8 @@ class ConfirmTests(unittest.TestCase):
         self.assertEqual(action, f"WASHER_CONFIRM|{self.TS}|drum_clean|-")
         self.assertEqual(wfb.parse_confirm_action(action), (self.TS, "drum_clean", None))
 
-    def test_every_confirm_push_offers_it(self):
-        app, _ = self._app([])
-        app._send_confirm_push({"ts": self.TS, "predicted": "bomuld", "predicted_temperature": "60"})
-        app._send_confirm_push({"ts": self.TS, "predicted": "unknown"})
-        guessed, unknown = (sent["data"]["data"]["actions"] for sent in app.sent)
-        self.assertEqual([a["title"] for a in guessed], ["Yes, Bomuld 60°C", "Drum clean", "Other..."])
-        self.assertEqual([a["title"] for a in unknown], ["Drum clean", "Choose in dashboard"])
-        self.assertEqual(guessed[1], unknown[0])
-        self.assertEqual(wfb.parse_confirm_action(guessed[1]["action"]), (self.TS, "drum_clean", None))
-
     def test_tapping_it_records_the_clean_and_republishes_at_once(self):
-        app, path = self._app([record(self.TS, confirmed="bomuld", temp="90", user=False)])
+        app, path = washer([record(self.TS, confirmed="bomuld", temp="90", user=False)])
         app.set_state_calls.clear()
         app._on_confirm_push_action("mobile_app_notification_action",
                                     {"action": wfb.encode_confirm_action(self.TS, "drum_clean", None)}, {})
@@ -178,35 +179,112 @@ class ConfirmTests(unittest.TestCase):
         self.assertEqual(self._published(app)[-1], utc(self.TS))
         self.assertEqual(app.states["sensor.washer_state"], "Off")
 
-    def test_the_programme_picker_offers_it_and_stores_no_temperature(self):
-        app, path = self._app([record(self.TS, confirmed="bomuld", temp="90", user=False)])
-        self.assertEqual(app._programme_display_order[-1], "drum_clean")
-        self.assertEqual(app._LABEL_TO_KEY["Drum clean"], "drum_clean")
+    def test_the_programme_picker_offers_it_and_drops_a_leftover_temperature(self):
+        calls = []
+        app, path = washer([record(self.TS, confirmed="bomuld", temp="90", user=False)],
+                           confirm_entity=PROGRAMME_SELECT, temperature_entity=TEMPERATURE_SELECT,
+                           call_service_fn=lambda service, **kw: calls.append((service, kw)))
+        options = [kw["options"] for service, kw in calls
+                   if service == "input_select/set_options" and kw["entity_id"] == PROGRAMME_SELECT]
+        self.assertEqual(options, [["Auto (unconfirmed)", "Ekspres", "Uld", "Bomuld", "Finvask", "Strygelet", "ECO",
+                                    "Mørkt/Denim", "Outdoor", "Imprægnering", "Pumpe/Centrifugering",
+                                    "Kun skyl/stivelse", "Drum clean"]])
+        app.states[TEMPERATURE_SELECT] = "90°C"
         app.set_state_calls.clear()
-        app._update_last_feedback_user_confirmed("drum_clean", "90°C", "Mikkel")
+        app._on_confirm_changed(PROGRAMME_SELECT, "state", "Bomuld", "Drum clean", {})
         saved = self._saved(path)
-        self.assertEqual((saved["confirmed"], saved["confirmed_temperature"]), ("drum_clean", None))
+        self.assertEqual((saved["confirmed"], saved["confirmed_temperature"], saved["programme_user_confirmed"]),
+                         ("drum_clean", None, True))
         self.assertEqual(self._published(app)[-1], utc(self.TS))
 
     def test_the_restore_publish_after_an_ha_restart_carries_it(self):
-        app, _ = self._app([record("2026-09-01T10:00:00+02:00")], sensor_state=None)
+        app, _ = washer([record("2026-09-01T10:00:00+02:00")], sensor_state=None)
         calls = [c for c in app.set_state_calls if c["entity"] == "sensor.washer_state"]
         self.assertTrue(calls)
         self.assertFalse(any(c["replace"] for c in calls if set(c["attributes"]) == {"last_drum_clean"}))
         self.assertEqual({c["attributes"]["last_drum_clean"] for c in calls}, {"2026-09-01T08:00:00+00:00"})
 
     def test_every_later_publish_carries_it_and_unknown_is_an_empty_string(self):
-        app, _ = self._app([record("2026-06-10T14:01:15+02:00", user=False)])
+        app, _ = washer([record("2026-06-10T14:01:15+02:00", user=False)])
         app._set_state_entity(state="Running", attributes={"progress_pct": 5}, replace=True)
         app._set_state_entity(state="Off")
         self.assertEqual(self._published(app), ["", ""])
         self.assertEqual(app.attrs_store["sensor.washer_state"], {"progress_pct": 5, "last_drum_clean": ""})
 
     def test_a_confirmation_that_changes_nothing_publishes_nothing(self):
-        app, _ = self._app([record("2026-01-01T10:00:00+01:00"), record(self.TS, confirmed="bomuld", temp="60", user=False)])
+        app, _ = washer([record("2026-01-01T10:00:00+01:00"), record(self.TS, confirmed="bomuld", temp="60", user=False)])
         app.set_state_calls.clear()
         app._update_last_feedback_user_confirmed("bomuld", "60°C", "Mikkel")
         self.assertEqual(self._published(app), [])
+
+
+class ConfirmPushButtonTests(unittest.TestCase):
+    """The "Drum clean" button reaches a phone only while a drum clean is due and only when the phone
+    is Mikkel's. Each push goes through the real MobileNotifier, which hands every phone its own
+    buttons; every other push keeps the buttons it always had."""
+
+    TS = ConfirmTests.TS
+    NOW = trs.NOW
+    GUESSED = ["Yes, Bomuld 60°C", "Other..."]
+
+    def _phones(self, cycles, started_by, predicted="bomuld", home=("mikkel", "kristine")):
+        """{person: button titles} on every phone the confirm push for the cycle at TS reaches."""
+        app, _ = washer(cycles)
+        notifier = mn.MobileNotifier.__new__(mn.MobileNotifier)
+        notifier.person_entities = ["person.mikkel", "person.kristine", "person.claudia"]
+        notifier.device_mapping = {"mikkel": ["notify.mobile_app_mikkels_ofx9p"],
+                                   "kristine": ["notify.mobile_app_kristine_iphone_2"],
+                                   "claudia": ["notify.mobile_app_claudias_iphone"]}
+        notifier.category_audience, notifier.platform_map, notifier.user_notification_service = {}, {}, None
+        notifier.log = lambda *a, **kw: None
+        sent = []
+
+        async def call_service(service, **kwargs):
+            sent.append((service, kwargs))
+
+        async def get_state(entity, **kwargs):
+            return "home" if entity.removeprefix("person.") in home else "not_home"
+
+        notifier.call_service, notifier.get_state = call_service, get_state
+        tasks = []
+        app.get_app = lambda name: notifier if name == "MobileNotifier" else None
+        app.create_task = tasks.append
+        app._send_confirm_push({"ts": self.TS, "predicted": predicted, "predicted_temperature": "60",
+                                "started_by": started_by})
+        for task in tasks:
+            asyncio.run(task)
+        return {notifier._person_for_service(service.replace("notify/", "notify.", 1)):
+                [action["title"] for action in kwargs["data"]["actions"]] for service, kwargs in sent}
+
+    def test_not_due_no_button(self):
+        cleaned = [record((self.NOW - 29 * DAY).isoformat())]
+        self.assertEqual(self._phones(cleaned, "mikkel"), {"mikkel": self.GUESSED})
+        self.assertEqual(self._phones(cleaned, None), {"mikkel": self.GUESSED, "kristine": self.GUESSED})
+
+    def test_due_but_sent_to_a_housemate_no_button(self):
+        self.assertEqual(self._phones([], "kristine"), {"kristine": self.GUESSED})
+        self.assertEqual(self._phones([], "claudia", predicted="unknown"), {"claudia": ["Choose in dashboard"]})
+
+    def test_due_and_sent_to_mikkel_the_button_appears(self):
+        for cycles in ([], [record((self.NOW - 30 * DAY).isoformat())]):
+            self.assertEqual(self._phones(cycles, "mikkel"),
+                             {"mikkel": ["Yes, Bomuld 60°C", "Drum clean", "Other..."]})
+        self.assertEqual(self._phones([], "mikkel", predicted="unknown"),
+                         {"mikkel": ["Drum clean", "Choose in dashboard"]})
+
+    def test_a_home_broadcast_gives_it_to_mikkels_phone_only(self):
+        self.assertEqual(self._phones([], None),
+                         {"mikkel": ["Yes, Bomuld 60°C", "Drum clean", "Other..."], "kristine": self.GUESSED})
+
+    def test_the_button_confirms_the_cycle_as_a_drum_clean(self):
+        app, _ = washer([])
+        actions = app._drum_clean_actions(self.TS, [{"action": "URI", "title": "Other...", "uri": "x"}])("mikkel")
+        self.assertEqual(wfb.parse_confirm_action(actions[0]["action"]), (self.TS, "drum_clean", None))
+
+    def test_due_with_none_on_record_or_thirty_days_after_the_last(self):
+        self.assertTrue(drum_clean.due(None, self.NOW))
+        self.assertFalse(drum_clean.due(self.NOW - 30 * DAY + timedelta(seconds=1), self.NOW))
+        self.assertTrue(drum_clean.due(self.NOW - 30 * DAY, self.NOW))
 
 
 if __name__ == "__main__":

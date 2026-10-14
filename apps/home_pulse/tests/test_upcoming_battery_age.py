@@ -13,6 +13,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "appliances"))
 import upcoming_battery_age as age  # noqa: E402
 import upcoming_maint as maint  # noqa: E402
 from upcoming_maint import HOUSE_TZ  # noqa: E402

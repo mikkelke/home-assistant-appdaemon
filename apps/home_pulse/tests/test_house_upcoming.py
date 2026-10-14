@@ -17,6 +17,7 @@ import yaml
 APPS = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(APPS / "home_pulse"))
 sys.path.insert(0, str(APPS / "climate"))
+sys.path.insert(0, str(APPS / "appliances"))
 _hassapi = types.ModuleType("appdaemon.plugins.hass.hassapi")
 _hassapi.Hass = object
 for _name, _mod in (

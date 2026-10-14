@@ -596,8 +596,8 @@ class ConfirmPushLinks(unittest.TestCase):
         app.confirm_push_dashboard_uri = uri
         app._send_confirm_push(dict(ConfirmPushTargeting._RECORD))
         app._send_confirm_push(dict(ConfirmPushTargeting._RECORD, predicted="unknown"))
-        other = app.notify_calls[0]["data"]["data"]["actions"][-1]
-        choose = app.notify_calls[1]["data"]["data"]["actions"][-1]
+        other = app.notify_calls[0]["data"]["data"]["actions"][1]
+        choose = app.notify_calls[1]["data"]["data"]["actions"][0]
         self.assertEqual(other, {"action": "URI", "title": "Other...", "uri": self.ROOM_LINK})
         self.assertEqual(choose, {"action": "URI", "title": "Choose in dashboard", "uri": self.ROOM_LINK})
 
