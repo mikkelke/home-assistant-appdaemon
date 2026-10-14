@@ -10,6 +10,9 @@ rober2_control:
   dependencies: MobileNotifier
   # Physical room name reported by sensor.rober2_current_room when robot is docked
   dock_room_name: "Kitchen1"
+  # Saved room maps are deleted after this many days; the dashboard timeline shows
+  # every cleaned room of a round with its map, so older rounds need theirs.
+  map_retention_days: 365
   # Master on/off for scheduled cleaning (off = automation disabled; separate from rober2_automation_paused errors)
   automation_enabled_entity: input_boolean.rober2_enabled
   # Human-readable cleaning story for React / History (input_text helper in HA)

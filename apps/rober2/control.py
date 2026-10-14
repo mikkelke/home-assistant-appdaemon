@@ -11,6 +11,58 @@ import urllib.request
 import urllib.error
 import json
 
+MAP_URL_PREFIX = "/media/local/rober2_maps"
+
+
+class MapIndexError(Exception):
+    """index.json exists but is not a readable maps index."""
+
+
+def is_map_file(name):
+    return name.startswith("rober2_map_") and name.endswith(".png")
+
+
+def map_file_time(name):
+    """When a map was saved, from the stamp in its rober2_map_YYYYmmdd_HHMMSS_... name."""
+    try:
+        return datetime.datetime.strptime(name[len("rober2_map_"):][:15], "%Y%m%d_%H%M%S")
+    except ValueError:
+        return None
+
+
+def map_entry_time(entry):
+    """When an indexed map was saved (house wall clock): its datetime, else its file name stamp."""
+    try:
+        saved = datetime.datetime.fromisoformat(str(entry.get("datetime")))
+    except ValueError:
+        return map_file_time(str(entry.get("filename") or ""))
+    return saved.astimezone().replace(tzinfo=None) if saved.tzinfo else saved
+
+
+def read_map_index(index_file):
+    """The parsed index, None when there is none yet. Raises MapIndexError for
+    an index that cannot be read or is not an index: no caller may treat that
+    as empty, since the cleanup would then delete every map as an orphan."""
+    try:
+        with open(index_file, "r") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise MapIndexError(f"{index_file}: {e}") from e
+    if not isinstance(data, dict) or not isinstance(data.get("maps"), list):
+        raise MapIndexError(f"{index_file}: no maps list")
+    return data
+
+
+def write_map_index(index_file, index_data):
+    """Temp file then rename, so no reader ever sees a half-written index."""
+    tmp = f"{index_file}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(index_data, f, indent=2)
+    os.replace(tmp, index_file)
+
+
 class Rober2Control(hass.Hass):
     """Simple vacuum control for Rober2 with door checking."""
     
@@ -45,16 +97,16 @@ class Rober2Control(hass.Hass):
         
         # Map image saving configuration
         self.map_image_entity = "image.rober2_rooftop"
-        # Save directory: use Home Assistant's www folder for web access
-        # Default: /www/rober2_maps (mounted from /data/homeassistant/www in docker-compose)
-        # Accessible via /local/rober2_maps/ in Home Assistant frontend
-        self.map_save_dir = self.args.get("map_save_dir", "/www/rober2_maps")
-        # Retention: keep last N images per room (default: 3 images per room)
-        self.map_retention_per_room = int(self.args.get("map_retention_per_room", 3))
+        # HA's media folder (/data/homeassistant/media on the box, /media in both
+        # containers), served at /media/local/rober2_maps/ to signed-in users only.
+        # Never under www/: HA serves that to anyone, from the internet too.
+        self.map_save_dir = self.args.get("map_save_dir", "/media/rober2_maps")
+        # Maps older than this are deleted; the timeline keeps each round's rooms and maps.
+        self.map_retention_days = int(self.args.get("map_retention_days", 365))
         # Ensure directory exists
         try:
             os.makedirs(self.map_save_dir, exist_ok=True)
-            self.log(f"Map save directory: {self.map_save_dir} (retention: {self.map_retention_per_room} images per room)", level="INFO")
+            self.log(f"Map save directory: {self.map_save_dir} (retention: {self.map_retention_days} days)", level="INFO")
         except Exception as e:
             self.log(f"Error creating map save directory: {e}", level="ERROR")
             self.map_save_dir = None  # Disable saving if directory creation fails
@@ -1870,146 +1922,104 @@ class Rober2Control(hass.Hass):
         """Update JSON index file with map image metadata for easy React access."""
         try:
             index_file = os.path.join(self.map_save_dir, "index.json")
-            
-            # Load existing index or create new
-            if os.path.exists(index_file):
-                try:
-                    with open(index_file, 'r') as f:
-                        index_data = json.load(f)
-                except (json.JSONDecodeError, IOError):
-                    index_data = {"maps": []}
-            else:
+            try:
+                index_data = read_map_index(index_file)
+            except MapIndexError as e:
+                self.log(f"Map index unusable, {filename} left out of it: {e}", level="WARNING")
+                return
+            if index_data is None:
+                # A fresh index beside older maps would orphan every one of them.
+                others = [f for f in os.listdir(self.map_save_dir) if is_map_file(f) and f != filename]
+                if others:
+                    self.log(f"Map index missing beside {len(others)} maps, {filename} left out of it", level="WARNING")
+                    return
                 index_data = {"maps": []}
-            
+
             # Add new entry
             entry = {
                 "filename": filename,
                 "timestamp": timestamp,
                 "datetime": datetime.datetime.now().isoformat(),
                 "room": trigger_context if trigger_context else None,
-                "url": f"/local/rober2_maps/{filename}"
+                "url": f"{MAP_URL_PREFIX}/{filename}"
             }
             
-            # Add to beginning of list (most recent first)
+            # Newest first; the age cleanup is what bounds the index.
             index_data["maps"].insert(0, entry)
-            
-            # Keep only last 100 entries to prevent index from growing too large
-            if len(index_data["maps"]) > 100:
-                index_data["maps"] = index_data["maps"][:100]
-                # Optionally delete old files here if desired
-            
-            # Save updated index
-            with open(index_file, 'w') as f:
-                json.dump(index_data, f, indent=2)
-                
+            write_map_index(index_file, index_data)
+
         except Exception as e:
             self.log(f"Error updating map index: {e}", level="WARNING")
             
     async def cleanup_old_map_images(self, kwargs):
-        """Clean up map images and metadata, keeping only the last N images per room."""
+        """Delete maps older than map_retention_days. The index then lists exactly
+        the maps on disk inside that window; a map file nobody indexed is only
+        deleted once it is that old too."""
         try:
             if not self.map_save_dir:
                 return
-            
-            deleted_count = 0
+
             index_file = os.path.join(self.map_save_dir, "index.json")
-            
-            # Load index if it exists
-            index_data = {"maps": []}
-            if os.path.exists(index_file):
-                try:
-                    with open(index_file, 'r') as f:
-                        index_data = json.load(f)
-                except (json.JSONDecodeError, IOError):
-                    index_data = {"maps": []}
-            
-            # Group maps by room
-            maps_by_room = {}
-            for map_entry in index_data.get("maps", []):
-                try:
-                    room = map_entry.get("room")
-                    if room is None:
-                        room = "unknown"  # Group entries without room name
-                    
-                    if room not in maps_by_room:
-                        maps_by_room[room] = []
-                    
-                    # Parse datetime for sorting
-                    entry_datetime = datetime.datetime.fromisoformat(map_entry.get("datetime", ""))
-                    maps_by_room[room].append((entry_datetime, map_entry))
-                except (ValueError, KeyError) as e:
-                    # Invalid entry, skip it
-                    self.log(f"Skipping invalid map entry: {e}", level="DEBUG")
-                    continue
-            
-            # Determine which files to keep (last N per room)
-            files_to_keep = set()
-            maps_to_keep = []
-            
-            for room, room_maps in maps_by_room.items():
-                # Sort by datetime (most recent first)
-                room_maps.sort(key=lambda x: x[0], reverse=True)
-                
-                # Keep only the last N images for this room
-                keep_count = min(self.map_retention_per_room, len(room_maps))
-                for i in range(keep_count):
-                    _, map_entry = room_maps[i]
-                    filename = map_entry.get("filename")
-                    files_to_keep.add(filename)
-                    maps_to_keep.append(map_entry)
-                
-                # Delete excess images for this room
-                for i in range(keep_count, len(room_maps)):
-                    _, map_entry = room_maps[i]
-                    filename = map_entry.get("filename")
-                    filepath = os.path.join(self.map_save_dir, filename)
-                    
-                    if os.path.exists(filepath):
-                        try:
-                            os.remove(filepath)
-                            deleted_count += 1
-                            self.log(f"Deleted old map image for {room}: {filename}", level="DEBUG")
-                        except Exception as e:
-                            self.log(f"Error deleting map file {filename}: {e}", level="WARNING")
-            
-            # Also check for orphaned files (files not in index)
-            if os.path.exists(self.map_save_dir):
-                for filename in os.listdir(self.map_save_dir):
-                    if filename == "index.json":
-                        continue
-                    
-                    if not filename.startswith("rober2_map_") or not filename.endswith(".png"):
-                        continue
-                    
-                    if filename not in files_to_keep:
-                        # Delete orphaned file
-                        filepath = os.path.join(self.map_save_dir, filename)
-                        try:
-                            os.remove(filepath)
-                            deleted_count += 1
-                            self.log(f"Deleted orphaned map image: {filename}", level="DEBUG")
-                        except Exception as e:
-                            self.log(f"Error deleting orphaned file {filename}: {e}", level="WARNING")
-            
-            # Sort maps_to_keep by datetime (most recent first) for consistent index
-            maps_to_keep.sort(key=lambda x: datetime.datetime.fromisoformat(x.get("datetime", "")), reverse=True)
-            
-            # Update index with only kept entries
-            index_data["maps"] = maps_to_keep
             try:
-                with open(index_file, 'w') as f:
-                    json.dump(index_data, f, indent=2)
+                index_data = read_map_index(index_file)
+            except MapIndexError as e:
+                self.log(f"Map cleanup skipped, nothing deleted: {e}", level="WARNING")
+                return
+            if index_data is None:
+                if any(is_map_file(f) for f in os.listdir(self.map_save_dir)):
+                    self.log("Map cleanup skipped, nothing deleted: index.json is missing beside saved maps", level="WARNING")
+                return
+
+            cutoff = datetime.datetime.now() - datetime.timedelta(days=self.map_retention_days)
+            expired = set()
+            listed = set()
+            kept = []
+            for entry in index_data["maps"]:
+                filename = str(entry.get("filename") or "") if isinstance(entry, dict) else ""
+                if not is_map_file(filename) or filename in listed:
+                    continue
+                listed.add(filename)
+                saved = map_entry_time(entry)
+                if saved is not None and saved < cutoff:
+                    expired.add(filename)
+                elif os.path.exists(os.path.join(self.map_save_dir, filename)):
+                    kept.append(entry)
+
+            indexed = {entry["filename"] for entry in kept}
+            for filename in os.listdir(self.map_save_dir):
+                if not is_map_file(filename) or filename in indexed or filename in expired:
+                    continue
+                saved = map_file_time(filename) or datetime.datetime.fromtimestamp(
+                    os.path.getmtime(os.path.join(self.map_save_dir, filename)))
+                if saved < cutoff:
+                    expired.add(filename)
+
+            removed = 0
+            for filename in sorted(expired):
+                path = os.path.join(self.map_save_dir, filename)
+                if not os.path.exists(path):
+                    continue
+                try:
+                    os.remove(path)
+                    removed += 1
+                except Exception as e:
+                    self.log(f"Error deleting map file {filename}: {e}", level="WARNING")
+
+            kept.sort(key=lambda e: map_entry_time(e) or datetime.datetime.min, reverse=True)
+            index_data["maps"] = kept
+            try:
+                write_map_index(index_file, index_data)
             except Exception as e:
                 self.log(f"Error updating index after cleanup: {e}", level="WARNING")
-            
-            if deleted_count > 0:
-                self.log(f"Map cleanup: Deleted {deleted_count} old map image(s) (keeping {self.map_retention_per_room} per room)", level="INFO")
+
+            if removed:
+                self.log(f"Map cleanup: deleted {removed} map image(s) older than {self.map_retention_days} days", level="INFO")
             else:
-                self.log(f"Map cleanup: No old images to delete (retention: {self.map_retention_per_room} per room)", level="DEBUG")
-                
+                self.log(f"Map cleanup: nothing older than {self.map_retention_days} days", level="DEBUG")
+
         except Exception as e:
             self.log(f"Error in cleanup_old_map_images: {e}", level="ERROR")
-            
+
     async def handle_clean_while_home(self, entity, attribute, old, new, kwargs):
         """Handle clean_while_home toggle."""
         try:

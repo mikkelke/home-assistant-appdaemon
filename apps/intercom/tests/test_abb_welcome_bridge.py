@@ -89,8 +89,8 @@ def _bare_bridge(tmpdir, clock):
     app.snapshot_probe_s = 6
     app.notify_target = "home"
     app.archive_dir = tmp / "abb_doorbell"
-    app.archive_url_prefix = "/local/abb_doorbell"
-    app.retain_days = 90
+    app.archive_url_prefix = "/media/local/abb_doorbell"
+    app.retain_days = 365
     app.max_files = 2000
     app.archive_warn_mb = 500
 
@@ -118,7 +118,7 @@ def _bare_bridge(tmpdir, clock):
     app.clip_seconds = 10
     app.clip_delay_s = 0
     app.native_ring_clips = False
-    app.clip_record_dir = "/config/www/abb_doorbell"
+    app.clip_record_dir = "/media/abb_doorbell"
     app.station_by_door = {"back door": "100000001", "front door": "100000002"}
     app._camera_doors = {}
     for _door_camera_map in (app.clip_cameras, app.announce_cameras):
@@ -254,10 +254,10 @@ class PureHelperTests(unittest.TestCase):
 
     def test_index_entry_exact_shape(self):
         entry = bridge_mod.build_index_entry(RING_ESP, "100000001", "back door",
-                                             "ring_auto_opened", "f.jpg", "/local/abb_doorbell")
+                                             "ring_auto_opened", "f.jpg", "/media/local/abb_doorbell")
         self.assertEqual(set(entry), {"ts", "datetime", "station", "door", "event_type", "filename", "url"})
         self.assertEqual(entry["ts"], int(RING_ESP.timestamp()))
-        self.assertEqual(entry["url"], "/local/abb_doorbell/f.jpg")
+        self.assertEqual(entry["url"], "/media/local/abb_doorbell/f.jpg")
         self.assertEqual(entry["event_type"], "ring_auto_opened")
 
     def test_prune_by_days_and_count(self):
@@ -270,6 +270,13 @@ class PureHelperTests(unittest.TestCase):
         keep, drop = bridge_mod.prune_images(fresh, now_ts, retain_days=90, max_files=3)
         self.assertEqual(len(keep), 3)
         self.assertEqual(len(drop), 2)
+
+    def test_prune_keeps_a_year(self):
+        now_ts = 1_000_000_000
+        aged = [{"ts": now_ts - days * 86400, "filename": f"d{days}.jpg"} for days in (0, 200, 364, 366, 400)]
+        keep, drop = bridge_mod.prune_images(aged, now_ts, retain_days=365, max_files=2000)
+        self.assertEqual([k["filename"] for k in keep], ["d0.jpg", "d200.jpg", "d364.jpg"])
+        self.assertEqual([d["filename"] for d in drop], ["d366.jpg", "d400.jpg"])
 
     def test_parse_iso_ts(self):
         self.assertEqual(bridge_mod.parse_iso_ts("2026-08-12T14:24:47+00:00"),
@@ -284,6 +291,12 @@ class YamlKnobTests(unittest.TestCase):
     """voice_unlock_lead_s must stay a plain scalar - see _yaml_scalar_line's
     docstring for why a dict-valued key crashes AppDaemon's deploy-time
     deep_compare."""
+
+    def test_archive_keeps_a_year_with_room_for_two_rings_a_day(self):
+        text = (Path(__file__).resolve().parent.parent / "abb_welcome_bridge.yaml").read_text()
+        retain_days = int(_yaml_scalar_line(text, "retain_days"))
+        self.assertEqual(retain_days, 365)
+        self.assertGreaterEqual(int(_yaml_scalar_line(text, "max_files")), 2 * retain_days)
 
     def test_voice_unlock_lead_s_is_a_float_scalar(self):
         yaml_path = Path(__file__).resolve().parent.parent / "abb_welcome_bridge.yaml"
@@ -619,7 +632,7 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(set(row), {"ts", "datetime", "station", "door", "event_type", "filename", "url"})
         self.assertEqual(row["door"], "back door")
         self.assertEqual(row["event_type"], "ring_auto_opened")
-        self.assertEqual(row["url"], f"/local/abb_doorbell/{jpgs[0].name}")
+        self.assertEqual(row["url"], f"/media/local/abb_doorbell/{jpgs[0].name}")
         self.assertEqual(row["ts"], int(RING_ESP.timestamp()))
 
     def test_stale_snapshot_never_archived(self):
@@ -652,9 +665,9 @@ class ArchiveTests(unittest.TestCase):
 
     def test_prune_removes_old_files_and_entries(self):
         self.app.max_files = 3
-        base = RING_ESP - timedelta(days=100)
+        base = RING_ESP - timedelta(days=400)
         # a file old enough to fall out of retain_days
-        old_entry = bridge_mod.build_index_entry(base, "", "front door", "ring", "old.jpg", "/local/abb_doorbell")
+        old_entry = bridge_mod.build_index_entry(base, "", "front door", "ring", "old.jpg", "/media/local/abb_doorbell")
         self.app.archive_dir.mkdir(parents=True, exist_ok=True)
         (self.app.archive_dir / "old.jpg").write_bytes(JPEG)
         index_file = self.app.archive_dir / "index.json"
@@ -1046,7 +1059,7 @@ class RingClipTests(unittest.TestCase):
         self.assertEqual(calls[1][0], "camera/record")
         self.assertEqual(calls[1][1]["entity_id"], "camera.abb_front")
         self.assertEqual(calls[1][1]["duration"], 10)
-        self.assertTrue(calls[1][1]["filename"].startswith("/config/www/abb_doorbell/abb_clip_"))
+        self.assertTrue(calls[1][1]["filename"].startswith("/media/abb_doorbell/abb_clip_"))
         self.assertTrue(calls[1][1]["filename"].endswith("_front.mp4"))
         self.assertEqual(episode["clip_filename"], calls[1][1]["filename"].rsplit("/", 1)[1])
 
@@ -1156,7 +1169,7 @@ class RingClipTests(unittest.TestCase):
                                 "ring_auto_opened", "abb_clip_x_front.mp4")
         entry = self.app._load_index()[0]
         self.assertEqual(entry["clip_filename"], "abb_clip_x_front.mp4")
-        self.assertEqual(entry["clip_url"], "/local/abb_doorbell/abb_clip_x_front.mp4")
+        self.assertEqual(entry["clip_url"], "/media/local/abb_doorbell/abb_clip_x_front.mp4")
         # Missing file: photo-only entry, no clip keys at all.
         self.app._archive_write(JPEG, (RING_ESP + timedelta(minutes=1)).isoformat(),
                                 "100000002", "front door", "ring", "abb_clip_gone.mp4")
@@ -1175,11 +1188,11 @@ class RingClipTests(unittest.TestCase):
 
     def test_prune_removes_clip_with_its_photo(self):
         self.app.archive_dir.mkdir(parents=True, exist_ok=True)
-        old_ring = RING_ESP - timedelta(days=100)
+        old_ring = RING_ESP - timedelta(days=400)
         old_entry = bridge_mod.build_index_entry(old_ring, "", "front door", "ring",
-                                                 "old.jpg", "/local/abb_doorbell")
+                                                 "old.jpg", "/media/local/abb_doorbell")
         old_entry["clip_filename"] = "old_clip.mp4"
-        old_entry["clip_url"] = "/local/abb_doorbell/old_clip.mp4"
+        old_entry["clip_url"] = "/media/local/abb_doorbell/old_clip.mp4"
         (self.app.archive_dir / "old.jpg").write_bytes(JPEG)
         (self.app.archive_dir / "old_clip.mp4").write_bytes(b"mp4data")
         index_file = self.app.archive_dir / "index.json"
@@ -1201,7 +1214,7 @@ class RingClipTests(unittest.TestCase):
         entry = self.app._load_index()[0]
         self.assertEqual(entry["filename"], "")
         self.assertEqual(entry["url"], "")
-        self.assertEqual(entry["clip_url"], "/local/abb_doorbell/abb_clip_t_front.mp4")
+        self.assertEqual(entry["clip_url"], "/media/local/abb_doorbell/abb_clip_t_front.mp4")
         self.assertEqual(entry["door"], "front door")
         self.assertEqual(list(self.app.archive_dir.glob("*.jpg")), [])
 
@@ -1663,8 +1676,8 @@ class NativeRingClipTests(unittest.TestCase):
         payload = {
             "station_id": "100000002",
             "filename": "abb_ringclip_20260824_090010_100000002.mp4",
-            "path": "/config/www/abb_doorbell/abb_ringclip_20260824_090010_100000002.mp4",
-            "url": "/local/abb_doorbell/abb_ringclip_20260824_090010_100000002.mp4",
+            "path": "/media/abb_doorbell/abb_ringclip_20260824_090010_100000002.mp4",
+            "url": "/media/local/abb_doorbell/abb_ringclip_20260824_090010_100000002.mp4",
             "duration_s": 12.5,
             "frames": 300,
             "segments": 2,
@@ -1756,7 +1769,7 @@ class NativeRingClipTests(unittest.TestCase):
         _run_scheduled(self.app, "_close_episode")
         entry = self.app._load_index()[0]
         self.assertEqual(entry["clip_filename"], payload["filename"])
-        self.assertEqual(entry["clip_url"], f"/local/abb_doorbell/{payload['filename']}")
+        self.assertEqual(entry["clip_url"], f"/media/local/abb_doorbell/{payload['filename']}")
 
     # --- native voice retry ---
 
@@ -1990,7 +2003,7 @@ class ClipPosterTests(unittest.TestCase):
     gateway sends nothing for a ring."""
 
     POSTER = "abb_ringclip_20261013_174450_100000002.jpg"
-    POSTER_URL = "/local/abb_doorbell/abb_ringclip_20261013_174450_100000002.jpg"
+    POSTER_URL = "/media/local/abb_doorbell/abb_ringclip_20261013_174450_100000002.jpg"
     CLIP = "abb_ringclip_20261013_174450_100000002.mp4"
     STALE_PICTURE = "/api/image_proxy/image.abb_screenshot?token=stale"
     STALE_SHOT = {"captured_at": "2026-09-11T13:27:06+00:00", "event_id": "shot-0911"}
@@ -2018,9 +2031,10 @@ class ClipPosterTests(unittest.TestCase):
         payload = {
             "station_id": "100000002",
             "filename": self.CLIP,
-            "url": f"/local/abb_doorbell/{self.CLIP}",
+            # What the integration sends for a ring_clip_dir outside www/.
+            "url": "",
             "poster_filename": self.POSTER,
-            "poster_url": self.POSTER_URL,
+            "poster_url": "",
             "duration_s": 4.95,
             "frames": 32,
             "segments": 1,
@@ -2068,12 +2082,21 @@ class ClipPosterTests(unittest.TestCase):
         self.assertEqual(len(self.app.pushes), 1)
         self.assertEqual(self.app.pushes[0]["data"]["image"], self.POSTER_URL)
 
-    def test_poster_without_a_url_sends_no_photo_not_the_stale_one(self):
-        self._clip_event(poster_url="")
-        self.assertEqual(self.episode["snapshot"]["bytes"], self.poster_bytes)
+    def test_poster_push_image_is_its_archive_path_whatever_the_event_says(self):
+        for event_url in ("", "/local/abb_doorbell/" + self.POSTER):
+            with self.subTest(poster_url=event_url):
+                self.setUp()
+                self._clip_event(poster_url=event_url)
+                self.assertEqual(self.episode["snapshot"]["bytes"], self.poster_bytes)
+                self._defer_push()
+                self.assertEqual(len(self.app.pushes), 1)
+                self.assertEqual(self.app.pushes[0]["data"]["image"], self.POSTER_URL)
+
+    def test_poster_push_image_follows_the_configured_archive_prefix(self):
+        self.app.archive_url_prefix = "/media/local/elsewhere/"
+        self._clip_event()
         self._defer_push()
-        self.assertEqual(len(self.app.pushes), 1)
-        self.assertNotIn("image", self.app.pushes[0]["data"])
+        self.assertEqual(self.app.pushes[0]["data"]["image"], f"/media/local/elsewhere/{self.POSTER}")
 
     def test_intercom_attachment_never_offers_the_stale_picture_beside_a_poster(self):
         self._clip_event()
@@ -2127,7 +2150,7 @@ class ClipPosterTests(unittest.TestCase):
         self.episode["snapshot"] = {"bytes": JPEG, "event_id": "shot-1",
                                     "captured_at": self.ring + timedelta(seconds=2)}
         self.app._capture_poster_for_episode(self.episode["id"], self.POSTER,
-                                             self.ring + timedelta(seconds=3.6), self.POSTER_URL)
+                                             self.ring + timedelta(seconds=3.6))
         self.assertEqual(self.episode["snapshot"]["event_id"], "shot-1")
         self.assertEqual(self._photo_arrived(), [])
 

@@ -189,7 +189,7 @@ AbbWelcomeBridge:
     back door: camera.abb_welcome_gateway_outdoor_station_1_1
   clip_seconds: 15
   clip_delay_s: 0
-  clip_record_dir: "/config/www/abb_doorbell"  # archive_dir as HA's container sees it
+  clip_record_dir: "/media/abb_doorbell"  # archive_dir; /media is the same host directory in both containers
 
   # --- auto-open-OFF ring fallback (2026-08-13, Mikkel: "The notification if auto
   # is not on should be with open or reject", door voices for wait/no-answer/reject).
@@ -223,13 +223,15 @@ AbbWelcomeBridge:
   health_heal_cooldown_s: 3600
   health_notify: ["mikkel"]
 
-  # --- ring image archive (same exposure model as the vacuum's rober2_maps:
-  # /www inside the container = /data/homeassistant/www on the box, served
-  # unauthenticated on LAN at /local/abb_doorbell/) ---
-  archive_dir: "/www/abb_doorbell"
-  archive_url_prefix: "/local/abb_doorbell"
-  retain_days: 90              # prune snapshots older than this on every write
-  max_files: 2000              # and never keep more than this many
+  # --- ring image archive. /media is /data/homeassistant/media on the box, in
+  # this container and in HA's; HA serves it at /media/local/ to signed-in users
+  # only. Never put the archive under www/: HA serves www/ at /local/ to anyone,
+  # from the internet too. The integration's ring_clip_dir option must name the
+  # same directory, since the bridge reads the clips and posters it writes. ---
+  archive_dir: "/media/abb_doorbell"
+  archive_url_prefix: "/media/local/abb_doorbell"
+  retain_days: 365             # prune rings older than this on every write
+  max_files: 2000              # and never keep more index entries (a photo and/or a clip each) than this
   archive_warn_mb: 500         # WARNING in the log above this directory size
 
   # --- street-door open feed (2026-08-25) ---

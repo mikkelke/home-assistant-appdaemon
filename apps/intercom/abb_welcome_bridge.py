@@ -58,11 +58,13 @@ Features:
    rings_abb_only + lag stats), logged grep-friendly ("RING-CMP ..."), published
    on sensor.abb_esp_ring_agreement, and persisted across restarts.
 4. RING IMAGE ARCHIVE - every ring episode (and standalone missed call) saves
-   the gateway snapshot to /www/abb_doorbell (= /local/abb_doorbell/, same
-   exposure as the vacuum's rober2_maps) with an atomically-written index.json
-   the dashboard can browse. One file per ring EPISODE: the episode holds the
-   newest FRESH snapshot (captured_at >= ring start) and writes once, at episode
-   close, when the auto-opened/missed/answered classification is known. A
+   the gateway snapshot to /media/abb_doorbell, which HA serves at
+   /media/local/abb_doorbell/ to signed-in users only, with an
+   atomically-written index.json the dashboard reads through a shell_command.
+   Never under www/: HA serves that to anyone, the internet included. One file
+   per ring EPISODE: the episode holds the newest FRESH snapshot (captured_at
+   >= ring start) and writes once, at episode close, when the
+   auto-opened/missed/answered classification is known. A
    snapshot probe runs a few seconds after the ring (knob), but the real capture
    normally comes from the image entity's own update 7-32 s later; stale frames
    (previous visitor) are never archived - a missing photo is honest, the wrong
@@ -299,7 +301,7 @@ class AbbWelcomeBridge(hass.Hass):
         # is the physical floor - there is no pre-ring buffer).
         self.clip_delay_s = int(self.args.get("clip_delay_s", 0))
 
-        self.clip_record_dir = str(self.args.get("clip_record_dir", "/config/www/abb_doorbell")).rstrip("/")
+        self.clip_record_dir = str(self.args.get("clip_record_dir", "/media/abb_doorbell")).rstrip("/")
         self.station_by_door = {v: k for k, v in self.station_doors.items()}
         # Camera entity -> door label, the reverse of announce_cameras/clip_cameras
         # (both door -> camera). abb_welcome_talkback_playing and the
@@ -377,9 +379,9 @@ class AbbWelcomeBridge(hass.Hass):
         self.door_open_ring_window_s = int(self.args.get("door_open_ring_window_s", 90))
 
         # --- archive knobs ---
-        self.archive_dir = Path(self.args.get("archive_dir", "/www/abb_doorbell"))
-        self.archive_url_prefix = self.args.get("archive_url_prefix", "/local/abb_doorbell")
-        self.retain_days = int(self.args.get("retain_days", 90))
+        self.archive_dir = Path(self.args.get("archive_dir", "/media/abb_doorbell"))
+        self.archive_url_prefix = self.args.get("archive_url_prefix", "/media/local/abb_doorbell")
+        self.retain_days = int(self.args.get("retain_days", 365))
         self.max_files = int(self.args.get("max_files", 2000))
         self.archive_warn_mb = int(self.args.get("archive_warn_mb", 500))
 
@@ -1463,9 +1465,9 @@ class AbbWelcomeBridge(hass.Hass):
         existing episode-close/ARCHIVE code (_close_episode/_archive_write) needs
         nothing more than clip_filename set - it already just stats
         self.archive_dir/clip_filename, and that is the SAME directory the
-        integration writes to (clip_record_dir/archive_dir are two container
-        mount aliases for one host path, exactly as they already are for the
-        fallback dial's own file). The clip's poster, its first frame as a JPEG
+        integration writes to (its ring_clip_dir option; /media is one host
+        directory mounted at the same path in both containers, exactly as for
+        the fallback dial's own file). The clip's poster, its first frame as a JPEG
         in that same directory, stands in as the ring photo when no gateway
         frame has arrived (_capture_poster_for_episode)."""
         try:
@@ -1496,7 +1498,7 @@ class AbbWelcomeBridge(hass.Hass):
             poster_filename = data.get("poster_filename") or ""
             if poster_filename and episode["snapshot"] is None:
                 self.submit_to_executor(self._capture_poster_for_episode, episode["id"],
-                                        poster_filename, started_at, data.get("poster_url") or "")
+                                        poster_filename, started_at)
         except Exception as e:
             self.log(f"Native ring-clip handling failed: {e}", level="WARNING")
 
@@ -2109,11 +2111,15 @@ class AbbWelcomeBridge(hass.Hass):
         except Exception as e:
             self.log(f"Snapshot capture failed for {episode_id}: {e}", level="WARNING")
 
-    def _capture_poster_for_episode(self, episode_id, filename, captured_at, url):
+    def _capture_poster_for_episode(self, episode_id, filename, captured_at):
         """Executor-thread twin of _capture_for_episode for the integration's clip
         poster: read from the archive under _fetch_image_bytes' JPEG checks, and
         only into an empty snapshot, so a gateway frame already captured keeps it.
-        url is the poster's own, "" when the integration could not serve one."""
+
+        Its url is the poster's relative archive path. The companion apps fetch
+        a relative push image over their own signed-in connection (Android adds
+        its bearer token, iOS authenticates any path starting with "/"), so the
+        push itself grants no access to the file."""
         try:
             if os.path.basename(filename) != filename:
                 self.log(f"Clip poster rejected: {filename!r} is not a bare file name", level="WARNING")
@@ -2130,7 +2136,7 @@ class AbbWelcomeBridge(hass.Hass):
                 "bytes": raw,
                 "captured_at": captured_at,
                 "event_id": f"clip:{filename}",
-                "url": url,
+                "url": f"{self.archive_url_prefix.rstrip('/')}/{filename}",
             }
             self.log(f"Snapshot from clip poster for episode {episode_id} ({len(raw)} bytes, {filename})", level="INFO")
             self.run_in(self._ring_push_due, 0, episode_id=episode_id,
