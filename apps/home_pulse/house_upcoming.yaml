@@ -1,0 +1,125 @@
+# HouseUpcoming - sensor.house_upcoming for the dashboard's Now timeline: maintenance (Rober2 parts,
+# washer drum clean, batteries and offline devices; admin only), Kristine's train, and rain while a
+# terrace door is open. Plus one maintenance push a day to Mikkel. See house_upcoming.py.
+#
+# Keep sensor.house_upcoming out of the recorder (configuration.yaml recorder: exclude:): the lease
+# renews every 5 minutes.
+HouseUpcoming:
+  module: house_upcoming
+  class: HouseUpcoming
+  # Init-order guarantee for get_app("MobileNotifier") cached in initialize().
+  dependencies: MobileNotifier
+  entity: sensor.house_upcoming
+  push_target: mikkel
+  push_time: "09:00:00"
+  push_link: "/dashboard-rooftop/home#now"
+  history_time: "03:40:00"
+  history_start: "2025-01-26"
+
+  rober2:
+    prefix: sensor.rober2_
+    suffix: _time_left
+    area: kitchen
+  washer:
+    entity: sensor.washer_state
+    area: guest_bathroom
+  train:
+    route: sensor.transit_kbh_ic_odense
+    stog_status: input_select.transit_carlsberg_stog_kbh_status
+    person: person.kristine
+    users: [Kristine]
+  rain:
+    weather: weather.forecast_home
+    alert: binary_sensor.weather_opening_alert_rooftop_rain
+    both_area: rooftop
+    doors:
+      binary_sensor.rooftop_door_1_contact: {label: living-room terrace door, area: living_room}
+      binary_sensor.rooftop_door_2_contact: {label: "Claudia's terrace door", area: office}
+
+  batteries:
+    # action: replace (primary cells), recharge (swappable rechargeables), charge (built in).
+    # low: N opens at a reading <= N (days: K = K house days in a row); drop: N opens N points under
+    # the cells' highest reading; neither = offline only. pushed_by: another app owns the push.
+    # trend: false = the percentage does not drain in a line, so no "about N weeks".
+    models:
+      zg204zm: {cell: LADDA AAA NiMH, action: recharge, low: 35, days: 2, trend: false}
+      zg204zk: {cell: LADDA AAA NiMH, action: recharge, low: 20, trend: false}
+      parasoll: {cell: 1x LADDA AAA NiMH, action: recharge, trend: false}
+      sq610rfnh: {cell: built-in rechargeable, action: charge, low: 40, pushed_by: salus_health}
+      yale: {cell: lithium AA (rechargeable), action: recharge, drop: 15, trend: false}
+      blind: {cell: "", action: charge, low: 25}
+      ws90: {cell: 2x AA, action: replace, low: 20, days: 2}
+      # Whole percent readings, so <= 19 is FireSafety's battery_low_pct (< 20).
+      twinguard: {cell: 6x AA alkaline, action: replace, low: 19, pushed_by: fire_safety}
+      fp300: {cell: 2x CR2450, action: replace, low: 20}
+      snzb04p: {cell: CR2477, action: replace, low: 20}
+      snzb02p: {cell: CR2477, action: replace, low: 20}
+      zg102zm: {cell: ""}
+    # One line per device. history_from: a known change in how the cells behave; sets that went in
+    # before it never count as a lifetime or get a trend.
+    devices:
+      - {entity: sensor.bathroom_presence_battery, model: zg204zm, name: Bathroom presence, area: bathroom}
+      - {entity: sensor.bathroom_bath_presence_battery, model: zg204zm, name: Bathroom bath presence, area: bathroom}
+      - {entity: sensor.guest_bathroom_presence_battery, model: zg204zm, name: Guest bathroom presence, area: guest_bathroom}
+      - {entity: sensor.hallway_presence_battery, model: zg204zm, name: Hallway presence, area: hallway}
+      - {entity: sensor.kristines_room_presence_battery, model: zg204zm, name: Kristines room presence, area: kristines_room}
+      - {entity: sensor.kristines_room_desk_presence_battery, model: zg204zk, name: Kristines room desk presence, area: kristines_room}
+      - {entity: sensor.dining_room_window_1_battery, model: parasoll, name: Dining room window 1, area: dining_room}
+      - {entity: sensor.bathroom_thermostat_battery_level, model: sq610rfnh, name: Bathroom thermostat, area: bathroom}
+      - {entity: sensor.bedroom_thermostat_battery_level, model: sq610rfnh, name: Bedroom thermostat, area: bedroom}
+      - {entity: sensor.claudias_room_thermostat_battery_level, model: sq610rfnh, name: Claudias room thermostat, area: office}
+      - {entity: sensor.family_room_thermostat_battery_level, model: sq610rfnh, name: Family room thermostat, area: dining_room}
+      - {entity: sensor.guest_bathroom_thermostat_battery_level, model: sq610rfnh, name: Guest bathroom thermostat, area: guest_bathroom}
+      - {entity: sensor.kristines_room_thermostat_battery_level, model: sq610rfnh, name: Kristines room thermostat, area: kristines_room}
+      # Lock BLE connection turned off and new cells on 22.02.2026; the cycles before are another regime.
+      - {entity: sensor.yale_battery, model: yale, name: Front door lock, area: hallway, history_from: 2026-02-22}
+      - {entity: sensor.bedroom_blind_battery, model: blind, name: Bedroom blind, area: bedroom}
+      - {entity: sensor.bathroom_blind_battery, model: blind, name: Bathroom blind, area: bathroom}
+      # WS90 backup cells, carrying the station since its supercapacitor failed on 30.08.2026; delete
+      # this line when the permanent supply is in.
+      - {entity: sensor.ecowitt_battery_8351, model: ws90, name: Roof weather station, area: rooftop, history_from: 2026-08-30}
+      - {entity: sensor.kitchen_smoke_alarm_battery, model: twinguard, name: Kitchen smoke alarm, area: kitchen}
+      - {entity: sensor.bedroom_presence_battery, model: fp300, name: Bedroom presence, area: bedroom}
+      - {entity: sensor.claudias_room_presence_battery, model: fp300, name: Claudias room presence, area: office}
+      - {entity: sensor.dining_room_presence_battery, model: fp300, name: Dining room presence, area: dining_room}
+      - {entity: sensor.kitchen_presence_battery, model: fp300, name: Kitchen presence, area: kitchen}
+      - {entity: sensor.living_room_presence_battery, model: fp300, name: Living room presence, area: living_room}
+      - {entity: sensor.bathroom_door_battery, model: snzb04p, name: Bathroom door, area: bathroom}
+      - {entity: sensor.bathroom_window_battery, model: snzb04p, name: Bathroom window, area: bathroom}
+      - {entity: sensor.bedroom_door_battery, model: snzb04p, name: Bedroom door, area: bedroom}
+      - {entity: sensor.bedroom_window_battery, model: snzb04p, name: Bedroom window, area: bedroom}
+      - {entity: sensor.claudias_room_door_battery, model: snzb04p, name: Claudias room door, area: office}
+      - {entity: sensor.dining_room_window_2_battery, model: snzb04p, name: Dining room window 2, area: dining_room}
+      - {entity: sensor.dining_room_window_3_battery, model: snzb04p, name: Dining room window 3, area: dining_room}
+      - {entity: sensor.dishwasher_door_battery, model: snzb04p, name: Dishwasher door, area: kitchen}
+      - {entity: sensor.dryer_door_battery, model: snzb04p, name: Dryer door, area: guest_bathroom}
+      - {entity: sensor.guest_bathroom_door_battery, model: snzb04p, name: Guest bathroom door, area: guest_bathroom}
+      - {entity: sensor.kitchen_window_battery, model: snzb04p, name: Kitchen window, area: kitchen}
+      - {entity: sensor.kristines_room_door_battery, model: snzb04p, name: Kristines room door, area: kristines_room}
+      - {entity: sensor.kristines_room_window_battery, model: snzb04p, name: Kristines room window, area: kristines_room}
+      - {entity: sensor.living_room_window_battery, model: snzb04p, name: Living room window, area: living_room}
+      - {entity: sensor.rooftop_door_1_battery, model: snzb04p, name: Rooftop door 1, area: living_room}
+      - {entity: sensor.rooftop_door_2_battery, model: snzb04p, name: Rooftop door 2, area: office}
+      - {entity: sensor.washer_door_battery, model: snzb04p, name: Washer door, area: guest_bathroom}
+      - {entity: sensor.bathroom_floor_thermometer_battery, model: snzb02p, name: Bathroom floor thermometer, area: bathroom}
+      - {entity: sensor.bedroom_floor_thermometer_battery, model: snzb02p, name: Bedroom floor thermometer, area: bedroom}
+      - {entity: sensor.claudias_room_floor_thermometer_battery, model: snzb02p, name: Claudias room floor thermometer, area: office}
+      - {entity: sensor.dining_room_floor_thermometer_battery, model: snzb02p, name: Dining room floor thermometer, area: dining_room}
+      - {entity: sensor.guest_bathroom_floor_thermometer_battery, model: snzb02p, name: Guest bathroom floor thermometer, area: guest_bathroom}
+      - {entity: sensor.kristines_room_floor_thermometer_battery, model: snzb02p, name: Kristines room floor thermometer, area: kristines_room}
+      - {entity: sensor.living_room_floor_thermometer_battery, model: snzb02p, name: Living room floor thermometer, area: living_room}
+      - {entity: sensor.ventilation_thermometer_battery, model: snzb02p, name: Ventilation thermometer, area: bedroom}
+      # Rechargeable, reads 25-30 when full; offline only until its empty level is known.
+      - {entity: sensor.washer_vibration_battery, model: zg102zm, name: Washer vibration, area: guest_bathroom}
+    # Phones and the tablet; Rober2 and the Sonos Move dock themselves; the HANK remotes are
+    # rechargeable and read anywhere from 26 to 100; yale_battery_bt is the lock's BLE twin.
+    excluded:
+      - sensor.claudias_iphone_battery_level
+      - sensor.kristine_iphone_2_battery_level
+      - sensor.mikkels_ofx9p_battery_level
+      - sensor.oppopad4pro_battery_level
+      - sensor.rober2_battery
+      - sensor.rooftop_battery
+      - sensor.bedroom_remote_left_battery_level
+      - sensor.bedroom_remote_right_battery_level
+      - sensor.yale_battery_bt
