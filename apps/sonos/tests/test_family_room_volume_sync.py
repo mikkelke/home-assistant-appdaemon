@@ -457,16 +457,27 @@ class LoopPrevention(unittest.TestCase):
         r.advance(1)
         self.assertEqual(len(r.logs(contains="family_volume_sync_apply")), 4)
 
-    def test_a_feedback_loop_the_echo_check_misses_stops_after_four_syncs(self):
-        r = Rig(echo_delay=11.0)
+    def test_a_feedback_loop_the_echo_check_misses_stops_after_eight_syncs(self):
+        for delay in (0.1, 1.26, 6.0):
+            with self.subTest(echo_delay=delay):
+                r = Rig(echo_delay=delay)
+                r.app._outstanding = Forgetful()
+                r.move(KITCHEN, 0.23)
+                r.advance(120)
+                self.assertEqual(len(r.logs(contains="family_volume_sync_apply")), 8)
+                self.assertEqual(len(r.write_log), 16)
+                warnings = r.logs(level="WARNING")
+                self.assertEqual(len(warnings), 1)
+                self.assertIn("family_volume_sync_stopped", warnings[0])
+                self.assertEqual(
+                    (r.vol(ROOFTOP), r.vol(LIVING), r.vol(KITCHEN), r.vol(DINING)), (0.38, 0.40, 0.43, 0.38)
+                )
+
+    def test_the_app_stays_stopped_for_ten_minutes_after_the_breaker_and_then_syncs_again(self):
+        r = Rig()
         r.app._outstanding = Forgetful()
         r.move(KITCHEN, 0.23)
-        r.advance(120)
-        self.assertEqual(len(r.logs(contains="family_volume_sync_apply")), 4)
-        self.assertEqual(len(r.write_log), 8)
-        warnings = r.logs(level="WARNING")
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("family_volume_sync_stopped", warnings[0])
+        r.advance(60)
         frozen = len(r.write_log)
         r.move(DINING, round(r.vol(DINING) + 0.05, 2))
         r.advance(60)

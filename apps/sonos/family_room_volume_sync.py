@@ -12,7 +12,7 @@ CEIL = 1.0
 NOISE = 0.005  # volume_level changes below this are rounding, not a move
 EPS = 1e-6     # float slack: one 0.01 step computes as 0.00999..., a timer can fire a hair early
 PARTY_CHECK_S = 900
-BREAKER_SYNCS = 4         # syncs one group may make within BREAKER_WINDOW_S
+BREAKER_SYNCS = 8         # syncs one group may make within BREAKER_WINDOW_S
 BREAKER_WINDOW_S = 60
 BREAKER_PAUSE_S = 600     # how long the app stops when a group goes past that
 
