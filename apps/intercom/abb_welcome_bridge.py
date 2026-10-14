@@ -178,6 +178,13 @@ def build_index_entry(ring_at, station_id, door, event_type, filename, url_prefi
     }
 
 
+def ring_link(ring_at):
+    """Dashboard link to a ring's row on the timeline: the ring's start in whole
+    epoch seconds, the same ts its archive entry carries, so the dashboard's
+    sheet for that row finds this ring's photo and clip."""
+    return f"/dashboard-rooftop/home#now=ring-{int(ring_at.timestamp())}"
+
+
 def prune_images(entries, now_ts, retain_days, max_files):
     """Split index entries (newest-first) into (keep, drop) by both retention
     bounds - same bounded-file discipline as forecast_log/rober2 maps."""
@@ -633,6 +640,7 @@ class AbbWelcomeBridge(hass.Hass):
             self.create_task(self.mobile_notifier.notify(
                 title=pending["title"], message=pending["message"],
                 target=pending["target"], data=data,
+                link=ring_link(episode["started_at"]),
             ))
             waited = (self.get_now() - episode["started_at"]).total_seconds()
             self.log(f"RING-PUSH-PHOTO door={pending['door']} episode={episode['id']} "
@@ -1797,6 +1805,7 @@ class AbbWelcomeBridge(hass.Hass):
             self._pending_actions[entry["open_id"]] = entry
             self._pending_actions[entry["reject_id"]] = entry
             if self.mobile_notifier:
+                link = ring_link(episode["started_at"])
                 self.create_task(self.mobile_notifier.notify(
                     title=f"Someone is ringing the {door}",
                     message="Auto-open is off - open for them?",
@@ -1807,6 +1816,7 @@ class AbbWelcomeBridge(hass.Hass):
                             {"action": entry["open_id"], "title": "Open"},
                             {"action": entry["reject_id"], "title": "Reject"},
                         ],
+                        "clickAction": link,
                     },
                 ))
                 self.log(f"RING-PUSH door={door} episode={episode['id']} (auto-open off)", level="INFO")
