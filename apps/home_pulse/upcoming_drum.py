@@ -116,14 +116,15 @@ def cheapest_start(wh, prices, now):
 
 
 def drum_start(price_attributes, profile_attributes, keys, now, appliance="washer"):
-    """(start, text) the drum row is timed at and says, or None without a priced start."""
+    """(start, text) the drum row is timed at and says, or None without a priced start. start is
+    None when no later start beats starting now, so the row stays untimed."""
     profile = programme_profile(profile_attributes, appliance, keys)
     found = cheapest_start(profile[1], hour_prices(price_attributes), now) if profile else None
     if found is None:
         return None
     start, saving = found
     if saving == 0:
-        return start, "start now"
+        return None, "any time, no cheaper start"
     text = f"cheapest start {start.astimezone(HOUSE_TZ):%H:%M}"
     if saving is not None:
         text += f" - saves {saving:.2f} kr vs now".replace(".", ",")

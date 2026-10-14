@@ -60,8 +60,7 @@ class WindowTests(unittest.TestCase):
     def test_no_start_whose_run_ends_after_the_last_price(self):
         attrs = price_attrs({}, tomorrow={}, valid=False)
         self.assertIsNone(drum.drum_start(attrs, TWO_HOURS, KEYS, local(TODAY, 22, 1)))
-        start, _ = drum.drum_start(attrs, TWO_HOURS, KEYS, local(TODAY, 21, 50))
-        self.assertEqual(start, local(TODAY, 21, 50))
+        self.assertEqual(drum.drum_start(attrs, TWO_HOURS, KEYS, local(TODAY, 21, 50)), (None, "any time, no cheaper start"))
 
     def test_starts_are_now_then_every_quarter_hour(self):
         attrs = price_attrs({11: 0.5, 12: 0.5, 13: 0.5})
@@ -69,7 +68,7 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(start, local(TODAY, 11))
         start, text = drum.drum_start(price_attrs({10: 0.5, 11: 0.5}), TWO_HOURS, KEYS,
                                       local(TODAY, 10, 7) + timedelta(seconds=20))
-        self.assertEqual((start, text), (local(TODAY, 10, 8), "start now"))
+        self.assertEqual((start, text), (None, "any time, no cheaper start"))
 
 
 class SavingRuleTests(unittest.TestCase):
@@ -77,11 +76,11 @@ class SavingRuleTests(unittest.TestCase):
 
     def test_starting_now_wins_unless_later_saves_ten_ore_and_ten_percent(self):
         start, text = drum.drum_start(price_attrs([1.0] * 11 + [0.95] * 13), TWO_HOURS, KEYS, self.NOW)
-        self.assertEqual((start, text), (self.NOW, "start now"))
+        self.assertEqual((start, text), (None, "any time, no cheaper start"))
         start, text = drum.drum_start(price_attrs([10.0] * 11 + [9.5] * 13), TWO_HOURS, KEYS, self.NOW)
-        self.assertEqual((start, text), (self.NOW, "start now"))
+        self.assertEqual((start, text), (None, "any time, no cheaper start"))
         start, text = drum.drum_start(price_attrs([1.0] * 11 + [0.85] * 13), TWO_HOURS, KEYS, self.NOW)
-        self.assertEqual((start, text), (self.NOW, "start now"))
+        self.assertEqual((start, text), (None, "any time, no cheaper start"))
         start, text = drum.drum_start(price_attrs([1.0] * 11 + [0.8] * 13), TWO_HOURS, KEYS, self.NOW)
         self.assertEqual((start, text), (local(TODAY, 11), "cheapest start 11:00 - saves 0,12 kr vs now"))
 
@@ -91,7 +90,7 @@ class SavingRuleTests(unittest.TestCase):
 
     def test_ties_keep_the_earliest_start(self):
         start, text = drum.drum_start(price_attrs({}), TWO_HOURS, KEYS, self.NOW)
-        self.assertEqual((start, text), (self.NOW, "start now"))
+        self.assertEqual((start, text), (None, "any time, no cheaper start"))
 
 
 class SourceTests(unittest.TestCase):
