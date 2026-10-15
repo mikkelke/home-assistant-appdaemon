@@ -12,9 +12,8 @@ Checked:
   - follow_me.yaml     player list (registry MA entities; extra zones allowed)
   - group_manager.yaml player list
   - family_room_volume_sync.yaml speakers (registry MA ids with <id>_2 twins) + tv_speaker
-  - audiocast_manager.yaml raw_to_base_map pairs + line-in RINCON
   - music_attribution.yaml raw_to_base_map pairs
-  - dashboard (optional, if repo present): speakers.ts ids, audiocast.ts RINCON
+  - dashboard (optional, if repo present): speakers.ts ids
 
 Run: python3 scripts/check_speakers.py   (deploy.sh runs it before rsync)
 """
@@ -54,8 +53,6 @@ def main():
     ma = {v["ma_entity"] for v in reg.values()}
     pairs = {v["raw_entity"]: v["ma_entity"] for v in reg.values()}
     volumes = {v["ma_entity"]: v["default_volume"] for v in reg.values()}
-    linein = [v["rincon"] for v in reg.values() if v.get("line_in_host")]
-    check(len(linein) == 1, f"registry must have exactly one line_in_host, found {len(linein)}")
 
     sr = load("apps/sonos/state_reset.yaml")
     sr_cfg = next(iter(sr.values()))
@@ -88,16 +85,6 @@ def main():
     check(fv.get("tv_speaker") in fv_speakers,
           f"{fv_fname}: tv_speaker {fv.get('tv_speaker')} not in speakers")
 
-    ac = next(iter(load("apps/sonos/audiocast_manager.yaml").values()))
-    ac_map = ac.get("raw_to_base_map") or {}
-    check(ac_map == pairs,
-          f"audiocast raw_to_base_map drift: only-in-yaml="
-          f"{sorted(set(ac_map.items()) - set(pairs.items()))} "
-          f"missing={sorted(set(pairs.items()) - set(ac_map.items()))}")
-    uri = str(ac.get("audiocast_uri_prefix") or "")
-    check(uri.endswith(linein[0]) if linein else False,
-          f"audiocast URI {uri} != line_in_host rincon {linein}")
-
     mus = next(iter(load("apps/sonos/music_attribution.yaml").values()))
     mus_map = mus.get("raw_to_base_map") or {}
     check(mus_map == pairs,
@@ -113,10 +100,6 @@ def main():
         check(ts_ids == ma,
               f"dashboard speakers.ts != registry: only-in-ts={sorted(ts_ids - ma)} "
               f"missing={sorted(ma - ts_ids)}")
-        aud = open(os.path.join(DASHBOARD, "src/config/audiocast.ts")).read()
-        m = re.search(r"x-rincon-stream:(RINCON_\w+)", aud)
-        check(bool(m) and linein and m.group(1) == linein[0],
-              "dashboard audiocast.ts RINCON != registry line_in_host")
 
     if errors:
         print("SPEAKER REGISTRY DRIFT:")

@@ -48,7 +48,6 @@ speakers:
     raw_entity: media_player.kristines_room_2
     rincon: RINCON_804AF2CB391401400
     model: Era 100
-    line_in_host: true        # Audiocast: Chromecast Audio feeds this unit's line-in
     default_volume: 0.18
     tts: [all]
   claudias_room:
