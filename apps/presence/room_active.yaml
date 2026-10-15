@@ -33,6 +33,7 @@ RoomActive:
   republish_after_sec: 120
   zones:
     bedroom:
+      settle_off_sec: 60          # per-zone override; other zones use the global value
       witnesses:
         - { entity: binary_sensor.bedroom_presence_presence,               tier: room }
         - { entity: binary_sensor.bedroom_presence_pir_detection,          tier: channel }

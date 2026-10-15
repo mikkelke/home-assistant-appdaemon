@@ -188,6 +188,30 @@ class ImmediateOnTransition(unittest.TestCase):
         self.assertEqual(app.set_state.call_args.kwargs["state"], "on")
 
 
+class PerZoneSettle(unittest.TestCase):
+    def test_a_zone_override_sets_its_own_settle_window(self):
+        app = _make_on_app()
+        app.zone_settle_off_sec = {ZONE: 60}
+        app.states[(W_ROOM, None)] = "off"
+        app._evaluate(ZONE)
+        app.run_in.assert_called_once_with(app._settle_fire, 60, zone=ZONE)
+
+    def test_zones_without_an_override_keep_the_global_window(self):
+        app = _make_on_app()
+        app.zone_settle_off_sec = {"some_other_zone": 60}
+        app.states[(W_ROOM, None)] = "off"
+        app._evaluate(ZONE)
+        app.run_in.assert_called_once_with(app._settle_fire, SETTLE_SEC, zone=ZONE)
+
+    def test_initialize_reads_the_override_from_the_zone_config(self):
+        zones = {zone: dict(cfg) for zone, cfg in BASE_ARGS["zones"].items()}
+        first = next(iter(zones))
+        zones[first]["settle_off_sec"] = 60
+        app = make_full_app({"zones": zones})
+        self.assertEqual(app.zone_settle_off_sec, {first: 60})
+        self.assertEqual(app.settle_off_sec, SETTLE_SEC)
+
+
 class SettleOffTiming(unittest.TestCase):
     def test_going_quiet_arms_settle_timer_state_stays_on_settling_true(self):
         app = _make_on_app()

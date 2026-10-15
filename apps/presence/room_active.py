@@ -60,6 +60,7 @@ class RoomActive(hass.Hass):
     # as HouseNightMode/ActorAttribution/BedPresenceCompare in this directory.
     zones: dict = {}
     settle_off_sec = 15
+    zone_settle_off_sec: dict = {}
     heartbeat_sec = 60
     republish_after_sec = 120
 
@@ -69,6 +70,11 @@ class RoomActive(hass.Hass):
         self.heartbeat_sec = int(a("heartbeat_sec", 60))
         self.republish_after_sec = int(a("republish_after_sec", 120))
         self.zones = self._parse_zones(a("zones", {}))
+        self.zone_settle_off_sec = {
+            str(zone): int(cfg["settle_off_sec"])
+            for zone, cfg in (a("zones", {}) or {}).items()
+            if (cfg or {}).get("settle_off_sec") is not None
+        }
         self._zone_state = {zone: self._fresh_zone_state() for zone in self.zones}
 
         for zone, witnesses in self.zones.items():
@@ -247,7 +253,7 @@ class RoomActive(hass.Hass):
                 # settle timer only once per settle window.
                 if zstate["settle_timer"] is None:
                     zstate["settle_timer"] = self.run_in(
-                        self._settle_fire, self.settle_off_sec, zone=zone
+                        self._settle_fire, self.zone_settle_off_sec.get(zone, self.settle_off_sec), zone=zone
                     )
                 new_state = "on"
                 settling = True
