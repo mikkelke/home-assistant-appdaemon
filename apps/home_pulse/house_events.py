@@ -141,12 +141,16 @@ def appliance_actor(kind, attrs):
     (an "emptied" row), or None.
 
     A wrong name is worse than none: only a resident named by a reliable method counts.
-    The monitors publish the starter as started_by + started_by_method, the emptier as
-    emptied_by alone - ActorAttribution names nobody except through a reliable method.
+    The monitors publish the starter as started_by + started_by_method and the emptier as
+    emptied_by, plus emptied_by_method where the monitor publishes one. When that method is
+    present it must be reliable; without it emptied_by counts on its own, since
+    ActorAttribution names nobody except through a reliable method.
     """
     if kind == "finished" and attrs.get("started_by_method") in RELIABLE_ACTOR_METHODS:
         return _resident_name(attrs.get("started_by"))
     if kind == "emptied":
+        if "emptied_by_method" in attrs and attrs["emptied_by_method"] not in RELIABLE_ACTOR_METHODS:
+            return None
         return _resident_name(attrs.get("emptied_by"))
     return None
 

@@ -66,6 +66,14 @@ class ApplianceActorTests(unittest.TestCase):
         self.assertIsNone(actor("emptied", {"emptied_by": "Cleaning"}))
         self.assertIsNone(actor("emptied", {"emptied_by": 7}))
 
+    def test_emptied_by_method_when_present_must_be_reliable(self):
+        actor = house_events.appliance_actor
+        self.assertEqual(actor("emptied", {"emptied_by": "kristine", "emptied_by_method": "dashboard_action"}), "Kristine")
+        self.assertEqual(actor("emptied", {"emptied_by": "claudia", "emptied_by_method": "sole_occupant"}), "Claudia")
+        for method in ("unknown", "", None, "restored_from_entity"):
+            self.assertIsNone(actor("emptied", {"emptied_by": "kristine", "emptied_by_method": method}), method)
+        self.assertIsNone(actor("emptied", {"emptied_by": "", "emptied_by_method": "sole_occupant"}))
+
     def test_starter_and_emptier_are_never_swapped(self):
         actor = house_events.appliance_actor
         started = {"started_by": "claudia", "started_by_method": "sole_occupant"}
