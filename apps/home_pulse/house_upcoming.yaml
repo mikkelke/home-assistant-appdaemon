@@ -1,6 +1,7 @@
 # HouseUpcoming - sensor.house_upcoming for the dashboard's Now timeline: maintenance (Rober2 parts,
-# washer drum clean, batteries and offline devices; admin only), Kristine's train, and rain while a
-# terrace door is open. Plus one maintenance push a day to Mikkel. See house_upcoming.py.
+# the dishwasher's and the washer's run-based tasks, batteries and offline devices; admin only),
+# Kristine's train, and rain while a terrace door is open. Plus one maintenance push a day to Mikkel.
+# See house_upcoming.py.
 #
 # Keep sensor.house_upcoming out of the recorder (configuration.yaml recorder: exclude:): the lease
 # renews every 5 minutes.
@@ -30,6 +31,15 @@ HouseUpcoming:
     price_entity: sensor.energi_data_service
     profiles_entity: sensor.appliance_run_profiles
     drum_programmes: [drum_clean, bomuld_90, bomuld_60]
+    # The run-based tasks (upcoming_runs.py) count runs in the monitors' feedback files next to the
+    # appliances' modules, washer_feedback.json, dishwasher_feedback.json and dryer_feedback.json, and
+    # the dishwasher's rows belong to the kitchen. Override with washer/dishwasher/dryer:
+    # {feedback_file: ..., area: ...}.
+  dryer:
+    # The plinth filter has no interval from Miele, so its row only counts the runs since it was last
+    # logged, untimed and never due or pushed. Set interval_runs (whole runs) once the real one is
+    # known, and the row becomes a normal one that counts down and is pushed when due.
+    interval_runs:
   train:
     route: sensor.transit_kbh_ic_odense
     stog_status: input_select.transit_carlsberg_stog_kbh_status

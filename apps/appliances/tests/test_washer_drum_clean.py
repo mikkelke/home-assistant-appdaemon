@@ -1,6 +1,7 @@
 # tests/test_washer_drum_clean.py - the drum clean as its own washer programme: last_drum_clean on
-# sensor.washer_state for HouseUpcoming's monthly row, the confirm push button (only on Mikkel's
-# phone, only while one is due) and the programme picker that record one, and its place in learning.
+# sensor.washer_state for HouseUpcoming's drum row, the confirm push button (only on Mikkel's
+# phone, only while one is due, every INTERVAL_RUNS runs) and the programme picker that record one,
+# and its place in learning.
 # Run from repo root: python3 -m unittest discover -s apps/appliances/tests -q
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import test_washer_restart_survival as trs  # noqa: E402  (installs the appdaemo
 
 import drum_clean  # noqa: E402
 import mobile_notifier as mn  # noqa: E402
+import run_ledger  # noqa: E402
 import washer_classify as wcls  # noqa: E402
 import washer_feedback as wfb  # noqa: E402
 import washer_profiles as wp  # noqa: E402
@@ -219,13 +221,20 @@ class ConfirmTests(unittest.TestCase):
 
 
 class ConfirmPushButtonTests(unittest.TestCase):
-    """The "Drum clean" button reaches a phone only while a drum clean is due and only when the phone
-    is Mikkel's. Each push goes through the real MobileNotifier, which hands every phone its own
-    buttons; every other push keeps the buttons it always had."""
+    """The "Drum clean" button reaches a phone only while a drum clean is due, which is
+    drum_clean.INTERVAL_RUNS runs after the last one, and only when the phone is Mikkel's. Each push
+    goes through the real MobileNotifier, which hands every phone its own buttons; every other push
+    keeps the buttons it always had."""
 
     TS = ConfirmTests.TS
     NOW = trs.NOW
     GUESSED = ["Yes, Bomuld 60°C", "Other..."]
+
+    def laundry(self, count, newest_end=None):
+        """`count` laundry runs, the newest ending at `newest_end`, each four hours before the next."""
+        newest_end = newest_end or self.NOW - timedelta(hours=1)
+        return [record((newest_end - timedelta(hours=4 * i)).isoformat(), confirmed="bomuld", temp="60", user=False)
+                for i in range(count - 1, -1, -1)]
 
     def _phones(self, cycles, started_by, predicted="bomuld", home=("mikkel", "kristine")):
         """{person: button titles} on every phone the confirm push for the cycle at TS reaches."""
@@ -257,34 +266,84 @@ class ConfirmPushButtonTests(unittest.TestCase):
                 [action["title"] for action in kwargs["data"]["actions"]] for service, kwargs in sent}
 
     def test_not_due_no_button(self):
-        cleaned = [record((self.NOW - 29 * DAY).isoformat())]
+        cleaned = [record((self.NOW - 100 * DAY).isoformat())] + self.laundry(14)
         self.assertEqual(self._phones(cleaned, "mikkel"), {"mikkel": self.GUESSED})
         self.assertEqual(self._phones(cleaned, None), {"mikkel": self.GUESSED, "kristine": self.GUESSED})
+        self.assertEqual(self._phones([], "mikkel"), {"mikkel": self.GUESSED})
 
     def test_due_but_sent_to_a_housemate_no_button(self):
-        self.assertEqual(self._phones([], "kristine"), {"kristine": self.GUESSED})
-        self.assertEqual(self._phones([], "claudia", predicted="unknown"), {"claudia": ["Choose in dashboard"]})
+        self.assertEqual(self._phones(self.laundry(15), "kristine"), {"kristine": self.GUESSED})
+        self.assertEqual(self._phones(self.laundry(15), "claudia", predicted="unknown"),
+                         {"claudia": ["Choose in dashboard"]})
 
     def test_due_and_sent_to_mikkel_the_button_appears(self):
-        for cycles in ([], [record((self.NOW - 30 * DAY).isoformat())]):
+        old_clean = [record((self.NOW - 300 * DAY).isoformat())]
+        for cycles in (self.laundry(15), old_clean + self.laundry(15)):
             self.assertEqual(self._phones(cycles, "mikkel"),
                              {"mikkel": ["Yes, Bomuld 60°C", "Drum clean", "Other..."]})
-        self.assertEqual(self._phones([], "mikkel", predicted="unknown"),
+        self.assertEqual(self._phones(self.laundry(15), "mikkel", predicted="unknown"),
                          {"mikkel": ["Drum clean", "Choose in dashboard"]})
 
     def test_a_home_broadcast_gives_it_to_mikkels_phone_only(self):
-        self.assertEqual(self._phones([], None),
+        self.assertEqual(self._phones(self.laundry(15), None),
                          {"mikkel": ["Yes, Bomuld 60°C", "Drum clean", "Other..."], "kristine": self.GUESSED})
 
     def test_the_button_confirms_the_cycle_as_a_drum_clean(self):
-        app, _ = washer([])
+        app, _ = washer(self.laundry(15))
         actions = app._drum_clean_actions(self.TS, [{"action": "URI", "title": "Other...", "uri": "x"}])("mikkel")
         self.assertEqual(wfb.parse_confirm_action(actions[0]["action"]), (self.TS, "drum_clean", None))
 
-    def test_due_with_none_on_record_or_thirty_days_after_the_last(self):
-        self.assertTrue(drum_clean.due(None, self.NOW))
-        self.assertFalse(drum_clean.due(self.NOW - 30 * DAY + timedelta(seconds=1), self.NOW))
-        self.assertTrue(drum_clean.due(self.NOW - 30 * DAY, self.NOW))
+    def test_an_unreadable_feedback_file_offers_no_button(self):
+        app, path = washer(self.laundry(15))
+        os.remove(path)
+        self.assertIsNone(app._drum_clean_actions(self.TS, [{"action": "URI", "title": "Other...", "uri": "x"}]))
+
+
+class DueTests(unittest.TestCase):
+    """drum_clean.due counts finished runs after the last confirmed clean, or all of them while none is."""
+
+    END = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
+
+    def laundry(self, count, first_end):
+        return [record((first_end + timedelta(hours=4 * i)).isoformat(), confirmed="bomuld", temp="60", user=False)
+                for i in range(count)]
+
+    def ledger(self, *groups):
+        return run_ledger.ledger([rec for group in groups for rec in group])
+
+    def test_the_interval_is_fifteen_runs(self):
+        self.assertEqual(drum_clean.INTERVAL_RUNS, 15)
+
+    def test_fifteen_runs_after_the_last_clean_make_it_due(self):
+        clean = [record((self.END - 10 * DAY).isoformat())]
+        for count, due in ((0, False), (14, False), (15, True), (40, True)):
+            led = self.ledger(clean, self.laundry(count, self.END - 9 * DAY))
+            self.assertEqual((drum_clean.runs_since(led), drum_clean.due(led)), (count, due), count)
+
+    def test_none_on_record_counts_every_run(self):
+        for count, due in ((0, False), (14, False), (15, True)):
+            led = self.ledger(self.laundry(count, self.END - 9 * DAY))
+            self.assertEqual((drum_clean.last_clean(led), drum_clean.runs_since(led), drum_clean.due(led)),
+                             (None, count, due), count)
+
+    def test_calendar_time_does_not_matter(self):
+        quiet = self.ledger([record((self.END - 200 * DAY).isoformat())], self.laundry(3, self.END - 100 * DAY))
+        self.assertFalse(drum_clean.due(quiet))
+        busy = self.ledger([record((self.END - 5 * DAY).isoformat())], self.laundry(15, self.END - 4 * DAY))
+        self.assertTrue(drum_clean.due(busy))
+
+    def test_an_unconfirmed_bomuld_90_is_no_clean_and_an_interrupted_wash_is_no_run(self):
+        led = self.ledger([record((self.END - 10 * DAY).isoformat(), confirmed="bomuld", temp="90", user=False)],
+                          self.laundry(14, self.END - 9 * DAY))
+        self.assertEqual(drum_clean.runs_since(led), 15)
+        cut = [record((self.END - DAY).isoformat(), confirmed="ekspres", user=False, completion="interrupted")]
+        self.assertEqual(drum_clean.runs_since(self.ledger(cut, self.laundry(14, self.END - 9 * DAY))), 14)
+
+    def test_the_run_a_clean_was_saved_twice_for_is_not_a_run_since(self):
+        first = record((self.END - 10 * DAY).isoformat(), duration=150.0)
+        again = record((self.END - 10 * DAY + timedelta(minutes=40)).isoformat(), user=False, completion="suspect",
+                       duration=190.0)
+        self.assertEqual(drum_clean.runs_since(self.ledger([first, again])), 0)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,12 @@
 # tests/test_house_upcoming.py - HouseUpcoming end to end on a fake AppDaemon surface, with the real
 # house_upcoming.yaml: lease, state acquisition, restart behaviour, the daily push, rain fetches,
-# the drum clean's cheapest start, the history job, replace-by days, Rober2's dated parts and the
-# battery inventory.
+# the drum clean's cheapest start, the run-based appliance tasks (the feedback ledgers, the seed, Done
+# and undo), the history job, replace-by days, Rober2's dated parts and the battery inventory.
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import types
@@ -31,6 +32,7 @@ for _name, _mod in (
 
 import house_upcoming as hu  # noqa: E402
 import upcoming_core as core  # noqa: E402
+import upcoming_guides as guides  # noqa: E402
 import upcoming_maint as maint  # noqa: E402
 
 CONFIG = yaml.safe_load((APPS / "home_pulse" / "house_upcoming.yaml").read_text())["HouseUpcoming"]
@@ -76,7 +78,7 @@ def base_states():
     states = {entity: full("100", {"device_class": "battery"}) for entity in LIVE_BATTERIES}
     for part in ("filter", "main_brush", "side_brush", "sensor"):
         states[f"sensor.rober2_{part}_time_left"] = full("500000")
-    states["sensor.washer_state"] = full("Off", {"last_drum_clean": iso(NOW - 3 * 24 * HOUR)})
+    states["sensor.washer_state"] = full("Off")
     states["sensor.transit_kbh_ic_odense"] = full("OK", {"departures": []})
     states["input_select.transit_carlsberg_stog_kbh_status"] = full("OK")
     states["person.kristine"] = full("not_home")
@@ -86,13 +88,69 @@ def base_states():
     return states
 
 
-def make_app(states=None, state_dir=None, now=NOW):
+def dish_run(end, **extra):
+    return {"ts": iso(end), "duration_min": 230.0, "energy_kwh": 0.75, "predicted": "eco", "confirmed": "eco",
+            "programme_confirmed_by_human": False, **extra}
+
+
+def wash_run(end, **extra):
+    return {"ts": iso(end), "duration_min": 150.0, "energy_kwh": 1.2, "confirmed": "bomuld",
+            "confirmed_temperature": "60", "programme_user_confirmed": False, "completion_class": "completed", **extra}
+
+
+def dryer_run(end, **extra):
+    return {"ts": iso(end), "duration_min": 90.0, "energy_kwh": 1.0, "predicted": "bomuld__skabstoert",
+            "confirmed": "bomuld__skabstoert", "programme_confirmed_by_human": False, **extra}
+
+
+def drum_clean_run(end):
+    return wash_run(end, confirmed="drum_clean", confirmed_temperature=None, programme_user_confirmed=True)
+
+
+RUN_MAKERS = {"washer": (wash_run, 60), "dishwasher": (dish_run, 50), "dryer": (dryer_run, 50)}
+
+
+def every_two_days(name, last_end=None, count=None):
+    """The ledger of `name`, one run every two days (3.5 a week), the newest ending a day before `last_end`."""
+    make, default_count = RUN_MAKERS[name]
+    last_end = (last_end or NOW) - 24 * HOUR
+    return [make(last_end - 48 * HOUR * i) for i in range(((count or default_count) - 1), -1, -1)]
+
+
+_ledger_clock = [0]
+
+
+def write_ledger(state_dir, name, cycles):
+    """The monitor's feedback file for `name`; None removes it. Each write gets a later mtime, so a
+    rewrite within one clock tick of the last still reads as a change."""
+    path = Path(state_dir) / f"{name}_feedback.json"
+    if cycles is None:
+        path.unlink(missing_ok=True)
+        return
+    path.write_text(json.dumps({"version": 2, "cycles": cycles}))
+    _ledger_clock[0] += 1
+    stamp = 1_700_000_000 + _ledger_clock[0] * 10
+    os.utime(path, (stamp, stamp))
+
+
+def make_app(states=None, state_dir=None, now=NOW, ledgers=None, **args):
     app = hu.HouseUpcoming.__new__(hu.HouseUpcoming)
     state_dir = state_dir or tempfile.mkdtemp(prefix="house_upcoming_")
-    app.args = {**CONFIG, "state_file": f"{state_dir}/state.json", "fixture_file": f"{state_dir}/fixtures.jsonl"}
+    for name in RUN_MAKERS:
+        if name in (ledgers or {}):
+            write_ledger(state_dir, name, ledgers[name])
+        elif not (Path(state_dir) / f"{name}_feedback.json").exists():
+            write_ledger(state_dir, name, every_two_days(name, now))
+    app.args = {**CONFIG, "state_file": f"{state_dir}/state.json", "fixture_file": f"{state_dir}/fixtures.jsonl",
+                "done_log_file": f"{state_dir}/done_log.jsonl", **args}
+    for name in RUN_MAKERS:
+        app.args[name] = {**(CONFIG.get(name) or {}), **(args.get(name) or {}),
+                          "feedback_file": f"{state_dir}/{name}_feedback.json"}
+    app.state_dir = state_dir
     app.now = now
     app.states = states if states is not None else base_states()
     app.published, app.logs, app.scheduled, app.tasks, app.services, app.listened = [], [], [], [], [], []
+    app.events = []
     app.history = {}
     app.forecast_response = None
     app.fail_publish = 0
@@ -132,7 +190,7 @@ def make_app(states=None, state_dir=None, now=NOW):
     app.get_app = lambda name: app.notifier
     app.create_task = lambda coro: app.tasks.append(coro)
     app.listen_state = lambda cb, entity, **kw: app.listened.append((entity, kw))
-    app.listen_event = lambda *a, **kw: None
+    app.listen_event = lambda callback, event_name=None, **kw: app.events.append((callback.__name__, event_name))
     app.run_every = lambda *a, **kw: None
     app.run_daily = lambda *a, **kw: None
     app.log = lambda msg, level="INFO", **kw: app.logs.append((level, msg))
@@ -174,7 +232,6 @@ class PublishTests(unittest.TestCase):
     def test_initialize_publishes_string_only_ascii_rows_with_a_lease(self):
         states = base_states()
         states["sensor.rober2_filter_time_left"] = full("-19902")
-        states["sensor.washer_state"] = full("Off", {"last_drum_clean": ""})
         app = make_app(states)
         published = last(app)
         self.assertEqual(published["entity"], "sensor.house_upcoming")
@@ -182,7 +239,9 @@ class PublishTests(unittest.TestCase):
         attrs = published["attributes"]
         self.assertEqual(attrs["expires"], iso(NOW + 15 * MIN).replace("+00:00", "+00:00"))
         self.assertEqual(set(rows(app)), {"maint:rober2:filter", "maint:rober2:main_brush", "maint:rober2:side_brush",
-                                          "maint:rober2:sensor", "maint:washer:drum"})
+                                          "maint:rober2:sensor", "maint:washer:drum", "maint:washer:inlet",
+                                          "maint:dishwasher:hygiene", "maint:dishwasher:filters",
+                                          "maint:dishwasher:check", "maint:dryer:plinth"})
         self.assertEqual(rows(app)["maint:rober2:filter"]["detail"], "replace")
         for row in attrs["rows"]:
             for value in row.values():
@@ -226,21 +285,24 @@ class PublishTests(unittest.TestCase):
 
 
 class AcquisitionTests(unittest.TestCase):
-    def test_an_attribute_only_change_reaches_the_rows(self):
+    def test_a_drum_clean_confirmed_in_the_ledger_reaches_the_row_at_once_through_the_washer_entity(self):
         app = make_app()
-        self.assertNotIn("maint:washer:drum", rows(app))
+        self.assertEqual(rows(app)["maint:washer:drum"]["detail"], "Bomuld 90, empty + a little powder, due, last unknown")
+        cycles = every_two_days("washer", NOW)
+        cycles[-4] = drum_clean_run(NOW - 7 * 24 * HOUR)
+        write_ledger(app.state_dir, "washer", cycles)
         washer = app.states["sensor.washer_state"]
-        fire(app, "sensor.washer_state", {**washer, "attributes": {"last_drum_clean": iso(NOW - 40 * 24 * HOUR)}})
-        self.assertEqual(rows(app)["maint:washer:drum"]["detail"], "Bomuld 90, empty + a little powder, last 04.09")
+        fire(app, "sensor.washer_state", {**washer, "attributes": {"last_drum_clean": iso(NOW - 7 * 24 * HOUR)}})
+        row = rows(app)["maint:washer:drum"]
+        self.assertTrue(row["detail"].startswith("Bomuld 90, empty + a little powder, 12 runs left, ~"), row["detail"])
+        self.assertIn("at", row)
         self.assertIn(("sensor.washer_state", {"attribute": "all"}), app.listened)
 
-    def test_washer_state_without_the_attribute_keeps_the_last_value_seen(self):
+    def test_the_drum_row_does_not_need_the_washer_entity(self):
         app = make_app()
-        fire(app, "sensor.washer_state", full("Off"))
-        self.assertNotIn("maint:washer:drum", rows(app))
         app.states.pop("sensor.washer_state")
         app._on_source("sensor.washer_state", "all", None, None, {})
-        self.assertNotIn("maint:washer:drum", rows(app))
+        self.assertIn("maint:washer:drum", rows(app))
 
     def test_a_value_from_a_callback_wins_over_a_stale_read(self):
         states = base_states()
@@ -266,7 +328,6 @@ class PushTests(unittest.TestCase):
     def setUp(self):
         states = base_states()
         states["sensor.rober2_filter_time_left"] = full("-19902")
-        states["sensor.washer_state"] = full("Off", {"last_drum_clean": ""})
         states["sensor.bathroom_door_battery"] = full("18")
         states["sensor.kitchen_smoke_alarm_battery"] = full("15")
         states["sensor.bedroom_thermostat_battery_level"] = full("40")
@@ -362,7 +423,6 @@ class DrumStartTests(unittest.TestCase):
 
     def states(self, *programmes):
         states = base_states()
-        states["sensor.washer_state"] = full("Off", {"last_drum_clean": ""})
         states["sensor.appliance_run_profiles"] = self.profiles(*(programmes or (self.BOMULD_60,)))
         return states
 
@@ -393,16 +453,399 @@ class DrumStartTests(unittest.TestCase):
         app = make_app(states)
         row = rows(app)["maint:washer:drum"]
         self.assertEqual((row["at"], row["detail"], row["next"]),
-                         (core.utc_iso(NOW), "Bomuld 90, empty + a little powder, cheapest now", "skip"))
+                         (core.utc_iso(NOW), "Bomuld 90, empty + a little powder, cheapest now, due", "skip"))
         tick(app, HOUR)
         row = rows(app)["maint:washer:drum"]
         self.assertEqual((row["at"], row["next"]), (core.utc_iso(NOW + HOUR), "skip"))
 
     def test_without_prices_the_row_stays_untimed(self):
         row = rows(make_app(self.states()))["maint:washer:drum"]
-        self.assertEqual(row["detail"], "Bomuld 90, empty + a little powder, last unknown")
+        self.assertEqual(row["detail"], "Bomuld 90, empty + a little powder, due, last unknown")
         self.assertNotIn("at", row)
         self.assertNotIn("next", row)
+
+
+DAY = 24 * HOUR
+
+
+def state_file(app):
+    return json.loads(Path(app.state_file).read_text())
+
+
+def done_log(app):
+    path = Path(app.done_log_file)
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def after(count, name="dishwasher", first=NOW, make=None):
+    """`count` more runs of `name` finishing one every two days from a day after `first`."""
+    make = make or RUN_MAKERS[name][0]
+    return [make(first + DAY + 2 * DAY * i) for i in range(count)]
+
+
+def grow(app, name, count, first=NOW):
+    """Appends `count` runs finishing after `first` to the ledger of `name`, the way a monitor does."""
+    path = Path(app.state_dir) / f"{name}_feedback.json"
+    cycles = json.loads(path.read_text())["cycles"]
+    write_ledger(app.state_dir, name, cycles + after(count, name, first))
+
+
+class RunTaskTests(unittest.TestCase):
+    def test_the_tapped_tasks_count_from_the_moment_they_are_first_seen_and_the_others_from_the_ledger(self):
+        shown = rows(make_app())
+        tasks = ("maint:dishwasher:hygiene", "maint:dishwasher:filters", "maint:dishwasher:check", "maint:washer:drum",
+                 "maint:washer:inlet", "maint:dryer:plinth")
+        self.assertEqual({key: shown[key]["detail"] for key in tasks}, {
+            "maint:dishwasher:hygiene": "Intensive 75, due, last unknown",
+            "maint:dishwasher:filters": "rinse filter + arms, 30 runs left, ~13.12",
+            "maint:dishwasher:check": "seal, sides, inside, 60 runs left, ~11.02.27",
+            "maint:washer:drum": "Bomuld 90, empty + a little powder, due, last unknown",
+            "maint:washer:inlet": "hose + valve filters, 90 runs left, ~12.04.27",
+            "maint:dryer:plinth": "0 runs since cleaned, counting from 14.10",
+        })
+
+    def test_every_new_row_is_admin_only_with_its_room_and_its_guide(self):
+        shown = rows(make_app())
+        for key, area in (("dishwasher:hygiene", "kitchen"), ("dishwasher:filters", "kitchen"),
+                          ("dishwasher:check", "kitchen"), ("washer:drum", "guest_bathroom"),
+                          ("washer:inlet", "guest_bathroom"), ("dryer:plinth", "guest_bathroom")):
+            row = shown[f"maint:{key}"]
+            self.assertEqual((row["kind"], row["audience"], row["area"]), ("maint", "admin", area), key)
+            self.assertEqual(row["steps"], list(guides.GUIDES[key].steps), key)
+            self.assertTrue(core.is_valid_row(row), key)
+        for key in ("dishwasher:filters", "dishwasher:check", "washer:inlet", "dryer:plinth"):
+            self.assertEqual(shown[f"maint:{key}"]["done"], "tap", key)
+        for key in ("dishwasher:hygiene", "washer:drum"):
+            self.assertNotIn("done", shown[f"maint:{key}"], key)
+
+    def test_the_rober2_rows_carry_their_guides_too(self):
+        shown = rows(make_app())
+        for part in ("filter", "main_brush", "side_brush", "sensor"):
+            self.assertEqual(shown[f"maint:rober2:{part}"]["steps"], list(guides.GUIDES[f"rober2:{part}"].steps))
+
+    def test_the_dryers_plinth_filter_is_low_key(self):
+        row = rows(make_app())["maint:dryer:plinth"]
+        self.assertNotIn("at", row)
+        self.assertEqual(row["next"], "skip")
+        self.assertEqual(row["info"], ["No interval yet. Log each clean to learn it.", "Counting from 14.10"])
+
+    def test_the_seed_is_saved_at_once_and_never_moves(self):
+        app = make_app()
+        seeded = state_file(app)["done"]
+        self.assertEqual(set(seeded), {"dishwasher:filters", "dishwasher:check", "washer:inlet", "dryer:plinth"})
+        self.assertEqual(seeded["dishwasher:filters"], {"at": core.utc_iso(NOW), "runs": 50, "seed": True})
+        self.assertEqual(seeded["washer:inlet"]["runs"], 60)
+        tick(app, 3 * DAY)
+        self.assertEqual(state_file(app)["done"], seeded)
+        reloaded = make_app(app.states, state_dir=app.state_dir, now=app.now)
+        self.assertEqual(reloaded._anchors, seeded)
+        self.assertEqual(rows(reloaded)["maint:dishwasher:filters"]["info"][1], "Counting from 14.10")
+
+    def test_a_run_that_has_finished_is_counted_by_the_next_tick(self):
+        app = make_app()
+        grow(app, "dishwasher", 2)
+        tick(app, 6 * DAY)
+        shown = rows(app)
+        self.assertTrue(shown["maint:dishwasher:filters"]["detail"].startswith("rinse filter + arms, 28 runs left"))
+        self.assertTrue(shown["maint:dishwasher:check"]["detail"].startswith("seal, sides, inside, 58 runs left"))
+        self.assertTrue(shown["maint:washer:inlet"]["detail"].startswith("hose + valve filters, 90 runs left"))
+        self.assertEqual(shown["maint:dishwasher:hygiene"]["detail"], "Intensive 75, due, last unknown")
+
+    def test_a_ledger_is_read_again_only_when_its_file_has_changed(self):
+        app = make_app()
+        reads = []
+        inner = hu.run_ledger.ledger
+        hu.run_ledger.ledger = lambda cycles: reads.append(len(cycles or [])) or inner(cycles)
+        try:
+            for _ in range(3):
+                tick(app)
+            self.assertEqual(reads, [])
+            grow(app, "dishwasher", 1)
+            tick(app)
+            tick(app)
+            self.assertEqual(reads, [51])
+        finally:
+            hu.run_ledger.ledger = inner
+
+    def test_an_unreadable_ledger_keeps_the_last_one_and_is_logged_once(self):
+        app = make_app()
+        path = Path(app.state_dir) / "dishwasher_feedback.json"
+        path.write_text('{"cycles": [')
+        os.utime(path, (1_800_000_000, 1_800_000_000))
+        for _ in range(3):
+            tick(app)
+        self.assertIn("maint:dishwasher:filters", rows(app))
+        bad = [msg for level, msg in app.logs if level == "WARNING" and "dishwasher_feedback.json" in msg]
+        self.assertEqual(len(bad), 1)
+        grow_ledger = every_two_days("dishwasher", NOW) + after(3)
+        write_ledger(app.state_dir, "dishwasher", grow_ledger)
+        tick(app, 8 * DAY)
+        self.assertTrue(rows(app)["maint:dishwasher:filters"]["detail"].startswith("rinse filter + arms, 27 runs left"))
+
+    def test_a_ledger_that_is_not_there_yet_gives_no_rows_and_is_seeded_when_it_appears(self):
+        app = make_app(ledgers={"dryer": None})
+        self.assertNotIn("maint:dryer:plinth", rows(app))
+        self.assertNotIn("dryer:plinth", state_file(app)["done"])
+        write_ledger(app.state_dir, "dryer", every_two_days("dryer", NOW))
+        tick(app, 3 * DAY)
+        self.assertEqual(rows(app)["maint:dryer:plinth"]["detail"], "0 runs since cleaned, counting from 17.10")
+        self.assertEqual(state_file(app)["done"]["dryer:plinth"]["at"], core.utc_iso(NOW + 3 * DAY))
+        self.assertEqual(state_file(app)["done"]["dishwasher:filters"]["at"], core.utc_iso(NOW))
+
+    def test_no_ledger_at_all_leaves_only_the_other_rows(self):
+        app = make_app(ledgers={"washer": None, "dishwasher": None, "dryer": None})
+        self.assertEqual({key for key in rows(app) if key.startswith(("maint:dish", "maint:washer", "maint:dryer"))},
+                         set())
+        self.assertIn("maint:rober2:filter", rows(app))
+        self.assertEqual(state_file(app).get("done", {}), {})
+
+    def test_the_old_attribute_the_washer_published_is_no_longer_read(self):
+        states = base_states()
+        states["sensor.washer_state"] = full("Off", {"last_drum_clean": iso(NOW - 3 * DAY)})
+        row = rows(make_app(states))["maint:washer:drum"]
+        self.assertEqual(row["detail"], "Bomuld 90, empty + a little powder, due, last unknown")
+
+    def test_an_old_state_file_with_the_drum_key_loads_and_loses_it(self):
+        app = make_app()
+        tick(app)
+        data = state_file(app)
+        data["drum"] = "2026-09-12T11:21:30+00:00"
+        Path(app.state_file).write_text(json.dumps(data))
+        reloaded = make_app(app.states, state_dir=app.state_dir, now=app.now)
+        tick(reloaded)
+        self.assertNotIn("drum", state_file(reloaded))
+        self.assertEqual(reloaded._anchors, app._anchors)
+
+    def test_the_dryers_interval_in_the_config_makes_its_row_a_normal_one(self):
+        shown = rows(make_app(dryer={"interval_runs": 40}))
+        row = shown["maint:dryer:plinth"]
+        self.assertEqual(row["detail"], "plinth filter + air path, 40 runs left, ~02.01.27")
+        self.assertEqual(row["at"], "2027-01-02T08:00:00+00:00")
+        self.assertNotIn("next", row)
+        self.assertEqual(row["info"][0], "Every 40 runs (~3 months)")
+
+    def test_a_config_interval_that_is_not_a_whole_number_leaves_it_a_log(self):
+        for bad in ("40", 0, -2, None, True, "soon"):
+            row = rows(make_app(dryer={"interval_runs": bad}))["maint:dryer:plinth"]
+            self.assertEqual(row["next"], "skip", bad)
+            self.assertNotIn("at", row, bad)
+
+    def test_the_shipped_config_leaves_the_interval_unset_and_the_dryer_in_the_guest_bathroom(self):
+        self.assertEqual(CONFIG["dryer"], {"interval_runs": None})
+        app = make_app()
+        self.assertEqual(app.run_areas, {"washer": "guest_bathroom", "dishwasher": "kitchen", "dryer": "guest_bathroom"})
+        self.assertEqual(set(app.feedback_files),  {"washer", "dishwasher", "dryer"})
+
+    def test_the_ledgers_default_to_the_files_next_to_the_appliance_modules(self):
+        app = hu.HouseUpcoming.__new__(hu.HouseUpcoming)
+        here = Path(hu.__file__).resolve().parent
+        app.args = {**CONFIG, "state_file": f"{tempfile.mkdtemp()}/state.json"}
+        app.get_state = lambda *a, **kw: None
+        app.set_state = lambda *a, **kw: None
+        app.get_now = lambda: NOW
+        app.get_app = lambda name: None
+        app.log = lambda *a, **kw: None
+        for hook in ("listen_state", "listen_event", "run_every", "run_daily", "run_in"):
+            setattr(app, hook, lambda *a, **kw: None)
+        app.create_task = lambda coro: None
+        app.initialize()
+        self.assertEqual(app.feedback_files["washer"], here.parent / "appliances" / "washer_feedback.json")
+        self.assertEqual(app.feedback_files["dishwasher"], here.parent / "appliances" / "dishwasher_feedback.json")
+        self.assertEqual(app.feedback_files["dryer"], here.parent / "appliances" / "dryer_feedback.json")
+        self.assertEqual(app.done_log_file, here / "house_upcoming_done_log.jsonl")
+
+
+class DoneEventTests(unittest.TestCase):
+    FILTERS = "maint:dishwasher:filters"
+
+    def done(self, app, row=FILTERS):
+        app._on_done("house_upcoming_done", {"row": row}, {})
+
+    def undo(self, app, row=FILTERS):
+        app._on_undo("house_upcoming_undo", {"row": row}, {})
+
+    def test_the_events_are_listened_for(self):
+        app = make_app()
+        self.assertIn(("_on_done", "house_upcoming_done"), app.events)
+        self.assertIn(("_on_undo", "house_upcoming_undo"), app.events)
+
+    def test_done_starts_the_count_over_publishes_at_once_and_is_saved(self):
+        app = make_app()
+        grow(app, "dishwasher", 2)
+        tick(app, 6 * DAY)
+        self.assertTrue(rows(app)[self.FILTERS]["detail"].startswith("rinse filter + arms, 28 runs left"))
+        seed = state_file(app)["done"]["dishwasher:filters"]
+        published = len(app.published)
+        self.done(app)
+        self.assertEqual(len(app.published), published + 1)
+        row = rows(app)[self.FILTERS]
+        self.assertTrue(row["detail"].startswith("rinse filter + arms, 30 runs left"), row["detail"])
+        self.assertEqual(row["info"][1], "Done 20.10, no runs since")
+        saved = state_file(app)["done"]["dishwasher:filters"]
+        self.assertEqual(saved, {"at": core.utc_iso(app.now), "runs": 52, "prev": seed})
+        self.assertEqual(done_log(app), [{"event": "done", "row": self.FILTERS, "at": core.utc_iso(app.now), "runs": 52}])
+        self.assertIn(("INFO", "Done: Dishwasher filters + spray arms, at run 52"), app.logs)
+
+    def test_only_the_task_that_was_tapped_starts_over(self):
+        app = make_app()
+        grow(app, "dishwasher", 2)
+        tick(app, 6 * DAY)
+        self.done(app)
+        shown = rows(app)
+        self.assertTrue(shown["maint:dishwasher:check"]["detail"].startswith("seal, sides, inside, 58 runs left"))
+        self.assertEqual(shown["maint:dishwasher:check"]["info"][1], "Counting from 14.10")
+
+    def test_a_done_survives_a_reload(self):
+        app = make_app()
+        tick(app, DAY)
+        self.done(app)
+        reloaded = make_app(app.states, state_dir=app.state_dir, now=app.now)
+        self.assertEqual(reloaded._anchors, app._anchors)
+        self.assertEqual(rows(reloaded)[self.FILTERS], rows(app)[self.FILTERS])
+
+    def test_undo_brings_the_seed_back_publishes_and_is_saved(self):
+        app = make_app()
+        tick(app, 2 * DAY)
+        before = state_file(app)["done"]
+        shown_before = rows(app)[self.FILTERS]
+        self.done(app)
+        published = len(app.published)
+        self.undo(app)
+        self.assertEqual(len(app.published), published + 1)
+        self.assertEqual(rows(app)[self.FILTERS], shown_before)
+        self.assertEqual(state_file(app)["done"], before)
+        self.assertEqual([entry["event"] for entry in done_log(app)], ["done", "undo"])
+        self.assertIn(("INFO", "Done undone: Dishwasher filters + spray arms"), app.logs)
+
+    def test_a_second_undo_has_nothing_to_undo(self):
+        app = make_app()
+        self.done(app)
+        self.undo(app)
+        published, logged = len(app.published), done_log(app)
+        self.undo(app)
+        self.assertEqual((len(app.published), done_log(app)), (published, logged))
+        self.assertTrue(any(level == "WARNING" and msg.startswith("Undo ignored") for level, msg in app.logs))
+
+    def test_undoing_the_second_of_two_dones_brings_back_the_first(self):
+        app = make_app()
+        tick(app, DAY)
+        self.done(app)
+        first = state_file(app)["done"]["dishwasher:filters"]
+        tick(app, DAY)
+        self.done(app)
+        self.undo(app)
+        self.assertEqual({k: v for k, v in state_file(app)["done"]["dishwasher:filters"].items() if k != "prev"},
+                         {k: v for k, v in first.items() if k != "prev"})
+
+    def test_a_done_for_any_other_row_is_ignored_and_logged(self):
+        app = make_app()
+        before, published = state_file(app), len(app.published)
+        for row in ("maint:washer:drum", "maint:dishwasher:hygiene", "maint:rober2:filter", "maint:nothing", "", None, 5):
+            self.done(app, row)
+        app._on_done("house_upcoming_done", {}, {})
+        app._on_done("house_upcoming_done", None, {})
+        self.assertEqual((state_file(app)["done"], len(app.published), done_log(app)), (before["done"], published, []))
+        warned = [msg for level, msg in app.logs if level == "WARNING" and msg.startswith("Done ignored")]
+        self.assertEqual(len(warned), 9)
+
+    def test_a_done_without_runs_on_record_is_ignored(self):
+        app = make_app(ledgers={"washer": None})
+        self.done(app, "maint:washer:inlet")
+        self.assertEqual(done_log(app), [])
+        self.assertNotIn("maint:washer:inlet", rows(app))
+
+    def test_the_dryers_plinth_filter_is_logged_with_the_same_event(self):
+        app = make_app()
+        grow(app, "dryer", 3)
+        tick(app, 8 * DAY)
+        self.assertEqual(rows(app)["maint:dryer:plinth"]["detail"], "3 runs since cleaned, counting from 14.10")
+        self.done(app, "maint:dryer:plinth")
+        row = rows(app)["maint:dryer:plinth"]
+        self.assertEqual((row["detail"], row["info"][1]), ("0 runs since cleaned, last 22.10", "Logged 22.10, no runs since"))
+        self.assertEqual(done_log(app)[0]["runs"], 53)
+
+    def test_done_and_undo_leave_the_state_file_exactly_as_it_was(self):
+        app = make_app()
+        tick(app, 2 * DAY)
+        before = Path(app.state_file).read_text()
+        for row in ("maint:dishwasher:filters", "maint:dishwasher:check", "maint:washer:inlet", "maint:dryer:plinth"):
+            self.done(app, row)
+            self.undo(app, row)
+        self.assertEqual(Path(app.state_file).read_text(), before)
+
+    def test_a_failed_log_write_does_not_stop_the_done(self):
+        app = make_app()
+        app.done_log_file = Path(app.state_dir) / "no" / "such" / "dir" / "log.jsonl"
+        self.done(app)
+        self.assertTrue(rows(app)[self.FILTERS]["info"][1].startswith("Done "))
+        self.assertTrue(any(level == "WARNING" and "Done log write failed" in msg for level, msg in app.logs))
+
+
+class PushRunTests(unittest.TestCase):
+    def push(self, app):
+        app._on_push_time({})
+        drain(app)
+
+    def test_a_tapped_task_that_comes_due_is_pushed_once_and_again_only_after_a_done(self):
+        app = make_app()
+        grow(app, "dishwasher", 31)
+        tick(app, 64 * DAY)
+        self.assertEqual(rows(app)["maint:dishwasher:filters"]["detail"], "rinse filter + arms, due")
+        self.push(app)
+        sent = app.notifier.sent
+        self.assertEqual([(s["title"], s["message"]) for s in sent], [("Maintenance due", "Dishwasher filters + spray arms")])
+        tick(app, DAY)
+        self.push(app)
+        self.assertEqual(len(sent), 1)
+        app._on_done("house_upcoming_done", {"row": "maint:dishwasher:filters"}, {})
+        grow(app, "dishwasher", 31, first=app.now)
+        tick(app, 64 * DAY)
+        self.push(app)
+        self.assertEqual([s["message"] for s in sent],
+                         ["Dishwasher filters + spray arms", "Dishwasher filters + spray arms, Dishwasher general check"])
+
+    def test_a_confirmed_task_nobody_ever_confirmed_is_due_but_never_pushed(self):
+        app = make_app()
+        shown = rows(app)
+        self.assertIn("due", shown["maint:dishwasher:hygiene"]["detail"])
+        self.assertIn("due", shown["maint:washer:drum"]["detail"])
+        tick(app, 2 * DAY)
+        self.push(app)
+        self.assertEqual(app.notifier.sent, [])
+
+    def test_a_confirmed_task_is_pushed_once_its_runs_since_the_last_confirmation_are_fifteen(self):
+        cycles = every_two_days("dishwasher", NOW)
+        cycles[-16] = dish_run(NOW - 31 * DAY, confirmed="intensive", programme_confirmed_by_human=True)
+        app = make_app(ledgers={"dishwasher": cycles})
+        self.assertEqual(rows(app)["maint:dishwasher:hygiene"]["detail"], "Intensive 75, due, last 13.09")
+        self.push(app)
+        self.assertEqual([s["message"] for s in app.notifier.sent], ["Dishwasher hygiene run"])
+        self.push(app)
+        self.assertEqual(len(app.notifier.sent), 1)
+
+    def test_the_drum_clean_is_pushed_fifteen_runs_after_the_last_confirmed_one(self):
+        cycles = every_two_days("washer", NOW)
+        cycles[-21] = drum_clean_run(NOW - 40 * DAY)
+        app = make_app(ledgers={"washer": cycles})
+        self.assertEqual(rows(app)["maint:washer:drum"]["detail"], "Bomuld 90, empty + a little powder, due, last 04.09")
+        self.push(app)
+        self.assertEqual([s["message"] for s in app.notifier.sent], ["Washer drum + drawer clean"])
+
+    def test_the_dryers_log_row_is_never_pushed(self):
+        app = make_app()
+        grow(app, "dryer", 200)
+        tick(app, 400 * DAY)
+        self.assertIn("runs since cleaned", rows(app)["maint:dryer:plinth"]["detail"])
+        self.push(app)
+        self.assertNotIn("Dryer plinth filter", " ".join(s["message"] for s in app.notifier.sent))
+
+    def test_with_an_interval_the_plinth_filter_is_pushed_when_due(self):
+        app = make_app(dryer={"interval_runs": 40})
+        grow(app, "dryer", 41)
+        tick(app, 84 * DAY)
+        self.assertEqual(rows(app)["maint:dryer:plinth"]["detail"], "plinth filter + air path, due")
+        self.push(app)
+        self.assertEqual([s["message"] for s in app.notifier.sent], ["Dryer plinth filter"])
 
 
 class TrainTests(unittest.TestCase):

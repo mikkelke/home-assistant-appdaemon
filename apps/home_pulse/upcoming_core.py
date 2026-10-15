@@ -9,7 +9,10 @@ Entity shape:
 Row fields: ``id`` (stable), ``kind`` (rain | train | maint), ``at`` (UTC ISO, absent =
 untimed), ``icon``, ``title``, ``detail``, ``chip``, ``area`` (HA area id a tap opens),
 ``audience`` ("admin") or ``audience_users`` (HA display names), ``next`` ("skip": the
-dashboard's next chip passes the row over).
+dashboard's next chip passes the row over). A maintenance row may carry what its sheet shows, and
+a tap on such a row opens that sheet instead of its room: ``info`` (short lines), ``steps`` (what
+to do, in order) with ``warn`` (the safety note), and ``done`` ("tap": a Done button, which fires
+house_upcoming_done with the row id).
 
 Every value is a string or a list of strings: AppDaemon 4.5.13 drops None, False and 0 from
 set_state attributes at any depth and turns True into "true".
@@ -25,11 +28,15 @@ CHIP_MAX = 30
 NAME_MAX = 40
 LEASE = timedelta(minutes=15)
 KINDS = ("rain", "train", "maint")
+INFO_MAX = 4
+STEPS_MAX = 8
+STEP_MAX = 150
 BATTERY_ID_PREFIX = "maint:battery:"
 OVERFLOW_ID = "maint:more"
 
 _SPACE = re.compile(r"\s+")
-_FIELDS = ("id", "kind", "at", "icon", "title", "detail", "chip", "area", "audience", "audience_users", "next")
+_FIELDS = ("id", "kind", "at", "icon", "title", "detail", "chip", "area", "audience", "audience_users", "next",
+           "done", "info", "steps", "warn")
 
 
 def clean_text(value, limit=TEXT_MAX):
@@ -45,7 +52,7 @@ def utc_iso(dt):
 
 
 def make_row(row_id, kind, title, detail="", *, at=None, icon="mdi:information-outline", area=None, chip=None,
-             audience=None, audience_users=None, skip_next=False):
+             audience=None, audience_users=None, skip_next=False, tap_done=False, info=None, steps=None, warn=None):
     row = {"id": row_id, "kind": kind, "icon": icon, "title": clean_text(title)}
     detail = clean_text(detail)
     if detail:
@@ -66,6 +73,19 @@ def make_row(row_id, kind, title, detail="", *, at=None, icon="mdi:information-o
             row["audience_users"] = names
     if skip_next:
         row["next"] = "skip"
+    if tap_done:
+        row["done"] = "tap"
+    lines = [clean_text(line) for line in info or []]
+    lines = [line for line in lines if line][:INFO_MAX]
+    if lines:
+        row["info"] = lines
+    todo = [clean_text(step, STEP_MAX) for step in steps or []]
+    todo = [step for step in todo if step][:STEPS_MAX]
+    if todo:
+        row["steps"] = todo
+    note = clean_text(warn, STEP_MAX)
+    if note and todo:
+        row["warn"] = note
     return row
 
 
@@ -87,6 +107,22 @@ def is_valid_row(row):
     if "audience" in row and row["audience"] != "admin":
         return False
     if "next" in row and row["next"] != "skip":
+        return False
+    if "done" in row and (row["done"] != "tap" or row.get("kind") != "maint"):
+        return False
+    if "info" in row:
+        lines = row["info"]
+        if not isinstance(lines, list) or not 0 < len(lines) <= INFO_MAX:
+            return False
+        if not all(line and _is_ascii_text(line, TEXT_MAX) for line in lines):
+            return False
+    if "steps" in row:
+        steps = row["steps"]
+        if row.get("kind") != "maint" or not isinstance(steps, list) or not 0 < len(steps) <= STEPS_MAX:
+            return False
+        if not all(step and _is_ascii_text(step, STEP_MAX) for step in steps):
+            return False
+    if "warn" in row and ("steps" not in row or not row["warn"] or not _is_ascii_text(row["warn"], STEP_MAX)):
         return False
     if "audience_users" in row:
         users = row["audience_users"]

@@ -1,6 +1,5 @@
 # tests/test_upcoming_maint.py - maintenance rows for sensor.house_upcoming: Rober2 parts and their
-# dates before they are due, the washer drum clean, battery rules, replace-by days, offline devices
-# and the daily push.
+# dates before they are due, battery rules, replace-by days, offline devices and the daily push.
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
 import sys
@@ -11,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "appliances"))
 import upcoming_core as core  # noqa: E402
+import upcoming_guides as guides  # noqa: E402
 import upcoming_maint as maint  # noqa: E402
 
 T0 = datetime(2026, 10, 14, 8, 0, tzinfo=timezone.utc)
@@ -313,6 +313,17 @@ class Rober2Tests(unittest.TestCase):
         st = self.step(None, -1, T0)
         self.assertEqual(self.step(st, None, T0 + DAY), st)
 
+    def test_every_row_of_a_part_carries_its_guide_due_or_not(self):
+        states = {"filter": self.step(None, -19902, T0)}
+        rows = rober2(states, {"main_brush": 514101, "side_brush": 714003, "sensor": 102003})
+        self.assertEqual(len(rows), 4)
+        for row, _ in rows:
+            part = row["id"].removeprefix("maint:rober2:")
+            self.assertEqual(row["steps"], list(guides.GUIDES[f"rober2:{part}"].steps), part)
+            self.assertNotIn("warn", row)
+            self.assertNotIn("done", row)
+            self.assertTrue(core.is_valid_row(row), row)
+
 
 class Rober2EstimateTests(unittest.TestCase):
     def test_a_part_with_time_left_is_dated_by_the_cleaning_rate(self):
@@ -401,42 +412,6 @@ class Rober2RateTests(unittest.TestCase):
         for series in ([], [(self.START, 7000.0)], [(self.START, None), (T0 - DAY, None)], flat, short):
             self.assertEqual(maint.rober2_rate(series, T0), 2900.0, series)
         self.assertEqual(maint.ROBER2_RATE_DEFAULT, 2900.0)
-
-
-class DrumTests(unittest.TestCase):
-    def test_unknown_shows_what_to_do_without_a_push_key(self):
-        row, key = maint.drum_row("", T0, "guest_bathroom")
-        self.assertEqual((row["title"], row["detail"], row["area"]),
-                         ("Washer drum clean", "Bomuld 90, empty + a little powder, last unknown", "guest_bathroom"))
-        self.assertNotIn("at", row)
-        self.assertIsNone(key)
-        self.assertEqual(maint.drum_row(None, T0, "guest_bathroom")[1], None)
-
-    def test_due_thirty_days_after_the_last_clean(self):
-        self.assertIsNone(maint.drum_row(core.utc_iso(T0 - 29 * DAY), T0, "guest_bathroom"))
-        self.assertFalse(maint.drum_due(core.utc_iso(T0 - 29 * DAY), T0))
-        self.assertTrue(maint.drum_due(core.utc_iso(T0 - 30 * DAY), T0) and maint.drum_due("", T0))
-        row, key = maint.drum_row("2026-09-12T11:21:30+00:00", T0, "guest_bathroom")
-        self.assertEqual(row["detail"], "Bomuld 90, empty + a little powder, last 12.09")
-        self.assertEqual(key, "washer:drum:2026-09-12T11:21:30+00:00")
-
-    def test_a_later_start_times_the_row_and_says_what_it_saves(self):
-        start = (datetime(2026, 10, 15, 0, 15, tzinfo=timezone.utc), "saves 10,40 kr vs now", False)
-        row, key = maint.drum_row("2026-09-12T11:21:30+00:00", T0, "guest_bathroom", start)
-        self.assertEqual((row["at"], row["detail"]),
-                         ("2026-10-15T00:15:00+00:00", "Bomuld 90, empty + a little powder, saves 10,40 kr vs now"))
-        self.assertNotIn("next", row)
-        self.assertEqual(key, "washer:drum:2026-09-12T11:21:30+00:00")
-        self.assertIsNone(maint.drum_row(core.utc_iso(T0 - DAY), T0, "guest_bathroom", start))
-
-    def test_a_start_now_stays_out_of_the_next_chip(self):
-        start = (T0, "cheapest now", True)
-        row, _ = maint.drum_row("2026-09-12T11:21:30+00:00", T0, "guest_bathroom", start)
-        self.assertEqual((row["at"], row["next"]), (core.utc_iso(T0), "skip"))
-        self.assertEqual(row["detail"], "Bomuld 90, empty + a little powder, cheapest now, last 12.09")
-        self.assertTrue(core.is_valid_row(row))
-        row, _ = maint.drum_row("", T0, "guest_bathroom", start)
-        self.assertEqual(row["detail"], "Bomuld 90, empty + a little powder, cheapest now")
 
 
 class DigestTests(unittest.TestCase):

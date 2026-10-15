@@ -1,5 +1,6 @@
-"""Maintenance rows for sensor.house_upcoming: the Rober2 parts, the monthly washer drum clean and
-the battery inventory. Pure: each step takes the persisted state and `now` and returns new state.
+"""Maintenance rows for sensor.house_upcoming: the Rober2 parts and the battery inventory (the
+appliances' run-based rows are upcoming_runs). Pure: each step takes the persisted state and `now`
+and returns new state.
 
 Battery rules, per model in house_upcoming.yaml:
     low: N        a reading at or below N, held for HOLD, opens the condition; with days: K it
@@ -31,8 +32,8 @@ import re
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-import drum_clean  # apps/appliances - AppDaemon puts every app dir on sys.path
 from upcoming_core import BATTERY_ID_PREFIX, TEXT_MAX, make_row, utc_iso
+from upcoming_guides import GUIDES
 
 HOUSE_TZ = ZoneInfo("Europe/Copenhagen")
 HOLD = timedelta(hours=2)
@@ -41,7 +42,6 @@ CHARGE_MARGIN = 10
 DEFAULT_RISE = 30
 LOW_DAYS_KEEP = 7
 DUE_TIME = time(9, 0)
-DRUM_HOW = "Bomuld 90, empty + a little powder"
 PUSHED_KEEP = timedelta(days=180)
 
 ACTIONS = ("replace", "recharge", "charge")
@@ -343,7 +343,7 @@ def battery_row(entity, device, model, st, value, facts, now):
     return row, (f"{key_base}:low:{st['low_since']}" if low and key_base else None)
 
 
-# ---------------------------------------------------------------- Rober2 and the washer drum
+# ---------------------------------------------------------------- Rober2
 
 
 def step_rober2(st, seconds_left, now):
@@ -398,30 +398,11 @@ def rober2_rows(states, area, left, rate, now):
             if day is None:
                 continue
             detail, at, key = _due_text(action, day, True, now), datetime.combine(day, DUE_TIME, HOUSE_TZ), None
+        guide = GUIDES[f"rober2:{part}"]
         row = make_row(f"maint:rober2:{part}", "maint", title, detail, at=at, icon=ROBER2_ICON, area=area,
-                       audience="admin")
+                       audience="admin", steps=guide.steps, warn=guide.warn)
         out.append((row, key))
     return out
-
-
-def drum_due(last_clean, now):
-    return drum_clean.due(parse_iso(last_clean), now)
-
-
-def drum_row(last_clean, now, area, start=None):
-    """Miele's monthly drum clean: what to run, then what the start saves, timed at `start`
-    (upcoming_drum.drum_start: when, what it saves, whether that is now) when there is one. A row
-    timed at now stays out of the next chip, where it would sit for as long as now stays cheapest.
-    Without a confirmed clean on record the row shows but is never pushed: missing evidence is not
-    an overdue clean."""
-    if not drum_due(last_clean, now):
-        return None
-    when = parse_iso(last_clean)
-    at, price, at_now = start or (None, None, False)
-    detail = fit_parts([DRUM_HOW, price, f"last {ddmm(when, now)}" if when else "last unknown"])
-    row = make_row("maint:washer:drum", "maint", "Washer drum clean", detail, at=at, icon="mdi:washing-machine",
-                   area=area, audience="admin", skip_next=at_now)
-    return row, (f"washer:drum:{utc_iso(when)}" if when else None)
 
 
 # ---------------------------------------------------------------- daily push

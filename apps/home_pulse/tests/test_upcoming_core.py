@@ -49,6 +49,74 @@ class MakeRowTests(unittest.TestCase):
         self.assertTrue(core.is_valid_row(row))
 
 
+class SheetFieldTests(unittest.TestCase):
+    """done, info, steps and warn: what the sheet of a maintenance row shows."""
+
+    def make(self, **extra):
+        return core.make_row("maint:dishwasher:filters", "maint", "Dishwasher filters", "30 runs left",
+                             audience="admin", **extra)
+
+    def test_a_sheet_row_carries_a_done_button_info_lines_steps_and_a_note(self):
+        row = self.make(tap_done=True, info=["Every 30 runs (~2 months)", "Counting from 15.10"],
+                        steps=["Switch it off.", "Rinse the filter."], warn="Never run it without the filter.")
+        self.assertEqual((row["done"], row["info"], row["steps"], row["warn"]),
+                         ("tap", ["Every 30 runs (~2 months)", "Counting from 15.10"],
+                          ["Switch it off.", "Rinse the filter."], "Never run it without the filter."))
+        self.assertTrue(all(strings_only(v) for v in row.values()))
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_a_row_without_them_has_none_of_the_fields(self):
+        row = self.make(info=["", " "], steps=[None, ""], warn="")
+        self.assertEqual(set(row), {"id", "kind", "icon", "title", "detail", "audience"})
+        self.assertEqual(set(self.make(tap_done=False, info=None, steps=None, warn=None)), set(row))
+
+    def test_empty_lines_are_dropped_and_the_lists_are_capped(self):
+        row = self.make(info=["a", "", "b", "c", "d", "e"], steps=[f"Step {i}." for i in range(12)])
+        self.assertEqual(row["info"], ["a", "b", "c", "d"])
+        self.assertEqual(len(row["steps"]), core.STEPS_MAX)
+
+    def test_the_lines_are_ascii_one_line_and_capped(self):
+        row = self.make(info=["x" * 90], steps=["Rinse \u2013 the\nfilter " + "y" * 200], warn="z" * 300)
+        self.assertEqual(len(row["info"][0]), core.TEXT_MAX)
+        self.assertEqual(len(row["steps"][0]), core.STEP_MAX)
+        self.assertTrue(row["steps"][0].startswith("Rinse the filter y"))
+        self.assertEqual(len(row["warn"]), core.STEP_MAX)
+
+    def test_a_note_without_steps_is_dropped(self):
+        self.assertNotIn("warn", self.make(warn="Careful."))
+
+    def test_done_is_tap_on_a_maintenance_row_only(self):
+        row = self.make(tap_done=True)
+        self.assertTrue(core.is_valid_row(row))
+        for bad in ("true", "Tap", "", True, 1):
+            self.assertFalse(core.is_valid_row({**row, "done": bad}), bad)
+        rain = core.make_row("rain:terrace", "rain", "Rain forecast")
+        self.assertFalse(core.is_valid_row({**rain, "done": "tap"}))
+        self.assertFalse(core.is_valid_row({**rain, "audience": "admin", "done": "tap"}))
+
+    def test_info_is_a_short_list_of_ascii_lines(self):
+        row = self.make()
+        self.assertTrue(core.is_valid_row({**row, "info": ["one", "two"]}))
+        for bad in ("one", [], [""], ["x" * 61], ["a", "b", "c", "d", "e"], [1], ["a", None], ["Regn \u00e6"]):
+            self.assertFalse(core.is_valid_row({**row, "info": bad}), bad)
+
+    def test_steps_are_a_list_of_ascii_lines_on_a_maintenance_row_only(self):
+        row = self.make()
+        self.assertTrue(core.is_valid_row({**row, "steps": ["Switch it off."], "warn": "Careful."}))
+        for bad in ("Switch it off.", [], [""], ["x" * 151], [f"Step {i}." for i in range(9)], [1], ["Regn \u00e6"]):
+            self.assertFalse(core.is_valid_row({**row, "steps": bad}), bad)
+        rain = {**core.make_row("rain:terrace", "rain", "Rain forecast"), "steps": ["Close the door."]}
+        self.assertFalse(core.is_valid_row(rain))
+
+    def test_a_note_needs_steps_and_a_string(self):
+        row = self.make(steps=["Switch it off."])
+        self.assertTrue(core.is_valid_row({**row, "warn": "Careful."}))
+        for bad in ("", "x" * 151, 5, ["Careful."], True):
+            self.assertFalse(core.is_valid_row({**row, "warn": bad}), bad)
+        without = {k: v for k, v in row.items() if k != "steps"}
+        self.assertFalse(core.is_valid_row({**without, "warn": "Careful."}))
+
+
 class ValidRowTests(unittest.TestCase):
     def valid(self, **extra):
         row = {"id": "rain:terrace", "kind": "rain", "icon": "mdi:weather-pouring", "title": "Rain forecast"}

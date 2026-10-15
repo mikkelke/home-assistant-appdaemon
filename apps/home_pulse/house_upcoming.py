@@ -1,7 +1,7 @@
 """HouseUpcoming - what is coming up in the house that only the server can know, for the dashboard's
-Now timeline: maintenance (the Rober2 parts, the washer drum clean at its cheapest start, batteries
-by their replace-by day and offline devices; admin only), Kristine's train, and rain while a terrace
-door is open (exploratory).
+Now timeline: maintenance (the Rober2 parts, the dishwasher's, washer's and dryer's run-based tasks, the
+drum clean at its cheapest start, batteries by their replace-by day and offline devices; admin only),
+Kristine's train, and rain while a terrace door is open (exploratory).
 
 Publishes sensor.house_upcoming (shape in upcoming_core.py) plus one maintenance push a day, built
 from the same conditions the rows show. The lease in `expires` is renewed every TICK_S even when
@@ -10,17 +10,24 @@ nothing changed, so the dashboard drops the rows within upcoming_core.LEASE once
 State acquisition: one snapshot of every source at initialize, then listen_state(attribute="all"),
 so attribute-only changes (departures, last_drum_clean) count. A value from a callback is never
 replaced by a later read, because AppDaemon 4.5.13's state store can lag behind HA; the daily
-history job refreshes battery readings from the recorder when it holds a newer one. The last drum
-clean seen is kept while washer_state is missing or lacks it. HA restarts re-run initialize, and
-plugin_started republishes.
+history job refreshes battery readings from the recorder when it holds a newer one. HA restarts
+re-run initialize, and plugin_started republishes.
+
+The appliance tasks (upcoming_runs) count finished runs in the monitors' feedback files
+(<appliance>_feedback.json next to the appliances' modules, read again whenever one changes, so a
+tick picks up a run that has finished). The tapped ones are closed by the house_upcoming_done event
+the dashboard fires for an admin, with {"row": <row id>}, and reopened by house_upcoming_undo; both
+reach the rows at once, and each is appended to house_upcoming_done_log.jsonl, which keeps every Done
+for working out the real interval of a task (the dryer's plinth filter is a log until it is known).
 
 The daily history job also turns each device's recorder history into battery facts and a
 replace-by day, with the median lifetime of every device of the same model as the last resort, and
 Rober2's recent cleaning rate from its cumulative cleaning time, which dates each part's row before
 it is due.
 
-Latches, push keys, battery facts and the cleaning rate persist in house_upcoming_state.json next to
-this module; rain forecast fixtures go to house_upcoming_rain_fixtures.jsonl.
+Latches, push keys, battery facts, the cleaning rate and the tapped tasks' anchors persist in
+house_upcoming_state.json next to this module; rain forecast fixtures go to
+house_upcoming_rain_fixtures.jsonl.
 """
 
 import asyncio
@@ -34,11 +41,13 @@ from pathlib import Path
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
 import climate_model as cm  # apps/climate - AppDaemon puts every app dir on sys.path
+import run_ledger  # apps/appliances
 import upcoming_battery_age as age
 import upcoming_core as core
 import upcoming_drum as drum
 import upcoming_maint as maint
 import upcoming_rain as rain
+import upcoming_runs as runs
 import upcoming_train as train
 
 TICK_S = 300
@@ -78,6 +87,16 @@ class HouseUpcoming(hass.Hass):
         self.price_entity = washer.get("price_entity", "sensor.energi_data_service")
         self.profiles_entity = washer.get("profiles_entity", "sensor.appliance_run_profiles")
         self.drum_programmes = tuple(washer.get("drum_programmes") or ["drum_clean", "bomuld_90", "bomuld_60"])
+        dishwasher = a.get("dishwasher") or {}
+        dryer = a.get("dryer") or {}
+        self.run_areas = {"washer": self.washer_area, "dishwasher": dishwasher.get("area", "kitchen"),
+                          "dryer": dryer.get("area", self.washer_area)}
+        self.feedback_files = {
+            name: Path(cfg.get("feedback_file") or here.parent / "appliances" / f"{name}_feedback.json")
+            for name, cfg in (("washer", washer), ("dishwasher", dishwasher), ("dryer", dryer))
+        }
+        self.run_tasks = runs.configured(runs.interval_from(dryer.get("interval_runs")))
+        self.done_log_file = Path(a.get("done_log_file") or here / "house_upcoming_done_log.jsonl")
         tr = a.get("train") or {}
         self.train_route = tr.get("route", "sensor.transit_kbh_ic_odense")
         self.train_stog = tr.get("stog_status", "input_select.transit_carlsberg_stog_kbh_status")
@@ -100,7 +119,8 @@ class HouseUpcoming(hass.Hass):
         self._pushed = dict(saved.get("pushed") or {})
         self._facts = dict(saved.get("facts") or {})
         self._content = dict(saved.get("content") or {})
-        self._drum_seen = saved.get("drum") if isinstance(saved.get("drum"), str) else None
+        self._anchors = runs.valid_anchors(saved.get("done"), self.run_tasks)
+        self._ledger_files = {}
         self._state_text = None
         self._state_written_at = None
         self._cache = {}
@@ -115,6 +135,8 @@ class HouseUpcoming(hass.Hass):
             self._cache[entity] = self._read(entity)
             self.listen_state(self._on_source, entity, attribute="all")
         self.listen_event(self._on_plugin_started, "plugin_started")
+        self.listen_event(self._on_done, "house_upcoming_done")
+        self.listen_event(self._on_undo, "house_upcoming_undo")
         self.run_every(self._on_tick, f"now+{TICK_S}", TICK_S)
         self.run_daily(self._on_push_time, _clock(a.get("push_time"), "09:00:00"))
         self.run_daily(self._history_job, _clock(a.get("history_time"), "03:40:00"))
@@ -182,6 +204,39 @@ class HouseUpcoming(hass.Hass):
     def _on_plugin_started(self, event_name, data, kwargs):
         self._evaluate(publish=True)
 
+    def _on_done(self, event_name, data, kwargs):
+        task = runs.tapped_task((data or {}).get("row"), self.run_tasks)
+        ledger = self._ledgers().get(task.appliance) if task else None
+        if ledger is None:
+            self.log(f"Done ignored: {(data or {}).get('row')!r} is no tapped task or has no runs on record",
+                     level="WARNING")
+            return
+        now = self.get_now()
+        self._anchors = runs.mark_done(self._anchors, task.key, now, len(ledger.runs))
+        self.log(f"Done: {task.title}, at run {len(ledger.runs)}")
+        self._after_anchor_change("done", task, now, len(ledger.runs))
+
+    def _on_undo(self, event_name, data, kwargs):
+        task = runs.tapped_task((data or {}).get("row"), self.run_tasks)
+        if task is None or not isinstance((self._anchors.get(task.key) or {}).get("prev"), dict):
+            self.log(f"Undo ignored: {(data or {}).get('row')!r} has nothing to undo", level="WARNING")
+            return
+        self._anchors = runs.undo_done(self._anchors, task.key)
+        self.log(f"Done undone: {task.title}")
+        self._after_anchor_change("undo", task, self.get_now(), None)
+
+    def _after_anchor_change(self, event, task, now, count):
+        self._append_done_log({"event": event, "row": runs.row_id(task), "at": core.utc_iso(now), "runs": count})
+        self._evaluate(publish=True)
+        self._save_state(force=True)
+
+    def _append_done_log(self, record):
+        try:
+            with open(self.done_log_file, "a") as f:
+                f.write(json.dumps(record, sort_keys=True) + "\n")
+        except Exception as e:
+            self.log(f"Done log write failed: {e!r}", level="WARNING")
+
     def _on_tick(self, kwargs):
         for entity, cached in list(self._cache.items()):
             if cached is None:
@@ -199,14 +254,7 @@ class HouseUpcoming(hass.Hass):
         for part, seconds in left.items():
             self._rober2[part] = maint.step_rober2(self._rober2.get(part), seconds, now)
         found = maint.rober2_rows(self._rober2, self.rober2_area, left, self._rober2_rate, now)
-        last_clean = (self._attributes(self.washer_entity) or {}).get("last_drum_clean")
-        if isinstance(last_clean, str):
-            self._drum_seen = last_clean
-        start = None
-        if maint.drum_due(self._drum_seen, now):
-            start = drum.drum_start(self._attributes(self.price_entity), self._attributes(self.profiles_entity),
-                                    self.drum_programmes, now)
-        found.append(maint.drum_row(self._drum_seen, now, self.washer_area, start))
+        found += self._run_rows(now)
         for entity, device in self.inventory["devices"].items():
             cached = self._cache.get(entity)
             if cached is None:
@@ -236,6 +284,40 @@ class HouseUpcoming(hass.Hass):
         if changed or publish:
             self._publish(rows, now)
         self._save_state()
+
+    def _run_rows(self, now):
+        ledgers = self._ledgers()
+        anchors = runs.seed(self._anchors, ledgers, now, self.run_tasks)
+        if anchors != self._anchors:
+            self._anchors = anchors
+            self._save_state(force=True)
+        counted = runs.statuses(ledgers, self._anchors, now, self.run_tasks)
+        drum_status = counted.get(runs.DRUM_KEY)
+        start = None
+        if drum_status is not None and not drum_status.left:
+            start = drum.drum_start(self._attributes(self.price_entity), self._attributes(self.profiles_entity),
+                                    self.drum_programmes, now)
+        return runs.rows(counted, now, self.run_areas, start)
+
+    def _ledgers(self):
+        """{appliance: run_ledger.Ledger} of the feedback files. A file is read again only once it has
+        changed, and a file that cannot be read keeps the ledger it last gave."""
+        for name, path in self.feedback_files.items():
+            try:
+                stat = path.stat()
+                stamp = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                continue
+            known = self._ledger_files.get(name)
+            if known and known[0] == stamp:
+                continue
+            ledger = known[1] if known else None
+            try:
+                ledger = run_ledger.ledger(json.loads(path.read_text()).get("cycles"))
+            except Exception as e:
+                self.log(f"Could not read {path.name}: {e!r}", level="WARNING")
+            self._ledger_files[name] = (stamp, ledger)
+        return {name: ledger for name, (_, ledger) in self._ledger_files.items() if ledger is not None}
 
     def _rain_row(self, now):
         doors = {}
@@ -436,7 +518,7 @@ class HouseUpcoming(hass.Hass):
     def _save_state(self, force=False):
         data = {"version": STATE_VERSION, "rober2": self._rober2, "rober2_rate": self._rober2_rate,
                 "batteries": self._batteries, "pushed": self._pushed, "facts": self._facts,
-                "content": self._content, "drum": self._drum_seen}
+                "content": self._content, "done": self._anchors}
         text = json.dumps(data, sort_keys=True)
         if text == self._state_text:
             return

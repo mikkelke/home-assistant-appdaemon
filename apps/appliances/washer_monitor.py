@@ -68,6 +68,7 @@ import washer_plug as wplug
 import washer_profiles as wp
 import cycle_store as cystore
 import drum_clean
+import run_ledger
 
 # Shared save/restore-snapshot/staleness-check plumbing for the on-disk store above - see
 # cycle_persistence.py's module docstring for the split between what it owns and what stays
@@ -5202,13 +5203,24 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         """MobileNotifier per_person_actions for the confirm push of record `ts`: while a drum clean is
         due, the phones of confirm_push_drum_clean_audience get a "Drum clean" button before the last
         one, every other phone gets `actions`. None while no drum clean is due."""
-        last = self._drum_clean_attr()
-        if not drum_clean.due(datetime.fromisoformat(last) if last else None, self._now_utc()):
+        if not self._drum_clean_due():
             return None
         button = {"action": self._encode_confirm_action(ts, wp.DRUM_CLEAN, None),
                   "title": self._get_profile(wp.DRUM_CLEAN).get("label", wp.DRUM_CLEAN)}
         with_button = actions[:-1] + [button] + actions[-1:]
         return lambda person: with_button if person in self.confirm_push_drum_clean_audience else actions
+
+    def _drum_clean_due(self):
+        """drum_clean.due on the feedback file as it is now, which holds the record of the run that has just
+        finished; False while the file cannot be read."""
+        import json
+
+        try:
+            with open(self.feedback_file, "r") as f:
+                cycles = json.load(f).get("cycles")
+        except Exception:
+            return False
+        return drum_clean.due(run_ledger.ledger(cycles))
 
     def _confirm_push_target_for(self, record: dict):
         """Same target resolution _send_confirm_push uses, so a dismiss (clear_notification)
