@@ -6,9 +6,8 @@ outside PRICE_RANGE leaves its hour unpriced, and a point off the hour is ignore
 profile is the first of the given programmes that sensor.appliance_run_profiles publishes, in
 0.1 Wh per minute from power onset. Starts are tried at the next whole minute and then on every
 quarter hour, as long as every minute of the run falls in a priced hour, so the search ends with
-today until tomorrow's prices are out and with tomorrow after that. A later start is offered only
-when it saves at least SAVING_MIN_KR and SAVING_MIN_PCT of starting now, the dashboard planner's
-saving rule; otherwise starting now is.
+today until tomorrow's prices are out and with tomorrow after that. The cheapest start wins however
+little it saves; a saving that rounds to 0,00 kr is none, so starting now wins.
 """
 
 import math
@@ -19,8 +18,6 @@ from upcoming_maint import HOUSE_TZ
 PRICE_RANGE = (-5.0, 15.0)
 START_STEP_MIN = 15
 PROFILE_MAX_MIN = 720
-SAVING_MIN_KR = 0.10
-SAVING_MIN_PCT = 10
 EPSILON_KR = 1e-9
 
 
@@ -85,14 +82,10 @@ def _cost(cumulative, prices, start):
     return kr
 
 
-def _passes(base, cost):
-    saving = base - cost
-    return saving + EPSILON_KR >= SAVING_MIN_KR and (base <= 0 or saving + EPSILON_KR >= base * SAVING_MIN_PCT / 100)
-
-
 def cheapest_start(wh, prices, now):
     """(start, saving) for a run of `wh`, or None when no start is priced throughout. `saving` is the
-    kr saved against starting now: 0 when starting now wins, None when starting now is unpriced."""
+    kr saved against starting now, rounded to the øre: 0 when starting now wins, None when starting
+    now is unpriced."""
     if not wh or not prices:
         return None
     cumulative = [0.0]
@@ -109,23 +102,22 @@ def cheapest_start(wh, prices, now):
             best = (start, cost)
     if best is None:
         return None
-    if base is not None and best[0] != first and not _passes(base, best[1]):
-        best = (first, base)
-    saving = None if base is None else base - best[1]
+    saving = None if base is None else round((base - best[1]) * 100) / 100
+    if saving == 0:
+        best, saving = (first, base), 0
     return datetime.fromtimestamp(best[0] * 60, timezone.utc), saving
 
 
 def drum_start(price_attributes, profile_attributes, keys, now, appliance="washer"):
-    """(start, text) the drum row is timed at and says, or None without a priced start. start is
-    None when no later start beats starting now, so the row stays untimed."""
+    """(start, text, at_now) for the drum row, or None without a priced start: when to time the row,
+    what that start saves, and whether it is now."""
     profile = programme_profile(profile_attributes, appliance, keys)
     found = cheapest_start(profile[1], hour_prices(price_attributes), now) if profile else None
     if found is None:
         return None
     start, saving = found
     if saving == 0:
-        return None, "any time, no cheaper start"
-    text = f"cheapest start {start.astimezone(HOUSE_TZ):%H:%M}"
-    if saving is not None:
-        text += f" - saves {saving:.2f} kr vs now".replace(".", ",")
-    return start, text
+        return start, "cheapest now", True
+    if saving is None:
+        return start, f"cheapest start {start.astimezone(HOUSE_TZ):%H:%M}", False
+    return start, f"saves {saving:.2f} kr vs now".replace(".", ","), False

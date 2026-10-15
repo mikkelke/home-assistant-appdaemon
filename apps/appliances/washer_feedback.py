@@ -44,16 +44,15 @@ DUPLICATE_DURATION_SLACK_MIN = 0.6
 def last_drum_clean(cycles):
     """When the newest drum clean finished, as a UTC ISO string; "" when none is on record.
 
-    Miele's monthly drum clean is a Bomuld 90 wash. Energy use cannot tell 90 from 60, so only a
-    completed cycle a person confirmed as Bomuld 90 counts, timed at its effective end.
+    Miele's monthly drum clean is a Bomuld 90 run with an empty drum, recorded as its own
+    programme. Energy use cannot tell it from a laundry Bomuld 60 or 90, so only a completed cycle
+    a person confirmed as a drum clean counts, timed at its effective end.
     """
     newest = None
     for rec in cycles or []:
         if not isinstance(rec, dict) or rec.get("programme_user_confirmed") is not True:
             continue
-        if rec.get("completion_class") != "completed" or rec.get("confirmed") != "bomuld":
-            continue
-        if wcls.temp_for_storage(rec.get("confirmed_temperature")) != "90":
+        if rec.get("completion_class") != "completed" or rec.get("confirmed") != wp.DRUM_CLEAN:
             continue
         try:
             ended = datetime.fromisoformat(str(rec.get("effective_end_at") or rec.get("ts")))
@@ -182,7 +181,9 @@ def aggregate_cycles(cycles, profiles: dict):
     centroids.
 
     Only user-confirmed, valid_for_learning records count - an unconfirmed guess can
-    carry a wrong programme, and a quarantined record a wrong duration.
+    carry a wrong programme, and a quarantined record a wrong duration. A drum clean
+    keeps its own duration bucket but is never a centroid: its energy signature is a
+    laundry Bomuld 60 or 90's, so the classifier must never answer it.
 
     Returns (buckets, centroids, skipped_unconfirmed) where buckets is
     {"prog|temp": {"durations": [...], "correct": int, "total": int, "prog":, "temp":}}
@@ -223,7 +224,7 @@ def aggregate_cycles(cycles, profiles: dict):
             buckets[learn_key]["correct"] += 1
 
         profile = wp.get_profile(profiles, confirmed, conf_temp)
-        if profile.get("heats") and dur and dur > 0:
+        if profile.get("heats") and dur and dur > 0 and confirmed != wp.DRUM_CLEAN:
             energy_kwh = rec.get("energy_kwh")
             bursts = rec.get("heating_bursts")
             if isinstance(energy_kwh, (int, float)) and energy_kwh >= 0:

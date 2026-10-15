@@ -17,6 +17,7 @@ import yaml
 APPS = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(APPS / "home_pulse"))
 sys.path.insert(0, str(APPS / "climate"))
+sys.path.insert(0, str(APPS / "appliances"))
 _hassapi = types.ModuleType("appdaemon.plugins.hass.hassapi")
 _hassapi.Hass = object
 for _name, _mod in (
@@ -227,7 +228,7 @@ class AcquisitionTests(unittest.TestCase):
         self.assertNotIn("maint:washer:drum", rows(app))
         washer = app.states["sensor.washer_state"]
         fire(app, "sensor.washer_state", {**washer, "attributes": {"last_drum_clean": iso(NOW - 40 * 24 * HOUR)}})
-        self.assertEqual(rows(app)["maint:washer:drum"]["detail"], "Bomuld 90 monthly, last 04.09")
+        self.assertEqual(rows(app)["maint:washer:drum"]["detail"], "Bomuld 90, empty + a little powder, last 04.09")
         self.assertIn(("sensor.washer_state", {"attribute": "all"}), app.listened)
 
     def test_washer_state_without_the_attribute_keeps_the_last_value_seen(self):
@@ -338,10 +339,15 @@ class RainTests(unittest.TestCase):
 
 
 class DrumStartTests(unittest.TestCase):
-    """At 12:30 on 14.10, before and after the next day's prices are out; Bomuld 60 stands in for 90."""
+    """At 12:30 on 14.10, before and after the next day's prices are out; Bomuld 60 stands in until a
+    drum clean profile is published."""
 
-    PROFILES = {"schema": 1, "appliances": {"washer": {"programmes": [
-        {"key": "bomuld_60", "label": "Bomuld 60", "n": 25, "p": ",".join(["100"] * 120)}]}}}
+    BOMULD_60 = {"key": "bomuld_60", "label": "Bomuld 60", "n": 25, "p": ",".join(["100"] * 120)}
+    DRUM_CLEAN = {"key": "drum_clean", "label": "Drum clean", "n": 5, "p": ",".join(["250"] * 60)}
+
+    @staticmethod
+    def profiles(*programmes):
+        return full("x", {"schema": 1, "appliances": {"washer": {"programmes": list(programmes)}}})
 
     @staticmethod
     def prices(today, tomorrow, valid):
@@ -351,28 +357,49 @@ class DrumStartTests(unittest.TestCase):
         return full("2.0", {"raw_today": points(14, today), "raw_tomorrow": points(15, tomorrow),
                             "tomorrow_valid": valid})
 
-    def test_the_row_moves_to_tomorrow_once_its_prices_are_out(self):
+    def states(self, *programmes):
         states = base_states()
         states["sensor.washer_state"] = full("Off", {"last_drum_clean": ""})
-        states["sensor.appliance_run_profiles"] = full("x", self.PROFILES)
+        states["sensor.appliance_run_profiles"] = self.profiles(*(programmes or (self.BOMULD_60,)))
+        return states
+
+    def test_the_row_moves_to_tomorrow_once_its_prices_are_out(self):
+        states = self.states()
         states["sensor.energi_data_service"] = self.prices({20, 21}, {3, 4}, False)
         app = make_app(states)
         row = rows(app)["maint:washer:drum"]
         self.assertEqual((row["at"], row["detail"]),
-                         ("2026-10-14T18:00:00+00:00", "cheapest start 20:00 - saves 1,80 kr vs now, last unknown"))
+                         ("2026-10-14T18:00:00+00:00", "Bomuld 90, empty + a little powder, saves 1,80 kr vs now"))
+        self.assertNotIn("next", row)
         self.assertIn(("sensor.energi_data_service", {"attribute": "all"}), app.listened)
         fire(app, "sensor.energi_data_service", self.prices({20}, {3, 4}, True))
         row = rows(app)["maint:washer:drum"]
         self.assertEqual((row["at"], row["detail"]),
-                         ("2026-10-15T01:00:00+00:00", "cheapest start 03:00 - saves 1,80 kr vs now, last unknown"))
+                         ("2026-10-15T01:00:00+00:00", "Bomuld 90, empty + a little powder, saves 1,80 kr vs now"))
+
+    def test_a_published_drum_clean_profile_prices_the_row(self):
+        states = self.states(self.BOMULD_60, self.DRUM_CLEAN)
+        states["sensor.energi_data_service"] = self.prices({20, 21}, {}, False)
+        row = rows(make_app(states))["maint:washer:drum"]
+        self.assertEqual((row["at"], row["detail"]),
+                         ("2026-10-14T18:00:00+00:00", "Bomuld 90, empty + a little powder, saves 2,25 kr vs now"))
+
+    def test_cheapest_now_times_the_row_at_now_and_out_of_the_next_chip(self):
+        states = self.states()
+        states["sensor.energi_data_service"] = self.prices({12, 13, 14}, {}, False)
+        app = make_app(states)
+        row = rows(app)["maint:washer:drum"]
+        self.assertEqual((row["at"], row["detail"], row["next"]),
+                         (core.utc_iso(NOW), "Bomuld 90, empty + a little powder, cheapest now", "skip"))
+        tick(app, HOUR)
+        row = rows(app)["maint:washer:drum"]
+        self.assertEqual((row["at"], row["next"]), (core.utc_iso(NOW + HOUR), "skip"))
 
     def test_without_prices_the_row_stays_untimed(self):
-        states = base_states()
-        states["sensor.washer_state"] = full("Off", {"last_drum_clean": ""})
-        states["sensor.appliance_run_profiles"] = full("x", self.PROFILES)
-        row = rows(make_app(states))["maint:washer:drum"]
-        self.assertEqual(row["detail"], "Bomuld 90 monthly, last unknown")
+        row = rows(make_app(self.states()))["maint:washer:drum"]
+        self.assertEqual(row["detail"], "Bomuld 90, empty + a little powder, last unknown")
         self.assertNotIn("at", row)
+        self.assertNotIn("next", row)
 
 
 class TrainTests(unittest.TestCase):

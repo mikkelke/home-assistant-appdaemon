@@ -17,8 +17,11 @@ import copy
 # UI matrix: allowed_temperatures, allowed_spin_speeds, default_temperature, default_spin, available_options (canonical values only).
 PROGRAMME_DISPLAY_ORDER = [
     "ekspres", "uld", "bomuld", "finvask", "strygelet", "eco",
-    "morkt_denim", "outdoor", "impraegnering", "pumpe_centrifugering", "kun_skyl_stivelse",
+    "morkt_denim", "outdoor", "impraegnering", "pumpe_centrifugering", "kun_skyl_stivelse", "drum_clean",
 ]
+# Miele's monthly drum clean: Bomuld 90 run empty. Its own programme, so drum cleans and laundry
+# never mix (washer_feedback.last_drum_clean and aggregate_cycles, run_profile_model.NOT_TYPICAL).
+DRUM_CLEAN = "drum_clean"
 CANONICAL_SPIN = ["1400 rpm", "1200 rpm", "900 rpm", "700 rpm", "No spin"]
 SPIN_MAX_1200 = ["1200 rpm", "900 rpm", "700 rpm", "No spin"]   # Manual: Strygelet, Uld, Ekspres, Mørkt/Denim, Imprægnering
 SPIN_MAX_900 = ["900 rpm", "700 rpm", "No spin"]                 # Manual: Finvask, Outdoor
@@ -83,6 +86,7 @@ DEFAULT_PROFILES = {
     "impraegnering": {"label": "Imprægnering", "default_temp": None, "allowed_temperatures": [], "default_temperature": None, "allowed_spin_speeds": SPIN_MAX_1200, "default_spin": "1200 rpm", "available_options": [], "duration_min":  25, "max_energy_kwh": 0.15, "heats": False, "stable_min":  8, "max_dur_min":  35, "supports_anti_crease": True},
     "pumpe_centrifugering": {"label": "Pumpe/Centrifugering", "default_temp": None, "allowed_temperatures": [], "default_temperature": None, "allowed_spin_speeds": CANONICAL_SPIN, "default_spin": "1400 rpm", "available_options": [], "duration_min":  10, "max_energy_kwh": 0.08, "heats": False, "stable_min":  5, "max_dur_min":  20, "supports_anti_crease": False},
     "kun_skyl_stivelse": {"label": "Kun skyl/stivelse", "default_temp": None, "allowed_temperatures": [], "default_temperature": None, "allowed_spin_speeds": CANONICAL_SPIN, "default_spin": "1400 rpm", "available_options": [], "duration_min":  30, "max_energy_kwh": 0.12, "heats": False, "stable_min":  8, "max_dur_min":  45, "supports_anti_crease": True},
+    "drum_clean": {"label": "Drum clean", "default_temp": None, "allowed_temperatures": [], "default_temperature": None, "allowed_spin_speeds": CANONICAL_SPIN, "default_spin": "1400 rpm", "available_options": [], "duration_min": 160, "max_energy_kwh": 2.20, "heats":  True, "stable_min": 15, "max_dur_min": 195, "supports_anti_crease": True},  # Bomuld 90's envelope
     "unknown":   {"label": "Unknown",   "default_temp": None,   "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C", "60°C", "90°C"], "allowed_spin_speeds": CANONICAL_SPIN, "default_temperature": None, "default_spin": "1400 rpm", "available_options": [], "duration_min": 180, "max_energy_kwh": 2.50, "heats":  None, "stable_min": 15, "max_dur_min": 240, "supports_anti_crease": True},
 }
 
@@ -109,6 +113,7 @@ LABEL_TO_KEY = {
     "Imprægnering": "impraegnering",
     "Pumpe/Centrifugering": "pumpe_centrifugering",
     "Kun skyl/stivelse": "kun_skyl_stivelse",
+    "Drum clean": "drum_clean",
     # Legacy options with temperature suffix (backwards compatibility)
     "Ekspres 20":   "ekspres",
     "Uld 30":       "uld",

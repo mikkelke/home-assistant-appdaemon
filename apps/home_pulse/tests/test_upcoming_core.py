@@ -43,6 +43,11 @@ class MakeRowTests(unittest.TestCase):
         row = core.make_row("rain:terrace", "rain", "Rain forecast", "", chip="", audience_users=["", " "])
         self.assertEqual(set(row), {"id", "kind", "icon", "title"})
 
+    def test_a_row_the_next_chip_skips(self):
+        row = core.make_row("maint:washer:drum", "maint", "Washer drum clean", at=NOW, audience="admin", skip_next=True)
+        self.assertEqual(row["next"], "skip")
+        self.assertTrue(core.is_valid_row(row))
+
 
 class ValidRowTests(unittest.TestCase):
     def valid(self, **extra):
@@ -67,6 +72,11 @@ class ValidRowTests(unittest.TestCase):
         self.assertTrue(self.valid(audience_users=["Kristine"]))
         self.assertFalse(self.valid(audience_users=[]))
         self.assertFalse(self.valid(audience="admin", audience_users=["Kristine"]))
+
+    def test_next_is_skip_or_absent(self):
+        self.assertTrue(self.valid(next="skip"))
+        for bad in ("true", "", "Skip", True):
+            self.assertFalse(self.valid(next=bad), bad)
 
     def test_maintenance_rows_must_be_admin(self):
         row = {"id": "maint:rober2:filter", "kind": "maint", "icon": "mdi:robot-vacuum", "title": "Rober2 filter"}

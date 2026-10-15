@@ -488,6 +488,10 @@ washer_monitor:
   # code change.
   confirm_push_target_actor: true
   confirm_push_dashboard_uri: "/dashboard-rooftop/home#room=guest_bathroom"   # "Other..." / "Choose in dashboard" button
+  # While the monthly drum clean is due (drum_clean.py, the rule HouseUpcoming's drum row uses), the
+  # confirm push gets a "Drum clean" button on these people's phones only; every other phone gets
+  # the buttons above. A drum clean that is not due is marked in the dashboard's programme picker.
+  confirm_push_drum_clean_audience: ["mikkel"]
 
   # ============================================================================
   # SETTLED PER-CYCLE COST

@@ -67,6 +67,7 @@ import washer_power as wpow
 import washer_plug as wplug
 import washer_profiles as wp
 import cycle_store as cystore
+import drum_clean
 
 # Shared save/restore-snapshot/staleness-check plumbing for the on-disk store above - see
 # cycle_persistence.py's module docstring for the split between what it owns and what stays
@@ -795,6 +796,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # revertible without a code change.
         self.confirm_push_target_actor = bool(self.args.get("confirm_push_target_actor", True))
         self.confirm_push_dashboard_uri = self.args.get("confirm_push_dashboard_uri", "/dashboard-rooftop/home#room=guest_bathroom")
+        self.confirm_push_drum_clean_audience = list(self.args.get("confirm_push_drum_clean_audience", ["mikkel"]))
 
         # Get Sonos Notifier App instance
         self.sonos_notifier = None
@@ -5190,10 +5192,23 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 data={"data": {"actions": actions, "tag": "washer_confirm"}},
                 category="washer_confirm",
                 link=wfb.confirm_push_link(ts),
+                per_person_actions=self._drum_clean_actions(ts, actions),
             ))
             self.log(f"Confirm push sent for cycle ts={ts} predicted={predicted} target={target}", level="INFO")
         except Exception as e:
             self.log(f"Could not send confirm push: {e}", level="WARNING")
+
+    def _drum_clean_actions(self, ts, actions):
+        """MobileNotifier per_person_actions for the confirm push of record `ts`: while a drum clean is
+        due, the phones of confirm_push_drum_clean_audience get a "Drum clean" button before the last
+        one, every other phone gets `actions`. None while no drum clean is due."""
+        last = self._drum_clean_attr()
+        if not drum_clean.due(datetime.fromisoformat(last) if last else None, self._now_utc()):
+            return None
+        button = {"action": self._encode_confirm_action(ts, wp.DRUM_CLEAN, None),
+                  "title": self._get_profile(wp.DRUM_CLEAN).get("label", wp.DRUM_CLEAN)}
+        with_button = actions[:-1] + [button] + actions[-1:]
+        return lambda person: with_button if person in self.confirm_push_drum_clean_audience else actions
 
     def _confirm_push_target_for(self, record: dict):
         """Same target resolution _send_confirm_push uses, so a dismiss (clear_notification)
@@ -5350,8 +5365,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         rec["programme_user_confirmed"] = True
         if confirmed_by:
             rec["confirmed_by"] = confirmed_by
-        # Optionally correct confirmed programme if user set something different
-        temp_stored = self._temp_for_storage(temp)
+        # Optionally correct confirmed programme if user set something different. Only programmes with a
+        # temperature dimension keep one, as on a saved record (learning and run profiles key on it).
+        temp_stored = self._temp_for_storage(temp) if self._programme_has_temperature(prog_key) else None
         if rec.get("confirmed") != prog_key or rec.get("confirmed_temperature") != temp_stored:
             rec["confirmed"] = prog_key
             rec["confirmed_temperature"] = temp_stored

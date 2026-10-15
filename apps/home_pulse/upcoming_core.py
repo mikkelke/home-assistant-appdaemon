@@ -8,7 +8,8 @@ Entity shape:
 
 Row fields: ``id`` (stable), ``kind`` (rain | train | maint), ``at`` (UTC ISO, absent =
 untimed), ``icon``, ``title``, ``detail``, ``chip``, ``area`` (HA area id a tap opens),
-``audience`` ("admin") or ``audience_users`` (HA display names).
+``audience`` ("admin") or ``audience_users`` (HA display names), ``next`` ("skip": the
+dashboard's next chip passes the row over).
 
 Every value is a string or a list of strings: AppDaemon 4.5.13 drops None, False and 0 from
 set_state attributes at any depth and turns True into "true".
@@ -28,7 +29,7 @@ BATTERY_ID_PREFIX = "maint:battery:"
 OVERFLOW_ID = "maint:more"
 
 _SPACE = re.compile(r"\s+")
-_FIELDS = ("id", "kind", "at", "icon", "title", "detail", "chip", "area", "audience", "audience_users")
+_FIELDS = ("id", "kind", "at", "icon", "title", "detail", "chip", "area", "audience", "audience_users", "next")
 
 
 def clean_text(value, limit=TEXT_MAX):
@@ -44,7 +45,7 @@ def utc_iso(dt):
 
 
 def make_row(row_id, kind, title, detail="", *, at=None, icon="mdi:information-outline", area=None, chip=None,
-             audience=None, audience_users=None):
+             audience=None, audience_users=None, skip_next=False):
     row = {"id": row_id, "kind": kind, "icon": icon, "title": clean_text(title)}
     detail = clean_text(detail)
     if detail:
@@ -63,6 +64,8 @@ def make_row(row_id, kind, title, detail="", *, at=None, icon="mdi:information-o
         names = [name for name in names if name]
         if names:
             row["audience_users"] = names
+    if skip_next:
+        row["next"] = "skip"
     return row
 
 
@@ -82,6 +85,8 @@ def is_valid_row(row):
         if key in row and (not row[key] or not _is_ascii_text(row[key], limit)):
             return False
     if "audience" in row and row["audience"] != "admin":
+        return False
+    if "next" in row and row["next"] != "skip":
         return False
     if "audience_users" in row:
         users = row["audience_users"]

@@ -35,6 +35,7 @@ programme_display_order:
   - impraegnering
   - pumpe_centrifugering
   - kun_skyl_stivelse
+  - drum_clean
 
 programmes:
   uld:
@@ -283,6 +284,30 @@ programmes:
     nominal_energy_kwh: 0.12
     min_valid_energy_kwh: 0.05
     max_valid_energy_kwh: 0.12
+    supports_anti_crease: true
+    supports_water_plus: false
+    supports_soak: false
+    supports_prewash: false
+    supports_short: false
+
+  # Miele's monthly drum clean (docs/miele-wea035-washer.md: Bomuld 90 °C monthly), run with an empty
+  # drum. On the machine it is Bomuld at 90 °C; here it is its own programme so its records never
+  # count as laundry. Duration and energy bands are Bomuld 90's.
+  drum_clean:
+    label: "Drum clean"
+    allowed_temperatures: []
+    default_temperature: null
+    allowed_spin_speeds: ["1400 rpm", "1200 rpm", "900 rpm", "600 rpm", "No spin"]
+    default_spin: "1400 rpm"
+    available_options: []
+    duration_min: 160
+    max_dur_min: 195
+    nominal_duration_min: 160
+    min_valid_duration_min: 104
+    max_valid_duration_min: 195
+    max_energy_kwh: 2.20
+    min_valid_energy_kwh: 0.1
+    max_valid_energy_kwh: 2.20
     supports_anti_crease: true
     supports_water_plus: false
     supports_soak: false

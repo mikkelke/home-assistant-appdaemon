@@ -112,6 +112,7 @@ def make_full_init_app(
     now=NOW,
     extra_args=None,
     get_history_fn=None,
+    call_service_fn=None,
 ):
     """WasherMonitor with initialize() run for real, end to end - including the real
     _restore_running_state, _resolve_store_candidate, _infer_boot_start_time_from_history and
@@ -246,7 +247,7 @@ def make_full_init_app(
     app.cancel_timer = lambda handle: None
     app.listen_state = lambda *a, **kw: None
     app.listen_event = lambda *a, **kw: None
-    app.call_service = lambda *a, **kw: None
+    app.call_service = call_service_fn or (lambda *a, **kw: None)
     app.get_app = lambda name: None
 
     app.initialize()
