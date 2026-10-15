@@ -59,6 +59,9 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from cycle_persistence import CyclePersistenceMixin
 
+# Atomic writes of the feedback file, and the history set aside when it cannot be read.
+import feedback_io
+
 
 class DryerMonitor(CyclePersistenceMixin, hass.Hass):
     PROGRAMME_PROFILES = {}
@@ -1468,18 +1471,13 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
             record["idle_min"] = round(idle_min, 1)
         record["started_by"] = (self._cycle_actor or {}).get("person")
         record["attribution"] = {"start": self._cycle_actor}
-        data = {"version": 2, "cycles": []}
-        if os.path.exists(self.feedback_file):
-            try:
-                with open(self.feedback_file, "r") as f:
-                    data = json.load(f)
-            except Exception:
-                pass
+        data = feedback_io.load_for_append(self.feedback_file, self.log)
+        if data is None:
+            return
         data["version"] = 2
         data.setdefault("cycles", []).append(record)
         try:
-            with open(self.feedback_file, "w") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            feedback_io.write_json(self.feedback_file, data)
         except Exception as e:
             self.log(f"Could not write feedback {self.feedback_file}: {e}", level="WARNING")
             return
@@ -2533,8 +2531,7 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
                     rec[key].update(value)
                 else:
                     rec[key] = value
-            with open(self.feedback_file, "w") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            feedback_io.write_json(self.feedback_file, data)
             self.log(f"Cycle record patch: updated {sorted(updates)} on ts={rec.get('ts')}", level="DEBUG")
         except Exception as e:
             self.log(f"Cycle record patch failed: {e}", level="WARNING")

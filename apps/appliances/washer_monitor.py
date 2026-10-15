@@ -68,6 +68,7 @@ import washer_plug as wplug
 import washer_profiles as wp
 import cycle_store as cystore
 import drum_clean
+import feedback_io
 import run_ledger
 
 # Shared save/restore-snapshot/staleness-check plumbing for the on-disk store above - see
@@ -2982,8 +2983,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         energy_kwh = removed.get("energy_kwh", 0)
         heating_bursts = removed.get("heating_bursts", 0)
         try:
-            with open(self.feedback_file, "w") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            feedback_io.write_json(self.feedback_file, data)
             self.log(f"Removed false cycle from feedback (was {duration_min:.0f}min, {confirmed})", level="INFO")
             self._reload_learning(data["cycles"])
         except Exception as e:
@@ -4660,8 +4660,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         counts = wfb.migrate_records(cycles, self._classify_cycle_completion)
         if counts.get("unchanged", 0) != len(cycles):
             try:
-                with open(path, "w") as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
+                feedback_io.write_json(path, data)
                 self.log(f"Feedback records re-validated (validation v{wfb.VALIDATION_VERSION}): {counts}", level="INFO")
             except Exception as e:
                 self.log(f"Could not write migrated feedback file: {e}", level="WARNING")
@@ -4705,8 +4704,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             return
         data["migration_version"] = "1"
         try:
-            with open(path, "w") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            feedback_io.write_json(path, data)
         except Exception as e:
             self.log(f"Could not write migrated feedback: {e}", level="WARNING")
             return
@@ -4812,13 +4810,11 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         )
 
         if os.path.exists(self.feedback_file):
-            try:
-                with open(self.feedback_file, "r") as f:
-                    data = json.load(f)
-            except Exception:
-                data = {"version": 2, "cycles": []}
+            data = feedback_io.load_for_append(self.feedback_file, self.log)
+            if data is None:
+                return None
         else:
-            data = {"version": 2, "cycles": []}
+            data = feedback_io.new_history()
             self.log(f"Feedback file will be created at: {self.feedback_file}", level="INFO")
 
         data["version"] = 2
@@ -4846,8 +4842,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         data["cycles"].append(record)
 
         try:
-            with open(self.feedback_file, "w") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            feedback_io.write_json(self.feedback_file, data)
         except Exception as e:
             self.log(f"Could not write feedback file {self.feedback_file}: {e}", level="WARNING")
             return
@@ -4979,8 +4974,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         rec.setdefault("vibration", {})["unload_pulse_count"] = pulse_count
         rec["vibration"]["unload_window_min"] = 10
         try:
-            with open(self.feedback_file, "w") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            feedback_io.write_json(self.feedback_file, data)
         except Exception as e:
             self.log(f"Vibration unload patch: could not write feedback file: {e}", level="WARNING")
             return
@@ -5050,8 +5044,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             else:
                 rec[key] = value
         try:
-            with open(self.feedback_file, "w") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            feedback_io.write_json(self.feedback_file, data)
         except Exception as e:
             self.log(f"Cycle record patch: could not write feedback file: {e}", level="WARNING")
             return
@@ -5297,8 +5290,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         rec["validation_version"] = wfb.VALIDATION_VERSION
 
         try:
-            with open(self.feedback_file, "w") as f:
-                json.dump(fb_data, f, indent=2, ensure_ascii=False)
+            feedback_io.write_json(self.feedback_file, fb_data)
         except Exception as e:
             self.log(f"Could not write feedback file for confirm action: {e}", level="WARNING")
             return
@@ -5409,8 +5401,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         rec["validation_flags"] = classification["validation_flags"]
         rec["programme_key_used_for_validation"] = classification.get("programme_key_used_for_validation", "")
         try:
-            with open(self.feedback_file, "w") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            feedback_io.write_json(self.feedback_file, data)
         except Exception as e:
             self.log(f"Could not write feedback after user-confirm update: {e}", level="WARNING")
             return

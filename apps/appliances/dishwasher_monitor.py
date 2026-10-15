@@ -61,6 +61,7 @@ except ImportError:
 
 # Pure history/power-signal helpers shared with the washer (sibling-import modules; AppDaemon
 # puts app dirs on sys.path — same precedent washer_monitor.py already relies on).
+import feedback_io
 import washer_history as whist
 import washer_power as wpow
 
@@ -1806,8 +1807,7 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         else:
             record.pop("short", None)
         try:
-            with open(self.feedback_file, "w") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            feedback_io.write_json(self.feedback_file, data)
         except Exception as e:
             self.log(f"Could not write feedback to confirm the last run: {e}", level="WARNING")
             return
@@ -1856,19 +1856,14 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             record["end_reason"] = end_reason
         if idle_min is not None and idle_min >= 0:
             record["idle_min"] = round(idle_min, 1)
-        data = {"version": 2, "cycles": []}
-        if os.path.exists(self.feedback_file):
-            try:
-                with open(self.feedback_file, "r") as f:
-                    data = json.load(f)
-            except Exception:
-                pass
+        data = feedback_io.load_for_append(self.feedback_file, self.log)
+        if data is None:
+            return
         data["version"] = 2
         data.setdefault("cycles", []).append(record)
         path = os.path.abspath(self.feedback_file)
         try:
-            with open(self.feedback_file, "w") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            feedback_io.write_json(self.feedback_file, data)
         except Exception as e:
             self.log(f"Could not write feedback to {path}: {e}", level="WARNING")
             return
@@ -1919,8 +1914,7 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
                     avg_new = (old["avg"] * old["n"] - duration_min) / n
                     self._learned_durations[key] = {"n": n, "avg": avg_new}
         try:
-            with open(self.feedback_file, "w") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            feedback_io.write_json(self.feedback_file, data)
         except Exception as e:
             self.log(f"Could not write feedback after recovery: {e}", level="WARNING")
         self.log(f"Removed false cycle from feedback ({duration_min:.0f}min, {confirmed})", level="INFO")
@@ -1941,8 +1935,7 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             return
         cycles[-1]["emptied_ts"] = self._format_local(self._now_utc())
         try:
-            with open(self.feedback_file, "w") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            feedback_io.write_json(self.feedback_file, data)
         except Exception as e:
             self.log(f"Could not write emptied_ts to feedback: {e}", level="DEBUG")
 
@@ -3056,8 +3049,7 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             return
         cycles[-1].pop("emptied_ts", None)
         try:
-            with open(self.feedback_file, "w") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            feedback_io.write_json(self.feedback_file, data)
         except Exception:
             pass
 
