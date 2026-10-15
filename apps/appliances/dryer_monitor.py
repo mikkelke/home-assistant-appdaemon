@@ -63,6 +63,14 @@ except ImportError:
 class DryerMonitor(CyclePersistenceMixin, hass.Hass):
     PROGRAMME_PROFILES = {}
 
+    # Attribution state (see _attribute), class-level so it also exists before initialize().
+    _cycle_actor = None  # ActorAttribution result for whoever started the current cycle
+    _last_saved_record_ts = None  # ts of the newest feedback record this process saved
+    last_door_closed_at = None  # UTC of the last on->off door edge, consumed by the next start
+    # The start is anchored on the door close that loaded the drum, which can precede the power
+    # edge by hours on a delayed start; a close older than this is not trusted.
+    LOAD_ANCHOR_MAX_AGE_S = 12 * 3600
+
     def _safe_cancel_timer(self, handle):
         """Cancel a timer only if still running (avoids invalid-handle warnings)."""
         try:
@@ -119,6 +127,8 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
             "keep_fresh_detected": lambda: self.keep_fresh_detected,
             "high_power_counter": lambda: self.high_power_counter,
             "notification_sent": lambda: self.notification_sent,
+            "started_by": lambda: (self._cycle_actor or {}).get("person"),
+            "started_by_method": lambda: (self._cycle_actor or {}).get("method"),
         }
 
     def initialize(self):
@@ -441,6 +451,8 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
         # would get via _should_change_state.
         if self.state != "Off" and self.state_since is None:
             self.state_since = self._now_utc()
+        if self.state != "Off":
+            self._cycle_actor = self._restored_cycle_actor()
         self._set_state_entity( state=self.state)
 
         # If we restored Running/Paused, restore start_time and timers so we keep polling
@@ -635,7 +647,7 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
                             )
                             if gate == "door-edge":
                                 self._transition_to_emptied(
-                                    "Door opened during the outage - already emptied"
+                                    "Door opened during the outage - already emptied", observed=False
                                 )
                             elif gate == "late-push" and became_unemptied:
                                 self._push_mobile(
@@ -1126,6 +1138,7 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
             "estimated_end_time": self._format_utc(eta) if eta else None,
             "energy_at_start": self.energy_start,
             "energy_used": round(self._get_energy_used(), 3),
+            **self._started_by_attrs(),
         }
         if overrun > 0:
             attrs["overrun_min"] = round(overrun, 1)
@@ -1453,6 +1466,8 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
             record["end_reason"] = end_reason
         if idle_min is not None and idle_min >= 0:
             record["idle_min"] = round(idle_min, 1)
+        record["started_by"] = (self._cycle_actor or {}).get("person")
+        record["attribution"] = {"start": self._cycle_actor}
         data = {"version": 2, "cycles": []}
         if os.path.exists(self.feedback_file):
             try:
@@ -1469,6 +1484,7 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
             self.log(f"Could not write feedback {self.feedback_file}: {e}", level="WARNING")
             return
         self._feedback_saved_cycle_id = current_cycle_id  # mark this cycle done - see the guard above
+        self._last_saved_record_ts = record["ts"]
         if programme_confirmed_by_human:
             prev = self._learned_durations.get(confirmed, {"n": 0, "avg": duration_min})
             n_new = prev["n"] + 1
@@ -1511,6 +1527,8 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
         if new == "on":  # Door opened
             self._handle_door_opened(current_state)
         elif new == "off":  # Door closed
+            if old == "on":
+                self.last_door_closed_at = self._now_utc()
             self._handle_door_closed(current_state)
 
     def _handle_door_opened(self, current_state):
@@ -1811,6 +1829,7 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
                 "cycle_complete": True,
                 "run_time_minutes": round(run_minutes, 1),
                 "derived_programme_key": effective_key,
+                **self._started_by_attrs(),
             }
             if energy_used > 0:
                 attributes["energy_used"] = round(energy_used, 3)
@@ -1863,7 +1882,8 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
         self._force_emptied(reason)
 
     def _on_emptied_button(self, event_name, data, kwargs):
-        """input_button.dryer_emptied press: dryer_force_emptied for every housemate.
+        """input_button.dryer_emptied press: dryer_force_emptied for every housemate. Raw
+        state_changed rather than listen_state, so context.user_id (who tapped) survives.
 
         After an HA restart input_button.* goes unavailable, then restores its last press
         timestamp - that restore is a state_changed event too and must never be read as a
@@ -1878,9 +1898,10 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
             return
         if old_state_raw is None or old in (None, "unknown", "unavailable"):
             return
-        self._force_emptied("Dashboard button")
+        user_id = (new_state.get("context") or {}).get("user_id")
+        self._force_emptied("Dashboard button", actor_user_id=user_id)
 
-    def _force_emptied(self, reason):
+    def _force_emptied(self, reason, actor_user_id=None):
         """Shared body for dryer_force_emptied and the input_button press. Only honored from
         Unemptied - any earlier state may still be a live cycle."""
         if self.state != "Unemptied":
@@ -1890,16 +1911,25 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
             )
             return
         self.log(f"Force Emptied via event ({reason})", level="INFO")
-        self._transition_to_emptied(f"Forced emptied ({reason})")
+        self._transition_to_emptied(f"Forced emptied ({reason})", actor_user_id=actor_user_id)
 
-    def _transition_to_emptied(self, reason):
+    def _transition_to_emptied(self, reason, actor_user_id=None, observed=True):
         """Transition to Emptied state (door open, user is emptying).
+
+        actor_user_id: context.user_id of a dashboard tap, passed through to ActorAttribution.
+        observed=False: the emptying happened at an unknown earlier time (found in history after
+        an outage), so nobody is named and no feedback record is patched.
 
         Returns True/False from _should_change_state - same silent-refusal shape as
         _transition_to_unemptied (see its docstring for why that return value matters there);
         no caller here currently needs it.
         """
         if self._should_change_state("Emptied", force=True):  # Door event bypasses cooling
+            if observed:
+                actor_empty = self._attribute("dryer_emptied", user_id=actor_user_id)
+            else:
+                actor_empty = self._unknown_actor("not_observed")
+            self.log(f"Emptied attribution: {actor_empty}", level="INFO")
             energy_used = self._get_energy_used()
             run_minutes = self._get_run_duration_minutes()
 
@@ -1910,6 +1940,9 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
                 "reason": reason,
                 "run_time_minutes": round(run_minutes, 1) if run_minutes > 0 else None,
                 "derived_programme_key": effective_key,
+                **self._started_by_attrs(),
+                "emptied_by": actor_empty.get("person") or "",
+                "emptied_by_method": actor_empty.get("method") or "unknown",
             }
             if energy_used > 0:
                 attributes["energy_used"] = round(energy_used, 3)
@@ -1917,6 +1950,13 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
                 attributes["keep_fresh_detected"] = True
 
             self._set_state_entity( state="Emptied", attributes=attributes, replace=True)
+
+            if observed:
+                self._patch_cycle_record(self._last_saved_record_ts, {
+                    "emptied_by": actor_empty.get("person"),
+                    "emptied_ts": self._format_local(self._now_utc()),
+                    "attribution": {"empty": actor_empty},
+                })
 
             # Cancel unemptied watchdog since we're now emptying
             self._safe_cancel_timer(self.unemptied_watchdog_timer)
@@ -1946,6 +1986,7 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
     def _reset_cycle_tracking(self):
         """Reset all cycle-related tracking variables."""
         self.start_time = None
+        self._cycle_actor = None
         self.energy_start = None
         self.door_opened_time = None
         self.door_opened_during_cycle = False
@@ -2205,6 +2246,8 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
                 self.start_time = self._now_utc()
                 self.cycle_id = uuid.uuid4().hex  # fresh identity for a genuinely new cycle
                 self._feedback_saved_cycle_id = None  # new cycle - clear the duplicate-save guard
+                self._cycle_actor = self._attribute("dryer_start", at=self._take_load_anchor(self.start_time))
+                self.log(f"Start attribution: {self._cycle_actor}", level="INFO")
                 self.keep_fresh_detected = False
                 self.power_readings = []
                 self.notification_sent = False
@@ -2223,7 +2266,7 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
                 self.detected_programme = prog
                 effective_key = self._get_confirmed_programme_key() or prog
                 self.expected_dur_at_start = self._get_guard_duration(tick_prog=effective_key)
-                self._set_state_entity( state="Running")
+                self._set_state_entity( state="Running", attributes=self._started_by_attrs())
                 self._update_running_attributes()
 
                 if not self.poll_timer:
@@ -2393,3 +2436,105 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
             self.create_task(notifier.notify(title="Dryer", message=message, target=self.notify_target, link=link))
         except Exception as e:
             self.log(f"notify failed: {e}", level="WARNING")
+
+    # ----- Who started / emptied the load, via the ActorAttribution app -----
+    # get_app is resolved on every call and ActorAttribution is deliberately not a yaml
+    # `dependencies:` entry: that would reload this monitor, dropping live cycle state, whenever
+    # ActorAttribution reloads.
+
+    def _attribute(self, event, at=None, user_id=None) -> dict:
+        """ActorAttribution.attribute(event, at=, user_id=), or an unknown result of the same
+        shape on any failure, so attribution can never break a cycle."""
+        try:
+            app = self.get_app("ActorAttribution")
+        except Exception as e:
+            self.log(f"Could not resolve ActorAttribution for event={event!r}: {e}", level="WARNING")
+            return self._unknown_actor("attribution_error", at)
+        if app is None:
+            self.log(f"ActorAttribution app not found - cannot attribute event={event!r}", level="WARNING")
+            return self._unknown_actor("attribution_app_missing", at)
+        try:
+            result = app.attribute(event, at=at, user_id=user_id)
+        except Exception as e:
+            self.log(f"ActorAttribution.attribute raised for event={event!r}: {e}", level="WARNING")
+            return self._unknown_actor("attribution_error", at)
+        if not isinstance(result, dict):
+            self.log(f"ActorAttribution.attribute returned {type(result).__name__} for event={event!r}", level="WARNING")
+            return self._unknown_actor("attribution_error", at)
+        return result
+
+    def _unknown_actor(self, reason, at=None) -> dict:
+        now = self._now_utc()
+        return {
+            "person": None,
+            "method": "unknown",
+            "reason": reason,
+            "people_home": [],
+            "anchor": self._format_utc(at if at is not None else now),
+            "evaluated_at": self._format_utc(now),
+            "version": 1,
+        }
+
+    def _cycle_actor_from_state_attrs(self, attrs) -> dict:
+        """The starter rebuilt from a persisted started_by/started_by_method. "" reads as unknown:
+        AppDaemon drops None-valued attributes, so unknown is published as ""."""
+        result = self._unknown_actor("restored_from_entity")
+        result["person"] = attrs.get("started_by") or None
+        result["method"] = attrs.get("started_by_method") or "unknown"
+        return result
+
+    def _restored_cycle_actor(self) -> dict:
+        """Starter of the cycle restored at boot: from the state entity when it carries one, else
+        from the on-disk store (an HA restart erases the entity)."""
+        full = self._boot_full_state_snapshot()
+        attrs = (full.get("attributes") or {}) if isinstance(full, dict) else {}
+        source = attrs if attrs.get("started_by_method") else self._boot_store_snapshot()
+        return self._cycle_actor_from_state_attrs(source)
+
+    def _take_load_anchor(self, now):
+        """When this cycle was loaded: the last door close when it is at most
+        LOAD_ANCHOR_MAX_AGE_S old, else `now`. Consumes the close, so it anchors one cycle only."""
+        loaded_at, self.last_door_closed_at = self.last_door_closed_at, None
+        if loaded_at is not None and 0 <= (now - loaded_at).total_seconds() <= self.LOAD_ANCHOR_MAX_AGE_S:
+            return loaded_at
+        return now
+
+    def _started_by_attrs(self) -> dict:
+        actor = self._cycle_actor or {}
+        return {
+            "started_by": actor.get("person") or "",
+            "started_by_method": actor.get("method") or "unknown",
+        }
+
+    def _patch_cycle_record(self, ts, updates):
+        """Merge `updates` into the feedback record saved at `ts`, or into the newest record when
+        ts is None: Unemptied outlives restarts, and no later cycle can finish while this one sits
+        Unemptied. A record that already carries emptied_ts is never re-stamped, so a stale ts
+        cannot credit an older cycle and a repeated emptying is a no-op. Never raises."""
+        import json
+        try:
+            if not os.path.exists(self.feedback_file):
+                return
+            with open(self.feedback_file, "r") as f:
+                data = json.load(f)
+            cycles = data.get("cycles") or []
+            if ts:
+                rec = next((c for c in cycles if c.get("ts") == ts), None)
+            else:
+                rec = cycles[-1] if cycles else None
+            if rec is None:
+                self.log(f"Cycle record patch: no record for ts={ts!r} - skipping", level="WARNING" if ts else "DEBUG")
+                return
+            if "emptied_ts" in updates and rec.get("emptied_ts"):
+                self.log(f"Cycle record patch: ts={rec.get('ts')} already emptied - not re-stamping", level="DEBUG")
+                return
+            for key, value in updates.items():
+                if isinstance(value, dict) and isinstance(rec.get(key), dict):
+                    rec[key].update(value)
+                else:
+                    rec[key] = value
+            with open(self.feedback_file, "w") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            self.log(f"Cycle record patch: updated {sorted(updates)} on ts={rec.get('ts')}", level="DEBUG")
+        except Exception as e:
+            self.log(f"Cycle record patch failed: {e}", level="WARNING")
