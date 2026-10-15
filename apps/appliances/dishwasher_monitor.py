@@ -682,6 +682,10 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         # Listen for door opening AND closing
         self.listen_state(self._door_state_changed, self.door_sensor)
 
+        # A programme picked after the run has finished confirms that run's record
+        if self.confirmed_programme_entity:
+            self.listen_state(self._on_programme_picked, self.confirmed_programme_entity)
+
         # Listen for unavailable states
         self.listen_state(self._handle_unavailable, self.state_entity, new="unavailable")
         self.listen_state(self._handle_unavailable, self.power_sensor, new="unavailable")
@@ -1761,6 +1765,62 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         if key is None:
             return (predicted, False)
         return (key, True)
+
+    RECENT_RUN_HOURS = 12
+
+    def _on_programme_picked(self, entity, attribute, old, new, kwargs):
+        """A programme picked once the run has finished (Unemptied, Emptied, or Off within RECENT_RUN_HOURS
+        of its record) confirms the last feedback record, the way the washer's picker confirms its last
+        one. While the run is going the finish reads the selector itself; "—" and the start's reset to it
+        confirm nothing."""
+        key = self._SELECTOR_LABEL_TO_KEY.get(new)
+        state = self.get_state(self.state_entity)
+        if key is None or state not in ("Unemptied", "Emptied", "Off"):
+            return
+        import json
+        if not os.path.exists(self.feedback_file):
+            return
+        try:
+            with open(self.feedback_file, "r") as f:
+                data = json.load(f)
+        except Exception as e:
+            self.log(f"Could not read feedback to confirm the last run: {e}", level="WARNING")
+            return
+        cycles = data.get("cycles") or []
+        if not cycles:
+            return
+        record = cycles[-1]
+        if state == "Off":
+            saved = self._parse_record_ts(record.get("ts"))
+            if saved is None or (self._now_utc() - saved) > timedelta(hours=self.RECENT_RUN_HOURS):
+                return
+        if record.get("confirmed") == key and record.get("programme_confirmed_by_human"):
+            return
+        record["confirmed"] = key
+        record["programme_confirmed_by_human"] = True
+        record["programme_confirmed_via"] = "picked_after_finish"
+        if key == "eco":
+            record["short"] = self._eco_short_active()
+        elif key == "quick":
+            record["short"] = self._quick_short_active()
+        else:
+            record.pop("short", None)
+        try:
+            with open(self.feedback_file, "w") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.log(f"Could not write feedback to confirm the last run: {e}", level="WARNING")
+            return
+        self._load_and_apply_feedback()
+        self.log(f"Last run confirmed as {key} after it finished", level="INFO")
+
+    @staticmethod
+    def _parse_record_ts(value):
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
     def _save_cycle_feedback(
         self,
