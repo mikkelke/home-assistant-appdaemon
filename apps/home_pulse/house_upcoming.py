@@ -15,10 +15,12 @@ clean seen is kept while washer_state is missing or lacks it. HA restarts re-run
 plugin_started republishes.
 
 The daily history job also turns each device's recorder history into battery facts and a
-replace-by day, with the median lifetime of every device of the same model as the last resort.
+replace-by day, with the median lifetime of every device of the same model as the last resort, and
+Rober2's recent cleaning rate from its cumulative cleaning time, which dates each part's row before
+it is due.
 
-Latches, push keys and battery facts persist in house_upcoming_state.json next to this module; rain
-forecast fixtures go to house_upcoming_rain_fixtures.jsonl.
+Latches, push keys, battery facts and the cleaning rate persist in house_upcoming_state.json next to
+this module; rain forecast fixtures go to house_upcoming_rain_fixtures.jsonl.
 """
 
 import asyncio
@@ -69,6 +71,7 @@ class HouseUpcoming(hass.Hass):
             for part, _, _ in maint.ROBER2_PARTS
         }
         self.rober2_area = rober2.get("area", "kitchen")
+        self.rober2_cleaning = rober2.get("cleaning_time", "sensor.rober2_total_cleaning_time")
         washer = a.get("washer") or {}
         self.washer_entity = washer.get("entity", "sensor.washer_state")
         self.washer_area = washer.get("area", "guest_bathroom")
@@ -91,6 +94,8 @@ class HouseUpcoming(hass.Hass):
 
         saved = self._load_state()
         self._rober2 = dict(saved.get("rober2") or {})
+        rate = saved.get("rober2_rate")
+        self._rober2_rate = rate if isinstance(rate, (int, float)) and rate > 0 else maint.ROBER2_RATE_DEFAULT
         self._batteries = dict(saved.get("batteries") or {})
         self._pushed = dict(saved.get("pushed") or {})
         self._facts = dict(saved.get("facts") or {})
@@ -190,9 +195,10 @@ class HouseUpcoming(hass.Hass):
         now = self.get_now()
         rows, conditions = [], []
 
-        for part, entity in self.rober2_entities.items():
-            self._rober2[part] = maint.step_rober2(self._rober2.get(part), maint.reading(self._state_of(entity)), now)
-        found = maint.rober2_rows(self._rober2, self.rober2_area)
+        left = {part: maint.reading(self._state_of(entity)) for part, entity in self.rober2_entities.items()}
+        for part, seconds in left.items():
+            self._rober2[part] = maint.step_rober2(self._rober2.get(part), seconds, now)
+        found = maint.rober2_rows(self._rober2, self.rober2_area, left, self._rober2_rate, now)
         last_clean = (self._attributes(self.washer_entity) or {}).get("last_drum_clean")
         if isinstance(last_clean, str):
             self._drum_seen = last_clean
@@ -298,29 +304,40 @@ class HouseUpcoming(hass.Hass):
         except Exception as e:
             self.log(f"Rain fixture write failed: {e!r}", level="WARNING")
 
-    # -- battery history ------------------------------------------------------
+    # -- recorder history -----------------------------------------------------
+
+    async def _history_rows(self, entity, start, now):
+        """The recorder's rows for `entity` from `start` to `now`, or None when the read failed."""
+        try:
+            rows = await self.get_history(entity_id=entity, start_time=start, end_time=now, minimal_response=True,
+                                          no_attributes=True)
+        except Exception as e:
+            self.log(f"History of {entity} failed: {e!r}", level="WARNING")
+            return None
+        return [row for group in rows or [] for row in (group if isinstance(group, list) else [group])]
 
     async def _history_job(self, kwargs):
         now = await self.get_now()
         series, latest = {}, {}
         for entity in self.inventory["devices"]:
-            try:
-                rows = await self.get_history(entity_id=entity, start_time=self.history_start, end_time=now,
-                                              minimal_response=True, no_attributes=True)
-            except Exception as e:
-                self.log(f"History of {entity} failed: {e!r}", level="WARNING")
+            flat = await self._history_rows(entity, self.history_start, now)
+            if flat is None:
                 continue
-            flat = [row for group in rows or [] for row in (group if isinstance(group, list) else [group])]
             series[entity] = age.series_from_history(flat)
             if flat and isinstance(flat[-1], dict):
                 latest[entity] = flat[-1]
-        self._handoff["history"] = (now, series, latest)
+        cleaning = await self._history_rows(self.rober2_cleaning, now - maint.ROBER2_RATE_WINDOW, now)
+        rate = None if cleaning is None else maint.rober2_rate(age.series_from_history(cleaning), now)
+        self._handoff["history"] = (now, series, latest, rate)
         await self.run_in(self._apply_history, 0)
 
     def _apply_history(self, kwargs):
-        fetched, series_by_entity, latest = self._handoff.pop("history", (None, {}, {}))
+        fetched, series_by_entity, latest, rate = self._handoff.pop("history", (None, {}, {}, None))
         if fetched is None:
             return
+        if rate is not None:
+            self._rober2_rate = rate
+            self.log(f"Rober2 cleaning rate {rate:.0f} s a day")
         for entity, series in series_by_entity.items():
             device = self.inventory["devices"][entity]
             model = self.inventory["models"][device["model"]]
@@ -417,8 +434,9 @@ class HouseUpcoming(hass.Hass):
         return data if isinstance(data, dict) and data.get("version") == STATE_VERSION else {}
 
     def _save_state(self, force=False):
-        data = {"version": STATE_VERSION, "rober2": self._rober2, "batteries": self._batteries,
-                "pushed": self._pushed, "facts": self._facts, "content": self._content, "drum": self._drum_seen}
+        data = {"version": STATE_VERSION, "rober2": self._rober2, "rober2_rate": self._rober2_rate,
+                "batteries": self._batteries, "pushed": self._pushed, "facts": self._facts,
+                "content": self._content, "drum": self._drum_seen}
         text = json.dumps(data, sort_keys=True)
         if text == self._state_text:
             return

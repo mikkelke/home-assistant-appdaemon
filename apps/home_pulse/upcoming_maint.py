@@ -19,6 +19,11 @@ lifetime reads as approximate.
 
 Every condition carries a push key that is unique per episode; `pushed_by` models belong to another
 app's notifications and have none. A replace-by day alone is never pushed.
+
+A Rober2 part is due once it has no cleaning time left; that row carries the part's action and is
+pushed once per episode. Before that the part's row is timed at DUE_TIME on the day its cleaning time
+left runs out at the robot's recent cleaning rate. It reads as an estimate (~), is never pushed, and
+a part further out than ROBER2_HORIZON_DAYS has none.
 """
 
 import math
@@ -54,6 +59,11 @@ ROBER2_PARTS = (
     ("side_brush", "Rober2 side brush", "replace"),
     ("sensor", "Rober2 sensors", "clean"),
 )
+ROBER2_ICON = "mdi:robot-vacuum"
+ROBER2_RATE_WINDOW = timedelta(days=30)
+ROBER2_RATE_MIN_SPAN = timedelta(days=7)
+ROBER2_RATE_DEFAULT = 2900.0
+ROBER2_HORIZON_DAYS = 366
 
 DIGEST_TITLE = "Maintenance due"
 DIGEST_NAMES = 3
@@ -352,14 +362,45 @@ def step_rober2(st, seconds_left, now):
     return st
 
 
-def rober2_rows(states, area):
+def rober2_rate(series, now):
+    """Seconds of cleaning a day over the last ROBER2_RATE_WINDOW, from the robot's cumulative
+    cleaning time [(aware datetime, seconds or None)], oldest first, as the recorder holds it for that
+    window. A count that falls back adds nothing. ROBER2_RATE_DEFAULT when the readings cover less
+    than ROBER2_RATE_MIN_SPAN or show no cleaning."""
+    counts = [(when, value) for when, value in series if value is not None]
+    cleaned = sum(max(0.0, after - before) for (_, before), (_, after) in zip(counts, counts[1:]))
+    span = min(now - counts[0][0], ROBER2_RATE_WINDOW) if counts else timedelta(0)
+    if cleaned <= 0 or span < ROBER2_RATE_MIN_SPAN:
+        return ROBER2_RATE_DEFAULT
+    return cleaned / (span / timedelta(days=1))
+
+
+def rober2_day(seconds_left, rate, now):
+    """The house day `seconds_left` of cleaning time runs out at `rate` seconds of cleaning a day, or
+    None without a positive count, or when that day is further out than ROBER2_HORIZON_DAYS."""
+    if seconds_left is None or seconds_left <= 0:
+        return None
+    days = seconds_left / rate
+    return house_date(now + timedelta(days=days)) if days <= ROBER2_HORIZON_DAYS else None
+
+
+def rober2_rows(states, area, left, rate, now):
+    """[(row, push key)] for the Rober2 parts, at most one row per part: its due row, else one dated by
+    the cleaning time left in `left` (seconds by part) at `rate` seconds a day. Both share the part's
+    row id, so the due row takes over from the estimate; only the due row has a push key."""
     out = []
     for part, title, action in ROBER2_PARTS:
         since = (states.get(part) or {}).get("due_since")
         if since:
-            row = make_row(f"maint:rober2:{part}", "maint", title, action, icon="mdi:robot-vacuum", area=area,
-                           audience="admin")
-            out.append((row, f"rober2:{part}:{since}"))
+            detail, at, key = action, None, f"rober2:{part}:{since}"
+        else:
+            day = rober2_day(left.get(part), rate, now)
+            if day is None:
+                continue
+            detail, at, key = _due_text(action, day, True, now), datetime.combine(day, DUE_TIME, HOUSE_TZ), None
+        row = make_row(f"maint:rober2:{part}", "maint", title, detail, at=at, icon=ROBER2_ICON, area=area,
+                       audience="admin")
+        out.append((row, key))
     return out
 
 

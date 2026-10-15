@@ -19,6 +19,7 @@ HouseUpcoming:
   rober2:
     prefix: sensor.rober2_
     suffix: _time_left
+    cleaning_time: sensor.rober2_total_cleaning_time
     area: kitchen
   washer:
     entity: sensor.washer_state

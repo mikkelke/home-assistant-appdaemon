@@ -1,6 +1,7 @@
 # tests/test_house_upcoming.py - HouseUpcoming end to end on a fake AppDaemon surface, with the real
 # house_upcoming.yaml: lease, state acquisition, restart behaviour, the daily push, rain fetches,
-# the drum clean's cheapest start, the history job, replace-by days and the battery inventory.
+# the drum clean's cheapest start, the history job, replace-by days, Rober2's dated parts and the
+# battery inventory.
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
 import asyncio
@@ -180,7 +181,9 @@ class PublishTests(unittest.TestCase):
         self.assertTrue(published["replace"])
         attrs = published["attributes"]
         self.assertEqual(attrs["expires"], iso(NOW + 15 * MIN).replace("+00:00", "+00:00"))
-        self.assertEqual(set(rows(app)), {"maint:rober2:filter", "maint:washer:drum"})
+        self.assertEqual(set(rows(app)), {"maint:rober2:filter", "maint:rober2:main_brush", "maint:rober2:side_brush",
+                                          "maint:rober2:sensor", "maint:washer:drum"})
+        self.assertEqual(rows(app)["maint:rober2:filter"]["detail"], "replace")
         for row in attrs["rows"]:
             for value in row.values():
                 ok = isinstance(value, str) or (isinstance(value, list) and all(isinstance(v, str) for v in value))
@@ -203,9 +206,9 @@ class PublishTests(unittest.TestCase):
         app = make_app()
         app.fail_publish = 1
         fire(app, "sensor.rober2_sensor_time_left", full("-5"))
-        self.assertNotIn("maint:rober2:sensor", rows(app))
+        self.assertTrue(rows(app)["maint:rober2:sensor"]["detail"].startswith("clean by ~"))
         tick(app)
-        self.assertIn("maint:rober2:sensor", rows(app))
+        self.assertEqual(rows(app)["maint:rober2:sensor"]["detail"], "clean")
 
     def test_a_reload_without_events_publishes_the_same_rows_and_state(self):
         states = base_states()
@@ -494,6 +497,110 @@ class ReplaceByTests(unittest.TestCase):
                          "recharge by ~30.01.27 - 108 days, LADDA AAA NiMH")
         self.assertNotIn("maint:battery:sensor.kristines_room_presence_battery", shown)
         self.assertNotIn("maint:battery:sensor.yale_battery", shown)
+
+
+class Rober2EstimateTests(unittest.TestCase):
+    """Each part dated before it is due, by the cleaning rate the history job reads from the recorder."""
+
+    CLEANING = "sensor.rober2_total_cleaning_time"
+    LEFT = {"filter": 534003, "main_brush": 514101, "side_brush": 714003, "sensor": 102003}
+
+    def states(self):
+        states = base_states()
+        for part, seconds in self.LEFT.items():
+            states[f"sensor.rober2_{part}_time_left"] = full(str(seconds))
+        return states
+
+    def read_month(self, app, first="1041807", last_count="1131245"):
+        app.history[self.CLEANING] = [{"state": first, "last_changed": iso(NOW - 30 * 24 * HOUR)},
+                                      {"state": last_count, "last_changed": iso(NOW - HOUR)}]
+        asyncio.run(app._history_job({}))
+        drain(app)
+
+    def sensor_detail(self, app):
+        return rows(app)["maint:rober2:sensor"]["detail"]
+
+    def test_every_part_is_dated_by_the_default_rate_until_the_history_job_has_run(self):
+        app = make_app(self.states())
+        self.assertEqual({part: rows(app)[f"maint:rober2:{part}"]["detail"] for part in self.LEFT}, {
+            "filter": "replace by ~16.04.27 - 184 days", "main_brush": "replace by ~09.04.27 - 177 days",
+            "side_brush": "replace by ~17.06.27 - 246 days", "sensor": "clean by ~18.11 - 35 days"})
+        row = rows(app)["maint:rober2:sensor"]
+        self.assertEqual((row["title"], row["at"], row["icon"], row["area"], row["audience"]),
+                         ("Rober2 sensors", "2026-11-18T08:00:00+00:00", "mdi:robot-vacuum", "kitchen", "admin"))
+        self.assertEqual(app.rober2_cleaning, CONFIG["rober2"]["cleaning_time"])
+
+    def test_the_history_job_reads_the_last_thirty_days_and_the_rate_dates_the_rows(self):
+        app = make_app(self.states())
+        asked = []
+        inner = app.get_history
+
+        def get_history(entity_id=None, **kw):
+            asked.append((entity_id, kw["start_time"], kw["end_time"]))
+            return inner(entity_id=entity_id, **kw)
+
+        app.get_history = get_history
+        self.read_month(app)
+        self.assertIn((self.CLEANING, NOW - 30 * 24 * HOUR, NOW), asked)
+        self.assertAlmostEqual(app._rober2_rate, 89438 / 30)
+        self.assertEqual(self.sensor_detail(app), "clean by ~17.11 - 34 days")
+        self.assertIn(("INFO", "Rober2 cleaning rate 2981 s a day"), app.logs)
+
+    def test_a_month_without_cleaning_goes_back_to_the_default_rate(self):
+        app = make_app(self.states())
+        self.read_month(app)
+        self.read_month(app, first="1131245", last_count="1131245")
+        self.assertEqual(app._rober2_rate, maint.ROBER2_RATE_DEFAULT)
+        self.assertEqual(self.sensor_detail(app), "clean by ~18.11 - 35 days")
+
+    def test_a_failed_read_keeps_the_rate_in_use(self):
+        app = make_app(self.states())
+        self.read_month(app)
+        inner = app.get_history
+
+        def get_history(entity_id=None, **kw):
+            if entity_id == self.CLEANING:
+                raise RuntimeError("recorder down")
+            return inner(entity_id=entity_id, **kw)
+
+        app.get_history = get_history
+        asyncio.run(app._history_job({}))
+        drain(app)
+        self.assertAlmostEqual(app._rober2_rate, 89438 / 30)
+        self.assertEqual(self.sensor_detail(app), "clean by ~17.11 - 34 days")
+        self.assertTrue(any(level == "WARNING" and f"History of {self.CLEANING} failed" in msg
+                            for level, msg in app.logs))
+
+    def test_the_rate_survives_a_reload_and_a_bad_saved_one_is_the_default(self):
+        app = make_app(self.states())
+        self.read_month(app)
+        tick(app)
+        state_dir = str(Path(app.state_file).parent)
+        reloaded = make_app(self.states(), state_dir=state_dir, now=app.now)
+        self.assertAlmostEqual(reloaded._rober2_rate, 89438 / 30)
+        self.assertEqual(last(reloaded)["attributes"]["rows"], last(app)["attributes"]["rows"])
+        for bad in ("fast", 0, -3.5, None):
+            Path(state_dir, "state.json").write_text(json.dumps({"version": hu.STATE_VERSION, "rober2_rate": bad}))
+            self.assertEqual(make_app(self.states(), state_dir=state_dir)._rober2_rate, maint.ROBER2_RATE_DEFAULT)
+
+    def test_a_part_at_zero_takes_its_row_over_and_a_reset_hands_it_back(self):
+        app = make_app(self.states())
+        self.assertIn("at", rows(app)["maint:rober2:sensor"])
+        fire(app, "sensor.rober2_sensor_time_left", full("-5"))
+        due = rows(app)["maint:rober2:sensor"]
+        self.assertEqual(due["detail"], "clean")
+        self.assertNotIn("at", due)
+        self.assertEqual([row["id"] for row in last(app)["attributes"]["rows"]].count("maint:rober2:sensor"), 1)
+        fire(app, "sensor.rober2_sensor_time_left", full("108000"))
+        tick(app, 3 * HOUR)
+        self.assertEqual(self.sensor_detail(app), "clean by ~20.11 - 37 days")
+
+    def test_estimates_are_never_pushed(self):
+        app = make_app(self.states())
+        self.assertEqual([key for title, key in app._conditions if title.startswith("Rober2")], [None] * 4)
+        app._on_push_time({})
+        drain(app)
+        self.assertEqual(app.notifier.sent, [])
 
 
 class InventoryTests(unittest.TestCase):

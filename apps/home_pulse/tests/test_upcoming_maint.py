@@ -1,5 +1,6 @@
-# tests/test_upcoming_maint.py - maintenance rows for sensor.house_upcoming: Rober2 parts, the washer
-# drum clean, battery rules, replace-by days, offline devices and the daily push.
+# tests/test_upcoming_maint.py - maintenance rows for sensor.house_upcoming: Rober2 parts and their
+# dates before they are due, the washer drum clean, battery rules, replace-by days, offline devices
+# and the daily push.
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
 import sys
@@ -40,6 +41,10 @@ def feed(battery_model, readings, st=None):
 
 def row_of(battery_model, st, value, now, facts=None):
     return maint.battery_row(ENTITY, DEVICE, battery_model, st, value, facts, now)
+
+
+def rober2(states, left=None, rate=maint.ROBER2_RATE_DEFAULT, now=T0):
+    return maint.rober2_rows(states, "kitchen", left or {}, rate, now)
 
 
 class LowRuleTests(unittest.TestCase):
@@ -282,18 +287,18 @@ class Rober2Tests(unittest.TestCase):
     def test_a_part_at_zero_is_due_with_the_robot_word(self):
         states = {"filter": self.step(None, -19902, T0), "sensor": self.step(None, 0, T0),
                   "side_brush": self.step(None, 716910, T0)}
-        rows = maint.rober2_rows(states, "kitchen")
+        rows = rober2(states)
         self.assertEqual([(r["title"], r["detail"], r["area"]) for r, _ in rows],
                          [("Rober2 filter", "replace", "kitchen"), ("Rober2 sensors", "clean", "kitchen")])
         self.assertEqual(rows[0][1], f"rober2:filter:{states['filter']['due_since']}")
 
     def test_a_replayed_one_poll_jump_to_150_h_does_not_clear(self):
         st = self.step(None, -19902, T0)
-        key = maint.rober2_rows({"filter": st}, "kitchen")[0][1]
+        key = rober2({"filter": st})[0][1]
         st = self.step(st, 540000, T0 + HOUR)
         st = self.step(st, -20000, T0 + HOUR + 15 * MIN)
         st = self.step(st, -20000, T0 + 4 * HOUR)
-        rows = maint.rober2_rows({"filter": st}, "kitchen")
+        rows = rober2({"filter": st})
         self.assertEqual(rows[0][1], key)
 
     def test_a_reset_that_holds_two_hours_clears(self):
@@ -307,6 +312,95 @@ class Rober2Tests(unittest.TestCase):
     def test_no_reading_changes_nothing(self):
         st = self.step(None, -1, T0)
         self.assertEqual(self.step(st, None, T0 + DAY), st)
+
+
+class Rober2EstimateTests(unittest.TestCase):
+    def test_a_part_with_time_left_is_dated_by_the_cleaning_rate(self):
+        [(row, key)] = rober2({}, {"sensor": 102003}, rate=3000)
+        self.assertEqual((row["id"], row["title"], row["detail"]),
+                         ("maint:rober2:sensor", "Rober2 sensors", "clean by ~17.11 - 34 days"))
+        self.assertEqual((row["at"], row["icon"], row["area"]), ("2026-11-17T08:00:00+00:00", "mdi:robot-vacuum", "kitchen"))
+        self.assertEqual((row["kind"], row["audience"]), ("maint", "admin"))
+        self.assertIsNone(key)
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_every_part_gets_its_own_row_in_its_own_words(self):
+        left = {"filter": 534003, "main_brush": 514101, "side_brush": 714003, "sensor": 102003}
+        shown = [(r["title"], r["detail"]) for r, _ in rober2({}, left)]
+        self.assertEqual(shown, [("Rober2 filter", "replace by ~16.04.27 - 184 days"),
+                                 ("Rober2 main brush", "replace by ~09.04.27 - 177 days"),
+                                 ("Rober2 side brush", "replace by ~17.06.27 - 246 days"),
+                                 ("Rober2 sensors", "clean by ~18.11 - 35 days")])
+
+    def test_the_day_is_the_house_day_the_time_runs_out(self):
+        evening = datetime(2026, 10, 14, 20, 0, tzinfo=timezone.utc)
+        [(row, _)] = rober2({}, {"sensor": 290}, now=evening)
+        self.assertEqual((row["detail"], row["at"]), ("clean by ~15.10 - 1 day", "2026-10-15T07:00:00+00:00"))
+        [(row, _)] = rober2({}, {"sensor": 1}, now=evening)
+        self.assertEqual(row["detail"], "clean by ~14.10 - today")
+
+    def test_a_part_without_a_reading_or_beyond_the_horizon_has_no_row(self):
+        rate = 3000.0
+        edge = maint.ROBER2_HORIZON_DAYS * rate
+        left = {"filter": None, "main_brush": edge, "side_brush": edge + 60, "sensor": 0}
+        self.assertEqual([r["id"] for r, _ in rober2({}, left, rate)], ["maint:rober2:main_brush"])
+        self.assertEqual(rober2({}, {}), [])
+
+    def test_a_due_part_takes_over_the_row_of_its_estimate(self):
+        estimate, _ = rober2({}, {"filter": 534003})[0]
+        due = maint.step_rober2(None, 0, T0)
+        rows = rober2({"filter": due}, {"filter": 0, "sensor": 102003})
+        self.assertEqual([r["id"] for r, _ in rows], [estimate["id"], "maint:rober2:sensor"])
+        row, key = rows[0]
+        self.assertEqual((row["title"], row["detail"]), (estimate["title"], "replace"))
+        self.assertNotIn("at", row)
+        self.assertEqual(key, f"rober2:filter:{due['due_since']}")
+
+    def test_a_part_held_due_by_a_reset_that_has_not_held_keeps_its_due_row(self):
+        due = maint.step_rober2(None, -19902, T0)
+        held = maint.step_rober2(due, 540000, T0 + HOUR)
+        [(row, key)] = rober2({"filter": held}, {"filter": 540000}, now=T0 + HOUR)
+        self.assertEqual(row["detail"], "replace")
+        self.assertEqual(key, f"rober2:filter:{due['due_since']}")
+        cleared = maint.step_rober2(held, 540000, T0 + 3 * HOUR)
+        [(row, key)] = rober2({"filter": cleared}, {"filter": 540000}, now=T0 + 3 * HOUR)
+        self.assertEqual(row["detail"], "replace by ~18.04.27 - 186 days")
+        self.assertIsNone(key)
+
+    def test_an_estimate_is_never_pushed_and_a_due_row_is_pushed_once(self):
+        due = maint.step_rober2(None, 0, T0)
+        rows = rober2({"sensor": due}, {"filter": 534003, "main_brush": 514101, "sensor": 0})
+        self.assertEqual([key is not None for _, key in rows], [False, False, True])
+        conditions = [(row["title"], key) for row, key in rows]
+        found = maint.digest(conditions, {})
+        self.assertEqual((found["message"], found["keys"]), ("Rober2 sensors", [rows[2][1]]))
+        self.assertIsNone(maint.digest(conditions[:2], {}))
+        self.assertIsNone(maint.digest(conditions, {rows[2][1]: core.utc_iso(T0)}))
+
+
+class Rober2RateTests(unittest.TestCase):
+    START = T0 - 30 * DAY
+
+    def test_the_rate_is_the_cleaning_time_added_a_day_over_the_window(self):
+        series = [(self.START, 1041807.0), (self.START + 2 * DAY, 1041871.0), (self.START + 20 * DAY, 1100000.0),
+                  (T0 - HOUR, 1131245.0)]
+        self.assertAlmostEqual(maint.rober2_rate(series, T0), 89438 / 30)
+
+    def test_unavailable_readings_and_a_count_that_falls_back_add_nothing(self):
+        series = [(self.START, 1000.0), (self.START + DAY, None), (self.START + 2 * DAY, 1000.0),
+                  (self.START + 5 * DAY, 4000.0), (self.START + 9 * DAY, 100.0), (self.START + 12 * DAY, 400.0)]
+        self.assertAlmostEqual(maint.rober2_rate(series, T0), 3300 / 30)
+
+    def test_a_series_shorter_than_the_window_is_averaged_over_what_it_covers(self):
+        series = [(T0 - 10 * DAY, 5000.0), (T0 - DAY, 35000.0)]
+        self.assertAlmostEqual(maint.rober2_rate(series, T0), 3000.0)
+
+    def test_without_cleaning_or_a_week_of_readings_the_default_applies(self):
+        flat = [(self.START, 7000.0), (T0 - HOUR, 7000.0)]
+        short = [(T0 - 6 * DAY, 7000.0), (T0 - DAY, 17000.0)]
+        for series in ([], [(self.START, 7000.0)], [(self.START, None), (T0 - DAY, None)], flat, short):
+            self.assertEqual(maint.rober2_rate(series, T0), 2900.0, series)
+        self.assertEqual(maint.ROBER2_RATE_DEFAULT, 2900.0)
 
 
 class DrumTests(unittest.TestCase):
