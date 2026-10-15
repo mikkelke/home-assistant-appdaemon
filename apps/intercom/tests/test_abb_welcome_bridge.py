@@ -260,6 +260,19 @@ class PureHelperTests(unittest.TestCase):
         self.assertEqual(entry["url"], "/media/local/abb_doorbell/f.jpg")
         self.assertEqual(entry["event_type"], "ring_auto_opened")
 
+    def test_ring_key_is_the_ring_not_its_classification_or_files(self):
+        def entry(at, station, event_type, filename):
+            return bridge_mod.build_index_entry(at, station, "front door", event_type,
+                                                filename, "/media/local/abb_doorbell")
+        early = entry(RING_ESP, "100000002", "ring", "early.jpg")
+        final = entry(RING_ESP, "100000002", "ring_auto_opened", "final.jpg")
+        self.assertEqual(bridge_mod.ring_key(early), bridge_mod.ring_key(final))
+        self.assertNotEqual(bridge_mod.ring_key(early),
+                            bridge_mod.ring_key(entry(RING_ESP, "100000001", "ring", "early.jpg")))
+        self.assertNotEqual(bridge_mod.ring_key(early),
+                            bridge_mod.ring_key(entry(RING_ESP + timedelta(seconds=1), "100000002",
+                                                      "ring", "early.jpg")))
+
     def test_ring_link_carries_the_archive_entry_ts(self):
         entry = bridge_mod.build_index_entry(RING_ESP, "100000001", "back door",
                                              "ring_auto_opened", "f.jpg", "/media/local/abb_doorbell")
@@ -1348,7 +1361,7 @@ class RingClipTests(unittest.TestCase):
         self.assertTrue(any("Neither photo nor clip" in m for _, m in self.app.logs))
 
     def test_two_clip_only_entries_coexist(self):
-        # Dedup keys on filename-or-clip: with bare filenames ("" for clip-only),
+        # Dedup keys on the ring, never a bare filename ("" for clip-only):
         # every new clip-only entry would swallow all previous ones.
         self.app.archive_dir.mkdir(parents=True, exist_ok=True)
         (self.app.archive_dir / "abb_clip_a_front.mp4").write_bytes(b"a")
@@ -2327,6 +2340,232 @@ class ClipPosterTests(unittest.TestCase):
                                 "ring_auto_opened")
         self.assertFalse(old_poster.exists())
         self.assertTrue((self.app.archive_dir / self.POSTER).exists())  # young: its push may still fetch it
+
+
+class EarlyArchiveTests(unittest.TestCase):
+    """The ring is archived as a plain "ring" the moment its clip is on disk,
+    seconds after the ring, and the episode close replaces that entry with the
+    final classification instead of adding a second one beside it."""
+
+    POSTER = "abb_ringclip_20261015_104740_100000002.jpg"
+    CLIP = "abb_ringclip_20261015_104740_100000002.mp4"
+    CLIP_2 = "abb_ringclip_20261015_104758_100000002.mp4"
+
+    def setUp(self):
+        self.ring = datetime(2026, 10, 15, 8, 47, 40, tzinfo=timezone.utc)
+        self.clock = Clock(self.ring)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.app = _bare_bridge(self.tmp.name, self.clock)
+        self.app.native_ring_clips = True
+        self.dir = self.app.archive_dir
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.stamp = self.ring.astimezone().strftime("%Y%m%d_%H%M%S")
+        self.poster_bytes = b"\xff\xd8\xff\xdb" + b"p" * 64
+        self.episode = self.app._open_episode("front door", "100000002", self.ring)
+
+    def _write_media(self, poster=True, clip=True):
+        if poster:
+            (self.dir / self.POSTER).write_bytes(self.poster_bytes)
+        if clip:
+            (self.dir / self.CLIP).write_bytes(b"mp4data")
+
+    def _clip_event(self, **overrides):
+        payload = {
+            "station_id": "100000002",
+            "filename": self.CLIP,
+            "poster_filename": self.POSTER,
+            "poster_url": "",
+            "duration_s": 4.95,
+            "frames": 32,
+            "segments": 1,
+            "started_at": (self.ring + timedelta(seconds=3.6)).isoformat(),
+            "reason": "ring",
+            "ok": True,
+        }
+        payload.update(overrides)
+        self.clock.at = self.ring + timedelta(seconds=8.8)
+        self.app._on_native_ring_clip("abb_welcome_ring_clip", payload, {})
+        return payload
+
+    def _unlock(self):
+        self.clock.at = self.ring + timedelta(seconds=3.5)
+        self.app._on_lock_activity("lock.intercomproxy_front_door", "state", "locked", "unlocking", {})
+
+    def _gateway_frame(self, raw):
+        self.app._fetch_image_bytes = lambda: raw
+        self.clock.at = self.ring + timedelta(seconds=22)
+        shot = {"attributes": {"captured_at": (self.ring + timedelta(seconds=2.5)).isoformat(),
+                               "event_id": "shot-1"}}
+        self.app.states["image.abb_screenshot"] = shot
+        self.app._on_image_update("image.abb_screenshot", "all", None, shot, {})
+
+    def _close(self):
+        self.clock.at = self.ring + timedelta(seconds=76)
+        _run_scheduled(self.app, "_close_episode")
+
+    def _jpgs(self):
+        return sorted(p.name for p in self.dir.glob("abb_ring_*.jpg"))
+
+    def test_clip_landing_archives_the_ring_as_a_plain_ring_before_the_close(self):
+        self._write_media()
+        self._clip_event()
+        self.assertIn(self.episode["id"], self.app.episodes)  # the episode is still open
+        (entry,) = self.app._load_index()
+        self.assertEqual(entry["event_type"], "ring")
+        self.assertEqual(entry["ts"], int(self.ring.timestamp()))
+        self.assertEqual(entry["station"], "100000002")
+        self.assertEqual(entry["door"], "front door")
+        self.assertEqual(entry["filename"], f"abb_ring_{self.stamp}_front_ring.jpg")
+        self.assertEqual(entry["url"], f"/media/local/abb_doorbell/{entry['filename']}")
+        self.assertEqual((self.dir / entry["filename"]).read_bytes(), self.poster_bytes)
+        self.assertEqual(entry["clip_filename"], self.CLIP)
+        self.assertEqual(entry["clip_url"], f"/media/local/abb_doorbell/{self.CLIP}")
+        self.assertTrue(any("ARCHIVE-EARLY" in m and "+8.8s" in m for _, m in self.app.logs))
+
+    def test_close_replaces_the_early_entry_and_keeps_the_clip(self):
+        self._unlock()
+        self._write_media()
+        self._clip_event()
+        early = self.app._load_index()[0]
+        self._close()
+        (entry,) = self.app._load_index()
+        self.assertEqual(entry["event_type"], "ring_auto_opened")
+        self.assertEqual(entry["ts"], early["ts"])
+        self.assertEqual(entry["filename"], f"abb_ring_{self.stamp}_front_ring_auto_opened.jpg")
+        self.assertEqual(entry["clip_filename"], self.CLIP)
+        self.assertEqual(self._jpgs(), [entry["filename"]])  # the early photo went
+        self.assertFalse((self.dir / early["filename"]).exists())
+        self.assertEqual((self.dir / self.CLIP).read_bytes(), b"mp4data")
+
+    def test_close_with_no_evidence_rewrites_the_same_photo_without_deleting_it(self):
+        self._write_media()
+        self._clip_event()
+        early = self.app._load_index()[0]
+        self._close()
+        (entry,) = self.app._load_index()
+        self.assertEqual(entry["event_type"], "ring")
+        self.assertEqual(entry["filename"], early["filename"])
+        self.assertEqual((self.dir / entry["filename"]).read_bytes(), self.poster_bytes)
+        self.assertTrue((self.dir / self.CLIP).exists())
+
+    def test_gateway_frame_arriving_after_the_early_entry_wins_at_close(self):
+        self._unlock()
+        self._write_media()
+        self._clip_event()
+        early = self.app._load_index()[0]
+        self._gateway_frame(JPEG)
+        self._close()
+        (entry,) = self.app._load_index()
+        self.assertEqual((self.dir / entry["filename"]).read_bytes(), JPEG)
+        self.assertEqual(self._jpgs(), [entry["filename"]])
+        self.assertNotEqual(entry["filename"], early["filename"])
+        self.assertEqual(entry["clip_filename"], self.CLIP)
+
+    def test_gateway_frame_already_in_hand_is_the_early_photo(self):
+        self.episode["snapshot"] = {"bytes": JPEG, "event_id": "shot-1",
+                                    "captured_at": self.ring + timedelta(seconds=2)}
+        self._write_media()
+        self._clip_event()
+        (entry,) = self.app._load_index()
+        self.assertEqual((self.dir / entry["filename"]).read_bytes(), JPEG)
+
+    def test_unusable_poster_archives_the_clip_alone_and_close_adds_the_photo(self):
+        self._write_media(poster=False)
+        self._clip_event()
+        (early,) = self.app._load_index()
+        self.assertEqual(early["filename"], "")
+        self.assertEqual(early["url"], "")
+        self.assertEqual(early["clip_url"], f"/media/local/abb_doorbell/{self.CLIP}")
+        self.assertEqual(self._jpgs(), [])
+        self._gateway_frame(JPEG)
+        self._close()
+        (entry,) = self.app._load_index()
+        self.assertEqual((self.dir / entry["filename"]).read_bytes(), JPEG)
+        self.assertEqual(entry["clip_filename"], self.CLIP)
+
+    def test_a_later_clip_replaces_the_early_entry_and_its_clip_goes(self):
+        self._write_media()
+        self._clip_event()
+        (self.dir / self.CLIP_2).write_bytes(b"second")
+        self._clip_event(filename=self.CLIP_2, poster_filename="")
+        (entry,) = self.app._load_index()
+        self.assertEqual(entry["clip_filename"], self.CLIP_2)
+        self.assertFalse((self.dir / self.CLIP).exists())
+        self.assertEqual(self._jpgs(), [entry["filename"]])
+
+    def test_clip_missing_from_disk_writes_nothing_and_the_close_still_archives(self):
+        self._write_media(clip=False)
+        self._clip_event()
+        self.assertFalse((self.dir / "index.json").exists())
+        self.assertEqual(self._jpgs(), [])
+        self.assertTrue(any("ARCHIVE-EARLY" in m and "not on disk" in m for _, m in self.app.logs))
+        (self.dir / self.CLIP).write_bytes(b"mp4data")
+        self._close()
+        (entry,) = self.app._load_index()
+        self.assertEqual(entry["clip_filename"], self.CLIP)
+        self.assertEqual((self.dir / entry["filename"]).read_bytes(), self.poster_bytes)
+
+    def test_empty_clip_writes_nothing_early_and_is_left_for_the_close(self):
+        self._write_media(clip=False)
+        turd = self.dir / self.CLIP
+        turd.write_bytes(b"")
+        self._clip_event()
+        self.assertFalse((self.dir / "index.json").exists())
+        self.assertEqual(self._jpgs(), [])
+        self.assertTrue(turd.exists())  # the early write never deletes
+        self._close()
+        (entry,) = self.app._load_index()
+        self.assertNotIn("clip_filename", entry)
+        self.assertFalse(turd.exists())  # the close removes it, as it always did
+
+    def test_events_that_attach_no_clip_archive_nothing_early(self):
+        self._write_media()
+        self._clip_event(ok=False)
+        self._clip_event(reason="service")
+        self._clip_event(station_id="999999999")
+        self.assertFalse((self.dir / "index.json").exists())
+        self.assertEqual(self._jpgs(), [])
+
+    def test_without_native_clips_the_event_archives_nothing_early(self):
+        self.app.native_ring_clips = False
+        self._write_media()
+        self._clip_event()
+        self.assertFalse((self.dir / "index.json").exists())
+
+    def test_a_job_reaching_the_executor_after_the_close_writes_nothing(self):
+        self._write_media()
+        self.episode["clip_filename"] = self.CLIP
+        self.episode["closed"] = True
+        self.app._archive_clip_landed(self.episode["id"], self.POSTER, self.ring)
+        self.app._archive_clip_landed("ep-unknown", self.POSTER, self.ring)
+        self.assertFalse((self.dir / "index.json").exists())
+
+    def test_a_failing_early_archive_costs_nothing_but_a_log_line(self):
+        def boom(*args, **kwargs):
+            raise OSError("disk full")
+        self.app._archive_write = boom
+        self._write_media()
+        self._clip_event()
+        self.assertEqual(self.episode["clip_filename"], self.CLIP)
+        self.assertTrue(any(level == "WARNING" and "Early archive failed" in m
+                            for level, m in self.app.logs))
+
+    def test_only_the_same_ring_is_replaced(self):
+        def write(offset_s, station, door, event_type):
+            self.app._archive_write(JPEG, (self.ring + timedelta(seconds=offset_s)).isoformat(),
+                                    station, door, event_type)
+        write(0, "100000002", "front door", "ring")
+        write(0, "100000001", "back door", "ring")    # same second, other station
+        write(60, "100000002", "front door", "ring")   # same station, other second
+        self.assertEqual(len(self.app._load_index()), 3)
+        write(0, "100000002", "front door", "ring_missed")
+        self.assertEqual(len(self.app._load_index()), 3)
+        self.assertEqual(self._jpgs(), [
+            f"abb_ring_{self.stamp}_back_ring.jpg",
+            f"abb_ring_{self.stamp}_front_ring_missed.jpg",
+            f"abb_ring_{(self.ring + timedelta(seconds=60)).astimezone().strftime('%Y%m%d_%H%M%S')}_front_ring.jpg",
+        ])
 
 
 class RingArmedVoiceTests(unittest.TestCase):

@@ -169,8 +169,11 @@ AbbWelcomeBridge:
   # outlasts it). true = this bridge NEVER dials arm_streaming/camera.record
   # itself (the clip_cameras/clip_seconds/clip_delay_s keys below still
   # configure WHICH cameras/doors get clips and how they are named, just not
-  # dialed) - it only listens for that event and attaches clip_filename to the
-  # matching open episode. It also opens the self-call window at episode open
+  # dialed) - it only listens for that event, attaches clip_filename to the
+  # matching open episode and archives the ring at once as a plain "ring" entry
+  # (the episode close then replaces it with the final classification, so the
+  # dashboard has the video seconds after the ring, not after episode_close_s).
+  # It also opens the self-call window at episode open
   # instead of at a dial WE placed, because the integration may place its own
   # continuation dial ~2.5 s after the ring call ends (to film the visitor
   # entering) - that shows up in the ABB portal as call-answered and must not be
