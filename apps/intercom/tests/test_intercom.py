@@ -500,6 +500,123 @@ class AbbNativeUnlockTests(unittest.TestCase):
             "_deferred_unlock", [cb.__name__ for cb, _, _ in app.run_in_calls]
         )
 
+    # --- a repeat ring inside one visit: its sentence has already played ---
+
+    def _with_bridge(self, app, spoken):
+        asked = []
+
+        class FakeBridge:
+            def voice_already_spoken(self, door):
+                asked.append(door)
+                return spoken
+        app.get_app = lambda name: FakeBridge()
+        return asked
+
+    def _held_front_door_app(self):
+        return self._app(
+            {"front door": "button.abb_front"},
+            voice_before_unlock={"front door": "camera.abb_front"},
+        )
+
+    def _assert_door_is_held(self, app):
+        """The hold exactly as it has always been: ceiling armed, record kept,
+        door shut until the sentence or the ceiling releases it."""
+        self.assertEqual(self._press(app), [])
+        self.assertEqual(
+            [(cb.__name__, delay) for cb, delay, _ in app.run_in_calls
+             if cb.__name__ == "_deferred_unlock"],
+            [("_deferred_unlock", app.voice_before_unlock_ceiling_s)],
+        )
+        self.assertEqual(list(app._voice_unlock_pending), ["front door"])
+        self.assertTrue(any(
+            msg.startswith("VOICE-BEFORE-UNLOCK door=front door") for _, msg in app.logs
+        ))
+        self.assertFalse(any("VOICE-REPEAT" in msg for _, msg in app.logs))
+        _run_scheduled(app, "_deferred_unlock")
+        self.assertEqual(
+            self._press(app), [("button/press", {"entity_id": "button.abb_front"})]
+        )
+
+    def test_repeat_ring_after_the_sentence_opens_now_without_a_hold(self):
+        """The bridge folds a repeat ring into the open visit and never speaks
+        again, so a hold would only ever end on the ceiling."""
+        app = self._held_front_door_app()
+        asked = self._with_bridge(app, True)
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+
+        self.assertEqual(asked, ["front door"])
+        self.assertEqual(
+            self._press(app), [("button/press", {"entity_id": "button.abb_front"})]
+        )
+        self.assertEqual(app._voice_unlock_pending, {})
+        self.assertNotIn(
+            "_deferred_unlock", [cb.__name__ for cb, _, _ in app.run_in_calls]
+        )
+        self.assertIn(
+            ("INFO", "VOICE-REPEAT door=front door already spoke this visit, opening now"),
+            app.logs,
+        )
+        self.assertFalse(any(
+            msg.startswith("VOICE-BEFORE-UNLOCK door=") for _, msg in app.logs
+        ))
+
+        # Nothing is held, so a late announcement cannot open it a second time.
+        app._on_announcement_spoken("abb_announcement_spoken", {"door": "front door"}, {})
+        self.assertEqual(len(self._press(app)), 1)
+
+    def test_repeat_ring_dispatches_what_the_hold_would_have_stored(self):
+        held = self._held_front_door_app()
+        self._with_bridge(held, False)
+        held_calls = []
+        held._dispatch_unlock = lambda *args: held_calls.append(args)
+        held._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+        held._on_announcement_spoken("abb_announcement_spoken", {"door": "front door"}, {})
+
+        repeat = self._held_front_door_app()
+        self._with_bridge(repeat, True)
+        repeat_calls = []
+        repeat._dispatch_unlock = lambda *args: repeat_calls.append(args)
+        repeat._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+
+        self.assertEqual(len(held_calls), 1)
+        self.assertEqual(repeat_calls, held_calls)
+
+    def test_bridge_reporting_no_sentence_yet_still_holds_the_door(self):
+        app = self._held_front_door_app()
+        asked = self._with_bridge(app, False)
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+
+        self.assertEqual(asked, ["front door"])
+        self._assert_door_is_held(app)
+
+    def test_bridge_absent_still_holds_the_door(self):
+        app = self._held_front_door_app()
+        app.get_app = lambda name: None
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+
+        self._assert_door_is_held(app)
+
+    def test_bridge_lookup_raising_still_holds_the_door(self):
+        app = self._held_front_door_app()
+
+        def boom(name):
+            raise RuntimeError("bridge exploded")
+        app.get_app = boom
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+
+        self._assert_door_is_held(app)
+
+    def test_bridge_method_raising_still_holds_the_door(self):
+        app = self._held_front_door_app()
+
+        class BadBridge:
+            def voice_already_spoken(self, door):
+                raise ValueError("mid-reload")
+        app.get_app = lambda name: BadBridge()
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+
+        self._assert_door_is_held(app)
+
     def test_abb_ack_in_time_succeeds_without_esp_unlock(self):
         app = self._app({"front door": "button.abb_front"})
         app._handle_trigger("binary_sensor.front", "state", "off", "on", {})

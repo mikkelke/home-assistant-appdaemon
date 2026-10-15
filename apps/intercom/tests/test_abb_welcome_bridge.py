@@ -739,6 +739,80 @@ class RingEpisodeFoldTests(unittest.TestCase):
         self.assertEqual(len(self.app.episodes), 2)
 
 
+class VoiceAlreadySpokenTests(unittest.TestCase):
+    """intercom.py asks this before holding a door for a sentence: a repeat ring
+    folds into the open visit, and the bridge never speaks for it again."""
+
+    def setUp(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        self.clock = Clock(RING_ESP)
+        self.app = _bare_bridge(tmpdir.name, self.clock)
+
+    def _open(self, door="front door", at=RING_ESP):
+        return self.app._open_episode(door, self.app.station_by_door[door], at)
+
+    def _speak(self, episode):
+        self.app._publish_voice_spoken(
+            {"door": episode["door"], "episode_id": episode["id"], "source": "return"})
+
+    def test_false_with_no_episode(self):
+        self.assertFalse(self.app.voice_already_spoken("front door"))
+
+    def test_false_while_the_open_visit_has_not_been_spoken_to(self):
+        self._open()
+        self.assertFalse(self.app.voice_already_spoken("front door"))
+
+    def test_true_once_the_open_visit_has_been_spoken_to(self):
+        self._speak(self._open())
+        self.assertTrue(self.app.voice_already_spoken("front door"))
+
+    def test_true_for_a_repeat_ring_folded_into_the_visit(self):
+        self.app._register_ring("esp", "front door", "", RING_ESP, "esp:test")
+        episode = next(iter(self.app.episodes.values()))
+        self._speak(episode)
+        self.clock.at = RING_ESP + timedelta(seconds=18)
+        self.app._register_ring("esp", "front door", "", self.clock.at, "esp:test")
+
+        self.assertEqual(len(self.app.episodes), 1)
+        self.assertEqual(episode["re_rings"], 1)
+        self.assertTrue(self.app.voice_already_spoken("front door"))
+
+    def test_false_once_the_visit_is_closed(self):
+        episode = self._open()
+        self._speak(episode)
+        self.clock.at = RING_ESP + timedelta(seconds=76)
+        _run_scheduled(self.app, "_close_episode")
+
+        self.assertTrue(episode["closed"])
+        self.assertFalse(self.app.voice_already_spoken("front door"))
+
+    def test_false_when_the_lookup_raises(self):
+        self._speak(self._open())
+
+        def boom(door, now=None, window_s=None):
+            raise RuntimeError("episodes changed during iteration")
+        self.app._latest_open_episode = boom
+
+        self.assertFalse(self.app.voice_already_spoken("front door"))
+
+    def test_only_the_asked_door_counts(self):
+        front = self._open("front door")
+        self._open("back door")
+        self._speak(front)
+
+        self.assertTrue(self.app.voice_already_spoken("front door"))
+        self.assertFalse(self.app.voice_already_spoken("back door"))
+
+    def test_the_latest_open_visit_decides(self):
+        older = self._open(at=RING_ESP)
+        newer = self._open(at=RING_ESP + timedelta(seconds=30))
+        self._speak(older)
+        self.assertFalse(self.app.voice_already_spoken("front door"))
+        self._speak(newer)
+        self.assertTrue(self.app.voice_already_spoken("front door"))
+
+
 class IntercomAttachmentSeamTests(unittest.TestCase):
     """The strictly-additive seam in intercom.py: pushes gain an image when the
     bridge offers one, and remain byte-identical to today when it cannot."""
@@ -853,6 +927,19 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
             raise RuntimeError("HA is down")
         bridge.get_state = broken_get_state
         self.assertIsNone(bridge.ring_attachment_data())
+
+    def test_voice_repeat_check_asks_the_real_bridge(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        bridge = _bare_bridge(tmpdir.name, Clock(RING_ESP))
+        episode = bridge._open_episode("front door", "100000002", RING_ESP)
+        app = self._bare_intercom()
+        app.get_app = lambda name: bridge
+
+        self.assertFalse(app._abb_voice_already_spoken("front door"))
+        bridge._publish_voice_spoken({"door": "front door", "episode_id": episode["id"]})
+        self.assertTrue(app._abb_voice_already_spoken("front door"))
+        self.assertFalse(app._abb_voice_already_spoken("back door"))
 
 
 class RingPushPhotoTests(unittest.TestCase):

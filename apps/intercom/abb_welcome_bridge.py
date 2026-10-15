@@ -648,6 +648,18 @@ class AbbWelcomeBridge(hass.Hass):
         except Exception as e:
             self.log(f"Deferred ring push failed for {pending['door']}: {e}", level="WARNING")
 
+    def voice_already_spoken(self, door):
+        """True when the visit still open at this door has already had its sentence."""
+        try:
+            episode = self._latest_open_episode(door)
+            return episode is not None and bool(episode.get("voice_published"))
+        except Exception as e:
+            try:
+                self.log(f"voice_already_spoken failed for {door}: {e}", level="DEBUG")
+            except Exception:
+                pass
+            return False
+
     # ------------------------------------------------------------------
     # Ring intake (three sources -> one _register_ring)
     # ------------------------------------------------------------------

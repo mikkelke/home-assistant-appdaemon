@@ -267,6 +267,24 @@ class Intercom(hass.Hass):
                 pass
         return False
 
+    def _abb_voice_already_spoken(self, ring_label):
+        """True when the bridge says this visit's sentence has already played,
+        so a repeat ring has no new sentence to hold the door for.
+
+        Same contract as _abb_defer_ring_push: any problem at all is a False,
+        and the caller holds the door exactly as before. Never raises."""
+        try:
+            if self.abb_bridge is None:
+                self.abb_bridge = self.get_app("AbbWelcomeBridge")
+            if self.abb_bridge:
+                return bool(self.abb_bridge.voice_already_spoken(ring_label))
+        except Exception as e:
+            try:
+                self.log(f"ABB voice-repeat check unavailable: {e}", level="DEBUG")
+            except Exception:
+                pass
+        return False
+
     def _validate_entities(self):
         """Validate that configured entities exist in Home Assistant."""
         entities_to_check = []
@@ -558,25 +576,33 @@ class Intercom(hass.Hass):
                     "door_sensor": door_sensor,
                     "ring_label": ring_label,
                 }
-                self.log(
-                    f"VOICE-BEFORE-UNLOCK door={ring_label} camera={voice_camera} "
-                    f"- unlock waits for the sentence, ceiling "
-                    f"{self.voice_before_unlock_ceiling_s}s",
-                    level="INFO",
-                )
-                # Arm the ceiling FIRST, then record the hold: if run_in were to
-                # raise, the door must not be left waiting on an event with no
-                # backstop behind it.
-                handle = self.run_in(
-                    self._deferred_unlock,
-                    self.voice_before_unlock_ceiling_s,
-                    **unlock_args,
-                )
-                self._voice_unlock_pending[ring_label] = {
-                    "ring_ts": ring_ts,
-                    "handle": handle,
-                    "args": unlock_args,
-                }
+                if self._abb_voice_already_spoken(ring_label):
+                    self.log(
+                        f"VOICE-REPEAT door={ring_label} already spoke this visit, "
+                        f"opening now",
+                        level="INFO",
+                    )
+                    self._dispatch_unlock(entity, ring_ts, lock_entity, door_sensor, ring_label)
+                else:
+                    self.log(
+                        f"VOICE-BEFORE-UNLOCK door={ring_label} camera={voice_camera} "
+                        f"- unlock waits for the sentence, ceiling "
+                        f"{self.voice_before_unlock_ceiling_s}s",
+                        level="INFO",
+                    )
+                    # Arm the ceiling FIRST, then record the hold: if run_in were to
+                    # raise, the door must not be left waiting on an event with no
+                    # backstop behind it.
+                    handle = self.run_in(
+                        self._deferred_unlock,
+                        self.voice_before_unlock_ceiling_s,
+                        **unlock_args,
+                    )
+                    self._voice_unlock_pending[ring_label] = {
+                        "ring_ts": ring_ts,
+                        "handle": handle,
+                        "args": unlock_args,
+                    }
             else:
                 self._dispatch_unlock(entity, ring_ts, lock_entity, door_sensor, ring_label)
 
