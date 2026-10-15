@@ -8,6 +8,7 @@ apps/people/
 
 # Behavioral / recorded data
 *.csv
+*_tape.jsonl
 
 # Media: copyrighted manuals, apartment layout drawings, maps
 *.pdf
