@@ -31,6 +31,8 @@ QUIET_HOURS_STATE = {
 CLIP_URL = "https://ha.example/local/chime_tts/abc123.mp3"
 EXPLICIT = "media_player.explicit"
 DAYTIME = datetime(2026, 9, 11, 12, 0, 0)
+AUDIO_CONVERSION = "-af loudnorm=I=-16:TP=-2:LRA=11"
+VOLUME_CAP = 0.35
 
 
 def _say_url_response(url=CLIP_URL, success=True):
@@ -62,6 +64,8 @@ def _new_app(state=None, now=None, time_constraints_enabled=True, volumes=None):
     app.tts_group_ms = ["media_player.bedroom"]
     app.default_chime_path = "/config/www/chimes/alert.mp3"
     app.tts_platform = "piper"
+    app.audio_conversion = AUDIO_CONVERSION
+    app.announce_volume_cap = VOLUME_CAP
 
     app.time_constraints_enabled = time_constraints_enabled
     app.quiet_hours_end_entity = "input_datetime.quiet_hours_end"
@@ -164,6 +168,7 @@ class RenderAndPlayPayloads(unittest.TestCase):
                     "cache": True,
                     "offset": -300,
                     "tts_platform": "piper",
+                    "audio_conversion": AUDIO_CONVERSION,
                     "return_response": True,
                 }
             ],
@@ -214,6 +219,20 @@ class RenderAndPlayPayloads(unittest.TestCase):
         app.notify("Hello", target_speakers=[EXPLICIT])
         self.assertNotIn("tts_platform", _renders(app)[0])
 
+    def test_audio_conversion_is_sent_with_every_render(self):
+        app = _new_app(now=DAYTIME)
+        app.notify("First", target_speakers=[EXPLICIT])
+        app.notify("Second", chime_path="/config/www/chimes/other.mp3", target_speakers=[EXPLICIT], volume_level=0.7)
+        self.assertEqual([r["audio_conversion"] for r in _renders(app)], [AUDIO_CONVERSION, AUDIO_CONVERSION])
+        self.assertTrue(_logged(app, f"audio_conversion='{AUDIO_CONVERSION}'"))
+
+    def test_no_audio_conversion_configured_is_not_sent(self):
+        for value in (None, ""):
+            app = _new_app(now=DAYTIME)
+            app.audio_conversion = value
+            app.notify("Hello", target_speakers=[EXPLICIT])
+            self.assertNotIn("audio_conversion", _renders(app)[0])
+
     def test_legacy_player_options_are_ignored(self):
         app = _new_app(now=DAYTIME)
         app.notify("Hello", target_speakers=[EXPLICIT], announce=False, fade_audio=False)
@@ -262,6 +281,46 @@ class VolumeLevel(unittest.TestCase):
             {("media_player.living_room", "media_player.kitchen"): 18, ("media_player.bedroom",): 24},
         )
 
+    def test_omitted_volume_is_capped(self):
+        for room_volume, pct in ((0.34, 34), (0.35, 35), (0.36, 35), (0.6, 35), (1.0, 35)):
+            app = _new_app(now=DAYTIME, volumes={EXPLICIT: room_volume})
+            app.notify("Hello", target_speakers=[EXPLICIT])
+            self.assertEqual(_plays(app)[0]["extra"]["announce_volume"], pct)
+
+    def test_explicit_volume_is_not_capped(self):
+        for room_volume, level, pct in ((0.2, 0.7, 70), (0.9, 0.5, 50), (0.9, 1.0, 100), (0.2, 0.36, 36)):
+            app = _new_app(now=DAYTIME, volumes={EXPLICIT: room_volume})
+            app.notify("Hello", target_speakers=[EXPLICIT], volume_level=level)
+            self.assertEqual(_plays(app)[0]["extra"]["announce_volume"], pct)
+
+    def test_rooms_capped_to_the_same_volume_share_one_call(self):
+        app = _new_app(
+            now=DAYTIME,
+            volumes={"media_player.living_room": 0.5, "media_player.kitchen": 0.9, "media_player.bedroom": 0.2},
+        )
+        app.notify(
+            "Hello",
+            target_speakers=["media_player.living_room", "media_player.kitchen", "media_player.bedroom"],
+        )
+        announced = {tuple(p["entity_id"]): p["extra"]["announce_volume"] for p in _plays(app)}
+        self.assertEqual(
+            announced,
+            {("media_player.living_room", "media_player.kitchen"): 35, ("media_player.bedroom",): 20},
+        )
+
+    def test_cap_follows_the_configuration(self):
+        app = _new_app(now=DAYTIME, volumes={EXPLICIT: 0.5})
+        app.announce_volume_cap = 0.25
+        app.notify("Hello", target_speakers=[EXPLICIT])
+        self.assertEqual(_plays(app)[0]["extra"]["announce_volume"], 25)
+
+    def test_no_usable_cap_leaves_the_current_volume_uncapped(self):
+        for cap in (None, "", "loud"):
+            app = _new_app(now=DAYTIME, volumes={EXPLICIT: 0.8})
+            app.announce_volume_cap = cap
+            app.notify("Hello", target_speakers=[EXPLICIT])
+            self.assertEqual(_plays(app)[0]["extra"]["announce_volume"], 80)
+
     def test_unreadable_current_volume_sends_no_announce_volume(self):
         app = _new_app(now=DAYTIME)
         app.notify("Hello", target_speakers=[EXPLICIT])
@@ -271,6 +330,44 @@ class VolumeLevel(unittest.TestCase):
         app = _new_app(now=DAYTIME, volumes={EXPLICIT: 0.2})
         app.notify("Hello", target_speakers=[EXPLICIT], volume_level=0.7)
         self.assertEqual({service for service, _ in app.calls}, {"chime_tts/say_url", "media_player/play_media"})
+
+
+class ShippedConfig(unittest.TestCase):
+    """The yaml next to the app carries the keys the app reads, in the units it reads them."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import yaml
+        except ImportError:
+            raise unittest.SkipTest("PyYAML not installed")
+        with open(Path(__file__).resolve().parents[1] / "sonos_notifier.yaml") as f:
+            cls.args = next(iter(yaml.safe_load(f).values()))
+
+    def _initialized_app(self, args=None, **kwargs):
+        app = _new_app(now=DAYTIME, **kwargs)
+        app.args = self.args if args is None else args
+        app.initialize()
+        return app
+
+    def test_loudness_filter_reaches_the_render(self):
+        app = self._initialized_app()
+        app.notify("Hello", target_speakers=[EXPLICIT])
+        self.assertIn("loudnorm", self.args["audio_conversion"])
+        self.assertEqual(_renders(app)[0]["audio_conversion"], self.args["audio_conversion"])
+
+    def test_cap_reaches_the_announce_volume(self):
+        cap = self.args["announce_volume_cap"]
+        self.assertTrue(0 < cap < 1)
+        app = self._initialized_app(volumes={EXPLICIT: 1.0})
+        app.notify("Hello", target_speakers=[EXPLICIT])
+        self.assertEqual(_plays(app)[0]["extra"]["announce_volume"], round(cap * 100))
+        self.assertFalse(_logged_at(app, "announce_volume_cap", "WARNING"))
+
+    def test_a_missing_cap_is_warned_about(self):
+        args = {k: v for k, v in self.args.items() if k != "announce_volume_cap"}
+        app = self._initialized_app(args=args)
+        self.assertTrue(_logged_at(app, "announce_volume_cap", "WARNING"))
 
 
 class DeliveryFailures(unittest.TestCase):

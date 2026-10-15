@@ -23,6 +23,8 @@ class SonosNotifier(hass.Hass):
         # TTS Configuration
         self.default_chime_path = self.args.get("default_chime_path")
         self.tts_platform = self.args.get("tts_platform")
+        self.audio_conversion = self.args.get("audio_conversion")
+        self.announce_volume_cap = self.args.get("announce_volume_cap")
 
         # Time Constraints using input_datetime entities
         self.time_constraints_enabled = False
@@ -62,6 +64,8 @@ class SonosNotifier(hass.Hass):
             self.log("WARN: 'default_chime_path' is not configured. Chime functionality might be affected if not provided in calls.")
         if not self.tts_platform:
             self.log("Using default TTS platform from chime_tts integration (no explicit tts_platform configured).", level="DEBUG")
+        if self._volume_pct(self.announce_volume_cap) is None:
+            self.log("WARN: 'announce_volume_cap' is missing or not a number. Announcements without a volume_level are not capped.", level="WARNING")
 
         self.log(f"{self.app_name} Initialized. Ready to send notifications.", level=self.log_level)
         self.log(
@@ -149,8 +153,9 @@ class SonosNotifier(hass.Hass):
                 Defaults to the sleep-mode based group selection.
             override_quiet_hours (bool, optional): Skip the quiet-hours check and announce
                 anyway. For life-safety callers only. Defaults to False.
-            volume_level (float, optional): Announcement volume (0.0-1.0) in every target room.
-                When omitted each room announces at its current volume.
+            volume_level (float, optional): Announcement volume (0.0-1.0) in every target room,
+                used as given. When omitted each room announces at its current volume, at most
+                announce_volume_cap.
             **kwargs: cache (default True), offset (default -300) and tts_platform for the
                 chime_tts render.
         """
@@ -240,7 +245,7 @@ class SonosNotifier(hass.Hass):
             tts_platform = self.tts_platform
 
         self.log(
-            f"Sending TTS: '{message}' with chime '{actual_chime_path}' to {target_speakers} (cache={cache}, offset={offset}, volume_level={volume_level})",
+            f"Sending TTS: '{message}' with chime '{actual_chime_path}' to {target_speakers} (cache={cache}, offset={offset}, volume_level={volume_level}, audio_conversion={self.audio_conversion!r})",
             level=self.log_level,
         )
 
@@ -256,6 +261,8 @@ class SonosNotifier(hass.Hass):
             service_data["chime_path"] = chime_path
         if tts_platform:
             service_data["tts_platform"] = tts_platform
+        if self.audio_conversion:
+            service_data["audio_conversion"] = self.audio_conversion
         try:
             response = self.call_service("chime_tts/say_url", return_response=True, **service_data)
         except Exception as e:
@@ -269,19 +276,29 @@ class SonosNotifier(hass.Hass):
         self.log(f"Rendered '{message}' as {url} ({payload.get('duration')} s)", level="DEBUG")
         return url
 
+    @staticmethod
+    def _volume_pct(level):
+        """A 0.0-1.0 volume in whole percent, or None when it is not a number."""
+        try:
+            return max(0, min(100, round(float(level) * 100)))
+        except (TypeError, ValueError):
+            return None
+
     def _announce_volume_pct(self, room, volume_level):
         """Announcement volume for one room in percent, or None when it cannot be determined.
 
-        Left without a level, Music Assistant announces louder than the player's volume.
-        A room without an explicit volume is therefore given the level it already plays at,
-        which is what a Sonos audio clip plays at when no volume is sent.
+        An explicit level is used as given. Left without a level, Music Assistant announces
+        louder than the player's volume. A room is therefore given the level it already plays
+        at, which is what a Sonos audio clip plays at when no volume is sent, but never more
+        than announce_volume_cap: a room left loud by music must not announce loudly.
         """
-        if volume_level is None:
-            volume_level = self.get_state(room, attribute="volume_level")
-        try:
-            return max(0, min(100, round(float(volume_level) * 100)))
-        except (TypeError, ValueError):
-            return None
+        if volume_level is not None:
+            return self._volume_pct(volume_level)
+        room_pct = self._volume_pct(self.get_state(room, attribute="volume_level"))
+        cap_pct = self._volume_pct(self.announce_volume_cap)
+        if room_pct is None or cap_pct is None:
+            return room_pct
+        return min(room_pct, cap_pct)
 
     def _play_announcement(self, message, url, rooms, volume_level):
         """Play the rendered clip as an announcement on the Music Assistant room entities."""
