@@ -2,27 +2,34 @@
 Salus health watchdog - admin-only alerts for the heating system's own
 plumbing: thermostat/controller connectivity, fault registers, and battery.
 
-The Salus iT600 gateway silently drops a thermostat's climate entity to
-`unavailable` on a dropout and never logs it (see homeassistant_salus's
-ENHANCEMENT_PLAN.md - Claudia's dropouts ran 16 min -> 55 min -> hours on
-2026-08-17 before anyone noticed). The wiring centre ("Control Centre") is
-worse: it is the single point of failure for ALL heating in the flat, yet HA
-exposed nothing for it until the connectivity/problem binary_sensor pair this
-alert relies on was added for it.
+A thermostat that drops off the Salus iT600 gateway raises no alarm of its
+own; the integration only shows its climate entity as `unavailable`. Any
+other climate state (off/heat/auto/...) means the thermostat is online. The
+wiring centre ("Control Centre") is the single point of failure for ALL
+heating in the flat; its connectivity binary_sensor reads `unavailable` (or
+`off`) while it is offline. A thermostat or the controller that stays offline
+for offline_minutes is pushed, and so is its recovery. `unknown` says nothing
+about the link, so it neither starts nor ends an outage.
 
 This is admin-class information - nobody needs to know their thermostat's
-battery reads 2/5 or that a Zigbee hop dropped - so every push goes to
+battery is at 25% or that a Zigbee hop dropped - so every push goes to
 Mikkel only, unlike the household-wide notify tiers used elsewhere.
 
 Entities are discovered by naming convention (thermostat_marker /
 controller_marker), not hardcoded per room, so adding, renaming or removing
-a thermostat needs no code or yaml change here.
+a thermostat needs no code or yaml change here. Thermostats are the climate
+entities whose id contains thermostat_marker (exclude_entities drops any that
+are not Salus, such as the A/C); the controller's link is the
+connectivity-class binary_sensor whose id contains controller_marker.
 """
 
 import json
 import os
 
 import appdaemon.plugins.hass.hassapi as hass
+
+ONLINE = "online"
+OFFLINE = "offline"
 
 
 class SalusHealth(hass.Hass):
@@ -45,9 +52,14 @@ class SalusHealth(hass.Hass):
         saved_state = self._load_state()
         self._offline_alerted: dict = dict(saved_state.get("offline_alerted", {}))
         self._problem_alerted: dict = dict(saved_state.get("problem_alerted", {}))
-        self._battery_alerted_level: dict = dict(saved_state.get("battery_alerted_level", {}))
+        self._battery_alerted_percent: dict = dict(saved_state.get("battery_alerted_percent", {}))
 
         connectivity_entities, problem_entities, battery_entities = self._discover_entities()
+
+        # An offline flag only means something for an entity that is watched now.
+        self._offline_alerted = {
+            e: v for e, v in self._offline_alerted.items() if e in connectivity_entities
+        }
 
         for entity_id in connectivity_entities:
             self.listen_state(self._on_connectivity_change, entity_id)
@@ -70,8 +82,8 @@ class SalusHealth(hass.Hass):
     # ---------- discovery ----------
 
     def _discover_entities(self):
-        """Find Salus diagnostic entities by naming convention rather than a
-        hardcoded per-room list - see module docstring."""
+        """Find Salus entities by naming convention rather than a hardcoded
+        per-room list - see module docstring."""
 
         def matches(entity_id, suffix):
             if entity_id in self.exclude_entities:
@@ -80,22 +92,41 @@ class SalusHealth(hass.Hass):
                 return False
             return self.thermostat_marker in entity_id or self.controller_marker in entity_id
 
-        try:
-            binary_sensors = self.get_state("binary_sensor") or {}
-        except Exception as e:
-            self.log(f"binary_sensor discovery failed: {e}", level="WARNING")
-            binary_sensors = {}
+        climates = self._domain_states("climate")
+        binary_sensors = self._domain_states("binary_sensor")
+        sensors = self._domain_states("sensor")
 
-        try:
-            sensors = self.get_state("sensor") or {}
-        except Exception as e:
-            self.log(f"sensor discovery failed: {e}", level="WARNING")
-            sensors = {}
-
-        connectivity = sorted(e for e in binary_sensors if matches(e, "_connectivity"))
-        problem = sorted(e for e in binary_sensors if matches(e, "_problem"))
+        thermostats = [
+            e for e in climates if e not in self.exclude_entities and self.thermostat_marker in e
+        ]
+        controller_links = [
+            e
+            for e, state in binary_sensors.items()
+            if e not in self.exclude_entities
+            and self.controller_marker in e
+            and self._device_class(state) == "connectivity"
+        ]
+        connectivity = sorted(thermostats + controller_links)
+        # The battery's own fault flag is covered by the percent alerts below.
+        problem = sorted(
+            e
+            for e in binary_sensors
+            if matches(e, "_problem") and not e.endswith("_battery_problem")
+        )
         battery = sorted(e for e in sensors if matches(e, "_battery_level"))
         return connectivity, problem, battery
+
+    def _domain_states(self, domain):
+        try:
+            return self.get_state(domain) or {}
+        except Exception as e:
+            self.log(f"{domain} discovery failed: {e}", level="WARNING")
+            return {}
+
+    @staticmethod
+    def _device_class(state):
+        attrs = state.get("attributes") if isinstance(state, dict) else None
+        return (attrs or {}).get("device_class")
 
     def _is_controller(self, entity_id):
         return self.controller_marker in entity_id
@@ -116,32 +147,48 @@ class SalusHealth(hass.Hass):
 
     # ---------- connectivity / offline ----------
 
+    @staticmethod
+    def _link(entity_id, state):
+        """ONLINE, OFFLINE, or None when the state says nothing about the link.
+        The integration reports an offline device as `unavailable`. A climate
+        entity's other states are its HVAC mode (off/heat/auto/...), so all of
+        them mean online; a connectivity binary_sensor is online only while
+        `on`."""
+        if state in (None, "unknown"):
+            return None
+        if state == "unavailable":
+            return OFFLINE
+        if entity_id.startswith("climate."):
+            return ONLINE
+        return ONLINE if state == "on" else OFFLINE
+
     def _init_connectivity(self, entity_id):
-        current = self.get_state(entity_id)
-        if current == "off":
+        link = self._link(entity_id, self.get_state(entity_id))
+        if link == OFFLINE:
             if not self._offline_alerted.get(entity_id, False):
                 self._arm_offline_timer(entity_id)
-            # else: already alerted before a restart and still off - keep waiting,
+            # else: already alerted before a restart and still offline - keep waiting,
             # no duplicate timer/alert needed.
-        elif current == "on":
+        elif link == ONLINE:
             if self._offline_alerted.get(entity_id, False):
                 # It recovered while AppDaemon was down/restarting - we would
-                # otherwise never see the off->on transition to report it.
+                # otherwise never see the offline->online transition to report it.
                 self._offline_alerted[entity_id] = False
                 self._save_state()
                 self.create_task(self._notify_recovery(entity_id))
-        # unknown/unavailable/None -> hold: neither arm nor clear anything.
+        # unknown/None -> hold: neither arm nor clear anything.
 
     def _on_connectivity_change(self, entity, attribute, old, new, kwargs):
-        if new == "off":
+        link = self._link(entity, new)
+        if link == OFFLINE:
             self._arm_offline_timer(entity)
-        elif new == "on":
+        elif link == ONLINE:
             self._disarm_offline_timer(entity)
             if self._offline_alerted.get(entity, False):
                 self._offline_alerted[entity] = False
                 self._save_state()
                 self.create_task(self._notify_recovery(entity))
-        # unknown/unavailable -> hold: a blip into "unknown" must not cancel a
+        # unknown -> hold: a blip into "unknown" must not cancel a
         # pending timer nor clear an already-alerted flag.
 
     def _arm_offline_timer(self, entity_id):
@@ -167,7 +214,7 @@ class SalusHealth(hass.Hass):
         self._offline_timer_handles.pop(entity_id, None)
         if self._offline_alerted.get(entity_id, False):
             return
-        if self.get_state(entity_id) != "off":
+        if self._link(entity_id, self.get_state(entity_id)) != OFFLINE:
             return
         self._offline_alerted[entity_id] = True
         self._save_state()
@@ -252,38 +299,25 @@ class SalusHealth(hass.Hass):
         self._check_battery(entity, new)
 
     def _check_battery(self, entity_id, raw_value):
-        """raw_value is now the entity's PERCENT state (see sensor.py's
-        SalusClimateBatterySensor), compared against battery_warn_percent.
-        The alerted/hysteresis level itself stays on the original 0-5 scale
-        - the raw_level attribute when present, else percent // 20, which
-        is exact because the percent state is always a multiple of 20 -
-        so it never mixes units across calls and the notify wording below
-        can keep saying "X/5" unchanged.
+        """raw_value is the battery entity's PERCENT state, compared against
+        battery_warn_percent. The alerted/hysteresis value is that same
+        percent: a further drop alerts again, a rise above the threshold
+        re-arms.
         """
         percent = self._parse_battery_level(raw_value)
         if percent is None:
             return  # unknown/unavailable/unparseable -> hold, not evidence of anything.
 
         if percent <= self.battery_warn_percent:
-            level = self._raw_battery_level(entity_id)
-            if level is None:
-                level = percent // 20
-            last_alerted = self._battery_alerted_level.get(entity_id)
-            if last_alerted is None or level < last_alerted:
-                self._battery_alerted_level[entity_id] = level
+            last_alerted = self._battery_alerted_percent.get(entity_id)
+            if last_alerted is None or percent < last_alerted:
+                self._battery_alerted_percent[entity_id] = percent
                 self._save_state()
-                self.create_task(self._notify_battery(entity_id, level))
-        elif entity_id in self._battery_alerted_level:
-            # Recovered above the threshold (replaced) - re-arm for a future drop.
-            del self._battery_alerted_level[entity_id]
+                self.create_task(self._notify_battery(entity_id, percent))
+        elif entity_id in self._battery_alerted_percent:
+            # Recovered above the threshold (recharged) - re-arm for a future drop.
+            del self._battery_alerted_percent[entity_id]
             self._save_state()
-
-    def _raw_battery_level(self, entity_id):
-        """Best-effort read of the raw_level attribute behind the percent
-        state (see sensor.py's SalusClimateBatterySensor) - the unrounded
-        0-5 truth the percentage was derived from. None if missing, so the
-        caller can derive an equivalent value from percent instead."""
-        return self._parse_battery_level(self.get_state(entity_id, attribute="raw_level"))
 
     @staticmethod
     def _parse_battery_level(value):
@@ -294,11 +328,11 @@ class SalusHealth(hass.Hass):
         except (TypeError, ValueError):
             return None
 
-    async def _notify_battery(self, entity_id, level):
+    async def _notify_battery(self, entity_id, percent):
         label = self._room_label(entity_id)
         await self._safe_notify(
             "Thermostat battery low",
-            f"{label} thermostat battery is at {level}/5 - charge soon.",
+            f"{label} thermostat battery is at {percent}% - charge soon.",
         )
 
     # ---------- notify ----------
@@ -323,7 +357,7 @@ class SalusHealth(hass.Hass):
         data = {
             "offline_alerted": self._offline_alerted,
             "problem_alerted": self._problem_alerted,
-            "battery_alerted_level": self._battery_alerted_level,
+            "battery_alerted_percent": self._battery_alerted_percent,
         }
         try:
             tmp = self.state_file + ".tmp"

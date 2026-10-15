@@ -8,18 +8,22 @@ SalusHealth:
   class: SalusHealth
   # Init-order guarantee for get_app("MobileNotifier") cached in initialize(); also reloads this app when MobileNotifier reloads.
   dependencies: MobileNotifier
-  # Substrings that identify Salus diagnostic entities among ALL binary_sensor/sensor
+  # Substrings that identify Salus entities among ALL climate/binary_sensor/sensor
   # entities in HA - entities are discovered by these markers, not hardcoded per room.
+  # Thermostats are the climate entities containing thermostat_marker; the controller's
+  # link is the connectivity-class binary_sensor containing controller_marker.
   thermostat_marker: thermostat
   controller_marker: control_centre
-  # How long a connectivity binary_sensor must read "off" continuously before alerting.
+  # How long a thermostat's climate entity, or the controller's connectivity sensor, must
+  # stay offline ("unavailable", or "off" for the sensor) continuously before alerting.
   offline_minutes: 10
-  # The battery sensor reports percent, quantized in 20-point steps because the gateway
-  # only ever sends a raw 0-5 level underneath (5 = full = 100%, so 2 = 40%). Alert at or
-  # below this percent, then again only on a further drop (40% -> 20% alerts again;
-  # staying at 40% does not re-nag).
+  # The battery sensor reports percent in coarse steps (0, 10, 25, 50, 75, 100). Alert at or
+  # below this percent, then again only on a further drop (25% -> 10% alerts again; staying
+  # at 25% does not re-nag). 40 alerts from 25% down and not at 50%.
   battery_warn_percent: 40
   notify_target: mikkel
-  # Entity ids to skip even if they match the markers above.
-  exclude_entities: []
+  # Entity ids to skip even if they match the markers above. The A/C's climate entity
+  # contains "thermostat" but is not a Salus device.
+  exclude_entities:
+    - climate.air_conditioner_thermostat
   state_file: /conf/apps/climate/salus_health_state.json
