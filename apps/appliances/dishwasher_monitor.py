@@ -683,9 +683,11 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         # Listen for door opening AND closing
         self.listen_state(self._door_state_changed, self.door_sensor)
 
-        # A programme picked after the run has finished confirms that run's record
+        # A programme or Short pick after the run has finished corrects that run's record
         if self.confirmed_programme_entity:
-            self.listen_state(self._on_programme_picked, self.confirmed_programme_entity)
+            for entity in (self.confirmed_programme_entity, self.short_entity):
+                if entity:
+                    self.listen_state(self._on_selector_changed, entity)
 
         # Listen for unavailable states
         self.listen_state(self._handle_unavailable, self.state_entity, new="unavailable")
@@ -1768,19 +1770,52 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         return (key, True)
 
     RECENT_RUN_HOURS = 12
+    FINISH_MATCH_MINUTES = 5
 
-    def _on_programme_picked(self, entity, attribute, old, new, kwargs):
-        """A programme picked once the run has finished (Unemptied, Emptied, or Off within RECENT_RUN_HOURS
-        of its record) confirms the last feedback record, the way the washer's picker confirms its last
-        one. While the run is going the finish reads the selector itself; "—" and the start's reset to it
-        confirm nothing."""
-        key = self._SELECTOR_LABEL_TO_KEY.get(new)
-        state = self.get_state(self.state_entity)
-        if key is None or state not in ("Unemptied", "Emptied", "Off"):
+    def _short_flag(self, key, state):
+        """Whether the run was short, for a programme that has the option: the Short selector's word, else
+        the classifier's guess, as _eco_short_active and _quick_short_active read them. None for any
+        other programme."""
+        if key not in ("eco", "quick"):
+            return None
+        if state == "Yes":
+            return True
+        if state == "No":
+            return False
+        return bool(self.detected_short if key == "eco" else self.detected_quick_short)
+
+    def _not_the_run_that_finished(self, record):
+        """Why `record` is not the run the dishwasher, now waiting to be emptied, has just finished; None
+        when it is: the record was saved as the monitor entered that state (state_since, which a forced
+        Unemptied stamps with no record of its own), and the run is at most RECENT_RUN_HOURS old."""
+        if record is None:
+            return "no run on record"
+        saved = self._parse_record_ts(record.get("ts"))
+        if saved is None or self.state_since is None:
+            return "the last record has no time to match"
+        if abs(saved - self.state_since) > timedelta(minutes=self.FINISH_MATCH_MINUTES):
+            return "the last record is not of the run that just finished"
+        if self._now_utc() - saved > timedelta(hours=self.RECENT_RUN_HOURS):
+            return f"the run finished more than {self.RECENT_RUN_HOURS} h ago"
+        return None
+
+    def _on_selector_changed(self, entity, attribute, old, new, kwargs):
+        """A programme or Short pick while the dishwasher waits to be emptied (self.state, never the entity,
+        which AppDaemon's store may serve stale) corrects the feedback record of the run that has just
+        finished, the way the washer's picker corrects its last one, with the pick's own value and the
+        other selector as it stands. A pick while the run is going is read by the finish itself, "—"
+        confirms nothing, and a pick that no finished run is waiting for is refused and logged."""
+        programme = new if entity == self.confirmed_programme_entity else self.get_state(self.confirmed_programme_entity)
+        key = self._SELECTOR_LABEL_TO_KEY.get(programme)
+        if key is None or self.state in ("Running", "Paused"):
             return
+        if self.state != "Unemptied":
+            self.log(f"Pick of {programme!r} ignored: the dishwasher is {self.state}, not waiting to be emptied",
+                     level="INFO")
+            return
+        short_state = new if entity == self.short_entity else (self.get_state(self.short_entity) if self.short_entity else None)
+        short = self._short_flag(key, short_state)
         import json
-        if not os.path.exists(self.feedback_file):
-            return
         try:
             with open(self.feedback_file, "r") as f:
                 data = json.load(f)
@@ -1788,31 +1823,28 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.log(f"Could not read feedback to confirm the last run: {e}", level="WARNING")
             return
         cycles = data.get("cycles") or []
-        if not cycles:
+        record = cycles[-1] if cycles else None
+        reason = self._not_the_run_that_finished(record)
+        if reason:
+            self.log(f"Pick of {programme!r} ignored: {reason}", level="INFO")
             return
-        record = cycles[-1]
-        if state == "Off":
-            saved = self._parse_record_ts(record.get("ts"))
-            if saved is None or (self._now_utc() - saved) > timedelta(hours=self.RECENT_RUN_HOURS):
-                return
-        if record.get("confirmed") == key and record.get("programme_confirmed_by_human"):
+        if (record.get("confirmed"), record.get("short")) == (key, short) and record.get("programme_confirmed_by_human"):
             return
         record["confirmed"] = key
         record["programme_confirmed_by_human"] = True
         record["programme_confirmed_via"] = "picked_after_finish"
-        if key == "eco":
-            record["short"] = self._eco_short_active()
-        elif key == "quick":
-            record["short"] = self._quick_short_active()
-        else:
+        if short is None:
             record.pop("short", None)
+        else:
+            record["short"] = short
         try:
             feedback_io.write_json(self.feedback_file, data)
         except Exception as e:
             self.log(f"Could not write feedback to confirm the last run: {e}", level="WARNING")
             return
         self._load_and_apply_feedback()
-        self.log(f"Last run confirmed as {key} after it finished", level="INFO")
+        self.log(f"Last run corrected to {key}{'' if short is None else ' short' if short else ' full'} after it finished",
+                 level="INFO")
 
     @staticmethod
     def _parse_record_ts(value):
