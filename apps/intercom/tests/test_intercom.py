@@ -617,6 +617,20 @@ class AbbNativeUnlockTests(unittest.TestCase):
 
         self._assert_door_is_held(app)
 
+    def test_a_stale_cached_bridge_is_never_asked(self):
+        """A bridge that reloaded on its own leaves its old instance with a visit
+        nobody will close. Only the live bridge may answer."""
+        app = self._held_front_door_app()
+
+        class StaleBridge:
+            def voice_already_spoken(self, door):
+                return True
+        app.abb_bridge = StaleBridge()
+        self._with_bridge(app, False)
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+
+        self._assert_door_is_held(app)
+
     def test_abb_ack_in_time_succeeds_without_esp_unlock(self):
         app = self._app({"front door": "button.abb_front"})
         app._handle_trigger("binary_sensor.front", "state", "off", "on", {})

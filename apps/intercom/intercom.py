@@ -274,10 +274,12 @@ class Intercom(hass.Hass):
         Same contract as _abb_defer_ring_push: any problem at all is a False,
         and the caller holds the door exactly as before. Never raises."""
         try:
-            if self.abb_bridge is None:
-                self.abb_bridge = self.get_app("AbbWelcomeBridge")
-            if self.abb_bridge:
-                return bool(self.abb_bridge.voice_already_spoken(ring_label))
+            # Looked up on every call, never cached: a bridge that reloaded on its
+            # own leaves its old instance with a visit nobody will ever close, and
+            # asking that copy would answer True for every later ring.
+            bridge = self.get_app("AbbWelcomeBridge")
+            if bridge:
+                return bool(bridge.voice_already_spoken(ring_label))
         except Exception as e:
             try:
                 self.log(f"ABB voice-repeat check unavailable: {e}", level="DEBUG")
