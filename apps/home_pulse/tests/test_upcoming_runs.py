@@ -16,6 +16,7 @@ import upcoming_guides as guides  # noqa: E402
 import upcoming_runs as runs  # noqa: E402
 
 NOW = datetime(2026, 10, 15, 10, 30, tzinfo=timezone.utc)
+MIN = timedelta(minutes=1)
 HOUR = timedelta(hours=1)
 DAY = timedelta(days=1)
 AREAS = {"washer": "guest_bathroom", "dishwasher": "kitchen", "dryer": "guest_bathroom"}
@@ -165,6 +166,36 @@ class CountingTests(unittest.TestCase):
         status = runs.statuses(ledgers(dishwasher=cycles), {}, NOW)["dishwasher:hygiene"]
         self.assertEqual((status.since, status.left), (5, 10))
         self.assertEqual(status.when, NOW - 11 * DAY)
+
+    def test_a_run_going_when_a_task_was_seeded_counts_once_it_has_finished(self):
+        going = dish(NOW + 2 * HOUR, duration_min=240.0)
+        led = ledgers(dishwasher=every_two_days(dish, 50) + [going])
+        found = runs.statuses(led, seeded(led), NOW + 3 * HOUR)
+        self.assertEqual((found["dishwasher:filters"].since, found["dishwasher:filters"].left), (1, 29))
+        self.assertEqual(found["dishwasher:check"].since, 1)
+
+    def test_a_run_going_when_done_was_tapped_counts_once_it_has_finished(self):
+        going = wash(NOW + 2 * HOUR, duration_min=180.0)
+        led = ledgers(washer=every_two_days(wash, 60) + [going])
+        done = runs.mark_done(seeded(led, NOW - 30 * DAY), "washer:inlet", NOW, 60)
+        self.assertEqual(runs.statuses(led, done, NOW + 3 * HOUR)["washer:inlet"].since, 1)
+
+    def test_the_confirmed_run_saved_again_later_does_not_count_against_its_own_task(self):
+        cycles = every_two_days(dish, 50)
+        confirmed = dish(NOW - 11 * DAY, confirmed="intensive", programme_confirmed_by_human=True)
+        again = dish(NOW - 11 * DAY + 40 * MIN, duration_min=270.0)
+        cycles = [c for c in cycles if c["ts"] != confirmed["ts"]] + [confirmed, again]
+        status = runs.statuses(ledgers(dishwasher=cycles), {}, NOW)["dishwasher:hygiene"]
+        self.assertEqual(status.when, NOW - 11 * DAY)
+        self.assertEqual(status.since, 5)
+
+    def test_a_drum_clean_saved_again_later_does_not_count_against_its_own_task(self):
+        cycles = every_two_days(wash, 60)
+        clean = drum_clean_run(NOW - 9 * DAY)
+        again = wash(NOW - 9 * DAY + 50 * MIN, duration_min=200.0, completion_class="suspect")
+        cycles = [c for c in cycles if c["ts"] != clean["ts"]] + [clean, again]
+        status = runs.statuses(ledgers(washer=cycles), {}, NOW)["washer:drum"]
+        self.assertEqual(status.since, 4)
 
     def test_a_guess_at_intensive_is_not_a_confirmation(self):
         cycles = replace(every_two_days(dish, 50), 5, dish(NOW - 11 * DAY, confirmed="intensive"))

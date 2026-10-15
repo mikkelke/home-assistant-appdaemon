@@ -18,8 +18,8 @@ def last_clean(ledger):
 
 
 def runs_since(ledger):
-    """The runs on record since the last confirmed drum clean, all of them while none is."""
-    return run_ledger.count_since(ledger.runs, last_clean(ledger))
+    """The runs on record after the last confirmed drum clean, all of them while none is."""
+    return run_ledger.count_after_run(ledger.runs, last_clean(ledger))
 
 
 def due(ledger):

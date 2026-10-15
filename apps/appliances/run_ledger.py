@@ -78,11 +78,20 @@ def ledger(cycles):
 
 
 def count_since(runs, since):
-    """The runs that began after `since` (an aware datetime), all of them for None. A run that began
-    within OVERLAP before it is the run `since` itself ended, or began a moment early by the estimate."""
+    """The runs that finished after `since` (an aware datetime), all of them for None. A run still going
+    at `since` counts once it finishes."""
     if since is None:
         return len(runs)
-    return sum(1 for run in runs if run.start >= since - OVERLAP)
+    return sum(1 for run in runs if run.end > since)
+
+
+def count_after_run(runs, ended):
+    """The runs after the run a person confirmed, which ended at `ended`: those that finished after it and
+    did not begin more than OVERLAP before it. The confirmed run, saved again by a resumed cycle so that
+    it ends later, began long before and is not one of them. All of the runs for None."""
+    if ended is None:
+        return len(runs)
+    return sum(1 for run in runs if run.end > ended and run.start >= ended - OVERLAP)
 
 
 def per_week(runs, now, default):

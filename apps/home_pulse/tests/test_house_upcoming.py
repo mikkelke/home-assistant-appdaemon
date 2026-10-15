@@ -551,6 +551,18 @@ class RunTaskTests(unittest.TestCase):
         self.assertTrue(shown["maint:washer:inlet"]["detail"].startswith("hose + valve filters, 90 runs left"))
         self.assertEqual(shown["maint:dishwasher:hygiene"]["detail"], "Intensive 75, due, last unknown")
 
+    def test_a_run_going_when_the_tasks_were_seeded_is_counted_when_it_finishes(self):
+        app = make_app()
+        seeded_at = state_file(app)["done"]["dishwasher:filters"]["at"]
+        cycles = every_two_days("dishwasher", NOW) + [dish_run(NOW + 2 * HOUR, duration_min=240.0)]
+        write_ledger(app.state_dir, "dishwasher", cycles)
+        tick(app, 3 * HOUR)
+        self.assertEqual(state_file(app)["done"]["dishwasher:filters"]["at"], seeded_at)
+        shown = rows(app)
+        self.assertTrue(shown["maint:dishwasher:filters"]["detail"].startswith("rinse filter + arms, 29 runs left"))
+        self.assertTrue(shown["maint:dishwasher:check"]["detail"].startswith("seal, sides, inside, 59 runs left"))
+        self.assertTrue(shown["maint:washer:inlet"]["detail"].startswith("hose + valve filters, 90 runs left"))
+
     def test_a_ledger_is_read_again_only_when_its_file_has_changed(self):
         app = make_app()
         reads = []

@@ -10,8 +10,9 @@ say when. Without one on record the task is due, its row says "last unknown", an
 missing evidence is not an overdue clean. A tapped task is closed by an admin tapping Done in the
 row's sheet, which fires house_upcoming_done; the anchor `{at, runs}` says when and at which run
 count, and keeps the anchor it replaced for one undo. Runs are counted from the time, not the count,
-so a change to what counts as a run never shifts an anchor. A tapped task with no anchor is seeded at
-the moment it is first seen, so it does not open overdue.
+so a change to what counts as a run never shifts an anchor: the runs that finish after it, a run still
+going at that moment included. A confirmed task counts the runs after the confirmed one. A tapped task
+with no anchor is seeded at the moment it is first seen, so it does not open overdue.
 
 A row says how many runs are left and, at the pace of the last 90 days, the day they run out (~dd.mm;
 timed at DUE_TIME that day, beyond ROW_HORIZON_DAYS none; DEFAULT_PER_WEEK until the ledger covers
@@ -143,12 +144,13 @@ def statuses(ledgers, anchors, now, tasks=TASKS):
         seeded = False
         if task.confirmed is not None:
             when = task.confirmed(led)
+            since = run_ledger.count_after_run(led.runs, when)
         else:
             anchor = anchors.get(task.key) or {}
             when, seeded = parse_iso(anchor.get("at")), bool(anchor.get("seed"))
             if when is None:
                 continue
-        since = run_ledger.count_since(led.runs, when)
+            since = run_ledger.count_since(led.runs, when)
         left = None if task.interval is None else max(0, task.interval - since)
         pace = run_ledger.per_week(led.runs, now, DEFAULT_PER_WEEK[task.appliance])
         out[task.key] = Status(task, when, seeded, since, left, pace)

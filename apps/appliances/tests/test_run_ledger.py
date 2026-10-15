@@ -137,31 +137,71 @@ class TwoRunsTests(unittest.TestCase):
 
 
 class CountSinceTests(unittest.TestCase):
+    """For a task an anchor closes (a tapped Done, or the moment a task was first seen): the runs that finished
+    after it."""
+
     RUNS = rl.finished_runs([dish(iso(at(day, 10)), 230.0) for day in (1, 3, 5, 7)])
 
     def test_none_counts_every_run(self):
         self.assertEqual(rl.count_since(self.RUNS, None), 4)
         self.assertEqual(rl.count_since([], None), 0)
 
-    def test_the_runs_that_began_after_the_moment(self):
+    def test_the_runs_that_finished_after_the_moment(self):
         self.assertEqual(rl.count_since(self.RUNS, at(5, 12)), 1)
         self.assertEqual(rl.count_since(self.RUNS, at(3, 12)), 2)
         self.assertEqual(rl.count_since(self.RUNS, at(8, 0)), 0)
         self.assertEqual(rl.count_since(self.RUNS, at(1, 0)), 4)
 
-    def test_the_run_a_moment_ended_is_not_counted_and_the_next_one_is(self):
-        ended = self.RUNS[1].end
-        self.assertEqual(rl.count_since(self.RUNS, ended), 2)
-        self.assertEqual(rl.count_since(self.RUNS, self.RUNS[2].start - timedelta(minutes=5)), 2)
+    def test_a_run_still_going_at_the_moment_counts_once_it_has_finished(self):
+        self.assertEqual(rl.count_since(self.RUNS, at(5, 8)), 2)
+        run = rl.finished_runs([wash("2026-10-15T14:00:00+00:00", 120.0)])
+        self.assertEqual(rl.count_since(run, datetime(2026, 10, 15, 13, tzinfo=timezone.utc)), 1)
+        self.assertEqual(rl.count_since(run, datetime(2026, 10, 15, 14, tzinfo=timezone.utc)), 0)
 
-    def test_a_run_that_began_a_few_minutes_before_the_moment_by_the_estimate_still_counts(self):
-        started = self.RUNS[2].start
-        self.assertEqual(rl.count_since(self.RUNS, started + timedelta(minutes=5)), 2)
-        self.assertEqual(rl.count_since(self.RUNS, started + timedelta(minutes=11)), 1)
+    def test_the_run_that_ended_at_the_moment_is_not_counted_and_the_next_one_is(self):
+        self.assertEqual(rl.count_since(self.RUNS, self.RUNS[1].end), 2)
+        self.assertEqual(rl.count_since(self.RUNS, self.RUNS[1].end - timedelta(seconds=1)), 3)
 
-    def test_a_record_saved_twice_for_the_run_that_ended_it_adds_nothing(self):
-        runs = rl.finished_runs([dish(iso(at(5, 10)), 230.0), dish(iso(at(5, 10) + timedelta(minutes=40)), 270.0)])
-        self.assertEqual(rl.count_since(runs, at(5, 10)), 0)
+    def test_a_run_that_began_before_the_moment_and_ended_after_it_is_never_lost(self):
+        for moment in (at(5, 6, 11), at(5, 8), at(5, 9, 59)):
+            self.assertEqual(rl.count_since(self.RUNS, moment), 2, moment)
+
+
+class CountAfterRunTests(unittest.TestCase):
+    """For a task a confirmed run closes: the runs after that run, which does not count itself."""
+
+    RUNS = rl.finished_runs([dish(iso(at(day, 10)), 230.0) for day in (1, 3, 5, 7)])
+
+    def test_none_counts_every_run(self):
+        self.assertEqual(rl.count_after_run(self.RUNS, None), 4)
+        self.assertEqual(rl.count_after_run([], None), 0)
+
+    def test_the_confirmed_run_is_not_counted_and_the_runs_after_it_are(self):
+        self.assertEqual(rl.count_after_run(self.RUNS, self.RUNS[0].end), 3)
+        self.assertEqual(rl.count_after_run(self.RUNS, self.RUNS[2].end), 1)
+        self.assertEqual(rl.count_after_run(self.RUNS, self.RUNS[3].end), 0)
+
+    def test_the_confirmed_run_saved_again_ending_later_does_not_count_itself(self):
+        runs = rl.finished_runs([dish(iso(at(5, 10)), 230.0), dish(iso(at(5, 10) + timedelta(minutes=40)), 270.0),
+                                 dish(iso(at(7, 10)), 230.0)])
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(runs[0].end, at(5, 10) + timedelta(minutes=40))
+        self.assertEqual(rl.count_after_run(runs, at(5, 10)), 1)
+
+    def test_the_confirmed_run_saved_again_hours_later_does_not_count_itself_either(self):
+        runs = rl.finished_runs([dish(iso(at(5, 10)), 230.0), dish(iso(at(5, 14)), 470.0), dish(iso(at(7, 10)), 230.0)])
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(rl.count_after_run(runs, at(5, 10)), 1)
+
+    def test_a_run_started_a_few_minutes_before_the_confirmed_one_ended_by_the_estimate_counts(self):
+        runs = rl.finished_runs([dish(iso(at(5, 10)), 230.0), dish(iso(at(5, 13, 5)), 190.0)])
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(runs[1].start, at(5, 9, 55))
+        self.assertEqual(rl.count_after_run(runs, at(5, 10)), 1)
+
+    def test_a_run_that_finished_before_the_confirmed_one_never_counts(self):
+        self.assertEqual(rl.count_after_run(self.RUNS, at(7, 10)), 0)
+        self.assertEqual(rl.count_after_run(self.RUNS, at(4, 0)), 2)
 
 
 class PerWeekTests(unittest.TestCase):
