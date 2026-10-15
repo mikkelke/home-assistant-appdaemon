@@ -101,6 +101,9 @@ class LivingRoomTvControl(hass.Hass):
         self.apple_tv_remote_entity = "remote." + self.apple_tv_entity.split(".", 1)[-1]
         self.apple_tv_reconnect_cooldown_seconds = float(self.args.get("apple_tv_reconnect_cooldown_seconds", 600))
         self._apple_reconnect_at = None
+        self.apple_tv_disconnect_grace_seconds = float(self.args.get("apple_tv_disconnect_grace_seconds", 120))
+        self._apple_tv_disconnect_handle = None
+        self._apple_tv_grace_elapsed = False
 
         # Power-aware wall move (optional; default off until YAML opts in)
         self.power_aware_wall_move_enabled = bool(self.args.get("power_aware_wall_move_enabled", False))
@@ -217,6 +220,8 @@ class LivingRoomTvControl(hass.Hass):
             # Listen for lift position changes to cancel wall moves when manually moved away
             self.listen_state(self._on_lift_position_changed, self.lift_select_entity)
 
+            self.listen_state(self._on_apple_tv_remote_connected, self.apple_tv_remote_entity, new="on")
+
             if (
                 self.power_aware_wall_move_enabled
                 and self.tv_power_entity
@@ -232,6 +237,7 @@ class LivingRoomTvControl(hass.Hass):
         # This handles the case where AppDaemon restarts while TV is off
         self.run_in(self._check_tv_state_on_init, 5)  # Delay slightly for HA to be fully ready
         self.run_in(self._reconnect_apple_tv_on_init, 5)
+        self.run_in(self._arm_apple_tv_disconnect_on_init, 5)
         
         self.log("LivingRoomTvControl Initialization complete.")
 
@@ -822,6 +828,7 @@ class LivingRoomTvControl(hass.Hass):
         except Exception as e:
             self.log(f"sonos_reset_speakers failed: {e}", level="WARNING")
         self.run_in(self._isolate_family_zone, 0.5)
+        self._reconnect_apple_tv_if_needed("TV turned on")
 
         if self.apple_tv_reset_enabled:
             if self._apple_tv_reset_handle:
@@ -1114,6 +1121,7 @@ class LivingRoomTvControl(hass.Hass):
         
         # Debounce "off" state changes to avoid premature lift movement
         if new == "off" and old != "off":
+            self._arm_apple_tv_disconnect("TV off")
             self._cancel_power_standby_monitor("universal TV off")
             self._cancel_power_on_confirm(reason="TV transitioning off: cancel pending power-on confirm")
             # Cancel any existing debounce timer
@@ -1130,6 +1138,7 @@ class LivingRoomTvControl(hass.Hass):
             return
 
         if new != "off":
+            self._cancel_apple_tv_disconnect()
             self._cancel_session_end_wall_timer("TV no longer off")
             if self._power_wall_verify_handle:
                 self._cancel_power_wall_verify(
@@ -1312,6 +1321,63 @@ class LivingRoomTvControl(hass.Hass):
             )
         except Exception as e:
             self.log(f"Apple TV reconnect ({reason}) failed: {e}", level="WARNING")
+
+    def _arm_apple_tv_disconnect_on_init(self, kwargs):
+        if self._tv_is_on():
+            self.log("Apple TV disconnect (startup): TV is on - nothing to do")
+            return
+        self._arm_apple_tv_disconnect("startup")
+
+    def _arm_apple_tv_disconnect(self, reason):
+        """Start the grace period after which a still-off TV gets the Apple TV disconnected."""
+        self._cancel_apple_tv_disconnect()
+        try:
+            self._apple_tv_disconnect_handle = self.run_in(
+                self._apple_tv_disconnect_due, self.apple_tv_disconnect_grace_seconds
+            )
+            self.log(
+                f"Apple TV disconnect ({reason}): will disconnect in "
+                f"{self.apple_tv_disconnect_grace_seconds:.0f}s if the TV is still off"
+            )
+        except Exception as e:
+            self.log(f"Apple TV disconnect ({reason}): could not schedule: {e}", level="WARNING")
+
+    def _cancel_apple_tv_disconnect(self):
+        self._safe_cancel_timer(self._apple_tv_disconnect_handle)
+        self._apple_tv_disconnect_handle = None
+        self._apple_tv_grace_elapsed = False
+
+    def _apple_tv_disconnect_due(self, kwargs):
+        self._apple_tv_disconnect_handle = None
+        if self._tv_is_on():
+            self.log("Apple TV disconnect (grace elapsed): TV is on - nothing to do")
+            return
+        self._apple_tv_grace_elapsed = True
+        self._disconnect_apple_tv("grace elapsed")
+
+    def _on_apple_tv_remote_connected(self, entity, attribute, old, new, kwargs):
+        """While the box sleeps the integration keeps reconnecting by itself; once the grace
+        has elapsed with the TV off, every such reconnect is cut again."""
+        if self._apple_tv_grace_elapsed and not self._tv_is_on():
+            self._disconnect_apple_tv("reconnected while the TV is off", remote_state=new)
+
+    def _disconnect_apple_tv(self, reason, remote_state=None):
+        """remote.turn_off only closes the integration's connection; it sends no command to
+        the Apple TV or the TV."""
+        try:
+            if remote_state is None:
+                remote_state = self.get_state(self.apple_tv_remote_entity)
+            if remote_state != "on":
+                self.log(f"Apple TV disconnect ({reason}): remote is '{remote_state}' - nothing to do")
+                return
+            self.call_service("remote/turn_off", entity_id=self.apple_tv_remote_entity)
+            self._apple_reconnect_at = None
+            self.log(
+                f"Apple TV disconnect ({reason}): TV is off - "
+                f"remote.turn_off sent to {self.apple_tv_remote_entity}"
+            )
+        except Exception as e:
+            self.log(f"Apple TV disconnect ({reason}) failed: {e}", level="WARNING")
 
     def _apple_tv_remote_reset(self, kwargs):
         # Toggle the Apple TV remote power to refresh state
@@ -1537,6 +1603,8 @@ class LivingRoomTvControl(hass.Hass):
             if tv_already_on:
                 self.log("TV already on; skipping WoL and power-on calls")
                 return
+
+            self._arm_apple_tv_disconnect("TV power-on requested")
 
             # WoL first if configured
             try:

@@ -50,6 +50,7 @@ living_room_tv_control:
   apple_tv_reset_enabled: true
   apple_tv_reset_delay_seconds: 30  # seconds to wait after TV turns on before resetting
   apple_tv_reconnect_cooldown_seconds: 600  # at most one reconnect request per window
+  apple_tv_disconnect_grace_seconds: 120  # TV off this long -> remote.turn_off disconnects the Apple TV integration
 
   # Optional Wake-on-LAN helper button to nudge TV power-on
   wol_button_entity: button.wake_on_lan_c4_08_26_6d_25_0e
