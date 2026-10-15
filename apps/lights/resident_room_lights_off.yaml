@@ -1,0 +1,26 @@
+# /conf/apps/lights/resident_room_lights_off.yaml
+
+# A resident's room lights go off once the room has stood empty for vacancy_hold_min while
+# its owner is away. The hold has to outlast the radar losing a still, awake occupant, so a
+# guest left sitting in the room keeps the light. See the module docstring for the rule.
+resident_room_lights_off:
+  module: resident_room_lights_off
+  class: ResidentRoomLightsOff
+  vacancy_hold_min: 60
+  rooms:
+    # Key = the room_active zone (binary_sensor.<zone>_active). name = the resident's HA
+    # user name: it words the feed row and is the only non-admin who sees it.
+    claudias_room:
+      owner: person.claudia
+      name: Claudia
+      room_label: her room
+      lights:
+        - light.claudias_room_ceiling_lights
+        - light.claudias_room_string_lights
+    kristines_room:
+      owner: person.kristine
+      name: Kristine
+      room_label: her room
+      lights:
+        - light.floor_lamp
+        - light.small_lamp
