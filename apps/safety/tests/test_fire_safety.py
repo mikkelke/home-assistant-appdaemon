@@ -168,12 +168,12 @@ def _make_app(**overrides):
     app.monthly_test_person_entities = ["person.mikkel", "person.kristine", "person.claudia"]
     app.monthly_test_max_retry_days = 7
     app.sonos_kitchen_entity = "media_player.kitchen"
-    app.sonos_all_entity = "media_player.sonos_tts_all"
+    app.sonos_all_entities = ["media_player.living_room", "media_player.bedroom"]
     app.sonos_kitchen_volume = 0.15
     app.sonos_alarm_volume = 0.7
     app.alarm_lights = ["light.hallway_lights"]
     app.alarm_light_manual_booleans = ["input_boolean.hallway_lights_manual"]
-    app.media_pause_players = ["media_player.sonos_tts_all"]
+    app.media_pause_players = ["media_player.living_room", "media_player.bedroom"]
     app._source_entities = [app.smoke_entity, app.siren_state_entity]
     app._tz = None
 
@@ -692,6 +692,7 @@ class StaleDeviceMidEpisode(_FrozenTimeTestCase):
         self.assertIn("stopped reporting", app.mobile_notifier.calls[0]["message"])
         self.assertEqual(len(app.sonos_notifier.calls), 1)
         self.assertTrue(app.sonos_notifier.calls[0].get("override_quiet_hours"))
+        self.assertEqual(app.sonos_notifier.calls[0]["target_speakers"], app.sonos_all_entities)
         self.assertTrue(app.stale_alarm_notified)
 
         # Still stale on the next tick - must not resend, and repeats stay stopped.

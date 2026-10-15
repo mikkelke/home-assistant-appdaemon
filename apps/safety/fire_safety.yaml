@@ -129,7 +129,16 @@ FireSafety:
 
   # --- Sonos ---
   sonos_kitchen_entity: media_player.kitchen
-  sonos_all_entity: media_player.sonos_tts_all
+  sonos_all_entities:
+    - media_player.living_room
+    - media_player.kitchen
+    - media_player.dining_room
+    - media_player.bedroom
+    - media_player.bathroom
+    - media_player.guest_bathroom
+    - media_player.kristines_room
+    - media_player.claudias_room
+    - media_player.rooftop
   sonos_kitchen_volume: 0.15
   sonos_alarm_volume: 0.7
 
@@ -150,6 +159,14 @@ FireSafety:
 
   # --- Media pause targets ---
   media_pause_players:
-    - media_player.sonos_tts_all
+    - media_player.living_room
+    - media_player.kitchen
+    - media_player.dining_room
+    - media_player.bedroom
+    - media_player.bathroom
+    - media_player.guest_bathroom
+    - media_player.kristines_room
+    - media_player.claudias_room
+    - media_player.rooftop
     - media_player.living_room_tv
     - media_player.bedroom_tv

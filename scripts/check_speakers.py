@@ -13,6 +13,9 @@ Checked:
   - group_manager.yaml player list
   - family_room_volume_sync.yaml speakers (registry MA ids with <id>_2 twins) + tv_speaker
   - music_attribution.yaml raw_to_base_map pairs
+  - sonos_notifier.yaml  TTS target groups (registry `tts:` tags all/family/kristine/ms)
+  - fire_safety.yaml     house-wide announcement rooms + media pause rooms, kitchen entity
+  - living_room_tv_control.yaml announcement speakers (registry MA entities, never a native twin)
   - dashboard (optional, if repo present): speakers.ts ids
 
 Run: python3 scripts/check_speakers.py   (deploy.sh runs it before rsync)
@@ -91,6 +94,40 @@ def main():
           f"music_attribution raw_to_base_map drift: only-in-yaml="
           f"{sorted(set(mus_map.items()) - set(pairs.items()))} "
           f"missing={sorted(set(pairs.items()) - set(mus_map.items()))}")
+
+    tts_rooms = {}
+    for v in reg.values():
+        for tag in v.get("tts") or []:
+            tts_rooms.setdefault(tag, set()).add(v["ma_entity"])
+    raw = set(pairs)
+
+    sn_fname = "apps/notify/sonos_notifier.yaml"
+    sn = next(iter(load(sn_fname).values()))
+    for key, tag in (("tts_group_all", "all"), ("tts_group_family_rooms", "family"),
+                     ("tts_group_kristine", "kristine"), ("tts_group_ms", "ms")):
+        got, want = set(sn.get(key) or []), tts_rooms.get(tag, set())
+        check(got == want,
+              f"{sn_fname}: {key} != registry tts:{tag}: only-in-yaml={sorted(got - want)} "
+              f"missing={sorted(want - got)}")
+
+    fs_fname = "apps/safety/fire_safety.yaml"
+    fs = next(iter(load(fs_fname).values()))
+    got, want = set(fs.get("sonos_all_entities") or []), tts_rooms.get("all", set())
+    check(got == want,
+          f"{fs_fname}: sonos_all_entities != registry tts:all: only-in-yaml={sorted(got - want)} "
+          f"missing={sorted(want - got)}")
+    check(fs.get("sonos_kitchen_entity") in ma,
+          f"{fs_fname}: sonos_kitchen_entity {fs.get('sonos_kitchen_entity')} is not a registry MA entity")
+    pause = set(fs.get("media_pause_players") or [])
+    check(pause & raw == set(), f"{fs_fname}: media_pause_players names native twins {sorted(pause & raw)}")
+    check(pause & ma == ma,
+          f"{fs_fname}: media_pause_players missing speakers {sorted(ma - pause)}")
+
+    tv_fname = "apps/tv/living_room_tv_control.yaml"
+    tv = next(iter(load(tv_fname).values()))
+    announce = set(tv.get("announce_speakers_living") or [])
+    check(announce and announce <= ma,
+          f"{tv_fname}: announce_speakers_living {sorted(announce)} are not registry MA entities")
 
     # Dashboard (best effort - skipped when the repo is not checked out here)
     sp_ts = os.path.join(DASHBOARD, "src/config/speakers.ts")

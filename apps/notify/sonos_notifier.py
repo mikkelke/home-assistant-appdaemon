@@ -14,11 +14,11 @@ class SonosNotifier(hass.Hass):
         self.kristine_sleep_mode_entity = self.args.get("kristine_sleep_mode_entity")
         self.mikkel_sleep_mode_entity = self.args.get("mikkel_sleep_mode_entity")
 
-        # Speaker Configuration (group entities for TTS routing)
-        self.tts_group_all = self.args.get("tts_group_all")  # everyone awake
-        self.tts_group_family_rooms = self.args.get("tts_group_family_rooms")  # always used
-        self.tts_group_kristine = self.args.get("tts_group_kristine")  # when only Mikkel sleeps
-        self.tts_group_ms = self.args.get("tts_group_ms")  # when only Kristine sleeps
+        # Speaker Configuration (Music Assistant room entities per TTS target group)
+        self.tts_group_all = self._entity_list(self.args.get("tts_group_all"))  # everyone awake
+        self.tts_group_family_rooms = self._entity_list(self.args.get("tts_group_family_rooms"))  # always used
+        self.tts_group_kristine = self._entity_list(self.args.get("tts_group_kristine"))  # when only Mikkel sleeps
+        self.tts_group_ms = self._entity_list(self.args.get("tts_group_ms"))  # when only Kristine sleeps
 
         # TTS Configuration
         self.default_chime_path = self.args.get("default_chime_path")
@@ -111,28 +111,23 @@ class SonosNotifier(hass.Hass):
             return in_quiet_hours_now
         return state == "on"
 
-    def _normalize_sonos_entity(self, entity_id):
-        """Normalize Sonos entity IDs from legacy cloud suffix to direct entity.
-
-        Example: media_player.living_room_2 -> media_player.living_room
-        """
-        try:
-            if isinstance(entity_id, str) and entity_id.startswith("media_player.") and entity_id.endswith("_2"):
-                return entity_id[:-2]
-        except Exception:
-            pass
-        return entity_id
-
-    def _normalize_target_list(self, entities):
-        """Return a new list with normalized Sonos entity IDs."""
+    @staticmethod
+    def _entity_list(entities):
+        """An entity id or a list of them as a list without duplicates or empty values, order kept."""
         if entities is None:
             return []
-        try:
-            if isinstance(entities, str):
-                entities = [entities]
-            return [self._normalize_sonos_entity(e) for e in list(entities)]
-        except Exception:
-            return list(entities) if isinstance(entities, list) else []
+        if isinstance(entities, str):
+            entities = [entities]
+        return list(dict.fromkeys(e for e in entities if e))
+
+    @staticmethod
+    def _say_url_payload(response):
+        """chime_tts.say_url's own result dict inside AppDaemon's service-response envelope."""
+        node = response
+        for key in ("result", "response"):
+            if isinstance(node, dict) and key in node:
+                node = node[key]
+        return node if isinstance(node, dict) else {}
 
     def notify(
         self,
@@ -150,10 +145,14 @@ class SonosNotifier(hass.Hass):
             message (str): The message to be spoken.
             chime_path (str, optional): Path to the chime sound file.
                                       Defaults to 'default_chime_path' from config.
+            target_speakers (str | list, optional): Music Assistant room entities to announce on.
+                Defaults to the sleep-mode based group selection.
             override_quiet_hours (bool, optional): Skip the quiet-hours check and announce
                 anyway. For life-safety callers only. Defaults to False.
-            volume_level (float, optional): Passed through to chime_tts/say when given.
-            **kwargs: Placeholder for future arguments.
+            volume_level (float, optional): Announcement volume (0.0-1.0) in every target room.
+                When omitted each room announces at its current volume.
+            **kwargs: cache (default True), offset (default -300) and tts_platform for the
+                chime_tts render.
         """
         if not message:
             self.log("Notification attempt with no message. Aborting.", level="WARNING")
@@ -200,7 +199,7 @@ class SonosNotifier(hass.Hass):
 
         # Determine target speakers (override wins; otherwise use grouped strategy)
         if target_speakers is not None:
-            target_speakers = self._normalize_target_list(target_speakers)
+            target_speakers = self._entity_list(target_speakers)
             self.log(f"Initial target speakers (override provided): {target_speakers}", level="DEBUG")
         else:
             kristine_sleep_state = self.get_state(self.kristine_sleep_mode_entity) if self.kristine_sleep_mode_entity else "off"
@@ -212,20 +211,19 @@ class SonosNotifier(hass.Hass):
             everyone_sleeping = kristine_sleeping and mikkel_sleeping
 
             if everyone_sleeping:
-                target_speakers = [self.tts_group_family_rooms]
+                target_speakers = self.tts_group_family_rooms
                 self.log("All sleeping -> using family rooms group", level="INFO")
             elif kristine_sleeping:
-                target_speakers = [self.tts_group_family_rooms, self.tts_group_ms]
+                target_speakers = self.tts_group_family_rooms + self.tts_group_ms
                 self.log("Kristine sleeping -> family rooms + Mikkel group", level="INFO")
             elif mikkel_sleeping:
-                target_speakers = [self.tts_group_family_rooms, self.tts_group_kristine]
+                target_speakers = self.tts_group_family_rooms + self.tts_group_kristine
                 self.log("Mikkel sleeping -> family rooms + Kristine group", level="INFO")
             else:
-                target_speakers = [self.tts_group_all]
+                target_speakers = self.tts_group_all
                 self.log("No one sleeping -> all speakers group", level="DEBUG")
 
-        # Remove duplicates/None and normalize
-        target_speakers = self._normalize_target_list([t for t in target_speakers if t])
+        target_speakers = self._entity_list(target_speakers)
         if not target_speakers:
             self.log(f"No target speakers determined. Notification for '{message}' will be skipped.", level="ERROR")
             return
@@ -234,61 +232,88 @@ class SonosNotifier(hass.Hass):
 
         if not actual_chime_path:
             self.log(f"No chime path provided or configured. Sending TTS for '{message}' to {target_speakers} without chime.", level="WARNING")
-            # Potentially call a different service or the same service without chime_path if supported
-            # For now, we assume chime_tts.say requires it or handles its absence gracefully.
 
-        # Extract optional service parameters (defaults aligned with central policy)
-        announce = bool(kwargs.get("announce", True))
-        fade_audio = bool(kwargs.get("fade_audio", True))
-        cache = kwargs.get("cache", True)  # cache re-enabled: recreating the piper container (2.2.2-ls113) cleared chime_tts/piper stuck state; tested 8/8 clean. If silent-doorbell ("Unable to generate local audio filepath") recurs -> restart piper container, or set this False (backup .bak_cachefalse).
-        # Keep offset support; default to -300 to start TTS sooner after chime
+        cache = kwargs.get("cache", True)
         offset = kwargs.get("offset", -300)
+        tts_platform = kwargs.get("tts_platform")
+        if tts_platform is None:
+            tts_platform = self.tts_platform
 
         self.log(
-            f"Sending TTS: '{message}' with chime '{actual_chime_path}' to {target_speakers} (announce={announce}, fade_audio={fade_audio}, cache={cache}, offset={offset})",
+            f"Sending TTS: '{message}' with chime '{actual_chime_path}' to {target_speakers} (cache={cache}, offset={offset}, volume_level={volume_level})",
             level=self.log_level,
         )
 
-        # Original service call logic:
-        # 'target_speakers' is already filtered and checked for emptiness before the "Sending TTS..." log.
+        url = self._render_announcement(message, actual_chime_path, cache, offset, tts_platform)
+        if url is None:
+            return
+        self._play_announcement(message, url, target_speakers, volume_level)
 
-        self.log(f"Preparing single API call to chime_tts/say for target(s): {target_speakers}", level="DEBUG")
-        
+    def _render_announcement(self, message, chime_path, cache, offset, tts_platform):
+        """Render chime + speech with chime_tts and return the URL of the combined mp3, or None."""
+        service_data = {"message": message, "cache": cache, "offset": offset}
+        if chime_path:
+            service_data["chime_path"] = chime_path
+        if tts_platform:
+            service_data["tts_platform"] = tts_platform
         try:
-            # Build service data and include tts_platform only if explicitly configured
-            tts_platform_override = kwargs.get("tts_platform")
-            tts_platform_to_use = tts_platform_override if tts_platform_override is not None else self.tts_platform
-
-            service_data = {
-                "entity_id": target_speakers,
-                "message": message,
-                "chime_path": actual_chime_path,
-                "cache": cache,
-                "announce": announce,
-                "fade_audio": fade_audio,
-                "offset": offset,
-            }
-            if tts_platform_to_use:
-                service_data["tts_platform"] = tts_platform_to_use
-            if volume_level is not None:
-                service_data["volume_level"] = volume_level
-
-            self.call_service(
-                "chime_tts/say",
-                **service_data
-            )
-            self.log(f"Successfully initiated chime_tts/say service call for target(s): {target_speakers} with message: '{message}'", level="INFO")
+            response = self.call_service("chime_tts/say_url", return_response=True, **service_data)
         except Exception as e:
-            self.log(f"Error calling chime_tts/say service for target(s) {target_speakers}: {e}", level="ERROR")
-            # Detailed log for error
-            error_details = {
-                "target_entity_id": target_speakers,
-                "message": message,
-                "chime_path": actual_chime_path,
-                "tts_platform": kwargs.get("tts_platform", self.tts_platform),
-                "cache": True
-            }
-            self.log(f"Service call failed. Details: {error_details}", level="DEBUG")
+            self.log(f"Error calling chime_tts/say_url for '{message}': {e}", level="ERROR")
+            return None
+        payload = self._say_url_payload(response)
+        url = payload.get("url")
+        if not payload.get("success") or not url:
+            self.log(f"chime_tts/say_url produced no audio for '{message}': {response}", level="ERROR")
+            return None
+        self.log(f"Rendered '{message}' as {url} ({payload.get('duration')} s)", level="DEBUG")
+        return url
+
+    def _announce_volume_pct(self, room, volume_level):
+        """Announcement volume for one room in percent, or None when it cannot be determined.
+
+        Left without a level, Music Assistant announces louder than the player's volume.
+        A room without an explicit volume is therefore given the level it already plays at,
+        which is what a Sonos audio clip plays at when no volume is sent.
+        """
+        if volume_level is None:
+            volume_level = self.get_state(room, attribute="volume_level")
+        try:
+            return max(0, min(100, round(float(volume_level) * 100)))
+        except (TypeError, ValueError):
+            return None
+
+    def _play_announcement(self, message, url, rooms, volume_level):
+        """Play the rendered clip as an announcement on the Music Assistant room entities."""
+        rooms_by_volume = {}
+        for room in rooms:
+            rooms_by_volume.setdefault(self._announce_volume_pct(room, volume_level), []).append(room)
+
+        for volume_pct, group in rooms_by_volume.items():
+            extra = {"use_pre_announce": False}
+            if volume_pct is not None:
+                extra["announce_volume"] = volume_pct
+            try:
+                self.call_service(
+                    "media_player/play_media",
+                    entity_id=group,
+                    media_content_id=url,
+                    media_content_type="music",
+                    announce=True,
+                    extra=extra,
+                    callback=lambda result, group=group, volume_pct=volume_pct: self._log_announcement_result(
+                        message, group, volume_pct, result
+                    ),
+                )
+            except Exception as e:
+                self.log(f"Error calling media_player/play_media for {group}: {e}", level="ERROR")
+
+    def _log_announcement_result(self, message, rooms, volume_pct, result):
+        volume = "no announce volume" if volume_pct is None else f"announce volume {volume_pct}%"
+        if isinstance(result, dict) and result.get("success"):
+            self.log(f"Announced '{message}' on {rooms} ({volume})", level="INFO")
+        else:
+            self.log(f"Announcing '{message}' on {rooms} ({volume}) failed: {result}", level="ERROR")
 
     # Example of how another app might call this notifier:
     # notifier = self.get_app("SonosNotifier")  # Assuming 'SonosNotifier' is the name in apps.yaml

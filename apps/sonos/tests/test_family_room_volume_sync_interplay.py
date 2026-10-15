@@ -2,14 +2,13 @@
 
 Each test runs a real writer (SonosStateReset, SonosGroupManager, SonosFollowMe, SonosNotifier)
 against the sync app's rig. The writer's service calls change the rig's Home Assistant state the
-way Home Assistant, Music Assistant, chime_tts and the speakers do, and the sync app sees the
-resulting state changes. None of them may make the sync write a volume.
+way Home Assistant, Music Assistant and the speakers do, and the sync app sees the resulting
+state changes. None of them may make the sync write a volume.
 """
 
 from __future__ import annotations
 
 import copy
-import math
 import sys
 import unittest
 from datetime import datetime
@@ -37,7 +36,7 @@ import group_manager as gm  # noqa: E402
 import sonos_notifier as sn  # noqa: E402
 import state_reset as sr  # noqa: E402
 
-TTS_ALL = "media_player.sonos_tts_all"
+CLIP_URL = "https://ha.example/local/chime_tts/clip.mp3"
 MASTER_SELECT = "input_select.sonos_master_speaker"
 OFF_DEFAULT = {ROOFTOP: 0.33, LIVING: 0.35, KITCHEN: 0.33, DINING: 0.30}
 
@@ -58,7 +57,7 @@ def app_args(path):
 class House:
     """Applies other apps' service calls to the rig's state, a moment later, the way Home
     Assistant and the speakers do: Music Assistant truncates a volume to whole percent, the
-    native twin rounds it, a media_player group passes a call on to every member."""
+    native twin rounds it."""
 
     LATENCY = 0.05
 
@@ -68,9 +67,6 @@ class House:
         self.events = []
         self.ignored = set()
         self.volume_listeners = []
-        self.groups = {TTS_ALL: [twin(m) for m in FAMILY]}
-        rig.states[TTS_ALL] = {"state": "playing", "attributes": {"friendly_name": "Sonos TTS all"}}
-        self.chime_tts = ChimeTts(self)
         rig_change = rig.change
 
         def change(entity, state=None, user_id=None, fire=True, **attrs):
@@ -98,8 +94,13 @@ class House:
 
     def call_service(self, service, **data):
         self.calls.append((service, copy.deepcopy(data)))
-        if service == "chime_tts/say":
-            self.chime_tts.say(data)
+        if service == "chime_tts/say_url":
+            return {
+                "success": True,
+                "result": {"context": {}, "response": {"url": CLIP_URL, "success": True, "duration": 3.1}},
+            }
+        if service == "media_player/play_media" and data.get("callback"):
+            data["callback"]({"success": True})
         elif service not in self.ignored:
             entities = data.get("entity_id")
             for entity in [entities] if isinstance(entities, str) else list(entities or []):
@@ -107,28 +108,27 @@ class House:
         return {"success": True}
 
     def apply(self, service, entity, data):
-        for member in self.groups.get(entity, [entity]):
-            native = member.endswith("_2")
-            speaker = member[: -len("_2")] if native else member
-            if speaker not in self.rig.states:
-                continue
-            if service == "media_player/volume_set":
-                level = data["volume_level"]
-                percent = round(level * 100) if native else int(level * 100)
-                self.rig.states[twin(speaker)]["attributes"]["volume_level"] = percent / 100
-                self.rig.move(speaker, percent / 100)
-            elif service == "media_player/volume_mute":
-                self.rig.change(speaker, is_volume_muted=data["is_volume_muted"])
-            elif service == "media_player/media_pause":
-                self.rig.change(speaker, state="paused")
-            elif service == "media_player/media_play":
-                self.rig.change(speaker, state="playing")
-            elif service == "media_player/unjoin":
-                rest = [m for m in self.rig.states[speaker]["attributes"]["group_members"] if m != speaker]
-                self.rig.change(speaker, group_members=[])
-                for m in rest:
-                    if m in self.rig.states:
-                        self.rig.change(m, group_members=rest if len(rest) > 1 else [])
+        native = entity.endswith("_2")
+        speaker = entity[: -len("_2")] if native else entity
+        if speaker not in self.rig.states:
+            return
+        if service == "media_player/volume_set":
+            level = data["volume_level"]
+            percent = round(level * 100) if native else int(level * 100)
+            self.rig.states[twin(speaker)]["attributes"]["volume_level"] = percent / 100
+            self.rig.move(speaker, percent / 100)
+        elif service == "media_player/volume_mute":
+            self.rig.change(speaker, is_volume_muted=data["is_volume_muted"])
+        elif service == "media_player/media_pause":
+            self.rig.change(speaker, state="paused")
+        elif service == "media_player/media_play":
+            self.rig.change(speaker, state="playing")
+        elif service == "media_player/unjoin":
+            rest = [m for m in self.rig.states[speaker]["attributes"]["group_members"] if m != speaker]
+            self.rig.change(speaker, group_members=[])
+            for m in rest:
+                if m in self.rig.states:
+                    self.rig.change(m, group_members=rest if len(rest) > 1 else [])
 
     def volume_sets(self, entity=None):
         return [d["volume_level"] for s, d in self.calls
@@ -136,72 +136,6 @@ class House:
 
     def volumes(self):
         return {m: self.rig.vol(m) for m in FAMILY}
-
-
-class ChimeTts:
-    """chime_tts v1.3.0 say(), as far as volumes go. A target fades only when it is playing with
-    a media_duration and a media_position; a media_player group entity has neither. Faded
-    players go out one after the other (0.5 s in 4 steps), pause, take the requested level,
-    speak, drop to 0, play and fade back in one after the other. Other players with a requested
-    level get it before and their own level back after, which a group entity does not have."""
-
-    STEPS = 4
-    STEP_S = 0.125
-    SPEECH_S = 4.0
-
-    def __init__(self, house):
-        self.house = house
-
-    def say(self, data):
-        rig = self.house.rig
-        targets = data["entity_id"] if isinstance(data["entity_id"], list) else [data["entity_id"]]
-        target = data.get("volume_level", -1)
-        faded, levelled = [], []
-        for entity in targets:
-            st = rig.states.get(entity) or {"state": None, "attributes": {}}
-            attrs = st["attributes"]
-            playing = (
-                st["state"] == "playing"
-                and (attrs.get("media_duration") or 0) > 0
-                and (attrs.get("media_position") or 0) > 0
-            )
-            initial = attrs.get("volume_level", -1)
-            if playing and data.get("fade_audio"):
-                faded.append((entity, initial))
-            elif target not in (-1, initial):
-                levelled.append((entity, initial))
-
-        t = 0.0
-        steps = []
-
-        def at(when, service, entity, **extra):
-            steps.append((when, service, entity, extra))
-
-        for entity, initial in faded:
-            for i in range(1, self.STEPS + 1):
-                at(t, "media_player/volume_set", entity, volume_level=round(max(initial * (1 - i / self.STEPS), 0), 4))
-                t += self.STEP_S
-        for entity, _ in faded:
-            at(t, "media_player/media_pause", entity)
-        t += 0.3
-        for entity, _ in faded + levelled:
-            if target != -1:
-                at(t, "media_player/volume_set", entity, volume_level=target)
-        t += self.SPEECH_S
-        for entity, _ in faded:
-            at(t, "media_player/volume_set", entity, volume_level=0)
-            at(t + 0.1, "media_player/media_play", entity)
-        t += 0.4
-        for entity, initial in faded:
-            for i in range(1, self.STEPS + 1):
-                at(t, "media_player/volume_set", entity, volume_level=round(initial * i / self.STEPS, 4))
-                t += self.STEP_S
-        for entity, initial in levelled:
-            if initial != -1:
-                at(t, "media_player/volume_set", entity, volume_level=initial)
-
-        for when, service, entity, extra in steps:
-            rig._schedule(when, lambda s=service, e=entity, x=extra: self.house.call_service(s, entity_id=e, **x))
 
 
 def quiet_sync(test, rig):
@@ -363,7 +297,8 @@ class FollowMeInterplay(unittest.TestCase):
 
 
 class SonosNotifierInterplay(unittest.TestCase):
-    """Announcements go through chime_tts; Sonos ducks the music itself while it speaks."""
+    """An announcement is a chime_tts render played as a Music Assistant announcement: Sonos
+    plays the clip over the music itself, so no player volume is written."""
 
     def setUp(self):
         self.rig = Rig()
@@ -378,18 +313,22 @@ class SonosNotifierInterplay(unittest.TestCase):
         self.app = app
         self.before = self.house.volumes()
 
-    def say(self, **kwargs):
+    def announce(self, **kwargs):
         self.app.notify("Dryer is ready to be emptied", **kwargs)
         self.rig.advance(30)
-        says = [d for s, d in self.house.calls if s == "chime_tts/say"]
-        self.assertEqual(len(says), 1)
-        self.assertTrue(says[0]["fade_audio"])
-        self.assertTrue(says[0]["announce"])
-        return says[0]
+        renders = [d for s, d in self.house.calls if s == "chime_tts/say_url"]
+        self.assertEqual(len(renders), 1)
+        plays = [d for s, d in self.house.calls if s == "media_player/play_media"]
+        for play in plays:
+            self.assertTrue(play["announce"])
+            self.assertEqual(play["media_content_id"], CLIP_URL)
+        return {room: play["extra"].get("announce_volume") for play in plays for room in play["entity_id"]}
 
     def test_an_announcement_while_the_family_group_plays_writes_nothing(self):
-        say = self.say()
-        self.assertEqual(say["entity_id"], [TTS_ALL])
+        announced = self.announce()
+        self.assertEqual(sorted(announced), sorted(self.app.tts_group_all))
+        for room in FAMILY:
+            self.assertEqual(announced[room], round(self.before[room] * 100))
         self.assertEqual(self.house.volume_sets(), [])
         self.assertEqual(self.house.volumes(), self.before)
         self.assertEqual(self.rig.arm_delays, [])
@@ -401,18 +340,20 @@ class SonosNotifierInterplay(unittest.TestCase):
                 self.setUp()
                 for m, v in (volumes or {}).items():
                     self.rig.quietly(m, volume_level=v)
-                self.say(target_speakers=[TTS_ALL], override_quiet_hours=True, volume_level=0.7)
-                self.assertEqual(self.house.volume_sets(), [0.7])
-                self.assertEqual(self.house.volumes(), {m: 0.7 for m in FAMILY})
+                before = self.house.volumes()
+                announced = self.announce(
+                    target_speakers=list(self.app.tts_group_all), override_quiet_hours=True, volume_level=0.7
+                )
+                self.assertEqual(set(announced.values()), {70})
+                self.assertEqual(self.house.volume_sets(), [])
+                self.assertEqual(self.house.volumes(), before)
                 quiet_sync(self, self.rig)
 
-    def test_the_kitchen_chime_fades_the_kitchen_alone_and_writes_nothing(self):
+    def test_the_kitchen_chime_over_playing_music_writes_nothing(self):
         self.rig.quietly(KITCHEN, media_duration=183, media_position=52)
-        self.say(target_speakers=[KITCHEN], volume_level=0.15)
-        sets = self.house.volume_sets(KITCHEN)
-        self.assertEqual(len(sets), 10)
-        self.assertEqual(sets[4], 0.15)
-        self.assertTrue(math.isclose(sets[-1], self.before[KITCHEN]))
+        announced = self.announce(target_speakers=[KITCHEN], volume_level=0.15)
+        self.assertEqual(announced, {KITCHEN: 15})
+        self.assertEqual(self.house.volume_sets(), [])
         self.assertEqual(self.house.volumes(), self.before)
         quiet_sync(self, self.rig)
 

@@ -185,7 +185,7 @@ class FireSafety(hass.Hass):
         self.monthly_test_max_retry_days = int(a("monthly_test_max_retry_days", 7))
 
         self.sonos_kitchen_entity = a("sonos_kitchen_entity", "media_player.kitchen")
-        self.sonos_all_entity = a("sonos_all_entity", "media_player.sonos_tts_all")
+        self.sonos_all_entities = list(a("sonos_all_entities", []))
         self.sonos_kitchen_volume = float(a("sonos_kitchen_volume", 0.15))
         self.sonos_alarm_volume = float(a("sonos_alarm_volume", 0.7))
 
@@ -660,7 +660,7 @@ class FireSafety(hass.Hass):
         self._announce(
             "stale-during-alarm over Sonos",
             message=message,
-            target_speakers=[self.sonos_all_entity],
+            target_speakers=self.sonos_all_entities,
             override_quiet_hours=True,
             volume_level=self.sonos_alarm_volume,
         )
@@ -1460,7 +1460,7 @@ class FireSafety(hass.Hass):
         self._announce(
             "alarm over house-wide Sonos",
             message="Smoke has been detected in the kitchen. Please check the kitchen now.",
-            target_speakers=[self.sonos_all_entity],
+            target_speakers=self.sonos_all_entities,
             override_quiet_hours=True,
             volume_level=self.sonos_alarm_volume,
         )
@@ -1469,7 +1469,7 @@ class FireSafety(hass.Hass):
         self._announce(
             "hush over Sonos",
             message="The kitchen alarm has been silenced.",
-            target_speakers=[self.sonos_all_entity],
+            target_speakers=self.sonos_all_entities,
             volume_level=self.sonos_alarm_volume,
         )
 
@@ -1477,7 +1477,7 @@ class FireSafety(hass.Hass):
         self._announce(
             "all-clear over Sonos",
             message="The kitchen alarm has reset. All clear.",
-            target_speakers=[self.sonos_all_entity],
+            target_speakers=self.sonos_all_entities,
         )
 
     # ---------- house_events feed (only on real transitions - see house_events.py) ----------
