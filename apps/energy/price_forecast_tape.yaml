@@ -1,0 +1,24 @@
+# PriceForecastTape - appends what each DK2 price forecast says, plus the prices then published, to
+# a JSONL tape, so the forecasts can be scored on this house's own data with
+# scripts/score_price_forecasts.py. Records only; decides nothing. See price_forecast_tape.py.
+#
+# The tape holds third-party forecast data: it stays on the box, never in this repo.
+PriceForecastTape:
+  module: price_forecast_tape
+  class: PriceForecastTape
+
+  tape_file: /conf/apps/energy/price_forecast_tape.jsonl
+
+  # Local times. 12:40 is the last look before tomorrow's prices are published; a run also follows
+  # tomorrow_valid turning true on the price entity. The scorer's origins match these times.
+  run_times: ["06:45:00", "12:40:00", "15:30:00", "20:45:00"]
+
+  price_entity: sensor.energi_data_service
+  # Open Spot Forecast's ML forecast entity; skipped while it does not exist.
+  osf_entity: sensor.open_spot_forecast_dk2_price_forecast_ml
+
+  price_area: DK2
+  # Stromligning's supplierId is the grid company, productId the retail product.
+  stromligning_grid: radius_c
+  stromligning_product: vindstoed_vestroem
+  timeout_seconds: 20
