@@ -23,6 +23,7 @@ import bedroom_tv_control as btc  # noqa: E402
 
 
 POWER_SENSOR = "sensor.bedroom_tv_relay_power"
+REMOTE = "remote.bedroom_apple_tv"
 
 
 def make_app(states, reset_enabled=True, refresh_in_progress=False, power_sensor=None):
@@ -54,6 +55,17 @@ def make_app(states, reset_enabled=True, refresh_in_progress=False, power_sensor
     app.datetime = lambda: _dt.datetime(2026, 7, 27, 12, 0, 0)
     app.get_state = lambda entity, **kw: states.get(entity)
     app.log = lambda *a, **kw: None
+    app.apple_tv_remote_entity = REMOTE
+    app.apple_tv_reconnect_cooldown_seconds = 600.0
+    app._apple_reconnect_at = None
+    app.mono = 1000.0
+    app._monotonic = lambda: app.mono
+    app._ready = True
+    app._last_off_at = None
+    app._pending_lower_handle = None
+    app.tv_off_debounce_seconds = 10.0
+    app.tv_off_blip_debounce_seconds = 75.0
+    app.tv_on_debounce_seconds = 0.1
     app.service_calls = []
     app.scheduled = []
     app.call_service = lambda service, **kw: app.service_calls.append((service, kw))
@@ -396,6 +408,156 @@ class EnsureDownDarkGuard(unittest.TestCase):
         app._get_lift_position = lambda: self.fail("dark guard must return before touching the lift")
         app._ensure_lift_down_if_tv_active({})
         self.assertEqual(app.service_calls, [])
+
+
+class AppleTvReconnect(unittest.TestCase):
+    """With start_off every HA restart leaves the Apple TV integration disconnected: the
+    remote and the player both read off with no attributes while the box is in use, and
+    media_player.turn_on does nothing in that state. remote.turn_on reconnects without
+    waking the box. The app must send it when the TV is on and the integration holds no
+    connection, and never otherwise."""
+
+    RECONNECT = ("remote/turn_on", {"entity_id": REMOTE})
+
+    @staticmethod
+    def states(**over):
+        states = {
+            "media_player.bedroom_tv": "on",
+            "media_player.bedroom_sony_tv": "on",
+            "media_player.bedroom_apple_tv": "off",
+            REMOTE: "off",
+        }
+        states.update(over)
+        return states
+
+    def test_tv_on_and_disconnected_reconnects_through_the_remote_only(self):
+        app = make_app(self.states())
+        app._reconnect_apple_tv_if_needed("startup")
+        self.assertEqual(app.service_calls, [self.RECONNECT])
+        self.assertEqual([c for c in app.service_calls if c[0].startswith("media_player/")], [])
+
+    def test_startup_check_runs_after_the_grace_period(self):
+        app = make_app(self.states())
+        app._ready = False
+        app._load_lift_position_on_startup = lambda: None
+        app._check_initial_tv_state = lambda: None
+        app._mark_ready({})
+        self.assertTrue(app._ready)
+        self.assertEqual(app.service_calls, [self.RECONNECT])
+
+    def test_tv_off_does_nothing(self):
+        app = make_app(self.states(**{
+            "media_player.bedroom_tv": "off",
+            "media_player.bedroom_sony_tv": "off",
+        }))
+        app._reconnect_apple_tv_if_needed("startup")
+        self.assertEqual(app.service_calls, [])
+
+    def test_connected_apple_tv_does_nothing(self):
+        for player in ("playing", "paused", "idle"):
+            app = make_app(self.states(**{"media_player.bedroom_apple_tv": player, REMOTE: "on"}))
+            app._reconnect_apple_tv_if_needed("startup")
+            self.assertEqual(app.service_calls, [], player)
+
+    def test_connected_but_sleeping_box_does_nothing(self):
+        # The player also reads off when the integration is connected to a sleeping
+        # box; only the remote tells the two apart.
+        app = make_app(self.states(**{REMOTE: "on"}))
+        app._reconnect_apple_tv_if_needed("startup")
+        self.assertEqual(app.service_calls, [])
+
+    def test_unknown_player_state_does_nothing(self):
+        app = make_app(self.states(**{"media_player.bedroom_apple_tv": "unknown"}))
+        app._reconnect_apple_tv_if_needed("startup")
+        self.assertEqual(app.service_calls, [])
+
+    def test_missing_remote_does_nothing(self):
+        states = self.states()
+        del states[REMOTE]
+        app = make_app(states)
+        app._reconnect_apple_tv_if_needed("startup")
+        self.assertEqual(app.service_calls, [])
+
+    def test_a_lit_panel_counts_as_tv_on_while_the_sony_integration_lags(self):
+        app = make_app(self.states(**{
+            "media_player.bedroom_tv": "off",
+            "media_player.bedroom_sony_tv": "off",
+            POWER_SENSOR: "45.0",
+        }), power_sensor=POWER_SENSOR)
+        app._reconnect_apple_tv_if_needed("startup")
+        self.assertEqual(app.service_calls, [self.RECONNECT])
+
+    def test_a_dark_panel_with_sony_off_is_not_tv_on(self):
+        app = make_app(self.states(**{
+            "media_player.bedroom_tv": "off",
+            "media_player.bedroom_sony_tv": "off",
+            POWER_SENSOR: "2.5",
+        }), power_sensor=POWER_SENSOR)
+        app._reconnect_apple_tv_if_needed("startup")
+        self.assertEqual(app.service_calls, [])
+
+    def test_repeat_inside_the_window_is_skipped_and_allowed_after_it(self):
+        app = make_app(self.states())
+        app._reconnect_apple_tv_if_needed("TV turned on")
+        app.mono += 599
+        app._reconnect_apple_tv_if_needed("TV turned on")
+        self.assertEqual(app.service_calls, [self.RECONNECT])
+        app.mono += 2
+        app._reconnect_apple_tv_if_needed("TV turned on")
+        self.assertEqual(app.service_calls, [self.RECONNECT, self.RECONNECT])
+
+    def test_checks_that_send_nothing_do_not_use_up_the_window(self):
+        states = self.states(**{REMOTE: "on"})
+        app = make_app(states)
+        app._reconnect_apple_tv_if_needed("startup")
+        states[REMOTE] = "off"
+        app._reconnect_apple_tv_if_needed("TV turned on")
+        self.assertEqual(app.service_calls, [self.RECONNECT])
+
+    def test_a_failed_call_is_swallowed_and_does_not_start_the_window(self):
+        app = make_app(self.states())
+
+        def boom(service, **kw):
+            raise RuntimeError("ha unreachable")
+
+        app.call_service = boom
+        app._reconnect_apple_tv_if_needed("startup")
+        self.assertIsNone(app._apple_reconnect_at)
+
+    def test_tv_turning_on_reconnects(self):
+        app = make_app(self.states())
+        app.tv_state_handler("media_player.bedroom_tv", "state", "off", "on", {})
+        self.assertIn(self.RECONNECT, app.service_calls)
+        self.assertIn(app._lower_lift_if_still_on, scheduled_callbacks(app))
+
+    def test_tv_turning_off_does_not_reconnect(self):
+        app = make_app(self.states(**{
+            "media_player.bedroom_tv": "off",
+            "media_player.bedroom_sony_tv": "off",
+        }))
+        app.tv_state_handler("media_player.bedroom_tv", "state", "on", "off", {})
+        self.assertEqual(app.service_calls, [])
+
+    def test_playback_state_changes_do_not_reconnect(self):
+        app = make_app(self.states())
+        app.tv_state_handler("media_player.bedroom_tv", "state", "playing", "paused", {})
+        self.assertEqual(app.service_calls, [])
+
+    def test_state_changes_inside_the_startup_grace_are_ignored(self):
+        app = make_app(self.states())
+        app._ready = False
+        app.tv_state_handler("media_player.bedroom_tv", "state", "off", "on", {})
+        self.assertEqual(app.service_calls, [])
+
+    def test_panel_power_rising_while_the_integration_lags_reconnects(self):
+        app = make_app(self.states(**{
+            "media_player.bedroom_tv": "off",
+            "media_player.bedroom_sony_tv": "off",
+            POWER_SENSOR: "45.0",
+        }), power_sensor=POWER_SENSOR)
+        app._on_tv_power(POWER_SENSOR, "state", "17.7", "45.0", {})
+        self.assertIn(self.RECONNECT, app.service_calls)
+        self.assertIn(("homeassistant/update_entity", {"entity_id": "media_player.bedroom_sony_tv"}), app.service_calls)
 
 
 if __name__ == "__main__":

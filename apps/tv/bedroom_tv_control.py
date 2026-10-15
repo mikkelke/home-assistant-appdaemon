@@ -2,6 +2,7 @@
 BedroomTVControl - Controls the bedroom TV integration and TV lift.
 """
 
+import time
 from datetime import datetime, timedelta
 
 import appdaemon.plugins.hass.hassapi as hass # type: ignore
@@ -41,6 +42,7 @@ class BedroomTVControl(hass.Hass):
         self.tv_entity = "media_player.bedroom_tv"
         self.sony_tv_entity = "media_player.bedroom_sony_tv"
         self.apple_tv_entity = "media_player.bedroom_apple_tv"
+        self.apple_tv_remote_entity = "remote.bedroom_apple_tv"
         # Timer for delayed Apple TV remote reset (off/on) after TV turns on
         self._bedroom_apple_tv_reset_handle = None
         # Flag to track when Apple TV remote reset sequence is actively executing (off -> wait -> on -> verify)
@@ -52,6 +54,11 @@ class BedroomTVControl(hass.Hass):
             self.apple_tv_reset_delay_seconds = 30
         # Apple TV reset enabled/disabled
         self.apple_tv_reset_enabled = self.args.get("apple_tv_reset_enabled", True)
+        try:
+            self.apple_tv_reconnect_cooldown_seconds = float(self.args.get("apple_tv_reconnect_cooldown_seconds", 600))
+        except Exception:
+            self.apple_tv_reconnect_cooldown_seconds = 600.0
+        self._apple_reconnect_at = None
         # Verification handle to ensure Apple TV remote ends ON
         self._bedroom_apple_tv_remote_verify_handle = None
         # Startup guard: prevent actions during HA/entity reload churn
@@ -284,6 +291,45 @@ class BedroomTVControl(hass.Hass):
             return False
         return not self._is_tv_actually_on()
 
+    def _monotonic(self):
+        return time.monotonic()
+
+    def _reconnect_apple_tv_if_needed(self, reason):
+        """Reconnect the Apple TV integration when the TV is on but it holds no connection.
+        The remote reads off exactly when the integration is disconnected; the player
+        reads off both then and when connected to a sleeping box. Only remote.turn_on is
+        used: it connects without waking the box, which media_player.turn_on would."""
+        try:
+            remote_state = self.get_state(self.apple_tv_remote_entity)
+            player_state = self.get_state(self.apple_tv_entity)
+            if not (self._is_tv_actually_on() or self._tv_draws_power()):
+                self.log(f"Apple TV reconnect ({reason}): TV is off - nothing to do", level="INFO")
+                return
+            if remote_state != "off" or player_state != "off":
+                self.log(
+                    f"Apple TV reconnect ({reason}): not needed "
+                    f"(remote '{remote_state}', player '{player_state}')",
+                    level="INFO",
+                )
+                return
+            if self._apple_reconnect_at is not None:
+                age = self._monotonic() - self._apple_reconnect_at
+                if age < self.apple_tv_reconnect_cooldown_seconds:
+                    self.log(
+                        f"Apple TV reconnect ({reason}): already requested {age:.0f}s ago - not repeating",
+                        level="INFO",
+                    )
+                    return
+            self.call_service("remote/turn_on", entity_id=self.apple_tv_remote_entity)
+            self._apple_reconnect_at = self._monotonic()
+            self.log(
+                f"Apple TV reconnect ({reason}): TV is on but the Apple TV is disconnected - "
+                f"remote.turn_on sent to {self.apple_tv_remote_entity}",
+                level="INFO",
+            )
+        except Exception as e:
+            self.log(f"Apple TV reconnect ({reason}) failed: {e}", level="WARNING")
+
     def tv_state_handler(self, entity, attribute, old, new, kwargs):
         """
         Event-based TV state handler: Reacts to TV on/off state changes.
@@ -374,6 +420,7 @@ class BedroomTVControl(hass.Hass):
             except Exception as e:
                 self._pending_lower_handle = None
                 self.log(f"Error scheduling lift lower: {e}", level="ERROR")
+            self._reconnect_apple_tv_if_needed("TV turned on")
         
         # TV staying ON (active state transitions: playing -> paused, etc.)
         # Ensure lift stays down when TV is active
@@ -395,6 +442,7 @@ class BedroomTVControl(hass.Hass):
         self._load_lift_position_on_startup()
         # Check current state on startup - if TV is off, raise lift
         self._check_initial_tv_state()
+        self._reconnect_apple_tv_if_needed("startup")
     
     def _load_lift_position_on_startup(self):
         """Load lift position from persistent entity on startup"""
@@ -1272,6 +1320,7 @@ class BedroomTVControl(hass.Hass):
                         probe_confirmed=True)
         except Exception as e:
             self.log(f"power-meter lift-lower scheduling failed: {e}", level="ERROR")
+        self._reconnect_apple_tv_if_needed("panel power")
 
     def _sony_probe_tick(self, kwargs):
         try:

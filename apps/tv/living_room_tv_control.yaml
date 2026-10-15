@@ -49,6 +49,7 @@ living_room_tv_control:
   # Set to false to disable and test if still needed with current HA/Apple TV versions
   apple_tv_reset_enabled: true
   apple_tv_reset_delay_seconds: 30  # seconds to wait after TV turns on before resetting
+  apple_tv_reconnect_cooldown_seconds: 600  # at most one reconnect request per window
 
   # Optional Wake-on-LAN helper button to nudge TV power-on
   wol_button_entity: button.wake_on_lan_c4_08_26_6d_25_0e

@@ -23,6 +23,7 @@ bedroom_tv_control:
   # Apple TV state correction
   apple_tv_reset_enabled: true   # Set to false to disable and test if still needed
   apple_tv_reset_delay_seconds: 30
+  apple_tv_reconnect_cooldown_seconds: 600  # at most one reconnect request per window
   
   # TV lift debounce (fast ON, verified OFF using Sony + Apple TV).
   # ADAPTIVE OFF (2026-07-13, user: "reaction is bad"): fast by default, and only

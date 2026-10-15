@@ -1,3 +1,5 @@
+import time
+
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
 class LivingRoomTvControl(hass.Hass):
@@ -96,6 +98,9 @@ class LivingRoomTvControl(hass.Hass):
         self._apple_tv_reset_handle = None
         # Verification handle to ensure Apple TV remote ends ON
         self._apple_tv_remote_verify_handle = None
+        self.apple_tv_remote_entity = "remote." + self.apple_tv_entity.split(".", 1)[-1]
+        self.apple_tv_reconnect_cooldown_seconds = float(self.args.get("apple_tv_reconnect_cooldown_seconds", 600))
+        self._apple_reconnect_at = None
 
         # Power-aware wall move (optional; default off until YAML opts in)
         self.power_aware_wall_move_enabled = bool(self.args.get("power_aware_wall_move_enabled", False))
@@ -226,6 +231,7 @@ class LivingRoomTvControl(hass.Hass):
         # Check on startup: if TV is off and lift is not at Wall, schedule wall move
         # This handles the case where AppDaemon restarts while TV is off
         self.run_in(self._check_tv_state_on_init, 5)  # Delay slightly for HA to be fully ready
+        self.run_in(self._reconnect_apple_tv_on_init, 5)
         
         self.log("LivingRoomTvControl Initialization complete.")
 
@@ -1258,6 +1264,54 @@ class LivingRoomTvControl(hass.Hass):
             self._begin_power_on_confirm_for_speaker_reset()
         except Exception as e:
             self.error(f"Failed to request living room speaker reset on TV power on: {e}")
+
+    def _monotonic(self):
+        return time.monotonic()
+
+    def _tv_is_on(self):
+        try:
+            universal_state = self.get_state(self.tv_entity)
+            hisense_state = self.get_state(self.hisense_tv_entity)
+        except Exception:
+            return False
+        return (
+            universal_state not in (None, "off", "unavailable", "unknown", "standby")
+            or hisense_state == "on"
+        )
+
+    def _reconnect_apple_tv_on_init(self, kwargs):
+        self._reconnect_apple_tv_if_needed("startup")
+
+    def _reconnect_apple_tv_if_needed(self, reason):
+        """Reconnect the Apple TV integration when the TV is on but it holds no connection.
+        The remote reads off exactly when the integration is disconnected; the player
+        reads off both then and when connected to a sleeping box. Only remote.turn_on is
+        used: it connects without waking the box, which media_player.turn_on would."""
+        try:
+            remote_state = self.get_state(self.apple_tv_remote_entity)
+            player_state = self.get_state(self.apple_tv_entity)
+            if not self._tv_is_on():
+                self.log(f"Apple TV reconnect ({reason}): TV is off - nothing to do")
+                return
+            if remote_state != "off" or player_state != "off":
+                self.log(
+                    f"Apple TV reconnect ({reason}): not needed "
+                    f"(remote '{remote_state}', player '{player_state}')"
+                )
+                return
+            if self._apple_reconnect_at is not None:
+                age = self._monotonic() - self._apple_reconnect_at
+                if age < self.apple_tv_reconnect_cooldown_seconds:
+                    self.log(f"Apple TV reconnect ({reason}): already requested {age:.0f}s ago - not repeating")
+                    return
+            self.call_service("remote/turn_on", entity_id=self.apple_tv_remote_entity)
+            self._apple_reconnect_at = self._monotonic()
+            self.log(
+                f"Apple TV reconnect ({reason}): TV is on but the Apple TV is disconnected - "
+                f"remote.turn_on sent to {self.apple_tv_remote_entity}"
+            )
+        except Exception as e:
+            self.log(f"Apple TV reconnect ({reason}) failed: {e}", level="WARNING")
 
     def _apple_tv_remote_reset(self, kwargs):
         # Toggle the Apple TV remote power to refresh state
