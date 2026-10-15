@@ -23,7 +23,8 @@ Feed shape (attributes, replace=True on every publish):
                                   "cause": <ascii, optional>, "effect": <ascii, optional>,
                                   "by": <person display name, optional - v4>}
 State = ts of the newest event (cheap change signal for the dashboard).
-`by` carries the acting HUMAN when knowable (report payloads and lock attribution);
+`by` carries the acting HUMAN when knowable (report payloads, lock attribution, and the
+resident who started or emptied an appliance run - see appliance_actor);
 the dashboard renders it as its own muted "By <name>" line (HA-Activity-style), so
 emitters keep cause/effect wording neutral instead of baking names into sentences.
 `audience` (v5): the literal "admin" hides an entry from non-admin dashboard viewers -
@@ -122,6 +123,32 @@ def _first_name_if_resident(who):
     passes through untouched."""
     first = who.split()[0] if who.split() else who
     return first if first.lower() in RESIDENT_FIRST_NAMES else who
+
+
+# ActorAttribution methods that name a person on evidence: the only person home
+# (sole_occupant) or the HA user behind a dashboard tap (dashboard_action).
+RELIABLE_ACTOR_METHODS = ("sole_occupant", "dashboard_action")
+
+
+def _resident_name(person):
+    """'claudia' -> 'Claudia' for a resident's person key, else None."""
+    key = person.strip().lower() if isinstance(person, str) else ""
+    return key.capitalize() if key in RESIDENT_FIRST_NAMES else None
+
+
+def appliance_actor(kind, attrs):
+    """Display name of the resident who started the run (a "finished" row) or emptied it
+    (an "emptied" row), or None.
+
+    A wrong name is worse than none: only a resident named by a reliable method counts.
+    The monitors publish the starter as started_by + started_by_method, the emptier as
+    emptied_by alone - ActorAttribution names nobody except through a reliable method.
+    """
+    if kind == "finished" and attrs.get("started_by_method") in RELIABLE_ACTOR_METHODS:
+        return _resident_name(attrs.get("started_by"))
+    if kind == "emptied":
+        return _resident_name(attrs.get("emptied_by"))
+    return None
 
 
 def lock_event(name, old, new, changed_by):
@@ -253,11 +280,12 @@ class HouseEvents(hass.Hass):
     def _on_appliance(self, entity, attribute, old, new, kwargs):
         name = self.appliances.get(entity, entity)
         state_obj = self.get_state(entity, attribute="all") or {}
-        result = appliance_event(name, old, new, state_obj.get("attributes") or {})
+        attrs = state_obj.get("attributes") or {}
+        result = appliance_event(name, old, new, attrs)
         if result:
             kind, text = result
             icon = "mdi:basket-check" if kind == "emptied" else APPLIANCE_ICONS.get(name.lower(), "mdi:washing-machine")
-            self._add(icon, text)
+            self._add(icon, text, by=appliance_actor(kind, attrs))
 
     def _on_lock(self, entity, attribute, old, new, kwargs):
         # Emit later, not now: attribution (cloud changed_by) usually hasn't landed yet

@@ -44,6 +44,53 @@ class ApplianceEventTests(unittest.TestCase):
         self.assertEqual(house_events.appliance_event("Dishwasher", "Unemptied", "Emptied", {}), ("emptied", "Dishwasher emptied"))
 
 
+class ApplianceActorTests(unittest.TestCase):
+    def test_reliable_method_names_the_resident(self):
+        actor = house_events.appliance_actor
+        self.assertEqual(actor("finished", {"started_by": "claudia", "started_by_method": "sole_occupant"}), "Claudia")
+        self.assertEqual(actor("finished", {"started_by": "mikkel", "started_by_method": "dashboard_action"}), "Mikkel")
+        self.assertEqual(actor("emptied", {"emptied_by": "kristine"}), "Kristine")
+
+    def test_unreliable_or_empty_method_names_nobody(self):
+        actor = house_events.appliance_actor
+        for method in ("unknown", "", None):
+            self.assertIsNone(actor("finished", {"started_by": "claudia", "started_by_method": method}), method)
+        self.assertIsNone(actor("finished", {"started_by": "claudia"}))
+        self.assertIsNone(actor("finished", {"started_by": "", "started_by_method": "sole_occupant"}))
+        self.assertIsNone(actor("emptied", {"emptied_by": ""}))
+        self.assertIsNone(actor("emptied", {}))
+
+    def test_non_resident_names_nobody(self):
+        actor = house_events.appliance_actor
+        self.assertIsNone(actor("finished", {"started_by": "guest", "started_by_method": "sole_occupant"}))
+        self.assertIsNone(actor("emptied", {"emptied_by": "Cleaning"}))
+        self.assertIsNone(actor("emptied", {"emptied_by": 7}))
+
+    def test_starter_and_emptier_are_never_swapped(self):
+        actor = house_events.appliance_actor
+        started = {"started_by": "claudia", "started_by_method": "sole_occupant"}
+        self.assertIsNone(actor("emptied", started))
+        self.assertIsNone(actor("finished", {"emptied_by": "claudia"}))
+
+    def test_finished_row_carries_the_name(self):
+        feed = house_events.HouseEvents()
+        feed.appliances = {"sensor.washer_state": "Washer"}
+        attrs = {"energy_used": 0.987, "started_by": "claudia", "started_by_method": "sole_occupant"}
+        feed.get_state = lambda entity, attribute=None: {"attributes": attrs}
+        added = []
+        feed._add = lambda icon, text, **kwargs: added.append((icon, text, kwargs.get("by")))
+        feed._on_appliance("sensor.washer_state", "state", "Running", "Unemptied", {})
+        attrs["started_by_method"] = "unknown"
+        feed._on_appliance("sensor.washer_state", "state", "Running", "Unemptied", {})
+        self.assertEqual(
+            added,
+            [
+                ("mdi:washing-machine", "Washer finished - used 0.99 kWh", "Claudia"),
+                ("mdi:washing-machine", "Washer finished - used 0.99 kWh", None),
+            ],
+        )
+
+
 class ReportEventTests(unittest.TestCase):
     def test_valid_report(self):
         event = house_events.build_report_event(
