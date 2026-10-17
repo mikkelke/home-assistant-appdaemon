@@ -73,6 +73,7 @@ def make_session_app(session=False, dark=True, session_exit_timer=None):
     app.session_exit_debounce_sec = 90
     app.bathroom_door_close_grace_sec = 5
     app._vacancy_grace_timer = None
+    app._off_verify_timer = None
     app.blind_closed_threshold = 95
     app.bedroom_blind_entity = BLIND
     app.mikkel_sleep_entity = SLEEP
@@ -608,3 +609,41 @@ class ReconcileSession(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OffVerify(unittest.TestCase):
+    def _app_after_off(self):
+        app = make_session_app(session=False, dark=True)
+        app.states[(CEILING, None)] = "on"
+        app._evaluate_lights("TEST")
+        app.turn_off.assert_any_call(CEILING)
+        app.run_in.assert_called_once_with(app._off_verify_fire, bedroom_lights.OFF_VERIFY_SEC)
+        app.turn_off.reset_mock()
+        app._off_verify_timer = "exit-timer-handle"
+        return app
+
+    def test_light_back_on_and_room_empty_turns_off_again_once(self):
+        app = self._app_after_off()
+        app._off_verify_fire({})
+        app.turn_off.assert_any_call(CEILING)
+        app.turn_off.assert_any_call(BED)
+        self.assertIsNone(app._off_verify_timer)
+        self.assertEqual(app.run_in.call_count, 1)
+
+    def test_room_occupied_again_leaves_light_alone(self):
+        app = self._app_after_off()
+        app.states[(ROOM_ACTIVE, None)] = "on"
+        app._off_verify_fire({})
+        app.turn_off.assert_not_called()
+
+    def test_light_stayed_off_does_nothing(self):
+        app = self._app_after_off()
+        app.states[(CEILING, None)] = "off"
+        app._off_verify_fire({})
+        app.turn_off.assert_not_called()
+
+    def test_no_off_sent_arms_nothing(self):
+        app = make_session_app(session=False, dark=True)
+        app._evaluate_lights("TEST")
+        app.turn_off.assert_not_called()
+        app.run_in.assert_not_called()

@@ -8,6 +8,9 @@ import lighting_actions
 import room_active_read  # apps/presence - AppDaemon puts every app dir on sys.path
 import room_state_darkness
 
+OFF_VERIFY_SEC = 3
+
+
 class BedroomLights(hass.Hass):
     """
     Bedroom lighting with occupancy-based auto control.
@@ -113,6 +116,7 @@ class BedroomLights(hass.Hass):
         self._session = False
         self._session_exit_timer = None
         self._vacancy_grace_timer = None
+        self._off_verify_timer = None
 
         if not all(
             [
@@ -551,8 +555,32 @@ class BedroomLights(hass.Hass):
                 )
                 self.turn_off(self.bed_lights)
                 self.turn_off(self.ceiling_lights)
+                self._arm_off_verify()
         except Exception as e:
             self.log(f"Error turning off lights: {e}", level="ERROR")
+
+    # An Adaptive Lighting adapt (turn_on with a long transition) sent just before our
+    # turn_off can land at the bulb after it and switch it back on. Re-check once.
+    def _arm_off_verify(self) -> None:
+        if self._off_verify_timer is not None:
+            try:
+                self.cancel_timer(self._off_verify_timer)
+            except Exception:
+                pass
+        self._off_verify_timer = self.run_in(self._off_verify_fire, OFF_VERIFY_SEC)
+
+    def _off_verify_fire(self, kwargs):
+        self._off_verify_timer = None
+        try:
+            if lighting_actions.manual_override_active(self, self.manual_override_entity):
+                return
+            if self._get_effective_occupancy() or not self._are_any_lights_on():
+                return
+            self.log("Bedroom: lights back on after OFF - turning OFF again", level="INFO")
+            self.turn_off(self.bed_lights)
+            self.turn_off(self.ceiling_lights)
+        except Exception as e:
+            self.log(f"Error in off verify: {e}", level="ERROR")
 
     def _are_any_lights_on(self) -> bool:
         try:
