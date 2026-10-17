@@ -608,11 +608,21 @@ class PartyWindows(unittest.TestCase):
 
     def test_missing_end_or_end_before_start_means_six_hours(self):
         start = T(19)
-        for end in (None, T(18), start):
+        for end in (None, T(18)):
             s = self.state(T(20), start, end)
             self.assertEqual(s.event_end, start + 6 * 3600, end)
             self.assertEqual(self.state(T(0, 59, day=18), start, end).pause, True)
             self.assertEqual(self.state(T(1, day=18), start, end).pause, False)
+
+    def test_start_and_end_at_the_same_moment_is_two_untouched_helpers(self):
+        self.assertEqual(self.state(T(0, 30), T(0), T(0)), hp.PartyState())
+
+    def test_an_end_more_than_a_day_after_the_start_is_a_stale_helper(self):
+        start = T(19)
+        s = self.state(T(20), start, start + 25 * 3600)
+        self.assertEqual(s.event_end, start + 6 * 3600)
+        s = self.state(T(20), start, start + 24 * 3600)
+        self.assertEqual(s.event_end, start + 24 * 3600)
 
     def test_an_unset_datetime_helper_is_ignored(self):
         epoch0 = datetime(1970, 1, 1).timestamp()

@@ -56,6 +56,7 @@ VALID_RANGE_C = (5.0, 35.0)
 JUMP_C = 2.0
 JUMP_WINDOW_S = 600.0
 MIN_VALID_EPOCH = 365 * 86400.0
+PLANNED_PARTY_MAX_S = 24 * 3600.0
 
 
 class ConfigError(ValueError):
@@ -621,13 +622,15 @@ def party_state(
     switch_since: Optional[float],
 ) -> PartyState:
     """The planned party [start, end) with the zone paused pc.lead_hours ahead, and the manual
-    party switch (stops by itself after switch_max_hours). A missing end, or one not after the
-    start, means start plus default_hours."""
+    party switch (stops by itself after switch_max_hours). A missing end, one before the start,
+    or one more than a day after it (a helper left at an old value) means start plus
+    default_hours. Start and end at the very same moment is how two untouched helpers read, so
+    it is no party."""
     windows = []
     sources = []
-    if valid_epoch(planned_start):
+    if valid_epoch(planned_start) and planned_end != planned_start:
         end = planned_end
-        if not valid_epoch(end) or end <= planned_start:
+        if not valid_epoch(end) or end < planned_start or end - planned_start > PLANNED_PARTY_MAX_S:
             end = planned_start + pc.default_hours * 3600.0
         windows.append((planned_start - pc.lead_hours * 3600.0, planned_start, end, "planned"))
     if switch_on and valid_epoch(switch_since):
@@ -1015,9 +1018,8 @@ def plan(zc: ZoneConfig, inp: ZoneInputs, now_ts: float, tz) -> Plan:
         reasons.append("No usable room temperature: constant target, no profile or cuts")
     else:
         plan_mode, aim = MODE_HOLD, t_lead
-        reasons.append(
-            f"Aim {t_lead:.1f} for {hhmm(lead_ts, tz)} (lead {zc.profile.lead_hours:g} h)"
-        )
+        ahead = f"{zc.profile.lead_hours:g} h ahead" if zc.profile.lead_hours else "now"
+        reasons.append(f"Aim {t_lead:.1f}: the target {ahead}")
 
     if aim is None:
         raw = lower
