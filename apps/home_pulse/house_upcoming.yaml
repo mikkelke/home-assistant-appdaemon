@@ -93,6 +93,7 @@ HouseUpcoming:
       - {entity: sensor.family_room_thermostat_battery_level, model: sq610rfnh, name: Family room thermostat, area: dining_room}
       - {entity: sensor.guest_bathroom_thermostat_battery_level, model: sq610rfnh, name: Guest bathroom thermostat, area: guest_bathroom}
       - {entity: sensor.kristines_room_thermostat_battery_level, model: sq610rfnh, name: Kristines room thermostat, area: kristines_room}
+      - {entity: sensor.living_room_thermostat_battery_level, model: sq610rfnh, name: Living room thermostat, area: living_room}
       # Lock BLE connection turned off and new cells on 22.02.2026; the cycles before are another regime.
       - {entity: sensor.yale_battery, model: yale, name: Front door lock, area: hallway, history_from: 2026-02-22}
       - {entity: sensor.bedroom_blind_battery, model: blind, name: Bedroom blind, area: bedroom}

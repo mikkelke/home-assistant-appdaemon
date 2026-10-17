@@ -1062,13 +1062,13 @@ class InventoryTests(unittest.TestCase):
     INV = maint.parse_inventory(CONFIG["batteries"])
 
     def test_forty_nine_devices_and_nine_exclusions_cover_every_live_battery_sensor(self):
-        self.assertEqual((len(self.INV["devices"]), len(self.INV["excluded"])), (49, 9))
+        self.assertEqual((len(self.INV["devices"]), len(self.INV["excluded"])), (50, 9))
         self.assertEqual(maint.unlisted_batteries(LIVE_BATTERIES, self.INV), [])
         self.assertEqual({d["model"] for d in self.INV["devices"].values()}, set(self.INV["models"]))
 
     def test_start_up_names_unlisted_battery_sensors(self):
         quiet = make_app()
-        self.assertIn(("INFO", "Battery inventory complete: 49 listed, 9 excluded"), quiet.logs)
+        self.assertIn(("INFO", "Battery inventory complete: 50 listed, 9 excluded"), quiet.logs)
         states = base_states()
         states["sensor.new_door_battery"] = full("100", {"device_class": "battery"})
         loud = make_app(states)
@@ -1098,7 +1098,7 @@ class InventoryTests(unittest.TestCase):
         lines = [line for line in text.splitlines() if "ecowitt_battery_8351" in line]
         self.assertEqual(len(lines), 1)
         without = yaml.safe_load(text.replace(lines[0] + "\n", ""))["HouseUpcoming"]["batteries"]
-        self.assertEqual(len(maint.parse_inventory(without)["devices"]), 48)
+        self.assertEqual(len(maint.parse_inventory(without)["devices"]), 49)
 
     def test_one_owner_per_condition_agrees_with_the_owner_apps(self):
         salus = yaml.safe_load((APPS / "climate" / "salus_health.yaml").read_text())["SalusHealth"]
