@@ -1,6 +1,8 @@
 # /conf/apps/climate/salus_health.yaml
-# Watchdog for the Salus iT600 heating gear itself (thermostats + the Control
-# Centre wiring centre): connectivity dropouts, fault registers, low battery.
+# Watchdog for the Salus heating gear itself (thermostats + the wiring centre), which runs
+# on zigbee2mqtt: connectivity dropouts and low battery. zigbee2mqtt marks a device offline
+# only after its own availability timeout - 60 min of silence for a thermostat, 30 min
+# without a ping answer for the wiring centre - and offline_minutes counts on top of that.
 # Admin-class information, so it goes to Mikkel only - see module docstring.
 
 SalusHealth:
@@ -8,21 +10,24 @@ SalusHealth:
   class: SalusHealth
   # Init-order guarantee for get_app("MobileNotifier") cached in initialize(); also reloads this app when MobileNotifier reloads.
   dependencies: MobileNotifier
-  # Substrings that identify Salus entities among ALL climate/binary_sensor/sensor
-  # entities in HA - entities are discovered by these markers, not hardcoded per room.
-  # Thermostats are the climate entities containing thermostat_marker; the controller's
-  # link is the connectivity-class binary_sensor containing controller_marker.
+  # Substring that identifies the Salus thermostats among ALL climate/sensor entities in HA -
+  # thermostats are discovered by this marker, not hardcoded per room. A thermostat is the
+  # climate entity containing thermostat_marker; its battery is the sensor containing it and
+  # ending in _battery_level.
   thermostat_marker: thermostat
-  controller_marker: control_centre
-  # How long a thermostat's climate entity, or the controller's connectivity sensor, must
-  # stay offline ("unavailable", or "off" for the sensor) continuously before alerting.
+  # The wiring centre's link. zigbee2mqtt marks every one of its entities unavailable when it
+  # stops answering, so a single zone sensor stands for the device. "unknown" (a free zone, or
+  # no value received yet) says nothing about the link.
+  controller_entity: sensor.wiring_centre_zone_1
+  # How long a thermostat's climate entity, or the controller entity, must stay "unavailable"
+  # continuously before alerting - counted from when zigbee2mqtt marks the device offline.
   offline_minutes: 10
   # The battery sensor reports percent in coarse steps (0, 10, 25, 50, 75, 100). Alert at or
   # below this percent, then again only on a further drop (25% -> 10% alerts again; staying
   # at 25% does not re-nag). 40 alerts from 25% down and not at 50%.
   battery_warn_percent: 40
   notify_target: mikkel
-  # Entity ids to skip even if they match the markers above. The A/C's climate entity
+  # Entity ids to skip even if they match the marker above. The A/C's climate entity
   # contains "thermostat" but is not a Salus device.
   exclude_entities:
     - climate.air_conditioner_thermostat

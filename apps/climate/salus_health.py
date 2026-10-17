@@ -1,26 +1,29 @@
 """
 Salus health watchdog - admin-only alerts for the heating system's own
-plumbing: thermostat/controller connectivity, fault registers, and battery.
+plumbing: thermostat and wiring-centre connectivity, and thermostat battery.
 
-A thermostat that drops off the Salus iT600 gateway raises no alarm of its
-own; the integration only shows its climate entity as `unavailable`. Any
-other climate state (off/heat/auto/...) means the thermostat is online. The
-wiring centre ("Control Centre") is the single point of failure for ALL
-heating in the flat; its connectivity binary_sensor reads `unavailable` (or
-`off`) while it is offline. A thermostat or the controller that stays offline
-for offline_minutes is pushed, and so is its recovery. `unknown` says nothing
-about the link, so it neither starts nor ends an outage.
+The Salus thermostats and the wiring centre run on zigbee2mqtt. A device that
+stops answering raises no alarm of its own: zigbee2mqtt marks it offline only
+after its availability timeout (60 min of silence for a thermostat, 30 min
+without an answer to its ping for the wiring centre), and Home Assistant then
+shows its entities as `unavailable`. Any other climate state (off/heat/auto/...)
+means the thermostat is online. The wiring centre is the single point of
+failure for ALL heating in the flat; its link is read from one configured
+entity (controller_entity, a zone sensor that holds a thermostat address while
+the wiring centre is online). A thermostat or the wiring centre that then stays
+`unavailable` for offline_minutes is pushed, and so is its recovery. `unknown`
+says nothing about the link, so it neither starts nor ends an outage.
 
 This is admin-class information - nobody needs to know their thermostat's
 battery is at 25% or that a Zigbee hop dropped - so every push goes to
 Mikkel only, unlike the household-wide notify tiers used elsewhere.
 
-Entities are discovered by naming convention (thermostat_marker /
-controller_marker), not hardcoded per room, so adding, renaming or removing
-a thermostat needs no code or yaml change here. Thermostats are the climate
-entities whose id contains thermostat_marker (exclude_entities drops any that
-are not Salus, such as the A/C); the controller's link is the
-connectivity-class binary_sensor whose id contains controller_marker.
+Thermostats are discovered by naming convention (thermostat_marker), not
+hardcoded per room, so adding, renaming or removing a thermostat needs no code
+or yaml change here. Thermostats are the climate entities whose id contains
+thermostat_marker (exclude_entities drops any that are not Salus, such as the
+A/C); a thermostat's battery is the sensor with that marker whose id ends in
+_battery_level.
 """
 
 import json
@@ -36,7 +39,7 @@ class SalusHealth(hass.Hass):
     def initialize(self):
         a = self.args.get
         self.thermostat_marker = a("thermostat_marker", "thermostat")
-        self.controller_marker = a("controller_marker", "control_centre")
+        self.controller_entity = a("controller_entity", "sensor.wiring_centre_zone_1")
         self.offline_minutes = float(a("offline_minutes", 10))
         self.battery_warn_percent = int(a("battery_warn_percent", 40))
         self.notify_target = a("notify_target", "mikkel")
@@ -51,10 +54,11 @@ class SalusHealth(hass.Hass):
 
         saved_state = self._load_state()
         self._offline_alerted: dict = dict(saved_state.get("offline_alerted", {}))
-        self._problem_alerted: dict = dict(saved_state.get("problem_alerted", {}))
         self._battery_alerted_percent: dict = dict(saved_state.get("battery_alerted_percent", {}))
 
-        connectivity_entities, problem_entities, battery_entities = self._discover_entities()
+        thermostat_entities, battery_entities = self._discover_entities()
+        controller_entities = [self.controller_entity]
+        connectivity_entities = sorted(thermostat_entities + controller_entities)
 
         # An offline flag only means something for an entity that is watched now.
         self._offline_alerted = {
@@ -65,56 +69,35 @@ class SalusHealth(hass.Hass):
             self.listen_state(self._on_connectivity_change, entity_id)
             self._init_connectivity(entity_id)
 
-        for entity_id in problem_entities:
-            self.listen_state(self._on_problem_change, entity_id)
-            self._init_problem(entity_id)
-
         for entity_id in battery_entities:
             self.listen_state(self._on_battery_change, entity_id)
             self._check_battery(entity_id, self.get_state(entity_id))
 
         self.log(
-            f"SalusHealth watching {len(connectivity_entities)} connectivity, "
-            f"{len(problem_entities)} problem, {len(battery_entities)} battery entities",
+            f"SalusHealth watching {len(thermostat_entities)} thermostat, "
+            f"{len(controller_entities)} controller, {len(battery_entities)} battery entities",
             level="INFO",
         )
 
     # ---------- discovery ----------
 
     def _discover_entities(self):
-        """Find Salus entities by naming convention rather than a hardcoded
-        per-room list - see module docstring."""
-
-        def matches(entity_id, suffix):
-            if entity_id in self.exclude_entities:
-                return False
-            if not entity_id.endswith(suffix):
-                return False
-            return self.thermostat_marker in entity_id or self.controller_marker in entity_id
-
+        """Find the thermostats and their batteries by naming convention rather
+        than a hardcoded per-room list - see module docstring."""
         climates = self._domain_states("climate")
-        binary_sensors = self._domain_states("binary_sensor")
         sensors = self._domain_states("sensor")
 
-        thermostats = [
+        thermostats = sorted(
             e for e in climates if e not in self.exclude_entities and self.thermostat_marker in e
-        ]
-        controller_links = [
-            e
-            for e, state in binary_sensors.items()
-            if e not in self.exclude_entities
-            and self.controller_marker in e
-            and self._device_class(state) == "connectivity"
-        ]
-        connectivity = sorted(thermostats + controller_links)
-        # The battery's own fault flag is covered by the percent alerts below.
-        problem = sorted(
-            e
-            for e in binary_sensors
-            if matches(e, "_problem") and not e.endswith("_battery_problem")
         )
-        battery = sorted(e for e in sensors if matches(e, "_battery_level"))
-        return connectivity, problem, battery
+        battery = sorted(
+            e
+            for e in sensors
+            if e not in self.exclude_entities
+            and self.thermostat_marker in e
+            and e.endswith("_battery_level")
+        )
+        return thermostats, battery
 
     def _domain_states(self, domain):
         try:
@@ -123,24 +106,15 @@ class SalusHealth(hass.Hass):
             self.log(f"{domain} discovery failed: {e}", level="WARNING")
             return {}
 
-    @staticmethod
-    def _device_class(state):
-        attrs = state.get("attributes") if isinstance(state, dict) else None
-        return (attrs or {}).get("device_class")
-
     def _is_controller(self, entity_id):
-        return self.controller_marker in entity_id
+        return entity_id == self.controller_entity
 
     def _room_label(self, entity_id):
-        """Derive a short room/device label from a discovered entity_id - same
+        """Derive a short room label from a discovered thermostat entity_id - same
         string-manipulation convention as climate_alarm.py's
-        _room_name_from_entity. Naturally yields "Control Centre" for the
-        controller's own entities without any special-casing here."""
+        _room_name_from_entity."""
         part = entity_id.split(".", 1)[-1]
-        for suffix in ("_connectivity", "_problem", "_battery_level"):
-            if part.endswith(suffix):
-                part = part[: -len(suffix)]
-                break
+        part = part.removesuffix("_battery_level")
         part = part.replace("_thermostat", "")
         part = part.replace("_", " ").strip()
         return part.title() if part else entity_id
@@ -148,22 +122,17 @@ class SalusHealth(hass.Hass):
     # ---------- connectivity / offline ----------
 
     @staticmethod
-    def _link(entity_id, state):
+    def _link(state):
         """ONLINE, OFFLINE, or None when the state says nothing about the link.
-        The integration reports an offline device as `unavailable`. A climate
-        entity's other states are its HVAC mode (off/heat/auto/...), so all of
-        them mean online; a connectivity binary_sensor is online only while
-        `on`."""
+        zigbee2mqtt reports an offline device's entities as `unavailable`. Every
+        other state is a live reading: a climate entity's HVAC mode
+        (off/heat/auto/...), or the wiring centre's zone value."""
         if state in (None, "unknown"):
             return None
-        if state == "unavailable":
-            return OFFLINE
-        if entity_id.startswith("climate."):
-            return ONLINE
-        return ONLINE if state == "on" else OFFLINE
+        return OFFLINE if state == "unavailable" else ONLINE
 
     def _init_connectivity(self, entity_id):
-        link = self._link(entity_id, self.get_state(entity_id))
+        link = self._link(self.get_state(entity_id))
         if link == OFFLINE:
             if not self._offline_alerted.get(entity_id, False):
                 self._arm_offline_timer(entity_id)
@@ -179,7 +148,7 @@ class SalusHealth(hass.Hass):
         # unknown/None -> hold: neither arm nor clear anything.
 
     def _on_connectivity_change(self, entity, attribute, old, new, kwargs):
-        link = self._link(entity, new)
+        link = self._link(new)
         if link == OFFLINE:
             self._arm_offline_timer(entity)
         elif link == ONLINE:
@@ -214,83 +183,34 @@ class SalusHealth(hass.Hass):
         self._offline_timer_handles.pop(entity_id, None)
         if self._offline_alerted.get(entity_id, False):
             return
-        if self._link(entity_id, self.get_state(entity_id)) != OFFLINE:
+        if self._link(self.get_state(entity_id)) != OFFLINE:
             return
         self._offline_alerted[entity_id] = True
         self._save_state()
         self.create_task(self._notify_offline(entity_id))
 
     async def _notify_offline(self, entity_id):
-        label = self._room_label(entity_id)
         minutes = self.offline_minutes
         if self._is_controller(entity_id):
-            title = "Heating controller offline"
+            title = "Wiring centre offline"
             message = (
-                f"{label} has been offline for {minutes:.0f}+ min - this affects "
-                "ALL room heating, not just one room."
+                f"The wiring centre has been offline for {minutes:.0f}+ min - "
+                "all room heating depends on it."
             )
         else:
             title = "Thermostat offline"
+            label = self._room_label(entity_id)
             message = f"{label} thermostat has been offline for {minutes:.0f}+ min."
         await self._safe_notify(title, message)
 
     async def _notify_recovery(self, entity_id):
-        label = self._room_label(entity_id)
         if self._is_controller(entity_id):
-            title = "Heating controller back online"
-            message = f"{label} reconnected - heating control is restored for all rooms."
+            title = "Wiring centre back online"
+            message = "The wiring centre reconnected - heating control is restored for all rooms."
         else:
             title = "Thermostat back online"
+            label = self._room_label(entity_id)
             message = f"{label} thermostat reconnected after being offline."
-        await self._safe_notify(title, message)
-
-    # ---------- problem (fault registers) ----------
-
-    def _init_problem(self, entity_id):
-        current = self.get_state(entity_id)
-        if current == "on":
-            if not self._problem_alerted.get(entity_id, False):
-                self._problem_alerted[entity_id] = True
-                self._save_state()
-                self.create_task(self._notify_problem(entity_id))
-        elif current == "off":
-            if self._problem_alerted.get(entity_id, False):
-                self._problem_alerted[entity_id] = False
-                self._save_state()
-        # unknown/unavailable/None -> hold.
-
-    def _on_problem_change(self, entity, attribute, old, new, kwargs):
-        if new == "on":
-            if not self._problem_alerted.get(entity, False):
-                self._problem_alerted[entity] = True
-                self._save_state()
-                self.create_task(self._notify_problem(entity))
-        elif new == "off":
-            if self._problem_alerted.get(entity, False):
-                self._problem_alerted[entity] = False
-                self._save_state()
-        # unknown/unavailable -> hold.
-
-    async def _read_errors(self, entity_id):
-        try:
-            info = await self.get_state(entity_id, attribute="all") or {}
-        except Exception as e:
-            self.log(f"Could not read attributes for {entity_id}: {e}", level="DEBUG")
-            return []
-        attrs = info.get("attributes") if isinstance(info, dict) else None
-        raw_errors = (attrs or {}).get("errors")
-        return [str(x) for x in raw_errors] if isinstance(raw_errors, list) else []
-
-    async def _notify_problem(self, entity_id):
-        errors = await self._read_errors(entity_id)
-        detail = f" ({', '.join(errors)})" if errors else ""
-        label = self._room_label(entity_id)
-        if self._is_controller(entity_id):
-            title = "Heating controller fault"
-            message = f"{label} reports a fault{detail} - this affects ALL room heating."
-        else:
-            title = "Thermostat fault"
-            message = f"{label} thermostat reports a fault{detail}."
         await self._safe_notify(title, message)
 
     # ---------- battery ----------
@@ -356,7 +276,6 @@ class SalusHealth(hass.Hass):
     def _save_state(self) -> None:
         data = {
             "offline_alerted": self._offline_alerted,
-            "problem_alerted": self._problem_alerted,
             "battery_alerted_percent": self._battery_alerted_percent,
         }
         try:

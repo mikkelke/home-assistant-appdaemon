@@ -1,5 +1,5 @@
-# tests/test_salus_health.py - SalusHealth watchdog (connectivity/problem/battery for
-# the Salus thermostats + the Control Centre wiring centre). Same __new__ +
+# tests/test_salus_health.py - SalusHealth watchdog (connectivity for the Salus thermostats +
+# the wiring centre, and thermostat battery, all on zigbee2mqtt). Same __new__ +
 # monkeypatched-callables harness as the other apps/climate/tests files; async notify
 # bodies are tested directly via IsolatedAsyncioTestCase, matching climate_alarm.py.
 # Run from repo root: python3 -m unittest discover -s apps/climate/tests -q
@@ -32,18 +32,38 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
 
 import salus_health as sh  # noqa: E402
 
+ROOMS = (
+    "kristines_room",
+    "claudias_room",
+    "bedroom",
+    "guest_bathroom",
+    "bathroom",
+    "family_room",
+    "living_room",
+)
+
 THERMOSTAT = "climate.bedroom_thermostat"
+LIVING_ROOM = "climate.living_room_thermostat"
 AC = "climate.air_conditioner_thermostat"
-CONTROLLER_LINK = "binary_sensor.control_centre"
-THERMOSTAT_PROBLEM = "binary_sensor.bedroom_thermostat_problem"
-THERMOSTAT_BATTERY_PROBLEM = "binary_sensor.bedroom_thermostat_battery_problem"
+CONTROLLER = "sensor.wiring_centre_zone_1"
 THERMOSTAT_BATTERY = "sensor.bedroom_thermostat_battery_level"
-CONTROLLER_PROBLEM = "binary_sensor.control_centre_problem"
+ADDRESS = "0x26b0"  # a zone sensor's state while the wiring centre is online
 
 
-def _bs(state, device_class=None):
-    """A binary_sensor entry as AppDaemon's domain-wide get_state returns it."""
-    return {"state": state, "attributes": {"device_class": device_class} if device_class else {}}
+def _house_climates():
+    climates = {f"climate.{room}_thermostat": "off" for room in ROOMS}
+    climates[AC] = "unavailable"
+    return climates
+
+
+def _house_sensors():
+    sensors = {}
+    for room in ROOMS:
+        sensors[f"sensor.{room}_thermostat_battery_level"] = "100"
+        sensors[f"sensor.{room}_thermostat_humidity"] = "45"
+    for zone in range(1, 9):
+        sensors[f"sensor.wiring_centre_zone_{zone}"] = ADDRESS
+    return sensors
 
 
 def _close_coroutine(coro):
@@ -56,14 +76,13 @@ def _base_app():
     sibling test files."""
     app = sh.SalusHealth.__new__(sh.SalusHealth)
     app.thermostat_marker = "thermostat"
-    app.controller_marker = "control_centre"
+    app.controller_entity = CONTROLLER
     app.offline_minutes = 10
     app.battery_warn_percent = 40
     app.notify_target = "mikkel"
     app.exclude_entities = set()
     app._offline_timer_handles = {}
     app._offline_alerted = {}
-    app._problem_alerted = {}
     app._battery_alerted_percent = {}
     app.log = MagicMock()
     app.create_task = MagicMock(side_effect=_close_coroutine)
@@ -72,10 +91,10 @@ def _base_app():
     return app
 
 
-def _initialized_app(args, *, climates=None, binary_sensors=None, sensors=None):
+def _initialized_app(args, *, climates=None, sensors=None):
     """SalusHealth with initialize() run for real against fake entity domains.
-    climate/sensor values are plain state strings; binary_sensor values are the
-    dicts _bs() builds. listen_state / run_in / create_task are mocks to assert on."""
+    Values are plain state strings. listen_state / run_in / create_task are mocks
+    to assert on."""
     app = sh.SalusHealth.__new__(sh.SalusHealth)
     app.args = args
     app.log = MagicMock()
@@ -86,7 +105,6 @@ def _initialized_app(args, *, climates=None, binary_sensors=None, sensors=None):
 
     domains = {
         "climate": climates or {},
-        "binary_sensor": binary_sensors or {},
         "sensor": sensors or {},
     }
 
@@ -95,8 +113,7 @@ def _initialized_app(args, *, climates=None, binary_sensors=None, sensors=None):
             return dict(domains[entity])
         for states in domains.values():
             if entity in states:
-                state = states[entity]
-                return state["state"] if isinstance(state, dict) else state
+                return states[entity]
         return None
 
     app.get_state = get_state
@@ -121,12 +138,11 @@ class FakeNotifier:
 
 
 class DiscoverEntities(unittest.TestCase):
-    def _app(self, climates=None, binary_sensors=None, sensors=None, exclude=None):
+    def _app(self, climates=None, sensors=None, exclude=None):
         app = _base_app()
         app.exclude_entities = set(exclude or [])
         domains = {
             "climate": climates or {},
-            "binary_sensor": binary_sensors or {},
             "sensor": sensors or {},
         }
 
@@ -136,97 +152,50 @@ class DiscoverEntities(unittest.TestCase):
         app.get_state = get_state
         return app
 
-    def test_finds_thermostat_climates_and_the_controller_link(self):
+    def test_finds_thermostat_climates_by_marker(self):
         climates = {
             THERMOSTAT: "heat",
             "climate.claudias_room_thermostat": "unavailable",
             "climate.some_other_hvac": "cool",  # no marker match
-            "climate.control_centre": "heat",  # the controller marker alone is not a thermostat
+            "climate.wiring_centre": "heat",  # not a thermostat
         }
-        binary_sensors = {
-            CONTROLLER_LINK: _bs("on", "connectivity"),
-            "binary_sensor.air_conditioner_connectivity": _bs("unavailable", "connectivity"),
-            "binary_sensor.front_door_contact": _bs("off", "door"),
-        }
-        app = self._app(climates=climates, binary_sensors=binary_sensors)
-        connectivity, _, _ = app._discover_entities()
-        self.assertEqual(
-            set(connectivity),
-            {THERMOSTAT, "climate.claudias_room_thermostat", CONTROLLER_LINK},
-        )
+        thermostats, _ = self._app(climates=climates)._discover_entities()
+        self.assertEqual(thermostats, [THERMOSTAT, "climate.claudias_room_thermostat"])
 
-    def test_controller_link_must_be_connectivity_class(self):
-        binary_sensors = {
-            CONTROLLER_LINK: _bs("on", "connectivity"),
-            CONTROLLER_PROBLEM: _bs("off", "problem"),  # same marker, other class
-            "binary_sensor.control_centre_other": _bs("on"),  # no device_class at all
-        }
-        app = self._app(binary_sensors=binary_sensors)
-        connectivity, _, _ = app._discover_entities()
-        self.assertEqual(connectivity, [CONTROLLER_LINK])
+    def test_a_renamed_or_added_thermostat_needs_no_config(self):
+        thermostats, _ = self._app(
+            climates={THERMOSTAT: "heat", LIVING_ROOM: "off"}
+        )._discover_entities()
+        self.assertEqual(thermostats, [THERMOSTAT, LIVING_ROOM])
 
-    def test_thermostat_connectivity_sensors_are_not_a_second_source(self):
-        """Thermostats are watched through their climate entity only, so a
-        connectivity sensor that merely carries the thermostat marker is ignored."""
-        binary_sensors = {
-            "binary_sensor.bedroom_thermostat_connectivity": _bs("unavailable", "connectivity")
-        }
-        app = self._app(climates={THERMOSTAT: "heat"}, binary_sensors=binary_sensors)
-        connectivity, _, _ = app._discover_entities()
-        self.assertEqual(connectivity, [THERMOSTAT])
-
-    def test_finds_thermostat_and_controller_problem_sensors(self):
-        binary_sensors = {
-            THERMOSTAT_PROBLEM: _bs("off", "problem"),
-            CONTROLLER_PROBLEM: _bs("off", "problem"),
-            "binary_sensor.front_door_contact": _bs("off", "door"),  # unrelated domain entity
-            "binary_sensor.some_other_integration_problem": _bs("off", "problem"),  # no marker
-        }
-        app = self._app(binary_sensors=binary_sensors)
-        _, problem, battery = app._discover_entities()
-        self.assertEqual(set(problem), {THERMOSTAT_PROBLEM, CONTROLLER_PROBLEM})
-        self.assertEqual(battery, [])
-
-    def test_battery_problem_flags_are_not_fault_registers(self):
-        """Battery trouble is already pushed from the percent sensor, so the
-        *_battery_problem flags must not be a second push, whichever way the
-        area prefix in their id is spelled."""
-        binary_sensors = {
-            THERMOSTAT_PROBLEM: _bs("off", "problem"),
-            THERMOSTAT_BATTERY_PROBLEM: _bs("off", "battery"),
-            "binary_sensor.bedroom_bedroom_thermostat_battery_problem": _bs("off", "battery"),
-        }
-        app = self._app(binary_sensors=binary_sensors)
-        _, problem, _ = app._discover_entities()
-        self.assertEqual(problem, [THERMOSTAT_PROBLEM])
-
-    def test_finds_thermostat_battery_but_ignores_non_battery_sensors(self):
+    def test_finds_thermostat_battery_but_ignores_other_sensors(self):
         sensors = {
             THERMOSTAT_BATTERY: "25",
-            "sensor.control_centre_signal_strength": "-27",  # wrong suffix
-            "sensor.some_unrelated_thermostat_temperature": "21.0",  # wrong suffix
+            "sensor.bedroom_thermostat_battery": "75",  # marker, but not the _battery_level id
+            "sensor.bedroom_thermostat_humidity": "45",  # wrong suffix
+            CONTROLLER: ADDRESS,  # no marker, wrong suffix
+            "sensor.front_door_battery_level": "80",  # right suffix, no marker
         }
-        app = self._app(sensors=sensors)
-        _, _, battery = app._discover_entities()
-        self.assertEqual(set(battery), {THERMOSTAT_BATTERY})
+        _, battery = self._app(sensors=sensors)._discover_entities()
+        self.assertEqual(battery, [THERMOSTAT_BATTERY])
 
     def test_exclude_entities_keeps_the_ac_climate_out(self):
         climates = {THERMOSTAT: "heat", AC: "cool"}
         # The A/C carries the thermostat marker, so only the knob keeps it out.
-        connectivity, _, _ = self._app(climates=climates)._discover_entities()
-        self.assertEqual(set(connectivity), {THERMOSTAT, AC})
+        thermostats, _ = self._app(climates=climates)._discover_entities()
+        self.assertEqual(set(thermostats), {THERMOSTAT, AC})
 
-        connectivity, _, _ = self._app(climates=climates, exclude=[AC])._discover_entities()
-        self.assertEqual(connectivity, [THERMOSTAT])
+        thermostats, _ = self._app(climates=climates, exclude=[AC])._discover_entities()
+        self.assertEqual(thermostats, [THERMOSTAT])
 
-    def test_exclude_entities_drops_a_controller_link_too(self):
-        binary_sensors = {CONTROLLER_LINK: _bs("on", "connectivity")}
-        app = self._app(binary_sensors=binary_sensors, exclude=[CONTROLLER_LINK])
-        connectivity, _, _ = app._discover_entities()
-        self.assertEqual(connectivity, [])
+    def test_exclude_entities_drops_a_battery_sensor_too(self):
+        ac_battery = "sensor.air_conditioner_thermostat_battery_level"
+        sensors = {THERMOSTAT_BATTERY: "25", ac_battery: "50"}
+        _, battery = self._app(sensors=sensors, exclude=[ac_battery])._discover_entities()
+        self.assertEqual(battery, [THERMOSTAT_BATTERY])
 
-    def test_a_failing_domain_lookup_does_not_block_the_others(self):
-        app = self._app(binary_sensors={CONTROLLER_LINK: _bs("on", "connectivity")})
+    def test_a_failing_domain_lookup_does_not_block_the_other(self):
+        app = self._app(sensors={THERMOSTAT_BATTERY: "25"})
         working = app.get_state
 
         def get_state(entity=None, **kw):
@@ -235,8 +204,9 @@ class DiscoverEntities(unittest.TestCase):
             return working(entity)
 
         app.get_state = get_state
-        connectivity, _, _ = app._discover_entities()
-        self.assertEqual(connectivity, [CONTROLLER_LINK])
+        thermostats, battery = app._discover_entities()
+        self.assertEqual(thermostats, [])
+        self.assertEqual(battery, [THERMOSTAT_BATTERY])
         app.log.assert_called_once()
 
 
@@ -249,26 +219,44 @@ class ShippedConfig(unittest.TestCase):
         args["state_file"] = _write_state_file(self, {})
         return args
 
-    def test_default_exclude_keeps_the_ac_out_of_the_watch_list(self):
-        app = _initialized_app(self._args(), climates={THERMOSTAT: "heat", AC: "unavailable"})
-        watched = [call.args[1] for call in app.listen_state.call_args_list]
-        self.assertEqual(watched, [THERMOSTAT])
-        app.run_in.assert_not_called()  # an unavailable A/C would have armed an offline timer
+    def test_the_controller_is_the_first_wiring_centre_zone_sensor(self):
+        self.assertEqual(self._args()["controller_entity"], CONTROLLER)
 
-    def test_watches_thermostats_and_the_controller_link_and_arms_an_unavailable_one(self):
+    def test_default_exclude_keeps_the_ac_out_of_the_watch_list(self):
         app = _initialized_app(
             self._args(),
-            climates={THERMOSTAT: "heat"},
-            binary_sensors={
-                CONTROLLER_LINK: _bs("unavailable", "connectivity"),
-                CONTROLLER_PROBLEM: _bs("off", "problem"),
-                THERMOSTAT_BATTERY_PROBLEM: _bs("off", "battery"),
-            },
+            climates={THERMOSTAT: "heat", AC: "unavailable"},
+            sensors={CONTROLLER: ADDRESS},
         )
+        watched = [call.args[1] for call in app.listen_state.call_args_list]
+        self.assertEqual(watched, [THERMOSTAT, CONTROLLER])
+        app.run_in.assert_not_called()  # an unavailable A/C would have armed an offline timer
+
+    def test_watches_every_thermostat_battery_and_the_one_controller_and_logs_the_counts(self):
+        app = _initialized_app(self._args(), climates=_house_climates(), sensors=_house_sensors())
         watched = {call.args[1] for call in app.listen_state.call_args_list}
-        self.assertEqual(watched, {THERMOSTAT, CONTROLLER_LINK, CONTROLLER_PROBLEM})
+        expected = {CONTROLLER}
+        for room in ROOMS:
+            expected.add(f"climate.{room}_thermostat")
+            expected.add(f"sensor.{room}_thermostat_battery_level")
+        self.assertEqual(watched, expected)
+        app.log.assert_called_once_with(
+            "SalusHealth watching 7 thermostat, 1 controller, 7 battery entities", level="INFO"
+        )
+
+    def test_an_unavailable_wiring_centre_arms_an_offline_timer(self):
+        app = _initialized_app(
+            self._args(), climates={THERMOSTAT: "heat"}, sensors={CONTROLLER: "unavailable"}
+        )
         armed = [call.kwargs["entity_id"] for call in app.run_in.call_args_list]
-        self.assertEqual(armed, [CONTROLLER_LINK])
+        self.assertEqual(armed, [CONTROLLER])
+
+    def test_an_unknown_wiring_centre_arms_nothing(self):
+        app = _initialized_app(
+            self._args(), climates={THERMOSTAT: "heat"}, sensors={CONTROLLER: "unknown"}
+        )
+        app.run_in.assert_not_called()
+        app.create_task.assert_not_called()
 
 
 class RoomLabelAndController(unittest.TestCase):
@@ -276,46 +264,31 @@ class RoomLabelAndController(unittest.TestCase):
         app = _base_app()
         self.assertEqual(app._room_label(THERMOSTAT), "Bedroom")
         self.assertEqual(app._room_label("climate.claudias_room_thermostat"), "Claudias Room")
-        self.assertEqual(
-            app._room_label("binary_sensor.claudias_room_thermostat_problem"),
-            "Claudias Room",
-        )
+        self.assertEqual(app._room_label(LIVING_ROOM), "Living Room")
         self.assertEqual(app._room_label(THERMOSTAT_BATTERY), "Bedroom")
 
-    def test_controller_label_is_control_centre(self):
+    def test_only_the_configured_entity_is_the_controller(self):
         app = _base_app()
-        self.assertEqual(app._room_label(CONTROLLER_LINK), "Control Centre")
-        self.assertEqual(app._room_label(CONTROLLER_PROBLEM), "Control Centre")
-
-    def test_is_controller(self):
-        app = _base_app()
-        self.assertTrue(app._is_controller(CONTROLLER_LINK))
-        self.assertTrue(app._is_controller(CONTROLLER_PROBLEM))
+        self.assertTrue(app._is_controller(CONTROLLER))
+        self.assertFalse(app._is_controller("sensor.wiring_centre_zone_2"))
         self.assertFalse(app._is_controller(THERMOSTAT))
-        self.assertFalse(app._is_controller(THERMOSTAT_PROBLEM))
 
 
 class LinkState(unittest.TestCase):
     """What a watched entity's state says about the link."""
 
-    def test_climate_unavailable_is_offline(self):
-        self.assertEqual(sh.SalusHealth._link(THERMOSTAT, "unavailable"), sh.OFFLINE)
+    def test_unavailable_is_offline(self):
+        self.assertEqual(sh.SalusHealth._link("unavailable"), sh.OFFLINE)
 
-    def test_every_other_climate_state_is_online_including_hvac_off(self):
-        for state in ("off", "heat", "auto", "cool", "heat_cool", "dry", "fan_only"):
+    def test_every_other_state_is_online_including_hvac_off_and_zone_addresses(self):
+        for state in ("off", "heat", "auto", "cool", "heat_cool", "dry", "fan_only", ADDRESS):
             with self.subTest(state=state):
-                self.assertEqual(sh.SalusHealth._link(THERMOSTAT, state), sh.ONLINE)
+                self.assertEqual(sh.SalusHealth._link(state), sh.ONLINE)
 
-    def test_controller_sensor_on_is_online_off_and_unavailable_are_offline(self):
-        self.assertEqual(sh.SalusHealth._link(CONTROLLER_LINK, "on"), sh.ONLINE)
-        self.assertEqual(sh.SalusHealth._link(CONTROLLER_LINK, "off"), sh.OFFLINE)
-        self.assertEqual(sh.SalusHealth._link(CONTROLLER_LINK, "unavailable"), sh.OFFLINE)
-
-    def test_unknown_and_none_hold_for_both_kinds(self):
-        for entity in (THERMOSTAT, CONTROLLER_LINK):
-            for state in ("unknown", None):
-                with self.subTest(entity=entity, state=state):
-                    self.assertIsNone(sh.SalusHealth._link(entity, state))
+    def test_unknown_and_none_hold(self):
+        for state in ("unknown", None):
+            with self.subTest(state=state):
+                self.assertIsNone(sh.SalusHealth._link(state))
 
 
 class OfflineArmDisarm(unittest.TestCase):
@@ -333,22 +306,16 @@ class OfflineArmDisarm(unittest.TestCase):
         return app
 
     def test_unavailable_arms_a_timer_for_offline_minutes(self):
-        app = self._app()
-        app._on_connectivity_change(THERMOSTAT, "state", "heat", "unavailable", {})
-        self.assertEqual(len(self.run_in_calls), 1)
-        cb, delay, kw = self.run_in_calls[0]
-        self.assertEqual(cb, app._maybe_alert_offline)
-        self.assertEqual(delay, 600)  # 10 min default, in seconds
-        self.assertEqual(kw.get("entity_id"), THERMOSTAT)
-        self.assertIn(THERMOSTAT, app._offline_timer_handles)
-
-    def test_controller_link_unavailable_or_off_arms_a_timer(self):
-        for new in ("unavailable", "off"):
-            with self.subTest(new=new):
+        for entity, online in ((THERMOSTAT, "heat"), (CONTROLLER, ADDRESS)):
+            with self.subTest(entity=entity):
                 app = self._app()
-                app._on_connectivity_change(CONTROLLER_LINK, "state", "on", new, {})
+                app._on_connectivity_change(entity, "state", online, "unavailable", {})
                 self.assertEqual(len(self.run_in_calls), 1)
-                self.assertEqual(self.run_in_calls[0][2].get("entity_id"), CONTROLLER_LINK)
+                cb, delay, kw = self.run_in_calls[0]
+                self.assertEqual(cb, app._maybe_alert_offline)
+                self.assertEqual(delay, 600)  # 10 min default, in seconds
+                self.assertEqual(kw.get("entity_id"), entity)
+                self.assertIn(entity, app._offline_timer_handles)
 
     def test_hvac_off_is_online_and_never_arms_a_timer(self):
         app = self._app()
@@ -356,20 +323,22 @@ class OfflineArmDisarm(unittest.TestCase):
         self.assertEqual(self.run_in_calls, [])
 
     def test_blip_shorter_than_threshold_does_not_alert(self):
-        app = self._app()
-        app._on_connectivity_change(THERMOSTAT, "state", "heat", "unavailable", {})
-        app._on_connectivity_change(THERMOSTAT, "state", "unavailable", "heat", {})
-        app.cancel_timer.assert_called_once()
-        self.assertNotIn(THERMOSTAT, app._offline_timer_handles)
+        for entity, online in ((THERMOSTAT, "heat"), (CONTROLLER, ADDRESS)):
+            with self.subTest(entity=entity):
+                app = self._app()
+                app._on_connectivity_change(entity, "state", online, "unavailable", {})
+                app._on_connectivity_change(entity, "state", "unavailable", online, {})
+                app.cancel_timer.assert_called_once()
+                self.assertNotIn(entity, app._offline_timer_handles)
 
-        # Even if the (cancelled) timer's callback somehow still fires late, the
-        # current state is online now, so _maybe_alert_offline must refuse to alert.
-        app.get_state = lambda e, **kw: "heat"
-        app._maybe_alert_offline({"entity_id": THERMOSTAT})
-        app.create_task.assert_not_called()
+                # Even if the (cancelled) timer's callback somehow still fires late, the
+                # current state is online now, so _maybe_alert_offline must refuse to alert.
+                app.get_state = lambda e, **kw: online
+                app._maybe_alert_offline({"entity_id": entity})
+                app.create_task.assert_not_called()
 
     def test_unknown_neither_arms_nor_disarms(self):
-        for entity, online in ((THERMOSTAT, "heat"), (CONTROLLER_LINK, "on")):
+        for entity, online in ((THERMOSTAT, "heat"), (CONTROLLER, ADDRESS)):
             with self.subTest(entity=entity):
                 app = self._app()
                 app._on_connectivity_change(entity, "state", online, "unknown", {})
@@ -389,19 +358,13 @@ class OfflineAlertFiring(unittest.TestCase):
         return app
 
     def test_sustained_offline_fires_once(self):
-        app = self._app("unavailable")
-        app._maybe_alert_offline({"entity_id": THERMOSTAT})
-        app.create_task.assert_called_once()
-        self.assertTrue(app._offline_alerted[THERMOSTAT])
-        app._save_state.assert_called_once()
-
-    def test_controller_link_offline_fires_for_unavailable_and_off(self):
-        for state in ("unavailable", "off"):
-            with self.subTest(state=state):
-                app = self._app(state)
-                app._maybe_alert_offline({"entity_id": CONTROLLER_LINK})
+        for entity in (THERMOSTAT, CONTROLLER):
+            with self.subTest(entity=entity):
+                app = self._app("unavailable")
+                app._maybe_alert_offline({"entity_id": entity})
                 app.create_task.assert_called_once()
-                self.assertTrue(app._offline_alerted[CONTROLLER_LINK])
+                self.assertTrue(app._offline_alerted[entity])
+                app._save_state.assert_called_once()
 
     def test_does_not_fire_twice_for_the_same_episode(self):
         app = self._app("unavailable")
@@ -410,11 +373,19 @@ class OfflineAlertFiring(unittest.TestCase):
         app.create_task.assert_called_once()
 
     def test_no_alert_if_state_recovered_before_timer_fired(self):
-        for entity, online in ((THERMOSTAT, "heat"), (THERMOSTAT, "off"), (CONTROLLER_LINK, "on")):
+        for entity, online in ((THERMOSTAT, "heat"), (THERMOSTAT, "off"), (CONTROLLER, ADDRESS)):
             with self.subTest(entity=entity, state=online):
                 app = self._app(online)
                 app._maybe_alert_offline({"entity_id": entity})
                 app.create_task.assert_not_called()
+
+    def test_no_alert_if_state_is_unknown_when_the_timer_fires(self):
+        for entity in (THERMOSTAT, CONTROLLER):
+            with self.subTest(entity=entity):
+                app = self._app("unknown")
+                app._maybe_alert_offline({"entity_id": entity})
+                app.create_task.assert_not_called()
+                self.assertFalse(app._offline_alerted.get(entity, False))
 
     def test_missing_entity_id_in_kwargs_is_a_noop(self):
         app = self._app("unavailable")
@@ -445,19 +416,30 @@ class OfflineRecovery(unittest.TestCase):
         app.create_task.assert_called_once()
         self.assertFalse(app._offline_alerted[THERMOSTAT])
 
-    def test_controller_link_recovery_notifies_and_clears_flag(self):
-        for old in ("unavailable", "off"):
-            with self.subTest(old=old):
-                app = self._app()
-                app._offline_alerted[CONTROLLER_LINK] = True
-                app._on_connectivity_change(CONTROLLER_LINK, "state", old, "on", {})
-                app.create_task.assert_called_once()
-                self.assertFalse(app._offline_alerted[CONTROLLER_LINK])
+    def test_wiring_centre_recovery_notifies_and_clears_flag(self):
+        app = self._app()
+        app._offline_alerted[CONTROLLER] = True
+        app._on_connectivity_change(CONTROLLER, "state", "unavailable", ADDRESS, {})
+        app.create_task.assert_called_once()
+        self.assertFalse(app._offline_alerted[CONTROLLER])
+        app._save_state.assert_called_once()
 
     def test_recovery_without_prior_alert_does_not_notify(self):
-        app = self._app()
-        app._on_connectivity_change(THERMOSTAT, "state", "unavailable", "heat", {})
-        app.create_task.assert_not_called()
+        for entity, online in ((THERMOSTAT, "heat"), (CONTROLLER, ADDRESS)):
+            with self.subTest(entity=entity):
+                app = self._app()
+                app._on_connectivity_change(entity, "state", "unavailable", online, {})
+                app.create_task.assert_not_called()
+
+    def test_unknown_after_an_alert_neither_recovers_nor_clears_the_flag(self):
+        for entity in (THERMOSTAT, CONTROLLER):
+            with self.subTest(entity=entity):
+                app = self._app()
+                app._offline_alerted[entity] = True
+                app._on_connectivity_change(entity, "state", "unavailable", "unknown", {})
+                app.create_task.assert_not_called()
+                app._save_state.assert_not_called()
+                self.assertTrue(app._offline_alerted[entity])
 
 
 class OfflineSurvivesRestart(unittest.TestCase):
@@ -474,43 +456,46 @@ class OfflineSurvivesRestart(unittest.TestCase):
         return app
 
     def test_still_unavailable_and_already_alerted_does_not_rearm_or_renotify(self):
-        app = self._app("unavailable", alerted_before=True)
-        app._init_connectivity(THERMOSTAT)
-        app.run_in.assert_not_called()
-        app.create_task.assert_not_called()
-        self.assertTrue(app._offline_alerted[THERMOSTAT])
+        for entity in (THERMOSTAT, CONTROLLER):
+            with self.subTest(entity=entity):
+                app = self._app("unavailable", alerted_before=True, entity=entity)
+                app._init_connectivity(entity)
+                app.run_in.assert_not_called()
+                app.create_task.assert_not_called()
+                self.assertTrue(app._offline_alerted[entity])
 
     def test_still_unavailable_and_not_yet_alerted_arms_a_fresh_timer(self):
-        app = self._app("unavailable", alerted_before=False)
-        app._init_connectivity(THERMOSTAT)
-        app.run_in.assert_called_once()
-        app.create_task.assert_not_called()
-
-    def test_controller_link_still_off_and_not_yet_alerted_arms_a_fresh_timer(self):
-        app = self._app("off", alerted_before=False, entity=CONTROLLER_LINK)
-        app._init_connectivity(CONTROLLER_LINK)
-        app.run_in.assert_called_once()
+        for entity in (THERMOSTAT, CONTROLLER):
+            with self.subTest(entity=entity):
+                app = self._app("unavailable", alerted_before=False, entity=entity)
+                app._init_connectivity(entity)
+                app.run_in.assert_called_once()
+                app.create_task.assert_not_called()
 
     def test_recovered_while_restarting_sends_recovery_once(self):
-        for state in ("heat", "off"):
-            with self.subTest(state=state):
-                app = self._app(state, alerted_before=True)
-                app._init_connectivity(THERMOSTAT)
+        for entity, state in ((THERMOSTAT, "heat"), (THERMOSTAT, "off"), (CONTROLLER, ADDRESS)):
+            with self.subTest(entity=entity, state=state):
+                app = self._app(state, alerted_before=True, entity=entity)
+                app._init_connectivity(entity)
                 app.create_task.assert_called_once()
-                self.assertFalse(app._offline_alerted[THERMOSTAT])
+                self.assertFalse(app._offline_alerted[entity])
                 app._save_state.assert_called_once()
 
     def test_online_and_never_alerted_does_nothing(self):
-        app = self._app("heat", alerted_before=False)
-        app._init_connectivity(THERMOSTAT)
-        app.create_task.assert_not_called()
-        app.run_in.assert_not_called()
+        for entity, state in ((THERMOSTAT, "heat"), (CONTROLLER, ADDRESS)):
+            with self.subTest(entity=entity):
+                app = self._app(state, alerted_before=False, entity=entity)
+                app._init_connectivity(entity)
+                app.create_task.assert_not_called()
+                app.run_in.assert_not_called()
 
     def test_unknown_at_startup_does_nothing(self):
-        app = self._app("unknown", alerted_before=False)
-        app._init_connectivity(THERMOSTAT)
-        app.create_task.assert_not_called()
-        app.run_in.assert_not_called()
+        for entity in (THERMOSTAT, CONTROLLER):
+            with self.subTest(entity=entity):
+                app = self._app("unknown", alerted_before=False, entity=entity)
+                app._init_connectivity(entity)
+                app.create_task.assert_not_called()
+                app.run_in.assert_not_called()
 
 
 class OfflineNotifyWording(unittest.IsolatedAsyncioTestCase):
@@ -528,109 +513,30 @@ class OfflineNotifyWording(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["message"], "Bedroom thermostat has been offline for 10+ min.")
         self.assertEqual(call["target"], "mikkel")
 
-    async def test_controller_offline_uses_all_heating_wording(self):
+    async def test_wiring_centre_offline_says_all_heating_depends_on_it(self):
         app = self._app()
-        await app._notify_offline(CONTROLLER_LINK)
+        await app._notify_offline(CONTROLLER)
         call = app._notifier.calls[0]
-        self.assertEqual(call["title"], "Heating controller offline")
+        self.assertEqual(call["title"], "Wiring centre offline")
         self.assertEqual(
             call["message"],
-            "Control Centre has been offline for 10+ min - this affects ALL room heating, "
-            "not just one room.",
+            "The wiring centre has been offline for 10+ min - all room heating depends on it.",
         )
+        self.assertEqual(call["target"], "mikkel")
 
-    async def test_recovery_wording_thermostat_vs_controller(self):
+    async def test_recovery_wording_thermostat_vs_wiring_centre(self):
         app = self._app()
         await app._notify_recovery(THERMOSTAT)
-        await app._notify_recovery(CONTROLLER_LINK)
+        await app._notify_recovery(CONTROLLER)
         titles = [c["title"] for c in app._notifier.calls]
-        self.assertEqual(titles, ["Thermostat back online", "Heating controller back online"])
+        self.assertEqual(titles, ["Thermostat back online", "Wiring centre back online"])
         self.assertEqual(
             app._notifier.calls[0]["message"], "Bedroom thermostat reconnected after being offline."
         )
-
-
-class ProblemAlerting(unittest.TestCase):
-    def _app(self):
-        return _base_app()
-
-    def test_turning_on_alerts_once(self):
-        app = self._app()
-        app._on_problem_change(THERMOSTAT_PROBLEM, "state", "off", "on", {})
-        app.create_task.assert_called_once()
-        self.assertTrue(app._problem_alerted[THERMOSTAT_PROBLEM])
-
-        # A duplicate "on" (e.g. a second Error* register flips while already on)
-        # must not push again.
-        app._on_problem_change(THERMOSTAT_PROBLEM, "state", "on", "on", {})
-        app.create_task.assert_called_once()
-
-    def test_turning_off_clears_silently(self):
-        app = self._app()
-        app._problem_alerted[THERMOSTAT_PROBLEM] = True
-        app._on_problem_change(THERMOSTAT_PROBLEM, "state", "on", "off", {})
-        self.assertFalse(app._problem_alerted[THERMOSTAT_PROBLEM])
-        app.create_task.assert_not_called()
-
-    def test_unknown_holds(self):
-        app = self._app()
-        app._problem_alerted[THERMOSTAT_PROBLEM] = True
-        app._on_problem_change(THERMOSTAT_PROBLEM, "state", "on", "unknown", {})
-        app.create_task.assert_not_called()
-        self.assertTrue(app._problem_alerted[THERMOSTAT_PROBLEM])
-
-
-class ProblemSurvivesRestart(unittest.TestCase):
-    def _app(self, state, alerted_before):
-        app = _base_app()
-        app.get_state = lambda e, **kw: state
-        if alerted_before:
-            app._problem_alerted[THERMOSTAT_PROBLEM] = True
-        return app
-
-    def test_still_on_and_already_alerted_does_not_renotify(self):
-        app = self._app("on", alerted_before=True)
-        app._init_problem(THERMOSTAT_PROBLEM)
-        app.create_task.assert_not_called()
-        self.assertTrue(app._problem_alerted[THERMOSTAT_PROBLEM])
-
-    def test_newly_on_at_startup_notifies(self):
-        app = self._app("on", alerted_before=False)
-        app._init_problem(THERMOSTAT_PROBLEM)
-        app.create_task.assert_called_once()
-
-
-class ProblemNotifyWording(unittest.IsolatedAsyncioTestCase):
-    def _app(self, errors=None):
-        app = _base_app()
-        app._notifier = FakeNotifier()
-
-        async def get_state(entity, **kw):
-            return {"attributes": {"errors": errors if errors is not None else []}}
-
-        app.get_state = get_state
-        return app
-
-    async def test_includes_active_error_keys(self):
-        app = self._app(errors=["Error10", "Error26"])
-        await app._notify_problem(THERMOSTAT_PROBLEM)
-        call = app._notifier.calls[0]
-        self.assertEqual(call["title"], "Thermostat fault")
-        self.assertIn("Error10", call["message"])
-        self.assertIn("Error26", call["message"])
-
-    async def test_no_errors_attribute_omits_detail(self):
-        app = self._app(errors=[])
-        await app._notify_problem(THERMOSTAT_PROBLEM)
-        call = app._notifier.calls[0]
-        self.assertNotIn("(", call["message"])
-
-    async def test_controller_problem_mentions_all_heating(self):
-        app = self._app(errors=["Error12"])
-        await app._notify_problem(CONTROLLER_PROBLEM)
-        call = app._notifier.calls[0]
-        self.assertEqual(call["title"], "Heating controller fault")
-        self.assertIn("ALL room heating", call["message"])
+        self.assertEqual(
+            app._notifier.calls[1]["message"],
+            "The wiring centre reconnected - heating control is restored for all rooms.",
+        )
 
 
 class BatteryAlerting(unittest.TestCase):
@@ -728,21 +634,19 @@ class StatePersistence(unittest.TestCase):
         app = self._app("/nonexistent/dir/salus_health_state.json")
         self.assertEqual(app._load_state(), {})
 
-    def test_save_then_load_round_trips_all_three_dicts(self):
+    def test_save_then_load_round_trips_both_dicts(self):
         fd, path = tempfile.mkstemp(suffix=".json")
         os.close(fd)
         self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
         app = self._app(path)
-        app._offline_alerted = {THERMOSTAT: True}
-        app._problem_alerted = {THERMOSTAT_PROBLEM: False}
+        app._offline_alerted = {THERMOSTAT: True, CONTROLLER: False}
         app._battery_alerted_percent = {THERMOSTAT_BATTERY: 10}
         app._save_state()
 
         reloaded = self._app(path)._load_state()
-        self.assertEqual(reloaded["offline_alerted"], {THERMOSTAT: True})
-        self.assertEqual(reloaded["problem_alerted"], {THERMOSTAT_PROBLEM: False})
+        self.assertEqual(reloaded["offline_alerted"], {THERMOSTAT: True, CONTROLLER: False})
         self.assertEqual(reloaded["battery_alerted_percent"], {THERMOSTAT_BATTERY: 10})
-        self.assertNotIn("battery_alerted_level", reloaded)
+        self.assertEqual(set(reloaded), {"offline_alerted", "battery_alerted_percent"})
 
     def test_save_leaves_no_tmp_file_behind(self):
         fd, path = tempfile.mkstemp(suffix=".json")
@@ -750,7 +654,6 @@ class StatePersistence(unittest.TestCase):
         self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
         app = self._app(path)
         app._offline_alerted = {}
-        app._problem_alerted = {}
         app._battery_alerted_percent = {}
         app._save_state()
         self.assertFalse(os.path.exists(path + ".tmp"))
@@ -779,11 +682,33 @@ class RestoredStateOnInitialize(unittest.TestCase):
         self.assertNotIn("battery_alerted_level", saved)
         self.assertEqual(saved["battery_alerted_percent"], {THERMOSTAT_BATTERY: 25})
 
+    def test_old_problem_alerted_key_is_ignored_and_not_written_back(self):
+        path = _write_state_file(
+            self,
+            {
+                "offline_alerted": {THERMOSTAT: False},
+                "problem_alerted": {"binary_sensor.claudias_room_thermostat_problem": True},
+            },
+        )
+        app = _initialized_app(
+            {"state_file": path},
+            climates={THERMOSTAT: "heat"},
+            sensors={THERMOSTAT_BATTERY: "25"},
+        )
+
+        app.create_task.assert_called_once()  # the battery alert; no fault-register push
+        self.assertFalse(hasattr(app, "_problem_alerted"))
+        with open(path) as f:
+            saved = json.load(f)
+        self.assertNotIn("problem_alerted", saved)
+        self.assertEqual(saved["offline_alerted"], {THERMOSTAT: False})
+
     def test_offline_flags_for_entities_no_longer_watched_are_dropped(self):
         path = _write_state_file(
             self,
             {
                 "offline_alerted": {
+                    "binary_sensor.control_centre": True,
                     "binary_sensor.bedroom_thermostat_connectivity": True,
                     THERMOSTAT: True,
                 }
@@ -792,6 +717,14 @@ class RestoredStateOnInitialize(unittest.TestCase):
         app = _initialized_app({"state_file": path}, climates={THERMOSTAT: "unavailable"})
 
         self.assertEqual(app._offline_alerted, {THERMOSTAT: True})
+        app.run_in.assert_not_called()  # already alerted: no fresh timer
+        app.create_task.assert_not_called()
+
+    def test_wiring_centre_alert_flag_survives_a_restart(self):
+        path = _write_state_file(self, {"offline_alerted": {CONTROLLER: True}})
+        app = _initialized_app({"state_file": path}, sensors={CONTROLLER: "unavailable"})
+
+        self.assertEqual(app._offline_alerted, {CONTROLLER: True})
         app.run_in.assert_not_called()  # already alerted: no fresh timer
         app.create_task.assert_not_called()
 
