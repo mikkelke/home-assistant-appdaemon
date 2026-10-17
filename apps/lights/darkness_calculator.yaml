@@ -136,7 +136,6 @@ darkness_calculator:
       indoor_min_bright: 250     # bedroom-grade: little indoor daylight needed to count bright
       lights:
         - light.claudias_room_ceiling_lights
-        - light.claudias_room_floor_light
       light_on_lux_offset: 200   # measured: 652 -> 425 lx when ceiling light turned off
 
     hallway:
