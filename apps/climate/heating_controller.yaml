@@ -1,0 +1,160 @@
+# /conf/apps/climate/heating_controller.yaml
+# HeatingController - shadow-mode planner for the floor-heating zones: it publishes what it
+# would set and logs it, and has no way to write to a thermostat. See heating_controller.py
+# and heating_plan.py. Targets are seated-air temperatures (what sensor.<room>_feel shows);
+# the thermostat hangs higher and reads warmer, which `trim` learns. Limits are the setpoint
+# bounds of the zone's thermostat. No `log:` key: it logs to the main log.
+
+HeatingController:
+  module: heating_controller
+  class: HeatingController
+  dependencies: MobileNotifier
+  notify_target: mikkel
+  season_entity: input_boolean.heating_season
+  state_file: /conf/apps/climate/heating_controller_state.json
+  log_dir: /conf/heating_log
+  # A change of setpoint needs a free token (refilled continuously) and either a priority
+  # event or a value that has stayed the same for write_stable_minutes.
+  writes_per_hour: 2
+  write_stable_minutes: 10
+  # Fraction of the forecast sun credit the cut decision trusts. Raise towards 1.0 once the
+  # shadow log shows the cuts landing on days that really overheated.
+  sun_term_factor: 0.5
+  # Residents' keypads are re-locked this long after an unlock.
+  keypad_relock_minutes: 15
+  forecast: {refresh_minutes: 60, stale_hours: 12}
+  outdoor_entities: [sensor.gw2000a_outdoor_temperature, weather.forecast_home]
+  relay_power_entity: sensor.floor_heating_relay_power
+
+  # The bedroom ceiling is the helper value from evening_from until morning_from, and
+  # morning_offset_c higher from then until wake. Once the evening window has closed, a mean
+  # above the bedtime ceiling holds the bathroom back, and a mean below release_below_c
+  # releases it. An evening with the bedroom window open decides nothing.
+  bedroom:
+    air_entity: sensor.bedroom_feel
+    ceiling_entity: input_number.heating_bedroom_ceiling
+    ceiling_default_c: 21.0
+    morning_offset_c: 0.5
+    evening_from: "21:00"
+    evening_to: "23:30"
+    morning_from: "03:00"
+    wake: "06:00"
+    release_below_c: 20.5
+
+  # The family zone is paused at its lower limit from lead_hours before the start until the
+  # end, or while the switch is on (at most switch_max_hours).
+  party:
+    zone: family
+    lead_hours: 8
+    start_entity: input_datetime.heating_party_start
+    end_entity: input_datetime.heating_party_end
+    switch_entity: input_boolean.party
+    switch_max_hours: 12
+    default_hours: 6
+    airing_over_target_c: 1.0
+    airing_band_entity: sensor.kitchen_feel
+    airing_bands: [stuffy, poor]
+    airing_repeat_minutes: 45
+
+  window:
+    open_debounce_minutes: 2
+    long_open_minutes: 30
+    settle_max_minutes: 60
+    settle_recovered_c: 0.3
+    unavailable_closed_minutes: 10
+
+  zones:
+    family:
+      thermostat: climate.family_room_thermostat
+      control_air: [sensor.living_room_feel, sensor.dining_room_feel]
+      floor: sensor.living_room_floor_thermometer_temperature
+      openings:
+        - binary_sensor.living_room_window_contact
+        - binary_sensor.kitchen_window_contact
+        - binary_sensor.dining_room_window_1_contact
+        - binary_sensor.dining_room_window_2_contact
+        - binary_sensor.dining_room_window_3_contact
+        - binary_sensor.rooftop_door_1_contact
+      target_entity: input_number.heating_target_family
+      base_c: 21.5
+      lower_limit_c: 19.0
+      upper_limit_c: 24.0
+      protected_min_c: 20.5
+      profile:
+        lead_hours: 4
+        periods:
+          - {from: "23:00", to: "10:00", offset: -0.5}
+          - {from: "17:00", to: "23:00", offset: 0.5}
+      trim: {initial: 0.5, min: -0.5, max: 1.5}
+      budget: {a: 0.55, b_om: -1.62, c: 1.21, d: -0.04}
+      sun_cut: {enabled: true, azimuth: [100, 260], ghi_min: 150, before_hours: 8, end_before_hours: 1, credit_ratio: 0.5}
+
+    kristines_room:
+      thermostat: climate.kristines_room_thermostat
+      control_air: [sensor.kristines_room_feel]
+      floor: sensor.kristines_room_floor_thermometer_temperature
+      openings: [binary_sensor.kristines_room_window_contact]
+      target_entity: input_number.heating_target_kristines_room
+      base_c: 21.5
+      lower_limit_c: 19.0
+      upper_limit_c: 24.0
+      protected_min_offset_c: -0.5
+      profile: {lead_hours: 4}
+      trim: {initial: 0.0, min: -1.0, max: 1.0}
+      budget: {changepoint: {k: 0.17, base_c: 15.5}}
+      residents: [kristine]
+      nudge: {min: -1.0, max: 1.0, step: 0.5}
+      buttons:
+        warmer: input_button.heating_kristines_room_warmer
+        colder: input_button.heating_kristines_room_colder
+
+    claudias_room:
+      thermostat: climate.claudias_room_thermostat
+      control_air: [sensor.claudias_room_feel]
+      floor: sensor.claudias_room_floor_thermometer_temperature
+      openings: [binary_sensor.rooftop_door_2_contact]
+      target_entity: input_number.heating_target_claudias_room
+      base_c: 21.5
+      lower_limit_c: 19.0
+      upper_limit_c: 24.0
+      protected_min_offset_c: -0.5
+      profile: {lead_hours: 6}
+      trim: {initial: 0.0, min: -1.0, max: 1.0}
+      budget: {a: 0.50, b_om: -2.74, c: 0, d: 2.32}
+      sun_cut: {enabled: true, azimuth: [180, 290], ghi_min: 150, before_hours: 8, end_before_hours: 1, credit_ratio: 0.5}
+      residents: [claudia]
+      nudge: {min: -1.0, max: 1.0, step: 0.5}
+      buttons:
+        warmer: input_button.heating_claudias_room_warmer
+        colder: input_button.heating_claudias_room_colder
+
+    # Warm only in the morning window, and no pre-heating before it: the bathroom shares a
+    # wall with the bedroom, and a held-back bathroom stays at the lower limit all day.
+    bathroom:
+      thermostat: climate.bathroom_thermostat
+      control_air: [sensor.bathroom_feel]
+      floor: sensor.bathroom_floor_thermometer_temperature
+      openings: [binary_sensor.bathroom_window_contact]
+      target_entity: input_number.heating_target_bathroom
+      base_c: 22.0
+      lower_limit_c: 19.0
+      upper_limit_c: 25.0
+      profile:
+        lead_hours: 0
+        outside: lower_limit
+        periods:
+          - {from: "06:00", to: "09:00", offset: 0}
+      trim: {initial: 0.0, min: -1.0, max: 1.0}
+      budget: {a: 0.64, b_om: -2.47, c: 0, d: -1.24}
+      bedroom_guard: {enabled: true, cap: lower_limit}
+
+    guest_bathroom:
+      thermostat: climate.guest_bathroom_thermostat
+      control_air: [sensor.guest_bathroom_feel]
+      floor: sensor.guest_bathroom_floor_thermometer_temperature
+      target_entity: input_number.heating_target_guest_bathroom
+      base_c: 20.0
+      lower_limit_c: 18.0
+      upper_limit_c: 24.0
+      profile: {lead_hours: 0}
+      trim: {initial: 0.0, min: -1.0, max: 1.0}
