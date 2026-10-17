@@ -1045,18 +1045,20 @@ def project_blocks(
 ) -> list:
     """The plan from now until `until_ts` as (start_ts, end_ts, plan_mode, setpoint) blocks,
     assuming the openings stay closed and the dynamic inputs (bedroom hold-back, fallback)
-    keep their current value."""
+    keep their current value. The plan is sampled on the clock grid of step_s seconds, so block
+    edges fall on round times."""
     blocks = []
     last = inp.last_planned
     t = now_ts
     while t < until_ts:
+        end = min((math.floor(t / step_s) + 1) * step_s, until_ts)
         p = plan(zc, replace(inp, window_state=STATE_CLOSED, last_planned=last), t, tz)
         last = p.setpoint
         if blocks and blocks[-1][2] == p.plan_mode and blocks[-1][3] == p.setpoint:
-            blocks[-1][1] = min(t + step_s, until_ts)
+            blocks[-1][1] = end
         else:
-            blocks.append([t, min(t + step_s, until_ts), p.plan_mode, p.setpoint])
-        t += step_s
+            blocks.append([t, end, p.plan_mode, p.setpoint])
+        t = end
     return [tuple(b) for b in blocks]
 
 

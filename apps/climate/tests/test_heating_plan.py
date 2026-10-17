@@ -1164,6 +1164,14 @@ class FamilyDayReplay(unittest.TestCase):
             ],
         )
 
+    def test_block_edges_fall_on_round_times_whatever_the_start(self):
+        zc = CFG.zones["family"]
+        now = T(12, 3) + 27
+        blocks = hp.project_blocks(zc, inputs(), now, T(0, day=18), TZ)
+        self.assertEqual(blocks[0][0], now)
+        self.assertEqual([hp.hhmm(b[1], TZ) for b in blocks][:2], ["13:00", "19:00"])
+        self.assertEqual(blocks[0][1], T(13))
+
     def test_project_blocks_include_a_cut_and_ignore_an_open_window(self):
         zc = CFG.zones["family"]
         cut = ((T(1), T(14), "2026-10-17"),)
