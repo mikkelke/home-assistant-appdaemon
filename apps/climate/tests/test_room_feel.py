@@ -11,6 +11,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 if "appdaemon.plugins.hass.hassapi" not in sys.modules:
@@ -759,6 +761,223 @@ class ParseRoomDefaults(unittest.TestCase):
             {"entity": "binary_sensor.a_contact", "label": "window"},
             {"entity": "binary_sensor.b_contact", "label": "rooftop door"},
         ])
+
+
+LIVING_FP300 = {
+    "entity": "sensor.living_room_presence_temperature",
+    "rh_entity": "sensor.living_room_presence_humidity",
+    "label": "fp300",
+}
+LIVING_MONITOR = {
+    "entity": "climate.living_room_thermostat",
+    "attribute": "current_temperature",
+    "rh_entity": "climate.living_room_thermostat",
+    "rh_attribute": "current_humidity",
+    "label": "salus_monitor",
+    "sun_flag": True,
+    "fallback_only": True,
+}
+HALLWAY_SALUS = {
+    "entity": "climate.family_room_thermostat",
+    "attribute": "current_temperature",
+    "rh_entity": "climate.family_room_thermostat",
+    "rh_attribute": "current_humidity",
+    "label": "salus_family",
+}
+LIVING_CFG = {
+    "air_sources": [LIVING_FP300, LIVING_MONITOR, dict(HALLWAY_SALUS, fallback_only=True)],
+    "window_contacts": [],
+}
+LIVING_ATTRS = {
+    ("climate.living_room_thermostat", "current_temperature"): 23.3,
+    ("climate.living_room_thermostat", "current_humidity"): 45,
+    ("climate.family_room_thermostat", "current_temperature"): 23.8,
+    ("climate.family_room_thermostat", "current_humidity"): 44,
+}
+
+
+class FallbackOnlySources(unittest.TestCase):
+    """A fallback_only source votes only while no plain source is left."""
+
+    def _living(self, fp300="23.2", down=()):
+        """`down` lists thermostats that are unavailable: no state and no attributes."""
+        plain = {
+            "sensor.living_room_presence_temperature": fp300,
+            "sensor.living_room_presence_humidity": "50",
+            "climate.living_room_thermostat": "off",
+            "climate.family_room_thermostat": "off",
+        }
+        attrs = {k: v for k, v in LIVING_ATTRS.items() if k[0] not in down}
+        for entity in down:
+            plain[entity] = "unavailable"
+        app = _make_app({"living_room": LIVING_CFG}, plain=plain, attrs=attrs)
+        app._evaluate_room("living_room")
+        return app._captured["sensor.living_room_feel"]
+
+    def test_a_reading_primary_is_the_only_voter(self):
+        cap = self._living()
+        self.assertEqual(cap["state"], 23.2)
+        self.assertEqual(cap["attrs"]["reason"], "single air source: sensor.living_room_presence_temperature")
+        self.assertNotIn("climate.living_room_thermostat", cap["attrs"]["sources"])
+        self.assertNotIn("climate.family_room_thermostat", cap["attrs"]["sources"])
+        self.assertEqual(cap["attrs"]["excluded"], ["<none>"])
+
+    def test_fallbacks_take_over_when_the_primary_is_unavailable(self):
+        cap = self._living(fp300="unavailable")
+        # median of the two fallbacks: (23.3 + 23.8) / 2
+        self.assertEqual(cap["state"], 23.6)
+        self.assertIn("median of 2 air sources", cap["attrs"]["reason"])
+        self.assertIn("fallback", cap["attrs"]["reason"])
+        self.assertEqual(
+            set(cap["attrs"]["sources"]),
+            {"climate.living_room_thermostat", "climate.family_room_thermostat"},
+        )
+        self.assertIn("sensor.living_room_presence_temperature: unavailable", cap["attrs"]["excluded"])
+
+    def test_one_fallback_alone_is_used_when_the_other_is_down(self):
+        cap = self._living(fp300="unknown", down=("climate.family_room_thermostat",))
+        self.assertEqual(cap["state"], 23.3)
+        self.assertTrue(cap["attrs"]["reason"].startswith("single air source: climate.living_room_thermostat"))
+
+    def test_history_follows_the_sources_in_use(self):
+        cap = self._living()
+        self.assertEqual(cap["attrs"]["history_entity"], "sensor.living_room_presence_temperature")
+        cap = self._living(fp300="unavailable")
+        self.assertEqual(cap["attrs"]["history_entity"], "climate.living_room_thermostat")
+        self.assertEqual(cap["attrs"]["history_attribute"], "current_temperature")
+
+    def test_nothing_readable_still_falls_to_the_floor(self):
+        cfg = dict(LIVING_CFG, floor_entity="sensor.living_room_floor_thermometer_temperature")
+        app = _make_app({"living_room": cfg}, plain={
+            "sensor.living_room_presence_temperature": "unavailable",
+            "climate.living_room_thermostat": "unavailable",
+            "climate.family_room_thermostat": "unavailable",
+            "sensor.living_room_floor_thermometer_temperature": "22.0",
+        })
+        app._evaluate_room("living_room")
+        self.assertEqual(app._captured["sensor.living_room_feel"]["state"], 22.5)
+
+    def test_sun_exclusion_may_drop_the_last_primary_when_a_fallback_reads(self):
+        app = _make_app({"dining_room": dict(DINING_CFG, air_sources=[
+            DINING_CFG["air_sources"][0],
+            dict(DINING_CFG["air_sources"][1], fallback_only=True),
+        ])}, plain={
+            "sensor.dining_room_presence_temperature": "26.0",
+            "sensor.dining_room_presence_humidity": "30",
+            "climate.family_room_thermostat": "off",
+            "sensor.gw2000a_solar_radiation": "300",
+        }, attrs={
+            ("climate.family_room_thermostat", "current_temperature"): 23.0,
+            ("climate.family_room_thermostat", "current_humidity"): 45,
+        }, get_now=lambda: NOW.replace(hour=8, minute=30))
+        app._evaluate_room("dining_room")
+        a = app._captured["sensor.dining_room_feel"]["attrs"]
+        self.assertEqual(a["temp_c"], 23.0)
+        self.assertEqual(a["sun_hit"], "true")
+        self.assertIn("sensor.dining_room_presence_temperature: sun_hit", a["excluded"])
+        self.assertIn("fallback", a["reason"])
+
+    def test_without_sun_the_fp300_alone_defines_the_dining_room(self):
+        app = _make_app({"dining_room": dict(DINING_CFG, air_sources=[
+            DINING_CFG["air_sources"][0],
+            dict(DINING_CFG["air_sources"][1], fallback_only=True),
+        ])}, plain={
+            "sensor.dining_room_presence_temperature": "22.0",
+            "sensor.dining_room_presence_humidity": "50",
+            "climate.family_room_thermostat": "off",
+            "sensor.gw2000a_solar_radiation": "20",
+        }, attrs={
+            ("climate.family_room_thermostat", "current_temperature"): 23.0,
+            ("climate.family_room_thermostat", "current_humidity"): 45,
+        }, get_now=lambda: NOW.replace(hour=8, minute=30))
+        app._evaluate_room("dining_room")
+        self.assertEqual(app._captured["sensor.dining_room_feel"]["state"], 22.0)
+
+    def test_kitchen_fuses_fp300_and_ceiling_while_the_hallway_stands_by(self):
+        cfg = dict(KITCHEN_CFG, air_sources=[
+            KITCHEN_CFG["air_sources"][0],
+            dict(KITCHEN_CFG["air_sources"][1], fallback_only=True),
+            KITCHEN_CFG["air_sources"][2],
+        ])
+        app = _make_app({"kitchen": cfg}, plain={
+            "sensor.kitchen_presence_temperature": "22.0",
+            "sensor.kitchen_presence_humidity": "50",
+            "climate.family_room_thermostat": "off",
+            "sensor.kitchen_smoke_alarm_temperature": "24.0",
+            "sensor.kitchen_smoke_alarm_humidity": "40",
+        }, attrs={
+            ("climate.family_room_thermostat", "current_temperature"): 25.0,
+            ("climate.family_room_thermostat", "current_humidity"): 45,
+        }, get_now=lambda: NOW.replace(hour=12))
+        app._evaluate_room("kitchen")
+        a = app._captured["sensor.kitchen_feel"]["attrs"]
+        # FP300 22.0 and ceiling 24.0 - 1.5 = 22.5 -> 22.25 -> 22.2; the hallway 25.0 is ignored
+        self.assertEqual(a["temp_c"], 22.2)
+        self.assertNotIn("climate.family_room_thermostat", a["sources"])
+
+    def test_a_hallway_source_without_the_flag_stays_a_plain_vote(self):
+        app = _make_app({"hallway": {"air_sources": [HALLWAY_SALUS]}}, plain={
+            "climate.family_room_thermostat": "off",
+        }, attrs=LIVING_ATTRS)
+        app._evaluate_room("hallway")
+        self.assertEqual(app._captured["sensor.hallway_feel"]["state"], 23.8)
+
+    def test_flag_defaults_to_false_and_parses_true(self):
+        plain = rf.RoomFeel._parse_source({"entity": "sensor.x"})
+        self.assertFalse(plain["fallback_only"])
+        flagged = rf.RoomFeel._parse_source({"entity": "sensor.x", "fallback_only": True})
+        self.assertTrue(flagged["fallback_only"])
+
+
+class ShippedRoomFeelConfig(unittest.TestCase):
+    """The air-source roles in the room_feel.yaml that is actually deployed."""
+
+    @classmethod
+    def setUpClass(cls):
+        text = (Path(__file__).resolve().parents[1] / "room_feel.yaml").read_text()
+        cls.rooms = yaml.safe_load(text)["RoomFeel"]["rooms"]
+
+    def _source(self, room, entity):
+        matches = [s for s in self.rooms[room]["air_sources"] if s["entity"] == entity]
+        self.assertEqual(len(matches), 1, f"{room}: {entity}")
+        return matches[0]
+
+    def test_the_hallway_thermostat_only_stands_in_for_the_room_sensors(self):
+        for room in ("living_room", "kitchen", "dining_room"):
+            src = self._source(room, "climate.family_room_thermostat")
+            self.assertTrue(src.get("fallback_only"), room)
+        # hallway has no sensor of its own, so there it is the plain source
+        self.assertFalse(self._source("hallway", "climate.family_room_thermostat").get("fallback_only"))
+
+    def test_the_living_room_monitor_is_a_sun_flagged_stand_in(self):
+        src = self._source("living_room", "climate.living_room_thermostat")
+        self.assertTrue(src.get("fallback_only"))
+        self.assertTrue(src.get("sun_flag"))
+        self.assertEqual(src["attribute"], "current_temperature")
+
+    def test_the_room_sensors_stay_plain_voters(self):
+        for room, entity in (
+            ("living_room", "sensor.living_room_presence_temperature"),
+            ("dining_room", "sensor.dining_room_presence_temperature"),
+            ("kitchen", "sensor.kitchen_presence_temperature"),
+        ):
+            self.assertFalse(self._source(room, entity).get("fallback_only"), room)
+
+    def test_shipped_living_room_follows_the_fp300_and_survives_its_loss(self):
+        app = _make_app({"living_room": self.rooms["living_room"]}, plain={
+            "sensor.living_room_presence_temperature": "23.2",
+            "sensor.living_room_presence_humidity": "50",
+            "climate.living_room_thermostat": "off",
+            "climate.family_room_thermostat": "off",
+            "sensor.living_room_floor_thermometer_temperature": "22.5",
+        }, attrs=LIVING_ATTRS)
+        app._evaluate_room("living_room")
+        self.assertEqual(app._captured["sensor.living_room_feel"]["state"], 23.2)
+        app.get_state = (lambda orig: lambda entity, attribute=None: (
+            "unavailable" if entity == "sensor.living_room_presence_temperature"
+            else orig(entity, attribute)))(app.get_state)
+        app._evaluate_room("living_room")
+        self.assertEqual(app._captured["sensor.living_room_feel"]["state"], 23.6)
 
 
 if __name__ == "__main__":

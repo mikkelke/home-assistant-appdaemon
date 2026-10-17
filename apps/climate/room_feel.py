@@ -12,18 +12,25 @@ Physical facts this fusion respects:
   - kitchen/dining_room/living_room/hallway share ONE physical Salus (the hallway master,
     climate.family_room_thermostat) - their per-room sensor.<room>_temperature/_humidity
     clones are template duplicates of that same reading and are never read here. hallway
-    has no FP300 either, so the family Salus is its sole/primary source; for
-    kitchen/dining_room/living_room it is a corroborating (equally-weighted) vote next to
-    that zone's own FP300.
+    has no FP300 either, so the family Salus is its sole/primary source. For
+    kitchen/dining_room/living_room it hangs in the hallway, not in the room, and reads warmer
+    than the air people sit in, so it is a `fallback_only` source there.
+  - climate.living_room_thermostat is a monitor on a living-room wall (zone 8, no actuator)
+    that can be sunlit: a `fallback_only` source marked `sun_flag`.
   - Floor thermometers (SNZB-02P) are SLAB sensors, not air: 0.5-1.5 C below the wall
     units with a multi-hour lag. Never a primary vote - only a `floor+0.5` backup estimate
     when no air source reads at all, and the published `floor_spread_c` (air - floor)
     heating-season signal.
   - The kitchen Twinguard ceiling unit is a THIRD source for kitchen only, offset-corrected
-    (it reads warm/dry vs the wall units) and never used alone.
+    (it reads warm/dry vs the wall units).
   - kitchen/dining_room FP300s sit window-adjacent (sun/draft biased); when the rooftop
     solar sensor is over threshold during that room's configured sun window, that FP300 is
     dropped from the median as long as another air source still reads.
+
+Source roles: a plain source votes. `sun_flag` drops it from the median while the room's
+sun_hit is active, as long as another air source still reads. `fallback_only` sources vote
+only while no plain source is left, which includes the case where the sun exclusion removed
+the last plain one.
 
 Publish contract: one direction, no consumers read this app's own output back in. Booleans
 (window_open/sun_hit/airing_helps/stale) are published as the literal strings "true"/"false"
@@ -272,6 +279,7 @@ class RoomFeel(hass.Hass):
             "rh_attribute": raw.get("rh_attribute"),
             "label": raw.get("label", raw["entity"]),
             "sun_flag": bool(raw.get("sun_flag", False)),
+            "fallback_only": bool(raw.get("fallback_only", False)),
             "offset_c": float(raw.get("offset_c", 0.0)),
             "offset_rh": float(raw.get("offset_rh", 0.0)),
         }
@@ -426,18 +434,24 @@ class RoomFeel(hass.Hass):
         floor_rh, _ = (
             self._read(cfg["floor_rh_entity"]) if cfg["floor_rh_entity"] else (None, "not_configured"))
 
+        # Fallback-only sources vote only while no primary source is left.
+        primaries = [e for e in valid if not e["src"]["fallback_only"]]
+        used = primaries or valid
+
         used_entities = []
-        if valid:
-            temp_raw = median([e["temp"] for e in valid])
-            rh_values = [e["rh"] for e in valid if e["rh"] is not None]
+        if used:
+            temp_raw = median([e["temp"] for e in used])
+            rh_values = [e["rh"] for e in used if e["rh"] is not None]
             rh = median(rh_values)
-            for e in valid:
+            for e in used:
                 used_entities.append(e["src"]["entity"])
                 if (e["src"]["rh_entity"] and e["rh"] is not None
                         and e["src"]["rh_entity"] != e["src"]["entity"]):
                     used_entities.append(e["src"]["rh_entity"])
-            reason = (f"median of {len(valid)} air sources" if len(valid) > 1
-                      else f"single air source: {valid[0]['src']['entity']}")
+            reason = (f"median of {len(used)} air sources" if len(used) > 1
+                      else f"single air source: {used[0]['src']['entity']}")
+            if not primaries:
+                reason += " (fallback: no primary air source in use)"
         elif floor_temp is not None:
             temp_raw = floor_temp + 0.5
             rh = floor_rh
@@ -532,13 +546,13 @@ class RoomFeel(hass.Hass):
         # the hvac mode, so its history needs the attribute).
         history_entity = None
         history_attribute = None
-        for entry in valid:
+        for entry in used:
             src = entry["src"]
             if src["entity"].startswith("sensor."):
                 history_entity, history_attribute = src["entity"], src["attribute"]
                 break
-        if history_entity is None and valid:
-            src = valid[0]["src"]
+        if history_entity is None and used:
+            src = used[0]["src"]
             history_entity, history_attribute = src["entity"], src["attribute"] or "current_temperature"
 
         attributes = {

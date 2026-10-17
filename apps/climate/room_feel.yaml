@@ -68,11 +68,22 @@ RoomFeel:
         - entity: sensor.living_room_presence_temperature
           rh_entity: sensor.living_room_presence_humidity
           label: fp300
+        # Zone 8 monitor on a living-room wall: it can be sunlit and has no sun mask yet, so
+        # it only stands in for the FP300.
+        - entity: climate.living_room_thermostat
+          attribute: current_temperature
+          rh_entity: climate.living_room_thermostat
+          rh_attribute: current_humidity
+          label: salus_monitor
+          sun_flag: true
+          fallback_only: true
+        # The hallway thermostat reads warmer than the air people sit in.
         - entity: climate.family_room_thermostat
           attribute: current_temperature
           rh_entity: climate.family_room_thermostat
           rh_attribute: current_humidity
           label: salus_family
+          fallback_only: true
       floor_entity: sensor.living_room_floor_thermometer_temperature
       floor_rh_entity: sensor.living_room_floor_thermometer_humidity
       window_contacts:
@@ -90,6 +101,7 @@ RoomFeel:
           rh_entity: climate.family_room_thermostat
           rh_attribute: current_humidity
           label: salus_family
+          fallback_only: true
         - entity: sensor.kitchen_smoke_alarm_temperature
           rh_entity: sensor.kitchen_smoke_alarm_humidity
           label: ceiling
@@ -120,6 +132,7 @@ RoomFeel:
           rh_entity: climate.family_room_thermostat
           rh_attribute: current_humidity
           label: salus_family
+          fallback_only: true
       floor_entity: sensor.dining_room_floor_thermometer_temperature
       floor_rh_entity: sensor.dining_room_floor_thermometer_humidity
       window_contacts:
