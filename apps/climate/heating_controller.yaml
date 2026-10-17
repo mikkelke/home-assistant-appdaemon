@@ -17,8 +17,7 @@ HeatingController:
   # event or a value that has stayed the same for write_stable_minutes.
   writes_per_hour: 2
   write_stable_minutes: 10
-  # Fraction of the forecast sun credit the cut decision trusts. Raise towards 1.0 once the
-  # shadow log shows the cuts landing on days that really overheated.
+  # Fraction of the forecast sun credit the cut decision trusts; 1.0 trusts it fully.
   sun_term_factor: 0.5
   # Residents' keypads are re-locked this long after an unlock.
   keypad_relock_minutes: 15
