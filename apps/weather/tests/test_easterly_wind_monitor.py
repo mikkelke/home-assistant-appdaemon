@@ -405,7 +405,7 @@ class RestartRehydrationEndToEnd(unittest.IsolatedAsyncioTestCase):
         )
 
 
-MEAN_ENT = "sensor.gw2000a_wind_direction_10m_avg"
+MEAN_ENT = "sensor.ecowitt_wind_direction_avg_8351"
 
 
 class WindDirectionSource(unittest.TestCase):

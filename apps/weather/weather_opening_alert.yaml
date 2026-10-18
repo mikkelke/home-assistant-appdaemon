@@ -23,7 +23,7 @@ WeatherOpeningAlert:
   # facade gets 92 qualifying minutes instead of 50, alerts land up to 12 min earlier, two
   # missed episodes appear, and the rarely-blowing SSE/NNW sectors get FEWER in-band minutes
   # (spurious single-sample excursions drop out). The vane stays as the fallback.
-  wind_direction_mean_entity: sensor.gw2000a_wind_direction_10m_avg
+  wind_direction_mean_entity: sensor.ecowitt_wind_direction_avg_8351
 
   # 0.5 mm/h is "any measurable rain": the piezo rate quantises in 0.6 mm/h steps, and unlike
   # binary_sensor.gw2000a_rain_state_piezo (an impact detector - see darkness_calculator.yaml)

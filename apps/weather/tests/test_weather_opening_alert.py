@@ -282,7 +282,7 @@ class FacadeWindDirectionSource(unittest.TestCase):
     NNW sectors the mean yields FEWER in-band minutes, because single-sample excursions into
     a sector the wind is not actually in stop counting."""
 
-    MEAN = "sensor.gw2000a_wind_direction_10m_avg"
+    MEAN = "sensor.ecowitt_wind_direction_avg_8351"
 
     def _app(self, mean_entity=MEAN, states=None):
         args = dict(VALID_ARGS)
