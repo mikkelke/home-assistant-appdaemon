@@ -16,7 +16,6 @@ resident_room_lights_off:
       room_label: her room
       lights:
         - light.claudias_room_ceiling_lights
-        - light.claudias_room_string_lights
     kristines_room:
       owner: person.kristine
       name: Kristine
