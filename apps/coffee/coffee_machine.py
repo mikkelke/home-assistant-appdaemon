@@ -21,6 +21,7 @@ plugin_started republishes all seven.
 
 import asyncio
 import json
+import os
 import re
 from datetime import datetime, time, timezone
 from pathlib import Path
@@ -787,8 +788,11 @@ class CoffeeMachine(hass.Hass):
     # -- files under /media/coffee -----------------------------------------------------------------
 
     def _write_json(self, path, data):
+        """Compact JSON, replacing the file in one step."""
+        tmp = Path(f"{path}.tmp")
         try:
-            feedback_io.write_json(str(path), data)
+            tmp.write_text(json.dumps(data, separators=(",", ":")))
+            os.replace(tmp, path)
             return True
         except Exception as e:
             self._warn(f"Write of {path} failed: {e!r}")
