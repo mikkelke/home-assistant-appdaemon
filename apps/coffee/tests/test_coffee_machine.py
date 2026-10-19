@@ -275,7 +275,7 @@ class StartTests(unittest.TestCase):
     def test_the_start_goes_at_once_on_a_live_link(self):
         app = fake.make_app()
         fake.set_entity(app, "switch.xbloom_studio_connect", "on")
-        fake.set_entity(app, "sensor.xbloom_studio_status_updated", fake.iso(app.now))
+        fake.fire(app, "xbloom_connect_ready", {"summary": {}})
         fake.op(app, "start", {"variant": "usual"})
         self.assertEqual(len(calls(app, "xbloom/start_brew")), 1)
         self.assertEqual(calls(app, "switch/turn_on"), [])
@@ -290,7 +290,7 @@ class StartTests(unittest.TestCase):
     def test_tweak_once_and_another_recipe(self):
         app = fake.make_app()
         fake.set_entity(app, "switch.xbloom_studio_connect", "on")
-        fake.set_entity(app, "sensor.xbloom_studio_status_updated", fake.iso(app.now))
+        fake.fire(app, "xbloom_connect_ready", {"summary": {}})
         fake.op(app, "start", {"variant": "tweak", "dose": "16", "grind_size": 44}, user_id=MIKKEL)
         self.assertEqual(calls(app, "xbloom/start_brew")[-1]["grind_size"], 44)
         self.assertEqual(calls(app, "xbloom/start_brew")[-1]["dose"], 16.0)
@@ -298,7 +298,7 @@ class StartTests(unittest.TestCase):
         self.assertEqual(coffee_state(app)[1]["source"], "phone")
         app = fake.make_app()
         fake.set_entity(app, "switch.xbloom_studio_connect", "on")
-        fake.set_entity(app, "sensor.xbloom_studio_status_updated", fake.iso(app.now))
+        fake.fire(app, "xbloom_connect_ready", {"summary": {}})
         fake.op(app, "start", {"variant": "other", "recipe_id": "7654321"}, as_text=False)
         self.assertEqual(calls(app, "xbloom/start_brew")[-1]["recipe_name"], "Iced")
 
@@ -324,6 +324,40 @@ class StartTests(unittest.TestCase):
                          ["xbloom/brew_pause", "xbloom/brew_resume", "xbloom/stop_brew"])
         fake.set_entity(app, "sensor.xbloom_studio_brew_status", "idle")
         self.assertEqual(coffee_state(app)[1]["stop_reason"], "home_assistant")
+
+
+class LinkTests(unittest.TestCase):
+    def test_an_idle_held_link_is_connected_though_silent(self):
+        app = fake.make_app()
+        fake.op(app, "connect")
+        self.assertEqual(coffee_state(app)[1]["link"], "connecting")
+        fake.fire(app, "xbloom_connect_ready", {"summary": {}})
+        self.assertEqual(coffee_state(app)[1]["link"], "connected")
+        fake.advance(app, 120)
+        self.assertEqual(coffee_state(app)[1]["link"], "connected")
+        fake.fire(app, "xbloom_connect_auto_stopped", {"reason": "idle_timeout"})
+        fake.set_entity(app, "switch.xbloom_studio_connect", "off")
+        self.assertEqual(coffee_state(app)[1]["link"], "not_connected")
+
+    def test_a_failed_connect_and_a_switch_turned_off(self):
+        app = fake.make_app()
+        app.switch_follows = False
+        fake.set_entity(app, "switch.xbloom_studio_connect", "on")
+        fake.fire(app, "xbloom_connect_ready", {"summary": {}})
+        fake.fire(app, "xbloom_connect_failed", {"reason": "connection_lost"})
+        self.assertEqual(coffee_state(app)[1]["link"], "connecting")
+        fake.set_entity(app, "switch.xbloom_studio_connect", "off")
+        self.assertEqual(coffee_state(app)[1]["link"], "not_connected")
+
+    def test_a_running_brew_is_judged_by_its_frames(self):
+        app = fake.make_app()
+        tape = [s for s in fake.synthetic_brew(BREW_ID, None) if s[0] <= 60 and s[1][0] != "call"]
+        fake.replay(app, tape)
+        fake.set_entity(app, "sensor.xbloom_studio_scale_weight", "40.0")
+        self.assertEqual(coffee_state(app)[1]["link"], "connected")
+        fake.advance(app, 15)
+        self.assertEqual(coffee_state(app)[1]["link"], "not_connected")
+        self.assertEqual(fake.last(app, "sensor.coffee_live")[0], "stale")
 
 
 class RestoreTests(unittest.TestCase):

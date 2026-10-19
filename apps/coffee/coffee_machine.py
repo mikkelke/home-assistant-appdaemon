@@ -158,6 +158,7 @@ class CoffeeMachine(hass.Hass):
         self._guess = (0.0, None)
         self._pending_start = None
         self._connect_asked = None
+        self._link_ready = False
 
         saved = self._load_state()
         self._beans = cbeans.Beans(saved.get("beans"))
@@ -206,7 +207,7 @@ class CoffeeMachine(hass.Hass):
                 self.listen_state(self._on_bermuda, entity)
         for event in ("xbloom_brew_started", "xbloom_brew_completed", "xbloom_brew_failed", "xbloom_brew_stopped",
                       "xbloom_brew_timeout", "xbloom_machine_brew_started", "xbloom_connect_ready",
-                      "xbloom_connect_failed"):
+                      "xbloom_connect_failed", "xbloom_connect_stopped", "xbloom_connect_auto_stopped"):
             self.listen_event(self._on_xbloom, event)
         self.listen_event(self._on_command, "coffee_command")
         self.listen_event(self._on_push_action, "mobile_app_notification_action")
@@ -219,6 +220,7 @@ class CoffeeMachine(hass.Hass):
         self._load_ledger(force=True)
         self._resume(now)
         if self._switch_on():
+            self._link_ready = True
             self._connect.activity(now)
         if self._machine(now) == "working":
             self._connect_trigger("init_working", now)
@@ -265,9 +267,16 @@ class CoffeeMachine(hass.Hass):
         return self._meter.state(now)
 
     def _link(self, now):
-        if self._tracker.fresh(now):
-            return "connected"
-        return "connecting" if self._switch_on() else "not_connected"
+        """A held session is silent while the machine idles, so the link is the Connect switch and the
+        integration's connect events; only a running brew is judged by its frames, which a brew on its own
+        link sends too."""
+        if self._tracker.phase() in cf.RUNNING:
+            if self._tracker.fresh(now):
+                return "connected"
+            return "connecting" if self._switch_on() and not self._link_ready else "not_connected"
+        if self._switch_on():
+            return "connected" if self._link_ready else "connecting"
+        return "not_connected"
 
     def _usual(self):
         return cp.by_id(self._recipes, self._usual_id)
@@ -328,6 +337,8 @@ class CoffeeMachine(hass.Hass):
         now = self._now()
         self._values[self.connect_entity] = new_state
         user = ((new_state.get("context") or {}).get("user_id") or "").replace("-", "").lower()
+        if new_state.get("state") != "on":
+            self._link_ready = False
         if new_state.get("state") == "off" and old_state.get("state") == "on":
             if user and self._person_for(user) is not None:
                 self._connect.person_off(now)
@@ -429,11 +440,18 @@ class CoffeeMachine(hass.Hass):
         elif event_name == "xbloom_machine_brew_started":
             self._apply(self._tracker.grinding_seen(now, "machine"))
         elif event_name == "xbloom_connect_ready":
+            self._link_ready = True
             self._connect.connected(now)
             self._send_pending_start()
+            self._publish_state()
         elif event_name == "xbloom_connect_failed":
+            self._link_ready = False
             self._connect.failed(now)
             self._send_pending_start()
+            self._publish_state()
+        elif event_name in ("xbloom_connect_stopped", "xbloom_connect_auto_stopped"):
+            self._link_ready = False
+            self._publish_state()
 
     def _on_plugin_started(self, event_name, data, kwargs):
         self._publish_all(force=True)
@@ -892,7 +910,7 @@ class CoffeeMachine(hass.Hass):
         service = {"recipe_name": recipe["name"], "context": {"coffee_brew_id": brew_id}, **overrides}
         self._pending_start = {"brew_id": brew_id, "service": service, "sent": False}
         self._info(f"Start {brew_id}: {recipe['name']}, variant {variant}, from the {source}")
-        if self._tracker.fresh(now) and self._switch_on():
+        if self._switch_on() and self._link_ready:
             self._send_pending_start()
             return
         self._connect_trigger("op_start", now)
