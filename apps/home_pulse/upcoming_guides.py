@@ -5,7 +5,8 @@ shows it. Plain ASCII English, three to six steps and the safety note the manual
 The Miele guides follow the operating instructions of the machines (Danish, the PDFs the distilled
 docs in apps/appliances/docs cite): the dishwasher's Rengoring og vedligeholdelse pp. 63-69, the
 washer's pp. 15 and 37-41, the dryer's pp. 11 and 40-45. The Rober2 guides are the Roborock Q8 Max
-routine for each part.
+routine for each part. The xBloom Studio guides are the usual care of its parts, provisional like
+their intervals until the xBloom manual is checked.
 """
 
 from typing import NamedTuple
@@ -88,6 +89,43 @@ GUIDES = {
         ),
         warn="Unplug the dryer only after its cool-down is finished. Never run it without the plinth filter or with "
              "the flap open. Wet filters cause faults.",
+    ),
+    "coffee:rinse": Guide(
+        steps=(
+            "Take the dripper off the machine and rinse it and its base under warm running water.",
+            "Wipe the shower screen under the brew head with a damp cloth.",
+            "Lift off the cover over the scale, rinse it and wipe the scale plate dry.",
+            "Let the parts dry before you put them back.",
+        ),
+        warn="Let the brew head cool down first. The dripper is not for the dishwasher.",
+    ),
+    "coffee:tank": Guide(
+        steps=(
+            "Lift the water tank out of the machine and empty it.",
+            "Rinse it with warm water and a drop of dish soap, then rinse it well with clean water.",
+            "Leave it open to air-dry, or wipe it dry with a clean cloth.",
+            "Fill it with fresh cold water to the fill line and put it back.",
+        ),
+        warn="Rinse out every trace of soap: soap left in the tank spoils the coffee.",
+    ),
+    "coffee:burrs": Guide(
+        steps=(
+            "Brew until the bean hopper is nearly empty, then switch the machine off and unplug it.",
+            "Brush the grinder chute and the burrs with the small brush that came with the machine.",
+            "Wipe the outlet above the dripper with a dry cloth.",
+            "Plug in and grind a few grams of beans to clear the path before the next brew.",
+        ),
+        warn="Unplug the machine before you reach into the grinder. Never put water on the burrs.",
+    ),
+    "coffee:descale": Guide(
+        steps=(
+            "Dissolve the xBloom descaling powder in a full tank of water, as its pack says.",
+            "Put a large jug under the brew head and run the descaling program from the xBloom app.",
+            "Empty the jug, rinse the tank and fill it with clean water.",
+            "Run the program again with the clean water to rinse the machine through.",
+            "Rinse the dripper and the cover over the scale.",
+        ),
+        warn="Use a coffee machine descaler only, never vinegar. The water comes out hot.",
     ),
     "rober2:filter": Guide(
         steps=(

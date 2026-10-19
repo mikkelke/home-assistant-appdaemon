@@ -19,7 +19,7 @@ NOW = datetime(2026, 10, 15, 10, 30, tzinfo=timezone.utc)
 MIN = timedelta(minutes=1)
 HOUR = timedelta(hours=1)
 DAY = timedelta(days=1)
-AREAS = {"washer": "guest_bathroom", "dishwasher": "kitchen", "dryer": "guest_bathroom"}
+AREAS = {"washer": "guest_bathroom", "dishwasher": "kitchen", "dryer": "guest_bathroom", "coffee": "kitchen"}
 
 
 def dish(end, **extra):
@@ -81,7 +81,16 @@ class TaskTests(unittest.TestCase):
             "washer:drum": ("washer", 15, False),
             "washer:inlet": ("washer", 90, True),
             "dryer:plinth": ("dryer", None, True),
+            "coffee:rinse": ("coffee", 10, True),
+            "coffee:tank": ("coffee", 20, True),
+            "coffee:burrs": ("coffee", 40, True),
+            "coffee:descale": ("coffee", 60, True),
         })
+
+    def test_the_coffee_tasks_count_brews_and_the_others_runs(self):
+        self.assertEqual({task.key for task in runs.TASKS if task.unit == "brew"},
+                         {"coffee:rinse", "coffee:tank", "coffee:burrs", "coffee:descale"})
+        self.assertEqual({task.unit for task in runs.TASKS if task.appliance != "coffee"}, {"run"})
 
     def test_the_drum_clean_interval_is_the_washers_own(self):
         task = next(task for task in runs.TASKS if task.key == runs.DRUM_KEY)
@@ -488,6 +497,64 @@ class DryerLogTests(unittest.TestCase):
         row, key = self.row(led, logged, tasks=tasks)
         self.assertTrue(row["detail"].startswith("plinth filter + air path, 40 runs left"), row["detail"])
         self.assertIsNone(key)
+
+
+def brew(end, **extra):
+    return {"id": f"c{int(end.timestamp()) - 240}", "ts": end.isoformat(), "duration_min": 4.0,
+            "completion_class": "complete", "outcome": "complete", **extra}
+
+
+class CoffeeTests(unittest.TestCase):
+    """The xBloom's four tapped tasks, counted in brews from the coffee app's ledger."""
+
+    def ledgers(self, cycles):
+        return {"coffee": run_ledger.ledger(cycles)}
+
+    def test_seeded_at_first_sight_with_brews_wording(self):
+        led = self.ledgers([brew(NOW - DAY - 2 * DAY * i) for i in range(45)])
+        anchors = runs.seed({}, led, NOW)
+        self.assertEqual(set(anchors), {"coffee:rinse", "coffee:tank", "coffee:burrs", "coffee:descale"})
+        found = rows_of(led, anchors)
+        row, key = found["maint:coffee:rinse"]
+        self.assertEqual((row["title"], row["area"], row["icon"], row["audience"], row["done"]),
+                         ("xBloom brewer rinse", "kitchen", "mdi:coffee-maker", "admin", "tap"))
+        self.assertEqual(row["detail"], "dripper + shower screen, 10 brews left, ~04.11")
+        self.assertEqual(row["info"], ["Every 10 brews (~3 weeks)", "Counting from 15.10",
+                                       "Provisional interval: check the xBloom manual"])
+        self.assertIsNone(key)
+        self.assertEqual(found["maint:coffee:descale"][0]["detail"], "descaler, 2 rounds, 60 brews left, ~11.02.27")
+        for row, _ in found.values():
+            self.assertTrue(core.is_valid_row(row), row)
+            self.assertNotIn("run", " ".join([row.get("detail", "")] + row.get("info", [])))
+
+    def test_only_complete_brews_count(self):
+        cycles = [brew(NOW - DAY * i) for i in range(1, 4)]
+        cycles += [brew(NOW - DAY * i - HOUR, completion_class="interrupted", outcome="stopped") for i in range(1, 4)]
+        anchors = {"coffee:rinse": {"at": core.utc_iso(NOW - 10 * DAY)}}
+        self.assertEqual(runs.statuses(self.ledgers(cycles), anchors, NOW)["coffee:rinse"].since, 3)
+
+    def test_done_and_the_brews_since(self):
+        cycles = [brew(NOW - DAY - 2 * DAY * i) for i in range(45)]
+        led = self.ledgers(cycles)
+        done = runs.mark_done(runs.seed({}, led, NOW - 30 * DAY), "coffee:tank", NOW - 11 * DAY, 39)
+        row, _ = rows_of(led, done)["maint:coffee:tank"]
+        self.assertEqual(row["info"][1], "Done 04.10, 5 brews ago")
+        self.assertTrue(row["detail"].startswith("empty, rinse, air-dry, 15 brews left"), row["detail"])
+        done = runs.mark_done(done, "coffee:tank", NOW, 45)
+        self.assertEqual(rows_of(led, done)["maint:coffee:tank"][0]["info"][1], "Done 15.10, no brews since")
+
+    def test_due_after_its_interval_and_pushed_once(self):
+        cycles = [brew(NOW - DAY - DAY * i) for i in range(25)]
+        led = self.ledgers(cycles)
+        anchors = {"coffee:rinse": {"at": core.utc_iso(NOW - 30 * DAY), "seed": True}}
+        row, key = rows_of(led, anchors)["maint:coffee:rinse"]
+        self.assertEqual(row["detail"], "dripper + shower screen, due")
+        self.assertEqual(key, f"coffee:rinse:{core.utc_iso(NOW - 30 * DAY)}")
+
+    def test_the_pace_until_the_ledger_covers_two_weeks(self):
+        led = self.ledgers([brew(NOW - DAY)])
+        status = runs.statuses(led, runs.seed({}, led, NOW), NOW)["coffee:burrs"]
+        self.assertEqual(status.per_week, 3.4)
 
 
 class EstimateTests(unittest.TestCase):

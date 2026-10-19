@@ -15,13 +15,14 @@ import upcoming_maint as maint  # noqa: E402
 import upcoming_runs as runs  # noqa: E402
 
 MIELE = ("dishwasher:hygiene", "dishwasher:filters", "dishwasher:check", "washer:drum", "washer:inlet", "dryer:plinth")
+XBLOOM = ("coffee:rinse", "coffee:tank", "coffee:burrs", "coffee:descale")
 
 
 class CoverageTests(unittest.TestCase):
     def test_every_task_and_every_rober2_part_has_a_guide_and_nothing_else_does(self):
         wanted = {task.key for task in runs.TASKS} | {f"rober2:{part}" for part, _, _ in maint.ROBER2_PARTS}
         self.assertEqual(set(guides.GUIDES), wanted)
-        self.assertEqual(set(MIELE), {task.key for task in runs.TASKS})
+        self.assertEqual(set(MIELE) | set(XBLOOM), {task.key for task in runs.TASKS})
 
     def test_each_guide_is_three_to_six_steps(self):
         for key, guide in guides.GUIDES.items():
@@ -49,9 +50,17 @@ class SafetyNoteTests(unittest.TestCase):
     def warn(self, key):
         return guides.GUIDES[key].warn.lower()
 
-    def test_every_miele_guide_carries_a_note(self):
-        for key in MIELE:
+    def test_every_miele_and_xbloom_guide_carries_a_note(self):
+        for key in MIELE + XBLOOM:
             self.assertTrue(guides.GUIDES[key].warn, key)
+
+    def test_the_xbloom_notes(self):
+        self.assertIn("cool", self.warn("coffee:rinse"))
+        self.assertIn("soap", self.warn("coffee:tank"))
+        self.assertIn("unplug", self.warn("coffee:burrs"))
+        self.assertIn("water on the burrs", self.warn("coffee:burrs"))
+        self.assertIn("vinegar", self.warn("coffee:descale"))
+        self.assertIn("hot", self.warn("coffee:descale"))
 
     def test_the_hygiene_run_warns_of_the_hot_water(self):
         self.assertIn("hot", self.warn("dishwasher:hygiene"))
@@ -117,6 +126,16 @@ class StepContentTests(unittest.TestCase):
         text = self.steps("dryer:plinth")
         for word in ("plinth flap", "plinth filter", "lint filters", "long nozzle", "filter lamp"):
             self.assertIn(word, text)
+
+    def test_the_descale_runs_twice_once_with_the_descaler_and_once_to_rinse(self):
+        text = self.steps("coffee:descale")
+        for word in ("descaling powder", "descaling program", "clean water", "again"):
+            self.assertIn(word, text)
+
+    def test_the_burrs_are_brushed_with_the_machine_unplugged(self):
+        steps = guides.GUIDES["coffee:burrs"].steps
+        self.assertIn("unplug", steps[0].lower())
+        self.assertIn("brush", steps[1].lower())
 
     def test_each_rober2_part_ends_with_resetting_its_counter(self):
         for part, _, _ in maint.ROBER2_PARTS:

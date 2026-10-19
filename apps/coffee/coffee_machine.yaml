@@ -1,0 +1,44 @@
+# CoffeeMachine - the xBloom Studio's brews, curves, ledger, baseline, beans container, Bluetooth link,
+# who made it and who is told, and the advisor. Publishes sensor.coffee_state, _live, _baseline, _beans,
+# _brews, _recipes and _advice for the dashboard. See coffee_machine.py.
+#
+# Keep sensor.coffee_live, _brews, _baseline and _recipes out of the recorder (configuration.yaml
+# recorder: exclude:): coffee_live changes every second while brewing.
+CoffeeMachine:
+  module: coffee_machine
+  class: CoffeeMachine
+  # Init-order guarantee for get_app("MobileNotifier") cached in initialize(). ActorAttribution is
+  # looked up per call on purpose and is no dependency.
+  dependencies: MobileNotifier
+
+  power_entity: sensor.pour_over_plug_power
+  plug_entity: switch.pour_over_plug
+  connect_entity: switch.xbloom_studio_connect
+  heartbeat_entity: sensor.xbloom_studio_status_updated
+  scale_entity: sensor.xbloom_studio_scale_weight
+  water_entity: sensor.xbloom_studio_water_dispensed
+  event_entity: event.xbloom_studio_brew_event
+  status_entity: sensor.xbloom_studio_brew_status
+  paused_entity: binary_sensor.xbloom_studio_brew_paused
+  fault_entity: sensor.xbloom_studio_machine_status
+  pour_entity: sensor.xbloom_studio_current_pour
+  recipe_select: select.xbloom_studio_recipe
+  # The usual until someone picks another with Make usual.
+  usual_name: 4 Pour Recipe
+
+  # The wine-fridge tablet's HA user (Rooftop): a start from it is source tablet, and nobody by itself.
+  tablet_user_id: 0b0b7ec25fed419dbeaed3898de34081
+  tablet_notify: notify/mobile_app_oppopad4pro
+  tablet_interactive: binary_sensor.oppopad4pro_interactive
+
+  # Mikkel's phone, the only one Bermuda can identify.
+  bermuda_person: person.mikkel
+  bermuda_distance: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_distance_to_pour_over_plug
+  bermuda_area: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area
+  person_entities: [person.mikkel, person.kristine, person.claudia]
+  # Name the brewer when exactly one person is home (ActorAttribution's rule). false: Bermuda only.
+  sole_occupancy: true
+
+  # An ai_task entity id turns the advisor on; empty keeps it at no_agent.
+  advisor_entity: ""
+  push_link: /dashboard-rooftop/home#room=kitchen

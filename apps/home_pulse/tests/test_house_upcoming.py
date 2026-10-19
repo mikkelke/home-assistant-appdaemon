@@ -146,6 +146,9 @@ def make_app(states=None, state_dir=None, now=NOW, ledgers=None, **args):
     for name in RUN_MAKERS:
         app.args[name] = {**(CONFIG.get(name) or {}), **(args.get(name) or {}),
                           "feedback_file": f"{state_dir}/{name}_feedback.json"}
+    app.args["coffee"] = {**(args.get("coffee") or {}), "feedback_file": f"{state_dir}/coffee_feedback.json"}
+    if "coffee" in (ledgers or {}):
+        write_ledger(state_dir, "coffee", ledgers["coffee"])
     app.state_dir = state_dir
     app.now = now
     app.states = states if states is not None else base_states()
@@ -645,8 +648,9 @@ class RunTaskTests(unittest.TestCase):
     def test_the_shipped_config_leaves_the_interval_unset_and_the_dryer_in_the_guest_bathroom(self):
         self.assertEqual(CONFIG["dryer"], {"interval_runs": None})
         app = make_app()
-        self.assertEqual(app.run_areas, {"washer": "guest_bathroom", "dishwasher": "kitchen", "dryer": "guest_bathroom"})
-        self.assertEqual(set(app.feedback_files),  {"washer", "dishwasher", "dryer"})
+        self.assertEqual(app.run_areas, {"washer": "guest_bathroom", "dishwasher": "kitchen", "dryer": "guest_bathroom",
+                                         "coffee": "kitchen"})
+        self.assertEqual(set(app.feedback_files), {"washer", "dishwasher", "dryer", "coffee"})
 
     def test_the_ledgers_default_to_the_files_next_to_the_appliance_modules(self):
         app = hu.HouseUpcoming.__new__(hu.HouseUpcoming)
@@ -664,7 +668,45 @@ class RunTaskTests(unittest.TestCase):
         self.assertEqual(app.feedback_files["washer"], here.parent / "appliances" / "washer_feedback.json")
         self.assertEqual(app.feedback_files["dishwasher"], here.parent / "appliances" / "dishwasher_feedback.json")
         self.assertEqual(app.feedback_files["dryer"], here.parent / "appliances" / "dryer_feedback.json")
+        self.assertEqual(app.feedback_files["coffee"], here.parent / "coffee" / "coffee_feedback.json")
         self.assertEqual(app.done_log_file, here / "house_upcoming_done_log.jsonl")
+
+
+def coffee_brews(count, last_end=NOW):
+    return [{"id": f"c{int((last_end - (count - i) * DAY).timestamp())}", "ts": iso(last_end - (count - i) * DAY),
+             "duration_min": 4.0, "completion_class": "complete", "outcome": "complete"} for i in range(count)]
+
+
+class CoffeeRowTests(unittest.TestCase):
+    """The coffee app's ledger gives the xBloom's four rows, like a monitor's feedback file."""
+
+    def test_no_ledger_no_coffee_rows(self):
+        self.assertFalse([key for key in rows(make_app()) if key.startswith("maint:coffee:")])
+
+    def test_four_admin_kitchen_rows_in_brews_seeded_at_first_sight(self):
+        app = make_app(ledgers={"coffee": coffee_brews(40)})
+        shown = {key: row for key, row in rows(app).items() if key.startswith("maint:coffee:")}
+        self.assertEqual(set(shown), {"maint:coffee:rinse", "maint:coffee:tank", "maint:coffee:burrs",
+                                      "maint:coffee:descale"})
+        for key, row in shown.items():
+            self.assertEqual((row["audience"], row["area"], row["done"], row["icon"]),
+                             ("admin", "kitchen", "tap", "mdi:coffee-maker"), key)
+            self.assertIn("brews left", row["detail"], key)
+            self.assertEqual(row["steps"], list(guides.GUIDES[key.removeprefix("maint:")].steps))
+        self.assertEqual(shown["maint:coffee:rinse"]["info"][1], "Counting from 14.10")
+        saved = state_file(app)["done"]
+        self.assertEqual(saved["coffee:rinse"], {"at": core.utc_iso(NOW), "runs": 40, "seed": True})
+
+    def test_an_empty_ledger_seeds_them_too(self):
+        app = make_app(ledgers={"coffee": []})
+        self.assertIn("maint:coffee:descale", rows(app))
+        self.assertTrue(rows(app)["maint:coffee:descale"]["detail"].startswith("descaler, 2 rounds, 60 brews left"))
+
+    def test_done_on_a_coffee_row(self):
+        app = make_app(ledgers={"coffee": coffee_brews(10)})
+        app._on_done("house_upcoming_done", {"row": "maint:coffee:tank"}, {})
+        self.assertEqual(rows(app)["maint:coffee:tank"]["info"][1], "Done 14.10, no brews since")
+        self.assertEqual(done_log(app)[-1]["row"], "maint:coffee:tank")
 
 
 class DoneEventTests(unittest.TestCase):

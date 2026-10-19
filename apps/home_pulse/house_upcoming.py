@@ -14,10 +14,11 @@ history job refreshes battery readings from the recorder when it holds a newer o
 re-run initialize, and plugin_started republishes.
 
 The appliance tasks (upcoming_runs) count finished runs in the monitors' feedback files
-(<appliance>_feedback.json next to the appliances' modules, read again whenever one changes, so a
-tick picks up a run that has finished). The tapped ones are closed by the house_upcoming_done event
-the dashboard fires for an admin, with {"row": <row id>}, and reopened by house_upcoming_undo; both
-reach the rows at once, and each is appended to house_upcoming_done_log.jsonl, which keeps every Done
+(<appliance>_feedback.json next to the appliances' modules, and the coffee app's coffee_feedback.json
+next to its own, read again whenever one changes, so a tick picks up a run that has finished). The
+tapped ones are closed by the house_upcoming_done event the dashboard fires for an admin, with
+{"row": <row id>}, and reopened by house_upcoming_undo; both reach the rows at once, and each is
+appended to house_upcoming_done_log.jsonl, which keeps every Done
 for working out the real interval of a task (the dryer's plinth filter is a log until it is known).
 
 The daily history job also turns each device's recorder history into battery facts and a
@@ -89,12 +90,15 @@ class HouseUpcoming(hass.Hass):
         self.drum_programmes = tuple(washer.get("drum_programmes") or ["drum_clean", "bomuld_90", "bomuld_60"])
         dishwasher = a.get("dishwasher") or {}
         dryer = a.get("dryer") or {}
+        coffee = a.get("coffee") or {}
         self.run_areas = {"washer": self.washer_area, "dishwasher": dishwasher.get("area", "kitchen"),
-                          "dryer": dryer.get("area", self.washer_area)}
+                          "dryer": dryer.get("area", self.washer_area), "coffee": coffee.get("area", "kitchen")}
         self.feedback_files = {
             name: Path(cfg.get("feedback_file") or here.parent / "appliances" / f"{name}_feedback.json")
             for name, cfg in (("washer", washer), ("dishwasher", dishwasher), ("dryer", dryer))
         }
+        self.feedback_files["coffee"] = Path(coffee.get("feedback_file")
+                                             or here.parent / "coffee" / "coffee_feedback.json")
         self.run_tasks = runs.configured(runs.interval_from(dryer.get("interval_runs")))
         self.done_log_file = Path(a.get("done_log_file") or here / "house_upcoming_done_log.jsonl")
         tr = a.get("train") or {}

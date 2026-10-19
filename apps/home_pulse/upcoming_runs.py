@@ -1,8 +1,9 @@
 """Run-based maintenance rows for sensor.house_upcoming: the dishwasher's hygiene run, filters and spray
-arms and general check, the washer's drum clean and inlet filters, and the dryer's plinth filter. A
-task is due after so many finished runs (run_ledger) since it was last done, which suits parts that
-clog with use better than the calendar. Pure: each step takes the persisted anchors and `now` and
-returns new state.
+arms and general check, the washer's drum clean and inlet filters, the dryer's plinth filter, and the
+xBloom's brewer rinse, water tank, grinder burrs and descale. A task is due after so many finished
+runs (run_ledger) since it was last done, which suits parts that clog with use better than the
+calendar. A task counts in its unit: the coffee machine's runs are brews. Pure: each step takes the
+persisted anchors and `now` and returns new state.
 
 A task is closed one of two ways. A confirmed task is closed by a person confirming a run as its
 programme, which is the dishwasher's Intensive run and the washer's drum clean; the ledger's records
@@ -37,7 +38,8 @@ from upcoming_guides import GUIDES
 from upcoming_maint import DUE_TIME, HOUSE_TZ, ddmm, fit_parts, house_date, parse_iso
 
 ROW_HORIZON_DAYS = 366
-DEFAULT_PER_WEEK = {"washer": 3.5, "dishwasher": 3.5, "dryer": 2.4}
+COFFEE_CLOSES = "Provisional interval: check the xBloom manual"
+DEFAULT_PER_WEEK = {"washer": 3.5, "dishwasher": 3.5, "dryer": 2.4, "coffee": 3.4}
 WEEKS_PER_MONTH = 4.345
 
 
@@ -50,6 +52,7 @@ class Task(NamedTuple):
     icon: str
     confirmed: Optional[Callable] = None
     closes: str = ""
+    unit: str = "run"
 
 
 TASKS = (
@@ -64,6 +67,14 @@ TASKS = (
          closes="Logged when you pick Drum clean on the washer card"),
     Task("washer:inlet", "washer", "Washer inlet filters", "hose + valve filters", 90, "mdi:washing-machine"),
     Task("dryer:plinth", "dryer", "Dryer plinth filter", "plinth filter + air path", None, "mdi:tumble-dryer"),
+    Task("coffee:rinse", "coffee", "xBloom brewer rinse", "dripper + shower screen", 10, "mdi:coffee-maker",
+         closes=COFFEE_CLOSES, unit="brew"),
+    Task("coffee:tank", "coffee", "xBloom water tank", "empty, rinse, air-dry", 20, "mdi:coffee-maker",
+         closes=COFFEE_CLOSES, unit="brew"),
+    Task("coffee:burrs", "coffee", "xBloom grinder burrs", "brush burrs + chute", 40, "mdi:coffee-maker",
+         closes=COFFEE_CLOSES, unit="brew"),
+    Task("coffee:descale", "coffee", "xBloom descale", "descaler, 2 rounds", 60, "mdi:coffee-maker",
+         closes=COFFEE_CLOSES, unit="brew"),
 )
 DRUM_KEY = "washer:drum"
 DRYER_KEY = "dryer:plinth"
@@ -184,8 +195,8 @@ def _last_line(status, now):
         return f"Counting from {ddmm(when, now)}"
     verb = "Logged" if task.interval is None else "Done"
     if status.since == 0:
-        return f"{verb} {ddmm(when, now)}, no runs since"
-    return f"{verb} {ddmm(when, now)}, {_plural(status.since, 'run')} ago"
+        return f"{verb} {ddmm(when, now)}, no {task.unit}s since"
+    return f"{verb} {ddmm(when, now)}, {_plural(status.since, task.unit)} ago"
 
 
 def _info(status, now):
@@ -193,12 +204,12 @@ def _info(status, now):
     if task.interval is None:
         first = "No interval yet. Log each clean to learn it."
     else:
-        first = f"Every {task.interval} runs ({calendar_text(task.interval / status.per_week)})"
+        first = f"Every {task.interval} {task.unit}s ({calendar_text(task.interval / status.per_week)})"
     return [first, _last_line(status, now), task.closes]
 
 
 def _log_detail(status, now):
-    since = f"{_plural(status.since, 'run')} since cleaned"
+    since = f"{_plural(status.since, status.task.unit)} since cleaned"
     last = f"counting from {ddmm(status.when, now)}" if status.seeded else f"last {ddmm(status.when, now)}"
     return fit_parts([since, last])
 
@@ -213,7 +224,7 @@ def _row(status, now, area, start):
         day = estimate_day(status.left, status.per_week, now)
         if day:
             at = datetime.combine(day, DUE_TIME, HOUSE_TZ)
-        detail = fit_parts([task.how, f"{_plural(status.left, 'run')} left", f"~{ddmm(day, now)}" if day else None])
+        detail = fit_parts([task.how, f"{_plural(status.left, task.unit)} left", f"~{ddmm(day, now)}" if day else None])
     else:
         price = None
         if start:
