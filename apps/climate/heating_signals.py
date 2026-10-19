@@ -19,8 +19,8 @@ one. The controller's own writes (same value within OWN_WRITE_S) and a report th
 the pre-write value (a device rejection) are excluded first.
 
 Meaning, by who and what:
-  - A resident's button press, or her setpoint change in her own room (Home Assistant or
-    keypad), moves her nudge one step. The owner's button press does the same.
+  - A resident's button press, or their setpoint change in their own room (Home Assistant or
+    keypad), moves their nudge one step. The owner's button press does the same.
   - The owner moving a managed thermostat is one step on the zone's target helper.
   - The owner changing a resident room's target helper resets that room's nudge.
   - The owner switching a zone off is the owner's choice; anyone else is restored.

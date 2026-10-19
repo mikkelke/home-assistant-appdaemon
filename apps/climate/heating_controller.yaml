@@ -12,7 +12,7 @@ HeatingController:
   dependencies: MobileNotifier
   notify_target: mikkel
   # The person who owns the targets and the helpers. Account ids come from the person
-  # entities' user_id, so a resident needs her person linked to her account.
+  # entities' user_id, so a resident needs their person linked to their account.
   owner: mikkel
   # AppDaemon's own HA account: what it does is another app, never a person.
   appdaemon_user_id: "f4fda494358943beaf8ad2c70db099f8"

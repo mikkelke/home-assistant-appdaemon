@@ -365,7 +365,7 @@ class HeatingController(hass.Hass):
 
     def _identity_for(self, now_ts: float) -> sig.Identity:
         """Which account is which person: the person entities' user_id, and the yaml map for a
-        resident whose person is not linked to her account. Re-read every ten minutes."""
+        resident whose person is not linked to their account. Re-read every ten minutes."""
         if now_ts - self._identity_at >= IDENTITY_REFRESH_S:
             cfg = self.cfg
             users = {sig.normalize_user_id(k): v for k, v in cfg.user_ids.items()}
