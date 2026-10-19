@@ -1,6 +1,6 @@
 # tests/test_heating_forecast.py - the floor-heating controller's weather side: Open-Meteo
-# request and parser, NOAA solar position, daily aggregates and sun hours. Pure functions, so
-# no AppDaemon harness is needed.
+# request and parser, NOAA solar position, daily aggregates, the mean over the coming hours and
+# sun hours. Pure functions, so no AppDaemon harness is needed.
 # Run from repo root: python3 -m unittest discover -s apps/climate/tests -q
 
 from __future__ import annotations
@@ -40,12 +40,12 @@ class RequestUrl(unittest.TestCase):
         url = hf.request_url(55.6841, 12.5666)
         self.assertIn("latitude=55.68&longitude=12.57&", url)
 
-    def test_asks_for_epoch_times_kmh_and_three_days(self):
+    def test_asks_for_epoch_times_kmh_and_four_days(self):
         url = hf.request_url(55.68, 12.57)
         for part in (
             "timeformat=unixtime",
             "wind_speed_unit=kmh",
-            "forecast_days=3",
+            "forecast_days=4",
             "timezone=auto",
             "temperature_2m,wind_speed_10m,shortwave_radiation,cloud_cover",
         ):
@@ -204,6 +204,41 @@ class DayAggregates(unittest.TestCase):
         end = datetime(2026, 10, 17, 22, 0, tzinfo=timezone.utc).timestamp()
         self.assertEqual(hf.hour_day(end, TZ), date(2026, 10, 17))
         self.assertEqual(hf.hour_day(end + 3600, TZ), date(2026, 10, 18))
+
+
+class MeanAhead(unittest.TestCase):
+    def test_the_mean_starts_at_the_hour_that_contains_the_instant(self):
+        fc = _forecast()
+        got = hf.mean_ahead(fc, fc.temperature, _local(date(2026, 10, 17), 6, 30), 24)
+        # the hour stamped 07:00 is index 7
+        self.assertAlmostEqual(got, sum(fc.temperature[7:31]) / 24, places=9)
+
+    def test_an_instant_before_the_series_starts_at_the_first_hour(self):
+        fc = _forecast()
+        got = hf.mean_ahead(fc, fc.temperature, _local(date(2026, 10, 16), 23, 30), 72)
+        self.assertAlmostEqual(got, sum(fc.temperature) / 72, places=9)
+
+    def test_a_window_the_forecast_does_not_reach_is_none(self):
+        fc = _forecast()
+        eight = _local(date(2026, 10, 17), 8, 5)  # the hour stamped 09:00 is index 9
+        self.assertIsNone(hf.mean_ahead(fc, fc.temperature, eight, 72))
+        self.assertIsNotNone(hf.mean_ahead(fc, fc.temperature, eight, 63))
+        self.assertIsNone(hf.mean_ahead(fc, fc.temperature, fc.times[-1] + 10, 1))
+
+    def test_unknown_values_are_skipped_down_to_nine_tenths_of_the_window(self):
+        payload = _payload()
+        for i in range(7):
+            payload["hourly"]["temperature_2m"][i * 10] = None
+        fc = hf.parse_response(payload, FETCHED_AT)
+        start = _local(date(2026, 10, 16), 23, 30)
+        known = [v for v in fc.temperature if v is not None]
+        self.assertEqual(len(known), 65)
+        self.assertAlmostEqual(
+            hf.mean_ahead(fc, fc.temperature, start, 72), sum(known) / 65, places=9
+        )
+        payload["hourly"]["temperature_2m"][71] = None
+        fc = hf.parse_response(payload, FETCHED_AT)
+        self.assertIsNone(hf.mean_ahead(fc, fc.temperature, start, 72))
 
 
 class SunHours(unittest.TestCase):

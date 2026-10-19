@@ -23,11 +23,13 @@ HOURLY_VARIABLES = ("temperature_2m", "wind_speed_10m", "shortwave_radiation", "
 HDD_BASE_C = 17.0
 HOUR_S = 3600
 MIN_DAY_HOURS = 20
+FORECAST_DAYS = 4
 
 
-def request_url(latitude: float, longitude: float, days: int = 3) -> str:
+def request_url(latitude: float, longitude: float, days: int = FORECAST_DAYS) -> str:
     """Forecast request for a location, rounded to 2 decimals. Times come back as epoch
-    seconds, wind in km/h; the series starts at local midnight of today."""
+    seconds, wind in km/h; the series starts at local midnight of today. Four days from
+    midnight cover the next 72 hours at any hour of the day."""
     return (
         f"{API_URL}?latitude={latitude:.2f}&longitude={longitude:.2f}"
         f"&hourly={','.join(HOURLY_VARIABLES)}"
@@ -205,6 +207,21 @@ def day_weather(
         wind_mean=_mean(wind),
         ghi_kwh=sum(ghi) / 1000.0,
     )
+
+
+def mean_ahead(
+    fc: Forecast, series: tuple, from_ts: float, hours: int, min_share: float = 0.9
+) -> Optional[float]:
+    """Mean of a series over the `hours` hourly values from the hour that contains from_ts.
+    None when the forecast does not reach that far, or when fewer than min_share of those
+    values are known."""
+    start = next((i for i, end in enumerate(fc.times) if end > from_ts), None)
+    if start is None or start + hours > len(series):
+        return None
+    known = [v for v in series[start : start + hours] if v is not None]
+    if len(known) < min_share * hours:
+        return None
+    return _mean(known)
 
 
 def sun_hours(
