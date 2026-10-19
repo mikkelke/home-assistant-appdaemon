@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import coffee_baseline as cb
 import coffee_curve as cc
-from coffee_fsm import epoch, iso
+from coffee_fsm import FAULTS, epoch, iso
 
 V = "1"
 HOUSE_TZ = ZoneInfo("Europe/Copenhagen")
@@ -90,7 +90,7 @@ def state_entity(brew, last, now, machine, power_w, link, link_seen_at, fault, n
     _put(attrs, "power_w", power_text(power_w))
     attrs["link"] = link
     _put(attrs, "link_seen_at", iso(link_seen_at))
-    _put(attrs, "fault", fault if fault and fault != "ok" else None)
+    _put(attrs, "fault", fault if fault in FAULTS else None)
     if brew is None:
         state = "asleep" if machine in ("asleep", "off") else "idle"
         if last:

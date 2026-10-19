@@ -326,10 +326,36 @@ class StartTests(unittest.TestCase):
         self.assertEqual(coffee_state(app)[1]["stop_reason"], "home_assistant")
 
 
+class RestoreTests(unittest.TestCase):
+    def test_values_restored_by_an_ha_restart_are_no_news(self):
+        app = fake.make_app()
+        fake.set_entity(app, "sensor.xbloom_studio_brew_status", "grinding")
+        fake.advance(app, 30)
+        for entity in ("event.xbloom_studio_brew_event", "sensor.xbloom_studio_scale_weight",
+                       "sensor.xbloom_studio_status_updated"):
+            fake.set_entity(app, entity, "unavailable")
+        fake.set_entity(app, "event.xbloom_studio_brew_event", fake.iso(app.now - 3600),
+                        {"event_type": "brew_done", "recipe_name": ""})
+        fake.set_entity(app, "sensor.xbloom_studio_scale_weight", "216.0")
+        fake.set_entity(app, "sensor.xbloom_studio_status_updated", fake.iso(app.now - 3600))
+        state, attrs = coffee_state(app)
+        self.assertEqual((state, attrs["link"]), ("grinding", "not_connected"))
+        self.assertIsNone(app._tracker.cup)
+
+
 class ConnectTests(unittest.TestCase):
     def test_a_rise_through_10_w_turns_connect_on_at_once(self):
         app = fake.make_app()
         fake.set_entity(app, "sensor.pour_over_plug_power", "38.0")
+        self.assertEqual(len(calls(app, "switch/turn_on")), 1)
+
+    def test_one_trigger_per_brew_not_one_per_heater_pulse(self):
+        app = fake.make_app()
+        app.switch_follows = False
+        rows = POWER["brew_2026_10_17"]
+        for ts, value in rows:
+            fake.advance(app, max(0.0, ts - rows[0][0] + T0 - app.now))
+            fake.set_entity(app, "sensor.pour_over_plug_power", value)
         self.assertEqual(len(calls(app, "switch/turn_on")), 1)
 
     def test_waking_up_or_an_ha_restart_is_no_trigger(self):

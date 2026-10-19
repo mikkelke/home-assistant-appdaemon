@@ -96,6 +96,12 @@ class StateTests(unittest.TestCase):
         self.assertNotIn("eta", attrs)
         self.assertEqual((attrs["paused_since"], attrs["fault"]), ("2026-10-20T06:01:40+00:00", "no_water"))
 
+    def test_only_a_real_fault_is_a_fault(self):
+        for status in ("ok", "unknown", "unavailable", None):
+            _, attrs = pub.state_entity(None, None, NOW, "awake", 2.3, "not_connected", None, status, None, None, None,
+                                        None, None)
+            self.assertNotIn("fault", attrs, status)
+
     def test_idle_and_asleep(self):
         state, attrs = pub.state_entity(None, {"id": "c1"}, NOW, "awake", 2.3, "not_connected", None, "ok", "mikkel",
                                         None, None, None, None)

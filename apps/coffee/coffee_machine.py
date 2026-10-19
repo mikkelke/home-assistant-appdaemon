@@ -367,7 +367,10 @@ class CoffeeMachine(hass.Hass):
         attrs = new.get("attributes") or {}
         kind = attrs.get("event_type")
         now = self._now()
-        when = min(cf.epoch(new.get("state")) or now, now)
+        when = cf.epoch(new.get("state"))
+        if when is None or now - when > FRAME_AGE_S:
+            return
+        when = min(when, now)
         self._tracker.frame(now)
         if kind == "pour_started":
             index = cpow.watts(attrs.get("pour_index"))
