@@ -259,9 +259,7 @@ class SeasonAdvisor:
         days = [_shift(inp.day, -k) for k in range(cfg.mornings)]
         means = {zone: [self._mean(zone, d) for d in days] for zone in cfg.zones}
         judged = [z for z in cfg.zones if None not in means[z] and inp.bases.get(z) is not None]
-        failed = tuple(
-            z for z in judged if all(m < inp.bases[z] - cfg.margin_c for m in means[z])
-        )
+        failed = tuple(z for z in judged if all(m < inp.bases[z] - cfg.margin_c for m in means[z]))
         seen = dict(day=inp.day, forecast_mean=inp.forecast_mean, mornings=means, failed=failed)
         if not judged:
             return Verdict(reason=REASON_NO_DATA, **seen)
@@ -269,16 +267,13 @@ class SeasonAdvisor:
             return Verdict(reason=REASON_WARM, **seen)
         if inp.forecast_mean >= cfg.start_below_c:
             return Verdict(reason=REASON_MILD, **seen)
-        rooms = [
-            f"{self._labels[z]} was {means[z][0]:.1f} °C this morning with the heat off"
-            if i == 0
-            else f"{self._labels[z]} {means[z][0]:.1f}"
-            for i, z in enumerate(failed)
-        ]
+        first, *others = failed
+        rooms = f"{self._labels[first]} was {means[first][0]:.1f} °C this morning with the heat off"
+        rooms += "".join(f", {self._labels[z]} {means[z][0]:.1f}" for z in others)
         return Verdict(
             advice=ADVICE_START,
             title="Heating season?",
-            message=", ".join(rooms) + f". {self._outlook(inp.forecast_mean)}",
+            message=f"{rooms}. {self._outlook(inp.forecast_mean)}",
             **seen,
         )
 

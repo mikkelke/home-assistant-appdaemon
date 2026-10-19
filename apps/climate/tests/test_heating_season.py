@@ -83,9 +83,7 @@ def inputs(**kw):
 
 
 def records(days, hours=0.0, ticks=288, zones=ALL_ZONES):
-    return {
-        name: [{"day": d, "ticks": ticks, "call_hours": hours} for d in days] for name in zones
-    }
+    return {name: [{"day": d, "ticks": ticks, "call_hours": hours} for d in days] for name in zones}
 
 
 def idle_days(today=DAY, n=5, **kw):
