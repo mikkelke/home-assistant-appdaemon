@@ -22,7 +22,7 @@ plugin_started republishes all seven.
 import asyncio
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from pathlib import Path
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
@@ -213,7 +213,7 @@ class CoffeeMachine(hass.Hass):
         self.listen_event(self._on_push_action, "mobile_app_notification_action")
         self.listen_event(self._on_plugin_started, "plugin_started")
         self.run_every(self._on_house_tick, f"now+{HOUSE_TICK_S}", HOUSE_TICK_S)
-        self.run_daily(self._on_midnight, "00:05:00")
+        self.run_daily(self._on_midnight, time(0, 5))
         self.run_in(self._refresh_recipes, RECIPES_DELAY_S)
 
         self._ensure_files()
@@ -225,6 +225,7 @@ class CoffeeMachine(hass.Hass):
         if self._machine(now) == "working":
             self._connect_trigger("init_working", now)
         self._recompute_baseline(now)
+        self._write_recent(now)
         self._publish_all(force=True)
         self._save_state()
         self._info(f"CoffeeMachine initialized - {len(self._records)} brews on record, {len(self._recipes)} recipes, "
@@ -507,6 +508,7 @@ class CoffeeMachine(hass.Hass):
             self._live_timer = None
 
     def _on_midnight(self, kwargs):
+        self._write_recent(self._now())
         self._publish("coffee_brews", force=True)
 
     # -- effects ------------------------------------------------------------------------------------

@@ -122,10 +122,12 @@ class PublishTests(unittest.TestCase):
         fake.fire(app, "plugin_started")
         self.assertEqual({e for _, e, _, _ in app.history[before:]}, set(COFFEE))
 
-    def test_the_ledger_file_exists_from_the_start(self):
+    def test_the_ledger_and_recent_json_exist_from_the_start(self):
         app = fake.make_app(recipes=())
         self.assertEqual(json.loads((app.dir / "coffee_feedback.json").read_text()), {"version": 1, "cycles": []})
         self.assertTrue((app.dir / "media" / "brews").is_dir())
+        recent = json.loads((app.dir / "media" / "recent.json").read_text())
+        self.assertEqual((recent["v"], recent["step_s"], recent["brews"], recent["bands"]), (1, 2, [], {}))
 
     def test_the_machine_class_and_asleep(self):
         app = fake.make_app()
