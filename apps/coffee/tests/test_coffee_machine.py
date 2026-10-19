@@ -20,6 +20,7 @@ import coffee_publish as pub  # noqa: E402
 import run_ledger  # noqa: E402
 
 POWER = json.loads((Path(__file__).resolve().parent / "fixtures" / "plug_power.json").read_text())
+TAPES = sorted((Path(__file__).resolve().parent / "fixtures").glob("tape_*.json"))
 BREW_ID = f"c{int(T0)}"
 COFFEE = [f"sensor.{key}" for key in cm.ENTITIES]
 
@@ -210,6 +211,27 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(calls(app, "switch/turn_off"), [])
         fake.advance(app, 20)
         self.assertEqual(len(calls(app, "switch/turn_off")), 1)
+
+
+class RecordedTapeTests(unittest.TestCase):
+    """Real brews cut out of the recorder with scripts/coffee_tape.py."""
+
+    def test_every_recorded_brew_gives_a_record_and_a_curve_a_second(self):
+        if not TAPES:
+            self.skipTest("no recorded brew yet")
+        for path in TAPES:
+            with self.subTest(path.name):
+                doc = json.loads(path.read_text())
+                start = cm.cf.epoch(doc["start"])
+                app = fake.make_app(now=start)
+                fake.replay(app, [(t, tuple(step)) for t, step in doc["tape"]], start=start)
+                fake.advance(app, 60)
+                record = [r for r in fake.ledger(app) if r.get("first_bloom_at")][-1]
+                for key in ("first_bloom_at", "enjoy_at", "total_s", "drawdown_s", "cup_g", "water_ml", "coverage"):
+                    self.assertIn(key, record)
+                data = json.loads((app.dir / "media" / "brews" / f"{record['id']}.json").read_text())
+                self.assertLessEqual(len(data["cup"]), data["end_s"] + 1)
+                self.assertGreater(len(data["water"]), 0.9 * data["end_s"])
 
 
 class StartTests(unittest.TestCase):

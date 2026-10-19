@@ -287,7 +287,10 @@ def replay(app, tape, start=None):
             advance(app, start + offset - app.now)
         kind = step[0]
         if kind == "state":
-            set_entity(app, *step[1:])
+            entity, state = step[1], step[2]
+            if isinstance(state, str) and state.startswith("@"):
+                state = iso(start + float(state[1:]))
+            set_entity(app, entity, state, *step[3:])
         elif kind == "event":
             fire(app, *step[1:])
         elif kind == "op":
