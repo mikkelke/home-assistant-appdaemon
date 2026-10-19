@@ -601,7 +601,7 @@ class AdvisorTests(unittest.TestCase):
         updates = calls(app, "xbloom/update_recipe")
         self.assertEqual(len(updates), 1)
         saved = json.loads(updates[0]["recipe_json"])
-        self.assertEqual((saved["grind_size"], saved["grinder_size"], saved["id"]), (44, 44, "1234567"))
+        self.assertEqual((saved["grind_size"], saved["grinder_size"], saved["id"]), (44, 44, "81696"))
         self.assertEqual(fake.last(app, "sensor.coffee_advice")[0], "none")
 
     def test_revert_and_dismiss_never_touch_the_recipe(self):

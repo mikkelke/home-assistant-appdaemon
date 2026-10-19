@@ -39,15 +39,17 @@ def iso(ts):
     return datetime.fromtimestamp(ts, timezone.utc).isoformat()
 
 
-def pour(ml, pause, pattern=3, after=2):
-    return {"volume_ml": ml, "temperature_c": 93.0, "pattern": pattern, "flow_rate": 3.0, "pause_s": pause,
+def pour(ml, pause, pattern=3, after=2, flow=3.0):
+    return {"volume_ml": ml, "temperature_c": 93.0, "pattern": pattern, "flow_rate": flow, "pause_s": pause,
             "agitate_before": 2, "agitate_after": after}
 
 
-USUAL = {"id": "1234567", "name": "4 Pour Recipe", "dose_g": 15.0, "water_ratio": 17.0, "grinder_size": 46.0,
-         "grinder_size_enabled": 1, "rpm": 90, "pour_count": 4, "cup_type": 1, "cup_type_name": "XPOD",
-         "pours": [pour(45, 15, after=1), pour(80, 15, after=1), pour(65, 12), pour(65, 5, pattern=1)]}
-OTHER = {**USUAL, "id": "7654321", "name": "Iced", "dose_g": 18.0, "water_ratio": 15.0, "cup_type": 2,
+USUAL = {"id": "81696", "name": "4 Pour Recipe", "dose_g": 15.0, "water_ratio": 17.0, "grinder_size": 46.0,
+         "grinder_size_enabled": 1, "rpm": 120, "pour_count": 4, "cup_type": 2, "bypass_water_enabled": 2,
+         "ratio": "1:17", "grind_size": 46.0, "grinder_speed_rpm": 120,
+         "pours": [pour(45, 15, after=1), pour(80, 15, after=1, flow=3.5), pour(65, 12, flow=3.5),
+                   pour(65, 5, pattern=1, flow=3.5)]}
+OTHER = {**USUAL, "id": "7654321", "name": "Iced", "dose_g": 18.0, "water_ratio": 15.0, "ratio": "1:15",
          "pours": [pour(90, 30), pour(180, 0)]}
 
 

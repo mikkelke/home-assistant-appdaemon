@@ -25,6 +25,34 @@ BUILT = {"id": "a1b2", "name": "Morning", "dose_g": 18.0, "ratio": "1:16", "wate
          "pours": [pour(48, 20, pattern=2, flow=3.5), pour(240, 0, pattern=2, flow=3.5)]}
 
 
+# The usual as HA's library holds it after the import: ratio "1:17", grind_size and grinder_speed_rpm added.
+USUAL_STORED = {"id": "81696", "name": "4 Pour Recipe", "dose_g": 15.0, "water_ratio": 17.0, "grinder_size": 50.0,
+                "grinder_size_enabled": 1, "rpm": 120, "pour_count": 4, "cup_type": 2, "bypass_water_enabled": 2,
+                "ratio": "1:17", "grind_size": 50.0, "grinder_speed_rpm": 120,
+                "pours": [{"name": "Bloom", "volume_ml": 45.0, "temperature_c": 93.0, "pattern": 3, "flow_rate": 3.0,
+                           "pause_s": 15, "agitate_before": 2, "agitate_after": 1},
+                          {"name": "Pour 2", "volume_ml": 80.0, "temperature_c": 93.0, "pattern": 3, "flow_rate": 3.5,
+                           "pause_s": 15, "agitate_before": 2, "agitate_after": 1},
+                          {"name": "Pour 3", "volume_ml": 65.0, "temperature_c": 93.0, "pattern": 3, "flow_rate": 3.5,
+                           "pause_s": 12, "agitate_before": 2, "agitate_after": 2},
+                          {"name": "Pour 4", "volume_ml": 65.0, "temperature_c": 93.0, "pattern": 1, "flow_rate": 3.5,
+                           "pause_s": 5, "agitate_before": 2, "agitate_after": 2}]}
+
+
+class StoredUsualTests(unittest.TestCase):
+    def test_the_usual_as_the_library_holds_it(self):
+        r = cp.normalize(USUAL_STORED)
+        self.assertEqual((r["dose_g"], r["ratio"], r["grind"], r["rpm"], r["cup_type"], r["total_ml"]),
+                         (15.0, 17.0, 50, 120, 2, 255.0))
+        self.assertEqual(cp.plan_pours(r), "0-15:circular:93:45;30-53:circular:93:80;68-86:circular:93:65;"
+                                           "98-117:centered:93:65")
+        self.assertEqual(cp.plan_total_s(r), 192)
+        self.assertEqual(cp.recipe_entry(r)["cup"], "Omni dripper")
+        self.assertEqual(cp.recipe_key(r), cp.recipe_key(cp.normalize({**USUAL_STORED, "ratio": None,
+                                                                       "grind_size": None,
+                                                                       "grinder_speed_rpm": None})))
+
+
 class NormalizeTests(unittest.TestCase):
     def test_a_share_link_recipe(self):
         r = cp.normalize(USUAL_SHARED)
