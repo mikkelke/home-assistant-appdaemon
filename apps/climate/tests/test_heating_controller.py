@@ -55,7 +55,7 @@ THERMOSTATS = {
     "guest_bathroom": "climate.guest_bathroom_thermostat",
 }
 FEELS = {
-    "family": ["sensor.living_room_feel", "sensor.dining_room_feel"],
+    "family": ["sensor.living_room_feel", "sensor.dining_room_feel", "sensor.kitchen_feel"],
     "kristines_room": ["sensor.kristines_room_feel"],
     "claudias_room": ["sensor.claudias_room_feel"],
     "bathroom": ["sensor.bathroom_feel"],
@@ -197,7 +197,7 @@ def house(ha: FakeHA):
     ):
         ha.set(opening, "off")
     ha.set("sensor.bedroom_feel", "20.8", {"stale": "false", "window_open": "false"})
-    ha.set("sensor.kitchen_feel", "22.0", {"air_band": "good"})
+    ha.set("sensor.kitchen_feel", "22.2", {"stale": "false", "air_band": "good"})
     ha.set("sensor.gw2000a_outdoor_temperature", "11.3")
     ha.set("weather.forecast_home", "cloudy", {"temperature": 11.7})
     ha.set("sensor.floor_heating_relay_power", "1.6")
@@ -429,6 +429,10 @@ class ShippedYaml(unittest.TestCase):
             self.cfg.season_advisor,
             hp.SeasonAdvisorConfig(zones=("family", "kristines_room", "claudias_room")),
         )
+
+    def test_the_family_room_is_one_zone_of_living_room_dining_room_and_kitchen(self):
+        rooms = ("sensor.living_room_feel", "sensor.dining_room_feel", "sensor.kitchen_feel")
+        self.assertEqual(self.cfg.zones["family"].control_air, rooms)
 
     def test_family_profile_is_minus_half_nights_and_mornings_plus_half_evenings(self):
         periods = {(p.start, p.end): p.offset for p in self.cfg.zones["family"].profile.periods}
@@ -679,11 +683,23 @@ class ControlAirChain(unittest.TestCase):
         a = self.h.attrs("family")
         self.assertEqual((a["control_air"], a["control_air_source"]), (22.2, "feel"))
 
-    def test_one_of_two_family_rooms_is_enough(self):
+    def test_the_family_air_is_the_mean_of_living_room_dining_room_and_kitchen(self):
+        self.h.ha.set("sensor.living_room_feel", "22.0", {"stale": "false"})
+        self.h.ha.set("sensor.dining_room_feel", "22.6", {"stale": "false"})
+        self.h.ha.set("sensor.kitchen_feel", "21.4", {"stale": "false"})
+        self.h.tick()
+        self.assertEqual(self.h.attrs("family")["control_air"], 22.0)
+
+    def test_one_of_three_family_rooms_is_enough(self):
         self.h.ha.set("sensor.dining_room_feel", "unavailable")
+        self.h.ha.set("sensor.kitchen_feel", "22.0", {"stale": "true"})
         self.h.ha.set("sensor.living_room_feel", "22.6", {"stale": "false"})
         self.h.tick()
         self.assertEqual(self.h.attrs("family")["control_air"], 22.6)
+        self.assertEqual(
+            self.h.attrs("family")["stale_inputs"],
+            ["control_air:sensor.dining_room_feel", "control_air:sensor.kitchen_feel"],
+        )
 
     def test_a_stale_room_reading_falls_back_to_the_thermostat_itself(self):
         for feel in FEELS["family"]:
@@ -727,13 +743,14 @@ class ControlAirChain(unittest.TestCase):
     def test_an_impossible_reading_is_ignored(self):
         self.h.ha.set("sensor.living_room_feel", "88.0", {"stale": "false"})
         self.h.ha.set("sensor.dining_room_feel", "22.0", {"stale": "false"})
+        self.h.ha.set("sensor.kitchen_feel", "22.0", {"stale": "false"})
         self.h.tick()
         self.assertEqual(self.h.attrs("family")["control_air"], 22.0)
 
     def test_a_jump_inside_ten_minutes_is_held_back(self):
         self.h.tick()
-        self.h.ha.set("sensor.living_room_feel", "26.5", {"stale": "false"})
-        self.h.ha.set("sensor.dining_room_feel", "26.5", {"stale": "false"})
+        for feel in FEELS["family"]:
+            self.h.ha.set(feel, "26.5", {"stale": "false"})
         self.h.tick(minutes=5)
         self.assertEqual(self.h.attrs("family")["control_air"], 22.2)
         self.h.tick(minutes=5)
@@ -1056,7 +1073,7 @@ class PartyEndToEnd(unittest.TestCase):
     def test_stuffy_air_alone_triggers_the_suggestion(self):
         h = Harness(self)
         h.ha.set("input_boolean.party", "on")
-        h.ha.set("sensor.kitchen_feel", "22.0", {"air_band": "stuffy"})
+        h.ha.set("sensor.kitchen_feel", "22.2", {"air_band": "stuffy"})
         h.tick()
         h.run_tasks()
         msg = h.notifier.notify.await_args.kwargs["message"]
@@ -1088,7 +1105,7 @@ class PartyEndToEnd(unittest.TestCase):
         h = Harness(self)
         h.notifier.notify = AsyncMock(side_effect=RuntimeError("no phone"))
         h.ha.set("input_boolean.party", "on")
-        h.ha.set("sensor.kitchen_feel", "22.0", {"air_band": "poor"})
+        h.ha.set("sensor.kitchen_feel", "22.2", {"air_band": "poor"})
         h.tick()
         h.run_tasks()
         self.assertTrue(any("push failed" in m for m in h.warnings()))

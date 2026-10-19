@@ -117,7 +117,7 @@ HeatingController:
   zones:
     family:
       thermostat: climate.family_room_thermostat
-      control_air: [sensor.living_room_feel, sensor.dining_room_feel]
+      control_air: [sensor.living_room_feel, sensor.dining_room_feel, sensor.kitchen_feel]
       floor: sensor.living_room_floor_thermometer_temperature
       evenness_floors:
         - sensor.living_room_floor_thermometer_temperature

@@ -29,7 +29,7 @@ def T(hour, minute=0, day=17, month=10):
 
 FAMILY = {
     "thermostat": "climate.family_room_thermostat",
-    "control_air": ["sensor.living_room_feel", "sensor.dining_room_feel"],
+    "control_air": ["sensor.living_room_feel", "sensor.dining_room_feel", "sensor.kitchen_feel"],
     "floor": "sensor.living_room_floor_thermometer_temperature",
     "openings": [
         "binary_sensor.living_room_window_contact",
