@@ -195,6 +195,7 @@ class ZoneConfig:
     residents: tuple
     nudge: NudgeConfig
     buttons: dict
+    evenness_floors: tuple = ()  # (reference, compared): the alert watches compared minus reference
 
 
 @dataclass(frozen=True)
@@ -241,6 +242,21 @@ class BedroomConfig:
 
 
 @dataclass(frozen=True)
+class AlertConfig:
+    """Thresholds of the plant alerts, see heating_alerts."""
+
+    cold_c: float = 19.0
+    cold_minutes: float = 30.0
+    calling_hours: float = 4.0
+    no_pump_w: float = 5.0
+    floor_rise_min_c: float = 0.1
+    evenness_c: float = 1.5
+    evenness_nights: int = 3
+    no_hot_water_c: float = 28.0
+    repeat_hours: float = 6.0
+
+
+@dataclass(frozen=True)
 class Config:
     season_entity: str
     state_file: str
@@ -258,6 +274,13 @@ class Config:
     party: Optional[PartyConfig]
     window: WindowConfig
     zones: dict = field(default_factory=dict)
+    owner: str = "mikkel"
+    appdaemon_user_id: str = ""
+    user_ids: dict = field(default_factory=dict)
+    supply_temp_entity: str = ""
+    return_temp_entity: str = ""
+    living_monitor_entity: str = ""
+    alerts: AlertConfig = field(default_factory=AlertConfig)
 
 
 def _req(raw: dict, key: str, where: str):
@@ -372,6 +395,12 @@ def _parse_zone(name: str, raw: dict) -> ZoneConfig:
         raise ConfigError(f"{where}: control_air needs at least one sensor")
     trim = raw.get("trim") or {}
     nudge = raw.get("nudge") or {}
+    buttons = dict(raw.get("buttons") or {})
+    if set(buttons) - {"warmer", "colder"}:
+        raise ConfigError(f"{where}: buttons are 'warmer' and 'colder'")
+    evenness = _as_tuple(raw.get("evenness_floors"))
+    if evenness and len(evenness) != 2:
+        raise ConfigError(f"{where}: evenness_floors needs [reference, compared]")
     return ZoneConfig(
         name=name,
         thermostat=_req(raw, "thermostat", where),
@@ -399,8 +428,29 @@ def _parse_zone(name: str, raw: dict) -> ZoneConfig:
             maximum=float(nudge.get("max", 0.0)),
             step=float(nudge.get("step", SETPOINT_STEP_C)),
         ),
-        buttons=dict(raw.get("buttons") or {}),
+        buttons=buttons,
+        evenness_floors=evenness,
     )
+
+
+def _parse_alerts(raw: dict) -> AlertConfig:
+    d = AlertConfig()
+    cfg = AlertConfig(
+        cold_c=float(raw.get("cold_c", d.cold_c)),
+        cold_minutes=float(raw.get("cold_minutes", d.cold_minutes)),
+        calling_hours=float(raw.get("calling_hours", d.calling_hours)),
+        no_pump_w=float(raw.get("no_pump_w", d.no_pump_w)),
+        floor_rise_min_c=float(raw.get("floor_rise_min_c", d.floor_rise_min_c)),
+        evenness_c=float(raw.get("evenness_c", d.evenness_c)),
+        evenness_nights=int(raw.get("evenness_nights", d.evenness_nights)),
+        no_hot_water_c=float(raw.get("no_hot_water_c", d.no_hot_water_c)),
+        repeat_hours=float(raw.get("repeat_hours", d.repeat_hours)),
+    )
+    if cfg.calling_hours <= 0 or cfg.cold_minutes < 0 or cfg.repeat_hours < 0:
+        raise ConfigError("alerts: calling_hours must be positive, the others not negative")
+    if cfg.evenness_nights < 1:
+        raise ConfigError("alerts: evenness_nights must be at least 1")
+    return cfg
 
 
 def parse_config(args: dict) -> Config:
@@ -459,6 +509,13 @@ def parse_config(args: dict) -> Config:
             unavailable_closed_minutes=float(window.get("unavailable_closed_minutes", 10)),
         ),
         zones=zones,
+        owner=str(args.get("owner", "mikkel")).lower(),
+        appdaemon_user_id=str(args.get("appdaemon_user_id") or ""),
+        user_ids={str(k): str(v).lower() for k, v in (args.get("user_ids") or {}).items()},
+        supply_temp_entity=args.get("supply_temp_entity") or "",
+        return_temp_entity=args.get("return_temp_entity") or "",
+        living_monitor_entity=(args.get("unmanaged") or {}).get("living_monitor") or "",
+        alerts=_parse_alerts(args.get("alerts") or {}),
     )
 
 

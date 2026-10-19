@@ -207,6 +207,62 @@ class ConfigParsing(unittest.TestCase):
         self.assertEqual(CFG.bedroom.release_below_c, 20.5)
         self.assertEqual(CFG.party.lead_hours, 8)
 
+    def test_the_signal_and_alert_settings_have_defaults(self):
+        self.assertEqual(CFG.owner, "mikkel")
+        self.assertEqual((CFG.appdaemon_user_id, CFG.user_ids), ("", {}))
+        self.assertEqual(
+            (CFG.supply_temp_entity, CFG.return_temp_entity, CFG.living_monitor_entity),
+            ("", "", ""),
+        )
+        a = CFG.alerts
+        self.assertEqual((a.cold_c, a.cold_minutes, a.calling_hours), (19.0, 30.0, 4.0))
+        self.assertEqual((a.no_pump_w, a.floor_rise_min_c, a.no_hot_water_c), (5.0, 0.1, 28.0))
+        self.assertEqual((a.evenness_c, a.evenness_nights, a.repeat_hours), (1.5, 3, 6.0))
+        self.assertEqual(CFG.zones["family"].evenness_floors, ())
+
+    def test_the_signal_and_alert_settings_are_read(self):
+        zones = dict(ARGS["zones"], family=dict(FAMILY, evenness_floors=["sensor.a", "sensor.b"]))
+        cfg = hp.parse_config(
+            dict(
+                ARGS,
+                zones=zones,
+                owner="Mikkel",
+                appdaemon_user_id="abc",
+                user_ids={"5BEE": "Kristine"},
+                supply_temp_entity="sensor.supply",
+                return_temp_entity="sensor.return",
+                unmanaged={"living_monitor": "climate.monitor"},
+                alerts={"cold_c": 18.0, "cold_minutes": 10, "evenness_nights": 5},
+            )
+        )
+        self.assertEqual((cfg.owner, cfg.appdaemon_user_id), ("mikkel", "abc"))
+        self.assertEqual(cfg.user_ids, {"5BEE": "kristine"})
+        self.assertEqual(
+            (cfg.supply_temp_entity, cfg.return_temp_entity), ("sensor.supply", "sensor.return")
+        )
+        self.assertEqual(cfg.living_monitor_entity, "climate.monitor")
+        self.assertEqual(
+            (cfg.alerts.cold_c, cfg.alerts.cold_minutes, cfg.alerts.evenness_nights),
+            (18.0, 10.0, 5),
+        )
+        self.assertEqual(cfg.alerts.calling_hours, 4.0)
+        self.assertEqual(cfg.zones["family"].evenness_floors, ("sensor.a", "sensor.b"))
+
+    def test_bad_signal_and_alert_settings_are_refused(self):
+        zones = lambda **kw: dict(ARGS["zones"], kristines_room=dict(KRISTINE, **kw))  # noqa: E731
+        cases = [
+            dict(ARGS, alerts={"calling_hours": 0}),
+            dict(ARGS, alerts={"evenness_nights": 0}),
+            dict(ARGS, alerts={"cold_minutes": -1}),
+            dict(ARGS, alerts={"repeat_hours": -1}),
+            dict(ARGS, zones=zones(buttons={"warmer": "a", "hotter": "b"})),
+            dict(ARGS, zones=zones(evenness_floors=["only.one"])),
+            dict(ARGS, zones=zones(evenness_floors=["a", "b", "c"])),
+        ]
+        for args in cases:
+            with self.assertRaises(hp.ConfigError, msg=repr(args)[:80]):
+                hp.parse_config(args)
+
     def _broken(self, **zone_change):
         zones = dict(ARGS["zones"], family=dict(FAMILY, **zone_change))
         return dict(ARGS, zones=zones)
