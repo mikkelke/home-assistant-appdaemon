@@ -1,7 +1,9 @@
 # tests/test_heating_controller.py - HeatingController (shadow mode): wiring, publishing, the
-# decision log, forecast handling, the plan end to end and the state file. Same __new__ +
-# monkeypatched-callables harness as test_salus_health.py, with a small fake Home Assistant
-# behind get_state. The planning rules themselves are tested in test_heating_plan.py.
+# decision log, forecast handling, the plan end to end, the nudge buttons, helper and thermostat
+# signals, the alerts and the state file. Same __new__ + monkeypatched-callables harness as
+# test_salus_health.py, with a small fake Home Assistant behind get_state. The planning rules
+# are tested in test_heating_plan.py, the signal rules in test_heating_signals.py and the alert
+# rules in test_heating_alerts.py.
 # Run from repo root: python3 -m unittest discover -s apps/climate/tests -q
 
 from __future__ import annotations
@@ -60,7 +62,13 @@ FEELS = {
     "guest_bathroom": ["sensor.guest_bathroom_feel"],
 }
 HOME_LAT, HOME_LON = 55.6841, 12.5666  # a made-up point in central Copenhagen
-# Helpers that exist in Home Assistant for this controller (increment 1).
+BUTTONS = {
+    ("kristines_room", "warmer"): "input_button.heating_kristines_room_warmer",
+    ("kristines_room", "colder"): "input_button.heating_kristines_room_colder",
+    ("claudias_room", "warmer"): "input_button.heating_claudias_room_warmer",
+    ("claudias_room", "colder"): "input_button.heating_claudias_room_colder",
+}
+# Helpers that exist in Home Assistant for this controller.
 HELPERS = {
     "input_boolean.heating_season",
     "input_boolean.heating_live",
@@ -73,7 +81,15 @@ HELPERS = {
     "input_datetime.heating_party_end",
     "input_number.heating_bedroom_ceiling",
     "input_boolean.party",
-}
+} | set(BUTTONS.values())
+# Home Assistant accounts. Kristine's person entity carries no user_id, so hers comes from the
+# yaml; AppDaemon's is the one the yaml ships.
+APP_ID = "f4fda494358943beaf8ad2c70db099f8"
+MIKKEL_ID = "11111111111111111111111111111111"
+CLAUDIA_ID = "33333333333333333333333333333333"
+KRISTINE_ID = "5bee78148825439488b70f92565e6c26"
+STRANGER_ID = "44444444444444444444444444444444"
+PRESS_TIME = "2026-10-01T10:00:00+00:00"
 
 
 def shipped_args(tmp: Path) -> dict:
@@ -161,6 +177,13 @@ def house(ha: FakeHA):
             ha.set(feel, "22.2", {"stale": "false", "sun_hit": "false", "window_open": "false"})
         ha.set(f"sensor.{zone}_floor_thermometer_temperature", "21.0")
     ha.set("sensor.living_room_floor_thermometer_temperature", "21.0")
+    ha.set("sensor.dining_room_floor_thermometer_temperature", "21.0")
+    ha.set("climate.living_room_thermostat", "off", {"current_temperature": 22.0})
+    ha.set("person.mikkel", "home", {"user_id": MIKKEL_ID})
+    ha.set("person.claudia", "home", {"user_id": CLAUDIA_ID})
+    ha.set("person.kristine", "home", {})
+    for button in BUTTONS.values():
+        ha.set(button, PRESS_TIME)
     for opening in (
         "binary_sensor.living_room_window_contact",
         "binary_sensor.kitchen_window_contact",
@@ -183,7 +206,9 @@ def house(ha: FakeHA):
 class Harness:
     """A HeatingController with initialize() run for real against the fake house."""
 
-    def __init__(self, testcase, args=None, clock=None, with_house=True, forecast=True):
+    def __init__(
+        self, testcase, args=None, clock=None, with_house=True, forecast=True, **overrides
+    ):
         self.tmp = Path(tempfile.mkdtemp(prefix="heating-test-"))
         testcase.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         testcase.addCleanup(self._close_tasks)
@@ -195,13 +220,15 @@ class Harness:
         self.published: list = []
         self.tasks: list = []
         self.urls: list = []
+        self.presses = 0
+        self.pushes_seen = 0
         self.notifier = MagicMock()
         self.notifier.notify = AsyncMock()
         self.payload = copy.deepcopy(FIXTURE)
         self.fetch_error = None
 
         app = hc.HeatingController.__new__(hc.HeatingController)
-        app.args = args if args is not None else shipped_args(self.tmp)
+        app.args = args if args is not None else {**shipped_args(self.tmp), **overrides}
         app.log = lambda msg, level="INFO", **kw: self.logs.append((level, msg))
         app.get_app = lambda name: self.notifier
         app.get_now = lambda: self.clock.now
@@ -281,6 +308,67 @@ class Harness:
         for coro in tasks:
             asyncio.run(coro)
 
+    def press(self, button, user_id=None, parent_id=None, old=None, new=None):
+        """A press of a nudge button, as the raw state_changed event Home Assistant fires."""
+        self.presses += 1
+        before = old if old is not None else self.ha.entities[button]["state"]
+        after = new if new is not None else f"{self.clock.now.isoformat()}#{self.presses}"
+        self.ha.set(button, after)
+        self.app._on_button(
+            "state_changed", self.event(button, before, after, user_id, parent_id), {}
+        )
+
+    def helper(self, entity, old, new, user_id=None, parent_id=None, attrs=None):
+        """A change of an input_* helper: the entity takes the new value, the event announces it."""
+        self.ha.set(entity, new, attrs)
+        self.app._on_helper("state_changed", self.event(entity, old, new, user_id, parent_id), {})
+
+    @staticmethod
+    def event(entity, old, new, user_id, parent_id):
+        return {
+            "entity_id": entity,
+            "old_state": None if old is None else {"state": str(old)},
+            "new_state": {
+                "state": str(new),
+                "context": {"id": "c", "user_id": user_id, "parent_id": parent_id},
+            },
+        }
+
+    def service_call(self, zone, service, user_id=None, parent_id=None, entity=None, **data):
+        """A climate service call as AppDaemon's call_service event hands it over."""
+        entity = entity or THERMOSTATS[zone]
+        self.app._on_service_call(
+            "call_service",
+            {
+                "domain": "climate",
+                "service": service,
+                "service_data": dict(data, entity_id=entity),
+                "metadata": {"context": {"id": "c", "user_id": user_id, "parent_id": parent_id}},
+            },
+            {},
+        )
+
+    def report(self, zone, state=None, **attrs):
+        """The thermostat reports a new state or attributes, as a state callback delivers it."""
+        entity = THERMOSTATS[zone]
+        current = self.ha.entities[entity]
+        self.ha.set(
+            entity, current["state"] if state is None else state, {**current["attributes"], **attrs}
+        )
+        self.app._on_state(entity, "all", None, copy.deepcopy(self.ha.entities[entity]), {})
+
+    def signals(self, zone=None):
+        return [r for r in self.log_lines("signal") if zone is None or r["zone"] == zone]
+
+    def effects(self, zone=None):
+        return [r["effect"] for r in self.signals(zone)]
+
+    def season(self, tick=True):
+        self.ha.set("input_boolean.heating_season", "on")
+        if tick:
+            self.tick()
+        return self
+
     def warnings(self):
         return [m for lvl, m in self.logs if lvl in ("WARNING", "ERROR")]
 
@@ -321,6 +409,21 @@ class ShippedYaml(unittest.TestCase):
         self.assertEqual(self.cfg.bedroom.morning_offset_c, 0.5)
         self.assertEqual(self.cfg.bedroom.release_below_c, 20.5)
 
+    def test_the_signal_and_alert_settings_ship_with_the_decided_numbers(self):
+        cfg = self.cfg
+        self.assertEqual((cfg.owner, cfg.notify_target), ("mikkel", "mikkel"))
+        self.assertEqual(cfg.appdaemon_user_id, APP_ID)
+        self.assertEqual(cfg.user_ids, {KRISTINE_ID: "kristine"})
+        self.assertEqual((cfg.supply_temp_entity, cfg.return_temp_entity), ("", ""))
+        self.assertEqual(cfg.living_monitor_entity, "climate.living_room_thermostat")
+        self.assertEqual(cfg.alerts, hp.AlertConfig())
+        floors = {n: zc.evenness_floors for n, zc in cfg.zones.items() if zc.evenness_floors}
+        self.assertEqual(floors, {"family": (LIVING_FLOOR, DINING_FLOOR)})
+        residents = {n: zc.residents for n, zc in cfg.zones.items() if zc.residents}
+        self.assertEqual(
+            residents, {"kristines_room": ("kristine",), "claudias_room": ("claudia",)}
+        )
+
     def test_family_profile_is_minus_half_nights_and_mornings_plus_half_evenings(self):
         periods = {(p.start, p.end): p.offset for p in self.cfg.zones["family"].profile.periods}
         self.assertEqual(periods, {(23 * 60, 10 * 60): -0.5, (17 * 60, 23 * 60): 0.5})
@@ -347,7 +450,9 @@ class ShippedYaml(unittest.TestCase):
         wanted.update(
             [self.cfg.party.start_entity, self.cfg.party.end_entity, self.cfg.party.switch_entity]
         )
-        self.assertLessEqual(wanted, HELPERS)
+        buttons = {e for zc in self.cfg.zones.values() for e in zc.buttons.values()}
+        self.assertEqual(buttons, set(BUTTONS.values()))
+        self.assertLessEqual(wanted | buttons, HELPERS)
 
     def test_no_coordinates_or_secrets_in_the_yaml(self):
         text = (APPS / "heating_controller.yaml").read_text()
@@ -401,7 +506,24 @@ class Initialize(unittest.TestCase):
         self.assertIn((h.app._tick, "now+30", 300), every)
         self.assertIn((h.app._fetch_forecast, "now+5", 3600), every)
         h.app.run_daily.assert_called_once_with(h.app._daily_rollup, "03:00:00")
-        h.app.listen_event.assert_called_once_with(h.app._on_plugin_started, "plugin_started")
+        events = [(c.args[0], c.args[1], c.kwargs) for c in h.app.listen_event.call_args_list]
+        self.assertIn((h.app._on_plugin_started, "plugin_started", {}), events)
+        self.assertIn((h.app._on_service_call, "call_service", {"domain": "climate"}), events)
+        for button in BUTTONS.values():
+            self.assertIn((h.app._on_button, "state_changed", {"entity_id": button}), events)
+        owned = {e["entity_id"] for cb, name, e in events if cb == h.app._on_helper}
+        self.assertEqual(
+            owned,
+            {
+                "input_boolean.heating_season",
+                "input_number.heating_bedroom_ceiling",
+                "input_boolean.party",
+                "input_datetime.heating_party_start",
+                "input_datetime.heating_party_end",
+            }
+            | {f"input_number.heating_target_{z}" for z in ZONES},
+        )
+        self.assertEqual(len(events), 1 + 1 + len(BUTTONS) + len(owned))
         self.assertTrue(any("shadow mode" in m for _lvl, m in h.logs))
 
     def test_a_bad_config_logs_an_error_and_starts_nothing(self):
@@ -1494,6 +1616,1100 @@ class Publishing(unittest.TestCase):
         h.app.set_state = boom
         h.tick()
         self.assertTrue(any("publish failed" in m for m in h.warnings()))
+
+
+LIVING_FLOOR = "sensor.living_room_floor_thermometer_temperature"
+DINING_FLOOR = "sensor.dining_room_floor_thermometer_temperature"
+KRISTINE_WARMER = BUTTONS[("kristines_room", "warmer")]
+KRISTINE_COLDER = BUTTONS[("kristines_room", "colder")]
+CLAUDIA_WARMER = BUTTONS[("claudias_room", "warmer")]
+CLAUDIA_COLDER = BUTTONS[("claudias_room", "colder")]
+KRISTINE_TARGET = "input_number.heating_target_kristines_room"
+
+
+class NudgeButtons(unittest.TestCase):
+    def setUp(self):
+        self.h = Harness(self).season()
+
+    def nudge(self, zone="kristines_room"):
+        return self.h.app._zones[zone].nudge
+
+    def test_a_press_moves_the_residents_nudge_and_the_plan(self):
+        h = self.h
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        self.assertEqual(self.nudge(), 0.5)
+        h.app.run_in.assert_called_with(h.app._evaluate_pending, 2)
+        h.app._evaluate_pending({})
+        a = h.attrs("kristines_room")
+        self.assertEqual(
+            (a["nudge"], a["setpoint_now"], a["profile_offset"]), ("+0.5", 22.0, "+0.0")
+        )
+        self.assertEqual(h.zone("kristines_room")["state"], 22.0)
+        self.assertEqual(
+            a["last_signal"],
+            {
+                "at": "2026-10-17T12:00:00+02:00",
+                "who": "kristine",
+                "source": "button",
+                "direction": "warmer",
+                "effect": "nudge",
+            },
+        )
+        d = [r for r in h.log_lines("decision") if r["zone"] == "kristines_room"][-1]
+        self.assertEqual((d["gate"], d["would_write"], d["nudge"]), ("priority:nudge", True, 0.5))
+        self.assertEqual(h.attrs("claudias_room")["nudge"], "+0.0")
+
+    def test_the_press_is_logged_and_kept_on_disk_at_once(self):
+        h = self.h
+        h.press(KRISTINE_COLDER, KRISTINE_ID)
+        (rec,) = h.signals("kristines_room")
+        self.assertEqual(rec["type"], "signal")
+        self.assertEqual(
+            {k: rec[k] for k in ("kind", "source", "who", "direction", "effect", "nudge")},
+            {
+                "kind": "button",
+                "source": "button",
+                "who": "kristine",
+                "direction": -1,
+                "effect": "nudge",
+                "nudge": [0.0, -0.5],
+            },
+        )
+        saved = json.loads((h.tmp / "state.json").read_text())
+        self.assertEqual(saved["zones"]["kristines_room"]["nudge"], -0.5)
+        self.assertEqual(saved["zones"]["kristines_room"]["nudge_dir"], -1)
+        self.assertEqual(saved["signals"][-1]["effect"], "nudge")
+
+    def test_presses_in_one_direction_within_five_minutes_are_one_step(self):
+        h = self.h
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        h.clock.advance(minutes=4)
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        self.assertEqual(
+            h.effects("kristines_room"), ["nudge", "nudge_collapsed", "nudge_collapsed"]
+        )
+        self.assertEqual(self.nudge(), 0.5)
+        h.clock.advance(minutes=2)
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        self.assertEqual(self.nudge(), 1.0)
+
+    def test_a_press_the_other_way_is_a_new_step(self):
+        h = self.h
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        h.press(KRISTINE_COLDER, KRISTINE_ID)
+        self.assertEqual(h.effects("kristines_room"), ["nudge", "nudge"])
+        self.assertEqual(self.nudge(), 0.0)
+
+    def test_the_nudge_stops_at_its_bounds_in_both_directions(self):
+        h = self.h
+        for _ in range(4):
+            h.press(KRISTINE_WARMER, KRISTINE_ID)
+            h.clock.advance(minutes=6)
+        self.assertEqual(
+            h.effects("kristines_room"), ["nudge", "nudge", "nudge_limit", "nudge_limit"]
+        )
+        self.assertEqual(self.nudge(), 1.0)
+        h.app._evaluate_pending({})
+        self.assertEqual(h.attrs("kristines_room")["setpoint_now"], 22.5)
+        for _ in range(6):
+            h.press(KRISTINE_COLDER, KRISTINE_ID)
+            h.clock.advance(minutes=6)
+        self.assertEqual(self.nudge(), -1.0)
+        self.assertEqual(h.effects("kristines_room")[-1], "nudge_limit")
+
+    def test_only_the_rooms_resident_and_the_owner_may_press(self):
+        cases = [
+            (MIKKEL_ID, None, "nudge", "mikkel"),
+            (CLAUDIA_ID, None, "ignored", "claudia"),
+            (STRANGER_ID, None, "ignored", "unknown"),
+            (APP_ID, None, "ignored", "appdaemon"),
+            (None, "automation-context", "ignored", "automation"),
+            (None, None, "ignored", "unknown"),
+        ]
+        for user, parent, effect, who in cases:
+            h = Harness(self).season()
+            h.press(KRISTINE_WARMER, user, parent)
+            (rec,) = h.signals("kristines_room")
+            self.assertEqual((rec["effect"], rec["who"]), (effect, who), (user, parent))
+            self.assertEqual(
+                h.app._zones["kristines_room"].nudge, 0.5 if effect == "nudge" else 0.0
+            )
+
+    def test_claudias_buttons_move_claudias_nudge_and_hers_only(self):
+        h = self.h
+        h.press(CLAUDIA_COLDER, CLAUDIA_ID)
+        self.assertEqual((self.nudge("claudias_room"), self.nudge()), (-0.5, 0.0))
+        h.press(CLAUDIA_WARMER, KRISTINE_ID)
+        self.assertEqual(h.effects("claudias_room"), ["nudge", "ignored"])
+        self.assertEqual(self.nudge("claudias_room"), -0.5)
+
+    def test_each_room_has_its_own_five_minute_window(self):
+        h = self.h
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        h.press(CLAUDIA_WARMER, CLAUDIA_ID)
+        self.assertEqual((self.nudge(), self.nudge("claudias_room")), (0.5, 0.5))
+
+    def test_the_first_press_of_a_button_nobody_has_pressed_counts(self):
+        h = self.h
+        h.ha.set(KRISTINE_WARMER, "unknown")
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        self.assertEqual(self.nudge(), 0.5)
+        self.assertEqual(h.effects("kristines_room"), ["nudge"])
+
+    def test_an_entity_coming_back_after_a_restart_is_not_a_press(self):
+        h = self.h
+        for old, new in (
+            ("unavailable", PRESS_TIME),
+            ("unavailable", "unknown"),
+            (PRESS_TIME, "unavailable"),
+            (PRESS_TIME, "unknown"),
+        ):
+            h.press(KRISTINE_WARMER, KRISTINE_ID, old=old, new=new)
+        h.app._on_button(
+            "state_changed", h.event(KRISTINE_WARMER, None, PRESS_TIME, KRISTINE_ID, None), {}
+        )
+        h.app._on_button(
+            "state_changed", h.event(KRISTINE_WARMER, PRESS_TIME, PRESS_TIME, KRISTINE_ID, None), {}
+        )
+        self.assertEqual(h.signals(), [])
+        self.assertEqual(self.nudge(), 0.0)
+
+    def test_junk_events_do_nothing_and_raise_nothing(self):
+        h = self.h
+        for data in (
+            None,
+            {},
+            {"entity_id": KRISTINE_WARMER},
+            {"entity_id": KRISTINE_WARMER, "old_state": "x", "new_state": "y"},
+            {
+                "entity_id": "input_button.other",
+                "old_state": {"state": "a"},
+                "new_state": {"state": "b"},
+            },
+        ):
+            h.app._on_button("state_changed", data, {})
+        self.assertEqual((h.signals(), self.nudge()), ([], 0.0))
+        self.assertEqual([m for lvl, m in h.logs if lvl == "ERROR"], [])
+
+    def test_the_buttons_are_the_four_the_yaml_names(self):
+        h = self.h
+        self.assertEqual(h.app._buttons.keys(), set(BUTTONS.values()))
+        self.assertEqual(h.app._buttons[CLAUDIA_COLDER], ("claudias_room", -1))
+        self.assertEqual(h.app._buttons[KRISTINE_WARMER], ("kristines_room", 1))
+
+    def test_a_missing_button_is_one_warning_each_and_the_app_carries_on(self):
+        h = Harness(self, with_house=False, forecast=False)
+        warned = [m for m in h.warnings() if "not known to AppDaemon" in m]
+        self.assertEqual(len(warned), len(BUTTONS))
+        self.assertTrue(all(any(b in m for m in warned) for b in BUTTONS.values()))
+        listened = [
+            c.kwargs["entity_id"]
+            for c in h.app.listen_event.call_args_list
+            if c.args[0] == h.app._on_button
+        ]
+        self.assertEqual(sorted(listened), sorted(BUTTONS.values()))
+        house(h.ha)
+        h.season()
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        self.assertEqual(h.app._zones["kristines_room"].nudge, 0.5)
+        self.assertEqual(
+            len([m for m in h.warnings() if "not known to AppDaemon" in m]), len(BUTTONS)
+        )
+
+    def test_a_state_store_that_raises_for_a_new_entity_does_not_stop_the_wiring(self):
+        h = Harness(self, forecast=False)
+
+        def boom(*args, **kw):
+            raise RuntimeError("not found")
+
+        h.app.get_state = boom
+        h.app.listen_event.reset_mock()
+        h.app._wire_events()
+        self.assertEqual(
+            len(h.app.listen_event.call_args_list), 1 + 1 + len(BUTTONS) + len(h.app._owned)
+        )
+
+
+class TargetHelpers(unittest.TestCase):
+    def setUp(self):
+        self.h = Harness(self).season()
+
+    def test_the_owner_changing_a_residents_target_resets_her_nudge(self):
+        h = self.h
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        h.helper(KRISTINE_TARGET, 21.5, 22.0, MIKKEL_ID)
+        rt = h.app._zones["kristines_room"]
+        self.assertEqual((rt.nudge, rt.nudge_at, rt.nudge_dir), (0.0, None, 0))
+        rec = h.signals("kristines_room")[-1]
+        self.assertEqual(
+            (rec["kind"], rec["source"], rec["who"], rec["direction"], rec["effect"]),
+            ("target", "ha", "mikkel", 1, "nudge_reset"),
+        )
+        self.assertEqual(rec["nudge"], [0.5, 0.0])
+        h.app._evaluate_pending({})
+        a = h.attrs("kristines_room")
+        self.assertEqual((a["base_target"], a["nudge"], a["setpoint_now"]), (22.0, "+0.0", 22.0))
+        saved = json.loads((h.tmp / "state.json").read_text())
+        self.assertEqual(saved["zones"]["kristines_room"]["nudge"], 0.0)
+
+    def test_a_reset_lets_the_next_press_count_at_once(self):
+        h = self.h
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        h.helper(KRISTINE_TARGET, 21.5, 22.0, MIKKEL_ID)
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        self.assertEqual(h.app._zones["kristines_room"].nudge, 0.5)
+
+    def test_the_owner_changing_a_target_with_no_nudge_just_sets_it(self):
+        h = self.h
+        h.helper(KRISTINE_TARGET, 21.5, 22.0, MIKKEL_ID)
+        h.helper("input_number.heating_target_family", 21.5, 21.0, MIKKEL_ID)
+        self.assertEqual(h.effects(), ["target_set", "target_set"])
+        self.assertEqual([r["direction"] for r in h.signals()], [1, -1])
+        h.tick(minutes=1)
+        self.assertEqual(h.zone("family")["state"], 21.0)
+
+    def test_somebody_else_changing_a_target_is_logged_as_a_revert_that_is_not_performed(self):
+        h = self.h
+        h.helper("input_number.heating_target_family", 21.5, 24.0, KRISTINE_ID)
+        (rec,) = h.signals("family")
+        self.assertEqual(
+            (rec["effect"], rec["who"], rec["old"], rec["new"], rec["revert_to"]),
+            ("would_revert", "kristine", "21.5", "24.0", "21.5"),
+        )
+        h.tick(minutes=1)
+        self.assertEqual(h.zone("family")["state"], 24.0)
+        for name in ("call_service", "turn_on", "turn_off", "toggle", "select_option", "set_value"):
+            getattr(h.app, name).assert_not_called()
+
+    def test_every_kind_of_stranger_would_be_reverted_but_an_app_or_the_house_would_not(self):
+        cases = [
+            (CLAUDIA_ID, None, "would_revert"),
+            (STRANGER_ID, None, "would_revert"),
+            (None, "automation-context", "would_revert"),
+            (APP_ID, None, "target_set"),
+            (None, None, "target_set"),
+        ]
+        for user, parent, effect in cases:
+            h = Harness(self).season()
+            h.helper("input_number.heating_target_family", 21.5, 22.5, user, parent)
+            self.assertEqual(h.effects("family"), [effect], (user, parent))
+
+    def test_an_app_changing_a_residents_target_leaves_her_nudge_alone(self):
+        h = self.h
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        h.helper(KRISTINE_TARGET, 21.5, 22.0, APP_ID)
+        self.assertEqual(h.app._zones["kristines_room"].nudge, 0.5)
+        self.assertEqual(h.effects("kristines_room"), ["nudge", "target_set"])
+
+    def test_the_other_owned_helpers_are_only_watched_for_strangers(self):
+        h = self.h
+        h.helper("input_boolean.heating_season", "on", "off", MIKKEL_ID)
+        h.helper("input_boolean.heating_season", "off", "on", APP_ID)
+        self.assertEqual(h.signals(), [])
+        h.helper("input_boolean.party", "off", "on", KRISTINE_ID)
+        h.helper("input_number.heating_bedroom_ceiling", 21.0, 24.0, None, "automation-context")
+        recs = h.signals()
+        self.assertEqual(
+            [(r["zone"], r["kind"], r["effect"]) for r in recs],
+            [(None, "helper", "would_revert")] * 2,
+        )
+        self.assertEqual(
+            [r["entity"] for r in recs],
+            ["input_boolean.party", "input_number.heating_bedroom_ceiling"],
+        )
+
+    def test_a_helper_coming_back_after_a_restart_is_not_a_change(self):
+        h = self.h
+        h.helper("input_number.heating_target_family", "unavailable", 21.5, KRISTINE_ID)
+        h.helper("input_number.heating_target_family", 21.5, "unknown", KRISTINE_ID)
+        h.helper("input_number.heating_target_family", None, 21.5, KRISTINE_ID)
+        h.helper("input_number.heating_target_family", 21.5, 21.5, KRISTINE_ID)
+        self.assertEqual(h.signals(), [])
+
+    def test_junk_events_do_nothing_and_raise_nothing(self):
+        h = self.h
+        for data in (
+            None,
+            {},
+            {"entity_id": "input_number.heating_target_family"},
+            {"old_state": 1, "new_state": 2},
+        ):
+            h.app._on_helper("state_changed", data, {})
+        self.assertEqual(h.signals(), [])
+        self.assertEqual([m for lvl, m in h.logs if lvl == "ERROR"], [])
+
+
+class ThermostatChanges(unittest.TestCase):
+    def setUp(self):
+        self.h = Harness(self).season()
+
+    def one(self, zone="kristines_room"):
+        (rec,) = self.h.signals(zone)
+        return rec
+
+    def test_a_keypad_change_in_a_residents_room_is_her_nudge(self):
+        h = self.h
+        h.report("kristines_room", temperature=15.5)
+        rec = self.one()
+        self.assertEqual(
+            {
+                k: rec[k]
+                for k in ("kind", "source", "who", "direction", "effect", "old", "new", "nudge")
+            },
+            {
+                "kind": "setpoint",
+                "source": "keypad",
+                "who": "kristine",
+                "direction": 1,
+                "effect": "nudge",
+                "old": 15.0,
+                "new": 15.5,
+                "nudge": [0.0, 0.5],
+            },
+        )
+        self.assertEqual(h.app._zones["kristines_room"].nudge, 0.5)
+        saved = json.loads((h.tmp / "state.json").read_text())
+        self.assertEqual(saved["zones"]["kristines_room"]["nudge"], 0.5)
+        h.app._evaluate_pending({})
+        self.assertEqual(h.attrs("kristines_room")["setpoint_now"], 22.0)
+
+    def test_the_size_of_a_keypad_change_does_not_matter_only_its_direction(self):
+        h = self.h
+        h.report("claudias_room", temperature=5.0)
+        rec = self.one("claudias_room")
+        self.assertEqual((rec["direction"], rec["who"], rec["effect"]), (-1, "claudia", "nudge"))
+        self.assertEqual(h.app._zones["claudias_room"].nudge, -0.5)
+
+    def test_a_residents_own_change_through_home_assistant_is_her_nudge_too(self):
+        h = self.h
+        h.service_call("kristines_room", "set_temperature", KRISTINE_ID, temperature=14.0)
+        h.report("kristines_room", temperature=14.0)
+        rec = self.one()
+        self.assertEqual(
+            (rec["source"], rec["who"], rec["direction"], rec["effect"], rec["call"]),
+            ("ha", "kristine", -1, "nudge", "set_temperature"),
+        )
+        self.assertEqual(h.app._zones["kristines_room"].nudge, -0.5)
+
+    def test_the_owner_moving_a_thermostat_is_a_target_step_that_is_only_recorded(self):
+        h = self.h
+        h.service_call("kristines_room", "set_temperature", MIKKEL_ID, temperature=16.0)
+        h.report("kristines_room", temperature=16.0)
+        rec = self.one()
+        self.assertEqual(
+            (rec["source"], rec["who"], rec["effect"], rec["target_from"], rec["target_to"]),
+            ("ha", "mikkel", "would_set_target", 21.5, 22.0),
+        )
+        self.assertEqual(h.app._zones["kristines_room"].nudge, 0.0)
+        h.service_call("family", "set_temperature", MIKKEL_ID, temperature=14.0)
+        h.report("family", temperature=14.0)
+        rec = self.one("family")
+        self.assertEqual(
+            (rec["effect"], rec["target_from"], rec["target_to"]), ("would_set_target", 21.5, 21.0)
+        )
+        self.assertNotIn("nudge", rec)
+        h.tick(minutes=1)
+        self.assertEqual(h.zone("family")["state"], 21.5)
+        self.assertEqual(h.zone("kristines_room")["state"], 21.5)
+
+    def test_the_target_step_stays_inside_the_helpers_range(self):
+        h = self.h
+        h.ha.set(KRISTINE_TARGET, "22.0", {"min": 18, "max": 22})
+        h.service_call("kristines_room", "set_temperature", MIKKEL_ID, temperature=16.0)
+        h.report("kristines_room", temperature=16.0)
+        rec = self.one()
+        self.assertEqual((rec["target_from"], rec["target_to"]), (22.0, 22.0))
+
+    def test_an_automation_or_another_app_changing_a_setpoint_would_be_restored(self):
+        for user, parent, source, who in (
+            (None, "automation-context", "automation", "automation"),
+            (APP_ID, None, "app", "appdaemon"),
+        ):
+            h = Harness(self).season()
+            h.service_call("kristines_room", "set_temperature", user, parent, temperature=18.0)
+            h.report("kristines_room", temperature=18.0)
+            rec = self.one_of(h, "kristines_room")
+            self.assertEqual(
+                (rec["source"], rec["who"], rec["effect"]), (source, who, "would_restore")
+            )
+            self.assertEqual(h.app._zones["kristines_room"].nudge, 0.0)
+
+    @staticmethod
+    def one_of(h, zone):
+        (rec,) = h.signals(zone)
+        return rec
+
+    def test_a_keypad_change_on_the_shared_thermostat_would_be_restored(self):
+        h = self.h
+        h.report("family", temperature=22.0)
+        rec = self.one("family")
+        self.assertEqual(
+            (rec["source"], rec["who"], rec["effect"]), ("keypad", "unknown", "would_restore")
+        )
+
+    def test_a_resident_changing_another_zones_thermostat_would_be_restored(self):
+        h = self.h
+        h.service_call("claudias_room", "set_temperature", KRISTINE_ID, temperature=25.0)
+        h.report("claudias_room", temperature=25.0)
+        rec = self.one("claudias_room")
+        self.assertEqual(
+            (rec["source"], rec["who"], rec["effect"]), ("ha", "kristine", "would_restore")
+        )
+        self.assertEqual(h.app._zones["claudias_room"].nudge, 0.0)
+
+    def test_a_call_older_than_two_minutes_or_for_another_value_is_not_the_cause(self):
+        h = self.h
+        h.service_call("kristines_room", "set_temperature", MIKKEL_ID, temperature=16.0)
+        h.clock.advance(seconds=121)
+        h.report("kristines_room", temperature=16.0)
+        self.assertEqual(self.one()["source"], "keypad")
+        h2 = Harness(self).season()
+        h2.service_call("kristines_room", "set_temperature", MIKKEL_ID, temperature=20.0)
+        h2.report("kristines_room", temperature=16.0)
+        self.assertEqual(self.one_of(h2, "kristines_room")["source"], "keypad")
+
+    def test_a_mode_change_is_classified_by_who_made_it(self):
+        h = self.h
+        h.service_call("kristines_room", "set_hvac_mode", MIKKEL_ID, hvac_mode="off")
+        h.report("kristines_room", state="off")
+        h.report("claudias_room", state="off")
+        h.service_call("bathroom", "turn_off", KRISTINE_ID)
+        h.report("bathroom", state="off")
+        recs = {r["zone"]: r for r in h.signals()}
+        self.assertEqual(
+            {
+                z: (r["kind"], r["source"], r["who"], r["effect"], r["old"], r["new"])
+                for z, r in recs.items()
+            },
+            {
+                "kristines_room": ("mode", "ha", "mikkel", "off_by_owner", "heat", "off"),
+                "claudias_room": ("mode", "keypad", "claudia", "would_restore", "heat", "off"),
+                "bathroom": ("mode", "ha", "kristine", "would_restore", "heat", "off"),
+            },
+        )
+
+    def test_switching_back_on_is_noted_and_needs_nothing(self):
+        h = self.h
+        h.report("kristines_room", state="off")
+        h.report("kristines_room", state="heat")
+        self.assertEqual(h.effects("kristines_room"), ["would_restore", "none"])
+        self.assertEqual(h.app._zones["kristines_room"].nudge, 0.0)
+
+    def test_a_preset_change_is_classified_too(self):
+        h = self.h
+        h.ha.update_attrs(THERMOSTATS["kristines_room"], preset_mode="permanent_hold")
+        h.tick(minutes=5)
+        h.report("kristines_room", preset_mode="schedule")
+        rec = self.one()
+        self.assertEqual(
+            (rec["kind"], rec["source"], rec["effect"], rec["old"], rec["new"]),
+            ("preset", "keypad", "would_restore", "permanent_hold", "schedule"),
+        )
+
+    def test_what_changed_while_the_thermostat_was_gone_is_not_a_signal(self):
+        h = self.h
+        h.report("kristines_room", state="unavailable")
+        h.report("kristines_room", state="heat", temperature=17.0)
+        self.assertEqual(h.signals(), [])
+        h.report("kristines_room", temperature=17.5)
+        self.assertEqual(h.effects("kristines_room"), ["nudge"])
+
+    def test_a_report_that_changes_nothing_is_no_signal(self):
+        h = self.h
+        h.report("kristines_room", current_temperature=22.9)
+        h.report("kristines_room", temperature=15.0)
+        h.report("kristines_room", hvac_action="heating")
+        self.assertEqual(h.signals(), [])
+
+    def test_a_change_reported_twice_is_one_signal(self):
+        h = self.h
+        h.report("kristines_room", temperature=15.5)
+        h.report("kristines_room", temperature=15.5)
+        self.assertEqual(h.effects("kristines_room"), ["nudge"])
+
+    def test_a_button_press_and_a_keypad_change_in_one_burst_are_one_step(self):
+        h = self.h
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        h.clock.advance(minutes=2)
+        h.report("kristines_room", temperature=15.5)
+        self.assertEqual(h.effects("kristines_room"), ["nudge", "nudge_collapsed"])
+        self.assertEqual(h.app._zones["kristines_room"].nudge, 0.5)
+
+    def test_only_climate_calls_on_the_managed_thermostats_are_remembered(self):
+        h = self.h
+        h.service_call(
+            "family",
+            "set_temperature",
+            MIKKEL_ID,
+            entity="climate.bedroom_thermostat",
+            temperature=20,
+        )
+        self.assertEqual(len(h.app._calls), 0)
+        h.service_call("family", "set_temperature", MIKKEL_ID, temperature=20)
+        self.assertEqual(len(h.app._calls), 1)
+        for junk in (None, {}, {"service_data": []}, "x"):
+            h.app._on_service_call("call_service", junk, {})
+        self.assertEqual(len(h.app._calls), 1)
+        self.assertEqual([m for lvl, m in h.logs if lvl == "ERROR"], [])
+
+    def test_the_zone_sensor_shows_the_last_signal(self):
+        h = self.h
+        h.service_call(
+            "kristines_room", "set_temperature", None, "automation-context", temperature=18.0
+        )
+        h.report("kristines_room", temperature=18.0)
+        h.app._evaluate_pending({})
+        a = h.attrs("kristines_room")
+        self.assertEqual(
+            a["last_signal"],
+            {
+                "at": "2026-10-17T12:00:00+02:00",
+                "who": "automation",
+                "source": "automation",
+                "direction": "warmer",
+                "effect": "would_restore",
+            },
+        )
+        assert_publishable(self, a)
+        self.assertNotIn("last_signal", h.attrs("family"))
+
+    def test_a_signal_without_a_direction_leaves_it_out(self):
+        h = self.h
+        h.report("kristines_room", state="off")
+        h.app._evaluate_pending({})
+        self.assertNotIn("direction", h.attrs("kristines_room")["last_signal"])
+
+    def test_an_unreadable_identity_lookup_does_not_lose_the_signal(self):
+        h = self.h
+
+        def boom(entity, **kw):
+            if entity.startswith("person."):
+                raise RuntimeError("no such entity")
+            return h.ha.get_state(entity, **kw)
+
+        h.app.get_state = boom
+        h.app._identity_at = -10_000.0
+        h.report("kristines_room", temperature=15.5)
+        self.assertEqual(h.effects("kristines_room"), ["nudge"])
+
+    def test_who_an_account_is_comes_from_the_person_entities_and_the_yaml(self):
+        h = self.h
+        users = h.app._identity_for(h.clock.now.timestamp()).users
+        self.assertEqual(
+            users, {MIKKEL_ID: "mikkel", CLAUDIA_ID: "claudia", KRISTINE_ID: "kristine"}
+        )
+        h.ha.set("person.kristine", "home", {"user_id": STRANGER_ID})
+        h.clock.advance(minutes=11)
+        users = h.app._identity_for(h.clock.now.timestamp()).users
+        self.assertEqual(users[STRANGER_ID], "kristine")
+
+    def test_without_an_app_account_in_the_yaml_the_app_is_an_unknown_account(self):
+        h = Harness(self, appdaemon_user_id="").season()
+        self.assertTrue(any("appdaemon_user_id not configured" in m for m in h.warnings()))
+        h.service_call("kristines_room", "set_temperature", APP_ID, temperature=18.0)
+        h.report("kristines_room", temperature=18.0)
+        self.assertEqual(self.one_of(h, "kristines_room")["source"], "unknown")
+
+
+class SeasonStart(unittest.TestCase):
+    def pressed(self):
+        h = Harness(self)
+        h.tick()
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        h.press(CLAUDIA_COLDER, CLAUDIA_ID)
+        return h
+
+    def test_the_nudge_survives_the_season_and_resets_when_the_next_one_starts(self):
+        h = self.pressed()
+        h.tick(minutes=5)
+        self.assertEqual(
+            (h.app._zones["kristines_room"].nudge, h.app._zones["claudias_room"].nudge), (0.5, -0.5)
+        )
+        h.season()
+        for zone in ("kristines_room", "claudias_room"):
+            self.assertEqual(h.app._zones[zone].nudge, 0.0, zone)
+        resets = [r for r in h.signals() if r["kind"] == "season"]
+        self.assertEqual(
+            [(r["zone"], r["effect"], r["nudge"]) for r in resets],
+            [
+                ("kristines_room", "nudge_reset", [0.5, 0.0]),
+                ("claudias_room", "nudge_reset", [-0.5, 0.0]),
+            ],
+        )
+        h.app._evaluate_pending({})
+        self.assertEqual(h.attrs("kristines_room")["setpoint_now"], 21.5)
+
+    def test_a_season_that_is_already_on_when_the_app_starts_resets_nothing(self):
+        h = Harness(self)
+        h.season()
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        h.tick(minutes=5)
+        self.assertEqual(h.app._zones["kristines_room"].nudge, 0.5)
+
+    def test_a_state_that_does_not_remember_the_season_resets_nothing(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        args = shipped_args(tmp)
+        Path(args["state_file"]).write_text(
+            json.dumps({"zones": {"kristines_room": {"nudge": 0.5}}})
+        )
+        h = Harness(self, args=args, forecast=False).season()
+        h.tick(minutes=5)
+        self.assertEqual(h.app._zones["kristines_room"].nudge, 0.5)
+
+    def test_a_home_assistant_restart_is_not_a_new_season(self):
+        h = Harness(self).season()
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        h.ha.set("input_boolean.heating_season", "unavailable")
+        h.tick(minutes=5)
+        h.ha.set("input_boolean.heating_season", "on")
+        h.tick(minutes=5)
+        self.assertEqual(h.app._zones["kristines_room"].nudge, 0.5)
+
+    def test_a_season_that_started_while_the_app_was_down_is_noticed_after_the_restart(self):
+        h = self.pressed()
+        h.tick(minutes=5)
+        h2 = Harness(self, args=h.app.args, clock=h.clock, with_house=False, forecast=False)
+        h2.ha.entities = h.ha.entities
+        h2.season()
+        self.assertEqual(h2.app._zones["kristines_room"].nudge, 0.0)
+
+    def test_a_season_that_was_on_before_and_after_the_restart_resets_nothing(self):
+        h = Harness(self).season()
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        h.tick(minutes=5)
+        h2 = Harness(self, args=h.app.args, clock=h.clock, with_house=False, forecast=False)
+        h2.ha.entities = h.ha.entities
+        h2.tick(minutes=5)
+        self.assertEqual(h2.app._zones["kristines_room"].nudge, 0.5)
+
+
+class SignalState(unittest.TestCase):
+    def test_nudges_signals_and_the_window_survive_a_restart(self):
+        h = Harness(self).season()
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        h.service_call("claudias_room", "set_temperature", None, "p", temperature=18.0)
+        h.report("claudias_room", temperature=18.0)
+        h.tick(minutes=1)
+        h2 = Harness(self, args=h.app.args, clock=h.clock, with_house=False, forecast=False)
+        h2.ha.entities = h.ha.entities
+        rt = h2.app._zones["kristines_room"]
+        self.assertEqual((rt.nudge, rt.nudge_dir, rt.nudge_at is not None), (0.5, 1, True))
+        self.assertEqual(len(h2.app._signals), 2)
+        self.assertEqual(rt.last_signal["effect"], "nudge")
+        self.assertEqual(h2.app._zones["claudias_room"].last_signal["effect"], "would_restore")
+        self.assertIsNone(h2.app._zones["family"].last_signal)
+        h2.press(KRISTINE_WARMER, KRISTINE_ID)
+        self.assertEqual(h.effects("kristines_room")[-1], "nudge_collapsed")
+        h2.tick()
+        self.assertEqual(h2.attrs("kristines_room")["last_signal"]["effect"], "nudge_collapsed")
+
+    def test_only_the_last_fifty_signals_are_kept(self):
+        h = Harness(self).season()
+        for i in range(60):
+            h.clock.advance(minutes=6)
+            h.press(KRISTINE_WARMER if i % 2 == 0 else KRISTINE_COLDER, KRISTINE_ID)
+        self.assertEqual(len(h.app._signals), 50)
+        h.tick()
+        self.assertEqual(len(json.loads((h.tmp / "state.json").read_text())["signals"]), 50)
+
+    def test_junk_in_the_new_state_keys_is_survivable(self):
+        for junk in (
+            {"signals": "x", "alerts": 3, "season_on": "yes"},
+            {"signals": [1, "x", None], "alerts": [], "season_on": 1},
+            {"zones": {"kristines_room": {"nudge_at": "x", "nudge_dir": "up", "nudge": 0.5}}},
+            {"signals": [{"zone": "nowhere", "at": 1}], "alerts": {"runs": {"family": 5}}},
+        ):
+            tmp = Path(tempfile.mkdtemp())
+            self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+            args = shipped_args(tmp)
+            Path(args["state_file"]).write_text(json.dumps(junk))
+            h = Harness(self, args=args, forecast=False).season()
+            h.tick(minutes=5)
+            self.assertEqual(h.attrs("family")["mode"], "hold", junk)
+            self.assertEqual([m for lvl, m in h.logs if lvl == "ERROR"], [], junk)
+
+
+class AlertsEndToEnd(unittest.TestCase):
+    COLD = {"stale": "false", "sun_hit": "false", "window_open": "false"}
+
+    def pushes(self, h):
+        """The pushes since the last call: (title, message, target)."""
+        h.run_tasks()
+        calls = h.notifier.notify.await_args_list
+        fresh, h.pushes_seen = calls[h.pushes_seen :], len(calls)
+        return [(c.kwargs["title"], c.kwargs["message"], c.kwargs["target"]) for c in fresh]
+
+    def cold_kristine(self, h, value="18.4"):
+        h.ha.set("sensor.kristines_room_feel", value, self.COLD)
+
+    def test_a_cold_room_pushes_to_the_owner_after_half_an_hour(self):
+        h = Harness(self)
+        self.cold_kristine(h)
+        h.season()
+        for _ in range(5):
+            h.tick(minutes=5)
+        self.assertEqual(self.pushes(h), [])
+        h.tick(minutes=5)
+        self.assertEqual(
+            self.pushes(h),
+            [("Heating: cold room", "Kristines room 18.4 °C for 30 min (target 21.5)", "mikkel")],
+        )
+        self.assertEqual(
+            h.last("sensor.heating_controller")["attributes"]["alerts_active"],
+            ["cold:kristines_room"],
+        )
+        (rec,) = h.log_lines("alert")
+        self.assertEqual(
+            (rec["key"], rec["zone"], rec["event"]),
+            ("cold:kristines_room", "kristines_room", "start"),
+        )
+        self.assertEqual(rec["ts"], "2026-10-17T12:30:00+02:00")
+
+    def test_it_pushes_once_per_episode_and_clears_quietly(self):
+        h = Harness(self)
+        self.cold_kristine(h)
+        h.season()
+        for _ in range(20):
+            h.tick(minutes=5)
+        self.assertEqual(len(self.pushes(h)), 1)
+        self.cold_kristine(h, "20.2")
+        h.tick(minutes=5)
+        self.assertEqual(self.pushes(h), [])
+        self.assertEqual([r["event"] for r in h.log_lines("alert")], ["start", "clear"])
+        self.assertEqual(
+            h.last("sensor.heating_controller")["attributes"]["alerts_active"], ["<none>"]
+        )
+
+    def test_a_second_cold_spell_inside_six_hours_is_logged_but_not_pushed(self):
+        h = Harness(self)
+        self.cold_kristine(h)
+        h.season()
+        for _ in range(6):
+            h.tick(minutes=5)
+        self.assertEqual(len(self.pushes(h)), 1)
+        self.cold_kristine(h, "20.2")
+        h.tick(minutes=5)
+        self.cold_kristine(h, "18.4")
+        for _ in range(8):
+            h.tick(minutes=5)
+        self.assertEqual(self.pushes(h), [])
+        self.assertEqual(
+            [r["event"] for r in h.log_lines("alert")], ["start", "clear", "suppressed"]
+        )
+        self.assertEqual(
+            h.last("sensor.heating_controller")["attributes"]["alerts_active"],
+            ["cold:kristines_room"],
+        )
+
+    def test_nothing_is_pushed_in_a_normal_season_day(self):
+        h = Harness(self).season()
+        h.at(0, 0)
+        for _ in range(24 * 12):
+            h.tick()
+            h.clock.advance(minutes=5)
+        self.assertEqual(self.pushes(h), [])
+        self.assertEqual(h.log_lines("alert"), [])
+
+    def test_the_living_room_monitor_in_heat_is_reported_also_outside_the_season(self):
+        h = Harness(self)
+        h.ha.set("climate.living_room_thermostat", "heat", {"current_temperature": 22.0})
+        h.tick()
+        self.assertEqual(
+            self.pushes(h),
+            [
+                (
+                    "Heating: zone 8 in heat",
+                    "Zone 8 has no actuator: heat mode runs the pump",
+                    "mikkel",
+                )
+            ],
+        )
+        h.tick(minutes=5)
+        self.assertEqual(self.pushes(h), [])
+        h.ha.set("climate.living_room_thermostat", "off", {"current_temperature": 22.0})
+        h.tick(minutes=5)
+        self.assertEqual([r["event"] for r in h.log_lines("alert")], ["start", "clear"])
+
+    def test_a_monitor_that_is_not_configured_or_unreadable_says_nothing(self):
+        h = Harness(self)
+        h.ha.set("climate.living_room_thermostat", "unavailable")
+        h.tick()
+        self.assertEqual(self.pushes(h), [])
+        h2 = Harness(self, unmanaged={})
+        h2.ha.set("climate.living_room_thermostat", "heat")
+        h2.tick()
+        self.assertEqual(self.pushes(h2), [])
+
+    def test_no_supply_clamp_configured_means_nothing_reads_it_and_nothing_is_said(self):
+        h = Harness(self)
+        asked = []
+        original = h.app.get_state
+        h.app.get_state = lambda entity_id=None, **kw: (
+            asked.append(entity_id),
+            original(entity_id, **kw),
+        )[1]
+        h.ha.set(
+            THERMOSTATS["bathroom"],
+            "heat",
+            {"current_temperature": 22.8, "temperature": 15.0, "hvac_action": "heating"},
+        )
+        h.season()
+        for _ in range(8):
+            h.tick(minutes=5)
+        self.assertNotIn("", asked)
+        self.assertEqual(self.pushes(h), [])
+        stats = h.app._house["2026-10-17"]
+        self.assertNotIn("supply", stats)
+        self.assertNotIn("return", stats)
+
+    def test_a_cold_supply_while_a_zone_calls_pushes_when_a_clamp_is_configured(self):
+        h = Harness(self, supply_temp_entity="sensor.supply", return_temp_entity="sensor.return")
+        h.ha.set("sensor.supply", "24.0")
+        h.ha.set("sensor.return", "22.0")
+        h.ha.set(
+            THERMOSTATS["bathroom"],
+            "heat",
+            {"current_temperature": 22.8, "temperature": 15.0, "hvac_action": "heating"},
+        )
+        h.season()
+        for _ in range(5):
+            h.tick(minutes=5)
+        self.assertEqual(self.pushes(h), [])
+        h.tick(minutes=5)
+        self.assertEqual(
+            self.pushes(h),
+            [("Heating: no hot water", "No hot water from the building (supply 24 °C)", "mikkel")],
+        )
+        stats = h.app._house["2026-10-17"]
+        self.assertEqual((stats["supply"][1], stats["return"][1]), (7, 7))
+        self.assertEqual(stats["supply"][0] / 7, 24.0)
+
+    def test_a_clamp_reading_that_is_nonsense_is_ignored(self):
+        h = Harness(self, supply_temp_entity="sensor.supply")
+        h.ha.set(
+            THERMOSTATS["bathroom"],
+            "heat",
+            {"current_temperature": 22.8, "temperature": 15.0, "hvac_action": "heating"},
+        )
+        for value in ("unavailable", "-300", "999", "abc"):
+            h.ha.set("sensor.supply", value)
+            self.assertIsNone(h.app._clamp_temp("sensor.supply"), value)
+        h.ha.set("sensor.supply", "45.5")
+        self.assertEqual(h.app._clamp_temp("sensor.supply"), 45.5)
+
+    def test_a_pump_that_is_off_while_a_zone_calls_for_four_hours_pushes(self):
+        h = Harness(self)
+        h.ha.set("sensor.floor_heating_relay_power", "1.6")
+        h.season(tick=False)
+        for i in range(49):
+            h.ha.set(
+                THERMOSTATS["bathroom"],
+                "heat",
+                {"current_temperature": 22.8, "temperature": 15.0, "hvac_action": "heating"},
+            )
+            h.ha.set(
+                "sensor.bathroom_floor_thermometer_temperature", str(round(20.0 + 0.05 * i, 2))
+            )
+            h.tick()
+            h.clock.advance(minutes=5)
+        self.assertEqual(
+            self.pushes(h),
+            [("Heating: pump off", "Bathroom has called 4 h, wiring-centre pump is off", "mikkel")],
+        )
+
+    def test_three_uneven_nights_push_the_floor_alert(self):
+        clock = Clock(datetime(2026, 10, 17, 2, 0, tzinfo=TZ))
+        h = Harness(self, clock=clock)
+        h.season(tick=False)
+        for day in (17, 18, 19):
+            h.at(2, 0, day=day)
+            h.fetch()
+            while h.clock.now.hour < 6:
+                h.ha.set(LIVING_FLOOR, "20.0")
+                h.ha.set(DINING_FLOOR, "21.8")
+                h.tick()
+                h.clock.advance(minutes=5)
+            h.tick()
+            if day < 19:
+                self.assertEqual(self.pushes(h), [], day)
+        self.assertEqual(
+            self.pushes(h),
+            [("Heating: uneven floors", "Living/dining floors uneven: 1.8 °C", "mikkel")],
+        )
+
+    def test_a_zone_without_room_temperature_for_three_hours_pushes(self):
+        h = Harness(self)
+        for feel in FEELS["family"]:
+            h.ha.set(feel, "unavailable")
+        old = h.clock.now - timedelta(minutes=200)
+        h.ha.set(
+            THERMOSTATS["family"],
+            "heat",
+            {"current_temperature": 22.8, "temperature": 15.0},
+            updated=old,
+        )
+        h.ha.set(LIVING_FLOOR, "21.0", updated=old)
+        h.season()
+        self.assertEqual(h.attrs("family")["mode"], "fallback")
+        for _ in range(35):
+            h.tick(minutes=5)
+        self.assertEqual(self.pushes(h), [])
+        h.tick(minutes=5)
+        self.assertEqual(
+            self.pushes(h),
+            [
+                (
+                    "Heating: no room temperature",
+                    "Family has no usable room temperature and runs on its constant target",
+                    "mikkel",
+                )
+            ],
+        )
+
+    def test_a_forecast_that_has_gone_stale_pushes_once(self):
+        h = Harness(self).season()
+        h.at(23, 55)
+        h.tick()
+        self.assertEqual(self.pushes(h), [])
+        h.at(0, 5, day=18)
+        h.tick()
+        self.assertEqual(
+            self.pushes(h),
+            [
+                (
+                    "Heating: forecast stale",
+                    "The forecast is stale: no sun cuts until it is refreshed",
+                    "mikkel",
+                )
+            ],
+        )
+        h.tick(minutes=5)
+        self.assertEqual(self.pushes(h), [])
+        h.fetch()
+        h.tick(minutes=5)
+        self.assertEqual(
+            h.last("sensor.heating_controller")["attributes"]["alerts_active"], ["<none>"]
+        )
+
+    def test_no_forecast_at_all_is_stale_after_twelve_hours_not_before(self):
+        h = Harness(self, forecast=False).season()
+        h.tick(minutes=11 * 60)
+        self.assertEqual(self.pushes(h), [])
+        h.tick(minutes=61)
+        self.assertEqual(
+            [m for _t, m, _g in self.pushes(h)],
+            ["The forecast is stale: no sun cuts until it is refreshed"],
+        )
+
+    def test_every_push_goes_to_the_owner_only(self):
+        h = Harness(self)
+        self.cold_kristine(h)
+        h.ha.set("climate.living_room_thermostat", "heat")
+        h.ha.set("input_boolean.party", "on")
+        h.season()
+        for _ in range(8):
+            h.tick(minutes=5)
+        pushes = self.pushes(h)
+        self.assertGreaterEqual(len(pushes), 2)
+        self.assertEqual({target for _t, _m, target in pushes}, {"mikkel"})
+
+    def test_alert_episodes_survive_a_restart_without_a_second_push(self):
+        h = Harness(self)
+        self.cold_kristine(h)
+        h.season()
+        for _ in range(6):
+            h.tick(minutes=5)
+        self.assertEqual(len(self.pushes(h)), 1)
+        h2 = Harness(self, args=h.app.args, clock=h.clock, with_house=False, forecast=False)
+        h2.ha.entities = h.ha.entities
+        for _ in range(4):
+            h2.tick(minutes=5)
+        self.assertEqual(self.pushes(h2), [])
+        self.assertEqual(h2.app._alerts.active(), ["cold:kristines_room"])
+
+    def test_a_failing_push_is_only_a_warning(self):
+        h = Harness(self)
+        h.notifier.notify = AsyncMock(side_effect=RuntimeError("no phone"))
+        h.ha.set("climate.living_room_thermostat", "heat")
+        h.tick()
+        h.run_tasks()
+        self.assertTrue(any("push failed" in m for m in h.warnings()))
+        self.assertEqual(h.app._alerts.active(), ["zone8_heat"])
+
+    def test_event_driven_evaluations_do_not_feed_the_alerts(self):
+        h = Harness(self)
+        h.ha.set("climate.living_room_thermostat", "heat")
+        h.app._evaluate_pending({})
+        self.assertEqual(h.log_lines("alert"), [])
+        h.tick()
+        self.assertEqual(len(h.log_lines("alert")), 1)
+
+    def test_the_log_lines_for_alerts_are_ascii_safe(self):
+        h = Harness(self)
+        self.cold_kristine(h)
+        h.season()
+        for _ in range(7):
+            h.tick(minutes=5)
+        for _lvl, msg in h.logs:
+            msg.encode("ascii")
+        for f in (h.tmp / "heating_log").glob("*"):
+            f.read_text().encode("ascii")
+
+
+class EverythingStaysShadow(unittest.TestCase):
+    def test_signals_and_alerts_never_call_a_service(self):
+        h = Harness(self)
+        h.ha.set("climate.living_room_thermostat", "heat")
+        h.ha.set("sensor.kristines_room_feel", "18.4", {"stale": "false", "sun_hit": "false"})
+        h.season()
+        h.press(KRISTINE_WARMER, KRISTINE_ID)
+        h.press(CLAUDIA_COLDER, STRANGER_ID)
+        h.helper("input_number.heating_target_family", 21.5, 23.0, KRISTINE_ID)
+        h.helper(KRISTINE_TARGET, 21.5, 22.0, MIKKEL_ID)
+        h.service_call("kristines_room", "set_temperature", MIKKEL_ID, temperature=16.0)
+        h.report("kristines_room", temperature=16.0)
+        h.report("claudias_room", state="off")
+        h.report("family", temperature=23.0)
+        for _ in range(10):
+            h.tick(minutes=5)
+        self.assertGreaterEqual(len(h.signals()), 6)
+        self.assertTrue(h.app._alerts.active())
+        for name in (
+            "call_service",
+            "turn_on",
+            "turn_off",
+            "toggle",
+            "select_option",
+            "set_value",
+            "set_textvalue",
+        ):
+            getattr(h.app, name).assert_not_called()
+        self.assertEqual(h.last("sensor.heating_controller")["state"], "shadow")
+        self.assertEqual(
+            h.last("sensor.heating_controller")["attributes"]["zones_live"], ["<none>"]
+        )
+
+    def test_the_controller_names_no_service_to_call(self):
+        lines = (APPS / "heating_controller.py").read_text().splitlines()
+        self.assertEqual([ln for ln in lines if "call_service" in ln], [])
+        for needle in (
+            "set_temperature",
+            "set_hvac_mode",
+            "set_preset_mode",
+            "number.set_value",
+            "climate/",
+        ):
+            self.assertEqual([ln for ln in lines if needle in ln], [], needle)
+
+    def test_the_new_modules_import_nothing_that_could_write(self):
+        for name in ("heating_signals.py", "heating_alerts.py"):
+            source = (APPS / name).read_text()
+            self.assertIsNone(
+                re.search(r"^\s*(import|from)\s+(appdaemon|requests|os|subprocess)", source, re.M),
+                name,
+            )
 
 
 if __name__ == "__main__":

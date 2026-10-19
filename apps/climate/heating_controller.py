@@ -4,21 +4,36 @@ would write. SHADOW ONLY: this app has no write path. It never calls a climate, 
 or input service, so a thermostat can only ever receive a setpoint from somebody else. Its
 outputs are the sensors it publishes, the decision log and its own state file.
 
-The planning rules live in heating_plan.py and the weather side in heating_forecast.py; this
-file reads Home Assistant, runs those rules and publishes the result.
+The planning rules live in heating_plan.py, the weather side in heating_forecast.py, the rules
+for who changed what in heating_signals.py and the plant alerts in heating_alerts.py; this file
+reads Home Assistant, runs those rules and publishes the result.
+
+Signals: a thermostat setpoint, mode or preset change is attributed from the service calls the
+app sees on the thermostats; the four nudge buttons and the helpers the owner owns are read from
+raw state-change events, which carry the context that names the human. A resident's nudge moves
+the plan. Everything the live controller would do about a change (restore a setpoint, revert a
+helper, move a target) is only recorded.
+
+Alerts go to the owner only, through MobileNotifier. They cover the physical plant and run in
+shadow too.
 
 Outputs:
   - sensor.heating_zone_<zone>: the zone's comfort target as state; mode, planned setpoint,
-    trim, day timeline, budget and reasons as attributes.
-  - sensor.heating_controller: shadow or off_season, with forecast and outdoor status.
+    trim, nudge, last signal, day timeline, budget and reasons as attributes.
+  - sensor.heating_controller: shadow or off_season, with forecast and outdoor status and the
+    active alerts.
   - <log_dir>/decisions-YYYY-MM.jsonl, append only. Line types: forecast (every fetch),
     decision (per zone when anything changed, at least every 30 minutes), bedroom (each closed
-    evening of the bedroom loop), daily (per zone and for the house, once a day).
+    evening of the bedroom loop), signal (each classified change), alert (each start,
+    suppressed start and clear), daily (per zone and for the house, once a day).
   - state_file: trims, nudges, window and bucket state, day timeline and statistics, the
-    bedroom loop. A missing or corrupt file falls back to the yaml defaults.
+    bedroom loop, the last signals and the alert episodes. A missing or corrupt file falls back
+    to the yaml defaults.
 
 Reading policy: AppDaemon 4.5.13 can serve a stale get_state value while still firing the
-state callback, so every read takes the fresher of the last callback value and the store.
+state callback, so every read takes the fresher of the last callback value and the store. An
+entity created while AppDaemon runs reads as None until it restarts; a missing nudge button is
+logged once and the app carries on.
 
 Publish contract (AppDaemon 4.5.13's set_state drops any attribute whose value is 0, False or
 None, also inside lists and dicts): booleans go out as the strings "true"/"false", values that
@@ -40,8 +55,10 @@ from typing import Optional
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
+import heating_alerts as al
 import heating_forecast as hf
 import heating_plan as hp
+import heating_signals as sig
 
 TICK_SECONDS = 300
 DECISION_REPEAT_S = 1800.0
@@ -51,7 +68,10 @@ OUTDOOR_FRESH_MIN = 20.0
 NO_SETPOINT_CHANGE_S = 7200.0
 DAILY_KEEP = 60
 NOTIFIED_KEEP_S = 3 * 86400.0
+SIGNALS_KEEP = 50
+IDENTITY_REFRESH_S = 600.0
 STATE_VERSION = 1
+UNREADABLE = (None, "", "unknown", "unavailable")
 
 
 def _num(value) -> Optional[float]:
@@ -106,6 +126,9 @@ class ZoneRuntime:
         self.trim = hp.clamp(self.trim, zc.trim.minimum, zc.trim.maximum)
         nudge = _num(saved.get("nudge")) or 0.0
         self.nudge = hp.clamp(nudge, zc.nudge.minimum, zc.nudge.maximum) if zc.residents else 0.0
+        self.nudge_at = _num(saved.get("nudge_at"))
+        direction = _num(saved.get("nudge_dir")) or 0
+        self.nudge_dir = (direction > 0) - (direction < 0)
         self.last_planned = _num(saved.get("last_planned"))
         self.tracker = hp.WindowTracker(cfg.window, _dict(saved.get("window")))
         self.bucket = hp.TokenBucket(cfg.writes_per_hour, _dict(saved.get("bucket")))
@@ -129,6 +152,10 @@ class ZoneRuntime:
         self.last_plan_mode: Optional[str] = None
         self.setpoint_seen: Optional[float] = None
         self.setpoint_changed_ts: Optional[float] = None
+        self.mode_seen: Optional[str] = None
+        self.preset_seen: Optional[str] = None
+        self.gap = False
+        self.last_signal: Optional[dict] = None
         self.last_tick_ts: Optional[float] = None
         self.decision_key = None
         self.decision_ts = 0.0
@@ -140,6 +167,8 @@ class ZoneRuntime:
         return {
             "trim": self.trim,
             "nudge": self.nudge,
+            "nudge_at": self.nudge_at,
+            "nudge_dir": self.nudge_dir,
             "last_planned": self.last_planned,
             "window": self.tracker.snapshot(),
             "bucket": self.bucket.snapshot(),
@@ -182,12 +211,36 @@ class HeatingController(hass.Hass):
         self._notified = {
             k: float(v) for k, v in _dict(saved.get("notified")).items() if _num(v) is not None
         }
+        self._started_ts = self.get_now().timestamp()
+        self._thermostats = {zc.thermostat: zone for zone, zc in cfg.zones.items()}
+        self._buttons = self._button_map()
+        self._owned = self._owned_helpers()
+        self._calls = sig.CallBuffer()
+        self._identity = sig.Identity(cfg.owner, cfg.appdaemon_user_id)
+        self._identity_at = -IDENTITY_REFRESH_S
+        saved_signals = saved.get("signals")
+        if not isinstance(saved_signals, list):
+            saved_signals = []
+        self._signals = [s for s in saved_signals if isinstance(s, dict)][-SIGNALS_KEEP:]
+        for zone, rt in self._zones.items():
+            rt.last_signal = next(
+                (s for s in reversed(self._signals) if s.get("zone") == zone), None
+            )
+        self._alerts = al.Alerts(cfg.alerts, saved.get("alerts"))
+        season_saved = saved.get("season_on")
+        self._season_prev: Optional[bool] = season_saved if isinstance(season_saved, bool) else None
+        if not cfg.appdaemon_user_id:
+            self._warn_once(
+                "appdaemon id",
+                "HeatingController: appdaemon_user_id not configured, "
+                "other apps' changes will read as unknown accounts",
+            )
 
         self._watched = self._watched_entities()
         self._triggers = self._trigger_entities()
         for entity in sorted(self._watched):
             self.listen_state(self._on_state, entity, attribute="all")
-        self.listen_event(self._on_plugin_started, "plugin_started")
+        self._wire_events()
         self.run_every(self._tick, "now+30", TICK_SECONDS)
         self.run_every(self._fetch_forecast, "now+5", int(cfg.forecast_refresh_minutes * 60))
         self.run_daily(self._daily_rollup, "03:00:00")
@@ -224,6 +277,40 @@ class HeatingController(hass.Hass):
         names.discard("")
         return names
 
+    def _button_map(self) -> dict:
+        """Nudge button entity -> (zone, direction)."""
+        out = {}
+        for zone, zc in self.cfg.zones.items():
+            for name, direction in (("warmer", 1), ("colder", -1)):
+                if zc.buttons.get(name):
+                    out[zc.buttons[name]] = (zone, direction)
+        return out
+
+    def _owned_helpers(self) -> dict:
+        """The helpers only the owner may change, each with the zone whose target it is."""
+        cfg = self.cfg
+        owned = {zc.target_entity: zone for zone, zc in cfg.zones.items()}
+        others = [cfg.season_entity, cfg.bedroom.ceiling_entity]
+        if cfg.party:
+            others += [cfg.party.start_entity, cfg.party.end_entity, cfg.party.switch_entity]
+        owned.update({entity: None for entity in others if entity})
+        return owned
+
+    def _wire_events(self) -> None:
+        self.listen_event(self._on_plugin_started, "plugin_started")
+        for domain in sig.CALL_DOMAINS:
+            self.listen_event(self._on_service_call, sig.CALL_EVENT, domain=domain)
+        for entity in sorted(self._buttons):
+            if self._state_of(entity) is None:
+                self._warn_once(
+                    f"button {entity}",
+                    f"HeatingController: {entity} is not known to AppDaemon yet (restart "
+                    "AppDaemon after creating a helper); listening for it anyway",
+                )
+            self.listen_event(self._on_button, "state_changed", entity_id=entity)
+        for entity in sorted(self._owned):
+            self.listen_event(self._on_helper, "state_changed", entity_id=entity)
+
     def _on_state(self, entity, attribute, old, new, kwargs):
         if not isinstance(new, dict):
             return
@@ -237,14 +324,29 @@ class HeatingController(hass.Hass):
                 "ts": ts if ts is not None else now_ts,
                 "changed": self._parse_ts(new.get("last_changed")),
             }
-            for rt in self._zones.values():
-                if rt.zc.thermostat == entity:
-                    self._note_setpoint(rt, attrs.get("temperature"), now_ts)
+            rt = self._zones.get(self._thermostats.get(entity))
+            if rt is not None:
+                self._safely(
+                    "thermostat change", self._on_thermostat, rt, new.get("state"), attrs, now_ts
+                )
             if entity == self.cfg.bedroom.air_entity:
                 self._feed_loop(self.get_now())
-        if entity in self._triggers and not self._eval_pending:
+        if entity in self._triggers:
+            self._request_eval()
+
+    def _request_eval(self) -> None:
+        if not self._eval_pending:
             self._eval_pending = True
             self.run_in(self._evaluate_pending, 2)
+
+    def _safely(self, what: str, fn, *args) -> None:
+        try:
+            fn(*args)
+        except Exception as e:
+            tail = " | ".join(traceback.format_exc().strip().splitlines()[-3:])
+            self.log(
+                f"HeatingController {what} failed: {type(e).__name__}: {e} [{tail}]", level="ERROR"
+            )
 
     def _on_plugin_started(self, event_name, data, kwargs):
         self.log("HeatingController: plugin_started - republishing", level="INFO")
@@ -258,6 +360,252 @@ class HeatingController(hass.Hass):
     def _evaluate_pending(self, kwargs):
         self._eval_pending = False
         self._evaluate("event")
+
+    # ---------------------------------------------------------------- signals
+
+    def _identity_for(self, now_ts: float) -> sig.Identity:
+        """Which account is which person: the person entities' user_id, and the yaml map for a
+        resident whose person is not linked to her account. Re-read every ten minutes."""
+        if now_ts - self._identity_at >= IDENTITY_REFRESH_S:
+            cfg = self.cfg
+            users = {sig.normalize_user_id(k): v for k, v in cfg.user_ids.items()}
+            for name in {cfg.owner}.union(*(zc.residents for zc in cfg.zones.values())):
+                try:
+                    account = self.get_state(f"person.{name}", attribute="user_id")
+                except Exception:
+                    account = None
+                if account:
+                    users[sig.normalize_user_id(account)] = name
+            self._identity = self._identity.with_users(users)
+            self._identity_at = now_ts
+        return self._identity
+
+    def _on_service_call(self, event_name, data, kwargs):
+        self._safely("service call", self._service_call_event, data)
+
+    def _service_call_event(self, data) -> None:
+        records = sig.call_records(data, self.get_now().timestamp(), self._thermostats)
+        with self._lock:
+            for record in records:
+                self._calls.add(record)
+
+    @staticmethod
+    def _state_event(data, first_press_ok: bool = False):
+        """(entity, old, new, user_id, parent_id) of a state_changed event that is a real
+        change, else None: an unreadable state on either side is Home Assistant restoring the
+        entity after a restart, not a press or an edit. A button nobody has pressed yet reads
+        unknown, so for a button that is a fine state to be pressed from."""
+        data = data if isinstance(data, dict) else {}
+        old_raw, new_raw = data.get("old_state"), data.get("new_state")
+        if not isinstance(old_raw, dict) or not isinstance(new_raw, dict):
+            return None
+        old, new = old_raw.get("state"), new_raw.get("state")
+        unreadable_old = ("", "unavailable", None) if first_press_ok else UNREADABLE
+        if old == new or old in unreadable_old or new in UNREADABLE:
+            return None
+        context = new_raw.get("context") if isinstance(new_raw.get("context"), dict) else {}
+        return data.get("entity_id"), old, new, context.get("user_id"), context.get("parent_id")
+
+    def _on_button(self, event_name, data, kwargs):
+        self._safely("nudge button", self._button_event, data)
+
+    def _button_event(self, data) -> None:
+        fields = self._state_event(data, first_press_ok=True)
+        if fields is None or fields[0] not in self._buttons:
+            return
+        entity, _old, _new, user_id, parent_id = fields
+        zone, direction = self._buttons[entity]
+        with self._lock:
+            rt = self._zones[zone]
+            now_ts = self.get_now().timestamp()
+            actor = self._identity_for(now_ts).actor(user_id, parent_id)
+            before = rt.nudge
+            if sig.button_allowed(rt.zc, self.cfg.owner, actor):
+                effect = self._step_nudge(rt, direction, now_ts)
+            else:
+                effect = sig.EFFECT_IGNORED
+            source, who = sig.describe(actor)
+            self._record_signal(
+                now_ts,
+                zone,
+                kind=sig.KIND_BUTTON,
+                source=sig.SRC_BUTTON,
+                who=sig.who_label(source, who),
+                direction=direction,
+                effect=effect,
+                nudge=[before, rt.nudge],
+            )
+            if effect == sig.EFFECT_NUDGE:
+                self._save_state()
+
+    def _on_helper(self, event_name, data, kwargs):
+        self._safely("helper change", self._helper_event, data)
+
+    def _helper_event(self, data) -> None:
+        fields = self._state_event(data)
+        if fields is None or fields[0] not in self._owned:
+            return
+        entity, old, new, user_id, parent_id = fields
+        zone = self._owned[entity]
+        with self._lock:
+            rt = self._zones.get(zone)
+            now_ts = self.get_now().timestamp()
+            actor = self._identity_for(now_ts).actor(user_id, parent_id)
+            effect = sig.helper_effect(
+                self.cfg.owner, actor, rt.zc if rt else None, rt.nudge if rt else 0.0
+            )
+            if effect == sig.EFFECT_NONE:
+                return
+            kind = sig.KIND_TARGET if rt else sig.KIND_HELPER
+            source, who = sig.describe(actor)
+            extra = {"entity": entity}
+            if rt is not None:
+                extra["nudge"] = [rt.nudge, 0.0 if effect == sig.EFFECT_NUDGE_RESET else rt.nudge]
+            if effect == sig.EFFECT_NUDGE_RESET:
+                rt.nudge, rt.nudge_at, rt.nudge_dir = 0.0, None, 0
+                rt.priority = "nudge"
+            if effect == sig.EFFECT_WOULD_REVERT:
+                extra["revert_to"] = old
+            self._record_signal(
+                now_ts,
+                zone,
+                kind=kind,
+                source=source,
+                who=sig.who_label(source, who),
+                direction=sig.Change(kind, old, new, now_ts).direction,
+                effect=effect,
+                old=old,
+                new=new,
+                **extra,
+            )
+            if effect == sig.EFFECT_NUDGE_RESET:
+                self._save_state()
+
+    def _on_thermostat(self, rt: ZoneRuntime, state, attrs: dict, now_ts: float) -> None:
+        """Notice a setpoint, mode or preset change of a managed thermostat. The first report
+        after the thermostat was unavailable only re-seeds what is remembered: whatever changed
+        while it was gone is not a signal."""
+        if state in UNREADABLE:
+            rt.gap = True
+            return
+        previous = rt.setpoint_seen
+        self._note_setpoint(rt, attrs.get("temperature"), now_ts)
+        setpoint = _num(attrs.get("temperature"))
+        preset = attrs.get("preset_mode") if isinstance(attrs.get("preset_mode"), str) else None
+        changes = []
+        if not rt.gap:
+            if setpoint is not None and previous is not None and abs(setpoint - previous) > 1e-9:
+                changes.append(sig.Change(sig.KIND_SETPOINT, previous, setpoint, now_ts))
+            if rt.mode_seen is not None and state != rt.mode_seen:
+                changes.append(sig.Change(sig.KIND_MODE, rt.mode_seen, state, now_ts))
+            if rt.preset_seen is not None and preset is not None and preset != rt.preset_seen:
+                changes.append(sig.Change(sig.KIND_PRESET, rt.preset_seen, preset, now_ts))
+        rt.gap = False
+        rt.mode_seen = state
+        if preset is not None:
+            rt.preset_seen = preset
+        for change in changes:
+            self._handle_change(rt, change)
+
+    def _handle_change(self, rt: ZoneRuntime, change: sig.Change) -> None:
+        zc = rt.zc
+        attr = sig.attribute_change(zc, change, self._calls, self._identity_for(change.ts))
+        effect = sig.thermostat_effect(zc, self.cfg.owner, change, attr)
+        extra: dict = {}
+        before = rt.nudge
+        if effect == sig.EFFECT_NUDGE:
+            effect = self._step_nudge(rt, change.direction, change.ts)
+        elif effect == sig.EFFECT_WOULD_SET_TARGET:
+            extra.update(self._target_step(rt, change.direction))
+        if zc.residents:
+            extra["nudge"] = [before, rt.nudge]
+        if attr.call is not None:
+            extra["call"] = attr.call.service
+        self._record_signal(
+            change.ts,
+            zc.name,
+            kind=change.kind,
+            source=attr.source,
+            who=sig.who_label(attr.source, attr.who),
+            direction=change.direction,
+            effect=effect,
+            old=change.old,
+            new=change.new,
+            **extra,
+        )
+        if effect == sig.EFFECT_NUDGE:
+            self._save_state()
+
+    def _step_nudge(self, rt: ZoneRuntime, direction: int, ts: float) -> str:
+        nudge, effect = sig.step_nudge(
+            rt.zc.nudge, rt.nudge, direction, ts, rt.nudge_at, rt.nudge_dir
+        )
+        if effect in (sig.EFFECT_NUDGE, sig.EFFECT_NUDGE_LIMIT):
+            rt.nudge_at, rt.nudge_dir = ts, direction
+        if effect == sig.EFFECT_NUDGE:
+            rt.nudge = nudge
+            rt.priority = "nudge"
+        return effect
+
+    def _target_step(self, rt: ZoneRuntime, direction: int) -> dict:
+        """What the live controller would write to the zone's target helper when the owner
+        moves the thermostat: one step from the current target, inside the helper's range."""
+        snap = self._snap(rt.zc.target_entity)
+        attrs = snap["attributes"] if snap else {}
+        current = _num(snap["state"]) if snap else None
+        if current is None:
+            current = rt.zc.base_c
+        target = current + direction * hp.SETPOINT_STEP_C
+        low, high = _num(attrs.get("min")), _num(attrs.get("max"))
+        if low is not None:
+            target = max(low, target)
+        if high is not None:
+            target = min(high, target)
+        return {"target_from": current, "target_to": round(target, 2)}
+
+    def _reset_nudges(self, now_ts: float) -> None:
+        for zone, rt in self._zones.items():
+            if rt.nudge == 0:
+                continue
+            before = rt.nudge
+            rt.nudge, rt.nudge_at, rt.nudge_dir = 0.0, None, 0
+            rt.priority = "nudge"
+            self._record_signal(
+                now_ts,
+                zone,
+                kind="season",
+                source="season",
+                who="season",
+                direction=0,
+                effect=sig.EFFECT_NUDGE_RESET,
+                nudge=[before, 0.0],
+            )
+
+    def _record_signal(self, now_ts: float, zone: Optional[str], **fields) -> None:
+        """Log a classified signal, remember the last ones and ask for an evaluation so the
+        zone sensor shows it."""
+        compact = {"zone": zone, "at": now_ts}
+        compact.update(
+            {
+                k: fields.get(k)
+                for k in ("kind", "source", "who", "direction", "effect", "old", "new")
+            }
+        )
+        self._signals.append(compact)
+        del self._signals[:-SIGNALS_KEEP]
+        if zone in self._zones:
+            self._zones[zone].last_signal = compact
+        now = self.get_now()
+        self._append_log(
+            now,
+            {"type": "signal", "ts": self._iso(now_ts, now.tzinfo), "zone": zone, **fields},
+        )
+        self.log(
+            f"HeatingController signal {zone or 'house'}: {fields.get('kind')} by "
+            f"{fields.get('who')} -> {fields.get('effect')}",
+            level="INFO",
+        )
+        self._request_eval()
 
     # ---------------------------------------------------------------- reading
 
@@ -447,7 +795,12 @@ class HeatingController(hass.Hass):
         today = hp.local_dt(now_ts, tz).date()
         periodic = reason == "tick"
 
-        season_on = self._state_of(cfg.season_entity) == "on"
+        season_state = self._state_of(cfg.season_entity)
+        season_on = season_state == "on"
+        if season_state in ("on", "off"):
+            if season_on and self._season_prev is False:
+                self._reset_nudges(now_ts)
+            self._season_prev = season_on
         forecast_ok = hf.is_usable(self._forecast, now_ts, cfg.forecast_stale_hours)
         if forecast_ok != self._forecast_was_usable and self._forecast_was_usable is not None:
             self.log(
@@ -465,10 +818,14 @@ class HeatingController(hass.Hass):
         party = self._party_view(now_ts, tz)
         outdoor = self._outdoor_now(now_ts)
         house = self._house_day(now)
+        relay_w = _num(self._state_of(cfg.relay_power_entity))
+        supply = self._clamp_temp(cfg.supply_temp_entity)
         if periodic:
             house["ticks"] = house.get("ticks", 0) + 1
             self._accumulate(house, "outdoor", outdoor[0])
-            self._accumulate(house, "relay_w", _num(self._state_of(cfg.relay_power_entity)))
+            self._accumulate(house, "relay_w", relay_w)
+            self._accumulate(house, "supply", supply)
+            self._accumulate(house, "return", self._clamp_temp(cfg.return_temp_entity))
 
         ctx = {
             "now": now,
@@ -481,6 +838,7 @@ class HeatingController(hass.Hass):
             "bedroom": bedroom,
             "party": party,
             "zones": {},
+            "obs": [],
         }
         for zone, rt in self._zones.items():
             try:
@@ -493,10 +851,20 @@ class HeatingController(hass.Hass):
                 )
 
         self._party_notices(ctx)
+        if periodic:
+            self._alerts_tick(ctx, outdoor[0], relay_w, supply)
         self._publish_controller(ctx, outdoor)
         self._rollup_if_due(now)
         self._prune_notified(now_ts)
         self._save_state()
+
+    def _clamp_temp(self, entity: str) -> Optional[float]:
+        """A pipe clamp reading. It runs far above the 5-35 C a room can read, so it does not
+        go through the reading guard. Empty while no clamp is configured."""
+        if not entity:
+            return None
+        value = _num(self._state_of(entity))
+        return value if value is not None and -20.0 <= value <= 120.0 else None
 
     @staticmethod
     def _accumulate(store: dict, key: str, value: Optional[float]) -> None:
@@ -629,9 +997,11 @@ class HeatingController(hass.Hass):
         therm_pair = None if therm_temp is None or therm_age is None else (therm_temp, therm_age)
         floor_pair = None if floor_temp is None or floor_age is None else (floor_temp, floor_age)
         air, source = hp.resolve_control_air(feels, therm_pair, floor_pair)
+        fresh_age = {"thermostat": therm_age, "floor": floor_age}.get(source)
         return {
             "online": online,
             "hvac_mode": state,
+            "preset": attrs.get("preset_mode"),
             "setpoint": _num(attrs.get("temperature")),
             "hvac_action": attrs.get("hvac_action"),
             "therm_temp": therm_temp,
@@ -639,6 +1009,8 @@ class HeatingController(hass.Hass):
             "floor_temp": floor_temp,
             "air": air,
             "air_source": source,
+            "air_fresh": source == "feel"
+            or (fresh_age is not None and fresh_age <= THERMOSTAT_FRESH_MIN),
             "sun_hit": sun_hit,
             "stale": stale,
         }
@@ -652,6 +1024,10 @@ class HeatingController(hass.Hass):
         reading = self._read_zone(rt, now_ts, window_active)
         if rt.setpoint_seen is None:
             self._note_setpoint(rt, reading["setpoint"], now_ts)
+        if rt.mode_seen is None and reading["online"]:
+            rt.mode_seen = reading["hvac_mode"]
+        if rt.preset_seen is None and isinstance(reading["preset"], str):
+            rt.preset_seen = reading["preset"]
         openings = {e: self._state_of(e) for e in zc.openings}
         event = rt.tracker.update(now_ts, openings, reading["air"])
 
@@ -714,6 +1090,24 @@ class HeatingController(hass.Hass):
             else:
                 gap = min(now_ts - rt.last_tick_ts, MAX_TICK_GAP_S)
             rt.last_tick_ts = now_ts
+            ctx["obs"].append(
+                al.ZoneObs(
+                    zone=zone,
+                    dt_s=max(gap, 0.0),
+                    season_on=ctx["season_on"],
+                    hvac_mode=reading["hvac_mode"],
+                    calling=reading["hvac_action"] == "heating",
+                    air=reading["air"],
+                    air_fresh=reading["air_fresh"],
+                    target=plan.target,
+                    plan_mode=plan.plan_mode,
+                    fallback=reading["air_source"] == "none",
+                    floor=reading["floor_temp"],
+                    window_active=rt.tracker.state != hp.STATE_CLOSED
+                    or bool(rt.tracker.open_openings()),
+                    evenness=self._evenness(zc, now_ts, window_active),
+                )
+            )
             acc.add_tick(
                 hp.TickSample(
                     ts=now_ts,
@@ -898,6 +1292,62 @@ class HeatingController(hass.Hass):
         ]:
             del self._notified[key]
 
+    # ---------------------------------------------------------------- alerts
+
+    def _evenness(self, zc: hp.ZoneConfig, now_ts: float, window_active: bool) -> Optional[float]:
+        """The compared floor's temperature minus the reference floor's, for a zone that
+        watches the evenness of its floors. A floor sensor reports on change only, so the age
+        of its state says nothing about whether it is alive."""
+        if len(zc.evenness_floors) != 2:
+            return None
+        values = []
+        for entity in zc.evenness_floors:
+            snap = self._snap(entity)
+            if snap is None:
+                return None
+            value = self._guard.filter(entity, snap["state"], now_ts, window_active)
+            if value is None:
+                return None
+            values.append(value)
+        return values[1] - values[0]
+
+    def _alerts_tick(self, ctx: dict, outdoor, relay_w, supply) -> None:
+        cfg = self.cfg
+        now_ts, tz = ctx["now_ts"], ctx["tz"]
+        local = hp.local_dt(now_ts, tz)
+        if self._forecast is None:
+            forecast_stale = now_ts - self._started_ts >= cfg.forecast_stale_hours * 3600.0
+        else:
+            forecast_stale = not ctx["forecast_ok"]
+        monitor = cfg.living_monitor_entity
+        house = al.HouseObs(
+            now_ts=now_ts,
+            day=local.date().isoformat(),
+            hour=local.hour,
+            season_on=ctx["season_on"],
+            relay_w=relay_w,
+            outdoor=outdoor,
+            supply=supply,
+            supply_enabled=bool(cfg.supply_temp_entity),
+            forecast_stale=forecast_stale,
+            monitor_heat=bool(monitor) and self._state_of(monitor) == "heat",
+        )
+        for event in self._alerts.update(house, ctx["obs"]):
+            self._append_log(
+                ctx["now"],
+                {
+                    "type": "alert",
+                    "ts": self._iso(now_ts, tz),
+                    "key": event.key,
+                    "zone": event.zone,
+                    "event": event.kind,
+                    "message": event.message,
+                },
+            )
+            self.log(f"HeatingController alert {event.key}: {event.kind}", level="INFO")
+            if event.kind == al.EVENT_START:
+                self._push(event.title, event.message)
+
     # ---------------------------------------------------------------- log and state
 
     @staticmethod
@@ -940,6 +1390,9 @@ class HeatingController(hass.Hass):
             "bedroom": self._loop.snapshot(),
             "house": self._house,
             "notified": self._notified,
+            "signals": self._signals,
+            "alerts": self._alerts.snapshot(),
+            "season_on": self._season_prev,
         }
         tmp = self.cfg.state_file + ".tmp"
         try:
@@ -1058,20 +1511,21 @@ class HeatingController(hass.Hass):
         for day in sorted(d for d in self._house if d < today and not self._house[d].get("closed")):
             stats = self._house[day]
             stats["closed"] = True
-            self._append_log(
-                now,
-                {
-                    "type": "daily",
-                    "day": day,
-                    "zone": "_house",
-                    "ts": self._iso(now.timestamp(), now.tzinfo),
-                    "ticks": stats.get("ticks", 0),
-                    "forecast_fetched": stats.get("forecast_fetched", 0),
-                    "forecast_failed": stats.get("forecast_failed", 0),
-                    "outdoor": self._range(stats.get("outdoor")),
-                    "relay_w_mean": self._range(stats.get("relay_w"), mean_only=True),
-                },
-            )
+            record = {
+                "type": "daily",
+                "day": day,
+                "zone": "_house",
+                "ts": self._iso(now.timestamp(), now.tzinfo),
+                "ticks": stats.get("ticks", 0),
+                "forecast_fetched": stats.get("forecast_fetched", 0),
+                "forecast_failed": stats.get("forecast_failed", 0),
+                "outdoor": self._range(stats.get("outdoor")),
+                "relay_w_mean": self._range(stats.get("relay_w"), mean_only=True),
+            }
+            for clamp in ("supply", "return"):
+                if stats.get(clamp):
+                    record[clamp] = self._range(stats[clamp])
+            self._append_log(now, record)
         for day in [
             d
             for d in self._house
@@ -1155,6 +1609,15 @@ class HeatingController(hass.Hass):
             "stale_inputs": reading["stale"],
             "yesterday": rt.yesterday,
         }
+        if rt.last_signal:
+            sg = rt.last_signal
+            attrs["last_signal"] = {
+                "at": iso(sg["at"]),
+                "who": sg.get("who") or "unknown",
+                "source": sg.get("source"),
+                "direction": sig.DIRECTION_WORDS.get(sg.get("direction")),
+                "effect": sg.get("effect"),
+            }
         if zc.guard.enabled:
             last = ctx["bedroom"]["last"] or {}
             attrs["bedroom_hold_back"] = ctx["bedroom"]["hold"]
@@ -1181,6 +1644,7 @@ class HeatingController(hass.Hass):
             "forecast_ok": ctx["forecast_ok"],
             "forecast_issued": None if fc is None else self._iso(fc.fetched_at, tz),
             "forecast_age_min": None if fc is None else f"{hf.age_minutes(fc, now_ts):.0f}",
+            "alerts_active": self._alerts.active(),
             "outdoor_source": outdoor[1],
             "outdoor_now": _text(outdoor[0]),
             "would_writes_today": str(writes),

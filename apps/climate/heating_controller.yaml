@@ -1,15 +1,24 @@
 # /conf/apps/climate/heating_controller.yaml
 # HeatingController - shadow-mode planner for the floor-heating zones: it publishes what it
-# would set and logs it, and has no way to write to a thermostat. See heating_controller.py
-# and heating_plan.py. Targets are seated-air temperatures (what sensor.<room>_feel shows);
-# the thermostat hangs higher and reads warmer, which `trim` learns. Limits are the setpoint
-# bounds of the zone's thermostat. No `log:` key: it logs to the main log.
+# would set and logs it, and has no way to write to a thermostat. See heating_controller.py,
+# heating_plan.py, heating_signals.py and heating_alerts.py. Targets are seated-air
+# temperatures (what sensor.<room>_feel shows); the thermostat hangs higher and reads warmer,
+# which `trim` learns. Limits are the setpoint bounds of the zone's thermostat. No `log:` key:
+# it logs to the main log.
 
 HeatingController:
   module: heating_controller
   class: HeatingController
   dependencies: MobileNotifier
   notify_target: mikkel
+  # The person who owns the targets and the helpers. Account ids come from the person
+  # entities' user_id, so a resident needs her person linked to her account.
+  owner: mikkel
+  # AppDaemon's own HA account: what it does is another app, never a person.
+  appdaemon_user_id: "f4fda494358943beaf8ad2c70db099f8"
+  # Account id -> person, for a resident whose person entity carries no user_id.
+  user_ids:
+    "5bee78148825439488b70f92565e6c26": kristine
   season_entity: input_boolean.heating_season
   state_file: /conf/apps/climate/heating_controller_state.json
   log_dir: /conf/heating_log
@@ -24,6 +33,30 @@ HeatingController:
   forecast: {refresh_minutes: 60, stale_hours: 12}
   outdoor_entities: [sensor.gw2000a_outdoor_temperature, weather.forecast_home]
   relay_power_entity: sensor.floor_heating_relay_power
+  # Pipe clamps on the building's supply and return, in degrees C. Leave empty until fitted:
+  # nothing reads them then, and the no-hot-water alert is off.
+  supply_temp_entity: ""
+  return_temp_entity: ""
+  # The living-room thermostat has no actuator and must stay in standby.
+  unmanaged:
+    living_monitor: climate.living_room_thermostat
+
+  # Alerts reach notify_target only. A room under cold_c for cold_minutes; a zone calling for
+  # calling_hours while the relay draws no more than no_pump_w, or while its floor rises less
+  # than floor_rise_min_c; the building's supply under no_hot_water_c while a zone calls; the
+  # mean of the last evenness_nights nights of the family floors apart by more than evenness_c.
+  # An alert pushes once per episode, and cold, pump and floor alerts at most once per zone in
+  # repeat_hours.
+  alerts:
+    cold_c: 19.0
+    cold_minutes: 30
+    calling_hours: 4
+    no_pump_w: 5
+    floor_rise_min_c: 0.1
+    evenness_c: 1.5
+    evenness_nights: 3
+    no_hot_water_c: 28
+    repeat_hours: 6
 
   # The bedroom ceiling is the helper value from evening_from until morning_from, and
   # morning_offset_c higher from then until wake. Once the evening window has closed, a mean
@@ -67,6 +100,9 @@ HeatingController:
       thermostat: climate.family_room_thermostat
       control_air: [sensor.living_room_feel, sensor.dining_room_feel]
       floor: sensor.living_room_floor_thermometer_temperature
+      evenness_floors:
+        - sensor.living_room_floor_thermometer_temperature
+        - sensor.dining_room_floor_thermometer_temperature
       openings:
         - binary_sensor.living_room_window_contact
         - binary_sensor.kitchen_window_contact
