@@ -5,8 +5,9 @@ or input service, so a thermostat can only ever receive a setpoint from somebody
 outputs are the sensors it publishes, the decision log and its own state file.
 
 The planning rules live in heating_plan.py, the weather side in heating_forecast.py, the rules
-for who changed what in heating_signals.py and the plant alerts in heating_alerts.py; this file
-reads Home Assistant, runs those rules and publishes the result.
+for who changed what in heating_signals.py, the plant alerts in heating_alerts.py and the season
+advice in heating_season.py; this file reads Home Assistant, runs those rules and publishes the
+result.
 
 Signals: a thermostat setpoint, mode or preset change is attributed from the service calls the
 app sees on the thermostats; the four nudge buttons and the helpers the owner owns are read from
@@ -15,20 +16,22 @@ the plan. Everything the live controller would do about a change (restore a setp
 helper, move a target) is only recorded.
 
 Alerts go to the owner only, through MobileNotifier. They cover the physical plant and run in
-shadow too.
+shadow too. So does the season advice: a push that asks the owner to start the season in the
+autumn or stop it in the spring, never a change of the season switch.
 
 Outputs:
   - sensor.heating_zone_<zone>: the zone's comfort target as state; mode, planned setpoint,
     trim, nudge, last signal, day timeline, budget and reasons as attributes.
-  - sensor.heating_controller: shadow or off_season, with forecast and outdoor status and the
-    active alerts.
+  - sensor.heating_controller: shadow or off_season, with forecast and outdoor status, the
+    active alerts and the latest season advice.
   - <log_dir>/decisions-YYYY-MM.jsonl, append only. Line types: forecast (every fetch),
     decision (per zone when anything changed, at least every 30 minutes), bedroom (each closed
     evening of the bedroom loop), signal (each classified change), alert (each start,
-    suppressed start and clear), daily (per zone and for the house, once a day).
+    suppressed start and clear), season_advice (each judgement that advises something, pushed
+    or not), daily (per zone and for the house, once a day).
   - state_file: trims, nudges, window and bucket state, day timeline and statistics, the
-    bedroom loop, the last signals and the alert episodes. A missing or corrupt file falls back
-    to the yaml defaults.
+    bedroom loop, the last signals, the alert episodes and the season advisor's morning means
+    and asks. A missing or corrupt file falls back to the yaml defaults.
 
 Reading policy: AppDaemon 4.5.13 can serve a stale get_state value while still firing the
 state callback, so every read takes the fresher of the last callback value and the store. An
@@ -58,6 +61,7 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 import heating_alerts as al
 import heating_forecast as hf
 import heating_plan as hp
+import heating_season as ss
 import heating_signals as sig
 
 TICK_SECONDS = 300
@@ -227,6 +231,11 @@ class HeatingController(hass.Hass):
                 (s for s in reversed(self._signals) if s.get("zone") == zone), None
             )
         self._alerts = al.Alerts(cfg.alerts, saved.get("alerts"))
+        self._advisor = (
+            ss.SeasonAdvisor(cfg.season_advisor, cfg.zones, saved.get("season_advisor"))
+            if cfg.season_advisor
+            else None
+        )
         season_saved = saved.get("season_on")
         self._season_prev: Optional[bool] = season_saved if isinstance(season_saved, bool) else None
         if not cfg.appdaemon_user_id:
@@ -834,6 +843,7 @@ class HeatingController(hass.Hass):
             "today": today,
             "periodic": periodic,
             "season_on": season_on,
+            "season_known": season_state in ("on", "off"),
             "forecast_ok": forecast_ok,
             "bedroom": bedroom,
             "party": party,
@@ -853,8 +863,9 @@ class HeatingController(hass.Hass):
         self._party_notices(ctx)
         if periodic:
             self._alerts_tick(ctx, outdoor[0], relay_w, supply)
-        self._publish_controller(ctx, outdoor)
         self._rollup_if_due(now)
+        self._safely("season advice", self._season_tick, ctx)
+        self._publish_controller(ctx, outdoor)
         self._prune_notified(now_ts)
         self._save_state()
 
@@ -1135,7 +1146,13 @@ class HeatingController(hass.Hass):
         next_change = None
         if rt.tracker.state == hp.STATE_CLOSED:
             next_change = next((b for b in projected if b[3] != plan.setpoint), None)
-        ctx["zones"][zone] = {"air": reading["air"], "target": plan.target}
+        aired = rt.tracker.state != hp.STATE_CLOSED or bool(rt.tracker.open_openings())
+        ctx["zones"][zone] = {
+            "air": reading["air"],
+            "target": plan.target,
+            "air_source": reading["air_source"],
+            "window_active": aired,
+        }
 
         if rt.last_mode is not None and rt.last_mode != plan.mode:
             self.log(
@@ -1348,6 +1365,70 @@ class HeatingController(hass.Hass):
             if event.kind == al.EVENT_START:
                 self._push(event.title, event.message)
 
+    # ---------------------------------------------------------------- season advice
+
+    def _season_tick(self, ctx: dict) -> None:
+        """Hand the advisor the morning air of the zones it watches, and judge the day once the
+        time has come. It only has the periodic ticks, so a reading is never weighed twice, and
+        it runs after the rollup, which closes the days it reads."""
+        advisor = self._advisor
+        if advisor is None or not ctx["periodic"] or not ctx["season_known"]:
+            return
+        now_ts, tz = ctx["now_ts"], ctx["tz"]
+        local = hp.local_dt(now_ts, tz)
+        day, minute = local.date().isoformat(), local.hour * 60 + local.minute
+        advisor.note_season(ctx["season_on"], day)
+        for zone in self.cfg.season_advisor.zones:
+            view = ctx["zones"].get(zone)
+            if view and view["air_source"] == "feel" and not view["window_active"]:
+                advisor.observe(zone, day, minute, view["air"])
+        if not advisor.due(day, minute):
+            return
+        verdict = advisor.evaluate(self._season_inputs(ctx, day))
+        if verdict.advice == ss.ADVICE_NONE:
+            return
+        self._append_log(
+            ctx["now"], {"type": "season_advice", "ts": self._iso(now_ts, tz), **verdict.to_dict()}
+        )
+        self.log(
+            f"HeatingController season advice: {verdict.advice}, pushed {verdict.push}",
+            level="INFO",
+        )
+        if verdict.push:
+            self._push(verdict.title, verdict.message)
+
+    def _season_inputs(self, ctx: dict, day: str) -> ss.Inputs:
+        fc, mean = self._forecast, None
+        if ctx["forecast_ok"]:
+            mean = hf.mean_ahead(fc, fc.temperature, ctx["now_ts"], ss.OUTLOOK_HOURS)
+        bases = {}
+        for zone in self.cfg.season_advisor.zones:
+            rt = self._zones[zone]
+            bases[zone] = rt.zc.base_c if rt.last_base is None else rt.last_base
+        return ss.Inputs(
+            day=day,
+            season_on=ctx["season_on"],
+            forecast_mean=mean,
+            bases=bases,
+            daily={zone: rt.daily for zone, rt in self._zones.items()},
+        )
+
+    def _season_attrs(self) -> dict:
+        """The advisor's latest judgement, for sensor.heating_controller."""
+        last = self._advisor.last or {}
+        means = {
+            zone: [_text(_num(m)) or "n/a" for m in values]
+            for zone, values in _dict(last.get("mornings")).items()
+            if isinstance(values, list) and values
+        }
+        return {
+            "season_advice": last.get("advice") or ss.ADVICE_NONE,
+            "season_advice_day": last.get("day"),
+            "season_advice_reason": last.get("reason"),
+            "season_forecast_mean": _text(_num(last.get("forecast_mean"))),
+            "season_morning_means": means or None,
+        }
+
     # ---------------------------------------------------------------- log and state
 
     @staticmethod
@@ -1394,6 +1475,8 @@ class HeatingController(hass.Hass):
             "alerts": self._alerts.snapshot(),
             "season_on": self._season_prev,
         }
+        if self._advisor is not None:
+            data["season_advisor"] = self._advisor.snapshot()
         tmp = self.cfg.state_file + ".tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
@@ -1651,6 +1734,8 @@ class HeatingController(hass.Hass):
             "sun_term_factor": self.cfg.sun_term_factor,
             "last_tick": self._iso(now_ts, tz),
         }
+        if self._advisor is not None:
+            attrs.update(self._season_attrs())
         self._publish(
             "sensor.heating_controller", "shadow" if ctx["season_on"] else "off_season", attrs
         )

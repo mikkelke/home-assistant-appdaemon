@@ -1,10 +1,10 @@
 # /conf/apps/climate/heating_controller.yaml
 # HeatingController - shadow-mode planner for the floor-heating zones: it publishes what it
 # would set and logs it, and has no way to write to a thermostat. See heating_controller.py,
-# heating_plan.py, heating_signals.py and heating_alerts.py. Targets are seated-air
-# temperatures (what sensor.<room>_feel shows); the thermostat hangs higher and reads warmer,
-# which `trim` learns. Limits are the setpoint bounds of the zone's thermostat. No `log:` key:
-# it logs to the main log.
+# heating_plan.py, heating_signals.py, heating_alerts.py and heating_season.py. Targets are
+# seated-air temperatures (what sensor.<room>_feel shows); the thermostat hangs higher and
+# reads warmer, which `trim` learns. Limits are the setpoint bounds of the zone's thermostat.
+# No `log:` key: it logs to the main log.
 
 HeatingController:
   module: heating_controller
@@ -57,6 +57,25 @@ HeatingController:
     evenness_nights: 3
     no_hot_water_c: 28
     repeat_hours: 6
+
+  # Asks the owner by push when to start or stop the season; the switch stays the owner's.
+  # Season off: from evaluate_at, a zone cannot keep warm when its 05:00-09:00 air, with the
+  # heat off and its openings closed, was under its base target minus margin_c on each of the
+  # last `mornings` mornings. With one such zone and the next 72 hours forecast to average
+  # under start_below_c, the owner is asked to start. Season on: when all zones together called
+  # for heat for under idle_hours a day for idle_days whole days and the next 72 hours are
+  # forecast to average over stop_above_c, the owner is asked whether it can stop. An ask
+  # repeats after reask_days at the earliest.
+  season_advisor:
+    evaluate_at: "08:00"
+    zones: [family, kristines_room, claudias_room]
+    margin_c: 0.5
+    mornings: 2
+    start_below_c: 10
+    idle_days: 5
+    idle_hours: 0.2
+    stop_above_c: 12
+    reask_days: 3
 
   # The bedroom ceiling is the helper value from evening_from until morning_from, and
   # morning_offset_c higher from then until wake. Once the evening window has closed, a mean
