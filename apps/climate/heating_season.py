@@ -1,25 +1,32 @@
 """
-Season advice for the floor-heating controller: the push that tells the owner when it is time to
-start the heating season in the autumn and when it can stop in the spring. State and rules only,
-no AppDaemon import and no I/O, so every rule can be unit-tested on its own. Nothing here touches
-a device or the season switch: the season is the owner's call.
+Season advice for the floor-heating controller: the push that asks the owner whether it is time to
+turn the heat on in the autumn and whether it can go off in the spring. State and rules only, no
+AppDaemon import and no I/O, so every rule can be unit-tested on its own. Nothing here touches a
+device or the season switch: the season is the owner's call.
 
 The advisor judges once a day, from evaluate_at on, and a judged day is used up. A day without a
 forecast is not used up: it is judged on the first tick that has one.
 
-Start, while the season is off. A zone cannot keep warm when the mean of its control air between
-SEASON_MORNING_FROM and SEASON_MORNING_TO was under its base target minus margin_c on each of the
-last `mornings` mornings, this one counted up to the moment of judging. Only readings from the
-room sensors with the heat off and every opening of the zone closed count, so an aired room is
-not a cold room, and a morning with fewer than MIN_MORNING_SAMPLES of them is unknown, never
-cold. The advice is to start when at least one zone cannot keep warm and the mean forecast
-outdoor temperature of the next OUTLOOK_HOURS is under start_below_c: one cold snap after a warm
-spell does not fire it.
+Start, while the season is off. A zone cannot keep warm when the mean of its rooms' air between
+SEASON_MORNING_FROM and SEASON_MORNING_TO was under its base target minus its margin on each of
+the last `mornings` mornings, this one counted up to the moment of judging. Only readings with
+the heat off and every opening of the zone closed count, so an aired room is not a cold room, and
+a morning with fewer than MIN_MORNING_SAMPLES of them is unknown, never cold. The advice is to
+start when at least one zone cannot keep warm and the mean forecast outdoor temperature of the
+next OUTLOOK_HOURS is under start_below_c. The indoor rule is the signal; the forecast only
+keeps one cold snap after a warm spell from firing it.
 
-Stop, while the season is on. The season has been on for idle_days whole days, all the zones
-together called for heat for under idle_hours on each of them, and the mean forecast outdoor
-temperature of the next OUTLOOK_HOURS is over stop_above_c. A day the controller's statistics
-cover with fewer than MIN_DAY_TICKS ticks is unknown.
+Stop, while the season is on and the date lies between stop_from and stop_until. The season has
+been on for at least season_min_days, all the zones together called for heat for under idle_hours
+on at least idle_days of the last look_back_days closed days (the other days are blips), and the
+mean forecast outdoor temperature of the next OUTLOOK_HOURS is at least stop_min_c. A closed day
+the controller's statistics cover with fewer than MIN_DAY_TICKS ticks is unknown, and an unknown
+day is not an idle one.
+
+Each push carries the facts the owner decides on: for the start the rooms that are cold this
+morning, the coldest against its target, and the outlook; for the stop the heat that ran on a
+typical day (the median of the days, so a blip or the last heated days do not outvote the rule),
+the temperature of the rooms now and the outlook.
 
 An advice is pushed at most once per reask_days calendar days. A change of the season starts
 afresh: what was asked and judged under the other season no longer applies. Days are ISO dates
@@ -28,6 +35,7 @@ in local time.
 
 from __future__ import annotations
 
+import statistics
 from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from typing import Optional
@@ -46,6 +54,7 @@ REASON_NO_FORECAST = "no_forecast"
 REASON_NO_DATA = "no_data"
 REASON_WARM = "warm_enough"
 REASON_MILD = "forecast_mild"
+REASON_DATES = "outside_dates"
 REASON_YOUNG = "season_young"
 REASON_CALLS = "heat_wanted"
 REASON_COOL = "forecast_cool"
@@ -84,8 +93,8 @@ def _shift(day: str, days: int) -> str:
     return (date.fromisoformat(day) + timedelta(days=days)).isoformat()
 
 
-def _plural(n: int, word: str) -> str:
-    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+def _cap(text: str) -> str:
+    return text[:1].upper() + text[1:]
 
 
 def zone_label(zc: hp.ZoneConfig) -> str:
@@ -94,7 +103,7 @@ def zone_label(zc: hp.ZoneConfig) -> str:
     if len(zc.residents) == 1:
         return f"{zc.residents[0].capitalize()}'s room"
     name = zc.name.replace("_", " ")
-    return (name if name.endswith("room") else f"{name} room").capitalize()
+    return name if name.endswith("room") else f"{name} room"
 
 
 def day_call_hours(daily: dict, day: str) -> Optional[float]:
@@ -113,16 +122,27 @@ def day_call_hours(daily: dict, day: str) -> Optional[float]:
     return total if daily else None
 
 
+def _outlook(mean: float) -> str:
+    return f"Next {OUTLOOK_HOURS // 24} days {round(mean)} °C."
+
+
+def _period(days: int) -> str:
+    if days == 1:
+        return "yesterday"
+    return "last week" if days == 7 else f"over the last {days} days"
+
+
 @dataclass(frozen=True)
 class Inputs:
     """What the advisor needs at the moment of judging: today's date, the season, the mean
-    forecast temperature of the next OUTLOOK_HOURS, each advised zone's base target and every
-    zone's closed-day records."""
+    forecast temperature of the next OUTLOOK_HOURS, each advised zone's base target and current
+    air (None where unreadable), and every zone's closed-day records."""
 
     day: str
     season_on: bool
     forecast_mean: Optional[float]
     bases: dict = field(default_factory=dict)
+    airs: dict = field(default_factory=dict)
     daily: dict = field(default_factory=dict)
 
 
@@ -139,6 +159,7 @@ class Verdict:
     message: str = ""
     forecast_mean: Optional[float] = None
     mornings: dict = field(default_factory=dict)  # zone -> mean per morning, newest first
+    limits: dict = field(default_factory=dict)  # zone -> the air it must stay under to fail
     failed: tuple = ()
     call_hours: tuple = ()  # all zones together per closed day, newest first
 
@@ -153,6 +174,8 @@ class Verdict:
                 zone: [None if m is None else round(m, 2) for m in means]
                 for zone, means in self.mornings.items()
             }
+        if self.limits:
+            out["limits"] = {zone: round(limit, 2) for zone, limit in self.limits.items()}
         if self.failed:
             out["failed"] = list(self.failed)
         if self.call_hours:
@@ -198,7 +221,7 @@ class SeasonAdvisor:
 
     def note_season(self, on: bool, day: str) -> None:
         """Tell the advisor what the season switch reads. The day a season is first seen on is
-        the day it started, so the stop advice waits for whole days after it."""
+        the day it started, so the stop advice waits for the days after it."""
         if on != self._season_on:
             self._season_on = on
             self._on_since = day if on else None
@@ -208,8 +231,8 @@ class SeasonAdvisor:
             self._on_since = day
 
     def observe(self, zone: str, day: str, minute: int, air: Optional[float]) -> None:
-        """One reading of a zone's control air, which the caller has already limited to room
-        sensors and closed openings. Only the morning of a season that is off is kept."""
+        """One reading of a zone's air, which the caller has already limited to closed openings.
+        Only the morning of a season that is off is kept."""
         if self._season_on is not False or zone not in self.cfg.zones or air is None:
             return
         if not hp.SEASON_MORNING_FROM <= minute < hp.SEASON_MORNING_TO:
@@ -259,48 +282,61 @@ class SeasonAdvisor:
         days = [_shift(inp.day, -k) for k in range(cfg.mornings)]
         means = {zone: [self._mean(zone, d) for d in days] for zone in cfg.zones}
         judged = [z for z in cfg.zones if None not in means[z] and inp.bases.get(z) is not None]
-        failed = tuple(z for z in judged if all(m < inp.bases[z] - cfg.margin_c for m in means[z]))
-        seen = dict(day=inp.day, forecast_mean=inp.forecast_mean, mornings=means, failed=failed)
+        limits = {z: inp.bases[z] - cfg.margin(z) for z in judged}
+        failed = tuple(z for z in judged if all(m < limits[z] for m in means[z]))
+        seen = dict(
+            day=inp.day,
+            forecast_mean=inp.forecast_mean,
+            mornings=means,
+            limits=limits,
+            failed=failed,
+        )
         if not judged:
             return Verdict(reason=REASON_NO_DATA, **seen)
         if not failed:
             return Verdict(reason=REASON_WARM, **seen)
         if inp.forecast_mean >= cfg.start_below_c:
             return Verdict(reason=REASON_MILD, **seen)
-        first, *others = failed
-        rooms = f"{self._labels[first]} was {means[first][0]:.1f} °C this morning with the heat off"
-        rooms += "".join(f", {self._labels[z]} {means[z][0]:.1f}" for z in others)
+        first, *others = sorted(failed, key=lambda z: means[z][0] - inp.bases[z])
+        rooms = [
+            f"{_cap(self._labels[first])} {means[first][0]:.1f} °C this morning "
+            f"(target {inp.bases[first]:.1f})"
+        ]
+        rooms += [f"{self._labels[z]} {means[z][0]:.1f}" for z in others]
         return Verdict(
             advice=ADVICE_START,
-            title="Heating season?",
-            message=f"{rooms}. {self._outlook(inp.forecast_mean)}",
+            title="Heating on?",
+            message=f"{', '.join(rooms)}. {_outlook(inp.forecast_mean)} Time to turn the heat on?",
             **seen,
         )
 
     def _stop(self, inp: Inputs) -> Verdict:
         cfg = self.cfg
-        days = [_shift(inp.day, -k) for k in range(1, cfg.idle_days + 1)]
         seen = dict(day=inp.day, forecast_mean=inp.forecast_mean)
-        if self._on_since is None or self._on_since > _shift(inp.day, -(cfg.idle_days + 1)):
+        today = date.fromisoformat(inp.day)
+        if not cfg.stop_from <= (today.month, today.day) <= cfg.stop_until:
+            return Verdict(reason=REASON_DATES, **seen)
+        if self._on_since is None or self._on_since > _shift(inp.day, -cfg.season_min_days):
             return Verdict(reason=REASON_YOUNG, **seen)
+        days = [_shift(inp.day, -k) for k in range(1, cfg.look_back_days + 1)]
         totals = tuple(day_call_hours(inp.daily, d) for d in days)
         seen["call_hours"] = totals
-        if None in totals:
-            return Verdict(reason=REASON_NO_DATA, **seen)
-        if any(t >= cfg.idle_hours for t in totals):
-            return Verdict(reason=REASON_CALLS, **seen)
-        if inp.forecast_mean <= cfg.stop_above_c:
+        known = [t for t in totals if t is not None]
+        idle = sum(1 for t in known if t < cfg.idle_hours)
+        if idle < cfg.idle_days:
+            unknown = len(totals) - len(known)
+            reason = REASON_NO_DATA if idle + unknown >= cfg.idle_days else REASON_CALLS
+            return Verdict(reason=reason, **seen)
+        if inp.forecast_mean < cfg.stop_min_c:
             return Verdict(reason=REASON_COOL, **seen)
+        facts = [f"Heat ran {statistics.median(known):.1f} h a day {_period(cfg.look_back_days)}"]
+        temps = [round(a) for a in inp.airs.values() if a is not None]
+        if temps:
+            low, high = min(temps), max(temps)
+            facts.append(f"rooms {low}-{high} °C" if low != high else f"rooms {low} °C")
         return Verdict(
             advice=ADVICE_STOP,
-            title="Heating can go off for the summer?",
-            message=(
-                f"No room has asked for heat for {_plural(cfg.idle_days, 'day')}. "
-                f"{self._outlook(inp.forecast_mean)}"
-            ),
+            title="Heating off?",
+            message=f"{', '.join(facts)}. {_outlook(inp.forecast_mean)} Turn the heat off?",
             **seen,
         )
-
-    @staticmethod
-    def _outlook(mean: float) -> str:
-        return f"Next {_plural(OUTLOOK_HOURS // 24, 'day')} average {mean:.1f} °C outside."

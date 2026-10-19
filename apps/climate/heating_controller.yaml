@@ -58,24 +58,37 @@ HeatingController:
     no_hot_water_c: 28
     repeat_hours: 6
 
-  # Asks the owner by push when to start or stop the season; the switch stays the owner's.
-  # Season off: from evaluate_at, a zone cannot keep warm when its 05:00-09:00 air, with the
-  # heat off and its openings closed, was under its base target minus margin_c on each of the
-  # last `mornings` mornings. With one such zone and the next 72 hours forecast to average
-  # under start_below_c, the owner is asked to start. Season on: when all zones together called
-  # for heat for under idle_hours a day for idle_days whole days and the next 72 hours are
-  # forecast to average over stop_above_c, the owner is asked whether it can stop. An ask
-  # repeats after reask_days at the earliest.
+  # Asks the owner by push whether to turn the heat on or off; the switch stays the owner's.
+  # Season off: from evaluate_at, a zone cannot keep warm when the mean air of its rooms
+  # between 05:00 and 09:00, with the heat off and every opening of the zone closed, was under
+  # its base target minus its margin_c on each of the last `mornings` mornings. With one such
+  # zone and the next 72 hours forecast to average under start_below_c, the owner is asked to
+  # turn it on. Season on, from stop_from to stop_until (month-day): when all zones together
+  # called for heat for under idle_hours on at least idle_days of the last look_back_days
+  # closed days, the season has been on for season_min_days and the next 72 hours are forecast
+  # to average at least stop_min_c, the owner is asked whether it can go off. An ask repeats
+  # after reask_days at the earliest. A zone's margin_c replaces the default.
   season_advisor:
     evaluate_at: "08:00"
-    zones: [family, kristines_room, claudias_room]
     margin_c: 0.5
     mornings: 2
-    start_below_c: 10
+    start_below_c: 12
+    stop_from: "03-01"
+    stop_until: "09-30"
+    look_back_days: 7
     idle_days: 5
-    idle_hours: 0.2
-    stop_above_c: 12
+    idle_hours: 2
+    stop_min_c: 5
+    season_min_days: 7
     reask_days: 3
+    zones:
+      family:
+        rooms: [sensor.living_room_feel, sensor.dining_room_feel, sensor.kitchen_feel]
+      kristines_room:
+        rooms: [sensor.kristines_room_feel]
+        margin_c: 0.2
+      claudias_room:
+        rooms: [sensor.claudias_room_feel]
 
   # The bedroom ceiling is the helper value from evening_from until morning_from, and
   # morning_offset_c higher from then until wake. Once the evening window has closed, a mean

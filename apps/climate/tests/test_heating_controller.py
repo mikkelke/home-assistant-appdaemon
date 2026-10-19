@@ -425,14 +425,25 @@ class ShippedYaml(unittest.TestCase):
         )
 
     def test_the_season_advisor_ships_with_the_decided_numbers(self):
-        self.assertEqual(
-            self.cfg.season_advisor,
-            hp.SeasonAdvisorConfig(zones=("family", "kristines_room", "claudias_room")),
-        )
+        a = self.cfg.season_advisor
+        self.assertEqual(a.zones, ("family", "kristines_room", "claudias_room"))
+        self.assertEqual(a.margins, {"kristines_room": 0.2})
+        self.assertEqual((a.margin("family"), a.margin("claudias_room")), (0.5, 0.5))
+        self.assertEqual((a.evaluate_at, a.mornings, a.start_below_c), (8 * 60, 2, 12.0))
+        self.assertEqual((a.stop_from, a.stop_until), ((3, 1), (9, 30)))
+        self.assertEqual((a.look_back_days, a.idle_days, a.idle_hours), (7, 5, 2.0))
+        self.assertEqual((a.stop_min_c, a.season_min_days, a.reask_days), (5.0, 7, 3))
+        self.assertEqual(a, hp.parse_config(self.args).season_advisor)
 
     def test_the_family_room_is_one_zone_of_living_room_dining_room_and_kitchen(self):
         rooms = ("sensor.living_room_feel", "sensor.dining_room_feel", "sensor.kitchen_feel")
         self.assertEqual(self.cfg.zones["family"].control_air, rooms)
+        self.assertEqual(self.cfg.season_advisor.rooms["family"], rooms)
+
+    def test_the_advisor_judges_every_zone_on_the_air_the_controller_plans_by(self):
+        a = self.cfg.season_advisor
+        for zone in a.zones:
+            self.assertEqual(a.rooms[zone], self.cfg.zones[zone].control_air, zone)
 
     def test_family_profile_is_minus_half_nights_and_mornings_plus_half_evenings(self):
         periods = {(p.start, p.end): p.offset for p in self.cfg.zones["family"].profile.periods}
@@ -2681,21 +2692,25 @@ class AlertsEndToEnd(unittest.TestCase):
             f.read_text().encode("ascii")
 
 
-class SeasonAdviceEndToEnd(unittest.TestCase):
-    """The advisor in the controller. The morning of the 19th runs on real ticks from 05:00; the
-    mornings before it are handed to the advisor."""
+class SeasonHarness:
+    """Helpers for the season advice tests. The day under test is DAY of MONTH 2026 and its
+    morning runs on real ticks from 05:00; the mornings before it are handed to the advisor."""
 
+    MONTH = 10
     DAY = 19
     COLD = {"stale": "false", "sun_hit": "false", "window_open": "false"}
-    MESSAGE = "Family room was 20.8 °C this morning with the heat off, Claudia's room 20.9. "
+
+    def set_clock(self, h, hour, minute=0, day=None):
+        h.clock.now = datetime(2026, self.MONTH, day or self.DAY, hour, minute, tzinfo=TZ)
+        return h
 
     def harness(self, **kw):
-        clock = Clock(datetime(2026, 10, self.DAY, 5, 0, tzinfo=TZ))
+        clock = Clock(datetime(2026, self.MONTH, self.DAY, 5, 0, tzinfo=TZ))
         return Harness(self, clock=clock, forecast=False, **kw)
 
     def forecast(self, h, temp=7.0, day=None):
         """A four-day forecast from midnight of the day with every hour at `temp`."""
-        midnight = int(datetime(2026, 10, day or self.DAY, tzinfo=TZ).timestamp())
+        midnight = int(datetime(2026, self.MONTH, day or self.DAY, tzinfo=TZ).timestamp())
         n = 96
         h.payload = {
             "hourly": {
@@ -2708,22 +2723,28 @@ class SeasonAdviceEndToEnd(unittest.TestCase):
         }
         h.fetch()
 
-    def cold(self, h, family=20.8, claudia=20.9):
+    def cold(self, h, family=20.8, claudia=20.9, kristine=None):
+        """The air of the advised zones; the family room is its three rooms at one temperature."""
         for feel in FEELS["family"]:
             h.ha.set(feel, str(family), self.COLD)
         h.ha.set("sensor.claudias_room_feel", str(claudia), self.COLD)
+        if kristine is not None:
+            h.ha.set("sensor.kristines_room_feel", str(kristine), self.COLD)
 
-    def before(self, h, family=20.9, claudia=20.9, day="2026-10-18"):
-        """A morning of the days before, as the advisor would have kept it."""
+    def before(self, h, family=20.9, claudia=20.9, kristine=None):
+        """The morning before, as the advisor would have kept it."""
+        day = f"2026-{self.MONTH:02d}-{self.DAY - 1:02d}"
         advisor = h.app._advisor
         advisor.note_season(False, day)
         for i in range(36):
             advisor.observe("family", day, 5 * 60 + 5 * i, family)
             advisor.observe("claudias_room", day, 5 * 60 + 5 * i, claudia)
+            if kristine is not None:
+                advisor.observe("kristines_room", day, 5 * 60 + 5 * i, kristine)
 
     def morning(self, h, until=(8, 0), start=(5, 0), day=None):
         """Five-minute ticks from `start` up to and including `until`."""
-        h.at(*start, day=day or self.DAY)
+        self.set_clock(h, *start, day=day)
         while (h.clock.now.hour, h.clock.now.minute) <= until:
             h.tick()
             h.clock.advance(minutes=5)
@@ -2737,17 +2758,37 @@ class SeasonAdviceEndToEnd(unittest.TestCase):
     def sensor(self, h):
         return h.last("sensor.heating_controller")["attributes"]
 
-    def cold_house(self):
-        h = self.harness()
-        self.forecast(h)
-        self.cold(h)
-        self.before(h)
-        return h
-
     def restarted(self, h):
         again = Harness(self, args=h.app.args, clock=h.clock, with_house=False, forecast=False)
         again.ha.entities = h.ha.entities
         return again
+
+    def silent(self, h):
+        for name in (
+            "call_service",
+            "turn_on",
+            "turn_off",
+            "toggle",
+            "select_option",
+            "set_value",
+            "set_textvalue",
+        ):
+            getattr(h.app, name).assert_not_called()
+        self.assertEqual(self.sensor(h)["zones_live"], ["<none>"])
+
+
+class SeasonStartEndToEnd(SeasonHarness, unittest.TestCase):
+    MESSAGE = (
+        "Family room 20.8 °C this morning (target 21.5), Claudia's room 20.9. "
+        "Next 3 days 7 °C. Time to turn the heat on?"
+    )
+
+    def cold_house(self):
+        h = self.harness()
+        self.forecast(h)
+        self.cold(h)
+        self.before(h, kristine=22.2)
+        return h
 
     def test_cold_mornings_and_a_cold_forecast_push_the_owner_at_eight(self):
         h = self.cold_house()
@@ -2757,10 +2798,7 @@ class SeasonAdviceEndToEnd(unittest.TestCase):
         self.assertEqual(a["season_advice"], "none")
         self.assertNotIn("season_advice_day", a)
         self.morning(h, start=(8, 0), until=(8, 0))
-        self.assertEqual(
-            self.pushes(h),
-            [("Heating season?", self.MESSAGE + "Next 3 days average 7.0 °C outside.", "mikkel")],
-        )
+        self.assertEqual(self.pushes(h), [("Heating on?", self.MESSAGE, "mikkel")])
 
     def test_the_sensor_and_the_log_show_what_it_judged(self):
         h = self.cold_house()
@@ -2775,7 +2813,7 @@ class SeasonAdviceEndToEnd(unittest.TestCase):
             a["season_morning_means"],
             {
                 "family": ["20.8", "20.9"],
-                "kristines_room": ["22.2", "n/a"],
+                "kristines_room": ["22.2", "22.2"],
                 "claudias_room": ["20.9", "20.9"],
             },
         )
@@ -2787,14 +2825,17 @@ class SeasonAdviceEndToEnd(unittest.TestCase):
             ("start", True, ["family", "claudias_room"], 7.0),
         )
         self.assertEqual(rec["mornings"]["family"], [20.8, 20.9])
-        self.assertEqual(rec["message"], self.MESSAGE + "Next 3 days average 7.0 °C outside.")
+        self.assertEqual(
+            rec["limits"], {"family": 21.0, "kristines_room": 21.3, "claudias_room": 21.0}
+        )
+        self.assertEqual(rec["message"], self.MESSAGE)
         self.assertEqual(h.app._advisor.snapshot()["asked"], {"start": "2026-10-19"})
 
     def test_it_judges_once_a_day(self):
         h = self.cold_house()
         self.morning(h, until=(8, 30))
         self.assertEqual(len(self.pushes(h)), 1)
-        h.at(15, 0, day=self.DAY)
+        self.set_clock(h, 15)
         h.tick()
         h.tick(minutes=5)
         self.assertEqual(self.pushes(h), [])
@@ -2808,14 +2849,58 @@ class SeasonAdviceEndToEnd(unittest.TestCase):
             self.pushes(h),
             [
                 (
-                    "Heating season?",
-                    "Claudia's room was 20.9 °C this morning with the heat off. "
-                    "Next 3 days average 7.0 °C outside.",
+                    "Heating on?",
+                    "Claudia's room 20.9 °C this morning (target 21.5). "
+                    "Next 3 days 7 °C. Time to turn the heat on?",
                     "mikkel",
                 )
             ],
         )
         self.assertEqual(self.sensor(h)["season_morning_means"]["family"], ["n/a", "20.9"])
+
+    def test_the_family_room_is_judged_on_living_room_dining_room_and_kitchen(self):
+        h = self.harness()
+        self.forecast(h)
+        self.before(h, family=20.6)
+        for feel, value in zip(FEELS["family"], ("20.6", "20.6", "22.4")):
+            h.ha.set(feel, value, self.COLD)  # a warm kitchen: the joined room is 21.2 in all
+        self.morning(h)
+        self.assertEqual(self.pushes(h), [])
+        self.assertEqual(self.sensor(h)["season_morning_means"]["family"], ["21.2", "20.6"])
+
+    def test_a_kitchen_that_reads_stale_is_left_out_of_the_family_room(self):
+        h = self.harness()
+        self.forecast(h)
+        self.before(h, family=20.6)
+        for feel, value in zip(FEELS["family"], ("20.6", "20.6", "22.4")):
+            h.ha.set(feel, value, dict(self.COLD, stale="true") if "kitchen" in feel else self.COLD)
+        self.morning(h)
+        (push,) = self.pushes(h)
+        self.assertIn("Family room 20.6 °C this morning (target 21.5)", push[1])
+
+    def test_kristine_is_judged_closer_to_her_target(self):
+        h = self.harness()
+        self.forecast(h)
+        self.before(h, family=22.0, claudia=22.0, kristine=21.2)
+        self.cold(h, family=22.0, claudia=22.0, kristine=21.2)
+        self.morning(h)
+        self.assertEqual(
+            self.pushes(h),
+            [
+                (
+                    "Heating on?",
+                    "Kristine's room 21.2 °C this morning (target 21.5). "
+                    "Next 3 days 7 °C. Time to turn the heat on?",
+                    "mikkel",
+                )
+            ],
+        )
+        h = self.harness()
+        self.forecast(h)
+        self.before(h, family=21.2, claudia=21.2, kristine=21.4)
+        self.cold(h, family=21.2, claudia=21.2, kristine=21.4)
+        self.morning(h)
+        self.assertEqual(self.pushes(h), [])
 
     def test_the_limit_is_the_target_helper_not_the_yaml_base(self):
         h = self.harness()
@@ -2825,7 +2910,7 @@ class SeasonAdviceEndToEnd(unittest.TestCase):
         self.before(h, family=21.2, claudia=22.0)
         self.morning(h)
         (push,) = self.pushes(h)
-        self.assertIn("Family room was 21.2 °C", push[1])
+        self.assertIn("Family room 21.2 °C this morning (target 22.0)", push[1])
 
     def test_warm_mornings_and_a_mild_forecast_ask_nothing(self):
         h = self.harness()
@@ -2836,7 +2921,7 @@ class SeasonAdviceEndToEnd(unittest.TestCase):
         self.assertEqual(self.sensor(h)["season_advice"], "none")
         self.assertEqual(self.sensor(h)["season_advice_reason"], "warm_enough")
         h = self.harness()
-        self.forecast(h, temp=11.0)
+        self.forecast(h, temp=12.0)
         self.cold(h)
         self.before(h)
         self.morning(h)
@@ -2865,13 +2950,24 @@ class SeasonAdviceEndToEnd(unittest.TestCase):
         self.assertEqual(self.pushes(h), [])
         self.assertEqual(self.sensor(h)["forecast_ok"], "true")
 
-    def test_only_the_room_sensors_count(self):
+    def test_only_room_sensors_that_read_count(self):
         h = self.cold_house()
         for feel in FEELS["family"] + FEELS["claudias_room"]:
             h.ha.set(feel, "20.8", {"stale": "true"})
         self.morning(h)
         self.assertNotIn("2026-10-19", h.app._advisor.snapshot()["mornings"].get("family", {}))
         self.assertEqual(self.pushes(h), [])
+        for feel in FEELS["family"] + FEELS["claudias_room"]:
+            h.ha.set(feel, "unavailable")
+        self.morning(h, start=(5, 0))
+        self.assertNotIn("2026-10-19", h.app._advisor.snapshot()["mornings"].get("family", {}))
+
+    def test_an_impossible_room_reading_is_not_a_sample(self):
+        h = self.cold_house()
+        for feel in FEELS["family"]:
+            h.ha.set(feel, "0.0", self.COLD)
+        self.morning(h)
+        self.assertNotIn("2026-10-19", h.app._advisor.snapshot()["mornings"].get("family", {}))
 
     def test_a_morning_with_the_heat_on_is_not_kept_and_asks_nothing(self):
         h = self.cold_house()
@@ -2880,7 +2976,7 @@ class SeasonAdviceEndToEnd(unittest.TestCase):
         self.assertNotIn("2026-10-19", h.app._advisor.snapshot()["mornings"].get("family", {}))
         self.assertEqual(self.pushes(h), [])
         self.assertEqual(self.sensor(h)["season_advice"], "none")
-        self.assertEqual(self.sensor(h)["season_advice_reason"], "season_young")
+        self.assertEqual(self.sensor(h)["season_advice_reason"], "outside_dates")
 
     def test_an_unreadable_season_switch_judges_nothing(self):
         h = self.cold_house()
@@ -2891,7 +2987,7 @@ class SeasonAdviceEndToEnd(unittest.TestCase):
 
     def test_event_driven_evaluations_do_not_weigh_a_reading_twice(self):
         h = self.cold_house()
-        h.at(6, 0, day=self.DAY)
+        self.set_clock(h, 6)
         h.tick()
         h.app._evaluate_pending({})
         h.app._evaluate_pending({})
@@ -2911,9 +3007,9 @@ class SeasonAdviceEndToEnd(unittest.TestCase):
             self.pushes(h2),
             [
                 (
-                    "Heating season?",
-                    "Family room was 20.8 °C this morning with the heat off. "
-                    "Next 3 days average 7.0 °C outside.",
+                    "Heating on?",
+                    "Family room 20.8 °C this morning (target 21.5). "
+                    "Next 3 days 7 °C. Time to turn the heat on?",
                     "mikkel",
                 )
             ],
@@ -2927,7 +3023,7 @@ class SeasonAdviceEndToEnd(unittest.TestCase):
         h2.tick()
         h2.tick(minutes=5)
         self.assertEqual(self.pushes(h2), [])
-        h2.at(5, 0, day=20)
+        self.set_clock(h2, 5, day=20)
         self.forecast(h2, day=20)
         self.morning(h2, day=20)
         self.assertEqual(self.pushes(h2), [])
@@ -2943,7 +3039,7 @@ class SeasonAdviceEndToEnd(unittest.TestCase):
         for day in ("2026-10-21", "2026-10-22"):
             for i in range(36):
                 h2.app._advisor.observe("family", day, 5 * 60 + 5 * i, 20.8)
-        h2.at(8, 0, day=22)
+        self.set_clock(h2, 8, day=22)
         self.forecast(h2, day=22)
         h2.tick()
         self.assertEqual(len(self.pushes(h2)), 1)
@@ -2956,85 +3052,6 @@ class SeasonAdviceEndToEnd(unittest.TestCase):
         h.tick()
         self.assertEqual(self.sensor(h)["season_advice"], "none")
         self.assertEqual(h.app._advisor.snapshot()["asked"], {})
-
-    def spring(self, calling=None):
-        """The season on since the 1st, and the 14th to the 18th closed by the real rollup. The
-        zones in `calling` ask for heat for that many seconds on the day given."""
-        h = self.harness()
-        h.ha.set("input_boolean.heating_season", "on")
-        self.forecast(h, temp=14.0)
-        h.app._advisor.note_season(True, "2026-10-01")
-        for zone, rt in h.app._zones.items():
-            rt.days = {}
-            for d in (14, 15, 16, 17, 18):
-                day = f"2026-10-{d}"
-                call_s = (calling or {}).get((zone, day), 0.0)
-                rt.days[day] = hp.ZoneDay(day, {"ticks": 288, "call_s": call_s})
-        h.app._rollup_if_due(h.clock.now)
-        return h
-
-    def test_five_idle_days_and_a_warm_forecast_ask_whether_it_can_stop(self):
-        h = self.spring()
-        self.assertEqual(len(h.app._zones["family"].daily), 5)
-        self.morning(h)
-        self.assertEqual(
-            self.pushes(h),
-            [
-                (
-                    "Heating can go off for the summer?",
-                    "No room has asked for heat for 5 days. Next 3 days average 14.0 °C outside.",
-                    "mikkel",
-                )
-            ],
-        )
-        (rec,) = h.log_lines("season_advice")
-        self.assertEqual(
-            (rec["advice"], rec["pushed"], rec["call_hours"]), ("stop", True, [0.0] * 5)
-        )
-        a = self.sensor(h)
-        self.assertEqual((a["season_advice"], a["season_forecast_mean"]), ("stop", "14.0"))
-        self.assertNotIn("season_morning_means", a)
-        assert_publishable(self, a)
-
-    def test_a_day_the_rollup_only_closes_at_the_first_tick_is_counted_by_that_tick(self):
-        h = self.spring()
-        for rt in h.app._zones.values():
-            rt.daily = [r for r in rt.daily if r["day"] != "2026-10-18"]
-            rt.days["2026-10-18"] = hp.ZoneDay("2026-10-18", {"ticks": 288, "call_s": 0.0})
-        self.morning(h, start=(9, 0), until=(9, 0))
-        self.assertEqual(len(self.pushes(h)), 1)
-
-    def test_a_day_with_heat_wanted_keeps_the_season(self):
-        h = self.spring({("claudias_room", "2026-10-16"): 1800.0})
-        self.morning(h)
-        self.assertEqual(self.pushes(h), [])
-        self.assertEqual(self.sensor(h)["season_advice_reason"], "heat_wanted")
-        self.assertEqual(self.sensor(h)["season_advice"], "none")
-
-    def test_the_limit_is_all_the_zones_together(self):
-        h = self.spring({("family", "2026-10-16"): 600.0})  # 0.17 h
-        self.morning(h)
-        self.assertEqual(len(self.pushes(h)), 1)
-        h = self.spring({(zone, "2026-10-16"): 300.0 for zone in ZONES})  # five times 0.08 h
-        self.morning(h)
-        self.assertEqual(self.pushes(h), [])
-        self.assertEqual(self.sensor(h)["season_advice_reason"], "heat_wanted")
-
-    def test_a_season_only_days_old_is_not_asked_about(self):
-        h = self.spring()
-        h.app._advisor.note_season(False, "2026-10-13")
-        h.app._advisor.note_season(True, "2026-10-17")
-        self.morning(h)
-        self.assertEqual(self.pushes(h), [])
-        self.assertEqual(self.sensor(h)["season_advice_reason"], "season_young")
-
-    def test_a_day_the_controller_did_not_see_is_unknown(self):
-        h = self.spring()
-        for rt in h.app._zones.values():
-            rt.daily = [r for r in rt.daily if r["day"] != "2026-10-15"]
-        self.morning(h)
-        self.assertEqual(self.pushes(h), [])
-        self.assertEqual(self.sensor(h)["season_advice_reason"], "no_data")
 
     def test_without_the_block_there_is_no_advisor_and_nothing_changes(self):
         tmp = Path(tempfile.mkdtemp())
@@ -3072,20 +3089,138 @@ class SeasonAdviceEndToEnd(unittest.TestCase):
         self.assertTrue(any("season advice: start" in m for _lvl, m in h.logs))
 
     def test_it_never_calls_a_service(self):
-        for h in (self.cold_house(), self.spring()):
-            self.morning(h)
-            for name in (
-                "call_service",
-                "turn_on",
-                "turn_off",
-                "toggle",
-                "select_option",
-                "set_value",
-                "set_textvalue",
-            ):
-                getattr(h.app, name).assert_not_called()
-            self.assertEqual(self.sensor(h)["zones_live"], ["<none>"])
-            self.assertEqual(len(self.pushes(h)), 1)
+        h = self.cold_house()
+        self.morning(h)
+        self.silent(h)
+        self.assertEqual(len(self.pushes(h)), 1)
+
+
+class SeasonStopEndToEnd(SeasonHarness, unittest.TestCase):
+    MONTH = 3
+    DAY = 26
+    DAYS = [f"2026-03-{d}" for d in range(19, 26)]
+
+    def spring(self, calling=None, since="2025-10-26", drop=()):
+        """The season on since `since`, and the 19th to the 25th closed by the real rollup. The
+        zones in `calling` ask for heat for that many seconds on the day given; the days in
+        `drop` are left out as if the controller had not seen them."""
+        h = self.harness()
+        h.ha.set("input_boolean.heating_season", "on")
+        h.ha.set("sensor.kristines_room_feel", "21.6", self.COLD)
+        h.ha.set("sensor.claudias_room_feel", "22.9", self.COLD)
+        self.forecast(h, temp=7.0)
+        h.app._advisor.note_season(True, since)
+        for zone, rt in h.app._zones.items():
+            rt.days = {}
+            for day in self.DAYS:
+                if day not in drop:
+                    call_s = (calling or {}).get((zone, day), 0.0)
+                    rt.days[day] = hp.ZoneDay(day, {"ticks": 288, "call_s": call_s})
+        h.app._rollup_if_due(h.clock.now)
+        return h
+
+    def test_a_week_without_much_heat_and_a_mild_outlook_ask_whether_it_can_go_off(self):
+        h = self.spring()
+        self.assertEqual(len(h.app._zones["family"].daily), 7)
+        self.morning(h)
+        self.assertEqual(
+            self.pushes(h),
+            [
+                (
+                    "Heating off?",
+                    "Heat ran 0.0 h a day last week, rooms 22-23 °C. "
+                    "Next 3 days 7 °C. Turn the heat off?",
+                    "mikkel",
+                )
+            ],
+        )
+        (rec,) = h.log_lines("season_advice")
+        self.assertEqual(rec["ts"], "2026-03-26T08:00:00+01:00")
+        self.assertEqual(
+            (rec["advice"], rec["pushed"], rec["call_hours"]), ("stop", True, [0.0] * 7)
+        )
+        a = self.sensor(h)
+        self.assertEqual((a["season_advice"], a["season_forecast_mean"]), ("stop", "7.0"))
+        self.assertNotIn("season_morning_means", a)
+        assert_publishable(self, a)
+
+    def test_blips_are_allowed_but_three_busy_days_are_not(self):
+        two = {("family", "2026-03-20"): 3 * 3600.0, ("family", "2026-03-23"): 5 * 3600.0}
+        h = self.spring(two)
+        self.morning(h)
+        self.assertEqual(len(self.pushes(h)), 1)
+        three = {**two, ("claudias_room", "2026-03-24"): 2.5 * 3600.0}
+        h = self.spring(three)
+        self.morning(h)
+        self.assertEqual(self.pushes(h), [])
+        self.assertEqual(self.sensor(h)["season_advice_reason"], "heat_wanted")
+
+    def test_the_limit_is_all_the_zones_together(self):
+        days = ("2026-03-20", "2026-03-22", "2026-03-24")
+        h = self.spring({("family", d): 1800.0 for d in days})  # 0.5 h a day
+        self.morning(h)
+        self.assertEqual(len(self.pushes(h)), 1)
+        h = self.spring({(zone, d): 1800.0 for zone in ZONES for d in days})  # 2.5 h a day
+        self.morning(h)
+        self.assertEqual(self.pushes(h), [])
+        self.assertEqual(self.sensor(h)["season_advice_reason"], "heat_wanted")
+
+    def test_a_cold_outlook_keeps_the_heat_on(self):
+        h = self.spring()
+        self.forecast(h, temp=4.0)
+        self.morning(h)
+        self.assertEqual(self.pushes(h), [])
+        self.assertEqual(self.sensor(h)["season_advice_reason"], "forecast_cool")
+        h = self.spring()
+        self.forecast(h, temp=5.0)
+        self.morning(h)
+        self.assertEqual(len(self.pushes(h)), 1)
+
+    def test_a_season_only_days_old_is_not_asked_about(self):
+        h = self.spring(since="2026-03-20")
+        self.morning(h)
+        self.assertEqual(self.pushes(h), [])
+        self.assertEqual(self.sensor(h)["season_advice_reason"], "season_young")
+
+    def test_days_the_controller_did_not_see_are_not_idle_ones(self):
+        h = self.spring(drop=("2026-03-20", "2026-03-22"))
+        self.morning(h)
+        self.assertEqual(len(self.pushes(h)), 1)
+        h = self.spring(drop=("2026-03-20", "2026-03-22", "2026-03-24"))
+        self.morning(h)
+        self.assertEqual(self.pushes(h), [])
+        self.assertEqual(self.sensor(h)["season_advice_reason"], "no_data")
+
+    def test_a_day_the_rollup_only_closes_at_the_first_tick_is_counted_by_that_tick(self):
+        # two busy days leave exactly five idle ones, the last of them still open
+        h = self.spring({("family", "2026-03-20"): 10800.0, ("family", "2026-03-22"): 10800.0})
+        for rt in h.app._zones.values():
+            rt.daily = [r for r in rt.daily if r["day"] != "2026-03-25"]
+            rt.days["2026-03-25"] = hp.ZoneDay("2026-03-25", {"ticks": 288, "call_s": 0.0})
+        self.morning(h, start=(9, 0), until=(9, 0))
+        self.assertEqual(len(self.pushes(h)), 1)
+
+    def test_the_ask_is_not_repeated_for_three_days_not_even_after_a_restart(self):
+        h = self.spring()
+        self.morning(h)
+        self.assertEqual(len(self.pushes(h)), 1)
+        h2 = self.restarted(h)
+        pushed = []
+        for day in (27, 28, 29):
+            for rt in h2.app._zones.values():
+                rt.daily.append({"day": f"2026-03-{day - 1}", "ticks": 288, "call_hours": 0.0})
+            self.set_clock(h2, 8, day=day)
+            self.forecast(h2, day=day)
+            h2.tick()
+            pushed.append(len(self.pushes(h2)))
+        self.assertEqual(pushed, [0, 0, 1])
+        self.assertEqual(h.log_lines("season_advice")[1]["reason"], "asked_recently")
+
+    def test_it_never_calls_a_service(self):
+        h = self.spring()
+        self.morning(h)
+        self.silent(h)
+        self.assertEqual(len(self.pushes(h)), 1)
 
 
 class EverythingStaysShadow(unittest.TestCase):

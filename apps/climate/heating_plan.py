@@ -102,6 +102,18 @@ def parse_clock(text: object) -> int:
     return h * 60 + m
 
 
+def parse_month_day(text: object) -> tuple:
+    """'MM-DD' to (month, day)."""
+    if not isinstance(text, str) or text.count("-") != 1:
+        raise ConfigError(f"date must be a quoted 'MM-DD' string, got {text!r}")
+    try:
+        month, day = (int(x) for x in text.split("-"))
+        date(2000, month, day)
+    except ValueError:
+        raise ConfigError(f"bad date {text!r}") from None
+    return month, day
+
+
 def in_span(minute: int, start: int, end: int) -> bool:
     """Whether a clock minute is inside [start, end), the span wrapping past midnight when
     start > end."""
@@ -260,18 +272,30 @@ class AlertConfig:
 
 @dataclass(frozen=True)
 class SeasonAdvisorConfig:
-    """Rules of the season advisor, see heating_season. evaluate_at is a clock time in minutes
-    since midnight, and the morning it judges is SEASON_MORNING_FROM to SEASON_MORNING_TO."""
+    """Rules of the season advisor, see heating_season. zones are the advised zones in the order
+    the config lists them, rooms the room sensors each one is judged on, and margins the zones
+    whose margin differs from margin_c. evaluate_at is a clock time in minutes since midnight,
+    and the morning it judges is SEASON_MORNING_FROM to SEASON_MORNING_TO. stop_from and
+    stop_until are the (month, day) between which the stop advice is considered."""
 
     zones: tuple
+    rooms: dict = field(default_factory=dict)
+    margins: dict = field(default_factory=dict)
     evaluate_at: int = 8 * 60
     margin_c: float = 0.5
     mornings: int = 2
-    start_below_c: float = 10.0
+    start_below_c: float = 12.0
+    stop_from: tuple = (3, 1)
+    stop_until: tuple = (9, 30)
+    look_back_days: int = 7
     idle_days: int = 5
-    idle_hours: float = 0.2
-    stop_above_c: float = 12.0
+    idle_hours: float = 2.0
+    stop_min_c: float = 5.0
+    season_min_days: int = 7
     reask_days: int = 3
+
+    def margin(self, zone: str) -> float:
+        return self.margins.get(zone, self.margin_c)
 
 
 @dataclass(frozen=True)
@@ -475,32 +499,53 @@ def _parse_alerts(raw: dict) -> AlertConfig:
 def _parse_season_advisor(raw, zones: dict) -> Optional[SeasonAdvisorConfig]:
     if not raw:
         return None
-    names = tuple(dict.fromkeys(_as_tuple(raw.get("zones"))))
-    if not names:
-        raise ConfigError("season_advisor: zones needs at least one zone")
-    for name in names:
+    zones_raw = raw.get("zones")
+    if not isinstance(zones_raw, dict) or not zones_raw:
+        raise ConfigError("season_advisor: zones maps each advised zone to its rooms")
+    rooms, margins = {}, {}
+    for name, z in zones_raw.items():
         if name not in zones:
             raise ConfigError(f"season_advisor: unknown zone {name}")
-    d = SeasonAdvisorConfig(zones=names)
+        if not isinstance(z, dict):
+            raise ConfigError(f"season_advisor: zone {name} needs rooms")
+        sensors = tuple(dict.fromkeys(_as_tuple(z.get("rooms"))))
+        if not sensors or not all(isinstance(e, str) and e for e in sensors):
+            raise ConfigError(f"season_advisor: zone {name} needs rooms, a list of sensors")
+        rooms[name] = sensors
+        if z.get("margin_c") is not None:
+            margins[name] = float(z["margin_c"])
+    d = SeasonAdvisorConfig(zones=())
     cfg = SeasonAdvisorConfig(
-        zones=names,
+        zones=tuple(zones_raw),
+        rooms=rooms,
+        margins=margins,
         evaluate_at=parse_clock(raw.get("evaluate_at", "08:00")),
         margin_c=float(raw.get("margin_c", d.margin_c)),
         mornings=int(raw.get("mornings", d.mornings)),
         start_below_c=float(raw.get("start_below_c", d.start_below_c)),
+        stop_from=parse_month_day(raw.get("stop_from", "03-01")),
+        stop_until=parse_month_day(raw.get("stop_until", "09-30")),
+        look_back_days=int(raw.get("look_back_days", d.look_back_days)),
         idle_days=int(raw.get("idle_days", d.idle_days)),
         idle_hours=float(raw.get("idle_hours", d.idle_hours)),
-        stop_above_c=float(raw.get("stop_above_c", d.stop_above_c)),
+        stop_min_c=float(raw.get("stop_min_c", d.stop_min_c)),
+        season_min_days=int(raw.get("season_min_days", d.season_min_days)),
         reask_days=int(raw.get("reask_days", d.reask_days)),
     )
     if cfg.evaluate_at < SEASON_MORNING_FROM + 60:
         raise ConfigError("season_advisor: evaluate_at must be an hour into the morning or later")
-    if cfg.margin_c < 0 or cfg.idle_hours <= 0:
-        raise ConfigError("season_advisor: margin_c must not be negative, idle_hours positive")
-    if min(cfg.mornings, cfg.idle_days, cfg.reask_days) < 1:
-        raise ConfigError("season_advisor: mornings, idle_days and reask_days must be at least 1")
-    if not cfg.start_below_c < cfg.stop_above_c:
-        raise ConfigError("season_advisor: stop_above_c must be above start_below_c")
+    if min(cfg.margin_c, *margins.values(), cfg.season_min_days) < 0 or cfg.idle_hours <= 0:
+        raise ConfigError(
+            "season_advisor: margins and season_min_days must not be negative, idle_hours positive"
+        )
+    if min(cfg.mornings, cfg.look_back_days, cfg.idle_days, cfg.reask_days) < 1:
+        raise ConfigError(
+            "season_advisor: mornings, look_back_days, idle_days and reask_days must be at least 1"
+        )
+    if cfg.idle_days > cfg.look_back_days:
+        raise ConfigError("season_advisor: idle_days must fit in look_back_days")
+    if cfg.stop_from > cfg.stop_until:
+        raise ConfigError("season_advisor: stop_from must not be after stop_until")
     return cfg
 
 

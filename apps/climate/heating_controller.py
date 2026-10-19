@@ -1147,12 +1147,7 @@ class HeatingController(hass.Hass):
         if rt.tracker.state == hp.STATE_CLOSED:
             next_change = next((b for b in projected if b[3] != plan.setpoint), None)
         aired = rt.tracker.state != hp.STATE_CLOSED or bool(rt.tracker.open_openings())
-        ctx["zones"][zone] = {
-            "air": reading["air"],
-            "target": plan.target,
-            "air_source": reading["air_source"],
-            "window_active": aired,
-        }
+        ctx["zones"][zone] = {"air": reading["air"], "target": plan.target, "window_active": aired}
 
         if rt.last_mode is not None and rt.last_mode != plan.mode:
             self.log(
@@ -1368,23 +1363,24 @@ class HeatingController(hass.Hass):
     # ---------------------------------------------------------------- season advice
 
     def _season_tick(self, ctx: dict) -> None:
-        """Hand the advisor the morning air of the zones it watches, and judge the day once the
-        time has come. It only has the periodic ticks, so a reading is never weighed twice, and
-        it runs after the rollup, which closes the days it reads."""
-        advisor = self._advisor
+        """Hand the advisor the air of the zones it watches, and judge the day once the time has
+        come. It only has the periodic ticks, so a reading is never weighed twice, and it runs
+        after the rollup, which closes the days it reads."""
+        advisor, cfg = self._advisor, self.cfg.season_advisor
         if advisor is None or not ctx["periodic"] or not ctx["season_known"]:
             return
         now_ts, tz = ctx["now_ts"], ctx["tz"]
         local = hp.local_dt(now_ts, tz)
         day, minute = local.date().isoformat(), local.hour * 60 + local.minute
         advisor.note_season(ctx["season_on"], day)
-        for zone in self.cfg.season_advisor.zones:
+        airs = {zone: self._season_air(cfg.rooms[zone], now_ts) for zone in cfg.zones}
+        for zone, air in airs.items():
             view = ctx["zones"].get(zone)
-            if view and view["air_source"] == "feel" and not view["window_active"]:
-                advisor.observe(zone, day, minute, view["air"])
+            if view and not view["window_active"]:
+                advisor.observe(zone, day, minute, air)
         if not advisor.due(day, minute):
             return
-        verdict = advisor.evaluate(self._season_inputs(ctx, day))
+        verdict = advisor.evaluate(self._season_inputs(ctx, day, airs))
         if verdict.advice == ss.ADVICE_NONE:
             return
         self._append_log(
@@ -1397,7 +1393,20 @@ class HeatingController(hass.Hass):
         if verdict.push:
             self._push(verdict.title, verdict.message)
 
-    def _season_inputs(self, ctx: dict, day: str) -> ss.Inputs:
+    def _season_air(self, entities: tuple, now_ts: float) -> Optional[float]:
+        """The mean air of the room sensors that read. One flagged stale or unreadable is left
+        out, and when none reads there is no air."""
+        values = []
+        for entity in entities:
+            snap = self._snap(entity)
+            if snap is None or snap["attributes"].get("stale") == "true":
+                continue
+            value = self._guard.filter(entity, snap["state"], now_ts)
+            if value is not None:
+                values.append(value)
+        return sum(values) / len(values) if values else None
+
+    def _season_inputs(self, ctx: dict, day: str, airs: dict) -> ss.Inputs:
         fc, mean = self._forecast, None
         if ctx["forecast_ok"]:
             mean = hf.mean_ahead(fc, fc.temperature, ctx["now_ts"], ss.OUTLOOK_HOURS)
@@ -1410,6 +1419,7 @@ class HeatingController(hass.Hass):
             season_on=ctx["season_on"],
             forecast_mean=mean,
             bases=bases,
+            airs=airs,
             daily={zone: rt.daily for zone, rt in self._zones.items()},
         )
 
