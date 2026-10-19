@@ -1,6 +1,6 @@
 """HouseUpcoming - what is coming up in the house that only the server can know, for the dashboard's
-Now timeline: maintenance (the Rober2 parts, the dishwasher's, washer's and dryer's run-based tasks, the
-drum clean at its cheapest start, batteries by their replace-by day and offline devices; admin only),
+Now timeline: maintenance (the Rober2 parts, the dishwasher's, washer's, dryer's and xBloom's run-based
+tasks, the drum clean at its cheapest start, batteries by their replace-by day and offline devices; admin only),
 Kristine's train, and rain while a terrace door is open (exploratory).
 
 Publishes sensor.house_upcoming (shape in upcoming_core.py) plus one maintenance push a day, built
