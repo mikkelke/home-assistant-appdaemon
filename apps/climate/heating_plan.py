@@ -57,6 +57,8 @@ JUMP_C = 2.0
 JUMP_WINDOW_S = 600.0
 MIN_VALID_EPOCH = 365 * 86400.0
 PLANNED_PARTY_MAX_S = 24 * 3600.0
+SEASON_MORNING_FROM = 5 * 60
+SEASON_MORNING_TO = 9 * 60
 
 
 class ConfigError(ValueError):
@@ -257,6 +259,22 @@ class AlertConfig:
 
 
 @dataclass(frozen=True)
+class SeasonAdvisorConfig:
+    """Rules of the season advisor, see heating_season. evaluate_at is a clock time in minutes
+    since midnight, and the morning it judges is SEASON_MORNING_FROM to SEASON_MORNING_TO."""
+
+    zones: tuple
+    evaluate_at: int = 8 * 60
+    margin_c: float = 0.5
+    mornings: int = 2
+    start_below_c: float = 10.0
+    idle_days: int = 5
+    idle_hours: float = 0.2
+    stop_above_c: float = 12.0
+    reask_days: int = 3
+
+
+@dataclass(frozen=True)
 class Config:
     season_entity: str
     state_file: str
@@ -281,6 +299,7 @@ class Config:
     return_temp_entity: str = ""
     living_monitor_entity: str = ""
     alerts: AlertConfig = field(default_factory=AlertConfig)
+    season_advisor: Optional[SeasonAdvisorConfig] = None
 
 
 def _req(raw: dict, key: str, where: str):
@@ -453,6 +472,38 @@ def _parse_alerts(raw: dict) -> AlertConfig:
     return cfg
 
 
+def _parse_season_advisor(raw, zones: dict) -> Optional[SeasonAdvisorConfig]:
+    if not raw:
+        return None
+    names = tuple(dict.fromkeys(_as_tuple(raw.get("zones"))))
+    if not names:
+        raise ConfigError("season_advisor: zones needs at least one zone")
+    for name in names:
+        if name not in zones:
+            raise ConfigError(f"season_advisor: unknown zone {name}")
+    d = SeasonAdvisorConfig(zones=names)
+    cfg = SeasonAdvisorConfig(
+        zones=names,
+        evaluate_at=parse_clock(raw.get("evaluate_at", "08:00")),
+        margin_c=float(raw.get("margin_c", d.margin_c)),
+        mornings=int(raw.get("mornings", d.mornings)),
+        start_below_c=float(raw.get("start_below_c", d.start_below_c)),
+        idle_days=int(raw.get("idle_days", d.idle_days)),
+        idle_hours=float(raw.get("idle_hours", d.idle_hours)),
+        stop_above_c=float(raw.get("stop_above_c", d.stop_above_c)),
+        reask_days=int(raw.get("reask_days", d.reask_days)),
+    )
+    if cfg.evaluate_at < SEASON_MORNING_FROM + 60:
+        raise ConfigError("season_advisor: evaluate_at must be an hour into the morning or later")
+    if cfg.margin_c < 0 or cfg.idle_hours <= 0:
+        raise ConfigError("season_advisor: margin_c must not be negative, idle_hours positive")
+    if min(cfg.mornings, cfg.idle_days, cfg.reask_days) < 1:
+        raise ConfigError("season_advisor: mornings, idle_days and reask_days must be at least 1")
+    if not cfg.start_below_c < cfg.stop_above_c:
+        raise ConfigError("season_advisor: stop_above_c must be above start_below_c")
+    return cfg
+
+
 def parse_config(args: dict) -> Config:
     """Controller arguments (the parsed yaml) to a validated Config. Raises ConfigError."""
     zones_raw = args.get("zones") or {}
@@ -516,6 +567,7 @@ def parse_config(args: dict) -> Config:
         return_temp_entity=args.get("return_temp_entity") or "",
         living_monitor_entity=(args.get("unmanaged") or {}).get("living_monitor") or "",
         alerts=_parse_alerts(args.get("alerts") or {}),
+        season_advisor=_parse_season_advisor(args.get("season_advisor"), zones),
     )
 
 

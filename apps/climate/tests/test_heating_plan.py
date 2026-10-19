@@ -263,6 +263,75 @@ class ConfigParsing(unittest.TestCase):
             with self.assertRaises(hp.ConfigError, msg=repr(args)[:80]):
                 hp.parse_config(args)
 
+    def test_the_season_advisor_is_off_unless_the_config_has_one(self):
+        self.assertIsNone(CFG.season_advisor)
+        self.assertIsNone(hp.parse_config(dict(ARGS, season_advisor={})).season_advisor)
+
+    def test_the_season_advisor_has_defaults(self):
+        cfg = hp.parse_config(dict(ARGS, season_advisor={"zones": ["family", "claudias_room"]}))
+        a = cfg.season_advisor
+        self.assertEqual(a, hp.SeasonAdvisorConfig(zones=("family", "claudias_room")))
+        self.assertEqual((a.evaluate_at, a.margin_c, a.mornings), (8 * 60, 0.5, 2))
+        self.assertEqual((a.start_below_c, a.stop_above_c), (10.0, 12.0))
+        self.assertEqual((a.idle_days, a.idle_hours, a.reask_days), (5, 0.2, 3))
+
+    def test_the_season_advisor_settings_are_read(self):
+        cfg = hp.parse_config(
+            dict(
+                ARGS,
+                season_advisor={
+                    "zones": ["family", "family", "bathroom"],
+                    "evaluate_at": "06:30",
+                    "margin_c": 1,
+                    "mornings": 3,
+                    "start_below_c": 8,
+                    "idle_days": 7,
+                    "idle_hours": 0.5,
+                    "stop_above_c": 15,
+                    "reask_days": 2,
+                },
+            )
+        )
+        self.assertEqual(
+            cfg.season_advisor,
+            hp.SeasonAdvisorConfig(
+                zones=("family", "bathroom"),
+                evaluate_at=6 * 60 + 30,
+                margin_c=1.0,
+                mornings=3,
+                start_below_c=8.0,
+                idle_days=7,
+                idle_hours=0.5,
+                stop_above_c=15.0,
+                reask_days=2,
+            ),
+        )
+
+    def test_bad_season_advisor_settings_are_refused(self):
+        def advisor(**kw):
+            return dict(ARGS, season_advisor=dict({"zones": ["family"]}, **kw))
+
+        cases = [
+            dict(ARGS, season_advisor={"evaluate_at": "08:00"}),
+            advisor(zones=[]),
+            advisor(zones=["nowhere"]),
+            advisor(zones=["family", "nowhere"]),
+            advisor(evaluate_at="05:59"),
+            advisor(evaluate_at="0800"),
+            advisor(evaluate_at=800),
+            advisor(margin_c=-0.1),
+            advisor(idle_hours=0),
+            advisor(mornings=0),
+            advisor(idle_days=0),
+            advisor(reask_days=0),
+            advisor(start_below_c=12, stop_above_c=12),
+            advisor(start_below_c=14, stop_above_c=12),
+        ]
+        for args in cases:
+            with self.assertRaises(hp.ConfigError, msg=repr(args)[:100]):
+                hp.parse_config(args)
+        hp.parse_config(advisor(evaluate_at="06:00"))
+
     def _broken(self, **zone_change):
         zones = dict(ARGS["zones"], family=dict(FAMILY, **zone_change))
         return dict(ARGS, zones=zones)
