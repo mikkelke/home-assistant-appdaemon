@@ -99,8 +99,8 @@ TransitStatus:
       rescue_window_min: 5
       delay_threshold_min: 10
 
-    # ── IC/Re: KBH H → Odense (Kristine) ─────────────────────────────────
-    # direction_id filters to trains that stop at Odense (IC + Re passing through).
+    # ── IC/Lyn/ECE/Re: KBH H → Odense (Kristine) ─────────────────────────
+    # direction_id filters to trains that stop at Odense (IC, IC Lyn = ICL, EuroCity Express = ECE, Re).
     # line_categories excludes Metro and S-tog from the same stop.
     # duration_min: 90 overrides the instance default (30) so there are always
     # 1-2 trains visible in the window even when IC runs every 30-60 min.
@@ -112,6 +112,8 @@ TransitStatus:
       duration_min: 90
       line_categories:
         - "IC"
+        - "ICL"
+        - "ECE"
         - "Re"
       evaluation_mode: infrequent_strict
       delay_threshold_min: 10   # IC/Re run ~hourly; 10+ min delay is significant
@@ -222,7 +224,7 @@ TransitKristine:
       rescue_window_min: 5
       delay_threshold_min: 10
 
-    # Second leg: IC/Re from KBH H toward Odense
+    # Second leg: IC/Lyn/ECE/Re from KBH H toward Odense
     - sensor_id: "kbh_ic_odense"
       transport_name: "IC -> Odense"
       stop_name: "KBH H"
@@ -231,6 +233,8 @@ TransitKristine:
       duration_min: 90
       line_categories:
         - "IC"
+        - "ICL"
+        - "ECE"
         - "Re"
       evaluation_mode: infrequent_strict
       delay_threshold_min: 10
