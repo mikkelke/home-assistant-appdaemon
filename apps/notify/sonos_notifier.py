@@ -24,7 +24,7 @@ class SonosNotifier(hass.Hass):
         self.default_chime_path = self.args.get("default_chime_path")
         self.tts_platform = self.args.get("tts_platform")
         self.audio_conversion = self.args.get("audio_conversion")
-        self.announce_volume_cap = self.args.get("announce_volume_cap")
+        self.announce_volumes = self.args.get("announce_volumes") or {}
 
         # Time Constraints using input_datetime entities
         self.time_constraints_enabled = False
@@ -64,8 +64,11 @@ class SonosNotifier(hass.Hass):
             self.log("WARN: 'default_chime_path' is not configured. Chime functionality might be affected if not provided in calls.")
         if not self.tts_platform:
             self.log("Using default TTS platform from chime_tts integration (no explicit tts_platform configured).", level="DEBUG")
-        if self._volume_pct(self.announce_volume_cap) is None:
-            self.log("WARN: 'announce_volume_cap' is missing or not a number. Announcements without a volume_level are not capped.", level="WARNING")
+        unset_rooms = [
+            room for room in self.tts_group_all if self._volume_pct(self.announce_volumes.get(room)) is None
+        ]
+        if unset_rooms:
+            self.log(f"WARN: no announce_volumes entry for {unset_rooms}. They announce at their current volume.", level="WARNING")
 
         self.log(f"{self.app_name} Initialized. Ready to send notifications.", level=self.log_level)
         self.log(
@@ -149,13 +152,12 @@ class SonosNotifier(hass.Hass):
             message (str): The message to be spoken.
             chime_path (str, optional): Path to the chime sound file.
                                       Defaults to 'default_chime_path' from config.
-            target_speakers (str | list, optional): Music Assistant room entities to announce on.
-                Defaults to the sleep-mode based group selection.
+            target_speakers (str | list, optional): Room entities to announce on; each plays on
+                its native Sonos twin. Defaults to the sleep-mode based group selection.
             override_quiet_hours (bool, optional): Skip the quiet-hours check and announce
                 anyway. For life-safety callers only. Defaults to False.
-            volume_level (float, optional): Announcement volume (0.0-1.0) in every target room,
-                used as given. When omitted each room announces at its current volume, at most
-                announce_volume_cap.
+            volume_level (float, optional): Announcement volume (0.0-1.0) in every target room.
+                When omitted each room announces at its level in announce_volumes.
             **kwargs: cache (default True), offset (default -300) and tts_platform for the
                 chime_tts render.
         """
@@ -284,32 +286,33 @@ class SonosNotifier(hass.Hass):
         except (TypeError, ValueError):
             return None
 
-    def _announce_volume_pct(self, room, volume_level):
-        """Announcement volume for one room in percent, or None when it cannot be determined.
+    @staticmethod
+    def _native_twin(room):
+        """The native Sonos entity of a room entity (registry convention: <room>_2)."""
+        return room if room.endswith("_2") else f"{room}_2"
 
-        An explicit level is used as given. Left without a level, Music Assistant announces
-        louder than the player's volume. A room is therefore given the level it already plays
-        at, which is what a Sonos audio clip plays at when no volume is sent, but never more
-        than announce_volume_cap: a room left loud by music must not announce loudly.
-        """
+    def _announce_volume_pct(self, room, volume_level):
+        """Announcement volume for one room in percent, or None to let the speaker use its
+        current volume. Independent of the music volume, so lowering music never mutes alerts."""
         if volume_level is not None:
             return self._volume_pct(volume_level)
-        room_pct = self._volume_pct(self.get_state(room, attribute="volume_level"))
-        cap_pct = self._volume_pct(self.announce_volume_cap)
-        if room_pct is None or cap_pct is None:
-            return room_pct
-        return min(room_pct, cap_pct)
+        return self._volume_pct(self.announce_volumes.get(room))
 
     def _play_announcement(self, message, url, rooms, volume_level):
-        """Play the rendered clip as an announcement on the Music Assistant room entities."""
+        """Play the rendered clip as a Sonos audio clip on each room's native entity.
+
+        Music Assistant serialises announcements to the members of a Sonos group behind the
+        group's lock, so grouped rooms would hear the clip one after another. A native audio
+        clip overlays whatever the speaker plays and starts on every speaker at once.
+        """
         rooms_by_volume = {}
         for room in rooms:
-            rooms_by_volume.setdefault(self._announce_volume_pct(room, volume_level), []).append(room)
+            rooms_by_volume.setdefault(self._announce_volume_pct(room, volume_level), []).append(
+                self._native_twin(room)
+            )
 
         for volume_pct, group in rooms_by_volume.items():
-            extra = {"use_pre_announce": False}
-            if volume_pct is not None:
-                extra["announce_volume"] = volume_pct
+            extra = {} if volume_pct is None else {"volume": volume_pct}
             try:
                 self.call_service(
                     "media_player/play_media",

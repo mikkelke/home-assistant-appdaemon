@@ -11,8 +11,9 @@ SonosNotifier:
 
   mikkel_sleep_mode_entity: "input_boolean.mikkel_sleep_mode"
   
-  # --- Speaker Configuration (Music Assistant room entities per TTS target group) ---
+  # --- Speaker Configuration (room entities per TTS target group) ---
   # Kept in sync with the `tts:` tags in apps/sonos/speakers.yaml by scripts/check_speakers.py.
+  # Rooms are named by their Music Assistant entity; the clip plays on the native <room>_2 twin.
   tts_group_all:                  # no one sleeping
     - media_player.living_room
     - media_player.kitchen
@@ -39,13 +40,22 @@ SonosNotifier:
   # --- TTS Configuration ---
   default_chime_path: "/config/www/chimes/alert_notification.mp3"
   # chime_tts.say_url renders chime + speech with cache on; the clip is then played as a
-  # Music Assistant announcement on the target rooms.
+  # Sonos audio clip on the target rooms' native entities.
   tts_platform: "piper"  # Use unprefixed name; chime_tts expects "piper"
   # FFmpeg arguments chime_tts applies to every rendered clip, so all announcements share one loudness.
   audio_conversion: "-af loudnorm=I=-16:TP=-2:LRA=11"
-  # Fraction (0.0-1.0). Without a volume_level from the caller, a room announces at its own
-  # volume up to this. An explicit volume_level is never capped.
-  announce_volume_cap: 0.35
+  # Fraction (0.0-1.0) each room announces at when the caller gives no volume_level,
+  # whatever the music volume. Scaled by the speaker's Sonos app volume limit like any volume.
+  announce_volumes:
+    media_player.living_room: 0.20
+    media_player.kitchen: 0.20
+    media_player.dining_room: 0.18
+    media_player.bedroom: 0.18
+    media_player.bathroom: 0.24
+    media_player.guest_bathroom: 0.24
+    media_player.kristines_room: 0.18
+    media_player.claudias_room: 0.18
+    media_player.rooftop: 0.18
 
   # --- Time Constraints (using Home Assistant input_datetime helpers) ---
   # Notifications will only be sent *after* quiet_hours_end_entity 

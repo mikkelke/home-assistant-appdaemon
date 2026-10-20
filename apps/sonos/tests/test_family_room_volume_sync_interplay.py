@@ -297,7 +297,7 @@ class FollowMeInterplay(unittest.TestCase):
 
 
 class SonosNotifierInterplay(unittest.TestCase):
-    """An announcement is a chime_tts render played as a Music Assistant announcement: Sonos
+    """An announcement is a chime_tts render played as a native Sonos audio clip: Sonos
     plays the clip over the music itself, so no player volume is written."""
 
     def setUp(self):
@@ -322,13 +322,15 @@ class SonosNotifierInterplay(unittest.TestCase):
         for play in plays:
             self.assertTrue(play["announce"])
             self.assertEqual(play["media_content_id"], CLIP_URL)
-        return {room: play["extra"].get("announce_volume") for play in plays for room in play["entity_id"]}
+        for play in plays:
+            self.assertTrue(all(twin.endswith("_2") for twin in play["entity_id"]))
+        return {twin[: -len("_2")]: play["extra"].get("volume") for play in plays for twin in play["entity_id"]}
 
     def test_an_announcement_while_the_family_group_plays_writes_nothing(self):
         announced = self.announce()
         self.assertEqual(sorted(announced), sorted(self.app.tts_group_all))
         for room in FAMILY:
-            self.assertEqual(announced[room], round(self.before[room] * 100))
+            self.assertEqual(announced[room], round(self.app.announce_volumes[room] * 100))
         self.assertEqual(self.house.volume_sets(), [])
         self.assertEqual(self.house.volumes(), self.before)
         self.assertEqual(self.rig.arm_delays, [])
