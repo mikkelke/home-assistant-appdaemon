@@ -98,12 +98,11 @@ GUIDES = {
     ),
     "coffee:rinse": Guide(
         steps=(
-            "Take the dripper off the machine and rinse it and its base under warm running water.",
             "Wipe the shower screen under the brew head with a damp cloth.",
             "Lift off the cover over the scale, rinse it and wipe the scale plate dry.",
             "Let the parts dry before you put them back.",
         ),
-        warn="Let the brew head cool down first. The dripper is not for the dishwasher.",
+        warn="Let the brew head cool down first.",
     ),
     "coffee:tank": Guide(
         steps=(

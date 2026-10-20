@@ -517,8 +517,8 @@ class CoffeeTests(unittest.TestCase):
         found = rows_of(led, anchors)
         row, key = found["maint:coffee:rinse"]
         self.assertEqual((row["title"], row["area"], row["icon"], row["audience"], row["done"]),
-                         ("xBloom brewer rinse", "kitchen", "mdi:coffee-maker", "admin", "tap"))
-        self.assertEqual(row["detail"], "dripper + shower screen, 10 brews left, ~04.11")
+                         ("xBloom brew head", "kitchen", "mdi:coffee-maker", "admin", "tap"))
+        self.assertEqual(row["detail"], "shower screen + scale plate, 10 brews left, ~04.11")
         self.assertEqual(row["info"], ["Every 10 brews (~3 weeks)", "Counting from 15.10",
                                        "Provisional interval: check the xBloom manual"])
         self.assertIsNone(key)
@@ -548,7 +548,7 @@ class CoffeeTests(unittest.TestCase):
         led = self.ledgers(cycles)
         anchors = {"coffee:rinse": {"at": core.utc_iso(NOW - 30 * DAY), "seed": True}}
         row, key = rows_of(led, anchors)["maint:coffee:rinse"]
-        self.assertEqual(row["detail"], "dripper + shower screen, due")
+        self.assertEqual(row["detail"], "shower screen + scale plate, due")
         self.assertEqual(key, f"coffee:rinse:{core.utc_iso(NOW - 30 * DAY)}")
 
     def test_the_pace_until_the_ledger_covers_two_weeks(self):

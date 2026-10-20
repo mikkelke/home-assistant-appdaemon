@@ -1,6 +1,6 @@
 """Run-based maintenance rows for sensor.house_upcoming: the dishwasher's hygiene run, filters and spray
 arms and general check, the washer's drum clean and inlet filters, the dryer's plinth filter, and the
-xBloom's brewer rinse, water tank, grinder burrs and descale. A task is due after so many finished
+xBloom's brew head, water tank, grinder burrs and descale. A task is due after so many finished
 runs (run_ledger) since it was last done, which suits parts that clog with use better than the
 calendar. A task counts in its unit: the coffee machine's runs are brews. Pure: each step takes the
 persisted anchors and `now` and returns new state.
@@ -67,7 +67,7 @@ TASKS = (
          closes="Logged when you pick Drum clean on the washer card"),
     Task("washer:inlet", "washer", "Washer inlet filters", "hose + valve filters", 90, "mdi:washing-machine"),
     Task("dryer:plinth", "dryer", "Dryer plinth filter", "plinth filter + air path", None, "mdi:tumble-dryer"),
-    Task("coffee:rinse", "coffee", "xBloom brewer rinse", "dripper + shower screen", 10, "mdi:coffee-maker",
+    Task("coffee:rinse", "coffee", "xBloom brew head", "shower screen + scale plate", 10, "mdi:coffee-maker",
          closes=COFFEE_CLOSES, unit="brew"),
     Task("coffee:tank", "coffee", "xBloom water tank", "empty, rinse, air-dry", 20, "mdi:coffee-maker",
          closes=COFFEE_CLOSES, unit="brew"),
