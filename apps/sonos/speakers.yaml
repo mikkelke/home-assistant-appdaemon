@@ -31,33 +31,33 @@ speakers:
     ma_entity: media_player.bedroom
     raw_entity: media_player.bedroom_2
     rincon: RINCON_F0F6C1A526E601400
-    default_volume: 0.12
+    default_volume: 0.14
     tts: [all, ms]            # never family announcements in the bedroom
   bathroom:
     ma_entity: media_player.bathroom
     raw_entity: media_player.bathroom_2
     rincon: RINCON_F0F6C1A5264A01400
-    default_volume: 0.20      # between the bedrooms and the family room, nearer the family room
+    default_volume: 0.18      # between the bedrooms and the family room, nearer the family room
     tts: [all, family]
   guest_bathroom:
     ma_entity: media_player.guest_bathroom
     raw_entity: media_player.guest_bathroom_2
     rincon: RINCON_804AF2CB366601400
-    default_volume: 0.20      # between the bedrooms and the family room, nearer the family room
+    default_volume: 0.18      # between the bedrooms and the family room, nearer the family room
     tts: [all, family]
   kristines_room:
     ma_entity: media_player.kristines_room
     raw_entity: media_player.kristines_room_2
     rincon: RINCON_804AF2CB391401400
     model: Era 100
-    default_volume: 0.12
+    default_volume: 0.14
     tts: [all, kristine]
   claudias_room:
     ma_entity: media_player.claudias_room
     raw_entity: media_player.claudias_room_2
     rincon: RINCON_804AF2CB397801400
     model: Era 100
-    default_volume: 0.12
+    default_volume: 0.14
     tts: [all, family]
   rooftop:
     ma_entity: media_player.rooftop

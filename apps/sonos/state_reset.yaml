@@ -33,14 +33,14 @@ SonosStateReset:
 
   # Target volumes per speaker
   speaker_volumes:
-    media_player.bathroom: 0.20       # between the bedrooms and the family room, nearer the family room
-    media_player.bedroom: 0.12
+    media_player.bathroom: 0.18       # between the bedrooms and the family room, nearer the family room
+    media_player.bedroom: 0.14
     media_player.dining_room: 0.12
     media_player.kitchen: 0.13       # a notch above the dining room: pair spread wider, busiest room
     media_player.living_room: 0.14   # a notch above the kitchen: lowest-mounted speaker
-    media_player.guest_bathroom: 0.20 # between the bedrooms and the family room, nearer the family room
-    media_player.kristines_room: 0.12
-    media_player.claudias_room: 0.12
+    media_player.guest_bathroom: 0.18 # between the bedrooms and the family room, nearer the family room
+    media_player.kristines_room: 0.14
+    media_player.claudias_room: 0.14
     media_player.rooftop: 0.12
 
   # Fallback if a speaker isn't in the above map
