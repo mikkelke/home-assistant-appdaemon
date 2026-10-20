@@ -16,6 +16,7 @@ ArrivalLists:
   category: arrival_lists
   settle_s: 60
   cooldown_min: 120
+  link: "/dashboard-rooftop/home#lists"
 
   places:
     home:
