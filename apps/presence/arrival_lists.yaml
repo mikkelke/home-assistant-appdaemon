@@ -1,0 +1,25 @@
+# /conf/apps/presence/arrival_lists.yaml
+# Pushes Mikkel the open items of the place's to-do lists when he arrives home or at the office.
+# Keys under places are person states: "home", or the zone name ("Office" is zone.office).
+#
+# No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
+# first or the app fails to instantiate.
+
+ArrivalLists:
+  module: arrival_lists
+  class: ArrivalLists
+  dependencies:
+    - MobileNotifier
+
+  person: person.mikkel
+  recipient: mikkel
+  category: arrival_lists
+  settle_s: 60
+  cooldown_min: 120
+
+  places:
+    home:
+      - todo.husk_hjemme
+    Office:
+      - todo.husk_kontor
+      - todo.firma_indkob
