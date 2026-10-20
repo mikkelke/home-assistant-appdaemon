@@ -414,7 +414,10 @@ class ShippedYaml(unittest.TestCase):
         self.assertEqual((cfg.owner, cfg.notify_target), ("mikkel", "mikkel"))
         self.assertEqual(cfg.appdaemon_user_id, APP_ID)
         self.assertEqual(cfg.user_ids, {KRISTINE_ID: "kristine"})
-        self.assertEqual((cfg.supply_temp_entity, cfg.return_temp_entity), ("", ""))
+        self.assertEqual(
+            (cfg.supply_temp_entity, cfg.return_temp_entity),
+            ("sensor.heating_room_floor_heating_supply", "sensor.heating_room_floor_heating_return"),
+        )
         self.assertEqual(cfg.living_monitor_entity, "climate.living_room_thermostat")
         self.assertEqual(cfg.alerts, hp.AlertConfig())
         floors = {n: zc.evenness_floors for n, zc in cfg.zones.items() if zc.evenness_floors}

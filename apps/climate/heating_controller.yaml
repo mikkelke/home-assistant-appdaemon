@@ -35,8 +35,8 @@ HeatingController:
   relay_power_entity: sensor.floor_heating_relay_power
   # Pipe clamps on the building's supply and return, in degrees C. Leave empty until fitted:
   # nothing reads them then, and the no-hot-water alert is off.
-  supply_temp_entity: ""
-  return_temp_entity: ""
+  supply_temp_entity: sensor.heating_room_floor_heating_supply
+  return_temp_entity: sensor.heating_room_floor_heating_return
   # The living-room thermostat has no actuator and must stay in standby.
   unmanaged:
     living_monitor: climate.living_room_thermostat
