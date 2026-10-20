@@ -49,7 +49,7 @@ SonosNotifier:
   audio_conversion: "-af loudnorm=I=-16:TP=-2:LRA=11"
   # Fraction (0.0-1.0) every room announces at when the caller gives no volume_level, whatever
   # the music volume. One level for all rooms keeps it to one call, so the clip starts together.
-  announce_volume: 0.25
+  announce_volume: 0.22
 
   # --- Time Constraints (using Home Assistant input_datetime helpers) ---
   # Notifications will only be sent *after* quiet_hours_end_entity 
