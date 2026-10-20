@@ -1431,28 +1431,6 @@ class TimedPlantTests(unittest.TestCase):
         self.assertEqual(state_file(app)["done"][self.KEY]["at"], core.utc_iso(app.now))
         self.assertEqual(len(done_log(app)), 1)
 
-    def test_a_renamed_plant_keeps_its_anchor_and_its_due_day_and_a_new_plant_is_seeded_now(self):
-        app = self.make()
-        tick(app, 3 * DAY)
-        self.done(app)
-        anchor = dict(app._anchors[self.KEY])
-        renamed = {**SAMPLE_TIMED, "name": "Monstera big", "was": "Monstera"}
-        bedroom = {**SAMPLE_TIMED, "name": "Monstera bedroom", "area": "bedroom"}
-        reloaded = self.make(plants=[renamed, bedroom], state_dir=app.state_dir, now=app.now)
-        self.assertEqual(reloaded._anchors["plant:monstera_big"], anchor)
-        self.assertNotIn(self.KEY, reloaded._anchors)
-        self.assertEqual(reloaded._anchors["plant:monstera_bedroom"], {"at": core.utc_iso(app.now), "seed": True})
-        saved = state_file(reloaded)["done"]
-        self.assertEqual((saved["plant:monstera_big"], self.KEY in saved), (anchor, False))
-        tick(reloaded, 9 * DAY)
-        shown = rows(reloaded)
-        self.assertNotIn(self.ROW, shown)
-        self.assertEqual(shown["maint:plant:monstera_bedroom"]["info"][1], "Counting from 17.10")
-        row = shown["maint:plant:monstera_big"]
-        self.assertEqual((row["title"], row["detail"], row["at"]),
-                         ("Water the Monstera big: 1 L", "1 day left, 27.10", "2026-10-27T08:00:00+00:00"))
-        self.assertEqual(row["info"][1], "Done 17.10, 9 days ago")
-
     def test_a_sensor_plants_row_and_unknown_ids_are_no_tapped_task(self):
         app = self.make(plants=[SAMPLE_TIMED, SAMPLE_PLANT])
         before, published = state_file(app), len(app.published)

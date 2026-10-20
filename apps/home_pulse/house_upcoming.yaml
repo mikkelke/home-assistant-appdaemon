@@ -58,7 +58,7 @@ HouseUpcoming:
   # water at a reading of dry (percent) or under, and the reminder stays until the reading is 5 points
   # above dry. With every_days, a whole number, the plant has no sensor: it counts the days from the day
   # it was first seen or last tapped Done, shows a row from the day before that many have passed, is
-  # due then and starts over with each Done. A renamed plant keeps that count through was, its old name.
+  # due then and starts over with each Done.
   plants:
     - {moisture: sensor.strelitzia_moisture, name: Strelitzia, area: dining_room, dry: 15, water: 3}
     - {moisture: sensor.philodendron_moisture, name: Philodendron, area: dining_room, dry: 20, water: 0.5}
@@ -67,7 +67,7 @@ HouseUpcoming:
     - {name: Monstera, area: kitchen, water: 1, every_days: 10}
     - {name: Peace lily kitchen, area: kitchen, water: 0.4, every_days: 7}
     - {name: Peace lily TV, area: living_room, water: 1, every_days: 10}
-    - {name: Fiddle leaf fig dining, was: Fiddle leaf fig, area: dining_room, water: 1, every_days: 10}
+    - {name: Fiddle leaf fig dining, area: dining_room, water: 1, every_days: 10}
     - {name: Fiddle leaf fig bedroom, area: bedroom, water: 1, every_days: 10}
     - {name: Satin pothos, area: hallway, water: 0.2, every_days: 10}
     - {name: Snake plant dining, area: dining_room, water: 0.2, every_days: 35}

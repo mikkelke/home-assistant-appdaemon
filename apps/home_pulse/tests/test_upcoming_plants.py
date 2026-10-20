@@ -297,19 +297,6 @@ class CalendarParseTests(unittest.TestCase):
                 plants.parse_timed([cfg])
         self.assertIsNone(plants.parse_timed([{**CAL[0], "water": None}])["monstera"]["water"])
 
-    def test_a_renamed_plant_names_its_old_name_in_was(self):
-        renamed = {**CAL[0], "name": "Monstera big", "was": "Monstera"}
-        self.assertEqual(plants.parse_timed([renamed])["monstera_big"]["was"], "monstera")
-        self.assertNotIn("was", plants.parse_timed(CAL)["monstera"])
-
-    def test_was_needs_a_name_goes_with_every_days_and_names_no_plant_that_is_listed(self):
-        for cfg in ([{**CAL[0], "was": "!!!"}], [{**CAL[0], "was": ""}], [{**RAW[0], "was": "Old"}],
-                    [{**CAL[0], "name": "Monstera big", "was": "Monstera"}, CAL[0]],
-                    [{**CAL[0], "name": "Fern", "was": "Strelitzia"}, RAW[0]]):
-            for parse in (plants.parse_plants, plants.parse_timed):
-                with self.assertRaises(ValueError, msg=cfg):
-                    parse(cfg)
-
     def test_a_name_is_unique_across_both_kinds_because_the_row_id_is(self):
         for raw in ([RAW[0], {**CAL[0], "name": "strelitzia"}], [CAL[0], {**CAL[0], "name": "MONSTERA!"}],
                     [CAL[0], {**RAW[0], "name": "Monstera"}]):
@@ -337,18 +324,6 @@ class CalendarRowTests(unittest.TestCase):
         self.assertEqual(seeded, {"plant:aloe": kept["plant:aloe"], "plant:monstera": self.anchor(self.NOW, seed=True)})
         self.assertEqual(plants.seed_timed(seeded, {"monstera": MONSTERA}, self.NOW + DAY), seeded)
         self.assertEqual(kept, {"plant:aloe": self.anchor(self.NOW - 3 * DAY)})
-
-    def test_a_renamed_plants_anchor_moves_to_its_new_key_unless_it_has_one(self):
-        big = plants.parse_timed([{**CAL[0], "name": "Monstera big", "was": "Monstera"}])
-        old, other = self.anchor(self.NOW - 3 * DAY, prev={"at": "x"}), self.anchor(self.NOW)
-        saved = {"plant:monstera": old, "plant:fern": other}
-        self.assertEqual(plants.migrate_anchors(saved, big), {"plant:monstera_big": old, "plant:fern": other})
-        self.assertEqual(saved, {"plant:monstera": old, "plant:fern": other})
-        has_one = {"plant:monstera": old, "plant:monstera_big": other}
-        self.assertEqual(plants.migrate_anchors(has_one, big), has_one)
-        self.assertEqual(plants.migrate_anchors(saved, {"monstera": MONSTERA}), saved)
-        for raw in (None, [], "x", 5):
-            self.assertEqual(plants.migrate_anchors(raw, big), {})
 
     def test_a_plant_is_found_by_its_row_id_and_nothing_else_is(self):
         timed = {"monstera": MONSTERA}
