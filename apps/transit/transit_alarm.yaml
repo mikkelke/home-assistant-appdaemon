@@ -81,6 +81,19 @@ TransitStatus:
       # real waiting time, so it must not count toward the >=2 "Disrupted" threshold.
       rescue_window_min: 5
 
+    # ── Metro M3: Enghave Plads → Frederiksberg ──────────────────────────
+    # The other way round the ring, so a one-direction outage shows next to the KBH H row.
+    - sensor_id: "enghave_metro_frb"
+      transport_name: "Metro M3 -> Frederiksberg"
+      stop_name: "Enghave Plads"
+      stop_id: "8603344"
+      direction_id: "8603343"
+      direction_name_filter: "frederiksberg"
+      lines:
+        - "M3"
+      evaluation_mode: high_frequency
+      rescue_window_min: 5
+
     # ── S-tog: Carlsberg → KBH H (Mikkel + Kristine) ─────────────────────
     - sensor_id: "carlsberg_stog_kbh"
       transport_name: "S-tog -> KBH H"
