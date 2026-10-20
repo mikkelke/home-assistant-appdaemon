@@ -42,20 +42,14 @@ SonosNotifier:
   # chime_tts.say_url renders chime + speech with cache on; the clip is then played as a
   # Sonos audio clip on the target rooms' native entities.
   tts_platform: "piper"  # Use unprefixed name; chime_tts expects "piper"
+  # chime_tts returns the clip on HA's external URL. The speakers fetch it here instead, over
+  # plain HTTP on the LAN rather than through the public address and TLS.
+  clip_base_url: "http://10.21.0.5:8123"
   # FFmpeg arguments chime_tts applies to every rendered clip, so all announcements share one loudness.
   audio_conversion: "-af loudnorm=I=-16:TP=-2:LRA=11"
-  # Fraction (0.0-1.0) each room announces at when the caller gives no volume_level,
-  # whatever the music volume. Scaled by the speaker's Sonos app volume limit like any volume.
-  announce_volumes:
-    media_player.living_room: 0.20
-    media_player.kitchen: 0.20
-    media_player.dining_room: 0.18
-    media_player.bedroom: 0.18
-    media_player.bathroom: 0.24
-    media_player.guest_bathroom: 0.24
-    media_player.kristines_room: 0.18
-    media_player.claudias_room: 0.18
-    media_player.rooftop: 0.18
+  # Fraction (0.0-1.0) every room announces at when the caller gives no volume_level, whatever
+  # the music volume. One level for all rooms keeps it to one call, so the clip starts together.
+  announce_volume: 0.25
 
   # --- Time Constraints (using Home Assistant input_datetime helpers) ---
   # Notifications will only be sent *after* quiet_hours_end_entity 

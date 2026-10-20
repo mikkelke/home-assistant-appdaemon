@@ -48,7 +48,7 @@ def _say_url_response(url=CLIP_URL, success=True):
     }
 
 
-def _new_app(state=None, now=None, time_constraints_enabled=True, volumes=None, announce_volumes=None):
+def _new_app(state=None, now=None, time_constraints_enabled=True, volumes=None, announce_volume=None):
     app = sn.SonosNotifier.__new__(sn.SonosNotifier)
     app.log_calls = []
     app.log = lambda *a, **kw: app.log_calls.append((a, kw))
@@ -65,7 +65,8 @@ def _new_app(state=None, now=None, time_constraints_enabled=True, volumes=None, 
     app.default_chime_path = "/config/www/chimes/alert.mp3"
     app.tts_platform = "piper"
     app.audio_conversion = AUDIO_CONVERSION
-    app.announce_volumes = dict(announce_volumes or {})
+    app.announce_volume = announce_volume
+    app.clip_base_url = ""
 
     app.time_constraints_enabled = time_constraints_enabled
     app.quiet_hours_end_entity = "input_datetime.quiet_hours_end"
@@ -179,7 +180,7 @@ class RenderAndPlayPayloads(unittest.TestCase):
         )
 
     def test_play_payload(self):
-        app = _new_app(now=DAYTIME, announce_volumes={EXPLICIT: 0.2})
+        app = _new_app(now=DAYTIME, announce_volume=0.2)
         app.notify("Washer finished", target_speakers=[EXPLICIT])
         play = dict(_plays(app)[0])
         self.assertTrue(callable(play.pop("callback")))
@@ -246,59 +247,61 @@ class RenderAndPlayPayloads(unittest.TestCase):
         self.assertTrue(_plays(app)[0]["announce"])
 
 
+class ClipUrl(unittest.TestCase):
+    def test_clip_is_played_from_the_base_url(self):
+        app = _new_app(now=DAYTIME)
+        app.clip_base_url = "http://10.0.0.5:8123"
+        app.notify("Hello", target_speakers=[EXPLICIT])
+        self.assertEqual(_plays(app)[0]["media_content_id"], "http://10.0.0.5:8123/local/chime_tts/abc123.mp3")
+
+    def test_query_is_kept(self):
+        app = _new_app(now=DAYTIME)
+        app.clip_base_url = "http://10.0.0.5:8123"
+        app.say_url_response = _say_url_response(url="https://ha.example/local/x.mp3?authSig=abc")
+        app.notify("Hello", target_speakers=[EXPLICIT])
+        self.assertEqual(_plays(app)[0]["media_content_id"], "http://10.0.0.5:8123/local/x.mp3?authSig=abc")
+
+    def test_no_base_url_plays_the_rendered_url(self):
+        app = _new_app(now=DAYTIME)
+        app.notify("Hello", target_speakers=[EXPLICIT])
+        self.assertEqual(_plays(app)[0]["media_content_id"], CLIP_URL)
+
+
 class VolumeLevel(unittest.TestCase):
+    ROOMS = ["media_player.living_room", "media_player.kitchen", "media_player.bathroom"]
+
+    def test_every_room_is_announced_in_one_call(self):
+        for volume_level in (None, 0.7):
+            app = _new_app(now=DAYTIME, announce_volume=0.25)
+            app.notify("Hello", target_speakers=self.ROOMS, volume_level=volume_level)
+            self.assertEqual(len(_plays(app)), 1)
+            self.assertEqual(_plays(app)[0]["entity_id"], _twins(self.ROOMS))
+
+    def test_omitted_volume_uses_the_announce_volume(self):
+        app = _new_app(now=DAYTIME, announce_volume=0.25)
+        app.notify("Hello", target_speakers=self.ROOMS)
+        self.assertEqual(_plays(app)[0]["extra"], {"volume": 25})
+
     def test_explicit_volume_is_the_clip_volume_in_percent(self):
         for level, pct in ((1.0, 100), (0.7, 70), (0.15, 15), (0.29, 29)):
-            app = _new_app(now=DAYTIME, announce_volumes={EXPLICIT: 0.2})
+            app = _new_app(now=DAYTIME, announce_volume=0.25)
             app.notify("Hello", target_speakers=[EXPLICIT], volume_level=level)
             self.assertEqual(_plays(app)[0]["extra"]["volume"], pct)
 
-    def test_explicit_volume_applies_to_every_room_in_one_call(self):
-        app = _new_app(now=DAYTIME, announce_volumes={"media_player.living_room": 0.2, "media_player.kitchen": 0.3})
-        app.notify("Hello", target_speakers=["media_player.living_room", "media_player.kitchen"], volume_level=0.7)
-        plays = _plays(app)
-        self.assertEqual(len(plays), 1)
-        self.assertEqual(plays[0]["entity_id"], ["media_player.living_room_2", "media_player.kitchen_2"])
-        self.assertEqual(plays[0]["extra"]["volume"], 70)
-
-    def test_omitted_volume_uses_each_rooms_announce_volume(self):
-        app = _new_app(
-            now=DAYTIME,
-            announce_volumes={"media_player.living_room": 0.2, "media_player.kitchen": 0.24},
-        )
-        app.notify("Hello", target_speakers=["media_player.living_room", "media_player.kitchen"])
-        announced = {tuple(p["entity_id"]): p["extra"]["volume"] for p in _plays(app)}
-        self.assertEqual(announced, {("media_player.living_room_2",): 20, ("media_player.kitchen_2",): 24})
-
     def test_music_volume_does_not_change_the_announce_volume(self):
         for music in (0.05, 0.12, 0.6, 1.0):
-            app = _new_app(now=DAYTIME, volumes={EXPLICIT: music}, announce_volumes={EXPLICIT: 0.2})
+            app = _new_app(now=DAYTIME, volumes={EXPLICIT: music}, announce_volume=0.2)
             app.notify("Hello", target_speakers=[EXPLICIT])
             self.assertEqual(_plays(app)[0]["extra"]["volume"], 20)
 
-    def test_rooms_at_the_same_announce_volume_share_one_call(self):
-        app = _new_app(
-            now=DAYTIME,
-            announce_volumes={"media_player.living_room": 0.18, "media_player.kitchen": 0.18, "media_player.bedroom": 0.24},
-        )
-        app.notify(
-            "Hello",
-            target_speakers=["media_player.living_room", "media_player.kitchen", "media_player.bedroom"],
-        )
-        announced = {tuple(p["entity_id"]): p["extra"]["volume"] for p in _plays(app)}
-        self.assertEqual(
-            announced,
-            {("media_player.living_room_2", "media_player.kitchen_2"): 18, ("media_player.bedroom_2",): 24},
-        )
-
-    def test_room_without_announce_volume_sends_no_volume(self):
-        for configured in ({}, {EXPLICIT: None}, {EXPLICIT: "loud"}):
-            app = _new_app(now=DAYTIME, volumes={EXPLICIT: 0.3}, announce_volumes=configured)
+    def test_no_usable_announce_volume_sends_no_volume(self):
+        for configured in (None, "", "loud"):
+            app = _new_app(now=DAYTIME, volumes={EXPLICIT: 0.3}, announce_volume=configured)
             app.notify("Hello", target_speakers=[EXPLICIT])
             self.assertEqual(_plays(app)[0]["extra"], {})
 
     def test_volume_is_never_set_on_the_player(self):
-        app = _new_app(now=DAYTIME, announce_volumes={EXPLICIT: 0.2})
+        app = _new_app(now=DAYTIME, announce_volume=0.2)
         app.notify("Hello", target_speakers=[EXPLICIT], volume_level=0.7)
         self.assertEqual({service for service, _ in app.calls}, {"chime_tts/say_url", "media_player/play_media"})
 
@@ -321,30 +324,29 @@ class ShippedConfig(unittest.TestCase):
         app.initialize()
         return app
 
+    def test_clip_is_fetched_over_the_lan(self):
+        app = self._initialized_app()
+        app.notify("Hello", target_speakers=[EXPLICIT])
+        self.assertTrue(_plays(app)[0]["media_content_id"].startswith("http://10.21.0.5:8123/local/chime_tts/"))
+
     def test_loudness_filter_reaches_the_render(self):
         app = self._initialized_app()
         app.notify("Hello", target_speakers=[EXPLICIT])
         self.assertIn("loudnorm", self.args["audio_conversion"])
         self.assertEqual(_renders(app)[0]["audio_conversion"], self.args["audio_conversion"])
 
-    def test_every_room_has_an_announce_volume(self):
-        volumes = self.args["announce_volumes"]
-        self.assertEqual(set(volumes), set(self.args["tts_group_all"]))
-        self.assertTrue(all(0 < v < 1 for v in volumes.values()))
-        app = self._initialized_app()
-        self.assertFalse(_logged_at(app, "announce_volumes", "WARNING"))
-
     def test_announce_volume_reaches_the_clip(self):
+        volume = self.args["announce_volume"]
+        self.assertTrue(0 < volume < 1)
         app = self._initialized_app(volumes={"media_player.kitchen": 1.0})
         app.notify("Hello", target_speakers=["media_player.kitchen"])
-        self.assertEqual(
-            _plays(app)[0]["extra"]["volume"], round(self.args["announce_volumes"]["media_player.kitchen"] * 100)
-        )
+        self.assertEqual(_plays(app)[0]["extra"]["volume"], round(volume * 100))
+        self.assertFalse(_logged_at(app, "announce_volume", "WARNING"))
 
-    def test_a_room_without_announce_volume_is_warned_about(self):
-        args = dict(self.args, announce_volumes={})
+    def test_a_missing_announce_volume_is_warned_about(self):
+        args = {k: v for k, v in self.args.items() if k != "announce_volume"}
         app = self._initialized_app(args=args)
-        self.assertTrue(_logged_at(app, "announce_volumes", "WARNING"))
+        self.assertTrue(_logged_at(app, "announce_volume", "WARNING"))
 
 
 class DeliveryFailures(unittest.TestCase):
@@ -383,7 +385,7 @@ class DeliveryFailures(unittest.TestCase):
         self.assertTrue(_logged_at(app, "Error calling chime_tts/say_url", "ERROR"))
 
     def test_successful_playback_is_logged_with_its_volume(self):
-        app = _new_app(now=DAYTIME, announce_volumes={EXPLICIT: 0.2})
+        app = _new_app(now=DAYTIME, announce_volume=0.2)
         app.notify("Hello", target_speakers=[EXPLICIT])
         self.assertTrue(_logged_at(app, "Announced 'Hello' on ['media_player.explicit_2'] (announce volume 20%)", "INFO"))
 

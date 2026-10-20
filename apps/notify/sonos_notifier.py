@@ -1,5 +1,6 @@
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 from datetime import datetime, time # Added time for comparison
+from urllib.parse import urlsplit
 
 # App to handle Sonos TTS notifications with sleep mode considerations
 class SonosNotifier(hass.Hass):
@@ -24,7 +25,8 @@ class SonosNotifier(hass.Hass):
         self.default_chime_path = self.args.get("default_chime_path")
         self.tts_platform = self.args.get("tts_platform")
         self.audio_conversion = self.args.get("audio_conversion")
-        self.announce_volumes = self.args.get("announce_volumes") or {}
+        self.announce_volume = self.args.get("announce_volume")
+        self.clip_base_url = (self.args.get("clip_base_url") or "").rstrip("/")
 
         # Time Constraints using input_datetime entities
         self.time_constraints_enabled = False
@@ -64,11 +66,8 @@ class SonosNotifier(hass.Hass):
             self.log("WARN: 'default_chime_path' is not configured. Chime functionality might be affected if not provided in calls.")
         if not self.tts_platform:
             self.log("Using default TTS platform from chime_tts integration (no explicit tts_platform configured).", level="DEBUG")
-        unset_rooms = [
-            room for room in self.tts_group_all if self._volume_pct(self.announce_volumes.get(room)) is None
-        ]
-        if unset_rooms:
-            self.log(f"WARN: no announce_volumes entry for {unset_rooms}. They announce at their current volume.", level="WARNING")
+        if self._volume_pct(self.announce_volume) is None:
+            self.log("WARN: 'announce_volume' is missing or not a number. Rooms announce at their current volume.", level="WARNING")
 
         self.log(f"{self.app_name} Initialized. Ready to send notifications.", level=self.log_level)
         self.log(
@@ -157,7 +156,7 @@ class SonosNotifier(hass.Hass):
             override_quiet_hours (bool, optional): Skip the quiet-hours check and announce
                 anyway. For life-safety callers only. Defaults to False.
             volume_level (float, optional): Announcement volume (0.0-1.0) in every target room.
-                When omitted each room announces at its level in announce_volumes.
+                Defaults to announce_volume.
             **kwargs: cache (default True), offset (default -300) and tts_platform for the
                 chime_tts render.
         """
@@ -276,7 +275,14 @@ class SonosNotifier(hass.Hass):
             self.log(f"chime_tts/say_url produced no audio for '{message}': {response}", level="ERROR")
             return None
         self.log(f"Rendered '{message}' as {url} ({payload.get('duration')} s)", level="DEBUG")
-        return url
+        return self._clip_url(url)
+
+    def _clip_url(self, url):
+        """The rendered clip's URL on clip_base_url, keeping its path and query."""
+        if not self.clip_base_url:
+            return url
+        parts = urlsplit(url)
+        return f"{self.clip_base_url}{parts.path}" + (f"?{parts.query}" if parts.query else "")
 
     @staticmethod
     def _volume_pct(level):
@@ -291,42 +297,27 @@ class SonosNotifier(hass.Hass):
         """The native Sonos entity of a room entity (registry convention: <room>_2)."""
         return room if room.endswith("_2") else f"{room}_2"
 
-    def _announce_volume_pct(self, room, volume_level):
-        """Announcement volume for one room in percent, or None to let the speaker use its
-        current volume. Independent of the music volume, so lowering music never mutes alerts."""
-        if volume_level is not None:
-            return self._volume_pct(volume_level)
-        return self._volume_pct(self.announce_volumes.get(room))
-
     def _play_announcement(self, message, url, rooms, volume_level):
-        """Play the rendered clip as a Sonos audio clip on each room's native entity.
+        """Play the rendered clip as a Sonos audio clip on every room's native entity.
 
-        Music Assistant serialises announcements to the members of a Sonos group behind the
-        group's lock, so grouped rooms would hear the clip one after another. A native audio
-        clip overlays whatever the speaker plays and starts on every speaker at once.
+        One call for all rooms: separate calls start the clip audibly apart. Music Assistant is
+        not used because it announces to the members of a Sonos group one after another.
         """
-        rooms_by_volume = {}
-        for room in rooms:
-            rooms_by_volume.setdefault(self._announce_volume_pct(room, volume_level), []).append(
-                self._native_twin(room)
+        twins = [self._native_twin(room) for room in rooms]
+        volume_pct = self._volume_pct(self.announce_volume if volume_level is None else volume_level)
+        extra = {} if volume_pct is None else {"volume": volume_pct}
+        try:
+            self.call_service(
+                "media_player/play_media",
+                entity_id=twins,
+                media_content_id=url,
+                media_content_type="music",
+                announce=True,
+                extra=extra,
+                callback=lambda result: self._log_announcement_result(message, twins, volume_pct, result),
             )
-
-        for volume_pct, group in rooms_by_volume.items():
-            extra = {} if volume_pct is None else {"volume": volume_pct}
-            try:
-                self.call_service(
-                    "media_player/play_media",
-                    entity_id=group,
-                    media_content_id=url,
-                    media_content_type="music",
-                    announce=True,
-                    extra=extra,
-                    callback=lambda result, group=group, volume_pct=volume_pct: self._log_announcement_result(
-                        message, group, volume_pct, result
-                    ),
-                )
-            except Exception as e:
-                self.log(f"Error calling media_player/play_media for {group}: {e}", level="ERROR")
+        except Exception as e:
+            self.log(f"Error calling media_player/play_media for {twins}: {e}", level="ERROR")
 
     def _log_announcement_result(self, message, rooms, volume_pct, result):
         volume = "no announce volume" if volume_pct is None else f"announce volume {volume_pct}%"

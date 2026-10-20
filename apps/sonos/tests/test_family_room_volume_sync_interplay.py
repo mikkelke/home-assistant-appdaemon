@@ -321,7 +321,7 @@ class SonosNotifierInterplay(unittest.TestCase):
         plays = [d for s, d in self.house.calls if s == "media_player/play_media"]
         for play in plays:
             self.assertTrue(play["announce"])
-            self.assertEqual(play["media_content_id"], CLIP_URL)
+            self.assertEqual(play["media_content_id"], "http://10.21.0.5:8123/local/chime_tts/clip.mp3")
         for play in plays:
             self.assertTrue(all(twin.endswith("_2") for twin in play["entity_id"]))
         return {twin[: -len("_2")]: play["extra"].get("volume") for play in plays for twin in play["entity_id"]}
@@ -330,7 +330,7 @@ class SonosNotifierInterplay(unittest.TestCase):
         announced = self.announce()
         self.assertEqual(sorted(announced), sorted(self.app.tts_group_all))
         for room in FAMILY:
-            self.assertEqual(announced[room], round(self.app.announce_volumes[room] * 100))
+            self.assertEqual(announced[room], round(self.app.announce_volume * 100))
         self.assertEqual(self.house.volume_sets(), [])
         self.assertEqual(self.house.volumes(), self.before)
         self.assertEqual(self.rig.arm_delays, [])
