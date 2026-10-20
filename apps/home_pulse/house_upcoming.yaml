@@ -74,6 +74,7 @@ HouseUpcoming:
     - {name: Snake plant bathroom, area: bathroom, water: 0.5, every_days: 35}
     - {name: Aloe, area: living_room, water: 0.3, every_days: 35}
     - {name: Alocasia, area: bathroom, water: 0.7, every_days: 7}
+    - {name: Cactus, area: bathroom, water: 0.1, every_days: 42}
 
   batteries:
     # action: replace (primary cells), recharge (swappable rechargeables), charge (built in).
