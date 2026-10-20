@@ -177,7 +177,7 @@ class CoffeeMachine(hass.Hass):
         self._recipes = [r for r in (saved.get("recipes") or []) if isinstance(r, dict) and r.get("pours")]
         self._baseline = saved.get("baseline") if isinstance(saved.get("baseline"), dict) else None
         self._tracker = cf.Tracker.from_dict(saved.get("tracker"))
-        self._cup = ccup.Cup.from_dict(saved.get("cup"))
+        self._cup = ccup.Cup()
         self._power = cpow.PowerBrew()
         self._power.restore(saved.get("power"))
         self._meter = cpow.MachineMeter()
@@ -1615,7 +1615,7 @@ class CoffeeMachine(hass.Hass):
         data = {"version": STATE_VERSION, "saved_at": cf.iso(self._now()), "usual_id": self._usual_id,
                 "beans": self._beans.to_dict(), "advice": self._advice.to_dict(), "connect": self._connect.to_dict(),
                 "pending_notify": self._pending_notify, "recipes": self._recipes, "baseline": self._baseline,
-                "tracker": self._tracker.to_dict(), "power": self._power.snapshot(), "cup": self._cup.to_dict()}
+                "tracker": self._tracker.to_dict(), "power": self._power.snapshot()}
         try:
             feedback_io.write_json(str(self.state_file), data)
         except Exception as e:

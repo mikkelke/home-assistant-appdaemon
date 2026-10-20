@@ -362,9 +362,9 @@ class CupTests(unittest.TestCase):
                 seen.append(attrs["cup"])
         return seen
 
-    def test_a_cup_lifted_since_the_zero_waits_for_one_then_starts_by_itself(self):
+    def test_readied_at_rest_without_the_cup_waits_for_it_then_starts_by_itself(self):
         app = fake.make_app(cup=False)
-        self.scale(app, "-270.6")
+        self.scale(app, "-113.64")
         fake.advance(app, 2)
         self.assertEqual(coffee_state(app)[1]["cup"], "absent")
         fake.op(app, "start", {"variant": "usual"})
@@ -373,17 +373,26 @@ class CupTests(unittest.TestCase):
         self.assertEqual((state, attrs["cup"], brew_id), ("awaiting_cup", "absent", f"c{int(app.now)}"))
         self.assertEqual(calls(app, "switch/turn_on"), [{"entity_id": "switch.xbloom_studio_connect"}])
         fake.fire(app, "xbloom_connect_ready", {"summary": {}})
-        self.scale(app, "-231.0")
-        fake.advance(app, 5)
-        self.scale(app, "0.2")
-        fake.advance(app, 1.5)
+        for grams in ("-105.72", "13.91", "220.41", "163.35"):
+            self.scale(app, grams)
+            fake.advance(app, 0.2)
+        fake.advance(app, 1.3)
         self.assertEqual(coffee_state(app)[0], "awaiting_cup")
         self.assertEqual(calls(app, "xbloom/start_brew"), [])
-        fake.advance(app, 0.5)
+        fake.advance(app, 0.3)
         state, attrs = coffee_state(app)
         self.assertEqual((state, attrs["cup"], attrs["brew_id"]), ("starting", "present", brew_id))
         self.assertEqual(calls(app, "xbloom/start_brew"), [{"return_response": True, "recipe_name": "4 Pour Recipe",
                                                             "context": {"coffee_brew_id": brew_id}}])
+
+    def test_the_cup_on_before_the_dripper_and_the_magnet_cup_come_off_starts_at_once(self):
+        app = fake.make_app(cup=False)
+        for grams in ("270.8", "231.2", "157.2"):
+            self.scale(app, grams)
+            fake.advance(app, 3)
+        self.assertEqual(coffee_state(app)[1]["cup"], "present")
+        fake.op(app, "start", {"variant": "usual"})
+        self.assertEqual(coffee_state(app)[0], "starting")
 
     def test_an_unknown_cup_waits_and_the_cup_is_already_on_starts_at_once(self):
         app = fake.make_app(cup=False)
@@ -444,18 +453,17 @@ class CupTests(unittest.TestCase):
         self.assertIn("the machine started a brew", " ".join(m for _, m in app.logs))
         self.assertEqual(calls(app, "xbloom/start_brew"), [])
 
-    def test_a_restart_drops_the_wait_and_keeps_the_level(self):
+    def test_a_restart_drops_the_wait_and_forgets_the_cup_until_the_next_frame(self):
         app = fake.make_app(cup=False)
-        self.scale(app, "270.8")
+        self.scale(app, "-113.64")
         fake.advance(app, 2)
-        fake.fire(app, "xbloom_connect_stopped", {"reason": "user"})
         fake.op(app, "start", {"variant": "usual"})
         self.assertEqual(coffee_state(app)[0], "awaiting_cup")
         again = fake.make_app(state_dir=app.dir, now=app.now + 1, states=app.states, cup=False)
         self.assertEqual((coffee_state(again)[0], coffee_state(again)[1]["cup"]), ("idle", "unknown"))
-        fake.set_entity(again, "sensor.xbloom_studio_scale_weight", "0.3")
+        fake.set_entity(again, "sensor.xbloom_studio_scale_weight", "157.16")
         fake.advance(again, 2)
-        self.assertEqual(coffee_state(again)[1]["cup"], "absent")
+        self.assertEqual(coffee_state(again)[1]["cup"], "present")
         self.assertEqual(calls(again, "xbloom/start_brew"), [])
 
     def test_a_sleeping_machine_is_nudged_awake_at_most_twice(self):
@@ -497,14 +505,14 @@ class CupTests(unittest.TestCase):
         app = fake.make_app(cup=False)
         fake.set_entity(app, "switch.xbloom_studio_connect", "on")
         fake.fire(app, "xbloom_connect_ready", {"summary": {}})
-        self.scale(app, "270.8")
-        fake.advance(app, 2)
-        self.assertEqual(coffee_state(app)[1]["cup"], "present")
-        fake.fire(app, "xbloom_connect_auto_stopped", {"reason": "idle_timeout"})
-        self.assertEqual(coffee_state(app)[1]["cup"], "unknown")
-        self.scale(app, "0.0")
+        self.scale(app, "-113.64")
         fake.advance(app, 2)
         self.assertEqual(coffee_state(app)[1]["cup"], "absent")
+        fake.fire(app, "xbloom_connect_auto_stopped", {"reason": "idle_timeout"})
+        self.assertEqual(coffee_state(app)[1]["cup"], "unknown")
+        self.scale(app, "157.16")
+        fake.advance(app, 2)
+        self.assertEqual(coffee_state(app)[1]["cup"], "present")
 
     def test_the_recorded_brew_had_its_cup_on_before_the_hold(self):
         doc = json.loads((Path(__file__).resolve().parent / "fixtures" / "tape_2026-10-20.json").read_text())
