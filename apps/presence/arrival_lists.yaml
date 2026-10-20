@@ -1,5 +1,5 @@
 # /conf/apps/presence/arrival_lists.yaml
-# Pushes Mikkel the open items of the place's to-do lists when he arrives home or at the office.
+# Pushes Mikkel the open items of the place's Husk list when he arrives home or at the office.
 # Keys under places are person states: "home", or the zone name ("Office" is zone.office).
 #
 # No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
@@ -23,4 +23,3 @@ ArrivalLists:
       - todo.husk_hjemme
     Office:
       - todo.husk_kontor
-      - todo.firma_indkob
