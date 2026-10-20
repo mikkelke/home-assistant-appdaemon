@@ -8,13 +8,15 @@ unavailable or not a number changes nothing and has no row; a sensor that stays 
 inventory's to report.
 
 A dry plant's row is admin only and untimed, like an open battery condition. It has no Done button, the
-moisture rising closes it, and its push key is unique per episode: the time the latch opened.
+moisture rising closes it, and its push key is unique per episode: the time the latch opened. A plant
+with a `water` amount in litres says how much to pour in the title, which gives up name characters
+before it gives up the amount.
 """
 
 import re
 import unicodedata
 
-from upcoming_core import make_row, utc_iso
+from upcoming_core import TEXT_MAX, clean_text, make_row, utc_iso
 from upcoming_maint import parse_iso, reading
 
 ID_PREFIX = "maint:plant:"
@@ -31,22 +33,25 @@ def slug(name):
 def parse_plants(raw):
     """The `plants` list of house_upcoming.yaml, validated, as {moisture entity: plant}. Raises
     ValueError on a plant without a moisture entity, a name with no letters or digits, a `dry` that is
-    not a number, or an entity or name listed twice, so a typo fails at start instead of silently
-    dropping a plant."""
+    not a number, a `water` that is given but not a positive number, or an entity or name listed twice,
+    so a typo fails at start instead of silently dropping a plant."""
     plants = {}
     for cfg in raw or []:
         cfg = cfg if isinstance(cfg, dict) else {}
         entity, name, dry = cfg.get("moisture"), str(cfg.get("name") or "").strip(), reading(cfg.get("dry"))
-        key = slug(name)
+        key, water = slug(name), cfg.get("water")
+        litres = reading(water)
         if not isinstance(entity, str) or not entity:
             raise ValueError(f"plant {name!r}: missing moisture entity")
         if not key:
             raise ValueError(f"plant {entity}: the name needs letters or digits")
         if dry is None:
             raise ValueError(f"plant {entity}: dry must be a number, not {cfg.get('dry')!r}")
+        if water is not None and (litres is None or litres <= 0):
+            raise ValueError(f"plant {entity}: water must be a positive number of litres, not {water!r}")
         if entity in plants or key in {plant["slug"] for plant in plants.values()}:
             raise ValueError(f"plant {entity}: entity or name listed twice")
-        plants[entity] = {"name": name, "slug": key, "area": cfg.get("area") or None, "dry": dry}
+        plants[entity] = {"name": name, "slug": key, "area": cfg.get("area") or None, "dry": dry, "water": litres}
     return plants
 
 
@@ -74,12 +79,19 @@ def _percent(value):
     return f"{round(value, 1):g}%"
 
 
+def _title(plant):
+    """"Water the <name>", then ": <litres> L" when the plant has an amount; the name is cut to make
+    room, never the amount."""
+    amount = f": {round(plant['water'], 2):g} L" if plant["water"] else ""
+    return clean_text(f"Water the {plant['name']}", TEXT_MAX - len(amount)) + amount
+
+
 def plant_row(entity, plant, st, value):
     """(row, push key) while the plant is dry and its reading is known, else None."""
     st = st or {}
     if "since" not in st or value is None:
         return None
-    row = make_row(ID_PREFIX + plant["slug"], "maint", f"Water the {plant['name']}",
+    row = make_row(ID_PREFIX + plant["slug"], "maint", _title(plant),
                    f"soil {_percent(value)}, water at {_percent(plant['dry'])}", icon=ICON, area=plant["area"],
                    audience="admin")
     return row, f"plant:{entity}:{st['since']}"

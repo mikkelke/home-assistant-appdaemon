@@ -1235,6 +1235,15 @@ class PlantTests(unittest.TestCase):
         self.push(app)
         self.assertEqual([s["message"] for s in app.notifier.sent], ["Water the Strelitzia"] * 2)
 
+    def test_the_amount_to_pour_is_in_the_title_and_the_push_but_not_the_detail(self):
+        poured = {**SAMPLE_PLANT, "water": 3}
+        app = self.make(self.states("12"), plants=[poured])
+        row = rows(app)[self.ROW]
+        self.assertEqual((row["title"], row["detail"]), ("Water the Strelitzia: 3 L", "soil 12%, water at 15%"))
+        self.assertTrue(core.is_valid_row(row))
+        self.push(app)
+        self.assertEqual([s["message"] for s in app.notifier.sent], ["Water the Strelitzia: 3 L"])
+
     def test_the_push_names_it_with_the_other_conditions(self):
         states = self.states("9")
         states["sensor.rober2_filter_time_left"] = full("-19902")
@@ -1274,10 +1283,11 @@ class PlantTests(unittest.TestCase):
             self.assertIn(plant["area"], AREAS, entity)
             self.assertEqual(core.clean_text(plant["name"]), plant["name"], entity)
             dry = f"{plant['dry']:g}"
+            title = f"Water the {plant['name']}" + (f": {plant['water']:g} L" if plant["water"] else "")
             fire(app, entity, full(dry))
             row = plant_rows(app)[f"maint:plant:{plant['slug']}"]
             self.assertEqual((row["title"], row["detail"], row.get("area")),
-                             (f"Water the {plant['name']}", f"soil {dry}%, water at {dry}%", plant["area"]), entity)
+                             (title, f"soil {dry}%, water at {dry}%", plant["area"]), entity)
             self.assertTrue(core.is_valid_row(row), entity)
         self.assertEqual(len(plant_rows(app)), len(PLANTS))
         for entity, plant in PLANTS.items():

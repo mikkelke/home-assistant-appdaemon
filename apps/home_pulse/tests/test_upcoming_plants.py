@@ -1,5 +1,5 @@
 # tests/test_upcoming_plants.py - watering reminders for sensor.house_upcoming: the dry latch and its
-# hysteresis, the row and its push key, and the plants list of house_upcoming.yaml.
+# hysteresis, the row with the litres to pour and its push key, and the plants list of house_upcoming.yaml.
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
 import sys
@@ -102,6 +102,30 @@ class RowTests(unittest.TestCase):
         self.assertEqual(row_of(feed([(T0, 10)], plant=half), 10.0, half, "sensor.fern")[0]["detail"],
                          "soil 10%, water at 17.5%")
 
+    def test_the_title_says_how_many_litres_to_pour_without_trailing_zeros(self):
+        amounts = [(3, "3"), (3.0, "3"), (0.5, "0.5"), (0.4, "0.4"), (0.3, "0.3"), (0.25, "0.25"), (1.5, "1.5"),
+                   (2.50, "2.5"), (12, "12")]
+        for litres, shown in amounts:
+            plant = plants.parse_plants([{**RAW[0], "water": litres}])[ENTITY]
+            row, _ = row_of(feed([(T0, 12)], plant=plant), 12.0, plant)
+            self.assertEqual(row["title"], f"Water the Strelitzia: {shown} L", litres)
+            self.assertEqual(row["detail"], "soil 12%, water at 15%", litres)
+            self.assertTrue(core.is_valid_row(row), litres)
+
+    def test_without_an_amount_the_title_is_as_it_was(self):
+        for cfg in (RAW[0], {**RAW[0], "water": None}):
+            plant = plants.parse_plants([cfg])[ENTITY]
+            self.assertEqual(row_of(feed([(T0, 12)], plant=plant), 12.0, plant)[0]["title"], "Water the Strelitzia")
+
+    def test_a_long_name_is_cut_before_the_amount_is(self):
+        name = "Monstera deliciosa variegata (the big one by the window)"
+        plant = plants.parse_plants([{"moisture": "sensor.p", "name": name, "dry": 20, "water": 0.3}])["sensor.p"]
+        row, _ = row_of(feed([(T0, 5)], plant=plant), 5.0, plant, "sensor.p")
+        self.assertEqual(len(row["title"]), core.TEXT_MAX)
+        self.assertTrue(row["title"].startswith("Water the Monstera deliciosa variegata (the big"), row["title"])
+        self.assertTrue(row["title"].endswith(": 0.3 L"), row["title"])
+        self.assertTrue(core.is_valid_row(row))
+
     def test_no_row_while_wet_or_while_the_reading_is_unknown(self):
         self.assertIsNone(row_of({}, 40.0))
         self.assertIsNone(row_of(None, 12.0))
@@ -117,11 +141,14 @@ class RowTests(unittest.TestCase):
     def test_awkward_names_still_make_a_valid_row(self):
         names = ("Monstera deliciosa variegata (the big one by the window)", "Ficus  \u00e9lastica", "x" * 60, "A&B")
         for name in names:
-            plant = plants.parse_plants([{"moisture": "sensor.p", "name": name, "dry": 20}])["sensor.p"]
-            row, _ = row_of(feed([(T0, 5)], plant=plant), 5.0, plant, "sensor.p")
-            self.assertTrue(core.is_valid_row(row), name)
-            self.assertLessEqual(len(row["title"]), core.TEXT_MAX)
-            self.assertTrue(row["title"].startswith("Water the "), name)
+            for litres in (None, 0.3, 12.5):
+                cfg = {"moisture": "sensor.p", "name": name, "dry": 20, "water": litres}
+                plant = plants.parse_plants([cfg])["sensor.p"]
+                row, _ = row_of(feed([(T0, 5)], plant=plant), 5.0, plant, "sensor.p")
+                self.assertTrue(core.is_valid_row(row), name)
+                self.assertLessEqual(len(row["title"]), core.TEXT_MAX)
+                self.assertTrue(row["title"].startswith("Water the "), name)
+                self.assertEqual(row["title"].endswith(" L"), litres is not None, row["title"])
 
 
 class PushKeyTests(unittest.TestCase):
@@ -136,6 +163,11 @@ class PushKeyTests(unittest.TestCase):
         watered = feed([(T0 + 3 * DAY, 40)], later)
         next_episode = feed([(T0 + 30 * DAY, 14)], watered)
         self.assertNotEqual(row_of(next_episode, 14.0)[1], row_of(st, 12.0)[1])
+
+    def test_changing_the_amount_does_not_change_the_key(self):
+        st = feed([(T0, 12)])
+        poured = plants.parse_plants([{**RAW[0], "water": 3}])[ENTITY]
+        self.assertEqual(row_of(st, 12.0, poured)[1], row_of(st, 12.0)[1])
 
     def test_the_digest_names_it_once_an_episode(self):
         row, key = row_of(feed([(T0, 12)]), 12.0)
@@ -158,9 +190,11 @@ class PushKeyTests(unittest.TestCase):
 
 
 class ParseTests(unittest.TestCase):
-    def test_a_plant_is_its_sensor_name_room_and_dry_level(self):
+    def test_a_plant_is_its_sensor_name_room_dry_level_and_optional_litres(self):
         self.assertEqual(plants.parse_plants(RAW),
-                         {ENTITY: {"name": "Strelitzia", "slug": "strelitzia", "area": "dining_room", "dry": 15.0}})
+                         {ENTITY: {"name": "Strelitzia", "slug": "strelitzia", "area": "dining_room", "dry": 15.0,
+                                   "water": None}})
+        self.assertEqual(plants.parse_plants([{**RAW[0], "water": 0.3}])[ENTITY]["water"], 0.3)
 
     def test_no_plants_is_fine(self):
         for raw in (None, [], ()):
@@ -200,6 +234,13 @@ class ParseTests(unittest.TestCase):
         for cfg in bad:
             with self.assertRaises(ValueError, msg=cfg):
                 plants.parse_plants([cfg])
+
+    def test_water_is_left_out_or_a_positive_number_of_litres(self):
+        for litres, expected in ((None, None), (3, 3.0), (0.3, 0.3), (0.01, 0.01), (250, 250.0)):
+            self.assertEqual(plants.parse_plants([{**RAW[0], "water": litres}])[ENTITY]["water"], expected, litres)
+        for bad in (0, 0.0, -1, -0.5, "lots", "", True, False, float("nan"), float("inf"), [], {}, [1]):
+            with self.assertRaises(ValueError, msg=bad):
+                plants.parse_plants([{**RAW[0], "water": bad}])
 
     def test_a_plant_listed_twice_by_sensor_or_by_name_fails_at_start(self):
         same_sensor = [RAW[0], {**RAW[0], "name": "Other"}]

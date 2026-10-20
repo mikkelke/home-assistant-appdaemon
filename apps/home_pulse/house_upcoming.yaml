@@ -54,12 +54,13 @@ HouseUpcoming:
       binary_sensor.rooftop_door_2_contact: {label: "Claudia's terrace door", area: office}
 
   # One line per houseplant: moisture is its soil moisture sensor, dry the reading in percent at or
-  # under which it needs water. The reminder stays until the reading is 5 points above dry.
+  # under which it needs water, water (optional) the litres to pour, which the row's title shows. The
+  # reminder stays until the reading is 5 points above dry.
   plants:
-    - {moisture: sensor.strelitzia_moisture, name: Strelitzia, area: dining_room, dry: 15}
-    - {moisture: sensor.philodendron_moisture, name: Philodendron, area: dining_room, dry: 20}
-    - {moisture: sensor.pothos_moisture, name: Pothos, area: living_room, dry: 15}
-    - {moisture: sensor.ivy_moisture, name: Ivy, area: kitchen, dry: 20}
+    - {moisture: sensor.strelitzia_moisture, name: Strelitzia, area: dining_room, dry: 15, water: 3}
+    - {moisture: sensor.philodendron_moisture, name: Philodendron, area: dining_room, dry: 20, water: 0.5}
+    - {moisture: sensor.pothos_moisture, name: Pothos, area: living_room, dry: 15, water: 0.4}
+    - {moisture: sensor.ivy_moisture, name: Ivy, area: kitchen, dry: 20, water: 0.3}
 
   batteries:
     # action: replace (primary cells), recharge (swappable rechargeables), charge (built in).
