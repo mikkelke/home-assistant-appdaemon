@@ -834,6 +834,8 @@ class TransitAlarm(hass.Hass):
             params["direction"] = direction_id
         if lines:
             params["lines"] = ",".join(str(ln) for ln in lines)
+        if route.get("arrival_stop_id"):
+            params["passlist"] = 1
 
         url = f"{REJSEPLANEN_BASE}/departureBoard"
         try:
@@ -908,7 +910,19 @@ class TransitAlarm(hass.Hass):
         except ValueError:
             return None
 
-    def _normalize_departure(self, dep: dict) -> dict:
+    def _arrival_at(self, dep: dict, stop_id: Optional[str]) -> Optional[datetime]:
+        """Realtime-else-scheduled arrival at stop_id from the departure's passlist, or None."""
+        if not stop_id:
+            return None
+        for stop in (dep.get("Stops") or {}).get("Stop") or []:
+            if str(stop.get("extId")) != str(stop_id):
+                continue
+            sched = self._parse_dt(stop.get("arrDate"), stop.get("arrTime"))
+            rt = self._parse_dt(stop.get("rtArrDate") or stop.get("arrDate"), stop.get("rtArrTime"))
+            return rt or sched
+        return None
+
+    def _normalize_departure(self, dep: dict, arrival_stop_id: Optional[str] = None) -> dict:
         """Parse one API departure into a single dict: effective, line, cancelled, delay_min, etc."""
         sched = self._parse_dt(dep.get("date"), dep.get("time"))
         rt = self._parse_dt(dep.get("rtDate") or dep.get("date"), dep.get("rtTime"))
@@ -917,6 +931,7 @@ class TransitAlarm(hass.Hass):
             or dep.get("ProductAtStop", {}).get("line")
             or ""
         )
+        category = dep.get("ProductAtStop", {}).get("catOut") or ""
         cancelled = (
             dep.get("cancelled") is True
             or str(dep.get("cancelled", "")).lower() == "true"
@@ -928,14 +943,23 @@ class TransitAlarm(hass.Hass):
             delay_min = int((rt - sched).total_seconds() / 60)
         time_label = (dep.get("rtTime") or dep.get("time") or "?")[:5]
         scheduled_str = (dep.get("time") or "")[:5]
+        arrival = self._arrival_at(dep, arrival_stop_id)
+        travel_min = None
+        arrival_time = None
+        if effective and arrival and arrival > effective:
+            travel_min = int((arrival - effective).total_seconds() / 60)
+            arrival_time = arrival.strftime("%H:%M")
         return {
             "effective": effective,
             "scheduled": sched,
             "scheduled_str": scheduled_str,
             "line": line,
+            "category": category,
             "cancelled": cancelled,
             "delay_min": delay_min,
             "time_label": time_label,
+            "travel_min": travel_min,
+            "arrival_time": arrival_time,
         }
 
     @staticmethod
@@ -965,10 +989,12 @@ class TransitAlarm(hass.Hass):
                 "ts": int(n["effective"].timestamp()),
                 "time": n["effective"].strftime("%H:%M"),
                 "line": n["line"],
+                "category": n.get("category", ""),
                 "delay_min": n["delay_min"],
                 "cancelled": n["cancelled"],
                 "scheduled_time": n["scheduled_str"],
                 "problematic": n["cancelled"] or n["delay_min"] >= delay_thr,
+                **{k: n[k] for k in ("travel_min", "arrival_time") if n.get(k) is not None},
             }
             for n in future_only
         ]
@@ -1144,7 +1170,8 @@ class TransitAlarm(hass.Hass):
 
     def _evaluate(self, departures: list, route: dict, delay_thr: int, name: str) -> dict:
         now = datetime.now()
-        normalized = [self._normalize_departure(d) for d in departures]
+        arrival_stop_id = route.get("arrival_stop_id")
+        normalized = [self._normalize_departure(d, arrival_stop_id) for d in departures]
         future_only = [
             n for n in normalized
             if n["effective"] and n["effective"] >= now - timedelta(minutes=1)

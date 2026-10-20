@@ -102,6 +102,7 @@ TransitStatus:
     # ── IC/Lyn/ECE/Re: KBH H → Odense (Kristine) ─────────────────────────
     # direction_id filters to trains that stop at Odense (IC, IC Lyn = ICL, EuroCity Express = ECE, Re).
     # line_categories excludes Metro and S-tog from the same stop.
+    # arrival_stop_id adds each train's stop list to the same API call, giving it a travel time to Odense.
     # duration_min: 90 overrides the instance default (30) so there are always
     # 1-2 trains visible in the window even when IC runs every 30-60 min.
     - sensor_id: "kbh_ic_odense"
@@ -109,6 +110,7 @@ TransitStatus:
       stop_name: "KBH H"
       stop_id: "8600626"
       direction_id: "8600512"
+      arrival_stop_id: "8600512"
       duration_min: 90
       line_categories:
         - "IC"
@@ -230,6 +232,7 @@ TransitKristine:
       stop_name: "KBH H"
       stop_id: "8600626"
       direction_id: "8600512"
+      arrival_stop_id: "8600512"
       duration_min: 90
       line_categories:
         - "IC"

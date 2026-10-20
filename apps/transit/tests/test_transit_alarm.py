@@ -13,11 +13,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -179,6 +181,218 @@ class TestRescueWindowResolution(unittest.TestCase):
 
         narrow = dict(METRO_ROUTE, rescue_window_min=2)
         self.assertEqual(app._evaluate(board, narrow, 5, "Metro M3")["severity"], 3)
+
+
+ODENSE = "8600512"
+KBH_IC_ROUTE = {
+    "sensor_id": "kbh_ic_odense",
+    "transport_name": "IC -> Odense",
+    "stop_id": "8600626",
+    "direction_id": ODENSE,
+    "arrival_stop_id": ODENSE,
+    "line_categories": ["IC", "ICL", "ECE", "Re"],
+    "evaluation_mode": "infrequent_strict",
+    "delay_threshold_min": 10,
+}
+
+
+def passlist_stop(ext_id: str, arrives: datetime, *, rt_arrives: datetime | None = None) -> dict:
+    out = {
+        "extId": ext_id,
+        "name": f"Stop {ext_id}",
+        "arrDate": arrives.strftime("%Y-%m-%d"),
+        "arrTime": arrives.strftime("%H:%M:%S"),
+    }
+    if rt_arrives is not None:
+        out["rtArrDate"] = rt_arrives.strftime("%Y-%m-%d")
+        out["rtArrTime"] = rt_arrives.strftime("%H:%M:%S")
+    return out
+
+
+def ic_train(
+    departs: datetime,
+    *,
+    category: str | None = "ECE",
+    delay_min: int = 0,
+    stops: list[dict] | None = None,
+) -> dict:
+    """One KBH H departure as the board returns it; `stops` is the passlist, absent when None."""
+    rt = departs + timedelta(minutes=delay_min)
+    out = {
+        "date": departs.strftime("%Y-%m-%d"),
+        "time": departs.strftime("%H:%M:%S"),
+        "rtDate": rt.strftime("%Y-%m-%d"),
+        "rtTime": rt.strftime("%H:%M:%S"),
+        "ProductAtStop": {"displayNumber": "IC 123"},
+    }
+    if category is not None:
+        out["ProductAtStop"]["catOut"] = category
+    if stops is not None:
+        out["Stops"] = {"Stop": stops}
+    return out
+
+
+class TestCategoryAndTravelTime(unittest.TestCase):
+    """KBH H -> Odense: every departure carries its category and, with a passlist, its trip length."""
+
+    def setUp(self) -> None:
+        self.app = ta.TransitAlarm.__new__(ta.TransitAlarm)
+        self.departs = datetime.now().replace(second=0, microsecond=0) + timedelta(minutes=20)
+
+    def _published(self, *board: dict, route: dict = KBH_IC_ROUTE) -> list[dict]:
+        return self.app._evaluate(list(board), route, 10, "IC -> Odense")["departures"]
+
+    def _arrives(self, after_min: int) -> datetime:
+        return self.departs + timedelta(minutes=after_min)
+
+    def _odense(self, after_min: int, **kwargs) -> dict:
+        return passlist_stop(ODENSE, self._arrives(after_min), **kwargs)
+
+    def test_category_passes_through(self):
+        [d] = self._published(ic_train(self.departs, category="ICL"))
+        self.assertEqual(d["category"], "ICL")
+
+    def test_missing_category_is_an_empty_string(self):
+        route = dict(KBH_IC_ROUTE, line_categories=[])
+        [d] = self._published(ic_train(self.departs, category=None), route=route)
+        self.assertEqual(d["category"], "")
+
+    def test_route_without_an_arrival_stop_gets_category_but_no_travel_time(self):
+        route = {k: v for k, v in KBH_IC_ROUTE.items() if k != "arrival_stop_id"}
+        [d] = self._published(ic_train(self.departs, stops=[self._odense(71)]), route=route)
+        self.assertEqual(d["category"], "ECE")
+        self.assertNotIn("travel_min", d)
+        self.assertNotIn("arrival_time", d)
+
+    def test_travel_time_from_scheduled_times(self):
+        stops = [
+            passlist_stop("8600700", self._arrives(30)),
+            self._odense(71),
+            passlist_stop("8600800", self._arrives(95)),
+        ]
+        [d] = self._published(ic_train(self.departs, stops=stops))
+        self.assertEqual(d["travel_min"], 71)
+        self.assertEqual(d["arrival_time"], self._arrives(71).strftime("%H:%M"))
+
+    def test_realtime_arrival_is_preferred(self):
+        stop = self._odense(71, rt_arrives=self._arrives(76))
+        [d] = self._published(ic_train(self.departs, stops=[stop]))
+        self.assertEqual(d["travel_min"], 76)
+        self.assertEqual(d["arrival_time"], self._arrives(76).strftime("%H:%M"))
+
+    def test_realtime_arrival_time_without_its_date_uses_the_scheduled_date(self):
+        """A late train arriving after midnight: the date is only on the scheduled arrival."""
+        departs = (datetime.now() + timedelta(days=1)).replace(hour=23, minute=30, second=0, microsecond=0)
+        stop = passlist_stop(ODENSE, departs + timedelta(minutes=71))
+        stop["rtArrTime"] = (departs + timedelta(minutes=74)).strftime("%H:%M:%S")
+        [d] = self._published(ic_train(departs, stops=[stop]))
+        self.assertEqual(d["travel_min"], 74)
+
+    def test_travel_time_runs_from_the_delayed_departure_to_the_delayed_arrival(self):
+        stop = self._odense(71, rt_arrives=self._arrives(80))
+        [d] = self._published(ic_train(self.departs, delay_min=5, stops=[stop]))
+        self.assertEqual(d["travel_min"], 75)
+
+    def test_no_passlist_or_no_arrival_stop_in_it_means_no_travel_time(self):
+        base = ic_train(self.departs)
+        no_time = {"extId": ODENSE, "name": "Odense St."}
+        cases = {
+            "no Stops key": base,
+            "Stops null": {**base, "Stops": None},
+            "empty Stops": {**base, "Stops": {}},
+            "Stop null": {**base, "Stops": {"Stop": None}},
+            "other stops only": ic_train(self.departs, stops=[passlist_stop("8600700", self._arrives(30))]),
+            "arrival stop without a time": ic_train(self.departs, stops=[no_time]),
+        }
+        for label, entry in cases.items():
+            with self.subTest(label):
+                [d] = self._published(entry)
+                self.assertEqual(d["category"], "ECE")
+                self.assertNotIn("travel_min", d)
+                self.assertNotIn("arrival_time", d)
+
+    def test_an_arrival_before_the_departure_is_not_a_travel_time(self):
+        [d] = self._published(ic_train(self.departs, stops=[self._odense(-5)]))
+        self.assertNotIn("travel_min", d)
+        self.assertNotIn("arrival_time", d)
+
+    def test_arrival_stop_id_given_as_a_yaml_number_still_matches(self):
+        route = dict(KBH_IC_ROUTE, arrival_stop_id=int(ODENSE))
+        [d] = self._published(ic_train(self.departs, stops=[self._odense(71)]), route=route)
+        self.assertEqual(d["travel_min"], 71)
+
+    def test_duplicate_departures_keep_category_and_travel_time(self):
+        train = ic_train(self.departs, stops=[self._odense(71)])
+        published = self._published(train, dict(train))
+        self.assertEqual(len(published), 1)
+        self.assertEqual(published[0]["category"], "ECE")
+        self.assertEqual(published[0]["travel_min"], 71)
+        self.assertEqual(published[0]["arrival_time"], self._arrives(71).strftime("%H:%M"))
+
+
+class FakeResponse:
+    status = 200
+
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    async def __aenter__(self) -> FakeResponse:
+        return self
+
+    async def __aexit__(self, *exc_info) -> bool:
+        return False
+
+    async def json(self, content_type=None) -> dict:
+        return self.payload
+
+
+class FakeSession:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+        self.requests: list[dict] = []
+
+    def get(self, url: str, params: dict, timeout) -> FakeResponse:
+        self.requests.append(params)
+        return FakeResponse(self.payload)
+
+
+class TestPasslistRequest(unittest.TestCase):
+    """The stop list makes the response bigger, so only a route with an arrival stop asks for it."""
+
+    def setUp(self) -> None:
+        self.app = ta.TransitAlarm.__new__(ta.TransitAlarm)
+        self.app.access_id = "key"
+        self.app.max_journeys = 25
+        self.app.duration_min = 60
+
+        async def enabled(route: dict) -> bool:
+            return True
+
+        self.app._route_is_enabled = enabled
+        timeout = mock.patch.object(ta.aiohttp, "ClientTimeout", create=True, new=lambda total: total)
+        timeout.start()
+        self.addCleanup(timeout.stop)
+
+        departs = datetime.now().replace(second=0, microsecond=0) + timedelta(minutes=20)
+        stops = [passlist_stop(ODENSE, departs + timedelta(minutes=71))]
+        self.board = {"Departure": [ic_train(departs, stops=stops)]}
+
+    def _check(self, route: dict) -> tuple[dict, dict]:
+        session = FakeSession(self.board)
+        result = asyncio.run(self.app._check_route(route, session))
+        return session.requests[0], result
+
+    def test_a_route_with_an_arrival_stop_asks_for_the_passlist(self):
+        params, result = self._check(KBH_IC_ROUTE)
+        self.assertEqual(params["passlist"], 1)
+        self.assertEqual(result["departures"][0]["category"], "ECE")
+        self.assertEqual(result["departures"][0]["travel_min"], 71)
+
+    def test_a_route_without_one_does_not(self):
+        route = {k: v for k, v in KBH_IC_ROUTE.items() if k != "arrival_stop_id"}
+        params, result = self._check(route)
+        self.assertNotIn("passlist", params)
+        self.assertNotIn("travel_min", result["departures"][0])
 
 
 if __name__ == "__main__":
