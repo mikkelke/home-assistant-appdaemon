@@ -59,6 +59,7 @@ HouseUpcoming:
     - {moisture: sensor.strelitzia_moisture, name: Strelitzia, area: dining_room, dry: 15}
     - {moisture: sensor.philodendron_moisture, name: Philodendron, area: dining_room, dry: 20}
     - {moisture: sensor.pothos_moisture, name: Pothos, area: living_room, dry: 15}
+    - {moisture: sensor.ivy_moisture, name: Ivy, area: kitchen, dry: 20}
 
   batteries:
     # action: replace (primary cells), recharge (swappable rechargeables), charge (built in).
@@ -143,6 +144,7 @@ HouseUpcoming:
       - {entity: sensor.strelitzia_battery, model: hhccjcy01, name: Strelitzia plant sensor, area: dining_room}
       - {entity: sensor.philodendron_battery, model: hhccjcy01, name: Philodendron plant sensor, area: dining_room}
       - {entity: sensor.pothos_battery, model: hhccjcy01, name: Pothos plant sensor, area: living_room}
+      - {entity: sensor.ivy_battery, model: hhccjcy01, name: Ivy plant sensor, area: kitchen}
     # Phones and the tablet; Rober2 and the Sonos Move dock themselves; the HANK remotes are
     # rechargeable and read anywhere from 26 to 100; yale_battery_bt is the lock's BLE twin.
     excluded:
