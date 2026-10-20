@@ -17,7 +17,7 @@ speakers:
     ma_entity: media_player.kitchen
     raw_entity: media_player.kitchen_2
     rincon: RINCON_F0F6C1A525A201400
-    default_volume: 0.14      # one notch above the dining room
+    default_volume: 0.13      # one notch above the dining room
     tts: [all, family]
   dining_room:
     ma_entity: media_player.dining_room

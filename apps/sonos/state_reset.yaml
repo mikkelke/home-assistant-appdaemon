@@ -36,7 +36,7 @@ SonosStateReset:
     media_player.bathroom: 0.18
     media_player.bedroom: 0.12
     media_player.dining_room: 0.12
-    media_player.kitchen: 0.14       # one notch above the dining room
+    media_player.kitchen: 0.13       # one notch above the dining room
     media_player.living_room: 0.14   # Arc Ultra: Era-100 default (0.12) + 2 — it is a far bigger unit (user 2026-07-08)
     media_player.guest_bathroom: 0.18
     media_player.kristines_room: 0.12
