@@ -70,6 +70,7 @@ HouseUpcoming:
     - {name: Satin pothos, area: hallway, water: 0.2, every_days: 10}
     - {name: Snake plant dining, area: dining_room, water: 0.2, every_days: 35}
     - {name: Snake plant living, area: living_room, water: 0.2, every_days: 35}
+    - {name: Snake plant bathroom, area: bathroom, water: 0.5, every_days: 35}
     - {name: Aloe, area: living_room, water: 0.3, every_days: 35}
     - {name: Alocasia, area: bathroom, water: 0.7, every_days: 7}
 
