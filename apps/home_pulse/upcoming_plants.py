@@ -17,7 +17,8 @@ anchors, Done and undo it uses): the anchor says when it was last watered, seede
 is first seen. It has no row until LEAD_DAYS house days before the house day that is `every_days` after
 the anchor's, so plants weeks away do not crowd the timeline or its row cap. From then on the row is
 timed at DUE_TIME on the due day, and once that day has come it is untimed and due, with a push key for
-the episode, which is the anchor's time. A Done tap starts the interval over.
+the episode, which is the anchor's time. A Done tap starts the interval over. A renamed plant's row id
+and anchor key follow its name, so its line carries the old name in `was` and the anchor moves over.
 """
 
 import re
@@ -44,7 +45,7 @@ def _parse(raw):
     sensor, calendar, slugs = {}, {}, set()
     for cfg in raw or []:
         cfg = cfg if isinstance(cfg, dict) else {}
-        entity, days, water = cfg.get("moisture"), cfg.get("every_days"), cfg.get("water")
+        entity, days, water, was = cfg.get("moisture"), cfg.get("every_days"), cfg.get("water"), cfg.get("was")
         name = str(cfg.get("name") or "").strip()
         who, key, litres = f"plant {name or cfg!r}", slug(name), reading(water)
         if not key:
@@ -63,14 +64,21 @@ def _parse(raw):
                 raise ValueError(f"{who}: every_days must be a whole number of days above zero, not {days!r}")
             if cfg.get("dry") is not None:
                 raise ValueError(f"{who}: dry goes with moisture, not every_days")
-            calendar[key] = {**plant, "every_days": int(interval)}
+            if was is not None and not slug(was):
+                raise ValueError(f"{who}: was needs letters or digits, not {was!r}")
+            calendar[key] = {**plant, "every_days": int(interval), **({"was": slug(was)} if was is not None else {})}
             continue
+        if was is not None:
+            raise ValueError(f"{who}: was goes with every_days, not moisture")
         dry = reading(cfg.get("dry"))
         if not isinstance(entity, str) or not entity or entity in sensor:
             raise ValueError(f"{who}: moisture must be a sensor entity id, listed once")
         if dry is None:
             raise ValueError(f"{who}: dry must be a number, not {cfg.get('dry')!r}")
         sensor[entity] = {**plant, "dry": dry}
+    for plant in calendar.values():
+        if plant.get("was") in slugs:
+            raise ValueError(f"plant {plant['name']}: was names a plant that is still listed")
     return sensor, calendar
 
 
@@ -85,7 +93,8 @@ def parse_plants(raw):
 
 def parse_timed(raw):
     """The calendar plants of the same list, as {slug: plant}, under the same checks, and `every_days`
-    has to be a whole number of days above zero and `dry` left out."""
+    has to be a whole number of days above zero, `dry` left out and `was`, the plant's former name, one
+    that no listed plant has."""
     return _parse(raw)[1]
 
 
@@ -141,6 +150,17 @@ def anchor_key(plant):
 def timed_by_row(row, calendar):
     """The calendar plant whose row id is `row`, None for any other id."""
     return next((plant for plant in calendar.values() if ID_PREFIX + plant["slug"] == row), None)
+
+
+def migrate_anchors(raw, calendar):
+    """The saved anchors with a renamed plant's anchor moved from its former name (`was`) to its own,
+    unless it has one already."""
+    out = dict(raw) if isinstance(raw, dict) else {}
+    for plant in calendar.values():
+        old = ANCHOR_PREFIX + plant.get("was", "")
+        if old in out and anchor_key(plant) not in out:
+            out[anchor_key(plant)] = out.pop(old)
+    return out
 
 
 def seed_timed(anchors, calendar, now):

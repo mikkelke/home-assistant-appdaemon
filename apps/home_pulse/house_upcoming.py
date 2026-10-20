@@ -130,7 +130,8 @@ class HouseUpcoming(hass.Hass):
         self._pushed = dict(saved.get("pushed") or {})
         self._facts = dict(saved.get("facts") or {})
         self._content = dict(saved.get("content") or {})
-        self._anchors = runs.valid_anchors(saved.get("done"), self.run_tasks,
+        self._anchors = runs.valid_anchors(plants.migrate_anchors(saved.get("done"), self.timed_plants),
+                                           self.run_tasks,
                                            [plants.anchor_key(plant) for plant in self.timed_plants.values()])
         self._ledger_files = {}
         self._state_text = None
