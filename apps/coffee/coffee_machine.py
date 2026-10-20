@@ -1,7 +1,8 @@
 """CoffeeMachine - the xBloom Studio in the house: one owner for each brew's lifecycle, its 1 Hz curve,
-the brew ledger, the usual's baseline, the beans container, the Bluetooth link, who made it and who is
-told, the maintenance counts and the advisor. Publishes sensor.coffee_state, _live, _baseline, _beans,
-_brews, _recipes and _advice (contract v1, see coffee_publish.py) and the files under /media/coffee.
+the brew ledger, the usual's baseline, the beans container, the Bluetooth link, the cup on the scale, who
+made it and who is told, the maintenance counts and the advisor. Publishes sensor.coffee_state, _live,
+_baseline, _beans, _brews, _recipes and _advice (contract v1, see coffee_publish.py) and the files under
+/media/coffee.
 
 Inputs: the plug (sensor.pour_over_plug_power), the xBloom integration's entities and bus events, the
 dashboard's coffee_command events (script.coffee_command fires them in the caller's context: the HA
@@ -32,6 +33,7 @@ import coffee_advice as ca
 import coffee_baseline as cb
 import coffee_beans as cbeans
 import coffee_connect as cconn
+import coffee_cup as ccup
 import coffee_fsm as cf
 import coffee_plan as cp
 import coffee_power as cpow
@@ -54,11 +56,14 @@ RECIPES_DELAY_S = 20
 PENDING_NOTIFY_S = 1800
 TABLET_IDLE_S = 120
 FRAME_AGE_S = 60
+WAKE_CHECK_S = 5
+WAKE_NUDGES = 2
 RESTORED = (None, "unavailable", "unknown")
 VARIANTS = ("usual", "base", "tweak", "other")
 PEOPLE = cw.PEOPLE
-OPS = ("start", "stop", "pause", "resume", "connect", "notify", "picked_up", "rate", "beans_add", "beans_undo",
-       "set_usual", "trial_accept", "trial_undo", "trial_keep", "trial_revert", "advice_dismiss", "advisor_reply")
+OPS = ("start", "cup_confirmed", "cancel", "stop", "pause", "resume", "connect", "notify", "picked_up", "rate",
+       "beans_add", "beans_undo", "set_usual", "trial_accept", "trial_undo", "trial_keep", "trial_revert",
+       "advice_dismiss", "advisor_reply")
 RATE_PREFIX = "COFFEE_RATE|"
 ENTITIES = ("coffee_state", "coffee_live", "coffee_baseline", "coffee_beans", "coffee_brews", "coffee_recipes",
             "coffee_advice")
@@ -160,6 +165,8 @@ class CoffeeMachine(hass.Hass):
         self._pending_start = None
         self._connect_asked = None
         self._link_ready = False
+        self._cup_timer = None
+        self._waking = None
 
         saved = self._load_state()
         self._beans = cbeans.Beans(saved.get("beans"))
@@ -170,6 +177,7 @@ class CoffeeMachine(hass.Hass):
         self._recipes = [r for r in (saved.get("recipes") or []) if isinstance(r, dict) and r.get("pours")]
         self._baseline = saved.get("baseline") if isinstance(saved.get("baseline"), dict) else None
         self._tracker = cf.Tracker.from_dict(saved.get("tracker"))
+        self._cup = ccup.Cup.from_dict(saved.get("cup"))
         self._power = cpow.PowerBrew()
         self._power.restore(saved.get("power"))
         self._meter = cpow.MachineMeter()
@@ -183,6 +191,8 @@ class CoffeeMachine(hass.Hass):
         self._meter.plug_on = (self._state_of(self.plug_entity) or "on") == "on"
         power = self._read(self.power_entity)
         self._meter.update(now, (power or {}).get("state"))
+        if self._machine(now) in ("asleep", "off"):
+            self._cup.asleep()
         for key, entity in (("distance", self.bermuda_distance), ("area", self.bermuda_area)):
             if entity:
                 full = self._read(entity)
@@ -314,7 +324,10 @@ class CoffeeMachine(hass.Hass):
             self._values[entity] = {**(self._values.get(entity) or {}), "state": new,
                                     "last_changed": cf.iso(self._now())}
         if entity == self.plug_entity:
+            now = self._now()
+            machine_before = self._machine(now)
             self._meter.plug_on = new == "on"
+            self._machine_moved(machine_before, now)
             self._publish_state()
         elif entity == self.pour_entity and self._tracker.brew is not None:
             total = cpow.watts(((new if isinstance(new, dict) else {}).get("attributes") or {}).get("total_pours"))
@@ -330,8 +343,18 @@ class CoffeeMachine(hass.Hass):
         machine = self._machine(now)
         if machine == "working" and machine_before != "working" and cpow.watts(old) is not None:
             self._connect_trigger("power_rise", now)
+        self._machine_moved(machine_before, now)
         if machine != machine_before:
             self._publish_state()
+
+    def _machine_moved(self, before, now):
+        """The machine zeroes its scale when it wakes; asleep or off it shows nothing."""
+        machine = self._machine(now)
+        if machine in ("asleep", "off") and before not in ("asleep", "off"):
+            self._cup_event(self._cup.asleep(), now, "the machine sleeps")
+        elif machine not in ("asleep", "off") and before in ("asleep", "off"):
+            self._waking = None
+            self._cup_event(self._cup.zero(), now, "the machine woke")
 
     def _on_connect_change(self, event_name, data, kwargs):
         new_state = (data or {}).get("new_state") or {}
@@ -341,6 +364,7 @@ class CoffeeMachine(hass.Hass):
         user = ((new_state.get("context") or {}).get("user_id") or "").replace("-", "").lower()
         if new_state.get("state") != "on":
             self._link_ready = False
+            self._cup_event(self._cup.unseen(), now, "the link is off")
         if new_state.get("state") == "off" and old_state.get("state") == "on":
             if user and self._person_for(user) is not None:
                 self._connect.person_off(now)
@@ -367,6 +391,8 @@ class CoffeeMachine(hass.Hass):
         now = self._now()
         was = self._link(now)
         self._apply(self._tracker.reading_cup(now, grams))
+        self._cup_event(self._cup.reading(now, grams), now)
+        self._cup_settle_later()
         if self._link(now) != was:
             self._publish_state()
 
@@ -445,14 +471,17 @@ class CoffeeMachine(hass.Hass):
             self._link_ready = True
             self._connect.connected(now)
             self._send_pending_start()
+            self._nudge(now)
             self._publish_state()
         elif event_name == "xbloom_connect_failed":
             self._link_ready = False
             self._connect.failed(now)
             self._send_pending_start()
+            self._cup_event(self._cup.unseen(), now, "the link failed")
             self._publish_state()
         elif event_name in ("xbloom_connect_stopped", "xbloom_connect_auto_stopped"):
             self._link_ready = False
+            self._cup_event(self._cup.unseen(), now, "the link stopped")
             self._publish_state()
 
     def _on_plugin_started(self, event_name, data, kwargs):
@@ -532,8 +561,12 @@ class CoffeeMachine(hass.Hass):
             elif effect == "picked_up":
                 self._upsert_record(brew, picked_up_at=cf.iso(brew.get("picked_up_ts")))
                 self._connect.activity(self._now())
+                self._cup_note(self._cup.lifted(), "picked up")
             elif effect == "expired":
                 self._pending_start = None
+            elif effect == "dropped":
+                self._pending_start = None
+                self._info(f"Start {self._tracker.dropped[0]} dropped: {self._tracker.dropped[1]}")
             elif effect == "fault":
                 self._fault_push(brew)
         if "live" in effects or "ready" in effects or "closed" in effects or "expired" in effects:
@@ -548,6 +581,7 @@ class CoffeeMachine(hass.Hass):
     def _on_started(self, brew):
         now = self._now()
         self._connect.activity(now)
+        self._cup_note(self._cup.zero(), "a brew started")
         if brew.get("recipe") is None:
             recipe = cp.by_name(self._recipes, brew.get("recipe_name"))
             usual = self._usual()
@@ -645,6 +679,8 @@ class CoffeeMachine(hass.Hass):
 
     def _on_ready(self, brew):
         now = self._now()
+        if brew["source"] != "power":
+            self._cup_note(self._cup.put_on(), "the brew is ready")
         self._finalize(brew)
         self._write_curve(brew)
         self._debit(brew)
@@ -902,7 +938,8 @@ class CoffeeMachine(hass.Hass):
         if recipe is not None:
             used = cp.with_overrides(recipe, overrides.get("dose"), overrides.get("ratio"), overrides.get("grind_size"))
             fields.update(recipe=used, recipe_name=recipe["name"], dose_g=used["dose_g"], dose_basis="sent")
-        effects = self._tracker.request(brew_id, now, source, **fields)
+        waiting = recipe is not None and self._cup.state != "present"
+        effects = (self._tracker.await_cup if waiting else self._tracker.request)(brew_id, now, source, **fields)
         if self._tracker.brew is not None and self._tracker.brew["id"] == brew_id:
             self._take_pending_chip(self._tracker.brew, now)
             self._resolve_who(self._tracker.brew, final=False)
@@ -910,17 +947,29 @@ class CoffeeMachine(hass.Hass):
         if recipe is None:
             self._apply(self._tracker.refused(brew_id, None, "recipe_not_found", now))
             return
-        if trial:
-            self._advice.trial_started(brew_id)
-            self._publish("coffee_advice")
         service = {"recipe_name": recipe["name"], "context": {"coffee_brew_id": brew_id}, **overrides}
         self._pending_start = {"brew_id": brew_id, "service": service, "sent": False}
-        self._info(f"Start {brew_id}: {recipe['name']}, variant {variant}, from the {source}")
+        if waiting:
+            self._info(f"Start {brew_id}: {recipe['name']} waits for a cup (cup {self._cup.state})")
+            self._wake_machine(now)
+            return
+        self._go(now)
+
+    def _go(self, now):
+        """The start leaves: over the link at once when it is up, else once it is or CONNECT_WAIT_S pass."""
+        brew, pending = self._tracker.brew, self._pending_start
+        if brew is None or brew["phase"] != "starting" or not pending or pending["brew_id"] != brew["id"]:
+            return
+        if brew.get("trial"):
+            self._advice.trial_started(brew["id"])
+            self._publish("coffee_advice")
+        self._info(f"Start {brew['id']}: {brew.get('recipe_name')}, variant {brew.get('variant')}, "
+                   f"from the {brew['source']}")
         if self._switch_on() and self._link_ready:
             self._send_pending_start()
             return
         self._connect_trigger("op_start", now)
-        self.run_in(self._on_connect_wait, CONNECT_WAIT_S, brew_id=brew_id)
+        self.run_in(self._on_connect_wait, CONNECT_WAIT_S, brew_id=brew["id"])
 
     def _on_connect_wait(self, kwargs):
         if self._pending_start and self._pending_start["brew_id"] == kwargs.get("brew_id"):
@@ -966,11 +1015,35 @@ class CoffeeMachine(hass.Hass):
             return self._machine(now) == "working"
         if kind == "op_start":
             return self._tracker.phase() == "starting"
-        return self._machine(now) in ("awake", "working")
+        return self._machine(now) != "off"
 
     def _connect_trigger(self, kind, now):
         if self._connect.trigger(kind, now, self._switch_on()) == "on":
             self._set_connect(True)
+
+    def _wake_machine(self, now):
+        """Takes the link; a sleeping machine is nudged awake over it, up to WAKE_NUDGES times WAKE_CHECK_S apart.
+        Connecting usually wakes it, and back_to_home does when the connect alone did not."""
+        self._connect_trigger("op_connect", now)
+        if self._machine(now) == "asleep":
+            self._waking = {"left": WAKE_NUDGES}
+            if self._switch_on() and self._link_ready:
+                self._nudge(now)
+
+    def _nudge(self, now):
+        waking = self._waking
+        if waking is None:
+            return
+        if self._machine(now) != "asleep" or waking["left"] <= 0 or not (self._switch_on() and self._link_ready):
+            self._waking = None
+            return
+        waking["left"] -= 1
+        self._info("Nudging the machine awake")
+        self._service("xbloom/back_to_home")
+        self.run_in(self._on_wake_check, WAKE_CHECK_S)
+
+    def _on_wake_check(self, kwargs):
+        self._nudge(self._now())
 
     def _set_connect(self, on):
         now = self._now()
@@ -994,6 +1067,36 @@ class CoffeeMachine(hass.Hass):
             self.log(ascii_text(f"{service} was refused: {(envelope.get('error') or {}).get('message')}"),
                      level="WARNING")
         return envelope
+
+    # -- the cup -------------------------------------------------------------------------------------
+
+    def _cup_note(self, changed, why=None):
+        if changed:
+            grams = self._cup.grams
+            self._info(f"Cup {self._cup.state}: {why}" if why else f"Cup {self._cup.state} at {grams:.1f} g")
+        return changed
+
+    def _cup_event(self, changed, now, why=None):
+        """A change of the cup's state outside a brew's effects. A start that waited for a cup goes out once one is
+        present."""
+        if not self._cup_note(changed, why):
+            return
+        self._publish_state()
+        self._save_state()
+        if self._cup.state == "present" and self._tracker.phase() == "awaiting_cup":
+            self._apply(self._tracker.cup_on(now))
+            self._go(now)
+
+    def _cup_settle_later(self):
+        due = self._cup.due()
+        if due is not None and self._cup_timer is None:
+            self._cup_timer = self.run_in(self._on_cup_settle, max(0.1, due - self._now()))
+
+    def _on_cup_settle(self, kwargs):
+        self._cup_timer = None
+        now = self._now()
+        self._cup_event(self._cup.settle(now), now)
+        self._cup_settle_later()
 
     # -- who is told ---------------------------------------------------------------------------------
 
@@ -1102,9 +1205,25 @@ class CoffeeMachine(hass.Hass):
         handler(user, payload, now)
 
     def _op_stop(self, user, data, now):
-        if self._tracker.active():
+        if self._tracker.phase() == "awaiting_cup":
+            self._op_cancel(user, data, now)
+        elif self._tracker.active():
             self._apply(self._tracker.stop_asked(now))
             self._service("xbloom/stop_brew")
+
+    def _op_cancel(self, user, data, now):
+        effects = self._tracker.drop_wait(now, "cancelled")
+        if not effects:
+            self._info(f"Cancel ignored: the brew is {self._tracker.phase() or 'none'}")
+            return
+        self._apply(effects)
+
+    def _op_cup_confirmed(self, user, data, now):
+        if self._tracker.phase() != "awaiting_cup" or self._cup.state == "absent":
+            self._info(f"Cup confirmation ignored: brew {self._tracker.phase() or 'none'}, cup {self._cup.state}")
+            return
+        self._cup.put_on()
+        self._cup_event(True, now, "confirmed")
 
     def _op_pause(self, user, data, now):
         if self._tracker.phase() in ("grinding", "brewing"):
@@ -1115,7 +1234,7 @@ class CoffeeMachine(hass.Hass):
             self._service("xbloom/brew_resume")
 
     def _op_connect(self, user, data, now):
-        self._connect_trigger("op_connect", now)
+        self._wake_machine(now)
 
     def _op_notify(self, user, data, now):
         person = data.get("person")
@@ -1363,6 +1482,9 @@ class CoffeeMachine(hass.Hass):
             return
         age = now - (cf.epoch(self._saved_at) or 0)
         phase = brew["phase"]
+        if phase == "awaiting_cup":
+            self._apply(self._tracker.abandon(now))
+            return
         if phase in cf.ACTIVE:
             if age < cf.RESUME_MAX_S and self._machine(now) in ("awake", "working"):
                 self._info(f"Brew {brew['id']} resumed after a restart ({int(age)} s)")
@@ -1416,7 +1538,7 @@ class CoffeeMachine(hass.Hass):
             guess = self._guess[1]
         state, attrs = pub.state_entity(brew, self._tracker.last, now, self._machine(now), self._meter.watts,
                                         self._link(now), self._tracker.frame_at, self._state_of(self.fault_entity),
-                                        guess, pending, (brew or {}).get("verdict"), eta, basis)
+                                        guess, pending, (brew or {}).get("verdict"), eta, basis, self._cup.state)
         compare = {k: v for k, v in attrs.items() if k not in ("power_w", "link_seen_at")}
         if not force and self._published.get("coffee_state") == (state, compare):
             return
@@ -1493,7 +1615,7 @@ class CoffeeMachine(hass.Hass):
         data = {"version": STATE_VERSION, "saved_at": cf.iso(self._now()), "usual_id": self._usual_id,
                 "beans": self._beans.to_dict(), "advice": self._advice.to_dict(), "connect": self._connect.to_dict(),
                 "pending_notify": self._pending_notify, "recipes": self._recipes, "baseline": self._baseline,
-                "tracker": self._tracker.to_dict(), "power": self._power.snapshot()}
+                "tracker": self._tracker.to_dict(), "power": self._power.snapshot(), "cup": self._cup.to_dict()}
         try:
             feedback_io.write_json(str(self.state_file), data)
         except Exception as e:

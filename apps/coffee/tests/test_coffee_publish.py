@@ -72,10 +72,12 @@ class EncodingTests(unittest.TestCase):
 
 class StateTests(unittest.TestCase):
     def test_every_phase_with_everything_set_is_strings_under_the_cap(self):
-        for phase in ("starting", "start_failed", "grinding", "brewing", "paused", "ready", "picked_up", "stopped"):
+        for phase in ("awaiting_cup", "starting", "start_failed", "grinding", "brewing", "paused", "ready",
+                      "picked_up", "stopped"):
             state, attrs = pub.state_entity(full_brew(phase), None, NOW, "working", 1043.2, "connected", NOW,
-                                            "no_water", "mikkel", "claudia", "on_track", NOW + 245, "baseline")
-            self.assertEqual(state, phase)
+                                            "no_water", "mikkel", "claudia", "on_track", NOW + 245, "baseline",
+                                            "present")
+            self.assertEqual((state, attrs["cup"]), (phase, "present"))
             all_strings(self, attrs, "coffee_state")
 
     def test_the_brewing_example(self):
@@ -105,7 +107,8 @@ class StateTests(unittest.TestCase):
     def test_idle_and_asleep(self):
         state, attrs = pub.state_entity(None, {"id": "c1"}, NOW, "awake", 2.3, "not_connected", None, "ok", "mikkel",
                                         None, None, None, None)
-        self.assertEqual((state, attrs["brew_id"], attrs["notify_guess"]), ("idle", "c1", "mikkel"))
+        self.assertEqual((state, attrs["brew_id"], attrs["notify_guess"], attrs["cup"]), ("idle", "c1", "mikkel",
+                                                                                          "unknown"))
         self.assertNotIn("notify", attrs)
         for machine in ("asleep", "off"):
             state, attrs = pub.state_entity(None, None, NOW, machine, 0.9, "not_connected", None, None, None,

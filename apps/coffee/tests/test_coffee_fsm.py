@@ -82,6 +82,55 @@ class StartTests(unittest.TestCase):
                          ("stopped", "home_assistant", None))
 
 
+class CupWaitTests(unittest.TestCase):
+    def test_a_start_waits_for_the_cup_then_goes_out(self):
+        tracker = cf.Tracker()
+        self.assertEqual(tracker.await_cup("c1", T, "tablet", variant="usual"), ["state"])
+        brew = tracker.brew
+        self.assertEqual((brew["phase"], brew["requested_ts"], brew["started_ts"], brew["variant"]),
+                         ("awaiting_cup", T, None, "usual"))
+        self.assertTrue(tracker.active())
+        self.assertEqual(tracker.await_cup("c2", T + 1, "phone"), [])
+        self.assertEqual(tracker.request("c2", T + 1, "phone"), [])
+        self.assertEqual(tracker.tick(T + 119), [])
+        self.assertEqual(tracker.cup_on(T + 30), ["state"])
+        self.assertEqual((tracker.phase(), tracker.brew["requested_ts"]), ("starting", T + 30))
+        self.assertEqual(tracker.cup_on(T + 31), [])
+        self.assertEqual(tracker.tick(T + 74), [])
+        self.assertEqual(tracker.tick(T + 75), ["start_failed", "state"])
+
+    def test_no_cup_within_two_minutes_or_a_cancel_leaves_nothing(self):
+        tracker = cf.Tracker()
+        brewing(tracker)
+        tracker.enjoy(T + 240)
+        tracker.picked_up(None, T + 300)
+        tracker.await_cup("c2", T + 400, "tablet")
+        self.assertEqual(tracker.tick(T + 400 + cf.AWAIT_CUP_S), ["dropped", "state"])
+        self.assertEqual((tracker.brew, tracker.last["id"], tracker.dropped), (None, "c1", ("c2", "no cup")))
+        tracker.await_cup("c3", T + 600, "tablet")
+        self.assertEqual(tracker.drop_wait(T + 610, "cancelled"), ["dropped", "state"])
+        self.assertEqual((tracker.brew, tracker.last["id"], tracker.dropped), (None, "c1", ("c3", "cancelled")))
+        self.assertEqual(tracker.drop_wait(T + 611, "cancelled"), [])
+
+    def test_a_machine_start_ends_the_wait(self):
+        for start in (lambda t: t.grinding_seen(T + 5, "machine"), lambda t: t.accepted(None, "run9", "Iced", T + 5),
+                      lambda t: t.power(("heating", T + 3, T + 5))):
+            tracker = cf.Tracker()
+            tracker.await_cup("c1", T, "tablet")
+            effects = start(tracker)
+            self.assertEqual(effects[:2], ["dropped", "started"])
+            self.assertEqual((tracker.dropped[0], tracker.last), ("c1", None))
+            self.assertNotEqual(tracker.brew["id"], "c1")
+
+    def test_a_restart_drops_the_wait(self):
+        tracker = cf.Tracker()
+        tracker.await_cup("c1", T, "tablet")
+        again = cf.Tracker.from_dict(json.loads(json.dumps(tracker.to_dict())))
+        self.assertEqual(again.phase(), "awaiting_cup")
+        self.assertEqual(again.abandon(T + 30), ["dropped", "state"])
+        self.assertIsNone(again.brew)
+
+
 class OtherStartTests(unittest.TestCase):
     def test_a_machine_start(self):
         tracker = cf.Tracker()

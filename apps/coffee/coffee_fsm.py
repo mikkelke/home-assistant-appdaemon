@@ -1,8 +1,10 @@
 """The lifecycle of a brew, from what the integration, the scale and the plug report. Pure.
 
-A brew is `starting` from our start op until the machine accepts it (`grinding`) or refuses it
-(`start_failed`, or `no_answer` after START_TIMEOUT_S). A brew nobody here started begins at
-`grinding` when the brew status or a machine-start event says so, or at `brewing` when the plug shows
+Our start op waits in `awaiting_cup` while no cup is known to stand on the scale, until one is put on or someone
+says it is; a cancel, AWAIT_CUP_S without a cup, or a brew the machine starts itself ends the wait, and nothing is
+kept of it. A brew is `starting` from our start op (or the end of its wait) until the machine accepts it
+(`grinding`) or refuses it (`start_failed`, or `no_answer` after START_TIMEOUT_S). A brew nobody here started
+begins at `grinding` when the brew status or a machine-start event says so, or at `brewing` when the plug shows
 a grind followed by heat (source `power`: a grind alone is not a brew, so the plug cannot tell one any
 earlier). The first bloom makes it `brewing`; the pause sensor makes it `paused` and back. ENJOY or the
 integration's completion makes it `ready`; the cup lifted off the scale (under max(PICKUP_MIN_G,
@@ -13,7 +15,7 @@ Bluetooth brew whose link went quiet is closed by the plug's ending after POWER_
 state lingers for LIFETIME_S, then the state is `idle` or `asleep` again.
 
 Every input returns the effects the app acts on: "started", "bloom", "ready", "closed",
-"start_failed", "picked_up", "expired", "fault", "source", "state" (publish sensor.coffee_state) and
+"start_failed", "picked_up", "expired", "dropped", "fault", "source", "state" (publish sensor.coffee_state) and
 "live" (publish sensor.coffee_live). Times are epoch seconds.
 """
 
@@ -22,8 +24,10 @@ from datetime import datetime, timezone
 from coffee_curve import FRESH_S, CupFilter, Curve
 
 START_TIMEOUT_S = 45
+AWAIT_CUP_S = 120
 LIFETIME_S = {"start_failed": 60, "stopped": 300, "ready": 1800, "picked_up": 300}
-ACTIVE = ("starting", "grinding", "brewing", "paused")
+REQUESTED = ("awaiting_cup", "starting")
+ACTIVE = REQUESTED + ("grinding", "brewing", "paused")
 RUNNING = ("grinding", "brewing", "paused")
 BUSY = ACTIVE + ("ready",)
 PICKUP_MIN_G = 20.0
@@ -64,6 +68,7 @@ class Tracker:
         self.water = None
         self.frame_at = None
         self.below_since = None
+        self.dropped = None
 
     # -- persistence ------------------------------------------------------------------------
 
@@ -130,8 +135,8 @@ class Tracker:
         if self.brew is not None:
             self.last = self.brew
         self.brew = {"id": brew_id, "phase": phase, "phase_ts": now, "source": source, "faults": [], "pour": 0,
-                     "ground": False, "requested_ts": now if phase == "starting" else None,
-                     "started_ts": None if phase == "starting" else now, **fields}
+                     "ground": False, "requested_ts": now if phase in REQUESTED else None,
+                     "started_ts": None if phase in REQUESTED else now, **fields}
         self.curve = None
         self.cup = self.water = None
         self.filter = CupFilter()
@@ -145,6 +150,32 @@ class Tracker:
             return []
         self._new(brew_id, "starting", source, now, **fields)
         return ["state"]
+
+    def await_cup(self, brew_id, now, source, **fields):
+        """Our start op while no cup is known to stand on the scale."""
+        if self.active():
+            return []
+        self._new(brew_id, "awaiting_cup", source, now, **fields)
+        return ["state"]
+
+    def cup_on(self, now):
+        """The cup a start waited for is on, so the start goes out now."""
+        if self.phase() != "awaiting_cup":
+            return []
+        self._set("starting", now, requested_ts=now)
+        return ["state"]
+
+    def drop_wait(self, now, reason):
+        """A start that waited for a cup and never went out: nothing is kept of it."""
+        if self.phase() != "awaiting_cup":
+            return []
+        self.dropped = (self.brew["id"], reason)
+        self.brew = None
+        return ["dropped", "state"]
+
+    def _superseded(self, now):
+        """A brew the machine started while our start waited for a cup ends the wait."""
+        return self.drop_wait(now, "the machine started a brew")[:1]
 
     def _grinding(self, now):
         self._set("grinding", now, started_ts=now)
@@ -168,8 +199,9 @@ class Tracker:
             return []
         if self.phase() == "starting":
             return []
+        effects = self._superseded(now)
         self._new(brew_id_for(now), "grinding", "ha", now, run_id=run_id, recipe_name=recipe_name)
-        return ["started", "state", "live"]
+        return effects + ["started", "state", "live"]
 
     def refused(self, brew_id, run_id, reason, now):
         """xbloom_brew_failed: before the start a refusal, after it a failure."""
@@ -188,13 +220,14 @@ class Tracker:
         """The brew status at grinding, or a machine-start event."""
         if self.phase() == "starting":
             return self._grinding(now)
+        effects = self._superseded(now)
         if self.active():
             if source == "machine" and self.brew["source"] == "power":
                 self.brew["source"] = "machine"
                 return ["source", "state"]
             return []
         self._new(brew_id_for(now), "grinding", source, now)
-        return ["started", "state", "live"]
+        return effects + ["started", "state", "live"]
 
     def bloom(self, now):
         effects = []
@@ -309,6 +342,8 @@ class Tracker:
 
     def abandon(self, now):
         """A brew the app could not follow to its end (a restart too late to resume, a timeout)."""
+        if self.phase() == "awaiting_cup":
+            return self.drop_wait(now, "the app restarted")
         if self.phase() == "starting":
             self._set("start_failed", now, start_error="no_answer")
             return ["start_failed", "state"]
@@ -321,11 +356,12 @@ class Tracker:
         kind = event[0]
         if kind == "heating":
             start, heat = event[1], event[2]
+            effects = self._superseded(heat)
             if self.active():
                 return []
             self._new(brew_id_for(start), "brewing", "power", start, bloom_ts=heat, ground=True, pour=1)
             self.brew["phase_ts"] = heat
-            return ["started", "bloom", "state", "live"]
+            return effects + ["started", "bloom", "state", "live"]
         if kind != "ended" or self.phase() not in RUNNING:
             return []
         end, complete = event[2], event[4]
@@ -362,6 +398,8 @@ class Tracker:
         phase = self.phase()
         if phase is None:
             return []
+        if phase == "awaiting_cup":
+            return self.drop_wait(now, "no cup") if now - self.brew["phase_ts"] >= AWAIT_CUP_S else []
         if phase == "starting" and now - (self.brew.get("requested_ts") or now) >= START_TIMEOUT_S:
             self._set("start_failed", now, start_error="no_answer")
             return ["start_failed", "state"]

@@ -120,7 +120,9 @@ def base_states(now):
     }
 
 
-def make_app(state_dir=None, now=T0, states=None, recipes=(USUAL, OTHER), **args):
+def make_app(state_dir=None, now=T0, states=None, recipes=(USUAL, OTHER), cup=True, **args):
+    """The app on the fake, with the usual and another recipe in the library and, unless `cup` is False, a cup known
+    to stand on the scale."""
     app = cm.CoffeeMachine.__new__(cm.CoffeeMachine)
     state_dir = Path(state_dir or tempfile.mkdtemp(prefix="coffee_"))
     app.args = {**CONFIG, "media_dir": str(state_dir / "media"), "ledger_file": str(state_dir / "coffee_feedback.json"),
@@ -198,7 +200,15 @@ def make_app(state_dir=None, now=T0, states=None, recipes=(USUAL, OTHER), **args
     if recipes:
         app._refresh_recipes({})
         drain(app)
+    if cup:
+        cup_on(app)
     return app
+
+
+def cup_on(app):
+    """A cup the app knows stands on the scale, as after someone said so."""
+    app._cup.put_on()
+    app._publish_state()
 
 
 def drain(app):

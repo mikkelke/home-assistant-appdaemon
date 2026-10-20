@@ -1,7 +1,7 @@
 # tests/test_coffee_machine.py - CoffeeMachine end to end on a fake AppDaemon (coffee_fake.py): what it
 # publishes, a replayed brew (real plug readings, the integration's event order) into the ledger and a
-# curve file, the start, the link, who is told, beans, the advisor with a stubbed AI task, restarts, and
-# guards against shadowing AppDaemon.
+# curve file, the start, the cup check and the wake, the link, who is told, beans, the advisor with a stubbed AI
+# task, restarts, and guards against shadowing AppDaemon.
 # Run from repo root: python3 -m unittest discover -s apps/coffee/tests
 
 import ast
@@ -77,6 +77,7 @@ def brew(app, ours=True, user=TABLET, power=True, brew_id=BREW_ID, **kw):
     tape = fake.synthetic_brew(brew_id, POWER["brew_2026_10_17"] if power else None, ours=ours, **kw)
     if ours:
         tape = [(0, ("op", "start", {"variant": "usual"}, user))] + [s for s in tape if s[1][0] != "op"]
+    fake.cup_on(app)
     fake.replay(app, tape)
 
 
@@ -348,6 +349,171 @@ class StartTests(unittest.TestCase):
                          ["xbloom/brew_pause", "xbloom/brew_resume", "xbloom/stop_brew"])
         fake.set_entity(app, "sensor.xbloom_studio_brew_status", "idle")
         self.assertEqual(coffee_state(app)[1]["stop_reason"], "home_assistant")
+
+
+class CupTests(unittest.TestCase):
+    def scale(self, app, grams):
+        fake.set_entity(app, "sensor.xbloom_studio_scale_weight", grams)
+
+    def cups(self, app):
+        seen = []
+        for _, entity, _, attrs in app.history:
+            if entity == "sensor.coffee_state" and (not seen or seen[-1] != attrs["cup"]):
+                seen.append(attrs["cup"])
+        return seen
+
+    def test_a_cup_lifted_since_the_zero_waits_for_one_then_starts_by_itself(self):
+        app = fake.make_app(cup=False)
+        self.scale(app, "-270.6")
+        fake.advance(app, 2)
+        self.assertEqual(coffee_state(app)[1]["cup"], "absent")
+        fake.op(app, "start", {"variant": "usual"})
+        state, attrs = coffee_state(app)
+        brew_id = attrs["brew_id"]
+        self.assertEqual((state, attrs["cup"], brew_id), ("awaiting_cup", "absent", f"c{int(app.now)}"))
+        self.assertEqual(calls(app, "switch/turn_on"), [{"entity_id": "switch.xbloom_studio_connect"}])
+        fake.fire(app, "xbloom_connect_ready", {"summary": {}})
+        self.scale(app, "-231.0")
+        fake.advance(app, 5)
+        self.scale(app, "0.2")
+        fake.advance(app, 1.5)
+        self.assertEqual(coffee_state(app)[0], "awaiting_cup")
+        self.assertEqual(calls(app, "xbloom/start_brew"), [])
+        fake.advance(app, 0.5)
+        state, attrs = coffee_state(app)
+        self.assertEqual((state, attrs["cup"], attrs["brew_id"]), ("starting", "present", brew_id))
+        self.assertEqual(calls(app, "xbloom/start_brew"), [{"return_response": True, "recipe_name": "4 Pour Recipe",
+                                                            "context": {"coffee_brew_id": brew_id}}])
+
+    def test_an_unknown_cup_waits_and_the_cup_is_already_on_starts_at_once(self):
+        app = fake.make_app(cup=False)
+        fake.set_entity(app, "switch.xbloom_studio_connect", "on")
+        fake.fire(app, "xbloom_connect_ready", {"summary": {}})
+        fake.op(app, "start", {"variant": "usual"})
+        self.assertEqual(coffee_state(app)[:1] + (coffee_state(app)[1]["cup"],), ("awaiting_cup", "unknown"))
+        self.assertEqual(calls(app, "xbloom/start_brew"), [])
+        fake.op(app, "cup_confirmed", user_id=MIKKEL)
+        state, attrs = coffee_state(app)
+        self.assertEqual((state, attrs["cup"]), ("starting", "present"))
+        self.assertEqual(len(calls(app, "xbloom/start_brew")), 1)
+
+    def test_the_cup_is_already_on_counts_only_while_waiting_and_never_after_a_lift(self):
+        app = fake.make_app(cup=False)
+        fake.op(app, "cup_confirmed")
+        self.assertEqual((coffee_state(app)[0], coffee_state(app)[1]["cup"]), ("idle", "unknown"))
+        self.scale(app, "-270.6")
+        fake.advance(app, 2)
+        fake.op(app, "start", {"variant": "usual"})
+        fake.op(app, "cup_confirmed")
+        self.assertEqual(coffee_state(app)[0], "awaiting_cup")
+        self.assertEqual(calls(app, "xbloom/start_brew"), [])
+
+    def test_the_magnet_cup_is_no_cup(self):
+        app = fake.make_app(cup=False)
+        fake.op(app, "start", {"variant": "usual"})
+        self.scale(app, "39.6")
+        fake.advance(app, 30)
+        self.assertEqual((coffee_state(app)[0], coffee_state(app)[1]["cup"]), ("awaiting_cup", "unknown"))
+
+    def test_cancel_stop_or_two_minutes_without_a_cup_leave_nothing(self):
+        app = fake.make_app(cup=False)
+        for end in ("cancel", "stop"):
+            fake.op(app, "start", {"variant": "usual"})
+            self.assertEqual(coffee_state(app)[0], "awaiting_cup")
+            fake.op(app, end)
+            self.assertEqual(coffee_state(app)[0], "idle")
+            fake.advance(app, 5)
+        fake.op(app, "start", {"variant": "usual"})
+        fake.advance(app, 119)
+        self.assertEqual(coffee_state(app)[0], "awaiting_cup")
+        fake.advance(app, 1)
+        self.assertEqual(coffee_state(app)[0], "idle")
+        self.assertEqual((calls(app, "xbloom/start_brew"), calls(app, "xbloom/stop_brew"), fake.ledger(app)),
+                         ([], [], []))
+        self.assertEqual([m.split(": ", 1)[1] for _, m in app.logs if " dropped: " in m], ["cancelled", "cancelled",
+                                                                                             "no cup"])
+        fake.op(app, "cancel")
+        self.assertEqual(coffee_state(app)[0], "idle")
+
+    def test_a_brew_started_on_the_machine_ends_the_wait(self):
+        app = fake.make_app(cup=False)
+        fake.op(app, "start", {"variant": "usual"})
+        fake.set_entity(app, "sensor.xbloom_studio_brew_status", "grinding")
+        state, attrs = coffee_state(app)
+        self.assertEqual((state, attrs["source"]), ("grinding", "machine"))
+        self.assertIn("the machine started a brew", " ".join(m for _, m in app.logs))
+        self.assertEqual(calls(app, "xbloom/start_brew"), [])
+
+    def test_a_restart_drops_the_wait_and_keeps_the_level(self):
+        app = fake.make_app(cup=False)
+        self.scale(app, "270.8")
+        fake.advance(app, 2)
+        fake.fire(app, "xbloom_connect_stopped", {"reason": "user"})
+        fake.op(app, "start", {"variant": "usual"})
+        self.assertEqual(coffee_state(app)[0], "awaiting_cup")
+        again = fake.make_app(state_dir=app.dir, now=app.now + 1, states=app.states, cup=False)
+        self.assertEqual((coffee_state(again)[0], coffee_state(again)[1]["cup"]), ("idle", "unknown"))
+        fake.set_entity(again, "sensor.xbloom_studio_scale_weight", "0.3")
+        fake.advance(again, 2)
+        self.assertEqual(coffee_state(again)[1]["cup"], "absent")
+        self.assertEqual(calls(again, "xbloom/start_brew"), [])
+
+    def test_a_sleeping_machine_is_nudged_awake_at_most_twice(self):
+        app = fake.make_app(cup=False)
+        fake.set_entity(app, "sensor.pour_over_plug_power", "0.8")
+        fake.op(app, "connect")
+        self.assertEqual((len(calls(app, "switch/turn_on")), calls(app, "xbloom/back_to_home")), (1, []))
+        fake.fire(app, "xbloom_connect_ready", {"summary": {}})
+        self.assertEqual(len(calls(app, "xbloom/back_to_home")), 1)
+        fake.advance(app, 5)
+        self.assertEqual(len(calls(app, "xbloom/back_to_home")), 2)
+        fake.advance(app, 60)
+        self.assertEqual(len(calls(app, "xbloom/back_to_home")), 2)
+        awake = fake.make_app(cup=False)
+        fake.op(awake, "connect")
+        fake.fire(awake, "xbloom_connect_ready", {"summary": {}})
+        fake.advance(awake, 30)
+        self.assertEqual(calls(awake, "xbloom/back_to_home"), [])
+
+    def test_waking_zeroes_the_scale_and_ends_the_nudges(self):
+        app = fake.make_app(cup=False)
+        self.scale(app, "-270.6")
+        fake.advance(app, 2)
+        fake.set_entity(app, "sensor.pour_over_plug_power", "0.8")
+        self.scale(app, "50.0")
+        self.assertEqual(coffee_state(app)[1]["cup"], "unknown")
+        fake.op(app, "start", {"variant": "usual"})
+        self.assertEqual(coffee_state(app)[0], "awaiting_cup")
+        fake.fire(app, "xbloom_connect_ready", {"summary": {}})
+        self.scale(app, "0.0")
+        fake.set_entity(app, "sensor.pour_over_plug_power", "2.1")
+        fake.advance(app, 10)
+        self.assertEqual(len(calls(app, "xbloom/back_to_home")), 1)
+        self.scale(app, "270.8")
+        fake.advance(app, 2)
+        self.assertEqual((coffee_state(app)[0], coffee_state(app)[1]["cup"]), ("starting", "present"))
+
+    def test_a_cup_seen_on_a_link_that_went_is_unknown_until_the_next_frame(self):
+        app = fake.make_app(cup=False)
+        fake.set_entity(app, "switch.xbloom_studio_connect", "on")
+        fake.fire(app, "xbloom_connect_ready", {"summary": {}})
+        self.scale(app, "270.8")
+        fake.advance(app, 2)
+        self.assertEqual(coffee_state(app)[1]["cup"], "present")
+        fake.fire(app, "xbloom_connect_auto_stopped", {"reason": "idle_timeout"})
+        self.assertEqual(coffee_state(app)[1]["cup"], "unknown")
+        self.scale(app, "0.0")
+        fake.advance(app, 2)
+        self.assertEqual(coffee_state(app)[1]["cup"], "absent")
+
+    def test_the_recorded_brew_had_its_cup_on_before_the_hold(self):
+        doc = json.loads((Path(__file__).resolve().parent / "fixtures" / "tape_2026-10-20.json").read_text())
+        start = cm.cf.epoch(doc["start"])
+        app = fake.make_app(now=start, cup=False)
+        fake.replay(app, [(t, tuple(step)) for t, step in doc["tape"]], start=start)
+        fake.advance(app, 60)
+        self.assertEqual(states_seen(app), ["idle", "starting", "grinding", "brewing", "ready", "picked_up"])
+        self.assertEqual(self.cups(app), ["unknown", "absent", "present", "unknown", "present", "absent"])
 
 
 class LinkTests(unittest.TestCase):
@@ -680,6 +846,7 @@ class AdvisorTests(unittest.TestCase):
         app.now += 3600
         tape = fake.synthetic_brew(f"c{int(app.now)}", None)
         tape = [(0, ("op", "start", {"variant": "base"}, TABLET))] + [s for s in tape if s[1][0] != "op"]
+        fake.cup_on(app)
         fake.replay(app, tape)
         self.assertNotIn("grind_size", calls(app, "xbloom/start_brew")[-1])
         self.assertEqual(fake.ledger(app)[-1]["variant"], "base")
