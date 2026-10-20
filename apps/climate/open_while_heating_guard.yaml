@@ -5,7 +5,7 @@ open_while_heating_guard:
   # Outward openings that leak heat while the room's radiator runs. Interior doors are
   # not watched (heat just moves between rooms). rooftop_door_1 is unmapped on purpose:
   # both rooftop doors sit in the "rooftop" HA area and only door 2's inner room is
-  # known (Claudias room, via claudias_room_climate) - add door 1 to its real room once
+  # known (Claudias room) - add door 1 to its real room once
   # confirmed.
   # Per-room push audience (person names from MobileNotifier's device_mapping).
   # Mikkel gets every room; Kristine/Claudia get their own room + the shared family

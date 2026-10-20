@@ -18,11 +18,6 @@ so heating cycling off and on under an open window can't double-report. Summer-s
 by construction (heating_active simply never turns on). The too-cold half of the same
 problem is climate_alarm's job (mobile push); this guard covers the heat-waste half.
 
-Claudias rooftop door 2 IS watched even though claudias_room_climate drops the setpoint
-on open - that drop stops the heating within a minute, so this guard stays silent there
-unless that automation breaks or gets removed (Claudia may not want it), which is
-exactly when this should start speaking up.
-
 Interior room doors are deliberately not watched - heat moving between rooms is not
 waste. rooftop_door_1 is unmapped until its inner room is confirmed (see yaml).
 """

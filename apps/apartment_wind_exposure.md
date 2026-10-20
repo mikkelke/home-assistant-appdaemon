@@ -69,11 +69,6 @@ Window directions and facade groups above are also the right physical context wh
 
 ## Existing HA/backend context
 
-- There is already backend climate/opening logic in Home Assistant:
-  - `automation.kristines_room_climate_control`
-  - Claudias Room (ex office): the setpoint logic was ported to AppDaemon
-    (`apps/climate/claudias_room_climate.py`, July 2026); the former
-    family-room climate automation no longer exists
 - `sensor.temperture_difference` exists, but its exact meaning should be verified before using it in final alert logic.
 - **Family-room/opening logic** currently appears to involve:
   - kitchen_window_contact

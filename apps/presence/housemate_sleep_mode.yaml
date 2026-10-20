@@ -1,13 +1,8 @@
 # /conf/apps/presence/housemate_sleep_mode.yaml
 # Server-side sleep booleans for the housemates, from signals HA can see itself
-# (person.*, companion battery_state, room PIR) - no phone-side automations, which is
-# exactly what broke Kristine's old setup: her HA automation ("Kristine sleep mode
-# control") only reacts to input_boolean.kristines_iphone_charging, which her iPhone's
-# own iOS Shortcuts write; on 2026-08-06 the phone posted turn_on + turn_off 19 ms
-# apart and her sleep mode read OFF all night while the phone charged.
-#
-# DEPLOY STEP (manual, by Mikkel): disable automation.kristine_sleep_mode_control in
-# HA. Until then this app tolerates it (foreign writes are adopted, last-writer-wins).
+# (person.*, companion battery_state, room PIR) - no phone-side automations: a phone's own
+# shortcut writing a charging boolean is not reliable. Foreign writes to the booleans are
+# adopted, last-writer-wins.
 #
 # input_boolean.claudia_sleep_mode is created by this app at startup if missing
 # (create-if-missing via the HA WebSocket API - REST /api/config has no input_boolean
