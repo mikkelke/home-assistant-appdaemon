@@ -62,7 +62,7 @@ TASKS = (
     Task("dishwasher:filters", "dishwasher", "Dishwasher filters + spray arms", "rinse filter + arms", 30,
          "mdi:dishwasher"),
     Task("dishwasher:check", "dishwasher", "Dishwasher general check", "seal, sides, inside", 60, "mdi:dishwasher"),
-    Task("washer:drum", "washer", "Washer drum + drawer clean", "Bomuld 90, empty + a little powder",
+    Task("washer:drum", "washer", "Washer drum + drawer clean", "Bomuld 90 + drain filter, door seal",
          drum_clean.INTERVAL_RUNS, "mdi:washing-machine", confirmed=drum_clean.last_clean,
          closes="Logged when you pick Drum clean on the washer card"),
     Task("washer:inlet", "washer", "Washer inlet filters", "hose + valve filters", 90, "mdi:washing-machine"),

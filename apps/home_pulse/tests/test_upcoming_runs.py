@@ -386,7 +386,7 @@ class RowTests(unittest.TestCase):
         row, key = rows_of(ledgers(), {}, start=start)["maint:washer:drum"]
         self.assertEqual((row["title"], row["at"], row["detail"], row["area"]),
                          ("Washer drum + drawer clean", "2026-10-16T00:15:00+00:00",
-                          "Bomuld 90, empty + a little powder, saves 10,40 kr vs now", "guest_bathroom"))
+                          "Bomuld 90 + drain filter, door seal, saves 10,40 kr vs now", "guest_bathroom"))
         self.assertNotIn("next", row)
         self.assertIsNone(key)
 
@@ -394,14 +394,14 @@ class RowTests(unittest.TestCase):
         cycles = replace(every_two_days(wash, 60), 20, drum_clean_run(NOW - 40 * DAY))
         row, key = rows_of(ledgers(washer=cycles), {}, start=(NOW, "cheapest now", True))["maint:washer:drum"]
         self.assertEqual((row["at"], row["next"]), (core.utc_iso(NOW), "skip"))
-        self.assertEqual(row["detail"], "Bomuld 90, empty + a little powder, cheapest now, due")
+        self.assertEqual(row["detail"], "Bomuld 90 + drain filter, door seal, cheapest now, due")
         self.assertEqual(key, f"washer:drum:{core.utc_iso(NOW - 40 * DAY)}")
         self.assertTrue(core.is_valid_row(row))
 
     def test_a_clean_that_is_not_due_is_a_dated_countdown_and_ignores_a_start(self):
         cycles = replace(every_two_days(wash, 60), 4, drum_clean_run(NOW - 9 * DAY))
         row, key = rows_of(ledgers(washer=cycles), {}, start=(NOW, "cheapest now", True))["maint:washer:drum"]
-        self.assertEqual(row["detail"], "Bomuld 90, empty + a little powder, 11 runs left, ~06.11")
+        self.assertEqual(row["detail"], "Bomuld 90 + drain filter, door seal, 11 runs left, ~06.11")
         self.assertEqual(row["at"], "2026-11-06T08:00:00+00:00")
         self.assertNotIn("next", row)
         self.assertIsNone(key)

@@ -73,11 +73,10 @@ class SafetyNoteTests(unittest.TestCase):
         for word in ("scouring", "ammonia", "acid", "chloride", "descaler", "oven"):
             self.assertIn(word, self.warn("dishwasher:check"))
 
-    def test_the_washer_is_unplugged_for_the_drawer_and_the_inlet_filters(self):
-        self.assertIn("pull the plug", self.warn("washer:drum"))
-        self.assertIn("mains voltage", self.warn("washer:drum"))
+    def test_the_drum_clean_rules_out_vinegar_and_liquid_and_the_inlet_closes_the_tap(self):
+        for word in ("vinegar", "liquid", "bleach", "hot"):
+            self.assertIn(word, self.warn("washer:drum"))
         self.assertIn("close the water tap", self.warn("washer:inlet"))
-        self.assertIn("pull the plug", self.warn("washer:inlet"))
 
     def test_the_dryer_waits_for_its_cool_down_and_never_runs_without_the_plinth_filter(self):
         warn = self.warn("dryer:plinth")
@@ -109,13 +108,14 @@ class StepContentTests(unittest.TestCase):
         for word in ("door seal", "sides of the door", "control panel", "front"):
             self.assertIn(word, text)
 
-    def test_the_drawer_is_cleaned_before_the_hot_wash_and_the_wash_is_logged(self):
+    def test_the_drawer_seal_and_drain_filter_are_cleaned_before_the_hot_wash_and_the_wash_is_logged(self):
         steps = guides.GUIDES["washer:drum"].steps
         self.assertIn("drawer", steps[0].lower())
-        self.assertIn("siphon", self.steps("washer:drum"))
-        self.assertIn("bomuld 90", steps[4].lower())
-        self.assertIn("empty drum", steps[4].lower())
-        self.assertIn("drum clean", steps[5].lower())
+        for word in ("siphon", "door seal", "drain filter", "oxygen bleach"):
+            self.assertIn(word, self.steps("washer:drum"))
+        self.assertIn("bomuld 90", steps[-1].lower())
+        self.assertIn("drum empty", steps[-1].lower())
+        self.assertIn("drum clean", steps[-1].lower())
 
     def test_the_inlet_filters_are_two_and_both_go_back(self):
         text = self.steps("washer:inlet")

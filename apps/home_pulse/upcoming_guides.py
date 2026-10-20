@@ -4,9 +4,10 @@ shows it. Plain ASCII English, three to six steps and the safety note the manual
 
 The Miele guides follow the operating instructions of the machines (Danish, the PDFs the distilled
 docs in apps/appliances/docs cite): the dishwasher's Rengoring og vedligeholdelse pp. 63-69, the
-washer's pp. 15 and 37-41, the dryer's pp. 11 and 40-45. The Rober2 guides are the Roborock Q8 Max
-routine for each part. The xBloom Studio guides are the usual care of its parts, provisional like
-their intervals until the xBloom manual is checked.
+washer's pp. 15, 37-41 and 45-46, the dryer's pp. 11 and 40-45. The washer's drum clean adds the
+usual household care: the door seal, oxygen bleach rather than vinegar. The Rober2 guides are the
+Roborock Q8 Max routine for each part. The xBloom Studio guides are the usual care of its parts,
+provisional like their intervals until the xBloom manual is checked.
 """
 
 from typing import NamedTuple
@@ -54,16 +55,21 @@ GUIDES = {
     ),
     "washer:drum": Guide(
         steps=(
-            "Pull the plug. Pull the drawer out to the stop, press the lock button down and lift it out.",
-            "Wash the drawer and the fabric softener channel in warm water, with a brush for the channel.",
-            "Pull the siphon out of its chamber, rinse it and the pipe it sits on, and put it back.",
-            "Scrub soap and limescale off the rinse nozzles in the drawer slot with a bottle brush. Put the drawer back.",
-            "Plug in. Start Bomuld 90 C with an empty drum and a little universal powder detergent (or Miele machine "
-            "cleaner).",
-            "Pick Drum clean on the washer card in the dashboard so the clean is logged. Afterwards leave the door and "
-            "the drawer ajar to dry.",
+            "Pull the drawer out to the stop, press the lock button and lift it out. Scrub it and the softener "
+            "channel in warm water.",
+            "In the softener chamber (flower symbol) sits a small plastic cap, the siphon. Pull it up, rinse it and "
+            "its pipe, push it back.",
+            "Brush soap and limescale off the nozzles in the drawer slot (look up inside it) with a bottle brush. Put "
+            "the drawer back.",
+            "Fold back the rubber door seal and wipe hair, lint and black slime out of its folds with a cloth and dish "
+            "soap. Dry it.",
+            "Bottom flap: towel and roasting tin under it, unscrew the drain filter slowly and let the water out. "
+            "Rinse off lint and coins. Screw it back tight.",
+            "Run Bomuld 90 C with the drum empty and a scoop of powder or oxygen bleach in it. Pick Drum clean on the "
+            "washer card. Leave door + drawer ajar after.",
         ),
-        warn="The washer has mains voltage even when it is switched off. Pull the plug before you clean the drawer.",
+        warn="Not vinegar or liquid detergent for this run: neither kills the slime, the bleach in powder does. The "
+             "drain water is hot after a hot wash.",
     ),
     "washer:inlet": Guide(
         steps=(
@@ -74,7 +80,7 @@ GUIDES = {
             "Screw the hose back onto the tap and open the tap.",
             "Check for drips at the connection. Tighten it more if water seeps out.",
         ),
-        warn="Close the water tap and pull the plug before you start.",
+        warn="Close the water tap before you start.",
     ),
     "dryer:plinth": Guide(
         steps=(

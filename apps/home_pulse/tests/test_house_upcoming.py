@@ -290,14 +290,14 @@ class PublishTests(unittest.TestCase):
 class AcquisitionTests(unittest.TestCase):
     def test_a_drum_clean_confirmed_in_the_ledger_reaches_the_row_at_once_through_the_washer_entity(self):
         app = make_app()
-        self.assertEqual(rows(app)["maint:washer:drum"]["detail"], "Bomuld 90, empty + a little powder, due, last unknown")
+        self.assertEqual(rows(app)["maint:washer:drum"]["detail"], "Bomuld 90 + drain filter, door seal, due, last unknown")
         cycles = every_two_days("washer", NOW)
         cycles[-4] = drum_clean_run(NOW - 7 * 24 * HOUR)
         write_ledger(app.state_dir, "washer", cycles)
         washer = app.states["sensor.washer_state"]
         fire(app, "sensor.washer_state", {**washer, "attributes": {"last_drum_clean": iso(NOW - 7 * 24 * HOUR)}})
         row = rows(app)["maint:washer:drum"]
-        self.assertTrue(row["detail"].startswith("Bomuld 90, empty + a little powder, 12 runs left, ~"), row["detail"])
+        self.assertTrue(row["detail"].startswith("Bomuld 90 + drain filter, door seal, 12 runs left, ~"), row["detail"])
         self.assertIn("at", row)
         self.assertIn(("sensor.washer_state", {"attribute": "all"}), app.listened)
 
@@ -435,20 +435,20 @@ class DrumStartTests(unittest.TestCase):
         app = make_app(states)
         row = rows(app)["maint:washer:drum"]
         self.assertEqual((row["at"], row["detail"]),
-                         ("2026-10-14T18:00:00+00:00", "Bomuld 90, empty + a little powder, saves 1,80 kr vs now"))
+                         ("2026-10-14T18:00:00+00:00", "Bomuld 90 + drain filter, door seal, saves 1,80 kr vs now"))
         self.assertNotIn("next", row)
         self.assertIn(("sensor.energi_data_service", {"attribute": "all"}), app.listened)
         fire(app, "sensor.energi_data_service", self.prices({20}, {3, 4}, True))
         row = rows(app)["maint:washer:drum"]
         self.assertEqual((row["at"], row["detail"]),
-                         ("2026-10-15T01:00:00+00:00", "Bomuld 90, empty + a little powder, saves 1,80 kr vs now"))
+                         ("2026-10-15T01:00:00+00:00", "Bomuld 90 + drain filter, door seal, saves 1,80 kr vs now"))
 
     def test_a_published_drum_clean_profile_prices_the_row(self):
         states = self.states(self.BOMULD_60, self.DRUM_CLEAN)
         states["sensor.energi_data_service"] = self.prices({20, 21}, {}, False)
         row = rows(make_app(states))["maint:washer:drum"]
         self.assertEqual((row["at"], row["detail"]),
-                         ("2026-10-14T18:00:00+00:00", "Bomuld 90, empty + a little powder, saves 2,25 kr vs now"))
+                         ("2026-10-14T18:00:00+00:00", "Bomuld 90 + drain filter, door seal, saves 2,25 kr vs now"))
 
     def test_cheapest_now_times_the_row_at_now_and_out_of_the_next_chip(self):
         states = self.states()
@@ -456,14 +456,14 @@ class DrumStartTests(unittest.TestCase):
         app = make_app(states)
         row = rows(app)["maint:washer:drum"]
         self.assertEqual((row["at"], row["detail"], row["next"]),
-                         (core.utc_iso(NOW), "Bomuld 90, empty + a little powder, cheapest now, due", "skip"))
+                         (core.utc_iso(NOW), "Bomuld 90 + drain filter, door seal, cheapest now, due", "skip"))
         tick(app, HOUR)
         row = rows(app)["maint:washer:drum"]
         self.assertEqual((row["at"], row["next"]), (core.utc_iso(NOW + HOUR), "skip"))
 
     def test_without_prices_the_row_stays_untimed(self):
         row = rows(make_app(self.states()))["maint:washer:drum"]
-        self.assertEqual(row["detail"], "Bomuld 90, empty + a little powder, due, last unknown")
+        self.assertEqual(row["detail"], "Bomuld 90 + drain filter, door seal, due, last unknown")
         self.assertNotIn("at", row)
         self.assertNotIn("next", row)
 
@@ -502,7 +502,7 @@ class RunTaskTests(unittest.TestCase):
             "maint:dishwasher:hygiene": "Intensive 75, due, last unknown",
             "maint:dishwasher:filters": "rinse filter + arms, 30 runs left, ~13.12",
             "maint:dishwasher:check": "seal, sides, inside, 60 runs left, ~11.02.27",
-            "maint:washer:drum": "Bomuld 90, empty + a little powder, due, last unknown",
+            "maint:washer:drum": "Bomuld 90 + drain filter, door seal, due, last unknown",
             "maint:washer:inlet": "hose + valve filters, 90 runs left, ~12.04.27",
             "maint:dryer:plinth": "0 runs since cleaned, counting from 14.10",
         })
@@ -618,7 +618,7 @@ class RunTaskTests(unittest.TestCase):
         states = base_states()
         states["sensor.washer_state"] = full("Off", {"last_drum_clean": iso(NOW - 3 * DAY)})
         row = rows(make_app(states))["maint:washer:drum"]
-        self.assertEqual(row["detail"], "Bomuld 90, empty + a little powder, due, last unknown")
+        self.assertEqual(row["detail"], "Bomuld 90 + drain filter, door seal, due, last unknown")
 
     def test_an_old_state_file_with_the_drum_key_loads_and_loses_it(self):
         app = make_app()
@@ -881,7 +881,7 @@ class PushRunTests(unittest.TestCase):
         cycles = every_two_days("washer", NOW)
         cycles[-21] = drum_clean_run(NOW - 40 * DAY)
         app = make_app(ledgers={"washer": cycles})
-        self.assertEqual(rows(app)["maint:washer:drum"]["detail"], "Bomuld 90, empty + a little powder, due, last 04.09")
+        self.assertEqual(rows(app)["maint:washer:drum"]["detail"], "Bomuld 90 + drain filter, door seal, due, last 04.09")
         self.push(app)
         self.assertEqual([s["message"] for s in app.notifier.sent], ["Washer drum + drawer clean"])
 
