@@ -56,8 +56,9 @@ HouseUpcoming:
   # One line per houseplant: name, area and water (optional, the litres to pour, which the row's title
   # shows), then either moisture or every_days. With moisture, its soil moisture sensor, the plant needs
   # water at a reading of dry (percent) or under, and the reminder stays until the reading is 5 points
-  # above dry. With every_days, a whole number, the plant has no sensor: its row counts the days from
-  # the day it was first seen or last tapped Done, is due after that many and starts over with each Done.
+  # above dry. With every_days, a whole number, the plant has no sensor: it counts the days from the day
+  # it was first seen or last tapped Done, shows a row from the day before that many have passed, is
+  # due then and starts over with each Done.
   plants:
     - {moisture: sensor.strelitzia_moisture, name: Strelitzia, area: dining_room, dry: 15, water: 3}
     - {moisture: sensor.philodendron_moisture, name: Philodendron, area: dining_room, dry: 20, water: 0.5}

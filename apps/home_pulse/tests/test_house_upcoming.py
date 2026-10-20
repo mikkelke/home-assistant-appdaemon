@@ -1300,9 +1300,10 @@ class PlantTests(unittest.TestCase):
 
 
 class TimedPlantTests(unittest.TestCase):
-    """Houseplants watered by the calendar: a tapped task counted in days, seeded at first sight, dated
-    until the day it is due, then untimed and pushed once; Done starts over and undo takes it back. The
-    behaviour tests run on SAMPLE_TIMED whatever the yaml lists, and the last two run every plant it lists."""
+    """Houseplants watered by the calendar: a tapped task counted in days, seeded at first sight, without a
+    row until the day before it is due, then dated, then untimed and pushed once; Done starts over and undo
+    takes it back. The behaviour tests run on SAMPLE_TIMED whatever the yaml lists, and the last two run
+    every plant it lists."""
 
     ROW = "maint:plant:monstera"
     KEY = "plant:monstera"
@@ -1321,21 +1322,26 @@ class TimedPlantTests(unittest.TestCase):
     def undo(self, app, row=ROW):
         app._on_undo("house_upcoming_undo", {"row": row}, {})
 
-    def test_the_plant_is_seeded_at_first_sight_and_shows_as_upcoming_with_a_done_button(self):
+    def test_the_plant_is_seeded_at_first_sight_and_has_no_row_until_the_day_before_it_is_due(self):
         app = self.make()
+        self.assertEqual(state_file(app)["done"][self.KEY], {"at": core.utc_iso(NOW), "seed": True})
+        for _ in range(8):
+            self.assertNotIn(self.ROW, rows(app))
+            tick(app, DAY)
+        self.assertNotIn(self.ROW, rows(app))
+        tick(app, DAY)
         row = rows(app)[self.ROW]
         self.assertEqual((row["kind"], row["title"], row["detail"], row["icon"], row["area"], row["audience"]),
-                         ("maint", "Water the Monstera: 1 L", "10 days left, 24.10", "mdi:watering-can-outline",
+                         ("maint", "Water the Monstera: 1 L", "1 day left, 24.10", "mdi:watering-can-outline",
                           "kitchen", "admin"))
         self.assertEqual((row["at"], row["done"]), ("2026-10-24T07:00:00+00:00", "tap"))
         self.assertEqual(row["info"], ["Every 10 days", "Counting from 14.10"])
         self.assertTrue(core.is_valid_row(row))
-        self.assertEqual(state_file(app)["done"][self.KEY], {"at": core.utc_iso(NOW), "seed": True})
 
     def test_the_seed_never_moves_and_survives_a_reload(self):
         app = self.make()
         seeded = state_file(app)["done"]
-        tick(app, 3 * DAY)
+        tick(app, 9 * DAY)
         self.assertEqual(state_file(app)["done"], seeded)
         reloaded = self.make(state_dir=app.state_dir, now=app.now)
         self.assertEqual(reloaded._anchors, app._anchors)
@@ -1366,19 +1372,21 @@ class TimedPlantTests(unittest.TestCase):
         published = len(app.published)
         self.done(app)
         self.assertEqual(len(app.published), published + 1)
-        row = rows(app)[self.ROW]
-        self.assertEqual((row["detail"], row["at"]), ("10 days left, 04.11", "2026-11-04T08:00:00+00:00"))
-        self.assertEqual(row["info"], ["Every 10 days", "Done 25.10, today"])
+        self.assertNotIn(self.ROW, rows(app))
         self.assertEqual(state_file(app)["done"][self.KEY], {"at": core.utc_iso(app.now), "prev": seed})
         self.assertEqual(done_log(app), [{"event": "done", "row": self.ROW, "at": core.utc_iso(app.now)}])
         self.assertIn(("INFO", "Done: water the Monstera"), app.logs)
+        tick(app, 9 * DAY)
+        row = rows(app)[self.ROW]
+        self.assertEqual((row["detail"], row["at"]), ("1 day left, 04.11", "2026-11-04T08:00:00+00:00"))
+        self.assertEqual(row["info"], ["Every 10 days", "Done 25.10, 9 days ago"])
 
     def test_done_needs_no_appliance_ledger(self):
         app = self.make(ledgers=self.NO_LEDGERS)
         self.assertNotIn("maint:washer:inlet", rows(app))
         tick(app, 11 * DAY)
         self.done(app)
-        self.assertEqual(rows(app)[self.ROW]["info"][1], "Done 25.10, today")
+        self.assertEqual(state_file(app)["done"][self.KEY]["at"], core.utc_iso(app.now))
         self.assertEqual(len(done_log(app)), 1)
 
     def test_a_done_survives_a_reload_and_is_pushed_again_in_the_next_episode(self):
@@ -1388,7 +1396,7 @@ class TimedPlantTests(unittest.TestCase):
         self.done(app)
         reloaded = self.make(state_dir=app.state_dir, now=app.now)
         self.assertEqual(reloaded._anchors, app._anchors)
-        self.assertEqual(rows(reloaded)[self.ROW], rows(app)[self.ROW])
+        self.assertNotIn(self.ROW, rows(reloaded))
         tick(reloaded, 5 * DAY)
         self.push(reloaded)
         self.assertEqual(reloaded.notifier.sent, [])
@@ -1398,9 +1406,10 @@ class TimedPlantTests(unittest.TestCase):
 
     def test_undo_brings_the_seed_back_publishes_logs_and_a_second_undo_is_ignored(self):
         app = self.make()
-        tick(app, 2 * DAY)
+        tick(app, 9 * DAY)
         before, shown = state_file(app)["done"], rows(app)[self.ROW]
         self.done(app)
+        self.assertNotIn(self.ROW, rows(app))
         published = len(app.published)
         self.undo(app)
         self.assertEqual(len(app.published), published + 1)
@@ -1413,6 +1422,14 @@ class TimedPlantTests(unittest.TestCase):
         self.undo(app)
         self.assertEqual((done_log(app), len(app.published)), (logged, published))
         self.assertTrue(any(level == "WARNING" and msg.startswith("Undo ignored") for level, msg in app.logs))
+
+    def test_a_done_before_the_row_shows_still_counts(self):
+        app = self.make()
+        tick(app, 3 * DAY)
+        self.assertNotIn(self.ROW, rows(app))
+        self.done(app)
+        self.assertEqual(state_file(app)["done"][self.KEY]["at"], core.utc_iso(app.now))
+        self.assertEqual(len(done_log(app)), 1)
 
     def test_a_sensor_plants_row_and_unknown_ids_are_no_tapped_task(self):
         app = self.make(plants=[SAMPLE_TIMED, SAMPLE_PLANT])
@@ -1429,36 +1446,41 @@ class TimedPlantTests(unittest.TestCase):
         self.done(app)
         self.assertEqual({key: row for key, row in rows(app).items() if key != self.ROW}, before)
 
-    def test_every_plant_the_yaml_lists_for_the_calendar_has_a_dated_tappable_row_seeded_now(self):
+    def test_every_plant_the_yaml_lists_for_the_calendar_is_seeded_now_and_shows_from_the_day_before_it_is_due(self):
         self.assertTrue(TIMED)
         app = make_app(plants=CONFIG["plants"])
-        shown = plant_rows(app, TIMED.values())
-        self.assertEqual(len(shown), len(TIMED))
+        self.assertEqual(plant_rows(app, TIMED.values()), {})
         for plant in TIMED.values():
-            row = shown[f"maint:plant:{plant['slug']}"]
-            due = date(2026, 10, 14) + timedelta(days=plant["every_days"])
-            title = f"Water the {plant['name']}" + (f": {plant['water']:g} L" if plant["water"] else "")
-            self.assertEqual((row["title"], row["kind"], row["audience"], row["done"], row.get("area")),
-                             (title, "maint", "admin", "tap", plant["area"]), plant["name"])
-            nine = datetime.combine(due, maint.DUE_TIME, maint.HOUSE_TZ)
-            self.assertEqual(row["at"], core.utc_iso(nine), plant["name"])
-            self.assertIn(plant["area"], AREAS, plant["name"])
-            self.assertEqual(core.clean_text(plant["name"]), plant["name"])
-            self.assertTrue(core.is_valid_row(row), plant["name"])
             self.assertEqual(state_file(app)["done"][f"plant:{plant['slug']}"], {"at": core.utc_iso(NOW), "seed": True})
+        elapsed = 0
+        for days in sorted({plant["every_days"] for plant in TIMED.values()}):
+            tick(app, (days - 1 - elapsed) * DAY)
+            elapsed = days - 1
+            shown = plant_rows(app, TIMED.values())
+            visible = [plant for plant in TIMED.values() if plant["every_days"] - 1 <= elapsed]
+            self.assertEqual(set(shown), {f"maint:plant:{plant['slug']}" for plant in visible}, days)
+            for plant in visible:
+                row, left = shown[f"maint:plant:{plant['slug']}"], plant["every_days"] - elapsed
+                due = date(2026, 10, 14) + timedelta(days=plant["every_days"])
+                title = f"Water the {plant['name']}" + (f": {plant['water']:g} L" if plant["water"] else "")
+                self.assertEqual((row["title"], row["kind"], row["audience"], row["done"], row.get("area")),
+                                 (title, "maint", "admin", "tap", plant["area"]), plant["name"])
+                nine = core.utc_iso(datetime.combine(due, maint.DUE_TIME, maint.HOUSE_TZ))
+                self.assertEqual(row.get("at"), nine if left > 0 else None, plant["name"])
+                self.assertIn(plant["area"], AREAS, plant["name"])
+                self.assertEqual(core.clean_text(plant["name"]), plant["name"])
+                self.assertTrue(core.is_valid_row(row), plant["name"])
 
-    def test_a_done_on_each_plant_the_yaml_lists_is_logged_and_moves_only_that_row(self):
+    def test_a_done_on_each_plant_the_yaml_lists_is_logged_and_takes_only_that_row_away(self):
         app = make_app(plants=CONFIG["plants"], ledgers=self.NO_LEDGERS)
-        tick(app, 40 * DAY)
-        for plant in TIMED.values():
-            self.assertNotIn("at", rows(app)[f"maint:plant:{plant['slug']}"], plant["name"])
+        tick(app, 60 * DAY)
+        self.assertEqual(len(plant_rows(app, TIMED.values())), len(TIMED))
         for count, plant in enumerate(TIMED.values(), 1):
             row_id = f"maint:plant:{plant['slug']}"
             self.done(app, row_id)
-            self.assertIn("at", rows(app)[row_id], plant["name"])
+            self.assertNotIn(row_id, rows(app), plant["name"])
             self.assertEqual(len(done_log(app)), count)
-            untimed = [row for row in plant_rows(app, TIMED.values()).values() if "at" not in row]
-            self.assertEqual(len(untimed), len(TIMED) - count)
+            self.assertEqual(len(plant_rows(app, TIMED.values())), len(TIMED) - count)
         ids = [f"maint:plant:{plant['slug']}" for plant in TIMED.values()]
         self.assertEqual([entry["row"] for entry in done_log(app)], ids)
 

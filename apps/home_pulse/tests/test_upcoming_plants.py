@@ -331,10 +331,18 @@ class CalendarRowTests(unittest.TestCase):
         for other in ("maint:plant:strelitzia", "maint:monstera", "plant:monstera", "", None, 5):
             self.assertIsNone(plants.timed_by_row(other, timed), other)
 
-    def test_before_the_due_day_the_row_is_dated_at_nine_house_time_and_not_pushed(self):
-        row, key = self.row(self.anchor(self.NOW, seed=True))
+    def test_a_plant_has_no_row_until_the_day_before_it_is_due(self):
+        seed = self.anchor(self.NOW, seed=True)
+        for days in range(9):
+            self.assertIsNone(self.row(seed, self.NOW + days * DAY), days)
+        self.assertEqual(plants.LEAD_DAYS, 1)
+        for days in (9, 10, 11):
+            self.assertIsNotNone(self.row(seed, self.NOW + days * DAY), days)
+
+    def test_the_day_before_the_row_is_dated_at_nine_house_time_and_not_pushed(self):
+        row, key = self.row(self.anchor(self.NOW, seed=True), self.NOW + 9 * DAY)
         self.assertEqual((row["id"], row["kind"], row["title"], row["detail"]),
-                         ("maint:plant:monstera", "maint", "Water the Monstera: 1 L", "10 days left, 30.10"))
+                         ("maint:plant:monstera", "maint", "Water the Monstera: 1 L", "1 day left, 30.10"))
         self.assertEqual((row["at"], row["icon"], row["area"], row["audience"], row["done"]),
                          ("2026-10-30T08:00:00+00:00", "mdi:watering-can-outline", "kitchen", "admin", "tap"))
         self.assertEqual(row["info"], ["Every 10 days", "Counting from 20.10"])
@@ -345,9 +353,10 @@ class CalendarRowTests(unittest.TestCase):
 
     def test_summer_time_and_winter_time_move_the_utc_time_not_the_house_time(self):
         week = plants.parse_timed([{"name": "Lily", "every_days": 4}])["lily"]
-        self.assertEqual(self.row(self.anchor(self.NOW), plant=week)[0]["at"], "2026-10-24T07:00:00+00:00")
-        self.assertEqual(self.row(self.anchor(self.NOW + DAY), plant=week)[0]["at"], "2026-10-25T08:00:00+00:00")
-        self.assertEqual(self.row(self.anchor(self.NOW + 2 * DAY), plant=week)[0]["at"], "2026-10-26T08:00:00+00:00")
+        for started, shown in ((0, "2026-10-24T07:00:00+00:00"), (1, "2026-10-25T08:00:00+00:00"),
+                               (2, "2026-10-26T08:00:00+00:00")):
+            anchor = self.anchor(self.NOW + started * DAY)
+            self.assertEqual(self.row(anchor, self.NOW + (started + 3) * DAY, week)[0]["at"], shown)
 
     def test_the_days_are_house_days_not_twenty_four_hours(self):
         daily = plants.parse_timed([{"name": "Fern", "every_days": 1}])["fern"]
@@ -370,35 +379,41 @@ class CalendarRowTests(unittest.TestCase):
         self.assertEqual(same, key)
         self.assertEqual(late["done"], "tap")
         self.assertTrue(core.is_valid_row(late))
+
+    def test_a_done_takes_the_row_away_until_the_day_before_the_next_one(self):
         watered = self.anchor(self.NOW + 13 * DAY)
-        again, new_key = self.row(watered, self.NOW + 13 * DAY)
-        self.assertNotIn("due", again["detail"])
-        self.assertIsNone(new_key)
-        self.assertNotEqual(self.row(watered, self.NOW + 24 * DAY)[1], key)
+        self.assertIsNone(self.row(watered, self.NOW + 13 * DAY))
+        self.assertIsNone(self.row(watered, self.NOW + 21 * DAY))
+        row, key = self.row(watered, self.NOW + 22 * DAY)
+        self.assertEqual((row["detail"], row["info"][1]), ("1 day left, 12.11", "Done 02.11, 9 days ago"))
+        self.assertIsNone(key)
+        self.assertNotEqual(self.row(watered, self.NOW + 24 * DAY)[1], f"plant:monstera:{core.utc_iso(self.NOW)}")
 
     def test_the_sheet_says_when_it_was_done_and_how_long_ago(self):
-        done = self.anchor(self.NOW - 3 * DAY)
-        self.assertEqual(self.row(done)[0]["info"], ["Every 10 days", "Done 17.10, 3 days ago"])
-        self.assertEqual(self.row(self.anchor(self.NOW - DAY))[0]["info"][1], "Done 19.10, 1 day ago")
-        self.assertEqual(self.row(self.anchor(self.NOW))[0]["info"][1], "Done 20.10, today")
+        nine_days_ago = self.row(self.anchor(self.NOW - 9 * DAY))[0]
+        self.assertEqual(nine_days_ago["info"], ["Every 10 days", "Done 11.10, 9 days ago"])
+        daily = plants.parse_timed([{"name": "Fern", "every_days": 1}])["fern"]
+        self.assertEqual(self.row(self.anchor(self.NOW - DAY), plant=daily)[0]["info"][1], "Done 19.10, 1 day ago")
+        self.assertEqual(self.row(self.anchor(self.NOW), plant=daily)[0]["info"][1], "Done 20.10, today")
         seeded_again = self.anchor(self.NOW, seed=True, prev={"at": "x"})
-        self.assertEqual(self.row(seeded_again)[0]["info"][1], "Counting from 20.10")
+        self.assertEqual(self.row(seeded_again, self.NOW + 9 * DAY)[0]["info"][1], "Counting from 20.10")
 
     def test_a_date_in_another_year_carries_it(self):
-        row, _ = self.row(self.anchor(datetime(2026, 12, 28, 12, 0, tzinfo=timezone.utc)),
-                          datetime(2026, 12, 28, 12, 0, tzinfo=timezone.utc))
-        self.assertEqual(row["detail"], "10 days left, 07.01.27")
-        self.assertEqual(row["at"], "2027-01-07T08:00:00+00:00")
+        row, _ = self.row(self.anchor(datetime(2026, 12, 22, 12, 0, tzinfo=timezone.utc)),
+                          datetime(2026, 12, 31, 12, 0, tzinfo=timezone.utc))
+        self.assertEqual(row["detail"], "1 day left, 01.01.27")
+        self.assertEqual(row["at"], "2027-01-01T08:00:00+00:00")
 
     def test_without_an_anchor_or_with_a_broken_one_there_is_no_row(self):
         for anchor in (None, {}, {"at": "soon"}, {"at": 5}):
-            self.assertIsNone(self.row(anchor), anchor)
+            self.assertIsNone(self.row(anchor, self.NOW + 11 * DAY), anchor)
 
     def test_the_title_carries_the_litres_when_there_are_some(self):
         bare = plants.parse_timed([{"name": "Aloe", "every_days": 35}])["aloe"]
         small = plants.parse_timed([{"name": "Aloe", "water": 0.25, "every_days": 35}])["aloe"]
-        self.assertEqual(self.row(self.anchor(self.NOW), plant=bare)[0]["title"], "Water the Aloe")
-        self.assertEqual(self.row(self.anchor(self.NOW), plant=small)[0]["title"], "Water the Aloe: 0.25 L")
+        eve = self.NOW + 34 * DAY
+        self.assertEqual(self.row(self.anchor(self.NOW), eve, bare)[0]["title"], "Water the Aloe")
+        self.assertEqual(self.row(self.anchor(self.NOW), eve, small)[0]["title"], "Water the Aloe: 0.25 L")
 
     def test_the_digest_names_a_due_plant_once_an_episode(self):
         seed = self.anchor(self.NOW, seed=True)

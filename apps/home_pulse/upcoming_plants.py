@@ -14,9 +14,10 @@ closes it, and its push key is unique per episode: the time the latch opened.
 
 A calendar plant is a tapped task counted in days, like the dishwasher's filters (upcoming_runs, whose
 anchors, Done and undo it uses): the anchor says when it was last watered, seeded at the moment the plant
-is first seen. Its row is timed at DUE_TIME on the house day that is `every_days` after the anchor's, so
-it reads as upcoming until then; once that day has come the row is untimed and due, with a push key
-for the episode, which is the anchor's time. A Done tap starts the interval over.
+is first seen. It has no row until LEAD_DAYS house days before the house day that is `every_days` after
+the anchor's, so plants weeks away do not crowd the timeline or its row cap. From then on the row is
+timed at DUE_TIME on the due day, and once that day has come it is untimed and due, with a push key for
+the episode, which is the anchor's time. A Done tap starts the interval over.
 """
 
 import re
@@ -30,6 +31,7 @@ ID_PREFIX = "maint:plant:"
 ANCHOR_PREFIX = "plant:"
 ICON = "mdi:watering-can-outline"
 CLOSE_MARGIN = 5
+LEAD_DAYS = 1
 
 
 def slug(name):
@@ -154,14 +156,17 @@ def _days(count):
 
 
 def timed_row(plant, anchor, now):
-    """(row, push key) for a calendar plant, None without an anchor. Dated and without a key while its
-    due day is ahead; untimed, due and with a key for the anchor's episode from that day on."""
+    """(row, push key) for a calendar plant, None without an anchor or while its due day is more than
+    LEAD_DAYS away. Dated and without a key until the due day; untimed, due and with a key for the
+    anchor's episode from that day on."""
     when = parse_iso((anchor or {}).get("at"))
     if when is None:
         return None
     interval = plant["every_days"]
     due = house_date(when) + timedelta(days=interval)
     left = (due - house_date(now)).days
+    if left > LEAD_DAYS:
+        return None
     since = max(0, (house_date(now) - house_date(when)).days)
     if left > 0:
         at, key = datetime.combine(due, DUE_TIME, HOUSE_TZ), None
