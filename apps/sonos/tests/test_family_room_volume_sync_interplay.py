@@ -330,7 +330,7 @@ class SonosNotifierInterplay(unittest.TestCase):
         announced = self.announce()
         self.assertEqual(sorted(announced), sorted(self.app.tts_group_all))
         for room in FAMILY:
-            self.assertEqual(announced[room], round(self.app.announce_volume * 100))
+            self.assertIsNone(announced[room])
         self.assertEqual(self.house.volume_sets(), [])
         self.assertEqual(self.house.volumes(), self.before)
         self.assertEqual(self.rig.arm_delays, [])
