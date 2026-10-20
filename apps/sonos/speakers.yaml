@@ -4,6 +4,8 @@
 # Convention: MA entity = clean id, native twin = <id>_2 (same physical unit).
 # When a speaker moves/renames: edit HERE first, then let the checker point at
 # every file that still disagrees. (The 2026-07 rename touched ~10 surfaces by hand.)
+# The Sonos app volume limit scales output, so default_volume compares across speakers only
+# when their limits match (family room: 0.8).
 
 speakers:
   living_room:
@@ -11,13 +13,13 @@ speakers:
     raw_entity: media_player.living_room_2
     rincon: RINCON_74CA6064C9BF01400
     model: Arc Ultra
-    default_volume: 0.14      # Era-100 default + 2: far bigger unit (user 2026-07-08)
+    default_volume: 0.14      # a notch above the kitchen: lowest-mounted speaker
     tts: [all, family]
   kitchen:
     ma_entity: media_player.kitchen
     raw_entity: media_player.kitchen_2
     rincon: RINCON_F0F6C1A525A201400
-    default_volume: 0.13      # one notch above the dining room
+    default_volume: 0.13      # a notch above the dining room: pair spread wider, busiest room
     tts: [all, family]
   dining_room:
     ma_entity: media_player.dining_room
