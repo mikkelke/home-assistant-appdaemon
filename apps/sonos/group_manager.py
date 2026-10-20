@@ -35,7 +35,6 @@ class SonosGroupManager(hass.Hass):
     def initialize(self):
         # app‑definition args
         self.speakers       = self.args["all_speakers"]
-        self.follow_flag    = self.args["follow_me_flag"]
         self.master_select  = self.args["master_select"]
         self.throttle       = float(self.args.get("throttle_seconds", 2))
         self.settle_delay   = float(self.args.get("settle_seconds", 2))
@@ -117,9 +116,6 @@ class SonosGroupManager(hass.Hass):
                           "call_service",
                           domain="media_player",
                           service="unjoin")
-
-        # NOTE: follow_me toggle is no longer used - automatic detection is used instead
-        # The follow_flag is kept for backward compatibility but not actively monitored
 
         # Listen for State Reset events
         self.listen_event(self._on_reset_requested, "sonos_reset_requested")

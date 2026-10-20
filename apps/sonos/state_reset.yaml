@@ -16,9 +16,6 @@ SonosStateReset:
   # far out rather than instantly inside the HA-reconnect window. Optional; default 5.
   min_reset_delay_seconds: 5
 
-  # Follow-me flag (will be turned off on any reset)
-  follow_me_flag: "input_boolean.follow_me"
-
   # All Sonos speakers to consider for manual reset
   all_speakers:
     - media_player.bathroom

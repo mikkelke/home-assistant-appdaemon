@@ -27,7 +27,6 @@ class SonosFollowMe(hass.Hass):
     def initialize(self):
         self.room_map    = self.args["room_presence_map"]   # room -> binary_sensor (may be a HA template combining inputs)
         self.speaker_map = self.args["speaker_room_map"]   # speaker_entity -> room name
-        self.follow_flag = self.args["follow_me_flag"]
         # Support both YAML key names (throttle_seconds/settle_seconds and min_update_interval)
         self.throttle    = float(self.args.get("throttle_seconds") or self.args.get("min_update_interval", 2))
         self.settle      = float(self.args.get("settle_seconds", 2))
@@ -83,9 +82,6 @@ class SonosFollowMe(hass.Hass):
             self.listen_state(self._on_speaker_group_change, sp, attribute="group_members")
             # Invalidate coordinator cache when speaker state changes (could affect coordinator)
             self.listen_state(self._invalidate_coordinator_cache, sp)
-
-        # NOTE: Follow_me toggle is no longer used - automatic detection is used instead
-        # The follow_flag is kept for backward compatibility but not actively monitored
 
         # Listen for rooftop docking/charging state changes
         if "rooftop_charging" in self.room_map:

@@ -17,7 +17,6 @@ SonosGroupManager:
     - media_player.claudias_room
     - media_player.rooftop
 
-  follow_me_flag: "input_boolean.follow_me"
   master_select: "input_select.sonos_master_speaker"
   throttle_seconds: 2  # Minimum time between evaluations
   settle_seconds: 2    # Delay to let state changes settle

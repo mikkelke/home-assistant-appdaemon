@@ -52,7 +52,6 @@ class SonosStateReset(hass.Hass):
 
     def initialize(self):
         self.speakers          = self.args["all_speakers"]
-        self.follow_flag       = self.args["follow_me_flag"]
         self.inactivity_sec    = int(self.args["inactivity_seconds"])
         self.speaker_volumes   = self.args["speaker_volumes"]
         self.default_volume    = float(self.args["default_volume"])
@@ -84,7 +83,6 @@ class SonosStateReset(hass.Hass):
         # Debug log initialization
         self.log(f"SonosStateReset initialized with {len(self.speakers)} speakers", level="INFO")
         self.log(f"Inactivity timeout set to {self.inactivity_sec} seconds", level="INFO")
-        self.log(f"Follow me flag: {self.follow_flag}", level="INFO")
         self.log(f"reset unjoin_strategy={self.unjoin_strategy}", level="INFO")
 
         # listen for manual event

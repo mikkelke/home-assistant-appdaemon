@@ -6,7 +6,6 @@ SonosFollowMe:
   log: sonos_log
 
   # Core settings
-  follow_me_flag:   "input_boolean.follow_me"
   room_presence_map:
     # Per-room union presence published by RoomActive (apps/presence/room_active.py) -
     # binary_sensor.<zone>_active already ORs each zone's full witness tier (room mmWave, spot
