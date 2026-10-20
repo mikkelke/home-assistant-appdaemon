@@ -37,13 +37,13 @@ speakers:
     ma_entity: media_player.bathroom
     raw_entity: media_player.bathroom_2
     rincon: RINCON_F0F6C1A5264A01400
-    default_volume: 0.18      # between the bedrooms and the family room, nearer the family room
+    default_volume: 0.18      # between the bedrooms and the family room
     tts: [all, family]
   guest_bathroom:
     ma_entity: media_player.guest_bathroom
     raw_entity: media_player.guest_bathroom_2
     rincon: RINCON_804AF2CB366601400
-    default_volume: 0.18      # between the bedrooms and the family room, nearer the family room
+    default_volume: 0.18      # between the bedrooms and the family room
     tts: [all, family]
   kristines_room:
     ma_entity: media_player.kristines_room
