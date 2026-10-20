@@ -78,6 +78,12 @@ HouseUpcoming:
     - {name: Cactus, area: bathroom, water: 0.1, every_days: 42}
     - {name: Pineapple, area: bathroom, water: 0.1, every_days: 14}
 
+  # One-off tasks: due is the day (yyyy-mm-dd), title is required, detail, area and icon are optional.
+  # The row shows from the day before, timed at 09:00 on the day, then untimed until a Done tap, which
+  # takes it away for good.
+  once:
+    - {due: 2026-11-17, title: Check the Alocasia for spider mites, detail: "new leaves dark and clean? then back to the living room", area: bathroom, icon: "mdi:bug-outline"}
+
   batteries:
     # action: replace (primary cells), recharge (swappable rechargeables), charge (built in).
     # low: N opens at a reading <= N (days: K = K house days in a row); drop: N opens N points under

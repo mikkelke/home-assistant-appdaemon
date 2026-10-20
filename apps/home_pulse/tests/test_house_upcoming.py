@@ -2,7 +2,7 @@
 # house_upcoming.yaml: lease, state acquisition, restart behaviour, the daily push, rain fetches,
 # the drum clean's cheapest start, the run-based appliance tasks (the feedback ledgers, the seed, Done
 # and undo), the history job, replace-by days, Rober2's dated parts, the plants' watering rows (by sensor
-# and by the calendar) and the battery inventory.
+# and by the calendar), the one-off tasks and the battery inventory.
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
 import asyncio
@@ -35,13 +35,17 @@ import house_upcoming as hu  # noqa: E402
 import upcoming_core as core  # noqa: E402
 import upcoming_guides as guides  # noqa: E402
 import upcoming_maint as maint  # noqa: E402
+import upcoming_once as once  # noqa: E402
 import upcoming_plants as plants  # noqa: E402
 
 CONFIG = yaml.safe_load((APPS / "home_pulse" / "house_upcoming.yaml").read_text())["HouseUpcoming"]
 PLANTS = plants.parse_plants(CONFIG["plants"])
 TIMED = plants.parse_timed(CONFIG["plants"])
+ONCE = once.parse_once(CONFIG["once"])
 SAMPLE_PLANT = {"moisture": "sensor.strelitzia_moisture", "name": "Strelitzia", "area": "dining_room", "dry": 15}
 SAMPLE_TIMED = {"name": "Monstera", "area": "kitchen", "water": 1, "every_days": 10}
+SAMPLE_ONCE = {"due": date(2026, 10, 24), "title": "Check the fern", "detail": "leaves clean?", "area": "bathroom",
+               "icon": "mdi:bug-outline"}
 MOISTURE = SAMPLE_PLANT["moisture"]
 AREAS = {"bathroom", "bedroom", "dining_room", "guest_bathroom", "hallway", "kitchen", "kristines_room",
          "living_room", "office", "rooftop"}
@@ -152,7 +156,7 @@ def make_app(states=None, state_dir=None, now=NOW, ledgers=None, **args):
             write_ledger(state_dir, name, ledgers[name])
         elif not (Path(state_dir) / f"{name}_feedback.json").exists():
             write_ledger(state_dir, name, every_two_days(name, now))
-    app.args = {**CONFIG, "plants": [], "state_file": f"{state_dir}/state.json",
+    app.args = {**CONFIG, "plants": [], "once": [], "state_file": f"{state_dir}/state.json",
                 "fixture_file": f"{state_dir}/fixtures.jsonl", "done_log_file": f"{state_dir}/done_log.jsonl", **args}
     for name in RUN_MAKERS:
         app.args[name] = {**(CONFIG.get(name) or {}), **(args.get(name) or {}),
@@ -1483,6 +1487,132 @@ class TimedPlantTests(unittest.TestCase):
             self.assertEqual(len(plant_rows(app, TIMED.values())), len(TIMED) - count)
         ids = [f"maint:plant:{plant['slug']}" for plant in TIMED.values()]
         self.assertEqual([entry["row"] for entry in done_log(app)], ids)
+
+
+class OnceTaskTests(unittest.TestCase):
+    """One-off tasks: a tapped task with a day on it, seeded at first sight, without a row until the day
+    before, then dated, then untimed and pushed once; a Done takes it away for good and undo brings it
+    back. The behaviour tests run on SAMPLE_ONCE whatever the yaml lists, and the last one runs every task
+    it lists."""
+
+    ROW = "maint:once:check_the_fern"
+    KEY = "once:check_the_fern"
+
+    def make(self, **args):
+        return make_app(**{"once": [SAMPLE_ONCE], **args})
+
+    def push(self, app):
+        app._on_push_time({})
+        drain(app)
+
+    def done(self, app, row=ROW):
+        app._on_done("house_upcoming_done", {"row": row}, {})
+
+    def undo(self, app, row=ROW):
+        app._on_undo("house_upcoming_undo", {"row": row}, {})
+
+    def test_the_task_is_seeded_at_first_sight_and_has_no_row_until_the_day_before(self):
+        app = self.make()
+        self.assertEqual(state_file(app)["done"][self.KEY], {"at": core.utc_iso(NOW), "seed": True})
+        tick(app, 8 * DAY)
+        self.assertNotIn(self.ROW, rows(app))
+        tick(app, DAY)
+        row = rows(app)[self.ROW]
+        self.assertEqual((row["kind"], row["title"], row["detail"], row["icon"], row["area"], row["audience"]),
+                         ("maint", "Check the fern", "leaves clean?", "mdi:bug-outline", "bathroom", "admin"))
+        self.assertEqual((row["at"], row["done"], row["info"]), ("2026-10-24T07:00:00+00:00", "tap", ["Due 24.10"]))
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_on_the_day_it_is_untimed_and_pushed_once(self):
+        app = self.make()
+        tick(app, 9 * DAY)
+        self.push(app)
+        self.assertEqual(app.notifier.sent, [])
+        tick(app, DAY)
+        self.assertNotIn("at", rows(app)[self.ROW])
+        self.push(app)
+        self.assertEqual([(s["title"], s["message"]) for s in app.notifier.sent],
+                         [("Maintenance due", "Check the fern")])
+        tick(app, 3 * DAY)
+        self.assertIn(self.ROW, rows(app))
+        self.push(app)
+        self.assertEqual(len(app.notifier.sent), 1)
+
+    def test_done_takes_it_away_for_good_logs_and_survives_a_reload(self):
+        app = self.make()
+        tick(app, 10 * DAY)
+        seed = state_file(app)["done"][self.KEY]
+        published = len(app.published)
+        self.done(app)
+        self.assertEqual(len(app.published), published + 1)
+        self.assertNotIn(self.ROW, rows(app))
+        self.assertEqual(state_file(app)["done"][self.KEY], {"at": core.utc_iso(app.now), "prev": seed})
+        self.assertEqual(done_log(app), [{"event": "done", "row": self.ROW, "at": core.utc_iso(app.now)}])
+        self.assertIn(("INFO", "Done: Check the fern"), app.logs)
+        reloaded = self.make(state_dir=app.state_dir, now=app.now)
+        for _ in range(3):
+            tick(reloaded, 20 * DAY)
+            self.assertNotIn(self.ROW, rows(reloaded))
+            self.push(reloaded)
+        self.assertEqual(reloaded.notifier.sent, [])
+
+    def test_a_second_done_is_ignored_so_one_undo_still_brings_it_back(self):
+        app = self.make()
+        tick(app, 10 * DAY)
+        self.done(app)
+        saved, logged = state_file(app)["done"], done_log(app)
+        self.done(app)
+        self.assertEqual((state_file(app)["done"], done_log(app)), (saved, logged))
+        self.assertTrue(any(level == "WARNING" and msg.startswith("Done ignored") for level, msg in app.logs))
+        self.undo(app)
+        self.assertIn(self.ROW, rows(app))
+
+    def test_undo_brings_the_row_and_the_seed_back_and_a_second_undo_is_ignored(self):
+        app = self.make()
+        tick(app, 10 * DAY)
+        before, shown = state_file(app)["done"], rows(app)[self.ROW]
+        self.done(app)
+        published = len(app.published)
+        self.undo(app)
+        self.assertEqual(len(app.published), published + 1)
+        self.assertEqual(rows(app)[self.ROW], shown)
+        self.assertEqual(state_file(app)["done"], before)
+        self.assertEqual([entry["event"] for entry in done_log(app)], ["done", "undo"])
+        self.assertIn(("INFO", "Done undone: Check the fern"), app.logs)
+        logged = done_log(app)
+        self.undo(app)
+        self.assertEqual(done_log(app), logged)
+        self.assertTrue(any(level == "WARNING" and msg.startswith("Undo ignored") for level, msg in app.logs))
+
+    def test_other_ids_are_no_one_off_task(self):
+        app = self.make(plants=[SAMPLE_TIMED])
+        before = state_file(app)["done"]
+        for row in ("maint:once:nothing", "maint:plant:check_the_fern", "once:check_the_fern", "", None, 5):
+            self.done(app, row)
+            self.undo(app, row)
+        self.assertEqual((state_file(app)["done"], done_log(app)), (before, []))
+
+    def test_every_task_the_yaml_lists_is_seeded_now_and_shows_the_day_before_its_day_until_done(self):
+        self.assertTrue(ONCE)
+        app = make_app(once=CONFIG["once"])
+        for task in ONCE.values():
+            row_id = f"maint:once:{task['slug']}"
+            self.assertEqual(state_file(app)["done"][f"once:{task['slug']}"], {"at": core.utc_iso(NOW), "seed": True})
+            self.assertNotIn(row_id, rows(app))
+            days = (task["due"] - date(2026, 10, 14)).days
+            tick(app, (days - 2) * DAY)
+            self.assertNotIn(row_id, rows(app), task["title"])
+            tick(app, DAY)
+            row = rows(app)[row_id]
+            nine = core.utc_iso(datetime.combine(task["due"], maint.DUE_TIME, maint.HOUSE_TZ))
+            self.assertEqual((row["title"], row["at"], row["done"], row["audience"], row["kind"]),
+                             (task["title"], nine, "tap", "admin", "maint"), task["title"])
+            self.assertEqual((row.get("detail"), row.get("area"), row["icon"]),
+                             (task["detail"] or None, task["area"], task["icon"]), task["title"])
+            self.assertIn(task["area"], AREAS, task["title"])
+            self.assertTrue(core.is_valid_row(row), task["title"])
+            self.done(app, row_id)
+            self.assertNotIn(row_id, rows(app), task["title"])
 
 
 class InventoryTests(unittest.TestCase):

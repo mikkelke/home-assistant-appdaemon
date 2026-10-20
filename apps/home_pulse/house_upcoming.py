@@ -1,8 +1,8 @@
 """HouseUpcoming - what is coming up in the house that only the server can know, for the dashboard's
 Now timeline: maintenance (the Rober2 parts, the dishwasher's, washer's, dryer's and xBloom's run-based
 tasks, the drum clean at its cheapest start, batteries by their replace-by day and offline devices, and
-houseplants that need water; admin only), Kristine's train, and rain while a terrace door is open
-(exploratory).
+houseplants that need water and one-off tasks; admin only), Kristine's train, and rain while a terrace door
+is open (exploratory).
 
 Publishes sensor.house_upcoming (shape in upcoming_core.py) plus one maintenance push a day, built
 from the same conditions the rows show. The lease in `expires` is renewed every TICK_S even when
@@ -21,8 +21,8 @@ tapped ones are closed by the house_upcoming_done event the dashboard fires for 
 {"row": <row id>}, and reopened by house_upcoming_undo; both reach the rows at once, and each is
 appended to house_upcoming_done_log.jsonl, which keeps every Done
 for working out the real interval of a task (the dryer's plinth filter is a log until it is known).
-The houseplants without a moisture sensor are tapped tasks counted in days (upcoming_plants), with
-their anchors in the same state.
+The houseplants without a moisture sensor are tapped tasks counted in days (upcoming_plants), and the
+one-off tasks tapped tasks with a day on them (upcoming_once), with their anchors in the same state.
 
 The daily history job also turns each device's recorder history into battery facts and a
 replace-by day, with the median lifetime of every device of the same model as the last resort, and
@@ -50,6 +50,7 @@ import upcoming_battery_age as age
 import upcoming_core as core
 import upcoming_drum as drum
 import upcoming_maint as maint
+import upcoming_once as once
 import upcoming_plants as plants
 import upcoming_rain as rain
 import upcoming_runs as runs
@@ -118,6 +119,7 @@ class HouseUpcoming(hass.Hass):
         self.inventory = maint.parse_inventory(a.get("batteries"))
         self.plants = plants.parse_plants(a.get("plants"))
         self.timed_plants = plants.parse_timed(a.get("plants"))
+        self.once_tasks = once.parse_once(a.get("once"))
 
         self._notifier = self.get_app("MobileNotifier")
 
@@ -130,8 +132,10 @@ class HouseUpcoming(hass.Hass):
         self._pushed = dict(saved.get("pushed") or {})
         self._facts = dict(saved.get("facts") or {})
         self._content = dict(saved.get("content") or {})
-        self._anchors = runs.valid_anchors(saved.get("done"), self.run_tasks,
-                                           [plants.anchor_key(plant) for plant in self.timed_plants.values()])
+        self._anchors = runs.valid_anchors(
+            saved.get("done"), self.run_tasks,
+            [plants.anchor_key(plant) for plant in self.timed_plants.values()]
+            + [once.anchor_key(task) for task in self.once_tasks.values()])
         self._ledger_files = {}
         self._state_text = None
         self._state_written_at = None
@@ -158,7 +162,7 @@ class HouseUpcoming(hass.Hass):
         self._evaluate(publish=True)
         self.log(f"HouseUpcoming initialized - {len(self.inventory['devices'])} battery devices, "
                  f"{len(self.plants)} plants, {len(self.timed_plants)} timed plants, "
-                 f"{len(self._sources())} sources, {self._row_count} rows")
+                 f"{len(self.once_tasks)} one-off tasks, {len(self._sources())} sources, {self._row_count} rows")
 
     def terminate(self):
         self._save_state(force=True)
@@ -220,13 +224,28 @@ class HouseUpcoming(hass.Hass):
     def _on_plugin_started(self, event_name, data, kwargs):
         self._evaluate(publish=True)
 
-    def _on_done(self, event_name, data, kwargs):
-        row = (data or {}).get("row")
+    def _calendar_item(self, row):
+        """(anchor key, what the log calls it, whether it is done for good) of the plant watered by the
+        calendar or the one-off task whose row id is `row`, None for any other id."""
         plant = plants.timed_by_row(row, self.timed_plants)
         if plant:
+            return plants.anchor_key(plant), f"water the {plant['name']}", False
+        job = once.by_row(row, self.once_tasks)
+        if job:
+            return once.anchor_key(job), job["title"], once.is_done(self._anchors.get(once.anchor_key(job)))
+        return None
+
+    def _on_done(self, event_name, data, kwargs):
+        row = (data or {}).get("row")
+        item = self._calendar_item(row)
+        if item:
+            key, label, closed = item
+            if closed:
+                self.log(f"Done ignored: {row!r} is done already", level="WARNING")
+                return
             now = self.get_now()
-            self._anchors = runs.mark_done(self._anchors, plants.anchor_key(plant), now)
-            self.log(f"Done: water the {plant['name']}")
+            self._anchors = runs.mark_done(self._anchors, key, now)
+            self.log(f"Done: {label}")
             self._after_anchor_change("done", row, now)
             return
         task = runs.tapped_task(row, self.run_tasks)
@@ -241,15 +260,15 @@ class HouseUpcoming(hass.Hass):
 
     def _on_undo(self, event_name, data, kwargs):
         row = (data or {}).get("row")
-        plant = plants.timed_by_row(row, self.timed_plants)
-        task = None if plant else runs.tapped_task(row, self.run_tasks)
-        key = plants.anchor_key(plant) if plant else task.key if task else None
+        item = self._calendar_item(row)
+        task = None if item else runs.tapped_task(row, self.run_tasks)
+        key = item[0] if item else task.key if task else None
         if key is None or not isinstance((self._anchors.get(key) or {}).get("prev"), dict):
             self.log(f"Undo ignored: {row!r} has nothing to undo", level="WARNING")
             return
         self._anchors = runs.undo_done(self._anchors, key)
-        self.log("Done undone: " + (f"water the {plant['name']}" if plant else task.title))
-        self._after_anchor_change("undo", row, self.get_now(), None if plant else {"runs": None})
+        self.log("Done undone: " + (item[1] if item else task.title))
+        self._after_anchor_change("undo", row, self.get_now(), None if item else {"runs": None})
 
     def _after_anchor_change(self, event, row, now, extra=None):
         self._append_done_log({"event": event, "row": row, "at": core.utc_iso(now), **(extra or {})})
@@ -282,6 +301,7 @@ class HouseUpcoming(hass.Hass):
         found = maint.rober2_rows(self._rober2, self.rober2_area, left, self._rober2_rate, now)
         found += self._run_rows(now)
         found += self._timed_plant_rows(now)
+        found += self._once_rows(now)
         for entity, device in self.inventory["devices"].items():
             cached = self._cache.get(entity)
             if cached is None:
@@ -340,6 +360,13 @@ class HouseUpcoming(hass.Hass):
             self._save_state(force=True)
         return [plants.timed_row(plant, self._anchors.get(plants.anchor_key(plant)), now)
                 for plant in self.timed_plants.values()]
+
+    def _once_rows(self, now):
+        anchors = once.seed(self._anchors, self.once_tasks, now)
+        if anchors != self._anchors:
+            self._anchors = anchors
+            self._save_state(force=True)
+        return [once.once_row(task, self._anchors.get(once.anchor_key(task)), now) for task in self.once_tasks.values()]
 
     def _ledgers(self):
         """{appliance: run_ledger.Ledger} of the feedback files. A file is read again only once it has
