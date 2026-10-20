@@ -25,7 +25,8 @@ start is now.
 A task without an interval is a log: its row counts the runs since it was last logged, is untimed and
 out of the next chip, is never due and never pushed. The dryer's plinth filter is one until the
 dryer's interval_runs is configured (house_upcoming.yaml), when it is a tapped task like the others.
-Every row opens a sheet with what to do (upcoming_guides).
+Every row opens a sheet with what to do (upcoming_guides). The houseplants watered by the calendar
+(upcoming_plants) keep their anchors, Done and undo here too.
 """
 
 from datetime import datetime, timedelta
@@ -113,10 +114,10 @@ def tapped_task(row, tasks=TASKS):
     return None
 
 
-def valid_anchors(raw, tasks=TASKS):
-    """The saved anchors that are for a tapped task and carry a time."""
+def valid_anchors(raw, tasks=TASKS, extra=()):
+    """The saved anchors that are for a tapped task, or for one of the `extra` keys, and carry a time."""
     raw = raw if isinstance(raw, dict) else {}
-    keys = {task.key for task in tasks if task.confirmed is None}
+    keys = {task.key for task in tasks if task.confirmed is None} | set(extra)
     return {key: anchor for key, anchor in raw.items()
             if key in keys and isinstance(anchor, dict) and parse_iso(anchor.get("at")) is not None}
 
@@ -130,9 +131,10 @@ def seed(anchors, ledgers, now, tasks=TASKS):
     return out
 
 
-def mark_done(anchors, key, now, runs):
-    """Done at `now`, when the ledger held `runs` runs; the anchor it replaces is kept for undo_done."""
-    anchor = {"at": utc_iso(now), "runs": runs}
+def mark_done(anchors, key, now, runs=None):
+    """Done at `now`, when the ledger held `runs` runs if there is one; the anchor it replaces is kept
+    for undo_done."""
+    anchor = {"at": utc_iso(now)} if runs is None else {"at": utc_iso(now), "runs": runs}
     previous = anchors.get(key)
     if isinstance(previous, dict):
         anchor["prev"] = {k: v for k, v in previous.items() if k != "prev"}

@@ -1,5 +1,6 @@
 # tests/test_upcoming_plants.py - watering reminders for sensor.house_upcoming: the dry latch and its
-# hysteresis, the row with the litres to pour and its push key, and the plants list of house_upcoming.yaml.
+# hysteresis, the row with the litres to pour and its push key, the plants watered by the calendar, and
+# the plants list of house_upcoming.yaml.
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
 import sys
@@ -18,6 +19,8 @@ DAY = timedelta(days=1)
 ENTITY = "sensor.strelitzia_moisture"
 RAW = [{"moisture": ENTITY, "name": "Strelitzia", "area": "dining_room", "dry": 15}]
 PLANT = plants.parse_plants(RAW)[ENTITY]
+CAL = [{"name": "Monstera", "area": "kitchen", "water": 1, "every_days": 10}]
+MONSTERA = plants.parse_timed(CAL)["monstera"]
 
 
 def feed(readings, st=None, plant=PLANT):
@@ -254,6 +257,155 @@ class ParseTests(unittest.TestCase):
         for dry, expected in ((15, 15.0), (17.5, 17.5), (0, 0.0)):
             [plant] = plants.parse_plants([{**RAW[0], "dry": dry}]).values()
             self.assertEqual(plant["dry"], expected, dry)
+
+
+class CalendarParseTests(unittest.TestCase):
+    def test_a_calendar_plant_is_its_name_room_litres_and_interval(self):
+        self.assertEqual(plants.parse_timed(CAL),
+                         {"monstera": {"name": "Monstera", "slug": "monstera", "area": "kitchen", "water": 1.0,
+                                       "every_days": 10}})
+        self.assertEqual(plants.parse_timed([{"name": "Aloe", "every_days": 35}])["aloe"],
+                         {"name": "Aloe", "slug": "aloe", "area": None, "water": None, "every_days": 35})
+
+    def test_each_kind_of_plant_is_found_in_a_mixed_list_in_the_order_of_the_lines(self):
+        raw = [CAL[0], RAW[0], {"name": "Aloe", "every_days": 35}]
+        self.assertEqual(list(plants.parse_plants(raw)), [ENTITY])
+        self.assertEqual(list(plants.parse_timed(raw)), ["monstera", "aloe"])
+        self.assertEqual(plants.parse_plants(CAL), {})
+        self.assertEqual(plants.parse_timed(RAW), {})
+
+    def test_a_plant_has_exactly_one_of_moisture_and_every_days(self):
+        both = {**RAW[0], "every_days": 10}
+        neither = {"name": "Monstera", "area": "kitchen", "water": 1}
+        for cfg in (both, neither, {**CAL[0], "moisture": None, "every_days": None}):
+            for parse in (plants.parse_plants, plants.parse_timed):
+                with self.assertRaises(ValueError, msg=cfg):
+                    parse([cfg])
+
+    def test_every_days_is_a_whole_number_of_days_above_zero(self):
+        for days, expected in ((1, 1), (7, 7), (35, 35), (10.0, 10)):
+            self.assertEqual(plants.parse_timed([{**CAL[0], "every_days": days}])["monstera"]["every_days"], expected)
+        for bad in (0, -1, 0.5, 3.5, "weekly", "", True, False, float("nan"), float("inf"), [], {}):
+            for parse in (plants.parse_plants, plants.parse_timed):
+                with self.assertRaises(ValueError, msg=bad):
+                    parse([{**CAL[0], "every_days": bad}])
+
+    def test_dry_goes_with_a_sensor_and_water_is_checked_for_both_kinds(self):
+        for cfg in ({**CAL[0], "dry": 20}, {**CAL[0], "water": 0}, {**CAL[0], "water": "lots"},
+                    {**CAL[0], "water": -1}):
+            with self.assertRaises(ValueError, msg=cfg):
+                plants.parse_timed([cfg])
+        self.assertIsNone(plants.parse_timed([{**CAL[0], "water": None}])["monstera"]["water"])
+
+    def test_a_name_is_unique_across_both_kinds_because_the_row_id_is(self):
+        for raw in ([RAW[0], {**CAL[0], "name": "strelitzia"}], [CAL[0], {**CAL[0], "name": "MONSTERA!"}],
+                    [CAL[0], {**RAW[0], "name": "Monstera"}]):
+            for parse in (plants.parse_plants, plants.parse_timed):
+                with self.assertRaises(ValueError, msg=raw):
+                    parse(raw)
+
+
+class CalendarRowTests(unittest.TestCase):
+    """Dates in house time: 22:00 on 20.10.2026 (summer time) and, from 25.10, winter time."""
+
+    NOW = datetime(2026, 10, 20, 20, 0, tzinfo=timezone.utc)
+
+    @staticmethod
+    def anchor(at, **extra):
+        return {"at": core.utc_iso(at), **extra}
+
+    def row(self, anchor, now=None, plant=MONSTERA):
+        return plants.timed_row(plant, anchor, now or self.NOW)
+
+    def test_seeding_adds_a_seed_at_now_for_each_plant_without_an_anchor_and_keeps_the_others(self):
+        aloe = plants.parse_timed([{"name": "Aloe", "every_days": 35}])["aloe"]
+        kept = {"plant:aloe": self.anchor(self.NOW - 3 * DAY)}
+        seeded = plants.seed_timed(kept, {"monstera": MONSTERA, "aloe": aloe}, self.NOW)
+        self.assertEqual(seeded, {"plant:aloe": kept["plant:aloe"], "plant:monstera": self.anchor(self.NOW, seed=True)})
+        self.assertEqual(plants.seed_timed(seeded, {"monstera": MONSTERA}, self.NOW + DAY), seeded)
+        self.assertEqual(kept, {"plant:aloe": self.anchor(self.NOW - 3 * DAY)})
+
+    def test_a_plant_is_found_by_its_row_id_and_nothing_else_is(self):
+        timed = {"monstera": MONSTERA}
+        self.assertIs(plants.timed_by_row("maint:plant:monstera", timed), MONSTERA)
+        for other in ("maint:plant:strelitzia", "maint:monstera", "plant:monstera", "", None, 5):
+            self.assertIsNone(plants.timed_by_row(other, timed), other)
+
+    def test_before_the_due_day_the_row_is_dated_at_nine_house_time_and_not_pushed(self):
+        row, key = self.row(self.anchor(self.NOW, seed=True))
+        self.assertEqual((row["id"], row["kind"], row["title"], row["detail"]),
+                         ("maint:plant:monstera", "maint", "Water the Monstera: 1 L", "10 days left, 30.10"))
+        self.assertEqual((row["at"], row["icon"], row["area"], row["audience"], row["done"]),
+                         ("2026-10-30T08:00:00+00:00", "mdi:watering-can-outline", "kitchen", "admin", "tap"))
+        self.assertEqual(row["info"], ["Every 10 days", "Counting from 20.10"])
+        self.assertNotIn("next", row)
+        self.assertNotIn("steps", row)
+        self.assertIsNone(key)
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_summer_time_and_winter_time_move_the_utc_time_not_the_house_time(self):
+        week = plants.parse_timed([{"name": "Lily", "every_days": 4}])["lily"]
+        self.assertEqual(self.row(self.anchor(self.NOW), plant=week)[0]["at"], "2026-10-24T07:00:00+00:00")
+        self.assertEqual(self.row(self.anchor(self.NOW + DAY), plant=week)[0]["at"], "2026-10-25T08:00:00+00:00")
+        self.assertEqual(self.row(self.anchor(self.NOW + 2 * DAY), plant=week)[0]["at"], "2026-10-26T08:00:00+00:00")
+
+    def test_the_days_are_house_days_not_twenty_four_hours(self):
+        daily = plants.parse_timed([{"name": "Fern", "every_days": 1}])["fern"]
+        late = datetime(2026, 10, 20, 21, 30, tzinfo=timezone.utc)
+        row, key = self.row(self.anchor(late), late + timedelta(minutes=40), daily)
+        self.assertEqual(row["detail"], "due today")
+        self.assertEqual(row["info"][0], "Every day")
+        self.assertIsNotNone(key)
+        row, key = self.row(self.anchor(late), late - timedelta(hours=2), daily)
+        self.assertEqual((row["detail"], row["at"]), ("1 day left, 21.10", "2026-10-21T07:00:00+00:00"))
+
+    def test_from_the_due_day_the_row_is_untimed_due_and_pushed_once_per_anchor(self):
+        seed = self.anchor(self.NOW, seed=True)
+        today, key = self.row(seed, self.NOW + 10 * DAY)
+        self.assertEqual(today["detail"], "due today")
+        self.assertNotIn("at", today)
+        self.assertEqual(key, f"plant:monstera:{core.utc_iso(self.NOW)}")
+        late, same = self.row(seed, self.NOW + 13 * DAY)
+        self.assertEqual(late["detail"], "due since 30.10")
+        self.assertEqual(same, key)
+        self.assertEqual(late["done"], "tap")
+        self.assertTrue(core.is_valid_row(late))
+        watered = self.anchor(self.NOW + 13 * DAY)
+        again, new_key = self.row(watered, self.NOW + 13 * DAY)
+        self.assertNotIn("due", again["detail"])
+        self.assertIsNone(new_key)
+        self.assertNotEqual(self.row(watered, self.NOW + 24 * DAY)[1], key)
+
+    def test_the_sheet_says_when_it_was_done_and_how_long_ago(self):
+        done = self.anchor(self.NOW - 3 * DAY)
+        self.assertEqual(self.row(done)[0]["info"], ["Every 10 days", "Done 17.10, 3 days ago"])
+        self.assertEqual(self.row(self.anchor(self.NOW - DAY))[0]["info"][1], "Done 19.10, 1 day ago")
+        self.assertEqual(self.row(self.anchor(self.NOW))[0]["info"][1], "Done 20.10, today")
+        seeded_again = self.anchor(self.NOW, seed=True, prev={"at": "x"})
+        self.assertEqual(self.row(seeded_again)[0]["info"][1], "Counting from 20.10")
+
+    def test_a_date_in_another_year_carries_it(self):
+        row, _ = self.row(self.anchor(datetime(2026, 12, 28, 12, 0, tzinfo=timezone.utc)),
+                          datetime(2026, 12, 28, 12, 0, tzinfo=timezone.utc))
+        self.assertEqual(row["detail"], "10 days left, 07.01.27")
+        self.assertEqual(row["at"], "2027-01-07T08:00:00+00:00")
+
+    def test_without_an_anchor_or_with_a_broken_one_there_is_no_row(self):
+        for anchor in (None, {}, {"at": "soon"}, {"at": 5}):
+            self.assertIsNone(self.row(anchor), anchor)
+
+    def test_the_title_carries_the_litres_when_there_are_some(self):
+        bare = plants.parse_timed([{"name": "Aloe", "every_days": 35}])["aloe"]
+        small = plants.parse_timed([{"name": "Aloe", "water": 0.25, "every_days": 35}])["aloe"]
+        self.assertEqual(self.row(self.anchor(self.NOW), plant=bare)[0]["title"], "Water the Aloe")
+        self.assertEqual(self.row(self.anchor(self.NOW), plant=small)[0]["title"], "Water the Aloe: 0.25 L")
+
+    def test_the_digest_names_a_due_plant_once_an_episode(self):
+        seed = self.anchor(self.NOW, seed=True)
+        row, key = self.row(seed, self.NOW + 11 * DAY)
+        found = maint.digest([(row["title"], key)], {})
+        self.assertEqual((found["message"], found["keys"]), ("Water the Monstera: 1 L", [key]))
+        self.assertIsNone(maint.digest([(row["title"], key)], {key: core.utc_iso(self.NOW + 11 * DAY)}))
 
 
 class SavedLatchTests(unittest.TestCase):

@@ -1,25 +1,33 @@
-"""Watering reminders for sensor.house_upcoming: one row for each houseplant whose soil is dry. Pure:
-each step takes the persisted latch and returns new state.
+"""Watering reminders for sensor.house_upcoming: one row for each houseplant that needs water. Pure:
+each step takes the persisted state and returns new state.
 
-A plant (the `plants` list in house_upcoming.yaml) is dry once its soil moisture reading, in percent,
-is at or under its `dry`, and stays dry until a reading is CLOSE_MARGIN above it: watering makes the
-reading jump, while a reading wandering around `dry` never flaps the row. A reading that is unknown,
-unavailable or not a number changes nothing and has no row; a sensor that stays offline is the battery
-inventory's to report.
+A plant (the `plants` list in house_upcoming.yaml) has either a soil moisture sensor, `moisture`, or a
+calendar interval, `every_days`, never both, and optionally a `water` amount in litres. The row's title
+is "Water the <name>: <litres> L", and gives up name characters before it gives up the amount.
 
-A dry plant's row is admin only and untimed, like an open battery condition. It has no Done button, the
-moisture rising closes it, and its push key is unique per episode: the time the latch opened. A plant
-with a `water` amount in litres says how much to pour in the title, which gives up name characters
-before it gives up the amount.
+A sensor plant is dry once its soil moisture reading, in percent, is at or under its `dry`, and stays dry
+until a reading is CLOSE_MARGIN above it: watering makes the reading jump, while a reading wandering
+around `dry` never flaps the row. A reading that is unknown, unavailable or not a number changes nothing
+and has no row; a sensor that stays offline is the battery inventory's to report. A dry plant's row is
+admin only and untimed, like an open battery condition. It has no Done button, the moisture rising
+closes it, and its push key is unique per episode: the time the latch opened.
+
+A calendar plant is a tapped task counted in days, like the dishwasher's filters (upcoming_runs, whose
+anchors, Done and undo it uses): the anchor says when it was last watered, seeded at the moment the plant
+is first seen. Its row is timed at DUE_TIME on the house day that is `every_days` after the anchor's, so
+it reads as upcoming until then; once that day has come the row is untimed and due, with a push key
+for the episode, which is the anchor's time. A Done tap starts the interval over.
 """
 
 import re
 import unicodedata
+from datetime import datetime, timedelta
 
 from upcoming_core import TEXT_MAX, clean_text, make_row, utc_iso
-from upcoming_maint import parse_iso, reading
+from upcoming_maint import DUE_TIME, HOUSE_TZ, ddmm, fit_parts, house_date, parse_iso, reading
 
 ID_PREFIX = "maint:plant:"
+ANCHOR_PREFIX = "plant:"
 ICON = "mdi:watering-can-outline"
 CLOSE_MARGIN = 5
 
@@ -30,29 +38,53 @@ def slug(name):
     return re.sub(r"[^a-z0-9]+", "_", ascii_name.lower()).strip("_")
 
 
-def parse_plants(raw):
-    """The `plants` list of house_upcoming.yaml, validated, as {moisture entity: plant}. Raises
-    ValueError on a plant without a moisture entity, a name with no letters or digits, a `dry` that is
-    not a number, a `water` that is given but not a positive number, or an entity or name listed twice,
-    so a typo fails at start instead of silently dropping a plant."""
-    plants = {}
+def _parse(raw):
+    sensor, calendar, slugs = {}, {}, set()
     for cfg in raw or []:
         cfg = cfg if isinstance(cfg, dict) else {}
-        entity, name, dry = cfg.get("moisture"), str(cfg.get("name") or "").strip(), reading(cfg.get("dry"))
-        key, water = slug(name), cfg.get("water")
-        litres = reading(water)
-        if not isinstance(entity, str) or not entity:
-            raise ValueError(f"plant {name!r}: missing moisture entity")
+        entity, days, water = cfg.get("moisture"), cfg.get("every_days"), cfg.get("water")
+        name = str(cfg.get("name") or "").strip()
+        who, key, litres = f"plant {name or cfg!r}", slug(name), reading(water)
         if not key:
-            raise ValueError(f"plant {entity}: the name needs letters or digits")
-        if dry is None:
-            raise ValueError(f"plant {entity}: dry must be a number, not {cfg.get('dry')!r}")
+            raise ValueError(f"{who}: the name needs letters or digits")
+        if (entity is None) == (days is None):
+            raise ValueError(f"{who}: give exactly one of moisture and every_days")
         if water is not None and (litres is None or litres <= 0):
-            raise ValueError(f"plant {entity}: water must be a positive number of litres, not {water!r}")
-        if entity in plants or key in {plant["slug"] for plant in plants.values()}:
-            raise ValueError(f"plant {entity}: entity or name listed twice")
-        plants[entity] = {"name": name, "slug": key, "area": cfg.get("area") or None, "dry": dry, "water": litres}
-    return plants
+            raise ValueError(f"{who}: water must be a positive number of litres, not {water!r}")
+        if key in slugs:
+            raise ValueError(f"{who}: name listed twice")
+        slugs.add(key)
+        plant = {"name": name, "slug": key, "area": cfg.get("area") or None, "water": litres}
+        if entity is None:
+            interval = reading(days)
+            if interval is None or interval < 1 or interval != int(interval):
+                raise ValueError(f"{who}: every_days must be a whole number of days above zero, not {days!r}")
+            if cfg.get("dry") is not None:
+                raise ValueError(f"{who}: dry goes with moisture, not every_days")
+            calendar[key] = {**plant, "every_days": int(interval)}
+            continue
+        dry = reading(cfg.get("dry"))
+        if not isinstance(entity, str) or not entity or entity in sensor:
+            raise ValueError(f"{who}: moisture must be a sensor entity id, listed once")
+        if dry is None:
+            raise ValueError(f"{who}: dry must be a number, not {cfg.get('dry')!r}")
+        sensor[entity] = {**plant, "dry": dry}
+    return sensor, calendar
+
+
+def parse_plants(raw):
+    """The sensor plants of the `plants` list of house_upcoming.yaml, validated, as {moisture entity:
+    plant}. Raises ValueError on a plant that has no name with letters or digits, does not have exactly
+    one of `moisture` and `every_days`, has a `dry` that is not a number or a `water` that is given but
+    not a positive number, or lists an entity or name twice, so a typo fails at start instead of silently
+    dropping a plant."""
+    return _parse(raw)[0]
+
+
+def parse_timed(raw):
+    """The calendar plants of the same list, as {slug: plant}, under the same checks, and `every_days`
+    has to be a whole number of days above zero and `dry` left out."""
+    return _parse(raw)[1]
 
 
 def valid_latches(raw, plants):
@@ -63,7 +95,7 @@ def valid_latches(raw, plants):
 
 
 def step_plant(st, plant, value, now):
-    """One observation of a plant: `value` is its soil moisture reading or None. The latch is
+    """One observation of a sensor plant: `value` is its soil moisture reading or None. The latch is
     {"since": when it opened} while the plant is dry and {} while it is not."""
     st = dict(st or {})
     if value is None:
@@ -87,7 +119,7 @@ def _title(plant):
 
 
 def plant_row(entity, plant, st, value):
-    """(row, push key) while the plant is dry and its reading is known, else None."""
+    """(row, push key) while the sensor plant is dry and its reading is known, else None."""
     st = st or {}
     if "since" not in st or value is None:
         return None
@@ -95,3 +127,51 @@ def plant_row(entity, plant, st, value):
                    f"soil {_percent(value)}, water at {_percent(plant['dry'])}", icon=ICON, area=plant["area"],
                    audience="admin")
     return row, f"plant:{entity}:{st['since']}"
+
+
+# ---------------------------------------------------------------- calendar plants
+
+
+def anchor_key(plant):
+    return ANCHOR_PREFIX + plant["slug"]
+
+
+def timed_by_row(row, calendar):
+    """The calendar plant whose row id is `row`, None for any other id."""
+    return next((plant for plant in calendar.values() if ID_PREFIX + plant["slug"] == row), None)
+
+
+def seed_timed(anchors, calendar, now):
+    """`anchors` plus a seed at `now` for every calendar plant that has none."""
+    out = dict(anchors)
+    for plant in calendar.values():
+        out.setdefault(anchor_key(plant), {"at": utc_iso(now), "seed": True})
+    return out
+
+
+def _days(count):
+    return f"{count} day{'' if count == 1 else 's'}"
+
+
+def timed_row(plant, anchor, now):
+    """(row, push key) for a calendar plant, None without an anchor. Dated and without a key while its
+    due day is ahead; untimed, due and with a key for the anchor's episode from that day on."""
+    when = parse_iso((anchor or {}).get("at"))
+    if when is None:
+        return None
+    interval = plant["every_days"]
+    due = house_date(when) + timedelta(days=interval)
+    left = (due - house_date(now)).days
+    since = max(0, (house_date(now) - house_date(when)).days)
+    if left > 0:
+        at, key = datetime.combine(due, DUE_TIME, HOUSE_TZ), None
+        detail = fit_parts([f"{_days(left)} left", ddmm(due, now)])
+    else:
+        at, key = None, f"{anchor_key(plant)}:{utc_iso(when)}"
+        detail = "due today" if left == 0 else f"due since {ddmm(due, now)}"
+    last = (f"Counting from {ddmm(when, now)}" if anchor.get("seed")
+            else f"Done {ddmm(when, now)}, {'today' if since == 0 else f'{_days(since)} ago'}")
+    row = make_row(ID_PREFIX + plant["slug"], "maint", _title(plant), detail, at=at, icon=ICON, area=plant["area"],
+                   audience="admin", tap_done=True,
+                   info=["Every day" if interval == 1 else f"Every {interval} days", last])
+    return row, key

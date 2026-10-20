@@ -141,6 +141,13 @@ class SeedTests(unittest.TestCase):
         anchors = runs.seed({}, {"washer": run_ledger.ledger([])}, NOW)
         self.assertEqual(set(anchors), {"washer:inlet"})
 
+    def test_extra_keys_let_other_tapped_rows_keep_their_anchors(self):
+        raw = {"plant:monstera": {"at": "2026-10-14T10:00:00+00:00", "seed": True}, "plant:gone": {"at": "soon"},
+               "dishwasher:filters": {"at": "2026-09-01T10:00:00+00:00", "runs": 10}}
+        self.assertEqual(set(runs.valid_anchors(raw, extra=["plant:monstera", "plant:gone"])),
+                         {"plant:monstera", "dishwasher:filters"})
+        self.assertEqual(set(runs.valid_anchors(raw)), {"dishwasher:filters"})
+
     def test_seeding_twice_changes_nothing(self):
         once = runs.seed({}, ledgers(), NOW)
         self.assertEqual(runs.seed(once, ledgers(), NOW + DAY), once)
@@ -242,6 +249,13 @@ class DoneTests(unittest.TestCase):
                          {"at": core.utc_iso(NOW), "runs": 50, "prev": seed["dishwasher:filters"]})
         self.assertEqual(runs.statuses(led, done, NOW)["dishwasher:filters"].since, 0)
         self.assertEqual(done["dishwasher:check"], seed["dishwasher:check"])
+
+    def test_a_done_without_a_run_count_has_none_stored(self):
+        first = runs.mark_done({}, "plant:monstera", NOW - DAY)
+        second = runs.mark_done(first, "plant:monstera", NOW)
+        self.assertEqual(first["plant:monstera"], {"at": core.utc_iso(NOW - DAY)})
+        self.assertEqual(second["plant:monstera"], {"at": core.utc_iso(NOW), "prev": first["plant:monstera"]})
+        self.assertEqual(runs.undo_done(second, "plant:monstera"), first)
 
     def test_a_second_done_keeps_only_the_one_before_it(self):
         first = runs.mark_done({}, "washer:inlet", NOW - DAY, 29)
