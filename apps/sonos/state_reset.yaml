@@ -33,18 +33,18 @@ SonosStateReset:
 
   # Target volumes per speaker
   speaker_volumes:
-    media_player.bathroom: 0.24
-    media_player.bedroom: 0.18
-    media_player.dining_room: 0.18
-    media_player.kitchen: 0.20       # one notch above the dining room
-    media_player.living_room: 0.20   # Arc Ultra: Era-100 default (0.18) + 2 — it is a far bigger unit (user 2026-07-08)
-    media_player.guest_bathroom: 0.24
-    media_player.kristines_room: 0.18
-    media_player.claudias_room: 0.18
-    media_player.rooftop: 0.18
+    media_player.bathroom: 0.21
+    media_player.bedroom: 0.15
+    media_player.dining_room: 0.15
+    media_player.kitchen: 0.17       # one notch above the dining room
+    media_player.living_room: 0.17   # Arc Ultra: Era-100 default (0.15) + 2 — it is a far bigger unit (user 2026-07-08)
+    media_player.guest_bathroom: 0.21
+    media_player.kristines_room: 0.15
+    media_player.claudias_room: 0.15
+    media_player.rooftop: 0.15
 
   # Fallback if a speaker isn't in the above map
-  default_volume: 0.18
+  default_volume: 0.15
 
   # Reset performance controls (optional)
   # Minimum wait after last unjoin before the first solo poll (poll loop is authoritative).
