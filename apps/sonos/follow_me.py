@@ -268,7 +268,7 @@ class SonosFollowMe(hass.Hass):
         try:
             reset_app = self.get_app("SonosStateReset")
             volumes = getattr(reset_app, "speaker_volumes", None) or {}
-            default = float(getattr(reset_app, "default_volume", 0.15))
+            default = float(getattr(reset_app, "default_volume", 0.12))
             return float(volumes.get(entity_id, default))
         except Exception:
             return 0.18
