@@ -1,7 +1,8 @@
 # tests/test_house_upcoming.py - HouseUpcoming end to end on a fake AppDaemon surface, with the real
 # house_upcoming.yaml: lease, state acquisition, restart behaviour, the daily push, rain fetches,
 # the drum clean's cheapest start, the run-based appliance tasks (the feedback ledgers, the seed, Done
-# and undo), the history job, replace-by days, Rober2's dated parts and the battery inventory.
+# and undo), the history job, replace-by days, Rober2's dated parts, the plants' watering rows and the
+# battery inventory.
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
 import asyncio
@@ -34,8 +35,14 @@ import house_upcoming as hu  # noqa: E402
 import upcoming_core as core  # noqa: E402
 import upcoming_guides as guides  # noqa: E402
 import upcoming_maint as maint  # noqa: E402
+import upcoming_plants as plants  # noqa: E402
 
 CONFIG = yaml.safe_load((APPS / "home_pulse" / "house_upcoming.yaml").read_text())["HouseUpcoming"]
+PLANTS = plants.parse_plants(CONFIG["plants"])
+SAMPLE_PLANT = {"moisture": "sensor.strelitzia_moisture", "name": "Strelitzia", "area": "dining_room", "dry": 15}
+MOISTURE = SAMPLE_PLANT["moisture"]
+AREAS = {"bathroom", "bedroom", "dining_room", "guest_bathroom", "hallway", "kitchen", "kristines_room",
+         "living_room", "office", "rooftop"}
 NOW = datetime(2026, 10, 14, 10, 30, tzinfo=timezone.utc)
 MIN = timedelta(minutes=1)
 HOUR = timedelta(hours=1)
@@ -85,6 +92,8 @@ def base_states():
     states["binary_sensor.weather_opening_alert_rooftop_rain"] = full("off")
     states["binary_sensor.rooftop_door_1_contact"] = full("off")
     states["binary_sensor.rooftop_door_2_contact"] = full("off")
+    for entity, plant in PLANTS.items():
+        states[entity] = full(f"{plant['dry'] + 20:g}")
     return states
 
 
@@ -229,6 +238,10 @@ def last(app):
 
 def rows(app):
     return {row["id"]: row for row in last(app)["attributes"]["rows"]}
+
+
+def plant_rows(app):
+    return {key: row for key, row in rows(app).items() if key.startswith("maint:plant:")}
 
 
 class PublishTests(unittest.TestCase):
@@ -1100,34 +1113,206 @@ class Rober2EstimateTests(unittest.TestCase):
         self.assertEqual(app.notifier.sent, [])
 
 
+class PlantTests(unittest.TestCase):
+    """Houseplants: a soil moisture sensor opens the plant's watering row at or under its dry level and
+    closes it five points above; the daily push names it once an episode. The behaviour tests run on
+    SAMPLE_PLANT whatever the yaml lists, and the last one runs every plant the yaml lists."""
+
+    ROW = "maint:plant:strelitzia"
+    UNREADABLE = ("unavailable", "unknown", "", "n/a")
+
+    @staticmethod
+    def states(moisture="35"):
+        states = base_states()
+        states[MOISTURE] = full(moisture)
+        return states
+
+    def make(self, states=None, **args):
+        return make_app(self.states() if states is None else states, **{"plants": [SAMPLE_PLANT], **args})
+
+    def push(self, app):
+        app._on_push_time({})
+        drain(app)
+
+    def test_the_sensor_is_a_listened_source_and_a_wet_plant_has_no_row(self):
+        app = self.make()
+        self.assertIn((MOISTURE, {"attribute": "all"}), app.listened)
+        self.assertNotIn(self.ROW, rows(app))
+        self.assertNotIn("Plant moisture sensors HA does not have", " ".join(msg for _, msg in app.logs))
+
+    def test_a_dry_reading_opens_an_admin_row_in_the_plants_room(self):
+        app = self.make()
+        fire(app, MOISTURE, full("12"))
+        row = rows(app)[self.ROW]
+        self.assertEqual((row["kind"], row["title"], row["detail"], row["icon"], row["area"], row["audience"]),
+                         ("maint", "Water the Strelitzia", "soil 12%, water at 15%", "mdi:watering-can-outline",
+                          "dining_room", "admin"))
+        self.assertEqual(set(row) & {"at", "next", "done", "info", "steps", "warn"}, set())
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_the_row_closes_only_five_points_above_dry(self):
+        app = self.make()
+        for state, detail in (("15", "soil 15%"), ("16", "soil 16%"), ("19", "soil 19%"), ("12", "soil 12%"),
+                              ("17", "soil 17%")):
+            fire(app, MOISTURE, full(state))
+            self.assertEqual(rows(app)[self.ROW]["detail"], f"{detail}, water at 15%", state)
+        for state, shown in (("20", False), ("16", False), ("15", True), ("20", False), ("100", False)):
+            fire(app, MOISTURE, full(state))
+            self.assertEqual(self.ROW in rows(app), shown, state)
+
+    def test_an_unreadable_reading_changes_nothing_and_has_no_row(self):
+        app = self.make()
+        for state in self.UNREADABLE:
+            fire(app, MOISTURE, full(state))
+            self.assertNotIn(self.ROW, rows(app), state)
+            self.assertEqual(app._plant_latches[MOISTURE], {}, state)
+        fire(app, MOISTURE, full("12"))
+        latch = dict(app._plant_latches[MOISTURE])
+        self.assertEqual(list(latch), ["since"])
+        for state in self.UNREADABLE:
+            fire(app, MOISTURE, full(state))
+            self.assertNotIn(self.ROW, rows(app), state)
+            self.assertEqual(app._plant_latches[MOISTURE], latch, state)
+        fire(app, MOISTURE, full("17"))
+        self.assertEqual(rows(app)[self.ROW]["detail"], "soil 17%, water at 15%")
+
+    def test_the_latch_is_saved_with_the_rest_and_a_reload_does_not_push_again(self):
+        app = self.make()
+        fire(app, MOISTURE, full("12"))
+        self.push(app)
+        self.assertEqual([s["message"] for s in app.notifier.sent], ["Water the Strelitzia"])
+        saved = state_file(app)
+        self.assertEqual(saved["plants"], {MOISTURE: {"since": core.utc_iso(NOW)}})
+        self.assertIn(f"plant:{MOISTURE}:{core.utc_iso(NOW)}", saved["pushed"])
+        reloaded = self.make(app.states, state_dir=app.state_dir, now=app.now)
+        self.assertEqual(reloaded._plant_latches, app._plant_latches)
+        self.assertEqual(rows(reloaded)[self.ROW], rows(app)[self.ROW])
+        self.push(reloaded)
+        self.assertEqual(reloaded.notifier.sent, [])
+
+    def test_a_restart_that_finds_the_sensor_unavailable_keeps_the_latch_and_pushes_nothing_new(self):
+        app = self.make()
+        fire(app, MOISTURE, full("12"))
+        self.push(app)
+        tick(app, MIN)
+        app.states[MOISTURE] = full("unavailable")
+        reloaded = self.make(app.states, state_dir=app.state_dir, now=app.now)
+        self.assertNotIn(self.ROW, rows(reloaded))
+        fire(reloaded, MOISTURE, full("13"))
+        self.assertEqual(rows(reloaded)[self.ROW]["detail"], "soil 13%, water at 15%")
+        self.push(reloaded)
+        self.assertEqual(reloaded.notifier.sent, [])
+
+    def test_a_latch_that_was_open_before_a_restart_closes_on_the_first_wet_reading(self):
+        app = self.make()
+        fire(app, MOISTURE, full("12"))
+        tick(app, MIN)
+        app.states[MOISTURE] = full("40")
+        reloaded = self.make(app.states, state_dir=app.state_dir, now=app.now)
+        self.assertNotIn(self.ROW, rows(reloaded))
+        self.assertEqual(reloaded._plant_latches, {MOISTURE: {}})
+
+    def test_a_saved_latch_for_a_plant_no_longer_listed_is_dropped(self):
+        app = self.make()
+        fire(app, MOISTURE, full("12"))
+        tick(app, MIN)
+        self.assertIn("since", state_file(app)["plants"][MOISTURE])
+        reloaded = self.make(app.states, state_dir=app.state_dir, now=app.now, plants=[])
+        self.assertNotIn(self.ROW, rows(reloaded))
+        self.assertEqual(reloaded._plant_latches, {})
+
+    def test_pushed_once_an_episode_and_again_once_it_was_watered_and_dried_out(self):
+        app = self.make()
+        fire(app, MOISTURE, full("12"))
+        for _ in range(3):
+            self.push(app)
+            tick(app, DAY)
+        self.assertEqual(len(app.notifier.sent), 1)
+        fire(app, MOISTURE, full("30"))
+        tick(app, DAY)
+        self.push(app)
+        fire(app, MOISTURE, full("14"))
+        self.push(app)
+        self.assertEqual([s["message"] for s in app.notifier.sent], ["Water the Strelitzia"] * 2)
+
+    def test_the_push_names_it_with_the_other_conditions(self):
+        states = self.states("9")
+        states["sensor.rober2_filter_time_left"] = full("-19902")
+        app = self.make(states)
+        self.push(app)
+        self.assertEqual([(s["title"], s["message"]) for s in app.notifier.sent],
+                         [("Maintenance due", "Rober2 filter, Water the Strelitzia")])
+
+    def test_more_plants_are_more_lines_and_a_sensor_ha_does_not_have_is_named_at_start(self):
+        fern = {"moisture": "sensor.fern_moisture", "name": "Boston fern", "area": "kitchen", "dry": 30}
+        ficus = {"moisture": "sensor.ficus_moistur", "name": "Ficus", "dry": 20}
+        states = self.states()
+        states["sensor.fern_moisture"] = full("28")
+        app = self.make(states, plants=[SAMPLE_PLANT, fern, ficus])
+        shown = rows(app)
+        self.assertEqual((shown["maint:plant:boston_fern"]["detail"], shown["maint:plant:boston_fern"]["area"]),
+                         ("soil 28%, water at 30%", "kitchen"))
+        self.assertNotIn(self.ROW, shown)
+        self.assertNotIn("maint:plant:ficus", shown)
+        self.assertIn(("sensor.fern_moisture", {"attribute": "all"}), app.listened)
+        self.assertIn(("WARNING", "Plant moisture sensors HA does not have: sensor.ficus_moistur"), app.logs)
+        fire(app, "sensor.fern_moisture", full("40"))
+        self.assertNotIn("maint:plant:boston_fern", rows(app))
+
+    def test_a_typo_in_the_plants_fails_at_start(self):
+        with self.assertRaises(ValueError):
+            self.make(plants=[{**SAMPLE_PLANT, "dry": "wet"}])
+
+    def test_every_plant_the_yaml_lists_is_listened_to_and_has_its_own_row_that_opens_dry_and_closes_above(self):
+        self.assertIsInstance(CONFIG["plants"], list)
+        self.assertEqual(len(PLANTS), len(CONFIG["plants"]))
+        app = make_app()
+        self.assertEqual(plant_rows(app), {})
+        self.assertNotIn("Plant moisture sensors HA does not have", " ".join(msg for _, msg in app.logs))
+        for entity, plant in PLANTS.items():
+            self.assertIn((entity, {"attribute": "all"}), app.listened)
+            self.assertIn(plant["area"], AREAS, entity)
+            self.assertEqual(core.clean_text(plant["name"]), plant["name"], entity)
+            dry = f"{plant['dry']:g}"
+            fire(app, entity, full(dry))
+            row = plant_rows(app)[f"maint:plant:{plant['slug']}"]
+            self.assertEqual((row["title"], row["detail"], row.get("area")),
+                             (f"Water the {plant['name']}", f"soil {dry}%, water at {dry}%", plant["area"]), entity)
+            self.assertTrue(core.is_valid_row(row), entity)
+        self.assertEqual(len(plant_rows(app)), len(PLANTS))
+        for entity, plant in PLANTS.items():
+            fire(app, entity, full(f"{plant['dry'] + plants.CLOSE_MARGIN:g}"))
+        self.assertEqual(plant_rows(app), {})
+
+
 class InventoryTests(unittest.TestCase):
     INV = maint.parse_inventory(CONFIG["batteries"])
 
-    def test_forty_nine_devices_and_nine_exclusions_cover_every_live_battery_sensor(self):
-        self.assertEqual((len(self.INV["devices"]), len(self.INV["excluded"])), (50, 9))
+    def test_every_device_and_exclusion_line_is_kept_and_no_live_battery_sensor_is_unlisted(self):
+        self.assertEqual(len(self.INV["devices"]), len(CONFIG["batteries"]["devices"]))
+        self.assertEqual(len(self.INV["excluded"]), len(CONFIG["batteries"]["excluded"]))
         self.assertEqual(maint.unlisted_batteries(LIVE_BATTERIES, self.INV), [])
         self.assertEqual({d["model"] for d in self.INV["devices"].values()}, set(self.INV["models"]))
 
     def test_start_up_names_unlisted_battery_sensors(self):
         quiet = make_app()
-        self.assertIn(("INFO", "Battery inventory complete: 50 listed, 9 excluded"), quiet.logs)
+        done = f"Battery inventory complete: {len(self.INV['devices'])} listed, {len(self.INV['excluded'])} excluded"
+        self.assertIn(("INFO", done), quiet.logs)
         states = base_states()
         states["sensor.new_door_battery"] = full("100", {"device_class": "battery"})
         loud = make_app(states)
         self.assertIn(("WARNING", "Battery sensors neither listed nor excluded: sensor.new_door_battery"), loud.logs)
 
     def test_rooms_names_and_cell_types(self):
-        areas = {"bathroom", "bedroom", "dining_room", "guest_bathroom", "hallway", "kitchen", "kristines_room",
-                 "living_room", "office", "rooftop"}
         for entity, device in self.INV["devices"].items():
-            self.assertIn(device["area"], areas, entity)
+            self.assertIn(device["area"], AREAS, entity)
             self.assertEqual(core.clean_text(device["name"]), device["name"])
         cells = {key: model["cell"] for key, model in self.INV["models"].items()}
         self.assertEqual(cells, {
             "zg204zm": "LADDA AAA NiMH", "zg204zk": "LADDA AAA NiMH", "parasoll": "1x LADDA AAA NiMH",
             "sq610rfnh": "built-in rechargeable", "yale": "lithium AA (rechargeable)", "blind": "", "ws90": "2x AA",
             "twinguard": "6x AA alkaline", "fp300": "2x CR2450", "snzb04p": "CR2477", "snzb02p": "CR2477",
-            "zg102zm": "",
+            "zg102zm": "", "hhccjcy01": "CR2032",
         })
         actions = {key: model["action"] for key, model in self.INV["models"].items()}
         self.assertEqual({k for k, a in actions.items() if a == "charge"}, {"sq610rfnh", "blind"})
@@ -1135,12 +1320,30 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(self.INV["devices"]["sensor.yale_battery"]["history_from"].isoformat(), "2026-02-22")
         self.assertEqual(self.INV["devices"]["sensor.ecowitt_battery_8351"]["history_from"].isoformat(), "2026-08-30")
 
+    def test_the_plant_sensors_batteries_are_cr2032_cells_that_open_at_ten_percent_after_two_hours(self):
+        model = self.INV["models"]["hhccjcy01"]
+        self.assertEqual((model["cell"], model["action"], model["low"], model["trend"]),
+                         ("CR2032", "replace", 10, False))
+        sensors = {entity: device for entity, device in self.INV["devices"].items() if device["model"] == "hhccjcy01"}
+        self.assertTrue(sensors)
+        states = base_states()
+        for entity in sensors:
+            states[entity] = full("10")
+        app = make_app(states)
+        for entity in sensors:
+            self.assertNotIn(f"maint:battery:{entity}", rows(app), entity)
+        tick(app, 2 * HOUR)
+        for entity, device in sensors.items():
+            row = rows(app)[f"maint:battery:{entity}"]
+            self.assertEqual((row["title"], row["detail"], row["area"]),
+                             (f"{device['name']} battery", "replace, CR2032", device["area"]), entity)
+
     def test_the_ws90_backup_cells_are_one_removable_line(self):
         text = (APPS / "home_pulse" / "house_upcoming.yaml").read_text()
         lines = [line for line in text.splitlines() if "ecowitt_battery_8351" in line]
         self.assertEqual(len(lines), 1)
         without = yaml.safe_load(text.replace(lines[0] + "\n", ""))["HouseUpcoming"]["batteries"]
-        self.assertEqual(len(maint.parse_inventory(without)["devices"]), 49)
+        self.assertEqual(len(maint.parse_inventory(without)["devices"]), len(self.INV["devices"]) - 1)
 
     def test_one_owner_per_condition_agrees_with_the_owner_apps(self):
         salus = yaml.safe_load((APPS / "climate" / "salus_health.yaml").read_text())["SalusHealth"]

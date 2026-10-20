@@ -1,7 +1,8 @@
 """HouseUpcoming - what is coming up in the house that only the server can know, for the dashboard's
 Now timeline: maintenance (the Rober2 parts, the dishwasher's, washer's, dryer's and xBloom's run-based
-tasks, the drum clean at its cheapest start, batteries by their replace-by day and offline devices; admin only),
-Kristine's train, and rain while a terrace door is open (exploratory).
+tasks, the drum clean at its cheapest start, batteries by their replace-by day and offline devices, and
+houseplants whose soil is dry; admin only), Kristine's train, and rain while a terrace door is open
+(exploratory).
 
 Publishes sensor.house_upcoming (shape in upcoming_core.py) plus one maintenance push a day, built
 from the same conditions the rows show. The lease in `expires` is renewed every TICK_S even when
@@ -47,6 +48,7 @@ import upcoming_battery_age as age
 import upcoming_core as core
 import upcoming_drum as drum
 import upcoming_maint as maint
+import upcoming_plants as plants
 import upcoming_rain as rain
 import upcoming_runs as runs
 import upcoming_train as train
@@ -112,6 +114,7 @@ class HouseUpcoming(hass.Hass):
         self.rain_doors = dict(rn.get("doors") or {})
         self.rain_both_area = rn.get("both_area", "rooftop")
         self.inventory = maint.parse_inventory(a.get("batteries"))
+        self.plants = plants.parse_plants(a.get("plants"))
 
         self._notifier = self.get_app("MobileNotifier")
 
@@ -120,6 +123,7 @@ class HouseUpcoming(hass.Hass):
         rate = saved.get("rober2_rate")
         self._rober2_rate = rate if isinstance(rate, (int, float)) and rate > 0 else maint.ROBER2_RATE_DEFAULT
         self._batteries = dict(saved.get("batteries") or {})
+        self._plant_latches = plants.valid_latches(saved.get("plants"), self.plants)
         self._pushed = dict(saved.get("pushed") or {})
         self._facts = dict(saved.get("facts") or {})
         self._content = dict(saved.get("content") or {})
@@ -149,7 +153,7 @@ class HouseUpcoming(hass.Hass):
         self._check_inventory()
         self._evaluate(publish=True)
         self.log(f"HouseUpcoming initialized - {len(self.inventory['devices'])} battery devices, "
-                 f"{len(self._sources())} sources, {self._row_count} rows")
+                 f"{len(self.plants)} plants, {len(self._sources())} sources, {self._row_count} rows")
 
     def terminate(self):
         self._save_state(force=True)
@@ -160,7 +164,7 @@ class HouseUpcoming(hass.Hass):
         sources = list(self.rober2_entities.values())
         sources += [self.washer_entity, self.price_entity, self.profiles_entity, self.train_route, self.train_stog,
                     self.train_person, self.rain_alert]
-        sources += list(self.rain_doors) + list(self.inventory["devices"])
+        sources += list(self.rain_doors) + list(self.inventory["devices"]) + list(self.plants)
         return list(dict.fromkeys(sources))
 
     def _read(self, entity):
@@ -187,10 +191,13 @@ class HouseUpcoming(hass.Hass):
                      if ((full or {}).get("attributes") or {}).get("device_class") == "battery"]
         unlisted = maint.unlisted_batteries(batteries, self.inventory)
         missing = sorted(entity for entity in self.inventory["devices"] if entity not in sensors)
+        missing_plants = sorted(entity for entity in self.plants if entity not in sensors)
         if unlisted:
             self.log(f"Battery sensors neither listed nor excluded: {', '.join(unlisted)}", level="WARNING")
         if missing:
             self.log(f"Listed battery sensors HA does not have: {', '.join(missing)}", level="WARNING")
+        if missing_plants:
+            self.log(f"Plant moisture sensors HA does not have: {', '.join(missing_plants)}", level="WARNING")
         if not unlisted and not missing:
             self.log(f"Battery inventory complete: {len(self.inventory['devices'])} listed, "
                      f"{len(self.inventory['excluded'])} excluded")
@@ -269,6 +276,13 @@ class HouseUpcoming(hass.Hass):
                                                          self._offline_at.pop(entity, None))
             found.append(maint.battery_row(entity, device, model, self._batteries[entity], value,
                                            self._facts.get(entity), now))
+        for entity, plant in self.plants.items():
+            cached = self._cache.get(entity)
+            if cached is None:
+                continue
+            value = maint.reading(cached.get("state"))
+            self._plant_latches[entity] = plants.step_plant(self._plant_latches.get(entity), plant, value, now)
+            found.append(plants.plant_row(entity, plant, self._plant_latches[entity], value))
         for item in found:
             if item:
                 rows.append(item[0])
@@ -521,8 +535,8 @@ class HouseUpcoming(hass.Hass):
 
     def _save_state(self, force=False):
         data = {"version": STATE_VERSION, "rober2": self._rober2, "rober2_rate": self._rober2_rate,
-                "batteries": self._batteries, "pushed": self._pushed, "facts": self._facts,
-                "content": self._content, "done": self._anchors}
+                "batteries": self._batteries, "plants": self._plant_latches, "pushed": self._pushed,
+                "facts": self._facts, "content": self._content, "done": self._anchors}
         text = json.dumps(data, sort_keys=True)
         if text == self._state_text:
             return

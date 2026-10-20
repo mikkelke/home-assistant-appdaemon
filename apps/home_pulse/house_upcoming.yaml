@@ -1,7 +1,7 @@
 # HouseUpcoming - sensor.house_upcoming for the dashboard's Now timeline: maintenance (Rober2 parts,
-# the dishwasher's and the washer's run-based tasks, batteries and offline devices; admin only),
-# Kristine's train, and rain while a terrace door is open. Plus one maintenance push a day to Mikkel.
-# See house_upcoming.py.
+# the dishwasher's and the washer's run-based tasks, batteries and offline devices, houseplants to
+# water; admin only), Kristine's train, and rain while a terrace door is open. Plus one maintenance
+# push a day to Mikkel. See house_upcoming.py.
 #
 # Keep sensor.house_upcoming out of the recorder (configuration.yaml recorder: exclude:): the lease
 # renews every 5 minutes.
@@ -53,6 +53,12 @@ HouseUpcoming:
       binary_sensor.rooftop_door_1_contact: {label: living-room terrace door, area: living_room}
       binary_sensor.rooftop_door_2_contact: {label: "Claudia's terrace door", area: office}
 
+  # One line per houseplant: moisture is its soil moisture sensor, dry the reading in percent at or
+  # under which it needs water. The reminder stays until the reading is 5 points above dry.
+  plants:
+    - {moisture: sensor.strelitzia_moisture, name: Strelitzia, area: dining_room, dry: 15}
+    - {moisture: sensor.philodendron_moisture, name: Philodendron, area: dining_room, dry: 20}
+
   batteries:
     # action: replace (primary cells), recharge (swappable rechargeables), charge (built in).
     # low: N opens at a reading <= N (days: K = K house days in a row); drop: N opens N points under
@@ -77,6 +83,7 @@ HouseUpcoming:
       snzb04p: {cell: CR2477, action: replace, low: 20, trend: false}
       snzb02p: {cell: CR2477, action: replace, low: 20}
       zg102zm: {cell: "", trend: false}
+      hhccjcy01: {cell: CR2032, action: replace, low: 10, trend: false}
     # One line per device. history_from: a known change in how the cells behave; sets that went in
     # before it never count as a lifetime, and a trend starts there.
     devices:
@@ -132,6 +139,8 @@ HouseUpcoming:
       - {entity: sensor.ventilation_thermometer_battery, model: snzb02p, name: Ventilation thermometer, area: bedroom}
       # Rechargeable, reads 25-30 when full; offline only until its empty level is known.
       - {entity: sensor.washer_vibration_battery, model: zg102zm, name: Washer vibration, area: guest_bathroom}
+      - {entity: sensor.strelitzia_battery, model: hhccjcy01, name: Strelitzia plant sensor, area: dining_room}
+      - {entity: sensor.philodendron_battery, model: hhccjcy01, name: Philodendron plant sensor, area: dining_room}
     # Phones and the tablet; Rober2 and the Sonos Move dock themselves; the HANK remotes are
     # rechargeable and read anywhere from 26 to 100; yale_battery_bt is the lock's BLE twin.
     excluded:
