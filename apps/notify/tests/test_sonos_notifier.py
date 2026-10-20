@@ -48,7 +48,7 @@ def _say_url_response(url=CLIP_URL, success=True):
     }
 
 
-def _new_app(state=None, now=None, time_constraints_enabled=True, volumes=None, announce_volume_cap=0.35):
+def _new_app(state=None, now=None, time_constraints_enabled=True, volumes=None, announce_volume_boost=0.03, announce_volume_cap=0.30):
     app = sn.SonosNotifier.__new__(sn.SonosNotifier)
     app.log_calls = []
     app.log = lambda *a, **kw: app.log_calls.append((a, kw))
@@ -65,6 +65,7 @@ def _new_app(state=None, now=None, time_constraints_enabled=True, volumes=None, 
     app.default_chime_path = "/config/www/chimes/alert.mp3"
     app.tts_platform = "piper"
     app.audio_conversion = AUDIO_CONVERSION
+    app.announce_volume_boost = announce_volume_boost
     app.announce_volume_cap = announce_volume_cap
     app.clip_base_url = ""
 
@@ -191,7 +192,7 @@ class RenderAndPlayPayloads(unittest.TestCase):
                 "media_content_id": CLIP_URL,
                 "media_content_type": "music",
                 "announce": True,
-                "extra": {},
+                "extra": {"volume": 23},
             },
         )
 
@@ -273,38 +274,51 @@ class VolumeLevel(unittest.TestCase):
     def _announced(self, app):
         return {tuple(p["entity_id"]): p["extra"].get("volume") for p in _plays(app)}
 
-    def test_rooms_announce_at_their_own_volume_in_one_call(self):
+    def test_each_room_announces_a_boost_above_its_own_volume(self):
         app = _new_app(now=DAYTIME, volumes={"media_player.living_room": 0.14, "media_player.kitchen": 0.13, "media_player.bathroom": 0.2})
-        app.notify("Hello", target_speakers=self.ROOMS)
-        self.assertEqual(len(_plays(app)), 1)
-        self.assertEqual(_plays(app)[0]["entity_id"], _twins(self.ROOMS))
-        self.assertEqual(_plays(app)[0]["extra"], {})
-
-    def test_unreadable_room_volume_announces_at_own_volume(self):
-        app = _new_app(now=DAYTIME)
-        app.notify("Hello", target_speakers=self.ROOMS)
-        self.assertEqual(self._announced(app), {tuple(_twins(self.ROOMS)): None})
-
-    def test_rooms_above_the_cap_get_the_cap_in_a_second_call(self):
-        app = _new_app(now=DAYTIME, volumes={"media_player.living_room": 0.6, "media_player.kitchen": 0.13, "media_player.bathroom": 0.35})
         app.notify("Hello", target_speakers=self.ROOMS)
         self.assertEqual(
             self._announced(app),
-            {("media_player.kitchen_2", "media_player.bathroom_2"): None, ("media_player.living_room_2",): 35},
+            {("media_player.living_room_2",): 17, ("media_player.kitchen_2",): 16, ("media_player.bathroom_2",): 23},
         )
 
-    def test_cap_follows_the_configuration(self):
-        app = _new_app(now=DAYTIME, volumes={EXPLICIT: 0.5}, announce_volume_cap=0.25)
-        app.notify("Hello", target_speakers=[EXPLICIT])
-        self.assertEqual(_plays(app)[0]["extra"], {"volume": 25})
+    def test_rooms_at_the_same_volume_share_one_call(self):
+        app = _new_app(now=DAYTIME, volumes={r: 0.12 for r in self.ROOMS})
+        app.notify("Hello", target_speakers=self.ROOMS)
+        self.assertEqual(self._announced(app), {tuple(_twins(self.ROOMS)): 15})
 
-    def test_no_usable_cap_leaves_every_room_at_its_own_volume(self):
+    def test_the_cap_limits_the_boosted_volume(self):
+        for music, pct in ((0.26, 29), (0.27, 30), (0.28, 30), (0.6, 30), (1.0, 30)):
+            app = _new_app(now=DAYTIME, volumes={EXPLICIT: music})
+            app.notify("Hello", target_speakers=[EXPLICIT])
+            self.assertEqual(_plays(app)[0]["extra"], {"volume": pct})
+
+    def test_boost_and_cap_follow_the_configuration(self):
+        app = _new_app(now=DAYTIME, volumes={EXPLICIT: 0.2}, announce_volume_boost=0.05, announce_volume_cap=0.22)
+        app.notify("Hello", target_speakers=[EXPLICIT])
+        self.assertEqual(_plays(app)[0]["extra"], {"volume": 22})
+
+    def test_no_usable_boost_announces_at_the_room_volume(self):
+        for boost in (None, "", "loud"):
+            app = _new_app(now=DAYTIME, volumes={EXPLICIT: 0.14}, announce_volume_boost=boost)
+            app.notify("Hello", target_speakers=[EXPLICIT])
+            self.assertEqual(_plays(app)[0]["extra"], {"volume": 14})
+
+    def test_no_usable_cap_leaves_the_boosted_volume_uncapped(self):
         for cap in (None, "", "loud"):
             app = _new_app(now=DAYTIME, volumes={EXPLICIT: 0.9}, announce_volume_cap=cap)
             app.notify("Hello", target_speakers=[EXPLICIT])
-            self.assertEqual(_plays(app)[0]["extra"], {})
+            self.assertEqual(_plays(app)[0]["extra"], {"volume": 93})
 
-    def test_explicit_volume_is_used_uncapped_in_one_call(self):
+    def test_unreadable_room_volume_sends_no_volume(self):
+        app = _new_app(now=DAYTIME, volumes={"media_player.living_room": 0.14})
+        app.notify("Hello", target_speakers=self.ROOMS)
+        self.assertEqual(
+            self._announced(app),
+            {("media_player.living_room_2",): 17, ("media_player.kitchen_2", "media_player.bathroom_2"): None},
+        )
+
+    def test_explicit_volume_is_used_as_given_in_one_call(self):
         for level, pct in ((1.0, 100), (0.7, 70), (0.15, 15), (0.36, 36)):
             app = _new_app(now=DAYTIME, volumes={"media_player.living_room": 0.6, "media_player.kitchen": 0.1})
             app.notify("Hello", target_speakers=self.ROOMS, volume_level=level)
@@ -343,15 +357,20 @@ class ShippedConfig(unittest.TestCase):
     def test_loudness_filter_reaches_the_render(self):
         app = self._initialized_app()
         app.notify("Hello", target_speakers=[EXPLICIT])
-        self.assertIn("loudnorm", self.args["audio_conversion"])
+        self.assertIn("alimiter", self.args["audio_conversion"])
+        self.assertNotIn("loudnorm", self.args["audio_conversion"])
         self.assertEqual(_renders(app)[0]["audio_conversion"], self.args["audio_conversion"])
 
-    def test_cap_reaches_the_announce_volume(self):
-        cap = self.args["announce_volume_cap"]
-        self.assertTrue(0 < cap < 1)
-        app = self._initialized_app(volumes={EXPLICIT: 1.0})
-        app.notify("Hello", target_speakers=[EXPLICIT])
-        self.assertEqual(_plays(app)[0]["extra"], {"volume": round(cap * 100)})
+    def test_boost_and_cap_reach_the_announce_volume(self):
+        boost, cap = self.args["announce_volume_boost"], self.args["announce_volume_cap"]
+        self.assertTrue(0 < boost < cap < 1)
+        app = self._initialized_app(volumes={"media_player.kitchen": 0.13, "media_player.living_room": 1.0})
+        app.notify("Hello", target_speakers=["media_player.kitchen", "media_player.living_room"])
+        announced = {tuple(p["entity_id"]): p["extra"].get("volume") for p in _plays(app)}
+        self.assertEqual(
+            announced,
+            {("media_player.kitchen_2",): 13 + round(boost * 100), ("media_player.living_room_2",): round(cap * 100)},
+        )
         self.assertFalse(_logged_at(app, "announce_volume_cap", "WARNING"))
 
     def test_a_missing_cap_is_warned_about(self):

@@ -25,6 +25,7 @@ class SonosNotifier(hass.Hass):
         self.default_chime_path = self.args.get("default_chime_path")
         self.tts_platform = self.args.get("tts_platform")
         self.audio_conversion = self.args.get("audio_conversion")
+        self.announce_volume_boost = self.args.get("announce_volume_boost")
         self.announce_volume_cap = self.args.get("announce_volume_cap")
         self.clip_base_url = (self.args.get("clip_base_url") or "").rstrip("/")
 
@@ -156,7 +157,8 @@ class SonosNotifier(hass.Hass):
             override_quiet_hours (bool, optional): Skip the quiet-hours check and announce
                 anyway. For life-safety callers only. Defaults to False.
             volume_level (float, optional): Announcement volume (0.0-1.0) in every target room.
-                When omitted each room announces at its own volume, at most announce_volume_cap.
+                When omitted each room announces announce_volume_boost above its own volume, at
+                most announce_volume_cap.
             **kwargs: cache (default True), offset (default -300) and tts_platform for the
                 chime_tts render.
         """
@@ -298,25 +300,30 @@ class SonosNotifier(hass.Hass):
         return room if room.endswith("_2") else f"{room}_2"
 
     def _announce_groups(self, rooms, volume_level):
-        """{announce volume in percent or None: native entities} for the rooms.
+        """{announce volume in percent or None: native entities} for the rooms; one call each.
 
-        None means no volume is sent and the speaker plays the clip at its own volume. Rooms
-        playing above announce_volume_cap get the cap instead. Each entry is one call, and
-        separate calls start the clip audibly apart, so the usual case is a single entry.
+        A room announces announce_volume_boost above its own volume, at most
+        announce_volume_cap. None means no volume is sent and the speaker plays the clip at its
+        own volume, for a room whose volume cannot be read.
         """
         if volume_level is not None:
             return {self._volume_pct(volume_level): [self._native_twin(room) for room in rooms]}
+        boost_pct = self._volume_pct(self.announce_volume_boost) or 0
         cap_pct = self._volume_pct(self.announce_volume_cap)
         groups = {}
         for room in rooms:
-            room_pct = self._volume_pct(self.get_state(room, attribute="volume_level"))
-            capped = cap_pct is not None and room_pct is not None and room_pct > cap_pct
-            groups.setdefault(cap_pct if capped else None, []).append(self._native_twin(room))
+            pct = self._volume_pct(self.get_state(room, attribute="volume_level"))
+            if pct is not None:
+                pct += boost_pct
+                if cap_pct is not None:
+                    pct = min(pct, cap_pct)
+            groups.setdefault(pct, []).append(self._native_twin(room))
         return groups
 
     def _play_announcement(self, message, url, rooms, volume_level):
         """Play the rendered clip as a Sonos audio clip on every room's native entity.
 
+        The calls are dispatched without waiting on each other.
         Music Assistant is not used because it announces to the members of a Sonos group one
         after another.
         """

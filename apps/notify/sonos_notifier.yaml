@@ -45,12 +45,13 @@ SonosNotifier:
   # chime_tts returns the clip on HA's external URL. The speakers fetch it here instead, over
   # plain HTTP on the LAN rather than through the public address and TLS.
   clip_base_url: "http://10.21.0.5:8123"
-  # FFmpeg arguments chime_tts applies to every rendered clip: one loudness for every announcement,
-  # about -11.5 LUFS, near DR P3 (-12 LUFS), so a clip at a room's own volume stands out over its music.
-  audio_conversion: "-af loudnorm=I=-16:TP=-2:LRA=11,volume=6dB,alimiter=limit=0.89:attack=5:release=50:level=false"
-  # Fraction (0.0-1.0). Without a volume_level from the caller, a room announces at its own
-  # volume up to this. An explicit volume_level is never capped.
-  announce_volume_cap: 0.35
+  # FFmpeg arguments chime_tts applies to every rendered clip: a fixed gain to about -12 LUFS,
+  # DR P3's loudness, with a limiter on the chime's peaks. loudnorm is avoided: it flattens the voice.
+  audio_conversion: "-af volume=4dB,alimiter=limit=0.89:attack=5:release=50:level=false"
+  # Fractions (0.0-1.0). Without a volume_level from the caller, a room announces this much above
+  # its own volume, at most announce_volume_cap. An explicit volume_level is used as given.
+  announce_volume_boost: 0.03
+  announce_volume_cap: 0.30
 
   # --- Time Constraints (using Home Assistant input_datetime helpers) ---
   # Notifications will only be sent *after* quiet_hours_end_entity 
