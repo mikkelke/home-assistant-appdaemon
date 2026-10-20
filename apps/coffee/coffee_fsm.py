@@ -21,6 +21,7 @@ Every input returns the effects the app acts on: "started", "bloom", "ready", "c
 
 from datetime import datetime, timezone
 
+from coffee_cup import sleep_frame
 from coffee_curve import FRESH_S, CupFilter, Curve
 
 START_TIMEOUT_S = 45
@@ -109,6 +110,8 @@ class Tracker:
         return None if self.frame_at is None else self.frame_at + FRESH_S
 
     def reading_cup(self, now, grams):
+        if sleep_frame(grams):
+            return []
         self.frame_at = now
         kept = self.filter.accept(grams)
         if kept is not None:

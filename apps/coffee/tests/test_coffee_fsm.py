@@ -300,6 +300,14 @@ class ReadyTests(unittest.TestCase):
         tracker.frame(T + 309)
         self.assertEqual(tracker.tick(T + 309), ["picked_up", "state"])
 
+    def test_the_frame_the_scale_sends_as_the_machine_falls_asleep_is_no_pickup(self):
+        tracker = self.ready()
+        tracker.brew["final"] = {"cup_g": 208.7}
+        tracker.reading_cup(T + 300, 208.63)
+        self.assertEqual(tracker.reading_cup(T + 900, 50.0), [])
+        self.assertEqual([tracker.tick(T + 900 + s) for s in range(1, 30)], [[]] * 29)
+        self.assertEqual((tracker.phase(), tracker.cup, tracker.frame_at), ("ready", 208.63, T + 300))
+
     def test_the_picked_up_op(self):
         tracker = self.ready()
         self.assertEqual(tracker.picked_up("c9", T + 400), [])

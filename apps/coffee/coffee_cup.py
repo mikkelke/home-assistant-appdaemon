@@ -21,6 +21,11 @@ def side(grams):
     return "present" if grams >= STEP_G else "absent" if grams <= -STEP_G else "unknown"
 
 
+def sleep_frame(grams):
+    """The frame the scale sends once as the machine falls asleep, which is no reading."""
+    return abs(grams - SLEEP_G) < 0.005
+
+
 class Cup:
     def __init__(self):
         self.state = "unknown"
@@ -34,7 +39,7 @@ class Cup:
 
     def reading(self, now, grams):
         """A frame from the scale. True when the state changed."""
-        if abs(grams - SLEEP_G) < 0.005:
+        if sleep_frame(grams):
             return False
         self.grams = grams
         way = side(grams)

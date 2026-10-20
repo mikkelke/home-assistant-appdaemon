@@ -514,6 +514,22 @@ class CupTests(unittest.TestCase):
         fake.advance(app, 2)
         self.assertEqual(coffee_state(app)[1]["cup"], "present")
 
+    def test_a_brew_left_on_the_scale_is_not_picked_up_when_the_machine_falls_asleep(self):
+        doc = json.loads((Path(__file__).resolve().parent / "fixtures" / "tape_2026-10-20.json").read_text())
+        start = cm.cf.epoch(doc["start"])
+        app = fake.make_app(now=start, cup=False)
+        fake.replay(app, [(t, tuple(step)) for t, step in doc["tape"] if t < 320], start=start)
+        fake.advance(app, 600)
+        self.assertEqual(coffee_state(app)[0], "ready")
+        self.scale(app, "50.0")
+        fake.advance(app, 2.2)
+        fake.set_entity(app, "sensor.pour_over_plug_power", "0.7")
+        fake.advance(app, 30)
+        state, attrs = coffee_state(app)
+        self.assertEqual((state, attrs["machine"], attrs["cup"]), ("ready", "asleep", "unknown"))
+        self.assertNotIn("picked_up_at", attrs)
+        self.assertNotIn("picked_up_at", [r for r in fake.ledger(app) if r.get("first_bloom_at")][-1])
+
     def test_the_recorded_brew_had_its_cup_on_before_the_hold(self):
         doc = json.loads((Path(__file__).resolve().parent / "fixtures" / "tape_2026-10-20.json").read_text())
         start = cm.cf.epoch(doc["start"])
