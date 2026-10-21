@@ -2,7 +2,7 @@ import appdaemon.plugins.hass.hassapi as hass # type: ignore
 import asyncio
 import json
 import os
-from datetime import date, time, timedelta
+from datetime import date, datetime, time, timedelta
 
 import cover_util
 import room_state_darkness
@@ -86,7 +86,8 @@ class WakeupRoutine(hass.Hass):
         self.media_verify_recheck_sec = int(A.get("media_verify_recheck_sec", 5))
         self.media_still_playing_check_sec = int(A.get("media_still_playing_check_sec", 45))
 
-        self.volume_entities = list(A["volume_entities"])
+        # Every speaker that plays the alarm is ramped, whether or not volume_entities lists it.
+        self.volume_entities = list(dict.fromkeys([self.master_player, *self.join_players, *A["volume_entities"]]))
         self.volume_start = float(A["volume_start"])
         self.volume_target = float(A["volume_target"])
         self.volume_step = float(A["volume_step"])
@@ -178,6 +179,9 @@ class WakeupRoutine(hass.Hass):
         # mid-day. Measured from alarm fire.
         self.wake_light_window_min = int(A.get("wake_light_window_min", 60))
         self._alarm_fired_at = None
+        # Apps that write volume on the wake speakers stand down while wake_window_open():
+        # from the alarm firing for this many minutes.
+        self.wake_window_min = int(A.get("wake_window_min", 30))
         # Dynamic settle after blinds reach target (based on outdoor lux clue).
         self.post_blind_settle_dark_sec = max(0, int(A.get("post_blind_settle_dark_sec", 10)))
         self.post_blind_settle_mid_sec = max(0, int(A.get("post_blind_settle_mid_sec", 25)))
@@ -201,7 +205,8 @@ class WakeupRoutine(hass.Hass):
         self.volume_timer = None
         self.ramp_active = False
         self.volume_active = False
-        self.volume_ceiling = None
+        self.volume_ceilings = {}
+        self.volume_levels = {}
         self.current_pct = None
         self.media_attempt = 0
         self._media_recheck_used = False
@@ -233,6 +238,13 @@ class WakeupRoutine(hass.Hass):
                 self.last_fire_date = date.fromisoformat(stored_fire_date)
             except (TypeError, ValueError):
                 self.last_fire_date = None
+        # A restart mid-wake keeps the wake window for as long as it has left to run.
+        self._wake_window_until = None
+        self._wake_group_seen = False
+        try:
+            self._wake_window_until = datetime.fromisoformat(self._state["wake_window_until"])
+        except (KeyError, TypeError, ValueError):
+            pass
 
         # Respect per-app log_level
         self.set_log_level(self.log_level)
@@ -652,6 +664,10 @@ class WakeupRoutine(hass.Hass):
 
         self.log("[wake] Alarm firing.", log=self.user_log)
         self._alarm_fired_at = self.datetime()
+        try:
+            self._open_wake_window()
+        except Exception as e:
+            self.log(f"[wake] Could not open the wake window: {e}", level="WARNING", log=self.user_log)
         # Explain the routine to the dashboard's Home activity feed (fire-and-forget) -
         # blinds moving and music starting "by themselves" is the house acting, and this
         # is the one place that knows why. Once per day by construction (alarm fire).
@@ -746,8 +762,10 @@ class WakeupRoutine(hass.Hass):
                     self.call_service("media_player/volume_mute", entity_id=t, is_volume_muted=False)
         except Exception:
             pass
-        self.volume_ceiling = self._volume_ceiling_for(self.master_player)
-        self._set_volume(min(self.volume_start, self.volume_ceiling))
+        self.volume_ceilings = {e: self._volume_ceiling_for(e) for e in self.volume_entities}
+        self.volume_levels = {}
+        for entity, ceiling in self.volume_ceilings.items():
+            self._ramp_set(entity, min(self.volume_start, ceiling))
         self.volume_active = True
         self._schedule_next_volume_tick()
         # Verify playback started; if not, try fallbacks (delays sized for HLS startup,
@@ -929,16 +947,21 @@ class WakeupRoutine(hass.Hass):
         self.volume_timer = None
         if not self.volume_active:
             return
-        current = self._get_first_volume([self.master_player])
-        if current is None:
-            current = self.volume_start
-        next_vol = min(self.volume_ceiling, round(current + self.volume_step, 3))
-        self._set_volume(next_vol)
-        if next_vol >= self.volume_ceiling:
-            self.volume_active = False
-            self.log(f"[wake] Volume ramp complete at {next_vol}", log=self.user_log)
-        else:
+        for entity, ceiling in list(self.volume_ceilings.items()):
+            last = self.volume_levels.get(entity, self.volume_start)
+            if last >= ceiling:
+                continue
+            current = self._get_first_volume([entity])
+            if current is None:
+                current = last
+            next_vol = min(ceiling, round(current + self.volume_step, 3))
+            self._ramp_set(entity, next_vol)
+            if next_vol >= ceiling:
+                self.log(f"[wake] Volume ramp complete on {entity} at {next_vol}", log=self.user_log)
+        if any(self.volume_levels.get(e, 0.0) < c for e, c in self.volume_ceilings.items()):
             self._schedule_next_volume_tick()
+        else:
+            self.volume_active = False
 
     def _get_first_volume(self, entities):
         for e in entities:
@@ -951,8 +974,16 @@ class WakeupRoutine(hass.Hass):
                 pass
         return None
 
-    def _set_volume(self, level):
-        self.call_service("media_player/volume_set", entity_id=self.master_player, volume_level=float(level))
+    def _set_volume(self, entity, level):
+        # One speaker failing must not stop the others (or the rest of the wake-up).
+        try:
+            self.call_service("media_player/volume_set", entity_id=entity, volume_level=float(level))
+        except Exception as e:
+            self.log(f"[wake] volume_set on {entity} failed: {e}", level="WARNING", log=self.user_log)
+
+    def _ramp_set(self, entity, level):
+        self.volume_levels[entity] = level
+        self._set_volume(entity, level)
 
     def _standard_volumes(self):
         """(speaker -> standard level, level for a speaker not listed), read from the
@@ -987,6 +1018,48 @@ class WakeupRoutine(hass.Hass):
             log=self.user_log,
         )
         return ceiling
+
+    # ---------- wake window (read by other apps) ----------
+    def _open_wake_window(self):
+        self._wake_window_until = self._alarm_fired_at + timedelta(minutes=self.wake_window_min)
+        self._wake_group_seen = False
+        self._state["wake_window_until"] = self._wake_window_until.isoformat()
+        self._save_state()
+
+    def _close_wake_window(self):
+        if self._wake_window_until is None:
+            return
+        self._wake_window_until = None
+        self._state["wake_window_until"] = None
+        self._save_state()
+
+    def wake_window_open(self):
+        """True while the wake-up plays out: from the alarm firing until wake_window_min
+        later, or until the routine is stopped or its speakers stop being one group. Apps
+        that copy a volume between the wake speakers (BedroomBathroomVolumeSync) hold off
+        while it is True."""
+        until = self._wake_window_until
+        if until is None or self.datetime() >= until:
+            return False
+        grouped = self._wake_group_state()
+        if grouped:
+            self._wake_group_seen = True
+        elif grouped is False and self._wake_group_seen:
+            return False
+        return True
+
+    def _wake_group_state(self):
+        """True when every joined speaker is in the master's group, False when one is not,
+        None when that cannot be told (nothing to join, or the group is unreadable)."""
+        if not self.join_players:
+            return None
+        try:
+            members = self.get_state(self.master_player, attribute="group_members")
+        except Exception:
+            return None
+        if not isinstance(members, (list, tuple)):
+            return None
+        return all(p in members for p in self.join_players)
 
     # ---------- covers ----------
     def _nudge_cover_if_closed(self, entity, target_pct):
@@ -1411,6 +1484,7 @@ class WakeupRoutine(hass.Hass):
 
     def _stop_all(self, reason):
         self.log(f"[wake] Stopping routine: {reason}", log=self.user_log)
+        self._close_wake_window()
         self._stop_media()
         # Always restore Adaptive Lighting brightness adaptation even if ramp never started
         self._resume_adaptive_brightness()

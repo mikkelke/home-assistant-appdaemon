@@ -27,15 +27,19 @@ WakeupBedroom:
   media_verify_recheck_sec: 5
   media_still_playing_check_sec: 45
 
+  # Every speaker here is set to volume_start when the alarm fires and ramps on its own to its own ceiling.
   volume_entities:
     - media_player.bedroom
     - media_player.bathroom
   volume_start: 0.06
-  # The ramp never passes the ramped speaker's standard volume: its ceiling is
-  # min(volume_target, speaker_volumes[<speaker>] in apps/sonos/state_reset.yaml), read when the alarm fires.
+  # A speaker's ceiling is min(volume_target, its standard volume: speaker_volumes in
+  # apps/sonos/state_reset.yaml), read when the alarm fires.
   volume_target: 0.18
   volume_step: 0.03
   volume_interval_sec: 60
+  # From the alarm firing for this many minutes (cut short when the routine stops or its speakers are
+  # no longer one group) wake_window_open() is True and BedroomBathroomVolumeSync copies no volume.
+  wake_window_min: 30
 
   covers:
     bedroom: cover.bedroom_blind

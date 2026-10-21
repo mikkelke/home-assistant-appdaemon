@@ -12,6 +12,12 @@ class BedroomBathroomVolumeSync(hass.Hass):
     Door closing deactivates tracking immediately - no forced restore, bedroom stays at whatever
     volume it last matched. Reactivates only after another full door_open_debounce_sec of
     continuous open.
+
+    While the wake-up routine's window is open (WakeupRoutine.wake_window_open: the alarm firing
+    until wake_window_min later, cut short when the routine stops or its speakers are no longer
+    one group) nothing is copied: the wake ramp owns both speakers' volume then, each capped at
+    its standard. The window is the wake routine's alone - this app only asks. When the wake
+    routine cannot be asked, the sync behaves as if no window were open.
     """
 
     def initialize(self):
@@ -19,9 +25,11 @@ class BedroomBathroomVolumeSync(hass.Hass):
         self.bathroom_speaker = self.args.get("bathroom_speaker", "media_player.bathroom")
         self.bedroom_speaker = self.args.get("bedroom_speaker", "media_player.bedroom")
         self.door_open_debounce_sec = int(self.args.get("door_open_debounce_sec", 120))
+        self.wake_app = self.args.get("wake_app", "WakeupBedroom")
 
         self._sync_active = False
         self._sync_arm_timer = None
+        self._wake_hold_logged = False
 
         self.listen_state(self._on_door_change, self.bathroom_door_sensor)
         self.listen_state(self._on_bathroom_volume_change, self.bathroom_speaker, attribute="volume_level")
@@ -75,9 +83,21 @@ class BedroomBathroomVolumeSync(hass.Hass):
     def _on_speaker_state_change(self, entity, attribute, old, new, kwargs):
         self._maybe_sync("speaker_state_change")
 
+    def _wake_window_open(self):
+        try:
+            return bool(self.get_app(self.wake_app).wake_window_open())
+        except Exception:
+            return False
+
     def _maybe_sync(self, reason):
         if not self._sync_active:
             return
+        if self._wake_window_open():
+            if not self._wake_hold_logged:
+                self._wake_hold_logged = True
+                self.log("Scenario: volume_sync_held -> wake window open", level="INFO")
+            return
+        self._wake_hold_logged = False
         if self.get_state(self.bathroom_speaker) != "playing" or self.get_state(self.bedroom_speaker) != "playing":
             return
         try:
