@@ -46,9 +46,11 @@ FamilyRoomLights:
   guest_exit_require_entry_door_closed: false
   guest_exit_use_adjacent_doors_only: true
   # Auto-on is held back while this vacuum is cleaning or returning, nobody is home, none of the
-  # quiet-house sensors changed between zone.home turning 0 and the run starting, and the
-  # apartment entry door has not changed since zone.home turned 0. Remove the vacuum entity to switch the hold off.
+  # quiet-house sensors turned on between the apartment entry door's last close and the run
+  # starting, that door has not changed since zone.home turned 0, and the untracked visitor
+  # sensor (none | cleaner | guest) reads none. Remove the vacuum entity to switch the hold off.
   robot_vacuum_entity: "vacuum.rober2"
+  untracked_visitor_entity: "sensor.untracked_visitor"
   robot_quiet_sensors:
     - "binary_sensor.kitchen_active"
     - "binary_sensor.dining_room_active"

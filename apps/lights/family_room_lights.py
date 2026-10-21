@@ -424,18 +424,25 @@ class FamilyRoomLights(hass.Hass):
             
             self._robot_vacuum_entity = self.args.get("robot_vacuum_entity") or None
             self._robot_quiet_sensors = list(self.args.get("robot_quiet_sensors") or [])
+            self._robot_visitor_entity = self.args.get("untracked_visitor_entity") or None
             self._robot_quiet_for = None
             self._robot_hold_logged = False
+            self._robot_on_edge_at = {}
+            self._robot_tracking_since = time.time()
             if self._robot_vacuum_entity:
                 try:
                     self.listen_state(self._on_robot_vacuum_state, self._robot_vacuum_entity)
+                    for sensor in self._robot_quiet_sensors:
+                        self.listen_state(self._on_quiet_sensor_on, sensor, new="on")
                     self.log(
                         f"Robot run hold: {self._robot_vacuum_entity}, "
-                        f"{len(self._robot_quiet_sensors)} quiet-house sensors",
+                        f"{len(self._robot_quiet_sensors)} quiet-house sensors, "
+                        f"visitor {self._robot_visitor_entity}",
                         level="INFO",
                     )
                 except Exception as e:
-                    self.log(f"Robot run hold listener failed: {e}", level="ERROR")
+                    self._robot_vacuum_entity = None
+                    self.log(f"Robot run hold off, listener setup failed: {e}", level="ERROR")
 
             # Validate and recover states after initialization
             self.run_in(self._validate_and_recover_states, self.initial_check_delay + 2)
@@ -1613,32 +1620,56 @@ class FamilyRoomLights(hass.Hass):
         except (TypeError, ValueError):
             return None
 
-    def _quiet_empty_house_since(self):
-        """Epoch seconds at which zone.home turned 0, when it reads 0 and none of the quiet-house
-        sensors has changed since; None otherwise. Unreadable inputs count as not quiet."""
-        if not self._robot_quiet_sensors:
-            return None
+    def _on_quiet_sensor_on(self, entity, attribute, old, new, kwargs):
+        """Remember when each quiet-house sensor last turned on: the time on the sensor itself,
+        the wall clock when that is unreadable."""
+        try:
+            turned_on_at = self._entity_changed_at(entity) or time.time()
+        except Exception:
+            turned_on_at = time.time()
+        self._robot_on_edge_at[entity] = max(self._robot_on_edge_at.get(entity, 0.0), turned_on_at)
+
+    def _quiet_since_departure(self):
+        """(zone.home turn-0 time, None) when the house stayed quiet from the last entry-door close
+        until now, else (None, why).
+
+        Quiet means none of the quiet-house sensors turned on in that span and this app was
+        watching them for all of it. A door that is open, unreadable or changed after zone.home
+        turned 0 leaves no departure to measure from, and so does a visitor sensor that does
+        not read none.
+        """
+        door_entity = getattr(self, "apartment_entry_door_sensor", None)
+        visitor_entity = getattr(self, "_robot_visitor_entity", None)
+        watching_since = getattr(self, "_robot_tracking_since", None)
+        if not self._robot_quiet_sensors or not door_entity or not visitor_entity or watching_since is None:
+            return None, "not configured"
         if self._safe_get_state("zone.home", default=None, timeout_warning=False) != "0":
-            return None
+            return None, "home is not empty"
+        visitor = self._safe_get_state(visitor_entity, default=None, timeout_warning=False)
+        if visitor != "none":
+            return None, f"{visitor_entity} reads {visitor}"
         emptied_at = self._entity_changed_at("zone.home")
-        if emptied_at is None:
-            return None
-        for sensor in self._robot_quiet_sensors:
-            changed_at = self._entity_changed_at(sensor)
-            if changed_at is None or changed_at >= emptied_at:
-                return None
-        return emptied_at
+        departed_at = self._entity_changed_at(door_entity)
+        door_closed = self._safe_get_state(door_entity, default=None, timeout_warning=False) == "off"
+        if not door_closed or emptied_at is None or departed_at is None or departed_at > emptied_at:
+            return None, "entry door history unknown"
+        if watching_since > departed_at:
+            return None, "sensors not watched since the entry door closed"
+        for sensor, turned_on_at in self._robot_on_edge_at.items():
+            if turned_on_at >= departed_at:
+                return None, f"{sensor} turned on after the entry door closed"
+        return emptied_at, None
 
     def _on_robot_vacuum_state(self, entity, attribute, old, new, kwargs):
         """Judge the house as the vacuum leaves the dock; the verdict lapses when the run ends.
-        Stirring inside the house after the run has started never changes the verdict."""
+        Sensors turning on after the run has started never change the verdict."""
         try:
             if new in ROBOT_RUN_STATES and old not in ROBOT_RUN_STATES:
-                self._robot_quiet_for = self._quiet_empty_house_since()
-                if self._robot_quiet_for is None:
-                    self.log("Robot run: house not empty or not quiet since it emptied, lights react normally", level="INFO")
+                self._robot_quiet_for, why = self._quiet_since_departure()
+                if why is None:
+                    self.log("Robot run: nobody home and the house stayed quiet since the entry door closed, auto-on is held back until someone enters", level="INFO")
                 else:
-                    self.log("Robot run: nobody home and the house stayed quiet, auto-on is held back until someone enters", level="INFO")
+                    self.log(f"Robot run: no hold, {why}", level="INFO")
             elif new not in ROBOT_RUN_STATES:
                 self._robot_quiet_for = None
         except Exception as e:
@@ -1660,15 +1691,17 @@ class FamilyRoomLights(hass.Hass):
 
         Holds only while ALL of these are true: zone.home reads exactly 0 and is still the
         empty-house episode judged quiet when the run started, the vacuum is cleaning or
-        returning, the entry door is closed and unchanged since zone.home turned 0, and no
-        family light besides the island is on. Anything unreadable or different returns None.
+        returning, the untracked visitor sensor reads none, the entry door is closed and
+        unchanged since zone.home turned 0, and no family light besides the island is on.
+        Anything unreadable or different returns None.
         """
         if action['action'] not in ('turn_on_all', 'turn_on_island_only'):
             return None
         vacuum_entity = getattr(self, "_robot_vacuum_entity", None)
         door_entity = getattr(self, "apartment_entry_door_sensor", None)
+        visitor_entity = getattr(self, "_robot_visitor_entity", None)
         emptied_at = getattr(self, "_robot_quiet_for", None)
-        if not vacuum_entity or not door_entity or emptied_at is None or context['anyone_home']:
+        if not vacuum_entity or not door_entity or not visitor_entity or emptied_at is None or context['anyone_home']:
             return None
         if self._safe_get_state("zone.home", default=None, timeout_warning=False) != "0":
             return None
@@ -1676,6 +1709,8 @@ class FamilyRoomLights(hass.Hass):
             return None
         vacuum_state = self._safe_get_state(vacuum_entity, default=None, timeout_warning=False)
         if vacuum_state not in ROBOT_RUN_STATES:
+            return None
+        if self._safe_get_state(visitor_entity, default=None, timeout_warning=False) != "none":
             return None
         if self._safe_get_state(door_entity, default=None, timeout_warning=False) != "off":
             return None
