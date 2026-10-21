@@ -43,7 +43,7 @@ UntrackedVisitor:
     - binary_sensor.living_room_active
 
   quiet_min: 15
-  cap_hours: 4
+  cap_hours: 2
 
   # Both blinds are the raw motor entities, in the device frame: 0 = fully retracted (window
   # clear), 100 = covering the window. Each is asked through its blind owner app as the

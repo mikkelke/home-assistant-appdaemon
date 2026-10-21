@@ -172,7 +172,7 @@ class UntrackedVisitor(hass.Hass):
         self.cleaners = list(a["cleaners"])
         self.non_person = list(a["non_person"])
         self.quiet_min = float(a.get("quiet_min", 15))
-        self.cap_hours = float(a.get("cap_hours", 4))
+        self.cap_hours = float(a.get("cap_hours", 2))
         self.reassert_s = float(a.get("blind_reassert_min", 5)) * 60
         self.release_ttl_min = float(a.get("blind_release_ttl_min", 3))
         self.blinds = {str(name): dict(cfg) for name, cfg in (a.get("blinds") or {}).items()}
