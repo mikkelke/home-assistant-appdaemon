@@ -105,8 +105,8 @@ RoomFeel:
         - entity: sensor.kitchen_smoke_alarm_temperature
           rh_entity: sensor.kitchen_smoke_alarm_humidity
           label: ceiling
-          offset_c: -1.5
-          offset_rh: 6.5
+          offset_c: -0.5
+          offset_rh: 1.8
       # No floor thermometer in the kitchen.
       window_contacts: [binary_sensor.kitchen_window_contact]
       air_quality:
