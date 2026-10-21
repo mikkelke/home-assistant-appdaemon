@@ -36,6 +36,20 @@ REQUIRED_TOP_LEVEL = [
     "log", "log_level",
 ]
 
+# The household's standard Sonos volume per speaker is configured on this app
+# (apps/sonos/state_reset.yaml: speaker_volumes, default_volume). The wake ramp
+# never goes above it - see WakeupRoutine._volume_ceiling_for.
+STANDARD_VOLUME_APP = "SonosStateReset"
+
+
+def _level(value):
+    """A 0.0-1.0 volume out of config, or None when the value is not one."""
+    try:
+        level = float(value)
+    except (TypeError, ValueError):
+        return None
+    return level if 0.0 <= level <= 1.0 else None
+
 
 class WakeupRoutine(hass.Hass):
     def initialize(self):
@@ -187,6 +201,7 @@ class WakeupRoutine(hass.Hass):
         self.volume_timer = None
         self.ramp_active = False
         self.volume_active = False
+        self.volume_ceiling = None
         self.current_pct = None
         self.media_attempt = 0
         self._media_recheck_used = False
@@ -731,7 +746,8 @@ class WakeupRoutine(hass.Hass):
                     self.call_service("media_player/volume_mute", entity_id=t, is_volume_muted=False)
         except Exception:
             pass
-        self._set_volume(self.volume_start)
+        self.volume_ceiling = self._volume_ceiling_for(self.master_player)
+        self._set_volume(min(self.volume_start, self.volume_ceiling))
         self.volume_active = True
         self._schedule_next_volume_tick()
         # Verify playback started; if not, try fallbacks (delays sized for HLS startup,
@@ -916,9 +932,9 @@ class WakeupRoutine(hass.Hass):
         current = self._get_first_volume([self.master_player])
         if current is None:
             current = self.volume_start
-        next_vol = min(self.volume_target, round(current + self.volume_step, 3))
+        next_vol = min(self.volume_ceiling, round(current + self.volume_step, 3))
         self._set_volume(next_vol)
-        if next_vol >= self.volume_target:
+        if next_vol >= self.volume_ceiling:
             self.volume_active = False
             self.log(f"[wake] Volume ramp complete at {next_vol}", log=self.user_log)
         else:
@@ -937,6 +953,40 @@ class WakeupRoutine(hass.Hass):
 
     def _set_volume(self, level):
         self.call_service("media_player/volume_set", entity_id=self.master_player, volume_level=float(level))
+
+    def _standard_volumes(self):
+        """(speaker -> standard level, level for a speaker not listed), read from the
+        SonosStateReset config. Anything unreadable comes back empty / None."""
+        try:
+            args = self.get_app(STANDARD_VOLUME_APP).args
+            volumes = {e: _level(v) for e, v in args["speaker_volumes"].items()}
+            default = _level(args.get("default_volume"))
+        except Exception:
+            return {}, None
+        return {e: v for e, v in volumes.items() if v is not None}, default
+
+    def _volume_ceiling_for(self, entity):
+        """Highest level the wake ramp may set on this speaker: volume_target, but never
+        above the speaker's standard volume (a speaker the reset app does not list gets its
+        default_volume, as it does there). When no standard can be read the ramp is capped
+        at the most conservative level instead - the lowest standard known, else
+        volume_start - so a missing config can never make the alarm louder than the house."""
+        volumes, default = self._standard_volumes()
+        standard = volumes.get(entity, default)
+        if standard is None:
+            standard = min(volumes.values()) if volumes else self.volume_start
+            self.log(
+                f"[wake] No standard volume for {entity} in the {STANDARD_VOLUME_APP} config - "
+                f"capping the ramp at {standard}",
+                level="WARNING", log=self.user_log,
+            )
+        ceiling = min(self.volume_target, standard)
+        self.log(
+            f"[wake] Volume ramp on {entity}: {min(self.volume_start, ceiling)} -> {ceiling} "
+            f"(target {self.volume_target})",
+            log=self.user_log,
+        )
+        return ceiling
 
     # ---------- covers ----------
     def _nudge_cover_if_closed(self, entity, target_pct):

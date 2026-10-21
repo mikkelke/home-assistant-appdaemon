@@ -31,6 +31,8 @@ WakeupBedroom:
     - media_player.bedroom
     - media_player.bathroom
   volume_start: 0.06
+  # The ramp never passes the ramped speaker's standard volume: its ceiling is
+  # min(volume_target, speaker_volumes[<speaker>] in apps/sonos/state_reset.yaml), read when the alarm fires.
   volume_target: 0.18
   volume_step: 0.03
   volume_interval_sec: 60
