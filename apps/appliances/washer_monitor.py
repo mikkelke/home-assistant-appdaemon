@@ -67,6 +67,7 @@ import washer_power as wpow
 import washer_plug as wplug
 import washer_profiles as wp
 import cycle_store as cystore
+import door_history
 import drum_clean
 import feedback_io
 import run_ledger
@@ -118,6 +119,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
     _CANONICAL_SPIN = wp.CANONICAL_SPIN
     _DEFAULT_PROFILES = wp.DEFAULT_PROFILES
     PROGRAMME_PROFILES = dict(wp.DEFAULT_PROFILES)
+
+    # The oldest door close still taken as the moment the machine was loaded.
+    LOAD_ANCHOR_MAX_AGE_S = 12 * 3600
 
 
     def _get_profile(self, programme: str, temperature=None):
@@ -2257,6 +2261,25 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.log(f"Door-open history check failed: {e}", level="DEBUG")
             return False
 
+    def _door_close_from_history(self, now):
+        """The door's last real close within LOAD_ANCHOR_MAX_AGE_S before `now`, from the recorder.
+        None when there is none, the sensor is wired inverted (door_history reads on = open), or
+        the lookup fails."""
+        try:
+            if self.door_sensor_inverted:
+                return None
+            hist = self.get_history(
+                entity_id=self.door_sensor,
+                start_time=now - timedelta(seconds=self.LOAD_ANCHOR_MAX_AGE_S),
+                end_time=now,
+            )
+            return door_history.last_close(
+                self._flatten_history(hist, self.door_sensor), now, self.LOAD_ANCHOR_MAX_AGE_S
+            )
+        except Exception as e:
+            self.log(f"Door-close history lookup failed: {e}", level="DEBUG")
+            return None
+
     def _finish_route_to_emptied(self) -> bool:
         """At a power/timer/backstop-driven finish (skip_announce=False), decide whether the
         human is already at/done with the machine so we go straight to Emptied and never
@@ -4019,10 +4042,16 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # washer.yaml), which would otherwise point ActorAttribution at whoever was home hours
         # later. Reuses the same trust/freshness bar as the start_time door-close clamp below
         # (~3705-3714): only a recent (<=12h), trusted door close that isn't stale from a
-        # PREVIOUS cycle (before last Off) counts; otherwise fall back to now.
+        # PREVIOUS cycle (before last Off) counts; otherwise fall back to now. Without a trusted
+        # close in memory (e.g. a restart while the timer ran) the recorder's last real close
+        # stands in, held to the same recency and last-Off bar.
         attribution_anchor = self._now_utc()
-        if self.last_door_closed_trusted and self.last_door_closed_at:
-            door_age_s = (attribution_anchor - self.last_door_closed_at).total_seconds()
+        door_close = self.last_door_closed_at if self.last_door_closed_trusted else None
+        close_from_history = door_close is None
+        if close_from_history:
+            door_close = self._door_close_from_history(attribution_anchor)
+        if door_close is not None:
+            door_age_s = (attribution_anchor - door_close).total_seconds()
             last_off_at = None
             try:
                 last_off_str = self.get_state(self.state_entity, attribute="last_off_at")
@@ -4030,9 +4059,15 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                     last_off_at = _parse_utc(last_off_str)
             except (TypeError, ValueError, AttributeError):
                 last_off_at = None
-            not_before_off = last_off_at is None or self.last_door_closed_at >= last_off_at
-            if 0 <= door_age_s <= 12 * 3600 and not_before_off:
-                attribution_anchor = self.last_door_closed_at
+            # last_off_at is stamped by the same close, truncated to whole seconds.
+            not_before_off = last_off_at is None or door_close >= last_off_at - timedelta(seconds=2)
+            if 0 <= door_age_s <= self.LOAD_ANCHOR_MAX_AGE_S and not_before_off:
+                attribution_anchor = door_close
+                if close_from_history:
+                    self.log(
+                        f"Start attributed at door close from history: {self._format_local(door_close)}",
+                        level="INFO",
+                    )
         self._cycle_actor = self._attribute("washer_start", at=attribution_anchor)
         self.start_time = self._now_utc()
         self._start_time_source = "live"  # directly observed the start - see _START_TIME_SOURCE_RANK

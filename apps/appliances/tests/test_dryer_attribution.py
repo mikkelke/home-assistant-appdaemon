@@ -287,6 +287,116 @@ class StartCapturedOnce(unittest.TestCase):
             self.assertEqual(actor.calls[-1], ("dryer_start", clock.now, None))
 
 
+def loading_close(close_at):
+    """Door history of a load going in: opened a minute and a half before it shut."""
+    return [
+        {"state": "on", "last_changed": cs.format_utc(close_at - timedelta(seconds=90))},
+        {"state": "off", "last_changed": cs.format_utc(close_at)},
+    ]
+
+
+def serve_door_history(app, states):
+    """The recorder holds `states` for the door sensor, or raises when handed an exception.
+    Returns the list of entities it was asked about."""
+    asked = []
+
+    def get_history(entity_id=None, **kwargs):
+        asked.append(entity_id)
+        if isinstance(states, Exception):
+            raise states
+        return [list(states if entity_id == DOOR_SENSOR else [])]
+
+    app.get_history = get_history
+    return asked
+
+
+class StartAnchoredFromHistory(unittest.TestCase):
+    """A start with no door close in memory (AppDaemon restarted after the door shut on a
+    delayed-start load) takes the close from the recorder."""
+
+    CLOSE = T0 - timedelta(hours=2, minutes=30)
+
+    def _booted(self, tmp, states):
+        clock = Clock(T0)
+        actor = make_actor(clock, [
+            (self.CLOSE - timedelta(hours=1), {"mikkel"}),
+            (T0 - timedelta(minutes=20), {"mikkel", "kristine"}),
+        ])
+        app = make_app(tmp, clock, actor)
+        app.initialize()
+        return app, clock, actor, serve_door_history(app, states)
+
+    def _history_anchor_logged(self, app):
+        return any(kw.get("level") == "INFO" and "from history" in a[0] for a, kw in app.log_calls)
+
+    def test_the_recorders_close_is_the_anchor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, clock, actor, asked = self._booted(tmp, loading_close(self.CLOSE))
+
+            load_and_start(app, clock)
+
+            self.assertEqual(actor.calls, [("dryer_start", self.CLOSE, None)])
+            self.assertEqual((published(app)["started_by"], published(app)["started_by_method"]), ("mikkel", "sole_occupant"))
+            self.assertIn(DOOR_SENSOR, asked)
+            self.assertTrue(self._history_anchor_logged(app))
+
+    def test_the_same_start_is_unknown_without_the_recorders_close(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, clock, actor, _asked = self._booted(tmp, [])
+
+            load_and_start(app, clock)
+
+            self.assertEqual(actor.calls, [("dryer_start", T0, None)])
+            self.assertEqual((published(app)["started_by"], published(app)["started_by_method"]), ("", "unknown"))
+            self.assertFalse(self._history_anchor_logged(app))
+
+    def test_a_close_in_memory_never_asks_the_recorder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, clock, actor, asked = self._booted(tmp, loading_close(self.CLOSE))
+            close_at = T0 - timedelta(minutes=5)
+
+            load_and_start(app, clock, close_at=close_at)
+
+            self.assertEqual(actor.calls, [("dryer_start", close_at, None)])
+            self.assertNotIn(DOOR_SENSOR, asked)
+            self.assertFalse(self._history_anchor_logged(app))
+
+    def test_a_failing_lookup_falls_back_to_the_power_edge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, clock, actor, asked = self._booted(tmp, RuntimeError("recorder unavailable"))
+
+            load_and_start(app, clock)
+
+            self.assertEqual(app.state, "Running")
+            self.assertEqual(actor.calls, [("dryer_start", T0, None)])
+            self.assertIn(DOOR_SENSOR, asked)
+            self.assertTrue(any(
+                kw.get("level") == "DEBUG" and "Door-close history lookup failed" in a[0] for a, kw in app.log_calls
+            ))
+
+    def test_a_close_over_the_anchor_bound_is_not_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, clock, actor, _asked = self._booted(
+                tmp, loading_close(T0 - timedelta(seconds=dm.DryerMonitor.LOAD_ANCHOR_MAX_AGE_S + 60)),
+            )
+
+            load_and_start(app, clock)
+
+            self.assertEqual(actor.calls, [("dryer_start", T0, None)])
+
+    def test_a_contact_reconnect_in_the_recorder_is_not_a_close(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reconnect = [
+                {"state": "unavailable", "last_changed": cs.format_utc(self.CLOSE - timedelta(minutes=1))},
+                {"state": "off", "last_changed": cs.format_utc(self.CLOSE)},
+            ]
+            app, clock, actor, _asked = self._booted(tmp, reconnect)
+
+            load_and_start(app, clock)
+
+            self.assertEqual(actor.calls, [("dryer_start", T0, None)])
+
+
 class EmptiedAttribution(unittest.TestCase):
 
     def _unemptied(self, tmp, timeline, user_ids=None):

@@ -62,6 +62,9 @@ except ImportError:
 # Atomic writes of the feedback file, and the history set aside when it cannot be read.
 import feedback_io
 
+# The door's last real close, read back from the recorder.
+import door_history
+
 
 class DryerMonitor(CyclePersistenceMixin, hass.Hass):
     PROGRAMME_PROFILES = {}
@@ -2491,11 +2494,36 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
 
     def _take_load_anchor(self, now):
         """When this cycle was loaded: the last door close when it is at most
-        LOAD_ANCHOR_MAX_AGE_S old, else `now`. Consumes the close, so it anchors one cycle only."""
+        LOAD_ANCHOR_MAX_AGE_S old, else `now`. Consumes the close, so it anchors one cycle only.
+        With no close in memory (e.g. a restart while the timer ran) the recorder's last one stands in."""
         loaded_at, self.last_door_closed_at = self.last_door_closed_at, None
+        close_from_history = loaded_at is None
+        if close_from_history:
+            loaded_at = self._door_close_from_history(now)
         if loaded_at is not None and 0 <= (now - loaded_at).total_seconds() <= self.LOAD_ANCHOR_MAX_AGE_S:
+            if close_from_history:
+                self.log(
+                    f"Start attributed at door close from history: {self._format_local(loaded_at)}",
+                    level="INFO",
+                )
             return loaded_at
         return now
+
+    def _door_close_from_history(self, now):
+        """The door's last real close within LOAD_ANCHOR_MAX_AGE_S before `now`, from the recorder.
+        None when there is none or the lookup fails."""
+        try:
+            hist = self.get_history(
+                entity_id=self.door_sensor,
+                start_time=now - timedelta(seconds=self.LOAD_ANCHOR_MAX_AGE_S),
+                end_time=now,
+            )
+            return door_history.last_close(
+                self._flatten_history(hist, self.door_sensor), now, self.LOAD_ANCHOR_MAX_AGE_S
+            )
+        except Exception as e:
+            self.log(f"Door-close history lookup failed: {e}", level="DEBUG")
+            return None
 
     def _started_by_attrs(self) -> dict:
         actor = self._cycle_actor or {}

@@ -1,8 +1,9 @@
 # tests/test_washer_attribution.py - "Who started this wash / who emptied it" unit tests for
 # washer_monitor.py: the ActorAttribution resolver (_attribute), the restore-shape helper
-# (_cycle_actor_from_state_attrs), the attribution anchor picked in _begin_running_cycle, the
-# delayed-start slide NOT re-attributing, the actor_start/actor_empty fields written by
-# _save_cycle_feedback, the emptied_by patch (_patch_cycle_record), and confirm-push targeting.
+# (_cycle_actor_from_state_attrs), the attribution anchor picked in _begin_running_cycle (the
+# recorder's door close when none is trusted in memory), the delayed-start slide NOT
+# re-attributing, the actor_start/actor_empty fields written by _save_cycle_feedback, the
+# emptied_by patch (_patch_cycle_record), and confirm-push targeting.
 # Same __new__ + monkeypatched-callables harness as test_washer_vibration.py /
 # test_washer_unavailable_grace.py in this directory (no running AppDaemon required).
 # Run from repo root: python3 -m unittest discover -s apps/appliances/tests -q
@@ -34,6 +35,7 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     sys.modules["appdaemon.plugins.hass.hassapi"] = hassapi
 
 import washer_monitor as wm
+from test_dryer_attribution import Clock, make_actor  # noqa: E402  (real ActorAttribution on a presence timeline)
 from washer_plug_fixture import attach_plug  # noqa: E402
 
 _RESULT_KEYS = {"person", "method", "reason", "people_home", "anchor", "evaluated_at", "version"}
@@ -184,14 +186,22 @@ class CycleActorFromStateAttrs(unittest.TestCase):
         self.assertEqual(result["reason"], "restored_from_entity")
 
 
-def _make_begin_cycle_app(now, last_door_closed_at=None, last_door_closed_trusted=False, last_off_at_str=None):
+def _make_begin_cycle_app(
+    now, last_door_closed_at=None, last_door_closed_trusted=False, last_off_at_str=None,
+    door_states=(), actor=None,
+):
     """WasherMonitor stubbed just enough to run the real _begin_running_cycle end to end -
     everything it touches besides the attribution anchor (poll timers, energy sensor, HA
-    entity plumbing) is faked out; the finish tick it arms is only recorded, never run."""
+    entity plumbing) is faked out; the finish tick it arms is only recorded, never run.
+    door_states is what the recorder holds for the door sensor (a list of state dicts, or an
+    exception to raise); actor, when given, replaces the canned attribution with a real
+    ActorAttribution."""
     app = wm.WasherMonitor.__new__(wm.WasherMonitor)
     app._now_utc = lambda: now
     app.state_entity = "sensor.washer_state"
     app.energy_sensor = "sensor.washer_plug_energy"
+    app.door_sensor = "binary_sensor.washer_door_contact"
+    app.door_sensor_inverted = False
     app.confirm_entity = None
     app.pause_window_minutes = 3
     app.max_running_hours = 5
@@ -201,6 +211,16 @@ def _make_begin_cycle_app(now, last_door_closed_at=None, last_door_closed_truste
     app.last_door_closed_trusted = last_door_closed_trusted
     app.last_door_closed_at = last_door_closed_at
     app.energy_start = None  # no numeric energy_sensor reading configured in this fixture
+
+    app.history_requests = []
+
+    def get_history(entity_id=None, start_time=None, end_time=None, **kw):
+        app.history_requests.append((entity_id, start_time, end_time))
+        if isinstance(door_states, Exception):
+            raise door_states
+        return [list(door_states)]
+
+    app.get_history = get_history
 
     states = {}
     if last_off_at_str is not None:
@@ -222,7 +242,7 @@ def _make_begin_cycle_app(now, last_door_closed_at=None, last_door_closed_truste
             "people_home": ["mikkel"], "anchor": "x", "evaluated_at": "y", "version": 1,
         }
 
-    app._attribute = fake_attribute
+    app._attribute = fake_attribute if actor is None else (lambda event, at=None: actor.attribute(event, at=at))
 
     app.log_calls = []
     app.log = lambda *a, **kw: app.log_calls.append((a, kw))
@@ -289,6 +309,112 @@ class BeginRunningCycleAttributionAnchor(unittest.TestCase):
         )
         app._begin_running_cycle()
         self.assertEqual(app.attribute_calls, [("washer_start", now)])
+
+
+def _loading_close(close_at):
+    """Door history of a load going in: opened a minute and a half before it shut."""
+    return [
+        {"state": "on", "last_changed": (close_at - timedelta(seconds=90)).isoformat()},
+        {"state": "off", "last_changed": close_at.isoformat()},
+    ]
+
+
+def _history_anchor_logged(app):
+    return any(kw.get("level") == "INFO" and "from history" in a[0] for a, kw in app.log_calls)
+
+
+class BeginRunningCycleAttributionFromHistory(unittest.TestCase):
+    """With no trusted door close in memory (an AppDaemon restart while the delayed-start timer
+    ran), _begin_running_cycle takes the door's last real close from the recorder and holds it
+    to the same age and last-Off bar as an in-memory one."""
+
+    NOW = datetime(2026, 7, 27, 22, 0, 0, tzinfo=timezone.utc)
+    CLOSE = NOW - timedelta(hours=2, minutes=30)
+
+    def test_history_close_is_the_anchor_when_memory_has_none(self):
+        app = _make_begin_cycle_app(self.NOW, door_states=_loading_close(self.CLOSE))
+        app._begin_running_cycle()
+        self.assertEqual(app.attribute_calls, [("washer_start", self.CLOSE)])
+        self.assertEqual(
+            app.history_requests,
+            [("binary_sensor.washer_door_contact", self.NOW - timedelta(hours=12), self.NOW)],
+        )
+        self.assertEqual(app.start_time, self.NOW)  # only the attribution moves, never the cycle clock
+        self.assertTrue(_history_anchor_logged(app))
+
+    def test_untrusted_close_in_memory_defers_to_the_recorder(self):
+        app = _make_begin_cycle_app(
+            self.NOW, last_door_closed_at=self.CLOSE + timedelta(milliseconds=40),
+            last_door_closed_trusted=False, door_states=_loading_close(self.CLOSE),
+        )
+        app._begin_running_cycle()
+        self.assertEqual(app.attribute_calls, [("washer_start", self.CLOSE)])
+
+    def test_trusted_close_in_memory_never_asks_the_recorder(self):
+        fresh = self.NOW - timedelta(hours=1)
+        app = _make_begin_cycle_app(
+            self.NOW, last_door_closed_at=fresh, last_door_closed_trusted=True,
+            last_off_at_str=(self.NOW - timedelta(hours=3)).isoformat(),
+            door_states=_loading_close(self.CLOSE),
+        )
+        app._begin_running_cycle()
+        self.assertEqual(app.attribute_calls, [("washer_start", fresh)])
+        self.assertEqual(app.history_requests, [])
+        self.assertFalse(_history_anchor_logged(app))
+
+    def test_started_by_is_whoever_was_home_at_the_history_close(self):
+        clock = Clock(self.NOW)
+        actor = make_actor(clock, [
+            (self.CLOSE - timedelta(hours=1), {"mikkel"}),
+            (self.NOW - timedelta(minutes=20), {"mikkel", "kristine"}),
+        ])
+        app = _make_begin_cycle_app(self.NOW, door_states=_loading_close(self.CLOSE), actor=actor)
+        app._begin_running_cycle()
+        attrs = app.set_state_calls[-1]["attributes"]
+        self.assertEqual((attrs["started_by"], attrs["started_by_method"]), ("mikkel", "sole_occupant"))
+        self.assertEqual(actor.calls, [("washer_start", self.CLOSE, None)])
+
+    def test_the_same_start_is_unknown_without_the_recorder_close(self):
+        clock = Clock(self.NOW)
+        actor = make_actor(clock, [
+            (self.CLOSE - timedelta(hours=1), {"mikkel"}),
+            (self.NOW - timedelta(minutes=20), {"mikkel", "kristine"}),
+        ])
+        app = _make_begin_cycle_app(self.NOW, door_states=(), actor=actor)
+        app._begin_running_cycle()
+        attrs = app.set_state_calls[-1]["attributes"]
+        self.assertEqual((attrs["started_by"], attrs["started_by_method"]), ("", "unknown"))
+        self.assertEqual(actor.calls, [("washer_start", self.NOW, None)])
+
+    def test_failing_lookup_falls_back_to_now(self):
+        app = _make_begin_cycle_app(self.NOW, door_states=RuntimeError("recorder unavailable"))
+        app._begin_running_cycle()
+        self.assertEqual(app.attribute_calls, [("washer_start", self.NOW)])
+        self.assertEqual(len(app.history_requests), 1)
+        self.assertTrue(any(
+            kw.get("level") == "DEBUG" and "Door-close history lookup failed" in a[0] for a, kw in app.log_calls
+        ))
+
+    def test_history_close_before_last_off_is_not_used(self):
+        app = _make_begin_cycle_app(
+            self.NOW, last_off_at_str=(self.CLOSE + timedelta(minutes=30)).isoformat(),
+            door_states=_loading_close(self.CLOSE),
+        )
+        app._begin_running_cycle()
+        self.assertEqual(app.attribute_calls, [("washer_start", self.NOW)])
+        self.assertFalse(_history_anchor_logged(app))
+
+    def test_history_close_over_12h_old_is_not_used(self):
+        app = _make_begin_cycle_app(self.NOW, door_states=_loading_close(self.NOW - timedelta(hours=13)))
+        app._begin_running_cycle()
+        self.assertEqual(app.attribute_calls, [("washer_start", self.NOW)])
+
+    def test_inverted_door_sensor_is_not_read_from_the_recorder(self):
+        app = _make_begin_cycle_app(self.NOW, door_states=_loading_close(self.CLOSE))
+        app.door_sensor_inverted = True
+        app._begin_running_cycle()
+        self.assertEqual(app.attribute_calls, [("washer_start", self.NOW)])
+        self.assertEqual(app.history_requests, [])
 
 
 class DelayedStartSlideDoesNotReattribute(unittest.TestCase):
