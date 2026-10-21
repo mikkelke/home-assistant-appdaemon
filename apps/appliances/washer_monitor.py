@@ -83,6 +83,14 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from cycle_persistence import CyclePersistenceMixin
 
+# A start or emptying that ActorAttribution can only settle minutes after the event.
+try:
+    from actor_followup import ActorFollowupMixin
+except ImportError:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from actor_followup import ActorFollowupMixin
+
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -108,7 +116,7 @@ _START_TIME_SOURCE_RANK = {
 }
 
 
-class WasherMonitor(CyclePersistenceMixin, hass.Hass):
+class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
     # Programme profiles loaded from washer_programmes.yaml at startup.
     # Programme and temperature are independent dimensions.  For "bomuld",
     # the profile depends on the selected temperature (by_temperature dict).
@@ -422,6 +430,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             lambda: bool(self._activity_seen),
             lambda: bool(self.programme_confirmed_by_user),
             lambda: self.last_door_closed_at,
+            lambda: (self._cycle_actor or {}).get("person"),
         )
 
     def _cycle_store_last_off_at(self):
@@ -3351,6 +3360,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             # Running publish, but writing it explicitly here keeps it correct even after a
             # _recover_from_false_unemptied revert re-seeded self._cycle_actor mid-cycle.
             attributes["started_by"] = (self._cycle_actor or {}).get("person") or ""
+            attributes["started_by_method"] = (self._cycle_actor or {}).get("method") or "unknown"
             if energy_used > 0:
                 attributes["energy_used"] = round(energy_used, 3)
             if spin_rpm is not None:
@@ -3627,6 +3637,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
             }
             # Dashboard visibility for who emptied the machine (see _attribute above).
             attributes["emptied_by"] = (actor_empty or {}).get("person") or ""
+            attributes["emptied_by_method"] = (actor_empty or {}).get("method") or "unknown"
             if energy_used > 0:
                 attributes["energy_used"] = round(energy_used, 3)
             # Preserve run_time_minutes, end_reason, idle_min from entity when coming from Unemptied
@@ -3696,6 +3707,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                     "emptied_ts": self._format_local(self._now_utc()),
                     "attribution": {"empty": actor_empty},
                 })
+            self._follow_up_actor("empty", actor_empty, "washer_emptied")
 
             # Cancel unemptied watchdog since we're now emptying
             self._safe_cancel_timer(self.unemptied_watchdog_timer)
@@ -4204,6 +4216,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
         # fresh cycle) -- AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish()
         # for details.
         self._set_state_entity( state="Running", attributes=attrs, replace=True)
+        self._follow_up_actor("start", self._cycle_actor, "washer_start")
 
         if not self.poll_timer:
             poll_interval = int(self.args.get("poll_interval_s", 60))

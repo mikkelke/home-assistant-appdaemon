@@ -65,8 +65,16 @@ import feedback_io
 # The door's last real close, read back from the recorder.
 import door_history
 
+# A start or emptying that ActorAttribution can only settle minutes after the event.
+try:
+    from actor_followup import ActorFollowupMixin
+except ImportError:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from actor_followup import ActorFollowupMixin
 
-class DryerMonitor(CyclePersistenceMixin, hass.Hass):
+
+class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
     PROGRAMME_PROFILES = {}
 
     # Attribution state (see _attribute), class-level so it also exists before initialize().
@@ -115,6 +123,7 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
             lambda: self.notification_sent,
             lambda: self.detected_programme,
             lambda: self.expected_dur_at_start,
+            lambda: (self._cycle_actor or {}).get("person"),
         )
 
     def _cycle_store_field_map(self):
@@ -1958,6 +1967,7 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
                     "emptied_ts": self._format_local(self._now_utc()),
                     "attribution": {"empty": actor_empty},
                 })
+                self._follow_up_actor("empty", actor_empty, "dryer_emptied")
 
             # Cancel unemptied watchdog since we're now emptying
             self._safe_cancel_timer(self.unemptied_watchdog_timer)
@@ -2269,6 +2279,7 @@ class DryerMonitor(CyclePersistenceMixin, hass.Hass):
                 self.expected_dur_at_start = self._get_guard_duration(tick_prog=effective_key)
                 self._set_state_entity( state="Running", attributes=self._started_by_attrs())
                 self._update_running_attributes()
+                self._follow_up_actor("start", self._cycle_actor, "dryer_start")
 
                 if not self.poll_timer:
                     self.poll_timer = self.run_in(self._poll_power, 60)

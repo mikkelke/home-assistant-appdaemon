@@ -59,8 +59,17 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from cycle_persistence import CyclePersistenceMixin
 
+# A start or emptying that ActorAttribution can only settle minutes after the event.
+try:
+    from actor_followup import ActorFollowupMixin
+except ImportError:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from actor_followup import ActorFollowupMixin
+
 # Pure history/power-signal helpers shared with the washer (sibling-import modules; AppDaemon
 # puts app dirs on sys.path — same precedent washer_monitor.py already relies on).
+import door_history
 import feedback_io
 import washer_history as whist
 import washer_power as wpow
@@ -82,8 +91,15 @@ def _parse_utc(s: str):
         return None
 
 
-class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
+class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
     PROGRAMME_PROFILES = {}
+
+    # Attribution state (see _attribute), class-level so it also exists before initialize().
+    _cycle_actor = None  # ActorAttribution result for whoever started the current cycle
+    last_door_closed_at = None  # UTC of the last door close with the machine Off or Emptied
+    # The start is anchored on the door close that loaded the machine, which can precede the power
+    # edge by hours on a delayed start; a close older than this is not trusted.
+    LOAD_ANCHOR_MAX_AGE_S = 12 * 3600
 
     def _safe_cancel_timer(self, handle):
         """Cancel a timer only if still running (avoids invalid-handle warnings)."""
@@ -143,6 +159,7 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             lambda: self.notification_sent,
             lambda: self.detected_programme,
             lambda: self.expected_dur_at_start,
+            lambda: (self._cycle_actor or {}).get("person"),
         )
 
     def _cycle_store_field_map(self):
@@ -166,6 +183,8 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
                 lambda: format_utc(self._last_high_power_time) if self._last_high_power_time else None
             ),
             "notification_sent": lambda: self.notification_sent,
+            "started_by": lambda: (self._cycle_actor or {}).get("person"),
+            "started_by_method": lambda: (self._cycle_actor or {}).get("method"),
         }
 
     def initialize(self):
@@ -592,6 +611,8 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         # would get via _should_change_state.
         if self.state != "Off" and self.state_since is None:
             self.state_since = self._now_utc()
+        if self.state != "Off" and not boot_store_rejected:
+            self._cycle_actor = self._restored_cycle_actor()
         self._set_state_entity( state=self.state)
         if self.state == "Unemptied":
             self._strict_start_until_door_or_sustain = True
@@ -1265,7 +1286,7 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             )
             if gate == "door-edge":
                 # Already emptied during the outage - move straight to Emptied (no reminder).
-                self._transition_to_emptied("Door opened during the outage - already emptied")
+                self._transition_to_emptied("Door opened during the outage - already emptied", observed=False)
             elif gate == "late-push":
                 self._push_mobile(
                     f"Dishwasher finished about {latency_min:.0f} min ago (late detection) - "
@@ -1888,6 +1909,8 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             record["end_reason"] = end_reason
         if idle_min is not None and idle_min >= 0:
             record["idle_min"] = round(idle_min, 1)
+        record["started_by"] = (self._cycle_actor or {}).get("person")
+        record["attribution"] = {"start": self._cycle_actor}
         data = feedback_io.load_for_append(self.feedback_file, self.log)
         if data is None:
             return
@@ -1951,8 +1974,12 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             self.log(f"Could not write feedback after recovery: {e}", level="WARNING")
         self.log(f"Removed false cycle from feedback ({duration_min:.0f}min, {confirmed})", level="INFO")
 
-    def _mark_last_cycle_emptied(self):
-        """Append emptied_ts to the last cycle in feedback so we have a record that the user emptied."""
+    def _mark_last_cycle_emptied(self, actor=None):
+        """Append emptied_ts to the last cycle in feedback so we have a record that the user emptied,
+        with emptied_by and attribution.empty when `actor` (ActorAttribution's answer for this
+        emptying) is given. A record that is already emptied is left as it is: the newest record is
+        not always the run being emptied (a forced emptying from Paused, a save that failed), and
+        a second stamp would credit this emptying to an older run."""
         import json
         if not os.path.exists(self.feedback_file):
             return
@@ -1965,7 +1992,16 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         cycles = data.get("cycles") or []
         if not cycles:
             return
-        cycles[-1]["emptied_ts"] = self._format_local(self._now_utc())
+        record = cycles[-1]
+        if record.get("emptied_ts"):
+            self.log(f"Last cycle record ts={record.get('ts')} is already emptied - not re-stamping", level="DEBUG")
+            return
+        record["emptied_ts"] = self._format_local(self._now_utc())
+        if actor is not None:
+            record["emptied_by"] = actor.get("person")
+            if not isinstance(record.get("attribution"), dict):
+                record["attribution"] = {}
+            record["attribution"]["empty"] = actor
         try:
             feedback_io.write_json(self.feedback_file, data)
         except Exception as e:
@@ -2108,6 +2144,10 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         ):
             self.start_time = self.last_door_closed_at
         self.cycle_id = uuid.uuid4().hex  # fresh identity for a genuinely new cycle
+        if not from_unemptied_recovery:
+            # A recovery is the same run: its starter is already known.
+            self._cycle_actor = self._attribute("dishwasher_start", at=self._load_anchor(self._now_utc()))
+            self.log(f"Start attribution: {self._cycle_actor}", level="INFO")
         self.notification_sent = False
         self.door_opened_during_cycle = False
         self.detected_programme = "unknown"
@@ -2126,8 +2166,10 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         display_prog = self._get_programme_for_display()
         self.detected_programme = display_prog
         self.expected_dur_at_start = self._get_guard_duration(tick_prog=display_prog)
-        self._set_state_entity(state="Running")
+        self._set_state_entity(state="Running", attributes=self._started_by_attrs())
         self._update_running_attributes()
+        if not from_unemptied_recovery:
+            self._follow_up_actor("start", self._cycle_actor, "dishwasher_start")
 
         if self.reset_programme_selector_on_start and self.confirmed_programme_entity:
             try:
@@ -2363,6 +2405,7 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             "estimated_end_time": self._format_utc(eta) if eta else None,
             "energy_at_start": self.energy_start,
             "energy_used": round(self._get_energy_used(), 3),
+            **self._started_by_attrs(),
         }
         pending = getattr(self, "_dry_tail_pending", None)
         if pending and pending.get("target"):
@@ -2815,6 +2858,8 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             "energy_at_start": None,
             "energy_used": None,
             "run_time_minutes": None,
+            "started_by": None,
+            "started_by_method": None,
         }
         try:
             full = self.get_state(self.state_entity, attribute="all") or {}
@@ -2845,6 +2890,9 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             "estimated_end_time": "",
             "energy_at_start": None,
             "run_time_minutes": round(float(run_minutes), 1),
+            **self._started_by_attrs(),
+            "emptied_by": None,
+            "emptied_by_method": None,
         }
         if energy_used is not None and float(energy_used) > 0:
             cleared["energy_used"] = round(float(energy_used), 3)
@@ -2955,10 +3003,12 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             return
         if old_state_raw is None or old in (None, "unknown", "unavailable"):
             return
-        self._force_emptied("Dashboard button")
+        user_id = (new_state.get("context") or {}).get("user_id")
+        self._force_emptied("Dashboard button", actor_user_id=user_id)
 
-    def _force_emptied(self, reason):
-        """Shared body for dishwasher_force_emptied and the input_button press."""
+    def _force_emptied(self, reason, actor_user_id=None):
+        """Shared body for dishwasher_force_emptied and the input_button press (which carries
+        actor_user_id, the HA user who tapped)."""
         st = self.get_state(self.state_entity)
         if st == "Emptied":
             self.log("Force Emptied ignored: already Emptied", level="DEBUG")
@@ -2975,7 +3025,7 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         if not self.start_time:
             self._restore_cycle_tracking_from_entity()
         self.log(f"Force Emptied via event ({reason})", level="INFO")
-        self._transition_to_emptied(reason)
+        self._transition_to_emptied(reason, actor_user_id=actor_user_id)
 
     def _handle_force_off(self, event_name, data, kwargs):
         """Handle dishwasher_force_off event: transition to Off (e.g. user requested from script/UI)."""
@@ -3045,6 +3095,8 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         full = self.get_state(self.state_entity, attribute="all") or {}
         attrs = dict((full.get("attributes") or {}))
         attrs.pop("reason", None)
+        attrs.pop("emptied_by", None)
+        attrs.pop("emptied_by_method", None)
         if "run_time_minutes" not in attrs and "energy_used" not in attrs:
             run_min = self._get_run_duration_minutes()
             energy = self._get_energy_used()
@@ -3067,7 +3119,8 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         self.log("Door closed too soon after opening (peek) -> back to Unemptied", level="INFO")
 
     def _clear_last_cycle_emptied_ts(self):
-        """Remove emptied_ts from last cycle in feedback (user didn't actually empty)."""
+        """Remove the emptying (emptied_ts, emptied_by, attribution.empty) from the last cycle in
+        feedback (user didn't actually empty)."""
         import json
         if not os.path.exists(self.feedback_file):
             return
@@ -3079,22 +3132,38 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         cycles = data.get("cycles") or []
         if not cycles or "emptied_ts" not in cycles[-1]:
             return
-        cycles[-1].pop("emptied_ts", None)
+        record = cycles[-1]
+        record.pop("emptied_ts", None)
+        record.pop("emptied_by", None)
+        if isinstance(record.get("attribution"), dict):
+            record["attribution"].pop("empty", None)
         try:
             feedback_io.write_json(self.feedback_file, data)
         except Exception:
             pass
 
-    def _transition_to_emptied(self, reason):
-        """Transition to Emptied state (door open, user is emptying). Log emptied, then auto-transition to Off after timeout."""
+    def _transition_to_emptied(self, reason, actor_user_id=None, observed=True):
+        """Transition to Emptied state (door open, user is emptying). Log emptied, then auto-transition to Off after timeout.
+
+        actor_user_id: context.user_id of a dashboard tap, passed through to ActorAttribution.
+        observed=False: the opening happened at an unknown earlier time (found in history after an
+        outage or a missed edge), so nobody is named."""
         if self._should_change_state("Emptied", force=True):  # Door event bypasses cooling
+            if observed:
+                actor_empty = self._attribute("dishwasher_emptied", user_id=actor_user_id)
+            else:
+                actor_empty = self._unknown_actor("not_observed")
+            self.log(f"Emptied attribution: {actor_empty}", level="INFO")
             energy_used = self._get_energy_used()
             run_minutes = self._get_run_duration_minutes()
 
             self.state = "Emptied"
             attributes = {
                 "reason": reason,
-                "run_time_minutes": round(run_minutes, 1) if run_minutes > 0 else None
+                "run_time_minutes": round(run_minutes, 1) if run_minutes > 0 else None,
+                **self._started_by_attrs(),
+                "emptied_by": actor_empty.get("person") or "",
+                "emptied_by_method": actor_empty.get("method") or "unknown",
             }
             if energy_used > 0:
                 attributes["energy_used"] = round(energy_used, 3)
@@ -3108,7 +3177,9 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
             # When we entered Emptied (for min_emptying_seconds: door closed too soon = peek, revert to Unemptied)
             self.emptied_at = self._now_utc()
             # Log that user emptied (for analytics); then auto-transition to Off after timeout if door close not seen
-            self._mark_last_cycle_emptied()
+            self._mark_last_cycle_emptied(actor_empty if observed else None)
+            if observed:
+                self._follow_up_actor("empty", actor_empty, "dishwasher_emptied")
             self._safe_cancel_timer(self.emptied_timeout_timer)
             self.emptied_timeout_timer = self.run_in(
                 self._emptied_timeout,
@@ -3122,6 +3193,7 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
         if getattr(self, "_start_candidate_active", False):
             self._cancel_start_candidate("cycle_reset", level="DEBUG")
         self.start_time = None
+        self._cycle_actor = None
         self.energy_start = None
         self.door_opened_time = None
         self.door_opened_during_cycle = False
@@ -3357,7 +3429,7 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
                     "a door event was missed",
                     level="INFO",
                 )
-                self._transition_to_emptied("Door opened (missed edge, found by poll)")
+                self._transition_to_emptied("Door opened (missed edge, found by poll)", observed=False)
                 return
             # Each check is a recorder history query; Unemptied can last a day, so poll
             # every 5 min here - a missed edge is not latency-critical.
@@ -3503,3 +3575,98 @@ class DishwasherMonitor(CyclePersistenceMixin, hass.Hass):
                 f"State entity became {new!r} — UI may be stale until entity is back",
                 level="WARNING",
             )
+
+    # ----- Who started / emptied the load, via the ActorAttribution app -----
+    # get_app is resolved on every call and ActorAttribution is deliberately not a yaml
+    # `dependencies:` entry: that would reload this monitor, dropping live cycle state, whenever
+    # ActorAttribution reloads.
+
+    def _attribute(self, event, at=None, user_id=None) -> dict:
+        """ActorAttribution.attribute(event, at=, user_id=), or an unknown result of the same
+        shape on any failure, so attribution can never break a cycle."""
+        try:
+            app = self.get_app("ActorAttribution")
+        except Exception as e:
+            self.log(f"Could not resolve ActorAttribution for event={event!r}: {e}", level="WARNING")
+            return self._unknown_actor("attribution_error", at)
+        if app is None:
+            self.log(f"ActorAttribution app not found - cannot attribute event={event!r}", level="WARNING")
+            return self._unknown_actor("attribution_app_missing", at)
+        try:
+            result = app.attribute(event, at=at, user_id=user_id)
+        except Exception as e:
+            self.log(f"ActorAttribution.attribute raised for event={event!r}: {e}", level="WARNING")
+            return self._unknown_actor("attribution_error", at)
+        if not isinstance(result, dict):
+            self.log(f"ActorAttribution.attribute returned {type(result).__name__} for event={event!r}", level="WARNING")
+            return self._unknown_actor("attribution_error", at)
+        return result
+
+    def _unknown_actor(self, reason, at=None) -> dict:
+        now = self._now_utc()
+        return {
+            "person": None,
+            "method": "unknown",
+            "reason": reason,
+            "people_home": [],
+            "anchor": self._format_utc(at if at is not None else now),
+            "evaluated_at": self._format_utc(now),
+            "version": 1,
+        }
+
+    def _cycle_actor_from_state_attrs(self, attrs) -> dict:
+        """The starter rebuilt from a persisted started_by/started_by_method. "" reads as unknown:
+        AppDaemon drops None-valued attributes, so unknown is published as ""."""
+        result = self._unknown_actor("restored_from_entity")
+        result["person"] = attrs.get("started_by") or None
+        result["method"] = attrs.get("started_by_method") or "unknown"
+        return result
+
+    def _restored_cycle_actor(self) -> dict:
+        """Starter of the cycle restored at boot: from the state entity when it carries one, else
+        from the on-disk store (an HA restart erases the entity)."""
+        full = self._boot_full_state_snapshot()
+        attrs = (full.get("attributes") or {}) if isinstance(full, dict) else {}
+        source = attrs if attrs.get("started_by_method") else self._boot_store_snapshot()
+        return self._cycle_actor_from_state_attrs(source)
+
+    def _load_anchor(self, now):
+        """When this cycle was loaded: the last door close when it is at most LOAD_ANCHOR_MAX_AGE_S
+        old. With no close in memory (e.g. a restart while the machine sat Off) the recorder's last
+        real one stands in; with none, `now`. The close in memory is not consumed: start_time is
+        clamped to it and it is stored with the cycle until the cycle's end clears it."""
+        loaded_at = self.last_door_closed_at
+        close_from_history = loaded_at is None
+        if close_from_history:
+            loaded_at = self._door_close_from_history(now)
+        if loaded_at is not None and 0 <= (now - loaded_at).total_seconds() <= self.LOAD_ANCHOR_MAX_AGE_S:
+            if close_from_history:
+                self.log(
+                    f"Start attributed at door close from history: {self._format_local(loaded_at)}",
+                    level="INFO",
+                )
+            return loaded_at
+        return now
+
+    def _door_close_from_history(self, now):
+        """The door's last real close within LOAD_ANCHOR_MAX_AGE_S before `now`, from the recorder.
+        None when there is none or the lookup fails."""
+        try:
+            hist = self.get_history(
+                entity_id=self.door_sensor,
+                start_time=now - timedelta(seconds=self.LOAD_ANCHOR_MAX_AGE_S),
+                end_time=now,
+            )
+            return door_history.last_close(
+                self._flatten_history(hist, self.door_sensor), now, self.LOAD_ANCHOR_MAX_AGE_S
+            )
+        except Exception as e:
+            self.log(f"Door-close history lookup failed: {e}", level="DEBUG")
+            return None
+
+    def _started_by_attrs(self) -> dict:
+        actor = self._cycle_actor or {}
+        return {
+            "started_by": actor.get("person") or "",
+            "started_by_method": actor.get("method") or "unknown",
+        }

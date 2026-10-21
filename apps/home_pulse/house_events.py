@@ -24,7 +24,8 @@ Feed shape (attributes, replace=True on every publish):
                                   "by": <person display name, optional - v4>}
 State = ts of the newest event (cheap change signal for the dashboard).
 `by` carries the acting HUMAN when knowable (report payloads, lock attribution, and the
-resident who started or emptied an appliance run - see appliance_actor);
+resident who started or emptied an appliance run - see appliance_actor, and enrich_by for
+an emptier the monitor can only name minutes after the row was written);
 the dashboard renders it as its own muted "By <name>" line (HA-Activity-style), so
 emitters keep cause/effect wording neutral instead of baking names into sentences.
 `audience` (v5): the literal "admin" hides an entry from non-admin dashboard viewers -
@@ -57,6 +58,7 @@ than guessing (see manual_override_timeout).
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
@@ -65,6 +67,8 @@ MAX_EVENTS = 40
 # One source emitting the exact same text again within this window is flapping
 # (e.g. washer Unemptied->Emptied->Off lands in the same second), not news.
 DUP_SUPPRESS_S = 300
+# An emptied row still takes the emptier's name this long after it was written (see enrich_by).
+EMPTIED_ENRICH_S = 900
 # Reports come from other apps but are still validated like external data - a bug
 # elsewhere must not be able to bloat the feed entity past what a dashboard expects.
 MAX_TEXT_LEN = 120
@@ -126,8 +130,9 @@ def _first_name_if_resident(who):
 
 
 # ActorAttribution methods that name a person on evidence: the only person home
-# (sole_occupant) or the HA user behind a dashboard tap (dashboard_action).
-RELIABLE_ACTOR_METHODS = ("sole_occupant", "dashboard_action")
+# (sole_occupant), the HA user behind a dashboard tap (dashboard_action), or the one resident
+# left once the others had stayed in their own rooms (room_elimination).
+RELIABLE_ACTOR_METHODS = ("sole_occupant", "dashboard_action", "room_elimination")
 
 
 def _resident_name(person):
@@ -140,19 +145,41 @@ def appliance_actor(kind, attrs):
     """Display name of the resident who started the run (a "finished" row) or emptied it
     (an "emptied" row), or None.
 
-    A wrong name is worse than none: only a resident named by a reliable method counts.
-    The monitors publish the starter as started_by + started_by_method and the emptier as
-    emptied_by, plus emptied_by_method where the monitor publishes one. When that method is
-    present it must be reliable; without it emptied_by counts on its own, since
-    ActorAttribution names nobody except through a reliable method.
+    A wrong name is worse than none: only a resident named by a reliable method counts. The
+    monitors publish the starter as started_by + started_by_method and the emptier as
+    emptied_by + emptied_by_method; without a reliable method there is no name.
     """
     if kind == "finished" and attrs.get("started_by_method") in RELIABLE_ACTOR_METHODS:
         return _resident_name(attrs.get("started_by"))
-    if kind == "emptied":
-        if "emptied_by_method" in attrs and attrs["emptied_by_method"] not in RELIABLE_ACTOR_METHODS:
-            return None
+    if kind == "emptied" and attrs.get("emptied_by_method") in RELIABLE_ACTOR_METHODS:
         return _resident_name(attrs.get("emptied_by"))
     return None
+
+
+def enrich_by(events, appliance, by, now):
+    """Copy of the newest-first feed `events` in which the newest "<appliance> emptied" row has `by`,
+    when it has none yet and is at most EMPTIED_ENRICH_S old at `now` (an aware datetime); every
+    other row, and any row it cannot date, is left as it was.
+
+    A row is written once, at the state change, and a monitor can name the emptier minutes later
+    (room elimination settles ~6.5 min after the door opened), so the name arrives after the row.
+    Only the newest row of that appliance is considered: an older one belongs to an earlier emptying.
+    """
+    text = f"{appliance} emptied"
+    out = list(events)
+    for i, event in enumerate(out):
+        if event.get("text") != text:
+            continue
+        if event.get("by"):
+            break
+        try:
+            age_s = (now - datetime.fromisoformat(event["ts"])).total_seconds()
+        except (ValueError, TypeError, KeyError):
+            break
+        if 0 <= age_s <= EMPTIED_ENRICH_S:
+            out[i] = dict(event, by=by)
+        break
+    return out
 
 
 def lock_event(name, old, new, changed_by):
@@ -258,6 +285,9 @@ class HouseEvents(hass.Hass):
         )
         for entity in self.appliances:
             self.listen_state(self._on_appliance, entity)
+            # Registered after _on_appliance so a state change that also names the emptier
+            # finds its row already written; enrich_by leaves a row that has a name alone.
+            self.listen_state(self._on_emptied_by, entity, attribute="emptied_by")
 
         # Locks: listen to the authoritative (BLE) entity, attribute from the cloud twin.
         self.locks = self.args.get("locks", {})
@@ -290,6 +320,20 @@ class HouseEvents(hass.Hass):
             kind, text = result
             icon = "mdi:basket-check" if kind == "emptied" else APPLIANCE_ICONS.get(name.lower(), "mdi:washing-machine")
             self._add(icon, text, by=appliance_actor(kind, attrs))
+
+    def _on_emptied_by(self, entity, attribute, old, new, kwargs):
+        """A monitor named the emptier after the emptied row was written."""
+        name = self.appliances.get(entity, entity)
+        attrs = (self.get_state(entity, attribute="all") or {}).get("attributes") or {}
+        by = appliance_actor("emptied", attrs)
+        if not by:
+            return
+        enriched = enrich_by(self.events, name, by, self.get_now())
+        if enriched != self.events:
+            self.events = enriched
+            self._publish()
+            self._write_state_file()
+            self.log(f"Event: {name} emptied by {by}")
 
     def _on_lock(self, entity, attribute, old, new, kwargs):
         # Emit later, not now: attribution (cloud changed_by) usually hasn't landed yet

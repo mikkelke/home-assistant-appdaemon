@@ -30,6 +30,7 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     sys.modules["appdaemon.plugins.hass.hassapi"] = hassapi
 
 import actor_attribution as aa  # noqa: E402
+import actor_followup  # noqa: E402
 import cycle_persistence  # noqa: E402
 import cycle_store as cs  # noqa: E402
 import dryer_monitor as dm  # noqa: E402
@@ -617,7 +618,7 @@ class NoAppDaemonInternalShadowing(unittest.TestCase):
     def test_no_class_attribute_shadows_an_adapi_member(self):
         offenders = [
             name
-            for cls in (dm.DryerMonitor, cycle_persistence.CyclePersistenceMixin)
+            for cls in (dm.DryerMonitor, cycle_persistence.CyclePersistenceMixin, actor_followup.ActorFollowupMixin)
             for name, value in vars(cls).items()
             if name in self.RESERVED and not callable(value)
         ]
@@ -625,7 +626,7 @@ class NoAppDaemonInternalShadowing(unittest.TestCase):
 
     def test_no_instance_attribute_assigned_in_source_shadows_an_adapi_member(self):
         assigned = set()
-        for module in (dm, cycle_persistence):
+        for module in (dm, cycle_persistence, actor_followup):
             for node in ast.walk(ast.parse(Path(module.__file__).read_text())):
                 if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store):
                     if isinstance(node.value, ast.Name) and node.value.id == "self":
