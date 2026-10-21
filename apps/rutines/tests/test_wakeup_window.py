@@ -15,6 +15,7 @@ import types
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -56,6 +57,11 @@ def window_app(now=FIRED, *, join=(BATHROOM,), window_min=30, state=None):
     app.user_log = "test_log"
     app.master_player = BEDROOM
     app.join_players = list(join)
+    app.volume_entities = [BEDROOM, BATHROOM]
+    app.volume_start = 0.06
+    app.volume_target = 0.18
+    app.standards = {"speaker_volumes": {BEDROOM: 0.14, BATHROOM: 0.18}, "default_volume": 0.12}
+    app.get_app = lambda name: SimpleNamespace(args=app.standards) if name == wb.STANDARD_VOLUME_APP else None
     app.wake_window_min = window_min
     app._wake_window_until = None
     app._wake_group_seen = False
@@ -148,6 +154,44 @@ class TheWindowEndsEarly(unittest.TestCase):
         app._open_wake_window()
         app.now = FIRED + timedelta(minutes=45)
         self.assertTrue(app.wake_window_open())
+
+
+class TheCapOtherAppsStayUnder(unittest.TestCase):
+    """wake_volume_cap(): the most an automation may raise a wake speaker to while the window is
+    open - its standard volume - and None the rest of the time."""
+
+    def test_no_cap_without_a_window(self):
+        app = window_app()
+        self.assertIsNone(app.wake_volume_cap(BATHROOM))
+
+    def test_each_wake_speaker_is_capped_at_its_own_standard_while_the_window_is_open(self):
+        app = opened()
+        self.assertEqual(app.wake_volume_cap(BATHROOM), 0.18)
+        self.assertEqual(app.wake_volume_cap(BEDROOM), 0.14)
+
+    def test_the_cap_is_the_standard_not_the_ramp_target(self):
+        app = opened()
+        app.volume_target = 0.10
+        self.assertEqual(app.wake_volume_cap(BATHROOM), 0.18)
+
+    def test_a_speaker_that_is_not_a_wake_speaker_has_no_cap(self):
+        self.assertIsNone(opened().wake_volume_cap("media_player.kitchen"))
+
+    def test_the_cap_ends_with_the_window(self):
+        app = opened()
+        app.now = FIRED + timedelta(minutes=30)
+        self.assertIsNone(app.wake_volume_cap(BATHROOM))
+        app = opened()
+        for name in ("_stop_media", "_resume_adaptive_brightness", "_stop_light_ramp", "_cleanup_listeners"):
+            setattr(app, name, MagicMock())
+        app._stop_all("Alarm toggle turned off")
+        self.assertIsNone(app.wake_volume_cap(BATHROOM))
+
+    def test_unreadable_standards_cap_at_the_most_conservative_level_with_a_warning(self):
+        app = opened()
+        app.get_app = lambda name: None
+        self.assertEqual(app.wake_volume_cap(BATHROOM), 0.06)
+        self.assertTrue(any(level == "WARNING" and BATHROOM in msg for level, msg in app.logged))
 
 
 def fire_app(now=FIRED):

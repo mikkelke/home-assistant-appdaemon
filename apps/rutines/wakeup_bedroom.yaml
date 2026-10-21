@@ -38,7 +38,8 @@ WakeupBedroom:
   volume_step: 0.03
   volume_interval_sec: 60
   # From the alarm firing for this many minutes (cut short when the routine stops or its speakers are
-  # no longer one group) wake_window_open() is True and BedroomBathroomVolumeSync copies no volume.
+  # no longer one group) wake_window_open() is True: BedroomBathroomVolumeSync copies no volume and the
+  # bath presence boost (sonos_bathroom_control) stays under the bathroom's standard volume.
   wake_window_min: 30
 
   covers:

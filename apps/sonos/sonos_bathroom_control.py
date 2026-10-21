@@ -48,6 +48,11 @@ class SonosBathroomControl(hass.Hass):
         # Bath presence configurations
         self.bath_presence_sensor = self.args.get("bath_presence_sensor")
         self._logically_present = None
+        # How high the presence boost may raise this speaker while the wake-up window is open is
+        # the wake routine's to say (WakeupRoutine.wake_volume_cap).
+        self.wake_app = self.args.get("wake_app", "WakeupBedroom")
+        # True when the wake window limited the last presence ON: leaving then takes nothing back.
+        self._presence_boost_held = False
         self.bath_presence_volume_boost = None
         self.presence_on_max_volume = None
         # Throttling for presence changes to prevent excessive callbacks
@@ -152,10 +157,16 @@ class SonosBathroomControl(hass.Hass):
         if new_state == "on":
             if not self._logically_present:
                 self._logically_present = True
+                wake_cap = self._wake_cap()
+                self._presence_boost_held = wake_cap is not None
+                if wake_cap is not None:
+                    self.log(f"Presence ON: wake window open, {self.media_player} may not go above its standard {wake_cap:.2f}")
                 current_volume = self._get_current_volume_float()
                 if current_volume < self.presence_on_max_volume:
                     potential_target = current_volume + self.bath_presence_volume_boost
                     capped_target = min(potential_target, self.presence_on_max_volume)
+                    if wake_cap is not None:
+                        capped_target = min(capped_target, wake_cap)
                     adj = capped_target - current_volume
                     if adj > 0.001:
                         self.log(f"Presence ON: Boosting {self.media_player} by {adj:.2f} to {capped_target:.2f}")
@@ -165,9 +176,23 @@ class SonosBathroomControl(hass.Hass):
         elif new_state == "off":
             if self._logically_present:
                 self._logically_present = False
+                if self._presence_boost_held:
+                    self._presence_boost_held = False
+                    self.log(f"Presence OFF: wake window held the boost for {self.media_player} at its standard, nothing to take back")
+                    return
                 self.log(f"Presence OFF: Reducing vol for {self.media_player} by {self.bath_presence_volume_boost:.2f}")
                 self._adjust_volume(-self.bath_presence_volume_boost)
         # Removed handling of unavailable/unknown - we only listen to on/off now
+
+    def _wake_cap(self):
+        """The most the wake-up lets this speaker be raised to right now (its standard volume
+        while the wake window is open), or None when no window is open or the wake routine
+        cannot be asked."""
+        try:
+            cap = self.get_app(self.wake_app).wake_volume_cap(self.media_player)
+            return None if cap is None else float(cap)
+        except Exception:
+            return None
 
     def handle_volume_event(self, event_name, data, kwargs):
         """Handle Z-Wave volume button presses."""

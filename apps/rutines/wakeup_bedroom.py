@@ -996,22 +996,26 @@ class WakeupRoutine(hass.Hass):
             return {}, None
         return {e: v for e, v in volumes.items() if v is not None}, default
 
-    def _volume_ceiling_for(self, entity):
-        """Highest level the wake ramp may set on this speaker: volume_target, but never
-        above the speaker's standard volume (a speaker the reset app does not list gets its
-        default_volume, as it does there). When no standard can be read the ramp is capped
-        at the most conservative level instead - the lowest standard known, else
-        volume_start - so a missing config can never make the alarm louder than the house."""
+    def _standard_for(self, entity):
+        """The speaker's standard volume from the SonosStateReset config (a speaker it does not
+        list gets its default_volume, as it does there). When none can be read this is the
+        most conservative level instead - the lowest standard known, else volume_start - so a
+        missing config can never make the wake-up louder than the house."""
         volumes, default = self._standard_volumes()
         standard = volumes.get(entity, default)
         if standard is None:
             standard = min(volumes.values()) if volumes else self.volume_start
             self.log(
                 f"[wake] No standard volume for {entity} in the {STANDARD_VOLUME_APP} config - "
-                f"capping the ramp at {standard}",
+                f"limiting it to {standard}",
                 level="WARNING", log=self.user_log,
             )
-        ceiling = min(self.volume_target, standard)
+        return standard
+
+    def _volume_ceiling_for(self, entity):
+        """Highest level the wake ramp may set on this speaker: volume_target, but never
+        above the speaker's standard volume."""
+        ceiling = min(self.volume_target, self._standard_for(entity))
         self.log(
             f"[wake] Volume ramp on {entity}: {min(self.volume_start, ceiling)} -> {ceiling} "
             f"(target {self.volume_target})",
@@ -1047,6 +1051,14 @@ class WakeupRoutine(hass.Hass):
         elif grouped is False and self._wake_group_seen:
             return False
         return True
+
+    def wake_volume_cap(self, entity):
+        """The most an automation may raise a wake speaker to while the wake-up plays out: its
+        standard volume while wake_window_open(), else None. Apps that raise a wake speaker's
+        volume on their own (the bath presence boost) stay under it."""
+        if entity not in self.volume_entities or not self.wake_window_open():
+            return None
+        return self._standard_for(entity)
 
     def _wake_group_state(self):
         """True when every joined speaker is in the master's group, False when one is not,

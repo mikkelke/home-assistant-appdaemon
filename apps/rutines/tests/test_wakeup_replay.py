@@ -12,6 +12,12 @@ speakers: the alarm fires, the ramp runs its ticks, and at every logged offset t
 the logged level and the sync is asked to act. Whatever the ramp or the sync writes is recorded.
 The leftover volume before the alarm is the loudest one the window saw.
 
+In 11 of the 42 windows someone also stepped into the bath, and the bath presence boost lifted the
+bathroom a further 0.10 (to 0.34 or 0.43 at the time). BOOST_WINDOWS holds those 11 as the bathroom
+control logged them: (seconds after the alarm, presence on or off). They are replayed through the real
+wake routine, the real bath presence control and the real sync, the sync listening to the bathroom
+the way it does live, with the door open.
+
 Speakers are checked against the standards in force when the windows were recorded, so the replay
 does not move when a standard is retuned (the current ones are pinned in test_wakeup_volume_cap).
 """
@@ -43,14 +49,17 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     sys.modules["appdaemon.plugins.hass.hassapi"] = hassapi
 
 import bedroom_bathroom_volume_sync as bbvs  # noqa: E402
+import sonos_bathroom_control as sbc  # noqa: E402
 import wakeup_bedroom as wb  # noqa: E402
 
 BEDROOM = "media_player.bedroom"
 BATHROOM = "media_player.bathroom"
 STANDARD = {BEDROOM: 0.14, BATHROOM: 0.18}
 RESET_ARGS = {"speaker_volumes": dict(STANDARD), "default_volume": 0.12}
+SENSOR = "binary_sensor.bathroom_bath_presence_presence"
 ALARM = datetime(2026, 10, 1, 7, 0, 0)
 WINDOW_SEC = 30 * 60
+NO_WAKE_WINDOW = SimpleNamespace(wake_window_open=lambda: False, wake_volume_cap=lambda entity: None)
 
 # (seconds after the alarm, trigger, bedroom level replaced, bathroom level copied)
 WINDOWS = [
@@ -80,6 +89,21 @@ WINDOWS = [
     [(104, "activated", 0.09, 0.34), (1168, "bathroom_volume_change", 0.18, 0.24)],
 ]
 
+# (seconds after the alarm, bath presence)
+BOOST_WINDOWS = [
+    [(845, "on"), (887, "off"), (932, "on"), (1366, "off")],
+    [(637, "on"), (680, "off"), (697, "on"), (1051, "off")],
+    [(689, "on"), (741, "off"), (752, "on"), (822, "off")],
+    [(373, "on"), (736, "off")],
+    [(1238, "on"), (1692, "off")],
+    [(713, "on"), (753, "off"), (764, "on"), (1107, "off")],
+    [(1337, "on"), (1367, "off")],
+    [(869, "on"), (1289, "off")],
+    [(1795, "on")],
+    [(1440, "on"), (1796, "off")],
+    [(93, "on"), (1168, "off")],
+]
+
 
 class House:
     """The bedroom and bathroom speakers as the wake routine and the sync see them."""
@@ -88,12 +112,17 @@ class House:
         self.now = ALARM
         self.volume = {BEDROOM: leftover, BATHROOM: leftover}
         self.writes = []
+        self.on_bathroom_volume = None
 
     def service(self, who):
         def call_service(service, **kw):
             if service == "media_player/volume_set":
-                self.volume[kw["entity_id"]] = kw["volume_level"]
-                self.writes.append((self.now, who, kw["entity_id"], kw["volume_level"]))
+                entity, level = kw["entity_id"], kw["volume_level"]
+                changed = self.volume[entity] != level
+                self.volume[entity] = level
+                self.writes.append((self.now, who, entity, level))
+                if entity == BATHROOM and changed and self.on_bathroom_volume:
+                    self.on_bathroom_volume()
 
         return call_service
 
@@ -135,6 +164,23 @@ class House:
         app.get_state = get_state
         return app
 
+    def bath_control(self, wake_app):
+        app = sbc.SonosBathroomControl.__new__(sbc.SonosBathroomControl)
+        app.media_player = BATHROOM
+        app.bath_presence_volume_boost = 0.1
+        app.presence_on_max_volume = 0.60
+        app._logically_present = False
+        app._last_presence_change_time = 0.0
+        app._presence_throttle_seconds = 0.5
+        app.wake_app = "WakeupBedroom"
+        app._presence_boost_held = False
+        app.log = lambda *a, **kw: None
+        app.error = lambda *a, **kw: None
+        app.get_app = lambda name: wake_app
+        app.call_service = self.service("bath")
+        app.get_state = lambda entity, **kw: self.volume[entity]
+        return app
+
     def sync(self, wake_app):
         app = bbvs.BedroomBathroomVolumeSync.__new__(bbvs.BedroomBathroomVolumeSync)
         app.bathroom_speaker = BATHROOM
@@ -171,6 +217,31 @@ def replay(window, *, hold=True, extra=()):
             house.volume[BATHROOM] = bathroom
             sync._maybe_sync(reason)
     return house.writes
+
+
+def replay_bath(window, *, hold=True):
+    """One wake-up with someone stepping into the bath and out again at the logged offsets. The
+    speakers start from the loudest leftover the logs ever showed (0.43); the sync is active, as
+    with the door open. hold=False answers the bath control and the sync as if no wake window
+    existed. Returns the house: every write, and where the speakers ended."""
+    house = House(leftover=0.43)
+    wake = house.wake_routine()
+    others = wake if hold else NO_WAKE_WINDOW
+    sync = house.sync(others)
+    bath = house.bath_control(others)
+    house.on_bathroom_volume = lambda: sync._maybe_sync("bathroom_volume_change")
+    wake._open_wake_window()
+    wake._start_media_and_volume_ramp()
+    steps = [(60 * k, 0, "tick", None) for k in range(1, 61)]
+    steps += [(off, 1, "presence", state) for off, state in window]
+    for offset, _, kind, state in sorted(steps, key=lambda s: (s[0], s[1])):
+        house.now = ALARM + timedelta(seconds=offset)
+        if kind == "tick":
+            wake._volume_tick(None)
+        else:
+            bath._last_presence_change_time = 0.0
+            bath._handle_presence_change(SENSOR, None, "off" if state == "on" else "on", state, {})
+    return house
 
 
 def above_standard(writes):
@@ -215,6 +286,47 @@ class TheWindowsThatBrokeTheRule(unittest.TestCase):
                                        (WINDOW_SEC, "bathroom_volume_change", 0.14, 0.24)])
         sync_writes = [(t, entity, level) for t, who, entity, level in writes if who == "sync"]
         self.assertEqual(sync_writes, [(ALARM + timedelta(seconds=WINDOW_SEC), BEDROOM, 0.24)])
+
+
+class TheWindowsWhereSomeoneSteppedIntoTheBath(unittest.TestCase):
+    def test_the_fixture_is_the_eleven_windows_that_were_found(self):
+        self.assertEqual(len(BOOST_WINDOWS), 11)
+        self.assertTrue(all(any(state == "on" for _, state in w) for w in BOOST_WINDOWS))
+        self.assertTrue(all(off < WINDOW_SEC for w in BOOST_WINDOWS for off, _ in w))
+
+    def test_as_the_boost_ran_before_the_hold_it_lifted_the_bathroom_above_its_standard_in_all_eleven(self):
+        for i, window in enumerate(BOOST_WINDOWS):
+            writes = replay_bath(window, hold=False).writes
+            self.assertTrue(
+                any(who == "bath" and level > STANDARD[BATHROOM] for _, who, _, level in writes), f"window {i}"
+            )
+
+    def test_with_the_hold_no_speaker_is_ever_set_above_its_standard(self):
+        for i, window in enumerate(BOOST_WINDOWS):
+            self.assertEqual(above_standard(replay_bath(window).writes), [], f"window {i}")
+
+    def test_with_the_hold_the_sync_never_hears_a_louder_bathroom_to_copy(self):
+        for i, window in enumerate(BOOST_WINDOWS):
+            writes = replay_bath(window).writes
+            self.assertEqual([w for w in writes if w[1] == "sync"], [], f"window {i}")
+
+    def test_with_the_hold_the_morning_ends_with_both_speakers_at_their_standard(self):
+        for i, window in enumerate(BOOST_WINDOWS):
+            house = replay_bath(window)
+            self.assertEqual(house.volume, {BEDROOM: 0.14, BATHROOM: 0.18}, f"window {i}")
+
+    def test_a_boost_in_the_middle_of_the_ramp_goes_no_further_than_the_standard(self):
+        window = [(93, "on"), (1168, "off")]
+        house = replay_bath(window)
+        bath = [level for _, who, entity, level in house.writes if who == "bath"]
+        self.assertEqual(bath, [0.18])
+        self.assertEqual(house.volume[BATHROOM], 0.18)
+
+    def test_the_boost_is_as_before_once_the_window_has_ended(self):
+        window = [(WINDOW_SEC, "on"), (WINDOW_SEC + 300, "off")]
+        house = replay_bath(window)
+        bath = [level for _, who, entity, level in house.writes if who == "bath"]
+        self.assertEqual(bath, [0.28, 0.18])
 
 
 if __name__ == "__main__":
