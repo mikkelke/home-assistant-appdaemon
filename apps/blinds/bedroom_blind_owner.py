@@ -3,7 +3,8 @@ BedroomBlindOwner - the one app that moves cover.bedroom_blind in normal operati
 
 ``blind_arbiter`` (bd0ee55) put the precedence for this blind in one place as data:
 
-    manual wall press (40)  >  venting need (30)  >  wake target (20)  >  solar shade (10)
+    manual wall press (40)  >  visitor in the flat (35)  >  venting need (30)
+    >  wake target (20)  >  solar shade (10)
 
 but every writer still issued its own ``cover/set_cover_position``, and each still
 carried a private notion of "somebody moved it by hand" (bedroom_blind_control's
@@ -53,6 +54,10 @@ position-less manual veto - the shade's file itself is left untouched.
 Publishes sensor.bedroom_blind_owner (same transparency style as
 sensor.smart_cooling_status): winning source, position, the whole claim set, and
 the manual-pause state.
+
+One instance owns one cover. BedroomBlindOwner owns the bedroom blind; a second
+instance, BathroomBlindOwner, owns the bathroom blind (same class, own cover, status
+entity and state file), where only the "visitor" source asks.
 """
 
 import json
@@ -90,6 +95,7 @@ class BedroomBlindOwner(hass.Hass):
         # shade outlives one 10-min tick so a standing claim never expires mid-cycle.
         self.claim_ttl_min = {
             blind_arbiter.SOURCE_MANUAL: float(a("manual_pause_min", 120)),
+            blind_arbiter.SOURCE_VISITOR: float(a("visitor_ttl_min", 15)),
             blind_arbiter.SOURCE_VENT: float(a("vent_ttl_min", 20)),
             blind_arbiter.SOURCE_WAKE: float(a("wake_ttl_min", 20)),
             blind_arbiter.SOURCE_SHADE: float(a("shade_ttl_min", 15)),
@@ -108,6 +114,7 @@ class BedroomBlindOwner(hass.Hass):
         self.verification_delay = float(a("verification_delay", 70.0))
         self.verification_tolerance = int(a("verification_tolerance", 5))
         self.status_entity = a("status_entity", "sensor.bedroom_blind_owner")
+        self.friendly_name = a("friendly_name", "Bedroom blind owner")
         self.state_file = a("state_file", "/conf/apps/blinds/bedroom_blind_owner_state.json")
         # One-time adoption of an in-flight manual pause across the deploy that
         # introduces this app - the shade's file schema stays untouched.
@@ -615,7 +622,7 @@ class BedroomBlindOwner(hass.Hass):
     def _publish(self, trigger=""):
         """sensor.bedroom_blind_owner - FIXED CONTRACT with the dashboard:
 
-        state: "manual" | "vent" | "wake" | "shade" | "idle"  (idle = no active
+        state: "manual" | "visitor" | "vent" | "wake" | "shade" | "idle"  (idle = no active
         request; the dashboard hides the row on idle/unknown/unavailable).
         attributes:
           position          - number the owner is enforcing (null/omitted at idle;
@@ -628,7 +635,7 @@ class BedroomBlindOwner(hass.Hass):
           claims            - list of {"source", "position"} for every ACTIVE
                               NON-winning request, highest rank first, may be []
           reason            - one short human sentence
-          friendly_name     - "Bedroom blind owner"
+          friendly_name     - "Bedroom blind owner" (the friendly_name arg)
         replace=True so stale attributes never linger. Extra attributes beyond the
         contract (icon, current_position, last_command, trigger) are additive and
         ignored by the dashboard."""
@@ -661,7 +668,7 @@ class BedroomBlindOwner(hass.Hass):
             else:
                 reason = top.reason or f"{top.source} holds the blind"
             attrs = {
-                "friendly_name": "Bedroom blind owner",
+                "friendly_name": self.friendly_name,
                 "icon": "mdi:blinds-horizontal",
                 "position": position,
                 "manual_pause_until": manual_until.isoformat() if manual_until else "",

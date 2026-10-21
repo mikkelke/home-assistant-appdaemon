@@ -1,10 +1,11 @@
 """
-Shared precedence for the one blind that several apps command.
+Shared precedence for the blinds that several apps command.
 
-``cover.bedroom_blind`` has three writers, and before this module each of them
+``cover.bedroom_blind`` has these writers, and before this module each of them
 called ``cover/set_cover_position`` on its own:
 
   * ``bedroom_blind_control``  - the wall remote's hold gestures (manual press)
+  * ``untracked_visitor``      - a non-resident person in the flat (the cleaner)
   * ``wakeup_bedroom``         - the morning open, at the wake target or the
                                  venting default
   * ``bedroom_solar_shade``    - daylight/heat balancing through the day
@@ -13,12 +14,16 @@ Nothing expressed how they rank, so whoever wrote last won, and each carried its
 own private notion of "somebody moved it by hand". This module holds the order as
 plain data, in one place, testable without an AppDaemon runtime:
 
-    manual wall press  >  venting need  >  wake target  >  solar shade
+    manual wall press  >  visitor in the flat  >  venting need  >  wake target
+    >  solar shade
 
 Why that order:
 
 * **manual** - a hand on the wall switch is a person in the room saying what they
   want right now. Nothing automatic outranks it.
+* **visitor** - a person who is not a resident (the cleaner) is in the flat and the
+  blind is held where the visit needs it. Every automatic writer is below it; a hand
+  on the wall switch is still above it, so a resident can undo it at any time.
 * **venting** - when the night's cooling plan is "open the window", the blind must
   land where the openable pane is actually clear. Shading a room we intend to
   ventilate trades away the cooling method in use for the one that is not
@@ -47,6 +52,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
 SOURCE_MANUAL = "manual"
+SOURCE_VISITOR = "visitor"
 SOURCE_VENT = "vent"
 SOURCE_WAKE = "wake"
 SOURCE_SHADE = "shade"
@@ -56,13 +62,14 @@ SOURCE_SHADE = "shade"
 #: should lose an argument, not crash the app that asked.
 PRIORITIES: dict[str, int] = {
     SOURCE_MANUAL: 40,
+    SOURCE_VISITOR: 35,
     SOURCE_VENT: 30,
     SOURCE_WAKE: 20,
     SOURCE_SHADE: 10,
 }
 
 #: The order as documented, highest first - handy for logs and tests.
-PRECEDENCE = (SOURCE_MANUAL, SOURCE_VENT, SOURCE_WAKE, SOURCE_SHADE)
+PRECEDENCE = (SOURCE_MANUAL, SOURCE_VISITOR, SOURCE_VENT, SOURCE_WAKE, SOURCE_SHADE)
 
 
 @dataclass(frozen=True)

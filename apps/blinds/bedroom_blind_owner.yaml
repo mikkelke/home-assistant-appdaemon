@@ -1,7 +1,8 @@
-# The single owner of cover.bedroom_blind: every writer (wall remote, wake routine,
-# solar shade) asks this app (get_app("BedroomBlindOwner").request(...)) instead of
-# calling cover/set_cover_position itself. Precedence is blind_arbiter's:
-# manual > vent > wake > shade. The owner also holds the ONE manual-pause notion
+# The single owner of cover.bedroom_blind: every writer (wall remote, untracked-visitor
+# claim, wake routine, solar shade) asks this app
+# (get_app("BedroomBlindOwner").request(...)) instead of calling
+# cover/set_cover_position itself. Precedence is blind_arbiter's:
+# manual > visitor > vent > wake > shade. The owner also holds the ONE manual-pause notion
 # (wall gestures + uncommanded moves) that used to exist three times.
 #
 # FAIL-SAFE: every caller keeps its old direct write for when this app is missing
@@ -63,4 +64,29 @@ BedroomBlindOwner:
   state_file: /conf/apps/blinds/bedroom_blind_owner_state.json
   shade_state_file: /conf/apps/blinds/bedroom_solar_shade_state.json
 
+  dry_run: false
+
+# Second instance of the same owner, for the bathroom blind. Only the "visitor" source asks
+# it: the cleaner's claim gets the same arbitration, manual-pause detection and restart-safe
+# state as the bedroom blind, and the wall remote and wake routine keep writing the bathroom
+# directly (the owner adopts those as AppDaemon-context moves, never as manual). Same position
+# frame as the bedroom: 100 = covering the window. No shade_state_file: there is no solar
+# shade for this blind to adopt a pause from.
+BathroomBlindOwner:
+  module: bedroom_blind_owner
+  class: BedroomBlindOwner
+  log: bedroom_blind_control_log
+
+  cover_entity: cover.bathroom_blind
+  friendly_name: Bathroom blind owner
+  appdaemon_user_id: "f4fda494358943beaf8ad2c70db099f8"
+  manual_pause_min: 120
+  position_tolerance: 6
+  manual_settle_seconds: 12
+  own_move_window_sec: 90
+  verification_delay: 70.0
+  verification_tolerance: 5
+  status_entity: sensor.bathroom_blind_owner
+  state_file: /conf/apps/blinds/bathroom_blind_owner_state.json
+  shade_state_file: ""
   dry_run: false

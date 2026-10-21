@@ -130,6 +130,127 @@ class PrecedenceMatrixEndToEnd(unittest.TestCase):
         self.assertTrue(any("DRY-RUN" in l for l in app.log_lines))
 
 
+class VisitorClaims(unittest.TestCase):
+    """The "visitor" source: ranked above every automatic writer, below a hand."""
+
+    def test_the_visitor_claim_moves_the_blind(self):
+        app = make_owner(position=38)
+        res = app.request("visitor", 0, reason="cleaner in the flat")
+        self.assertTrue(res["granted"])
+        self.assertTrue(res["moved"])
+        self.assertEqual(positions_commanded(app), [0])
+
+    def test_automatic_writers_are_refused_while_the_claim_stands(self):
+        for low, pos in (("vent", 38), ("wake", 38), ("shade", 92)):
+            with self.subTest(low=low):
+                app = make_owner(position=38)
+                app.request("visitor", 0)
+                res = app.request(low, pos)
+                self.assertFalse(res["granted"])
+                self.assertEqual(res["winner"], "visitor")
+                self.assertEqual(positions_commanded(app), [0])
+
+    def test_the_visitor_claim_beats_standing_automatic_claims(self):
+        app = make_owner(position=38)
+        app.request("shade", 92)
+        app.request("wake", 70)
+        res = app.request("visitor", 0)
+        self.assertTrue(res["granted"])
+        self.assertEqual(positions_commanded(app)[-1], 0)
+
+    def test_a_hand_outranks_the_visitor_and_the_visitor_is_told_who_won(self):
+        app = make_owner(position=38)
+        app.request("manual", 100, reason="wall press")
+        res = app.request("visitor", 0)
+        self.assertFalse(res["granted"])
+        self.assertEqual(res["winner"], "manual")
+        self.assertEqual(positions_commanded(app), [100])
+
+    def test_a_hand_on_the_blind_during_the_claim_takes_over(self):
+        app = make_owner(position=38)
+        app.request("visitor", 0)
+        for pos in (25, 10, 0):
+            report(app, pos)          # the motor reaching the lowered position
+        settle(app)
+        self.assertFalse(app.manual_hold_active())
+        for pos in (15, 38):
+            report(app, pos, ctx="a-person-id")   # a resident moves it from the dashboard
+        settle(app)
+        self.assertTrue(app.manual_hold_active())
+        self.assertFalse(app.request("visitor", 0)["granted"])
+
+    def test_the_claim_lapses_after_its_default_lifetime(self):
+        app = make_owner(position=38)
+        app.request("visitor", 0)
+        app._now = app._now + timedelta(minutes=14)
+        self.assertFalse(app.request("shade", 92)["granted"])
+        app._now = app._now + timedelta(minutes=2)
+        self.assertTrue(app.request("shade", 92)["granted"])
+
+    def test_a_short_ttl_makes_the_claim_a_one_off_move(self):
+        app = make_owner(position=0)
+        res = app.request("visitor", 38, reason="visit over", ttl_min=3)
+        self.assertTrue(res["moved"])
+        app._now = app._now + timedelta(minutes=4)
+        self.assertTrue(app.request("shade", 92)["granted"])
+
+    def test_withdrawing_drops_the_claim_and_never_moves(self):
+        app = make_owner(position=38)
+        app.request("visitor", 0)
+        app.withdraw("visitor", reason="outranked")
+        self.assertEqual(positions_commanded(app), [0])
+        self.assertTrue(app.request("shade", 92)["granted"])
+
+    def test_the_status_entity_names_the_visitor(self):
+        app = make_owner(position=38)
+        app.request("visitor", 0, reason="cleaner in the flat")
+        entity, kwargs = app.set_state_calls[-1]
+        self.assertEqual(kwargs["state"], "visitor")
+        self.assertEqual(kwargs["attributes"]["position"], 0)
+        self.assertEqual(kwargs["attributes"]["reason"], "cleaner in the flat")
+
+
+class SecondInstanceForTheBathroom(unittest.TestCase):
+    """BathroomBlindOwner is this same class on another cover (see the yaml)."""
+
+    ARGS = {"cover_entity": "cover.bathroom_blind", "status_entity": "sensor.bathroom_blind_owner",
+            "friendly_name": "Bathroom blind owner", "shade_state_file": ""}
+
+    def make(self, **kw):
+        return make_owner(args={**self.ARGS, **kw.pop("args", {})}, **kw)
+
+    def test_it_listens_to_its_own_cover_and_publishes_under_its_own_name(self):
+        app = self.make(position=40)
+        self.assertEqual([(entity, kw) for _, entity, kw in app.listeners],
+                         [("cover.bathroom_blind", {"attribute": "current_position"})])
+        self.assertEqual(app.set_state_calls[-1][0], "sensor.bathroom_blind_owner")
+        self.assertEqual(app.set_state_calls[-1][1]["attributes"]["friendly_name"], "Bathroom blind owner")
+
+    def test_it_commands_its_own_cover(self):
+        app = self.make(position=40)
+        app.request("visitor", 0, reason="cleaner in the flat")
+        self.assertEqual(app.cover_commands,
+                         [("cover/set_cover_position", {"entity_id": "cover.bathroom_blind", "position": 0})])
+
+    def test_it_adopts_no_pause_from_a_solar_shade_file(self):
+        self.assertFalse(self.make(position=40).manual_hold_active())
+
+    def test_a_hand_on_the_bathroom_blind_holds_the_visitor_off(self):
+        app = self.make(position=40)
+        for pos in (55, 70, 100):
+            report(app, pos)
+        settle(app)
+        self.assertTrue(app.manual_hold_active())
+        res = app.request("visitor", 0)
+        self.assertFalse(res["granted"])
+        self.assertEqual(res["winner"], "manual")
+
+    def test_the_default_instance_keeps_its_name(self):
+        app = make_owner(position=38)
+        self.assertEqual(app.set_state_calls[-1][0], "sensor.bedroom_blind_owner")
+        self.assertEqual(app.set_state_calls[-1][1]["attributes"]["friendly_name"], "Bedroom blind owner")
+
+
 class UncommandedMoveRegistersManual(unittest.TestCase):
     """A move the owner didn't order is a human at the blind - one episode, one
     hold, however many position reports the travel emits (solar shade's machine)."""

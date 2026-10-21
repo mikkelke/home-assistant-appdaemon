@@ -2,7 +2,8 @@
 
 The order under test is the one documented in blind_arbiter's docstring:
 
-    manual wall press  >  venting need  >  wake target  >  solar shade
+    manual wall press  >  visitor in the flat  >  venting need  >  wake target
+    >  solar shade
 
 The second class checks that bedroom_solar_shade - the lowest rank, and the one
 writer that re-evaluates often enough to quietly undo the others - actually asks
@@ -34,7 +35,8 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
 import blind_arbiter as ba  # noqa: E402
 import bedroom_solar_shade as bss  # noqa: E402
 
-MANUAL, VENT, WAKE, SHADE = ba.SOURCE_MANUAL, ba.SOURCE_VENT, ba.SOURCE_WAKE, ba.SOURCE_SHADE
+MANUAL, VISITOR, VENT, WAKE, SHADE = (
+    ba.SOURCE_MANUAL, ba.SOURCE_VISITOR, ba.SOURCE_VENT, ba.SOURCE_WAKE, ba.SOURCE_SHADE)
 
 
 def req(source, position=None, reason="", active=True):
@@ -50,8 +52,16 @@ class PrecedenceOrder(unittest.TestCase):
         self.assertEqual(len(set(ranks)), len(ranks), "no two sources may tie")
 
     def test_manual_beats_everything(self):
-        winner = ba.arbitrate([req(SHADE, 92), req(WAKE, 38), req(VENT, 38), req(MANUAL, 100)])
+        winner = ba.arbitrate([req(SHADE, 92), req(WAKE, 38), req(VENT, 38), req(VISITOR, 0),
+                               req(MANUAL, 100)])
         self.assertEqual(winner.source, MANUAL)
+
+    def test_visitor_sits_between_manual_and_every_automatic_writer(self):
+        self.assertEqual(ba.PRECEDENCE[:2], (MANUAL, VISITOR))
+        winner = ba.arbitrate([req(SHADE, 92), req(WAKE, 38), req(VENT, 38), req(VISITOR, 0)])
+        self.assertEqual(winner.source, VISITOR)
+        self.assertEqual(winner.position, 0)
+        self.assertEqual(ba.arbitrate([req(VISITOR, 0), req(MANUAL, 100)]).source, MANUAL)
 
     def test_vent_beats_wake_and_shade(self):
         winner = ba.arbitrate([req(SHADE, 92), req(WAKE, 72), req(VENT, 38)])

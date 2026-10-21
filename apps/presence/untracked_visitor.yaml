@@ -1,0 +1,64 @@
+# /conf/apps/presence/untracked_visitor.yaml
+# Publishes sensor.untracked_visitor (none | cleaner | guest) for a keypad person who is not
+# a resident, and lowers the bedroom and bathroom blinds while that person is the cleaner.
+# See untracked_visitor.py's module docstring for the on/off rules.
+#
+# Names are matched word by word, ignoring case: an entry matches a keypad name that BEGINS
+# with its words, so residents are first names only (the lock reports full account names and
+# this repo is public). non_person labels must match the whole name.
+#
+# No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
+# first or the app fails to instantiate.
+
+UntrackedVisitor:
+  module: untracked_visitor
+  class: UntrackedVisitor
+
+  entity: sensor.untracked_visitor
+  lock: lock.yale
+  door: binary_sensor.apartment_door_open
+
+  residents: [Mikkel, Kristine, Claudia]
+  cleaners: ["Liga Cleaning"]
+  non_person:
+    - Auto Lock
+    - Manual Lock
+    - Manual Unlock
+    - One-Touch Lock
+    - Home Assistant
+    - unknown
+    - unavailable
+  persons: [person.mikkel, person.kristine, person.claudia]
+
+  # One entity per RoomActive zone (room_active.yaml); a test keeps the two lists in step.
+  activity:
+    - binary_sensor.bathroom_active
+    - binary_sensor.bedroom_active
+    - binary_sensor.claudias_room_active
+    - binary_sensor.dining_room_active
+    - binary_sensor.guest_bathroom_active
+    - binary_sensor.hallway_active
+    - binary_sensor.kitchen_active
+    - binary_sensor.kristines_room_active
+    - binary_sensor.living_room_active
+
+  quiet_min: 15
+  cap_hours: 4
+
+  # Both blinds are the raw motor entities, in the device frame: 0 = fully retracted (window
+  # clear), 100 = covering the window. Each is asked through its blind owner app as the
+  # "visitor" source (blind_arbiter), never written here. restore_position is only used when
+  # the position the blind had at the start of the visit could not be read.
+  blind_reassert_min: 5
+  blind_release_ttl_min: 3
+  blinds:
+    bedroom:
+      owner_app: BedroomBlindOwner
+      cover: cover.bedroom_blind
+      lowered_position: 0
+      restore_position: 38
+    bathroom:
+      owner_app: BathroomBlindOwner
+      cover: cover.bathroom_blind
+      lowered_position: 0
+      restore_position: 40
