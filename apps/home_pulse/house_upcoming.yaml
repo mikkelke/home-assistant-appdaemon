@@ -48,7 +48,6 @@ HouseUpcoming:
   rain:
     weather: weather.forecast_home
     alert: binary_sensor.weather_opening_alert_rooftop_rain
-    both_area: rooftop
     doors:
       binary_sensor.rooftop_door_1_contact: {label: living-room terrace door, area: living_room}
       binary_sensor.rooftop_door_2_contact: {label: "Claudia's terrace door", area: office}

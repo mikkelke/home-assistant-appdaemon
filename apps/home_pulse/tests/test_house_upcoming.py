@@ -418,14 +418,65 @@ class RainTests(unittest.TestCase):
         drain(app)
         self.assertEqual([s[0] for s in app.services], ["weather/get_forecasts"])
         self.assertTrue(any("RAIN fetch" in msg for _, msg in app.logs))
-        row = rows(app)["rain:terrace"]
-        self.assertEqual((row["detail"], row["area"]), ("living-room terrace door open", "living_room"))
+        row = rows(app)["rain:living_room"]
+        self.assertEqual((row["title"], row["detail"], row["area"]),
+                         ("Rain forecast", "living-room terrace door open", "living_room"))
         lines = Path(app.fixture_file).read_text().splitlines()
         self.assertEqual(json.loads(lines[0])["row_at"], row["at"])
         fire(app, "binary_sensor.rooftop_door_1_contact", full("off", changed=app.now))
-        self.assertNotIn("rain:terrace", rows(app))
+        self.assertNotIn("rain:living_room", rows(app))
         tick(app, HOUR)
         self.assertEqual(len(app.services), 1)
+
+    def test_with_both_doors_open_each_has_a_forecast_row_in_its_own_room(self):
+        app = make_app()
+        app.forecast_response = self.forecast([0, 0, 0.6, 1.0])
+        for door in ("binary_sensor.rooftop_door_1_contact", "binary_sensor.rooftop_door_2_contact"):
+            fire(app, door, full("on", changed=app.now))
+        tick(app, 10 * MIN)
+        drain(app)
+        shown = {key: row for key, row in rows(app).items() if key.startswith("rain:")}
+        self.assertEqual({key: (row["detail"], row["area"]) for key, row in shown.items()}, {
+            "rain:living_room": ("living-room terrace door open", "living_room"),
+            "rain:office": ("Claudia's terrace door open", "office")})
+        self.assertEqual(shown["rain:living_room"]["at"], shown["rain:office"]["at"])
+        self.assertEqual(len(Path(app.fixture_file).read_text().splitlines()), 1)
+        fire(app, "binary_sensor.rooftop_door_1_contact", full("off", changed=app.now))
+        self.assertEqual([key for key in rows(app) if key.startswith("rain:")], ["rain:office"])
+
+    def test_while_the_rooftop_rain_alert_is_on_an_open_door_keeps_a_row_that_says_to_close_it(self):
+        alert = "binary_sensor.weather_opening_alert_rooftop_rain"
+        app = make_app()
+        app.forecast_response = self.forecast([0, 0, 0.6, 1.0])
+        fire(app, "binary_sensor.rooftop_door_1_contact", full("on", changed=app.now))
+        tick(app, 10 * MIN)
+        drain(app)
+        self.assertEqual(rows(app)["rain:living_room"]["title"], "Rain forecast")
+        fire(app, alert, full("on", changed=app.now))
+        row = rows(app)["rain:living_room"]
+        self.assertEqual((row["title"], row["area"], row["at"], row["kind"]),
+                         ("Raining, close the living-room terrace door", "living_room",
+                          core.utc_iso(app.now.replace(minute=0, second=0)), "rain"))
+        self.assertTrue(core.is_valid_row(row))
+        changed = last(app)["state"]
+        tick(app, 5 * MIN)
+        self.assertEqual((rows(app)["rain:living_room"], last(app)["state"]), (row, changed))
+        fire(app, "binary_sensor.rooftop_door_2_contact", full("on", changed=app.now))
+        self.assertEqual(rows(app)["rain:office"]["title"], "Raining, close the Claudia's terrace door")
+        fire(app, "binary_sensor.rooftop_door_1_contact", full("off", changed=app.now))
+        self.assertEqual([key for key in rows(app) if key.startswith("rain:")], ["rain:office"])
+        fire(app, "binary_sensor.rooftop_door_2_contact", full("off", changed=app.now))
+        self.assertEqual([key for key in rows(app) if key.startswith("rain:")], [])
+
+    def test_the_alert_with_every_door_shut_and_the_alert_going_off_leave_the_forecast_or_nothing(self):
+        alert = "binary_sensor.weather_opening_alert_rooftop_rain"
+        app = make_app()
+        fire(app, alert, full("on", changed=app.now))
+        self.assertEqual([key for key in rows(app) if key.startswith("rain:")], [])
+        fire(app, "binary_sensor.rooftop_door_2_contact", full("on", changed=app.now))
+        self.assertEqual(rows(app)["rain:office"]["title"], "Raining, close the Claudia's terrace door")
+        fire(app, alert, full("off", changed=app.now))
+        self.assertEqual([key for key in rows(app) if key.startswith("rain:")], [])
 
 
 class DrumStartTests(unittest.TestCase):

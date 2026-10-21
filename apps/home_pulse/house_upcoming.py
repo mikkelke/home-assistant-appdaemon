@@ -1,8 +1,8 @@
 """HouseUpcoming - what is coming up in the house that only the server can know, for the dashboard's
 Now timeline: maintenance (the Rober2 parts, the dishwasher's, washer's, dryer's and xBloom's run-based
 tasks, the drum clean at its cheapest start, batteries by their replace-by day and offline devices, and
-houseplants that need water and one-off tasks; admin only), Kristine's train, and rain while a terrace door
-is open (exploratory).
+houseplants that need water and one-off tasks; admin only), Kristine's train, and rain, forecast or falling,
+while a terrace door is open (exploratory).
 
 Publishes sensor.house_upcoming (shape in upcoming_core.py) plus one maintenance push a day, built
 from the same conditions the rows show. The lease in `expires` is renewed every TICK_S even when
@@ -115,7 +115,6 @@ class HouseUpcoming(hass.Hass):
         self.weather_entity = rn.get("weather", "weather.forecast_home")
         self.rain_alert = rn.get("alert", "binary_sensor.weather_opening_alert_rooftop_rain")
         self.rain_doors = dict(rn.get("doors") or {})
-        self.rain_both_area = rn.get("both_area", "rooftop")
         self.inventory = maint.parse_inventory(a.get("batteries"))
         self.plants = plants.parse_plants(a.get("plants"))
         self.timed_plants = plants.parse_timed(a.get("plants"))
@@ -335,7 +334,7 @@ class HouseUpcoming(hass.Hass):
 
         rows.append(train.train_row(self._cache.get(self.train_route), self._state_of(self.train_stog),
                                     self._state_of(self.train_person), now, self.train_users))
-        rows.append(self._rain_row(now))
+        rows.extend(self._rain_rows(now))
 
         rows = core.finalize_rows([row for row in rows if row])
         self._conditions = conditions
@@ -397,7 +396,7 @@ class HouseUpcoming(hass.Hass):
             self._ledger_files[name] = (stamp, ledger)
         return {name: ledger for name, (_, ledger) in self._ledger_files.items() if ledger is not None}
 
-    def _rain_row(self, now):
+    def _rain_rows(self, now):
         doors = {}
         for entity in self.rain_doors:
             cached = self._cache.get(entity) or {}
@@ -410,8 +409,7 @@ class HouseUpcoming(hass.Hass):
             self.log(f"RAIN fetch: {', '.join(open_long)} open")
             self.create_task(self._fetch_forecast(open_long))
         hours, fetched = self._forecast or ([], None)
-        return rain.rain_row(hours, fetched, open_long, self.rain_doors, self._state_of(self.rain_alert) == "on",
-                             now, self.rain_both_area)
+        return rain.rain_rows(hours, fetched, doors, self.rain_doors, self._state_of(self.rain_alert) == "on", now)
 
     def _publish(self, rows, now):
         try:
@@ -452,9 +450,9 @@ class HouseUpcoming(hass.Hass):
         if fetched is not None and entries is not None:
             hours = rain.forecast_hours(entries)
             self._forecast = (hours, fetched)
-            row = rain.rain_row(hours, fetched, open_long, self.rain_doors, False, fetched, self.rain_both_area)
-            self._append_fixture(rain.fixture(fetched, hours, open_long, row))
-            self.log(f"RAIN forecast: {len(hours)} hours, row at {row.get('at') if row else 'none'}")
+            found = rain.forecast_rows(hours, fetched, open_long, self.rain_doors, fetched)
+            self._append_fixture(rain.fixture(fetched, hours, open_long, found))
+            self.log(f"RAIN forecast: {len(hours)} hours, rows at {found[0].get('at') if found else 'none'}")
         self._evaluate()
 
     def _append_fixture(self, record):

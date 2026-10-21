@@ -1,11 +1,12 @@
-"""Rain forecast while a terrace door stands open, for sensor.house_upcoming. Exploratory: the row
-only says "forecast", never pushes, and every fetch is kept as a fixture so the rule can be
-measured against what the roof station saw. Pure.
+"""Rain while a terrace door stands open, for sensor.house_upcoming: one row for each open door, in the
+door's own room. Exploratory: the forecast row only says "forecast", never pushes, and every fetch is
+kept as a fixture so the rule can be measured against what the roof station saw. Pure.
 
 A door open for OPEN_FOR starts hourly met.no fetches, repeated every REFETCH while one stays open.
-The row sits at the first forecast hour within HORIZON with at least MIN_MM, and goes when the
-doors close, when the rooftop rain alert is on, or when the forecast is empty or older than
-MAX_AGE.
+That door's forecast row sits at the first forecast hour within HORIZON with at least MIN_MM, and goes
+when the door closes, when the rooftop rain alert is on, or when the forecast is empty or older than
+MAX_AGE. While the alert is on every open door has a row instead, telling to close it, at the current
+hour so it does not change with every tick, and gone when the door closes or the alert goes off.
 """
 
 from datetime import datetime, timedelta
@@ -19,6 +20,7 @@ HORIZON = timedelta(hours=3)
 HOUR = timedelta(hours=1)
 MIN_MM = 0.3
 FIXTURE_HOURS = 4
+ICON = "mdi:weather-pouring"
 
 
 def doors_open_long(doors, now):
@@ -53,35 +55,53 @@ def forecast_hours(entries):
     return sorted(out)
 
 
-def _doors_text(open_long, door_cfg, both_area):
-    if len(open_long) == 1:
-        cfg = door_cfg.get(open_long[0]) or {}
-        return f"{cfg.get('label', 'terrace door')} open", cfg.get("area")
-    return "terrace doors open", both_area
+def _label(entity, door_cfg):
+    return (door_cfg.get(entity) or {}).get("label", "terrace door")
 
 
-def rain_row(hours, fetched_at, open_long, door_cfg, alert_on, now, both_area="rooftop"):
-    if not open_long or alert_on or fetched_at is None or now - fetched_at > MAX_AGE:
-        return None
+def _row(entity, door_cfg, title, detail, at):
+    """The door's row: its id is `rain:` and its room, so each door has one and the dashboard puts it in
+    that room."""
+    area = (door_cfg.get(entity) or {}).get("area")
+    return make_row(f"rain:{area or entity.split('.', 1)[-1]}", "rain", title, detail, at=at, icon=ICON, area=area)
+
+
+def forecast_rows(hours, fetched_at, open_long, door_cfg, now):
+    """A "Rain forecast" row for each door in `open_long`, at the first coming hour with rain, else none."""
+    if not open_long or fetched_at is None or now - fetched_at > MAX_AGE:
+        return []
     for start, mm in hours:
         if start + HOUR <= now:
             continue
         if start >= now + HORIZON:
             break
         if mm >= MIN_MM:
-            detail, area = _doors_text(open_long, door_cfg, both_area)
-            return make_row("rain:terrace", "rain", "Rain forecast", detail, at=start, icon="mdi:weather-pouring",
-                            area=area)
-    return None
+            return [_row(entity, door_cfg, "Rain forecast", f"{_label(entity, door_cfg)} open", start)
+                    for entity in open_long]
+    return []
 
 
-def fixture(fetched_at, hours, open_long, row):
+def raining_rows(doors, door_cfg, now):
+    """A row for every door that is open, telling to close it, at the current hour."""
+    hour = now.replace(minute=0, second=0, microsecond=0)
+    return [_row(entity, door_cfg, f"Raining, close the {_label(entity, door_cfg)}", "rain on the open door", hour)
+            for entity, (is_open, _) in sorted(doors.items()) if is_open]
+
+
+def rain_rows(hours, fetched_at, doors, door_cfg, alert_on, now):
+    """The rain rows: `doors` maps entity -> (is_open, open since or None)."""
+    if alert_on:
+        return raining_rows(doors, door_cfg, now)
+    return forecast_rows(hours, fetched_at, doors_open_long(doors, now), door_cfg, now)
+
+
+def fixture(fetched_at, hours, open_long, rows):
     """One line for the fixture log: the fetch time, each early hour as [start, minutes ahead, mm],
-    the open doors and where the row went."""
+    the open doors and where the forecast rows went."""
     return {
         "fetched": utc_iso(fetched_at),
         "doors": list(open_long),
         "hours": [[utc_iso(start), round((start - fetched_at).total_seconds() / 60), mm]
                   for start, mm in hours[:FIXTURE_HOURS]],
-        "row_at": row.get("at") if row else None,
+        "row_at": rows[0].get("at") if rows else None,
     }
