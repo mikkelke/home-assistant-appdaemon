@@ -1,0 +1,23 @@
+# /conf/apps/presence/ghost_distance.yaml
+# TEMPORARY diagnostic: remove this yaml, ghost_distance.py and its test once a few episodes
+# are recorded. When the dining room radar has held presence for dwell_min in an empty house
+# (zone.home at 0), presses its track-target-distance button once, records the target distance
+# for record_min and appends one JSON line to log_file. The caps protect the sensor's coin
+# cells. See ghost_distance.py's module docstring.
+#
+# No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
+# first or the app fails to instantiate.
+
+GhostDistance:
+  module: ghost_distance
+  class: GhostDistance
+
+  home_zone: zone.home
+  presence: binary_sensor.dining_room_presence_presence
+  track_button: button.dining_room_presence_track_target_distance
+  distance: sensor.dining_room_presence_target_distance
+
+  dwell_min: 3
+  record_min: 5
+  max_episodes_per_day: 3
+  log_file: /conf/apps/presence/ghost_distance_log.jsonl
