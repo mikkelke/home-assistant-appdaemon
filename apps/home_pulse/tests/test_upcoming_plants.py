@@ -196,7 +196,7 @@ class ParseTests(unittest.TestCase):
     def test_a_plant_is_its_sensor_name_room_dry_level_and_optional_litres(self):
         self.assertEqual(plants.parse_plants(RAW),
                          {ENTITY: {"name": "Strelitzia", "slug": "strelitzia", "area": "dining_room", "dry": 15.0,
-                                   "water": None, "info": []}})
+                                   "water": None, "info": [], "conductivity": None}})
         self.assertEqual(plants.parse_plants([{**RAW[0], "water": 0.3}])[ENTITY]["water"], 0.3)
 
     def test_no_plants_is_fine(self):
@@ -259,6 +259,171 @@ class ParseTests(unittest.TestCase):
             self.assertEqual(plant["dry"], expected, dry)
 
 
+class FeedTitleTests(unittest.TestCase):
+    def test_the_dose_is_a_teaspoon_a_litre_to_the_nearest_quarter_and_at_least_a_quarter(self):
+        table = {0.05: "1/4", 0.1: "1/4", 0.2: "1/4", 0.3: "1/4", 0.4: "1/2", 0.5: "1/2", 0.6: "1/2", 0.7: "3/4",
+                 0.8: "3/4", 1: "1", 1.5: "1 1/2", 2.25: "2 1/4", 3: "3", 3.0: "3", 10: "10"}
+        for litres, expected in table.items():
+            self.assertEqual(plants.tsp_text(litres), expected, litres)
+
+    def test_a_dry_plant_due_for_feed_says_so_in_the_title_at_its_dose(self):
+        for water, title in ((3, "Water the Strelitzia: 3 L + 3 tsp fertiliser"),
+                             (0.3, "Water the Strelitzia: 0.3 L + 1/4 tsp fertiliser"),
+                             (0.5, "Water the Strelitzia: 0.5 L + 1/2 tsp fertiliser"),
+                             (0.7, "Water the Strelitzia: 0.7 L + 3/4 tsp fertiliser"),
+                             (1, "Water the Strelitzia: 1 L + 1 tsp fertiliser")):
+            plant = plants.parse_plants([{**RAW[0], "water": water}])[ENTITY]
+            row, _ = plants.plant_row(ENTITY, plant, feed([(T0, 12)], plant=plant), 12.0, 90)
+            self.assertEqual(row["title"], title, water)
+            self.assertEqual(row["detail"], "soil 12%, water at 15%")
+            self.assertTrue(core.is_valid_row(row), water)
+    def test_a_long_name_gives_up_the_word_before_it_gives_up_the_name_and_the_dose_before_neither(self):
+        def title(name, water=1):
+            plant = plants.parse_plants([{"moisture": "sensor.p", "name": name, "dry": 20, "water": water}])["sensor.p"]
+            return plants.plant_row("sensor.p", plant, {"since": "x"}, 5.0, 10)[0]["title"]
+
+        self.assertEqual(title("Fiddle leaf fig bedroom"), "Water the Fiddle leaf fig bedroom: 1 L + 1 tsp fertiliser")
+        medium = title("Monstera deliciosa variegata big")
+        self.assertEqual(medium, "Water the Monstera deliciosa variegata big: 1 L + 1 tsp feed")
+        long_name = title("Monstera deliciosa variegata (the big one by the window)", 0.5)
+        self.assertEqual(len(long_name), core.TEXT_MAX)
+        self.assertTrue(long_name.startswith("Water the Monstera deliciosa"), long_name)
+        self.assertTrue(long_name.endswith(": 0.5 L + 1/2 tsp feed"), long_name)
+
+    def test_without_an_amount_the_feed_is_named_but_not_dosed(self):
+        plant = plants.parse_plants([{"moisture": "sensor.p", "name": "Fern", "dry": 20}])["sensor.p"]
+        self.assertEqual(plants.plant_row("sensor.p", plant, {"since": "x"}, 5.0, 10)[0]["title"],
+                         "Water the Fern + fertiliser")
+
+    def test_a_sensor_plant_is_due_for_feed_under_350_microsiemens_and_not_at_it_or_without_a_reading(self):
+        st = feed([(T0, 12)])
+        for conductivity, fed in ((90, True), (349.9, True), (0, True), (350, False), (807, False), (None, False)):
+            row, _ = plants.plant_row(ENTITY, PLANT, st, 12.0, conductivity)
+            self.assertEqual("fertiliser" in row["title"] or "feed" in row["title"], fed, conductivity)
+        self.assertEqual(plants.FEED_BELOW, 350)
+
+    def test_the_title_without_feed_is_as_it_was(self):
+        row, _ = plants.plant_row(ENTITY, PLANT, feed([(T0, 12)]), 12.0)
+        self.assertEqual(row["title"], "Water the Strelitzia")
+
+
+class SensorParseTests(unittest.TestCase):
+    def test_a_sensor_plant_may_name_its_conductivity_sensor(self):
+        cfg = {**RAW[0], "conductivity": "sensor.strelitzia_conductivity"}
+        self.assertEqual(plants.parse_plants([cfg])[ENTITY]["conductivity"], "sensor.strelitzia_conductivity")
+        self.assertIsNone(plants.parse_plants(RAW)[ENTITY]["conductivity"])
+
+    def test_the_conductivity_sensor_is_an_entity_id_listed_once_and_only_on_a_sensor_plant(self):
+        other = {"moisture": "sensor.other_moisture", "name": "Other", "dry": 10}
+        for cfgs in ([{**RAW[0], "conductivity": ""}], [{**RAW[0], "conductivity": 5}],
+                     [{**RAW[0], "conductivity": ENTITY}],
+                     [{**RAW[0], "conductivity": "sensor.ec"}, {**other, "conductivity": "sensor.ec"}],
+                     [{**RAW[0], "conductivity": "sensor.other_moisture"}, other],
+                     [{**CAL[0], "conductivity": "sensor.ec"}]):
+            for parse in (plants.parse_plants, plants.parse_timed):
+                with self.assertRaises(ValueError, msg=cfgs):
+                    parse(cfgs)
+
+    def test_feed_is_summer_or_left_out_and_only_on_a_calendar_plant(self):
+        self.assertEqual(plants.parse_timed([{**CAL[0], "feed": "summer"}])["monstera"]["feed"], "summer")
+        for cfg in ({**CAL[0], "feed": "winter"}, {**CAL[0], "feed": True}, {**CAL[0], "feed": ""},
+                    {**RAW[0], "feed": "summer"}):
+            for parse in (plants.parse_plants, plants.parse_timed):
+                with self.assertRaises(ValueError, msg=cfg):
+                    parse([cfg])
+
+
+class CalendarFeedTests(unittest.TestCase):
+    """The watering a row is for is on its due day, or today once that has passed."""
+
+    def plant(self, **extra):
+        return plants.parse_timed([{**CAL[0], **extra}])["monstera"]
+
+    @staticmethod
+    def anchor(at, **extra):
+        return {"at": core.utc_iso(at), **extra}
+
+    def feeds(self, plant, anchor, now):
+        return plants.feeds(plant, anchor, now)
+
+    def test_from_march_to_september_every_watering_comes_with_feed(self):
+        june = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+        anchor = self.anchor(june, seed=True)
+        self.assertTrue(self.feeds(self.plant(), anchor, june + 9 * DAY))
+        fed_yesterday = self.anchor(june, fed_at=core.utc_iso(june + 8 * DAY))
+        self.assertTrue(self.feeds(self.plant(), fed_yesterday, june + 9 * DAY))
+
+    def test_in_the_other_months_a_watering_comes_with_feed_after_twenty_eight_days_or_if_never_fed(self):
+        fed = datetime(2026, 10, 20, 20, 0, tzinfo=timezone.utc)
+        anchor = self.anchor(fed, seed=True)
+        for days, expected in ((9, False), (10, False), (26, False), (27, False), (28, True), (35, True)):
+            self.assertEqual(self.feeds(self.plant(), anchor, fed + days * DAY), expected, days)
+        never = self.anchor(fed)
+        self.assertTrue(self.feeds(self.plant(), never, fed + 9 * DAY))
+        self.assertFalse(self.feeds(self.plant(), self.anchor(fed, fed_at=core.utc_iso(fed + 8 * DAY)), fed + 9 * DAY))
+
+    def test_the_row_for_the_eve_is_for_the_due_day_so_the_title_does_not_flip_when_it_is_reached(self):
+        fed = datetime(2026, 10, 20, 20, 0, tzinfo=timezone.utc)
+        exactly = self.anchor(fed + 18 * DAY, fed_at=core.utc_iso(fed))   # watered 07.11, due 17.11: 28 days after
+        for days in (24, 26, 27, 30):
+            self.assertTrue(self.feeds(self.plant(), exactly, fed + days * DAY), days)
+        short = self.anchor(fed + 17 * DAY, fed_at=core.utc_iso(fed))      # watered 06.11, due 16.11: 27 days after
+        for days in (24, 25, 26):
+            self.assertFalse(self.feeds(self.plant(), short, fed + days * DAY), days)
+        self.assertTrue(self.feeds(self.plant(), short, fed + 28 * DAY))   # two days late: the watering is today
+    def test_a_succulent_is_fed_only_from_march_to_september_and_then_at_most_every_twenty_eight_days(self):
+        cactus = self.plant(feed="summer", every_days=42)
+        winter = datetime(2026, 10, 20, 20, 0, tzinfo=timezone.utc)
+        self.assertFalse(self.feeds(cactus, self.anchor(winter, seed=True), winter + 41 * DAY))
+        self.assertFalse(self.feeds(cactus, self.anchor(winter), winter + 41 * DAY))
+        spring = datetime(2027, 3, 1, 10, 0, tzinfo=timezone.utc)
+        old = self.anchor(spring, fed_at=core.utc_iso(spring - 60 * DAY))
+        self.assertTrue(self.feeds(cactus, old, spring + 41 * DAY))
+        self.assertTrue(self.feeds(cactus, self.anchor(spring), spring + 41 * DAY))
+        recent = self.anchor(spring, fed_at=core.utc_iso(spring + 20 * DAY))
+        self.assertFalse(self.feeds(cactus, recent, spring + 41 * DAY))
+        week = self.plant(feed="summer", every_days=7)
+        june = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+        for watered, expected in ((0, False), (14, False), (20, False), (21, True)):
+            # watered `watered` days after the feeding on 01.06, so due 7 days later
+            anchor = self.anchor(june + watered * DAY, fed_at=core.utc_iso(june))
+            self.assertEqual(self.feeds(week, anchor, june + (watered + 7) * DAY), expected, watered)
+    def test_the_seasons_switch_on_the_first_of_march_and_the_first_of_october(self):
+        daily = self.plant(every_days=1)
+        for due, expected in ((datetime(2027, 2, 28, 10, 0, tzinfo=timezone.utc), False),
+                              (datetime(2027, 3, 1, 10, 0, tzinfo=timezone.utc), True),
+                              (datetime(2026, 9, 30, 10, 0, tzinfo=timezone.utc), True),
+                              (datetime(2026, 10, 1, 10, 0, tzinfo=timezone.utc), False)):
+            watered = self.anchor(due - DAY, fed_at=core.utc_iso(due - DAY))
+            self.assertEqual(self.feeds(daily, watered, due), expected, due)
+    def test_no_anchor_means_no_feed(self):
+        self.assertFalse(self.feeds(self.plant(), None, datetime(2026, 6, 1, tzinfo=timezone.utc)))
+        self.assertFalse(self.feeds(self.plant(), {"at": "soon"}, datetime(2026, 6, 1, tzinfo=timezone.utc)))
+
+    def test_a_done_records_the_feeding_when_the_row_said_to_feed_and_carries_the_last_one_over_when_it_did_not(self):
+        fed = datetime(2026, 10, 20, 20, 0, tzinfo=timezone.utc)
+        seed = self.anchor(fed, seed=True)
+        self.assertEqual(plants.fed_on(seed), fed)
+        self.assertEqual(plants.done_fields(self.plant(), seed, fed + 10 * DAY), {"fed_at": core.utc_iso(fed)})
+        later = fed + 28 * DAY
+        self.assertEqual(plants.done_fields(self.plant(), seed, later), {"fed_at": core.utc_iso(later)})
+        carried = self.anchor(fed + 10 * DAY, fed_at=core.utc_iso(fed))
+        self.assertEqual(plants.fed_on(carried), fed)
+        self.assertEqual(plants.done_fields(self.plant(), carried, fed + 20 * DAY), {"fed_at": core.utc_iso(fed)})
+        never = self.anchor(fed)
+        self.assertIsNone(plants.fed_on(never))
+        self.assertEqual(plants.done_fields(self.plant(feed="summer"), never, fed + 10 * DAY), {})
+
+    def test_the_calendar_row_title_says_the_feed(self):
+        now = datetime(2026, 10, 20, 20, 0, tzinfo=timezone.utc)
+        plant = self.plant()
+        quiet, _ = plants.timed_row(plant, self.anchor(now, seed=True), now + 9 * DAY)
+        self.assertEqual(quiet["title"], "Water the Monstera: 1 L")
+        fed, _ = plants.timed_row(plant, self.anchor(now - 20 * DAY, seed=True), now + 9 * DAY)
+        self.assertEqual(fed["title"], "Water the Monstera: 1 L + 1 tsp fertiliser")
+        self.assertTrue(core.is_valid_row(fed))
+
+
 class NoteTests(unittest.TestCase):
     LOOK, STANDS = "Bird of paradise, the big banana-leaf plant", "Floor by the facade, between kitchen and dining"
 
@@ -300,9 +465,10 @@ class CalendarParseTests(unittest.TestCase):
     def test_a_calendar_plant_is_its_name_room_litres_and_interval(self):
         self.assertEqual(plants.parse_timed(CAL),
                          {"monstera": {"name": "Monstera", "slug": "monstera", "area": "kitchen", "water": 1.0,
-                                       "every_days": 10, "info": []}})
+                                       "every_days": 10, "info": [], "feed": None}})
         self.assertEqual(plants.parse_timed([{"name": "Aloe", "every_days": 35}])["aloe"],
-                         {"name": "Aloe", "slug": "aloe", "area": None, "water": None, "every_days": 35, "info": []})
+                         {"name": "Aloe", "slug": "aloe", "area": None, "water": None, "every_days": 35, "info": [],
+                          "feed": None})
 
     def test_each_kind_of_plant_is_found_in_a_mixed_list_in_the_order_of_the_lines(self):
         raw = [CAL[0], RAW[0], {"name": "Aloe", "every_days": 35}]
@@ -446,8 +612,8 @@ class CalendarRowTests(unittest.TestCase):
             self.assertIsNone(self.row(anchor, self.NOW + 11 * DAY), anchor)
 
     def test_the_title_carries_the_litres_when_there_are_some(self):
-        bare = plants.parse_timed([{"name": "Aloe", "every_days": 35}])["aloe"]
-        small = plants.parse_timed([{"name": "Aloe", "water": 0.25, "every_days": 35}])["aloe"]
+        bare = plants.parse_timed([{"name": "Aloe", "feed": "summer", "every_days": 35}])["aloe"]
+        small = plants.parse_timed([{"name": "Aloe", "feed": "summer", "water": 0.25, "every_days": 35}])["aloe"]
         eve = self.NOW + 34 * DAY
         self.assertEqual(self.row(self.anchor(self.NOW), eve, bare)[0]["title"], "Water the Aloe")
         self.assertEqual(self.row(self.anchor(self.NOW), eve, small)[0]["title"], "Water the Aloe: 0.25 L")

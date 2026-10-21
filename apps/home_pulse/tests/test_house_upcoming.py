@@ -100,6 +100,8 @@ def base_states():
     states["binary_sensor.rooftop_door_2_contact"] = full("off")
     for entity, plant in PLANTS.items():
         states[entity] = full(f"{plant['dry'] + 20:g}")
+        if plant["conductivity"]:
+            states[plant["conductivity"]] = full("800")
     return states
 
 
@@ -1276,6 +1278,33 @@ class PlantTests(unittest.TestCase):
         fire(app, "sensor.fern_moisture", full("40"))
         self.assertNotIn("maint:plant:boston_fern", rows(app))
 
+    def test_a_low_conductivity_adds_the_feed_to_the_title_and_the_push_while_it_lasts(self):
+        ec = "sensor.strelitzia_conductivity"
+        fed = {**SAMPLE_PLANT, "water": 3, "conductivity": ec}
+        states = self.states("12")
+        states[ec] = full("90")
+        app = self.make(states, plants=[fed])
+        self.assertIn((ec, {"attribute": "all"}), app.listened)
+        self.assertEqual(rows(app)[self.ROW]["title"], "Water the Strelitzia: 3 L + 3 tsp fertiliser")
+        self.push(app)
+        self.assertEqual([s["message"] for s in app.notifier.sent], ["Water the Strelitzia: 3 L + 3 tsp fertiliser"])
+        plain, with_feed = "Water the Strelitzia: 3 L", "Water the Strelitzia: 3 L + 3 tsp fertiliser"
+        steps = (("350", plain), ("349", with_feed), ("unavailable", plain), ("0", with_feed), ("807", plain))
+        for state, title in steps:
+            fire(app, ec, full(state))
+            self.assertEqual(rows(app)[self.ROW]["title"], title, state)
+
+    def test_a_conductivity_that_cannot_be_read_says_nothing_and_a_sensor_ha_does_not_have_is_named(self):
+        fed = {**SAMPLE_PLANT, "water": 3, "conductivity": "sensor.ec_typo"}
+        app = self.make(self.states("12"), plants=[fed])
+        self.assertEqual(rows(app)[self.ROW]["title"], "Water the Strelitzia: 3 L")
+        self.assertIn(("WARNING", "Plant conductivity sensors HA does not have: sensor.ec_typo"), app.logs)
+        self.assertNotIn("Plant moisture sensors HA does not have", " ".join(msg for _, msg in app.logs))
+
+    def test_a_plant_without_a_conductivity_sensor_never_says_feed(self):
+        app = self.make(self.states("12"), plants=[{**SAMPLE_PLANT, "water": 3}])
+        self.assertEqual(rows(app)[self.ROW]["title"], "Water the Strelitzia: 3 L")
+
     def test_a_typo_in_the_plants_fails_at_start(self):
         with self.assertRaises(ValueError):
             self.make(plants=[{**SAMPLE_PLANT, "dry": "wet"}])
@@ -1298,6 +1327,14 @@ class PlantTests(unittest.TestCase):
                              (title, f"soil {dry}%, water at {dry}%", plant["area"]), entity)
             self.assertEqual(row.get("info"), plant["info"] or None, entity)
             self.assertTrue(core.is_valid_row(row), entity)
+            if plant["conductivity"]:
+                self.assertIn((plant["conductivity"], {"attribute": "all"}), app.listened, entity)
+                fire(app, plant["conductivity"], full("100"))
+                fed = plant_rows(app, PLANTS.values())[f"maint:plant:{plant['slug']}"]["title"]
+                self.assertEqual(fed, f"{title} + {plants.tsp_text(plant['water'])} tsp fertiliser", entity)
+                fire(app, plant["conductivity"], full("800"))
+                plain = plant_rows(app, PLANTS.values())[f"maint:plant:{plant['slug']}"]["title"]
+                self.assertEqual(plain, title, entity)
         self.assertEqual(len(plant_rows(app, PLANTS.values())), len(PLANTS))
         for entity, plant in PLANTS.items():
             fire(app, entity, full(f"{plant['dry'] + plants.CLOSE_MARGIN:g}"))
@@ -1378,7 +1415,8 @@ class TimedPlantTests(unittest.TestCase):
         self.done(app)
         self.assertEqual(len(app.published), published + 1)
         self.assertNotIn(self.ROW, rows(app))
-        self.assertEqual(state_file(app)["done"][self.KEY], {"at": core.utc_iso(app.now), "prev": seed})
+        self.assertEqual(state_file(app)["done"][self.KEY],
+                         {"at": core.utc_iso(app.now), "prev": seed, "fed_at": seed["at"]})
         self.assertEqual(done_log(app), [{"event": "done", "row": self.ROW, "at": core.utc_iso(app.now)}])
         self.assertIn(("INFO", "Done: water the Monstera"), app.logs)
         tick(app, 9 * DAY)
@@ -1436,6 +1474,68 @@ class TimedPlantTests(unittest.TestCase):
         self.assertEqual(state_file(app)["done"][self.KEY]["at"], core.utc_iso(app.now))
         self.assertEqual(len(done_log(app)), 1)
 
+    def test_in_winter_feed_comes_after_twenty_eight_days_and_a_done_records_it_and_undo_takes_it_back(self):
+        app = self.make()
+        tick(app, 9 * DAY)
+        self.assertEqual(rows(app)[self.ROW]["title"], "Water the Monstera: 1 L")
+        seed_time = state_file(app)["done"][self.KEY]["at"]
+        tick(app, DAY)
+        self.done(app)
+        first = state_file(app)["done"][self.KEY]
+        self.assertEqual(first["fed_at"], seed_time)
+        self.assertEqual(done_log(app)[-1], {"event": "done", "row": self.ROW, "at": core.utc_iso(app.now)})
+        tick(app, 9 * DAY)
+        self.assertEqual(rows(app)[self.ROW]["title"], "Water the Monstera: 1 L")
+        tick(app, DAY)
+        self.done(app)
+        self.assertEqual(state_file(app)["done"][self.KEY]["fed_at"], seed_time)
+        tick(app, 9 * DAY)
+        row = rows(app)[self.ROW]
+        self.assertEqual((row["title"], row["detail"]),
+                         ("Water the Monstera: 1 L + 1 tsp fertiliser", "1 day left, 13.11"))
+        self.push(app)
+        tick(app, DAY)
+        self.push(app)
+        self.assertEqual([s["message"] for s in app.notifier.sent], ["Water the Monstera: 1 L + 1 tsp fertiliser"])
+        before = {k: v for k, v in state_file(app)["done"][self.KEY].items() if k != "prev"}
+        self.done(app)
+        fed = state_file(app)["done"][self.KEY]
+        self.assertEqual((fed["fed_at"], fed["at"]), (core.utc_iso(app.now), core.utc_iso(app.now)))
+        self.assertEqual(done_log(app)[-1],
+                         {"event": "done", "row": self.ROW, "at": core.utc_iso(app.now), "fed": True})
+        self.assertIn(("INFO", "Done: water the Monstera, with feed"), app.logs)
+        tick(app, 9 * DAY)
+        self.assertEqual(rows(app)[self.ROW]["title"], "Water the Monstera: 1 L")
+        self.undo(app)
+        self.assertEqual(state_file(app)["done"][self.KEY], before)
+        self.assertEqual(rows(app)[self.ROW]["title"], "Water the Monstera: 1 L + 1 tsp fertiliser")
+
+    def test_from_march_to_september_every_watering_comes_with_feed(self):
+        june = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+        app = self.make(now=june)
+        tick(app, 9 * DAY)
+        self.assertEqual(rows(app)[self.ROW]["title"], "Water the Monstera: 1 L + 1 tsp fertiliser")
+        tick(app, DAY)
+        self.done(app)
+        self.assertEqual(state_file(app)["done"][self.KEY]["fed_at"], core.utc_iso(app.now))
+        tick(app, 9 * DAY)
+        self.assertEqual(rows(app)[self.ROW]["title"], "Water the Monstera: 1 L + 1 tsp fertiliser")
+
+    def test_a_succulent_is_fed_only_in_the_warm_months_and_then_at_most_every_twenty_eight_days(self):
+        cactus = {**SAMPLE_TIMED, "name": "Cactus", "water": 0.1, "every_days": 35, "feed": "summer"}
+        winter = self.make(plants=[cactus])
+        tick(winter, 34 * DAY)
+        self.assertEqual(rows(winter)["maint:plant:cactus"]["title"], "Water the Cactus: 0.1 L")
+        tick(winter, 40 * DAY)
+        self.assertEqual(rows(winter)["maint:plant:cactus"]["title"], "Water the Cactus: 0.1 L")
+        june = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+        summer = self.make(plants=[cactus], now=june)
+        tick(summer, 34 * DAY)
+        self.assertEqual(rows(summer)["maint:plant:cactus"]["title"], "Water the Cactus: 0.1 L + 1/4 tsp fertiliser")
+        soon = self.make(plants=[{**cactus, "every_days": 14}], now=june)
+        tick(soon, 13 * DAY)
+        self.assertEqual(rows(soon)["maint:plant:cactus"]["title"], "Water the Cactus: 0.1 L")
+
     def test_a_sensor_plants_row_and_unknown_ids_are_no_tapped_task(self):
         app = self.make(plants=[SAMPLE_TIMED, SAMPLE_PLANT])
         before, published = state_file(app), len(app.published)
@@ -1468,8 +1568,13 @@ class TimedPlantTests(unittest.TestCase):
                 row, left = shown[f"maint:plant:{plant['slug']}"], plant["every_days"] - elapsed
                 due = date(2026, 10, 14) + timedelta(days=plant["every_days"])
                 title = f"Water the {plant['name']}" + (f": {plant['water']:g} L" if plant["water"] else "")
-                self.assertEqual((row["title"], row["kind"], row["audience"], row["done"], row.get("area")),
-                                 (title, "maint", "admin", "tap", plant["area"]), plant["name"])
+                self.assertTrue(row["title"].startswith(title), (row["title"], title))
+                fed = row["title"] != title
+                self.assertEqual(fed, elapsed >= plants.FEED_EVERY_DAYS and plant["feed"] is None, plant["name"])
+                if fed:
+                    self.assertEqual(row["title"], f"{title} + {plants.tsp_text(plant['water'])} tsp fertiliser")
+                self.assertEqual((row["kind"], row["audience"], row["done"], row.get("area")),
+                                 ("maint", "admin", "tap", plant["area"]), plant["name"])
                 nine = core.utc_iso(datetime.combine(due, maint.DUE_TIME, maint.HOUSE_TZ))
                 self.assertEqual(row.get("at"), nine if left > 0 else None, plant["name"])
                 notes = plant["info"]

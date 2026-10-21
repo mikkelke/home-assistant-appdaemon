@@ -257,6 +257,16 @@ class DoneTests(unittest.TestCase):
         self.assertEqual(second["plant:monstera"], {"at": core.utc_iso(NOW), "prev": first["plant:monstera"]})
         self.assertEqual(runs.undo_done(second, "plant:monstera"), first)
 
+    def test_a_done_can_carry_extra_fields_that_undo_takes_back_with_it(self):
+        first = runs.mark_done({}, "plant:monstera", NOW - DAY, extra={"fed_at": core.utc_iso(NOW - DAY)})
+        second = runs.mark_done(first, "plant:monstera", NOW, 12, {"fed_at": core.utc_iso(NOW - DAY)})
+        self.assertEqual(first["plant:monstera"], {"at": core.utc_iso(NOW - DAY), "fed_at": core.utc_iso(NOW - DAY)})
+        self.assertEqual(second["plant:monstera"],
+                         {"at": core.utc_iso(NOW), "runs": 12, "fed_at": core.utc_iso(NOW - DAY),
+                          "prev": first["plant:monstera"]})
+        self.assertEqual(runs.undo_done(second, "plant:monstera"), first)
+        self.assertEqual(runs.mark_done({}, "k", NOW, extra=None), {"k": {"at": core.utc_iso(NOW)}})
+
     def test_a_second_done_keeps_only_the_one_before_it(self):
         first = runs.mark_done({}, "washer:inlet", NOW - DAY, 29)
         second = runs.mark_done(first, "washer:inlet", NOW, 30)

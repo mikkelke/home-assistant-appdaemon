@@ -131,10 +131,10 @@ def seed(anchors, ledgers, now, tasks=TASKS):
     return out
 
 
-def mark_done(anchors, key, now, runs=None):
-    """Done at `now`, when the ledger held `runs` runs if there is one; the anchor it replaces is kept
-    for undo_done."""
-    anchor = {"at": utc_iso(now)} if runs is None else {"at": utc_iso(now), "runs": runs}
+def mark_done(anchors, key, now, runs=None, extra=None):
+    """Done at `now`, when the ledger held `runs` runs if there is one, with the `extra` fields the
+    anchor carries; the anchor it replaces is kept for undo_done."""
+    anchor = {"at": utc_iso(now), **({} if runs is None else {"runs": runs}), **(extra or {})}
     previous = anchors.get(key)
     if isinstance(previous, dict):
         anchor["prev"] = {k: v for k, v in previous.items() if k != "prev"}

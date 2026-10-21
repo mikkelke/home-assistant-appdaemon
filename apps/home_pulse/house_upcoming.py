@@ -174,6 +174,7 @@ class HouseUpcoming(hass.Hass):
         sources += [self.washer_entity, self.price_entity, self.profiles_entity, self.train_route, self.train_stog,
                     self.train_person, self.rain_alert]
         sources += list(self.rain_doors) + list(self.inventory["devices"]) + list(self.plants)
+        sources += [plant["conductivity"] for plant in self.plants.values() if plant["conductivity"]]
         return list(dict.fromkeys(sources))
 
     def _read(self, entity):
@@ -201,12 +202,16 @@ class HouseUpcoming(hass.Hass):
         unlisted = maint.unlisted_batteries(batteries, self.inventory)
         missing = sorted(entity for entity in self.inventory["devices"] if entity not in sensors)
         missing_plants = sorted(entity for entity in self.plants if entity not in sensors)
+        missing_feed = sorted(plant["conductivity"] for plant in self.plants.values()
+                              if plant["conductivity"] and plant["conductivity"] not in sensors)
         if unlisted:
             self.log(f"Battery sensors neither listed nor excluded: {', '.join(unlisted)}", level="WARNING")
         if missing:
             self.log(f"Listed battery sensors HA does not have: {', '.join(missing)}", level="WARNING")
         if missing_plants:
             self.log(f"Plant moisture sensors HA does not have: {', '.join(missing_plants)}", level="WARNING")
+        if missing_feed:
+            self.log(f"Plant conductivity sensors HA does not have: {', '.join(missing_feed)}", level="WARNING")
         if not unlisted and not missing:
             self.log(f"Battery inventory complete: {len(self.inventory['devices'])} listed, "
                      f"{len(self.inventory['excluded'])} excluded")
@@ -244,9 +249,12 @@ class HouseUpcoming(hass.Hass):
                 self.log(f"Done ignored: {row!r} is done already", level="WARNING")
                 return
             now = self.get_now()
-            self._anchors = runs.mark_done(self._anchors, key, now)
-            self.log(f"Done: {label}")
-            self._after_anchor_change("done", row, now)
+            plant = plants.timed_by_row(row, self.timed_plants)
+            fields = plants.done_fields(plant, self._anchors.get(key), now) if plant else {}
+            fed = plant is not None and fields.get("fed_at") == core.utc_iso(now)
+            self._anchors = runs.mark_done(self._anchors, key, now, extra=fields)
+            self.log(f"Done: {label}" + (", with feed" if fed else ""))
+            self._after_anchor_change("done", row, now, {"fed": True} if fed else None)
             return
         task = runs.tapped_task(row, self.run_tasks)
         ledger = self._ledgers().get(task.appliance) if task else None
@@ -318,7 +326,8 @@ class HouseUpcoming(hass.Hass):
                 continue
             value = maint.reading(cached.get("state"))
             self._plant_latches[entity] = plants.step_plant(self._plant_latches.get(entity), plant, value, now)
-            found.append(plants.plant_row(entity, plant, self._plant_latches[entity], value))
+            feed = maint.reading((self._cache.get(plant["conductivity"]) or {}).get("state"))
+            found.append(plants.plant_row(entity, plant, self._plant_latches[entity], value, feed))
         for item in found:
             if item:
                 rows.append(item[0])

@@ -7,6 +7,15 @@ is "Water the <name>: <litres> L", and gives up name characters before it gives 
 may also say what it looks like, `aka`, and where it stands, `where`: plain text of one line, which
 lead the info lines of the row's sheet.
 
+The title says to add liquid feed when the plant is due for it: "... + <tsp> tsp fertiliser", at one
+teaspoon a litre of water, to the nearest quarter. A sensor plant with a `conductivity` sensor is due for
+it while the reading is under FEED_BELOW; an unknown reading says nothing. A calendar plant is due for it
+at the watering the row is for (its due day, or today once that has passed): from March to September at
+every watering, in the other months once FEED_EVERY_DAYS days have passed since it was last fed or if it
+never was. A succulent (`feed: summer`) is fed from March to September only, and then at most every
+FEED_EVERY_DAYS days. The anchor keeps `fed_at`, set by a Done that said to feed and carried over by one
+that did not; a seed counts as a feeding at the moment it is made.
+
 A sensor plant is dry once its soil moisture reading, in percent, is at or under its `dry`, and stays dry
 until a reading is CLOSE_MARGIN above it: watering makes the reading jump, while a reading wandering
 around `dry` never flaps the row. A reading that is unknown, unavailable or not a number changes nothing
@@ -34,6 +43,9 @@ ANCHOR_PREFIX = "plant:"
 ICON = "mdi:watering-can-outline"
 CLOSE_MARGIN = 5
 LEAD_DAYS = 1
+FEED_BELOW = 350
+FEED_EVERY_DAYS = 28
+SUMMER_MONTHS = range(3, 10)
 
 
 def slug(name):
@@ -53,7 +65,7 @@ def _note(value, who, field):
 
 
 def _parse(raw):
-    sensor, calendar, slugs = {}, {}, set()
+    sensor, calendar, slugs, entities = {}, {}, set(), set()
     for cfg in raw or []:
         cfg = cfg if isinstance(cfg, dict) else {}
         entity, days, water = cfg.get("moisture"), cfg.get("every_days"), cfg.get("water")
@@ -74,16 +86,23 @@ def _parse(raw):
             interval = reading(days)
             if interval is None or interval < 1 or interval != int(interval):
                 raise ValueError(f"{who}: every_days must be a whole number of days above zero, not {days!r}")
-            if cfg.get("dry") is not None:
-                raise ValueError(f"{who}: dry goes with moisture, not every_days")
-            calendar[key] = {**plant, "every_days": int(interval)}
+            if cfg.get("dry") is not None or cfg.get("conductivity") is not None:
+                raise ValueError(f"{who}: dry and conductivity go with moisture, not every_days")
+            if cfg.get("feed") not in (None, "summer"):
+                raise ValueError(f"{who}: feed can only be summer, not {cfg.get('feed')!r}")
+            calendar[key] = {**plant, "every_days": int(interval), "feed": cfg.get("feed")}
             continue
-        dry = reading(cfg.get("dry"))
-        if not isinstance(entity, str) or not entity or entity in sensor:
-            raise ValueError(f"{who}: moisture must be a sensor entity id, listed once")
+        dry, conductivity = reading(cfg.get("dry")), cfg.get("conductivity")
+        if cfg.get("feed") is not None:
+            raise ValueError(f"{who}: feed goes with every_days, not moisture")
+        used = [each for each in (entity, conductivity) if each is not None]
+        valid = all(isinstance(each, str) and each for each in used)
+        if not valid or len(set(used)) < len(used) or entities & set(used):
+            raise ValueError(f"{who}: moisture and conductivity must be sensor entity ids, each listed once")
         if dry is None:
             raise ValueError(f"{who}: dry must be a number, not {cfg.get('dry')!r}")
-        sensor[entity] = {**plant, "dry": dry}
+        entities |= set(used)
+        sensor[entity] = {**plant, "dry": dry, "conductivity": conductivity}
     return sensor, calendar
 
 
@@ -91,8 +110,9 @@ def parse_plants(raw):
     """The sensor plants of the `plants` list of house_upcoming.yaml, validated, as {moisture entity:
     plant}. Raises ValueError on a plant that has no name with letters or digits, does not have exactly
     one of `moisture` and `every_days`, has a `dry` that is not a number, a `water` that is given but not
-    a positive number or an `aka` or `where` that is not plain text, or lists an entity or name twice, so a
-    typo fails at start instead of silently dropping a plant."""
+    a positive number, an `aka` or `where` that is not plain text, a `conductivity` or `feed` that does not
+    fit its kind, or lists an entity or name twice, so a typo fails at start instead of silently dropping
+    a plant."""
     return _parse(raw)[0]
 
 
@@ -126,19 +146,35 @@ def _percent(value):
     return f"{round(value, 1):g}%"
 
 
-def _title(plant):
-    """"Water the <name>", then ": <litres> L" when the plant has an amount; the name is cut to make
-    room, never the amount."""
-    amount = f": {round(plant['water'], 2):g} L" if plant["water"] else ""
-    return clean_text(f"Water the {plant['name']}", TEXT_MAX - len(amount)) + amount
+def tsp_text(litres):
+    """The teaspoons of feed for `litres` of water at one a litre, to the nearest quarter and at least a
+    quarter: 1/4, 1/2, 3/4, 1, 1 1/2."""
+    whole, part = divmod(max(1, int(litres * 4 + 0.5)), 4)
+    return " ".join(filter(None, [str(whole) if whole else "", {1: "1/4", 2: "1/2", 3: "3/4"}.get(part, "")]))
 
 
-def plant_row(entity, plant, st, value):
-    """(row, push key) while the sensor plant is dry and its reading is known, else None."""
+def _title(plant, feed=False):
+    """"Water the <name>", then ": <litres> L" when the plant has an amount, then " + <tsp> tsp fertiliser"
+    when it is due for feed, or " + <tsp> tsp feed" if that is what fits. The name is cut to make room,
+    never the amount or the dose."""
+    base, litres = clean_text(f"Water the {plant['name']}"), plant["water"]
+    amount = f": {round(litres, 2):g} L" if litres else ""
+    if feed:
+        dose = f" + {tsp_text(litres)} tsp" if litres else " +"
+        if len(base + amount + dose + " fertiliser") <= TEXT_MAX:
+            return base + amount + dose + " fertiliser"
+        amount += dose + " feed"
+    return clean_text(base, TEXT_MAX - len(amount)) + amount
+
+
+def plant_row(entity, plant, st, value, conductivity=None):
+    """(row, push key) while the sensor plant is dry and its reading is known, else None. The row says to
+    add feed while the `conductivity` reading, if there is one, is under FEED_BELOW."""
     st = st or {}
     if "since" not in st or value is None:
         return None
-    row = make_row(ID_PREFIX + plant["slug"], "maint", _title(plant),
+    feed = conductivity is not None and conductivity < FEED_BELOW
+    row = make_row(ID_PREFIX + plant["slug"], "maint", _title(plant, feed),
                    f"soil {_percent(value)}, water at {_percent(plant['dry'])}", icon=ICON, area=plant["area"],
                    audience="admin", info=plant["info"])
     return row, f"plant:{entity}:{st['since']}"
@@ -162,6 +198,32 @@ def seed_timed(anchors, calendar, now):
     for plant in calendar.values():
         out.setdefault(anchor_key(plant), {"at": utc_iso(now), "seed": True})
     return out
+
+
+def fed_on(anchor):
+    """When the plant was last fed: the anchor's `fed_at`, else its own time if it is a seed, else None."""
+    anchor = anchor or {}
+    return parse_iso(anchor.get("fed_at")) or (parse_iso(anchor.get("at")) if anchor.get("seed") else None)
+
+
+def feeds(plant, anchor, now):
+    """Whether the watering of a calendar plant, on its due day or today once that has passed, comes
+    with feed."""
+    when = parse_iso((anchor or {}).get("at"))
+    if when is None:
+        return False
+    day = max(house_date(when) + timedelta(days=plant["every_days"]), house_date(now))
+    fed = fed_on(anchor)
+    stale = fed is None or (day - house_date(fed)).days >= FEED_EVERY_DAYS
+    summer = day.month in SUMMER_MONTHS
+    return summer and stale if plant["feed"] == "summer" else summer or stale
+
+
+def done_fields(plant, anchor, now):
+    """The fields a Done at `now` gives the new anchor: when the plant was last fed, which is now if the
+    row said to feed."""
+    fed = now if feeds(plant, anchor, now) else fed_on(anchor)
+    return {"fed_at": utc_iso(fed)} if fed else {}
 
 
 def _days(count):
@@ -189,7 +251,7 @@ def timed_row(plant, anchor, now):
         detail = "due today" if left == 0 else f"due since {ddmm(due, now)}"
     last = (f"Counting from {ddmm(when, now)}" if anchor.get("seed")
             else f"Done {ddmm(when, now)}, {'today' if since == 0 else f'{_days(since)} ago'}")
-    row = make_row(ID_PREFIX + plant["slug"], "maint", _title(plant), detail, at=at, icon=ICON, area=plant["area"],
-                   audience="admin", tap_done=True,
+    row = make_row(ID_PREFIX + plant["slug"], "maint", _title(plant, feeds(plant, anchor, now)), detail, at=at,
+                   icon=ICON, area=plant["area"], audience="admin", tap_done=True,
                    info=[*plant["info"], "Every day" if interval == 1 else f"Every {interval} days", last])
     return row, key
