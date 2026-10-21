@@ -7,6 +7,9 @@ import lighting_actions
 import presence_trust
 import room_state_darkness
 
+# Vacuum states that mean a run is in progress, the trip back to the dock included.
+ROBOT_RUN_STATES = ("cleaning", "returning")
+
 class FamilyRoomLights(hass.Hass):
     """
     Family room lights with presence detection, door awareness, sleep mode and enhanced illuminance calculation.
@@ -419,6 +422,21 @@ class FamilyRoomLights(hass.Hass):
                 except Exception as e:
                     self.log(f"Dishwasher state listener failed: {e}", level="ERROR")
             
+            self._robot_vacuum_entity = self.args.get("robot_vacuum_entity") or None
+            self._robot_quiet_sensors = list(self.args.get("robot_quiet_sensors") or [])
+            self._robot_quiet_for = None
+            self._robot_hold_logged = False
+            if self._robot_vacuum_entity:
+                try:
+                    self.listen_state(self._on_robot_vacuum_state, self._robot_vacuum_entity)
+                    self.log(
+                        f"Robot run hold: {self._robot_vacuum_entity}, "
+                        f"{len(self._robot_quiet_sensors)} quiet-house sensors",
+                        level="INFO",
+                    )
+                except Exception as e:
+                    self.log(f"Robot run hold listener failed: {e}", level="ERROR")
+
             # Validate and recover states after initialization
             self.run_in(self._validate_and_recover_states, self.initial_check_delay + 2)
             # Removed verbose initialization complete message for streamlined logging
@@ -1098,6 +1116,7 @@ class FamilyRoomLights(hass.Hass):
 
             # Step 2: Apply decision tree and determine required action
             action = self._determine_lighting_action(context)
+            action = self._hold_turn_on_during_robot_run(action, context)
             
             # Step 3: Execute the determined action
             self._execute_lighting_action(action, context)
@@ -1585,6 +1604,112 @@ class FamilyRoomLights(hass.Hass):
             and not self._zone_manual_active(light)
             for light in self._all_light_entities()
         )
+
+    def _entity_changed_at(self, entity_id):
+        """Epoch seconds of an entity's last state change, None when unreadable."""
+        try:
+            raw = self.get_state(entity_id, attribute="last_changed")
+            return datetime.datetime.fromisoformat(str(raw)).timestamp() if raw else None
+        except (TypeError, ValueError):
+            return None
+
+    def _quiet_empty_house_since(self):
+        """Epoch seconds at which zone.home turned 0, when it reads 0 and none of the quiet-house
+        sensors has changed since; None otherwise. Unreadable inputs count as not quiet."""
+        if not self._robot_quiet_sensors:
+            return None
+        if self._safe_get_state("zone.home", default=None, timeout_warning=False) != "0":
+            return None
+        emptied_at = self._entity_changed_at("zone.home")
+        if emptied_at is None:
+            return None
+        for sensor in self._robot_quiet_sensors:
+            changed_at = self._entity_changed_at(sensor)
+            if changed_at is None or changed_at >= emptied_at:
+                return None
+        return emptied_at
+
+    def _on_robot_vacuum_state(self, entity, attribute, old, new, kwargs):
+        """Judge the house as the vacuum leaves the dock; the verdict lapses when the run ends.
+        Stirring inside the house after the run has started never changes the verdict."""
+        try:
+            if new in ROBOT_RUN_STATES and old not in ROBOT_RUN_STATES:
+                self._robot_quiet_for = self._quiet_empty_house_since()
+                if self._robot_quiet_for is None:
+                    self.log("Robot run: house not empty or not quiet since it emptied, lights react normally", level="INFO")
+                else:
+                    self.log("Robot run: nobody home and the house stayed quiet, auto-on is held back until someone enters", level="INFO")
+            elif new not in ROBOT_RUN_STATES:
+                self._robot_quiet_for = None
+        except Exception as e:
+            self._robot_quiet_for = None
+            self.log(f"Error in robot vacuum handler: {e}", level="ERROR")
+
+    def _family_lights_on_outside_island(self):
+        """True when a family light other than the island group is on (the island is left out
+        because the dishwasher signal lights it whenever the kitchen sees motion)."""
+        island = self._island_entity_set()
+        return any(
+            self._safe_get_state(light, default="off", timeout_warning=False) == "on"
+            for light in self._all_light_entities()
+            if light not in island
+        )
+
+    def _robot_run_holds(self, action, context):
+        """The vacuum state to report when a turn-on decision must be held back, else None.
+
+        Holds only while ALL of these are true: zone.home reads exactly 0 and is still the
+        empty-house episode judged quiet when the run started, the vacuum is cleaning or
+        returning, the entry door is closed and unchanged since zone.home turned 0, and no
+        family light besides the island is on. Anything unreadable or different returns None.
+        """
+        if action['action'] not in ('turn_on_all', 'turn_on_island_only'):
+            return None
+        vacuum_entity = getattr(self, "_robot_vacuum_entity", None)
+        door_entity = getattr(self, "apartment_entry_door_sensor", None)
+        emptied_at = getattr(self, "_robot_quiet_for", None)
+        if not vacuum_entity or not door_entity or emptied_at is None or context['anyone_home']:
+            return None
+        if self._safe_get_state("zone.home", default=None, timeout_warning=False) != "0":
+            return None
+        if self._entity_changed_at("zone.home") != emptied_at:
+            return None
+        vacuum_state = self._safe_get_state(vacuum_entity, default=None, timeout_warning=False)
+        if vacuum_state not in ROBOT_RUN_STATES:
+            return None
+        if self._safe_get_state(door_entity, default=None, timeout_warning=False) != "off":
+            return None
+        door_changed_at = self._entity_changed_at(door_entity)
+        if door_changed_at is None or door_changed_at > emptied_at:
+            return None
+        if self._family_lights_on_outside_island():
+            return None
+        return vacuum_state
+
+    def _hold_turn_on_during_robot_run(self, action, context):
+        """Turn a turn-on decision into preserve_current_state while the vacuum runs through an
+        empty, quiet house nobody has entered (see _robot_run_holds). Never raises; any failure
+        leaves the decision untouched. One INFO line per hold, not per evaluation."""
+        try:
+            vacuum_state = self._robot_run_holds(action, context)
+        except Exception as e:
+            self.log(f"Robot run hold check failed, lights react normally: {e}", level="WARNING")
+            vacuum_state = None
+        if vacuum_state is None:
+            self._robot_hold_logged = False
+            return action
+        if not getattr(self, "_robot_hold_logged", False):
+            self._robot_hold_logged = True
+            self.log(
+                f"Robot run hold: {self._robot_vacuum_entity} is {vacuum_state}, nobody home, "
+                f"house quiet, entry door untouched: {action['action'].replace('_', ' ')} held back",
+                level="INFO",
+            )
+        return {
+            'action': 'preserve_current_state',
+            'reason': 'robot_run_nobody_home',
+            'details': f"Nobody home, vacuum {vacuum_state}, entry door untouched: holding back {action['action']}",
+        }
 
     def _determine_lighting_action(self, context):
         """

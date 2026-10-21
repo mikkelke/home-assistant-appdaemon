@@ -45,6 +45,20 @@ FamilyRoomLights:
   # Guest-exit: all adjacent room doors closed + no family PIR; optionally require entry door closed before clearing latch.
   guest_exit_require_entry_door_closed: false
   guest_exit_use_adjacent_doors_only: true
+  # Auto-on is held back while this vacuum is cleaning or returning, nobody is home, none of the
+  # quiet-house sensors changed between zone.home turning 0 and the run starting, and the
+  # apartment entry door has not changed since zone.home turned 0. Remove the vacuum entity to switch the hold off.
+  robot_vacuum_entity: "vacuum.rober2"
+  robot_quiet_sensors:
+    - "binary_sensor.kitchen_active"
+    - "binary_sensor.dining_room_active"
+    - "binary_sensor.living_room_active"
+    - "binary_sensor.hallway_active"
+    - "binary_sensor.bedroom_active"
+    - "binary_sensor.bathroom_active"
+    - "binary_sensor.guest_bathroom_active"
+    - "binary_sensor.claudias_room_active"
+    - "binary_sensor.kristines_room_active"
   # Living/dining only: detect human brighten via context.user_id + echo suppression after this app's service calls.
   manual_bright_listen_groups:
     - living
