@@ -136,6 +136,7 @@ def make_finish_app(
     app.start_w = 18.0
     app.announce_entity = None
     app.announce_message = "Washer is ready to be emptied"
+    app.drum_clean_announce_message = "Drum clean is done. Open the washer door to air it"
     app.door_lock_entity = None
     app.unemptied_timeout_hours = 24
     app.emptied_timeout_minutes = 30
@@ -267,6 +268,28 @@ class RegressionGuardUntouchedDoor(unittest.TestCase):
         self.assertEqual(app.mobile_calls, [])
         self.assertEqual(len(app.saved_feedback), 1)
         self.assertEqual(app.saved_feedback[0]["end_reason"], "standby")
+
+
+class DrumCleanFinish(unittest.TestCase):
+    """A drum clean leaves nothing to empty: the finish says to open the door and air it."""
+
+    def drum_clean_app(self, **kw):
+        app = make_finish_app(pending_end_reason="standby", door_now="off", door_history=[], **kw)
+        app._compute_final_and_confirmed_programme = lambda run, en, update_detected=False: (
+            "drum_clean", None, "drum_clean", None)
+        return app
+
+    def test_the_announcement_says_to_air_it(self):
+        app = self.drum_clean_app(last_high_energy_at=NOW)
+        app._transition_to_unemptied()
+        self.assertEqual(app.state, "Unemptied")
+        self.assertEqual(app.sonos_calls, ["Drum clean is done. Open the washer door to air it"])
+
+    def test_a_late_push_says_to_air_it(self):
+        app = self.drum_clean_app(last_high_energy_at=NOW - timedelta(minutes=20))
+        app._transition_to_unemptied()
+        self.assertEqual(app.sonos_calls, [])
+        self.assertTrue(app.mobile_calls[0]["message"].endswith("open the door to air it."))
 
 
 class Fix3AnnounceFreshness(unittest.TestCase):

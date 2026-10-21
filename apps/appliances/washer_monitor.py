@@ -765,6 +765,9 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
 
         # Notification
         self.announce_message = self.args.get("announce_message", "Washer is ready to be emptied")
+        self.drum_clean_announce_message = self.args.get(
+            "drum_clean_announce_message", "Drum clean is done. Open the washer door to air it"
+        )
         self.announce_entity = self.args.get("announce_entity")  # input_boolean to enable/disable
         # If we only detect the finish this many minutes after it actually happened (finish
         # anchor = last_high_energy_at), a Sonos announcement is too late to be useful - send a
@@ -2345,6 +2348,10 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 return
             self._handle_door_closed(current_state)
 
+    def _finish_announcement(self, programme):
+        """The Sonos line for a finished run: a drum clean leaves nothing to empty, only a door to open."""
+        return self.drum_clean_announce_message if programme == wp.DRUM_CLEAN else self.announce_message
+
     def _door_lock_state_changed(self, entity, attr, old, new, kwargs):
         """When door lock goes to unlocked and we're Unemptied, announce (washer ready to empty)."""
         if new not in ("unlocked", "off"):
@@ -2364,7 +2371,8 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 pass
         if self.sonos_notifier and announce_enabled:
             try:
-                self.sonos_notifier.notify(message=self.announce_message)
+                programme = self.get_state(self.state_entity, attribute="detected_programme")
+                self.sonos_notifier.notify(message=self._finish_announcement(programme))
                 self.log("Washer announcement sent (door unlocked)", level="INFO")
                 self.notification_sent = True
             except Exception as e:
@@ -3442,7 +3450,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                 if latency_min > freshness_min or force_push:
                     self._push_mobile(
                         f"Washer finished about {latency_min:.0f} min ago (late detection) - "
-                        f"ready to empty.",
+                        f"{'open the door to air it' if confirmed_prog == wp.DRUM_CLEAN else 'ready to empty'}.",
                         link=f"/dashboard-rooftop/home#now=washer-{int(self._now_utc().timestamp())}",
                     )
                     if latency_min > freshness_min:
@@ -3460,7 +3468,7 @@ class WasherMonitor(CyclePersistenceMixin, hass.Hass):
                     self.notification_sent = True
                 else:
                     try:
-                        self.sonos_notifier.notify(message=self.announce_message)
+                        self.sonos_notifier.notify(message=self._finish_announcement(confirmed_prog))
                         self.log("[TAIL] Washer announcement sent", level="INFO")
                         self.notification_sent = True
                     except Exception as e:
