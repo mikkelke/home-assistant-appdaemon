@@ -747,14 +747,15 @@ class HeatingController(hass.Hass):
         )
 
     def _budgets(self, zc: hp.ZoneConfig, now_ts: float, tz) -> list:
-        """Today's and tomorrow's budget for a zone from the current forecast."""
+        """The budget for a zone from the current forecast, today and the next two days: the
+        plan is projected to the end of tomorrow, and its lead time reaches into the day after."""
         fc = self._forecast
         if not hf.is_usable(fc, now_ts, self.cfg.forecast_stale_hours) or self._location is None:
             return []
         lat, lon = self._location
         today = hp.local_dt(now_ts, tz).date()
         out = []
-        for day in (today, today + timedelta(days=1)):
+        for day in (today + timedelta(days=n) for n in range(3)):
             weather = hf.day_weather(fc, day, tz)
             if weather is None:
                 continue
@@ -1076,6 +1077,11 @@ class HeatingController(hass.Hass):
             hold_back=self._loop.hold and zc.guard.enabled,
             cut_windows=cut.windows,
             last_planned=rt.last_planned,
+            day_duty=(
+                tuple((b.day.isoformat(), b.u_eq) for b in budgets if b.u_eq is not None)
+                if (zc.weather_offset.enabled and ctx["forecast_ok"])
+                else ()
+            ),
         )
         plan = hp.plan(zc, inp, now_ts, tz)
 
@@ -1532,6 +1538,7 @@ class HeatingController(hass.Hass):
             "base": base,
             "nudge": rt.nudge,
             "trim": rt.trim,
+            "weather_offset": plan.weather_offset,
             "limits": [lower, upper],
             "thermostat": {
                 "online": reading["online"],
@@ -1681,6 +1688,7 @@ class HeatingController(hass.Hass):
             "nudge_min": _signed(zc.nudge.minimum),
             "nudge_max": _signed(zc.nudge.maximum),
             "trim": _signed(rt.trim, 2),
+            "weather_offset": _signed(plan.weather_offset, 2),
             "profile_offset": _signed(plan.target - base - rt.nudge),
             "lower_limit": lower,
             "upper_limit": upper,

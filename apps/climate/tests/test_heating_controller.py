@@ -468,6 +468,12 @@ class ShippedYaml(unittest.TestCase):
         self.assertEqual(enabled, ["family", "claudias_room"])
         self.assertEqual(self.cfg.zones["claudias_room"].sun_cut.az_min, 180.0)
 
+    def test_only_the_family_zone_ships_a_weather_offset(self):
+        shipped = {
+            n: zc.weather_offset for n, zc in self.cfg.zones.items() if zc.weather_offset.enabled
+        }
+        self.assertEqual(shipped, {"family": hp.WeatherOffsetConfig(True, 0.85, 0.22, 1.5)})
+
     def test_helper_entities_are_ones_that_exist(self):
         wanted = {self.cfg.season_entity, self.cfg.bedroom.ceiling_entity}
         wanted.update(zc.target_entity for zc in self.cfg.zones.values())
@@ -956,6 +962,136 @@ class SunCut(unittest.TestCase):
         h.app.cfg = dataclasses.replace(h.app.cfg, sun_term_factor=1.0)  # 0.89 at full trust
         h.tick(minutes=5)
         self.assertEqual(h.attrs("family")["mode"], "sun_cut")
+
+
+class WeatherOffsetEndToEnd(unittest.TestCase):
+    """On a cold day the family zone asks its thermostat for more than the profile says."""
+
+    COLD_PLAN = [
+        "Aim 21.5: the target 4 h ahead",
+        "Weather +0.5: expected duty 0.63",
+        "Setpoint 22.5 (trim +0.50, weather +0.49)",
+    ]
+
+    @staticmethod
+    def forecast(h, today, tomorrow):
+        """Fetch a forecast with a flat temperature on 17 and on 18 October, and no sun."""
+        hourly = h.payload["hourly"]
+        temp = {17: today, 18: tomorrow}
+        hourly["temperature_2m"] = [
+            temp.get(hp.local_dt(t - 1800, TZ).day, tomorrow) for t in hourly["time"]
+        ]
+        hourly["shortwave_radiation"] = [0.0] * len(hourly["time"])
+        h.fetch()
+
+    def cold_house(self, today=-3.0, tomorrow=-3.0):
+        h = Harness(self, forecast=False)
+        h.ha.set("input_boolean.heating_season", "on")
+        self.forecast(h, today, tomorrow)
+        return h
+
+    @staticmethod
+    def decision(h, zone="family"):
+        return [r for r in h.log_lines("decision") if r["zone"] == zone][-1]
+
+    def test_a_cold_day_raises_the_family_setpoint_and_the_sensor_and_the_log_say_so(self):
+        h = self.cold_house()
+        h.tick()
+        a, d = h.attrs("family"), self.decision(h)
+        self.assertEqual((a["weather_offset"], d["weather_offset"]), ("+0.49", 0.49))
+        self.assertEqual((d["aim"], d["raw"], d["setpoint"]), (21.5, 22.49, 22.5))
+        self.assertEqual(a["setpoint_now"], 22.5)
+        self.assertEqual(h.zone("family")["state"], 21.5)
+        self.assertEqual(a["reasons"], self.COLD_PLAN)
+        self.assertEqual(d["reasons"], self.COLD_PLAN)
+
+    def test_the_plan_shows_the_raise_outside_the_season_too(self):
+        h = self.cold_house()
+        h.ha.set("input_boolean.heating_season", "off")
+        h.tick()
+        a = h.attrs("family")
+        self.assertEqual(
+            (a["mode"], a["plan_mode"], a["weather_offset"]), ("off_season", "hold", "+0.49")
+        )
+
+    def test_no_other_zone_is_raised(self):
+        h = self.cold_house()
+        h.tick()
+        others = ZONES[1:]
+        for zone in others:
+            self.assertEqual(h.attrs(zone)["weather_offset"], "+0.00", zone)
+            self.assertEqual(self.decision(h, zone)["weather_offset"], 0.0, zone)
+        self.assertEqual([h.attrs(z)["setpoint_now"] for z in others], [21.5, 21.5, 19.0, 20.0])
+
+    def test_a_mild_day_changes_nothing(self):
+        h = Harness(self)
+        h.ha.set("input_boolean.heating_season", "on")
+        h.tick()
+        a, d = h.attrs("family"), self.decision(h)
+        self.assertEqual((a["weather_offset"], d["weather_offset"]), ("+0.00", 0.0))
+        self.assertEqual(a["setpoint_now"], 22.0)
+        self.assertEqual(
+            a["reasons"], ["Aim 21.5: the target 4 h ahead", "Setpoint 22.0 (trim +0.50)"]
+        )
+
+    def test_the_day_at_the_lead_time_decides_which_forecast_counts(self):
+        h = self.cold_house(today=11.0, tomorrow=-3.0)
+        h.at(19, 55).tick()  # lead time 23:55, still today
+        self.assertEqual(h.attrs("family")["weather_offset"], "+0.00")
+        h.at(20, 5).tick()  # lead time 00:05, tomorrow
+        a = h.attrs("family")
+        self.assertEqual(a["weather_offset"], "+0.47")
+        self.assertIn("Weather +0.5: expected duty 0.62", a["reasons"])
+
+    def test_the_budget_reaches_the_lead_day_at_the_end_of_the_projection(self):
+        h = self.cold_house()
+        h.tick()
+        days = [b["day"] for b in self.decision(h)["budget"]]
+        self.assertEqual(days, ["2026-10-17", "2026-10-18", "2026-10-19"])
+
+    def test_a_new_forecast_moves_the_projected_change_as_well(self):
+        h = Harness(self)
+        h.ha.set("input_boolean.heating_season", "on")
+        h.tick()
+        a = h.attrs("family")
+        self.assertEqual(
+            (a["next_change_at"], a["next_setpoint"]), ("2026-10-17T13:00:00+02:00", 22.5)
+        )
+        self.forecast(h, -3.0, -3.0)
+        h.tick(minutes=1)
+        a = h.attrs("family")
+        self.assertEqual((a["setpoint_now"], a["next_setpoint"]), (22.5, 23.0))
+
+    def test_an_airing_takes_the_raise_away_until_it_is_over(self):
+        h = self.cold_house()
+        h.tick()
+        h.ha.set("binary_sensor.rooftop_door_1_contact", "on")
+        h.tick(minutes=1)
+        h.tick(minutes=2)
+        a = h.attrs("family")
+        self.assertEqual(
+            (a["mode"], a["setpoint_now"], a["weather_offset"]), ("window", 19.0, "+0.00")
+        )
+        self.assertEqual(self.decision(h)["weather_offset"], 0.0)
+        h.ha.set("binary_sensor.rooftop_door_1_contact", "off")
+        h.tick(minutes=40)
+        a = h.attrs("family")
+        self.assertEqual((a["mode"], a["weather_offset"]), ("hold", "+0.49"))
+
+    def test_without_a_usable_forecast_there_is_no_raise(self):
+        h = Harness(self, forecast=False)
+        h.ha.set("input_boolean.heating_season", "on")
+        h.tick()
+        self.assertEqual(h.attrs("family")["weather_offset"], "+0.00")
+        h = self.cold_house()
+        h.tick()
+        self.assertEqual(h.attrs("family")["weather_offset"], "+0.49")
+        h.fetch_error = OSError("down")
+        h.at(0, 30, day=18).tick()  # 12.5 hours after the fetch
+        self.assertEqual(h.last("sensor.heating_controller")["attributes"]["forecast_ok"], "false")
+        a = h.attrs("family")
+        self.assertEqual((a["weather_offset"], a["setpoint_now"]), ("+0.00", 21.5))
+        self.assertEqual(self.decision(h)["weather_offset"], 0.0)
 
 
 class WindowEndToEnd(unittest.TestCase):

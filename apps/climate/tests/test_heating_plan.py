@@ -49,6 +49,7 @@ FAMILY = {
     },
     "trim": {"initial": 0.5, "min": -0.5, "max": 1.5},
     "budget": {"a": 0.55, "b_om": -1.62, "c": 1.21, "d": -0.04},
+    "weather_offset": {"gain": 0.85, "bias": 0.22, "max_c": 1.5},
     "sun_cut": {
         "enabled": True,
         "azimuth": [100, 260],
@@ -205,6 +206,8 @@ class ConfigParsing(unittest.TestCase):
         self.assertFalse(CFG.zones["kristines_room"].sun_cut.enabled)
         self.assertEqual(CFG.zones["kristines_room"].nudge.maximum, 1.0)
         self.assertEqual(CFG.zones["kristines_room"].budget.changepoint_k, 0.17)
+        self.assertEqual(zc.weather_offset, hp.WeatherOffsetConfig(True, 0.85, 0.22, 1.5))
+        self.assertEqual([n for n, z in CFG.zones.items() if z.weather_offset.enabled], ["family"])
 
     def test_defaults(self):
         self.assertEqual(CFG.sun_term_factor, 0.5)
@@ -270,6 +273,53 @@ class ConfigParsing(unittest.TestCase):
         for args in cases:
             with self.assertRaises(hp.ConfigError, msg=repr(args)[:80]):
                 hp.parse_config(args)
+
+    def weather_offset_of(self, raw):
+        return hp.parse_config(self._broken(weather_offset=raw)).zones["family"].weather_offset
+
+    def test_the_weather_offset_is_off_unless_a_zone_gives_one(self):
+        self.assertEqual(hp.WeatherOffsetConfig(), hp.WeatherOffsetConfig(False, 0.85, 0.22, 1.5))
+        self.assertEqual(CFG.zones["kristines_room"].weather_offset, hp.WeatherOffsetConfig())
+        for empty in (None, {}):
+            self.assertEqual(self.weather_offset_of(empty), hp.WeatherOffsetConfig(), repr(empty))
+
+    def test_a_weather_offset_is_read_and_leaves_out_what_the_default_covers(self):
+        self.assertEqual(
+            self.weather_offset_of({"gain": 0.9, "bias": 0.3, "max_c": 1}),
+            hp.WeatherOffsetConfig(True, 0.9, 0.3, 1.0),
+        )
+        self.assertEqual(
+            self.weather_offset_of({"max_c": 1}), hp.WeatherOffsetConfig(True, max_c=1.0)
+        )
+        self.assertEqual(self.weather_offset_of({"gain": 2}).gain, 2.0)
+
+    def test_the_edges_of_what_a_weather_offset_allows_are_accepted(self):
+        for raw in ({"bias": 0}, {"bias": 1}, {"max_c": 0}, {"gain": 0.01}):
+            self.assertTrue(self.weather_offset_of(raw).enabled, repr(raw))
+
+    def test_a_bad_weather_offset_is_refused(self):
+        bad = [{"gain": 0}, {"gain": -0.85}, {"max_c": -0.1}, {"bias": -0.01}, {"bias": 1.01}]
+        for raw in bad:
+            with self.assertRaisesRegex(
+                hp.ConfigError, "zone family: weather_offset", msg=repr(raw)
+            ):
+                self.weather_offset_of(raw)
+        for raw in (True, 1.5, ["gain"], "on"):
+            with self.assertRaisesRegex(
+                hp.ConfigError, "weather_offset is a mapping", msg=repr(raw)
+            ):
+                self.weather_offset_of(raw)
+
+    def test_a_weather_offset_needs_the_budget_the_duty_comes_from(self):
+        for budget in (None, {}):
+            with self.assertRaisesRegex(
+                hp.ConfigError, "zone family: weather_offset needs a budget"
+            ):
+                hp.parse_config(self._broken(budget=budget))
+        zones = dict(ARGS["zones"], guest_bathroom=dict(GUEST, weather_offset={"max_c": 1.5}))
+        with self.assertRaisesRegex(hp.ConfigError, "zone guest_bathroom: weather_offset needs"):
+            hp.parse_config(dict(ARGS, zones=zones))
+        self.assertEqual(CFG.zones["guest_bathroom"].weather_offset, hp.WeatherOffsetConfig())
 
     ADVISED = {
         "family": {
@@ -762,6 +812,197 @@ class BudgetAndCut(unittest.TestCase):
     def test_duty_is_limited_to_a_full_day(self):
         b = self.budget(dw(-20.0, 30.0, 0.1), [])
         self.assertEqual(b.u_eq, 1.0)
+
+
+class WeatherOffsetMath(unittest.TestCase):
+    """The setpoint raise (u_eq - bias) / gain, limited to [0, max_c], in hundredths of a degree."""
+
+    cfg = CFG.zones["family"].weather_offset
+
+    def test_a_duty_at_or_below_the_bias_needs_no_raise(self):
+        for u_eq in (0.0, 0.1, 0.22):
+            self.assertEqual(hp.weather_offset(self.cfg, u_eq), 0.0, u_eq)
+
+    def test_the_raise_is_the_error_the_band_needs_for_the_duty(self):
+        self.assertEqual(hp.weather_offset(self.cfg, 0.55), 0.39)  # 0.33 / 0.85
+        self.assertEqual(hp.weather_offset(self.cfg, 0.33), 0.13)  # 0.11 / 0.85
+        self.assertEqual(hp.weather_offset(self.cfg, 1.0), 0.92)  # 0.78 / 0.85
+        band = hp.WeatherOffsetConfig(True, gain=0.5, bias=0.1, max_c=1.5)
+        self.assertEqual(hp.weather_offset(band, 0.4), 0.6)
+
+    def test_the_raise_is_rounded_to_a_hundredth(self):
+        self.assertEqual(hp.weather_offset(self.cfg, 0.4), 0.21)  # 0.2118
+        self.assertIsInstance(hp.weather_offset(self.cfg, 0.4), float)
+        self.assertIsInstance(hp.weather_offset(self.cfg, 0.1), float)
+
+    def test_the_raise_stops_at_max_c(self):
+        capped = replace(self.cfg, max_c=0.3)
+        self.assertEqual(hp.weather_offset(capped, 0.55), 0.3)
+        self.assertEqual(hp.weather_offset(capped, 1.0), 0.3)
+        self.assertEqual(hp.weather_offset(capped, 0.3), 0.09)
+        self.assertEqual(hp.weather_offset(replace(self.cfg, max_c=0.0), 1.0), 0.0)
+        self.assertEqual(hp.weather_offset(replace(self.cfg, gain=0.1), 1.0), 1.5)
+
+    def test_disabled_or_without_a_duty_is_zero(self):
+        self.assertEqual(hp.weather_offset(hp.WeatherOffsetConfig(), 0.9), 0.0)
+        self.assertEqual(hp.weather_offset(replace(self.cfg, enabled=False), 0.9), 0.0)
+        self.assertEqual(hp.weather_offset(self.cfg, None), 0.0)
+        self.assertIsInstance(hp.weather_offset(self.cfg, None), float)
+
+    def test_the_budget_of_a_cold_day_gives_a_raise_and_a_mild_day_none(self):
+        zc = CFG.zones["family"]
+        cold = hp.day_budget(zc, dw(-1.0, 15.0, 1.2), [], 0.5)
+        mild = hp.day_budget(zc, dw(11.4, 17.6, 0.3), [], 0.5)
+        self.assertEqual(hp.weather_offset(zc.weather_offset, cold.u_eq), 0.38)
+        self.assertEqual(hp.weather_offset(zc.weather_offset, mild.u_eq), 0.0)
+
+
+class WeatherOffsetInPlan(unittest.TestCase):
+    """The family zone in hold with trim 0.5 and a lead of 4 h: aim plus trim plus the raise of
+    the day the lead time falls on. Today needs 0.39 K, tomorrow 0.56 K."""
+
+    DUTY = (("2026-10-17", 0.55), ("2026-10-18", 0.70))
+    family = CFG.zones["family"]
+
+    def test_hold_adds_the_raise_to_the_raw_setpoint_and_leaves_the_aim_alone(self):
+        p = plan_at(T(12), day_duty=self.DUTY)
+        self.assertEqual(
+            (p.mode, p.plan_mode, p.aim, p.weather_offset), ("hold", "hold", 21.5, 0.39)
+        )
+        self.assertAlmostEqual(p.raw, 22.39)
+        self.assertEqual(p.setpoint, 22.5)
+        self.assertEqual(plan_at(T(12)).setpoint, 22.0)
+
+    def test_the_reasons_tell_the_raise_and_the_duty_before_the_setpoint(self):
+        p = plan_at(T(12), day_duty=self.DUTY)
+        self.assertEqual(
+            p.reasons,
+            (
+                "Aim 21.5: the target 4 h ahead",
+                "Weather +0.4: expected duty 0.55",
+                "Setpoint 22.5 (trim +0.50, weather +0.39)",
+            ),
+        )
+
+    def test_a_season_off_zone_still_plans_the_raise(self):
+        p = plan_at(T(12), day_duty=self.DUTY, season_on=False)
+        self.assertEqual((p.mode, p.plan_mode, p.weather_offset), ("off_season", "hold", 0.39))
+        self.assertEqual(p.reasons[0], "Heating season is off: nothing would be written")
+        self.assertIn("Weather +0.4: expected duty 0.55", p.reasons)
+
+    def test_a_mild_day_changes_nothing_and_says_nothing(self):
+        for duty in ((("2026-10-17", 0.18),), (("2026-10-17", 0.22),), (("2026-10-17", 0.0),)):
+            p = plan_at(T(12), day_duty=duty)
+            self.assertEqual(p.weather_offset, 0.0, duty)
+            self.assertEqual(
+                p.reasons, ("Aim 21.5: the target 4 h ahead", "Setpoint 22.0 (trim +0.50)")
+            )
+            self.assertEqual(p, plan_at(T(12)), duty)
+
+    def test_no_duty_at_all_gives_no_raise(self):
+        p = plan_at(T(12), day_duty=())
+        self.assertEqual((p.weather_offset, p.raw, p.setpoint), (0.0, 22.0, 22.0))
+        self.assertEqual(p, plan_at(T(12)))
+
+    def test_a_zone_that_was_not_given_one_ignores_the_duty(self):
+        for zone in ("kristines_room", "claudias_room", "guest_bathroom"):
+            self.assertEqual(plan_at(T(12), zone, day_duty=self.DUTY), plan_at(T(12), zone), zone)
+        self.assertEqual(plan_at(T(7), "bathroom", day_duty=self.DUTY), plan_at(T(7), "bathroom"))
+
+    def test_the_raise_cannot_lift_the_setpoint_over_the_upper_limit(self):
+        p = plan_at(T(12), base=24.0, day_duty=self.DUTY)
+        self.assertGreater(p.raw, 24.0)
+        self.assertEqual(p.setpoint, 24.0)
+        p = plan_at(T(12), upper_c=22.0, day_duty=self.DUTY)
+        self.assertEqual(p.setpoint, 22.0)
+
+    def test_the_raise_goes_through_the_same_step_and_hysteresis_as_the_rest(self):
+        p = plan_at(T(12), day_duty=self.DUTY, last_planned=22.0)  # raw 22.39 is within 0.4 of 22.0
+        self.assertEqual(p.setpoint, 22.0)
+        p = plan_at(T(12), day_duty=self.DUTY, last_planned=21.5)
+        self.assertEqual(p.setpoint, 22.5)
+
+    def test_only_a_plain_hold_takes_the_raise(self):
+        guarded = replace(self.family, guard=hp.GuardConfig(True, "lower_limit"))
+        cases = [
+            ("sun_cut", self.family, dict(cut_windows=((T(1), T(14), "2026-10-17"),)), T(4)),
+            ("window", self.family, dict(window_state=hp.STATE_OPEN), T(12)),
+            ("settle", self.family, dict(window_state=hp.STATE_SETTLE), T(12)),
+            ("party", self.family, dict(party_windows=((T(8), T(18)),)), T(12)),
+            ("guard", guarded, dict(hold_back=True), T(12)),
+            ("fallback", self.family, dict(fallback=True), T(12)),
+        ]
+        for mode, zone, kw, now in cases:
+            warm = hp.plan(zone, inputs(day_duty=self.DUTY, **kw), now, TZ)
+            plain = hp.plan(zone, inputs(**kw), now, TZ)
+            self.assertEqual(warm.plan_mode, mode)
+            self.assertEqual(warm.weather_offset, 0.0, mode)
+            self.assertEqual(warm, plain, mode)
+            self.assertFalse(any(r.startswith("Weather") for r in warm.reasons), mode)
+
+    def test_the_duty_is_the_one_of_the_day_the_lead_time_falls_on(self):
+        self.assertEqual(plan_at(T(1), day_duty=self.DUTY).weather_offset, 0.39)  # lead 05:00
+        self.assertEqual(plan_at(T(19, 59), day_duty=self.DUTY).weather_offset, 0.39)  # 23:59
+        self.assertEqual(plan_at(T(20, 0), day_duty=self.DUTY).weather_offset, 0.56)  # 00:00
+        p = plan_at(T(21), day_duty=self.DUTY)  # lead 01:00 tomorrow
+        self.assertEqual(p.weather_offset, 0.56)
+        self.assertIn("Weather +0.6: expected duty 0.70", p.reasons)
+        self.assertEqual(p.reasons[-1], "Setpoint 22.0 (trim +0.50, weather +0.56)")
+
+    def test_the_day_is_the_local_one_not_the_utc_one(self):
+        duty = (("2026-10-16", 0.9), ("2026-10-17", 0.55))
+        now = T(21, 30, day=16)  # lead 01:30 local on the 17th, which is still the 16th in UTC
+        self.assertEqual(plan_at(now, day_duty=duty).weather_offset, 0.39)
+
+    def test_without_a_lead_the_day_is_today(self):
+        profile = replace(self.family.profile, lead_hours=0.0)
+        zone = replace(self.family, profile=profile)
+        p = hp.plan(zone, inputs(day_duty=self.DUTY), T(21), TZ)
+        self.assertEqual(p.weather_offset, 0.39)
+
+    def test_a_day_that_has_no_duty_gets_no_raise(self):
+        self.assertEqual(plan_at(T(21), day_duty=self.DUTY[:1]).weather_offset, 0.0)
+        self.assertEqual(plan_at(T(12), day_duty=self.DUTY[1:]).weather_offset, 0.0)
+        self.assertEqual(plan_at(T(12), day_duty=(("2026-10-16", 0.9),)).weather_offset, 0.0)
+
+    def test_the_inputs_with_a_duty_still_compare_and_hash(self):
+        a, b = inputs(day_duty=self.DUTY), inputs(day_duty=tuple(self.DUTY))
+        self.assertEqual((a, hash(a)), (b, hash(b)))
+        self.assertNotEqual(a, inputs(day_duty=self.DUTY[:1]))
+        self.assertNotEqual(a, inputs())
+        self.assertEqual(inputs().day_duty, ())
+        self.assertEqual(hp.Plan("hold", "hold", 21.5, 21.5, 22.0, 22.0, 20.5).weather_offset, 0.0)
+
+    def test_the_projection_carries_the_raise_and_changes_day_at_the_lead_time(self):
+        def blocks(duty):
+            projected = hp.project_blocks(
+                self.family, inputs(day_duty=duty), T(12), T(0, day=18), TZ
+            )
+            return [(hp.hhmm(b[0], TZ), hp.hhmm(b[1], TZ), b[2], b[3]) for b in projected]
+
+        self.assertEqual(
+            blocks(()),
+            [
+                ("12:00", "13:00", "hold", 22.0),
+                ("13:00", "19:00", "hold", 22.5),
+                ("19:00", "00:00", "hold", 21.5),
+            ],
+        )
+        # raw 22.39 rounds to 22.5 and 22.89 stays there inside the hysteresis, 21.89 rounds to 22.0
+        flat = (("2026-10-17", 0.55), ("2026-10-18", 0.55))
+        self.assertEqual(
+            blocks(flat), [("12:00", "19:00", "hold", 22.5), ("19:00", "00:00", "hold", 22.0)]
+        )
+        # from 20:00 the lead time is tomorrow, which needs only 0.09 K: raw 21.59 steps down
+        mild_tomorrow = (("2026-10-17", 0.55), ("2026-10-18", 0.30))
+        self.assertEqual(
+            blocks(mild_tomorrow),
+            [
+                ("12:00", "19:00", "hold", 22.5),
+                ("19:00", "20:00", "hold", 22.0),
+                ("20:00", "00:00", "hold", 21.5),
+            ],
+        )
 
 
 class PartyWindows(unittest.TestCase):

@@ -7,7 +7,8 @@ setpoint the controller would hand them, in two layers:
 
   - HOLD: the setpoint follows the comfort profile, shifted EARLIER by the slab lag (the floor
     answers hours late), plus `trim`, the learned offset between the thermostat's own reading
-    and the seated-air reading the targets are defined in.
+    and the seated-air reading the targets are defined in, plus the weather offset where a zone
+    has one: the raise the thermostat's proportional band needs to call the day's expected duty.
   - COAST: the setpoint drops to a protected minimum (sun cut) or to the zone's lower limit
     (open window, party, bedroom loop).
 
@@ -189,6 +190,14 @@ class NudgeConfig:
 
 
 @dataclass(frozen=True)
+class WeatherOffsetConfig:
+    enabled: bool = False
+    gain: float = 0.85
+    bias: float = 0.22
+    max_c: float = 1.5
+
+
+@dataclass(frozen=True)
 class ZoneConfig:
     name: str
     thermostat: str
@@ -210,6 +219,7 @@ class ZoneConfig:
     nudge: NudgeConfig
     buttons: dict
     evenness_floors: tuple = ()  # (reference, compared): the alert watches compared minus reference
+    weather_offset: WeatherOffsetConfig = WeatherOffsetConfig()
 
 
 @dataclass(frozen=True)
@@ -375,6 +385,30 @@ def _parse_budget(raw) -> Optional[BudgetConfig]:
     )
 
 
+def _parse_weather_offset(raw, budget: Optional[BudgetConfig], where: str) -> WeatherOffsetConfig:
+    if not raw:
+        return WeatherOffsetConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where}: weather_offset is a mapping of gain, bias and max_c")
+    d = WeatherOffsetConfig()
+    cfg = WeatherOffsetConfig(
+        enabled=True,
+        gain=float(raw.get("gain", d.gain)),
+        bias=float(raw.get("bias", d.bias)),
+        max_c=float(raw.get("max_c", d.max_c)),
+    )
+    if not (cfg.gain > 0 and cfg.max_c >= 0 and 0.0 <= cfg.bias <= 1.0):
+        raise ConfigError(
+            f"{where}: weather_offset gain must be positive, bias between 0 and 1, "
+            "max_c not negative"
+        )
+    if budget is None:
+        raise ConfigError(
+            f"{where}: weather_offset needs a budget, the expected duty comes from it"
+        )
+    return cfg
+
+
 def _parse_sun_cut(raw, where: str) -> SunCutConfig:
     raw = raw or {}
     if not raw.get("enabled", False):
@@ -444,6 +478,7 @@ def _parse_zone(name: str, raw: dict) -> ZoneConfig:
     evenness = _as_tuple(raw.get("evenness_floors"))
     if evenness and len(evenness) != 2:
         raise ConfigError(f"{where}: evenness_floors needs [reference, compared]")
+    budget = _parse_budget(raw.get("budget"))
     return ZoneConfig(
         name=name,
         thermostat=_req(raw, "thermostat", where),
@@ -462,7 +497,7 @@ def _parse_zone(name: str, raw: dict) -> ZoneConfig:
             minimum=float(trim.get("min", -1.0)),
             maximum=float(trim.get("max", 1.0)),
         ),
-        budget=_parse_budget(raw.get("budget")),
+        budget=budget,
         sun_cut=_parse_sun_cut(raw.get("sun_cut"), where),
         guard=_parse_guard(raw.get("bedroom_guard"), where),
         residents=_as_tuple(raw.get("residents")),
@@ -473,6 +508,7 @@ def _parse_zone(name: str, raw: dict) -> ZoneConfig:
         ),
         buttons=buttons,
         evenness_floors=evenness,
+        weather_offset=_parse_weather_offset(raw.get("weather_offset"), budget, where),
     )
 
 
@@ -718,6 +754,15 @@ def day_budget(
     skipped = out.u_eq * (w_end - w_start) / 3600.0
     ratio = out.s_credit / skipped if skipped > 0 else None
     return replace(out, window_start=w_start, window_end=w_end, skipped_h=skipped, ratio=ratio)
+
+
+def weather_offset(cfg: WeatherOffsetConfig, u_eq: Optional[float]) -> float:
+    """Setpoint raise in K that makes the thermostat's proportional band, duty = gain * error +
+    bias (gain in duty per K), call the expected duty u_eq: (u_eq - bias) / gain, limited to
+    [0, max_c] and rounded to 0.01 K. Zero when disabled or u_eq is unknown."""
+    if not cfg.enabled or u_eq is None:
+        return 0.0
+    return round(clamp((u_eq - cfg.bias) / cfg.gain, 0.0, cfg.max_c), 2)
 
 
 @dataclass(frozen=True)
@@ -1117,6 +1162,7 @@ class ZoneInputs:
     hold_back: bool = False
     cut_windows: tuple = ()
     last_planned: Optional[float] = None
+    day_duty: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -1129,6 +1175,7 @@ class Plan:
     setpoint: float
     protected_min: float
     reasons: tuple = ()
+    weather_offset: float = 0.0
 
 
 def plan(zc: ZoneConfig, inp: ZoneInputs, now_ts: float, tz) -> Plan:
@@ -1148,6 +1195,8 @@ def plan(zc: ZoneConfig, inp: ZoneInputs, now_ts: float, tz) -> Plan:
     guard_now = guard.enabled and inp.hold_back
 
     aim: Optional[float]
+    u_eq: Optional[float] = None
+    offset = 0.0
     reasons: list = []
     if inp.window_state == STATE_OPEN:
         plan_mode, aim = MODE_WINDOW, None
@@ -1174,14 +1223,20 @@ def plan(zc: ZoneConfig, inp: ZoneInputs, now_ts: float, tz) -> Plan:
         plan_mode, aim = MODE_HOLD, t_lead
         ahead = f"{zc.profile.lead_hours:g} h ahead" if zc.profile.lead_hours else "now"
         reasons.append(f"Aim {t_lead:.1f}: the target {ahead}")
+        u_eq = dict(inp.day_duty).get(local_dt(lead_ts, tz).date().isoformat())
+        offset = weather_offset(zc.weather_offset, u_eq)
 
     if aim is None:
         raw = lower
         setpoint = clamp(lower, lower, upper)
     else:
-        raw = aim + inp.trim
+        raw = aim + inp.trim + offset
         setpoint = clamp(quantize(raw, inp.last_planned), lower, upper)
-        reasons.append(f"Setpoint {setpoint:.1f} (trim {inp.trim:+.2f})")
+        if offset > 0:
+            reasons.append(f"Weather {offset:+.1f}: expected duty {u_eq:.2f}")
+            reasons.append(f"Setpoint {setpoint:.1f} (trim {inp.trim:+.2f}, weather {offset:+.2f})")
+        else:
+            reasons.append(f"Setpoint {setpoint:.1f} (trim {inp.trim:+.2f})")
 
     if not inp.season_on:
         mode = MODE_OFF_SEASON
@@ -1191,7 +1246,7 @@ def plan(zc: ZoneConfig, inp: ZoneInputs, now_ts: float, tz) -> Plan:
         reasons.insert(0, "Thermostat unavailable: nothing can be written")
     else:
         mode = plan_mode
-    return Plan(mode, plan_mode, target, aim, raw, setpoint, pmin, tuple(reasons))
+    return Plan(mode, plan_mode, target, aim, raw, setpoint, pmin, tuple(reasons), offset)
 
 
 def project_blocks(
