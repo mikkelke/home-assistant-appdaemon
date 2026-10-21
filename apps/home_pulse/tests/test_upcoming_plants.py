@@ -196,7 +196,7 @@ class ParseTests(unittest.TestCase):
     def test_a_plant_is_its_sensor_name_room_dry_level_and_optional_litres(self):
         self.assertEqual(plants.parse_plants(RAW),
                          {ENTITY: {"name": "Strelitzia", "slug": "strelitzia", "area": "dining_room", "dry": 15.0,
-                                   "water": None}})
+                                   "water": None, "info": []}})
         self.assertEqual(plants.parse_plants([{**RAW[0], "water": 0.3}])[ENTITY]["water"], 0.3)
 
     def test_no_plants_is_fine(self):
@@ -259,13 +259,50 @@ class ParseTests(unittest.TestCase):
             self.assertEqual(plant["dry"], expected, dry)
 
 
+class NoteTests(unittest.TestCase):
+    LOOK, STANDS = "Bird of paradise, the big banana-leaf plant", "Floor by the facade, between kitchen and dining"
+
+    def test_what_a_plant_looks_like_and_where_it_stands_become_its_info_lines_in_that_order(self):
+        both = {**RAW[0], "where": self.STANDS, "aka": self.LOOK}
+        self.assertEqual(plants.parse_plants([both])[ENTITY]["info"], [self.LOOK, self.STANDS])
+        self.assertEqual(plants.parse_timed([{**CAL[0], "where": self.STANDS, "aka": self.LOOK}])["monstera"]["info"],
+                         [self.LOOK, self.STANDS])
+        self.assertEqual(plants.parse_plants([{**RAW[0], "where": self.STANDS}])[ENTITY]["info"], [self.STANDS])
+        self.assertEqual(plants.parse_plants([{**RAW[0], "aka": self.LOOK}])[ENTITY]["info"], [self.LOOK])
+        self.assertEqual(plants.parse_plants([{**RAW[0], "aka": None, "where": None}])[ENTITY]["info"], [])
+
+    def test_a_note_is_plain_text_on_one_line_of_at_most_sixty_characters(self):
+        self.assertEqual(plants.parse_plants([{**RAW[0], "aka": "x" * 60}])[ENTITY]["info"], ["x" * 60])
+        for bad in ("x" * 61, "", " ", " padded", "two  spaces", "line\nbreak", "Br\u00f8nd", 5, True, ["a"], {}):
+            for key in ("aka", "where"):
+                for parse, cfg in ((plants.parse_plants, RAW[0]), (plants.parse_timed, CAL[0])):
+                    with self.assertRaises(ValueError, msg=(key, bad)):
+                        parse([{**cfg, key: bad}])
+
+    def test_the_sensor_row_leads_with_the_notes_and_has_none_without_them(self):
+        plant = plants.parse_plants([{**RAW[0], "aka": self.LOOK, "where": self.STANDS}])[ENTITY]
+        row, _ = row_of(feed([(T0, 12)], plant=plant), 12.0, plant)
+        self.assertEqual(row["info"], [self.LOOK, self.STANDS])
+        self.assertTrue(core.is_valid_row(row))
+        self.assertNotIn("info", row_of(feed([(T0, 12)]), 12.0)[0])
+
+    def test_the_calendar_row_leads_with_the_notes_before_the_interval_and_the_last_watering(self):
+        plant = plants.parse_timed([{**CAL[0], "aka": self.LOOK, "where": self.STANDS}])["monstera"]
+        now = datetime(2026, 10, 20, 20, 0, tzinfo=timezone.utc)
+        row, _ = plants.timed_row(plant, {"at": core.utc_iso(now), "seed": True}, now + 9 * DAY)
+        self.assertEqual(row["info"], [self.LOOK, self.STANDS, "Every 10 days", "Counting from 20.10"])
+        self.assertTrue(core.is_valid_row(row))
+        bare, _ = plants.timed_row(MONSTERA, {"at": core.utc_iso(now), "seed": True}, now + 9 * DAY)
+        self.assertEqual(bare["info"], ["Every 10 days", "Counting from 20.10"])
+
+
 class CalendarParseTests(unittest.TestCase):
     def test_a_calendar_plant_is_its_name_room_litres_and_interval(self):
         self.assertEqual(plants.parse_timed(CAL),
                          {"monstera": {"name": "Monstera", "slug": "monstera", "area": "kitchen", "water": 1.0,
-                                       "every_days": 10}})
+                                       "every_days": 10, "info": []}})
         self.assertEqual(plants.parse_timed([{"name": "Aloe", "every_days": 35}])["aloe"],
-                         {"name": "Aloe", "slug": "aloe", "area": None, "water": None, "every_days": 35})
+                         {"name": "Aloe", "slug": "aloe", "area": None, "water": None, "every_days": 35, "info": []})
 
     def test_each_kind_of_plant_is_found_in_a_mixed_list_in_the_order_of_the_lines(self):
         raw = [CAL[0], RAW[0], {"name": "Aloe", "every_days": 35}]

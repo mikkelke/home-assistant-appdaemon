@@ -3,7 +3,9 @@ each step takes the persisted state and returns new state.
 
 A plant (the `plants` list in house_upcoming.yaml) has either a soil moisture sensor, `moisture`, or a
 calendar interval, `every_days`, never both, and optionally a `water` amount in litres. The row's title
-is "Water the <name>: <litres> L", and gives up name characters before it gives up the amount.
+is "Water the <name>: <litres> L", and gives up name characters before it gives up the amount. A plant
+may also say what it looks like, `aka`, and where it stands, `where`: plain text of one line, which
+lead the info lines of the row's sheet.
 
 A sensor plant is dry once its soil moisture reading, in percent, is at or under its `dry`, and stays dry
 until a reading is CLOSE_MARGIN above it: watering makes the reading jump, while a reading wandering
@@ -40,6 +42,16 @@ def slug(name):
     return re.sub(r"[^a-z0-9]+", "_", ascii_name.lower()).strip("_")
 
 
+def _note(value, who, field):
+    """[value] for a note that is plain one-line ASCII text of at most TEXT_MAX characters, [] for none."""
+    if value is None:
+        return []
+    if not isinstance(value, str) or not value or clean_text(value) != value:
+        raise ValueError(f"{who}: {field} must be plain text on one line of at most {TEXT_MAX} characters "
+                         f"without accents, not {value!r}")
+    return [value]
+
+
 def _parse(raw):
     sensor, calendar, slugs = {}, {}, set()
     for cfg in raw or []:
@@ -56,7 +68,8 @@ def _parse(raw):
         if key in slugs:
             raise ValueError(f"{who}: name listed twice")
         slugs.add(key)
-        plant = {"name": name, "slug": key, "area": cfg.get("area") or None, "water": litres}
+        info = _note(cfg.get("aka"), who, "aka") + _note(cfg.get("where"), who, "where")
+        plant = {"name": name, "slug": key, "area": cfg.get("area") or None, "water": litres, "info": info}
         if entity is None:
             interval = reading(days)
             if interval is None or interval < 1 or interval != int(interval):
@@ -77,9 +90,9 @@ def _parse(raw):
 def parse_plants(raw):
     """The sensor plants of the `plants` list of house_upcoming.yaml, validated, as {moisture entity:
     plant}. Raises ValueError on a plant that has no name with letters or digits, does not have exactly
-    one of `moisture` and `every_days`, has a `dry` that is not a number or a `water` that is given but
-    not a positive number, or lists an entity or name twice, so a typo fails at start instead of silently
-    dropping a plant."""
+    one of `moisture` and `every_days`, has a `dry` that is not a number, a `water` that is given but not
+    a positive number or an `aka` or `where` that is not plain text, or lists an entity or name twice, so a
+    typo fails at start instead of silently dropping a plant."""
     return _parse(raw)[0]
 
 
@@ -127,7 +140,7 @@ def plant_row(entity, plant, st, value):
         return None
     row = make_row(ID_PREFIX + plant["slug"], "maint", _title(plant),
                    f"soil {_percent(value)}, water at {_percent(plant['dry'])}", icon=ICON, area=plant["area"],
-                   audience="admin")
+                   audience="admin", info=plant["info"])
     return row, f"plant:{entity}:{st['since']}"
 
 
@@ -178,5 +191,5 @@ def timed_row(plant, anchor, now):
             else f"Done {ddmm(when, now)}, {'today' if since == 0 else f'{_days(since)} ago'}")
     row = make_row(ID_PREFIX + plant["slug"], "maint", _title(plant), detail, at=at, icon=ICON, area=plant["area"],
                    audience="admin", tap_done=True,
-                   info=["Every day" if interval == 1 else f"Every {interval} days", last])
+                   info=[*plant["info"], "Every day" if interval == 1 else f"Every {interval} days", last])
     return row, key

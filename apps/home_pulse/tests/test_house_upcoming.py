@@ -1296,6 +1296,7 @@ class PlantTests(unittest.TestCase):
             row = plant_rows(app, PLANTS.values())[f"maint:plant:{plant['slug']}"]
             self.assertEqual((row["title"], row["detail"], row.get("area")),
                              (title, f"soil {dry}%, water at {dry}%", plant["area"]), entity)
+            self.assertEqual(row.get("info"), plant["info"] or None, entity)
             self.assertTrue(core.is_valid_row(row), entity)
         self.assertEqual(len(plant_rows(app, PLANTS.values())), len(PLANTS))
         for entity, plant in PLANTS.items():
@@ -1471,6 +1472,10 @@ class TimedPlantTests(unittest.TestCase):
                                  (title, "maint", "admin", "tap", plant["area"]), plant["name"])
                 nine = core.utc_iso(datetime.combine(due, maint.DUE_TIME, maint.HOUSE_TZ))
                 self.assertEqual(row.get("at"), nine if left > 0 else None, plant["name"])
+                notes = plant["info"]
+                self.assertEqual(row["info"][:len(notes)], notes, plant["name"])
+                self.assertEqual(row["info"][len(notes):][0], f"Every {plant['every_days']} days", plant["name"])
+                self.assertEqual(len(row["info"]), len(notes) + 2, plant["name"])
                 self.assertIn(plant["area"], AREAS, plant["name"])
                 self.assertEqual(core.clean_text(plant["name"]), plant["name"])
                 self.assertTrue(core.is_valid_row(row), plant["name"])
