@@ -15,6 +15,8 @@ import upcoming_rain as rain  # noqa: E402
 
 NOW = datetime(2026, 7, 14, 13, 20, tzinfo=timezone.utc)
 MIN = timedelta(minutes=1)
+HOME = timedelta(hours=1)
+AWAY = timedelta(hours=3)
 DOOR1 = "binary_sensor.rooftop_door_1_contact"
 DOOR2 = "binary_sensor.rooftop_door_2_contact"
 DOORS_CFG = {
@@ -42,8 +44,8 @@ def doors(door1_open_for=None, door2_open_for=None):
     return state
 
 
-def rows(forecast, door_state, fetched_at=NOW, alert_on=False, now=NOW):
-    return rain.rain_rows(forecast, fetched_at, door_state, DOORS_CFG, alert_on, now)
+def rows(forecast, door_state, fetched_at=NOW, alert_on=False, now=NOW, ahead=AWAY):
+    return rain.rain_rows(forecast, fetched_at, door_state, DOORS_CFG, alert_on, now, ahead)
 
 
 def row(forecast, door_state, **kwargs):
@@ -70,8 +72,24 @@ class RainRowTests(unittest.TestCase):
     def test_two_tenths_of_a_millimetre_is_no_row(self):
         self.assertIsNone(row(hours([0.2, 0.2, 0.2, 0.2]), doors(door1_open_for=10 * MIN)))
 
-    def test_rain_beyond_three_hours_is_no_row(self):
+    def test_rain_beyond_the_horizon_is_no_row(self):
         self.assertIsNone(row(hours([0, 0, 0, 0, 3.0]), doors(door1_open_for=40 * MIN)))
+        self.assertIsNotNone(row(hours([0, 0, 0, 3.0]), doors(door1_open_for=40 * MIN)))
+        self.assertIsNone(row(hours([0, 0, 0, 3.0]), doors(door1_open_for=40 * MIN), ahead=timedelta(hours=2)))
+
+    def test_while_somebody_is_home_it_looks_one_hour_ahead_and_otherwise_three(self):
+        state = doors(door1_open_for=40 * MIN)
+        soon, later = hours([0, 0.6]), hours([0, 0, 0.6])
+        self.assertEqual(row(soon, state, ahead=HOME)["at"], "2026-07-14T14:00:00+00:00")
+        self.assertIsNone(row(later, state, ahead=HOME))
+        self.assertEqual(row(later, state, ahead=AWAY)["at"], "2026-07-14T15:00:00+00:00")
+        self.assertEqual(row(soon, state, ahead=AWAY)["at"], "2026-07-14T14:00:00+00:00")
+
+    def test_the_horizon_is_the_short_one_unless_zone_home_counts_nobody(self):
+        for state in ("1", "2", "3", 1, "unknown", "unavailable", None, "", "0.5", "10"):
+            self.assertEqual(rain.horizon(state, HOME, AWAY), HOME, state)
+        for state in ("0", 0, " 0 "):
+            self.assertEqual(rain.horizon(state, HOME, AWAY), AWAY, state)
 
     def test_closed_doors_or_a_door_open_under_ten_minutes_give_no_row(self):
         forecast = hours([2.0])
@@ -141,7 +159,7 @@ class RainingTests(unittest.TestCase):
 
     def test_a_door_the_config_does_not_know_still_gets_a_row_named_after_its_entity(self):
         state = {"binary_sensor.roof_hatch": (True, NOW - 20 * MIN)}
-        found = rain.rain_rows([], None, state, {}, True, NOW)
+        found = rain.rain_rows([], None, state, {}, True, NOW, AWAY)
         self.assertEqual((found[0]["id"], found[0]["title"], "area" in found[0]),
                          ("rain:roof_hatch", "Raining, close the terrace door", False))
 
@@ -170,13 +188,15 @@ class FetchTests(unittest.TestCase):
 
     def test_a_fixture_records_each_early_hour_with_its_lead(self):
         found = rows(hours([0, 0.4]), doors(door1_open_for=10 * MIN))
-        line = rain.fixture(NOW, hours([0, 0.4, 0, 0, 0]), [DOOR1], found)
+        line = rain.fixture(NOW, hours([0, 0.4, 0, 0, 0]), [DOOR1], found, AWAY)
         self.assertEqual(line["fetched"], "2026-07-14T13:20:00+00:00")
         self.assertEqual(line["hours"][:2],
                          [["2026-07-14T13:00:00+00:00", -20, 0.0], ["2026-07-14T14:00:00+00:00", 40, 0.4]])
         self.assertEqual(len(line["hours"]), rain.FIXTURE_HOURS)
-        self.assertEqual((line["doors"], line["row_at"]), ([DOOR1], "2026-07-14T14:00:00+00:00"))
-        self.assertIsNone(rain.fixture(NOW, hours([0]), [DOOR1], [])["row_at"])
+        self.assertEqual((line["doors"], line["row_at"], line["ahead_min"]),
+                         ([DOOR1], "2026-07-14T14:00:00+00:00", 180))
+        self.assertIsNone(rain.fixture(NOW, hours([0]), [DOOR1], [], HOME)["row_at"])
+        self.assertEqual(rain.fixture(NOW, hours([0]), [DOOR1], [], HOME)["ahead_min"], 60)
 
 
 if __name__ == "__main__":

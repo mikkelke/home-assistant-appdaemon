@@ -48,6 +48,12 @@ HouseUpcoming:
   rain:
     weather: weather.forecast_home
     alert: binary_sensor.weather_opening_alert_rooftop_rain
+    # How far ahead a forecast row looks: horizon_home_hours while somebody is home, who feels the rain and
+    # only needs a warning, horizon_away_hours once home (zone.home, the people count the lights and Rober2
+    # read) says 0.
+    home: zone.home
+    horizon_home_hours: 1
+    horizon_away_hours: 3
     doors:
       binary_sensor.rooftop_door_1_contact: {label: living-room terrace door, area: living_room}
       binary_sensor.rooftop_door_2_contact: {label: "Claudia's terrace door", area: office}

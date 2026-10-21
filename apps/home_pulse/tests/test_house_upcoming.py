@@ -98,6 +98,7 @@ def base_states():
     states["binary_sensor.weather_opening_alert_rooftop_rain"] = full("off")
     states["binary_sensor.rooftop_door_1_contact"] = full("off")
     states["binary_sensor.rooftop_door_2_contact"] = full("off")
+    states["zone.home"] = full("1", {"persons": ["person.kristine"]})
     for entity, plant in PLANTS.items():
         states[entity] = full(f"{plant['dry'] + 20:g}")
         if plant["conductivity"]:
@@ -406,8 +407,14 @@ class RainTests(unittest.TestCase):
         items = [{"datetime": iso(start + i * HOUR), "temperature": 15.0, "precipitation": v} for i, v in enumerate(mm)]
         return {"result": {"response": {"weather.forecast_home": {"forecast": items}}}}
 
+    def away(self):
+        """An app with nobody home, so a forecast row looks three hours ahead."""
+        states = base_states()
+        states["zone.home"] = full("0", {"persons": []})
+        return make_app(states)
+
     def test_fetched_only_while_a_door_has_stood_open_ten_minutes(self):
-        app = make_app()
+        app = self.away()
         tick(app, HOUR)
         self.assertEqual(app.services, [])
         fire(app, "binary_sensor.rooftop_door_1_contact", full("on", changed=app.now))
@@ -429,7 +436,7 @@ class RainTests(unittest.TestCase):
         self.assertEqual(len(app.services), 1)
 
     def test_with_both_doors_open_each_has_a_forecast_row_in_its_own_room(self):
-        app = make_app()
+        app = self.away()
         app.forecast_response = self.forecast([0, 0, 0.6, 1.0])
         for door in ("binary_sensor.rooftop_door_1_contact", "binary_sensor.rooftop_door_2_contact"):
             fire(app, door, full("on", changed=app.now))
@@ -444,9 +451,51 @@ class RainTests(unittest.TestCase):
         fire(app, "binary_sensor.rooftop_door_1_contact", full("off", changed=app.now))
         self.assertEqual([key for key in rows(app) if key.startswith("rain:")], ["rain:office"])
 
+    def open_door_with_rain(self, app, first_mm_hour):
+        """Door 1 open for ten minutes and a forecast whose rain starts `first_mm_hour` hours after 10:00."""
+        mm = [0] * first_mm_hour + [1.0]
+        app.forecast_response = self.forecast(mm)
+        fire(app, "binary_sensor.rooftop_door_1_contact", full("on", changed=app.now))
+        tick(app, 10 * MIN)
+        drain(app)
+
+    def test_while_somebody_is_home_the_forecast_looks_an_hour_ahead_so_rain_in_eighty_minutes_waits(self):
+        near = make_app()
+        self.open_door_with_rain(near, 1)
+        self.assertEqual(rows(near)["rain:living_room"]["at"], "2026-10-14T11:00:00+00:00")
+        far = make_app()
+        self.open_door_with_rain(far, 2)
+        self.assertNotIn("rain:living_room", rows(far))
+        line = json.loads(Path(far.fixture_file).read_text().splitlines()[0])
+        self.assertEqual((line["ahead_min"], line["row_at"]), (60, None))
+
+    def test_when_the_last_person_leaves_the_longer_horizon_brings_the_row_and_an_arrival_takes_it_away(self):
+        app = make_app()
+        self.open_door_with_rain(app, 2)
+        self.assertNotIn("rain:living_room", rows(app))
+        fire(app, "zone.home", full("0", {"persons": []}))
+        self.assertEqual(rows(app)["rain:living_room"]["at"], "2026-10-14T12:00:00+00:00")
+        fire(app, "zone.home", full("1", {"persons": ["person.kristine"]}))
+        self.assertNotIn("rain:living_room", rows(app))
+        fire(app, "zone.home", full("unavailable"))
+        self.assertNotIn("rain:living_room", rows(app))
+        fire(app, "zone.home", full("0", {"persons": []}))
+        self.assertIn("rain:living_room", rows(app))
+
+    def test_both_horizons_are_config_values_and_the_shipped_ones_are_one_hour_and_longer_for_nobody(self):
+        shipped = CONFIG["rain"]
+        self.assertEqual(shipped["home"], "zone.home")
+        self.assertTrue(0 < shipped["horizon_home_hours"] < shipped["horizon_away_hours"])
+        app = make_app(rain={**shipped, "horizon_home_hours": 2.5, "horizon_away_hours": 0.5})
+        self.open_door_with_rain(app, 2)
+        self.assertIn("rain:living_room", rows(app))
+        fire(app, "zone.home", full("0", {"persons": []}))
+        self.assertNotIn("rain:living_room", rows(app))
+        self.assertIn(("zone.home", {"attribute": "all"}), app.listened)
+
     def test_while_the_rooftop_rain_alert_is_on_an_open_door_keeps_a_row_that_says_to_close_it(self):
         alert = "binary_sensor.weather_opening_alert_rooftop_rain"
-        app = make_app()
+        app = self.away()
         app.forecast_response = self.forecast([0, 0, 0.6, 1.0])
         fire(app, "binary_sensor.rooftop_door_1_contact", full("on", changed=app.now))
         tick(app, 10 * MIN)

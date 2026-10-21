@@ -115,6 +115,9 @@ class HouseUpcoming(hass.Hass):
         self.weather_entity = rn.get("weather", "weather.forecast_home")
         self.rain_alert = rn.get("alert", "binary_sensor.weather_opening_alert_rooftop_rain")
         self.rain_doors = dict(rn.get("doors") or {})
+        self.rain_home = rn.get("home", "zone.home")
+        self.rain_ahead_home = timedelta(hours=float(rn.get("horizon_home_hours", 1)))
+        self.rain_ahead_away = timedelta(hours=float(rn.get("horizon_away_hours", 3)))
         self.inventory = maint.parse_inventory(a.get("batteries"))
         self.plants = plants.parse_plants(a.get("plants"))
         self.timed_plants = plants.parse_timed(a.get("plants"))
@@ -171,7 +174,7 @@ class HouseUpcoming(hass.Hass):
     def _sources(self):
         sources = list(self.rober2_entities.values())
         sources += [self.washer_entity, self.price_entity, self.profiles_entity, self.train_route, self.train_stog,
-                    self.train_person, self.rain_alert]
+                    self.train_person, self.rain_alert, self.rain_home]
         sources += list(self.rain_doors) + list(self.inventory["devices"]) + list(self.plants)
         sources += [plant["conductivity"] for plant in self.plants.values() if plant["conductivity"]]
         return list(dict.fromkeys(sources))
@@ -409,7 +412,11 @@ class HouseUpcoming(hass.Hass):
             self.log(f"RAIN fetch: {', '.join(open_long)} open")
             self.create_task(self._fetch_forecast(open_long))
         hours, fetched = self._forecast or ([], None)
-        return rain.rain_rows(hours, fetched, doors, self.rain_doors, self._state_of(self.rain_alert) == "on", now)
+        return rain.rain_rows(hours, fetched, doors, self.rain_doors, self._state_of(self.rain_alert) == "on", now,
+                              self._rain_ahead())
+
+    def _rain_ahead(self):
+        return rain.horizon(self._state_of(self.rain_home), self.rain_ahead_home, self.rain_ahead_away)
 
     def _publish(self, rows, now):
         try:
@@ -450,8 +457,9 @@ class HouseUpcoming(hass.Hass):
         if fetched is not None and entries is not None:
             hours = rain.forecast_hours(entries)
             self._forecast = (hours, fetched)
-            found = rain.forecast_rows(hours, fetched, open_long, self.rain_doors, fetched)
-            self._append_fixture(rain.fixture(fetched, hours, open_long, found))
+            ahead = self._rain_ahead()
+            found = rain.forecast_rows(hours, fetched, open_long, self.rain_doors, fetched, ahead)
+            self._append_fixture(rain.fixture(fetched, hours, open_long, found, ahead))
             self.log(f"RAIN forecast: {len(hours)} hours, rows at {found[0].get('at') if found else 'none'}")
         self._evaluate()
 
