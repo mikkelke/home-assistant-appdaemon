@@ -297,8 +297,8 @@ programmes:
     label: "Drum clean"
     allowed_temperatures: []
     default_temperature: null
-    allowed_spin_speeds: ["1400 rpm", "1200 rpm", "900 rpm", "600 rpm", "No spin"]
-    default_spin: "1400 rpm"
+    allowed_spin_speeds: []
+    default_spin: null
     available_options: []
     duration_min: 160
     max_dur_min: 195
