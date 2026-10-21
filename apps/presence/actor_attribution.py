@@ -2,27 +2,31 @@
 ActorAttribution - answers "who did this" for appliance monitors (washer/dishwasher/
 dryer) recording who started or emptied a load: directly, when the action carries HA's
 own context.user_id (a dashboard-issued service call, e.g. input_button.press), else by
-falling back to "who was home at time T, if exactly one person was". Physical button
-presses carry no HA context_user_id at all - only an HA-native trigger does - so
-sole-occupancy remains the only free signal for those.
+falling back to "who was home at time T, if exactly one person was" - or, with several
+home, whoever is left once the others were provably in their own rooms. Physical button
+presses carry no HA context_user_id at all - only an HA-native trigger does - so presence
+inference remains the only free signal for those.
 
-NEVER GUESS. attribute() only ever names a person when the tracked home-set has held
-exactly one person, continuously and fully observable, for the whole stability_seconds
-window ending at the anchor, AND the apartment door has not opened in the trailing
-door_settle_seconds (a person who just walked in produces no presence *change* to be
-unstable about - their phone hasn't reported home yet - so a fresh door-open is read as
-"someone could have entered unnoticed", never as confirmation). Every other case returns
-unknown with a specific machine-readable reason. A wrong attribution silently poisons an
-appliance's per-person history/learning forever; a missing one just leaves a blank -
-recoverable the next time the signal is clean. See _by_sole_occupancy for the full
-seven-rule table, evaluated in order, each one a short-circuit.
+NEVER GUESS. Short of a dashboard tap (Phase 2), attribute() only ever names a person off
+a clean presence log: the tracked home-set has held exactly one person, continuously and
+fully observable, for the whole stability_seconds window ending at the anchor, AND the
+apartment door has not opened in the trailing door_settle_seconds (a person who just walked
+in produces no presence *change* to be unstable about - their phone hasn't reported home
+yet - so a fresh door-open is read as "someone could have entered unnoticed", never as
+confirmation). With 2+ people home on that same clean footing, room elimination (Phase 3)
+may still name one. Every other case returns unknown with a specific machine-readable
+reason. A wrong attribution silently poisons an appliance's per-person history/learning
+forever; a missing one just leaves a blank - recoverable the next time the signal is
+clean. See _by_sole_occupancy for the full seven-rule table, evaluated in order, each one
+a short-circuit.
 
 Known residual (not closed by this app): sole-occupancy is a WEAK signal by construction.
 An untracked human physically inside the flat - a guest, a cleaner, a kid's friend, or
 even one of the three tracked people without their phone/location switched on - is
 invisible to person.* state entirely, and will read as either "nobody home" or get folded
 into whoever else happens to be tracked as home. A "sole occupant" verdict can still be
-wrong if such a person pressed the actual button.
+wrong if such a person pressed the actual button. Room elimination shares the blind spot:
+an untracked person in a private room crosses its owner off.
 
 Phase 2 (filled): attribute() tries _by_dashboard_action() first - a dashboard-issued
 action's context.user_id resolves straight to a person via self._user_id_to_person and
@@ -31,10 +35,24 @@ _by_sole_occupancy would refuse as multi_occupant). It falls through to
 _by_sole_occupancy() whenever no user_id was given, the map is empty/unbuilt, or the id
 doesn't resolve:
     result = self._by_dashboard_action(event, anchor, evaluated_at, user_id) or self._by_sole_occupancy(event, anchor, evaluated_at)
-A future BLE-presence signal remains a possible third method, slotted in ahead of both
-without touching any call site. Appliance monitors call attribute(event, at=..., user_id=...);
-user_id is optional and simply absent for callers with nothing to give (probe(), and any
-physical/legacy trigger with no HA context).
+Appliance monitors call attribute(event, at=..., user_id=...); user_id is optional and
+simply absent for callers with nothing to give (probe(), and any physical/legacy trigger
+with no HA context).
+
+Phase 3 (filled): when _by_sole_occupancy refuses with multi_occupant - every hard stop
+above already passed, 2+ people home - _by_room_elimination crosses off each home resident
+whose private room (private_rooms) was occupied at anchor - room_lead_seconds and stayed
+so, with no off row, through anchor + room_hold_seconds: someone in their own room is not
+at the appliance. One resident left is named (method room_elimination); none left is
+room_contradiction (the presence and room signals disagree - never a guess); two or more
+stay multi_occupant. A resident without a private room, or without room history reaching
+back to that point, is never crossed off, and an unavailable/unknown room counts as off.
+A cross-off can only be revoked as time passes (an off row not recorded yet), so a verdict
+evaluated before anchor + room_hold_seconds + 30 s never names anyone: while it could still
+end up naming one (at most one candidate) it carries pending_until (ISO Z) - ask again at
+or after that instant with the same at=; with two or more candidates it is already final.
+A future BLE-presence signal remains a possible further method, chained ahead of room
+elimination in _attribute_unsafe and, like it, only ever consulted for multi_occupant.
 
 Hard rule - zero AppDaemon API calls inside attribute() and everything it calls (no
 get_state/call_service/run_in/create_task/set_state/get_history): it reads only the
@@ -111,7 +129,13 @@ _REASON_TO_STATE = {
     "presence_unobservable": "unobservable",
     "door_event_recent": "door_recent",
     "no_history": "no_history",
+    "room_contradiction": "contradiction",
 }
+
+# Slack added to room_hold_seconds before room elimination may name anyone: covers the lag
+# between a room going off and its listener recording the row, so the last off row that
+# belongs inside the hold window has landed by then.
+_ROOM_MARGIN_SECONDS = 30
 
 
 class ActorAttribution(hass.Hass):
@@ -130,9 +154,13 @@ class ActorAttribution(hass.Hass):
     _door_events = ()         # tuple[datetime]: door OPEN edges only, ascending
     _door_state = None        # last known raw door_entity state (None -> unobservable)
     _user_id_to_person = {}   # {normalized_user_id: person_key}, see _refresh_user_map
+    private_rooms = {}        # {person_key: room occupancy entity}; empty = no room elimination
+    _room_log = {}            # {person_key: tuple[(ts, is_on)]}, change-only, ascending by ts
     stability_seconds = 600
     door_settle_seconds = 300
     retention_hours = 26
+    room_lead_seconds = 60
+    room_hold_seconds = 360
     backfill_retry_delays = (30, 60, 120, 300)
 
     def initialize(self):
@@ -144,6 +172,11 @@ class ActorAttribution(hass.Hass):
         self.stability_seconds = int(a("stability_seconds", 600))
         self.door_settle_seconds = int(a("door_settle_seconds", 300))
         self.retention_hours = float(a("retention_hours", 26))
+        # Person key -> occupancy entity of that resident's private room (see
+        # _by_room_elimination); empty leaves room elimination inert.
+        self.private_rooms = dict(a("private_rooms", {}) or {})
+        self.room_lead_seconds = int(a("room_lead_seconds", 60))
+        self.room_hold_seconds = int(a("room_hold_seconds", 360))
         self.publish_sensor = a("publish_sensor", "sensor.household_actor")
         # HA account id -> person key, merged in after the automatic person_entities
         # resolution (see _refresh_user_map) - a gap-filler for a resident whose
@@ -159,6 +192,8 @@ class ActorAttribution(hass.Hass):
         for entity in self.person_entities:
             self.listen_state(self._on_person_change, entity, person=self._person_key(entity))
         self.listen_state(self._on_door_change, self.door_entity)
+        for person, entity in self.private_rooms.items():
+            self.listen_state(self._on_room_change, entity, person=person)
         self.listen_event(self._on_probe_event, "actor_attribution_probe")
 
         # Deferred so initialize() returns immediately - get_history's response time
@@ -171,7 +206,8 @@ class ActorAttribution(hass.Hass):
         self.log(
             f"ActorAttribution initialized: {len(self.person_entities)} person(s), "
             f"door={self.door_entity}, stability={self.stability_seconds}s, "
-            f"door_settle={self.door_settle_seconds}s, retention={self.retention_hours:.0f}h",
+            f"door_settle={self.door_settle_seconds}s, retention={self.retention_hours:.0f}h, "
+            f"{len(self.private_rooms)} private room(s)",
             level="INFO",
         )
 
@@ -205,6 +241,11 @@ class ActorAttribution(hass.Hass):
         evaluated_at = self._now_utc()
         anchor = self._coerce_utc(at) if at is not None else evaluated_at
         result = self._by_dashboard_action(event, anchor, evaluated_at, user_id) or self._by_sole_occupancy(event, anchor, evaluated_at)
+        if result["reason"] == "multi_occupant":
+            # Past every hard stop of _by_sole_occupancy with 2+ people home. Methods that
+            # can still tell them apart chain here, strongest evidence first, each only
+            # while the verdict is still multi_occupant.
+            result = self._by_room_elimination(event, anchor, evaluated_at, result)
         if self._door_state in _UNOBSERVABLE_STATES:
             # The door guard itself is blind, so rule 4 below could have missed a real
             # open edge. Per spec we still attribute - the absence of a recorded edge is
@@ -312,7 +353,7 @@ class ActorAttribution(hass.Hass):
         if len(effective_home) > 1:
             return self._unknown(anchor, evaluated_at, "multi_occupant", effective_home)
 
-        # Rule 7: exactly one - the only case this app ever names a person.
+        # Rule 7: exactly one - the only case this method ever names a person.
         person = next(iter(effective_home))
         return {
             "person": person,
@@ -323,6 +364,61 @@ class ActorAttribution(hass.Hass):
             "evaluated_at": self._iso(evaluated_at),
             "version": _VERSION,
         }
+
+    def _by_room_elimination(self, event, anchor, evaluated_at, multi):
+        """Phase 3, only ever handed `multi`: the multi_occupant verdict from
+        _by_sole_occupancy, so every hard stop already passed and 2+ people are home.
+        Crosses off each home resident whose private room was occupied across the event
+        (_room_occupied_through): exactly one candidate left is named, none left is
+        room_contradiction, two or more leave `multi` as it is.
+
+        A cross-off can only be revoked as time passes (an off row that has not been
+        recorded yet), so the candidates can only grow. Hence before anchor +
+        room_hold_seconds + _ROOM_MARGIN_SECONDS nobody is named: with two or more
+        candidates `multi` is already final, with at most one it comes back plus
+        pending_until - the first instant at which asking again can name someone (or
+        contradict)."""
+        home = frozenset(multi["people_home"])
+        candidates = home - {p for p in home if self._room_occupied_through(p, anchor, evaluated_at)}
+        settled_at = anchor + timedelta(seconds=self.room_hold_seconds + _ROOM_MARGIN_SECONDS)
+        if evaluated_at < settled_at:
+            if len(candidates) <= 1:
+                return dict(multi, pending_until=self._iso_up(settled_at))
+            return multi
+        if len(candidates) == 1:
+            return {
+                "person": next(iter(candidates)),
+                "method": "room_elimination",
+                "reason": None,
+                "people_home": sorted(home),
+                "anchor": self._iso(anchor),
+                "evaluated_at": self._iso(evaluated_at),
+                "version": _VERSION,
+            }
+        if not candidates:
+            return self._unknown(anchor, evaluated_at, "room_contradiction", home)
+        return multi
+
+    def _room_occupied_through(self, person, anchor, evaluated_at):
+        """True when person's private room was on at anchor - room_lead_seconds and has no
+        off row after that through anchor + room_hold_seconds, counting only rows recorded
+        by evaluated_at. No row at or before the lead instant (no private room, or room
+        history not reaching back that far) means False: occupancy is never assumed.
+        self._room_log already stores unavailable/unknown as plain off."""
+        lead_start = anchor - timedelta(seconds=self.room_lead_seconds)
+        hold_end = anchor + timedelta(seconds=self.room_hold_seconds)
+        occupied = False
+        for ts, is_on in self._room_log.get(person, ()):
+            if ts > evaluated_at:
+                break
+            if ts <= lead_start:
+                occupied = is_on
+            elif ts <= hold_end:
+                if not is_on:
+                    return False
+            else:
+                break
+        return occupied
 
     def _snapshots_covering_window(self, win_start, win_end):
         """Every self._snapshot_log entry whose validity overlaps [win_start, win_end]: the entry
@@ -408,6 +504,15 @@ class ActorAttribution(hass.Hass):
             return ""
         return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
+    @classmethod
+    def _iso_up(cls, dt):
+        """_iso rounded UP to a whole second, for an instant a caller will wait for: _iso
+        truncates, and waiting for a truncated string can end just before the instant it
+        names."""
+        if dt.microsecond:
+            dt = dt.replace(microsecond=0) + timedelta(seconds=1)
+        return cls._iso(dt)
+
     @staticmethod
     def _person_key(entity_id):
         """person.mikkel -> mikkel. Mirrors MobileNotifier.get_people_home()'s own
@@ -445,6 +550,14 @@ class ActorAttribution(hass.Hass):
             self._publish()
         except Exception as e:
             self.log(f"ActorAttribution: door-change handler failed: {e}", level="ERROR")
+
+    def _on_room_change(self, entity, attribute, old, new, kwargs):
+        """Anything but "on" (including unavailable/unknown) is a plain off row. No publish:
+        the published verdict (anchor = now) never depends on room state."""
+        try:
+            self._append_room_row(kwargs["person"], self._now_utc(), new == "on")
+        except Exception as e:
+            self.log(f"ActorAttribution: room-change handler failed for {entity}: {e}", level="ERROR")
 
     def _on_probe_event(self, event_name, data, kwargs):
         """Test hook: fire event actor_attribution_probe (e.g. from Developer Tools ->
@@ -538,16 +651,44 @@ class ActorAttribution(hass.Hass):
                 if door_fresh == "on" and not was_on:
                     self._door_events = self._door_events + (now,)
 
+            self._reconcile_rooms(now)
+
             self._prune_log(now)
             self._prune_door_events(now)
+            self._prune_room_log(now)
             self._refresh_user_map()
             self._publish()
         except Exception as e:
             self.log(f"ActorAttribution tick failed: {e}", level="ERROR")
 
+    def _reconcile_rooms(self, now):
+        """_tick's check on every room the log holds as occupied: a fresh read of anything
+        but "on" is applied as an off row stamped now, so a dropped listener callback
+        cannot leave someone "in their room" forever. One direction only - a fresh "on"
+        against a room logged off is ignored, because the same stale store could be the
+        one serving it and a row crediting the room with time nobody saw it occupied
+        would cross a resident off on no evidence."""
+        for person, entity in self.private_rooms.items():
+            rows = self._room_log.get(person, ())
+            if not rows or not rows[-1][1]:
+                continue
+            try:
+                fresh = self.get_state(entity)
+            except Exception as e:
+                self.log(f"ActorAttribution tick: get_state({entity}) failed: {e}", level="WARNING")
+                continue
+            if fresh != "on":
+                self.log(
+                    f"ActorAttribution: {entity} disagreed with the cached view at "
+                    f"reconcile (on -> {fresh!r}) - applying as an off transition now "
+                    f"instead of trusting the stale cache",
+                    level="WARNING",
+                )
+                self._append_room_row(person, now, False)
+
     def _backfill(self, kwargs):
-        """Seed self._snapshot_log/_door_events/_door_state from HA history so attribute() has
-        real coverage as soon as live traffic starts, instead of needing
+        """Seed self._snapshot_log/_door_events/_door_state/_room_log from HA history so
+        attribute() has real coverage as soon as live traffic starts, instead of needing
         retention_hours of fresh uptime before rule 1 ("no_history") stops firing for
         every call. Runs from the run_in(..., 5) callback armed in initialize() so
         AppDaemon's blocking startup sequence is never held hostage by however long
@@ -621,6 +762,8 @@ class ActorAttribution(hass.Hass):
             if door_hist:
                 self._door_state = last_door_state
 
+            room_log = self._room_log_from_history(window_start, now)
+
             events.sort(key=lambda e: e[0])
             log_entries = []
             last_pair = None
@@ -641,12 +784,15 @@ class ActorAttribution(hass.Hass):
             self._person_state = current
             self._snapshot_log = tuple(log_entries)
             self._door_events = tuple(sorted(door_open_events))
+            self._room_log = room_log
             self._prune_log(now)
             self._prune_door_events(now)
+            self._prune_room_log(now)
 
             self.log(
                 f"ActorAttribution backfill complete: {len(self._snapshot_log)} presence "
-                f"transition(s), {len(self._door_events)} door-open event(s) over the "
+                f"transition(s), {len(self._door_events)} door-open event(s), "
+                f"{len(self._room_log)} private-room log(s) over the "
                 f"last {self.retention_hours:.0f}h",
                 level="INFO",
             )
@@ -705,6 +851,47 @@ class ActorAttribution(hass.Hass):
             return hist
         return []
 
+    def _room_log_from_history(self, window_start, now):
+        """_backfill's seed for self._room_log: every private room's history over the same
+        window as the presence log, first row clamped to window_start the same way (and
+        for the same reason). A room whose history cannot be fetched, or comes back
+        empty, is left out - its resident is never crossed off until a live row arrives."""
+        room_log = {}
+        for person, entity in self.private_rooms.items():
+            try:
+                hist = self.get_history(entity_id=entity, start_time=window_start, end_time=now)
+            except Exception as e:
+                self.log(
+                    f"ActorAttribution backfill: get_history({entity}) failed: {e} - "
+                    f"{person} is never crossed off until a live update arrives",
+                    level="WARNING",
+                )
+                continue
+            rows = []
+            first = True
+            for entry in self._flatten_history(hist, entity):
+                ts = _parse_utc(entry.get("last_changed") or entry.get("last_updated"))
+                if ts is None:
+                    continue
+                if first:
+                    ts = window_start if ts <= window_start else ts
+                    first = False
+                rows.append((ts, entry.get("state") == "on"))
+            rows.sort(key=lambda r: r[0])
+            changes = []
+            for ts, is_on in rows:
+                if not changes or changes[-1][1] != is_on:
+                    changes.append((ts, is_on))
+            if not changes:
+                self.log(
+                    f"ActorAttribution backfill: no history returned for {entity} - "
+                    f"{person} is never crossed off until a live update arrives",
+                    level="WARNING",
+                )
+                continue
+            room_log[person] = tuple(changes)
+        return room_log
+
     def _append_snapshot_if_changed(self, ts):
         """Recompute the (home, unobservable) pair from self._person_state and append a
         new log entry only if it actually differs from the last one - this is what keeps
@@ -716,6 +903,19 @@ class ActorAttribution(hass.Hass):
             return False
         self._snapshot_log = self._snapshot_log + (_Snapshot(ts, home, unobservable),)
         self._prune_log(ts)
+        return True
+
+    def _append_room_row(self, person, ts, is_on):
+        """Append (ts, is_on) to person's room log unless it repeats the last value - one
+        row per real transition, like the presence log. The dict and the person's tuple
+        are both replaced, never mutated (same thread-safety convention as
+        self._snapshot_log)."""
+        rows = self._room_log.get(person, ())
+        if rows and rows[-1][1] == is_on:
+            return False
+        room_log = dict(self._room_log)
+        room_log[person] = rows + ((ts, is_on),)
+        self._room_log = room_log
         return True
 
     def _prune_log(self, now=None):
@@ -744,6 +944,22 @@ class ActorAttribution(hass.Hass):
         now = now or self._now_utc()
         cutoff = now - timedelta(hours=self.retention_hours) - timedelta(seconds=self.door_settle_seconds)
         self._door_events = tuple(t for t in self._door_events if t >= cutoff)
+
+    def _prune_room_log(self, now=None):
+        """Same carry-in reasoning as _prune_log, reaching room_lead_seconds back - how far
+        before an anchor still valid under rule 1 the room check looks - instead of
+        stability_seconds: per person, everything at/after the cutoff plus the one row in
+        effect going into it. Replaces the dict and every tuple wholesale."""
+        now = now or self._now_utc()
+        cutoff = now - timedelta(hours=self.retention_hours) - timedelta(seconds=self.room_lead_seconds)
+        pruned = {}
+        for person, rows in self._room_log.items():
+            kept = tuple(r for r in rows if r[0] >= cutoff)
+            older = [r for r in rows if r[0] < cutoff]
+            if older:
+                kept = (older[-1],) + kept
+            pruned[person] = kept
+        self._room_log = pruned
 
     def _publish(self):
         """Publish sensor.household_actor on every change and on every tick, following

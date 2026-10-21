@@ -11,8 +11,15 @@
 # Phase 2 (filled): attribute() tries _by_dashboard_action() first (self._user_id_to_person,
 # built from person_entities' own user_id attribute below, plus user_id_overrides) and only
 # falls back to _by_sole_occupancy() when no id was given or it doesn't resolve - see
-# actor_attribution.py's module docstring. A future BLE-presence signal remains a possible
-# third method, slotted in ahead of both without changing any call site.
+# actor_attribution.py's module docstring.
+#
+# Phase 3 (filled): with 2+ people home and every other check passed, room elimination crosses
+# off each home resident whose private room (private_rooms below) was occupied from
+# room_lead_seconds before the event through room_hold_seconds after it. One resident left is
+# named, none left is room_contradiction. A verdict asked for sooner than room_hold_seconds +
+# 30 s after the event never names anyone and carries pending_until while a name is still
+# possible. A future BLE-presence signal remains a possible further method, ahead of room
+# elimination. See actor_attribution.py's module docstring.
 #
 # Known residual: an untracked human physically in the flat (a guest, a cleaner, a kid's
 # friend, or one of the three people below without their phone/location on) is invisible
@@ -33,6 +40,14 @@ ActorAttribution:
   stability_seconds: 600
   door_settle_seconds: 300
   retention_hours: 26
+  # Person key -> room_active entity of that resident's private room. A resident missing
+  # here is never crossed off; empty disables room elimination.
+  private_rooms:
+    mikkel: binary_sensor.bedroom_active
+    kristine: binary_sensor.kristines_room_active
+    claudia: binary_sensor.claudias_room_active
+  room_lead_seconds: 60
+  room_hold_seconds: 360
   publish_sensor: sensor.household_actor
   # HA account id -> person key, for a resident whose person.*.user_id link is missing or
   # not (yet) made in Settings -> People - same override convention as
