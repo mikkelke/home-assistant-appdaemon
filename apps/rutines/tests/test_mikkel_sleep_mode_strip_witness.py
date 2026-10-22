@@ -1,27 +1,29 @@
 # tests/test_mikkel_sleep_mode_strip_witness.py - the ESPHome pressure strip
 # (binary_sensor.bed_presence_6b9c94_bed_occupied_left, added 2026-08-12 with zero
-# nights of track record) as a witness in in_bed_entities and (2026-08-31)
-# bed_empty_entities too:
+# nights of track record) as a witness in in_bed_entities and in the bed tier that
+# releases the re-arm hold:
 #   - OR semantics for arming: any exact "on" arms; unavailable/unknown/off strip is
 #     inert and can never hold sleep mode on nor stop a Withings mat from arming it.
-#   - bed_empty_entities (2026-08-31: mats AND strip) is what releases the post-wakeup
-#     re-arm hold: every configured witness must now read explicitly "off". The strip
-#     is local ESPHome with sub-second updates and measured near-zero unavailability,
-#     unlike the cloud-polled mats' documented multi-hour outages, so this does not
-#     introduce a new deadlock risk - it removes an asymmetry that pointed at the
-#     wrong sensor. See _bed_reads_empty's docstring in mikkel_sleep_mode.py.
+#   - The post-wakeup re-arm hold is released by room_active_read.bed_occupied() over
+#     RoomActive's bed tier (mats AND strip): every witness must read off, where a mat
+#     with no report since the restart (unknown) counts as off. An unavailable witness,
+#     strip included, keeps the hold. See _bed_reads_empty in mikkel_sleep_mode.py.
 # Same __new__ + monkeypatched-callables harness as the other tests here.
 # Run from repo root: python3 -m unittest discover -s apps/rutines/tests -q
 
 from __future__ import annotations
 
+import itertools
 import sys
 import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# mikkel_sleep_mode imports room_active_read, which lives in apps/presence
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "presence"))
 
 if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     ad = types.ModuleType("appdaemon")
@@ -42,16 +44,17 @@ STRIP = "binary_sensor.bed_presence_6b9c94_bed_occupied_left"
 SLEEP = "input_boolean.mikkel_sleep_mode"
 
 
-def make_app(states, *, block_rearm=False, bed_empty_configured=True):
-    """MikkelSleepMode with the production three-witness list (two mats + strip)
-    and, matching the shipped yaml (2026-08-31), bed_empty_entities = mats AND
-    strip too. bed_empty_configured=False simulates the key being unset (legacy
-    fallback to the full in_bed_entities list - the same three entities today)."""
+def make_app(states, *, block_rearm=False):
+    """MikkelSleepMode with the production three-witness list (two mats + strip),
+    which is also RoomActive's bedroom bed tier in the shipped yaml."""
     app = msm.MikkelSleepMode.__new__(msm.MikkelSleepMode)
     app.battery_entity = "sensor.mikkels_ofx9p_battery_state"
     app.person_entity = "person.mikkel"
     app.in_bed_entities = [LEFT_MAT, RIGHT_MAT, STRIP]
-    app.bed_empty_entities = [LEFT_MAT, RIGHT_MAT, STRIP] if bed_empty_configured else None
+    app.get_app = lambda name: (
+        SimpleNamespace(zones={"bedroom": [{"entity": e, "tier": "bed"} for e in app.in_bed_entities]})
+        if name == "RoomActive" else None
+    )
     app.sleep_mode_entity = SLEEP
     app._on_battery_states = frozenset(["charging", "not_charging"])
     app._off_battery_state = "discharging"
@@ -131,13 +134,12 @@ class OrSemanticsWithTheStrip(unittest.TestCase):
 
 
 class BedEmptyIncludesTheStrip(unittest.TestCase):
-    """_bed_reads_empty consults bed_empty_entities, which (2026-08-31) is mats AND
-    strip: every configured witness must read explicitly "off" to release the hold."""
+    """_bed_reads_empty asks room_active_read.bed_occupied() over the bed tier, which is
+    mats AND strip: every witness must read off (or unknown, a mat with no report since
+    the restart) to release the hold."""
 
     def test_mats_off_strip_on_does_not_read_empty(self):
-        # The reversal: a strip still reading "on" now withholds the release too,
-        # same as a mat would - see _bed_reads_empty's docstring for why this does
-        # not reintroduce the old deadlock risk (near-zero strip unavailability).
+        # A strip still reading "on" withholds the release, same as a mat would.
         app = make_app(base_states({STRIP: "on"}))
         self.assertFalse(app._bed_reads_empty())
 
@@ -158,28 +160,45 @@ class BedEmptyIncludesTheStrip(unittest.TestCase):
         self.assertFalse(app._bed_reads_empty())
 
     def test_mats_unavailable_is_not_empty(self):
-        # Unchanged Withings semantics: cloud dropout is "unreadable", never
-        # "he got up" - the hold survives HA restarts exactly as before.
+        # A cloud dropout is "unreadable", never "he got up" - the hold survives the
+        # Withings integration reloading.
         app = make_app(base_states({LEFT_MAT: "unavailable", RIGHT_MAT: "unavailable"}))
         self.assertFalse(app._bed_reads_empty())
 
-    def test_without_bed_empty_entities_the_full_list_is_used(self):
-        # Legacy fallback (bare instances / yaml without the key): every listed
-        # sensor must read off. Same three entities as the configured shipped-yaml
-        # list today, but this exercises the code's fallback path on its own,
-        # independent of what the yaml actually sets.
-        app = make_app(base_states({STRIP: "on"}), bed_empty_configured=False)
+    def test_mats_unknown_strip_off_reads_empty(self):
+        # After an HA restart a mat reads unknown until someone lies on it: no report,
+        # not a body in the bed.
+        app = make_app(base_states({LEFT_MAT: "unknown", RIGHT_MAT: "unknown"}))
+        self.assertTrue(app._bed_reads_empty())
+
+    def test_mats_unknown_strip_on_does_not_read_empty(self):
+        app = make_app(base_states({LEFT_MAT: "unknown", RIGHT_MAT: "unknown", STRIP: "on"}))
         self.assertFalse(app._bed_reads_empty())
-        app2 = make_app(base_states(), bed_empty_configured=False)
-        self.assertTrue(app2._bed_reads_empty())
+
+    def test_mats_unknown_strip_unavailable_does_not_read_empty(self):
+        app = make_app(base_states({LEFT_MAT: "unknown", RIGHT_MAT: "unknown", STRIP: "unavailable"}))
+        self.assertFalse(app._bed_reads_empty())
+
+    def test_outside_unknown_every_witness_must_read_off(self):
+        # Every reading but unknown keeps its meaning: on, unavailable and a missing
+        # entity all stop the bed from reading empty.
+        witnesses = (LEFT_MAT, RIGHT_MAT, STRIP)
+        for combo in itertools.product(("on", "off", "unavailable", None), repeat=3):
+            app = make_app(base_states(dict(zip(witnesses, combo))))
+            self.assertEqual(app._bed_reads_empty(), all(s == "off" for s in combo), combo)
+
+    def test_without_room_active_the_bed_cannot_be_told(self):
+        app = make_app(base_states())
+        app.get_app = lambda name: None
+        self.assertFalse(app._bed_reads_empty())
 
 
 class HoldReleaseAndRearmWithTheStrip(unittest.TestCase):
     def test_offline_strip_blocks_hold_release_until_it_reports_explicitly_off(self):
-        # Reversal: mats off, strip unavailable no longer releases the hold on its
-        # own - every configured witness must read explicitly "off" now (see
-        # _bed_reads_empty). Once the strip catches up and reads "off" too, the
-        # hold releases and a mat can re-arm sleep mode again that night.
+        # Mats off, strip unavailable does not release the hold on its own: an
+        # unavailable witness cannot be told (see _bed_reads_empty). Once the strip
+        # catches up and reads "off" too, the hold releases and a mat can re-arm
+        # sleep mode again that night.
         states = base_states({STRIP: "unavailable"})
         app = make_app(states, block_rearm=True)
         app._apply_sleep_mode()
@@ -194,9 +213,26 @@ class HoldReleaseAndRearmWithTheStrip(unittest.TestCase):
         app._apply_sleep_mode()
         self.assertEqual(len(sleep_writes(app, "on")), 1)
 
+    def test_unknown_mats_release_the_hold_and_the_first_mat_on_arms_sleep_mode(self):
+        states = base_states({LEFT_MAT: "unknown", RIGHT_MAT: "unknown"})
+        app = make_app(states, block_rearm=True)
+        app._apply_sleep_mode()
+        self.assertFalse(app._block_rearm_until_out_of_bed)
+        self.assertEqual(sleep_writes(app, "on"), [])
+
+        states[RIGHT_MAT] = "on"
+        app._apply_sleep_mode()
+        self.assertEqual(len(sleep_writes(app, "on")), 1)
+
+    def test_unknown_mats_keep_the_hold_while_the_strip_reads_on(self):
+        states = base_states({LEFT_MAT: "unknown", RIGHT_MAT: "unknown", STRIP: "on"})
+        app = make_app(states, block_rearm=True)
+        app._apply_sleep_mode()
+        self.assertTrue(app._block_rearm_until_out_of_bed)
+        self.assertEqual(sleep_writes(app, "on"), [])
+
     def test_stuck_on_strip_blocks_hold_release(self):
-        # Reversal of the old "strip stuck-on cannot deadlock the hold" guarantee:
-        # the strip is now part of the all-off condition, so a stuck-on strip does
+        # The strip is part of the all-off condition, so a stuck-on strip does
         # withhold release - accepted given its near-zero real-world unavailability.
         states = base_states({STRIP: "on"})
         app = make_app(states, block_rearm=True)

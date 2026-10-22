@@ -19,6 +19,8 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# mikkel_sleep_mode imports room_active_read, which lives in apps/presence
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "presence"))
 
 if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     ad = types.ModuleType("appdaemon")

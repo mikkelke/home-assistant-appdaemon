@@ -225,9 +225,9 @@ def _bedroom(**states):
 
 
 class BedOccupied(unittest.TestCase):
-    """bed_occupied(): True when any bed witness reads on; False only when EVERY one reads an
-    explicit off (the sleep-mode release rule); None otherwise - callers that guard a sleeper
-    treat anything but False as occupied."""
+    """bed_occupied(): True when any bed witness reads on; False when EVERY one reads off or
+    unknown (a cloud mat that has not reported since the HA restart); None otherwise - callers
+    that guard a sleeper treat anything but False as occupied."""
 
     def test_any_bed_witness_on_is_occupied(self):
         self.assertIs(rar.bed_occupied(_bedroom(left="on", right="off", strip="off")), True)
@@ -236,13 +236,29 @@ class BedOccupied(unittest.TestCase):
     def test_every_bed_witness_explicitly_off_is_empty(self):
         self.assertIs(rar.bed_occupied(_bedroom(left="off", right="off", strip="off")), False)
 
+    def test_a_mat_that_reads_unknown_counts_as_off(self):
+        # the Withings mats read unknown after every HA restart until someone lies on them
+        self.assertIs(rar.bed_occupied(_bedroom(left="off", right="unknown", strip="off")), False)
+        self.assertIs(rar.bed_occupied(_bedroom(left="unknown", right="unknown", strip="off")), False)
+        self.assertIs(rar.bed_occupied(_bedroom(left="unknown", right="unknown", strip="unknown")), False)
+
+    def test_an_unknown_mat_does_not_hide_a_witness_that_is_on(self):
+        self.assertIs(rar.bed_occupied(_bedroom(left="unknown", right="unknown", strip="on")), True)
+        self.assertIs(rar.bed_occupied(_bedroom(left="on", right="unknown", strip="off")), True)
+
     def test_an_unreadable_witness_with_none_on_cannot_be_told(self):
-        for unreadable in ("unknown", "unavailable", None):
+        for unreadable in ("unavailable", None):
             hass = _bedroom(left="off", right=unreadable, strip="off")
             self.assertIsNone(rar.bed_occupied(hass), unreadable)
 
+    def test_unavailable_stays_unreadable_next_to_mats_that_read_unknown(self):
+        for unreadable in ("unavailable", None):
+            self.assertIsNone(rar.bed_occupied(_bedroom(left="unknown", right="unknown", strip=unreadable)), unreadable)
+            self.assertIsNone(rar.bed_occupied(_bedroom(left=unreadable, right="unknown", strip="off")), unreadable)
+
     def test_on_beats_an_unreadable_witness(self):
         self.assertIs(rar.bed_occupied(_bedroom(left="on", right="unknown", strip="unavailable")), True)
+        self.assertIs(rar.bed_occupied(_bedroom(left="on", right="unavailable", strip=None)), True)
 
     def test_only_bed_tier_witnesses_count(self):
         # the room radar reading on says nothing about the bed; off says nothing either

@@ -10,13 +10,13 @@ In-bed witnesses (2026-08-12): in_bed_entities is an OR list - the two Withings
 mats plus the new ESPHome pressure strip (binary_sensor.bed_presence_6b9c94_
 bed_occupied_left, hours old, zero nights of track record). Only an exact "on"
 counts, so an offline/unavailable strip can never hold sleep mode on nor stop a
-mat from arming it. bed_empty_entities (2026-08-31: mats AND strip, see
-_bed_reads_empty) is what the release side consults - every configured witness
-must read explicitly "off" before the re-arm hold clears; the strip's local,
-sub-second, near-zero-unavailability profile means listing it there does not
-reintroduce the deadlock risk a cloud-polled mat outage could. Withings stays
-authoritative until sensor.bed_presence_agreement
-(apps/presence/bed_presence_compare.py) shows the strip earning promotion.
+mat from arming it. The release side (_bed_reads_empty) asks
+room_active_read.bed_occupied(), the one rule for an empty bed (RoomActive's bed
+tier: the mats AND the strip): every witness must read "off", or "unknown" for a
+cloud mat that has not reported since the last HA restart, before the re-arm hold
+clears; an unavailable witness keeps it. Withings stays authoritative until
+sensor.bed_presence_agreement (apps/presence/bed_presence_compare.py) shows the
+strip earning promotion.
 
 The blind gate (2026-08-12, Mikkel's own words: "if I lay in bed and connect a charger
 my phone will go to DND, that is mostly fine, but if the curtain is not up it does not
@@ -54,6 +54,8 @@ from datetime import datetime, time as dtime
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
+import room_active_read  # apps/presence - AppDaemon puts every app dir on sys.path
+
 
 def _in_window(t, start, end):
     """True when time-of-day t lies in [start, end), handling windows that wrap
@@ -80,9 +82,6 @@ class MikkelSleepMode(hass.Hass):
     blind_covering_min = 95.0
     night_window = None
     house_night_entity = None
-    # None -> _bed_reads_empty falls back to in_bed_entities (legacy behaviour and
-    # the bare __new__() test instances). The real yaml sets it to the mats only.
-    bed_empty_entities = None
     out_of_bed_clear_seconds = 12 * 60
     _out_of_bed_since = None
 
@@ -99,10 +98,6 @@ class MikkelSleepMode(hass.Hass):
                 "in_bed_entity", "binary_sensor.left_bedside"
             )
             self.in_bed_entities = [legacy] if legacy else []
-        # The subset whose EXPLICIT "off" may release the re-arm hold (the proven
-        # Withings mats). Unset -> all of in_bed_entities, the pre-strip behaviour.
-        raw_empty = self.args.get("bed_empty_entities")
-        self.bed_empty_entities = list(raw_empty) if raw_empty else None
         self.sleep_mode_entity = self.args.get(
             "sleep_mode_entity", "input_boolean.mikkel_sleep_mode"
         )
@@ -154,9 +149,10 @@ class MikkelSleepMode(hass.Hass):
         )
         # A restored hold must be reconciled against the bed right now: its clear path is
         # a live off edge, and Mikkel routinely gets out of bed while AD is down (deploy,
-        # HA restart). Without this the hold outlives the night it belongs to. Only an
-        # explicit "off" on every bedside releases it here - at init the cloud bedsides are
-        # regularly unavailable/loading, and that must keep the hold, not clear it.
+        # HA restart). Without this the hold outlives the night it belongs to. Only a bed
+        # that reads empty releases it here; at init the cloud bedsides are regularly
+        # unavailable/loading and RoomActive may not be up yet, and an unreadable bed keeps
+        # the hold until the minutely tick looks again.
         self._release_rearm_hold_if_out_of_bed("restored at startup")
 
         for entity_id in (
@@ -210,31 +206,14 @@ class MikkelSleepMode(hass.Hass):
         return False
 
     def _bed_reads_empty(self) -> bool:
-        """Every bedside in bed_empty_entities explicitly "off" - an EXPLICIT negative,
-        never merely "not on". The Withings bedsides are cloud-backed: unknown/
-        unavailable/None is what they read while HA restarts or the integration reloads,
-        which is exactly when this app re-initializes. Treating that as "he got up"
-        would drop the hold at the one moment it is needed most.
-
-        bed_empty_entities now includes the ESPHome strip alongside the two mats
-        (2026-08-31): every configured bed witness, mats AND strip, must read
-        explicitly "off" before the hold releases. The strip is local ESPHome with
-        sub-second updates and measured near-zero unavailability, unlike the
-        cloud-polled Withings mats' documented multi-hour outages - an unreadable
-        witness is already inert under this method's own logic (unavailable/unknown
-        is not an explicit "off", so it can't complete the all-off condition
-        regardless, mats included). Adding the strip here does not introduce a new
-        deadlock risk; it removes an asymmetry that was pointing at the wrong sensor."""
-        ents = self.bed_empty_entities or self.in_bed_entities
-        if not ents:
-            return False
-        for ent in ents:
-            try:
-                if self.get_state(ent) != "off":
-                    return False
-            except Exception:
-                return False
-        return True
+        """True only when room_active_read.bed_occupied() reads the bed empty: every bed
+        witness (the Withings mats AND the strip) "off", where a cloud mat that has not
+        reported since the last HA restart reads "unknown" and counts as off. Never merely
+        "not on": unavailable, a missing entity or RoomActive not loaded cannot be told, and
+        the cloud mats are unavailable while the integration reloads, which is when this app
+        re-initializes; reading that as "he got up" would drop the hold at the one moment it
+        is needed most."""
+        return room_active_read.bed_occupied(self) is False
 
     def _on_relevant_change(self, entity, attribute, old, new, kwargs) -> None:
         self._apply_sleep_mode()

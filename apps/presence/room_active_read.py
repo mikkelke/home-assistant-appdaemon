@@ -6,7 +6,8 @@ AppDaemon apps without tripping the sync-from-async gotcha (an un-awaited async-
 a coroutine-returning API silently returns a dead coroutine that never runs).
 
 Bias throughout: unknown/unreadable never collapses to "empty" - see active()'s resolution
-order and explicitly_inactive()'s stricter bar below.
+order and explicitly_inactive()'s stricter bar below. The one exception is bed_occupied(): a
+cloud bed mat that reads unknown has not reported since the last HA restart, which counts as off.
 """
 
 from __future__ import annotations
@@ -59,12 +60,13 @@ def bed_occupied(hass, zone: str = "bedroom") -> bool | None:
     """Is anyone in the zone's bed? Read from the zone's bed-tier witnesses in RoomActive's
     config (the Withings mats and the pressure strip, one list for the whole house).
 
-    True when any bed witness reads "on". False only when EVERY bed witness reads an explicit
-    "off" - the rule mikkel_sleep_mode's release uses (_bed_reads_empty): the cloud mats read
-    unknown after every HA restart and until someone lies on them, and an unreadable witness
-    must never read as a bed that is empty. None otherwise: RoomActive not loaded, no bed
-    witness configured, or a witness unreadable with none on. Callers that guard a sleeper
-    treat anything but False as occupied."""
+    True when any bed witness reads "on". False when EVERY bed witness reads "off" or
+    "unknown": the cloud mats read unknown after every HA restart until someone lies on them,
+    which is no report yet and not a body in the bed. None otherwise: RoomActive not loaded, no
+    bed witness configured, or a witness unreadable (unavailable, missing or failing to read)
+    with none on - an unreadable witness must never read as a bed that is empty. This is the one
+    rule for "the bed is empty" (the wake volume cap and mikkel_sleep_mode's re-arm hold both
+    ask it). Callers that guard a sleeper treat anything but False as occupied."""
     try:
         app = hass.get_app("RoomActive")
         witnesses = [w for w in (app.zones.get(zone) or []) if w.get("tier") == "bed"]
@@ -80,7 +82,7 @@ def bed_occupied(hass, zone: str = "bedroom") -> bool | None:
             state = None
         if state in (w.get("on_states") or ["on"]):
             return True
-        if state != "off":
+        if state not in ("off", "unknown"):
             all_off = False
     return False if all_off else None
 

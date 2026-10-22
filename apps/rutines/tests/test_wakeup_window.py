@@ -7,7 +7,8 @@ for as long as it has left to run. The timing lives here and nowhere else.
 wake_volume_cap() is what other apps (BedroomBathroomVolumeSync) ask: the speaker in the room with
 the bed is held to its standard volume during the window for as long as the bed is not known to be
 empty, because the cap is for whoever stays in bed. An empty bed - and the bathroom, always - is
-not capped: the volume follows the person who got up. An unreadable bed counts as occupied.
+not capped: the volume follows the person who got up. An unreadable bed (unavailable) counts as
+occupied; a mat that has not reported since the last restart (unknown) reads as off.
 """
 
 from __future__ import annotations
@@ -60,7 +61,8 @@ GROUPED = [BEDROOM, BATHROOM]
 LEFT, RIGHT, STRIP = "binary_sensor.left_bedside", "binary_sensor.right_bedside", "binary_sensor.strip_either"
 OCCUPIED = {LEFT: "off", RIGHT: "off", STRIP: "on"}
 EMPTY = {LEFT: "off", RIGHT: "off", STRIP: "off"}
-UNREADABLE = {LEFT: "off", RIGHT: "unknown", STRIP: "off"}
+UNREADABLE = {LEFT: "off", RIGHT: "unavailable", STRIP: "off"}
+NO_REPORT_SINCE_RESTART = {LEFT: "off", RIGHT: "unknown", STRIP: "off"}
 
 
 def window_app(now=FIRED, *, join=(BATHROOM,), window_min=30, state=None):
@@ -214,6 +216,13 @@ class TheCapOtherAppsStayUnder(unittest.TestCase):
     def test_an_unreadable_bed_counts_as_occupied(self):
         app = opened()
         app.bed = dict(UNREADABLE)
+        self.assertEqual(app.wake_volume_cap(BEDROOM), 0.14)
+
+    def test_a_mat_that_has_not_reported_since_the_restart_does_not_hold_the_cap(self):
+        app = opened()
+        app.bed = dict(NO_REPORT_SINCE_RESTART)
+        self.assertIsNone(app.wake_volume_cap(BEDROOM))
+        app.bed = {LEFT: "unknown", RIGHT: "unknown", STRIP: "on"}
         self.assertEqual(app.wake_volume_cap(BEDROOM), 0.14)
 
     def test_any_bed_witness_on_beats_the_rest(self):

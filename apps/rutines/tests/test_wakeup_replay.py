@@ -7,8 +7,8 @@ wake speaker at volume_start whatever it was left at and only ever raises.
 
 WINDOWS holds each morning as the house saw it, with nothing but offsets and states (no dates,
 no clock times):
-  - the bed witnesses (left mat, right mat, strip) as three letters, n on / f off / u unreadable,
-    at the alarm and at every change;
+  - the bed witnesses (left mat, right mat, strip) as three letters, n on / f off / u unknown (a
+    mat with no report since the restart, which reads as off), at the alarm and at every change;
   - how long the bathroom door had been open when the alarm fired (None: closed) and every change
     of it - the sync is active once the door has been open 60 s;
   - the bath presence sensor at the alarm and every change, and any wall-button presses.
@@ -301,7 +301,7 @@ def replay(window, *, capped=True):
 
 
 def bed_is_empty(code):
-    return code == "fff"
+    return "n" not in code
 
 
 def bedroom_writes_above_standard(result):
@@ -380,29 +380,29 @@ class TheForty2Mornings(unittest.TestCase):
         uncapped = [replay(w, capped=False) for w in WINDOWS]
         broke = [r for r in uncapped if [w for w in bedroom_writes_above_standard(r) if not bed_is_empty(w[4])]]
         witness_on = [r for r in broke if [w for w in bedroom_writes_above_standard(r) if "n" in w[4]]]
-        self.assertEqual(len(broke), 17)
+        self.assertEqual(len(broke), 11)
         self.assertEqual(len(witness_on), 11)
 
-    def test_the_cap_lowers_the_copy_29_times_in_17_mornings(self):
+    def test_the_cap_lowers_the_copy_15_times_in_11_mornings(self):
         lowered = [(i, bed) for i, r in enumerate(self.results) for _, _, cap, bath, bed in r.asked
                    if cap is not None and bath > cap + 0.005]
-        self.assertEqual(len(lowered), 29)
-        self.assertEqual(len({i for i, _ in lowered}), 17)
+        self.assertEqual(len(lowered), 15)
+        self.assertEqual(len({i for i, _ in lowered}), 11)
         self.assertEqual(sum(1 for _, bed in lowered if "n" in bed), 15)
-        self.assertEqual(sum(1 for _, bed in lowered if "n" not in bed), 14)
+        self.assertEqual(sum(1 for _, bed in lowered if "n" not in bed), 0)
 
     def test_the_cap_holds_while_the_bathroom_plays_louder_in_most_mornings(self):
         louder = [i for i, r in enumerate(self.results)
                   if any(cap is not None and bath > STANDARD[BEDROOM] for _, _, cap, _, bath in r.samples)]
         witness_on = [i for i, r in enumerate(self.results)
                       if any(cap is not None and "n" in bed and bath > STANDARD[BEDROOM] for _, bed, cap, _, bath in r.samples)]
-        self.assertEqual(len(louder), 39)
+        self.assertEqual(len(louder), 38)
         self.assertEqual(len(witness_on), 38)
 
     def test_once_the_bed_reads_empty_the_sync_follows_the_person(self):
         followed = [i for i, r in enumerate(self.results)
                     if [w for w in bedroom_writes_above_standard(r) if w[1] == "sync" and bed_is_empty(w[4])]]
-        self.assertEqual(len(followed), 18)
+        self.assertEqual(len(followed), 24)
 
 
 if __name__ == "__main__":
