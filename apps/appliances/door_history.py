@@ -106,3 +106,23 @@ def timer_set_close(states, power_points, now, max_age_s, idle_below_w, settle_s
     if last_idle is None or last_idle + 1 >= len(closes):
         return None
     return closes[last_idle + 1][0]
+
+
+def standby_reading(power_points, now, idle_below_w, awake_above_w, window_s=600, parts=5):
+    """What closed-door standby power says about a delay timer over the `window_s` before `now`,
+    judged in `parts` equal slices: "timer" when every slice's mean lies between `idle_below_w` and
+    `awake_above_w` (a countdown; an awake display draws more), "idle" when every slice is below
+    `idle_below_w`, else None (awake, mixed, or too little history). `power_points` is
+    [(datetime_utc, watts)] sorted by time."""
+    now = _utc(now)
+    if now is None:
+        return None
+    step = timedelta(seconds=window_s / parts)
+    means = [_mean_w(power_points, now - step * (k + 1), now - step * k) for k in range(parts)]
+    if any(m is None for m in means):
+        return None
+    if all(idle_below_w <= m <= awake_above_w for m in means):
+        return "timer"
+    if all(m < idle_below_w for m in means):
+        return "idle"
+    return None

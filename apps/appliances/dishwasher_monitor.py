@@ -102,6 +102,15 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
     LOAD_ANCHOR_MAX_AGE_S = 12 * 3600
     # Closed-door standby: below this the machine idles; a running delay countdown draws more.
     TIMER_IDLE_BELOW_W = 0.04
+    # A countdown draws 0.06-0.09 W; above this the display is awake (0.6-1.5 W), which says nothing.
+    TIMER_AWAKE_ABOVE_W = 0.3
+    TIMER_WINDOW_S = 600
+    TIMER_ENTITY = "binary_sensor.dishwasher_timer"
+    _timer_since = None  # UTC the delay timer was set, None while no timer is seen
+    _standby_points = ()  # recent (UTC, watts) plug readings, see _remember_standby
+    confirmed_programme_entity = None
+    short_entity = None
+    reset_programme_selector_on_start = True
 
     def _safe_cancel_timer(self, handle):
         """Cancel a timer only if still running (avoids invalid-handle warnings)."""
@@ -699,6 +708,8 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         # (e.g. from _handle_force_emptied, potentially hours after boot) falls back to a live
         # read instead of replaying this boot's stale snapshot - see _boot_full_state_snapshot.
         self._drop_cycle_store_boot_snapshot()
+
+        self._seed_standby_points()
 
         # Listen for power changes
         self.listen_state(self._power_changed, self.power_sensor)
@@ -1832,6 +1843,9 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         key = self._SELECTOR_LABEL_TO_KEY.get(programme)
         if key is None or self.state in ("Running", "Paused"):
             return
+        if self.state == "Off" and self._timer_since is not None:
+            self.log(f"Pick of {programme!r} kept for the timed run", level="INFO")
+            return
         if self.state != "Unemptied":
             self.log(f"Pick of {programme!r} ignored: the dishwasher is {self.state}, not waiting to be emptied",
                      level="INFO")
@@ -2173,27 +2187,12 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         if not from_unemptied_recovery:
             self._follow_up_actor("start", self._cycle_actor, "dishwasher_start")
 
-        if self.reset_programme_selector_on_start and self.confirmed_programme_entity:
-            try:
-                self.call_service(
-                    "input_select/select_option",
-                    entity_id=self.confirmed_programme_entity,
-                    option="—",
-                )
-            except Exception as e:
-                self.log(f"Could not reset programme selector: {e}", level="DEBUG")
-
-        # Reset short_entity too - normal full ECO is most of our cycles, so a "Yes" left over
-        # from a rare Express wash must not leak into the next (usually full) cycle's estimate.
-        if self.reset_programme_selector_on_start and self.short_entity:
-            try:
-                self.call_service(
-                    "input_select/select_option",
-                    entity_id=self.short_entity,
-                    option="—",
-                )
-            except Exception as e:
-                self.log(f"Could not reset short selector: {e}", level="DEBUG")
+        # A run the delay timer started keeps what was picked while the timer ran; the finish reads it.
+        if self._timer_since is not None:
+            self._timer_since = None
+            self._publish_timer("the timed run started")
+        else:
+            self._reset_selectors()
 
         if not self.poll_timer:
             self.poll_timer = self.run_in(self._poll_power, 60)
@@ -2921,6 +2920,8 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             self._set_state_entity(state="Off", attributes=self._off_merged_attributes(reason), replace=True)
             self.log(f"State -> Off ({reason})", level="INFO")
             self._reset_cycle_tracking()
+            # A pick made after the last run must not pass for a pick made for the next timed run.
+            self._reset_selectors()
 
     def _transition_to_unemptied(self, skip_announce=False, run_minutes=None, energy_used=None, force=False):
         """Transition to Unemptied state (cycle done, door still closed, waiting for user).
@@ -3330,6 +3331,8 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
 
         self._cancel_power_unavailable_grace()
         self._record_power_reading(watts)
+        self._remember_standby(watts)
+        self._timer_check()
         current_state = self.get_state(self.state_entity)
         if current_state == "Error":
             self._transition_to_off("Power sensor OK after Error (verify dishwasher)", force=True)
@@ -3631,6 +3634,82 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         attrs = (full.get("attributes") or {}) if isinstance(full, dict) else {}
         source = attrs if attrs.get("started_by_method") else self._boot_store_snapshot()
         return self._cycle_actor_from_state_attrs(source)
+
+    def _reset_selectors(self):
+        """Programme and Short back to "—" (unless the yaml keeps the last selection): normal full ECO is
+        most of our cycles, so a pick left over from another run must not leak into this one."""
+        if not self.reset_programme_selector_on_start:
+            return
+        for entity in (self.confirmed_programme_entity, self.short_entity):
+            if not entity:
+                continue
+            try:
+                self.call_service("input_select/select_option", entity_id=entity, option="—")
+            except Exception as e:
+                self.log(f"Could not reset {entity}: {e}", level="DEBUG")
+
+    def _remember_standby(self, watts):
+        """Keep the plug readings of the last TIMER_WINDOW_S, plus the one before that sets its level."""
+        now = self._now_utc()
+        points = list(self._standby_points)
+        points.append((now, watts))
+        cutoff = now - timedelta(seconds=self.TIMER_WINDOW_S)
+        while len(points) > 1 and points[1][0] <= cutoff:
+            points.pop(0)
+        self._standby_points = points
+
+    def _seed_standby_points(self):
+        """The recorder's last TIMER_WINDOW_S of plug power, so a restart mid-countdown still sees the timer."""
+        try:
+            now = self._now_utc()
+            hist = self.get_history(
+                entity_id=self.power_sensor, start_time=now - timedelta(seconds=self.TIMER_WINDOW_S + 60), end_time=now
+            )
+            points = whist.parse_power_points(self._flatten_history(hist, self.power_sensor))
+            points.sort(key=lambda x: x[0])
+            self._standby_points = points
+        except Exception as e:
+            self.log(f"Standby power history lookup failed: {e}", level="DEBUG")
+
+    def _timer_check(self):
+        """The delay timer, from closed-door standby power while the dishwasher is Off: set once the last
+        TIMER_WINDOW_S look like a countdown, gone once they idle again (and what was picked for it with
+        it) or the machine leaves Off. An open door or an awake display changes nothing: people add a
+        glass while the timer runs. Also republishes what an HA or AppDaemon restart left wrong."""
+        published_on = self.get_state(self.TIMER_ENTITY) == "on"
+        if self.state != "Off":
+            if self._timer_since is not None or published_on:
+                self._timer_since = None
+                self._publish_timer(f"the dishwasher is {self.state}")
+            return
+        if self.get_state(self.door_sensor) != "off":
+            return
+        now = self._now_utc()
+        reading = door_history.standby_reading(
+            self._standby_points, now, self.TIMER_IDLE_BELOW_W, self.TIMER_AWAKE_ABOVE_W, window_s=self.TIMER_WINDOW_S
+        )
+        if reading == "timer":
+            if self._timer_since is None:
+                self._timer_since = self._timer_close_from_history(now) or now
+                self.log(f"Delay timer set at {self._format_local(self._timer_since)}", level="INFO")
+            if not published_on:
+                self._publish_timer("standby draws a countdown")
+        elif reading == "idle" and (self._timer_since is not None or published_on):
+            self._timer_since = None
+            self.log("Delay timer gone: standby is idle again", level="INFO")
+            self._publish_timer("standby is idle again")
+            self._reset_selectors()
+
+    def _publish_timer(self, reason):
+        attrs = {"friendly_name": "Dishwasher timer", "icon": "mdi:timer-outline", "reason": reason}
+        if self._timer_since is not None:
+            attrs["since"] = self._format_utc(self._timer_since)
+        try:
+            self.set_state(
+                self.TIMER_ENTITY, state="on" if self._timer_since is not None else "off", attributes=attrs, replace=True
+            )
+        except Exception as e:
+            self.log(f"Could not publish {self.TIMER_ENTITY}: {e}", level="WARNING")
 
     def _load_anchor(self, now):
         """When this cycle was started: the door close that set the delay timer, read from the
