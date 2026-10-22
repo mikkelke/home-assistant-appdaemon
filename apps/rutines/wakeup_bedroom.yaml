@@ -27,7 +27,8 @@ WakeupBedroom:
   media_verify_recheck_sec: 5
   media_still_playing_check_sec: 45
 
-  # Every speaker here is set to volume_start when the alarm fires and ramps on its own to its own ceiling.
+  # Every speaker here is set to volume_start when the alarm fires and ramps up on its own to its own
+  # ceiling. The ramp only ever raises a speaker, so a bath boost or a hand on the volume is never undone.
   volume_entities:
     - media_player.bedroom
     - media_player.bathroom
@@ -38,9 +39,12 @@ WakeupBedroom:
   volume_step: 0.03
   volume_interval_sec: 60
   # From the alarm firing for this many minutes (cut short when the routine stops or its speakers are
-  # no longer one group) wake_window_open() is True: BedroomBathroomVolumeSync copies no volume and the
-  # bath presence boost (sonos_bathroom_control) stays under the bathroom's standard volume.
+  # no longer one group) the speaker in the room with the bed stays at or under its standard volume for
+  # as long as the bed is not known to be empty (wake_volume_cap, read by BedroomBathroomVolumeSync;
+  # bed witnesses: RoomActive's bed tier via room_active_read.bed_occupied, unreadable counts as
+  # occupied). Once the bed reads empty, and for the bathroom always, the volume follows the person.
   wake_window_min: 30
+  bed_speaker: media_player.bedroom
 
   covers:
     bedroom: cover.bedroom_blind

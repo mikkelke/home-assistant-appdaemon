@@ -13,11 +13,11 @@ class BedroomBathroomVolumeSync(hass.Hass):
     volume it last matched. Reactivates only after another full door_open_debounce_sec of
     continuous open.
 
-    While the wake-up routine's window is open (WakeupRoutine.wake_window_open: the alarm firing
-    until wake_window_min later, cut short when the routine stops or its speakers are no longer
-    one group) nothing is copied: the wake ramp owns both speakers' volume then, each capped at
-    its standard. The window is the wake routine's alone - this app only asks. When the wake
-    routine cannot be asked, the sync behaves as if no window were open.
+    While the wake-up plays out and someone is still in the bed, the bedroom copies the bathroom
+    only up to the bedroom's standard volume: WakeupRoutine.wake_volume_cap says so, and says
+    nothing once the bed reads empty, so the volume follows a person who has walked to the
+    bathroom. The window and the bed are the wake routine's to judge - this app only asks. When
+    the wake routine cannot be asked, the sync behaves as if there were no wake-up.
     """
 
     def initialize(self):
@@ -29,7 +29,6 @@ class BedroomBathroomVolumeSync(hass.Hass):
 
         self._sync_active = False
         self._sync_arm_timer = None
-        self._wake_hold_logged = False
 
         self.listen_state(self._on_door_change, self.bathroom_door_sensor)
         self.listen_state(self._on_bathroom_volume_change, self.bathroom_speaker, attribute="volume_level")
@@ -83,21 +82,16 @@ class BedroomBathroomVolumeSync(hass.Hass):
     def _on_speaker_state_change(self, entity, attribute, old, new, kwargs):
         self._maybe_sync("speaker_state_change")
 
-    def _wake_window_open(self):
+    def _wake_cap(self):
         try:
-            return bool(self.get_app(self.wake_app).wake_window_open())
+            cap = self.get_app(self.wake_app).wake_volume_cap(self.bedroom_speaker)
+            return None if cap is None else float(cap)
         except Exception:
-            return False
+            return None
 
     def _maybe_sync(self, reason):
         if not self._sync_active:
             return
-        if self._wake_window_open():
-            if not self._wake_hold_logged:
-                self._wake_hold_logged = True
-                self.log("Scenario: volume_sync_held -> wake window open", level="INFO")
-            return
-        self._wake_hold_logged = False
         if self.get_state(self.bathroom_speaker) != "playing" or self.get_state(self.bedroom_speaker) != "playing":
             return
         try:
@@ -108,10 +102,13 @@ class BedroomBathroomVolumeSync(hass.Hass):
             bed_vol = float(self.get_state(self.bedroom_speaker, attribute="volume_level"))
         except (TypeError, ValueError):
             bed_vol = None
-        if bed_vol is not None and abs(bed_vol - bath_vol) < 0.005:
+        cap = self._wake_cap()
+        target = bath_vol if cap is None else min(bath_vol, cap)
+        if bed_vol is not None and abs(bed_vol - target) < 0.005:
             return
+        capped = "" if target == bath_vol else f", capped at the wake standard {cap:.2f}"
         self.log(
-            f"Scenario: volume_sync_apply -> {reason}, bedroom {bed_vol} -> {bath_vol:.2f} (matching bathroom)",
+            f"Scenario: volume_sync_apply -> {reason}, bedroom {bed_vol} -> {target:.2f} (matching bathroom{capped})",
             level="INFO",
         )
-        self.call_service("media_player/volume_set", entity_id=self.bedroom_speaker, volume_level=bath_vol)
+        self.call_service("media_player/volume_set", entity_id=self.bedroom_speaker, volume_level=target)

@@ -1,7 +1,8 @@
 """The wake-up volume ramp never plays a speaker louder than its standard volume.
 
 Every speaker in the wake group is set to volume_start when the alarm fires - whatever it
-was left at - and ramps on its own to its own ceiling. The standard lives in one place, the
+was left at - and ramps up on its own to its own ceiling; the ramp only ever raises a speaker,
+so a bath boost or a hand on the volume is never undone. The standard lives in one place, the
 SonosStateReset config (speaker_volumes, default_volume), and the wake routine reads it when
 the alarm fires: ceiling = min(volume_target, the speaker's standard). When that config cannot
 be read the ramp is capped at the most conservative level instead of falling back to
@@ -81,7 +82,7 @@ class Rig:
         app.volume_interval_sec = 60
         app.volume_active = False
         app.volume_timer = None
-        app.volume_ceilings = {}
+        app.volume_ramp = {}
         app.volume_levels = {}
         app.stream_id = "stream"
         app.media_verify_delay_sec = 12
@@ -184,16 +185,34 @@ class EverySpeakerRampsToItsOwnCeiling(unittest.TestCase):
         self.assertEqual(max(rig.run_ramp()[BEDROOM]), 0.05)
 
 
-class TheRampKeepsHoldOfItsSpeakers(unittest.TestCase):
-    def test_a_volume_raised_past_the_ceiling_mid_ramp_is_pulled_back(self):
+class TheRampOnlyEverRaises(unittest.TestCase):
+    def test_a_speaker_taken_past_its_ceiling_mid_ramp_is_left_where_it_is(self):
         rig = standards_rig()
         rig.app._start_media_and_volume_ramp()
         rig.volume[BEDROOM] = 0.24
         rig.volume[BATHROOM] = 0.34
         rig.app._volume_tick(None)
-        self.assertEqual(rig.volume[BEDROOM], 0.14)
-        self.assertEqual(rig.volume[BATHROOM], 0.18)
+        self.assertEqual(rig.volume, {BEDROOM: 0.24, BATHROOM: 0.34})
+        self.assertEqual(rig.sets, [(BEDROOM, 0.06), (BATHROOM, 0.06)])
         self.assertFalse(rig.app.volume_active)
+
+    def test_a_boost_in_the_middle_of_the_ramp_is_never_pulled_back_down(self):
+        rig = standards_rig()
+        rig.app._start_media_and_volume_ramp()
+        rig.app._volume_tick(None)
+        rig.volume[BATHROOM] = round(rig.volume[BATHROOM] + 0.10, 2)
+        boosted = rig.volume[BATHROOM]
+        for _ in range(6):
+            rig.app._volume_tick(None)
+            self.assertGreaterEqual(rig.volume[BATHROOM], boosted)
+        self.assertFalse(rig.app.volume_active)
+
+    def test_a_boost_below_the_ceiling_is_ramped_on_not_undone(self):
+        rig = standards_rig()
+        rig.app._start_media_and_volume_ramp()
+        rig.volume[BATHROOM] = 0.16
+        rig.app._volume_tick(None)
+        self.assertEqual(rig.volume[BATHROOM], 0.18)
 
     def test_one_speaker_failing_does_not_stop_the_other_or_the_ramp(self):
         rig = standards_rig()
@@ -278,6 +297,11 @@ class RealConfigs(unittest.TestCase):
     def test_the_wake_group_is_exactly_the_ramped_speakers(self):
         group = {self.wake["media_master"], *self.wake["media_join"]}
         self.assertEqual(group, set(self.wake["volume_entities"]))
+
+    def test_the_bed_speaker_is_a_wake_speaker_and_the_bedroom_has_bed_witnesses(self):
+        self.assertIn(self.wake["bed_speaker"], self.wake["volume_entities"])
+        zones = self.load("presence/room_active.yaml")["zones"]
+        self.assertTrue(any(w["tier"] == "bed" for w in zones["bedroom"]["witnesses"]))
 
     def test_every_ramped_speaker_has_a_standard_of_its_own(self):
         for speaker in self.wake["volume_entities"]:

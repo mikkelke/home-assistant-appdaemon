@@ -55,6 +55,36 @@ def explicitly_inactive(hass, zone: str) -> bool:
         return False
 
 
+def bed_occupied(hass, zone: str = "bedroom") -> bool | None:
+    """Is anyone in the zone's bed? Read from the zone's bed-tier witnesses in RoomActive's
+    config (the Withings mats and the pressure strip, one list for the whole house).
+
+    True when any bed witness reads "on". False only when EVERY bed witness reads an explicit
+    "off" - the rule mikkel_sleep_mode's release uses (_bed_reads_empty): the cloud mats read
+    unknown after every HA restart and until someone lies on them, and an unreadable witness
+    must never read as a bed that is empty. None otherwise: RoomActive not loaded, no bed
+    witness configured, or a witness unreadable with none on. Callers that guard a sleeper
+    treat anything but False as occupied."""
+    try:
+        app = hass.get_app("RoomActive")
+        witnesses = [w for w in (app.zones.get(zone) or []) if w.get("tier") == "bed"]
+    except Exception:
+        return None
+    if not witnesses:
+        return None
+    all_off = True
+    for w in witnesses:
+        try:
+            state = hass.get_state(w["entity"])
+        except Exception:
+            state = None
+        if state in (w.get("on_states") or ["on"]):
+            return True
+        if state != "off":
+            all_off = False
+    return False if all_off else None
+
+
 def _age_seconds(computed_at):
     """Seconds between now (UTC) and an ISO-8601 timestamp, or None if unparseable/absent."""
     if not computed_at:

@@ -9,11 +9,13 @@ import room_state_darkness
 import solar_window
 
 # Shared layers this routine ORCHESTRATES rather than reimplements: who owns the
-# bedroom blind (apps/blinds/blind_arbiter.py) and how a room is faded up
-# (apps/lights/light_ramp.py). Imported defensively on purpose - this is the alarm
+# bedroom blind (apps/blinds/blind_arbiter.py), how a room is faded up
+# (apps/lights/light_ramp.py) and whether the bed is occupied
+# (apps/presence/room_active_read.py). Imported defensively on purpose - this is the alarm
 # that wakes a real person, so a missing or broken shared module must cost the house
 # a layer, never the wake-up. Every use site below falls back to the direct service
-# call this app made before the split; see _set_cover_position / _ramp_tick.
+# call this app made before the split (or, for the bed, to treating it as occupied); see
+# _set_cover_position / _ramp_tick / _bed_occupied.
 try:
     import blind_arbiter
 except Exception:  # pragma: no cover - exercised via the None-module tests
@@ -22,6 +24,10 @@ try:
     import light_ramp
 except Exception:  # pragma: no cover - exercised via the None-module tests
     light_ramp = None
+try:
+    import room_active_read
+except Exception:  # pragma: no cover - exercised via the None-module tests
+    room_active_read = None
 
 REQUIRED_TOP_LEVEL = [
     "alarm_time_entity", "alarm_enabled_entity",
@@ -88,6 +94,9 @@ class WakeupRoutine(hass.Hass):
 
         # Every speaker that plays the alarm is ramped, whether or not volume_entities lists it.
         self.volume_entities = list(dict.fromkeys([self.master_player, *self.join_players, *A["volume_entities"]]))
+        # The speaker in the room with the bed: capped at its standard while someone is still in
+        # it (see wake_volume_cap). Every other wake speaker is the person's to turn up.
+        self.bed_speaker = A.get("bed_speaker", self.master_player)
         self.volume_start = float(A["volume_start"])
         self.volume_target = float(A["volume_target"])
         self.volume_step = float(A["volume_step"])
@@ -179,8 +188,9 @@ class WakeupRoutine(hass.Hass):
         # mid-day. Measured from alarm fire.
         self.wake_light_window_min = int(A.get("wake_light_window_min", 60))
         self._alarm_fired_at = None
-        # Apps that write volume on the wake speakers stand down while wake_window_open():
-        # from the alarm firing for this many minutes.
+        # The wake window (wake_window_open): from the alarm firing for this many minutes. While it
+        # is open the bed speaker is held to its standard for as long as the bed is not known to
+        # be empty (wake_volume_cap).
         self.wake_window_min = int(A.get("wake_window_min", 30))
         # Dynamic settle after blinds reach target (based on outdoor lux clue).
         self.post_blind_settle_dark_sec = max(0, int(A.get("post_blind_settle_dark_sec", 10)))
@@ -205,7 +215,7 @@ class WakeupRoutine(hass.Hass):
         self.volume_timer = None
         self.ramp_active = False
         self.volume_active = False
-        self.volume_ceilings = {}
+        self.volume_ramp = {}
         self.volume_levels = {}
         self.current_pct = None
         self.media_attempt = 0
@@ -248,6 +258,9 @@ class WakeupRoutine(hass.Hass):
 
         # Respect per-app log_level
         self.set_log_level(self.log_level)
+        if room_active_read is None:
+            self.log("[wake] room_active_read could not be imported - the bedroom speaker stays at its "
+                     "standard for the whole wake window", level="WARNING", log=self.user_log)
 
         # Schedule alarm and reschedule on time change
         self._schedule_daily_alarm()
@@ -282,6 +295,10 @@ class WakeupRoutine(hass.Hass):
         self.forecast_timer = self.run_every(
             lambda kw: self.create_task(self._refresh_forecast_high()),
             self.datetime() + timedelta(seconds=20), self.forecast_refresh_min * 60)
+        # Once a minute while the wake window is open: the bed speaker goes back to its standard
+        # when the bed stops reading empty (see _bed_guard).
+        self._bed_was_empty = False
+        self.bed_guard_timer = self.run_every(self._bed_guard, self.datetime() + timedelta(seconds=80), 60)
 
     # ---------- scheduling ----------
     def _schedule_daily_alarm(self):
@@ -762,9 +779,9 @@ class WakeupRoutine(hass.Hass):
                     self.call_service("media_player/volume_mute", entity_id=t, is_volume_muted=False)
         except Exception:
             pass
-        self.volume_ceilings = {e: self._volume_ceiling_for(e) for e in self.volume_entities}
+        self.volume_ramp = {e: self._volume_ceiling_for(e) for e in self.volume_entities}
         self.volume_levels = {}
-        for entity, ceiling in self.volume_ceilings.items():
+        for entity, ceiling in self.volume_ramp.items():
             self._ramp_set(entity, min(self.volume_start, ceiling))
         self.volume_active = True
         self._schedule_next_volume_tick()
@@ -947,18 +964,21 @@ class WakeupRoutine(hass.Hass):
         self.volume_timer = None
         if not self.volume_active:
             return
-        for entity, ceiling in list(self.volume_ceilings.items()):
-            last = self.volume_levels.get(entity, self.volume_start)
-            if last >= ceiling:
-                continue
+        for entity, ceiling in list(self.volume_ramp.items()):
             current = self._get_first_volume([entity])
             if current is None:
-                current = last
+                current = self.volume_levels.get(entity, self.volume_start)
+            if current >= ceiling:
+                # Already there, or taken past it by someone's hand or a bath boost: the ramp
+                # only ever raises a speaker, so it is done with this one.
+                self.volume_ramp.pop(entity, None)
+                continue
             next_vol = min(ceiling, round(current + self.volume_step, 3))
             self._ramp_set(entity, next_vol)
             if next_vol >= ceiling:
+                self.volume_ramp.pop(entity, None)
                 self.log(f"[wake] Volume ramp complete on {entity} at {next_vol}", log=self.user_log)
-        if any(self.volume_levels.get(e, 0.0) < c for e, c in self.volume_ceilings.items()):
+        if self.volume_ramp:
             self._schedule_next_volume_tick()
         else:
             self.volume_active = False
@@ -1023,7 +1043,7 @@ class WakeupRoutine(hass.Hass):
         )
         return ceiling
 
-    # ---------- wake window (read by other apps) ----------
+    # ---------- wake window and the bed speaker's cap (read by other apps) ----------
     def _open_wake_window(self):
         self._wake_window_until = self._alarm_fired_at + timedelta(minutes=self.wake_window_min)
         self._wake_group_seen = False
@@ -1039,9 +1059,7 @@ class WakeupRoutine(hass.Hass):
 
     def wake_window_open(self):
         """True while the wake-up plays out: from the alarm firing until wake_window_min
-        later, or until the routine is stopped or its speakers stop being one group. Apps
-        that copy a volume between the wake speakers (BedroomBathroomVolumeSync) hold off
-        while it is True."""
+        later, or until the routine is stopped or its speakers stop being one group."""
         until = self._wake_window_until
         if until is None or self.datetime() >= until:
             return False
@@ -1053,12 +1071,48 @@ class WakeupRoutine(hass.Hass):
         return True
 
     def wake_volume_cap(self, entity):
-        """The most an automation may raise a wake speaker to while the wake-up plays out: its
-        standard volume while wake_window_open(), else None. Apps that raise a wake speaker's
-        volume on their own (the bath presence boost) stay under it."""
-        if entity not in self.volume_entities or not self.wake_window_open():
+        """The most an automation may set `entity` to right now on account of the wake-up, or
+        None. Only the speaker in the room with the bed has one: its standard volume while
+        wake_window_open() and the bed is not known to be empty. The cap is for whoever stays
+        in bed - once the bed reads empty, and for every other speaker (the bathroom the
+        person walks to), the volume follows the person."""
+        if entity != self.bed_speaker or not self.wake_window_open():
+            return None
+        if self._bed_occupied() is False:
             return None
         return self._standard_for(entity)
+
+    def _bed_guard(self, _):
+        """The volume follows a person once the bed reads empty (wake_volume_cap is None), so the
+        bed speaker may have been taken past its standard. When the bed reads occupied again
+        within the wake window - someone back in it - bring the speaker back to the standard."""
+        try:
+            if not self.wake_window_open():
+                self._bed_was_empty = False
+                return
+            cap = self.wake_volume_cap(self.bed_speaker)
+            was_empty, self._bed_was_empty = self._bed_was_empty, cap is None
+            if cap is None or not was_empty:
+                return
+            current = self._get_first_volume([self.bed_speaker])
+            if current is not None and current > cap + 0.005:
+                self._set_volume(self.bed_speaker, cap)
+                self.log(
+                    f"[wake] Bed occupied again - {self.bed_speaker} back from {current} to its standard {cap}",
+                    log=self.user_log,
+                )
+        except Exception as e:
+            self.log(f"[wake] Bed guard failed: {e}", level="WARNING", log=self.user_log)
+
+    def _bed_occupied(self):
+        """True/False from the shared bed witnesses (mats and strip, see
+        room_active_read.bed_occupied); None when that cannot be told. Only False means empty."""
+        if room_active_read is None:
+            return None
+        try:
+            return room_active_read.bed_occupied(self)
+        except Exception:
+            return None
 
     def _wake_group_state(self):
         """True when every joined speaker is in the master's group, False when one is not,

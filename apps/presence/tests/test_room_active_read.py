@@ -207,5 +207,73 @@ class ExplicitlyInactive(unittest.TestCase):
         self.assertFalse(rar.explicitly_inactive(hass, ZONE))
 
 
+LEFT, RIGHT, STRIP = "binary_sensor.left_bedside", "binary_sensor.right_bedside", "binary_sensor.strip_either"
+FP300 = "binary_sensor.bedroom_presence"
+
+
+def _bedroom(**states):
+    """FakeHass for the bedroom: the two mats and the strip are bed-tier witnesses, the room
+    radar is not. `states` maps left/right/strip/room to a state."""
+    zones = {"bedroom": [
+        _witness(LEFT, "bed"), _witness(RIGHT, "bed"), _witness(STRIP, "bed"), _witness(FP300, "room"),
+    ]}
+    hass = FakeHass(apps={"RoomActive": _room_active_app(zones)})
+    for key, entity in (("left", LEFT), ("right", RIGHT), ("strip", STRIP), ("room", FP300)):
+        if key in states:
+            hass.states[(entity, None)] = states[key]
+    return hass
+
+
+class BedOccupied(unittest.TestCase):
+    """bed_occupied(): True when any bed witness reads on; False only when EVERY one reads an
+    explicit off (the sleep-mode release rule); None otherwise - callers that guard a sleeper
+    treat anything but False as occupied."""
+
+    def test_any_bed_witness_on_is_occupied(self):
+        self.assertIs(rar.bed_occupied(_bedroom(left="on", right="off", strip="off")), True)
+        self.assertIs(rar.bed_occupied(_bedroom(left="off", right="off", strip="on")), True)
+
+    def test_every_bed_witness_explicitly_off_is_empty(self):
+        self.assertIs(rar.bed_occupied(_bedroom(left="off", right="off", strip="off")), False)
+
+    def test_an_unreadable_witness_with_none_on_cannot_be_told(self):
+        for unreadable in ("unknown", "unavailable", None):
+            hass = _bedroom(left="off", right=unreadable, strip="off")
+            self.assertIsNone(rar.bed_occupied(hass), unreadable)
+
+    def test_on_beats_an_unreadable_witness(self):
+        self.assertIs(rar.bed_occupied(_bedroom(left="on", right="unknown", strip="unavailable")), True)
+
+    def test_only_bed_tier_witnesses_count(self):
+        # the room radar reading on says nothing about the bed; off says nothing either
+        self.assertIs(rar.bed_occupied(_bedroom(left="off", right="off", strip="off", room="on")), False)
+        self.assertIs(rar.bed_occupied(_bedroom(left="on", right="off", strip="off", room="off")), True)
+
+    def test_no_bed_witness_configured_cannot_be_told(self):
+        hass = FakeHass(apps={"RoomActive": _room_active_app({"bedroom": [_witness(FP300, "room")]})})
+        self.assertIsNone(rar.bed_occupied(hass))
+        self.assertIsNone(rar.bed_occupied(hass, "no_such_zone"))
+
+    def test_room_active_not_loaded_cannot_be_told(self):
+        self.assertIsNone(rar.bed_occupied(FakeHass()))
+
+    def test_a_failing_app_registry_or_state_read_cannot_be_told(self):
+        class NoApps(FakeHass):
+            def get_app(self, name):
+                raise RuntimeError("boom")
+
+        class NoStates(FakeHass):
+            def get_state(self, entity, attribute=None, **kwargs):
+                raise RuntimeError("boom")
+
+        self.assertIsNone(rar.bed_occupied(NoApps()))
+        hass = NoStates(apps={"RoomActive": _room_active_app({"bedroom": [_witness(LEFT, "bed")]})})
+        self.assertIsNone(rar.bed_occupied(hass))
+
+    def test_a_witness_with_its_own_on_states(self):
+        zones = {"bedroom": [_witness(LEFT, "bed", on_states=["occupied"])]}
+        hass = FakeHass(apps={"RoomActive": _room_active_app(zones)}, states={(LEFT, None): "occupied"})
+        self.assertIs(rar.bed_occupied(hass), True)
+
 if __name__ == "__main__":
     unittest.main()

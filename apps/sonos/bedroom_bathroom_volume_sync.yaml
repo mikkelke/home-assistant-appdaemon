@@ -3,7 +3,8 @@
 # While the bathroom door is open 2+ minutes, the bedroom speaker's volume tracks the
 # bathroom speaker's (bathroom leads, bedroom follows, never reverse) - only while both
 # are actively playing. While the wake-up window is open (rutines/wakeup_bedroom.yaml
-# wake_window_min) nothing is copied. See bedroom_bathroom_volume_sync.py class docstring.
+# wake_window_min) and someone is still in the bed, the bedroom copies only up to its standard
+# volume. See bedroom_bathroom_volume_sync.py class docstring.
 
 BedroomBathroomVolumeSync:
   module: bedroom_bathroom_volume_sync
@@ -14,5 +15,5 @@ BedroomBathroomVolumeSync:
   bathroom_speaker: media_player.bathroom
   bedroom_speaker: media_player.bedroom
   door_open_debounce_sec: 60
-  # App asked whether the wake-up window is open (its wake_window_open()).
+  # App asked how high the bedroom may go during the wake-up (its wake_volume_cap()).
   wake_app: WakeupBedroom

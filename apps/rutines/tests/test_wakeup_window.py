@@ -1,9 +1,13 @@
-"""wake_window_open(): the one signal other apps read to know the wake-up is playing out.
+"""The wake window and what hangs on it.
 
-Open from the alarm firing for wake_window_min minutes, cut short when the routine is stopped or
-its speakers are no longer one group, and kept across an AppDaemon restart for as long as it has
-left to run. BedroomBathroomVolumeSync asks it and copies no volume while it is open; the timing
-lives here and nowhere else.
+wake_window_open() is open from the alarm firing for wake_window_min minutes, cut short when the
+routine is stopped or its speakers are no longer one group, and kept across an AppDaemon restart
+for as long as it has left to run. The timing lives here and nowhere else.
+
+wake_volume_cap() is what other apps (BedroomBathroomVolumeSync) ask: the speaker in the room with
+the bed is held to its standard volume during the window for as long as the bed is not known to be
+empty, because the cap is for whoever stays in bed. An empty bed - and the bathroom, always - is
+not capped: the volume follows the person who got up. An unreadable bed counts as occupied.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from unittest.mock import MagicMock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lights"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "blinds"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "presence"))
 
 if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     ad = types.ModuleType("appdaemon")
@@ -33,7 +38,12 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     sys.modules["appdaemon.plugins.hass"] = hassmod
     sys.modules["appdaemon.plugins.hass.hassapi"] = hassapi
 
+import room_active_read  # noqa: E402
 import wakeup_bedroom as wb  # noqa: E402
+
+# wakeup_bedroom imports its shared layers defensively, and another test file may have imported it
+# first without apps/presence on the path; the cap needs the real reader.
+wb.room_active_read = room_active_read
 
 try:
     import yaml
@@ -47,6 +57,10 @@ ALARM_TIME = "input_datetime.wakeup_bedroom"
 ALARM_ENABLED = "input_boolean.wakeup_bedroom"
 FIRED = datetime(2026, 10, 21, 7, 40, 0)
 GROUPED = [BEDROOM, BATHROOM]
+LEFT, RIGHT, STRIP = "binary_sensor.left_bedside", "binary_sensor.right_bedside", "binary_sensor.strip_either"
+OCCUPIED = {LEFT: "off", RIGHT: "off", STRIP: "on"}
+EMPTY = {LEFT: "off", RIGHT: "off", STRIP: "off"}
+UNREADABLE = {LEFT: "off", RIGHT: "unknown", STRIP: "off"}
 
 
 def window_app(now=FIRED, *, join=(BATHROOM,), window_min=30, state=None):
@@ -58,10 +72,17 @@ def window_app(now=FIRED, *, join=(BATHROOM,), window_min=30, state=None):
     app.master_player = BEDROOM
     app.join_players = list(join)
     app.volume_entities = [BEDROOM, BATHROOM]
+    app.bed_speaker = BEDROOM
     app.volume_start = 0.06
     app.volume_target = 0.18
     app.standards = {"speaker_volumes": {BEDROOM: 0.14, BATHROOM: 0.18}, "default_volume": 0.12}
-    app.get_app = lambda name: SimpleNamespace(args=app.standards) if name == wb.STANDARD_VOLUME_APP else None
+    app.bed = dict(OCCUPIED)
+    app.volume = {BEDROOM: 0.14, BATHROOM: 0.18}
+    app.zones = {"bedroom": [{"entity": e, "tier": "bed"} for e in (LEFT, RIGHT, STRIP)]}
+    app.get_app = lambda name: (
+        SimpleNamespace(args=app.standards) if name == wb.STANDARD_VOLUME_APP
+        else SimpleNamespace(zones=app.zones) if name == "RoomActive" else None
+    )
     app.wake_window_min = window_min
     app._wake_window_until = None
     app._wake_group_seen = False
@@ -71,8 +92,18 @@ def window_app(now=FIRED, *, join=(BATHROOM,), window_min=30, state=None):
     app.now = now
     app.datetime = lambda: app.now
     app.group_members = GROUPED
-    app.get_state = lambda entity, **kw: (
-        app.group_members if (entity, kw.get("attribute")) == (BEDROOM, "group_members") else None
+
+    def get_state(entity, **kw):
+        if (entity, kw.get("attribute")) == (BEDROOM, "group_members"):
+            return app.group_members
+        if kw.get("attribute") == "all":
+            return {"attributes": {"volume_level": app.volume[entity]}}
+        return app.bed.get(entity)
+
+    app.get_state = get_state
+    app.sets = []
+    app.call_service = lambda service, **kw: (
+        app.sets.append((kw["entity_id"], kw["volume_level"])), app.volume.update({kw["entity_id"]: kw["volume_level"]})
     )
     return app
 
@@ -157,41 +188,163 @@ class TheWindowEndsEarly(unittest.TestCase):
 
 
 class TheCapOtherAppsStayUnder(unittest.TestCase):
-    """wake_volume_cap(): the most an automation may raise a wake speaker to while the window is
-    open - its standard volume - and None the rest of the time."""
+    """wake_volume_cap(entity): the most an automation may set the speaker to right now on account
+    of the wake-up, or None."""
 
     def test_no_cap_without_a_window(self):
-        app = window_app()
+        self.assertIsNone(window_app().wake_volume_cap(BEDROOM))
+
+    def test_the_bedroom_is_held_to_its_standard_while_the_bed_is_occupied(self):
+        app = opened()
+        self.assertEqual(app.wake_volume_cap(BEDROOM), 0.14)
+
+    def test_the_bathroom_is_never_capped(self):
+        app = opened()
+        self.assertIsNone(app.wake_volume_cap(BATHROOM))
+        app.bed = dict(EMPTY)
         self.assertIsNone(app.wake_volume_cap(BATHROOM))
 
-    def test_each_wake_speaker_is_capped_at_its_own_standard_while_the_window_is_open(self):
+    def test_a_bed_that_reads_empty_lifts_the_bedroom_cap_and_an_occupied_one_brings_it_back(self):
         app = opened()
-        self.assertEqual(app.wake_volume_cap(BATHROOM), 0.18)
+        app.bed = dict(EMPTY)
+        self.assertIsNone(app.wake_volume_cap(BEDROOM))
+        app.bed = dict(OCCUPIED)
         self.assertEqual(app.wake_volume_cap(BEDROOM), 0.14)
+
+    def test_an_unreadable_bed_counts_as_occupied(self):
+        app = opened()
+        app.bed = dict(UNREADABLE)
+        self.assertEqual(app.wake_volume_cap(BEDROOM), 0.14)
+
+    def test_any_bed_witness_on_beats_the_rest(self):
+        app = opened()
+        app.bed = {LEFT: "on", RIGHT: "off", STRIP: "off"}
+        self.assertEqual(app.wake_volume_cap(BEDROOM), 0.14)
+
+    def test_a_bed_that_cannot_be_judged_counts_as_occupied(self):
+        app = opened()
+        app.bed = dict(EMPTY)
+        app.zones = {}
+        self.assertEqual(app.wake_volume_cap(BEDROOM), 0.14)
+
+        app = opened()
+        app.bed = dict(EMPTY)
+        standards = app.get_app
+        app.get_app = lambda name: (_ for _ in ()).throw(RuntimeError("registry down")) if name == "RoomActive" else standards(name)
+        self.assertEqual(app.wake_volume_cap(BEDROOM), 0.14)
+
+    def test_a_missing_or_failing_bed_reader_counts_as_occupied(self):
+        class Raising:
+            @staticmethod
+            def bed_occupied(hass):
+                raise RuntimeError("boom")
+
+        for reader in (None, Raising):
+            app = opened()
+            app.bed = dict(EMPTY)
+            original = wb.room_active_read
+            wb.room_active_read = reader
+            self.addCleanup(setattr, wb, "room_active_read", original)
+            self.assertEqual(app.wake_volume_cap(BEDROOM), 0.14)
+            wb.room_active_read = original
 
     def test_the_cap_is_the_standard_not_the_ramp_target(self):
         app = opened()
         app.volume_target = 0.10
-        self.assertEqual(app.wake_volume_cap(BATHROOM), 0.18)
-
-    def test_a_speaker_that_is_not_a_wake_speaker_has_no_cap(self):
-        self.assertIsNone(opened().wake_volume_cap("media_player.kitchen"))
+        self.assertEqual(app.wake_volume_cap(BEDROOM), 0.14)
 
     def test_the_cap_ends_with_the_window(self):
         app = opened()
         app.now = FIRED + timedelta(minutes=30)
-        self.assertIsNone(app.wake_volume_cap(BATHROOM))
+        self.assertIsNone(app.wake_volume_cap(BEDROOM))
         app = opened()
         for name in ("_stop_media", "_resume_adaptive_brightness", "_stop_light_ramp", "_cleanup_listeners"):
             setattr(app, name, MagicMock())
         app._stop_all("Alarm toggle turned off")
-        self.assertIsNone(app.wake_volume_cap(BATHROOM))
+        self.assertIsNone(app.wake_volume_cap(BEDROOM))
+
+    def test_a_speaker_that_is_not_the_bed_speaker_has_no_cap(self):
+        self.assertIsNone(opened().wake_volume_cap("media_player.kitchen"))
 
     def test_unreadable_standards_cap_at_the_most_conservative_level_with_a_warning(self):
         app = opened()
-        app.get_app = lambda name: None
-        self.assertEqual(app.wake_volume_cap(BATHROOM), 0.06)
-        self.assertTrue(any(level == "WARNING" and BATHROOM in msg for level, msg in app.logged))
+        standards_down = app.get_app
+
+        def get_app(name):
+            return None if name == wb.STANDARD_VOLUME_APP else standards_down(name)
+
+        app.get_app = get_app
+        self.assertEqual(app.wake_volume_cap(BEDROOM), 0.06)
+        self.assertTrue(any(level == "WARNING" and BEDROOM in msg for level, msg in app.logged))
+
+
+class TheBedGuardBringsTheBedSpeakerBack(unittest.TestCase):
+    """The volume follows a person once the bed reads empty, so the bed speaker can end up past
+    its standard. When the bed reads occupied again inside the window the guard (once a minute)
+    puts it back - and only then: it never touches the speaker otherwise."""
+
+    def guard(self, app, bed, volume=None):
+        app.bed = dict(bed)
+        if volume is not None:
+            app.volume[BEDROOM] = volume
+        app.now += timedelta(seconds=60)
+        app._bed_guard(None)
+
+    def setUp(self):
+        self.app = opened()
+        self.app._bed_was_empty = False
+
+    def test_an_empty_bed_that_fills_again_brings_a_followed_up_speaker_back_to_the_standard(self):
+        self.guard(self.app, EMPTY, volume=0.24)
+        self.assertEqual(self.app.sets, [])
+        self.guard(self.app, OCCUPIED)
+        self.assertEqual(self.app.sets, [(BEDROOM, 0.14)])
+        self.assertTrue(any("Bed occupied again" in msg for _, msg in self.app.logged))
+
+    def test_an_unreadable_bed_after_an_empty_one_counts_as_occupied_again(self):
+        self.guard(self.app, EMPTY, volume=0.24)
+        self.guard(self.app, UNREADABLE)
+        self.assertEqual(self.app.sets, [(BEDROOM, 0.14)])
+
+    def test_a_bed_that_stays_occupied_is_left_alone_whatever_the_volume(self):
+        for _ in range(3):
+            self.guard(self.app, OCCUPIED, volume=0.24)
+        self.assertEqual(self.app.sets, [])
+
+    def test_a_bed_that_stays_empty_is_left_alone(self):
+        for _ in range(3):
+            self.guard(self.app, EMPTY, volume=0.24)
+        self.assertEqual(self.app.sets, [])
+
+    def test_a_speaker_already_at_its_standard_is_not_touched(self):
+        self.guard(self.app, EMPTY, volume=0.14)
+        self.guard(self.app, OCCUPIED)
+        self.assertEqual(self.app.sets, [])
+
+    def test_only_the_edge_acts_so_a_hand_on_the_volume_afterwards_stands(self):
+        self.guard(self.app, EMPTY, volume=0.24)
+        self.guard(self.app, OCCUPIED)
+        self.guard(self.app, OCCUPIED, volume=0.20)
+        self.assertEqual(self.app.sets, [(BEDROOM, 0.14)])
+
+    def test_every_new_occupied_edge_acts(self):
+        self.guard(self.app, EMPTY, volume=0.24)
+        self.guard(self.app, OCCUPIED)
+        self.guard(self.app, EMPTY, volume=0.24)
+        self.guard(self.app, OCCUPIED)
+        self.assertEqual(self.app.sets, [(BEDROOM, 0.14), (BEDROOM, 0.14)])
+
+    def test_nothing_happens_outside_the_window(self):
+        self.guard(self.app, EMPTY, volume=0.24)
+        self.app.now = FIRED + timedelta(minutes=31)
+        self.guard(self.app, OCCUPIED)
+        self.assertEqual(self.app.sets, [])
+        self.assertFalse(self.app._bed_was_empty)
+
+    def test_a_failure_never_escapes(self):
+        self.app.wake_volume_cap = lambda entity: (_ for _ in ()).throw(RuntimeError("boom"))
+        self.app._bed_guard(None)
+        self.assertTrue(any(level == "WARNING" and "Bed guard" in msg for level, msg in self.app.logged))
 
 
 def fire_app(now=FIRED):
@@ -250,10 +403,12 @@ class TheAlarmOpensIt(unittest.TestCase):
 class InitializeKeepsAndExtendsIt(unittest.TestCase):
     """Runs the real initialize() against the repo's own wakeup_bedroom.yaml."""
 
-    def initialized(self, now, state=None, **arg_overrides):
+    def initialized(self, now, state=None, drop=(), **arg_overrides):
         with open(APPS / "rutines/wakeup_bedroom.yaml") as f:
             args = next(iter(yaml.safe_load(f).values()))
         args.update(arg_overrides)
+        for key in drop:
+            del args[key]
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         args["state_file"] = str(Path(tmp.name) / "wakeup_bedroom_state.json")
@@ -287,6 +442,28 @@ class InitializeKeepsAndExtendsIt(unittest.TestCase):
     def test_nothing_unreadable_in_the_state_file_opens_it(self):
         for state in (None, {}, {"wake_window_until": None}, {"wake_window_until": "soon"}):
             self.assertFalse(self.initialized(FIRED, state).wake_window_open(), state)
+
+    def test_the_bed_speaker_comes_from_the_yaml_and_defaults_to_the_master(self):
+        self.assertEqual(self.initialized(FIRED).bed_speaker, BEDROOM)
+        self.assertEqual(self.initialized(FIRED, drop=("bed_speaker",)).bed_speaker, BEDROOM)
+        self.assertEqual(self.initialized(FIRED, bed_speaker="media_player.other").bed_speaker, "media_player.other")
+
+    def test_a_missing_bed_reader_is_said_out_loud_at_start(self):
+        original = wb.room_active_read
+        self.addCleanup(setattr, wb, "room_active_read", original)
+        wb.room_active_read = None
+        app = self.initialized(FIRED)
+        warned = [c for c in app.log.call_args_list if "room_active_read" in str(c) and "WARNING" in str(c)]
+        self.assertEqual(len(warned), 1)
+        wb.room_active_read = original
+        app = self.initialized(FIRED)
+        self.assertFalse([c for c in app.log.call_args_list if "room_active_read" in str(c)])
+
+    def test_the_bed_guard_is_scheduled_once_a_minute(self):
+        app = self.initialized(FIRED)
+        guards = [c for c in app.run_every.call_args_list if c.args[0] == app._bed_guard]
+        self.assertEqual(len(guards), 1)
+        self.assertEqual(guards[0].args[2], 60)
 
     def test_the_wake_group_is_ramped_even_if_volume_entities_forgets_it(self):
         self.assertEqual(self.initialized(FIRED).volume_entities, [BEDROOM, BATHROOM])

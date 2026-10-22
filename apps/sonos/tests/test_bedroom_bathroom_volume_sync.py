@@ -51,7 +51,6 @@ def make_app(
     app.door_open_debounce_sec = DEBOUNCE_SEC
     app._sync_active = sync_active
     app._sync_arm_timer = sync_arm_timer
-    app._wake_hold_logged = False
 
     app.states = {
         (DOOR, None): door,
@@ -209,99 +208,126 @@ class RestartSafety(unittest.TestCase):
         self.assertIsNone(app._sync_arm_timer)
 
 
-def wake_app(window_open):
-    """get_app() for a house where the wake routine answers wake_window_open()."""
-    return lambda name: SimpleNamespace(wake_window_open=lambda: window_open) if name == "WakeupBedroom" else None
+def wake_app(cap):
+    """get_app() for a wake routine whose wake_volume_cap answers `cap` for the bedroom speaker
+    (None: no wake-up, or the bed reads empty)."""
+    asked = []
+
+    def wake_volume_cap(entity):
+        asked.append(entity)
+        return cap
+
+    def get_app(name):
+        return SimpleNamespace(wake_volume_cap=wake_volume_cap) if name == "WakeupBedroom" else None
+
+    get_app.asked = asked
+    return get_app
 
 
-def wake_make_app(get_app, **kw):
-    """An active sync that WOULD copy the bathroom's 0.24 into the bedroom, asked to hold off by
-    the wake routine's window (or not)."""
-    app = make_app(sync_active=True, bathroom_volume=0.24, bedroom_volume=0.12, **kw)
+def wake_make_app(get_app, *, bathroom=0.24, bedroom=0.12, **kw):
+    """An active sync with the bathroom louder than the bedroom, asking the wake routine."""
+    app = make_app(sync_active=True, bathroom_volume=bathroom, bedroom_volume=bedroom, **kw)
     app.wake_app = "WakeupBedroom"
+    app.bedroom_speaker = BEDROOM
     app.get_app = get_app
     app.log = MagicMock()
     return app
 
 
-class WakeWindowHoldsTheSync(unittest.TestCase):
-    """While the wake-up window is open the wake ramp owns both speakers' volume: the sync copies
-    nothing into either, whatever triggers it."""
-
-    def setUp(self):
-        self.app = wake_make_app(wake_app(True))
-
-    def test_a_bathroom_volume_change_copies_nothing(self):
-        self.app._on_bathroom_volume_change(BATHROOM, "volume_level", 0.18, 0.24, {})
-        self.app.call_service.assert_not_called()
-
-    def test_a_speaker_state_change_copies_nothing(self):
-        self.app._on_speaker_state_change(BATHROOM, "state", "idle", "playing", {})
-        self.app.call_service.assert_not_called()
-
-    def test_the_door_arming_timer_activates_the_sync_but_copies_nothing(self):
-        self.app._sync_active = False
-        self.app.states[(DOOR, None)] = "on"
-        self.app._sync_timer_fire({})
-        self.assertTrue(self.app._sync_active)
-        self.app.call_service.assert_not_called()
-
-    def test_the_hold_is_logged_once_per_window_not_once_per_event(self):
-        for _ in range(3):
-            self.app._maybe_sync("bathroom_volume_change")
-        held = [c for c in self.app.log.call_args_list if "volume_sync_held" in str(c)]
-        self.assertEqual(len(held), 1)
+def written(app):
+    return [c.kwargs["volume_level"] for c in app.call_service.call_args_list]
 
 
-class SyncBehavesAsBeforeOutsideTheWindow(unittest.TestCase):
-    def test_a_closed_window_copies_as_always(self):
-        app = wake_make_app(wake_app(False))
+class WakeCapLimitsTheCopy(unittest.TestCase):
+    """While the wake-up plays out with someone still in the bed, the bedroom copies the bathroom
+    only up to the cap the wake routine names - whatever triggers the copy."""
+
+    def test_a_louder_bathroom_is_copied_only_up_to_the_cap(self):
+        app = wake_make_app(wake_app(0.14))
         app._on_bathroom_volume_change(BATHROOM, "volume_level", 0.18, 0.24, {})
-        app.call_service.assert_called_once_with(
-            "media_player/volume_set", entity_id=BEDROOM, volume_level=0.24
-        )
+        self.assertEqual(written(app), [0.14])
 
-    def test_nothing_is_caught_up_when_the_window_closes_and_the_next_event_copies(self):
-        window = {"open": True}
-        app = wake_make_app(lambda name: SimpleNamespace(wake_window_open=lambda: window["open"]))
+    def test_every_trigger_is_capped(self):
+        for trigger in (
+            lambda app: app._on_speaker_state_change(BATHROOM, "state", "idle", "playing", {}),
+            lambda app: app._maybe_sync("anything"),
+        ):
+            app = wake_make_app(wake_app(0.14), bathroom=0.43)
+            trigger(app)
+            self.assertEqual(written(app), [0.14])
+
+    def test_the_door_arming_timer_copies_only_up_to_the_cap(self):
+        app = wake_make_app(wake_app(0.14), bathroom=0.34)
+        app._sync_active = False
+        app.states[(DOOR, None)] = "on"
+        app._sync_timer_fire({})
+        self.assertTrue(app._sync_active)
+        self.assertEqual(written(app), [0.14])
+
+    def test_a_bathroom_below_the_cap_is_copied_as_always(self):
+        app = wake_make_app(wake_app(0.14), bathroom=0.09, bedroom=0.14)
+        app._maybe_sync("bathroom_volume_change")
+        self.assertEqual(written(app), [0.09])
+
+    def test_a_bedroom_already_at_the_cap_is_not_written_again(self):
+        app = wake_make_app(wake_app(0.14), bathroom=0.34, bedroom=0.14)
         app._maybe_sync("bathroom_volume_change")
         app.call_service.assert_not_called()
-        window["open"] = False
-        app.call_service.assert_not_called()
-        app._maybe_sync("bathroom_volume_change")
-        app.call_service.assert_called_once_with(
-            "media_player/volume_set", entity_id=BEDROOM, volume_level=0.24
-        )
 
-    def test_the_hold_log_comes_again_for_the_next_window(self):
-        window = {"open": True}
-        app = wake_make_app(lambda name: SimpleNamespace(wake_window_open=lambda: window["open"]))
+    def test_a_bedroom_found_above_the_cap_is_brought_down_to_it(self):
+        app = wake_make_app(wake_app(0.14), bathroom=0.34, bedroom=0.24)
+        app._maybe_sync("bathroom_volume_change")
+        self.assertEqual(written(app), [0.14])
+
+    def test_the_wake_routine_is_asked_about_the_bedroom_speaker(self):
+        get_app = wake_app(0.14)
+        wake_make_app(get_app)._maybe_sync("x")
+        self.assertEqual(get_app.asked, [BEDROOM])
+
+    def test_the_log_says_the_copy_was_capped(self):
+        app = wake_make_app(wake_app(0.14))
+        app._maybe_sync("bathroom_volume_change")
+        logged = [str(c) for c in app.log.call_args_list]
+        self.assertTrue(any("volume_sync_apply" in line and "capped at the wake standard 0.14" in line for line in logged))
+
+
+class SyncBehavesAsBeforeWithoutACap(unittest.TestCase):
+    """No cap means no wake-up in progress, or the bed reads empty (the volume follows the person),
+    or the wake routine cannot be asked."""
+
+    def test_no_cap_copies_the_bathroom_in_full(self):
+        app = wake_make_app(wake_app(None))
+        app._on_bathroom_volume_change(BATHROOM, "volume_level", 0.18, 0.24, {})
+        self.assertEqual(written(app), [0.24])
+        logged = [str(c) for c in app.log.call_args_list]
+        self.assertFalse(any("capped" in line for line in logged))
+
+    def test_the_bed_going_empty_lets_the_next_copy_through(self):
+        cap = {"v": 0.14}
+        app = wake_make_app(lambda name: SimpleNamespace(wake_volume_cap=lambda entity: cap["v"]))
         app._maybe_sync("a")
-        window["open"] = False
+        self.assertEqual(written(app), [0.14])
+        cap["v"] = None
         app._maybe_sync("b")
-        window["open"] = True
-        app._maybe_sync("c")
-        held = [c for c in app.log.call_args_list if "volume_sync_held" in str(c)]
-        self.assertEqual(len(held), 2)
+        self.assertEqual(written(app), [0.14, 0.24])
 
-    def test_a_wake_routine_that_cannot_be_asked_means_no_window(self):
+    def test_a_wake_routine_that_cannot_be_asked_changes_nothing(self):
         def broken(name):
             raise RuntimeError("app registry unavailable")
 
         for get_app in (lambda name: None, broken, lambda name: SimpleNamespace()):
             app = wake_make_app(get_app)
             app._maybe_sync("bathroom_volume_change")
-            app.call_service.assert_called_once_with(
-                "media_player/volume_set", entity_id=BEDROOM, volume_level=0.24
-            )
+            self.assertEqual(written(app), [0.24])
 
-    def test_a_wake_routine_whose_answer_raises_means_no_window(self):
-        def raising():
+    def test_a_wake_routine_whose_answer_raises_or_is_not_a_number_changes_nothing(self):
+        def raising(entity):
             raise RuntimeError("mid reload")
 
-        app = wake_make_app(lambda name: SimpleNamespace(wake_window_open=raising))
-        app._maybe_sync("bathroom_volume_change")
-        app.call_service.assert_called_once()
+        for answer in (raising, lambda entity: "loud"):
+            app = wake_make_app(lambda name, answer=answer: SimpleNamespace(wake_volume_cap=answer))
+            app._maybe_sync("bathroom_volume_change")
+            self.assertEqual(written(app), [0.24])
 
     def test_the_wake_app_name_is_configurable_and_defaults_to_the_routine(self):
         self.assertEqual(make_full_app().wake_app, "WakeupBedroom")
