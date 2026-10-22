@@ -45,6 +45,13 @@ class ApplianceEventTests(unittest.TestCase):
     def test_emptied(self):
         self.assertEqual(house_events.appliance_event("Dishwasher", "Unemptied", "Emptied", {}), ("emptied", "Dishwasher emptied"))
 
+    def test_opening_the_door_after_a_drum_clean_is_not_an_emptying(self):
+        self.assertIsNone(
+            house_events.appliance_event("Washer", "Unemptied", "Emptied", {"detected_programme": "drum_clean"})
+        )
+        kind, _ = house_events.appliance_event("Washer", "Unemptied", "Emptied", {"detected_programme": "bomuld"})
+        self.assertEqual(kind, "emptied")
+
 
 class ApplianceActorTests(unittest.TestCase):
     def test_reliable_method_names_the_resident(self):

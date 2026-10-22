@@ -102,6 +102,9 @@ def appliance_event(name, old, new, attrs):
             energy_txt = ""
         return "finished", f"{name} finished{energy_txt}"
     if new == "Emptied":
+        # A drum clean runs with an empty drum: opening the door airs it, nothing is emptied.
+        if attrs.get("detected_programme") == "drum_clean":
+            return None
         return "emptied", f"{name} emptied"
     return None
 
