@@ -363,7 +363,7 @@ class StartAnchoredFromHistory(unittest.TestCase):
             self.assertEqual((published(app)["started_by"], published(app)["started_by_method"]), ("", "unknown"))
             self.assertFalse(self._history_anchor_logged(app))
 
-    def test_a_close_in_memory_never_asks_the_recorder(self):
+    def test_without_timer_evidence_the_close_in_memory_is_the_anchor(self):
         with tempfile.TemporaryDirectory() as tmp:
             app, clock, actor = self._booted(tmp, loading_close(self.CLOSE))
             close_at = T0 - timedelta(minutes=5)
@@ -371,7 +371,32 @@ class StartAnchoredFromHistory(unittest.TestCase):
             load_and_start(app, clock, close_at=close_at)
 
             self.assertEqual(actor.calls, [("dishwasher_start", close_at, None)])
-            self.assertNotIn(DOOR_SENSOR, app.history_asked)
+
+    def test_the_close_that_set_the_timer_is_the_anchor_not_a_later_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            idle_close = T0 - timedelta(hours=6)
+            timer_close = T0 - timedelta(hours=5)
+            later_close = T0 - timedelta(hours=4)
+            doors = [
+                {"state": "on", "last_changed": cs.format_utc(idle_close - timedelta(minutes=2))},
+                {"state": "off", "last_changed": cs.format_utc(idle_close)},
+                {"state": "on", "last_changed": cs.format_utc(timer_close - timedelta(minutes=10))},
+                {"state": "off", "last_changed": cs.format_utc(timer_close)},
+                {"state": "on", "last_changed": cs.format_utc(later_close - timedelta(seconds=20))},
+                {"state": "off", "last_changed": cs.format_utc(later_close)},
+            ]
+            app, clock, actor = self._booted(tmp, doors)
+            app._history[POWER_SENSOR] = [
+                {"state": "0.02", "last_changed": cs.format_utc(idle_close - timedelta(hours=1))},
+                {"state": "0.8", "last_changed": cs.format_utc(timer_close - timedelta(minutes=10))},
+                {"state": "0.07", "last_changed": cs.format_utc(timer_close + timedelta(minutes=1))},
+                {"state": "0.9", "last_changed": cs.format_utc(later_close - timedelta(seconds=20))},
+                {"state": "0.07", "last_changed": cs.format_utc(later_close + timedelta(minutes=1))},
+            ]
+
+            load_and_start(app, clock, close_at=later_close)
+
+            self.assertEqual(actor.calls, [("dishwasher_start", timer_close, None)])
 
     def test_a_failing_lookup_falls_back_to_the_power_edge(self):
         with tempfile.TemporaryDirectory() as tmp:

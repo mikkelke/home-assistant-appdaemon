@@ -121,3 +121,41 @@ class Timestamps(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def pw(*rows):
+    return [(NOW - timedelta(**ago), w) for ago, w in rows]
+
+
+class TimerSetClose(unittest.TestCase):
+    """22.10 shape: idle until the loading session, timer set at the first close after it, glasses
+    added later; the later closes must not win."""
+
+    DOORS = [
+        st("on", at(hours=8)), st("off", at(hours=7, minutes=50)),
+        st("on", at(hours=5, minutes=40)), st("off", at(hours=5)),
+        st("on", at(hours=4, minutes=55)), st("off", at(hours=4, minutes=54)),
+        st("on", at(hours=4)), st("off", at(hours=3, minutes=59)),
+    ]
+
+    def test_first_close_after_the_last_idle_one_set_the_timer(self):
+        power = pw(({"hours": 9}, 0.02), ({"hours": 5, "minutes": 40}, 0.8), ({"hours": 5, "minutes": 1}, 0.07),
+                   ({"hours": 4}, 0.9), ({"hours": 3, "minutes": 58}, 0.07))
+        self.assertEqual(door_history.timer_set_close(self.DOORS, power, NOW, MAX_AGE_S, 0.04), NOW - timedelta(hours=5))
+
+    def test_an_immediate_start_is_its_own_last_close(self):
+        doors = [st("on", at(hours=3)), st("off", at(hours=2)), st("on", at(minutes=12)), st("off", at(minutes=8))]
+        power = pw(({"hours": 4}, 0.02), ({"minutes": 12}, 0.9), ({"minutes": 3}, 1800.0))
+        self.assertEqual(door_history.timer_set_close(doors, power, NOW, MAX_AGE_S, 0.04), NOW - timedelta(minutes=8))
+
+    def test_no_idle_baseline_gives_none(self):
+        power = pw(({"hours": 9}, 0.07))
+        self.assertIsNone(door_history.timer_set_close(self.DOORS, power, NOW, MAX_AGE_S, 0.04))
+
+    def test_no_close_after_the_last_idle_one_gives_none(self):
+        doors = [st("on", at(hours=3)), st("off", at(hours=2))]
+        power = pw(({"hours": 4}, 0.02))
+        self.assertIsNone(door_history.timer_set_close(doors, power, NOW, MAX_AGE_S, 0.04))
+
+    def test_no_power_history_gives_none(self):
+        self.assertIsNone(door_history.timer_set_close(self.DOORS, [], NOW, MAX_AGE_S, 0.04))

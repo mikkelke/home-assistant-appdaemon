@@ -100,6 +100,8 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
     # The start is anchored on the door close that loaded the machine, which can precede the power
     # edge by hours on a delayed start; a close older than this is not trusted.
     LOAD_ANCHOR_MAX_AGE_S = 12 * 3600
+    # Closed-door standby: below this the machine idles; a running delay countdown draws more.
+    TIMER_IDLE_BELOW_W = 0.04
 
     def _safe_cancel_timer(self, handle):
         """Cancel a timer only if still running (avoids invalid-handle warnings)."""
@@ -3631,10 +3633,16 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         return self._cycle_actor_from_state_attrs(source)
 
     def _load_anchor(self, now):
-        """When this cycle was loaded: the last door close when it is at most LOAD_ANCHOR_MAX_AGE_S
-        old. With no close in memory (e.g. a restart while the machine sat Off) the recorder's last
-        real one stands in; with none, `now`. The close in memory is not consumed: start_time is
-        clamped to it and it is stored with the cycle until the cycle's end clears it."""
+        """When this cycle was started: the door close that set the delay timer, read from the
+        recorder's door and standby power history. Without that evidence, the last door close when
+        it is at most LOAD_ANCHOR_MAX_AGE_S old; with no close in memory (e.g. a restart while the
+        machine sat Off) the recorder's last real one stands in; with none, `now`. The close in
+        memory is not consumed: start_time is clamped to it and it is stored with the cycle until
+        the cycle's end clears it."""
+        timer_close = self._timer_close_from_history(now)
+        if timer_close is not None:
+            self.log(f"Start attributed at the close that set the timer: {self._format_local(timer_close)}", level="INFO")
+            return timer_close
         loaded_at = self.last_door_closed_at
         close_from_history = loaded_at is None
         if close_from_history:
@@ -3647,6 +3655,27 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                 )
             return loaded_at
         return now
+
+    def _timer_close_from_history(self, now):
+        """door_history.timer_set_close over the last LOAD_ANCHOR_MAX_AGE_S; None when it finds
+        none or the lookup fails."""
+        try:
+            start = now - timedelta(seconds=self.LOAD_ANCHOR_MAX_AGE_S)
+            doors = self._flatten_history(
+                self.get_history(entity_id=self.door_sensor, start_time=start, end_time=now), self.door_sensor
+            )
+            power = whist.parse_power_points(
+                self._flatten_history(
+                    self.get_history(entity_id=self.power_sensor, start_time=start, end_time=now), self.power_sensor
+                )
+            )
+            power.sort(key=lambda x: x[0])
+            return door_history.timer_set_close(
+                doors, power, now, self.LOAD_ANCHOR_MAX_AGE_S, idle_below_w=self.TIMER_IDLE_BELOW_W
+            )
+        except Exception as e:
+            self.log(f"Timer-close history lookup failed: {e}", level="DEBUG")
+            return None
 
     def _door_close_from_history(self, now):
         """The door's last real close within LOAD_ANCHOR_MAX_AGE_S before `now`, from the recorder.
