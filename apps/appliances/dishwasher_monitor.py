@@ -3676,7 +3676,10 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         TIMER_WINDOW_S look like a countdown, gone once they idle again (and what was picked for it with
         it) or the machine leaves Off. An open door or an awake display changes nothing: people add a
         glass while the timer runs. Also republishes what an HA or AppDaemon restart left wrong."""
-        published_on = self.get_state(self.TIMER_ENTITY) == "on"
+        published = self.get_state(self.TIMER_ENTITY)
+        if published is None and self._timer_since is None:
+            self._publish_timer("no timer seen")
+        published_on = published == "on"
         if self.state != "Off":
             if self._timer_since is not None or published_on:
                 self._timer_since = None

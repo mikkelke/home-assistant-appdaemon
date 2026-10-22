@@ -231,9 +231,10 @@ class IdleAndCancel(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             clock = attribution.Clock(datetime.fromisoformat(segment["base"]))
             app = make_app(tmp, clock, door="on")
+            self.assertEqual(timer(app), "off")
             states = []
             replay(app, clock, segment, on_event=lambda at: states.append(timer(app)))
-            self.assertNotIn("on", states)
+            self.assertEqual(set(states), {"off"})
 
     def test_a_cancelled_timer_goes_and_takes_the_pick_with_it(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -264,7 +265,7 @@ class SelectorsAroundAnUntimedRun(unittest.TestCase):
             app = make_app(tmp, clock, programme="ECO", short="Yes")
             attribution.load_and_start(app, clock, close_at=T0)
             self.assertEqual((app.entities[SELECTOR]["state"], app.entities[SHORT]["state"]), ("—", "—"))
-            self.assertIsNone(timer(app))
+            self.assertEqual(timer(app), "off")
 
     def test_emptying_resets_a_pick_made_after_the_last_run(self):
         with tempfile.TemporaryDirectory() as tmp:
