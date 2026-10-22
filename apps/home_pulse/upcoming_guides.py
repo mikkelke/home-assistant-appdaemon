@@ -21,7 +21,7 @@ class Guide(NamedTuple):
 GUIDES = {
     "dishwasher:hygiene": Guide(
         steps=(
-            "Pick the Intensive 75 C programme on the dishwasher and start it.",
+            "Run the Intensive 75 C programme with a normal load of dishes. Heavily soiled pots and pans are ideal for it.",
             "It cleans the wash cabinet and stops germs and odour. Miele says to run it about once a month.",
             "Pick Intensive on the dishwasher card in the dashboard, during the run or after it, so the run is logged.",
         ),

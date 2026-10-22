@@ -95,6 +95,13 @@ class StepContentTests(unittest.TestCase):
         self.assertIn("intensive 75", text)
         self.assertIn("dishwasher card", text)
 
+    def test_the_hygiene_run_is_a_normal_wash_with_a_normal_load_and_is_never_run_empty(self):
+        steps = guides.GUIDES["dishwasher:hygiene"].steps
+        self.assertIn("normal load", steps[0].lower())
+        self.assertIn("pots and pans", steps[0].lower())
+        self.assertNotIn("empty", self.steps("dishwasher:hygiene"))
+        self.assertIn("once a month", steps[1])
+
     def test_the_filters_come_out_before_they_are_rinsed_and_go_back_with_the_arm(self):
         steps = guides.GUIDES["dishwasher:filters"].steps
         order = [next(i for i, step in enumerate(steps) if word in step.lower())
