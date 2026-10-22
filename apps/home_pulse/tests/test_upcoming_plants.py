@@ -14,6 +14,7 @@ import upcoming_maint as maint  # noqa: E402
 import upcoming_plants as plants  # noqa: E402
 
 T0 = datetime(2026, 10, 14, 8, 0, tzinfo=timezone.utc)
+MIN = timedelta(minutes=1)
 HOUR = timedelta(hours=1)
 DAY = timedelta(days=1)
 ENTITY = "sensor.strelitzia_moisture"
@@ -624,6 +625,173 @@ class CalendarRowTests(unittest.TestCase):
         found = maint.digest([(row["title"], key)], {})
         self.assertEqual((found["message"], found["keys"]), ("Water the Monstera: 1 L", [key]))
         self.assertIsNone(maint.digest([(row["title"], key)], {key: core.utc_iso(self.NOW + 11 * DAY)}))
+
+
+class RiseTests(unittest.TestCase):
+    """A watering is a rise of ten points or more within half an hour that has stopped climbing for fifteen
+    minutes."""
+
+    T = datetime(2026, 10, 21, 14, 0, tzinfo=timezone.utc)
+
+    def feed(self, readings, until):
+        """Looks at the soil every minute up to minute `until`: the reading where `readings` (minute, value)
+        has one, else the last one again, as a sensor that has not changed. Returns ([(minute, event)], state)."""
+        steps, st, found, value = dict(readings), None, [], None
+        for minute in range(until + 1):
+            value = steps.get(minute, value)
+            st, event = plants.step_rise(st, value, self.T + minute * MIN)
+            if event:
+                found.append((minute, event))
+        return found, st
+
+    def test_a_rise_that_has_stopped_climbing_is_one_watering_told_with_its_lowest_and_highest_reading(self):
+        found, _ = self.feed([(0, 15), (5, 28), (10, 40), (15, 42)], until=60)
+        self.assertEqual(found, [(30, {"at": core.utc_iso(self.T + 5 * MIN), "low": 15, "peak": 42})])
+
+    def test_it_is_told_only_when_fifteen_minutes_have_passed_without_a_higher_reading(self):
+        found, _ = self.feed([(0, 15), (5, 28), (10, 40), (15, 42)], until=29)
+        self.assertEqual(found, [])
+        found, _ = self.feed([(0, 15), (5, 28), (10, 40), (15, 42), (20, 43)], until=34)
+        self.assertEqual(found, [])
+        found, _ = self.feed([(0, 15), (5, 28), (10, 40), (15, 42), (20, 43)], until=35)
+        self.assertEqual([minute for minute, _ in found], [35])
+        self.assertEqual(found[0][1]["peak"], 43)
+
+    def test_less_than_ten_points_or_a_climb_slower_than_the_window_is_no_watering(self):
+        self.assertEqual(self.feed([(0, 15), (5, 24)], until=60)[0], [])
+        self.assertEqual(self.feed([(0, 15), (20, 20), (40, 25), (60, 30)], until=120)[0], [])
+        self.assertEqual(self.feed([(0, 15), (5, 25)], until=60)[0][0][1]["peak"], 25)
+        self.assertEqual(self.feed([(0, 25), (5, 15)], until=60)[0], [])
+
+    def test_a_reading_that_never_changes_or_a_sensor_that_drops_out_changes_nothing(self):
+        self.assertEqual(self.feed([(0, 15)], until=120)[0], [])
+        found, _ = self.feed([(0, 15), (5, 30), (10, None), (15, None)], until=60)
+        self.assertEqual([event["peak"] for _, event in found], [30])
+
+    def test_a_watering_is_told_once_and_the_next_one_later_is_another(self):
+        readings = [(0, 15), (5, 40), (60, 30), (65, 20), (120, 12), (125, 35)]
+        found, _ = self.feed(readings, until=180)
+        self.assertEqual([(minute, event["low"], event["peak"]) for minute, event in found],
+                         [(20, 15, 40), (140, 12, 35)])
+
+    def test_the_state_given_is_never_changed_in_place(self):
+        st, _ = plants.step_rise(None, 15, self.T)
+        before = {"recent": [list(each) for each in st["recent"]], "rise": st["rise"]}
+        plants.step_rise(st, 40, self.T + 5 * MIN)
+        self.assertEqual(st, before)
+
+    def test_a_moisture_history_gives_its_waterings_oldest_first(self):
+        series = [(self.T + minute * MIN, value) for minute, value in (
+            (0, 15), (5, 28), (10, 41), (15, 42), (200, 30), (400, 12), (405, 12), (410, 35), (415, 36))]
+        found = plants.rises(series, self.T + 600 * MIN)
+        self.assertEqual([(event["at"], event["low"], event["peak"]) for event in found], [
+            (core.utc_iso(self.T + 5 * MIN), 15, 42), (core.utc_iso(self.T + 410 * MIN), 12, 36)])
+        self.assertEqual(plants.rises(series[:3], self.T + 11 * MIN), [])
+        self.assertEqual(plants.rises([], self.T), [])
+
+    def test_the_saved_times_are_kept_for_the_sensor_plants_that_are_listed_and_parse(self):
+        raw = {"strelitzia": "2026-10-21T14:05:00+00:00", "gone": "2026-10-21T14:05:00+00:00", "ivy": "soon",
+               "pothos": None}
+        self.assertEqual(plants.valid_watered(raw, plants.parse_plants([
+            RAW[0], {"moisture": "sensor.ivy_moisture", "name": "Ivy", "dry": 20},
+            {"moisture": "sensor.pothos_moisture", "name": "Pothos", "dry": 15}])),
+            {"strelitzia": "2026-10-21T14:05:00+00:00"})
+        for bad in (None, [], "x", 5):
+            self.assertEqual(plants.valid_watered(bad, {ENTITY: PLANT}), {})
+
+
+class OverviewTests(unittest.TestCase):
+    """The row that lists every plant: 17:00 on 22.10.2026 in the house."""
+
+    NOW = datetime(2026, 10, 22, 15, 0, tzinfo=timezone.utc)
+    SEEDED = datetime(2026, 10, 20, 20, 0, tzinfo=timezone.utc)
+
+    @staticmethod
+    def timed(name, days):
+        return plants.parse_timed([{"name": name, "every_days": days}])[plants.slug(name)]
+
+    def anchor(self, **extra):
+        return {"at": core.utc_iso(self.SEEDED), "seed": True, **extra}
+
+    def sensor(self, value=31, dry=False, watered="2026-10-21T10:00:00+00:00", plant=PLANT):
+        return {"plant": plant, "value": value, "dry": dry, "watered": watered}
+
+    def row(self, sensor=(), timed=(), now=None):
+        return plants.overview_row(list(sensor), list(timed), now or self.NOW)
+
+    def test_each_plant_is_a_line_with_its_due_day_or_its_soil_and_when_it_was_last_watered(self):
+        row = self.row([self.sensor()], [(self.timed("Peace lily kitchen", 7), self.anchor()),
+                                         (self.timed("Aloe", 35), self.anchor())])
+        self.assertEqual(row["items"], ["Peace lily kitchen: 27.10, watered 20.10", "Aloe: 24.11, watered 20.10",
+                                        "Strelitzia: soil 31%, at 15%, watered 21.10"])
+        self.assertEqual((row["id"], row["kind"], row["icon"], row["audience"]),
+                         ("maint:plants", "maint", "mdi:sprout", "admin"))
+        self.assertNotIn("done", row)
+        self.assertNotIn("area", row)
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_the_title_gives_the_next_day_and_the_row_sits_at_nine_that_morning(self):
+        row = self.row([self.sensor()], [(self.timed("Aloe", 35), self.anchor()),
+                                         (self.timed("Peace lily kitchen", 7), self.anchor())])
+        self.assertEqual((row["title"], row["detail"], row["at"]),
+                         ("Plants: next 27.10", "3 plants", "2026-10-27T08:00:00+00:00"))
+
+    def test_when_something_is_due_the_title_names_it_and_the_row_has_no_time(self):
+        late = datetime(2026, 10, 28, 15, 0, tzinfo=timezone.utc)
+        timed = [(self.timed("Peace lily kitchen", 7), self.anchor()), (self.timed("Aloe", 35), self.anchor())]
+        row = self.row(timed=timed, now=late)
+        self.assertEqual((row["title"], row["detail"]), ("Plants: Peace lily kitchen due", "2 plants, 1 due"))
+        self.assertNotIn("at", row)
+        self.assertEqual(row["items"][0], "Peace lily kitchen: due 27.10, watered 20.10")
+        today = self.row(timed=[(self.timed("Peace lily kitchen", 7), self.anchor())],
+                         now=datetime(2026, 10, 27, 15, 0, tzinfo=timezone.utc))
+        self.assertEqual(today["title"], "Plants: Peace lily kitchen due")
+
+    def test_a_dry_sensor_plant_is_due_and_leads_with_the_other_due_plants(self):
+        late = datetime(2026, 10, 28, 15, 0, tzinfo=timezone.utc)
+        row = self.row([self.sensor(12, dry=True)], [(self.timed("Peace lily kitchen", 7), self.anchor())], now=late)
+        self.assertEqual(row["title"], "Plants: Peace lily kitchen +1 due")
+        self.assertEqual(row["items"], ["Peace lily kitchen: due 27.10, watered 20.10",
+                                        "Strelitzia: dry, soil 12%, at 15%, watered 21.10"])
+        only = self.row([self.sensor(12, dry=True)], [(self.timed("Aloe", 35), self.anchor())])
+        self.assertEqual((only["title"], only["items"][0], "at" in only),
+                         ("Plants: Strelitzia due", "Strelitzia: dry, soil 12%, at 15%, watered 21.10", False))
+
+    def test_the_sensor_plants_that_are_not_dry_come_last_the_nearest_to_dry_first(self):
+        ivy = plants.parse_plants([{"moisture": "sensor.ivy_moisture", "name": "Ivy", "dry": 20}])
+        far = ivy["sensor.ivy_moisture"]
+        row = self.row([self.sensor(60, plant=far), self.sensor(31)], [(self.timed("Aloe", 35), self.anchor())])
+        self.assertEqual([line.split(":")[0] for line in row["items"]], ["Aloe", "Strelitzia", "Ivy"])
+
+    def test_a_reading_that_is_unknown_and_a_watering_nobody_has_seen_are_said_so(self):
+        row = self.row([self.sensor(None, watered=None)])
+        self.assertEqual(row["items"], ["Strelitzia: soil unknown, at 15%"])
+        self.assertEqual(row["title"], "Plants: none due")
+        self.assertNotIn("at", row)
+
+    def test_only_twenty_lines_fit_and_the_rest_is_counted(self):
+        timed = [(self.timed(f"Plant {i:02d}", 10 + i), self.anchor()) for i in range(25)]
+        row = self.row(timed=timed)
+        self.assertEqual(len(row["items"]), core.ITEMS_MAX)
+        self.assertEqual(row["items"][-1], "+6 more")
+        self.assertTrue(row["items"][0].startswith("Plant 00"))
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_no_plants_no_row_and_a_plant_without_a_usable_anchor_has_no_line(self):
+        self.assertIsNone(self.row())
+        row = self.row(timed=[(self.timed("Aloe", 35), None), (self.timed("Fern", 7), {"at": "soon"}),
+                              (self.timed("Lily", 7), self.anchor())])
+        self.assertEqual([line.split(":")[0] for line in row["items"]], ["Lily"])
+
+    def test_a_done_after_the_seed_shows_as_the_last_watering(self):
+        row = self.row(timed=[(self.timed("Aloe", 35), {"at": "2026-10-22T10:00:00+00:00", "prev": self.anchor()})])
+        self.assertEqual(row["items"], ["Aloe: 26.11, watered 22.10"])
+
+    def test_a_long_name_is_cut_to_a_line_that_fits(self):
+        name = "Monstera deliciosa variegata (the big one by the window)"
+        row = self.row(timed=[(self.timed(name, 7), self.anchor())])
+        self.assertTrue(all(len(line) <= core.TEXT_MAX for line in row["items"]))
+        self.assertTrue(core.is_valid_row(row))
 
 
 class SavedLatchTests(unittest.TestCase):

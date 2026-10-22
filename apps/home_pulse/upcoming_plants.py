@@ -16,6 +16,13 @@ never was. A succulent (`feed: summer`) is fed from March to September only, and
 FEED_EVERY_DAYS days. The anchor keeps `fed_at`, set by a Done that said to feed and carried over by one
 that did not; a seed counts as a feeding at the moment it is made.
 
+Every plant is also one line in the `items` of a single row, `maint:plants`, which is always there: its
+title says what is due or the next due day, and the lines say when each plant is due (a sensor plant:
+its soil and its dry level) and when it was last watered, the plants due first. A calendar plant was last
+watered at its anchor's time. A sensor plant was watered when its soil moisture rose RISE_POINTS or more
+within RISE_WINDOW and then stopped climbing for RISE_SETTLE; that moment is what `step_rise` finds, live
+and in the recorder's history.
+
 A sensor plant is dry once its soil moisture reading, in percent, is at or under its `dry`, and stays dry
 until a reading is CLOSE_MARGIN above it: watering makes the reading jump, while a reading wandering
 around `dry` never flaps the row. A reading that is unknown, unavailable or not a number changes nothing
@@ -35,7 +42,7 @@ import re
 import unicodedata
 from datetime import datetime, timedelta
 
-from upcoming_core import TEXT_MAX, clean_text, make_row, utc_iso
+from upcoming_core import ITEMS_MAX, TEXT_MAX, clean_text, make_row, utc_iso
 from upcoming_maint import DUE_TIME, HOUSE_TZ, ddmm, fit_parts, house_date, parse_iso, reading
 
 ID_PREFIX = "maint:plant:"
@@ -44,6 +51,11 @@ ICON = "mdi:watering-can-outline"
 CLOSE_MARGIN = 5
 LEAD_DAYS = 1
 FEED_BELOW = 350
+RISE_POINTS = 10
+RISE_WINDOW = timedelta(minutes=30)
+RISE_SETTLE = timedelta(minutes=15)
+OVERVIEW_ID = "maint:plants"
+OVERVIEW_ICON = "mdi:sprout"
 FEED_EVERY_DAYS = 28
 SUMMER_MONTHS = range(3, 10)
 
@@ -180,6 +192,50 @@ def plant_row(entity, plant, st, value, conductivity=None):
     return row, f"plant:{entity}:{st['since']}"
 
 
+# ---------------------------------------------------------------- watering seen in the soil
+
+
+def valid_watered(raw, plants):
+    """The saved last-watered times that are for a configured sensor plant (by slug) and parse."""
+    raw = raw if isinstance(raw, dict) else {}
+    slugs = {plant["slug"] for plant in plants.values()}
+    return {slug: when for slug, when in raw.items() if slug in slugs and parse_iso(when) is not None}
+
+
+def step_rise(st, value, now):
+    """One look at a sensor plant's soil moisture, `value` its reading or None: (state, event). The state
+    keeps the readings of the last RISE_WINDOW and the rise under way. The event is {"at", "low",
+    "peak"} once a rise of RISE_POINTS or more has stopped climbing for RISE_SETTLE: when it began, the
+    lowest reading before it and the highest after."""
+    st = st or {}
+    recent = [[when, seen] for when, seen in st.get("recent", []) if now - parse_iso(when) < RISE_WINDOW]
+    rise = st.get("rise")
+    if value is not None:
+        if rise is None:
+            lows = [seen for _, seen in recent]
+            if lows and value - min(lows) >= RISE_POINTS:
+                rise = {"at": utc_iso(now), "low": min(lows), "peak": value, "top": utc_iso(now)}
+        elif value > rise["peak"]:
+            rise = {**rise, "peak": value, "top": utc_iso(now)}
+        if not recent or recent[-1][1] != value:
+            recent.append([utc_iso(now), value])
+    if rise is not None and now - parse_iso(rise["top"]) >= RISE_SETTLE:
+        done = {"at": rise["at"], "low": rise["low"], "peak": rise["peak"]}
+        return {"recent": [] if value is None else [[utc_iso(now), value]], "rise": None}, done
+    return {"recent": recent, "rise": rise}, None
+
+
+def rises(series, now):
+    """The waterings [{"at", "low", "peak"}] in a moisture history [(aware datetime, reading or None)],
+    oldest first, as of `now`."""
+    st, found = None, []
+    for when, value in list(series) + [(now, None)]:
+        st, event = step_rise(st, value, when)
+        if event:
+            found.append(event)
+    return found
+
+
 # ---------------------------------------------------------------- calendar plants
 
 
@@ -228,6 +284,47 @@ def done_fields(plant, anchor, now):
 
 def _days(count):
     return f"{count} day{'' if count == 1 else 's'}"
+
+
+def overview_row(sensor, timed, now):
+    """The `maint:plants` row, None without plants: `sensor` is [{"plant", "value", "dry", "watered"}] (the
+    reading or None, whether the plant is dry, when it was last watered or None) and `timed` is
+    [(plant, anchor)]. The lines come plants due first, then by due day, then the sensor plants that are
+    not dry by how far above their dry level they stand."""
+    today = house_date(now)
+    entries = []
+    for plant, anchor in timed:
+        when = parse_iso((anchor or {}).get("at"))
+        if when is None:
+            continue
+        due = house_date(when) + timedelta(days=plant["every_days"])
+        late = due <= today
+        line = f"{plant['name']}: {'due ' if late else ''}{ddmm(due, now)}, watered {ddmm(when, now)}"
+        entries.append(((0 if late else 1, due, plant["name"]), late, due, plant["name"], line))
+    for each in sensor:
+        plant, value, watered = each["plant"], each["value"], parse_iso(each["watered"])
+        soil = "soil unknown" if value is None else f"soil {_percent(value)}"
+        line = f"{plant['name']}: {'dry, ' if each['dry'] else ''}{soil}, at {_percent(plant['dry'])}"
+        line += f", watered {ddmm(watered, now)}" if watered else ""
+        margin = 0 if value is None else value - plant["dry"]
+        entries.append(((0, today, plant["name"]) if each["dry"] else (2, margin, plant["name"]), each["dry"], None,
+                        plant["name"], line))
+    if not entries:
+        return None
+    entries.sort(key=lambda entry: entry[0])
+    due_names = [name for _, late, _, name, _ in entries if late]
+    coming = [due for _, late, due, _, _ in entries if due and not late]
+    lines = [line for *_, line in entries]
+    if len(lines) > ITEMS_MAX:
+        lines = lines[:ITEMS_MAX - 1] + [f"+{len(lines) - ITEMS_MAX + 1} more"]
+    if due_names:
+        title, at = f"Plants: {due_names[0]}{f' +{len(due_names) - 1}' if len(due_names) > 1 else ''} due", None
+    elif coming:
+        title, at = f"Plants: next {ddmm(min(coming), now)}", datetime.combine(min(coming), DUE_TIME, HOUSE_TZ)
+    else:
+        title, at = "Plants: none due", None
+    detail = f"{len(entries)} plants" + (f", {len(due_names)} due" if due_names else "")
+    return make_row(OVERVIEW_ID, "maint", title, detail, at=at, icon=OVERVIEW_ICON, audience="admin", items=lines)
 
 
 def timed_row(plant, anchor, now):

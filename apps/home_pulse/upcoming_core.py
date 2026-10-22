@@ -11,8 +11,9 @@ untimed), ``icon``, ``title``, ``detail``, ``chip``, ``area`` (HA area id a tap 
 ``audience`` ("admin") or ``audience_users`` (HA display names), ``next`` ("skip": the
 dashboard's next chip passes the row over). A maintenance row may carry what its sheet shows, and
 a tap on such a row opens that sheet instead of its room: ``info`` (short lines), ``steps`` (what
-to do, in order) with ``warn`` (the safety note), and ``done`` ("tap": a Done button, which fires
-house_upcoming_done with the row id).
+to do, in order) with ``warn`` (the safety note), ``done`` ("tap": a Done button, which fires
+house_upcoming_done with the row id) and ``items`` (a plain list, one line each, for a row that
+summarises several things, such as the plants).
 
 Every value is a string or a list of strings: AppDaemon 4.5.13 drops None, False and 0 from
 set_state attributes at any depth and turns True into "true".
@@ -31,12 +32,13 @@ KINDS = ("rain", "train", "maint")
 INFO_MAX = 4
 STEPS_MAX = 8
 STEP_MAX = 150
+ITEMS_MAX = 20
 BATTERY_ID_PREFIX = "maint:battery:"
 OVERFLOW_ID = "maint:more"
 
 _SPACE = re.compile(r"\s+")
 _FIELDS = ("id", "kind", "at", "icon", "title", "detail", "chip", "area", "audience", "audience_users", "next",
-           "done", "info", "steps", "warn")
+           "done", "info", "steps", "warn", "items")
 
 
 def clean_text(value, limit=TEXT_MAX):
@@ -52,7 +54,8 @@ def utc_iso(dt):
 
 
 def make_row(row_id, kind, title, detail="", *, at=None, icon="mdi:information-outline", area=None, chip=None,
-             audience=None, audience_users=None, skip_next=False, tap_done=False, info=None, steps=None, warn=None):
+             audience=None, audience_users=None, skip_next=False, tap_done=False, info=None, steps=None, warn=None,
+             items=None):
     row = {"id": row_id, "kind": kind, "icon": icon, "title": clean_text(title)}
     detail = clean_text(detail)
     if detail:
@@ -86,6 +89,10 @@ def make_row(row_id, kind, title, detail="", *, at=None, icon="mdi:information-o
     note = clean_text(warn, STEP_MAX)
     if note and todo:
         row["warn"] = note
+    listed = [clean_text(line) for line in items or []]
+    listed = [line for line in listed if line][:ITEMS_MAX]
+    if listed:
+        row["items"] = listed
     return row
 
 
@@ -124,6 +131,12 @@ def is_valid_row(row):
             return False
     if "warn" in row and ("steps" not in row or not row["warn"] or not _is_ascii_text(row["warn"], STEP_MAX)):
         return False
+    if "items" in row:
+        listed = row["items"]
+        if row.get("kind") != "maint" or not isinstance(listed, list) or not 0 < len(listed) <= ITEMS_MAX:
+            return False
+        if not all(line and _is_ascii_text(line, TEXT_MAX) for line in listed):
+            return False
     if "audience_users" in row:
         users = row["audience_users"]
         if "audience" in row or not isinstance(users, list) or not users:

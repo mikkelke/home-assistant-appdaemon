@@ -29,8 +29,13 @@ replace-by day, with the median lifetime of every device of the same model as th
 Rober2's recent cleaning rate from its cumulative cleaning time, which dates each part's row before
 it is due.
 
-Latches, push keys, battery facts, the cleaning rate and the tapped tasks' anchors persist in
-house_upcoming_state.json next to this module; rain forecast fixtures go to
+The plants also have one row, maint:plants, with a line for each in `items` (upcoming_plants): when it is
+due and when it was last watered. A Done on a plant without a sensor, and a rise of its soil moisture
+for one with a sensor, are told to the house events feed as `house_events_report` events, which is
+also where the sensor plants' last-watered times come from.
+
+Latches, push keys, battery facts, the cleaning rate, the tapped tasks' anchors and the sensor plants'
+last-watered times persist in house_upcoming_state.json next to this module; rain forecast fixtures go to
 house_upcoming_rain_fixtures.jsonl.
 """
 
@@ -62,6 +67,7 @@ STATE_WRITE_MIN_S = 60
 FORECAST_TIMEOUT_S = 12
 FETCH_STUCK = timedelta(minutes=5)
 STATE_VERSION = 1
+PLANT_HISTORY = timedelta(days=14)
 
 
 def _clock(value, default):
@@ -131,6 +137,8 @@ class HouseUpcoming(hass.Hass):
         self._rober2_rate = rate if isinstance(rate, (int, float)) and rate > 0 else maint.ROBER2_RATE_DEFAULT
         self._batteries = dict(saved.get("batteries") or {})
         self._plant_latches = plants.valid_latches(saved.get("plants"), self.plants)
+        self._watered = plants.valid_watered(saved.get("watered"), self.plants)
+        self._rise = {}
         self._pushed = dict(saved.get("pushed") or {})
         self._facts = dict(saved.get("facts") or {})
         self._content = dict(saved.get("content") or {})
@@ -257,6 +265,8 @@ class HouseUpcoming(hass.Hass):
             self._anchors = runs.mark_done(self._anchors, key, now, extra=fields)
             self.log(f"Done: {label}" + (", with feed" if fed else ""))
             self._after_anchor_change("done", row, now, {"fed": True} if fed else None)
+            if plant:
+                self._report(f"Watered {plant['name']}" + (" + fertiliser" if fed else ""))
             return
         task = runs.tapped_task(row, self.run_tasks)
         ledger = self._ledgers().get(task.appliance) if task else None
@@ -279,6 +289,9 @@ class HouseUpcoming(hass.Hass):
         self._anchors = runs.undo_done(self._anchors, key)
         self.log("Done undone: " + (item[1] if item else task.title))
         self._after_anchor_change("undo", row, self.get_now(), None if item else {"runs": None})
+        plant = plants.timed_by_row(row, self.timed_plants)
+        if plant:
+            self._report(f"Watering of {plant['name']} taken back")
 
     def _after_anchor_change(self, event, row, now, extra=None):
         self._append_done_log({"event": event, "row": row, "at": core.utc_iso(now), **(extra or {})})
@@ -330,6 +343,8 @@ class HouseUpcoming(hass.Hass):
             self._plant_latches[entity] = plants.step_plant(self._plant_latches.get(entity), plant, value, now)
             feed = maint.reading((self._cache.get(plant["conductivity"]) or {}).get("state"))
             found.append(plants.plant_row(entity, plant, self._plant_latches[entity], value, feed))
+            self._track_watering(plant, value, now)
+        found.append(self._plants_row(now))
         for item in found:
             if item:
                 rows.append(item[0])
@@ -363,6 +378,30 @@ class HouseUpcoming(hass.Hass):
             start = drum.drum_start(self._attributes(self.price_entity), self._attributes(self.profiles_entity),
                                     self.drum_programmes, now)
         return runs.rows(counted, now, self.run_areas, start)
+
+    def _track_watering(self, plant, value, now):
+        slug = plant["slug"]
+        self._rise[slug], event = plants.step_rise(self._rise.get(slug), value, now)
+        if event:
+            self._watered[slug] = event["at"]
+            self._save_state(force=True)
+            self._report(f"Watered {plant['name']}, soil {event['low']:g}% to {event['peak']:g}%")
+
+    def _plants_row(self, now):
+        sensors = [{"plant": plant, "value": maint.reading((self._cache.get(entity) or {}).get("state")),
+                    "dry": "since" in self._plant_latches.get(entity, {}), "watered": self._watered.get(plant["slug"])}
+                   for entity, plant in self.plants.items()]
+        timed = [(plant, self._anchors.get(plants.anchor_key(plant))) for plant in self.timed_plants.values()]
+        row = plants.overview_row(sensors, timed, now)
+        return (row, None) if row else None
+
+    def _report(self, text):
+        """One line for the house events feed, admin only like the plant rows; HouseEvents listens, and
+        if it is not there the event evaporates."""
+        try:
+            self.fire_event("house_events_report", text=text, icon=plants.ICON, audience="admin")
+        except Exception as e:
+            self.log(f"House event not sent: {e!r}", level="WARNING")
 
     def _timed_plant_rows(self, now):
         anchors = plants.seed_timed(self._anchors, self.timed_plants, now)
@@ -494,13 +533,23 @@ class HouseUpcoming(hass.Hass):
                 latest[entity] = flat[-1]
         cleaning = await self._history_rows(self.rober2_cleaning, now - maint.ROBER2_RATE_WINDOW, now)
         rate = None if cleaning is None else maint.rober2_rate(age.series_from_history(cleaning), now)
-        self._handoff["history"] = (now, series, latest, rate)
+        moisture = {}
+        for entity, plant in self.plants.items():
+            if plant["slug"] not in self._watered:
+                flat = await self._history_rows(entity, now - PLANT_HISTORY, now)
+                if flat is not None:
+                    moisture[plant["slug"]] = age.series_from_history(flat)
+        self._handoff["history"] = (now, series, latest, rate, moisture)
         await self.run_in(self._apply_history, 0)
 
     def _apply_history(self, kwargs):
-        fetched, series_by_entity, latest, rate = self._handoff.pop("history", (None, {}, {}, None))
+        fetched, series_by_entity, latest, rate, moisture = self._handoff.pop("history", (None, {}, {}, None, {}))
         if fetched is None:
             return
+        for slug, series in moisture.items():
+            found = plants.rises(series, fetched)
+            if found:
+                self._watered.setdefault(slug, found[-1]["at"])
         if rate is not None:
             self._rober2_rate = rate
             self.log(f"Rober2 cleaning rate {rate:.0f} s a day")
@@ -601,8 +650,8 @@ class HouseUpcoming(hass.Hass):
 
     def _save_state(self, force=False):
         data = {"version": STATE_VERSION, "rober2": self._rober2, "rober2_rate": self._rober2_rate,
-                "batteries": self._batteries, "plants": self._plant_latches, "pushed": self._pushed,
-                "facts": self._facts, "content": self._content, "done": self._anchors}
+                "batteries": self._batteries, "plants": self._plant_latches, "watered": self._watered,
+                "pushed": self._pushed, "facts": self._facts, "content": self._content, "done": self._anchors}
         text = json.dumps(data, sort_keys=True)
         if text == self._state_text:
             return

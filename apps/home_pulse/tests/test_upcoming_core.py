@@ -49,6 +49,31 @@ class MakeRowTests(unittest.TestCase):
         self.assertTrue(core.is_valid_row(row))
 
 
+class ItemsTests(unittest.TestCase):
+    """items: one plain line each for a maintenance row that summarises several things."""
+
+    def make(self, **extra):
+        return core.make_row("maint:plants", "maint", "Plants: next 27.10", "17 plants", audience="admin", **extra)
+
+    def test_a_row_may_list_lines_that_are_ascii_one_line_and_capped(self):
+        row = self.make(items=["Monstera: 30.10, watered 20.10", "", "x" * 90, "Caf\u00e9: 01.11"])
+        self.assertEqual(row["items"], ["Monstera: 30.10, watered 20.10", "x" * core.TEXT_MAX, "Caf: 01.11"])
+        self.assertTrue(core.is_valid_row(row))
+        self.assertEqual(len(self.make(items=[f"Plant {i}" for i in range(30)])["items"]), core.ITEMS_MAX)
+
+    def test_a_row_without_lines_has_no_field(self):
+        for items in (None, [], ["", " "]):
+            self.assertNotIn("items", self.make(items=items))
+
+    def test_the_contract_is_a_list_of_non_empty_ascii_lines_on_a_maintenance_row(self):
+        good = {**self.make(items=["a"])}
+        self.assertTrue(core.is_valid_row(good))
+        too_many = [f"Plant {i}" for i in range(21)]
+        for bad in ([], "a", ["a", ""], [5], ["x" * 61], ["caf\u00e9"], ["a\nb"], too_many, None):
+            self.assertFalse(core.is_valid_row({**good, "items": bad}), bad)
+        self.assertFalse(core.is_valid_row({**core.make_row("rain:terrace", "rain", "Rain forecast"), "items": ["a"]}))
+
+
 class SheetFieldTests(unittest.TestCase):
     """done, info, steps and warn: what the sheet of a maintenance row shows."""
 
