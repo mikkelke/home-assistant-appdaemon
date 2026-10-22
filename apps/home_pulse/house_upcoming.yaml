@@ -27,7 +27,9 @@ HouseUpcoming:
     area: guest_bathroom
     # The drum row's cheapest start: the first of drum_programmes the run profiles publish, priced
     # on the price entity's published hours. Bomuld 90 and 60 stand in until enough confirmed drum
-    # cleans make a profile of their own.
+    # cleans make a profile of their own. The dishwasher's hygiene row is timed the same way on these
+    # two entities, with the dishwasher's Timer setting for its start: priced on Intensive's profile,
+    # else on the published programme that uses the most energy.
     price_entity: sensor.energi_data_service
     profiles_entity: sensor.appliance_run_profiles
     drum_programmes: [drum_clean, bomuld_90, bomuld_60]

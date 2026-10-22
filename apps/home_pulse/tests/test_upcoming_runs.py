@@ -1,5 +1,6 @@
 # tests/test_upcoming_runs.py - the run-based appliance tasks of sensor.house_upcoming: counting runs since
-# the last Done or confirmation, the seed, Done and undo, the estimate, the rows and the dryer's log row.
+# the last Done or confirmation, the seed, Done and undo, the estimate, the rows, the drum clean's and the
+# hygiene run's cheapest start, and the dryer's log row.
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
 import sys
@@ -14,6 +15,7 @@ import run_ledger  # noqa: E402
 import upcoming_core as core  # noqa: E402
 import upcoming_guides as guides  # noqa: E402
 import upcoming_runs as runs  # noqa: E402
+from upcoming_drum import Start  # noqa: E402
 
 NOW = datetime(2026, 10, 15, 10, 30, tzinfo=timezone.utc)
 MIN = timedelta(minutes=1)
@@ -66,9 +68,11 @@ def seeded(led, at=NOW, tasks=runs.TASKS):
     return runs.seed({}, led, at, tasks)
 
 
-def rows_of(led, anchors, now=NOW, start=None, tasks=runs.TASKS):
+def rows_of(led, anchors, now=NOW, start=None, tasks=runs.TASKS, hygiene=None):
+    """The rows, the drum clean's timed at `start` and the hygiene run's at `hygiene` once due."""
     found = runs.statuses(led, anchors, now, tasks)
-    return {row["id"]: (row, key) for row, key in runs.rows(found, now, AREAS, start)}
+    starts = {runs.DRUM_KEY: start, runs.HYGIENE_KEY: hygiene}
+    return {row["id"]: (row, key) for row, key in runs.rows(found, now, AREAS, starts)}
 
 
 class TaskTests(unittest.TestCase):
@@ -446,6 +450,75 @@ class RowTests(unittest.TestCase):
             self.assertTrue(core.is_valid_row(row), row)
             self.assertEqual((row["kind"], row["audience"]), ("maint", "admin"))
             self.assertLessEqual(len(row["detail"]), core.TEXT_MAX)
+
+
+class HygieneStartTests(unittest.TestCase):
+    """The hygiene run once due, timed at its cheapest start with the dishwasher's Timer setting."""
+
+    AT = datetime(2026, 10, 16, 0, 15, tzinfo=timezone.utc)  # 02:15 in the house
+
+    def row(self, start, led=None, anchors=None):
+        return rows_of(led or ledgers(), anchors or {}, hygiene=start)["maint:dishwasher:hygiene"]
+
+    def test_the_start_and_the_timer_to_set_lead_the_detail(self):
+        row, key = self.row(Start(self.AT, "saves 3,20 kr vs now", False, "timer 14 h"))
+        self.assertEqual((row["at"], row["detail"]),
+                         ("2026-10-16T00:15:00+00:00", "Intensive 75 at 02:15, timer 14 h, saves 3,20 kr vs now, due"))
+        self.assertNotIn("next", row)
+        self.assertIsNone(key)
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_starting_now_keeps_the_row_out_of_the_next_chip(self):
+        row, _ = self.row(Start(NOW, "cheapest now", True))
+        self.assertEqual((row["at"], row["next"], row["detail"]),
+                         (core.utc_iso(NOW), "skip", "Intensive 75, cheapest now, due, last unknown"))
+
+    def test_waiting_for_prices_leaves_the_row_untimed(self):
+        row, _ = self.row(Start(None, "best start after 13:00 prices", False))
+        self.assertEqual(row["detail"], "Intensive 75, best start after 13:00 prices, due")
+        self.assertNotIn("at", row)
+        self.assertNotIn("next", row)
+
+    def test_a_long_text_gives_up_due_and_last_before_the_start(self):
+        row, _ = self.row(Start(self.AT, "saves 10,40 kr vs now", False, "timer 16 h"))
+        self.assertEqual(row["detail"], "Intensive 75 at 02:15, timer 16 h, saves 10,40 kr vs now")
+
+    def test_no_saving_to_claim_leaves_the_start_and_the_timer(self):
+        row, _ = self.row(Start(self.AT, "", False, "timer 7 h"))
+        self.assertEqual(row["detail"], "Intensive 75 at 02:15, timer 7 h, due, last unknown")
+
+    def test_a_stand_in_profile_is_named_in_the_sheet(self):
+        basis = "Priced on ECO, Intensive has too few runs"
+        row, _ = self.row(Start(self.AT, "saves 3,20 kr vs now", False, "timer 14 h", basis))
+        self.assertEqual(row["info"], ["Every 15 runs (~1 month)", "None logged yet",
+                                       "Logged when you pick Intensive on the dishwasher card", basis])
+        row, _ = self.row(Start(self.AT, "saves 3,20 kr vs now", False, "timer 14 h"))
+        self.assertEqual(len(row["info"]), 3)
+
+    def test_a_confirmed_run_is_pushed_as_before(self):
+        cycles = replace(every_two_days(dish, 50), 15, dish(NOW - 31 * DAY, confirmed="intensive",
+                                                            programme_confirmed_by_human=True))
+        row, key = self.row(Start(NOW, "cheapest now", True), ledgers(dishwasher=cycles))
+        self.assertEqual(row["detail"], "Intensive 75, cheapest now, due, last 14.09")
+        self.assertEqual(key, f"dishwasher:hygiene:{core.utc_iso(NOW - 31 * DAY)}")
+
+    def test_a_run_that_is_not_due_is_a_dated_countdown_and_ignores_a_start(self):
+        cycles = replace(every_two_days(dish, 50), 5, dish(NOW - 11 * DAY, confirmed="intensive",
+                                                           programme_confirmed_by_human=True))
+        row, key = self.row(Start(self.AT, "saves 3,20 kr vs now", False, "timer 14 h", "Priced on ECO"),
+                            ledgers(dishwasher=cycles))
+        self.assertEqual((row["detail"], row["at"]),
+                         ("Intensive 75, 10 runs left, ~04.11", "2026-11-04T08:00:00+00:00"))
+        self.assertEqual(len(row["info"]), 3)
+        self.assertIsNone(key)
+
+    def test_a_start_times_its_own_task_only(self):
+        found = rows_of(ledgers(), {}, hygiene=Start(self.AT, "saves 3,20 kr vs now", False, "timer 14 h"))
+        self.assertEqual(found["maint:washer:drum"][0]["detail"],
+                         "Bomuld 90 + drain filter, door seal, due, last unknown")
+        found = rows_of(ledgers(), {}, start=(self.AT, "saves 10,40 kr vs now", False))
+        self.assertEqual(found["maint:dishwasher:hygiene"][0]["detail"], "Intensive 75, due, last unknown")
+        self.assertNotIn("at", found["maint:dishwasher:hygiene"][0])
 
 
 class DryerLogTests(unittest.TestCase):

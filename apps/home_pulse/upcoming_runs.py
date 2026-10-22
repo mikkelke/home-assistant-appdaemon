@@ -19,8 +19,8 @@ A row says how many runs are left and, at the pace of the last 90 days, the day 
 timed at DUE_TIME that day, beyond ROW_HORIZON_DAYS none; DEFAULT_PER_WEEK until the ledger covers
 two weeks). It reads as an estimate, like the Rober2 parts' rows. Once due the row says so and carries
 a push key for the episode, which is the time it was last closed. A tapped task's due row is untimed;
-the drum clean's is timed at its cheapest start (upcoming_drum), kept out of the next chip while that
-start is now.
+the drum clean's and the hygiene run's are timed at their cheapest start (upcoming_drum), kept out of
+the next chip while that start is now. The hygiene run says the dishwasher Timer setting for its start.
 
 A task without an interval is a log: its row counts the runs since it was last logged, is untimed and
 out of the next chip, is never due and never pushed. The dryer's plinth filter is one until the
@@ -35,6 +35,7 @@ from typing import Callable, NamedTuple, Optional
 import drum_clean  # apps/appliances - AppDaemon puts every app dir on sys.path
 import run_ledger
 from upcoming_core import make_row, utc_iso
+from upcoming_drum import Start
 from upcoming_guides import GUIDES
 from upcoming_maint import DUE_TIME, HOUSE_TZ, ddmm, fit_parts, house_date, parse_iso
 
@@ -58,7 +59,7 @@ class Task(NamedTuple):
 
 TASKS = (
     Task("dishwasher:hygiene", "dishwasher", "Dishwasher hygiene run", "Intensive 75", 15, "mdi:dishwasher",
-         confirmed=lambda led: run_ledger.last_confirmed(led.cycles, "intensive"),
+         confirmed=lambda led: run_ledger.last_confirmed(led.cycles, HYGIENE_PROGRAMME),
          closes="Logged when you pick Intensive on the dishwasher card"),
     Task("dishwasher:filters", "dishwasher", "Dishwasher filters + spray arms", "rinse filter + arms", 30,
          "mdi:dishwasher"),
@@ -77,6 +78,8 @@ TASKS = (
     Task("coffee:descale", "coffee", "xBloom descale", "descaler, 2 rounds", 60, "mdi:coffee-maker",
          closes=COFFEE_CLOSES, unit="brew"),
 )
+HYGIENE_KEY = "dishwasher:hygiene"
+HYGIENE_PROGRAMME = "intensive"
 DRUM_KEY = "washer:drum"
 DRYER_KEY = "dryer:plinth"
 
@@ -220,6 +223,7 @@ def _row(status, now, area, start):
     task, when = status.task, status.when
     tapped = task.confirmed is None
     at, key, at_now = None, None, False
+    info = _info(status, now)
     if status.left is None:
         detail = _log_detail(status, now)
     elif status.left:
@@ -228,21 +232,24 @@ def _row(status, now, area, start):
             at = datetime.combine(day, DUE_TIME, HOUSE_TZ)
         detail = fit_parts([task.how, f"{_plural(status.left, task.unit)} left", f"~{ddmm(day, now)}" if day else None])
     else:
-        price = None
-        if start:
-            at, price, at_now = start
+        start = Start(*start) if start else Start(None, "", False)
+        at, at_now = start.at, start.at_now
+        lead = f"{task.how} at {at.astimezone(HOUSE_TZ):%H:%M}" if start.timer else task.how
         last = None if tapped else f"last {ddmm(when, now)}" if when else "last unknown"
-        detail = fit_parts([task.how, price, "due", last])
+        detail = fit_parts([lead, start.timer, start.price, "due", last])
         key = f"{task.key}:{utc_iso(when)}" if when else None
+        info.append(start.basis)
     guide = GUIDES[task.key]
     row = make_row(row_id(task), "maint", task.title, detail, at=at, icon=task.icon, area=area, audience="admin",
-                   skip_next=at_now or task.interval is None, tap_done=tapped, info=_info(status, now),
+                   skip_next=at_now or task.interval is None, tap_done=tapped, info=info,
                    steps=guide.steps, warn=guide.warn)
     return row, key
 
 
-def rows(found, now, areas, drum_start=None):
-    """[(row, push key)] for the tasks in `found` (statuses), one row each. `drum_start` is
-    upcoming_drum.drum_start's (when, what it saves, whether that is now) for the drum clean once due."""
-    return [_row(status, now, areas.get(status.task.appliance), drum_start if status.task.key == DRUM_KEY else None)
+def rows(found, now, areas, starts=None):
+    """[(row, push key)] for the tasks in `found` (statuses), one row each. `starts` maps a task key to
+    the upcoming_drum start for the tasks timed at their cheapest start once due: a Start, or the drum
+    clean's (when, what it saves, whether that is now)."""
+    starts = starts or {}
+    return [_row(status, now, areas.get(status.task.appliance), starts.get(status.task.key))
             for status in found.values()]

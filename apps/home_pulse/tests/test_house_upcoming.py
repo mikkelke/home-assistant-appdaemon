@@ -1,8 +1,8 @@
 # tests/test_house_upcoming.py - HouseUpcoming end to end on a fake AppDaemon surface, with the real
 # house_upcoming.yaml: lease, state acquisition, restart behaviour, the daily push, rain fetches,
-# the drum clean's cheapest start, the run-based appliance tasks (the feedback ledgers, the seed, Done
-# and undo), the history job, replace-by days, Rober2's dated parts, the plants' watering rows (by sensor
-# and by the calendar), the one-off tasks and the battery inventory.
+# the drum clean's and the hygiene run's cheapest start, the run-based appliance tasks (the feedback
+# ledgers, the seed, Done and undo), the history job, replace-by days, Rober2's dated parts, the plants'
+# watering rows (by sensor and by the calendar), the one-off tasks and the battery inventory.
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
 import asyncio
@@ -591,6 +591,97 @@ class DrumStartTests(unittest.TestCase):
         self.assertEqual(row["detail"], "Bomuld 90 + drain filter, door seal, due, last unknown")
         self.assertNotIn("at", row)
         self.assertNotIn("next", row)
+
+
+class HygieneStartTests(unittest.TestCase):
+    """At 12:30 on 14.10: the hygiene run, set going with the dishwasher's Timer. ECO stands in until
+    an Intensive profile is published; the pooled profile never does."""
+
+    ECO = {"key": "eco", "label": "ECO", "n": 26, "p": ",".join(["50"] * 120)}
+    INTENSIVE = {"key": "intensive", "label": "Intensive", "n": 5, "p": ",".join(["100"] * 120)}
+    POOLED = {"key": "typical", "label": "Typical", "n": 30, "p": ",".join(["300"] * 120)}
+
+    @staticmethod
+    def states(*programmes):
+        states = base_states()
+        states["sensor.appliance_run_profiles"] = full(
+            "x", {"schema": 1, "appliances": {"dishwasher": {"programmes": list(programmes)}}})
+        return states
+
+    @staticmethod
+    def prices(today, tomorrow, valid):
+        def points(day, cheap):
+            return [{"hour": datetime(2026, 10, day, hour, tzinfo=maint.HOUSE_TZ).isoformat(),
+                     "price": cheap.get(hour, 2.0)} for hour in range(24)]
+        return full("2.0", {"raw_today": points(14, today), "raw_tomorrow": points(15, tomorrow),
+                            "tomorrow_valid": valid})
+
+    def test_the_row_waits_for_tomorrows_prices_and_then_names_the_timer(self):
+        states = self.states(self.POOLED, self.ECO)
+        states["sensor.energi_data_service"] = self.prices({20: 0.8, 21: 0.8}, {3: 0.5, 4: 0.5}, False)
+        app = make_app(states)
+        row = rows(app)["maint:dishwasher:hygiene"]
+        self.assertEqual(row["detail"], "Intensive 75, best start after 13:00 prices, due")
+        self.assertNotIn("at", row)
+        fire(app, "sensor.energi_data_service", self.prices({20: 0.8, 21: 0.8}, {3: 0.5, 4: 0.5}, True))
+        row = rows(app)["maint:dishwasher:hygiene"]
+        self.assertEqual((row["at"], row["detail"]),
+                         ("2026-10-15T01:00:00+00:00", "Intensive 75 at 03:00, timer 15 h, saves 0,90 kr vs now, due"))
+        self.assertEqual(row["info"][3], "Priced on ECO, Intensive has too few runs")
+        self.assertNotIn("next", row)
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_the_timer_is_worked_out_again_every_tick(self):
+        states = self.states(self.ECO)
+        states["sensor.energi_data_service"] = self.prices({}, {3: 0.5, 4: 0.5}, True)
+        app = make_app(states)
+        self.assertIn("timer 15 h", rows(app)["maint:dishwasher:hygiene"]["detail"])
+        tick(app, HOUR)
+        self.assertIn("timer 14 h", rows(app)["maint:dishwasher:hygiene"]["detail"])
+        tick(app, 6 * HOUR)
+        row = rows(app)["maint:dishwasher:hygiene"]
+        self.assertEqual((row["at"], row["detail"]),
+                         ("2026-10-15T01:00:00+00:00", "Intensive 75 at 03:00, timer 8 h, saves 0,90 kr vs now, due"))
+
+    def test_an_intensive_profile_prices_the_row_without_a_stand_in(self):
+        states = self.states(self.POOLED, self.ECO, self.INTENSIVE)
+        states["sensor.energi_data_service"] = self.prices({}, {3: 0.5, 4: 0.5}, True)
+        row = rows(make_app(states))["maint:dishwasher:hygiene"]
+        self.assertEqual(row["detail"], "Intensive 75 at 03:00, timer 15 h, saves 1,80 kr vs now, due")
+        self.assertEqual(len(row["info"]), 3)
+
+    def test_cheapest_now_times_the_row_at_now_and_out_of_the_next_chip(self):
+        states = self.states(self.ECO)
+        states["sensor.energi_data_service"] = self.prices({12: 0.5, 13: 0.5, 14: 0.5}, {}, False)
+        app = make_app(states)
+        row = rows(app)["maint:dishwasher:hygiene"]
+        self.assertEqual((row["at"], row["detail"], row["next"]),
+                         (core.utc_iso(NOW), "Intensive 75, cheapest now, due, last unknown", "skip"))
+        tick(app, HOUR)
+        row = rows(app)["maint:dishwasher:hygiene"]
+        self.assertEqual((row["at"], row["next"]), (core.utc_iso(NOW + HOUR), "skip"))
+
+    def test_the_drum_clean_and_the_hygiene_run_are_timed_each_on_its_own_profile(self):
+        states = self.states(self.ECO)
+        states["sensor.appliance_run_profiles"]["attributes"]["appliances"]["washer"] = {
+            "programmes": [DrumStartTests.BOMULD_60]}
+        states["sensor.energi_data_service"] = self.prices({}, {3: 0.5, 4: 0.5}, True)
+        shown = rows(make_app(states))
+        self.assertEqual(shown["maint:dishwasher:hygiene"]["detail"],
+                         "Intensive 75 at 03:00, timer 15 h, saves 0,90 kr vs now, due")
+        self.assertEqual(shown["maint:washer:drum"]["detail"],
+                         "Bomuld 90 + drain filter, door seal, saves 1,80 kr vs now")
+
+    def test_without_prices_or_a_profile_the_row_stays_untimed(self):
+        row = rows(make_app(self.states(self.ECO)))["maint:dishwasher:hygiene"]
+        self.assertEqual(row["detail"], "Intensive 75, due, last unknown")
+        self.assertNotIn("at", row)
+        states = self.states(self.POOLED)
+        states["sensor.energi_data_service"] = self.prices({}, {3: 0.5}, True)
+        row = rows(make_app(states))["maint:dishwasher:hygiene"]
+        self.assertEqual(row["detail"], "Intensive 75, due, last unknown")
+        self.assertNotIn("at", row)
+        self.assertEqual(len(row["info"]), 3)
 
 
 DAY = 24 * HOUR

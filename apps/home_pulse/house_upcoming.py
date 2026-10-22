@@ -1,8 +1,8 @@
 """HouseUpcoming - what is coming up in the house that only the server can know, for the dashboard's
 Now timeline: maintenance (the Rober2 parts, the dishwasher's, washer's, dryer's and xBloom's run-based
-tasks, the drum clean at its cheapest start, batteries by their replace-by day and offline devices, and
-houseplants that need water and one-off tasks; admin only), Kristine's train, and rain, forecast or falling,
-while a terrace door is open (exploratory).
+tasks, the drum clean and the hygiene run at their cheapest start, batteries by their replace-by day and
+offline devices, and houseplants that need water and one-off tasks; admin only), Kristine's train, and
+rain, forecast or falling, while a terrace door is open (exploratory).
 
 Publishes sensor.house_upcoming (shape in upcoming_core.py) plus one maintenance push a day, built
 from the same conditions the rows show. The lease in `expires` is renewed every TICK_S even when
@@ -372,12 +372,13 @@ class HouseUpcoming(hass.Hass):
             self._anchors = anchors
             self._save_state(force=True)
         counted = runs.statuses(ledgers, self._anchors, now, self.run_tasks)
-        drum_status = counted.get(runs.DRUM_KEY)
-        start = None
-        if drum_status is not None and not drum_status.left:
-            start = drum.drum_start(self._attributes(self.price_entity), self._attributes(self.profiles_entity),
-                                    self.drum_programmes, now)
-        return runs.rows(counted, now, self.run_areas, start)
+        return runs.rows(counted, now, self.run_areas, self._starts(now))
+
+    def _starts(self, now):
+        """{task key: start} for the drum clean and the hygiene run, which a row uses once due."""
+        prices, profiles = self._attributes(self.price_entity), self._attributes(self.profiles_entity)
+        return {runs.DRUM_KEY: drum.drum_start(prices, profiles, self.drum_programmes, now),
+                runs.HYGIENE_KEY: drum.timer_start(prices, profiles, runs.HYGIENE_PROGRAMME, now)}
 
     def _track_watering(self, plant, value, now):
         slug = plant["slug"]
