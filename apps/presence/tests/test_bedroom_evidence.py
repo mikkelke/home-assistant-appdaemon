@@ -357,7 +357,7 @@ class ArchiveTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
-    def test_explicit_secret_path_refreshes_installed_appdaemon_parser(self):
+    def test_adjacent_secret_link_passes_strict_installed_appdaemon_parser(self):
         # A subprocess avoids this unit suite's fake AppDaemon modules. Locally
         # optional; also run against the real installed parser in the container.
         script = r"""
@@ -370,21 +370,33 @@ try:
 except ModuleNotFoundError:
     sys.exit(77)
 source = sys.stdin.read()
-assert "secrets: /conf/secrets.yaml" in source
 with tempfile.TemporaryDirectory() as directory:
     root = Path(directory)
-    secrets = root / "private-secrets.yaml"
+    secrets = root / "secrets.yaml"
     secrets.write_text("bedroom_evidence_mqtt_user: fixture-user\n"
-                       "bedroom_evidence_mqtt_password: fixture-password\n")
-    config = root / "bedroom_evidence.yaml"
-    config.write_text(source.replace("secrets: /conf/secrets.yaml", "secrets: " + str(secrets)))
+                       "bedroom_evidence_mqtt_password: fixture-password\n"
+                       "unrelated_live_secret: preserve-this-key\n")
+    app_dir = root / "apps"
+    presence_dir = app_dir / "presence"
+    presence_dir.mkdir(parents=True)
+    (presence_dir / "secrets.yaml").symlink_to("../../secrets.yaml")
+    config = presence_dir / "bedroom_evidence.yaml"
+    config.write_text(source)
     utils.secrets = {"unrelated_cached_key": "stale"}
-    parsed = utils.read_yaml_config(config)
+    # Match AppManagement.read_config_file's strict chain exactly. The tolerant
+    # AllAppConfig.from_config_files method can hide an invalid top-level key.
+    parsed = utils.read_config_file(config, app_config=True)
     assert parsed["BedroomEvidence"]["mqtt_user"] == "fixture-user"
     assert parsed["BedroomEvidence"]["mqtt_password"] == "fixture-password"
-    apps = AllAppConfig.from_config_files([config])
+    assert set(parsed) == {"BedroomEvidence"}
+    apps = AllAppConfig.model_validate(parsed)
     assert apps.app_names() == {"BedroomEvidence"}
-print("Installed parser refreshed secrets and loaded exactly BedroomEvidence")
+    assert utils.secrets["unrelated_live_secret"] == "preserve-this-key"
+    scanned = set(utils.recursive_get_files(
+        base=app_dir.resolve(), suffix={".yaml", ".toml"},
+        exclude={"ruff.toml", "pyproject.toml", "secrets.yaml"}))
+    assert scanned == {config}
+print("Strict installed parser loaded BedroomEvidence; adjacent secret link excluded from scan")
 """
         result = subprocess.run([sys.executable, "-c", script],
                                 input=Path(be.__file__).with_suffix(".yaml").read_text(),
