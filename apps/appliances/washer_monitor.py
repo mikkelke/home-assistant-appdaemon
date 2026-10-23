@@ -70,6 +70,7 @@ import cycle_store as cystore
 import door_history
 import drum_clean
 import feedback_io
+from completed_measurements import completed_measurements
 import run_ledger
 
 # Shared save/restore-snapshot/staleness-check plumbing for the on-disk store above - see
@@ -3547,8 +3548,11 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             # Attribution: captured as "now" - unlike the start anchor (which clamps back to
             # door-close, see _begin_running_cycle), emptying is observed as it happens.
             actor_empty = self._attribute("washer_emptied", user_id=actor_user_id)
-            energy_used = self._get_energy_used()
-            run_minutes = self._get_run_duration_minutes()
+            finished = completed_measurements(
+                self.state, self.get_state(self.state_entity, attribute="all")
+            )
+            energy_used = self._get_energy_used() if finished is None else None
+            run_minutes = self._get_run_duration_minutes() if finished is None else None
 
             # Save feedback when we arrive in Emptied directly from Running (bypassing Unemptied).
             # This covers two paths:
@@ -3559,7 +3563,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             # Must check self.state, not the HA entity: right after _transition_to_unemptied the
             # entity read can still return "Running" (set_state round trip pending), which made
             # this guard pass again and save the same cycle twice seconds apart.
-            came_from_running = (
+            came_from_running = finished is None and (
                 self.state == "Running"
                 or "cycle finished" in reason
             )
@@ -3570,7 +3574,8 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             # the uncorrected wall-clock figure. should_save_feedback also gates the feedback
             # save itself, further down.
             should_save_feedback = (
-                self.start_time is not None
+                finished is None
+                and self.start_time is not None
                 and run_minutes >= self.min_cycle_minutes
                 and came_from_running
             )
@@ -3631,29 +3636,16 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                     should_save_feedback = False
                     run_minutes = run_minutes_wall
 
-            attributes = {
-                "reason": reason,
-                "run_time_minutes": round(run_minutes, 1) if run_minutes > 0 else None
-            }
+            attributes = {"reason": reason}
             # Dashboard visibility for who emptied the machine (see _attribute above).
             attributes["emptied_by"] = (actor_empty or {}).get("person") or ""
             attributes["emptied_by_method"] = (actor_empty or {}).get("method") or "unknown"
-            if energy_used > 0:
-                attributes["energy_used"] = round(energy_used, 3)
-            # Preserve run_time_minutes, end_reason, idle_min from entity when coming from Unemptied
-            # so we keep the corrected programme length in the UI instead of overwriting with wall-clock to door.
-            try:
-                full = self.get_state(self.state_entity, attribute="all")
-                attrs = (full or {}).get("attributes") or {}
-                if self.get_state(self.state_entity) == "Unemptied":
-                    if attrs.get("run_time_minutes") is not None:
-                        attributes["run_time_minutes"] = attrs["run_time_minutes"]
-                    if attrs.get("end_reason"):
-                        attributes["end_reason"] = attrs["end_reason"]
-                    if attrs.get("idle_min") is not None:
-                        attributes["idle_min"] = attrs["idle_min"]
-            except Exception:
-                pass
+            if finished is None:
+                attributes["run_time_minutes"] = round(run_minutes, 1) if run_minutes > 0 else None
+                if energy_used > 0:
+                    attributes["energy_used"] = round(energy_used, 3)
+            else:
+                attributes.update(finished)
 
             self._set_state_entity( state="Emptied", attributes=attributes)
 

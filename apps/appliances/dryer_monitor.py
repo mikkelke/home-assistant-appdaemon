@@ -61,6 +61,7 @@ except ImportError:
 
 # Atomic writes of the feedback file, and the history set aside when it cannot be read.
 import feedback_io
+from completed_measurements import completed_measurements
 
 # The door's last real close, read back from the recorder.
 import door_history
@@ -1161,6 +1162,10 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             full = self.get_state(self.state_entity, attribute="all")
             existing = dict((full or {}).get("attributes") or {})
             existing.update(attrs)
+            # Emptying preserves the finished summary; a new live cycle must
+            # drop its completion flag explicitly (False/None partial updates
+            # are discarded by AppDaemon's falsy-attribute handling).
+            existing.pop("cycle_complete", None)
             if overrun <= 0:
                 # attrs merges over the previous publish, so a past overrun_min would otherwise
                 # linger after dur grows mid-cycle (selector/classification change) and leak a
@@ -1940,26 +1945,34 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             else:
                 actor_empty = self._unknown_actor("not_observed")
             self.log(f"Emptied attribution: {actor_empty}", level="INFO")
-            energy_used = self._get_energy_used()
-            run_minutes = self._get_run_duration_minutes()
+            finished = completed_measurements(
+                self.state, self.get_state(self.state_entity, attribute="all")
+            )
 
             self.state = "Emptied"
             effective_key = self._get_confirmed_programme_key() or self.detected_programme
             attributes = {
                 **self._attrs_clear_running_progress(),
                 "reason": reason,
-                "run_time_minutes": round(run_minutes, 1) if run_minutes > 0 else None,
                 "derived_programme_key": effective_key,
                 **self._started_by_attrs(),
                 "emptied_by": actor_empty.get("person") or "",
                 "emptied_by_method": actor_empty.get("method") or "unknown",
             }
-            if energy_used > 0:
-                attributes["energy_used"] = round(energy_used, 3)
+            if finished is None:
+                run_minutes = self._get_run_duration_minutes()
+                energy_used = self._get_energy_used()
+                attributes["run_time_minutes"] = round(run_minutes, 1) if run_minutes > 0 else None
+                if energy_used > 0:
+                    attributes["energy_used"] = round(energy_used, 3)
+            else:
+                attributes.update(finished)
             if self.keep_fresh_detected:
                 attributes["keep_fresh_detected"] = True
 
-            self._set_state_entity( state="Emptied", attributes=attributes, replace=True)
+            # A completed load already has its summary in HA. Merge so a delayed
+            # full-state read cannot erase newer measurements the helper omitted.
+            self._set_state_entity(state="Emptied", attributes=attributes, replace=finished is None)
 
             if observed:
                 self._patch_cycle_record(self._last_saved_record_ts, {

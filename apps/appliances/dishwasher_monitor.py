@@ -71,6 +71,7 @@ except ImportError:
 # puts app dirs on sys.path — same precedent washer_monitor.py already relies on).
 import door_history
 import feedback_io
+from completed_measurements import completed_measurements
 import washer_history as whist
 import washer_power as wpow
 
@@ -3152,7 +3153,9 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             else:
                 actor_empty = self._unknown_actor("not_observed")
             self.log(f"Emptied attribution: {actor_empty}", level="INFO")
-            already_finished = self.state in ("Unemptied", "Emptied")
+            finished = completed_measurements(
+                self.state, self.get_state(self.state_entity, attribute="all")
+            )
 
             self.state = "Emptied"
             attributes = {
@@ -3161,7 +3164,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                 "emptied_by": actor_empty.get("person") or "",
                 "emptied_by_method": actor_empty.get("method") or "unknown",
             }
-            if not already_finished:
+            if finished is None:
                 # A door-first finish has no published completion summary yet.
                 # Unemptied already has the corrected duration/energy: preserve
                 # those via the merge below, however long the dishes waited.
@@ -3171,6 +3174,8 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                     attributes["run_time_minutes"] = round(run_minutes, 1)
                 if energy_used > 0:
                     attributes["energy_used"] = round(energy_used, 3)
+            else:
+                attributes.update(finished)
 
             self._set_state_entity( state="Emptied", attributes=attributes)
             
