@@ -8,6 +8,10 @@
 # Box-only prerequisite: copy the existing broker account into these two keys in
 # /conf/secrets.yaml without printing values. No broker/plugin/container restart.
 # Paho MQTT 2.1.0 is already installed. Main log only; no new named log stream.
+# Load these newly provisioned keys on this file's hot reload. Without an explicit
+# path, AppDaemon looks beside this YAML and can fall back to stale cached secrets.
+secrets: /conf/secrets.yaml
+
 BedroomEvidence:
   module: bedroom_evidence
   class: BedroomEvidence

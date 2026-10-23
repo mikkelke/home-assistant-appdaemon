@@ -9,6 +9,7 @@ import base64
 import json
 import os
 import queue
+import subprocess
 import sys
 import tempfile
 import threading
@@ -356,6 +357,42 @@ class ArchiveTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_explicit_secret_path_refreshes_installed_appdaemon_parser(self):
+        # A subprocess avoids this unit suite's fake AppDaemon modules. Locally
+        # optional; also run against the real installed parser in the container.
+        script = r"""
+import sys
+import tempfile
+from pathlib import Path
+try:
+    from appdaemon import utils
+    from appdaemon.app_management import AllAppConfig
+except ModuleNotFoundError:
+    sys.exit(77)
+source = sys.stdin.read()
+assert "secrets: /conf/secrets.yaml" in source
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    secrets = root / "private-secrets.yaml"
+    secrets.write_text("bedroom_evidence_mqtt_user: fixture-user\n"
+                       "bedroom_evidence_mqtt_password: fixture-password\n")
+    config = root / "bedroom_evidence.yaml"
+    config.write_text(source.replace("secrets: /conf/secrets.yaml", "secrets: " + str(secrets)))
+    utils.secrets = {"unrelated_cached_key": "stale"}
+    parsed = utils.read_yaml_config(config)
+    assert parsed["BedroomEvidence"]["mqtt_user"] == "fixture-user"
+    assert parsed["BedroomEvidence"]["mqtt_password"] == "fixture-password"
+    apps = AllAppConfig.from_config_files([config])
+    assert apps.app_names() == {"BedroomEvidence"}
+print("Installed parser refreshed secrets and loaded exactly BedroomEvidence")
+"""
+        result = subprocess.run([sys.executable, "-c", script],
+                                input=Path(be.__file__).with_suffix(".yaml").read_text(),
+                                text=True, capture_output=True, timeout=10)
+        if result.returncode == 77:
+            self.skipTest("AppDaemon is not installed in this local interpreter")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_full_lifecycle_reads_only_whitelist_and_flushes_stop(self):
         with tempfile.TemporaryDirectory() as root, patch.object(be, "PRIVATE_LOG_ROOT", Path(root)):
             app = be.BedroomEvidence.__new__(be.BedroomEvidence)
