@@ -379,6 +379,73 @@ class LifecycleTests(unittest.TestCase):
             self.assertNotIn("secret", json.dumps(rows))
             self.assertTrue(any("write_failures=" in call.args[0] for call in app.log.call_args_list))
 
+    def test_shutdown_rejects_producer_already_waiting_for_enqueue_lock(self):
+        app = bare_app()
+        checked = threading.Event()
+        original_is_set = app._stop.is_set
+
+        def observe_check():
+            stopped = original_is_set()
+            if not stopped:
+                checked.set()
+            return stopped
+
+        with patch.object(app._stop, "is_set", side_effect=observe_check):
+            with app._lock:
+                producer = threading.Thread(target=app._enqueue, args=("test", "test", {}), daemon=True)
+                producer.start()
+                self.assertTrue(checked.wait(timeout=1))
+                app._stop.set()
+            producer.join(timeout=1)
+        self.assertFalse(producer.is_alive())
+        self.assertTrue(app._queue.empty())
+
+    def test_shutdown_waits_for_producer_inside_enqueue_critical_section(self):
+        app = bare_app()
+        app._listeners = []
+        app._mqtt = None
+        app._writer = MagicMock()
+        app._writer.is_alive.return_value = False
+        entered_put, release_put, stopping = (threading.Event() for _ in range(3))
+        real_lock = threading.Lock()
+        original_put = app._queue.put_nowait
+
+        class ObservedLock:
+            def __enter__(self):
+                if threading.current_thread().name == "evidence-test-stopper":
+                    stopping.set()
+                real_lock.acquire()
+
+            def __exit__(self, *args):
+                real_lock.release()
+
+        def blocked_put(row):
+            entered_put.set()
+            if not release_put.wait(timeout=2):
+                raise AssertionError("producer was not released")
+            original_put(row)
+
+        app._lock = ObservedLock()
+        with patch.object(app._queue, "put_nowait", side_effect=blocked_put):
+            producer = threading.Thread(target=app._enqueue, args=("test", "test", {}), daemon=True)
+            producer.start()
+            self.assertTrue(entered_put.wait(timeout=1))
+            stopper = threading.Thread(target=app.terminate, name="evidence-test-stopper", daemon=True)
+            stopper.start()
+            try:
+                self.assertTrue(stopping.wait(timeout=1))
+                self.assertFalse(app._stop.is_set())
+            finally:
+                release_put.set()
+                producer.join(timeout=1)
+                stopper.join(timeout=1)
+        self.assertFalse(producer.is_alive())
+        self.assertFalse(stopper.is_alive())
+        self.assertTrue(app._stop.is_set())
+        self.assertEqual(app._queue.qsize(), 1)
+        app._enqueue("too_late", "test", {})
+        self.assertEqual(app._queue.qsize(), 1)
+
     def test_archive_path_inside_apps_is_rejected(self):
         app = be.BedroomEvidence.__new__(be.BedroomEvidence)
         app.args = {"archive_dir": "/conf/apps/presence/evidence"}

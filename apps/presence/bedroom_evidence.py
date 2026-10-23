@@ -332,6 +332,10 @@ class BedroomEvidence(hass.Hass):
         if self._stop.is_set():
             return
         with self._lock:
+            # Stop and enqueue share this barrier: the writer may exit as soon as
+            # stop is set and its queue is empty, so no producer may add afterward.
+            if self._stop.is_set():
+                return
             now, mono = time.time(), time.monotonic()
             self._sequence += 1
             record = {"kind": kind, "source": source, "session_id": self._session_id,
@@ -466,7 +470,8 @@ class BedroomEvidence(hass.Hass):
         self._archive.close()
 
     def terminate(self):
-        self._stop.set()
+        with self._lock:
+            self._stop.set()
         for listener in self._listeners:
             self.cancel_listen_state(listener)
         if self._mqtt is not None:
