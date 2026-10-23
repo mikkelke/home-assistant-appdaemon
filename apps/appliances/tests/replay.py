@@ -25,7 +25,7 @@ from __future__ import annotations
 import enum
 import json
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -227,6 +227,7 @@ def _parse_anchor(tape):
 class ReplayResult:
     trace: list  # [{"t": offset_seconds, "published": "Running"}, ...]
     actions: list  # RecordingActionSink.calls, in call order
+    snapshots: list = field(default_factory=list)  # every sampled event, even without a state change
 
 
 class Replay:
@@ -258,6 +259,7 @@ class Replay:
 
     def run(self, engine):
         trace = []
+        snapshots = []
         last_published = None
         for ev in sorted(self.tape["events"], key=lambda e: e["t"]):
             self.scheduler.advance_to(self.anchor + timedelta(seconds=ev["t"]))
@@ -268,7 +270,12 @@ class Replay:
                 trace.append({"t": self.offset(), "published": published})
                 last_published = published
                 self.entities["entity_state"] = published
-        return ReplayResult(trace=trace, actions=list(self.actions_sink.calls))
+            if hasattr(engine, "snapshot"):
+                snapshots.append({"t": self.offset(), **engine.snapshot()})
+        # The real adapter owns its recording sink. Returning Replay's separate
+        # unused sink previously reported [] even when the engine emitted effects.
+        sink = getattr(engine, "actions", self.actions_sink)
+        return ReplayResult(trace=trace, actions=list(sink.calls), snapshots=snapshots)
 
     def _dispatch(self, engine, ev):
         kind = ev["kind"]
@@ -301,7 +308,8 @@ class Replay:
             # mirrored by _RealEngineHandle.initialize() below), never a method on the raw FSM.
             engine.initialize()
         elif kind == "force_emptied":
-            ev2 = Evidence(EvidenceType.FORCE_EMPTIED, EventClass.PHYSICAL, now, "replay.force_emptied", True, {})
+            ev2 = Evidence(EvidenceType.FORCE_EMPTIED, EventClass.PHYSICAL, now, "replay.force_emptied", True,
+                           {"user_id": ev.get("user_id")})
             engine.submit(ev2)
         elif kind == "tick":
             pass  # advance_to() above already did the only thing a bare tick needs to do
@@ -400,12 +408,19 @@ class _RealEngineHandle:
         self._ensure_booted()
         return self._fsm.published
 
+    def snapshot(self):
+        self._ensure_booted()
+        return {"published": self._fsm.published,
+                "attributes": self._policy.presentation(self._fsm.ctx, self._fsm.published),
+                "effect_count": len(self.actions.calls)}
+
     def submit(self, evidence):
         from appliance_fsm import Evidence as RealEvidence, EvidenceType as RealEvidenceType
 
         self._ensure_booted()
         if evidence.type is EvidenceType.FORCE_EMPTIED:
-            self._fsm.submit(RealEvidence.make(RealEvidenceType.FORCE_EMPTIED, self.clock.now(), evidence.source))
+            self._fsm.submit(RealEvidence.make(RealEvidenceType.FORCE_EMPTIED, self.clock.now(), evidence.source,
+                                               payload=evidence.payload))
             return
         watts = (evidence.payload or {}).get("watts")
         if evidence.type in (EvidenceType.POWER_HIGH, EvidenceType.POWER_LOW):

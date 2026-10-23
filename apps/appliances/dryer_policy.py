@@ -122,11 +122,17 @@ def load_programme_profiles(path, log=None):
         return dict(_PROFILE_DEFAULTS)
 
 
-def load_learned_durations(feedback_path, log=None):
-    """dryer_monitor.py:936-963, ported verbatim. Only human-confirmed cycles feed the EMA."""
+def load_learned_durations(feedback_path, log=None, *, strict=False):
+    """Legacy learned-duration calculation, ignoring malformed records.
+
+    Strict reads distinguish a failed refresh from an observed empty history so
+    an unavailable/partially written file cannot erase a previous valid snapshot.
+    """
     log = log or _noop_log
     learned = {}
     if not os.path.exists(feedback_path):
+        if strict:
+            raise FileNotFoundError(feedback_path)
         return learned
     try:
         import json
@@ -134,14 +140,27 @@ def load_learned_durations(feedback_path, log=None):
         with open(feedback_path, "r") as f:
             data = json.load(f)
     except Exception as e:
+        if strict:
+            raise
         log(f"Could not load feedback {feedback_path}: {e}", level="WARNING")
         return learned
-    for c in data.get("cycles") or []:
+    cycles = data.get("cycles") if isinstance(data, dict) else None
+    if strict and (not isinstance(data, dict) or (cycles is not None and not isinstance(cycles, list))):
+        raise ValueError("feedback must contain a cycles list")
+    for c in cycles if isinstance(cycles, list) else []:
+        if not isinstance(c, dict):
+            continue
         if not c.get("programme_confirmed_by_human", c.get("programme_user_confirmed", False)):
             continue
         prog = c.get("confirmed", "")
         dur = c.get("duration_min")
-        if not prog or prog == "unknown" or dur is None or dur <= 0:
+        if not isinstance(prog, str) or not prog or prog == "unknown":
+            continue
+        try:
+            valid_duration = type(dur) in (int, float) and isfinite(dur) and dur > 0
+        except OverflowError:
+            valid_duration = False
+        if not valid_duration:
             continue
         prev = learned.get(prog, {"n": 0, "avg": float(dur)})
         n_new = prev["n"] + 1
@@ -574,6 +593,10 @@ class DryerPolicy:
         # restoring, closing a gap the live dryer_monitor.py's own _feedback_saved_cycle_id never
         # had to close (it is in-memory only there too, but no restore ever replays it).
         self.last_feedback_cycle_id: Optional[str] = None
+        # Our own completed snapshot survives HA erasure; never remeasure a finished
+        # load from its surviving start clock. Raw actor context is not a resolved name.
+        self.completed_attributes = {}
+        self.emptying_context = {}
 
         # Spec 4.2's four watchdogs. Held here (not in `detectors=`, WatchdogTimer's own docstring:
         # "does not wire or tick") - armed/cancelled from actions below and from
@@ -757,6 +780,48 @@ class DryerPolicy:
     def _effective_key(self, ctx):
         return get_confirmed_programme_key(ctx) or self._classify(ctx)
 
+    def presentation(self, ctx, published):
+        """Dryer presentation, separate from lifecycle publication and action dispatch.
+
+        Mirrors the legacy 30-second progress updater using the already shared
+        duration/overrun functions. Actor resolution remains an explicit missing
+        production capability; never borrow a name from the live comparison entity.
+        """
+        from cycle_store import format_utc
+
+        attrs = {"started_by": "", "started_by_method": "unknown"}
+        if published in ("Running", "Paused") and self.start_time:
+            prog = self._classify(ctx)
+            effective = get_confirmed_programme_key(ctx) or prog
+            duration = programme_duration(self.profiles, self.learned, effective)
+            now = ctx.now()
+            elapsed = self._run_minutes(ctx)
+            remaining, progress, overrun = overrun_eta(
+                elapsed, duration, self.keep_fresh_detected, self._live_watts(ctx),
+                self.cfg["main_cycle_power"], self.cfg["overrun_floor_min"],
+            )
+            eta = self.start_time + timedelta(minutes=duration) if overrun <= 0 else now + timedelta(minutes=remaining)
+            attrs.update({
+                "detected_programme": prog, "derived_programme_key": effective,
+                "programme_label": get_profile(self.profiles, effective).get("label", effective),
+                "cycle_start_time": format_utc(self.start_time),
+                # Same local-offset formatter as DryerMonitor._format_local.
+                "started_at_display": self.start_time.astimezone(datetime.now().astimezone().tzinfo).isoformat(timespec="seconds"),
+                "programme_duration_min": duration, "elapsed_minutes": round(elapsed, 1),
+                "progress_pct": progress, "estimated_remaining_min": max(1, round(remaining)),
+                "estimated_end_time": format_utc(eta), "energy_at_start": self.energy_start,
+                "energy_used": round(self._energy_used(ctx), 3),
+            })
+            if overrun > 0:
+                attrs["overrun_min"] = round(overrun, 1)
+        elif published in ("Unemptied", "Emptied"):
+            attrs.update(self.completed_attributes)
+            if published == "Emptied":
+                attrs.update({"emptied_by": "", "emptied_by_method": "unknown"})
+                if self.emptying_context:
+                    attrs["emptying_context"] = dict(self.emptying_context)
+        return attrs
+
     # ---- actions ----
 
     def a_start_confirmed(self, ctx):
@@ -765,6 +830,8 @@ class DryerPolicy:
         watts = (ctx.evidence.payload or {}).get("watts", self.cfg["start_w"])
         ctx.mint_cycle_id()
         self.start_time = ctx.now()
+        self.completed_attributes = {}
+        self.emptying_context = {}
         self.energy_start = self._read_energy(ctx)
         self.keep_fresh_detected = False
         self.notification_sent = False
@@ -834,8 +901,8 @@ class DryerPolicy:
         """Shared 'declare finished' bundle for every table row that lands on FINISHED or EMPTIED -
         builds the feedback record, requests it (engine enforces exactly-once), announces/pushes
         subject to the hypothesis gate (engine-enforced) and the announce_entity toggle
-        (dryer_monitor.py:1775-1851's shape, minus Running-progress attributes - the v2 entity
-        contract, spec 7.3, does not carry those), and arms the ONE watchdog the target state
+        (dryer_monitor.py's completion shape), freezes the completed measurements,
+        and arms the ONE watchdog the target state
         owns (spec 4.2) - `lands_on` is "FINISHED" (arms unemptied) or "EMPTIED" (arms emptied
         directly, skipping unemptied entirely - the cycle never dwells in Unemptied on this route).
         cancel-side watchdog bookkeeping is centralized elsewhere (sync_watchdogs_on_publish)."""
@@ -850,6 +917,16 @@ class DryerPolicy:
         idle_min = run_min - run_minutes if duration_source and run_min > run_minutes else None
         energy_kwh = self._energy_used(ctx)
         confirmed, is_human = get_confirmed_from_selector(ctx, prog)
+        self.completed_attributes = {
+            "cycle_complete": True, "run_time_minutes": round(run_minutes, 1),
+            "derived_programme_key": confirmed, "end_reason": end_reason,
+        }
+        if energy_kwh > 0:
+            self.completed_attributes["energy_used"] = round(energy_kwh, 3)
+        if idle_min is not None:
+            self.completed_attributes["idle_min"] = round(idle_min, 1)
+        if self.keep_fresh_detected:
+            self.completed_attributes["keep_fresh_detected"] = True
         record = build_feedback_record(
             ts_local=ctx.now().isoformat(), predicted=prog, confirmed=confirmed, duration_min=run_minutes,
             energy_kwh=energy_kwh, max_power_w=self.max_power_w, programme_confirmed_by_human=is_human,
@@ -939,6 +1016,11 @@ class DryerPolicy:
         new feedback record - the cycle already saved one becoming Unemptied; only the emptied
         watchdog is new here (unemptied's own cancel is sync_watchdogs_on_publish's job)."""
         ctx.log("Force Emptied via dashboard event", level="INFO")
+        self.emptying_context = {
+            "source": ctx.evidence.source,
+            "user_id": (ctx.evidence.payload or {}).get("user_id"),
+            "observed_at": ctx.now().isoformat(), "resolution": "unresolved",
+        }
         self.watchdogs["emptied"].arm(ctx)
 
     def a_door_emptying_from_finished(self, ctx):
@@ -1000,6 +1082,8 @@ class DryerPolicy:
         self.max_power_w = 0.0
         self.detected_programme = "unknown"
         self.expected_dur_at_start = None
+        self.completed_attributes = {}
+        self.emptying_context = {}
 
     def sync_watchdogs_on_publish(self, ctx, state):
         """Cancel-only watchdog sync, keyed purely on the LANDED internal state - called from
@@ -1115,6 +1199,8 @@ class DryerPolicy:
         ("door_opened_during_cycle", "door_opened_during_cycle", False), ("door_opened_time", "door_opened_time", True),
         ("keep_fresh_detected", "keep_fresh_detected", False), ("notification_sent", "notification_sent", False),
         ("last_feedback_cycle_id", "last_feedback_cycle_id", False),
+        ("completed_attributes", "completed_attributes", False),
+        ("emptying_context", "emptying_context", False),
     )
 
     def to_store_fields(self):
@@ -1128,10 +1214,17 @@ class DryerPolicy:
 
     def restore_from(self, fields):
         from cycle_store import parse_utc
+        from dryer_shadow_contract import validated_completed, validated_emptying_context
 
         fields = fields or {}
         for key, attr, is_dt in self._STORE_FIELDS:
             if key not in fields or fields[key] in (None, ""):
+                continue
+            if key == "completed_attributes":
+                self.completed_attributes = validated_completed(fields[key])
+                continue
+            if key == "emptying_context":
+                self.emptying_context = validated_emptying_context(fields[key])
                 continue
             setattr(self, attr, parse_utc(fields[key]) if is_dt else fields[key])
         if fields.get("detected_programme"):
@@ -1154,7 +1247,7 @@ def _coerce_counter(value):
         return None
 
 
-def resolve_shadow_progress(*, file_data, entity_attrs, code_fingerprint):
+def resolve_shadow_progress(*, file_data, entity_attrs, code_fingerprint, input_fingerprint=None):
     """Restore the shadow's cutover evidence across an app reload (spec section 7.4's counter).
 
     `clean_cycles` counts consecutive divergence-free cycles and is the gate for promoting the
@@ -1189,6 +1282,8 @@ def resolve_shadow_progress(*, file_data, entity_attrs, code_fingerprint):
                 **zero, "source": source,
                 "reset_reason": "engine code changed since it was recorded (or its current fingerprint is unavailable)",
             }
+        if input_fingerprint is not None and data.get("input_fingerprint") != input_fingerprint:
+            return {**zero, "source": source, "reset_reason": "effective configuration/profiles/learned inputs changed"}
         return {
             "clean_cycles": clean,
             "divergence_count": _coerce_counter(data.get("divergence_count")) or 0,

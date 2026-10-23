@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections import deque
 from pathlib import Path
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
@@ -66,16 +67,22 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from cycle_store import CycleStore, format_utc, parse_utc
 
+from completed_measurements import completed_measurements
+from dryer_shadow_contract import compare_attributes, input_fingerprint, validated_completed
+
 E = EvidenceType
 _UNAVAILABLE = (None, "unknown", "unavailable")
 
-# The engine IS these four files together, not just this host (2026-09 audit F2):
+# The engine includes its shared presentation/persistence dependencies, not just this host:
 # _compute_fingerprint used to hash only dryer_shadow.py, so a change to the policy, the
 # transition table, a guard/action body, or a detector went completely undetected -
 # resolve_shadow_progress would keep trusting a stored clean_cycles count, and corroborate_restore
 # would keep trusting a stored code_fingerprint, that both actually describe a DIFFERENT engine.
 # Sorted (already alphabetical here) so the hash is stable regardless of how this tuple is written.
-_FINGERPRINT_MODULES = ("appliance_detectors.py", "appliance_fsm.py", "dryer_policy.py", "dryer_shadow.py")
+_FINGERPRINT_MODULES = (
+    "appliance_detectors.py", "appliance_fsm.py", "completed_measurements.py", "cycle_store.py",
+    "dryer_policy.py", "dryer_shadow.py", "dryer_shadow_contract.py",
+)
 
 
 def _hash_engine_files(directory):
@@ -106,24 +113,30 @@ class ShadowActions:
         self.selected = []
         self.resets = []
         self.feedback = []
+        self.calls = deque(maxlen=64)
 
     def announce(self, message, **kwargs):
         self.announced.append(message)
+        self.calls.append({"kind": "announce", "message": message, **kwargs})
         self._log(f"[shadow] would announce: {message}", level="INFO")
 
     def push_mobile(self, message, **kwargs):
         self.pushed.append(message)
+        self.calls.append({"kind": "push_mobile", "message": message, **kwargs})
         self._log(f"[shadow] would push: {message}", level="INFO")
 
     def select_option(self, entity, option, **kwargs):
         self.selected.append((entity, option))
+        self.calls.append({"kind": "select_option", "entity": entity, "option": option, **kwargs})
 
     def reset_selectors(self, **kwargs):
         self.resets.append(kwargs)
+        self.calls.append({"kind": "reset_selectors", **kwargs})
 
     def save_feedback(self, record):
         # In-memory only - the shadow never touches dryer_feedback.json (own-store isolation).
         self.feedback.append(record)
+        self.calls.append({"kind": "save_feedback", "record": dict(record)})
 
 
 class _SchedulerAdapter:
@@ -176,7 +189,17 @@ class DryerShadow(hass.Hass):
 
         programmes_file = self.args.get("programmes_file") or str(Path(__file__).with_name("dryer_programmes.yaml"))
         profiles = policy_mod.load_programme_profiles(programmes_file, log=self.log)
-        policy = policy_mod.DryerPolicy(config=cfg, profiles=profiles)
+        # Same human-confirmed input as legacy. Refresh only at boot/new-cycle
+        # boundaries; a partial cycle must never count in a new input cohort.
+        self._feedback_file = self.args.get("feedback_file") or Path(__file__).with_name("dryer_feedback.json")
+        try:
+            learned = policy_mod.load_learned_durations(self._feedback_file, log=self.log, strict=True)
+            self._learning_input_status = "observed"
+        except (OSError, ValueError, TypeError):
+            learned = {}
+            self._learning_input_status = "unobserved"
+        policy = policy_mod.DryerPolicy(config=cfg, profiles=profiles, learned=learned)
+        self._input_fingerprint = input_fingerprint(cfg, profiles, learned)
 
         state_file = self.args.get("state_file") or Path(__file__).with_name("dryer_shadow_state.json")
         self._store = CycleStore(state_file, "dryer_shadow", log=self.log)
@@ -219,6 +242,7 @@ class DryerShadow(hass.Hass):
         progress = policy_mod.resolve_shadow_progress(
             file_data=self._load_progress(), entity_attrs=entity_attrs,
             code_fingerprint=self._code_fingerprint,
+            input_fingerprint=self._input_fingerprint,
         )
         self._clean_cycles = progress["clean_cycles"]
         self._divergence_count = progress["divergence_count"]
@@ -241,6 +265,14 @@ class DryerShadow(hass.Hass):
         if snap is not None:
             initial_state = RESTORE_STATE_OF.get(snap["state"], State.OFF)
             policy.restore_from(snap["store_fields"])
+            if snap["source"] == "entity" and snap["state"] in ("Unemptied", "Emptied"):
+                # The boot snapshot is the only v2 entity read. A missing completed
+                # snapshot stays missing, even if an old start clock survived.
+                snapshot = completed_measurements(snap["state"], full) or {}
+                for key in ("derived_programme_key", "cycle_complete", "keep_fresh_detected"):
+                    if key in entity_attrs:
+                        snapshot[key] = entity_attrs[key]
+                policy.completed_attributes.update(validated_completed(snapshot))
             cycle_id = snap["cycle_id"]
             state_since = parse_utc(snap["state_since"]) if snap["state_since"] else None
             if initial_state in (State.RUNNING, State.PAUSED):
@@ -280,8 +312,10 @@ class DryerShadow(hass.Hass):
 
         self.listen_event(self._on_force_emptied, "dryer_force_emptied")
         self.listen_event(self._on_emptied_button, "state_changed", entity_id=self.emptied_button_entity)
+        self.listen_state(self._on_live_changed, self.live_state_entity, attribute="all")
         self.fsm.start(tick_interval_s=60)
         self._arm_divergence_tick(60)
+        self.run_in(self._presentation_tick, 30)
 
         self.log(f"DryerShadow initialized - state: {self.fsm.state.name} (published {self.fsm.published})", level="INFO")
 
@@ -303,7 +337,11 @@ class DryerShadow(hass.Hass):
         self.listen_state(lambda e, a, o, n, kw: handler(e, o, n, self.fsm.ctx), entity)
 
     def _on_force_emptied(self, event_name, data, kwargs):
-        self.fsm.submit(Evidence.make(E.FORCE_EMPTIED, self.fsm.ctx.now(), "dryer_force_emptied_event"))
+        data = data or {}
+        self.fsm.submit(Evidence.make(
+            E.FORCE_EMPTIED, self.fsm.ctx.now(), "dryer_force_emptied_event",
+            payload={"user_id": (data.get("context") or {}).get("user_id")},
+        ))
 
     def _on_emptied_button(self, event_name, data, kwargs):
         """input_button.dryer_emptied press, submitted exactly like the dryer_force_emptied event
@@ -320,13 +358,18 @@ class DryerShadow(hass.Hass):
             return
         if old_state_raw is None or old in _UNAVAILABLE:
             return
-        self._on_force_emptied(event_name, data, kwargs)
+        self.fsm.submit(Evidence.make(
+            E.FORCE_EMPTIED, self.fsm.ctx.now(), "dryer_emptied_button",
+            payload={"user_id": (new_state.get("context") or {}).get("user_id")},
+        ))
 
     def _publish(self, published, *, internal, store_only, attrs):
         """The engine's only write path (spec section 2's store-only rule: same-published-value
         transitions persist the store but never re-publish to HA). Also the single point every
         landed transition passes through, so watchdog cancel-sync and divergence tracking cannot
         be missed by a future table row (see dryer_policy.sync_watchdogs_on_publish)."""
+        if internal == State.RUNNING and self._prev_internal == State.STARTING:
+            self._refresh_learning()
         self._policy.sync_watchdogs_on_publish(self.fsm.ctx, internal)
         self._policy.sync_selectors_on_publish(self.fsm.ctx, internal)
 
@@ -339,12 +382,56 @@ class DryerShadow(hass.Hass):
         self._prev_internal = internal
         self._save_progress()
 
-        self._save_store(store_only=store_only)
         if store_only:
+            self._save_store(store_only=True)
             self._check_divergence()
             return
 
-        v2_attrs = {"internal_state": attrs["internal_state"], "cycle_id": attrs.get("cycle_id") or ""}
+        self._presentation_attrs = self._policy.presentation(self.fsm.ctx, published)
+        self._save_store(store_only=False)
+        self._write_presentation()
+        self._check_divergence()
+
+    def _refresh_learning(self):
+        """Read the authoritative legacy feedback before a new cycle's first publish."""
+        try:
+            learned = policy_mod.load_learned_durations(self._feedback_file, log=self.log, strict=True)
+        except (OSError, ValueError, TypeError):
+            self._learning_input_status = "unobserved"
+            self.log("Learned input refresh unavailable - retaining previous effective inputs", level="WARNING")
+            return
+        self._learning_input_status = "observed"
+        fingerprint = input_fingerprint(self._policy.cfg, self._policy.profiles, learned)
+        if fingerprint != self._input_fingerprint:
+            self._policy.learned = learned
+            self._input_fingerprint = fingerprint
+            self._clean_cycles = self._divergence_count = self._divergence_count_at_last_off = 0
+            self._last_divergence = self._divergence_pending = self._divergence_active = None
+            self.log("Cutover evidence starts at 0 - learned inputs changed at new cycle", level="INFO")
+
+    def _write_presentation(self, live_full=None):
+        """Attribute-only refresh: no lifecycle/selector/store/clean-cycle side effects."""
+        attrs = {"internal_state": self.fsm.state.name, "cycle_id": self.fsm.cycle_id,
+                 "hypothesis": self.fsm.hypothesis}
+        live_full = live_full if isinstance(live_full, dict) else self.get_state(self.live_state_entity, attribute="all")
+        live_full = live_full or {}
+        comparison = compare_attributes(
+            self.fsm.published, self._presentation_attrs,
+            live_full.get("state"), live_full.get("attributes") or {},
+        )
+        v2_attrs = {
+            **self._presentation_attrs,
+            "internal_state": attrs["internal_state"], "cycle_id": attrs.get("cycle_id") or "",
+            "input_fingerprint": self._input_fingerprint,
+            "learning_input_status": self._learning_input_status,
+            "learning_input_scope": "boot_and_cycle_start",
+            "comparison_scope": "immediate_attributes; clean_cycles=debounced_state_only",
+            "attribute_comparison": comparison,
+            "effect_comparison": "unobserved",
+            "effect_intents": list(self._actions.calls)[-12:],
+            "actor_resolution": "unimplemented",
+        }
+
         if attrs.get("hypothesis"):
             v2_attrs["hypothesis"] = "true"
         if self._code_fingerprint:
@@ -356,13 +443,26 @@ class DryerShadow(hass.Hass):
             v2_attrs["last_divergence"] = self._last_divergence["text"]
             v2_attrs["last_divergence_at"] = format_utc(self._last_divergence["at"])
             v2_attrs["last_divergence_kind"] = self._last_divergence["kind"]
-        self.set_state(self.state_entity, state=published, attributes=v2_attrs, replace=True)
+        self.set_state(self.state_entity, state=self.fsm.published, attributes=v2_attrs, replace=True)
+
+    def _presentation_tick(self, kwargs):
+        self._presentation_attrs = self._policy.presentation(self.fsm.ctx, self.fsm.published)
+        self._write_presentation()
+        self.run_in(self._presentation_tick, 30)
+
+    def _on_live_changed(self, entity, attribute, old, new, kwargs):
+        # Raw observations are visible immediately, including mismatches shorter
+        # than the lifecycle comparator's 90-second debounce.
+        # Explicit deletion is an observation too; do not replace it with a
+        # possibly lagging cache read merely because the callback supplied None.
+        self._write_presentation(live_full=new if isinstance(new, dict) else {"state": None})
         self._check_divergence()
 
     def _save_store(self, *, store_only):
         payload = {
             "state": self.fsm.published, "state_since": format_utc(self.fsm.state_since) if self.fsm.state_since else None,
             "cycle_id": self.fsm.cycle_id, "code_fingerprint": self._code_fingerprint,
+            "input_fingerprint": self._input_fingerprint,
             **self._policy.to_store_fields(),
         }
         if self.fsm.published == "Off":
@@ -389,6 +489,7 @@ class DryerShadow(hass.Hass):
             "divergence_count": self._divergence_count,
             "divergence_count_at_last_off": self._divergence_count_at_last_off,
             "code_fingerprint": self._code_fingerprint,
+            "input_fingerprint": self._input_fingerprint,
         }
         fsm = getattr(self, "fsm", None)
         if fsm is not None:

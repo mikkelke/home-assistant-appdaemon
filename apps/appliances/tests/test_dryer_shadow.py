@@ -297,7 +297,7 @@ class EmptiedButtonSubmitsForceEmptied(unittest.TestCase):
             self.assertEqual(app.fsm.state.name, "EMPTIED")
             self.assertEqual(entities[V2]["state"], "Emptied")
 
-    def test_button_press_submits_the_same_evidence_as_the_legacy_event(self):
+    def test_button_press_keeps_physical_semantics_and_its_own_actor_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             app, _ = self._finished_shadow(tmp)
             app._on_force_emptied("dryer_force_emptied", {"reason": "Dashboard"}, {})
@@ -307,9 +307,12 @@ class EmptiedButtonSubmitsForceEmptied(unittest.TestCase):
             self._press(app, self.OLD, self.NEW)
             (button,) = app.submitted
         self.assertEqual(
-            (button.type, button.event_class, button.source, button.live, button.payload),
-            (legacy.type, legacy.event_class, legacy.source, legacy.live, legacy.payload),
+            (button.type, button.event_class, button.live),
+            (legacy.type, legacy.event_class, legacy.live),
         )
+        self.assertEqual(button.payload, {"user_id": "abc123"})
+        self.assertEqual(button.source, "dryer_emptied_button")
+        self.assertEqual(legacy.payload, {"user_id": None})
 
     def test_restore_and_no_op_events_submit_nothing(self):
         """A restart replays the helper as None/unknown/unavailable -> last-press timestamp (and
