@@ -1,0 +1,20 @@
+# Temporary passive evidence capture for item 6 (bedroom false-return investigation).
+# Remove after useful episodes. No device commands, HA writes or automation changes.
+# MQTT payloads are published Z2M JSON, NOT raw Zigbee/ZCL reports.
+# Exact allowlists, 120s correlation window, 512 queued records, 8 KiB MQTT payload cap,
+# 16 MiB total / 128 segments / 7 days since segment's last write are fixed in Python.
+# Runtime JSONL is private under /conf/logs; never inside the synced apps tree.
+#
+# Box-only prerequisite: copy the existing broker account into these two keys in
+# /conf/secrets.yaml without printing values. No broker/plugin/container restart.
+# Paho MQTT 2.1.0 is already installed. Main log only; no new named log stream.
+BedroomEvidence:
+  module: bedroom_evidence
+  class: BedroomEvidence
+  archive_dir: /conf/logs/bedroom_evidence
+  mqtt_enabled: true
+  # AppDaemon uses host networking; the Z2M-only Docker name "mqtt" does not resolve here.
+  mqtt_host: 127.0.0.1
+  mqtt_port: 1883
+  mqtt_user: !secret bedroom_evidence_mqtt_user
+  mqtt_password: !secret bedroom_evidence_mqtt_password
