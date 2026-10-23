@@ -735,7 +735,7 @@ class ControlAirChain(unittest.TestCase):
         old = self.h.clock.now - timedelta(minutes=200)
         self.h.ha.set(
             THERMOSTATS["family"],
-            "heat",
+            "unavailable",
             {"current_temperature": 22.8, "temperature": 15.0},
             updated=old,
         )
@@ -750,7 +750,7 @@ class ControlAirChain(unittest.TestCase):
         self.h.ha.set(
             THERMOSTATS["family"],
             "heat",
-            {"current_temperature": 22.8, "temperature": 15.0},
+            {"current_temperature": None, "temperature": 15.0},
             updated=old,
         )
         self.h.ha.set("sensor.living_room_floor_thermometer_temperature", "21.0", updated=old)
@@ -759,6 +759,97 @@ class ControlAirChain(unittest.TestCase):
         self.assertEqual((a["mode"], a["control_air_source"]), ("fallback", "none"))
         self.assertEqual(a["setpoint_now"], 22.0)
         self.assertTrue(a["stale_inputs"])
+
+    def test_normal_heartbeat_and_unchanged_online_state_are_usable(self):
+        for age_min in (60.0, 65.6, 131.2, 225.0, 24 * 60.0):
+            with self.subTest(age_min=age_min):
+                old = self.h.clock.now - timedelta(minutes=age_min)
+                self.h.ha.set(
+                    THERMOSTATS["family"], "heat",
+                    {"current_temperature": 22.8, "temperature": 15.0}, updated=old,
+                )
+                # An HA state_changed snapshot can also carry an old last_reported;
+                # unchanged reports do not update AppDaemon's cached snapshot.
+                self.h.ha.entities[THERMOSTATS["family"]]["last_reported"] = old.isoformat()
+                self.h.tick()
+                attrs = self.h.attrs("family")
+                self.assertNotIn(
+                    f"thermostat_reading:{THERMOSTATS['family']}", attrs["stale_inputs"]
+                )
+                self.assertEqual(attrs["thermostat_freshness_source"], "availability")
+                self.assertEqual(
+                    datetime.fromisoformat(attrs["thermostat_state_updated_at"]), old
+                )
+
+    def test_unchanged_online_temperature_is_a_usable_fallback_and_trim_sample(self):
+        old = self.h.clock.now - timedelta(hours=6)
+        self.h.ha.set(
+            THERMOSTATS["family"], "heat",
+            {"current_temperature": 22.8, "temperature": 15.0}, updated=old,
+        )
+        app, rt = self.h.app, self.h.app._zones["family"]
+        now_ts = self.h.clock.now.timestamp()
+        rt.setpoint_changed_ts = old.timestamp()
+        reading = app._read_zone(rt, now_ts, False)
+        self.assertAlmostEqual(
+            app._trim_sample(rt, types.SimpleNamespace(mode=hp.MODE_HOLD), reading, False, now_ts),
+            0.6,
+        )
+        for feel in FEELS["family"]:
+            self.h.ha.set(feel, "unavailable")
+        reading = app._read_zone(rt, now_ts, False)
+        self.assertEqual((reading["air"], reading["air_source"]), (22.8, "thermostat"))
+        self.assertTrue(reading["air_fresh"])
+
+    def test_missing_state_timestamp_is_unknown_age_not_a_stale_thermostat(self):
+        self.h.ha.entities[THERMOSTATS["family"]].pop("last_updated")
+        self.h.tick()
+        attrs = self.h.attrs("family")
+        self.assertNotIn("thermostat_state_updated_at", attrs)
+        self.assertNotIn(f"thermostat_reading:{THERMOSTATS['family']}", attrs["stale_inputs"])
+
+    def test_lost_device_with_cached_temperature_is_not_a_reading_or_trim_sample(self):
+        old = self.h.clock.now - timedelta(minutes=200)
+        self.h.ha.set(
+            THERMOSTATS["family"], "unavailable",
+            {"current_temperature": 22.8, "temperature": 15.0}, updated=old,
+        )
+        app, rt = self.h.app, self.h.app._zones["family"]
+        now_ts = self.h.clock.now.timestamp()
+        rt.setpoint_changed_ts = old.timestamp()
+        reading = app._read_zone(rt, now_ts, False)
+        self.assertIsNone(reading["therm_temp"])
+        self.assertFalse(reading["therm_usable"])
+        self.assertIn(f"thermostat:{THERMOSTATS['family']}", reading["stale"])
+        self.assertIsNone(
+            app._trim_sample(rt, types.SimpleNamespace(mode=hp.MODE_HOLD), reading, False, now_ts)
+        )
+
+    def test_online_invalid_temperature_is_still_rejected(self):
+        for value in (None, "unknown", "unavailable", "nan", "inf", -20, 88):
+            with self.subTest(value=value):
+                self.h.ha.set(
+                    THERMOSTATS["family"], "heat",
+                    {"current_temperature": value, "temperature": 15.0},
+                )
+                self.h.tick()
+                attrs = self.h.attrs("family")
+                self.assertIn(f"thermostat_reading:{THERMOSTATS['family']}", attrs["stale_inputs"])
+                self.assertEqual(attrs["control_air_source"], "feel")
+
+    def test_floor_fallback_freshness_is_not_widened_to_fit_salus(self):
+        for feel in FEELS["family"]:
+            self.h.ha.set(feel, "unavailable")
+        self.h.ha.set(THERMOSTATS["family"], "unavailable")
+        self.h.ha.set(
+            "sensor.living_room_floor_thermometer_temperature", "21.0",
+            updated=self.h.clock.now - timedelta(minutes=65.6),
+        )
+        reading = self.h.app._read_zone(
+            self.h.app._zones["family"], self.h.clock.now.timestamp(), False
+        )
+        self.assertEqual(reading["air_source"], "floor")
+        self.assertFalse(reading["air_fresh"])
 
     def test_an_impossible_reading_is_ignored(self):
         self.h.ha.set("sensor.living_room_feel", "88.0", {"stale": "false"})
@@ -2720,7 +2811,7 @@ class AlertsEndToEnd(unittest.TestCase):
         h.ha.set(
             THERMOSTATS["family"],
             "heat",
-            {"current_temperature": 22.8, "temperature": 15.0},
+            {"current_temperature": None, "temperature": 15.0},
             updated=old,
         )
         h.ha.set(LIVING_FLOOR, "21.0", updated=old)

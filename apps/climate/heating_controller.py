@@ -67,7 +67,7 @@ import heating_signals as sig
 TICK_SECONDS = 300
 DECISION_REPEAT_S = 1800.0
 MAX_TICK_GAP_S = 900.0
-THERMOSTAT_FRESH_MIN = 60.0
+FLOOR_FRESH_MIN = 60.0
 OUTDOOR_FRESH_MIN = 20.0
 NO_SETPOINT_CHANGE_S = 7200.0
 DAILY_KEEP = 60
@@ -980,8 +980,14 @@ class HeatingController(hass.Hass):
         therm_temp = self._guard.filter(
             zc.thermostat, attrs.get("current_temperature"), now_ts, window_active
         )
-        therm_age = None if not snap or snap["ts"] is None else (now_ts - snap["ts"]) / 60.0
-        if online and (therm_temp is None or therm_age is None or therm_age > THERMOSTAT_FRESH_MIN):
+        # Salus reports about every 65.6 min; unchanged reports need not generate an HA
+        # state_changed event. AppDaemon's cached last_updated (or last_reported) therefore
+        # cannot time device reports. Use z2m's availability (150 min timeout) and a valid
+        # reading; retain the age of the *state change* only as a diagnostic. Do not invent
+        # a report timestamp on each evaluation or let unrelated attribute changes renew it.
+        therm_state_age = None if not snap or snap["ts"] is None else (now_ts - snap["ts"]) / 60.0
+        therm_usable = online and therm_temp is not None
+        if online and not therm_usable:
             stale.append(f"thermostat_reading:{zc.thermostat}")
 
         feels, sun_hit = [], False
@@ -1006,10 +1012,13 @@ class HeatingController(hass.Hass):
             if floor_temp is None:
                 stale.append(f"floor:{zc.floor_sensor}")
 
-        therm_pair = None if therm_temp is None or therm_age is None else (therm_temp, therm_age)
         floor_pair = None if floor_temp is None or floor_age is None else (floor_temp, floor_age)
-        air, source = hp.resolve_control_air(feels, therm_pair, floor_pair)
-        fresh_age = {"thermostat": therm_age, "floor": floor_age}.get(source)
+        # The thermostat's availability is its freshness signal. The floor fallback still
+        # has the planner's existing age limit; do not widen it to fit the Salus heartbeat.
+        if not any(value is not None for value in feels) and therm_usable:
+            air, source = therm_temp, "thermostat"
+        else:
+            air, source = hp.resolve_control_air(feels, None, floor_pair)
         return {
             "online": online,
             "hvac_mode": state,
@@ -1017,12 +1026,14 @@ class HeatingController(hass.Hass):
             "setpoint": _num(attrs.get("temperature")),
             "hvac_action": attrs.get("hvac_action"),
             "therm_temp": therm_temp,
-            "therm_age": therm_age,
+            "therm_state_age": therm_state_age,
+            "therm_state_updated_ts": snap["ts"] if snap else None,
+            "therm_usable": therm_usable,
             "floor_temp": floor_temp,
             "air": air,
             "air_source": source,
-            "air_fresh": source == "feel"
-            or (fresh_age is not None and fresh_age <= THERMOSTAT_FRESH_MIN),
+            "air_fresh": source in ("feel", "thermostat")
+            or (source == "floor" and floor_age is not None and floor_age <= FLOOR_FRESH_MIN),
             "sun_hit": sun_hit,
             "stale": stale,
         }
@@ -1223,12 +1234,11 @@ class HeatingController(hass.Hass):
             rt.setpoint_changed_ts is not None
             and now_ts - rt.setpoint_changed_ts >= NO_SETPOINT_CHANGE_S
         )
-        fresh = reading["therm_age"] is not None and reading["therm_age"] <= THERMOSTAT_FRESH_MIN
         if (
             plan.mode == hp.MODE_HOLD
             and reading["air_source"] == "feel"
             and reading["therm_temp"] is not None
-            and fresh
+            and reading["therm_usable"]
             and quiet
             and not window_active
             and not reading["sun_hit"]
@@ -1544,6 +1554,8 @@ class HeatingController(hass.Hass):
                 "online": reading["online"],
                 "mode": reading["hvac_mode"],
                 "temp": reading["therm_temp"],
+                "state_age_min": reading["therm_state_age"],
+                "freshness_source": "availability",
                 "setpoint": reading["setpoint"],
                 "action": reading["hvac_action"],
             },
@@ -1696,6 +1708,11 @@ class HeatingController(hass.Hass):
             "control_air": None if reading["air"] is None else round(reading["air"], 1),
             "control_air_source": reading["air_source"],
             "thermostat_temp": reading["therm_temp"],
+            "thermostat_state_updated_at": (
+                iso(reading["therm_state_updated_ts"])
+                if reading["therm_state_updated_ts"] is not None else None
+            ),
+            "thermostat_freshness_source": "availability",
             "floor_temp": reading["floor_temp"],
             "next_change_at": iso(next_change[0]) if next_change else None,
             "next_setpoint": next_change[3] if next_change else None,

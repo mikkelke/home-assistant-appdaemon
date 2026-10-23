@@ -2,7 +2,7 @@
 
 User direction (2026-07-16): the earlier Claudias-room frost feed entry focused on one
 room, but the real rule is general - short airing with the heat on is normal, an opening
-left open for LONG with the radiator running wastes heat and over-cools the room. This
+left open for LONG with the floor heating running wastes heat and over-cools the room. This
 guard watches every room that has both an outward opening contact and a heating-active
 sensor, apartment-wide.
 
@@ -11,15 +11,14 @@ grace_minutes straight -> ONE public house-activity entry per episode (public be
 whoever happens to be home can close it), plus ONE mobile push to the room's own
 audience (per-room `notify` list in the yaml: Mikkel everywhere; Kristine/Claudia for
 their own rooms and the shared family space). A recipient without a phone in
-MobileNotifier's device_mapping (Claudia until she moves in) resolves to nothing and
-is silently skipped - the routing is ready the day her phone is added. An episode is
+MobileNotifier's device_mapping resolves to nothing and is silently skipped. An episode is
 the open-span: it re-arms only when every watched contact in the room is closed again,
 so heating cycling off and on under an open window can't double-report. Summer-silent
 by construction (heating_active simply never turns on). The too-cold half of the same
 problem is climate_alarm's job (mobile push); this guard covers the heat-waste half.
 
 Interior room doors are deliberately not watched - heat moving between rooms is not
-waste. rooftop_door_1 is unmapped until its inner room is confirmed (see yaml).
+waste. The living-room window and terrace door share one open episode.
 """
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
@@ -87,13 +86,17 @@ class OpenWhileHeatingGuard(hass.Hass):
             self._reported.add(room)
             cfg = self.rooms.get(room) or {}
             label = cfg.get("label", str(room).replace("_", " ").capitalize())
-            opening = cfg.get("opening", "window")
+            labels = cfg.get("opening_labels") or {}
+            opening = " and ".join(dict.fromkeys(
+                labels.get(contact, cfg.get("opening", "window"))
+                for contact in self._open_contacts(room)
+            ))
             self.fire_event(
                 "house_events_report",
                 cause=f"{label} {opening} open {self.grace_min:.0f}+ min with heating on",
                 # Reader-neutral wording (user 2026-07-30): the log is read by anybody, so no
                 # "you" - the phone push keeps its personal phrasing, this entry does not.
-                effect=f"Radiator is heating past an open {opening} - worth closing it soon",
+                effect=f"Heating is running past an open {opening} - worth closing it soon",
                 icon="mdi:window-open-variant",
             )
             self._push(room, cfg, label, opening)

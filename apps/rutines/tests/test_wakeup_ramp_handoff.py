@@ -38,7 +38,7 @@ def make_ramp_app(session, ramp_active=True, session_listener=None, current_pct=
     app.ramp_max_pct = 90
     app.ramp_step_pct = 6
     app.ramp_interval_sec = 60
-    app.adaptive_main_switch = "switch.adaptive_lighting_bedroom"
+    app.adaptive_main_switch = "switch.adaptive_lighting_bedroom_bed_lights"
     app.light_entity = "light.bedroom_bed_lights"
     app.user_log = "test_log"
     app.log = lambda *a, **kw: None

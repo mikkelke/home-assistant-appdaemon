@@ -62,12 +62,8 @@ class MobileNotifier(hass.Hass):
                     # Extract person name from entity (e.g., "person.mikkel" -> "mikkel")
                     person_name = person_entity.replace("person.", "").lower()
                     
-                    # Person is home if state is "home" or their zone
+                    # Other zones (e.g. Office) and unknown presence are not home.
                     if person_state == "home":
-                        people_home.append(person_name)
-                    # Also check if person is in a specific zone (not "not_home")
-                    elif person_state and person_state != "not_home" and person_state != "unavailable":
-                        # Could be a zone name, treat as home
                         people_home.append(person_name)
                 except Exception as e:
                     self.log(f"Error checking person {person_entity}: {e}", level="WARNING")

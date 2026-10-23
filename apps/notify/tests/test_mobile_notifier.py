@@ -98,6 +98,32 @@ def _make_notifier(**overrides):
     return app
 
 
+class TestPeopleHome(unittest.IsolatedAsyncioTestCase):
+    async def test_only_home_state_is_a_home_recipient(self):
+        app = _make_notifier(person_entities=["person.mikkel"])
+        for state in ("home", "not_home", "Office", "unknown", "unavailable", None, ""):
+            with self.subTest(state=state):
+                app.get_state = AsyncMock(return_value=state)
+                self.assertEqual(await app.get_people_home(), ["mikkel"] if state == "home" else [])
+
+    async def test_home_broadcast_keeps_only_present_people_and_category_audience(self):
+        app = _make_notifier(
+            person_entities=["person.mikkel", "person.kristine", "person.claudia"],
+            device_mapping={"mikkel": ["notify.owner"], "kristine": ["notify.kristine"],
+                            "claudia": ["notify.claudia"]},
+            category_audience={"ac": ["mikkel"]},
+        )
+        async def state(entity):
+            return {"person.mikkel": "home", "person.kristine": "Office",
+                    "person.claudia": "unknown"}[entity]
+        app.get_state = state
+        self.assertEqual(await app._resolve_services("home", "weather"), ["notify.owner"])
+        self.assertEqual(await app._resolve_services("home", "ac"), ["notify.owner"])
+        # Explicit recipients are independent of whether they are at home.
+        self.assertEqual(await app._resolve_services(["kristine", "claudia"]),
+                         ["notify.kristine", "notify.claudia"])
+
+
 class TestNotifyReturnValue(unittest.IsolatedAsyncioTestCase):
     """notify() returns the number of services actually delivered to (an int, 0 when none),
     not None - callers (e.g. FireSafety's fault-push throttle) need to tell "silently

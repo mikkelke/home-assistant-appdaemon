@@ -114,7 +114,7 @@ def ramp_app(*, current_pct=50, adaptive_target=None, session="on", dark=True):
     app = _bare_app()
     app.light_entity = LIGHT
     app.adaptive_brightness_switch = AL_BRIGHTNESS
-    app.adaptive_main_switch = "switch.adaptive_lighting_bedroom"
+    app.adaptive_main_switch = "switch.adaptive_lighting_bedroom_bed_lights"
     app.bed_session_entity = "input_boolean.bedroom_bed_session"
     app.ramp_active = True
     app.ramp_timer = None
@@ -131,6 +131,22 @@ def ramp_app(*, current_pct=50, adaptive_target=None, session="on", dark=True):
     app._room_dark_for_wake_light = lambda: dark
     app.get_state = lambda entity, **kw: session
     return app
+
+
+class ConfiguredAdaptiveBrightnessTarget(unittest.TestCase):
+    def test_real_config_reads_bed_lights_target_and_caps_it(self):
+        import yaml
+        config = yaml.safe_load(Path(wb.__file__).with_suffix(".yaml").read_text())["WakeupBedroom"]
+        app = _bare_app()
+        app.adaptive_main_switch = config["adaptive_main_switch"]
+        app.ramp_max_pct = config["ramp_max_pct"]
+        for target, expected in ((83.23, 83), (98, 90), (None, 90)):
+            with self.subTest(target=target):
+                available = ({"attributes": {"brightness_pct": target}} if target is not None else None)
+                app.get_state = MagicMock(side_effect=lambda entity, **kw:
+                    available if entity == "switch.adaptive_lighting_bedroom_bed_lights" else None)
+                self.assertEqual(app._ramp_target_pct(), expected)
+                app.get_state.assert_called_once_with("switch.adaptive_lighting_bedroom_bed_lights", attribute="all")
 
 
 class BlindWriteGoesThroughTheOwner(unittest.TestCase):

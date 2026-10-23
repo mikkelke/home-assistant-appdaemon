@@ -3100,13 +3100,8 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         attrs.pop("reason", None)
         attrs.pop("emptied_by", None)
         attrs.pop("emptied_by_method", None)
-        if "run_time_minutes" not in attrs and "energy_used" not in attrs:
-            run_min = self._get_run_duration_minutes()
-            energy = self._get_energy_used()
-            if run_min > 0:
-                attrs["run_time_minutes"] = round(run_min, 1)
-            if energy > 0:
-                attrs["energy_used"] = round(energy, 3)
+        # The completed summary came through Emptied unchanged. If HA erased it,
+        # leave it unknown rather than counting the wait/peek as extra wash time.
         if self.short_entity:
             attrs["short_selected"] = self.get_state(self.short_entity)
         self._set_state_entity( state="Unemptied", attributes=attrs, replace=True)
@@ -3157,19 +3152,25 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             else:
                 actor_empty = self._unknown_actor("not_observed")
             self.log(f"Emptied attribution: {actor_empty}", level="INFO")
-            energy_used = self._get_energy_used()
-            run_minutes = self._get_run_duration_minutes()
+            already_finished = self.state in ("Unemptied", "Emptied")
 
             self.state = "Emptied"
             attributes = {
                 "reason": reason,
-                "run_time_minutes": round(run_minutes, 1) if run_minutes > 0 else None,
                 **self._started_by_attrs(),
                 "emptied_by": actor_empty.get("person") or "",
                 "emptied_by_method": actor_empty.get("method") or "unknown",
             }
-            if energy_used > 0:
-                attributes["energy_used"] = round(energy_used, 3)
+            if not already_finished:
+                # A door-first finish has no published completion summary yet.
+                # Unemptied already has the corrected duration/energy: preserve
+                # those via the merge below, however long the dishes waited.
+                run_minutes = self._get_run_duration_minutes()
+                energy_used = self._get_energy_used()
+                if run_minutes > 0:
+                    attributes["run_time_minutes"] = round(run_minutes, 1)
+                if energy_used > 0:
+                    attributes["energy_used"] = round(energy_used, 3)
 
             self._set_state_entity( state="Emptied", attributes=attributes)
             

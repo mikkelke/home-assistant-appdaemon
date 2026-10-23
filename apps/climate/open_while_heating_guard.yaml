@@ -2,15 +2,12 @@ open_while_heating_guard:
   module: open_while_heating_guard
   class: OpenWhileHeatingGuard
   grace_minutes: 15
-  # Outward openings that leak heat while the room's radiator runs. Interior doors are
-  # not watched (heat just moves between rooms). rooftop_door_1 is unmapped on purpose:
-  # both rooftop doors sit in the "rooftop" HA area and only door 2's inner room is
-  # known (Claudias room) - add door 1 to its real room once
-  # confirmed.
+  # Outward openings that leak heat while the room's floor heating runs. Interior
+  # doors are not watched. Door 1 serves the living/family room; door 2 serves Claudia.
+  # Use the actual heating-active sensors, not HeatingController's shadow plan.
   # Per-room push audience (person names from MobileNotifier's device_mapping).
   # Mikkel gets every room; Kristine/Claudia get their own room + the shared family
-  # space (kitchen/living/dining). A name without a mapped phone (Claudia for now)
-  # resolves to nothing and is skipped - ready the day her phone is added.
+  # space (kitchen/living/dining). A name without a mapped phone is skipped.
   rooms:
     bedroom:
       label: "Bedroom"
@@ -29,7 +26,11 @@ open_while_heating_guard:
       notify: ["mikkel", "kristine", "claudia"]
     living_room:
       label: "Living room"
-      contacts: ["binary_sensor.living_room_window_contact"]
+      contacts:
+        - "binary_sensor.living_room_window_contact"
+        - "binary_sensor.rooftop_door_1_contact"
+      opening_labels:
+        binary_sensor.rooftop_door_1_contact: "rooftop door"
       heating: "binary_sensor.living_room_heating_active"
       notify: ["mikkel", "kristine", "claudia"]
     kristines_room:
