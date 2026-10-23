@@ -448,7 +448,7 @@ class _RealEngineHandle:
             entity_state = initial.get("entity_state")
             seed_store = initial.get("store")
             if seed_store:
-                self._store.save(dict(seed_store))
+                self._save_store(dict(seed_store))
             entity_last_changed = (seed_store or {}).get("state_since") or self.anchor.isoformat()
             helper_state = initial.get("helper_state")
         else:
@@ -460,7 +460,8 @@ class _RealEngineHandle:
             store_data = None
 
         snap = policy_mod.resolve_boot_snapshot(
-            entity_state=entity_state, entity_attrs={}, entity_last_changed=entity_last_changed,
+            entity_state=entity_state, entity_attrs=initial.get("entity_attrs", {}) if self._boot_count == 0 else {},
+            entity_last_changed=entity_last_changed,
             store_data=store_data, helper_state=helper_state, now=boot_now, cfg=policy.cfg,
         )
 
@@ -470,7 +471,7 @@ class _RealEngineHandle:
             policy.restore_from(snap["store_fields"])
             cycle_id = snap["cycle_id"]
             state_since = self._parse_utc(snap["state_since"]) if snap["state_since"] else None
-            if initial_state in (State.RUNNING, State.PAUSED) and snap["source"] != "entity":
+            if initial_state in (State.RUNNING, State.PAUSED):
                 hypothesis, why = policy_mod.corroborate_restore(
                     boot_watts=self._live_watts(), last_high_energy_at=policy.last_high_energy_at, now=boot_now,
                     cfg=policy.cfg, code_fingerprint=self._code_fingerprint, stored_fingerprint=snap["code_fingerprint"],
@@ -561,6 +562,15 @@ class _RealEngineHandle:
 
     # ---- publish + durable store (mirrors dryer_shadow.py's _publish/_save_store) ----------
 
+    def _save_store(self, payload):
+        # CycleStore's envelope clock must follow the tape too. A real wall-clock saved_at
+        # made historical restores depend on the test date, bypassing future/downtime checks.
+        from unittest.mock import patch
+
+        with patch("cycle_store.datetime", wraps=datetime) as store_clock:
+            store_clock.now.return_value = self.clock.now()
+            return self._store.save(payload)
+
     def _publish(self, published, *, internal, store_only, attrs):
         self._policy.sync_watchdogs_on_publish(self._fsm.ctx, internal)
         payload = {
@@ -572,7 +582,7 @@ class _RealEngineHandle:
         if self._fsm.published == "Off":
             self._store.clear()
         else:
-            self._store.save(payload)
+            self._save_store(payload)
 
     def _log(self, message, level="INFO"):
         self.log_calls.append((level, message))

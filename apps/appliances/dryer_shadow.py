@@ -243,7 +243,7 @@ class DryerShadow(hass.Hass):
             policy.restore_from(snap["store_fields"])
             cycle_id = snap["cycle_id"]
             state_since = parse_utc(snap["state_since"]) if snap["state_since"] else None
-            if initial_state in (State.RUNNING, State.PAUSED) and snap["source"] != "entity":
+            if initial_state in (State.RUNNING, State.PAUSED):
                 boot_watts = self._live_watts()
                 hypothesis, why = policy_mod.corroborate_restore(
                     boot_watts=boot_watts, last_high_energy_at=policy.last_high_energy_at, now=clock.now(),
@@ -265,20 +265,6 @@ class DryerShadow(hass.Hass):
         self._policy = policy
         self._actions = actions
 
-        if initial_state in (State.RUNNING, State.PAUSED) and cycle_id is None:
-            # 2026-09 audit F5: the entity branch takes cycle_id from store_data (resolve_boot_
-            # snapshot), which is None whenever the store is missing/unreadable even though the
-            # v2 entity itself says Running/Paused - an active cycle restored with NO identity at
-            # all. mint_cycle_id() also resets the engine's own exactly-once guard, so a later
-            # finish for THIS freshly-minted id still dedupes correctly against any re-entry,
-            # rather than leaving cycle_id permanently None (which _request_feedback's own "no
-            # guard" fallback would otherwise re-save on every single re-entry, forever).
-            cycle_id = self.fsm.mint_cycle_id()
-            self.log(
-                "Boot restore had no cycle_id (store missing/unreadable) - minted a fresh one so "
-                "feedback stays well-defined for this cycle",
-                level="INFO",
-            )
         self.fsm.enter_state_silently(initial_state, state_since=state_since, hypothesis=hypothesis, cycle_id=cycle_id)
         self._prev_internal = initial_state
         if policy.last_feedback_cycle_id is not None:

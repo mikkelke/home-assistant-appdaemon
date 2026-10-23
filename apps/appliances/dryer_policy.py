@@ -35,6 +35,7 @@ from __future__ import annotations
 import os
 import statistics
 from datetime import datetime, timedelta, timezone
+from math import isfinite
 from pathlib import Path
 from typing import Optional
 
@@ -1200,65 +1201,97 @@ def resolve_shadow_progress(*, file_data, entity_attrs, code_fingerprint):
 
 def resolve_boot_snapshot(*, entity_state, entity_attrs, entity_last_changed, store_data, helper_state,
                            now, cfg):
-    """dryer_monitor.py:292-428's precedence (entity -> store -> helper -> Off), minus the
-    AppDaemon plumbing: entity/store staleness+future-clock rejection reuses the same numeric
-    rules as cycle_persistence.py's _cycle_store_validate_running_candidate (F5; not imported -
-    that method lives on the mixin, which dryer_shadow.py deliberately does not subclass, spec
-    7.1 - reimplemented here as a pure function of already-fetched values instead).
+    """Choose the first VALID candidate: entity -> store -> helper -> Off.
 
-    Returns a plain dict shaped like BOOT_RESTORE's payload convention (appliance_fsm.py's Evidence
-    docstring): {"state","source","start_time"(attr dict; caller merges into policy via restore_from),
-    "state_since","cycle_id","code_fingerprint","store_fields"} or None for a fresh boot (Off, no
-    restore needed at all)."""
-    entity_sourced = entity_state in VALID_STATES
-    if entity_sourced:
-        # Falls back to the store's own state_since when the entity carries none (2026-09 audit
-        # F7b; dryer_monitor.py:790's `boot_last_changed or store_data.get("state_since")` has
-        # always had this fallback - a v2 entity with no last_changed left state_since as None
-        # here, which rearm_watchdogs_after_restore then treated as "now", arming a FULL watchdog
-        # period for a pause/finish/emptied that may already be most of the way through its own).
-        state_since = entity_last_changed or (store_data or {}).get("state_since")
-        return {
-            "state": entity_state, "source": "entity", "state_since": state_since,
-            "cycle_id": (store_data or {}).get("cycle_id"), "code_fingerprint": (store_data or {}).get("code_fingerprint"),
-            "store_fields": store_data or {},
-        }
-
-    store_state = (store_data or {}).get("state")
-    store_ok = store_state in VALID_STATES
-    if store_ok and store_state in ("Running", "Paused"):
-        start_time = _parse_hist_ts((store_data or {}).get("cycle_start_time"))
-        saved_at = _parse_hist_ts((store_data or {}).get("saved_at"))
-        store_ok = _validate_running_candidate(
-            start_time=start_time, saved_at=saved_at, now=now,
-            future_skew_s=cfg["boot_future_start_skew_s"], max_running_hours=cfg["max_running_hours"],
-            max_downtime_hours=cfg["store_max_downtime_hours"],
+    The v2 entity publishes identity/status, not cycle clocks or physics. Its Running/Paused
+    label therefore needs the same validated durable tracking as a store-only restore. Neither
+    an entity timestamp nor a newly minted identity can reconstruct missing cycle history.
+    CycleStore.load has already checked the store's schema and appliance isolation envelope.
+    """
+    store = store_data if isinstance(store_data, dict) else {}
+    attrs = entity_attrs if isinstance(entity_attrs, dict) else {}
+    entity_cycle_id = attrs.get("cycle_id") if entity_state in VALID_STATES else None
+    for state, source, since, fields in (
+        (entity_state, "entity", entity_last_changed or store.get("state_since"), store),
+        (store.get("state"), "store", store.get("state_since"), store),
+        (helper_state, "helper", None, {}),
+    ):
+        candidate = _validate_boot_candidate(
+            state=state, source=source, state_since=since, fields=fields,
+            entity_cycle_id=entity_cycle_id, now=now, cfg=cfg,
         )
-    if store_ok:
-        return {
-            "state": store_state, "source": "store", "state_since": (store_data or {}).get("state_since"),
-            "cycle_id": (store_data or {}).get("cycle_id"), "code_fingerprint": (store_data or {}).get("code_fingerprint"),
-            "store_fields": store_data or {},
-        }
-
-    if helper_state in ("Running", "Paused"):
-        return None  # bare helper never carries a clock - falls through to Off (dryer_monitor.py:374-386)
-    if helper_state in VALID_STATES:
-        return {"state": helper_state, "source": "helper", "state_since": None, "cycle_id": None, "code_fingerprint": None, "store_fields": {}}
+        if candidate is not None:
+            return candidate
     return None
 
 
+def _validate_boot_candidate(*, state, source, state_since, fields, entity_cycle_id, now, cfg):
+    """One validation gate for every boot source; never splice two different cycles together."""
+    if state not in VALID_STATES:
+        return None
+    cycle_id = fields.get("cycle_id")
+    identity_mismatch = bool(entity_cycle_id) and entity_cycle_id != cycle_id
+    if state in ("Running", "Paused"):
+        # Helper labels and v2 attributes have no supported tracking contract. The original
+        # durable identity must survive too: minting a new ID hides missing or conflicting data.
+        if fields.get("state") not in ("Running", "Paused") or identity_mismatch:
+            return None
+        if not isinstance(cycle_id, str) or not cycle_id.strip():
+            return None
+        # Missing optional physics keeps its policy default. Supplied corrupt values must
+        # not become truthy completion flags or poison arithmetic after an otherwise valid boot.
+        for key in ("energy_at_start", "programme_duration_min", "max_power_w"):
+            value = fields.get(key)
+            if value is not None and (type(value) not in (int, float) or value < 0 or not isfinite(value)):
+                return None
+        for key in ("door_opened_during_cycle", "keep_fresh_detected", "notification_sent"):
+            value = fields.get(key)
+            if value is not None and not isinstance(value, bool):
+                return None
+        for key in ("detected_programme", "last_feedback_cycle_id", "code_fingerprint"):
+            value = fields.get(key)
+            if value is not None and not isinstance(value, str):
+                return None
+        start_time = _parse_hist_ts(fields.get("cycle_start_time"))
+        saved_at = _parse_hist_ts(fields.get("saved_at"))
+        if not _validate_running_candidate(
+            start_time=start_time, saved_at=saved_at, now=now,
+            future_skew_s=cfg["boot_future_start_skew_s"], max_running_hours=cfg["max_running_hours"],
+            max_downtime_hours=cfg["store_max_downtime_hours"],
+        ):
+            return None
+        # Optional timestamps may be absent, but supplied garbage/future clocks must not arm
+        # unbounded watchdogs or masquerade as a recent high-energy observation.
+        skew = timedelta(seconds=cfg["boot_future_start_skew_s"])
+        for value in (state_since, fields.get("last_high_energy_at"), fields.get("door_opened_time")):
+            if value in (None, ""):
+                continue
+            stamp = _parse_hist_ts(value)
+            if stamp is None or stamp > now + skew or stamp < start_time - skew:
+                return None
+        if saved_at < start_time - skew:
+            return None
+        state_since = state_since or fields["cycle_start_time"]
+    elif identity_mismatch:
+        # A clock-free entity/helper can stand alone, but must not inherit another cycle's
+        # programme, feedback guard, or notification bookkeeping.
+        fields, cycle_id = {}, None
+    return {
+        "state": state, "source": source, "state_since": state_since,
+        "cycle_id": cycle_id, "code_fingerprint": fields.get("code_fingerprint"),
+        "store_fields": fields,
+    }
+
+
 def _validate_running_candidate(*, start_time, saved_at, now, future_skew_s, max_running_hours, max_downtime_hours):
-    """cycle_persistence.py:177-232's rule set, reimplemented (see resolve_boot_snapshot's
-    docstring for why this is not a mixin call)."""
-    if start_time is None:
+    """Bound the cycle and persistence clocks; saved_at is mandatory in CycleStore's envelope."""
+    if start_time is None or saved_at is None:
         return False
-    skew_s = (start_time - now).total_seconds()
-    if skew_s > future_skew_s:
+    if any((stamp - now).total_seconds() > future_skew_s for stamp in (start_time, saved_at)):
         return False
     if (now - start_time).total_seconds() / 3600 > max_running_hours:
         return False
-    if saved_at is not None and (now - saved_at).total_seconds() / 3600 > max_downtime_hours:
+    if (now - saved_at).total_seconds() / 3600 > max_downtime_hours:
         return False
     return True
 
@@ -1267,7 +1300,7 @@ def corroborate_restore(*, boot_watts, last_high_energy_at, now, cfg, code_finge
     """spec section 8: corroborated = (boot_watts > stop_w OR last_high_energy_at within
     restore_corroboration_window_minutes) AND NOT a code_fingerprint mismatch. dryer reuses stop_w
     as the standby ceiling (no new knob, per spec). Returns (hypothesis: bool, why: str)."""
-    recent_high = last_high_energy_at is not None and (now - last_high_energy_at) <= timedelta(
+    recent_high = last_high_energy_at is not None and timedelta(0) <= (now - last_high_energy_at) <= timedelta(
         minutes=cfg["restore_corroboration_window_minutes"]
     )
     power_ok = boot_watts > cfg["stop_w"]

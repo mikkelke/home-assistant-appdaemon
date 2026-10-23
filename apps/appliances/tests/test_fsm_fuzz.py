@@ -164,6 +164,7 @@ class Rig:
             policy.sync_watchdogs_on_publish(fsm.ctx, internal)
             self.store = {
                 "state": fsm.published, "cycle_id": fsm.cycle_id,
+                "saved_at": self.clock.now().isoformat(),
                 "state_since": fsm.state_since, **policy.to_store_fields(),
             }
 

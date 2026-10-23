@@ -423,7 +423,7 @@ class BootRestoreHypothesisAndReconcile(unittest.TestCase):
             self.assertFalse(app.fsm.hypothesis)
             self.assertEqual(app.fsm.state.name, "RUNNING")
 
-    def test_ad_only_reload_live_v2_entity_trusted_outright(self):
+    def test_ad_only_reload_v2_label_without_tracking_falls_back_off(self):
         with tempfile.TemporaryDirectory() as tmp:
             import datetime as dtmod
 
@@ -433,8 +433,8 @@ class BootRestoreHypothesisAndReconcile(unittest.TestCase):
                 power_w="0", live_state="Running", extra_args={"min_cycle_minutes": 1, "cooling_period": 0},
             )
             app.initialize()
-            self.assertFalse(app.fsm.hypothesis, "AD-only reload (live entity) is trusted outright")
-            self.assertEqual(app.fsm.state.name, "RUNNING")
+            self.assertEqual(app.fsm.state.name, "OFF", "v2 publishes no cycle clock; a label alone cannot restore")
+            self.assertIsNone(app.fsm.cycle_id, "boot must not mint identity to repair missing tracking")
 
     def test_restart_carries_cycle_id_and_feedback_guard_exactly_once(self):
         """Cross-restart exactly-once (spec section 6): engine A finishes and feeds back once;

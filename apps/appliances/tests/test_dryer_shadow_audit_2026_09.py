@@ -310,12 +310,12 @@ class F4SelectorResetAndAnnounceToggle(unittest.TestCase):
 
 
 # =================================================================================================
-# F5: cycle_id is None dropped feedback entirely (entity Running/Paused, store missing/unreadable)
+# F5: a None cycle_id must not silently drop engine feedback; boot needs valid tracking first
 # =================================================================================================
 
 
 class F5NoneCycleIdStillFeedsBackOnce(unittest.TestCase):
-    def test_entity_running_no_store_finish_produces_one_feedback_record(self):
+    def test_entity_paused_no_store_cannot_invent_a_cycle_to_feed_back(self):
         with tempfile.TemporaryDirectory() as tmp:
             # No CycleStore.save() at all - state_file points at a path that never gets written,
             # so self._store.load() returns None (missing file) exactly like a corrupt/unreadable
@@ -325,18 +325,16 @@ class F5NoneCycleIdStillFeedsBackOnce(unittest.TestCase):
                 extra_args={"min_cycle_minutes": 1, "cooling_period": 0},
             )
             app.initialize()
-            self.assertEqual(app.fsm.state.name, "PAUSED")
-            self.assertIsNone(app._policy.start_time, "precondition: no store means no restored physics either")
-            self.assertIsNotNone(app.fsm.cycle_id, "a restored active cycle must never carry a None cycle_id")
-
-            # keep_fresh short-circuits G_valid_cycle regardless of start_time/energy being unknown
-            # (is_valid_completed_cycle: "if keep_fresh: return True") - isolates this test to the
-            # cycle_id fix itself, not a second, unrelated physics-restore gap.
+            # The former test explicitly accepted clockless PAUSED and minted an ID. That
+            # repairs feedback deduplication by inventing a cycle; restore now rejects it.
+            self.assertEqual(app.fsm.state.name, "OFF")
+            self.assertIsNone(app._policy.start_time)
+            self.assertIsNone(app.fsm.cycle_id)
             app._policy.keep_fresh_detected = True
-            push_door(app, entities, "off")  # PAUSED/DOOR_CLOSED, power=2 (< start_w) -> FINISHED
+            push_door(app, entities, "off")
 
-            self.assertEqual(app.fsm.state.name, "FINISHED")
-            self.assertEqual(len(app._actions.feedback), 1, "a None-cycle_id restore must still save exactly once")
+            self.assertEqual(app.fsm.state.name, "OFF")
+            self.assertEqual(app._actions.feedback, [])
 
     def test_request_feedback_saves_when_cycle_id_is_none(self):
         """Engine-level pin of the exact appliance_fsm.py:686 condition, isolated from the shadow's
@@ -418,14 +416,17 @@ class F7RunningWatchdogAnchorAndStateSinceFallback(unittest.TestCase):
             self.assertGreater(remaining_s, 3000)
 
     def test_entity_branch_falls_back_to_store_state_since_when_entity_last_changed_missing(self):
+        now = datetime.now(timezone.utc)
+        since = format_utc(now - timedelta(minutes=30))
         snap = dp.resolve_boot_snapshot(
             entity_state="Running", entity_attrs={}, entity_last_changed=None,
-            store_data={"state": "Running", "state_since": "2026-09-01T00:00:00+00:00", "cycle_id": "x"},
-            helper_state=None, now=datetime.now(timezone.utc), cfg=CFG,
+            store_data={"state": "Running", "state_since": since, "cycle_id": "x",
+                        "cycle_start_time": since, "saved_at": format_utc(now)},
+            helper_state=None, now=now, cfg={**dp.DEFAULTS, **CFG},
         )
         self.assertEqual(snap["source"], "entity")
         self.assertEqual(
-            snap["state_since"], "2026-09-01T00:00:00+00:00",
+            snap["state_since"], since,
             "entity_last_changed missing must fall back to the store's own state_since, not None",
         )
 
