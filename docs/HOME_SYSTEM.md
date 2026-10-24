@@ -98,7 +98,10 @@ Read [wake configuration](../apps/rutines/wakeup_bedroom.yaml) for the actual de
 Several apps want the bedroom blind. [BlindArbiter](../apps/blinds/blind_arbiter.py) defines
 manual > visitor > ventilation > wake > shade; [BlindOwner](../apps/blinds/bedroom_blind_owner.py)
 coordinates ownership. An active, time-limited manual claim outranks automatic requests while
-the owner is functioning. Callers have deliberate direct-write fallbacks when that owner is
+the owner is functioning, with one lifecycle exception: a new visitor claim clears a manual
+hold from before the visit. A manual choice made during a still-valid visitor claim continues
+to win. [UntrackedVisitor](../apps/presence/untracked_visitor.py) owns that visit lifecycle.
+Callers have deliberate direct-write fallbacks when that owner is
 missing or fails; see [wake fallback](../apps/rutines/wakeup_bedroom.py). Ownership is therefore
 not an unconditional guarantee across outages.
 Check the cover's documented position convention before interpreting a percentage.

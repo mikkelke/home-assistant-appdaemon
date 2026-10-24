@@ -74,7 +74,7 @@ a resident's confirmation and a successful physical action.
   explicit speakers, quiet-hours override and alarm callers.
   Default routing adds each awake resident's private room to shared speakers; it protects all
   three known sleepers. Unknown sleep helpers retain the existing quiet-hours-dependent rule.
-- **Topology:** [speaker registry](../apps/sonos/speakers.yaml) owns speaker facts and tags;
+- **Topology:** [speaker registry](../config/sonos_speakers.yaml) owns speaker facts and tags;
   [check_speakers](../scripts/check_speakers.py) detects duplicated-list drift.
 - **Proof:** [mobile tests](../apps/notify/tests/test_mobile_notifier.py) and
   [TTS tests](../apps/notify/tests/test_sonos_notifier.py). A successful routing decision is
@@ -85,11 +85,13 @@ a resident's confirmation and a successful physical action.
 - **Owner:** [BlindOwner](../apps/blinds/bedroom_blind_owner.py) applies
   [arbitration](../apps/blinds/blind_arbiter.py): manual > visitor > ventilation > wake > shade.
   Follow the owner's YAML and claim lifetime rather than copying its priorities elsewhere.
-- **Boundaries:** manual claims expire. Callers have deliberate direct-write fallback when
+- **Boundaries:** manual claims expire. A new visitor claim clears an older manual hold;
+  manual input during an ongoing valid visitor claim still wins. Callers have direct-write fallback when
   the owner fails or is missing. A requested target is not observed cover movement; position
   conventions and actual reported state matter.
 - **Consumers:** [wake](../apps/rutines/wakeup_bedroom.py),
-  [solar shade](../apps/blinds/bedroom_solar_shade.py) and manual control paths.
+  [solar shade](../apps/blinds/bedroom_solar_shade.py),
+  [visitor lifecycle](../apps/presence/untracked_visitor.py) and manual control paths.
 - **Proof:** [arbiter](../apps/blinds/tests/test_blind_arbiter.py),
   [owner](../apps/blinds/tests/test_bedroom_blind_owner.py) and
   [wake yield](../apps/rutines/tests/test_wakeup_blind_yield.py) tests, including owner failure.

@@ -23,6 +23,8 @@ consumers, uncertainty rules, resident outcomes and tests.
   with a self-learning night-coast model.
 - `apps/appliances/docs/` — appliance-manual facts distilled to markdown for AI use
   (the copyrighted PDFs themselves stay out of the repo).
+- `config/sonos_speakers.yaml` — build-time speaker registry checked before deploy;
+  kept outside `apps/` so AppDaemon does not try to load it as an app.
 - `scripts/deploy.sh` — compile-check, unit tests, rsync tracked files to the box,
   verify the reload.
 

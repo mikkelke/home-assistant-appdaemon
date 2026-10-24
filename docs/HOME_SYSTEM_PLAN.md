@@ -6,13 +6,33 @@ Review baseline: AppDaemon `de67630`, dashboard `51d4d1f`; these are not the cur
 implementation revisions. Recheck HEAD and effective configuration before rollout.
 The progress record below distinguishes implemented source from deployment evidence.
 
-## Rollout resumed, 2026-10-24
+## Completed rollout, 2026-10-24
 
 Repository write access and SSH connectivity are now available. The full current suite passed:
 **5,552 tests across 18 domains**, including the three socket tests blocked in the original
 environment. AST parsing, the speaker-registry check and whitespace validation also pass.
-Commit/push/deployment and per-app runtime verification are in progress; the earlier blocked
-attempts below remain historical validation context, not the current access status.
+Implementation commit `e7cd353` and registry cleanup `51aaa94` were pushed to master and
+deployed through `scripts/deploy.sh`. The final content check matched **421 tracked app files**
+on the box. The original access failures below are historical, not remaining blockers.
+
+Live verification confirmed fresh initialization of all ten directly changed apps, plus
+`bedroom_lights` and `resident_room_lights_off`, which consume the changed presence reader.
+All nine room-activity publications advanced their timestamps across successive snapshots.
+Natural presence changes reached the running lighting callbacks, and eleven checked light
+groups retained both their state and transition timestamp through reload and observation.
+EntryTruth exposed the new explicit door-evidence attributes. No artificial sensor events,
+announcements, lock operations or blind movements were used as tests.
+
+The first deploy exposed a scanner error: the build-time speaker registry was treated as an
+app because it lived under `apps/`. It now lives at
+[`config/sonos_speakers.yaml`](../config/sonos_speakers.yaml). The reviewed old deployed file
+was moved outside the watched app tree, retaining a backup. After that cleanup, the observed
+scan/runtime window contained no new error records across the app logs. The comment-only
+follow-up deploy correctly required no app reload.
+
+These checks verify deployment, ongoing publication and observed ordinary operation. No
+natural total witness outage occurred in the observation window: outage/recovery behavior
+remains verified by the focused tests, not by a deliberately induced household outage.
 
 ## Implementation progress, 2026-10-23
 
@@ -52,17 +72,13 @@ by the full lighting suite separately. Existing unrelated coroutine warnings rem
 and presence tests. These results are not proof of deployed operation.
 Documentation changes are checked by resolving relative links and `git diff --check`.
 
-Deployment has **not** been verified: SSH was blocked by the execution environment's network.
-Staging was also attempted by explicit path and rejected because `.git` is read-only
-(`index.lock`: read-only file system). No commit, push or deployment was performed; all changes
-remain in the working tree. Complete the ordinary commit/push/deploy workflow in an environment
-with repository-metadata write access and SSH connectivity, after rerunning the three blocked
-socket tests and performing the required live lighting checks. Deploy the presence producer
-and its consumer guards together, and verify fresh initialization for every affected app.
+The initial attempt was blocked by network restrictions and a read-only `.git/index.lock`.
+Those restrictions were removed on 2026-10-24; the full test run, commit/push, combined
+producer/consumer deployment and live verification are recorded in the completed rollout above.
 A scoped HA configuration search for the exact `apartment_entry_secure` identifier returned no
 matches in automations, scripts, scenes, helpers or dashboards, with no partial result reported.
 That does not cover AppDaemon, Node-RED or templates outside that search. Validate remaining
-consumers and actual deployed publication before claiming rollout complete.
+consumers when changing this interface again; the search does not establish their absence.
 
 ## Outcome and constraints
 
@@ -125,7 +141,7 @@ consumers before rollout; do not imply that dashboard lock behavior was already 
 Scope: [SonosNotifier](../apps/notify/sonos_notifier.py), its
 [configuration](../apps/notify/sonos_notifier.yaml),
 [tests](../apps/notify/tests/test_sonos_notifier.py),
-[speaker registry](../apps/sonos/speakers.yaml) and
+[speaker registry](../config/sonos_speakers.yaml) and
 [registry checker](../scripts/check_speakers.py).
 
 At the review baseline, default routing read two sleep signals and the third resident's speaker
