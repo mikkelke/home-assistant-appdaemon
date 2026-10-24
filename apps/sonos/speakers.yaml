@@ -58,7 +58,7 @@ speakers:
     rincon: RINCON_804AF2CB397801400
     model: Era 100
     default_volume: 0.14
-    tts: [all, family]
+    tts: [all, claudia]
   rooftop:
     ma_entity: media_player.rooftop
     raw_entity: media_player.rooftop_2

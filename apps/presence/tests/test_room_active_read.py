@@ -59,6 +59,47 @@ class FreshPublishedEntity(unittest.TestCase):
         hass = FakeHass(states={(ENTITY, None): "on", (ENTITY, "computed_at"): _iso(50)})
         self.assertTrue(rar.active(hass, ZONE, max_age_sec=60))
 
+    def test_fresh_unknown_does_not_skip_the_publishers_recovery_interval(self):
+        for witness in ("off", "on"):
+            with self.subTest(witness=witness):
+                hass = FakeHass(
+                    states={(ENTITY, None): "unknown", (ENTITY, "computed_at"): _iso(5),
+                            ("binary_sensor.w1", None): witness},
+                    apps={"RoomActive": _room_active_app({ZONE: [_witness("binary_sensor.w1")]})},
+                )
+                self.assertIsNone(rar.active(hass, ZONE))
+                self.assertFalse(rar.explicitly_inactive(hass, ZONE))
+
+    def test_fresh_legacy_off_with_stale_evidence_checks_live_witnesses(self):
+        for stale in ("true", True):
+            for witness, expected in (("unknown", None), ("unavailable", None),
+                                      ("off", False), ("on", True)):
+                with self.subTest(stale=stale, witness=witness):
+                    hass = FakeHass(
+                        states={(ENTITY, None): "off", (ENTITY, "computed_at"): _iso(5),
+                                (ENTITY, "stale"): stale, ("binary_sensor.w1", None): witness},
+                        apps={"RoomActive": _room_active_app({ZONE: [_witness("binary_sensor.w1")]})},
+                    )
+                    self.assertIs(rar.active(hass, ZONE), expected)
+
+    def test_fresh_legacy_off_with_mixed_unreadable_and_off_keeps_existing_rule(self):
+        hass = FakeHass(
+            states={(ENTITY, None): "off", (ENTITY, "computed_at"): _iso(5),
+                    (ENTITY, "stale"): "true", ("binary_sensor.w1", None): "unknown",
+                    ("binary_sensor.w2", None): "off"},
+            apps={"RoomActive": _room_active_app(
+                {ZONE: [_witness("binary_sensor.w1"), _witness("binary_sensor.w2")]})},
+        )
+        self.assertIs(rar.active(hass, ZONE), False)
+
+    def test_old_unknown_can_use_live_fallback(self):
+        hass = FakeHass(
+            states={(ENTITY, None): "unknown", (ENTITY, "computed_at"): _iso(600),
+                    ("binary_sensor.w1", None): "off"},
+            apps={"RoomActive": _room_active_app({ZONE: [_witness("binary_sensor.w1")]})},
+        )
+        self.assertIs(rar.active(hass, ZONE), False)
+
 
 class FallbackTriggers(unittest.TestCase):
     """Missing / stale / malformed computed_at all fall back to recomputing from

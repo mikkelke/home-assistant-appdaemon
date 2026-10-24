@@ -229,6 +229,8 @@ class PresenceLostResetsSessionAndLatch(unittest.TestCase):
         app._latch_zone_persons_snapshot = None
         app._sleep_activated_during_presence = True
         app._presence_session_started_at = SESSION_START.timestamp()
+        app._family_presence_sensors = {"dining_room": DPIR}
+        app.get_state = lambda *args, **kwargs: "off"
         app.log_calls = []
         app.log = lambda msg, level="INFO": app.log_calls.append((level, msg))
         app.evaluations = []

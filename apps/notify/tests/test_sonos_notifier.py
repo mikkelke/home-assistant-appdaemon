@@ -7,6 +7,7 @@ import sys
 import types
 import unittest
 from datetime import datetime, time
+from itertools import product
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -56,12 +57,19 @@ def _new_app(state=None, now=None, time_constraints_enabled=True, volumes=None, 
 
     app.kristine_sleep_mode_entity = "input_boolean.kristine_sleep_mode"
     app.mikkel_sleep_mode_entity = "input_boolean.mikkel_sleep_mode"
+    app.claudia_sleep_mode_entity = "input_boolean.claudia_sleep_mode"
     app.tts_group_all = [
-        "media_player.living_room", "media_player.kitchen", "media_player.bedroom", "media_player.kristines_room",
+        "media_player.living_room", "media_player.kitchen", "media_player.dining_room",
+        "media_player.bedroom", "media_player.bathroom", "media_player.guest_bathroom",
+        "media_player.kristines_room", "media_player.claudias_room", "media_player.rooftop",
     ]
-    app.tts_group_family_rooms = ["media_player.living_room", "media_player.kitchen"]
+    app.tts_group_family_rooms = [
+        "media_player.living_room", "media_player.kitchen", "media_player.dining_room",
+        "media_player.bathroom", "media_player.guest_bathroom", "media_player.rooftop",
+    ]
     app.tts_group_kristine = ["media_player.kristines_room"]
     app.tts_group_ms = ["media_player.bedroom"]
+    app.tts_group_claudia = ["media_player.claudias_room"]
     app.default_chime_path = "/config/www/chimes/alert.mp3"
     app.tts_platform = "piper"
     app.audio_conversion = AUDIO_CONVERSION
@@ -378,6 +386,29 @@ class ShippedConfig(unittest.TestCase):
         app = self._initialized_app(args=args)
         self.assertTrue(_logged_at(app, "announce_volume_cap", "WARNING"))
 
+    def test_default_routing_protects_each_residents_room(self):
+        for mikkel, kristine, claudia in product(("off", "on"), repeat=3):
+            with self.subTest(mikkel=mikkel, kristine=kristine, claudia=claudia):
+                app = self._initialized_app(state={
+                    "input_boolean.mikkel_sleep_mode": mikkel,
+                    "input_boolean.kristine_sleep_mode": kristine,
+                    "input_boolean.claudia_sleep_mode": claudia,
+                })
+                app.notify("Washer finished")
+                rooms = {entity for call in _plays(app) for entity in call["entity_id"]}
+                expected = {
+                    "media_player.living_room_2", "media_player.kitchen_2", "media_player.dining_room_2",
+                    "media_player.bathroom_2", "media_player.guest_bathroom_2", "media_player.rooftop_2",
+                }
+                for sleeping, room in (
+                    (mikkel, "media_player.bedroom_2"),
+                    (kristine, "media_player.kristines_room_2"),
+                    (claudia, "media_player.claudias_room_2"),
+                ):
+                    if sleeping == "off":
+                        expected.add(room)
+                self.assertEqual(rooms, expected)
+
 
 class DeliveryFailures(unittest.TestCase):
     def test_render_without_url_plays_nothing_and_logs_error(self):
@@ -446,23 +477,26 @@ class TargetResolution(unittest.TestCase):
 
     def test_everybody_sleeping_uses_family_rooms_only(self):
         app = _new_app(
-            state={"input_boolean.kristine_sleep_mode": "on", "input_boolean.mikkel_sleep_mode": "on"},
+            state={
+                "input_boolean.kristine_sleep_mode": "on", "input_boolean.mikkel_sleep_mode": "on",
+                "input_boolean.claudia_sleep_mode": "on",
+            },
             now=DAYTIME,
         )
         app.notify("Hello")
         self.assertEqual(_plays(app)[0]["entity_id"], _twins(app.tts_group_family_rooms))
 
-    def test_kristine_sleeping_adds_the_ms_room(self):
+    def test_kristine_sleeping_adds_only_awake_private_rooms(self):
         app = _new_app(
             state={"input_boolean.kristine_sleep_mode": "on", "input_boolean.mikkel_sleep_mode": "off"},
             now=DAYTIME,
         )
         app.notify("Hello")
         self.assertEqual(
-            _plays(app)[0]["entity_id"], ["media_player.living_room_2", "media_player.kitchen_2", "media_player.bedroom_2"]
+            _plays(app)[0]["entity_id"], _twins(app.tts_group_family_rooms + app.tts_group_ms + app.tts_group_claudia)
         )
 
-    def test_mikkel_sleeping_adds_kristines_room(self):
+    def test_mikkel_sleeping_adds_only_awake_private_rooms(self):
         app = _new_app(
             state={"input_boolean.kristine_sleep_mode": "off", "input_boolean.mikkel_sleep_mode": "on"},
             now=DAYTIME,
@@ -470,8 +504,27 @@ class TargetResolution(unittest.TestCase):
         app.notify("Hello")
         self.assertEqual(
             _plays(app)[0]["entity_id"],
-            ["media_player.living_room_2", "media_player.kitchen_2", "media_player.kristines_room_2"],
+            _twins(app.tts_group_family_rooms + app.tts_group_kristine + app.tts_group_claudia),
         )
+
+    def test_claudia_sleeping_adds_only_awake_private_rooms(self):
+        app = _new_app(state={"input_boolean.claudia_sleep_mode": "on"}, now=DAYTIME)
+        app.notify("Hello")
+        self.assertEqual(
+            _plays(app)[0]["entity_id"], _twins(app.tts_group_family_rooms + app.tts_group_ms + app.tts_group_kristine)
+        )
+
+    def test_explicit_alarm_targets_still_reach_all_sleeping_residents(self):
+        app = _new_app(state={
+            f"input_boolean.{name}_sleep_mode": "on" for name in ("mikkel", "kristine", "claudia")
+        })
+        app.notify("Fire!", target_speakers=app.tts_group_all, override_quiet_hours=True)
+        self.assertEqual(_plays(app)[0]["entity_id"], _twins(app.tts_group_all))
+
+    def test_explicit_target_can_reach_sleeping_claudias_room(self):
+        app = _new_app(state={"input_boolean.claudia_sleep_mode": "on"}, now=DAYTIME)
+        app.notify("Hello", target_speakers="media_player.claudias_room")
+        self.assertEqual(_plays(app)[0]["entity_id"], ["media_player.claudias_room_2"])
 
     def test_explicit_targets_win_over_sleep_mode(self):
         app = _new_app(
@@ -575,7 +628,9 @@ class SleepModeEntityFailSafe(unittest.TestCase):
         )
         app.notify("Doorbell", override_quiet_hours=True)
         self.assertEqual(len(_plays(app)), 1)
-        self.assertEqual(_plays(app)[0]["entity_id"], _twins(app.tts_group_family_rooms + app.tts_group_ms))
+        self.assertEqual(
+            _plays(app)[0]["entity_id"], _twins(app.tts_group_family_rooms + app.tts_group_ms + app.tts_group_claudia)
+        )
 
     def test_unavailable_sleep_entity_during_day_unchanged(self):
         app = _new_app(
@@ -585,6 +640,23 @@ class SleepModeEntityFailSafe(unittest.TestCase):
         app.notify("Doorbell")
         self.assertEqual(len(_plays(app)), 1)
         self.assertEqual(_plays(app)[0]["entity_id"], _twins(app.tts_group_all))
+
+    def test_each_unknown_sleep_helper_follows_existing_time_policy(self):
+        for name, room in (
+            ("mikkel", "media_player.bedroom_2"),
+            ("kristine", "media_player.kristines_room_2"),
+            ("claudia", "media_player.claudias_room_2"),
+        ):
+            for state in (None, "unknown", "unavailable"):
+                for night in (False, True):
+                    with self.subTest(name=name, state=state, night=night):
+                        app = _new_app(
+                            state={f"input_boolean.{name}_sleep_mode": state},
+                            now=datetime(2026, 9, 11, 3, 0, 0) if night else DAYTIME,
+                        )
+                        app.notify("Doorbell", override_quiet_hours=night)
+                        targets = {entity for call in _plays(app) for entity in call["entity_id"]}
+                        self.assertEqual(room in targets, not night)
 
 
 if __name__ == "__main__":

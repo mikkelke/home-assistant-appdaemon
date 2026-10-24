@@ -16,7 +16,9 @@ it directly via self.get_app("RoomActive").zones rather than duplicating the wit
 
 State rule: a zone is "on" if ANY witness currently reads a state in its own on_states
 (default ["on"]). A witness reading unavailable/unknown/None is INERT - it never asserts and
-never denies. Tier priority when multiple witnesses assert at once (used to pick the single
+never denies. If no witness is readable, publish "unknown" immediately; readable negative
+evidence after that outage must settle for a new full interval before publishing "off".
+Tier priority when multiple witnesses assert at once (used to pick the single
 witness named in `reason`/`tier`): bed > spot > room > channel - a mat/strip witness is
 trusted over a room-level mmWave read, which in turn outranks a raw PIR/motion channel.
 
@@ -119,7 +121,8 @@ class RoomActive(hass.Hass):
 
     @staticmethod
     def _fresh_zone_state():
-        return {"state": None, "settle_timer": None, "last_cmp": None, "last_publish_time": None}
+        return {"state": None, "settle_timer": None, "settle_generation": 0,
+                "last_cmp": None, "last_publish_time": None}
 
     # ---------- callbacks ----------
 
@@ -137,8 +140,10 @@ class RoomActive(hass.Hass):
         if not zone:
             return
         zstate = self._zone_state.get(zone)
-        if zstate is not None:
-            zstate["settle_timer"] = None
+        if (zstate is None or zstate["settle_timer"] is None
+                or kwargs.get("generation") != zstate.get("settle_generation")):
+            return  # A canceled timer must not finish a newer recovery interval.
+        zstate["settle_timer"] = None
         try:
             self._evaluate(zone, timer_fired=True)
         except Exception as e:
@@ -174,7 +179,8 @@ class RoomActive(hass.Hass):
         source_entities = [w["entity"] for w in witnesses]
         witness_states = []
         active = []  # [(tier, entity), ...] currently asserting, config order
-        stale = False
+        stale = not witnesses
+        readable = False
         for w in witnesses:
             entity = w["entity"]
             on_states = w["on_states"]
@@ -186,6 +192,7 @@ class RoomActive(hass.Hass):
             if state in (None, "unavailable", "unknown"):
                 stale = True
                 continue
+            readable = True
             if state in on_states:
                 active.append((w["tier"], entity))
         return {
@@ -193,6 +200,7 @@ class RoomActive(hass.Hass):
             "witness_states": witness_states,
             "active": active,
             "stale": stale,
+            "readable": readable,
         }
 
     def _attributes(self, live, settling):
@@ -203,7 +211,7 @@ class RoomActive(hass.Hass):
             confidence = "high" if tier in _HIGH_CONFIDENCE_TIERS else "medium"
         else:
             tier = "none"
-            reason = "all_clear"
+            reason = "all_clear" if live["readable"] else "no_readable_witnesses"
             confidence = "low"
         active_witnesses = [entity for _, entity in active] or ["<none>"]
         return {
@@ -215,8 +223,8 @@ class RoomActive(hass.Hass):
             # trusted unconditionally until then.
             "auto_on_ok": "true",
             "active_witnesses": active_witnesses,
-            "source_entities": live["source_entities"],
-            "witness_states": live["witness_states"],
+            "source_entities": live["source_entities"] or ["<none>"],
+            "witness_states": live["witness_states"] or ["<none>"],
             "settling": "true" if settling else "false",
             "stale": "true" if live["stale"] else "false",
             "computed_at": datetime.now(timezone.utc).isoformat(),
@@ -229,33 +237,36 @@ class RoomActive(hass.Hass):
         zstate = self._zone_state.setdefault(zone, self._fresh_zone_state())
         is_first = zstate["state"] is None
 
-        if live["active"]:
-            # Something asserts right now: off->on (or staying on) is always immediate,
-            # and cancels any pending settle-off countdown.
+        if live["active"] or not live["readable"]:
+            # Positive evidence and total evidence loss both publish immediately,
+            # canceling any pending settle-off countdown.
             if zstate["settle_timer"] is not None:
                 self.cancel_timer(zstate["settle_timer"])
                 zstate["settle_timer"] = None
-            new_state = "on"
+            new_state = "on" if live["active"] else "unknown"
             settling = False
         elif is_first:
             # Nothing to transition FROM yet (cold start) - publish "off" immediately,
             # no settle window for a state that was never "on".
             new_state = "off"
             settling = False
-        elif zstate["state"] == "on":
+        elif zstate["state"] in ("on", "unknown"):
             if timer_fired:
-                # Full settle_off_sec elapsed with nothing asserting the whole time
+                # Full settle_off_sec elapsed with readable negative evidence
                 # (re-verified live just above) - now flip to off.
                 new_state = "off"
                 settling = False
             else:
-                # Union just went (or still is) from asserting to not-asserting. Arm the
-                # settle timer only once per settle window.
+                # The union went from asserting or unknown to readable negative
+                # evidence. Arm only once; recovery never inherits a pre-outage timer.
                 if zstate["settle_timer"] is None:
+                    generation = zstate.get("settle_generation", 0) + 1
+                    zstate["settle_generation"] = generation
                     zstate["settle_timer"] = self.run_in(
-                        self._settle_fire, self.zone_settle_off_sec.get(zone, self.settle_off_sec), zone=zone
+                        self._settle_fire, self.zone_settle_off_sec.get(zone, self.settle_off_sec),
+                        zone=zone, generation=generation
                     )
-                new_state = "on"
+                new_state = zstate["state"]
                 settling = True
         else:
             # Already published "off", steady state, nothing asserting - no-op.

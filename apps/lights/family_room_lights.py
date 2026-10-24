@@ -41,7 +41,8 @@ class FamilyRoomLights(hass.Hass):
       ``manual_bright_echo_suppress_seconds`` window (8 s) the fallback for context-less echoes.
 
     Presence source note:
-    This app expects boolean on/off "presence" entities. In this setup we point those at
+    Presence is tri-state: positive evidence wins, explicit all-off proves absence, and an
+    unknown union preserves lighting and presence-session state. In this setup we point inputs at
     Area Occupancy Detection (AOD) `*_occupancy_status` entities (instead of raw PIR/mmWave),
     so the lighting decisions benefit from AOD's probability + decay behavior.
     """
@@ -265,12 +266,11 @@ class FamilyRoomLights(hass.Hass):
             if self.raw_pir_sensors:
                 for room, sensor in self.raw_pir_sensors.items():
                     try:
-                        self.listen_state(self._on_raw_pir_off, sensor, old="on", new="off", room=room)
+                        self.listen_state(self._on_raw_pir_off, sensor, new="off", room=room)
                         if room in self._family_presence_sensors:
                             self.listen_state(
                                 self._on_raw_pir_on,
                                 sensor,
-                                old="off",
                                 new="on",
                                 room=room,
                             )
@@ -434,6 +434,7 @@ class FamilyRoomLights(hass.Hass):
                     self.listen_state(self._on_robot_vacuum_state, self._robot_vacuum_entity)
                     for sensor in self._robot_quiet_sensors:
                         self.listen_state(self._on_quiet_sensor_on, sensor, new="on")
+                        self.listen_state(self._on_quiet_sensor_change, sensor)
                     self.log(
                         f"Robot run hold: {self._robot_vacuum_entity}, "
                         f"{len(self._robot_quiet_sensors)} quiet-house sensors, "
@@ -469,7 +470,7 @@ class FamilyRoomLights(hass.Hass):
         try:
             room = kwargs.get("room", "unknown")
             self.log(f"Family room: Presence lost in {room}", level="INFO")
-            if not self._has_family_room_presence():
+            if self._family_presence_state() is False:
                 self._clear_door_arrival_latch("all family PIR off")
                 self._sleep_activated_during_presence = False
                 self._presence_session_started_at = None
@@ -747,6 +748,14 @@ class FamilyRoomLights(hass.Hass):
                 rooms.append(room)
         return rooms
 
+    def _family_presence_state(self):
+        """Positive evidence wins; only an explicitly clear union proves absence."""
+        states = [self._safe_get_state(sensor, default=None, timeout_warning=False)
+                  for sensor in self._family_presence_sensors.values()]
+        if "on" in states:
+            return True
+        return False if states and all(state == "off" for state in states) else None
+
     def _scan_raw_main_presence(self):
         """True if any PIR in ``_family_presence_sensors`` is ``on`` - same OR as the dashboard binaries."""
         rooms = self._family_presence_rooms_on()
@@ -815,8 +824,17 @@ class FamilyRoomLights(hass.Hass):
         return self._safe_get_state(k, default="off", timeout_warning=False) == "on"
 
     def _turn_off_exempt_dishwasher_signal_lights(self):
-        """Unemptied + kitchen PIR + bright: exempt ``light.island_lights`` (dishwasher drives full green). Dark signal uses only SG/bulb1 - not in this app's light_map, so no exempt needed."""
-        if not self._is_dishwasher_unemptied() or not self._kitchen_pir_on():
+        """Protect a bright dishwasher signal, including a lit signal held through evidence loss.
+
+        Unknown kitchen activity cannot grant a new signal, but it also cannot end an
+        already-lit one while another room gives this app a positive presence decision.
+        Explicit absence or task completion releases the exemption normally.
+        """
+        if not self._is_dishwasher_unemptied():
+            return set()
+        kitchen = self.presence.get("kitchen") if isinstance(self.presence, dict) else None
+        state = self._safe_get_state(kitchen, default=None, timeout_warning=False) if kitchen else None
+        if state != "on" and (state == "off" or not self._any_island_light_on()):
             return set()
         if not self._is_dark_enough():
             nid = self._normal_island_group_entity()
@@ -855,6 +873,8 @@ class FamilyRoomLights(hass.Hass):
     def _handle_presence_lost(self):
         """Handle when family room presence is lost"""
         try:
+            if self._family_presence_state() is not False:
+                return
             self._clear_door_arrival_latch("presence lost handler")
             # Presence session ended; allow sleep mode rules to take effect next time
             self._sleep_activated_during_presence = False
@@ -1186,7 +1206,7 @@ class FamilyRoomLights(hass.Hass):
         return list((self.doors or {}).keys())
 
     def _guest_exit_satisfied(self):
-        if self._has_family_room_presence():
+        if self._family_presence_state() is not False:
             return False
         for room in self._guest_exit_door_rooms():
             door = self.doors.get(room)
@@ -1453,7 +1473,7 @@ class FamilyRoomLights(hass.Hass):
         }
 
         rooms_on = self._family_presence_rooms_on()
-        context['family_presence'] = bool(rooms_on)
+        context['family_presence'] = self._family_presence_state()
         if rooms_on:
             context['presence_room'] = rooms_on[0]
         if context['family_presence'] and getattr(self, "_presence_session_started_at", None) is None:
@@ -1555,7 +1575,7 @@ class FamilyRoomLights(hass.Hass):
     def _note_darkness_committed_changed(self):
         """Re-evaluate when committed dark/bright changes (not ``pending_target``)."""
         new_dark = self._is_confirmed_dark()
-        if not new_dark:
+        if not new_dark and self._family_presence_state() is not None:
             self._sleep_activated_during_presence = False
         if new_dark != self._dark_flag:
             self._dark_flag = new_dark
@@ -1629,6 +1649,11 @@ class FamilyRoomLights(hass.Hass):
             turned_on_at = time.time()
         self._robot_on_edge_at[entity] = max(self._robot_on_edge_at.get(entity, 0.0), turned_on_at)
 
+    def _on_quiet_sensor_change(self, entity, attribute, old, new, kwargs):
+        """An evidence gap breaks continuous coverage, including after recovery."""
+        if old not in ("on", "off") or new not in ("on", "off"):
+            self._robot_tracking_since = time.time()
+
     def _quiet_since_departure(self):
         """(zone.home turn-0 time, None) when the house stayed quiet from the last entry-door close
         until now, else (None, why).
@@ -1655,6 +1680,9 @@ class FamilyRoomLights(hass.Hass):
             return None, "entry door history unknown"
         if watching_since > departed_at:
             return None, "sensors not watched since the entry door closed"
+        for sensor in self._robot_quiet_sensors:
+            if self._safe_get_state(sensor, default=None, timeout_warning=False) not in ("on", "off"):
+                return None, f"{sensor} is unreadable"
         for sensor, turned_on_at in self._robot_on_edge_at.items():
             if turned_on_at >= departed_at:
                 return None, f"{sensor} turned on after the entry door closed"
@@ -1765,6 +1793,13 @@ class FamilyRoomLights(hass.Hass):
             }
 
         # DECISION TREE - Mutually exclusive conditions:
+
+        if context['family_presence'] is None:
+            return {
+                'action': 'preserve_current_state',
+                'reason': 'presence_unknown',
+                'details': 'No positive family presence and at least one room is unreadable',
+            }
 
         # 0. Adjacent room door+PIR while everyone sleeping, no family PIR, dark (would match branch 1 before branch 6)
         if (

@@ -13,7 +13,7 @@ Checked:
   - group_manager.yaml player list
   - family_room_volume_sync.yaml speakers (registry MA ids with <id>_2 twins) + tv_speaker
   - music_attribution.yaml raw_to_base_map pairs
-  - sonos_notifier.yaml  TTS target groups (registry `tts:` tags all/family/kristine/ms)
+  - sonos_notifier.yaml  TTS target groups (registry `tts:` tags all/family/kristine/ms/claudia)
   - fire_safety.yaml     house-wide announcement rooms + media pause rooms, kitchen entity
   - living_room_tv_control.yaml announcement speakers (registry MA entities, never a native twin)
   - dashboard (optional, if repo present): speakers.ts ids
@@ -104,7 +104,8 @@ def main():
     sn_fname = "apps/notify/sonos_notifier.yaml"
     sn = next(iter(load(sn_fname).values()))
     for key, tag in (("tts_group_all", "all"), ("tts_group_family_rooms", "family"),
-                     ("tts_group_kristine", "kristine"), ("tts_group_ms", "ms")):
+                     ("tts_group_kristine", "kristine"), ("tts_group_ms", "ms"),
+                     ("tts_group_claudia", "claudia")):
         got, want = set(sn.get(key) or []), tts_rooms.get(tag, set())
         check(got == want,
               f"{sn_fname}: {key} != registry tts:{tag}: only-in-yaml={sorted(got - want)} "

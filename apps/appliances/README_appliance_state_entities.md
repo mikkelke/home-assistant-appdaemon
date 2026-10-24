@@ -2,7 +2,8 @@
 
 ## Persistent UI entities (`input_select`)
 
-These helpers exist in HA storage and **survive restarts**. Use them in **Lovelace / badges** for the main state string:
+These helpers exist in HA storage and **survive restarts**. Standard **Lovelace / badges**
+can use them for a persistent main state string:
 
 | Entity | Friendly name | Options |
 |--------|---------------|---------|
@@ -13,6 +14,11 @@ These helpers exist in HA storage and **survive restarts**. Use them in **Lovela
 Icons: washing machine / dishwasher / tumble dryer (MDI).
 
 **AppDaemon** still uses **`sensor.washer_state`**, **`sensor.dishwasher_state`**, **`sensor.dryer_state`** for logic and **attributes** (progress, times, etc.). Those sensors are recreated when AppDaemon runs; they are not the same as the `input_select` rows above.
+
+The custom HAKit dashboard reads the semantic sensors directly, including the state string
+and attributes: see [WasherCard](../../../home-assistant-hakit-dashboard/src/components/Washer/WasherCard.tsx).
+The helper recommendation is for persistent standard Lovelace displays, not a requirement to
+replace that dashboard's sensor contract. See the [shared home contracts](../../docs/HOME_CONTRACTS.md).
 
 **Monitor apps sync automatically:** whenever the state string changes on `sensor.*_state`, they call **`input_select/select_option`** on the matching helper. Default mapping: `sensor.washer_state` → `input_select.washer_state` (same suffix). Override in app YAML with optional **`ui_state_entity`** (use `""` to disable sync).
 
@@ -38,12 +44,14 @@ Template helpers with:
 
 **read their own state** while the Template integration updates on that entity. When **AppDaemon** updates attributes, HA re-renders the template → **loop detected**.
 
-Do **not** recreate that pattern. Use **`input_select`** for UI persistence instead (see above).
+Do **not** recreate that pattern. Use **`input_select`** when standard Lovelace needs a
+persistent state string, and let AppDaemon own the semantic sensors (see above).
 
 ## Fix summary
 
 1. **Remove** the old Template entries (*Washer / Dishwasher / Dryer state*) from **Settings → Devices & services → Template** (or disable via `homeassistant.disable_config_entry`).
-2. Use **`input_select.washer_state`** (and dishwasher/dryer) for **UI state** after restart.
+2. For persistent standard Lovelace state after restart, use **`input_select.washer_state`**
+   (and dishwasher/dryer). The custom dashboard continues to read `sensor.*_state`.
 3. **Restart AppDaemon** so `sensor.*_state` exists again with full attributes.
 
 ### HA MCP notes

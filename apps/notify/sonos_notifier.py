@@ -14,12 +14,14 @@ class SonosNotifier(hass.Hass):
         # Sleep Mode Entities
         self.kristine_sleep_mode_entity = self.args.get("kristine_sleep_mode_entity")
         self.mikkel_sleep_mode_entity = self.args.get("mikkel_sleep_mode_entity")
+        self.claudia_sleep_mode_entity = self.args.get("claudia_sleep_mode_entity")
 
         # Speaker Configuration (Music Assistant room entities per TTS target group)
         self.tts_group_all = self._entity_list(self.args.get("tts_group_all"))  # everyone awake
         self.tts_group_family_rooms = self._entity_list(self.args.get("tts_group_family_rooms"))  # always used
-        self.tts_group_kristine = self._entity_list(self.args.get("tts_group_kristine"))  # when only Mikkel sleeps
-        self.tts_group_ms = self._entity_list(self.args.get("tts_group_ms"))  # when only Kristine sleeps
+        self.tts_group_kristine = self._entity_list(self.args.get("tts_group_kristine"))  # when Kristine is awake
+        self.tts_group_ms = self._entity_list(self.args.get("tts_group_ms"))  # when Mikkel is awake
+        self.tts_group_claudia = self._entity_list(self.args.get("tts_group_claudia"))  # when Claudia is awake
 
         # TTS Configuration
         self.default_chime_path = self.args.get("default_chime_path")
@@ -54,6 +56,7 @@ class SonosNotifier(hass.Hass):
                 ("tts_group_family_rooms", self.tts_group_family_rooms),
                 ("tts_group_kristine", self.tts_group_kristine),
                 ("tts_group_ms", self.tts_group_ms),
+                ("tts_group_claudia", self.tts_group_claudia),
             ] if not val
         ]
         if missing_groups:
@@ -63,6 +66,8 @@ class SonosNotifier(hass.Hass):
             self.log("WARN: Kristine's sleep mode entity not configured.")
         if not self.mikkel_sleep_mode_entity:
             self.log("WARN: Mikkel sleep mode entity not configured.")
+        if not self.claudia_sleep_mode_entity:
+            self.log("WARN: Claudia sleep mode entity not configured.")
         if not self.default_chime_path:
             self.log("WARN: 'default_chime_path' is not configured. Chime functionality might be affected if not provided in calls.")
         if not self.tts_platform:
@@ -73,7 +78,7 @@ class SonosNotifier(hass.Hass):
         self.log(f"{self.app_name} Initialized. Ready to send notifications.", level=self.log_level)
         self.log(
             f"TTS groups: all={self.tts_group_all}, family_rooms={self.tts_group_family_rooms}, "
-            f"kristine={self.tts_group_kristine}, ms={self.tts_group_ms}",
+            f"kristine={self.tts_group_kristine}, ms={self.tts_group_ms}, claudia={self.tts_group_claudia}",
             level="DEBUG",
         )
         self.log(f"Default Chime Path: {self.default_chime_path}", level="DEBUG")
@@ -210,23 +215,22 @@ class SonosNotifier(hass.Hass):
             target_speakers = self._entity_list(target_speakers)
             self.log(f"Initial target speakers (override provided): {target_speakers}", level="DEBUG")
         else:
-            kristine_sleep_state = self.get_state(self.kristine_sleep_mode_entity) if self.kristine_sleep_mode_entity else "off"
-            mikkel_sleep_state = self.get_state(self.mikkel_sleep_mode_entity) if self.mikkel_sleep_mode_entity else "off"
-
             # Unavailable/unknown -> assume sleeping only inside quiet hours (fail-safe).
-            kristine_sleeping = self._resolve_sleeping(kristine_sleep_state, in_quiet_hours_now)
-            mikkel_sleeping = self._resolve_sleeping(mikkel_sleep_state, in_quiet_hours_now)
-            everyone_sleeping = kristine_sleeping and mikkel_sleeping
-
-            if everyone_sleeping:
-                target_speakers = self.tts_group_family_rooms
-                self.log("All sleeping -> using family rooms group", level="INFO")
-            elif kristine_sleeping:
-                target_speakers = self.tts_group_family_rooms + self.tts_group_ms
-                self.log("Kristine sleeping -> family rooms + Mikkel group", level="INFO")
-            elif mikkel_sleeping:
-                target_speakers = self.tts_group_family_rooms + self.tts_group_kristine
-                self.log("Mikkel sleeping -> family rooms + Kristine group", level="INFO")
+            residents = (
+                ("Mikkel", self.mikkel_sleep_mode_entity, self.tts_group_ms),
+                ("Kristine", self.kristine_sleep_mode_entity, self.tts_group_kristine),
+                ("Claudia", self.claudia_sleep_mode_entity, self.tts_group_claudia),
+            )
+            sleeping = []
+            target_speakers = list(self.tts_group_family_rooms)
+            for name, sleep_entity, private_rooms in residents:
+                state = self.get_state(sleep_entity) if sleep_entity else "off"
+                if self._resolve_sleeping(state, in_quiet_hours_now):
+                    sleeping.append(name)
+                else:
+                    target_speakers.extend(private_rooms)
+            if sleeping:
+                self.log(f"Sleeping: {', '.join(sleeping)} -> family rooms + awake residents' rooms", level="INFO")
             else:
                 target_speakers = self.tts_group_all
                 self.log("No one sleeping -> all speakers group", level="DEBUG")

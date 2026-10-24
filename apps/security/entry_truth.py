@@ -9,8 +9,9 @@ docstring for the two incidents - 2026-07-12 cloud stuck, 2026-07-22 BLE stuck -
 made a single hardcoded "trust BLE" rule wrong); this app no longer touches
 ``lock.yale_bt``/``lock.yale`` directly except as a fallback, below.
 
-State: on  = door closed AND sensor.apartment_lock reports "locked"
-       off = door open, or the arbitrated lock is not "locked"
+State: on      = contact confirms door closed AND effective lock reports "locked"
+       off     = contact confirms door open, or effective lock reports "unlocked"
+       unknown = neither conclusion is established (including transitional/jammed locks)
 
 Fallback: if sensor.apartment_lock itself is down (None/unknown/unavailable - LockHealth
 not running, mid-reload, etc.), fall back to the raw BLE entity (``lock_fallback``) so a
@@ -20,7 +21,8 @@ which path was used ("arbitrated" | "fallback_ble").
 Attributes: lock_state (the effective state entry_secure is judged on), bt_state /
 cloud_state (read from sensor.apartment_lock's own attributes when arbitrated;
 cloud_state is unknown in fallback mode - we no longer have visibility into the cloud
-twin without LockHealth), door_open, reason, lock_source_used, source_entities,
+twin without LockHealth), door_state, door_open ("true"/"false"/"unknown"), reason,
+lock_source_used, source_entities,
 computed_at (middle-layer convention).
 """
 
@@ -51,7 +53,8 @@ class EntryTruth(hass.Hass):
         try:
             lock_state = await self.get_state(self.lock_source)
             door = await self.get_state(self.door)
-            door_open = door == "on"
+            door_state = door if door in ("on", "off", "unknown", "unavailable") else "unknown"
+            door_open = "true" if door_state == "on" else "false" if door_state == "off" else "unknown"
 
             lock_source_used = "arbitrated"
             effective_state = lock_state
@@ -68,29 +71,33 @@ class EntryTruth(hass.Hass):
                 bt_state = source_attrs.get("bt_state")
                 cloud_state = source_attrs.get("cloud_state")
 
-            locked = effective_state == "locked"
-            secure = locked and not door_open
-
-            if door_open:
+            if door_state == "on":
+                state = "off"
                 reason = "door is open"
-            elif not locked:
+            elif effective_state == "unlocked":
+                state = "off"
                 reason = f"lock reports {effective_state or 'unknown'} ({lock_source_used})"
-            else:
+            elif door_state == "off" and effective_state == "locked":
+                state = "on"
                 reason = f"locked and closed ({lock_source_used})"
+            else:
+                state = "unknown"
+                reason = (f"door contact reports {door_state}; "
+                          f"lock reports {effective_state or 'unknown'} ({lock_source_used})")
 
-            # door_open silently drops from published attributes whenever it's False
-            # (door closed, the common case) -- AppDaemon 4.5.13 set_state bug, not
-            # ours; see smart_cooling.py's _publish() for details.
+            # String booleans survive AppDaemon 4.5.13's attribute filtering, which
+            # drops False. An unreadable contact must never masquerade as closed.
             await self.set_state(self.publish_entity,
-                                 state="on" if secure else "off",
+                                 state=state,
                                  replace=True,
                                  attributes={
                                      "friendly_name": "Apartment entry secure",
                                      "device_class": "lock",
                                      "icon": "mdi:shield-home",
-                                     "lock_state": effective_state,
+                                     "lock_state": effective_state or "unknown",
                                      "bt_state": bt_state,
                                      "cloud_state": cloud_state,
+                                     "door_state": door_state,
                                      "door_open": door_open,
                                      "reason": reason,
                                      "lock_source_used": lock_source_used,

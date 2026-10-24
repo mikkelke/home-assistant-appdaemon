@@ -18,6 +18,8 @@ HA reports as on, and HA's state for a Zigbee group trails a command, so adaptin
 ``FamilyRoomLights`` switched the island off would switch it back on.
 
 **Unemptied with no kitchen presence** is the normal layout: nothing is applied and no light is touched.
+Unknown kitchen presence preserves any applied signal and cannot apply a new one; only explicit
+absence or leaving Unemptied permits hand-back.
 
 **Startup:** if the AL switches are still in a signal layout (anything other than main-on/SG-off) while the
 kitchen is empty or the dishwasher is not Unemptied, the same hand-back runs, so a missed transition or AD
@@ -327,7 +329,7 @@ class DishwasherIslandSignal(hass.Hass):
         ``turn_on_lights=False`` makes AL skip bulbs HA reports as off.
         """
         try:
-            if self._is_unemptied() and self._pir_on():
+            if self._is_unemptied() and self.get_state(self._pir) != "off":
                 return
             if self._al_is_normal_not_unemptied():
                 return
@@ -352,8 +354,11 @@ class DishwasherIslandSignal(hass.Hass):
                 self._hand_back_island()
             return
 
-        if not self._pir_on():
+        presence = self.get_state(self._pir)
+        if presence == "off":
             self._hand_back_island()
+            return
+        if presence != "on":
             return
 
         if self._kitchen_presence_suspect():

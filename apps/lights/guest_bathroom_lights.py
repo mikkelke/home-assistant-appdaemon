@@ -36,8 +36,8 @@ class GuestBathroomLights(hass.Hass):
         
         if self.raw_pir_sensor:
             try:
-                self.listen_state(self._on_raw_pir_trigger, self.raw_pir_sensor, old="off", new="on")
-                self.listen_state(self._on_raw_pir_off, self.raw_pir_sensor, old="on", new="off")
+                self.listen_state(self._on_raw_pir_trigger, self.raw_pir_sensor, new="on")
+                self.listen_state(self._on_raw_pir_off, self.raw_pir_sensor, new="off")
                 if self.log_level == "debug":
                     self.log(f"Listening for PIR/presence: {self.raw_pir_sensor}", level="DEBUG")
             except Exception as e:
@@ -78,6 +78,8 @@ class GuestBathroomLights(hass.Hass):
             if self.manual_override_entity and self.get_state(self.manual_override_entity) == "on":
                 return
             occupancy_state = self.get_state(self.raw_pir_sensor) if self.raw_pir_sensor else "off"
+            if occupancy_state not in ("on", "off"):
+                return
             light_state = self.get_state(self.light_entity)
             
             # If no occupancy, lights should be off
@@ -246,7 +248,7 @@ class GuestBathroomLights(hass.Hass):
             self.log("Guest bathroom: manual override ON - automatic lighting paused", level="INFO")
         elif new == "off":
             try:
-                occupied = self.get_state(self.raw_pir_sensor) == "on"
+                occupied = self.get_state(self.raw_pir_sensor) != "off"
             except Exception:
                 occupied = True  # fail toward not touching the lights
             if occupied:

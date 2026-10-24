@@ -6,6 +6,11 @@
 AppDaemon apps for my Home Assistant smart home. This repo is the **source of truth**;
 the box runs a deployed copy under `/data/appdaemon/apps`.
 
+Start with the [whole-home system map](docs/HOME_SYSTEM.md) for resident journeys,
+shared entity contracts, dashboard connections, and the boundaries agents must preserve.
+The [contract index](docs/HOME_CONTRACTS.md) connects the first eight groups to their
+consumers, uncertainty rules, resident outcomes and tests.
+
 ## Layout
 
 - `apps/<domain>/` — one directory per domain (lights, sonos, climate, appliances, tv,

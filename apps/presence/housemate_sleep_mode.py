@@ -44,9 +44,9 @@ Signals (per person, config-driven):
       "left" (the companion sensors go stale exactly when the phone sleeps).
 
 Robustness choices, stated rather than implied:
-- A PIR stuck unavailable counts as quiet once quiet_minutes have passed since its
-  last observed motion: home + charging + night window still carry the signal, and
-  a dead PIR must not permanently disable someone's sleep mode.
+- Room activity must explicitly report off for the quiet interval before inferring sleep.
+  Unknown activity breaks the quiet clock; recovery starts a fresh interval. Once sleep is
+  established an activity outage alone never clears it.
 - Restart survival needs no state file: the current boolean state IS the verdict at
   init (adopted as-is), and the away/unplug clocks are re-seeded from HA's own
   last_changed timestamps, so an AppDaemon restart mid-night neither clears nor
@@ -158,7 +158,7 @@ class HousemateSleepMode(hass.Hass):
                 "person_state": None,
                 "battery_state": "",
                 "pir_state": None,
-                "last_motion": None,       # naive local dt of last PIR "on"
+                "last_motion": None,       # naive local dt of disturbance/quiet recovery
                 "battery_off_since": None,  # naive local dt battery left Charging/Full
                 "away_since": None,         # naive local dt person went explicitly away
                 "rearm_block": False,       # set by a foreign OFF; see module docstring
@@ -198,13 +198,13 @@ class HousemateSleepMode(hass.Hass):
         p["pir_state"] = self._safe_state(p["pir_entity"])
         p["verdict"] = self._safe_state(p["sleep_entity"]) == "on"
 
-        if p["pir_state"] == "on":
-            p["last_motion"] = now
-        else:
+        if p["pir_state"] == "off":
             p["last_motion"] = (
                 _parse_iso_local(self._safe_state(p["pir_entity"], attribute="last_changed"))
                 or now
             )
+        else:
+            p["last_motion"] = now if p["pir_state"] == "on" else None
         if p["verdict"]:
             if self._explicit_away(p["person_state"]):
                 p["away_since"] = (
@@ -257,7 +257,7 @@ class HousemateSleepMode(hass.Hass):
         try:
             p = self._people[kwargs["person"]]
             p["pir_state"] = new
-            if new == "on":
+            if new != "off" or old != "off":
                 p["last_motion"] = self._now_local()
             self._evaluate(p)
         except Exception as e:
@@ -340,7 +340,7 @@ class HousemateSleepMode(hass.Hass):
             self._write(p, False, f"left home for >={p['leave_grace_seconds'] // 60} min")
 
     def _room_quiet(self, p, now):
-        if p["pir_state"] == "on":
+        if p["pir_state"] != "off":
             return False
         if p["last_motion"] is None:
             return False

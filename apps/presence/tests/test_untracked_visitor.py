@@ -243,7 +243,7 @@ def make_app(states=None, attrs=None, args=None, state_file=None, owners=None, n
     Every app gets its own state file unless one is passed; `now` is seconds after T0."""
     app = uv.UntrackedVisitor.__new__(uv.UntrackedVisitor)
     app.args = {**BASE_ARGS, "state_file": state_file or new_state_file(), **(args or {})}
-    app.states = {LOCK: "locked", DOOR: "off"}
+    app.states = {LOCK: "locked", DOOR: "off", **{entity: "off" for entity in ACTIVITY}}
     app.states.update(states or {})
     app.attrs = {("cover.bedroom_blind", "current_position"): 38,
                  ("cover.bathroom_blind", "current_position"): 40}
@@ -434,6 +434,44 @@ class Start(unittest.TestCase):
 
 
 class EndRules(unittest.TestCase):
+    def test_unknown_activity_holds_visit_and_blind_claims_until_readable_quiet(self):
+        app = make_app()
+        start_cleaner(app)
+        entity = "binary_sensor.kitchen_active"
+        at(app, 30)
+        app.states[entity] = "unknown"
+        app._on_activity(entity, None, "off", "unknown", {})
+        self.assertIsNone(app._active[entity])
+        tick(app, 1800)
+        self.assertEqual(published(app)[0], "cleaner")
+        # No restoration request occurred while activity was unknown.
+        self.assertEqual(set(owner_of(app, "BedroomBlindOwner").positions()), {0})
+        zone(app, 1801, "kitchen", False)
+        tick(app, 1801 + QUIET_S - 1)
+        self.assertEqual(published(app)[0], "cleaner")
+        tick(app, 1801 + QUIET_S)
+        self.assertEqual(published(app)[0], "none")
+        self.assertEqual(owner_of(app, "BedroomBlindOwner").positions()[-1], 38)
+
+    def test_unavailable_or_missing_activity_cannot_establish_a_quiet_flat(self):
+        for unknown in (None, "unknown", "unavailable"):
+            with self.subTest(state=unknown):
+                app = make_app(states={"binary_sensor.kitchen_active": unknown})
+                start_cleaner(app)
+                tick(app, 1800)
+                self.assertEqual(published(app)[0], "cleaner")
+
+    def test_arrival_and_cap_still_end_visits_with_unknown_activity(self):
+        for why in ("arrival", "cap"):
+            with self.subTest(why=why):
+                app = make_app(states={"binary_sensor.kitchen_active": "unknown"})
+                start_cleaner(app)
+                if why == "arrival":
+                    arrive(app, 600)
+                else:
+                    tick(app, 2 + 2 * 3600)
+                self.assertEqual(published(app)[0], "none")
+
     def test_a_closed_door_and_a_quiet_flat_end_the_visit_after_fifteen_minutes(self):
         app = make_app()
         start_cleaner(app)

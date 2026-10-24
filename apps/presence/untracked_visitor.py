@@ -16,7 +16,7 @@ A second unlock by the same person during a visit belongs to the same visit; an 
 anyone else replaces it.
 
 OFF. The first of
-  * the front door is closed and none of the `activity` entities has been on for quiet_min
+  * the front door is closed and every `activity` entity has been explicitly off for quiet_min
     minutes (the quiet clock restarts at every door edge and every activity change),
   * a resident in `persons` arrives home,
   * cap_hours have passed since the visit began.
@@ -95,9 +95,16 @@ def is_on(state):
     return str(state).strip().lower() == "on"
 
 
+def activity_state(state):
+    """Tri-state activity: unknown must not become evidence that the flat is quiet."""
+    normalized = str(state).strip().lower()
+    return True if normalized == "on" else False if normalized == "off" else None
+
+
 def end_reason(now, since, anchor, *, door_open, active, quiet_s, cap_s):
     """Why a visit that began at `since` is over, or None while it is still on. `anchor` is
-    the last door edge or activity change, `active` whether any activity entity is on."""
+    the last door edge or activity change; `active` blocks a quiet exit when activity is
+    positive or unreadable."""
     if not door_open and not active and now - anchor >= quiet_s:
         return QUIET
     if now - since >= cap_s:
@@ -185,7 +192,7 @@ class UntrackedVisitor(hass.Hass):
         self._published_at = 0.0
         self._warned = set()
         self._door_open = is_on(self.get_state(self.door_entity))
-        self._active = {entity: is_on(self.get_state(entity)) for entity in self.activity}
+        self._active = {entity: activity_state(self.get_state(entity)) for entity in self.activity}
 
         with self._lock:
             now = self._now()
@@ -221,7 +228,7 @@ class UntrackedVisitor(hass.Hass):
 
     def _on_activity(self, entity, attribute, old, new, kwargs):
         with self._lock:
-            self._active[entity] = is_on(new)
+            self._active[entity] = activity_state(new)
             self._touch()
 
     def _on_person(self, entity, attribute, old, new, kwargs):
@@ -269,8 +276,9 @@ class UntrackedVisitor(hass.Hass):
     def _step(self, now):
         visit = self._visit
         if visit is not None:
+            activity_quiet = bool(self._active) and all(value is False for value in self._active.values())
             why = end_reason(now, visit["since"], visit["anchor"], door_open=self._door_open,
-                             active=any(self._active.values()),
+                             active=not activity_quiet,
                              quiet_s=self.quiet_min * 60, cap_s=self.cap_hours * 3600)
             if why is not None:
                 self._end(now, why)

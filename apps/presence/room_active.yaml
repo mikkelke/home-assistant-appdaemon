@@ -1,10 +1,15 @@
 # /conf/apps/presence/room_active.yaml
-# Wave 1 of the room-active presence-unification plan (shadow-only, zero consumers): publishes
+# Shared occupancy used by lighting, music, sleep/wake and attribution/visitor consumers:
+# publishes
 # binary_sensor.<zone>_active for every zone below by unioning a small tiered witness list
 # (room mmWave presence, spot sensors, bed mats/strip, raw PIR/motion channels) - see
 # room_active.py's module docstring for the state/timing/publish-contract rules in full, and
 # room_active_read.py for the paired reader helper (active()/explicitly_inactive(), plain
 # functions, no yaml, no app registration).
+# Any positive witness publishes on immediately. Total unreadability publishes unknown;
+# readable negative evidence after recovery must complete a new full settle interval.
+# Mixed readable-negative/unreadable witnesses keep the existing settle rule, with stale=true.
+# Some lighting handoffs intentionally keep raw witnesses; this signal is not a person identity.
 #
 # Every witness entity_id below was verified live against this HA instance's
 # .storage/core.entity_registry on 2026-08-31 - all present exactly as written, including

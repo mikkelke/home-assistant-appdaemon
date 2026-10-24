@@ -194,14 +194,14 @@ class PerZoneSettle(unittest.TestCase):
         app.zone_settle_off_sec = {ZONE: 60}
         app.states[(W_ROOM, None)] = "off"
         app._evaluate(ZONE)
-        app.run_in.assert_called_once_with(app._settle_fire, 60, zone=ZONE)
+        app.run_in.assert_called_once_with(app._settle_fire, 60, zone=ZONE, generation=1)
 
     def test_zones_without_an_override_keep_the_global_window(self):
         app = _make_on_app()
         app.zone_settle_off_sec = {"some_other_zone": 60}
         app.states[(W_ROOM, None)] = "off"
         app._evaluate(ZONE)
-        app.run_in.assert_called_once_with(app._settle_fire, SETTLE_SEC, zone=ZONE)
+        app.run_in.assert_called_once_with(app._settle_fire, SETTLE_SEC, zone=ZONE, generation=1)
 
     def test_initialize_reads_the_override_from_the_zone_config(self):
         zones = {zone: dict(cfg) for zone, cfg in BASE_ARGS["zones"].items()}
@@ -217,7 +217,7 @@ class SettleOffTiming(unittest.TestCase):
         app = _make_on_app()
         app.states[(W_ROOM, None)] = "off"
         app._evaluate(ZONE)
-        app.run_in.assert_called_once_with(app._settle_fire, SETTLE_SEC, zone=ZONE)
+        app.run_in.assert_called_once_with(app._settle_fire, SETTLE_SEC, zone=ZONE, generation=1)
         kwargs = app.set_state.call_args.kwargs
         self.assertEqual(kwargs["state"], "on")
         self.assertEqual(kwargs["attributes"]["settling"], "true")
@@ -237,7 +237,7 @@ class SettleOffTiming(unittest.TestCase):
         app._evaluate(ZONE)  # arms the timer
         app.set_state.reset_mock()
 
-        app._settle_fire({"zone": ZONE})
+        app._settle_fire(app.run_in.call_args.kwargs)
 
         kwargs = app.set_state.call_args.kwargs
         self.assertEqual(kwargs["state"], "off")
@@ -248,7 +248,7 @@ class SettleOffTiming(unittest.TestCase):
         app = _make_on_app()
         app.states[(W_ROOM, None)] = "off"
         app._evaluate(ZONE)
-        app._settle_fire({"zone": ZONE})
+        app._settle_fire(app.run_in.call_args.kwargs)
         self.assertEqual(app._zone_state[ZONE]["state"], "off")
 
 
@@ -310,28 +310,122 @@ class UnreadableWitnesses(unittest.TestCase):
         self.assertEqual(kwargs["state"], "off")
         self.assertEqual(kwargs["attributes"]["stale"], "true")
 
-    def test_all_unreadable_while_on_holds_last_value_settles_normally(self):
-        """Zone was "on"; every witness then goes unavailable at once - unreadable is inert,
-        not denial, so this must follow the exact same settle path as any other all-quiet
-        transition, not flip immediately."""
+    def test_all_unreadable_while_on_publishes_unknown_without_settling(self):
         app = _make_on_app()
         for w in WITNESSES:
             app.states[(w["entity"], None)] = "unavailable"
         app._evaluate(ZONE)
         kwargs = app.set_state.call_args.kwargs
-        self.assertEqual(kwargs["state"], "on")
+        self.assertEqual(kwargs["state"], "unknown")
         self.assertEqual(kwargs["attributes"]["stale"], "true")
-        self.assertEqual(kwargs["attributes"]["settling"], "true")
-        app.run_in.assert_called_once()
+        self.assertEqual(kwargs["attributes"]["settling"], "false")
+        self.assertEqual(kwargs["attributes"]["reason"], "no_readable_witnesses")
+        app.run_in.assert_not_called()
 
-    def test_all_unreadable_while_already_off_holds_off(self):
+    def test_all_unreadable_while_already_off_publishes_unknown(self):
         app = make_app(zone_state="off")
         for w in WITNESSES:
             app.states[(w["entity"], None)] = "unavailable"
         app._evaluate(ZONE)
         kwargs = app.set_state.call_args.kwargs
-        self.assertEqual(kwargs["state"], "off")
+        self.assertEqual(kwargs["state"], "unknown")
         self.assertEqual(kwargs["attributes"]["stale"], "true")
+
+    def test_cold_start_with_no_readable_witnesses_is_unknown(self):
+        for unreadable in (None, "unknown", "unavailable"):
+            with self.subTest(state=unreadable):
+                app = make_app(zone_state=None)
+                for w in WITNESSES:
+                    app.states[(w["entity"], None)] = unreadable
+                app._evaluate(ZONE)
+                self.assertEqual(app.set_state.call_args.kwargs["state"], "unknown")
+                app.run_in.assert_not_called()
+
+    def test_empty_configuration_has_no_evidence(self):
+        app = make_app(zone_state=None, zones={ZONE: []})
+        app._evaluate(ZONE)
+        payload = app.set_state.call_args.kwargs
+        self.assertEqual(payload["state"], "unknown")
+        self.assertEqual(payload["attributes"]["reason"], "no_readable_witnesses")
+        self.assertEqual(payload["attributes"]["stale"], "true")
+        self.assertEqual(payload["attributes"]["source_entities"], ["<none>"])
+
+    def test_read_errors_are_unreadable(self):
+        app = make_app(zone_state="on")
+        app.get_state = MagicMock(side_effect=RuntimeError("read failed"))
+        app._evaluate(ZONE)
+        self.assertEqual(app.set_state.call_args.kwargs["state"], "unknown")
+
+
+class OutageRecovery(unittest.TestCase):
+    def outage(self, app):
+        for w in WITNESSES:
+            app.states[(w["entity"], None)] = "unavailable"
+        app._evaluate(ZONE)
+
+    def test_recovery_to_readable_off_waits_a_full_new_interval(self):
+        app = _make_on_app()
+        app.states[(W_ROOM, None)] = "off"
+        app._evaluate(ZONE)
+        old_callback = dict(app.run_in.call_args.kwargs)
+        self.outage(app)
+        app.cancel_timer.assert_called_once_with("settle-timer-handle")
+        self.assertEqual(app._zone_state[ZONE]["state"], "unknown")
+
+        # One readable negative witness is enough for the existing mixed-evidence rule.
+        app.states[(W_ROOM, None)] = "off"
+        app._evaluate(ZONE)
+        new_callback = dict(app.run_in.call_args.kwargs)
+        self.assertNotEqual(old_callback["generation"], new_callback["generation"])
+        self.assertEqual(app._zone_state[ZONE]["state"], "unknown")
+        self.assertEqual(app.set_state.call_args.kwargs["attributes"]["settling"], "true")
+        self.assertEqual(app.run_in.call_args.args[1], SETTLE_SEC)
+
+        # A callback already queued before cancellation must not steal the new timer.
+        app._settle_fire(old_callback)
+        self.assertEqual(app._zone_state[ZONE]["state"], "unknown")
+        self.assertIsNotNone(app._zone_state[ZONE]["settle_timer"])
+        app._settle_fire(new_callback)
+        self.assertEqual(app._zone_state[ZONE]["state"], "off")
+
+    def test_unknown_recovers_to_positive_evidence_immediately(self):
+        app = make_app(zone_state="off")
+        self.outage(app)
+        app.states[(W_BED, None)] = "on"
+        app._evaluate(ZONE)
+        self.assertEqual(app._zone_state[ZONE]["state"], "on")
+        app.run_in.assert_not_called()
+
+    def test_a_second_outage_cancels_recovery_and_requires_a_new_interval(self):
+        app = make_app(zone_state="off")
+        self.outage(app)
+        app.states[(W_ROOM, None)] = "off"
+        app._evaluate(ZONE)
+        first = dict(app.run_in.call_args.kwargs)
+        self.outage(app)
+        app._settle_fire(first)
+        self.assertEqual(app._zone_state[ZONE]["state"], "unknown")
+        app.states[(W_ROOM, None)] = "off"
+        app._evaluate(ZONE)
+        self.assertEqual(app.run_in.call_count, 2)
+        app._settle_fire(first)
+        self.assertEqual(app._zone_state[ZONE]["state"], "unknown")
+        app._settle_fire(app.run_in.call_args.kwargs)
+        self.assertEqual(app._zone_state[ZONE]["state"], "off")
+
+    def test_reassertion_invalidates_a_previous_quiet_callback(self):
+        app = _make_on_app()
+        app.states[(W_ROOM, None)] = "off"
+        app._evaluate(ZONE)
+        old_callback = dict(app.run_in.call_args.kwargs)
+        app.states[(W_ROOM, None)] = "on"
+        app._evaluate(ZONE)
+        app.states[(W_ROOM, None)] = "off"
+        app._evaluate(ZONE)
+        app._settle_fire(old_callback)
+        self.assertEqual(app._zone_state[ZONE]["state"], "on")
+        app._settle_fire(app.run_in.call_args.kwargs)
+        self.assertEqual(app._zone_state[ZONE]["state"], "off")
 
 
 class PayloadNeverFalsy(unittest.TestCase):

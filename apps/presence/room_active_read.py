@@ -21,8 +21,9 @@ def active(hass, zone: str, max_age_sec: int = 300) -> bool | None:
 
     Resolution order:
       1. Read binary_sensor.<zone>_active and its computed_at attribute. If the state is
-         "on"/"off" and computed_at parses as a valid ISO timestamp within max_age_sec of
-         now (UTC), trust it directly.
+         "on"/"off"/"unknown" and computed_at parses as a valid ISO timestamp within
+         max_age_sec of now (UTC), trust it directly. Fresh unknown preserves the publisher's
+         recovery settle interval. Legacy off + stale=true is checked against live witnesses.
       2. Otherwise fall back to recomputing live from RoomActive's own witness config
          (self.get_app("RoomActive").zones) - the exact same union-of-witnesses rule the
          publisher itself uses. If the app isn't loaded, or the zone is unknown to it, or
@@ -34,13 +35,22 @@ def active(hass, zone: str, max_age_sec: int = 300) -> bool | None:
     except Exception:
         state = None
 
-    if state in ("on", "off"):
+    if state in ("on", "off", "unknown"):
         try:
             computed_at = hass.get_state(entity_id, attribute="computed_at")
         except Exception:
             computed_at = None
         age = _age_seconds(computed_at)
         if age is not None and age <= max_age_sec:
+            if state == "unknown":
+                return None
+            if state == "off":
+                try:
+                    stale = hass.get_state(entity_id, attribute="stale")
+                except Exception:
+                    return _fallback(hass, zone)
+                if stale in (True, "true"):
+                    return _fallback(hass, zone)
             return state == "on"
 
     return _fallback(hass, zone)

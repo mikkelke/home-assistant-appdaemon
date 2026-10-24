@@ -335,8 +335,14 @@ class SonosFollowMe(hass.Hass):
                         level="INFO",
                     )
                     return None
-            # Otherwise, presence is true if any known sensor is present
-            result = k_present or h_present
+            # Positive evidence wins, but absence requires both composites explicitly off.
+            # One off plus an unreadable composite cannot establish an empty kitchen/hallway.
+            if k_present or h_present:
+                result = True
+            elif k_raw == "off" and h_raw == "off":
+                result = False
+            else:
+                result = None
             self.log(f"Scenario: kitchen_presence -> kitchen:{kitchen_state} hallway:{hallway_state} result:{result}", level="INFO")
             return result
             

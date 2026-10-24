@@ -121,6 +121,37 @@ class TurnsOnWhenSettled(unittest.TestCase):
         app._evaluate(p)
         self.assertEqual(turn_ons(app), [])
 
+    def test_unknown_room_cannot_establish_quiet_or_sleep(self):
+        for state in ("unknown", "unavailable", None):
+            with self.subTest(state=state):
+                p = make_person(pir_state=state, last_motion=NIGHT - timedelta(hours=3))
+                app = make_app(p)
+                app._evaluate(p)
+                self.assertEqual(turn_ons(app), [])
+
+    def test_unknown_breaks_the_quiet_clock_and_recovery_starts_fresh(self):
+        p = make_person()
+        app = make_app(p)
+        app._on_pir(p["pir_entity"], "state", "off", "unknown", {"person": p["key"]})
+        app._clock["now"] = NIGHT + timedelta(minutes=20)
+        app._on_pir(p["pir_entity"], "state", "unknown", "off", {"person": p["key"]})
+        self.assertEqual(turn_ons(app), [])
+        app._clock["now"] += timedelta(seconds=app.quiet_seconds - 1)
+        app._tick({})
+        self.assertEqual(turn_ons(app), [])
+        app._clock["now"] += timedelta(seconds=1)
+        app._tick({})
+        self.assertEqual(len(turn_ons(app)), 1)
+
+    def test_unknown_room_does_not_clear_existing_sleep(self):
+        p = make_person(verdict=True)
+        app = make_app(p)
+        app._on_pir(p["pir_entity"], "state", "off", "unknown", {"person": p["key"]})
+        app._clock["now"] += timedelta(hours=2)
+        app._tick({})
+        self.assertTrue(p["verdict"])
+        self.assertEqual(turn_offs(app), [])
+
     def test_not_charging_blocks_on(self):
         p = make_person(battery_state="not charging")
         app = make_app(p)
@@ -501,6 +532,17 @@ class StartupSeeding(unittest.TestCase):
             "binary_sensor.kristines_room_pir_presence": "off",
         })
         self.assertFalse(app._people["kristine"]["verdict"])
+
+    def test_unknown_room_at_startup_does_not_seed_a_quiet_interval(self):
+        app = self._init_app({
+            "person.kristine": "home",
+            "sensor.kristine_battery_state": "Charging",
+            "binary_sensor.kristines_room_pir_presence": "unknown",
+            ("binary_sensor.kristines_room_pir_presence", "last_changed"): "2020-01-01T00:00:00+00:00",
+        })
+        p = app._people["kristine"]
+        self.assertIsNone(p["last_motion"])
+        self.assertFalse(app._room_quiet(p, NIGHT))
 
 
 if __name__ == "__main__":

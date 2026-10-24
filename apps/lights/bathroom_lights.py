@@ -74,9 +74,9 @@ class BathroomLights(hass.Hass):
             self.listen_state(
                 self._on_raw_pir_on,
                 self.raw_pir_sensor,
-                old="off",
                 new="on",
             )
+            self.listen_state(self._on_raw_pir_off, self.raw_pir_sensor, new="off")
 
         if self.bathroom_door_sensor:
             self.listen_state(
@@ -125,19 +125,18 @@ class BathroomLights(hass.Hass):
             )
         return on_d, off_d
 
-    def _is_local_occupied(self) -> bool:
+    def _is_local_occupied(self) -> bool | None:
         """Bathroom occupancy based only on bathroom sensors (no shared-zone occupancy)."""
-        try:
-            if self.raw_pir_sensor and self.get_state(self.raw_pir_sensor) == "on":
+        states = []
+        for entity in (self.raw_pir_sensor, self.specific_bath_presence_entity):
+            try:
+                state = self.get_state(entity) if entity else None
+            except Exception:
+                state = None
+            if state == "on":
                 return True
-            if (
-                self.specific_bath_presence_entity
-                and self.get_state(self.specific_bath_presence_entity) == "on"
-            ):
-                return True
-        except Exception:
-            pass
-        return False
+            states.append(state)
+        return False if all(state == "off" for state in states) else None
 
     def _is_bright_fast(self, trigger: str, off_decision) -> bool:
         """
@@ -177,6 +176,11 @@ class BathroomLights(hass.Hass):
         """Fast path: PIR on before ``room_state`` push (calculator may lag). Dark/bright still from push."""
         self._evaluate_main_lights("PIR_ON")
         self._evaluate_bath_spot("PIR_ON")
+
+    def _on_raw_pir_off(self, entity, attribute, old, new, kwargs):
+        """Includes recovery to known absence, even if the room-state label is unchanged."""
+        self._evaluate_main_lights("PIR_OFF")
+        self._evaluate_bath_spot("PIR_OFF")
 
     def _on_bathroom_door_open(self, entity, attribute, old, new, kwargs):
         """Entering from bedroom - lights should not wait on ``room_state`` alone."""
@@ -226,6 +230,8 @@ class BathroomLights(hass.Hass):
             occupied = self._is_local_occupied()
             if trigger in ("PIR_ON", "DOOR_OPEN"):
                 occupied = True
+            if occupied is None:
+                return
             lighting_actions.apply_global_lighting(
                 self,
                 room_state_entity=self.room_state_text_entity,
@@ -266,7 +272,10 @@ class BathroomLights(hass.Hass):
         """
         try:
             # Check if someone is in the bath/shower area
-            bath_presence = self.get_state(self.specific_bath_presence_entity) == "on"
+            bath_state = self.get_state(self.specific_bath_presence_entity)
+            if bath_state not in ("on", "off"):
+                return
+            bath_presence = bath_state == "on"
             
             _, off_d = self._lighting_decisions(trigger)
             is_bright = self._is_bright_fast(trigger, off_d)
@@ -367,7 +376,7 @@ class BathroomLights(hass.Hass):
                 occupied = self._is_local_occupied()
             except Exception:
                 occupied = True  # fail toward not touching the lights
-            if occupied:
+            if occupied is not False:
                 self.log("Bathroom: manual override OFF - room occupied, resuming on next trigger", level="INFO")
             else:
                 self.log("Bathroom: manual override OFF - resuming automatic lighting", level="INFO")

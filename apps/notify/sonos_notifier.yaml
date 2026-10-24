@@ -10,6 +10,7 @@ SonosNotifier:
   kristine_sleep_mode_entity: "input_boolean.kristine_sleep_mode"
 
   mikkel_sleep_mode_entity: "input_boolean.mikkel_sleep_mode"
+  claudia_sleep_mode_entity: "input_boolean.claudia_sleep_mode"
   
   # --- Speaker Configuration (room entities per TTS target group) ---
   # Kept in sync with the `tts:` tags in apps/sonos/speakers.yaml by scripts/check_speakers.py.
@@ -30,12 +31,13 @@ SonosNotifier:
     - media_player.dining_room
     - media_player.bathroom
     - media_player.guest_bathroom
-    - media_player.claudias_room
     - media_player.rooftop
-  tts_group_kristine:             # add when only Mikkel sleeps
+  tts_group_kristine:             # add when Kristine is awake
     - media_player.kristines_room
-  tts_group_ms:                   # add when only Kristine sleeps
+  tts_group_ms:                   # add when Mikkel is awake
     - media_player.bedroom
+  tts_group_claudia:              # add when Claudia is awake
+    - media_player.claudias_room
 
   # --- TTS Configuration ---
   default_chime_path: "/config/www/chimes/alert_notification.mp3"
@@ -63,4 +65,4 @@ SonosNotifier:
   # Fail-safe defaults used only when the helpers above are unavailable/unparseable
   # (e.g. briefly after every HA restart).
   default_quiet_hours_start: "22:00"
-  default_quiet_hours_end: "07:00" 
+  default_quiet_hours_end: "07:00"

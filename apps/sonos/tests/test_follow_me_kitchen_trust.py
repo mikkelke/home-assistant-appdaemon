@@ -130,6 +130,55 @@ class KitchenPresenceTrust(unittest.TestCase):
         self.assertIs(app._is_present("kitchen", KITCHEN_SPEAKER), False)
 
 
+class KitchenPresenceEvidence(unittest.TestCase):
+    def test_either_unreadable_composite_cannot_establish_absence(self):
+        for unreadable in (None, "unknown", "unavailable", "", "unexpected"):
+            for kitchen, hallway in (("off", unreadable), (unreadable, "off"), (unreadable, unreadable)):
+                with self.subTest(kitchen=kitchen, hallway=hallway):
+                    app = make_app(ghost_states(kitchen_composite=kitchen, hallway=hallway))
+                    self.assertIsNone(app._is_present("kitchen", KITCHEN_SPEAKER))
+
+    def test_positive_evidence_wins_over_an_unreadable_composite(self):
+        for unreadable in (None, "unknown", "unavailable"):
+            for kitchen, hallway in (("on", unreadable), (unreadable, "on")):
+                with self.subTest(kitchen=kitchen, hallway=hallway):
+                    app = make_app(ghost_states(
+                        kitchen_composite=kitchen, hallway=hallway, interferer="idle",
+                    ))
+                    self.assertIs(app._is_present("kitchen", KITCHEN_SPEAKER), True)
+
+    def test_suspect_kitchen_does_not_win_over_an_unreadable_hallway(self):
+        app = make_app(ghost_states(hallway="unknown"))
+        self.assertIsNone(app._is_present("kitchen", KITCHEN_SPEAKER))
+        self.assertTrue(any("SUSPECT" in msg for _lvl, msg in app.log_calls))
+
+    def test_settled_sync_holds_then_resumes_after_evidence_recovers(self):
+        app = make_app(ghost_states(kitchen_composite="off", hallway="unknown", interferer="idle"))
+        app._pending_changes = {}
+        app.datetime = lambda: datetime(2026, 8, 9, 17, 0, tzinfo=timezone.utc)
+        app._get_current_coordinator = lambda: KITCHEN_SPEAKER
+        app._apply_follow_me_mute = MagicMock()
+
+        # No change to either an already muted or already unmuted speaker during the outage.
+        for muted in (False, True):
+            app.states[KITCHEN_SPEAKER]["attributes"]["is_volume_muted"] = muted
+            app._check_settled({})
+            app._apply_follow_me_mute.assert_not_called()
+
+        app.states[HPIR]["state"] = "off"
+        app._check_settled({})
+        app._apply_follow_me_mute.assert_called_once_with(
+            KITCHEN_SPEAKER, True, room="kitchen", master=KITCHEN_SPEAKER,
+        )
+
+        app._apply_follow_me_mute.reset_mock()
+        app.states[HPIR]["state"] = "on"
+        app._check_settled({})
+        app._apply_follow_me_mute.assert_called_once_with(
+            KITCHEN_SPEAKER, False, room="kitchen", master=KITCHEN_SPEAKER,
+        )
+
+
 class MuteActionsUnderSuspicion(unittest.TestCase):
     def _wire(self, app):
         app._should_follow_me_be_active = lambda: True
@@ -153,6 +202,11 @@ class MuteActionsUnderSuspicion(unittest.TestCase):
             entity_id=KITCHEN_SPEAKER,
             is_volume_muted=True,
         )
+
+    def test_partial_outage_does_not_reapply_mute(self):
+        app = self._wire(make_app(ghost_states(kitchen_composite="off", hallway="unknown")))
+        app._preserve_mute_state_if_needed(KITCHEN_SPEAKER)
+        app.call_service.assert_not_called()
 
 
 if __name__ == "__main__":

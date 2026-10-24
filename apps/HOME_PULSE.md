@@ -1,6 +1,13 @@
 # Home Pulse – UI and data sources
 
-**Home Pulse** is the **dashboard / UI layer**: it shows apartment-level alerts by reading Home Assistant entities. It is **not** an AppDaemon module name.
+For the current whole-home architecture, start with the [system map](../docs/HOME_SYSTEM.md).
+This document describes the earlier weather/opening-alert slice of Home Pulse; its suggested
+priorities are design history, not a complete description of the current dashboard.
+
+**Home Pulse** names the dashboard experience. Its backend now includes
+[`home_pulse/house_events.py`](home_pulse/house_events.py) (explanations of what happened) and
+[`home_pulse/house_upcoming.py`](home_pulse/house_upcoming.py) (upcoming needs and reminders).
+Weather and thermal decisions still belong to their respective domains below.
 
 Backend logic is split by **source of truth**:
 
@@ -62,4 +69,7 @@ The UI can merge `weather_opening_alert_priority` with climate alarm state to de
 
 ## Historical note
 
-An earlier draft described a **single AppDaemon app `HomePulse`** under `home_pulse/`. That was superseded: **weather** alerts live in `weather/weather_opening_alert.py`, **climate** in `climate/climate_alarm.py`, and this folder only holds **documentation** for the Home Pulse UI concept.
+An earlier draft described a **single AppDaemon app `HomePulse`**. That was superseded:
+weather alerts live in `weather/weather_opening_alert.py`, thermal alerts in
+`climate/climate_alarm.py`, and the current `home_pulse/` directory contains the separate
+HouseEvents and HouseUpcoming apps and their helpers/tests.
