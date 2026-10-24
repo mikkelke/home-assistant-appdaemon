@@ -22,7 +22,9 @@ WHAT "MANUAL" MEANS HERE - one definition, replacing three:
     means it stopped).
 
 Either one sets a manual claim at the position the human chose, active for
-``manual_pause_min``. While it is active nothing automatic moves the blind, and
+``manual_pause_min``. A visit that begins (a fresh ``visitor`` claim) clears a manual
+hold set before it; a hand on the blind during the visit still wins. While the hold
+is active nothing automatic moves the blind, and
 askers are told who outranked them so they can react (the wake routine starts its
 light ramp anyway instead of waiting for a blind that will never arrive).
 
@@ -176,6 +178,10 @@ class BedroomBlindOwner(hass.Hass):
         with self._lock:
             now = self.get_now()
             ttl = self.claim_ttl_min.get(src, 15.0) if ttl_min is None else float(ttl_min)
+            self._prune(now)
+            if (src == blind_arbiter.SOURCE_VISITOR and src not in self._claims
+                    and self._claims.pop(blind_arbiter.SOURCE_MANUAL, None) is not None):
+                self.log("visitor arrived - the manual hold from before the visit is cleared")
             self._claims[src] = {
                 "position": pos,
                 "reason": str(reason or ""),

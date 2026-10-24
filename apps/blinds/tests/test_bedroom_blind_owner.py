@@ -158,13 +158,32 @@ class VisitorClaims(unittest.TestCase):
         self.assertTrue(res["granted"])
         self.assertEqual(positions_commanded(app)[-1], 0)
 
-    def test_a_hand_outranks_the_visitor_and_the_visitor_is_told_who_won(self):
+    def test_a_visit_clears_a_manual_hold_from_before_it(self):
+        app = make_owner(position=100)
+        for pos in (70, 38):
+            report(app, pos)          # the morning open by hand
+        settle(app)
+        self.assertTrue(app.manual_hold_active())
+        res = app.request("visitor", 0, reason="cleaner in the flat")
+        self.assertTrue(res["granted"])
+        self.assertEqual(positions_commanded(app), [0])
+        self.assertFalse(app.manual_hold_active())
+
+    def test_a_hand_during_the_visit_outranks_it_and_the_visitor_is_told_who_won(self):
         app = make_owner(position=38)
+        app.request("visitor", 0)
         app.request("manual", 100, reason="wall press")
         res = app.request("visitor", 0)
         self.assertFalse(res["granted"])
         self.assertEqual(res["winner"], "manual")
-        self.assertEqual(positions_commanded(app), [100])
+        self.assertEqual(positions_commanded(app), [0, 100])
+
+    def test_a_new_visit_after_an_expired_one_still_clears_the_hold(self):
+        app = make_owner(position=38)
+        app.request("visitor", 38, reason="visit over", ttl_min=3)
+        app._now = app._now + timedelta(days=1)
+        app.request("manual", 100, reason="wall press")
+        self.assertTrue(app.request("visitor", 0)["granted"])
 
     def test_a_hand_on_the_blind_during_the_claim_takes_over(self):
         app = make_owner(position=38)
@@ -235,10 +254,14 @@ class SecondInstanceForTheBathroom(unittest.TestCase):
     def test_it_adopts_no_pause_from_a_solar_shade_file(self):
         self.assertFalse(self.make(position=40).manual_hold_active())
 
-    def test_a_hand_on_the_bathroom_blind_holds_the_visitor_off(self):
+    def test_a_hand_on_the_bathroom_blind_during_the_visit_holds_the_visitor_off(self):
         app = self.make(position=40)
-        for pos in (55, 70, 100):
+        app.request("visitor", 0)
+        for pos in (20, 0):
             report(app, pos)
+        settle(app)
+        for pos in (55, 70, 100):
+            report(app, pos, ctx="a-person-id")
         settle(app)
         self.assertTrue(app.manual_hold_active())
         res = app.request("visitor", 0)

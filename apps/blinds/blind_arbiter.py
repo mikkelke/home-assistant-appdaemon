@@ -23,7 +23,9 @@ Why that order:
   want right now. Nothing automatic outranks it.
 * **visitor** - a person who is not a resident (the cleaner) is in the flat and the
   blind is held where the visit needs it. Every automatic writer is below it; a hand
-  on the wall switch is still above it, so a resident can undo it at any time.
+  on the wall switch is still above it, so a resident can undo it at any time. A
+  hand move from before the visit began does not count: the owner clears that hold
+  when the visit's claim first arrives.
 * **venting** - when the night's cooling plan is "open the window", the blind must
   land where the openable pane is actually clear. Shading a room we intend to
   ventilate trades away the cooling method in use for the one that is not
