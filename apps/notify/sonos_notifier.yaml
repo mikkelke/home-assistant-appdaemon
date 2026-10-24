@@ -52,7 +52,7 @@ SonosNotifier:
   audio_conversion: "-af volume=4dB,alimiter=limit=0.89:attack=5:release=50:level=false"
   # Fractions (0.0-1.0). Without a volume_level from the caller, a room announces this much above
   # its own volume, at most announce_volume_cap. An explicit volume_level is used as given.
-  announce_volume_boost: 0.01
+  announce_volume_boost: 0.0
   announce_volume_cap: 0.30
 
   # --- Time Constraints (using Home Assistant input_datetime helpers) ---

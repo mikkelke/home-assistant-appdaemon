@@ -371,7 +371,7 @@ class ShippedConfig(unittest.TestCase):
 
     def test_boost_and_cap_reach_the_announce_volume(self):
         boost, cap = self.args["announce_volume_boost"], self.args["announce_volume_cap"]
-        self.assertTrue(0 < boost < cap < 1)
+        self.assertTrue(0 <= boost < cap < 1)
         app = self._initialized_app(volumes={"media_player.kitchen": 0.13, "media_player.living_room": 1.0})
         app.notify("Hello", target_speakers=["media_player.kitchen", "media_player.living_room"])
         announced = {tuple(p["entity_id"]): p["extra"].get("volume") for p in _plays(app)}
