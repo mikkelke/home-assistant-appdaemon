@@ -13,7 +13,7 @@ SonosNotifier:
   claudia_sleep_mode_entity: "input_boolean.claudia_sleep_mode"
   
   # --- Speaker Configuration (room entities per TTS target group) ---
-  # Kept in sync with the `tts:` tags in apps/sonos/speakers.yaml by scripts/check_speakers.py.
+  # Kept in sync with the `tts:` tags in config/sonos_speakers.yaml by scripts/check_speakers.py.
   # Rooms are named by their Music Assistant entity; the clip plays on the native <room>_2 twin.
   tts_group_all:                  # no one sleeping
     - media_player.living_room

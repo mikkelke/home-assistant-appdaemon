@@ -9,7 +9,7 @@ MusicAttribution:
   log: sonos_log
 
   # Raw HA Sonos entities (state, group_members, media_content_id) -> Music Assistant twins.
-  # Service calls may target either. scripts/check_speakers.py checks this against speakers.yaml.
+  # Service calls may target either. scripts/check_speakers.py checks this against config/sonos_speakers.yaml.
   raw_to_base_map:
     media_player.bathroom_2: media_player.bathroom
     media_player.bedroom_2: media_player.bedroom

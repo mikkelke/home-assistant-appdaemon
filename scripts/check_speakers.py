@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Speaker-registry drift checker.
 
-apps/sonos/speakers.yaml is the source of record for the Sonos fleet. This
+config/sonos_speakers.yaml is the source of record for the Sonos fleet. This
 script cross-checks every consumer that still hardcodes speaker facts and
 exits non-zero on drift, so a rename/move gets flagged at deploy time instead
 of surfacing as a half-broken house (the 2026-07 office rename touched ~10
@@ -52,7 +52,7 @@ def check(cond, msg):
 
 
 def main():
-    reg = load("apps/sonos/speakers.yaml")["speakers"]
+    reg = load("config/sonos_speakers.yaml")["speakers"]
     ma = {v["ma_entity"] for v in reg.values()}
     pairs = {v["raw_entity"]: v["ma_entity"] for v in reg.values()}
     volumes = {v["ma_entity"]: v["default_volume"] for v in reg.values()}

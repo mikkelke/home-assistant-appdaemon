@@ -1,4 +1,5 @@
 # Speaker registry - the single source of record for the Sonos fleet.
+# Build-time metadata: keep outside apps/ so AppDaemon never discovers this as an app.
 # NOT loaded by AppDaemon (no module/class): consumed by scripts/check_speakers.py,
 # which fails the deploy when any app yaml or the dashboard drifts from this file.
 # Convention: MA entity = clean id, native twin = <id>_2 (same physical unit).
