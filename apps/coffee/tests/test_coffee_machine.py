@@ -327,6 +327,20 @@ class StartTests(unittest.TestCase):
         fake.op(app, "start", {"variant": "other", "recipe_id": "7654321"}, as_text=False)
         self.assertEqual(calls(app, "xbloom/start_brew")[-1]["recipe_name"], "Iced")
 
+    def test_the_last_recipe_brewed_becomes_the_one_the_button_brews(self):
+        app = fake.make_app()
+        fake.set_entity(app, "switch.xbloom_studio_connect", "on")
+        fake.fire(app, "xbloom_connect_ready", {"summary": {}})
+        fake.op(app, "start", {"variant": "other", "recipe_id": "7654321"}, as_text=False)
+        brew_id = coffee_state(app)[1]["brew_id"]
+        fake.fire(app, "xbloom_brew_started", {"recipe_name": "Iced", "total_pours": 2, "run_id": "r1",
+                                               "context": {"coffee_brew_id": brew_id}})
+        fake.set_entity(app, "sensor.xbloom_studio_brew_status", "grinding")
+        self.assertEqual(coffee_state(app)[1]["variant"], "other")
+        self.assertEqual(fake.last(app, "sensor.coffee_recipes")[1]["usual_id"], "7654321")
+        again = fake.make_app(state_dir=app.dir, now=app.now + 1, states=app.states)
+        self.assertEqual(fake.last(again, "sensor.coffee_recipes")[1]["usual_id"], "7654321")
+
     def test_invalid_ops_are_ignored(self):
         app = fake.make_app()
         for name, data in (("start", {"variant": "tweak", "dose": 99}), ("start", {"variant": "espresso"}),

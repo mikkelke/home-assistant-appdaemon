@@ -63,7 +63,7 @@ RESTORED = (None, "unavailable", "unknown")
 VARIANTS = ("usual", "base", "tweak", "other")
 PEOPLE = cw.PEOPLE
 OPS = ("start", "cup_confirmed", "cancel", "stop", "pause", "resume", "connect", "notify", "picked_up", "rate",
-       "beans_add", "beans_undo", "water_filled", "set_usual", "trial_accept", "trial_undo", "trial_keep",
+       "beans_add", "beans_undo", "water_filled", "trial_accept", "trial_undo", "trial_keep",
        "trial_revert", "advice_dismiss", "advisor_reply")
 RATE_PREFIX = "COFFEE_RATE|"
 ENTITIES = ("coffee_state", "coffee_live", "coffee_baseline", "coffee_beans", "coffee_brews", "coffee_recipes",
@@ -608,6 +608,8 @@ class CoffeeMachine(hass.Hass):
         brew["bean"] = self._beans.bean()
         if brew.get("variant") in ("usual", "base", "trial", "tweak"):
             brew["baseline"] = cb.frozen(self._baseline)
+        if brew.get("variant") == "other" and recipe is not None:
+            self._set_usual(recipe, now)
         self._take_pending_chip(brew, now)
         self._resolve_who(brew, final=False)
         self.run_in(self._on_who_final, WHO_AFTER_S, brew_id=brew["id"])
@@ -1337,11 +1339,7 @@ class CoffeeMachine(hass.Hass):
         self._publish_state()
         self._save_state()
 
-    def _op_set_usual(self, user, data, now):
-        recipe = cp.by_id(self._recipes, data.get("recipe_id"))
-        if recipe is None:
-            self._warn(f"set_usual ignored: {ascii_text(data.get('recipe_id'), 40)}")
-            return
+    def _set_usual(self, recipe, now):
         self._usual_id = recipe["id"]
         self._info(f"Usual is now {recipe['name']}")
         self._recompute_baseline(now)
