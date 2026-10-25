@@ -510,6 +510,8 @@ class LivingRoomTvControl(hass.Hass):
     def _wall_state_allows_move(self, schedule_mode):
         if self.tv_operation_in_progress:
             return False
+        if schedule_mode == "power_standby" and not self.power_standby_wall_enabled:
+            return False
         try:
             state = self.get_state(self.tv_entity)
             primary_state = self.get_state(self.hisense_tv_entity)
@@ -550,8 +552,8 @@ class LivingRoomTvControl(hass.Hass):
 
     def _hisense_blocks_wall(self):
         """
-        Hisense 'on' blocks wall only when relay draw suggests the panel is actually on.
-        At standby power, Hisense often still reports 'on' after the TV is physically off.
+        A trusted primary 'on' always blocks Wall. The legacy standby override is
+        available only when explicitly enabled for an integration that lags power-off.
         """
         try:
             hisense_state = self.get_state(self.hisense_tv_entity)
@@ -559,6 +561,8 @@ class LivingRoomTvControl(hass.Hass):
             return False
         if hisense_state != "on":
             return False
+        if not self.power_standby_wall_enabled:
+            return True
         if self.power_aware_wall_move_enabled and self._relay_suggests_tv_standby():
             return False
         return True

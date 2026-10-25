@@ -1,5 +1,8 @@
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import unittest
+
+import yaml
 
 from test_living_room_apple_tv_disconnect import APPLE, HISENSE, TV, make_app, states
 
@@ -225,6 +228,58 @@ class WallRequiresConfirmedStandby(unittest.TestCase):
         app._begin_power_verify_then_wall("off", "off")
         app._move_lift_to_wall(app._wall_timer_kwargs("move"))
         self.assertEqual(wall_calls(app), [])
+
+
+class ProductionPrimaryPowerSafety(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        config_path = Path(__file__).resolve().parents[1] / "living_room_tv_control.yaml"
+        cls.config = yaml.safe_load(config_path.read_text())["living_room_tv_control"]
+
+    def production_app(self, aggregate="off", primary="off"):
+        app = wall_app(tv_state=aggregate, **self.config)
+        app.states[app.hisense_tv_entity] = primary
+        self.assertTrue(app.power_aware_wall_move_enabled)
+        self.assertFalse(app.power_standby_wall_enabled)
+        return app
+
+    def test_either_on_report_blocks_wall_at_27_watts(self):
+        for aggregate, primary in (("off", "on"), ("on", "on"), ("on", "off")):
+            with self.subTest(aggregate=aggregate, primary=primary):
+                app = self.production_app(aggregate, primary)
+                app._read_tv_power_w()
+                advance(app, 2)
+                self.assertTrue(app._wall_power_confirmed())
+                self.assertEqual(app._hisense_blocks_wall(), primary == "on")
+                app._fire_wall_after_session_over(from_power=aggregate == "on")
+                app._begin_power_verify_then_wall("off", primary)
+                app._schedule_wall_move_after_tv_off("off", primary)
+                app._move_lift_to_wall(app._wall_timer_kwargs("move"))
+                self.assertEqual(wall_calls(app), [])
+                self.assertIsNone(app._power_wall_verify_handle)
+
+    def test_disabled_standby_path_rejects_queued_callbacks_even_when_both_off(self):
+        app = self.production_app()
+        app._read_tv_power_w()
+        advance(app, 2)
+        app._begin_power_verify_then_wall("off", "off", "power_standby")
+        app._schedule_wall_move_after_tv_off("off", "off", "power_standby")
+        app._move_lift_to_wall(app._wall_timer_kwargs("move", schedule_mode="power_standby"))
+        self.assertEqual(wall_calls(app), [])
+        self.assertIsNone(app._power_wall_verify_handle)
+
+    def test_both_off_still_require_two_seconds_then_use_normal_wall_delay(self):
+        app = self.production_app()
+        app._fire_wall_after_session_over()
+        self.assertEqual(wall_calls(app), [])
+        self.assertIsNone(app._delayed_wall_handle)
+        advance(app, 2)
+        fire_timer(app, app._power_wall_verify_tick)
+        self.assertEqual(wall_calls(app), [])
+        callback, delay, kwargs = take_timer(app, app._move_lift_to_wall)
+        advance(app, delay)
+        callback(kwargs)
+        self.assertEqual(wall_calls(app), [WALL])
 
 
 if __name__ == "__main__":

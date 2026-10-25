@@ -22,10 +22,9 @@ living_room_tv_control:
   # power_off_confirm_seconds, and rechecks power/state immediately before movement.
   # Unknown, stale, future-dated or non-finite readings block Wall and reset confirmation.
   # ignore_apple_tv_when_relay_standby: while relay <= threshold, Apple TV paused/idle/on does NOT cancel the
-  # scheduled wall move. Hisense 'on' is also ignored at standby draw (integration often lags power-off).
-  # power_standby_wall_enabled: when relay stays <= threshold but universal TV still reports on/paused,
-  # start the normal session-end wall path (fixes Hisense/HA lag after physical TV off).
-  power_standby_wall_enabled: true
+  # scheduled wall move. The local VIDAA provider's 'on' always blocks Wall, even at low draw.
+  # Keep the legacy standby override disabled: low power alone cannot prove a dark panel is off.
+  power_standby_wall_enabled: false
   #
   # Session-end grace: after universal TV is debounced 'off' and Hisense is not 'on', wait this many seconds;
   # if still off, run the same standby power verification (Apple TV state ignored).
