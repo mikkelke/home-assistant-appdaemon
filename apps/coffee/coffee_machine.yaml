@@ -1,5 +1,5 @@
-# CoffeeMachine - the xBloom Studio's brews, curves, ledger, baseline, beans container, Bluetooth link,
-# who made it and who is told, and the advisor. Publishes sensor.coffee_state, _live, _baseline, _beans,
+# CoffeeMachine - the xBloom Studio's brews, curves, ledger, baseline, beans container, water tank, Bluetooth
+# link, who made it and who is told, and the advisor. Publishes sensor.coffee_state, _live, _baseline, _beans,
 # _brews, _recipes and _advice for the dashboard. See coffee_machine.py.
 #
 # Keep sensor.coffee_live, _brews, _baseline and _recipes out of the recorder (configuration.yaml
@@ -25,6 +25,9 @@ CoffeeMachine:
   recipe_select: select.xbloom_studio_recipe
   # The usual until someone picks another with Make usual.
   usual_name: 4 Pour Recipe
+
+  # Water tank capacity in ml.
+  tank_ml: 946
 
   # The wine-fridge tablet's HA user (Rooftop): a start from it is source tablet, and nobody by itself.
   tablet_user_id: 0b0b7ec25fed419dbeaed3898de34081

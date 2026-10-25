@@ -84,14 +84,18 @@ def _put(out, key, value):
 
 
 def state_entity(brew, last, now, machine, power_w, link, link_seen_at, fault, notify_guess, pending_notify,
-                 live_verdict, eta_ts, eta_basis, cup="unknown"):
-    """(state, attributes) of sensor.coffee_state."""
+                 live_verdict, eta_ts, eta_basis, cup="unknown", tank=None):
+    """(state, attributes) of sensor.coffee_state. `tank` is coffee_tank.Tank.view()."""
     attrs = {"machine": machine}
     _put(attrs, "power_w", power_text(power_w))
     attrs["link"] = link
     _put(attrs, "link_seen_at", iso(link_seen_at))
     attrs["cup"] = cup
     _put(attrs, "fault", fault if fault in FAULTS else None)
+    if tank:
+        _put(attrs, "tank_ml", num(tank.get("capacity")))
+        _put(attrs, "tank_left_ml", num(tank.get("left")))
+        _put(attrs, "tank_filled_at", tank.get("filled_at"))
     if brew is None:
         state = "asleep" if machine in ("asleep", "off") else "idle"
         if last:

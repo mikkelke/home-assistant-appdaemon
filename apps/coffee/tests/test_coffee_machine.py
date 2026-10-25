@@ -1,7 +1,7 @@
 # tests/test_coffee_machine.py - CoffeeMachine end to end on a fake AppDaemon (coffee_fake.py): what it
 # publishes, a replayed brew (real plug readings, the integration's event order) into the ledger and a
-# curve file, the start, the cup check and the wake, the link, who is told, beans, the advisor with a stubbed AI
-# task, restarts, and guards against shadowing AppDaemon.
+# curve file, the start, the cup check and the wake, the link, who is told, beans, the water tank, the advisor with a
+# stubbed AI task, restarts, and guards against shadowing AppDaemon.
 # Run from repo root: python3 -m unittest discover -s apps/coffee/tests
 
 import ast
@@ -799,6 +799,152 @@ class BeansTests(unittest.TestCase):
         fake.op(app, "stop")
         self.assertEqual(fake.ledger(app), [])
         self.assertEqual(fake.last(app, "sensor.coffee_beans")[0], "100")
+
+
+class TankTests(unittest.TestCase):
+    def mid_brew(self, extra, until=None):
+        """A filled tank and a brew of the usual, whole or cut at `until` s, with the steps `extra` played along."""
+        app = fake.make_app()
+        fake.op(app, "water_filled")
+        tape = fake.synthetic_brew(BREW_ID, None)
+        tape = [(0, ("op", "start", {"variant": "usual"}, MIKKEL))] + [s for s in tape if s[1][0] != "op"]
+        fake.replay(app, [s for s in tape if until is None or s[0] <= until] + extra)
+        return app
+
+    def test_unknown_until_the_first_fill(self):
+        app = fake.make_app()
+        self.assertEqual(coffee_state(app)[1]["tank_ml"], "946")
+        brew(app)
+        attrs = coffee_state(app)[1]
+        self.assertEqual(attrs["tank_ml"], "946")
+        self.assertNotIn("tank_left_ml", attrs)
+        self.assertNotIn("tank_filled_at", attrs)
+        self.assertEqual(coffee_state(fake.make_app(tank_ml=1000))[1]["tank_ml"], "1000")
+
+    def test_a_fill_and_a_brew_that_poured_255_ml(self):
+        app = fake.make_app()
+        fake.op(app, "water_filled")
+        attrs = coffee_state(app)[1]
+        self.assertEqual((attrs["tank_left_ml"], attrs["tank_filled_at"]), ("946", cm.cf.iso(T0)))
+        self.assertIn(("INFO", "Water tank filled"), app.logs)
+        brew(app)
+        self.assertEqual(fake.ledger(app)[-1]["water_ml"], 255.0)
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "691")
+        app._debit_water(app._tracker.last)
+        app._publish_state(force=True)
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "691")
+
+    def test_the_tank_is_saved_with_the_beans_and_survives_a_restart(self):
+        app = fake.make_app()
+        fake.op(app, "water_filled")
+        brew(app)
+        saved = json.loads((app.dir / "coffee_state.json").read_text())
+        self.assertEqual((saved["tank"]["filled_at"], saved["tank"]["used_ml"], saved["tank"]["debited_id"]),
+                         (cm.cf.iso(T0), 255.0, BREW_ID))
+        again = fake.make_app(state_dir=app.dir, now=app.now, states=app.states)
+        attrs = coffee_state(again)[1]
+        self.assertEqual((attrs["tank_left_ml"], attrs["tank_filled_at"]), ("691", cm.cf.iso(T0)))
+
+    def test_a_stopped_brew_takes_the_water_it_poured(self):
+        app = fake.make_app()
+        fake.op(app, "water_filled")
+        tape = [s for s in fake.synthetic_brew(BREW_ID, None) if s[0] <= 60]
+        tape.append((61, ("event", "xbloom_brew_stopped", {"by": "machine", "ground": True, "run_id": "r1",
+                                                           "context": {"coffee_brew_id": BREW_ID}})))
+        fake.replay(app, tape)
+        record = fake.ledger(app)[-1]
+        self.assertEqual(record["outcome"], "stopped")
+        self.assertTrue(0 < record["water_ml"] < 255)
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], str(int(round(946 - record["water_ml"]))))
+
+    def test_a_brew_stopped_before_the_first_pour_takes_nothing(self):
+        app = fake.make_app()
+        fake.op(app, "water_filled")
+        tape = [s for s in fake.synthetic_brew(BREW_ID, None) if s[0] <= 20]
+        tape.append((21, ("event", "xbloom_brew_stopped", {"by": "machine", "ground": True, "run_id": "r1",
+                                                           "context": {"coffee_brew_id": BREW_ID}})))
+        fake.replay(app, tape)
+        self.assertEqual(fake.ledger(app)[-1]["outcome"], "stopped")
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "946")
+
+    def test_a_fill_before_the_first_pour_leaves_no_offset_behind_when_the_brew_is_stopped(self):
+        stop = {"by": "machine", "ground": True, "run_id": "r1", "context": {"coffee_brew_id": BREW_ID}}
+        app = self.mid_brew([(15, ("state", "sensor.xbloom_studio_water_dispensed", "3.0")),
+                             (16, ("op", "water_filled")), (21, ("event", "xbloom_brew_stopped", stop))], until=20)
+        self.assertEqual(coffee_state(app)[0], "stopped")
+        self.assertEqual((app._tank.offset_ml, coffee_state(app)[1]["tank_left_ml"]), (None, "946"))
+
+    def test_a_plug_only_brew_takes_the_usuals_pours(self):
+        app = fake.make_app()
+        fake.op(app, "water_filled")
+        start = app.now
+        for ts, value in POWER["brew_2026_10_17"]:
+            fake.advance(app, max(0.0, ts - POWER["brew_2026_10_17"][0][0] + start - app.now))
+            fake.set_entity(app, "sensor.pour_over_plug_power", value)
+        fake.advance(app, 120)
+        record = fake.ledger(app)[-1]
+        self.assertEqual(record["source"], "power")
+        self.assertNotIn("water_ml", record)
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "691")
+
+    def test_no_water_mid_brew_empties_the_tank_once_and_the_rest_of_the_brew_is_not_debited_again(self):
+        seen = []
+        app = self.mid_brew([(89.9, ("call", lambda app: seen.append(app._tracker.water))),
+                             (90, ("state", "sensor.xbloom_studio_machine_status", "no_water")),
+                             (91, ("state", "sensor.xbloom_studio_machine_status", "ok")),
+                             (92, ("state", "sensor.xbloom_studio_machine_status", "no_water"))])
+        self.assertTrue(0 < seen[0] < 255)
+        self.assertEqual(app._tank.empties, [{"at": cm.cf.iso(T0 + 90), "used_ml": seen[0]}])
+        self.assertIn(("INFO", f"Water tank empty after {seen[0]:.0f} ml"), app.logs)
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "0")
+        self.assertEqual(app._tank.used_ml, 946.0 + 255.0 - seen[0])
+
+    def test_a_second_fault_or_the_end_of_the_brew_does_not_empty_it_again(self):
+        stop = {"by": "machine", "ground": True, "run_id": "r1", "context": {"coffee_brew_id": BREW_ID}}
+        app = self.mid_brew([(90, ("state", "sensor.xbloom_studio_machine_status", "no_water")),
+                             (95, ("state", "sensor.xbloom_studio_machine_status", "dose_water_error")),
+                             (100, ("event", "xbloom_brew_stopped", stop))], until=100)
+        self.assertEqual(coffee_state(app)[0], "stopped")
+        self.assertEqual(len(app._tank.empties), 1)
+
+    def test_a_fill_after_the_run_dry_counts_only_the_water_poured_after_it(self):
+        seen = []
+        app = self.mid_brew([(89.9, ("call", lambda app: seen.append(app._tracker.water))),
+                             (90, ("state", "sensor.xbloom_studio_machine_status", "no_water")),
+                             (119.9, ("call", lambda app: seen.append(app._tracker.water))),
+                             (120, ("op", "water_filled"))])
+        self.assertTrue(0 < seen[0] < seen[1] < 255)
+        self.assertEqual(len(app._tank.empties), 1)
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], str(int(round(946 - (255 - seen[1])))))
+        self.assertEqual(coffee_state(app)[1]["tank_filled_at"], cm.cf.iso(T0 + 120))
+
+    def test_a_fill_between_brews_leaves_no_offset(self):
+        app = fake.make_app()
+        brew(app)
+        self.assertGreater(app._tracker.water, 0)
+        fake.op(app, "water_filled")
+        self.assertIsNone(app._tank.offset_ml)
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "946")
+
+    def test_a_brew_the_machine_fails_for_no_water_empties_the_tank(self):
+        app = fake.make_app()
+        fake.op(app, "water_filled")
+        tape = [s for s in fake.synthetic_brew(BREW_ID, None) if s[0] <= 60]
+        tape.append((61, ("event", "xbloom_brew_failed", {"reason": "no_water", "run_id": "r1",
+                                                          "context": {"coffee_brew_id": BREW_ID}})))
+        fake.replay(app, tape)
+        record = fake.ledger(app)[-1]
+        self.assertEqual((record["outcome"], record["stop_reason"], record["faults"]),
+                         ("failed", "fault", ["no_water"]))
+        self.assertEqual(len(app._tank.empties), 1)
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "0")
+
+    def test_no_water_with_no_brew_leaves_the_tank_alone(self):
+        app = fake.make_app()
+        fake.op(app, "water_filled")
+        fake.set_entity(app, "sensor.xbloom_studio_machine_status", "no_water")
+        self.assertEqual(app._tank.empties, [])
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "946")
 
 
 class AdvisorTests(unittest.TestCase):

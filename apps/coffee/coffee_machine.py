@@ -1,7 +1,7 @@
 """CoffeeMachine - the xBloom Studio in the house: one owner for each brew's lifecycle, its 1 Hz curve,
-the brew ledger, the usual's baseline, the beans container, the Bluetooth link, the cup on the scale, who
-made it and who is told, the maintenance counts and the advisor. Publishes sensor.coffee_state, _live,
-_baseline, _beans, _brews, _recipes and _advice (contract v1, see coffee_publish.py) and the files under
+the brew ledger, the usual's baseline, the beans container, the water tank, the Bluetooth link, the cup on
+the scale, who made it and who is told, the maintenance counts and the advisor. Publishes sensor.coffee_state,
+_live, _baseline, _beans, _brews, _recipes and _advice (contract v1, see coffee_publish.py) and the files under
 /media/coffee.
 
 Inputs: the plug (sensor.pour_over_plug_power), the xBloom integration's entities and bus events, the
@@ -10,8 +10,8 @@ user is data.metadata.context.user_id), the ready push's rating buttons, and Ber
 who. A value from a state callback is never replaced by a later read: AppDaemon 4.5.13's store can lag.
 
 Files: coffee_feedback.json (the ledger, one record per brew that ground; HouseUpcoming counts its
-maintenance runs from it), coffee_state.json (container, usual, advice, link suppression and the
-brew in flight, saved every CHECKPOINT_S), /media/coffee/brews/<id>.json (each brew's 1 Hz curve),
+maintenance runs from it), coffee_state.json (beans container, water tank, usual, advice, link suppression
+and the brew in flight, saved every CHECKPOINT_S), /media/coffee/brews/<id>.json (each brew's 1 Hz curve),
 /media/coffee/bands/<baseline id>.json and /media/coffee/recent.json (60 days at 2 s with the bands
 the brews were compared with; read by the dashboard through shell_command.coffee_recent).
 
@@ -38,6 +38,7 @@ import coffee_fsm as cf
 import coffee_plan as cp
 import coffee_power as cpow
 import coffee_publish as pub
+import coffee_tank as ctank
 import coffee_who as cw
 import feedback_io  # apps/appliances - AppDaemon puts every app dir on sys.path
 
@@ -62,8 +63,8 @@ RESTORED = (None, "unavailable", "unknown")
 VARIANTS = ("usual", "base", "tweak", "other")
 PEOPLE = cw.PEOPLE
 OPS = ("start", "cup_confirmed", "cancel", "stop", "pause", "resume", "connect", "notify", "picked_up", "rate",
-       "beans_add", "beans_undo", "set_usual", "trial_accept", "trial_undo", "trial_keep", "trial_revert",
-       "advice_dismiss", "advisor_reply")
+       "beans_add", "beans_undo", "water_filled", "set_usual", "trial_accept", "trial_undo", "trial_keep",
+       "trial_revert", "advice_dismiss", "advisor_reply")
 RATE_PREFIX = "COFFEE_RATE|"
 ENTITIES = ("coffee_state", "coffee_live", "coffee_baseline", "coffee_beans", "coffee_brews", "coffee_recipes",
             "coffee_advice")
@@ -141,6 +142,7 @@ class CoffeeMachine(hass.Hass):
         self.pour_entity = a.get("pour_entity", "sensor.xbloom_studio_current_pour")
         self.recipe_select = a.get("recipe_select", "select.xbloom_studio_recipe")
         self.usual_name = a.get("usual_name", "4 Pour Recipe")
+        self.tank_ml = number_in(a.get("tank_ml"), 100, 10000) or ctank.DEFAULT_ML
         self.tablet_user = str(a.get("tablet_user_id") or "").replace("-", "").lower()
         self.tablet_notify = a.get("tablet_notify", "notify/mobile_app_oppopad4pro")
         self.tablet_interactive = a.get("tablet_interactive", "binary_sensor.oppopad4pro_interactive")
@@ -170,6 +172,7 @@ class CoffeeMachine(hass.Hass):
 
         saved = self._load_state()
         self._beans = cbeans.Beans(saved.get("beans"))
+        self._tank = ctank.Tank(saved.get("tank"), capacity=self.tank_ml)
         self._advice = ca.Advice(saved.get("advice"), enabled=bool(self.advisor_entity))
         self._connect = cconn.ConnectPolicy(saved.get("connect"))
         self._usual_id = saved.get("usual_id")
@@ -568,6 +571,8 @@ class CoffeeMachine(hass.Hass):
                 self._pending_start = None
                 self._info(f"Start {self._tracker.dropped[0]} dropped: {self._tracker.dropped[1]}")
             elif effect == "fault":
+                if brew and brew["phase"] in cf.RUNNING:
+                    self._tank_empty(brew)
                 self._fault_push(brew)
         if "live" in effects or "ready" in effects or "closed" in effects or "expired" in effects:
             self._publish("coffee_live", force=True)
@@ -684,6 +689,7 @@ class CoffeeMachine(hass.Hass):
         self._finalize(brew)
         self._write_curve(brew)
         self._debit(brew)
+        self._debit_water(brew)
         if brew.get("trial"):
             self._advice.trial_finished(brew["id"], complete=True)
         push = self._ready_push(brew)
@@ -713,7 +719,9 @@ class CoffeeMachine(hass.Hass):
             return
         if brew.get("bloom_ts"):
             self._write_curve(brew)
+        self._tank_empty(brew)
         self._debit(brew)
+        self._debit_water(brew)
         self._upsert_record(brew)
         self._write_recent(now)
         self._publish("coffee_brews", force=True)
@@ -725,6 +733,21 @@ class CoffeeMachine(hass.Hass):
         if brew.get("ground") and brew.get("dose_g"):
             if self._beans.debit(brew["id"], brew["dose_g"], self._now_dt()):
                 brew["debited_g"] = brew["dose_g"]
+
+    def _debit_water(self, brew):
+        """The brew's water out of the tank once: what the machine measured it dispensing, else its recipe's pours."""
+        water = (brew.get("final") or {}).get("water_ml")
+        if water is None and (brew["phase"] == "ready" or brew.get("bloom_ts")):
+            water = (brew.get("recipe") or self._usual() or {}).get("total_ml")
+        self._tank.brew_done(water, brew["id"])
+
+    def _tank_empty(self, brew):
+        """The machine said no water during this brew: the tank is empty, noted once per brew."""
+        if "no_water" not in brew.get("faults", []) or brew.get("tank_empty"):
+            return
+        brew["tank_empty"] = True
+        used = self._tank.empty(self._now_dt(), self._tracker.water)
+        self._info("Water tank empty" if used is None else f"Water tank empty after {used:.0f} ml")
 
     # -- the ledger --------------------------------------------------------------------------------
 
@@ -1307,6 +1330,13 @@ class CoffeeMachine(hass.Hass):
         self._publish("coffee_advice")
         self._save_state()
 
+    def _op_water_filled(self, user, data, now):
+        running = self._tracker.phase() in cf.RUNNING
+        self._tank.fill(self._now_dt(), self._tracker.water if running else None)
+        self._info("Water tank filled")
+        self._publish_state()
+        self._save_state()
+
     def _op_set_usual(self, user, data, now):
         recipe = cp.by_id(self._recipes, data.get("recipe_id"))
         if recipe is None:
@@ -1538,7 +1568,8 @@ class CoffeeMachine(hass.Hass):
             guess = self._guess[1]
         state, attrs = pub.state_entity(brew, self._tracker.last, now, self._machine(now), self._meter.watts,
                                         self._link(now), self._tracker.frame_at, self._state_of(self.fault_entity),
-                                        guess, pending, (brew or {}).get("verdict"), eta, basis, self._cup.state)
+                                        guess, pending, (brew or {}).get("verdict"), eta, basis, self._cup.state,
+                                        self._tank.view())
         compare = {k: v for k, v in attrs.items() if k not in ("power_w", "link_seen_at")}
         if not force and self._published.get("coffee_state") == (state, compare):
             return
@@ -1613,9 +1644,9 @@ class CoffeeMachine(hass.Hass):
 
     def _save_state(self):
         data = {"version": STATE_VERSION, "saved_at": cf.iso(self._now()), "usual_id": self._usual_id,
-                "beans": self._beans.to_dict(), "advice": self._advice.to_dict(), "connect": self._connect.to_dict(),
-                "pending_notify": self._pending_notify, "recipes": self._recipes, "baseline": self._baseline,
-                "tracker": self._tracker.to_dict(), "power": self._power.snapshot()}
+                "beans": self._beans.to_dict(), "tank": self._tank.to_dict(), "advice": self._advice.to_dict(),
+                "connect": self._connect.to_dict(), "pending_notify": self._pending_notify, "recipes": self._recipes,
+                "baseline": self._baseline, "tracker": self._tracker.to_dict(), "power": self._power.snapshot()}
         try:
             feedback_io.write_json(str(self.state_file), data)
         except Exception as e:

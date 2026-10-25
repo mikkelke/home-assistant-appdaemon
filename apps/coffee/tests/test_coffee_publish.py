@@ -14,6 +14,7 @@ import coffee_beans as cbeans  # noqa: E402
 import coffee_curve as cc  # noqa: E402
 import coffee_plan as cp  # noqa: E402
 import coffee_publish as pub  # noqa: E402
+import coffee_tank as ctank  # noqa: E402
 
 NOW = datetime(2026, 10, 20, 6, 0, tzinfo=timezone.utc).timestamp()
 DAY = 86400
@@ -43,6 +44,13 @@ def full_brew(phase="brewing"):
             "start_error": "not_on_home_screen", "who": "kristine", "who_method": "sole_occupancy",
             "notify": "kristine", "push": "sent", "verdict": "on_track", "in_band": "inside",
             "final": {"cup_g": 217.4, "water_ml": 255.0, "total_s": 207, "drawdown_s": 62}}
+
+
+def filled_tank():
+    tank = ctank.Tank()
+    tank.fill(datetime.fromtimestamp(NOW, timezone.utc))
+    tank.brew_done(255.4, "c1")
+    return tank
 
 
 def record(i, **extra):
@@ -76,7 +84,7 @@ class StateTests(unittest.TestCase):
                       "picked_up", "stopped"):
             state, attrs = pub.state_entity(full_brew(phase), None, NOW, "working", 1043.2, "connected", NOW,
                                             "no_water", "mikkel", "claudia", "on_track", NOW + 245, "baseline",
-                                            "present")
+                                            "present", filled_tank().view())
             self.assertEqual((state, attrs["cup"]), (phase, "present"))
             all_strings(self, attrs, "coffee_state")
 
@@ -103,6 +111,31 @@ class StateTests(unittest.TestCase):
             _, attrs = pub.state_entity(None, None, NOW, "awake", 2.3, "not_connected", None, status, None, None, None,
                                         None, None)
             self.assertNotIn("fault", attrs, status)
+
+    def test_the_tank_is_unknown_until_it_is_filled(self):
+        for brew in (None, full_brew("brewing")):
+            _, attrs = pub.state_entity(brew, None, NOW, "awake", 2.3, "connected", NOW, "ok", None, None, None, None,
+                                        None, tank=ctank.Tank().view())
+            self.assertEqual(attrs["tank_ml"], "946")
+            self.assertNotIn("tank_left_ml", attrs)
+            self.assertNotIn("tank_filled_at", attrs)
+
+    def test_the_tank_level_and_when_it_was_filled(self):
+        tank = filled_tank()
+        for brew in (None, full_brew("brewing")):
+            _, attrs = pub.state_entity(brew, None, NOW, "awake", 2.3, "connected", NOW, "ok", None, None, None, None,
+                                        None, tank=tank.view())
+            self.assertEqual((attrs["tank_ml"], attrs["tank_left_ml"], attrs["tank_filled_at"]),
+                             ("946", "691", "2026-10-20T06:00:00+00:00"))
+            all_strings(self, attrs, "coffee_state")
+        tank.brew_done(900.0, "c2")
+        _, attrs = pub.state_entity(None, None, NOW, "awake", 2.3, "connected", NOW, "ok", None, None, None, None,
+                                    None, tank=tank.view())
+        self.assertEqual(attrs["tank_left_ml"], "0")
+
+    def test_without_a_tank_the_attributes_are_left_out(self):
+        _, attrs = pub.state_entity(None, None, NOW, "awake", 2.3, "connected", NOW, "ok", None, None, None, None, None)
+        self.assertFalse([key for key in attrs if key.startswith("tank_")])
 
     def test_idle_and_asleep(self):
         state, attrs = pub.state_entity(None, {"id": "c1"}, NOW, "awake", 2.3, "not_connected", None, "ok", "mikkel",
