@@ -1,4 +1,6 @@
+import math
 import time
+from datetime import datetime
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
@@ -93,6 +95,8 @@ class LivingRoomTvControl(hass.Hass):
         # Runtime handles/state
         self._delayed_wall_handle = None
         self._session_end_wall_handle = None
+        self._wall_timer_generations = {}
+        self._wall_power_below_since = None
         self._last_button_press_ts = None
         # Timer for delayed Apple TV remote reset (off/on) after TV turns on
         self._apple_tv_reset_handle = None
@@ -113,6 +117,7 @@ class LivingRoomTvControl(hass.Hass):
         # Idle ~27W vs TV-on ~60W+: keep threshold in the gap (see YAML comments).
         self.power_off_threshold_w = float(self.args.get("power_off_threshold_w", 52))
         self.power_off_confirm_seconds = float(self.args.get("power_off_confirm_seconds", 2))
+        self.power_snapshot_max_age_seconds = float(self.args.get("power_snapshot_max_age_seconds", 120))
         self.power_recheck_interval_seconds = float(self.args.get("power_recheck_interval_seconds", 2))
         self.power_max_wait_seconds = float(self.args.get("power_max_wait_seconds", 45))
         # When relay <= power_off_threshold_w, ignore Apple TV for wall-cancel (flaky paused/idle)
@@ -122,7 +127,7 @@ class LivingRoomTvControl(hass.Hass):
         # After universal TV + Hisense stay "session over", wait this long then schedule wall (ignores Apple TV noise).
         # 0 = disabled: use legacy power-verify path only.
         self.session_end_grace_seconds = float(self.args.get("session_end_grace_seconds", 22.0))
-        # At session-end fire: if relay is still above this, skip wall (full stack still drawing like viewing).
+        # Additional full-stack-on hint for the standby monitor; Wall always uses the lower off threshold.
         self.power_definitely_on_w = float(self.args.get("power_definitely_on_w", 115.0))
         # Symmetric to wall-off: before Sonos reset / Apple TV remote cycle, confirm real TV-on via
         # relay power (> threshold) and/or Apple & Hisense indicators (when power-aware mode is on).
@@ -148,7 +153,7 @@ class LivingRoomTvControl(hass.Hass):
         if self.power_aware_wall_move_enabled and not self.tv_power_entity:
             self.log(
                 "power_aware_wall_move_enabled is true but tv_power_entity is missing or empty; "
-                "bypassing the power gate (wall scheduling matches pre-power-aware behavior).",
+                "automatic wall moves will be blocked until a power sensor is configured.",
                 level="WARNING",
             )
 
@@ -225,7 +230,6 @@ class LivingRoomTvControl(hass.Hass):
             if (
                 self.power_aware_wall_move_enabled
                 and self.tv_power_entity
-                and self.power_standby_wall_enabled
             ):
                 self.listen_state(self._on_relay_power_changed, self.tv_power_entity)
                 self.log(
@@ -433,8 +437,18 @@ class LivingRoomTvControl(hass.Hass):
             self.log(f"Failed to stop and reset living room media: {e}", level="WARNING")
 
 
+    def _wall_timer_kwargs(self, name, **kwargs):
+        return dict(kwargs, wall_generation=self._wall_timer_generations.get(name, 0))
+
+    def _wall_timer_current(self, name, kwargs):
+        return (kwargs or {}).get("wall_generation") == self._wall_timer_generations.get(name, 0)
+
+    def _invalidate_wall_timer(self, name):
+        self._wall_timer_generations[name] = self._wall_timer_generations.get(name, 0) + 1
+
     def _cancel_session_end_wall_timer(self, reason=""):
-        """Cancel pending session-end grace timer (TV must stay 'off' for the full grace period)."""
+        """Invalidate even an already-dispatched grace callback."""
+        self._invalidate_wall_timer("session")
         if not self._session_end_wall_handle:
             return
         self._safe_cancel_timer(self._session_end_wall_handle)
@@ -443,33 +457,75 @@ class LivingRoomTvControl(hass.Hass):
             self.log(f"Cancelled session-end wall timer ({reason})", level="INFO")
 
     def _cancel_delayed_wall_move(self, reason=""):
-        # Session timer is also a pending wall path - cancel together
+        self._invalidate_wall_timer("move")
+        self._invalidate_wall_timer("debounce")
+        self._wall_power_below_since = None
         self._cancel_session_end_wall_timer(reason)
         self._cancel_power_standby_monitor(reason)
-        # Cancel any scheduled delayed move to Wall
+        self._cancel_power_wall_verify()
         if self._delayed_wall_handle:
             self._safe_cancel_timer(self._delayed_wall_handle)
             self._delayed_wall_handle = None
-            try:
-                reason_str = f" ({reason})" if reason else ""
-                self.log(f"Cancelled scheduled delayed move to 'Wall'{reason_str}")
-            except Exception:
-                pass
+            if reason:
+                self.log(f"Cancelled scheduled delayed move to 'Wall' ({reason})")
 
     def _read_tv_power_w(self):
-        """Return current TV relay power in watts, or None if unreadable."""
-        if not self.tv_power_entity:
-            return None
+        """Use a fresh HA snapshot; invalid/high readings reset standby confirmation."""
+        power = None
         try:
-            raw = self.get_state(self.tv_power_entity)
+            snapshot = self.get_state(self.tv_power_entity, attribute="all") if self.tv_power_entity else None
+            if isinstance(snapshot, dict):
+                raw = snapshot.get("state")
+                if not isinstance(raw, bool):
+                    power = float(raw)
+                stamp = snapshot.get("last_reported", snapshot.get("last_updated"))
+                reported = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                age = self.datetime(aware=True).timestamp() - reported.timestamp()
+                if (
+                    reported.tzinfo is None or not math.isfinite(power) or power < 0
+                    or not 0 <= age <= self.power_snapshot_max_age_seconds
+                ):
+                    power = None
+        except (TypeError, ValueError, AttributeError, OverflowError):
+            power = None
         except Exception:
-            return None
-        if raw in (None, "unavailable", "unknown", ""):
-            return None
+            power = None
+        if power is None or power > self.power_off_threshold_w:
+            self._wall_power_below_since = None
+        elif self._wall_power_below_since is None:
+            self._wall_power_below_since = self._monotonic()
+        return power
+
+    def _wall_power_confirmed(self):
+        power = self._read_tv_power_w()
+        return (
+            power is not None and power <= self.power_off_threshold_w
+            and self._wall_power_below_since is not None
+            and self._monotonic() - self._wall_power_below_since >= self.power_off_confirm_seconds
+        )
+
+    def _wall_state_allows_move(self, schedule_mode):
+        if self.tv_operation_in_progress:
+            return False
         try:
-            return float(raw)
-        except (TypeError, ValueError):
-            return None
+            state = self.get_state(self.tv_entity)
+            primary_state = self.get_state(self.hisense_tv_entity)
+        except Exception:
+            self._wall_power_below_since = None
+            return False
+        if (
+            state not in ("off", "on", "playing", "paused", "idle", "standby")
+            or primary_state in (None, "unknown", "unavailable", "")
+        ):
+            self._wall_power_below_since = None
+            return False
+        if state == "off":
+            return not self._hisense_blocks_wall()
+        return (
+            schedule_mode == "power_standby"
+            and state in ("on", "playing", "paused", "idle", "standby")
+            and self._wall_power_confirmed()
+        )
 
     def _relay_suggests_tv_standby(self):
         """True when relay is at/below off threshold (standby vs TV-on draw)."""
@@ -514,6 +570,7 @@ class LivingRoomTvControl(hass.Hass):
             return False
 
     def _cancel_power_standby_monitor(self, reason=""):
+        self._invalidate_wall_timer("standby")
         if self._power_standby_wall_handle:
             self._safe_cancel_timer(self._power_standby_wall_handle)
             self._power_standby_wall_handle = None
@@ -522,6 +579,7 @@ class LivingRoomTvControl(hass.Hass):
             self.log(f"Power standby wall monitor cancelled ({reason})", level="DEBUG")
 
     def _on_relay_power_changed(self, entity, attribute, old, new, kwargs):
+        self._read_tv_power_w()
         self._evaluate_power_standby_wall()
 
     def _evaluate_power_standby_wall(self):
@@ -597,11 +655,14 @@ class LivingRoomTvControl(hass.Hass):
                 self._power_standby_wall_handle = self.run_in(
                     self._power_standby_wall_tick,
                     self.power_recheck_interval_seconds,
+                    **self._wall_timer_kwargs("standby"),
                 )
             except Exception as e:
                 self.log(f"Failed to schedule power standby wall tick: {e}", level="WARNING")
 
     def _power_standby_wall_tick(self, kwargs=None):
+        if not self._wall_timer_current("standby", kwargs):
+            return
         self._power_standby_wall_handle = None
         self._evaluate_power_standby_wall()
 
@@ -617,7 +678,7 @@ class LivingRoomTvControl(hass.Hass):
                 self._session_end_wall_handle = self.run_in(
                     self._session_end_wall_fired,
                     self.session_end_grace_seconds,
-                    from_power=True,
+                    **self._wall_timer_kwargs("session", from_power=True),
                 )
                 self.log(
                     f"Power standby: relay {relay_w:.1f} W, universal TV '{tv_state}' - "
@@ -641,6 +702,9 @@ class LivingRoomTvControl(hass.Hass):
         except Exception:
             cur_tv = None
 
+        if cur_tv in (None, "unknown", "unavailable"):
+            self._wall_power_below_since = None
+
         if not from_power and cur_tv != "off":
             self.log(
                 f"Session-end wall: skipped (universal TV is '{cur_tv}', not off)",
@@ -648,9 +712,9 @@ class LivingRoomTvControl(hass.Hass):
             )
             return
 
-        if from_power and cur_tv == "off":
+        if from_power and cur_tv not in ("on", "playing", "paused", "idle", "standby"):
             self.log(
-                "Power standby wall: universal TV already off; normal off path will handle wall",
+                "Power standby wall: universal TV state is no longer usable for this path",
                 level="DEBUG",
             )
             return
@@ -658,15 +722,6 @@ class LivingRoomTvControl(hass.Hass):
         if self._hisense_blocks_wall():
             self.log("Session-end wall: skipped (Hisense still on with TV-level power draw)", level="INFO")
             return
-
-        if self.power_aware_wall_move_enabled and self.tv_power_entity:
-            p = self._read_tv_power_w()
-            if p is not None and p > self.power_definitely_on_w:
-                self.log(
-                    f"Session-end wall: skipped (relay {p:.1f} W > {self.power_definitely_on_w} W - still high draw)",
-                    level="WARNING",
-                )
-                return
 
         try:
             apple_tv_state = self.get_state(self.apple_tv_entity)
@@ -684,7 +739,7 @@ class LivingRoomTvControl(hass.Hass):
             level="INFO",
         )
         mode = "init" if from_init else ("power_standby" if from_power else "debounced")
-        self._schedule_wall_move_after_tv_off(apple_tv_state, hisense_tv_state, schedule_mode=mode)
+        self._begin_power_verify_then_wall(apple_tv_state, hisense_tv_state, schedule_mode=mode)
 
     def _power_verify_state_reset(self):
         """Clear power-verify timers and stored states (does not cancel a running timer)."""
@@ -695,13 +750,14 @@ class LivingRoomTvControl(hass.Hass):
         self._power_verify_schedule_mode = "debounced"
 
     def _cancel_power_wall_verify(self, reason=""):
-        """Cancel in-flight power verification and log reason if provided."""
+        """Cancel and invalidate in-flight power verification."""
+        self._invalidate_wall_timer("verify")
         if self._power_wall_verify_handle:
             self._safe_cancel_timer(self._power_wall_verify_handle)
             self._power_wall_verify_handle = None
-            self._power_verify_state_reset()
-            if reason:
-                self.log(reason, level="INFO")
+        self._power_verify_state_reset()
+        if reason:
+            self.log(reason, level="INFO")
 
     def _cancel_power_on_confirm(self, reason=None):
         """Cancel relay/indicator polling before running Sonos reset on TV power-on."""
@@ -803,8 +859,10 @@ class LivingRoomTvControl(hass.Hass):
             self.log(f"Power-on confirm tick error: {e}", level="WARNING")
 
     def _session_end_wall_fired(self, kwargs=None):
-        """Grace period elapsed with session still 'over' - schedule wall (relay sanity check only)."""
+        """Grace elapsed: recheck the session, then require confirmed standby power."""
         kwargs = kwargs or {}
+        if not self._wall_timer_current("session", kwargs):
+            return
         from_init = bool(kwargs.get("from_init", False))
         from_power = bool(kwargs.get("from_power", False))
         self._session_end_wall_handle = None
@@ -852,42 +910,25 @@ class LivingRoomTvControl(hass.Hass):
         After Apple TV/Hisense indicators pass: optionally confirm power is low, then schedule wall move.
         schedule_mode: 'debounced' (normal off path) or 'init' (startup check; simpler delay).
         """
-        if self._power_wall_verify_handle:
-            self._safe_cancel_timer(self._power_wall_verify_handle)
-            self._power_wall_verify_handle = None
-            self._power_verify_state_reset()
-
+        self._cancel_power_wall_verify()
+        if not self._wall_state_allows_move(schedule_mode):
+            return
         if not self.power_aware_wall_move_enabled:
             self._schedule_wall_move_after_tv_off(apple_tv_state, hisense_tv_state, schedule_mode)
             return
-        if not self.tv_power_entity:
-            self._schedule_wall_move_after_tv_off(apple_tv_state, hisense_tv_state, schedule_mode)
-            return
-
         p = self._read_tv_power_w()
         if p is None:
-            self.log(
-                "Power check: unreadable sensor; skipping wall move (fail closed)",
-                level="WARNING",
-            )
-            return
-
-        if p <= self.power_off_threshold_w:
-            self.log(
-                f"Power check: {p:.1f} W at or below {self.power_off_threshold_w} W threshold; proceeding with wall scheduling",
-                level="INFO",
-            )
-            self._schedule_wall_move_after_tv_off(apple_tv_state, hisense_tv_state, schedule_mode)
+            self.log("Power check: unreadable or stale sensor; skipping wall move", level="WARNING")
             return
 
         self.log(
-            f"Power check: {p:.1f} W above {self.power_off_threshold_w} W threshold; "
+            f"Power check: {p:.1f} W; "
             f"waiting up to {self.power_max_wait_seconds:.0f}s (confirm {self.power_off_confirm_seconds:.0f}s below threshold, "
             f"recheck every {self.power_recheck_interval_seconds:.0f}s)",
             level="INFO",
         )
         self._power_verify_wait_start = self.datetime()
-        self._power_verify_below_since = None
+        self._power_verify_below_since = self.datetime() if p <= self.power_off_threshold_w else None
         self._power_verify_apple_state = apple_tv_state
         self._power_verify_hisense_state = hisense_tv_state
         self._power_verify_schedule_mode = schedule_mode
@@ -895,20 +936,19 @@ class LivingRoomTvControl(hass.Hass):
             self._power_wall_verify_handle = self.run_in(
                 self._power_wall_verify_tick,
                 self.power_recheck_interval_seconds,
+                **self._wall_timer_kwargs("verify"),
             )
         except Exception as e:
             self.error(f"Failed to schedule power verify tick: {e}")
 
     def _power_wall_verify_tick(self, kwargs=None):
         """Poll power until confirmed below threshold, timeout, or canceled."""
+        if not self._wall_timer_current("verify", kwargs):
+            return
         self._power_wall_verify_handle = None
 
-        try:
-            cur_tv = self.get_state(self.tv_entity)
-        except Exception:
-            cur_tv = None
-        if cur_tv != "off":
-            self.log("Power check canceled: TV is no longer off", level="INFO")
+        if not self._wall_state_allows_move(self._power_verify_schedule_mode):
+            self.log("Power check canceled: TV state or operation no longer permits wall", level="INFO")
             self._power_verify_state_reset()
             return
 
@@ -945,6 +985,7 @@ class LivingRoomTvControl(hass.Hass):
                 self._power_wall_verify_handle = self.run_in(
                     self._power_wall_verify_tick,
                     self.power_recheck_interval_seconds,
+                    **self._wall_timer_kwargs("verify"),
                 )
             except Exception as e:
                 self.error(f"Failed to reschedule power verify tick: {e}")
@@ -962,7 +1003,7 @@ class LivingRoomTvControl(hass.Hass):
         except Exception:
             below_elapsed = 0
 
-        if below_elapsed >= self.power_off_confirm_seconds:
+        if below_elapsed >= self.power_off_confirm_seconds and self._wall_power_confirmed():
             self.log(
                 f"Power check: confirmed <= {self.power_off_threshold_w} W for {self.power_off_confirm_seconds:.0f}s; proceeding with wall scheduling",
                 level="INFO",
@@ -978,12 +1019,19 @@ class LivingRoomTvControl(hass.Hass):
             self._power_wall_verify_handle = self.run_in(
                 self._power_wall_verify_tick,
                 self.power_recheck_interval_seconds,
+                **self._wall_timer_kwargs("verify"),
             )
         except Exception as e:
             self.error(f"Failed to reschedule power verify tick: {e}")
 
     def _schedule_wall_move_after_tv_off(self, apple_tv_state, hisense_tv_state, schedule_mode="debounced"):
         """Stop media, apply smart/min delays, schedule or immediate move to Wall."""
+        if not self._wall_state_allows_move(schedule_mode):
+            return
+        if self.power_aware_wall_move_enabled and not self._wall_power_confirmed():
+            self._begin_power_verify_then_wall(apple_tv_state, hisense_tv_state, schedule_mode)
+            return
+        self._invalidate_wall_timer("move")
         self._stop_living_room_media_and_reset(
             reason="tv_off_confirmed" if schedule_mode == "debounced" else "tv_off_confirmed_init",
         )
@@ -1009,7 +1057,10 @@ class LivingRoomTvControl(hass.Hass):
                     f"Init: scheduling lift to 'Wall' in {delay}s (minimum delay; power confirmed)",
                 )
             try:
-                self._delayed_wall_handle = self.run_in(self._move_lift_to_wall, delay)
+                self._delayed_wall_handle = self.run_in(
+                    self._move_lift_to_wall, delay,
+                    **self._wall_timer_kwargs("move", schedule_mode=schedule_mode),
+                )
             except Exception as e:
                 self.error(f"Error scheduling init move to 'Wall': {e}")
             return
@@ -1059,22 +1110,14 @@ class LivingRoomTvControl(hass.Hass):
         if remaining_delay > 0:
             self.log(f"TV ({self.tv_entity}) turned off. Scheduling lift to 'Wall' in {remaining_delay}s")
             try:
-                self._delayed_wall_handle = self.run_in(self._move_lift_to_wall, remaining_delay)
+                self._delayed_wall_handle = self.run_in(
+                    self._move_lift_to_wall, remaining_delay,
+                    **self._wall_timer_kwargs("move", schedule_mode=schedule_mode),
+                )
             except Exception as e:
                 self.error(f"Error scheduling delayed move to 'Wall': {e}")
         else:
-            lift_position = "Wall"
-            self.log(
-                f"TV ({self.tv_entity}) turned off. Setting lift position ({self.lift_select_entity}) to '{lift_position}' immediately",
-            )
-            try:
-                self.call_service("select/select_option", entity_id=self.lift_select_entity, option=lift_position)
-                self._report_house_event("Living room TV turned off", "TV moving to wall")
-            except Exception as e:
-                self.error(
-                    f"Error setting lift position to '{lift_position}' when TV turned off: {e}",
-                    exc_info=True,
-                )
+            self._move_lift_to_wall(self._wall_timer_kwargs("move", schedule_mode=schedule_mode))
 
     def _on_tv_indicator_active(self, entity, attribute, old, new, kwargs):
         # If Apple TV becomes active-ish or Hisense is reported ON, cancel delayed wall moves
@@ -1086,7 +1129,7 @@ class LivingRoomTvControl(hass.Hass):
             if (
                 self.power_aware_wall_move_enabled
                 and self.ignore_apple_tv_when_relay_standby
-                and self._relay_suggests_tv_standby()
+                and self._wall_power_confirmed()
             ):
                 if is_hisense and new == "on":
                     self.log(
@@ -1124,20 +1167,25 @@ class LivingRoomTvControl(hass.Hass):
             self._arm_apple_tv_disconnect("TV off")
             self._cancel_power_standby_monitor("universal TV off")
             self._cancel_power_on_confirm(reason="TV transitioning off: cancel pending power-on confirm")
+            self._invalidate_wall_timer("debounce")
             # Cancel any existing debounce timer
             if self._tv_off_debounce_handle:
                 self._safe_cancel_timer(self._tv_off_debounce_handle)
             # Schedule debounced handler
             try:
-                self._tv_off_debounce_handle = self.run_in(self._handle_tv_off_debounced, self.tv_off_debounce_seconds)
+                self._tv_off_debounce_handle = self.run_in(
+                    self._handle_tv_off_debounced, self.tv_off_debounce_seconds,
+                    **self._wall_timer_kwargs("debounce"),
+                )
                 self.log(f"TV state changed to 'off', debouncing for {self.tv_off_debounce_seconds}s before action")
             except Exception as e:
                 self.log(f"Error scheduling TV off debounce: {e}", level="WARNING")
                 # Fall through to immediate handling if scheduling fails
-                self._handle_tv_off_debounced(None)
+                self._handle_tv_off_debounced(self._wall_timer_kwargs("debounce"))
             return
 
         if new != "off":
+            self._cancel_delayed_wall_move("TV no longer off")
             self._cancel_apple_tv_disconnect()
             self._cancel_session_end_wall_timer("TV no longer off")
             if self._power_wall_verify_handle:
@@ -1152,6 +1200,8 @@ class LivingRoomTvControl(hass.Hass):
     
     def _handle_tv_off_debounced(self, kwargs):
         """Handle TV off state after debounce period."""
+        if not self._wall_timer_current("debounce", kwargs):
+            return
         self._tv_off_debounce_handle = None
         
         # Re-check state to ensure it's still "off" after debounce
@@ -1162,7 +1212,7 @@ class LivingRoomTvControl(hass.Hass):
                 return
         except Exception as e:
             self.log(f"Error checking TV state after debounce: {e}", level="WARNING")
-            # Continue anyway - better to act than miss an off event
+            return
 
         if self._lift_already_at_wall():
             self.log(f"TV ({self.tv_entity}) off after debounce but lift already at Wall", level="DEBUG")
@@ -1206,6 +1256,7 @@ class LivingRoomTvControl(hass.Hass):
                     self._session_end_wall_handle = self.run_in(
                         self._session_end_wall_fired,
                         self.session_end_grace_seconds,
+                        **self._wall_timer_kwargs("session"),
                     )
                     self.log(
                         f"TV ({self.tv_entity}) off after debounce: session-end grace "
@@ -1229,15 +1280,24 @@ class LivingRoomTvControl(hass.Hass):
             self.log(f"TV ({self.tv_entity}) turned off but TV operation in progress - skipping scheduling/immediate wall move", level="INFO")
 
     def _move_lift_to_wall(self, kwargs):
-        lift_position = "Wall"
-        self.log(f"Executing delayed move: setting lift position ({self.lift_select_entity}) to '{lift_position}'")
+        if not self._wall_timer_current("move", kwargs):
+            return
+        self._delayed_wall_handle = None
+        self._invalidate_wall_timer("move")
+        if self._lift_already_at_wall():
+            return
+        # Re-read every safety input at execution, including zero-delay moves.
+        if not self._wall_state_allows_move((kwargs or {}).get("schedule_mode", "debounced")):
+            self.log("Wall move blocked: TV state or operation changed", level="INFO")
+            return
+        if self.power_aware_wall_move_enabled and not self._wall_power_confirmed():
+            self.log("Wall move blocked: power is not freshly confirmed standby", level="WARNING")
+            return
         try:
-            self.call_service("select/select_option", entity_id=self.lift_select_entity, option=lift_position)
+            self.call_service("select/select_option", entity_id=self.lift_select_entity, option="Wall")
             self._report_house_event("Living room TV turned off", "TV moving to wall")
         except Exception as e:
-            self.error(f"Error executing delayed move to '{lift_position}': {e}", exc_info=True)
-        finally:
-            self._delayed_wall_handle = None
+            self.error(f"Error executing delayed move to 'Wall': {e}", exc_info=True)
 
     def handle_tv_power_on(self, entity, attribute, old, new, kwargs):
         """Off -> on only (see listen_state). When power-aware, confirm relay + indicators like the wall-off path."""
@@ -1708,7 +1768,7 @@ class LivingRoomTvControl(hass.Hass):
                     self._session_end_wall_handle = self.run_in(
                         self._session_end_wall_fired,
                         self.session_end_grace_seconds,
-                        from_init=True,
+                        **self._wall_timer_kwargs("session", from_init=True),
                     )
                     self.log(
                         f"Init check: TV off, lift at '{lift_state}'; session-end grace "

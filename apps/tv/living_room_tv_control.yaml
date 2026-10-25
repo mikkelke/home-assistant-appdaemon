@@ -18,8 +18,9 @@ living_room_tv_control:
   # idle — relay sits in a middle band — so power is a sanity check, not the only signal; Hisense/Apple TV +
   # app logic (e.g. stop living room speaker on TV off) matter for consistent UX.
   # Threshold ~52W sits above idle/Sonos-only bumps and below typical TV-on draw; 45W hit edge cases (e.g. 46W).
-  # If power is already <= threshold, wall scheduling runs immediately.
-  # If power is high, poll until it stays <= threshold for power_off_confirm_seconds, within power_max_wait_seconds.
+  # Every automatic Wall move requires fresh, valid relay power <= threshold for
+  # power_off_confirm_seconds, and rechecks power/state immediately before movement.
+  # Unknown, stale, future-dated or non-finite readings block Wall and reset confirmation.
   # ignore_apple_tv_when_relay_standby: while relay <= threshold, Apple TV paused/idle/on does NOT cancel the
   # scheduled wall move. Hisense 'on' is also ignored at standby draw (integration often lags power-off).
   # power_standby_wall_enabled: when relay stays <= threshold but universal TV still reports on/paused,
@@ -27,15 +28,15 @@ living_room_tv_control:
   power_standby_wall_enabled: true
   #
   # Session-end grace: after universal TV is debounced 'off' and Hisense is not 'on', wait this many seconds;
-  # if still off, schedule Wall (Apple TV state ignored). Skips fragile power polling for the common case.
-  # At fire time: if relay > power_definitely_on_w, skip wall (stack still drawing like real viewing). Set to 0
-  # to disable and use only the power-verify path below.
+  # if still off, run the same standby power verification (Apple TV state ignored).
+  # Set to 0 to omit this grace period; power verification still applies.
   session_end_grace_seconds: 15
   power_definitely_on_w: 115
   power_aware_wall_move_enabled: true
   tv_power_entity: sensor.living_room_tv_relay_power
   power_off_threshold_w: 52
   power_off_confirm_seconds: 2
+  power_snapshot_max_age_seconds: 120 # last_reported, falling back to last_updated
   power_recheck_interval_seconds: 2
   power_max_wait_seconds: 45
   ignore_apple_tv_when_relay_standby: true
