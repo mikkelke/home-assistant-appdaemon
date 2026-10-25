@@ -46,15 +46,11 @@ living_room_tv_control:
   power_on_confirm_recheck_seconds: 1.0 # poll interval while waiting (first check ~0.1s after off->on)
 
   # Apple TV remote reset (workaround for stuck Apple TV integration in older HA versions)
-  # This toggles the remote entity off/on to refresh Apple TV state
-  # Set to false to disable and test if still needed with current HA/Apple TV versions
-  apple_tv_reset_enabled: true
+  # Disabled: the local VIDAA provider reports power; reconnect is gated by the TV input.
+  apple_tv_reset_enabled: false
   apple_tv_reset_delay_seconds: 30  # seconds to wait after TV turns on before resetting
   apple_tv_reconnect_cooldown_seconds: 600  # at most one reconnect request per window
   apple_tv_disconnect_grace_seconds: 120  # TV off this long -> remote.turn_off disconnects the Apple TV integration
-
-  # Optional Wake-on-LAN helper button to nudge TV power-on
-  wol_button_entity: button.wake_on_lan_c4_08_26_6d_25_0e
 
   # Z-Wave settings.
   # The following values are defaults in the Python code (inspired by sonos_bathroom_control.py)
@@ -84,12 +80,14 @@ living_room_tv_control:
   rooftop_charging_sensor: binary_sensor.rooftop_charging
   
   # Entity configuration (for power-on checks and media control)
-  hisense_tv_entity: media_player.living_room_hisense_tv_television
+  hisense_tv_entity: media_player.hisense_vidaa_local
   apple_tv_entity: media_player.living_room_apple_tv
+  apple_tv_source_name: HDMI2 # auto-reconnect only while this input is selected
+  source_selection_script_entity: script.living_room_tv_select_source
   living_room_speaker_entity: media_player.living_room
   
   # Operation timing configuration
-  tv_operation_timeout_s: 45  # Seconds before resetting stuck operation flag (default 45s for WoL + multiple TV turn-ons)
+  tv_operation_timeout_s: 45  # Seconds before resetting a stuck operation flag while HA powers on the TV
   min_operation_time_s: 3.0  # Minimum seconds to keep operation flag True (prevents race conditions)
   
   # Lift verification

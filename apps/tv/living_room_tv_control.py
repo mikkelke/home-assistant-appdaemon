@@ -40,9 +40,6 @@ class LivingRoomTvControl(hass.Hass):
         self.zwave_endpoint = self.args.get("zwave_endpoint")
         self.zwave_event_value_held = self.args.get("zwave_event_value_held")
 
-        # Optional WOL helper
-        self.wol_button_entity = self.args.get("wol_button_entity")
-
         # Announcement config
         self.announce_on_lift_move = self.args.get("announce_on_lift_move", True)
         self.announce_speakers_living = self.args.get("announce_speakers_living", [])
@@ -60,6 +57,8 @@ class LivingRoomTvControl(hass.Hass):
         # TV entity configuration (for power-on checks)
         self.hisense_tv_entity = self.args.get("hisense_tv_entity", "media_player.living_room_hisense_tv_television")
         self.apple_tv_entity = self.args.get("apple_tv_entity", "media_player.living_room_apple_tv")
+        self.apple_tv_source_name = self.args.get("apple_tv_source_name")
+        self.source_selection_script_entity = self.args.get("source_selection_script_entity")
         self.living_room_speaker_entity = self.args.get("living_room_speaker_entity", "media_player.living_room")
         
         # Lift verification
@@ -90,7 +89,7 @@ class LivingRoomTvControl(hass.Hass):
         self.apple_tv_reset_enabled = self.args.get("apple_tv_reset_enabled", True)
         self.tv_operation_in_progress = False  # Flag to prevent overlapping operations
         self._tv_operation_start_time = None  # Track when operation started for stuck flag detection
-        # Make timeout configurable (default 45s to allow for WoL + multiple TV turn-ons)
+        # Make timeout configurable (default 45s to allow the shared HA power-on path to finish).
         self._tv_operation_timeout_s = int(self.args.get("tv_operation_timeout_s", 45))
         # Runtime handles/state
         self._delayed_wall_handle = None
@@ -226,6 +225,10 @@ class LivingRoomTvControl(hass.Hass):
             self.listen_state(self._on_lift_position_changed, self.lift_select_entity)
 
             self.listen_state(self._on_apple_tv_remote_connected, self.apple_tv_remote_entity, new="on")
+            if self.apple_tv_source_name is not None:
+                self.listen_state(
+                    self._on_tv_source_changed, self.hisense_tv_entity, attribute="source"
+                )
 
             if (
                 self.power_aware_wall_move_enabled
@@ -373,7 +376,7 @@ class LivingRoomTvControl(hass.Hass):
             else:
                 self.log(f"Lift already at '{target_pos}', skipping move")
 
-            # Fire Wake-on-LAN and power-on only if moving to a viewing position and TV is not already on
+            # Request the shared power-on path when selecting a viewing position.
             if should_power_on:
                 self._power_on_tv_if_needed(reason=f"Z-Wave button {button_id} pressed")
 
@@ -1351,6 +1354,27 @@ class LivingRoomTvControl(hass.Hass):
     def _reconnect_apple_tv_on_init(self, kwargs):
         self._reconnect_apple_tv_if_needed("startup")
 
+    def _on_tv_source_changed(self, entity, attribute, old, new, kwargs):
+        """Keep the Apple TV integration connected only while its input is in use."""
+        source_name = getattr(self, "apple_tv_source_name", None)
+        if source_name is None or old == new:
+            return
+        try:
+            if self.get_state(self.hisense_tv_entity) != "on":
+                return
+            if new == source_name:
+                self._reconnect_apple_tv_if_needed("Apple TV input selected")
+            elif old == source_name:
+                selection_script = getattr(self, "source_selection_script_entity", None)
+                if selection_script and self.get_state(selection_script) == "on":
+                    # The managed source operation owns the connection while waking/selecting.
+                    return
+                # None is also a valid native/Home source while the primary is on.
+                # Requiring the old input avoids acting on an initial/reload report.
+                self._disconnect_apple_tv("TV input changed away from Apple TV")
+        except Exception as e:
+            self.log(f"Apple TV source change check failed: {e}", level="WARNING")
+
     def _reconnect_apple_tv_if_needed(self, reason):
         """Reconnect the Apple TV integration when the TV is on but it holds no connection.
         The remote reads off exactly when the integration is disconnected; the player
@@ -1362,6 +1386,16 @@ class LivingRoomTvControl(hass.Hass):
             if not self._tv_is_on():
                 self.log(f"Apple TV reconnect ({reason}): TV is off - nothing to do")
                 return
+            source_name = getattr(self, "apple_tv_source_name", None)
+            if source_name is not None:
+                primary_state = self.get_state(self.hisense_tv_entity)
+                source = self.get_state(self.hisense_tv_entity, attribute="source")
+                if primary_state != "on" or source != source_name:
+                    self.log(
+                        f"Apple TV reconnect ({reason}): primary TV is '{primary_state}', "
+                        f"source '{source}' (requires on / {source_name})"
+                    )
+                    return
             if remote_state != "off" or player_state != "off":
                 self.log(
                     f"Apple TV reconnect ({reason}): not needed "
@@ -1433,7 +1467,7 @@ class LivingRoomTvControl(hass.Hass):
             self.call_service("remote/turn_off", entity_id=self.apple_tv_remote_entity)
             self._apple_reconnect_at = None
             self.log(
-                f"Apple TV disconnect ({reason}): TV is off - "
+                f"Apple TV disconnect ({reason}): "
                 f"remote.turn_off sent to {self.apple_tv_remote_entity}"
             )
         except Exception as e:
@@ -1639,79 +1673,16 @@ class LivingRoomTvControl(hass.Hass):
         self._lift_verify_handle = None
 
     def _power_on_tv_if_needed(self, reason=""):
-        """Helper method to power on TV if it's currently off. Used by both Z-Wave button handler and manual lift position changes."""
+        """Request the shared HA power-on path without changing the selected input."""
         try:
-            # Read states up-front
-            universal_state = None
-            hisense_state = None
-            try:
-                universal_state = self.get_state(self.tv_entity)
-            except Exception as e:
-                self.log(f"Could not read state for {self.tv_entity}: {e}", level="WARNING")
-            try:
-                hisense_state = self.get_state(self.hisense_tv_entity)
-            except Exception as e:
-                self.log(f"Could not read state for {self.hisense_tv_entity}: {e}", level="WARNING")
-
-            tv_already_on = (
-                (universal_state not in [None, "off", "unavailable", "unknown", "standby"]) or
-                (hisense_state == "on")
-            )
-            reason_str = f" ({reason})" if reason else ""
-            self.log(f"Power-on check{reason_str} -> Universal: {universal_state}, Hisense: {hisense_state}, already_on={tv_already_on}")
-
-            if tv_already_on:
-                self.log("TV already on; skipping WoL and power-on calls")
+            if self._tv_is_on():
+                self.log("TV already on; skipping power-on request")
                 return
-
             self._arm_apple_tv_disconnect("TV power-on requested")
-
-            # WoL first if configured
-            try:
-                if self.wol_button_entity:
-                    self.log(f"Triggering WOL helper button: {self.wol_button_entity}")
-                    self.call_service("button/press", entity_id=self.wol_button_entity)
-            except Exception as e:
-                self.log(f"Failed to press WOL helper button: {e}", level="WARNING")
-
-            # Universal TV turn on
-            try:
-                if universal_state in [None, "off", "unavailable", "unknown", "standby"]:
-                    self.log(f"Powering universal TV: {self.tv_entity} (state: {universal_state})")
-                    self.call_service("media_player/turn_on", entity_id=self.tv_entity)
-                else:
-                    self.log(f"Skipping universal TV turn_on; current state: {universal_state}")
-            except Exception as e:
-                self.log(f"Universal TV turn_on attempt failed: {e}", level="WARNING")
-
-            # Hisense turn on
-            try:
-                if hisense_state == "unavailable":
-                    self.log("Hisense TV is unavailable; skipping direct control", level="WARNING")
-                elif hisense_state != "on":
-                    self.log(f"Powering Hisense TV (HomeKit); state: {hisense_state}")
-                    self.call_service("media_player/turn_on", entity_id=self.hisense_tv_entity)
-                else:
-                    self.log("Skipping Hisense TV turn_on; already on")
-            except Exception as e:
-                self.log(f"Hisense TV turn_on attempt failed: {e}", level="WARNING")
-
-            # Apple TV wake only if not already active.
-            # Apple TV does not support media_player.turn_on; use remote.turn_on to wake it.
-            try:
-                apple_tv_state = self.get_state(self.apple_tv_entity)
-                if apple_tv_state in ["playing", "paused", "idle", "on"]:
-                    self.log(f"Skipping Apple TV wake; current state: {apple_tv_state}")
-                elif apple_tv_state == "unavailable":
-                    self.log("Apple TV is unavailable; skipping wake", level="WARNING")
-                else:
-                    self.log(f"Waking Apple TV via remote; state: {apple_tv_state}")
-                    remote_entity = "remote." + self.apple_tv_entity.split(".", 1)[-1]
-                    self.call_service("remote/turn_on", entity_id=remote_entity)
-            except Exception as e:
-                self.log(f"Apple TV wake attempt failed: {e}", level="WARNING")
+            self.log(f"Requesting TV power-on through {self.tv_entity} ({reason})")
+            self.call_service("media_player/turn_on", entity_id=self.tv_entity)
         except Exception as e:
-            self.log(f"Error in _power_on_tv_if_needed: {e}", level="WARNING")
+            self.log(f"TV power-on request failed: {e}", level="WARNING")
 
     def _on_lift_position_changed(self, entity, attribute, old, new, kwargs):
         """Handle lift position changes to cancel wall moves and power on TV when moved to viewing positions."""

@@ -237,7 +237,7 @@ class ReconnectsAfterTheGraceAreCut(unittest.TestCase):
         tv_changes(app, "on", "off")
         fire(app, app._apple_tv_disconnect_due)
         app._power_on_tv_if_needed(reason="button")
-        self.assertIn(CONNECT, app.service_calls)
+        self.assertEqual(app.service_calls, [("media_player/turn_on", {"entity_id": TV})])
         self.assertEqual(pending(app, app._apple_tv_disconnect_due), [120.0])
         remote_connects(app)
         self.assertNotIn(DISCONNECT, app.service_calls)
