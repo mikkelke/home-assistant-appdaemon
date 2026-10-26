@@ -46,16 +46,18 @@ NOW = datetime(2026, 10, 17, 12, 0, tzinfo=TZ)
 HERE = Path(__file__).resolve().parent
 APPS = HERE.parent
 FIXTURE = json.loads((HERE / "fixtures" / "open_meteo_forecast.json").read_text())
-ZONES = ("family", "kristines_room", "claudias_room", "bathroom", "guest_bathroom")
+ZONES = ("family", "living", "kristines_room", "claudias_room", "bathroom", "guest_bathroom")
 THERMOSTATS = {
     "family": "climate.family_room_thermostat",
+    "living": "climate.living_room_thermostat",
     "kristines_room": "climate.kristines_room_thermostat",
     "claudias_room": "climate.claudias_room_thermostat",
     "bathroom": "climate.bathroom_thermostat",
     "guest_bathroom": "climate.guest_bathroom_thermostat",
 }
 FEELS = {
-    "family": ["sensor.living_room_feel", "sensor.dining_room_feel", "sensor.kitchen_feel"],
+    "family": ["sensor.kitchen_feel", "sensor.dining_room_feel"],
+    "living": ["sensor.living_room_feel"],
     "kristines_room": ["sensor.kristines_room_feel"],
     "claudias_room": ["sensor.claudias_room_feel"],
     "bathroom": ["sensor.bathroom_feel"],
@@ -73,6 +75,7 @@ HELPERS = {
     "input_boolean.heating_season",
     "input_boolean.heating_live",
     "input_number.heating_target_family",
+    "input_number.heating_target_living",
     "input_number.heating_target_kristines_room",
     "input_number.heating_target_claudias_room",
     "input_number.heating_target_bathroom",
@@ -156,7 +159,7 @@ def house(ha: FakeHA):
     """A quiet October afternoon: season off, every sensor fresh, air 22.2, thermostats 22.8."""
     ha.set("input_boolean.heating_season", "off")
     ha.set("input_number.heating_bedroom_ceiling", "21.0")
-    for zone, value in zip(ZONES, ("21.5", "21.5", "21.5", "22.0", "20.0")):
+    for zone, value in zip(ZONES, ("21.5", "21.5", "21.5", "21.5", "22.0", "20.0")):
         ha.set(f"input_number.heating_target_{zone}", value)
     # a new date-and-time helper without an initial value reads midnight of the day it was made
     ha.set("input_datetime.heating_party_start", "2026-10-17 00:00:00")
@@ -178,7 +181,6 @@ def house(ha: FakeHA):
         ha.set(f"sensor.{zone}_floor_thermometer_temperature", "21.0")
     ha.set("sensor.living_room_floor_thermometer_temperature", "21.0")
     ha.set("sensor.dining_room_floor_thermometer_temperature", "21.0")
-    ha.set("climate.living_room_thermostat", "off", {"current_temperature": 22.0})
     ha.set("person.mikkel", "home", {"user_id": MIKKEL_ID})
     ha.set("person.claudia", "home", {"user_id": CLAUDIA_ID})
     ha.set("person.kristine", "home", {})
@@ -397,9 +399,9 @@ class ShippedYaml(unittest.TestCase):
 
     def test_the_owner_decisions_are_what_ships(self):
         z = self.cfg.zones
-        self.assertEqual([z[n].base_c for n in ZONES], [21.5, 21.5, 21.5, 22.0, 20.0])
-        self.assertEqual([z[n].lower_c for n in ZONES], [19.0, 19.0, 19.0, 19.0, 18.0])
-        self.assertEqual([z[n].upper_c for n in ZONES], [24.0, 24.0, 24.0, 25.0, 24.0])
+        self.assertEqual([z[n].base_c for n in ZONES], [21.5, 21.5, 21.5, 21.5, 22.0, 20.0])
+        self.assertEqual([z[n].lower_c for n in ZONES], [19.0, 19.0, 19.0, 19.0, 19.0, 18.0])
+        self.assertEqual([z[n].upper_c for n in ZONES], [24.0, 24.0, 24.0, 24.0, 25.0, 24.0])
         self.assertEqual(z["family"].protected_min_c, 20.5)
         self.assertEqual(self.cfg.sun_term_factor, 0.5)
         self.assertEqual(self.cfg.keypad_relock_minutes, 15)
@@ -418,7 +420,7 @@ class ShippedYaml(unittest.TestCase):
             (cfg.supply_temp_entity, cfg.return_temp_entity),
             ("sensor.heating_room_floor_heating_supply", "sensor.heating_room_floor_heating_return"),
         )
-        self.assertEqual(cfg.living_monitor_entity, "climate.living_room_thermostat")
+        self.assertEqual(cfg.living_monitor_entity, "")
         self.assertEqual(cfg.alerts, hp.AlertConfig())
         floors = {n: zc.evenness_floors for n, zc in cfg.zones.items() if zc.evenness_floors}
         self.assertEqual(floors, {"family": (LIVING_FLOOR, DINING_FLOOR)})
@@ -438,14 +440,45 @@ class ShippedYaml(unittest.TestCase):
         self.assertEqual((a.stop_min_c, a.season_min_days, a.reask_days), (5.0, 7, 3))
         self.assertEqual(a, hp.parse_config(self.args).season_advisor)
 
-    def test_the_family_room_is_one_zone_of_living_room_dining_room_and_kitchen(self):
-        rooms = ("sensor.living_room_feel", "sensor.dining_room_feel", "sensor.kitchen_feel")
-        self.assertEqual(self.cfg.zones["family"].control_air, rooms)
-        self.assertEqual(self.cfg.season_advisor.rooms["family"], rooms)
+    def test_the_family_room_has_separate_living_and_kitchen_dining_loops(self):
+        self.assertEqual(tuple(self.cfg.zones), ZONES)
+        family, living = self.cfg.zones["family"], self.cfg.zones["living"]
+        self.assertEqual(family.thermostat, THERMOSTATS["family"])
+        self.assertEqual(family.control_air, tuple(FEELS["family"]))
+        self.assertEqual(family.floor_sensor, DINING_FLOOR)
+        self.assertEqual(
+            family.openings,
+            (
+                "binary_sensor.kitchen_window_contact",
+                "binary_sensor.dining_room_window_1_contact",
+                "binary_sensor.dining_room_window_2_contact",
+                "binary_sensor.dining_room_window_3_contact",
+            ),
+        )
+        self.assertEqual(living.thermostat, THERMOSTATS["living"])
+        self.assertEqual(living.control_air, tuple(FEELS["living"]))
+        self.assertEqual(living.floor_sensor, LIVING_FLOOR)
+        self.assertEqual(living.target_entity, "input_number.heating_target_living")
+        self.assertEqual(
+            living.openings,
+            ("binary_sensor.living_room_window_contact", "binary_sensor.rooftop_door_1_contact"),
+        )
+        self.assertEqual(living.floor_max_c, 26.0)
+        self.assertIsNone(family.floor_max_c)
+        for setting in (
+            "base_c", "lower_c", "upper_c", "protected_min_c", "profile", "trim", "budget",
+            "weather_offset", "sun_cut",
+        ):
+            self.assertEqual(getattr(living, setting), getattr(family, setting), setting)
+        self.assertEqual(self.cfg.party.zone, "family")
 
-    def test_the_advisor_judges_every_zone_on_the_air_the_controller_plans_by(self):
+    def test_the_advisor_still_judges_the_combined_family_room(self):
         a = self.cfg.season_advisor
-        for zone in a.zones:
+        self.assertEqual(
+            a.rooms["family"],
+            ("sensor.living_room_feel", "sensor.dining_room_feel", "sensor.kitchen_feel"),
+        )
+        for zone in ("kristines_room", "claudias_room"):
             self.assertEqual(a.rooms[zone], self.cfg.zones[zone].control_air, zone)
 
     def test_family_profile_is_minus_half_nights_and_mornings_plus_half_evenings(self):
@@ -465,14 +498,17 @@ class ShippedYaml(unittest.TestCase):
 
     def test_sun_cuts_only_where_the_glass_looks_at_the_sun(self):
         enabled = [n for n, zc in self.cfg.zones.items() if zc.sun_cut.enabled]
-        self.assertEqual(enabled, ["family", "claudias_room"])
+        self.assertEqual(enabled, ["family", "living", "claudias_room"])
         self.assertEqual(self.cfg.zones["claudias_room"].sun_cut.az_min, 180.0)
 
-    def test_only_the_family_zone_ships_a_weather_offset(self):
+    def test_both_family_room_loops_ship_the_fitted_weather_offset(self):
         shipped = {
             n: zc.weather_offset for n, zc in self.cfg.zones.items() if zc.weather_offset.enabled
         }
-        self.assertEqual(shipped, {"family": hp.WeatherOffsetConfig(True, 0.85, 0.22, 1.5)})
+        self.assertEqual(
+            shipped,
+            {zone: hp.WeatherOffsetConfig(True, 0.85, 0.22, 1.5) for zone in ("family", "living")},
+        )
 
     def test_helper_entities_are_ones_that_exist(self):
         wanted = {self.cfg.season_entity, self.cfg.bedroom.ceiling_entity}
@@ -600,6 +636,7 @@ class OffSeasonPlan(unittest.TestCase):
         # 12:00: the family target is the base, the others are flat, the bathroom is below its window
         want = {
             "family": (21.5, 22.0),
+            "living": (21.5, 22.0),
             "kristines_room": (21.5, 21.5),
             "claudias_room": (21.5, 21.5),
             "bathroom": (19.0, 19.0),
@@ -703,22 +740,23 @@ class ControlAirChain(unittest.TestCase):
         a = self.h.attrs("family")
         self.assertEqual((a["control_air"], a["control_air_source"]), (22.2, "feel"))
 
-    def test_the_family_air_is_the_mean_of_living_room_dining_room_and_kitchen(self):
-        self.h.ha.set("sensor.living_room_feel", "22.0", {"stale": "false"})
+    def test_family_air_is_the_mean_of_kitchen_and_dining_independent_of_living(self):
+        self.h.ha.set("sensor.living_room_feel", "24.0", {"stale": "false"})
         self.h.ha.set("sensor.dining_room_feel", "22.6", {"stale": "false"})
         self.h.ha.set("sensor.kitchen_feel", "21.4", {"stale": "false"})
         self.h.tick()
         self.assertEqual(self.h.attrs("family")["control_air"], 22.0)
+        self.assertEqual(self.h.attrs("living")["control_air"], 24.0)
 
-    def test_one_of_three_family_rooms_is_enough(self):
+    def test_one_of_the_two_family_rooms_is_enough(self):
         self.h.ha.set("sensor.dining_room_feel", "unavailable")
-        self.h.ha.set("sensor.kitchen_feel", "22.0", {"stale": "true"})
+        self.h.ha.set("sensor.kitchen_feel", "22.6", {"stale": "false"})
         self.h.ha.set("sensor.living_room_feel", "22.6", {"stale": "false"})
         self.h.tick()
         self.assertEqual(self.h.attrs("family")["control_air"], 22.6)
         self.assertEqual(
             self.h.attrs("family")["stale_inputs"],
-            ["control_air:sensor.dining_room_feel", "control_air:sensor.kitchen_feel"],
+            ["control_air:sensor.dining_room_feel"],
         )
 
     def test_a_stale_room_reading_falls_back_to_the_thermostat_itself(self):
@@ -753,7 +791,7 @@ class ControlAirChain(unittest.TestCase):
             {"current_temperature": None, "temperature": 15.0},
             updated=old,
         )
-        self.h.ha.set("sensor.living_room_floor_thermometer_temperature", "21.0", updated=old)
+        self.h.ha.set("sensor.dining_room_floor_thermometer_temperature", "21.0", updated=old)
         self.h.tick()
         a = self.h.attrs("family")
         self.assertEqual((a["mode"], a["control_air_source"]), ("fallback", "none"))
@@ -842,7 +880,7 @@ class ControlAirChain(unittest.TestCase):
             self.h.ha.set(feel, "unavailable")
         self.h.ha.set(THERMOSTATS["family"], "unavailable")
         self.h.ha.set(
-            "sensor.living_room_floor_thermometer_temperature", "21.0",
+            "sensor.dining_room_floor_thermometer_temperature", "21.0",
             updated=self.h.clock.now - timedelta(minutes=65.6),
         )
         reading = self.h.app._read_zone(
@@ -852,9 +890,8 @@ class ControlAirChain(unittest.TestCase):
         self.assertFalse(reading["air_fresh"])
 
     def test_an_impossible_reading_is_ignored(self):
-        self.h.ha.set("sensor.living_room_feel", "88.0", {"stale": "false"})
+        self.h.ha.set("sensor.kitchen_feel", "88.0", {"stale": "false"})
         self.h.ha.set("sensor.dining_room_feel", "22.0", {"stale": "false"})
-        self.h.ha.set("sensor.kitchen_feel", "22.0", {"stale": "false"})
         self.h.tick()
         self.assertEqual(self.h.attrs("family")["control_air"], 22.0)
 
@@ -883,7 +920,7 @@ class DeviceLimits(unittest.TestCase):
         h.tick()
         h.tick(minutes=5)
         found = [m for m in h.warnings() if "thermostat limits" in m]
-        self.assertEqual(len(found), 5)
+        self.assertEqual(len(found), len(ZONES))
         self.assertEqual(
             h.attrs("family")["upper_limit"], 24.0
         )  # the configured limits still apply
@@ -976,6 +1013,149 @@ class ForecastHandling(unittest.TestCase):
         h.fetch()
         self.assertEqual(h.urls, [])
         self.assertTrue(any("no location" in m for m in h.warnings()))
+
+
+class FloorCapEndToEnd(unittest.TestCase):
+    def hot_floor(self):
+        h = Harness(self, forecast=False)
+        h.ha.set(LIVING_FLOOR, "26.0")
+        h.season()
+        return h
+
+    def test_hot_floor_caps_the_living_loop_and_publishes_the_setting(self):
+        h = self.hot_floor()
+        a = h.attrs("living")
+        self.assertEqual(
+            (a["mode"], a["setpoint_now"], a["floor_max_c"]), ("floor_cap", 19.0, 26.0)
+        )
+        self.assertEqual(a["weather_offset"], "+0.00")
+        self.assertIn("until the floor is below 25.5", a["reasons"][0])
+        self.assertEqual(h.attrs("family")["mode"], "hold")
+        self.assertNotIn("floor_max_c", h.attrs("family"))
+        records = {r["zone"]: r for r in h.log_lines("decision")}
+        self.assertEqual(records["living"]["plan_mode"], "floor_cap")
+        self.assertEqual(records["family"]["plan_mode"], "hold")
+
+    def test_hysteresis_survives_restart_and_releases_below_the_boundary(self):
+        h = self.hot_floor()
+        h.ha.set(LIVING_FLOOR, "25.5")
+        h.tick(minutes=5)
+        self.assertEqual(h.attrs("living")["mode"], "floor_cap")
+        saved = json.loads((h.tmp / "state.json").read_text())
+        self.assertIs(saved["zones"]["living"]["floor_cap"], True)
+        restarted = Harness(self, args=h.app.args, clock=h.clock, with_house=False, forecast=False)
+        self.assertTrue(restarted.app._zones["living"].floor_cap)
+        restarted.ha.entities = copy.deepcopy(h.ha.entities)
+        restarted.tick()
+        self.assertEqual(restarted.attrs("living")["mode"], "floor_cap")
+        restarted.ha.set(LIVING_FLOOR, "25.49")
+        restarted.tick(minutes=5)
+        self.assertFalse(restarted.app._zones["living"].floor_cap)
+        self.assertEqual(restarted.attrs("living")["mode"], "hold")
+        restarted.ha.set(LIVING_FLOOR, "25.9")
+        restarted.tick(minutes=5)
+        self.assertEqual(restarted.attrs("living")["mode"], "hold")
+
+    def test_stale_floor_suspends_the_cap_without_erasing_its_latch(self):
+        h = self.hot_floor()
+        h.tick(minutes=1440)
+        self.assertEqual(h.attrs("living")["mode"], "floor_cap")
+        h.tick(seconds=1)
+        self.assertEqual(h.attrs("living")["mode"], "hold")
+        self.assertTrue(h.app._zones["living"].floor_cap)
+        h.ha.set(LIVING_FLOOR, "25.7")
+        h.tick()
+        self.assertEqual(h.attrs("living")["mode"], "floor_cap")
+        h.ha.remove(LIVING_FLOOR)
+        h.tick()
+        self.assertEqual(h.attrs("living")["mode"], "hold")
+        self.assertTrue(h.app._zones["living"].floor_cap)
+        h.ha.set(LIVING_FLOOR, "25.4")
+        h.tick()
+        self.assertFalse(h.app._zones["living"].floor_cap)
+        self.assertEqual(h.attrs("living")["mode"], "hold")
+
+    def test_missing_invalid_undated_and_stale_floors_do_not_enter_the_cap(self):
+        readings = (
+            (None, 0), ("unavailable", 0), ("nan", 0), ("26.0", 1440.01), ("26.0", None)
+        )
+        for value, age in readings:
+            with self.subTest(value=value, age=age):
+                h = Harness(self, forecast=False)
+                if value is None:
+                    h.ha.remove(LIVING_FLOOR)
+                else:
+                    h.ha.set(
+                        LIVING_FLOOR, value, updated=h.clock.now - timedelta(minutes=age or 0)
+                    )
+                    if age is None:
+                        h.ha.entities[LIVING_FLOOR].pop("last_updated")
+                h.season()
+                self.assertFalse(h.app._zones["living"].floor_cap)
+                self.assertEqual(h.attrs("living")["mode"], "hold")
+
+    def test_runtime_without_saved_cap_state_is_backwards_compatible(self):
+        h = Harness(self, forecast=False)
+        zc = h.app.cfg.zones["living"]
+        for saved in ({}, {"floor_cap": "true"}, {"floor_cap": []}):
+            with self.subTest(saved=saved):
+                rt = hc.ZoneRuntime(zc, h.app.cfg, saved)
+                self.assertFalse(rt.floor_cap)
+
+    def test_window_wins_and_retains_the_cap_for_when_it_closes(self):
+        h = self.hot_floor()
+        h.ha.set("binary_sensor.living_room_window_contact", "on")
+        h.tick(minutes=1)
+        h.tick(minutes=2)
+        self.assertEqual(h.attrs("living")["mode"], "window")
+        self.assertTrue(h.app._zones["living"].floor_cap)
+        h.ha.set("binary_sensor.living_room_window_contact", "off")
+        h.tick(minutes=1)
+        self.assertEqual(h.attrs("living")["mode"], "settle")
+        h.tick(minutes=1)
+        self.assertEqual(h.attrs("living")["mode"], "floor_cap")
+
+
+class SplitFamilyLoops(unittest.TestCase):
+    def test_openings_only_pause_the_loop_they_belong_to(self):
+        openings = {
+            "living": (
+                "binary_sensor.living_room_window_contact", "binary_sensor.rooftop_door_1_contact"
+            ),
+            "family": (
+                "binary_sensor.kitchen_window_contact",
+                "binary_sensor.dining_room_window_1_contact",
+                "binary_sensor.dining_room_window_2_contact",
+                "binary_sensor.dining_room_window_3_contact",
+            ),
+        }
+        for zone, entities in openings.items():
+            for entity in entities:
+                with self.subTest(zone=zone, entity=entity):
+                    h = Harness(self, forecast=False).season()
+                    h.ha.set(entity, "on")
+                    h.tick(minutes=1)
+                    h.tick(minutes=2)
+                    other = "living" if zone == "family" else "family"
+                    self.assertEqual(h.attrs(zone)["mode"], "window")
+                    self.assertEqual(h.attrs(other)["mode"], "hold")
+
+    def test_party_only_pauses_family(self):
+        h = Harness(self, forecast=False).season()
+        h.ha.set("input_boolean.party", "on")
+        h.tick()
+        self.assertEqual(h.attrs("family")["mode"], "party")
+        self.assertEqual(h.attrs("living")["mode"], "hold")
+
+    def test_owner_living_target_change_is_attributed_to_living_only(self):
+        h = Harness(self, forecast=False).season()
+        h.helper("input_number.heating_target_living", 21.5, 22.0, MIKKEL_ID)
+        h.tick()
+        self.assertEqual(h.zone("living")["state"], 22.0)
+        self.assertEqual(h.zone("family")["state"], 21.5)
+        self.assertEqual(h.effects("living"), ["target_set"])
+        self.assertEqual(h.signals("living")[0]["who"], "mikkel")
+        self.assertEqual(h.signals("family"), [])
 
 
 class SunCut(unittest.TestCase):
@@ -1105,10 +1285,12 @@ class WeatherOffsetEndToEnd(unittest.TestCase):
             (a["mode"], a["plan_mode"], a["weather_offset"]), ("off_season", "hold", "+0.49")
         )
 
-    def test_no_other_zone_is_raised(self):
+    def test_only_the_two_family_room_loops_are_raised(self):
         h = self.cold_house()
         h.tick()
-        others = ZONES[1:]
+        self.assertEqual(h.attrs("living")["weather_offset"], "+0.49")
+        self.assertEqual(h.attrs("living")["setpoint_now"], 22.5)
+        others = ZONES[2:]
         for zone in others:
             self.assertEqual(h.attrs(zone)["weather_offset"], "+0.00", zone)
             self.assertEqual(self.decision(h, zone)["weather_offset"], 0.0, zone)
@@ -1156,7 +1338,7 @@ class WeatherOffsetEndToEnd(unittest.TestCase):
     def test_an_airing_takes_the_raise_away_until_it_is_over(self):
         h = self.cold_house()
         h.tick()
-        h.ha.set("binary_sensor.rooftop_door_1_contact", "on")
+        h.ha.set("binary_sensor.kitchen_window_contact", "on")
         h.tick(minutes=1)
         h.tick(minutes=2)
         a = h.attrs("family")
@@ -1164,7 +1346,7 @@ class WeatherOffsetEndToEnd(unittest.TestCase):
             (a["mode"], a["setpoint_now"], a["weather_offset"]), ("window", 19.0, "+0.00")
         )
         self.assertEqual(self.decision(h)["weather_offset"], 0.0)
-        h.ha.set("binary_sensor.rooftop_door_1_contact", "off")
+        h.ha.set("binary_sensor.kitchen_window_contact", "off")
         h.tick(minutes=40)
         a = h.attrs("family")
         self.assertEqual((a["mode"], a["weather_offset"]), ("hold", "+0.49"))
@@ -1191,12 +1373,12 @@ class WindowEndToEnd(unittest.TestCase):
         self.h.ha.set("input_boolean.heating_season", "on")
         self.h.tick()
 
-    def open_door(self):
-        self.h.ha.set("binary_sensor.rooftop_door_1_contact", "on")
+    def open_window(self):
+        self.h.ha.set("binary_sensor.kitchen_window_contact", "on")
 
     def test_an_airing_pauses_the_zone_then_settles_then_restores(self):
         h = self.h
-        self.open_door()
+        self.open_window()
         h.tick(minutes=1)
         self.assertEqual(h.attrs("family")["mode"], "hold")  # not two minutes yet
         h.tick(minutes=2)
@@ -1204,13 +1386,13 @@ class WindowEndToEnd(unittest.TestCase):
         self.assertEqual((a["mode"], a["setpoint_now"]), ("window", 19.0))
         d = [r for r in h.log_lines("decision") if r["zone"] == "family"][-1]
         self.assertEqual((d["gate"], d["would_write"]), ("priority:window_open", True))
-        h.ha.set("binary_sensor.rooftop_door_1_contact", "off")
-        h.ha.set("sensor.living_room_feel", "20.9", {"stale": "false"})
+        h.ha.set("binary_sensor.kitchen_window_contact", "off")
+        h.ha.set("sensor.kitchen_feel", "20.9", {"stale": "false"})
         h.ha.set("sensor.dining_room_feel", "20.9", {"stale": "false"})
         h.tick(minutes=7)
         a = h.attrs("family")
         self.assertEqual((a["mode"], a["setpoint_now"]), ("settle", 19.0))
-        h.ha.set("sensor.living_room_feel", "22.0", {"stale": "false"})
+        h.ha.set("sensor.kitchen_feel", "22.0", {"stale": "false"})
         h.ha.set("sensor.dining_room_feel", "22.0", {"stale": "false"})
         h.tick(minutes=5)
         a = h.attrs("family")
@@ -1220,10 +1402,10 @@ class WindowEndToEnd(unittest.TestCase):
 
     def test_a_long_opening_is_restored_at_once(self):
         h = self.h
-        self.open_door()
+        self.open_window()
         h.tick(minutes=3)
         h.tick(minutes=30)
-        h.ha.set("binary_sensor.rooftop_door_1_contact", "off")
+        h.ha.set("binary_sensor.kitchen_window_contact", "off")
         h.tick(minutes=2)
         self.assertEqual(h.attrs("family")["mode"], "hold")
 
@@ -1237,7 +1419,7 @@ class WindowEndToEnd(unittest.TestCase):
 
     def test_the_opening_state_is_kept_across_a_restart(self):
         h = self.h
-        self.open_door()
+        self.open_window()
         h.tick(minutes=1)
         h.tick(minutes=2)
         h2 = Harness(self, args=h.app.args, clock=h.clock, with_house=False, forecast=False)
@@ -2676,9 +2858,9 @@ class AlertsEndToEnd(unittest.TestCase):
         self.assertEqual(self.pushes(h), [])
         self.assertEqual(h.log_lines("alert"), [])
 
-    def test_the_living_room_monitor_in_heat_is_reported_also_outside_the_season(self):
-        h = Harness(self)
-        h.ha.set("climate.living_room_thermostat", "heat", {"current_temperature": 22.0})
+    def test_a_spare_monitor_in_heat_is_reported_also_outside_the_season(self):
+        h = Harness(self, unmanaged={"living_monitor": "climate.spare_thermostat"})
+        h.ha.set("climate.spare_thermostat", "heat", {"current_temperature": 22.0})
         h.tick()
         self.assertEqual(
             self.pushes(h),
@@ -2692,17 +2874,17 @@ class AlertsEndToEnd(unittest.TestCase):
         )
         h.tick(minutes=5)
         self.assertEqual(self.pushes(h), [])
-        h.ha.set("climate.living_room_thermostat", "off", {"current_temperature": 22.0})
+        h.ha.set("climate.spare_thermostat", "off", {"current_temperature": 22.0})
         h.tick(minutes=5)
         self.assertEqual([r["event"] for r in h.log_lines("alert")], ["start", "clear"])
 
     def test_a_monitor_that_is_not_configured_or_unreadable_says_nothing(self):
-        h = Harness(self)
-        h.ha.set("climate.living_room_thermostat", "unavailable")
+        h = Harness(self, unmanaged={"living_monitor": "climate.spare_thermostat"})
+        h.ha.set("climate.spare_thermostat", "unavailable")
         h.tick()
         self.assertEqual(self.pushes(h), [])
         h2 = Harness(self, unmanaged={})
-        h2.ha.set("climate.living_room_thermostat", "heat")
+        h2.ha.set("climate.spare_thermostat", "heat")
         h2.tick()
         self.assertEqual(self.pushes(h2), [])
 
@@ -2814,7 +2996,7 @@ class AlertsEndToEnd(unittest.TestCase):
             {"current_temperature": None, "temperature": 15.0},
             updated=old,
         )
-        h.ha.set(LIVING_FLOOR, "21.0", updated=old)
+        h.ha.set(DINING_FLOOR, "21.0", updated=old)
         h.season()
         self.assertEqual(h.attrs("family")["mode"], "fallback")
         for _ in range(35):
@@ -2868,9 +3050,9 @@ class AlertsEndToEnd(unittest.TestCase):
         )
 
     def test_every_push_goes_to_the_owner_only(self):
-        h = Harness(self)
+        h = Harness(self, unmanaged={"living_monitor": "climate.spare_thermostat"})
         self.cold_kristine(h)
-        h.ha.set("climate.living_room_thermostat", "heat")
+        h.ha.set("climate.spare_thermostat", "heat")
         h.ha.set("input_boolean.party", "on")
         h.season()
         for _ in range(8):
@@ -2894,17 +3076,17 @@ class AlertsEndToEnd(unittest.TestCase):
         self.assertEqual(h2.app._alerts.active(), ["cold:kristines_room"])
 
     def test_a_failing_push_is_only_a_warning(self):
-        h = Harness(self)
+        h = Harness(self, unmanaged={"living_monitor": "climate.spare_thermostat"})
         h.notifier.notify = AsyncMock(side_effect=RuntimeError("no phone"))
-        h.ha.set("climate.living_room_thermostat", "heat")
+        h.ha.set("climate.spare_thermostat", "heat")
         h.tick()
         h.run_tasks()
         self.assertTrue(any("push failed" in m for m in h.warnings()))
         self.assertEqual(h.app._alerts.active(), ["zone8_heat"])
 
     def test_event_driven_evaluations_do_not_feed_the_alerts(self):
-        h = Harness(self)
-        h.ha.set("climate.living_room_thermostat", "heat")
+        h = Harness(self, unmanaged={"living_monitor": "climate.spare_thermostat"})
+        h.ha.set("climate.spare_thermostat", "heat")
         h.app._evaluate_pending({})
         self.assertEqual(h.log_lines("alert"), [])
         h.tick()
@@ -2955,7 +3137,7 @@ class SeasonHarness:
 
     def cold(self, h, family=20.8, claudia=20.9, kristine=None):
         """The air of the advised zones; the family room is its three rooms at one temperature."""
-        for feel in FEELS["family"]:
+        for feel in FEELS["living"] + FEELS["family"]:
             h.ha.set(feel, str(family), self.COLD)
         h.ha.set("sensor.claudias_room_feel", str(claudia), self.COLD)
         if kristine is not None:
@@ -3073,7 +3255,7 @@ class SeasonStartEndToEnd(SeasonHarness, unittest.TestCase):
 
     def test_only_the_rooms_that_failed_are_named_and_an_aired_room_is_not_a_cold_one(self):
         h = self.cold_house()
-        h.ha.set("binary_sensor.living_room_window_contact", "on")
+        h.ha.set("binary_sensor.kitchen_window_contact", "on")
         self.morning(h)
         self.assertEqual(
             self.pushes(h),
@@ -3092,7 +3274,7 @@ class SeasonStartEndToEnd(SeasonHarness, unittest.TestCase):
         h = self.harness()
         self.forecast(h)
         self.before(h, family=20.6)
-        for feel, value in zip(FEELS["family"], ("20.6", "20.6", "22.4")):
+        for feel, value in zip(h.app.cfg.season_advisor.rooms["family"], ("20.6", "20.6", "22.4")):
             h.ha.set(feel, value, self.COLD)  # a warm kitchen: the joined room is 21.2 in all
         self.morning(h)
         self.assertEqual(self.pushes(h), [])
@@ -3102,7 +3284,7 @@ class SeasonStartEndToEnd(SeasonHarness, unittest.TestCase):
         h = self.harness()
         self.forecast(h)
         self.before(h, family=20.6)
-        for feel, value in zip(FEELS["family"], ("20.6", "20.6", "22.4")):
+        for feel, value in zip(h.app.cfg.season_advisor.rooms["family"], ("20.6", "20.6", "22.4")):
             h.ha.set(feel, value, dict(self.COLD, stale="true") if "kitchen" in feel else self.COLD)
         self.morning(h)
         (push,) = self.pushes(h)
@@ -3182,19 +3364,19 @@ class SeasonStartEndToEnd(SeasonHarness, unittest.TestCase):
 
     def test_only_room_sensors_that_read_count(self):
         h = self.cold_house()
-        for feel in FEELS["family"] + FEELS["claudias_room"]:
+        for feel in FEELS["living"] + FEELS["family"] + FEELS["claudias_room"]:
             h.ha.set(feel, "20.8", {"stale": "true"})
         self.morning(h)
         self.assertNotIn("2026-10-19", h.app._advisor.snapshot()["mornings"].get("family", {}))
         self.assertEqual(self.pushes(h), [])
-        for feel in FEELS["family"] + FEELS["claudias_room"]:
+        for feel in FEELS["living"] + FEELS["family"] + FEELS["claudias_room"]:
             h.ha.set(feel, "unavailable")
         self.morning(h, start=(5, 0))
         self.assertNotIn("2026-10-19", h.app._advisor.snapshot()["mornings"].get("family", {}))
 
     def test_an_impossible_room_reading_is_not_a_sample(self):
         h = self.cold_house()
-        for feel in FEELS["family"]:
+        for feel in h.app.cfg.season_advisor.rooms["family"]:
             h.ha.set(feel, "0.0", self.COLD)
         self.morning(h)
         self.assertNotIn("2026-10-19", h.app._advisor.snapshot()["mornings"].get("family", {}))

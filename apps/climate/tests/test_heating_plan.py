@@ -277,6 +277,25 @@ class ConfigParsing(unittest.TestCase):
     def weather_offset_of(self, raw):
         return hp.parse_config(self._broken(weather_offset=raw)).zones["family"].weather_offset
 
+    def test_floor_max_is_optional_and_may_exceed_the_upper_setpoint_limit(self):
+        self.assertIsNone(CFG.zones["family"].floor_max_c)
+        for value in (19.1, 24, 26.0):
+            with self.subTest(value=value):
+                zc = hp.parse_config(self._broken(floor_max_c=value)).zones["family"]
+                self.assertEqual(zc.floor_max_c, value)
+                self.assertIsInstance(zc.floor_max_c, float)
+
+    def test_invalid_floor_limits_are_refused(self):
+        invalid = (
+            19.0, 18.0, True, False, "26.0", "bad", [], {},
+            float("nan"), float("inf"), -float("inf"),
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaisesRegex(
+                hp.ConfigError, "zone family: floor_max_c"
+            ):
+                hp.parse_config(self._broken(floor_max_c=value))
+
     def test_the_weather_offset_is_off_unless_a_zone_gives_one(self):
         self.assertEqual(hp.WeatherOffsetConfig(), hp.WeatherOffsetConfig(False, 0.85, 0.22, 1.5))
         self.assertEqual(CFG.zones["kristines_room"].weather_offset, hp.WeatherOffsetConfig())
@@ -590,14 +609,15 @@ class SetpointByTime(unittest.TestCase):
 
 
 class ModePrecedence(unittest.TestCase):
-    """window > settle > party > guard > sun_cut > fallback > hold, behind the season gate."""
+    """window > settle > party > floor_cap > guard > sun_cut > fallback > hold."""
 
-    zone = replace(CFG.zones["family"], guard=hp.GuardConfig(True, "lower_limit"))
+    zone = replace(CFG.zones["family"], guard=hp.GuardConfig(True, "lower_limit"), floor_max_c=26.0)
 
     def mode_of(self, **kw):
         base = dict(
             fallback=True,
             hold_back=True,
+            floor_cap=True,
             party_windows=((T(8), T(18)),),
             cut_windows=((T(1), T(14), "2026-10-17"),),
         )
@@ -609,11 +629,20 @@ class ModePrecedence(unittest.TestCase):
         self.assertEqual(self.mode_of(window_state=hp.STATE_OPEN), "window")
         self.assertEqual(self.mode_of(window_state=hp.STATE_SETTLE), "settle")
         self.assertEqual(self.mode_of(), "party")
-        self.assertEqual(self.mode_of(party_windows=()), "guard")
-        self.assertEqual(self.mode_of(party_windows=(), hold_back=False), "fallback")
-        self.assertEqual(self.mode_of(party_windows=(), hold_back=False, fallback=False), "sun_cut")
+        self.assertEqual(self.mode_of(party_windows=()), "floor_cap")
+        self.assertEqual(self.mode_of(party_windows=(), floor_cap=False), "guard")
         self.assertEqual(
-            self.mode_of(party_windows=(), hold_back=False, fallback=False, cut_windows=()), "hold"
+            self.mode_of(party_windows=(), floor_cap=False, hold_back=False), "fallback"
+        )
+        self.assertEqual(
+            self.mode_of(party_windows=(), floor_cap=False, hold_back=False, fallback=False),
+            "sun_cut",
+        )
+        self.assertEqual(
+            self.mode_of(
+                party_windows=(), floor_cap=False, hold_back=False, fallback=False, cut_windows=()
+            ),
+            "hold",
         )
 
     def test_fallback_suppresses_cuts_but_not_window_or_party(self):
@@ -688,6 +717,44 @@ class ModePrecedence(unittest.TestCase):
 
     def test_window_in_the_bathroom_beats_the_hold_back_and_the_morning(self):
         self.assertEqual(plan_at(T(7), "bathroom", window_state="open").mode, "window")
+
+
+class FloorCap(unittest.TestCase):
+    zone = replace(CFG.zones["family"], floor_max_c=26.0)
+
+    def test_enters_at_the_maximum_and_releases_strictly_below_half_a_degree_less(self):
+        active = False
+        readings = (
+            (25.9, False), (26.0, True), (26.5, True), (25.9, True),
+            (25.5, True), (25.49, False), (25.9, False),
+        )
+        for floor, expected in readings:
+            with self.subTest(floor=floor, active=active):
+                active = hp.evaluate_floor_cap(self.zone.floor_max_c, floor, active)
+                self.assertEqual(active, expected)
+                result = hp.plan(self.zone, inputs(floor_cap=active), T(12), TZ)
+                self.assertEqual(result.plan_mode, "floor_cap" if expected else "hold")
+
+    def test_missing_floor_preserves_the_latch_and_unconfigured_limit_clears_it(self):
+        self.assertFalse(hp.evaluate_floor_cap(26.0, None, False))
+        self.assertTrue(hp.evaluate_floor_cap(26.0, None, True))
+        self.assertFalse(hp.evaluate_floor_cap(None, 30.0, True))
+        self.assertEqual(plan_at(T(12), floor_cap=True).plan_mode, "hold")
+
+    def test_floor_cap_stays_at_the_lower_limit_despite_trim_weather_or_sun_cut(self):
+        for extra in ({}, {"cut_windows": ((T(1), T(14), "2026-10-17"),)}):
+            with self.subTest(extra=extra):
+                result = hp.plan(
+                    self.zone,
+                    inputs(floor_cap=True, trim=1.5, day_duty=(("2026-10-17", 1.0),), **extra),
+                    T(12),
+                    TZ,
+                )
+                self.assertEqual(
+                    (result.mode, result.aim, result.raw, result.setpoint, result.weather_offset),
+                    ("floor_cap", None, 19.0, 19.0, 0.0),
+                )
+                self.assertIn("until the floor is below 25.5", result.reasons[0])
 
 
 class BudgetAndCut(unittest.TestCase):

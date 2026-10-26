@@ -62,11 +62,12 @@ class OpeningReminder(unittest.TestCase):
         self.assertEqual(delay, 15 * 60)
         callback(kwargs)
 
-    def test_door_matches_the_shared_family_zone_and_living_room_feel(self):
+    def test_door_matches_the_living_zone_and_living_room_feel(self):
         controller = yaml.safe_load((APPS / "heating_controller.yaml").read_text())["HeatingController"]
-        family = controller["zones"]["family"]
-        self.assertIn(DOOR, family["openings"])
-        self.assertEqual(family["thermostat"], "climate.family_room_thermostat")
+        zone = controller["zones"]["living"]
+        self.assertIn(DOOR, zone["openings"])
+        self.assertNotIn(DOOR, controller["zones"]["family"]["openings"])
+        self.assertEqual(zone["thermostat"], "climate.living_room_thermostat")
         feel = next(iter(yaml.safe_load((APPS / "room_feel.yaml").read_text()).values()))
         living = feel["rooms"]["living_room"]
         self.assertIn(DOOR, [c if isinstance(c, str) else c["entity"] for c in living["window_contacts"]])

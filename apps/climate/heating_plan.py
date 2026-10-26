@@ -19,8 +19,8 @@ Terms used throughout:
   - protected minimum: the air temperature a sun cut still defends.
 
 Mode precedence, first match wins (see plan()): off_season / device_offline, window, settle,
-party, guard, sun_cut, fallback, hold. The plan is always computed, also when the first row
-gates the zone, so the log shows what would have been planned. `guard` is the bedroom loop
+party, floor_cap, guard, sun_cut, fallback, hold. The plan is always computed, also when the
+first row gates the zone, so the log shows what would have been planned. `guard` is the bedroom loop
 holding the bathroom back (BedroomLoop).
 
 Timestamps are epoch seconds. Local clock times come from the tzinfo passed in.
@@ -40,6 +40,7 @@ MODE_DEVICE_OFFLINE = "device_offline"
 MODE_WINDOW = "window"
 MODE_SETTLE = "settle"
 MODE_PARTY = "party"
+MODE_FLOOR_CAP = "floor_cap"
 MODE_GUARD = "guard"
 MODE_SUN_CUT = "sun_cut"
 MODE_FALLBACK = "fallback"
@@ -220,6 +221,7 @@ class ZoneConfig:
     buttons: dict
     evenness_floors: tuple = ()  # (reference, compared): the alert watches compared minus reference
     weather_offset: WeatherOffsetConfig = WeatherOffsetConfig()
+    floor_max_c: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -464,6 +466,16 @@ def _parse_zone(name: str, raw: dict) -> ZoneConfig:
     )
     if not lower < upper:
         raise ConfigError(f"{where}: lower limit must be below the upper limit")
+    floor_max = raw.get("floor_max_c")
+    if floor_max is not None:
+        if (
+            isinstance(floor_max, bool)
+            or not isinstance(floor_max, (int, float))
+            or not math.isfinite(floor_max)
+            or floor_max <= lower
+        ):
+            raise ConfigError(f"{where}: floor_max_c must be a finite number above lower_limit_c")
+        floor_max = float(floor_max)
     pm_abs, pm_off = raw.get("protected_min_c"), raw.get("protected_min_offset_c")
     if pm_abs is not None and pm_off is not None:
         raise ConfigError(f"{where}: give protected_min_c or protected_min_offset_c, not both")
@@ -509,6 +521,7 @@ def _parse_zone(name: str, raw: dict) -> ZoneConfig:
         buttons=buttons,
         evenness_floors=evenness,
         weather_offset=_parse_weather_offset(raw.get("weather_offset"), budget, where),
+        floor_max_c=floor_max,
     )
 
 
@@ -1147,6 +1160,16 @@ class WindowTracker:
 # ---------------------------------------------------------------- planning
 
 
+def evaluate_floor_cap(
+    maximum: Optional[float], floor: Optional[float], active: bool = False
+) -> bool:
+    if maximum is None:
+        return False
+    if floor is None:
+        return active
+    return floor >= maximum - (0.5 if active else 0.0)
+
+
 @dataclass(frozen=True)
 class ZoneInputs:
     season_on: bool
@@ -1163,6 +1186,7 @@ class ZoneInputs:
     cut_windows: tuple = ()
     last_planned: Optional[float] = None
     day_duty: tuple = ()
+    floor_cap: bool = False
 
 
 @dataclass(frozen=True)
@@ -1208,6 +1232,12 @@ def plan(zc: ZoneConfig, inp: ZoneInputs, now_ts: float, tz) -> Plan:
         plan_mode, aim = MODE_PARTY, None
         end = max(e for s, e in inp.party_windows if s <= now_ts < e)
         reasons.append(f"Party: held at the lower limit until {hhmm(end, tz)}")
+    elif inp.floor_cap and zc.floor_max_c is not None:
+        plan_mode, aim = MODE_FLOOR_CAP, None
+        reasons.append(
+            f"Floor temperature limit {zc.floor_max_c:.1f}: held at the lower limit "
+            f"until the floor is below {zc.floor_max_c - 0.5:.1f}"
+        )
     elif guard_now:
         cap = lower if guard.cap == "lower_limit" else pmin
         plan_mode, aim = MODE_GUARD, min(t_lead, cap)

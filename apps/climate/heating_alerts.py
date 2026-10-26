@@ -9,8 +9,8 @@ after the condition has cleared. The cold, pump and floor alerts, which one faul
 together, also share a limit of one push per zone every repeat_hours.
 
   cold:<zone>      the control air has stayed under cold_c for cold_minutes, with the zone
-                   wanting more than cold_c, its thermostat not off, and no opening, party or
-                   bedroom hold-back explaining it
+                   wanting more than cold_c, its thermostat not off, and no opening, party,
+                   floor cap or bedroom hold-back explaining it
   no_pump:<zone>   the zone has called for calling_hours without a break, and the relay drew no
                    more than no_pump_w for 90% of those hours
   floor:<zone>     the zone's floor rose by less than floor_rise_min_c between one hour and
@@ -51,7 +51,9 @@ EVENNESS_FROM_HOUR = 2
 EVENNESS_TO_HOUR = 6
 EVENNESS_MIN_S = 7200.0
 NIGHTS_KEPT = 14
-COLD_EXEMPT_MODES = (hp.MODE_WINDOW, hp.MODE_SETTLE, hp.MODE_PARTY, hp.MODE_GUARD)
+COLD_EXEMPT_MODES = (
+    hp.MODE_WINDOW, hp.MODE_SETTLE, hp.MODE_PARTY, hp.MODE_FLOOR_CAP, hp.MODE_GUARD
+)
 
 EVENT_START = "start"
 EVENT_SUPPRESSED = "suppressed"

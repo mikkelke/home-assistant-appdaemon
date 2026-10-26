@@ -136,7 +136,9 @@ class ColdRoom(unittest.TestCase):
         )
 
     def test_a_deliberate_coast_is_not_a_cold_room(self):
-        for mode in (hp.MODE_WINDOW, hp.MODE_SETTLE, hp.MODE_PARTY, hp.MODE_GUARD):
+        for mode in (
+            hp.MODE_WINDOW, hp.MODE_SETTLE, hp.MODE_PARTY, hp.MODE_FLOOR_CAP, hp.MODE_GUARD
+        ):
             r = Run()
             self.assertEqual(r.ticks(12, [zobs(air=18.0, plan_mode=mode)]), [], mode)
 

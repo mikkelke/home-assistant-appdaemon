@@ -68,6 +68,7 @@ TICK_SECONDS = 300
 DECISION_REPEAT_S = 1800.0
 MAX_TICK_GAP_S = 900.0
 FLOOR_FRESH_MIN = 60.0
+FLOOR_CAP_FRESH_MIN = 1440.0
 OUTDOOR_FRESH_MIN = 20.0
 NO_SETPOINT_CHANGE_S = 7200.0
 DAILY_KEEP = 60
@@ -143,6 +144,7 @@ class ZoneRuntime:
             if isinstance(snap, dict)
         }
         self.cut_day = saved.get("cut_day") if isinstance(saved.get("cut_day"), str) else None
+        self.floor_cap = saved.get("floor_cap") is True
         daily = saved.get("daily")
         self.daily = list(daily)[-DAILY_KEEP:] if isinstance(daily, list) else []
         self.yesterday = (
@@ -179,6 +181,7 @@ class ZoneRuntime:
             "blocks": self.blocks.snapshot(),
             "days": {d: acc.snapshot() for d, acc in self.days.items()},
             "cut_day": self.cut_day,
+            "floor_cap": self.floor_cap,
             "daily": self.daily[-DAILY_KEEP:],
             "yesterday": self.yesterday,
         }
@@ -1030,6 +1033,7 @@ class HeatingController(hass.Hass):
             "therm_state_updated_ts": snap["ts"] if snap else None,
             "therm_usable": therm_usable,
             "floor_temp": floor_temp,
+            "floor_fresh": floor_pair is not None and floor_age <= FLOOR_CAP_FRESH_MIN,
             "air": air,
             "air_source": source,
             "air_fresh": source in ("feel", "thermostat")
@@ -1074,6 +1078,11 @@ class HeatingController(hass.Hass):
 
         party = ctx["party"]
         party_windows = party.windows if (cfg.party and cfg.party.zone == zone) else ()
+        rt.floor_cap = hp.evaluate_floor_cap(
+            zc.floor_max_c,
+            reading["floor_temp"] if reading["floor_fresh"] else None,
+            rt.floor_cap,
+        )
         inp = hp.ZoneInputs(
             season_on=ctx["season_on"],
             online=reading["online"],
@@ -1088,6 +1097,7 @@ class HeatingController(hass.Hass):
             hold_back=self._loop.hold and zc.guard.enabled,
             cut_windows=cut.windows,
             last_planned=rt.last_planned,
+            floor_cap=rt.floor_cap and reading["floor_fresh"],
             day_duty=(
                 tuple((b.day.isoformat(), b.u_eq) for b in budgets if b.u_eq is not None)
                 if (zc.weather_offset.enabled and ctx["forecast_ok"])
@@ -1705,6 +1715,7 @@ class HeatingController(hass.Hass):
             "lower_limit": lower,
             "upper_limit": upper,
             "protected_min": plan.protected_min,
+            "floor_max_c": zc.floor_max_c,
             "control_air": None if reading["air"] is None else round(reading["air"], 1),
             "control_air_source": reading["air_source"],
             "thermostat_temp": reading["therm_temp"],
