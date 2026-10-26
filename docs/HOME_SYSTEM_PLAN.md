@@ -98,6 +98,15 @@ the helper definitions in automations, scripts, scenes, helpers or dashboards; r
 not partial. This does not cover Node-RED or configuration outside those search surfaces.
 Source audit found no current lighting path using the mislabel as proof of vacancy.
 
+Deployed on 26.10 at 22:09 Copenhagen time from `33f767b`, after the full 18-domain
+suite completed successfully (5,797 tests). The committed deployment script verified all
+429 tracked app files. DarknessCalculator, FamilyRoomLights, bathroom_lights and
+bedroom_lights each initialized afresh. All 11 room publications advanced their timestamps
+on the next ordinary heartbeat, including persistent `occupied="false"` attributes.
+All 29 light entities retained state and last-change timestamps through deployment and
+observation; the main, error and four affected app logs contained no new errors. No total
+sensor outage was induced: unknown behavior remains demonstrated by tests, not live outage.
+
 ## Outcome and constraints
 
 A new agent should be able to trace a resident's need across sensors, interpretation,
