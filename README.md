@@ -15,7 +15,7 @@ consumers, uncertainty rules, resident outcomes and tests.
 
 - `apps/<domain>/` — one directory per domain (lights, sonos, climate, appliances, tv,
   weather, transit, intercom, blinds, rober2, rutines, notify), each app as
-  `<name>.py` + `<name>.yaml` (AppDaemon auto-reloads on change).
+  `<name>.py` + `<name>.yaml` (reloaded explicitly by the deploy script).
 - `apps/lights/darkness_calculator.*` — the per-room dark/bright brain every lights app
   consumes (semantic middle layer: published `binary_sensor.dark_*` / `sensor.room_state_*`
   with `reason` attributes).
@@ -30,18 +30,52 @@ consumers, uncertainty rules, resident outcomes and tests.
 
 ## Deploy workflow
 
-Edit locally → `scripts/deploy.sh` → the script py-compiles everything, runs the
-unit tests (`apps/*/tests/`, stdlib `unittest`), rsyncs **only git-tracked files**
-(runtime state on the box is never touched), then watches the AppDaemon log to
-confirm the app actually re-initialized.
+Run `bash scripts/deploy.sh` from the checkout to deploy. It compiles Python,
+runs the app and deploy unit tests, checks speaker and log-stream declarations,
+then rsyncs **only git-tracked files under `apps/`**. It uses checksums without
+copying timestamps, so unchanged files are untouched. Runtime files and private
+box-only apps are preserved; removing a file from git does not delete it on the box.
 
-Note: AppDaemon only restarts an app when its **parsed yaml args** change — comment-only
-yaml edits do not trigger a reload; the deploy script warns when no reload is observed.
+The box's private `appdaemon.yaml` must set `appdaemon.production_mode: true` and
+`appdaemon.exclude_dirs: [tests]`. Native production mode skips periodic source
+scans; startup and Home Assistant reconnect scans still run. Activate production
+mode explicitly before using this deploy flow. After acquiring the deploy lock,
+the helper enforces this configured mode through AppDaemon's native service
+before allowing transfer. A refused or unreachable service fails the deploy
+before transfer. The helper never changes the private configuration file.
 
-Note: the box `appdaemon.yaml` must carry `exclude_dirs: [tests]` — AppDaemon imports
-every `.py` under the apps tree, and a failing import of a test module can abort
-loading of *other* new apps (bit us 2026-07-12: `apps/security/` never started until
-the tests dirs were excluded).
+`scripts/appdaemon_deploy.py` runs inside the existing AppDaemon container. It
+holds a deploy lock across transfer and verification, records pending work under
+`/data/appdaemon/.deploy/` (outside the synced apps), and checks every transferred
+file against an immutable SHA256 manifest **before** sending `SIGUSR2` to PID 1.
+It resolves affected apps using the installed AppDaemon config/import loaders,
+including module importers, shared-module instances and app dependencies. It
+subscribes to authenticated `app_initialized` events before the signal and
+requires a fresh successful completion event and `idle` state for every affected
+app. An initialization-start log or unrelated app reload cannot pass this check.
+It also checks fresh bytes in the configured file-backed `error_log`: AppDaemon
+can otherwise initialize successfully with stale arguments after skipping a bad
+YAML file. Private error contents stay on the box. Existing errors in unrelated
+apps are reported without failing this deploy.
+
+Failed transfer, content verification, initialization, or timeout leaves the
+journal pending. Rerun the same command after correcting the failure: pending
+apps are rechecked even when rsync has no new bytes to send. YAML argument
+changes invalidate only their consumer modules (plus dependencies), including
+key removals that AppDaemon 4.5.13 otherwise misses. Documentation, tests and
+YAML comment-only edits need no app reload. An unreferenced Python helper is
+byte-verified without claiming that a scan completed.
+
+AppDaemon 4.5.13 cannot reliably apply new dictionary-valued config keys, app
+removal/disable, or changes to global-module/sequence definitions through this
+verified path. These changes fail explicitly and retain pending work for a
+controlled restart and independent verification; the script never restarts the
+container automatically. A new app subdirectory may also need a restart to
+establish its Python import path. After an independently verified restart,
+archive the pending journal before starting a fresh deploy transaction.
+
+Run the deploy unit tests without contacting the box:
+`python3 -m unittest discover -s scripts/tests -p test_appdaemon_deploy.py -q`.
 
 ## Private archives
 
