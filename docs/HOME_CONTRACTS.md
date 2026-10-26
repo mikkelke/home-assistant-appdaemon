@@ -105,8 +105,9 @@ a resident's confirmation and a successful physical action.
 - **Interfaces/consumers:** `sensor.<room>_feel`, `sensor.sleep_plan` and bedroom comfort feed
   dashboard [room stories](../../home-assistant-hakit-dashboard/src/utils/roomClimateStory.ts),
   wake/blind decisions and notifications. Do not derive competing comfort physics in a card.
-- **Modes:** [HeatingController](../apps/climate/heating_controller.py) is shadow planning;
-  planned setpoints are not thermostat writes. An open window can require a human reminder.
+- **Modes:** [HeatingController](../apps/climate/heating_controller.py) writes thermostat
+  setpoints only for configured `live_zones` while its live switch is on; other zones stay
+  in shadow. Each zone publishes its live status. An open window lowers a live zone's setpoint.
   Source freshness and excluded sensors belong to the interpretation, not just the temperature.
 - **Proof:** [RoomFeel](../apps/climate/tests/test_room_feel.py),
   [cooling](../apps/climate/tests/test_smart_cooling.py) and relevant wake tests.

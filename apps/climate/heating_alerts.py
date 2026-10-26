@@ -24,6 +24,8 @@ together, also share a limit of one push per zone every repeat_hours.
   fallback:<zone>  the zone has had no usable control air for three hours and runs on its
                    constant target
   forecast_stale   the forecast is unusable
+  write:<zone>     two consecutive thermostat writes were not confirmed; a confirmed write
+                   clears the episode
   zone8_heat       the living-room monitor thermostat is in heat, which runs the pump for a zone
                    with no actuator
 
@@ -225,6 +227,16 @@ class Alerts:
 
     def active(self) -> list:
         return sorted(self._episodes)
+
+    def write_result(self, zone: str, failures: int, now_ts: float) -> list:
+        return self._episode(
+            f"write:{zone}",
+            zone,
+            failures >= 2,
+            now_ts,
+            "Heating: thermostat write failed",
+            f"{_name(zone)} has not confirmed two consecutive heating writes",
+        )
 
     def update(self, house: HouseObs, zones: list) -> list:
         """Feed one tick. Returns the events of this tick: starts to push, suppressed starts and

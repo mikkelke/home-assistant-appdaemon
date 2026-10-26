@@ -318,16 +318,22 @@ class Attribution(unittest.TestCase):
         a = self.who(setpoint(22.0, ts=T0 + 601), own=own)
         self.assertEqual(a.source, sig.SRC_KEYPAD)
 
+    def test_the_controllers_own_call_never_explains_a_fall_back(self):
+        own = sig.OwnWrite(22.0, T0, prev_reported=21.5)
+        mine = call(T0, user="appdaemon", temperature=22.0)
+        a = self.who(setpoint(21.5, ts=T0 + 30, old=22.0), mine, own=own)
+        self.assertEqual(a.source, sig.SRC_REVERT)
+
     def test_a_report_that_falls_back_to_the_value_before_the_write_is_a_device_rejection(self):
         own = sig.OwnWrite(22.0, T0, prev_reported=21.0)
         self.assertEqual(
             self.who(setpoint(21.0, ts=T0 + 120, old=22.0), own=own).source, sig.SRC_REVERT
         )
         self.assertEqual(
-            self.who(setpoint(21.0, ts=T0 + 900, old=22.0), own=own).source, sig.SRC_REVERT
+            self.who(setpoint(21.0, ts=T0 + sig.DEVICE_REVERT_S, old=22.0), own=own).source, sig.SRC_REVERT
         )
         self.assertEqual(
-            self.who(setpoint(21.0, ts=T0 + 901, old=22.0), own=own).source, sig.SRC_KEYPAD
+            self.who(setpoint(21.0, ts=T0 + sig.DEVICE_REVERT_S + 1, old=22.0), own=own).source, sig.SRC_KEYPAD
         )
 
     def test_another_value_after_an_own_write_is_somebody_elses(self):
@@ -337,10 +343,73 @@ class Attribution(unittest.TestCase):
         )
         self.assertEqual((a.source, a.who), (sig.SRC_HA, "mikkel"))
 
+    def test_an_explicit_call_to_the_prewrite_value_is_not_a_device_rejection(self):
+        own = sig.OwnWrite(22.0, T0, prev_reported=21.0)
+        attr = self.who(
+            setpoint(21.0, ts=T0 + 30, old=22.0),
+            call(T0 + 20, user=MIKKEL, temperature=21.0),
+            own=own,
+        )
+        self.assertEqual((attr.source, attr.who), (sig.SRC_HA, "mikkel"))
+
     def test_a_write_by_the_controller_does_not_hide_a_mode_change(self):
         own = sig.OwnWrite(22.0, T0, prev_reported=21.0)
         change = sig.Change(sig.KIND_MODE, "heat", "off", T0 + 5)
         self.assertEqual(self.who(change, own=own).source, sig.SRC_KEYPAD)
+
+    def test_the_mode_written_by_the_controller_is_an_own_echo(self):
+        own = sig.OwnWrite(22.0, T0, prev_reported=21.0, mode="heat")
+        for age in (0, 8, sig.OWN_WRITE_S):
+            with self.subTest(age=age):
+                change = sig.Change(sig.KIND_MODE, "off", "heat", T0 + age)
+                self.assertEqual(self.who(change, own=own).source, sig.SRC_OWN)
+        change = sig.Change(sig.KIND_MODE, "off", "heat", T0 + sig.OWN_WRITE_S + 1)
+        self.assertEqual(self.who(change, own=own).source, sig.SRC_KEYPAD)
+        change = sig.Change(sig.KIND_MODE, "heat", "off", T0 + 8)
+        self.assertEqual(self.who(change, own=own).source, sig.SRC_KEYPAD)
+
+    def test_a_mode_falling_back_to_the_previous_mode_is_a_device_rejection(self):
+        own = sig.OwnWrite(22.0, T0, prev_reported=21.0, mode="heat", prev_mode="off")
+        change = sig.Change(sig.KIND_MODE, "heat", "off", T0 + 8)
+        self.assertEqual(self.who(change, own=own).source, sig.SRC_REVERT)
+        explicit = call(T0 + 7, "set_hvac_mode", user=MIKKEL, hvac_mode="off")
+        attr = self.who(change, explicit, own=own)
+        self.assertEqual((attr.source, attr.who), (sig.SRC_HA, "mikkel"))
+        change = sig.Change(sig.KIND_MODE, "heat", "off", T0 + sig.DEVICE_REVERT_S + 1)
+        self.assertEqual(self.who(change, own=own).source, sig.SRC_KEYPAD)
+
+    def test_a_mode_only_write_can_echo_a_setpoint(self):
+        own = sig.OwnWrite(None, T0, prev_reported=21.0, mode="off")
+        for age in (8, sig.OWN_WRITE_S):
+            with self.subTest(age=age):
+                self.assertEqual(self.who(setpoint(5.0, ts=T0 + age), own=own).source, sig.SRC_OWN)
+        self.assertEqual(
+            self.who(setpoint(5.0, ts=T0 + sig.OWN_WRITE_S + 1), own=own).source, sig.SRC_KEYPAD
+        )
+
+    def test_salus_permanent_hold_after_a_mode_write_is_own(self):
+        own = sig.OwnWrite(22.0, T0, prev_reported=21.0, mode="heat")
+        change = sig.Change(sig.KIND_PRESET, "schedule", "permanent_hold", T0 + 8)
+        self.assertEqual(self.who(change, own=own).source, sig.SRC_OWN)
+        change = sig.Change(sig.KIND_PRESET, "schedule", "permanent_hold", T0 + sig.OWN_WRITE_S + 1)
+        self.assertEqual(self.who(change, own=own).source, sig.SRC_KEYPAD)
+
+    def test_a_setpoint_only_write_does_not_claim_a_preset_change(self):
+        own = sig.OwnWrite(22.0, T0, prev_reported=21.0)
+        change = sig.Change(sig.KIND_PRESET, "schedule", "permanent_hold", T0 + 8)
+        self.assertEqual(self.who(change, own=own).source, sig.SRC_KEYPAD)
+
+    def test_a_mode_write_does_not_claim_changes_before_it_was_sent(self):
+        own = sig.OwnWrite(None, T0, mode="off")
+        for kind, old, new in (
+            (sig.KIND_MODE, "heat", "off"),
+            (sig.KIND_SETPOINT, 22.0, 5.0),
+            (sig.KIND_PRESET, "schedule", "permanent_hold"),
+        ):
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    self.who(sig.Change(kind, old, new, T0 - 1), own=own).source, sig.SRC_KEYPAD
+                )
 
 
 class ChangeDirection(unittest.TestCase):

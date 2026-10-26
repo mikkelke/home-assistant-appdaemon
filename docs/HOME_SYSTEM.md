@@ -47,7 +47,7 @@ resident outcomes and tests for the first eight groups. Read it before changing 
 | [WeatherOpeningAlert](../apps/weather/weather_opening_alert.py) | `weather_opening_alert_*` entities | Opening-risk messages, pushes and dashboard alerts; [weather contract](../apps/weather/README.md). |
 | [HouseEvents](../apps/home_pulse/house_events.py) | `sensor.house_events`, `house_events_report` event | Explains meaningful cause/effect and reliable human attribution. |
 | [HouseUpcoming](../apps/home_pulse/house_upcoming.py) | `sensor.house_upcoming`, [row schema](../apps/home_pulse/upcoming_core.py) | Upcoming maintenance, train and rain needs; daily maintenance reminder from the same conditions. |
-| [HeatingController](../apps/climate/heating_controller.py) | `sensor.heating_zone_*`, `sensor.heating_controller` | **Shadow planning** and advice: planned setpoints are not thermostat writes. |
+| [HeatingController](../apps/climate/heating_controller.py) | `sensor.heating_zone_*`, `sensor.heating_controller` | Per-zone live control and shadow planning, plus advice. Writes require both configured `live_zones` and the live switch; sensors publish which zones are live. |
 
 These are entrypoints, not an exhaustive inventory. YAML determines entity mappings and enabled
 behavior; Python defaults and older comments can describe different assumptions.

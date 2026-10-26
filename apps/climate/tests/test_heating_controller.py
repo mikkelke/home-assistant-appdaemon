@@ -1,4 +1,4 @@
-# tests/test_heating_controller.py - HeatingController (shadow mode): wiring, publishing, the
+# tests/test_heating_controller.py - HeatingController: live writes, wiring, publishing, the
 # decision log, forecast handling, the plan end to end, the nudge buttons, helper and thermostat
 # signals, the alerts, the season advice and the state file. Same __new__ + monkeypatched-callables
 # harness as test_salus_health.py, with a small fake Home Assistant behind get_state. The planning
@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import copy
 import dataclasses
 import json
@@ -20,7 +21,7 @@ import types
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import yaml
@@ -158,6 +159,7 @@ class FakeHA:
 def house(ha: FakeHA):
     """A quiet October afternoon: season off, every sensor fresh, air 22.2, thermostats 22.8."""
     ha.set("input_boolean.heating_season", "off")
+    ha.set("input_boolean.heating_live", "off")
     ha.set("input_number.heating_bedroom_ceiling", "21.0")
     for zone, value in zip(ZONES, ("21.5", "21.5", "21.5", "21.5", "22.0", "20.0")):
         ha.set(f"input_number.heating_target_{zone}", value)
@@ -212,6 +214,7 @@ class Harness:
         self, testcase, args=None, clock=None, with_house=True, forecast=True, **overrides
     ):
         self.tmp = Path(tempfile.mkdtemp(prefix="heating-test-"))
+        self.testcase = testcase
         testcase.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         testcase.addCleanup(self._close_tasks)
         self.clock = clock or Clock()
@@ -228,6 +231,8 @@ class Harness:
         self.notifier.notify = AsyncMock()
         self.payload = copy.deepcopy(FIXTURE)
         self.fetch_error = None
+        self.calls: list = []
+        self.service_result = {"success": True}
 
         app = hc.HeatingController.__new__(hc.HeatingController)
         app.args = args if args is not None else {**shipped_args(self.tmp), **overrides}
@@ -246,9 +251,8 @@ class Harness:
                 {"entity": entity, "state": state, "replace": replace, "attributes": attributes}
             )
         )
-        shadow = AssertionError("shadow mode must not call a service")
+        app.call_service = MagicMock(side_effect=self._call_service)
         for name in (
-            "call_service",
             "turn_on",
             "turn_off",
             "toggle",
@@ -256,7 +260,7 @@ class Harness:
             "set_value",
             "set_textvalue",
         ):
-            setattr(app, name, MagicMock(side_effect=shadow))
+            setattr(app, name, MagicMock(side_effect=AssertionError("unexpected service helper")))
         app._http_get_json = self._http
         self.app = app
         app.initialize()
@@ -273,6 +277,27 @@ class Harness:
         if self.fetch_error:
             raise self.fetch_error
         return copy.deepcopy(self.payload)
+
+    def _call_service(self, service, **data):
+        self.calls.append({"service": service, **data})
+        return copy.deepcopy(self.service_result)
+
+    def echo(self, index=-1, **attrs):
+        """Apply a recorded climate call and deliver the device's state callback."""
+        call = self.calls[index]
+        zone = next(name for name, entity in THERMOSTATS.items() if entity == call["entity_id"])
+        if "temperature" in call:
+            attrs = {"temperature": call["temperature"], **attrs}
+        self.report(zone, state=call.get("hvac_mode"), **attrs)
+
+    def restart(self):
+        self.app.terminate()
+        restarted = Harness(
+            self.testcase, args=self.app.args, clock=self.clock, with_house=False, forecast=False
+        )
+        restarted.ha.entities = copy.deepcopy(self.ha.entities)
+        restarted.fetch()
+        return restarted
 
     def fetch(self):
         self.app._fetch_forecast({})
@@ -299,7 +324,7 @@ class Harness:
         return self.zone(name)["attributes"]
 
     def log_lines(self, kind=None):
-        files = sorted((self.tmp / "heating_log").glob("decisions-*.jsonl"))
+        files = sorted(Path(self.app.args["log_dir"]).glob("decisions-*.jsonl"))
         out = []
         for f in files:
             out += [json.loads(line) for line in f.read_text().splitlines()]
@@ -527,21 +552,41 @@ class ShippedYaml(unittest.TestCase):
         self.assertNotRegex(text, r"(?i)latitude|longitude|password|secret|api[_-]?key")
 
 
-class ShadowOnly(unittest.TestCase):
-    def test_the_module_has_no_call_to_any_service(self):
-        source = (APPS / "heating_controller.py").read_text()
-        for needle in (
-            "call_service",
-            ".turn_on(",
-            ".turn_off(",
-            ".toggle(",
-            "select_option",
-            "set_value",
-            "set_temperature",
-            "set_hvac_mode",
-            "set_preset_mode",
-        ):
-            self.assertNotIn(needle, source, needle)
+class ServiceBoundary(unittest.TestCase):
+    def test_only_the_controller_calls_the_two_permitted_services(self):
+        services = set()
+        for name in ("controller", "plan", "signals", "alerts", "season"):
+            tree = ast.parse((APPS / f"heating_{name}.py").read_text())
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                    continue
+                self.assertNotIn(
+                    node.func.attr,
+                    ("turn_on", "turn_off", "toggle", "select_option", "set_value", "set_textvalue"),
+                    name,
+                )
+                if node.func.attr == "call_service":
+                    self.assertEqual(name, "controller")
+                    self.assertIsInstance(node.args[0], ast.Constant)
+                    services.add(node.args[0].value)
+        self.assertEqual(services, {"climate/set_temperature", "climate/set_hvac_mode"})
+
+    def test_the_rule_modules_have_no_io(self):
+        for name in ("plan", "signals", "alerts", "season"):
+            tree = ast.parse((APPS / f"heating_{name}.py").read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    modules = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    modules = [node.module or ""]
+                else:
+                    modules = []
+                for module in modules:
+                    self.assertNotIn(
+                        module.split(".")[0], ("appdaemon", "requests", "socket", "subprocess"), name
+                    )
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    self.assertNotIn(node.func.id, ("open", "print", "input"), name)
 
     def test_a_season_with_windows_a_party_and_a_hold_back_never_calls_one(self):
         h = Harness(self)
@@ -574,6 +619,7 @@ class Initialize(unittest.TestCase):
         h.app.run_daily.assert_called_once_with(h.app._daily_rollup, "03:00:00")
         events = [(c.args[0], c.args[1], c.kwargs) for c in h.app.listen_event.call_args_list]
         self.assertIn((h.app._on_plugin_started, "plugin_started", {}), events)
+        self.assertIn((h.app._on_plugin_stopped, "plugin_stopped", {}), events)
         self.assertIn((h.app._on_service_call, "call_service", {"domain": "climate"}), events)
         for button in BUTTONS.values():
             self.assertIn((h.app._on_button, "state_changed", {"entity_id": button}), events)
@@ -582,6 +628,7 @@ class Initialize(unittest.TestCase):
             owned,
             {
                 "input_boolean.heating_season",
+                "input_boolean.heating_live",
                 "input_number.heating_bedroom_ceiling",
                 "input_boolean.party",
                 "input_datetime.heating_party_start",
@@ -589,8 +636,8 @@ class Initialize(unittest.TestCase):
             }
             | {f"input_number.heating_target_{z}" for z in ZONES},
         )
-        self.assertEqual(len(events), 1 + 1 + len(BUTTONS) + len(owned))
-        self.assertTrue(any("shadow mode" in m for _lvl, m in h.logs))
+        self.assertEqual(len(events), 2 + 1 + len(BUTTONS) + len(owned))
+        self.assertTrue(any("live-enabled" in m and "zones" in m for _lvl, m in h.logs))
 
     def test_a_bad_config_logs_an_error_and_starts_nothing(self):
         args = shipped_args(Path("/tmp"))
@@ -605,6 +652,570 @@ class Initialize(unittest.TestCase):
         h.tick()
         for _lvl, msg in h.logs:
             msg.encode("ascii")
+
+
+class LiveWrites(unittest.TestCase):
+    def ready(self, mode="heat", **overrides):
+        h = Harness(self, **{"live_zones": ["living"], **overrides})
+        entity = THERMOSTATS["living"]
+        h.ha.set(entity, mode, {**h.ha.entities[entity]["attributes"], "preset_mode": "schedule"})
+        h.ha.set(h.app.cfg.live_switch_entity, "on")
+        h.season()
+        return h
+
+    def written(self, mode="heat", **overrides):
+        h = self.ready(mode, **overrides)
+        h.tick(minutes=10)
+        self.assertEqual(len(h.calls), 1)
+        return h
+
+    def confirmed(self, mode="heat", **overrides):
+        h = self.written(mode, **overrides)
+        h.clock.advance(seconds=5)
+        h.echo()
+        h.tick()
+        self.assertEqual(h.attrs("living")["last_write"]["result"], "confirmed")
+        return h
+
+    def timeout(self, h):
+        calls = [c for c in h.app.run_in.call_args_list if len(c.args) > 1 and c.args[1] == 180]
+        self.assertTrue(calls, "the write needs a 180 second read-back deadline")
+        timer = calls[-1]
+        h.clock.advance(seconds=180)
+        timer.args[0](timer.kwargs)
+
+    def test_only_living_ships_live_and_the_switch_is_watched(self):
+        h = Harness(self)
+        self.assertEqual(h.app.cfg.live_zones, ("living",))
+        watched = {c.args[1] for c in h.app.listen_state.call_args_list}
+        self.assertIn("input_boolean.heating_live", watched)
+        self.assertIn("input_boolean.heating_live", h.app._triggers)
+
+    def test_empty_live_zones_never_write_even_with_the_switch_on(self):
+        h = self.ready(live_zones=[])
+        h.tick(minutes=10)
+        self.assertEqual(h.calls, [])
+        self.assertEqual(h.last("sensor.heating_controller")["state"], "shadow")
+        self.assertEqual(h.last("sensor.heating_controller")["attributes"]["zones_live"], ["<none>"])
+
+    def test_off_unknown_unavailable_and_missing_switch_disable_writes(self):
+        for state in ("off", "unknown", "unavailable", None):
+            with self.subTest(state=state):
+                h = Harness(self, live_zones=["living"])
+                if state is None:
+                    h.ha.remove("input_boolean.heating_live")
+                else:
+                    h.ha.set("input_boolean.heating_live", state)
+                h.season()
+                h.tick(minutes=10)
+                self.assertEqual(h.calls, [])
+                self.assertEqual(h.attrs("living")["live"], "false")
+
+    def test_a_custom_live_switch_controls_the_writer(self):
+        h = self.written(live_switch_entity="input_boolean.heating_write")
+        self.assertIn("input_boolean.heating_write", h.app._watched)
+        self.assertEqual(h.calls[0]["entity_id"], THERMOSTATS["living"])
+
+    def test_going_live_turns_only_living_on_at_the_planned_setpoint(self):
+        h = self.written(mode="off")
+        self.assertEqual(
+            h.calls,
+            [{"service": "climate/set_temperature", "entity_id": THERMOSTATS["living"],
+              "temperature": 22.0, "hvac_mode": "heat"}],
+        )
+        self.assertEqual(h.attrs("living")["live"], "true")
+        self.assertTrue(all(h.attrs(z)["live"] == "false" for z in ZONES if z != "living"))
+        controller = h.last("sensor.heating_controller")
+        self.assertEqual(controller["state"], "live")
+        self.assertEqual(controller["attributes"]["zones_live"], ["living"])
+        self.assertEqual(int(controller["attributes"]["writes_today"]), 1)
+        self.assertIn("would_writes_today", controller["attributes"])
+        self.assertEqual(h.attrs("living")["thermostat_mode"], "off")
+        self.assertEqual(float(h.attrs("living")["thermostat_setpoint"]), 15.0)
+        self.assertEqual(h.attrs("living")["held_off"], "false")
+        self.assertEqual(h.attrs("living")["last_write"]["result"], "pending")
+        self.assertTrue(all("live" in r for r in h.log_lines("decision")))
+
+    def test_a_thermostat_already_in_heat_receives_no_mode_field(self):
+        h = self.written()
+        self.assertEqual(
+            h.calls[0],
+            {"service": "climate/set_temperature", "entity_id": THERMOSTATS["living"],
+             "temperature": 22.0},
+        )
+
+    def test_own_write_is_recorded_before_the_service_call(self):
+        h = self.ready(mode="off")
+        original = h.app.call_service.side_effect
+
+        def inspect(service, **data):
+            rt = h.app._zones["living"]
+            self.assertIsNotNone(rt.own_write)
+            self.assertEqual((rt.own_write.value, rt.own_write.mode), (data["temperature"], "heat"))
+            self.assertIs(rt.pending_write, rt.own_write)
+            return original(service, **data)
+
+        h.app.call_service.side_effect = inspect
+        h.tick(minutes=10)
+        self.assertEqual(len(h.calls), 1)
+
+    def test_echo_confirms_and_salus_preset_echo_is_not_a_restore(self):
+        h = self.confirmed(mode="off")
+        record = h.attrs("living")["last_write"]
+        self.assertEqual(record["setpoint"], 22.0)
+        self.assertEqual(record["mode"], "heat")
+        self.assertEqual(float(record["latency_s"]), 5.0)
+        self.assertIn("at", record)
+        self.assertIsNone(h.app._zones["living"].pending_write)
+        h.clock.advance(seconds=3)
+        h.report("living", preset_mode="permanent_hold")
+        self.assertNotIn("restore", h.effects("living"))
+        self.assertTrue(all(r["source"] == "own_write" for r in h.signals("living")))
+        h.tick(minutes=10)
+        self.assertEqual(len(h.calls), 1)
+        for published in h.published:
+            assert_publishable(self, published["attributes"])
+
+    def test_reported_state_controls_the_gate_even_when_last_planned_disagrees(self):
+        h = self.ready()
+        h.ha.update_attrs(THERMOSTATS["living"], temperature=22.0)
+        h.app._zones["living"].last_planned = 19.0
+        h.app._zones["living"].decision_key = None
+        h.tick(minutes=10)
+        self.assertEqual(h.calls, [])
+        self.assertEqual(
+            [r for r in h.log_lines("decision") if r["zone"] == "living"][-1]["gate"],
+            "unchanged",
+        )
+
+    def test_a_pending_write_prevents_a_second_send(self):
+        h = self.written()
+        for _ in range(2):
+            h.tick(seconds=60)
+        self.assertEqual(len(h.calls), 1)
+        self.assertIsNotNone(h.app._zones["living"].pending_write)
+        h.echo()
+        h.tick()
+        self.assertIsNone(h.app._zones["living"].pending_write)
+
+    def test_an_echo_after_the_deadline_cannot_confirm_even_if_the_timer_is_delayed(self):
+        h = self.written()
+        h.clock.advance(seconds=181)
+        h.echo()
+        self.assertEqual(h.app._zones["living"].last_write["result"], "timeout")
+        self.assertIsNone(h.app._zones["living"].pending_write)
+        day = h.app._zones["living"].days["2026-10-17"]
+        self.assertEqual((day.confirmed, day.failed), (0, 1))
+
+    def test_an_open_window_writes_the_lower_limit_as_soon_as_it_is_debounced(self):
+        h = self.confirmed()
+        h.ha.set("binary_sensor.living_room_window_contact", "on")
+        h.tick()
+        self.assertEqual(len(h.calls), 1)
+        h.tick(minutes=2)
+        self.assertEqual(len(h.calls), 2)
+        self.assertEqual(h.calls[-1]["service"], "climate/set_temperature")
+        self.assertEqual(h.calls[-1]["temperature"], 19.0)
+        self.assertNotIn("hvac_mode", h.calls[-1])
+        self.assertEqual(h.attrs("living")["mode"], "window")
+
+    def test_foreign_setpoint_changes_are_restored_after_ten_minutes(self):
+        for caller in (None, APP_ID, MIKKEL_ID):
+            with self.subTest(caller=caller):
+                h = self.confirmed()
+                h.clock.advance(seconds=1)
+                if caller is not None:
+                    h.service_call("living", "set_temperature", caller, temperature=20.0)
+                h.report("living", temperature=20.0)
+                changed_at = h.clock.now.timestamp()
+                self.assertEqual(h.effects("living")[-1], "restore")
+                self.assertEqual(h.app._zones["living"].desired_since, changed_at)
+                h.tick(minutes=9, seconds=59)
+                self.assertEqual(len(h.calls), 1)
+                h.tick(seconds=1)
+                self.assertEqual(len(h.calls), 2)
+                self.assertEqual(h.calls[-1]["temperature"], 22.0)
+                self.assertEqual(h.zone("living")["state"], 21.5)
+                self.assertEqual(h.app._zones["living"].nudge, 0.0)
+                self.assertEqual(h.ha.get_state("input_number.heating_target_living"), "21.5")
+
+    def test_foreign_mode_changes_restore_heat_after_ten_minutes(self):
+        for mode in ("off", "auto"):
+            with self.subTest(mode=mode):
+                h = self.confirmed()
+                h.clock.advance(seconds=1)
+                h.report("living", state=mode)
+                h.tick(minutes=9)
+                self.assertEqual(len(h.calls), 1)
+                h.tick(minutes=1)
+                self.assertEqual(len(h.calls), 2)
+                self.assertEqual(h.calls[-1]["hvac_mode"], "heat")
+                self.assertEqual(h.attrs("living")["held_off"], "false")
+
+    def test_the_owners_off_latch_survives_restart_until_the_mode_changes(self):
+        h = self.confirmed()
+        h.service_call("living", "set_hvac_mode", MIKKEL_ID, hvac_mode="off")
+        h.report("living", state="off")
+        h.tick()
+        self.assertEqual(h.attrs("living")["held_off"], "true")
+        restarted = h.restart()
+        restarted.tick()
+        restarted.tick(minutes=10)
+        self.assertEqual(restarted.calls, [])
+        self.assertEqual(restarted.attrs("living")["held_off"], "true")
+        restarted.report("living", state="heat", temperature=20.0)
+        restarted.tick()
+        self.assertEqual(restarted.attrs("living")["held_off"], "false")
+        restarted.tick(minutes=10)
+        self.assertEqual(restarted.calls[-1]["temperature"], 22.0)
+
+    def test_a_new_season_releases_the_owners_off_latch(self):
+        h = self.confirmed()
+        h.service_call("living", "set_hvac_mode", MIKKEL_ID, hvac_mode="off")
+        h.report("living", state="off")
+        h.ha.set("input_boolean.heating_season", "off")
+        h.tick()
+        h.ha.set("input_boolean.heating_season", "on")
+        h.tick()
+        self.assertEqual(h.attrs("living")["held_off"], "false")
+        h.tick(minutes=10)
+        self.assertEqual(h.calls[-1].get("hvac_mode"), "heat")
+
+    def test_no_echo_times_out_at_180_seconds_and_the_second_failure_alerts_once(self):
+        h = self.written()
+        self.timeout(h)
+        self.assertEqual(h.app._zones["living"].last_write["result"], "timeout")
+        h.tick()
+        self.assertEqual(len(h.calls), 2)
+        self.timeout(h)
+        h.tick()
+        self.assertEqual(len(h.calls), 2)
+        h.run_tasks()
+        self.assertEqual(h.notifier.notify.await_count, 1)
+        self.assertEqual(h.notifier.notify.await_args.kwargs["target"], "mikkel")
+        self.assertIn("write:living", h.last("sensor.heating_controller")["attributes"]["alerts_active"])
+        events = [r for r in h.log_lines("alert") if r["key"] == "write:living"]
+        self.assertEqual([r["event"] for r in events], ["start"])
+        h.tick(minutes=24)
+        self.assertEqual(len(h.calls), 3)
+        h.echo()
+        h.tick()
+        self.assertNotIn("write:living", h.last("sensor.heating_controller")["attributes"]["alerts_active"])
+        events = [r for r in h.log_lines("alert") if r["key"] == "write:living"]
+        self.assertEqual([r["event"] for r in events], ["start", "clear"])
+        self.assertGreaterEqual(len(h.log_lines("write")), 6)
+        self.assertGreaterEqual(len(h.warnings()), 2)
+
+    def test_service_results_without_success_true_are_immediate_failures(self):
+        for result in (None, {"success": False}, {}, {"success": 1}):
+            with self.subTest(result=result):
+                h = self.ready()
+                h.service_result = result
+                h.tick(minutes=10)
+                self.assertEqual(len(h.calls), 1)
+                self.assertIsNone(h.app._zones["living"].pending_write)
+                self.assertEqual(h.attrs("living")["last_write"]["result"], "failed")
+                self.assertTrue(any(level == "WARNING" for level, _ in h.logs))
+
+    def test_a_failed_service_result_overrides_a_synchronous_echo(self):
+        h = self.ready(mode="off")
+        original = h.app.call_service.side_effect
+
+        def echo_before_returning(service, **data):
+            original(service, **data)
+            h.echo()
+            return {"success": False}
+
+        h.app.call_service.side_effect = echo_before_returning
+        h.tick(minutes=10)
+        self.assertEqual(h.attrs("living")["last_write"]["result"], "failed")
+        day = h.app._zones["living"].days["2026-10-17"]
+        self.assertEqual((day.writes, day.confirmed, day.failed), (1, 0, 1))
+
+    def test_device_reversion_is_a_failed_write_and_converges_on_the_next_token(self):
+        h = self.confirmed()
+        h.clock.advance(seconds=5)
+        h.report("living", temperature=15.0)
+        h.tick()
+        self.assertEqual(h.app._zones["living"].days["2026-10-17"].failed, 1)
+        self.assertEqual(h.calls[-1]["temperature"], 22.0)
+        self.assertEqual(len(h.calls), 2)
+
+    def test_two_writes_that_echo_then_revert_raise_the_write_alert(self):
+        h = self.confirmed()
+        h.clock.advance(seconds=5)
+        h.report("living", temperature=15.0)
+        h.tick()
+        self.assertEqual(len(h.calls), 2)
+        h.clock.advance(seconds=5)
+        h.echo()
+        h.clock.advance(seconds=5)
+        h.report("living", temperature=15.0)
+        h.tick()
+        h.run_tasks()
+        self.assertEqual(h.notifier.notify.await_count, 1)
+        self.assertIn("write:living", h.last("sensor.heating_controller")["attributes"]["alerts_active"])
+        day = h.app._zones["living"].days["2026-10-17"]
+        self.assertEqual((day.writes, day.confirmed, day.failed), (2, 0, 2))
+
+    def test_a_confirmed_mode_that_reverts_is_failed_and_retried(self):
+        h = self.confirmed(mode="off")
+        h.clock.advance(seconds=5)
+        h.report("living", state="off")
+        self.assertEqual(h.app._zones["living"].last_write["result"], "reverted")
+        h.tick()
+        self.assertEqual(len(h.calls), 2)
+        self.assertEqual(h.calls[-1]["hvac_mode"], "heat")
+        self.assertEqual(h.app._zones["living"].days["2026-10-17"].failed, 1)
+
+    def test_the_owners_off_after_a_mode_write_is_held_and_not_a_failure(self):
+        h = self.confirmed(mode="off")
+        h.service_call("living", "set_hvac_mode", MIKKEL_ID, hvac_mode="off")
+        h.report("living", state="off")
+        h.tick(minutes=10)
+        self.assertEqual(len(h.calls), 1)
+        self.assertEqual(h.attrs("living")["held_off"], "true")
+        self.assertEqual(h.app._zones["living"].days["2026-10-17"].failed, 0)
+
+    def test_an_owner_change_to_the_prewrite_value_is_a_restore_not_a_device_reversion(self):
+        h = self.confirmed()
+        h.service_call("living", "set_temperature", MIKKEL_ID, temperature=15.0)
+        h.report("living", temperature=15.0)
+        self.assertEqual(h.signals("living")[-1]["source"], "ha")
+        self.assertEqual(h.effects("living")[-1], "restore")
+        h.tick(minutes=9, seconds=59)
+        self.assertEqual(len(h.calls), 1)
+        h.tick(seconds=1)
+        self.assertEqual(len(h.calls), 2)
+        self.assertEqual(h.app._zones["living"].days["2026-10-17"].failed, 0)
+
+    def test_the_kill_switch_stops_a_pending_retry_immediately(self):
+        h = self.written()
+        h.ha.set("input_boolean.heating_live", "off")
+        entity = "input_boolean.heating_live"
+        h.app._on_state(entity, "all", None, copy.deepcopy(h.ha.entities[entity]), {})
+        self.timeout(h)
+        h.app._evaluate_pending({})
+        h.tick(minutes=10)
+        self.assertEqual(len(h.calls), 1)
+        self.assertEqual(h.attrs("living")["live"], "false")
+        self.assertIsNone(h.app._zones["living"].pending_write)
+
+    def test_offline_drops_pending_and_recovery_reseeds_without_a_signal(self):
+        h = self.written()
+        h.report("living", state="unavailable")
+        h.tick()
+        self.assertEqual(h.attrs("living")["mode"], "device_offline")
+        self.assertIsNone(h.app._zones["living"].pending_write)
+        h.tick(minutes=5)
+        self.assertEqual(len(h.calls), 1)
+        h.report("living", state="heat", temperature=20.0)
+        self.assertEqual(h.signals("living"), [])
+        h.tick()
+        h.tick(minutes=10)
+        self.assertEqual(len(h.calls), 2)
+        self.assertEqual(h.calls[-1]["temperature"], 22.0)
+
+    def test_a_home_assistant_restart_blocks_writes_and_reseeds_the_first_report(self):
+        h = self.written()
+        h.app._on_plugin_stopped("plugin_stopped", {}, {})
+        self.assertEqual(h.attrs("living")["mode"], "device_offline")
+        self.assertIsNone(h.app._zones["living"].pending_write)
+        h.tick(minutes=5)
+        self.assertEqual(len(h.calls), 1)
+        h.ha.update_attrs(THERMOSTATS["living"], temperature=20.0)
+        h.app._on_plugin_started("plugin_started", {}, {})
+        h.report("living", temperature=20.0)
+        h.tick(minutes=10)
+        self.assertEqual(h.signals("living"), [])
+        self.assertEqual(len(h.calls), 2)
+        self.assertEqual(h.calls[-1]["temperature"], 22.0)
+
+    def test_season_off_is_sent_once_and_remains_sent_across_restart(self):
+        h = self.confirmed()
+        h.ha.set("input_boolean.heating_season", "off")
+        h.tick()
+        self.assertEqual(h.calls[-1], {
+            "service": "climate/set_hvac_mode", "entity_id": THERMOSTATS["living"],
+            "hvac_mode": "off",
+        })
+        self.assertEqual(len(h.calls), 2)
+        h.tick(minutes=1)
+        self.assertEqual(len(h.calls), 2)
+        restarted = h.restart()
+        restarted.tick()
+        restarted.tick(minutes=10)
+        self.assertEqual(restarted.calls, [])
+        restarted.report("living", state="off")
+        restarted.tick(minutes=10)
+        self.assertEqual(restarted.calls, [])
+
+    def test_a_failed_season_off_is_sent_again(self):
+        h = self.confirmed()
+        h.service_result = {"success": False}
+        h.ha.set("input_boolean.heating_season", "off")
+        h.tick()
+        self.assertEqual(h.attrs("living")["last_write"]["result"], "failed")
+        h.service_result = {"success": True}
+        h.tick(minutes=60)
+        offs = [c for c in h.calls if c.get("hvac_mode") == "off"]
+        self.assertEqual(len(offs), 2)
+
+    def test_invalid_entity_limits_keep_the_zone_planned(self):
+        h = self.ready()
+        h.ha.set("number.living_room_thermostat_max_heat_setpoint", "18")
+        since = h.clock.now.timestamp()
+        h.tick(minutes=31)
+        h.tick(minutes=31)
+        self.assertEqual(h.calls, [])
+        later = [
+            r for r in h.log_lines("decision")
+            if r["zone"] == "living" and datetime.fromisoformat(r["ts"]).timestamp() > since
+        ]
+        self.assertTrue(later)
+
+    def test_a_mode_only_season_off_echo_can_change_setpoint_and_preset(self):
+        h = self.confirmed()
+        h.ha.set("input_boolean.heating_season", "off")
+        h.tick()
+        h.clock.advance(seconds=5)
+        h.echo(temperature=5.0)
+        h.clock.advance(seconds=3)
+        h.report("living", preset_mode="permanent_hold")
+        h.tick()
+        self.assertEqual(h.attrs("living")["last_write"]["result"], "confirmed")
+        self.assertNotIn("restore", h.effects("living"))
+        self.assertTrue(all(r["source"] == "own_write" for r in h.signals("living")))
+        self.assertEqual(h.attrs("living")["held_off"], "false")
+
+    def test_a_season_off_waiting_for_a_token_survives_restart(self):
+        h = self.confirmed()
+        self.assertTrue(h.app._zones["living"].bucket.take(h.clock.now.timestamp()))
+        h.ha.set("input_boolean.heating_season", "off")
+        h.tick()
+        self.assertEqual(len(h.calls), 1)
+        restarted = h.restart()
+        restarted.tick()
+        self.assertEqual(restarted.calls, [])
+        restarted.tick(minutes=30)
+        self.assertEqual(restarted.calls, [{
+            "service": "climate/set_hvac_mode", "entity_id": THERMOSTATS["living"],
+            "hvac_mode": "off",
+        }])
+        restarted.tick(minutes=5)
+        self.assertEqual(len(restarted.calls), 1)
+
+    def test_starting_with_the_season_off_never_sends_an_off(self):
+        h = Harness(self, live_zones=["living"])
+        h.ha.set("input_boolean.heating_live", "on")
+        h.tick()
+        h.tick(minutes=10)
+        self.assertEqual(h.calls, [])
+
+    def test_restart_drops_pending_and_waits_ten_minutes_for_a_nonpriority_write(self):
+        h = self.written()
+        saved = json.loads(Path(h.app.args["state_file"]).read_text())["zones"]["living"]
+        self.assertNotIn("desired_since", saved)
+        self.assertNotIn("pending_write", saved)
+        restarted = h.restart()
+        self.assertIsNone(restarted.app._zones["living"].pending_write)
+        restarted.tick()
+        restarted.tick(minutes=9, seconds=59)
+        self.assertEqual(restarted.calls, [])
+        restarted.tick(seconds=1)
+        self.assertEqual(len(restarted.calls), 1)
+        self.assertEqual(restarted.calls[-1]["temperature"], 22.0)
+
+    def test_terminate_never_writes(self):
+        h = self.ready(mode="off")
+        h.clock.advance(minutes=10)
+        h.app.terminate()
+        self.assertEqual(h.calls, [])
+
+    def test_live_writes_obey_both_the_device_and_entity_limits(self):
+        for entity_bounds, device_bounds, expected in (
+            ((20.0, 21.0), (19.0, 24.0), 21.0),
+            ((23.0, 24.0), (19.0, 24.0), 23.0),
+            ((19.0, 24.0), (19.0, 21.0), 21.0),
+            ((19.0, 24.0), (23.0, 24.0), 23.0),
+        ):
+            with self.subTest(entity=entity_bounds, device=device_bounds):
+                h = self.ready()
+                h.ha.update_attrs(THERMOSTATS["living"], min_temp=entity_bounds[0], max_temp=entity_bounds[1])
+                h.ha.set("number.living_room_thermostat_min_heat_setpoint", device_bounds[0])
+                h.ha.set("number.living_room_thermostat_max_heat_setpoint", device_bounds[1])
+                h.tick()
+                h.tick(minutes=10)
+                self.assertEqual(h.calls[0]["temperature"], expected)
+
+    def test_nonfinite_or_off_step_plans_are_not_written_and_warn_once(self):
+        original = hp.plan
+        for value in (float("nan"), float("inf"), float("-inf"), 22.25):
+            with self.subTest(value=value):
+                h = self.ready()
+
+                def invalid(zc, *args, **kwargs):
+                    planned = original(zc, *args, **kwargs)
+                    return dataclasses.replace(planned, setpoint=value) if zc.name == "living" else planned
+
+                with patch.object(hp, "plan", side_effect=invalid):
+                    h.tick()
+                    h.tick(minutes=10)
+                    h.tick(minutes=5)
+                self.assertEqual(h.calls, [])
+                self.assertEqual(len([msg for level, msg in h.logs if level == "WARNING"]), 1)
+                self.assertEqual([msg for level, msg in h.logs if level == "ERROR"], [])
+
+    def test_a_nonfinite_target_helper_is_not_written_and_warns_once(self):
+        for value in ("nan", "inf", "-inf"):
+            with self.subTest(value=value):
+                h = self.ready()
+                h.ha.set("input_number.heating_target_living", value)
+                h.tick()
+                h.tick(minutes=10)
+                h.tick(minutes=5)
+                self.assertEqual(h.calls, [])
+                self.assertEqual(len([msg for level, msg in h.logs if level == "WARNING"]), 1)
+                self.assertEqual([msg for level, msg in h.logs if level == "ERROR"], [])
+
+    def test_invalid_entity_limits_never_reach_the_service(self):
+        for bounds in (
+            {"min_temp": float("nan")}, {"max_temp": float("inf")},
+            {"min_temp": 24.0, "max_temp": 20.0}, {"max_temp": 21.25},
+        ):
+            with self.subTest(bounds=bounds):
+                h = self.ready()
+                h.ha.update_attrs(THERMOSTATS["living"], **bounds)
+                h.tick()
+                h.tick(minutes=10)
+                self.assertEqual(h.calls, [])
+                self.assertEqual(len([msg for level, msg in h.logs if level == "WARNING"]), 1)
+
+    def test_nonfinite_and_inverted_device_limits_never_reach_the_service(self):
+        for lower, upper in (("nan", "24"), ("19", "inf"), ("24", "20")):
+            with self.subTest(lower=lower, upper=upper):
+                h = self.ready()
+                h.ha.set("number.living_room_thermostat_min_heat_setpoint", lower)
+                h.ha.set("number.living_room_thermostat_max_heat_setpoint", upper)
+                h.tick()
+                h.tick(minutes=10)
+                self.assertEqual(h.calls, [])
+                self.assertTrue(any(level == "WARNING" for level, _ in h.logs))
+                self.assertEqual([msg for level, msg in h.logs if level == "ERROR"], [])
+
+    def test_daily_counts_cover_writes_confirmation_failure_and_restore(self):
+        h = self.confirmed()
+        h.report("living", temperature=20.0)
+        h.tick(minutes=10)
+        self.timeout(h)
+        h.at(3, day=18)
+        h.app._daily_rollup({})
+        rows = {r["zone"]: r for r in h.log_lines("daily")}
+        for zone in ("living", "_house"):
+            self.assertEqual(
+                {key: rows[zone][key] for key in ("writes", "confirmed", "failed", "restores")},
+                {"writes": 2, "confirmed": 1, "failed": 1, "restores": 1},
+            )
 
 
 class OffSeasonPlan(unittest.TestCase):
@@ -1461,7 +2072,7 @@ class PartyEndToEnd(unittest.TestCase):
         kw = h.notifier.notify.await_args.kwargs
         self.assertEqual(kw["target"], "mikkel")
         self.assertIn("would pause until 23:00", kw["message"])
-        self.assertIn("Nothing is written", kw["message"])
+        self.assertIn("This zone is in shadow mode", kw["message"])
         h.tick(minutes=5)
         h.run_tasks()
         self.assertEqual(h.notifier.notify.await_count, 1)
@@ -2273,7 +2884,7 @@ class NudgeButtons(unittest.TestCase):
         h.app.listen_event.reset_mock()
         h.app._wire_events()
         self.assertEqual(
-            len(h.app.listen_event.call_args_list), 1 + 1 + len(BUTTONS) + len(h.app._owned)
+            len(h.app.listen_event.call_args_list), 2 + 1 + len(BUTTONS) + len(h.app._owned)
         )
 
 
@@ -3667,18 +4278,6 @@ class EverythingStaysShadow(unittest.TestCase):
         self.assertEqual(
             h.last("sensor.heating_controller")["attributes"]["zones_live"], ["<none>"]
         )
-
-    def test_the_controller_names_no_service_to_call(self):
-        lines = (APPS / "heating_controller.py").read_text().splitlines()
-        self.assertEqual([ln for ln in lines if "call_service" in ln], [])
-        for needle in (
-            "set_temperature",
-            "set_hvac_mode",
-            "set_preset_mode",
-            "number.set_value",
-            "climate/",
-        ):
-            self.assertEqual([ln for ln in lines if needle in ln], [], needle)
 
     def test_the_new_modules_import_nothing_that_could_write(self):
         for name in ("heating_signals.py", "heating_alerts.py", "heating_season.py"):

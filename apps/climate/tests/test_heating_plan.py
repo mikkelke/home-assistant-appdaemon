@@ -193,6 +193,20 @@ class ClockHelpers(unittest.TestCase):
 
 
 class ConfigParsing(unittest.TestCase):
+    def test_live_zones_default_to_empty_and_the_switch_is_configurable(self):
+        self.assertEqual(CFG.live_zones, ())
+        self.assertEqual(CFG.live_switch_entity, "input_boolean.heating_live")
+        cfg = hp.parse_config(
+            dict(ARGS, live_zones=["family"], live_switch_entity="input_boolean.heating_write")
+        )
+        self.assertEqual(cfg.live_zones, ("family",))
+        self.assertEqual(cfg.live_switch_entity, "input_boolean.heating_write")
+
+    def test_live_zones_must_be_a_list_of_configured_zone_names(self):
+        for value in (["missing"], "family", {"family": True}, [1], [None]):
+            with self.subTest(value=value), self.assertRaisesRegex(hp.ConfigError, "live_zones"):
+                hp.parse_config(dict(ARGS, live_zones=value))
+
     def test_the_fixture_config_parses_with_the_decided_numbers(self):
         zc = CFG.zones["family"]
         self.assertEqual(
@@ -1608,6 +1622,24 @@ class WriteGateTests(unittest.TestCase):
         bucket = hp.TokenBucket(2)
         self.gate(22.5, 22.0, T(13, 1), T(13), None, bucket)
         self.assertEqual(bucket.available(T(13, 1)), 2.0)
+
+    def test_the_reported_value_decides_if_a_live_write_is_needed(self):
+        self.assertEqual(self.gate(22.0, 22.0, T(12), T(10)), hp.GateResult(False, "unchanged"))
+        self.assertEqual(self.gate(22.0, 20.0, T(12), T(10)), hp.GateResult(True, "stable"))
+        self.assertEqual(self.gate(22.0, None, T(12), T(10)), hp.GateResult(True, "stable"))
+
+    def test_a_pending_write_blocks_even_a_priority_without_spending_a_token(self):
+        bucket = hp.TokenBucket(2)
+        result = hp.write_gate(19.0, 22.0, T(12), T(10), "window_open", bucket, 600, pending=True)
+        self.assertEqual(result, hp.GateResult(False, "pending"))
+        self.assertEqual(bucket.available(T(12)), 2.0)
+
+    def test_clearing_pending_allows_the_next_eligible_write(self):
+        bucket = hp.TokenBucket(2)
+        hp.write_gate(22.0, 20.0, T(12), T(10), None, bucket, 600, pending=True)
+        result = hp.write_gate(22.0, 20.0, T(12), T(10), None, bucket, 600, pending=False)
+        self.assertEqual(result, hp.GateResult(True, "stable"))
+        self.assertEqual(bucket.available(T(12)), 1.0)
 
 
 class FamilyDayReplay(unittest.TestCase):

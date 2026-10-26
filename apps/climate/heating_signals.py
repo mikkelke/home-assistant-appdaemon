@@ -3,9 +3,9 @@ Signals for the floor-heating controller: who changed a thermostat, a nudge butt
 and what that means for the plan. Pure functions and small state objects, no AppDaemon import and
 no I/O, so every rule can be unit-tested on its own.
 
-Nothing here writes anything. An effect named would_* is what the writing controller will do;
-the shadow controller only records it. The effects that change the plan are nudge and
-nudge_reset: they move the zone's persisted nudge.
+Nothing here writes anything. The controller records would_* effects for shadow zones; live
+zones restore foreign setpoint and mode changes while the owner's off choice is held. Nudges
+from buttons and shadow-zone resident changes move the zone's persisted nudge.
 
 Attribution of a thermostat change. A state change does not reliably carry its caller (the
 device echoes seconds later), so the change is matched to the climate service calls seen on the
@@ -15,13 +15,14 @@ same entity shortly before it. A call that explains the change decides who made 
   - with a parent context and no user: a Home Assistant automation
   - from an account nobody maps: unknown
 No explaining call means the keypad, credited to the room's resident when the zone has exactly
-one. The controller's own writes (same value within OWN_WRITE_S) and a report that falls back to
-the pre-write value (a device rejection) are excluded first.
+one. The controller's own writes are excluded first; a return to the pre-write value or mode
+without an explaining call is attributed to a device rejection.
 
 Meaning, by who and what:
   - A resident's button press, or their setpoint change in their own room (Home Assistant or
     keypad), moves their nudge one step. The owner's button press does the same.
-  - The owner moving a managed thermostat is one step on the zone's target helper.
+  - In shadow, the owner moving a thermostat records one step on its target helper. Live
+    thermostat setpoint changes restore the plan, including the owner's direct changes.
   - The owner changing a resident room's target helper resets that room's nudge.
   - The owner switching a zone off is the owner's choice; anyone else is restored.
   - Anything else (another zone's resident, an automation, another app, an unknown keypad) leaves
@@ -46,7 +47,7 @@ CALL_KEEP_S = 600.0
 CALL_MATCH_S = 120.0
 CALL_LATE_S = 2.0
 OWN_WRITE_S = 600.0
-DEVICE_REVERT_S = 900.0
+DEVICE_REVERT_S = 180.0
 NUDGE_COLLAPSE_S = 300.0
 SETPOINT_MATCH_C = hp.SETPOINT_STEP_C + 0.01
 
@@ -75,6 +76,7 @@ EFFECT_TARGET_SET = "target_set"
 EFFECT_WOULD_SET_TARGET = "would_set_target"
 EFFECT_OFF_BY_OWNER = "off_by_owner"
 EFFECT_WOULD_RESTORE = "would_restore"
+EFFECT_RESTORE = "restore"
 EFFECT_WOULD_REVERT = "would_revert"
 EFFECT_IGNORED = "ignored"
 
@@ -237,11 +239,13 @@ class Change:
 
 @dataclass(frozen=True)
 class OwnWrite:
-    """The controller's latest setpoint write to a thermostat and what it reported before."""
+    """The controller's latest setpoint or mode write and the previous reported setpoint."""
 
-    value: float
+    value: Optional[float]
     ts: float
     prev_reported: Optional[float] = None
+    mode: Optional[str] = None
+    prev_mode: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -249,6 +253,22 @@ class Attribution:
     source: str
     who: Optional[str] = None
     call: Optional[CallRecord] = None
+
+
+def _is_own_call(call: CallRecord, own: OwnWrite) -> bool:
+    """Whether a recorded call is the controller's own write, so it cannot explain a change."""
+    data = call.data
+    if abs(call.ts - own.ts) > CALL_MATCH_S:
+        return False
+    if own.value is None:
+        return call.service == "set_hvac_mode" and data.get("hvac_mode") == own.mode
+    asked = _num(data.get("temperature"))
+    return (
+        call.service == "set_temperature"
+        and asked is not None
+        and abs(asked - own.value) < 1e-6
+        and data.get("hvac_mode") == own.mode
+    )
 
 
 def call_explains(call: CallRecord, change: Change) -> bool:
@@ -284,21 +304,44 @@ def attribute_change(
     own: Optional[OwnWrite] = None,
 ) -> Attribution:
     """Who made a thermostat change, see the module docstring."""
-    if own is not None and change.kind == KIND_SETPOINT:
-        age, new = change.ts - own.ts, _num(change.new)
-        if new is not None and 0.0 <= age <= OWN_WRITE_S and abs(new - own.value) < 1e-6:
-            return Attribution(SRC_OWN)
-        if (
-            new is not None
-            and own.prev_reported is not None
-            and 0.0 <= age <= DEVICE_REVERT_S
-            and abs(new - own.prev_reported) < 1e-6
-        ):
-            return Attribution(SRC_REVERT)
+    if own is not None:
+        age = change.ts - own.ts
+        if 0.0 <= age <= OWN_WRITE_S:
+            if change.kind == KIND_MODE and own.mode is not None and change.new == own.mode:
+                return Attribution(SRC_OWN)
+            if change.kind == KIND_PRESET and own.mode is not None:
+                return Attribution(SRC_OWN)
+            if change.kind == KIND_SETPOINT:
+                new = _num(change.new)
+                if own.value is None and own.mode is not None:
+                    return Attribution(SRC_OWN)
+                if new is not None and own.value is not None and abs(new - own.value) < 1e-6:
+                    return Attribution(SRC_OWN)
     for call in calls.recent(zc.thermostat, change.ts):
+        if own is not None and _is_own_call(call, own):
+            continue
         if call_explains(call, change):
             source, who = describe(identity.actor(call.user_id, call.parent_id))
             return Attribution(source, who, call)
+    if own is not None and change.kind == KIND_SETPOINT:
+        new = _num(change.new)
+        if (
+            new is not None
+            and own.value is not None
+            and own.prev_reported is not None
+            and 0.0 <= change.ts - own.ts <= DEVICE_REVERT_S
+            and abs(new - own.prev_reported) < 1e-6
+        ):
+            return Attribution(SRC_REVERT)
+    if (
+        own is not None
+        and change.kind == KIND_MODE
+        and own.mode is not None
+        and own.prev_mode is not None
+        and change.new == own.prev_mode != own.mode
+        and 0.0 <= change.ts - own.ts <= DEVICE_REVERT_S
+    ):
+        return Attribution(SRC_REVERT)
     who = zc.residents[0] if len(zc.residents) == 1 else None
     return Attribution(SRC_KEYPAD, who)
 

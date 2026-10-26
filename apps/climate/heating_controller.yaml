@@ -1,6 +1,6 @@
 # /conf/apps/climate/heating_controller.yaml
-# HeatingController - shadow-mode planner for the floor-heating zones: it publishes what it
-# would set and logs it, and has no way to write to a thermostat. See heating_controller.py,
+# HeatingController - per-zone live control and shadow planning for the floor-heating zones.
+# Only live_zones are written, while live_switch_entity is on. See heating_controller.py,
 # heating_plan.py, heating_signals.py, heating_alerts.py and heating_season.py. Targets are
 # seated-air temperatures (what sensor.<room>_feel shows); the thermostat hangs higher and
 # reads warmer, which `trim` learns. Limits are the setpoint bounds of the zone's thermostat.
@@ -20,6 +20,8 @@ HeatingController:
   user_ids:
     "5bee78148825439488b70f92565e6c26": kristine
   season_entity: input_boolean.heating_season
+  live_zones: [living]
+  live_switch_entity: input_boolean.heating_live
   state_file: /conf/apps/climate/heating_controller_state.json
   log_dir: /conf/heating_log
   # A change of setpoint needs a free token (refilled continuously) and either a priority

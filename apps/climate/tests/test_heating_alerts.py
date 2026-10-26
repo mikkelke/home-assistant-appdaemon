@@ -86,6 +86,31 @@ def kinds(events):
     return [(e.kind, e.key) for e in events]
 
 
+class WriteFailures(unittest.TestCase):
+    def test_two_consecutive_failures_start_one_episode(self):
+        alerts = al.Alerts(CFG)
+        self.assertEqual(alerts.write_result("living", 1, T0), [])
+        self.assertEqual(kinds(alerts.write_result("living", 2, T0 + STEP)), [(START, "write:living")])
+        self.assertEqual(alerts.write_result("living", 3, T0 + 2 * STEP), [])
+        self.assertEqual(alerts.active(), ["write:living"])
+
+    def test_confirmation_clears_and_rearms_the_episode(self):
+        alerts = al.Alerts(CFG)
+        alerts.write_result("living", 2, T0)
+        self.assertEqual(kinds(alerts.write_result("living", 0, T0 + STEP)), [(CLEAR, "write:living")])
+        self.assertEqual(alerts.write_result("living", 1, T0 + 2 * STEP), [])
+        self.assertEqual(
+            kinds(alerts.write_result("living", 2, T0 + 3 * STEP)), [(START, "write:living")]
+        )
+
+    def test_a_restart_does_not_repeat_the_push(self):
+        alerts = al.Alerts(CFG)
+        alerts.write_result("living", 2, T0)
+        restarted = al.Alerts(CFG, json.loads(json.dumps(alerts.snapshot())))
+        self.assertEqual(restarted.write_result("living", 3, T0 + STEP), [])
+        self.assertEqual(restarted.active(), ["write:living"])
+
+
 class ColdRoom(unittest.TestCase):
     def test_it_pushes_when_the_room_has_been_cold_for_thirty_minutes_not_before(self):
         r = Run()

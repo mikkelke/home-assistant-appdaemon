@@ -336,6 +336,8 @@ class Config:
     living_monitor_entity: str = ""
     alerts: AlertConfig = field(default_factory=AlertConfig)
     season_advisor: Optional[SeasonAdvisorConfig] = None
+    live_zones: tuple = ()
+    live_switch_entity: str = "input_boolean.heating_live"
 
 
 def _req(raw: dict, key: str, where: str):
@@ -604,6 +606,15 @@ def parse_config(args: dict) -> Config:
     if not zones_raw:
         raise ConfigError("no zones configured")
     zones = {name: _parse_zone(name, raw or {}) for name, raw in zones_raw.items()}
+    live_zones = args.get("live_zones", [])
+    if not isinstance(live_zones, list):
+        raise ConfigError("live_zones must be a list of zone names")
+    for zone in live_zones:
+        if not isinstance(zone, str) or zone not in zones:
+            raise ConfigError(f"live_zones: unknown zone {zone!r}")
+    live_switch = args.get("live_switch_entity", "input_boolean.heating_live")
+    if not isinstance(live_switch, str) or not live_switch.strip():
+        raise ConfigError("live_switch_entity must name an entity")
 
     forecast = args.get("forecast") or {}
     window = args.get("window") or {}
@@ -662,6 +673,8 @@ def parse_config(args: dict) -> Config:
         living_monitor_entity=(args.get("unmanaged") or {}).get("living_monitor") or "",
         alerts=_parse_alerts(args.get("alerts") or {}),
         season_advisor=_parse_season_advisor(args.get("season_advisor"), zones),
+        live_zones=tuple(live_zones),
+        live_switch_entity=live_switch,
     )
 
 
@@ -1344,7 +1357,7 @@ def render_blocks(log: BlockLog, projected: list, now_ts: float, day_end_ts: flo
     ]
 
 
-# ---------------------------------------------------------------- writes (shadow bookkeeping)
+# ---------------------------------------------------------------- writes
 
 
 class TokenBucket:
@@ -1387,9 +1400,16 @@ def write_gate(
     priority: Optional[str],
     bucket: TokenBucket,
     stable_s: float,
+    pending: bool = False,
 ) -> GateResult:
     """Whether the controller would write `desired` now. A change needs a free token and
     either a priority event or a value that has stayed the same for stable_s."""
+    if pending:
+        return GateResult(False, "pending")
+    if not math.isfinite(desired) or not math.isclose(
+        desired / SETPOINT_STEP_C, round(desired / SETPOINT_STEP_C), abs_tol=1e-9
+    ):
+        return GateResult(False, "invalid_setpoint")
     if last is not None and abs(desired - last) < 1e-9:
         return GateResult(False, "unchanged")
     if priority is None and now_ts - desired_since < stable_s:
@@ -1467,6 +1487,10 @@ class ZoneDay:
         self.bias = {int(h): list(v) for h, v in s.get("bias", {}).items()}
         self.would_writes = [list(w) for w in s.get("would_writes", [])]
         self.reverts = s.get("reverts", 0)
+        self.writes = s.get("writes", 0)
+        self.confirmed = s.get("confirmed", 0)
+        self.failed = s.get("failed", 0)
+        self.restores = s.get("restores", 0)
         self.budget = s.get("budget")
 
     def snapshot(self) -> dict:
@@ -1482,6 +1506,10 @@ class ZoneDay:
             "bias": {str(h): v for h, v in self.bias.items()},
             "would_writes": self.would_writes,
             "reverts": self.reverts,
+            "writes": self.writes,
+            "confirmed": self.confirmed,
+            "failed": self.failed,
+            "restores": self.restores,
             "budget": self.budget,
         }
 
@@ -1549,6 +1577,10 @@ class ZoneDay:
                 None if self.afternoon_excess_max is None else round(self.afternoon_excess_max, 2)
             ),
             "would_writes": len(self.would_writes),
+            "writes": self.writes,
+            "confirmed": self.confirmed,
+            "failed": self.failed,
+            "restores": self.restores,
             "would_write_reverts": self.reverts,
             "budget": self.budget,
             "trim_before": trim_before,
