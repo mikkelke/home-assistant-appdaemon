@@ -1,0 +1,20 @@
+BathroomBoostTrial:
+  module: bathroom_boost_trial
+  class: BathroomBoostTrial
+  thermostat: climate.bathroom_thermostat
+  floor: sensor.bathroom_floor_thermometer_temperature
+  air: sensor.bathroom_feel
+  season: input_boolean.heating_season
+  start: "02:30"
+  latest_end: "06:30"
+  boost_setpoint: 22.0
+  rest_setpoint: 19.0
+  floor_below: 22.0
+  air_below: 21.5
+  floor_rise: 0.5
+  max_heating_hours: 2.0
+  max_reading_age_hours: 24
+  first_day: 2026-10-27
+  last_day: 2026-11-16
+  log_path: /conf/heating_log/bathroom_boost_trial.jsonl
+  snapshot_times: ["07:00", "08:30"]
