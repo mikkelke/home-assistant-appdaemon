@@ -463,8 +463,8 @@ class ShippedYaml(unittest.TestCase):
             living.openings,
             ("binary_sensor.living_room_window_contact", "binary_sensor.rooftop_door_1_contact"),
         )
-        self.assertEqual(living.floor_max_c, 26.0)
-        self.assertIsNone(family.floor_max_c)
+        self.assertEqual(living.floor_max_c, 24.5)
+        self.assertEqual(family.floor_max_c, 24.5)
         for setting in (
             "base_c", "lower_c", "upper_c", "protected_min_c", "profile", "trim", "budget",
             "weather_offset", "sun_cut",
@@ -1018,7 +1018,7 @@ class ForecastHandling(unittest.TestCase):
 class FloorCapEndToEnd(unittest.TestCase):
     def hot_floor(self):
         h = Harness(self, forecast=False)
-        h.ha.set(LIVING_FLOOR, "26.0")
+        h.ha.set(LIVING_FLOOR, "24.5")
         h.season()
         return h
 
@@ -1026,19 +1026,19 @@ class FloorCapEndToEnd(unittest.TestCase):
         h = self.hot_floor()
         a = h.attrs("living")
         self.assertEqual(
-            (a["mode"], a["setpoint_now"], a["floor_max_c"]), ("floor_cap", 19.0, 26.0)
+            (a["mode"], a["setpoint_now"], a["floor_max_c"]), ("floor_cap", 19.0, 24.5)
         )
         self.assertEqual(a["weather_offset"], "+0.00")
-        self.assertIn("until the floor is below 25.5", a["reasons"][0])
+        self.assertIn("until the floor is below 24.0", a["reasons"][0])
         self.assertEqual(h.attrs("family")["mode"], "hold")
-        self.assertNotIn("floor_max_c", h.attrs("family"))
+        self.assertEqual(h.attrs("family")["floor_max_c"], 24.5)
         records = {r["zone"]: r for r in h.log_lines("decision")}
         self.assertEqual(records["living"]["plan_mode"], "floor_cap")
         self.assertEqual(records["family"]["plan_mode"], "hold")
 
     def test_hysteresis_survives_restart_and_releases_below_the_boundary(self):
         h = self.hot_floor()
-        h.ha.set(LIVING_FLOOR, "25.5")
+        h.ha.set(LIVING_FLOOR, "24.0")
         h.tick(minutes=5)
         self.assertEqual(h.attrs("living")["mode"], "floor_cap")
         saved = json.loads((h.tmp / "state.json").read_text())
@@ -1048,11 +1048,11 @@ class FloorCapEndToEnd(unittest.TestCase):
         restarted.ha.entities = copy.deepcopy(h.ha.entities)
         restarted.tick()
         self.assertEqual(restarted.attrs("living")["mode"], "floor_cap")
-        restarted.ha.set(LIVING_FLOOR, "25.49")
+        restarted.ha.set(LIVING_FLOOR, "23.99")
         restarted.tick(minutes=5)
         self.assertFalse(restarted.app._zones["living"].floor_cap)
         self.assertEqual(restarted.attrs("living")["mode"], "hold")
-        restarted.ha.set(LIVING_FLOOR, "25.9")
+        restarted.ha.set(LIVING_FLOOR, "24.4")
         restarted.tick(minutes=5)
         self.assertEqual(restarted.attrs("living")["mode"], "hold")
 
@@ -1063,21 +1063,21 @@ class FloorCapEndToEnd(unittest.TestCase):
         h.tick(seconds=1)
         self.assertEqual(h.attrs("living")["mode"], "hold")
         self.assertTrue(h.app._zones["living"].floor_cap)
-        h.ha.set(LIVING_FLOOR, "25.7")
+        h.ha.set(LIVING_FLOOR, "24.2")
         h.tick()
         self.assertEqual(h.attrs("living")["mode"], "floor_cap")
         h.ha.remove(LIVING_FLOOR)
         h.tick()
         self.assertEqual(h.attrs("living")["mode"], "hold")
         self.assertTrue(h.app._zones["living"].floor_cap)
-        h.ha.set(LIVING_FLOOR, "25.4")
+        h.ha.set(LIVING_FLOOR, "23.9")
         h.tick()
         self.assertFalse(h.app._zones["living"].floor_cap)
         self.assertEqual(h.attrs("living")["mode"], "hold")
 
     def test_missing_invalid_undated_and_stale_floors_do_not_enter_the_cap(self):
         readings = (
-            (None, 0), ("unavailable", 0), ("nan", 0), ("26.0", 1440.01), ("26.0", None)
+            (None, 0), ("unavailable", 0), ("nan", 0), ("24.5", 1440.01), ("24.5", None)
         )
         for value, age in readings:
             with self.subTest(value=value, age=age):

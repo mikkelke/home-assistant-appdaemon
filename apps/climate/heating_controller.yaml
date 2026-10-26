@@ -129,6 +129,7 @@ HeatingController:
       thermostat: climate.family_room_thermostat
       control_air: [sensor.kitchen_feel, sensor.dining_room_feel]
       floor: sensor.dining_room_floor_thermometer_temperature
+      floor_max_c: 24.5
       evenness_floors:
         - sensor.living_room_floor_thermometer_temperature
         - sensor.dining_room_floor_thermometer_temperature
@@ -159,7 +160,7 @@ HeatingController:
       thermostat: climate.living_room_thermostat
       control_air: [sensor.living_room_feel]
       floor: sensor.living_room_floor_thermometer_temperature
-      floor_max_c: 26.0
+      floor_max_c: 24.5
       openings:
         - binary_sensor.living_room_window_contact
         - binary_sensor.rooftop_door_1_contact
