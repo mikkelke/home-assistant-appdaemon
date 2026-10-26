@@ -17,6 +17,8 @@ Terms used throughout:
   - target (T*): the comfort target in seated-air terms, base + nudge + profile offset.
   - aim: the air temperature the setpoint is meant to produce (T* shifted by the lead, or capped).
   - protected minimum: the air temperature a sun cut still defends.
+  - control air: the zone's measured seated air, the weighted mean of its room sensors that read.
+    In a zone with several, a room whose 3 h mean is far from T* takes over (ComfortSwitch).
 
 Mode precedence, first match wins (see plan()): off_season / device_offline, window, settle,
 party, floor_cap, guard, sun_cut, fallback, hold. The plan is always computed, also when the
@@ -54,6 +56,11 @@ TRIM_MIN_HOURS = 6
 TRIM_GAIN = 0.5
 TRIM_STEP_C = 0.05
 CONTROL_AIR_MAX_AGE_MIN = 180.0
+COMFORT_WINDOW_S = 3 * 3600.0
+COMFORT_SAMPLE_GAP_S = 240.0
+COMFORT_MIN_SAMPLES = 24
+COMFORT_ENTER_C = 0.7
+COMFORT_RELEASE_C = 0.4
 VALID_RANGE_C = (5.0, 35.0)
 JUMP_C = 2.0
 JUMP_WINDOW_S = 600.0
@@ -203,7 +210,7 @@ class ZoneConfig:
     name: str
     thermostat: str
     control_air: tuple
-    floor_sensor: str
+    floor_sensors: tuple
     openings: tuple
     target_entity: str
     base_c: float
@@ -221,7 +228,8 @@ class ZoneConfig:
     buttons: dict
     evenness_floors: tuple = ()  # (reference, compared): the alert watches compared minus reference
     weather_offset: WeatherOffsetConfig = WeatherOffsetConfig()
-    floor_max_c: Optional[float] = None
+    floor_max_c: Optional[float] = None  # holds against the warmest of the floor_sensors
+    control_air_weights: tuple = ()  # one per control_air sensor; empty weighs them equally
 
 
 @dataclass(frozen=True)
@@ -443,6 +451,33 @@ def _parse_guard(raw, where: str) -> GuardConfig:
     return GuardConfig(enabled=True, cap=cap)
 
 
+def _parse_floor_sensors(raw, where: str) -> tuple:
+    sensors = _as_tuple(raw)
+    if not all(isinstance(e, str) and e for e in sensors):
+        raise ConfigError(f"{where}: floor is a sensor or a list of sensors")
+    return tuple(dict.fromkeys(sensors))
+
+
+def _parse_control_air_weights(raw, control_air: tuple, where: str) -> tuple:
+    """One weight per control_air sensor in its order, or () for equal weights."""
+    if not raw:
+        return ()
+    if not isinstance(raw, dict) or set(raw) != set(control_air):
+        raise ConfigError(f"{where}: control_air_weights needs a weight per control_air sensor")
+    weights = []
+    for entity in control_air:
+        weight = raw[entity]
+        if (
+            isinstance(weight, bool)
+            or not isinstance(weight, (int, float))
+            or not math.isfinite(weight)
+            or weight <= 0
+        ):
+            raise ConfigError(f"{where}: control_air_weights must be positive numbers")
+        weights.append(float(weight))
+    return tuple(weights)
+
+
 def _parse_bedroom(raw: dict) -> BedroomConfig:
     cfg = BedroomConfig(
         air_entity=raw.get("air_entity", "sensor.bedroom_feel"),
@@ -497,7 +532,7 @@ def _parse_zone(name: str, raw: dict) -> ZoneConfig:
         name=name,
         thermostat=_req(raw, "thermostat", where),
         control_air=control_air,
-        floor_sensor=raw.get("floor") or "",
+        floor_sensors=_parse_floor_sensors(raw.get("floor"), where),
         openings=_as_tuple(raw.get("openings")),
         target_entity=_req(raw, "target_entity", where),
         base_c=float(_req(raw, "base_c", where)),
@@ -524,6 +559,9 @@ def _parse_zone(name: str, raw: dict) -> ZoneConfig:
         evenness_floors=evenness,
         weather_offset=_parse_weather_offset(raw.get("weather_offset"), budget, where),
         floor_max_c=floor_max,
+        control_air_weights=_parse_control_air_weights(
+            raw.get("control_air_weights"), control_air, where
+        ),
     )
 
 
@@ -1051,19 +1089,122 @@ class ReadingGuard:
         return v
 
 
-def resolve_control_air(feels: list, thermostat: Optional[tuple], floor: Optional[tuple]) -> tuple:
-    """(air, source) for a zone. The fused room readings first (mean when there are several),
-    then the thermostat's own reading, then the floor sensor plus 0.5, each only while younger
-    than CONTROL_AIR_MAX_AGE_MIN. `thermostat` and `floor` are (value, age_minutes) or None.
-    Source 'none' puts the zone into fallback mode."""
-    values = [v for v in feels if v is not None]
-    if values:
-        return sum(values) / len(values), "feel"
+def weighted_mean(values: list, weights: tuple = ()) -> Optional[float]:
+    """The mean of the values that read, each counted by its weight (1 where none is given).
+    The weight of a value that is missing drops out, so the rest renormalise."""
+    pairs = [
+        (v, weights[i] if i < len(weights) else 1.0) for i, v in enumerate(values) if v is not None
+    ]
+    total = sum(w for _v, w in pairs)
+    if not pairs or not total > 0:
+        return None
+    return sum(v * w for v, w in pairs) / total
+
+
+def resolve_control_air(
+    feels: list, thermostat: Optional[tuple], floor: Optional[tuple], weights: tuple = ()
+) -> tuple:
+    """(air, source) for a zone. The fused room readings first (their weighted mean when there
+    are several), then the thermostat's own reading, then the floor sensor plus 0.5, each only
+    while younger than CONTROL_AIR_MAX_AGE_MIN. `thermostat` and `floor` are (value,
+    age_minutes) or None. Source 'none' puts the zone into fallback mode."""
+    air = weighted_mean(feels, weights)
+    if air is not None:
+        return air, "feel"
     if thermostat is not None and thermostat[1] <= CONTROL_AIR_MAX_AGE_MIN:
         return thermostat[0], "thermostat"
     if floor is not None and floor[1] <= CONTROL_AIR_MAX_AGE_MIN:
         return floor[0] + 0.5, "floor"
     return None, "none"
+
+
+# ---------------------------------------------------------------- comfort switch
+
+
+def comfort_pick(means: dict, target: float, active: Optional[str]) -> Optional[str]:
+    """The room sensor that becomes the zone's control air, or None for the weighted mean.
+
+    `means` maps each room sensor to its mean over the comfort window. A sensor is off when its
+    mean is more than COMFORT_ENTER_C from the target, and the active one stays off until its
+    mean is back within COMFORT_RELEASE_C. Sensors off on both sides of the target cancel out:
+    the weighted mean is the compromise, and the pick starts over once one side is back. With
+    several off on one side the active one stays, else the furthest from the target wins."""
+    if not math.isfinite(target):
+        return None
+    off = {}
+    for entity, mean in means.items():
+        gap = round(mean - target, 3)
+        if abs(gap) > (COMFORT_RELEASE_C if entity == active else COMFORT_ENTER_C):
+            off[entity] = gap
+    if not off or min(off.values()) < 0 < max(off.values()):
+        return None
+    if active in off:
+        return active
+    return max(off, key=lambda entity: abs(off[entity]))
+
+
+class ComfortSwitch:
+    """The rolling means behind comfort_pick, for the room sensors of one zone.
+
+    A sensor's readings are kept for COMFORT_WINDOW_S, at most one per COMFORT_SAMPLE_GAP_S, and
+    its mean only counts on COMFORT_MIN_SAMPLES of them: a cold start or a long outage leaves
+    the weighted mean in charge instead of judging a room on a few readings. The samples and the
+    active sensor are saved with the zone, so a restart carries on where it stopped."""
+
+    def __init__(self, entities: tuple, saved: Optional[dict] = None):
+        self.entities = tuple(entities)
+        s = saved if isinstance(saved, dict) else {}
+        raw = s.get("samples") if isinstance(s.get("samples"), dict) else {}
+        self.samples = {e: self._load(raw.get(e)) for e in self.entities}
+        self.active = s.get("active") if s.get("active") in self.entities else None
+
+    @staticmethod
+    def _load(items) -> list:
+        out = []
+        for item in items if isinstance(items, list) else []:
+            numbers = isinstance(item, list) and len(item) == 2
+            if numbers and all(
+                isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+                for x in item
+            ):
+                out.append([float(item[0]), float(item[1])])
+        return sorted(out)
+
+    def snapshot(self) -> dict:
+        return {
+            "samples": {
+                e: [[int(ts), round(v, 2)] for ts, v in samples]
+                for e, samples in self.samples.items()
+            },
+            "active": self.active,
+        }
+
+    def observe(self, now_ts: float, readings: dict, record: bool = True) -> None:
+        """Take the current readings (None for a sensor that does not read) and drop what has
+        left the window. With record off only the dropping happens."""
+        cutoff = now_ts - COMFORT_WINDOW_S
+        for entity in self.entities:
+            kept = [s for s in self.samples[entity] if cutoff < s[0] <= now_ts]
+            value = readings.get(entity)
+            if (
+                record
+                and value is not None
+                and (not kept or now_ts - kept[-1][0] >= COMFORT_SAMPLE_GAP_S)
+            ):
+                kept.append([now_ts, value])
+            self.samples[entity] = kept
+
+    def means(self, now_ts: float) -> dict:
+        out = {}
+        for entity in self.entities:
+            values = [v for ts, v in self.samples[entity] if ts > now_ts - COMFORT_WINDOW_S]
+            if len(values) >= COMFORT_MIN_SAMPLES:
+                out[entity] = sum(values) / len(values)
+        return out
+
+    def decide(self, now_ts: float, target: float) -> Optional[str]:
+        self.active = comfort_pick(self.means(now_ts), target, self.active)
+        return self.active
 
 
 # ---------------------------------------------------------------- window tracker

@@ -20,7 +20,7 @@ HeatingController:
   user_ids:
     "5bee78148825439488b70f92565e6c26": kristine
   season_entity: input_boolean.heating_season
-  live_zones: [living]
+  live_zones: [family]
   live_switch_entity: input_boolean.heating_live
   state_file: /conf/apps/climate/heating_controller_state.json
   log_dir: /conf/heating_log
@@ -39,6 +39,9 @@ HeatingController:
   # nothing reads them then, and the no-hot-water alert is off.
   supply_temp_entity: sensor.heating_room_floor_heating_supply
   return_temp_entity: sensor.heating_room_floor_heating_return
+  # The living-room thermostat has no actuator and must stay in standby.
+  unmanaged:
+    living_monitor: climate.living_room_thermostat
 
   # Alerts reach notify_target only. A room under cold_c for cold_minutes; a zone calling for
   # calling_hours while the relay draws no more than no_pump_w, or while its floor rises less
@@ -129,17 +132,29 @@ HeatingController:
   zones:
     family:
       thermostat: climate.family_room_thermostat
-      control_air: [sensor.kitchen_feel, sensor.dining_room_feel]
-      floor: sensor.dining_room_floor_thermometer_temperature
+      # Control air: the rooms that read, averaged by control_air_weights. A room whose 3 h mean
+      # is more than 0.7 from the target stands in for the average until its mean is back within
+      # 0.4; with rooms off on both sides of the target the average stays.
+      control_air: [sensor.living_room_feel, sensor.dining_room_feel, sensor.kitchen_feel]
+      control_air_weights:
+        sensor.living_room_feel: 19
+        sensor.dining_room_feel: 18.5
+        sensor.kitchen_feel: 18.5
+      # floor_max_c applies to the warmer of the floors.
+      floor:
+        - sensor.living_room_floor_thermometer_temperature
+        - sensor.dining_room_floor_thermometer_temperature
       floor_max_c: 24.5
       evenness_floors:
         - sensor.living_room_floor_thermometer_temperature
         - sensor.dining_room_floor_thermometer_temperature
       openings:
+        - binary_sensor.living_room_window_contact
         - binary_sensor.kitchen_window_contact
         - binary_sensor.dining_room_window_1_contact
         - binary_sensor.dining_room_window_2_contact
         - binary_sensor.dining_room_window_3_contact
+        - binary_sensor.rooftop_door_1_contact
       target_entity: input_number.heating_target_family
       base_c: 21.5
       lower_limit_c: 19.0
@@ -155,29 +170,6 @@ HeatingController:
       # ITLC settles below its setpoint in proportion to the heat the room needs. While holding, the
       # setpoint rises by (u_eq - bias) / gain, at most max_c, with u_eq the day's expected duty
       # at the lead time. gain and bias are the thermostat's band: duty per K, duty at the setpoint.
-      weather_offset: {gain: 0.85, bias: 0.22, max_c: 1.5}
-      sun_cut: {enabled: true, azimuth: [100, 260], ghi_min: 150, before_hours: 8, end_before_hours: 1, credit_ratio: 0.5}
-
-    living:
-      thermostat: climate.living_room_thermostat
-      control_air: [sensor.living_room_feel]
-      floor: sensor.living_room_floor_thermometer_temperature
-      floor_max_c: 24.5
-      openings:
-        - binary_sensor.living_room_window_contact
-        - binary_sensor.rooftop_door_1_contact
-      target_entity: input_number.heating_target_living
-      base_c: 21.5
-      lower_limit_c: 19.0
-      upper_limit_c: 24.0
-      protected_min_c: 20.5
-      profile:
-        lead_hours: 4
-        periods:
-          - {from: "23:00", to: "10:00", offset: -0.5}
-          - {from: "17:00", to: "23:00", offset: 0.5}
-      trim: {initial: 0.5, min: -0.5, max: 1.5}
-      budget: {a: 0.55, b_om: -1.62, c: 1.21, d: -0.04}
       weather_offset: {gain: 0.85, bias: 0.22, max_c: 1.5}
       sun_cut: {enabled: true, azimuth: [100, 260], ghi_min: 150, before_hours: 8, end_before_hours: 1, credit_ratio: 0.5}
 

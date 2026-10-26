@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from dataclasses import replace
@@ -309,6 +310,69 @@ class ConfigParsing(unittest.TestCase):
                 hp.ConfigError, "zone family: floor_max_c"
             ):
                 hp.parse_config(self._broken(floor_max_c=value))
+
+    WEIGHTS = {
+        "sensor.living_room_feel": 19,
+        "sensor.dining_room_feel": 18.5,
+        "sensor.kitchen_feel": 18.5,
+    }
+
+    def weights_of(self, raw):
+        return hp.parse_config(self._broken(control_air_weights=raw)).zones["family"]
+
+    def test_control_air_weights_are_read_in_the_order_of_control_air(self):
+        reordered = {e: self.WEIGHTS[e] for e in reversed(list(self.WEIGHTS))}
+        for raw in (self.WEIGHTS, reordered):
+            self.assertEqual(self.weights_of(raw).control_air_weights, (19.0, 18.5, 18.5))
+        zc = self.weights_of({e: 1 for e in FAMILY["control_air"]})
+        self.assertEqual(zc.control_air_weights, (1.0, 1.0, 1.0))
+
+    def test_control_air_weights_are_optional_and_leave_the_other_zones_equal(self):
+        for raw in (None, {}):
+            self.assertEqual(self.weights_of(raw).control_air_weights, ())
+        self.assertEqual({zc.control_air_weights for zc in CFG.zones.values()}, {()})
+
+    def test_bad_control_air_weights_are_refused(self):
+        living, dining, kitchen = FAMILY["control_air"]
+        bad = (
+            [19, 18.5, 18.5],
+            "equal",
+            {living: 19, dining: 18.5},
+            dict(self.WEIGHTS, **{"sensor.hall_feel": 5}),
+            {living: 19, dining: 18.5, "sensor.kitchn_feel": 18.5},
+            dict(self.WEIGHTS, **{kitchen: 0}),
+            dict(self.WEIGHTS, **{kitchen: -1}),
+            dict(self.WEIGHTS, **{kitchen: True}),
+            dict(self.WEIGHTS, **{kitchen: "18.5"}),
+            dict(self.WEIGHTS, **{kitchen: None}),
+            dict(self.WEIGHTS, **{kitchen: float("nan")}),
+            dict(self.WEIGHTS, **{kitchen: float("inf")}),
+        )
+        for raw in bad:
+            with self.subTest(raw=raw), self.assertRaisesRegex(
+                hp.ConfigError, "zone family: control_air_weights"
+            ):
+                self.weights_of(raw)
+
+    def floors_of(self, raw):
+        return hp.parse_config(self._broken(floor=raw)).zones["family"].floor_sensors
+
+    def test_floor_is_one_sensor_or_a_list_of_them(self):
+        self.assertEqual(self.floors_of("sensor.a"), ("sensor.a",))
+        self.assertEqual(self.floors_of(["sensor.a"]), ("sensor.a",))
+        self.assertEqual(self.floors_of(["sensor.a", "sensor.b"]), ("sensor.a", "sensor.b"))
+        self.assertEqual(self.floors_of(["sensor.a", "sensor.a"]), ("sensor.a",))
+        for none in (None, "", []):
+            self.assertEqual(self.floors_of(none), ())
+        self.assertEqual(CFG.zones["family"].floor_sensors, (FAMILY["floor"],))
+        self.assertEqual(CFG.zones["bathroom"].floor_sensors, ())
+
+    def test_a_floor_that_is_not_a_sensor_name_is_refused(self):
+        for raw in (5, [5], ["sensor.a", None], ["sensor.a", ""], [["sensor.a"]], {"a": "b"}):
+            with self.subTest(raw=raw), self.assertRaisesRegex(
+                hp.ConfigError, "zone family: floor"
+            ):
+                self.floors_of(raw)
 
     def test_the_weather_offset_is_off_unless_a_zone_gives_one(self):
         self.assertEqual(hp.WeatherOffsetConfig(), hp.WeatherOffsetConfig(False, 0.85, 0.22, 1.5))
@@ -1373,6 +1437,223 @@ class ControlAirChain(unittest.TestCase):
         self.assertEqual(hp.resolve_control_air([None], (21.0, 181), (19.0, 180)), (19.5, "floor"))
         self.assertEqual(hp.resolve_control_air([None], (21.0, 181), (19.0, 181)), (None, "none"))
         self.assertEqual(hp.resolve_control_air([], None, None), (None, "none"))
+
+
+class WeightedAir(unittest.TestCase):
+    def test_a_room_counts_by_its_weight(self):
+        self.assertAlmostEqual(hp.weighted_mean([26.0, 22.0, 22.0], (19.0, 18.5, 18.5)), 1308 / 56)
+        self.assertEqual(hp.weighted_mean([20.0, 24.0], (3.0, 1.0)), 21.0)
+
+    def test_without_weights_it_is_the_plain_mean(self):
+        for values in ([22.0, 23.0], [21.4, 22.6, 22.0], [22.2]):
+            plain = sum(values) / len(values)
+            self.assertEqual(hp.weighted_mean(values), plain)
+            self.assertEqual(hp.weighted_mean(values, (1.0,) * len(values)), plain)
+
+    def test_a_room_that_does_not_read_drops_out_and_the_rest_renormalise(self):
+        weights = (19.0, 18.5, 18.5)
+        self.assertAlmostEqual(
+            hp.weighted_mean([26.0, None, 22.0], weights), (19 * 26.0 + 18.5 * 22.0) / 37.5
+        )
+        self.assertEqual(hp.weighted_mean([None, 22.0, None], weights), 22.0)
+        self.assertIsNone(hp.weighted_mean([None, None, None], weights))
+        self.assertIsNone(hp.weighted_mean([], weights))
+
+    def test_the_chain_weighs_only_the_rooms_and_the_fallbacks_stay_as_they_were(self):
+        weighted = hp.resolve_control_air([20.0, 24.0], None, None, (3.0, 1.0))
+        self.assertEqual(weighted, (21.0, "feel"))
+        self.assertEqual(hp.resolve_control_air([20.0, 24.0], None, None), (22.0, "feel"))
+        self.assertEqual(
+            hp.resolve_control_air([None, None], (21.0, 5), (19.0, 5), (3.0, 1.0)),
+            (21.0, "thermostat"),
+        )
+        self.assertEqual(
+            hp.resolve_control_air([None, None], None, (19.0, 5), (3.0, 1.0)), (19.5, "floor")
+        )
+
+
+class ComfortPick(unittest.TestCase):
+    TARGET = 21.5
+
+    def pick(self, means, active=None, target=TARGET):
+        return hp.comfort_pick(means, target, active)
+
+    def test_rooms_within_the_band_leave_the_weighted_mean_in_charge(self):
+        self.assertIsNone(self.pick({"a": 21.5, "b": 21.0, "c": 22.0}))
+        self.assertIsNone(self.pick({}))
+
+    def test_a_room_more_than_seven_tenths_off_takes_over_on_either_side(self):
+        self.assertEqual(self.pick({"a": 20.79, "b": 21.5}), "a")
+        self.assertEqual(self.pick({"a": 21.5, "b": 22.21}), "b")
+
+    def test_exactly_seven_tenths_is_not_off(self):
+        self.assertIsNone(self.pick({"a": 20.8, "b": 22.2}))
+        self.assertIsNone(self.pick({"a": 20.8}))
+        self.assertIsNone(self.pick({"a": 22.2}))
+
+    def test_the_active_room_stays_until_it_is_back_within_four_tenths(self):
+        self.assertEqual(self.pick({"a": 21.0, "b": 21.5}, active="a"), "a")
+        self.assertEqual(self.pick({"a": 22.0, "b": 21.5}, active="a"), "a")
+        self.assertIsNone(self.pick({"a": 21.11, "b": 21.5}, active="a"))
+        self.assertIsNone(self.pick({"a": 21.1, "b": 21.5}, active="a"))
+        self.assertIsNone(self.pick({"a": 21.89, "b": 21.5}, active="a"))
+        self.assertIsNone(self.pick({"a": 21.0, "b": 21.5}))
+
+    def test_of_several_rooms_off_on_one_side_the_active_one_stays_else_the_furthest_wins(self):
+        self.assertEqual(self.pick({"a": 21.0, "b": 20.0}, active="a"), "a")
+        self.assertEqual(self.pick({"a": 20.4, "b": 20.0, "c": 21.5}), "b")
+        self.assertEqual(self.pick({"a": 20.0, "b": 20.4}), "a")
+        self.assertEqual(self.pick({"a": 22.5, "b": 22.9}), "b")
+        self.assertEqual(self.pick({"a": 20.5, "b": 20.5}), "a")
+
+    def test_rooms_off_on_both_sides_are_a_conflict_the_weighted_mean_settles(self):
+        both = {"a": 20.5, "b": 22.5, "c": 21.5}
+        self.assertIsNone(self.pick(both))
+        self.assertIsNone(self.pick(both, active="a"))
+        self.assertIsNone(self.pick({"a": 21.0, "b": 22.5}, active="a"))
+
+    def test_the_pick_starts_over_once_one_side_is_back(self):
+        self.assertEqual(self.pick({"a": 20.5, "b": 21.5, "c": 21.5}), "a")
+        self.assertEqual(self.pick({"a": 21.0, "b": 22.5}), "b")
+
+    def test_a_target_that_is_not_a_number_picks_nothing(self):
+        for target in (float("nan"), float("inf"), -float("inf")):
+            self.assertIsNone(hp.comfort_pick({"a": 10.0}, target, None))
+            self.assertIsNone(hp.comfort_pick({"a": 10.0}, target, "a"))
+
+
+class ComfortSwitchTests(unittest.TestCase):
+    A, B = "sensor.a", "sensor.b"
+    T0 = T(10)
+    STEP = 300.0
+    TARGET = 21.5
+
+    def switch(self, saved=None):
+        return hp.ComfortSwitch((self.A, self.B), saved)
+
+    def feed(self, switch, count, a, b, start=None, record=True):
+        """count readings five minutes apart from `start`; returns the time of the last."""
+        start = self.T0 if start is None else start
+        for i in range(count):
+            switch.observe(start + i * self.STEP, {self.A: a, self.B: b}, record)
+        return start + (count - 1) * self.STEP
+
+    def test_a_reading_is_kept_at_most_once_per_sample_gap(self):
+        switch = self.switch()
+        gap = hp.COMFORT_SAMPLE_GAP_S
+        for offset in (0, 100, gap - 1, gap, gap + 100, 2 * gap):
+            switch.observe(self.T0 + offset, {self.A: 20.0, self.B: None})
+        self.assertEqual(
+            [ts for ts, _v in switch.samples[self.A]], [self.T0, self.T0 + gap, self.T0 + 2 * gap]
+        )
+        self.assertEqual(switch.samples[self.B], [])
+
+    def test_a_mean_counts_only_on_enough_readings(self):
+        switch = self.switch()
+        last = self.feed(switch, hp.COMFORT_MIN_SAMPLES - 1, 20.0, 21.5)
+        self.assertEqual(switch.means(last), {})
+        last = self.feed(switch, 1, 20.0, 21.5, start=last + self.STEP)
+        self.assertEqual(switch.means(last), {self.A: 20.0, self.B: 21.5})
+
+    def test_a_reading_leaves_the_window_after_three_hours(self):
+        switch = self.switch()
+        switch.observe(self.T0, {self.A: 10.0})
+        self.feed(switch, 36, 20.0, 21.5, start=self.T0 + self.STEP)
+        end = self.T0 + 36 * self.STEP
+        self.assertEqual(len(switch.samples[self.A]), 36)
+        self.assertEqual(switch.means(end), {self.A: 20.0, self.B: 21.5})
+        switch.observe(self.T0 + hp.COMFORT_WINDOW_S, {})
+        self.assertEqual(switch.samples[self.A][0][0], self.T0 + self.STEP)
+
+    def test_an_airing_is_not_recorded_but_the_window_still_moves(self):
+        switch = self.switch()
+        last = self.feed(switch, 30, 20.0, 21.5)
+        before = [list(s) for s in switch.samples[self.A]]
+        later = last + 2 * 3600.0
+        switch.observe(later, {self.A: 5.0, self.B: 5.0}, record=False)
+        cutoff = later - hp.COMFORT_WINDOW_S
+        self.assertEqual(switch.samples[self.A], [s for s in before if s[0] > cutoff])
+        self.assertNotIn(5.0, [v for _t, v in switch.samples[self.A]])
+
+    def test_a_cold_start_does_not_judge_a_room_on_a_few_readings(self):
+        switch = self.switch()
+        last = self.feed(switch, hp.COMFORT_MIN_SAMPLES - 1, 15.0, 21.5)
+        self.assertIsNone(switch.decide(last, self.TARGET))
+
+    def test_a_room_that_stays_off_takes_over_and_the_pick_is_kept_with_the_mean(self):
+        switch = self.switch()
+        last = self.feed(switch, hp.COMFORT_MIN_SAMPLES, 20.0, 21.5)
+        self.assertEqual(switch.decide(last, self.TARGET), self.A)
+        self.assertEqual(switch.active, self.A)
+        self.assertEqual(switch.decide(last, self.TARGET), self.A)
+
+    def test_it_is_released_when_the_mean_is_back_within_four_tenths(self):
+        switch = self.switch()
+        last = self.feed(switch, hp.COMFORT_MIN_SAMPLES, 20.0, 21.5)
+        switch.decide(last, self.TARGET)
+        previous_gap = None
+        for _ in range(60):
+            last = self.feed(switch, 1, 21.5, 21.5, start=last + self.STEP)
+            gap = abs(switch.means(last)[self.A] - self.TARGET)
+            if switch.decide(last, self.TARGET) is None:
+                break
+            previous_gap = gap
+        self.assertIsNone(switch.active)
+        self.assertLessEqual(gap, hp.COMFORT_RELEASE_C)
+        self.assertGreater(previous_gap, hp.COMFORT_RELEASE_C)
+
+    def test_two_rooms_off_on_opposite_sides_keep_the_weighted_mean(self):
+        switch = self.switch()
+        last = self.feed(switch, hp.COMFORT_MIN_SAMPLES, 20.0, 23.0)
+        self.assertIsNone(switch.decide(last, self.TARGET))
+
+    def test_a_pick_is_dropped_when_its_room_has_no_mean_any_more(self):
+        switch = self.switch()
+        last = self.feed(switch, hp.COMFORT_MIN_SAMPLES, 20.0, 21.5)
+        switch.decide(last, self.TARGET)
+        later = last + hp.COMFORT_WINDOW_S + 60.0
+        switch.observe(later, {self.A: 20.0, self.B: 21.5})
+        self.assertEqual(switch.means(later), {})
+        self.assertIsNone(switch.decide(later, self.TARGET))
+
+    def test_a_restart_carries_the_readings_and_the_pick_over_unchanged(self):
+        switch = self.switch()
+        last = self.feed(switch, hp.COMFORT_MIN_SAMPLES + 5, 20.0, 21.5)
+        switch.decide(last, self.TARGET)
+        restored = self.switch(json.loads(json.dumps(switch.snapshot())))
+        self.assertEqual(restored.active, self.A)
+        self.assertEqual(restored.means(last), switch.means(last))
+        self.assertEqual(restored.decide(last + 60.0, self.TARGET), self.A)
+
+    def test_a_restart_without_saved_readings_waits_instead_of_switching(self):
+        restored = self.switch({})
+        self.assertIsNone(restored.active)
+        last = self.feed(restored, hp.COMFORT_MIN_SAMPLES - 1, 20.0, 21.5)
+        self.assertIsNone(restored.decide(last, self.TARGET))
+
+    def test_junk_in_the_saved_state_is_ignored(self):
+        saved = {
+            "samples": {
+                self.A: [
+                    [self.T0, 20.0], [1, 2, 3], ["x", 1], [float("nan"), 1], [True, 1],
+                    None, [self.T0 + 60.0, float("inf")], [self.T0 - 60.0, 19.0],
+                ],
+                "sensor.gone": [[self.T0, 20.0]],
+                self.B: "junk",
+            },
+            "active": "sensor.gone",
+        }
+        switch = self.switch(saved)
+        kept = {self.A: [[self.T0 - 60.0, 19.0], [self.T0, 20.0]], self.B: []}
+        self.assertEqual(switch.samples, kept)
+        self.assertIsNone(switch.active)
+        for junk in (None, [], "x", {"samples": []}, {"samples": {}, "active": ["sensor.a"]}):
+            self.assertIsNone(self.switch(junk).active)
+
+    def test_readings_from_the_future_are_dropped(self):
+        switch = self.switch({"samples": {self.A: [[self.T0 + 3600.0, 20.0]]}})
+        switch.observe(self.T0, {self.A: 21.0})
+        self.assertEqual(switch.samples[self.A], [[self.T0, 21.0]])
 
 
 class WindowTrackerTests(unittest.TestCase):

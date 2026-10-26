@@ -89,26 +89,26 @@ def kinds(events):
 class WriteFailures(unittest.TestCase):
     def test_two_consecutive_failures_start_one_episode(self):
         alerts = al.Alerts(CFG)
-        self.assertEqual(alerts.write_result("living", 1, T0), [])
-        self.assertEqual(kinds(alerts.write_result("living", 2, T0 + STEP)), [(START, "write:living")])
-        self.assertEqual(alerts.write_result("living", 3, T0 + 2 * STEP), [])
-        self.assertEqual(alerts.active(), ["write:living"])
+        self.assertEqual(alerts.write_result("family", 1, T0), [])
+        self.assertEqual(kinds(alerts.write_result("family", 2, T0 + STEP)), [(START, "write:family")])
+        self.assertEqual(alerts.write_result("family", 3, T0 + 2 * STEP), [])
+        self.assertEqual(alerts.active(), ["write:family"])
 
     def test_confirmation_clears_and_rearms_the_episode(self):
         alerts = al.Alerts(CFG)
-        alerts.write_result("living", 2, T0)
-        self.assertEqual(kinds(alerts.write_result("living", 0, T0 + STEP)), [(CLEAR, "write:living")])
-        self.assertEqual(alerts.write_result("living", 1, T0 + 2 * STEP), [])
+        alerts.write_result("family", 2, T0)
+        self.assertEqual(kinds(alerts.write_result("family", 0, T0 + STEP)), [(CLEAR, "write:family")])
+        self.assertEqual(alerts.write_result("family", 1, T0 + 2 * STEP), [])
         self.assertEqual(
-            kinds(alerts.write_result("living", 2, T0 + 3 * STEP)), [(START, "write:living")]
+            kinds(alerts.write_result("family", 2, T0 + 3 * STEP)), [(START, "write:family")]
         )
 
     def test_a_restart_does_not_repeat_the_push(self):
         alerts = al.Alerts(CFG)
-        alerts.write_result("living", 2, T0)
+        alerts.write_result("family", 2, T0)
         restarted = al.Alerts(CFG, json.loads(json.dumps(alerts.snapshot())))
-        self.assertEqual(restarted.write_result("living", 3, T0 + STEP), [])
-        self.assertEqual(restarted.active(), ["write:living"])
+        self.assertEqual(restarted.write_result("family", 3, T0 + STEP), [])
+        self.assertEqual(restarted.active(), ["write:family"])
 
 
 class ColdRoom(unittest.TestCase):
