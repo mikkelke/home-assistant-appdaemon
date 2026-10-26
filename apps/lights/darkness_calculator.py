@@ -36,11 +36,12 @@ Anti-flap:
     can never classify the room as bright.
   - "Raining" requires MEASURED water, not just the piezo contact - see _apply_rain.
 
-Publish contract (unchanged from the previous implementation):
+Publish contract:
   - ``binary_sensor.dark_<name>``  on/off        (confirmed only)
   - ``sensor.darkness_<name>``     dark|bright   (confirmed only)
-  - ``sensor.room_state_<name>``   "Occupied|Empty (Dark|Bright)" labels; occupancy
-    from ``presence_sensors`` per published name (label only - see contract above)
+  - ``sensor.room_state_<name>``   "Occupied|Empty|Unknown (Dark|Bright)" labels;
+    occupancy from ``presence_sensors`` per published name, independent of darkness.
+    ``occupied`` is "true"/"false"/"unknown"; ``occupancy_reason`` explains that vote.
   - optional ``room_state_helpers`` input_text sync with the same label
   - mirrors republish the source zone classification under their own names
   - ``pending_target`` / ``pending_*`` attributes are informational only (a flip that
@@ -67,6 +68,8 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 import time
 from collections import deque
 from statistics import median
+
+import room_active_read  # apps/presence - AppDaemon exposes every app directory
 
 DARK = "dark"
 BRIGHT = "bright"
@@ -395,12 +398,30 @@ class DarknessCalculator(hass.Hass):
             return max(0.0, indoor - offset)
         return indoor
 
-    def _any_presence_on(self, publish_name):
+    def _presence(self, publish_name):
+        """Same bounded union as RoomActive: any on, else any readable off, else unknown."""
         cfg = self.presence_sensors.get(publish_name)
         if not cfg:
-            return False
+            return None, "no_presence_config"
         ents = cfg if isinstance(cfg, (list, tuple)) else [cfg]
-        return self._any_on(e for e in ents if e)
+        ents = [e for e in ents if e]
+        if not ents:
+            return None, "no_presence_config"
+        readable_off = False
+        for entity in ents:
+            if entity.startswith("binary_sensor.") and entity.endswith("_active"):
+                zone = entity[len("binary_sensor."):-len("_active")]
+                state = room_active_read.active(self, zone) if zone else None
+            else:
+                raw = self._get_raw(entity)
+                state = True if raw == "on" else False if raw == "off" else None
+            if state is True:
+                return True, f"source_on:{entity}"
+            if state is False:
+                readable_off = True
+        if readable_off:
+            return False, "readable_sources_off"
+        return None, "no_readable_sources"
 
     # ─────────────────────────────────────────────────────────────
     # Core decision
@@ -728,9 +749,9 @@ class DarknessCalculator(hass.Hass):
                 self.log(f"Publish error [{name}]: {e}", level="ERROR")
 
     def _publish_one(self, name, is_dark, attrs):
-        occupied = self._any_presence_on(name)
+        occupied, occupancy_reason = self._presence(name)
         label = (
-            ("Occupied" if occupied else "Empty")
+            ("Unknown" if occupied is None else "Occupied" if occupied else "Empty")
             + (" (Dark)" if is_dark else " (Bright)")
         )
         snap = (
@@ -761,15 +782,15 @@ class DarknessCalculator(hass.Hass):
 
         room_attrs = {
             "room": name,
-            "occupied": occupied,
+            # AD 4.5.13 drops False/None attributes; all three strings survive.
+            "occupied": "unknown" if occupied is None else "true" if occupied else "false",
+            "occupancy_reason": occupancy_reason,
             "dark": is_dark,
             "presence_ts": time.time(),
             **attrs,
         }
-        # room_attrs also carries every attrs key above (same risk), plus its own occupied/dark
-        # -- both False in the routine empty-room / bright-daytime case -- so they too silently
-        # drop from published attributes whenever False/0 -- AppDaemon 4.5.13 set_state bug, not
-        # ours; see smart_cooling.py's _publish() for details.
+        # dark and environmental False/0 attributes still have the AD serialization risk
+        # described above; occupied's explicit strings preserve all three occupancy states.
         if self._publish_snapshots.get(room_ent) != snap:
             self.set_state(room_ent, state=label, attributes=room_attrs, replace=True)
             self._publish_snapshots[room_ent] = snap

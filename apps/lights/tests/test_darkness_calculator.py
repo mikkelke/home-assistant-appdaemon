@@ -14,6 +14,7 @@ from pathlib import Path
 _LIGHTS_DIR = Path(__file__).resolve().parents[1]
 if str(_LIGHTS_DIR) not in sys.path:
     sys.path.insert(0, str(_LIGHTS_DIR))
+sys.path.insert(0, str(_LIGHTS_DIR.parent / "presence"))
 
 if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     ad = types.ModuleType("appdaemon")
@@ -163,13 +164,13 @@ class RoomStateAlwaysIncludesState(unittest.TestCase):
         app._recompute_all()  # first call: the "changed" branch (state included already)
         first = calls_for(app, ROOM_ENT)
         self.assertEqual(len(first), 1)
-        self.assertEqual(first[-1][1].get("state"), "Empty (Dark)")
+        self.assertEqual(first[-1][1].get("state"), "Unknown (Dark)")
 
         app._recompute_all()  # second call: snap unchanged -> the "else" branch
 
         second = calls_for(app, ROOM_ENT)
         self.assertEqual(len(second), 2)
-        self.assertEqual(second[-1][1].get("state"), "Empty (Dark)")
+        self.assertEqual(second[-1][1].get("state"), "Unknown (Dark)")
 
 
 # Real-shaped zone (the family room's live numbers) so _decide runs its actual branches

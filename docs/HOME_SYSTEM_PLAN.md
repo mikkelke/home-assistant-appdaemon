@@ -49,8 +49,8 @@ remains verified by the focused tests, not by a deliberately induced household o
   activity and mixed off/unreadable behavior, and requires full settle on unknown -> off recovery.
   A fresh unknown reads as no opinion without fallback. Producer and affected lighting, music,
   sleep-quiet and visitor-exit guards ship together. Partial stale evidence and direct consumers
-  after a publisher stops remain limitations. DarknessCalculator's unknown -> Empty occupancy
-  label is a deferred presentation gap. Targeted suites pass. Heavy review found one cross-app
+  after a publisher stops remain limitations. The 26.10 room-label follow-up below addresses
+  DarknessCalculator's former unknown -> Empty gap. Targeted suites pass. Heavy review found one cross-app
   conflict: shared-space lighting could extinguish an existing dishwasher signal while kitchen
   presence was unknown. That path now preserves an already-on signal, with regressions for
   unknown, initially-off and release on explicit absence/task completion. The reviewer verified
@@ -79,6 +79,24 @@ A scoped HA configuration search for the exact `apartment_entry_secure` identifi
 matches in automations, scripts, scenes, helpers or dashboards, with no partial result reported.
 That does not cover AppDaemon, Node-RED or templates outside that search. Validate remaining
 consumers when changing this interface again; the search does not establish their absence.
+
+## Room-label follow-up, 2026-10-26 (source implementation)
+
+DarknessCalculator now preserves unknown occupancy in its label and string attribute, with
+an independent occupancy reason. Semantic activity inputs use the existing reader's freshness
+and recovery policy. Combined raw groups keep the bounded mixed-readable rule. The shared
+lighting reader rejects unknown/malformed occupancy and missing, invalid or old `presence_ts`;
+unresolved occupancy cannot turn lights on or off. Darkness decisions and configured sensor
+mappings are unchanged. Deployment and live verification are separate from these source changes.
+
+Validation: 377 lighting tests (18 new publication/reader/action cases) and 409 presence
+tests pass, with one existing presence skip and its existing coroutine warning. Independent
+GPT-6 Astra review found no blocking findings and checked additional source combinations,
+timestamp boundaries and unchanged brightness behavior. Live HA configuration searches for
+`room_state_` and all nine configured `input_text.*_state` helpers found no consumers beyond
+the helper definitions in automations, scripts, scenes, helpers or dashboards; results were
+not partial. This does not cover Node-RED or configuration outside those search surfaces.
+Source audit found no current lighting path using the mislabel as proof of vacancy.
 
 ## Outcome and constraints
 

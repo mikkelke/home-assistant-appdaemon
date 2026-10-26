@@ -6,25 +6,42 @@ See ``LIGHTING_STANDARD.md``.
 
 from __future__ import annotations
 
+import math
+import time
 from typing import Any, Callable
 
 import room_state_darkness
 
+_OCCUPANCY_UNSET = object()
+
 
 def read_occupied_from_room_state(hass: Any, room_state_entity: str | None) -> bool | None:
-    """Occupied flag pushed by ``darkness_calculator`` on ``sensor.room_state_*``."""
+    """Fresh occupancy only; unknown data must never establish an empty room.
+
+    The publisher refreshes presence_ts every 90s. Legacy labels remain readable when
+    their occupied attribute is absent, but they must satisfy the same 300s freshness.
+    """
     if not room_state_entity:
         return None
     try:
+        published_at = float(hass.get_state(room_state_entity, attribute="presence_ts"))
+        age = time.time() - published_at
+        if not math.isfinite(age) or not 0 <= age <= 300:
+            return None
         occ = hass.get_state(room_state_entity, attribute="occupied")
         if occ is not None:
-            return str(occ).lower() in ("true", "on", "1", "yes")
+            value = str(occ).strip().lower()
+            if value in ("true", "on", "1", "yes"):
+                return True
+            if value in ("false", "off", "0", "no"):
+                return False
+            return None
         label = hass.get_state(room_state_entity)
         if isinstance(label, str) and label:
             low = label.lower()
-            if "empty" in low:
+            if low in ("empty (dark)", "empty (bright)"):
                 return False
-            if "occupied" in low:
+            if low in ("occupied (dark)", "occupied (bright)"):
                 return True
     except Exception:
         pass
@@ -56,7 +73,7 @@ def apply_global_lighting(
     lights_on: bool,
     turn_on: Callable[[], None],
     turn_off: Callable[[], None],
-    occupied: bool | None = None,
+    occupied: bool | None | object = _OCCUPANCY_UNSET,
     block_auto_on: bool = False,
     log_fn: Callable[[str], None] | None = None,
     bright_lights_on: bool | None = None,
@@ -66,10 +83,10 @@ def apply_global_lighting(
     Global standard: dark/bright from ``room_state`` push; optional explicit occupied
     (bedroom effective occupancy). Returns action from ``apply_occupied_brightness``.
     """
-    if occupied is None:
+    if occupied is _OCCUPANCY_UNSET:
         occupied = read_occupied_from_room_state(hass, room_state_entity)
     if occupied is None:
-        occupied = not default_dark
+        return "noop_unknown"
 
     on_d = room_state_darkness.evaluate_auto_on(
         hass,
@@ -99,7 +116,7 @@ def apply_global_lighting(
 
 def apply_occupied_brightness(
     *,
-    occupied: bool,
+    occupied: bool | None,
     is_dark_for_on: bool,
     is_dark_for_off: bool,
     lights_on: bool,
@@ -114,13 +131,15 @@ def apply_occupied_brightness(
   Apply standard occupied + brightness rules.
 
   Returns action taken: ``off_vacant``, ``off_bright``, ``on_dark``, ``noop_dark_on``,
-  ``noop_bright``, ``blocked``, ``noop``.
+  ``noop_bright``, ``blocked``, ``noop``, ``noop_unknown``.
 
   ``bright_lights_on`` / ``turn_off_bright``: rooms with a sub-zone light that stays
   on in bright conditions (bathroom bath spot) pass the main-lights-only state and a
   mains-only off action here, so the occupied+bright shutoff cannot kill the sub-zone
   light. Vacancy shutoff always uses ``lights_on`` + ``turn_off`` (everything off).
     """
+    if occupied is None:
+        return "noop_unknown"
     if bright_lights_on is None:
         bright_lights_on = lights_on
     if turn_off_bright is None:

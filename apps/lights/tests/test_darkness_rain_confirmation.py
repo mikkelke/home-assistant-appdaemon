@@ -40,6 +40,7 @@ from pathlib import Path
 _LIGHTS_DIR = Path(__file__).resolve().parents[1]
 if str(_LIGHTS_DIR) not in sys.path:
     sys.path.insert(0, str(_LIGHTS_DIR))
+sys.path.insert(0, str(_LIGHTS_DIR.parent / "presence"))
 
 if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     ad = types.ModuleType("appdaemon")

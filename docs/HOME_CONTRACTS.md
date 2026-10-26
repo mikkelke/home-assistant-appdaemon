@@ -32,6 +32,15 @@ a resident's confirmation and a successful physical action.
   [Lighting uncertainty tests](../apps/lights/tests/test_lighting_presence_unknown.py) and
   [kitchen/hall music tests](../apps/sonos/tests/test_follow_me_kitchen_trust.py) exercise
   consumer holds, recovery listeners and mixed evidence. Ship these guards with the producer.
+- **Room labels:** [DarknessCalculator](../apps/lights/darkness_calculator.py) publishes
+  `Occupied|Empty|Unknown (Dark|Bright)` independently of brightness. Its `occupied` attribute
+  is the string `true`, `false` or `unknown`, with a separate `occupancy_reason`. Semantic
+  activity inputs use the shared reader above; combined raw groups retain the bounded union
+  policy. [Lighting actions](../apps/lights/lighting_actions.py) requires a valid `presence_ts`
+  no older than 300 seconds before reading cached occupancy. Unknown occupancy leaves lights
+  unchanged, including when brightness changes. Explicit local occupancy keeps its own owner.
+  [Room-label tests](../apps/lights/tests/test_room_state_occupancy.py) cover publication,
+  serialization, freshness and recovery. This source contract does not establish deployment.
 
 ## 2. Personal sleep and household night
 

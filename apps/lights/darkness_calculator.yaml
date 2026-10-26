@@ -3,7 +3,7 @@
 # Contract:
 #   - Dark/bright is environment only (sun, outdoor lux, rain, indoor daylight),
 #     computed rolling for every zone 24/7. Occupancy NEVER affects dark/bright,
-#     it only sets the Occupied|Empty part of sensor.room_state_* labels.
+#     it only sets the Occupied|Empty|Unknown part of sensor.room_state_* labels.
 #   - Light apps: occupied AND dark -> on; not occupied -> off; occupied AND bright -> off.
 #   - Published state is confirmed only; pending_* attributes are informational.
 #
@@ -146,7 +146,9 @@ darkness_calculator:
       lights: [light.hallway_lights]
       light_on_lux_offset: 700   # measured ~750 lx at the sensor with hallway lights on
 
-  # Occupied|Empty in room_state_* labels only (dark/bright ignores these).
+  # Occupied|Empty|Unknown in room_state_* labels (dark/bright ignores these).
+  # *_active sources use room_active_read's freshness/recovery rules. The raw combined
+  # groupings retain the bounded union policy: any on, else any readable off, else unknown.
   # bedroom also counts input_boolean.bedroom_bed_session (bedroom_lights' 90s-debounced
   # in-bed latch): the raw group flickers off while someone lies still, flipping the label
   # to Empty mid-sleep. Label-only - bedroom_lights derives its own occupancy, no loop.
