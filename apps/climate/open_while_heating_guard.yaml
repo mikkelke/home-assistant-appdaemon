@@ -1,10 +1,12 @@
 open_while_heating_guard:
   module: open_while_heating_guard
   class: OpenWhileHeatingGuard
-  grace_minutes: 15
-  # Outward openings that leak heat while the room's floor heating runs. Interior
+  grace_minutes: 12
+  season_entity: input_boolean.heating_season
+  # Outward openings that leak heat while the room's heating is enabled. Interior
   # doors are not watched. Door 1 serves the living/family room; door 2 serves Claudia.
-  # Use the actual heating-active sensors, not HeatingController's shadow plan.
+  # Heat mode counts even while the valve is idle; ordinary heat cycles do not reset
+  # the 12-minute open allowance. The season switch keeps summer airing silent.
   # Per-room push audience (person names from MobileNotifier's device_mapping).
   # Mikkel gets every room; Kristine/Claudia get their own room + the shared family
   # space (kitchen/living/dining). A name without a mapped phone is skipped.
@@ -12,17 +14,17 @@ open_while_heating_guard:
     bedroom:
       label: "Bedroom"
       contacts: ["binary_sensor.bedroom_window_contact"]
-      heating: "binary_sensor.bedroom_heating_active"
+      thermostat: "climate.bedroom_thermostat"
       notify: ["mikkel"]
     bathroom:
       label: "Bathroom"
       contacts: ["binary_sensor.bathroom_window_contact"]
-      heating: "binary_sensor.bathroom_heating_active"
+      thermostat: "climate.bathroom_thermostat"
       notify: ["mikkel"]
     kitchen:
       label: "Kitchen"
       contacts: ["binary_sensor.kitchen_window_contact"]
-      heating: "binary_sensor.kitchen_heating_active"
+      thermostat: "climate.family_room_thermostat"
       notify: ["mikkel", "kristine", "claudia"]
     living_room:
       label: "Living room"
@@ -31,12 +33,12 @@ open_while_heating_guard:
         - "binary_sensor.rooftop_door_1_contact"
       opening_labels:
         binary_sensor.rooftop_door_1_contact: "rooftop door"
-      heating: "binary_sensor.living_room_heating_active"
+      thermostat: "climate.family_room_thermostat"
       notify: ["mikkel", "kristine", "claudia"]
     kristines_room:
       label: "Kristines room"
       contacts: ["binary_sensor.kristines_room_window_contact"]
-      heating: "binary_sensor.kristines_room_heating_active"
+      thermostat: "climate.kristines_room_thermostat"
       notify: ["mikkel", "kristine"]
     dining_room:
       label: "Dining room"
@@ -44,11 +46,11 @@ open_while_heating_guard:
         - "binary_sensor.dining_room_window_1_contact"
         - "binary_sensor.dining_room_window_2_contact"
         - "binary_sensor.dining_room_window_3_contact"
-      heating: "binary_sensor.dining_room_heating_active"
+      thermostat: "climate.family_room_thermostat"
       notify: ["mikkel", "kristine", "claudia"]
     claudias_room:
       label: "Claudias room"
       opening: "rooftop door"
       contacts: ["binary_sensor.rooftop_door_2_contact"]
-      heating: "binary_sensor.claudias_room_heating_active"
+      thermostat: "climate.claudias_room_thermostat"
       notify: ["mikkel", "claudia"]

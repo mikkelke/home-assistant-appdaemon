@@ -1,6 +1,7 @@
-"""The shipped openings, actual heating signal, grace and shared open-episode reminder."""
+"""Airing allowance follows the opening, independent of floor-heating cycles."""
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import sys
 import types
 import unittest
@@ -22,12 +23,16 @@ from open_while_heating_guard import OpenWhileHeatingGuard  # noqa: E402
 
 DOOR = "binary_sensor.rooftop_door_1_contact"
 WINDOW = "binary_sensor.living_room_window_contact"
-HEATING = "binary_sensor.living_room_heating_active"
+THERMOSTAT = "climate.family_room_thermostat"
+SEASON = "input_boolean.heating_season"
+ACTIVE = "binary_sensor.living_room_heating_active"
 
 
 class OpeningReminder(unittest.TestCase):
     def setUp(self):
-        self.states = {DOOR: "off", WINDOW: "off", HEATING: "off"}
+        self.now = datetime(2026, 10, 27, 20, 0, tzinfo=timezone.utc)
+        self.states = {DOOR: "off", WINDOW: "off", THERMOSTAT: "heat", SEASON: "on", ACTIVE: "off"}
+        self.changed = {}
         self.pending = {}
         self.notifier = MagicMock()
         self.notifier.notify = AsyncMock()
@@ -35,7 +40,8 @@ class OpeningReminder(unittest.TestCase):
         self.app.args = yaml.safe_load((APPS / "open_while_heating_guard.yaml").read_text())[
             "open_while_heating_guard"
         ]
-        self.app.get_state = lambda entity: self.states.get(entity)
+        self.app.get_state = self.get_state
+        self.app.get_now = lambda: self.now
         self.app.get_app = lambda name: self.notifier
         self.app.create_task = asyncio.run
         self.app.listen_state = MagicMock()
@@ -46,6 +52,11 @@ class OpeningReminder(unittest.TestCase):
         self.app.cancel_timer = lambda handle: self.pending.pop(handle, None)
         self.app.initialize()
 
+    def get_state(self, entity, attribute=None):
+        if attribute == "all":
+            return {"state": self.states.get(entity), "last_changed": self.changed.get(entity)}
+        return self.states.get(entity)
+
     def schedule(self, callback, delay, **kwargs):
         handle = object()
         self.pending[handle] = callback, delay, kwargs
@@ -54,68 +65,108 @@ class OpeningReminder(unittest.TestCase):
     def change(self, entity, value):
         old = self.states.get(entity)
         self.states[entity] = value
-        self.app._on_change(entity, "state", old, value, {"room": "living_room"})
+        self.changed[entity] = self.now.isoformat()
+        kwargs = {} if entity == SEASON else {"room": "living_room"}
+        self.app._on_change(entity, "state", old, value, kwargs)
 
-    def elapse(self):
+    def advance(self, seconds):
+        self.now += timedelta(seconds=seconds)
+
+    def elapse(self, expected_delay=12 * 60):
         handle = self.app._timers["living_room"]
         callback, delay, kwargs = self.pending.pop(handle)
-        self.assertEqual(delay, 15 * 60)
+        self.assertEqual(delay, expected_delay)
+        self.advance(delay)
         callback(kwargs)
 
-    def test_door_matches_the_shared_family_zone_and_living_room_feel(self):
+    def test_shipped_rooms_use_their_actual_zone_thermostat(self):
         controller = yaml.safe_load((APPS / "heating_controller.yaml").read_text())["HeatingController"]
         family = controller["zones"]["family"]
         self.assertIn(DOOR, family["openings"])
-        self.assertEqual(family["thermostat"], "climate.family_room_thermostat")
-        feel = next(iter(yaml.safe_load((APPS / "room_feel.yaml").read_text()).values()))
-        living = feel["rooms"]["living_room"]
-        self.assertIn(DOOR, [c if isinstance(c, str) else c["entity"] for c in living["window_contacts"]])
+        for room in ("kitchen", "living_room", "dining_room"):
+            self.assertEqual(self.app.rooms[room]["thermostat"], family["thermostat"])
+        for room in ("bedroom", "bathroom", "kristines_room", "claudias_room"):
+            self.assertEqual(self.app.rooms[room]["thermostat"], f"climate.{room}_thermostat")
+        self.assertEqual(self.app.season_entity, controller["season_entity"])
         self.app.listen_state.assert_any_call(self.app._on_change, DOOR, room="living_room")
-        self.assertEqual(self.app.rooms["living_room"]["heating"], HEATING)
+        self.app.listen_state.assert_any_call(self.app._on_change, THERMOSTAT, room="living_room")
+        self.app.listen_state.assert_any_call(self.app._on_change, SEASON)
 
-    def test_door_alone_reports_after_grace_and_names_the_door(self):
+    def test_idle_heat_warns_after_twelve_minutes_and_names_the_door(self):
         self.change(DOOR, "on")
-        self.assertNotIn("living_room", self.app._timers)
-        self.change(HEATING, "on")
         self.app.fire_event.assert_not_called()
         self.elapse()
+        self.assertEqual(self.states[ACTIVE], "off")
         event = self.app.fire_event.call_args.kwargs
-        self.assertEqual(event["cause"], "Living room rooftop door open 15+ min with heating on")
+        self.assertEqual(event["cause"], "Living room rooftop door open 12+ min with heating on")
+        self.assertIn("Heating is enabled", event["effect"])
         push = self.notifier.notify.await_args.kwargs
         self.assertEqual(push["target"], ["mikkel", "kristine", "claudia"])
         self.assertIn("rooftop door", push["message"])
         self.assertNotIn("window", push["message"])
+        self.assertEqual(self.app.rooms["claudias_room"]["notify"], ["mikkel", "claudia"])
 
-    def test_shadow_plan_and_monitor_cannot_trigger_actual_heating_reminder(self):
-        self.states["sensor.heating_zone_family"] = "hold"
-        self.states["climate.living_room_thermostat"] = "heat"
+    def test_heat_cycles_do_not_reset_pending_allowance(self):
         self.change(DOOR, "on")
-        self.assertNotIn("living_room", self.app._timers)
-        self.app.fire_event.assert_not_called()
-        self.states["sensor.heating_zone_family"] = "off_season"
-        self.states["climate.living_room_thermostat"] = "off"
-        self.change(HEATING, "on")
+        handle = self.app._timers["living_room"]
+        self.change(ACTIVE, "on")
+        self.change(ACTIVE, "off")
+        self.assertIs(self.app._timers["living_room"], handle)
         self.elapse()
         self.app.fire_event.assert_called_once()
 
-    def test_short_airing_or_heating_stopping_cancels_grace(self):
-        self.change(HEATING, "on")
+    def test_short_airing_cancels_and_reopening_gets_a_new_allowance(self):
         self.change(DOOR, "on")
+        handle = self.app._timers["living_room"]
+        self.advance(300)
         self.change(DOOR, "off")
-        self.assertNotIn("living_room", self.app._timers)
+        self.assertNotIn(handle, self.pending)
+        self.assertNotIn("living_room", self.app._opened_at)
         self.change(DOOR, "on")
-        self.change(HEATING, "off")
-        self.assertNotIn("living_room", self.app._timers)
-        self.app.fire_event.assert_not_called()
+        self.elapse()
+        self.app.fire_event.assert_called_once()
+
+    def test_disabled_or_unavailable_heating_is_silent(self):
+        for entity, value in ((SEASON, "off"), (THERMOSTAT, "off"), (THERMOSTAT, "cool"),
+                              (THERMOSTAT, "unavailable"), (SEASON, "unknown")):
+            with self.subTest(entity=entity, value=value):
+                self.change(DOOR, "off")
+                self.states[SEASON], self.states[THERMOSTAT] = "on", "heat"
+                self.change(entity, value)
+                self.change(DOOR, "on")
+                self.elapse()
+                self.app.fire_event.assert_not_called()
+
+    def test_heating_enabled_after_overdue_opening_warns_immediately(self):
+        for entity in (THERMOSTAT, SEASON):
+            with self.subTest(entity=entity):
+                self.change(DOOR, "off")
+                self.change(entity, "off")
+                self.change(DOOR, "on")
+                self.elapse()
+                before = self.app.fire_event.call_count
+                self.change(entity, "heat" if entity == THERMOSTAT else "on")
+                self.assertEqual(self.app.fire_event.call_count, before + 1)
+                self.assertNotIn("living_room", self.app._timers)
+
+    def test_disabling_and_reenabling_does_not_restart_pending_time(self):
+        self.change(DOOR, "on")
+        handle = self.app._timers["living_room"]
+        self.change(THERMOSTAT, "off")
+        self.change(SEASON, "off")
+        self.change(THERMOSTAT, "heat")
+        self.change(SEASON, "on")
+        self.assertIs(self.app._timers["living_room"], handle)
+        self.elapse()
+        self.app.fire_event.assert_called_once()
 
     def test_window_and_door_share_one_episode_across_heat_cycles(self):
-        self.change(HEATING, "on")
         self.change(DOOR, "on")
         self.elapse()
         self.change(WINDOW, "on")
         self.change(DOOR, "off")
-        self.change(HEATING, "off")
-        self.change(HEATING, "on")
+        self.change(THERMOSTAT, "off")
+        self.change(THERMOSTAT, "heat")
         self.assertNotIn("living_room", self.app._timers)
         self.app.fire_event.assert_called_once()
         self.change(WINDOW, "off")
@@ -125,13 +176,64 @@ class OpeningReminder(unittest.TestCase):
         self.assertIn("Living room window", self.app.fire_event.call_args.kwargs["cause"])
         self.assertEqual(self.notifier.notify.await_count, 2)
 
+    def test_overlapping_openings_keep_original_allowance(self):
+        self.change(DOOR, "on")
+        started = self.app._opened_at["living_room"]
+        self.advance(300)
+        self.change(WINDOW, "on")
+        self.change(DOOR, "off")
+        self.assertEqual(self.app._opened_at["living_room"], started)
+
     def test_both_openings_are_named_without_splitting_the_episode(self):
-        self.change(HEATING, "on")
         self.change(DOOR, "on")
         self.change(WINDOW, "on")
         self.elapse()
         self.assertIn("window and rooftop door", self.notifier.notify.await_args.kwargs["message"])
         self.app.fire_event.assert_called_once()
+
+    def test_restart_uses_remaining_open_time(self):
+        self.states[DOOR] = "on"
+        self.changed[DOOR] = (self.now - timedelta(minutes=8)).isoformat()
+        self.app._recheck_all()
+        self.elapse(expected_delay=4 * 60)
+        self.app.fire_event.assert_called_once()
+
+    def test_restart_with_already_overdue_opening_warns_immediately(self):
+        self.states[DOOR] = "on"
+        self.changed[DOOR] = (self.now - timedelta(minutes=20)).isoformat()
+        self.app._recheck_all()
+        self.assertNotIn("living_room", self.app._timers)
+        self.app.fire_event.assert_called_once()
+
+    def test_unknown_contact_recovery_does_not_duplicate_report(self):
+        self.change(DOOR, "on")
+        self.elapse()
+        started = self.app._opened_at["living_room"]
+        self.change(DOOR, "unavailable")
+        self.assertEqual(self.app._opened_at["living_room"], started)
+        self.change(DOOR, "on")
+        self.app.fire_event.assert_called_once()
+        self.assertNotIn("living_room", self.app._timers)
+
+    def test_unknown_contact_recovery_keeps_elapsed_allowance(self):
+        self.change(DOOR, "on")
+        self.advance(300)
+        self.change(DOOR, "unknown")
+        self.assertNotIn("living_room", self.app._timers)
+        self.advance(500)
+        self.change(DOOR, "on")
+        self.app.fire_event.assert_called_once()
+
+    def test_restart_without_valid_timestamp_grants_full_allowance(self):
+        for stamp in (None, "unknown", "2026-10-27T19:00:00", (self.now + timedelta(hours=1)).isoformat()):
+            with self.subTest(stamp=stamp):
+                self.change(DOOR, "off")
+                self.states[DOOR] = "on"
+                self.changed[DOOR] = stamp
+                self.app._recheck_all()
+                before = self.app.fire_event.call_count
+                self.elapse()
+                self.assertEqual(self.app.fire_event.call_count, before + 1)
 
 
 if __name__ == "__main__":
