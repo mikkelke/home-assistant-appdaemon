@@ -2077,8 +2077,8 @@ class OnceTaskTests(unittest.TestCase):
 
     def test_every_task_the_yaml_lists_is_seeded_now_and_shows_the_day_before_its_day_until_done(self):
         self.assertTrue(ONCE)
-        app = make_app(once=CONFIG["once"])
         for task in ONCE.values():
+            app = make_app(once=CONFIG["once"])
             row_id = f"maint:once:{task['slug']}"
             self.assertEqual(state_file(app)["done"][f"once:{task['slug']}"], {"at": core.utc_iso(NOW), "seed": True})
             self.assertNotIn(row_id, rows(app))
