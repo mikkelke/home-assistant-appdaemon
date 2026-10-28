@@ -1,4 +1,7 @@
-"""Alternating bathroom floor-heating mornings for a fixed three-week trial."""
+"""Alternating bathroom floor-heating mornings for a three-week trial.
+
+The trial runs past last_day, up to extend_until, until min_boosts boosts have run.
+"""
 
 from __future__ import annotations
 
@@ -117,6 +120,12 @@ class BathroomBoostTrial(hass.Hass):
         self.last_day = date.fromisoformat(str(self.args.get("last_day")))
         if self.first_day > self.last_day:
             raise ValueError("first_day must not follow last_day")
+        self.min_boosts = self.args.get("min_boosts", 0)
+        if isinstance(self.min_boosts, bool) or not isinstance(self.min_boosts, int) or self.min_boosts < 0:
+            raise ValueError("min_boosts must be a nonnegative integer")
+        self.extend_until = date.fromisoformat(str(self.args.get("extend_until", self.last_day)))
+        if self.extend_until < self.last_day:
+            raise ValueError("extend_until must not precede last_day")
         snapshots = self.args.get("snapshot_times")
         if not isinstance(snapshots, list) or not snapshots:
             raise ValueError("snapshot_times must be a nonempty list")
@@ -133,11 +142,27 @@ class BathroomBoostTrial(hass.Hass):
     def _day_type(self, day):
         return "boost" if (day - self.first_day).days % 2 == 0 else "control"
 
+    def _boosts_done(self):
+        try:
+            with self.log_path.open(encoding="utf-8") as stream:
+                return sum(json.loads(line).get("kind") == "stop" for line in stream if line.strip())
+        except FileNotFoundError:
+            return 0
+        except Exception as error:
+            self.log(f"BathroomBoostTrial: log unreadable: {error}", level="WARNING")
+            return 0
+
+    def _end_day(self, day):
+        if day <= self.last_day or self._boosts_done() >= self.min_boosts:
+            return self.last_day
+        return self.extend_until
+
     def _in_trial(self, now):
-        if now.date() > self.last_day and not self._finished:
+        end_day = self._end_day(now.date())
+        if now.date() > end_day and not self._finished:
             self.log("BathroomBoostTrial: finished", level="INFO")
             self._finished = True
-        return self.first_day <= now.date() <= self.last_day
+        return self.first_day <= now.date() <= end_day
 
     def _snapshot(self, entity):
         try:
@@ -358,7 +383,7 @@ class BathroomBoostTrial(hass.Hass):
             if not 0 <= active["start_ts"] <= now_ts or active["heating_seconds"] < 0:
                 raise ValueError("invalid boost interval")
             day = datetime.fromtimestamp(active["start_ts"], LOCAL_TIMEZONE).date()
-            if not self.first_day <= day <= self.last_day or self._day_type(day) != "boost":
+            if not self.first_day <= day <= self._end_day(day) or self._day_type(day) != "boost":
                 raise ValueError("saved boost is outside the trial")
             started = active.get("heating_started_ts")
             if started is not None and (

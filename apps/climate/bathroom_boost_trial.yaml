@@ -16,5 +16,7 @@ BathroomBoostTrial:
   max_reading_age_hours: 24
   first_day: 2026-10-27
   last_day: 2026-11-16
+  min_boosts: 5
+  extend_until: 2026-12-14
   log_path: /conf/heating_log/bathroom_boost_trial.jsonl
   snapshot_times: ["07:00", "08:30"]

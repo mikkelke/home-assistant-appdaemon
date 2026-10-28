@@ -152,6 +152,9 @@ class Configuration(unittest.TestCase):
             ("latest_end", "02:30"),
             ("first_day", "not-a-date"),
             ("last_day", "2026-10-26"),
+            ("min_boosts", -1),
+            ("min_boosts", True),
+            ("extend_until", "2026-11-15"),
             ("snapshot_times", "07:00"),
             ("snapshot_times", []),
             ("snapshot_times", ["bad"]),
@@ -504,7 +507,7 @@ class LoggingAndFailures(unittest.TestCase):
 
     def test_outside_trial_no_rows_or_writes_and_finished_is_logged_once(self):
         for offset in (-1, 21):
-            h = Harness(self, NOW + timedelta(days=offset))
+            h = Harness(self, NOW + timedelta(days=offset), min_boosts=0)
             for _ in range(3):
                 h.morning()
                 h.tick()
@@ -518,7 +521,7 @@ class LoggingAndFailures(unittest.TestCase):
                 h.app.run_every.assert_not_called()
 
     def test_trial_finishes_when_running_across_last_day(self):
-        h = Harness(self, NOW + timedelta(days=20))
+        h = Harness(self, NOW + timedelta(days=20), min_boosts=0)
         h.morning()
         h.change(FLOOR, 21.5)
         h.app.call_service.reset_mock()
@@ -531,6 +534,25 @@ class LoggingAndFailures(unittest.TestCase):
         self.assertTrue(
             any(call.args[0] == "BathroomBoostTrial: finished" for call in h.app.log.call_args_list)
         )
+
+    def test_too_few_boosts_extend_the_trial_until_extend_until(self):
+        h = Harness(self, NOW + timedelta(days=22))
+        h.morning()
+        self.assertEqual(h.rows("morning")[0]["day_type"], "boost")
+        self.assertEqual(h.app.call_service.call_count, 1)
+        h = Harness(self, datetime(2026, 12, 15, 2, 30, tzinfo=TZ))
+        h.morning()
+        self.assertEqual(h.rows(), [])
+        h.app.call_service.assert_not_called()
+
+    def test_enough_boosts_end_the_trial_on_last_day(self):
+        h = Harness(self, NOW + timedelta(days=22))
+        with Path(h.args["log_path"]).open("w") as stream:
+            for _ in range(5):
+                stream.write(json.dumps({"kind": "stop"}) + "\n")
+        h.morning()
+        h.app.call_service.assert_not_called()
+        self.assertEqual(len(h.rows()), 5)
 
     def test_state_save_failure_prevents_boost(self):
         h = Harness(self)
