@@ -18,8 +18,10 @@ HOST="mke@10.21.0.5"
 cd "$(git rev-parse --show-toplevel)"
 
 # Refuse to overwrite changes from another checkout with an older tree.
-if ! timeout 20 git fetch -q origin master; then
-  echo "WARNING: could not fetch origin master within 20 seconds; using the existing origin/master ref. Fetch successfully before deploying if that ref may be stale." >&2
+if ! timeout 20 git fetch -q origin master \
+  && ! GIT_SSH_COMMAND="ssh -o IdentitiesOnly=yes -i $HOME/.ssh/id_ed25519_github -p 443" \
+    timeout 20 git -c url."git@ssh.github.com:".insteadOf="git@github.com:" fetch -q origin master; then
+  echo "WARNING: could not fetch origin master over port 22 or 443; using the existing origin/master ref. Fetch successfully before deploying if that ref may be stale." >&2
 fi
 if ! git merge-base --is-ancestor origin/master HEAD; then
   echo "FATAL: this tree lacks origin/master commits that are live on the box. Rebase on origin/master before deploying so those changes are preserved." >&2
