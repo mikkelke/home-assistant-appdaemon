@@ -120,10 +120,10 @@ class OpeningReminder(unittest.TestCase):
         self.assertNotIn("window", push["message"])
         self.assertEqual(self.app.rooms["claudias_room"]["notify"], ["mikkel", "claudia"])
 
-    def test_heat_cycles_do_not_reset_pending_allowance(self):
+    def test_heat_stopping_does_not_reset_pending_allowance(self):
+        self.change(ACTIVE, "on")
         self.change(DOOR, "on")
         handle = self.app._timers["living_room"]
-        self.change(ACTIVE, "on")
         self.change(ACTIVE, "off")
         self.assertIs(self.app._timers["living_room"], handle)
         self.elapse()
@@ -343,6 +343,78 @@ class OpeningReminder(unittest.TestCase):
         self.app.log.assert_any_call("living_room: recent heating history unavailable: recorder unavailable", level="WARNING")
         self.change(ACTIVE, "on")
         self.app.fire_event.assert_called_once()
+
+    def test_heat_starts_after_two_minutes_warns_once_and_cancels_grace(self):
+        self.app._last_heated.clear()
+        self.change(DOOR, "on")
+        handle = self.app._timers["living_room"]
+        callback, delay, kwargs = self.pending[handle]
+        self.advance(120)
+        self.change(ACTIVE, "on")
+        self.app.fire_event.assert_called_once()
+        self.assertNotIn(handle, self.pending)
+        self.assertNotIn("living_room", self.app._timers)
+        event = self.app.fire_event.call_args.kwargs
+        self.assertEqual(event["cause"], "Living room heating started while the rooftop door was open")
+        push = self.notifier.notify.await_args.kwargs
+        self.assertIn("heating has started", push["message"])
+        self.assertNotIn("12+", push["message"])
+        self.assertNotIn("12+", event["cause"])
+        self.assertEqual(push["target"], ["mikkel", "kristine", "claudia"])
+        self.advance(delay)
+        callback(kwargs)  # Even an already-dispatched grace callback must stay silent.
+        self.change(ACTIVE, "off")
+        self.change(ACTIVE, "on")
+        self.app.fire_event.assert_called_once()
+        self.assertEqual(self.notifier.notify.await_count, 1)
+
+    def test_heat_start_with_closed_openings_is_silent(self):
+        self.change(ACTIVE, "on")
+        self.app.fire_event.assert_not_called()
+        self.assertNotIn("living_room", self.app._reported)
+
+    def test_opening_while_heat_already_on_keeps_twelve_minute_allowance(self):
+        self.change(ACTIVE, "on")
+        self.change(DOOR, "on")
+        self.app.fire_event.assert_not_called()
+        self.elapse()
+        self.app.fire_event.assert_called_once()
+        self.assertIn("12+ min", self.notifier.notify.await_args.kwargs["message"])
+
+    def test_heat_availability_recovery_does_not_warn_early(self):
+        for previous in (None, "unknown", "unavailable"):
+            with self.subTest(previous=previous):
+                self.change(DOOR, "off")
+                self.states[ACTIVE] = previous
+                self.change(DOOR, "on")
+                handle = self.app._timers["living_room"]
+                self.advance(120)
+                self.change(ACTIVE, "on")
+                self.assertIs(self.app._timers["living_room"], handle)
+                self.app.fire_event.assert_not_called()
+
+    def test_heat_start_requires_enabled_season_and_thermostat(self):
+        for entity, value in ((SEASON, "off"), (THERMOSTAT, "off"), (THERMOSTAT, "cool")):
+            with self.subTest(entity=entity, value=value):
+                self.change(DOOR, "off")
+                self.states[ACTIVE], self.states[SEASON], self.states[THERMOSTAT] = "off", "on", "heat"
+                self.change(entity, value)
+                self.change(DOOR, "on")
+                handle = self.app._timers["living_room"]
+                self.change(ACTIVE, "on")
+                self.assertIs(self.app._timers["living_room"], handle)
+                self.app.fire_event.assert_not_called()
+
+    def test_closure_rearms_early_heat_start_warning(self):
+        self.change(DOOR, "on")
+        self.change(ACTIVE, "on")
+        self.app.fire_event.assert_called_once()
+        self.change(DOOR, "off")
+        self.change(ACTIVE, "off")
+        self.change(DOOR, "on")
+        self.change(ACTIVE, "on")
+        self.assertEqual(self.app.fire_event.call_count, 2)
+        self.assertEqual(self.notifier.notify.await_count, 2)
 
 
 if __name__ == "__main__":

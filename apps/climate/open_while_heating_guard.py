@@ -4,7 +4,8 @@ An outward opening left open for grace_minutes produces one public house-activit
 entry and one mobile push when the room's thermostat is in heat mode, the heating
 season is enabled, and actual heat ran within heating_lookback_hours. The timer measures
 the open episode, not current heat demand: ordinary floor-heating cycles must never
-restart the airing allowance.
+restart the airing allowance. A confirmed off-to-on heat call while an opening is
+already open warns immediately instead of waiting for the allowance.
 
 An episode ends only when all watched contacts in the room are closed. If heating is
 enabled after the allowance has elapsed, warn immediately while the opening is still
@@ -104,6 +105,10 @@ class OpenWhileHeatingGuard(hass.Hass):
         if room in self.rooms and entity == self.rooms[room].get("heating"):
             if new == "on" or (old == "on" and new == "off"):
                 self._remember_heat(room, self.get_now().timestamp())
+            if (old == "off" and new == "on" and room not in self._reported
+                    and self._open_contacts(room) and self._heating_enabled(room)):
+                self._cancel(room)
+                self._report(room, heating_started=True)
         if room is None:
             self._recheck_all()
         else:
@@ -180,7 +185,7 @@ class OpenWhileHeatingGuard(hass.Hass):
         self._timers.pop(room, None)
         self._evaluate(room)
 
-    def _report(self, room):
+    def _report(self, room, heating_started=False):
         try:
             self._reported.add(room)
             cfg = self.rooms.get(room) or {}
@@ -190,20 +195,28 @@ class OpenWhileHeatingGuard(hass.Hass):
                 labels.get(contact, cfg.get("opening", "window"))
                 for contact in self._open_contacts(room)
             ))
+            cause = (
+                f"{label} heating started while the {opening} was open" if heating_started else
+                f"{label} {opening} open {self.grace_min:.0f}+ min in a recently heated room"
+            )
+            effect = (
+                f"Heating started with an open {opening} - worth closing it soon" if heating_started else
+                f"The room has been heated recently - worth closing the {opening} soon"
+            )
             self.fire_event(
                 "house_events_report",
-                cause=f"{label} {opening} open {self.grace_min:.0f}+ min in a recently heated room",
+                cause=cause,
                 # Reader-neutral wording (user 2026-07-30): the log is read by anybody, so no
                 # "you" - the phone push keeps its personal phrasing, this entry does not.
-                effect=f"The room has been heated recently - worth closing the {opening} soon",
+                effect=effect,
                 icon="mdi:window-open-variant",
             )
-            self._push(room, cfg, label, opening)
+            self._push(room, cfg, label, opening, heating_started=heating_started)
             self.log(f"{room}: open-{opening}-while-heating reported")
         except Exception as e:
             self.log(f"report failed for {room}: {e}", level="WARNING")
 
-    def _push(self, room, cfg, label, opening):
+    def _push(self, room, cfg, label, opening, heating_started=False):
         """One mobile push per episode, to the room's own audience (yaml `notify` list).
         Fail-soft on every step - a missing MobileNotifier or an unmapped recipient must
         never take the feed entry (already sent) down with it."""
@@ -215,11 +228,18 @@ class OpenWhileHeatingGuard(hass.Hass):
             if notifier is None:
                 self.log(f"{room}: MobileNotifier not available, push skipped", level="WARNING")
                 return
+            title = ("Heating started with an open " + opening if heating_started else
+                     "Open " + opening + " in a heated room")
+            message = (
+                f"{label}: heating has started while the {opening} is open - close it when you can."
+                if heating_started else
+                f"{label}: the {opening} has been open {self.grace_min:.0f}+ min. "
+                f"The room has been heated recently - close it when you can."
+            )
             self.create_task(
                 notifier.notify(
-                    title="Open " + opening + " in a heated room",
-                    message=f"{label}: the {opening} has been open {self.grace_min:.0f}+ min. "
-                            f"The room has been heated recently - close it when you can.",
+                    title=title,
+                    message=message,
                     target=list(recipients),
                 )
             )

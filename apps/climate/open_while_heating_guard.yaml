@@ -8,6 +8,7 @@ open_while_heating_guard:
   # doors are not watched. Door 1 serves the living/family room; door 2 serves Claudia.
   # Heat mode alone is not enough: actual heat must be on now or confirmed within
   # the preceding 24 hours. Ordinary heat cycles do not reset the opening allowance.
+  # A confirmed new heat call while an opening is already open warns immediately.
   # The season switch keeps summer airing silent.
   # Per-room push audience (person names from MobileNotifier's device_mapping).
   # Mikkel gets every room; Kristine/Claudia get their own room + the shared family
