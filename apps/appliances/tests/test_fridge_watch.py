@@ -201,8 +201,7 @@ class AlertPush(unittest.TestCase):
         app.notifier.notify.assert_awaited_once_with(
             title="Køleskab kører uafbrudt",
             message="Kompressoren har kørt i 3 t. Står døren på klem?",
-            target="home",
-            category="fridge",
+            target="mikkel",
             data={"tag": "fridge_health"},
         )
         self.assertEqual(published(app)[-1][0], "long_run")
@@ -272,8 +271,7 @@ class AlertPush(unittest.TestCase):
             {
                 "title": "Vinkøleskab kører uafbrudt",
                 "message": "Kompressoren har kørt i 45 min. Står døren på klem?",
-                "target": "home",
-                "category": "fridge",
+                "target": "mikkel",
                 "data": {"tag": "wine_fridge_health"},
             },
         )
@@ -482,11 +480,11 @@ class Registration(unittest.TestCase):
 
     def test_optional_args_default(self):
         app = make_app()
-        self.assertEqual((app.running_w, app.off_hold_s, app.category), (20.0, 120.0, "fridge"))
+        self.assertEqual((app.running_w, app.off_hold_s, app.notify_target), (20.0, 120.0, "mikkel"))
 
     def test_optional_args_can_be_set(self):
-        app = make_app(args={**ARGS, "running_w": 35, "off_hold_s": 300, "category": "kitchen"})
-        self.assertEqual((app.running_w, app.off_hold_s, app.category), (35.0, 300.0, "kitchen"))
+        app = make_app(args={**ARGS, "running_w": 35, "off_hold_s": 300, "notify_target": "kristine"})
+        self.assertEqual((app.running_w, app.off_hold_s, app.notify_target), (35.0, 300.0, "kristine"))
 
     def test_required_args(self):
         for key in ARGS:

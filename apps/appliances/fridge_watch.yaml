@@ -1,10 +1,9 @@
 # /conf/apps/appliances/fridge_watch.yaml
-# Pushes the household once when a fridge compressor runs without a break for too long (door left
+# Pushes notify_target once when a fridge compressor runs without a break for too long (door left
 # ajar, or a failing fridge). One yaml instance per fridge - see fridge_watch.py's module docstring
 # for the run rule. Publishes <health_entity> (ok | long_run) with a `reason` attribute.
 #
-# Push: MobileNotifier home broadcast, category "fridge" (no category_audience entry, so everyone
-# mapped who is home gets it).
+# Push: MobileNotifier to notify_target, whether or not that person is home.
 #
 # Args: running_w = power at or above which the compressor counts as running; off_hold_s = how long
 # power must stay below running_w before a run counts as ended; alert_minutes = run length that
@@ -21,6 +20,7 @@ FridgeWatch:
   power_sensor: sensor.fridge_plug_power
   health_entity: sensor.fridge_health
   display_name: Køleskab
+  notify_target: mikkel
   alert_minutes: 180
   running_w: 20
   off_hold_s: 120
@@ -32,6 +32,7 @@ WineFridgeWatch:
   power_sensor: sensor.wine_fridge_power
   health_entity: sensor.wine_fridge_health
   display_name: Vinkøleskab
+  notify_target: mikkel
   alert_minutes: 45
   running_w: 20
   off_hold_s: 120

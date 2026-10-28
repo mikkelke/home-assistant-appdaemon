@@ -4,9 +4,9 @@ FridgeWatch - one push when a fridge compressor runs without a break for too lon
 A fridge that cannot hold its temperature (door left ajar, failing compressor) never switches
 off, which its own plug shows. A run starts when power reaches `running_w` and ends only once
 power has stayed below it for `off_hold_s`, so a short dip does not split a run. A run that
-reaches `alert_minutes` pushes the household once through MobileNotifier (home broadcast,
-category "fridge"); a push that reached nobody is retried every RETRY_S. When the run ends the
-fridge is "ok" again and the next long run pushes again.
+reaches `alert_minutes` pushes `notify_target` once through MobileNotifier, home or away; a push
+that reached nobody is retried every RETRY_S. When the run ends the fridge is "ok" again and the
+next long run pushes again.
 
 Publishes `health_entity` (ok | long_run) with a `reason` attribute and the current run's start
 and length. AppDaemon-published sensors vanish when Home Assistant restarts, so the entity is
@@ -59,7 +59,7 @@ class FridgeWatch(hass.Hass):
         self.alert_minutes = a["alert_minutes"]
         self.running_w = float(a.get("running_w", 20))
         self.off_hold_s = float(a.get("off_hold_s", 120))
-        self.category = a.get("category", "fridge")
+        self.notify_target = a.get("notify_target", "mikkel")
 
         self.alert_s = float(self.alert_minutes) * 60
         self._tag = self.health_entity.split(".", 1)[-1]
@@ -179,8 +179,7 @@ class FridgeWatch(hass.Hass):
             sent = await self._notifier.notify(
                 title=f"{self.display_name} kører uafbrudt",
                 message=f"Kompressoren har kørt i {_duration(minutes, 't')}. Står døren på klem?",
-                target="home",
-                category=self.category,
+                target=self.notify_target,
                 data={"tag": self._tag},
             )
         except Exception as e:
