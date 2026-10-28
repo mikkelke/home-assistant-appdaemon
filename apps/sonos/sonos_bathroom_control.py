@@ -178,6 +178,14 @@ class SonosBathroomControl(hass.Hass):
         scene = data.get("property_key")
         # self.log(f"Volume event. Scene: {scene}, Data: {data}") # Can be verbose
 
+        # A press while nothing plays is usually someone looking for the light switch, and the
+        # state reset only restores the volume after playback, so the change would stick.
+        if scene in (self.zwave_property_key_volume_up, self.zwave_property_key_volume_down):
+            state = self.get_state(self.media_player)
+            if state != "playing":
+                self.log(f"Volume button (Scene {scene}) ignored: {self.media_player} is {state}")
+                return
+
         if scene == self.zwave_property_key_volume_up:
             self.log(f"Volume Up triggered for {self.media_player} (Scene {scene})")
             self._adjust_volume(self.volume_step)
