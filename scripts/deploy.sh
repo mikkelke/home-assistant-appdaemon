@@ -3,6 +3,9 @@
 #
 # Usage: scripts/deploy.sh
 #   Deploys ALL git-tracked files under apps/ (rsync only sends content changes).
+#   Requires origin/master to be an ancestor of HEAD and warns on unpushed commits.
+#   Dirty tracked apps/ files require DEPLOY_ALLOW_DIRTY=1. Uncommitted box drift
+#   requires DEPLOY_FORCE=1; box content matching recent commits is safe to update.
 #
 # Native production_mode must be true. The remote helper serializes cooperating
 # deploys, journals pending work before transfer, verifies bytes, then signals
@@ -13,6 +16,25 @@ set -euo pipefail
 HOST="mke@10.21.0.5"
 
 cd "$(git rev-parse --show-toplevel)"
+
+# Refuse to overwrite changes from another checkout with an older tree.
+if ! timeout 20 git fetch -q origin master; then
+  echo "WARNING: could not fetch origin master within 20 seconds; using the existing origin/master ref. Fetch successfully before deploying if that ref may be stale." >&2
+fi
+if ! git merge-base --is-ancestor origin/master HEAD; then
+  echo "FATAL: this tree lacks origin/master commits that are live on the box. Rebase on origin/master before deploying so those changes are preserved." >&2
+  exit 1
+fi
+if ! git merge-base --is-ancestor HEAD origin/master; then
+  echo "WARNING: HEAD has commits not on origin/master. Push before or right after deploying so other checkouts can include these changes." >&2
+fi
+if ! git diff --quiet -- apps/ || ! git diff --cached --quiet -- apps/; then
+  if [ "${DEPLOY_ALLOW_DIRTY:-}" != "1" ]; then
+    echo "FATAL: tracked files under apps/ have staged or unstaged changes. Commit them before deploying so other checkouts can preserve your work, or set DEPLOY_ALLOW_DIRTY=1 to deploy these uncommitted changes." >&2
+    exit 1
+  fi
+  echo "WARNING: deploying uncommitted apps/ changes because DEPLOY_ALLOW_DIRTY=1. Commit and push them so other checkouts can preserve your work." >&2
+fi
 
 # 1. compile gate
 mapfile -t pyfiles < <(git ls-files 'apps/**/*.py' 'apps/*.py')
@@ -62,12 +84,9 @@ git ls-files apps > "$LIST"
 mapfile -t TRACKED < "$LIST"
 python3 scripts/appdaemon_deploy.py --manifest > "$MANIFEST"
 
-# 3a. pre-deploy drift guard: every tracked file on the box should currently
-# match either the last commit or the working tree we're about to send. A
-# file matching neither means an earlier deploy (e.g. a stale sibling
-# worktree) silently reverted it - undetected on the box 08-13 through 08-19
-# until it caused a production incident. This never aborts: deploying is
-# exactly what fixes drift. It only makes drift loud instead of silent.
+# 3a. pre-deploy drift guard: tracked box files must match the working tree,
+# HEAD, or a recent commit. Other content may be someone's uncommitted work;
+# abort before overwriting it unless DEPLOY_FORCE=1 explicitly allows it.
 if [ "${#TRACKED[@]}" -gt 0 ]; then
   BOXHASHES=$(printf '%s\n' "${TRACKED[@]}" | ssh -o BatchMode=yes "$HOST" '
     cd /data/appdaemon || exit 1
@@ -99,7 +118,7 @@ if [ "${#TRACKED[@]}" -gt 0 ]; then
   # pre-deploy state, not drift - warning on it every deploy would teach everyone to ignore
   # the block. Second pass, drifted candidates only: match the box hash against the file's
   # last 20 historical blobs; a hit downgrades to one quiet "behind" line. Only content
-  # matching NO recent commit keeps the loud warning.
+  # matching NO recent commit blocks the deploy unless DEPLOY_FORCE=1.
   behind=()
   true_drift=()
   for f in "${drifted[@]}"; do
@@ -122,16 +141,15 @@ if [ "${#TRACKED[@]}" -gt 0 ]; then
     done
   fi
   if [ "${#true_drift[@]}" -gt 0 ]; then
-    echo ""
-    echo "=================================================================="
-    echo "WARNING: box content drift detected - ${#true_drift[@]} file(s) match"
-    echo "         neither the working tree, HEAD, nor any of the last 20"
-    echo "         commits of that file (stale sibling-worktree deploy?):"
+    if [ "${DEPLOY_FORCE:-}" = "1" ]; then
+      echo "WARNING: box content drift detected in ${#true_drift[@]} file(s), matching neither this tree, HEAD nor recent commits. Overwriting because DEPLOY_FORCE=1; get the live uncommitted work committed and rebase to preserve it." >&2
+    else
+      echo "FATAL: box content drift detected in ${#true_drift[@]} file(s), matching neither this tree, HEAD nor recent commits. Someone's uncommitted work is live; get it committed and rebase before deploying, or set DEPLOY_FORCE=1 to overwrite it." >&2
+    fi
     for f in "${true_drift[@]}"; do
-      echo "  DRIFT: $f"
+      echo "  DRIFT: $f" >&2
     done
-    echo "=================================================================="
-    echo ""
+    if [ "${DEPLOY_FORCE:-}" != "1" ]; then exit 1; fi
   fi
 fi
 
