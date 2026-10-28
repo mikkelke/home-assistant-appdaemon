@@ -42,6 +42,10 @@ class OpeningReminder(unittest.TestCase):
         ]
         self.app.get_state = self.get_state
         self.app.get_now = lambda: self.now
+        self.app.get_history = MagicMock(return_value=[[
+            self.history_row("on", self.now - timedelta(hours=1)),
+            self.history_row("off", self.now - timedelta(minutes=30)),
+        ]])
         self.app.get_app = lambda name: self.notifier
         self.app.create_task = asyncio.run
         self.app.listen_state = MagicMock()
@@ -51,6 +55,12 @@ class OpeningReminder(unittest.TestCase):
         self.app.timer_running = lambda handle: handle in self.pending
         self.app.cancel_timer = lambda handle: self.pending.pop(handle, None)
         self.app.initialize()
+        self.app.get_history.assert_not_called()
+        self.app._startup_recheck({})
+
+    @staticmethod
+    def history_row(state, when):
+        return {"state": state, "last_changed": when.isoformat()}
 
     def get_state(self, entity, attribute=None):
         if attribute == "all":
@@ -88,6 +98,10 @@ class OpeningReminder(unittest.TestCase):
         for room in ("bedroom", "bathroom", "kristines_room", "claudias_room"):
             self.assertEqual(self.app.rooms[room]["thermostat"], f"climate.{room}_thermostat")
         self.assertEqual(self.app.season_entity, controller["season_entity"])
+        self.assertEqual(self.app.heating_lookback_s, 24 * 3600)
+        for room, cfg in self.app.rooms.items():
+            self.assertEqual(cfg["heating"], f"binary_sensor.{room}_heating_active")
+        self.app.listen_state.assert_any_call(self.app._on_change, ACTIVE, room="living_room")
         self.app.listen_state.assert_any_call(self.app._on_change, DOOR, room="living_room")
         self.app.listen_state.assert_any_call(self.app._on_change, THERMOSTAT, room="living_room")
         self.app.listen_state.assert_any_call(self.app._on_change, SEASON)
@@ -98,8 +112,8 @@ class OpeningReminder(unittest.TestCase):
         self.elapse()
         self.assertEqual(self.states[ACTIVE], "off")
         event = self.app.fire_event.call_args.kwargs
-        self.assertEqual(event["cause"], "Living room rooftop door open 12+ min with heating on")
-        self.assertIn("Heating is enabled", event["effect"])
+        self.assertEqual(event["cause"], "Living room rooftop door open 12+ min in a recently heated room")
+        self.assertIn("heated recently", event["effect"])
         push = self.notifier.notify.await_args.kwargs
         self.assertEqual(push["target"], ["mikkel", "kristine", "claudia"])
         self.assertIn("rooftop door", push["message"])
@@ -234,6 +248,101 @@ class OpeningReminder(unittest.TestCase):
                 before = self.app.fire_event.call_count
                 self.elapse()
                 self.assertEqual(self.app.fire_event.call_count, before + 1)
+
+    def test_heat_mode_without_actual_use_is_silent(self):
+        self.app._last_heated.clear()
+        self.change(DOOR, "on")
+        self.elapse()
+        self.app.fire_event.assert_not_called()
+        self.assertNotIn("living_room", self.app._reported)
+
+    def test_confirmed_recent_heat_expires_after_twenty_four_hours(self):
+        self.app._last_heated["living_room"] = self.now.timestamp() - 24 * 3600 + 1
+        self.assertTrue(self.app._heating_enabled("living_room"))
+        self.advance(2)
+        self.assertFalse(self.app._heating_enabled("living_room"))
+
+    def test_current_heat_qualifies_even_when_run_started_over_a_day_ago(self):
+        self.app._last_heated["living_room"] = self.now.timestamp() - 30 * 3600
+        self.states[ACTIVE] = "on"
+        self.assertTrue(self.app._heating_enabled("living_room"))
+        self.change(ACTIVE, "off")
+        ended = self.now.timestamp()
+        self.assertEqual(self.app._last_heated["living_room"], ended)
+        self.advance(24 * 3600 - 1)
+        self.assertTrue(self.app._heating_enabled("living_room"))
+        self.advance(2)
+        self.assertFalse(self.app._heating_enabled("living_room"))
+
+    def test_heat_begins_while_opening_overdue_warns_immediately(self):
+        self.app._last_heated.clear()
+        self.change(DOOR, "on")
+        self.elapse()
+        self.app.fire_event.assert_not_called()
+        self.change(ACTIVE, "on")
+        self.app.fire_event.assert_called_once()
+
+    def test_history_initial_off_is_not_proof_of_heating(self):
+        self.app._last_heated.clear()
+        self.app.get_history.return_value = [[self.history_row("off", self.now - timedelta(hours=1))]]
+        self.app._startup_recheck({})
+        self.assertFalse(self.app._heating_enabled("living_room"))
+        self.assertEqual(self.app._last_heated, {})
+
+    def test_history_long_run_uses_recent_end_not_old_start(self):
+        self.app._last_heated.clear()
+        self.app.get_history.return_value = [[
+            self.history_row("on", self.now - timedelta(hours=30)),
+            self.history_row("off", self.now - timedelta(hours=2)),
+        ]]
+        self.app._startup_recheck({})
+        self.assertTrue(self.app._heating_enabled("living_room"))
+        self.assertEqual(self.app._last_heated["living_room"], self.now.timestamp() - 2 * 3600)
+        call = self.app.get_history.call_args.kwargs
+        self.assertEqual(call["start_time"], self.now - timedelta(hours=24))
+        self.assertTrue(call["minimal_response"])
+        self.assertTrue(call["no_attributes"])
+
+    def test_history_unknown_gap_does_not_extend_confirmed_heat(self):
+        self.app._last_heated.clear()
+        self.app.get_history.return_value = [[
+            self.history_row("on", self.now - timedelta(hours=30)),
+            self.history_row("unavailable", self.now - timedelta(hours=2)),
+            self.history_row("off", self.now - timedelta(hours=1)),
+        ]]
+        self.app._startup_recheck({})
+        self.assertFalse(self.app._heating_enabled("living_room"))
+        self.assertEqual(self.app._last_heated["living_room"], self.now.timestamp() - 30 * 3600)
+
+    def test_live_unknown_to_off_is_not_proof_of_recent_heat(self):
+        self.app._last_heated.clear()
+        self.change(ACTIVE, "unknown")
+        self.change(ACTIVE, "off")
+        self.assertFalse(self.app._heating_enabled("living_room"))
+
+    def test_history_cannot_overwrite_newer_live_heat(self):
+        self.app._last_heated.clear()
+
+        def history_during_live_event(**kwargs):
+            self.change(ACTIVE, "on")
+            self.change(ACTIVE, "off")
+            return [[self.history_row("on", self.now - timedelta(hours=2)),
+                     self.history_row("off", self.now - timedelta(hours=1))]]
+
+        self.app.get_history.side_effect = history_during_live_event
+        self.app._startup_recheck({})
+        self.assertEqual(self.app._last_heated["living_room"], self.now.timestamp())
+
+    def test_history_failure_is_silent_until_actual_heat_observed(self):
+        self.app._last_heated.clear()
+        self.app.get_history.side_effect = RuntimeError("recorder unavailable")
+        self.app._startup_recheck({})
+        self.change(DOOR, "on")
+        self.elapse()
+        self.app.fire_event.assert_not_called()
+        self.app.log.assert_any_call("living_room: recent heating history unavailable: recorder unavailable", level="WARNING")
+        self.change(ACTIVE, "on")
+        self.app.fire_event.assert_called_once()
 
 
 if __name__ == "__main__":

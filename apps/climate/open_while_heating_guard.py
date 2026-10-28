@@ -1,9 +1,10 @@
 """Open-window/door-while-heating guard - whole-apartment.
 
 An outward opening left open for grace_minutes produces one public house-activity
-entry and one mobile push when the room's thermostat is in heat mode and the heating
-season is enabled. The timer measures the open episode, not the thermostat's current
-heat demand: ordinary floor-heating cycles must never restart the airing allowance.
+entry and one mobile push when the room's thermostat is in heat mode, the heating
+season is enabled, and actual heat ran within heating_lookback_hours. The timer measures
+the open episode, not current heat demand: ordinary floor-heating cycles must never
+restart the airing allowance.
 
 An episode ends only when all watched contacts in the room are closed. If heating is
 enabled after the allowance has elapsed, warn immediately while the opening is still
@@ -14,7 +15,7 @@ Interior room doors are deliberately not watched - heat moving between rooms is 
 waste. The living-room window and terrace door share one open episode.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
@@ -24,24 +25,75 @@ class OpenWhileHeatingGuard(hass.Hass):
         self.grace_min = float(self.args.get("grace_minutes", 12))
         self.rooms = self.args.get("rooms") or {}
         self.season_entity = self.args.get("season_entity")
+        self.heating_lookback_s = float(self.args.get("heating_lookback_hours", 24)) * 3600
+        self._last_heated = {}  # room -> latest confirmed heat observation or on-to-off edge
         self._timers = {}  # room -> pending grace run_in handle
         self._opened_at = {}  # room -> beginning of the current open episode
         self._reported = set()  # rooms whose current open-episode already produced an entry
         for room, cfg in self.rooms.items():
             for contact in cfg.get("contacts", []):
                 self.listen_state(self._on_change, contact, room=room)
-            thermostat = cfg.get("thermostat")
-            if thermostat:
-                self.listen_state(self._on_change, thermostat, room=room)
+            for signal in (cfg.get("thermostat"), cfg.get("heating")):
+                if signal:
+                    self.listen_state(self._on_change, signal, room=room)
         if self.season_entity:
             self.listen_state(self._on_change, self.season_entity)
-        # Recover the remaining grace from the contacts' last_changed timestamps.
-        self.run_in(lambda _: self._recheck_all(), 10)
+        # Recorder I/O runs after initialize; recover recent heat and remaining open time.
+        self.run_in(self._startup_recheck, 10)
         self.log(f"OpenWhileHeatingGuard: {len(self.rooms)} rooms, grace {self.grace_min:.0f} min")
 
     def terminate(self):
         for room in list(self._timers):
             self._cancel(room)
+
+    def _startup_recheck(self, kwargs):
+        now = self.get_now().timestamp()
+        for room, cfg in self.rooms.items():
+            heating = cfg.get("heating")
+            if not heating:
+                continue
+            try:
+                raw = self.get_history(
+                    entity_id=heating,
+                    start_time=datetime.fromtimestamp(now - self.heating_lookback_s, timezone.utc),
+                    end_time=datetime.fromtimestamp(now, timezone.utc),
+                    minimal_response=True,
+                    no_attributes=True,
+                )
+                last_heated = self._history_last_heated(raw, now)
+                if last_heated is not None:
+                    self._remember_heat(room, last_heated)
+            except Exception as e:
+                self.log(f"{room}: recent heating history unavailable: {e}", level="WARNING")
+        recent = ", ".join(room for room in self.rooms if self._recent_heat(room)) or "none"
+        self.log(f"OpenWhileHeatingGuard: heating within {self.heating_lookback_s / 3600:g}h: {recent}")
+        self._recheck_all()
+
+    @staticmethod
+    def _history_last_heated(raw, now):
+        """A closing off edge proves an on interval; an initial off row proves nothing."""
+        points = []
+        for group in raw or []:
+            rows = [group] if isinstance(group, dict) else group
+            for row in rows or []:
+                try:
+                    changed = datetime.fromisoformat(str(row.get("last_changed") or row.get("last_updated")))
+                    if changed.tzinfo is not None and changed.timestamp() <= now:
+                        points.append((changed.timestamp(), row.get("state")))
+                except (AttributeError, TypeError, ValueError):
+                    continue
+        last_heated = None
+        was_on = False
+        for ts, state in sorted(points, key=lambda item: item[0]):
+            if state == "on" or (state == "off" and was_on):
+                last_heated = ts
+            # An unavailable gap cannot be filled with assumed heating.
+            was_on = state == "on"
+        return last_heated
+
+    def _remember_heat(self, room, timestamp):
+        # Recorder queries may return after a newer live heating observation.
+        self._last_heated[room] = max(timestamp, self._last_heated.get(room, timestamp))
 
     def _recheck_all(self):
         for room in self.rooms:
@@ -49,6 +101,9 @@ class OpenWhileHeatingGuard(hass.Hass):
 
     def _on_change(self, entity, attribute, old, new, kwargs):
         room = kwargs.get("room")
+        if room in self.rooms and entity == self.rooms[room].get("heating"):
+            if new == "on" or (old == "on" and new == "off"):
+                self._remember_heat(room, self.get_now().timestamp())
         if room is None:
             self._recheck_all()
         else:
@@ -66,7 +121,17 @@ class OpenWhileHeatingGuard(hass.Hass):
             and self.get_state(self.season_entity) == "on"
             and bool(thermostat)
             and self.get_state(thermostat) == "heat"
+            and self._recent_heat(room)
         )
+
+    def _recent_heat(self, room):
+        heating = self.rooms[room].get("heating")
+        now = self.get_now().timestamp()
+        if heating and self.get_state(heating) == "on":
+            self._remember_heat(room, now)
+            return True
+        last_heated = self._last_heated.get(room)
+        return last_heated is not None and 0 <= now - last_heated <= self.heating_lookback_s
 
     def _episode_start(self, contacts, now):
         """Use the oldest currently open contact after a reload; missing dates start now."""
@@ -127,10 +192,10 @@ class OpenWhileHeatingGuard(hass.Hass):
             ))
             self.fire_event(
                 "house_events_report",
-                cause=f"{label} {opening} open {self.grace_min:.0f}+ min with heating on",
+                cause=f"{label} {opening} open {self.grace_min:.0f}+ min in a recently heated room",
                 # Reader-neutral wording (user 2026-07-30): the log is read by anybody, so no
                 # "you" - the phone push keeps its personal phrasing, this entry does not.
-                effect=f"Heating is enabled with an open {opening} - worth closing it soon",
+                effect=f"The room has been heated recently - worth closing the {opening} soon",
                 icon="mdi:window-open-variant",
             )
             self._push(room, cfg, label, opening)
@@ -152,9 +217,9 @@ class OpenWhileHeatingGuard(hass.Hass):
                 return
             self.create_task(
                 notifier.notify(
-                    title="Open " + opening + " with heating on",
-                    message=f"{label}: the {opening} has been open {self.grace_min:.0f}+ min with the "
-                            f"heating on - close it when you can.",
+                    title="Open " + opening + " in a heated room",
+                    message=f"{label}: the {opening} has been open {self.grace_min:.0f}+ min. "
+                            f"The room has been heated recently - close it when you can.",
                     target=list(recipients),
                 )
             )
