@@ -513,9 +513,9 @@ class ShippedYaml(unittest.TestCase):
         for zone in a.zones:
             self.assertEqual(a.rooms[zone], self.cfg.zones[zone].control_air, zone)
 
-    def test_family_profile_is_minus_half_nights_and_mornings_plus_half_evenings(self):
+    def test_family_profile_is_minus_half_nights_and_mornings(self):
         periods = {(p.start, p.end): p.offset for p in self.cfg.zones["family"].profile.periods}
-        self.assertEqual(periods, {(23 * 60, 10 * 60): -0.5, (17 * 60, 23 * 60): 0.5})
+        self.assertEqual(periods, {(23 * 60, 10 * 60): -0.5})
 
     def test_bathroom_heats_in_the_morning_window_only(self):
         zc = self.cfg.zones["bathroom"]
@@ -1266,10 +1266,10 @@ class OffSeasonPlan(unittest.TestCase):
         a = h.attrs("family")
         self.assertEqual(
             [(b["start"], b["end"], b["setpoint"]) for b in a["day_blocks"]],
-            [("12:00", "13:00", "22.0"), ("13:00", "19:00", "22.5"), ("19:00", "24:00", "21.5")],
+            [("12:00", "19:00", "22.0"), ("19:00", "24:00", "21.5")],
         )
-        self.assertEqual(a["next_change_at"], "2026-10-17T13:00:00+02:00")
-        self.assertEqual(a["next_setpoint"], 22.5)
+        self.assertEqual(a["next_change_at"], "2026-10-17T19:00:00+02:00")
+        self.assertEqual(a["next_setpoint"], 21.5)
         self.assertEqual(a["trim"], "+0.50")
         self.assertEqual(a["nudge"], "+0.0")
         self.assertEqual(a["lower_limit"], 19.0)
@@ -2221,12 +2221,12 @@ class WeatherOffsetEndToEnd(unittest.TestCase):
         h.tick()
         a = h.attrs("family")
         self.assertEqual(
-            (a["next_change_at"], a["next_setpoint"]), ("2026-10-17T13:00:00+02:00", 22.5)
+            (a["next_change_at"], a["next_setpoint"]), ("2026-10-17T19:00:00+02:00", 21.5)
         )
         self.forecast(h, -3.0, -3.0)
         h.tick(minutes=1)
         a = h.attrs("family")
-        self.assertEqual((a["setpoint_now"], a["next_setpoint"]), (22.5, 23.0))
+        self.assertEqual((a["setpoint_now"], a["next_setpoint"]), (22.5, 22.0))
 
     def test_an_airing_takes_the_raise_away_until_it_is_over(self):
         h = self.cold_house()
@@ -2517,8 +2517,8 @@ class TerminateAndEvents(unittest.TestCase):
         h.tick()
         blocks = h.attrs("family")["day_blocks"]
         self.assertEqual(blocks[-1]["end"], "24:00")
-        self.assertEqual([b["setpoint"] for b in blocks], ["22.0", "22.5", "21.5"])
-        self.assertEqual(h.attrs("family")["next_change_at"], "2026-10-25T13:00:00+01:00")
+        self.assertEqual([b["setpoint"] for b in blocks], ["22.0", "21.5"])
+        self.assertEqual(h.attrs("family")["next_change_at"], "2026-10-25T19:00:00+01:00")
 
     def test_a_day_without_ticks_is_not_reported(self):
         h = Harness(self)
@@ -2552,8 +2552,7 @@ class Timeline(unittest.TestCase):
             [(b["start"], b["end"], b["setpoint"]) for b in blocks],
             [
                 ("05:50", "06:05", "21.5"),
-                ("06:05", "13:00", "22.0"),
-                ("13:00", "19:00", "22.5"),
+                ("06:05", "19:00", "22.0"),
                 ("19:00", "24:00", "21.5"),
             ],
         )
@@ -2749,9 +2748,7 @@ class DailyRollup(unittest.TestCase):
         self.assertEqual(rec["trim_bias"], 0.6)
         self.assertGreaterEqual(rec["trim_valid_hours"], 6)
         self.assertEqual(rec["call_hours"], 6.0)
-        self.assertEqual(
-            rec["in_band_pct"], 37.5
-        )  # only the evening target (22.0) is within 0.5 of 22.2
+        self.assertEqual(rec["in_band_pct"], 0.0)  # no target of the day is within 0.5 of 22.2
         self.assertEqual(rec["ticks"], 24 * 12)
         house = [r for r in h.log_lines("daily") if r["zone"] == "_house"]
         self.assertEqual(len(house), 1)
