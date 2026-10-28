@@ -344,7 +344,14 @@ class HouseUpcoming(hass.Hass):
             feed = maint.reading((self._cache.get(plant["conductivity"]) or {}).get("state"))
             found.append(plants.plant_row(entity, plant, self._plant_latches[entity], value, feed))
             self._track_watering(plant, value, now)
-        found.append(self._plants_row(now))
+        overview = self._plants_row(now)
+        due_plants = [item[0] for item in found if item and item[0]["id"].startswith(plants.ID_PREFIX)
+                      and "at" not in item[0]]
+        if overview and due_plants:
+            for row in due_plants:
+                row["items"] = overview[0]["items"]
+        else:
+            found.append(overview)
         for item in found:
             if item:
                 rows.append(item[0])

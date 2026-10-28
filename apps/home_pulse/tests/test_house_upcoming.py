@@ -1778,7 +1778,8 @@ class TimedPlantTests(unittest.TestCase):
         app = self.make()
         self.assertEqual(rows(app)["maint:plants"]["items"], ["Monstera: 24.10, watered 14.10"])
         tick(app, 10 * DAY)
-        self.assertEqual(rows(app)["maint:plants"]["title"], "Plants: 1 of 1 due")
+        self.assertNotIn("maint:plants", rows(app))
+        self.assertEqual(rows(app)[self.ROW]["items"], ["Monstera: due 24.10, watered 14.10"])
         self.done(app)
         self.assertEqual(app.reports, [("house_events_report", {"text": "Watered Monstera",
                                                                 "icon": "mdi:watering-can-outline",
@@ -1788,7 +1789,8 @@ class TimedPlantTests(unittest.TestCase):
                          ("Plants: next 03.11", ["Monstera: 03.11, watered 24.10"]))
         self.undo(app)
         self.assertEqual(app.reports[-1][1]["text"], "Watering of Monstera taken back")
-        self.assertEqual(rows(app)["maint:plants"]["items"], ["Monstera: due 24.10, watered 14.10"])
+        self.assertNotIn("maint:plants", rows(app))
+        self.assertEqual(rows(app)[self.ROW]["items"], ["Monstera: due 24.10, watered 14.10"])
         self.assertEqual(len(app.reports), 2)
 
     def test_from_march_to_september_every_watering_comes_with_feed(self):
@@ -1910,15 +1912,63 @@ class PlantOverviewTests(unittest.TestCase):
         self.assertIn(self.ROW, rows(app))
         self.assertLessEqual(len(rows(app)), core.MAX_ROWS)
 
-    def test_a_dry_sensor_plant_and_a_due_plant_head_the_list_and_the_title(self):
+    def test_each_due_row_carries_the_list_and_its_info_instead_of_the_overview(self):
         states = base_states()
         states[MOISTURE] = full("12")
-        app = make_app(states, plants=[SAMPLE_PLANT, SAMPLE_TIMED])
+        sensor = {**SAMPLE_PLANT, "aka": "Bird of paradise", "where": "By the window"}
+        timed = {**SAMPLE_TIMED, "aka": "Split leaves", "where": "On the shelf"}
+        future = {**SAMPLE_TIMED, "name": "Aloe", "every_days": 11}
+        app = make_app(states, plants=[sensor, timed, future])
+        self.assertNotIn(self.ROW, rows(app))
+        self.assertEqual(rows(app)["maint:plant:strelitzia"]["items"], [
+            "Strelitzia: dry, soil 12%, at 15%", "Monstera: 24.10, watered 14.10",
+            "Aloe: 25.10, watered 14.10"])
         tick(app, 10 * DAY)
-        row = rows(app)[self.ROW]
-        self.assertEqual((row["title"], row["detail"]), ("Plants: 2 of 2 due", "Monstera, Strelitzia"))
-        self.assertEqual(row["items"], ["Monstera: due 24.10, watered 14.10", "Strelitzia: dry, soil 12%, at 15%"])
-        self.assertNotIn("at", row)
+        self.assertNotIn(self.ROW, rows(app))
+        for row_id, info in (("maint:plant:strelitzia", ["Bird of paradise", "By the window"]),
+                             ("maint:plant:monstera", ["Split leaves", "On the shelf", "Every 10 days",
+                                                      "Counting from 14.10"])):
+            row = rows(app)[row_id]
+            self.assertEqual(row["items"], ["Monstera: due 24.10, watered 14.10",
+                                            "Strelitzia: dry, soil 12%, at 15%", "Aloe: 25.10, watered 14.10"])
+            self.assertEqual(row["info"], info)
+            self.assertNotIn("at", row)
+            self.assertTrue(core.is_valid_row(row))
+        self.assertNotIn("items", rows(app)["maint:plant:aloe"])
+
+    def test_a_calendar_row_gets_the_list_on_its_due_day_and_keeps_it_when_overdue(self):
+        app = make_app(plants=[SAMPLE_TIMED])
+        tick(app, 9 * DAY)
+        self.assertIn(self.ROW, rows(app))
+        self.assertNotIn("items", rows(app)["maint:plant:monstera"])
+        for _ in range(2):
+            tick(app, DAY)
+            self.assertNotIn(self.ROW, rows(app))
+            self.assertEqual(rows(app)["maint:plant:monstera"]["items"],
+                             ["Monstera: due 24.10, watered 14.10"])
+
+    def test_the_overview_stays_when_no_sensor_row_is_due_and_returns_after_watering(self):
+        app = make_app(plants=[SAMPLE_PLANT])
+        overview = rows(app)[self.ROW]
+        self.assertEqual((overview["title"], overview["detail"]), ("Plants: none due", "1 plants"))
+        self.assertNotIn("at", overview)
+        fire(app, MOISTURE, full("12"))
+        self.assertNotIn(self.ROW, rows(app))
+        fire(app, MOISTURE, full("unknown"))
+        self.assertIn(self.ROW, rows(app))
+        self.assertNotIn("maint:plant:strelitzia", rows(app))
+        fire(app, MOISTURE, full("20"))
+        self.assertEqual(rows(app)[self.ROW]["title"], "Plants: none due")
+
+    def test_a_due_rows_list_keeps_the_overviews_limit_and_remainder(self):
+        calendar = [{**SAMPLE_TIMED, "name": f"Plant {i:02d}", "every_days": 10 + i} for i in range(25)]
+        app = make_app(plants=calendar)
+        before = rows(app)[self.ROW]["items"]
+        self.assertEqual((len(before), before[-1]), (core.ITEMS_MAX, "+6 more"))
+        tick(app, 10 * DAY)
+        self.assertNotIn(self.ROW, rows(app))
+        items = rows(app)["maint:plant:plant_00"]["items"]
+        self.assertEqual(items, ["Plant 00: due 24.10, watered 14.10", *before[1:]])
 
 
 class OnceTaskTests(unittest.TestCase):

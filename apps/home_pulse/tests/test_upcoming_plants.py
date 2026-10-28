@@ -552,6 +552,7 @@ class CalendarRowTests(unittest.TestCase):
         self.assertEqual(row["info"], ["Every 10 days", "Counting from 20.10"])
         self.assertNotIn("next", row)
         self.assertNotIn("steps", row)
+        self.assertNotIn("items", row)
         self.assertIsNone(key)
         self.assertTrue(core.is_valid_row(row))
 
@@ -771,11 +772,12 @@ class OverviewTests(unittest.TestCase):
 
     def test_only_twenty_lines_fit_and_the_rest_is_counted(self):
         timed = [(self.timed(f"Plant {i:02d}", 10 + i), self.anchor()) for i in range(25)]
-        row = self.row(timed=timed)
-        self.assertEqual(len(row["items"]), core.ITEMS_MAX)
-        self.assertEqual(row["items"][-1], "+6 more")
-        self.assertTrue(row["items"][0].startswith("Plant 00"))
-        self.assertTrue(core.is_valid_row(row))
+        for now in (self.NOW, self.NOW + 20 * DAY):
+            row = self.row(timed=timed, now=now)
+            self.assertEqual(len(row["items"]), core.ITEMS_MAX)
+            self.assertEqual(row["items"][-1], "+6 more")
+            self.assertTrue(row["items"][0].startswith("Plant 00"))
+            self.assertTrue(core.is_valid_row(row))
 
     def test_no_plants_no_row_and_a_plant_without_a_usable_anchor_has_no_line(self):
         self.assertIsNone(self.row())

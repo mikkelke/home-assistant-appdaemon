@@ -16,12 +16,13 @@ never was. A succulent (`feed: summer`) is fed from March to September only, and
 FEED_EVERY_DAYS days. The anchor keeps `fed_at`, set by a Done that said to feed and carried over by one
 that did not; a seed counts as a feeding at the moment it is made.
 
-Every plant is also one line in the `items` of a single row, `maint:plants`, which is always there: its title
-counts the plants due and its detail names them, or the title gives the next due day, and the lines say when
-each plant is due (a sensor plant: its soil and its dry level) and when it was last watered, the plants due
-first. A calendar plant was last watered at its anchor's time. A sensor plant was watered when its soil
-moisture rose RISE_POINTS or more within RISE_WINDOW and then stopped climbing for RISE_SETTLE; that moment is
-what `step_rise` finds, live and in the recorder's history.
+Every plant is also one line in the `items` of each untimed, due plant row, with `maint:plants` omitted while
+any such row is there. Otherwise `maint:plants` carries the lines and gives the next due day or says none due.
+Dated plant rows do not carry the list. The lines say when each plant is due (a sensor plant: its soil and
+its dry level) and when it was last watered, the plants due first, capped at ITEMS_MAX. A calendar plant was
+last watered at its anchor's time. A sensor plant was watered when its soil moisture rose RISE_POINTS or
+more within RISE_WINDOW and then stopped climbing for RISE_SETTLE; that moment is what `step_rise` finds,
+live and in the recorder's history.
 
 A sensor plant is dry once its soil moisture reading, in percent, is at or under its `dry`, and stays dry
 until a reading is CLOSE_MARGIN above it: watering makes the reading jump, while a reading wandering
