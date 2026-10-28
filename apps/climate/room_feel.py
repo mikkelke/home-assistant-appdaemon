@@ -5,10 +5,10 @@ with slab (floor) sensors, the kitchen ceiling unit and window-side units treate
 they physically are.
 
 Physical facts this fusion respects:
-  - Salus wall thermostats (climate.<room>_thermostat, ~1.5 m) and FP300 mmWave presence
-    sensors (sensor.<room>_presence_temperature/_humidity) are the AIR sources - equal
-    weight, fused by median. Kristine's room has no FP300; several rooms have no ceiling
-    or ceiling-adjacent ambient sensor at all.
+  - Seated thermometers, Salus wall thermostats (climate.<room>_thermostat) and FP300
+    presence sensors (sensor.<room>_presence_temperature/_humidity) are AIR sources,
+    offset-corrected onto the seated scale. `median` gives fresh sources equal weight;
+    `primary` uses the first source alone while fresh, then the remaining sources' median.
   - kitchen/dining_room/living_room/hallway share ONE physical Salus (the hallway master,
     climate.family_room_thermostat) - their per-room sensor.<room>_temperature/_humidity
     clones are template duplicates of that same reading and are never read here. hallway
@@ -16,21 +16,20 @@ Physical facts this fusion respects:
     kitchen/dining_room/living_room it hangs in the hallway, not in the room, and reads warmer
     than the air people sit in, so it is a `fallback_only` source there.
   - climate.living_room_thermostat is a monitor on a living-room wall (zone 8, no actuator)
-    that can be sunlit: a `fallback_only` source marked `sun_flag`.
-  - Floor thermometers (SNZB-02P) are SLAB sensors, not air: 0.5-1.5 C below the wall
-    units with a multi-hour lag. Never a primary vote - only a `floor+0.5` backup estimate
-    when no air source reads at all, and the published `floor_spread_c` (air - floor)
+    that can be sunlit: a source marked `sun_flag`.
+  - Floor thermometers are SLAB sensors, not air, with a multi-hour lag. Never a primary
+    vote - only a backup estimate with the room's `floor_offset_c` (default +0.5 C)
+    when no fresh air source reads, and the published `floor_spread_c` (air - floor)
     heating-season signal.
-  - The kitchen Twinguard ceiling unit is a THIRD source for kitchen only, offset-corrected
-    (it reads warm/dry vs the wall units).
+  - The kitchen Twinguard ceiling unit is an offset-corrected air source for kitchen only.
   - kitchen/dining_room FP300s sit window-adjacent (sun/draft biased); when the rooftop
     solar sensor is over threshold during that room's configured sun window, that FP300 is
     dropped from the median as long as another air source still reads.
 
-Source roles: a plain source votes. `sun_flag` drops it from the median while the room's
-sun_hit is active, as long as another air source still reads. `fallback_only` sources vote
-only while no plain source is left, which includes the case where the sun exclusion removed
-the last plain one.
+Source roles: a plain source votes while its temperature or humidity entity is fresh.
+`sun_flag` drops it while the room's sun_hit is active, as long as another fresh air source
+still reads. `fallback_only` sources vote only while no plain source is left, which includes
+the case where the sun exclusion removed the last plain one.
 
 Publish contract: one direction, no consumers read this app's own output back in. Booleans
 (window_open/sun_hit/airing_helps/stale) are published as the literal strings "true"/"false"
@@ -44,8 +43,8 @@ worth it, and the numbers rule below is the real safety net: nothing here is eve
 fabricated 0.
 
 Numbers rule: unavailable/unknown/non-numeric readings are excluded with a reason and never
-enter the median as a 0. A room left with zero readable air source falls back to
-floor+0.5 C; a room with neither air nor floor readable publishes state "unavailable"
+enter the median as a 0. A room left with zero fresh, readable air sources falls back to
+floor plus its offset; a room with neither air nor floor readable publishes state "unavailable"
 (still not a fake number).
 
 Also publishes two renamed single-source readings via the same fusion path:
@@ -313,9 +312,11 @@ class RoomFeel(hass.Hass):
             }
 
         return {
+            "fusion": raw.get("fusion", "median"),
             "air_sources": [RoomFeel._parse_source(s) for s in (raw.get("air_sources") or [])],
             "floor_entity": raw.get("floor_entity"),
             "floor_rh_entity": raw.get("floor_rh_entity"),
+            "floor_offset_c": float(raw.get("floor_offset_c", 0.5)),
             "window_contacts": [RoomFeel._parse_window_contact(c) for c in (raw.get("window_contacts") or [])],
             "air_quality": air_quality_cfg,
             "sun_hit": sun_hit_cfg,
@@ -412,13 +413,24 @@ class RoomFeel(hass.Hass):
             if t_reason is not None:
                 excluded.append(f"{src['entity']}: {t_reason}")
                 continue
+            freshness_entities = [src["entity"]]
+            if src["rh_entity"]:
+                freshness_entities.append(src["rh_entity"])
+            age = self._freshest_age_minutes(freshness_entities, now)
             t_val += src["offset_c"]
             rh_val = None
             if src["rh_entity"]:
                 rh_raw, rh_reason = self._read(src["rh_entity"], src["rh_attribute"])
                 if rh_reason is None and rh_raw is not None:
                     rh_val = rh_raw + src["offset_rh"]
-            valid.append({"src": src, "temp": t_val, "rh": rh_val})
+            valid.append({"src": src, "temp": t_val, "rh": rh_val,
+                          "stale": age is not None and age > self.stale_minutes})
+
+        # A stale source drops out only while a fresh one still reads.
+        if any(not e["stale"] for e in valid):
+            for entry in [e for e in valid if e["stale"]]:
+                valid.remove(entry)
+                excluded.append(f"{entry['src']['entity']}: stale")
 
         sun_hit = self._sun_hit_active(cfg["sun_hit"], now)
         sun_excluded = None
@@ -437,6 +449,11 @@ class RoomFeel(hass.Hass):
         # Fallback-only sources vote only while no primary source is left.
         primaries = [e for e in valid if not e["src"]["fallback_only"]]
         used = primaries or valid
+        if cfg["fusion"] == "primary":
+            reference = cfg["air_sources"][0] if cfg["air_sources"] else None
+            primary = next((e for e in valid if e["src"] is reference), None)
+            if primary is not None:
+                used = [primary]
 
         used_entities = []
         if used:
@@ -453,12 +470,12 @@ class RoomFeel(hass.Hass):
             if not primaries:
                 reason += " (fallback: no primary air source in use)"
         elif floor_temp is not None:
-            temp_raw = floor_temp + 0.5
+            temp_raw = floor_temp + cfg["floor_offset_c"]
             rh = floor_rh
             used_entities = [cfg["floor_entity"]]
             if cfg["floor_rh_entity"] and floor_rh is not None:
                 used_entities.append(cfg["floor_rh_entity"])
-            reason = "floor+0.5°C fallback (no air source available)"
+            reason = f"floor{cfg['floor_offset_c']:+g}°C fallback (no air source available)"
         else:
             temp_raw = None
             rh = None
@@ -575,6 +592,7 @@ class RoomFeel(hass.Hass):
             "sun_hit": "true" if sun_hit else "false",
             "airing_helps": "true" if helps else "false",
             "mould_risk": mould,
+            "fusion": cfg["fusion"],
             "sources": used_entities or ["<none>"],
             "excluded": excluded or ["<none>"],
             "stale": "true" if stale else "false",

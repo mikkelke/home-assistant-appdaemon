@@ -48,15 +48,23 @@ RoomFeel:
 
   rooms:
     bedroom:
+      fusion: primary
       air_sources:
+        - entity: sensor.bedroom_seated_thermometer_temperature
+          rh_entity: sensor.bedroom_seated_thermometer_humidity
+          label: seated
+          offset_c: 0.0
         - entity: climate.bedroom_thermostat
           attribute: current_temperature
           rh_entity: sensor.bedroom_humidity
           label: salus
+          offset_c: -0.1
         - entity: sensor.bedroom_presence_temperature
           rh_entity: sensor.bedroom_presence_humidity
           label: fp300
+          offset_c: 0.3
       floor_entity: sensor.bedroom_floor_thermometer_temperature
+      floor_offset_c: 0.2
       # sensor.bedroom_floor_thermometer_humidity: UNVERIFIED (only the _temperature side
       # is read anywhere else in this repo; SNZB-02P is a combo temp+humidity sensor so the
       # channel likely exists under this name).
@@ -64,19 +72,23 @@ RoomFeel:
       window_contacts: [binary_sensor.bedroom_window_contact]
 
     living_room:
+      fusion: median
       air_sources:
+        - entity: sensor.living_room_seated_thermometer_temperature
+          rh_entity: sensor.living_room_seated_thermometer_humidity
+          label: seated
+          offset_c: 0.0
         - entity: sensor.living_room_presence_temperature
           rh_entity: sensor.living_room_presence_humidity
           label: fp300
-        # Zone 8 monitor on a living-room wall: it can be sunlit and has no sun mask yet, so
-        # it only stands in for the FP300.
+          offset_c: 0.1
         - entity: climate.living_room_thermostat
           attribute: current_temperature
           rh_entity: climate.living_room_thermostat
           rh_attribute: current_humidity
           label: salus_monitor
           sun_flag: true
-          fallback_only: true
+          offset_c: 0.2
         # The hallway thermostat reads warmer than the air people sit in.
         - entity: climate.family_room_thermostat
           attribute: current_temperature
@@ -84,29 +96,38 @@ RoomFeel:
           rh_attribute: current_humidity
           label: salus_family
           fallback_only: true
+          offset_c: -0.5
       floor_entity: sensor.living_room_floor_thermometer_temperature
+      floor_offset_c: 0.2
       floor_rh_entity: sensor.living_room_floor_thermometer_humidity
       window_contacts:
         - binary_sensor.living_room_window_contact
         - {entity: binary_sensor.rooftop_door_1_contact, label: rooftop door}
 
     kitchen:
+      fusion: median
       air_sources:
+        - entity: sensor.kitchen_seated_thermometer_temperature
+          rh_entity: sensor.kitchen_seated_thermometer_humidity
+          label: seated
+          offset_c: 0.0
         - entity: sensor.kitchen_presence_temperature
           rh_entity: sensor.kitchen_presence_humidity
           label: fp300
           sun_flag: true
+          offset_c: 0.45
+        - entity: sensor.kitchen_smoke_alarm_temperature
+          rh_entity: sensor.kitchen_smoke_alarm_humidity
+          label: ceiling
+          offset_c: -0.1
+          offset_rh: 1.8
         - entity: climate.family_room_thermostat
           attribute: current_temperature
           rh_entity: climate.family_room_thermostat
           rh_attribute: current_humidity
           label: salus_family
           fallback_only: true
-        - entity: sensor.kitchen_smoke_alarm_temperature
-          rh_entity: sensor.kitchen_smoke_alarm_humidity
-          label: ceiling
-          offset_c: -0.5
-          offset_rh: 1.8
+          offset_c: -0.2
       # No floor thermometer in the kitchen.
       window_contacts: [binary_sensor.kitchen_window_contact]
       air_quality:
@@ -122,18 +143,26 @@ RoomFeel:
         end: "15:00"
 
     dining_room:
+      fusion: primary
       air_sources:
+        - entity: sensor.dining_room_seated_thermometer_temperature
+          rh_entity: sensor.dining_room_seated_thermometer_humidity
+          label: seated
+          offset_c: 0.0
         - entity: sensor.dining_room_presence_temperature
           rh_entity: sensor.dining_room_presence_humidity
           label: fp300
           sun_flag: true
+          offset_c: 0.15
         - entity: climate.family_room_thermostat
           attribute: current_temperature
           rh_entity: climate.family_room_thermostat
           rh_attribute: current_humidity
           label: salus_family
           fallback_only: true
+          offset_c: -0.9
       floor_entity: sensor.dining_room_floor_thermometer_temperature
+      floor_offset_c: -0.6
       floor_rh_entity: sensor.dining_room_floor_thermometer_humidity
       window_contacts:
         - binary_sensor.dining_room_window_1_contact
@@ -165,30 +194,44 @@ RoomFeel:
         eco2_entity: sensor.kitchen_smoke_alarm_eco2
 
     claudias_room:
+      fusion: primary
       air_sources:
+        - entity: sensor.claudias_room_seated_thermometer_temperature
+          rh_entity: sensor.claudias_room_seated_thermometer_humidity
+          label: seated
+          offset_c: 0.0
         - entity: sensor.claudias_room_presence_temperature
           rh_entity: sensor.claudias_room_presence_humidity
           label: fp300
+          offset_c: 0.1
         - entity: climate.claudias_room_thermostat
           attribute: current_temperature
           rh_entity: sensor.claudias_room_humidity
           label: salus
+          offset_c: -0.1
       floor_entity: sensor.claudias_room_floor_thermometer_temperature
+      floor_offset_c: 0.6
       floor_rh_entity: sensor.claudias_room_floor_thermometer_humidity
       # Her only outward opening is the rooftop door (open_while_heating_guard.yaml) -
       # the room has no window contact of its own.
       window_contacts: [{entity: binary_sensor.rooftop_door_2_contact, label: rooftop door}]
 
     kristines_room:
+      fusion: primary
       air_sources:
-        # No FP300 in Kristine's room - Salus is the sole/primary source.
+        - entity: sensor.kristines_room_seated_thermometer_temperature
+          rh_entity: sensor.kristines_room_seated_thermometer_humidity
+          label: seated
+          offset_c: 0.0
         - entity: climate.kristines_room_thermostat
           attribute: current_temperature
           # sensor.kristines_room_humidity: UNVERIFIED (pattern-inferred from
           # sensor.bedroom_humidity/sensor.claudias_room_humidity, not grepped directly).
           rh_entity: sensor.kristines_room_humidity
           label: salus
+          offset_c: -1.2
       floor_entity: sensor.kristines_room_floor_thermometer_temperature
+      floor_offset_c: -0.2
       floor_rh_entity: sensor.kristines_room_floor_thermometer_humidity
       window_contacts: [binary_sensor.kristines_room_window_contact]
 

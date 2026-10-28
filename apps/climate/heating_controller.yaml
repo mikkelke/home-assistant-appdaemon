@@ -179,12 +179,12 @@ HeatingController:
       floor_max_c: 24.5
       openings: [binary_sensor.kristines_room_window_contact]
       target_entity: input_number.heating_target_kristines_room
-      base_c: 21.5
+      base_c: 20.5
       lower_limit_c: 19.0
       upper_limit_c: 24.0
       protected_min_offset_c: -0.5
       profile: {lead_hours: 4}
-      trim: {initial: 0.0, min: -1.0, max: 1.0}
+      trim: {initial: 1.2, min: -1.0, max: 2.0}
       budget: {changepoint: {k: 0.17, base_c: 15.5}}
       residents: [kristine]
       nudge: {min: -1.0, max: 1.0, step: 0.5}

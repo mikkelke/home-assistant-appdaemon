@@ -337,6 +337,105 @@ class CeilingOffsetApplied(unittest.TestCase):
         self.assertEqual(a["rh"], 38.0)  # round(38.5, 0) -> banker's rounding to 38
 
 
+class FusionModes(unittest.TestCase):
+    def _room(self, fusion="primary", reference="20.0", last_updated=None, **overrides):
+        cfg = {
+            "fusion": fusion,
+            "air_sources": [
+                {"entity": "sensor.seated", "rh_entity": "sensor.seated_rh"},
+                {"entity": "sensor.fp300", "offset_c": 0.5},
+                {"entity": "sensor.salus", "offset_c": -1.0},
+                {"entity": "sensor.family", "offset_c": -0.5, "fallback_only": True},
+            ],
+        }
+        plain = {"sensor.seated": reference, "sensor.seated_rh": "50",
+                 "sensor.fp300": "22.0", "sensor.salus": "24.0", "sensor.family": "30.0"}
+        plain.update(overrides)
+        app = _make_app({"room": cfg}, plain=plain, last_updated=last_updated)
+        app._evaluate_room("room")
+        return app._captured["sensor.room_feel"]
+
+    def test_primary_uses_only_the_fresh_reference(self):
+        cap = self._room()
+        self.assertEqual(cap["state"], 20.0)
+        self.assertEqual(cap["attrs"]["fusion"], "primary")
+        self.assertEqual(cap["attrs"]["sources"], ["sensor.seated", "sensor.seated_rh"])
+        self.assertEqual(cap["attrs"]["history_entity"], "sensor.seated")
+        self.assertEqual(cap["attrs"]["stale"], "false")
+
+    def test_primary_falls_back_to_corrected_median_when_reference_is_stale(self):
+        old = (NOW - timedelta(minutes=90)).isoformat()
+        cap = self._room(last_updated={"sensor.seated": old, "sensor.seated_rh": old})
+        self.assertEqual(cap["state"], 22.8)
+        self.assertEqual(cap["attrs"]["sources"], ["sensor.fp300", "sensor.salus"])
+        self.assertIn("sensor.seated: stale", cap["attrs"]["excluded"])
+        self.assertEqual(cap["attrs"]["stale"], "false")
+
+    def test_primary_falls_back_when_reference_is_unavailable(self):
+        cap = self._room(reference="unavailable")
+        self.assertEqual(cap["state"], 22.8)
+        self.assertIn("sensor.seated: unavailable", cap["attrs"]["excluded"])
+
+    def test_primary_falls_back_to_fallback_only_when_regular_sources_are_unavailable(self):
+        cap = self._room(reference="unavailable", **{
+            "sensor.fp300": "unknown", "sensor.salus": "unavailable"})
+        self.assertEqual(cap["state"], 29.5)
+        self.assertEqual(cap["attrs"]["sources"], ["sensor.family"])
+        self.assertIn("fallback", cap["attrs"]["reason"])
+
+    def test_primary_humidity_update_keeps_reference_fresh(self):
+        old = (NOW - timedelta(minutes=90)).isoformat()
+        fresh = (NOW - timedelta(minutes=5)).isoformat()
+        cap = self._room(last_updated={"sensor.seated": old, "sensor.seated_rh": fresh})
+        self.assertEqual(cap["state"], 20.0)
+        self.assertEqual(cap["attrs"]["stale"], "false")
+
+    def test_primary_temperature_update_keeps_reference_fresh(self):
+        old = (NOW - timedelta(minutes=90)).isoformat()
+        cap = self._room(last_updated={"sensor.seated_rh": old})
+        self.assertEqual(cap["state"], 20.0)
+        self.assertEqual(cap["attrs"]["stale"], "false")
+
+    def test_reference_at_freshness_boundary_is_used(self):
+        boundary = (NOW - timedelta(minutes=45)).isoformat()
+        cap = self._room(last_updated={"sensor.seated": boundary, "sensor.seated_rh": boundary})
+        self.assertEqual(cap["state"], 20.0)
+
+    def test_median_uses_offsets_and_ignores_fallback_only(self):
+        cap = self._room(fusion="median")
+        self.assertEqual(cap["state"], 22.5)
+        self.assertEqual(cap["attrs"]["fusion"], "median")
+        self.assertNotIn("sensor.family", cap["attrs"]["sources"])
+
+    def test_median_excludes_stale_sources(self):
+        old = (NOW - timedelta(minutes=90)).isoformat()
+        cap = self._room(fusion="median", last_updated={"sensor.salus": old})
+        self.assertEqual(cap["state"], 21.2)
+        self.assertIn("sensor.salus: stale", cap["attrs"]["excluded"])
+
+    def test_stale_regular_sources_allow_a_fresh_fallback_only_source(self):
+        old = (NOW - timedelta(minutes=90)).isoformat()
+        cap = self._room(fusion="median", last_updated={
+            "sensor.seated": old, "sensor.seated_rh": old,
+            "sensor.fp300": old, "sensor.salus": old})
+        self.assertEqual(cap["state"], 29.5)
+        self.assertEqual(cap["attrs"]["sources"], ["sensor.family"])
+        self.assertEqual(cap["attrs"]["stale"], "false")
+
+    def test_primary_respects_sun_exclusion(self):
+        cfg = dict(DINING_CFG, fusion="primary")
+        app = _make_app({"dining_room": cfg}, plain={
+            "sensor.dining_room_presence_temperature": "26.0",
+            "sensor.gw2000a_solar_radiation": "300",
+        }, attrs={
+            ("climate.family_room_thermostat", "current_temperature"): 22.0,
+        }, get_now=lambda: NOW.replace(hour=8))
+        app._evaluate_room("dining_room")
+        cap = app._captured["sensor.dining_room_feel"]
+        self.assertEqual(cap["state"], 22.0)
+        self.assertIn("sensor.dining_room_presence_temperature: sun_hit", cap["attrs"]["excluded"])
+
+
 class SunHitExclusion(unittest.TestCase):
     def test_sun_hit_excludes_flagged_fp300_when_others_remain(self):
         app = _make_app({"kitchen": KITCHEN_CFG}, plain={
@@ -392,6 +491,43 @@ class SunHitExclusion(unittest.TestCase):
 
 
 class FloorOnlyFallback(unittest.TestCase):
+    def test_per_room_floor_offsets(self):
+        for offset in (-0.6, 0.0, 0.2, 0.6):
+            with self.subTest(offset=offset):
+                cfg = dict(BEDROOM_CFG, floor_offset_c=offset)
+                app = _make_app({"bedroom": cfg}, plain={
+                    "sensor.bedroom_floor_thermometer_temperature": "19.0",
+                })
+                app._evaluate_room("bedroom")
+                cap = app._captured["sensor.bedroom_feel"]
+                self.assertEqual(cap["state"], round(19.0 + offset, 1))
+                self.assertIn(f"floor{offset:+g}°C", cap["attrs"]["reason"])
+
+    def test_stale_air_still_beats_a_fresh_floor(self):
+        old = (NOW - timedelta(minutes=90)).isoformat()
+        app = _make_app({"bedroom": BEDROOM_CFG}, plain={
+            "sensor.bedroom_presence_temperature": "22.0",
+            "sensor.bedroom_floor_thermometer_temperature": "19.0",
+        }, last_updated={
+            "sensor.bedroom_presence_temperature": old,
+            "sensor.bedroom_presence_humidity": old,
+        })
+        app._evaluate_room("bedroom")
+        cap = app._captured["sensor.bedroom_feel"]
+        self.assertEqual(cap["state"], 22.0)
+        self.assertEqual(cap["attrs"]["stale"], "true")
+
+    def test_stale_floor_fallback_is_marked_stale(self):
+        app = _make_app({"bedroom": BEDROOM_CFG}, plain={
+            "sensor.bedroom_floor_thermometer_temperature": "19.0",
+        }, last_updated={
+            "sensor.bedroom_floor_thermometer_temperature": (NOW - timedelta(minutes=90)).isoformat(),
+        })
+        app._evaluate_room("bedroom")
+        cap = app._captured["sensor.bedroom_feel"]
+        self.assertEqual(cap["state"], 19.5)
+        self.assertEqual(cap["attrs"]["stale"], "true")
+
     def test_all_air_sources_dead_uses_floor_plus_half(self):
         app = _make_app({"bedroom": BEDROOM_CFG}, plain={
             "climate.bedroom_thermostat": "unavailable",
@@ -621,6 +757,7 @@ class StaleFlag(unittest.TestCase):
         app._evaluate_room("bedroom")
         a = app._captured["sensor.bedroom_feel"]["attrs"]
         self.assertEqual(a["stale"], "true")
+        self.assertEqual(app._captured["sensor.bedroom_feel"]["state"], 22.0)
 
     def test_stale_false_when_fresh(self):
         fresh_ts = (NOW - timedelta(minutes=5)).isoformat()
@@ -647,6 +784,9 @@ class StaleFlag(unittest.TestCase):
             "sensor.bedroom_presence_humidity": "unavailable",
         }, attrs={
             ("climate.bedroom_thermostat", "current_temperature"): 22.0,
+        }, last_updated={
+            "climate.bedroom_thermostat": None,
+            "sensor.bedroom_humidity": "invalid",
         })
         app._evaluate_room("bedroom")
         a = app._captured["sensor.bedroom_feel"]["attrs"]
@@ -741,6 +881,8 @@ class TechnicalRoomFeel(unittest.TestCase):
 class ParseRoomDefaults(unittest.TestCase):
     def test_missing_optional_keys_default_safely(self):
         cfg = rf.RoomFeel._parse_room({"air_sources": [{"entity": "sensor.x"}]})
+        self.assertEqual(cfg["fusion"], "median")
+        self.assertEqual(cfg["floor_offset_c"], 0.5)
         self.assertIsNone(cfg["floor_entity"])
         self.assertIsNone(cfg["sun_hit"])
         self.assertIsNone(cfg["air_quality"])
@@ -949,9 +1091,9 @@ class ShippedRoomFeelConfig(unittest.TestCase):
         # hallway has no sensor of its own, so there it is the plain source
         self.assertFalse(self._source("hallway", "climate.family_room_thermostat").get("fallback_only"))
 
-    def test_the_living_room_monitor_is_a_sun_flagged_stand_in(self):
+    def test_the_living_room_monitor_is_a_sun_flagged_plain_voter(self):
         src = self._source("living_room", "climate.living_room_thermostat")
-        self.assertTrue(src.get("fallback_only"))
+        self.assertFalse(src.get("fallback_only"))
         self.assertTrue(src.get("sun_flag"))
         self.assertEqual(src["attribute"], "current_temperature")
 
@@ -963,8 +1105,34 @@ class ShippedRoomFeelConfig(unittest.TestCase):
         ):
             self.assertFalse(self._source(room, entity).get("fallback_only"), room)
 
-    def test_shipped_living_room_follows_the_fp300_and_survives_its_loss(self):
+    def test_seated_references_and_source_offsets(self):
+        expected = {
+            "living_room": ("median", [("seated", 0.0), ("fp300", 0.1),
+                                        ("salus_monitor", 0.2), ("salus_family", -0.5)], 0.2),
+            "kitchen": ("median", [("seated", 0.0), ("fp300", 0.45),
+                                    ("ceiling", -0.1), ("salus_family", -0.2)], None),
+            "dining_room": ("primary", [("seated", 0.0), ("fp300", 0.15),
+                                         ("salus_family", -0.9)], -0.6),
+            "claudias_room": ("primary", [("seated", 0.0), ("fp300", 0.1), ("salus", -0.1)], 0.6),
+            "kristines_room": ("primary", [("seated", 0.0), ("salus", -1.2)], -0.2),
+            "bedroom": ("primary", [("seated", 0.0), ("salus", -0.1), ("fp300", 0.3)], 0.2),
+        }
+        for room, (fusion, sources, floor_offset) in expected.items():
+            with self.subTest(room=room):
+                cfg = self.rooms[room]
+                self.assertEqual(cfg["fusion"], fusion)
+                self.assertEqual([(s["label"], s.get("offset_c", 0.0))
+                                  for s in cfg["air_sources"]], sources)
+                seated = cfg["air_sources"][0]
+                self.assertEqual(seated["entity"], f"sensor.{room}_seated_thermometer_temperature")
+                self.assertEqual(seated["rh_entity"], f"sensor.{room}_seated_thermometer_humidity")
+                self.assertEqual(cfg.get("floor_offset_c"), floor_offset)
+        self.assertEqual(self._source("kitchen", "sensor.kitchen_smoke_alarm_temperature")["offset_rh"], 1.8)
+
+    def test_shipped_living_room_fuses_sources_and_survives_fp300_loss(self):
         app = _make_app({"living_room": self.rooms["living_room"]}, plain={
+            "sensor.living_room_seated_thermometer_temperature": "23.3",
+            "sensor.living_room_seated_thermometer_humidity": "50",
             "sensor.living_room_presence_temperature": "23.2",
             "sensor.living_room_presence_humidity": "50",
             "climate.living_room_thermostat": "off",
@@ -972,12 +1140,12 @@ class ShippedRoomFeelConfig(unittest.TestCase):
             "sensor.living_room_floor_thermometer_temperature": "22.5",
         }, attrs=LIVING_ATTRS)
         app._evaluate_room("living_room")
-        self.assertEqual(app._captured["sensor.living_room_feel"]["state"], 23.2)
+        self.assertEqual(app._captured["sensor.living_room_feel"]["state"], 23.3)
         app.get_state = (lambda orig: lambda entity, attribute=None: (
             "unavailable" if entity == "sensor.living_room_presence_temperature"
             else orig(entity, attribute)))(app.get_state)
         app._evaluate_room("living_room")
-        self.assertEqual(app._captured["sensor.living_room_feel"]["state"], 23.6)
+        self.assertEqual(app._captured["sensor.living_room_feel"]["state"], 23.4)
 
 
 if __name__ == "__main__":

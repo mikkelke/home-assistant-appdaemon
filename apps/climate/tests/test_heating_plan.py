@@ -2039,7 +2039,7 @@ class TrimTests(unittest.TestCase):
     cfg = hp.TrimConfig(initial=0.5, minimum=-0.5, maximum=1.5)
 
     @staticmethod
-    def hours(bias, n_hours=10, ticks=12, first=7):
+    def hours(bias, n_hours=10, ticks=12, first=0):
         return {h: [bias * ticks, ticks] for h in range(first, first + n_hours)}
 
     def test_moves_halfway_to_the_measured_bias(self):
@@ -2057,14 +2057,23 @@ class TrimTests(unittest.TestCase):
 
     def test_an_hour_needs_six_samples(self):
         hours = self.hours(1.2, n_hours=6)
-        hours[7] = [1.2 * 5, 5]
+        hours[0] = [1.2 * 5, 5]
         self.assertFalse(hp.update_trim(0.5, hours, self.cfg).changed)
 
     def test_only_the_trim_hours_count(self):
-        hours = {h: [1.0 * 12, 12] for h in (3, 4, 5, 6, 23, 0)}
+        hours = {h: [1.0 * 12, 12] for h in (10, 11, 12, 21, 22, 23)}
         self.assertEqual(hp.update_trim(0.5, hours, self.cfg).valid_hours, 0)
-        hours = {str(h): [1.0 * 12, 12] for h in range(7, 13)}  # json keys are strings
+        hours = {str(h): [1.0 * 12, 12] for h in range(4, 10)}  # json keys are strings
         self.assertEqual(hp.update_trim(0.5, hours, self.cfg).valid_hours, 6)
+
+    def test_trim_window_is_midnight_through_nine(self):
+        self.assertEqual(list(hp.TRIM_HOURS), list(range(0, 10)))
+        hours = {h: [12.0, 12] for h in (0, 9, 10, 23)}
+        self.assertEqual(hp.update_trim(0.5, hours, self.cfg).valid_hours, 2)
+
+    def test_six_of_the_ten_hours_are_enough(self):
+        u = hp.update_trim(0.5, self.hours(0.9, n_hours=6), self.cfg)
+        self.assertEqual((u.trim, u.valid_hours, u.changed), (0.7, 6, True))
 
     def test_clamped_to_the_zone_range(self):
         self.assertEqual(hp.update_trim(1.5, self.hours(4.0), self.cfg).trim, 1.5)
@@ -2144,9 +2153,12 @@ class ZoneDayTests(unittest.TestCase):
         d = hp.ZoneDay("2026-10-17")
         d.add_tick(tick(hour=8, bias=0.4))
         d.add_tick(tick(hour=8, bias=0.6))
-        d.add_tick(tick(hour=3, bias=9.0))
+        d.add_tick(tick(hour=0, bias=0.2))
+        d.add_tick(tick(hour=9, bias=0.3))
+        d.add_tick(tick(hour=10, bias=9.0))
+        d.add_tick(tick(hour=23, bias=9.0))
         d.add_tick(tick(hour=9, bias=None))
-        self.assertEqual(d.bias, {8: [1.0, 2]})
+        self.assertEqual(d.bias, {0: [0.2, 1], 8: [1.0, 2], 9: [0.3, 1]})
 
     def test_fallback_hours(self):
         d = hp.ZoneDay("2026-10-17")

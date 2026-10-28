@@ -158,7 +158,7 @@ def house(ha: FakeHA):
     ha.set("input_boolean.heating_season", "off")
     ha.set("input_boolean.heating_live", "off")
     ha.set("input_number.heating_bedroom_ceiling", "21.0")
-    for zone, value in zip(ZONES, ("21.5", "21.5", "21.5", "22.0", "20.0")):
+    for zone, value in zip(ZONES, ("21.5", "20.5", "21.5", "22.0", "20.0")):
         ha.set(f"input_number.heating_target_{zone}", value)
     # a new date-and-time helper without an initial value reads midnight of the day it was made
     ha.set("input_datetime.heating_party_start", "2026-10-17 00:00:00")
@@ -422,10 +422,11 @@ class ShippedYaml(unittest.TestCase):
 
     def test_the_owner_decisions_are_what_ships(self):
         z = self.cfg.zones
-        self.assertEqual([z[n].base_c for n in ZONES], [21.5, 21.5, 21.5, 22.0, 20.0])
+        self.assertEqual([z[n].base_c for n in ZONES], [21.5, 20.5, 21.5, 22.0, 20.0])
         self.assertEqual([z[n].lower_c for n in ZONES], [19.0, 19.0, 19.0, 19.0, 18.0])
         self.assertEqual([z[n].upper_c for n in ZONES], [24.0, 24.0, 24.0, 25.0, 24.0])
         self.assertEqual(z["family"].protected_min_c, 20.5)
+        self.assertEqual(z["kristines_room"].trim, hp.TrimConfig(1.2, -1.0, 2.0))
         self.assertEqual(self.cfg.sun_term_factor, 0.5)
         self.assertEqual(self.cfg.keypad_relock_minutes, 15)
         for n in ("kristines_room", "claudias_room"):
@@ -1251,7 +1252,7 @@ class OffSeasonPlan(unittest.TestCase):
         # 12:00: the family target is the base, the others are flat, the bathroom is below its window
         want = {
             "family": (21.5, 22.0),
-            "kristines_room": (21.5, 21.5),
+            "kristines_room": (20.5, 21.5),
             "claudias_room": (21.5, 21.5),
             "bathroom": (19.0, 19.0),
             "guest_bathroom": (20.0, 20.0),
@@ -2754,7 +2755,7 @@ class DailyRollup(unittest.TestCase):
         self.assertEqual(len(house), 1)
         self.assertEqual(house[0]["ticks"], 24 * 12)
 
-    def test_zones_whose_air_is_their_thermostat_stay_at_zero(self):
+    def test_zones_whose_air_is_their_thermostat_learn_zero_bias(self):
         h = Harness(self)
         h.ha.set("input_boolean.heating_season", "on")
         h.at(0, 0)
@@ -2768,8 +2769,8 @@ class DailyRollup(unittest.TestCase):
             h.clock.advance(minutes=5)
         h.at(3, 0, day=18)
         h.app._daily_rollup({})
-        for zone in ("bathroom", "guest_bathroom", "kristines_room"):
-            self.assertEqual(h.app._zones[zone].trim, 0.0, zone)
+        for zone, expected in (("bathroom", 0.0), ("guest_bathroom", 0.0), ("kristines_room", 0.6)):
+            self.assertEqual(h.app._zones[zone].trim, expected, zone)
 
     def test_off_season_ticks_teach_nothing(self):
         h = Harness(self)
@@ -2980,7 +2981,7 @@ class NudgeButtons(unittest.TestCase):
         self.assertEqual(
             (a["nudge"], a["setpoint_now"], a["profile_offset"]), ("+0.5", 22.0, "+0.0")
         )
-        self.assertEqual(h.zone("kristines_room")["state"], 22.0)
+        self.assertEqual(h.zone("kristines_room")["state"], 21.0)
         self.assertEqual(
             a["last_signal"],
             {
@@ -3174,7 +3175,7 @@ class TargetHelpers(unittest.TestCase):
     def test_the_owner_changing_a_residents_target_resets_her_nudge(self):
         h = self.h
         h.press(KRISTINE_WARMER, KRISTINE_ID)
-        h.helper(KRISTINE_TARGET, 21.5, 22.0, MIKKEL_ID)
+        h.helper(KRISTINE_TARGET, 20.5, 22.0, MIKKEL_ID)
         rt = h.app._zones["kristines_room"]
         self.assertEqual((rt.nudge, rt.nudge_at, rt.nudge_dir), (0.0, None, 0))
         rec = h.signals("kristines_room")[-1]
@@ -3185,20 +3186,20 @@ class TargetHelpers(unittest.TestCase):
         self.assertEqual(rec["nudge"], [0.5, 0.0])
         h.app._evaluate_pending({})
         a = h.attrs("kristines_room")
-        self.assertEqual((a["base_target"], a["nudge"], a["setpoint_now"]), (22.0, "+0.0", 22.0))
+        self.assertEqual((a["base_target"], a["nudge"], a["setpoint_now"]), (22.0, "+0.0", 23.0))
         saved = json.loads((h.tmp / "state.json").read_text())
         self.assertEqual(saved["zones"]["kristines_room"]["nudge"], 0.0)
 
     def test_a_reset_lets_the_next_press_count_at_once(self):
         h = self.h
         h.press(KRISTINE_WARMER, KRISTINE_ID)
-        h.helper(KRISTINE_TARGET, 21.5, 22.0, MIKKEL_ID)
+        h.helper(KRISTINE_TARGET, 20.5, 22.0, MIKKEL_ID)
         h.press(KRISTINE_WARMER, KRISTINE_ID)
         self.assertEqual(h.app._zones["kristines_room"].nudge, 0.5)
 
     def test_the_owner_changing_a_target_with_no_nudge_just_sets_it(self):
         h = self.h
-        h.helper(KRISTINE_TARGET, 21.5, 22.0, MIKKEL_ID)
+        h.helper(KRISTINE_TARGET, 20.5, 22.0, MIKKEL_ID)
         h.helper("input_number.heating_target_family", 21.5, 21.0, MIKKEL_ID)
         self.assertEqual(h.effects(), ["target_set", "target_set"])
         self.assertEqual([r["direction"] for r in h.signals()], [1, -1])
@@ -3234,7 +3235,7 @@ class TargetHelpers(unittest.TestCase):
     def test_an_app_changing_a_residents_target_leaves_her_nudge_alone(self):
         h = self.h
         h.press(KRISTINE_WARMER, KRISTINE_ID)
-        h.helper(KRISTINE_TARGET, 21.5, 22.0, APP_ID)
+        h.helper(KRISTINE_TARGET, 20.5, 22.0, APP_ID)
         self.assertEqual(h.app._zones["kristines_room"].nudge, 0.5)
         self.assertEqual(h.effects("kristines_room"), ["nudge", "target_set"])
 
@@ -3335,7 +3336,7 @@ class ThermostatChanges(unittest.TestCase):
         rec = self.one()
         self.assertEqual(
             (rec["source"], rec["who"], rec["effect"], rec["target_from"], rec["target_to"]),
-            ("ha", "mikkel", "would_set_target", 21.5, 22.0),
+            ("ha", "mikkel", "would_set_target", 20.5, 21.0),
         )
         self.assertEqual(h.app._zones["kristines_room"].nudge, 0.0)
         h.service_call("family", "set_temperature", MIKKEL_ID, temperature=14.0)
@@ -3347,7 +3348,7 @@ class ThermostatChanges(unittest.TestCase):
         self.assertNotIn("nudge", rec)
         h.tick(minutes=1)
         self.assertEqual(h.zone("family")["state"], 21.5)
-        self.assertEqual(h.zone("kristines_room")["state"], 21.5)
+        self.assertEqual(h.zone("kristines_room")["state"], 20.5)
 
     def test_the_target_step_stays_inside_the_helpers_range(self):
         h = self.h
@@ -3690,7 +3691,7 @@ class AlertsEndToEnd(unittest.TestCase):
         h.tick(minutes=5)
         self.assertEqual(
             self.pushes(h),
-            [("Heating: cold room", "Kristines room 18.4 °C for 30 min (target 21.5)", "mikkel")],
+            [("Heating: cold room", "Kristines room 18.4 °C for 30 min (target 20.5)", "mikkel")],
         )
         self.assertEqual(
             h.last("sensor.heating_controller")["attributes"]["alerts_active"],
@@ -4129,7 +4130,7 @@ class SeasonStartEndToEnd(SeasonHarness, unittest.TestCase):
         )
         self.assertEqual(rec["mornings"]["family"], [20.8, 20.9])
         self.assertEqual(
-            rec["limits"], {"family": 21.0, "kristines_room": 21.3, "claudias_room": 21.0}
+            rec["limits"], {"family": 21.0, "kristines_room": 20.3, "claudias_room": 21.0}
         )
         self.assertEqual(rec["message"], self.MESSAGE)
         self.assertEqual(h.app._advisor.snapshot()["asked"], {"start": "2026-10-19"})
@@ -4184,15 +4185,15 @@ class SeasonStartEndToEnd(SeasonHarness, unittest.TestCase):
     def test_kristine_is_judged_closer_to_her_target(self):
         h = self.harness()
         self.forecast(h)
-        self.before(h, family=22.0, claudia=22.0, kristine=21.2)
-        self.cold(h, family=22.0, claudia=22.0, kristine=21.2)
+        self.before(h, family=22.0, claudia=22.0, kristine=20.2)
+        self.cold(h, family=22.0, claudia=22.0, kristine=20.2)
         self.morning(h)
         self.assertEqual(
             self.pushes(h),
             [
                 (
                     "Heating on?",
-                    "Kristine's room 21.2 °C this morning (target 21.5). "
+                    "Kristine's room 20.2 °C this morning (target 20.5). "
                     "Next 3 days 7 °C. Time to turn the heat on?",
                     "mikkel",
                 )
@@ -4535,7 +4536,7 @@ class EverythingStaysShadow(unittest.TestCase):
         h.press(KRISTINE_WARMER, KRISTINE_ID)
         h.press(CLAUDIA_COLDER, STRANGER_ID)
         h.helper("input_number.heating_target_family", 21.5, 23.0, KRISTINE_ID)
-        h.helper(KRISTINE_TARGET, 21.5, 22.0, MIKKEL_ID)
+        h.helper(KRISTINE_TARGET, 20.5, 22.0, MIKKEL_ID)
         h.service_call("kristines_room", "set_temperature", MIKKEL_ID, temperature=16.0)
         h.report("kristines_room", temperature=16.0)
         h.report("claudias_room", state="off")
