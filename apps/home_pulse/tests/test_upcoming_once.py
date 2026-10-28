@@ -31,7 +31,7 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(once.parse_once(RAW), {SLUG: {
             "slug": SLUG, "title": "Check the Alocasia for spider mites",
             "detail": "new leaves dark and clean? then back to the living room", "area": "bathroom",
-            "icon": "mdi:bug-outline", "due": date(2026, 11, 17)}})
+            "icon": "mdi:bug-outline", "due": date(2026, 11, 17), "info": []}})
 
     def test_detail_room_and_icon_are_optional_and_the_day_may_be_written_as_text(self):
         [task] = once.parse_once([{"due": "2026-11-17", "title": "Call the sweep"}]).values()
@@ -123,6 +123,12 @@ class RowTests(unittest.TestCase):
         bare = once.parse_once([{"due": date(2026, 11, 17), "title": "Call the sweep"}])["call_the_sweep"]
         row, _ = row_of(SEED, NOW + 6 * DAY, bare)
         self.assertEqual((row["icon"], "detail" in row, "area" in row), (once.ICON, False, False))
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_info_lines_lead_the_sheet_before_the_due_day(self):
+        task = once.parse_once([{"due": date(2026, 11, 17), "title": "Spray", "info": ["Mix it", " Spray it "]}])
+        row, _ = row_of(SEED, NOW + 6 * DAY, task["spray"])
+        self.assertEqual(row["info"], ["Mix it", "Spray it", "Due 17.11"])
         self.assertTrue(core.is_valid_row(row))
 
     def test_a_day_in_another_year_carries_it(self):

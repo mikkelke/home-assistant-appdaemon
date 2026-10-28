@@ -2,7 +2,7 @@
 plant for pests. Pure: each step takes the persisted anchors and `now` and returns new state.
 
 A task (the `once` list in house_upcoming.yaml) is a tapped task like the plants watered by the calendar
-(upcoming_plants, whose anchors, Done and undo it uses). Its row appears LEAD_DAYS house days before its
+(upcoming_plants, whose anchors, Done and undo it uses). Its optional `info` lines lead its sheet. Its row appears LEAD_DAYS house days before its
 `due` day, timed at DUE_TIME on that day; from the day itself the row is untimed and has a push key. The
 anchor is a seed while the task is open and a Done replaces it, which takes the row away for good; undo
 brings the seed back, and the row with it.
@@ -37,7 +37,8 @@ def parse_once(raw):
         if key in tasks:
             raise ValueError(f"one-off task {title}: listed twice")
         tasks[key] = {"slug": key, "title": title, "detail": clean_text(str(cfg.get("detail") or "")),
-                      "area": cfg.get("area") or None, "icon": cfg.get("icon") or ICON, "due": day}
+                      "area": cfg.get("area") or None, "icon": cfg.get("icon") or ICON, "due": day,
+                      "info": [clean_text(str(line)) for line in cfg.get("info") or []]}
     return tasks
 
 
@@ -76,5 +77,5 @@ def once_row(task, anchor, now):
     else:
         at, key = None, f"{anchor_key(task)}:{utc_iso(when)}"
     row = make_row(ID_PREFIX + task["slug"], "maint", task["title"], task["detail"], at=at, icon=task["icon"],
-                   area=task["area"], audience="admin", tap_done=True, info=[f"Due {ddmm(task['due'], now)}"])
+                   area=task["area"], audience="admin", tap_done=True, info=[*task["info"], f"Due {ddmm(task['due'], now)}"])
     return row, key

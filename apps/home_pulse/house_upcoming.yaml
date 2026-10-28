@@ -94,6 +94,10 @@ HouseUpcoming:
   # The row shows from the day before, timed at 09:00 on the day, then untimed until a Done tap, which
   # takes it away for good.
   once:
+    - {due: 2026-10-28, title: Test the mite spray on one Alocasia leaf, detail: "both sides; leaf fine tomorrow? then spray it all", area: bathroom, icon: "mdi:spray", info: ["1 tbsp rapeseed oil, 1 tsp dish soap, 1 L warm water", "Shake, spray tops and undersides of every leaf till wet", "Keep it out of sun till dry; a bought spray: follow label"]}
+    - {due: 2026-10-29, title: "Spray the Alocasia for spider mites, 1 of 3", detail: "every leaf, both sides", area: bathroom, icon: "mdi:spray", info: ["1 tbsp rapeseed oil, 1 tsp dish soap, 1 L warm water", "Shake, spray tops and undersides of every leaf till wet", "Keep it out of sun till dry; a bought spray: follow label"]}
+    - {due: 2026-11-04, title: "Spray the Alocasia for spider mites, 2 of 3", detail: "every leaf, both sides", area: bathroom, icon: "mdi:spray", info: ["1 tbsp rapeseed oil, 1 tsp dish soap, 1 L warm water", "Shake, spray tops and undersides of every leaf till wet", "Keep it out of sun till dry; a bought spray: follow label"]}
+    - {due: 2026-11-10, title: "Spray the Alocasia for spider mites, 3 of 3", detail: "every leaf, both sides", area: bathroom, icon: "mdi:spray", info: ["1 tbsp rapeseed oil, 1 tsp dish soap, 1 L warm water", "Shake, spray tops and undersides of every leaf till wet", "Keep it out of sun till dry; a bought spray: follow label"]}
     - {due: 2026-11-17, title: Check the Alocasia for spider mites, detail: "new leaves dark and clean? then back to the living room", area: bathroom, icon: "mdi:bug-outline"}
 
   batteries:
