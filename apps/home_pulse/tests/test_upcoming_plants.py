@@ -736,26 +736,26 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual((row["title"], row["detail"], row["at"]),
                          ("Plants: next 27.10", "3 plants", "2026-10-27T08:00:00+00:00"))
 
-    def test_when_something_is_due_the_title_names_it_and_the_row_has_no_time(self):
+    def test_when_something_is_due_the_title_counts_it_the_detail_names_it_and_the_row_has_no_time(self):
         late = datetime(2026, 10, 28, 15, 0, tzinfo=timezone.utc)
         timed = [(self.timed("Peace lily kitchen", 7), self.anchor()), (self.timed("Aloe", 35), self.anchor())]
         row = self.row(timed=timed, now=late)
-        self.assertEqual((row["title"], row["detail"]), ("Plants: Peace lily kitchen due", "2 plants, 1 due"))
+        self.assertEqual((row["title"], row["detail"]), ("Plants: 1 of 2 due", "Peace lily kitchen"))
         self.assertNotIn("at", row)
         self.assertEqual(row["items"][0], "Peace lily kitchen: due 27.10, watered 20.10")
         today = self.row(timed=[(self.timed("Peace lily kitchen", 7), self.anchor())],
                          now=datetime(2026, 10, 27, 15, 0, tzinfo=timezone.utc))
-        self.assertEqual(today["title"], "Plants: Peace lily kitchen due")
+        self.assertEqual(today["title"], "Plants: 1 of 1 due")
 
     def test_a_dry_sensor_plant_is_due_and_leads_with_the_other_due_plants(self):
         late = datetime(2026, 10, 28, 15, 0, tzinfo=timezone.utc)
         row = self.row([self.sensor(12, dry=True)], [(self.timed("Peace lily kitchen", 7), self.anchor())], now=late)
-        self.assertEqual(row["title"], "Plants: Peace lily kitchen +1 due")
+        self.assertEqual(row["title"], "Plants: 2 of 2 due")
         self.assertEqual(row["items"], ["Peace lily kitchen: due 27.10, watered 20.10",
                                         "Strelitzia: dry, soil 12%, at 15%, watered 21.10"])
         only = self.row([self.sensor(12, dry=True)], [(self.timed("Aloe", 35), self.anchor())])
         self.assertEqual((only["title"], only["items"][0], "at" in only),
-                         ("Plants: Strelitzia due", "Strelitzia: dry, soil 12%, at 15%, watered 21.10", False))
+                         ("Plants: 1 of 2 due", "Strelitzia: dry, soil 12%, at 15%, watered 21.10", False))
 
     def test_the_sensor_plants_that_are_not_dry_come_last_the_nearest_to_dry_first(self):
         ivy = plants.parse_plants([{"moisture": "sensor.ivy_moisture", "name": "Ivy", "dry": 20}])

@@ -1778,7 +1778,7 @@ class TimedPlantTests(unittest.TestCase):
         app = self.make()
         self.assertEqual(rows(app)["maint:plants"]["items"], ["Monstera: 24.10, watered 14.10"])
         tick(app, 10 * DAY)
-        self.assertEqual(rows(app)["maint:plants"]["title"], "Plants: Monstera due")
+        self.assertEqual(rows(app)["maint:plants"]["title"], "Plants: 1 of 1 due")
         self.done(app)
         self.assertEqual(app.reports, [("house_events_report", {"text": "Watered Monstera",
                                                                 "icon": "mdi:watering-can-outline",
@@ -1916,7 +1916,7 @@ class PlantOverviewTests(unittest.TestCase):
         app = make_app(states, plants=[SAMPLE_PLANT, SAMPLE_TIMED])
         tick(app, 10 * DAY)
         row = rows(app)[self.ROW]
-        self.assertEqual((row["title"], row["detail"]), ("Plants: Monstera +1 due", "2 plants, 2 due"))
+        self.assertEqual((row["title"], row["detail"]), ("Plants: 2 of 2 due", "Monstera, Strelitzia"))
         self.assertEqual(row["items"], ["Monstera: due 24.10, watered 14.10", "Strelitzia: dry, soil 12%, at 15%"])
         self.assertNotIn("at", row)
 

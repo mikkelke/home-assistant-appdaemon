@@ -16,12 +16,12 @@ never was. A succulent (`feed: summer`) is fed from March to September only, and
 FEED_EVERY_DAYS days. The anchor keeps `fed_at`, set by a Done that said to feed and carried over by one
 that did not; a seed counts as a feeding at the moment it is made.
 
-Every plant is also one line in the `items` of a single row, `maint:plants`, which is always there: its
-title says what is due or the next due day, and the lines say when each plant is due (a sensor plant:
-its soil and its dry level) and when it was last watered, the plants due first. A calendar plant was last
-watered at its anchor's time. A sensor plant was watered when its soil moisture rose RISE_POINTS or more
-within RISE_WINDOW and then stopped climbing for RISE_SETTLE; that moment is what `step_rise` finds, live
-and in the recorder's history.
+Every plant is also one line in the `items` of a single row, `maint:plants`, which is always there: its title
+counts the plants due and its detail names them, or the title gives the next due day, and the lines say when
+each plant is due (a sensor plant: its soil and its dry level) and when it was last watered, the plants due
+first. A calendar plant was last watered at its anchor's time. A sensor plant was watered when its soil
+moisture rose RISE_POINTS or more within RISE_WINDOW and then stopped climbing for RISE_SETTLE; that moment is
+what `step_rise` finds, live and in the recorder's history.
 
 A sensor plant is dry once its soil moisture reading, in percent, is at or under its `dry`, and stays dry
 until a reading is CLOSE_MARGIN above it: watering makes the reading jump, while a reading wandering
@@ -318,12 +318,13 @@ def overview_row(sensor, timed, now):
     if len(lines) > ITEMS_MAX:
         lines = lines[:ITEMS_MAX - 1] + [f"+{len(lines) - ITEMS_MAX + 1} more"]
     if due_names:
-        title, at = f"Plants: {due_names[0]}{f' +{len(due_names) - 1}' if len(due_names) > 1 else ''} due", None
+        title, at = f"Plants: {len(due_names)} of {len(entries)} due", None
+        detail = fit_parts(due_names)
     elif coming:
         title, at = f"Plants: next {ddmm(min(coming), now)}", datetime.combine(min(coming), DUE_TIME, HOUSE_TZ)
+        detail = f"{len(entries)} plants"
     else:
-        title, at = "Plants: none due", None
-    detail = f"{len(entries)} plants" + (f", {len(due_names)} due" if due_names else "")
+        title, at, detail = "Plants: none due", None, f"{len(entries)} plants"
     return make_row(OVERVIEW_ID, "maint", title, detail, at=at, icon=OVERVIEW_ICON, audience="admin", items=lines)
 
 
