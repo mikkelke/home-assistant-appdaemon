@@ -6,6 +6,8 @@ season is enabled, and actual heat ran within heating_lookback_hours. The timer 
 the open episode, not current heat demand: ordinary floor-heating cycles must never
 restart the airing allowance. A confirmed off-to-on heat call while an opening is
 already open warns immediately instead of waiting for the allowance.
+Warm rooms delay the allowance until air reaches setpoint + warm_margin_c; once
+started it keeps running. Heat-start warnings are suppressed while air is warm.
 
 An episode ends only when all watched contacts in the room are closed. If heating is
 enabled after the allowance has elapsed, warn immediately while the opening is still
@@ -17,6 +19,7 @@ waste. The living-room window and terrace door share one open episode.
 """
 
 from datetime import datetime, timezone
+from math import isfinite
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
@@ -24,19 +27,23 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 class OpenWhileHeatingGuard(hass.Hass):
     def initialize(self):
         self.grace_min = float(self.args.get("grace_minutes", 12))
+        self.warm_margin_c = float(self.args.get("warm_margin_c", 0.5))
         self.rooms = self.args.get("rooms") or {}
         self.season_entity = self.args.get("season_entity")
         self.heating_lookback_s = float(self.args.get("heating_lookback_hours", 24)) * 3600
         self._last_heated = {}  # room -> latest confirmed heat observation or on-to-off edge
         self._timers = {}  # room -> pending grace run_in handle
         self._opened_at = {}  # room -> beginning of the current open episode
+        self._grace_started_at = {}  # room -> start of the airing allowance, after any warm spell
         self._reported = set()  # rooms whose current open-episode already produced an entry
         for room, cfg in self.rooms.items():
             for contact in cfg.get("contacts", []):
                 self.listen_state(self._on_change, contact, room=room)
-            for signal in (cfg.get("thermostat"), cfg.get("heating")):
+            for signal in (cfg.get("thermostat"), cfg.get("heating"), cfg.get("air")):
                 if signal:
                     self.listen_state(self._on_change, signal, room=room)
+            if cfg.get("thermostat"):
+                self.listen_state(self._on_change, cfg["thermostat"], attribute="temperature", room=room)
         if self.season_entity:
             self.listen_state(self._on_change, self.season_entity)
         # Recorder I/O runs after initialize; recover recent heat and remaining open time.
@@ -106,7 +113,8 @@ class OpenWhileHeatingGuard(hass.Hass):
             if new == "on" or (old == "on" and new == "off"):
                 self._remember_heat(room, self.get_now().timestamp())
             if (old == "off" and new == "on" and room not in self._reported
-                    and self._open_contacts(room) and self._heating_enabled(room)):
+                    and self._open_contacts(room) and self._heating_enabled(room)
+                    and not self._too_warm(room)):
                 self._cancel(room)
                 self._report(room, heating_started=True)
         if room is None:
@@ -117,6 +125,19 @@ class OpenWhileHeatingGuard(hass.Hass):
     def _open_contacts(self, room):
         cfg = self.rooms.get(room) or {}
         return [c for c in cfg.get("contacts", []) if self.get_state(c) == "on"]
+
+    def _too_warm(self, room):
+        cfg = self.rooms[room]
+        if not cfg.get("air") or not cfg.get("thermostat"):
+            return None
+        try:
+            air = float(self.get_state(cfg["air"]))
+            target = float(self.get_state(cfg["thermostat"], attribute="temperature"))
+            if isfinite(air) and isfinite(target):
+                return air > target + self.warm_margin_c
+        except (TypeError, ValueError):
+            pass
+        return None
 
     def _heating_enabled(self, room):
         cfg = self.rooms.get(room) or {}
@@ -163,14 +184,23 @@ class OpenWhileHeatingGuard(hass.Hass):
                 # its age and report marker until every contact is explicitly closed.
                 if all(self.get_state(c) == "off" for c in self.rooms[room].get("contacts", [])):
                     self._opened_at.pop(room, None)
+                    self._grace_started_at.pop(room, None)
                     self._reported.discard(room)
                 return
             if room in self._reported:
                 return
             now = self.get_now().timestamp()
-            if room not in self._opened_at:
+            new_episode = room not in self._opened_at
+            if new_episode:
                 self._opened_at[room] = self._episode_start(contacts, now)
-            remaining = self.grace_min * 60 - (now - self._opened_at[room])
+            if room not in self._grace_started_at:
+                too_warm = self._too_warm(room)
+                if too_warm:
+                    return
+                self._grace_started_at[room] = (
+                    self._opened_at[room] if new_episode or too_warm is None else now
+                )
+            remaining = self.grace_min * 60 - (now - self._grace_started_at[room])
             if remaining > 0:
                 if room not in self._timers:
                     self._timers[room] = self.run_in(self._grace_elapsed, remaining, room=room)

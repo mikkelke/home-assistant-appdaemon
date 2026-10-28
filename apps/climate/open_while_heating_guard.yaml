@@ -2,6 +2,7 @@ open_while_heating_guard:
   module: open_while_heating_guard
   class: OpenWhileHeatingGuard
   grace_minutes: 12
+  warm_margin_c: 0.5
   heating_lookback_hours: 24
   season_entity: input_boolean.heating_season
   # Outward openings that leak heat while the room's heating is enabled. Interior
@@ -19,18 +20,21 @@ open_while_heating_guard:
       contacts: ["binary_sensor.bedroom_window_contact"]
       thermostat: "climate.bedroom_thermostat"
       heating: "binary_sensor.bedroom_heating_active"
+      air: "sensor.bedroom_feel"
       notify: ["mikkel"]
     bathroom:
       label: "Bathroom"
       contacts: ["binary_sensor.bathroom_window_contact"]
       thermostat: "climate.bathroom_thermostat"
       heating: "binary_sensor.bathroom_heating_active"
+      air: "sensor.bathroom_feel"
       notify: ["mikkel"]
     kitchen:
       label: "Kitchen"
       contacts: ["binary_sensor.kitchen_window_contact"]
       thermostat: "climate.family_room_thermostat"
       heating: "binary_sensor.kitchen_heating_active"
+      air: "sensor.kitchen_feel"
       notify: ["mikkel", "kristine", "claudia"]
     living_room:
       label: "Living room"
@@ -41,12 +45,14 @@ open_while_heating_guard:
         binary_sensor.rooftop_door_1_contact: "rooftop door"
       thermostat: "climate.family_room_thermostat"
       heating: "binary_sensor.living_room_heating_active"
+      air: "sensor.living_room_feel"
       notify: ["mikkel", "kristine", "claudia"]
     kristines_room:
       label: "Kristines room"
       contacts: ["binary_sensor.kristines_room_window_contact"]
       thermostat: "climate.kristines_room_thermostat"
       heating: "binary_sensor.kristines_room_heating_active"
+      air: "sensor.kristines_room_feel"
       notify: ["mikkel", "kristine"]
     dining_room:
       label: "Dining room"
@@ -56,6 +62,7 @@ open_while_heating_guard:
         - "binary_sensor.dining_room_window_3_contact"
       thermostat: "climate.family_room_thermostat"
       heating: "binary_sensor.dining_room_heating_active"
+      air: "sensor.dining_room_feel"
       notify: ["mikkel", "kristine", "claudia"]
     claudias_room:
       label: "Claudias room"
@@ -63,4 +70,5 @@ open_while_heating_guard:
       contacts: ["binary_sensor.rooftop_door_2_contact"]
       thermostat: "climate.claudias_room_thermostat"
       heating: "binary_sensor.claudias_room_heating_active"
+      air: "sensor.claudias_room_feel"
       notify: ["mikkel", "claudia"]

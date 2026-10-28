@@ -26,12 +26,14 @@ WINDOW = "binary_sensor.living_room_window_contact"
 THERMOSTAT = "climate.family_room_thermostat"
 SEASON = "input_boolean.heating_season"
 ACTIVE = "binary_sensor.living_room_heating_active"
+AIR = "sensor.living_room_feel"
 
 
 class OpeningReminder(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 10, 27, 20, 0, tzinfo=timezone.utc)
-        self.states = {DOOR: "off", WINDOW: "off", THERMOSTAT: "heat", SEASON: "on", ACTIVE: "off"}
+        self.states = {DOOR: "off", WINDOW: "off", THERMOSTAT: "heat", SEASON: "on", ACTIVE: "off", AIR: "21"}
+        self.attributes = {THERMOSTAT: {"temperature": 21}}
         self.changed = {}
         self.pending = {}
         self.notifier = MagicMock()
@@ -65,6 +67,8 @@ class OpeningReminder(unittest.TestCase):
     def get_state(self, entity, attribute=None):
         if attribute == "all":
             return {"state": self.states.get(entity), "last_changed": self.changed.get(entity)}
+        if attribute:
+            return self.attributes.get(entity, {}).get(attribute)
         return self.states.get(entity)
 
     def schedule(self, callback, delay, **kwargs):
@@ -72,12 +76,14 @@ class OpeningReminder(unittest.TestCase):
         self.pending[handle] = callback, delay, kwargs
         return handle
 
-    def change(self, entity, value):
-        old = self.states.get(entity)
-        self.states[entity] = value
+    def change(self, entity, value, attribute="state"):
+        values = self.states if attribute == "state" else self.attributes.setdefault(entity, {})
+        key = entity if attribute == "state" else attribute
+        old = values.get(key)
+        values[key] = value
         self.changed[entity] = self.now.isoformat()
         kwargs = {} if entity == SEASON else {"room": "living_room"}
-        self.app._on_change(entity, "state", old, value, kwargs)
+        self.app._on_change(entity, attribute, old, value, kwargs)
 
     def advance(self, seconds):
         self.now += timedelta(seconds=seconds)
@@ -99,12 +105,169 @@ class OpeningReminder(unittest.TestCase):
             self.assertEqual(self.app.rooms[room]["thermostat"], f"climate.{room}_thermostat")
         self.assertEqual(self.app.season_entity, controller["season_entity"])
         self.assertEqual(self.app.heating_lookback_s, 24 * 3600)
+        self.assertEqual(self.app.warm_margin_c, 0.5)
         for room, cfg in self.app.rooms.items():
             self.assertEqual(cfg["heating"], f"binary_sensor.{room}_heating_active")
+            self.assertEqual(cfg["air"], f"sensor.{room}_feel")
+            self.app.listen_state.assert_any_call(self.app._on_change, cfg["air"], room=room)
         self.app.listen_state.assert_any_call(self.app._on_change, ACTIVE, room="living_room")
         self.app.listen_state.assert_any_call(self.app._on_change, DOOR, room="living_room")
         self.app.listen_state.assert_any_call(self.app._on_change, THERMOSTAT, room="living_room")
+        self.app.listen_state.assert_any_call(
+            self.app._on_change, THERMOSTAT, attribute="temperature", room="living_room"
+        )
         self.app.listen_state.assert_any_call(self.app._on_change, SEASON)
+
+    def test_warm_airing_with_short_heat_pulses_stays_silent_for_forty_minutes(self):
+        self.change(AIR, "23.5")
+        self.change(DOOR, "on")
+        for _ in range(4):
+            self.change(ACTIVE, "on")
+            self.advance(5 * 60)
+            self.change(ACTIVE, "off")
+            self.advance(5 * 60)
+            self.app._evaluate("living_room")
+        self.app.fire_event.assert_not_called()
+        self.notifier.notify.assert_not_awaited()
+        self.assertNotIn("living_room", self.app._timers)
+        self.assertNotIn("living_room", self.app._grace_started_at)
+
+    def test_threshold_reached_at_twenty_minutes_warns_at_thirty_two(self):
+        self.change(AIR, "23.5")
+        self.change(DOOR, "on")
+        opened = self.now
+        self.advance(20 * 60)
+        self.change(AIR, "21.5")
+        self.app.fire_event.assert_not_called()
+        self.elapse()
+        self.assertEqual(self.now, opened + timedelta(minutes=32))
+        self.app.fire_event.assert_called_once()
+
+    def test_air_rising_after_threshold_does_not_pause_or_restart_allowance(self):
+        self.change(AIR, "23.5")
+        self.change(DOOR, "on")
+        opened = self.now
+        self.advance(20 * 60)
+        self.change(AIR, "21.5")
+        handle = self.app._timers["living_room"]
+        self.advance(5 * 60)
+        self.change(AIR, "22")
+        self.assertIs(self.app._timers["living_room"], handle)
+        self.app.fire_event.assert_not_called()
+        self.advance(7 * 60)
+        callback, _, kwargs = self.pending.pop(handle)
+        callback(kwargs)
+        self.assertEqual(self.now, opened + timedelta(minutes=32))
+        self.app.fire_event.assert_called_once()
+
+    def test_cool_room_warns_after_twelve_minutes(self):
+        self.change(AIR, "20.5")
+        self.change(DOOR, "on")
+        self.elapse()
+        self.app.fire_event.assert_called_once()
+
+    def test_warm_heat_start_is_silent_but_cool_heat_start_warns_immediately(self):
+        self.change(AIR, "23.5")
+        self.change(DOOR, "on")
+        self.advance(2 * 60)
+        self.change(ACTIVE, "on")
+        self.app.fire_event.assert_not_called()
+        self.change(ACTIVE, "off")
+        self.change(AIR, "21.5")
+        self.change(ACTIVE, "on")
+        self.app.fire_event.assert_called_once()
+        self.assertIn("heating started", self.app.fire_event.call_args.kwargs["cause"])
+
+    def test_warm_heat_start_does_not_end_an_allowance_already_running(self):
+        self.change(DOOR, "on")
+        handle = self.app._timers["living_room"]
+        self.change(AIR, "23.5")
+        self.change(ACTIVE, "on")
+        self.app.fire_event.assert_not_called()
+        self.assertIs(self.app._timers["living_room"], handle)
+        self.elapse()
+        self.app.fire_event.assert_called_once()
+        self.assertIn("12+ min", self.app.fire_event.call_args.kwargs["cause"])
+
+    def test_missing_air_sensor_uses_opening_allowance(self):
+        self.states.pop(AIR)
+        self.change(DOOR, "on")
+        self.elapse()
+        self.app.fire_event.assert_called_once()
+
+    def test_unconfigured_air_sensor_uses_opening_allowance(self):
+        self.app.rooms["living_room"].pop("air")
+        self.change(DOOR, "on")
+        self.elapse()
+        self.app.fire_event.assert_called_once()
+
+    def test_invalid_air_or_target_uses_opening_allowance(self):
+        for entity, attribute in ((AIR, "state"), (THERMOSTAT, "temperature")):
+            for value in (None, "unknown", "unavailable", "bad", "nan", "inf", "-inf"):
+                with self.subTest(entity=entity, value=value):
+                    self.change(DOOR, "off")
+                    self.states[AIR] = "23.5"
+                    self.attributes[THERMOSTAT]["temperature"] = 21
+                    self.change(entity, value, attribute)
+                    self.change(DOOR, "on")
+                    before = self.app.fire_event.call_count
+                    self.elapse()
+                    self.assertEqual(self.app.fire_event.call_count, before + 1)
+
+    def test_invalid_reading_during_warm_airing_falls_back_to_opening_time(self):
+        for entity, attribute in ((AIR, "state"), (THERMOSTAT, "temperature")):
+            with self.subTest(entity=entity):
+                self.change(DOOR, "off")
+                self.states[AIR] = "23.5"
+                self.attributes[THERMOSTAT]["temperature"] = 21
+                self.change(DOOR, "on")
+                self.advance(20 * 60)
+                before = self.app.fire_event.call_count
+                self.change(entity, "unavailable", attribute)
+                self.assertEqual(self.app.fire_event.call_count, before + 1)
+                self.assertNotIn("living_room", self.app._timers)
+
+    def test_setpoint_change_can_start_warm_airing_allowance(self):
+        self.change(AIR, "23.5")
+        self.change(DOOR, "on")
+        self.advance(20 * 60)
+        self.change(THERMOSTAT, "23", "temperature")
+        self.app.fire_event.assert_not_called()
+        self.elapse()
+        self.app.fire_event.assert_called_once()
+
+    def test_restart_while_warm_waits_for_threshold(self):
+        self.states[DOOR], self.states[AIR] = "on", "23.5"
+        self.changed[DOOR] = (self.now - timedelta(minutes=40)).isoformat()
+        self.app._startup_recheck({})
+        self.assertNotIn("living_room", self.app._timers)
+        self.app.fire_event.assert_not_called()
+        self.change(AIR, "21.5")
+        self.elapse()
+        self.app.fire_event.assert_called_once()
+
+    def test_restart_at_threshold_counts_from_opening(self):
+        self.states[DOOR], self.states[AIR] = "on", "21.5"
+        self.changed[DOOR] = (self.now - timedelta(minutes=8)).isoformat()
+        self.app._startup_recheck({})
+        self.elapse(expected_delay=4 * 60)
+        self.app.fire_event.assert_called_once()
+
+    def test_all_contacts_must_close_to_reset_warm_airing_allowance(self):
+        self.change(AIR, "23.5")
+        self.change(DOOR, "on")
+        self.change(WINDOW, "on")
+        self.advance(20 * 60)
+        self.change(AIR, "21.5")
+        started = self.app._grace_started_at["living_room"]
+        self.change(DOOR, "off")
+        self.change(WINDOW, "unavailable")
+        self.assertEqual(self.app._grace_started_at["living_room"], started)
+        self.change(WINDOW, "off")
+        self.assertNotIn("living_room", self.app._grace_started_at)
+        self.change(AIR, "23.5")
+        self.change(DOOR, "on")
+        self.assertNotIn("living_room", self.app._timers)
 
     def test_idle_heat_warns_after_twelve_minutes_and_names_the_door(self):
         self.change(DOOR, "on")
