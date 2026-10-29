@@ -635,6 +635,8 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         self.plug_host = self.args["plug_host"]
         self.plug_poll_s = float(self.args.get("plug_poll_s", wplug.POLL_S))
         self._plug = wplug.PlugPoller(lambda: wplug.read_switch(self.plug_host), self.plug_poll_s)
+        self._tail = wplug.TailTracker()  # replaced wherever _plug is cleared: it sees only this cycle's reads
+        self._tail_eta_logged = None  # UTC of the Bomuld tail ETA last logged - see _tail_eta_utc
         self._plug_offline_pushed = False
         self.wash_activity_watts = float(self.args.get("wash_activity_watts", wplug.ACTIVITY_W))
         self.plug_unreachable_push_minutes = float(self.args.get("plug_unreachable_push_minutes", 10))
@@ -3165,6 +3167,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         self._set_state_entity( state="Running", attributes=run_attrs)
         self._remove_last_cycle_feedback()
         self._plug.clear()
+        self._tail = wplug.TailTracker()
         self._spin_end_checked_at = None
 
         self._safe_cancel_timer(self.unemptied_watchdog_timer)
@@ -4012,8 +4015,9 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         Used when entering Running from Off/Emptied, or when fixing stale cycle_start_time while
         the entity already shows Running (see _power_changed start_before_off path).
         """
-        # Finish decisions for this cycle see only reads taken from here on.
+        # Finish decisions and the tail ETA for this cycle see only reads taken from here on.
         self._plug.clear()
+        self._tail = wplug.TailTracker()
         self._spin_end_checked_at = None
         self._activity_seen = False
         self._activity_recorder_retry_after = None
@@ -5622,6 +5626,25 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         if current_state == "Running" and self.start_time:
             self._push_running_eta_attributes()
 
+    def _tail_eta_utc(self, eta_prog, now):
+        """UTC time a Bomuld wash ends, from the strong spins the plug has read since this cycle's last heating
+        (washer_plug.bomuld_tail_eta); None for any other programme and while it has read no real spin. The tracker is
+        fed whatever the programme, so one that is only classified as Bomuld late still has its spins. Logged when the
+        time first appears and whenever it moves by a minute or more. Display only: no finish or guard decision reads it."""
+        self._tail.feed(self._plug.snapshot(), self._tail.fed)
+        if eta_prog != "bomuld":
+            return None
+        eta_mono = wplug.bomuld_tail_eta(self._tail.spins)
+        if eta_mono is None:
+            return None
+        mono = self._plug.clock()
+        eta = now - timedelta(seconds=mono - eta_mono)
+        if self._tail_eta_logged is None or abs((eta - self._tail_eta_logged).total_seconds()) >= 60:
+            self._tail_eta_logged = eta
+            spin = now - timedelta(seconds=mono - wplug.tail_spins(self._tail.spins)[-1][0])
+            self.log(f"Tail ETA: spin at {self._strftime_local(spin)} -> ETA {self._strftime_local(eta)}", level="INFO")
+        return eta
+
     def _push_running_eta_attributes(self):
         """Update state entity with current ETA from the selected programme. Call when user confirms programme during Running so the UI updates immediately."""
         if not self.start_time:
@@ -5644,9 +5667,16 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             # auto-detected (or "unknown") value even though the user just confirmed one.
             self.detected_programme = eta_prog
             self.detected_temperature = eta_temp
-            elapsed_min = (self._now_utc() - self.start_time).total_seconds() / 60
+            now = self._now_utc()
+            elapsed_min = (now - self.start_time).total_seconds() / 60
             remaining = max(0, round(effective_dur - elapsed_min))
             est_end = self.start_time + timedelta(minutes=effective_dur)
+            total_min = effective_dur
+            tail_end = self._tail_eta_utc(eta_prog, now)
+            if tail_end is not None:
+                est_end = tail_end
+                remaining = max(0, round((est_end - now).total_seconds() / 60))
+                total_min = (est_end - self.start_time).total_seconds() / 60
             full = self.get_state(self.state_entity, attribute="all") or {}
             attrs = dict((full.get("attributes") or {}))
             attrs["detected_programme"] = eta_prog
@@ -5656,7 +5686,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             attrs["estimated_remaining_min"] = self._falsy_drop_safe(remaining)
             attrs["estimated_end_time"] = est_end.astimezone(self._local_tz()).strftime("%H:%M")
             attrs["elapsed_minutes"] = round(elapsed_min, 1)
-            attrs["progress_pct"] = min(100, max(0, round(100 * elapsed_min / effective_dur))) if effective_dur else 0
+            attrs["progress_pct"] = min(100, max(0, round(100 * elapsed_min / total_min))) if total_min else 0
             attrs["programme_confirmed_by_user"] = bool(self.programme_confirmed_by_user)
             attrs["programme_confirmed_by"] = self.confirmed_by_username or ""
             attrs["supports_soak"] = bool(self.option_soak_entity)
@@ -6088,13 +6118,20 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             attrs["cycle_start_time"] = self._format_utc(self.start_time)
             attrs["cycle_start_time_local"] = self._format_local(self.start_time)
             attrs["started_at_display"] = self.start_time.astimezone(self._local_tz()).strftime("%H:%M")
-            elapsed_min = (self._now_utc() - self.start_time).total_seconds() / 60
+            now = self._now_utc()
+            elapsed_min = (now - self.start_time).total_seconds() / 60
             remaining = max(0, round(effective_dur - elapsed_min))
             est_end = self.start_time + timedelta(minutes=effective_dur)
+            total_min = effective_dur
+            tail_end = self._tail_eta_utc(eta_prog, now)
+            if tail_end is not None:
+                est_end = tail_end
+                remaining = max(0, round((est_end - now).total_seconds() / 60))
+                total_min = (est_end - self.start_time).total_seconds() / 60
             attrs["estimated_remaining_min"] = self._falsy_drop_safe(remaining)
             attrs["estimated_end_time"] = est_end.astimezone(self._local_tz()).strftime("%H:%M")
             attrs["elapsed_minutes"] = round(elapsed_min, 1)
-            attrs["progress_pct"] = min(100, max(0, round(100 * elapsed_min / effective_dur))) if effective_dur else 0
+            attrs["progress_pct"] = min(100, max(0, round(100 * elapsed_min / total_min))) if total_min else 0
             attrs["programme_duration_min"] = effective_dur
             if self._delay_waiting and self.delayed_start_show_waiting:
                 # Suspected delayed-start wait: blank ETA/progress instead of showing a bogus

@@ -1,5 +1,6 @@
 # The plug-read surface of WasherMonitor for hand-built test apps (WasherMonitor.__new__ fixtures): a PlugPoller that
-# never starts its thread, driven by a fake monotonic clock, plus the knobs the finish decisions read.
+# never starts its thread, driven by a fake monotonic clock, the tail tracker that reads its ring, plus the knobs the
+# finish decisions read.
 import washer_plug as wplug
 
 
@@ -17,6 +18,8 @@ def attach_plug(app, reads=(), clock=None, poll_s=wplug.POLL_S):
     clock = clock or FakeClock(reads[-1][0] if reads else 0.0)
     app._plug = wplug.PlugPoller(lambda: 0.0, poll_s=poll_s, clock=clock)
     app._plug.start = lambda: None
+    app._tail = wplug.TailTracker()
+    app._tail_eta_logged = None
     for ts, w in reads:
         app._plug._ring.append((ts, w))
         if w is not None:

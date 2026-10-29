@@ -136,6 +136,9 @@
 #     progress_pct         0–100 (how far through the programme)
 #     estimated_remaining_min  Minutes left (rounded)
 #     estimated_end_time    "HH:MM" in your timezone
+#                          (Bomuld: once the plug has read the strong spins that close the wash, estimated_end_time,
+#                          estimated_remaining_min and progress_pct follow them while programme_duration_min stays the
+#                          programme's, so remaining is not programme_duration_min minus elapsed_minutes)
 #     energy_at_start      kWh at cycle start (optional)
 #     last_high_energy_at  ISO datetime in your timezone, last high consumption (optional)
 #     last_door_closed_at  ISO datetime in your timezone (optional anchor for restore/clamp)

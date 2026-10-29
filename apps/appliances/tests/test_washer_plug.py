@@ -1,5 +1,5 @@
 # tests/test_washer_plug.py - washer_plug: the one window rule every finish decision uses, the
-# decisions built on it, the plug read's overall deadline, and the read thread's lifecycle.
+# decisions built on it, the Bomuld tail ETA, the plug read's overall deadline, and the read thread's lifecycle.
 # Run from repo root: python3 -m unittest discover -s apps/appliances/tests -q
 
 from __future__ import annotations
@@ -47,6 +47,26 @@ def brief_pass_ring():
     i0 = next(i for i in range(len(reads)) if wp.spin_end(reads[:i + 1], reads[i][0]) is not None)
     t = reads[i0][0]
     return reads[:i0 + 1] + [(t + k * P, 40.0) for k in range(1, 7)] + [(t + k * P, 4.0) for k in range(7, 60)], i0
+
+
+def hold(t0, *parts):
+    """Reads on the P grid from t0, each (seconds, watts) part held for its seconds."""
+    return grid(t0, [w for seconds, w in parts for _ in range(int(seconds / P))])
+
+
+def tail_reads(*spins, heat_s=120, after_s=60, base_w=80.0, spin_w=400.0):
+    """A heating, then tumbling at base_w with each (start_s, length_s) spin at spin_w, and after_s of tumbling after the
+    last spin."""
+    end = max(start + length for start, length in spins) + after_s
+    return [(k * P, 2000.0 if k * P < heat_s else spin_w if any(s <= k * P < s + n for s, n in spins) else base_w)
+            for k in range(int(end / P))]
+
+
+def tail_eta(reads, until=None):
+    """bomuld_tail_eta of a fresh TailTracker fed the reads up to `until`."""
+    tracker = wp.TailTracker()
+    tracker.feed([r for r in reads if until is None or r[0] <= until])
+    return wp.bomuld_tail_eta(tracker.spins)
 
 
 REAL_WASH = Path(__file__).resolve().parent / "fixtures" / "washer_plug_2026_10_04.json"
@@ -305,6 +325,125 @@ class RecoveryAndHardOff(unittest.TestCase):
     def test_hard_off_needs_five_minutes_at_zero(self):
         self.assertTrue(wp.hard_off(grid(0, [0.0] * 151), 300))
         self.assertFalse(wp.hard_off(grid(0, [0.0] * 140), 278))
+
+
+class TailTracking(unittest.TestCase):
+    """TailTracker: the strong spins since the cycle's last heating, kept from call to call."""
+
+    def test_spins_are_the_strong_stretches_after_a_heating(self):
+        reads = hold(0, (120, 2000.0), (60, 80.0), (30, 400.0), (240, 80.0), (30, 600.0))
+        tracker = wp.TailTracker()
+        tracker.feed(reads)
+        self.assertEqual(tracker.spins, [[180.0, 208.0], [450.0, 478.0]])
+        self.assertEqual((tracker.last_heat, tracker.fed), (118.0, 478.0))
+
+    def test_a_read_at_a_threshold_belongs_to_the_stronger_class(self):
+        tracker = wp.TailTracker()
+        tracker.feed([(0, wp.HEAT_W), (2, wp.SPIN_STRONG_W - 0.1), (4, wp.SPIN_STRONG_W), (6, wp.HEAT_W - 0.1)])
+        self.assertEqual(tracker.spins, [[4, 6]])
+        tracker.feed([(8, wp.HEAT_W)], since=6)
+        self.assertEqual(tracker.spins, [])
+        self.assertEqual(tracker.last_heat, 8)
+
+    def test_strong_reads_up_to_the_spin_gap_apart_are_one_spin(self):
+        again = 12 + wp.SPIN_GAP_S
+        tracker = wp.TailTracker()
+        tracker.feed([(0, 2000.0), (10, 400.0), (12, 400.0), (again, 400.0)])
+        self.assertEqual(tracker.spins, [[10, again]])
+        tracker = wp.TailTracker()
+        tracker.feed([(0, 2000.0), (10, 400.0), (12, 400.0), (again + P, 400.0)])
+        self.assertEqual(tracker.spins, [[10, 12], [again + P, again + P]])
+
+    def test_heating_after_a_spin_discards_it(self):
+        reads = hold(0, (120, 2000.0), (880, 80.0), (90, 400.0), (200, 80.0), (30, 2000.0), (400, 80.0), (90, 400.0),
+                     (60, 80.0))                    # spins at 1000 and 1720, a heating at 1290
+        self.assertEqual(tail_eta(reads, 1030), 1000 + wp.BOMULD_TAIL_S[0])
+        self.assertIsNone(tail_eta(reads, 1700))
+        self.assertEqual(tail_eta(reads, 1750), 1720 + wp.BOMULD_TAIL_S[0])      # the first spin since the heating
+
+    def test_spins_before_any_heating_are_ignored(self):
+        reads = hold(0, (500, 80.0), (90, 400.0), (300, 80.0), (60, 2000.0), (400, 80.0), (90, 400.0), (60, 80.0))
+        self.assertIsNone(tail_eta(reads, 888))
+        self.assertIsNone(tail_eta(reads, 1300))
+        self.assertEqual(tail_eta(reads, 1380), 1350 + wp.BOMULD_TAIL_S[0])
+
+    def test_a_burst_under_20_s_is_not_a_spin(self):
+        self.assertIsNone(tail_eta(tail_reads((1000, 20))))                  # strong reads 1000..1018: 18 s
+        self.assertEqual(tail_eta(tail_reads((1000, 22))), 1000 + wp.BOMULD_TAIL_S[0])      # 1000..1020: 20 s
+
+    def test_a_blip_between_two_spins_is_not_a_step(self):
+        reads = tail_reads((1000, 90), (1700, 10), (2140, 150))
+        self.assertEqual(tail_eta(reads), 2140 + wp.BOMULD_TAIL_S[1])
+
+    def test_failed_reads_say_nothing(self):
+        reads = tail_reads((1000, 90))
+        holed = [(t, None) if t == 60 or 1030 <= t <= 1040 else (t, w) for t, w in reads]
+        whole, tracker = wp.TailTracker(), wp.TailTracker()
+        whole.feed(reads)
+        tracker.feed(holed)
+        self.assertEqual(whole.spins, [[1000.0, 1088.0]])
+        self.assertEqual((tracker.spins, tracker.last_heat, tracker.fed), (whole.spins, whole.last_heat, whole.fed))
+
+    def test_reads_at_or_before_since_are_skipped(self):
+        tracker = wp.TailTracker()
+        tracker.feed([(0, 2000.0)])
+        tracker.feed([(0, 2000.0), (2, 400.0), (4, 400.0)], since=2)
+        self.assertEqual((tracker.spins, tracker.last_heat, tracker.fed), ([[4, 4]], 0, 4))
+
+    def test_feeding_in_steps_from_the_newest_read_equals_one_feed(self):
+        reads = tail_reads((1000, 90), (2200, 120), (3280, 400))
+        whole, steps = wp.TailTracker(), wp.TailTracker()
+        whole.feed(reads)
+        for end in range(15, len(reads) + 15, 15):           # a call per 30 s tick, each given everything read so far
+            steps.feed(reads[:end], steps.fed)
+        self.assertEqual(len(whole.spins), 3)
+        self.assertEqual((steps.spins, steps.last_heat, steps.fed), (whole.spins, whole.last_heat, whole.fed))
+
+    def test_spins_are_kept_after_their_reads_leave_the_ring(self):
+        reads = tail_reads((600, 90), (1740, 120), (2880, 600), after_s=120)         # 60 min: longer than the ring
+        ring_len = int(wp.RING_S / P) + 1
+        whole, steps, alone = wp.TailTracker(), wp.TailTracker(), wp.TailTracker()
+        whole.feed(reads)
+        for end in range(15, len(reads) + 15, 15):
+            steps.feed(reads[max(0, end - ring_len):end], steps.fed)
+        alone.feed(reads[-ring_len:])
+        self.assertGreater(reads[-ring_len][0], 600 + 90)            # the first spin and the heating are out of the ring
+        self.assertEqual(len(steps.spins), 3)
+        self.assertEqual(steps.spins, whole.spins)
+        self.assertEqual(alone.spins, [])                            # the ring alone holds no heating
+
+
+class BomuldTailEta(unittest.TestCase):
+    """bomuld_tail_eta: the end from the latest spin and the place the gaps between spin starts give it."""
+
+    def test_no_spin_no_eta(self):
+        self.assertIsNone(wp.bomuld_tail_eta([]))
+
+    def test_each_of_three_spins_gives_the_end_from_its_own_start(self):
+        reads = tail_reads((1000, 90), (2200, 120), (3280, 300))     # starts 20 and 18 min apart
+        self.assertEqual(tail_eta(reads, 1030), 1000 + 50 * 60)
+        self.assertEqual(tail_eta(reads, 2230), 2200 + 31 * 60)
+        self.assertEqual(tail_eta(reads, 3310), 3280 + 12 * 60)
+
+    def test_a_missing_middle_spin_is_a_double_gap(self):
+        for gap_min in (34, 38, 41):
+            start = 1000 + gap_min * 60
+            reads = tail_reads((1000, 90), (start, 300))
+            self.assertEqual(tail_eta(reads), start + 12 * 60, gap_min)
+
+    def test_spins_closer_than_half_a_step_still_count_one_step(self):
+        self.assertEqual(wp.bomuld_tail_eta([[0, 30], [300, 330]]), 300 + 31 * 60)
+
+    def test_more_spins_than_the_schedule_stay_at_its_last_step(self):
+        self.assertEqual(wp.bomuld_tail_eta([[s, s + 30] for s in (0, 1140, 2280, 3420)]), 3420 + 12 * 60)
+
+    def test_a_spin_of_6_min_is_the_final_one_wherever_it_falls(self):
+        first = tail_reads((1000, 600))
+        self.assertEqual(tail_eta(first, 1000 + wp.TAIL_FINAL_SPIN_S - 2), 1000 + 50 * 60)
+        self.assertEqual(tail_eta(first, 1000 + wp.TAIL_FINAL_SPIN_S), 1000 + 12 * 60)
+        second = tail_reads((1000, 90), (2200, 600))                 # the gap alone would make it the second
+        self.assertEqual(tail_eta(second, 2200 + wp.TAIL_FINAL_SPIN_S - 2), 2200 + 31 * 60)
+        self.assertEqual(tail_eta(second, 2200 + wp.TAIL_FINAL_SPIN_S), 2200 + 12 * 60)
 
 
 class ReadDeadline(unittest.TestCase):

@@ -9,6 +9,9 @@ fresh. Anything else is "no decision yet", never a guess.
 The reads run on a private thread rather than an AppDaemon schedule: AppDaemon's event loop stalls for seconds at a
 time (its utility loop re-parses the app files on the loop), and a scheduled read landing that late breaks the window
 it falls in. The thread only ever waits for the GIL, which one file parse holds far shorter than the gap bound.
+
+TailTracker and bomuld_tail_eta read the same ring for the spins that close a Bomuld wash and give its expected end;
+they decide nothing.
 """
 import json
 import socket
@@ -33,6 +36,11 @@ PULSE_MAX_S = 11.0
 RESUME_W = 18.0; RESUME_S = 60
 HARD_OFF_W = 0.5; HARD_OFF_S = 300
 ACTIVITY_W = 150.0
+# Bomuld ends BOMULD_TAIL_S after the start of its 1st, 2nd and 3rd strong spin (SPIN_STRONG_W up to HEAT_W) since the
+# last heating. Consecutive spins start about TAIL_STEP_S apart; one shorter than TAIL_MIN_SPIN_S is a drum blip, one of
+# TAIL_FINAL_SPIN_S or more is the final spin (the rinse spins are shorter).
+TAIL_MIN_SPIN_S = 20; TAIL_FINAL_SPIN_S = 360; TAIL_STEP_S = 19 * 60
+BOMULD_TAIL_S = (50 * 60, 31 * 60, 12 * 60)
 
 
 def read_switch(host, deadline_s=DEADLINE_S, clock=time.monotonic):
@@ -264,3 +272,52 @@ def _pulses(seg, first):
             return None
         out.append((seg[i][0] - seg[a - 1][0], a - 1 >= first))
     return out
+
+
+class TailTracker:
+    """The strong spins since a cycle's last heating, as [first, last] read times, fed from the poller's ring in steps so
+    spins that have left the ring stay counted. Heating discards the spins so far, and a spin counts only after a
+    heating has been read. `fed` is the newest read time consumed: pass it back as `since`."""
+
+    def __init__(self):
+        self.spins = []
+        self.last_heat = None
+        self.fed = None
+
+    def feed(self, samples, since=None):
+        """Consume the reads newer than `since`, oldest first. A failed read says nothing; a spin continues across
+        reads at most SPIN_GAP_S apart."""
+        for ts, w in samples:
+            if since is not None and ts <= since:
+                continue
+            self.fed = ts
+            if w is None:
+                continue
+            if w >= HEAT_W:
+                self.last_heat, self.spins = ts, []
+            elif w >= SPIN_STRONG_W and self.last_heat is not None:
+                if self.spins and ts - self.spins[-1][1] <= SPIN_GAP_S:
+                    self.spins[-1][1] = ts
+                else:
+                    self.spins.append([ts, ts])
+
+
+def tail_spins(spins):
+    """The spins long enough to be programme spins rather than drum blips."""
+    return [s for s in spins if s[1] - s[0] >= TAIL_MIN_SPIN_S]
+
+
+def bomuld_tail_eta(spins):
+    """Monotonic time a Bomuld wash ends, from a TailTracker's spins, or None before the first real spin. The latest spin
+    is the n-th of BOMULD_TAIL_S, n counted from the first by the gaps between spin starts (a weak rinse spin that never
+    reached SPIN_STRONG_W leaves a double gap); one lasting TAIL_FINAL_SPIN_S is the final spin whatever its place."""
+    known = tail_spins(spins)
+    if not known:
+        return None
+    last = known[-1]
+    if last[1] - last[0] >= TAIL_FINAL_SPIN_S:
+        return last[0] + BOMULD_TAIL_S[-1]
+    i = 0
+    for a, b in zip(known, known[1:]):
+        i += max(1, round((b[0] - a[0]) / TAIL_STEP_S))
+    return last[0] + BOMULD_TAIL_S[min(i, len(BOMULD_TAIL_S) - 1)]
