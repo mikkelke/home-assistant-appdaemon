@@ -16,7 +16,7 @@
 # data gates.
 #
 # Sent at most once per calendar day (last-sent date in state_file), gated on person_entity
-# being home (suppress ONLY on a live "not_home" reading -- a dead/unknown sensor is never
+# being home (suppress ONLY on a live away reading, not_home or a zone -- a dead/unknown sensor is never
 # evidence of being away) and on sleep_plan_entity actually having published data (missing/
 # unknown data does NOT mark the day as sent, so a later trigger retries).
 

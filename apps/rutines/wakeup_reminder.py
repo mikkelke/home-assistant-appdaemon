@@ -271,9 +271,9 @@ class WakeupReminder(hass.Hass):
             if weekday not in [4, 5]:
                 return
             
-            # Check if person left home (was home, now not_home)
-            was_home = old and old != "not_home" and old != "unavailable"
-            is_not_home = new == "not_home" or new == "unavailable"
+            # Check if person left home (was home, now away or unavailable)
+            was_home = old == "home"
+            is_not_home = new not in ("home", "unknown")
             
             if was_home and is_not_home:
                 today = self.datetime().date()
@@ -400,16 +400,10 @@ class WakeupReminder(hass.Hass):
     def _is_person_home(self, person_entity):
         """Check if a person is home.
         
-        Returns True if person state is 'home' or in a zone (not 'not_home').
+        Returns True for 'home' and for 'unknown'; not_home, another zone and unavailable read away.
         """
         try:
-            person_state = self.get_state(person_entity)
-            if person_state == "home":
-                return True
-            # Also check if person is in a specific zone (not "not_home")
-            if person_state and person_state != "not_home" and person_state != "unavailable":
-                return True
-            return False
+            return self.get_state(person_entity) in ("home", "unknown")
         except Exception as e:
             self.log(f"Error checking person {person_entity}: {e}", level="WARNING")
             return False

@@ -344,6 +344,12 @@ class HomeGate(unittest.TestCase):
         self.assertEqual(app._notified, [])
         self.assertIsNone(app._sent_date)
 
+    def test_other_zone_suppresses(self):
+        app = _make_app(person="Office", plan_attrs=PLAN_ATTRS)
+        _run(app)
+        self.assertEqual(app._notified, [])
+        self.assertIsNone(app._sent_date)
+
     def test_missing_unknown_unavailable_person_does_not_suppress(self):
         for state in (None, "unknown", "unavailable"):
             app = _make_app(person=state, plan_attrs=PLAN_ATTRS)

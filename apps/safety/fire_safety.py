@@ -988,7 +988,7 @@ class FireSafety(hass.Hass):
         """Refuse unless the alarm is idle and the device itself is clear - a self-test
         sounds the siren, so it must never fire mid-episode or onto ambiguous device state.
         The automatic monthly run additionally refuses unless everyone tracked is CONFIRMED
-        not_home (unknown/unavailable presence counts as home)."""
+        away, not_home or another zone (unknown/unavailable presence counts as home)."""
         async with self._eval_lock:
             if not await self._self_test_ready(automatic):
                 self.log("Self-test refused - alarm not idle, device not clear, or presence unclear", level="WARNING")
@@ -1024,7 +1024,7 @@ class FireSafety(hass.Hass):
         """Unknown/unavailable presence counts as "home" for this gate - a self-test
         sounds the siren, so an unclear reading must never read as "away"."""
         for entity in self.monthly_test_person_entities:
-            if await self._read_state(entity) != "not_home":
+            if await self._read_state(entity) in (None, "home", "unknown", "unavailable"):
                 return True
         return False
 
@@ -1313,7 +1313,7 @@ class FireSafety(hass.Hass):
         while home.
 
         The "nobody home -> everyone" fallback only applies once every tracked person is
-        CONFIRMED not_home - an unknown/unavailable presence is ambiguous, not evidence of
+        CONFIRMED away (not_home or another zone) - an unknown/unavailable presence is ambiguous, not evidence of
         absence, so that person is simply left out rather than triggering "everyone".
 
         include_history=False (initial alarm + repeats) computes "always ∪ home now" only;
@@ -1327,7 +1327,7 @@ class FireSafety(hass.Hass):
             state = await self._read_state(entity)
             if state == "home":
                 home.add(person)
-            if state != "not_home":
+            if state in (None, "home", "unknown", "unavailable"):
                 all_confirmed_away = False
         if not home and all_confirmed_away and self.alarm_nobody_home == "everyone":
             home = set(self.alarm_notify_if_home.keys())

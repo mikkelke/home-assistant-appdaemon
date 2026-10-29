@@ -33,7 +33,7 @@ own pre-empt check is mid-flight -- can't both slip past the once-per-day check 
 double-send):
   1. Local hour in [from_hour, until_hour) -- outside it, ignore silently.
   2. Once per day -- last-sent date persisted to state_file.
-  3. Home (person_entity) -- suppress ONLY on a live "not_home" reading; a dead/unknown/
+  3. Home (person_entity) -- suppress ONLY on a live away reading (not_home or a zone); a dead/unknown/
      unavailable sensor is never evidence of being away (same semantics as SmartCooling's
      rescue_home_entity gate).
   4. Data -- sensor.sleep_plan must have a real state and non-empty attributes. Missing/
@@ -311,11 +311,11 @@ class MorningBriefing(hass.Hass):
                 self.log("Morning briefing already sent today -- ignoring", level="DEBUG")
                 return
 
-            # Gate 3: home. Suppress ONLY on a live "not_home" reading -- a dead/unknown/
-            # unavailable sensor is not evidence of being away.
+            # Gate 3: home. Suppress ONLY on a live away reading (not_home or another zone) --
+            # a dead/unknown/unavailable sensor is not evidence of being away.
             person = await self._state(self.person_entity)
-            if person == "not_home":
-                self.log(f"{self.person_entity} is not_home -- skipping the morning briefing",
+            if person not in (None, "home", "unknown", "unavailable"):
+                self.log(f"{self.person_entity} is {person} -- skipping the morning briefing",
                          level="DEBUG")
                 return
 
@@ -391,7 +391,7 @@ class MorningBriefing(hass.Hass):
         """The rescue's inverse (2026-08-06): the morning said set-up/deploy/arm, the plan
         has since downgraded to windows/nothing -- say so once, in the evening, so the unit
         never gets carried in for a night that sorted itself. Same manners as the rescue:
-        a live not_home suppresses WITHOUT consuming the day; once per calendar day."""
+        a live away reading suppresses WITHOUT consuming the day; once per calendar day."""
         try:
             if not self.stand_down_enabled:
                 return
@@ -405,7 +405,7 @@ class MorningBriefing(hass.Hass):
             if plan_state not in ("windows", "nothing"):
                 return
             person = await self._state(self.person_entity)
-            if person == "not_home":
+            if person not in (None, "home", "unknown", "unavailable"):
                 return
             body = "Skip the AC. Keep windows open." if plan_state == "windows" else \
                 "Skip the AC. The bedroom stays cool on its own."

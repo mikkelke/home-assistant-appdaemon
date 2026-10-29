@@ -484,18 +484,18 @@ class Rober2Control(hass.Hass):
             
     async def is_away(self) -> bool:
         """Return True if home is considered away.
-        New logic: zone.home must be "0" AND all tracked persons must be explicitly 'not_home'.
-        Unknown/unavailable person states now BLOCK cleaning (treated as not-away).
+        zone.home must be "0" AND every tracked person must read away: not_home or another zone.
+        Home and unknown/unavailable person states BLOCK cleaning (treated as not-away).
         """
         try:
             home_state = await self.get_state("zone.home")
             if str(home_state) != "0":
                 return False
-            # All tracked persons must be explicitly 'not_home'. Any other state blocks cleaning.
+            # Every tracked person must read away (not_home or a zone such as Office).
             for person in getattr(self, 'person_entities', []):
                 try:
                     person_state = await self.get_state(person)
-                    if person_state != "not_home":
+                    if person_state in (None, "home", "unknown", "unavailable"):
                         return False
                 except Exception:
                     # On error reading a person entity, block cleaning conservatively
