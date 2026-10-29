@@ -34,6 +34,10 @@ due and when it was last watered. A Done on a plant without a sensor, and a rise
 for one with a sensor, are told to the house events feed as `house_events_report` events, which is
 also where the sensor plants' last-watered times come from.
 
+Yale keypad unlocks by residents still registered away 15 minutes later add quiet admin notes
+(upcoming_yale), closed with Done. Notes and Done survive reload; pending checks are dropped. These
+notes have no push key and never enter the maintenance digest.
+
 Latches, push keys, battery facts, the cleaning rate, the tapped tasks' anchors and the sensor plants'
 last-watered times persist in house_upcoming_state.json next to this module; rain forecast fixtures go to
 house_upcoming_rain_fixtures.jsonl.
@@ -60,6 +64,7 @@ import upcoming_plants as plants
 import upcoming_rain as rain
 import upcoming_runs as runs
 import upcoming_train as train
+import upcoming_yale as yale
 
 TICK_S = 300
 HISTORY_DELAY_S = 45
@@ -128,10 +133,21 @@ class HouseUpcoming(hass.Hass):
         self.plants = plants.parse_plants(a.get("plants"))
         self.timed_plants = plants.parse_timed(a.get("plants"))
         self.once_tasks = once.parse_once(a.get("once"))
+        yl = a.get("yale") or {}
+        self.yale_lock = yl.get("lock", "lock.yale")
+        self.yale_operator = yl.get("operator", "sensor.yale_operator")
+        self.yale_operators = yale.operators(yl.get("operators"))
 
         self._notifier = self.get_app("MobileNotifier")
 
         saved = self._load_state()
+        self._yale_notes = yale.restore(saved.get("yale"), self.yale_operators)
+        self._yale_pending = {}
+        self._yale_unlock = None
+        self._yale_last_unlock = None
+        self._yale_actor = None
+        self._yale_seen = set()
+        self._yale_started = self.get_now()
         self._rober2 = dict(saved.get("rober2") or {})
         rate = saved.get("rober2_rate")
         self._rober2_rate = rate if isinstance(rate, (int, float)) and rate > 0 else maint.ROBER2_RATE_DEFAULT
@@ -184,6 +200,9 @@ class HouseUpcoming(hass.Hass):
         sources += [self.washer_entity, self.price_entity, self.profiles_entity, self.train_route, self.train_stog,
                     self.train_person, self.rain_alert, self.rain_home]
         sources += list(self.rain_doors) + list(self.inventory["devices"]) + list(self.plants)
+        if self.yale_operators:
+            sources += [self.yale_lock, self.yale_operator]
+            sources += [item["person"] for item in self.yale_operators.values()]
         sources += [plant["conductivity"] for plant in self.plants.values() if plant["conductivity"]]
         return list(dict.fromkeys(sources))
 
@@ -230,11 +249,79 @@ class HouseUpcoming(hass.Hass):
 
     def _on_source(self, entity, attribute, old, new, kwargs):
         self._cache[entity] = new if isinstance(new, dict) else None
+        self._on_yale_source(entity, old, new)
         if entity in self.inventory["devices"] and isinstance(new, dict):
             was = maint.reading(old.get("state")) if isinstance(old, dict) else None
             if was is not None and maint.reading(new.get("state")) is None:
                 self._offline_at[entity] = maint.parse_iso(new.get("last_changed")) or self.get_now()
         self._evaluate()
+
+    # -- Yale keypad notes ----------------------------------------------------
+
+    def _on_yale_source(self, entity, old, new):
+        if not self.yale_operators:
+            return
+        now = self.get_now()
+        people = {item["person"] for item in self.yale_operators.values()}
+        if entity in people and not yale.known_away(self._state_of(entity)):
+            if self._yale_unlock:
+                self._yale_unlock["away"].discard(entity)
+            for key, pending in list(self._yale_pending.items()):
+                if pending["person"] == entity:
+                    self.cancel_timer(pending["handle"])
+                    del self._yale_pending[key]
+        if entity == self.yale_lock:
+            was = (old or {}).get("state") if isinstance(old, dict) else None
+            state = (new or {}).get("state") if isinstance(new, dict) else None
+            at = maint.parse_iso((new or {}).get("last_changed")) if isinstance(new, dict) else None
+            if state != "unlocked":
+                self._yale_unlock = None
+            if was == "locked" and state == "unlocked" and at is not None:
+                locked_at = maint.parse_iso(old.get("last_changed"))
+                # A rapid lock/unlock can still be waiting for the LOCK's operator update.
+                settled = locked_at is not None and at - locked_at > yale.ATTRIBUTION_WINDOW
+                fresh = self._yale_started <= at <= now and now - at <= yale.ATTRIBUTION_WINDOW
+                if settled and fresh and (self._yale_last_unlock is None or at > self._yale_last_unlock):
+                    self._yale_last_unlock = at
+                    self._yale_unlock = {"at": at, "away": {person for person in people
+                                                          if yale.known_away(self._state_of(person))}}
+        if entity == self.yale_operator:
+            # A fresh picture/metadata update does not describe another keypad operation.
+            before = ((old or {}).get("state"), ((old or {}).get("attributes") or {}).get("method"))
+            after = ((new or {}).get("state"), ((new or {}).get("attributes") or {}).get("method"))
+            if before == after:
+                return
+            self._yale_actor = None
+            actor = yale.operator(new, self.yale_operators)
+            at = maint.parse_iso((new or {}).get("last_updated")) if isinstance(new, dict) else None
+            if actor and at is not None and self._yale_started <= at <= now:
+                if now - at <= yale.ATTRIBUTION_WINDOW:
+                    self._yale_actor = {"at": at, "person": actor["person"]}
+        unlock, actor = self._yale_unlock, self._yale_actor
+        if not unlock or not actor:
+            return
+        if not timedelta(0) <= actor["at"] - unlock["at"] <= yale.ATTRIBUTION_WINDOW:
+            return
+        self._yale_unlock = None
+        person, at = actor["person"], unlock["at"]
+        key = yale.row_id(person, at)
+        if key in self._yale_seen or key in self._yale_notes:
+            return
+        self._yale_seen.add(key)
+        if person not in unlock["away"] or not yale.known_away(self._state_of(person)):
+            return
+        delay = max(0, (at + yale.WAIT - now).total_seconds())
+        handle = self.run_in(self._on_yale_check, delay, row=key)
+        self._yale_pending[key] = {"person": person, "at": at.isoformat(), "handle": handle}
+
+    def _on_yale_check(self, kwargs):
+        key = kwargs["row"]
+        pending = self._yale_pending.pop(key, None)
+        if not pending or key in self._yale_notes or not yale.known_away(self._state_of(pending["person"])):
+            return
+        self._yale_notes[key] = {"person": pending["person"], "at": pending["at"]}
+        self._save_state(force=True)
+        self._evaluate(publish=True)
 
     def _on_plugin_started(self, event_name, data, kwargs):
         self._evaluate(publish=True)
@@ -252,6 +339,11 @@ class HouseUpcoming(hass.Hass):
 
     def _on_done(self, event_name, data, kwargs):
         row = (data or {}).get("row")
+        if row in self._yale_notes:
+            if not self._yale_notes[row].get("done"):
+                self._yale_notes[row]["done"] = core.utc_iso(self.get_now())
+                self._after_anchor_change("done", row, self.get_now())
+            return
         item = self._calendar_item(row)
         if item:
             key, label, closed = item
@@ -280,6 +372,10 @@ class HouseUpcoming(hass.Hass):
 
     def _on_undo(self, event_name, data, kwargs):
         row = (data or {}).get("row")
+        if row in self._yale_notes:
+            if self._yale_notes[row].pop("done", None):
+                self._after_anchor_change("undo", row, self.get_now())
+            return
         item = self._calendar_item(row)
         task = None if item else runs.tapped_task(row, self.run_tasks)
         key = item[0] if item else task.key if task else None
@@ -360,6 +456,8 @@ class HouseUpcoming(hass.Hass):
         rows.append(train.train_row(self._cache.get(self.train_route), self._state_of(self.train_stog),
                                     self._state_of(self.train_person), now, self.train_users))
         rows.extend(self._rain_rows(now))
+        # Informative notes never enter maintenance push conditions.
+        rows.extend(yale.rows(self._yale_notes, self.yale_operators))
 
         rows = core.finalize_rows([row for row in rows if row])
         self._conditions = conditions
@@ -659,7 +757,8 @@ class HouseUpcoming(hass.Hass):
     def _save_state(self, force=False):
         data = {"version": STATE_VERSION, "rober2": self._rober2, "rober2_rate": self._rober2_rate,
                 "batteries": self._batteries, "plants": self._plant_latches, "watered": self._watered,
-                "pushed": self._pushed, "facts": self._facts, "content": self._content, "done": self._anchors}
+                "pushed": self._pushed, "facts": self._facts, "content": self._content, "done": self._anchors,
+                "yale": self._yale_notes}
         text = json.dumps(data, sort_keys=True)
         if text == self._state_text:
             return

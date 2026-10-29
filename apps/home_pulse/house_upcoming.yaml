@@ -17,6 +17,17 @@ HouseUpcoming:
   history_time: "03:40:00"
   history_start: "2025-01-26"
 
+  # The operator sensor follows the cloud lock by a few seconds. Only keypad unlocks count.
+  # Match the first word of the cloud account name, keeping full account names out of this repo.
+  # Quiet admin notes stay until Done; completed notes survive reload, pending checks do not.
+  yale:
+    lock: lock.yale
+    operator: sensor.yale_operator
+    operators:
+      Mikkel: person.mikkel
+      Kristine: person.kristine
+      Claudia: person.claudia
+
   rober2:
     prefix: sensor.rober2_
     suffix: _time_left
