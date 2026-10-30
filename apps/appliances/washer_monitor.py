@@ -1091,9 +1091,9 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
 
         # Restore _store_state_since (see the mixin's _build_cycle_store_payload docstring) so
         # it survives multiple consecutive restarts instead of resetting to "now" every boot:
-        # prefer the entity's own last_changed when it is itself live (AD-only reload -
-        # boot_last_changed is always None after a HA-restart erasure, so this is meaningless
-        # there), else the store's own state_since when THIS boot's resolution actually came
+        # prefer what the live entity says - its published state_since, else its last_changed
+        # (a republish after a HA restart sets last_changed to that republish, so the attribute
+        # must win) - else the store's own state_since when THIS boot's resolution actually came
         # from the store (store_used - never from an unrelated store record that lost out to
         # the mirror or was rejected as stale). Only when a real value is found is
         # _store_last_written_state also set to the resolved self.state, so the imminent first
@@ -1103,8 +1103,8 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         # (the pre-existing behaviour) stands, same as it always has.
         if self.state != "Off":
             restored_since = None
-            if entity_trusted and boot_last_changed:
-                restored_since = cystore.parse_utc(boot_last_changed)
+            if entity_trusted and (boot_attrs.get("state_since") or boot_last_changed):
+                restored_since = cystore.parse_utc(boot_attrs.get("state_since") or boot_last_changed)
             elif store_used and store_data:
                 restored_since = cystore.parse_utc(store_data.get("state_since"))
             if restored_since is not None:

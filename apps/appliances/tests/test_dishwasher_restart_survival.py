@@ -660,6 +660,20 @@ class UnemptiedStateSinceSurvivesAcrossRestartsFromTheStore(unittest.TestCase):
             published = entities[app.state_entity]["attributes"].get("state_since")
             self.assertEqual(published, cs.format_utc(app.state_since))
 
+    def test_live_entity_republished_by_a_ha_restart_keeps_its_published_entry_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, entities = make_app(
+                tmp,
+                sensor_state="Unemptied",
+                sensor_attrs={"state_since": "2026-10-30T05:09:56Z"},
+                sensor_last_changed="2026-10-30T06:05:15Z",
+            )
+
+            app.initialize()
+
+            self.assertEqual(app.state, "Unemptied")
+            self.assertEqual(cs.format_utc(app.state_since), "2026-10-30T05:09:56Z")
+
 
 # ----------------------------------------------------------------------------------------
 # FIX 1 (blocker) - 2026-08-12 adversarial review: the boot self-heal used to decide the

@@ -483,14 +483,16 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         elif store_data:
             self._entity_recreated_at = parse_utc(store_data.get("entity_recreated_at"))
 
-        # state_since (see its init comment): prefer the entity's own last_changed from the
-        # boot snapshot - meaningful only when the entity is itself live (AD-only reload; after
-        # a HA-restart erasure it would just be this boot's own recreation instant, worthless
-        # exactly when the store matters most) - else carry forward whatever the store's own
-        # state_since already was, rather than treating "now" as a fresh one.
+        # state_since (see its init comment): prefer what the live entity says - its published
+        # state_since, else its last_changed (an entity republished after a HA restart has a
+        # last_changed of that republish, so the attribute must win) - else carry forward
+        # whatever the store's own state_since already was, rather than treating "now" as a
+        # fresh one.
+        boot_full = self._boot_full_state if entity_sourced and isinstance(self._boot_full_state, dict) else {}
         boot_last_changed = (
-            (self._boot_full_state.get("last_changed") or self._boot_full_state.get("last_updated"))
-            if entity_sourced and isinstance(self._boot_full_state, dict) else None
+            (boot_full.get("attributes") or {}).get("state_since")
+            or boot_full.get("last_changed")
+            or boot_full.get("last_updated")
         )
         if boot_last_changed:
             self.state_since = parse_utc(boot_last_changed)
