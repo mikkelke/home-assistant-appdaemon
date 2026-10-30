@@ -71,6 +71,12 @@ class NormalizeTests(unittest.TestCase):
         r = cp.normalize({**BUILT, "ratio": None})
         self.assertEqual(r["ratio"], 16.0)
 
+    def test_a_recipe_without_a_cloud_id_is_known_by_its_name(self):
+        r = cp.normalize({**BUILT, "id": None, "name": " Espresso-koncentrat "})
+        self.assertEqual(r["id"], "Espresso-koncentrat")
+        self.assertEqual(cp.recipe_entry(r)["id"], "Espresso-koncentrat")
+        self.assertIs(cp.by_id([r], "Espresso-koncentrat"), r)
+
     def test_junk_is_no_recipe(self):
         for junk in (None, {}, {"name": "x"}, {"name": "x", "dose_g": 15, "pours": []}, "recipe", {"dose_g": 15}):
             self.assertIsNone(cp.normalize(junk), junk)

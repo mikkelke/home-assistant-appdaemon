@@ -67,7 +67,7 @@ def _pour(raw):
 
 def normalize(recipe):
     """The coffee app's recipe: id, name, dose_g, ratio (the N of 1:N), grind, rpm, cup_type, pours, total_ml.
-    None for anything that is no recipe."""
+    A recipe added locally has no cloud id, so its name is its id. None for anything that is no recipe."""
     if not isinstance(recipe, dict) or not str(recipe.get("name") or "").strip():
         return None
     dose = _num(recipe.get("dose_g"))
@@ -76,9 +76,10 @@ def normalize(recipe):
         return None
     grind = _num(recipe.get("grind_size"), _num(recipe.get("grinder_size")))
     rpm = _num(recipe.get("grinder_speed_rpm"), _num(recipe.get("rpm")))
+    name = str(recipe["name"]).strip()
     out = {
-        "id": str(recipe.get("id") or ""),
-        "name": str(recipe["name"]).strip(),
+        "id": str(recipe.get("id") or name),
+        "name": name,
         "dose_g": round(dose, 1),
         "ratio": _ratio(recipe, dose),
         "grind": int(round(grind)) if grind is not None else None,
