@@ -62,7 +62,8 @@ def make_app(path, now=T0, history=None, states=None):
         start, end = kwargs["start_time"].timestamp(), kwargs["end_time"].timestamp()
         before = [full for full in rows if sv.epoch(full["last_changed"]) <= start]
         after = [full for full in rows if start < sv.epoch(full["last_changed"]) <= end]
-        return [(before[-1:] + after)]
+        return [[{key: datetime.fromisoformat(value) if key.startswith("last_") else value
+                 for key, value in full.items()} for full in before[-1:] + after]]
 
     app.get_history = MagicMock(side_effect=get_history)
     app.set_state = MagicMock()

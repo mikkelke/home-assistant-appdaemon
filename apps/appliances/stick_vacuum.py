@@ -50,6 +50,8 @@ def stamp(value):
 
 
 def epoch(value):
+    if isinstance(value, datetime):
+        return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).timestamp()
     parsed = run_ledger.parse_time(value)
     return parsed.timestamp() if parsed is not None else None
 
