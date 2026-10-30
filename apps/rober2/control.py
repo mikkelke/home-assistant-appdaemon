@@ -1015,19 +1015,7 @@ class Rober2Control(hass.Hass):
                             self.log(f"Robot really left dock - tracking room {self.current_room} ({room_name})", level="INFO")
                         else:
                             self.log(f"Robot cleaning but input_text.rober2_current_room is '{current_room_text}' - cannot track", level="WARNING")
-                    
-                    
-                    # Proactively enforce max_plus at cleaning start (in addition to attribute listener)
-                    try:
-                        current_fan = await self.get_state("vacuum.rober2", attribute="fan_speed")
-                        if current_fan != "max_plus":
-                            now_ts = datetime.datetime.now().timestamp()
-                            await self.set_fan_speed("max_plus")
-                            self._last_fan_set = now_ts
-                            self.fan_speed_enforced = True
-                    except Exception:
-                        pass
-                    
+
                     if self.current_room:
                         await self._set_narrative(
                             f"Cleaning {self._pretty_room_from_segment_id(self.current_room)}"
@@ -1035,9 +1023,21 @@ class Rober2Control(hass.Hass):
                     else:
                         await self._set_narrative("Cleaning - target unknown")
 
-                    self.log_state_conclusion("vacuum_cleaning", "cleaning", "monitor_cleaning", 
+                    self.log_state_conclusion("vacuum_cleaning", "cleaning", "monitor_cleaning",
                                             "Robot started cleaning")
-                
+
+                # Outside the guard: handle_robot_status usually sets self.cleaning first, and the
+                # robot keeps the turbo it drops to when docking, so no fan_speed change event fires.
+                try:
+                    current_fan = await self.get_state("vacuum.rober2", attribute="fan_speed")
+                    if current_fan != "max_plus":
+                        now_ts = datetime.datetime.now().timestamp()
+                        await self.set_fan_speed("max_plus")
+                        self._last_fan_set = now_ts
+                        self.fan_speed_enforced = True
+                except Exception:
+                    pass
+
             elif new == "docked":
                 dock_room_seg = self.current_room
                 # Safety net: if we somehow arrived docked with rooms left,
