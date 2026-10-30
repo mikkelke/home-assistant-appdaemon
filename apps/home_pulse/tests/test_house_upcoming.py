@@ -145,7 +145,7 @@ def write_ledger(state_dir, name, cycles):
     if cycles is None:
         path.unlink(missing_ok=True)
         return
-    path.write_text(json.dumps({"version": 2, "cycles": cycles}))
+    path.write_text(json.dumps({"version": 2, "visits" if name == "stick" else "cycles": cycles}))
     _ledger_clock[0] += 1
     stamp = 1_700_000_000 + _ledger_clock[0] * 10
     os.utime(path, (stamp, stamp))
@@ -167,6 +167,10 @@ def make_app(states=None, state_dir=None, now=NOW, ledgers=None, **args):
     app.args["coffee"] = {**(args.get("coffee") or {}), "feedback_file": f"{state_dir}/coffee_feedback.json"}
     if "coffee" in (ledgers or {}):
         write_ledger(state_dir, "coffee", ledgers["coffee"])
+    app.args["stick"] = {**(CONFIG.get("stick") or {}), **(args.get("stick") or {}),
+                          "feedback_file": f"{state_dir}/stick_feedback.json"}
+    if "stick" in (ledgers or {}):
+        write_ledger(state_dir, "stick", ledgers["stick"])
     app.state_dir = state_dir
     app.now = now
     app.states = states if states is not None else base_states()
@@ -865,8 +869,8 @@ class RunTaskTests(unittest.TestCase):
         self.assertEqual(CONFIG["dryer"], {"interval_runs": None})
         app = make_app()
         self.assertEqual(app.run_areas, {"washer": "guest_bathroom", "dishwasher": "kitchen", "dryer": "guest_bathroom",
-                                         "coffee": "kitchen"})
-        self.assertEqual(set(app.feedback_files), {"washer", "dishwasher", "dryer", "coffee"})
+                                         "coffee": "kitchen", "stick": "kitchen"})
+        self.assertEqual(set(app.feedback_files), {"washer", "dishwasher", "dryer", "coffee", "stick"})
 
     def test_the_ledgers_default_to_the_files_next_to_the_appliance_modules(self):
         app = hu.HouseUpcoming.__new__(hu.HouseUpcoming)
@@ -885,6 +889,7 @@ class RunTaskTests(unittest.TestCase):
         self.assertEqual(app.feedback_files["dishwasher"], here.parent / "appliances" / "dishwasher_feedback.json")
         self.assertEqual(app.feedback_files["dryer"], here.parent / "appliances" / "dryer_feedback.json")
         self.assertEqual(app.feedback_files["coffee"], here.parent / "coffee" / "coffee_feedback.json")
+        self.assertEqual(app.feedback_files["stick"], here.parent / "appliances" / "stick_vacuum_feedback.json")
         self.assertEqual(app.done_log_file, here / "house_upcoming_done_log.jsonl")
 
 
@@ -2167,6 +2172,91 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(models["twinguard"]["pushed_by"], "fire_safety")
         for pct in range(0, 101):
             self.assertEqual(pct <= models["twinguard"]["low"], pct < fire_safety["battery_low_pct"], pct)
+
+
+class StickVacuumTests(unittest.TestCase):
+    def state(self, problems="", session_open="no", **attrs):
+        return full("in_use" if session_open == "yes" else "off_mount",
+                    {"problems": problems, "session_open": session_open, **attrs})
+
+    def test_filter_counts_visits_rather_than_sessions_and_done_and_undo_use_the_same_flow(self):
+        app = make_app(ledgers={"stick": []})
+        visits = [{"start": iso(NOW + i * 7 * 24 * HOUR - HOUR), "ts": iso(NOW + i * 7 * 24 * HOUR),
+                   "duration_min": 40, "sessions": ["one", "two"]} for i in range(1, 5)]
+        write_ledger(app.state_dir, "stick", visits)
+        tick(app, 28 * 24 * HOUR)
+        row = rows(app)["maint:stick:filters"]
+        self.assertEqual(row["detail"], "wash filters + dry 24 h, due")
+        self.assertTrue(row["info"][0].startswith("Every 4 visits ("))
+        self.assertEqual((row["icon"], row["audience"], row["done"]), ("mdi:vacuum", "admin", "tap"))
+        app._on_done("house_upcoming_done", {"row": "maint:stick:filters"}, {})
+        self.assertIn("4 visits left", rows(app)["maint:stick:filters"]["detail"])
+        self.assertEqual(app._anchors["stick:filters"]["runs"], 4)
+        app._on_undo("house_upcoming_undo", {"row": "maint:stick:filters"}, {})
+        self.assertIn("due", rows(app)["maint:stick:filters"]["detail"])
+
+    def test_filter_flag_is_due_without_a_ledger_and_only_the_digest_pushes(self):
+        states = base_states()
+        states["sensor.stick_vacuum"] = self.state("filter")
+        app = make_app(states)
+        self.assertIn("due", rows(app)["maint:stick:filters"]["detail"])
+        self.assertEqual(app.tasks, [])
+        app._on_push_time({})
+        drain(app)
+        self.assertEqual([item["message"] for item in app.notifier.sent], ["Stick vacuum filters"])
+        fire(app, "sensor.stick_vacuum", self.state(""))
+        self.assertIn("4 visits left", rows(app)["maint:stick:filters"]["detail"])
+
+    def test_clog_waits_for_session_close_pushes_once_and_the_digest_and_restart_do_not_repeat_it(self):
+        app = make_app()
+        onset = iso(NOW)
+        fire(app, "sensor.stick_vacuum", self.state("clogged", "yes", clogged_since=onset))
+        self.assertIn("maint:stick:clogged", rows(app))
+        self.assertEqual(app.tasks, [])
+        app._on_push_time({})
+        drain(app)
+        self.assertEqual(app.notifier.sent, [])
+        fire(app, "sensor.stick_vacuum", self.state("clogged", clogged_since=onset))
+        drain(app)
+        self.assertEqual(len(app.notifier.sent), 1)
+        self.assertEqual(app.notifier.sent[0]["target"], ["mikkel"])
+        self.assertEqual(app.notifier.sent[0]["message"], "Stick vacuum air path clogged")
+        tick(app)
+        app._on_push_time({})
+        drain(app)
+        self.assertEqual(len(app.notifier.sent), 1)
+        reloaded = make_app(app.states, state_dir=app.state_dir, now=app.now)
+        drain(reloaded)
+        reloaded._on_push_time({})
+        drain(reloaded)
+        self.assertEqual(reloaded.notifier.sent, [])
+        fire(app, "sensor.stick_vacuum", self.state())
+        fire(app, "sensor.stick_vacuum", self.state("clogged", clogged_since=iso(app.now)))
+        drain(app)
+        self.assertEqual(len(app.notifier.sent), 2)
+
+    def test_not_charging_no_push_is_row_only_including_the_digest(self):
+        app = make_app()
+        fire(app, "sensor.stick_vacuum", self.state("not_charging", not_charging_since=iso(NOW - HOUR),
+                                                   not_charging_push="no"))
+        self.assertEqual(rows(app)["maint:stick:not_charging"]["detail"],
+                         "since 11:30 - check it is on the mount")
+        app._on_push_time({})
+        drain(app)
+        self.assertEqual(app.notifier.sent, [])
+
+    def test_not_charging_pushes_the_requested_sentence_once(self):
+        app = make_app()
+        fire(app, "sensor.stick_vacuum", self.state("not_charging", not_charging_since=iso(NOW - HOUR),
+                                                   not_charging_push="yes"))
+        drain(app)
+        self.assertEqual(app.notifier.sent[0]["message"],
+                         "Stick vacuum not charging since 11:30 - check it is on the mount")
+        self.assertEqual(app.notifier.sent[0]["target"], ["mikkel"])
+        tick(app)
+        app._on_push_time({})
+        drain(app)
+        self.assertEqual(len(app.notifier.sent), 1)
 
 
 if __name__ == "__main__":

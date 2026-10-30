@@ -132,6 +132,23 @@ GUIDES = {
         ),
         warn="Use a coffee machine descaler only, never vinegar. The water comes out hot.",
     ),
+    "stick:filters": Guide(
+        steps=(
+            "Switch the stick vacuum off and empty the bin.",
+            "Remove the pre-filter and the metal mesh/cyclone filter, then rinse them in water.",
+            "Remove and wash the exhaust filter in water.",
+            "Let every washed part dry for 24 h before refitting it.",
+        ),
+        warn="Never refit damp filters. No detergent and no dishwasher.",
+    ),
+    "stick:clogged": Guide(
+        steps=(
+            "Switch the stick vacuum off and detach the tube and nozzle.",
+            "Look through the tube and nozzle for blockages and remove anything caught inside.",
+            "Check the inlet to the bin for blockages, then refit the tube and nozzle.",
+        ),
+        warn="Switch the vacuum off before reaching into the air path.",
+    ),
     "rober2:filter": Guide(
         steps=(
             "Switch the robot off and take out the dust bin.",

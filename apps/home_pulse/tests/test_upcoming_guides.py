@@ -21,8 +21,9 @@ XBLOOM = ("coffee:rinse", "coffee:tank", "coffee:burrs", "coffee:descale")
 class CoverageTests(unittest.TestCase):
     def test_every_task_and_every_rober2_part_has_a_guide_and_nothing_else_does(self):
         wanted = {task.key for task in runs.TASKS} | {f"rober2:{part}" for part, _, _ in maint.ROBER2_PARTS}
+        wanted.add("stick:clogged")
         self.assertEqual(set(guides.GUIDES), wanted)
-        self.assertEqual(set(MIELE) | set(XBLOOM), {task.key for task in runs.TASKS})
+        self.assertEqual(set(MIELE) | set(XBLOOM) | {"stick:filters"}, {task.key for task in runs.TASKS})
 
     def test_each_guide_is_three_to_six_steps(self):
         for key, guide in guides.GUIDES.items():
@@ -61,6 +62,13 @@ class SafetyNoteTests(unittest.TestCase):
         self.assertIn("water on the burrs", self.warn("coffee:burrs"))
         self.assertIn("vinegar", self.warn("coffee:descale"))
         self.assertIn("hot", self.warn("coffee:descale"))
+
+    def test_the_stick_filters_dry_before_refitting_without_detergent_or_a_dishwasher(self):
+        for word in ("damp", "detergent", "dishwasher"):
+            self.assertIn(word, self.warn("stick:filters"))
+        text = " ".join(guides.GUIDES["stick:filters"].steps).lower()
+        for word in ("bin", "pre-filter", "mesh/cyclone", "exhaust filter", "water", "24 h"):
+            self.assertIn(word, text)
 
     def test_the_hygiene_run_warns_of_the_hot_water(self):
         self.assertIn("hot", self.warn("dishwasher:hygiene"))

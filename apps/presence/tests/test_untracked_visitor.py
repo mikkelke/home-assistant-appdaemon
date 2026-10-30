@@ -121,6 +121,15 @@ class EndReason(unittest.TestCase):
         self.assertIsNone(self.why(10 * 3600 + self.CAP_S - 1, since=10 * 3600, door_open=True))
         self.assertEqual(self.why(10 * 3600 + self.CAP_S, since=10 * 3600, door_open=True), uv.CAP)
 
+    def test_a_hold_blocks_quiet_and_the_ordinary_cap_until_the_hard_cap(self):
+        args = {"door_open": False, "active": False, "quiet_s": self.QUIET_S,
+                "cap_s": self.CAP_S, "hold": True, "hard_cap_s": 4 * 3600}
+        self.assertIsNone(uv.end_reason(3 * 3600, 0, 0, **args))
+        self.assertEqual(uv.end_reason(4 * 3600, 0, 0, **args), uv.HARD_CAP)
+
+    def test_the_hard_cap_is_reported_even_if_the_visit_is_quiet(self):
+        self.assertEqual(self.why(4 * 3600), uv.HARD_CAP)
+
 
 class SmallRules(unittest.TestCase):
     def test_restore_target_prefers_where_the_blind_was(self):
@@ -176,6 +185,7 @@ T0 = datetime(2026, 10, 21, 13, 53, tzinfo=TZ).timestamp()
 ENTITY = "sensor.untracked_visitor"
 LOCK = "lock.yale"
 DOOR = "binary_sensor.apartment_door_open"
+HOLD = "binary_sensor.stick_vacuum_in_use"
 ZONES = ("bathroom", "bedroom", "claudias_room", "dining_room", "guest_bathroom", "hallway",
          "kitchen", "kristines_room", "living_room")
 ACTIVITY = [f"binary_sensor.{zone}_active" for zone in ZONES]
@@ -293,6 +303,12 @@ def zone(app, seconds, name, on):
     entity = f"binary_sensor.{name}_active"
     old, app.states[entity] = app.states.get(entity), "on" if on else "off"
     app._on_activity(entity, None, old, app.states[entity], {})
+
+
+def hold(app, seconds, on):
+    at(app, seconds)
+    old, app.states[HOLD] = app.states.get(HOLD), "on" if on else "off"
+    app._on_hold(HOLD, None, old, app.states[HOLD], {})
 
 
 def arrive(app, seconds, person="person.kristine"):
@@ -434,6 +450,70 @@ class Start(unittest.TestCase):
 
 
 class EndRules(unittest.TestCase):
+    def test_a_cleaner_using_the_stick_stays_past_the_ordinary_cap(self):
+        app = make_app(args={"hold": HOLD})
+        start_cleaner(app)
+        hold(app, 30, True)
+        tick(app, 3 * 3600)
+        self.assertEqual(published(app)[0], "cleaner")
+        self.assertIn(HOLD, {c.args[1] for c in app.listen_state.call_args_list})
+
+    def test_the_hard_cap_ends_a_cleaner_visit_even_while_using_the_stick(self):
+        app = make_app(args={"hold": HOLD, "hard_cap_hours": 4})
+        start_cleaner(app)
+        hold(app, 30, True)
+        tick(app, 2 + 4 * 3600 - 1)
+        self.assertEqual(published(app)[0], "cleaner")
+        tick(app, 2 + 4 * 3600)
+        state, attrs = published(app)
+        self.assertEqual((state, attrs["end_reason"]), ("none", "hard_cap"))
+        self.assertIn("4 h hard limit", attrs["reason"])
+
+    def test_hold_changes_restart_the_cleaners_quiet_clock(self):
+        app = make_app(args={"hold": HOLD})
+        start_cleaner(app)
+        hold(app, 30, True)
+        tick(app, 1800)
+        self.assertEqual(published(app)[0], "cleaner")
+        hold(app, 1801, False)
+        tick(app, 1801 + QUIET_S - 1)
+        self.assertEqual(published(app)[0], "cleaner")
+        tick(app, 1801 + QUIET_S)
+        self.assertEqual(published(app)[1]["end_reason"], "quiet")
+
+    def test_guests_ignore_the_hold_for_quiet_and_the_cap(self):
+        for active in (False, True):
+            with self.subTest(active=active):
+                app = make_app(args={"hold": HOLD}, states={HOLD: "on"})
+                unlock(app, 0, GUEST_NAME)
+                zone(app, 1, "bedroom", active)
+                hold(app, 500, False)
+                hold(app, 600, True)
+                tick(app, 2 * 3600 if active else 1 + QUIET_S)
+                state, attrs = published(app)
+                self.assertEqual((state, attrs["end_reason"]), ("none", "cap" if active else "quiet"))
+
+    def test_an_arrival_still_ends_a_held_cleaner_visit(self):
+        app = make_app(args={"hold": HOLD}, states={HOLD: "on"})
+        start_cleaner(app)
+        arrive(app, 600)
+        self.assertEqual(published(app)[1]["end_reason"], "arrival")
+
+    def test_the_hard_cap_also_ends_a_guest_visit(self):
+        app = make_app(args={"hold": HOLD, "cap_hours": 6, "hard_cap_hours": 4}, states={HOLD: "on"})
+        unlock(app, 0, GUEST_NAME)
+        zone(app, 1, "bedroom", True)
+        tick(app, 4 * 3600)
+        self.assertEqual(published(app)[1]["end_reason"], "hard_cap")
+
+    def test_the_end_cause_is_empty_during_a_new_visit(self):
+        app = make_app()
+        start_cleaner(app)
+        tick(app, 4 + QUIET_S)
+        self.assertEqual(published(app)[1]["end_reason"], "quiet")
+        unlock(app, 1800, GUEST_NAME)
+        self.assertEqual(published(app)[1]["end_reason"], "")
+
     def test_unknown_activity_holds_visit_and_blind_claims_until_readable_quiet(self):
         app = make_app()
         start_cleaner(app)
@@ -484,6 +564,7 @@ class EndRules(unittest.TestCase):
         self.assertEqual(state, "none")
         self.assertEqual((attrs["who"], attrs["since"]), ("", ""))
         self.assertIn("quiet for 15 min", attrs["reason"])
+        self.assertEqual(attrs["end_reason"], "quiet")
 
     def test_activity_anywhere_keeps_the_visit_on(self):
         app = make_app()
@@ -525,6 +606,7 @@ class EndRules(unittest.TestCase):
         state, attrs = published(app)
         self.assertEqual(state, "none")
         self.assertIn("Kristine arrived home", attrs["reason"])
+        self.assertEqual(attrs["end_reason"], "arrival")
 
     def test_an_arrival_with_no_visit_does_nothing(self):
         app = make_app()
@@ -549,6 +631,7 @@ class EndRules(unittest.TestCase):
         state, attrs = published(app)
         self.assertEqual(state, "none")
         self.assertIn("2 h limit", attrs["reason"])
+        self.assertEqual(attrs["end_reason"], "cap")
 
     def test_a_guest_visit_ends_by_the_same_rules(self):
         app = make_app()
@@ -682,6 +765,40 @@ class Restart(unittest.TestCase):
         self.assertEqual(visit["who"], CLEANER_NAME)
         self.assertEqual(visit["blinds"]["bedroom"]["state"], "lowered")
         self.assertEqual(visit["blinds"]["bedroom"]["prior"], 38)
+
+    def test_a_held_cleaner_visit_survives_a_restart_after_the_ordinary_cap(self):
+        first = self.boot(0, args={"hold": HOLD})
+        start_cleaner(first)
+        hold(first, 30, True)
+        tick(first, 60)
+        self.assertTrue(json.loads(Path(self.file).read_text())["hold"])
+        again = self.boot(3 * 3600, args={"hold": HOLD}, states={HOLD: "on"})
+        self.assertEqual(published(again)[0], "cleaner")
+        tick(again, 2 + 4 * 3600)
+        self.assertEqual(published(again)[1]["end_reason"], "hard_cap")
+
+    def test_a_hold_that_changed_while_offline_restarts_the_quiet_clock(self):
+        first = self.boot(0, args={"hold": HOLD}, states={HOLD: "on"})
+        start_cleaner(first)
+        tick(first, 60)
+        again = self.boot(1800, args={"hold": HOLD}, states={HOLD: "off"})
+        self.assertEqual(published(again)[0], "cleaner")
+        tick(again, 1800 + QUIET_S)
+        self.assertEqual(published(again)[1]["end_reason"], "quiet")
+
+    def test_the_end_cause_survives_a_restart(self):
+        first = self.boot(0)
+        start_cleaner(first)
+        arrive(first, 600)
+        self.assertEqual(json.loads(Path(self.file).read_text())["end_reason"], "arrival")
+        again = self.boot(1800)
+        self.assertEqual(published(again)[1]["end_reason"], "arrival")
+
+    def test_the_entity_preserves_the_end_cause_without_a_file(self):
+        app = make_app(states={ENTITY: "none"},
+                       attrs={(ENTITY, "end_reason"): "cap", (ENTITY, "reason"): "Visit ended"})
+        self.assertEqual(published(app)[1]["end_reason"], "cap")
+        self.assertEqual(published(app)[1]["reason"], "Visit ended")
 
     def test_a_restart_during_a_visit_resumes_it_and_keeps_the_blind_claims_alive(self):
         first = self.boot(0)

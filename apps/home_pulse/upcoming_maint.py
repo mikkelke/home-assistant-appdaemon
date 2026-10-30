@@ -1,6 +1,6 @@
-"""Maintenance rows for sensor.house_upcoming: the Rober2 parts and the battery inventory (the
-appliances' run-based rows are upcoming_runs). Pure: each step takes the persisted state and `now`
-and returns new state.
+"""Maintenance rows for sensor.house_upcoming: the Rober2 parts, stick vacuum faults and the battery
+inventory (the appliances' run-based rows are upcoming_runs). Pure: each step takes the persisted
+state and `now` and returns new state.
 
 Battery rules, per model in house_upcoming.yaml:
     low: N        a reading at or below N, held for HOLD, opens the condition; with days: K it
@@ -25,6 +25,10 @@ A Rober2 part is due once it has no cleaning time left; that row carries the par
 pushed once per episode. Before that the part's row is timed at DUE_TIME on the day its cleaning time
 left runs out at the robot's recent cleaning rate. It reads as an estimate (~), is never pushed, and
 a part further out than ROBER2_HORIZON_DAYS has none.
+
+Stick vacuum faults come from sensor.stick_vacuum. A clog's push waits for its session to close;
+not charging is pushed unless its source flags the episode as row only. Both share their episode
+keys with the daily digest.
 """
 
 import math
@@ -403,6 +407,40 @@ def rober2_rows(states, area, left, rate, now):
                        audience="admin", steps=guide.steps, warn=guide.warn)
         out.append((row, key))
     return out
+
+
+# ---------------------------------------------------------------- stick vacuum
+
+
+def stick_problems(full):
+    attributes = (full or {}).get("attributes") or {}
+    return {part.strip() for part in str(attributes.get("problems") or "").split(",") if part.strip()}
+
+
+def stick_rows(full, area):
+    """[(row, push key)] for the semantic stick vacuum faults. Source timestamps identify episodes."""
+    attrs = (full or {}).get("attributes") or {}
+    problems = stick_problems(full)
+    out = []
+    if "clogged" in problems:
+        guide = GUIDES["stick:clogged"]
+        row = make_row("maint:stick:clogged", "maint", "Stick vacuum air path clogged", "check tube, nozzle + inlet",
+                       icon="mdi:vacuum", area=area, audience="admin", steps=guide.steps, warn=guide.warn)
+        since = parse_iso(attrs.get("clogged_since"))
+        key = f"stick:clogged:{utc_iso(since)}" if since and attrs.get("session_open") == "no" else None
+        out.append((row, key))
+    if "not_charging" in problems:
+        since = parse_iso(attrs.get("not_charging_since"))
+        clock = since.astimezone(HOUSE_TZ).strftime("%H:%M") if since else "unknown"
+        row = make_row("maint:stick:not_charging", "maint", "Stick vacuum not charging",
+                       f"since {clock} - check it is on the mount", icon="mdi:vacuum", area=area, audience="admin")
+        key = f"stick:not_charging:{utc_iso(since)}" if since and attrs.get("not_charging_push") != "no" else None
+        out.append((row, key))
+    return out
+
+
+def stick_push_text(row):
+    return f"{row['title']} {row['detail']}" if row["id"] == "maint:stick:not_charging" else row["title"]
 
 
 # ---------------------------------------------------------------- daily push

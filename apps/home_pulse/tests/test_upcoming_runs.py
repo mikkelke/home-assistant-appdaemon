@@ -21,7 +21,8 @@ NOW = datetime(2026, 10, 15, 10, 30, tzinfo=timezone.utc)
 MIN = timedelta(minutes=1)
 HOUR = timedelta(hours=1)
 DAY = timedelta(days=1)
-AREAS = {"washer": "guest_bathroom", "dishwasher": "kitchen", "dryer": "guest_bathroom", "coffee": "kitchen"}
+AREAS = {"washer": "guest_bathroom", "dishwasher": "kitchen", "dryer": "guest_bathroom", "coffee": "kitchen",
+         "stick": "kitchen"}
 
 
 def dish(end, **extra):
@@ -89,12 +90,14 @@ class TaskTests(unittest.TestCase):
             "coffee:tank": ("coffee", 20, True),
             "coffee:burrs": ("coffee", 40, True),
             "coffee:descale": ("coffee", 60, True),
+            "stick:filters": ("stick", 4, True),
         })
 
     def test_the_coffee_tasks_count_brews_and_the_others_runs(self):
         self.assertEqual({task.key for task in runs.TASKS if task.unit == "brew"},
                          {"coffee:rinse", "coffee:tank", "coffee:burrs", "coffee:descale"})
-        self.assertEqual({task.unit for task in runs.TASKS if task.appliance != "coffee"}, {"run"})
+        self.assertEqual({task.unit for task in runs.TASKS if task.appliance not in ("coffee", "stick")}, {"run"})
+        self.assertEqual(next(task.unit for task in runs.TASKS if task.appliance == "stick"), "visit")
 
     def test_the_drum_clean_interval_is_the_washers_own(self):
         task = next(task for task in runs.TASKS if task.key == runs.DRUM_KEY)
@@ -667,6 +670,17 @@ class EstimateTests(unittest.TestCase):
         self.assertEqual([runs.calendar_text(w) for w in (0.4, 1.0, 2.6, 3.9, 4.3, 5.2, 6.5, 10.4, 17.1, 21.4)],
                          ["~1 week", "~1 week", "~3 weeks", "~4 weeks", "~1 month", "~1 month", "~1 month", "~2 months",
                           "~4 months", "~5 months"])
+
+
+class StickVisitTests(unittest.TestCase):
+    def test_overlapping_visits_each_count_once_without_merging_their_suction_spans(self):
+        records = [{"start": core.utc_iso(NOW - 2 * HOUR), "ts": core.utc_iso(NOW - HOUR), "duration_min": 100},
+                   {"start": core.utc_iso(NOW - 90 * MIN), "ts": core.utc_iso(NOW), "duration_min": 100}]
+        ledger = runs.visit_ledger(records)
+        self.assertEqual(len(ledger.runs), 2)
+        anchors = {"stick:filters": {"at": core.utc_iso(NOW - DAY)}}
+        status = runs.statuses({"stick": ledger}, anchors, NOW)["stick:filters"]
+        self.assertEqual((status.since, status.left, status.per_week), (2, 2, 1.0))
 
 
 if __name__ == "__main__":

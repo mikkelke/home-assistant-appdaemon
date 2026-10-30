@@ -1,0 +1,22 @@
+# /conf/apps/appliances/stick_vacuum.yaml
+# Publishes sensor.stick_vacuum and binary_sensor.stick_vacuum_in_use from the LG handle's
+# local readings. Sessions and cleaner visits survive in stick_vacuum_feedback.json.
+# HouseUpcoming owns maintenance rows and pushes; visit receipts are admin-only house events.
+#
+# Recovery reads the raw LG sensors, the visitor and the front door.
+#
+# No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
+# first or the app fails to instantiate.
+
+StickVacuum:
+  module: stick_vacuum
+  class: StickVacuum
+  entity: sensor.stick_vacuum
+  in_use_entity: binary_sensor.stick_vacuum_in_use
+  status: sensor.lg_stick_vacuum_status
+  power_mode: sensor.lg_stick_vacuum_power_mode
+  battery: sensor.lg_stick_vacuum_battery
+  filter: binary_sensor.lg_stick_vacuum_filter_needs_cleaning
+  clogged: binary_sensor.lg_stick_vacuum_air_path_clogged
+  visitor: sensor.untracked_visitor
+  door: binary_sensor.apartment_door_open

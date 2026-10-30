@@ -53,6 +53,11 @@ HouseUpcoming:
     # logged, untimed and never due or pushed. Set interval_runs (whole runs) once the real one is
     # known, and the row becomes a normal one that counts down and is pushed when due.
     interval_runs:
+  stick:
+    entity: sensor.stick_vacuum
+    area: kitchen
+    # One cleaner visit in stick_vacuum_feedback.json is one run; wash the filters every four visits.
+    # Faults push once per episode; a clog waits until the stick session has closed.
   train:
     route: sensor.transit_kbh_ic_odense
     stog_status: input_select.transit_carlsberg_stog_kbh_status

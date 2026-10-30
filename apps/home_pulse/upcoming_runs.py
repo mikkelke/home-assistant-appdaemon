@@ -1,9 +1,10 @@
 """Run-based maintenance rows for sensor.house_upcoming: the dishwasher's hygiene run, filters and spray
 arms and general check, the washer's drum clean and inlet filters, the dryer's plinth filter, and the
-xBloom's brew head, water tank, grinder burrs and descale. A task is due after so many finished
-runs (run_ledger) since it was last done, which suits parts that clog with use better than the
-calendar. A task counts in its unit: the coffee machine's runs are brews. Pure: each step takes the
-persisted anchors and `now` and returns new state.
+xBloom's brew head, water tank, grinder burrs and descale, and the stick vacuum's filters. A task is
+due after so many finished runs (run_ledger) since it was last done, which suits parts that clog with
+use better than the calendar. A task counts in its unit: the coffee machine's runs are brews, the
+stick vacuum's are cleaner visits. Its filter flag makes the filter task due regardless of the count.
+Pure: each step takes the persisted anchors and `now` and returns new state.
 
 A task is closed one of two ways. A confirmed task is closed by a person confirming a run as its
 programme, which is the dishwasher's Intensive run and the washer's drum clean; the ledger's records
@@ -41,7 +42,7 @@ from upcoming_maint import DUE_TIME, HOUSE_TZ, ddmm, fit_parts, house_date, pars
 
 ROW_HORIZON_DAYS = 366
 COFFEE_CLOSES = "Provisional interval: check the xBloom manual"
-DEFAULT_PER_WEEK = {"washer": 3.5, "dishwasher": 3.5, "dryer": 2.4, "coffee": 3.4}
+DEFAULT_PER_WEEK = {"washer": 3.5, "dishwasher": 3.5, "dryer": 2.4, "coffee": 3.4, "stick": 1.0}
 WEEKS_PER_MONTH = 4.345
 
 
@@ -77,11 +78,13 @@ TASKS = (
          closes=COFFEE_CLOSES, unit="brew"),
     Task("coffee:descale", "coffee", "xBloom descale", "descaler, 2 rounds", 60, "mdi:coffee-maker",
          closes=COFFEE_CLOSES, unit="brew"),
+    Task("stick:filters", "stick", "Stick vacuum filters", "wash filters + dry 24 h", 4, "mdi:vacuum", unit="visit"),
 )
 HYGIENE_KEY = "dishwasher:hygiene"
 HYGIENE_PROGRAMME = "intensive"
 DRUM_KEY = "washer:drum"
 DRYER_KEY = "dryer:plinth"
+STICK_KEY = "stick:filters"
 
 
 class Status(NamedTuple):
@@ -149,7 +152,21 @@ def undo_done(anchors, key):
     return {**anchors, key: previous} if isinstance(previous, dict) else anchors
 
 
-def statuses(ledgers, anchors, now, tasks=TASKS):
+def visit_ledger(records):
+    """A cleaner visit is one run, even when its span overlaps another record's span."""
+    cycles, counted = [], []
+    for record in records or []:
+        if not isinstance(record, dict):
+            continue
+        end = run_ledger.record_end(record)
+        if end is not None:
+            start = run_ledger.parse_time(record.get("start")) or end
+            cycles.append(record)
+            counted.append(run_ledger.Run(min(start, end), end))
+    return run_ledger.Ledger(cycles, sorted(counted))
+
+
+def statuses(ledgers, anchors, now, tasks=TASKS, due=()):
     """{task key: Status} for every task that can be counted: its appliance has a ledger and, for a
     tapped task, an anchor."""
     out = {}
@@ -168,6 +185,8 @@ def statuses(ledgers, anchors, now, tasks=TASKS):
                 continue
             since = run_ledger.count_since(led.runs, when)
         left = None if task.interval is None else max(0, task.interval - since)
+        if task.key in due:
+            left = 0
         pace = run_ledger.per_week(led.runs, now, DEFAULT_PER_WEEK[task.appliance])
         out[task.key] = Status(task, when, seeded, since, left, pace)
     return out

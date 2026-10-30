@@ -1,12 +1,13 @@
 """HouseUpcoming - what is coming up in the house that only the server can know, for the dashboard's
-Now timeline: maintenance (the Rober2 parts, the dishwasher's, washer's, dryer's and xBloom's run-based
-tasks, the drum clean and the hygiene run at their cheapest start, batteries by their replace-by day and
+Now timeline: maintenance (the Rober2 parts, the appliances' run-based tasks, the drum clean and the
+hygiene run at their cheapest start, batteries by their replace-by day and
 offline devices, and houseplants that need water and one-off tasks; admin only), Kristine's train, and
 rain, forecast or falling, while a terrace door is open (exploratory).
 
 Publishes sensor.house_upcoming (shape in upcoming_core.py) plus one maintenance push a day, built
-from the same conditions the rows show. The lease in `expires` is renewed every TICK_S even when
-nothing changed, so the dashboard drops the rows within upcoming_core.LEASE once this app stops.
+from the same conditions the rows show. Stick vacuum faults push once per episode as soon as their
+source allows it, using the daily digest's bookkeeping. The lease in `expires` is renewed every TICK_S
+even when nothing changed, so the dashboard drops the rows within upcoming_core.LEASE once this app stops.
 
 State acquisition: one snapshot of every source at initialize, then listen_state(attribute="all"),
 so attribute-only changes (departures, last_drum_clean) count. A value from a callback is never
@@ -107,14 +108,19 @@ class HouseUpcoming(hass.Hass):
         dishwasher = a.get("dishwasher") or {}
         dryer = a.get("dryer") or {}
         coffee = a.get("coffee") or {}
+        stick = a.get("stick") or {}
+        self.stick_entity = stick.get("entity", "sensor.stick_vacuum")
         self.run_areas = {"washer": self.washer_area, "dishwasher": dishwasher.get("area", "kitchen"),
-                          "dryer": dryer.get("area", self.washer_area), "coffee": coffee.get("area", "kitchen")}
+                          "dryer": dryer.get("area", self.washer_area), "coffee": coffee.get("area", "kitchen"),
+                          "stick": stick.get("area", "kitchen")}
         self.feedback_files = {
             name: Path(cfg.get("feedback_file") or here.parent / "appliances" / f"{name}_feedback.json")
             for name, cfg in (("washer", washer), ("dishwasher", dishwasher), ("dryer", dryer))
         }
         self.feedback_files["coffee"] = Path(coffee.get("feedback_file")
                                              or here.parent / "coffee" / "coffee_feedback.json")
+        self.feedback_files["stick"] = Path(stick.get("feedback_file")
+                                            or here.parent / "appliances" / "stick_vacuum_feedback.json")
         self.run_tasks = runs.configured(runs.interval_from(dryer.get("interval_runs")))
         self.done_log_file = Path(a.get("done_log_file") or here / "house_upcoming_done_log.jsonl")
         tr = a.get("train") or {}
@@ -198,7 +204,7 @@ class HouseUpcoming(hass.Hass):
     def _sources(self):
         sources = list(self.rober2_entities.values())
         sources += [self.washer_entity, self.price_entity, self.profiles_entity, self.train_route, self.train_stog,
-                    self.train_person, self.rain_alert, self.rain_home]
+                    self.train_person, self.rain_alert, self.rain_home, self.stick_entity]
         sources += list(self.rain_doors) + list(self.inventory["devices"]) + list(self.plants)
         if self.yale_operators:
             sources += [self.yale_lock, self.yale_operator]
@@ -419,6 +425,8 @@ class HouseUpcoming(hass.Hass):
             self._rober2[part] = maint.step_rober2(self._rober2.get(part), seconds, now)
         found = maint.rober2_rows(self._rober2, self.rober2_area, left, self._rober2_rate, now)
         found += self._run_rows(now)
+        stick = maint.stick_rows(self._cache.get(self.stick_entity), self.run_areas["stick"])
+        found += stick
         found += self._timed_plant_rows(now)
         found += self._once_rows(now)
         for entity, device in self.inventory["devices"].items():
@@ -469,14 +477,16 @@ class HouseUpcoming(hass.Hass):
         if changed or publish:
             self._publish(rows, now)
         self._save_state()
+        self._push_stick(stick)
 
     def _run_rows(self, now):
         ledgers = self._ledgers()
+        due = (runs.STICK_KEY,) if "filter" in maint.stick_problems(self._cache.get(self.stick_entity)) else ()
         anchors = runs.seed(self._anchors, ledgers, now, self.run_tasks)
         if anchors != self._anchors:
             self._anchors = anchors
             self._save_state(force=True)
-        counted = runs.statuses(ledgers, self._anchors, now, self.run_tasks)
+        counted = runs.statuses(ledgers, self._anchors, now, self.run_tasks, due=due)
         return runs.rows(counted, now, self.run_areas, self._starts(now))
 
     def _starts(self, now):
@@ -538,11 +548,15 @@ class HouseUpcoming(hass.Hass):
                 continue
             ledger = known[1] if known else None
             try:
-                ledger = run_ledger.ledger(json.loads(path.read_text()).get("cycles"))
+                data = json.loads(path.read_text())
+                ledger = runs.visit_ledger(data.get("visits")) if name == "stick" else run_ledger.ledger(data.get("cycles"))
             except Exception as e:
                 self.log(f"Could not read {path.name}: {e!r}", level="WARNING")
             self._ledger_files[name] = (stamp, ledger)
-        return {name: ledger for name, (_, ledger) in self._ledger_files.items() if ledger is not None}
+        out = {name: ledger for name, (_, ledger) in self._ledger_files.items() if ledger is not None}
+        if runs.STICK_KEY in self._anchors or "filter" in maint.stick_problems(self._cache.get(self.stick_entity)):
+            out.setdefault("stick", runs.visit_ledger([]))
+        return out
 
     def _rain_rows(self, now):
         doors = {}
@@ -710,6 +724,12 @@ class HouseUpcoming(hass.Hass):
         self._cache[entity] = {**cached, "state": row["state"], "last_changed": core.utc_iso(when)}
 
     # -- daily push -----------------------------------------------------------
+
+    def _push_stick(self, found):
+        fresh = maint.digest([(maint.stick_push_text(row), key) for row, key in found], self._pushed)
+        if fresh and "push" not in self._handoff:
+            self._handoff["push"] = None
+            self.create_task(self._send_digest(fresh))
 
     def _on_push_time(self, kwargs):
         now = self.get_now()
