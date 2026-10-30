@@ -807,6 +807,16 @@ class StateSinceSurvivesConsecutiveRestarts(unittest.TestCase):
             "state_since reset to this boot's own time instead of carrying the original entry "
             "time forward across a restart",
         )
+        self.assertEqual(app2.attrs_store["sensor.washer_state"].get("state_since"), first_state_since)
+
+    def test_unemptied_publishes_the_stored_entry_time(self):
+        done_at = NOW - timedelta(hours=3)
+        payload = make_store_payload(
+            state="Unemptied", start_time=None, cycle_id="cycle-done", state_since=_iso(done_at),
+        )
+        app = make_full_init_app(sensor_state=None, helper_state="Off", power_watts=0, store_payload=payload, now=NOW)
+        self.assertEqual(app.state, "Unemptied")
+        self.assertEqual(app.attrs_store["sensor.washer_state"].get("state_since"), _iso(done_at))
 
 
 if __name__ == "__main__":

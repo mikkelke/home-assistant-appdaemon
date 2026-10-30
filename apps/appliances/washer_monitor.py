@@ -262,6 +262,9 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             return super()._set_state_entity(_store_only=True, **kwargs)
         kwargs["attributes"] = {**(kwargs.get("attributes") or {}), "last_drum_clean": self._drum_clean_attr()}
         state = kwargs.get("state")
+        # The store stamps state_since after this publish, so a new state is entered now.
+        entered = state != getattr(self, "_store_last_written_state", None)
+        self._add_state_since_attr(kwargs, self._now_utc() if entered else self._store_state_since)
         try:
             self.set_state(self.state_entity, **kwargs)
         except Exception:

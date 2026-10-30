@@ -656,6 +656,9 @@ class UnemptiedStateSinceSurvivesAcrossRestartsFromTheStore(unittest.TestCase):
             self.assertEqual(app.state, "Unemptied")
             self.assertIsNotNone(app.state_since)
             self.assertLessEqual(abs((app.state_since - state_since).total_seconds()), 2)
+            # The re-created entity's last_changed is the boot; the card's "done at" reads this.
+            published = entities[app.state_entity]["attributes"].get("state_since")
+            self.assertEqual(published, cs.format_utc(app.state_since))
 
 
 # ----------------------------------------------------------------------------------------

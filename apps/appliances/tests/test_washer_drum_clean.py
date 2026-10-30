@@ -211,7 +211,9 @@ class ConfirmTests(unittest.TestCase):
         app._set_state_entity(state="Running", attributes={"progress_pct": 5}, replace=True)
         app._set_state_entity(state="Off")
         self.assertEqual(self._published(app), ["", ""])
-        self.assertEqual(app.attrs_store["sensor.washer_state"], {"progress_pct": 5, "last_drum_clean": ""})
+        attrs = dict(app.attrs_store["sensor.washer_state"])
+        attrs.pop("state_since", None)
+        self.assertEqual(attrs, {"progress_pct": 5, "last_drum_clean": ""})
 
     def test_a_confirmation_that_changes_nothing_publishes_nothing(self):
         app, _ = washer([record("2026-01-01T10:00:00+01:00"), record(self.TS, confirmed="bomuld", temp="60", user=False)])

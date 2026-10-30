@@ -514,7 +514,10 @@ class DryerFollowUps(unittest.TestCase):
             self.assertEqual(entity, tda.STATE_ENTITY)
             self.assertEqual(call["state"], "Running")
             self.assertFalse(call.get("replace"))
-            self.assertEqual(call["attributes"], {"started_by": "kristine", "started_by_method": "room_elimination"})
+            self.assertEqual(
+                call["attributes"],
+                {"started_by": "kristine", "started_by_method": "room_elimination", "state_since": cs.format_utc(since)},
+            )
             self.assertEqual((app.last_state_change, app.state_since), (last_change, since))
 
     def test_an_answer_that_stays_unknown_leaves_the_names_empty_and_records_why(self):
@@ -630,7 +633,7 @@ class DryerFollowUps(unittest.TestCase):
             self.assertEqual(app.state, "Emptied")
             (entity, call), = app.publishes[publishes:]
             self.assertFalse(call.get("replace"))
-            self.assertEqual(set(call["attributes"]), {"emptied_by", "emptied_by_method"})
+            self.assertEqual(set(call["attributes"]), {"emptied_by", "emptied_by_method", "state_since"})
 
     def test_a_name_that_arrives_after_the_door_shut_still_reaches_the_record_and_the_entity(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -847,7 +850,9 @@ class WasherFollowUps(unittest.TestCase):
         (call,) = app.set_state_calls[published_before:]
         self.assertEqual((call["state"], call["replace"]), ("Emptied", False))
         self.assertEqual(call["attributes"]["emptied_by"], "kristine")
-        self.assertEqual(set(call["attributes"]) - {"last_drum_clean"}, {"emptied_by", "emptied_by_method"})
+        self.assertEqual(
+            set(call["attributes"]) - {"last_drum_clean"}, {"emptied_by", "emptied_by_method", "state_since"}
+        )
 
     def test_a_direct_running_to_emptied_record_is_named_the_same_way(self):
         app, actor = self._finished(on_since("mikkel", since=trs.NOW - timedelta(hours=1)), minutes=100, direct=True)

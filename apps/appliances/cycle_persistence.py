@@ -395,7 +395,16 @@ class CyclePersistenceMixin:
         self._save_cycle_state(new_state=kwargs.get("state"), force=_store_only)
         if _store_only:
             return
+        self._add_state_since_attr(kwargs, self._cycle_store_state_since())
         self.set_state(self.state_entity, **kwargs)
         st = kwargs.get("state")
         if st is not None:
             self._sync_ui_select(st)
+
+    @staticmethod
+    def _add_state_since_attr(kwargs, since):
+        """Publish when the current state was entered as the ``state_since`` attribute. HA erases
+        this entity on restart and the republish resets ``last_changed`` to the restart time, so
+        anything showing "done at" or "done for" must read this attribute instead."""
+        if since and kwargs.get("state") is not None:
+            kwargs["attributes"] = {**(kwargs.get("attributes") or {}), "state_since": format_utc(since)}
