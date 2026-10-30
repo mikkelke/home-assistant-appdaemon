@@ -161,6 +161,8 @@ class Rober2Control(hass.Hass):
         # Set up event listeners
         self.listen_state(self.handle_vacuum_state, "vacuum.rober2")
         self.listen_state(self.handle_presence, "zone.home")
+        self._visitor_entity = self.args.get("visitor_entity", "sensor.untracked_visitor")
+        self.listen_state(self.handle_visitor_state, self._visitor_entity)
         self.listen_state(self.handle_room_change, "input_text.rober2_current_room")
         self.listen_state(self.handle_battery, "sensor.rober2_battery")
         self.listen_state(self.handle_fan_speed, "vacuum.rober2", attribute="fan_speed")
@@ -482,12 +484,18 @@ class Rober2Control(hass.Hass):
         except Exception as e:
             self.log(f"Error in state logging: {e}", level="ERROR")
             
+    async def _is_cleaner_visiting(self) -> bool:
+        entity = getattr(self, "_visitor_entity", "sensor.untracked_visitor")
+        return await self.get_state(entity) == "cleaner"
+
     async def is_away(self) -> bool:
         """Return True if home is considered away.
         zone.home must be "0" AND every tracked person must read away: not_home or another zone.
         Home and unknown/unavailable person states BLOCK cleaning (treated as not-away).
         """
         try:
+            if await self._is_cleaner_visiting():
+                return False
             home_state = await self.get_state("zone.home")
             if str(home_state) != "0":
                 return False
@@ -539,6 +547,9 @@ class Rober2Control(hass.Hass):
         self._eval_in_progress = True
         try:
             trigger = kwargs.get("trigger", "unknown")
+            if await self._is_cleaner_visiting():
+                await self._set_narrative("Paused - cleaner visiting")
+                return
             
             # Automation paused (e.g. blocked at dock) - do not start cleaning until user resets
             try:
@@ -775,6 +786,9 @@ class Rober2Control(hass.Hass):
                 
             # Presence logic with override (unknown/unavailable person states block "away")
             if not away:  # Someone is (explicitly) home
+                if trigger == "cleaner_left":
+                    await self._set_narrative("Waiting - someone home")
+                    return
                 if clean_while_home == "on":
                     self.log_state_conclusion(f"{trigger}_eval", "home_occupied_override", "start_cleaning", 
                                             f"Someone is home but clean_while_home is enabled, starting cleaning")
@@ -798,6 +812,10 @@ class Rober2Control(hass.Hass):
             self.log(f"Vacuum state: {old} -> {new}")
             
             if new == "returning":
+                if await self._is_cleaner_visiting():
+                    self.cleaning = False
+                    await self._set_narrative("Paused - cleaner visiting")
+                    return
                 # Use peak progress (not current progress which resets to 0% during returning)
                 progress_value = self.peak_progress
                 
@@ -1191,6 +1209,9 @@ class Rober2Control(hass.Hass):
     async def queue_next_room(self, trigger: str):
         """Queue next room *before* robot docks - critical timing for Q-series."""
         try:
+            if await self._is_cleaner_visiting():
+                await self._set_narrative("Paused - cleaner visiting")
+                return
             # Check if robot has active error (pauses all automation)
             has_error, error_msg = await self.has_active_error()
             if has_error:
@@ -1487,6 +1508,21 @@ class Rober2Control(hass.Hass):
         except Exception as e:
             self.log(f"Error handling presence: {e}", level="ERROR")
             
+    async def handle_visitor_state(self, entity, attribute, old, new, kwargs):
+        """Handle cleaner visits."""
+        try:
+            if new == "cleaner" and old != "cleaner":
+                if self.cleaning:
+                    self.log_state_conclusion("cleaner_arrived", "cleaner_visiting", "stop_cleaning",
+                                            "Cleaner arrived, stopping cleaning")
+                    await self._report_house_event("Cleaner arrived", "Vacuum went to dock")
+                    await self.stop_cleaning()
+                await self._set_narrative("Paused - cleaner visiting")
+            elif old == "cleaner" and new != "cleaner":
+                self.run_in(self.evaluate_cleaning_conditions, 1, trigger="cleaner_left")
+        except Exception as e:
+            self.log(f"Error handling visitor state: {e}", level="ERROR")
+
     async def handle_room_change(self, entity, attribute, old, new, kwargs):
         """Handle changes to input_text.rober2_current_room (tracks TARGET room id)."""
         try:
@@ -1634,6 +1670,8 @@ class Rober2Control(hass.Hass):
             return
         async with self._segment_send_lock:
             try:
+                if await self._is_cleaner_visiting():
+                    return
                 if self._use_segment_clean_script:
                     await self._safe_call_service(
                         "script/turn_on",
@@ -1654,6 +1692,9 @@ class Rober2Control(hass.Hass):
     async def start_cleaning(self, room_id):
         """Start cleaning a specific room."""
         try:
+            if await self._is_cleaner_visiting():
+                await self._set_narrative("Paused - cleaner visiting")
+                return
             # Get room name for logging
             room_name = self.room_config.get(room_id, room_id)
             

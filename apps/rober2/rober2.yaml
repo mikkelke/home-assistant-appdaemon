@@ -15,6 +15,7 @@ rober2_control:
   map_retention_days: 365
   # Master on/off for scheduled cleaning (off = automation disabled; separate from rober2_automation_paused errors)
   automation_enabled_entity: input_boolean.rober2_enabled
+  visitor_entity: sensor.untracked_visitor
   # Human-readable cleaning story for React / History (input_text helper in HA)
   narrative_entity: input_text.rober2_cleaning_narrative
   narrative_labels:
