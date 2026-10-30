@@ -901,7 +901,7 @@ class TankTests(unittest.TestCase):
         self.assertNotIn("water_ml", record)
         self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "691")
 
-    def test_no_water_mid_brew_empties_the_tank_once_and_the_rest_of_the_brew_is_not_debited_again(self):
+    def test_no_water_mid_brew_empties_the_tank_once_and_water_poured_after_it_means_a_refill(self):
         seen = []
         app = self.mid_brew([(89.9, ("call", lambda app: seen.append(app._tracker.water))),
                              (90, ("state", "sensor.xbloom_studio_machine_status", "no_water")),
@@ -910,8 +910,10 @@ class TankTests(unittest.TestCase):
         self.assertTrue(0 < seen[0] < 255)
         self.assertEqual(app._tank.empties, [{"at": cm.cf.iso(T0 + 90), "used_ml": seen[0]}])
         self.assertIn(("INFO", f"Water tank empty after {seen[0]:.0f} ml"), app.logs)
-        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "0")
-        self.assertEqual(app._tank.used_ml, 946.0 + 255.0 - seen[0])
+        self.assertGreater(255.0 - seen[0], cm.ctank.REFILL_MIN_ML)
+        self.assertEqual(app._tank.used_ml, round(255.0 - seen[0], 1))
+        self.assertFalse(app._tank.dry)
+        self.assertIn(("INFO", f"Water tank refilled: brew {fake.ledger(app)[-1]['id']} poured after a run-dry"), app.logs)
 
     def test_a_second_fault_or_the_end_of_the_brew_does_not_empty_it_again(self):
         stop = {"by": "machine", "ground": True, "run_id": "r1", "context": {"coffee_brew_id": BREW_ID}}

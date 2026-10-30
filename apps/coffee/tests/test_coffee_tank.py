@@ -1,5 +1,6 @@
 # tests/test_coffee_tank.py - the water tank: unknown until the first fill, a brew's water debited once, a fill or a
-# run-dry in the middle of a brew, the last ten run-dry moments, and the store.
+# run-dry in the middle of a brew, a refill seen from water poured after a run-dry, the last ten run-dry moments,
+# and the store.
 # Run from repo root: python3 -m unittest discover -s apps/coffee/tests
 
 import json
@@ -157,3 +158,39 @@ class StoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RefillAfterRunDryTests(unittest.TestCase):
+    def test_water_poured_after_a_run_dry_in_the_same_brew_means_a_refill(self):
+        tank = filled()
+        tank.empty(NOW + MIN, 250.0)
+        self.assertTrue(tank.dry)
+        tank.brew_done(410.0, "c1", NOW + 2 * MIN)
+        self.assertFalse(tank.dry)
+        self.assertEqual((tank.left, tank.filled_at), (786.0, "2026-10-20T06:02:00+00:00"))
+
+    def test_a_later_brew_after_a_run_dry_means_a_refill(self):
+        tank = filled()
+        tank.empty(NOW + MIN, 250.0)
+        tank.brew_done(250.0, "c1", NOW + MIN)
+        self.assertTrue(tank.dry)
+        tank.brew_done(103.5, "c2", NOW + 2 * MIN)
+        self.assertEqual((tank.dry, tank.left), (False, 842.5))
+
+    def test_a_trickle_after_a_run_dry_is_no_refill(self):
+        tank = filled()
+        tank.empty(NOW + MIN, 250.0)
+        tank.brew_done(270.0, "c1", NOW + 2 * MIN)
+        self.assertEqual((tank.dry, tank.left, tank.filled_at), (True, 0.0, "2026-10-20T06:00:00+00:00"))
+
+    def test_a_fill_ends_the_dry_state(self):
+        tank = filled()
+        tank.empty(NOW + MIN, 250.0)
+        tank.fill(NOW + 2 * MIN)
+        self.assertFalse(tank.dry)
+
+    def test_dry_survives_the_store(self):
+        tank = filled()
+        tank.empty(NOW + MIN, 250.0)
+        self.assertTrue(ctank.Tank(json.loads(json.dumps(tank.to_dict()))).dry)
+        self.assertFalse(ctank.Tank({}).dry)

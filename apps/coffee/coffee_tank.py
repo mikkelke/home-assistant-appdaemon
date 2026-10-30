@@ -4,11 +4,14 @@ The tank is filled by hand and the machine only says when it has run dry, so the
 water the machine measured dispensing since the last fill, and unknown until the first one. Every brew debits its
 water once. A fill or a run-dry in the middle of a brew moves `offset_ml` to that brew's reading, so only the
 water it pours after the event is debited. The water used may pass the capacity, which shows as zero left.
-`empties` keeps the water used at each of the last EMPTIES_MAX run-dry moments.
+After a run-dry the tank is `dry`: a brew that then pours more than REFILL_MIN_ML means it was refilled, and the
+tank counts as full from the run-dry on. `empties` keeps the water used at each of the last EMPTIES_MAX run-dry
+moments.
 """
 
 DEFAULT_ML = 946
 EMPTIES_MAX = 10
+REFILL_MIN_ML = 30
 
 
 def _ml(value):
@@ -26,10 +29,11 @@ class Tank:
                         if isinstance(e, dict) and isinstance(e.get("at"), str) and _ml(e.get("used_ml")) is not None
                         ][-EMPTIES_MAX:]
         self.debited_id = data.get("debited_id") if isinstance(data.get("debited_id"), str) else None
+        self.dry = data.get("dry") is True
 
     def to_dict(self):
         return {"filled_at": self.filled_at, "used_ml": self.used_ml, "offset_ml": self.offset_ml,
-                "empties": self.empties, "debited_id": self.debited_id}
+                "empties": self.empties, "debited_id": self.debited_id, "dry": self.dry}
 
     @property
     def left(self):
@@ -40,6 +44,7 @@ class Tank:
         self.used_ml = 0.0
         self.filled_at = now.isoformat(timespec="seconds")
         self.offset_ml = _ml(brew_water_ml)
+        self.dry = False
 
     def empty(self, now, brew_water_ml=None):
         """The machine ran dry: the water used since the fill, None while the level is unknown."""
@@ -51,15 +56,22 @@ class Tank:
             -EMPTIES_MAX:]
         self.used_ml = self.capacity
         self.offset_ml = reading
+        self.dry = True
         return round(used, 1)
 
-    def brew_done(self, water_ml, brew_id=None):
+    def brew_done(self, water_ml, brew_id=None, now=None):
         """Takes a brew's water out once; False when `brew_id` was debited already."""
         if brew_id is not None and brew_id == self.debited_id:
             return False
         water = _ml(water_ml)
         if self.filled_at is not None and water is not None:
-            self.used_ml = round(self.used_ml + max(0.0, water - (self.offset_ml or 0.0)), 1)
+            poured = max(0.0, water - (self.offset_ml or 0.0))
+            if self.dry and poured > REFILL_MIN_ML and now is not None:
+                self.used_ml = round(poured, 1)
+                self.filled_at = now.isoformat(timespec="seconds")
+                self.dry = False
+            else:
+                self.used_ml = round(self.used_ml + poured, 1)
         self.offset_ml = None
         if brew_id is not None:
             self.debited_id = brew_id

@@ -741,7 +741,10 @@ class CoffeeMachine(hass.Hass):
         water = (brew.get("final") or {}).get("water_ml")
         if water is None and (brew["phase"] == "ready" or brew.get("bloom_ts")):
             water = (brew.get("recipe") or self._usual() or {}).get("total_ml")
-        self._tank.brew_done(water, brew["id"])
+        was_dry = self._tank.dry
+        self._tank.brew_done(water, brew["id"], self._now_dt())
+        if was_dry and not self._tank.dry:
+            self._info(f"Water tank refilled: brew {brew['id']} poured after a run-dry")
 
     def _tank_empty(self, brew):
         """The machine said no water during this brew: the tank is empty, noted once per brew."""
