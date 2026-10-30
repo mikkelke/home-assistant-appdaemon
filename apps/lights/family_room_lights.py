@@ -1467,6 +1467,7 @@ class FamilyRoomLights(hass.Hass):
             'current_lights_on': False,
             'island_light_on': False,
             'other_lights_on': False,
+            'sit_in_lights_on': False,
             'offline_sensors': [],
             'apartment_entry_active': False,
             'presence_suspect_only': False,
@@ -1567,6 +1568,14 @@ class FamilyRoomLights(hass.Hass):
                     context['current_lights_on'] = True
                     context['other_lights_on'] = True
                     break
+
+        # Sit-in lamps on means a person chose normal lighting. Read from the lamps rather than the
+        # manual-bright latch, so it holds after a restart and for presses without user context.
+        context['sit_in_lights_on'] = any(
+            self._safe_get_state(light, default="off", timeout_warning=False) == "on"
+            and not self._zone_manual_active(light)
+            for light in sorted(getattr(self, "_manual_bright_watch", ()))
+        )
 
         context["apartment_entry_active"] = self._apartment_entry_signal_active()
 
@@ -1902,7 +1911,7 @@ class FamilyRoomLights(hass.Hass):
                     if context['sleep_status']['anyone_sleeping']:
                         # If non-island lights are detected on, user has active control/normal lighting.
                         # Disable sleep mode restrictions for this session.
-                        if context['other_lights_on']:
+                        if context['other_lights_on'] or context['sit_in_lights_on']:
                             # Latch the session flag so we don't force island-only if the user toggles lights
                             if not self._sleep_activated_during_presence:
                                 self._sleep_activated_during_presence = True
