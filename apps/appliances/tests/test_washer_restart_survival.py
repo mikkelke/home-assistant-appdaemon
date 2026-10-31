@@ -243,6 +243,7 @@ def make_full_init_app(
         return handle
 
     app.run_in = run_in
+    app.run_every = lambda cb, start, interval, **kw: object()
     app.timer_running = lambda handle: False
     app.cancel_timer = lambda handle: None
     app.listen_state = lambda *a, **kw: None

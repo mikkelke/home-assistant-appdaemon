@@ -156,6 +156,12 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
     def _start_plug_poller(self, kwargs):
         """Started once initialize() has fully succeeded, so a failed initialize never leaves a thread behind."""
         self._plug.start()
+        self.run_every(self._log_plug_defects, "now+600", 600)
+
+    def _log_plug_defects(self, kwargs):
+        failed, late, longest = wplug.read_defects(self._plug.snapshot(), self._plug.clock() - 600, self.plug_poll_s)
+        if failed or late:
+            self.log(f"Plug reads last 10 min: {failed} failed, {late} late (longest spacing {longest:.1f}s)", level="INFO")
 
     def terminate(self):
         self._plug.stop()

@@ -1,5 +1,6 @@
 # tests/test_washer_plug.py - washer_plug: the one window rule every finish decision uses, the
-# decisions built on it, the Bomuld tail ETA, the plug read's overall deadline, and the read thread's lifecycle.
+# decisions built on it, the Bomuld tail ETA, the read-defect count, the plug read's overall deadline, and the read
+# thread's lifecycle.
 # Run from repo root: python3 -m unittest discover -s apps/appliances/tests -q
 
 from __future__ import annotations
@@ -444,6 +445,15 @@ class BomuldTailEta(unittest.TestCase):
         second = tail_reads((1000, 90), (2200, 600))                 # the gap alone would make it the second
         self.assertEqual(tail_eta(second, 2200 + wp.TAIL_FINAL_SPIN_S - 2), 2200 + 31 * 60)
         self.assertEqual(tail_eta(second, 2200 + wp.TAIL_FINAL_SPIN_S), 2200 + 12 * 60)
+
+
+class ReadDefects(unittest.TestCase):
+    def test_counts_failed_and_late_reads_after_since(self):
+        samples = [(0.0, 5.0), (2.0, None), (4.0, 5.0), (8.0, 5.0), (10.0, None), (12.0, 5.0)]
+        self.assertEqual(wp.read_defects(samples, 3.0), (1, 1, 4.0))
+
+    def test_clean_reads(self):
+        self.assertEqual(wp.read_defects([(t, 4.0) for t in (0.0, 2.0, 4.0)], -1.0), (0, 0, 2.0))
 
 
 class ReadDeadline(unittest.TestCase):

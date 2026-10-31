@@ -169,6 +169,22 @@ def window(samples, now, seconds, poll_s=POLL_S):
     return out
 
 
+def read_defects(samples, since, poll_s=POLL_S):
+    """(failed reads, late reads, longest spacing in s) among the reads after `since`; a late read sits more than
+    MAX_GAP_FACTOR * poll_s after the one before it, which voids every window spanning it just as a failed read does."""
+    failed = late = 0
+    longest = 0.0
+    prev = None
+    for ts, w in samples:
+        if ts > since:
+            failed += w is None
+            if prev is not None:
+                longest = max(longest, ts - prev)
+                late += ts - prev > MAX_GAP_FACTOR * poll_s
+        prev = ts
+    return failed, late, longest
+
+
 def standby(samples, now, poll_s=POLL_S):
     win = window(samples, now, STANDBY_S, poll_s)
     return win is not None and all(w <= STANDBY_W for _, w in win)
