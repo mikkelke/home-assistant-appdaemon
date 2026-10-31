@@ -127,6 +127,13 @@ class EndReason(unittest.TestCase):
         self.assertIsNone(uv.end_reason(3 * 3600, 0, 0, **args))
         self.assertEqual(uv.end_reason(4 * 3600, 0, 0, **args), uv.HARD_CAP)
 
+    def test_the_stick_back_on_its_mount_ends_it_after_the_mount_time_even_while_busy(self):
+        args = {"door_open": True, "active": True, "quiet_s": self.QUIET_S, "cap_s": self.CAP_S,
+                "hold": True, "mounted_at": 600, "mount_s": 180}
+        self.assertIsNone(uv.end_reason(779, 0, 0, **args))
+        self.assertEqual(uv.end_reason(780, 0, 0, **args), uv.MOUNTED)
+        self.assertEqual(uv.end_reason(4 * 3600, 0, 0, **args), uv.HARD_CAP)
+
     def test_the_hard_cap_is_reported_even_if_the_visit_is_quiet(self):
         self.assertEqual(self.why(4 * 3600), uv.HARD_CAP)
 
@@ -142,7 +149,8 @@ class SmallRules(unittest.TestCase):
 
     def test_sanitize_keeps_a_good_visit(self):
         raw = {"kind": "cleaner", "who": "Liga Cleaning", "since": 100.0, "anchor": 160.0,
-               "blinds": {"bedroom": {"state": "lowered", "prior": 38, "asserted": 120.0}}}
+               "blinds": {"bedroom": {"state": "lowered", "prior": 38, "asserted": 120.0}},
+               "mounted": 150.0}
         self.assertEqual(uv.sanitize_visit(raw), raw)
 
     def test_sanitize_drops_a_visit_that_is_not_one(self):
@@ -184,6 +192,7 @@ ENTITY = "sensor.untracked_visitor"
 LOCK = "lock.yale"
 DOOR = "binary_sensor.apartment_door_open"
 HOLD = "binary_sensor.stick_vacuum_in_use"
+MOUNT = "sensor.stick_vacuum"
 ZONES = ("bathroom", "bedroom", "claudias_room", "dining_room", "guest_bathroom", "hallway",
          "kitchen", "kristines_room", "living_room")
 ACTIVITY = [f"binary_sensor.{zone}_active" for zone in ZONES]
@@ -306,6 +315,12 @@ def hold(app, seconds, on):
     at(app, seconds)
     old, app.states[HOLD] = app.states.get(HOLD), "on" if on else "off"
     app._on_hold(HOLD, None, old, app.states[HOLD], {})
+
+
+def mount(app, seconds, old, new):
+    at(app, seconds)
+    app.states[MOUNT] = new
+    app._on_mount(MOUNT, None, old, new, {})
 
 
 def tick(app, seconds):
@@ -440,6 +455,56 @@ class Start(unittest.TestCase):
         self.assertEqual(owner_of(app, "BedroomBlindOwner").positions(), [0, 38])
         self.assertEqual(published(app)[1]["since"], iso(600))
 
+
+    def test_the_stick_back_on_its_mount_ends_a_busy_cleaner_visit_and_gives_the_blinds_back(self):
+        app = make_app(args={"hold": HOLD, "mount": MOUNT})
+        start_cleaner(app)
+        zone(app, 30, "kitchen", True)
+        hold(app, 60, True)
+        mount(app, 3000, "in_use", "charging")
+        hold(app, 3000, False)
+        tick(app, 3000 + 179)
+        self.assertEqual(published(app)[0], "cleaner")
+        tick(app, 3000 + 180)
+        state, attrs = published(app)
+        self.assertEqual((state, attrs["end_reason"]), ("none", "mounted"))
+        self.assertIn("back on its mount for 3 min", attrs["reason"])
+        self.assertEqual(owner_of(app, "BedroomBlindOwner").positions()[-1], 38)
+
+    def test_the_stick_taken_off_its_mount_again_keeps_the_visit_on(self):
+        app = make_app(args={"mount": MOUNT})
+        start_cleaner(app)
+        zone(app, 30, "kitchen", True)
+        mount(app, 600, "in_use", "charging")
+        mount(app, 700, "charging", "off_mount")
+        tick(app, 1200)
+        self.assertEqual(published(app)[0], "cleaner")
+
+    def test_an_unreadable_stick_coming_back_as_mounted_does_not_end_it(self):
+        app = make_app(args={"mount": MOUNT})
+        start_cleaner(app)
+        zone(app, 30, "kitchen", True)
+        mount(app, 600, "unknown", "charging")
+        tick(app, 1200)
+        self.assertEqual(published(app)[0], "cleaner")
+
+    def test_a_mount_flapping_through_unknown_keeps_its_time(self):
+        app = make_app(args={"mount": MOUNT})
+        start_cleaner(app)
+        zone(app, 30, "kitchen", True)
+        mount(app, 600, "in_use", "charging")
+        mount(app, 650, "charging", "unknown")
+        mount(app, 670, "unknown", "charging")
+        tick(app, 780)
+        self.assertEqual(published(app)[1]["end_reason"], "mounted")
+
+    def test_a_guest_ignores_the_mount(self):
+        app = make_app(args={"mount": MOUNT})
+        unlock(app, 0, GUEST_NAME)
+        zone(app, 1, "kitchen", True)
+        mount(app, 600, "in_use", "charging")
+        tick(app, 1200)
+        self.assertEqual(published(app)[0], "guest")
 
 class EndRules(unittest.TestCase):
     def test_a_cleaner_using_the_stick_stays_past_the_ordinary_cap(self):
@@ -709,6 +774,17 @@ class Restart(unittest.TestCase):
     def boot(self, now, **kw):
         """A fresh instance `now` seconds after T0 sharing the state file, like a new AppDaemon."""
         return make_app(state_file=self.file, now=now, **kw)
+
+    def test_the_mount_time_survives_a_restart(self):
+        first = self.boot(0, args={"mount": MOUNT})
+        start_cleaner(first)
+        zone(first, 30, "kitchen", True)
+        mount(first, 600, "in_use", "charging")
+        tick(first, 630)
+        again = self.boot(700, args={"mount": MOUNT}, states={"binary_sensor.kitchen_active": "on"})
+        self.assertEqual(published(again)[0], "cleaner")
+        tick(again, 780)
+        self.assertEqual(published(again)[1]["end_reason"], "mounted")
 
     def test_the_state_file_records_the_visit_and_the_blinds(self):
         app = self.boot(0)

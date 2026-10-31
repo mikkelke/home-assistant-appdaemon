@@ -45,6 +45,9 @@ UntrackedVisitor:
   cap_hours: 2
   # A cleaner using the stick keeps the visit open through quiet and the ordinary cap.
   hold: binary_sensor.stick_vacuum_in_use
+  # The cleaner putting the stick back on its mount ends the visit after mount_min.
+  mount: sensor.stick_vacuum
+  mount_min: 3
   # Every visit ends at this limit, even while held.
   hard_cap_hours: 4
 

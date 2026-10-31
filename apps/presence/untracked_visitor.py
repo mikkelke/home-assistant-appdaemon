@@ -3,8 +3,8 @@ UntrackedVisitor - publishes sensor.untracked_visitor: is a person the house doe
 in the flat?
 
 State is none, cleaner or guest. Attributes: who (the keypad user's name), since (when the
-visit began, ISO), reason (one sentence for the current state) and end_reason (quiet, cap
-or hard_cap after a visit, otherwise ""). who and since are "" at none. Consumers
+visit began, ISO), reason (one sentence for the current state) and end_reason (quiet,
+mounted, cap or hard_cap after a visit, otherwise ""). who and since are "" at none. Consumers
 read this entity, never the lock.
 
 ON. lock.yale reports unlocked and its changed_by names a keypad person who is not a
@@ -19,10 +19,12 @@ anyone else replaces it.
 OFF. The first of
   * the front door is closed and every `activity` entity has been explicitly off for quiet_min
     minutes (the quiet clock restarts at every door edge and every activity change),
+  * the cleaner put the stick vacuum back on its mount during the visit and it has stayed
+    there for mount_min minutes,
   * cap_hours have passed since the visit began,
   * hard_cap_hours have passed since the visit began, even with a hold.
 For a cleaner visit, optional `hold` being on blocks the quiet exit and cap_hours; every
-hold change restarts the quiet clock. Guests ignore the hold.
+hold change restarts the quiet clock. Guests ignore the hold and the mount.
 
 BLINDS. While the visitor is the cleaner, each blind in `blinds` is held at lowered_position
 through its blind owner app (apps/blinds/bedroom_blind_owner.py) as the "visitor" source and
@@ -59,6 +61,11 @@ SOURCE = "visitor"
 QUIET = "quiet"
 CAP = "cap"
 HARD_CAP = "hard_cap"
+MOUNTED = "mounted"
+
+# sensor.stick_vacuum states (apps/appliances/stick_vacuum.py).
+ON_MOUNT = ("charging", "charged")
+OFF_MOUNT = ("in_use", "off_mount")
 
 BLIND_STATES = ("pending", "lowered", "yielded")
 UNLOCKED_STATES = ("unlocked", "unlocking", "open")
@@ -104,12 +111,16 @@ def activity_state(state):
     return True if normalized == "on" else False if normalized == "off" else None
 
 
-def end_reason(now, since, anchor, *, door_open, active, quiet_s, cap_s, hold=False, hard_cap_s=4 * 3600):
+def end_reason(now, since, anchor, *, door_open, active, quiet_s, cap_s, hold=False, hard_cap_s=4 * 3600,
+               mounted_at=None, mount_s=3 * 60):
     """Why a visit that began at `since` is over, or None while it is still on. `anchor` is
     the last door edge or activity change; `active` blocks a quiet exit when activity is
-    positive or unreadable. `hold` blocks quiet and the ordinary cap, never the hard cap."""
+    positive or unreadable. `hold` blocks quiet and the ordinary cap, never the hard cap.
+    `mounted_at` is when the stick went back on its mount during the visit."""
     if now - since >= hard_cap_s:
         return HARD_CAP
+    if mounted_at is not None and now - mounted_at >= mount_s:
+        return MOUNTED
     if not hold and not door_open and not active and now - anchor >= quiet_s:
         return QUIET
     if not hold and now - since >= cap_s:
@@ -148,7 +159,8 @@ def sanitize_visit(raw):
                 "asserted": _number(blind.get("asserted")) or 0.0,
             }
     return {"kind": kind, "who": who, "since": since,
-            "anchor": since if anchor is None else anchor, "blinds": blinds}
+            "anchor": since if anchor is None else anchor, "blinds": blinds,
+            "mounted": _number(raw.get("mounted"))}
 
 
 def stamp(epoch, tz):
@@ -163,8 +175,9 @@ def started_text(who, epoch, tz):
     return f"{who} unlocked the front door at {hhmm(epoch, tz)}"
 
 
-def ended_text(why, epoch, tz, quiet_min, cap_hours, hard_cap_hours=4):
+def ended_text(why, epoch, tz, quiet_min, cap_hours, hard_cap_hours=4, mount_min=3):
     cause = {
+        MOUNTED: f"the stick vacuum has been back on its mount for {mount_min:g} min",
         QUIET: f"the front door is closed and the flat has been quiet for {quiet_min:g} min",
         CAP: f"{cap_hours:g} h limit reached",
         HARD_CAP: f"{hard_cap_hours:g} h hard limit reached",
@@ -186,6 +199,8 @@ class UntrackedVisitor(hass.Hass):
         self.cap_hours = float(a.get("cap_hours", 2))
         self.hard_cap_hours = float(a.get("hard_cap_hours", 4))
         self.hold_entity = a.get("hold")
+        self.mount_entity = a.get("mount")
+        self.mount_min = float(a.get("mount_min", 3))
         self.reassert_s = float(a.get("blind_reassert_min", 5)) * 60
         self.release_ttl_min = float(a.get("blind_release_ttl_min", 3))
         self.blinds = {str(name): dict(cfg) for name, cfg in (a.get("blinds") or {}).items()}
@@ -213,6 +228,8 @@ class UntrackedVisitor(hass.Hass):
             self.listen_state(self._on_activity, entity)
         if self.hold_entity:
             self.listen_state(self._on_hold, self.hold_entity)
+        if self.mount_entity:
+            self.listen_state(self._on_mount, self.mount_entity)
         self.listen_event(self._on_plugin_started, "plugin_started")
         self.run_every(self._tick, f"now+{TICK_S}", TICK_S)
 
@@ -246,6 +263,18 @@ class UntrackedVisitor(hass.Hass):
             if self._visit is not None and self._visit["kind"] == CLEANER:
                 self._touch()
 
+    def _on_mount(self, entity, attribute, old, new, kwargs):
+        with self._lock:
+            visit = self._visit
+            if visit is None or visit["kind"] != CLEANER:
+                return
+            if old in OFF_MOUNT and new in ON_MOUNT:
+                visit["mounted"] = self._now()
+                self._dirty = True
+            elif new in OFF_MOUNT and visit.get("mounted") is not None:
+                visit["mounted"] = None
+                self._dirty = True
+
     def _on_plugin_started(self, event_name, data, kwargs):
         with self._lock:
             self._publish(self._now())
@@ -268,7 +297,8 @@ class UntrackedVisitor(hass.Hass):
         elif visit is not None:
             self._release_blinds(visit)
         tz = self.get_now().tzinfo
-        self._visit = {"kind": kind, "who": who, "since": now, "anchor": now, "blinds": blinds}
+        self._visit = {"kind": kind, "who": who, "since": now, "anchor": now, "blinds": blinds,
+                       "mounted": None}
         self._reason = started_text(who, now, tz)
         self._end_reason = ""
         if kind == CLEANER:
@@ -290,7 +320,8 @@ class UntrackedVisitor(hass.Hass):
                              active=not activity_quiet,
                              quiet_s=self.quiet_min * 60, cap_s=self.cap_hours * 3600,
                              hold=visit["kind"] == CLEANER and self._hold,
-                             hard_cap_s=self.hard_cap_hours * 3600)
+                             hard_cap_s=self.hard_cap_hours * 3600,
+                             mounted_at=visit.get("mounted"), mount_s=self.mount_min * 60)
             if why is not None:
                 self._end(now, why)
         if self._visit is not None and self._visit["kind"] == CLEANER:
@@ -304,7 +335,8 @@ class UntrackedVisitor(hass.Hass):
         visit, self._visit = self._visit, None
         self._release_blinds(visit)
         tz = self.get_now().tzinfo
-        self._reason = ended_text(why, now, tz, self.quiet_min, self.cap_hours, self.hard_cap_hours)
+        self._reason = ended_text(why, now, tz, self.quiet_min, self.cap_hours, self.hard_cap_hours,
+                                  self.mount_min)
         self._end_reason = why
         self._persist()
         self._publish(now)
@@ -405,7 +437,7 @@ class UntrackedVisitor(hass.Hass):
             self._visit = sanitize_visit(raw.get("visit"))
             if isinstance(raw.get("reason"), str) and raw["reason"]:
                 self._reason = raw["reason"]
-            if raw.get("end_reason") in (QUIET, CAP, HARD_CAP):
+            if raw.get("end_reason") in (QUIET, CAP, HARD_CAP, MOUNTED):
                 self._end_reason = raw["end_reason"]
             if (self._visit is not None and self._visit["kind"] == CLEANER
                     and isinstance(raw.get("hold"), bool) and raw["hold"] != self._hold):
@@ -418,7 +450,7 @@ class UntrackedVisitor(hass.Hass):
                 why = self.get_state(self.visitor_entity, attribute="end_reason")
                 if isinstance(reason, str) and reason:
                     self._reason = reason
-                if why in (QUIET, CAP, HARD_CAP):
+                if why in (QUIET, CAP, HARD_CAP, MOUNTED):
                     self._end_reason = why
         if self._visit is not None:
             self._visit["since"] = min(self._visit["since"], now)
