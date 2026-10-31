@@ -170,11 +170,9 @@ class SmallRules(unittest.TestCase):
         tz = timezone(timedelta(hours=2))
         t = datetime(2026, 10, 21, 13, 53, tzinfo=tz).timestamp()
         self.assertEqual(uv.started_text("Liga Cleaning", t, tz), "Liga Cleaning unlocked the front door at 13:53")
-        self.assertEqual(uv.ended_text(uv.QUIET, "", t, tz, 15, 2),
+        self.assertEqual(uv.ended_text(uv.QUIET, t, tz, 15, 2),
                          "Visit ended at 13:53: the front door is closed and the flat has been quiet for 15 min")
-        self.assertEqual(uv.ended_text(uv.CAP, "", t, tz, 15, 2), "Visit ended at 13:53: 2 h limit reached")
-        self.assertEqual(uv.ended_text(uv.ARRIVAL, "Kristine", t, tz, 15, 2),
-                         "Visit ended at 13:53: Kristine arrived home")
+        self.assertEqual(uv.ended_text(uv.CAP, t, tz, 15, 2), "Visit ended at 13:53: 2 h limit reached")
 
 
 # ---------- the app ----------
@@ -189,7 +187,6 @@ HOLD = "binary_sensor.stick_vacuum_in_use"
 ZONES = ("bathroom", "bedroom", "claudias_room", "dining_room", "guest_bathroom", "hallway",
          "kitchen", "kristines_room", "living_room")
 ACTIVITY = [f"binary_sensor.{zone}_active" for zone in ZONES]
-PERSONS = ["person.mikkel", "person.kristine", "person.claudia"]
 
 BLINDS = {
     "bedroom": {"owner_app": "BedroomBlindOwner", "cover": "cover.bedroom_blind",
@@ -199,7 +196,7 @@ BLINDS = {
 }
 
 BASE_ARGS = {
-    "entity": ENTITY, "lock": LOCK, "door": DOOR, "activity": ACTIVITY, "persons": PERSONS,
+    "entity": ENTITY, "lock": LOCK, "door": DOOR, "activity": ACTIVITY,
     "residents": RESIDENTS, "cleaners": CLEANERS, "non_person": NON_PERSON,
     "quiet_min": 15, "cap_hours": 2, "blind_reassert_min": 5, "blind_release_ttl_min": 3,
     "blinds": BLINDS,
@@ -311,11 +308,6 @@ def hold(app, seconds, on):
     app._on_hold(HOLD, None, old, app.states[HOLD], {})
 
 
-def arrive(app, seconds, person="person.kristine"):
-    at(app, seconds)
-    app._on_person(person, None, "not_home", "home", {})
-
-
 def tick(app, seconds):
     at(app, seconds)
     app._tick({})
@@ -374,8 +366,8 @@ class Publishing(unittest.TestCase):
         self.assertIn(DOOR, listened)
         for entity in ACTIVITY:
             self.assertIn(entity, listened)
-        for person in PERSONS:
-            self.assertEqual(listened[person], {"new": "home"})
+        for person in ("person.mikkel", "person.kristine", "person.claudia"):
+            self.assertNotIn(person, listened)
 
 
 class Start(unittest.TestCase):
@@ -493,12 +485,6 @@ class EndRules(unittest.TestCase):
                 state, attrs = published(app)
                 self.assertEqual((state, attrs["end_reason"]), ("none", "cap" if active else "quiet"))
 
-    def test_an_arrival_still_ends_a_held_cleaner_visit(self):
-        app = make_app(args={"hold": HOLD}, states={HOLD: "on"})
-        start_cleaner(app)
-        arrive(app, 600)
-        self.assertEqual(published(app)[1]["end_reason"], "arrival")
-
     def test_the_hard_cap_also_ends_a_guest_visit(self):
         app = make_app(args={"hold": HOLD, "cap_hours": 6, "hard_cap_hours": 4}, states={HOLD: "on"})
         unlock(app, 0, GUEST_NAME)
@@ -541,16 +527,11 @@ class EndRules(unittest.TestCase):
                 tick(app, 1800)
                 self.assertEqual(published(app)[0], "cleaner")
 
-    def test_arrival_and_cap_still_end_visits_with_unknown_activity(self):
-        for why in ("arrival", "cap"):
-            with self.subTest(why=why):
-                app = make_app(states={"binary_sensor.kitchen_active": "unknown"})
-                start_cleaner(app)
-                if why == "arrival":
-                    arrive(app, 600)
-                else:
-                    tick(app, 2 + 2 * 3600)
-                self.assertEqual(published(app)[0], "none")
+    def test_the_cap_still_ends_a_visit_with_unknown_activity(self):
+        app = make_app(states={"binary_sensor.kitchen_active": "unknown"})
+        start_cleaner(app)
+        tick(app, 2 + 2 * 3600)
+        self.assertEqual(published(app)[0], "none")
 
     def test_a_closed_door_and_a_quiet_flat_end_the_visit_after_fifteen_minutes(self):
         app = make_app()
@@ -597,29 +578,6 @@ class EndRules(unittest.TestCase):
         self.assertEqual(published(app)[0], "cleaner")
         tick(app, 4 + QUIET_S)
         self.assertEqual(published(app)[0], "none")
-
-    def test_a_resident_arriving_home_ends_it_at_once(self):
-        app = make_app()
-        start_cleaner(app)
-        zone(app, 30, "hallway", True)
-        arrive(app, 600, "person.kristine")
-        state, attrs = published(app)
-        self.assertEqual(state, "none")
-        self.assertIn("Kristine arrived home", attrs["reason"])
-        self.assertEqual(attrs["end_reason"], "arrival")
-
-    def test_an_arrival_with_no_visit_does_nothing(self):
-        app = make_app()
-        count = len(app.published)
-        arrive(app, 600)
-        self.assertEqual(len(app.published), count)
-
-    def test_a_resident_who_was_already_home_does_not_end_it(self):
-        app = make_app()
-        start_cleaner(app)
-        zone(app, 30, "bedroom", True)
-        app._on_person("person.mikkel", None, "home", "home", {})
-        self.assertEqual(published(app)[0], "cleaner")
 
     def test_the_cap_ends_a_visit_that_never_goes_quiet(self):
         app = make_app()
@@ -693,13 +651,6 @@ class Blinds(unittest.TestCase):
         self.assertEqual(owner_of(app, "BedroomBlindOwner").positions(), [0, 38])
         self.assertEqual(owner_of(app, "BathroomBlindOwner").positions(), [0, 40])
 
-    def test_a_resident_arriving_gives_the_blinds_back_at_once(self):
-        app = make_app()
-        unlock(app, 0, CLEANER_NAME)
-        arrive(app, 700)
-        self.assertEqual(owner_of(app, "BedroomBlindOwner").positions(), [0, 38])
-        self.assertEqual(owner_of(app, "BathroomBlindOwner").positions(), [0, 40])
-
     def test_the_cap_gives_the_blinds_back_too(self):
         app = make_app()
         start_cleaner(app)
@@ -717,7 +668,8 @@ class Blinds(unittest.TestCase):
         self.assertEqual(len(bedroom.requests()), 1)
         tick(app, 600)
         tick(app, 1200)
-        arrive(app, 1300)
+        zone(app, 1300, "hallway", False)
+        tick(app, 1300 + QUIET_S)
         self.assertEqual(len(bedroom.requests()), 1)
         self.assertEqual(owner_of(app, "BathroomBlindOwner").positions(), [0, 0, 0, 40])
 
@@ -789,10 +741,10 @@ class Restart(unittest.TestCase):
     def test_the_end_cause_survives_a_restart(self):
         first = self.boot(0)
         start_cleaner(first)
-        arrive(first, 600)
-        self.assertEqual(json.loads(Path(self.file).read_text())["end_reason"], "arrival")
+        tick(first, 4 + QUIET_S)
+        self.assertEqual(json.loads(Path(self.file).read_text())["end_reason"], "quiet")
         again = self.boot(1800)
-        self.assertEqual(published(again)[1]["end_reason"], "arrival")
+        self.assertEqual(published(again)[1]["end_reason"], "quiet")
 
     def test_the_entity_preserves_the_end_cause_without_a_file(self):
         app = make_app(states={ENTITY: "none"},
@@ -820,7 +772,7 @@ class Restart(unittest.TestCase):
         first = make_app(state_file=self.file, attrs={("cover.bedroom_blind", "current_position"): 100})
         unlock(first, 0, CLEANER_NAME)
         again = self.boot(60, attrs={("cover.bedroom_blind", "current_position"): 0})
-        arrive(again, 120)
+        tick(again, QUIET_S)
         self.assertEqual(owner_of(again, "BedroomBlindOwner").positions(), [100])
 
     def test_a_restart_after_the_visit_went_quiet_ends_it_and_gives_the_blinds_back(self):

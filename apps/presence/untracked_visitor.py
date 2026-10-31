@@ -3,8 +3,8 @@ UntrackedVisitor - publishes sensor.untracked_visitor: is a person the house doe
 in the flat?
 
 State is none, cleaner or guest. Attributes: who (the keypad user's name), since (when the
-visit began, ISO), reason (one sentence for the current state) and end_reason (quiet, cap,
-hard_cap or arrival after a visit, otherwise ""). who and since are "" at none. Consumers
+visit began, ISO), reason (one sentence for the current state) and end_reason (quiet, cap
+or hard_cap after a visit, otherwise ""). who and since are "" at none. Consumers
 read this entity, never the lock.
 
 ON. lock.yale reports unlocked and its changed_by names a keypad person who is not a
@@ -19,7 +19,6 @@ anyone else replaces it.
 OFF. The first of
   * the front door is closed and every `activity` entity has been explicitly off for quiet_min
     minutes (the quiet clock restarts at every door edge and every activity change),
-  * a resident in `persons` arrives home,
   * cap_hours have passed since the visit began,
   * hard_cap_hours have passed since the visit began, even with a hold.
 For a cleaner visit, optional `hold` being on blocks the quiet exit and cap_hours; every
@@ -60,7 +59,6 @@ SOURCE = "visitor"
 QUIET = "quiet"
 CAP = "cap"
 HARD_CAP = "hard_cap"
-ARRIVAL = "arrival"
 
 BLIND_STATES = ("pending", "lowered", "yielded")
 UNLOCKED_STATES = ("unlocked", "unlocking", "open")
@@ -165,12 +163,11 @@ def started_text(who, epoch, tz):
     return f"{who} unlocked the front door at {hhmm(epoch, tz)}"
 
 
-def ended_text(why, detail, epoch, tz, quiet_min, cap_hours, hard_cap_hours=4):
+def ended_text(why, epoch, tz, quiet_min, cap_hours, hard_cap_hours=4):
     cause = {
         QUIET: f"the front door is closed and the flat has been quiet for {quiet_min:g} min",
         CAP: f"{cap_hours:g} h limit reached",
         HARD_CAP: f"{hard_cap_hours:g} h hard limit reached",
-        ARRIVAL: f"{detail} arrived home",
     }[why]
     return f"Visit ended at {hhmm(epoch, tz)}: {cause}"
 
@@ -182,7 +179,6 @@ class UntrackedVisitor(hass.Hass):
         self.lock_entity = a["lock"]
         self.door_entity = a["door"]
         self.activity = list(a["activity"])
-        self.persons = list(a["persons"])
         self.residents = list(a["residents"])
         self.cleaners = list(a["cleaners"])
         self.non_person = list(a["non_person"])
@@ -217,8 +213,6 @@ class UntrackedVisitor(hass.Hass):
             self.listen_state(self._on_activity, entity)
         if self.hold_entity:
             self.listen_state(self._on_hold, self.hold_entity)
-        for person in self.persons:
-            self.listen_state(self._on_person, person, new="home")
         self.listen_event(self._on_plugin_started, "plugin_started")
         self.run_every(self._tick, f"now+{TICK_S}", TICK_S)
 
@@ -251,13 +245,6 @@ class UntrackedVisitor(hass.Hass):
             self._dirty = True
             if self._visit is not None and self._visit["kind"] == CLEANER:
                 self._touch()
-
-    def _on_person(self, entity, attribute, old, new, kwargs):
-        if old == "home":
-            return
-        with self._lock:
-            if self._visit is not None:
-                self._end(self._now(), ARRIVAL, entity.split(".", 1)[-1].capitalize())
 
     def _on_plugin_started(self, event_name, data, kwargs):
         with self._lock:
@@ -313,11 +300,11 @@ class UntrackedVisitor(hass.Hass):
         if now - self._published_at >= REPUBLISH_S:
             self._publish(now)
 
-    def _end(self, now, why, detail=""):
+    def _end(self, now, why):
         visit, self._visit = self._visit, None
         self._release_blinds(visit)
         tz = self.get_now().tzinfo
-        self._reason = ended_text(why, detail, now, tz, self.quiet_min, self.cap_hours, self.hard_cap_hours)
+        self._reason = ended_text(why, now, tz, self.quiet_min, self.cap_hours, self.hard_cap_hours)
         self._end_reason = why
         self._persist()
         self._publish(now)
@@ -418,7 +405,7 @@ class UntrackedVisitor(hass.Hass):
             self._visit = sanitize_visit(raw.get("visit"))
             if isinstance(raw.get("reason"), str) and raw["reason"]:
                 self._reason = raw["reason"]
-            if raw.get("end_reason") in (QUIET, CAP, HARD_CAP, ARRIVAL):
+            if raw.get("end_reason") in (QUIET, CAP, HARD_CAP):
                 self._end_reason = raw["end_reason"]
             if (self._visit is not None and self._visit["kind"] == CLEANER
                     and isinstance(raw.get("hold"), bool) and raw["hold"] != self._hold):
@@ -431,7 +418,7 @@ class UntrackedVisitor(hass.Hass):
                 why = self.get_state(self.visitor_entity, attribute="end_reason")
                 if isinstance(reason, str) and reason:
                     self._reason = reason
-                if why in (QUIET, CAP, HARD_CAP, ARRIVAL):
+                if why in (QUIET, CAP, HARD_CAP):
                     self._end_reason = why
         if self._visit is not None:
             self._visit["since"] = min(self._visit["since"], now)

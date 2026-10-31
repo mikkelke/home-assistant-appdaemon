@@ -28,7 +28,6 @@ UntrackedVisitor:
     - Home Assistant
     - unknown
     - unavailable
-  persons: [person.mikkel, person.kristine, person.claudia]
 
   # One entity per RoomActive zone (room_active.yaml); a test keeps the two lists in step.
   activity:
