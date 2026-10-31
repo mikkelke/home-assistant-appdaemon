@@ -1,5 +1,6 @@
 # tests/test_upcoming_core.py - the sensor.house_upcoming row schema: strings only, ASCII, order,
-# overflow and lease. Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
+# overflow, lease and the records of a row that stands in for several plants.
+# Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
 import json
 import sys
@@ -72,6 +73,86 @@ class ItemsTests(unittest.TestCase):
         for bad in ([], "a", ["a", ""], [5], ["x" * 61], ["caf\u00e9"], ["a\nb"], too_many, None):
             self.assertFalse(core.is_valid_row({**good, "items": bad}), bad)
         self.assertFalse(core.is_valid_row({**core.make_row("rain:terrace", "rain", "Rain forecast"), "items": ["a"]}))
+
+
+class PlantsTests(unittest.TestCase):
+    """plants: the records of one maintenance row that stands in for several plants."""
+
+    RECORD = {"id": "maint:plant:monstera", "name": "Monstera", "amount": "1 L + 1 tsp fertiliser",
+              "detail": "due since 30.10", "where": "Kitchen floor", "aka": "Big leaves with holes",
+              "photo": "monstera", "done": "tap"}
+
+    def make(self, **extra):
+        return core.make_row("maint:plants", "maint", "Water 2 plants", "Monstera, Ivy", audience="admin", **extra)
+
+    def test_a_row_may_list_records_of_ascii_strings_and_stays_valid(self):
+        other = {"id": "maint:plant:ivy", "name": "Ivy", "detail": "soil 20%, water at 20%"}
+        row = self.make(plants=[self.RECORD, other])
+        self.assertEqual(row["plants"], [self.RECORD, other])
+        self.assertTrue(all(isinstance(value, str) and value.isascii() for each in row["plants"]
+                            for value in each.values()))
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_every_text_is_one_ascii_line_and_capped_and_an_id_may_be_as_long_as_a_row_id(self):
+        row = self.make(plants=[{**self.RECORD, "name": "Caf\u00e9\n  Palme", "aka": "x" * 90,
+                                 "id": "maint:plant:" + "y" * 100}])
+        [record] = row["plants"]
+        self.assertEqual((record["name"], len(record["aka"]), len(record["id"])), ("Caf Palme", core.TEXT_MAX, 112))
+        self.assertTrue(core.is_valid_row(row))
+        long_id = self.make(plants=[{**self.RECORD, "id": "z" * 150}])
+        self.assertEqual(len(long_id["plants"][0]["id"]), core.ID_MAX)
+
+    def test_a_field_with_nothing_in_it_is_left_out_of_the_record(self):
+        record = {"id": "maint:plant:ivy", "name": "Ivy", "amount": "", "detail": None, "where": " ", "aka": 5,
+                  "photo": [], "done": False, "stray": "dropped"}
+        self.assertEqual(self.make(plants=[record])["plants"], [{"id": "maint:plant:ivy", "name": "Ivy"}])
+
+    def test_a_record_without_an_id_or_a_name_or_that_is_no_dict_is_dropped(self):
+        records = [{"name": "Ivy"}, {"id": "maint:plant:ivy"}, {"id": " ", "name": "Ivy"}, "Ivy", None, 5, [], {},
+                   self.RECORD]
+        self.assertEqual(self.make(plants=records)["plants"], [self.RECORD])
+
+    def test_a_row_without_records_has_no_field(self):
+        for plants in (None, [], [{}], [{"name": "Ivy"}]):
+            self.assertNotIn("plants", self.make(plants=plants))
+
+    def test_at_most_twenty_records_fit(self):
+        records = [{"id": f"maint:plant:p{i:02d}", "name": f"Plant {i:02d}"} for i in range(30)]
+        row = self.make(plants=records)
+        self.assertEqual([record["name"] for record in row["plants"]], [f"Plant {i:02d}" for i in range(20)])
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_the_contract_is_a_list_of_records_of_non_empty_ascii_strings_on_a_maintenance_row(self):
+        good = self.make(plants=[self.RECORD])
+        too_many = [{"id": f"maint:plant:p{i:02d}", "name": "Plant"} for i in range(21)]
+        bad_lists = ([], "a", {}, None, [None], ["Ivy"], [{"id": "maint:plant:ivy"}], [{"name": "Ivy"}], too_many,
+                     [{**self.RECORD, "stray": "x"}], [{**self.RECORD, "amount": ""}], [{**self.RECORD, "amount": 5}],
+                     [{**self.RECORD, "where": None}], [{**self.RECORD, "name": "x" * 61}],
+                     [{**self.RECORD, "aka": "Caf\u00e9"}], [{**self.RECORD, "detail": "a\nb"}],
+                     [{**self.RECORD, "id": "z" * 121}], [{**self.RECORD, "photo": ["monstera"]}])
+        for bad in bad_lists:
+            self.assertFalse(core.is_valid_row({**good, "plants": bad}), bad)
+        self.assertTrue(core.is_valid_row({**good, "plants": [{**self.RECORD, "id": "z" * 120}]}))
+        self.assertFalse(core.is_valid_row({**core.make_row("rain:terrace", "rain", "Rain forecast"),
+                                            "plants": [self.RECORD]}))
+
+    def test_done_in_a_record_is_tap_or_absent(self):
+        good = self.make(plants=[{k: v for k, v in self.RECORD.items() if k != "done"}])
+        self.assertTrue(core.is_valid_row(good))
+        for bad in ("true", "Tap", "yes", True):
+            self.assertFalse(core.is_valid_row({**good, "plants": [{**self.RECORD, "done": bad}]}), bad)
+
+    def test_the_canonical_form_ignores_the_order_of_a_records_keys_but_not_of_the_records(self):
+        one, two = {"id": "maint:plant:a", "name": "A"}, {"id": "maint:plant:b", "name": "B"}
+        flipped = {"name": "A", "id": "maint:plant:a"}
+        same, flipped_keys, swapped = (core.canonical([self.make(plants=records)])
+                                       for records in ([one, two], [flipped, two], [two, one]))
+        self.assertEqual(same, flipped_keys)
+        self.assertNotEqual(same, swapped)
+
+    def test_a_row_with_records_goes_through_finalize_untouched(self):
+        row = self.make(plants=[self.RECORD])
+        self.assertEqual(core.finalize_rows([battery(1), row])[1], row)
 
 
 class SheetFieldTests(unittest.TestCase):

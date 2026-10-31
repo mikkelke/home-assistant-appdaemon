@@ -30,10 +30,13 @@ replace-by day, with the median lifetime of every device of the same model as th
 Rober2's recent cleaning rate from its cumulative cleaning time, which dates each part's row before
 it is due.
 
-The plants also have one row, maint:plants, with a line for each in `items` (upcoming_plants): when it is
-due and when it was last watered. A Done on a plant without a sensor, and a rise of its soil moisture
-for one with a sensor, are told to the house events feed as `house_events_report` events, which is
-also where the sensor plants' last-watered times come from.
+The plants have one row, maint:plants (upcoming_plants). While none is due it has a line for each in
+`items`: when it is due and when it was last watered. Once some are due it stands in for their rows,
+with a record for each in `plants`; a calendar plant's record has a Done button, which fires
+house_upcoming_done with the plant's own row id, maint:plant:<slug>, although no published row has it.
+The push still has one condition for each plant. A Done on a plant without a sensor, and a rise of its
+soil moisture for one with a sensor, are told to the house events feed as `house_events_report` events,
+which is also where the sensor plants' last-watered times come from.
 
 Yale keypad unlocks by residents still registered away 15 minutes later add quiet admin notes
 (upcoming_yale), closed with Done. Notes and Done survive reload; pending checks are dropped. These
@@ -427,8 +430,11 @@ class HouseUpcoming(hass.Hass):
         found += self._run_rows(now)
         stick = maint.stick_rows(self._cache.get(self.stick_entity), self.run_areas["stick"])
         found += stick
-        found += self._timed_plant_rows(now)
+        timed = self._timed_plant_rows(now)
+        found += timed
         found += self._once_rows(now)
+        due = [(item[0], plant, plants.feeds(plant, self._anchors.get(plants.anchor_key(plant)), now))
+               for item, plant in zip(timed, self.timed_plants.values()) if item and "at" not in item[0]]
         for entity, device in self.inventory["devices"].items():
             cached = self._cache.get(entity)
             if cached is None:
@@ -445,20 +451,18 @@ class HouseUpcoming(hass.Hass):
                 continue
             value = maint.reading(cached.get("state"))
             self._plant_latches[entity] = plants.step_plant(self._plant_latches.get(entity), plant, value, now)
-            feed = maint.reading((self._cache.get(plant["conductivity"]) or {}).get("state"))
-            found.append(plants.plant_row(entity, plant, self._plant_latches[entity], value, feed))
+            conductivity = maint.reading((self._cache.get(plant["conductivity"]) or {}).get("state"))
+            item = plants.plant_row(entity, plant, self._plant_latches[entity], value, conductivity)
+            found.append(item)
+            if item:
+                due.append((item[0], plant, plants.soil_feeds(conductivity)))
             self._track_watering(plant, value, now)
-        overview = self._plants_row(now)
-        due_plants = [item[0] for item in found if item and item[0]["id"].startswith(plants.ID_PREFIX)
-                      and "at" not in item[0]]
-        if overview and due_plants:
-            for row in due_plants:
-                row["items"] = overview[0]["items"]
-        else:
-            found.append(overview)
+        found.append((plants.round_row(due), None) if due else self._plants_row(now))
+        folded = [row for row, _, _ in due]
         for item in found:
             if item:
-                rows.append(item[0])
+                if item[0] not in folded:
+                    rows.append(item[0])
                 conditions.append((item[0]["title"], item[1]))
 
         rows.append(train.train_row(self._cache.get(self.train_route), self._state_of(self.train_stog),

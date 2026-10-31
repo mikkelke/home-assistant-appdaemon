@@ -1,8 +1,9 @@
 # tests/test_upcoming_plants.py - watering reminders for sensor.house_upcoming: the dry latch and its
-# hysteresis, the row with the litres to pour and its push key, the plants watered by the calendar, and
-# the plants list of house_upcoming.yaml.
+# hysteresis, the row with the litres to pour and its push key, the plants watered by the calendar, the
+# one row for the plants due now, and the plants list of house_upcoming.yaml.
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
+import copy
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -197,7 +198,8 @@ class ParseTests(unittest.TestCase):
     def test_a_plant_is_its_sensor_name_room_dry_level_and_optional_litres(self):
         self.assertEqual(plants.parse_plants(RAW),
                          {ENTITY: {"name": "Strelitzia", "slug": "strelitzia", "area": "dining_room", "dry": 15.0,
-                                   "water": None, "info": [], "conductivity": None}})
+                                   "water": None, "info": [], "aka": None, "where": None, "photo": None,
+                                   "conductivity": None}})
         self.assertEqual(plants.parse_plants([{**RAW[0], "water": 0.3}])[ENTITY]["water"], 0.3)
 
     def test_no_plants_is_fine(self):
@@ -302,6 +304,10 @@ class FeedTitleTests(unittest.TestCase):
             row, _ = plants.plant_row(ENTITY, PLANT, st, 12.0, conductivity)
             self.assertEqual("fertiliser" in row["title"] or "feed" in row["title"], fed, conductivity)
         self.assertEqual(plants.FEED_BELOW, 350)
+
+    def test_the_predicate_is_the_same_under_350_and_says_nothing_without_a_reading(self):
+        for conductivity, expected in ((0, True), (90, True), (349.9, True), (350, False), (807, False), (None, False)):
+            self.assertIs(plants.soil_feeds(conductivity), expected, conductivity)
 
     def test_the_title_without_feed_is_as_it_was(self):
         row, _ = plants.plant_row(ENTITY, PLANT, feed([(T0, 12)]), 12.0)
@@ -437,6 +443,18 @@ class NoteTests(unittest.TestCase):
         self.assertEqual(plants.parse_plants([{**RAW[0], "aka": self.LOOK}])[ENTITY]["info"], [self.LOOK])
         self.assertEqual(plants.parse_plants([{**RAW[0], "aka": None, "where": None}])[ENTITY]["info"], [])
 
+    def test_the_notes_and_the_photo_are_also_kept_apart_for_the_record_of_the_plant(self):
+        raw = {"where": self.STANDS, "aka": self.LOOK, "photo": "bird_of_paradise"}
+        for parse, cfg, found in ((plants.parse_plants, RAW[0], lambda parsed: parsed[ENTITY]),
+                                  (plants.parse_timed, CAL[0], lambda parsed: parsed["monstera"])):
+            plant = found(parse([{**cfg, **raw}]))
+            self.assertEqual((plant["aka"], plant["where"], plant["photo"]),
+                             (self.LOOK, self.STANDS, "bird_of_paradise"))
+            bare = found(parse([cfg]))
+            self.assertEqual((bare["aka"], bare["where"], bare["photo"], bare["info"]), (None, None, None, []))
+            only = found(parse([{**cfg, "where": self.STANDS}]))
+            self.assertEqual((only["aka"], only["where"], only["info"]), (None, self.STANDS, [self.STANDS]))
+
     def test_a_note_is_plain_text_on_one_line_of_at_most_sixty_characters(self):
         self.assertEqual(plants.parse_plants([{**RAW[0], "aka": "x" * 60}])[ENTITY]["info"], ["x" * 60])
         for bad in ("x" * 61, "", " ", " padded", "two  spaces", "line\nbreak", "Br\u00f8nd", 5, True, ["a"], {}):
@@ -462,14 +480,43 @@ class NoteTests(unittest.TestCase):
         self.assertEqual(bare["info"], ["Every 10 days", "Counting from 20.10"])
 
 
+class PhotoTests(unittest.TestCase):
+    def test_a_photo_is_a_key_of_lowercase_letters_digits_and_underscores(self):
+        for key in ("strelitzia", "snake_plant_moonshine", "peace_lily", "fern2", "2", "_", "a" * 60):
+            self.assertEqual(plants.parse_plants([{**RAW[0], "photo": key}])[ENTITY]["photo"], key, key)
+            self.assertEqual(plants.parse_timed([{**CAL[0], "photo": key}])["monstera"]["photo"], key, key)
+
+    def test_it_is_optional(self):
+        for cfg in (RAW[0], {**RAW[0], "photo": None}):
+            self.assertIsNone(plants.parse_plants([cfg])[ENTITY]["photo"])
+        for cfg in (CAL[0], {**CAL[0], "photo": None}):
+            self.assertIsNone(plants.parse_timed([cfg])["monstera"]["photo"])
+
+    def test_anything_else_fails_at_start_in_the_words_of_the_other_fields(self):
+        bad = ("", " ", "Strelitzia", "snake-plant", "snake plant", "peace.lily", "caf\u00e9", "fern\n", " fern",
+               "a" * 61, 5, True, False, ["fern"], {}, 0)
+        for key in bad:
+            for parse, cfg in ((plants.parse_plants, RAW[0]), (plants.parse_timed, CAL[0])):
+                with self.assertRaisesRegex(ValueError, r"^plant '[^']+': photo must be a key of lowercase letters",
+                                            msg=repr(key)):
+                    parse([{**cfg, "photo": key}])
+
+    def test_a_row_does_not_carry_the_photo(self):
+        plant = plants.parse_plants([{**RAW[0], "photo": "strelitzia"}])[ENTITY]
+        row, _ = row_of(feed([(T0, 12)], plant=plant), 12.0, plant)
+        self.assertNotIn("photo", row)
+        self.assertTrue(core.is_valid_row(row))
+
+
 class CalendarParseTests(unittest.TestCase):
     def test_a_calendar_plant_is_its_name_room_litres_and_interval(self):
         self.assertEqual(plants.parse_timed(CAL),
                          {"monstera": {"name": "Monstera", "slug": "monstera", "area": "kitchen", "water": 1.0,
-                                       "every_days": 10, "info": [], "feed": None}})
+                                       "every_days": 10, "info": [], "aka": None, "where": None, "photo": None,
+                                       "feed": None}})
         self.assertEqual(plants.parse_timed([{"name": "Aloe", "every_days": 35}])["aloe"],
                          {"name": "Aloe", "slug": "aloe", "area": None, "water": None, "every_days": 35, "info": [],
-                          "feed": None})
+                          "aka": None, "where": None, "photo": None, "feed": None})
 
     def test_each_kind_of_plant_is_found_in_a_mixed_list_in_the_order_of_the_lines(self):
         raw = [CAL[0], RAW[0], {"name": "Aloe", "every_days": 35}]
@@ -626,6 +673,164 @@ class CalendarRowTests(unittest.TestCase):
         found = maint.digest([(row["title"], key)], {})
         self.assertEqual((found["message"], found["keys"]), ("Water the Monstera: 1 L", [key]))
         self.assertIsNone(maint.digest([(row["title"], key)], {key: core.utc_iso(self.NOW + 11 * DAY)}))
+
+
+class RoundRowTests(unittest.TestCase):
+    """The one row for the plants due now: 18:00 on 31.10.2026 in the house."""
+
+    NOW = datetime(2026, 10, 31, 17, 0, tzinfo=timezone.utc)
+    NOTES = {"where": "Kitchen floor by the dock", "aka": "Big leaves with holes", "photo": "monstera"}
+
+    def sensor(self, name="Strelitzia", reading=12, conductivity=None, **cfg):
+        entity = f"sensor.{plants.slug(name)}_moisture"
+        [plant] = plants.parse_plants([{"moisture": entity, "name": name, "dry": 15, **cfg}]).values()
+        row, _ = plants.plant_row(entity, plant, {"since": core.utc_iso(self.NOW)}, float(reading), conductivity)
+        return row, plant, plants.soil_feeds(conductivity)
+
+    def calendar(self, name="Monstera", over=0, fed=1, **cfg):
+        """A calendar plant `over` days past its due day, last fed `fed` days ago (None: never)."""
+        [plant] = plants.parse_timed([{"name": name, "every_days": 10, **cfg}]).values()
+        anchor = {"at": core.utc_iso(self.NOW - (10 + over) * DAY)}
+        if fed is not None:
+            anchor["fed_at"] = core.utc_iso(self.NOW - fed * DAY)
+        row, _ = plants.timed_row(plant, anchor, self.NOW)
+        return row, plant, plants.feeds(plant, anchor, self.NOW)
+
+    def names(self, row):
+        return [record["name"] for record in row["plants"]]
+
+    def test_nothing_due_is_no_row(self):
+        self.assertIsNone(plants.round_row([]))
+        self.assertIsNone(plants.round_row(()))
+
+    def test_one_due_plant_gives_a_row_with_the_plants_own_title_and_one_record(self):
+        row = plants.round_row([self.sensor(water=3)])
+        self.assertEqual((row["id"], row["kind"], row["icon"], row["audience"], row["title"], row["detail"]),
+                         ("maint:plants", "maint", "mdi:watering-can-outline", "admin", "Water the Strelitzia: 3 L",
+                          "Strelitzia"))
+        self.assertEqual(row["plants"], [{"id": "maint:plant:strelitzia", "name": "Strelitzia", "amount": "3 L",
+                                          "detail": "soil 12%, water at 15%"}])
+        self.assertEqual(set(row), {"id", "kind", "icon", "title", "detail", "audience", "plants"})
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_the_plants_own_title_is_kept_whole_with_its_feed_or_its_cut_name(self):
+        row = plants.round_row([self.sensor(water=3, conductivity=90)])
+        self.assertEqual(row["title"], "Water the Strelitzia: 3 L + 3 tsp fertiliser")
+        name = "Monstera deliciosa variegata (the big one by the window)"
+        row = plants.round_row([self.sensor(name, water=0.5, conductivity=90)])
+        self.assertEqual(len(row["title"]), core.TEXT_MAX)
+        self.assertTrue(row["title"].endswith(": 0.5 L + 1/2 tsp feed"), row["title"])
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_several_due_plants_are_counted_in_the_title_and_named_in_the_detail(self):
+        row = plants.round_row([self.calendar("Monstera", area="kitchen", water=1), self.sensor(area="dining_room"),
+                                self.calendar("Alocasia", over=2, area="bathroom")])
+        self.assertEqual((row["title"], row["detail"]), ("Water 3 plants", "Monstera, Strelitzia, Alocasia"))
+        self.assertEqual(self.names(row), ["Monstera", "Strelitzia", "Alocasia"])
+        self.assertEqual(set(row), {"id", "kind", "icon", "title", "detail", "audience", "plants"})
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_the_row_has_no_time_no_lines_no_room_and_no_sheet(self):
+        row = plants.round_row([self.calendar(area="kitchen"), self.sensor(area="dining_room")])
+        for field in ("at", "items", "area", "info", "steps", "warn", "done", "next", "chip"):
+            self.assertNotIn(field, row)
+
+    def test_the_records_go_in_the_order_of_a_walk_through_the_flat_and_then_by_name(self):
+        self.assertEqual(plants.WALK, ("kitchen", "living_room", "dining_room", "hallway", "bedroom", "bathroom"))
+        spec = [("Bath", "bathroom"), ("Zzz", "guest_bathroom"), ("Bed", "bedroom"), ("Hall", "hallway"),
+                ("banana", "kitchen"), ("Dining", "dining_room"), ("Aaa", "office"), ("Living", "living_room"),
+                ("Cherry", "kitchen"), ("Nowhere", None), ("Apple", "kitchen")]
+        row = plants.round_row([self.calendar(name, area=area) for name, area in spec])
+        self.assertEqual(self.names(row), ["Apple", "banana", "Cherry", "Living", "Dining", "Hall", "Bed", "Bath",
+                                           "Aaa", "Nowhere", "Zzz"])
+        reverse = plants.round_row([self.calendar(name, area=area) for name, area in reversed(spec)])
+        self.assertEqual(reverse["plants"], row["plants"])
+        self.assertEqual(row["detail"], maint.fit_parts(self.names(row)))
+        self.assertTrue(row["detail"].startswith("Apple, banana, Cherry, Living, Dining"), row["detail"])
+
+    def test_a_record_has_the_plants_name_its_rows_id_and_its_rows_reason(self):
+        row = plants.round_row([self.calendar(area="kitchen", **self.NOTES),
+                                self.calendar("Fern", over=2, area="hallway")])
+        self.assertEqual(row["plants"][0], {"id": "maint:plant:monstera", "name": "Monstera", "detail": "due today",
+                                            "done": "tap", **self.NOTES})
+        self.assertEqual((row["plants"][1]["id"], row["plants"][1]["detail"]), ("maint:plant:fern", "due since 29.10"))
+
+    def test_a_calendar_plant_can_be_tapped_done_and_a_sensor_plant_cannot(self):
+        row = plants.round_row([self.calendar(area="kitchen"), self.sensor(area="dining_room")])
+        self.assertEqual([record.get("done") for record in row["plants"]], ["tap", None])
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_the_notes_and_the_photo_are_in_the_record_when_the_plant_has_them(self):
+        row = plants.round_row([self.sensor(**self.NOTES), self.sensor("Ivy", where="Top of the wine fridge"),
+                                self.sensor("Pothos")])
+        by_name = {record["name"]: record for record in row["plants"]}
+        self.assertEqual({key: by_name["Strelitzia"][key] for key in self.NOTES}, self.NOTES)
+        self.assertEqual({key for key in by_name["Ivy"] if key in self.NOTES}, {"where"})
+        self.assertEqual({key for key in by_name["Pothos"] if key in self.NOTES}, set())
+
+    def test_the_amount_is_the_part_of_the_title_after_the_name(self):
+        for water in (0.1, 0.3, 0.5, 1, 2.5, 3):
+            for conductivity in (None, 90):
+                row = plants.round_row([self.sensor(water=water, conductivity=conductivity)])
+                [record] = row["plants"]
+                self.assertEqual(row["title"], f"Water the Strelitzia: {record['amount']}", (water, conductivity))
+                self.assertEqual("fertiliser" in record["amount"], conductivity is not None)
+        self.assertEqual(plants.round_row([self.sensor(water=0.3, conductivity=90)])["plants"][0]["amount"],
+                         "0.3 L + 1/4 tsp fertiliser")
+        self.assertEqual(plants.round_row([self.calendar(water=1, fed=None)])["plants"][0]["amount"],
+                         "1 L + 1 tsp fertiliser")
+        self.assertEqual(plants.round_row([self.calendar(water=1, fed=1)])["plants"][0]["amount"], "1 L")
+
+    def test_a_long_name_does_not_shorten_the_amount_the_title_had_to_shorten(self):
+        name = "Monstera deliciosa variegata big"
+        row = plants.round_row([self.sensor(name, water=1, conductivity=90)])
+        self.assertTrue(row["title"].endswith("1 L + 1 tsp feed"), row["title"])
+        self.assertEqual(row["plants"][0]["amount"], "1 L + 1 tsp fertiliser")
+
+    def test_a_plant_without_an_amount_has_no_amount_even_when_it_is_due_for_feed(self):
+        sensor, calendar = self.sensor(conductivity=90), self.calendar("Aloe", fed=None)
+        self.assertEqual(sensor[0]["title"], "Water the Strelitzia + fertiliser")
+        self.assertEqual((sensor[2], calendar[2]), (True, True))
+        row = plants.round_row([sensor, calendar])
+        self.assertEqual(self.names(row), ["Aloe", "Strelitzia"])
+        self.assertFalse(any("amount" in record for record in row["plants"]))
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_every_text_goes_through_clean_text(self):
+        row = plants.round_row([self.calendar("Caf\u00e9  Palme", area="kitchen")])
+        self.assertEqual(row["plants"][0]["name"], "Caf Palme")
+        self.assertEqual(row["plants"][0]["id"], "maint:plant:cafe_palme")
+        long = plants.round_row([self.calendar("x" * 60, **self.NOTES), self.calendar("y" * 60)])
+        self.assertTrue(all(len(record["name"]) == core.TEXT_MAX for record in long["plants"]))
+        self.assertTrue(len(long["detail"]) <= core.TEXT_MAX)
+        self.assertTrue(core.is_valid_row(long))
+
+    def test_a_plant_with_a_long_name_still_has_its_whole_row_id_in_the_record(self):
+        name = "Monstera deliciosa variegata (the big one by the window)"
+        row = plants.round_row([self.calendar(name)])
+        self.assertEqual(row["plants"][0]["id"], "maint:plant:monstera_deliciosa_variegata_the_big_one_by_the_window")
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_the_detail_names_as_many_plants_as_fit(self):
+        due = [self.calendar(f"Plant number {i:02d}", area="kitchen") for i in range(12)]
+        row = plants.round_row(due)
+        self.assertEqual(row["title"], "Water 12 plants")
+        self.assertEqual(row["detail"], maint.fit_parts(self.names(row)))
+        self.assertLessEqual(len(row["detail"]), core.TEXT_MAX)
+        self.assertTrue(row["detail"].startswith("Plant number 00, Plant number 01"))
+
+    def test_the_list_is_capped_like_the_items_but_the_title_counts_every_plant(self):
+        due = [self.calendar(f"Plant {i:02d}", area="kitchen") for i in range(25)]
+        row = plants.round_row(due)
+        self.assertEqual(row["title"], "Water 25 plants")
+        self.assertEqual(self.names(row), [f"Plant {i:02d}" for i in range(core.ITEMS_MAX)])
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_the_rows_it_is_given_are_left_as_they_are(self):
+        due = [self.calendar(**self.NOTES), self.sensor(conductivity=90)]
+        before = copy.deepcopy(due)
+        plants.round_row(due)
+        self.assertEqual(due, before)
 
 
 class RiseTests(unittest.TestCase):

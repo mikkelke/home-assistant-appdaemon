@@ -1,11 +1,13 @@
-"""Watering reminders for sensor.house_upcoming: one row for each houseplant that needs water. Pure:
-each step takes the persisted state and returns new state.
+"""Watering reminders for sensor.house_upcoming: one row for the houseplants that need water now, and a row
+of its own for each calendar plant the day before. Pure: each step takes the persisted state and returns
+new state.
 
 A plant (the `plants` list in house_upcoming.yaml) has either a soil moisture sensor, `moisture`, or a
 calendar interval, `every_days`, never both, and optionally a `water` amount in litres. The row's title
 is "Water the <name>: <litres> L", and gives up name characters before it gives up the amount. A plant
 may also say what it looks like, `aka`, and where it stands, `where`: plain text of one line, which
-lead the info lines of the row's sheet.
+lead the info lines of the row's sheet and are in its record in `maint:plants`. Its `photo`, the key of
+its picture, is lowercase letters, digits and underscores, and goes in the record only.
 
 The title says to add liquid feed when the plant is due for it: "... + <tsp> tsp fertiliser", at one
 teaspoon a litre of water, to the nearest quarter. A sensor plant with a `conductivity` sensor is due for
@@ -16,13 +18,18 @@ never was. A succulent (`feed: summer`) is fed from March to September only, and
 FEED_EVERY_DAYS days. The anchor keeps `fed_at`, set by a Done that said to feed and carried over by one
 that did not; a seed counts as a feeding at the moment it is made.
 
-Every plant is also one line in the `items` of each untimed, due plant row, with `maint:plants` omitted while
-any such row is there. Otherwise `maint:plants` carries the lines and gives the next due day or says none due.
-Dated plant rows do not carry the list. The lines say when each plant is due (a sensor plant: its soil and
-its dry level) and when it was last watered, the plants due first, capped at ITEMS_MAX. A calendar plant was
-last watered at its anchor's time. A sensor plant was watered when its soil moisture rose RISE_POINTS or
-more within RISE_WINDOW and then stopped climbing for RISE_SETTLE; that moment is what `step_rise` finds,
-live and in the recorder's history.
+The plants that need water now, a dry sensor plant or a calendar plant on or past its due day, are one
+row, `maint:plants`, instead of a row each. Its title is that plant's own while one is due and "Water N
+plants" otherwise, its detail names them, and `plants` has a record for each: the id of the plant's own
+row, its name, the amount to pour, why it is due (the detail of that row), `where`, `aka` and `photo`, and
+`done` for a calendar plant, whose Done names that row id although no row has it. The records go in the
+order of a walk through the flat, WALK, then by name, capped at ITEMS_MAX. Every plant keeps its own push
+key and title in the daily push. A dated plant row stays a row of its own. While no plant is due,
+`maint:plants` has instead one line in `items` for every plant and gives the next due day or says none
+due. The lines say when each plant is due (a sensor plant: its soil and its dry level) and when it was last
+watered, the plants due first, capped at ITEMS_MAX. A calendar plant was last watered at its anchor's time.
+A sensor plant was watered when its soil moisture rose RISE_POINTS or more within RISE_WINDOW and then
+stopped climbing for RISE_SETTLE; that moment is what `step_rise` finds, live and in the recorder's history.
 
 A sensor plant is dry once its soil moisture reading, in percent, is at or under its `dry`, and stays dry
 until a reading is CLOSE_MARGIN above it: watering makes the reading jump, while a reading wandering
@@ -57,6 +64,7 @@ RISE_WINDOW = timedelta(minutes=30)
 RISE_SETTLE = timedelta(minutes=15)
 OVERVIEW_ID = "maint:plants"
 OVERVIEW_ICON = "mdi:sprout"
+WALK = ("kitchen", "living_room", "dining_room", "hallway", "bedroom", "bathroom")
 FEED_EVERY_DAYS = 28
 SUMMER_MONTHS = range(3, 10)
 
@@ -68,13 +76,24 @@ def slug(name):
 
 
 def _note(value, who, field):
-    """[value] for a note that is plain one-line ASCII text of at most TEXT_MAX characters, [] for none."""
+    """`value` for a note that is plain one-line ASCII text of at most TEXT_MAX characters, None for none."""
     if value is None:
-        return []
+        return None
     if not isinstance(value, str) or not value or clean_text(value) != value:
         raise ValueError(f"{who}: {field} must be plain text on one line of at most {TEXT_MAX} characters "
                          f"without accents, not {value!r}")
-    return [value]
+    return value
+
+
+def _photo(value, who):
+    """`value` for a picture key of lowercase letters, digits and underscores, at most TEXT_MAX characters,
+    None for none."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r"[a-z0-9_]+", value) or len(value) > TEXT_MAX:
+        raise ValueError(f"{who}: photo must be a key of lowercase letters, digits and underscores of at most "
+                         f"{TEXT_MAX} characters, not {value!r}")
+    return value
 
 
 def _parse(raw):
@@ -93,8 +112,10 @@ def _parse(raw):
         if key in slugs:
             raise ValueError(f"{who}: name listed twice")
         slugs.add(key)
-        info = _note(cfg.get("aka"), who, "aka") + _note(cfg.get("where"), who, "where")
-        plant = {"name": name, "slug": key, "area": cfg.get("area") or None, "water": litres, "info": info}
+        aka, where = _note(cfg.get("aka"), who, "aka"), _note(cfg.get("where"), who, "where")
+        photo = _photo(cfg.get("photo"), who)
+        plant = {"name": name, "slug": key, "area": cfg.get("area") or None, "water": litres,
+                 "info": [note for note in (aka, where) if note], "aka": aka, "where": where, "photo": photo}
         if entity is None:
             interval = reading(days)
             if interval is None or interval < 1 or interval != int(interval):
@@ -123,9 +144,9 @@ def parse_plants(raw):
     """The sensor plants of the `plants` list of house_upcoming.yaml, validated, as {moisture entity:
     plant}. Raises ValueError on a plant that has no name with letters or digits, does not have exactly
     one of `moisture` and `every_days`, has a `dry` that is not a number, a `water` that is given but not
-    a positive number, an `aka` or `where` that is not plain text, a `conductivity` or `feed` that does not
-    fit its kind, or lists an entity or name twice, so a typo fails at start instead of silently dropping
-    a plant."""
+    a positive number, an `aka` or `where` that is not plain text, a `photo` that is not a key of lowercase
+    letters, digits and underscores, a `conductivity` or `feed` that does not fit its kind, or lists an
+    entity or name twice, so a typo fails at start instead of silently dropping a plant."""
     return _parse(raw)[0]
 
 
@@ -166,18 +187,40 @@ def tsp_text(litres):
     return " ".join(filter(None, [str(whole) if whole else "", {1: "1/4", 2: "1/2", 3: "3/4"}.get(part, "")]))
 
 
+def _litres(plant):
+    """"<litres> L" without trailing zeros, "" for a plant without an amount."""
+    return f"{round(plant['water'], 2):g} L" if plant["water"] else ""
+
+
+def _dose(plant, word):
+    """" + <tsp> tsp <word>" for the feed at the plant's amount, " + <word>" for a plant without one."""
+    return f" + {tsp_text(plant['water'])} tsp {word}" if plant["water"] else f" + {word}"
+
+
+def _amount(plant, feed=False):
+    """What to pour: the litres, then " + <tsp> tsp fertiliser" when the plant is due for feed; "" for a plant
+    without an amount."""
+    litres = _litres(plant)
+    return litres + _dose(plant, "fertiliser") if litres and feed else litres
+
+
 def _title(plant, feed=False):
     """"Water the <name>", then ": <litres> L" when the plant has an amount, then " + <tsp> tsp fertiliser"
     when it is due for feed, or " + <tsp> tsp feed" if that is what fits. The name is cut to make room,
     never the amount or the dose."""
-    base, litres = clean_text(f"Water the {plant['name']}"), plant["water"]
-    amount = f": {round(litres, 2):g} L" if litres else ""
+    base, litres = clean_text(f"Water the {plant['name']}"), _litres(plant)
+    amount = f": {litres}" if litres else ""
     if feed:
-        dose = f" + {tsp_text(litres)} tsp" if litres else " +"
-        if len(base + amount + dose + " fertiliser") <= TEXT_MAX:
-            return base + amount + dose + " fertiliser"
-        amount += dose + " feed"
+        full = base + amount + _dose(plant, "fertiliser")
+        if len(full) <= TEXT_MAX:
+            return full
+        amount += _dose(plant, "feed")
     return clean_text(base, TEXT_MAX - len(amount)) + amount
+
+
+def soil_feeds(conductivity):
+    """Whether a sensor plant is due for feed at this `conductivity` reading; an unknown one says nothing."""
+    return conductivity is not None and conductivity < FEED_BELOW
 
 
 def plant_row(entity, plant, st, value, conductivity=None):
@@ -186,8 +229,7 @@ def plant_row(entity, plant, st, value, conductivity=None):
     st = st or {}
     if "since" not in st or value is None:
         return None
-    feed = conductivity is not None and conductivity < FEED_BELOW
-    row = make_row(ID_PREFIX + plant["slug"], "maint", _title(plant, feed),
+    row = make_row(ID_PREFIX + plant["slug"], "maint", _title(plant, soil_feeds(conductivity)),
                    f"soil {_percent(value)}, water at {_percent(plant['dry'])}", icon=ICON, area=plant["area"],
                    audience="admin", info=plant["info"])
     return row, f"plant:{entity}:{st['since']}"
@@ -327,6 +369,30 @@ def overview_row(sensor, timed, now):
     else:
         title, at, detail = "Plants: none due", None, f"{len(entries)} plants"
     return make_row(OVERVIEW_ID, "maint", title, detail, at=at, icon=OVERVIEW_ICON, audience="admin", items=lines)
+
+
+def _walk(plant):
+    area = plant["area"]
+    return WALK.index(area) if area in WALK else len(WALK), plant["name"].lower()
+
+
+def _entry(row, plant, feed):
+    """The record of one due plant: its row's id and detail, and its Done button if the row has one."""
+    return {"id": row["id"], "name": plant["name"], "amount": _amount(plant, feed), "detail": row.get("detail"),
+            "where": plant["where"], "aka": plant["aka"], "photo": plant["photo"], "done": row.get("done")}
+
+
+def round_row(due):
+    """The `maint:plants` row for the plants due now, None for none: `due` is [(row, plant, feed)], the untimed
+    row of each (from plant_row or timed_row), its plant and whether it is due for feed. The row stands in for
+    them: the title is the plant's own when one is due and "Water N plants" otherwise, the detail names them,
+    and `plants` has a record for each in the order of WALK, then by name."""
+    ordered = sorted(due, key=lambda item: _walk(item[1]))
+    if not ordered:
+        return None
+    title = ordered[0][0]["title"] if len(ordered) == 1 else f"Water {len(ordered)} plants"
+    return make_row(OVERVIEW_ID, "maint", title, fit_parts([plant["name"] for _, plant, _ in ordered]), icon=ICON,
+                    audience="admin", plants=[_entry(*item) for item in ordered])
 
 
 def timed_row(plant, anchor, now):

@@ -82,29 +82,30 @@ HouseUpcoming:
   # above dry. With every_days, a whole number, the plant has no sensor: it counts the days from the day
   # it was first seen or last tapped Done, shows a row from the day before that many have passed, is
   # due then and starts over with each Done. aka, what the plant looks like, and where, where it stands,
-  # are optional plain text of at most 60 characters, shown first in the row's sheet.
+  # are optional plain text of at most 60 characters, shown first in the row's sheet. photo (optional) is the
+  # key of the plant's picture in the dashboard: lowercase letters, digits and underscores.
   # The title adds "+ <tsp> tsp fertiliser" (one teaspoon a litre) when the plant is due for feed. With
   # moisture, conductivity (optional) is the sensor whose reading under 350 says so. With every_days, it
   # is every watering from March to September and otherwise after 28 days without; feed: summer (for
   # succulents) means from March to September only, and then at most every 28 days.
   plants:
-    - {moisture: sensor.strelitzia_moisture, name: Strelitzia, area: dining_room, dry: 15, water: 3, conductivity: sensor.strelitzia_conductivity, aka: "Bird of paradise, the big banana-leaf plant", where: "Floor by the facade, between kitchen and dining"}
-    - {moisture: sensor.philodendron_moisture, name: Philodendron, area: dining_room, dry: 20, water: 0.5, conductivity: sensor.philodendron_conductivity, aka: "Hanging plant, heart-shaped leaves", where: "Dining room, south-east corner"}
-    - {moisture: sensor.pothos_moisture, name: Pothos, area: living_room, dry: 15, water: 0.4, conductivity: sensor.pothos_conductivity, aka: "Hanging plant, white-speckled leaves", where: "Living room corner, above the sofa"}
-    - {moisture: sensor.ivy_moisture, name: Ivy, area: kitchen, dry: 20, water: 0.3, conductivity: sensor.ivy_conductivity, aka: "Small trailing ivy", where: "Top of the wine fridge"}
-    - {name: Monstera, area: kitchen, water: 1, every_days: 10, aka: "Big leaves with holes", where: "Kitchen floor by the Rober2 dock"}
-    - {name: Peace lily kitchen, area: kitchen, water: 0.4, every_days: 7, aka: "Small peace lily, droops when thirsty", where: "Coffee cart next to the xBloom"}
-    - {name: Peace lily TV, area: living_room, water: 1, every_days: 10, aka: "Large peace lily, droops when thirsty", where: "Living room floor under the TV"}
-    - {name: Fiddle leaf fig dining, area: dining_room, water: 1, every_days: 10, aka: "Tall plant, big violin-shaped leaves", where: "Below the family room thermostat"}
-    - {name: Fiddle leaf fig bedroom, area: bedroom, water: 1, every_days: 10, aka: "Tall plant, big violin-shaped leaves", where: "Bedroom corner by the bathroom door"}
-    - {name: Satin pothos, area: hallway, water: 0.2, every_days: 10, aka: "Small vine, silver-spotted leaves", where: "Top of the white wardrobe by the hallway"}
-    - {name: Snake plant dining, area: dining_room, water: 0.2, every_days: 35, feed: summer, aka: "Upright stiff leaves, pale green", where: "Stool under the right dining Sonos"}
-    - {name: Snake plant living, area: living_room, water: 0.2, every_days: 35, feed: summer, aka: "Upright stiff leaves, pale green", where: "Stool next to the bar cart"}
-    - {name: Snake plant bathroom, area: bathroom, water: 0.5, every_days: 35, feed: summer, aka: "Tall dark-green striped leaves", where: "Mikkel's bathroom, under the thermostat"}
-    - {name: Aloe, area: living_room, water: 0.3, every_days: 35, feed: summer, aka: "Spiky succulent with toothed leaves", where: "Top of the glass cabinet, living room"}
-    - {name: Alocasia, area: bathroom, water: 0.7, every_days: 7, aka: "Arrow-shaped dark leaves, white veins", where: "Mikkel's shower (mite cure)"}
-    - {name: Cactus, area: bathroom, water: 0.1, every_days: 42, feed: summer, aka: "Small column cactus", where: "Laundry cart in Mikkel's bathroom"}
-    - {name: Pineapple, area: bathroom, water: 0.1, every_days: 14, feed: summer, aka: "Pineapple top", where: "Laundry cart in Mikkel's bathroom"}
+    - {moisture: sensor.strelitzia_moisture, name: Strelitzia, area: dining_room, dry: 15, water: 3, conductivity: sensor.strelitzia_conductivity, aka: "Bird of paradise, the big banana-leaf plant", where: "Floor by the facade, between kitchen and dining", photo: strelitzia}
+    - {moisture: sensor.philodendron_moisture, name: Philodendron, area: dining_room, dry: 20, water: 0.5, conductivity: sensor.philodendron_conductivity, aka: "Hanging plant, heart-shaped leaves", where: "Dining room, south-east corner", photo: philodendron}
+    - {moisture: sensor.pothos_moisture, name: Pothos, area: living_room, dry: 15, water: 0.4, conductivity: sensor.pothos_conductivity, aka: "Hanging plant, white-speckled leaves", where: "Living room corner, above the sofa", photo: pothos}
+    - {moisture: sensor.ivy_moisture, name: Ivy, area: kitchen, dry: 20, water: 0.3, conductivity: sensor.ivy_conductivity, aka: "Small trailing ivy", where: "Top of the wine fridge", photo: ivy}
+    - {name: Monstera, area: kitchen, water: 1, every_days: 10, aka: "Big leaves with holes", where: "Kitchen floor by the Rober2 dock", photo: monstera}
+    - {name: Peace lily kitchen, area: kitchen, water: 0.4, every_days: 7, aka: "Small peace lily, droops when thirsty", where: "Coffee cart next to the xBloom", photo: peace_lily}
+    - {name: Peace lily TV, area: living_room, water: 1, every_days: 10, aka: "Large peace lily, droops when thirsty", where: "Living room floor under the TV", photo: peace_lily}
+    - {name: Fiddle leaf fig dining, area: dining_room, water: 1, every_days: 10, aka: "Tall plant, big violin-shaped leaves", where: "Below the family room thermostat", photo: fiddle_leaf_fig}
+    - {name: Fiddle leaf fig bedroom, area: bedroom, water: 1, every_days: 10, aka: "Tall plant, big violin-shaped leaves", where: "Bedroom corner by the bathroom door", photo: fiddle_leaf_fig}
+    - {name: Satin pothos, area: hallway, water: 0.2, every_days: 10, aka: "Small vine, silver-spotted leaves", where: "Top of the white wardrobe by the hallway", photo: satin_pothos}
+    - {name: Snake plant dining, area: dining_room, water: 0.2, every_days: 35, feed: summer, aka: "Upright stiff leaves, pale green", where: "Stool under the right dining Sonos", photo: snake_plant_moonshine}
+    - {name: Snake plant living, area: living_room, water: 0.2, every_days: 35, feed: summer, aka: "Upright stiff leaves, pale green", where: "Stool next to the bar cart", photo: snake_plant_moonshine}
+    - {name: Snake plant bathroom, area: bathroom, water: 0.5, every_days: 35, feed: summer, aka: "Tall dark-green striped leaves", where: "Mikkel's bathroom, under the thermostat", photo: snake_plant}
+    - {name: Aloe, area: living_room, water: 0.3, every_days: 35, feed: summer, aka: "Spiky succulent with toothed leaves", where: "Top of the glass cabinet, living room", photo: aloe}
+    - {name: Alocasia, area: bathroom, water: 0.7, every_days: 7, aka: "Arrow-shaped dark leaves, white veins", where: "Mikkel's shower (mite cure)", photo: alocasia}
+    - {name: Cactus, area: bathroom, water: 0.1, every_days: 42, feed: summer, aka: "Small column cactus", where: "Laundry cart in Mikkel's bathroom", photo: cactus}
+    - {name: Pineapple, area: bathroom, water: 0.1, every_days: 14, feed: summer, aka: "Pineapple top", where: "Laundry cart in Mikkel's bathroom", photo: pineapple}
 
   # One-off tasks: due is the day (yyyy-mm-dd), title is required, detail, area and icon are optional.
   # The row shows from the day before, timed at 09:00 on the day, then untimed until a Done tap, which

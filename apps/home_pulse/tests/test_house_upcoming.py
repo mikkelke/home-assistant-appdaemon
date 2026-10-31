@@ -2,7 +2,8 @@
 # house_upcoming.yaml: lease, state acquisition, restart behaviour, the daily push, rain fetches,
 # the drum clean's and the hygiene run's cheapest start, the run-based appliance tasks (the feedback
 # ledgers, the seed, Done and undo), the history job, replace-by days, Rober2's dated parts, the plants'
-# watering rows (by sensor and by the calendar), the one-off tasks and the battery inventory.
+# watering (by sensor and by the calendar, the dated rows and the one row for the plants due now), the
+# one-off tasks and the battery inventory.
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
 import asyncio
@@ -259,6 +260,11 @@ def plant_rows(app, among):
     """The rows of the plants in `among` (the dicts parse_plants or parse_timed gives, by value)."""
     ids = {f"maint:plant:{plant['slug']}" for plant in among}
     return {key: row for key, row in rows(app).items() if key in ids}
+
+
+def round_entries(app):
+    """The records of the watering round by plant id, {} while no plant is due."""
+    return {record["id"]: record for record in rows(app).get("maint:plants", {}).get("plants", [])}
 
 
 class PublishTests(unittest.TestCase):
@@ -1342,47 +1348,52 @@ class PlantTests(unittest.TestCase):
         app._on_push_time({})
         drain(app)
 
-    def test_the_sensor_is_a_listened_source_and_a_wet_plant_has_no_row(self):
+    def record(self, app):
+        return round_entries(app).get(self.ROW)
+
+    def test_the_sensor_is_a_listened_source_and_a_wet_plant_is_not_in_the_round(self):
         app = self.make()
         self.assertIn((MOISTURE, {"attribute": "all"}), app.listened)
-        self.assertNotIn(self.ROW, rows(app))
+        self.assertIsNone(self.record(app))
+        self.assertNotIn("plants", rows(app)["maint:plants"])
         self.assertNotIn("Plant moisture sensors HA does not have", " ".join(msg for _, msg in app.logs))
 
-    def test_a_dry_reading_opens_an_admin_row_in_the_plants_room(self):
+    def test_a_dry_reading_opens_the_round_as_an_admin_row_with_the_plant_in_it(self):
         app = self.make()
         fire(app, MOISTURE, full("12"))
-        row = rows(app)[self.ROW]
-        self.assertEqual((row["kind"], row["title"], row["detail"], row["icon"], row["area"], row["audience"]),
-                         ("maint", "Water the Strelitzia", "soil 12%, water at 15%", "mdi:watering-can-outline",
-                          "dining_room", "admin"))
-        self.assertEqual(set(row) & {"at", "next", "done", "info", "steps", "warn"}, set())
+        row = rows(app)["maint:plants"]
+        self.assertEqual((row["kind"], row["title"], row["detail"], row["icon"], row["audience"]),
+                         ("maint", "Water the Strelitzia", "Strelitzia", "mdi:watering-can-outline", "admin"))
+        self.assertEqual(set(row) & {"at", "next", "done", "info", "steps", "warn", "items", "area"}, set())
+        self.assertEqual(row["plants"], [{"id": self.ROW, "name": "Strelitzia", "detail": "soil 12%, water at 15%"}])
+        self.assertNotIn(self.ROW, rows(app))
         self.assertTrue(core.is_valid_row(row))
 
-    def test_the_row_closes_only_five_points_above_dry(self):
+    def test_the_plant_leaves_the_round_only_five_points_above_dry(self):
         app = self.make()
         for state, detail in (("15", "soil 15%"), ("16", "soil 16%"), ("19", "soil 19%"), ("12", "soil 12%"),
                               ("17", "soil 17%")):
             fire(app, MOISTURE, full(state))
-            self.assertEqual(rows(app)[self.ROW]["detail"], f"{detail}, water at 15%", state)
+            self.assertEqual(self.record(app)["detail"], f"{detail}, water at 15%", state)
         for state, shown in (("20", False), ("16", False), ("15", True), ("20", False), ("100", False)):
             fire(app, MOISTURE, full(state))
-            self.assertEqual(self.ROW in rows(app), shown, state)
+            self.assertEqual(self.record(app) is not None, shown, state)
 
-    def test_an_unreadable_reading_changes_nothing_and_has_no_row(self):
+    def test_an_unreadable_reading_changes_nothing_and_leaves_the_plant_out_of_the_round(self):
         app = self.make()
         for state in self.UNREADABLE:
             fire(app, MOISTURE, full(state))
-            self.assertNotIn(self.ROW, rows(app), state)
+            self.assertIsNone(self.record(app), state)
             self.assertEqual(app._plant_latches[MOISTURE], {}, state)
         fire(app, MOISTURE, full("12"))
         latch = dict(app._plant_latches[MOISTURE])
         self.assertEqual(list(latch), ["since"])
         for state in self.UNREADABLE:
             fire(app, MOISTURE, full(state))
-            self.assertNotIn(self.ROW, rows(app), state)
+            self.assertIsNone(self.record(app), state)
             self.assertEqual(app._plant_latches[MOISTURE], latch, state)
         fire(app, MOISTURE, full("17"))
-        self.assertEqual(rows(app)[self.ROW]["detail"], "soil 17%, water at 15%")
+        self.assertEqual(self.record(app)["detail"], "soil 17%, water at 15%")
 
     def test_the_latch_is_saved_with_the_rest_and_a_reload_does_not_push_again(self):
         app = self.make()
@@ -1394,7 +1405,7 @@ class PlantTests(unittest.TestCase):
         self.assertIn(f"plant:{MOISTURE}:{core.utc_iso(NOW)}", saved["pushed"])
         reloaded = self.make(app.states, state_dir=app.state_dir, now=app.now)
         self.assertEqual(reloaded._plant_latches, app._plant_latches)
-        self.assertEqual(rows(reloaded)[self.ROW], rows(app)[self.ROW])
+        self.assertEqual(rows(reloaded)["maint:plants"], rows(app)["maint:plants"])
         self.push(reloaded)
         self.assertEqual(reloaded.notifier.sent, [])
 
@@ -1405,9 +1416,9 @@ class PlantTests(unittest.TestCase):
         tick(app, MIN)
         app.states[MOISTURE] = full("unavailable")
         reloaded = self.make(app.states, state_dir=app.state_dir, now=app.now)
-        self.assertNotIn(self.ROW, rows(reloaded))
+        self.assertIsNone(self.record(reloaded))
         fire(reloaded, MOISTURE, full("13"))
-        self.assertEqual(rows(reloaded)[self.ROW]["detail"], "soil 13%, water at 15%")
+        self.assertEqual(self.record(reloaded)["detail"], "soil 13%, water at 15%")
         self.push(reloaded)
         self.assertEqual(reloaded.notifier.sent, [])
 
@@ -1417,7 +1428,7 @@ class PlantTests(unittest.TestCase):
         tick(app, MIN)
         app.states[MOISTURE] = full("40")
         reloaded = self.make(app.states, state_dir=app.state_dir, now=app.now)
-        self.assertNotIn(self.ROW, rows(reloaded))
+        self.assertIsNone(self.record(reloaded))
         self.assertEqual(reloaded._plant_latches, {MOISTURE: {}})
 
     def test_a_saved_latch_for_a_plant_no_longer_listed_is_dropped(self):
@@ -1426,7 +1437,7 @@ class PlantTests(unittest.TestCase):
         tick(app, MIN)
         self.assertIn("since", state_file(app)["plants"][MOISTURE])
         reloaded = self.make(app.states, state_dir=app.state_dir, now=app.now, plants=[])
-        self.assertNotIn(self.ROW, rows(reloaded))
+        self.assertNotIn("maint:plants", rows(reloaded))
         self.assertEqual(reloaded._plant_latches, {})
 
     def test_pushed_once_an_episode_and_again_once_it_was_watered_and_dried_out(self):
@@ -1443,11 +1454,12 @@ class PlantTests(unittest.TestCase):
         self.push(app)
         self.assertEqual([s["message"] for s in app.notifier.sent], ["Water the Strelitzia"] * 2)
 
-    def test_the_amount_to_pour_is_in_the_title_and_the_push_but_not_the_detail(self):
+    def test_the_amount_to_pour_is_in_the_title_the_record_and_the_push_but_not_the_detail(self):
         poured = {**SAMPLE_PLANT, "water": 3}
         app = self.make(self.states("12"), plants=[poured])
-        row = rows(app)[self.ROW]
-        self.assertEqual((row["title"], row["detail"]), ("Water the Strelitzia: 3 L", "soil 12%, water at 15%"))
+        row = rows(app)["maint:plants"]
+        self.assertEqual((row["title"], row["detail"]), ("Water the Strelitzia: 3 L", "Strelitzia"))
+        self.assertEqual((self.record(app)["amount"], self.record(app)["detail"]), ("3 L", "soil 12%, water at 15%"))
         self.assertTrue(core.is_valid_row(row))
         self.push(app)
         self.assertEqual([s["message"] for s in app.notifier.sent], ["Water the Strelitzia: 3 L"])
@@ -1466,15 +1478,18 @@ class PlantTests(unittest.TestCase):
         states = self.states()
         states["sensor.fern_moisture"] = full("28")
         app = self.make(states, plants=[SAMPLE_PLANT, fern, ficus])
-        shown = rows(app)
-        self.assertEqual((shown["maint:plant:boston_fern"]["detail"], shown["maint:plant:boston_fern"]["area"]),
-                         ("soil 28%, water at 30%", "kitchen"))
-        self.assertNotIn(self.ROW, shown)
-        self.assertNotIn("maint:plant:ficus", shown)
+        shown = round_entries(app)
+        self.assertEqual(shown, {"maint:plant:boston_fern": {"id": "maint:plant:boston_fern", "name": "Boston fern",
+                                                             "detail": "soil 28%, water at 30%"}})
+        self.assertEqual(rows(app)["maint:plants"]["title"], "Water the Boston fern")
         self.assertIn(("sensor.fern_moisture", {"attribute": "all"}), app.listened)
         self.assertIn(("WARNING", "Plant moisture sensors HA does not have: sensor.ficus_moistur"), app.logs)
         fire(app, "sensor.fern_moisture", full("40"))
-        self.assertNotIn("maint:plant:boston_fern", rows(app))
+        self.assertEqual(round_entries(app), {})
+        fire(app, "sensor.fern_moisture", full("20"))
+        fire(app, MOISTURE, full("10"))
+        self.assertEqual(list(round_entries(app)), ["maint:plant:boston_fern", self.ROW])
+        self.assertEqual(rows(app)["maint:plants"]["title"], "Water 2 plants")
 
     def test_a_low_conductivity_adds_the_feed_to_the_title_and_the_push_while_it_lasts(self):
         ec = "sensor.strelitzia_conductivity"
@@ -1483,25 +1498,28 @@ class PlantTests(unittest.TestCase):
         states[ec] = full("90")
         app = self.make(states, plants=[fed])
         self.assertIn((ec, {"attribute": "all"}), app.listened)
-        self.assertEqual(rows(app)[self.ROW]["title"], "Water the Strelitzia: 3 L + 3 tsp fertiliser")
+        self.assertEqual(rows(app)["maint:plants"]["title"], "Water the Strelitzia: 3 L + 3 tsp fertiliser")
+        self.assertEqual(self.record(app)["amount"], "3 L + 3 tsp fertiliser")
         self.push(app)
         self.assertEqual([s["message"] for s in app.notifier.sent], ["Water the Strelitzia: 3 L + 3 tsp fertiliser"])
         plain, with_feed = "Water the Strelitzia: 3 L", "Water the Strelitzia: 3 L + 3 tsp fertiliser"
         steps = (("350", plain), ("349", with_feed), ("unavailable", plain), ("0", with_feed), ("807", plain))
         for state, title in steps:
             fire(app, ec, full(state))
-            self.assertEqual(rows(app)[self.ROW]["title"], title, state)
+            self.assertEqual(rows(app)["maint:plants"]["title"], title, state)
+            self.assertEqual(self.record(app)["amount"], title.split(": ")[1], state)
 
     def test_a_conductivity_that_cannot_be_read_says_nothing_and_a_sensor_ha_does_not_have_is_named(self):
         fed = {**SAMPLE_PLANT, "water": 3, "conductivity": "sensor.ec_typo"}
         app = self.make(self.states("12"), plants=[fed])
-        self.assertEqual(rows(app)[self.ROW]["title"], "Water the Strelitzia: 3 L")
+        self.assertEqual(rows(app)["maint:plants"]["title"], "Water the Strelitzia: 3 L")
         self.assertIn(("WARNING", "Plant conductivity sensors HA does not have: sensor.ec_typo"), app.logs)
         self.assertNotIn("Plant moisture sensors HA does not have", " ".join(msg for _, msg in app.logs))
 
     def test_a_plant_without_a_conductivity_sensor_never_says_feed(self):
         app = self.make(self.states("12"), plants=[{**SAMPLE_PLANT, "water": 3}])
-        self.assertEqual(rows(app)[self.ROW]["title"], "Water the Strelitzia: 3 L")
+        self.assertEqual(rows(app)["maint:plants"]["title"], "Water the Strelitzia: 3 L")
+        self.assertEqual(self.record(app)["amount"], "3 L")
 
     def test_a_watering_seen_in_the_soil_is_told_to_the_feed_once_it_has_settled_and_is_remembered(self):
         app = self.make(self.states("12"))
@@ -1577,43 +1595,59 @@ class PlantTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.make(plants=[{**SAMPLE_PLANT, "dry": "wet"}])
 
-    def test_every_plant_the_yaml_lists_is_listened_to_and_has_its_own_row_that_opens_dry_and_closes_above(self):
+    def test_every_plant_the_yaml_lists_is_listened_to_and_has_its_own_record_that_opens_dry_and_closes_above(self):
         self.assertIsInstance(CONFIG["plants"], list)
         self.assertEqual(len(PLANTS) + len(TIMED), len(CONFIG["plants"]))
         app = make_app(plants=CONFIG["plants"])
-        self.assertEqual(plant_rows(app, PLANTS.values()), {})
+        self.assertEqual(round_entries(app), {})
         self.assertNotIn("Plant moisture sensors HA does not have", " ".join(msg for _, msg in app.logs))
-        for entity, plant in PLANTS.items():
+        for count, (entity, plant) in enumerate(PLANTS.items(), 1):
             self.assertIn((entity, {"attribute": "all"}), app.listened)
             self.assertIn(plant["area"], AREAS, entity)
             self.assertEqual(core.clean_text(plant["name"]), plant["name"], entity)
             dry = f"{plant['dry']:g}"
-            title = f"Water the {plant['name']}" + (f": {plant['water']:g} L" if plant["water"] else "")
+            amount = f"{plant['water']:g} L" if plant["water"] else None
             fire(app, entity, full(dry))
-            row = plant_rows(app, PLANTS.values())[f"maint:plant:{plant['slug']}"]
-            self.assertEqual((row["title"], row["detail"], row.get("area")),
-                             (title, f"soil {dry}%, water at {dry}%", plant["area"]), entity)
-            self.assertEqual(row.get("info"), plant["info"] or None, entity)
-            self.assertTrue(core.is_valid_row(row), entity)
+            self.assertEqual(len(round_entries(app)), count, entity)
+            record = round_entries(app)[f"maint:plant:{plant['slug']}"]
+            self.assertEqual((record["name"], record.get("amount"), record["detail"]),
+                             (plant["name"], amount, f"soil {dry}%, water at {dry}%"), entity)
+            self.assertEqual((record.get("where"), record.get("aka"), record.get("photo")),
+                             (plant["where"], plant["aka"], plant["photo"]), entity)
+            self.assertNotIn("done", record, entity)
+            self.assertTrue(core.is_valid_row(rows(app)["maint:plants"]), entity)
             if plant["conductivity"]:
                 self.assertIn((plant["conductivity"], {"attribute": "all"}), app.listened, entity)
                 fire(app, plant["conductivity"], full("100"))
-                fed = plant_rows(app, PLANTS.values())[f"maint:plant:{plant['slug']}"]["title"]
-                self.assertEqual(fed, f"{title} + {plants.tsp_text(plant['water'])} tsp fertiliser", entity)
+                fed = round_entries(app)[f"maint:plant:{plant['slug']}"]["amount"]
+                self.assertEqual(fed, f"{amount} + {plants.tsp_text(plant['water'])} tsp fertiliser", entity)
                 fire(app, plant["conductivity"], full("800"))
-                plain = plant_rows(app, PLANTS.values())[f"maint:plant:{plant['slug']}"]["title"]
-                self.assertEqual(plain, title, entity)
-        self.assertEqual(len(plant_rows(app, PLANTS.values())), len(PLANTS))
+                self.assertEqual(round_entries(app)[f"maint:plant:{plant['slug']}"]["amount"], amount, entity)
+        self.assertEqual(len(round_entries(app)), len(PLANTS))
+        self.assertEqual(rows(app)["maint:plants"]["title"], f"Water {len(PLANTS)} plants")
         for entity, plant in PLANTS.items():
             fire(app, entity, full(f"{plant['dry'] + plants.CLOSE_MARGIN:g}"))
-        self.assertEqual(plant_rows(app, PLANTS.values()), {})
+        self.assertEqual(round_entries(app), {})
+
+    def test_every_plant_the_yaml_lists_has_a_photo_key_and_it_reaches_the_record(self):
+        everyone = [*PLANTS.values(), *TIMED.values()]
+        self.assertEqual(len(everyone), len(CONFIG["plants"]))
+        app = make_app(plants=CONFIG["plants"])
+        tick(app, 60 * DAY)
+        for entity, plant in PLANTS.items():
+            fire(app, entity, full(f"{plant['dry']:g}"))
+        records = round_entries(app)
+        self.assertEqual(len(records), len(everyone))
+        for plant in everyone:
+            self.assertRegex(plant["photo"], r"^[a-z0-9_]+$", plant["name"])
+            self.assertEqual(records[f"maint:plant:{plant['slug']}"]["photo"], plant["photo"], plant["name"])
 
 
 class TimedPlantTests(unittest.TestCase):
     """Houseplants watered by the calendar: a tapped task counted in days, seeded at first sight, without a
-    row until the day before it is due, then dated, then untimed and pushed once; Done starts over and undo
-    takes it back. The behaviour tests run on SAMPLE_TIMED whatever the yaml lists, and the last two run
-    every plant it lists."""
+    row until the day before it is due, then dated, then a record in the round of the plants due, pushed
+    once; Done starts over and undo takes it back. The behaviour tests run on SAMPLE_TIMED whatever the yaml
+    lists, and the last two run every plant it lists."""
 
     ROW = "maint:plant:monstera"
     KEY = "plant:monstera"
@@ -1631,6 +1665,9 @@ class TimedPlantTests(unittest.TestCase):
 
     def undo(self, app, row=ROW):
         app._on_undo("house_upcoming_undo", {"row": row}, {})
+
+    def record(self, app, row=ROW):
+        return round_entries(app).get(row)
 
     def test_the_plant_is_seeded_at_first_sight_and_has_no_row_until_the_day_before_it_is_due(self):
         app = self.make()
@@ -1664,14 +1701,17 @@ class TimedPlantTests(unittest.TestCase):
         self.push(app)
         self.assertEqual(app.notifier.sent, [])
         tick(app, DAY)
-        row = rows(app)[self.ROW]
-        self.assertEqual(row["detail"], "due today")
+        self.assertNotIn(self.ROW, rows(app))
+        row = rows(app)["maint:plants"]
+        self.assertEqual((row["title"], row["detail"]), ("Water the Monstera: 1 L", "Monstera"))
         self.assertNotIn("at", row)
+        self.assertEqual(self.record(app), {"id": self.ROW, "name": "Monstera", "amount": "1 L", "detail": "due today",
+                                            "done": "tap"})
         self.push(app)
         self.assertEqual([(s["title"], s["message"]) for s in app.notifier.sent],
                          [("Maintenance due", "Water the Monstera: 1 L")])
         tick(app, 2 * DAY)
-        self.assertEqual(rows(app)[self.ROW]["detail"], "due since 24.10")
+        self.assertEqual(self.record(app)["detail"], "due since 24.10")
         self.push(app)
         self.assertEqual(len(app.notifier.sent), 1)
 
@@ -1680,9 +1720,11 @@ class TimedPlantTests(unittest.TestCase):
         tick(app, 11 * DAY)
         seed = state_file(app)["done"][self.KEY]
         published = len(app.published)
+        self.assertIsNotNone(self.record(app))
         self.done(app)
         self.assertEqual(len(app.published), published + 1)
         self.assertNotIn(self.ROW, rows(app))
+        self.assertIsNone(self.record(app))
         self.assertEqual(state_file(app)["done"][self.KEY],
                          {"at": core.utc_iso(app.now), "prev": seed, "fed_at": seed["at"]})
         self.assertEqual(done_log(app), [{"event": "done", "row": self.ROW, "at": core.utc_iso(app.now)}])
@@ -1777,14 +1819,15 @@ class TimedPlantTests(unittest.TestCase):
         self.assertEqual(rows(app)[self.ROW]["title"], "Water the Monstera: 1 L")
         self.undo(app)
         self.assertEqual(state_file(app)["done"][self.KEY], before)
-        self.assertEqual(rows(app)[self.ROW]["title"], "Water the Monstera: 1 L + 1 tsp fertiliser")
+        self.assertEqual(rows(app)["maint:plants"]["title"], "Water the Monstera: 1 L + 1 tsp fertiliser")
+        self.assertEqual(self.record(app)["amount"], "1 L + 1 tsp fertiliser")
 
     def test_a_done_is_told_to_the_feed_and_the_overview_and_undo_takes_both_back(self):
         app = self.make()
         self.assertEqual(rows(app)["maint:plants"]["items"], ["Monstera: 24.10, watered 14.10"])
         tick(app, 10 * DAY)
-        self.assertNotIn("maint:plants", rows(app))
-        self.assertEqual(rows(app)[self.ROW]["items"], ["Monstera: due 24.10, watered 14.10"])
+        self.assertNotIn("items", rows(app)["maint:plants"])
+        self.assertEqual(self.record(app)["detail"], "due today")
         self.done(app)
         self.assertEqual(app.reports, [("house_events_report", {"text": "Watered Monstera",
                                                                 "icon": "mdi:watering-can-outline",
@@ -1794,8 +1837,8 @@ class TimedPlantTests(unittest.TestCase):
                          ("Plants: next 03.11", ["Monstera: 03.11, watered 24.10"]))
         self.undo(app)
         self.assertEqual(app.reports[-1][1]["text"], "Watering of Monstera taken back")
-        self.assertNotIn("maint:plants", rows(app))
-        self.assertEqual(rows(app)[self.ROW]["items"], ["Monstera: due 24.10, watered 14.10"])
+        self.assertNotIn("items", rows(app)["maint:plants"])
+        self.assertEqual(self.record(app)["detail"], "due today")
         self.assertEqual(len(app.reports), 2)
 
     def test_from_march_to_september_every_watering_comes_with_feed(self):
@@ -1815,11 +1858,15 @@ class TimedPlantTests(unittest.TestCase):
         tick(winter, 34 * DAY)
         self.assertEqual(rows(winter)["maint:plant:cactus"]["title"], "Water the Cactus: 0.1 L")
         tick(winter, 40 * DAY)
-        self.assertEqual(rows(winter)["maint:plant:cactus"]["title"], "Water the Cactus: 0.1 L")
+        self.assertEqual(rows(winter)["maint:plants"]["title"], "Water the Cactus: 0.1 L")
+        self.assertEqual(self.record(winter, "maint:plant:cactus")["amount"], "0.1 L")
         june = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
         summer = self.make(plants=[cactus], now=june)
         tick(summer, 34 * DAY)
         self.assertEqual(rows(summer)["maint:plant:cactus"]["title"], "Water the Cactus: 0.1 L + 1/4 tsp fertiliser")
+        tick(summer, DAY)
+        self.assertEqual(rows(summer)["maint:plants"]["title"], "Water the Cactus: 0.1 L + 1/4 tsp fertiliser")
+        self.assertEqual(self.record(summer, "maint:plant:cactus")["amount"], "0.1 L + 1/4 tsp fertiliser")
         soon = self.make(plants=[{**cactus, "every_days": 14}], now=june)
         tick(soon, 13 * DAY)
         self.assertEqual(rows(soon)["maint:plant:cactus"]["title"], "Water the Cactus: 0.1 L")
@@ -1842,19 +1889,21 @@ class TimedPlantTests(unittest.TestCase):
     def test_every_plant_the_yaml_lists_for_the_calendar_is_seeded_now_and_shows_from_the_day_before_it_is_due(self):
         self.assertTrue(TIMED)
         app = make_app(plants=CONFIG["plants"])
-        self.assertEqual(plant_rows(app, TIMED.values()), {})
+        self.assertEqual((plant_rows(app, TIMED.values()), round_entries(app)), ({}, {}))
         for plant in TIMED.values():
             self.assertEqual(state_file(app)["done"][f"plant:{plant['slug']}"], {"at": core.utc_iso(NOW), "seed": True})
         elapsed = 0
         for days in sorted({plant["every_days"] for plant in TIMED.values()}):
             tick(app, (days - 1 - elapsed) * DAY)
             elapsed = days - 1
-            shown = plant_rows(app, TIMED.values())
-            visible = [plant for plant in TIMED.values() if plant["every_days"] - 1 <= elapsed]
-            self.assertEqual(set(shown), {f"maint:plant:{plant['slug']}" for plant in visible}, days)
-            for plant in visible:
-                row, left = shown[f"maint:plant:{plant['slug']}"], plant["every_days"] - elapsed
-                due = date(2026, 10, 14) + timedelta(days=plant["every_days"])
+            shown, round_ = plant_rows(app, TIMED.values()), round_entries(app)
+            coming = [plant for plant in TIMED.values() if plant["every_days"] == days]
+            due = [plant for plant in TIMED.values() if plant["every_days"] < days]
+            self.assertEqual(set(shown), {f"maint:plant:{plant['slug']}" for plant in coming}, days)
+            self.assertEqual(set(round_), {f"maint:plant:{plant['slug']}" for plant in due}, days)
+            for plant in coming:
+                row = shown[f"maint:plant:{plant['slug']}"]
+                day = date(2026, 10, 14) + timedelta(days=plant["every_days"])
                 title = f"Water the {plant['name']}" + (f": {plant['water']:g} L" if plant["water"] else "")
                 self.assertTrue(row["title"].startswith(title), (row["title"], title))
                 fed = row["title"] != title
@@ -1863,8 +1912,8 @@ class TimedPlantTests(unittest.TestCase):
                     self.assertEqual(row["title"], f"{title} + {plants.tsp_text(plant['water'])} tsp fertiliser")
                 self.assertEqual((row["kind"], row["audience"], row["done"], row.get("area")),
                                  ("maint", "admin", "tap", plant["area"]), plant["name"])
-                nine = core.utc_iso(datetime.combine(due, maint.DUE_TIME, maint.HOUSE_TZ))
-                self.assertEqual(row.get("at"), nine if left > 0 else None, plant["name"])
+                nine = core.utc_iso(datetime.combine(day, maint.DUE_TIME, maint.HOUSE_TZ))
+                self.assertEqual(row.get("at"), nine, plant["name"])
                 notes = plant["info"]
                 self.assertEqual(row["info"][:len(notes)], notes, plant["name"])
                 self.assertEqual(row["info"][len(notes):][0], f"Every {plant['every_days']} days", plant["name"])
@@ -1872,19 +1921,72 @@ class TimedPlantTests(unittest.TestCase):
                 self.assertIn(plant["area"], AREAS, plant["name"])
                 self.assertEqual(core.clean_text(plant["name"]), plant["name"])
                 self.assertTrue(core.is_valid_row(row), plant["name"])
+            for plant in due:
+                record = round_[f"maint:plant:{plant['slug']}"]
+                day = date(2026, 10, 14) + timedelta(days=plant["every_days"])
+                plain = f"{plant['water']:g} L" if plant["water"] else None
+                fed = record.get("amount") != plain
+                self.assertEqual(fed, elapsed >= plants.FEED_EVERY_DAYS and plant["feed"] is None, plant["name"])
+                if fed:
+                    self.assertEqual(record["amount"], f"{plain} + {plants.tsp_text(plant['water'])} tsp fertiliser")
+                self.assertEqual(record["detail"], "due today" if plant["every_days"] == elapsed
+                                 else f"due since {day:%d.%m}", plant["name"])
+                self.assertEqual((record["name"], record["done"], record.get("where"), record.get("aka")),
+                                 (plant["name"], "tap", plant["where"], plant["aka"]), plant["name"])
+            if due:
+                self.assertEqual(rows(app)["maint:plants"]["title"], f"Water {len(due)} plants")
+                self.assertTrue(core.is_valid_row(rows(app)["maint:plants"]), days)
 
-    def test_a_done_on_each_plant_the_yaml_lists_is_logged_and_takes_only_that_row_away(self):
+    def test_a_done_on_each_plant_the_yaml_lists_is_logged_and_takes_only_that_record_away(self):
         app = make_app(plants=CONFIG["plants"], ledgers=self.NO_LEDGERS)
         tick(app, 60 * DAY)
-        self.assertEqual(len(plant_rows(app, TIMED.values())), len(TIMED))
-        for count, plant in enumerate(TIMED.values(), 1):
-            row_id = f"maint:plant:{plant['slug']}"
-            self.done(app, row_id)
-            self.assertNotIn(row_id, rows(app), plant["name"])
-            self.assertEqual(len(done_log(app)), count)
-            self.assertEqual(len(plant_rows(app, TIMED.values())), len(TIMED) - count)
         ids = [f"maint:plant:{plant['slug']}" for plant in TIMED.values()]
+        self.assertEqual(set(round_entries(app)), set(ids))
+        self.assertEqual(plant_rows(app, TIMED.values()), {})
+        for count, (plant, row_id) in enumerate(zip(TIMED.values(), ids), 1):
+            self.done(app, row_id)
+            self.assertNotIn(row_id, round_entries(app), plant["name"])
+            self.assertEqual(len(done_log(app)), count)
+            self.assertEqual(len(round_entries(app)), len(TIMED) - count)
         self.assertEqual([entry["row"] for entry in done_log(app)], ids)
+
+    def test_a_done_and_an_undo_find_a_plant_by_the_id_in_its_record_though_no_row_has_that_id(self):
+        states = base_states()
+        states[MOISTURE] = full("12")
+        app = self.make(states=states, plants=[SAMPLE_TIMED, {**SAMPLE_TIMED, "name": "Aloe"}, SAMPLE_PLANT])
+        tick(app, 10 * DAY)
+        records = round_entries(app)
+        self.assertEqual(list(records), ["maint:plant:aloe", self.ROW, "maint:plant:strelitzia"])
+        self.assertEqual({record_id: record.get("done") for record_id, record in records.items()},
+                         {self.ROW: "tap", "maint:plant:aloe": "tap", "maint:plant:strelitzia": None})
+        self.assertFalse(set(records) & set(rows(app)))
+        seed = state_file(app)["done"][self.KEY]
+        self.done(app, records[self.ROW]["id"])
+        self.assertEqual(list(round_entries(app)), ["maint:plant:aloe", "maint:plant:strelitzia"])
+        self.assertEqual(rows(app)["maint:plants"]["title"], "Water 2 plants")
+        self.assertEqual(state_file(app)["done"][self.KEY],
+                         {"at": core.utc_iso(app.now), "prev": seed, "fed_at": seed["at"]})
+        self.assertEqual(done_log(app), [{"event": "done", "row": self.ROW, "at": core.utc_iso(app.now)}])
+        self.assertIn(("INFO", "Done: water the Monstera"), app.logs)
+        self.assertEqual(state_file(app)["done"]["plant:aloe"], {"at": core.utc_iso(NOW), "seed": True})
+        self.undo(app, records[self.ROW]["id"])
+        self.assertEqual(list(round_entries(app)), ["maint:plant:aloe", self.ROW, "maint:plant:strelitzia"])
+        self.assertEqual(state_file(app)["done"][self.KEY], seed)
+        self.assertEqual([entry["event"] for entry in done_log(app)], ["done", "undo"])
+        self.assertEqual(app.reports[-1][1]["text"], "Watering of Monstera taken back")
+
+    def test_a_sensor_plants_record_has_no_done_and_a_done_on_its_id_changes_nothing(self):
+        states = base_states()
+        states[MOISTURE] = full("12")
+        app = self.make(states=states, plants=[SAMPLE_PLANT])
+        self.assertEqual(list(round_entries(app)), ["maint:plant:strelitzia"])
+        self.assertNotIn("done", round_entries(app)["maint:plant:strelitzia"])
+        before, published = state_file(app), len(app.published)
+        self.done(app, "maint:plant:strelitzia")
+        self.undo(app, "maint:plant:strelitzia")
+        self.assertEqual((state_file(app)["done"], len(app.published), done_log(app)), (before["done"], published, []))
+        self.assertEqual(list(round_entries(app)), ["maint:plant:strelitzia"])
+        self.assertTrue(any(level == "WARNING" and msg.startswith("Done ignored") for level, msg in app.logs))
 
 
 class PlantOverviewTests(unittest.TestCase):
@@ -1917,63 +2019,95 @@ class PlantOverviewTests(unittest.TestCase):
         self.assertIn(self.ROW, rows(app))
         self.assertLessEqual(len(rows(app)), core.MAX_ROWS)
 
-    def test_each_due_row_carries_the_list_and_its_info_instead_of_the_overview(self):
+    def test_the_plants_due_are_one_row_that_replaces_the_overview_and_a_row_each(self):
         states = base_states()
         states[MOISTURE] = full("12")
-        sensor = {**SAMPLE_PLANT, "aka": "Bird of paradise", "where": "By the window"}
-        timed = {**SAMPLE_TIMED, "aka": "Split leaves", "where": "On the shelf"}
+        sensor = {**SAMPLE_PLANT, "aka": "Bird of paradise", "where": "By the window", "photo": "strelitzia"}
+        timed = {**SAMPLE_TIMED, "aka": "Split leaves", "where": "On the shelf", "photo": "monstera"}
         future = {**SAMPLE_TIMED, "name": "Aloe", "every_days": 11}
         app = make_app(states, plants=[sensor, timed, future])
-        self.assertNotIn(self.ROW, rows(app))
-        self.assertEqual(rows(app)["maint:plant:strelitzia"]["items"], [
-            "Strelitzia: dry, soil 12%, at 15%", "Monstera: 24.10, watered 14.10",
-            "Aloe: 25.10, watered 14.10"])
+        row = rows(app)[self.ROW]
+        self.assertEqual((row["title"], row["detail"]), ("Water the Strelitzia", "Strelitzia"))
+        self.assertEqual(list(round_entries(app)), ["maint:plant:strelitzia"])
+        self.assertNotIn("items", row)
         tick(app, 10 * DAY)
-        self.assertNotIn(self.ROW, rows(app))
-        for row_id, info in (("maint:plant:strelitzia", ["Bird of paradise", "By the window"]),
-                             ("maint:plant:monstera", ["Split leaves", "On the shelf", "Every 10 days",
-                                                      "Counting from 14.10"])):
-            row = rows(app)[row_id]
-            self.assertEqual(row["items"], ["Monstera: due 24.10, watered 14.10",
-                                            "Strelitzia: dry, soil 12%, at 15%", "Aloe: 25.10, watered 14.10"])
-            self.assertEqual(row["info"], info)
-            self.assertNotIn("at", row)
-            self.assertTrue(core.is_valid_row(row))
-        self.assertNotIn("items", rows(app)["maint:plant:aloe"])
+        row = rows(app)[self.ROW]
+        self.assertEqual((row["id"], row["kind"], row["icon"], row["audience"], row["title"], row["detail"]),
+                         ("maint:plants", "maint", "mdi:watering-can-outline", "admin", "Water 2 plants",
+                          "Monstera, Strelitzia"))
+        self.assertEqual(set(row), {"id", "kind", "icon", "title", "detail", "audience", "plants"})
+        self.assertEqual(row["plants"], [
+            {"id": "maint:plant:monstera", "name": "Monstera", "amount": "1 L", "detail": "due today",
+             "where": "On the shelf", "aka": "Split leaves", "photo": "monstera", "done": "tap"},
+            {"id": "maint:plant:strelitzia", "name": "Strelitzia", "detail": "soil 12%, water at 15%",
+             "where": "By the window", "aka": "Bird of paradise", "photo": "strelitzia"}])
+        self.assertTrue(core.is_valid_row(row))
+        self.assertFalse({"maint:plant:monstera", "maint:plant:strelitzia"} & set(rows(app)))
+        aloe = rows(app)["maint:plant:aloe"]
+        self.assertEqual((aloe["detail"], aloe["done"], "items" in aloe, "plants" in aloe),
+                         ("1 day left, 25.10", "tap", False, False))
 
-    def test_a_calendar_row_gets_the_list_on_its_due_day_and_keeps_it_when_overdue(self):
+    def test_a_calendar_plant_joins_the_round_on_its_due_day_and_stays_in_it_while_overdue(self):
         app = make_app(plants=[SAMPLE_TIMED])
         tick(app, 9 * DAY)
-        self.assertIn(self.ROW, rows(app))
-        self.assertNotIn("items", rows(app)["maint:plant:monstera"])
-        for _ in range(2):
+        self.assertIn("items", rows(app)[self.ROW])
+        self.assertEqual(rows(app)["maint:plant:monstera"]["detail"], "1 day left, 24.10")
+        self.assertEqual(round_entries(app), {})
+        for detail in ("due today", "due since 24.10"):
             tick(app, DAY)
-            self.assertNotIn(self.ROW, rows(app))
-            self.assertEqual(rows(app)["maint:plant:monstera"]["items"],
-                             ["Monstera: due 24.10, watered 14.10"])
+            self.assertNotIn("maint:plant:monstera", rows(app))
+            self.assertNotIn("items", rows(app)[self.ROW])
+            self.assertEqual(round_entries(app)["maint:plant:monstera"]["detail"], detail)
 
-    def test_the_overview_stays_when_no_sensor_row_is_due_and_returns_after_watering(self):
+    def test_the_overview_stays_when_no_sensor_plant_is_due_and_returns_after_watering(self):
         app = make_app(plants=[SAMPLE_PLANT])
         overview = rows(app)[self.ROW]
         self.assertEqual((overview["title"], overview["detail"]), ("Plants: none due", "1 plants"))
         self.assertNotIn("at", overview)
+        self.assertNotIn("plants", overview)
         fire(app, MOISTURE, full("12"))
-        self.assertNotIn(self.ROW, rows(app))
+        row = rows(app)[self.ROW]
+        self.assertEqual((row["title"], "items" in row), ("Water the Strelitzia", False))
         fire(app, MOISTURE, full("unknown"))
-        self.assertIn(self.ROW, rows(app))
-        self.assertNotIn("maint:plant:strelitzia", rows(app))
+        self.assertEqual(round_entries(app), {})
+        row = rows(app)[self.ROW]
+        self.assertEqual((row["title"], "plants" in row, "items" in row), ("Plants: 1 of 1 due", False, True))
         fire(app, MOISTURE, full("20"))
         self.assertEqual(rows(app)[self.ROW]["title"], "Plants: none due")
 
-    def test_a_due_rows_list_keeps_the_overviews_limit_and_remainder(self):
+    def test_the_round_keeps_the_limit_of_the_lists_but_the_title_counts_every_plant(self):
         calendar = [{**SAMPLE_TIMED, "name": f"Plant {i:02d}", "every_days": 10 + i} for i in range(25)]
         app = make_app(plants=calendar)
         before = rows(app)[self.ROW]["items"]
         self.assertEqual((len(before), before[-1]), (core.ITEMS_MAX, "+6 more"))
-        tick(app, 10 * DAY)
-        self.assertNotIn(self.ROW, rows(app))
-        items = rows(app)["maint:plant:plant_00"]["items"]
-        self.assertEqual(items, ["Plant 00: due 24.10, watered 14.10", *before[1:]])
+        tick(app, 35 * DAY)
+        row = rows(app)[self.ROW]
+        self.assertEqual(row["title"], "Water 25 plants")
+        self.assertNotIn("items", row)
+        self.assertEqual([record["name"] for record in row["plants"]],
+                         [f"Plant {i:02d}" for i in range(core.ITEMS_MAX)])
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_every_plant_the_yaml_lists_due_at_once_walks_the_flat_in_order_and_the_push_names_each(self):
+        app = make_app(plants=CONFIG["plants"])
+        tick(app, 60 * DAY)
+        for entity, plant in PLANTS.items():
+            fire(app, entity, full(f"{plant['dry']:g}"))
+        everyone = [*PLANTS.values(), *TIMED.values()]
+        walk = ["kitchen", "living_room", "dining_room", "hallway", "bedroom", "bathroom"]
+        by_walk = sorted(everyone, key=lambda plant: (walk.index(plant["area"]), plant["name"]))
+        names = [plant["name"] for plant in by_walk]
+        row = rows(app)[self.ROW]
+        self.assertEqual([record["name"] for record in row["plants"]], names)
+        self.assertEqual((row["title"], row["detail"]), (f"Water {len(everyone)} plants", maint.fit_parts(names)))
+        self.assertTrue(core.is_valid_row(row))
+        self.assertEqual(plant_rows(app, everyone), {})
+        app._on_push_time({})
+        drain(app)
+        [sent] = app.notifier.sent
+        self.assertEqual(sent["message"].count("Water the"), maint.DIGEST_NAMES)
+        self.assertTrue(sent["message"].endswith(f" +{len(everyone) - maint.DIGEST_NAMES}"), sent["message"])
+        self.assertEqual(len(state_file(app)["pushed"]), len(everyone))
 
 
 class OnceTaskTests(unittest.TestCase):
