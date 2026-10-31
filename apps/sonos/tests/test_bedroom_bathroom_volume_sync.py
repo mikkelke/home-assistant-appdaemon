@@ -334,5 +334,64 @@ class SyncBehavesAsBeforeWithoutACap(unittest.TestCase):
         self.assertEqual(make_full_app(overrides={"wake_app": "OtherWake"}).wake_app, "OtherWake")
 
 
+def boost_make_app(boost, *, bathroom, bedroom, wake_cap=None):
+    """An active sync whose bathroom app reports `boost` of bath-presence boost."""
+    app = make_app(sync_active=True, bathroom_volume=bathroom, bedroom_volume=bedroom)
+    app.wake_app = "WakeupBedroom"
+    app.bathroom_app = "sonos_bathroom_control"
+    apps = {
+        "WakeupBedroom": SimpleNamespace(wake_volume_cap=lambda entity: wake_cap),
+        "sonos_bathroom_control": SimpleNamespace(presence_boost=lambda: boost),
+    }
+    app.get_app = apps.get
+    app.log = MagicMock()
+    return app
+
+
+class BathBoostIsNotCopied(unittest.TestCase):
+    """The bath-presence boost raises only the bathroom; the bedroom copies the volume under it."""
+
+    def test_the_boost_going_on_leaves_the_bedroom_where_it_was(self):
+        app = boost_make_app(0.1, bathroom=0.34, bedroom=0.24)
+        app._on_bathroom_volume_change(BATHROOM, "volume_level", 0.24, 0.34, {})
+        app.call_service.assert_not_called()
+
+    def test_the_boost_going_off_leaves_the_bedroom_where_it_was(self):
+        app = boost_make_app(0.0, bathroom=0.24, bedroom=0.24)
+        app._on_bathroom_volume_change(BATHROOM, "volume_level", 0.34, 0.24, {})
+        app.call_service.assert_not_called()
+
+    def test_a_button_press_during_the_bath_is_copied_without_the_boost(self):
+        app = boost_make_app(0.1, bathroom=0.39, bedroom=0.24)
+        app._on_bathroom_volume_change(BATHROOM, "volume_level", 0.34, 0.39, {})
+        self.assertEqual(written(app), [0.29])
+
+    def test_the_door_arming_mid_bath_copies_the_unboosted_volume(self):
+        app = boost_make_app(0.1, bathroom=0.34, bedroom=0.18)
+        app._sync_active = False
+        app.states[(DOOR, None)] = "on"
+        app._sync_timer_fire({})
+        self.assertEqual(written(app), [0.24])
+
+    def test_the_wake_cap_applies_to_the_unboosted_volume(self):
+        app = boost_make_app(0.1, bathroom=0.34, bedroom=0.1, wake_cap=0.14)
+        app._maybe_sync("x")
+        self.assertEqual(written(app), [0.14])
+
+    def test_a_bathroom_app_that_cannot_be_asked_copies_the_bathroom_as_it_is(self):
+        def broken():
+            raise RuntimeError("mid reload")
+
+        for bathroom_app in (None, SimpleNamespace(), SimpleNamespace(presence_boost=broken)):
+            app = boost_make_app(0.1, bathroom=0.34, bedroom=0.24)
+            app.get_app = lambda name, bathroom_app=bathroom_app: bathroom_app if name == "sonos_bathroom_control" else None
+            app._maybe_sync("x")
+            self.assertEqual(written(app), [0.34])
+
+    def test_the_bathroom_app_name_is_configurable(self):
+        self.assertEqual(make_full_app().bathroom_app, "sonos_bathroom_control")
+        self.assertEqual(make_full_app(overrides={"bathroom_app": "Other"}).bathroom_app, "Other")
+
+
 if __name__ == "__main__":
     unittest.main()

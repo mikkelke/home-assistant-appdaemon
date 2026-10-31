@@ -169,6 +169,13 @@ class SonosBathroomControl(hass.Hass):
                 self._adjust_volume(-self.bath_presence_volume_boost)
         # Removed handling of unavailable/unknown - we only listen to on/off now
 
+    def presence_boost(self) -> float:
+        """The part of the bathroom volume that is bath-presence boost right now (0.0 when none).
+        Presence OFF takes back the full configured boost, so this is the configured amount."""
+        if self._logically_present and self.bath_presence_volume_boost and self.presence_on_max_volume is not None:
+            return self.bath_presence_volume_boost
+        return 0.0
+
     def handle_volume_event(self, event_name, data, kwargs):
         """Handle Z-Wave volume button presses."""
         if self.volume_step is None:

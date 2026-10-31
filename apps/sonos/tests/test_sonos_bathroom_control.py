@@ -58,5 +58,22 @@ class VolumeButtons(unittest.TestCase):
                 app.call_service.assert_not_called()
 
 
+def boost_app(present, boost=0.1, max_volume=0.6):
+    app = sbc.SonosBathroomControl.__new__(sbc.SonosBathroomControl)
+    app._logically_present = present
+    app.bath_presence_volume_boost = boost
+    app.presence_on_max_volume = max_volume
+    return app
+
+
+class PresenceBoost(unittest.TestCase):
+    def test_the_boost_counts_while_someone_is_in_the_bath(self):
+        self.assertEqual(boost_app(True).presence_boost(), 0.1)
+
+    def test_no_boost_without_bath_presence_or_without_the_feature(self):
+        for app in (boost_app(False), boost_app(None), boost_app(True, boost=None), boost_app(True, max_volume=None)):
+            self.assertEqual(app.presence_boost(), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

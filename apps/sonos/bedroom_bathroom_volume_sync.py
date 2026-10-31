@@ -18,6 +18,10 @@ class BedroomBathroomVolumeSync(hass.Hass):
     nothing once the bed reads empty, so the volume follows a person who has walked to the
     bathroom. The window and the bed are the wake routine's to judge - this app only asks. When
     the wake routine cannot be asked, the sync behaves as if there were no wake-up.
+
+    The bath-presence boost belongs to the bathroom alone: the bedroom copies the bathroom volume
+    minus SonosBathroomControl.presence_boost(), so the boost going on or off moves nothing here.
+    When the bathroom app cannot be asked, the bathroom volume is copied as it is.
     """
 
     def initialize(self):
@@ -26,6 +30,7 @@ class BedroomBathroomVolumeSync(hass.Hass):
         self.bedroom_speaker = self.args.get("bedroom_speaker", "media_player.bedroom")
         self.door_open_debounce_sec = int(self.args.get("door_open_debounce_sec", 120))
         self.wake_app = self.args.get("wake_app", "WakeupBedroom")
+        self.bathroom_app = self.args.get("bathroom_app", "sonos_bathroom_control")
 
         self._sync_active = False
         self._sync_arm_timer = None
@@ -89,6 +94,12 @@ class BedroomBathroomVolumeSync(hass.Hass):
         except Exception:
             return None
 
+    def _bath_boost(self):
+        try:
+            return float(self.get_app(self.bathroom_app).presence_boost())
+        except Exception:
+            return 0.0
+
     def _maybe_sync(self, reason):
         if not self._sync_active:
             return
@@ -102,13 +113,16 @@ class BedroomBathroomVolumeSync(hass.Hass):
             bed_vol = float(self.get_state(self.bedroom_speaker, attribute="volume_level"))
         except (TypeError, ValueError):
             bed_vol = None
+        boost = self._bath_boost()
+        base = max(0.0, round(bath_vol - boost, 2))
         cap = self._wake_cap()
-        target = bath_vol if cap is None else min(bath_vol, cap)
+        target = base if cap is None else min(base, cap)
         if bed_vol is not None and abs(bed_vol - target) < 0.005:
             return
-        capped = "" if target == bath_vol else f", capped at the wake standard {cap:.2f}"
+        unboosted = f" without its bath boost {boost:.2f}" if boost else ""
+        capped = "" if target == base else f", capped at the wake standard {cap:.2f}"
         self.log(
-            f"Scenario: volume_sync_apply -> {reason}, bedroom {bed_vol} -> {target:.2f} (matching bathroom{capped})",
+            f"Scenario: volume_sync_apply -> {reason}, bedroom {bed_vol} -> {target:.2f} (matching bathroom{unboosted}{capped})",
             level="INFO",
         )
         self.call_service("media_player/volume_set", entity_id=self.bedroom_speaker, volume_level=target)
