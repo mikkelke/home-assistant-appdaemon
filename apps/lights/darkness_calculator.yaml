@@ -160,8 +160,7 @@ darkness_calculator:
       - binary_sensor.bathroom_pir_presence
       - input_boolean.bedroom_bed_session
     bathroom: binary_sensor.bathroom_active
-    # binary_sensor.bedroom_active already ORs in the bed-session tier server-side,
-    # so the separate bedroom_bed_session entry is no longer needed here.
+    # binary_sensor.bedroom_active already ORs in the bed mats and strip.
     bedroom: binary_sensor.bedroom_active
     # family_room is a combined grouping (not one of the 9 RoomActive zones) - left
     # on the raw PIR composites, not migrated.

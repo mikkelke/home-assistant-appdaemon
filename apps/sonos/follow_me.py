@@ -16,8 +16,8 @@ class SonosFollowMe(hass.Hass):
     • Kitchen uses kitchen OR hallway presence; rooftop undocked is always present, docked follows living_room.
     • Bedroom is a generic room like bathroom/guest_bathroom/etc.: room_presence_map["bedroom"]
       already points at binary_sensor.bedroom_active (apps/presence/room_active.py), whose own
-      union of witnesses (room mmWave, bed mats/strip, PIR) includes the bed-session signal
-      server-side with a 15s settle-off - no app-level special case or mute grace needed here.
+      union of witnesses (room mmWave, bed mats/strip, PIR) has its own settle-off - no
+      app-level special case or mute grace needed here.
     • Kitchen presence trust (presence_trust.py): mmWave-only kitchen presence while the kitchen speaker
       plays is SUSPECT - _is_present returns None (indeterminate), so every caller skips the mute change:
       a ghost can never unmute (the ON trigger), and a possibly-real still person is never muted either.

@@ -9,7 +9,7 @@ SonosFollowMe:
   room_presence_map:
     # Per-room union presence published by RoomActive (apps/presence/room_active.py) -
     # binary_sensor.<zone>_active already ORs each zone's full witness tier (room mmWave, spot
-    # sensors, bed mats/strip, PIR/motion channels), including bedroom's bed-session witness.
+    # sensors, bed mats/strip, PIR/motion channels).
     bathroom:       "binary_sensor.bathroom_active"
     bedroom:        "binary_sensor.bedroom_active"
     guest_bathroom: "binary_sensor.guest_bathroom_active"
