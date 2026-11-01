@@ -15,7 +15,7 @@ import upcoming_maint as maint  # noqa: E402
 import upcoming_runs as runs  # noqa: E402
 
 MIELE = ("dishwasher:hygiene", "dishwasher:filters", "dishwasher:check", "washer:drum", "washer:inlet", "dryer:plinth")
-XBLOOM = ("coffee:rinse", "coffee:tank", "coffee:burrs", "coffee:descale")
+XBLOOM = ("coffee:rinse", "coffee:burrs", "coffee:descale")
 
 
 class CoverageTests(unittest.TestCase):
@@ -57,7 +57,6 @@ class SafetyNoteTests(unittest.TestCase):
 
     def test_the_xbloom_notes(self):
         self.assertIn("cool", self.warn("coffee:rinse"))
-        self.assertIn("soap", self.warn("coffee:tank"))
         self.assertIn("unplug", self.warn("coffee:burrs"))
         self.assertIn("water on the burrs", self.warn("coffee:burrs"))
         self.assertIn("vinegar", self.warn("coffee:descale"))

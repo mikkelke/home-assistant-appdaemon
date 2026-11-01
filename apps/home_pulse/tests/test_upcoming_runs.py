@@ -87,7 +87,6 @@ class TaskTests(unittest.TestCase):
             "washer:inlet": ("washer", 90, True),
             "dryer:plinth": ("dryer", None, True),
             "coffee:rinse": ("coffee", 10, True),
-            "coffee:tank": ("coffee", 20, True),
             "coffee:burrs": ("coffee", 40, True),
             "coffee:descale": ("coffee", 60, True),
             "stick:filters": ("stick", 4, True),
@@ -95,7 +94,7 @@ class TaskTests(unittest.TestCase):
 
     def test_the_coffee_tasks_count_brews_and_the_others_runs(self):
         self.assertEqual({task.key for task in runs.TASKS if task.unit == "brew"},
-                         {"coffee:rinse", "coffee:tank", "coffee:burrs", "coffee:descale"})
+                         {"coffee:rinse", "coffee:burrs", "coffee:descale"})
         self.assertEqual({task.unit for task in runs.TASKS if task.appliance not in ("coffee", "stick")}, {"run"})
         self.assertEqual(next(task.unit for task in runs.TASKS if task.appliance == "stick"), "visit")
 
@@ -613,7 +612,7 @@ class CoffeeTests(unittest.TestCase):
     def test_seeded_at_first_sight_with_brews_wording(self):
         led = self.ledgers([brew(NOW - DAY - 2 * DAY * i) for i in range(45)])
         anchors = runs.seed({}, led, NOW)
-        self.assertEqual(set(anchors), {"coffee:rinse", "coffee:tank", "coffee:burrs", "coffee:descale"})
+        self.assertEqual(set(anchors), {"coffee:rinse", "coffee:burrs", "coffee:descale"})
         found = rows_of(led, anchors)
         row, key = found["maint:coffee:rinse"]
         self.assertEqual((row["title"], row["area"], row["icon"], row["audience"], row["done"]),
@@ -636,12 +635,12 @@ class CoffeeTests(unittest.TestCase):
     def test_done_and_the_brews_since(self):
         cycles = [brew(NOW - DAY - 2 * DAY * i) for i in range(45)]
         led = self.ledgers(cycles)
-        done = runs.mark_done(runs.seed({}, led, NOW - 30 * DAY), "coffee:tank", NOW - 11 * DAY, 39)
-        row, _ = rows_of(led, done)["maint:coffee:tank"]
+        done = runs.mark_done(runs.seed({}, led, NOW - 30 * DAY), "coffee:burrs", NOW - 11 * DAY, 39)
+        row, _ = rows_of(led, done)["maint:coffee:burrs"]
         self.assertEqual(row["info"][1], "Done 04.10, 5 brews ago")
-        self.assertTrue(row["detail"].startswith("empty, rinse, air-dry, 15 brews left"), row["detail"])
-        done = runs.mark_done(done, "coffee:tank", NOW, 45)
-        self.assertEqual(rows_of(led, done)["maint:coffee:tank"][0]["info"][1], "Done 15.10, no brews since")
+        self.assertTrue(row["detail"].startswith("brush burrs + chute, 35 brews left"), row["detail"])
+        done = runs.mark_done(done, "coffee:burrs", NOW, 45)
+        self.assertEqual(rows_of(led, done)["maint:coffee:burrs"][0]["info"][1], "Done 15.10, no brews since")
 
     def test_due_after_its_interval_and_pushed_once(self):
         cycles = [brew(NOW - DAY - DAY * i) for i in range(25)]

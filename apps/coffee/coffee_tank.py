@@ -4,8 +4,9 @@ The tank is filled by hand and the machine only says when it has run dry, so the
 water the machine measured dispensing since the last fill, and unknown until the first one. Every brew debits its
 water once. A fill or a run-dry in the middle of a brew moves `offset_ml` to that brew's reading, so only the
 water it pours after the event is debited. The water used may pass the capacity, which shows as zero left.
-After a run-dry the tank is `dry`: a brew that then pours more than REFILL_MIN_ML means it was refilled, and the
-tank counts as full from the run-dry on. `empties` keeps the water used at each of the last EMPTIES_MAX run-dry
+The machine says it has run dry while some water is left and finishes the brew, so the rest of that brew is no
+refill. After a run-dry the tank is `dry`: a later brew that pours more than REFILL_MIN_ML means it was refilled, and
+the tank counts as full from that brew on. `empties` keeps the water used at each of the last EMPTIES_MAX run-dry
 moments.
 """
 
@@ -66,7 +67,7 @@ class Tank:
         water = _ml(water_ml)
         if self.filled_at is not None and water is not None:
             poured = max(0.0, water - (self.offset_ml or 0.0))
-            if self.dry and poured > REFILL_MIN_ML and now is not None:
+            if self.dry and self.offset_ml is None and poured > REFILL_MIN_ML and now is not None:
                 self.used_ml = round(poured, 1)
                 self.filled_at = now.isoformat(timespec="seconds")
                 self.dry = False

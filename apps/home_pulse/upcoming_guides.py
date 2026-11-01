@@ -104,15 +104,6 @@ GUIDES = {
         ),
         warn="Let the brew head cool down first.",
     ),
-    "coffee:tank": Guide(
-        steps=(
-            "Lift the water tank out of the machine and empty it.",
-            "Rinse it with warm water and a drop of dish soap, then rinse it well with clean water.",
-            "Leave it open to air-dry, or wipe it dry with a clean cloth.",
-            "Fill it with fresh cold water to the fill line and put it back.",
-        ),
-        warn="Rinse out every trace of soap: soap left in the tank spoils the coffee.",
-    ),
     "coffee:burrs": Guide(
         steps=(
             "Brew until the bean hopper is nearly empty, then switch the machine off and unplug it.",

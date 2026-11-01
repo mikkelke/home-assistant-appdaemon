@@ -161,13 +161,12 @@ if __name__ == "__main__":
 
 
 class RefillAfterRunDryTests(unittest.TestCase):
-    def test_water_poured_after_a_run_dry_in_the_same_brew_means_a_refill(self):
+    def test_the_rest_of_the_brew_that_ran_dry_is_no_refill(self):
         tank = filled()
         tank.empty(NOW + MIN, 250.0)
         self.assertTrue(tank.dry)
         tank.brew_done(410.0, "c1", NOW + 2 * MIN)
-        self.assertFalse(tank.dry)
-        self.assertEqual((tank.left, tank.filled_at), (786.0, "2026-10-20T06:02:00+00:00"))
+        self.assertEqual((tank.dry, tank.left, tank.filled_at), (True, 0.0, "2026-10-20T06:00:00+00:00"))
 
     def test_a_later_brew_after_a_run_dry_means_a_refill(self):
         tank = filled()

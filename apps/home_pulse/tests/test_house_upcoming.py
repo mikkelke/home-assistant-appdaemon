@@ -905,16 +905,15 @@ def coffee_brews(count, last_end=NOW):
 
 
 class CoffeeRowTests(unittest.TestCase):
-    """The coffee app's ledger gives the xBloom's four rows, like a monitor's feedback file."""
+    """The coffee app's ledger gives the xBloom's three rows, like a monitor's feedback file."""
 
     def test_no_ledger_no_coffee_rows(self):
         self.assertFalse([key for key in rows(make_app()) if key.startswith("maint:coffee:")])
 
-    def test_four_admin_kitchen_rows_in_brews_seeded_at_first_sight(self):
+    def test_three_admin_kitchen_rows_in_brews_seeded_at_first_sight(self):
         app = make_app(ledgers={"coffee": coffee_brews(40)})
         shown = {key: row for key, row in rows(app).items() if key.startswith("maint:coffee:")}
-        self.assertEqual(set(shown), {"maint:coffee:rinse", "maint:coffee:tank", "maint:coffee:burrs",
-                                      "maint:coffee:descale"})
+        self.assertEqual(set(shown), {"maint:coffee:rinse", "maint:coffee:burrs", "maint:coffee:descale"})
         for key, row in shown.items():
             self.assertEqual((row["audience"], row["area"], row["done"], row["icon"]),
                              ("admin", "kitchen", "tap", "mdi:coffee-maker"), key)
@@ -931,9 +930,9 @@ class CoffeeRowTests(unittest.TestCase):
 
     def test_done_on_a_coffee_row(self):
         app = make_app(ledgers={"coffee": coffee_brews(10)})
-        app._on_done("house_upcoming_done", {"row": "maint:coffee:tank"}, {})
-        self.assertEqual(rows(app)["maint:coffee:tank"]["info"][1], "Done 14.10, no brews since")
-        self.assertEqual(done_log(app)[-1]["row"], "maint:coffee:tank")
+        app._on_done("house_upcoming_done", {"row": "maint:coffee:burrs"}, {})
+        self.assertEqual(rows(app)["maint:coffee:burrs"]["info"][1], "Done 14.10, no brews since")
+        self.assertEqual(done_log(app)[-1]["row"], "maint:coffee:burrs")
 
 
 class DoneEventTests(unittest.TestCase):
