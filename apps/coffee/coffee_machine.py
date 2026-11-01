@@ -160,6 +160,7 @@ class CoffeeMachine(hass.Hass):
 
         self._notifier = self.get_app("MobileNotifier")
         self._handoff = {}
+        self._select_name = None
         self._published = {}
         self._live_timer = None
         self._ledger_stamp = None
@@ -1362,14 +1363,23 @@ class CoffeeMachine(hass.Hass):
         brew = self._tracker.brew if self._tracker.brew and self._tracker.brew.get("id") == brew_id else None
         brew = brew or next((r for r in self._records if r.get("id") == brew_id), None)
         used = (brew or {}).get("recipe")
+        new_name = str(data.get("new_name") or "").strip() or None
         if not isinstance(used, dict) or not used.get("name") or not used.get("pours"):
             self._warn(f"save_brew ignored: {ascii_text(brew_id, 40)}")
             return
-        self.create_task(self._save_brew(brew_id, used))
+        if new_name is not None and (len(new_name) > 40 or cp.by_name(self._recipes, new_name)):
+            self._warn(f"save_brew ignored: the name {ascii_text(new_name, 60)!r} is taken or too long")
+            return
+        self.create_task(self._save_brew(brew_id, used, new_name))
 
-    async def _save_brew(self, brew_id, used):
-        self._handoff[f"save:{brew_id}"] = await self._write_recipe(used["name"], lambda raw: cp.saved(raw, used))
-        await self.run_in(self._on_brew_saved, 0, brew_id=brew_id, name=used["name"])
+    async def _save_brew(self, brew_id, used, new_name):
+        if new_name is None:
+            error = await self._write_recipe(used["name"], lambda raw: cp.saved(raw, used))
+        else:
+            error = await self._write_recipe(used["name"], lambda raw: cp.as_new(cp.saved(raw, used), new_name),
+                                             "xbloom/add_recipe")
+        self._handoff[f"save:{brew_id}"] = error
+        await self.run_in(self._on_brew_saved, 0, brew_id=brew_id, name=new_name or used["name"], new=new_name is not None)
 
     def _on_brew_saved(self, kwargs):
         error = self._handoff.pop(f"save:{kwargs.get('brew_id')}", None)
@@ -1377,6 +1387,8 @@ class CoffeeMachine(hass.Hass):
             self._warn(f"save_brew {kwargs.get('brew_id')} failed: {error}")
             return
         self._info(f"{kwargs.get('name')} saved from brew {kwargs.get('brew_id')}")
+        if kwargs.get("new"):
+            self._select_name = kwargs.get("name")
         self._refresh_recipes({})
 
     def _set_usual(self, recipe, now):
@@ -1427,8 +1439,9 @@ class CoffeeMachine(hass.Hass):
                                                                              "grinder_size": grind})
         await self.run_in(self._on_kept, 0)
 
-    async def _write_recipe(self, name, change):
-        """Rewrites the library recipe `name` as `change(raw)` returns it. None when saved, else the error."""
+    async def _write_recipe(self, name, change, service="xbloom/update_recipe"):
+        """Writes what `change(raw)` makes of the library recipe `name`, over it or with `service` as another.
+        None when saved, else the error."""
         try:
             envelope = await asyncio.wait_for(self.call_service("xbloom/get_recipe", name=name, return_response=True),
                                               timeout=SERVICE_TIMEOUT_S)
@@ -1439,7 +1452,7 @@ class CoffeeMachine(hass.Hass):
             if recipe is None:
                 raise ValueError("the pours differ")
             envelope = await asyncio.wait_for(
-                self.call_service("xbloom/update_recipe", recipe_json=json.dumps(recipe), return_response=True),
+                self.call_service(service, recipe_json=json.dumps(recipe), return_response=True),
                 timeout=SERVICE_TIMEOUT_S)
             answer = response_data(envelope) or {}
             if not answer.get("ok"):
@@ -1539,6 +1552,9 @@ class CoffeeMachine(hass.Hass):
         if recipes == self._recipes:
             return
         self._recipes = recipes
+        saved = cp.by_name(recipes, self._select_name)
+        if saved:
+            self._usual_id, self._select_name = saved["id"], None
         if self._usual() is None:
             match = cp.by_name(recipes, self.usual_name)
             self._usual_id = match["id"] if match else self._usual_id

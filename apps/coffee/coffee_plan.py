@@ -206,6 +206,19 @@ def saved(raw, used):
     return out
 
 
+CLOUD_ONLY = ("id", "share_url", "subset_id", "subset_type", "is_default", "is_shortcut", "created_at_ms")
+
+
+def as_new(raw, name):
+    """`raw` as another recipe called `name`: without the ids and links that tie it to the one it came from."""
+    if raw is None:
+        return None
+    out = {key: value for key, value in raw.items() if key not in CLOUD_ONLY}
+    out["name"] = name
+    out["pours"] = [{key: value for key, value in pour.items() if key not in ("id", "recipe_id")} for pour in raw["pours"]]
+    return out
+
+
 def by_id(recipes, recipe_id):
     return next((r for r in recipes if r["id"] == str(recipe_id)), None) if recipe_id else None
 

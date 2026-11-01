@@ -375,6 +375,35 @@ class StartTests(unittest.TestCase):
         self.assertEqual({p["temperature_c"] for p in saved["pours"]}, {90.0})
         self.assertEqual(calls(app, "xbloom/get_recipe")[-1]["name"], "4 Pour Recipe")
 
+    def test_a_tweaked_brew_saves_as_a_new_recipe_that_becomes_the_selected_one(self):
+        app = fake.make_app()
+        fake.set_entity(app, "switch.xbloom_studio_connect", "on")
+        fake.fire(app, "xbloom_connect_ready", {"summary": {}})
+        fake.op(app, "start", {"variant": "tweak", "grind_size": 42})
+        brew_id = app._tracker.brew["id"]
+        stored = {**fake.USUAL, "share_url": "https://share", "pours": [{**p, "id": 7, "recipe_id": 81696}
+                                                                         for p in fake.USUAL["pours"]]}
+        app.responses["xbloom/get_recipe"] = fake.ok({"recipe": stored})
+        app.responses["xbloom/add_recipe"] = fake.ok({"ok": True, "name": "Fine 42"})
+        new = {k: v for k, v in fake.USUAL.items() if k != "id"} | {"name": "Fine 42", "grinder_size": 42}
+        app.responses["xbloom/list_recipes"] = fake.ok({"recipes": [fake.USUAL, fake.OTHER, new]})
+        fake.op(app, "save_brew", {"brew_id": brew_id, "new_name": " Fine 42 "})
+        self.assertEqual(calls(app, "xbloom/update_recipe"), [])
+        added = json.loads(calls(app, "xbloom/add_recipe")[0]["recipe_json"])
+        self.assertEqual((added["name"], added["grind_size"], "id" in added, "share_url" in added), ("Fine 42", 42, False,
+                                                                                                    False))
+        self.assertEqual([("id" in p, "recipe_id" in p) for p in added["pours"]], [(False, False)] * 4)
+        self.assertEqual(fake.last(app, "sensor.coffee_recipes")[1]["usual_id"], "Fine 42")
+
+    def test_save_as_new_refuses_a_name_already_in_the_library(self):
+        app = fake.make_app()
+        fake.set_entity(app, "switch.xbloom_studio_connect", "on")
+        fake.fire(app, "xbloom_connect_ready", {"summary": {}})
+        fake.op(app, "start", {"variant": "tweak", "grind_size": 42})
+        fake.op(app, "save_brew", {"brew_id": app._tracker.brew["id"], "new_name": fake.OTHER["name"]})
+        self.assertEqual(calls(app, "xbloom/add_recipe"), [])
+        self.assertEqual(calls(app, "xbloom/update_recipe"), [])
+
     def test_save_brew_for_an_unknown_brew_does_nothing(self):
         app = fake.make_app()
         fake.op(app, "save_brew", {"brew_id": "c1"})
