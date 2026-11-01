@@ -63,6 +63,7 @@ class BedroomLights(hass.Hass):
     Truth table (after the vacant/occupied gate):
       - No effective occupancy -> all lights OFF
       - Occupied + bright -> bed + ceiling OFF
+      - Occupied + dark + Close-again wake snooze -> no auto-on or light transfer
       - Occupied + dark + bed session active + ceiling already on -> ceiling OFF, bed ON
         (applies even under sleep mode / blind closed below - an ALREADY-LIT room
         follows you to bed; this re-points existing light, it never conjures new
@@ -504,6 +505,9 @@ class BedroomLights(hass.Hass):
                     self.turn_off(self.ceiling_lights)
                 return
 
+            if self._close_again_snooze_active():
+                return
+
             # An already-lit ceiling always follows you to bed once the session is
             # active - this re-points EXISTING light, it doesn't conjure new light in
             # a dark/private room, so it applies even though the gates below would
@@ -591,6 +595,19 @@ class BedroomLights(hass.Hass):
         except Exception:
             pass
         return False
+
+    def _close_again_snooze_active(self) -> bool:
+        try:
+            session = self.get_state("sensor.wake_alarm_session", attribute="all")
+            if not isinstance(session, dict) or session.get("state") != "snoozing":
+                return False
+            attrs = session.get("attributes") or {}
+            if not isinstance(attrs, dict) or attrs.get("snooze_curtain") != "closed":
+                return False
+            deadline = datetime.datetime.fromisoformat(attrs.get("snooze_until"))
+            return deadline.tzinfo is not None and deadline > datetime.datetime.now(datetime.timezone.utc)
+        except Exception:
+            return False
 
     def _is_sleep_mode_active(self) -> bool:
         try:

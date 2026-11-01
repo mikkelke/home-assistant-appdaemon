@@ -1,8 +1,11 @@
 import appdaemon.plugins.hass.hassapi as hass # type: ignore
 import asyncio
+import inspect
 import json
 import os
-from datetime import date, datetime, time, timedelta
+from uuid import uuid4
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import cover_util
 import room_state_darkness
@@ -46,6 +49,8 @@ REQUIRED_TOP_LEVEL = [
 # (apps/sonos/state_reset.yaml: speaker_volumes, default_volume). The wake ramp
 # never goes above it - see WakeupRoutine._volume_ceiling_for.
 STANDARD_VOLUME_APP = "SonosStateReset"
+SESSION_ENTITY = "sensor.wake_alarm_session"
+ALARM_LINK = "/dashboard-rooftop/home#wake-alarm"
 
 
 def _level(value):
@@ -76,6 +81,7 @@ class WakeupRoutine(hass.Hass):
 
         self.master_player = A["media_master"]
         self.join_players = list(A["media_join"])
+        self.watchdog_players = list(A.get("watchdog_players", [self.master_player] + self.join_players))
         self.stream_id = A["media_content_id"]
         self.stream_type = A["media_content_type"]
         # Optional fallback URL for failover
@@ -234,6 +240,15 @@ class WakeupRoutine(hass.Hass):
         # 2026-08-10 - 3 of 4 presses that morning died in _alarm_fire's toggle guard). Read
         # by the trigger-window guard, the toggle guard, and _attach_cancel_listeners below.
         self._manual_fire_in_progress = False
+        self._snooze_return_in_progress = False
+        self._media_generation = 0
+        self._light_generation = 0
+        self._snooze_generation = 0
+        self._notification_generation = 0
+        self._notification_lock = None
+        self._session_publish_failed = False
+        self._notification_failed = False
+        self.snooze_timer = None
 
         # Restart-survival state: small JSON file, deploy_advisor's path convention +
         # house_events' atomic tmp+replace write (see _load_state/_save_state). An AD
@@ -255,6 +270,7 @@ class WakeupRoutine(hass.Hass):
             self._wake_window_until = datetime.fromisoformat(self._state["wake_window_until"])
         except (KeyError, TypeError, ValueError):
             pass
+        self._load_wake_session()
 
         # Respect per-app log_level
         self.set_log_level(self.log_level)
@@ -270,12 +286,24 @@ class WakeupRoutine(hass.Hass):
         self.wake_now_entity = self.args.get("wake_now_entity", "input_button.wake_up_now")
         if self.wake_now_entity:
             self.listen_state(self._on_wake_now, self.wake_now_entity)
+        try:
+            for event in ("wake_snooze", "wake_dismiss", "wake_snooze_cancel"):
+                self.listen_event(self._on_wake_action, event)
+            self.listen_event(self._on_notification_action, "mobile_app_notification_action")
+            self.listen_event(self._on_session_reconnect, "plugin_started")
+            self.listen_event(self._on_session_reconnect, "homeassistant_started")
+        except Exception as e:
+            self.log(f"[wake] Alarm action listeners unavailable: {e}", level="WARNING", log=self.user_log)
+        for player in set([self.master_player] + self.join_players):
+            self.listen_state(self._on_wake_media_state, player)
         # Restart survival, init-only: reconcile Adaptive Lighting first (a late catch-up
         # ramp turns it off itself moments later, so reconciling first never fights it),
         # then check for a fire that fell in the gap between the 120s grace window above
         # and the 60s heartbeat below - an AD restart can easily eat more than either.
         self._reconcile_adaptive_lighting_after_restart()
-        self._late_catchup_after_restart()
+        if self._session_status != "snoozing":
+            self._late_catchup_after_restart()
+        self._restore_wake_session()
         # Always-on minute heartbeat as the alarm's safety net. History (Sep 19 - Nov 16
         # 2025): the AppDaemon scheduler developed a constant +67 min phase shift, so the
         # run_daily callback arrived 67 minutes late every single day and was rejected by
@@ -394,11 +422,8 @@ class WakeupRoutine(hass.Hass):
             now = self.datetime()
             # Floor, never round up. A slot in the future would make _schedule_daily_alarm
             # (via the _on_alarm_time_changed listener this triggers) arm a fresh one-shot
-            # run_at(self._alarm_fire, today_run) for later today - and unlike the grace
-            # refire / heartbeat paths, _alarm_fire itself is NOT guarded by last_fire_date,
-            # so that one-shot would fire the whole sequence again a few minutes from now. A
-            # floored slot is already in the past, where the last_fire_date guard set by the
-            # _alarm_fire call above already covers it.
+            # run_at(self._alarm_fire, today_run) for later today. A floored slot is
+            # already in the past, and the daily duplicate guard covers rescheduling.
             slot_min = (now.minute // 5) * 5
             hhmmss = "%02d:%02d:00" % (now.hour, slot_min)
             current = str(self.get_state(self.alarm_time_entity) or "")[:5]
@@ -421,6 +446,8 @@ class WakeupRoutine(hass.Hass):
         :00.0x when the scheduler is well), still passes _alarm_fire's ±90 s guard,
         and tolerates one delayed tick. last_fire_date (set inside _alarm_fire)
         makes the normal day a date-compare no-op."""
+        self._reconcile_finished_session()
+        self._publish_wake_session()
         try:
             now_dt = self.datetime()
             if self.last_fire_date == now_dt.date():
@@ -462,6 +489,320 @@ class WakeupRoutine(hass.Hass):
             os.replace(tmp, self.state_file)
         except Exception as e:
             self.log(f"[wake] state save failed: {e}", level="WARNING", log=self.user_log)
+
+    def _session_now(self):
+        now = self.datetime()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=ZoneInfo("Europe/Copenhagen"))
+        return now.astimezone(timezone.utc)
+
+    def _load_wake_session(self):
+        stored = self._state.get("wake_session") or {}
+        if not isinstance(stored, dict):
+            stored = {}
+        self._session_status = stored.get("status", "idle")
+        if self._session_status not in ("idle", "ringing", "snoozing", "dismissed", "stopped"):
+            self._session_status = "idle"
+        self._session_id = str(stored.get("session_id") or "")
+        self._session_started_at = stored.get("started_at")
+        self._session_reason = stored.get("reason", "")
+        self._snooze_minutes = stored.get("minutes", 10)
+        if self._snooze_minutes not in (5, 10, 15):
+            self._snooze_minutes = 10
+        self._snooze_curtain = stored.get("curtain", "closed")
+        if self._snooze_curtain not in ("closed", "open"):
+            self._snooze_curtain = "closed"
+        self._snooze_until = None
+        try:
+            deadline = datetime.fromisoformat(stored["snooze_until"])
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=ZoneInfo("Europe/Copenhagen"))
+            self._snooze_until = deadline.astimezone(timezone.utc)
+        except (KeyError, TypeError, ValueError):
+            pass
+        if self._snooze_until is not None and self._session_status == "ringing":
+            self._session_status = "snoozing"
+        if self._session_status == "snoozing" and self._snooze_until is None:
+            self._session_status = "stopped"
+        self._radio_playing = False
+
+    def _persist_wake_session(self):
+        state = getattr(self, "_state", None)
+        if state is None:
+            return
+        state["wake_session"] = {
+            "status": getattr(self, "_session_status", "idle"),
+            "session_id": getattr(self, "_session_id", ""),
+            "started_at": getattr(self, "_session_started_at", None),
+            "reason": getattr(self, "_session_reason", ""),
+            "minutes": getattr(self, "_snooze_minutes", 10),
+            "curtain": getattr(self, "_snooze_curtain", "closed"),
+            "snooze_until": self._snooze_until.isoformat() if getattr(self, "_snooze_until", None) else None,
+        }
+        self._save_state()
+
+    def _publish_wake_session(self):
+        try:
+            self.set_state(SESSION_ENTITY, state=getattr(self, "_session_status", "idle"), attributes={
+                "friendly_name": "Morning alarm",
+                "session_id": getattr(self, "_session_id", ""),
+                "started_at": getattr(self, "_session_started_at", None),
+                "reason": getattr(self, "_session_reason", ""),
+                "snooze_minutes": getattr(self, "_snooze_minutes", 10),
+                "snooze_curtain": getattr(self, "_snooze_curtain", "closed"),
+                "snooze_until": self._snooze_until.isoformat() if getattr(self, "_snooze_until", None) else None,
+                "radio_playing": bool(getattr(self, "_radio_playing", False)),
+                "icon": "mdi:alarm",
+            })
+        except Exception as e:
+            if not getattr(self, "_session_publish_failed", False):
+                self._session_publish_failed = True
+                self.log(f"[wake] Session state unavailable: {e}", level="WARNING", log=self.user_log)
+
+    def _on_session_reconnect(self, event, data, kwargs):
+        self._publish_wake_session()
+
+    def _restore_wake_session(self):
+        if self._session_status == "snoozing":
+            self._publish_wake_session()
+            self._stop_media()
+            self._close_wake_window()
+            self._arm_snooze()
+            self._queue_wake_notification("snoozing")
+        elif self._session_status == "ringing":
+            states = [self.get_state(p) for p in [self.master_player] + self.join_players]
+            self._radio_playing = any(state == "playing" for state in states)
+            if self.wake_window_open() or not all(state in ("idle", "off", "paused", "standby") for state in states):
+                self._queue_wake_notification("ringing")
+            else:
+                self._session_status = "stopped"
+                self._persist_wake_session()
+                self._queue_wake_notification("clear")
+        self._publish_wake_session()
+
+    def _reconcile_finished_session(self):
+        if getattr(self, "_session_status", "idle") != "ringing":
+            return
+        try:
+            states = [self.get_state(p) for p in [self.master_player] + self.join_players]
+            if all(state in ("idle", "off", "paused", "standby") for state in states) and not self.wake_window_open():
+                self._session_status = "stopped"
+                self._session_reason = "stopped"
+                self._radio_playing = False
+                self._persist_wake_session()
+                self._queue_wake_notification("clear")
+        except Exception:
+            pass
+
+    def _on_wake_media_state(self, entity, attr, old, new, kwargs):
+        if getattr(self, "_session_status", "idle") != "ringing":
+            return
+        self._radio_playing = any(self.get_state(p) == "playing" for p in [self.master_player] + self.join_players)
+        self._publish_wake_session()
+
+    def _cancel_snooze_timer(self, clear_deadline=True):
+        self._snooze_generation = getattr(self, "_snooze_generation", 0) + 1
+        timer = getattr(self, "snooze_timer", None)
+        self.snooze_timer = None
+        if timer is not None:
+            try:
+                self.cancel_timer(timer)
+            except Exception:
+                pass
+        if clear_deadline:
+            self._snooze_until = None
+
+    def _arm_snooze(self):
+        self._snooze_generation = getattr(self, "_snooze_generation", 0) + 1
+        delay = max(0, (self._snooze_until - self._session_now()).total_seconds())
+        self.snooze_timer = self.run_in(self._snooze_return, delay, generation=self._snooze_generation)
+
+    def _action_session_matches(self, session_id):
+        if session_id in (None, "") or session_id == getattr(self, "_session_id", ""):
+            return True
+        self.log("[wake] Ignoring action for an older session", log=self.user_log)
+        return False
+
+    def _on_wake_action(self, event, data, kwargs):
+        if not self._action_session_matches((data or {}).get("session_id")):
+            return
+        if event == "wake_snooze":
+            self._start_snooze((data or {}).get("minutes"), (data or {}).get("curtain"))
+        elif event == "wake_dismiss":
+            self._dismiss_wake()
+        elif event == "wake_snooze_cancel":
+            self._cancel_snooze()
+
+    def _on_notification_action(self, event, data, kwargs):
+        action = (data or {}).get("action")
+        if not isinstance(action, str):
+            return
+        action, _, session_id = action.partition("|")
+        if not self._action_session_matches(session_id):
+            return
+        if action == "WAKE_SNOOZE":
+            self._start_snooze(getattr(self, "_snooze_minutes", 10), getattr(self, "_snooze_curtain", "closed"))
+        elif action == "WAKE_DISMISS":
+            self._dismiss_wake()
+        elif action == "WAKE_SNOOZE_CANCEL":
+            self._cancel_snooze()
+        elif action == "WAKE_NOW":
+            if getattr(self, "_session_status", "idle") == "snoozing":
+                self._on_wake_now(None, None, None, "notification", {})
+        elif action == "WAKE_OPTIONS":
+            if getattr(self, "_session_status", "idle") in ("ringing", "snoozing"):
+                self._queue_wake_notification("options")
+
+    def _start_snooze(self, minutes, curtain):
+        if getattr(self, "_session_status", "idle") not in ("ringing", "snoozing"):
+            self.log("[wake] Ignoring snooze without an active session", log=self.user_log)
+            return
+        try:
+            valid_minutes = int(minutes)
+        except (TypeError, ValueError):
+            valid_minutes = None
+        if isinstance(minutes, bool) or str(minutes) not in ("5", "10", "15") or valid_minutes not in (5, 10, 15) or curtain not in ("closed", "open"):
+            self.log("[wake] Ignoring invalid snooze choice", log=self.user_log)
+            return
+        deadline = self._session_now() + timedelta(minutes=valid_minutes)
+        self._cancel_snooze_timer()
+        self._snooze_minutes = valid_minutes
+        self._snooze_curtain = curtain
+        self._snooze_until = deadline
+        self._session_status = "snoozing"
+        self._session_reason = ""
+        self._radio_playing = False
+        self._persist_wake_session()
+        self._publish_wake_session()
+        self._arm_snooze()
+        self._stop_media()
+        self._close_wake_window()
+        self._remove_wake_cancel_listeners()
+        if curtain == "closed":
+            self._stop_light_ramp()
+            self._invalidate_light_wait()
+            self._current_bedroom_wake_source = "wake"
+            self._current_bedroom_wake_reason = "snooze"
+            try:
+                self._set_cover_position(self.bedroom_cover, 100 if self.closed_is_100 else 0)
+            except Exception as e:
+                self.log(f"[wake] Snooze blind request failed: {e}", level="WARNING", log=self.user_log)
+            try:
+                if light_ramp is not None:
+                    light_ramp.pause_adaptive_brightness(self, self.adaptive_brightness_switch)
+                else:
+                    self.turn_off(self.adaptive_brightness_switch)
+                self.call_service("light/turn_off", entity_id=self.light_entity, transition=3)
+            except Exception as e:
+                self.log(f"[wake] Snooze light fade failed: {e}", level="WARNING", log=self.user_log)
+            finally:
+                self._resume_adaptive_brightness()
+        self._queue_wake_notification("snoozing")
+
+    def _dismiss_wake(self):
+        status = getattr(self, "_session_status", "idle")
+        if status == "snoozing":
+            self._cancel_snooze()
+            return
+        if status != "ringing":
+            self.log("[wake] Ignoring dismiss without an active session", log=self.user_log)
+            return
+        self._stop_media()
+        self._session_status = "dismissed"
+        self._session_reason = "dismissed"
+        self._radio_playing = False
+        self._persist_wake_session()
+        self._publish_wake_session()
+        self._queue_wake_notification("clear")
+
+    def _cancel_snooze(self):
+        if getattr(self, "_session_status", "idle") != "snoozing":
+            self.log("[wake] Ignoring snooze cancel without a pending snooze", log=self.user_log)
+            return
+        self._cancel_snooze_timer()
+        self._session_status = "dismissed"
+        self._session_reason = "snooze_cancelled"
+        self._persist_wake_session()
+        self._publish_wake_session()
+        self._queue_wake_notification("clear")
+
+    def _snooze_return(self, kwargs):
+        if (getattr(self, "_session_status", "idle") != "snoozing"
+                or kwargs.get("generation") != getattr(self, "_snooze_generation", 0)):
+            return
+        curtain = self._snooze_curtain
+        self._cancel_snooze_timer(clear_deadline=False)
+        self._session_status = "ringing"
+        self._snooze_return_in_progress = True
+        try:
+            self._start_wake_sequence(full_room=curtain == "closed")
+            self._snooze_until = None
+            self._persist_wake_session()
+            self._publish_wake_session()
+        finally:
+            self._snooze_return_in_progress = False
+
+    def _queue_wake_notification(self, kind):
+        if not hasattr(self, "get_app"):
+            return
+        if kind != "options":
+            self._notification_generation = getattr(self, "_notification_generation", 0) + 1
+        generation = getattr(self, "_notification_generation", 0)
+        task = self._send_wake_notification(kind, generation)
+        try:
+            self.create_task(task)
+        except Exception as e:
+            task.close()
+            self._log_notification_failure(e)
+
+    def _log_notification_failure(self, error):
+        if not getattr(self, "_notification_failed", False):
+            self._notification_failed = True
+            self.log(f"[wake] Alarm notification unavailable: {error}", level="WARNING", log=self.user_log)
+
+    async def _send_wake_notification(self, kind, generation):
+        try:
+            if getattr(self, "_notification_lock", None) is None:
+                self._notification_lock = asyncio.Lock()
+            async with self._notification_lock:
+                if kind != "options" and generation != self._notification_generation:
+                    return
+                notifier = self.get_app("MobileNotifier")
+                if inspect.isawaitable(notifier):
+                    notifier = await notifier
+                if kind == "options":
+                    if getattr(self, "_session_status", "idle") in ("ringing", "snoozing"):
+                        await notifier.notify(title="", message="command_webview", target=["mikkel"],
+                                              data={"command": ALARM_LINK + "=options"})
+                    return
+                if kind in ("clear", "ringing"):
+                    await notifier.clear_notification(tag="wake_alarm", target=["mikkel"])
+                if generation != self._notification_generation or kind == "clear":
+                    return
+                data = {"tag": "wake_alarm", "channel": "wake_alarm", "importance": "high",
+                        "priority": "high", "ttl": 0, "visibility": "public", "sticky": True,
+                        "persistent": True, "alert_once": True, "notification_icon": "mdi:alarm"}
+                if kind == "snoozing":
+                    data["channel"] = "wake_alarm_snooze"
+                    data["importance"] = "low"
+                    title = "A little more sleep"
+                    message = "Alarm returns at " + self._snooze_until.astimezone(ZoneInfo("Europe/Copenhagen")).strftime("%H:%M")
+                    data["actions"] = [{"action": "WAKE_SNOOZE_CANCEL", "title": "Cancel"},
+                                       {"action": "WAKE_NOW", "title": "Wake now"}]
+                else:
+                    title = "Good morning, Mikkel"
+                    message = "DR P3 - bedroom + bathroom"
+                    room = "curtain closed" if self._snooze_curtain == "closed" else "keep room"
+                    data["actions"] = [
+                        {"action": "WAKE_SNOOZE", "title": f"Snooze {self._snooze_minutes} - {room}"},
+                        {"action": "WAKE_OPTIONS", "title": "Options"},
+                        {"action": "WAKE_DISMISS", "title": "Stop radio"},
+                    ]
+                for action in data["actions"]:
+                    action["action"] += "|" + self._session_id
+                await notifier.notify(title=title, message=message, target=["mikkel"], data=data, link=ALARM_LINK)
+        except Exception as e:
+            self._log_notification_failure(e)
 
     def _reconcile_adaptive_lighting_after_restart(self):
         """Init-only. The ramp turns adaptive_brightness_switch off at ramp start and only
@@ -659,6 +1000,19 @@ class WakeupRoutine(hass.Hass):
                 return
         except Exception:
             pass
+        if not self._manual_fire_in_progress:
+            today = self.datetime().date()
+            session_day = None
+            try:
+                session_day = datetime.fromisoformat(self._session_started_at).astimezone(ZoneInfo("Europe/Copenhagen")).date()
+            except (AttributeError, TypeError, ValueError):
+                pass
+            fired_on = getattr(self, "last_fire_date", None)
+            if (fired_on == today
+                    or (fired_on is None and session_day == today
+                        and getattr(self, "_session_status", "idle") in ("ringing", "snoozing", "dismissed"))):
+                self.log("[wake] Already fired today; skipping scheduled callback.", log=self.user_log)
+                return
         # Mark date for heartbeat duplicate suppression; persisted so an AD restart sees
         # today's fire too (see _load_state / _schedule_daily_alarm / _heartbeat_check /
         # _late_catchup_after_restart).
@@ -676,11 +1030,31 @@ class WakeupRoutine(hass.Hass):
         # "Wake up now" presses that morning).
         if not self._manual_fire_in_progress and self.get_state(self.alarm_enabled_entity) != "on":
             self.log("[wake] Toggle off; skipping.", log=self.user_log); return
-        if self._both_away():
+        if not self._manual_fire_in_progress and self._both_away():
             self.log("[wake] Both away; skipping.", log=self.user_log); return
 
+        self._start_wake_sequence(full_room=True)
+
+    def _start_wake_sequence(self, full_room=True):
+        # A return remains recoverable on disk until all wake commands are issued.
+        self._cancel_snooze_timer(clear_deadline=not getattr(self, "_snooze_return_in_progress", False))
+        self._remove_wake_cancel_listeners()
+        if full_room:
+            self._invalidate_light_wait()
+            if getattr(self, "ramp_active", False):
+                self._stop_light_ramp()
         self.log("[wake] Alarm firing.", log=self.user_log)
         self._alarm_fired_at = self.datetime()
+        self._session_status = "ringing"
+        self._session_reason = ""
+        self._session_started_at = self._session_now().isoformat()
+        self._session_id = uuid4().hex
+        self._snooze_minutes = getattr(self, "_snooze_minutes", 10)
+        self._snooze_curtain = getattr(self, "_snooze_curtain", "closed")
+        self._radio_playing = True
+        self._persist_wake_session()
+        self._publish_wake_session()
+        self._queue_wake_notification("ringing")
         try:
             self._open_wake_window()
         except Exception as e:
@@ -693,13 +1067,13 @@ class WakeupRoutine(hass.Hass):
             self.fire_event(
                 "house_events_report",
                 cause=f"Wake-up alarm ({alarm_hhmm})" if alarm_hhmm else "Wake-up alarm",
-                effect="Raising the blinds and fading the lights in",
+                effect="Raising the blinds and fading the lights in" if full_room else "Restarting the wake radio",
                 icon="mdi:weather-sunset-up",
                 audience="admin",  # Mikkel's bedroom routine - not the housemates' business
             )
         except Exception:
             pass
-        if self._fired_via_heartbeat:
+        if getattr(self, "_fired_via_heartbeat", False):
             # The daily scheduler tick was missed and the minute heartbeat rescued the
             # routine - one extra admin line, because repeats of this point at an
             # AppDaemon scheduler problem. Once per day by construction (last_fire_date).
@@ -716,6 +1090,8 @@ class WakeupRoutine(hass.Hass):
         self._attach_cancel_listeners()
         self._group_speakers()
         self._start_media_and_volume_ramp()
+        if not full_room:
+            return
         target, reason = self._decide_bedroom_wake_target()
         self._current_bedroom_wake_target = target
         self._current_bedroom_wake_reason = reason
@@ -745,13 +1121,15 @@ class WakeupRoutine(hass.Hass):
             if self.cover_listener:
                 self.cancel_listen_state(self.cover_listener)
             self.cover_listener = self.listen_state(
-                self._on_bedroom_position, self.bedroom_cover, attribute="current_position"
+                self._on_bedroom_position, self.bedroom_cover, attribute="current_position",
+                generation=getattr(self, "_light_generation", 0)
             )
             # Hard deadline: a listener that never fires (blind never hits the exact
             # target) must not stay armed into the day - see wake_light_window_min.
             # This is also the bounded backstop for the manual-yield below: if every
             # earlier detection misses, the wait still ends here.
-            self.run_in(self._expire_cover_listener, self.wake_light_window_min * 60)
+            self.run_in(self._expire_cover_listener, self.wake_light_window_min * 60,
+                        generation=getattr(self, "_light_generation", 0))
             self.log("[wake] Waiting for bedroom blind target to start light ramp...", log=self.user_log)
 
     # ---------- media / volume ----------
@@ -765,6 +1143,8 @@ class WakeupRoutine(hass.Hass):
             self.log(f"[wake] Join failed: {e}", level="WARNING", log=self.user_log)
 
     def _start_media_and_volume_ramp(self):
+        self._media_generation = getattr(self, "_media_generation", 0) + 1
+        self._media_running = True
         # Attempt 0: play as-provided
         self.media_attempt = 0
         self._media_recheck_used = False
@@ -788,10 +1168,11 @@ class WakeupRoutine(hass.Hass):
         # Verify playback started; if not, try fallbacks (delays sized for HLS startup,
         # see media_verify_* in initialize)
         try:
-            self.run_in(self._verify_media_playback, self.media_verify_delay_sec)
+            self.run_in(self._verify_media_playback, self.media_verify_delay_sec, generation=self._media_generation)
             # Also check if playback drops shortly after start ("playing but dead" scenario) -
             # after the whole verify/recheck/fallback chain has had time to conclude
-            self.run_in(self._verify_media_is_still_playing, self.media_still_playing_check_sec)
+            self.run_in(self._verify_media_is_still_playing, self.media_still_playing_check_sec,
+                        generation=self._media_generation)
         except Exception:
             pass
 
@@ -807,11 +1188,18 @@ class WakeupRoutine(hass.Hass):
         except Exception as e:
             self.log(f"[wake] play_media failed: {e}", level="WARNING", log=self.user_log)
 
-    def _verify_media_playback(self, _):
+    def _media_callback_valid(self, kwargs):
+        return (getattr(self, "_media_running", True)
+                and (not isinstance(kwargs, dict) or "generation" not in kwargs
+                     or kwargs["generation"] == getattr(self, "_media_generation", 0)))
+
+    def _verify_media_playback(self, kwargs):
         """
         Verify media playback is active. If not, escalate through configured fallback streams.
         Uses a candidates list approach for cleaner iteration through fallback options.
         """
+        if not self._media_callback_valid(kwargs):
+            return
         try:
             state = self.get_state(self.master_player)
             # Also check attributes to ensure it's actually playing (not just reporting "playing" state)
@@ -841,7 +1229,8 @@ class WakeupRoutine(hass.Hass):
                 f"{self.media_verify_recheck_sec}s before failover",
                 log=self.user_log,
             )
-            self.run_in(self._verify_media_playback, self.media_verify_recheck_sec)
+            self.run_in(self._verify_media_playback, self.media_verify_recheck_sec,
+                        generation=getattr(self, "_media_generation", 0))
             return
 
         # Build ordered candidates list: primary + configured fallback
@@ -876,7 +1265,8 @@ class WakeupRoutine(hass.Hass):
                     pass
             self._media_recheck_used = False  # fresh recheck budget for the new stream
             self._play_media(next_id)
-            self.run_in(self._verify_media_playback, self.media_verify_delay_sec)
+            self.run_in(self._verify_media_playback, self.media_verify_delay_sec,
+                        generation=getattr(self, "_media_generation", 0))
             return
 
         # Final attempt: nudge media_play as last resort
@@ -885,7 +1275,8 @@ class WakeupRoutine(hass.Hass):
                 self.call_service("media_player/media_play", entity_id=self.master_player)
                 self.log("[wake] Final fallback: sent generic media_play command", level="WARNING", log=self.user_log)
                 self._media_recheck_used = False
-                self.run_in(self._verify_media_playback, self.media_verify_recheck_sec)
+                self.run_in(self._verify_media_playback, self.media_verify_recheck_sec,
+                            generation=getattr(self, "_media_generation", 0))
             except Exception:
                 pass
             return
@@ -912,11 +1303,13 @@ class WakeupRoutine(hass.Hass):
             except Exception as e:
                 self.log(f"[wake] media-failure notify failed: {e}", level="WARNING", log=self.user_log)
 
-    def _verify_media_is_still_playing(self, _):
+    def _verify_media_is_still_playing(self, kwargs):
         """
         Second verification to catch "playing but dead" scenarios where playback
         starts briefly then stops (e.g., MA disconnect/reset issues).
         """
+        if not self._media_callback_valid(kwargs):
+            return
         try:
             state = self.get_state(self.master_player)
             try:
@@ -957,9 +1350,12 @@ class WakeupRoutine(hass.Hass):
         return False
 
     def _schedule_next_volume_tick(self):
-        self.volume_timer = self.run_in(self._volume_tick, self.volume_interval_sec)
+        self.volume_timer = self.run_in(self._volume_tick, self.volume_interval_sec,
+                                       generation=getattr(self, "_media_generation", 0))
 
-    def _volume_tick(self, _):
+    def _volume_tick(self, kwargs):
+        if not self._media_callback_valid(kwargs):
+            return
         # The timer that invoked this callback is now expired; clear handle to avoid invalid cancel warnings
         self.volume_timer = None
         if not self.volume_active:
@@ -1249,6 +1645,9 @@ class WakeupRoutine(hass.Hass):
         return int(self.post_blind_settle_dark_sec), outdoor_lux
 
     def _on_bedroom_position(self, entity, attr, old, new, kwargs):
+        if ("generation" in kwargs
+                and kwargs["generation"] != getattr(self, "_light_generation", 0)):
+            return
         try:
             pos = int(float(new))
         except Exception:
@@ -1280,7 +1679,10 @@ class WakeupRoutine(hass.Hass):
             self.cancel_listen_state(self.cover_listener)
             self.cover_listener = None
         # Allow sensor lag to catch up, then recompute darkness and decide.
+        generation = getattr(self, "_light_generation", 0)
         def _delayed_decide(_):
+            if generation != getattr(self, "_light_generation", 0):
+                return
             try:
                 self.fire_event("darkness_recompute", zone="bedroom")
             except Exception:
@@ -1317,7 +1719,10 @@ class WakeupRoutine(hass.Hass):
             self, self.bedroom_state_entity, default_dark=True
         )
 
-    def _expire_cover_listener(self, _):
+    def _expire_cover_listener(self, kwargs):
+        if (isinstance(kwargs, dict) and "generation" in kwargs
+                and kwargs["generation"] != getattr(self, "_light_generation", 0)):
+            return
         if self.cover_listener:
             try:
                 self.cancel_listen_state(self.cover_listener)
@@ -1380,9 +1785,13 @@ class WakeupRoutine(hass.Hass):
         self._turn_off_sleep_modes_if_on()
 
     def _schedule_next_ramp_tick(self):
-        self.ramp_timer = self.run_in(self._ramp_tick, self.ramp_interval_sec)
+        self.ramp_timer = self.run_in(self._ramp_tick, self.ramp_interval_sec,
+                                     generation=getattr(self, "_light_generation", 0))
 
-    def _ramp_tick(self, _):
+    def _ramp_tick(self, kwargs):
+        if (isinstance(kwargs, dict) and "generation" in kwargs
+                and kwargs["generation"] != getattr(self, "_light_generation", 0)):
+            return
         # Clear expired handle to avoid invalid cancel warnings
         self.ramp_timer = None
         if not self.ramp_active:
@@ -1471,6 +1880,9 @@ class WakeupRoutine(hass.Hass):
         return self.get_state(self.bed_session_entity) != "off"  # None/unknown -> treat active
 
     def _on_bed_session_change(self, entity, attr, old, new, kwargs):
+        if ("generation" in kwargs
+                and kwargs["generation"] != getattr(self, "_light_generation", 0)):
+            return
         if self.ramp_active and new == "off":
             self._finish_ramp("bed session ended - handing bedroom to ceiling logic")
 
@@ -1500,42 +1912,81 @@ class WakeupRoutine(hass.Hass):
 
     # ---------- cancellation & safety ----------
     def _attach_cancel_listeners(self):
+        if getattr(self, "_snooze_return_in_progress", False):
+            return
+        self._wake_cancel_handles = []
+        generation = getattr(self, "_wake_cancel_generation", 0)
         # Presence watchers (stop media & lights if both leave)
         for p in self.persons:
-            self.cancel_listeners.append(self.listen_state(self._on_presence_change, p))
+            handle = self.listen_state(self._on_presence_change, p, generation=generation)
+            self.cancel_listeners.append(handle)
+            self._wake_cancel_handles.append(handle)
         # Alarm toggle off stops the whole routine - but only for a SCHEDULED fire. For a
         # manual "Wake up now" run the toggle is not the arming state (see the toggle guard
         # in _alarm_fire), so an off-edge here must not _stop_all a run the user explicitly
         # asked for. This is exactly what killed the run this morning at 07:46:54
         # (2026-08-10). Presence listeners above still apply either way.
         if not self._manual_fire_in_progress:
-            self.cancel_listeners.append(self.listen_state(self._on_alarm_toggle, self.alarm_enabled_entity))
+            handle = self.listen_state(self._on_alarm_toggle, self.alarm_enabled_entity, generation=generation)
+            self.cancel_listeners.append(handle)
+            self._wake_cancel_handles.append(handle)
+
+    def _remove_wake_cancel_listeners(self):
+        self._wake_cancel_generation = getattr(self, "_wake_cancel_generation", 0) + 1
+        for handle in getattr(self, "_wake_cancel_handles", []):
+            try:
+                self.cancel_listen_state(handle)
+            except Exception:
+                pass
+            if handle in getattr(self, "cancel_listeners", []):
+                self.cancel_listeners.remove(handle)
+        self._wake_cancel_handles = []
+
+    def _invalidate_light_wait(self):
+        self._light_generation = getattr(self, "_light_generation", 0) + 1
+        self._alarm_fired_at = None
+        if getattr(self, "cover_listener", None):
+            try:
+                self.cancel_listen_state(self.cover_listener)
+            except Exception:
+                pass
+            self.cover_listener = None
 
     def _attach_cancel_listeners_light(self):
+        self._light_cancel_handles = []
+        generation = getattr(self, "_light_generation", 0)
         # Stop the ramp when darkness logic says bright (state, pending_target, lux - same as bedroom_lights)
-        self.cancel_listeners.append(
-            self.listen_state(self._on_room_darkness_for_wake, self.bedroom_state_entity)
-        )
-        self.cancel_listeners.append(
-            self.listen_state(
-                self._on_room_darkness_for_wake,
-                self.bedroom_state_entity,
-                attribute="pending_target",
-            )
-        )
+        self._light_cancel_handles.append(self.listen_state(
+            self._on_room_darkness_for_wake, self.bedroom_state_entity, generation=generation))
+        self._light_cancel_handles.append(self.listen_state(
+            self._on_room_darkness_for_wake, self.bedroom_state_entity, attribute="pending_target", generation=generation))
+        self.cancel_listeners.extend(self._light_cancel_handles)
         # Bed-light session listener has its own slot (not cancel_listeners) since it must be
         # torn down by _stop_light_ramp specifically, same lifetime as the ramp.
         self._session_listener = self.listen_state(
-            self._on_bed_session_change, self.bed_session_entity
+            self._on_bed_session_change, self.bed_session_entity, generation=generation
         )
 
     def _on_alarm_toggle(self, entity, attr, old, new, kwargs):
+        if ("generation" in kwargs
+                and kwargs["generation"] != getattr(self, "_wake_cancel_generation", 0)):
+            return
+        if getattr(self, "_session_status", "idle") == "snoozing":
+            return
         if new == "off": self._stop_all("Alarm toggle turned off")
 
     def _on_presence_change(self, entity, attr, old, new, kwargs):
+        if ("generation" in kwargs
+                and kwargs["generation"] != getattr(self, "_wake_cancel_generation", 0)):
+            return
+        if getattr(self, "_session_status", "idle") == "snoozing":
+            return
         if self._both_away(): self._stop_all("Both users left home")
 
     def _on_room_darkness_for_wake(self, entity, attr, old, new, kwargs):
+        if ("generation" in kwargs
+                and kwargs["generation"] != getattr(self, "_light_generation", 0)):
+            return
         if not self.ramp_active:
             return
         if self._room_dark_for_wake_light():
@@ -1555,27 +2006,65 @@ class WakeupRoutine(hass.Hass):
         # Always restore Adaptive Lighting brightness adaptation even if ramp never started
         self._resume_adaptive_brightness()
         self._stop_light_ramp()
+        self._invalidate_light_wait()
         self._cleanup_listeners()
+        self._cancel_snooze_timer()
+        self._session_status = "stopped"
+        self._session_reason = "stopped"
+        self._radio_playing = False
+        self._persist_wake_session()
+        self._publish_wake_session()
+        self._queue_wake_notification("clear")
 
     def _finish_ramp(self, reason=None):
         if reason: self.log(f"[wake] Finishing light ramp: {reason}", log=self.user_log)
         self._stop_light_ramp()
 
     def _stop_media(self):
+        self._media_generation = getattr(self, "_media_generation", 0) + 1
+        self._media_running = False
         self.volume_active = False
-        # Do not cancel expired timer handles; just clear
+        if getattr(self, "volume_timer", None) is not None:
+            try:
+                self.cancel_timer(self.volume_timer)
+            except Exception:
+                pass
         self.volume_timer = None
+        try:
+            watchdog = self.get_app("RadioWatchdog")
+            if watchdog is not None:
+                watchdog.suppress_restart(getattr(self, "watchdog_players", [self.master_player] + self.join_players))
+        except Exception as e:
+            if not getattr(self, "_watchdog_suppress_failed", False):
+                self._watchdog_suppress_failed = True
+                self.log(f"[wake] Radio watchdog suppression unavailable: {e}", level="WARNING", log=self.user_log)
         for e in set([self.master_player] + self.join_players):
             try:
                 self.call_service("media_player/media_stop", entity_id=e)
             except Exception:
-                self.call_service("media_player/turn_off", entity_id=e)
+                try:
+                    self.call_service("media_player/turn_off", entity_id=e)
+                except Exception as error:
+                    self.log(f"[wake] Could not stop {e}: {error}", level="WARNING", log=self.user_log)
 
     def _stop_light_ramp(self):
+        self._light_generation = getattr(self, "_light_generation", 0) + 1
         self.ramp_active = False
-        # Do not cancel expired timer handles; just clear
+        if getattr(self, "ramp_timer", None) is not None:
+            try:
+                self.cancel_timer(self.ramp_timer)
+            except Exception:
+                pass
         self.ramp_timer = None
-        if self._session_listener is not None:
+        for handle in getattr(self, "_light_cancel_handles", []):
+            try:
+                self.cancel_listen_state(handle)
+            except Exception:
+                pass
+            if handle in getattr(self, "cancel_listeners", []):
+                self.cancel_listeners.remove(handle)
+        self._light_cancel_handles = []
+        if getattr(self, "_session_listener", None) is not None:
             try: self.cancel_listen_state(self._session_listener)
             except Exception: pass
             self._session_listener = None

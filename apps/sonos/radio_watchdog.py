@@ -15,7 +15,7 @@ Deliberately conservative:
   - every action is notified - silence from this app means it did nothing
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import appdaemon.plugins.hass.hassapi as hass
 
@@ -57,6 +57,8 @@ class RadioWatchdog(hass.Hass):
         self._playing_since = {}
         self._last_content = {}
         self._last_attempt = {}
+        self._suppressed_until = {}
+        self._stop_generations = {}
         # get_app must be resolved in sync init - async context returns a Task.
         self._notifier = self.get_app("MobileNotifier")
 
@@ -64,6 +66,20 @@ class RadioWatchdog(hass.Hass):
             self.listen_state(self._on_player, p, player=p)
 
         self._seed_playing_state()
+
+    def suppress_restart(self, players, seconds=30):
+        until = datetime.now() + timedelta(seconds=seconds)
+        for player in players:
+            if player not in self.players:
+                continue
+            self._suppressed_until[player] = until
+            self._stop_generations[player] = self._stop_generations.get(player, 0) + 1
+            self._playing_since.pop(player, None)
+            self._last_content.pop(player, None)
+
+    def _restart_suppressed(self, player):
+        until = getattr(self, "_suppressed_until", {}).get(player)
+        return until is not None and datetime.now() < until
 
     def _seed_playing_state(self):
         """Seed _playing_since/_last_content for players already playing at app start.
@@ -94,7 +110,8 @@ class RadioWatchdog(hass.Hass):
             cid = self.get_state(player, attribute="media_content_id")
             if cid:
                 self._last_content[player] = cid
-        if old == "playing" and new in ("idle", "off") and self.enabled:
+        if (old == "playing" and new in ("idle", "off") and self.enabled
+                and not self._restart_suppressed(player)):
             self.run_in(self._check_dead, self.check_delay_s, player=player)
 
     def _check_dead(self, kwargs):
@@ -102,6 +119,9 @@ class RadioWatchdog(hass.Hass):
 
     async def _check_dead_async(self, player):
         try:
+            generation = getattr(self, "_stop_generations", {}).get(player, 0)
+            if self._restart_suppressed(player):
+                return
             cid = self._last_content.get(player)
             if not looks_like_radio(cid):
                 return
@@ -116,6 +136,9 @@ class RadioWatchdog(hass.Hass):
                 return  # not the coordinator
             last = self._last_attempt.get(player)
             if last and (datetime.now() - last).total_seconds() < self.cooldown_minutes * 60:
+                return
+            if (self._restart_suppressed(player)
+                    or generation != getattr(self, "_stop_generations", {}).get(player, 0)):
                 return
             self._last_attempt[player] = datetime.now()
 
@@ -144,6 +167,8 @@ class RadioWatchdog(hass.Hass):
 
     async def _verify_async(self, player, cid):
         try:
+            if self._restart_suppressed(player):
+                return
             ok = (await self.get_state(player)) == "playing"
             msg = (f"Radio stream died on {self.friendly_name(player)} - resumed it."
                    if ok else
