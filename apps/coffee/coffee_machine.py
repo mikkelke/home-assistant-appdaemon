@@ -445,11 +445,6 @@ class CoffeeMachine(hass.Hass):
 
     def _on_fault(self, entity, attribute, old, new, kwargs):
         self._values[entity] = {"state": new}
-        if new == "no_water" and old == "ok" and not self._tracker.active() and not self._tank.dry:
-            used = self._tank.empty(self._now_dt())
-            if used is not None:
-                self._info(f"Water tank empty after {used:.0f} ml, seen while idle")
-                self._save_state()
         self._apply(self._tracker.fault(new, self._now()))
         self._publish_state()
 
