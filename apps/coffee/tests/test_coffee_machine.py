@@ -827,10 +827,10 @@ class TankTests(unittest.TestCase):
 
     def test_unknown_until_the_first_fill(self):
         app = fake.make_app()
-        self.assertEqual(coffee_state(app)[1]["tank_ml"], "946")
+        self.assertEqual(coffee_state(app)[1]["tank_ml"], "760")
         brew(app)
         attrs = coffee_state(app)[1]
-        self.assertEqual(attrs["tank_ml"], "946")
+        self.assertEqual(attrs["tank_ml"], "760")
         self.assertNotIn("tank_left_ml", attrs)
         self.assertNotIn("tank_filled_at", attrs)
         self.assertEqual(coffee_state(fake.make_app(tank_ml=1000))[1]["tank_ml"], "1000")
@@ -839,14 +839,14 @@ class TankTests(unittest.TestCase):
         app = fake.make_app()
         fake.op(app, "water_filled")
         attrs = coffee_state(app)[1]
-        self.assertEqual((attrs["tank_left_ml"], attrs["tank_filled_at"]), ("946", cm.cf.iso(T0)))
+        self.assertEqual((attrs["tank_left_ml"], attrs["tank_filled_at"]), ("760", cm.cf.iso(T0)))
         self.assertIn(("INFO", "Water tank filled"), app.logs)
         brew(app)
         self.assertEqual(fake.ledger(app)[-1]["water_ml"], 255.0)
-        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "691")
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "505")
         app._debit_water(app._tracker.last)
         app._publish_state(force=True)
-        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "691")
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "505")
 
     def test_the_tank_is_saved_with_the_beans_and_survives_a_restart(self):
         app = fake.make_app()
@@ -857,7 +857,7 @@ class TankTests(unittest.TestCase):
                          (cm.cf.iso(T0), 255.0, BREW_ID))
         again = fake.make_app(state_dir=app.dir, now=app.now, states=app.states)
         attrs = coffee_state(again)[1]
-        self.assertEqual((attrs["tank_left_ml"], attrs["tank_filled_at"]), ("691", cm.cf.iso(T0)))
+        self.assertEqual((attrs["tank_left_ml"], attrs["tank_filled_at"]), ("505", cm.cf.iso(T0)))
 
     def test_a_stopped_brew_takes_the_water_it_poured(self):
         app = fake.make_app()
@@ -869,7 +869,7 @@ class TankTests(unittest.TestCase):
         record = fake.ledger(app)[-1]
         self.assertEqual(record["outcome"], "stopped")
         self.assertTrue(0 < record["water_ml"] < 255)
-        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], str(int(round(946 - record["water_ml"]))))
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], str(int(round(760 - record["water_ml"]))))
 
     def test_a_brew_stopped_before_the_first_pour_takes_nothing(self):
         app = fake.make_app()
@@ -879,14 +879,14 @@ class TankTests(unittest.TestCase):
                                                            "context": {"coffee_brew_id": BREW_ID}})))
         fake.replay(app, tape)
         self.assertEqual(fake.ledger(app)[-1]["outcome"], "stopped")
-        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "946")
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "760")
 
     def test_a_fill_before_the_first_pour_leaves_no_offset_behind_when_the_brew_is_stopped(self):
         stop = {"by": "machine", "ground": True, "run_id": "r1", "context": {"coffee_brew_id": BREW_ID}}
         app = self.mid_brew([(15, ("state", "sensor.xbloom_studio_water_dispensed", "3.0")),
                              (16, ("op", "water_filled")), (21, ("event", "xbloom_brew_stopped", stop))], until=20)
         self.assertEqual(coffee_state(app)[0], "stopped")
-        self.assertEqual((app._tank.offset_ml, coffee_state(app)[1]["tank_left_ml"]), (None, "946"))
+        self.assertEqual((app._tank.offset_ml, coffee_state(app)[1]["tank_left_ml"]), (None, "760"))
 
     def test_a_plug_only_brew_takes_the_usuals_pours(self):
         app = fake.make_app()
@@ -899,7 +899,7 @@ class TankTests(unittest.TestCase):
         record = fake.ledger(app)[-1]
         self.assertEqual(record["source"], "power")
         self.assertNotIn("water_ml", record)
-        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "691")
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "505")
 
     def test_no_water_mid_brew_empties_the_tank_once_and_the_rest_of_the_brew_is_no_refill(self):
         seen = []
@@ -923,7 +923,7 @@ class TankTests(unittest.TestCase):
         self.assertTrue(app._tank.dry)
         fake.fire(app, "mobile_app_notification_action", {"action": "COFFEE_WATER_FILLED"}, MIKKEL)
         self.assertFalse(app._tank.dry)
-        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "946")
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "760")
 
     def test_no_water_while_idle_empties_the_tank_but_a_reconnect_does_not(self):
         app = fake.make_app()
@@ -953,7 +953,7 @@ class TankTests(unittest.TestCase):
                              (120, ("op", "water_filled"))])
         self.assertTrue(0 < seen[0] < seen[1] < 255)
         self.assertEqual(len(app._tank.empties), 1)
-        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], str(int(round(946 - (255 - seen[1])))))
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], str(int(round(760 - (255 - seen[1])))))
         self.assertEqual(coffee_state(app)[1]["tank_filled_at"], cm.cf.iso(T0 + 120))
 
     def test_a_fill_between_brews_leaves_no_offset(self):
@@ -962,7 +962,7 @@ class TankTests(unittest.TestCase):
         self.assertGreater(app._tracker.water, 0)
         fake.op(app, "water_filled")
         self.assertIsNone(app._tank.offset_ml)
-        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "946")
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "760")
 
     def test_a_brew_the_machine_fails_for_no_water_empties_the_tank(self):
         app = fake.make_app()
