@@ -63,7 +63,7 @@ RESTORED = (None, "unavailable", "unknown")
 VARIANTS = ("usual", "base", "tweak", "other")
 PEOPLE = cw.PEOPLE
 OPS = ("start", "cup_confirmed", "cancel", "stop", "pause", "resume", "connect", "notify", "picked_up", "rate",
-       "beans_add", "beans_undo", "water_filled", "select", "trial_accept", "trial_undo", "trial_keep",
+       "beans_add", "beans_undo", "water_filled", "select", "save_brew", "trial_accept", "trial_undo", "trial_keep",
        "trial_revert", "advice_dismiss", "advisor_reply")
 RATE_PREFIX = "COFFEE_RATE|"
 WATER_FILLED_ACTION = "COFFEE_WATER_FILLED"
@@ -1357,6 +1357,28 @@ class CoffeeMachine(hass.Hass):
             return
         self._set_usual(recipe, now)
 
+    def _op_save_brew(self, user, data, now):
+        brew_id = data.get("brew_id")
+        brew = self._tracker.brew if self._tracker.brew and self._tracker.brew.get("id") == brew_id else None
+        brew = brew or next((r for r in self._records if r.get("id") == brew_id), None)
+        used = (brew or {}).get("recipe")
+        if not isinstance(used, dict) or not used.get("name") or not used.get("pours"):
+            self._warn(f"save_brew ignored: {ascii_text(brew_id, 40)}")
+            return
+        self.create_task(self._save_brew(brew_id, used))
+
+    async def _save_brew(self, brew_id, used):
+        self._handoff[f"save:{brew_id}"] = await self._write_recipe(used["name"], lambda raw: cp.saved(raw, used))
+        await self.run_in(self._on_brew_saved, 0, brew_id=brew_id, name=used["name"])
+
+    def _on_brew_saved(self, kwargs):
+        error = self._handoff.pop(f"save:{kwargs.get('brew_id')}", None)
+        if error:
+            self._warn(f"save_brew {kwargs.get('brew_id')} failed: {error}")
+            return
+        self._info(f"{kwargs.get('name')} saved from brew {kwargs.get('brew_id')}")
+        self._refresh_recipes({})
+
     def _set_usual(self, recipe, now):
         self._usual_id = recipe["id"]
         self._info(f"Usual is now {recipe['name']}")
@@ -1401,24 +1423,30 @@ class CoffeeMachine(hass.Hass):
         self.create_task(self._keep_grind(usual["name"], int(grind)))
 
     async def _keep_grind(self, name, grind):
-        error = None
+        self._handoff["keep"] = await self._write_recipe(name, lambda raw: {**raw, "grind_size": grind,
+                                                                             "grinder_size": grind})
+        await self.run_in(self._on_kept, 0)
+
+    async def _write_recipe(self, name, change):
+        """Rewrites the library recipe `name` as `change(raw)` returns it. None when saved, else the error."""
         try:
             envelope = await asyncio.wait_for(self.call_service("xbloom/get_recipe", name=name, return_response=True),
                                               timeout=SERVICE_TIMEOUT_S)
             recipe = response_data(envelope, "recipe")
             if not isinstance(recipe, dict):
                 raise ValueError("recipe not found")
-            recipe = {**recipe, "grind_size": grind, "grinder_size": grind}
+            recipe = change(recipe)
+            if recipe is None:
+                raise ValueError("the pours differ")
             envelope = await asyncio.wait_for(
                 self.call_service("xbloom/update_recipe", recipe_json=json.dumps(recipe), return_response=True),
                 timeout=SERVICE_TIMEOUT_S)
             answer = response_data(envelope) or {}
             if not answer.get("ok"):
                 raise ValueError(answer.get("error") or "update refused")
+            return None
         except Exception as e:
-            error = repr(e)
-        self._handoff["keep"] = error
-        await self.run_in(self._on_kept, 0)
+            return repr(e)
 
     def _on_kept(self, kwargs):
         error = self._handoff.pop("keep", None)

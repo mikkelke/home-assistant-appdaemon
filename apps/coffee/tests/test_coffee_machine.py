@@ -360,6 +360,27 @@ class StartTests(unittest.TestCase):
         self.assertEqual(calls(app, "xbloom/update_recipe"), [])
         self.assertEqual(fake.last(app, "sensor.coffee_recipes")[1]["usual_id"], "81696")
 
+    def test_a_tweaked_brew_saves_into_its_recipe_while_it_runs(self):
+        app = fake.make_app()
+        fake.set_entity(app, "switch.xbloom_studio_connect", "on")
+        fake.fire(app, "xbloom_connect_ready", {"summary": {}})
+        fake.op(app, "start", {"variant": "tweak", "dose": 16, "ratio": 16, "grind_size": 42, "temperature": 90})
+        brew_id = app._tracker.brew["id"]
+        app.responses["xbloom/get_recipe"] = fake.ok({"recipe": dict(fake.USUAL)})
+        app.responses["xbloom/update_recipe"] = fake.ok({"ok": True, "name": "4 Pour Recipe"})
+        fake.op(app, "save_brew", {"brew_id": brew_id})
+        saved = json.loads(calls(app, "xbloom/update_recipe")[0]["recipe_json"])
+        self.assertEqual((saved["id"], saved["dose_g"], saved["ratio"], saved["grind_size"]), ("81696", 16.0, "1:16", 42))
+        self.assertAlmostEqual(sum(p["volume_ml"] for p in saved["pours"]), 256.0, delta=0.2)
+        self.assertEqual({p["temperature_c"] for p in saved["pours"]}, {90.0})
+        self.assertEqual(calls(app, "xbloom/get_recipe")[-1]["name"], "4 Pour Recipe")
+
+    def test_save_brew_for_an_unknown_brew_does_nothing(self):
+        app = fake.make_app()
+        fake.op(app, "save_brew", {"brew_id": "c1"})
+        self.assertEqual(calls(app, "xbloom/update_recipe"), [])
+        self.assertTrue(any(level == "WARNING" for level, _ in app.logs))
+
     def test_invalid_ops_are_ignored(self):
         app = fake.make_app()
         for name, data in (("start", {"variant": "tweak", "dose": 99}), ("start", {"variant": "tweak", "temperature": 99}),

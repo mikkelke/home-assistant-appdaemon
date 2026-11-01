@@ -138,6 +138,20 @@ class OverrideTests(unittest.TestCase):
         self.assertAlmostEqual(tweak["pours"][0]["ml"], 42.7, places=1)
 
 
+class SavedTests(unittest.TestCase):
+    def test_only_what_the_brew_changed_is_written(self):
+        used = cp.with_overrides(cp.normalize(USUAL_STORED), grind=44, temperature=91)
+        out = cp.saved(USUAL_STORED, used)
+        self.assertEqual((out["grind_size"], out["grinder_size"], out["dose_g"], out["ratio"]), (44, 44, 15.0, "1:17"))
+        self.assertEqual([p["temperature_c"] for p in out["pours"]], [91.0] * 4)
+        self.assertEqual([p["volume_ml"] for p in out["pours"]], [45.0, 80.0, 65.0, 65.0])
+        self.assertEqual(USUAL_STORED["pours"][0]["temperature_c"], 93.0)
+
+    def test_a_brew_with_other_pours_is_refused(self):
+        used = cp.normalize(USUAL_STORED)
+        self.assertIsNone(cp.saved(BUILT, used))
+
+
 class EntryTests(unittest.TestCase):
     def test_the_recipes_entry_is_strings(self):
         entry = cp.recipe_entry(cp.normalize(USUAL_SHARED))

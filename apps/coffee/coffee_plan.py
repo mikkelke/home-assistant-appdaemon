@@ -185,6 +185,27 @@ def recipe_entry(recipe):
     return {key: value for key, value in entry.items() if value != ""}
 
 
+def saved(raw, used):
+    """The integration's recipe `raw` with what the brew's `used` recipe changed in it: dose, ratio, grind and each
+    pour's volume and temperature. What it left alone stays as stored. None when the pours do not line up."""
+    base = normalize(raw)
+    if base is None or len(raw["pours"]) != len(base["pours"]) or len(base["pours"]) != len(used["pours"]):
+        return None
+    out = {**raw, "pours": [dict(p) for p in raw["pours"]]}
+    if used["dose_g"] != base["dose_g"]:
+        out["dose_g"] = used["dose_g"]
+    if used.get("ratio") and used["ratio"] != base["ratio"]:
+        out.update(ratio=f"1:{used['ratio']:g}", water_ratio=used["ratio"])
+    if used.get("grind") is not None and used["grind"] != base["grind"]:
+        out.update(grind_size=used["grind"], grinder_size=used["grind"])
+    for pour, was, now in zip(out["pours"], base["pours"], used["pours"]):
+        if now["ml"] != was["ml"]:
+            pour["volume_ml"] = now["ml"]
+        if now["temp_c"] != was["temp_c"]:
+            pour["temperature_c"] = now["temp_c"]
+    return out
+
+
 def by_id(recipes, recipe_id):
     return next((r for r in recipes if r["id"] == str(recipe_id)), None) if recipe_id else None
 
