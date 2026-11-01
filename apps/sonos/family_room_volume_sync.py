@@ -15,6 +15,7 @@ PARTY_CHECK_S = 900
 BREAKER_SYNCS = 8         # syncs one group may make within BREAKER_WINDOW_S
 BREAKER_WINDOW_S = 60
 BREAKER_PAUSE_S = 600     # how long the app stops when a group goes past that
+RESET_HOLD_S = 4          # quiet period after a sonos_reset_volume event, longer than a speaker takes to report
 
 
 class FamilyRoomVolumeSync(hass.Hass):
@@ -62,6 +63,9 @@ class FamilyRoomVolumeSync(hass.Hass):
     it on drops the moves collected so far. A periodic check switches the helper off again
     once it has been on for more than party_mode_max_hours; a Home Assistant restart restarts
     that clock.
+
+    A sonos_reset_volume event (one speaker sent back to its configured volume) pauses the app
+    for RESET_HOLD_S, so the other speakers do not follow that move.
     """
 
     def initialize(self):
@@ -101,6 +105,8 @@ class FamilyRoomVolumeSync(hass.Hass):
             self._set_party(self.get_state(self.party_entity, attribute="all"))
             self.listen_state(self._on_party, self.party_entity, attribute="all")
             self.run_every(self._check_party_expiry, "now+60", PARTY_CHECK_S)
+
+        self.listen_event(self._on_reset_volume, "sonos_reset_volume")
 
         self.log("Scenario: FamilyRoomVolumeSync_loaded", level="INFO")
 
@@ -224,6 +230,9 @@ class FamilyRoomVolumeSync(hass.Hass):
             level="INFO",
         )
         self._call("input_boolean/turn_off", entity_id=self.party_entity)
+
+    def _on_reset_volume(self, event_name, data, kwargs):
+        self._stopped_until = max(self._stopped_until, self._now() + RESET_HOLD_S)
 
     def _on_change(self, entity, attribute, old, new, kwargs):
         prev = self._snap.get(entity)

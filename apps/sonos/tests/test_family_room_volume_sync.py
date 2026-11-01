@@ -161,6 +161,7 @@ class Rig:
         app.args = copy.deepcopy(BASE_ARGS)
         app.get_state = self._get_state
         app.listen_state = MagicMock()
+        app.listen_event = MagicMock()
         app.run_in = self._run_in
         app.run_every = self._run_every
         app.call_service = self._call_service
@@ -287,6 +288,23 @@ class Rig:
             if (level is None or lvl == level) and (contains is None or contains in msg):
                 out.append(msg)
         return out
+
+
+class ResetVolumeHold(unittest.TestCase):
+    def test_a_speaker_reset_is_not_followed_by_the_others(self):
+        r = Rig()
+        r.app._on_reset_volume("sonos_reset_volume", {"entity_id": DINING}, {})
+        r.move(DINING, 0.12)
+        r.advance(2)
+        self.assertEqual(r.write_log, [])
+
+    def test_sync_resumes_after_the_hold(self):
+        r = Rig()
+        r.app._on_reset_volume("sonos_reset_volume", {"entity_id": DINING}, {})
+        r.advance(frvs.RESET_HOLD_S + 0.1)
+        r.move(KITCHEN, 0.23)
+        r.advance(1)
+        self.assertEqual(len(r.write_log), 3)
 
 
 class CoreSync(unittest.TestCase):

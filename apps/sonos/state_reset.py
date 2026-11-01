@@ -93,6 +93,9 @@ class SonosStateReset(hass.Hass):
         self.listen_event(self._manual_reset_targets, "sonos_reset_speakers")
         self.log("Listening for sonos_reset_speakers events", level="INFO")
 
+        # a single speaker back to its configured volume (dashboard long-press on its mute icon)
+        self.listen_event(self._on_reset_volume, "sonos_reset_volume")
+
         # Listen for Group Manager ready signal; only then execute reset (event-driven, not time-based)
         self.listen_event(self._on_reset_ready, "sonos_reset_ready")
         self.log("Listening for sonos_reset_ready (from Group Manager)", level="INFO")
@@ -555,6 +558,21 @@ class SonosStateReset(hass.Hass):
         # house-activity entry so a requested reset can say WHO wanted it, not "(manual_trigger)".
         req_source = data.get("source") if isinstance(data, dict) else None
         self._do_reset(valid_targets, trigger="manual_trigger", source=req_source)
+
+    def _on_reset_volume(self, event_name, data, kwargs):
+        """Triggered by event_type=sonos_reset_volume with an entity_id: that speaker returns to its
+        configured volume. Mute and grouping are left alone, so the write goes through the native
+        twin, whose SetVolume does not un-mute. FamilyRoomVolumeSync listens to the same event and
+        holds off, so the other family speakers do not follow."""
+        sp = data.get("entity_id") if isinstance(data, dict) else None
+        if sp not in self.speakers:
+            self.log(f"Ignoring sonos_reset_volume for unknown speaker: {sp}", level="WARNING")
+            return
+        twin = sp + "_2"
+        target = sp if self.get_state(twin) in (None, "unavailable", "unknown") else twin
+        vol = self.speaker_volumes.get(sp, self.default_volume)
+        self._safe_call_service("media_player/volume_set", entity_id=target, volume_level=vol)
+        self.log(f"reset_volume -> {sp} vol={vol}", level="INFO")
 
     def _auto_reset(self, kwargs):
         """Called when inactivity timer expires"""

@@ -170,3 +170,29 @@ class NormalCompletionCancelsWedgeTimer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResetVolume(unittest.TestCase):
+    def make(self, twin_state):
+        app = make_app()
+        app.speakers = ["media_player.dining_room"]
+        app.speaker_volumes = {"media_player.dining_room": 0.12}
+        app.get_state = lambda entity, attribute=None, **kw: twin_state
+        app.calls = []
+        app.call_service = lambda service, **kw: app.calls.append((service, kw))
+        return app
+
+    def test_speaker_goes_to_its_configured_volume_through_the_twin(self):
+        app = self.make("playing")
+        app._on_reset_volume("sonos_reset_volume", {"entity_id": "media_player.dining_room"}, {})
+        self.assertEqual(app.calls, [("media_player/volume_set", {"entity_id": "media_player.dining_room_2", "volume_level": 0.12})])
+
+    def test_unavailable_twin_falls_back_to_the_entity(self):
+        app = self.make("unavailable")
+        app._on_reset_volume("sonos_reset_volume", {"entity_id": "media_player.dining_room"}, {})
+        self.assertEqual(app.calls, [("media_player/volume_set", {"entity_id": "media_player.dining_room", "volume_level": 0.12})])
+
+    def test_unknown_speaker_is_ignored(self):
+        app = self.make("playing")
+        app._on_reset_volume("sonos_reset_volume", {"entity_id": "media_player.nope"}, {})
+        self.assertEqual(app.calls, [])
