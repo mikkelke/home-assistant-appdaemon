@@ -66,6 +66,7 @@ OPS = ("start", "cup_confirmed", "cancel", "stop", "pause", "resume", "connect",
        "beans_add", "beans_undo", "water_filled", "trial_accept", "trial_undo", "trial_keep",
        "trial_revert", "advice_dismiss", "advisor_reply")
 RATE_PREFIX = "COFFEE_RATE|"
+WATER_FILLED_ACTION = "COFFEE_WATER_FILLED"
 ENTITIES = ("coffee_state", "coffee_live", "coffee_baseline", "coffee_beans", "coffee_brews", "coffee_recipes",
             "coffee_advice")
 
@@ -444,6 +445,11 @@ class CoffeeMachine(hass.Hass):
 
     def _on_fault(self, entity, attribute, old, new, kwargs):
         self._values[entity] = {"state": new}
+        if new == "no_water" and old == "ok" and not self._tracker.active() and not self._tank.dry:
+            used = self._tank.empty(self._now_dt())
+            if used is not None:
+                self._info(f"Water tank empty after {used:.0f} ml, seen while idle")
+                self._save_state()
         self._apply(self._tracker.fault(new, self._now()))
         self._publish_state()
 
@@ -1181,8 +1187,10 @@ class CoffeeMachine(hass.Hass):
 
     async def _send_fault_push(self, person):
         try:
-            await self._notifier.notify(title="Coffee: no water", message="The xBloom reports its water tank is empty.",
-                                        target=[person], data={"data": {"tag": "coffee_fault"}}, link=self.push_link)
+            actions = [{"action": WATER_FILLED_ACTION, "title": "Filled"}]
+            await self._notifier.notify(title="Coffee: water low", message="Fill the xBloom's tank before the next cup.",
+                                        target=[person], data={"data": {"tag": "coffee_fault", "actions": actions}},
+                                        link=self.push_link)
         except Exception as e:
             self.log(ascii_text(f"Fault push failed: {e!r}"), level="WARNING")
 
@@ -1300,6 +1308,9 @@ class CoffeeMachine(hass.Hass):
 
     def _on_push_action(self, event_name, data, kwargs):
         action = (data or {}).get("action") if isinstance(data, dict) else None
+        if action == WATER_FILLED_ACTION:
+            self._op_water_filled(None, {}, self._now())
+            return
         if not isinstance(action, str) or not action.startswith(RATE_PREFIX):
             return
         parts = action.split("|")

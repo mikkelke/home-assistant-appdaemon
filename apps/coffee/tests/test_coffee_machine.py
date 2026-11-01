@@ -915,6 +915,28 @@ class TankTests(unittest.TestCase):
         self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "0")
         self.assertFalse(any("refilled" in line for _, line in app.logs))
 
+    def test_no_water_mid_brew_pushes_the_brewer_a_filled_button(self):
+        app = self.mid_brew([(90, ("state", "sensor.xbloom_studio_machine_status", "no_water"))])
+        push = next(p for p in app.notifier.sent if p["data"]["data"]["tag"] == "coffee_fault")
+        self.assertEqual((push["title"], push["target"]), ("Coffee: water low", ["mikkel"]))
+        self.assertEqual(push["data"]["data"]["actions"], [{"action": "COFFEE_WATER_FILLED", "title": "Filled"}])
+        self.assertTrue(app._tank.dry)
+        fake.fire(app, "mobile_app_notification_action", {"action": "COFFEE_WATER_FILLED"}, MIKKEL)
+        self.assertFalse(app._tank.dry)
+        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "946")
+
+    def test_no_water_while_idle_empties_the_tank_but_a_reconnect_does_not(self):
+        app = fake.make_app()
+        fake.op(app, "water_filled")
+        fake.set_entity(app, "sensor.xbloom_studio_machine_status", "ok")
+        fake.set_entity(app, "sensor.xbloom_studio_machine_status", "no_water")
+        self.assertEqual((app._tank.dry, coffee_state(app)[1]["tank_left_ml"]), (True, "0"))
+        self.assertIn(("INFO", "Water tank empty after 0 ml, seen while idle"), app.logs)
+        fake.op(app, "water_filled")
+        fake.set_entity(app, "sensor.xbloom_studio_machine_status", "unavailable")
+        fake.set_entity(app, "sensor.xbloom_studio_machine_status", "no_water")
+        self.assertFalse(app._tank.dry)
+
     def test_a_second_fault_or_the_end_of_the_brew_does_not_empty_it_again(self):
         stop = {"by": "machine", "ground": True, "run_id": "r1", "context": {"coffee_brew_id": BREW_ID}}
         app = self.mid_brew([(90, ("state", "sensor.xbloom_studio_machine_status", "no_water")),
@@ -954,13 +976,6 @@ class TankTests(unittest.TestCase):
                          ("failed", "fault", ["no_water"]))
         self.assertEqual(len(app._tank.empties), 1)
         self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "0")
-
-    def test_no_water_with_no_brew_leaves_the_tank_alone(self):
-        app = fake.make_app()
-        fake.op(app, "water_filled")
-        fake.set_entity(app, "sensor.xbloom_studio_machine_status", "no_water")
-        self.assertEqual(app._tank.empties, [])
-        self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "946")
 
 
 class AdvisorTests(unittest.TestCase):
