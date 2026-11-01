@@ -348,24 +348,22 @@ class StartTests(unittest.TestCase):
         fake.op(app, "select", {"recipe_id": "nope"})
         self.assertEqual(fake.last(app, "sensor.coffee_recipes")[1]["usual_id"], "7654321")
 
-    def test_adjust_saves_grind_and_shifts_every_pour_temperature(self):
+    def test_a_tweak_sends_grind_and_temperature_for_this_brew_only(self):
         app = fake.make_app()
-        recipe = {**fake.USUAL, "pours": [{**p, "temperature_c": t} for p, t in zip(fake.USUAL["pours"], (93, 93, 93, 85))]}
-        app.responses["xbloom/get_recipe"] = fake.ok({"recipe": recipe})
-        app.responses["xbloom/update_recipe"] = fake.ok({"ok": True, "name": "4 Pour Recipe"})
-        fake.op(app, "adjust", {"grind_size": 42, "temperature": 90})
-        saved = json.loads(calls(app, "xbloom/update_recipe")[-1]["recipe_json"])
-        self.assertEqual((saved["id"], saved["grind_size"], saved["grinder_size"]), ("81696", 42, 42))
-        self.assertEqual([p["temperature_c"] for p in saved["pours"]], [90.0, 90.0, 90.0, 82.0])
-        fake.op(app, "adjust", {"temperature": 90})
-        saved = json.loads(calls(app, "xbloom/update_recipe")[-1]["recipe_json"])
-        self.assertEqual(saved["grinder_size"], fake.USUAL["grinder_size"])
-        fake.op(app, "adjust", {"grind_size": 99})
-        self.assertEqual(len(calls(app, "xbloom/update_recipe")), 2)
+        fake.set_entity(app, "switch.xbloom_studio_connect", "on")
+        fake.fire(app, "xbloom_connect_ready", {"summary": {}})
+        fake.op(app, "start", {"variant": "tweak", "grind_size": 42, "temperature": 90})
+        sent = calls(app, "xbloom/start_brew")[-1]
+        self.assertEqual((sent["grind_size"], sent["temperature"]), (42, 90.0))
+        recipe = app._tracker.brew["recipe"]
+        self.assertEqual((recipe["grind"], [p["temp_c"] for p in recipe["pours"]]), (42, [90.0] * 4))
+        self.assertEqual(calls(app, "xbloom/update_recipe"), [])
+        self.assertEqual(fake.last(app, "sensor.coffee_recipes")[1]["usual_id"], "81696")
 
     def test_invalid_ops_are_ignored(self):
         app = fake.make_app()
-        for name, data in (("start", {"variant": "tweak", "dose": 99}), ("start", {"variant": "espresso"}),
+        for name, data in (("start", {"variant": "tweak", "dose": 99}), ("start", {"variant": "tweak", "temperature": 99}),
+                           ("start", {"variant": "espresso"}),
                            ("brew", {}), ("notify", {"person": "bob"}), ("rate", {"brew_id": "c1", "taste": "meh"})):
             fake.op(app, name, data)
         fake.fire(app, "coffee_command", {"op": "start", "data": "{not json"}, TABLET)

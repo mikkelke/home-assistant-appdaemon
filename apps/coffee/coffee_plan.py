@@ -91,12 +91,16 @@ def normalize(recipe):
     return out
 
 
-def with_overrides(recipe, dose=None, ratio=None, grind=None):
+def with_overrides(recipe, dose=None, ratio=None, grind=None, temperature=None):
     """`recipe` as a brew with one-off overrides makes it: the pours scaled to dose x ratio, as the
-    integration's customizer does."""
+    integration's customizer does, and the first pour at `temperature` with the others moved alike."""
     out = json.loads(json.dumps(recipe))
     if grind is not None:
         out["grind"] = int(grind)
+    if temperature is not None and out["pours"]:
+        shift = float(temperature) - out["pours"][0]["temp_c"]
+        for pour in out["pours"]:
+            pour["temp_c"] = round(min(98.0, max(40.0, pour["temp_c"] + shift)), 1)
     if dose is None and ratio is None:
         return out
     dose = float(dose if dose is not None else recipe["dose_g"])
