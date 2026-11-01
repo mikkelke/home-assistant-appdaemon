@@ -63,7 +63,7 @@ RESTORED = (None, "unavailable", "unknown")
 VARIANTS = ("usual", "base", "tweak", "other")
 PEOPLE = cw.PEOPLE
 OPS = ("start", "cup_confirmed", "cancel", "stop", "pause", "resume", "connect", "notify", "picked_up", "rate",
-       "beans_add", "beans_undo", "water_filled", "trial_accept", "trial_undo", "trial_keep",
+       "beans_add", "beans_undo", "water_filled", "select", "adjust", "trial_accept", "trial_undo", "trial_keep",
        "trial_revert", "advice_dismiss", "advisor_reply")
 RATE_PREFIX = "COFFEE_RATE|"
 WATER_FILLED_ACTION = "COFFEE_WATER_FILLED"
@@ -1353,6 +1353,34 @@ class CoffeeMachine(hass.Hass):
         self._publish_state()
         self._save_state()
 
+    def _op_select(self, user, data, now):
+        recipe = cp.by_id(self._recipes, data.get("recipe_id"))
+        if recipe is None:
+            self._warn(f"select ignored: {ascii_text(data.get('recipe_id'), 40)}")
+            return
+        self._set_usual(recipe, now)
+
+    def _op_adjust(self, user, data, now):
+        usual = self._usual()
+        grind = number_in(data.get("grind_size"), 1, 80, True) if data.get("grind_size") is not None else None
+        temp = number_in(data.get("temperature"), 40, 98) if data.get("temperature") is not None else None
+        if usual is None or (grind is None and temp is None):
+            self._warn(f"adjust ignored: {ascii_text(json.dumps(data), 80)}")
+            return
+        self.create_task(self._adjust(usual["name"], grind, temp))
+
+    async def _adjust(self, name, grind, temp):
+        self._handoff["adjust"] = await self._edit_recipe(name, grind=grind, temp=temp)
+        await self.run_in(self._on_adjusted, 0, name=name, grind=grind, temp=temp)
+
+    def _on_adjusted(self, kwargs):
+        error = self._handoff.pop("adjust", None)
+        if error:
+            self._warn(f"adjust {kwargs.get('name')} failed: {error}")
+            return
+        self._info(f"{kwargs.get('name')} adjusted: grind {kwargs.get('grind')}, temperature {kwargs.get('temp')}")
+        self._refresh_recipes({})
+
     def _set_usual(self, recipe, now):
         self._usual_id = recipe["id"]
         self._info(f"Usual is now {recipe['name']}")
@@ -1397,24 +1425,35 @@ class CoffeeMachine(hass.Hass):
         self.create_task(self._keep_grind(usual["name"], int(grind)))
 
     async def _keep_grind(self, name, grind):
-        error = None
+        self._handoff["keep"] = await self._edit_recipe(name, grind=grind)
+        await self.run_in(self._on_kept, 0)
+
+    async def _edit_recipe(self, name, grind=None, temp=None):
+        """Saves `grind` and the first pour's temperature `temp` into the library recipe `name`; the other pours keep
+        their difference from the first. None when saved, else the error."""
         try:
             envelope = await asyncio.wait_for(self.call_service("xbloom/get_recipe", name=name, return_response=True),
                                               timeout=SERVICE_TIMEOUT_S)
             recipe = response_data(envelope, "recipe")
             if not isinstance(recipe, dict):
                 raise ValueError("recipe not found")
-            recipe = {**recipe, "grind_size": grind, "grinder_size": grind}
+            recipe = dict(recipe)
+            if grind is not None:
+                recipe.update(grind_size=grind, grinder_size=grind)
+            pours = recipe.get("pours") or []
+            if temp is not None and pours:
+                shift = temp - float(pours[0].get("temperature_c") or 93.0)
+                recipe["pours"] = [{**pour, "temperature_c": round(min(98.0, max(40.0, float(
+                    pour.get("temperature_c") or 93.0) + shift)), 1)} for pour in pours]
             envelope = await asyncio.wait_for(
                 self.call_service("xbloom/update_recipe", recipe_json=json.dumps(recipe), return_response=True),
                 timeout=SERVICE_TIMEOUT_S)
             answer = response_data(envelope) or {}
             if not answer.get("ok"):
                 raise ValueError(answer.get("error") or "update refused")
+            return None
         except Exception as e:
-            error = repr(e)
-        self._handoff["keep"] = error
-        await self.run_in(self._on_kept, 0)
+            return repr(e)
 
     def _on_kept(self, kwargs):
         error = self._handoff.pop("keep", None)

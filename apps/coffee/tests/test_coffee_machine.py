@@ -341,6 +341,28 @@ class StartTests(unittest.TestCase):
         again = fake.make_app(state_dir=app.dir, now=app.now + 1, states=app.states)
         self.assertEqual(fake.last(again, "sensor.coffee_recipes")[1]["usual_id"], "7654321")
 
+    def test_select_makes_a_recipe_the_one_the_button_brews(self):
+        app = fake.make_app()
+        fake.op(app, "select", {"recipe_id": "7654321"})
+        self.assertEqual(fake.last(app, "sensor.coffee_recipes")[1]["usual_id"], "7654321")
+        fake.op(app, "select", {"recipe_id": "nope"})
+        self.assertEqual(fake.last(app, "sensor.coffee_recipes")[1]["usual_id"], "7654321")
+
+    def test_adjust_saves_grind_and_shifts_every_pour_temperature(self):
+        app = fake.make_app()
+        recipe = {**fake.USUAL, "pours": [{**p, "temperature_c": t} for p, t in zip(fake.USUAL["pours"], (93, 93, 93, 85))]}
+        app.responses["xbloom/get_recipe"] = fake.ok({"recipe": recipe})
+        app.responses["xbloom/update_recipe"] = fake.ok({"ok": True, "name": "4 Pour Recipe"})
+        fake.op(app, "adjust", {"grind_size": 42, "temperature": 90})
+        saved = json.loads(calls(app, "xbloom/update_recipe")[-1]["recipe_json"])
+        self.assertEqual((saved["id"], saved["grind_size"], saved["grinder_size"]), ("81696", 42, 42))
+        self.assertEqual([p["temperature_c"] for p in saved["pours"]], [90.0, 90.0, 90.0, 82.0])
+        fake.op(app, "adjust", {"temperature": 90})
+        saved = json.loads(calls(app, "xbloom/update_recipe")[-1]["recipe_json"])
+        self.assertEqual(saved["grinder_size"], fake.USUAL["grinder_size"])
+        fake.op(app, "adjust", {"grind_size": 99})
+        self.assertEqual(len(calls(app, "xbloom/update_recipe")), 2)
+
     def test_invalid_ops_are_ignored(self):
         app = fake.make_app()
         for name, data in (("start", {"variant": "tweak", "dose": 99}), ("start", {"variant": "espresso"}),
