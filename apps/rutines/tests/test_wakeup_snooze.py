@@ -391,12 +391,12 @@ class WakeSession(unittest.TestCase):
         for method in ("_start_snooze", "_dismiss_wake", "_cancel_snooze", "_queue_wake_notification", "_on_wake_now"):
             setattr(app, method, MagicMock())
         app._snooze_minutes, app._snooze_curtain = 15, "open"
-        for action in ("OTHER", "WAKE_SNOOZE", "WAKE_DISMISS", "WAKE_SNOOZE_CANCEL", "WAKE_OPTIONS", "WAKE_NOW"):
+        for action in ("OTHER", "WAKE_SNOOZE", "WAKE_DISMISS", "WAKE_SNOOZE_CANCEL", "WAKE_NOW"):
             app._on_notification_action("mobile_app_notification_action", {"action": action}, {})
         app._start_snooze.assert_called_once_with(15, "open")
         app._dismiss_wake.assert_called_once()
         app._cancel_snooze.assert_called_once()
-        app._queue_wake_notification.assert_called_once_with("options")
+        app._queue_wake_notification.assert_not_called()
         app._on_wake_now.assert_not_called()
         app._session_status = "snoozing"
         app._on_notification_action("mobile_app_notification_action", {"action": "WAKE_NOW"}, {})
@@ -413,7 +413,9 @@ class WakeSession(unittest.TestCase):
         self.assertEqual(ring["data"]["importance"], "high")
         self.assertEqual(ring["data"]["visibility"], "public")
         self.assertTrue(ring["data"]["sticky"])
-        self.assertEqual([item["action"] for item in ring["data"]["actions"]], [f"{action}|{app._session_id}" for action in ("WAKE_SNOOZE", "WAKE_OPTIONS", "WAKE_DISMISS")])
+        ring_actions = ring["data"]["actions"]
+        self.assertEqual([item["action"] for item in ring_actions], [f"WAKE_SNOOZE|{app._session_id}", "URI", f"WAKE_DISMISS|{app._session_id}"])
+        self.assertEqual(ring_actions[1]["uri"], wb.ALARM_LINK + "=options")
         app._start_snooze(10, "open")
         self.drain_notifications(app)
         snooze = app.notifier.notify.await_args.kwargs
@@ -421,10 +423,6 @@ class WakeSession(unittest.TestCase):
         self.assertEqual(snooze["data"]["channel"], "wake_alarm_snooze")
         self.assertEqual(snooze["data"]["importance"], "low")
         self.assertEqual([item["action"] for item in snooze["data"]["actions"]], [f"{action}|{app._session_id}" for action in ("WAKE_SNOOZE_CANCEL", "WAKE_NOW")])
-        app._queue_wake_notification("options")
-        self.drain_notifications(app)
-        self.assertEqual(app.notifier.notify.await_args.kwargs["message"], "command_webview")
-        self.assertEqual(app.notifier.notify.await_args.kwargs["data"]["command"], wb.ALARM_LINK + "=options")
 
     def test_notification_stale_ring_does_not_replace_clear(self):
         app = self.make_app()
@@ -433,16 +431,6 @@ class WakeSession(unittest.TestCase):
         self.drain_notifications(app)
         app.notifier.notify.assert_not_awaited()
         app.notifier.clear_notification.assert_awaited_once()
-
-    def test_options_does_not_cancel_pending_lifecycle_notification(self):
-        app = self.make_app()
-        app._start_snooze(5, "open")
-        app._queue_wake_notification("options")
-        self.drain_notifications(app)
-        calls = app.notifier.notify.await_args_list
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0].kwargs["data"]["channel"], "wake_alarm_snooze")
-        self.assertEqual(calls[1].kwargs["message"], "command_webview")
 
     def test_restart_keeps_ringing_past_window_when_radio_plays_or_is_unknown(self):
         for state in ("playing", "unknown", None):

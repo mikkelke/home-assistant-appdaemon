@@ -10,8 +10,7 @@ class SessionActions(unittest.TestCase):
 
     def test_late_phone_actions_cannot_control_current_session(self):
         for action, status in (("WAKE_SNOOZE", "ringing"), ("WAKE_DISMISS", "ringing"),
-                               ("WAKE_SNOOZE_CANCEL", "snoozing"), ("WAKE_NOW", "snoozing"),
-                               ("WAKE_OPTIONS", "ringing")):
+                               ("WAKE_SNOOZE_CANCEL", "snoozing"), ("WAKE_NOW", "snoozing")):
             with self.subTest(action=action):
                 app = self.make_app()
                 app._session_id = "current"
@@ -70,4 +69,4 @@ class SessionActions(unittest.TestCase):
                 app._queue_wake_notification(kind)
             self.drain_notifications(app)
             actions = app.notifier.notify.await_args.kwargs["data"]["actions"]
-            self.assertTrue(all(action["action"].endswith("|current") for action in actions))
+            self.assertTrue(all(action["action"].endswith("|current") for action in actions if action["action"] != "URI"))

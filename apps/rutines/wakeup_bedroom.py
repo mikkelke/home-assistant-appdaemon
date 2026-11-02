@@ -649,9 +649,6 @@ class WakeupRoutine(hass.Hass):
         elif action == "WAKE_NOW":
             if getattr(self, "_session_status", "idle") == "snoozing":
                 self._on_wake_now(None, None, None, "notification", {})
-        elif action == "WAKE_OPTIONS":
-            if getattr(self, "_session_status", "idle") in ("ringing", "snoozing"):
-                self._queue_wake_notification("options")
 
     def _start_snooze(self, minutes, curtain):
         if getattr(self, "_session_status", "idle") not in ("ringing", "snoozing"):
@@ -745,8 +742,7 @@ class WakeupRoutine(hass.Hass):
     def _queue_wake_notification(self, kind):
         if not hasattr(self, "get_app"):
             return
-        if kind != "options":
-            self._notification_generation = getattr(self, "_notification_generation", 0) + 1
+        self._notification_generation = getattr(self, "_notification_generation", 0) + 1
         generation = getattr(self, "_notification_generation", 0)
         task = self._send_wake_notification(kind, generation)
         try:
@@ -765,16 +761,11 @@ class WakeupRoutine(hass.Hass):
             if getattr(self, "_notification_lock", None) is None:
                 self._notification_lock = asyncio.Lock()
             async with self._notification_lock:
-                if kind != "options" and generation != self._notification_generation:
+                if generation != self._notification_generation:
                     return
                 notifier = self.get_app("MobileNotifier")
                 if inspect.isawaitable(notifier):
                     notifier = await notifier
-                if kind == "options":
-                    if getattr(self, "_session_status", "idle") in ("ringing", "snoozing"):
-                        await notifier.notify(title="", message="command_webview", target=["mikkel"],
-                                              data={"command": ALARM_LINK + "=options"})
-                    return
                 if kind in ("clear", "ringing"):
                     await notifier.clear_notification(tag="wake_alarm", target=["mikkel"])
                 if generation != self._notification_generation or kind == "clear":
@@ -795,11 +786,12 @@ class WakeupRoutine(hass.Hass):
                     room = "curtain closed" if self._snooze_curtain == "closed" else "keep room"
                     data["actions"] = [
                         {"action": "WAKE_SNOOZE", "title": f"Snooze {self._snooze_minutes} - {room}"},
-                        {"action": "WAKE_OPTIONS", "title": "Options"},
+                        {"action": "URI", "title": "Options", "uri": ALARM_LINK + "=options"},
                         {"action": "WAKE_DISMISS", "title": "Stop radio"},
                     ]
                 for action in data["actions"]:
-                    action["action"] += "|" + self._session_id
+                    if action["action"] != "URI":
+                        action["action"] += "|" + self._session_id
                 await notifier.notify(title=title, message=message, target=["mikkel"], data=data, link=ALARM_LINK)
         except Exception as e:
             self._log_notification_failure(e)
