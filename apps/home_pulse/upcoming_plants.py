@@ -1,13 +1,13 @@
-"""Watering reminders for sensor.house_upcoming: one row for the houseplants that need water now, and a row
-of its own for each calendar plant the day before. Pure: each step takes the persisted state and returns
-new state.
+"""Watering reminders for sensor.house_upcoming: one row for each houseplant that needs water. Pure:
+each step takes the persisted state and returns new state.
 
 A plant (the `plants` list in house_upcoming.yaml) has either a soil moisture sensor, `moisture`, or a
 calendar interval, `every_days`, never both, and optionally a `water` amount in litres. The row's title
 is "Water the <name>: <litres> L", and gives up name characters before it gives up the amount. A plant
 may also say what it looks like, `aka`, and where it stands, `where`: plain text of one line, which
-lead the info lines of the row's sheet and are in its record in `maint:plants`. Its `photo`, the key of
-its picture, is lowercase letters, digits and underscores, and goes in the record only.
+lead the info lines of the row's sheet. Its `photo`, the key of its picture in the dashboard, is lowercase
+letters, digits and underscores, and is the `photo` of every row the plant has, dated or due. A plant with a
+photo has both notes, so its sheet can take the second info line for where it stands.
 
 The title says to add liquid feed when the plant is due for it: "... + <tsp> tsp fertiliser", at one
 teaspoon a litre of water, to the nearest quarter. A sensor plant with a `conductivity` sensor is due for
@@ -18,25 +18,14 @@ never was. A succulent (`feed: summer`) is fed from March to September only, and
 FEED_EVERY_DAYS days. The anchor keeps `fed_at`, set by a Done that said to feed and carried over by one
 that did not; a seed counts as a feeding at the moment it is made.
 
-The plants that need water now, a dry sensor plant or a calendar plant on or past its due day, are one
-row, `maint:plants`, instead of a row each. Its title is that plant's own while one is due and "Water N
-plants" otherwise, its detail names them, and `plants` has a record for each: the id of the plant's own
-row, its name, the amount to pour, why it is due (the detail of that row), `where`, `aka` and `photo`, and
-`done` for a calendar plant, whose Done names that row id although no row has it. The records go in the
-order of a walk through the flat, WALK, then by name, capped at ITEMS_MAX. Every plant keeps its own push
-key and title in the daily push. A dated plant row stays a row of its own. While no plant is due,
-`maint:plants` instead has a record for every plant, without a Done button, and gives the next due day or
-says none due. The records say when each plant is due ("in 8 days, 10.11"; a sensor plant: its soil and its
-dry level), the plants due first, capped at ITEMS_MAX. A calendar plant was last watered at its anchor's
-time. A sensor plant was watered when its soil moisture rose RISE_POINTS or more within RISE_WINDOW and then
-stopped climbing for RISE_SETTLE; that moment is what `step_rise` finds, live and in the recorder's history.
-
 A sensor plant is dry once its soil moisture reading, in percent, is at or under its `dry`, and stays dry
 until a reading is CLOSE_MARGIN above it: watering makes the reading jump, while a reading wandering
 around `dry` never flaps the row. A reading that is unknown, unavailable or not a number changes nothing
 and has no row; a sensor that stays offline is the battery inventory's to report. A dry plant's row is
 admin only and untimed, like an open battery condition. It has no Done button, the moisture rising
-closes it, and its push key is unique per episode: the time the latch opened.
+closes it, and its push key is unique per episode: the time the latch opened. Its watering is seen in the
+soil too: `step_rise` finds a rise of RISE_POINTS or more within RISE_WINDOW that has stopped climbing for
+RISE_SETTLE, and HouseUpcoming tells the house events feed. No row depends on it.
 
 A calendar plant is a tapped task counted in days, like the dishwasher's filters (upcoming_runs, whose
 anchors, Done and undo it uses): the anchor says when it was last watered, seeded at the moment the plant
@@ -50,7 +39,7 @@ import re
 import unicodedata
 from datetime import datetime, timedelta
 
-from upcoming_core import ITEMS_MAX, TEXT_MAX, clean_text, make_row, utc_iso
+from upcoming_core import TEXT_MAX, clean_text, make_row, utc_iso
 from upcoming_maint import DUE_TIME, HOUSE_TZ, ddmm, fit_parts, house_date, parse_iso, reading
 
 ID_PREFIX = "maint:plant:"
@@ -62,9 +51,6 @@ FEED_BELOW = 350
 RISE_POINTS = 10
 RISE_WINDOW = timedelta(minutes=30)
 RISE_SETTLE = timedelta(minutes=15)
-OVERVIEW_ID = "maint:plants"
-OVERVIEW_ICON = "mdi:sprout"
-WALK = ("kitchen", "living_room", "dining_room", "hallway", "bedroom", "bathroom")
 FEED_EVERY_DAYS = 28
 SUMMER_MONTHS = range(3, 10)
 
@@ -114,8 +100,10 @@ def _parse(raw):
         slugs.add(key)
         aka, where = _note(cfg.get("aka"), who, "aka"), _note(cfg.get("where"), who, "where")
         photo = _photo(cfg.get("photo"), who)
+        if photo and not (aka and where):
+            raise ValueError(f"{who}: a plant with a photo needs both aka and where")
         plant = {"name": name, "slug": key, "area": cfg.get("area") or None, "water": litres,
-                 "info": [note for note in (aka, where) if note], "aka": aka, "where": where, "photo": photo}
+                 "info": [note for note in (aka, where) if note], "photo": photo}
         if entity is None:
             interval = reading(days)
             if interval is None or interval < 1 or interval != int(interval):
@@ -145,8 +133,9 @@ def parse_plants(raw):
     plant}. Raises ValueError on a plant that has no name with letters or digits, does not have exactly
     one of `moisture` and `every_days`, has a `dry` that is not a number, a `water` that is given but not
     a positive number, an `aka` or `where` that is not plain text, a `photo` that is not a key of lowercase
-    letters, digits and underscores, a `conductivity` or `feed` that does not fit its kind, or lists an
-    entity or name twice, so a typo fails at start instead of silently dropping a plant."""
+    letters, digits and underscores or comes without both notes, a `conductivity` or `feed` that does not
+    fit its kind, or lists an entity or name twice, so a typo fails at start instead of silently dropping a
+    plant."""
     return _parse(raw)[0]
 
 
@@ -197,13 +186,6 @@ def _dose(plant, word):
     return f" + {tsp_text(plant['water'])} tsp {word}" if plant["water"] else f" + {word}"
 
 
-def _amount(plant, feed=False):
-    """What to pour: the litres, then " + <tsp> tsp fertiliser" when the plant is due for feed; "" for a plant
-    without an amount."""
-    litres = _litres(plant)
-    return litres + _dose(plant, "fertiliser") if litres and feed else litres
-
-
 def _title(plant, feed=False):
     """"Water the <name>", then ": <litres> L" when the plant has an amount, then " + <tsp> tsp fertiliser"
     when it is due for feed, or " + <tsp> tsp feed" if that is what fits. The name is cut to make room,
@@ -231,18 +213,11 @@ def plant_row(entity, plant, st, value, conductivity=None):
         return None
     row = make_row(ID_PREFIX + plant["slug"], "maint", _title(plant, soil_feeds(conductivity)),
                    f"soil {_percent(value)}, water at {_percent(plant['dry'])}", icon=ICON, area=plant["area"],
-                   audience="admin", info=plant["info"])
+                   audience="admin", info=plant["info"], photo=plant["photo"])
     return row, f"plant:{entity}:{st['since']}"
 
 
 # ---------------------------------------------------------------- watering seen in the soil
-
-
-def valid_watered(raw, plants):
-    """The saved last-watered times that are for a configured sensor plant (by slug) and parse."""
-    raw = raw if isinstance(raw, dict) else {}
-    slugs = {plant["slug"] for plant in plants.values()}
-    return {slug: when for slug, when in raw.items() if slug in slugs and parse_iso(when) is not None}
 
 
 def step_rise(st, value, now):
@@ -266,17 +241,6 @@ def step_rise(st, value, now):
         done = {"at": rise["at"], "low": rise["low"], "peak": rise["peak"]}
         return {"recent": [] if value is None else [[utc_iso(now), value]], "rise": None}, done
     return {"recent": recent, "rise": rise}, None
-
-
-def rises(series, now):
-    """The waterings [{"at", "low", "peak"}] in a moisture history [(aware datetime, reading or None)],
-    oldest first, as of `now`."""
-    st, found = None, []
-    for when, value in list(series) + [(now, None)]:
-        st, event = step_rise(st, value, when)
-        if event:
-            found.append(event)
-    return found
 
 
 # ---------------------------------------------------------------- calendar plants
@@ -329,85 +293,6 @@ def _days(count):
     return f"{count} day{'' if count == 1 else 's'}"
 
 
-def _when(due, now):
-    """When a calendar plant is due, said from today: "due since 30.10", "due today", "tomorrow" or "in 8
-    days, 10.11"."""
-    left = (due - house_date(now)).days
-    if left < 0:
-        return f"due since {ddmm(due, now)}"
-    if left < 2:
-        return "due today" if left == 0 else "tomorrow"
-    return f"in {_days(left)}, {ddmm(due, now)}"
-
-
-def overview_row(sensor, timed, now):
-    """The `maint:plants` row, None without plants: `sensor` is [{"plant", "value", "dry", "watered"}] (the
-    reading or None, whether the plant is dry, when it was last watered or None) and `timed` is
-    [(plant, anchor)]. It has a record in `plants` for each, without a Done button: the amount, when it is
-    due (a sensor plant: its soil and its dry level), `where`, `aka` and `photo`. The records come plants
-    due first, then by due day, then the sensor plants that are not dry by how far above their dry level
-    they stand."""
-    today = house_date(now)
-    entries = []
-    for plant, anchor in timed:
-        when = parse_iso((anchor or {}).get("at"))
-        if when is None:
-            continue
-        due = house_date(when) + timedelta(days=plant["every_days"])
-        late = due <= today
-        record = _entry({"id": ID_PREFIX + plant["slug"], "detail": _when(due, now)}, plant,
-                        feeds(plant, anchor, now))
-        entries.append(((0 if late else 1, due, plant["name"]), late, due, plant["name"], record))
-    for each in sensor:
-        plant, value = each["plant"], each["value"]
-        soil = "soil unknown" if value is None else f"soil {_percent(value)}"
-        detail = f"{'dry, ' if each['dry'] else ''}{soil}, water at {_percent(plant['dry'])}"
-        record = _entry({"id": ID_PREFIX + plant["slug"], "detail": detail}, plant, False)
-        margin = 0 if value is None else value - plant["dry"]
-        entries.append(((0, today, plant["name"]) if each["dry"] else (2, margin, plant["name"]), each["dry"], None,
-                        plant["name"], record))
-    if not entries:
-        return None
-    entries.sort(key=lambda entry: entry[0])
-    due_names = [name for _, late, _, name, _ in entries if late]
-    coming = [due for _, late, due, _, _ in entries if due and not late]
-    records = [record for *_, record in entries]
-    if due_names:
-        title, at = f"Plants: {len(due_names)} of {len(entries)} due", None
-        detail = fit_parts(due_names)
-    elif coming:
-        title, at = f"Plants: next {ddmm(min(coming), now)}", datetime.combine(min(coming), DUE_TIME, HOUSE_TZ)
-        detail = f"{len(entries)} plants"
-    else:
-        title, at, detail = "Plants: none due", None, f"{len(entries)} plants"
-    return make_row(OVERVIEW_ID, "maint", title, detail, at=at, icon=OVERVIEW_ICON, audience="admin",
-                    plants=records)
-
-
-def _walk(plant):
-    area = plant["area"]
-    return WALK.index(area) if area in WALK else len(WALK), plant["name"].lower()
-
-
-def _entry(row, plant, feed):
-    """The record of one plant: the id and detail of `row`, and its Done button if `row` has one."""
-    return {"id": row["id"], "name": plant["name"], "amount": _amount(plant, feed), "detail": row.get("detail"),
-            "where": plant["where"], "aka": plant["aka"], "photo": plant["photo"], "done": row.get("done")}
-
-
-def round_row(due):
-    """The `maint:plants` row for the plants due now, None for none: `due` is [(row, plant, feed)], the untimed
-    row of each (from plant_row or timed_row), its plant and whether it is due for feed. The row stands in for
-    them: the title is the plant's own when one is due and "Water N plants" otherwise, the detail names them,
-    and `plants` has a record for each in the order of WALK, then by name."""
-    ordered = sorted(due, key=lambda item: _walk(item[1]))
-    if not ordered:
-        return None
-    title = ordered[0][0]["title"] if len(ordered) == 1 else f"Water {len(ordered)} plants"
-    return make_row(OVERVIEW_ID, "maint", title, fit_parts([plant["name"] for _, plant, _ in ordered]), icon=ICON,
-                    audience="admin", plants=[_entry(*item) for item in ordered])
-
-
 def timed_row(plant, anchor, now):
     """(row, push key) for a calendar plant, None without an anchor or while its due day is more than
     LEAD_DAYS away. Dated and without a key until the due day; untimed, due and with a key for the
@@ -431,5 +316,6 @@ def timed_row(plant, anchor, now):
             else f"Done {ddmm(when, now)}, {'today' if since == 0 else f'{_days(since)} ago'}")
     row = make_row(ID_PREFIX + plant["slug"], "maint", _title(plant, feeds(plant, anchor, now)), detail, at=at,
                    icon=ICON, area=plant["area"], audience="admin", tap_done=True,
-                   info=[*plant["info"], "Every day" if interval == 1 else f"Every {interval} days", last])
+                   info=[*plant["info"], "Every day" if interval == 1 else f"Every {interval} days", last],
+                   photo=plant["photo"])
     return row, key
