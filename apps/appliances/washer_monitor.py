@@ -4555,13 +4555,11 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         return (prog, temp)
 
     def _update_guard_bar(self, new_prog, new_temp):
-        """Freeze/raise/lower expected_dur_at_start from this tick's live classification.
+        """Freeze/raise/lower expected_dur_at_start, the Auto-mode ETA duration, from this tick's live classification.
 
-        The decision itself is pure (wcls.resolve_guard_bar - see its docstring for the
-        2026-08-11 incident rationale); this method feeds it live durations, the bar
+        The decision itself is pure (wcls.resolve_guard_bar); this method feeds it live durations, the bar
         programme's max plausible energy, cumulative cycle energy and the stability streak,
-        then applies + logs the result. Runs on every Running energy tick, before the
-        finish paths of the same tick consult _get_guard_duration."""
+        then applies + logs the result. Runs on every Running energy tick."""
         if not new_prog or new_prog == "unknown":
             return
         live_dur = self._get_programme_duration(new_prog, new_temp, use_learned=False)
@@ -5602,28 +5600,24 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                 temp_str = f" + {temp}" if temp else ""
                 by_str = f" by {self.confirmed_by_username}" if self.confirmed_by_username else ""
                 self.log(f"User confirmed/corrected programme: '{new}'{self._log_safe(temp_str)} (key: {prog_key}){by_str}", level="INFO")
-                # Upgrade expected_dur_at_start when user selects a longer programme (avoids
-                # false finish from earlier misclassification e.g. Ekspres vs Bomuld 60).
-                user_dur = self._get_programme_duration(prog_key, temp, use_learned=False)
-                if user_dur and (self.expected_dur_at_start is None or user_dur > self.expected_dur_at_start):
-                    old = self.expected_dur_at_start
-                    self.expected_dur_at_start = user_dur
-                    self._guard_bar_class = (prog_key, temp)
-                    self.log(f"Upgraded expected_dur_at_start: {old} -> {user_dur:.0f} min (user confirmed {new})", level="INFO")
+                self._set_bar_from_user(prog_key, temp, f"user confirmed {new}")
         elif entity == self.temperature_entity:
             by_str = f" by {self.confirmed_by_username}" if self.confirmed_by_username else ""
             self.log(f"User set temperature to '{self._log_safe(new)}'{by_str} (programme already confirmed)", level="INFO")
-            # Upgrade expected_dur when user sets temperature (e.g. Bomuld 60 vs 40).
             prog_label = self.get_state(self.confirm_entity) if self.confirm_entity else None
             prog_key = self._LABEL_TO_KEY.get(prog_label, "unknown") if prog_label else "unknown"
             temp = self._read_temperature_selector()
             if prog_key and prog_key != "unknown":
-                user_dur = self._get_programme_duration(prog_key, temp, use_learned=False)
-                if user_dur and (self.expected_dur_at_start is None or user_dur > self.expected_dur_at_start):
-                    old = self.expected_dur_at_start
-                    self.expected_dur_at_start = user_dur
-                    self._guard_bar_class = (prog_key, temp)
-                    self.log(f"Upgraded expected_dur_at_start: {old} -> {user_dur:.0f} min (user set temp {new})", level="INFO")
+                self._set_bar_from_user(prog_key, temp, f"user set temp {new}")
+
+    def _set_bar_from_user(self, prog_key, temp, why):
+        """The user's programme and temperature are the expected duration, in either direction."""
+        user_dur = self._get_programme_duration(prog_key, temp, use_learned=False)
+        if user_dur and (user_dur != self.expected_dur_at_start or self._guard_bar_class != (prog_key, temp)):
+            old = self.expected_dur_at_start
+            self.expected_dur_at_start = user_dur
+            self._guard_bar_class = (prog_key, temp)
+            self.log(f"Set expected_dur_at_start: {old} -> {user_dur:.0f} min ({why})", level="INFO")
 
     def _on_soak_option_changed(self, entity, attribute, old, new, kwargs):
         """Refresh the published ETA immediately when the soak option toggles during Running,
@@ -5894,8 +5888,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         _tick_prog, _tick_temp = self._classify_programme()
         _pred_prog, _pred_temp = self._classify_programme(energy_signature_only=True)
         _tick_class = (_tick_prog, _tick_temp)
-        # Track classification stability + evolve the guard bar BEFORE any finish path of this
-        # tick consults _get_guard_duration (freeze/raise/lower - see _update_guard_bar).
+        # Track classification stability + evolve the guard bar (freeze/raise/lower - see _update_guard_bar).
         self._note_live_classification(_tick_prog, _tick_temp)
         self._update_guard_bar(_tick_prog, _tick_temp)
 
