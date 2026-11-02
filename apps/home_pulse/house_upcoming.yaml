@@ -94,14 +94,14 @@ HouseUpcoming:
     - {moisture: sensor.pothos_moisture, name: Pothos, area: living_room, dry: 15, water: 0.4, conductivity: sensor.pothos_conductivity, aka: "Hanging plant, white-speckled leaves", where: "Living room corner, above the sofa", photo: pothos}
     - {moisture: sensor.ivy_moisture, name: Ivy, area: kitchen, dry: 20, water: 0.3, conductivity: sensor.ivy_conductivity, aka: "Small trailing ivy", where: "Top of the wine fridge", photo: ivy}
     - {name: Monstera, area: kitchen, water: 1, every_days: 10, aka: "Big leaves with holes", where: "Kitchen floor by the Rober2 dock", photo: monstera}
-    - {name: Peace lily kitchen, area: kitchen, water: 0.4, every_days: 7, aka: "Small peace lily, droops when thirsty", where: "Coffee cart next to the xBloom", photo: peace_lily}
-    - {name: Peace lily TV, area: living_room, water: 1, every_days: 10, aka: "Large peace lily, droops when thirsty", where: "Living room floor under the TV", photo: peace_lily}
-    - {name: Fiddle leaf fig dining, area: dining_room, water: 1, every_days: 10, aka: "Tall plant, big violin-shaped leaves", where: "Below the family room thermostat", photo: fiddle_leaf_fig}
-    - {name: Fiddle leaf fig bedroom, area: bedroom, water: 1, every_days: 10, aka: "Tall plant, big violin-shaped leaves", where: "Bedroom corner by the bathroom door", photo: fiddle_leaf_fig}
+    - {name: Peace lily kitchen, area: kitchen, water: 0.4, every_days: 7, aka: "Small peace lily, droops when thirsty", where: "Coffee cart next to the xBloom", photo: peace_lily_kitchen}
+    - {name: Peace lily TV, area: living_room, water: 1, every_days: 10, aka: "Large peace lily, droops when thirsty", where: "Living room floor under the TV", photo: peace_lily_tv}
+    - {name: Fiddle leaf fig dining, area: dining_room, water: 1, every_days: 10, aka: "Tall plant, big violin-shaped leaves", where: "Below the family room thermostat", photo: fiddle_leaf_fig_dining}
+    - {name: Fiddle leaf fig bedroom, area: bedroom, water: 1, every_days: 10, aka: "Tall plant, big violin-shaped leaves", where: "Bedroom corner by the bathroom door", photo: fiddle_leaf_fig_bedroom}
     - {name: Satin pothos, area: hallway, water: 0.2, every_days: 10, aka: "Small vine, silver-spotted leaves", where: "Top of the white wardrobe by the hallway", photo: satin_pothos}
-    - {name: Snake plant dining, area: dining_room, water: 0.2, every_days: 35, feed: summer, aka: "Upright stiff leaves, pale green", where: "Stool under the right dining Sonos", photo: snake_plant_moonshine}
-    - {name: Snake plant living, area: living_room, water: 0.2, every_days: 35, feed: summer, aka: "Upright stiff leaves, pale green", where: "Stool next to the bar cart", photo: snake_plant_moonshine}
-    - {name: Snake plant bathroom, area: bathroom, water: 0.5, every_days: 35, feed: summer, aka: "Tall dark-green striped leaves", where: "Mikkel's bathroom, under the thermostat", photo: snake_plant}
+    - {name: Snake plant dining, area: dining_room, water: 0.2, every_days: 35, feed: summer, aka: "Upright stiff leaves, pale green", where: "Stool under the right dining Sonos", photo: snake_plant_dining}
+    - {name: Snake plant living, area: living_room, water: 0.2, every_days: 35, feed: summer, aka: "Upright stiff leaves, pale green", where: "Stool next to the bar cart", photo: snake_plant_living}
+    - {name: Snake plant bathroom, area: bathroom, water: 0.5, every_days: 35, feed: summer, aka: "Tall dark-green striped leaves", where: "Mikkel's bathroom, under the thermostat", photo: snake_plant_bathroom}
     - {name: Aloe, area: living_room, water: 0.3, every_days: 35, feed: summer, aka: "Spiky succulent with toothed leaves", where: "Top of the glass cabinet, living room", photo: aloe}
     - {name: Alocasia, area: bathroom, water: 0.7, every_days: 7, aka: "Arrow-shaped dark leaves, white veins", where: "Mikkel's shower (mite cure)", photo: alocasia}
     - {name: Cactus, area: bathroom, water: 0.1, every_days: 42, feed: summer, aka: "Small column cactus", where: "Laundry cart in Mikkel's bathroom", photo: cactus}
