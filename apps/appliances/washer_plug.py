@@ -20,7 +20,7 @@ import time
 from collections import deque
 
 POLL_S = 2.0
-DEADLINE_S = 1.0             # one read never takes longer than this, connect to last byte
+DEADLINE_S = 1.0             # both RPC attempts share this acquisition deadline, connect to last byte
 MAX_GAP_FACTOR = 1.5         # a nudge lasts ~4 s, so reads <= 3 s apart always land at least one sample inside it
 RING_S = 45 * 60             # the longest final spin chain seen is ~25 min; plus its 3-min lead-in and the train
 
@@ -44,10 +44,18 @@ BOMULD_TAIL_S = (50 * 60, 31 * 60, 12 * 60)
 
 
 def read_switch(host, deadline_s=DEADLINE_S, clock=time.monotonic):
-    """apower (W) from Switch.GetStatus. Raises on any failure, including the overall deadline. `host` is an address:
-    a name lookup would run outside the deadline."""
+    """apower (W), retrying once within the same acquisition deadline and poll timestamp. Each attempt gets at most
+    half the budget; no answer is carried forward. `host` is an address: name lookup is outside the deadline."""
     end = clock() + deadline_s
+    for attempt in range(2):
+        try:
+            return _read_switch_once(host, min(end, clock() + deadline_s / 2), clock)
+        except Exception:
+            if attempt:
+                raise
 
+
+def _read_switch_once(host, end, clock):
     def left():
         remaining = end - clock()
         if remaining <= 0:

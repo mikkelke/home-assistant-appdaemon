@@ -13,11 +13,12 @@ import time
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import washer_plug as wp  # noqa: E402
-from washer_plug_fixture import grid  # noqa: E402
+from washer_plug_fixture import FakeClock, grid  # noqa: E402
 
 P = wp.POLL_S
 
@@ -454,6 +455,60 @@ class ReadDefects(unittest.TestCase):
 
     def test_clean_reads(self):
         self.assertEqual(wp.read_defects([(t, 4.0) for t in (0.0, 2.0, 4.0)], -1.0), (0, 0, 2.0))
+
+
+class ReadRetry(unittest.TestCase):
+    def reader(self, outcomes):
+        clock = FakeClock(100.0)
+        calls = []
+        outcomes = iter(outcomes)
+
+        def once(host, end, supplied_clock):
+            self.assertIs(supplied_clock, clock)
+            calls.append((clock(), end - clock()))
+            elapsed, result = next(outcomes)
+            clock.t += elapsed
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        mocked = patch.object(wp, "_read_switch_once", side_effect=once)
+        mocked.start()
+        self.addCleanup(mocked.stop)
+        return clock, calls, lambda: wp.read_switch("plug.test", clock=clock)
+
+    def test_success_needs_only_one_attempt(self):
+        clock, calls, read = self.reader([(0.08, 123.4)])
+        self.assertEqual(read(), 123.4)
+        self.assertEqual(calls, [(100.0, wp.DEADLINE_S / 2)])
+
+    def test_timeout_then_success_keeps_the_acquisition_start_timestamp(self):
+        clock, calls, read = self.reader([(0.5, TimeoutError()), (0.3, 450.0)])
+        poller = wp.PlugPoller(read, clock=clock)
+        poller.poll_once()
+        self.assertEqual(poller.snapshot(), [(100.0, 450.0)])
+        self.assertEqual(poller.last_ok(), 100.0)
+        self.assertEqual(poller.peak(), 450.0)
+        self.assertEqual(calls, [(100.0, 0.5), (100.5, 0.5)])
+        self.assertAlmostEqual(clock(), 100.8)
+
+    def test_two_failures_leave_one_failed_read(self):
+        clock, calls, read = self.reader([(0.5, TimeoutError()), (0.5, TimeoutError())])
+        poller = wp.PlugPoller(read, clock=clock)
+        clock.t = 102.0
+        poller.poll_once()
+        self.assertEqual(poller.snapshot(), [(102.0, None)])
+        self.assertEqual(poller.last_ok(), 100.0)
+        self.assertEqual(poller.peak(), 0.0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(clock(), 103.0)
+
+    def test_retry_has_only_the_remaining_overall_budget(self):
+        clock, calls, read = self.reader([(0.7, TimeoutError()), (0.3, TimeoutError())])
+        with self.assertRaises(TimeoutError):
+            read()
+        self.assertAlmostEqual(calls[1][1], 0.3)
+        self.assertAlmostEqual(clock(), 101.0)
 
 
 class ReadDeadline(unittest.TestCase):
