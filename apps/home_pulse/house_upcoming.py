@@ -30,9 +30,9 @@ replace-by day, with the median lifetime of every device of the same model as th
 Rober2's recent cleaning rate from its cumulative cleaning time, which dates each part's row before
 it is due.
 
-The plants have one row, maint:plants (upcoming_plants). While none is due it has a line for each in
-`items`: when it is due and when it was last watered. Once some are due it stands in for their rows,
-with a record for each in `plants`; a calendar plant's record has a Done button, which fires
+The plants have one row, maint:plants (upcoming_plants), with a record for each in `plants`. While none
+is due it lists them all with when each is due. Once some are due it stands in for their rows and lists
+only them; a calendar plant's record has a Done button, which fires
 house_upcoming_done with the plant's own row id, maint:plant:<slug>, although no published row has it.
 The push still has one condition for each plant. A Done on a plant without a sensor, and a rise of its
 soil moisture for one with a sensor, are told to the house events feed as `house_events_report` events,

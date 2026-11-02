@@ -25,10 +25,10 @@ row, its name, the amount to pour, why it is due (the detail of that row), `wher
 `done` for a calendar plant, whose Done names that row id although no row has it. The records go in the
 order of a walk through the flat, WALK, then by name, capped at ITEMS_MAX. Every plant keeps its own push
 key and title in the daily push. A dated plant row stays a row of its own. While no plant is due,
-`maint:plants` has instead one line in `items` for every plant and gives the next due day or says none
-due. The lines say when each plant is due (a sensor plant: its soil and its dry level) and when it was last
-watered, the plants due first, capped at ITEMS_MAX. A calendar plant was last watered at its anchor's time.
-A sensor plant was watered when its soil moisture rose RISE_POINTS or more within RISE_WINDOW and then
+`maint:plants` instead has a record for every plant, without a Done button, and gives the next due day or
+says none due. The records say when each plant is due ("in 8 days, 10.11"; a sensor plant: its soil and its
+dry level), the plants due first, capped at ITEMS_MAX. A calendar plant was last watered at its anchor's
+time. A sensor plant was watered when its soil moisture rose RISE_POINTS or more within RISE_WINDOW and then
 stopped climbing for RISE_SETTLE; that moment is what `step_rise` finds, live and in the recorder's history.
 
 A sensor plant is dry once its soil moisture reading, in percent, is at or under its `dry`, and stays dry
@@ -329,11 +329,24 @@ def _days(count):
     return f"{count} day{'' if count == 1 else 's'}"
 
 
+def _when(due, now):
+    """When a calendar plant is due, said from today: "due since 30.10", "due today", "tomorrow" or "in 8
+    days, 10.11"."""
+    left = (due - house_date(now)).days
+    if left < 0:
+        return f"due since {ddmm(due, now)}"
+    if left < 2:
+        return "due today" if left == 0 else "tomorrow"
+    return f"in {_days(left)}, {ddmm(due, now)}"
+
+
 def overview_row(sensor, timed, now):
     """The `maint:plants` row, None without plants: `sensor` is [{"plant", "value", "dry", "watered"}] (the
     reading or None, whether the plant is dry, when it was last watered or None) and `timed` is
-    [(plant, anchor)]. The lines come plants due first, then by due day, then the sensor plants that are
-    not dry by how far above their dry level they stand."""
+    [(plant, anchor)]. It has a record in `plants` for each, without a Done button: the amount, when it is
+    due (a sensor plant: its soil and its dry level), `where`, `aka` and `photo`. The records come plants
+    due first, then by due day, then the sensor plants that are not dry by how far above their dry level
+    they stand."""
     today = house_date(now)
     entries = []
     for plant, anchor in timed:
@@ -342,24 +355,23 @@ def overview_row(sensor, timed, now):
             continue
         due = house_date(when) + timedelta(days=plant["every_days"])
         late = due <= today
-        line = f"{plant['name']}: {'due ' if late else ''}{ddmm(due, now)}, watered {ddmm(when, now)}"
-        entries.append(((0 if late else 1, due, plant["name"]), late, due, plant["name"], line))
+        record = _entry({"id": ID_PREFIX + plant["slug"], "detail": _when(due, now)}, plant,
+                        feeds(plant, anchor, now))
+        entries.append(((0 if late else 1, due, plant["name"]), late, due, plant["name"], record))
     for each in sensor:
-        plant, value, watered = each["plant"], each["value"], parse_iso(each["watered"])
+        plant, value = each["plant"], each["value"]
         soil = "soil unknown" if value is None else f"soil {_percent(value)}"
-        line = f"{plant['name']}: {'dry, ' if each['dry'] else ''}{soil}, at {_percent(plant['dry'])}"
-        line += f", watered {ddmm(watered, now)}" if watered else ""
+        detail = f"{'dry, ' if each['dry'] else ''}{soil}, water at {_percent(plant['dry'])}"
+        record = _entry({"id": ID_PREFIX + plant["slug"], "detail": detail}, plant, False)
         margin = 0 if value is None else value - plant["dry"]
         entries.append(((0, today, plant["name"]) if each["dry"] else (2, margin, plant["name"]), each["dry"], None,
-                        plant["name"], line))
+                        plant["name"], record))
     if not entries:
         return None
     entries.sort(key=lambda entry: entry[0])
     due_names = [name for _, late, _, name, _ in entries if late]
     coming = [due for _, late, due, _, _ in entries if due and not late]
-    lines = [line for *_, line in entries]
-    if len(lines) > ITEMS_MAX:
-        lines = lines[:ITEMS_MAX - 1] + [f"+{len(lines) - ITEMS_MAX + 1} more"]
+    records = [record for *_, record in entries]
     if due_names:
         title, at = f"Plants: {len(due_names)} of {len(entries)} due", None
         detail = fit_parts(due_names)
@@ -368,7 +380,8 @@ def overview_row(sensor, timed, now):
         detail = f"{len(entries)} plants"
     else:
         title, at, detail = "Plants: none due", None, f"{len(entries)} plants"
-    return make_row(OVERVIEW_ID, "maint", title, detail, at=at, icon=OVERVIEW_ICON, audience="admin", items=lines)
+    return make_row(OVERVIEW_ID, "maint", title, detail, at=at, icon=OVERVIEW_ICON, audience="admin",
+                    plants=records)
 
 
 def _walk(plant):
@@ -377,7 +390,7 @@ def _walk(plant):
 
 
 def _entry(row, plant, feed):
-    """The record of one due plant: its row's id and detail, and its Done button if the row has one."""
+    """The record of one plant: the id and detail of `row`, and its Done button if `row` has one."""
     return {"id": row["id"], "name": plant["name"], "amount": _amount(plant, feed), "detail": row.get("detail"),
             "where": plant["where"], "aka": plant["aka"], "photo": plant["photo"], "done": row.get("done")}
 

@@ -262,9 +262,23 @@ def plant_rows(app, among):
     return {key: row for key, row in rows(app).items() if key in ids}
 
 
+def plant_records(app, overview):
+    """The records of the maint:plants row by plant id: those of the overview (the row titled "Plants: ...")
+    when `overview`, else those of the watering round. {} when the row is the other one, or there is none."""
+    row = rows(app).get("maint:plants", {})
+    if row.get("title", "").startswith("Plants:") != overview:
+        return {}
+    return {record["id"]: record for record in row.get("plants", [])}
+
+
 def round_entries(app):
-    """The records of the watering round by plant id, {} while no plant is due."""
-    return {record["id"]: record for record in rows(app).get("maint:plants", {}).get("plants", [])}
+    """The records of the watering round by plant id, {} while no plant is due and the row is the overview."""
+    return plant_records(app, overview=False)
+
+
+def overview_entries(app):
+    """The records of the overview by plant id, {} while some plant is due and the row is the round."""
+    return plant_records(app, overview=True)
 
 
 class PublishTests(unittest.TestCase):
@@ -1354,7 +1368,8 @@ class PlantTests(unittest.TestCase):
         app = self.make()
         self.assertIn((MOISTURE, {"attribute": "all"}), app.listened)
         self.assertIsNone(self.record(app))
-        self.assertNotIn("plants", rows(app)["maint:plants"])
+        self.assertEqual(overview_entries(app),
+                         {self.ROW: {"id": self.ROW, "name": "Strelitzia", "detail": "soil 35%, water at 15%"}})
         self.assertNotIn("Plant moisture sensors HA does not have", " ".join(msg for _, msg in app.logs))
 
     def test_a_dry_reading_opens_the_round_as_an_admin_row_with_the_plant_in_it(self):
@@ -1471,7 +1486,7 @@ class PlantTests(unittest.TestCase):
         self.assertEqual([(s["title"], s["message"]) for s in app.notifier.sent],
                          [("Maintenance due", "Rober2 filter, Water the Strelitzia")])
 
-    def test_more_plants_are_more_lines_and_a_sensor_ha_does_not_have_is_named_at_start(self):
+    def test_more_plants_are_more_records_and_a_sensor_ha_does_not_have_is_named_at_start(self):
         fern = {"moisture": "sensor.fern_moisture", "name": "Boston fern", "area": "kitchen", "dry": 30}
         ficus = {"moisture": "sensor.ficus_moistur", "name": "Ficus", "dry": 20}
         states = self.states()
@@ -1534,13 +1549,14 @@ class PlantTests(unittest.TestCase):
         self.assertEqual(app.reports, [("house_events_report",
                                         {"text": text, "icon": "mdi:watering-can-outline", "audience": "admin"})])
         self.assertEqual(state_file(app)["watered"], {"strelitzia": core.utc_iso(start + 5 * MIN)})
-        self.assertEqual(rows(app)["maint:plants"]["items"], ["Strelitzia: soil 42%, at 15%, watered 14.10"])
+        self.assertEqual(overview_entries(app),
+                         {self.ROW: {"id": self.ROW, "name": "Strelitzia", "detail": "soil 42%, water at 15%"}})
         for _ in range(6):
             tick(app, 5 * MIN)
         self.assertEqual(len(app.reports), 1)
         reloaded = self.make(app.states, state_dir=app.state_dir, now=app.now)
         self.assertEqual(reloaded._watered, app._watered)
-        self.assertEqual(rows(reloaded)["maint:plants"]["items"], rows(app)["maint:plants"]["items"])
+        self.assertEqual(overview_entries(reloaded), overview_entries(app))
 
     def test_a_small_rise_in_the_soil_is_no_watering(self):
         app = self.make(self.states("20"))
@@ -1550,7 +1566,8 @@ class PlantTests(unittest.TestCase):
         for _ in range(8):
             tick(app, 5 * MIN)
         self.assertEqual((app.reports, app._watered), ([], {}))
-        self.assertEqual(rows(app)["maint:plants"]["items"], ["Strelitzia: soil 29%, at 15%"])
+        self.assertEqual(overview_entries(app),
+                         {self.ROW: {"id": self.ROW, "name": "Strelitzia", "detail": "soil 29%, water at 15%"}})
 
     def test_the_last_watering_is_found_in_the_recorder_once_and_not_told(self):
         app = self.make()
@@ -1567,7 +1584,8 @@ class PlantTests(unittest.TestCase):
         drain(app)
         self.assertEqual(app._watered, {"strelitzia": core.utc_iso(started + 10 * MIN)})
         self.assertEqual(app.reports, [])
-        self.assertEqual(rows(app)["maint:plants"]["items"], ["Strelitzia: soil 35%, at 15%, watered 11.10"])
+        self.assertEqual(overview_entries(app),
+                         {self.ROW: {"id": self.ROW, "name": "Strelitzia", "detail": "soil 35%, water at 15%"}})
         self.assertEqual(asked.count(MOISTURE), 1)
         asyncio.run(app._history_job({}))
         drain(app)
@@ -1823,20 +1841,22 @@ class TimedPlantTests(unittest.TestCase):
 
     def test_a_done_is_told_to_the_feed_and_the_overview_and_undo_takes_both_back(self):
         app = self.make()
-        self.assertEqual(rows(app)["maint:plants"]["items"], ["Monstera: 24.10, watered 14.10"])
+        self.assertEqual(overview_entries(app), {self.ROW: {
+            "id": self.ROW, "name": "Monstera", "amount": "1 L", "detail": "in 10 days, 24.10"}})
         tick(app, 10 * DAY)
-        self.assertNotIn("items", rows(app)["maint:plants"])
+        self.assertEqual(overview_entries(app), {})
         self.assertEqual(self.record(app)["detail"], "due today")
         self.done(app)
         self.assertEqual(app.reports, [("house_events_report", {"text": "Watered Monstera",
                                                                 "icon": "mdi:watering-can-outline",
                                                                 "audience": "admin"})])
         overview = rows(app)["maint:plants"]
-        self.assertEqual((overview["title"], overview["items"]),
-                         ("Plants: next 03.11", ["Monstera: 03.11, watered 24.10"]))
+        self.assertEqual((overview["title"], overview["plants"]),
+                         ("Plants: next 03.11", [{"id": self.ROW, "name": "Monstera", "amount": "1 L",
+                                                  "detail": "in 10 days, 03.11"}]))
         self.undo(app)
         self.assertEqual(app.reports[-1][1]["text"], "Watering of Monstera taken back")
-        self.assertNotIn("items", rows(app)["maint:plants"])
+        self.assertEqual(overview_entries(app), {})
         self.assertEqual(self.record(app)["detail"], "due today")
         self.assertEqual(len(app.reports), 2)
 
@@ -1994,11 +2014,12 @@ class PlantOverviewTests(unittest.TestCase):
     def test_there_is_no_overview_without_plants(self):
         self.assertNotIn(self.ROW, rows(make_app()))
 
-    def test_every_plant_the_yaml_lists_is_a_line_and_the_row_stays_while_the_timed_rows_are_hidden(self):
+    def test_every_plant_the_yaml_lists_is_a_record_and_the_row_stays_while_the_timed_rows_are_hidden(self):
         app = make_app(plants=CONFIG["plants"])
         row = rows(app)[self.ROW]
         everyone = [*PLANTS.values(), *TIMED.values()]
-        self.assertEqual(sorted(line.split(":")[0] for line in row["items"]), sorted(p["name"] for p in everyone))
+        self.assertEqual(sorted(record["name"] for record in row["plants"]), sorted(p["name"] for p in everyone))
+        shown = {record["name"]: record for record in row["plants"]}
         first = min(date(2026, 10, 14) + timedelta(days=plant["every_days"]) for plant in TIMED.values())
         nine = datetime.combine(first, maint.DUE_TIME, maint.HOUSE_TZ)
         self.assertEqual((row["title"], row["at"], row["icon"], row["audience"], row["kind"]),
@@ -2007,13 +2028,18 @@ class PlantOverviewTests(unittest.TestCase):
         self.assertTrue(core.is_valid_row(row))
         self.assertEqual(plant_rows(app, TIMED.values()), {})
         for plant in TIMED.values():
-            line = next(each for each in row["items"] if each.startswith(f"{plant['name']}: "))
             due = date(2026, 10, 14) + timedelta(days=plant["every_days"])
-            self.assertEqual(line, f"{plant['name']}: {due:%d.%m}, watered 14.10", plant["name"])
+            self.assertEqual(shown[plant["name"]]["detail"], f"in {plant['every_days']} days, {due:%d.%m}",
+                             plant["name"])
         for plant in PLANTS.values():
-            line = next(each for each in row["items"] if each.startswith(f"{plant['name']}: "))
-            soil = f"{plant['name']}: soil {plant['dry'] + 20:g}%, at {plant['dry']:g}%"
-            self.assertTrue(line.startswith(soil), line)
+            soil = f"soil {plant['dry'] + 20:g}%, water at {plant['dry']:g}%"
+            self.assertEqual(shown[plant["name"]]["detail"], soil, plant["name"])
+        for plant in everyone:
+            record = shown[plant["name"]]
+            self.assertEqual((record["id"], record.get("where"), record.get("aka"), record.get("photo")),
+                             (f"maint:plant:{plant['slug']}", plant["where"], plant["aka"], plant["photo"]),
+                             plant["name"])
+            self.assertNotIn("done", record, plant["name"])
         tick(app, 3 * DAY)
         self.assertIn(self.ROW, rows(app))
         self.assertLessEqual(len(rows(app)), core.MAX_ROWS)
@@ -2049,36 +2075,41 @@ class PlantOverviewTests(unittest.TestCase):
     def test_a_calendar_plant_joins_the_round_on_its_due_day_and_stays_in_it_while_overdue(self):
         app = make_app(plants=[SAMPLE_TIMED])
         tick(app, 9 * DAY)
-        self.assertIn("items", rows(app)[self.ROW])
+        self.assertEqual(overview_entries(app)["maint:plant:monstera"]["detail"], "tomorrow")
         self.assertEqual(rows(app)["maint:plant:monstera"]["detail"], "1 day left, 24.10")
         self.assertEqual(round_entries(app), {})
         for detail in ("due today", "due since 24.10"):
             tick(app, DAY)
             self.assertNotIn("maint:plant:monstera", rows(app))
-            self.assertNotIn("items", rows(app)[self.ROW])
+            self.assertEqual(overview_entries(app), {})
             self.assertEqual(round_entries(app)["maint:plant:monstera"]["detail"], detail)
 
     def test_the_overview_stays_when_no_sensor_plant_is_due_and_returns_after_watering(self):
-        app = make_app(plants=[SAMPLE_PLANT])
+        states = base_states()
+        states[MOISTURE] = full("35")
+        app = make_app(states, plants=[SAMPLE_PLANT])
         overview = rows(app)[self.ROW]
         self.assertEqual((overview["title"], overview["detail"]), ("Plants: none due", "1 plants"))
         self.assertNotIn("at", overview)
-        self.assertNotIn("plants", overview)
+        self.assertEqual([record["detail"] for record in overview["plants"]], ["soil 35%, water at 15%"])
         fire(app, MOISTURE, full("12"))
         row = rows(app)[self.ROW]
-        self.assertEqual((row["title"], "items" in row), ("Water the Strelitzia", False))
+        self.assertEqual((row["title"], [record["detail"] for record in row["plants"]]),
+                         ("Water the Strelitzia", ["soil 12%, water at 15%"]))
         fire(app, MOISTURE, full("unknown"))
         self.assertEqual(round_entries(app), {})
         row = rows(app)[self.ROW]
-        self.assertEqual((row["title"], "plants" in row, "items" in row), ("Plants: 1 of 1 due", False, True))
+        self.assertEqual((row["title"], [record["detail"] for record in row["plants"]]),
+                         ("Plants: 1 of 1 due", ["dry, soil unknown, water at 15%"]))
         fire(app, MOISTURE, full("20"))
         self.assertEqual(rows(app)[self.ROW]["title"], "Plants: none due")
 
     def test_the_round_keeps_the_limit_of_the_lists_but_the_title_counts_every_plant(self):
         calendar = [{**SAMPLE_TIMED, "name": f"Plant {i:02d}", "every_days": 10 + i} for i in range(25)]
         app = make_app(plants=calendar)
-        before = rows(app)[self.ROW]["items"]
-        self.assertEqual((len(before), before[-1]), (core.ITEMS_MAX, "+6 more"))
+        before = rows(app)[self.ROW]
+        self.assertEqual((len(before["plants"]), before["detail"]), (core.ITEMS_MAX, "25 plants"))
+        self.assertTrue(core.is_valid_row(before))
         tick(app, 35 * DAY)
         row = rows(app)[self.ROW]
         self.assertEqual(row["title"], "Water 25 plants")

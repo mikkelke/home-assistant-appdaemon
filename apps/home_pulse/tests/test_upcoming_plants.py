@@ -6,7 +6,7 @@
 import copy
 import sys
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -925,15 +925,34 @@ class OverviewTests(unittest.TestCase):
     def row(self, sensor=(), timed=(), now=None):
         return plants.overview_row(list(sensor), list(timed), now or self.NOW)
 
-    def test_each_plant_is_a_line_with_its_due_day_or_its_soil_and_when_it_was_last_watered(self):
+    def test_each_plant_is_a_record_with_when_it_is_due_or_its_soil_and_its_dry_level(self):
         row = self.row([self.sensor()], [(self.timed("Peace lily kitchen", 7), self.anchor()),
                                          (self.timed("Aloe", 35), self.anchor())])
-        self.assertEqual(row["items"], ["Peace lily kitchen: 27.10, watered 20.10", "Aloe: 24.11, watered 20.10",
-                                        "Strelitzia: soil 31%, at 15%, watered 21.10"])
+        self.assertEqual(row["plants"], [
+            {"id": "maint:plant:peace_lily_kitchen", "name": "Peace lily kitchen", "detail": "in 5 days, 27.10"},
+            {"id": "maint:plant:aloe", "name": "Aloe", "detail": "in 33 days, 24.11"},
+            {"id": "maint:plant:strelitzia", "name": "Strelitzia", "detail": "soil 31%, water at 15%"}])
         self.assertEqual((row["id"], row["kind"], row["icon"], row["audience"]),
                          ("maint:plants", "maint", "mdi:sprout", "admin"))
         self.assertNotIn("done", row)
         self.assertNotIn("area", row)
+        self.assertNotIn("items", row)
+        self.assertTrue(all("done" not in record for record in row["plants"]))
+        self.assertTrue(core.is_valid_row(row))
+
+    def test_a_record_has_the_amount_with_feed_for_a_calendar_plant_never_for_a_sensor_plant_and_the_notes(self):
+        notes = {"where": "Kitchen floor by the dock", "aka": "Big leaves with holes", "photo": "monstera"}
+        fed = plants.parse_timed([{"name": "Monstera", "water": 1, "every_days": 10, **notes}])["monstera"]
+        plain = plants.parse_timed([{"name": "Fern", "water": 0.5, "every_days": 10}])["fern"]
+        [ivy] = plants.parse_plants([{"moisture": "sensor.ivy_moisture", "name": "Ivy", "dry": 20, "water": 3,
+                                      "conductivity": "sensor.ivy_conductivity"}]).values()
+        last_fed_long_ago = {"at": core.utc_iso(self.SEEDED), "fed_at": "2026-08-01T10:00:00+00:00"}
+        row = self.row([self.sensor(plant=ivy)], [(fed, last_fed_long_ago), (plain, self.anchor())])
+        self.assertEqual(row["plants"], [
+            {"id": "maint:plant:fern", "name": "Fern", "amount": "0.5 L", "detail": "in 8 days, 30.10"},
+            {"id": "maint:plant:monstera", "name": "Monstera", "amount": "1 L + 1 tsp fertiliser",
+             "detail": "in 8 days, 30.10", **notes},
+            {"id": "maint:plant:ivy", "name": "Ivy", "amount": "3 L", "detail": "soil 31%, water at 20%"}])
         self.assertTrue(core.is_valid_row(row))
 
     def test_the_title_gives_the_next_day_and_the_row_sits_at_nine_that_morning(self):
@@ -948,7 +967,8 @@ class OverviewTests(unittest.TestCase):
         row = self.row(timed=timed, now=late)
         self.assertEqual((row["title"], row["detail"]), ("Plants: 1 of 2 due", "Peace lily kitchen"))
         self.assertNotIn("at", row)
-        self.assertEqual(row["items"][0], "Peace lily kitchen: due 27.10, watered 20.10")
+        self.assertEqual(row["plants"][0], {"id": "maint:plant:peace_lily_kitchen", "name": "Peace lily kitchen",
+                                            "detail": "due since 27.10"})
         today = self.row(timed=[(self.timed("Peace lily kitchen", 7), self.anchor())],
                          now=datetime(2026, 10, 27, 15, 0, tzinfo=timezone.utc))
         self.assertEqual(today["title"], "Plants: 1 of 1 due")
@@ -957,48 +977,61 @@ class OverviewTests(unittest.TestCase):
         late = datetime(2026, 10, 28, 15, 0, tzinfo=timezone.utc)
         row = self.row([self.sensor(12, dry=True)], [(self.timed("Peace lily kitchen", 7), self.anchor())], now=late)
         self.assertEqual(row["title"], "Plants: 2 of 2 due")
-        self.assertEqual(row["items"], ["Peace lily kitchen: due 27.10, watered 20.10",
-                                        "Strelitzia: dry, soil 12%, at 15%, watered 21.10"])
+        self.assertEqual([(record["name"], record["detail"]) for record in row["plants"]],
+                         [("Peace lily kitchen", "due since 27.10"), ("Strelitzia", "dry, soil 12%, water at 15%")])
         only = self.row([self.sensor(12, dry=True)], [(self.timed("Aloe", 35), self.anchor())])
-        self.assertEqual((only["title"], only["items"][0], "at" in only),
-                         ("Plants: 1 of 2 due", "Strelitzia: dry, soil 12%, at 15%, watered 21.10", False))
+        self.assertEqual((only["title"], only["plants"][0]["name"], only["plants"][0]["detail"], "at" in only),
+                         ("Plants: 1 of 2 due", "Strelitzia", "dry, soil 12%, water at 15%", False))
 
     def test_the_sensor_plants_that_are_not_dry_come_last_the_nearest_to_dry_first(self):
         ivy = plants.parse_plants([{"moisture": "sensor.ivy_moisture", "name": "Ivy", "dry": 20}])
         far = ivy["sensor.ivy_moisture"]
         row = self.row([self.sensor(60, plant=far), self.sensor(31)], [(self.timed("Aloe", 35), self.anchor())])
-        self.assertEqual([line.split(":")[0] for line in row["items"]], ["Aloe", "Strelitzia", "Ivy"])
+        self.assertEqual([record["name"] for record in row["plants"]], ["Aloe", "Strelitzia", "Ivy"])
 
-    def test_a_reading_that_is_unknown_and_a_watering_nobody_has_seen_are_said_so(self):
-        row = self.row([self.sensor(None, watered=None)])
-        self.assertEqual(row["items"], ["Strelitzia: soil unknown, at 15%"])
+    def test_a_reading_that_is_unknown_is_said_so(self):
+        row = self.row([self.sensor(None)])
+        self.assertEqual(row["plants"], [{"id": "maint:plant:strelitzia", "name": "Strelitzia",
+                                          "detail": "soil unknown, water at 15%"}])
         self.assertEqual(row["title"], "Plants: none due")
         self.assertNotIn("at", row)
 
-    def test_only_twenty_lines_fit_and_the_rest_is_counted(self):
+    def test_only_twenty_plants_fit_in_the_row(self):
         timed = [(self.timed(f"Plant {i:02d}", 10 + i), self.anchor()) for i in range(25)]
         for now in (self.NOW, self.NOW + 20 * DAY):
             row = self.row(timed=timed, now=now)
-            self.assertEqual(len(row["items"]), core.ITEMS_MAX)
-            self.assertEqual(row["items"][-1], "+6 more")
-            self.assertTrue(row["items"][0].startswith("Plant 00"))
+            self.assertEqual([record["name"] for record in row["plants"]],
+                             [f"Plant {i:02d}" for i in range(core.ITEMS_MAX)])
             self.assertTrue(core.is_valid_row(row))
 
-    def test_no_plants_no_row_and_a_plant_without_a_usable_anchor_has_no_line(self):
+    def test_no_plants_no_row_and_a_plant_without_a_usable_anchor_has_no_record(self):
         self.assertIsNone(self.row())
         row = self.row(timed=[(self.timed("Aloe", 35), None), (self.timed("Fern", 7), {"at": "soon"}),
                               (self.timed("Lily", 7), self.anchor())])
-        self.assertEqual([line.split(":")[0] for line in row["items"]], ["Lily"])
+        self.assertEqual([record["name"] for record in row["plants"]], ["Lily"])
 
-    def test_a_done_after_the_seed_shows_as_the_last_watering(self):
+    def test_the_days_are_counted_from_a_done_after_the_seed(self):
         row = self.row(timed=[(self.timed("Aloe", 35), {"at": "2026-10-22T10:00:00+00:00", "prev": self.anchor()})])
-        self.assertEqual(row["items"], ["Aloe: 26.11, watered 22.10"])
+        self.assertEqual(row["plants"], [{"id": "maint:plant:aloe", "name": "Aloe", "detail": "in 35 days, 26.11"}])
 
-    def test_a_long_name_is_cut_to_a_line_that_fits(self):
-        name = "Monstera deliciosa variegata (the big one by the window)"
+    def test_a_long_name_is_cut_to_fit_its_record_and_its_id_stays_whole(self):
+        name = "Monstera deliciosa variegata (the big one by the window) in the hall"
         row = self.row(timed=[(self.timed(name, 7), self.anchor())])
-        self.assertTrue(all(len(line) <= core.TEXT_MAX for line in row["items"]))
+        [record] = row["plants"]
+        self.assertEqual(record["name"], core.clean_text(name))
+        self.assertLess(len(record["name"]), len(name))
+        self.assertLessEqual(len(record["name"]), core.TEXT_MAX)
+        self.assertEqual(record["id"], "maint:plant:" + plants.slug(name))
+        self.assertGreater(len(record["id"]), core.TEXT_MAX)
         self.assertTrue(core.is_valid_row(row))
+
+    def test_a_calendar_plant_is_due_since_a_day_today_tomorrow_or_in_so_many_days(self):
+        today = date(2026, 10, 22)
+        for days, said in ((-23, "due since 29.09"), (-1, "due since 21.10"), (0, "due today"), (1, "tomorrow"),
+                           (2, "in 2 days, 24.10"), (8, "in 8 days, 30.10"), (76, "in 76 days, 06.01.27")):
+            self.assertEqual(plants._when(today + days * DAY, self.NOW), said, days)
+        after_midnight_in_the_house = datetime(2026, 10, 21, 22, 30, tzinfo=timezone.utc)
+        self.assertEqual(plants._when(today, after_midnight_in_the_house), "due today")
 
 
 class SavedLatchTests(unittest.TestCase):
