@@ -177,7 +177,7 @@ class DayAggregates(unittest.TestCase):
 
     def test_each_day_gets_its_own_hours(self):
         fc = _forecast()
-        self.assertAlmostEqual(hf.day_weather(fc, date(2026, 10, 17), TZ).ghi_kwh, 1.065, places=3)
+        self.assertAlmostEqual(hf.day_weather(fc, date(2026, 10, 17), TZ).ghi_kwh, 0.965, places=3)
         last = hf.day_weather(fc, date(2026, 10, 19), TZ)
         self.assertEqual(last.hours, 23)
         self.assertAlmostEqual(last.t_mean, 9.7, places=3)
@@ -246,8 +246,8 @@ class SunHours(unittest.TestCase):
         starts = hf.sun_hours(_forecast(), day, TZ, LAT, LON, az_min, az_max, ghi_min)
         return [datetime.fromtimestamp(s, TZ).strftime("%H:%M") for s in starts]
 
-    def test_dull_day_has_two_bright_hours(self):
-        self.assertEqual(self._hours(date(2026, 10, 17), 100, 260), ["11:00", "14:00"])
+    def test_dull_day_has_one_bright_hour(self):
+        self.assertEqual(self._hours(date(2026, 10, 17), 100, 260), ["11:00"])
 
     def test_clear_day_has_the_bright_afternoon_through_morning_span(self):
         got = self._hours(date(2026, 10, 18), 100, 260)

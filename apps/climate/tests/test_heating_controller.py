@@ -425,7 +425,7 @@ class ShippedYaml(unittest.TestCase):
         self.assertEqual([z[n].base_c for n in ZONES], [21.5, 20.5, 21.5, 22.0, 20.0])
         self.assertEqual([z[n].lower_c for n in ZONES], [19.0, 19.0, 19.0, 19.0, 18.0])
         self.assertEqual([z[n].upper_c for n in ZONES], [24.0, 24.0, 24.0, 25.0, 24.0])
-        self.assertEqual(z["family"].protected_min_c, 20.5)
+        self.assertEqual(z["family"].protected_min_c, 21.0)
         self.assertEqual(z["kristines_room"].trim, hp.TrimConfig(1.2, -1.0, 2.0))
         self.assertEqual(self.cfg.sun_term_factor, 0.5)
         self.assertEqual(self.cfg.keypad_relock_minutes, 15)
@@ -1850,14 +1850,14 @@ class ForecastHandling(unittest.TestCase):
         h.ha.set("input_boolean.heating_season", "on")
         h.at(2, 55, day=18)
         h.fetch()
-        h.at(3, 0, day=18)
+        h.at(8, 0, day=18)
         h.tick()
         self.assertEqual(h.attrs("family")["mode"], "sun_cut")
         h.fetch_error = OSError("down")
         h.at(15, 0, day=18)
         h.tick()
         self.assertEqual(h.last("sensor.heating_controller")["attributes"]["forecast_ok"], "false")
-        h.at(3, 0, day=19)
+        h.at(8, 0, day=19)
         h.tick()
         self.assertEqual(h.attrs("family")["mode"], "hold")
         self.assertTrue(any("forecast stale" in m for m in h.warnings()))
@@ -2062,16 +2062,16 @@ class SunCut(unittest.TestCase):
         h.fetch()
         return h
 
-    def test_the_sunny_day_cuts_the_family_zone_in_the_small_hours(self):
+    def test_the_sunny_day_cuts_the_family_zone_from_two_hours_before_the_sun(self):
         h = self.season()
-        h.at(3, 0, day=18)
+        h.at(8, 0, day=18)
         h.tick()
         a = h.attrs("family")
         self.assertEqual(a["mode"], "sun_cut")
-        # aim: the night target 21.0 at 07:00, capped at 20.5, plus the trim of 0.5
-        self.assertEqual(a["setpoint_now"], 21.0)
+        # aim: the day target 21.5 at 12:00, capped at 21.0, plus the trim of 0.5
+        self.assertEqual(a["setpoint_now"], 21.5)
         self.assertEqual(
-            a["cut_window"], ["2026-10-18T01:00:00+02:00", "2026-10-18T16:00:00+02:00"]
+            a["cut_window"], ["2026-10-18T07:00:00+02:00", "2026-10-18T16:00:00+02:00"]
         )
         self.assertIn("Sun cut until 16:00", a["reasons"][0])
         self.assertEqual(a["sun_credit_h"], "2.0")
@@ -2080,25 +2080,30 @@ class SunCut(unittest.TestCase):
 
     def test_the_cut_ends_with_its_window(self):
         h = self.season()
+        h.at(15, 55, day=18)
+        h.fetch()
+        h.tick()
+        self.assertEqual(h.attrs("family")["mode"], "sun_cut")
         h.at(16, 5, day=18)
         h.tick()
         self.assertEqual(h.attrs("family")["mode"], "hold")
 
     def test_before_the_window_the_cut_is_announced_but_not_running(self):
         h = self.season()
-        h.at(0, 30, day=18)
+        h.at(6, 30, day=18)
         h.tick()
         a = h.attrs("family")
         self.assertEqual(a["mode"], "hold")
-        self.assertEqual(a["cut_window"][0], "2026-10-18T01:00:00+02:00")
+        self.assertEqual(a["cut_window"][0], "2026-10-18T07:00:00+02:00")
 
     def test_the_dull_day_is_not_cut(self):
         h = Harness(self)
         h.ha.set("input_boolean.heating_season", "on")
+        h.at(10, 0)  # inside the window that today's one bright hour would open
         h.tick()
         self.assertEqual(h.attrs("family")["mode"], "hold")
-        # today's two bright hours are not worth a cut; the window shown is tomorrow's
-        self.assertEqual(h.attrs("family")["cut_window"][0], "2026-10-18T01:00:00+02:00")
+        # one bright hour is no sun day; the window shown is tomorrow's
+        self.assertEqual(h.attrs("family")["cut_window"][0], "2026-10-18T07:00:00+02:00")
 
     def test_claudias_window_opens_later_because_her_glass_looks_west(self):
         h = self.season()
@@ -2118,15 +2123,15 @@ class SunCut(unittest.TestCase):
         for zone in ("kristines_room", "bathroom", "guest_bathroom"):
             self.assertNotEqual(h.attrs(zone)["mode"], "sun_cut")
 
-    def test_full_trust_cuts_a_borderline_day_that_half_trust_leaves_alone(self):
-        h = Harness(self)
+    def test_half_trust_cuts_a_sunny_day_that_quarter_trust_leaves_alone(self):
+        h = Harness(self, sun_term_factor=0.25)
         h.ha.set("input_boolean.heating_season", "on")
-        h.at(4, 55)
+        h.at(7, 55, day=18)
         h.fetch()
-        h.at(5, 0)
-        h.tick()  # 17 October: ratio 0.44 at half trust
+        h.at(8, 0, day=18)
+        h.tick()  # 18 October: ratio 0.48 at quarter trust
         self.assertEqual(h.attrs("family")["mode"], "hold")
-        h.app.cfg = dataclasses.replace(h.app.cfg, sun_term_factor=1.0)  # 0.89 at full trust
+        h.app.cfg = dataclasses.replace(h.app.cfg, sun_term_factor=0.5)  # 0.96 at half trust
         h.tick(minutes=5)
         self.assertEqual(h.attrs("family")["mode"], "sun_cut")
 
