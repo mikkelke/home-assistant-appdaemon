@@ -55,7 +55,7 @@ class LivingRoomTvControl(hass.Hass):
         self.rooftop_charging_sensor = self.args.get("rooftop_charging_sensor", "binary_sensor.rooftop_charging")
         
         # TV entity configuration (for power-on checks)
-        self.hisense_tv_entity = self.args.get("hisense_tv_entity", "media_player.living_room_hisense_tv_television")
+        self.hisense_tv_entity = self.args.get("hisense_tv_entity", "media_player.hisense_vidaa_local")
         self.apple_tv_entity = self.args.get("apple_tv_entity", "media_player.living_room_apple_tv")
         self.apple_tv_source_name = self.args.get("apple_tv_source_name")
         self.source_selection_script_entity = self.args.get("source_selection_script_entity")

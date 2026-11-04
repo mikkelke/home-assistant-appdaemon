@@ -22,7 +22,7 @@ import living_room_tv_control as lrc  # noqa: E402
 
 
 TV = "media_player.living_room_tv"
-HISENSE = "media_player.living_room_hisense_tv_television"
+HISENSE = "media_player.hisense_vidaa_local"
 APPLE = "media_player.living_room_apple_tv"
 REMOTE = "remote.living_room_apple_tv"
 CONNECT = ("remote/turn_on", {"entity_id": REMOTE})
