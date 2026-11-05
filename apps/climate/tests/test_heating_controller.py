@@ -522,7 +522,7 @@ class ShippedYaml(unittest.TestCase):
         zc = self.cfg.zones["bathroom"]
         self.assertEqual(zc.profile.lead_hours, 0)
         self.assertTrue(zc.profile.outside_is_lower_limit)
-        self.assertEqual([(p.start, p.end) for p in zc.profile.periods], [(150, 7 * 60)])
+        self.assertEqual([(p.start, p.end) for p in zc.profile.periods], [(150, 9 * 60)])
 
     def test_no_zone_is_held_back_for_the_bedroom(self):
         guarded = [n for n, zc in self.cfg.zones.items() if zc.guard.enabled]
