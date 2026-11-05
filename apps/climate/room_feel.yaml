@@ -180,12 +180,18 @@ RoomFeel:
         end: "14:45"
 
     hallway:
+      fusion: primary
       air_sources:
+        - entity: sensor.hallway_seated_thermometer_temperature
+          rh_entity: sensor.hallway_seated_thermometer_humidity
+          label: seated
+          offset_c: 0.0
         - entity: climate.family_room_thermostat
           attribute: current_temperature
           rh_entity: climate.family_room_thermostat
           rh_attribute: current_humidity
           label: salus_family
+          offset_c: -1.0
       # No hallway floor thermometer and no known exterior window/door contact (interior
       # corridor) - window_contacts intentionally empty.
       window_contacts: []
