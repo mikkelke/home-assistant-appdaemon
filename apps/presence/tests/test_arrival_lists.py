@@ -42,6 +42,7 @@ def envelope(entity_id, summaries, completed=()):
 def make_app(lists):
     app = al.ArrivalLists.__new__(al.ArrivalLists)
     app.person = "person.mikkel"
+    app.away_tracker = None
     app.recipient = "mikkel"
     app.category = "arrival_lists"
     app.places = {"home": ["todo.husk_hjemme"], "Office": ["todo.husk_kontor", "todo.firma_indkob"]}
@@ -117,6 +118,19 @@ class ArrivalListsTest(unittest.TestCase):
         app._on_person_change("person.mikkel", "state", "not_home", "home", {})
         self.assertEqual(len(app.tasks), 1)
         run_tasks(app)
+
+    def test_with_an_away_tracker_home_comes_from_the_person_and_office_from_the_tracker(self):
+        app = make_app({"todo.husk_hjemme": ["Pant"], "todo.husk_kontor": ["Lader"]})
+        app.away_tracker = "device_tracker.of9p"
+        app._on_person_change("device_tracker.of9p", "state", "not_home", "home", {})
+        app._on_person_change("person.mikkel", "state", "not_home", "Office", {})
+        run_tasks(app)
+        app._notifier.notify.assert_not_awaited()
+        app._on_person_change("person.mikkel", "state", "not_home", "home", {})
+        app._on_person_change("device_tracker.of9p", "state", "not_home", "Office", {})
+        run_tasks(app)
+        self.assertEqual([c.kwargs["title"] for c in app._notifier.notify.await_args_list],
+                         ["Husk hjemme", "Husk kontor"])
 
     def test_open_items_ignores_completed_and_bad_envelopes(self):
         env = envelope("todo.x", ["a"], completed=["b"])

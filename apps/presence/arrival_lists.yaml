@@ -1,6 +1,7 @@
 # /conf/apps/presence/arrival_lists.yaml
 # Pushes Mikkel the open items of the place's Husk list when he arrives home or at the office.
 # Keys under places are person states: "home", or the zone name ("Office" is zone.office).
+# home comes from the person (wifi); other zones from the GPS tracker in away_tracker.
 #
 # No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
 # first or the app fails to instantiate.
@@ -12,6 +13,7 @@ ArrivalLists:
     - MobileNotifier
 
   person: person.mikkel
+  away_tracker: device_tracker.of9p
   recipient: mikkel
   category: arrival_lists
   settle_s: 60

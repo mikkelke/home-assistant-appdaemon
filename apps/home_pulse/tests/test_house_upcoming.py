@@ -93,6 +93,7 @@ def base_states():
     for part in ("filter", "main_brush", "side_brush", "sensor"):
         states[f"sensor.rober2_{part}_time_left"] = full("500000")
     states["sensor.washer_state"] = full("Off")
+    states["person.mikkel"] = full("home")
     states["sensor.transit_kbh_ic_odense"] = full("OK", {"departures": []})
     states["input_select.transit_carlsberg_stog_kbh_status"] = full("OK")
     states["person.kristine"] = full("not_home")
@@ -397,6 +398,48 @@ class PushTests(unittest.TestCase):
         tick(self.app, 24 * HOUR)
         self.push()
         self.assertEqual([s["message"] for s in self.app.notifier.sent], ["Rober2 filter, Bathroom door battery"] * 2)
+
+    def away(self):
+        self.app.states["person.mikkel"] = full("not_home")
+
+    def arrive(self, at):
+        self.app.now = at
+        self.app.states["person.mikkel"] = full("home")
+        self.app._on_push_person_home("person.mikkel", None, "not_home", "home", {})
+        drain(self.app)
+
+    def test_no_push_while_mikkel_is_away(self):
+        self.away()
+        self.push()
+        self.assertEqual(self.app.notifier.sent, [])
+
+    def test_it_goes_when_he_comes_home_later_that_day(self):
+        self.away()
+        self.push()
+        self.arrive(self.app.now.replace(hour=17))
+        self.assertEqual([s["message"] for s in self.app.notifier.sent], ["Rober2 filter, Bathroom door battery"])
+
+    def test_an_arrival_after_push_until_waits_for_the_next_morning(self):
+        self.away()
+        self.push()
+        self.arrive(self.app.now.replace(hour=22))
+        self.assertEqual(self.app.notifier.sent, [])
+
+    def test_an_arrival_before_push_time_does_not_push(self):
+        self.away()
+        self.arrive(self.app.now.replace(hour=7))
+        self.assertEqual(self.app.notifier.sent, [])
+
+    def test_a_second_arrival_does_not_repeat_the_push(self):
+        self.away()
+        self.push()
+        self.arrive(self.app.now.replace(hour=12))
+        self.away()
+        self.arrive(self.app.now.replace(hour=15))
+        self.assertEqual(len(self.app.notifier.sent), 1)
+
+    def test_it_listens_to_mikkel_coming_home(self):
+        self.assertIn(("person.mikkel", {"new": "home"}), self.app.listened)
 
     def test_a_new_episode_after_a_battery_change_pushes_again(self):
         self.push()

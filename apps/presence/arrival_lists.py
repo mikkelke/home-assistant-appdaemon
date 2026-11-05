@@ -2,9 +2,11 @@
 ArrivalLists - when a person arrives at a place, push the open items of that place's to-do lists.
 
 `places` maps a person state (a zone name as HA writes it: "home", "Office") to the
-to-do lists to read on arrival. A list with no open items is left out; when every list is
-empty nothing is sent. The arrival has to hold for `settle_s` seconds, and a place pushes at
-most once per `cooldown_min`, so a tracker flapping at a zone edge sends one push.
+to-do lists to read on arrival. "home" is read from `person`; with `away_tracker` set, every
+other place is read from that GPS tracker instead, since the person carries no GPS. A list with
+no open items is left out; when every list is empty nothing is sent. The arrival has to hold for
+`settle_s` seconds, and a place pushes at most once per `cooldown_min`, so a tracker flapping at a
+zone edge sends one push.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ class ArrivalLists(hass.Hass):
     def initialize(self):
         a = self.args
         self.person = a["person"]
+        self.away_tracker = a.get("away_tracker")
         self.recipient = a["recipient"]
         self.category = a.get("category")
         self.places = a["places"]
@@ -46,11 +49,16 @@ class ArrivalLists(hass.Hass):
         self._notifier = self.get_app("MobileNotifier")
         self._last_push = {}
 
-        self.listen_state(self._on_person_change, self.person, duration=int(a.get("settle_s", 60)))
+        settle = int(a.get("settle_s", 60))
+        self.listen_state(self._on_person_change, self.person, duration=settle)
+        if self.away_tracker:
+            self.listen_state(self._on_person_change, self.away_tracker, duration=settle)
         self.log(f"ArrivalLists initialized for {self.person}: {', '.join(self.places)}", level="INFO")
 
     def _on_person_change(self, entity, attribute, old, new, kwargs):
         if new == old or new not in self.places:
+            return
+        if self.away_tracker and (entity == self.away_tracker) == (new == "home"):
             return
         now = time.time()
         if now - self._last_push.get(new, 0) < self.cooldown_s:

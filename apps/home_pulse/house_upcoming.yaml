@@ -1,7 +1,7 @@
 # HouseUpcoming - sensor.house_upcoming for the dashboard's Now timeline: maintenance (Rober2 parts,
 # the dishwasher's and the washer's run-based tasks, batteries and offline devices, houseplants to
 # water; admin only), Kristine's train, and rain while a terrace door is open. Plus one maintenance
-# push a day to Mikkel. See house_upcoming.py.
+# push a day to Mikkel while he is home. See house_upcoming.py.
 #
 # Keep sensor.house_upcoming out of the recorder (configuration.yaml recorder: exclude:): the lease
 # renews every 5 minutes.
@@ -13,6 +13,9 @@ HouseUpcoming:
   entity: sensor.house_upcoming
   push_target: mikkel
   push_time: "09:00:00"
+  # The push waits for Mikkel to be home, and goes on his arrival until push_until.
+  push_person: person.mikkel
+  push_until: "21:00:00"
   push_link: "/dashboard-rooftop/home#now"
   history_time: "03:40:00"
   history_start: "2025-01-26"

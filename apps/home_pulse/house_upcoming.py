@@ -5,8 +5,10 @@ offline devices, and houseplants that need water and one-off tasks; admin only),
 rain, forecast or falling, while a terrace door is open (exploratory).
 
 Publishes sensor.house_upcoming (shape in upcoming_core.py) plus one maintenance push a day, built
-from the same conditions the rows show. Stick vacuum faults push once per episode as soon as their
-source allows it, using the daily digest's bookkeeping. The lease in `expires` is renewed every TICK_S
+from the same conditions the rows show. With push_person set the push goes at push_time only while
+that person is home; otherwise their next arrival before push_until sends what has not been pushed.
+Stick vacuum faults push once per episode as soon as their source allows it, using the daily
+digest's bookkeeping. The lease in `expires` is renewed every TICK_S
 even when nothing changed, so the dashboard drops the rows within upcoming_core.LEASE once this app stops.
 
 State acquisition: one snapshot of every source at initialize, then listen_state(attribute="all"),
@@ -88,6 +90,9 @@ class HouseUpcoming(hass.Hass):
         self.fixture_file = Path(a.get("fixture_file") or here / "house_upcoming_rain_fixtures.jsonl")
         self.push_target = a.get("push_target", "mikkel")
         self.push_link = a.get("push_link", "/dashboard-rooftop/home#now")
+        self.push_person = a.get("push_person")
+        self.push_time = _clock(a.get("push_time"), "09:00:00")
+        self.push_until = _clock(a.get("push_until"), "21:00:00")
         start = datetime.fromisoformat(str(a.get("history_start", "2025-01-26")))
         self.history_start = start if start.tzinfo else start.replace(tzinfo=timezone.utc)
 
@@ -184,7 +189,9 @@ class HouseUpcoming(hass.Hass):
         self.listen_event(self._on_done, "house_upcoming_done")
         self.listen_event(self._on_undo, "house_upcoming_undo")
         self.run_every(self._on_tick, f"now+{TICK_S}", TICK_S)
-        self.run_daily(self._on_push_time, _clock(a.get("push_time"), "09:00:00"))
+        self.run_daily(self._on_push_time, self.push_time)
+        if self.push_person:
+            self.listen_state(self._on_push_person_home, self.push_person, new="home")
         self.run_daily(self._history_job, _clock(a.get("history_time"), "03:40:00"))
         self.run_in(self._history_job, HISTORY_DELAY_S)
 
@@ -702,6 +709,16 @@ class HouseUpcoming(hass.Hass):
             self.create_task(self._send_digest(fresh))
 
     def _on_push_time(self, kwargs):
+        if self.push_person and self.get_state(self.push_person) != "home":
+            self.log(f"Maintenance push waits until {self.push_person} is home")
+            return
+        self._push_digest()
+
+    def _on_push_person_home(self, entity, attribute, old, new, kwargs):
+        if old != "home" and self.push_time <= self.get_now().time() < self.push_until:
+            self._push_digest()
+
+    def _push_digest(self):
         now = self.get_now()
         self._pushed = maint.prune_pushed(self._pushed, now)
         found = maint.digest(self._conditions, self._pushed)
