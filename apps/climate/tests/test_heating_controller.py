@@ -775,6 +775,7 @@ class LiveWrites(unittest.TestCase):
         h.report("family", preset_mode="permanent_hold")
         self.assertNotIn("restore", h.effects("family"))
         self.assertTrue(all(r["source"] == "own_write" for r in h.signals("family")))
+        self.assertNotIn("last_signal", h.attrs("family"))
         h.tick(minutes=10)
         self.assertEqual(len(h.calls), 1)
         for published in h.published:
@@ -2072,7 +2073,7 @@ class SunCut(unittest.TestCase):
         self.assertEqual(
             a["cut_window"], ["2026-10-18T07:00:00+02:00", "2026-10-18T16:00:00+02:00"]
         )
-        self.assertIn("Sun cut until 16:00", a["reasons"][0])
+        self.assertIn("Sun expected until 16:00", a["reasons"][0])
         self.assertEqual(a["sun_credit_h"], "2.0")
         self.assertEqual(a["budget_today_h"], "1.6")
         self.assertEqual(a["budget_dull_h"], "5.7")
@@ -2139,9 +2140,8 @@ class WeatherOffsetEndToEnd(unittest.TestCase):
     """On a cold day the family zone asks its thermostat for more than the profile says."""
 
     COLD_PLAN = [
-        "Aim 21.5: the target 4 h ahead",
-        "Weather +0.5: expected duty 0.63",
-        "Setpoint 22.5 (trim +0.50, weather +0.49)",
+        "Aims for 21.5 °C, the target in 4 h, because the floor takes that long to warm the room",
+        "Thermostat set to 22.5 °C: +0.5 because the thermostat reads 0.5 °C warmer than the room; +0.5 so it calls enough on a day the floor should run 63 % of the time",
     ]
 
     @staticmethod
@@ -2202,7 +2202,7 @@ class WeatherOffsetEndToEnd(unittest.TestCase):
         self.assertEqual((a["weather_offset"], d["weather_offset"]), ("+0.00", 0.0))
         self.assertEqual(a["setpoint_now"], 22.0)
         self.assertEqual(
-            a["reasons"], ["Aim 21.5: the target 4 h ahead", "Setpoint 22.0 (trim +0.50)"]
+            a["reasons"], ["Aims for 21.5 °C, the target in 4 h, because the floor takes that long to warm the room", "Thermostat set to 22.0 °C: +0.5 because the thermostat reads 0.5 °C warmer than the room"]
         )
 
     def test_the_day_at_the_lead_time_decides_which_forecast_counts(self):
@@ -2212,7 +2212,7 @@ class WeatherOffsetEndToEnd(unittest.TestCase):
         h.at(20, 5).tick()  # lead time 00:05, tomorrow
         a = h.attrs("family")
         self.assertEqual(a["weather_offset"], "+0.47")
-        self.assertIn("Weather +0.5: expected duty 0.62", a["reasons"])
+        self.assertIn("+0.5 so it calls enough on a day the floor should run 62 % of the time", a["reasons"][-1])
 
     def test_the_budget_reaches_the_lead_day_at_the_end_of_the_projection(self):
         h = self.cold_house()
@@ -2584,7 +2584,7 @@ class DecisionLogging(unittest.TestCase):
         self.assertEqual(fam["trim"], 0.5)
         self.assertIn("budget", fam)
         self.assertEqual(fam["budget"][0]["day"], "2026-10-17")
-        self.assertEqual(fam["reasons"][0], "Heating season is off: nothing would be written")
+        self.assertEqual(fam["reasons"][0], "Heating season is off: the thermostat is left alone")
 
     def test_an_unchanged_tick_writes_nothing_until_half_an_hour_has_passed(self):
         h = Harness(self)

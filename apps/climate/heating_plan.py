@@ -829,6 +829,20 @@ def weather_offset(cfg: WeatherOffsetConfig, u_eq: Optional[float]) -> float:
     return round(clamp((u_eq - cfg.bias) / cfg.gain, 0.0, cfg.max_c), 2)
 
 
+def setpoint_reason(setpoint: float, trim: float, offset: float, u_eq: Optional[float]) -> str:
+    """The thermostat setting and what was added to the aim to get it, in words."""
+    parts = []
+    if round(trim, 1):
+        side = "warmer" if trim > 0 else "colder"
+        parts.append(f"{trim:+.1f} because the thermostat reads {abs(trim):.1f} °C {side} than the room")
+    if offset > 0 and u_eq is not None:
+        parts.append(
+            f"{offset:+.1f} so it calls enough on a day the floor should run {u_eq * 100:.0f} % of the time"
+        )
+    text = f"Thermostat set to {setpoint:.1f} °C"
+    return f"{text}: {'; '.join(parts)}" if parts else text
+
+
 @dataclass(frozen=True)
 class CutEval:
     windows: tuple = ()  # qualifying (start_ts, end_ts, day iso) cut windows
@@ -1378,35 +1392,40 @@ def plan(zc: ZoneConfig, inp: ZoneInputs, now_ts: float, tz) -> Plan:
     reasons: list = []
     if inp.window_state == STATE_OPEN:
         plan_mode, aim = MODE_WINDOW, None
-        reasons.append("Opening open: held at the lower limit")
+        reasons.append("A window or door is open: heat held at the minimum")
     elif inp.window_state == STATE_SETTLE:
         plan_mode, aim = MODE_SETTLE, None
-        reasons.append("Settling after airing: held at the lower limit until the air recovers")
+        reasons.append("Just aired: heat held at the minimum until the air has recovered")
     elif in_party:
         plan_mode, aim = MODE_PARTY, None
         end = max(e for s, e in inp.party_windows if s <= now_ts < e)
-        reasons.append(f"Party: held at the lower limit until {hhmm(end, tz)}")
+        reasons.append(f"Party until {hhmm(end, tz)}: heat held at the minimum")
     elif inp.floor_cap and zc.floor_max_c is not None:
         plan_mode, aim = MODE_FLOOR_CAP, None
         reasons.append(
-            f"Floor temperature limit {zc.floor_max_c:.1f}: held at the lower limit "
-            f"until the floor is below {zc.floor_max_c - 0.5:.1f}"
+            f"The floor reached its {zc.floor_max_c:.1f} °C limit: heat held at the minimum "
+            f"until the floor is below {zc.floor_max_c - 0.5:.1f} °C"
         )
     elif guard_now:
         cap = lower if guard.cap == "lower_limit" else pmin
         plan_mode, aim = MODE_GUARD, min(t_lead, cap)
-        reasons.append(f"Bedroom too warm at bedtime: aim capped at {cap:.1f}")
+        reasons.append(f"The bedroom is too warm for bedtime: aims no higher than {cap:.1f} °C")
     elif zc.sun_cut.enabled and in_cut and not inp.fallback:
         plan_mode, aim = MODE_SUN_CUT, min(t_lead, pmin)
         end = max(e for s, e, _d in inp.cut_windows if s <= now_ts < e)
-        reasons.append(f"Sun cut until {hhmm(end, tz)}: aim capped at {pmin:.1f}")
+        reasons.append(f"Sun expected until {hhmm(end, tz)}: aims no higher than {pmin:.1f} °C and lets the sun warm the room")
     elif inp.fallback:
         plan_mode, aim = MODE_FALLBACK, fallback_aim
-        reasons.append("No usable room temperature: constant target, no profile or cuts")
+        reasons.append("No room temperature to go by: holds a fixed target")
     else:
         plan_mode, aim = MODE_HOLD, t_lead
-        ahead = f"{zc.profile.lead_hours:g} h ahead" if zc.profile.lead_hours else "now"
-        reasons.append(f"Aim {t_lead:.1f}: the target {ahead}")
+        if zc.profile.lead_hours:
+            reasons.append(
+                f"Aims for {t_lead:.1f} °C, the target in {zc.profile.lead_hours:g} h, "
+                "because the floor takes that long to warm the room"
+            )
+        else:
+            reasons.append(f"Aims for {t_lead:.1f} °C, the target right now")
         u_eq = dict(inp.day_duty).get(local_dt(lead_ts, tz).date().isoformat())
         offset = weather_offset(zc.weather_offset, u_eq)
 
@@ -1416,18 +1435,14 @@ def plan(zc: ZoneConfig, inp: ZoneInputs, now_ts: float, tz) -> Plan:
     else:
         raw = aim + inp.trim + offset
         setpoint = clamp(quantize(raw, inp.last_planned), lower, upper)
-        if offset > 0:
-            reasons.append(f"Weather {offset:+.1f}: expected duty {u_eq:.2f}")
-            reasons.append(f"Setpoint {setpoint:.1f} (trim {inp.trim:+.2f}, weather {offset:+.2f})")
-        else:
-            reasons.append(f"Setpoint {setpoint:.1f} (trim {inp.trim:+.2f})")
+        reasons.append(setpoint_reason(setpoint, inp.trim, offset, u_eq))
 
     if not inp.season_on:
         mode = MODE_OFF_SEASON
-        reasons.insert(0, "Heating season is off: nothing would be written")
+        reasons.insert(0, "Heating season is off: the thermostat is left alone")
     elif not inp.online:
         mode = MODE_DEVICE_OFFLINE
-        reasons.insert(0, "Thermostat unavailable: nothing can be written")
+        reasons.insert(0, "The thermostat is offline: nothing can be set")
     else:
         mode = plan_mode
     return Plan(mode, plan_mode, target, aim, raw, setpoint, pmin, tuple(reasons), offset)

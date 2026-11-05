@@ -120,6 +120,11 @@ def _publishable(value):
     return value
 
 
+def _is_human(signal: dict) -> bool:
+    """A signal somebody gave, not the echo of the controller's own write or its revert."""
+    return signal.get("source") not in (sig.SRC_OWN, sig.SRC_REVERT)
+
+
 def _label(zone: str) -> str:
     return zone.replace("_", " ").title()
 
@@ -262,7 +267,8 @@ class HeatingController(hass.Hass):
         self._signals = [s for s in saved_signals if isinstance(s, dict)][-SIGNALS_KEEP:]
         for zone, rt in self._zones.items():
             rt.last_signal = next(
-                (s for s in reversed(self._signals) if s.get("zone") == zone), None
+                (s for s in reversed(self._signals) if s.get("zone") == zone and _is_human(s)),
+                None,
             )
         self._alerts = al.Alerts(cfg.alerts, saved.get("alerts"))
         self._advisor = (
@@ -693,7 +699,7 @@ class HeatingController(hass.Hass):
         )
         self._signals.append(compact)
         del self._signals[:-SIGNALS_KEEP]
-        if zone in self._zones:
+        if zone in self._zones and _is_human(compact):
             self._zones[zone].last_signal = compact
         now = self.get_now()
         self._append_log(
