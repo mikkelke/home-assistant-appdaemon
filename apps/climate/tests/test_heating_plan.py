@@ -1023,8 +1023,8 @@ class WeatherOffsetInPlan(unittest.TestCase):
         self.assertEqual(
             p.reasons,
             (
-                "Aims for 21.5 °C, the target in 4 h, because the floor takes that long to warm the room",
-                "Thermostat set to 22.5 °C: +0.5 because the thermostat reads 0.5 °C warmer than the room; +0.4 so it calls enough on a day the floor should run 55 % of the time",
+                "Holding 21.5 °C",
+                "Thermostat at 22.5 °C: +0.5 as it reads warmer than the room, +0.4 for the cold weather",
             ),
         )
 
@@ -1032,14 +1032,14 @@ class WeatherOffsetInPlan(unittest.TestCase):
         p = plan_at(T(12), day_duty=self.DUTY, season_on=False)
         self.assertEqual((p.mode, p.plan_mode, p.weather_offset), ("off_season", "hold", 0.39))
         self.assertEqual(p.reasons[0], "Heating season is off: the thermostat is left alone")
-        self.assertIn("+0.4 so it calls enough on a day the floor should run 55 % of the time", p.reasons[-1])
+        self.assertIn("+0.4 for the cold weather", p.reasons[-1])
 
     def test_a_mild_day_changes_nothing_and_says_nothing(self):
         for duty in ((("2026-10-17", 0.18),), (("2026-10-17", 0.22),), (("2026-10-17", 0.0),)):
             p = plan_at(T(12), day_duty=duty)
             self.assertEqual(p.weather_offset, 0.0, duty)
             self.assertEqual(
-                p.reasons, ("Aims for 21.5 °C, the target in 4 h, because the floor takes that long to warm the room", "Thermostat set to 22.0 °C: +0.5 because the thermostat reads 0.5 °C warmer than the room")
+                p.reasons, ("Holding 21.5 °C", "Thermostat at 22.0 °C: +0.5 as it reads warmer than the room")
             )
             self.assertEqual(p, plan_at(T(12)), duty)
 
@@ -1090,7 +1090,7 @@ class WeatherOffsetInPlan(unittest.TestCase):
         self.assertEqual(plan_at(T(20, 0), day_duty=self.DUTY).weather_offset, 0.56)  # 00:00
         p = plan_at(T(21), day_duty=self.DUTY)  # lead 01:00 tomorrow
         self.assertEqual(p.weather_offset, 0.56)
-        self.assertEqual(p.reasons[-1], "Thermostat set to 22.0 °C: +0.5 because the thermostat reads 0.5 °C warmer than the room; +0.6 so it calls enough on a day the floor should run 70 % of the time")
+        self.assertEqual(p.reasons[-1], "Thermostat at 22.0 °C: +0.5 as it reads warmer than the room, +0.6 for the cold weather")
 
     def test_the_day_is_the_local_one_not_the_utc_one(self):
         duty = (("2026-10-16", 0.9), ("2026-10-17", 0.55))

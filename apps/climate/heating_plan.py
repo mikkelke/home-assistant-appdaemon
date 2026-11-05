@@ -834,13 +834,11 @@ def setpoint_reason(setpoint: float, trim: float, offset: float, u_eq: Optional[
     parts = []
     if round(trim, 1):
         side = "warmer" if trim > 0 else "colder"
-        parts.append(f"{trim:+.1f} because the thermostat reads {abs(trim):.1f} °C {side} than the room")
-    if offset > 0 and u_eq is not None:
-        parts.append(
-            f"{offset:+.1f} so it calls enough on a day the floor should run {u_eq * 100:.0f} % of the time"
-        )
-    text = f"Thermostat set to {setpoint:.1f} °C"
-    return f"{text}: {'; '.join(parts)}" if parts else text
+        parts.append(f"{trim:+.1f} as it reads {side} than the room")
+    if round(offset, 1) and u_eq is not None:
+        parts.append(f"{offset:+.1f} for the cold weather")
+    text = f"Thermostat at {setpoint:.1f} °C"
+    return f"{text}: {', '.join(parts)}" if parts else text
 
 
 @dataclass(frozen=True)
@@ -1419,13 +1417,12 @@ def plan(zc: ZoneConfig, inp: ZoneInputs, now_ts: float, tz) -> Plan:
         reasons.append("No room temperature to go by: holds a fixed target")
     else:
         plan_mode, aim = MODE_HOLD, t_lead
-        if zc.profile.lead_hours:
-            reasons.append(
-                f"Aims for {t_lead:.1f} °C, the target in {zc.profile.lead_hours:g} h, "
-                "because the floor takes that long to warm the room"
-            )
+        if abs(t_lead - target) < 0.05:
+            reasons.append(f"Holding {t_lead:.1f} °C")
         else:
-            reasons.append(f"Aims for {t_lead:.1f} °C, the target right now")
+            reasons.append(
+                f"Getting ready for {t_lead:.1f} °C in {zc.profile.lead_hours:g} h: the floor is slow"
+            )
         u_eq = dict(inp.day_duty).get(local_dt(lead_ts, tz).date().isoformat())
         offset = weather_offset(zc.weather_offset, u_eq)
 

@@ -2140,8 +2140,8 @@ class WeatherOffsetEndToEnd(unittest.TestCase):
     """On a cold day the family zone asks its thermostat for more than the profile says."""
 
     COLD_PLAN = [
-        "Aims for 21.5 °C, the target in 4 h, because the floor takes that long to warm the room",
-        "Thermostat set to 22.5 °C: +0.5 because the thermostat reads 0.5 °C warmer than the room; +0.5 so it calls enough on a day the floor should run 63 % of the time",
+        "Holding 21.5 °C",
+        "Thermostat at 22.5 °C: +0.5 as it reads warmer than the room, +0.5 for the cold weather",
     ]
 
     @staticmethod
@@ -2202,7 +2202,7 @@ class WeatherOffsetEndToEnd(unittest.TestCase):
         self.assertEqual((a["weather_offset"], d["weather_offset"]), ("+0.00", 0.0))
         self.assertEqual(a["setpoint_now"], 22.0)
         self.assertEqual(
-            a["reasons"], ["Aims for 21.5 °C, the target in 4 h, because the floor takes that long to warm the room", "Thermostat set to 22.0 °C: +0.5 because the thermostat reads 0.5 °C warmer than the room"]
+            a["reasons"], ["Holding 21.5 °C", "Thermostat at 22.0 °C: +0.5 as it reads warmer than the room"]
         )
 
     def test_the_day_at_the_lead_time_decides_which_forecast_counts(self):
@@ -2212,7 +2212,7 @@ class WeatherOffsetEndToEnd(unittest.TestCase):
         h.at(20, 5).tick()  # lead time 00:05, tomorrow
         a = h.attrs("family")
         self.assertEqual(a["weather_offset"], "+0.47")
-        self.assertIn("+0.5 so it calls enough on a day the floor should run 62 % of the time", a["reasons"][-1])
+        self.assertIn("+0.5 for the cold weather", a["reasons"][-1])
 
     def test_the_budget_reaches_the_lead_day_at_the_end_of_the_projection(self):
         h = self.cold_house()
