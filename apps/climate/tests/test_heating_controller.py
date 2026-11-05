@@ -518,16 +518,15 @@ class ShippedYaml(unittest.TestCase):
         periods = {(p.start, p.end): p.offset for p in self.cfg.zones["family"].profile.periods}
         self.assertEqual(periods, {(23 * 60, 10 * 60): -0.5})
 
-    def test_bathroom_heats_in_the_morning_window_only(self):
+    def test_bathroom_heats_from_night_to_morning_only(self):
         zc = self.cfg.zones["bathroom"]
         self.assertEqual(zc.profile.lead_hours, 0)
         self.assertTrue(zc.profile.outside_is_lower_limit)
-        self.assertEqual([(p.start, p.end) for p in zc.profile.periods], [(6 * 60, 9 * 60)])
+        self.assertEqual([(p.start, p.end) for p in zc.profile.periods], [(150, 7 * 60)])
 
-    def test_only_the_bathroom_is_held_back_for_the_bedroom(self):
+    def test_no_zone_is_held_back_for_the_bedroom(self):
         guarded = [n for n, zc in self.cfg.zones.items() if zc.guard.enabled]
-        self.assertEqual(guarded, ["bathroom"])
-        self.assertEqual(self.cfg.zones["bathroom"].guard.cap, "lower_limit")
+        self.assertEqual(guarded, [])
 
     def test_sun_cuts_only_where_the_glass_looks_at_the_sun(self):
         enabled = [n for n, zc in self.cfg.zones.items() if zc.sun_cut.enabled]
@@ -689,9 +688,9 @@ class LiveWrites(unittest.TestCase):
         h.clock.advance(seconds=180)
         timer.args[0](timer.kwargs)
 
-    def test_only_family_ships_live_and_the_switch_is_watched(self):
+    def test_family_and_bathroom_ship_live_and_the_switch_is_watched(self):
         h = Harness(self)
-        self.assertEqual(h.app.cfg.live_zones, ("family",))
+        self.assertEqual(h.app.cfg.live_zones, ("family", "bathroom"))
         watched = {c.args[1] for c in h.app.listen_state.call_args_list}
         self.assertIn("input_boolean.heating_live", watched)
         self.assertIn("input_boolean.heating_live", h.app._triggers)
@@ -2434,6 +2433,11 @@ class PartyEndToEnd(unittest.TestCase):
 
 
 class BedroomEndToEnd(unittest.TestCase):
+    def guarded(self):
+        zones = copy.deepcopy(shipped_args(Path("."))["zones"])
+        zones["bathroom"]["bedroom_guard"] = {"enabled": True, "cap": "lower_limit"}
+        return Harness(self, zones=zones)
+
     def evening(self, h, air, window_open="false", day=17):
         h.at(21, 0, day)
         for _ in range(31):
@@ -2445,12 +2449,12 @@ class BedroomEndToEnd(unittest.TestCase):
         # the loop closes the evening at the first reading after 23:30
 
     def test_a_warm_bedtime_holds_the_bathroom_at_its_lower_limit_next_morning(self):
-        h = Harness(self)
+        h = self.guarded()
         h.ha.set("input_boolean.heating_season", "on")
         self.evening(h, 21.4)
         self.assertTrue(h.app._loop.hold)
         self.assertEqual(h.log_lines("bedroom")[-1]["action"], "hold")
-        h.at(7, 0, day=18)
+        h.at(3, 0, day=18)
         h.ha.set("sensor.bedroom_feel", "21.0", {"stale": "false", "window_open": "false"})
         h.tick()
         a = h.attrs("bathroom")
@@ -2460,12 +2464,12 @@ class BedroomEndToEnd(unittest.TestCase):
         self.assertEqual(h.attrs("family")["mode"], "hold")  # the family zone is never held back
 
     def test_a_cool_bedtime_gives_the_bathroom_its_morning_heat(self):
-        h = Harness(self)
+        h = self.guarded()
         h.ha.set("input_boolean.heating_season", "on")
         h.app._loop.hold = True
         self.evening(h, 20.2)
         self.assertFalse(h.app._loop.hold)
-        h.at(7, 0, day=18)
+        h.at(3, 0, day=18)
         h.ha.set("sensor.bedroom_feel", "20.2", {"stale": "false", "window_open": "false"})
         h.tick()
         a = h.attrs("bathroom")

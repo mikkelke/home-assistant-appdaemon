@@ -20,7 +20,7 @@ HeatingController:
   user_ids:
     "5bee78148825439488b70f92565e6c26": kristine
   season_entity: input_boolean.heating_season
-  live_zones: [family]
+  live_zones: [family, bathroom]
   live_switch_entity: input_boolean.heating_live
   state_file: /conf/apps/climate/heating_controller_state.json
   log_dir: /conf/heating_log
@@ -213,8 +213,7 @@ HeatingController:
         warmer: input_button.heating_claudias_room_warmer
         colder: input_button.heating_claudias_room_colder
 
-    # Warm only in the morning window, and no pre-heating before it: the bathroom shares a
-    # wall with the bedroom, and a held-back bathroom stays at the lower limit all day.
+    # Warm only from night to morning: the slab is slow to respond.
     bathroom:
       thermostat: climate.bathroom_thermostat
       control_air: [sensor.bathroom_feel]
@@ -228,10 +227,9 @@ HeatingController:
         lead_hours: 0
         outside: lower_limit
         periods:
-          - {from: "06:00", to: "09:00", offset: 0}
+          - {from: "02:30", to: "07:00", offset: 0}
       trim: {initial: 0.0, min: -1.0, max: 1.0}
       budget: {a: 0.64, b_om: -2.47, c: 0, d: -1.24}
-      bedroom_guard: {enabled: true, cap: lower_limit}
 
     guest_bathroom:
       thermostat: climate.guest_bathroom_thermostat
