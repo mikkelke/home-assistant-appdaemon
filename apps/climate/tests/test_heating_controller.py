@@ -688,9 +688,9 @@ class LiveWrites(unittest.TestCase):
         h.clock.advance(seconds=180)
         timer.args[0](timer.kwargs)
 
-    def test_family_and_bathroom_ship_live_and_the_switch_is_watched(self):
+    def test_every_zone_ships_live_and_the_switch_is_watched(self):
         h = Harness(self)
-        self.assertEqual(h.app.cfg.live_zones, ("family", "bathroom"))
+        self.assertEqual(h.app.cfg.live_zones, ("family", "bathroom", "kristines_room", "claudias_room", "guest_bathroom"))
         watched = {c.args[1] for c in h.app.listen_state.call_args_list}
         self.assertIn("input_boolean.heating_live", watched)
         self.assertIn("input_boolean.heating_live", h.app._triggers)
