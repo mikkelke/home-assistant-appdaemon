@@ -107,6 +107,27 @@ class CleanerVisitTests(unittest.IsolatedAsyncioTestCase):
         self.app.run_in.assert_not_called()
         self.assertEqual(self.app.current_room, "17")
 
+    async def test_previous_rooms_final_progress_does_not_count_for_the_next_room(self):
+        self.states["zone.home"] = "1"
+        self.states["person.kristine"] = "home"
+        self.states["input_boolean.clean_while_home"] = "off"
+        self.app._progress_armed = True
+        await self.app.handle_robot_status("sensor.rober2_status", "state", "returning_home", "segment_cleaning", {})
+        await self.app.handle_progress("sensor.rober2_cleaning_progress", "state", "97", "99", {})
+        self.assertEqual(self.app.peak_progress, 0)
+
+        self.app.stop_cleaning = AsyncMock()
+        await self.app.handle_presence("zone.home", "state", "0", "1", {})
+        self.app.stop_cleaning.assert_awaited_once()
+
+    async def test_progress_counts_once_the_sensor_has_reset(self):
+        self.app.cleaning = True
+        self.app._progress_armed = False
+        self.app.set_fan_speed = AsyncMock()
+        for value in ("99", "0", "12", "95"):
+            await self.app.handle_progress("sensor.rober2_cleaning_progress", "state", None, value, {})
+        self.assertEqual(self.app.peak_progress, 95)
+
     async def test_cleaner_blocks_away_when_all_residents_are_away(self):
         self.states["sensor.untracked_visitor"] = "cleaner"
         self.assertFalse(await self.app.is_away())

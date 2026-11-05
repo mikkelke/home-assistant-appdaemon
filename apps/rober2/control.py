@@ -78,6 +78,9 @@ class Rober2Control(hass.Hass):
         self.room_start_time = None  # Track when room cleaning started
         self.fan_speed_enforced = False  # Track if fan speed is enforced
         self.peak_progress = 0  # Track highest progress reached during current room cleaning
+        # False from a room start until the progress sensor reads below 50: the robot can report the
+        # previous room's final value a few seconds into the next room.
+        self._progress_armed = True
         self.last_progress_update = None  # Track when we last updated progress
         # Track rooms actually observed while robot was in cleaning state
         self._visited_rooms = set()
@@ -1001,6 +1004,7 @@ class Rober2Control(hass.Hass):
                     self.fan_speed_enforced = False
                     self.room_start_time = datetime.datetime.now()
                     self.peak_progress = 0  # Reset progress tracking for new room
+                    self._progress_armed = False
                     # Reset bin empty flag for new cleaning session (persistent in HA)
                     await self.call_service("input_boolean/turn_off", entity_id="input_boolean.rober2_bin_empty_triggered")
                     
@@ -1580,7 +1584,11 @@ class Rober2Control(hass.Hass):
             if new and new != "unavailable" and self.cleaning:
                 try:
                     progress_value = float(new)
-                    
+                    if not self._progress_armed:
+                        if progress_value >= 50:
+                            return
+                        self._progress_armed = True
+
                     # Update peak progress if this is higher
                     if progress_value > self.peak_progress:
                         self.peak_progress = progress_value
@@ -2425,6 +2433,7 @@ class Rober2Control(hass.Hass):
                     try:
                         if not self.cleaning:
                             self.cleaning = True
+                            self._progress_armed = False
                             # Reset bin empty flag for new cleaning session (persistent in HA)
                             await self.call_service("input_boolean/turn_off", entity_id="input_boolean.rober2_bin_empty_triggered")
                         # If we don't have a current room, derive from input_text helper
