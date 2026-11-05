@@ -242,12 +242,18 @@ RoomFeel:
       window_contacts: [binary_sensor.kristines_room_window_contact]
 
     bathroom:
+      fusion: primary
       air_sources:
+        - entity: sensor.bathroom_seated_thermometer_temperature
+          rh_entity: sensor.bathroom_seated_thermometer_humidity
+          label: seated
+          offset_c: 0.0
         - entity: climate.bathroom_thermostat
           attribute: current_temperature
           # sensor.bathroom_humidity: UNVERIFIED (pattern-inferred, not grepped directly).
           rh_entity: sensor.bathroom_humidity
           label: salus
+          offset_c: -0.7
       floor_entity: sensor.bathroom_floor_thermometer_temperature
       floor_rh_entity: sensor.bathroom_floor_thermometer_humidity
       window_contacts: [binary_sensor.bathroom_window_contact]
