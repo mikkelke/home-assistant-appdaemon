@@ -1,0 +1,29 @@
+# BathroomDisplay - sensor.bathroom_display for the round display in the main bathroom (ESPHome node
+# bathroom-display): off, someone, or mikkel with a greeting and up to three lines (a title, an icon and
+# a due chip each). See bathroom_display.py.
+BathroomDisplay:
+  module: bathroom_display
+  class: BathroomDisplay
+  entity: sensor.bathroom_display
+  # Occupancy is binary_sensor.<zone>_active (RoomActive); when it has no opinion the display stays as it
+  # was. The zone is also the HA area id whose house_upcoming rows are listed after everything due
+  # within 24 hours.
+  zone: bathroom
+  # The name in the greeting and the person attribute, and the audience of house_upcoming rows.
+  resident: Mikkel
+  # The display hears Mikkel's phone as an iBeacon; the sensor turns unknown once it is out of range.
+  # A reading at or above mikkel_rssi_min dBm that is at most rssi_fresh_s seconds old identifies him,
+  # and he stays identified until the room goes inactive. mikkel_rssi_min is provisional until
+  # calibrated from the history of the rssi sensor on the mounted display.
+  rssi_entity: sensor.bathroom_display_mikkel_phone_rssi
+  mikkel_rssi_min: -75
+  rssi_fresh_s: 20
+  upcoming_entity: sensor.house_upcoming
+  # Mikkel's routes (TransitMikkel in apps/transit/transit_alarm.yaml) by the sensors TransitStatus
+  # writes. A route whose status is Delayed or Disrupted becomes a line before the rows; Unavailable
+  # (the API failed) is not a transit problem and shows nothing. Data older than transit_max_age_min
+  # is ignored; the poller runs every 30 minutes at night.
+  transit:
+    - {entity: sensor.transit_enghave_metro_kbh, label: Metro}
+    - {entity: sensor.transit_carlsberg_stog_kbh, label: S-tog}
+  transit_max_age_min: 45
