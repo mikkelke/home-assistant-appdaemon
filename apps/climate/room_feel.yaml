@@ -260,13 +260,19 @@ RoomFeel:
       mould_risk: true
 
     guest_bathroom:
+      fusion: primary
       air_sources:
+        - entity: sensor.guest_bathroom_seated_thermometer_temperature
+          rh_entity: sensor.guest_bathroom_seated_thermometer_humidity
+          label: seated
+          offset_c: 0.0
         - entity: climate.guest_bathroom_thermostat
           attribute: current_temperature
           # sensor.guest_bathroom_humidity: UNVERIFIED (pattern-inferred, not grepped
           # directly).
           rh_entity: sensor.guest_bathroom_humidity
           label: salus
+          offset_c: -0.8
       floor_entity: sensor.guest_bathroom_floor_thermometer_temperature
       floor_rh_entity: sensor.guest_bathroom_floor_thermometer_humidity
       # Only a door contact is known here (binary_sensor.guest_bathroom_door_contact, an
