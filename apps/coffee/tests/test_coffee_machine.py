@@ -585,6 +585,31 @@ class CupTests(unittest.TestCase):
         fake.advance(app, 2)
         self.assertEqual((coffee_state(app)[0], coffee_state(app)[1]["cup"]), ("starting", "present"))
 
+    def test_the_emptied_cup_back_after_a_pickup_starts_the_next_cup_at_once(self):
+        app = fake.make_app()
+        brew(app, power=False)
+        self.assertEqual((coffee_state(app)[0], coffee_state(app)[1]["cup"]), ("picked_up", "absent"))
+        self.scale(app, "-2.6")
+        fake.advance(app, 2)
+        self.assertEqual(coffee_state(app)[1]["cup"], "present")
+        fake.op(app, "start", {"variant": "usual"})
+        state, attrs = coffee_state(app)
+        self.assertEqual((state, attrs["cup"]), ("starting", "present"))
+        self.assertEqual(len(calls(app, "xbloom/start_brew")), 2)
+
+    def test_a_wake_noticed_after_the_cup_was_seen_holds_no_cup(self):
+        app = fake.make_app(cup=False)
+        fake.set_entity(app, "sensor.pour_over_plug_power", "0.8")
+        self.scale(app, "270.8")
+        fake.advance(app, 2)
+        self.assertEqual(coffee_state(app)[1]["cup"], "present")
+        fake.set_entity(app, "sensor.pour_over_plug_power", "2.1")
+        for grams in ("-113.64", "-0.04"):
+            self.scale(app, grams)
+            fake.advance(app, 2)
+        fake.op(app, "start", {"variant": "usual"})
+        self.assertEqual((coffee_state(app)[0], coffee_state(app)[1]["cup"]), ("awaiting_cup", "unknown"))
+
     def test_a_cup_seen_on_a_link_that_went_is_unknown_until_the_next_frame(self):
         app = fake.make_app(cup=False)
         fake.set_entity(app, "switch.xbloom_studio_connect", "on")

@@ -7,12 +7,18 @@ zero. At rest the magnet grinder cup and the dripper stand on the scale: a machi
 cup reads about -114 g, and with the cup about +160 g. A completed brew leaves its cup on the scale (`present`) until
 it is picked up (`absent`).
 
+A brew starts with its cup on the scale, so a zero taken then with the cup `present` holds that cup: once it is lifted
+(`absent`), a reading within NEAR_G of zero held for HOLD_S is the emptied cup back (`present`), and stays so while it
+reads within NEAR_G. A zero taken on waking holds no cup, as the magnet grinder cup and the dripper put back read about
+zero too.
+
 Frames come only while the app holds the link, so the state holds only while it watches: once the link goes or the
 app restarts it is `unknown` until the next frame. While the machine sleeps the scale sends nothing but SLEEP_G once,
 which is no reading. Times are epoch seconds.
 """
 
 STEP_G = 100.0
+NEAR_G = 50.0
 HOLD_S = 2.0
 SLEEP_G = 50.0
 
@@ -31,18 +37,25 @@ class Cup:
         self.state = "unknown"
         self.grams = None
         self.step = None
+        self.cup_at_zero = False
 
     def _set(self, state):
         changed = state != self.state
         self.state, self.step = state, None
         return changed
 
+    def _way(self, grams):
+        """The state a reading points to: where the scale was zeroed with the cup on it, near zero is that cup."""
+        if self.cup_at_zero and self.state in ("absent", "present") and abs(grams) <= NEAR_G:
+            return "present"
+        return side(grams)
+
     def reading(self, now, grams):
         """A frame from the scale. True when the state changed."""
         if sleep_frame(grams):
             return False
         self.grams = grams
-        way = side(grams)
+        way = self._way(grams)
         if way == self.state:
             self.step = None
         elif self.step is None or self.step[0] != way:
@@ -59,14 +72,17 @@ class Cup:
         """When the reading under way decides, None without one."""
         return None if self.step is None else self.step[1] + HOLD_S
 
-    def zero(self):
-        """The machine zeroed the scale: on waking and at the start of a brew."""
+    def zero(self, tared=False):
+        """The machine zeroed the scale: on waking, and with `tared` at the start of a brew, whose zero holds the
+        cup if it was `present`."""
         self.grams = 0.0
+        self.cup_at_zero = tared and self.state == "present"
         return self._set("unknown")
 
     def asleep(self):
         """The machine sleeps or is off."""
         self.grams = None
+        self.cup_at_zero = False
         return self._set("unknown")
 
     def unseen(self):

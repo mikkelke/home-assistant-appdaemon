@@ -588,7 +588,7 @@ class CoffeeMachine(hass.Hass):
     def _on_started(self, brew):
         now = self._now()
         self._connect.activity(now)
-        self._cup_note(self._cup.zero(), "a brew started")
+        self._cup_note(self._cup.zero(tared=True), "a brew started")
         if brew.get("recipe") is None:
             recipe = cp.by_name(self._recipes, brew.get("recipe_name"))
             usual = self._usual()

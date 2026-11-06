@@ -1,7 +1,7 @@
 # tests/test_coffee_cup.py - whether a cup stands on the scale, replayed from the scale frames recorded on 20.10:
 # a machine woken at rest and readied, then the cup put on; woken with the scale empty and the magnet cup and the
 # coffee cup put on and off; woken with the coffee cup on and it lifted; glitches, the sleep reading, a brew and its
-# pickup.
+# pickup, and the emptied cup put back where the brew was tared with it.
 # Run from repo root: python3 -m unittest discover -s apps/coffee/tests
 
 import sys
@@ -134,6 +134,50 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(play(cup, [(330.0, 221.22), (330.2, -72.72), (330.4, -268.57), (330.6, -276.63)]),
                          [(332.4, "absent")])
         self.assertFalse(cup.lifted())
+
+    def test_the_emptied_cup_back_where_the_scale_was_zeroed_with_it_is_present_again(self):
+        cup = cc.Cup()
+        cup.put_on()
+        cup.zero(tared=True)
+        self.assertEqual(play(cup, [(1, 0.4)], until=20), [])
+        self.assertEqual(cup.state, "unknown")
+        self.assertEqual(play(cup, [(30, -CUP_G)], until=40), [(32, "absent")])
+        self.assertEqual(play(cup, [(100, 5.4)], until=110), [(102, "present")])
+        self.assertEqual(play(cup, [(130, -2.6), (160, -2.0)], until=200), [])
+        self.assertEqual(cup.state, "present")
+
+    def test_things_put_back_at_zero_after_a_wake_zero_are_no_cup(self):
+        cup = cc.Cup()
+        cup.zero()
+        self.assertEqual(play(cup, AT_REST[:1], until=10), [(2.0, "absent")])
+        back = [(100, AT_REST[0][1] + MAGNET_G), (110, AT_REST[0][1] + MAGNET_G + DRIPPER_G)]
+        self.assertEqual(play(cup, back, until=120), [(102, "unknown")])
+        self.assertEqual(cup.state, "unknown")
+
+    def test_a_wake_zero_holds_no_cup_even_when_one_was_seen_before_it(self):
+        cup = cc.Cup()
+        play(cup, [(0, CUP_G)])
+        self.assertEqual(cup.state, "present")
+        cup.zero()
+        self.assertEqual(play(cup, [(10, -CUP_G)], until=20), [(12, "absent")])
+        self.assertEqual(play(cup, [(100, 0.4)], until=110), [(102, "unknown")])
+
+    def test_the_machine_sleeping_forgets_a_cup_held_by_the_zero(self):
+        cup = cc.Cup()
+        cup.put_on()
+        cup.zero(tared=True)
+        cup.asleep()
+        self.assertEqual(play(cup, AT_REST[:1], until=10), [(2.0, "absent")])
+        self.assertEqual(play(cup, [(100, -0.04)], until=110), [(102, "unknown")])
+
+    def test_near_zero_is_fifty_grams_either_way(self):
+        for grams, state in ((49.9, "present"), (-50.0, "present"), (50.1, "unknown"), (-50.1, "unknown")):
+            cup = cc.Cup()
+            cup.put_on()
+            cup.zero(tared=True)
+            cup.lifted()
+            play(cup, [(0, grams)], until=10)
+            self.assertEqual(cup.state, state, grams)
 
     def test_a_brew_left_on_the_scale_is_present_even_without_frames(self):
         cup = cc.Cup()
