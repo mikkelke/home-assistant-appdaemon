@@ -5,7 +5,8 @@ Publishes sensor.bathroom_display, the one entity the display reads:
                 "mikkel" (active, and his phone has been near during this visit)
     attributes  every value a string, since AppDaemon 4.5.13's set_state drops None, False and 0:
         reason      why, in RoomActive's style: "inactive:binary_sensor.bathroom_active"; "unknown:..."
-                    for a first evaluation room_active_read has no opinion on; while active
+                    for a first evaluation room_active_read has no opinion on;
+                    "sleep:input_boolean.mikkel_sleep_mode" for an active room kept dark; while active
                     "active:binary_sensor.bathroom_active phone:near", the word being the phone's status:
                     near, weak (under mikkel_rssi_min), stale (older than rssi_fresh_s) or none (no
                     reading), or held for a mikkel whose phone is not near right now
@@ -26,6 +27,10 @@ phone is out of range - is a number at or above mikkel_rssi_min dBm and was upda
 seconds ago. From then on he stays identified for as long as the room stays active, whatever the phone does.
 No opinion on the room (None) changes nothing, the state, reason and lines staying as they were; before
 there is a state it is off.
+
+While Mikkel's sleep mode (sleep_entity) is on, an active room stays off unless the main spots (light_entity)
+are on. The lights app never switches them on automatically in sleep mode, so they are on only because
+someone used the wall switch. A visit that starts dark begins again as someone once the light comes on.
 
 The lines for Mikkel, at most three:
     transit  one line for each of his routes (the `transit` list) whose status is Delayed or Disrupted
@@ -118,6 +123,12 @@ def next_state(prev, active, status):
     if not active:
         return "off"
     return "mikkel" if prev == "mikkel" or status == "near" else "someone"
+
+
+def kept_dark(sleep_state, light_state):
+    """True while sleep mode is on and the main spots are not: the display then stays off. A sleep mode
+    that cannot be read is not on, and a light that cannot be read is not on."""
+    return sleep_state == "on" and light_state != "on"
 
 
 def reason_text(active_entity, active, state, status):
@@ -281,6 +292,8 @@ class BathroomDisplay(hass.Hass):
         self.upcoming_entity = a.get("upcoming_entity", "sensor.house_upcoming")
         self.routes = [(str(route["label"]), route["entity"]) for route in a.get("transit") or []]
         self.transit_max_age = timedelta(minutes=float(a.get("transit_max_age_min", TRANSIT_MAX_AGE_MIN)))
+        self.sleep_entity = a.get("sleep_entity", "input_boolean.mikkel_sleep_mode")
+        self.light_entity = a.get("light_entity", "light.bathroom_main_lights")
 
         self._cache = {}
         self._current = None  # (state, attributes) as last worked out
@@ -301,7 +314,8 @@ class BathroomDisplay(hass.Hass):
     # -- sources --------------------------------------------------------------
 
     def _sources(self):
-        return list(dict.fromkeys([self.rssi_entity, self.upcoming_entity] + [entity for _, entity in self.routes]))
+        return list(dict.fromkeys([self.rssi_entity, self.upcoming_entity, self.sleep_entity, self.light_entity]
+                                  + [entity for _, entity in self.routes]))
 
     def _read(self, entity):
         try:
@@ -345,9 +359,15 @@ class BathroomDisplay(hass.Hass):
         now = self.get_now()
         value, at = phone_reading(self._cache.get(self.rssi_entity))
         status = phone_status(value, at, now, self.rssi_min, self.rssi_fresh)
+        if active and kept_dark(self._state_of(self.sleep_entity), self._state_of(self.light_entity)):
+            return "off", payload("off", f"sleep:{self.sleep_entity}", self.resident, [])
         state = next_state(prev, active, status)
         reason = reason_text(self.active_entity, active, state, status)
         return state, payload(state, reason, self.resident, self._lines(now) if state == "mikkel" else [])
+
+    def _state_of(self, entity):
+        full = self._cache.get(entity)
+        return full.get("state") if isinstance(full, dict) else None
 
     def _lines(self, now):
         routes = [(label, self._cache.get(entity)) for label, entity in self.routes]

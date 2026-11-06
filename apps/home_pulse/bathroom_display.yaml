@@ -19,6 +19,10 @@ BathroomDisplay:
   mikkel_rssi_min: -75
   rssi_fresh_s: 20
   upcoming_entity: sensor.house_upcoming
+  # While Mikkel's sleep mode is on the display stays off in an active room, unless the main spots are on:
+  # the lights app does not switch them on in sleep mode, so on means the wall switch.
+  sleep_entity: input_boolean.mikkel_sleep_mode
+  light_entity: light.bathroom_main_lights
   # Mikkel's routes (TransitMikkel in apps/transit/transit_alarm.yaml) by the sensors TransitStatus
   # writes. A route whose status is Delayed or Disrupted becomes a line before the rows; Unavailable
   # (the API failed) is not a transit problem and shows nothing. Data older than transit_max_age_min

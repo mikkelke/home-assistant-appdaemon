@@ -44,6 +44,8 @@ ACTIVE = "binary_sensor.bathroom_active"
 RSSI = CONFIG["rssi_entity"]
 UPCOMING = CONFIG["upcoming_entity"]
 METRO, STOG = (route["entity"] for route in CONFIG["transit"])
+SLEEP = CONFIG["sleep_entity"]
+LIGHT = CONFIG["light_entity"]
 
 
 def iso(moment):
@@ -737,7 +739,8 @@ class PublishTests(unittest.TestCase):
     def test_it_listens_to_the_room_the_phone_the_rows_and_mikkels_routes(self):
         app = make_app()
         self.assertEqual(sorted((entity, kw.get("attribute")) for _, entity, kw in app.listened),
-                         sorted([(ACTIVE, None), (RSSI, "all"), (UPCOMING, "all"), (METRO, "all"), (STOG, "all")]))
+                         sorted([(ACTIVE, None), (RSSI, "all"), (UPCOMING, "all"), (SLEEP, "all"), (LIGHT, "all"),
+                                 (METRO, "all"), (STOG, "all")]))
         self.assertEqual(app.events, [("_on_plugin_started", "plugin_started")])
         self.assertEqual(app.scheduled, [("_on_tick", "now+10", 10)])
 
@@ -851,6 +854,46 @@ class LineTests(unittest.TestCase):
         self.assertEqual(last(app)["attributes"]["line1"], "")
         fire(app, UPCOMING, upcoming(self.ROWS))
         self.assertEqual(last(app)["attributes"]["line1"], "Spray the Alocasia")
+
+
+class SleepTests(unittest.TestCase):
+    """While Mikkel's sleep mode is on the display stays off, unless the light was switched on by hand."""
+
+    DARK = f"sleep:{SLEEP}"
+
+    def test_kept_dark(self):
+        for sleep, light, expected in (("on", "off", True), ("on", None, True), ("on", "unavailable", True),
+                                       ("on", "on", False), ("off", "off", False), ("unavailable", "off", False),
+                                       (None, None, False)):
+            with self.subTest(sleep=sleep, light=light):
+                self.assertEqual(bd.kept_dark(sleep, light), expected)
+
+    def test_an_active_room_stays_off_in_sleep_mode_even_with_the_phone_near(self):
+        app = make_app({SLEEP: full("on"), LIGHT: full("off"), RSSI: full("-60")})
+        self.assertEqual(last(app)["state"], "off")
+        self.assertEqual(last(app)["attributes"], attrs_of(reason=self.DARK))
+
+    def test_the_wall_switch_wakes_it_and_the_visit_starts_again(self):
+        app = make_app({SLEEP: full("on"), LIGHT: full("off")})
+        fire(app, LIGHT, full("on"))
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]),
+                         ("someone", f"active:{ACTIVE} phone:none"))
+        phone(app, "-60")
+        self.assertEqual(last(app)["state"], "mikkel")
+        fire(app, LIGHT, full("off"))
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]), ("off", self.DARK))
+
+    def test_sleep_mode_turning_on_mid_visit_switches_it_off_and_turning_off_brings_it_back(self):
+        app = make_app({SLEEP: full("off"), LIGHT: full("off"), RSSI: full("-60")})
+        self.assertEqual(last(app)["state"], "mikkel")
+        fire(app, SLEEP, full("on"))
+        self.assertEqual(last(app)["state"], "off")
+        fire(app, SLEEP, full("off"))
+        self.assertEqual(last(app)["state"], "mikkel")
+
+    def test_an_empty_room_in_sleep_mode_is_inactive_not_dark(self):
+        app = make_app({SLEEP: full("on")}, active="off")
+        self.assertEqual(last(app)["attributes"]["reason"], f"inactive:{ACTIVE}")
 
 
 class ConfigTests(unittest.TestCase):
