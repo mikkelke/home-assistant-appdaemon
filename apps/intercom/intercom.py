@@ -1039,6 +1039,7 @@ class Intercom(hass.Hass):
                 outcome["succeeded"] = True
             if first_success:
                 self._mark_ring_succeeded(trigger_entity)
+                self._cancel_pending_unlocks(trigger_entity)
             self.log(f"OK: Successfully unlocked {lock_entity} (attempt {unlock_attempt})", level="INFO")
             # Check door state after unlock for additional verification
             if door_sensor:

@@ -681,6 +681,42 @@ class AbbNativeUnlockTests(unittest.TestCase):
         titles = [p["title"] for p in app.pushes]
         self.assertEqual(titles, ["Intercom auto-opened"])  # exactly once, not once per attempt
 
+    def test_esp_ladder_stops_after_first_confirmed_unlock(self):
+        app = self._app(abb_unlock_doors={})
+        running = set()
+        cancelled = []
+        app.timer_running = lambda handle: handle in running
+        app.cancel_timer = lambda handle: (cancelled.append(handle), running.discard(handle))
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+        later_handles = list(app.pending_unlocks["binary_sensor.front"][1:])
+        running.update(app.pending_unlocks["binary_sensor.front"])
+
+        first_attempt = app.run_in_calls.pop(0)
+        running.discard(app.pending_unlocks["binary_sensor.front"][0])
+        first_attempt[0](first_attempt[2])
+        self.states["lock.front"] = "unlocking"
+        _run_scheduled(app, "_verify_unlock")
+
+        self.assertEqual(cancelled, later_handles)
+        self.assertNotIn("binary_sensor.front", app.pending_unlocks)
+        self.assertEqual([p["title"] for p in app.pushes], ["Intercom auto-opened"])
+
+    def test_esp_ladder_keeps_retrying_while_unconfirmed(self):
+        app = self._app(abb_unlock_doors={})
+        running = set()
+        cancelled = []
+        app.timer_running = lambda handle: handle in running
+        app.cancel_timer = lambda handle: (cancelled.append(handle), running.discard(handle))
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+        running.update(app.pending_unlocks["binary_sensor.front"])
+
+        first_attempt = app.run_in_calls.pop(0)
+        first_attempt[0](first_attempt[2])
+        _run_scheduled(app, "_verify_unlock")
+
+        self.assertEqual(cancelled, [])
+        self.assertEqual([cb.__name__ for cb, _, _ in app.run_in_calls], ["unlock_callback"] * (app.unlock_repeat_count - 1))
+
     def test_abb_ack_timeout_then_esp_failure_reports_once(self):
         app = self._app({"front door": "button.abb_front"})
         app._handle_trigger("binary_sensor.front", "state", "off", "on", {})

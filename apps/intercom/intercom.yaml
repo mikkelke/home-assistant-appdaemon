@@ -32,13 +32,12 @@ Intercom:
   door_open_message_front: "I opened the front door"
   door_open_message_back: "I opened the back door"
 
-  # Unlock behavior - multiple attempts so delivery person notices
-  # ESP32 unlock duration is 3 seconds per command
-  # Non-overlapping: 1s, 4s, 7s (door open 1-4s, then 4-7s, then 7-10s)
-  # This gives multiple distinct unlock events they can notice/hear
+  # ESP unlock: up to unlock_repeat_count attempts at 1s, 4s, 7s, each 3 s long.
+  # The ladder stops at the first attempt the ESP confirms, so a working door
+  # gets one unlock and one module announcement.
   unlock_delay_s: 1
-  unlock_repeat_count: 3  # 3 attempts for better visibility
-  unlock_repeat_interval_s: 3  # 3s interval = non-overlapping (each unlock is a separate event)
+  unlock_repeat_count: 3
+  unlock_repeat_interval_s: 3
 
   # Debounce rapid retriggers
   debounce_s: 5
