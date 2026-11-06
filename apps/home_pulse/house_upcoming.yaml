@@ -114,7 +114,8 @@ HouseUpcoming:
   # The row shows from the day before, timed at 09:00 on the day, then untimed until a Done tap, which
   # takes it away for good.
   once:
-    - {due: 2026-11-06, title: Photograph the Alocasia for Claude, detail: "whole plant plus a few leaf undersides; clean means back to the living room", area: bathroom, icon: "mdi:camera-outline"}
+    - {due: 2026-11-06, title: Trim the Alocasia and tap it over white paper, detail: "cut the yellow and brown-spotted leaves; moving dots on the paper = mites still there", area: bathroom, icon: "mdi:content-cut", info: ["Cut each bad leaf at the base of its stalk", "Hold white paper under a leaf and tap it a few times", "Dots that crawl are mites; dust that stays put is fine", "Rinse only the undersides and keep the leaves dry overnight"]}
+    - {due: 2026-11-20, title: Check the newest Alocasia leaf, detail: "dark, glossy and no fine pale dots? then back to the living room", area: bathroom, icon: "mdi:bug-outline"}
 
   batteries:
     # action: replace (primary cells), recharge (swappable rechargeables), charge (built in).
