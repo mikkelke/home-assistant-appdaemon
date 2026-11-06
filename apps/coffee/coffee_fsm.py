@@ -113,10 +113,13 @@ class Tracker:
         if sleep_frame(grams):
             return []
         self.frame_at = now
+        if self.phase() == "ready":
+            self.cup = grams
+            return self._pickup(now)
         kept = self.filter.accept(grams)
         if kept is not None:
             self.cup = kept
-        return self._pickup(now) if self.phase() == "ready" else []
+        return []
 
     def reading_water(self, now, ml):
         self.frame_at = now

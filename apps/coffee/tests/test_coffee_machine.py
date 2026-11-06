@@ -1150,6 +1150,19 @@ class RestartTests(unittest.TestCase):
         data = json.loads((again.dir / "media" / "brews" / f"{BREW_ID}.json").read_text())
         self.assertIn(None, data["cup"])
 
+    def test_a_cup_lifted_after_a_restart_while_ready_is_picked_up(self):
+        app = fake.make_app()
+        fake.cup_on(app)
+        fake.replay(app, [(0, ("op", "start", {"variant": "usual"}, TABLET))]
+                    + [s for s in fake.synthetic_brew(BREW_ID, None) if s[0] < 250 and s[1][0] != "op"])
+        fake.advance(app, 10)
+        app._save_state()
+        again = fake.make_app(state_dir=app.dir, now=app.now + 1, states=app.states)
+        self.assertEqual(coffee_state(again)[0], "ready")
+        fake.set_entity(again, "sensor.xbloom_studio_scale_weight", "-270.6")
+        fake.advance(again, 5)
+        self.assertEqual(coffee_state(again)[0], "picked_up")
+
     def test_a_brew_too_old_to_resume_is_closed_as_abandoned(self):
         app, _ = self.half()
         states = dict(app.states)

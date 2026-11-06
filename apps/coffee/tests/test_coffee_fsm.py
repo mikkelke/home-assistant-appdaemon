@@ -280,6 +280,14 @@ class ReadyTests(unittest.TestCase):
         self.assertEqual(tracker.tick(T + 304), ["picked_up", "state"])
         self.assertEqual(tracker.brew["picked_up_ts"], T + 304)
 
+    def test_a_cup_lifted_in_one_frame_then_silent_is_picked_up(self):
+        tracker = self.ready()
+        tracker.brew["final"] = {"cup_g": 238.4}
+        for at, grams in ((T + 300.0, 251.84), (T + 300.2, 130.94), (T + 300.4, -230.59), (T + 300.6, -270.45)):
+            tracker.reading_cup(at, grams)
+        self.assertEqual(tracker.tick(T + 303.0), [])
+        self.assertEqual(tracker.tick(T + 304.0), ["picked_up", "state"])
+
     def test_a_dip_or_a_stale_link_is_no_pickup(self):
         tracker = self.ready()
         tracker.reading_cup(T + 300, 30.0)

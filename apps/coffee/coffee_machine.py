@@ -1584,6 +1584,8 @@ class CoffeeMachine(hass.Hass):
             self._apply(self._tracker.abandon(now))
             return
         self._apply(self._tracker.tick(now))
+        if self._tracker.busy():
+            self._start_live_timer()
 
     # -- publishing ----------------------------------------------------------------------------------
 

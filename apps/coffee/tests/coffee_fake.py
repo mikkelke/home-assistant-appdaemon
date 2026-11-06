@@ -373,7 +373,7 @@ def synthetic_brew(brew_id, power_rows=None, start_at=8.0, bloom_at=28.0, enjoy_
     tape.append((enjoy_at + 1, ("event", "xbloom_brew_completed", {
         "recipe_id": "1234567", "recipe_name": "4 Pour Recipe", "dose_g": 15.0, "cup_type": 1, "outcome": "confirmed",
         "duration_s": int(enjoy_at - bloom_at), "run_id": "r1", **context})))
-    tape.append((pickup_at, ("state", "sensor.xbloom_studio_scale_weight", "0.4")))
+    tape.append((pickup_at, ("state", "sensor.xbloom_studio_scale_weight", "-270.6")))
     if power_rows:
         first = power_rows[0][0]
         grinder = next(ts for ts, value in power_rows if 12 <= float(value) < 100)
