@@ -2108,7 +2108,7 @@ class InventoryTests(unittest.TestCase):
         cells = {key: model["cell"] for key, model in self.INV["models"].items()}
         self.assertEqual(cells, {
             "zg204zm": "LADDA AAA NiMH", "zg204zk": "LADDA AAA NiMH", "parasoll": "1x LADDA AAA NiMH",
-            "sq610rfnh": "built-in rechargeable", "yale": "lithium AA (rechargeable)", "blind": "", "ws90": "2x AA",
+            "sq610rfnh": "built-in rechargeable", "yale": "4x XTAR AA Li-ion 4150 mWh", "blind": "", "ws90": "2x AA",
             "twinguard": "6x AA alkaline", "fp300": "2x CR2450", "snzb04p": "CR2477", "snzb02p": "CR2477",
             "zg102zm": "", "hhccjcy01": "CR2032", "aoyan_soil": "",
         })
