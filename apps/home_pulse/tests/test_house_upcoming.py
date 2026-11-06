@@ -2062,7 +2062,6 @@ class OnceTaskTests(unittest.TestCase):
         self.assertEqual((state_file(app)["done"], done_log(app)), (before, []))
 
     def test_every_task_the_yaml_lists_is_seeded_now_and_shows_the_day_before_its_day_until_done(self):
-        self.assertTrue(ONCE)
         for task in ONCE.values():
             app = make_app(once=CONFIG["once"])
             row_id = f"maint:once:{task['slug']}"
@@ -2111,7 +2110,7 @@ class InventoryTests(unittest.TestCase):
             "zg204zm": "LADDA AAA NiMH", "zg204zk": "LADDA AAA NiMH", "parasoll": "1x LADDA AAA NiMH",
             "sq610rfnh": "built-in rechargeable", "yale": "lithium AA (rechargeable)", "blind": "", "ws90": "2x AA",
             "twinguard": "6x AA alkaline", "fp300": "2x CR2450", "snzb04p": "CR2477", "snzb02p": "CR2477",
-            "zg102zm": "", "hhccjcy01": "CR2032",
+            "zg102zm": "", "hhccjcy01": "CR2032", "aoyan_soil": "",
         })
         actions = {key: model["action"] for key, model in self.INV["models"].items()}
         self.assertEqual({k for k, a in actions.items() if a == "charge"}, {"sq610rfnh", "blind"})

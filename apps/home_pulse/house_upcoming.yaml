@@ -96,6 +96,7 @@ HouseUpcoming:
     - {moisture: sensor.philodendron_moisture, name: Philodendron, area: dining_room, dry: 20, water: 0.5, conductivity: sensor.philodendron_conductivity, aka: "Hanging plant, heart-shaped leaves", where: "Dining room, south-east corner", photo: philodendron}
     - {moisture: sensor.pothos_moisture, name: Pothos, area: living_room, dry: 15, water: 0.4, conductivity: sensor.pothos_conductivity, aka: "Hanging plant, white-speckled leaves", where: "Living room corner, above the sofa", photo: pothos}
     - {moisture: sensor.ivy_moisture, name: Ivy, area: kitchen, dry: 20, water: 0.3, conductivity: sensor.ivy_conductivity, aka: "Small trailing ivy", where: "Top of the wine fridge", photo: ivy}
+    - {moisture: sensor.alocasia_soil_moisture, name: Alocasia, area: living_room, dry: 30, water: 0.7, aka: "Arrow-shaped dark leaves, white veins", where: "Living room corner by the terrace door", photo: alocasia}
     - {name: Monstera, area: kitchen, water: 1, every_days: 10, aka: "Big leaves with holes", where: "Kitchen floor by the Rober2 dock", photo: monstera}
     - {name: Peace lily kitchen, area: kitchen, water: 0.4, every_days: 7, aka: "Small peace lily, droops when thirsty", where: "Coffee cart next to the xBloom", photo: peace_lily_kitchen}
     - {name: Peace lily TV, area: living_room, water: 1, every_days: 10, aka: "Large peace lily, droops when thirsty", where: "Living room floor under the TV", photo: peace_lily_tv}
@@ -106,7 +107,6 @@ HouseUpcoming:
     - {name: Snake plant living, area: living_room, water: 0.2, every_days: 35, feed: summer, aka: "Upright stiff leaves, pale green", where: "Stool next to the bar cart", photo: snake_plant_living}
     - {name: Snake plant bathroom, area: bathroom, water: 0.5, every_days: 35, feed: summer, aka: "Tall dark-green striped leaves", where: "Mikkel's bathroom, under the thermostat", photo: snake_plant_bathroom}
     - {name: Aloe, area: living_room, water: 0.3, every_days: 35, feed: summer, aka: "Spiky succulent with toothed leaves", where: "Top of the glass cabinet, living room", photo: aloe}
-    - {name: Alocasia, area: bathroom, water: 0.7, every_days: 7, aka: "Arrow-shaped dark leaves, white veins", where: "Mikkel's bathroom", photo: alocasia}
     - {name: Cactus, area: bathroom, water: 0.1, every_days: 42, feed: summer, aka: "Small column cactus", where: "Laundry cart in Mikkel's bathroom", photo: cactus}
     - {name: Pineapple, area: bathroom, water: 0.1, every_days: 14, feed: summer, aka: "Pineapple top", where: "Laundry cart in Mikkel's bathroom", photo: pineapple}
 
@@ -114,7 +114,6 @@ HouseUpcoming:
   # The row shows from the day before, timed at 09:00 on the day, then untimed until a Done tap, which
   # takes it away for good.
   once:
-    - {due: 2026-12-04, title: "Alocasia: keep it or bin it?", detail: "webbing, or no new leaf since 06.11? bin it and buy a new one", area: bathroom, icon: "mdi:sprout"}
 
   batteries:
     # action: replace (primary cells), recharge (swappable rechargeables), charge (built in).
@@ -141,6 +140,7 @@ HouseUpcoming:
       snzb02p: {cell: CR2477, action: replace, low: 20}
       zg102zm: {cell: "", trend: false}
       hhccjcy01: {cell: CR2032, action: replace, low: 10, trend: false}
+      aoyan_soil: {cell: "", action: replace, low: 20, trend: false}
     # One line per device. history_from: a known change in how the cells behave; sets that went in
     # before it never count as a lifetime, and a trend starts there.
     devices:
@@ -200,6 +200,7 @@ HouseUpcoming:
       - {entity: sensor.philodendron_battery, model: hhccjcy01, name: Philodendron plant sensor, area: dining_room}
       - {entity: sensor.pothos_battery, model: hhccjcy01, name: Pothos plant sensor, area: living_room}
       - {entity: sensor.ivy_battery, model: hhccjcy01, name: Ivy plant sensor, area: kitchen}
+      - {entity: sensor.alocasia_battery, model: aoyan_soil, name: Alocasia plant sensor, area: living_room}
     # Phones and the tablet; Rober2 and the Sonos Move dock themselves; the HANK remotes are
     # rechargeable and read anywhere from 26 to 100; yale_battery_bt is the lock's BLE twin.
     excluded:
