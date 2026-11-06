@@ -106,7 +106,7 @@ HouseUpcoming:
     - {name: Snake plant living, area: living_room, water: 0.2, every_days: 35, feed: summer, aka: "Upright stiff leaves, pale green", where: "Stool next to the bar cart", photo: snake_plant_living}
     - {name: Snake plant bathroom, area: bathroom, water: 0.5, every_days: 35, feed: summer, aka: "Tall dark-green striped leaves", where: "Mikkel's bathroom, under the thermostat", photo: snake_plant_bathroom}
     - {name: Aloe, area: living_room, water: 0.3, every_days: 35, feed: summer, aka: "Spiky succulent with toothed leaves", where: "Top of the glass cabinet, living room", photo: aloe}
-    - {name: Alocasia, area: bathroom, water: 0.7, every_days: 7, aka: "Arrow-shaped dark leaves, white veins", where: "Mikkel's shower (mite cure)", photo: alocasia}
+    - {name: Alocasia, area: bathroom, water: 0.7, every_days: 7, aka: "Arrow-shaped dark leaves, white veins", where: "Mikkel's bathroom", photo: alocasia}
     - {name: Cactus, area: bathroom, water: 0.1, every_days: 42, feed: summer, aka: "Small column cactus", where: "Laundry cart in Mikkel's bathroom", photo: cactus}
     - {name: Pineapple, area: bathroom, water: 0.1, every_days: 14, feed: summer, aka: "Pineapple top", where: "Laundry cart in Mikkel's bathroom", photo: pineapple}
 
@@ -114,8 +114,7 @@ HouseUpcoming:
   # The row shows from the day before, timed at 09:00 on the day, then untimed until a Done tap, which
   # takes it away for good.
   once:
-    - {due: 2026-11-06, title: Trim the Alocasia and tap it over white paper, detail: "cut the yellow and brown-spotted leaves; moving dots on the paper = mites still there", area: bathroom, icon: "mdi:content-cut", info: ["Cut each bad leaf at the base of its stalk", "Hold white paper under a leaf and tap it a few times", "Dots that crawl are mites; dust that stays put is fine", "Rinse only the undersides and keep the leaves dry overnight"]}
-    - {due: 2026-11-20, title: Check the newest Alocasia leaf, detail: "dark, glossy and no fine pale dots? then back to the living room", area: bathroom, icon: "mdi:bug-outline"}
+    - {due: 2026-12-04, title: "Alocasia: keep it or bin it?", detail: "webbing, or no new leaf since 06.11? bin it and buy a new one", area: bathroom, icon: "mdi:sprout"}
 
   batteries:
     # action: replace (primary cells), recharge (swappable rechargeables), charge (built in).
