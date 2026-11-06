@@ -1840,8 +1840,10 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         """A programme or Short pick while the dishwasher waits to be emptied (self.state, never the entity,
         which AppDaemon's store may serve stale) corrects the feedback record of the run that has just
         finished, the way the washer's picker corrects its last one, with the pick's own value and the
-        other selector as it stands. A pick while the run is going is read by the finish itself, "—"
+        other selector as it stands. A pick while the run is going is shown at once and read by the finish itself, "—"
         confirms nothing, and a pick that no finished run is waiting for is refused and logged."""
+        if self.state == "Running":
+            self._update_running_attributes()
         programme = new if entity == self.confirmed_programme_entity else self.get_state(self.confirmed_programme_entity)
         key = self._SELECTOR_LABEL_TO_KEY.get(programme)
         if key is None or self.state in ("Running", "Paused"):

@@ -57,6 +57,12 @@ def make_app(cycles, state="Unemptied", state_since=FINISHED, programme="—", s
     app.states = {STATE_ENTITY: state, SELECTOR: programme, SHORT: short}
     app.get_state = lambda entity, **kw: app.states.get(entity)
     app._now_utc = lambda: NOW
+    app.republished = 0
+
+    def republish():
+        app.republished += 1
+
+    app._update_running_attributes = republish
     return app, path
 
 
@@ -113,6 +119,12 @@ class PickAfterFinishTests(unittest.TestCase):
             pick(app, "Intensive")
             self.assertEqual(saved(path)[-1]["confirmed"], "eco", state)
             self.assertEqual(app.logs, [], state)
+
+    def test_a_pick_while_running_is_published_at_once(self):
+        for state, republished in (("Running", 1), ("Paused", 0), ("Unemptied", 0)):
+            app, _ = make_app([record(FINISHED)], state=state)
+            pick(app, "Intensive")
+            self.assertEqual(app.republished, republished, state)
 
     def test_nothing_to_confirm_with_no_programme_picked(self):
         for label in ("—", "Not set", "unknown", "unavailable", None):

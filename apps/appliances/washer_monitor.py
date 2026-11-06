@@ -6102,7 +6102,9 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         attrs.update({
             "detected_programme": new_prog,
             "detected_temperature": new_temp or "",
-            "programme_label": profile.get("label", new_prog),
+            "programme_label": (
+                self._get_profile(eta_prog, eta_temp).get("label", eta_prog) if user_has_selected else profile.get("label", new_prog)
+            ),
             "cycle_complete": False,
             "run_time_minutes": None,
             "energy_used": round(self._get_energy_used(), 3),
