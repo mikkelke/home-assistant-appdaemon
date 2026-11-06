@@ -27,7 +27,7 @@ CoffeeMachine:
   usual_name: 4 Pour Recipe
 
   # Water a full tank gives before the machine warns of low water, in ml (the tank holds 946).
-  tank_ml: 630
+  tank_ml: 760
 
   # The wine-fridge tablet's HA user (Rooftop): a start from it is source tablet, and nobody by itself.
   tablet_user_id: 0b0b7ec25fed419dbeaed3898de34081
