@@ -80,6 +80,9 @@ TransitStatus:
       # 2-4 min headway: a cancellation the next train picks up this soon costs no
       # real waiting time, so it must not count toward the >=2 "Disrupted" threshold.
       rescue_window_min: 5
+      # m.dk's network status overrules Rejseplanen having no Metro times: "Normal togdrift"
+      # is OK, any other text is Disrupted.
+      operator_status: mdk
 
     # ── Metro M3: Enghave Plads → Frederiksberg ──────────────────────────
     # The other way round the ring, so a one-direction outage shows next to the KBH H row.
@@ -93,6 +96,7 @@ TransitStatus:
         - "M3"
       evaluation_mode: high_frequency
       rescue_window_min: 5
+      operator_status: mdk
 
     # ── S-tog: Carlsberg → KBH H (Mikkel + Kristine) ─────────────────────
     - sensor_id: "carlsberg_stog_kbh"
@@ -176,6 +180,8 @@ TransitMikkel:
       # 2-4 min headway: a cancellation the next train picks up this soon costs no
       # real waiting time, so it must not count toward the >=2 "Disrupted" threshold.
       rescue_window_min: 5
+      # Same sensor as TransitStatus's route, so it must follow the operator status too.
+      operator_status: mdk
 
     - sensor_id: "carlsberg_stog_kbh"
       transport_name: "S-tog -> KBH H"

@@ -21,6 +21,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # transit_alarm imports aiohttp at module scope for the Rejseplanen fetch; none of the pure
@@ -393,6 +395,483 @@ class TestPasslistRequest(unittest.TestCase):
         params, result = self._check(route)
         self.assertNotIn("passlist", params)
         self.assertNotIn("travel_min", result["departures"][0])
+
+
+def mdk_page(*paragraphs: str, blocks: int = 1) -> str:
+    """m.dk's status page in miniature: a `track` marquee among other elements whose class merely contains the word."""
+    track = '<div class="track">' + "".join(f"<p>{text}</p>" for text in paragraphs) + "</div>"
+    return (
+        '<html><body><header><div class="simplebar-track simplebar-vertical">'
+        '<div class="simplebar-scrollbar"></div></div></header>'
+        '<div class="no-scrollbar [&amp;::-webkit-scrollbar-track]:bg-transparent">menu</div>'
+        '<div class="marquee flex items-center"><div class="relative flex items-center">'
+        + track * blocks
+        + "</div></div></body></html>"
+    )
+
+
+class TestParseMdkStatus(unittest.TestCase):
+    def test_a_normal_day_is_the_one_paragraph(self):
+        self.assertEqual(ta.parse_mdk_status(mdk_page("Normal togdrift")), "Normal togdrift")
+
+    def test_elements_whose_class_only_contains_track_are_not_the_status(self):
+        for cls in ("simplebar-track", "tracker", "my-track", "track-list"):
+            with self.subTest(cls):
+                self.assertIsNone(ta.parse_mdk_status(f'<div class="{cls}"><p>Normal togdrift</p></div>'))
+
+    def test_track_among_other_classes_counts(self):
+        self.assertEqual(
+            ta.parse_mdk_status('<div id="x" class="a track b"><p>Normal togdrift</p></div>'),
+            "Normal togdrift",
+        )
+
+    def test_a_disruption_joins_its_distinct_paragraphs_in_page_order_once_each(self):
+        page = (
+            '<div class="track"><p>Driftsforstyrrelse p&aring; M1 og M2</p>'
+            "<p>Ingen tog mellem Vanl&#248;se &amp; N&oslash;rreport</p></div>"
+            '<div class="track"><p>Driftsforstyrrelse p&aring; M1 og M2</p></div>'
+        )
+        self.assertEqual(
+            ta.parse_mdk_status(page),
+            "Driftsforstyrrelse på M1 og M2 | Ingen tog mellem Vanløse & Nørreport",
+        )
+
+    def test_a_marquee_repeating_its_one_text_is_still_that_text(self):
+        self.assertEqual(ta.parse_mdk_status(mdk_page("Normal togdrift", blocks=3)), "Normal togdrift")
+
+    def test_whitespace_markup_and_non_breaking_spaces_are_normalised(self):
+        page = '<div class="track"><p>\n   Normal\xa0 <b>togdrift</b>\n</p></div>'
+        self.assertEqual(ta.parse_mdk_status(page), "Normal togdrift")
+
+    def test_text_straight_in_the_track_without_a_paragraph_counts(self):
+        self.assertEqual(ta.parse_mdk_status('<div class="track">Normal togdrift</div>'), "Normal togdrift")
+
+    def test_garbage_has_no_status(self):
+        garbage = {
+            "none": None,
+            "empty": "",
+            "blank": "  \n ",
+            "not html": "Normal togdrift",
+            "unclosed": '<div class="track"><p>Normal togdrift',
+            "empty track": '<div class="track"></div>',
+            "blank paragraph": '<div class="track"><p> &nbsp; </p></div>',
+            "paragraph outside any track": "<p>Normal togdrift</p>",
+            "binary noise": "\x00\x01<<>>\x7f<div",
+        }
+        for label, page in garbage.items():
+            with self.subTest(label):
+                self.assertIsNone(ta.parse_mdk_status(page))
+
+    def test_a_page_the_size_of_the_real_one_parses_quickly(self):
+        filler = '<div class="flex items-center gap-2 text-sm"><a href="/x">link</a></div>' * 3000
+        page = filler + mdk_page("Normal togdrift") + filler
+        started = datetime.now()
+        self.assertEqual(ta.parse_mdk_status(page), "Normal togdrift")
+        self.assertLess(datetime.now() - started, timedelta(seconds=1))
+
+
+MDK_METRO = dict(
+    METRO_ROUTE, stop_name="Enghave Plads", stop_id="8603344", direction_id="8603330", lines=["M3"],
+    operator_status="mdk",
+)
+QUIET = {
+    "has_issues": False, "no_service": True, "issues": [], "future_dep_times": [],
+    "next_departure": None, "mins_to_next": None, "severity": 0, "departures": [],
+}
+
+
+class PublishedRoute:
+    """What `_update_status_sensors` writes for one route result."""
+
+    def __init__(self, route: dict, res: dict) -> None:
+        app = ta.TransitAlarm.__new__(ta.TransitAlarm)
+        app.args = {}
+        app.duration_min = 60
+        app.log = lambda *args, **kwargs: None
+        services: dict[str, dict] = {}
+        sensors: list[tuple[str, dict]] = []
+
+        async def call_service(service: str, **kwargs) -> None:
+            services[service] = kwargs
+
+        app.call_service = call_service
+        app.set_state = lambda entity, **kwargs: sensors.append((entity, kwargs))
+        asyncio.run(app._update_status_sensors([(route, res)]))
+        self.status = services["input_select/select_option"]["option"]
+        self.info = services["input_text/set_value"]["value"]
+        [(self.entity, sensor)] = sensors
+        self.state = sensor["state"]
+        self.attributes = sensor["attributes"]
+
+
+class TestOperatorStatusDecision(unittest.TestCase):
+    """What m.dk says about the network decides the Metro route; Rejseplanen's own findings still count."""
+
+    NORMAL = ta.MDK_NORMAL_TEXT
+    DISRUPTION = "Driftsforstyrrelse på M1 og M2"
+
+    def decide(self, res: dict, text: str | None, route: dict = MDK_METRO) -> dict:
+        return ta.TransitAlarm._apply_operator_status(route, res, text)
+
+    def publish(self, res: dict, text: str | None, route: dict = MDK_METRO) -> PublishedRoute:
+        return PublishedRoute(route, self.decide(res, text, route))
+
+    def board(self, *departures: dict) -> dict:
+        app = ta.TransitAlarm.__new__(ta.TransitAlarm)
+        return app._evaluate(list(departures), MDK_METRO, 5, "Metro M3")
+
+    def test_normal_togdrift_without_times_is_ok_and_says_so(self):
+        out = self.publish(QUIET, self.NORMAL)
+        self.assertEqual((out.status, out.state), ("OK", "OK"))
+        self.assertEqual(out.info, "Enghave Plads: Normal service - no times")
+        self.assertEqual(out.attributes["issues"], [])
+        self.assertEqual(out.attributes["departures"], [])
+
+    def test_normal_togdrift_when_rejseplanen_fails_is_ok_not_unavailable(self):
+        for error in ("HTTP 500", "unknown API error"):
+            with self.subTest(error):
+                out = self.publish({"error": error, "has_issues": True}, self.NORMAL)
+                self.assertEqual((out.status, out.state), ("OK", "OK"))
+                self.assertEqual(out.info, "Enghave Plads: Normal service - no times")
+
+    def test_normal_togdrift_keeps_rejseplanens_cancellations(self):
+        res = self.board(dep(2, cancelled=True), dep(4, cancelled=True), dep(6, cancelled=True), dep(18), dep(20))
+        out = self.publish(res, self.NORMAL)
+        self.assertEqual(out.status, "Disrupted")
+        self.assertTrue(out.attributes["issues"])
+
+    def test_normal_togdrift_with_times_changes_nothing_else(self):
+        res = self.board(dep(2), dep(5), dep(8))
+        decided = self.decide(res, self.NORMAL)
+        self.assertEqual(decided["operator_status"], self.NORMAL)
+        self.assertFalse(decided["no_times"])
+        self.assertEqual({k: v for k, v in decided.items() if k not in ("operator_status", "no_times")}, res)
+        out = PublishedRoute(MDK_METRO, decided)
+        self.assertEqual(out.status, "OK")
+        self.assertIn("Next:", out.info)
+        self.assertEqual(len(out.attributes["departures"]), 3)
+
+    def test_any_other_text_is_disrupted_with_that_text_as_the_issue(self):
+        out = self.publish(QUIET, self.DISRUPTION)
+        self.assertEqual((out.status, out.state), ("Disrupted", "Disrupted"))
+        self.assertEqual(out.attributes["issues"], [f"Metro M3: {self.DISRUPTION}"])
+        self.assertIn(self.DISRUPTION, out.info)
+
+    def test_a_disruption_text_outranks_healthy_departures(self):
+        out = self.publish(self.board(dep(2), dep(5), dep(8)), self.DISRUPTION)
+        self.assertEqual(out.status, "Disrupted")
+        self.assertEqual(out.attributes["issues"][0], f"Metro M3: {self.DISRUPTION}")
+
+    def test_a_disruption_text_keeps_the_departure_issues_after_its_own(self):
+        res = self.board(dep(2), dep(4, cancelled=True), dep(6), dep(8))
+        self.assertTrue(res["issues"])
+        out = self.publish(res, self.DISRUPTION)
+        self.assertEqual(out.attributes["issues"], [f"Metro M3: {self.DISRUPTION}", *res["issues"]])
+
+    def test_a_disruption_text_is_disrupted_even_when_rejseplanen_fails(self):
+        out = self.publish({"error": "HTTP 500", "has_issues": True}, self.DISRUPTION)
+        self.assertEqual(out.status, "Disrupted")
+
+    def test_a_text_that_only_resembles_normal_is_a_disruption(self):
+        for text in ("Normal togdrift | Planlagt sporarbejde", "normal togdrift", "Normal togdrift."):
+            with self.subTest(text):
+                self.assertEqual(self.publish(QUIET, text).status, "Disrupted")
+
+    def test_no_text_leaves_the_rejseplanen_verdict_alone(self):
+        cases = {
+            "quiet period": (QUIET, "OK", "Enghave Plads: Quiet period - no trains in next 60 min"),
+            "api error": ({"error": "HTTP 500", "has_issues": True}, "Unavailable", "Enghave Plads: Unavailable"),
+        }
+        for label, (res, status, info) in cases.items():
+            with self.subTest(label):
+                out = self.publish(res, None)
+                self.assertEqual((out.status, out.info), (status, info))
+        cancelled = self.board(dep(2, cancelled=True), dep(4, cancelled=True), dep(6, cancelled=True), dep(18), dep(20))
+        self.assertEqual(self.publish(cancelled, None).status, "Disrupted")
+        self.assertEqual(self.publish(self.board(dep(2), dep(5)), None).status, "OK")
+
+    def test_a_paused_route_stays_paused(self):
+        out = self.publish({"disabled": True, "has_issues": False, "severity": 0}, self.DISRUPTION)
+        self.assertEqual((out.status, out.info), ("OK", "Enghave Plads: Paused"))
+
+    def test_the_sensor_names_its_source_and_the_text_or_nothing(self):
+        out = self.publish(QUIET, self.NORMAL)
+        self.assertEqual(out.attributes["operator_status"], self.NORMAL)
+        self.assertEqual(out.attributes["operator_status_source"], "m.dk")
+        self.assertEqual(out.entity, "sensor.transit_enghave_metro_kbh")
+        unread = self.publish(QUIET, None).attributes
+        self.assertIsNone(unread["operator_status"])
+        self.assertEqual(unread["operator_status_source"], "m.dk")
+
+    def test_every_existing_attribute_is_still_published(self):
+        expected = {
+            "friendly_name", "icon", "next_departure", "mins_to_next", "upcoming", "departures", "issues", "lines",
+            "rescue_window_min", "delay_threshold_min", "last_checked", "data_as_of",
+        }
+        for text in (self.NORMAL, self.DISRUPTION, None):
+            with self.subTest(text):
+                keys = set(self.publish(QUIET, text).attributes)
+                self.assertEqual(keys - {"operator_status", "operator_status_source"}, expected)
+
+    def test_a_route_that_does_not_follow_an_operator_publishes_none_of_it(self):
+        out = PublishedRoute(METRO_ROUTE, dict(QUIET))
+        self.assertNotIn("operator_status", out.attributes)
+        self.assertNotIn("operator_status_source", out.attributes)
+        self.assertEqual(out.info, "Quiet period - no trains in next 60 min")
+
+    def test_the_push_texts_do_not_call_a_normal_metro_a_problem(self):
+        app = ta.TransitAlarm.__new__(ta.TransitAlarm)
+        app.duration_min = 60
+        sensor = self.decide(QUIET, self.NORMAL)
+        results = [(MDK_METRO, sensor), (KBH_IC_ROUTE, {"has_issues": True, "issues": ["IC: delayed"], "severity": 2})]
+        message = app._build_message(results)
+        self.assertIn("✅ Metro M3: normal service, no times", message)
+        self.assertIn("Head to Enghave Plads (Metro M3, no info) - IC -> Odense has problems", message)
+        self.assertEqual(app._build_all_clear_message([(MDK_METRO, sensor)]), "✅ Metro M3: normal service, no times")
+
+    def test_a_disrupted_metro_without_times_does_not_say_next_none(self):
+        app = ta.TransitAlarm.__new__(ta.TransitAlarm)
+        message = app._build_message([(MDK_METRO, self.decide(QUIET, self.DISRUPTION))])
+        self.assertIn("⚠️ Transit problems - Metro M3: no times", message)
+        self.assertNotIn("None", message)
+
+
+class SiteResponse:
+    def __init__(self, status: int, body: str) -> None:
+        self.status = status
+        self.body = body
+
+    async def __aenter__(self) -> SiteResponse:
+        return self
+
+    async def __aexit__(self, *exc_info) -> bool:
+        return False
+
+    async def text(self) -> str:
+        return self.body
+
+
+class SiteSession:
+    """Serves the Rejseplanen board and m.dk's page from one session and remembers every URL asked for."""
+
+    def __init__(self, page: str = "", *, status: int = 200, error: Exception | None = None, board: dict | None = None) -> None:
+        self.page, self.status, self.error = page, status, error
+        self.board = board if board is not None else {"Departure": []}
+        self.urls: list[str] = []
+
+    def get(self, url: str, params: dict | None = None, timeout=None):
+        self.urls.append(url)
+        if url == ta.MDK_STATUS_URL:
+            if self.error is not None:
+                raise self.error
+            return SiteResponse(self.status, self.page)
+        return FakeResponse(self.board)
+
+    @property
+    def mdk_requests(self) -> int:
+        return self.urls.count(ta.MDK_STATUS_URL)
+
+
+class OneSession:
+    """Stands in for aiohttp.ClientSession: every `async with ClientSession()` yields the same session."""
+
+    def __init__(self, session: SiteSession) -> None:
+        self.session = session
+
+    def __call__(self) -> OneSession:
+        return self
+
+    async def __aenter__(self) -> SiteSession:
+        return self.session
+
+    async def __aexit__(self, *exc_info) -> bool:
+        return False
+
+
+class OperatorStatusFetchTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.app = ta.TransitAlarm.__new__(ta.TransitAlarm)
+        self.app.args = {}
+        self.app.access_id = "key"
+        self.app.max_journeys = 25
+        self.app.duration_min = 60
+        self.app._mdk_text = None
+        self.app._mdk_warned_at = None
+        self.logs: list[tuple[str, str]] = []
+        self.app.log = lambda message, level="INFO": self.logs.append((level, message))
+
+        async def enabled(route: dict) -> bool:
+            return True
+
+        self.app._route_is_enabled = enabled
+        patch = mock.patch.object(ta.aiohttp, "ClientTimeout", create=True, new=lambda total: total)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def levels(self, level: str) -> list[str]:
+        return [message for lvl, message in self.logs if lvl == level]
+
+    def fetch(self, session: SiteSession) -> str | None:
+        return asyncio.run(self.app._fetch_mdk_status(session))
+
+    def fetch_all(self, session: SiteSession, routes: list[dict]) -> dict[str, dict]:
+        self.app.routes = routes
+        patch = mock.patch.object(ta.aiohttp, "ClientSession", create=True, new=OneSession(session))
+        patch.start()
+        self.addCleanup(patch.stop)
+        return {route["sensor_id"]: res for route, res in asyncio.run(self.app._fetch_all_routes())}
+
+
+class TestMdkFetch(OperatorStatusFetchTestCase):
+    def test_reads_the_status_text(self):
+        session = SiteSession(mdk_page("Normal togdrift"))
+        self.assertEqual(self.fetch(session), "Normal togdrift")
+        self.assertEqual(session.urls, [ta.MDK_STATUS_URL])
+
+    def test_every_failure_is_no_status(self):
+        failures = {
+            "HTTP 503": SiteSession("busy", status=503),
+            "no status on the page": SiteSession("<html>maintenance</html>"),
+            "connection error": SiteSession(error=OSError("connection refused")),
+            "timeout": SiteSession(error=asyncio.TimeoutError()),
+        }
+        for label, session in failures.items():
+            with self.subTest(label):
+                self.assertIsNone(self.fetch(session))
+
+    def test_logs_info_only_when_the_text_changes(self):
+        self.fetch(SiteSession(mdk_page("Normal togdrift")))
+        self.fetch(SiteSession(mdk_page("Normal togdrift")))
+        self.assertEqual(self.levels("INFO"), ["m.dk metro status: Normal togdrift"])
+        self.fetch(SiteSession(mdk_page("Driftsforstyrrelse på M3")))
+        self.fetch(SiteSession(mdk_page("Driftsforstyrrelse på M3")))
+        self.assertEqual(len(self.levels("INFO")), 2)
+
+    def test_logs_are_ascii(self):
+        self.fetch(SiteSession(mdk_page("Ingen tog til Nørreport – følg skiltene")))
+        self.fetch(SiteSession(error=OSError("kan ikke nå m.dk: æøå")))
+        for _, message in self.logs:
+            self.assertTrue(message.isascii(), message)
+        self.assertEqual(self.levels("INFO"), ["m.dk metro status: Ingen tog til Norreport - folg skiltene"])
+
+    def test_a_failure_is_warned_about_at_most_every_half_hour(self):
+        down = SiteSession(error=OSError("connection refused"))
+        for _ in range(5):
+            self.fetch(down)
+        self.assertEqual(len(self.levels("WARNING")), 1)
+        self.assertIn("connection refused", self.levels("WARNING")[0])
+        self.app._mdk_warned_at = datetime.now() - ta.MDK_WARN_EVERY - timedelta(seconds=1)
+        self.fetch(down)
+        self.assertEqual(len(self.levels("WARNING")), 2)
+
+    def test_a_recovery_to_the_same_text_is_not_a_status_change(self):
+        self.fetch(SiteSession(mdk_page("Normal togdrift")))
+        self.fetch(SiteSession(error=OSError("down")))
+        self.fetch(SiteSession(mdk_page("Normal togdrift")))
+        self.assertEqual(len(self.levels("INFO")), 1)
+
+
+class TestOperatorStatusPerCheck(OperatorStatusFetchTestCase):
+    METRO_FRB = dict(MDK_METRO, sensor_id="enghave_metro_frb", transport_name="Metro M3 -> Frederiksberg")
+    STOG = {
+        "sensor_id": "carlsberg_stog_kbh", "transport_name": "S-tog", "stop_id": "8600631",
+        "evaluation_mode": "passenger_impact",
+    }
+
+    def test_both_metro_routes_share_one_fetch_of_the_page(self):
+        session = SiteSession(mdk_page("Normal togdrift"))
+        results = self.fetch_all(session, [MDK_METRO, self.METRO_FRB, self.STOG])
+        self.assertEqual(session.mdk_requests, 1)
+        for sensor_id in ("enghave_metro_kbh", "enghave_metro_frb"):
+            self.assertEqual(results[sensor_id]["operator_status"], "Normal togdrift")
+            self.assertTrue(results[sensor_id]["no_times"])
+            self.assertFalse(results[sensor_id]["has_issues"])
+        self.assertNotIn("operator_status", results["carlsberg_stog_kbh"])
+        self.assertTrue(results["carlsberg_stog_kbh"]["no_service"])
+
+    def test_a_check_without_a_metro_route_never_asks_m_dk(self):
+        session = SiteSession(mdk_page("Normal togdrift"))
+        self.fetch_all(session, [self.STOG])
+        self.assertEqual(session.mdk_requests, 0)
+
+    def test_each_check_fetches_afresh(self):
+        session = SiteSession(mdk_page("Normal togdrift"))
+        self.fetch_all(session, [MDK_METRO])
+        self.fetch_all(session, [MDK_METRO])
+        self.assertEqual(session.mdk_requests, 2)
+
+    def test_a_disruption_text_makes_every_metro_route_disrupted(self):
+        session = SiteSession(mdk_page("Driftsforstyrrelse på M3"))
+        results = self.fetch_all(session, [MDK_METRO, self.METRO_FRB])
+        for res in results.values():
+            self.assertEqual(res["severity"], 3)
+            self.assertEqual(res["issues"][0].split(": ", 1)[1], "Driftsforstyrrelse på M3")
+
+    def test_an_unreadable_page_leaves_every_route_as_rejseplanen_made_it(self):
+        for label, down in {
+            "error": SiteSession(error=OSError("down")),
+            "no status": SiteSession("<html></html>"),
+            "HTTP 500": SiteSession("oops", status=500),
+        }.items():
+            with self.subTest(label):
+                results = self.fetch_all(down, [MDK_METRO, self.STOG])
+                metro = results["enghave_metro_kbh"]
+                self.assertIsNone(metro["operator_status"])
+                self.assertTrue(metro["no_service"])
+                self.assertNotIn("no_times", metro)
+                self.assertEqual(metro["severity"], 0)
+                self.assertEqual(
+                    {k: v for k, v in metro.items() if k != "operator_status"},
+                    {k: v for k, v in results["carlsberg_stog_kbh"].items()},
+                )
+
+    def test_rejseplanen_times_and_a_normal_page_agree_when_both_exist(self):
+        board = {"Departure": [dep(2), dep(5), dep(8)]}
+        results = self.fetch_all(SiteSession(mdk_page("Normal togdrift"), board=board), [MDK_METRO])
+        metro = results["enghave_metro_kbh"]
+        self.assertFalse(metro["no_times"])
+        self.assertEqual(len(metro["departures"]), 3)
+        self.assertEqual(metro["severity"], 0)
+
+
+class TestOperatorStatusConfig(unittest.TestCase):
+    """The deployed yaml: the Metro follows m.dk everywhere it is polled, nothing else does."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        class Loader(yaml.SafeLoader):
+            pass
+
+        Loader.add_constructor("!secret", lambda loader, node: "secret")
+        text = (Path(__file__).resolve().parents[1] / "transit_alarm.yaml").read_text()
+        cls.apps = yaml.load(text, Loader=Loader)
+        cls.routes = [(app, route) for app, cfg in cls.apps.items() for route in cfg["routes"]]
+
+    def test_the_metro_routes_follow_m_dk_in_every_instance_that_polls_them(self):
+        metro = [(app, route) for app, route in self.routes if route["sensor_id"].startswith("enghave_metro_")]
+        self.assertEqual({route["sensor_id"] for _, route in metro}, {"enghave_metro_kbh", "enghave_metro_frb"})
+        self.assertIn(("TransitMikkel", "enghave_metro_kbh"), {(app, route["sensor_id"]) for app, route in metro})
+        for app, route in metro:
+            with self.subTest(f"{app} {route['sensor_id']}"):
+                self.assertEqual(route.get("operator_status"), "mdk")
+
+    def test_no_other_route_follows_an_operator(self):
+        for app, route in self.routes:
+            if not route["sensor_id"].startswith("enghave_metro_"):
+                with self.subTest(f"{app} {route['sensor_id']}"):
+                    self.assertNotIn("operator_status", route)
+
+    def test_every_source_named_is_known(self):
+        for _, route in self.routes:
+            self.assertIn(route.get("operator_status"), (None, *ta.OPERATOR_STATUS_SOURCES))
+
+    def test_an_unknown_source_is_refused_at_start(self):
+        app = ta.TransitAlarm.__new__(ta.TransitAlarm)
+        route = dict(MDK_METRO, operator_status="nope")
+        app.args = {"access_id": "key", "routes": [route]}
+        app.log = lambda *args, **kwargs: None
+        with self.assertRaisesRegex(ValueError, "invalid operator_status 'nope'"):
+            app.initialize()
 
 
 if __name__ == "__main__":

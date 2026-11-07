@@ -24,9 +24,14 @@ member - each with independent routes, notification targets, and thresholds.
 Trigger-driven instances (e.g. leave-home trigger) should set
 enable_status_change_alerts: false to avoid duplicate problem/clear notifications.
 
+A route may set `operator_status: mdk` to let the operator's own network status (the text on
+m.dk's status page, fetched once per check) overrule Rejseplanen's missing times: "Normal togdrift"
+means OK, any other text means Disrupted, an unreachable page changes nothing.
+
 Requires an AppDaemon build where get_state/call_service are awaitable (async API).
 """
 
+import html
 import re
 import unicodedata
 import asyncio
@@ -38,6 +43,14 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
 REJSEPLANEN_BASE = "https://www.rejseplanen.dk/api"
 
+MDK_STATUS_URL = "https://m.dk/da/drift-og-service/status-og-planlagte-driftsaendringer/"
+MDK_NORMAL_TEXT = "Normal togdrift"
+MDK_TIMEOUT_SEC = 8
+MDK_WARN_EVERY = timedelta(minutes=30)
+
+# Values of a route's `operator_status` key -> the source name published as `operator_status_source`.
+OPERATOR_STATUS_SOURCES = {"mdk": "m.dk"}
+
 # Per-route policy for `_evaluate` (required in YAML for every route).
 EVALUATION_MODES = frozenset({"high_frequency", "passenger_impact", "infrequent_strict"})
 
@@ -46,6 +59,32 @@ def _ascii_lower(s: str) -> str:
     """Normalize Danish/accented chars to ASCII and lowercase for reliable string matching.
     e.g. 'København H' -> 'kobenhavn h' so direction filters work regardless of ø encoding."""
     return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii").lower()
+
+
+_TO_ASCII = str.maketrans({"æ": "ae", "Æ": "AE", "ø": "o", "Ø": "O", "–": "-", "—": "-"})
+
+
+def _ascii(s: str) -> str:
+    """Log-safe text: æ/ø and dashes transliterated, anything else non-ASCII dropped."""
+    return unicodedata.normalize("NFKD", s.translate(_TO_ASCII)).encode("ascii", "ignore").decode("ascii")
+
+
+_TRACK_DIV = re.compile(r'<div\b[^>]*?\sclass="(?:[^"]*\s)?track(?:\s[^"]*)?"[^>]*>(.*?)</div>', re.S | re.I)
+_PARAGRAPH = re.compile(r"<p\b[^>]*>(.*?)</p>", re.S | re.I)
+_TAG = re.compile(r"<[^>]*>")
+
+
+def parse_mdk_status(page: Optional[str]) -> Optional[str]:
+    """The overall metro status on m.dk's status page: the distinct, whitespace-normalised texts of
+    its `track` paragraphs joined with " | " (one on a normal day, several during a disruption),
+    or None when the page has no such text."""
+    texts: list[str] = []
+    for block in _TRACK_DIV.findall(page or ""):
+        for part in _PARAGRAPH.findall(block) or [block]:
+            text = " ".join(html.unescape(_TAG.sub(" ", part)).split())
+            if text and text not in texts:
+                texts.append(text)
+    return " | ".join(texts) or None
 
 
 class TransitAlarm(hass.Hass):
@@ -154,6 +193,12 @@ class TransitAlarm(hass.Hass):
                     f"TransitAlarm: route '{label}' has invalid evaluation_mode {mode!r}; "
                     f"expected one of: {', '.join(sorted(EVALUATION_MODES))}."
                 )
+            source = route.get("operator_status")
+            if source is not None and source not in OPERATOR_STATUS_SOURCES:
+                raise ValueError(
+                    f"TransitAlarm: route '{label}' has invalid operator_status {source!r}; "
+                    f"expected one of: {', '.join(sorted(OPERATOR_STATUS_SOURCES))}."
+                )
         for route in self.routes:
             if "sensor_id" not in route:
                 self.log(
@@ -171,6 +216,9 @@ class TransitAlarm(hass.Hass):
         # Prevents repeat notifications while disruption persists.
         # Maps sensor_id -> "Delayed" | "Disrupted" | "Unavailable"
         self._disruption_notified: dict = {}
+        # Last m.dk status text seen (logged when it changes) and when a failed fetch was last logged.
+        self._mdk_text: Optional[str] = None
+        self._mdk_warned_at: Optional[datetime] = None
 
         # Wire up the trigger
         if self.trigger_mode == "schedule":
@@ -628,14 +676,84 @@ class TransitAlarm(hass.Hass):
         async with aiohttp.ClientSession() as session:
             coros = [limited_check(route, session) for route in self.routes]
             res_list = await asyncio.gather(*coros, return_exceptions=True)
+            # One fetch serves every route that asks for the operator's status.
+            operator_text = (
+                await self._fetch_mdk_status(session)
+                if any(route.get("operator_status") for route in self.routes)
+                else None
+            )
         results = []
         for route, res in zip(self.routes, res_list):
             if isinstance(res, Exception):
-                results.append((route, {"error": str(res), "has_issues": True}))
                 self.log(f"Route {route.get('transport_name', '?')} failed: {res}", level="WARNING")
-            else:
-                results.append((route, res))
+                res = {"error": str(res), "has_issues": True}
+            if route.get("operator_status"):
+                res = self._apply_operator_status(route, res, operator_text)
+            results.append((route, res))
         return results
+
+    async def _fetch_mdk_status(self, session: aiohttp.ClientSession) -> Optional[str]:
+        """The metro status text on m.dk's status page, or None when it cannot be had.
+        Logs INFO when the text changes and WARNING (at most every MDK_WARN_EVERY) when it fails."""
+        try:
+            async with session.get(
+                MDK_STATUS_URL, timeout=aiohttp.ClientTimeout(total=MDK_TIMEOUT_SEC)
+            ) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                page = await resp.text()
+            text = parse_mdk_status(page)
+            if text is None:
+                raise ValueError("no status text on the page")
+        except Exception as exc:
+            now = datetime.now()
+            if self._mdk_warned_at is None or now - self._mdk_warned_at >= MDK_WARN_EVERY:
+                self._mdk_warned_at = now
+                self.log(
+                    f"m.dk metro status unavailable ({_ascii(str(exc)) or type(exc).__name__}); "
+                    "using Rejseplanen times only",
+                    level="WARNING",
+                )
+            return None
+        if text != self._mdk_text:
+            self._mdk_text = text
+            self.log(f"m.dk metro status: {_ascii(text)[:200]}", level="INFO")
+        return text
+
+    @staticmethod
+    def _apply_operator_status(route: dict, res: dict, text: Optional[str]) -> dict:
+        """Lay the operator's own network status over a route's Rejseplanen result.
+
+        "Normal togdrift" means the trains run, so missing times or a failed lookup is no problem
+        (cancellations Rejseplanen does report still count). Any other text is a disruption.
+        No text (the operator's page could not be read) leaves the result as Rejseplanen made it."""
+        out = {**res, "operator_status": text}
+        if text is None or res.get("disabled"):
+            return out
+        if text == MDK_NORMAL_TEXT:
+            if res.get("error"):
+                out = {"has_issues": False, "operator_status": text}
+            out["no_service"] = False
+            out["no_times"] = not out.get("departures")
+            return out
+        name = route.get("transport_name", route.get("sensor_id", "Route"))
+        out.pop("error", None)
+        out["no_service"] = False
+        out["issues"] = [f"{name}: {text}", *res.get("issues", [])]
+        out["severity"] = max(res.get("severity", 0), 3)
+        out["has_issues"] = True
+        return out
+
+    @staticmethod
+    def _operator_attributes(route: dict, res: dict) -> dict:
+        """The sensor attributes of a route that follows an operator's status; none for any other."""
+        source = route.get("operator_status")
+        if not source:
+            return {}
+        return {
+            "operator_status": res.get("operator_status"),
+            "operator_status_source": OPERATOR_STATUS_SOURCES[source],
+        }
 
     # ── HA entity / helper update ──────────────────────────────────────────
 
@@ -725,6 +843,7 @@ class TransitAlarm(hass.Hass):
                     "delay_threshold_min": int(route.get("delay_threshold_min", 5)),
                     "last_checked":   now_str,
                     "data_as_of":     data_as_of_iso,  # ISO timestamp; UI should hide departures before current time
+                    **self._operator_attributes(route, res),
                 },
                 replace=True,
             )
@@ -782,6 +901,9 @@ class TransitAlarm(hass.Hass):
         if res.get("no_service"):
             duration = int((route or {}).get("duration_min", self.duration_min))
             base = f"Quiet period - no trains in next {duration} min"
+            return f"{stop_name}: {base}" if stop_name else base
+        if res.get("no_times"):
+            base = "Normal service - no times"
             return f"{stop_name}: {base}" if stop_name else base
 
         next_dep = res.get("next_departure")
@@ -1211,6 +1333,8 @@ class TransitAlarm(hass.Hass):
             name = route.get("transport_name", "Transit")
             if res.get("no_service"):
                 lines.append(f"✅ {name}: quiet period")
+            elif res.get("no_times"):
+                lines.append(f"✅ {name}: normal service, no times")
             else:
                 next_dep = res.get("next_departure")
                 mins = res.get("mins_to_next")
@@ -1232,12 +1356,15 @@ class TransitAlarm(hass.Hass):
             if res.get("error"):
                 lines.append(f"⚠️ {name}: data unavailable ({res['error']})")
             elif res.get("has_issues"):
-                lines.append(f"⚠️ Transit problems - {name}: next {next_dep}{mins_str}")
+                upcoming = f"next {next_dep}{mins_str}" if next_dep else "no times"
+                lines.append(f"⚠️ Transit problems - {name}: {upcoming}")
                 for issue in res.get("issues", []):
                     lines.append(f"  • {issue}")
             elif res.get("no_service"):
                 duration = int(route.get("duration_min", self.duration_min))
                 lines.append(f"✅ {name}: quiet period (no trains in next {duration} min)")
+            elif res.get("no_times"):
+                lines.append(f"✅ {name}: normal service, no times")
             else:
                 lines.append(f"✅ {name}: next {next_dep}{mins_str}, on time")
 
