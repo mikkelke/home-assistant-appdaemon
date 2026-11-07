@@ -644,6 +644,8 @@ class WakeupRoutine(hass.Hass):
             self._start_snooze(getattr(self, "_snooze_minutes", 10), getattr(self, "_snooze_curtain", "closed"))
         elif action == "WAKE_DISMISS":
             self._dismiss_wake()
+        elif action == "WAKE_DISMISS_KEEP":
+            self._dismiss_wake(keep_radio=True)
         elif action == "WAKE_SNOOZE_CANCEL":
             self._cancel_snooze()
         elif action == "WAKE_NOW":
@@ -787,12 +789,11 @@ class WakeupRoutine(hass.Hass):
                     room = "curtain closed" if self._snooze_curtain == "closed" else "keep room"
                     data["actions"] = [
                         {"action": "WAKE_SNOOZE", "title": f"Snooze {self._snooze_minutes} - {room}"},
-                        {"action": "URI", "title": "Options", "uri": ALARM_LINK + "=options"},
+                        {"action": "WAKE_DISMISS_KEEP", "title": "Dismiss"},
                         {"action": "WAKE_DISMISS", "title": "Stop radio"},
                     ]
                 for action in data["actions"]:
-                    if action["action"] != "URI":
-                        action["action"] += "|" + self._session_id
+                    action["action"] += "|" + self._session_id
                 await notifier.notify(title=title, message=message, target=["mikkel"], data=data, link=ALARM_LINK)
         except Exception as e:
             self._log_notification_failure(e)

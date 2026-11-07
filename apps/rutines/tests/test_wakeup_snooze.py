@@ -411,10 +411,10 @@ class WakeSession(unittest.TestCase):
         for method in ("_start_snooze", "_dismiss_wake", "_cancel_snooze", "_queue_wake_notification", "_on_wake_now"):
             setattr(app, method, MagicMock())
         app._snooze_minutes, app._snooze_curtain = 15, "open"
-        for action in ("OTHER", "WAKE_SNOOZE", "WAKE_DISMISS", "WAKE_SNOOZE_CANCEL", "WAKE_NOW"):
+        for action in ("OTHER", "WAKE_SNOOZE", "WAKE_DISMISS", "WAKE_DISMISS_KEEP", "WAKE_SNOOZE_CANCEL", "WAKE_NOW"):
             app._on_notification_action("mobile_app_notification_action", {"action": action}, {})
         app._start_snooze.assert_called_once_with(15, "open")
-        app._dismiss_wake.assert_called_once()
+        self.assertEqual([c.kwargs for c in app._dismiss_wake.call_args_list], [{}, {"keep_radio": True}])
         app._cancel_snooze.assert_called_once()
         app._queue_wake_notification.assert_not_called()
         app._on_wake_now.assert_not_called()
@@ -434,8 +434,8 @@ class WakeSession(unittest.TestCase):
         self.assertEqual(ring["data"]["visibility"], "public")
         self.assertTrue(ring["data"]["sticky"])
         ring_actions = ring["data"]["actions"]
-        self.assertEqual([item["action"] for item in ring_actions], [f"WAKE_SNOOZE|{app._session_id}", "URI", f"WAKE_DISMISS|{app._session_id}"])
-        self.assertEqual(ring_actions[1]["uri"], wb.ALARM_LINK + "=options")
+        self.assertEqual([item["action"] for item in ring_actions],
+                         [f"{action}|{app._session_id}" for action in ("WAKE_SNOOZE", "WAKE_DISMISS_KEEP", "WAKE_DISMISS")])
         app._start_snooze(10, "open")
         self.drain_notifications(app)
         snooze = app.notifier.notify.await_args.kwargs
