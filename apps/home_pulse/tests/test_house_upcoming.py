@@ -2109,8 +2109,8 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(cells, {
             "zg204zm": "LADDA AAA NiMH", "zg204zk": "LADDA AAA NiMH", "parasoll": "1x LADDA AAA NiMH",
             "sq610rfnh": "built-in rechargeable", "yale": "4x XTAR AA Li-ion 4150 mWh", "blind": "", "ws90": "2x AA",
-            "twinguard": "6x AA alkaline", "fp300": "2x CR2450", "snzb04p": "CR2477", "snzb02p": "CR2477",
-            "zg102zm": "", "hhccjcy01": "CR2032", "aoyan_soil": "",
+            "wn36": "whole sensor (sealed 2x AA)", "twinguard": "6x AA alkaline", "fp300": "2x CR2450",
+            "snzb04p": "CR2477", "snzb02p": "CR2477", "zg102zm": "", "hhccjcy01": "CR2032", "aoyan_soil": "",
         })
         actions = {key: model["action"] for key, model in self.INV["models"].items()}
         self.assertEqual({k for k, a in actions.items() if a == "charge"}, {"sq610rfnh", "blind"})
@@ -2135,6 +2135,27 @@ class InventoryTests(unittest.TestCase):
             row = rows(app)[f"maint:battery:{entity}"]
             self.assertEqual((row["title"], row["detail"], row["area"]),
                              (f"{device['name']} battery", "replace, CR2032", device["area"]), entity)
+
+    def test_the_ice_bath_thermometer_is_the_only_wn36_and_asks_for_a_new_sensor_after_two_hours_at_ten_percent(self):
+        entity = "sensor.ice_bath_battery"
+        model = self.INV["models"]["wn36"]
+        self.assertEqual((model["action"], model["low"], model["days"], model["trend"], model["pushed_by"]),
+                         ("replace", 10, 1, False, None))
+        self.assertEqual([e for e, device in self.INV["devices"].items() if device["model"] == "wn36"], [entity])
+        self.assertEqual(self.INV["devices"][entity]["name"], "Ice bath thermometer")
+        self.assertNotIn(f"maint:battery:{entity}", rows(make_app()))
+        states = base_states()
+        states[entity] = full("10")
+        app = make_app(states)
+        self.assertNotIn(f"maint:battery:{entity}", rows(app))
+        tick(app, 2 * HOUR)
+        row = rows(app)[f"maint:battery:{entity}"]
+        self.assertEqual((row["title"], row["detail"], row["area"], row["audience"]),
+                         ("Ice bath thermometer battery", "replace, whole sensor (sealed 2x AA)", "rooftop", "admin"))
+        self.assertTrue(core.is_valid_row(row))
+        fire(app, entity, full("100"))
+        tick(app, 2 * HOUR)
+        self.assertNotIn(f"maint:battery:{entity}", rows(app))
 
     def test_the_ws90_backup_cells_are_one_removable_line(self):
         text = (APPS / "home_pulse" / "house_upcoming.yaml").read_text()

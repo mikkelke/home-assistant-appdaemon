@@ -132,6 +132,8 @@ HouseUpcoming:
       yale: {cell: 4x XTAR AA Li-ion 4150 mWh, action: recharge, drop: 15, trend: false}
       blind: {cell: "", action: charge, low: 25}
       ws90: {cell: 2x AA, action: replace, low: 20, days: 2}
+      # Reports only 100 or 10 %.
+      wn36: {cell: whole sensor (sealed 2x AA), action: replace, low: 10, trend: false}
       # Whole percent readings, so <= 19 is FireSafety's battery_low_pct (< 20).
       twinguard: {cell: 6x AA alkaline, action: replace, low: 19, pushed_by: fire_safety}
       fp300: {cell: 2x CR2450, action: replace, low: 20}
@@ -163,6 +165,7 @@ HouseUpcoming:
       - {entity: sensor.bedroom_blind_battery, model: blind, name: Bedroom blind, area: bedroom}
       - {entity: sensor.bathroom_blind_battery, model: blind, name: Bathroom blind, area: bathroom}
       - {entity: sensor.ecowitt_battery_8351, model: ws90, name: Roof weather station, area: rooftop, history_from: 2026-08-30}  # WS90 backup cells since the supercapacitor failed; delete this line once the permanent supply is in
+      - {entity: sensor.ice_bath_battery, model: wn36, name: Ice bath thermometer, area: rooftop}
       - {entity: sensor.kitchen_smoke_alarm_battery, model: twinguard, name: Kitchen smoke alarm, area: kitchen}
       - {entity: sensor.bedroom_presence_battery, model: fp300, name: Bedroom presence, area: bedroom}
       - {entity: sensor.claudias_room_presence_battery, model: fp300, name: Claudias room presence, area: office}
