@@ -629,7 +629,7 @@ class WakeupRoutine(hass.Hass):
         if event == "wake_snooze":
             self._start_snooze((data or {}).get("minutes"), (data or {}).get("curtain"))
         elif event == "wake_dismiss":
-            self._dismiss_wake()
+            self._dismiss_wake(keep_radio=(data or {}).get("keep_radio") in (True, "true", "True", "1", 1))
         elif event == "wake_snooze_cancel":
             self._cancel_snooze()
 
@@ -696,7 +696,7 @@ class WakeupRoutine(hass.Hass):
                 self._resume_adaptive_brightness()
         self._queue_wake_notification("snoozing")
 
-    def _dismiss_wake(self):
+    def _dismiss_wake(self, keep_radio=False):
         status = getattr(self, "_session_status", "idle")
         if status == "snoozing":
             self._cancel_snooze()
@@ -704,10 +704,13 @@ class WakeupRoutine(hass.Hass):
         if status != "ringing":
             self.log("[wake] Ignoring dismiss without an active session", log=self.user_log)
             return
-        self._stop_media()
+        if keep_radio:
+            self._release_media()
+        else:
+            self._stop_media()
+            self._radio_playing = False
         self._session_status = "dismissed"
-        self._session_reason = "dismissed"
-        self._radio_playing = False
+        self._session_reason = "radio_kept" if keep_radio else "dismissed"
         self._persist_wake_session()
         self._publish_wake_session()
         self._queue_wake_notification("clear")
@@ -2012,7 +2015,8 @@ class WakeupRoutine(hass.Hass):
         if reason: self.log(f"[wake] Finishing light ramp: {reason}", log=self.user_log)
         self._stop_light_ramp()
 
-    def _stop_media(self):
+    def _release_media(self):
+        """Stop the volume ramp and playback checks; whatever is playing keeps playing."""
         self._media_generation = getattr(self, "_media_generation", 0) + 1
         self._media_running = False
         self.volume_active = False
@@ -2022,6 +2026,9 @@ class WakeupRoutine(hass.Hass):
             except Exception:
                 pass
         self.volume_timer = None
+
+    def _stop_media(self):
+        self._release_media()
         try:
             watchdog = self.get_app("RadioWatchdog")
             if watchdog is not None:

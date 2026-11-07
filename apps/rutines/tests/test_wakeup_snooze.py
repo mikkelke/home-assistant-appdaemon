@@ -122,6 +122,19 @@ class WakeSession(unittest.TestCase):
         self.drain_notifications(app)
         app.notifier.clear_notification.assert_awaited_once_with(tag="wake_alarm", target=["mikkel"])
 
+    def test_dismiss_keeping_radio_ends_alarm_without_touching_playback(self):
+        app = self.make_app()
+        old = {"generation": app._media_generation}
+        app._on_wake_action("wake_dismiss", {"session_id": app._session_id, "keep_radio": True}, {})
+        self.assertEqual((app._session_status, app._session_reason), ("dismissed", "radio_kept"))
+        self.assertEqual(app.services, [])
+        self.assertFalse(app.volume_active)
+        app.watchdog.suppress_restart.assert_not_called()
+        app._volume_tick(old)
+        self.assertEqual(app.services, [])
+        self.drain_notifications(app)
+        app.notifier.clear_notification.assert_awaited_once_with(tag="wake_alarm", target=["mikkel"])
+
     def test_closed_snooze_starts_clock_at_tap_and_respects_blind_owner(self):
         app = self.make_app()
         requested = []
