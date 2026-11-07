@@ -704,9 +704,7 @@ class WakeupRoutine(hass.Hass):
         if status != "ringing":
             self.log("[wake] Ignoring dismiss without an active session", log=self.user_log)
             return
-        if keep_radio:
-            self._release_media()
-        else:
+        if not keep_radio:
             self._stop_media()
             self._radio_playing = False
         self._session_status = "dismissed"
@@ -2015,8 +2013,7 @@ class WakeupRoutine(hass.Hass):
         if reason: self.log(f"[wake] Finishing light ramp: {reason}", log=self.user_log)
         self._stop_light_ramp()
 
-    def _release_media(self):
-        """Stop the volume ramp and playback checks; whatever is playing keeps playing."""
+    def _stop_media(self):
         self._media_generation = getattr(self, "_media_generation", 0) + 1
         self._media_running = False
         self.volume_active = False
@@ -2026,9 +2023,6 @@ class WakeupRoutine(hass.Hass):
             except Exception:
                 pass
         self.volume_timer = None
-
-    def _stop_media(self):
-        self._release_media()
         try:
             watchdog = self.get_app("RadioWatchdog")
             if watchdog is not None:

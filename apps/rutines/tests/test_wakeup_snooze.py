@@ -122,16 +122,23 @@ class WakeSession(unittest.TestCase):
         self.drain_notifications(app)
         app.notifier.clear_notification.assert_awaited_once_with(tag="wake_alarm", target=["mikkel"])
 
-    def test_dismiss_keeping_radio_ends_alarm_without_touching_playback(self):
+    def test_dismiss_keeping_radio_ends_alarm_and_lets_the_volume_ramp_finish(self):
         app = self.make_app()
-        old = {"generation": app._media_generation}
+        app.volume_ramp = {app.master_player: 0.3}
+        app.volume_step = 0.05
+        app.volume_levels = {}
+        app.volume_start = 0.1
+        app._get_first_volume = lambda entities: 0.2
+        app._ramp_set = lambda entity, level: app.services.append(("volume", {"entity_id": entity, "level": level}))
+        app._schedule_next_volume_tick = MagicMock()
+        current = {"generation": app._media_generation}
         app._on_wake_action("wake_dismiss", {"session_id": app._session_id, "keep_radio": True}, {})
         self.assertEqual((app._session_status, app._session_reason), ("dismissed", "radio_kept"))
         self.assertEqual(app.services, [])
-        self.assertFalse(app.volume_active)
+        self.assertTrue(app.volume_active)
         app.watchdog.suppress_restart.assert_not_called()
-        app._volume_tick(old)
-        self.assertEqual(app.services, [])
+        app._volume_tick(current)
+        self.assertEqual(app.services, [("volume", {"entity_id": app.master_player, "level": 0.25})])
         self.drain_notifications(app)
         app.notifier.clear_notification.assert_awaited_once_with(tag="wake_alarm", target=["mikkel"])
 
