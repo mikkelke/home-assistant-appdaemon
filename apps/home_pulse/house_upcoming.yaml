@@ -97,12 +97,12 @@ HouseUpcoming:
     - {moisture: sensor.pothos_moisture, name: Pothos, area: living_room, dry: 15, water: 0.4, conductivity: sensor.pothos_conductivity, aka: "Hanging plant, white-speckled leaves", where: "Living room corner, above the sofa", photo: pothos}
     - {moisture: sensor.ivy_moisture, name: Ivy, area: kitchen, dry: 20, water: 0.3, conductivity: sensor.ivy_conductivity, aka: "Small trailing ivy", where: "Top of the wine fridge", photo: ivy}
     - {moisture: sensor.alocasia_soil_moisture, name: Alocasia, area: living_room, dry: 30, water: 0.7, aka: "Arrow-shaped dark leaves, white veins", where: "Living room corner by the terrace door", photo: alocasia}
-    - {name: Monstera, area: kitchen, water: 1, every_days: 10, aka: "Big leaves with holes", where: "Kitchen floor by the Rober2 dock", photo: monstera}
-    - {name: Peace lily kitchen, area: kitchen, water: 0.4, every_days: 7, aka: "Small peace lily, droops when thirsty", where: "Coffee cart next to the xBloom", photo: peace_lily_kitchen}
-    - {name: Peace lily TV, area: living_room, water: 1, every_days: 10, aka: "Large peace lily, droops when thirsty", where: "Living room floor under the TV", photo: peace_lily_tv}
-    - {name: Fiddle leaf fig dining, area: dining_room, water: 1, every_days: 10, aka: "Tall plant, big violin-shaped leaves", where: "Below the family room thermostat", photo: fiddle_leaf_fig_dining}
-    - {name: Fiddle leaf fig bedroom, area: bedroom, water: 1, every_days: 10, aka: "Tall plant, big violin-shaped leaves", where: "Bedroom corner by the bathroom door", photo: fiddle_leaf_fig_bedroom}
-    - {name: Satin pothos, area: hallway, water: 0.2, every_days: 10, aka: "Small vine, silver-spotted leaves", where: "Top of the white wardrobe by the hallway", photo: satin_pothos}
+    - {moisture: sensor.monstera_soil_moisture, name: Monstera, area: kitchen, dry: 25, water: 1, aka: "Big leaves with holes", where: "Kitchen floor by the Rober2 dock", photo: monstera}
+    - {moisture: sensor.peace_lily_kitchen_soil_moisture, name: Peace lily kitchen, area: kitchen, dry: 30, water: 0.4, aka: "Small peace lily, droops when thirsty", where: "Coffee cart next to the xBloom", photo: peace_lily_kitchen}
+    - {moisture: sensor.peace_lily_tv_soil_moisture, name: Peace lily TV, area: living_room, dry: 30, water: 1, aka: "Large peace lily, droops when thirsty", where: "Living room floor under the TV", photo: peace_lily_tv}
+    - {moisture: sensor.fiddle_leaf_fig_dining_soil_moisture, name: Fiddle leaf fig dining, area: dining_room, dry: 25, water: 1, aka: "Tall plant, big violin-shaped leaves", where: "Below the family room thermostat", photo: fiddle_leaf_fig_dining}
+    - {moisture: sensor.fiddle_leaf_fig_bedroom_soil_moisture, name: Fiddle leaf fig bedroom, area: bedroom, dry: 25, water: 1, aka: "Tall plant, big violin-shaped leaves", where: "Bedroom corner by the bathroom door", photo: fiddle_leaf_fig_bedroom}
+    - {moisture: sensor.satin_pothos_soil_moisture, name: Satin pothos, area: hallway, dry: 25, water: 0.2, aka: "Small vine, silver-spotted leaves", where: "Top of the white wardrobe by the hallway", photo: satin_pothos}
     - {name: Snake plant dining, area: dining_room, water: 0.2, every_days: 35, feed: summer, aka: "Upright stiff leaves, pale green", where: "Stool under the right dining Sonos", photo: snake_plant_dining}
     - {name: Snake plant living, area: living_room, water: 0.2, every_days: 35, feed: summer, aka: "Upright stiff leaves, pale green", where: "Stool next to the bar cart", photo: snake_plant_living}
     - {name: Snake plant bathroom, area: bathroom, water: 0.5, every_days: 35, feed: summer, aka: "Tall dark-green striped leaves", where: "Mikkel's bathroom, under the thermostat", photo: snake_plant_bathroom}
@@ -205,6 +205,12 @@ HouseUpcoming:
       - {entity: sensor.pothos_battery, model: hhccjcy01, name: Pothos plant sensor, area: living_room}
       - {entity: sensor.ivy_battery, model: hhccjcy01, name: Ivy plant sensor, area: kitchen}
       - {entity: sensor.alocasia_battery, model: aoyan_soil, name: Alocasia plant sensor, area: living_room}
+      - {entity: sensor.monstera_battery, model: aoyan_soil, name: Monstera plant sensor, area: kitchen}
+      - {entity: sensor.peace_lily_kitchen_battery, model: aoyan_soil, name: Peace lily kitchen plant sensor, area: kitchen}
+      - {entity: sensor.peace_lily_tv_battery, model: aoyan_soil, name: Peace lily TV plant sensor, area: living_room}
+      - {entity: sensor.fiddle_leaf_fig_dining_battery, model: aoyan_soil, name: Fiddle leaf fig dining plant sensor, area: dining_room}
+      - {entity: sensor.fiddle_leaf_fig_bedroom_battery, model: aoyan_soil, name: Fiddle leaf fig bedroom plant sensor, area: bedroom}
+      - {entity: sensor.satin_pothos_battery, model: aoyan_soil, name: Satin pothos plant sensor, area: hallway}
     # Phones and the tablet; Rober2 and the Sonos Move dock themselves; the HANK remotes are
     # rechargeable and read anywhere from 26 to 100; yale_battery_bt is the lock's BLE twin.
     excluded:
