@@ -46,6 +46,7 @@ UPCOMING = CONFIG["upcoming_entity"]
 METRO, STOG = (route["entity"] for route in CONFIG["transit"])
 SLEEP = CONFIG["sleep_entity"]
 LIGHT = CONFIG["light_entity"]
+SPEAKER = CONFIG["speaker"]
 
 
 def iso(moment):
@@ -75,6 +76,13 @@ def watering(days_ago, name="Alocasia", area="bathroom", now=NOW):
     """The row HouseUpcoming builds for a calendar plant (every 7 days) last watered `days_ago` days ago."""
     [plant] = plants.parse_timed([{"name": name, "area": area, "water": 0.7, "every_days": 7}]).values()
     return plants.timed_row(plant, {"at": core.utc_iso(now - days_ago * DAY), "seed": True}, now)[0]
+
+
+def dry_plant(name="Philodendron", area="dining_room", now=NOW):
+    """The row HouseUpcoming builds for a sensor plant whose soil is at its dry level: no time, no Done button."""
+    [(entity, plant)] = plants.parse_plants([{"moisture": "sensor.philodendron_moisture", "name": name,
+                                              "area": area, "dry": 20, "water": 0.5}]).items()
+    return plants.plant_row(entity, plant, {"since": core.utc_iso(now)}, 20.0)[0]
 
 
 def departure(minutes, scheduled, delay=0, cancelled=False):
@@ -123,6 +131,71 @@ class PhoneTests(unittest.TestCase):
                 self.assertEqual(bd.phone_status(value, NOW - age * SEC, NOW, -75, FRESH), expected)
         self.assertEqual(bd.phone_status(-60, None, NOW, -75, FRESH), "stale")
 
+    def test_a_phone_that_rose_on_its_baseline_is_rise(self):
+        cases = (  # value, baseline, status
+            (-79, -88, "rise"), (-80, -86, "rise"), (-76, -100, "rise"), (-80, -100, "rise"),
+            (-78, -77, "weak"), (-79, -84.9, "weak"), (-80.01, -100, "weak"), (-90, -100, "weak"),
+            (-75, -77, "near"), (-75, -100, "near"), (-60, -61, "near"))
+        for value, baseline, expected in cases:
+            with self.subTest(value=value, baseline=baseline):
+                self.assertEqual(bd.phone_status(value, NOW - 3 * SEC, NOW, -75, FRESH, baseline), expected)
+
+    def test_without_a_baseline_there_is_no_rise(self):
+        self.assertEqual(bd.phone_status(-78, NOW, NOW, -75, FRESH), "weak")
+        self.assertEqual(bd.phone_status(-78, NOW, NOW, -75, FRESH, None), "weak")
+
+    def test_the_rise_limits_are_arguments(self):
+        self.assertEqual(bd.phone_status(-85, NOW, NOW, -75, FRESH, -100, rise_min=-90, rise_db=10), "rise")
+        self.assertEqual(bd.phone_status(-85, NOW, NOW, -75, FRESH, -100, rise_min=-84, rise_db=10), "weak")
+        self.assertEqual(bd.phone_status(-85, NOW, NOW, -75, FRESH, -92, rise_min=-90, rise_db=10), "weak")
+
+    def test_a_rise_needs_a_fresh_reading(self):
+        self.assertEqual(bd.phone_status(-79, NOW - 20 * SEC, NOW, -75, FRESH, -100), "rise")
+        self.assertEqual(bd.phone_status(-79, NOW - 21 * SEC, NOW, -75, FRESH, -100), "stale")
+        self.assertEqual(bd.phone_status(-79, None, NOW, -75, FRESH, -100), "stale")
+        self.assertEqual(bd.phone_status(None, NOW, NOW, -75, FRESH, -100), "none")
+
+
+class BaselineTests(unittest.TestCase):
+    def test_it_is_the_median_of_the_readings_from_120_down_to_15_seconds_before_the_visit(self):
+        history = [(NOW - 121 * SEC, -50.0), (NOW - 120 * SEC, -90.0), (NOW - 15 * SEC, -86.0),
+                   (NOW - 14 * SEC, -60.0), (NOW, -55.0)]
+        self.assertEqual(bd.baseline_at(history, NOW), -88.0)
+        self.assertEqual(bd.baseline_at(history[1:3], NOW), -88.0)
+        self.assertEqual(bd.baseline_at([(NOW - 60 * SEC, -90.0), (NOW - 50 * SEC, -88.0), (NOW - 40 * SEC, -70.0)],
+                                        NOW), -88.0)
+
+    def test_it_is_measured_from_the_start_of_the_visit(self):
+        history = [(NOW - 100 * SEC, -90.0), (NOW - 10 * SEC, -60.0)]
+        self.assertEqual(bd.baseline_at(history, NOW), -90.0)
+        self.assertEqual(bd.baseline_at(history, NOW + 60 * SEC), -60.0)
+        self.assertEqual(bd.baseline_at(history, NOW - 110 * SEC), bd.UNHEARD)
+
+    def test_a_phone_not_heard_in_the_window_is_minus_100(self):
+        self.assertEqual(bd.UNHEARD, -100.0)
+        self.assertEqual(bd.baseline_at([], NOW), -100.0)
+        self.assertEqual(bd.baseline_at([(NOW - 121 * SEC, -60.0), (NOW - 10 * SEC, -60.0), (NOW, -60.0)], NOW), -100.0)
+
+    def test_remember_keeps_a_reading_once_with_its_moment(self):
+        history = bd.remember([], full("-88", updated=NOW - 60 * SEC), NOW)
+        self.assertEqual(history, [(NOW - 60 * SEC, -88.0)])
+        self.assertEqual(bd.remember(history, full("-88", updated=NOW - 60 * SEC), NOW), history)
+        self.assertEqual(bd.remember(history, full("-90", updated=NOW - 60 * SEC), NOW), history)
+        self.assertEqual(bd.remember(history, full("-88", updated=NOW - 59 * SEC), NOW),
+                         history + [(NOW - 59 * SEC, -88.0)])
+
+    def test_remember_leaves_out_what_is_not_a_dated_number(self):
+        history = [(NOW - 60 * SEC, -88.0)]
+        for state in (full("unknown"), full("unavailable"), full("nan"), full(None), {"state": "-70"}, None, "-70"):
+            with self.subTest(state=state):
+                self.assertEqual(bd.remember(history, state, NOW), history)
+
+    def test_remember_drops_what_is_more_than_180_seconds_old(self):
+        history = [(NOW - 181 * SEC, -81.0), (NOW - 180 * SEC, -80.0), (NOW - 10 * SEC, -79.0)]
+        self.assertEqual(bd.remember(history, None, NOW), history[1:])
+        self.assertEqual(bd.remember([], full("-70", updated=NOW - 181 * SEC), NOW), [])
+        self.assertEqual(bd.remember([], full("-70", updated=NOW - 180 * SEC), NOW), [(NOW - 180 * SEC, -70.0)])
+
 
 class StateTests(unittest.TestCase):
     def test_next_state(self):
@@ -137,7 +210,10 @@ class StateTests(unittest.TestCase):
             ("mikkel", False, "near", "off"), ("mikkel", False, "none", "off"), ("mikkel", None, "near", "mikkel"),
             ("mikkel", None, "none", "mikkel"), ("mikkel", True, "near", "mikkel"),
             ("mikkel", True, "weak", "mikkel"), ("mikkel", True, "stale", "mikkel"),
-            ("mikkel", True, "none", "mikkel"))
+            ("mikkel", True, "none", "mikkel"),
+            (None, True, "rise", "mikkel"), ("off", True, "rise", "mikkel"), ("someone", True, "rise", "mikkel"),
+            ("mikkel", True, "rise", "mikkel"), (None, False, "rise", "off"), ("someone", False, "rise", "off"),
+            ("someone", None, "rise", "someone"), ("off", None, "rise", "off"))
         for prev, active, status, expected in cases:
             with self.subTest(prev=prev, active=active, status=status):
                 self.assertEqual(bd.next_state(prev, active, status), expected)
@@ -152,9 +228,17 @@ class StateTests(unittest.TestCase):
         self.assertEqual(seen, ["someone", "someone", "mikkel", "mikkel", "mikkel", "mikkel", "mikkel", "off",
                                 "off", "someone", "mikkel"])
 
+    def test_a_visit_that_is_identified_by_a_rise_is_the_same_visit(self):
+        state, seen = None, []
+        for active, status in ((True, "weak"), (True, "rise"), (True, "weak"), (False, "rise"), (True, "rise")):
+            state = bd.next_state(state, active, status)
+            seen.append(state)
+        self.assertEqual(seen, ["someone", "mikkel", "mikkel", "off", "mikkel"])
+
     def test_reason(self):
         cases = ((None, "off", "none", f"unknown:{ACTIVE}"), (False, "off", "near", f"inactive:{ACTIVE}"),
                  (True, "mikkel", "near", f"active:{ACTIVE} phone:near"),
+                 (True, "mikkel", "rise", f"active:{ACTIVE} phone:rise"),
                  (True, "mikkel", "weak", f"active:{ACTIVE} phone:held"),
                  (True, "mikkel", "stale", f"active:{ACTIVE} phone:held"),
                  (True, "mikkel", "none", f"active:{ACTIVE} phone:held"),
@@ -195,12 +279,18 @@ class DueTests(unittest.TestCase):
             with self.subTest(row=row):
                 self.assertEqual(bd.due_at(row, NOW), expected)
 
-    def test_a_row_without_a_day_is_not_due(self):
+    def test_a_row_without_a_time_or_a_day_is_due_now(self):
         for row in ({}, {"info": ["Due 04.11"]}, {"detail": "due today"}, {"done": "tap", "info": ["Due soon"]},
                     {"done": "tap", "detail": "due"}, {"done": "tap", "detail": "6 days left, 11.11"},
-                    {"done": "tap", "info": ["Due 31.02"]}, {"done": "tap", "info": "Due 04.11"}):
+                    {"done": "tap", "info": ["Due 31.02"]}, {"done": "tap", "info": "Due 04.11"},
+                    {"detail": "soil 20%, water at 20%"}, {"detail": "no data since 03.11"},
+                    {"done": "tap", "info": ["Every 10 runs"]}):
             with self.subTest(row=row):
-                self.assertIsNone(bd.due_at(row, NOW))
+                self.assertEqual(bd.due_at(row, NOW), NOW)
+
+    def test_a_row_with_a_time_is_due_then_even_when_it_names_a_day(self):
+        row = {"at": iso(NOW + 2 * DAY), "done": "tap", "info": ["Due 04.11"], "detail": "due today"}
+        self.assertEqual(bd.due_at(row, NOW), NOW + 2 * DAY)
 
     def test_the_chip_counts_house_days_not_utc_days(self):
         now = datetime(2026, 11, 5, 22, 30, tzinfo=timezone.utc)  # 23:30 in the house
@@ -235,10 +325,11 @@ class RowTests(unittest.TestCase):
     def test_a_one_off_task_of_another_year_is_overdue(self):
         self.assertEqual([line.due for line in self.lines([one_off(date(2025, 12, 30))])], ["overdue"])
 
-    def test_a_one_off_task_due_tomorrow_is_timed_beyond_24_hours_so_only_a_bathroom_one_is_listed(self):
-        self.assertEqual(self.lines([one_off(date(2026, 11, 6))]),
-                         [bd.Line("Spray the Alocasia", "mdi:spray", "tomorrow")])
-        self.assertEqual(self.lines([one_off(date(2026, 11, 6), area="kitchen")]), [])
+    def test_a_one_off_task_due_tomorrow_is_a_line_whatever_the_room(self):
+        for area in ("bathroom", "kitchen"):
+            with self.subTest(area=area):
+                self.assertEqual(self.lines([one_off(date(2026, 11, 6), area=area)]),
+                                 [bd.Line("Spray the Alocasia", "mdi:spray", "tomorrow")])
 
     def test_a_calendar_plant_is_a_line_the_day_before_on_the_day_and_after(self):
         for days_ago, chip in ((6, "tomorrow"), (7, "today"), (9, "overdue")):
@@ -246,39 +337,49 @@ class RowTests(unittest.TestCase):
                 self.assertEqual(self.lines([watering(days_ago)]),
                                  [bd.Line("Water the Alocasia: 0.7 L", "mdi:watering-can-outline", chip)])
 
-    def test_a_calendar_plant_in_another_room_is_a_line_from_the_day_it_is_due(self):
-        self.assertEqual(self.lines([watering(6, area="kitchen")]), [])
-        self.assertEqual([line.due for line in self.lines([watering(7, area="kitchen")])], ["today"])
-        self.assertEqual([line.due for line in self.lines([watering(9, area="kitchen")])], ["overdue"])
+    def test_a_calendar_plant_in_another_room_is_a_line_the_day_before_on_the_day_and_after(self):
+        for days_ago, chip in ((6, "tomorrow"), (7, "today"), (9, "overdue")):
+            with self.subTest(days_ago=days_ago):
+                self.assertEqual([line.due for line in self.lines([watering(days_ago, area="kitchen")])], [chip])
 
-    def test_timed_rows_inside_24_hours_are_lines_whatever_the_room(self):
+    def test_timed_rows_inside_7_days_are_lines_whatever_the_room(self):
         rows = [maint_row("past", "Earlier today", at=NOW - 2 * HOUR, area="kitchen"),
                 maint_row("yesterday", "Since yesterday", at=NOW - DAY, area="kitchen"),
-                maint_row("edge", "Exactly 24 hours", at=NOW + DAY, area="kitchen"),
-                maint_row("tonight", "Tonight", at=NOW + 6 * HOUR, area="living_room")]
+                maint_row("edge", "Exactly 7 days", at=NOW + 7 * DAY, area="kitchen"),
+                maint_row("over", "A minute over 7 days", at=NOW + 7 * DAY + MIN, area="kitchen"),
+                maint_row("tonight", "Tonight", at=NOW + 6 * HOUR, area="living_room"),
+                maint_row("drum", "In three days", at=NOW + 3 * DAY, area="guest_bathroom")]
         self.assertEqual([(line.text, line.due) for line in self.lines(rows, limit=10)],
                          [("Since yesterday", "overdue"), ("Earlier today", "today"), ("Tonight", "today"),
-                          ("Exactly 24 hours", "tomorrow")])
+                          ("In three days", "3 d"), ("Exactly 7 days", "7 d")])
 
-    def test_beyond_24_hours_only_the_bathroom_rows_within_14_days_are_lines(self):
-        rows = [maint_row("a", "Bathroom in five days", at=NOW + 5 * DAY, area="bathroom"),
-                maint_row("b", "Kitchen in five days", at=NOW + 5 * DAY, area="kitchen"),
+    def test_a_row_three_days_out_is_a_line_whatever_the_room(self):
+        row = maint_row("washer:drum", "Washer drum + drawer clean", at=NOW + 3 * DAY, area="guest_bathroom")
+        self.assertEqual(self.lines([row]), [bd.Line("Washer drum + drawer clean", "mdi:information-outline", "3 d")])
+
+    def test_beyond_7_days_only_the_bathroom_rows_within_14_days_are_lines(self):
+        rows = [maint_row("a", "Bathroom in ten days", at=NOW + 10 * DAY, area="bathroom"),
+                maint_row("b", "Kitchen in ten days", at=NOW + 10 * DAY, area="kitchen"),
                 maint_row("c", "Bathroom at 14 days", at=NOW + 14 * DAY, area="bathroom"),
                 maint_row("d", "Bathroom a minute later", at=NOW + 14 * DAY + MIN, area="bathroom"),
-                maint_row("e", "No room in five days", at=NOW + 5 * DAY),
-                maint_row("f", "Guest bathroom in five days", at=NOW + 5 * DAY, area="guest_bathroom")]
+                maint_row("e", "No room in ten days", at=NOW + 10 * DAY),
+                maint_row("f", "Guest bathroom in ten days", at=NOW + 10 * DAY, area="guest_bathroom"),
+                maint_row("g", "Bathroom a minute over 7 days", at=NOW + 7 * DAY + MIN, area="bathroom")]
         self.assertEqual([(line.text, line.due) for line in self.lines(rows, limit=10)],
-                         [("Bathroom in five days", "5 d"), ("Bathroom at 14 days", "14 d")])
+                         [("Bathroom a minute over 7 days", "7 d"), ("Bathroom in ten days", "10 d"),
+                          ("Bathroom at 14 days", "14 d")])
 
     def test_what_is_due_comes_first_earliest_first_then_the_bathroom_rows_earliest_first(self):
-        rows = [maint_row("later", "Bathroom later", at=NOW + 3 * DAY, area="bathroom"),
-                maint_row("soon", "Bathroom soon", at=NOW + 2 * DAY, area="bathroom"),
+        rows = [maint_row("later", "Bathroom later", at=NOW + 9 * DAY, area="bathroom"),
+                maint_row("soon", "Bathroom soon", at=NOW + 8 * DAY, area="bathroom"),
+                maint_row("kitchen", "Kitchen in six days", at=NOW + 6 * DAY, area="kitchen"),
+                maint_row("far", "Kitchen in eight days", at=NOW + 8 * DAY, area="kitchen"),
                 maint_row("afternoon", "This afternoon", at=NOW + 6 * HOUR),
                 maint_row("old", "Overdue since yesterday", at=NOW - DAY)]
         lines = self.lines(rows, limit=10)
-        self.assertEqual([line.text for line in lines],
-                         ["Overdue since yesterday", "This afternoon", "Bathroom soon", "Bathroom later"])
-        self.assertEqual([line.due for line in lines], ["overdue", "today", "2 d", "3 d"])
+        self.assertEqual([line.text for line in lines], ["Overdue since yesterday", "This afternoon",
+                                                         "Kitchen in six days", "Bathroom soon", "Bathroom later"])
+        self.assertEqual([line.due for line in lines], ["overdue", "today", "6 d", "8 d", "9 d"])
 
     def test_at_most_three_lines(self):
         rows = [maint_row(f"r{i}", f"Row {i}", at=NOW + i * HOUR) for i in range(5)]
@@ -291,6 +392,8 @@ class RowTests(unittest.TestCase):
         rows = [maint_row("skip", "Log row", at=NOW - HOUR, skip_next=True),
                 maint_row("skip2", "Overdue log row", area="bathroom", tap_done=True, skip_next=True,
                           info=["Due 04.11"]),
+                maint_row("skip3", "Log row with no time", area="bathroom", skip_next=True),
+                maint_row("skip4", "Log row with no Done button", area="bathroom", tap_done=True, skip_next=True),
                 maint_row("ok", "Real row", at=NOW + HOUR)]
         self.assertEqual([line.text for line in self.lines(rows)], ["Real row"])
 
@@ -304,14 +407,33 @@ class RowTests(unittest.TestCase):
         self.assertEqual([line.text for line in self.lines(rows, resident="Kristine")],
                          ["Train to Odense", "Shared train", "Rain forecast"])
 
-    def test_a_row_with_no_day_is_never_a_line(self):
+    def test_a_row_with_no_time_is_due_now_and_a_line_with_a_today_chip(self):
         rows = [core.make_row("maint:battery:sensor.door", "maint", "Bathroom door battery", "no data since 03.11",
                               area="bathroom", audience="admin"),
-                core.make_row("maint:plant:ivy", "maint", "Water the Ivy", "soil 12%, water at 20%",
-                              area="bathroom", audience="admin"),
-                maint_row("tapped", "Tapped without a day", area="bathroom", tap_done=True, info=["Every 10 runs"]),
+                dry_plant("Ivy", area="kitchen"),
+                maint_row("tapped", "Tapped without a day", area="living_room", tap_done=True,
+                          info=["Every 10 runs"]),
                 maint_row("info", "Due text without a Done button", area="bathroom", info=["Due 04.11"])]
-        self.assertEqual(self.lines(rows), [])
+        self.assertEqual([(line.text, line.due) for line in self.lines(rows, limit=10)],
+                         [("Bathroom door battery", "today"), ("Due text without a Done button", "today"),
+                          ("Water the Ivy: 0.5 L", "today"), ("Tapped without a day", "today")])
+
+    def test_a_dry_sensor_plant_is_a_line_with_its_icon_whatever_the_room(self):
+        for area in ("dining_room", "bathroom"):
+            with self.subTest(area=area):
+                row = dry_plant(area=area)
+                self.assertNotIn("at", row)
+                self.assertEqual(self.lines([row]),
+                                 [bd.Line("Water the Philodendron: 0.5 L", "mdi:watering-can-outline", "today")])
+
+    def test_what_is_due_now_comes_after_what_is_overdue_and_before_what_is_timed_ahead(self):
+        rows = [maint_row("ahead", "In three days", at=NOW + 3 * DAY),
+                dry_plant(),
+                maint_row("old", "Overdue since yesterday", at=NOW - DAY),
+                maint_row("tonight", "Tonight", at=NOW + 6 * HOUR)]
+        self.assertEqual([(line.text, line.due) for line in self.lines(rows, limit=10)],
+                         [("Overdue since yesterday", "overdue"), ("Water the Philodendron: 0.5 L", "today"),
+                          ("Tonight", "today"), ("In three days", "3 d")])
 
     def test_a_row_needs_a_readable_title(self):
         rows = [{"id": "maint:x", "kind": "maint", "at": iso(NOW)}, {"id": "maint:y", "title": 5, "at": iso(NOW)},
@@ -431,6 +553,29 @@ class PayloadTests(unittest.TestCase):
                                   line2="Spray the Alocasia", icon2="mdi:spray", due2="overdue"))
 
 
+class PlayActionTests(unittest.TestCase):
+    ALONE = [SPEAKER]
+    GROUP = [SPEAKER, "media_player.kitchen"]
+
+    def test_a_speaker_that_is_playing_is_paused_and_one_that_is_paused_plays_on_whatever_its_group(self):
+        for members in (None, [], self.ALONE, self.GROUP, "media_player.a, media_player.b"):
+            with self.subTest(members=members):
+                self.assertEqual(bd.play_action("playing", members), "pause")
+                self.assertEqual(bd.play_action("paused", members), "play")
+
+    def test_anything_else_starts_the_radio_at_once_when_the_speaker_is_not_grouped(self):
+        for state in ("idle", "off", "on", "standby", "buffering", "unavailable", "unknown", "", None):
+            for members in (None, [], self.ALONE, "media_player.a, media_player.b", {"a": 1}):
+                with self.subTest(state=state, members=members):
+                    self.assertEqual(bd.play_action(state, members), "radio")
+
+    def test_anything_else_leaves_the_group_first_when_the_speaker_is_grouped(self):
+        for state in ("idle", "off", "on", "standby", "buffering", "unavailable", "unknown", "", None):
+            with self.subTest(state=state):
+                self.assertEqual(bd.play_action(state, self.GROUP), "unjoin_radio")
+                self.assertEqual(bd.play_action(state, self.GROUP + ["media_player.living_room"]), "unjoin_radio")
+
+
 def room(state):
     return full(state, {"stale": "false"})
 
@@ -442,6 +587,7 @@ def make_app(states=None, active="on", now=NOW, fail=0, **args):
     app.now = now
     app.states = {ACTIVE: room(active), **(states or {})}
     app.published, app.logs, app.listened, app.events, app.scheduled = [], [], [], [], []
+    app.calls, app.later, app.fail_services = [], [], set()
     app.fail_publish = fail
 
     def get_state(entity, attribute=None, **kw):
@@ -460,8 +606,15 @@ def make_app(states=None, active="on", now=NOW, fail=0, **args):
             raise RuntimeError("HA unreachable")
         app.published.append({"entity": entity, "state": state, "attributes": attributes, "replace": replace})
 
+    def call_service(service, **kw):
+        if service in app.fail_services:
+            raise RuntimeError("HA unreachable")
+        app.calls.append((service, kw))
+
     app.get_state = get_state
     app.set_state = set_state
+    app.call_service = call_service
+    app.run_in = lambda callback, delay, **kw: app.later.append((callback, delay, kw))
     app.get_now = lambda: app.now
     app.get_app = lambda name: None
     app.listen_state = lambda callback, entity, **kw: app.listened.append((callback.__name__, entity, kw))
@@ -490,9 +643,26 @@ def phone(app, dbm, age=0):
     fire(app, RSSI, full(dbm, updated=app.now - age * SEC))
 
 
+def heard(app, dbm, *ages):
+    """Readings of the phone, each `age` seconds old by the app's clock and its own update."""
+    for age in ages:
+        phone(app, dbm, age=age)
+
+
 def tick(app, delta=10 * SEC):
     app.now += delta
     app._on_tick({})
+
+
+def tap(app):
+    app._on_play(CONFIG["play_event"], {}, {})
+
+
+def run_later(app):
+    """The callbacks run_in was given, run now."""
+    pending, app.later = app.later, []
+    for callback, _, kw in pending:
+        callback(kw)
 
 
 def last(app):
@@ -531,13 +701,152 @@ class TransitionTests(unittest.TestCase):
         self.assertEqual(len(app.published), 1)
 
     def test_a_weak_phone_is_someone_and_the_threshold_is_inclusive(self):
-        app = make_app({RSSI: full("-76")})
+        app = make_app({RSSI: full("-76", updated=NOW - 60 * SEC)}, active="off")
+        occupy(app, "on")
+        phone(app, "-76")
         self.assertEqual(last(app)["state"], "someone")
         self.assertEqual(last(app)["attributes"]["reason"], f"active:{ACTIVE} phone:weak")
         phone(app, "-75.4")
         self.assertEqual(last(app)["state"], "someone")
         phone(app, "-75")
         self.assertEqual(last(app)["state"], "mikkel")
+        self.assertEqual(last(app)["attributes"]["reason"], f"active:{ACTIVE} phone:near")
+
+    def test_a_phone_that_rises_on_what_it_was_before_the_visit_is_mikkel(self):
+        app = make_app(active="off")
+        heard(app, "-88", 100, 60, 30)
+        occupy(app, "on")
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]),
+                         ("someone", f"active:{ACTIVE} phone:stale"))
+        phone(app, "-79")
+        self.assertEqual(last(app)["state"], "mikkel")
+        self.assertEqual(last(app)["attributes"],
+                         attrs_of(reason=f"active:{ACTIVE} phone:rise", person="mikkel", greeting="Hej Mikkel"))
+        phone(app, "-95")
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]),
+                         ("mikkel", f"active:{ACTIVE} phone:held"))
+
+    def test_a_phone_that_was_already_as_loud_next_door_is_not_a_rise(self):
+        app = make_app(active="off")
+        heard(app, "-77", 100, 60, 30)
+        occupy(app, "on")
+        for reading in ("-78", "-76", "-79", "-80", "-76.5"):
+            phone(app, reading)
+            self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]),
+                             ("someone", f"active:{ACTIVE} phone:weak"))
+        phone(app, "-75")
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]),
+                         ("mikkel", f"active:{ACTIVE} phone:near"))
+
+    def test_near_identifies_him_whatever_the_baseline_was(self):
+        for before in ("-77", "-75", "-90"):
+            with self.subTest(before=before):
+                app = make_app(active="off")
+                heard(app, before, 100, 60, 30)
+                occupy(app, "on")
+                phone(app, "-75")
+                self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]),
+                                 ("mikkel", f"active:{ACTIVE} phone:near"))
+
+    def test_the_baseline_leaves_out_the_last_15_seconds_and_what_is_older_than_120(self):
+        app = make_app(active="off")
+        heard(app, "-60", 130, 125)
+        heard(app, "-88", 100, 60)
+        heard(app, "-79", 10, 5)
+        occupy(app, "on")
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]),
+                         ("mikkel", f"active:{ACTIVE} phone:rise"))
+
+    def test_a_phone_not_heard_before_the_visit_is_minus_100_so_minus_80_is_a_rise(self):
+        app = make_app(active="off")
+        occupy(app, "on")
+        phone(app, "-81")
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]),
+                         ("someone", f"active:{ACTIVE} phone:weak"))
+        phone(app, "-80")
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]),
+                         ("mikkel", f"active:{ACTIVE} phone:rise"))
+
+    def test_unknown_readings_before_the_visit_do_not_count_as_a_level(self):
+        app = make_app(active="off")
+        heard(app, "-77", 100, 90)
+        heard(app, "unknown", 80, 70, 60)
+        heard(app, "unavailable", 50)
+        occupy(app, "on")
+        phone(app, "-76")
+        self.assertEqual(last(app)["attributes"]["reason"], f"active:{ACTIVE} phone:weak")
+
+    def test_an_app_that_starts_in_an_active_room_takes_its_baseline_from_the_snapshot(self):
+        app = make_app({RSSI: full("-79")})
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]),
+                         ("mikkel", f"active:{ACTIVE} phone:rise"))
+        app = make_app({RSSI: full("-79", updated=NOW - 60 * SEC)})
+        self.assertEqual(last(app)["attributes"]["reason"], f"active:{ACTIVE} phone:stale")
+        phone(app, "-79")
+        self.assertEqual(last(app)["attributes"]["reason"], f"active:{ACTIVE} phone:weak")
+
+    def test_the_baseline_is_worked_out_once_for_the_visit(self):
+        app = make_app(active="off")
+        heard(app, "-88", 100, 60, 30)
+        occupy(app, "on")
+        for _ in range(13):
+            tick(app)
+            phone(app, "-81")
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]),
+                         ("someone", f"active:{ACTIVE} phone:weak"))
+        phone(app, "-79")
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]),
+                         ("mikkel", f"active:{ACTIVE} phone:rise"))
+
+    def test_the_next_visit_has_its_own_baseline(self):
+        app = make_app(active="off")
+        heard(app, "-88", 100, 60, 30)
+        occupy(app, "on")
+        phone(app, "-79")
+        self.assertEqual(last(app)["state"], "mikkel")
+        occupy(app, "off")
+        tick(app, 5 * MIN)
+        heard(app, "-78", 100, 60, 30)
+        occupy(app, "on")
+        phone(app, "-77")
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]),
+                         ("someone", f"active:{ACTIVE} phone:weak"))
+
+    def test_a_visit_that_begins_when_the_light_comes_on_takes_its_baseline_then(self):
+        app = make_app({SLEEP: full("on"), LIGHT: full("off")})
+        heard(app, "-88", 100, 60, 30)
+        fire(app, LIGHT, full("on"))
+        phone(app, "-79")
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]),
+                         ("mikkel", f"active:{ACTIVE} phone:rise"))
+        app = make_app({SLEEP: full("on"), LIGHT: full("off")})
+        heard(app, "-79", 100, 60, 30)
+        fire(app, LIGHT, full("on"))
+        phone(app, "-79")
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]),
+                         ("someone", f"active:{ACTIVE} phone:weak"))
+
+    def test_a_reading_the_tick_fetched_is_in_the_history_too(self):
+        app = make_app(active="off")
+        app.states[RSSI] = full("-77", updated=app.now - 60 * SEC)
+        tick(app, 1 * SEC)
+        occupy(app, "on")
+        phone(app, "-78")
+        self.assertEqual(last(app)["attributes"]["reason"], f"active:{ACTIVE} phone:weak")
+
+    def test_the_rise_limits_are_from_the_yaml(self):
+        app = make_app(active="off", rssi_rise_min=-85, rssi_rise_db=3)
+        heard(app, "-90", 100, 60, 30)
+        occupy(app, "on")
+        phone(app, "-86")
+        self.assertEqual(last(app)["attributes"]["reason"], f"active:{ACTIVE} phone:weak")
+        phone(app, "-85")
+        self.assertEqual(last(app)["attributes"]["reason"], f"active:{ACTIVE} phone:rise")
+        app = make_app(active="off", rssi_rise_min=-85, rssi_rise_db=8)
+        heard(app, "-90", 100, 60, 30)
+        occupy(app, "on")
+        phone(app, "-85")
+        self.assertEqual(last(app)["attributes"]["reason"], f"active:{ACTIVE} phone:weak")
 
     def test_the_threshold_and_the_freshness_are_from_the_yaml(self):
         app = make_app(mikkel_rssi_min=-90, rssi_fresh_s=5)
@@ -613,6 +922,20 @@ class StickyTests(unittest.TestCase):
                 phone(app, "-61")
                 self.assertEqual(last(app)["attributes"]["reason"], self.NEAR)
 
+    def test_a_rise_is_held_like_a_near_phone(self):
+        app = make_app(active="off")
+        heard(app, "-88", 100, 60, 30)
+        occupy(app, "on")
+        phone(app, "-79")
+        self.assertEqual(last(app)["attributes"]["reason"], f"active:{ACTIVE} phone:rise")
+        for reading in ("-81", "-95", "unknown"):
+            phone(app, reading)
+            self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]), ("mikkel", self.HELD))
+        tick(app, 30 * MIN)
+        self.assertEqual(last(app)["state"], "mikkel")
+        occupy(app, "off")
+        self.assertEqual(last(app)["state"], "off")
+
     def test_a_removed_sensor_does_not_end_it(self):
         app = make_app({RSSI: full("-60")})
         app.states.pop(RSSI)
@@ -646,7 +969,7 @@ class StickyTests(unittest.TestCase):
 
     def test_a_visit_that_never_saw_the_phone_stays_someone(self):
         app = make_app({RSSI: full("-90")})
-        for reading in ("unknown", "-80", "unavailable"):
+        for reading in ("unknown", "-81", "unavailable"):
             phone(app, reading)
             self.assertEqual(last(app)["state"], "someone")
         tick(app, 30 * MIN)
@@ -741,7 +1064,8 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(sorted((entity, kw.get("attribute")) for _, entity, kw in app.listened),
                          sorted([(ACTIVE, None), (RSSI, "all"), (UPCOMING, "all"), (SLEEP, "all"), (LIGHT, "all"),
                                  (METRO, "all"), (STOG, "all")]))
-        self.assertEqual(app.events, [("_on_plugin_started", "plugin_started")])
+        self.assertEqual(app.events, [("_on_plugin_started", "plugin_started"),
+                                      ("_on_play", "esphome.bathroom_display_play")])
         self.assertEqual(app.scheduled, [("_on_tick", "now+10", 10)])
 
     def test_it_publishes_only_when_the_payload_changes(self):
@@ -754,14 +1078,17 @@ class PublishTests(unittest.TestCase):
         for dbm in ("-60.4", "-61", "-74.9", "-75", "-59"):
             phone(app, dbm)
         self.assertEqual(len(app.published), 1)
-        phone(app, "-80")
+        phone(app, "-81")
         self.assertEqual(len(app.published), 2)
         self.assertEqual(last(app)["attributes"]["reason"], f"active:{ACTIVE} phone:held")
-        phone(app, "-81")
+        phone(app, "-82")
         self.assertEqual(len(app.published), 2)
         phone(app, "-70")
         self.assertEqual(len(app.published), 3)
         self.assertEqual(last(app)["attributes"]["reason"], f"active:{ACTIVE} phone:near")
+        phone(app, "-77")
+        self.assertEqual(len(app.published), 4)
+        self.assertEqual(last(app)["attributes"]["reason"], f"active:{ACTIVE} phone:rise")
 
     def test_plugin_started_republishes_the_same_payload(self):
         app = make_app({RSSI: full("-60")})
@@ -798,7 +1125,7 @@ class PublishTests(unittest.TestCase):
 
 class LineTests(unittest.TestCase):
     ROWS = [one_off(date(2026, 11, 3)), watering(7),
-            maint_row("battery", "Bathroom door battery", at=NOW + 4 * DAY, area="bathroom",
+            maint_row("battery", "Bathroom door battery", at=NOW + 9 * DAY, area="bathroom",
                       icon="mdi:battery-clock-outline")]
 
     def test_mikkel_gets_the_rows_that_are_due_and_the_bathroom_rows_after_them(self):
@@ -807,7 +1134,19 @@ class LineTests(unittest.TestCase):
             reason=f"active:{ACTIVE} phone:near", person="mikkel", greeting="Hej Mikkel",
             line1="Spray the Alocasia", icon1="mdi:spray", due1="overdue",
             line2="Water the Alocasia: 0.7 L", icon2="mdi:watering-can-outline", due2="today",
-            line3="Bathroom door battery", icon3="mdi:battery-clock-outline", due3="4 d"))
+            line3="Bathroom door battery", icon3="mdi:battery-clock-outline", due3="9 d"))
+
+    def test_a_dry_plant_and_a_washer_drum_clean_two_days_out_show_and_the_dryer_log_does_not(self):
+        rows = [maint_row("washer:drum", "Washer drum + drawer clean", at=NOW + 2 * DAY, area="guest_bathroom",
+                          icon="mdi:washing-machine"),
+                dry_plant(),
+                maint_row("dryer:plinth", "Dryer plinth filter", area="guest_bathroom", tap_done=True,
+                          skip_next=True)]
+        app = make_app({RSSI: full("-60"), UPCOMING: upcoming(rows)})
+        self.assertEqual(last(app)["attributes"], attrs_of(
+            reason=f"active:{ACTIVE} phone:near", person="mikkel", greeting="Hej Mikkel",
+            line1="Water the Philodendron: 0.5 L", icon1="mdi:watering-can-outline", due1="today",
+            line2="Washer drum + drawer clean", icon2="mdi:washing-machine", due2="2 d"))
 
     def test_a_route_that_is_bad_comes_first_and_takes_a_slot(self):
         app = make_app({RSSI: full("-60"), UPCOMING: upcoming(self.ROWS),
@@ -896,6 +1235,132 @@ class SleepTests(unittest.TestCase):
         self.assertEqual(last(app)["attributes"]["reason"], f"inactive:{ACTIVE}")
 
 
+class PlayButtonTests(unittest.TestCase):
+    GROUP = [SPEAKER, "media_player.kitchen"]
+    PLAY_RADIO = ("media_player/play_media",
+                  {"entity_id": SPEAKER, "media_content_id": "dr_podcasts://radio/p3", "media_content_type": "music"})
+
+    def app(self, state, members=None, **args):
+        attributes = {} if members is None else {"group_members": members}
+        return make_app({SPEAKER: full(state, attributes)} if state is not None else {}, **args)
+
+    def lines(self, app):
+        return [msg for _, msg in app.logs if msg.startswith("Play button")]
+
+    def test_a_playing_speaker_is_paused(self):
+        app = self.app("playing", [SPEAKER])
+        tap(app)
+        self.assertEqual(app.calls, [("media_player/media_pause", {"entity_id": SPEAKER})])
+        self.assertEqual(app.later, [])
+        self.assertEqual(self.lines(app), [f"Play button: {SPEAKER} is playing -> pause"])
+
+    def test_a_paused_speaker_plays_on(self):
+        app = self.app("paused", [SPEAKER])
+        tap(app)
+        self.assertEqual(app.calls, [("media_player/media_play", {"entity_id": SPEAKER})])
+        self.assertEqual(app.later, [])
+        self.assertEqual(self.lines(app), [f"Play button: {SPEAKER} is paused -> play"])
+
+    def test_a_grouped_speaker_that_plays_or_is_paused_stays_in_its_group(self):
+        for state, service in (("playing", "media_player/media_pause"), ("paused", "media_player/media_play")):
+            with self.subTest(state=state):
+                app = self.app(state, self.GROUP)
+                tap(app)
+                self.assertEqual(app.calls, [(service, {"entity_id": SPEAKER})])
+                self.assertEqual(app.later, [])
+
+    def test_any_other_speaker_starts_the_radio_as_music_at_once(self):
+        for state in ("idle", "off", "standby", "unavailable", "unknown", None):
+            with self.subTest(state=state):
+                app = self.app(state, [SPEAKER])
+                tap(app)
+                self.assertEqual(app.calls, [self.PLAY_RADIO])
+                self.assertEqual(app.later, [])
+                self.assertEqual(len(self.lines(app)), 1)
+
+    def test_a_speaker_without_group_members_starts_the_radio_at_once(self):
+        app = self.app("idle")
+        tap(app)
+        self.assertEqual(app.calls, [self.PLAY_RADIO])
+        self.assertEqual(app.later, [])
+
+    def test_a_grouped_speaker_leaves_its_group_and_starts_the_radio_a_second_later(self):
+        app = self.app("idle", self.GROUP)
+        tap(app)
+        self.assertEqual(app.calls, [("media_player/unjoin", {"entity_id": SPEAKER})])
+        self.assertEqual([(callback.__name__, delay) for callback, delay, _ in app.later], [("_start_radio", 1)])
+        self.assertEqual(len(self.lines(app)), 1)
+        run_later(app)
+        self.assertEqual(app.calls, [("media_player/unjoin", {"entity_id": SPEAKER}), self.PLAY_RADIO])
+        self.assertEqual(app.later, [])
+        self.assertEqual(len(self.lines(app)), 1)
+
+    def test_the_state_is_read_at_the_tap(self):
+        app = self.app("idle", [SPEAKER])
+        tap(app)
+        app.states[SPEAKER] = full("playing", {"group_members": [SPEAKER]})
+        tap(app)
+        app.states[SPEAKER] = full("paused", {"group_members": [SPEAKER]})
+        tap(app)
+        app.states[SPEAKER] = full("idle", {"group_members": self.GROUP})
+        tap(app)
+        self.assertEqual([call for call, _ in app.calls],
+                         ["media_player/play_media", "media_player/media_pause", "media_player/media_play",
+                          "media_player/unjoin"])
+        self.assertEqual(len(self.lines(app)), 4)
+
+    def warnings(self, app):
+        return [msg for level, msg in app.logs if level == "WARNING"]
+
+    def test_a_service_call_that_fails_logs_a_warning(self):
+        for state, service in (("playing", "media_player/media_pause"), ("paused", "media_player/media_play"),
+                               ("idle", "media_player/play_media")):
+            with self.subTest(state=state):
+                app = self.app(state, [SPEAKER])
+                app.fail_services = {service}
+                tap(app)
+                self.assertEqual(app.calls, [])
+                self.assertEqual(self.warnings(app), [f"{service} failed: RuntimeError('HA unreachable')"])
+
+    def test_a_failed_unjoin_logs_a_warning_and_the_radio_still_follows(self):
+        app = self.app("idle", self.GROUP)
+        app.fail_services = {"media_player/unjoin"}
+        tap(app)
+        run_later(app)
+        self.assertEqual(app.calls, [self.PLAY_RADIO])
+        self.assertEqual(self.warnings(app), ["media_player/unjoin failed: RuntimeError('HA unreachable')"])
+
+    def test_a_failed_radio_after_the_unjoin_logs_a_warning(self):
+        app = self.app("idle", self.GROUP)
+        app.fail_services = {"media_player/play_media"}
+        tap(app)
+        run_later(app)
+        self.assertEqual([call for call, _ in app.calls], ["media_player/unjoin"])
+        self.assertEqual(self.warnings(app), ["media_player/play_media failed: RuntimeError('HA unreachable')"])
+
+    def test_a_speaker_that_cannot_be_read_gets_the_radio_and_a_warning(self):
+        app = self.app("playing", [SPEAKER])
+
+        def broken(entity, **kw):
+            raise RuntimeError("no state")
+
+        app.get_state = broken
+        tap(app)
+        self.assertEqual(app.calls, [self.PLAY_RADIO])
+        self.assertEqual(len(self.warnings(app)), 1)
+        self.assertIn(f"Read of {SPEAKER} failed", self.warnings(app)[0])
+
+    def test_the_event_the_speaker_and_the_radio_are_from_the_yaml(self):
+        app = make_app({"media_player.den": full("idle", {"group_members": ["media_player.den"]})},
+                       play_event="esphome.den_play", speaker="media_player.den", radio="http://example.test/stream")
+        self.assertIn(("_on_play", "esphome.den_play"), app.events)
+        self.assertNotIn(("_on_play", "esphome.bathroom_display_play"), app.events)
+        app._on_play("esphome.den_play", {}, {})
+        self.assertEqual(app.calls, [("media_player/play_media", {
+            "entity_id": "media_player.den", "media_content_id": "http://example.test/stream",
+            "media_content_type": "music"})])
+
+
 class ConfigTests(unittest.TestCase):
     def test_the_yaml_names_the_module_and_class(self):
         self.assertEqual((CONFIG["module"], CONFIG["class"]), ("bathroom_display", "BathroomDisplay"))
@@ -917,6 +1382,14 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((app.rssi_min, app.rssi_fresh), (bd.RSSI_MIN, timedelta(seconds=bd.RSSI_FRESH_S)))
         self.assertEqual(app.transit_max_age, timedelta(minutes=bd.TRANSIT_MAX_AGE_MIN))
         self.assertEqual((CONFIG["mikkel_rssi_min"], CONFIG["rssi_fresh_s"]), (-75, 20))
+        self.assertEqual((app.rise_min, app.rise_db), (bd.RISE_MIN, bd.RISE_DB))
+        self.assertEqual((CONFIG["rssi_rise_min"], CONFIG["rssi_rise_db"]), (-80, 6))
+        self.assertEqual((app.play_event, app.speaker, app.radio), (bd.PLAY_EVENT, bd.SPEAKER, bd.RADIO))
+        self.assertEqual((CONFIG["play_event"], CONFIG["speaker"], CONFIG["radio"]),
+                         ("esphome.bathroom_display_play", "media_player.bathroom", "dr_podcasts://radio/p3"))
+
+    def test_the_history_outlasts_the_baseline_window(self):
+        self.assertGreater(bd.HISTORY_S, bd.BASELINE_FROM_S)
 
 
 if __name__ == "__main__":

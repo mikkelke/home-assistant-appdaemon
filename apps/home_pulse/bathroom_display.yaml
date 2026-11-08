@@ -1,22 +1,29 @@
 # BathroomDisplay - sensor.bathroom_display for the round display in the main bathroom (ESPHome node
 # bathroom-display): off, someone, or mikkel with a greeting and up to three lines (a title, an icon and
-# a due chip each). See bathroom_display.py.
+# a due chip each), and the speaker its play button works. See bathroom_display.py.
 BathroomDisplay:
   module: bathroom_display
   class: BathroomDisplay
   entity: sensor.bathroom_display
   # Occupancy is binary_sensor.<zone>_active (RoomActive); when it has no opinion the display stays as it
   # was. The zone is also the HA area id whose house_upcoming rows are listed after everything due
-  # within 24 hours.
+  # within 7 days.
   zone: bathroom
   # The name in the greeting and the person attribute, and the audience of house_upcoming rows.
   resident: Mikkel
   # The display hears Mikkel's phone as an iBeacon; the sensor turns unknown once it is out of range.
-  # A reading at or above mikkel_rssi_min dBm that is at most rssi_fresh_s seconds old identifies him,
-  # and he stays identified until the room goes inactive. mikkel_rssi_min is provisional until
-  # calibrated from the history of the rssi sensor on the mounted display.
+  # A reading that is at most rssi_fresh_s seconds old identifies him when it is at or above
+  # mikkel_rssi_min dBm (near), or at or above rssi_rise_min dBm and at least rssi_rise_db dB above the
+  # phone's baseline, its level before the visit (rise). The baseline is the median of the phone's
+  # readings from BASELINE_FROM_S (120) down to BASELINE_TO_S (15) seconds before the visit started,
+  # -100 dBm when it was not heard then, and holds for the visit: a phone that was already as loud, from
+  # a room next door, is not a rise.
+  # He stays identified until the room goes inactive. In the bathroom his phone mostly reads -76 to -84;
+  # the bedroom next door reaches -76, which a fixed threshold under -75 cannot tell apart.
   rssi_entity: sensor.bathroom_display_mikkel_phone_rssi
   mikkel_rssi_min: -75
+  rssi_rise_min: -80
+  rssi_rise_db: 6
   rssi_fresh_s: 20
   upcoming_entity: sensor.house_upcoming
   # While Mikkel's sleep mode is on the display stays off in an active room, unless the main spots are on:
@@ -31,3 +38,9 @@ BathroomDisplay:
     - {entity: sensor.transit_enghave_metro_kbh, label: Metro}
     - {entity: sensor.transit_carlsberg_stog_kbh, label: S-tog}
   transit_max_age_min: 45
+  # The display fires play_event when its round play button is tapped. The speaker then pauses if it is
+  # playing, plays on if it is paused and otherwise starts radio as music, after leaving its group first
+  # when it is grouped with another speaker.
+  play_event: esphome.bathroom_display_play
+  speaker: media_player.bathroom
+  radio: "dr_podcasts://radio/p3"

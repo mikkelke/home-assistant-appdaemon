@@ -1,15 +1,18 @@
-"""BathroomDisplay - what the round display in the main bathroom (ESPHome node bathroom-display) shows.
+"""BathroomDisplay - what the round display in the main bathroom (ESPHome node bathroom-display) shows, and the
+speaker its play button works.
 
 Publishes sensor.bathroom_display, the one entity the display reads:
     state       "off" (the bathroom is not active), "someone" (active, Mikkel not identified yet) or
-                "mikkel" (active, and his phone has been near during this visit)
+                "mikkel" (active, and his phone has been near or has risen during this visit)
     attributes  every value a string, since AppDaemon 4.5.13's set_state drops None, False and 0:
         reason      why, in RoomActive's style: "inactive:binary_sensor.bathroom_active"; "unknown:..."
                     for a first evaluation room_active_read has no opinion on;
                     "sleep:input_boolean.mikkel_sleep_mode" for an active room kept dark; while active
                     "active:binary_sensor.bathroom_active phone:near", the word being the phone's status:
-                    near, weak (under mikkel_rssi_min), stale (older than rssi_fresh_s) or none (no
-                    reading), or held for a mikkel whose phone is not near right now
+                    near (at or above mikkel_rssi_min), rise (under it, but at or above rssi_rise_min and
+                    rssi_rise_db dB above the phone's baseline), weak (neither), stale (older than
+                    rssi_fresh_s) or none (no reading), or held for a mikkel whose phone is neither near
+                    nor rising right now
         person      "mikkel" for state mikkel, else ""
         greeting    "Hej Mikkel" for state mikkel, else ""
         line1..3    the title of each line, at most LINE_MAX characters; "" when unused
@@ -23,10 +26,21 @@ Publishes sensor.bathroom_display, the one entity the display reads:
 The state is next_state(). Occupancy is room_active_read.active(), never a raw presence sensor, and False is
 off at once. In an active room Mikkel is identified when the latest reading of his phone - the iBeacon the
 display hears, sensor.bathroom_display_mikkel_phone_rssi, which reads unknown (NaN on the device) once the
-phone is out of range - is a number at or above mikkel_rssi_min dBm and was updated at most rssi_fresh_s
-seconds ago. From then on he stays identified for as long as the room stays active, whatever the phone does.
+phone is out of range - is a number that was updated at most rssi_fresh_s seconds ago and is
+    near  at or above mikkel_rssi_min dBm, or
+    rise  at or above rssi_rise_min dBm and at least rssi_rise_db dB above the phone's baseline.
+From then on he stays identified for as long as the room stays active, whatever the phone does.
 No opinion on the room (None) changes nothing, the state, reason and lines staying as they were; before
 there is a state it is off.
+
+The baseline is how loud the phone was before the visit, which tells a phone that has just come into the
+bathroom from one that sits at the same level in a room next door: the median of its readings that were
+updated from BASELINE_FROM_S (120) down to BASELINE_TO_S (15) seconds before the visit started, or UNHEARD
+(-100 dBm) when it was not heard then. A visit starts at the evaluation where the state leaves off (or has no
+value yet) for an active room: the room becoming active, the main spots coming on in sleep mode (below) or
+the app starting in an active room. The baseline is worked out there and holds for the whole visit. For it
+the app keeps the numeric readings of the phone's last HISTORY_S seconds, one for each last_updated, from the
+snapshot at initialize and from every callback.
 
 While Mikkel's sleep mode (sleep_entity) is on, an active room stays off unless the main spots (light_entity)
 are on. The lights app never switches them on automatically in sleep mode, so they are on only because
@@ -37,13 +51,13 @@ The lines for Mikkel, at most three:
              and whose data is at most transit_max_age_min old: the first upcoming cancelled departure
              ("S-tog: cancelled 07:42"), else the first late one ("S-tog: 07:42 +12 min"), else the status.
     rows     from sensor.house_upcoming while its lease (`expires`) holds, never a row that asks the next
-             chip to pass it over or names other people. First what is due by 24 hours from now, earliest
-             first: a row timed in the past or inside 24 hours, a one-off task that lost its time on its
-             day ("Due dd.mm" info) and a calendar plant that is due ("due today", "due since dd.mm"
-             detail). Then the rows of the zone's own area (the zone doubles as the HA area id) timed
-             within 14 days. A line is the row's title, cut back to a whole word and ended in "..." when
-             it is longer than LINE_MAX; its due chip counts house days. A row with no day (an offline
-             battery, a dry sensor plant) is never a line.
+             chip to pass it over or names other people. First what is due by 7 days from now, earliest
+             first: a row timed in the past or inside 7 days, a one-off task that lost its time on its
+             day ("Due dd.mm" info), a calendar plant that is due ("due today", "due since dd.mm"
+             detail) and any other row with no time (an offline battery, a dry sensor plant), which is
+             due now, as it is on the dashboard. Then the rows of the zone's own area (the zone doubles
+             as the HA area id) timed within 14 days. A line is the row's title, cut back to a whole word
+             and ended in "..." when it is longer than LINE_MAX; its due chip counts house days.
 
 State acquisition follows HouseUpcoming: one snapshot of each source at initialize, then
 listen_state(attribute="all"), and a value from a callback is never replaced by a later read, because
@@ -52,9 +66,17 @@ late callback or a stale snapshot does not look new. Every TICK_S seconds everyt
 is how a reading that stops coming, a lease that runs out, an old transit report and a due chip that rolls
 over reach the display; the result is published only when it differs from the last one published, and always
 on plugin_started, since HA forgets a set_state entity when it restarts.
+
+The play button: the display fires the HA event play_event (esphome.bathroom_display_play) when its round
+button is tapped. The app then reads the speaker (media_player.bathroom) afresh and play_action() decides: a
+speaker that is playing is paused and one that is paused plays on; anything else (idle, off, standby,
+unavailable, unreadable) starts `radio` (dr_podcasts://radio/p3) as music, and a speaker whose group_members
+holds more than one member first leaves its group (media_player/unjoin) and starts the radio a second later
+(RADIO_DELAY_S). A tap logs one line, and a service call that fails logs a warning.
 """
 
 import re
+import statistics
 from datetime import date, datetime, timedelta
 from typing import NamedTuple
 
@@ -71,15 +93,27 @@ LINES = 3
 RESIDENT = "Mikkel"
 ZONE = "bathroom"
 RSSI_MIN = -75.0
+RISE_MIN = -80.0
+RISE_DB = 6.0
+UNHEARD = -100.0
+BASELINE_FROM_S = 120
+BASELINE_TO_S = 15
+HISTORY_S = 180
 RSSI_FRESH_S = 20.0
+IDENTIFIED = ("near", "rise")
 TRANSIT_MAX_AGE_MIN = 45.0
 LATE_MIN = 10
-SOON = timedelta(hours=24)
+SOON = timedelta(days=7)
 AHEAD = timedelta(days=14)
 BAD_STATUS = ("Delayed", "Disrupted")
 ICON = "mdi:monitor-dashboard"
 TRANSIT_ICON = "mdi:train"
 ICON_MAX = 80
+PLAY_EVENT = "esphome.bathroom_display_play"
+SPEAKER = "media_player.bathroom"
+RADIO = "dr_podcasts://radio/p3"
+RADIO_TYPE = "music"
+RADIO_DELAY_S = 1
 
 _DUE_INFO = re.compile(r"Due (\d\d)\.(\d\d)(?:\.(\d\d))?")
 _DUE_DETAIL = re.compile(r"due (?:today|since (\d\d)\.(\d\d)(?:\.(\d\d))?)")
@@ -102,27 +136,51 @@ def phone_reading(full):
     return maint.reading(full.get("state")), maint.parse_iso(full.get("last_updated"))
 
 
-def phone_status(value, at, now, rssi_min, fresh):
-    """"none" without a dBm, "stale" once it is older than `fresh` or undated, "weak" under `rssi_min`, else
-    "near"."""
+def remember(history, full, now):
+    """`history` - [(moment of the update, dBm)] - with the reading of the RSSI sensor's state dict `full`
+    added, unless it is not a number, undated or already in it (one update has one last_updated), and
+    whatever is more than HISTORY_S old at `now` dropped."""
+    value, at = phone_reading(full)
+    span = timedelta(seconds=HISTORY_S)
+    kept = [(when, dbm) for when, dbm in history if now - when <= span]
+    if value is not None and at is not None and now - at <= span and all(when != at for when, _ in kept):
+        kept.append((at, value))
+    return kept
+
+
+def baseline_at(history, started):
+    """The phone's baseline for a visit that started at `started`: the median dBm of the readings in `history`
+    that were updated from BASELINE_FROM_S down to BASELINE_TO_S seconds before it, both ends included,
+    UNHEARD when there are none."""
+    oldest, newest = timedelta(seconds=BASELINE_FROM_S), timedelta(seconds=BASELINE_TO_S)
+    levels = [dbm for when, dbm in history if newest <= started - when <= oldest]
+    return statistics.median(levels) if levels else UNHEARD
+
+
+def phone_status(value, at, now, rssi_min, fresh, baseline=None, rise_min=RISE_MIN, rise_db=RISE_DB):
+    """"none" without a dBm, "stale" once it is older than `fresh` or undated, "near" at or above `rssi_min`,
+    "rise" at or above `rise_min` and at least `rise_db` above `baseline` (None: no baseline, so no rise),
+    else "weak"."""
     if value is None:
         return "none"
     if at is None or now - at > fresh:
         return "stale"
-    return "near" if value >= rssi_min else "weak"
+    if value >= rssi_min:
+        return "near"
+    return "rise" if baseline is not None and value >= rise_min and value - baseline >= rise_db else "weak"
 
 
 def next_state(prev, active, status):
     """The state after an evaluation: `prev` is the one before it (None before the first), `active` what
     room_active_read says (True, False or None) and `status` the phone's. An inactive room is off. In an
-    active one a near phone identifies Mikkel, who then stays identified, whatever the phone does, for as
-    long as the room stays active; until then it is someone. No opinion on the room keeps `prev`, which is
-    off before there is one."""
+    active one a phone that is near or has risen identifies Mikkel, who then stays identified, whatever the
+    phone does, for as long as the room stays active; until then it is someone. No opinion on the room keeps
+    `prev`, which is off before there is one."""
     if active is None:
         return prev or "off"
     if not active:
         return "off"
-    return "mikkel" if prev == "mikkel" or status == "near" else "someone"
+    return "mikkel" if prev == "mikkel" or status in IDENTIFIED else "someone"
 
 
 def kept_dark(sleep_state, light_state):
@@ -133,12 +191,12 @@ def kept_dark(sleep_state, light_state):
 
 def reason_text(active_entity, active, state, status):
     """Why `state`, in RoomActive's style. While active it names the phone's status; a mikkel whose phone is
-    not near right now is "held"."""
+    neither near nor rising right now is "held"."""
     if active is None:
         return f"unknown:{active_entity}"
     if not active:
         return f"inactive:{active_entity}"
-    word = "held" if state == "mikkel" and status != "near" else status
+    word = "held" if state == "mikkel" and status not in IDENTIFIED else status
     return f"active:{active_entity} phone:{word}"
 
 
@@ -211,19 +269,20 @@ def _day(match, today):
 def due_at(row, now):
     """When `row` is due: its `at`; else, for a Done task that has lost its time on the day it is due, that day
     at maint.DUE_TIME - a one-off task's "Due dd.mm" info line (upcoming_once) or a calendar plant's "due
-    today" / "due since dd.mm" detail (upcoming_plants). None for a row with no day."""
+    today" / "due since dd.mm" detail (upcoming_plants); else `now`, since the dashboard counts a row with no
+    time as due now (an offline battery, a dry sensor plant)."""
     at = maint.parse_iso(row.get("at"))
     if at is not None:
         return at
     if row.get("done") != "tap":
-        return None
+        return now
     info = row.get("info") if isinstance(row.get("info"), list) else []
     for text, pattern in [(line, _DUE_INFO) for line in info] + [(row.get("detail"), _DUE_DETAIL)]:
         match = pattern.fullmatch(text) if isinstance(text, str) else None
         if match:
             day = _day(match, maint.house_date(now))
-            return datetime.combine(day, maint.DUE_TIME, maint.HOUSE_TZ) if day else None
-    return None
+            return datetime.combine(day, maint.DUE_TIME, maint.HOUSE_TZ) if day else now
+    return now
 
 
 def due_chip(due, now):
@@ -252,14 +311,12 @@ def _icon(row):
 
 def task_lines(rows, now, resident=RESIDENT, area=ZONE, limit=LINES):
     """At most `limit` lines from the house_upcoming rows: what is due by SOON from now (including anything
-    overdue), earliest first, then the rows of `area` due within AHEAD, earliest first."""
+    overdue or due now), earliest first, then the rows of `area` due within AHEAD, earliest first."""
     soon, later = [], []
     for row in rows if isinstance(rows, list) else []:
         if not _wanted(row, resident):
             continue
         due = due_at(row, now)
-        if due is None:
-            continue
         if due <= now + SOON:
             soon.append((due, str(row.get("id")), row))
         elif row.get("area") == area and due <= now + AHEAD:
@@ -279,6 +336,21 @@ def payload(state, reason, resident, lines):
     return attributes
 
 
+# -- the play button ----------------------------------------------------------
+
+
+def play_action(state, group_members):
+    """What a tap of the play button does for a speaker in `state` whose group_members attribute is
+    `group_members`: "pause" while it is playing and "play" while it is paused. Anything else - idle, off,
+    standby, unavailable, unreadable - starts the radio: "radio" at once, or "unjoin_radio" when the speaker is
+    grouped (`group_members` is a list of more than one), so that it plays on its own."""
+    if state == "playing":
+        return "pause"
+    if state == "paused":
+        return "play"
+    return "unjoin_radio" if isinstance(group_members, list) and len(group_members) > 1 else "radio"
+
+
 class BathroomDisplay(hass.Hass):
     def initialize(self):
         a = self.args
@@ -288,28 +360,37 @@ class BathroomDisplay(hass.Hass):
         self.resident = str(a.get("resident", RESIDENT))
         self.rssi_entity = a.get("rssi_entity", "sensor.bathroom_display_mikkel_phone_rssi")
         self.rssi_min = float(a.get("mikkel_rssi_min", RSSI_MIN))
+        self.rise_min = float(a.get("rssi_rise_min", RISE_MIN))
+        self.rise_db = float(a.get("rssi_rise_db", RISE_DB))
         self.rssi_fresh = timedelta(seconds=float(a.get("rssi_fresh_s", RSSI_FRESH_S)))
         self.upcoming_entity = a.get("upcoming_entity", "sensor.house_upcoming")
         self.routes = [(str(route["label"]), route["entity"]) for route in a.get("transit") or []]
         self.transit_max_age = timedelta(minutes=float(a.get("transit_max_age_min", TRANSIT_MAX_AGE_MIN)))
         self.sleep_entity = a.get("sleep_entity", "input_boolean.mikkel_sleep_mode")
         self.light_entity = a.get("light_entity", "light.bathroom_main_lights")
+        self.play_event = a.get("play_event", PLAY_EVENT)
+        self.speaker = a.get("speaker", SPEAKER)
+        self.radio = str(a.get("radio", RADIO))
 
         self._cache = {}
+        self._history = []  # (last_updated, dBm) of the phone's readings of the last HISTORY_S seconds
+        self._baseline = None  # the phone's baseline for the visit under way, set when it starts
         self._current = None  # (state, attributes) as last worked out
         self._published = None  # (state, attributes) as last handed to HA
 
         for entity in self._sources():
-            self._cache[entity] = self._read(entity)
+            self._store(entity, self._read(entity))
             self.listen_state(self._on_source, entity, attribute="all")
         self.listen_state(self._on_active, self.active_entity)
         self.listen_event(self._on_plugin_started, "plugin_started")
+        self.listen_event(self._on_play, self.play_event)
         self.run_every(self._on_tick, f"now+{TICK_S}", TICK_S)
 
         self._evaluate(publish=True)
         self.log(f"BathroomDisplay initialized - {self.entity} from {self.active_entity}, "
-                 f"phone >= {self.rssi_min:g} dBm within {self.rssi_fresh.total_seconds():g} s, "
-                 f"{len(self.routes)} transit routes")
+                 f"phone >= {self.rssi_min:g} dBm, or >= {self.rise_min:g} dBm and {self.rise_db:g} dB over its "
+                 f"baseline, within {self.rssi_fresh.total_seconds():g} s, {len(self.routes)} transit routes, "
+                 f"{self.play_event} works {self.speaker}")
 
     # -- sources --------------------------------------------------------------
 
@@ -325,10 +406,15 @@ class BathroomDisplay(hass.Hass):
             return None
         return full if isinstance(full, dict) else None
 
+    def _store(self, entity, full):
+        self._cache[entity] = full
+        if entity == self.rssi_entity:
+            self._history = remember(self._history, full, self.get_now())
+
     # -- callbacks ------------------------------------------------------------
 
     def _on_source(self, entity, attribute, old, new, kwargs):
-        self._cache[entity] = new if isinstance(new, dict) else None
+        self._store(entity, new if isinstance(new, dict) else None)
         self._evaluate()
 
     def _on_active(self, entity, attribute, old, new, kwargs):
@@ -340,8 +426,34 @@ class BathroomDisplay(hass.Hass):
     def _on_tick(self, kwargs):
         for entity, cached in list(self._cache.items()):
             if cached is None:
-                self._cache[entity] = self._read(entity)
+                self._store(entity, self._read(entity))
         self._evaluate()
+
+    def _on_play(self, event_name, data, kwargs):
+        full = self._read(self.speaker) or {}
+        attrs = full.get("attributes") if isinstance(full.get("attributes"), dict) else {}
+        state = full.get("state")
+        action = play_action(state, attrs.get("group_members"))
+        self.log(f"Play button: {self.speaker} is {state} -> {action}")
+        if action == "pause":
+            self._call("media_player/media_pause", entity_id=self.speaker)
+        elif action == "play":
+            self._call("media_player/media_play", entity_id=self.speaker)
+        elif action == "radio":
+            self._start_radio({})
+        else:
+            self._call("media_player/unjoin", entity_id=self.speaker)
+            self.run_in(self._start_radio, RADIO_DELAY_S)
+
+    def _start_radio(self, kwargs):
+        self._call("media_player/play_media", entity_id=self.speaker, media_content_id=self.radio,
+                   media_content_type=RADIO_TYPE)
+
+    def _call(self, service, **kwargs):
+        try:
+            self.call_service(service, **kwargs)
+        except Exception as e:
+            self.log(f"{service} failed: {e!r}", level="WARNING")
 
     # -- evaluation -----------------------------------------------------------
 
@@ -357,10 +469,13 @@ class BathroomDisplay(hass.Hass):
 
     def _compute(self, prev, active):
         now = self.get_now()
-        value, at = phone_reading(self._cache.get(self.rssi_entity))
-        status = phone_status(value, at, now, self.rssi_min, self.rssi_fresh)
         if active and kept_dark(self._state_of(self.sleep_entity), self._state_of(self.light_entity)):
             return "off", payload("off", f"sleep:{self.sleep_entity}", self.resident, [])
+        if active and prev in (None, "off"):
+            self._baseline = baseline_at(self._history, now)
+        value, at = phone_reading(self._cache.get(self.rssi_entity))
+        status = phone_status(value, at, now, self.rssi_min, self.rssi_fresh, self._baseline, self.rise_min,
+                              self.rise_db)
         state = next_state(prev, active, status)
         reason = reason_text(self.active_entity, active, state, status)
         return state, payload(state, reason, self.resident, self._lines(now) if state == "mikkel" else [])
