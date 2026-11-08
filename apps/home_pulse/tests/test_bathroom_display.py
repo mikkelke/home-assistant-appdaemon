@@ -4,10 +4,13 @@
 # real bathroom_display.yaml, a fake clock and a settable state dict.
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
+import asyncio
 import sys
 import types
 import unittest
 from datetime import date, datetime, timedelta, timezone
+from datetime import time as dtime
+from unittest import mock
 from pathlib import Path
 
 import yaml
@@ -15,6 +18,7 @@ import yaml
 APPS = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(APPS / "home_pulse"))
 sys.path.insert(0, str(APPS / "presence"))
+sys.path.insert(0, str(APPS / "climate"))
 _hassapi = types.ModuleType("appdaemon.plugins.hass.hassapi")
 _hassapi.Hass = object
 for _name, _mod in (
@@ -30,6 +34,7 @@ import upcoming_core as core  # noqa: E402
 import upcoming_maint as maint  # noqa: E402
 import upcoming_once as once  # noqa: E402
 import upcoming_plants as plants  # noqa: E402
+import upcoming_rain as rain  # noqa: E402
 
 CONFIG = yaml.safe_load((APPS / "home_pulse" / "bathroom_display.yaml").read_text())["BathroomDisplay"]
 HOUSE = maint.HOUSE_TZ
@@ -47,6 +52,13 @@ METRO, STOG = (route["entity"] for route in CONFIG["transit"])
 SLEEP = CONFIG["sleep_entity"]
 LIGHT = CONFIG["light_entity"]
 SPEAKER = CONFIG["speaker"]
+MEASURED = CONFIG["measured_entity"]
+WEIGHT = CONFIG["weight_entity"]
+FAT = CONFIG["body_fat_entity"]
+PIEZO = CONFIG["rain_entity"]
+WEATHER = CONFIG["weather_entity"]
+ALARM = CONFIG["alarm_entity"]
+ALARM_TIME = CONFIG["alarm_time_entity"]
 
 
 def iso(moment):
@@ -85,9 +97,9 @@ def dry_plant(name="Philodendron", area="dining_room", now=NOW):
     return plants.plant_row(entity, plant, {"since": core.utc_iso(now)}, 20.0)[0]
 
 
-def departure(minutes, scheduled, delay=0, cancelled=False):
+def departure(minutes, scheduled, delay=0, cancelled=False, now=NOW):
     """A departure as TransitStatus publishes it: on time and not cancelled leave out delay_min and cancelled."""
-    dep = {"ts": int((NOW + minutes * MIN).timestamp()), "time": scheduled, "line": "A", "scheduled_time": scheduled}
+    dep = {"ts": int((now + minutes * MIN).timestamp()), "time": scheduled, "line": "A", "scheduled_time": scheduled}
     if delay:
         dep["delay_min"] = delay
     if cancelled:
@@ -106,10 +118,41 @@ def upcoming(rows, expires=NOW + 10 * MIN):
 
 def attrs_of(**overrides):
     base = {"friendly_name": "Bathroom display", "icon": "mdi:monitor-dashboard", "reason": "", "person": "",
-            "greeting": ""}
+            "greeting": "", "night": ""}
     for number in (1, 2, 3):
         base.update({f"line{number}": "", f"icon{number}": "", f"due{number}": ""})
     return {**base, **overrides}
+
+
+def utc(hour, minute=0, day=5):
+    return datetime(2026, 11, day, hour, minute, tzinfo=timezone.utc)
+
+
+def entries(*hours):
+    """Hourly forecast entries as weather.get_forecasts gives them, from (hour start, mm) pairs."""
+    return [{"datetime": iso(start), "precipitation": mm, "temperature": 7.0, "condition": "cloudy"}
+            for start, mm in hours]
+
+
+def forecast_hours(*hours):
+    return rain.forecast_hours(entries(*hours))
+
+
+def weather_answer(*hours):
+    """The envelope AppDaemon's call_service hands over for weather.get_forecasts."""
+    return {"id": 9, "type": "result", "success": True, "result": {"context": {"id": "c"}, "response": {
+        WEATHER: {"forecast": entries(*hours)}}}}
+
+
+def stat_row(start, mean):
+    return {"start": iso(start), "end": iso(start + HOUR), "mean": mean}
+
+
+def stats_answer(weight_rows, fat_rows):
+    """The envelope AppDaemon's call_service hands over for recorder.get_statistics."""
+    return {"id": 7, "type": "result", "success": True, "result": {
+        "context": {"id": "c", "parent_id": None, "user_id": "u"},
+        "response": {"statistics": {WEIGHT: weight_rows, FAT: fat_rows}}}}
 
 
 class PhoneTests(unittest.TestCase):
@@ -576,18 +619,409 @@ class PlayActionTests(unittest.TestCase):
                 self.assertEqual(bd.play_action(state, self.GROUP + ["media_player.living_room"]), "unjoin_radio")
 
 
+class WindowTests(unittest.TestCase):
+    def test_the_rain_window_is_06_to_12_in_house_time(self):
+        cases = ((house(11, 5, 5, 59), False), (datetime(2026, 11, 5, 5, 59, 59, tzinfo=HOUSE), False),
+                 (house(11, 5, 6, 0), True), (house(11, 5, 11, 59), True),
+                 (datetime(2026, 11, 5, 11, 59, 59, tzinfo=HOUSE), True), (house(11, 5, 12, 0), False),
+                 (house(11, 5, 0, 0), False), (house(11, 5, 20, 0), False))
+        for moment, expected in cases:
+            with self.subTest(moment=moment):
+                self.assertEqual(bd.in_window(moment, bd.RAIN_FROM, bd.RAIN_TO), expected)
+
+    def test_the_alarm_window_is_20_to_02_in_house_time_through_midnight(self):
+        cases = ((house(11, 5, 19, 59), False), (datetime(2026, 11, 5, 19, 59, 59, tzinfo=HOUSE), False),
+                 (house(11, 5, 20, 0), True), (house(11, 5, 23, 59), True), (house(11, 6, 0, 0), True),
+                 (house(11, 6, 1, 59), True), (datetime(2026, 11, 6, 1, 59, 59, tzinfo=HOUSE), True),
+                 (house(11, 6, 2, 0), False), (house(11, 6, 6, 0), False), (house(11, 5, 12, 0), False))
+        for moment, expected in cases:
+            with self.subTest(moment=moment):
+                self.assertEqual(bd.in_window(moment, bd.ALARM_FROM, bd.ALARM_TO), expected)
+
+    def test_a_window_is_the_house_clock_in_winter_and_in_summer_time(self):
+        cases = ((datetime(2026, 11, 5, 5, 0, tzinfo=timezone.utc), True), (datetime(2026, 11, 5, 4, 59, tzinfo=timezone.utc), False),
+                 (datetime(2026, 7, 1, 4, 0, tzinfo=timezone.utc), True), (datetime(2026, 7, 1, 3, 59, tzinfo=timezone.utc), False),
+                 (datetime(2026, 7, 1, 10, 0, tzinfo=timezone.utc), False), (datetime(2026, 7, 1, 9, 59, tzinfo=timezone.utc), True))
+        for moment, expected in cases:
+            with self.subTest(moment=moment):
+                self.assertEqual(bd.in_window(moment, bd.RAIN_FROM, bd.RAIN_TO), expected)
+
+
+class WeighingMomentTests(unittest.TestCase):
+    def moment(self, age, previous="2026-11-02T06:47:03+00:00", now=NOW):
+        return bd.weighing_moment(previous, full(iso(now - age)), now)
+
+    def test_a_change_to_a_moment_just_gone_is_a_weighing_at_that_moment(self):
+        self.assertEqual(self.moment(2 * SEC), NOW - 2 * SEC)
+        self.assertEqual(self.moment(0 * SEC), NOW)
+
+    def test_the_moment_may_be_at_most_120_seconds_old(self):
+        self.assertEqual(self.moment(120 * SEC), NOW - 120 * SEC)
+        self.assertIsNone(self.moment(121 * SEC))
+        self.assertIsNone(self.moment(3 * DAY))
+
+    def test_a_moment_still_to_come_is_not_a_weighing(self):
+        self.assertIsNone(self.moment(-1 * SEC))
+
+    def test_the_same_state_again_is_not_one_however_new_its_update(self):
+        recent = iso(NOW - 2 * SEC)
+        self.assertIsNone(bd.weighing_moment(recent, full(recent, updated=NOW), NOW))
+
+    def test_the_first_state_the_app_sees_is_a_change(self):
+        self.assertEqual(bd.weighing_moment(None, full(iso(NOW - 2 * SEC)), NOW), NOW - 2 * SEC)
+
+    def test_a_state_that_is_no_moment_is_not_a_weighing(self):
+        for state in ("unknown", "unavailable", "", None, 5, "73.3"):
+            with self.subTest(state=state):
+                self.assertIsNone(bd.weighing_moment("2026-11-02T06:47:03+00:00", full(state), NOW))
+        for state in (None, {}, "2026-11-05T07:29:58+00:00"):
+            with self.subTest(full=state):
+                self.assertIsNone(bd.weighing_moment(None, state, NOW))
+
+    def test_a_moment_in_another_zone_is_the_same_moment(self):
+        local = (NOW - 5 * SEC).astimezone(HOUSE).isoformat()
+        self.assertEqual(bd.weighing_moment(None, full(local), NOW), NOW - 5 * SEC)
+
+
+class WeighedValueTests(unittest.TestCase):
+    def test_a_reading_updated_with_the_weighing_counts(self):
+        for offset in (0, 1, -1, 30, -30):
+            with self.subTest(offset=offset):
+                self.assertEqual(bd.weighed_value(full("73.3", updated=NOW + offset * SEC), NOW), 73.3)
+
+    def test_a_reading_that_kept_its_old_update_does_not(self):
+        for offset in (31, -31, 3600, 3 * 86400):
+            with self.subTest(offset=offset):
+                self.assertIsNone(bd.weighed_value(full("73.3", updated=NOW - offset * SEC), NOW))
+
+    def test_a_reading_needs_a_number_an_update_and_an_anchor(self):
+        for state in ("unknown", "unavailable", "", None, "nan"):
+            with self.subTest(state=state):
+                self.assertIsNone(bd.weighed_value(full(state), NOW))
+        self.assertIsNone(bd.weighed_value({"state": "73.3"}, NOW))
+        self.assertIsNone(bd.weighed_value(None, NOW))
+        self.assertIsNone(bd.weighed_value(full("73.3"), None))
+
+
+LIVE_STATISTICS = {  # recorder.get_statistics as the websocket answered it, through AppDaemon's call_service
+    "id": 1, "type": "result", "success": True,
+    "result": {"context": {"id": "01M6Y1N7KHT77XK6K4YQ0E3F0Z", "parent_id": None, "user_id": "f4fda494358943beaf8ad2c70db099f8"},
+               "response": {"statistics": {
+                   "sensor.mikkel_body_fat": [
+                       {"start": "2026-10-05T06:00:00+00:00", "end": "2026-10-05T07:00:00+00:00", "mean": 20.1},
+                       {"start": "2026-10-06T06:00:00+00:00", "end": "2026-10-06T07:00:00+00:00", "mean": 19.9},
+                       {"start": "2026-10-08T06:00:00+00:00", "end": "2026-10-08T07:00:00+00:00", "mean": 20.0},
+                       {"start": "2026-10-12T04:00:00+00:00", "end": "2026-10-12T05:00:00+00:00", "mean": 19.6}],
+                   "sensor.mikkel_weight": [
+                       {"start": "2026-10-05T06:00:00+00:00", "end": "2026-10-05T07:00:00+00:00", "mean": 74.3},
+                       {"start": "2026-10-06T06:00:00+00:00", "end": "2026-10-06T07:00:00+00:00", "mean": 74.3},
+                       {"start": "2026-10-08T06:00:00+00:00", "end": "2026-10-08T07:00:00+00:00", "mean": 74.1},
+                       {"start": "2026-10-12T04:00:00+00:00", "end": "2026-10-12T05:00:00+00:00", "mean": 73.9}]}}}}
+
+
+class StatisticsTests(unittest.TestCase):
+    IDS = (WEIGHT, FAT)
+    TARGET = datetime(2026, 10, 9, 17, 0, tzinfo=timezone.utc)
+
+    def test_the_rows_are_under_result_response_and_statistics(self):
+        stats = bd.statistics_rows(LIVE_STATISTICS)
+        self.assertEqual(set(stats), {WEIGHT, FAT})
+        self.assertEqual(len(stats[WEIGHT]), 4)
+
+    def test_other_shapes_have_no_rows(self):
+        for resp in (None, {}, [], "x", 5, {"result": None}, {"result": {"response": []}}, {"result": {"response": {"statistics": []}}}):
+            with self.subTest(resp=resp):
+                self.assertEqual(bd.statistics_rows(resp), {})
+
+    def test_an_answer_without_the_websocket_envelope_is_read_too(self):
+        self.assertEqual(set(bd.statistics_rows({"statistics": {WEIGHT: [], FAT: []}})), {WEIGHT, FAT})
+        self.assertEqual(set(bd.statistics_rows({"response": {"statistics": {WEIGHT: []}}})), {WEIGHT})
+
+    def test_the_nearest_hour_is_taken_from_the_live_shape(self):
+        self.assertEqual(bd.before_values(LIVE_STATISTICS, self.IDS, self.TARGET), (74.1, 20.0))
+        self.assertEqual(bd.before_values(LIVE_STATISTICS, self.IDS, datetime(2026, 10, 11, 9, 0, tzinfo=timezone.utc)),
+                         (73.9, 19.6))
+
+    def test_a_row_is_taken_within_three_days_and_not_beyond(self):
+        target = utc(7)
+        for offset, expected in ((timedelta(days=3), True), (-timedelta(days=3), True),
+                                 (timedelta(days=3, minutes=1), False), (-timedelta(days=3, minutes=1), False)):
+            with self.subTest(offset=offset):
+                resp = stats_answer([stat_row(target + offset, 74.0)], [stat_row(target + offset, 20.0)])
+                self.assertEqual(bd.before_values(resp, self.IDS, target), (74.0, 20.0) if expected else None)
+
+    def test_the_nearest_wins_and_a_tie_goes_to_the_earlier_hour(self):
+        target = utc(7)
+        rows = [stat_row(target - 2 * DAY, 75.0), stat_row(target + DAY, 74.0), stat_row(target + 2 * DAY, 73.0)]
+        fat = [stat_row(row_start, 20.0) for row_start in (target - 2 * DAY, target + DAY, target + 2 * DAY)]
+        self.assertEqual(bd.before_values(stats_answer(rows, fat), self.IDS, target), (74.0, 20.0))
+        tie = stats_answer([stat_row(target - DAY, 75.0), stat_row(target + DAY, 74.0)],
+                           [stat_row(target - DAY, 21.0), stat_row(target + DAY, 20.0)])
+        self.assertEqual(bd.before_values(tie, self.IDS, target), (75.0, 21.0))
+
+    def test_only_an_hour_both_sensors_have_counts(self):
+        target = utc(7)
+        resp = stats_answer([stat_row(target - HOUR, 75.0), stat_row(target + DAY, 74.0)],
+                            [stat_row(target + DAY, 20.0)])
+        self.assertEqual(bd.before_values(resp, self.IDS, target), (74.0, 20.0))
+        self.assertIsNone(bd.before_values(stats_answer([stat_row(target, 75.0)], []), self.IDS, target))
+        self.assertIsNone(bd.before_values(stats_answer([], [stat_row(target, 20.0)]), self.IDS, target))
+
+    def test_a_row_needs_a_start_and_a_mean(self):
+        target = utc(7)
+        bad = [{"start": iso(target), "mean": None}, {"start": iso(target), "mean": "unknown"},
+               {"start": "soon", "mean": 74.0}, {"mean": 74.0}, {"start": iso(target)}, "row", None,
+               {"start": iso(target), "mean": float("nan")}]
+        self.assertIsNone(bd.before_values(stats_answer(bad, bad), self.IDS, target))
+        mixed = stats_answer(bad + [stat_row(target + HOUR, 74.0)], bad + [stat_row(target + HOUR, 20.0)])
+        self.assertEqual(bd.before_values(mixed, self.IDS, target), (74.0, 20.0))
+
+    def test_nothing_is_none(self):
+        for resp in (None, {}, stats_answer([], []), {"result": {"response": {"statistics": {}}}},
+                     stats_answer("rows", "rows")):
+            with self.subTest(resp=resp):
+                self.assertIsNone(bd.before_values(resp, self.IDS, utc(7)))
+
+
+class WeighingTextTests(unittest.TestCase):
+    def test_a_value_has_one_decimal_and_a_decimal_comma(self):
+        for value, text in ((73.3, "73,3"), (73.0, "73,0"), (20, "20,0"), (19.96, "20,0"), (100.04, "100,0")):
+            with self.subTest(value=value):
+                self.assertEqual(bd.kg_text(value), text)
+
+    def test_a_change_of_at_most_0_3_kg_either_way_reads_plus_minus_zero(self):
+        for delta in (0, 0.1, -0.1, 0.2999, -0.2999, 0.3, -0.3, 14.82 - 14.52, 14.52 - 14.82, 74.1 * 0.2 - 73.8 * 0.2):
+            with self.subTest(delta=delta):
+                self.assertEqual(bd.change_text(delta), "±0")
+
+    def test_a_bigger_change_has_its_sign_and_one_decimal(self):
+        cases = ((0.31, "+0,3"), (-0.31, "−0,3"), (0.4, "+0,4"), (-0.4335, "−0,4"), (0.1335 + 0.2, "+0,3"), (2.0, "+2,0"),
+                 (-0.64, "−0,6"), (-12.34, "−12,3"))
+        for delta, text in cases:
+            with self.subTest(delta=delta):
+                self.assertEqual(bd.change_text(delta), text)
+
+    def test_a_fall_is_written_with_a_true_minus_sign(self):
+        text = bd.change_text(-0.64)
+        self.assertEqual(text[0], "−")
+        self.assertNotIn("-", text)
+
+
+class WeighingLinesTests(unittest.TestCase):
+    def test_the_card_has_the_weight_and_fat_then_the_change_in_fat_and_in_the_rest(self):
+        lines = bd.weighing_lines(73.6, 21.0, (73.0, 22.0))
+        self.assertEqual(lines, [bd.Line("73,6 kg · 21,0 % fedt", "mdi:scale-bathroom", "73,6 kg"),
+                                 bd.Line("Fedt 30 d: −0,6 kg", "mdi:water-percent", "−0,6 kg"),
+                                 bd.Line("Fedtfri 30 d: +1,2 kg", "mdi:arm-flex", "+1,2 kg")])
+
+    def test_fat_mass_is_weight_times_fat_percentage_and_the_rest_is_what_is_left(self):
+        [_, fat, rest] = bd.weighing_lines(80.0, 25.0, (82.0, 30.0))  # 20 kg and 60 kg now, 24.6 kg and 57.4 kg then
+        self.assertEqual((fat.text, rest.text), ("Fedt 30 d: −4,6 kg", "Fedtfri 30 d: +2,6 kg"))
+
+    def test_changes_inside_the_dead_band_read_plus_minus_zero(self):
+        [_, fat, rest] = bd.weighing_lines(73.3, 20.0, (73.3, 20.0))
+        self.assertEqual((fat.text, rest.text), ("Fedt 30 d: ±0 kg", "Fedtfri 30 d: ±0 kg"))
+        self.assertEqual((fat.due, rest.due), ("±0 kg", "±0 kg"))
+
+    def test_the_dead_band_is_for_each_change_alone(self):
+        [_, fat, rest] = bd.weighing_lines(73.3, 20.0, (74.1, 20.0))
+        self.assertEqual((fat.text, rest.text), ("Fedt 30 d: ±0 kg", "Fedtfri 30 d: −0,6 kg"))
+
+    def test_without_a_row_to_compare_with_only_the_first_line_shows(self):
+        self.assertEqual(bd.weighing_lines(73.3, 20.0, None),
+                         [bd.Line("73,3 kg · 20,0 % fedt", "mdi:scale-bathroom", "73,3 kg")])
+
+    def test_without_a_fat_percentage_it_is_the_weight_alone(self):
+        for before in (None, (74.1, 20.0)):
+            with self.subTest(before=before):
+                self.assertEqual(bd.weighing_lines(73.3, None, before),
+                                 [bd.Line("73,3 kg", "mdi:scale-bathroom", "73,3 kg")])
+
+    def test_every_line_fits(self):
+        for line in bd.weighing_lines(123.4, 45.6, (65.4, 12.3)):
+            self.assertLessEqual(len(line.text), bd.LINE_MAX)
+            self.assertLessEqual(len(line.due), 8)
+
+
+class ForecastRunTests(unittest.TestCase):
+    def run_of(self, *hours, now=NOW):
+        return bd.forecast_run(forecast_hours(*hours), now)
+
+    def test_the_run_is_from_the_start_of_its_first_hour_to_the_end_of_its_last(self):
+        self.assertEqual(self.run_of((utc(8), 0.0), (utc(9), 0.6), (utc(10), 0.4), (utc(11), 0.0), (utc(12), 2.0)),
+                         (utc(9), utc(11)))
+
+    def test_an_hour_that_is_going_on_counts_and_one_that_is_over_does_not(self):
+        self.assertEqual(self.run_of((utc(7), 0.5), (utc(8), 0.5)), (utc(7), utc(9)))
+        self.assertIsNone(self.run_of((utc(6), 5.0), (utc(7), 0.0)))
+        self.assertEqual(self.run_of((utc(6), 5.0), (utc(7), 0.0), (utc(8), 1.0)), (utc(8), utc(9)))
+
+    def test_a_run_has_to_start_within_the_next_four_hours(self):
+        self.assertEqual(self.run_of((utc(11), 0.5)), (utc(11), utc(12)))  # 11:00 is before 11:30
+        self.assertIsNone(self.run_of((utc(12), 0.5)))
+        self.assertIsNone(self.run_of((utc(8), 0.0), (utc(11), 0.0), (utc(12), 3.0)))
+        self.assertIsNone(self.run_of((utc(11), 0.5), now=utc(7)))  # 11:00 is four hours from 07:00
+        self.assertEqual(self.run_of((utc(10), 0.5), now=utc(7)), (utc(10), utc(11)))
+
+    def test_a_hour_needs_the_least_rain_the_station_counts(self):
+        self.assertEqual(self.run_of((utc(9), rain.MIN_MM)), (utc(9), utc(10)))
+        self.assertIsNone(self.run_of((utc(9), rain.MIN_MM - 0.01)))
+        self.assertEqual(self.run_of((utc(9), 0.29), (utc(10), 0.3)), (utc(10), utc(11)))
+
+    def test_a_dry_hour_or_a_missing_one_ends_the_run(self):
+        self.assertEqual(self.run_of((utc(8), 0.5), (utc(9), 0.0), (utc(10), 0.5)), (utc(8), utc(9)))
+        self.assertEqual(self.run_of((utc(8), 0.5), (utc(10), 0.5)), (utc(8), utc(9)))
+        self.assertEqual(self.run_of((utc(8), 0.5), (utc(9), 0.5), (utc(11), 0.5)), (utc(8), utc(10)))
+
+    def test_a_run_goes_on_past_the_four_hours_when_the_forecast_says_so(self):
+        self.assertEqual(self.run_of((utc(10), 0.5), (utc(11), 0.5), (utc(12), 0.5), (utc(13), 0.5), (utc(14), 0.0)),
+                         (utc(10), utc(14)))
+
+    def test_an_hour_without_a_precipitation_figure_is_dry(self):
+        hours = rain.forecast_hours([{"datetime": iso(utc(9)), "precipitation": None},
+                                     {"datetime": iso(utc(10))}, {"datetime": iso(utc(11)), "precipitation": 1.0}])
+        self.assertEqual(bd.forecast_run(hours, NOW), (utc(11), utc(12)))
+
+    def test_no_hours_no_run(self):
+        self.assertIsNone(bd.forecast_run([], NOW))
+        self.assertIsNone(self.run_of((utc(9), 0.0), (utc(10), 0.0)))
+
+
+class RainLineTests(unittest.TestCase):
+    FETCHED = NOW - 5 * MIN
+
+    def line(self, *hours, raining=False, fetched=FETCHED, now=NOW):
+        return bd.rain_line(raining, forecast_hours(*hours), fetched, now)
+
+    def test_it_raining_now_is_regner_nu_whatever_the_forecast(self):
+        expected = bd.Line("Regner nu", "mdi:weather-rainy", "nu")
+        self.assertEqual(self.line(raining=True), expected)
+        self.assertEqual(self.line((utc(9), 3.0), raining=True), expected)
+        self.assertEqual(bd.rain_line(True, [], None, NOW), expected)
+
+    def test_the_first_run_is_named_by_the_house_hours_it_covers(self):
+        self.assertEqual(self.line((utc(8), 0.6), (utc(9), 0.4)), bd.Line("Regn 09-11", "mdi:weather-rainy", "09-11"))
+        self.assertEqual(self.line((utc(8), 0.6)), bd.Line("Regn 09-10", "mdi:weather-rainy", "09-10"))
+
+    def test_the_hours_have_two_digits(self):
+        self.assertEqual(self.line((utc(5), 0.6), now=utc(4, 30)).text, "Regn 06-07")
+
+    def test_a_run_that_goes_on_past_the_next_four_hours_is_named_by_its_start(self):
+        self.assertEqual(self.line((utc(10), 0.5), (utc(11), 0.5), (utc(12), 0.5), (utc(13), 0.1)),
+                         bd.Line("Regn fra 11", "mdi:weather-rainy", "fra 11"))
+
+    def test_a_run_that_ends_just_as_the_four_hours_do_is_not_one_that_goes_on(self):
+        self.assertEqual(self.line((utc(9), 0.5), (utc(10), 0.5), now=utc(7)).text, "Regn 10-12")
+        self.assertEqual(self.line((utc(10), 0.5), (utc(11), 0.5), now=utc(7)).text, "Regn fra 11")
+
+    def test_no_rain_in_the_next_four_hours_is_no_line(self):
+        self.assertIsNone(self.line((utc(9), 0.0), (utc(10), 0.1)))
+        self.assertIsNone(self.line((utc(12), 5.0)))
+        self.assertIsNone(self.line())
+
+    def test_a_forecast_that_was_not_fetched_or_is_too_old_is_not_used(self):
+        hours = ((utc(9), 1.0),)
+        self.assertEqual(self.line(*hours, fetched=NOW - rain.MAX_AGE).text, "Regn 10-11")
+        self.assertIsNone(self.line(*hours, fetched=NOW - rain.MAX_AGE - SEC))
+        self.assertIsNone(self.line(*hours, fetched=None))
+
+
+class AlarmLineTests(unittest.TestCase):
+    def test_an_alarm_that_is_on_says_when_it_wakes_him(self):
+        self.assertEqual(bd.alarm_line("on", "09:15:00"), bd.Line("Vækker 09:15", "mdi:alarm", "09:15"))
+        self.assertEqual(bd.alarm_line("on", "06:05:00").text, "Vækker 06:05")
+        self.assertEqual(bd.alarm_line("on", "23:59:59").text, "Vækker 23:59")
+
+    def test_an_alarm_that_is_off_says_so(self):
+        for clock in ("09:15:00", None, "unknown"):
+            with self.subTest(clock=clock):
+                self.assertEqual(bd.alarm_line("off", clock), bd.Line("Ingen vækker", "mdi:alarm", "ingen"))
+
+    def test_an_alarm_that_cannot_be_read_is_no_line(self):
+        for armed in ("unknown", "unavailable", "", None, True, "ON"):
+            with self.subTest(armed=armed):
+                self.assertIsNone(bd.alarm_line(armed, "09:15:00"))
+
+    def test_a_time_that_cannot_be_read_leaves_the_time_out(self):
+        for clock in ("unknown", "unavailable", "", None, "soon", 915):
+            with self.subTest(clock=clock):
+                self.assertEqual(bd.alarm_line("on", clock), bd.Line("Vækker", "mdi:alarm", ""))
+
+    def test_the_texts_fit_the_line(self):
+        for line in (bd.alarm_line("on", "09:15:00"), bd.alarm_line("off", None)):
+            self.assertLessEqual(len(line.text), bd.LINE_MAX)
+
+
+class WeighedStateTests(unittest.TestCase):
+    def test_a_weighing_identifies_him_whatever_the_phone_says(self):
+        for prev in (None, "off", "someone", "mikkel"):
+            for status in ("none", "stale", "weak", "near", "rise"):
+                with self.subTest(prev=prev, status=status):
+                    self.assertEqual(bd.next_state(prev, True, status, weighed=True), "mikkel")
+
+    def test_a_weighing_makes_no_difference_to_an_empty_room_or_no_opinion_on_it(self):
+        self.assertEqual(bd.next_state("mikkel", False, "none", weighed=True), "off")
+        self.assertEqual(bd.next_state("someone", None, "none", weighed=True), "someone")
+        self.assertEqual(bd.next_state(None, None, "none", weighed=True), "off")
+
+    def test_it_is_not_weighed_unless_told(self):
+        self.assertEqual(bd.next_state("someone", True, "weak"), "someone")
+        self.assertEqual(bd.next_state("someone", True, "weak", weighed=False), "someone")
+
+
+class NightPayloadTests(unittest.TestCase):
+    def test_night_is_on_or_empty_in_every_state(self):
+        for state in ("off", "someone", "mikkel"):
+            with self.subTest(state=state):
+                self.assertEqual(bd.payload(state, "r", "Mikkel", [], night=True)["night"], "on")
+                self.assertEqual(bd.payload(state, "r", "Mikkel", [], night=False)["night"], "")
+                self.assertEqual(bd.payload(state, "r", "Mikkel", [])["night"], "")
+
+    def test_lines_are_kept_whatever_the_state(self):
+        line = bd.Line("Vækker 09:15", "mdi:alarm", "09:15")
+        self.assertEqual(bd.payload("someone", "r", "Mikkel", [line], night=True),
+                         attrs_of(reason="r", night="on", line1="Vækker 09:15", icon1="mdi:alarm", due1="09:15"))
+
+
 def room(state):
     return full(state, {"stale": "false"})
 
 
+def maybe_async(value):
+    """`value`, or an awaitable of it inside a running event loop: AppDaemon's API answers the way it is called,
+    from a worker thread or from the loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return value
+
+    async def wrap():
+        return value
+
+    return wrap()
+
+
+MADE = []
+
+
+def tearDownModule():
+    for app in MADE:
+        for task in app.tasks:
+            task.close()
+
+
 def make_app(states=None, active="on", now=NOW, fail=0, **args):
-    """The app after initialize(), the first `fail` publishes of which fail."""
+    """The app after initialize(), the first `fail` publishes of which fail. Its fetches are the coroutines in
+    `tasks`, run by drain(); the answers to them are in `responses`, by service, and the calls that asked for
+    one are in `requests`."""
     app = bd.BathroomDisplay.__new__(bd.BathroomDisplay)
+    MADE.append(app)
     app.args = {**CONFIG, **args}
     app.now = now
     app.states = {ACTIVE: room(active), **(states or {})}
     app.published, app.logs, app.listened, app.events, app.scheduled = [], [], [], [], []
     app.calls, app.later, app.fail_services = [], [], set()
+    app.tasks, app.requests, app.responses, app.hang = [], [], {}, set()
     app.fail_publish = fail
 
     def get_state(entity, attribute=None, **kw):
@@ -607,14 +1041,19 @@ def make_app(states=None, active="on", now=NOW, fail=0, **args):
         app.published.append({"entity": entity, "state": state, "attributes": attributes, "replace": replace})
 
     def call_service(service, **kw):
+        if kw.get("return_response"):
+            app.requests.append((service, kw))
         if service in app.fail_services:
             raise RuntimeError("HA unreachable")
+        if kw.get("return_response"):
+            return asyncio.sleep(3600) if service in app.hang else maybe_async(app.responses.get(service))
         app.calls.append((service, kw))
 
     app.get_state = get_state
     app.set_state = set_state
     app.call_service = call_service
-    app.run_in = lambda callback, delay, **kw: app.later.append((callback, delay, kw))
+    app.run_in = lambda callback, delay, **kw: (app.later.append((callback, delay, kw)), maybe_async("handle"))[1]
+    app.create_task = lambda coro: app.tasks.append(coro)
     app.get_now = lambda: app.now
     app.get_app = lambda name: None
     app.listen_state = lambda callback, entity, **kw: app.listened.append((callback.__name__, entity, kw))
@@ -663,6 +1102,17 @@ def run_later(app):
     pending, app.later = app.later, []
     for callback, _, kw in pending:
         callback(kw)
+
+
+def drain(app):
+    """The fetches create_task was given, run, and then the callbacks they handed their results to."""
+    while app.tasks or any(delay == 0 for _, delay, _ in app.later):
+        while app.tasks:
+            asyncio.run(app.tasks.pop(0))
+        ready = [item for item in app.later if item[1] == 0]
+        app.later = [item for item in app.later if item[1] != 0]
+        for callback, _, kw in ready:
+            callback(kw)
 
 
 def last(app):
@@ -1059,13 +1509,15 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(app.published, [{"entity": "sensor.bathroom_display", "state": "off",
                                           "attributes": attrs_of(reason=f"inactive:{ACTIVE}"), "replace": True}])
 
-    def test_it_listens_to_the_room_the_phone_the_rows_and_mikkels_routes(self):
+    def test_it_listens_to_the_room_the_phone_the_rows_mikkels_routes_the_scale_the_rain_and_the_alarm(self):
         app = make_app()
         self.assertEqual(sorted((entity, kw.get("attribute")) for _, entity, kw in app.listened),
                          sorted([(ACTIVE, None), (RSSI, "all"), (UPCOMING, "all"), (SLEEP, "all"), (LIGHT, "all"),
-                                 (METRO, "all"), (STOG, "all")]))
+                                 (METRO, "all"), (STOG, "all"), (MEASURED, "all"), (WEIGHT, "all"), (FAT, "all"),
+                                 (PIEZO, "all"), (ALARM, "all"), (ALARM_TIME, "all")]))
         self.assertEqual(app.events, [("_on_plugin_started", "plugin_started"),
-                                      ("_on_play", "esphome.bathroom_display_play")])
+                                      ("_on_play", "esphome.bathroom_display_play"),
+                                      ("_on_alarm", "esphome.bathroom_display_alarm")])
         self.assertEqual(app.scheduled, [("_on_tick", "now+10", 10)])
 
     def test_it_publishes_only_when_the_payload_changes(self):
@@ -1210,7 +1662,7 @@ class SleepTests(unittest.TestCase):
     def test_an_active_room_stays_off_in_sleep_mode_even_with_the_phone_near(self):
         app = make_app({SLEEP: full("on"), LIGHT: full("off"), RSSI: full("-60")})
         self.assertEqual(last(app)["state"], "off")
-        self.assertEqual(last(app)["attributes"], attrs_of(reason=self.DARK))
+        self.assertEqual(last(app)["attributes"], attrs_of(reason=self.DARK, night="on"))
 
     def test_the_wall_switch_wakes_it_and_the_visit_starts_again(self):
         app = make_app({SLEEP: full("on"), LIGHT: full("off")})
@@ -1361,6 +1813,599 @@ class PlayButtonTests(unittest.TestCase):
             "media_content_type": "music"})])
 
 
+STATS = "recorder/get_statistics"
+FORECAST = "weather/get_forecasts"
+BLANK = ("", "", "")
+OLD = NOW - 3 * DAY
+
+
+def scale_states():
+    """The scale's three sensors as the weighing before left them."""
+    return {MEASURED: full(iso(OLD), updated=OLD), WEIGHT: full("73.0", updated=OLD), FAT: full("20.2", updated=OLD)}
+
+
+def weigh(app, weight="73.3", fat="20.0", ago=2):
+    """What HA reports for a weighing: the weight, the fat and then the measurement sensor, which holds the moment."""
+    fire(app, WEIGHT, full(weight, updated=app.now))
+    fire(app, FAT, full(fat, updated=app.now))
+    fire(app, MEASURED, full(iso(app.now - ago * SEC), updated=app.now))
+
+
+def thirty_days_ago(app, kg=74.1, fat=20.0):
+    at = app.now - 30 * DAY - HOUR
+    app.responses[STATS] = stats_answer([stat_row(at, kg)], [stat_row(at, fat)])
+
+
+def shown(app):
+    attributes = last(app)["attributes"]
+    return [(attributes[f"line{n}"], attributes[f"icon{n}"], attributes[f"due{n}"]) for n in (1, 2, 3)]
+
+
+def warnings(app):
+    return [msg for level, msg in app.logs if level == "WARNING"]
+
+
+class WeighingFlowTests(unittest.TestCase):
+    """The app runs in the afternoon, which is neither of the windows of the rain and the alarm line."""
+
+    AFTERNOON = house(11, 5, 14, 0)
+    CARD = [("73,3 kg · 20,0 % fedt", "mdi:scale-bathroom", "73,3 kg"),
+            ("Fedt 30 d: ±0 kg", "mdi:water-percent", "±0 kg"),
+            ("Fedtfri 30 d: −0,6 kg", "mdi:arm-flex", "−0,6 kg")]
+    WEIGHT_ONLY = [CARD[0][:0] or ("73,3 kg", "mdi:scale-bathroom", "73,3 kg"), BLANK, BLANK]
+    ROWS = ("Spray the Alocasia", "mdi:spray", "overdue")
+
+    def app(self, states=None, now=AFTERNOON, **kw):
+        rows = upcoming(LineTests.ROWS, expires=now + 10 * MIN)
+        return make_app({**scale_states(), UPCOMING: rows, **(states or {})}, now=now, **kw)
+
+    def test_a_weighing_identifies_him_and_the_card_replaces_his_lines_once_the_statistics_are_in(self):
+        app = self.app()
+        self.assertEqual((last(app)["state"], shown(app)), ("someone", [BLANK] * 3))
+        weigh(app)
+        self.assertEqual(last(app)["state"], "mikkel")
+        self.assertEqual(last(app)["attributes"]["reason"], f"active:{ACTIVE} phone:held")
+        self.assertEqual(shown(app)[0], self.ROWS)
+        thirty_days_ago(app)
+        drain(app)
+        self.assertEqual((last(app)["state"], shown(app)), ("mikkel", self.CARD))
+        self.assertEqual((last(app)["attributes"]["person"], last(app)["attributes"]["greeting"]),
+                         ("mikkel", "Hej Mikkel"))
+
+    def test_the_statistics_are_asked_for_once_with_both_sensors_around_30_days_ago(self):
+        app = self.app()
+        weigh(app)
+        thirty_days_ago(app)
+        drain(app)
+        self.assertEqual(app.requests, [(STATS, {
+            "statistic_ids": [WEIGHT, FAT], "start_time": "2026-10-03T13:00:00+00:00",
+            "end_time": "2026-10-09T13:00:00+00:00", "period": "hour", "types": ["mean"], "return_response": True})])
+        for _ in range(20):
+            tick(app)
+        self.assertEqual((len(app.requests), app.tasks), (1, []))
+
+    def test_the_card_has_the_whole_set_of_lines_the_figures_and_the_change_since_then(self):
+        app = self.app()
+        weigh(app, weight="73.6", fat="21.0")
+        thirty_days_ago(app, kg=73.0, fat=22.0)
+        drain(app)
+        self.assertEqual(shown(app), [("73,6 kg · 21,0 % fedt", "mdi:scale-bathroom", "73,6 kg"),
+                                      ("Fedt 30 d: −0,6 kg", "mdi:water-percent", "−0,6 kg"),
+                                      ("Fedtfri 30 d: +1,2 kg", "mdi:arm-flex", "+1,2 kg")])
+
+    def test_the_card_takes_the_place_of_the_alarm_the_transit_and_the_rows(self):
+        now = house(11, 5, 21, 0)
+        app = self.app({ALARM: full("on"), ALARM_TIME: full("09:15:00"),
+                        STOG: route("Disrupted", [departure(12, "21:12", cancelled=True, now=now)], as_of=now - 2 * MIN)},
+                       now=now)
+        weigh(app)
+        self.assertEqual([line[0] for line in shown(app)], ["Vækker 09:15", "S-tog: cancelled 21:12", "Spray the Alocasia"])
+        thirty_days_ago(app)
+        drain(app)
+        self.assertEqual(shown(app), self.CARD)
+
+    def test_a_morning_weighing_also_asks_for_the_forecast_and_the_card_takes_the_place_of_the_rain(self):
+        app = self.app({PIEZO: full("on"), STOG: route("Disrupted", [departure(12, "08:42", cancelled=True)])}, now=NOW)
+        weigh(app)
+        self.assertEqual([task.cr_code.co_name for task in app.tasks], ["_fetch_comparison"])
+        self.assertEqual([line[0] for line in shown(app)], ["Regner nu", "S-tog: cancelled 08:42", "Spray the Alocasia"])
+        thirty_days_ago(app)
+        drain(app)
+        self.assertEqual(shown(app), self.CARD)
+        fire(app, PIEZO, full("off"))
+        self.assertEqual(app.tasks, [])
+        app.responses[FORECAST] = weather_answer((utc(8), 0.6))
+        app.now += 90 * SEC
+        run_later(app)
+        self.assertEqual([task.cr_code.co_name for task in app.tasks], ["_fetch_forecast"])
+        drain(app)
+        self.assertEqual(shown(app)[0], ("Regn 09-10", "mdi:weather-rainy", "09-10"))
+
+    def test_the_card_ends_90_seconds_after_the_weighing(self):
+        app = self.app()
+        weigh(app)
+        thirty_days_ago(app)
+        drain(app)
+        seen = app.now
+        self.assertEqual([(callback.__name__, delay) for callback, delay, _ in app.later], [("_on_card_end", 90)])
+        tick(app, 89 * SEC)
+        self.assertEqual(shown(app), self.CARD)
+        app.now = seen + 90 * SEC
+        run_later(app)
+        self.assertEqual(shown(app)[0], self.ROWS)
+        self.assertEqual(last(app)["state"], "mikkel")
+
+    def test_the_tick_ends_it_too_when_the_scheduled_end_is_late(self):
+        app = self.app()
+        weigh(app)
+        thirty_days_ago(app)
+        drain(app)
+        tick(app, 90 * SEC)
+        self.assertEqual(shown(app)[0], self.ROWS)
+
+    def test_without_a_row_30_days_ago_only_the_first_line_shows(self):
+        app = self.app()
+        weigh(app)
+        app.responses[STATS] = stats_answer([], [])
+        drain(app)
+        self.assertEqual(shown(app), [self.CARD[0], BLANK, BLANK])
+
+    def test_a_row_further_than_3_days_from_that_day_is_no_row(self):
+        app = self.app()
+        weigh(app)
+        at = app.now - 30 * DAY - 3 * DAY - HOUR
+        app.responses[STATS] = stats_answer([stat_row(at, 74.1)], [stat_row(at, 20.0)])
+        drain(app)
+        self.assertEqual(shown(app), [self.CARD[0], BLANK, BLANK])
+
+    def test_a_fetch_that_fails_or_answers_nonsense_leaves_the_first_line_and_no_more(self):
+        failing = self.app()
+        failing.fail_services = {STATS}
+        weigh(failing)
+        drain(failing)
+        self.assertEqual(shown(failing), [self.CARD[0], BLANK, BLANK])
+        self.assertEqual(warnings(failing), ["Statistics fetch failed: RuntimeError('HA unreachable')"])
+        for answer in (None, {}, {"oops": 1}, "x", stats_answer("rows", None)):
+            with self.subTest(answer=answer):
+                app = self.app()
+                app.responses[STATS] = answer
+                weigh(app)
+                drain(app)
+                self.assertEqual(shown(app), [self.CARD[0], BLANK, BLANK])
+
+    def test_a_fetch_that_hangs_gives_up_after_its_timeout(self):
+        app = self.app()
+        app.hang = {STATS}
+        weigh(app)
+        with mock.patch.object(bd, "FETCH_TIMEOUT_S", 0.01):
+            drain(app)
+        self.assertEqual(shown(app), [self.CARD[0], BLANK, BLANK])
+        self.assertEqual(len(warnings(app)), 1)
+        self.assertIn("Statistics fetch failed", warnings(app)[0])
+
+    def test_the_card_waits_for_the_weight_and_the_fat_the_weighing_took(self):
+        app = self.app()
+        fire(app, MEASURED, full(iso(app.now - 2 * SEC), updated=app.now))
+        thirty_days_ago(app)
+        drain(app)
+        self.assertEqual(shown(app)[0], self.ROWS)
+        fire(app, WEIGHT, full("73.3", updated=app.now))
+        self.assertEqual(shown(app), self.WEIGHT_ONLY)
+        fire(app, FAT, full("20.0", updated=app.now))
+        self.assertEqual(shown(app), self.CARD)
+
+    def test_a_fat_percentage_the_weighing_did_not_update_is_left_out_not_repeated(self):
+        app = self.app()
+        fire(app, WEIGHT, full("73.3", updated=app.now))
+        fire(app, MEASURED, full(iso(app.now - 2 * SEC), updated=app.now))
+        thirty_days_ago(app)
+        drain(app)
+        self.assertEqual(shown(app), self.WEIGHT_ONLY)
+
+    def test_a_fat_reading_that_is_not_a_number_is_left_out_too(self):
+        for fat in ("unknown", "unavailable", ""):
+            with self.subTest(fat=fat):
+                app = self.app()
+                weigh(app, fat=fat)
+                thirty_days_ago(app)
+                drain(app)
+                self.assertEqual(shown(app), self.WEIGHT_ONLY)
+
+    def test_a_weight_the_weighing_did_not_update_makes_no_card(self):
+        app = self.app()
+        fire(app, FAT, full("20.0", updated=app.now))
+        fire(app, MEASURED, full(iso(app.now - 2 * SEC), updated=app.now))
+        thirty_days_ago(app)
+        drain(app)
+        self.assertEqual(shown(app)[0], self.ROWS)
+        self.assertEqual(last(app)["state"], "mikkel")
+
+    def test_a_weighing_while_the_room_is_not_active_is_ignored(self):
+        for active in ("off", "unknown"):
+            with self.subTest(active=active):
+                app = self.app(active=active)
+                weigh(app)
+                self.assertEqual((app.tasks, app.later, last(app)["state"]), ([], [], "off"))
+                self.assertTrue(any("ignored" in msg for _, msg in app.logs))
+                occupy(app, "on")
+                drain(app)
+                self.assertEqual((last(app)["state"], shown(app)), ("someone", [BLANK] * 3))
+
+    def test_a_state_that_comes_back_or_is_old_is_not_a_weighing(self):
+        app = self.app()
+        fire(app, MEASURED, full(app.states[MEASURED]["state"], updated=app.now))
+        fire(app, MEASURED, full(iso(NOW - 2 * DAY), updated=app.now))
+        fire(app, MEASURED, full("unavailable", updated=app.now))
+        fire(app, MEASURED, full(iso(NOW - 2 * DAY), updated=app.now))
+        fire(app, MEASURED, full(iso(NOW - 121 * SEC), updated=app.now))
+        self.assertEqual((app.tasks, app.later, last(app)["state"]), ([], [], "someone"))
+
+    def test_the_same_moment_twice_is_one_weighing(self):
+        app = self.app()
+        weigh(app)
+        fire(app, MEASURED, dict(app.states[MEASURED]))
+        self.assertEqual(len(app.tasks), 1)
+        self.assertEqual(len([item for item in app.later if item[0].__name__ == "_on_card_end"]), 1)
+
+    def test_a_weighing_that_arrives_late_still_counts_up_to_120_seconds(self):
+        app = self.app()
+        weigh(app, ago=120)
+        self.assertEqual((len(app.tasks), last(app)["state"]), (1, "mikkel"))
+        app = self.app()
+        weigh(app, ago=121)
+        self.assertEqual((app.tasks, last(app)["state"]), ([], "someone"))
+
+    def test_a_second_weighing_takes_over_and_the_first_ones_answer_is_not_used_for_it(self):
+        app = self.app()
+        weigh(app)
+        app.now += 20 * SEC
+        weigh(app, weight="73.5")
+        self.assertEqual(len(app.tasks), 2)
+        thirty_days_ago(app)
+        asyncio.run(app.tasks.pop(0))
+        run_later_zero = [item for item in app.later if item[1] == 0]
+        app.later = [item for item in app.later if item[1] != 0]
+        for callback, _, kw in run_later_zero:
+            callback(kw)
+        self.assertEqual(shown(app)[0], self.ROWS)
+        drain(app)
+        self.assertEqual(shown(app)[0][0], "73,5 kg · 20,0 % fedt")
+
+    def test_the_weighing_alone_identifies_him_for_the_visit_and_not_for_the_next(self):
+        app = self.app()
+        weigh(app)
+        thirty_days_ago(app)
+        drain(app)
+        for dbm in ("-95", "unknown"):
+            phone(app, dbm)
+            self.assertEqual(last(app)["state"], "mikkel")
+        occupy(app, "off")
+        self.assertEqual((last(app)["state"], shown(app)), ("off", [BLANK] * 3))
+        occupy(app, "on")
+        self.assertEqual((last(app)["state"], shown(app)), ("someone", [BLANK] * 3))
+
+    def test_a_weighing_in_sleep_mode_identifies_nobody_in_the_dark(self):
+        app = self.app({SLEEP: full("on"), LIGHT: full("off")})
+        weigh(app)
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]), ("off", f"sleep:{SLEEP}"))
+
+    def test_in_sleep_mode_the_lines_stay_the_alarm_line_whatever_the_weighing(self):
+        app = self.app({SLEEP: full("on"), LIGHT: full("on"), ALARM: full("on"), ALARM_TIME: full("09:15:00")})
+        weigh(app)
+        thirty_days_ago(app)
+        drain(app)
+        self.assertEqual(last(app)["state"], "mikkel")
+        self.assertEqual(shown(app), [("Vækker 09:15", "mdi:alarm", "09:15"), BLANK, BLANK])
+
+    def test_the_card_never_goes_to_someone_who_is_not_him(self):
+        app = self.app()
+        weigh(app)
+        thirty_days_ago(app)
+        drain(app)
+        occupy(app, "off")
+        app.now += 30 * SEC
+        occupy(app, "on")
+        self.assertEqual((last(app)["state"], shown(app)), ("someone", [BLANK] * 3))
+
+    def test_every_attribute_of_the_card_is_a_string(self):
+        app = self.app()
+        weigh(app)
+        thirty_days_ago(app)
+        drain(app)
+        for key, value in last(app)["attributes"].items():
+            with self.subTest(key=key):
+                self.assertIsInstance(value, str)
+        for number in (1, 2, 3):
+            self.assertLessEqual(len(last(app)["attributes"][f"line{number}"]), bd.LINE_MAX)
+
+
+class RainFlowTests(unittest.TestCase):
+    RAIN = ("Regn 09-11", "mdi:weather-rainy", "09-11")
+
+    def app(self, now=NOW, states=None, **kw):
+        return make_app({RSSI: full("-60", updated=now), **(states or {})}, now=now, **kw)
+
+    def test_inside_the_window_he_gets_the_forecast_once_and_a_line_from_it(self):
+        app = self.app()
+        self.assertEqual((len(app.tasks), shown(app)[0]), (1, BLANK))
+        app.responses[FORECAST] = weather_answer((utc(8), 0.6), (utc(9), 0.4))
+        drain(app)
+        self.assertEqual(app.requests, [(FORECAST, {"entity_id": WEATHER, "type": "hourly", "return_response": True})])
+        self.assertEqual(shown(app)[0], self.RAIN)
+
+    def test_the_window_is_06_to_12_house_time(self):
+        for now, fetches in ((house(11, 5, 5, 59), 0), (datetime(2026, 11, 5, 5, 59, 59, tzinfo=HOUSE), 0),
+                             (house(11, 5, 6, 0), 1), (datetime(2026, 11, 5, 11, 59, 59, tzinfo=HOUSE), 1),
+                             (house(11, 5, 12, 0), 0), (house(11, 5, 21, 0), 0)):
+            with self.subTest(now=now):
+                self.assertEqual(len(self.app(now=now).tasks), fetches)
+
+    def test_the_line_is_not_there_outside_the_window_whatever_the_piezo_says(self):
+        for now, line in ((house(11, 5, 5, 59), BLANK), (house(11, 5, 6, 0), ("Regner nu", "mdi:weather-rainy", "nu")),
+                          (house(11, 5, 11, 59), ("Regner nu", "mdi:weather-rainy", "nu")), (house(11, 5, 12, 0), BLANK)):
+            with self.subTest(now=now):
+                self.assertEqual(shown(self.app(now=now, states={PIEZO: full("on")}))[0], line)
+
+    def test_someone_an_empty_room_and_a_dark_room_get_no_forecast_and_no_line(self):
+        for states, active in (({RSSI: full("-90")}, "on"), ({}, "off"), ({SLEEP: full("on"), LIGHT: full("off")}, "on")):
+            with self.subTest(states=states, active=active):
+                app = make_app({PIEZO: full("on"), **states}, active=active)
+                self.assertEqual((app.tasks, shown(app)), ([], [BLANK] * 3))
+
+    def test_it_raining_now_needs_no_forecast(self):
+        app = self.app(states={PIEZO: full("on")})
+        self.assertEqual((app.tasks, shown(app)[0]), ([], ("Regner nu", "mdi:weather-rainy", "nu")))
+        fire(app, PIEZO, full("off"))
+        self.assertEqual((len(app.tasks), shown(app)[0]), (1, BLANK))
+        fire(app, PIEZO, full("on"))
+        self.assertEqual(shown(app)[0][0], "Regner nu")
+
+    def test_a_piezo_that_cannot_be_read_is_not_rain(self):
+        for state in ("unknown", "unavailable", "off", None):
+            with self.subTest(state=state):
+                app = self.app(states={PIEZO: full(state)} if state else {})
+                self.assertEqual(shown(app)[0], BLANK)
+
+    def test_no_rain_in_the_forecast_no_line(self):
+        app = self.app()
+        app.responses[FORECAST] = weather_answer((utc(8), 0.0), (utc(9), 0.1), (utc(10), 0.0), (utc(12), 5.0))
+        drain(app)
+        self.assertEqual(shown(app), [BLANK] * 3)
+
+    def test_the_forecast_is_asked_for_at_most_every_30_minutes_answered_or_not(self):
+        app = self.app()
+        app.fail_services = {FORECAST}
+        drain(app)
+        self.assertEqual(len(app.requests), 1)
+        self.assertEqual(warnings(app), ["Forecast fetch failed: RuntimeError('HA unreachable')"])
+        tick(app, 29 * MIN + 59 * SEC)
+        self.assertEqual(app.tasks, [])
+        tick(app, 1 * SEC)
+        self.assertEqual(len(app.tasks), 1)
+        drain(app)
+        self.assertEqual(len(app.requests), 2)
+        for _ in range(100):
+            tick(app)
+        self.assertEqual((len(app.requests), app.tasks), (2, []))
+
+    def test_a_forecast_that_cannot_be_read_gives_no_line(self):
+        for answer in (None, {}, {"oops": 1}, weather_answer()):
+            with self.subTest(answer=answer):
+                app = self.app()
+                app.responses[FORECAST] = answer
+                drain(app)
+                self.assertEqual(shown(app), [BLANK] * 3)
+
+    def test_the_forecast_goes_stale_when_the_fetches_stop_working(self):
+        app = self.app()
+        app.responses[FORECAST] = weather_answer((utc(8), 0.6), (utc(9), 0.4), (utc(10), 0.4))
+        drain(app)
+        app.fail_services = {FORECAST}
+        tick(app, 31 * MIN)
+        drain(app)
+        self.assertEqual(shown(app)[0][0], "Regn 09-12")
+        tick(app, 59 * MIN)  # 90 minutes since the forecast
+        self.assertEqual(shown(app)[0][0], "Regn 10-12")
+        tick(app, 1 * SEC)
+        self.assertEqual(shown(app)[0], BLANK)
+
+    def test_the_line_follows_the_clock(self):
+        app = self.app()
+        app.responses[FORECAST] = weather_answer((utc(8), 0.6), (utc(9), 0.4))
+        drain(app)
+        self.assertEqual(shown(app)[0][0], "Regn 09-11")
+        tick(app, 60 * MIN)  # 09:30 house: the first hour is still going on
+        self.assertEqual(shown(app)[0][0], "Regn 09-11")
+        tick(app, 30 * MIN)  # 10:00: it is over
+        self.assertEqual(shown(app)[0][0], "Regn 10-11")
+
+    def test_the_rain_comes_before_transit_and_rows(self):
+        app = self.app(states={UPCOMING: upcoming(LineTests.ROWS), PIEZO: full("on"),
+                               STOG: route("Disrupted", [departure(12, "08:42", cancelled=True)])})
+        self.assertEqual([line[0] for line in shown(app)],
+                         ["Regner nu", "S-tog: cancelled 08:42", "Spray the Alocasia"])
+
+    def test_the_forecast_entity_is_from_the_yaml(self):
+        app = self.app(weather_entity="weather.den")
+        drain(app)
+        self.assertEqual(app.requests[0][1]["entity_id"], "weather.den")
+        app = self.app(rain_entity="binary_sensor.den_rain", states={"binary_sensor.den_rain": full("on")})
+        self.assertEqual(shown(app)[0][0], "Regner nu")
+
+
+class AlarmFlowTests(unittest.TestCase):
+    ON = ("Vækker 09:15", "mdi:alarm", "09:15")
+    OFF = ("Ingen vækker", "mdi:alarm", "ingen")
+
+    def app(self, now=NOW, states=None, **kw):
+        return make_app({RSSI: full("-60", updated=now), ALARM: full("on"), ALARM_TIME: full("09:15:00"),
+                         **(states or {})}, now=now, **kw)
+
+    def test_the_line_is_there_from_20_to_02_house_time(self):
+        cases = ((house(11, 5, 19, 59), False), (datetime(2026, 11, 5, 19, 59, 59, tzinfo=HOUSE), False),
+                 (house(11, 5, 20, 0), True), (house(11, 5, 23, 59), True), (house(11, 6, 0, 0), True),
+                 (datetime(2026, 11, 6, 1, 59, 59, tzinfo=HOUSE), True), (house(11, 6, 2, 0), False),
+                 (house(11, 5, 12, 0), False), (house(11, 5, 6, 0), False))
+        for now, expected in cases:
+            with self.subTest(now=now):
+                self.assertEqual(shown(self.app(now=now))[0], self.ON if expected else BLANK)
+
+    def test_an_alarm_that_is_off_says_ingen_vaekker(self):
+        app = self.app(now=house(11, 5, 21, 0), states={ALARM: full("off")})
+        self.assertEqual(shown(app)[0], self.OFF)
+
+    def test_an_alarm_that_cannot_be_read_is_no_line(self):
+        for state in ("unknown", "unavailable"):
+            with self.subTest(state=state):
+                self.assertEqual(shown(self.app(now=house(11, 5, 21, 0), states={ALARM: full(state)})), [BLANK] * 3)
+        app = make_app({RSSI: full("-60", updated=house(11, 5, 21, 0))}, now=house(11, 5, 21, 0))
+        self.assertEqual(shown(app), [BLANK] * 3)
+
+    def test_someone_and_an_empty_room_get_no_alarm_line(self):
+        now = house(11, 5, 21, 0)
+        for states, active in (({RSSI: full("-90", updated=now)}, "on"), ({}, "off")):
+            with self.subTest(active=active):
+                self.assertEqual(shown(self.app(now=now, states=states, active=active)), [BLANK] * 3)
+
+    def test_the_alarm_comes_first_then_transit_and_rows_up_to_three(self):
+        now = house(11, 5, 21, 0)
+        app = self.app(now=now, states={
+            UPCOMING: upcoming(LineTests.ROWS, expires=now + 10 * MIN),
+            METRO: route("Disrupted", [departure(5, "21:05", cancelled=True)], as_of=now - 2 * MIN),
+            STOG: route("Delayed", [departure(9, "21:09", delay=11)], as_of=now - 2 * MIN)})
+        self.assertEqual([line[0] for line in shown(app)], ["Vækker 09:15", "Metro: disrupted", "S-tog: delayed"])
+
+    def test_the_line_follows_the_alarm_and_its_time(self):
+        app = self.app(now=house(11, 5, 21, 0))
+        fire(app, ALARM_TIME, full("06:45:00"))
+        self.assertEqual(shown(app)[0], ("Vækker 06:45", "mdi:alarm", "06:45"))
+        fire(app, ALARM, full("off"))
+        self.assertEqual(shown(app)[0], self.OFF)
+        fire(app, ALARM, full("on"))
+        self.assertEqual(shown(app)[0][0], "Vækker 06:45")
+
+    def test_a_tap_toggles_the_alarm_and_logs_it(self):
+        app = self.app()
+        app._on_alarm(CONFIG["alarm_event"], {}, {})
+        self.assertEqual(app.calls, [("homeassistant/toggle", {"entity_id": ALARM})])
+        self.assertEqual([msg for level, msg in app.logs if msg.startswith("Alarm button")],
+                         [f"Alarm button: toggles {ALARM}"])
+
+    def test_a_tap_toggles_whatever_the_display_shows(self):
+        app = make_app(active="off")
+        app._on_alarm(CONFIG["alarm_event"], {}, {})
+        self.assertEqual(app.calls, [("homeassistant/toggle", {"entity_id": ALARM})])
+
+    def test_a_tap_whose_call_fails_logs_a_warning(self):
+        app = self.app()
+        app.fail_services = {"homeassistant/toggle"}
+        app._on_alarm(CONFIG["alarm_event"], {}, {})
+        self.assertEqual(app.calls, [])
+        self.assertEqual(warnings(app), ["homeassistant/toggle failed: RuntimeError('HA unreachable')"])
+
+    def test_the_event_and_the_entities_are_from_the_yaml(self):
+        app = make_app(alarm_event="esphome.den_alarm", alarm_entity="input_boolean.den",
+                       alarm_time_entity="input_datetime.den")
+        self.assertIn(("_on_alarm", "esphome.den_alarm"), app.events)
+        self.assertNotIn(("_on_alarm", "esphome.bathroom_display_alarm"), app.events)
+        app._on_alarm("esphome.den_alarm", {}, {})
+        self.assertEqual(app.calls, [("homeassistant/toggle", {"entity_id": "input_boolean.den"})])
+        self.assertIn(("_on_source", "input_datetime.den"), [(name, entity) for name, entity, _ in app.listened])
+
+
+class NightTests(unittest.TestCase):
+    """Sleep mode is the night: the attribute is on in every state and the lines are just the alarm line."""
+
+    ALARM_LINE = ("Vækker 09:15", "mdi:alarm", "09:15")
+    SLEEPING = {ALARM: full("on"), ALARM_TIME: full("09:15:00"), UPCOMING: upcoming(LineTests.ROWS),
+                STOG: route("Disrupted", [departure(12, "08:42", cancelled=True)]), PIEZO: full("on")}
+    CASES = (  # the room, its states, whether it is active and the state it gets
+        ("an empty room", {SLEEP: full("on")}, "off", "off"),
+        ("a room kept dark", {SLEEP: full("on"), LIGHT: full("off")}, "on", "off"),
+        ("a lit room, nobody known", {SLEEP: full("on"), LIGHT: full("on")}, "on", "someone"),
+        ("a lit room, Mikkel", {SLEEP: full("on"), LIGHT: full("on"), RSSI: full("-60")}, "on", "mikkel"))
+
+    def test_night_is_on_in_every_state_while_sleep_mode_is_on(self):
+        for name, states, active, state in self.CASES:
+            with self.subTest(room=name):
+                app = make_app(states, active=active)
+                self.assertEqual((last(app)["state"], last(app)["attributes"]["night"]), (state, "on"))
+
+    def test_night_is_empty_in_every_state_while_sleep_mode_is_not_on(self):
+        for name, states, active, state in self.CASES:
+            for sleep in ("off", "unavailable", "unknown", None):
+                with self.subTest(room=name, sleep=sleep):
+                    states = {**states, **({SLEEP: full(sleep)} if sleep else {})}
+                    if not sleep:
+                        states.pop(SLEEP)
+                    app = make_app(states, active=active)
+                    self.assertEqual(last(app)["attributes"]["night"], "")
+
+    def test_the_reason_and_the_state_are_what_they_were_without_the_night(self):
+        app = make_app({SLEEP: full("on"), LIGHT: full("off")})
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]), ("off", f"sleep:{SLEEP}"))
+        fire(app, LIGHT, full("on"))
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["reason"]),
+                         ("someone", f"active:{ACTIVE} phone:none"))
+
+    def test_the_lines_are_just_the_alarm_line_whatever_the_state(self):
+        for name, states, active, state in self.CASES:
+            with self.subTest(room=name):
+                app = make_app({**self.SLEEPING, **states}, active=active)
+                self.assertEqual(last(app)["state"], state)
+                self.assertEqual(shown(app), [self.ALARM_LINE, BLANK, BLANK])
+
+    def test_the_alarm_line_is_there_at_any_hour_of_the_night_mode(self):
+        for now in (house(11, 5, 8, 30), house(11, 5, 14, 0), house(11, 5, 21, 0), house(11, 6, 3, 0)):
+            with self.subTest(now=now):
+                app = make_app({**self.SLEEPING, SLEEP: full("on"), LIGHT: full("on"),
+                                RSSI: full("-60", updated=now)}, now=now)
+                self.assertEqual(shown(app), [self.ALARM_LINE, BLANK, BLANK])
+
+    def test_it_says_ingen_vaekker_when_the_alarm_is_off(self):
+        app = make_app({SLEEP: full("on"), LIGHT: full("on"), ALARM: full("off")})
+        self.assertEqual(shown(app), [("Ingen vækker", "mdi:alarm", "ingen"), BLANK, BLANK])
+
+    def test_without_an_alarm_to_read_there_are_no_lines_but_it_is_night(self):
+        app = make_app({SLEEP: full("on"), LIGHT: full("on"), UPCOMING: upcoming(LineTests.ROWS)})
+        self.assertEqual((last(app)["attributes"]["night"], shown(app)), ("on", [BLANK] * 3))
+
+    def test_no_forecast_is_asked_for_in_the_night(self):
+        app = make_app({SLEEP: full("on"), LIGHT: full("on"), RSSI: full("-60")})
+        self.assertEqual(app.tasks, [])
+
+    def test_sleep_mode_turning_on_and_off_changes_the_payload_at_once(self):
+        app = make_app({**self.SLEEPING, SLEEP: full("off"), RSSI: full("-60"), PIEZO: full("off")})
+        before = last(app)["attributes"]
+        self.assertEqual((before["night"], before["line1"]), ("", "S-tog: cancelled 08:42"))
+        count = len(app.published)
+        fire(app, SLEEP, full("on"))
+        self.assertEqual(len(app.published), count + 1)
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["night"], shown(app)),
+                         ("off", "on", [self.ALARM_LINE, BLANK, BLANK]))
+        fire(app, LIGHT, full("on"))
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["night"], shown(app)),
+                         ("mikkel", "on", [self.ALARM_LINE, BLANK, BLANK]))
+        fire(app, SLEEP, full("off"))
+        self.assertEqual((last(app)["attributes"]["night"], shown(app)[0]),
+                         ("", ("S-tog: cancelled 08:42", "mdi:train", "")))
+
+    def test_the_alarm_line_follows_the_alarm_in_the_night(self):
+        app = make_app({SLEEP: full("on"), LIGHT: full("on"), ALARM: full("on"), ALARM_TIME: full("09:15:00")})
+        fire(app, ALARM, full("off"))
+        self.assertEqual(shown(app)[0][0], "Ingen vækker")
+        fire(app, ALARM_TIME, full("07:00:00"))
+        fire(app, ALARM, full("on"))
+        self.assertEqual(shown(app)[0][0], "Vækker 07:00")
+
+    def test_every_attribute_is_a_string_and_the_line_fits(self):
+        app = make_app({**self.SLEEPING, SLEEP: full("on"), LIGHT: full("on")})
+        for key, value in last(app)["attributes"].items():
+            with self.subTest(key=key):
+                self.assertIsInstance(value, str)
+        self.assertLessEqual(len(last(app)["attributes"]["line1"]), bd.LINE_MAX)
+
+
 class ConfigTests(unittest.TestCase):
     def test_the_yaml_names_the_module_and_class(self):
         self.assertEqual((CONFIG["module"], CONFIG["class"]), ("bathroom_display", "BathroomDisplay"))
@@ -1387,6 +2432,39 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((app.play_event, app.speaker, app.radio), (bd.PLAY_EVENT, bd.SPEAKER, bd.RADIO))
         self.assertEqual((CONFIG["play_event"], CONFIG["speaker"], CONFIG["radio"]),
                          ("esphome.bathroom_display_play", "media_player.bathroom", "dr_podcasts://radio/p3"))
+
+    def test_the_weighing_rain_and_alarm_defaults_are_the_yamls_values(self):
+        app = make_app()
+        self.assertEqual((app.measured_entity, app.weight_entity, app.fat_entity),
+                         (bd.MEASURED, bd.WEIGHT, bd.BODY_FAT))
+        self.assertEqual((CONFIG["measured_entity"], CONFIG["weight_entity"], CONFIG["body_fat_entity"]),
+                         ("sensor.mikkel_last_measurement", "sensor.mikkel_weight", "sensor.mikkel_body_fat"))
+        self.assertEqual((app.rain_entity, app.weather_entity), (bd.PIEZO, bd.WEATHER))
+        self.assertEqual((CONFIG["rain_entity"], CONFIG["weather_entity"]),
+                         ("binary_sensor.gw2000a_rain_state_piezo", "weather.forecast_home"))
+        self.assertEqual((app.alarm_entity, app.alarm_time_entity, app.alarm_event),
+                         (bd.ALARM, bd.ALARM_TIME, bd.ALARM_EVENT))
+        self.assertEqual((CONFIG["alarm_entity"], CONFIG["alarm_time_entity"], CONFIG["alarm_event"]),
+                         ("input_boolean.wakeup_bedroom", "input_datetime.wakeup_bedroom",
+                          "esphome.bathroom_display_alarm"))
+
+    def test_the_defaults_are_the_apps_without_the_yaml(self):
+        app = make_app()
+        app.args = {}
+        app.initialize()
+        self.assertEqual((app.measured_entity, app.weight_entity, app.fat_entity, app.rain_entity,
+                          app.weather_entity, app.alarm_entity, app.alarm_time_entity, app.alarm_event),
+                         (bd.MEASURED, bd.WEIGHT, bd.BODY_FAT, bd.PIEZO, bd.WEATHER, bd.ALARM, bd.ALARM_TIME,
+                          bd.ALARM_EVENT))
+        self.assertEqual(app.alarm_event, CONFIG["alarm_event"])
+
+    def test_the_limits_and_windows_are_the_agreed_ones(self):
+        self.assertEqual((bd.CARD_S, bd.WEIGH_FRESH, bd.COMPARE_AGO, bd.COMPARE_SLACK, bd.DEAD_BAND_KG),
+                         (90, 120 * SEC, 30 * DAY, 3 * DAY, 0.3))
+        self.assertEqual((bd.RAIN_FROM, bd.RAIN_TO, bd.RAIN_AHEAD, bd.RAIN_REFETCH),
+                         (dtime(6), dtime(12), 4 * HOUR, 30 * MIN))
+        self.assertEqual((bd.ALARM_FROM, bd.ALARM_TO), (dtime(20), dtime(2)))
+        self.assertEqual((bd.LINES, bd.LINE_MAX), (3, 32))
 
     def test_the_history_outlasts_the_baseline_window(self):
         self.assertGreater(bd.HISTORY_S, bd.BASELINE_FROM_S)
