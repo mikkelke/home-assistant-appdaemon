@@ -82,6 +82,7 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
     _cycle_actor = None  # ActorAttribution result for whoever started the current cycle
     _last_saved_record_ts = None  # ts of the newest feedback record this process saved
     last_door_closed_at = None  # UTC of the last on->off door edge, consumed by the next start
+    _run_durations = ()  # minutes of the recent real runs, for the ETA of an unconfirmed run
     # The start is anchored on the door close that loaded the drum, which can precede the power
     # edge by hours on a delayed start; a close older than this is not trusted.
     LOAD_ANCHOR_MAX_AGE_S = 12 * 3600
@@ -980,6 +981,11 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             self.log(f"Could not load feedback {self.feedback_file}: {e}", level="WARNING")
             return
         cycles = data.get("cycles") or []
+        self._run_durations = tuple(
+            float(c["duration_min"]) for c in cycles
+            if (c.get("duration_min") or 0) >= self.TYPICAL_RUN_MIN_MINUTES
+            and (c.get("energy_kwh") or 0) >= self.TYPICAL_RUN_MIN_KWH
+        )[-self.TYPICAL_RUN_WINDOW:]
         for c in cycles:
             if not c.get("programme_confirmed_by_human", c.get("programme_user_confirmed", False)):
                 continue
@@ -1047,6 +1053,21 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         if energy < 1.6:
             return "bomuld__skabstoert"
         return "bomuld_eco__skabstoert"
+
+    # The dryer stops on its moisture sensor, so a run's length is unknown until it ends and draws the
+    # same ~0.6 kW whatever the programme: elapsed time is the only signal before the end.
+    TYPICAL_RUN_MIN_MINUTES = 30
+    TYPICAL_RUN_MIN_KWH = 0.2
+    TYPICAL_RUN_WINDOW = 60
+    TYPICAL_RUN_MIN_SAMPLES = 3
+
+    def _typical_total_after(self, elapsed_min: float):
+        """Median length of the recent real runs that lasted longer than `elapsed_min`; None
+        when too few did."""
+        longer = [d for d in self._run_durations if d > elapsed_min]
+        if len(longer) < self.TYPICAL_RUN_MIN_SAMPLES:
+            return None
+        return round(statistics.median(longer))
 
     def _get_programme_duration(self, prog: str, use_learned: bool = True) -> int:
         """Expected duration in minutes. For guards use use_learned=False."""
@@ -1126,12 +1147,15 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         prog = self._classify_programme()
         self.detected_programme = prog
         # Effective key: user-selected (derived from selectors) or classified
-        effective_key = self._get_confirmed_programme_key() or prog
+        confirmed_key = self._get_confirmed_programme_key()
+        effective_key = confirmed_key or prog
         profile = self._get_profile(effective_key)
         label = profile.get("label", effective_key)
-        dur = self._get_programme_duration(effective_key)
         now = self._now_utc()
         elapsed = (now - self.start_time).total_seconds() / 60
+        dur = None if confirmed_key else self._typical_total_after(elapsed)
+        if dur is None:
+            dur = self._get_programme_duration(effective_key)
         overrun = 0
         if dur > 0:
             current_power = self._get_current_power()
