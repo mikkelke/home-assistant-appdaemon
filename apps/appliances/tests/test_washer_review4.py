@@ -241,6 +241,20 @@ class Blocker7ReaderLifecycle(unittest.TestCase):
         time.sleep(0.1)
         self.assertEqual([t for t in threading.enumerate() if t.name == "washer-plug"], [])
 
+    def test_only_a_fresh_ring_during_a_cycle_schedules_the_recorder_rebuild(self):
+        app, clock = running_app()
+        rebuilds = lambda: [d for cb, d, _ in app.scheduled if cb == app._rebuild_plug_reads]
+        app._plug.start = lambda: None
+        app._start_plug_poller({})
+        self.assertEqual(rebuilds(), [app.plug_rebuild_delay_s])
+        app._plug._ring.append((clock.t, 3.0))
+        app._start_plug_poller({})
+        self.assertEqual(len(rebuilds()), 1)
+        app._plug.clear()
+        app.state = "Off"
+        app._start_plug_poller({})
+        self.assertEqual(len(rebuilds()), 1)
+
     def test_an_app_restart_reuses_the_poller_with_its_ring_and_last_decision(self):
         app, clock = running_app()
         app._plug._ring.append((clock.t, 300.0))

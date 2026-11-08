@@ -158,6 +158,27 @@ class PlugPoller:
         with self._lock:
             return self._peak
 
+    @property
+    def epoch(self):
+        with self._lock:
+            return self._epoch
+
+    def prepend(self, reads, epoch):
+        """Put older reads (oldest first) in front of the ring as if they had been read live, as many as it has room
+        for, newest kept. Ignored once the evidence period `epoch` has ended or while the ring is empty. Returns the
+        reads kept."""
+        with self._lock:
+            if epoch != self._epoch or not self._ring:
+                return []
+            older = [r for r in reads if r[0] < self._ring[0][0]]
+            room = self._ring.maxlen - len(self._ring)
+            older = older[len(older) - room:] if room < len(older) else older
+            self._ring.extendleft(reversed(older))
+            for _, w in older:
+                if w is not None:
+                    self._peak = max(self._peak, w)
+            return older
+
 
 for _retired in globals().get("_shared", {}).values():
     _retired.stop()
@@ -174,6 +195,26 @@ def shared_poller(host, poll_s=POLL_S):
             poller.stop()
         poller = _shared[host] = PlugPoller(lambda: read_switch(host), poll_s)
     return poller
+
+
+def held_reads(points, before, oldest, poll_s=POLL_S):
+    """Recorder points ((t, watts or None for an unavailable state), oldest first, on the poller's clock) as the poller
+    would have read them: one read every poll_s back from `before` (exclusive) to no earlier than `oldest`, each holding
+    the newest point at or before it, and none before the first point. The recorder writes a state only when it
+    changes, so the held value is what the plug read; the replays that validated the finish rules turned recorder
+    tapes into reads the same way."""
+    reads = []
+    i = len(points) - 1
+    t = before - poll_s
+    while t >= oldest:
+        while i >= 0 and points[i][0] > t:
+            i -= 1
+        if i < 0:
+            break
+        reads.append((t, points[i][1]))
+        t -= poll_s
+    reads.reverse()
+    return reads
 
 
 def window(samples, now, seconds, poll_s=POLL_S):

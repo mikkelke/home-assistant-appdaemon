@@ -657,5 +657,40 @@ class SharedPoller(unittest.TestCase):
         self.assertEqual([t for t in threading.enumerate() if t.name == "washer-plug"], [])
 
 
+
+class RecorderRebuild(unittest.TestCase):
+    def test_held_reads_hold_each_point_on_the_poll_grid_back_from_the_first_live_read(self):
+        points = [(3.0, 10.0), (7.5, None), (8.0, 400.0)]
+        self.assertEqual(wp.held_reads(points, before=12.0, oldest=0.0),
+                         [(4.0, 10.0), (6.0, 10.0), (8.0, 400.0), (10.0, 400.0)])
+        self.assertEqual(wp.held_reads(points, before=12.0, oldest=7.0), [(8.0, 400.0), (10.0, 400.0)])
+        self.assertEqual(wp.held_reads([], before=12.0, oldest=0.0), [])
+
+    def test_held_reads_carry_an_unavailable_state_as_a_failed_read(self):
+        self.assertEqual(wp.held_reads([(0.0, 5.0), (1.0, None)], before=6.0, oldest=0.0),
+                         [(0.0, 5.0), (2.0, None), (4.0, None)])
+
+    def test_prepend_fills_in_front_of_the_ring_only_within_its_evidence_period(self):
+        poller = wp.PlugPoller(lambda: 0.0)
+        poller._ring.append((100.0, 5.0))
+        epoch = poller.epoch
+        kept = poller.prepend([(96.0, 300.0), (98.0, 4.0), (100.0, 9.0)], epoch)
+        self.assertEqual(kept, [(96.0, 300.0), (98.0, 4.0)])
+        self.assertEqual(poller.snapshot(), [(96.0, 300.0), (98.0, 4.0), (100.0, 5.0)])
+        self.assertEqual(poller.peak(), 300.0)
+        poller.clear()
+        poller._ring.append((200.0, 5.0))
+        self.assertEqual(poller.prepend([(198.0, 4.0)], epoch), [])
+        self.assertEqual(wp.PlugPoller(lambda: 0.0).prepend([(1.0, 1.0)], 0), [])
+
+    def test_prepend_keeps_the_newest_reads_the_ring_has_room_for(self):
+        poller = wp.PlugPoller(lambda: 0.0)
+        for i in range(poller._ring.maxlen - 2):
+            poller._ring.append((1000.0 + 2 * i, 1.0))
+        kept = poller.prepend([(990.0, 1.0), (994.0, 2.0), (998.0, 3.0)], poller.epoch)
+        self.assertEqual(kept, [(994.0, 2.0), (998.0, 3.0)])
+        self.assertEqual(len(poller.snapshot()), poller._ring.maxlen)
+
+
 if __name__ == "__main__":
     unittest.main()

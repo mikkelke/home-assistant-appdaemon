@@ -83,5 +83,63 @@ class CycleBoundariesRestartTheScan(unittest.TestCase):
         self.assertIsNone(app._plug.checked_at)
 
 
+
+class ProcessRestartRebuildsTheRingFromTheRecorder(unittest.TestCase):
+    """A new AppDaemon process starts with an empty ring a minute before the final spin of the fixture wash ends;
+    the recorder holds the plug's reported values up to the restart."""
+
+    def restarted_wash(self, ha_started_s=None):
+        reads, door_s, spin_end_s = real_wash()
+        restart = spin_end_s - 60
+        app, clock = r4.running_app(minutes=150)
+        ha_start = NOW + timedelta(seconds=ha_started_s) if ha_started_s is not None else NOW - timedelta(days=1)
+        app.states[app.ha_uptime_sensor] = trs._iso(ha_start)
+        app.get_history = lambda **kw: [[{"state": str(w), "last_changed": trs._iso(NOW + timedelta(seconds=ts))}
+                                         for ts, w in reads if ts < restart]]
+        live = iter([(ts, w) for ts, w in reads if ts >= restart])
+        pending = [next(live)]
+
+        def run_to(t):
+            while pending and pending[0][0] <= t:
+                ts, w = pending.pop()
+                app._plug._ring.append((BASE + ts, w))
+                app._plug._last_ok = BASE + ts
+                nxt = next(live, None)
+                if nxt is not None:
+                    pending.append(nxt)
+            clock.t = BASE + t
+            app.now = NOW + timedelta(seconds=t)
+
+        run_to(restart + 16)
+        return app, run_to, restart, door_s, spin_end_s
+
+    def finish_before(self, app, run_to, t, door_s):
+        while app.state == "Running" and t < door_s:
+            run_to(t)
+            app._check_energy_finish({})
+            t += TICK_S
+        return app.state
+
+    def test_the_rebuilt_reads_announce_the_final_spin(self):
+        app, run_to, restart, door_s, spin_end_s = self.restarted_wash()
+        app._rebuild_plug_reads({})
+        ring = app._plug.snapshot()
+        self.assertEqual(ring[0][0], BASE + real_wash()[0][0][0])
+        self.assertEqual({round(b[0] - a[0], 6) for a, b in zip(ring, ring[1:])}, {wp.POLL_S})
+        self.assertEqual(self.finish_before(app, run_to, restart + 30, door_s), "Unemptied")
+        self.assertAlmostEqual((app._spin_end_at - NOW).total_seconds(), spin_end_s, places=3)
+
+    def test_without_the_rebuild_the_door_comes_first(self):
+        app, run_to, restart, door_s, spin_end_s = self.restarted_wash()
+        self.assertEqual(self.finish_before(app, run_to, restart + 30, door_s), "Running")
+
+    def test_nothing_from_before_ha_started_is_rebuilt(self):
+        ha_started_s = real_wash()[2] - 600
+        app, run_to, restart, door_s, spin_end_s = self.restarted_wash(ha_started_s=ha_started_s)
+        app._rebuild_plug_reads({})
+        self.assertGreaterEqual(app._plug.snapshot()[0][0], BASE + ha_started_s + 60)
+        self.assertLess(app._plug.snapshot()[0][0], BASE + ha_started_s + 60 + wp.POLL_S)
+
+
 if __name__ == "__main__":
     unittest.main()

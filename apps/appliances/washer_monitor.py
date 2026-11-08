@@ -156,8 +156,59 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
     def _start_plug_poller(self, kwargs):
         """Started once initialize() has fully succeeded, so a failed initialize never leaves a thread behind. After an
         app restart this replaces the previous instance's thread on the same shared poller, whose ring carries on."""
+        fresh = not self._plug.snapshot()
         self._plug.start()
         self.run_every(self._log_plug_defects, "now+600", 600)
+        if fresh and self.state in ("Running", "Paused"):
+            self.run_in(self._rebuild_plug_reads, self.plug_rebuild_delay_s)
+
+    def _rebuild_plug_reads(self, kwargs):
+        """A new AppDaemon process starts the poller with an empty ring, so the reads before it are rebuilt from the
+        recorder, back to the latest of the cycle's start, a minute after HA's own start and the ring's span. HA records
+        nothing while it is down and leaves no trace of the gap, and its first states after a start can be restored
+        ones, so nothing from before then is rebuilt; the first finish tick
+        afterwards looks at every rebuilt read. Runs plug_rebuild_delay_s after the poller starts, so the recorder has
+        committed everything up to its first read."""
+        if self.state not in ("Running", "Paused") or not self.start_time:
+            return
+        epoch = self._plug.epoch
+        samples = self._plug.snapshot()
+        ha_start = whist.parse_utc(self.get_state(self.ha_uptime_sensor))
+        if not samples or ha_start is None:
+            return
+        mono_now, wall_now = self._plug.clock(), self._now_utc()
+        first = samples[0][0]
+        oldest_wall = max(self.start_time, ha_start + timedelta(seconds=60),
+                          wall_now - timedelta(seconds=mono_now - first + wplug.RING_S))
+        first_wall = wall_now - timedelta(seconds=mono_now - first)
+        if oldest_wall >= first_wall:
+            return
+        try:
+            hist = self._flatten_history(
+                self.get_history(entity_id=self.power_sensor, start_time=oldest_wall, end_time=first_wall),
+                self.power_sensor,
+            )
+        except Exception as e:
+            self.log(f"Could not rebuild plug reads from the recorder: {e}", level="WARNING")
+            return
+        points = []
+        for entry in hist:
+            t = whist.parse_utc(entry.get("last_changed") or entry.get("last_updated"))
+            if t is None:
+                continue
+            try:
+                watts = float(entry.get("state"))
+            except (TypeError, ValueError):
+                watts = None
+            points.append((mono_now - (wall_now - t).total_seconds(), watts))
+        points.sort(key=lambda p: p[0])
+        oldest = mono_now - (wall_now - oldest_wall).total_seconds()
+        kept = self._plug.prepend(wplug.held_reads(points, first, oldest, self.plug_poll_s), epoch)
+        if kept:
+            self._plug.checked_at = kept[0][0]
+            back_to = wall_now - timedelta(seconds=mono_now - kept[0][0])
+            self.log(f"Plug reads rebuilt from the recorder: {len(kept)} back to {self._strftime_local(back_to)}",
+                     level="INFO")
 
     def _log_plug_defects(self, kwargs):
         failed, late, longest = wplug.read_defects(self._plug.snapshot(), self._plug.clock() - 600, self.plug_poll_s)
@@ -641,6 +692,8 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         # drives start detection, the recorder and the dashboard, and its outages never change the washer state.
         self.plug_host = self.args["plug_host"]
         self.plug_poll_s = float(self.args.get("plug_poll_s", wplug.POLL_S))
+        self.plug_rebuild_delay_s = float(self.args.get("plug_rebuild_delay_s", 15))
+        self.ha_uptime_sensor = self.args.get("ha_uptime_sensor", "sensor.uptime")
         self._plug = wplug.shared_poller(self.plug_host, self.plug_poll_s)
         self._tail = wplug.TailTracker()  # replaced wherever _plug is cleared: it sees only this cycle's reads
         self._tail_eta_logged = None  # UTC of the Bomuld tail ETA last logged - see _tail_eta_utc
