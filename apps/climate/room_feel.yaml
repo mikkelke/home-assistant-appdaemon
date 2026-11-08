@@ -191,7 +191,7 @@ RoomFeel:
           rh_entity: climate.family_room_thermostat
           rh_attribute: current_humidity
           label: salus_family
-          offset_c: -1.0
+          offset_c: -0.3
       # No hallway floor thermometer and no known exterior window/door contact (interior
       # corridor) - window_contacts intentionally empty.
       window_contacts: []
