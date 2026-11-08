@@ -44,6 +44,7 @@ RoomActive:
         - { entity: binary_sensor.left_bedside,                            tier: bed }
         - { entity: binary_sensor.right_bedside,                           tier: bed }
         - { entity: binary_sensor.bed_presence_6b9c94_bed_occupied_either, tier: bed }
+        - { entity: binary_sensor.bed_pressure_rise,                       tier: bed }
     kitchen:
       witnesses:
         - { entity: binary_sensor.kitchen_presence_presence,      tier: room }

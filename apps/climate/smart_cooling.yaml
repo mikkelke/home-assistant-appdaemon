@@ -136,6 +136,7 @@ SmartCooling:
     - binary_sensor.left_bedside
     - binary_sensor.right_bedside
     - binary_sensor.bed_presence_6b9c94_bed_occupied_either
+    - binary_sensor.bed_pressure_rise
   # Occupied quiet cooling (user 2026-07-19: watching TV in bed -> cool, just less
   # noisy): active cooling drops to this fan speed instead of cool_fan_mode while
   # either bedside is occupied. Not measured on this unit (the 2026-07-15 sweep

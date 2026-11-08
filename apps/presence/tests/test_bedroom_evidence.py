@@ -63,8 +63,8 @@ def read_records(directory):
 
 class ProjectionTests(unittest.TestCase):
     def test_only_expected_entities_and_fields(self):
-        self.assertEqual(len(be.ENTITIES), 11)
-        self.assertEqual(len(be.WITNESSES), 5)
+        self.assertEqual(len(be.ENTITIES), 12)
+        self.assertEqual(len(be.WITNESSES), 6)
         self.assertEqual(len(be.TOPICS), 3)
         state = {"state": "on", "last_changed": "earlier", "last_updated": "now",
                  "context": {"id": "context", "parent_id": "parent", "user_id": None, "token": "secret"},

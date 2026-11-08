@@ -1,0 +1,28 @@
+# /conf/apps/presence/bed_pressure_rise.yaml
+# Publishes binary_sensor.bed_pressure_rise: the ESPHome bed pressure strip rising well above
+# its last known-empty level. An extra bed witness, never a controller - see
+# bed_pressure_rise.py's module docstring for the rule.
+#
+# No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
+# first or the app fails to instantiate.
+
+BedPressureRise:
+  module: bed_pressure_rise
+  class: BedPressureRise
+
+  left_pressure: sensor.bed_presence_6b9c94_left_pressure
+  right_pressure: sensor.bed_presence_6b9c94_right_pressure
+  left_occupied: binary_sensor.bed_presence_6b9c94_bed_occupied_left
+  right_occupied: binary_sensor.bed_presence_6b9c94_bed_occupied_right
+  # With the two occupied sensors: all exactly "off" for empty_room_sec marks the bed empty.
+  room_witnesses:
+    - binary_sensor.bedroom_presence_presence
+    - binary_sensor.bedroom_presence_pir_detection
+  output: binary_sensor.bed_pressure_rise
+
+  # Percent points over the learned empty level: on from rise_points, off below release_points.
+  rise_points: 40
+  release_points: 32
+  # Seconds: a rise must hold for hold_sec; the room must stay quiet for empty_room_sec first.
+  hold_sec: 20
+  empty_room_sec: 300

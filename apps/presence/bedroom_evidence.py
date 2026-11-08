@@ -1,6 +1,6 @@
 """Temporary, passive bedroom evidence recorder; remove after useful episodes are captured.
 
-Only three exact Z2M device topics and eleven named HA entities are observed. MQTT
+Only three exact Z2M device topics and twelve named HA entities are observed. MQTT
 records contain the published application payload, NOT Zigbee/ZCL frames; a cached
 last_seen is not proof that every property was freshly measured. No service calls,
 state publication, device requests, notifications, or automation timing changes.
@@ -14,7 +14,7 @@ Every restart starts a new session/segment; gaps are explicit, never interpolate
 Receive UTC is paired with monotonic seconds and a session id. Clock rollback cannot
 extend an in-process window or age retention; after restart the archive's newest
 mtime is the retention clock floor. Forward clock jumps can expire evidence early.
-OFF->ON markers on room_active and two light groups include the five witness states,
+OFF->ON markers on room_active and two light groups include the six witness states,
 room_active's reported reason/active_witnesses, doors and bed-session state. This is
 observed correlation, not proof of physical occupancy or an automation's cause.
 
@@ -52,6 +52,7 @@ WITNESSES = (
     "binary_sensor.left_bedside",
     "binary_sensor.right_bedside",
     "binary_sensor.bed_presence_6b9c94_bed_occupied_either",
+    "binary_sensor.bed_pressure_rise",
 )
 ROOM = "binary_sensor.bedroom_active"
 SESSION = "input_boolean.bedroom_bed_session"

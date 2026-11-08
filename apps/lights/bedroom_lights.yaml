@@ -25,6 +25,7 @@ bedroom_lights:
     - binary_sensor.left_bedside
     - binary_sensor.right_bedside
     - binary_sensor.bed_presence_6b9c94_bed_occupied_either
+    - binary_sensor.bed_pressure_rise
 
   switch_device_id: "951e07324391856c37850361629523d7"
   remote_device_id: "fde0ce72582c723f4d8b729b522fc2fa"

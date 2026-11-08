@@ -29,6 +29,7 @@ MikkelSleepMode:
     - binary_sensor.left_bedside
     - binary_sensor.right_bedside
     - binary_sensor.bed_presence_6b9c94_bed_occupied_either
+    - binary_sensor.bed_pressure_rise
   # Releasing the post-wakeup re-arm hold has no list of its own: _bed_reads_empty asks
   # room_active_read.bed_occupied(), i.e. RoomActive's bed tier (the same mats and strip).
   sleep_mode_entity: input_boolean.mikkel_sleep_mode
