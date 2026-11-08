@@ -34,7 +34,7 @@ SonosStateReset:
     media_player.bedroom: 0.14
     media_player.dining_room: 0.12
     media_player.kitchen: 0.13       # a notch above the dining room: pair spread wider, busiest room
-    media_player.living_room: 0.14   # a notch above the kitchen: lowest-mounted speaker
+    media_player.living_room: 0.15   # lowest-mounted speaker: three notches above the rooftop to match it at the sofas
     media_player.guest_bathroom: 0.18 # between the bedrooms and the family room
     media_player.kristines_room: 0.14
     media_player.claudias_room: 0.14

@@ -14,7 +14,7 @@ speakers:
     raw_entity: media_player.living_room_2
     rincon: RINCON_74CA6064C9BF01400
     model: Arc Ultra
-    default_volume: 0.14      # a notch above the kitchen: lowest-mounted speaker
+    default_volume: 0.15      # lowest-mounted speaker: three notches above the rooftop to match it at the sofas
     tts: [all, family]
   kitchen:
     ma_entity: media_player.kitchen
