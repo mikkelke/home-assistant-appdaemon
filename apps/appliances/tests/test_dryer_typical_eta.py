@@ -82,6 +82,7 @@ class UnconfirmedRunUsesTypicalLength(unittest.TestCase):
         app = make_app(6, energy_kwh=0.04)
         app._update_running_attributes()
         self.assertEqual(app.published["detected_programme"], "finish_uld")
+        self.assertEqual(app.published["programme_label"], "Auto (unconfirmed)")
         self.assertEqual(app.published["programme_duration_min"], 95)
         self.assertEqual(app.published["estimated_remaining_min"], 89)
         self.assertLess(app.published["progress_pct"], 10)
@@ -100,6 +101,7 @@ class UnconfirmedRunUsesTypicalLength(unittest.TestCase):
         app = make_app(6, energy_kwh=0.04, confirmed_key="skjorter__skabstoert")
         app._update_running_attributes()
         self.assertEqual(app.published["programme_duration_min"], 60)
+        self.assertEqual(app.published["programme_label"], "Skjorter - Skabstørt")
 
     def test_no_history_keeps_the_classifier(self):
         app = make_app(20, energy_kwh=0.2, durations=[])

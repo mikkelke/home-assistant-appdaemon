@@ -1156,6 +1156,8 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         dur = None if confirmed_key else self._typical_total_after(elapsed)
         if dur is None:
             dur = self._get_programme_duration(effective_key)
+        else:
+            label = "Auto (unconfirmed)"
         overrun = 0
         if dur > 0:
             current_power = self._get_current_power()
