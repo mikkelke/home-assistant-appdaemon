@@ -154,7 +154,8 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             return 0
 
     def _start_plug_poller(self, kwargs):
-        """Started once initialize() has fully succeeded, so a failed initialize never leaves a thread behind."""
+        """Started once initialize() has fully succeeded, so a failed initialize never leaves a thread behind. After an
+        app restart this replaces the previous instance's thread on the same shared poller, whose ring carries on."""
         self._plug.start()
         self.run_every(self._log_plug_defects, "now+600", 600)
 
@@ -162,9 +163,6 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         failed, late, longest = wplug.read_defects(self._plug.snapshot(), self._plug.clock() - 600, self.plug_poll_s)
         if failed or late:
             self.log(f"Plug reads last 10 min: {failed} failed, {late} late (longest spacing {longest:.1f}s)", level="INFO")
-
-    def terminate(self):
-        self._plug.stop()
 
     def _wash_activity(self):
         """Wash evidence for this cycle: restored with the cycle, or a plug read at or above wash_activity_watts since
@@ -243,9 +241,9 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                 self._transition_to_off("Standby without a wash")
                 return self.state != "Running"
             return False
-        since = mono - self.energy_check_interval if self._spin_end_checked_at is None else self._spin_end_checked_at
+        since = mono - self.energy_check_interval if self._plug.checked_at is None else self._plug.checked_at
         end = wplug.spin_end_since(samples, since, mono, poll_s)
-        self._spin_end_checked_at = mono
+        self._plug.checked_at = mono
         if end is None:
             return False
         self._spin_end_at = now - timedelta(seconds=mono - end)
@@ -643,14 +641,13 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         # drives start detection, the recorder and the dashboard, and its outages never change the washer state.
         self.plug_host = self.args["plug_host"]
         self.plug_poll_s = float(self.args.get("plug_poll_s", wplug.POLL_S))
-        self._plug = wplug.PlugPoller(lambda: wplug.read_switch(self.plug_host), self.plug_poll_s)
+        self._plug = wplug.shared_poller(self.plug_host, self.plug_poll_s)
         self._tail = wplug.TailTracker()  # replaced wherever _plug is cleared: it sees only this cycle's reads
         self._tail_eta_logged = None  # UTC of the Bomuld tail ETA last logged - see _tail_eta_utc
         self._plug_offline_pushed = False
         self.wash_activity_watts = float(self.args.get("wash_activity_watts", wplug.ACTIVITY_W))
         self.plug_unreachable_push_minutes = float(self.args.get("plug_unreachable_push_minutes", 10))
         self._spin_end_at = None
-        self._spin_end_checked_at = None  # plug clock instant of the last spin-end decision; None = look back one tick
         self._activity_seen = False
         # None (never coerced to False) while a transiently-failed recorder lookup has not yet
         # been retried - see _retry_activity_seen_from_recorder.
@@ -3177,7 +3174,6 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         self._remove_last_cycle_feedback()
         self._plug.clear()
         self._tail = wplug.TailTracker()
-        self._spin_end_checked_at = None
 
         self._safe_cancel_timer(self.unemptied_watchdog_timer)
         self.unemptied_watchdog_timer = None
@@ -4027,7 +4023,6 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         # Finish decisions and the tail ETA for this cycle see only reads taken from here on.
         self._plug.clear()
         self._tail = wplug.TailTracker()
-        self._spin_end_checked_at = None
         self._activity_seen = False
         self._activity_recorder_retry_after = None
         self._spin_end_at = None

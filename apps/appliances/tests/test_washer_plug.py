@@ -627,5 +627,35 @@ class PollerLifecycle(unittest.TestCase):
         self.assertEqual(poller.last_ok(), 100.0)   # creation time: never answered
 
 
+class SharedPoller(unittest.TestCase):
+    def setUp(self):
+        wp._shared.clear()
+
+    def test_one_poller_per_host_survives_until_its_poll_interval_changes(self):
+        first = wp.shared_poller("plug.invalid", 2.0)
+        self.assertIs(wp.shared_poller("plug.invalid", 2.0), first)
+        self.assertIsNot(wp.shared_poller("other.invalid", 2.0), first)
+        replaced = wp.shared_poller("plug.invalid", 1.0)
+        self.assertIsNot(replaced, first)
+        self.assertEqual(first._gen, 1)
+
+    def test_clear_forgets_the_last_spin_end_decision(self):
+        poller = wp.shared_poller("plug.invalid")
+        poller.checked_at = 123.0
+        poller.clear()
+        self.assertIsNone(poller.checked_at)
+
+    def test_a_module_reload_retires_the_previous_loads_pollers(self):
+        import importlib
+        poller = wp.PlugPoller(lambda: 1.0, poll_s=0.02)
+        wp._shared["plug.invalid"] = poller
+        poller.start()
+        time.sleep(0.05)
+        importlib.reload(wp)
+        time.sleep(0.1)
+        self.assertEqual(wp._shared, {})
+        self.assertEqual([t for t in threading.enumerate() if t.name == "washer-plug"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -51,6 +51,7 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
 
 import washer_monitor as wm  # noqa: E402
 import cycle_store as cystore  # noqa: E402
+import washer_plug as wplug  # noqa: E402
 
 NOW = datetime(2026, 8, 12, 14, 0, 0, tzinfo=timezone.utc)
 
@@ -113,6 +114,7 @@ def make_full_init_app(
     extra_args=None,
     get_history_fn=None,
     call_service_fn=None,
+    keep_plug=False,
 ):
     """WasherMonitor with initialize() run for real, end to end - including the real
     _restore_running_state, _resolve_store_candidate, _infer_boot_start_time_from_history and
@@ -122,6 +124,8 @@ def make_full_init_app(
     instead of touching real repo data; programmes_file is left unset so the real
     washer_programmes.yaml next to the app loads, matching production classification.
     """
+    if not keep_plug:
+        wplug._shared.clear()
     app = wm.WasherMonitor.__new__(wm.WasherMonitor)
     app.now = now
     app._now_utc = lambda: app.now

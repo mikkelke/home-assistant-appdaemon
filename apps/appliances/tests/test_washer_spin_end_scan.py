@@ -43,7 +43,7 @@ class FinishTickScansSinceItsPreviousTick(unittest.TestCase):
 
         tick(app, clock, reads, t_pass - 10)
         self.assertEqual(app.state, "Running")
-        self.assertEqual(app._spin_end_checked_at, clock.t)
+        self.assertEqual(app._plug.checked_at, clock.t)
 
         tick(app, clock, reads, reads[-1][0])       # 130 s on, well past the one-interval look-back
         self.assertIsNone(wp.spin_end(app._plug.snapshot(), clock.t))
@@ -68,19 +68,19 @@ class FinishTickScansSinceItsPreviousTick(unittest.TestCase):
 class CycleBoundariesRestartTheScan(unittest.TestCase):
     def test_boot_a_new_cycle_and_a_recovered_one_start_with_no_previous_tick(self):
         app = trs.make_full_init_app(sensor_state=None, helper_state=None, power_watts=0, now=NOW)
-        self.assertIsNone(app._spin_end_checked_at)
+        self.assertIsNone(app._plug.checked_at)
 
-        app._spin_end_checked_at = 123.0
+        app._plug.checked_at = 123.0
         app._begin_running_cycle()
-        self.assertIsNone(app._spin_end_checked_at)
+        self.assertIsNone(app._plug.checked_at)
 
-        app._spin_end_checked_at = 123.0
+        app._plug.checked_at = 123.0
         app.state = "Unemptied"
         app.states[app.state_entity] = "Unemptied"
         app.attrs_store.setdefault(app.state_entity, {})["run_time_minutes"] = 120
         app._recover_from_false_unemptied(60.0)
         self.assertEqual(app.state, "Running")
-        self.assertIsNone(app._spin_end_checked_at)
+        self.assertIsNone(app._plug.checked_at)
 
 
 if __name__ == "__main__":

@@ -81,8 +81,9 @@ def _read_switch_once(host, end, clock):
 class PlugPoller:
     """Reads the plug every poll_s from one daemon thread into a bounded ring; the app only takes snapshots and never
     blocks on the plug, and the thread never touches AppDaemon. start() retires any earlier thread (it exits after at
-    most one more read, which it then discards), stop() retires the current one (the app's terminate() calls it), and
-    clear() starts a fresh evidence period: a read that was in flight across it is dropped."""
+    most one more read, which it then discards), stop() retires the current one (shared_poller calls it on a poller it
+    replaces), and clear() starts a fresh evidence period: a read that was in flight across it is dropped. `checked_at`
+    is the poller-clock instant of the app's last spin-end decision (None until the first one of an evidence period)."""
 
     def __init__(self, read, poll_s=POLL_S, clock=time.monotonic):
         self._read = read
@@ -94,6 +95,7 @@ class PlugPoller:
         self._epoch = 0
         self._peak = 0.0
         self._last_ok = clock()
+        self.checked_at = None
 
     def start(self):
         with self._lock:
@@ -110,6 +112,7 @@ class PlugPoller:
             self._ring.clear()
             self._epoch += 1
             self._peak = 0.0
+            self.checked_at = None
 
     def _run(self, gen):
         due = self.clock()
@@ -154,6 +157,23 @@ class PlugPoller:
         """Highest watts read since the last clear()."""
         with self._lock:
             return self._peak
+
+
+for _retired in globals().get("_shared", {}).values():
+    _retired.stop()
+_shared = {}
+
+
+def shared_poller(host, poll_s=POLL_S):
+    """The one poller for `host`, kept while this module stays loaded. AppDaemon keeps a module across its apps'
+    restarts (an HA restart stops and starts every app) and reloads it only when its file changes, so the ring and
+    the last spin-end decision outlive an app restart; a reload retires the previous load's pollers."""
+    poller = _shared.get(host)
+    if poller is None or poller.poll_s != poll_s:
+        if poller is not None:
+            poller.stop()
+        poller = _shared[host] = PlugPoller(lambda: read_switch(host), poll_s)
+    return poller
 
 
 def window(samples, now, seconds, poll_s=POLL_S):

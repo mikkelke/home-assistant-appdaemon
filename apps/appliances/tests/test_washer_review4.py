@@ -225,17 +225,31 @@ class Blocker6CounterResetIsIrrelevant(unittest.TestCase):
 
 
 class Blocker7ReaderLifecycle(unittest.TestCase):
-    def test_initialize_schedules_the_reader_and_terminate_retires_it(self):
+    def test_initialize_schedules_the_reader_and_a_restart_keeps_one_reader_and_its_reads(self):
         app, clock = running_app()
         self.assertIn((app._start_plug_poller, 0), [(cb, d) for cb, d, _ in app.scheduled])
         poller = wp.PlugPoller(lambda: 1.0, poll_s=0.02)
         app._plug = poller
         app._start_plug_poller({})
         time.sleep(0.1)
+        before = len(poller.snapshot())
+        app._start_plug_poller({})
+        time.sleep(0.1)
         self.assertEqual(len([t for t in threading.enumerate() if t.name == "washer-plug"]), 1)
-        app.terminate()
+        self.assertGreater(len(poller.snapshot()), before)
+        poller.stop()
         time.sleep(0.1)
         self.assertEqual([t for t in threading.enumerate() if t.name == "washer-plug"], [])
+
+    def test_an_app_restart_reuses_the_poller_with_its_ring_and_last_decision(self):
+        app, clock = running_app()
+        app._plug._ring.append((clock.t, 300.0))
+        app._plug.checked_at = clock.t
+        restarted = trs.make_full_init_app(sensor_state="Running", power_watts=3.0, extra_args={}, now=app.now,
+                                           keep_plug=True)
+        self.assertIs(restarted._plug, app._plug)
+        self.assertEqual(restarted._plug.checked_at, clock.t)
+        self.assertEqual(restarted._plug.snapshot()[-1], (clock.t, 300.0))
 
 
 class OutagePolicy(unittest.TestCase):
