@@ -1,0 +1,2107 @@
+{
+ "Trip": [
+  {
+   "Origin": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Enghave Plads",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Enghave Plads"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Enghave Plads St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+    "extId": "8603344",
+    "lon": 12.545813,
+    "lat": 55.667283,
+    "routeIdx": 16,
+    "prognosisType": "PROGNOSED",
+    "time": "14:42:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "Destination": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "København H",
+       "key": "MY",
+       "type": "I",
+       "txtN": "København H"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "København H (Metro)",
+    "type": "ST",
+    "id": "A=1@O=København H (Metro)@X=12564124@Y=55671940@U=86@L=8603330@",
+    "extId": "8603330",
+    "lon": 12.564124,
+    "lat": 55.67194,
+    "routeIdx": 17,
+    "prognosisType": "PROGNOSED",
+    "time": "14:43:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "ServiceDays": [
+    {
+     "planningPeriodBegin": "2026-11-06",
+     "planningPeriodEnd": "2027-01-27",
+     "sDaysR": "ikke altid",
+     "sDaysI": "8. nov - 27. dec 2026 lør, søn",
+     "sDaysB": "60C183060C183000000000"
+    }
+   ],
+   "LegList": {
+    "Leg": [
+     {
+      "Origin": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Enghave Plads",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Enghave Plads"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Enghave Plads St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+       "extId": "8603344",
+       "lon": 12.545813,
+       "lat": 55.667283,
+       "routeIdx": 16,
+       "prognosisType": "PROGNOSED",
+       "time": "14:42:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Destination": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "København H",
+          "key": "MY",
+          "type": "I",
+          "txtN": "København H"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "København H (Metro)",
+       "type": "ST",
+       "id": "A=1@O=København H (Metro)@X=12564124@Y=55671940@U=86@L=8603330@",
+       "extId": "8603330",
+       "lon": 12.564124,
+       "lat": 55.67194,
+       "routeIdx": 17,
+       "prognosisType": "PROGNOSED",
+       "time": "14:43:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Notes": {
+       "Note": [
+        {
+         "value": "Toget har lav indstigning",
+         "key": "BE",
+         "type": "A",
+         "priority": 0,
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "Toget har lav indstigning"
+        },
+        {
+         "value": "E6140F",
+         "key": "CT",
+         "type": "I",
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "E6140F"
+        },
+        {
+         "value": "9614",
+         "key": "FD",
+         "type": "I",
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "9614"
+        }
+       ]
+      },
+      "JourneyDetailRef": {
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61070#TA#46#DA#81126#1S#8603330#1T#1420#LS#8603330#LT#1507#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1420#TO#8603330#TT#1507#"
+      },
+      "JourneyStatus": "P",
+      "Product": [
+       {
+        "icon": {
+         "foregroundColor": {
+          "r": 255,
+          "g": 255,
+          "b": 255,
+          "hex": "#FFFFFF"
+         },
+         "backgroundColor": {
+          "r": 230,
+          "g": 20,
+          "b": 15,
+          "hex": "#E6140F"
+         },
+         "res": "prod_sub"
+        },
+        "operatorInfo": {
+         "name": "Metroselskabet",
+         "nameS": "Met",
+         "nameN": "Metro",
+         "nameL": "Metroselskabet"
+        },
+        "name": "Metro M3",
+        "internalName": "Metro M3",
+        "displayNumber": "M3",
+        "num": "7171",
+        "line": "M3",
+        "lineId": "034_000082_M3",
+        "catOut": "MET",
+        "catIn": "034",
+        "catCode": "10",
+        "cls": "1024",
+        "catOutS": "034",
+        "catOutL": "Metro",
+        "operatorCode": "Met",
+        "operator": "Metroselskabet",
+        "admin": "000082",
+        "routeIdxFrom": 16,
+        "routeIdxTo": 17,
+        "matchId": "9614"
+       }
+      ],
+      "JourneyDetail": {
+       "dayOfOperation": "2026-11-08",
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61070#TA#46#DA#81126#1S#8603330#1T#1420#LS#8603330#LT#1507#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1420#TO#8603330#TT#1507#"
+      },
+      "id": "C-0:000",
+      "idx": 0,
+      "name": "Metro M3",
+      "number": "M3",
+      "category": "034",
+      "type": "JNY",
+      "reachable": true,
+      "waitingState": "UNDEF",
+      "direction": "via København H",
+      "directionFlag": "1",
+      "duration": "PT1M"
+     }
+    ]
+   },
+   "calculation": "INITIAL",
+   "TripStatus": {
+    "hintCode": 0
+   },
+   "idx": 0,
+   "tripId": "C-0",
+   "ctxRecon": "¶HKI¶T$A=1@O=Enghave Plads St. (Metro)@L=8603344@a=128@$A=1@O=København H (Metro)@L=8603330@a=128@$202611081442$202611081443$Metro M3$$1$$$$$$¶KC¶#VE#2#CF#100#CA#0#CM#0#SICT#0#AM#16481#AM2#0#RT#20#¶KRCC¶#VE#1#MRTF#",
+   "duration": "PT1M",
+   "checksum": "b55ddb44_3",
+   "checksumDti": "5538d5b1_3",
+   "checksumSave": "b55ddb44_3"
+  },
+  {
+   "Origin": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Enghave Plads",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Enghave Plads"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Enghave Plads St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+    "extId": "8603344",
+    "lon": 12.545813,
+    "lat": 55.667283,
+    "routeIdx": 16,
+    "prognosisType": "PROGNOSED",
+    "time": "14:46:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "Destination": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "København H",
+       "key": "MY",
+       "type": "I",
+       "txtN": "København H"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "København H (Metro)",
+    "type": "ST",
+    "id": "A=1@O=København H (Metro)@X=12564124@Y=55671940@U=86@L=8603330@",
+    "extId": "8603330",
+    "lon": 12.564124,
+    "lat": 55.67194,
+    "routeIdx": 17,
+    "prognosisType": "PROGNOSED",
+    "time": "14:47:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "ServiceDays": [
+    {
+     "planningPeriodBegin": "2026-11-06",
+     "planningPeriodEnd": "2027-01-27",
+     "sDaysR": "ikke altid",
+     "sDaysI": "8. nov - 31. dec 2026",
+     "sDaysB": "FFFFFFFFFFFFFF00000000"
+    }
+   ],
+   "LegList": {
+    "Leg": [
+     {
+      "Origin": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Enghave Plads",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Enghave Plads"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Enghave Plads St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+       "extId": "8603344",
+       "lon": 12.545813,
+       "lat": 55.667283,
+       "routeIdx": 16,
+       "prognosisType": "PROGNOSED",
+       "time": "14:46:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Destination": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "København H",
+          "key": "MY",
+          "type": "I",
+          "txtN": "København H"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "København H (Metro)",
+       "type": "ST",
+       "id": "A=1@O=København H (Metro)@X=12564124@Y=55671940@U=86@L=8603330@",
+       "extId": "8603330",
+       "lon": 12.564124,
+       "lat": 55.67194,
+       "routeIdx": 17,
+       "prognosisType": "PROGNOSED",
+       "time": "14:47:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Notes": {
+       "Note": [
+        {
+         "value": "Toget har lav indstigning",
+         "key": "BE",
+         "type": "A",
+         "priority": 0,
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "Toget har lav indstigning"
+        },
+        {
+         "value": "E6140F",
+         "key": "CT",
+         "type": "I",
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "E6140F"
+        },
+        {
+         "value": "9673",
+         "key": "FD",
+         "type": "I",
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "9673"
+        }
+       ]
+      },
+      "JourneyDetailRef": {
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61070#TA#47#DA#81126#1S#8603330#1T#1424#LS#8603330#LT#1511#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1424#TO#8603330#TT#1511#"
+      },
+      "JourneyStatus": "P",
+      "Product": [
+       {
+        "icon": {
+         "foregroundColor": {
+          "r": 255,
+          "g": 255,
+          "b": 255,
+          "hex": "#FFFFFF"
+         },
+         "backgroundColor": {
+          "r": 230,
+          "g": 20,
+          "b": 15,
+          "hex": "#E6140F"
+         },
+         "res": "prod_sub"
+        },
+        "operatorInfo": {
+         "name": "Metroselskabet",
+         "nameS": "Met",
+         "nameN": "Metro",
+         "nameL": "Metroselskabet"
+        },
+        "name": "Metro M3",
+        "internalName": "Metro M3",
+        "displayNumber": "M3",
+        "num": "7251",
+        "line": "M3",
+        "lineId": "034_000082_M3",
+        "catOut": "MET",
+        "catIn": "034",
+        "catCode": "10",
+        "cls": "1024",
+        "catOutS": "034",
+        "catOutL": "Metro",
+        "operatorCode": "Met",
+        "operator": "Metroselskabet",
+        "admin": "000082",
+        "routeIdxFrom": 16,
+        "routeIdxTo": 17,
+        "matchId": "9673"
+       }
+      ],
+      "JourneyDetail": {
+       "dayOfOperation": "2026-11-08",
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61070#TA#47#DA#81126#1S#8603330#1T#1424#LS#8603330#LT#1511#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1424#TO#8603330#TT#1511#"
+      },
+      "id": "C-1:000",
+      "idx": 0,
+      "name": "Metro M3",
+      "number": "M3",
+      "category": "034",
+      "type": "JNY",
+      "reachable": true,
+      "waitingState": "UNDEF",
+      "direction": "via København H",
+      "directionFlag": "1",
+      "duration": "PT1M"
+     }
+    ]
+   },
+   "calculation": "INITIAL",
+   "TripStatus": {
+    "hintCode": 0
+   },
+   "idx": 1,
+   "tripId": "C-1",
+   "ctxRecon": "¶HKI¶T$A=1@O=Enghave Plads St. (Metro)@L=8603344@a=128@$A=1@O=København H (Metro)@L=8603330@a=128@$202611081446$202611081447$Metro M3$$1$$$$$$¶KC¶#VE#2#CF#100#CA#0#CM#0#SICT#0#AM#16481#AM2#0#RT#20#¶KRCC¶#VE#1#MRTF#",
+   "duration": "PT1M",
+   "checksum": "0df38ffa_3",
+   "checksumDti": "73abc1e1_3",
+   "checksumSave": "0df38ffa_3"
+  },
+  {
+   "Origin": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Enghave Plads",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Enghave Plads"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Enghave Plads St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+    "extId": "8603344",
+    "lon": 12.545813,
+    "lat": 55.667283,
+    "routeIdx": 16,
+    "prognosisType": "PROGNOSED",
+    "time": "14:50:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "Destination": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "København H",
+       "key": "MY",
+       "type": "I",
+       "txtN": "København H"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "København H (Metro)",
+    "type": "ST",
+    "id": "A=1@O=København H (Metro)@X=12564124@Y=55671940@U=86@L=8603330@",
+    "extId": "8603330",
+    "lon": 12.564124,
+    "lat": 55.67194,
+    "routeIdx": 17,
+    "prognosisType": "PROGNOSED",
+    "time": "14:51:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "ServiceDays": [
+    {
+     "planningPeriodBegin": "2026-11-06",
+     "planningPeriodEnd": "2027-01-27",
+     "sDaysR": "ikke altid",
+     "sDaysI": "8. nov - 27. dec 2026 lør, søn",
+     "sDaysB": "60C183060C183000000000"
+    }
+   ],
+   "LegList": {
+    "Leg": [
+     {
+      "Origin": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Enghave Plads",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Enghave Plads"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Enghave Plads St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+       "extId": "8603344",
+       "lon": 12.545813,
+       "lat": 55.667283,
+       "routeIdx": 16,
+       "prognosisType": "PROGNOSED",
+       "time": "14:50:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Destination": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "København H",
+          "key": "MY",
+          "type": "I",
+          "txtN": "København H"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "København H (Metro)",
+       "type": "ST",
+       "id": "A=1@O=København H (Metro)@X=12564124@Y=55671940@U=86@L=8603330@",
+       "extId": "8603330",
+       "lon": 12.564124,
+       "lat": 55.67194,
+       "routeIdx": 17,
+       "prognosisType": "PROGNOSED",
+       "time": "14:51:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Notes": {
+       "Note": [
+        {
+         "value": "Toget har lav indstigning",
+         "key": "BE",
+         "type": "A",
+         "priority": 0,
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "Toget har lav indstigning"
+        },
+        {
+         "value": "E6140F",
+         "key": "CT",
+         "type": "I",
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "E6140F"
+        },
+        {
+         "value": "9826",
+         "key": "FD",
+         "type": "I",
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "9826"
+        }
+       ]
+      },
+      "JourneyDetailRef": {
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61070#TA#48#DA#81126#1S#8603330#1T#1428#LS#8603330#LT#1515#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1428#TO#8603330#TT#1515#"
+      },
+      "JourneyStatus": "P",
+      "Product": [
+       {
+        "icon": {
+         "foregroundColor": {
+          "r": 255,
+          "g": 255,
+          "b": 255,
+          "hex": "#FFFFFF"
+         },
+         "backgroundColor": {
+          "r": 230,
+          "g": 20,
+          "b": 15,
+          "hex": "#E6140F"
+         },
+         "res": "prod_sub"
+        },
+        "operatorInfo": {
+         "name": "Metroselskabet",
+         "nameS": "Met",
+         "nameN": "Metro",
+         "nameL": "Metroselskabet"
+        },
+        "name": "Metro M3",
+        "internalName": "Metro M3",
+        "displayNumber": "M3",
+        "num": "7323",
+        "line": "M3",
+        "lineId": "034_000082_M3",
+        "catOut": "MET",
+        "catIn": "034",
+        "catCode": "10",
+        "cls": "1024",
+        "catOutS": "034",
+        "catOutL": "Metro",
+        "operatorCode": "Met",
+        "operator": "Metroselskabet",
+        "admin": "000082",
+        "routeIdxFrom": 16,
+        "routeIdxTo": 17,
+        "matchId": "9826"
+       }
+      ],
+      "JourneyDetail": {
+       "dayOfOperation": "2026-11-08",
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61070#TA#48#DA#81126#1S#8603330#1T#1428#LS#8603330#LT#1515#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1428#TO#8603330#TT#1515#"
+      },
+      "id": "C-2:000",
+      "idx": 0,
+      "name": "Metro M3",
+      "number": "M3",
+      "category": "034",
+      "type": "JNY",
+      "reachable": true,
+      "waitingState": "UNDEF",
+      "direction": "via København H",
+      "directionFlag": "1",
+      "duration": "PT1M"
+     }
+    ]
+   },
+   "calculation": "INITIAL",
+   "TripStatus": {
+    "hintCode": 0
+   },
+   "idx": 2,
+   "tripId": "C-2",
+   "ctxRecon": "¶HKI¶T$A=1@O=Enghave Plads St. (Metro)@L=8603344@a=128@$A=1@O=København H (Metro)@L=8603330@a=128@$202611081450$202611081451$Metro M3$$1$$$$$$¶KC¶#VE#2#CF#100#CA#0#CM#0#SICT#0#AM#16481#AM2#0#RT#20#¶KRCC¶#VE#1#MRTF#",
+   "duration": "PT1M",
+   "checksum": "1c87d3f6_3",
+   "checksumDti": "4376cdef_3",
+   "checksumSave": "1c87d3f6_3"
+  },
+  {
+   "Origin": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Enghave Plads",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Enghave Plads"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Enghave Plads St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+    "extId": "8603344",
+    "lon": 12.545813,
+    "lat": 55.667283,
+    "routeIdx": 16,
+    "prognosisType": "PROGNOSED",
+    "time": "14:54:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "Destination": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "København H",
+       "key": "MY",
+       "type": "I",
+       "txtN": "København H"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "København H (Metro)",
+    "type": "ST",
+    "id": "A=1@O=København H (Metro)@X=12564124@Y=55671940@U=86@L=8603330@",
+    "extId": "8603330",
+    "lon": 12.564124,
+    "lat": 55.67194,
+    "routeIdx": 17,
+    "prognosisType": "PROGNOSED",
+    "time": "14:55:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "ServiceDays": [
+    {
+     "planningPeriodBegin": "2026-11-06",
+     "planningPeriodEnd": "2027-01-27",
+     "sDaysR": "ikke altid",
+     "sDaysI": "8. nov - 27. dec 2026 lør, søn",
+     "sDaysB": "60C183060C183000000000"
+    }
+   ],
+   "LegList": {
+    "Leg": [
+     {
+      "Origin": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Enghave Plads",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Enghave Plads"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Enghave Plads St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+       "extId": "8603344",
+       "lon": 12.545813,
+       "lat": 55.667283,
+       "routeIdx": 16,
+       "prognosisType": "PROGNOSED",
+       "time": "14:54:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Destination": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "København H",
+          "key": "MY",
+          "type": "I",
+          "txtN": "København H"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "København H (Metro)",
+       "type": "ST",
+       "id": "A=1@O=København H (Metro)@X=12564124@Y=55671940@U=86@L=8603330@",
+       "extId": "8603330",
+       "lon": 12.564124,
+       "lat": 55.67194,
+       "routeIdx": 17,
+       "prognosisType": "PROGNOSED",
+       "time": "14:55:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Notes": {
+       "Note": [
+        {
+         "value": "Toget har lav indstigning",
+         "key": "BE",
+         "type": "A",
+         "priority": 0,
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "Toget har lav indstigning"
+        },
+        {
+         "value": "E6140F",
+         "key": "CT",
+         "type": "I",
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "E6140F"
+        },
+        {
+         "value": "9884",
+         "key": "FD",
+         "type": "I",
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "9884"
+        }
+       ]
+      },
+      "JourneyDetailRef": {
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61070#TA#49#DA#81126#1S#8603330#1T#1432#LS#8603330#LT#1519#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1432#TO#8603330#TT#1519#"
+      },
+      "JourneyStatus": "P",
+      "Product": [
+       {
+        "icon": {
+         "foregroundColor": {
+          "r": 255,
+          "g": 255,
+          "b": 255,
+          "hex": "#FFFFFF"
+         },
+         "backgroundColor": {
+          "r": 230,
+          "g": 20,
+          "b": 15,
+          "hex": "#E6140F"
+         },
+         "res": "prod_sub"
+        },
+        "operatorInfo": {
+         "name": "Metroselskabet",
+         "nameS": "Met",
+         "nameN": "Metro",
+         "nameL": "Metroselskabet"
+        },
+        "name": "Metro M3",
+        "internalName": "Metro M3",
+        "displayNumber": "M3",
+        "num": "7365",
+        "line": "M3",
+        "lineId": "034_000082_M3",
+        "catOut": "MET",
+        "catIn": "034",
+        "catCode": "10",
+        "cls": "1024",
+        "catOutS": "034",
+        "catOutL": "Metro",
+        "operatorCode": "Met",
+        "operator": "Metroselskabet",
+        "admin": "000082",
+        "routeIdxFrom": 16,
+        "routeIdxTo": 17,
+        "matchId": "9884"
+       }
+      ],
+      "JourneyDetail": {
+       "dayOfOperation": "2026-11-08",
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61070#TA#49#DA#81126#1S#8603330#1T#1432#LS#8603330#LT#1519#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1432#TO#8603330#TT#1519#"
+      },
+      "id": "C-3:000",
+      "idx": 0,
+      "name": "Metro M3",
+      "number": "M3",
+      "category": "034",
+      "type": "JNY",
+      "reachable": true,
+      "waitingState": "UNDEF",
+      "direction": "via København H",
+      "directionFlag": "1",
+      "duration": "PT1M"
+     }
+    ]
+   },
+   "calculation": "INITIAL",
+   "TripStatus": {
+    "hintCode": 0
+   },
+   "idx": 3,
+   "tripId": "C-3",
+   "ctxRecon": "¶HKI¶T$A=1@O=Enghave Plads St. (Metro)@L=8603344@a=128@$A=1@O=København H (Metro)@L=8603330@a=128@$202611081454$202611081455$Metro M3$$1$$$$$$¶KC¶#VE#2#CF#100#CA#0#CM#0#SICT#0#AM#16481#AM2#0#RT#20#¶KRCC¶#VE#1#MRTF#",
+   "duration": "PT1M",
+   "checksum": "26745baf_3",
+   "checksumDti": "d4c1419d_3",
+   "checksumSave": "26745baf_3"
+  },
+  {
+   "Origin": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Enghave Plads",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Enghave Plads"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Enghave Plads St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+    "extId": "8603344",
+    "lon": 12.545813,
+    "lat": 55.667283,
+    "routeIdx": 16,
+    "prognosisType": "PROGNOSED",
+    "time": "14:58:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "Destination": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "København H",
+       "key": "MY",
+       "type": "I",
+       "txtN": "København H"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "København H (Metro)",
+    "type": "ST",
+    "id": "A=1@O=København H (Metro)@X=12564124@Y=55671940@U=86@L=8603330@",
+    "extId": "8603330",
+    "lon": 12.564124,
+    "lat": 55.67194,
+    "routeIdx": 17,
+    "prognosisType": "PROGNOSED",
+    "time": "14:59:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "ServiceDays": [
+    {
+     "planningPeriodBegin": "2026-11-06",
+     "planningPeriodEnd": "2027-01-27",
+     "sDaysR": "ikke altid",
+     "sDaysI": "8. nov - 31. dec 2026",
+     "sDaysB": "FFFFFFFFFFFFFF00000000"
+    }
+   ],
+   "LegList": {
+    "Leg": [
+     {
+      "Origin": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Enghave Plads",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Enghave Plads"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Enghave Plads St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+       "extId": "8603344",
+       "lon": 12.545813,
+       "lat": 55.667283,
+       "routeIdx": 16,
+       "prognosisType": "PROGNOSED",
+       "time": "14:58:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Destination": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "København H",
+          "key": "MY",
+          "type": "I",
+          "txtN": "København H"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "København H (Metro)",
+       "type": "ST",
+       "id": "A=1@O=København H (Metro)@X=12564124@Y=55671940@U=86@L=8603330@",
+       "extId": "8603330",
+       "lon": 12.564124,
+       "lat": 55.67194,
+       "routeIdx": 17,
+       "prognosisType": "PROGNOSED",
+       "time": "14:59:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Notes": {
+       "Note": [
+        {
+         "value": "Toget har lav indstigning",
+         "key": "BE",
+         "type": "A",
+         "priority": 0,
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "Toget har lav indstigning"
+        },
+        {
+         "value": "E6140F",
+         "key": "CT",
+         "type": "I",
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "E6140F"
+        },
+        {
+         "value": "9942",
+         "key": "FD",
+         "type": "I",
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "9942"
+        }
+       ]
+      },
+      "JourneyDetailRef": {
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61070#TA#50#DA#81126#1S#8603330#1T#1436#LS#8603330#LT#1523#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1436#TO#8603330#TT#1523#"
+      },
+      "JourneyStatus": "P",
+      "Product": [
+       {
+        "icon": {
+         "foregroundColor": {
+          "r": 255,
+          "g": 255,
+          "b": 255,
+          "hex": "#FFFFFF"
+         },
+         "backgroundColor": {
+          "r": 230,
+          "g": 20,
+          "b": 15,
+          "hex": "#E6140F"
+         },
+         "res": "prod_sub"
+        },
+        "operatorInfo": {
+         "name": "Metroselskabet",
+         "nameS": "Met",
+         "nameN": "Metro",
+         "nameL": "Metroselskabet"
+        },
+        "name": "Metro M3",
+        "internalName": "Metro M3",
+        "displayNumber": "M3",
+        "num": "7445",
+        "line": "M3",
+        "lineId": "034_000082_M3",
+        "catOut": "MET",
+        "catIn": "034",
+        "catCode": "10",
+        "cls": "1024",
+        "catOutS": "034",
+        "catOutL": "Metro",
+        "operatorCode": "Met",
+        "operator": "Metroselskabet",
+        "admin": "000082",
+        "routeIdxFrom": 16,
+        "routeIdxTo": 17,
+        "matchId": "9942"
+       }
+      ],
+      "JourneyDetail": {
+       "dayOfOperation": "2026-11-08",
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61070#TA#50#DA#81126#1S#8603330#1T#1436#LS#8603330#LT#1523#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1436#TO#8603330#TT#1523#"
+      },
+      "id": "C-4:000",
+      "idx": 0,
+      "name": "Metro M3",
+      "number": "M3",
+      "category": "034",
+      "type": "JNY",
+      "reachable": true,
+      "waitingState": "UNDEF",
+      "direction": "via København H",
+      "directionFlag": "1",
+      "duration": "PT1M"
+     }
+    ]
+   },
+   "calculation": "INITIAL",
+   "TripStatus": {
+    "hintCode": 0
+   },
+   "idx": 4,
+   "tripId": "C-4",
+   "ctxRecon": "¶HKI¶T$A=1@O=Enghave Plads St. (Metro)@L=8603344@a=128@$A=1@O=København H (Metro)@L=8603330@a=128@$202611081458$202611081459$Metro M3$$1$$$$$$¶KC¶#VE#2#CF#100#CA#0#CM#0#SICT#0#AM#16481#AM2#0#RT#20#¶KRCC¶#VE#1#MRTF#",
+   "duration": "PT1M",
+   "checksum": "6ec37996_3",
+   "checksumDti": "55d8e97e_3",
+   "checksumSave": "6ec37996_3"
+  },
+  {
+   "Origin": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Enghave Plads",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Enghave Plads"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Enghave Plads St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+    "extId": "8603344",
+    "lon": 12.545813,
+    "lat": 55.667283,
+    "routeIdx": 16,
+    "prognosisType": "PROGNOSED",
+    "time": "15:02:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "Destination": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "København H",
+       "key": "MY",
+       "type": "I",
+       "txtN": "København H"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "København H (Metro)",
+    "type": "ST",
+    "id": "A=1@O=København H (Metro)@X=12564124@Y=55671940@U=86@L=8603330@",
+    "extId": "8603330",
+    "lon": 12.564124,
+    "lat": 55.67194,
+    "routeIdx": 17,
+    "prognosisType": "PROGNOSED",
+    "time": "15:03:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "ServiceDays": [
+    {
+     "planningPeriodBegin": "2026-11-06",
+     "planningPeriodEnd": "2027-01-27",
+     "sDaysR": "ikke altid",
+     "sDaysI": "8. nov - 27. dec 2026 lør, søn",
+     "sDaysB": "60C183060C183000000000"
+    }
+   ],
+   "LegList": {
+    "Leg": [
+     {
+      "Origin": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Enghave Plads",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Enghave Plads"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Enghave Plads St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+       "extId": "8603344",
+       "lon": 12.545813,
+       "lat": 55.667283,
+       "routeIdx": 16,
+       "prognosisType": "PROGNOSED",
+       "time": "15:02:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Destination": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "København H",
+          "key": "MY",
+          "type": "I",
+          "txtN": "København H"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "København H (Metro)",
+       "type": "ST",
+       "id": "A=1@O=København H (Metro)@X=12564124@Y=55671940@U=86@L=8603330@",
+       "extId": "8603330",
+       "lon": 12.564124,
+       "lat": 55.67194,
+       "routeIdx": 17,
+       "prognosisType": "PROGNOSED",
+       "time": "15:03:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Notes": {
+       "Note": [
+        {
+         "value": "Toget har lav indstigning",
+         "key": "BE",
+         "type": "A",
+         "priority": 0,
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "Toget har lav indstigning"
+        },
+        {
+         "value": "E6140F",
+         "key": "CT",
+         "type": "I",
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "E6140F"
+        },
+        {
+         "value": "10096",
+         "key": "FD",
+         "type": "I",
+         "routeIdxFrom": 16,
+         "routeIdxTo": 17,
+         "txtN": "10096"
+        }
+       ]
+      },
+      "JourneyDetailRef": {
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61070#TA#51#DA#81126#1S#8603330#1T#1440#LS#8603330#LT#1527#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1440#TO#8603330#TT#1527#"
+      },
+      "JourneyStatus": "P",
+      "Product": [
+       {
+        "icon": {
+         "foregroundColor": {
+          "r": 255,
+          "g": 255,
+          "b": 255,
+          "hex": "#FFFFFF"
+         },
+         "backgroundColor": {
+          "r": 230,
+          "g": 20,
+          "b": 15,
+          "hex": "#E6140F"
+         },
+         "res": "prod_sub"
+        },
+        "operatorInfo": {
+         "name": "Metroselskabet",
+         "nameS": "Met",
+         "nameN": "Metro",
+         "nameL": "Metroselskabet"
+        },
+        "name": "Metro M3",
+        "internalName": "Metro M3",
+        "displayNumber": "M3",
+        "num": "7517",
+        "line": "M3",
+        "lineId": "034_000082_M3",
+        "catOut": "MET",
+        "catIn": "034",
+        "catCode": "10",
+        "cls": "1024",
+        "catOutS": "034",
+        "catOutL": "Metro",
+        "operatorCode": "Met",
+        "operator": "Metroselskabet",
+        "admin": "000082",
+        "routeIdxFrom": 16,
+        "routeIdxTo": 17,
+        "matchId": "10096"
+       }
+      ],
+      "JourneyDetail": {
+       "dayOfOperation": "2026-11-08",
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61070#TA#51#DA#81126#1S#8603330#1T#1440#LS#8603330#LT#1527#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1440#TO#8603330#TT#1527#"
+      },
+      "id": "C-5:000",
+      "idx": 0,
+      "name": "Metro M3",
+      "number": "M3",
+      "category": "034",
+      "type": "JNY",
+      "reachable": true,
+      "waitingState": "UNDEF",
+      "direction": "via København H",
+      "directionFlag": "1",
+      "duration": "PT1M"
+     }
+    ]
+   },
+   "calculation": "INITIAL",
+   "TripStatus": {
+    "hintCode": 0
+   },
+   "idx": 5,
+   "tripId": "C-5",
+   "ctxRecon": "¶HKI¶T$A=1@O=Enghave Plads St. (Metro)@L=8603344@a=128@$A=1@O=København H (Metro)@L=8603330@a=128@$202611081502$202611081503$Metro M3$$1$$$$$$¶KC¶#VE#2#CF#100#CA#0#CM#0#SICT#0#AM#16481#AM2#0#RT#20#¶KRCC¶#VE#1#MRTF#",
+   "duration": "PT1M",
+   "checksum": "484cebf4_3",
+   "checksumDti": "2ec1e3a3_3",
+   "checksumSave": "484cebf4_3"
+  }
+ ],
+ "ResultStatus": {
+  "timeDiffCritical": false
+ },
+ "TechnicalMessages": {
+  "TechnicalMessage": [
+   {
+    "value": "2026-11-08 14:42:59",
+    "key": "requestTime"
+   },
+   {
+    "value": "ttp=17112#17194 plancode0=ydb8y planid=1793972400 planid0=1793972400 planid_adr=1793621953 plancode_adr=x5tub planid_poi=1788521519 plancode_poi=u4ibl srvv=5.45.Rejseplanen.19.1.23 (customer/hcudk/release/2026.4.0.3) [2026-09-14] tlibv=TRFVER: rel/dk/13.03.2 2026-09-02 15:26:33 +0200 Rejsekort v13.3.1 jno=1",
+    "key": "backendInfo"
+   }
+  ]
+ },
+ "serverVersion": "2.53.1.2",
+ "dialectVersion": "2.53-Rejseplanen",
+ "planRtTs": "2026-11-08T14:42:53.000+01:00",
+ "requestId": "8y2x2qcsgxs3wm8g",
+ "scrB": "3|OB|MTµ14µ6642µ6642µ6643µ6643µ0µ0µ485µ6642µ1µ0µ106µ0µ0µ-2147483648µ1µ2|PDHµ5cc18aeded0ee8d47315a7bc7193c708|RDµ8112026|RTµ144259|USµ1|RSµINIT",
+ "scrF": "3|OF|MTµ14µ6662µ6662µ6663µ6663µ0µ0µ485µ6659µ6µ0µ106µ0µ0µ-2147483648µ1µ2|PDHµ5cc18aeded0ee8d47315a7bc7193c708|RDµ8112026|RTµ144259|USµ1|RSµINIT"
+}

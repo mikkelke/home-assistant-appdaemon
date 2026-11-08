@@ -1,0 +1,458 @@
+{
+ "ResultStatus": {
+  "timeDiffCritical": false
+ },
+ "serverVersion": "2.53.1.2",
+ "dialectVersion": "2.53-Rejseplanen",
+ "planRtTs": "2026-11-08T14:48:33.000+01:00",
+ "Trip": [
+  {
+   "Origin": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "8600646///741,74/",
+       "key": "TE",
+       "type": "I",
+       "txtN": "8600646///741,74/"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      },
+      {
+       "value": "Stoppested udgår",
+       "key": "text.realtime.stop.cancelled",
+       "type": "R",
+       "txtN": "Stoppested udgår"
+      }
+     ]
+    },
+    "platform": {
+     "type": "PL",
+     "text": "2"
+    },
+    "name": "Nørreport St.",
+    "type": "ST",
+    "id": "A=1@O=Nørreport St.@X=12571801@Y=55683455@U=86@L=8600646@",
+    "extId": "8600646",
+    "lon": 12.571801,
+    "lat": 55.683455,
+    "routeIdx": 12,
+    "time": "16:35:00",
+    "date": "2026-11-08",
+    "track": "2",
+    "isMainMast": true,
+    "rtBoarding": false,
+    "cancelled": true,
+    "cancelledDeparture": true,
+    "rtCnclDataSourceType": "DEFAULT",
+    "minimumChangeDuration": "PT4M"
+   },
+   "Destination": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "8600626///741,74/",
+       "key": "TE",
+       "type": "I",
+       "txtN": "8600626///741,74/"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      },
+      {
+       "value": "Stoppested udgår",
+       "key": "text.realtime.stop.cancelled",
+       "type": "R",
+       "txtN": "Stoppested udgår"
+      }
+     ]
+    },
+    "platform": {
+     "type": "PL",
+     "text": "6"
+    },
+    "name": "København H",
+    "type": "ST",
+    "id": "A=1@O=København H@X=12565562@Y=55673063@U=86@L=8600626@",
+    "extId": "8600626",
+    "lon": 12.565562,
+    "lat": 55.673063,
+    "routeIdx": 13,
+    "time": "16:38:00",
+    "date": "2026-11-08",
+    "track": "6",
+    "isMainMast": true,
+    "rtAlighting": false,
+    "cancelled": true,
+    "cancelledArrival": true,
+    "rtCnclDataSourceType": "DEFAULT",
+    "minimumChangeDuration": "PT6M"
+   },
+   "Notes": {
+    "Note": [
+     {
+      "value": "Et af dine transportmidler er desværre aflyst. Vi anbefaler derfor et af de øvrige rejseforslag.",
+      "key": "text.realtime.connection.cancelled",
+      "type": "R",
+      "txtN": "Et af dine transportmidler er desværre aflyst. Vi anbefaler derfor et af de øvrige rejseforslag."
+     },
+     {
+      "key": "text.realtime.connection.critical",
+      "type": "R"
+     }
+    ]
+   },
+   "ServiceDays": [
+    {
+     "planningPeriodBegin": "2026-11-06",
+     "planningPeriodEnd": "2027-01-27",
+     "sDaysR": "ikke altid",
+     "sDaysI": "8. nov - 12. dec 2026 lør, søn",
+     "sDaysB": "60C1830608000000000000"
+    }
+   ],
+   "LegList": {
+    "Leg": [
+     {
+      "Origin": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "8600646///741,74/",
+          "key": "TE",
+          "type": "I",
+          "txtN": "8600646///741,74/"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         },
+         {
+          "value": "Stoppested udgår",
+          "key": "text.realtime.stop.cancelled",
+          "type": "R",
+          "txtN": "Stoppested udgår"
+         }
+        ]
+       },
+       "platform": {
+        "type": "PL",
+        "text": "2"
+       },
+       "name": "Nørreport St.",
+       "type": "ST",
+       "id": "A=1@O=Nørreport St.@X=12571801@Y=55683455@U=86@L=8600646@",
+       "extId": "8600646",
+       "lon": 12.571801,
+       "lat": 55.683455,
+       "routeIdx": 12,
+       "time": "16:35:00",
+       "date": "2026-11-08",
+       "track": "2",
+       "isMainMast": true,
+       "rtBoarding": false,
+       "cancelled": true,
+       "cancelledDeparture": true,
+       "rtCnclDataSourceType": "DEFAULT",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Destination": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "8600626///741,74/",
+          "key": "TE",
+          "type": "I",
+          "txtN": "8600626///741,74/"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         },
+         {
+          "value": "Stoppested udgår",
+          "key": "text.realtime.stop.cancelled",
+          "type": "R",
+          "txtN": "Stoppested udgår"
+         }
+        ]
+       },
+       "platform": {
+        "type": "PL",
+        "text": "6"
+       },
+       "name": "København H",
+       "type": "ST",
+       "id": "A=1@O=København H@X=12565562@Y=55673063@U=86@L=8600626@",
+       "extId": "8600626",
+       "lon": 12.565562,
+       "lat": 55.673063,
+       "routeIdx": 13,
+       "time": "16:38:00",
+       "date": "2026-11-08",
+       "track": "6",
+       "isMainMast": true,
+       "rtAlighting": false,
+       "cancelled": true,
+       "cancelledArrival": true,
+       "rtCnclDataSourceType": "DEFAULT",
+       "minimumChangeDuration": "PT6M"
+      },
+      "Notes": {
+       "Note": [
+        {
+         "value": "Toget har lav indstigning",
+         "key": "BE",
+         "type": "A",
+         "priority": 0,
+         "routeIdxFrom": 12,
+         "routeIdxTo": 13,
+         "txtN": "Toget har lav indstigning"
+        },
+        {
+         "value": "Cykelmedtagning gratis",
+         "key": "FR",
+         "type": "A",
+         "priority": 99,
+         "routeIdxFrom": 12,
+         "routeIdxTo": 13,
+         "txtN": "Cykelmedtagning gratis"
+        },
+        {
+         "value": "Mulighed for internet",
+         "key": "TD",
+         "type": "A",
+         "priority": 200,
+         "routeIdxFrom": 12,
+         "routeIdxTo": 13,
+         "txtN": "Mulighed for internet"
+        },
+        {
+         "value": "4565",
+         "key": "FD",
+         "type": "I",
+         "routeIdxFrom": 12,
+         "routeIdxTo": 13,
+         "txtN": "4565"
+        },
+        {
+         "value": "50ae30",
+         "key": "CT",
+         "type": "I",
+         "routeIdxFrom": 12,
+         "routeIdxTo": 13,
+         "txtN": "50ae30"
+        },
+        {
+         "value": "Re 4565: Tog/bus aflyst. Søg venligst også information på stationen/stoppestedet.",
+         "key": "text.realtime.journey.cancelled",
+         "type": "R",
+         "txtN": "Re 4565: Tog/bus aflyst. Søg venligst også information på stationen/stoppestedet."
+        }
+       ]
+      },
+      "JourneyDetailRef": {
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#2464#TA#0#DA#81126#1S#8600669#1T#1543#LS#8600626#LT#1638#PU#86#RT#1#CA#004#ZE#4565#ZB#Re 4565#PC#2#FR#8600669#FT#1543#TO#8600626#TT#1638#"
+      },
+      "JourneyStatus": "P",
+      "Product": [
+       {
+        "icon": {
+         "foregroundColor": {
+          "r": 255,
+          "g": 255,
+          "b": 255,
+          "hex": "#FFFFFF"
+         },
+         "backgroundColor": {
+          "r": 80,
+          "g": 174,
+          "b": 48,
+          "hex": "#50AE30"
+         },
+         "res": "prod_ic"
+        },
+        "operatorInfo": {
+         "name": "DSB",
+         "nameS": "DSB",
+         "nameN": "DSB",
+         "nameL": "DSB"
+        },
+        "name": "Re 4565",
+        "internalName": "Re 4565",
+        "displayNumber": "4565",
+        "num": "4565",
+        "line": "4565",
+        "lineId": "004_000002_4565",
+        "lineHidden": true,
+        "catOut": "Re",
+        "catIn": "004",
+        "catCode": "2",
+        "cls": "4",
+        "catOutS": "004",
+        "catOutL": "Re",
+        "operatorCode": "DSB",
+        "operator": "DSB",
+        "admin": "000002",
+        "routeIdxFrom": 12,
+        "routeIdxTo": 13,
+        "matchId": "4565"
+       }
+      ],
+      "JourneyDetail": {
+       "dayOfOperation": "2026-11-08",
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#2464#TA#0#DA#81126#1S#8600669#1T#1543#LS#8600626#LT#1638#PU#86#RT#1#CA#004#ZE#4565#ZB#Re 4565#PC#2#FR#8600669#FT#1543#TO#8600626#TT#1638#"
+      },
+      "id": "C-6:000",
+      "idx": 0,
+      "name": "Re 4565",
+      "number": "4565",
+      "category": "004",
+      "type": "JNY",
+      "cancelled": true,
+      "reachable": false,
+      "waitingState": "NOWAIT",
+      "direction": "København H",
+      "directionFlag": "1",
+      "duration": "PT3M"
+     }
+    ]
+   },
+   "calculation": "INITIAL",
+   "TripStatus": {
+    "hintCode": 0
+   },
+   "valid": false,
+   "idx": 6,
+   "tripId": "C-6",
+   "ctxRecon": "¶HKI¶T$A=1@O=Nørreport St.@L=8600646@a=128@$A=1@O=København H@L=8600626@a=128@$202611081635$202611081638$Re 4565$$1$$$$$$¶KC¶#VE#2#CF#100#CA#0#CM#0#SICT#0#AM#16481#AM2#0#RT#20#¶KRCC¶#VE#1#MRTF#",
+   "duration": "PT3M",
+   "checksum": "6b906663_3",
+   "checksumDti": "5227a902_3",
+   "checksumSave": "6b906663_3"
+  }
+ ]
+}

@@ -14,10 +14,13 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import re
 import sys
 import types
 import unittest
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -1023,6 +1026,634 @@ class TestOperatorStatusConfig(unittest.TestCase):
             with self.subTest(label):
                 with self.assertRaisesRegex(ValueError, "needs operator_status_lines"):
                     self.start(route)
+
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+ENGHAVE_PLADS = "8603344"
+KBH_H = "8603330"
+FREDERIKSBERG_ALLE = "8603343"
+TO_KBH_H = "trip_enghave_to_kbh_h"
+TO_FREDERIKSBERG_ALLE = "trip_enghave_to_frederiksberg_alle"
+CANCELLED_REGIONAL_LEG = "trip_cancelled_regional_leg"
+TRIP_URL = "https://www.rejseplanen.dk/api/trip"
+BOARD_URL = "https://www.rejseplanen.dk/api/departureBoard"
+BOARD_METRO = dict(MDK_METRO)
+TRIP_METRO = dict(MDK_METRO, departure_source="trip", trip_dest_id=KBH_H)
+TRIP_METRO_FRB = dict(
+    TRIP_METRO, sensor_id="enghave_metro_frb", transport_name="Metro M3 -> Frederiksberg", trip_dest_id=FREDERIKSBERG_ALLE
+)
+
+
+def trip_search(name: str) -> dict:
+    """A trip search as Rejseplanen answered it, parsed afresh on every call."""
+    return json.loads((FIXTURES / f"{name}.json").read_text(encoding="utf-8"))
+
+
+def first_leg(trip: dict) -> dict:
+    return trip["LegList"]["Leg"][0]
+
+
+def leaves_at(leg: dict) -> datetime:
+    return datetime.strptime(f"{leg['Origin']['date']} {leg['Origin']['time']}", "%Y-%m-%d %H:%M:%S")
+
+
+def moved_to_now(search: dict, first_in_min: int = 2) -> dict:
+    """The search with its trains moved so the first leaves `first_in_min` from now, their spacing kept."""
+    start = datetime.now().replace(second=0, microsecond=0) + timedelta(minutes=first_in_min)
+    first = leaves_at(first_leg(search["Trip"][0]))
+    for trip in search["Trip"]:
+        for leg in trip["LegList"]["Leg"]:
+            moved = start + (leaves_at(leg) - first)
+            leg["Origin"]["date"], leg["Origin"]["time"] = moved.strftime("%Y-%m-%d"), moved.strftime("%H:%M:%S")
+    return search
+
+
+def late_by(leg: dict, minutes: int, *, with_date: bool = True) -> datetime:
+    """Give the leg a realtime `minutes` after its scheduled time; returns that time."""
+    realtime = leaves_at(leg) + timedelta(minutes=minutes)
+    if with_date:
+        leg["Origin"]["rtDate"] = realtime.strftime("%Y-%m-%d")
+    leg["Origin"]["rtTime"] = realtime.strftime("%H:%M:%S")
+    return realtime
+
+
+def other_leg(leg: dict, **product) -> dict:
+    """The leg as a journey of another product, or on another line of the same."""
+    changed = copy.deepcopy(leg)
+    changed["Product"][0].update(product)
+    return changed
+
+
+def walking_leg(leg: dict) -> dict:
+    return {
+        "type": "WALK",
+        "name": "Gå",
+        "dist": 58,
+        "duration": "PT2M",
+        "Origin": copy.deepcopy(leg["Origin"]),
+        "Destination": copy.deepcopy(leg["Destination"]),
+        "Product": [{"name": "Gå", "internalName": "Gå", "icon": {"res": "prod_walk", "txtS": "2min"}}],
+    }
+
+
+def trips_of(*legs_per_trip: list[dict]) -> dict:
+    return {"Trip": [{"LegList": {"Leg": legs}} for legs in legs_per_trip]}
+
+
+BUS = {"name": "Bus 23", "displayNumber": "23", "line": "23", "catOut": "Bus", "cls": "32", "catCode": "5"}
+
+
+class TestCapturedTripSearches(unittest.TestCase):
+    """The captured responses are what the Metro routes rely on: six one-leg Metro M3 trips from Enghave Plads."""
+
+    def test_each_search_is_six_direct_metro_m3_trips_from_enghave_plads_to_the_next_stop(self):
+        cases = {
+            TO_KBH_H: (KBH_H, "via København H"),
+            TO_FREDERIKSBERG_ALLE: (FREDERIKSBERG_ALLE, "via Frederiksberg"),
+        }
+        for name, (destination, direction) in cases.items():
+            with self.subTest(name):
+                trips = trip_search(name)["Trip"]
+                self.assertEqual(len(trips), ta.TRIP_COUNT)
+                for trip in trips:
+                    [leg] = trip["LegList"]["Leg"]
+                    self.assertEqual(leg["Origin"]["extId"], ENGHAVE_PLADS)
+                    self.assertEqual(leg["Destination"]["extId"], destination)
+                    self.assertEqual(leg["direction"], direction)
+                    [product] = leg["Product"]
+                    self.assertEqual(
+                        (product["cls"], product["catOut"], product["line"], product["operator"]),
+                        ("1024", "MET", "M3", "Metroselskabet"),
+                    )
+
+    def test_a_cancelled_leg_is_flagged_on_the_leg_and_on_its_origin(self):
+        [trip] = trip_search(CANCELLED_REGIONAL_LEG)["Trip"]
+        [leg] = trip["LegList"]["Leg"]
+        self.assertIs(leg["cancelled"], True)
+        self.assertIs(leg["Origin"]["cancelled"], True)
+        self.assertIs(leg["Origin"]["cancelledDeparture"], True)
+        self.assertIs(leg["reachable"], False)
+
+    def test_a_captured_search_has_no_access_id(self):
+        uuid = re.compile(r"[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}")
+        for path in FIXTURES.glob("*.json"):
+            with self.subTest(path.name):
+                self.assertIsNone(uuid.search(path.read_text(encoding="utf-8")))
+
+
+class TestTripDepartures(unittest.TestCase):
+    """What the first Metro leg of each trip gives."""
+
+    def departures(self, search: dict, lines=("M3",), stop_id: str = ENGHAVE_PLADS) -> list[dict]:
+        return ta.trip_departures(search, stop_id, list(lines))
+
+    def test_the_search_to_kbh_h_gives_its_six_trains_soonest_first(self):
+        deps = self.departures(trip_search(TO_KBH_H))
+        self.assertEqual([d["time"][:5] for d in deps], ["14:42", "14:46", "14:50", "14:54", "14:58", "15:02"])
+        self.assertEqual({d["date"] for d in deps}, {"2026-11-08"})
+        for dep in deps:
+            self.assertEqual(
+                {k: dep["ProductAtStop"][k] for k in ("displayNumber", "line", "catOut", "cls")},
+                {"displayNumber": "M3", "line": "M3", "catOut": "MET", "cls": "1024"},
+            )
+
+    def test_the_search_to_frederiksberg_alle_gives_its_six_trains_soonest_first(self):
+        deps = self.departures(trip_search(TO_FREDERIKSBERG_ALLE))
+        self.assertEqual([d["time"][:5] for d in deps], ["14:45", "14:49", "14:53", "14:57", "15:01", "15:05"])
+
+    def test_a_departure_is_shaped_like_a_departure_board_entry(self):
+        [dep, *_] = self.departures(trip_search(TO_KBH_H))
+        self.assertEqual(
+            set(dep), {"date", "time", "rtDate", "rtTime", "ProductAtStop", "JourneyStatus", "cancelled"}
+        )
+        self.assertEqual((dep["time"], dep["rtDate"], dep["rtTime"]), ("14:42:00", None, None))
+        self.assertEqual((dep["JourneyStatus"], dep["cancelled"]), ("P", False))
+
+    def test_the_origin_carries_the_realtime_when_there_is_one(self):
+        search = trip_search(TO_KBH_H)
+        late_by(first_leg(search["Trip"][1]), 3)
+        deps = self.departures(search)
+        self.assertEqual([(d["rtDate"], d["rtTime"]) for d in deps][:3], [(None, None), ("2026-11-08", "14:49:00"), (None, None)])
+        self.assertEqual(deps[1]["time"], "14:46:00")
+
+    def test_a_cancelled_leg_or_origin_is_cancelled_however_the_flag_is_written(self):
+        flags = {True: True, "true": True, "True": True, False: False, "false": False, None: False}
+        for flag, cancelled in flags.items():
+            for where in ("leg", "origin"):
+                with self.subTest(where=where, flag=flag):
+                    search = trip_search(TO_KBH_H)
+                    leg = first_leg(search["Trip"][0])
+                    (leg if where == "leg" else leg["Origin"])["cancelled"] = flag
+                    self.assertIs(self.departures(search)[0]["cancelled"], cancelled)
+
+    def test_the_flags_of_a_captured_cancelled_leg_cancel_a_metro_departure(self):
+        [captured] = trip_search(CANCELLED_REGIONAL_LEG)["Trip"][0]["LegList"]["Leg"]
+        flags = {
+            "all of them": lambda leg: (
+                leg.update(cancelled=captured["cancelled"], reachable=captured["reachable"]),
+                leg["Origin"].update(
+                    cancelled=captured["Origin"]["cancelled"], cancelledDeparture=captured["Origin"]["cancelledDeparture"]
+                ),
+            ),
+            "the departure alone": lambda leg: leg["Origin"].update(cancelledDeparture=True),
+        }
+        for label, apply in flags.items():
+            with self.subTest(label):
+                search = trip_search(TO_KBH_H)
+                apply(first_leg(search["Trip"][0]))
+                self.assertEqual([d["cancelled"] for d in self.departures(search)], [True, False, False, False, False, False])
+
+    def test_the_departures_are_sorted_and_a_train_several_trips_start_with_counts_once(self):
+        search = trip_search(TO_KBH_H)
+        trips = search["Trip"]
+        search["Trip"] = [trips[3], trips[1], copy.deepcopy(trips[1]), trips[0], copy.deepcopy(trips[3]), trips[2]]
+        deps = self.departures(search)
+        self.assertEqual([d["time"][:5] for d in deps], ["14:42", "14:46", "14:50", "14:54"])
+
+    def test_the_same_time_on_two_lines_is_two_departures(self):
+        search = trip_search(TO_KBH_H)
+        leg = first_leg(search["Trip"][0])
+        search["Trip"] = trips_of([leg], [other_leg(leg, displayNumber="M4", line="M4")])["Trip"]
+        self.assertEqual(len(self.departures(search, lines=("M3", "M4"))), 2)
+
+    def test_a_trip_that_does_not_start_with_a_metro_leg_on_the_lines_gives_nothing(self):
+        metro = first_leg(trip_search(TO_KBH_H)["Trip"][0])
+        elsewhere = copy.deepcopy(metro)
+        elsewhere["Origin"]["extId"] = KBH_H
+        cases = {
+            "a bus": trips_of([other_leg(metro, **BUS)]),
+            "a walk": trips_of([walking_leg(metro)]),
+            "another metro line": trips_of([other_leg(metro, displayNumber="M1", line="M1", name="Metro M1")]),
+            "a metro leg from another stop": trips_of([elsewhere]),
+            "a metro leg from another stop, then one from this": trips_of([elsewhere, metro]),
+            "no legs": trips_of([]),
+            "a leg that is not a mapping": trips_of(["M3"]),
+            "a leg without a Product": trips_of([{k: v for k, v in metro.items() if k != "Product"}]),
+        }
+        for label, search in cases.items():
+            with self.subTest(label):
+                self.assertEqual(self.departures(search), [])
+
+    def test_a_metro_leg_after_a_walk_is_found(self):
+        metro = first_leg(trip_search(TO_KBH_H)["Trip"][0])
+        [dep] = self.departures(trips_of([walking_leg(metro), metro]))
+        self.assertEqual(dep["time"], "14:42:00")
+
+    def test_a_trip_with_other_products_among_others_gives_only_its_metro_ones(self):
+        metro = first_leg(trip_search(TO_KBH_H)["Trip"][0])
+        search = trips_of([other_leg(metro, **BUS)], [metro], [walking_leg(metro)])
+        [dep] = self.departures(search)
+        self.assertEqual(dep["ProductAtStop"]["line"], "M3")
+
+    def test_the_lines_are_matched_without_regard_to_case_or_spacing_and_none_means_any_metro_line(self):
+        search = trip_search(TO_KBH_H)
+        for lines in (["M3"], ["m3"], [" M3 "], ["M1", "M3"], [], None):
+            with self.subTest(lines):
+                self.assertEqual(len(ta.trip_departures(search, ENGHAVE_PLADS, lines)), 6)
+        self.assertEqual(self.departures(search, lines=["M1"]), [])
+        self.assertEqual(self.departures(search, lines=["M30"]), [])
+
+    def test_without_lines_any_metro_line_counts_and_nothing_else_does(self):
+        metro = first_leg(trip_search(TO_KBH_H)["Trip"][0])
+        search = trips_of(
+            [metro],
+            [other_leg(metro, displayNumber="M1", line="M1")],
+            [other_leg(metro, **BUS)],
+            [walking_leg(metro)],
+        )
+        self.assertEqual([d["ProductAtStop"]["line"] for d in self.departures(search, lines=())], ["M3", "M1"])
+
+    def test_the_stop_is_matched_as_text_so_a_yaml_number_works(self):
+        self.assertEqual(len(ta.trip_departures(trip_search(TO_KBH_H), int(ENGHAVE_PLADS), ["M3"])), 6)
+
+    def test_a_single_product_object_is_read_like_a_list_of_one(self):
+        search = trip_search(TO_KBH_H)
+        for trip in search["Trip"]:
+            leg = first_leg(trip)
+            leg["Product"] = leg["Product"][0]
+        self.assertEqual(len(self.departures(search)), 6)
+
+    def test_a_response_without_trips_gives_nothing(self):
+        for data in ({}, {"Trip": None}, {"Trip": []}):
+            with self.subTest(data):
+                self.assertEqual(self.departures(data), [])
+
+
+class TripSession(SiteSession):
+    """Answers Rejseplanen's trip search by its destination, its departure board with `board` and m.dk as SiteSession does."""
+
+    def __init__(
+        self,
+        trips: dict[str, dict] | None = None,
+        mdk: dict | str = NORMAL_DAY,
+        *,
+        status: int = 200,
+        error: Exception | None = None,
+        board: dict | None = None,
+        mdk_error: Exception | None = None,
+    ) -> None:
+        super().__init__(mdk, board=board, error=mdk_error)
+        self.trips = trips or {}
+        self.trip_status = status
+        self.trip_error = error
+        self.trip_params: list[dict] = []
+
+    def get(self, url: str, params: dict | None = None, timeout=None):
+        if url != TRIP_URL:
+            return super().get(url, params, timeout)
+        self.urls.append(url)
+        self.trip_params.append(params)
+        if self.trip_error is not None:
+            raise self.trip_error
+        response = FakeResponse(self.trips.get(str(params["destId"]), {}))
+        response.status = self.trip_status
+        return response
+
+    @property
+    def rejseplanen_calls(self) -> Counter:
+        return Counter(url.rsplit("/", 1)[-1] for url in self.urls if url != ta.MDK_STATUS_URL)
+
+
+def both_directions(first_in_min: int = 2) -> dict[str, dict]:
+    return {
+        KBH_H: moved_to_now(trip_search(TO_KBH_H), first_in_min),
+        FREDERIKSBERG_ALLE: moved_to_now(trip_search(TO_FREDERIKSBERG_ALLE), first_in_min),
+    }
+
+
+class TripRouteTestCase(OperatorStatusFetchTestCase):
+    def check(self, route: dict, session: TripSession) -> dict:
+        return asyncio.run(self.app._check_route(route, session))
+
+    def check_trip(self, search: dict, route: dict = TRIP_METRO) -> dict:
+        return self.check(route, TripSession({route["trip_dest_id"]: search}))
+
+
+class TestTripRoute(TripRouteTestCase):
+    def test_a_trip_route_makes_one_trip_search_and_no_board_request(self):
+        session = TripSession(both_directions())
+        self.check(TRIP_METRO, session)
+        self.assertEqual(session.urls, [TRIP_URL])
+        self.assertEqual(
+            session.trip_params,
+            [{
+                "originId": ENGHAVE_PLADS, "destId": KBH_H, "products": 1024, "numF": 6, "tariff": 0,
+                "format": "json", "accessId": "key",
+            }],
+        )
+
+    def test_the_frederiksberg_route_asks_for_the_trains_that_way(self):
+        session = TripSession(both_directions())
+        result = self.check(TRIP_METRO_FRB, session)
+        self.assertEqual(session.trip_params[0]["destId"], FREDERIKSBERG_ALLE)
+        self.assertEqual(len(result["departures"]), 6)
+
+    def test_one_search_fills_the_usual_departure_list(self):
+        result = self.check_trip(moved_to_now(trip_search(TO_KBH_H)))
+        self.assertEqual(len(result["departures"]), 6)
+        self.assertEqual(len(result["future_dep_times"]), 6)
+        self.assertEqual(result["severity"], 0)
+        self.assertFalse(result["has_issues"])
+        self.assertIn(result["mins_to_next"], (0, 1, 2))
+        self.assertEqual(result["next_departure"], f"M3 {result['departures'][0]['time']}")
+
+    def test_the_departures_are_in_the_board_shape(self):
+        self.app.expose_departure_ts = True
+        search = moved_to_now(trip_search(TO_KBH_H))
+        scheduled = [leaves_at(first_leg(trip)) for trip in search["Trip"]]
+        result = self.check_trip(search)
+        self.assertEqual(
+            [
+                (d["ts"], d["time"], d["scheduled_time"], d["line"], d["category"], d["delay_min"], d["cancelled"], d["problematic"])
+                for d in result["departures"]
+            ],
+            [(int(at.timestamp()), at.strftime("%H:%M"), at.strftime("%H:%M"), "M3", "MET", 0, False, False) for at in scheduled],
+        )
+
+    def test_that_shape_is_the_one_a_board_route_publishes(self):
+        self.app.expose_departure_ts = True
+        board = self.check(BOARD_METRO, TripSession(board={"Departure": [dep(2), dep(6, delay_min=2)]}))
+        trip = self.check_trip(moved_to_now(trip_search(TO_KBH_H)))
+        self.assertEqual(set(trip["departures"][0]), set(board["departures"][0]))
+        self.assertEqual(set(trip), set(board))
+
+    def test_ts_is_left_out_unless_the_instance_exposes_it(self):
+        result = self.check_trip(moved_to_now(trip_search(TO_KBH_H)))
+        self.assertNotIn("ts", result["departures"][0])
+
+    def test_realtime_replaces_the_scheduled_time_and_gives_the_delay(self):
+        for with_date in (True, False):
+            with self.subTest(rtDate=with_date):
+                search = moved_to_now(trip_search(TO_KBH_H))
+                scheduled = leaves_at(first_leg(search["Trip"][1]))
+                realtime = late_by(first_leg(search["Trip"][1]), 3, with_date=with_date)
+                deps = self.check_trip(search)["departures"]
+                self.assertEqual(
+                    (deps[1]["time"], deps[1]["scheduled_time"], deps[1]["delay_min"]),
+                    (realtime.strftime("%H:%M"), scheduled.strftime("%H:%M"), 3),
+                )
+                self.assertEqual([d["delay_min"] for d in deps], [0, 3, 0, 0, 0, 0])
+                self.assertEqual([d["time"] == d["scheduled_time"] for d in deps], [True, False, True, True, True, True])
+
+    def test_a_train_that_leaves_early_is_not_late(self):
+        search = moved_to_now(trip_search(TO_KBH_H))
+        scheduled = leaves_at(first_leg(search["Trip"][2]))
+        early = late_by(first_leg(search["Trip"][2]), -1)
+        deps = self.check_trip(search)["departures"]
+        self.assertEqual((deps[2]["delay_min"], deps[2]["time"]), (0, early.strftime("%H:%M")))
+        self.assertEqual(deps[2]["scheduled_time"], scheduled.strftime("%H:%M"))
+
+    def test_a_late_train_is_problematic_from_the_delay_threshold_on(self):
+        search = moved_to_now(trip_search(TO_KBH_H))
+        scheduled = [leaves_at(first_leg(search["Trip"][i])).strftime("%H:%M") for i in (0, 1)]
+        late_by(first_leg(search["Trip"][0]), 4)
+        late_by(first_leg(search["Trip"][1]), 5)
+        by_scheduled = {d["scheduled_time"]: d for d in self.check_trip(search)["departures"]}
+        self.assertEqual(
+            [(by_scheduled[t]["delay_min"], by_scheduled[t]["problematic"]) for t in scheduled],
+            [(4, False), (5, True)],
+        )
+
+    def test_a_cancelled_leg_is_a_cancelled_departure_the_next_train_absorbs(self):
+        search = moved_to_now(trip_search(TO_KBH_H))
+        first_leg(search["Trip"][1])["Origin"]["cancelled"] = True
+        result = self.check_trip(search)
+        self.assertEqual([d["cancelled"] for d in result["departures"]], [False, True, False, False, False, False])
+        self.assertTrue(result["departures"][1]["problematic"])
+        self.assertEqual(len(result["future_dep_times"]), 5)
+        self.assertEqual(result["severity"], 0)
+        self.assertTrue(any("absorbed by following departures" in issue for issue in result["issues"]))
+
+    def test_cancelled_legs_nothing_follows_soon_disrupt_the_route(self):
+        search = moved_to_now(trip_search(TO_KBH_H))
+        first_leg(search["Trip"][0])["cancelled"] = True
+        first_leg(search["Trip"][1])["Origin"]["cancelled"] = "true"
+        first_leg(search["Trip"][2])["cancelled"] = True
+        result = self.check_trip(search)
+        self.assertEqual(result["severity"], 3)
+        self.assertTrue(result["has_issues"])
+        self.assertEqual(len(result["issues"]), 2)
+
+    def test_trains_that_have_left_are_dropped_as_on_a_board(self):
+        result = self.check_trip(moved_to_now(trip_search(TO_KBH_H), first_in_min=-10))
+        self.assertEqual(len(result["departures"]), 3)
+
+    def test_trips_that_start_with_another_product_add_no_departure(self):
+        metro = first_leg(trip_search(TO_KBH_H)["Trip"][0])
+        search = moved_to_now(trip_search(TO_KBH_H))
+        bus = other_leg(first_leg(search["Trip"][3]), **BUS)
+        search["Trip"] += trips_of([bus], [walking_leg(metro)])["Trip"]
+        result = self.check_trip(search)
+        self.assertEqual(len(result["departures"]), 6)
+        self.assertEqual({d["category"] for d in result["departures"]}, {"MET"})
+
+    def test_the_direction_name_filter_is_not_applied_to_a_trip(self):
+        route = dict(TRIP_METRO, direction_name_filter="nowhere")
+        result = self.check_trip(moved_to_now(trip_search(TO_KBH_H)), route)
+        self.assertEqual(len(result["departures"]), 6)
+
+    def test_trips_without_a_usable_metro_leg_are_a_quiet_period(self):
+        metro = first_leg(trip_search(TO_KBH_H)["Trip"][0])
+        result = self.check_trip(trips_of([other_leg(metro, **BUS)], [walking_leg(metro)]))
+        self.assertTrue(result["no_service"])
+        self.assertEqual((result["departures"], result["severity"]), ([], 0))
+        self.assertNotIn("error", result)
+        self.assertEqual(len(self.levels("INFO")), 1)
+        self.assertIn("No departures for Metro M3", self.levels("INFO")[0])
+
+    def test_every_failed_search_is_an_error_like_a_failed_board(self):
+        api_error = {"errorCode": "API_PARAM", "errorText": "Invalid value for parameter numF: 7"}
+        failures = {
+            "HTTP 500": (TripSession(status=500), "HTTP 500"),
+            "HTTP 400": (TripSession({KBH_H: api_error}, status=400), "HTTP 400"),
+            "an errorCode": (TripSession({KBH_H: dict(api_error, errorCode="SVC_NO_RESULT")}), api_error["errorText"]),
+            "an errorCode without text": (TripSession({KBH_H: {"errorCode": "SVC_UNKNOWN"}}), "unknown API error"),
+            "no Trip": (TripSession({KBH_H: {"ResultStatus": {}}}), "no Trip in the response"),
+            "an empty Trip": (TripSession({KBH_H: {"Trip": []}}), "no Trip in the response"),
+            "a Trip that is not a list": (TripSession({KBH_H: {"Trip": {"idx": 0}}}), "no Trip in the response"),
+            "a connection error": (TripSession(error=OSError("connection refused")), "connection refused"),
+        }
+        for label, (session, error) in failures.items():
+            with self.subTest(label):
+                self.logs.clear()
+                result = self.check(TRIP_METRO, session)
+                self.assertEqual(result, {"error": error, "has_issues": True})
+                self.assertEqual(len(self.levels("WARNING")), 1)
+        with self.subTest("a timeout"):
+            self.assertTrue(self.check(TRIP_METRO, TripSession(error=asyncio.TimeoutError()))["has_issues"])
+
+    def test_a_board_route_still_asks_the_board(self):
+        session = TripSession(board={"Departure": [dep(2)]})
+        self.check(BOARD_METRO, session)
+        self.assertEqual(session.urls, [BOARD_URL])
+        self.assertEqual(session.trip_params, [])
+
+
+class TestTripRouteVerdict(TripRouteTestCase):
+    """m.dk still decides whether the Metro is OK; the trip search supplies the times."""
+
+    def published(self, session: TripSession, route: dict = TRIP_METRO) -> PublishedRoute:
+        return PublishedRoute(route, self.fetch_all(session, [route])[route["sensor_id"]])
+
+    def test_times_with_an_all_clear_are_ok_and_the_empty_message_is_gone(self):
+        out = self.published(TripSession(both_directions()))
+        self.assertEqual((out.status, out.state), ("OK", "OK"))
+        self.assertEqual(len(out.attributes["departures"]), 6)
+        self.assertTrue(out.info.startswith("Enghave Plads | Next: M3 "), out.info)
+        self.assertNotIn("no times", out.info)
+        self.assertEqual(out.attributes["operator_status"], CLEAR_TEXT)
+        self.assertIs(out.attributes["operator_status_ok"], True)
+
+    def test_times_during_a_disruption_m_dk_reports_are_disrupted_with_its_text(self):
+        out = self.published(TripSession(both_directions(), M3_DISRUPTED))
+        self.assertEqual(out.status, "Disrupted")
+        self.assertEqual(out.attributes["issues"][0], f"Metro M3: {DISRUPTION_TEXT}")
+        self.assertEqual(len(out.attributes["departures"]), 6)
+
+    def test_a_failed_search_with_an_all_clear_is_ok_without_times(self):
+        failures = {
+            "HTTP 500": TripSession(status=500),
+            "an errorCode": TripSession({KBH_H: {"errorCode": "SVC_NO_RESULT", "errorText": "No connection"}}),
+            "no Trip": TripSession({KBH_H: {"ResultStatus": {}}}),
+            "a connection error": TripSession(error=OSError("down")),
+        }
+        for label, session in failures.items():
+            with self.subTest(label):
+                out = self.published(session)
+                self.assertEqual((out.status, out.state), ("OK", "OK"))
+                self.assertEqual(out.info, "Enghave Plads: Normal service - no times")
+                self.assertEqual(out.attributes["departures"], [])
+                self.assertEqual(out.attributes["issues"], [])
+
+    def test_a_failed_search_during_a_reported_disruption_is_disrupted(self):
+        out = self.published(TripSession(status=500, mdk=M3_DISRUPTED))
+        self.assertEqual(out.status, "Disrupted")
+
+    def test_a_failed_search_without_m_dk_is_unavailable_as_a_failed_board_is(self):
+        out = self.published(TripSession(status=500, mdk_error=OSError("down")))
+        self.assertEqual((out.status, out.info), ("Unavailable", "Enghave Plads: Unavailable"))
+
+
+def deployed_apps() -> dict:
+    class Loader(yaml.SafeLoader):
+        pass
+
+    Loader.add_constructor("!secret", lambda loader, node: "secret")
+    return yaml.load((Path(__file__).resolve().parents[1] / "transit_alarm.yaml").read_text(), Loader=Loader)
+
+
+class TestTripSourceInTheDeployedYaml(TripRouteTestCase):
+    """Both Metro routes, in the instance that polls them and in the one that checks them on leave-home."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.apps = deployed_apps()
+
+    def routes(self, app: str) -> dict[str, dict]:
+        return {route["sensor_id"]: route for route in self.apps[app]["routes"]}
+
+    def test_the_metro_routes_take_their_times_from_a_trip_search_to_the_next_stop(self):
+        expected = {
+            "TransitStatus": {"enghave_metro_kbh": KBH_H, "enghave_metro_frb": FREDERIKSBERG_ALLE},
+            "TransitMikkel": {"enghave_metro_kbh": KBH_H},
+        }
+        for app, destinations in expected.items():
+            for sensor_id, destination in destinations.items():
+                with self.subTest(f"{app} {sensor_id}"):
+                    route = self.routes(app)[sensor_id]
+                    self.assertEqual(route["departure_source"], "trip")
+                    self.assertEqual(str(route["trip_dest_id"]), destination)
+                    self.assertEqual(str(route["stop_id"]), ENGHAVE_PLADS)
+                    self.assertEqual(route["lines"], ["M3"])
+                    self.assertEqual(route["operator_status"], "mdk")
+                    self.assertEqual(route["operator_status_lines"], ["M3"])
+
+    def test_no_other_route_leaves_the_departure_board(self):
+        for app, cfg in self.apps.items():
+            for route in cfg["routes"]:
+                if not route["sensor_id"].startswith("enghave_metro_"):
+                    with self.subTest(f"{app} {route['sensor_id']}"):
+                        self.assertNotIn("departure_source", route)
+                        self.assertNotIn("trip_dest_id", route)
+
+    def test_every_trip_route_names_its_destination(self):
+        for app, cfg in self.apps.items():
+            for route in cfg["routes"]:
+                if route.get("departure_source") == "trip":
+                    self.assertTrue(str(route.get("trip_dest_id") or "").strip(), f"{app} {route['sensor_id']}")
+
+    def test_both_metro_routes_get_departures_from_one_search_each(self):
+        session = TripSession(both_directions())
+        results = self.fetch_all(session, self.apps["TransitStatus"]["routes"])
+        self.assertEqual(sorted(p["destId"] for p in session.trip_params), sorted([KBH_H, FREDERIKSBERG_ALLE]))
+        for sensor_id in ("enghave_metro_kbh", "enghave_metro_frb"):
+            with self.subTest(sensor_id):
+                result = results[sensor_id]
+                self.assertEqual(len(result["departures"]), 6)
+                self.assertFalse(result["no_times"])
+                self.assertIs(result["operator_status_ok"], True)
+                self.assertFalse(result["has_issues"])
+        self.assertEqual(
+            results["enghave_metro_frb"]["departures"][0]["scheduled_time"],
+            results["enghave_metro_frb"]["departures"][0]["time"],
+        )
+
+    def test_a_check_makes_one_rejseplanen_call_per_route(self):
+        counts = {
+            "TransitStatus": Counter(trip=2, departureBoard=2),
+            "TransitMikkel": Counter(trip=1, departureBoard=1),
+            "TransitKristine": Counter(departureBoard=2),
+        }
+        for app, expected in counts.items():
+            with self.subTest(app):
+                session = TripSession(both_directions())
+                self.fetch_all(session, self.apps[app]["routes"])
+                self.assertEqual(session.rejseplanen_calls, expected)
+                self.assertEqual(sum(session.rejseplanen_calls.values()), len(self.apps[app]["routes"]))
+                self.assertEqual(session.mdk_requests, 1 if app != "TransitKristine" else 0)
+
+    def test_leave_home_check_writes_the_same_sensor_from_the_same_search(self):
+        session = TripSession(both_directions())
+        mikkel = self.fetch_all(session, self.apps["TransitMikkel"]["routes"])["enghave_metro_kbh"]
+        status = self.fetch_all(session, self.apps["TransitStatus"]["routes"])["enghave_metro_kbh"]
+        self.assertEqual(len(mikkel["departures"]), 6)
+        self.assertEqual(mikkel["departures"], status["departures"])
+
+
+class TestDepartureSourceConfig(unittest.TestCase):
+    def start(self, route: dict) -> None:
+        app = ta.TransitAlarm.__new__(ta.TransitAlarm)
+        app.args = {"access_id": "key", "routes": [route]}
+        app.log = lambda *args, **kwargs: None
+        for method in ("listen_state", "run_every", "run_in", "create_task"):
+            setattr(app, method, lambda *args, **kwargs: None)
+        app.initialize()
+
+    def test_the_board_is_the_default_and_the_trip_source_is_accepted(self):
+        self.start(BOARD_METRO)
+        self.start(dict(BOARD_METRO, departure_source="board"))
+        self.start(TRIP_METRO)
+
+    def test_an_unknown_source_is_refused_at_start(self):
+        for source in ("trips", "Trip", "", None, 3):
+            with self.subTest(source):
+                with self.assertRaisesRegex(ValueError, "invalid departure_source"):
+                    self.start(dict(TRIP_METRO, departure_source=source))
+
+    def test_a_trip_route_must_name_its_destination(self):
+        without = {k: v for k, v in TRIP_METRO.items() if k != "trip_dest_id"}
+        for label, route in {
+            "missing": without,
+            "empty": dict(TRIP_METRO, trip_dest_id=""),
+            "blank": dict(TRIP_METRO, trip_dest_id="  "),
+            "null": dict(TRIP_METRO, trip_dest_id=None),
+        }.items():
+            with self.subTest(label):
+                with self.assertRaisesRegex(ValueError, "needs trip_dest_id"):
+                    self.start(route)
+
+    def test_a_yaml_number_is_a_valid_destination(self):
+        self.start(dict(TRIP_METRO, trip_dest_id=8603330))
 
 
 if __name__ == "__main__":

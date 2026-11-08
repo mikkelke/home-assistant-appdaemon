@@ -1,0 +1,2107 @@
+{
+ "Trip": [
+  {
+   "Origin": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Enghave Plads",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Enghave Plads"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Enghave Plads St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+    "extId": "8603344",
+    "lon": 12.545813,
+    "lat": 55.667283,
+    "routeIdx": 1,
+    "prognosisType": "PROGNOSED",
+    "time": "14:45:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "Destination": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Frederiksberg Allé",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Frederiksberg Allé"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Frederiksberg Allé St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Frederiksberg Allé St. (Metro)@X=12540348@Y=55673729@U=86@L=8603343@",
+    "extId": "8603343",
+    "lon": 12.540348,
+    "lat": 55.673729,
+    "routeIdx": 2,
+    "prognosisType": "PROGNOSED",
+    "time": "14:46:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "ServiceDays": [
+    {
+     "planningPeriodBegin": "2026-11-06",
+     "planningPeriodEnd": "2027-01-27",
+     "sDaysR": "ikke altid",
+     "sDaysI": "8. nov - 27. dec 2026 lør, søn",
+     "sDaysB": "60C183060C183000000000"
+    }
+   ],
+   "LegList": {
+    "Leg": [
+     {
+      "Origin": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Enghave Plads",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Enghave Plads"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Enghave Plads St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+       "extId": "8603344",
+       "lon": 12.545813,
+       "lat": 55.667283,
+       "routeIdx": 1,
+       "prognosisType": "PROGNOSED",
+       "time": "14:45:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Destination": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Frederiksberg Allé",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Frederiksberg Allé"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Frederiksberg Allé St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Frederiksberg Allé St. (Metro)@X=12540348@Y=55673729@U=86@L=8603343@",
+       "extId": "8603343",
+       "lon": 12.540348,
+       "lat": 55.673729,
+       "routeIdx": 2,
+       "prognosisType": "PROGNOSED",
+       "time": "14:46:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Notes": {
+       "Note": [
+        {
+         "value": "Toget har lav indstigning",
+         "key": "BE",
+         "type": "A",
+         "priority": 0,
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "Toget har lav indstigning"
+        },
+        {
+         "value": "E6140F",
+         "key": "CT",
+         "type": "I",
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "E6140F"
+        },
+        {
+         "value": "10155",
+         "key": "FD",
+         "type": "I",
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "10155"
+        }
+       ]
+      },
+      "JourneyDetailRef": {
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61047#TA#52#DA#81126#1S#8603330#1T#1444#LS#8603330#LT#1531#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1444#TO#8603330#TT#1531#"
+      },
+      "JourneyStatus": "P",
+      "Product": [
+       {
+        "icon": {
+         "foregroundColor": {
+          "r": 255,
+          "g": 255,
+          "b": 255,
+          "hex": "#FFFFFF"
+         },
+         "backgroundColor": {
+          "r": 230,
+          "g": 20,
+          "b": 15,
+          "hex": "#E6140F"
+         },
+         "res": "prod_sub"
+        },
+        "operatorInfo": {
+         "name": "Metroselskabet",
+         "nameS": "Met",
+         "nameN": "Metro",
+         "nameL": "Metroselskabet"
+        },
+        "name": "Metro M3",
+        "internalName": "Metro M3",
+        "displayNumber": "M3",
+        "num": "7558",
+        "line": "M3",
+        "lineId": "034_000082_M3",
+        "catOut": "MET",
+        "catIn": "034",
+        "catCode": "10",
+        "cls": "1024",
+        "catOutS": "034",
+        "catOutL": "Metro",
+        "operatorCode": "Met",
+        "operator": "Metroselskabet",
+        "admin": "000082",
+        "routeIdxFrom": 1,
+        "routeIdxTo": 2,
+        "matchId": "10155"
+       }
+      ],
+      "JourneyDetail": {
+       "dayOfOperation": "2026-11-08",
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61047#TA#52#DA#81126#1S#8603330#1T#1444#LS#8603330#LT#1531#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1444#TO#8603330#TT#1531#"
+      },
+      "id": "C-0:000",
+      "idx": 0,
+      "name": "Metro M3",
+      "number": "M3",
+      "category": "034",
+      "type": "JNY",
+      "reachable": true,
+      "waitingState": "UNDEF",
+      "direction": "via Frederiksberg",
+      "directionFlag": "2",
+      "duration": "PT1M"
+     }
+    ]
+   },
+   "calculation": "INITIAL",
+   "TripStatus": {
+    "hintCode": 0
+   },
+   "idx": 0,
+   "tripId": "C-0",
+   "ctxRecon": "¶HKI¶T$A=1@O=Enghave Plads St. (Metro)@L=8603344@a=128@$A=1@O=Frederiksberg Allé St. (Metro)@L=8603343@a=128@$202611081445$202611081446$Metro M3$$1$$$$$$¶KC¶#VE#2#CF#100#CA#0#CM#0#SICT#0#AM#16481#AM2#0#RT#20#¶KRCC¶#VE#1#MRTF#",
+   "duration": "PT1M",
+   "checksum": "05b34eab_3",
+   "checksumDti": "b499e8fd_3",
+   "checksumSave": "05b34eab_3"
+  },
+  {
+   "Origin": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Enghave Plads",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Enghave Plads"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Enghave Plads St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+    "extId": "8603344",
+    "lon": 12.545813,
+    "lat": 55.667283,
+    "routeIdx": 1,
+    "prognosisType": "PROGNOSED",
+    "time": "14:49:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "Destination": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Frederiksberg Allé",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Frederiksberg Allé"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Frederiksberg Allé St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Frederiksberg Allé St. (Metro)@X=12540348@Y=55673729@U=86@L=8603343@",
+    "extId": "8603343",
+    "lon": 12.540348,
+    "lat": 55.673729,
+    "routeIdx": 2,
+    "prognosisType": "PROGNOSED",
+    "time": "14:50:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "ServiceDays": [
+    {
+     "planningPeriodBegin": "2026-11-06",
+     "planningPeriodEnd": "2027-01-27",
+     "sDaysR": "ikke altid",
+     "sDaysI": "8. nov - 31. dec 2026",
+     "sDaysB": "FFFFFFFFFFFFFF00000000"
+    }
+   ],
+   "LegList": {
+    "Leg": [
+     {
+      "Origin": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Enghave Plads",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Enghave Plads"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Enghave Plads St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+       "extId": "8603344",
+       "lon": 12.545813,
+       "lat": 55.667283,
+       "routeIdx": 1,
+       "prognosisType": "PROGNOSED",
+       "time": "14:49:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Destination": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Frederiksberg Allé",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Frederiksberg Allé"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Frederiksberg Allé St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Frederiksberg Allé St. (Metro)@X=12540348@Y=55673729@U=86@L=8603343@",
+       "extId": "8603343",
+       "lon": 12.540348,
+       "lat": 55.673729,
+       "routeIdx": 2,
+       "prognosisType": "PROGNOSED",
+       "time": "14:50:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Notes": {
+       "Note": [
+        {
+         "value": "Toget har lav indstigning",
+         "key": "BE",
+         "type": "A",
+         "priority": 0,
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "Toget har lav indstigning"
+        },
+        {
+         "value": "E6140F",
+         "key": "CT",
+         "type": "I",
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "E6140F"
+        },
+        {
+         "value": "10213",
+         "key": "FD",
+         "type": "I",
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "10213"
+        }
+       ]
+      },
+      "JourneyDetailRef": {
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61047#TA#53#DA#81126#1S#8603330#1T#1448#LS#8603330#LT#1535#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1448#TO#8603330#TT#1535#"
+      },
+      "JourneyStatus": "P",
+      "Product": [
+       {
+        "icon": {
+         "foregroundColor": {
+          "r": 255,
+          "g": 255,
+          "b": 255,
+          "hex": "#FFFFFF"
+         },
+         "backgroundColor": {
+          "r": 230,
+          "g": 20,
+          "b": 15,
+          "hex": "#E6140F"
+         },
+         "res": "prod_sub"
+        },
+        "operatorInfo": {
+         "name": "Metroselskabet",
+         "nameS": "Met",
+         "nameN": "Metro",
+         "nameL": "Metroselskabet"
+        },
+        "name": "Metro M3",
+        "internalName": "Metro M3",
+        "displayNumber": "M3",
+        "num": "7615",
+        "line": "M3",
+        "lineId": "034_000082_M3",
+        "catOut": "MET",
+        "catIn": "034",
+        "catCode": "10",
+        "cls": "1024",
+        "catOutS": "034",
+        "catOutL": "Metro",
+        "operatorCode": "Met",
+        "operator": "Metroselskabet",
+        "admin": "000082",
+        "routeIdxFrom": 1,
+        "routeIdxTo": 2,
+        "matchId": "10213"
+       }
+      ],
+      "JourneyDetail": {
+       "dayOfOperation": "2026-11-08",
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61047#TA#53#DA#81126#1S#8603330#1T#1448#LS#8603330#LT#1535#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1448#TO#8603330#TT#1535#"
+      },
+      "id": "C-1:000",
+      "idx": 0,
+      "name": "Metro M3",
+      "number": "M3",
+      "category": "034",
+      "type": "JNY",
+      "reachable": true,
+      "waitingState": "UNDEF",
+      "direction": "via Frederiksberg",
+      "directionFlag": "2",
+      "duration": "PT1M"
+     }
+    ]
+   },
+   "calculation": "INITIAL",
+   "TripStatus": {
+    "hintCode": 0
+   },
+   "idx": 1,
+   "tripId": "C-1",
+   "ctxRecon": "¶HKI¶T$A=1@O=Enghave Plads St. (Metro)@L=8603344@a=128@$A=1@O=Frederiksberg Allé St. (Metro)@L=8603343@a=128@$202611081449$202611081450$Metro M3$$1$$$$$$¶KC¶#VE#2#CF#100#CA#0#CM#0#SICT#0#AM#16481#AM2#0#RT#20#¶KRCC¶#VE#1#MRTF#",
+   "duration": "PT1M",
+   "checksum": "85ffe404_3",
+   "checksumDti": "8d57a5c5_3",
+   "checksumSave": "85ffe404_3"
+  },
+  {
+   "Origin": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Enghave Plads",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Enghave Plads"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Enghave Plads St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+    "extId": "8603344",
+    "lon": 12.545813,
+    "lat": 55.667283,
+    "routeIdx": 1,
+    "prognosisType": "PROGNOSED",
+    "time": "14:53:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "Destination": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Frederiksberg Allé",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Frederiksberg Allé"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Frederiksberg Allé St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Frederiksberg Allé St. (Metro)@X=12540348@Y=55673729@U=86@L=8603343@",
+    "extId": "8603343",
+    "lon": 12.540348,
+    "lat": 55.673729,
+    "routeIdx": 2,
+    "prognosisType": "PROGNOSED",
+    "time": "14:54:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "ServiceDays": [
+    {
+     "planningPeriodBegin": "2026-11-06",
+     "planningPeriodEnd": "2027-01-27",
+     "sDaysR": "ikke altid",
+     "sDaysI": "8. nov - 27. dec 2026 lør, søn",
+     "sDaysB": "60C183060C183000000000"
+    }
+   ],
+   "LegList": {
+    "Leg": [
+     {
+      "Origin": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Enghave Plads",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Enghave Plads"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Enghave Plads St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+       "extId": "8603344",
+       "lon": 12.545813,
+       "lat": 55.667283,
+       "routeIdx": 1,
+       "prognosisType": "PROGNOSED",
+       "time": "14:53:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Destination": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Frederiksberg Allé",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Frederiksberg Allé"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Frederiksberg Allé St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Frederiksberg Allé St. (Metro)@X=12540348@Y=55673729@U=86@L=8603343@",
+       "extId": "8603343",
+       "lon": 12.540348,
+       "lat": 55.673729,
+       "routeIdx": 2,
+       "prognosisType": "PROGNOSED",
+       "time": "14:54:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Notes": {
+       "Note": [
+        {
+         "value": "Toget har lav indstigning",
+         "key": "BE",
+         "type": "A",
+         "priority": 0,
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "Toget har lav indstigning"
+        },
+        {
+         "value": "E6140F",
+         "key": "CT",
+         "type": "I",
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "E6140F"
+        },
+        {
+         "value": "10323",
+         "key": "FD",
+         "type": "I",
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "10323"
+        }
+       ]
+      },
+      "JourneyDetailRef": {
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61047#TA#54#DA#81126#1S#8603330#1T#1452#LS#8603330#LT#1539#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1452#TO#8603330#TT#1539#"
+      },
+      "JourneyStatus": "P",
+      "Product": [
+       {
+        "icon": {
+         "foregroundColor": {
+          "r": 255,
+          "g": 255,
+          "b": 255,
+          "hex": "#FFFFFF"
+         },
+         "backgroundColor": {
+          "r": 230,
+          "g": 20,
+          "b": 15,
+          "hex": "#E6140F"
+         },
+         "res": "prod_sub"
+        },
+        "operatorInfo": {
+         "name": "Metroselskabet",
+         "nameS": "Met",
+         "nameN": "Metro",
+         "nameL": "Metroselskabet"
+        },
+        "name": "Metro M3",
+        "internalName": "Metro M3",
+        "displayNumber": "M3",
+        "num": "7680",
+        "line": "M3",
+        "lineId": "034_000082_M3",
+        "catOut": "MET",
+        "catIn": "034",
+        "catCode": "10",
+        "cls": "1024",
+        "catOutS": "034",
+        "catOutL": "Metro",
+        "operatorCode": "Met",
+        "operator": "Metroselskabet",
+        "admin": "000082",
+        "routeIdxFrom": 1,
+        "routeIdxTo": 2,
+        "matchId": "10323"
+       }
+      ],
+      "JourneyDetail": {
+       "dayOfOperation": "2026-11-08",
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61047#TA#54#DA#81126#1S#8603330#1T#1452#LS#8603330#LT#1539#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1452#TO#8603330#TT#1539#"
+      },
+      "id": "C-2:000",
+      "idx": 0,
+      "name": "Metro M3",
+      "number": "M3",
+      "category": "034",
+      "type": "JNY",
+      "reachable": true,
+      "waitingState": "UNDEF",
+      "direction": "via Frederiksberg",
+      "directionFlag": "2",
+      "duration": "PT1M"
+     }
+    ]
+   },
+   "calculation": "INITIAL",
+   "TripStatus": {
+    "hintCode": 0
+   },
+   "idx": 2,
+   "tripId": "C-2",
+   "ctxRecon": "¶HKI¶T$A=1@O=Enghave Plads St. (Metro)@L=8603344@a=128@$A=1@O=Frederiksberg Allé St. (Metro)@L=8603343@a=128@$202611081453$202611081454$Metro M3$$1$$$$$$¶KC¶#VE#2#CF#100#CA#0#CM#0#SICT#0#AM#16481#AM2#0#RT#20#¶KRCC¶#VE#1#MRTF#",
+   "duration": "PT1M",
+   "checksum": "e449c9e6_3",
+   "checksumDti": "3532f677_3",
+   "checksumSave": "e449c9e6_3"
+  },
+  {
+   "Origin": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Enghave Plads",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Enghave Plads"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Enghave Plads St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+    "extId": "8603344",
+    "lon": 12.545813,
+    "lat": 55.667283,
+    "routeIdx": 1,
+    "prognosisType": "PROGNOSED",
+    "time": "14:57:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "Destination": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Frederiksberg Allé",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Frederiksberg Allé"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Frederiksberg Allé St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Frederiksberg Allé St. (Metro)@X=12540348@Y=55673729@U=86@L=8603343@",
+    "extId": "8603343",
+    "lon": 12.540348,
+    "lat": 55.673729,
+    "routeIdx": 2,
+    "prognosisType": "PROGNOSED",
+    "time": "14:58:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "ServiceDays": [
+    {
+     "planningPeriodBegin": "2026-11-06",
+     "planningPeriodEnd": "2027-01-27",
+     "sDaysR": "ikke altid",
+     "sDaysI": "8. nov - 27. dec 2026 lør, søn",
+     "sDaysB": "60C183060C183000000000"
+    }
+   ],
+   "LegList": {
+    "Leg": [
+     {
+      "Origin": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Enghave Plads",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Enghave Plads"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Enghave Plads St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+       "extId": "8603344",
+       "lon": 12.545813,
+       "lat": 55.667283,
+       "routeIdx": 1,
+       "prognosisType": "PROGNOSED",
+       "time": "14:57:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Destination": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Frederiksberg Allé",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Frederiksberg Allé"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Frederiksberg Allé St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Frederiksberg Allé St. (Metro)@X=12540348@Y=55673729@U=86@L=8603343@",
+       "extId": "8603343",
+       "lon": 12.540348,
+       "lat": 55.673729,
+       "routeIdx": 2,
+       "prognosisType": "PROGNOSED",
+       "time": "14:58:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Notes": {
+       "Note": [
+        {
+         "value": "Toget har lav indstigning",
+         "key": "BE",
+         "type": "A",
+         "priority": 0,
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "Toget har lav indstigning"
+        },
+        {
+         "value": "E6140F",
+         "key": "CT",
+         "type": "I",
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "E6140F"
+        },
+        {
+         "value": "10381",
+         "key": "FD",
+         "type": "I",
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "10381"
+        }
+       ]
+      },
+      "JourneyDetailRef": {
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61047#TA#55#DA#81126#1S#8603330#1T#1456#LS#8603330#LT#1543#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1456#TO#8603330#TT#1543#"
+      },
+      "JourneyStatus": "P",
+      "Product": [
+       {
+        "icon": {
+         "foregroundColor": {
+          "r": 255,
+          "g": 255,
+          "b": 255,
+          "hex": "#FFFFFF"
+         },
+         "backgroundColor": {
+          "r": 230,
+          "g": 20,
+          "b": 15,
+          "hex": "#E6140F"
+         },
+         "res": "prod_sub"
+        },
+        "operatorInfo": {
+         "name": "Metroselskabet",
+         "nameS": "Met",
+         "nameN": "Metro",
+         "nameL": "Metroselskabet"
+        },
+        "name": "Metro M3",
+        "internalName": "Metro M3",
+        "displayNumber": "M3",
+        "num": "7722",
+        "line": "M3",
+        "lineId": "034_000082_M3",
+        "catOut": "MET",
+        "catIn": "034",
+        "catCode": "10",
+        "cls": "1024",
+        "catOutS": "034",
+        "catOutL": "Metro",
+        "operatorCode": "Met",
+        "operator": "Metroselskabet",
+        "admin": "000082",
+        "routeIdxFrom": 1,
+        "routeIdxTo": 2,
+        "matchId": "10381"
+       }
+      ],
+      "JourneyDetail": {
+       "dayOfOperation": "2026-11-08",
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61047#TA#55#DA#81126#1S#8603330#1T#1456#LS#8603330#LT#1543#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1456#TO#8603330#TT#1543#"
+      },
+      "id": "C-3:000",
+      "idx": 0,
+      "name": "Metro M3",
+      "number": "M3",
+      "category": "034",
+      "type": "JNY",
+      "reachable": true,
+      "waitingState": "UNDEF",
+      "direction": "via Frederiksberg",
+      "directionFlag": "2",
+      "duration": "PT1M"
+     }
+    ]
+   },
+   "calculation": "INITIAL",
+   "TripStatus": {
+    "hintCode": 0
+   },
+   "idx": 3,
+   "tripId": "C-3",
+   "ctxRecon": "¶HKI¶T$A=1@O=Enghave Plads St. (Metro)@L=8603344@a=128@$A=1@O=Frederiksberg Allé St. (Metro)@L=8603343@a=128@$202611081457$202611081458$Metro M3$$1$$$$$$¶KC¶#VE#2#CF#100#CA#0#CM#0#SICT#0#AM#16481#AM2#0#RT#20#¶KRCC¶#VE#1#MRTF#",
+   "duration": "PT1M",
+   "checksum": "f17fbb9f_3",
+   "checksumDti": "5e1c6b94_3",
+   "checksumSave": "f17fbb9f_3"
+  },
+  {
+   "Origin": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Enghave Plads",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Enghave Plads"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Enghave Plads St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+    "extId": "8603344",
+    "lon": 12.545813,
+    "lat": 55.667283,
+    "routeIdx": 1,
+    "prognosisType": "PROGNOSED",
+    "time": "15:01:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "Destination": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Frederiksberg Allé",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Frederiksberg Allé"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Frederiksberg Allé St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Frederiksberg Allé St. (Metro)@X=12540348@Y=55673729@U=86@L=8603343@",
+    "extId": "8603343",
+    "lon": 12.540348,
+    "lat": 55.673729,
+    "routeIdx": 2,
+    "prognosisType": "PROGNOSED",
+    "time": "15:02:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "ServiceDays": [
+    {
+     "planningPeriodBegin": "2026-11-06",
+     "planningPeriodEnd": "2027-01-27",
+     "sDaysR": "ikke altid",
+     "sDaysI": "8. nov - 31. dec 2026",
+     "sDaysB": "FFFFFFFFFFFFFF00000000"
+    }
+   ],
+   "LegList": {
+    "Leg": [
+     {
+      "Origin": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Enghave Plads",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Enghave Plads"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Enghave Plads St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+       "extId": "8603344",
+       "lon": 12.545813,
+       "lat": 55.667283,
+       "routeIdx": 1,
+       "prognosisType": "PROGNOSED",
+       "time": "15:01:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Destination": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Frederiksberg Allé",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Frederiksberg Allé"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Frederiksberg Allé St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Frederiksberg Allé St. (Metro)@X=12540348@Y=55673729@U=86@L=8603343@",
+       "extId": "8603343",
+       "lon": 12.540348,
+       "lat": 55.673729,
+       "routeIdx": 2,
+       "prognosisType": "PROGNOSED",
+       "time": "15:02:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Notes": {
+       "Note": [
+        {
+         "value": "Toget har lav indstigning",
+         "key": "BE",
+         "type": "A",
+         "priority": 0,
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "Toget har lav indstigning"
+        },
+        {
+         "value": "E6140F",
+         "key": "CT",
+         "type": "I",
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "E6140F"
+        },
+        {
+         "value": "10439",
+         "key": "FD",
+         "type": "I",
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "10439"
+        }
+       ]
+      },
+      "JourneyDetailRef": {
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61047#TA#56#DA#81126#1S#8603330#1T#1500#LS#8603330#LT#1547#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1500#TO#8603330#TT#1547#"
+      },
+      "JourneyStatus": "P",
+      "Product": [
+       {
+        "icon": {
+         "foregroundColor": {
+          "r": 255,
+          "g": 255,
+          "b": 255,
+          "hex": "#FFFFFF"
+         },
+         "backgroundColor": {
+          "r": 230,
+          "g": 20,
+          "b": 15,
+          "hex": "#E6140F"
+         },
+         "res": "prod_sub"
+        },
+        "operatorInfo": {
+         "name": "Metroselskabet",
+         "nameS": "Met",
+         "nameN": "Metro",
+         "nameL": "Metroselskabet"
+        },
+        "name": "Metro M3",
+        "internalName": "Metro M3",
+        "displayNumber": "M3",
+        "num": "7779",
+        "line": "M3",
+        "lineId": "034_000082_M3",
+        "catOut": "MET",
+        "catIn": "034",
+        "catCode": "10",
+        "cls": "1024",
+        "catOutS": "034",
+        "catOutL": "Metro",
+        "operatorCode": "Met",
+        "operator": "Metroselskabet",
+        "admin": "000082",
+        "routeIdxFrom": 1,
+        "routeIdxTo": 2,
+        "matchId": "10439"
+       }
+      ],
+      "JourneyDetail": {
+       "dayOfOperation": "2026-11-08",
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61047#TA#56#DA#81126#1S#8603330#1T#1500#LS#8603330#LT#1547#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1500#TO#8603330#TT#1547#"
+      },
+      "id": "C-4:000",
+      "idx": 0,
+      "name": "Metro M3",
+      "number": "M3",
+      "category": "034",
+      "type": "JNY",
+      "reachable": true,
+      "waitingState": "UNDEF",
+      "direction": "via Frederiksberg",
+      "directionFlag": "2",
+      "duration": "PT1M"
+     }
+    ]
+   },
+   "calculation": "INITIAL",
+   "TripStatus": {
+    "hintCode": 0
+   },
+   "idx": 4,
+   "tripId": "C-4",
+   "ctxRecon": "¶HKI¶T$A=1@O=Enghave Plads St. (Metro)@L=8603344@a=128@$A=1@O=Frederiksberg Allé St. (Metro)@L=8603343@a=128@$202611081501$202611081502$Metro M3$$1$$$$$$¶KC¶#VE#2#CF#100#CA#0#CM#0#SICT#0#AM#16481#AM2#0#RT#20#¶KRCC¶#VE#1#MRTF#",
+   "duration": "PT1M",
+   "checksum": "6e707728_3",
+   "checksumDti": "ab02a679_3",
+   "checksumSave": "6e707728_3"
+  },
+  {
+   "Origin": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Enghave Plads",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Enghave Plads"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Enghave Plads St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+    "extId": "8603344",
+    "lon": 12.545813,
+    "lat": 55.667283,
+    "routeIdx": 1,
+    "prognosisType": "PROGNOSED",
+    "time": "15:05:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "Destination": {
+    "Notes": {
+     "Note": [
+      {
+       "key": "FB",
+       "type": "A"
+      },
+      {
+       "value": "Frederiksberg Allé",
+       "key": "MY",
+       "type": "I",
+       "txtN": "Frederiksberg Allé"
+      },
+      {
+       "value": "FL",
+       "key": "OZ",
+       "type": "I",
+       "txtN": "FL"
+      },
+      {
+       "value": "1001",
+       "key": "TN",
+       "type": "I",
+       "txtN": "1001"
+      },
+      {
+       "value": "TH",
+       "key": "TP",
+       "type": "I",
+       "txtN": "TH"
+      },
+      {
+       "value": "DOT 1",
+       "key": "TR",
+       "type": "I",
+       "txtN": "DOT 1"
+      },
+      {
+       "value": "1",
+       "key": "TW",
+       "type": "I",
+       "txtN": "1"
+      }
+     ]
+    },
+    "name": "Frederiksberg Allé St. (Metro)",
+    "type": "ST",
+    "id": "A=1@O=Frederiksberg Allé St. (Metro)@X=12540348@Y=55673729@U=86@L=8603343@",
+    "extId": "8603343",
+    "lon": 12.540348,
+    "lat": 55.673729,
+    "routeIdx": 2,
+    "prognosisType": "PROGNOSED",
+    "time": "15:06:00",
+    "date": "2026-11-08",
+    "minimumChangeDuration": "PT4M"
+   },
+   "ServiceDays": [
+    {
+     "planningPeriodBegin": "2026-11-06",
+     "planningPeriodEnd": "2027-01-27",
+     "sDaysR": "ikke altid",
+     "sDaysI": "8. nov - 27. dec 2026 lør, søn",
+     "sDaysB": "60C183060C183000000000"
+    }
+   ],
+   "LegList": {
+    "Leg": [
+     {
+      "Origin": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Enghave Plads",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Enghave Plads"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Enghave Plads St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Enghave Plads St. (Metro)@X=12545813@Y=55667283@U=86@L=8603344@",
+       "extId": "8603344",
+       "lon": 12.545813,
+       "lat": 55.667283,
+       "routeIdx": 1,
+       "prognosisType": "PROGNOSED",
+       "time": "15:05:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Destination": {
+       "Notes": {
+        "Note": [
+         {
+          "key": "FB",
+          "type": "A"
+         },
+         {
+          "value": "Frederiksberg Allé",
+          "key": "MY",
+          "type": "I",
+          "txtN": "Frederiksberg Allé"
+         },
+         {
+          "value": "FL",
+          "key": "OZ",
+          "type": "I",
+          "txtN": "FL"
+         },
+         {
+          "value": "1001",
+          "key": "TN",
+          "type": "I",
+          "txtN": "1001"
+         },
+         {
+          "value": "TH",
+          "key": "TP",
+          "type": "I",
+          "txtN": "TH"
+         },
+         {
+          "value": "DOT 1",
+          "key": "TR",
+          "type": "I",
+          "txtN": "DOT 1"
+         },
+         {
+          "value": "1",
+          "key": "TW",
+          "type": "I",
+          "txtN": "1"
+         }
+        ]
+       },
+       "name": "Frederiksberg Allé St. (Metro)",
+       "type": "ST",
+       "id": "A=1@O=Frederiksberg Allé St. (Metro)@X=12540348@Y=55673729@U=86@L=8603343@",
+       "extId": "8603343",
+       "lon": 12.540348,
+       "lat": 55.673729,
+       "routeIdx": 2,
+       "prognosisType": "PROGNOSED",
+       "time": "15:06:00",
+       "date": "2026-11-08",
+       "minimumChangeDuration": "PT4M"
+      },
+      "Notes": {
+       "Note": [
+        {
+         "value": "Toget har lav indstigning",
+         "key": "BE",
+         "type": "A",
+         "priority": 0,
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "Toget har lav indstigning"
+        },
+        {
+         "value": "E6140F",
+         "key": "CT",
+         "type": "I",
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "E6140F"
+        },
+        {
+         "value": "10549",
+         "key": "FD",
+         "type": "I",
+         "routeIdxFrom": 1,
+         "routeIdxTo": 2,
+         "txtN": "10549"
+        }
+       ]
+      },
+      "JourneyDetailRef": {
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61047#TA#57#DA#81126#1S#8603330#1T#1504#LS#8603330#LT#1551#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1504#TO#8603330#TT#1551#"
+      },
+      "JourneyStatus": "P",
+      "Product": [
+       {
+        "icon": {
+         "foregroundColor": {
+          "r": 255,
+          "g": 255,
+          "b": 255,
+          "hex": "#FFFFFF"
+         },
+         "backgroundColor": {
+          "r": 230,
+          "g": 20,
+          "b": 15,
+          "hex": "#E6140F"
+         },
+         "res": "prod_sub"
+        },
+        "operatorInfo": {
+         "name": "Metroselskabet",
+         "nameS": "Met",
+         "nameN": "Metro",
+         "nameL": "Metroselskabet"
+        },
+        "name": "Metro M3",
+        "internalName": "Metro M3",
+        "displayNumber": "M3",
+        "num": "7844",
+        "line": "M3",
+        "lineId": "034_000082_M3",
+        "catOut": "MET",
+        "catIn": "034",
+        "catCode": "10",
+        "cls": "1024",
+        "catOutS": "034",
+        "catOutL": "Metro",
+        "operatorCode": "Met",
+        "operator": "Metroselskabet",
+        "admin": "000082",
+        "routeIdxFrom": 1,
+        "routeIdxTo": 2,
+        "matchId": "10549"
+       }
+      ],
+      "JourneyDetail": {
+       "dayOfOperation": "2026-11-08",
+       "ref": "2|#VN#1#ST#1793972400#PI#0#ZI#61047#TA#57#DA#81126#1S#8603330#1T#1504#LS#8603330#LT#1551#PU#86#RT#1#CA#034#ZE#M3#ZB#Metro M3#PC#10#FR#8603330#FT#1504#TO#8603330#TT#1551#"
+      },
+      "id": "C-5:000",
+      "idx": 0,
+      "name": "Metro M3",
+      "number": "M3",
+      "category": "034",
+      "type": "JNY",
+      "reachable": true,
+      "waitingState": "UNDEF",
+      "direction": "via Frederiksberg",
+      "directionFlag": "2",
+      "duration": "PT1M"
+     }
+    ]
+   },
+   "calculation": "INITIAL",
+   "TripStatus": {
+    "hintCode": 0
+   },
+   "idx": 5,
+   "tripId": "C-5",
+   "ctxRecon": "¶HKI¶T$A=1@O=Enghave Plads St. (Metro)@L=8603344@a=128@$A=1@O=Frederiksberg Allé St. (Metro)@L=8603343@a=128@$202611081505$202611081506$Metro M3$$1$$$$$$¶KC¶#VE#2#CF#100#CA#0#CM#0#SICT#0#AM#16481#AM2#0#RT#20#¶KRCC¶#VE#1#MRTF#",
+   "duration": "PT1M",
+   "checksum": "62cc36e0_3",
+   "checksumDti": "2f510d3a_3",
+   "checksumSave": "62cc36e0_3"
+  }
+ ],
+ "ResultStatus": {
+  "timeDiffCritical": false
+ },
+ "TechnicalMessages": {
+  "TechnicalMessage": [
+   {
+    "value": "2026-11-08 14:43:00",
+    "key": "requestTime"
+   },
+   {
+    "value": "ttp=17112#17194 plancode0=ydb8y planid=1793972400 planid0=1793972400 planid_adr=1793621953 plancode_adr=x5tub planid_poi=1788521519 plancode_poi=u4ibl srvv=5.45.Rejseplanen.19.1.23 (customer/hcudk/release/2026.4.0.3) [2026-09-14] tlibv=TRFVER: rel/dk/13.03.2 2026-09-02 15:26:33 +0200 Rejsekort v13.3.1 jno=2",
+    "key": "backendInfo"
+   }
+  ]
+ },
+ "serverVersion": "2.53.1.2",
+ "dialectVersion": "2.53-Rejseplanen",
+ "planRtTs": "2026-11-08T14:42:53.000+01:00",
+ "requestId": "uz2xgqx6ixuewmwg",
+ "scrB": "3|OB|MTµ14µ6645µ6645µ6646µ6646µ0µ0µ485µ6643µ1µ0µ106µ0µ0µ-2147483648µ1µ2|PDHµ5cc18aeded0ee8d47315a7bc7193c708|RDµ8112026|RTµ144300|USµ1|RSµINIT",
+ "scrF": "3|OF|MTµ14µ6665µ6665µ6666µ6666µ0µ0µ485µ6662µ6µ0µ106µ0µ0µ-2147483648µ1µ2|PDHµ5cc18aeded0ee8d47315a7bc7193c708|RDµ8112026|RTµ144300|USµ1|RSµINIT"
+}

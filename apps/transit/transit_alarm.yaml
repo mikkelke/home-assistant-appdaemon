@@ -17,6 +17,7 @@
 #   Carlsberg (S-tog)      → 8600631
 #   KBH H (S-tog)          → 8600626
 #   KBH H (Metro)          → 8603330
+#   Frederiksberg Allé (Metro) → 8603343
 #   Odense St. (IC/Re)     → 8600512
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -71,9 +72,9 @@ TransitStatus:
       transport_name: "Metro M3"
       stop_name: "Enghave Plads"
       stop_id: "8603344"
-      direction_id: "8603330"
-      # Cityringen: filter to "via København H" (1 stop); ø normalized in code.
-      direction_name_filter: "københavn h"
+      # The times come from a trip search to the next stop that way round the ring, which fixes the direction.
+      departure_source: trip
+      trip_dest_id: "8603330"
       lines:
         - "M3"
       evaluation_mode: high_frequency
@@ -92,8 +93,8 @@ TransitStatus:
       transport_name: "Metro M3 -> Frederiksberg"
       stop_name: "Enghave Plads"
       stop_id: "8603344"
-      direction_id: "8603343"
-      direction_name_filter: "frederiksberg"
+      departure_source: trip
+      trip_dest_id: "8603343"
       lines:
         - "M3"
       evaluation_mode: high_frequency
@@ -176,8 +177,8 @@ TransitMikkel:
       transport_name: "Metro M3"
       stop_name: "Enghave Plads"
       stop_id: "8603344"
-      direction_id: "8603330"
-      direction_name_filter: "københavn h"
+      departure_source: trip
+      trip_dest_id: "8603330"
       lines:
         - "M3"
       evaluation_mode: high_frequency

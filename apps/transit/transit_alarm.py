@@ -1,5 +1,5 @@
 """
-Transit Alarm - Rejseplanen 2.0 departureBoard integration for AppDaemon.
+Transit Alarm - Rejseplanen 2.0 departureBoard and trip integration for AppDaemon.
 
 Two independent functions:
 
@@ -29,6 +29,11 @@ messages for those lines (the operations data behind m.dk's status page, fetched
 overrule Rejseplanen's missing times: with only all-clear messages, or none, the route is OK; any
 other message makes it Disrupted, worded as that message. Unreadable data changes nothing.
 
+A Metro route may set `departure_source: trip` and `trip_dest_id` (the stop its trains run to next) to take
+its departures from one trip search from `stop_id` to that stop instead of the departure board: the first
+Metro leg of each of the next TRIP_COUNT trips, on one of the route's `lines`, with the leg's own scheduled
+time, realtime and cancellation. The destination fixes the direction, so `direction_name_filter` is not used.
+
 Requires an AppDaemon build where get_state/call_service are awaitable (async API).
 """
 
@@ -42,6 +47,13 @@ from typing import Any, Optional
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
 REJSEPLANEN_BASE = "https://www.rejseplanen.dk/api"
+
+# Values of a route's `departure_source` key (default "board").
+DEPARTURE_SOURCES = frozenset({"board", "trip"})
+# Rejseplanen's product class for Metro: the `products` filter of a trip search and a leg's Product `cls`.
+METRO_PRODUCT_CLASS = 1024
+# The most trips one trip search returns; a larger `numF` is refused.
+TRIP_COUNT = 6
 
 MDK_STATUS_URL = "https://m.dk/api/operationsdata/"
 MDK_TIMEOUT_SEC = 8
@@ -97,6 +109,53 @@ def parse_mdk_status(data: Any) -> dict:
         "warning": warning if isinstance(warning, bool) else None,
         "raw": " | ".join(f"{m['group']}: {m['name']}" for m in messages),
     }
+
+
+def _metro_product(leg: Any, lines: set) -> Optional[dict]:
+    """The Product of a trip leg when the leg is a Metro journey on one of `lines` (any Metro line when none)."""
+    products = leg.get("Product") if isinstance(leg, dict) else None
+    for product in products if isinstance(products, list) else [products]:
+        if not isinstance(product, dict) or str(product.get("cls")) != str(METRO_PRODUCT_CLASS):
+            continue
+        line = str(product.get("displayNumber") or product.get("line") or "").strip().upper()
+        if not lines or line in lines:
+            return product
+    return None
+
+
+def trip_departures(data: Any, stop_id: Any, lines: Any) -> list[dict]:
+    """The Metro departures from `stop_id` in a trip search, as departure-board entries, soonest first.
+
+    Each trip gives the first of its legs that is a Metro journey on one of `lines`, provided that leg
+    leaves `stop_id`; a trip whose first such leg leaves elsewhere gives nothing. The leg's origin holds
+    the scheduled time and, once the train runs off schedule, the realtime. A train that several trips
+    start with counts once."""
+    wanted = {str(line).strip().upper() for line in lines or []}
+    found: dict[tuple, dict] = {}
+    for trip in data.get("Trip") or []:
+        for leg in (trip.get("LegList") or {}).get("Leg") or []:
+            product = _metro_product(leg, wanted)
+            if product is None:
+                continue
+            origin = leg.get("Origin") or {}
+            if str(origin.get("extId")) == str(stop_id):
+                cancelled = any(
+                    flag is True or str(flag).lower() == "true"
+                    for flag in (leg.get("cancelled"), origin.get("cancelled"), origin.get("cancelledDeparture"))
+                )
+                departure = {
+                    "date": origin.get("date"),
+                    "time": origin.get("time"),
+                    "rtDate": origin.get("rtDate"),
+                    "rtTime": origin.get("rtTime"),
+                    "ProductAtStop": product,
+                    "JourneyStatus": leg.get("JourneyStatus"),
+                    "cancelled": cancelled,
+                }
+                line = product.get("displayNumber") or product.get("line")
+                found.setdefault((departure["date"], departure["time"], line), departure)
+            break
+    return sorted(found.values(), key=lambda dep: (dep["date"] or "", dep["time"] or ""))
 
 
 class TransitAlarm(hass.Hass):
@@ -220,6 +279,17 @@ class TransitAlarm(hass.Hass):
                 raise ValueError(
                     f"TransitAlarm: route '{label}' needs operator_status_lines, the lines the operator's "
                     f"messages are read for (e.g. ['M3']); got {status_lines!r}."
+                )
+            departure_source = route.get("departure_source", "board")
+            if departure_source not in DEPARTURE_SOURCES:
+                raise ValueError(
+                    f"TransitAlarm: route '{label}' has invalid departure_source {departure_source!r}; "
+                    f"expected one of: {', '.join(sorted(DEPARTURE_SOURCES))}."
+                )
+            if departure_source == "trip" and not str(route.get("trip_dest_id") or "").strip():
+                raise ValueError(
+                    f"TransitAlarm: route '{label}' needs trip_dest_id, the stop id its trips run to "
+                    f"(e.g. '8603330'); got {route.get('trip_dest_id')!r}."
                 )
         for route in self.routes:
             if "sensor_id" not in route:
@@ -974,7 +1044,8 @@ class TransitAlarm(hass.Hass):
         stop_id        = route["stop_id"]
         direction_id   = route.get("direction_id", "")
         lines          = route.get("lines", [])
-        name_filter    = (route.get("direction_name_filter") or "").lower()
+        from_trip      = route.get("departure_source") == "trip"
+        name_filter    = "" if from_trip else (route.get("direction_name_filter") or "").lower()
         delay_thr      = int(route.get("delay_threshold_min", 5))
         transport_name = route.get("transport_name", f"Stop {stop_id}")
 
@@ -982,22 +1053,35 @@ class TransitAlarm(hass.Hass):
         # where the instance-level duration_min may not capture any trains.
         duration = int(route.get("duration_min", self.duration_min))
 
-        params: dict = {
-            "id":          stop_id,
-            "duration":    duration,
-            "maxJourneys": self.max_journeys,
-            "format":      "json",
-            "rtMode":      "SERVER_DEFAULT",
-            "accessId":    self.access_id,
-        }
-        if direction_id:
-            params["direction"] = direction_id
-        if lines:
-            params["lines"] = ",".join(str(ln) for ln in lines)
-        if route.get("arrival_stop_id"):
-            params["passlist"] = 1
+        params: dict
+        if from_trip:
+            url = f"{REJSEPLANEN_BASE}/trip"
+            params = {
+                "originId": stop_id,
+                "destId":   route["trip_dest_id"],
+                "products": METRO_PRODUCT_CLASS,
+                "numF":     TRIP_COUNT,
+                "tariff":   0,
+                "format":   "json",
+                "accessId": self.access_id,
+            }
+        else:
+            url = f"{REJSEPLANEN_BASE}/departureBoard"
+            params = {
+                "id":          stop_id,
+                "duration":    duration,
+                "maxJourneys": self.max_journeys,
+                "format":      "json",
+                "rtMode":      "SERVER_DEFAULT",
+                "accessId":    self.access_id,
+            }
+            if direction_id:
+                params["direction"] = direction_id
+            if lines:
+                params["lines"] = ",".join(str(ln) for ln in lines)
+            if route.get("arrival_stop_id"):
+                params["passlist"] = 1
 
-        url = f"{REJSEPLANEN_BASE}/departureBoard"
         try:
             async with session.get(
                 url, params=params, timeout=aiohttp.ClientTimeout(total=10)
@@ -1015,7 +1099,11 @@ class TransitAlarm(hass.Hass):
             self.log(f"API error for {transport_name}: {msg}", level="WARNING")
             return {"error": msg, "has_issues": True}
 
-        departures: list = data.get("Departure", [])
+        if from_trip and not (isinstance(data.get("Trip"), list) and data["Trip"]):
+            self.log(f"API returned no trips for {transport_name}", level="WARNING")
+            return {"error": "no Trip in the response", "has_issues": True}
+
+        departures: list = trip_departures(data, stop_id, lines) if from_trip else data.get("Departure", [])
 
         if name_filter:
             nf = _ascii_lower(name_filter)
@@ -1033,7 +1121,7 @@ class TransitAlarm(hass.Hass):
                 if (d.get("ProductAtStop", {}).get("catOut") or "").lower() in cat_filter
             ]
 
-        had_filters = bool(name_filter or cat_filter)
+        had_filters = from_trip or bool(name_filter or cat_filter)
         if not departures:
             if had_filters:
                 self.log(
