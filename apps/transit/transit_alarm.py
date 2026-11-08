@@ -24,27 +24,26 @@ member - each with independent routes, notification targets, and thresholds.
 Trigger-driven instances (e.g. leave-home trigger) should set
 enable_status_change_alerts: false to avoid duplicate problem/clear notifications.
 
-A route may set `operator_status: mdk` to let the operator's own network status (the text on
-m.dk's status page, fetched once per check) overrule Rejseplanen's missing times: "Normal togdrift"
-means OK, any other text means Disrupted, an unreachable page changes nothing.
+A route may set `operator_status: mdk` and `operator_status_lines: ["M3"]` to let the operator's own
+messages for those lines (the operations data behind m.dk's status page, fetched once per check)
+overrule Rejseplanen's missing times: with only all-clear messages, or none, the route is OK; any
+other message makes it Disrupted, worded as that message. Unreadable data changes nothing.
 
 Requires an AppDaemon build where get_state/call_service are awaitable (async API).
 """
 
-import html
 import re
 import unicodedata
 import asyncio
 import aiohttp
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
 REJSEPLANEN_BASE = "https://www.rejseplanen.dk/api"
 
-MDK_STATUS_URL = "https://m.dk/da/drift-og-service/status-og-planlagte-driftsaendringer/"
-MDK_NORMAL_TEXT = "Normal togdrift"
+MDK_STATUS_URL = "https://m.dk/api/operationsdata/"
 MDK_TIMEOUT_SEC = 8
 MDK_WARN_EVERY = timedelta(minutes=30)
 
@@ -69,22 +68,35 @@ def _ascii(s: str) -> str:
     return unicodedata.normalize("NFKD", s.translate(_TO_ASCII)).encode("ascii", "ignore").decode("ascii")
 
 
-_TRACK_DIV = re.compile(r'<div\b[^>]*?\sclass="(?:[^"]*\s)?track(?:\s[^"]*)?"[^>]*>(.*?)</div>', re.S | re.I)
-_PARAGRAPH = re.compile(r"<p\b[^>]*>(.*?)</p>", re.S | re.I)
-_TAG = re.compile(r"<[^>]*>")
+def _mdk_message(item: Any) -> dict:
+    setup = item.get("lineSetup") if isinstance(item, dict) else None
+    if not isinstance(setup, dict):
+        raise ValueError("unexpected message in activeMessages")
+    group, name, clear = setup.get("lineGroup"), item.get("name"), item.get("isClearMessage")
+    group = group.strip() if isinstance(group, str) else ""
+    name = " ".join(name.split()) if isinstance(name, str) else ""
+    if not (group and name and isinstance(clear, bool)):
+        raise ValueError("unexpected message in activeMessages")
+    return {"group": group, "lines": [line.strip().upper() for line in group.split("/")], "name": name, "clear": clear}
 
 
-def parse_mdk_status(page: Optional[str]) -> Optional[str]:
-    """The overall metro status on m.dk's status page: the distinct, whitespace-normalised texts of
-    its `track` paragraphs joined with " | " (one on a normal day, several during a disruption),
-    or None when the page has no such text."""
-    texts: list[str] = []
-    for block in _TRACK_DIV.findall(page or ""):
-        for part in _PARAGRAPH.findall(block) or [block]:
-            text = " ".join(html.unescape(_TAG.sub(" ", part)).split())
-            if text and text not in texts:
-                texts.append(text)
-    return " | ".join(texts) or None
+def parse_mdk_status(data: Any) -> dict:
+    """The operator's messages in the operations data m.dk's status page reads, one per line group.
+
+    A message is {"group": "M3/M4", "lines": ["M3", "M4"], "name": its text, "clear": whether it is
+    an all-clear}; the line group is trimmed and split on "/" as m.dk's page does. "raw" lists every
+    group with its text and "warning" is `activeWarning`. Raises ValueError for anything else, so a
+    changed format reads as no status instead of as a normal one."""
+    items = data.get("activeMessages") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise ValueError("no activeMessages list in the response")
+    messages = [_mdk_message(item) for item in items]
+    warning = data.get("activeWarning")
+    return {
+        "messages": messages,
+        "warning": warning if isinstance(warning, bool) else None,
+        "raw": " | ".join(f"{m['group']}: {m['name']}" for m in messages),
+    }
 
 
 class TransitAlarm(hass.Hass):
@@ -199,6 +211,16 @@ class TransitAlarm(hass.Hass):
                     f"TransitAlarm: route '{label}' has invalid operator_status {source!r}; "
                     f"expected one of: {', '.join(sorted(OPERATOR_STATUS_SOURCES))}."
                 )
+            status_lines = route.get("operator_status_lines")
+            if source is not None and not (
+                isinstance(status_lines, list)
+                and status_lines
+                and all(isinstance(line, str) and line.strip() for line in status_lines)
+            ):
+                raise ValueError(
+                    f"TransitAlarm: route '{label}' needs operator_status_lines, the lines the operator's "
+                    f"messages are read for (e.g. ['M3']); got {status_lines!r}."
+                )
         for route in self.routes:
             if "sensor_id" not in route:
                 self.log(
@@ -216,7 +238,7 @@ class TransitAlarm(hass.Hass):
         # Prevents repeat notifications while disruption persists.
         # Maps sensor_id -> "Delayed" | "Disrupted" | "Unavailable"
         self._disruption_notified: dict = {}
-        # Last m.dk status text seen (logged when it changes) and when a failed fetch was last logged.
+        # Last m.dk messages seen (logged when they change) and when a failed fetch was last logged.
         self._mdk_text: Optional[str] = None
         self._mdk_warned_at: Optional[datetime] = None
 
@@ -677,7 +699,7 @@ class TransitAlarm(hass.Hass):
             coros = [limited_check(route, session) for route in self.routes]
             res_list = await asyncio.gather(*coros, return_exceptions=True)
             # One fetch serves every route that asks for the operator's status.
-            operator_text = (
+            operator_status = (
                 await self._fetch_mdk_status(session)
                 if any(route.get("operator_status") for route in self.routes)
                 else None
@@ -688,23 +710,20 @@ class TransitAlarm(hass.Hass):
                 self.log(f"Route {route.get('transport_name', '?')} failed: {res}", level="WARNING")
                 res = {"error": str(res), "has_issues": True}
             if route.get("operator_status"):
-                res = self._apply_operator_status(route, res, operator_text)
+                res = self._apply_operator_status(route, res, operator_status)
             results.append((route, res))
         return results
 
-    async def _fetch_mdk_status(self, session: aiohttp.ClientSession) -> Optional[str]:
-        """The metro status text on m.dk's status page, or None when it cannot be had.
-        Logs INFO when the text changes and WARNING (at most every MDK_WARN_EVERY) when it fails."""
+    async def _fetch_mdk_status(self, session: aiohttp.ClientSession) -> Optional[dict]:
+        """The operator's messages from m.dk (see parse_mdk_status), or None when they cannot be had.
+        Logs INFO when the messages change and WARNING (at most every MDK_WARN_EVERY) when it fails."""
         try:
             async with session.get(
                 MDK_STATUS_URL, timeout=aiohttp.ClientTimeout(total=MDK_TIMEOUT_SEC)
             ) as resp:
                 if resp.status != 200:
                     raise RuntimeError(f"HTTP {resp.status}")
-                page = await resp.text()
-            text = parse_mdk_status(page)
-            if text is None:
-                raise ValueError("no status text on the page")
+                status = parse_mdk_status(await resp.json(content_type=None))
         except Exception as exc:
             now = datetime.now()
             if self._mdk_warned_at is None or now - self._mdk_warned_at >= MDK_WARN_EVERY:
@@ -715,31 +734,45 @@ class TransitAlarm(hass.Hass):
                     level="WARNING",
                 )
             return None
-        if text != self._mdk_text:
-            self._mdk_text = text
-            self.log(f"m.dk metro status: {_ascii(text)[:200]}", level="INFO")
-        return text
+        if status["raw"] != self._mdk_text:
+            self._mdk_text = status["raw"]
+            self.log(f"m.dk metro status: {_ascii(status['raw'])[:200] or 'no messages'}", level="INFO")
+        return status
 
     @staticmethod
-    def _apply_operator_status(route: dict, res: dict, text: Optional[str]) -> dict:
-        """Lay the operator's own network status over a route's Rejseplanen result.
+    def _apply_operator_status(route: dict, res: dict, status: Optional[dict]) -> dict:
+        """Lay the operator's own messages for a route's lines over its Rejseplanen result.
 
-        "Normal togdrift" means the trains run, so missing times or a failed lookup is no problem
-        (cancellations Rejseplanen does report still count). Any other text is a disruption.
-        No text (the operator's page could not be read) leaves the result as Rejseplanen made it."""
-        out = {**res, "operator_status": text}
-        if text is None or res.get("disabled"):
+        Only messages for a line group containing one of the route's `operator_status_lines` count. When
+        they are all all-clears, or there are none, the trains run: missing times or a failed lookup is
+        no problem (cancellations Rejseplanen does report still count). Any other message is a
+        disruption, worded as the message. No status (m.dk could not be read) leaves the result as
+        Rejseplanen made it."""
+        if status is None:
+            return {**res, "operator_status": None}
+        wanted = {line.strip().upper() for line in route["operator_status_lines"]}
+        relevant = [m for m in status["messages"] if wanted.intersection(m["lines"])]
+        disruptions = [m for m in relevant if not m["clear"]]
+        texts = list(dict.fromkeys(m["name"] for m in disruptions or relevant))
+        published = {
+            "operator_status": " | ".join(texts) or None,
+            "operator_status_ok": not disruptions,
+            "operator_status_raw": status["raw"] or None,
+            "operator_status_warning": status["warning"],
+        }
+        out = {**res, **published}
+        if res.get("disabled"):
             return out
-        if text == MDK_NORMAL_TEXT:
+        if not disruptions:
             if res.get("error"):
-                out = {"has_issues": False, "operator_status": text}
+                out = {"has_issues": False, **published}
             out["no_service"] = False
             out["no_times"] = not out.get("departures")
             return out
         name = route.get("transport_name", route.get("sensor_id", "Route"))
         out.pop("error", None)
         out["no_service"] = False
-        out["issues"] = [f"{name}: {text}", *res.get("issues", [])]
+        out["issues"] = [*(f"{name}: {text}" for text in texts), *res.get("issues", [])]
         out["severity"] = max(res.get("severity", 0), 3)
         out["has_issues"] = True
         return out
@@ -750,8 +783,13 @@ class TransitAlarm(hass.Hass):
         source = route.get("operator_status")
         if not source:
             return {}
+        # AppDaemon 4.5.13 publishes True as "true" and drops False and None, so a consumer reads an
+        # operator_status without operator_status_ok as a disruption, and neither as no status.
         return {
             "operator_status": res.get("operator_status"),
+            "operator_status_ok": res.get("operator_status_ok"),
+            "operator_status_raw": res.get("operator_status_raw"),
+            "operator_status_warning": res.get("operator_status_warning"),
             "operator_status_source": OPERATOR_STATUS_SOURCES[source],
         }
 
