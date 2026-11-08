@@ -98,6 +98,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
     # Attribution state (see _attribute), class-level so it also exists before initialize().
     _cycle_actor = None  # ActorAttribution result for whoever started the current cycle
     last_door_closed_at = None  # UTC of the last door close with the machine Off or Emptied
+    announce_entity = None  # input_boolean; off silences the Sonos finish announcement
     # The start is anchored on the door close that loaded the machine, which can precede the power
     # edge by hours on a delayed start; a close older than this is not trusted.
     LOAD_ANCHOR_MAX_AGE_S = 12 * 3600
@@ -268,6 +269,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         # quiet mobile push; a door-open edge since that end (emptied during the outage)
         # suppresses it entirely. See _finish_with_dry_tail's boot_self_heal branch.
         self.announce_freshness_minutes = float(self.args.get("announce_freshness_minutes", 20))
+        self.announce_entity = self.args.get("announce_entity")
 
         # Start candidate: HA stays Off/Unemptied until power evidence proves a real start (blocks plug blips / door-arm single-sample false starts).
         self.start_candidate_window_s = int(
@@ -2981,7 +2983,14 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
 
             # Send notification - dishwasher done, please empty!
             # Skip when skip_announce=True (user opened door before we detected finish).
-            if not skip_announce and self.sonos_notifier and not self.notification_sent:
+            announce_enabled = True
+            if self.announce_entity:
+                try:
+                    announce_enabled = self.get_state(self.announce_entity) == "on"
+                except Exception:
+                    pass
+            if (not skip_announce and self.sonos_notifier and not self.notification_sent
+                    and announce_enabled):
                 try:
                     self.sonos_notifier.notify(message="Dishwasher is ready to be emptied")
                     self.log("Sent notification.", level="INFO")
@@ -3199,6 +3208,12 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                 self.emptied_timeout_minutes * 60
             )
             
+            if self.announce_entity:
+                try:
+                    self.call_service("input_boolean/turn_on", entity_id=self.announce_entity)
+                except Exception as e:
+                    self.log(f"Could not reset announce toggle: {e}", level="WARNING")
+
             self.log(f"State -> Emptied ({reason})", level="INFO")
 
     def _reset_cycle_tracking(self):

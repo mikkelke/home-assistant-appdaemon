@@ -145,6 +145,7 @@ dishwasher_monitor:
   # since that end (emptied during the outage) suppresses the reminder entirely. The DEFERRED
   # dry-tail path (machine still drying) is unaffected - it announces at the real end.
   announce_freshness_minutes: 20
+  announce_entity: "input_boolean.dishwasher_announce"   # Toggle off to silence; app resets to on when Emptied
   # Per-programme dry_tail_minutes lives in dishwasher_programmes.yaml (eco: 35). When the
   # finish guards + energy idle are met, Unemptied and its Sonos/push announcement wait
   # until guard-open + dry_tail, so "finished" means the MACHINE is finished. Door opens

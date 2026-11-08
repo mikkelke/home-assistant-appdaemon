@@ -257,6 +257,31 @@ class EcoFinishDefersToMachineEnd(BaseTailTest):
         self.assertIsNone(app._dry_tail_pending)
 
 
+class AnnounceToggle(BaseTailTest):
+    ANNOUNCE = "input_boolean.dishwasher_announce"
+
+    def test_toggle_off_silences_the_finish_announcement(self):
+        app = make_running_app(datetime(2026, 8, 12, 15, 45, 0, tzinfo=UTC))
+        app.announce_entity = self.ANNOUNCE
+        app.states[self.ANNOUNCE] = "off"
+        app._confirm_finished({})
+
+        self.assertEqual(app.states[app.state_entity], "Unemptied")
+        self.assertEqual(app.sonos_notifier.calls, [])
+
+    def test_emptying_turns_the_toggle_back_on(self):
+        app = make_running_app(datetime(2026, 8, 12, 15, 45, 0, tzinfo=UTC))
+        app.announce_entity = self.ANNOUNCE
+        app.states[self.ANNOUNCE] = "off"
+        calls = []
+        app.call_service = lambda service, **kw: calls.append((service, kw.get("entity_id")))
+        app._confirm_finished({})
+        app._transition_to_emptied("door opened")
+
+        self.assertEqual(app.states[app.state_entity], "Emptied")
+        self.assertIn(("input_boolean/turn_on", self.ANNOUNCE), calls)
+
+
 class TailAlreadyElapsedAtGuardTime(BaseTailTest):
     def test_late_evaluation_transitions_immediately(self):
         """Guard-open + tail (~15:30) already past when the finish is evaluated (e.g. app
