@@ -50,17 +50,20 @@ BathroomDisplay:
   # three together. measured_entity changing to a moment at most 120 s old while the room is active
   # identifies him for the visit and shows the weighing card for 90 s: weight and fat, then the change in
   # fat mass and in the rest since 30 days ago (the recorder's hourly mean nearest to that day, within 3
-  # days; a change of at most 0,3 kg reads "±0 kg"). The card uses only readings the weighing updated.
+  # days; a change of at most 0.3 kg reads "±0 kg"). The card uses only readings the weighing updated.
   measured_entity: sensor.mikkel_last_measurement
   weight_entity: sensor.mikkel_weight
   body_fat_entity: sensor.mikkel_body_fat
-  # On the way out, 06:00-12:00: "Regner nu" while the roof station's piezo sensor is on, else the first run
-  # of forecast hours with rain in the next 4 hours ("Regn 09-11", or "Regn fra 09" when it goes on past
-  # them). The hourly forecast is fetched at most every 30 minutes, and only while it is wanted.
+  # On the way out, 06:00-12:00: "Raining now" while the roof station's piezo sensor is on, else the first
+  # run of forecast hours with rain in the next 4 hours ("Rain 09-11", or "Rain from 09" when it goes on
+  # past them). Monday to Friday the line also tells of rain on the way home, 16:00-20:00 ("Rain 09-11 ·
+  # home 17-19"). The hourly forecast is fetched at most every 30 minutes, and only while it is wanted.
   rain_entity: binary_sensor.gw2000a_rain_state_piezo
   weather_entity: weather.forecast_home
-  # The wake-up alarm line, 20:00-02:00 and all through sleep mode. Tapping it on the display fires
-  # alarm_event, which toggles alarm_entity.
+  # The wake-up alarm line. Tapping it on the display fires alarm_event, which toggles alarm_entity.
   alarm_entity: input_boolean.wakeup_bedroom
   alarm_time_entity: input_datetime.wakeup_bedroom
   alarm_event: esphome.bathroom_display_alarm
+  # The alarm line shows from this time until 02:00 and all through sleep mode; 21:00 while this helper
+  # cannot be read as a time.
+  alarm_from_entity: input_datetime.bathroom_display_alarm_from

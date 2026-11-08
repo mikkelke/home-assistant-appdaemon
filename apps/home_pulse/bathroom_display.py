@@ -15,12 +15,12 @@ Publishes sensor.bathroom_display, the one entity the display reads:
                     rssi_fresh_s) or none (no reading), or held for a mikkel whose phone is neither near
                     nor rising right now
         person      "mikkel" for state mikkel, else ""
-        greeting    "Hej Mikkel" for state mikkel, else ""
+        greeting    "Hi Mikkel" for state mikkel, else ""
         night       "on" while Mikkel's sleep mode (sleep_entity) is on, else "", in every state
         line1..3    the title of each line, at most LINE_MAX characters; "" when unused
         icon1..3    the line's mdi icon, the row's own or the line's (mdi:train for transit); "" when unused
         due1..3     the text under the line's chip: when a row is due ("overdue", "today", "tomorrow" or
-                    "6 d"), or the short value of a weighing, alarm or rain line ("73,3 kg", "09:15",
+                    "6 d"), or the short value of a weighing, alarm or rain line ("73.3 kg", "09:15",
                     "09-11"); "" when it has none
         friendly_name, icon
     The lines are filled only for state mikkel, except while the night is on (below). The phone's dBm is not
@@ -57,17 +57,25 @@ display wakes it to the same.
 
 The lines for Mikkel, at most three, in this order:
     weighing  for CARD_S (90) seconds from a weighing of his, the card below in place of all the others.
-    alarm     20:00-02:00 house time: "Vækker 09:15" while alarm_entity (input_boolean.wakeup_bedroom) is
-              on, with the time of alarm_time_entity, else "Ingen vækker"; none while alarm_entity cannot
-              be read as on or off.
-    rain      06:00-12:00 house time, on the way out: "Regner nu" while rain_entity (the roof station's
+    alarm     from the time of alarm_from_entity (input_datetime.bathroom_display_alarm_from; ALARM_FROM,
+              21:00, while it cannot be read as a time) until 02:00 house time: "Alarm 09:15" while
+              alarm_entity (input_boolean.wakeup_bedroom) is on, with the time of alarm_time_entity, else
+              "No alarm"; none while alarm_entity cannot be read as on or off.
+    rain      06:00-12:00 house time, on the way out: "Raining now" while rain_entity (the roof station's
               piezo sensor) is on, else the first run of consecutive forecast hours with at least
-              upcoming_rain.MIN_MM that starts within RAIN_AHEAD (4 h): "Regn 09-11", from the start of
-              its first hour to the end of its last, or "Regn fra 09" when it goes on past those 4 hours.
+              upcoming_rain.MIN_MM that starts within RAIN_AHEAD (4 h): "Rain 09-11", from the start of
+              its first hour to the end of its last, or "Rain from 09" when it goes on past those 4 hours.
               An hour that is going on counts, one that is over does not, and a missing hour ends a run.
+              Monday to Friday (house days, holidays not known) it also covers the way home: the first
+              run of such hours among those that start inside today's HOME_FROM-HOME_TO (16:00-20:00),
+              "home 17-19", which comes after the way out's part and a " · " ("Rain 09-11 · home 17-19",
+              "Raining now · home 17-19") or stands alone as "Rain home 17-19". The text under the chip
+              is the way out's value ("now", "09-11", "from 09"), else the way home's ("17-19").
               No rain, no line. The hourly forecast (weather.get_forecasts for weather_entity) is
-              fetched only when it is wanted - state mikkel inside the window - and at most every
-              RAIN_REFETCH (30 min); one older than upcoming_rain.MAX_AGE is not used.
+              fetched only when it is wanted - state mikkel inside the window, and not while it rains on
+              a Saturday or Sunday, when the line needs none - and at most every RAIN_REFETCH (30 min).
+              One older than upcoming_rain.MAX_AGE is not used: no forecast part shows then, while
+              "Raining now" stays.
     transit   one line for each of his routes (the `transit` list) whose status is Delayed or Disrupted
               and whose data is at most transit_max_age_min old: the first upcoming cancelled departure
               ("S-tog: cancelled 07:42"), else the first late one ("S-tog: 07:42 +12 min"), else the status.
@@ -89,11 +97,11 @@ call, for the weight and the body fat of 30 days ago: the hourly mean row neares
 days of it, among the rows that have both. The card waits for the answer (or its failure) and shows only the
 values the weight and fat sensors took in this weighing, those updated within WEIGH_SPREAD (30 s) of the
 measurement sensor, so a fat percentage the scale did not measure is left out and not repeated from an
-earlier weighing. Its lines, with a decimal comma and a true minus:
-    "73,3 kg · 20,0 % fedt"   mdi:scale-bathroom; just "73,3 kg" without a fat percentage
-    "Fedt 30 d: −0,4 kg"      the change in fat mass (weight x fat % / 100) since then
-    "Fedtfri 30 d: +0,6 kg"   the change in the rest
-A change of at most DEAD_BAND_KG (0,3 kg) either way reads "±0 kg". With no row to compare with, or no fat
+earlier weighing. Its lines, with a decimal point and a true minus:
+    "73.3 kg · 20.0% fat"     mdi:scale-bathroom; just "73.3 kg" without a fat percentage
+    "Fat 30 d: −0.4 kg"       the change in fat mass (weight x fat % / 100) since then
+    "Lean 30 d: +0.6 kg"      the change in the rest
+A change of at most DEAD_BAND_KG (0.3 kg) either way reads "±0 kg". With no row to compare with, or no fat
 percentage, only the first line shows.
 
 State acquisition follows HouseUpcoming: one snapshot of each source at initialize, then
@@ -177,12 +185,15 @@ WEATHER = "weather.forecast_home"
 RAIN_ICON = "mdi:weather-rainy"
 RAIN_FROM = time(6)
 RAIN_TO = time(12)
+HOME_FROM = time(16)
+HOME_TO = time(20)
 RAIN_AHEAD = timedelta(hours=4)
 RAIN_REFETCH = timedelta(minutes=30)
 ALARM = "input_boolean.wakeup_bedroom"
 ALARM_TIME = "input_datetime.wakeup_bedroom"
 ALARM_ICON = "mdi:alarm"
-ALARM_FROM = time(20)
+ALARM_FROM_ENTITY = "input_datetime.bathroom_display_alarm_from"
+ALARM_FROM = time(21)
 ALARM_TO = time(2)
 ALARM_EVENT = "esphome.bathroom_display_alarm"
 FETCH_TIMEOUT_S = 12
@@ -467,8 +478,8 @@ def before_values(resp, ids, target):
 
 
 def kg_text(value):
-    """`value` with one decimal and a decimal comma."""
-    return f"{value:.1f}".replace(".", ",")
+    """`value` with one decimal."""
+    return f"{value:.1f}"
 
 
 def change_text(delta):
@@ -484,12 +495,12 @@ def weighing_lines(kg, percent, before):
     and fat as one line, then, given `before` - (kg, percent) from COMPARE_AGO - the change since then in fat
     mass (kg x percent / 100) and in the rest. The text under each chip is its value."""
     first = f"{kg_text(kg)} kg"
-    lines = [Line(fit(first if percent is None else f"{first} · {kg_text(percent)} % fedt"), SCALE_ICON, first)]
+    lines = [Line(fit(first if percent is None else f"{first} · {kg_text(percent)}% fat"), SCALE_ICON, first)]
     if percent is None or before is None:
         return lines
     fat, fat_before = kg * percent / 100, before[0] * before[1] / 100
-    for icon, name, delta in ((FAT_ICON, "Fedt", fat - fat_before),
-                              (LEAN_ICON, "Fedtfri", (kg - fat) - (before[0] - fat_before))):
+    for icon, name, delta in ((FAT_ICON, "Fat", fat - fat_before),
+                              (LEAN_ICON, "Lean", (kg - fat) - (before[0] - fat_before))):
         change = f"{change_text(delta)} kg"
         lines.append(Line(fit(f"{name} {COMPARE_AGO.days} d: {change}"), icon, change))
     return lines
@@ -519,42 +530,82 @@ def forecast_run(hours, now, ahead=RAIN_AHEAD):
     return run
 
 
+def workday(now):
+    """Whether the house date of `now` is a Monday to Friday; holidays are not known."""
+    return now.astimezone(maint.HOUSE_TZ).weekday() < 5
+
+
+def home_run(hours, now):
+    """The first run of rain, as forecast_run reads one, among the forecast `hours` that start inside today's
+    HOME_FROM-HOME_TO window in the house: (start of its first hour, end of its last), else None. An hour that
+    starts outside the window is not looked at, so a run ends with the window at the latest."""
+    start, end = (datetime.combine(maint.house_date(now), edge, maint.HOUSE_TZ) for edge in (HOME_FROM, HOME_TO))
+    return forecast_run([(hour, mm) for hour, mm in hours if start <= hour < end], start, end - start)
+
+
+def _house_hours(run):
+    """The house hours a run starts and ends at, as ("09", "11")."""
+    return tuple(moment.astimezone(maint.HOUSE_TZ).strftime("%H") for moment in run)
+
+
 def rain_line(raining, hours, fetched, now):
-    """"Regner nu" while it `raining`, else the forecast's first run of rain as "Regn 09-11" (house hours), or
-    "Regn fra 09" when it goes on past RAIN_AHEAD from `now`. None for no rain, and for a forecast that was
-    not fetched or was fetched, at `fetched`, more than rain.MAX_AGE ago."""
+    """The rain on the way out and, on a workday, on the way home. Out: "Raining now" while it `raining`, else
+    the forecast's first run of rain as "Rain 09-11" (house hours), or "Rain from 09" when it goes on past
+    RAIN_AHEAD from `now`. Home: the first run inside today's HOME_FROM-HOME_TO as "home 17-19". Both make
+    "Rain 09-11 · home 17-19" and home alone "Rain home 17-19". The text under the chip is the way out's value
+    ("09-11", "from 09", "now"), else the way home's ("17-19"). None for no rain. The forecast parts need one
+    that was fetched, at `fetched`, no more than rain.MAX_AGE ago; "Raining now" does not."""
+    fresh = fetched is not None and now - fetched <= rain.MAX_AGE
+    out = home = None
     if raining:
-        return Line("Regner nu", RAIN_ICON, "nu")
-    if fetched is None or now - fetched > rain.MAX_AGE:
+        out = ("Raining now", "now")
+    elif fresh:
+        run = forecast_run(hours, now)
+        if run:
+            start, end = _house_hours(run)
+            when = f"from {start}" if run[1] > now + RAIN_AHEAD else f"{start}-{end}"
+            out = (f"Rain {when}", when)
+    if fresh and workday(now):
+        run = home_run(hours, now)
+        if run:
+            span = "-".join(_house_hours(run))
+            home = (f"home {span}", span)
+    parts = [part for part in (out, home) if part]
+    if not parts:
         return None
-    run = forecast_run(hours, now)
-    if run is None:
-        return None
-    start, end = (moment.astimezone(maint.HOUSE_TZ).strftime("%H") for moment in run)
-    when = f"fra {start}" if run[1] > now + RAIN_AHEAD else f"{start}-{end}"
-    return Line(f"Regn {when}", RAIN_ICON, when)
+    joined = " · ".join(title for title, _ in parts)
+    return Line(joined if out else f"Rain {joined}", RAIN_ICON, parts[0][1])
+
+
+def alarm_start(clock):
+    """When the alarm line starts showing in the evening: `clock`, the state of the helper input_datetime
+    ("21:00:00"), as a time; ALARM_FROM for one that cannot be read as a time."""
+    try:
+        return time.fromisoformat(clock)
+    except (TypeError, ValueError):
+        return ALARM_FROM
 
 
 def alarm_line(armed, clock):
-    """The wake-up alarm as a line: "Vækker 09:15" while `armed` (the state of the alarm's input_boolean) is
-    on, "Ingen vækker" while it is off, none for any other state. `clock` is the state of the alarm's
+    """The wake-up alarm as a line: "Alarm 09:15" while `armed` (the state of the alarm's input_boolean) is
+    on, "No alarm" while it is off, none for any other state. `clock` is the state of the alarm's
     input_datetime ("09:15:00"); one that cannot be read leaves the time out."""
     if armed == "off":
-        return Line("Ingen vækker", ALARM_ICON, "ingen")
+        return Line("No alarm", ALARM_ICON, "off")
     if armed != "on":
         return None
     try:
         at = time.fromisoformat(clock).strftime("%H:%M")
     except (TypeError, ValueError):
-        return Line("Vækker", ALARM_ICON)
-    return Line(f"Vækker {at}", ALARM_ICON, at)
+        return Line("Alarm", ALARM_ICON)
+    return Line(f"Alarm {at}", ALARM_ICON, at)
 
 
 def payload(state, reason, resident, lines, night=False):
     """The attributes of sensor.bathroom_display: strings only, the lines padded with empty ones."""
     mikkel = state == "mikkel"
     attributes = {"friendly_name": "Bathroom display", "icon": ICON, "reason": reason,
-                  "person": resident.lower() if mikkel else "", "greeting": f"Hej {resident}" if mikkel else "",
+                  "person": resident.lower() if mikkel else "", "greeting": f"Hi {resident}" if mikkel else "",
                   "night": "on" if night else ""}
     for number, line in enumerate((list(lines) + [Line("")] * LINES)[:LINES], 1):
         attributes.update({f"line{number}": line.text, f"icon{number}": line.icon, f"due{number}": line.due})
@@ -603,6 +654,7 @@ class BathroomDisplay(hass.Hass):
         self.weather_entity = a.get("weather_entity", WEATHER)
         self.alarm_entity = a.get("alarm_entity", ALARM)
         self.alarm_time_entity = a.get("alarm_time_entity", ALARM_TIME)
+        self.alarm_from_entity = a.get("alarm_from_entity", ALARM_FROM_ENTITY)
         self.alarm_event = a.get("alarm_event", ALARM_EVENT)
 
         self._cache = {}
@@ -635,7 +687,7 @@ class BathroomDisplay(hass.Hass):
     def _sources(self):
         return list(dict.fromkeys([self.rssi_entity, self.upcoming_entity, self.sleep_entity, self.light_entity,
                                    self.measured_entity, self.weight_entity, self.fat_entity, self.rain_entity,
-                                   self.alarm_entity, self.alarm_time_entity]
+                                   self.alarm_entity, self.alarm_time_entity, self.alarm_from_entity]
                                   + [entity for _, entity in self.routes]))
 
     def _read(self, entity):
@@ -809,7 +861,7 @@ class BathroomDisplay(hass.Hass):
         card = self._card(now)
         if card:
             return card
-        lines = alarm if in_window(now, ALARM_FROM, ALARM_TO) else []
+        lines = alarm if in_window(now, alarm_start(self._state_of(self.alarm_from_entity)), ALARM_TO) else []
         if in_window(now, RAIN_FROM, RAIN_TO):
             lines = lines + self._rain(now)
         routes = [(label, self._cache.get(entity)) for label, entity in self.routes]
@@ -830,10 +882,11 @@ class BathroomDisplay(hass.Hass):
         return weighing_lines(kg, percent, weighing["before"])
 
     def _rain(self, now):
-        """The rain line, as a list. While it does not rain the hourly forecast is asked for, at most every
-        RAIN_REFETCH."""
+        """The rain line, as a list. The hourly forecast is asked for, at most every RAIN_REFETCH, unless it
+        rains on a Saturday or Sunday, when the line needs none."""
         raining = self._state_of(self.rain_entity) == "on"
-        if not raining and (self._forecast_asked is None or now - self._forecast_asked >= RAIN_REFETCH):
+        wanted = workday(now) or not raining
+        if wanted and (self._forecast_asked is None or now - self._forecast_asked >= RAIN_REFETCH):
             self._forecast_asked = now
             self.create_task(self._fetch_forecast(now))
         hours, fetched = self._forecast or ([], None)
