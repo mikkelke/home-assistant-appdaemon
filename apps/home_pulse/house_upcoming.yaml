@@ -129,7 +129,8 @@ HouseUpcoming:
       # Went offline at 52 % on 12.07.2026.
       parasoll: {cell: 1x LADDA AAA NiMH, action: recharge, trend: false}
       sq610rfnh: {cell: built-in rechargeable, action: charge, low: 40, pushed_by: salus_health}
-      yale: {cell: 4x XTAR AA Li-ion 4150 mWh, action: recharge, drop: 15, trend: false}
+      # The set out on 22.02.2026 read 27 % for ten days and still ran.
+      yale: {cell: 4x XTAR AA Li-ion 4150 mWh, action: recharge, low: 30, trend: false}
       blind: {cell: "", action: charge, low: 25}
       ws90: {cell: 2x AA, action: replace, low: 20, days: 2}
       # Reports only 100 or 10 %.
