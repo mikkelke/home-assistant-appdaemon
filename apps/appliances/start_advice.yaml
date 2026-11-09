@@ -1,0 +1,10 @@
+# Default Energy Plan advice; entity contract in start_advice.py.
+start_advice:
+  module: start_advice
+  class: StartAdvice
+  profiles_entity: sensor.appliance_run_profiles
+  # Match the grid flow's entity_energy_price in HA Energy preferences.
+  price_entity: sensor.energi_data_service
+  appliances:
+    washer: sensor.washer_state
+    dishwasher: sensor.dishwasher_state
