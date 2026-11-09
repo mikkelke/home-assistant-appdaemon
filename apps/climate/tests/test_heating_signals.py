@@ -495,6 +495,16 @@ class ThermostatEffects(unittest.TestCase):
             self.effect(KRISTINES, preset, sig.SRC_AUTOMATION), sig.EFFECT_WOULD_RESTORE
         )
 
+    def test_the_agent_acts_for_the_owner(self):
+        agent = sig.AGENT
+        self.assertEqual(
+            self.effect(FAMILY, setpoint(22.0), sig.SRC_HA, agent), sig.EFFECT_WOULD_SET_TARGET
+        )
+        off = sig.Change(sig.KIND_MODE, "heat", "off", T0)
+        self.assertEqual(self.effect(KRISTINES, off, sig.SRC_HA, agent), sig.EFFECT_OFF_BY_OWNER)
+        preset = sig.Change(sig.KIND_PRESET, "permanent_hold", "schedule", T0)
+        self.assertEqual(self.effect(KRISTINES, preset, sig.SRC_HA, agent), sig.EFFECT_NONE)
+
     def test_the_controllers_own_writes_and_rejections_mean_nothing(self):
         for source in (sig.SRC_OWN, sig.SRC_REVERT):
             self.assertEqual(self.effect(KRISTINES, setpoint(22.0), source), sig.EFFECT_NONE)
@@ -514,6 +524,13 @@ class ButtonsAndHelpers(unittest.TestCase):
             sig.Actor("none"),
         ):
             self.assertFalse(sig.button_allowed(KRISTINES, "mikkel", actor), actor)
+
+    def test_the_agent_presses_buttons_and_changes_helpers_as_the_owner(self):
+        agent = sig.Actor("person", sig.AGENT)
+        self.assertTrue(sig.button_allowed(KRISTINES, "mikkel", agent))
+        self.assertEqual(sig.helper_effect("mikkel", agent, KRISTINES, 0.5), sig.EFFECT_NUDGE_RESET)
+        self.assertEqual(sig.helper_effect("mikkel", agent, FAMILY, 0.0), sig.EFFECT_TARGET_SET)
+        self.assertEqual(sig.helper_effect("mikkel", agent), sig.EFFECT_NONE)
 
     def test_the_owner_changing_a_residents_target_resets_her_nudge(self):
         owner = sig.Actor("person", "mikkel")

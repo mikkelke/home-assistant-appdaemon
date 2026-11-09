@@ -90,6 +90,7 @@ MIKKEL_ID = "11111111111111111111111111111111"
 CLAUDIA_ID = "33333333333333333333333333333333"
 KRISTINE_ID = "5bee78148825439488b70f92565e6c26"
 STRANGER_ID = "44444444444444444444444444444444"
+AGENT_ID = "f3cc2e6da7c849aba3f366f044725316"
 PRESS_TIME = "2026-10-01T10:00:00+00:00"
 
 
@@ -439,7 +440,7 @@ class ShippedYaml(unittest.TestCase):
         cfg = self.cfg
         self.assertEqual((cfg.owner, cfg.notify_target), ("mikkel", "mikkel"))
         self.assertEqual(cfg.appdaemon_user_id, APP_ID)
-        self.assertEqual(cfg.user_ids, {KRISTINE_ID: "kristine"})
+        self.assertEqual(cfg.user_ids, {KRISTINE_ID: "kristine", AGENT_ID: "agent"})
         self.assertEqual(
             (cfg.supply_temp_entity, cfg.return_temp_entity),
             ("sensor.heating_room_floor_heating_supply", "sensor.heating_room_floor_heating_return"),
@@ -3543,7 +3544,13 @@ class ThermostatChanges(unittest.TestCase):
         h = self.h
         users = h.app._identity_for(h.clock.now.timestamp()).users
         self.assertEqual(
-            users, {MIKKEL_ID: "mikkel", CLAUDIA_ID: "claudia", KRISTINE_ID: "kristine"}
+            users,
+            {
+                MIKKEL_ID: "mikkel",
+                CLAUDIA_ID: "claudia",
+                KRISTINE_ID: "kristine",
+                AGENT_ID: "agent",
+            },
         )
         h.ha.set("person.kristine", "home", {"user_id": STRANGER_ID})
         h.clock.advance(minutes=11)

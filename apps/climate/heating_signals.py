@@ -29,6 +29,7 @@ Meaning, by who and what:
     the target alone and would be restored.
   - A helper the owner owns, changed by anyone but the owner, AppDaemon or Home Assistant itself
     (a change with no context at all), would be reverted.
+  - The agent account acts for the owner: everything the owner may do, it may do, named agent.
 
 Repeated signals in the same direction within NUDGE_COLLAPSE_S are one step; a signal the other
 way is a new step. A nudge stays inside the zone's bounds and persists.
@@ -50,6 +51,8 @@ OWN_WRITE_S = 600.0
 DEVICE_REVERT_S = 180.0
 NUDGE_COLLAPSE_S = 300.0
 SETPOINT_MATCH_C = hp.SETPOINT_STEP_C + 0.01
+
+AGENT = "agent"
 
 KIND_SETPOINT = "setpoint"
 KIND_MODE = "mode"
@@ -351,7 +354,7 @@ def thermostat_effect(zc: hp.ZoneConfig, owner: str, change: Change, attr: Attri
     moves, stops at a bound or collapses into an earlier step is step_nudge's call."""
     if attr.source in (SRC_OWN, SRC_REVERT):
         return EFFECT_NONE
-    by_owner = attr.source == SRC_HA and attr.who == owner
+    by_owner = attr.source == SRC_HA and attr.who in (owner, AGENT)
     if change.kind == KIND_MODE:
         if change.new != "off":
             return EFFECT_NONE
@@ -370,7 +373,7 @@ def thermostat_effect(zc: hp.ZoneConfig, owner: str, change: Change, attr: Attri
 
 def button_allowed(zc: hp.ZoneConfig, owner: str, actor: Actor) -> bool:
     """A nudge button answers to the room's residents and to the owner."""
-    return actor.kind == "person" and (actor.name == owner or actor.name in zc.residents)
+    return actor.kind == "person" and (actor.name in (owner, AGENT) or actor.name in zc.residents)
 
 
 def helper_effect(
@@ -379,7 +382,7 @@ def helper_effect(
     """What a change of a helper the owner owns means. `zc` is the zone whose target helper it
     is, None for any other owned helper. A change that carries no context at all is Home
     Assistant itself (a restore, a reload), never a person, so it is never reverted."""
-    if actor.kind == "person" and actor.name == owner:
+    if actor.kind == "person" and actor.name in (owner, AGENT):
         if zc is None:
             return EFFECT_NONE
         return EFFECT_NUDGE_RESET if zc.residents and nudge != 0 else EFFECT_TARGET_SET

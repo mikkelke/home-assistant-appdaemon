@@ -54,7 +54,6 @@ ActorAttribution:
   # manual_override_timeout.yaml's user_name_fallback. Checked AFTER the automatic
   # person_entities resolution, so a real person.*.user_id link always wins once made;
   # this is only a gap-filler. Keys normalized to undashed lowercase hex, matching
-  # context.user_id's own format. Empty by default - populate only if
-  # sensor.household_actor's user_id_count attribute comes back short of the household
-  # size.
-  user_id_overrides: {}
+  # context.user_id's own format. The agent account acts for Mikkel, so what it does is his.
+  user_id_overrides:
+    "f3cc2e6da7c849aba3f366f044725316": mikkel  # Agent

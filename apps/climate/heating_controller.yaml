@@ -16,9 +16,11 @@ HeatingController:
   owner: mikkel
   # AppDaemon's own HA account: what it does is another app, never a person.
   appdaemon_user_id: "f4fda494358943beaf8ad2c70db099f8"
-  # Account id -> person, for a resident whose person entity carries no user_id.
+  # Account id -> person, for a resident whose person entity carries no user_id, and the
+  # agent account, which acts for the owner.
   user_ids:
     "5bee78148825439488b70f92565e6c26": kristine
+    "f3cc2e6da7c849aba3f366f044725316": agent
   season_entity: input_boolean.heating_season
   live_zones: [family, bathroom, kristines_room, claudias_room, guest_bathroom]
   live_switch_entity: input_boolean.heating_live

@@ -30,6 +30,7 @@ MusicAttribution:
   house_user_ids:
     - f4fda494358943beaf8ad2c70db099f8  # AppDaemon
     - c297749bf4144544aac66cd639818964  # NodeRed
+    - f3cc2e6da7c849aba3f366f044725316  # Agent
 
   # Resident -> media_player of their own Spotify integration config entry. Spotify Connect
   # starts read "Someone" while this is empty, and "A guest" needs every resident listed.
