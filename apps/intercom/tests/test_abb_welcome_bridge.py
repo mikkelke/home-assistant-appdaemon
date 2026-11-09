@@ -213,6 +213,16 @@ def _missed_attrs(event_id=MISSED_ID, timestamp=MISSED_TS):
             "station_id": "", "station": ""}
 
 
+def _entry_with_clips(ring_at, photo, clip_names):
+    """An index row as the bridge writes it for a ring with these clips, oldest first."""
+    entry = bridge_mod.build_index_entry(ring_at, "100000002", "front door", "ring", photo,
+                                         "/media/local/abb_doorbell")
+    entry["clips"] = [{"filename": n, "url": f"/media/local/abb_doorbell/{n}"} for n in clip_names]
+    entry["clip_filename"] = entry["clips"][-1]["filename"]
+    entry["clip_url"] = entry["clips"][-1]["url"]
+    return entry
+
+
 def _yaml_scalar_line(text, key):
     """Best-effort, PyYAML-free extraction of a top-level `key: <value>` line's
     value - this suite's uvx pytest sandbox has no PyYAML installed. Returns
@@ -272,6 +282,38 @@ class PureHelperTests(unittest.TestCase):
         self.assertNotEqual(bridge_mod.ring_key(early),
                             bridge_mod.ring_key(entry(RING_ESP + timedelta(seconds=1), "100000002",
                                                       "ring", "early.jpg")))
+
+    def test_attach_clip_lists_every_clip_once_oldest_first(self):
+        episode = {"clip_filename": None, "clip_filenames": []}
+        bridge_mod.attach_clip(episode, "first.mp4")
+        bridge_mod.attach_clip(episode, "second.mp4")
+        self.assertEqual(episode["clip_filenames"], ["first.mp4", "second.mp4"])
+        self.assertEqual(episode["clip_filename"], "second.mp4")
+        bridge_mod.attach_clip(episode, "second.mp4")  # named again, as the fallback redial does
+        self.assertEqual(episode["clip_filenames"], ["first.mp4", "second.mp4"])
+
+    def test_attach_clip_without_a_file_adds_no_name(self):
+        episode = {"clip_filename": None, "clip_filenames": []}
+        bridge_mod.attach_clip(episode, "")
+        self.assertEqual(episode["clip_filenames"], [])
+        self.assertEqual(episode["clip_filename"], "")
+
+    def test_entry_files_lists_photo_latest_clip_and_every_clip(self):
+        entry = {"filename": "p.jpg", "clip_filename": "c3.mp4",
+                 "clips": [{"filename": "c1.mp4", "url": "u1"}, {"filename": "c2.mp4", "url": "u2"},
+                           {"filename": "c3.mp4", "url": "u3"}]}
+        self.assertEqual(bridge_mod.entry_files(entry), {"p.jpg", "c1.mp4", "c2.mp4", "c3.mp4"})
+
+    def test_entry_files_of_an_entry_without_clips(self):
+        self.assertEqual(bridge_mod.entry_files({"filename": "p.jpg", "clip_filename": "c.mp4"}), {"p.jpg", "c.mp4"})
+        self.assertEqual(bridge_mod.entry_files({"filename": "p.jpg"}), {"p.jpg"})
+        self.assertEqual(bridge_mod.entry_files({"filename": "", "clip_filename": "c.mp4"}), {"c.mp4"})
+        self.assertEqual(bridge_mod.entry_files({}), set())
+
+    def test_entry_files_ignores_a_malformed_clips_list(self):
+        self.assertEqual(bridge_mod.entry_files({"filename": "p.jpg", "clips": "c.mp4"}), {"p.jpg"})
+        self.assertEqual(bridge_mod.entry_files({"clips": ["c.mp4", None, {"url": "u"}, {"filename": "ok.mp4"}]}),
+                         {"ok.mp4"})
 
     def test_ring_link_carries_the_archive_entry_ts(self):
         entry = bridge_mod.build_index_entry(RING_ESP, "100000001", "back door",
@@ -1196,6 +1238,7 @@ class RingClipTests(unittest.TestCase):
         self.assertTrue(calls[1][1]["filename"].startswith("/media/abb_doorbell/abb_clip_"))
         self.assertTrue(calls[1][1]["filename"].endswith("_front.mp4"))
         self.assertEqual(episode["clip_filename"], calls[1][1]["filename"].rsplit("/", 1)[1])
+        self.assertEqual(episode["clip_filenames"], [episode["clip_filename"]])
 
     def test_no_announce_door_records_without_deferral(self):
         # The back door has no announce voice, so _last_announce_at never holds it
@@ -1271,6 +1314,7 @@ class RingClipTests(unittest.TestCase):
         _run_scheduled(self.app, "_start_clip")       # the redial
         self.assertEqual(len(self._clip_calls()), 4)
         self.assertIsNotNone(episode["clip_filename"])
+        self.assertEqual(episode["clip_filenames"], [episode["clip_filename"]])  # the redial names the same file
         # confirmed recording: another confirm invocation must change nothing
         self.app.states[("camera.abb_front", None)] = "recording"
         self.app._confirm_clip_recording({"episode_id": episode["id"]})
@@ -1300,25 +1344,30 @@ class RingClipTests(unittest.TestCase):
         self.app.archive_dir.mkdir(parents=True, exist_ok=True)
         (self.app.archive_dir / "abb_clip_x_front.mp4").write_bytes(b"mp4data")
         self.app._archive_write(JPEG, RING_ESP.isoformat(), "100000002", "front door",
-                                "ring_auto_opened", "abb_clip_x_front.mp4")
+                                "ring_auto_opened", ["abb_clip_x_front.mp4"])
         entry = self.app._load_index()[0]
         self.assertEqual(entry["clip_filename"], "abb_clip_x_front.mp4")
         self.assertEqual(entry["clip_url"], "/media/local/abb_doorbell/abb_clip_x_front.mp4")
+        self.assertEqual(entry["clips"], [{"filename": "abb_clip_x_front.mp4",
+                                           "url": "/media/local/abb_doorbell/abb_clip_x_front.mp4"}])
         # Missing file: photo-only entry, no clip keys at all.
         self.app._archive_write(JPEG, (RING_ESP + timedelta(minutes=1)).isoformat(),
-                                "100000002", "front door", "ring", "abb_clip_gone.mp4")
+                                "100000002", "front door", "ring", ["abb_clip_gone.mp4"])
         entry = self.app._load_index()[0]
         self.assertNotIn("clip_url", entry)
         self.assertNotIn("clip_filename", entry)
+        self.assertNotIn("clips", entry)
 
     def test_empty_clip_turd_is_removed(self):
         self.app.archive_dir.mkdir(parents=True, exist_ok=True)
         turd = self.app.archive_dir / "abb_clip_dead_front.mp4"
         turd.write_bytes(b"")
         self.app._archive_write(JPEG, RING_ESP.isoformat(), "100000002", "front door",
-                                "ring", "abb_clip_dead_front.mp4")
+                                "ring", ["abb_clip_dead_front.mp4"])
         self.assertFalse(turd.exists())
-        self.assertNotIn("clip_url", self.app._load_index()[0])
+        entry = self.app._load_index()[0]
+        self.assertNotIn("clip_url", entry)
+        self.assertNotIn("clips", entry)
 
     def test_prune_removes_clip_with_its_photo(self):
         self.app.archive_dir.mkdir(parents=True, exist_ok=True)
@@ -1335,12 +1384,74 @@ class RingClipTests(unittest.TestCase):
         self.assertFalse((self.app.archive_dir / "old.jpg").exists())
         self.assertFalse((self.app.archive_dir / "old_clip.mp4").exists())
 
+    def test_prune_removes_every_clip_of_the_entry(self):
+        archive = self.app.archive_dir
+        archive.mkdir(parents=True, exist_ok=True)
+        names = ["old_clip_1.mp4", "old_clip_2.mp4", "old_clip_3.mp4"]
+        old_entry = _entry_with_clips(RING_ESP - timedelta(days=400), "old.jpg", names)
+        (archive / "old.jpg").write_bytes(JPEG)
+        for name in names:
+            (archive / name).write_bytes(b"mp4data")
+        (archive / "index.json").write_text(json.dumps({"version": 1, "updated": "x", "images": [old_entry]}))
+        self.app._archive_write(JPEG, RING_ESP.isoformat(), "100000002", "front door", "ring")
+        self.assertFalse((archive / "old.jpg").exists())
+        for name in names:
+            self.assertFalse((archive / name).exists(), name)
+
+    def test_prune_leaves_a_clip_a_kept_entry_still_lists(self):
+        archive = self.app.archive_dir
+        archive.mkdir(parents=True, exist_ok=True)
+        (archive / "shared.mp4").write_bytes(b"mp4data")
+        (archive / "dropped_only.mp4").write_bytes(b"mp4data")
+        old_entry = _entry_with_clips(RING_ESP - timedelta(days=400), "", ["dropped_only.mp4", "shared.mp4"])
+        (archive / "index.json").write_text(json.dumps({"version": 1, "updated": "x", "images": [old_entry]}))
+        self.app._archive_write(JPEG, RING_ESP.isoformat(), "100000002", "front door", "ring", ["shared.mp4"])
+        self.assertTrue((archive / "shared.mp4").exists())
+        self.assertFalse((archive / "dropped_only.mp4").exists())
+
+    def test_orphan_sweep_keeps_clips_a_kept_entry_lists_only_in_clips(self):
+        archive = self.app.archive_dir
+        archive.mkdir(parents=True, exist_ok=True)
+        day_plus = RING_ESP.timestamp() - 2 * 86400
+        names = ["abb_ringclip_a.mp4", "abb_ringclip_b.mp4", "abb_ringclip_c.mp4"]
+        orphan = archive / "abb_ringclip_orphan.mp4"
+        for path in [archive / n for n in names] + [orphan]:
+            path.write_bytes(b"mp4data")
+            os.utime(path, (day_plus, day_plus))
+        kept = _entry_with_clips(RING_ESP - timedelta(minutes=5), "", names)
+        (archive / "index.json").write_text(json.dumps({"version": 1, "updated": "x", "images": [kept]}))
+        # another ring's write runs the sweep
+        self.app._archive_write(JPEG, RING_ESP.isoformat(), "100000002", "front door", "ring")
+        for name in names:
+            self.assertTrue((archive / name).exists(), name)
+        self.assertFalse(orphan.exists())
+
+    def test_archive_write_lists_the_clips_that_landed_in_order(self):
+        archive = self.app.archive_dir
+        archive.mkdir(parents=True, exist_ok=True)
+        (archive / "abb_clip_a.mp4").write_bytes(b"a")
+        (archive / "abb_clip_empty.mp4").write_bytes(b"")
+        (archive / "abb_clip_c.mp4").write_bytes(b"c")
+        self.app._archive_write(JPEG, RING_ESP.isoformat(), "100000002", "front door", "ring_auto_opened",
+                                ["abb_clip_a.mp4", "abb_clip_empty.mp4", "abb_clip_gone.mp4", "abb_clip_c.mp4"])
+        (entry,) = self.app._load_index()
+        self.assertEqual([c["filename"] for c in entry["clips"]], ["abb_clip_a.mp4", "abb_clip_c.mp4"])
+        self.assertEqual(entry["clip_filename"], "abb_clip_c.mp4")
+        self.assertEqual(entry["clip_url"], "/media/local/abb_doorbell/abb_clip_c.mp4")
+        self.assertFalse((archive / "abb_clip_empty.mp4").exists())  # the 0-byte turd goes, as before
+        self.assertTrue((archive / "abb_clip_a.mp4").exists())
+
+    def test_archive_write_without_clips_keeps_the_entry_shape(self):
+        self.app._archive_write(JPEG, RING_ESP.isoformat(), "100000002", "front door", "ring")
+        (entry,) = self.app._load_index()
+        self.assertEqual(set(entry), {"ts", "datetime", "station", "door", "event_type", "filename", "url"})
+
     def test_clip_survives_a_ring_with_no_snapshot(self):
         # The 2026-08-13 13:06 front ring: recording landed, gateway screenshot
         # never arrived. The old close path archived NOTHING - clip orphaned on
         # disk, ring invisible in the gallery. Now: a clip-only index entry.
         episode = self.app._open_episode("front door", "100000002", self.clock.now())
-        episode["clip_filename"] = "abb_clip_t_front.mp4"
+        bridge_mod.attach_clip(episode, "abb_clip_t_front.mp4")
         self.app.archive_dir.mkdir(parents=True, exist_ok=True)
         (self.app.archive_dir / "abb_clip_t_front.mp4").write_bytes(b"mp4data")
         self.clock.at += timedelta(seconds=76)
@@ -1349,12 +1460,14 @@ class RingClipTests(unittest.TestCase):
         self.assertEqual(entry["filename"], "")
         self.assertEqual(entry["url"], "")
         self.assertEqual(entry["clip_url"], "/media/local/abb_doorbell/abb_clip_t_front.mp4")
+        self.assertEqual(entry["clips"], [{"filename": "abb_clip_t_front.mp4",
+                                           "url": "/media/local/abb_doorbell/abb_clip_t_front.mp4"}])
         self.assertEqual(entry["door"], "front door")
         self.assertEqual(list(self.app.archive_dir.glob("*.jpg")), [])
 
     def test_no_snapshot_and_no_clip_file_archives_nothing(self):
         episode = self.app._open_episode("front door", "100000002", self.clock.now())
-        episode["clip_filename"] = "abb_clip_gone_front.mp4"  # record failed: file never appeared
+        bridge_mod.attach_clip(episode, "abb_clip_gone_front.mp4")  # record failed: file never appeared
         self.clock.at += timedelta(seconds=76)
         _run_scheduled(self.app, "_close_episode")
         self.assertFalse((self.app.archive_dir / "index.json").exists())
@@ -1367,9 +1480,9 @@ class RingClipTests(unittest.TestCase):
         (self.app.archive_dir / "abb_clip_a_front.mp4").write_bytes(b"a")
         (self.app.archive_dir / "abb_clip_b_front.mp4").write_bytes(b"b")
         self.app._archive_write(None, RING_ESP.isoformat(), "100000002", "front door",
-                                "ring_auto_opened", "abb_clip_a_front.mp4")
+                                "ring_auto_opened", ["abb_clip_a_front.mp4"])
         self.app._archive_write(None, (RING_ESP + timedelta(minutes=1)).isoformat(),
-                                "100000002", "front door", "ring_auto_opened", "abb_clip_b_front.mp4")
+                                "100000002", "front door", "ring_auto_opened", ["abb_clip_b_front.mp4"])
         clips = [e.get("clip_filename") for e in self.app._load_index()]
         self.assertEqual(clips, ["abb_clip_b_front.mp4", "abb_clip_a_front.mp4"])
 
@@ -1388,7 +1501,7 @@ class RingClipTests(unittest.TestCase):
         referenced_clip.write_bytes(b"mp4data")
         os.utime(referenced_clip, (day_plus, day_plus))
         self.app._archive_write(JPEG, RING_ESP.isoformat(), "100000002", "front door",
-                                "ring_auto_opened", "abb_clip_kept_front.mp4")
+                                "ring_auto_opened", ["abb_clip_kept_front.mp4"])
         self.assertFalse(old_orphan.exists())          # old + never indexed: swept
         self.assertTrue(fresh_orphan.exists())         # young: grace for in-flight recordings
         self.assertTrue(foreign.exists())              # not abb_*: never ours to delete
@@ -1875,6 +1988,26 @@ class NativeRingClipTests(unittest.TestCase):
         self.assertTrue(any("CLIP-NATIVE" in m for _, m in self.app.logs))
         self.assertEqual(self._clip_dial_calls(), [])  # never dials itself
 
+    def test_repeat_ring_clips_are_all_attached_with_the_latest_apart(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        first = self._native_clip_event()
+        second = self._native_clip_event(filename="abb_ringclip_20260824_090031_100000002.mp4")
+        self.assertEqual(episode["clip_filenames"], [first["filename"], second["filename"]])
+        self.assertEqual(episode["clip_filename"], second["filename"])
+
+    def test_the_same_clip_event_twice_attaches_it_once(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        payload = self._native_clip_event()
+        self._native_clip_event()
+        self.assertEqual(episode["clip_filenames"], [payload["filename"]])
+
+    def test_dropped_events_attach_no_clip_name(self):
+        episode = self.app._open_episode("front door", "100000002", self.clock.now())
+        self._native_clip_event(ok=False)
+        self._native_clip_event(reason="service")
+        self._native_clip_event(station_id="999999999")
+        self.assertEqual(episode["clip_filenames"], [])
+
     def test_service_reason_is_ignored(self):
         episode = self.app._open_episode("front door", "100000002", self.clock.now())
         self._native_clip_event(reason="service")
@@ -1915,6 +2048,8 @@ class NativeRingClipTests(unittest.TestCase):
         entry = self.app._load_index()[0]
         self.assertEqual(entry["clip_filename"], payload["filename"])
         self.assertEqual(entry["clip_url"], f"/media/local/abb_doorbell/{payload['filename']}")
+        self.assertEqual(entry["clips"], [{"filename": payload["filename"],
+                                           "url": f"/media/local/abb_doorbell/{payload['filename']}"}])
 
     # --- native voice retry ---
 
@@ -2350,6 +2485,7 @@ class EarlyArchiveTests(unittest.TestCase):
     POSTER = "abb_ringclip_20261015_104740_100000002.jpg"
     CLIP = "abb_ringclip_20261015_104740_100000002.mp4"
     CLIP_2 = "abb_ringclip_20261015_104758_100000002.mp4"
+    CLIP_3 = "abb_ringclip_20261015_104815_100000002.mp4"
 
     def setUp(self):
         self.ring = datetime(2026, 10, 15, 8, 47, 40, tzinfo=timezone.utc)
@@ -2484,15 +2620,117 @@ class EarlyArchiveTests(unittest.TestCase):
         self.assertEqual((self.dir / entry["filename"]).read_bytes(), JPEG)
         self.assertEqual(entry["clip_filename"], self.CLIP)
 
-    def test_a_later_clip_replaces_the_early_entry_and_its_clip_goes(self):
+    def _repeat_ring_clip(self, name):
+        (self.dir / name).write_bytes(b"mp4data")
+        return self._clip_event(filename=name, poster_filename="")
+
+    def _clip_names(self, entry):
+        return [c["filename"] for c in entry["clips"]]
+
+    def test_a_later_clip_joins_the_early_entry_and_both_stay(self):
         self._write_media()
         self._clip_event()
-        (self.dir / self.CLIP_2).write_bytes(b"second")
-        self._clip_event(filename=self.CLIP_2, poster_filename="")
+        self._repeat_ring_clip(self.CLIP_2)
         (entry,) = self.app._load_index()
+        self.assertEqual(self._clip_names(entry), [self.CLIP, self.CLIP_2])
         self.assertEqual(entry["clip_filename"], self.CLIP_2)
-        self.assertFalse((self.dir / self.CLIP).exists())
+        self.assertEqual(entry["clip_url"], f"/media/local/abb_doorbell/{self.CLIP_2}")
+        self.assertTrue((self.dir / self.CLIP).exists())
+        self.assertTrue((self.dir / self.CLIP_2).exists())
         self.assertEqual(self._jpgs(), [entry["filename"]])
+
+    def test_every_clip_of_a_three_ring_visit_stays_on_disk_and_in_the_entry(self):
+        self._unlock()
+        self._write_media()
+        clips = [self.CLIP, self.CLIP_2, self.CLIP_3]
+        self._clip_event()
+        self._repeat_ring_clip(self.CLIP_2)
+        self._repeat_ring_clip(self.CLIP_3)
+        for name in clips:
+            self.assertTrue((self.dir / name).exists(), f"{name} deleted before the close")
+        early = self.app._load_index()[0]
+        self.assertEqual(self._clip_names(early), clips)
+
+        self._close()
+        (entry,) = self.app._load_index()
+        self.assertEqual(entry["event_type"], "ring_auto_opened")
+        self.assertEqual(self._clip_names(entry), clips)
+        self.assertEqual([c["url"] for c in entry["clips"]], [f"/media/local/abb_doorbell/{n}" for n in clips])
+        self.assertEqual(entry["clip_filename"], self.CLIP_3)
+        self.assertEqual(entry["clip_url"], f"/media/local/abb_doorbell/{self.CLIP_3}")
+        for name in clips:
+            self.assertTrue((self.dir / name).exists(), f"{name} deleted by the close")
+        self.assertEqual(sorted(p.name for p in self.dir.glob("*.mp4")), sorted(clips))
+
+    def test_a_clip_only_visit_lists_every_clip_too(self):
+        self._write_media(poster=False, clip=False)
+        clips = [self.CLIP, self.CLIP_2, self.CLIP_3]
+        for name in clips:
+            self._repeat_ring_clip(name)
+        self._close()
+        (entry,) = self.app._load_index()
+        self.assertEqual(entry["filename"], "")
+        self.assertEqual(self._clip_names(entry), clips)
+        self.assertEqual(entry["clip_filename"], self.CLIP_3)
+
+    def test_pruning_a_three_ring_visit_removes_all_its_clips(self):
+        clips = [self.CLIP, self.CLIP_2, self.CLIP_3]
+        self._write_media()
+        self._clip_event()
+        self._repeat_ring_clip(self.CLIP_2)
+        self._repeat_ring_clip(self.CLIP_3)
+        self._close()
+        photo = self.app._load_index()[0]["filename"]
+        for name in clips:
+            self.assertTrue((self.dir / name).exists(), f"{name} deleted before the prune")
+        self.app.max_files = 1  # the next ring pushes this visit out of the archive
+        self.app._archive_write(JPEG, (self.ring + timedelta(hours=1)).isoformat(),
+                                "100000002", "front door", "ring")
+        (entry,) = self.app._load_index()
+        self.assertEqual(entry["ts"], int((self.ring + timedelta(hours=1)).timestamp()))
+        for name in clips:
+            self.assertFalse((self.dir / name).exists(), f"{name} left behind")
+        self.assertFalse((self.dir / photo).exists())
+
+    def test_a_visit_clip_that_never_landed_is_left_out_and_the_others_stay(self):
+        self._write_media()
+        self._clip_event()
+        (self.dir / self.CLIP_2).write_bytes(b"")  # the second ring's recording came out empty
+        self._clip_event(filename=self.CLIP_2, poster_filename="")
+        self._repeat_ring_clip(self.CLIP_3)
+        self._close()
+        (entry,) = self.app._load_index()
+        self.assertEqual(self._clip_names(entry), [self.CLIP, self.CLIP_3])
+        self.assertEqual(entry["clip_filename"], self.CLIP_3)
+        self.assertFalse((self.dir / self.CLIP_2).exists())
+        self.assertTrue((self.dir / self.CLIP).exists())
+        self.assertTrue((self.dir / self.CLIP_3).exists())
+
+    def test_a_visit_whose_last_clip_never_landed_keeps_the_earlier_ones(self):
+        self._write_media()
+        self._clip_event()
+        self._repeat_ring_clip(self.CLIP_2)
+        self._clip_event(filename=self.CLIP_3, poster_filename="")  # the file never appears
+        self._close()
+        (entry,) = self.app._load_index()
+        self.assertEqual(self._clip_names(entry), [self.CLIP, self.CLIP_2])
+        self.assertEqual(entry["clip_filename"], self.CLIP_2)
+        self.assertEqual(entry["clip_url"], f"/media/local/abb_doorbell/{self.CLIP_2}")
+        self.assertTrue((self.dir / self.CLIP).exists())
+        self.assertTrue((self.dir / self.CLIP_2).exists())
+
+    def test_a_clip_listed_by_the_early_entry_survives_the_orphan_sweep(self):
+        day_plus = self.ring.timestamp() - 2 * 86400
+        self._write_media()
+        self._clip_event()
+        self._repeat_ring_clip(self.CLIP_2)
+        for name in (self.CLIP, self.CLIP_2):
+            os.utime(self.dir / name, (day_plus, day_plus))
+        # another ring's write sweeps the archive
+        self.app._archive_write(JPEG, (self.ring + timedelta(hours=1)).isoformat(),
+                                "100000002", "front door", "ring")
+        self.assertTrue((self.dir / self.CLIP).exists())
+        self.assertTrue((self.dir / self.CLIP_2).exists())
 
     def test_clip_missing_from_disk_writes_nothing_and_the_close_still_archives(self):
         self._write_media(clip=False)
@@ -2535,7 +2773,7 @@ class EarlyArchiveTests(unittest.TestCase):
 
     def test_a_job_reaching_the_executor_after_the_close_writes_nothing(self):
         self._write_media()
-        self.episode["clip_filename"] = self.CLIP
+        bridge_mod.attach_clip(self.episode, self.CLIP)
         self.episode["closed"] = True
         self.app._archive_clip_landed(self.episode["id"], self.POSTER, self.ring)
         self.app._archive_clip_landed("ep-unknown", self.POSTER, self.ring)

@@ -68,7 +68,10 @@ Features:
    disk ~10 s after the ring, long before that, so the entry is first written
    as a plain "ring" the moment the clip lands (_archive_clip_landed) and the
    close write replaces it - the dashboard shows the video within seconds of
-   the push instead of after the close. A snapshot probe runs a few seconds
+   the push instead of after the close. A visitor who rings again before the
+   episode closes brings another clip: the entry lists every clip of the
+   ring, oldest first, in `clips` (clip_filename/clip_url stay the latest, for
+   readers that know a single clip). A snapshot probe runs a few seconds
    after the ring (knob), but the real capture normally comes from the image
    entity's own update 7-32 s later; stale frames (previous visitor) are never
    archived - a missing photo is honest, the wrong person is misleading.
@@ -188,6 +191,26 @@ def ring_key(entry):
     which differs between the early entry and the final one - and a clip-only
     entry has none at all."""
     return entry.get("ts"), entry.get("station")
+
+
+def entry_files(entry):
+    """Every archive file an index entry owns: its photo, its latest clip and
+    each clip listed in `clips`. Entries written before `clips` existed own
+    just the first two."""
+    names = {entry.get("filename"), entry.get("clip_filename")}
+    clips = entry.get("clips")
+    if isinstance(clips, list):
+        names.update(c.get("filename") for c in clips if isinstance(c, dict))
+    return {str(name) for name in names if name}
+
+
+def attach_clip(episode, filename):
+    """Record a clip the ring episode got. clip_filename is always the latest;
+    clip_filenames keeps every one, oldest first and once each, since a repeat
+    ring of the same visit brings its own clip."""
+    episode["clip_filename"] = filename
+    if filename and filename not in episode["clip_filenames"]:
+        episode["clip_filenames"].append(filename)
 
 
 def ring_link(ring_at):
@@ -784,7 +807,8 @@ class AbbWelcomeBridge(hass.Hass):
             "push_sent": False,
             "scored": False,
             "snapshot": None,  # {"bytes","captured_at","event_id"} (+ "url" when it is the clip poster - _capture_poster_for_episode)
-            "clip_filename": None,  # set by _start_clip (or _on_native_ring_clip) once a clip exists
+            "clip_filename": None,  # the latest clip, set by _start_clip (or _on_native_ring_clip) once one exists
+            "clip_filenames": [],  # every clip of the episode, oldest first (attach_clip)
             "clip_started_at": None,  # when the record dial went out (voices yield until it ends)
             "voice_spoken": False,  # one "the door is open" sentence per episode (native + legacy dedup)
             "voice_dispatched": False,  # a native voice retry chain already started (2nd unlock confirm must not start another)
@@ -1404,7 +1428,7 @@ class AbbWelcomeBridge(hass.Hass):
                 # Restrict the armed window to this station so a HomeKit/Scrypted
                 # probe cannot ride it into a call at the other door (schema warning).
                 arm["station_id"] = station
-            episode["clip_filename"] = filename
+            attach_clip(episode, filename)
             episode["clip_started_at"] = self.get_now()
             self._self_call_until[door] = self.get_now() + timedelta(seconds=self.clip_seconds + 20)
             self.log(f"CLIP-START door={door} file={filename} ({self.clip_seconds}s) {self._ring_rel(episode)}"
@@ -1493,13 +1517,14 @@ class AbbWelcomeBridge(hass.Hass):
         """native_ring_clips=true: the integration's own ring-clip recorder fires
         this once per ring, after its mp4 is finalized - anywhere from ~10 to
         ~40 s after the ring, always before the episode closes (episode_close_s
-        defaults to 75 s). Attaches straight onto the matching open episode; the
-        existing episode-close/ARCHIVE code (_close_episode/_archive_write) needs
-        nothing more than clip_filename set - it already just stats
-        self.archive_dir/clip_filename, and that is the SAME directory the
-        integration writes to (its ring_clip_dir option; /media is one host
-        directory mounted at the same path in both containers, exactly as for
-        the fallback dial's own file). The clip's poster, its first frame as a JPEG
+        defaults to 75 s). Attaches straight onto the matching open episode - a
+        repeat ring of the same visit adds its clip beside the earlier ones
+        (attach_clip); the existing episode-close/ARCHIVE code
+        (_close_episode/_archive_write) needs nothing more than the clips attached
+        - it already just stats self.archive_dir/<clip name>, and that is the SAME
+        directory the integration writes to (its ring_clip_dir option; /media is
+        one host directory mounted at the same path in both containers, exactly as
+        for the fallback dial's own file). The clip's poster, its first frame as a JPEG
         in that same directory, stands in as the ring photo when no gateway
         frame has arrived (_capture_poster_for_episode). The mp4 and poster are
         complete when this event fires, so one executor job reads the poster and
@@ -1523,7 +1548,7 @@ class AbbWelcomeBridge(hass.Hass):
                 return
             filename = data.get("filename") or ""
             started_at = parse_iso_ts(data.get("started_at")) or episode["started_at"]
-            episode["clip_filename"] = filename
+            attach_clip(episode, filename)
             episode["clip_started_at"] = started_at
             self.log(
                 f"CLIP-NATIVE door={door} file={filename} duration={data.get('duration_s')}s "
@@ -2193,7 +2218,8 @@ class AbbWelcomeBridge(hass.Hass):
         no gateway frame has arrived. The clip must already be non-empty on disk:
         if not, nothing is written and nothing deleted, and the close write stays
         the only one. The close write replaces this entry (_update_index keys on
-        the ring), and so does the early write for a re-ring's later clip."""
+        the ring), and so does the early write for a re-ring's later clip - each
+        write lists every clip the episode has so far."""
         try:
             episode = self.episodes.get(episode_id)
             if episode is None or episode["closed"]:
@@ -2213,7 +2239,8 @@ class AbbWelcomeBridge(hass.Hass):
             self.log(f"ARCHIVE-EARLY id={episode_id} door={episode['door'] or '?'} clip={clip} "
                      f"photo={'yes' if snap else 'no'} {self._ring_rel(episode)}", level="INFO")
             self._archive_write(snap["bytes"] if snap else None, episode["started_at"].isoformat(),
-                                episode["station_id"], episode["door"], "ring", clip)
+                                episode["station_id"], episode["door"], "ring",
+                                list(episode["clip_filenames"]))
         except Exception as e:
             self.log(f"Early archive failed for {episode_id}: {e}", level="WARNING")
 
@@ -2282,7 +2309,7 @@ class AbbWelcomeBridge(hass.Hass):
                     episode["station_id"],
                     episode["door"],
                     event_type,
-                    episode.get("clip_filename"),
+                    list(episode["clip_filenames"]),
                 )
             elif episode.get("clip_filename"):
                 # No snapshot, but a recording was requested: the clip must not die
@@ -2296,7 +2323,7 @@ class AbbWelcomeBridge(hass.Hass):
                     episode["station_id"],
                     episode["door"],
                     event_type,
-                    episode["clip_filename"],
+                    list(episode["clip_filenames"]),
                 )
             else:
                 self.log(f"EPISODE-CLOSE id={episode['id']}: no fresh snapshot arrived - nothing archived", level="WARNING")
@@ -2325,11 +2352,15 @@ class AbbWelcomeBridge(hass.Hass):
             self.log(f"Standalone missed fetch failed: {e}", level="WARNING")
 
     # --- disk layer (executor thread; blocking IO stays off the callback threads) ---
-    def _archive_write(self, raw, ring_iso, station_id, door, event_type, clip_filename=None):
+    def _archive_write(self, raw, ring_iso, station_id, door, event_type, clip_filenames=()):
         """raw=None means clip-only: no photo arrived for the episode, so no jpg is
         written and the entry carries filename=""/url="" (the gallery renders a
-        video placeholder tile). If the clip then turns out missing/empty too,
-        there is nothing to show and no entry is written at all."""
+        video placeholder tile). If the clips then turn out missing/empty too,
+        there is nothing to show and no entry is written at all.
+
+        clip_filenames are all the clips of the ring, oldest first. The entry
+        lists those that landed in `clips`; clip_filename/clip_url name the last
+        of them, for readers that know only one clip."""
         try:
             ring_at = parse_iso_ts(ring_iso) or datetime.now(timezone.utc)
             self.archive_dir.mkdir(parents=True, exist_ok=True)
@@ -2343,31 +2374,36 @@ class AbbWelcomeBridge(hass.Hass):
                 os.replace(tmp, path)
             entry = build_index_entry(ring_at, station_id, door, event_type,
                                       filename, self.archive_url_prefix)
-            if clip_filename:
-                # Both writers come after the mp4 is finalized - the native recorder
+            clips = []
+            for clip_filename in clip_filenames:
+                # Both writers come after each mp4 is finalized - the native recorder
                 # fires its event only once the file is complete, and episode close
                 # (75 s) is long after the fallback record ended - so a single
                 # stat decides. A missing or empty file means the record failed
                 # (e.g. the station delivered no video, seen live 2026-08-13) - the
-                # entry stays photo-only and any 0-byte turd is removed.
+                # entry leaves it out and any 0-byte turd is removed.
                 clip_path = self.archive_dir / clip_filename
                 try:
                     clip_ok = clip_path.stat().st_size > 0
                 except OSError:
                     clip_ok = False
                 if clip_ok:
-                    entry["clip_filename"] = clip_filename
-                    entry["clip_url"] = f"{self.archive_url_prefix.rstrip('/')}/{clip_filename}"
+                    clips.append({"filename": clip_filename,
+                                  "url": f"{self.archive_url_prefix.rstrip('/')}/{clip_filename}"})
                 else:
                     clip_path.unlink(missing_ok=True)
-                    self.log(f"Clip {clip_filename} never landed - photo-only entry", level="INFO")
-            if not filename and not entry.get("clip_url"):
+                    self.log(f"Clip {clip_filename} never landed - left out of the entry", level="INFO")
+            if clips:
+                entry["clip_filename"] = clips[-1]["filename"]
+                entry["clip_url"] = clips[-1]["url"]
+                entry["clips"] = clips
+            if not filename and not clips:
                 self.log("Neither photo nor clip survived for this ring - nothing archived", level="WARNING")
                 return
             self._update_index(entry)
-            what = f"{filename} ({len(raw)} bytes)" if filename else f"clip-only {clip_filename}"
-            self.log(f"ARCHIVE saved {what}"
-                     + (f" + clip {clip_filename}" if filename and entry.get("clip_url") else ""), level="INFO")
+            clip_names = ", ".join(c["filename"] for c in clips)
+            what = f"{filename} ({len(raw)} bytes)" if filename else f"clip-only {clip_names}"
+            self.log(f"ARCHIVE saved {what}" + (f" + clip {clip_names}" if filename and clips else ""), level="INFO")
         except Exception as e:
             self.log(f"Archive write failed: {e}", level="WARNING")
 
@@ -2394,8 +2430,9 @@ class AbbWelcomeBridge(hass.Hass):
         the clip landed (_archive_clip_landed). Files only the replaced entry
         used (its photo, when the new classification gives it another name) go
         after the new index is in place, never before: a crash in between must
-        not leave the index naming a file that is gone. The clip both share
-        stays."""
+        not leave the index naming a file that is gone. The clips both list
+        stay, and so does any file a kept entry still lists, whichever entry
+        it came from."""
         loaded = self._load_index()
         replaced = [i for i in loaded if ring_key(i) == ring_key(entry)]
         images = [i for i in loaded if ring_key(i) != ring_key(entry)]
@@ -2403,14 +2440,13 @@ class AbbWelcomeBridge(hass.Hass):
         images.sort(key=lambda i: i.get("ts", 0), reverse=True)
         now_ts = datetime.now(timezone.utc).timestamp()
         keep, drop = prune_images(images, now_ts, self.retain_days, self.max_files)
+        still_used = set().union(*(entry_files(i) for i in keep))
         for stale in drop:
-            try:
-                if stale.get("filename"):
-                    (self.archive_dir / str(stale["filename"])).unlink(missing_ok=True)
-                if stale.get("clip_filename"):
-                    (self.archive_dir / str(stale["clip_filename"])).unlink(missing_ok=True)
-            except Exception as e:
-                self.log(f"Prune failed for {stale.get('filename')}: {e}", level="DEBUG")
+            for name in entry_files(stale) - still_used:
+                try:
+                    (self.archive_dir / name).unlink(missing_ok=True)
+                except Exception as e:
+                    self.log(f"Prune failed for {name}: {e}", level="DEBUG")
         self._sweep_orphans(keep, now_ts)
         index_file = self.archive_dir / "index.json"
         tmp = index_file.with_name(index_file.name + ".tmp")
@@ -2421,13 +2457,10 @@ class AbbWelcomeBridge(hass.Hass):
         }
         tmp.write_text(json.dumps(payload))
         os.replace(tmp, index_file)
-        still_used = {i.get("filename") for i in keep} | {i.get("clip_filename") for i in keep}
         for old in replaced:
-            for name in (old.get("filename"), old.get("clip_filename")):
-                if not name or name in still_used:
-                    continue
+            for name in entry_files(old) - still_used:
                 try:
-                    (self.archive_dir / str(name)).unlink(missing_ok=True)
+                    (self.archive_dir / name).unlink(missing_ok=True)
                 except Exception as e:
                     self.log(f"Replaced entry's file {name} not removed: {e}", level="DEBUG")
         self._check_archive_size()
@@ -2441,7 +2474,7 @@ class AbbWelcomeBridge(hass.Hass):
         is not ours to delete - and the 24 h grace covers any in-flight recording.
         Executor thread only (called from _update_index)."""
         try:
-            referenced = {i.get("filename") for i in keep} | {i.get("clip_filename") for i in keep}
+            referenced = set().union(*(entry_files(i) for i in keep))
             for f in self.archive_dir.glob("abb_*"):
                 if f.suffix not in (".jpg", ".mp4") or f.name in referenced:
                     continue
