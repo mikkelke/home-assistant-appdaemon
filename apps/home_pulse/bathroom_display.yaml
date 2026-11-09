@@ -10,7 +10,7 @@ BathroomDisplay:
   # was. The zone is also the HA area id whose house_upcoming rows are listed after everything due
   # within 7 days.
   zone: bathroom
-  # The name in the greeting and the person attribute, and the audience of house_upcoming rows.
+  # The name in the greeting and person attribute, the audience of rows and the starter of laundry runs.
   resident: Mikkel
   # The display hears Mikkel's phone as an iBeacon; the sensor turns unknown once it is out of range.
   # A reading that is at most rssi_fresh_s seconds old identifies him when it is at or above
@@ -40,6 +40,9 @@ BathroomDisplay:
     - {entity: sensor.transit_enghave_metro_kbh, label: Metro}
     - {entity: sensor.transit_carlsberg_stog_kbh, label: S-tog}
   transit_max_age_min: 45
+  # Running or paused laundry started by the resident, after transit and before the rows.
+  washer_entity: sensor.washer_state
+  dryer_entity: sensor.dryer_state
   # The display fires play_event when its round play button is tapped. The speaker then pauses if it is
   # playing, plays on if it is paused and otherwise starts radio as music, after leaving its group first
   # when it is grouped with another speaker.

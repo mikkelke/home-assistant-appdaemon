@@ -61,6 +61,8 @@ WEATHER = CONFIG["weather_entity"]
 ALARM = CONFIG["alarm_entity"]
 ALARM_TIME = CONFIG["alarm_time_entity"]
 ALARM_FROM_ENTITY = CONFIG["alarm_from_entity"]
+WASHER = CONFIG["washer_entity"]
+DRYER = CONFIG["dryer_entity"]
 
 
 def iso(moment):
@@ -1677,12 +1679,13 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(app.published, [{"entity": "sensor.bathroom_display", "state": "off",
                                           "attributes": attrs_of(reason=f"inactive:{ACTIVE}"), "replace": True}])
 
-    def test_it_listens_to_the_room_the_phone_the_rows_mikkels_routes_the_scale_the_rain_and_the_alarm(self):
+    def test_it_listens_to_the_room_the_phone_the_rows_routes_scale_rain_alarm_and_appliances(self):
         app = make_app()
         self.assertEqual(sorted((entity, kw.get("attribute")) for _, entity, kw in app.listened),
                          sorted([(ACTIVE, None), (RSSI, "all"), (UPCOMING, "all"), (SLEEP, "all"), (LIGHT, "all"),
                                  (METRO, "all"), (STOG, "all"), (MEASURED, "all"), (WEIGHT, "all"), (FAT, "all"),
-                                 (PIEZO, "all"), (ALARM, "all"), (ALARM_TIME, "all"), (ALARM_FROM_ENTITY, "all")]))
+                                 (PIEZO, "all"), (ALARM, "all"), (ALARM_TIME, "all"), (ALARM_FROM_ENTITY, "all"),
+                                 (WASHER, "all"), (DRYER, "all")]))
         self.assertEqual(app.events, [("_on_plugin_started", "plugin_started"),
                                       ("_on_play", "esphome.bathroom_display_play"),
                                       ("_on_alarm", "esphome.bathroom_display_alarm")])
@@ -2013,6 +2016,151 @@ def warnings(app):
     return [msg for level, msg in app.logs if level == "WARNING"]
 
 
+class ApplianceFlowTests(unittest.TestCase):
+    WASH = {"started_by": "mikkel", "estimated_end_time": "09:12"}
+    DRY = {"started_by": "mikkel", "estimated_end_time": "2026-11-05T08:35:00Z"}
+    WASH_LINE = ("Washer 42 min left", "mdi:washing-machine", "09:12")
+    DRY_LINE = ("Dryer 1 h 05 left", "mdi:tumble-dryer", "09:35")
+
+    def app(self, states=None, now=NOW, **kw):
+        return make_app({RSSI: full("-60", updated=now), **(states or {})}, now=now, **kw)
+
+    def test_his_running_washer_has_the_minutes_left_and_the_finish_chip(self):
+        app = self.app({WASHER: full("Running", self.WASH)})
+        self.assertEqual(shown(app), [self.WASH_LINE, BLANK, BLANK])
+
+    def test_the_dryers_timestamp_is_shown_in_house_time(self):
+        app = self.app({DRYER: full("Running", self.DRY)})
+        self.assertEqual(shown(app), [self.DRY_LINE, BLANK, BLANK])
+
+    def test_a_housemates_run_has_no_line(self):
+        for entity, attrs in ((WASHER, self.WASH), (DRYER, self.DRY)):
+            for starter in ("kristine", "claudia"):
+                with self.subTest(entity=entity, starter=starter):
+                    app = self.app({entity: full("Running", {**attrs, "started_by": starter})})
+                    self.assertEqual(shown(app), [BLANK] * 3)
+
+    def test_an_unknown_starter_has_no_line(self):
+        for entity, attrs in ((WASHER, self.WASH), (DRYER, self.DRY)):
+            for starter in ("", None, "unknown", " "):
+                with self.subTest(entity=entity, starter=starter):
+                    attrs = {**attrs, "started_by": starter}
+                    if starter is None:
+                        attrs.pop("started_by")
+                    self.assertEqual(shown(self.app({entity: full("Running", attrs)})), [BLANK] * 3)
+
+    def test_the_starter_and_resident_are_compared_without_regard_to_case(self):
+        app = self.app({WASHER: full("Running", {**self.WASH, "started_by": "MiKkEl"})}, resident="MIKKEL")
+        self.assertEqual(shown(app)[0], self.WASH_LINE)
+        app = self.app({DRYER: full("Running", {**self.DRY, "started_by": "kristine"})}, resident="Kristine")
+        self.assertEqual(shown(app)[0], self.DRY_LINE)
+
+    def test_a_paused_appliance_says_so_and_keeps_its_finish_chip(self):
+        for entity, label, icon, attrs, chip in ((WASHER, "Washer", bd.WASHER_ICON, self.WASH, "09:12"),
+                                               (DRYER, "Dryer", bd.DRYER_ICON, self.DRY, "09:35")):
+            for end in (attrs["estimated_end_time"], ""):
+                with self.subTest(entity=entity, end=end):
+                    app = self.app({entity: full("Paused", {**attrs, "estimated_end_time": end})})
+                    self.assertEqual(shown(app), [(f"{label} paused", icon, chip if end else ""), BLANK, BLANK])
+
+    def test_without_a_readable_eta_it_says_running_and_has_no_chip(self):
+        for entity, label, icon in ((WASHER, "Washer", bd.WASHER_ICON), (DRYER, "Dryer", bd.DRYER_ICON)):
+            for end in (None, "", "unknown", "unavailable", "soon", "25:00"):
+                with self.subTest(entity=entity, end=end):
+                    attrs = {"started_by": "mikkel", "estimated_remaining_min": 42}
+                    if end is not None:
+                        attrs["estimated_end_time"] = end
+                    app = self.app({entity: full("Running", attrs)})
+                    self.assertEqual(shown(app), [(f"{label} running", icon, ""), BLANK, BLANK])
+
+    def test_other_states_have_no_line(self):
+        for entity, attrs in ((WASHER, self.WASH), (DRYER, self.DRY)):
+            for state in ("Off", "Unemptied", "Emptied", "unknown", "unavailable"):
+                with self.subTest(entity=entity, state=state):
+                    self.assertEqual(shown(self.app({entity: full(state, attrs)})), [BLANK] * 3)
+
+    def test_they_come_after_transit_before_rows_and_use_at_most_three_lines(self):
+        app = self.app({WASHER: full("Running", self.WASH), UPCOMING: upcoming(LineTests.ROWS),
+                        STOG: route("Disrupted", [departure(12, "08:42", cancelled=True)])})
+        self.assertEqual([line[0] for line in shown(app)],
+                         ["S-tog: cancelled 08:42", "Washer 42 min left", "Spray the Alocasia"])
+        fire(app, DRYER, full("Running", self.DRY))
+        self.assertEqual([line[0] for line in shown(app)],
+                         ["S-tog: cancelled 08:42", "Washer 42 min left", "Dryer 1 h 05 left"])
+        fire(app, METRO, route("Delayed", [departure(5, "08:35", delay=12)]))
+        self.assertEqual([line[0] for line in shown(app)],
+                         ["Metro: 08:35 +12 min", "S-tog: cancelled 08:42", "Washer 42 min left"])
+
+    def test_a_start_stop_or_attribute_change_reaches_the_display_at_once(self):
+        for entity, attrs, expected in ((WASHER, self.WASH, self.WASH_LINE), (DRYER, self.DRY, self.DRY_LINE)):
+            with self.subTest(entity=entity):
+                app = self.app()
+                fire(app, entity, full("Running", attrs))
+                self.assertEqual(shown(app)[0], expected)
+                fire(app, entity, full("Running", {**attrs, "started_by": "claudia"}))
+                self.assertEqual(shown(app), [BLANK] * 3)
+                fire(app, entity, full("Running", attrs))
+                fire(app, entity, full("Running", {**attrs, "estimated_end_time": ""}))
+                self.assertEqual(shown(app)[0], (expected[0].split()[0] + " running", expected[1], ""))
+                fire(app, entity, full("Unemptied", attrs))
+                self.assertEqual(shown(app), [BLANK] * 3)
+
+    def test_the_minutes_count_down_on_the_tick_without_republishing_the_same_line(self):
+        for entity, attrs, first, later in ((WASHER, self.WASH, "Washer 42 min left", "Washer 41 min left"),
+                                           (DRYER, self.DRY, "Dryer 1 h 05 left", "Dryer 1 h 04 left")):
+            with self.subTest(entity=entity):
+                app = self.app({entity: full("Running", attrs)})
+                phone(app, "-90")
+                before = len(app.published)
+                tick(app, 10 * SEC)
+                self.assertEqual((shown(app)[0][0], len(app.published)), (first, before))
+                tick(app, 50 * SEC)
+                self.assertEqual((shown(app)[0][0], len(app.published)), (later, before + 1))
+
+    def test_the_washers_clock_time_can_finish_after_midnight(self):
+        now = house(11, 5, 23, 50)
+        attrs = {"started_by": "mikkel", "estimated_end_time": "00:10", "estimated_remaining_min": "20"}
+        app = self.app({WASHER: full("Running", attrs, updated=now)}, now=now)
+        self.assertEqual(shown(app)[0], ("Washer 20 min left", bd.WASHER_ICON, "00:10"))
+        tick(app, 15 * MIN)
+        self.assertEqual(shown(app)[0][0], "Washer 5 min left")
+        tick(app, 6 * MIN)
+        self.assertEqual(shown(app)[0][0], "Washer 0 min left")
+
+    def test_a_past_washer_eta_does_not_jump_to_tomorrow(self):
+        for remaining in (None, 0, "0"):
+            with self.subTest(remaining=remaining):
+                attrs = {**self.WASH, "estimated_end_time": "08:25", "estimated_remaining_min": remaining}
+                self.assertEqual(shown(self.app({WASHER: full("Running", attrs)}))[0],
+                                 ("Washer 0 min left", bd.WASHER_ICON, "08:25"))
+
+    def test_the_dryers_overrun_eta_takes_the_monitors_new_finish(self):
+        attrs = {**self.DRY, "estimated_end_time": iso(NOW + 10 * MIN), "estimated_remaining_min": 10,
+                 "overrun_min": 25}
+        app = self.app({DRYER: full("Running", attrs)})
+        self.assertEqual(shown(app)[0], ("Dryer 10 min left", bd.DRYER_ICON, "08:40"))
+        tick(app, 2 * MIN)
+        self.assertEqual(shown(app)[0][0], "Dryer 8 min left")
+        fire(app, DRYER, full("Running", {**attrs, "estimated_end_time": iso(app.now + 10 * MIN)}, updated=app.now))
+        self.assertEqual(shown(app)[0], ("Dryer 10 min left", bd.DRYER_ICON, "08:42"))
+
+    def test_someone_and_an_empty_room_get_no_appliance_line(self):
+        for states, active in (({RSSI: full("-90")}, "on"), ({}, "off")):
+            with self.subTest(active=active):
+                app = self.app({WASHER: full("Running", self.WASH), **states}, active=active)
+                self.assertEqual(shown(app), [BLANK] * 3)
+
+    def test_the_entities_are_from_the_yaml(self):
+        app = self.app({"sensor.den_washer": full("Running", self.WASH),
+                        "sensor.den_dryer": full("Running", self.DRY)},
+                       washer_entity="sensor.den_washer", dryer_entity="sensor.den_dryer")
+        self.assertEqual(shown(app), [self.WASH_LINE, self.DRY_LINE, BLANK])
+        for entity in ("sensor.den_washer", "sensor.den_dryer"):
+            self.assertIn(("_on_source", entity, {"attribute": "all"}), app.listened)
+        self.assertNotIn(WASHER, [entity for _, entity, _ in app.listened])
+        self.assertNotIn(DRYER, [entity for _, entity, _ in app.listened])
+
+
 class WeighingFlowTests(unittest.TestCase):
     """The app runs in the afternoon, which is neither of the windows of the rain and the alarm line."""
 
@@ -2028,12 +2176,13 @@ class WeighingFlowTests(unittest.TestCase):
         return make_app({**scale_states(), UPCOMING: rows, **(states or {})}, now=now, **kw)
 
     def test_a_weighing_identifies_him_and_the_card_replaces_his_lines_once_the_statistics_are_in(self):
-        app = self.app()
+        app = self.app({WASHER: full("Running", {"started_by": "mikkel", "estimated_end_time": "14:42"},
+                                    updated=self.AFTERNOON)})
         self.assertEqual((last(app)["state"], shown(app)), ("someone", [BLANK] * 3))
         weigh(app)
         self.assertEqual(last(app)["state"], "mikkel")
         self.assertEqual(last(app)["attributes"]["reason"], f"active:{ACTIVE} phone:held")
-        self.assertEqual(shown(app)[0], self.ROWS)
+        self.assertEqual(shown(app)[0], ("Washer 42 min left", bd.WASHER_ICON, "14:42"))
         thirty_days_ago(app)
         drain(app)
         self.assertEqual((last(app)["state"], shown(app)), ("mikkel", self.CARD))
@@ -2611,7 +2760,8 @@ class NightTests(unittest.TestCase):
 
     ALARM_LINE = ("Alarm 09:15", "mdi:alarm", "09:15")
     SLEEPING = {ALARM: full("on"), ALARM_TIME: full("09:15:00"), UPCOMING: upcoming(LineTests.ROWS),
-                STOG: route("Disrupted", [departure(12, "08:42", cancelled=True)]), PIEZO: full("on")}
+                STOG: route("Disrupted", [departure(12, "08:42", cancelled=True)]), PIEZO: full("on"),
+                WASHER: full("Running", ApplianceFlowTests.WASH), DRYER: full("Paused", ApplianceFlowTests.DRY)}
     CASES = (  # the room, its states, whether it is active and the state it gets
         ("an empty room", {SLEEP: full("on")}, "off", "off"),
         ("a room kept dark", {SLEEP: full("on"), LIGHT: full("off")}, "on", "off"),
@@ -2732,6 +2882,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((app.play_event, app.speaker, app.radio), (bd.PLAY_EVENT, bd.SPEAKER, bd.RADIO))
         self.assertEqual((CONFIG["play_event"], CONFIG["speaker"], CONFIG["radio"]),
                          ("esphome.bathroom_display_play", "media_player.bathroom", "dr_podcasts://radio/p3"))
+        self.assertEqual((app.washer_entity, app.dryer_entity), (bd.WASHER, bd.DRYER))
+        self.assertEqual((CONFIG["washer_entity"], CONFIG["dryer_entity"]), ("sensor.washer_state", "sensor.dryer_state"))
 
     def test_the_weighing_rain_and_alarm_defaults_are_the_yamls_values(self):
         app = make_app()
@@ -2759,6 +2911,7 @@ class ConfigTests(unittest.TestCase):
                          (bd.MEASURED, bd.WEIGHT, bd.BODY_FAT, bd.PIEZO, bd.WEATHER, bd.ALARM, bd.ALARM_TIME,
                           bd.ALARM_FROM_ENTITY, bd.ALARM_EVENT))
         self.assertEqual(app.alarm_event, CONFIG["alarm_event"])
+        self.assertEqual((app.washer_entity, app.dryer_entity), (bd.WASHER, bd.DRYER))
 
     def test_the_limits_and_windows_are_the_agreed_ones(self):
         self.assertEqual((bd.CARD_S, bd.WEIGH_FRESH, bd.COMPARE_AGO, bd.COMPARE_SLACK, bd.DEAD_BAND_KG),

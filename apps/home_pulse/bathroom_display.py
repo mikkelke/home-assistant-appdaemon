@@ -20,8 +20,8 @@ Publishes sensor.bathroom_display, the one entity the display reads:
         line1..3    the title of each line, at most LINE_MAX characters; "" when unused
         icon1..3    the line's mdi icon, the row's own or the line's (mdi:train for transit); "" when unused
         due1..3     the text under the line's chip: when a row is due ("overdue", "today", "tomorrow" or
-                    "6 d"), or the short value of a weighing, alarm or rain line ("73.3 kg", "09:15",
-                    "09-11"); "" when it has none
+                    "6 d"), or the short value of a weighing, alarm, rain or appliance line ("73.3 kg",
+                    "09:15", "09-11", "11:30"); "" when it has none
         friendly_name, icon
     The lines are filled only for state mikkel, except while the night is on (below). The phone's dBm is not
     published (mikkel_rssi_min is calibrated from the history of its sensor), so the payload changes only
@@ -79,6 +79,14 @@ The lines for Mikkel, at most three, in this order:
     transit   one line for each of his routes (the `transit` list) whose status is Delayed or Disrupted
               and whose data is at most transit_max_age_min old: the first upcoming cancelled departure
               ("S-tog: cancelled 07:42"), else the first late one ("S-tog: 07:42 +12 min"), else the status.
+    laundry   washer_entity (sensor.washer_state), then dryer_entity (sensor.dryer_state), while Running or
+              Paused and started_by names the resident, without regard to case. "Washer 42 min left" or
+              "Dryer 1 h 05 left", with mdi:washing-machine or mdi:tumble-dryer and the finish time under
+              the chip ("11:30"); "Washer paused" while Paused. The washer's estimated_end_time is a house
+              clock time, dated nearest to its last_updated plus estimated_remaining_min when known;
+              the dryer's is an ISO timestamp, including its own extension when it runs over. Minutes
+              round up and stop at zero; without an end time the title is "Washer running" and the chip
+              is empty. A paused line keeps the finish chip when known.
     rows      from sensor.house_upcoming while its lease (`expires`) holds, never a row that asks the next
               chip to pass it over or names other people. First what is due by 7 days from now, earliest
               first: a row timed in the past or inside 7 days, a one-off task that lost its time on its
@@ -108,9 +116,10 @@ State acquisition follows HouseUpcoming: one snapshot of each source at initiali
 listen_state(attribute="all"), and a value from a callback is never replaced by a later read, because
 AppDaemon 4.5.13's state store can lag behind HA. The freshness of a reading is its own last_updated, so a
 late callback or a stale snapshot does not look new. Every TICK_S seconds everything is evaluated again, which
-is how a reading that stops coming, a lease that runs out, an old transit report and a due chip that rolls
-over reach the display, and so is the end of the card; the result is published only when it differs from the
-last one published, and always on plugin_started, since HA forgets a set_state entity when it restarts.
+is how a reading that stops coming, a lease that runs out, an old transit report, the minutes left on an
+appliance and a due chip that rolls over reach the display, and so is the end of the card; the result is
+published only when it differs from the last one published, and always on plugin_started, since HA forgets
+a set_state entity when it restarts.
 The recorder's answer and the forecast are fetched like HouseUpcoming's: an async method awaits the service
 call (with a timeout of FETCH_TIMEOUT_S), leaves the result in a hand-over and has run_in(.., 0) apply it.
 
@@ -130,6 +139,7 @@ import asyncio
 import re
 import statistics
 from datetime import date, datetime, time, timedelta, timezone
+from math import ceil
 from typing import NamedTuple
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
@@ -162,6 +172,10 @@ AHEAD = timedelta(days=14)
 BAD_STATUS = ("Delayed", "Disrupted")
 ICON = "mdi:monitor-dashboard"
 TRANSIT_ICON = "mdi:train"
+WASHER = "sensor.washer_state"
+DRYER = "sensor.dryer_state"
+WASHER_ICON = "mdi:washing-machine"
+DRYER_ICON = "mdi:tumble-dryer"
 ICON_MAX = 80
 PLAY_EVENT = "esphome.bathroom_display_play"
 SPEAKER = "media_player.bathroom"
@@ -327,6 +341,44 @@ def transit_lines(routes, now, max_age):
     """The lines of [(label, state dict)] that have one, in order."""
     texts = (transit_line(label, full, now, max_age) for label, full in routes)
     return [Line(text, TRANSIT_ICON) for text in texts if text]
+
+
+def appliance_end(full, now):
+    """The appliance's end timestamp, else None. The washer publishes a house HH:MM, the dryer an ISO
+    timestamp. A clock time takes the date nearest the update plus its remaining minutes, or the update
+    alone without them, so crossing midnight does not turn a past finish into tomorrow's."""
+    attrs = full.get("attributes") if isinstance(full.get("attributes"), dict) else {}
+    value = attrs.get("estimated_end_time")
+    if not isinstance(value, str) or not re.fullmatch(r"\d\d:\d\d", value):
+        return maint.parse_iso(value)
+    try:
+        clock = time.fromisoformat(value)
+    except ValueError:
+        return None
+    updated = maint.parse_iso(full.get("last_updated")) or now
+    day = maint.house_date(updated)
+    remaining = maint.reading(attrs.get("estimated_remaining_min"))
+    target = max(0, remaining) if remaining is not None else 0
+    ends = [datetime.combine(day + timedelta(days=offset), clock, maint.HOUSE_TZ) for offset in (-1, 0, 1)]
+    return min(ends, key=lambda end: abs((end - updated).total_seconds() / 60 - target))
+
+
+def appliance_line(label, icon, full, now, resident=RESIDENT):
+    """A running or paused appliance started by `resident`, else None; its end time is the chip, and a
+    running one counts down to it. An unknown starter belongs to nobody."""
+    state = full.get("state") if isinstance(full, dict) else None
+    if state not in ("Running", "Paused"):
+        return None
+    attrs = full.get("attributes") if isinstance(full.get("attributes"), dict) else {}
+    starter = attrs.get("started_by")
+    if not isinstance(starter, str) or not starter.strip() or starter.strip().lower() != resident.strip().lower():
+        return None
+    end = appliance_end(full, now)
+    word = "paused" if state == "Paused" else "running"
+    if state == "Running" and end is not None:
+        minutes = max(0, ceil((end.astimezone(timezone.utc) - now.astimezone(timezone.utc)).total_seconds() / 60))
+        word = f"{minutes} min left" if minutes < 60 else f"{minutes // 60} h {minutes % 60:02d} left"
+    return Line(fit(f"{label} {word}"), icon, end.astimezone(maint.HOUSE_TZ).strftime("%H:%M") if end else "")
 
 
 def live_rows(full, now):
@@ -642,6 +694,8 @@ class BathroomDisplay(hass.Hass):
         self.upcoming_entity = a.get("upcoming_entity", "sensor.house_upcoming")
         self.routes = [(str(route["label"]), route["entity"]) for route in a.get("transit") or []]
         self.transit_max_age = timedelta(minutes=float(a.get("transit_max_age_min", TRANSIT_MAX_AGE_MIN)))
+        self.washer_entity = a.get("washer_entity", WASHER)
+        self.dryer_entity = a.get("dryer_entity", DRYER)
         self.sleep_entity = a.get("sleep_entity", "input_boolean.mikkel_sleep_mode")
         self.light_entity = a.get("light_entity", "light.bathroom_main_lights")
         self.play_event = a.get("play_event", PLAY_EVENT)
@@ -687,7 +741,8 @@ class BathroomDisplay(hass.Hass):
     def _sources(self):
         return list(dict.fromkeys([self.rssi_entity, self.upcoming_entity, self.sleep_entity, self.light_entity,
                                    self.measured_entity, self.weight_entity, self.fat_entity, self.rain_entity,
-                                   self.alarm_entity, self.alarm_time_entity, self.alarm_from_entity]
+                                   self.alarm_entity, self.alarm_time_entity, self.alarm_from_entity,
+                                   self.washer_entity, self.dryer_entity]
                                   + [entity for _, entity in self.routes]))
 
     def _read(self, entity):
@@ -866,6 +921,11 @@ class BathroomDisplay(hass.Hass):
             lines = lines + self._rain(now)
         routes = [(label, self._cache.get(entity)) for label, entity in self.routes]
         lines = lines + transit_lines(routes, now, self.transit_max_age)
+        for label, icon, entity in (("Washer", WASHER_ICON, self.washer_entity),
+                                    ("Dryer", DRYER_ICON, self.dryer_entity)):
+            line = appliance_line(label, icon, self._cache.get(entity), now, self.resident)
+            if line:
+                lines.append(line)
         rows = live_rows(self._cache.get(self.upcoming_entity), now)
         return (lines + task_lines(rows, now, self.resident, self.zone, LINES - len(lines)))[:LINES]
 
