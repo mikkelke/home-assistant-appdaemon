@@ -99,7 +99,9 @@ FireSafety:
   test_overdue_days: 35
   fault_push_throttle_hours: 48
   fault_check_time: "09:00:00"
-  monthly_test_time: "11:00:00"
+  monthly_test_start: "10:00:00"
+  monthly_test_end: "17:00:00"
+  monthly_test_check_min: 10
 
   # --- Notifications ---
   push_tag: fire_alarm
@@ -119,8 +121,9 @@ FireSafety:
   # who else gets the push when none of alarm_notify_if_home is home: "always_only" or "everyone"
   alarm_nobody_home: everyone
 
-  # Monthly self-test (11:00 on the 1st, retried daily up to 7 days) only runs while none
-  # of these are home; gives up for the month if someone's always home within the window.
+  # Monthly self-test: checked every monthly_test_check_min between monthly_test_start and
+  # monthly_test_end on days 1..monthly_test_max_retry_days, runs the first time none of
+  # these are home; gives up for the month (health push) if that never happens.
   monthly_test_person_entities:
     - person.mikkel
     - person.kristine

@@ -10,7 +10,7 @@ import sys
 import tempfile
 import types
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -167,6 +167,8 @@ def _make_app(**overrides):
     app.alarm_nobody_home = "everyone"
     app.monthly_test_person_entities = ["person.mikkel", "person.kristine", "person.claudia"]
     app.monthly_test_max_retry_days = 7
+    app.monthly_test_start = time(10, 0)
+    app.monthly_test_end = time(17, 0)
     app.sonos_kitchen_entity = "media_player.kitchen"
     app.sonos_all_entities = ["media_player.living_room", "media_player.bedroom"]
     app.sonos_kitchen_volume = 0.15
@@ -2281,10 +2283,18 @@ class MonthlySelfTest(_FrozenTimeTestCase):
         self.assertFalse(app.monthly_test_resolved)
         self.assertEqual(app.mobile_notifier.calls, [])
 
-    async def test_gives_up_after_max_retry_days_with_someone_home(self):
+    async def test_keeps_trying_on_the_last_retry_day(self):
         app = _make_app()
         app.states["person.mikkel"] = "home"
-        now = datetime(2026, 9, 7, 11, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 9, 7, 16, 50, tzinfo=timezone.utc)
+        await app._maybe_run_monthly_test(now)
+        self.assertFalse(app.monthly_test_resolved)
+        self.assertEqual(app.mobile_notifier.calls, [])
+
+    async def test_gives_up_the_day_after_max_retry_days(self):
+        app = _make_app()
+        app.states["person.mikkel"] = "home"
+        now = datetime(2026, 9, 8, 0, 10, tzinfo=timezone.utc)
         await app._maybe_run_monthly_test(now)
         await asyncio.gather(*app._test_tasks)  # give-up health push runs detached
         self.assertIsNone(app.self_test_until)
@@ -2292,6 +2302,34 @@ class MonthlySelfTest(_FrozenTimeTestCase):
         self.assertEqual(len(app.mobile_notifier.calls), 1)
         self.assertIn("someone was home", app.mobile_notifier.calls[0]["message"])
         self.assertEqual(app.mobile_notifier.calls[0]["target"], ["mikkel"])
+        await app._maybe_run_monthly_test(now + timedelta(minutes=10))
+        self.assertEqual(len(app.mobile_notifier.calls), 1)
+
+    async def test_waits_for_the_window_even_when_nobody_home(self):
+        app = _make_app()
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
+        app.states["person.mikkel"] = "not_home"
+        app.states["person.kristine"] = "not_home"
+        app.states["person.claudia"] = "not_home"
+        for hour in (9, 17, 22):
+            await app._maybe_run_monthly_test(datetime(2026, 9, 2, hour, 30, tzinfo=timezone.utc))
+        self.assertIsNone(app.self_test_until)
+        self.assertFalse(app.monthly_test_resolved)
+
+    async def test_runs_when_the_flat_empties_in_the_afternoon(self):
+        app = _make_app()
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
+        app.states["person.mikkel"] = "home"
+        app.states["person.kristine"] = "not_home"
+        app.states["person.claudia"] = "not_home"
+        await app._maybe_run_monthly_test(datetime(2026, 9, 4, 11, 0, tzinfo=timezone.utc))
+        self.assertIsNone(app.self_test_until)
+        app.states["person.mikkel"] = "not_home"
+        await app._maybe_run_monthly_test(datetime(2026, 9, 4, 14, 10, tzinfo=timezone.utc))
+        self.assertIsNotNone(app.self_test_until)
+        self.assertTrue(app.monthly_test_resolved)
 
     async def test_does_not_rerun_once_resolved_this_month(self):
         app = _make_app(monthly_test_month_key="2026-09", monthly_test_resolved=True)
@@ -2312,12 +2350,11 @@ class MonthlySelfTest(_FrozenTimeTestCase):
         self.assertEqual(app.monthly_test_month_key, "2026-09")
         self.assertIsNotNone(app.self_test_until)
 
-    async def test_past_max_retry_day_does_nothing(self):
-        app = _make_app()
+    async def test_past_max_retry_day_after_giving_up_does_nothing(self):
+        app = _make_app(monthly_test_month_key="2026-09", monthly_test_resolved=True)
         app.states["person.mikkel"] = "home"
-        now = datetime(2026, 9, 8, 11, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 9, 20, 11, 0, tzinfo=timezone.utc)
         await app._maybe_run_monthly_test(now)
-        self.assertFalse(app.monthly_test_resolved)
         self.assertEqual(app.mobile_notifier.calls, [])
 
 

@@ -165,7 +165,9 @@ class FireSafety(hass.Hass):
         self.test_overdue_days = int(a("test_overdue_days", 35))
         self.fault_push_throttle_hours = int(a("fault_push_throttle_hours", 48))
         self.fault_check_time = a("fault_check_time", "09:00:00")
-        self.monthly_test_time = a("monthly_test_time", "11:00:00")
+        self.monthly_test_start = time(*self._parse_hms(a("monthly_test_start", "10:00:00")))
+        self.monthly_test_end = time(*self._parse_hms(a("monthly_test_end", "17:00:00")))
+        self.monthly_test_check_min = int(a("monthly_test_check_min", 10))
 
         self.push_tag = a("push_tag", "fire_alarm")
         self.push_category = a("push_category", "fire_alarm")
@@ -236,7 +238,7 @@ class FireSafety(hass.Hass):
         self.listen_event(self._on_notification_action, "mobile_app_notification_action")
 
         self.run_daily(self._on_fault_check_tick, time(*self._parse_hms(self.fault_check_time)))
-        self.run_daily(self._on_monthly_test_tick, time(*self._parse_hms(self.monthly_test_time)))
+        self.run_every(self._on_monthly_test_tick, "now+60", self.monthly_test_check_min * 60)
 
         # First tick at +2s (covers smoke already being on at boot), then every
         # tick_interval_s afterward for the time-based transitions/repeats.
@@ -991,7 +993,8 @@ class FireSafety(hass.Hass):
         away, not_home or another zone (unknown/unavailable presence counts as home)."""
         async with self._eval_lock:
             if not await self._self_test_ready(automatic):
-                self.log("Self-test refused - alarm not idle, device not clear, or presence unclear", level="WARNING")
+                if not automatic:
+                    self.log("Self-test refused - alarm not idle or device not clear", level="WARNING")
                 return False
             await self._call(
                 f"switch/turn_on {self.self_test_switch_entity}",
@@ -1030,27 +1033,29 @@ class FireSafety(hass.Hass):
 
     async def _maybe_run_monthly_test(self, now):
         """Automatic monthly self-test: only while no one is home (a self-test sounds the
-        siren). Retries daily at monthly_test_time through day monthly_test_max_retry_days,
-        then gives up for the month and sends a health push instead."""
-        if now.day > self.monthly_test_max_retry_days:
-            return
-        month_key = now.strftime("%Y-%m")
+        siren). Checked every monthly_test_check_min between monthly_test_start and
+        monthly_test_end local time on days 1..monthly_test_max_retry_days; the first check
+        after that window gives up for the month and sends a health push instead."""
+        local = now.astimezone(self._tz) if self._tz else now
+        month_key = local.strftime("%Y-%m")
         if self.monthly_test_month_key != month_key:
             self.monthly_test_month_key = month_key
             self.monthly_test_resolved = False
             self._save_state()
         if self.monthly_test_resolved:
             return
-        if await self._run_self_test(now, automatic=True):
-            self.monthly_test_resolved = True
-            self._save_state()
-            return
-        if now.day >= self.monthly_test_max_retry_days:
+        if local.day > self.monthly_test_max_retry_days:
             self.monthly_test_resolved = True
             self._save_state()
             self.create_task(self._push_health(
                 now, "Monthly smoke alarm test skipped — someone was home; run it from the dashboard"
             ))
+            return
+        if not (self.monthly_test_start <= local.time() < self.monthly_test_end):
+            return
+        if await self._run_self_test(now, automatic=True):
+            self.monthly_test_resolved = True
+            self._save_state()
 
     # ---------- cooking mode ----------
 
