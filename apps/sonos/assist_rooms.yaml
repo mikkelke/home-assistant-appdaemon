@@ -1,0 +1,22 @@
+AssistRooms:
+  module: assist_rooms
+  class: AssistRooms
+  log: sonos_log
+
+  # Satellite entity -> HA area id.
+  satellites:
+    assist_satellite.bathroom_bathroom_display_assist_satellite: bathroom
+
+  # HA area id -> Music Assistant player.
+  speakers:
+    bathroom: media_player.bathroom
+    bedroom: media_player.bedroom
+    kitchen: media_player.kitchen
+    living_room: media_player.living_room
+    dining_room: media_player.dining_room
+    guest_bathroom: media_player.guest_bathroom
+    rooftop: media_player.rooftop
+
+  master_select: input_select.sonos_master_speaker
+  radio: dr_podcasts://radio/p3
+  duck_failsafe_s: 20

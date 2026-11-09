@@ -11,6 +11,7 @@ Checked:
   - state_reset.yaml   speaker list + per-speaker default volumes
   - follow_me.yaml     player list (registry MA entities; extra zones allowed)
   - group_manager.yaml player list
+  - assist_rooms.yaml room speakers (registry Music Assistant entities)
   - family_room_volume_sync.yaml speakers (registry MA ids with <id>_2 twins) + tv_speaker
   - music_attribution.yaml raw_to_base_map pairs
   - sonos_notifier.yaml  TTS target groups (registry `tts:` tags all/family/kristine/ms/claudia)
@@ -77,6 +78,12 @@ def main():
         for p in players:
             check(p in ma or p == "media_player.rooftop",
                   f"{fname}: player {p} not in registry")
+
+    ar_fname = "apps/sonos/assist_rooms.yaml"
+    ar = next(iter(load(ar_fname).values()))
+    for area, speaker in (ar.get("speakers") or {}).items():
+        check(speaker in ma,
+              f"{ar_fname}: speaker {speaker} for {area} is not a registry Music Assistant entity")
 
     fv_fname = "apps/sonos/family_room_volume_sync.yaml"
     fv = next(iter(load(fv_fname).values()))
