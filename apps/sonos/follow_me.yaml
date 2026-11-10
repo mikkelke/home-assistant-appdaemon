@@ -72,3 +72,7 @@ SonosFollowMe:
   special_conditions:
     kitchen_or_hallway: true   # Kitchen should unmute if either kitchen or hallway has presence
     rooftop_with_living_room: true  # Rooftop should only unmute with living room presence + charging
+
+  # What FollowMe last did to each speaker and why. State = how many speakers it last left muted;
+  # attribute speakers = {speaker: {action: muted|unmuted, at: ISO time, why: short phrase}}.
+  status_entity: sensor.follow_me

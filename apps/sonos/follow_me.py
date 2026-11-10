@@ -1,4 +1,6 @@
 # /conf/apps/sonos/follow_me.py
+import threading
+
 import appdaemon.plugins.hass.hassapi as hass   # type: ignore
 
 import presence_trust  # apps/lights - AppDaemon puts every app dir on sys.path
@@ -22,7 +24,14 @@ class SonosFollowMe(hass.Hass):
       plays is SUSPECT - _is_present returns None (indeterminate), so every caller skips the mute change:
       a ghost can never unmute (the ON trigger), and a possibly-real still person is never muted either.
     • During reset, mute/unmute is paused; after reset, state is re-synced.
+    • Every mute or unmute FollowMe does goes through _set_mute, which records what it did and why
+      and publishes status_entity (sensor.follow_me): the state is how many speakers FollowMe last
+      left muted, the attribute `speakers` maps each speaker it has touched to {action: muted |
+      unmuted, at: ISO time, why: a short phrase}. Strings only: set_state drops falsy attributes.
     """
+
+    # Entity that publishes the records; None publishes nothing.
+    status_entity = None
 
     def initialize(self):
         self.room_map    = self.args["room_presence_map"]   # room -> binary_sensor (may be a HA template combining inputs)
@@ -47,6 +56,12 @@ class SonosFollowMe(hass.Hass):
 
         # Track last non-zero volume per speaker for AirPlay restore
         self._last_nonzero_volume = {}
+
+        # What FollowMe last did to each speaker, published as sensor.follow_me (see _set_mute).
+        self.status_entity = self.args.get("status_entity")
+        self._mute_records = {}
+        self._status_lock = threading.RLock()
+        self._load_mute_records()
         
         # Coordinator cache for _get_current_coordinator() optimization
         # Cache with 1-second TTL, invalidated on group changes
@@ -100,10 +115,88 @@ class SonosFollowMe(hass.Hass):
         self.listen_event(self._on_reset_started, "sonos_reset_started")
         self.listen_event(self._on_reset_completed, "sonos_reset_completed")
 
+        # A Home Assistant restart drops the published entity: publish it again from memory.
+        self.listen_event(self._on_plugin_started, "plugin_started")
+        self._publish_status()
+
         # On startup, check and unmute any solo speakers that aren't playing
         self.run_in(self._check_and_unmute_stale_speakers, 5)
 
         self.log("Scenario: SonosFollowMe_loaded", level="INFO")
+
+    def _set_mute(self, entity, muted, why):
+        """Mute or unmute one speaker, and record why. The only place FollowMe calls
+        media_player/volume_mute. Recording and publishing can fail without the call being lost."""
+        self.call_service("media_player/volume_mute", entity_id=entity, is_volume_muted=muted)
+        try:
+            self._record_mute(entity, muted, why)
+        except Exception as e:
+            self.log(f"Scenario: status_record_error -> {entity} {e!r}", level="WARNING")
+
+    def _presence_why(self, room, muted, speaker=None):
+        """The phrase for a mute or unmute that presence in `room` decided (in the room of
+        `speaker` when `room` is None). Never raises: a phrase is not worth a missed mute."""
+        try:
+            room = room or self.speaker_map.get(speaker) or speaker.split(".", 1)[-1]
+            if room == "rooftop":
+                if muted:
+                    return "docked and nobody in the living room"
+                if self.get_state("input_boolean.rooftop_keep_speaker_on") == "on":
+                    return "keep speaker on is set"
+                if self.get_state(self.room_map["rooftop_charging"]) not in ["on", "home"]:
+                    return "off its dock"
+                return "someone in the living room"
+            if room == "kitchen" and self.special.get("kitchen_or_hallway"):
+                area = "kitchen or hallway"
+            else:
+                area = str(room).replace("_", " ")
+            return f"nobody seen in the {area}" if muted else f"someone in the {area}"
+        except Exception:
+            return "presence changed"
+
+    def _record_mute(self, entity, muted, why):
+        if not self.status_entity:
+            return
+        with self._status_lock:
+            self._mute_records[entity] = {
+                "action": "muted" if muted else "unmuted",
+                "at": self.get_now().isoformat(timespec="seconds"),
+                "why": str(why),
+            }
+            self._publish_status()
+
+    def _publish_status(self):
+        if not self.status_entity:
+            return
+        with self._status_lock:
+            speakers = {entity: dict(record) for entity, record in self._mute_records.items()}
+            left_muted = sum(1 for record in speakers.values() if record["action"] == "muted")
+            try:
+                self.set_state(
+                    self.status_entity,
+                    state=str(left_muted),
+                    attributes={"friendly_name": "FollowMe", "icon": "mdi:speaker-multiple", "speakers": speakers},
+                    replace=True,
+                )
+            except Exception as e:
+                self.log(f"Scenario: status_publish_error -> {self.status_entity} {e!r}", level="WARNING")
+
+    def _load_mute_records(self):
+        """After an AppDaemon restart, take the records back from the published entity."""
+        if not self.status_entity:
+            return
+        try:
+            published = self.get_state(self.status_entity, attribute="speakers")
+        except Exception:
+            return
+        for entity, record in (published.items() if isinstance(published, dict) else ()):
+            if (isinstance(entity, str) and isinstance(record, dict)
+                    and record.get("action") in ("muted", "unmuted")
+                    and isinstance(record.get("at"), str) and isinstance(record.get("why"), str)):
+                self._mute_records[entity] = {"action": record["action"], "at": record["at"], "why": record["why"]}
+
+    def _on_plugin_started(self, event_name, data, kwargs):
+        self._publish_status()
 
     def _safe_cancel_timer(self, timer_handle):
         if timer_handle is None:
@@ -216,9 +309,7 @@ class SonosFollowMe(hass.Hass):
             desired_mute = not present
             if desired_mute and not self._is_muted(entity):
                 self.log(f"Scenario: preserve_mute_state -> {entity} was unmuted externally but should be muted (no presence in {speaker_room}), re-applying mute", level="INFO")
-                self.call_service("media_player/volume_mute",
-                                entity_id=entity,
-                                is_volume_muted=True)
+                self._set_mute(entity, True, self._presence_why(speaker_room, True))
         except Exception:
             # Ignore errors silently to avoid noisy logs
             pass
@@ -242,7 +333,7 @@ class SonosFollowMe(hass.Hass):
                 self.log(f"Scenario: volume_restore_skip -> {entity_id} volume already {curr_f}", level="DEBUG")
                 return
             # Volume is 0: unmute and set volume (AirPlay often does this; no reason to leave at 0)
-            self.call_service("media_player/volume_mute", entity_id=entity_id, is_volume_muted=False)
+            self._set_mute(entity_id, False, "AirPlay set the volume to 0")
             # No stored volume or stored volume is 0 -> use default (state_reset). Never set volume to 0.
             last = self._last_nonzero_volume.get(entity_id)
             default_level = self._get_reset_volume_for_speaker(entity_id)
@@ -405,11 +496,7 @@ class SonosFollowMe(hass.Hass):
                         f"Scenario: unmute_not_playing -> {entity} state={new}, clearing mute (idle/pause must not stay muted)",
                         level="INFO",
                     )
-                    self.call_service(
-                        "media_player/volume_mute",
-                        entity_id=entity,
-                        is_volume_muted=False,
-                    )
+                    self._set_mute(entity, False, "stopped playing")
 
         if not self._should_follow_me_be_active():
             return
@@ -436,11 +523,7 @@ class SonosFollowMe(hass.Hass):
                     f"Scenario: speaker_became_solo_not_playing -> {entity} solo, not playing (state: {state}), unmuting",
                     level="INFO",
                 )
-                self.call_service(
-                    "media_player/volume_mute",
-                    entity_id=entity,
-                    is_volume_muted=False,
-                )
+                self._set_mute(entity, False, "left the group")
 
         if not self._should_follow_me_be_active():
             return
@@ -461,11 +544,7 @@ class SonosFollowMe(hass.Hass):
                     f"Scenario: startup_unmute_stale -> {sp} not playing (state: {state}) but muted - unmuting",
                     level="INFO",
                 )
-                self.call_service(
-                    "media_player/volume_mute",
-                    entity_id=sp,
-                    is_volume_muted=False,
-                )
+                self._set_mute(sp, False, "cleanup after an AppDaemon restart")
 
     def _presence_changed(self, entity, attribute, old, new, kwargs):
         """Handle presence sensor state changes."""
@@ -733,7 +812,7 @@ class SonosFollowMe(hass.Hass):
             return
         action = "muting" if desired_mute else "unmuting"
         self.log(f"Scenario: apply_mute -> {action} {speaker_entity}", level="INFO")
-        self.call_service("media_player/volume_mute", entity_id=speaker_entity, is_volume_muted=desired_mute)
+        self._set_mute(speaker_entity, desired_mute, self._presence_why(room, desired_mute, speaker_entity))
         if not desired_mute:
             m = master or self._get_current_coordinator()
             if speaker_entity == m:
