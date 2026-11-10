@@ -606,6 +606,41 @@ class ComparatorTests(unittest.TestCase):
         self.assertEqual(kwargs["attributes"]["rings_both"], 1)
         self.assertEqual(kwargs["state"], "1")
 
+    def test_visit_publisher_starts_merges_and_closes(self):
+        self.app._publish_visits()
+        self.assertEqual(dict(self.app.published)["sensor.intercom_visit"]["state"], "idle")
+        self.app._register_ring("esp", "back door", "", RING_ESP, "esp:test")
+        expected = [{"door": "back door", "ring_at": RING_ESP.isoformat()}]
+        visit = dict(self.app.published)["sensor.intercom_visit"]
+        self.assertEqual(visit["state"], "active")
+        self.assertEqual(visit["attributes"]["visits"], expected)
+        self.assertTrue(visit["replace"])
+        self.app._register_ring("abb", "back door", "100000001", RING_ESP, "abb:test")
+        self.assertEqual(dict(self.app.published)["sensor.intercom_visit"]["attributes"]["visits"], expected)
+        episode_id = next(iter(self.app.episodes))
+        self.app._close_episode({"episode_id": episode_id})
+        visit = dict(self.app.published)["sensor.intercom_visit"]
+        self.assertEqual(visit["state"], "idle")
+        self.assertEqual(visit["attributes"]["visits"], [])
+
+    def test_visit_close_preserves_other_door(self):
+        self.app._register_ring("esp", "front door", "", RING_ESP, "esp:test")
+        front_id = next(iter(self.app.episodes))
+        self.app._register_ring("esp", "back door", "", RING_ESP, "esp:test")
+        self.app._close_episode({"episode_id": front_id})
+        visit = dict(self.app.published)["sensor.intercom_visit"]
+        self.assertEqual(visit["state"], "active")
+        self.assertEqual(visit["attributes"]["visits"],
+                         [{"door": "back door", "ring_at": RING_ESP.isoformat()}])
+
+    def test_visit_publish_failure_does_not_interrupt_ring(self):
+        def fail(entity, **kwargs):
+            raise RuntimeError("HA unavailable")
+        self.app.set_state = fail
+        self.app._register_ring("esp", "back door", "", RING_ESP, "esp:test")
+        self.assertEqual(len(self.app.episodes), 1)
+        self.assertTrue(any("Visit publish failed" in message for _, message in self.app.logs))
+
     def test_esp_only_and_abb_only_counted_on_window_expiry(self):
         self.app._register_ring("esp", "front door", "", RING_ESP, "esp:test")
         self.clock.at = RING_ESP + timedelta(seconds=11)

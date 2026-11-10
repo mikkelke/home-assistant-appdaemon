@@ -1,0 +1,44 @@
+# Ongoing cards for Android Live Updates and iOS Live Activities. Every send uses the same tag;
+# existing finish/ring/ready notifications remain the responsibility of the source apps.
+LiveUpdates:
+  module: live_updates
+  class: LiveUpdates
+  dependencies:
+    - MobileNotifier
+
+  # People resolve through MobileNotifier.device_mapping. Nobody outside this list receives even
+  # a cleanup message. Add Kristine/Claudia here to enable their iPhone Live Activities.
+  enabled_people: [mikkel]
+
+  # Laundry goes to started_by, including late attribution. Until that is known, the audience is
+  # enabled people home when this app first sees the cycle (Mikkel if none). It stays fixed for
+  # that cycle, including reloads; the first named starter replaces that audience once.
+  washer_entity: sensor.washer_state
+  dryer_entity: sensor.dryer_state
+
+  # Independent bath/probe cards support cooking both at once. Coffee's published brewing phase
+  # includes heating; eta appears when the source has an estimate. Finished phases clear the card.
+  cook_entity: sensor.cook_state
+  coffee_entity: sensor.coffee_state
+  cook_people: [mikkel]
+  coffee_people: [mikkel]
+
+  # AbbWelcomeBridge publishes its open street-door visits, and closes them when its episode ends.
+  # Yale's apartment bell has no published visit end: retain its ring pulse until doorbell_max_s.
+  # Every door has a stable tag, and tapping opens the existing dashboard ring view.
+  doorbell_entity: sensor.intercom_visit
+  apartment_entity: binary_sensor.yale_doorbell_ding
+  doorbell_people: [mikkel]
+  doorbell_max_s: 180
+
+  # Unknown/unavailable sources retain their last card for this long. Doorbells also obey their
+  # shorter hard maximum. Source recovery resumes reconciliation; an explicit end clears at once.
+  stale_limit_s: 600
+
+  # One quiet channel for every ongoing card. Existing channel settings on Android remain under
+  # the phone user's control. Updates also carry alert_once and no sound field.
+  channel: Live
+
+  # Durable cycle audiences, last cards and send times survive reloads. Default beside this app;
+  # use a writable persistent path when overriding. No credentials are written here.
+  # state_file: /conf/apps/notify/live_updates_state.json

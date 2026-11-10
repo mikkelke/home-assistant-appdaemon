@@ -522,6 +522,7 @@ class AbbWelcomeBridge(hass.Hass):
             self.log(f"Health tick failed to schedule: {e}", level="WARNING")
 
         self._publish_agreement()
+        self._publish_visits()
         self.log(
             f"ABB Welcome bridge initialized (stations: {self.station_doors}; "
             f"counters: {self.counters})", level="INFO",
@@ -762,6 +763,7 @@ class AbbWelcomeBridge(hass.Hass):
             episode["door"] = door
         if not episode["door"] and episode["station_id"]:
             episode["door"] = self.station_doors.get(episode["station_id"])
+        self._publish_visits()
         self.log(
             f"RING-SEEN side={side} source={source} door={episode['door'] or '?'} "
             f"station={episode['station_id'] or '?'} episode={episode['id']}", level="INFO",
@@ -966,6 +968,17 @@ class AbbWelcomeBridge(hass.Hass):
             )
         except Exception as e:
             self.log(f"Agreement publish failed: {e}", level="WARNING")
+
+    def _publish_visits(self):
+        """Expose open street-door visits without coupling consumers to bridge internals."""
+        try:
+            visits = [{"door": episode["door"] or "", "ring_at": episode["started_at"].isoformat()}
+                      for episode in self.episodes.values() if not episode.get("closed")]
+            self.set_state("sensor.intercom_visit", state="active" if visits else "idle",
+                           attributes={"friendly_name": "Intercom visit", "icon": "mdi:bell-ring",
+                                       "visits": visits}, replace=True)
+        except Exception as e:
+            self.log(f"Visit publish failed: {e}", level="WARNING")
 
     # ------------------------------------------------------------------
     # Cloud events (poll-lagged): missed / answered
@@ -2280,6 +2293,7 @@ class AbbWelcomeBridge(hass.Hass):
         if episode is None or episode["closed"]:
             return
         episode["closed"] = True
+        self._publish_visits()
         # Belt and braces: ring_push_photo_wait_s is well under episode_close_s, so
         # a held push has normally gone out long before this. If anything ate that
         # timer, the household still gets the notification here rather than never.

@@ -17,6 +17,9 @@
 AbbWelcomeBridge:
   module: abb_welcome_bridge
   class: AbbWelcomeBridge
+  # Publishes sensor.intercom_visit: active/idle, visits [{door, ring_at}] for
+  # open front/back door episodes. ring_at is ISO; a re-ring keeps its visit.
+  # Consumers can clear ongoing cards when the episode closes (episode_close_s).
   # No custom `log:` stream on purpose: those must be declared in appdaemon.yaml, which lives
   # only on the box and is not in this repo - an undeclared stream fails instantiation on a
   # fresh deploy (it did, 2026-08-12, same trap as forecast_log three days earlier).
