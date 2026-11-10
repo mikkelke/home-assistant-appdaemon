@@ -14,7 +14,7 @@ living_room_tv_control:
   smart_wall_move_delay_seconds: 5 # smart delay when both Apple TV and Hisense are confirmed off (faster response)
 
   # Power-aware wall retract (whole stack on this relay: TV + Apple TV + Sonos).
-  # True idle is ~27W; full TV-on viewing is much higher. Sonos playing alone (no picture) still draws more than
+  # Idle is ~2.5W when the TV is in deep standby and ~28W in networked standby; full TV-on viewing is much higher. Sonos playing alone (no picture) still draws more than
   # idle — relay sits in a middle band — so power is a sanity check, not the only signal; Hisense/Apple TV +
   # app logic (e.g. stop living room speaker on TV off) matter for consistent UX.
   # Threshold ~52W sits above idle/Sonos-only bumps and below typical TV-on draw; 45W hit edge cases (e.g. 46W).
