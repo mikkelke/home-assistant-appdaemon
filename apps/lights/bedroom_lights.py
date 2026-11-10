@@ -210,6 +210,7 @@ class BedroomLights(hass.Hass):
         if self.manual_override_entity:
             self.listen_state(self._on_manual_override_change, self.manual_override_entity)
 
+        self._reconcile_session()
         self.run_in(self._initial_check, 5)
         self.log("Bedroom: App initialized", level="INFO")
 

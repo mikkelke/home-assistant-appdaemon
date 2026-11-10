@@ -130,7 +130,7 @@ BASE_ARGS = {
 }
 
 
-def make_full_app(overrides=None):
+def make_full_app(overrides=None, states=None):
     """BedroomLights with initialize() actually run (AppDaemon primitives stubbed only) -
     used solely to verify listener *registration*, since that is the real mechanism that
     keeps e.g. a Withings OFF edge from ever reaching its handler (see
@@ -144,6 +144,8 @@ def make_full_app(overrides=None):
     app.listen_event = MagicMock()
     app.listen_state = MagicMock(return_value="listener-handle")
     app.run_in = MagicMock(return_value="timer-handle")
+    app.states = dict(states or {})
+    app.get_state = lambda entity, **kw: app.states.get((entity, kw.get("attribute")))
     app.initialize()
     return app
 
@@ -368,6 +370,25 @@ class SessionEntryArmsExitIfPresenceAlreadyClear(unittest.TestCase):
         app._reconcile_session()
         self.assertTrue(app._session)
         app.run_in.assert_not_called()
+
+
+class SessionAfterReinit(unittest.TestCase):
+    def test_persisted_session_holds_before_the_initial_check(self):
+        app = make_full_app(states={
+            (SESSION, None): "on",
+            (ROOM_ACTIVE, None): "on",
+            (ROOM_ACTIVE, "computed_at"): _fresh_computed_at(),
+            (LEFT, None): "on",
+            (BED, None): "on",
+            (DARK_SENSOR, None): "dark",
+            (BLIND, "current_position"): 0,
+        })
+        self.assertTrue(app._session)
+        app.turn_on = MagicMock()
+        app.turn_off = MagicMock()
+        app.call_service = MagicMock()
+        app._evaluate_lights("ROOM_STATE_PUSH")
+        app.turn_on.assert_not_called()
 
 
 class LightDecision(unittest.TestCase):
