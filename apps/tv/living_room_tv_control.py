@@ -107,6 +107,7 @@ class LivingRoomTvControl(hass.Hass):
         self.apple_tv_disconnect_grace_seconds = float(self.args.get("apple_tv_disconnect_grace_seconds", 120))
         self._apple_tv_disconnect_handle = None
         self._apple_tv_grace_elapsed = False
+        self._apple_tv_input_unconfirmed = False
 
         # Power-aware wall move (optional; default off until YAML opts in)
         self.power_aware_wall_move_enabled = bool(self.args.get("power_aware_wall_move_enabled", False))
@@ -229,6 +230,7 @@ class LivingRoomTvControl(hass.Hass):
                 self.listen_state(
                     self._on_tv_source_changed, self.hisense_tv_entity, attribute="source"
                 )
+                self.listen_state(self._on_hisense_reported_on, self.hisense_tv_entity, new="on")
 
             if (
                 self.power_aware_wall_move_enabled
@@ -588,6 +590,12 @@ class LivingRoomTvControl(hass.Hass):
     def _on_relay_power_changed(self, entity, attribute, old, new, kwargs):
         self._read_tv_power_w()
         self._evaluate_power_standby_wall()
+        try:
+            rose = float(old) <= self.power_off_threshold_w < float(new)
+        except (TypeError, ValueError):
+            rose = False
+        if rose:
+            self._reconnect_apple_tv_if_needed("TV drawing power")
 
     def _evaluate_power_standby_wall(self):
         """
@@ -1353,6 +1361,7 @@ class LivingRoomTvControl(hass.Hass):
         return (
             universal_state not in (None, "off", "unavailable", "unknown", "standby")
             or hisense_state == "on"
+            or self._tv_relay_power_suggests_tv_on()
         )
 
     def _reconnect_apple_tv_on_init(self, kwargs):
@@ -1366,6 +1375,8 @@ class LivingRoomTvControl(hass.Hass):
         try:
             if self.get_state(self.hisense_tv_entity) != "on":
                 return
+            if self._settle_unconfirmed_apple_tv_input(new):
+                return
             if new == source_name:
                 self._reconnect_apple_tv_if_needed("Apple TV input selected")
             elif old == source_name:
@@ -1378,6 +1389,25 @@ class LivingRoomTvControl(hass.Hass):
                 self._disconnect_apple_tv("TV input changed away from Apple TV")
         except Exception as e:
             self.log(f"Apple TV source change check failed: {e}", level="WARNING")
+
+    def _on_hisense_reported_on(self, entity, attribute, old, new, kwargs):
+        """Native apps and casting report no input, so the source listener may never fire."""
+        self._settle_unconfirmed_apple_tv_input(self.get_state(self.hisense_tv_entity, attribute="source"))
+
+    def _settle_unconfirmed_apple_tv_input(self, source):
+        """After a connect made before the TV could report its input, keep the connection only
+        if the first reported input is the Apple TV's. Returns True when it acted."""
+        if not self._apple_tv_input_unconfirmed:
+            return False
+        self._apple_tv_input_unconfirmed = False
+        selection_script = getattr(self, "source_selection_script_entity", None)
+        if selection_script and self.get_state(selection_script) == "on":
+            return True
+        if source == self.apple_tv_source_name:
+            self.log(f"Apple TV early connect confirmed: TV reports {source}")
+            return True
+        self._disconnect_apple_tv(f"TV reports input '{source}', not the Apple TV")
+        return True
 
     def _reconnect_apple_tv_if_needed(self, reason):
         """Reconnect the Apple TV integration when the TV is on but it holds no connection.
@@ -1394,12 +1424,21 @@ class LivingRoomTvControl(hass.Hass):
             if source_name is not None:
                 primary_state = self.get_state(self.hisense_tv_entity)
                 source = self.get_state(self.hisense_tv_entity, attribute="source")
-                if primary_state != "on" or source != source_name:
+                if primary_state == "on" and source != source_name:
                     self.log(
-                        f"Apple TV reconnect ({reason}): primary TV is '{primary_state}', "
-                        f"source '{source}' (requires on / {source_name})"
+                        f"Apple TV reconnect ({reason}): TV reports input '{source}' "
+                        f"(requires {source_name})"
                     )
                     return
+                input_unconfirmed = primary_state != "on"
+                if input_unconfirmed and not self._tv_relay_power_suggests_tv_on():
+                    self.log(
+                        f"Apple TV reconnect ({reason}): primary TV is '{primary_state}' "
+                        f"and the relay does not show the TV drawing power"
+                    )
+                    return
+            else:
+                input_unconfirmed = False
             if remote_state != "off" or player_state != "off":
                 self.log(
                     f"Apple TV reconnect ({reason}): not needed "
@@ -1413,9 +1452,11 @@ class LivingRoomTvControl(hass.Hass):
                     return
             self.call_service("remote/turn_on", entity_id=self.apple_tv_remote_entity)
             self._apple_reconnect_at = self._monotonic()
+            self._apple_tv_input_unconfirmed = input_unconfirmed
             self.log(
                 f"Apple TV reconnect ({reason}): TV is on but the Apple TV is disconnected - "
                 f"remote.turn_on sent to {self.apple_tv_remote_entity}"
+                + (" (input not reported yet)" if input_unconfirmed else "")
             )
         except Exception as e:
             self.log(f"Apple TV reconnect ({reason}) failed: {e}", level="WARNING")
@@ -1463,6 +1504,7 @@ class LivingRoomTvControl(hass.Hass):
         """remote.turn_off only closes the integration's connection; it sends no command to
         the Apple TV or the TV."""
         try:
+            self._apple_tv_input_unconfirmed = False
             if remote_state is None:
                 remote_state = self.get_state(self.apple_tv_remote_entity)
             if remote_state != "on":

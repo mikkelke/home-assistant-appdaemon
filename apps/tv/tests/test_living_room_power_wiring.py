@@ -167,3 +167,79 @@ class AppleTvInputChanges(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def booting_app(**overrides):
+    """TV drawing power while the local provider still cannot be reached."""
+    app = configured_app(source=None, **{LOCAL_TV: "unavailable", TV: "unavailable", **overrides})
+    app.power_off_threshold_w = 52.0
+    app.power_w = 64.0
+    app._tv_relay_power_suggests_tv_on = lambda: app.power_w > app.power_off_threshold_w
+    app._evaluate_power_standby_wall = lambda: None
+    app._read_tv_power_w = lambda: app.power_w
+    return app
+
+
+class AppleTvConnectsWhenTheTvDrawsPower(unittest.TestCase):
+    def test_power_rise_connects_before_the_tv_reports_its_input(self):
+        app = booting_app()
+        app._on_relay_power_changed("sensor.p", "state", "3.6", "64.9", {})
+        self.assertEqual(app.service_calls, [CONNECT])
+        self.assertTrue(app._apple_tv_input_unconfirmed)
+
+    def test_power_already_above_threshold_does_not_retrigger(self):
+        app = booting_app()
+        app._on_relay_power_changed("sensor.p", "state", "70.0", "90.0", {})
+        self.assertEqual(app.service_calls, [])
+
+    def test_no_power_evidence_keeps_the_unknown_tv_unconnected(self):
+        app = booting_app()
+        app.power_w = 3.6
+        app._reconnect_apple_tv_if_needed("startup")
+        self.assertEqual(app.service_calls, [])
+
+    def test_first_reported_other_input_disconnects(self):
+        app = booting_app()
+        app._reconnect_apple_tv_if_needed("TV drawing power")
+        app.states.update({LOCAL_TV: "on", REMOTE: "on"})
+        app._on_tv_source_changed(LOCAL_TV, "source", None, "HDMI1", {})
+        self.assertEqual(app.service_calls, [CONNECT, DISCONNECT])
+        self.assertFalse(app._apple_tv_input_unconfirmed)
+
+    def test_native_app_without_an_input_disconnects(self):
+        app = booting_app()
+        app._reconnect_apple_tv_if_needed("TV drawing power")
+        app.states.update({LOCAL_TV: "on", REMOTE: "on"})
+        app._on_hisense_reported_on(LOCAL_TV, "state", "unavailable", "on", {})
+        self.assertEqual(app.service_calls, [CONNECT, DISCONNECT])
+
+    def test_apple_tv_input_keeps_the_early_connection(self):
+        app = booting_app()
+        app._reconnect_apple_tv_if_needed("TV drawing power")
+        app.states.update({LOCAL_TV: "on", REMOTE: "on"})
+        app._on_tv_source_changed(LOCAL_TV, "source", None, "HDMI2", {})
+        app._on_hisense_reported_on(LOCAL_TV, "state", "unavailable", "on", {})
+        self.assertEqual(app.service_calls, [CONNECT])
+        self.assertFalse(app._apple_tv_input_unconfirmed)
+
+    def test_a_later_input_change_after_confirmation_uses_the_normal_rule(self):
+        app = booting_app()
+        app._reconnect_apple_tv_if_needed("TV drawing power")
+        app.states.update({LOCAL_TV: "on", REMOTE: "on"})
+        app._on_tv_source_changed(LOCAL_TV, "source", None, "HDMI2", {})
+        app._on_hisense_reported_on(LOCAL_TV, "state", "off", "on", {})
+        self.assertEqual(app.service_calls, [CONNECT])
+
+    def test_elapsed_off_grace_does_not_cut_the_connection_while_the_tv_draws_power(self):
+        app = booting_app()
+        app._apple_tv_grace_elapsed = True
+        app._on_apple_tv_remote_connected(REMOTE, "state", "off", "on", {})
+        self.assertEqual(app.service_calls, [])
+
+    def test_managed_input_selection_owns_the_early_connection(self):
+        app = booting_app(**{SOURCE_SCRIPT: "on"})
+        app.source_selection_script_entity = SOURCE_SCRIPT
+        app._reconnect_apple_tv_if_needed("TV drawing power")
+        app.states.update({LOCAL_TV: "on", REMOTE: "on"})
+        app._on_tv_source_changed(LOCAL_TV, "source", None, "HDMI1", {})
+        self.assertEqual(app.service_calls, [CONNECT])
