@@ -21,6 +21,11 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
 
 import home_delivery as hd  # noqa: E402
 
+try:
+    import jinja2.sandbox
+except ImportError:
+    jinja2 = None
+
 NOW = datetime(2026, 11, 10, 16, 48, tzinfo=timezone.utc).timestamp()  # 17:48 in Copenhagen
 SENSOR = "sensor.home_delivery"
 KITCHEN = "Test Kitchen"
@@ -30,6 +35,14 @@ KITCHEN = "Test Kitchen"
 APPDAEMON_PRIVATE = {"_check_entity", "_check_service", "_config_model", "_create_helper", "_domain_service_call",
                      "_entity_service_call", "_get_namespace", "_log", "_logging", "_namespace",
                      "_notify_mobile_app", "_plugin", "_sub_stack", "_template_command"}
+
+
+def appdaemon_render_result(raw):
+    """What AppDaemon's render_template hands the app: the raw text, or its literal_eval when that parses."""
+    try:
+        return ast.literal_eval(raw)
+    except (SyntaxError, ValueError):
+        return raw
 
 
 def at(minutes=0, now=NOW):
@@ -158,6 +171,54 @@ class WoltDiscoveryTests(unittest.TestCase):
         states["sensor.wolt_order_test_kitchen_item_count"]["state"] = "-3"
         [d] = hd.wolt_deliveries(states)
         self.assertEqual((d.eta, d.item_count), (None, None))
+
+
+class WoltStatesTests(unittest.TestCase):
+    def test_the_marked_json_becomes_states_by_entity_id(self):
+        raw = "J" + json.dumps([{"entity_id": "sensor.wolt_a", "state": "x", "attributes": {"k": 1}},
+                                {"entity_id": "sensor.wolt_b", "state": "y", "attributes": {}}])
+        self.assertEqual(hd.wolt_states(raw), {"sensor.wolt_a": {"entity_id": "sensor.wolt_a", "state": "x", "attributes": {"k": 1}},
+                                              "sensor.wolt_b": {"entity_id": "sensor.wolt_b", "state": "y", "attributes": {}}})
+        self.assertEqual(hd.wolt_states("J[]"), {})
+
+    def test_malformed_items_are_skipped(self):
+        raw = "J" + json.dumps([None, 3, {"state": "x"}, {"entity_id": 4}, {"entity_id": "sensor.wolt_a", "state": "x"}])
+        self.assertEqual(list(hd.wolt_states(raw)), ["sensor.wolt_a"])
+
+    def test_anything_else_is_an_error(self):
+        for raw in (None, "", [], "[]", "J", "Jnot json", 'J{"a": 1', 7):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError):
+                    hd.wolt_states(raw)
+
+
+@unittest.skipIf(jinja2 is None, "jinja2 is not installed")
+class WoltSensorsTemplateTests(unittest.TestCase):
+    def render(self, sensors):
+        environment = jinja2.sandbox.SandboxedEnvironment()
+        environment.filters["to_json"] = json.dumps
+        fake = types.SimpleNamespace(sensor=[types.SimpleNamespace(entity_id=entity_id, state=value["state"],
+                                                                   attributes=value["attributes"])
+                                             for entity_id, value in sensors.items()])
+        return appdaemon_render_result(environment.from_string(hd.WOLT_SENSORS).render(states=fake))
+
+    def test_only_wolt_sensors_come_out_with_their_state_and_attributes(self):
+        sensors = {**wolt(courier=True, eta=at(8), items=3), "sensor.washer_state": {"state": "Off", "attributes": {}},
+                   "sensor.woltish": {"state": "1", "attributes": {}}}
+        out = hd.wolt_states(self.render(sensors))
+        self.assertEqual(set(out), {key for key in sensors if key.startswith("sensor.wolt_")})
+        tracking = out["sensor.wolt_delivery_test_kitchen"]
+        self.assertEqual((tracking["state"], tracking["attributes"]), ("unknown", sensors["sensor.wolt_delivery_test_kitchen"]["attributes"]))
+        self.assertEqual([d.stage for d in hd.wolt_deliveries(out)], ["on_the_way"])
+
+    def test_json_types_survive(self):
+        attributes = {"flag": True, "nothing": None, "list": [1, "a"], "number": 2.5}
+        out = hd.wolt_states(self.render({"sensor.wolt_x": {"state": "s", "attributes": attributes}}))
+        self.assertEqual(out["sensor.wolt_x"]["attributes"], attributes)
+
+    def test_appdaemon_leaves_even_an_empty_result_a_string(self):
+        self.assertEqual(self.render({}), "J[]")
+        self.assertEqual(hd.wolt_states(self.render({})), {})
 
 
 class NemligParseTests(unittest.TestCase):
@@ -536,18 +597,29 @@ class Harness:
         self.listened = []
         self.logs = []
         self.queue = []
+        self.unreadable = None
         self.app = hd.HomeDelivery.__new__(hd.HomeDelivery)
         self.app.args = args
         self.app.log = lambda message, level="INFO": self.logs.append((level, message))
         self.app.get_now = lambda: datetime.fromtimestamp(self.now, timezone.utc)
-        self.app.get_state = lambda entity=None, **kw: {key: copy.deepcopy(value) for key, value in self.states.items()
-                                                       if key.startswith(entity + ".")}
+        self.app.render_template = self.render_template
         self.app.set_state = lambda entity, state=None, attributes=None, replace=False: self.published.append(
             (entity, state, copy.deepcopy(attributes), replace))
         self.app.listen_state = lambda callback, entity, **kw: self.listened.append((entity, kw)) or "handle"
         self.app.run_every = lambda *a, **kw: "timer"
         self.app.submit_to_executor = lambda func, *a, callback=None: self.queue.append((func, a, callback))
         self.app.initialize()
+
+    def render_template(self, template):
+        if template != hd.WOLT_SENSORS:
+            raise AssertionError(template)
+        if self.unreadable == "raises":
+            raise RuntimeError("Home Assistant did not answer")
+        if self.unreadable == "nothing":
+            return None
+        items = [{"entity_id": key, **copy.deepcopy(value)} for key, value in self.states.items()
+                 if key.startswith("sensor.wolt_")]
+        return appdaemon_render_result("J" + json.dumps(items))
 
     @property
     def last(self):
@@ -650,6 +722,29 @@ class AppTests(unittest.TestCase):
         self.assertEqual(state, "2")
         self.assertEqual([e["title"] for e in attrs["deliveries"]], ["Pizza Test", KITCHEN])
         self.assertTrue(attrs["spoken"].endswith("There's one more after that."))
+
+    def test_unreadable_wolt_sensors_keep_the_last_read_and_warn_once(self):
+        h = Harness(wolt(courier=True, eta=at(2000)))
+        h.unreadable = "raises"
+        for _ in range(30):
+            h.tick(30)
+        self.assertEqual(h.last[0], "1")
+        warnings = [message for level, message in h.logs if level == "WARNING" and message.startswith("Wolt sensors unreadable")]
+        self.assertEqual(warnings, ["Wolt sensors unreadable, keeping the last read: RuntimeError"])
+        h.unreadable = None
+        h.states.update(wolt(status="delivered", kind="DELIVERED"))
+        h.tick(30)
+        self.assertEqual(h.last[0], "0")
+        self.assertEqual([message for _, message in h.logs if message == "Wolt sensors readable again"],
+                         ["Wolt sensors readable again"])
+
+    def test_a_template_that_answers_nothing_is_unreadable_too(self):
+        h = Harness(wolt(courier=True, eta=at(2000)))
+        h.unreadable = "nothing"
+        for _ in range(30):
+            h.tick(30)
+        self.assertEqual(h.last[0], "1")
+        self.assertIn(("WARNING", "Wolt sensors unreadable, keeping the last read: ValueError"), h.logs)
 
     def test_without_a_nemlig_login_only_wolt_is_tracked(self):
         h = Harness(wolt())

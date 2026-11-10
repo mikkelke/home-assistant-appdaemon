@@ -19,6 +19,7 @@ AppDaemon 4.5.13 drops None, False and 0 from set_state attributes at any depth 
 the state is published as a string and a missing key reads as null, 0 or false.
 """
 
+import json
 import math
 import re
 import time
@@ -42,6 +43,15 @@ COURIER_AFTER_S = 1800
 
 WOLT_DELIVERY = "sensor.wolt_delivery_"
 WOLT_ORDER = re.compile(r"sensor\.wolt_order_(.+?)_(estimated_arrival|item_count)(_\d+)?")
+# Asked of Home Assistant itself: AppDaemon 4.5.13's entity cache misses entities created after it started, and
+# Wait for Wolt creates new entities for every order. The J stops AppDaemon's render_template from
+# literal_eval-ing the JSON into a Python object.
+WOLT_SENSORS = (
+    "{% set ns = namespace(found=[]) %}"
+    "{% for s in states.sensor if s.entity_id.startswith('sensor.wolt_') %}"
+    "{% set ns.found = ns.found + [{'entity_id': s.entity_id, 'state': s.state, 'attributes': dict(s.attributes)}] %}"
+    "{% endfor %}J{{ ns.found | to_json }}"
+)
 
 NEMLIG_SITE = "https://www.nemlig.com"
 NEMLIG_FEATURED = "https://webapi.prod.knl.nemlig.it/productbff/api/web/orderHistory/orders/featured"
@@ -116,6 +126,14 @@ def flag(value):
 
 def local_day(at):
     return datetime.fromtimestamp(at, HOUSE_TZ).date()
+
+
+def wolt_states(rendered):
+    """Entity id -> {state, attributes} from the WOLT_SENSORS output; raises when it is anything else."""
+    if not isinstance(rendered, str) or not rendered.startswith("J"):
+        raise ValueError("unexpected template output")
+    return {item["entity_id"]: item for item in json.loads(rendered[1:])
+            if isinstance(item, dict) and isinstance(item.get("entity_id"), str)}
 
 
 def wolt_stage(attrs):
@@ -420,6 +438,8 @@ class HomeDelivery(hass.Hass):
         self._entity = args.get("entity", ENTITY)
         self._ledger = Ledger()
         self._listened = set()
+        self._wolt = {}
+        self._wolt_ok = True
         self._stages = {}
         self._nemlig = None
         self._nemlig_order = None
@@ -457,12 +477,21 @@ class HomeDelivery(hass.Hass):
         self.set_state(self._entity, state=str(published["state"]), attributes=published["attributes"], replace=True)
 
     def _read_wolt(self, now):
-        states = self.get_state("sensor") or {}
-        for entity_id in states:
+        try:
+            self._wolt = wolt_states(self.render_template(WOLT_SENSORS))
+        except Exception as error:
+            if self._wolt_ok:
+                self.log(f"Wolt sensors unreadable, keeping the last read: {type(error).__name__}", level="WARNING")
+            self._wolt_ok = False
+        else:
+            if not self._wolt_ok:
+                self.log("Wolt sensors readable again")
+            self._wolt_ok = True
+        for entity_id in self._wolt:
             if entity_id.startswith(WOLT_DELIVERY) and entity_id not in self._listened:
                 self._listened.add(entity_id)
                 self.listen_state(self._on_change, entity_id, attribute="all")
-        return wolt_deliveries(states)
+        return wolt_deliveries(self._wolt)
 
     def _read_nemlig(self, now):
         if now - self._nemlig_at > NEMLIG_MAX_AGE_S:
