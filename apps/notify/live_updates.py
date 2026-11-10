@@ -27,6 +27,11 @@ DELIVERY_APPS = {"wolt": "app://com.wolt.android", "nemlig": "app://com.nemlig",
 DELIVERY_ICONS = {"wolt": ("mdi:chef-hat", "mdi:moped"), "nemlig": ("mdi:cart", "mdi:truck-delivery")}
 PARCEL_CARRIERS = {"airmee": "Airmee", "postnord": "PostNord", "gls": "GLS"}
 PARCEL_ICON = "mdi:package-variant-closed"
+DELIVERY_KINDS = {"wolt": "food", "nemlig": "groceries", **dict.fromkeys(PARCEL_CARRIERS, "parcel")}
+STREET_DOORS = ("front door", "back door")
+COURIER_MESSAGE = "Probably the Wolt courier"
+COURIER_RING_WINDOW_S = 600
+COURIER_RING_KEEP_S = 3600
 DELIVERY_STAGES = {"preparing": "Preparing", "on_the_way": "On the way", "arriving": "Arriving"}
 ENTITIES = {"washer": "sensor.washer_state", "dryer": "sensor.dryer_state", "cook": "sensor.cook_state",
             "coffee": "sensor.coffee_state", "doorbell": "sensor.intercom_visit",
@@ -194,23 +199,38 @@ def coffee_card(full, now):
                 DASHBOARD_LINK_PREFIX + "coffee", end)
 
 
-def doorbell_cards(full, now, max_age_s=180):
+def fresh_visits(full, now, max_age_s):
+    """(door label, ring time) of each visit in sensor.intercom_visit that rang less than max_age_s ago."""
     if not isinstance(full, dict) or full.get("state") != "active":
-        return {}
+        return []
     visits = attributes(full).get("visits")
     if not isinstance(visits, list):
-        return {}
-    cards = {}
+        return []
+    found = []
     for visit in visits:
         if not isinstance(visit, dict):
             continue
         door = visit.get("door")
         at = epoch(visit.get("ring_at"))
-        if not isinstance(door, str) or door not in DOORS or at is None or not 0 <= now - at < max_age_s:
-            continue
+        if isinstance(door, str) and door in DOORS and at is not None and 0 <= now - at < max_age_s:
+            found.append((door, at))
+    return found
+
+
+def ring_key(at):
+    return str(int(at))
+
+
+def doorbell_cards(full, now, max_age_s=180, matched=()):
+    """One card per door for its latest fresh ring. A ring whose ring_key is in matched says it is probably the
+    Wolt courier instead of how long ago it rang."""
+    cards = {}
+    for door, at in fresh_visits(full, now, max_age_s):
         minutes = int((now - at) // 60)
         critical = f"{minutes} min" if minutes else "Now"
         message = f"Rang {minutes} min ago" if minutes else "Someone is at the door"
+        if ring_key(at) in matched:
+            message = COURIER_MESSAGE
         tag = "live_doorbell_" + DOORS[door]
         card = Card(tag, f"Doorbell · {door}", message, critical, "mdi:bell-ring",
                     DASHBOARD_LINK_PREFIX + f"now=ring-{int(at)}")
@@ -292,10 +312,13 @@ def delivery_entries(full):
     return [value for value in values if isinstance(value, dict)] if isinstance(values, list) else []
 
 
-def delivery_cards(full, now):
-    """One card per source: its first delivery that has a card, the sensor having sorted them by arrival."""
+def delivery_cards(full, now, handed_over=()):
+    """One card per source: its first delivery that has a card, the sensor having sorted them by arrival. An order
+    in handed_over has gone to the doorbell card and gets none."""
     cards = {}
     for delivery in delivery_entries(full):
+        if delivery.get("id") in handed_over:
+            continue
         card = delivery_card(delivery, now)
         if card is not None and card.tag not in cards:
             cards[card.tag] = card
@@ -303,8 +326,34 @@ def delivery_cards(full, now):
 
 
 def cancelled_deliveries(full):
-    return [(delivery["id"], delivery_title(delivery)) for delivery in delivery_entries(full)
+    """(id, card title, kind) of every cancelled delivery."""
+    return [(delivery["id"], delivery_title(delivery), DELIVERY_KINDS.get(delivery.get("source")))
+            for delivery in delivery_entries(full)
             if delivery.get("stage") == "cancelled" and isinstance(delivery.get("id"), str)]
+
+
+def matched_rings(previous, doorbell, delivery, now, max_age_s):
+    """Street-door rings that came while a food courier was expected, as {ring_key: id of the food order that was
+    next, or ""}. A ring is matched the first time it is seen with food expected and stays matched, so a card never
+    flips back; a matched ring is forgotten after COURIER_RING_KEEP_S."""
+    rings = {}
+    for key, order in (previous.items() if isinstance(previous, dict) else ()):
+        at = number(key)
+        if at is not None and isinstance(order, str) and now - at < COURIER_RING_KEEP_S:
+            rings[key] = order
+    attrs = attributes(delivery)
+    if not unavailable(delivery) and attrs.get("food_courier_expected") is True:
+        food = attrs.get("next_food")
+        order = food.get("id") if isinstance(food, dict) and isinstance(food.get("id"), str) else ""
+        for door, at in fresh_visits(doorbell, now, max_age_s):
+            if door in STREET_DOORS:
+                rings.setdefault(ring_key(at), order)
+    return rings
+
+
+def apartment_ring_matched(rings, at):
+    """An apartment ring up to COURIER_RING_WINDOW_S after a matched street-door ring is the same courier."""
+    return at is not None and any(0 <= at - number(key) <= COURIER_RING_WINDOW_S for key in rings)
 
 
 def laundry_audience(previous, cycle, starter, enabled, home, now=None):
@@ -363,7 +412,9 @@ class LiveUpdates(hass.Hass):
         args = self.args
         self.enabled_people = people(args.get("enabled_people", ["mikkel"]))
         self.source_people = {source: people(args.get(source + "_people", ["mikkel"]))
-                              for source in ("cook", "coffee", "doorbell", "delivery")}
+                              for source in ("cook", "coffee", "doorbell")}
+        self.delivery_people = {kind: people(args.get(f"delivery_{kind}_people", ["mikkel"]))
+                                for kind in ("food", "groceries", "parcel")}
         self.entities = {source: args.get(source + "_entity", entity) for source, entity in ENTITIES.items()}
         self.channel = args.get("channel", "Live updates")
         self.stale_limit_s = max(0, number(args.get("stale_limit_s", 600)) or 0)
@@ -392,6 +443,7 @@ class LiveUpdates(hass.Hass):
                 "sources": value.get("sources") if isinstance(value.get("sources"), dict) else {},
                 "deliveries": value.get("deliveries") if isinstance(value.get("deliveries"), dict) else {},
                 "delivery_ends": value.get("delivery_ends") if isinstance(value.get("delivery_ends"), dict) else {},
+                "courier_rings": value.get("courier_rings") if isinstance(value.get("courier_rings"), dict) else {},
                 "apartment_ring_at": epoch(value.get("apartment_ring_at"))}
 
     def _save(self):
@@ -423,6 +475,11 @@ class LiveUpdates(hass.Hass):
             if isinstance(values, (list, tuple)):
                 services.extend(service for service in values if isinstance(service, str) and service)
         return list(dict.fromkeys(services))
+
+    def _audience(self, source, tag):
+        if source == "delivery":
+            return self.delivery_people.get(DELIVERY_KINDS.get(tag.removeprefix("live_delivery_")), [])
+        return self.source_people[source]
 
     async def _read(self, entity):
         try:
@@ -482,10 +539,14 @@ class LiveUpdates(hass.Hass):
                 audience = people(previous.get("people")) if isinstance(previous, dict) else []
                 for tag, card in cards.items():
                     desired[tag] = (card, self._services(audience))
+            rings = matched_rings(self._state["courier_rings"], full["doorbell"], full["delivery"], now,
+                                  self.doorbell_max_s)
+            self._state["courier_rings"] = rings
             source_cards = {"cook": cook_cards(full["cook"], now),
                             "coffee": {"live_coffee": coffee_card(full["coffee"], now)},
-                            "doorbell": doorbell_cards(full["doorbell"], now, self.doorbell_max_s),
-                            "delivery": delivery_cards(full["delivery"], now)}
+                            "doorbell": doorbell_cards(full["doorbell"], now, self.doorbell_max_s, rings),
+                            "delivery": delivery_cards(full["delivery"], now,
+                                                       {order for order in rings.values() if order})}
             source_cards["coffee"] = {tag: card for tag, card in source_cards["coffee"].items() if card}
             for source, cards in source_cards.items():
                 cards = self._retained(source, full[source], cards, now)
@@ -495,7 +556,7 @@ class LiveUpdates(hass.Hass):
                         at = epoch(card.link.rsplit("-", 1)[-1])
                         if at is None or now - at >= self.doorbell_max_s:
                             continue
-                    desired[tag] = (card, self._services(self.source_people[source]))
+                    desired[tag] = (card, self._services(self._audience(source, tag)))
             apartment = full["apartment"]
             if isinstance(apartment, dict) and apartment.get("state") == "on":
                 at = epoch(apartment.get("last_changed"))
@@ -503,7 +564,8 @@ class LiveUpdates(hass.Hass):
                     self._state["apartment_ring_at"] = max(at, self._state.get("apartment_ring_at") or at)
             ring_at = self._state.get("apartment_ring_at")
             virtual = {"state": "active", "attributes": {"visits": [{"door": "apartment door", "ring_at": ring_at}]}}
-            cards = doorbell_cards(virtual, now, self.doorbell_max_s)
+            matched = {ring_key(ring_at): ""} if apartment_ring_matched(rings, ring_at) else {}
+            cards = doorbell_cards(virtual, now, self.doorbell_max_s, matched)
             cards = self._retained("apartment", apartment, cards, now)
             for tag, card in cards.items():
                 if ring_at is not None and 0 <= now - ring_at < self.doorbell_max_s:
@@ -552,15 +614,15 @@ class LiveUpdates(hass.Hass):
     async def _announce_cancelled(self, full, now):
         """A cancelled delivery gets one real push, retried once a minute until it reaches someone."""
         ends = self._state["delivery_ends"]
-        people = [person for person in self.source_people["delivery"] if person in self.enabled_people]
-        for delivery_id, title in cancelled_deliveries(full):
+        for delivery_id, title, kind in cancelled_deliveries(full):
+            audience = [person for person in self.delivery_people.get(kind, []) if person in self.enabled_people]
             record = ends.get(delivery_id)
             record = record if isinstance(record, dict) else {}
-            if record.get("sent") or not people or now - (number(record.get("attempt_at")) or 0) < SEND_INTERVAL_S:
+            if record.get("sent") or not audience or now - (number(record.get("attempt_at")) or 0) < SEND_INTERVAL_S:
                 continue
             record["attempt_at"] = now
             ends[delivery_id] = record
-            record["sent"] = bool(await self._notifier.notify(title=title, message="Order cancelled", target=people,
+            record["sent"] = bool(await self._notifier.notify(title=title, message="Order cancelled", target=audience,
                                                               category="delivery", data={"tag": "delivery_end"}))
         for delivery_id in [key for key, record in ends.items()
                             if not isinstance(record, dict) or now - (number(record.get("attempt_at")) or 0) > 86400]:

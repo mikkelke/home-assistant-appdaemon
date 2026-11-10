@@ -1,6 +1,9 @@
 """Delivery cards read sensor.home_delivery only: one card per source (Wolt, Nemlig, each parcel carrier),
-cleared on delivery, one push on a cancel and none for parcels."""
+cleared on delivery, one push on a cancel and none for parcels. Only food reaches Kristine, and the first
+street ring while a Wolt courier is due turns the Wolt card into the doorbell's courier message."""
 
+import json
+import re
 import sys
 import tempfile
 import unittest
@@ -9,12 +12,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_live_updates import ENTITIES, HOUSE, NOW, TAGS, Harness, full  # noqa: E402
+from test_live_updates import ENTITIES, HOUSE, NOW, TAGS, Harness, full, iso, visit  # noqa: E402
 
 import live_updates as lu  # noqa: E402
 
 WOLT, NEMLIG = TAGS["wolt"], TAGS["nemlig"]
 AIRMEE, POSTNORD, GLS = TAGS["airmee"], TAGS["postnord"], TAGS["gls"]
+FRONT, BACK, APARTMENT = TAGS["front"], TAGS["back"], TAGS["apartment"]
+YALE_DING = "binary_sensor.yale_doorbell_ding"
+COURIER = "Probably the Wolt courier"
+SHIPPED = Path(__file__).resolve().parents[1] / "live_updates.yaml"
 KRISTINE = "notify/mobile_app_kristine_iphone_2"
 MIKKEL = "notify/mobile_app_mikkels_ofx9p"
 KITCHEN = "Test Kitchen"
@@ -43,6 +50,27 @@ def parcel_entry(source="postnord", stage="on_the_way", eta=None, start=None, en
 def sensor(*entries):
     active = [e for e in entries if e["stage"] in ("preparing", "on_the_way", "arriving")]
     return full(str(len(active)), {"deliveries": list(entries), "next": active[0] if active else None})
+
+
+def shipped_audiences():
+    """The delivery_*_people lines of the shipped live_updates.yaml, read without PyYAML."""
+    found = {}
+    for line in SHIPPED.read_text().splitlines():
+        match = re.match(r"\s+(delivery_\w+_people):\s*\[([^\]]*)\]", line)
+        if match:
+            found[match.group(1)] = [name.strip() for name in match.group(2).split(",") if name.strip()]
+    return found
+
+
+def expecting(*entries, due=True):
+    """sensor(...) as HomeDelivery publishes it: while a Wolt courier is due it adds food_courier_expected,
+    otherwise the key is absent; next_food is the first active food entry."""
+    state = sensor(*entries)
+    food = [e for e in entries if e["kind"] == "food" and e["stage"] in ("preparing", "on_the_way", "arriving")]
+    state["attributes"]["next_food"] = food[0] if food else None
+    if due:
+        state["attributes"]["food_courier_expected"] = True
+    return state
 
 
 def card(**kw):
@@ -234,7 +262,9 @@ class SelectionTests(unittest.TestCase):
 
     def test_cancelled_deliveries_are_listed_with_their_card_title(self):
         state = sensor(entry(stage="cancelled"), entry(title="Pizza Test"), entry("nemlig", stage="delivered"))
-        self.assertEqual(lu.cancelled_deliveries(state), [("wolt:test_kitchen", f"Wolt · {KITCHEN}")])
+        self.assertEqual(lu.cancelled_deliveries(state), [("wolt:test_kitchen", f"Wolt · {KITCHEN}", "food")])
+        self.assertEqual(lu.cancelled_deliveries(sensor(entry("nemlig", stage="cancelled"))),
+                         [("nemlig:test_kitchen", "Nemlig", "groceries")])
 
 
 class DeliveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -247,7 +277,7 @@ class DeliveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         return await Harness(self.path, **kwargs).initialize()
 
     async def test_a_wolt_order_gets_its_card_on_mikkels_phone_and_only_there_until_kristine_is_enabled(self):
-        h = await self.make(delivery_people=["mikkel", "kristine"], states={ENTITIES["delivery"]: sensor(entry())})
+        h = await self.make(delivery_food_people=["mikkel", "kristine"], states={ENTITIES["delivery"]: sensor(entry())})
         [(service, payload)] = h.ongoing(WOLT)
         self.assertEqual(service, MIKKEL)
         self.assertEqual(payload["data"]["when"], 480)
@@ -255,7 +285,7 @@ class DeliveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_enabled_kristine_gets_the_same_card_but_only_when_listed(self):
         state = {ENTITIES["delivery"]: sensor(entry())}
-        h = await self.make(enabled=["mikkel", "kristine"], delivery_people=["mikkel", "kristine"], states=state)
+        h = await self.make(enabled=["mikkel", "kristine"], delivery_food_people=["mikkel", "kristine"], states=state)
         self.assertEqual({s for s, _ in h.ongoing(WOLT)}, {MIKKEL, KRISTINE})
         h = await Harness(Path(self.temp.name) / "other.json", enabled=["mikkel", "kristine"], states=state).initialize()
         self.assertEqual([s for s, _ in h.ongoing(WOLT)], [MIKKEL])
@@ -282,7 +312,7 @@ class DeliveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         h.notify.assert_not_awaited()
 
     async def test_a_cancelled_order_clears_its_card_and_pushes_once(self):
-        h = await self.make(delivery_people=["mikkel", "kristine"],
+        h = await self.make(delivery_food_people=["mikkel", "kristine"],
                             states={ENTITIES["delivery"]: sensor(entry(stage="preparing"))})
         h.forget_calls()
         h.states[ENTITIES["delivery"]] = sensor(entry(stage="cancelled", eta=None))
@@ -295,10 +325,10 @@ class DeliveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(h.notify.await_count, 1)
 
     async def test_the_cancel_push_follows_the_card_audience(self):
-        h = await self.make(enabled=["mikkel", "kristine"], delivery_people=["kristine"],
+        h = await self.make(enabled=["mikkel", "kristine"], delivery_food_people=["kristine"],
                             states={ENTITIES["delivery"]: sensor(entry(stage="cancelled", eta=None))})
         self.assertEqual(h.notify.await_args.kwargs["target"], ["kristine"])
-        h = await Harness(Path(self.temp.name) / "none.json", enabled=["mikkel"], delivery_people=["kristine"],
+        h = await Harness(Path(self.temp.name) / "none.json", enabled=["mikkel"], delivery_food_people=["kristine"],
                           states={ENTITIES["delivery"]: sensor(entry(stage="cancelled", eta=None))}).initialize()
         h.notify.assert_not_awaited()
 
@@ -336,8 +366,7 @@ class DeliveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(h.app._state["delivery_ends"], {})
 
     async def test_a_parcel_gets_a_card_on_mikkels_phone_and_never_a_push(self):
-        h = await self.make(delivery_people=["mikkel", "kristine"],
-                            states={ENTITIES["delivery"]: sensor(parcel_entry(eta=NOW + 1800))})
+        h = await self.make(states={ENTITIES["delivery"]: sensor(parcel_entry(eta=NOW + 1800))})
         [(service, payload)] = h.ongoing(POSTNORD)
         self.assertEqual((service, payload["title"], payload["message"]), (MIKKEL, "PostNord", "Out for delivery · 13:30"))
         self.assertEqual(payload["data"]["when"], 1800)
@@ -398,6 +427,236 @@ class DeliveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         h.states[ENTITIES["delivery"]] = sensor(entry(eta=NOW + 720))
         await h.reconcile(60)
         self.assertEqual(len(h.ongoing(WOLT)), 1)
+
+
+class AudienceTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+
+    def path(self, name):
+        return Path(self.temp.name) / f"{name}.json"
+
+    def test_the_shipped_audiences_are_food_to_mikkel_and_kristine_and_the_rest_to_mikkel(self):
+        self.assertEqual(shipped_audiences(), {"delivery_food_people": ["mikkel", "kristine"],
+                                               "delivery_groceries_people": ["mikkel"],
+                                               "delivery_parcel_people": ["mikkel"]})
+
+    async def test_enabling_kristine_gives_her_wolt_cards_but_never_nemlig_or_parcel_cards(self):
+        everything = sensor(entry(eta=NOW + 300), entry("nemlig", eta=NOW + 1200), parcel_entry("airmee", eta=NOW + 900),
+                            parcel_entry("postnord", eta=NOW + 900), parcel_entry("gls", stage="arriving"))
+        h = await Harness(self.path("both"), enabled=["mikkel", "kristine"], states={ENTITIES["delivery"]: everything},
+                          **shipped_audiences()).initialize()
+        reached = {}
+        for service, payload in h.ongoing():
+            reached.setdefault(service, set()).add(payload["data"]["tag"])
+        self.assertEqual(reached, {MIKKEL: {WOLT, NEMLIG, AIRMEE, POSTNORD, GLS}, KRISTINE: {WOLT}})
+
+    async def test_while_kristine_is_not_enabled_only_mikkel_gets_any_card(self):
+        everything = sensor(entry(eta=NOW + 300), entry("nemlig", eta=NOW + 1200), parcel_entry(eta=NOW + 900))
+        h = await Harness(self.path("one"), states={ENTITIES["delivery"]: everything}, **shipped_audiences()).initialize()
+        self.assertEqual({service for service, _ in h.ongoing()}, {MIKKEL})
+
+    async def test_every_kind_has_its_own_audience(self):
+        everything = sensor(entry(eta=NOW + 300), entry("nemlig", eta=NOW + 1200), parcel_entry(eta=NOW + 900))
+        h = await Harness(self.path("kinds"), enabled=["mikkel", "kristine"], states={ENTITIES["delivery"]: everything},
+                          delivery_food_people=["mikkel"], delivery_groceries_people=["kristine"],
+                          delivery_parcel_people=[]).initialize()
+        self.assertEqual({tag: {s for s, p in h.ongoing(tag)} for tag in (WOLT, NEMLIG, POSTNORD)},
+                         {WOLT: {MIKKEL}, NEMLIG: {KRISTINE}, POSTNORD: set()})
+
+    async def test_the_shipped_cancel_push_reaches_kristine_only_for_wolt(self):
+        for order, target in ((entry(stage="cancelled", eta=None), ["mikkel", "kristine"]),
+                              (entry("nemlig", stage="cancelled", eta=None), ["mikkel"])):
+            with self.subTest(source=order["source"]):
+                h = await Harness(self.path(order["source"]), enabled=["mikkel", "kristine"],
+                                  states={ENTITIES["delivery"]: sensor(order)}, **shipped_audiences()).initialize()
+                self.assertEqual(h.notify.await_args.kwargs["target"], target)
+
+
+class MatchedRingTests(unittest.TestCase):
+    def rings(self, previous=None, delivery=None, doorbell=None, now=NOW):
+        return lu.matched_rings(previous, doorbell or visit(), expecting(entry()) if delivery is None else delivery, now, 180)
+
+    def test_a_street_ring_while_food_is_due_is_matched_to_the_next_food_order(self):
+        self.assertEqual(self.rings(), {str(int(NOW)): "wolt:test_kitchen"})
+        self.assertEqual(self.rings(doorbell=visit(door="back door")), {str(int(NOW)): "wolt:test_kitchen"})
+
+    def test_the_apartment_door_never_matches_by_itself(self):
+        self.assertEqual(self.rings(doorbell=visit(door="apartment door")), {})
+
+    def test_nothing_matches_without_a_due_food_courier(self):
+        for delivery in (sensor(entry()), expecting(entry(), due=False), full("unavailable"), full("1", {"food_courier_expected": "true"})):
+            with self.subTest(delivery=delivery):
+                self.assertEqual(self.rings(delivery=delivery), {})
+        self.assertEqual(lu.matched_rings({}, visit(), None, NOW, 180), {})
+
+    def test_only_a_fresh_ring_is_matched(self):
+        self.assertEqual(self.rings(now=NOW + 179), {str(int(NOW)): "wolt:test_kitchen"})
+        self.assertEqual(self.rings(now=NOW + 180), {})
+
+    def test_a_match_stays_with_its_first_order_when_the_sensor_moves_on(self):
+        first = self.rings()
+        self.assertEqual(self.rings(previous=first, delivery=expecting(entry(title="Pizza Test")), now=NOW + 30), first)
+
+    def test_a_match_without_an_order_hands_nothing_over(self):
+        state = expecting(entry())
+        state["attributes"]["next_food"] = None
+        self.assertEqual(self.rings(delivery=state), {str(int(NOW)): ""})
+
+    def test_a_match_is_forgotten_after_an_hour_and_damaged_ones_are_dropped(self):
+        old = {str(int(NOW)): "wolt:a"}
+        self.assertEqual(self.rings(previous=old, delivery=sensor(), now=NOW + 3599), old)
+        self.assertEqual(self.rings(previous=old, delivery=sensor(), now=NOW + 3600), {})
+        for bad in (None, [], "x", {"x": "wolt:a"}, {str(int(NOW)): None}, {"nan": "wolt:a"}, {"inf": "wolt:a"}):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.rings(previous=bad, delivery=sensor()), {})
+
+    def test_an_apartment_ring_matches_up_to_ten_minutes_after_a_matched_street_ring(self):
+        rings = {str(int(NOW)): ""}
+        for offset, matched in ((0, True), (600, True), (601, False), (-1, False)):
+            with self.subTest(offset=offset):
+                self.assertEqual(lu.apartment_ring_matched(rings, NOW + offset), matched)
+        self.assertFalse(lu.apartment_ring_matched(rings, None))
+        self.assertFalse(lu.apartment_ring_matched({}, NOW))
+
+    def test_only_the_matched_ring_gets_the_courier_message(self):
+        state = full("active", {"visits": [{"door": "front door", "ring_at": iso(NOW)},
+                                           {"door": "back door", "ring_at": iso(NOW + 1)}]})
+        cards = lu.doorbell_cards(state, NOW + 1, 180, {str(int(NOW)): ""})
+        self.assertEqual((cards[FRONT].message, cards[BACK].message), (COURIER, "Someone is at the door"))
+        plain = lu.doorbell_cards(state, NOW + 1, 180)
+        self.assertEqual({tag: (card.title, card.critical_text, card.link, card.icon) for tag, card in cards.items()},
+                         {tag: (card.title, card.critical_text, card.link, card.icon) for tag, card in plain.items()})
+
+
+class CourierHandoverTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "state.json"
+
+    async def make(self, **kwargs):
+        return await Harness(self.path, **kwargs).initialize()
+
+    async def test_a_street_ring_while_food_is_due_says_probably_the_wolt_courier(self):
+        for door, tag in (("front door", FRONT), ("back door", BACK)):
+            with self.subTest(door=door):
+                h = await Harness(Path(self.temp.name) / f"{tag}.json", states={
+                    ENTITIES["delivery"]: expecting(entry()), ENTITIES["doorbell"]: visit(door=door)}).initialize()
+                [(service, payload)] = h.ongoing(tag)
+                self.assertEqual((service, payload["title"], payload["message"]), (MIKKEL, f"Doorbell · {door}", COURIER))
+                self.assertEqual((payload["data"]["critical_text"], payload["data"]["clickAction"]),
+                                 ("Now", f"/dashboard-rooftop/home#now=ring-{int(NOW)}"))
+
+    async def test_a_ring_with_no_food_courier_due_keeps_the_usual_wording(self):
+        cases = {"no order": sensor(), "food not due": expecting(entry(eta=NOW + 3600), due=False),
+                 "a parcel is out": sensor(parcel_entry(eta=NOW + 600)),
+                 "nemlig is out": sensor(entry("nemlig", eta=NOW + 600)), "sensor unavailable": full("unavailable")}
+        for name, delivery in cases.items():
+            with self.subTest(name):
+                h = await Harness(Path(self.temp.name) / f"{name}.json",
+                                  states={ENTITIES["delivery"]: delivery, ENTITIES["doorbell"]: visit()}).initialize()
+                [(_, payload)] = h.ongoing(FRONT)
+                self.assertEqual(payload["message"], "Someone is at the door")
+                h.forget_calls()
+                await h.reconcile(60)
+                self.assertEqual(h.ongoing(FRONT)[0][1]["message"], "Rang 1 min ago")
+                self.assertEqual(h.app._state["courier_rings"], {})
+
+    async def test_the_match_sticks_after_the_order_is_delivered(self):
+        h = await self.make(states={ENTITIES["delivery"]: expecting(entry()), ENTITIES["doorbell"]: visit()})
+        h.forget_calls()
+        h.states[ENTITIES["delivery"]] = sensor(entry(stage="delivered", eta=None))
+        await h.reconcile(60)
+        [(_, payload)] = h.ongoing(FRONT)
+        self.assertEqual((payload["message"], payload["data"]["critical_text"]), (COURIER, "1 min"))
+
+    async def test_a_reload_keeps_the_match_and_the_hand_over(self):
+        h = await self.make(states={ENTITIES["delivery"]: expecting(entry(eta=NOW + 480)), ENTITIES["doorbell"]: visit()})
+        self.assertEqual(json.loads(self.path.read_text())["courier_rings"], {str(int(NOW)): "wolt:test_kitchen"})
+        states = {**h.states, ENTITIES["delivery"]: sensor(entry(eta=NOW + 480))}
+        restored = await Harness(self.path, states=states, now=NOW + 30).initialize()
+        self.assertEqual(restored.ongoing(), [])
+        await restored.reconcile(60)
+        self.assertEqual([payload["message"] for _, payload in restored.ongoing(FRONT)], [COURIER])
+        self.assertEqual(restored.ongoing(WOLT), [])
+
+    async def test_the_first_matched_ring_takes_that_orders_wolt_card_away_for_good(self):
+        h = await self.make(states={ENTITIES["delivery"]: sensor(entry(eta=NOW + 480))})
+        self.assertEqual(len(h.ongoing(WOLT)), 1)
+        h.forget_calls()
+        h.states[ENTITIES["delivery"]] = expecting(entry(eta=NOW + 480))
+        h.states[ENTITIES["doorbell"]] = visit(at=NOW + 60)
+        await h.reconcile(60)
+        self.assertEqual(len(h.clears(WOLT)), 1)
+        self.assertEqual([payload["message"] for _, payload in h.ongoing(FRONT)], [COURIER])
+        h.forget_calls()
+        for seconds in (10, 60, 300, 1800):
+            await h.reconcile(seconds)
+        self.assertEqual((h.ongoing(WOLT), h.clears(WOLT)), ([], []))
+        restored = await Harness(self.path, states=h.states, now=h.now).initialize()
+        self.assertEqual(restored.ongoing(WOLT), [])
+
+    async def test_another_wolt_order_keeps_the_wolt_card_after_the_hand_over(self):
+        pizza, other = entry(title="Pizza Test", eta=NOW + 300), entry(title=KITCHEN, eta=NOW + 1500)
+        h = await self.make(states={ENTITIES["delivery"]: sensor(pizza, other)})
+        self.assertEqual(h.ongoing(WOLT)[0][1]["title"], "Wolt · Pizza Test")
+        h.forget_calls()
+        h.states[ENTITIES["delivery"]] = expecting(pizza, other)
+        h.states[ENTITIES["doorbell"]] = visit(at=NOW + 60)
+        await h.reconcile(60)
+        [(_, payload)] = h.ongoing(WOLT)
+        self.assertEqual(payload["title"], f"Wolt · {KITCHEN}")
+        self.assertEqual(h.clears(WOLT), [])
+
+    async def test_a_ring_that_matched_no_order_hands_no_card_over(self):
+        h = await self.make(states={ENTITIES["delivery"]: sensor(entry(eta=NOW + 480))})
+        state = expecting(entry(eta=NOW + 480))
+        state["attributes"]["next_food"] = None
+        h.forget_calls()
+        h.states[ENTITIES["delivery"]] = state
+        h.states[ENTITIES["doorbell"]] = visit(at=NOW + 60)
+        await h.reconcile(60)
+        self.assertEqual([payload["message"] for _, payload in h.ongoing(FRONT)], [COURIER])
+        self.assertEqual(h.clears(WOLT), [])
+
+    async def test_a_food_ring_leaves_nemlig_and_parcel_cards_alone(self):
+        state = expecting(entry(eta=NOW + 300), entry("nemlig", eta=NOW + 1200), parcel_entry(eta=NOW + 900))
+        h = await self.make(states={ENTITIES["delivery"]: state, ENTITIES["doorbell"]: visit()})
+        self.assertEqual([len(h.ongoing(tag)) for tag in (WOLT, NEMLIG, POSTNORD, FRONT)], [0, 1, 1, 1])
+
+    async def test_an_apartment_ring_soon_after_a_matched_street_ring_is_the_same_courier(self):
+        h = await self.make(states={ENTITIES["delivery"]: expecting(entry()), ENTITIES["doorbell"]: visit()})
+        h.forget_calls()
+        h.states[YALE_DING] = full("on", at=NOW + 90)
+        await h.reconcile(90)
+        [(service, payload)] = h.ongoing(APARTMENT)
+        self.assertEqual((service, payload["title"], payload["message"]), (MIKKEL, "Doorbell · apartment door", COURIER))
+
+    async def test_an_apartment_ring_with_no_matched_street_ring_before_it_keeps_the_usual_wording(self):
+        cases = {"no street ring": (expecting(entry()), None, 0), "street ring unmatched": (sensor(entry()), visit(), 90),
+                 "ten minutes and a second later": (expecting(entry()), visit(), 601)}
+        for name, (delivery, street, later) in cases.items():
+            with self.subTest(name):
+                states = {ENTITIES["delivery"]: delivery}
+                if street:
+                    states[ENTITIES["doorbell"]] = street
+                h = await Harness(Path(self.temp.name) / f"{name}.json", states=states).initialize()
+                h.states[YALE_DING] = full("on", at=NOW + later)
+                await h.reconcile(later)
+                [(_, payload)] = h.ongoing(APARTMENT)
+                self.assertEqual(payload["message"], "Someone is at the door")
+
+    async def test_damaged_saved_matches_are_dropped_without_a_crash(self):
+        self.path.write_text(json.dumps({"version": 1, "courier_rings": {
+            "x": "wolt:a", str(int(NOW) - 4000): "wolt:old", str(int(NOW)): 5, str(int(NOW) - 10): "wolt:kept"}}))
+        h = await self.make()
+        self.assertEqual(h.app._state["courier_rings"], {str(int(NOW) - 10): "wolt:kept"})
+        other = Path(self.temp.name) / "other.json"
+        other.write_text(json.dumps({"version": 1, "courier_rings": ["x"]}))
+        h = await Harness(other).initialize()
+        self.assertEqual(h.app._state["courier_rings"], {})
 
 
 if __name__ == "__main__":

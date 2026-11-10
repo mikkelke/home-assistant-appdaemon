@@ -33,10 +33,16 @@ LiveUpdates:
 
   # HomeDelivery's sensor.home_delivery: one card per source (Wolt, Nemlig, and the parcel carriers Airmee,
   # PostNord, GLS) for its next active delivery, cleared when delivered. A parcel has a card only while it is
-  # out for delivery. A cancelled delivery also sends one real push through MobileNotifier, category
-  # delivery. Kristine orders on Mikkel's Wolt account; she gets these once she is in enabled_people.
+  # out for delivery. A cancelled Wolt order also sends one real push through MobileNotifier, category
+  # delivery. Only food concerns the household: Kristine orders on Mikkel's Wolt account, while Nemlig and
+  # parcels are Mikkel's own errands. Each audience is cut down to enabled_people, so Kristine gets Wolt
+  # cards (and the cancel push) once she is listed there, and never a Nemlig or parcel card.
+  # The first street-door ring while a Wolt courier is due changes the doorbell card's message to
+  # "Probably the Wolt courier" and takes that order's Wolt card away, since the courier is here.
   delivery_entity: sensor.home_delivery
-  delivery_people: [mikkel, kristine]
+  delivery_food_people: [mikkel, kristine]
+  delivery_groceries_people: [mikkel]
+  delivery_parcel_people: [mikkel]
 
   # Unknown/unavailable sources retain their last card for this long. Doorbells also obey their
   # shorter hard maximum. Source recovery resumes reconciliation; an explicit end clears at once.
