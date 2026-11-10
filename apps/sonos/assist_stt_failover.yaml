@@ -1,0 +1,27 @@
+# AssistSttFailover - keeps the Assist pipeline's speech-to-text on primary_entity (the Wyoming
+# server on the GPU box) while that server answers, and on fallback_entity (the local server)
+# while it does not. See assist_stt_failover.py for how health is decided.
+#
+# The app rewrites stt_engine of pipeline_id and nothing else. To pin an engine by hand, disable
+# the app first; an engine other than the two below is never touched.
+AssistSttFailover:
+  module: assist_stt_failover
+  class: AssistSttFailover
+  log: sonos_log
+
+  pipeline_id: 01hjvht94y4d2br354snxvydy7
+  primary_entity: stt.acer_stt
+  fallback_entity: stt.faster_whisper
+
+  # Wyoming address of the primary server. The host lives in the box's secrets.yaml.
+  primary_host: !secret acer_stt_host
+  primary_port: 10300
+  language: en
+
+  # A probe every interval_s must return a transcript within probe_timeout_s (faster than the
+  # local server answers a real utterance). down_after failures in a row switch to the fallback,
+  # up_after successes in a row switch back.
+  interval_s: 10
+  probe_timeout_s: 2
+  down_after: 2
+  up_after: 3
