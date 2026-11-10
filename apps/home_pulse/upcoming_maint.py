@@ -3,8 +3,8 @@ inventory (the appliances' run-based rows are upcoming_runs). Pure: each step ta
 state and `now` and returns new state.
 
 Battery rules, per model in house_upcoming.yaml:
-    low: N        a reading at or below N, held for HOLD, opens the condition; with days: K it
-                  opens once K house days in a row had such a reading
+    low: N        a reading at or below N, held for HOLD, opens the condition; with days: K a
+                  reading at or below N opens it once K house days in a row had such a reading
     drop: N       a reading N points or more below the highest reading of the current cells,
                   held for HOLD
     neither       offline only
@@ -219,7 +219,7 @@ def _step_low(st, model, value, now):
             today = house_date(now).isoformat()
             if value <= low:
                 st["low_days"] = sorted(set(st.get("low_days", [])) | {today})[-LOW_DAYS_KEEP:]
-            opens = _run_ending(st.get("low_days", []), today) >= model["days"]
+            opens = value <= low and _run_ending(st.get("low_days", []), today) >= model["days"]
         else:
             opens = _held(st, "low_from", value <= low, now)
         if opens:

@@ -27,6 +27,7 @@ SNZB = model(cell="CR2477", action="replace", low=20)
 WS90 = model(cell="2x AA", action="replace", low=20, days=2)
 BLIND = model(action="charge", low=25)
 YALE = model(cell="lithium AA (rechargeable)", action="recharge", drop=15, trend=False)
+ZG204ZM = model(cell="LADDA AAA NiMH", action="recharge", low=35, days=2, trend=False)
 PARASOLL = model(cell="1x LADDA AAA NiMH", action="recharge", trend=False)
 SALUS = model(cell="built-in rechargeable", action="charge", low=40, pushed_by="salus_health")
 DEVICE = {"model": "m", "name": "Dining room window 1", "area": "dining_room", "history_from": None}
@@ -112,10 +113,17 @@ class DayRuleTests(unittest.TestCase):
         st = feed(WS90, [(T0 - 2 * DAY, 20), (T0, 20)])
         self.assertNotIn("low_since", st)
 
-    def test_history_low_days_open_on_the_next_reading(self):
+    def test_history_low_days_open_on_the_next_low_reading(self):
         st = maint.bootstrap_battery(None, WS90, low_dates=["2026-10-13", "2026-10-14"])
         st = feed(WS90, [(T0, 40)], st)
+        self.assertNotIn("low_since", st)
+        st = feed(WS90, [(T0 + MIN, 20)], st)
         self.assertIn("low_since", st)
+
+    def test_new_cells_before_a_restart_do_not_reopen(self):
+        st = maint.bootstrap_battery(None, ZG204ZM, low_dates=["2026-11-09", "2026-11-10"])
+        st = feed(ZG204ZM, [(datetime(2026, 11, 10, 21, 32, tzinfo=timezone.utc), 50)], st)
+        self.assertNotIn("low_since", st)
 
 
 class DropRuleTests(unittest.TestCase):
