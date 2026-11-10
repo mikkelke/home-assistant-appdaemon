@@ -1,0 +1,32 @@
+# /conf/apps/security/arrival_unlock.yaml
+# MEASUREMENT ONLY. Records what unlocking the front door when the resident's phone is seen on
+# the landing would have done: one JSON line per would-be unlock (did the door open, how soon) and
+# one per arrival that no window caught. It never calls a lock service and publishes nothing. See
+# arrival_unlock.py's module docstring.
+#
+# No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
+# first or the app fails to instantiate.
+
+ArrivalUnlock:
+  module: arrival_unlock
+  class: ArrivalUnlock
+
+  tracker: device_tracker.mikkels_ofx9p
+  away_min: 10
+
+  # The sighting is Bermuda's area sensor for the phone beacon changing to landing_area. The two
+  # landing entity ids (landing_distance, landing_online) and the area name Landing are expected
+  # names until the proxy is installed; the app waits for entities that do not exist yet.
+  # landing_distance is optional and only logged at the sighting.
+  landing_area_sensor: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area
+  landing_area: Landing
+  landing_distance: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_distance_to_ble_proxy_landing
+  landing_online: sensor.ble_proxy_landing_uptime
+
+  lock: sensor.apartment_lock
+  door: binary_sensor.apartment_door_open
+  keypad: lock.yale
+
+  window_s: 180
+  # Defaults to arrival_unlock_log.jsonl beside the module (*_log.jsonl is gitignored).
+  # log_file: /conf/apps/security/arrival_unlock_log.jsonl
