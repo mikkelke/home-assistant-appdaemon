@@ -235,7 +235,7 @@ RoomFeel:
           # sensor.bedroom_humidity/sensor.claudias_room_humidity, not grepped directly).
           rh_entity: sensor.kristines_room_humidity
           label: salus
-          offset_c: -0.2
+          offset_c: 0.1
       floor_entity: sensor.kristines_room_floor_thermometer_temperature
       floor_offset_c: -0.2
       floor_rh_entity: sensor.kristines_room_floor_thermometer_humidity
