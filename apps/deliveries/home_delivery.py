@@ -346,8 +346,8 @@ def parcel_delivery(parcel, now):
 
 
 def parcel_deliveries(lists, now):
-    """Deliveries from the aggregator's parcel lists, delivered ones last. A parcel in two lists is delivered
-    if either says so: that end is final."""
+    """Deliveries from the aggregator's parcel lists. A parcel in two lists is delivered if either says so:
+    that end is final."""
     found = {}
     for parcels in lists:
         for parcel in parcels:
