@@ -1,0 +1,18 @@
+# AssistTurnLog - copies every Assist voice turn into a durable JSONL file, one line per pipeline
+# run: what was heard, the tools the agent called, what it answered, any error, the stage
+# durations. Home Assistant keeps only the last ten runs per pipeline, in memory. Records only;
+# decides nothing. See assist_turn_log.py for the fields.
+#
+# The file holds transcripts of what people said at home: it stays on the box, never in this repo.
+AssistTurnLog:
+  module: assist_turn_log
+  class: AssistTurnLog
+  log: sonos_log
+
+  log_file: /conf/apps/sonos/assist_turn_log.jsonl
+
+  # A poll runs this long after an assist_satellite state change, and every poll_every_s as a
+  # fallback. A run that has not ended after grace_s is written anyway, as unfinished.
+  settle_s: 5
+  poll_every_s: 300
+  grace_s: 600
