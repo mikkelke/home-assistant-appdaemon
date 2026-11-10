@@ -1,11 +1,12 @@
 """Room-local music controls for Assist satellites.
 
 satellites maps each Assist satellite entity to its HA area id; speakers maps areas
-to Music Assistant players. A satellite entering listening from idle mutes its room's
-speaker only while it is playing and unmuted. A follow-up turn (responding to listening)
-never mutes: the answer is a Music Assistant announcement on that speaker, and Music
-Assistant restores the mute state it saw during the announcement, so a mute made then
-would come back after the release. Only mutes made here are released, either on
+to Music Assistant players. A satellite entering listening mutes its room's speaker
+only while it is playing and unmuted, except within answer_guard_s of entering
+responding: the answer is then still a Music Assistant announcement on that speaker,
+and Music Assistant restores the mute state it saw during the announcement, so a mute
+made then would come back after the release. Satellites that hand their answer to a
+speaker stay in responding until the next wake, so responding alone says nothing. Only mutes made here are released, either on
 leaving listening or after duck_failsafe_s. Release checks the current mute state,
 even if playback has stopped, and always forgets ownership. Responding needs no end
 signal. Volume levels never change, and ducking never pauses a group. FollowMe may
@@ -19,6 +20,8 @@ grouped and starts radio one second later; a solo speaker starts immediately.
 Group requests use GroupManager's custom events. Unknown areas warn and do nothing;
 satellites without a configured room speaker are ignored.
 """
+
+import time
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
@@ -83,6 +86,8 @@ class AssistRooms(hass.Hass):
         self.master_select = self.args.get("master_select", "input_select.sonos_master_speaker")
         self.radio = self.args.get("radio", "dr_podcasts://radio/p3")
         self.duck_failsafe_s = float(self.args.get("duck_failsafe_s", 20))
+        self.answer_guard_s = float(self.args.get("answer_guard_s", 30))
+        self._responding_since = {}
         self._ducked = {}
         self._duck_generation = 0
 
@@ -100,7 +105,9 @@ class AssistRooms(hass.Hass):
         speaker = self.speakers.get(area)
         if not speaker or old == new:
             return
-        if new == "listening" and old == "idle":
+        if new == "responding":
+            self._responding_since[area] = time.monotonic()
+        if new == "listening" and not self._answer_playing(area, old):
             actions = duck_actions(speaker, self._read(speaker), True, area in self._ducked)
             if actions:
                 self._run_actions(area, actions)
@@ -110,6 +117,10 @@ class AssistRooms(hass.Hass):
                             area=area, generation=self._duck_generation)
         elif old == "listening":
             self._release_duck(area)
+
+    def _answer_playing(self, area, old):
+        since = self._responding_since.get(area)
+        return old == "responding" and since is not None and time.monotonic() - since < self.answer_guard_s
 
     def _release_duck(self, area):
         owned = self._ducked.pop(area, None) is not None

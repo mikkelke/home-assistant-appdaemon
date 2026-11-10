@@ -7,7 +7,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -247,6 +247,16 @@ class AssistRoomsGlue(unittest.TestCase):
         app.call_service.assert_not_called()
         app.run_in.assert_not_called()
         self.assertFalse(app._ducked)
+
+    def test_new_wake_long_after_answer_mutes(self):
+        app = make_app()
+        with patch.object(ar.time, "monotonic", return_value=1000.0):
+            satellite(app, "processing", "responding")
+        app.call_service.reset_mock()
+        with patch.object(ar.time, "monotonic", return_value=1031.0):
+            satellite(app, "responding", "listening")
+        app.call_service.assert_called_once_with(
+            "media_player/volume_mute", entity_id=BATHROOM, is_volume_muted=True)
 
     def test_satellite_without_speaker_does_nothing(self):
         app = make_app()
