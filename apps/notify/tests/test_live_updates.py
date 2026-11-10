@@ -33,11 +33,13 @@ ENTITIES = {
     "cook": "sensor.cook_state",
     "coffee": "sensor.coffee_state",
     "doorbell": "sensor.intercom_visit",
+    "delivery": "sensor.home_delivery",
 }
 TAGS = {
     "washer": "live_washer", "dryer": "live_dryer", "bath": "live_cook_bath",
     "probe": "live_cook_probe", "coffee": "live_coffee", "front": "live_doorbell_front",
     "back": "live_doorbell_back", "apartment": "live_doorbell_apartment",
+    "wolt": "live_delivery_wolt", "nemlig": "live_delivery_nemlig",
 }
 
 
@@ -84,6 +86,7 @@ class Harness:
             ENTITIES["washer"]: full("Off"), ENTITIES["dryer"]: full("Off"),
             ENTITIES["cook"]: full("off", {"bath_phase": "off", "probe_phase": "off"}),
             ENTITIES["coffee"]: full("idle"), ENTITIES["doorbell"]: full("idle", {"visits": []}),
+            ENTITIES["delivery"]: full("0", {"deliveries": []}),
             "binary_sensor.yale_doorbell_ding": full("off"),
             "person.mikkel": full("home"), "person.kristine": full("home"),
             "person.claudia": full("not_home"),
@@ -91,13 +94,14 @@ class Harness:
         self.states.update(copy.deepcopy(states or {}))
         self.calls = []
         self.fail = set()
+        self.notify = AsyncMock(return_value=1)
         self.app = lu.LiveUpdates.__new__(lu.LiveUpdates)
         self.app.args = {"state_file": str(path), **args}
         if enabled is not None:
             self.app.args["enabled_people"] = enabled
         self.app.log = lambda *a, **kw: None
         self.app.get_now = AsyncMock(side_effect=lambda: datetime.fromtimestamp(self.now, timezone.utc))
-        self.app.get_app = AsyncMock(return_value=types.SimpleNamespace(device_mapping=self.mapping))
+        self.app.get_app = AsyncMock(return_value=types.SimpleNamespace(device_mapping=self.mapping, notify=self.notify))
         self.app.get_state = AsyncMock(side_effect=self.get_state)
         self.app.listen_state = AsyncMock(return_value="listener")
         self.app.run_every = AsyncMock(return_value="timer")

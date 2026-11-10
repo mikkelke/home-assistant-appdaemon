@@ -17,11 +17,15 @@ HOUSE_TZ = ZoneInfo("Europe/Copenhagen")
 SEND_INTERVAL_S = 60
 TICK_S = 10
 TAGS = ("live_washer", "live_dryer", "live_cook_bath", "live_cook_probe", "live_coffee",
-        "live_doorbell_front", "live_doorbell_back", "live_doorbell_apartment")
+        "live_doorbell_front", "live_doorbell_back", "live_doorbell_apartment",
+        "live_delivery_wolt", "live_delivery_nemlig")
 DOORS = {"front door": "front", "back door": "back", "apartment door": "apartment"}
+DELIVERY_APPS = {"wolt": "app://com.wolt.android", "nemlig": "app://com.nemlig"}
+DELIVERY_ICONS = {"wolt": ("mdi:chef-hat", "mdi:moped"), "nemlig": ("mdi:cart", "mdi:truck-delivery")}
+DELIVERY_STAGES = {"preparing": "Preparing", "on_the_way": "On the way", "arriving": "Arriving"}
 ENTITIES = {"washer": "sensor.washer_state", "dryer": "sensor.dryer_state", "cook": "sensor.cook_state",
             "coffee": "sensor.coffee_state", "doorbell": "sensor.intercom_visit",
-            "apartment": "binary_sensor.yale_doorbell_ding"}
+            "apartment": "binary_sensor.yale_doorbell_ding", "delivery": "sensor.home_delivery"}
 
 
 def number(value):
@@ -211,6 +215,70 @@ def doorbell_cards(full, now, max_age_s=180):
     return cards
 
 
+def hhmm(at):
+    return datetime.fromtimestamp(at, HOUSE_TZ).strftime("%H:%M")
+
+
+def window_label(start, end):
+    if start is None or end is None:
+        return None
+    first, last = datetime.fromtimestamp(start, HOUSE_TZ), datetime.fromtimestamp(end, HOUSE_TZ)
+    if first.minute or last.minute:
+        return f"{first:%H:%M}–{last:%H:%M}"
+    return f"{first:%H}–{last:%H}"
+
+
+def delivery_title(delivery):
+    source, name = delivery.get("source"), delivery.get("title")
+    name = name if isinstance(name, str) else ""
+    if source == "wolt":
+        return f"Wolt · {name}" if name else "Wolt"
+    return name or "Nemlig"
+
+
+def delivery_card(delivery, now):
+    source, stage = delivery.get("source"), delivery.get("stage")
+    if source not in DELIVERY_APPS or stage not in DELIVERY_STAGES:
+        return None
+    tag, title, link = "live_delivery_" + source, delivery_title(delivery), DELIVERY_APPS[source]
+    waiting, moving = DELIVERY_ICONS[source]
+    label = DELIVERY_STAGES[stage]
+    eta = epoch(delivery.get("eta"))
+    if source == "nemlig" and stage == "preparing":
+        start = epoch(delivery.get("window_start"))
+        window = window_label(start, epoch(delivery.get("window_end")))
+        message = f"Delivery {window}" if window else "Delivery today"
+        if start is not None and 0 < start - now <= 3600:
+            return Card(tag, title, message, countdown(start, now, window or "Today"), waiting, link, start)
+        return Card(tag, title, message, window or "Today", waiting, link)
+    if eta is None:
+        return Card(tag, title, label, label, waiting if stage == "preparing" else moving, link)
+    if eta <= now:
+        return Card(tag, title, "Arriving", "Arriving", moving, link)
+    return Card(tag, title, f"{label} · {hhmm(eta)}", countdown(eta, now, label),
+                waiting if stage == "preparing" else moving, link, eta)
+
+
+def delivery_entries(full):
+    values = attributes(full).get("deliveries") if not unavailable(full) else None
+    return [value for value in values if isinstance(value, dict)] if isinstance(values, list) else []
+
+
+def delivery_cards(full, now):
+    """One card per source: its first active delivery, the sensor having sorted them by arrival."""
+    cards = {}
+    for delivery in delivery_entries(full):
+        card = delivery_card(delivery, now)
+        if card is not None and card.tag not in cards:
+            cards[card.tag] = card
+    return cards
+
+
+def cancelled_deliveries(full):
+    return [(delivery["id"], delivery_title(delivery)) for delivery in delivery_entries(full)
+            if delivery.get("stage") == "cancelled" and isinstance(delivery.get("id"), str)]
+
+
 def laundry_audience(previous, cycle, starter, enabled, home, now=None):
     """Keep the start-time audience until the first named attribution, including across reloads."""
     enabled = people(enabled)
@@ -267,7 +335,7 @@ class LiveUpdates(hass.Hass):
         args = self.args
         self.enabled_people = people(args.get("enabled_people", ["mikkel"]))
         self.source_people = {source: people(args.get(source + "_people", ["mikkel"]))
-                              for source in ("cook", "coffee", "doorbell")}
+                              for source in ("cook", "coffee", "doorbell", "delivery")}
         self.entities = {source: args.get(source + "_entity", entity) for source, entity in ENTITIES.items()}
         self.channel = args.get("channel", "Live updates")
         self.stale_limit_s = max(0, number(args.get("stale_limit_s", 600)) or 0)
@@ -295,6 +363,7 @@ class LiveUpdates(hass.Hass):
         return {"version": 1, "laundry": value.get("laundry") if isinstance(value.get("laundry"), dict) else {},
                 "sources": value.get("sources") if isinstance(value.get("sources"), dict) else {},
                 "deliveries": value.get("deliveries") if isinstance(value.get("deliveries"), dict) else {},
+                "delivery_ends": value.get("delivery_ends") if isinstance(value.get("delivery_ends"), dict) else {},
                 "apartment_ring_at": epoch(value.get("apartment_ring_at"))}
 
     def _save(self):
@@ -387,7 +456,8 @@ class LiveUpdates(hass.Hass):
                     desired[tag] = (card, self._services(audience))
             source_cards = {"cook": cook_cards(full["cook"], now),
                             "coffee": {"live_coffee": coffee_card(full["coffee"], now)},
-                            "doorbell": doorbell_cards(full["doorbell"], now, self.doorbell_max_s)}
+                            "doorbell": doorbell_cards(full["doorbell"], now, self.doorbell_max_s),
+                            "delivery": delivery_cards(full["delivery"], now)}
             source_cards["coffee"] = {tag: card for tag, card in source_cards["coffee"].items() if card}
             for source, cards in source_cards.items():
                 cards = self._retained(source, full[source], cards, now)
@@ -411,6 +481,7 @@ class LiveUpdates(hass.Hass):
                 if ring_at is not None and 0 <= now - ring_at < self.doorbell_max_s:
                     desired[tag] = (card, self._services(self.source_people["doorbell"]))
             await self._deliver(desired, now, startup)
+            await self._announce_cancelled(full["delivery"], now)
             self._save()
 
     async def _deliver(self, desired, now, startup):
@@ -449,6 +520,23 @@ class LiveUpdates(hass.Hass):
                 records[service] = record
                 if await self._send(service, notification_payload(card, now, self.channel)):
                     record.update(card=asdict(card), at=now, pending_clear=False)
+
+    async def _announce_cancelled(self, full, now):
+        """A cancelled delivery gets one real push, retried once a minute until it reaches someone."""
+        ends = self._state["delivery_ends"]
+        people = [person for person in self.source_people["delivery"] if person in self.enabled_people]
+        for delivery_id, title in cancelled_deliveries(full):
+            record = ends.get(delivery_id)
+            record = record if isinstance(record, dict) else {}
+            if record.get("sent") or not people or now - (number(record.get("attempt_at")) or 0) < SEND_INTERVAL_S:
+                continue
+            record["attempt_at"] = now
+            ends[delivery_id] = record
+            record["sent"] = bool(await self._notifier.notify(title=title, message="Order cancelled", target=people,
+                                                              category="delivery", data={"tag": "delivery_end"}))
+        for delivery_id in [key for key, record in ends.items()
+                            if not isinstance(record, dict) or now - (number(record.get("attempt_at")) or 0) > 86400]:
+            del ends[delivery_id]
 
     async def _send(self, service, payload):
         try:

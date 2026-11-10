@@ -1,0 +1,494 @@
+"""HomeDelivery - every delivery on its way to the flat, as one entity: sensor.home_delivery.
+
+Each source is a reader that returns Delivery records. Wolt comes from the Wait for Wolt integration's
+entities, found by name so a new venue needs no config; Nemlig comes from the signed-in homepage's featured
+order, polled slowly until the delivery day. A ledger remembers what the readers cannot: that an order
+ended (kept KEEP_ENDED_S) and that one went missing (held HOLD_MISSING_S in case its source blinked).
+
+state: the number of active deliveries (preparing, on_the_way, arriving).
+attributes:
+  deliveries      [{id, source: wolt|nemlig, kind: food|groceries, title, stage: preparing|on_the_way|
+                  arriving|delivered|cancelled, eta, window_start, window_end (ISO local), minutes_left,
+                  item_count}], active first, each group by ETA or window start
+  next            the first active entry
+  courier_expected  an active delivery is on its way, near its ETA or inside its window
+  spoken          one short English answer for voice
+  reason          why the state is what it is
+
+AppDaemon 4.5.13 drops None, False and 0 from set_state attributes at any depth and from the state itself, so
+the state is published as a string and a missing key reads as null, 0 or false.
+"""
+
+import math
+import re
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import requests  # type: ignore
+
+import appdaemon.plugins.hass.hassapi as hass  # type: ignore
+
+HOUSE_TZ = ZoneInfo("Europe/Copenhagen")
+ENTITY = "sensor.home_delivery"
+TICK_S = 30
+ACTIVE = ("preparing", "on_the_way", "arriving")
+KEEP_ENDED_S = 1800
+HOLD_MISSING_S = 600
+COURIER_BEFORE_S = 1200
+COURIER_AFTER_S = 1800
+
+WOLT_DELIVERY = "sensor.wolt_delivery_"
+WOLT_ORDER = re.compile(r"sensor\.wolt_order_(.+?)_(estimated_arrival|item_count)(_\d+)?")
+
+NEMLIG_SITE = "https://www.nemlig.com"
+NEMLIG_FEATURED = "https://webapi.prod.knl.nemlig.it/productbff/api/web/orderHistory/orders/featured"
+NEMLIG_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "da-DK,da;q=0.9,en;q=0.8",
+    "User-Agent": "home-assistant-appdaemon-delivery/1.0",
+    "Device-Size": "desktop",
+    "Platform": "web",
+    "Version": "11.201.0",
+    "Referer": NEMLIG_SITE + "/",
+    "Origin": NEMLIG_SITE,
+}
+NEMLIG_IDLE_S = 900
+NEMLIG_ACTIVE_S = 90
+NEMLIG_LEAD_S = 3600
+NEMLIG_STALE_S = 10800
+NEMLIG_MAX_AGE_S = 3600
+NEMLIG_RETRY_S = 300
+NEMLIG_AUTH_RETRY_S = 3600
+NEMLIG_GUARD_S = 300
+NEMLIG_TIMEOUT_S = 15
+NEMLIG_LOGIN_MAX_AGE_S = 21600
+NEMLIG_TOKEN_SKEW_S = 30
+
+
+@dataclass(frozen=True)
+class Delivery:
+    id: str
+    source: str
+    kind: str
+    title: str
+    stage: str
+    eta: float | None = None
+    window_start: float | None = None
+    window_end: float | None = None
+    item_count: int | None = None
+    ended_at: float | None = None
+
+
+def attributes(full):
+    attrs = full.get("attributes") if isinstance(full, dict) else None
+    return attrs if isinstance(attrs, dict) else {}
+
+
+def epoch(value):
+    """Seconds since the epoch for an ISO timestamp with an offset, None for anything else."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed.timestamp() if parsed.tzinfo else None
+
+
+def iso(at):
+    return datetime.fromtimestamp(at, HOUSE_TZ).isoformat(timespec="seconds") if at is not None else None
+
+
+def count(value):
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if number >= 0 else None
+
+
+def flag(value):
+    return value is True or value == "true"
+
+
+def local_day(at):
+    return datetime.fromtimestamp(at, HOUSE_TZ).date()
+
+
+def wolt_stage(attrs):
+    status = attrs.get("order_status")
+    if status == "delivered":
+        return "delivered"
+    if status in ("cancelled", "failed"):
+        return "cancelled"
+    if attrs.get("order_status_type") != "IN_PROGRESS":
+        return None
+    if flag(attrs.get("is_arriving_soon")):
+        return "arriving"
+    if flag(attrs.get("delivering_your_order")):
+        return "on_the_way"
+    return "preparing"
+
+
+def wolt_deliveries(states):
+    """Wolt orders from the integration's sensors. The tracking sensor holds the stage; the estimated-arrival
+    and item-count sensors join it by venue and entity-id suffix, since only the tracking sensor lacks a device."""
+    siblings = {}
+    for entity_id, full in states.items():
+        match = WOLT_ORDER.fullmatch(entity_id)
+        if match and isinstance(full, dict):
+            siblings[(attributes(full).get("venue_name"), match[2], match[1] + (match[3] or ""))] = full.get("state")
+    found = []
+    for entity_id, full in states.items():
+        if not entity_id.startswith(WOLT_DELIVERY):
+            continue
+        attrs = attributes(full)
+        stage = wolt_stage(attrs)
+        if stage is None:
+            continue
+        key = entity_id[len(WOLT_DELIVERY):]
+        venue = attrs.get("venue_name")
+        eta = epoch(siblings.get((venue, "estimated_arrival", key)))
+        if eta is None:
+            eta = epoch(attrs.get("delivery_eta"))
+        found.append(Delivery(f"wolt:{key}", "wolt", "food", venue if isinstance(venue, str) and venue else "Wolt",
+                              stage, eta=eta, item_count=count(siblings.get((venue, "item_count", key)))))
+    return found
+
+
+def interval(value):
+    if not isinstance(value, dict):
+        return None
+    start, end = epoch(value.get("start")), epoch(value.get("end"))
+    return (start, end) if start is not None and end is not None and start < end else None
+
+
+def nemlig_delivery(order, now):
+    """The Delivery for the homepage's featured order; None when there is nothing to track: no order, a
+    finished one offered for reorder, one booked for a later day, or one the shop never closed."""
+    if not isinstance(order, dict):
+        return None
+    status = order.get("orderStatus")
+    if not isinstance(status, str) or status == "Reorder":
+        return None
+    booked = interval(order.get("timeslotInterval"))
+    start, end = interval(order.get("deliveryInterval")) or booked or (None, None)
+    at = epoch(order.get("deliveryTime"))
+    if status == "Delivered":
+        return Delivery("nemlig", "nemlig", "groceries", "Nemlig", "delivered", window_start=start, window_end=end,
+                        ended_at=at)
+    if booked and now > booked[1] + NEMLIG_STALE_S:
+        return None
+    en_route = status == "EnRoute"
+    if not en_route and booked and local_day(booked[0]) > local_day(now):
+        return None
+    return Delivery("nemlig", "nemlig", "groceries", "Nemlig", "on_the_way" if en_route else "preparing",
+                    eta=at if en_route else None, window_start=start, window_end=end)
+
+
+def nemlig_poll_s(order, now):
+    """Seconds to the next poll: NEMLIG_IDLE_S, but NEMLIG_ACTIVE_S from NEMLIG_LEAD_S before the booked
+    window until the order is delivered."""
+    if not isinstance(order, dict) or order.get("orderStatus") in (None, "Reorder", "Delivered"):
+        return NEMLIG_IDLE_S
+    if order.get("orderStatus") == "EnRoute":
+        return NEMLIG_ACTIVE_S
+    booked = interval(order.get("timeslotInterval"))
+    if booked is None or now > booked[1] + NEMLIG_STALE_S:
+        return NEMLIG_IDLE_S
+    return min(NEMLIG_IDLE_S, max(NEMLIG_ACTIVE_S, booked[0] - NEMLIG_LEAD_S - now))
+
+
+class NemligAuthError(Exception):
+    pass
+
+
+class NemligClient:
+    """The nemlig.com web login and the homepage's featured order. Blocking: run it off the app's thread."""
+
+    def __init__(self, user, password, http=None, clock=time.time):
+        self._user = user
+        self._password = password
+        self._http = http or requests.Session()
+        self._clock = clock
+        self._xsrf = None
+        self._bearer = None
+        self._expires = 0.0
+        self._logged_in_at = None
+
+    def featured_order(self):
+        """The featured order object, None when the account has none."""
+        for attempt in (1, 2):
+            self._ensure_session()
+            response = self._http.get(NEMLIG_FEATURED, headers=self._headers(bearer=True), timeout=NEMLIG_TIMEOUT_S)
+            if response.status_code == 401 and attempt == 1:
+                self._logged_in_at = None
+                continue
+            response.raise_for_status()
+            body = response.json()
+            order = body.get("order") if isinstance(body, dict) else None
+            return order if isinstance(order, dict) else None
+
+    def _headers(self, bearer=False):
+        headers = dict(NEMLIG_HEADERS)
+        headers["X-Correlation-Id"] = str(uuid.uuid4())
+        if self._xsrf:
+            headers["X-XSRF-TOKEN"] = self._xsrf
+        if bearer and self._bearer:
+            headers["Authorization"] = "Bearer " + self._bearer
+        return headers
+
+    def _ensure_session(self):
+        now = self._clock()
+        if self._logged_in_at is None or now - self._logged_in_at > NEMLIG_LOGIN_MAX_AGE_S:
+            self._login()
+        elif now >= self._expires - NEMLIG_TOKEN_SKEW_S:
+            self._token()
+
+    def _token(self):
+        response = self._http.get(NEMLIG_SITE + "/webapi/Token", headers=self._headers(), timeout=NEMLIG_TIMEOUT_S)
+        response.raise_for_status()
+        body = response.json()
+        self._bearer = body["access_token"]
+        self._expires = self._clock() + float(body.get("expires_in") or 300)
+
+    def _login(self):
+        response = self._http.get(NEMLIG_SITE + "/webapi/AntiForgery", headers=self._headers(), timeout=NEMLIG_TIMEOUT_S)
+        response.raise_for_status()
+        self._xsrf = response.json()["Value"]
+        self._token()
+        response = self._http.post(
+            NEMLIG_SITE + "/webapi/login", headers=self._headers(bearer=True), timeout=NEMLIG_TIMEOUT_S,
+            json={"Username": self._user, "Password": self._password, "CheckForExistingProducts": True,
+                  "DoMerge": True, "AppInstalled": False, "SaveExistingBasket": False})
+        if response.status_code in (401, 403):
+            raise NemligAuthError(f"login rejected (HTTP {response.status_code})")
+        response.raise_for_status()
+        self._token()
+        self._logged_in_at = self._clock()
+
+
+def poll_nemlig(client):
+    """One poll, run on the executor. Never raises: a failure comes back as {"ok": False, ...}."""
+    try:
+        return {"ok": True, "order": client.featured_order()}
+    except NemligAuthError as error:
+        return {"ok": False, "auth": True, "error": str(error)}
+    except Exception as error:
+        return {"ok": False, "error": f"{type(error).__name__}: {error}"[:200]}
+
+
+class Ledger:
+    """What the readers cannot know: that a delivery ended, and when."""
+
+    def __init__(self, keep_s=KEEP_ENDED_S, hold_s=HOLD_MISSING_S):
+        self._keep_s = keep_s
+        self._hold_s = hold_s
+        self._records = {}
+
+    def update(self, observed, now):
+        """Fold in one round of observations; returns the deliveries to publish. An ended delivery counts only
+        if it was seen alive or its source says when it ended; a missing active one is held for a while."""
+        seen = set()
+        for delivery in observed:
+            seen.add(delivery.id)
+            record = self._records.get(delivery.id)
+            if delivery.stage in ACTIVE:
+                self._records[delivery.id] = {"delivery": delivery, "ended_at": None, "missing_since": None}
+                continue
+            ended_at = record["ended_at"] if record else None
+            if ended_at is None:
+                ended_at = delivery.ended_at
+            if ended_at is None and record is not None:
+                ended_at = now
+            if ended_at is not None:
+                self._records[delivery.id] = {"delivery": delivery, "ended_at": ended_at, "missing_since": None}
+        kept = {}
+        for id_, record in self._records.items():
+            if id_ not in seen and record["ended_at"] is None and record["missing_since"] is None:
+                record["missing_since"] = now
+            if record["ended_at"] is not None and now - record["ended_at"] >= self._keep_s:
+                continue
+            if record["missing_since"] is not None and now - record["missing_since"] >= self._hold_s:
+                continue
+            kept[id_] = record
+        self._records = kept
+        return [record["delivery"] for record in kept.values()]
+
+
+def sort_key(delivery):
+    return (delivery.stage not in ACTIVE, delivery.eta or delivery.window_start or math.inf, delivery.id)
+
+
+def entry(delivery, now):
+    minutes = None
+    if delivery.stage in ACTIVE and delivery.eta is not None:
+        minutes = max(0, math.ceil((delivery.eta - now) / 60))
+    return {"id": delivery.id, "source": delivery.source, "kind": delivery.kind, "title": delivery.title,
+            "stage": delivery.stage, "eta": iso(delivery.eta), "window_start": iso(delivery.window_start),
+            "window_end": iso(delivery.window_end), "minutes_left": minutes, "item_count": delivery.item_count}
+
+
+def courier_expected(active, now):
+    """(expected, why): some active delivery is on its way, is within COURIER_BEFORE_S..COURIER_AFTER_S of its
+    ETA, or has its booked window open now."""
+    for delivery in active:
+        if delivery.stage in ("on_the_way", "arriving"):
+            return True, "on the way"
+        if delivery.eta is not None and delivery.eta - COURIER_BEFORE_S <= now <= delivery.eta + COURIER_AFTER_S:
+            return True, "close to its ETA"
+        if delivery.window_start is not None and delivery.window_end is not None \
+                and delivery.window_start <= now <= delivery.window_end:
+            return True, "inside its window"
+    return False, None
+
+
+def clock(at, whole=False):
+    """12-hour wall clock for speech: 5:56 PM, or with whole=True 4 PM for 16:00."""
+    moment = datetime.fromtimestamp(at, HOUSE_TZ)
+    hour = moment.hour % 12 or 12
+    text = f"{hour}" if whole and moment.minute == 0 else f"{hour}:{moment.minute:02d}"
+    return text + (" AM" if moment.hour < 12 else " PM")
+
+
+def window_text(start, end):
+    if start is None or end is None:
+        return None
+    first, last = clock(start, whole=True), clock(end, whole=True)
+    if first[-2:] == last[-2:]:
+        first = first[:-3]
+    return f"{first} to {last}"
+
+
+def sentence(delivery, now):
+    if delivery.source == "wolt":
+        if delivery.stage == "preparing":
+            text = f"{delivery.title} is still making it."
+            return text + (f" Wolt expects it around {clock(delivery.eta)}." if delivery.eta is not None else "")
+        if delivery.eta is None:
+            return f"{delivery.title} is on the way."
+        if delivery.eta <= now:
+            return "It should be there any moment now."
+        minutes = max(1, math.ceil((delivery.eta - now) / 60))
+        wait = "a minute" if minutes == 1 else f"{minutes} minutes"
+        return f"In about {wait}, around {clock(delivery.eta)}."
+    if delivery.source == "nemlig":
+        if delivery.stage == "preparing":
+            window = window_text(delivery.window_start, delivery.window_end)
+            return f"Nemlig is booked for {window}." if window else "Nemlig has an order coming."
+        if delivery.eta is None:
+            return "Nemlig is on the way."
+        if delivery.eta <= now:
+            return "Nemlig should be there any moment now."
+        return f"Nemlig is on the way, around {clock(delivery.eta)}."
+    return f"{delivery.title} is on the way."
+
+
+def spoken(active, now):
+    if not active:
+        return "There's no delivery on the way."
+    text = sentence(active[0], now)
+    more = len(active) - 1
+    if more:
+        text += " There's one more after that." if more == 1 else f" There are {more} more after that."
+    return text
+
+
+def snapshot(deliveries, now):
+    """The published state and attributes for these deliveries."""
+    ordered = sorted(deliveries, key=sort_key)
+    entries = [entry(delivery, now) for delivery in ordered]
+    active = [delivery for delivery in ordered if delivery.stage in ACTIVE]
+    expected, why = courier_expected(active, now)
+    if active:
+        reason = f"{len(active)} active, next {active[0].title} {active[0].stage}; " + \
+                 (f"courier expected: {why}" if expected else "no courier expected yet")
+    else:
+        reason = "no active delivery"
+    return {"state": len(active),
+            "attributes": {"friendly_name": "Home delivery", "icon": "mdi:truck-delivery", "deliveries": entries,
+                           "next": entries[0] if active else None, "courier_expected": expected,
+                           "spoken": spoken(active, now), "reason": reason}}
+
+
+class HomeDelivery(hass.Hass):
+    def initialize(self):
+        args = self.args
+        self._entity = args.get("entity", ENTITY)
+        self._ledger = Ledger()
+        self._listened = set()
+        self._stages = {}
+        self._nemlig = None
+        self._nemlig_order = None
+        self._nemlig_at = 0.0
+        self._nemlig_next = 0.0
+        self._nemlig_status = None
+        user, password = args.get("nemlig_user"), args.get("nemlig_pass")
+        if user and password:
+            self._nemlig = NemligClient(user, password)
+        else:
+            self.log("No Nemlig login configured: Nemlig deliveries are not tracked", level="WARNING")
+        self._readers = [self._read_wolt, self._read_nemlig]
+        self.run_every(self._on_tick, "now+5", TICK_S)
+        self._refresh()
+
+    def _on_tick(self, kwargs):
+        self._poll_nemlig()
+        self._refresh()
+
+    def _on_change(self, entity, attribute, old, new, kwargs):
+        self._refresh()
+
+    def _refresh(self):
+        now = self.get_now().timestamp()
+        observed = []
+        for read in self._readers:
+            observed.extend(read(now))
+        deliveries = self._ledger.update(observed, now)
+        stages = {delivery.id: delivery.stage for delivery in deliveries}
+        for id_, stage in stages.items():
+            if self._stages.get(id_) != stage:
+                self.log(f"{id_}: {self._stages.get(id_, 'new')} -> {stage}")
+        self._stages = stages
+        published = snapshot(deliveries, now)
+        self.set_state(self._entity, state=str(published["state"]), attributes=published["attributes"], replace=True)
+
+    def _read_wolt(self, now):
+        states = self.get_state("sensor") or {}
+        for entity_id in states:
+            if entity_id.startswith(WOLT_DELIVERY) and entity_id not in self._listened:
+                self._listened.add(entity_id)
+                self.listen_state(self._on_change, entity_id, attribute="all")
+        return wolt_deliveries(states)
+
+    def _read_nemlig(self, now):
+        if now - self._nemlig_at > NEMLIG_MAX_AGE_S:
+            return []
+        delivery = nemlig_delivery(self._nemlig_order, now)
+        return [delivery] if delivery else []
+
+    def _poll_nemlig(self):
+        now = self.get_now().timestamp()
+        if self._nemlig is None or now < self._nemlig_next:
+            return
+        self._nemlig_next = now + NEMLIG_GUARD_S
+        self.submit_to_executor(poll_nemlig, self._nemlig, callback=self._on_nemlig)
+
+    def _on_nemlig(self, result=None, **kwargs):
+        now = self.get_now().timestamp()
+        result = result if isinstance(result, dict) else {}
+        if result.get("ok"):
+            order = result.get("order")
+            status = order.get("orderStatus") if isinstance(order, dict) else None
+            if status != self._nemlig_status:
+                self.log(f"Nemlig order status: {self._nemlig_status} -> {status}")
+                self._nemlig_status = status
+            self._nemlig_order, self._nemlig_at = order, now
+            self._nemlig_next = now + nemlig_poll_s(order, now)
+        else:
+            self.log(f"Nemlig poll failed: {result.get('error', 'no result')}", level="WARNING")
+            self._nemlig_next = now + (NEMLIG_AUTH_RETRY_S if result.get("auth") else NEMLIG_RETRY_S)
+        self._refresh()
