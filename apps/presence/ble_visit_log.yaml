@@ -1,0 +1,21 @@
+# /conf/apps/presence/ble_visit_log.yaml
+# MEASUREMENT ONLY. After every front-door unlock and every cleaner visit start it records which
+# Bluetooth addresses Bermuda sees for window_min minutes, one JSON line per window, to find out
+# whether the house cleaner carries a device with a stable address. It decides nothing and
+# publishes nothing. See ble_visit_log.py's module docstring.
+#
+# No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
+# first or the app fails to instantiate.
+
+BleVisitLog:
+  module: ble_visit_log
+  class: BleVisitLog
+
+  lock: lock.yale
+  visitor: sensor.untracked_visitor
+
+  window_min: 180
+  interval_s: 300
+  first_delay_s: 20
+  # Defaults to ble_visit_log.jsonl beside the module (*_log.jsonl is gitignored).
+  # log_file: /conf/apps/presence/ble_visit_log.jsonl
