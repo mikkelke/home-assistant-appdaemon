@@ -1,7 +1,9 @@
 # Every delivery on its way to the flat, as one entity: sensor.home_delivery. Wolt comes from the
 # Wait for Wolt integration's entities (found by name, so a new venue needs no config); Nemlig is
 # polled from the signed-in homepage's featured order: every 15 min, every 90 s from an hour before
-# the booked window until delivered. See home_delivery.py for the published contract.
+# the booked window until delivered. Parcels come from the Parcel Aggregator's incoming and delivered
+# sensors, one source per carrier, and are listed only when they matter today. See home_delivery.py
+# for the published contract.
 #
 # Nemlig's login lives in /data/appdaemon/secrets.yaml on the box (nemlig_user, nemlig_pass); drop
 # the two nemlig_* lines to track Wolt only. No `log:` key on purpose: a named log stream must be

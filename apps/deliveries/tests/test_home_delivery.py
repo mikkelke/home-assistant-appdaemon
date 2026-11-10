@@ -1,5 +1,6 @@
 # tests/test_home_delivery.py - HomeDelivery: Wolt stages from the integration's entities, Nemlig parsing,
-# login and polling cadence, the ledger, the published contract and the spoken answer. All data is made up.
+# login and polling cadence, Parcel Aggregator parcels, the ledger, the published contract and the spoken
+# answer. All data is made up.
 # Run from repo root: python3 -m unittest discover -s apps/deliveries/tests
 
 import ast
@@ -83,6 +84,31 @@ def delivery(**kw):
     values = {"id": "wolt:x", "source": "wolt", "kind": "food", "title": KITCHEN, "stage": "on_the_way"}
     values.update(kw)
     return hd.Delivery(**values)
+
+
+AGGREGATOR_INCOMING = "sensor.parcel_aggregator_incoming_parcels"
+AGGREGATOR_DELIVERED = "sensor.parcel_aggregator_delivered_parcels"
+
+
+def parcel(carrier="PostNord", barcode="TESTPN0001", status="out_for_delivery", sender="Test Shop", start=None,
+           end=None, delivered_at=None, **extra):
+    """One parcel as the Parcel Aggregator publishes it: ISO times, null where the carrier says nothing."""
+    values = {"carrier": carrier, "barcode": barcode, "sender": sender, "receiver": None, "status": status,
+              "raw_status": "Test status", "delivered": status == "delivered",
+              "delivered_at": stamp(delivered_at) if delivered_at is not None else None,
+              "planned_from": stamp(start) if start is not None else None,
+              "planned_to": stamp(end) if end is not None else None, "pickup": False, "pickup_point": None,
+              "url": None, "weight": None, "dimensions": None, "history": None}
+    values.update(extra)
+    return values
+
+
+def aggregator(*parcels):
+    return {"state": str(len(parcels)), "attributes": {"parcels": list(parcels), "friendly_name": "Parcels"}}
+
+
+def local_time(day, hour, minute=0):
+    return datetime(2026, 11, day, hour, minute, tzinfo=hd.HOUSE_TZ).timestamp()
 
 
 class WoltStageTests(unittest.TestCase):
@@ -589,6 +615,261 @@ class SpokenTests(unittest.TestCase):
         self.assertEqual(self.say(delivery(source="airmee", title="Airmee")), "Airmee is on the way.")
 
 
+class ParcelStageTests(unittest.TestCase):
+    def one(self, **kw):
+        return hd.parcel_delivery(parcel(**kw), NOW)
+
+    def test_out_for_delivery_is_on_the_way(self):
+        d = self.one()
+        self.assertEqual((d.id, d.source, d.kind, d.title, d.stage), ("postnord:TESTPN0001", "postnord", "parcel", "Test Shop", "on_the_way"))
+        self.assertEqual((d.carrier, d.eta, d.window_start, d.window_end, d.item_count), ("PostNord", None, None, None, None))
+        self.assertEqual(self.one(start=at(120), end=at(180)).stage, "on_the_way")
+        self.assertEqual(self.one(start=at(120)).stage, "on_the_way")
+
+    def test_it_is_arriving_once_the_expected_time_is_within_fifteen_minutes(self):
+        for start, end, stage in ((at(15.5), at(60), "on_the_way"), (at(15), at(60), "arriving"), (at(1), at(60), "arriving"),
+                                  (at(-30), at(30), "arriving"), (at(-90), at(-30), "arriving"),
+                                  (at(15.5), None, "on_the_way"), (at(15), None, "arriving"), (at(-5), None, "arriving")):
+            with self.subTest(start=start, end=end):
+                self.assertEqual(self.one(start=start, end=end).stage, stage)
+
+    def test_registered_or_in_transit_with_an_expected_time_today_is_preparing(self):
+        for status in ("registered", "in_transit"):
+            with self.subTest(status=status):
+                d = self.one(status=status, start=at(60), end=at(180))
+                self.assertEqual((d.stage, d.eta, d.window_start, d.window_end), ("preparing", None, at(60), at(180)))
+                d = self.one(status=status, start=at(120))
+                self.assertEqual((d.stage, d.eta, d.window_start, d.window_end), ("preparing", at(120), None, None))
+
+    def test_today_is_the_house_calendar_day_of_the_expected_time(self):
+        for status in ("registered", "in_transit"):
+            with self.subTest(status=status):
+                late = local_time(10, 23, 30)
+                self.assertEqual(self.one(status=status, start=late, end=late + 1800).stage, "preparing")
+                after_midnight = local_time(11, 0, 30)
+                self.assertIsNone(self.one(status=status, start=after_midnight, end=after_midnight + 3600))
+                self.assertIsNone(self.one(status=status, start=at(24 * 60), end=at(25 * 60)))
+                self.assertIsNone(self.one(status=status, start=at(-24 * 60), end=at(-23 * 60)))
+                self.assertEqual(self.one(status=status, start=local_time(10, 0, 5)).stage, "preparing")
+
+    def test_without_an_expected_time_a_parcel_that_is_not_out_is_not_listed(self):
+        for status in ("registered", "in_transit"):
+            with self.subTest(status=status):
+                self.assertIsNone(self.one(status=status))
+
+    def test_nothing_else_is_listed_even_with_a_time_today(self):
+        for status in ("at_pickup_point", "returning", "problem", "unknown", "", None, 7, ["delivered"], "Delivered"):
+            with self.subTest(status=status):
+                self.assertIsNone(self.one(status=status, start=at(60), end=at(180)))
+                self.assertIsNone(self.one(status=status))
+
+    def test_old_parcels_the_carrier_still_lists_stay_out(self):
+        years_ago = local_time(10, 12) - 700 * 86400
+        for status in ("returning", "registered", "in_transit"):
+            with self.subTest(status=status):
+                self.assertIsNone(self.one(status=status))
+                self.assertIsNone(self.one(status=status, start=years_ago, end=years_ago + 7200))
+                self.assertIsNone(self.one(status=status, start=years_ago))
+
+    def test_delivered_carries_when_it_ended(self):
+        d = self.one(status="delivered", delivered_at=at(-5))
+        self.assertEqual((d.stage, d.ended_at, d.eta), ("delivered", at(-5), None))
+        self.assertIsNone(self.one(status="delivered").ended_at)
+        self.assertEqual(self.one(status="delivered", delivered_at=at(-5)).title, "Test Shop")
+
+    def test_a_window_needs_both_ends_in_order_and_one_time_is_an_eta(self):
+        d = self.one(start=at(60), end=at(120))
+        self.assertEqual((d.eta, d.window_start, d.window_end), (None, at(60), at(120)))
+        d = self.one(start=at(60))
+        self.assertEqual((d.eta, d.window_start, d.window_end), (at(60), None, None))
+        for end in (at(60), at(30)):
+            d = self.one(start=at(60), end=end)
+            self.assertEqual((d.eta, d.window_start, d.window_end), (at(60), None, None))
+        d = self.one(end=at(60))
+        self.assertEqual((d.eta, d.window_start, d.window_end, d.stage), (None, None, None, "on_the_way"))
+
+    def test_times_are_read_with_their_offset_and_naive_ones_are_ignored(self):
+        z = self.one(planned_from="2026-11-10T17:00:00Z", planned_to="2026-11-10T19:00:00Z")
+        self.assertEqual((z.window_start, z.window_end), (datetime(2026, 11, 10, 17, tzinfo=timezone.utc).timestamp(),
+                                                         datetime(2026, 11, 10, 19, tzinfo=timezone.utc).timestamp()))
+        local = self.one(planned_from="2026-11-10T18:30:00+01:00")
+        self.assertEqual(local.eta, datetime(2026, 11, 10, 17, 30, tzinfo=timezone.utc).timestamp())
+        for value in ("2026-11-10T18:30:00", "2026-11-10", "tomorrow", "", 12, [], {}):
+            with self.subTest(value=value):
+                d = self.one(status="in_transit", planned_from=value, planned_to=value)
+                self.assertIsNone(d)
+                d = self.one(planned_from=value, planned_to=value)
+                self.assertEqual((d.stage, d.eta, d.window_start, d.window_end), ("on_the_way", None, None, None))
+
+    def test_the_title_is_the_sender_else_the_carrier_with_stray_whitespace_gone(self):
+        self.assertEqual(self.one(sender="  Test   Shop \n").title, "Test Shop")
+        for sender in (None, "", "   ", 5, [], {}):
+            with self.subTest(sender=sender):
+                self.assertEqual(self.one(sender=sender).title, "PostNord")
+
+    def test_the_source_is_the_carrier_name_as_a_slug(self):
+        for carrier, source in (("PostNord", "postnord"), ("Airmee", "airmee"), ("GLS", "gls"), ("DHL (DE)", "dhl_de"),
+                                ("  Posten   Bring ", "posten_bring")):
+            with self.subTest(carrier=carrier):
+                d = self.one(carrier=carrier, barcode=" TESTX1 ")
+                self.assertEqual((d.source, d.id, d.carrier), (source, f"{source}:TESTX1", " ".join(carrier.split())))
+
+    def test_unusable_parcels_are_skipped(self):
+        for bad in (None, 3, "x", [], {}, parcel(carrier=None), parcel(carrier=""), parcel(carrier="()"),
+                    parcel(barcode=None), parcel(barcode=""), parcel(barcode=12345), parcel(carrier=["PostNord"])):
+            with self.subTest(parcel=bad):
+                self.assertIsNone(hd.parcel_delivery(bad, NOW))
+
+
+class ParcelDeliveriesTests(unittest.TestCase):
+    def test_both_lists_are_read_and_junk_is_skipped(self):
+        incoming = [parcel(), None, parcel(barcode="TESTPN0002", status="returning"),
+                    parcel(carrier="Airmee", barcode="TESTAM0001", status="in_transit", start=at(60), end=at(120))]
+        delivered = [parcel(barcode="TESTPN0003", status="delivered", delivered_at=at(-3))]
+        found = {d.id: d.stage for d in hd.parcel_deliveries([incoming, delivered], NOW)}
+        self.assertEqual(found, {"postnord:TESTPN0001": "on_the_way", "airmee:TESTAM0001": "preparing",
+                                 "postnord:TESTPN0003": "delivered"})
+
+    def test_a_parcel_in_two_lists_is_delivered_if_either_says_so(self):
+        out, done = parcel(), parcel(status="delivered", delivered_at=at(-1))
+        for lists in ([[out], [done]], [[done], [out]]):
+            with self.subTest(lists=lists):
+                [d] = hd.parcel_deliveries(lists, NOW)
+                self.assertEqual(d.stage, "delivered")
+        [d] = hd.parcel_deliveries([[parcel(sender="First")], [parcel(sender="Second")]], NOW)
+        self.assertEqual(d.title, "First")
+
+    def test_the_same_barcode_at_two_carriers_is_two_parcels(self):
+        found = hd.parcel_deliveries([[parcel(), parcel(carrier="Airmee")]], NOW)
+        self.assertEqual({d.id for d in found}, {"postnord:TESTPN0001", "airmee:TESTPN0001"})
+
+    def test_no_lists_no_parcels(self):
+        self.assertEqual(hd.parcel_deliveries([[], []], NOW), [])
+        self.assertEqual(hd.parcel_deliveries([], NOW), [])
+
+
+class ParcelPublishedTests(unittest.TestCase):
+    def test_a_parcel_entry_carries_the_contract(self):
+        d = hd.parcel_delivery(parcel(start=at(60), end=at(120)), NOW)
+        entry = hd.snapshot([d], NOW)["attributes"]["deliveries"][0]
+        self.assertEqual(entry, {"id": "postnord:TESTPN0001", "source": "postnord", "kind": "parcel", "title": "Test Shop",
+                                 "stage": "on_the_way", "eta": None, "window_start": "2026-11-10T18:48:00+01:00",
+                                 "window_end": "2026-11-10T19:48:00+01:00", "minutes_left": None, "item_count": None})
+        d = hd.parcel_delivery(parcel(start=at(25)), NOW)
+        entry = hd.snapshot([d], NOW)["attributes"]["deliveries"][0]
+        self.assertEqual((entry["eta"], entry["minutes_left"], entry["window_start"]), ("2026-11-10T18:13:00+01:00", 25, None))
+
+    def test_the_carrier_is_not_a_published_key(self):
+        entry = hd.snapshot([hd.parcel_delivery(parcel(), NOW)], NOW)["attributes"]["deliveries"][0]
+        self.assertNotIn("carrier", entry)
+
+    def test_parcels_count_when_active_and_sort_with_the_other_sources(self):
+        wolt_order = delivery(title=KITCHEN, stage="on_the_way", eta=at(20))
+        out = hd.parcel_delivery(parcel(start=at(10)), NOW)
+        later = hd.parcel_delivery(parcel(barcode="TESTPN0002", status="in_transit", start=at(90), end=at(150)), NOW)
+        done = hd.parcel_delivery(parcel(barcode="TESTPN0003", status="delivered", delivered_at=at(-2)), NOW)
+        published = hd.snapshot([done, later, wolt_order, out], NOW)
+        self.assertEqual(published["state"], 3)
+        self.assertEqual([e["id"] for e in published["attributes"]["deliveries"]],
+                         ["postnord:TESTPN0001", "wolt:x", "postnord:TESTPN0002", "postnord:TESTPN0003"])
+        self.assertEqual(published["attributes"]["next"]["id"], "postnord:TESTPN0001")
+
+    def test_courier_expected_while_a_parcel_is_out_for_delivery_even_without_a_time(self):
+        d = hd.parcel_delivery(parcel(), NOW)
+        self.assertEqual(hd.courier_expected([d], NOW), (True, "on the way"))
+        self.assertEqual(hd.snapshot([d], NOW)["attributes"]["reason"],
+                         "1 active, next Test Shop on_the_way; courier expected: on the way")
+
+    def test_a_parcel_window_counts_once_it_opens_until_it_closes(self):
+        d = hd.parcel_delivery(parcel(status="in_transit", start=at(60), end=at(180)), NOW)
+        self.assertEqual(d.stage, "preparing")
+        for minutes, expected in ((-1, False), (59, False), (60, True), (120, True), (180, True), (181, False)):
+            with self.subTest(minutes=minutes):
+                self.assertEqual(hd.courier_expected([d], at(minutes)), (True, "inside its window") if expected else (False, None))
+
+    def test_a_parcel_eta_counts_from_twenty_minutes_before_to_thirty_after(self):
+        d = hd.parcel_delivery(parcel(status="registered", start=at(120)), NOW)
+        for offset, expected in ((-1201, False), (-1200, True), (0, True), (1800, True), (1801, False)):
+            with self.subTest(offset=offset):
+                self.assertEqual(hd.courier_expected([d], at(120) + offset)[0], expected)
+        self.assertEqual(hd.courier_expected([d], at(110)), (True, "close to its ETA"))
+
+    def test_a_parcel_later_today_does_not_expect_the_courier_yet(self):
+        d = hd.parcel_delivery(parcel(status="in_transit", start=at(240), end=at(300)), NOW)
+        self.assertEqual(hd.snapshot([d], NOW)["attributes"]["courier_expected"], False)
+
+    def test_a_delivered_parcel_expects_no_courier(self):
+        d = hd.parcel_delivery(parcel(status="delivered", delivered_at=at(-1)), NOW)
+        self.assertEqual(hd.snapshot([d], NOW)["attributes"]["courier_expected"], False)
+
+
+class ParcelSpokenTests(unittest.TestCase):
+    def say(self, *deliveries, now=NOW):
+        return hd.snapshot(list(deliveries), now)["attributes"]["spoken"]
+
+    def parcel(self, now=NOW, **kw):
+        return hd.parcel_delivery(parcel(**kw), now)
+
+    def test_out_for_delivery_with_a_window(self):
+        self.assertEqual(self.say(self.parcel(start=local_time(10, 18), end=local_time(10, 20))),
+                         "A PostNord parcel is out for delivery, expected between 6 and 8 PM.")
+        self.assertEqual(self.say(self.parcel(start=local_time(10, 11, 30), end=local_time(10, 13)), now=local_time(10, 11)),
+                         "A PostNord parcel is out for delivery, expected between 11:30 AM and 1 PM.")
+        self.assertEqual(self.say(self.parcel(start=local_time(10, 14), end=local_time(10, 16)), now=local_time(10, 14, 30)),
+                         "A PostNord parcel is out for delivery, expected between 2 and 4 PM.")
+
+    def test_out_for_delivery_with_an_eta_or_nothing(self):
+        self.assertEqual(self.say(self.parcel(start=local_time(10, 18, 30))),
+                         "A PostNord parcel is out for delivery, expected around 6:30 PM.")
+        self.assertEqual(self.say(self.parcel(start=local_time(10, 19))),
+                         "A PostNord parcel is out for delivery, expected around 7 PM.")
+        self.assertEqual(self.say(self.parcel()), "A PostNord parcel is out for delivery.")
+
+    def test_a_late_courier_should_be_there_any_moment(self):
+        self.assertEqual(self.say(self.parcel(start=at(-6))), "A PostNord parcel should be there any moment now.")
+        self.assertEqual(self.say(self.parcel(start=NOW)), "A PostNord parcel should be there any moment now.")
+        self.assertEqual(self.say(self.parcel(start=at(-60), end=NOW)), "A PostNord parcel should be there any moment now.")
+        self.assertEqual(self.say(self.parcel(start=at(0.5))), "A PostNord parcel is out for delivery, expected around 5:48 PM.")
+        self.assertEqual(self.say(self.parcel(start=at(-60), end=at(-6))), "A PostNord parcel should be there any moment now.")
+        self.assertEqual(self.say(self.parcel(start=at(-60), end=at(30))), "A PostNord parcel is out for delivery, expected between 4:48 and 6:18 PM.")
+
+    def test_preparing(self):
+        self.assertEqual(self.say(self.parcel(status="in_transit", start=local_time(10, 18), end=local_time(10, 20))),
+                         "A PostNord parcel is expected between 6 and 8 PM.")
+        self.assertEqual(self.say(self.parcel(status="registered", start=local_time(10, 18, 30))),
+                         "A PostNord parcel is expected around 6:30 PM.")
+        d = delivery(source="postnord", kind="parcel", carrier="PostNord", stage="preparing")
+        self.assertEqual(self.say(d), "A PostNord parcel is expected today.")
+
+    def test_the_article_follows_the_carrier_name(self):
+        self.assertEqual(self.say(self.parcel(carrier="Airmee")), "An Airmee parcel is out for delivery.")
+        self.assertEqual(self.say(self.parcel(carrier="GLS")), "A GLS parcel is out for delivery.")
+        self.assertEqual(self.say(self.parcel(carrier="DHL (DE)")), "A DHL (DE) parcel is out for delivery.")
+        self.assertEqual(self.say(self.parcel(carrier="InPost")), "An InPost parcel is out for delivery.")
+
+    def test_more_deliveries_are_counted_in_the_same_sentence_after_a_parcel(self):
+        first = self.parcel(start=local_time(10, 18, 30))
+        second = self.parcel(barcode="TESTPN0002", start=local_time(10, 19))
+        third = self.parcel(barcode="TESTPN0003", carrier="Airmee", start=local_time(10, 20))
+        self.assertEqual(self.say(first, second), "A PostNord parcel is out for delivery, expected around 6:30 PM, and 1 more.")
+        self.assertEqual(self.say(first, second, third), "A PostNord parcel is out for delivery, expected around 6:30 PM, and 2 more.")
+        self.assertEqual(self.say(first, delivery(eta=at(300))), "A PostNord parcel is out for delivery, expected around 6:30 PM, and 1 more.")
+
+    def test_a_parcel_after_another_source_keeps_the_existing_phrasing(self):
+        wolt_order = delivery(eta=at(8))
+        out = self.parcel(start=at(30))
+        self.assertEqual(self.say(wolt_order, out), "In about 8 minutes, around 5:56 PM. There's one more after that.")
+
+    def test_a_delivered_parcel_is_not_on_the_way(self):
+        self.assertEqual(self.say(self.parcel(status="delivered", delivered_at=at(-2))), "There's no delivery on the way.")
+
+    def test_window_text_can_be_linked_with_and(self):
+        self.assertEqual(hd.window_text(local_time(10, 14), local_time(10, 16)), "2 to 4 PM")
+        self.assertEqual(hd.window_text(local_time(10, 14), local_time(10, 16), "and"), "2 and 4 PM")
+        self.assertEqual(hd.window_text(local_time(10, 11), local_time(10, 13), "and"), "11 AM and 1 PM")
+        self.assertIsNone(hd.window_text(None, local_time(10, 16), "and"))
+
+
 class Harness:
     def __init__(self, states=None, now=NOW, **args):
         self.now = now
@@ -603,6 +884,7 @@ class Harness:
         self.app.log = lambda message, level="INFO": self.logs.append((level, message))
         self.app.get_now = lambda: datetime.fromtimestamp(self.now, timezone.utc)
         self.app.render_template = self.render_template
+        self.app.get_state = self.get_state
         self.app.set_state = lambda entity, state=None, attributes=None, replace=False: self.published.append(
             (entity, state, copy.deepcopy(attributes), replace))
         self.app.listen_state = lambda callback, entity, **kw: self.listened.append((entity, kw)) or "handle"
@@ -620,6 +902,11 @@ class Harness:
         items = [{"entity_id": key, **copy.deepcopy(value)} for key, value in self.states.items()
                  if key.startswith("sensor.wolt_")]
         return appdaemon_render_result("J" + json.dumps(items))
+
+    def get_state(self, entity_id, attribute=None):
+        if attribute != "all":
+            raise AssertionError(attribute)
+        return copy.deepcopy(self.states.get(entity_id))
 
     @property
     def last(self):
@@ -691,13 +978,16 @@ class AppTests(unittest.TestCase):
 
     def test_every_tracking_sensor_is_listened_to_once_including_ones_that_appear_later(self):
         h = Harness(wolt())
-        self.assertEqual([entity for entity, _ in h.listened], ["sensor.wolt_delivery_test_kitchen"])
-        self.assertEqual(h.listened[0][1], {"attribute": "all"})
+
+        def wolt_listened():
+            return [entity for entity, _ in h.listened if entity.startswith("sensor.wolt_")]
+
+        self.assertEqual(wolt_listened(), ["sensor.wolt_delivery_test_kitchen"])
+        self.assertEqual(h.listened[-1][1], {"attribute": "all"})
         h.states.update(wolt(venue="Pizza Test", slug="pizza_test"))
         h.tick(30)
         h.tick(30)
-        self.assertEqual([entity for entity, _ in h.listened],
-                         ["sensor.wolt_delivery_test_kitchen", "sensor.wolt_delivery_pizza_test"])
+        self.assertEqual(wolt_listened(), ["sensor.wolt_delivery_test_kitchen", "sensor.wolt_delivery_pizza_test"])
 
     def test_a_state_change_publishes_at_once(self):
         h = Harness(wolt())
@@ -887,6 +1177,121 @@ class NemligAppTests(unittest.TestCase):
         h.run_executor()
         state, attrs = h.last
         self.assertEqual((state, [e["source"] for e in attrs["deliveries"]]), ("2", ["wolt", "nemlig"]))
+
+
+class ParcelAppTests(unittest.TestCase):
+    def test_what_the_aggregator_holds_today_leaves_the_sensor_empty(self):
+        week_ago = at(-7 * 24 * 60)
+        h = Harness({
+            AGGREGATOR_INCOMING: aggregator(parcel(barcode="TESTPN0001", status="registered"),
+                                            parcel(barcode="TESTPN0002", status="returning", sender=None),
+                                            parcel(barcode="TESTAM0001", carrier="Airmee", status="in_transit")),
+            AGGREGATOR_DELIVERED: aggregator(parcel(barcode="TESTPN0003", status="delivered", delivered_at=week_ago),
+                                             parcel(barcode="TESTAM0002", carrier="Airmee", status="delivered"),
+                                             parcel(barcode="TESTAM0003", carrier="Airmee", status="delivered"))})
+        h.tick(30)
+        state, attrs = h.last
+        self.assertEqual((state, attrs["deliveries"], attrs["courier_expected"]), ("0", [], False))
+        self.assertEqual((attrs["spoken"], attrs["reason"]), ("There's no delivery on the way.", "no active delivery"))
+        self.assertFalse(any("TEST" in message for _, message in h.logs))
+
+    def test_a_parcel_from_booked_to_delivered(self):
+        window = (local_time(10, 19), local_time(10, 21))
+        h = Harness({AGGREGATOR_INCOMING: aggregator(parcel(status="in_transit", start=window[0], end=window[1]))})
+        state, attrs = h.last
+        self.assertEqual((state, attrs["next"]["stage"], attrs["next"]["source"], attrs["courier_expected"]), ("1", "preparing", "postnord", False))
+        self.assertEqual(attrs["spoken"], "A PostNord parcel is expected between 7 and 9 PM.")
+
+        h.states[AGGREGATOR_INCOMING] = aggregator(parcel(start=window[0], end=window[1]))
+        h.tick(30 * 60)
+        state, attrs = h.last
+        self.assertEqual((state, attrs["next"]["stage"], attrs["courier_expected"]), ("1", "on_the_way", True))
+        self.assertEqual(attrs["spoken"], "A PostNord parcel is out for delivery, expected between 7 and 9 PM.")
+
+        h.tick(26 * 60)
+        self.assertEqual(h.last[1]["next"]["stage"], "on_the_way")
+        h.tick(2 * 60)
+        self.assertEqual(h.last[1]["next"]["stage"], "arriving")
+
+        h.states[AGGREGATOR_INCOMING] = aggregator()
+        h.states[AGGREGATOR_DELIVERED] = aggregator(parcel(status="delivered", delivered_at=h.now))
+        h.tick(60)
+        state, attrs = h.last
+        self.assertEqual((state, attrs["next"], attrs["courier_expected"], [e["stage"] for e in attrs["deliveries"]]),
+                         ("0", None, False, ["delivered"]))
+        h.tick(28 * 60)
+        self.assertEqual([e["stage"] for e in h.last[1]["deliveries"]], ["delivered"])
+        h.tick(3 * 60)
+        self.assertEqual(h.last[1]["deliveries"], [])
+        self.assertEqual([message for _, message in h.logs if message.startswith("postnord:")],
+                         ["postnord:TESTPN0001: new -> preparing", "postnord:TESTPN0001: preparing -> on_the_way",
+                          "postnord:TESTPN0001: on_the_way -> arriving", "postnord:TESTPN0001: arriving -> delivered"])
+
+    def test_a_carrier_that_gives_no_delivery_time_is_dated_by_when_it_was_first_seen_delivered(self):
+        h = Harness({AGGREGATOR_INCOMING: aggregator(parcel(carrier="Airmee", barcode="TESTAM0001"))})
+        self.assertEqual(h.last[1]["spoken"], "An Airmee parcel is out for delivery.")
+        h.states[AGGREGATOR_INCOMING] = aggregator()
+        h.states[AGGREGATOR_DELIVERED] = aggregator(parcel(carrier="Airmee", barcode="TESTAM0001", status="delivered"))
+        h.tick(120)
+        self.assertEqual([e["stage"] for e in h.last[1]["deliveries"]], ["delivered"])
+        h.tick(28 * 60)
+        self.assertEqual(len(h.last[1]["deliveries"]), 1)
+        h.tick(120)
+        self.assertEqual(h.last[1]["deliveries"], [])
+
+    def test_a_parcel_delivered_before_this_app_looked_is_not_listed(self):
+        h = Harness({AGGREGATOR_DELIVERED: aggregator(parcel(status="delivered", delivered_at=at(-31)),
+                                                      parcel(barcode="TESTPN0002", status="delivered", delivered_at=at(-29)))})
+        self.assertEqual([e["id"] for e in h.last[1]["deliveries"]], ["postnord:TESTPN0002"])
+
+    def test_both_aggregator_sensors_are_listened_to_and_a_change_publishes_at_once(self):
+        h = Harness()
+        self.assertEqual([kw for entity, kw in h.listened if entity in (AGGREGATOR_INCOMING, AGGREGATOR_DELIVERED)],
+                         [{"attribute": "all"}] * 2)
+        self.assertEqual({entity for entity, _ in h.listened}, {AGGREGATOR_INCOMING, AGGREGATOR_DELIVERED})
+        before = len(h.published)
+        h.states[AGGREGATOR_INCOMING] = aggregator(parcel(start=at(30)))
+        h.app._on_change(AGGREGATOR_INCOMING, "all", {}, {}, {})
+        self.assertEqual(len(h.published), before + 1)
+        self.assertEqual((h.last[0], h.last[1]["next"]["stage"]), ("1", "on_the_way"))
+
+    def test_without_the_aggregator_wolt_is_unaffected(self):
+        h = Harness(wolt(courier=True, eta=at(10)))
+        self.assertEqual((h.last[0], h.last[1]["next"]["source"]), ("1", "wolt"))
+        self.assertEqual([m for level, m in h.logs if level == "WARNING" and "Nemlig" not in m], [])
+
+    def test_odd_aggregator_states_are_no_parcels(self):
+        for value in (None, {}, {"state": "unavailable", "attributes": None}, {"state": "1", "attributes": []},
+                      {"state": "1", "attributes": {"parcels": None}}, {"state": "1", "attributes": {"parcels": "x"}},
+                      {"state": "1", "attributes": {"parcels": {"carrier": "PostNord"}}}):
+            with self.subTest(value=value):
+                h = Harness({AGGREGATOR_INCOMING: value, AGGREGATOR_DELIVERED: value})
+                h.tick(30)
+                self.assertEqual((h.last[0], h.last[1]["deliveries"]), ("0", []))
+
+    def test_an_aggregator_that_blinks_is_held_not_dropped(self):
+        h = Harness({AGGREGATOR_INCOMING: aggregator(parcel(start=at(40)))})
+        h.states[AGGREGATOR_INCOMING] = {"state": "unavailable", "attributes": {"friendly_name": "Parcels"}}
+        h.tick(60)
+        self.assertEqual(h.last[0], "1")
+        h.tick(600)
+        self.assertEqual(h.last[0], "0")
+
+    def test_parcels_wolt_and_the_rest_share_one_sorted_entity(self):
+        h = Harness({**wolt(courier=True, eta=at(30)),
+                     AGGREGATOR_INCOMING: aggregator(parcel(start=at(10)), parcel(carrier="Airmee", barcode="TESTAM0001",
+                                                                                     status="registered", start=at(300)))})
+        h.tick(5)
+        state, attrs = h.last
+        self.assertEqual(state, "3")
+        self.assertEqual([e["source"] for e in attrs["deliveries"]], ["postnord", "wolt", "airmee"])
+        self.assertEqual(attrs["spoken"], "A PostNord parcel is out for delivery, expected around 5:58 PM, and 2 more.")
+
+    def test_two_parcels_from_one_carrier_are_two_deliveries(self):
+        h = Harness({AGGREGATOR_INCOMING: aggregator(parcel(), parcel(barcode="TESTPN0002"))})
+        self.assertEqual((h.last[0], [e["id"] for e in h.last[1]["deliveries"]]),
+                         ("2", ["postnord:TESTPN0001", "postnord:TESTPN0002"]))
+        self.assertEqual(h.last[1]["spoken"], "A PostNord parcel is out for delivery, and 1 more.")
 
 
 if __name__ == "__main__":

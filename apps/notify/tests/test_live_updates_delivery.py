@@ -1,4 +1,5 @@
-"""Delivery cards read sensor.home_delivery only: one card per source, cleared on delivery, one push on a cancel."""
+"""Delivery cards read sensor.home_delivery only: one card per source (Wolt, Nemlig, each parcel carrier),
+cleared on delivery, one push on a cancel and none for parcels."""
 
 import sys
 import tempfile
@@ -13,6 +14,7 @@ from test_live_updates import ENTITIES, HOUSE, NOW, TAGS, Harness, full  # noqa:
 import live_updates as lu  # noqa: E402
 
 WOLT, NEMLIG = TAGS["wolt"], TAGS["nemlig"]
+AIRMEE, POSTNORD, GLS = TAGS["airmee"], TAGS["postnord"], TAGS["gls"]
 KRISTINE = "notify/mobile_app_kristine_iphone_2"
 MIKKEL = "notify/mobile_app_mikkels_ofx9p"
 KITCHEN = "Test Kitchen"
@@ -28,6 +30,14 @@ def entry(source="wolt", stage="on_the_way", eta=NOW + 480, start=None, end=None
             "stage": stage, "eta": local(eta) if eta is not None else None,
             "window_start": local(start) if start is not None else None,
             "window_end": local(end) if end is not None else None, "item_count": 1}
+
+
+def parcel_entry(source="postnord", stage="on_the_way", eta=None, start=None, end=None, barcode="TEST0001",
+                 title="Test Shop"):
+    return {"id": f"{source}:{barcode}", "source": source, "kind": "parcel", "title": title, "stage": stage,
+            "eta": local(eta) if eta is not None else None,
+            "window_start": local(start) if start is not None else None,
+            "window_end": local(end) if end is not None else None, "item_count": None}
 
 
 def sensor(*entries):
@@ -69,7 +79,7 @@ class WoltCardTests(unittest.TestCase):
     def test_ended_stages_and_unknown_sources_have_no_card(self):
         for stage in ("delivered", "cancelled", "mystery"):
             self.assertIsNone(card(stage=stage))
-        self.assertIsNone(lu.delivery_card(entry(source="airmee"), NOW))
+        self.assertIsNone(lu.delivery_card(entry(source="mystery"), NOW))
         self.assertIsNone(lu.delivery_card({"stage": "on_the_way"}, NOW))
 
     def test_a_venue_less_wolt_order_is_titled_wolt(self):
@@ -124,6 +134,78 @@ class NemligCardTests(unittest.TestCase):
         self.assertIsNone(card(source="nemlig", stage="delivered"))
 
 
+def parcel_card(**kw):
+    return lu.delivery_card(parcel_entry(**kw), NOW)
+
+
+class ParcelCardTests(unittest.TestCase):
+    def test_each_carrier_has_its_own_tag_title_icon_and_app(self):
+        for source, title, link in (("airmee", "Airmee", "app://com.airmee.customer"),
+                                    ("postnord", "PostNord", "app://se.postnord.private"),
+                                    ("gls", "GLS", "app://dk.gls.consigneeapp")):
+            with self.subTest(source=source):
+                c = parcel_card(source=source, eta=NOW + 1800)
+                self.assertEqual((c.tag, c.title, c.icon, c.link), (TAGS[source], title, "mdi:package-variant-closed", link))
+
+    def test_the_title_is_the_carrier_not_the_sender(self):
+        self.assertEqual(parcel_card(title="Some Webshop").title, "PostNord")
+        self.assertEqual(parcel_card(title=None).title, "PostNord")
+
+    def test_a_window_is_shown_while_the_courier_is_out(self):
+        c = parcel_card(start=NOW + 3600, end=NOW + 10800)
+        self.assertEqual((c.message, c.critical_text, c.finish_at), ("Out for delivery · 14–16", "14–16", None))
+        c = parcel_card(start=NOW + 5400, end=NOW + 10800)
+        self.assertEqual((c.message, c.critical_text, c.finish_at), ("Out for delivery · 14:30–16:00", "14:30–16:00", None))
+
+    def test_an_arriving_parcel_keeps_its_window(self):
+        c = parcel_card(stage="arriving", start=NOW + 600, end=NOW + 3600)
+        self.assertEqual((c.message, c.critical_text, c.finish_at), ("Arriving · 13:10–14:00", "13:10–14:00", None))
+        c = parcel_card(stage="arriving", start=NOW - 600, end=NOW + 600)
+        self.assertEqual((c.message, c.finish_at), ("Arriving · 12:50–13:10", None))
+
+    def test_an_exact_eta_is_counted_down_to(self):
+        c = parcel_card(eta=NOW + 1800)
+        self.assertEqual((c.message, c.critical_text, c.finish_at), ("Out for delivery · 13:30", "30 min", NOW + 1800))
+        c = parcel_card(stage="arriving", eta=NOW + 600)
+        self.assertEqual((c.message, c.critical_text, c.finish_at), ("Arriving · 13:10", "10 min", NOW + 600))
+        self.assertEqual(lu.notification_payload(c, NOW)["data"]["when"], 600)
+
+    def test_a_passed_eta_or_window_says_arriving_without_a_countdown(self):
+        for kw in ({"eta": NOW - 60}, {"eta": NOW}, {"start": NOW - 7200, "end": NOW - 60}, {"start": NOW - 7200, "end": NOW},
+                   {"stage": "arriving", "eta": NOW - 60}):
+            with self.subTest(kw=kw):
+                c = parcel_card(**kw)
+                self.assertEqual((c.message, c.critical_text, c.finish_at), ("Arriving", "Arriving", None))
+                self.assertNotIn("when", lu.notification_payload(c, NOW)["data"])
+
+    def test_no_time_shows_the_stage_without_inventing_a_timer(self):
+        c = parcel_card()
+        self.assertEqual((c.message, c.critical_text, c.finish_at), ("Out for delivery", "On the way", None))
+        c = parcel_card(stage="arriving")
+        self.assertEqual((c.message, c.critical_text, c.finish_at), ("Arriving", "Arriving", None))
+
+    def test_there_is_never_a_card_before_the_courier_is_out_or_after_the_hand_over(self):
+        for stage in ("preparing", "delivered", "cancelled", "mystery", None):
+            with self.subTest(stage=stage):
+                self.assertIsNone(parcel_card(stage=stage, eta=NOW + 1800))
+                self.assertIsNone(parcel_card(stage=stage, start=NOW + 600, end=NOW + 3600))
+
+    def test_other_carriers_have_no_card(self):
+        self.assertIsNone(lu.delivery_card(parcel_entry(source="dao"), NOW))
+        self.assertIsNone(lu.delivery_card(parcel_entry(source="dhl_de", eta=NOW + 600), NOW))
+
+    def test_the_payload_is_the_quiet_live_card_and_the_countdown_only_comes_with_an_eta(self):
+        payload = lu.notification_payload(parcel_card(eta=NOW + 1800), NOW)
+        data = payload["data"]
+        self.assertEqual(payload["title"], "PostNord")
+        self.assertEqual((data["tag"], data["channel"], data["importance"], data["critical_text"]),
+                         (POSTNORD, "Live updates", "low", "30 min"))
+        self.assertEqual((data["when"], data["chronometer"], data["when_relative"], data["live_update"]), (1800, True, True, True))
+        self.assertEqual((data["clickAction"], data["url"]), ("app://se.postnord.private",) * 2)
+        self.assertEqual(data["notification_icon"], "mdi:package-variant-closed")
+        self.assertNotIn("when", lu.notification_payload(parcel_card(start=NOW + 600, end=NOW + 3600), NOW)["data"])
+
+
 class SelectionTests(unittest.TestCase):
     def test_one_card_per_source_for_its_first_active_delivery(self):
         sensor_state = sensor(entry(title="Pizza Test", eta=NOW + 300), entry("nemlig", eta=NOW + 900),
@@ -137,6 +219,18 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(lu.delivery_cards(value, NOW), {})
         self.assertEqual(lu.cancelled_deliveries(full("unknown", {"deliveries": [entry(stage="cancelled")]})), [])
+
+    def test_a_carrier_has_one_card_for_its_first_parcel_that_is_out(self):
+        state = sensor(parcel_entry(stage="preparing", start=NOW + 600, end=NOW + 3600, barcode="TEST0001"),
+                       parcel_entry(eta=NOW + 1200, barcode="TEST0002"), parcel_entry(eta=NOW + 2400, barcode="TEST0003"),
+                       parcel_entry("airmee", start=NOW + 3600, end=NOW + 7200), parcel_entry("gls", stage="preparing"),
+                       entry(title="Pizza Test", eta=NOW + 300))
+        cards = lu.delivery_cards(state, NOW)
+        self.assertEqual(set(cards), {WOLT, POSTNORD, AIRMEE})
+        self.assertEqual((cards[POSTNORD].message, cards[AIRMEE].message), ("Out for delivery · 13:20", "Out for delivery · 14–15"))
+
+    def test_parcels_are_never_cancelled_announcements(self):
+        self.assertEqual(lu.cancelled_deliveries(sensor(parcel_entry(stage="delivered"), parcel_entry("airmee", stage="on_the_way"))), [])
 
     def test_cancelled_deliveries_are_listed_with_their_card_title(self):
         state = sensor(entry(stage="cancelled"), entry(title="Pizza Test"), entry("nemlig", stage="delivered"))
@@ -240,6 +334,49 @@ class DeliveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         h.states[ENTITIES["delivery"]] = sensor()
         await h.reconcile(86401)
         self.assertEqual(h.app._state["delivery_ends"], {})
+
+    async def test_a_parcel_gets_a_card_on_mikkels_phone_and_never_a_push(self):
+        h = await self.make(delivery_people=["mikkel", "kristine"],
+                            states={ENTITIES["delivery"]: sensor(parcel_entry(eta=NOW + 1800))})
+        [(service, payload)] = h.ongoing(POSTNORD)
+        self.assertEqual((service, payload["title"], payload["message"]), (MIKKEL, "PostNord", "Out for delivery · 13:30"))
+        self.assertEqual(payload["data"]["when"], 1800)
+        self.assertEqual((h.ongoing(WOLT), h.ongoing(AIRMEE), h.ongoing(GLS)), ([], [], []))
+        h.notify.assert_not_awaited()
+
+    async def test_each_carrier_and_wolt_have_their_own_card(self):
+        states = {ENTITIES["delivery"]: sensor(entry(eta=NOW + 300), parcel_entry("airmee", start=NOW + 3600, end=NOW + 7200),
+                                               parcel_entry("postnord", eta=NOW + 900), parcel_entry("gls", stage="arriving"))}
+        h = await self.make(states=states)
+        self.assertEqual([len(h.ongoing(tag)) for tag in (WOLT, AIRMEE, POSTNORD, GLS, NEMLIG)], [1, 1, 1, 1, 0])
+        self.assertEqual(h.ongoing(AIRMEE)[0][1]["data"]["clickAction"], "app://com.airmee.customer")
+        self.assertEqual(h.ongoing(GLS)[0][1]["message"], "Arriving")
+
+    async def test_a_parcel_that_is_only_expected_today_has_no_card_until_the_courier_is_out(self):
+        h = await self.make(states={ENTITIES["delivery"]: sensor(parcel_entry(stage="preparing", start=NOW + 3600, end=NOW + 10800))})
+        self.assertEqual(h.ongoing(POSTNORD), [])
+        h.states[ENTITIES["delivery"]] = sensor(parcel_entry(stage="on_the_way", start=NOW + 3600, end=NOW + 10800))
+        await h.reconcile(60)
+        self.assertEqual(h.ongoing(POSTNORD)[0][1]["message"], "Out for delivery · 14–16")
+
+    async def test_the_parcel_card_follows_the_parcel_and_clears_on_delivered_without_a_push(self):
+        h = await self.make(states={ENTITIES["delivery"]: sensor(parcel_entry(eta=NOW + 1800))})
+        h.forget_calls()
+        h.states[ENTITIES["delivery"]] = sensor(parcel_entry(stage="arriving", eta=NOW + 540))
+        await h.reconcile(60)
+        [(_, payload)] = h.ongoing(POSTNORD)
+        self.assertEqual((payload["message"], payload["data"]["critical_text"]), ("Arriving · 13:09", "8 min"))
+        h.forget_calls()
+        h.states[ENTITIES["delivery"]] = sensor(parcel_entry(stage="delivered", eta=None))
+        await h.reconcile(60)
+        self.assertEqual(len(h.clears(POSTNORD)), 1)
+        self.assertEqual(h.ongoing(POSTNORD), [])
+        h.notify.assert_not_awaited()
+
+    async def test_a_reload_clears_every_parcel_tag_on_each_enabled_phone(self):
+        h = await self.make()
+        for tag in (AIRMEE, POSTNORD, GLS):
+            self.assertEqual([service for service, _ in h.clears(tag)], [MIKKEL])
 
     async def test_an_unavailable_sensor_holds_the_card_then_clears_it(self):
         h = await self.make(stale_limit_s=90, states={ENTITIES["delivery"]: sensor(entry())})

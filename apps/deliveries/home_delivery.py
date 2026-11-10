@@ -2,14 +2,22 @@
 
 Each source is a reader that returns Delivery records. Wolt comes from the Wait for Wolt integration's
 entities, found by name so a new venue needs no config; Nemlig comes from the signed-in homepage's featured
-order, polled slowly until the delivery day. A ledger remembers what the readers cannot: that an order
-ended (kept KEEP_ENDED_S) and that one went missing (held HOLD_MISSING_S in case its source blinked).
+order, polled slowly until the delivery day; parcels come from the Parcel Aggregator's incoming and delivered
+lists, one source per carrier. A ledger remembers what the readers cannot: that an order ended (kept
+KEEP_ENDED_S) and that one went missing (held HOLD_MISSING_S in case its source blinked).
+
+A parcel is listed only when it matters today: out for delivery, registered or in transit with an expected time
+that falls today, or delivered. Everything else the aggregator holds (days away, at a pickup point, returning,
+a problem, an unmapped status, old parcels) stays out. The aggregator's parcel has no stops-away or live ETA,
+only planned_from and planned_to: both with planned_from before planned_to is a window, planned_from alone is
+an ETA.
 
 state: the number of active deliveries (preparing, on_the_way, arriving).
 attributes:
-  deliveries      [{id, source: wolt|nemlig, kind: food|groceries, title, stage: preparing|on_the_way|
-                  arriving|delivered|cancelled, eta, window_start, window_end (ISO local), minutes_left,
-                  item_count}], active first, each group by ETA or window start
+  deliveries      [{id, source: wolt|nemlig|<carrier slug, e.g. postnord>, kind: food|groceries|parcel, title
+                  (a parcel's sender, else its carrier), stage: preparing|on_the_way|arriving|delivered|
+                  cancelled, eta, window_start, window_end (ISO local), minutes_left, item_count}], active
+                  first, each group by ETA or window start
   next            the first active entry
   courier_expected  an active delivery is on its way, near its ETA or inside its window
   spoken          one short English answer for voice
@@ -40,6 +48,11 @@ KEEP_ENDED_S = 1800
 HOLD_MISSING_S = 600
 COURIER_BEFORE_S = 1200
 COURIER_AFTER_S = 1800
+
+PARCELS_INCOMING = "sensor.parcel_aggregator_incoming_parcels"
+PARCELS_DELIVERED = "sensor.parcel_aggregator_delivered_parcels"
+PARCEL_NOT_YET_OUT = ("registered", "in_transit")
+PARCEL_ARRIVING_S = 900
 
 WOLT_DELIVERY = "sensor.wolt_delivery_"
 WOLT_ORDER = re.compile(r"sensor\.wolt_order_(.+?)_(estimated_arrival|item_count)(_\d+)?")
@@ -90,6 +103,7 @@ class Delivery:
     window_end: float | None = None
     item_count: int | None = None
     ended_at: float | None = None
+    carrier: str | None = None
 
 
 def attributes(full):
@@ -299,6 +313,50 @@ def poll_nemlig(client):
         return {"ok": False, "error": f"{type(error).__name__}: {error}"[:200]}
 
 
+def tidy(value):
+    """A display string without stray whitespace; '' for anything that is not a string."""
+    return " ".join(value.split()) if isinstance(value, str) else ""
+
+
+def parcel_delivery(parcel, now):
+    """The Delivery for one Parcel Aggregator parcel; None unless it matters today: out for delivery, registered
+    or in transit with an expected time today, or delivered. Arriving means the expected time is within
+    PARCEL_ARRIVING_S or past. A delivered parcel ends when its carrier says; the ledger dates it otherwise."""
+    if not isinstance(parcel, dict):
+        return None
+    carrier, barcode = tidy(parcel.get("carrier")), tidy(parcel.get("barcode"))
+    source = re.sub(r"[^a-z0-9]+", "_", carrier.lower()).strip("_")
+    if not source or not barcode:
+        return None
+    start, end = epoch(parcel.get("planned_from")), epoch(parcel.get("planned_to"))
+    window = start is not None and end is not None and start < end
+    times = {"window_start": start, "window_end": end} if window else {"eta": start}
+    status, ended_at = parcel.get("status"), None
+    if status == "out_for_delivery":
+        soon = start is not None and start - now <= PARCEL_ARRIVING_S
+        stage = "arriving" if soon else "on_the_way"
+    elif status in PARCEL_NOT_YET_OUT and start is not None and local_day(start) == local_day(now):
+        stage = "preparing"
+    elif status == "delivered":
+        stage, ended_at = "delivered", epoch(parcel.get("delivered_at"))
+    else:
+        return None
+    return Delivery(f"{source}:{barcode}", source, "parcel", tidy(parcel.get("sender")) or carrier, stage,
+                    ended_at=ended_at, carrier=carrier, **times)
+
+
+def parcel_deliveries(lists, now):
+    """Deliveries from the aggregator's parcel lists, delivered ones last. A parcel in two lists is delivered
+    if either says so: that end is final."""
+    found = {}
+    for parcels in lists:
+        for parcel in parcels:
+            delivery = parcel_delivery(parcel, now)
+            if delivery and (delivery.id not in found or delivery.stage == "delivered"):
+                found[delivery.id] = delivery
+    return list(found.values())
+
+
 class Ledger:
     """What the readers cannot know: that a delivery ended, and when."""
 
@@ -372,16 +430,39 @@ def clock(at, whole=False):
     return text + (" AM" if moment.hour < 12 else " PM")
 
 
-def window_text(start, end):
+def window_text(start, end, link="to"):
     if start is None or end is None:
         return None
     first, last = clock(start, whole=True), clock(end, whole=True)
     if first[-2:] == last[-2:]:
         first = first[:-3]
-    return f"{first} to {last}"
+    return f"{first} {link} {last}"
+
+
+def article(name):
+    return "An" if name.startswith(tuple("AEIOU")) and not name.isupper() else "A"
+
+
+def parcel_sentence(delivery, now):
+    carrier = delivery.carrier or delivery.title
+    parcel = f"{article(carrier)} {carrier} parcel"
+    window = window_text(delivery.window_start, delivery.window_end, "and")
+    when = None
+    if window:
+        when = f"between {window}"
+    elif delivery.eta is not None:
+        when = f"around {clock(delivery.eta, whole=True)}"
+    if delivery.stage == "preparing":
+        return f"{parcel} is expected {when or 'today'}."
+    due = delivery.window_end if delivery.window_end is not None else delivery.eta
+    if due is not None and due <= now:
+        return f"{parcel} should be there any moment now."
+    return f"{parcel} is out for delivery" + (f", expected {when}." if when else ".")
 
 
 def sentence(delivery, now):
+    if delivery.kind == "parcel":
+        return parcel_sentence(delivery, now)
     if delivery.source == "wolt":
         if delivery.stage == "preparing":
             text = f"{delivery.title} is still making it."
@@ -410,6 +491,8 @@ def spoken(active, now):
         return "There's no delivery on the way."
     text = sentence(active[0], now)
     more = len(active) - 1
+    if more and active[0].kind == "parcel":
+        return f"{text[:-1]}, and {more} more."
     if more:
         text += " There's one more after that." if more == 1 else f" There are {more} more after that."
     return text
@@ -451,7 +534,9 @@ class HomeDelivery(hass.Hass):
             self._nemlig = NemligClient(user, password)
         else:
             self.log("No Nemlig login configured: Nemlig deliveries are not tracked", level="WARNING")
-        self._readers = [self._read_wolt, self._read_nemlig]
+        self._readers = [self._read_wolt, self._read_nemlig, self._read_parcels]
+        for entity_id in (PARCELS_INCOMING, PARCELS_DELIVERED):
+            self.listen_state(self._on_change, entity_id, attribute="all")
         self.run_every(self._on_tick, "now+5", TICK_S)
         self._refresh()
 
@@ -498,6 +583,13 @@ class HomeDelivery(hass.Hass):
             return []
         delivery = nemlig_delivery(self._nemlig_order, now)
         return [delivery] if delivery else []
+
+    def _read_parcels(self, now):
+        lists = []
+        for entity_id in (PARCELS_INCOMING, PARCELS_DELIVERED):
+            parcels = attributes(self.get_state(entity_id, attribute="all")).get("parcels")
+            lists.append(parcels if isinstance(parcels, list) else [])
+        return parcel_deliveries(lists, now)
 
     def _poll_nemlig(self):
         now = self.get_now().timestamp()

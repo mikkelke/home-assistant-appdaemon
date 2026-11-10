@@ -40,6 +40,7 @@ TAGS = {
     "probe": "live_cook_probe", "coffee": "live_coffee", "front": "live_doorbell_front",
     "back": "live_doorbell_back", "apartment": "live_doorbell_apartment",
     "wolt": "live_delivery_wolt", "nemlig": "live_delivery_nemlig",
+    "airmee": "live_delivery_airmee", "postnord": "live_delivery_postnord", "gls": "live_delivery_gls",
 }
 
 

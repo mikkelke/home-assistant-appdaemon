@@ -18,10 +18,15 @@ SEND_INTERVAL_S = 60
 TICK_S = 10
 TAGS = ("live_washer", "live_dryer", "live_cook_bath", "live_cook_probe", "live_coffee",
         "live_doorbell_front", "live_doorbell_back", "live_doorbell_apartment",
-        "live_delivery_wolt", "live_delivery_nemlig")
+        "live_delivery_wolt", "live_delivery_nemlig",
+        "live_delivery_airmee", "live_delivery_postnord", "live_delivery_gls")
 DOORS = {"front door": "front", "back door": "back", "apartment door": "apartment"}
-DELIVERY_APPS = {"wolt": "app://com.wolt.android", "nemlig": "app://com.nemlig"}
+DELIVERY_APPS = {"wolt": "app://com.wolt.android", "nemlig": "app://com.nemlig",
+                 "airmee": "app://com.airmee.customer", "postnord": "app://se.postnord.private",
+                 "gls": "app://dk.gls.consigneeapp"}
 DELIVERY_ICONS = {"wolt": ("mdi:chef-hat", "mdi:moped"), "nemlig": ("mdi:cart", "mdi:truck-delivery")}
+PARCEL_CARRIERS = {"airmee": "Airmee", "postnord": "PostNord", "gls": "GLS"}
+PARCEL_ICON = "mdi:package-variant-closed"
 DELIVERY_STAGES = {"preparing": "Preparing", "on_the_way": "On the way", "arriving": "Arriving"}
 ENTITIES = {"washer": "sensor.washer_state", "dryer": "sensor.dryer_state", "cook": "sensor.cook_state",
             "coffee": "sensor.coffee_state", "doorbell": "sensor.intercom_visit",
@@ -236,8 +241,31 @@ def delivery_title(delivery):
     return name or "Nemlig"
 
 
+def parcel_card(delivery, now):
+    """A parcel has a card only while it is out for delivery, titled by its carrier. An exact ETA is counted
+    down to; otherwise the window is shown, or just the stage."""
+    source, stage = delivery.get("source"), delivery.get("stage")
+    if stage not in ("on_the_way", "arriving"):
+        return None
+    tag, title, link = "live_delivery_" + source, PARCEL_CARRIERS[source], DELIVERY_APPS[source]
+    label = "Arriving" if stage == "arriving" else "Out for delivery"
+    eta = epoch(delivery.get("eta"))
+    start, end = epoch(delivery.get("window_start")), epoch(delivery.get("window_end"))
+    due = end if end is not None else eta
+    if due is not None and due <= now:
+        return Card(tag, title, "Arriving", "Arriving", PARCEL_ICON, link)
+    if eta is not None:
+        return Card(tag, title, f"{label} · {hhmm(eta)}", countdown(eta, now, label), PARCEL_ICON, link, eta)
+    window = window_label(start, end)
+    if window:
+        return Card(tag, title, f"{label} · {window}", window, PARCEL_ICON, link)
+    return Card(tag, title, label, "Arriving" if stage == "arriving" else "On the way", PARCEL_ICON, link)
+
+
 def delivery_card(delivery, now):
     source, stage = delivery.get("source"), delivery.get("stage")
+    if source in PARCEL_CARRIERS:
+        return parcel_card(delivery, now)
     if source not in DELIVERY_APPS or stage not in DELIVERY_STAGES:
         return None
     tag, title, link = "live_delivery_" + source, delivery_title(delivery), DELIVERY_APPS[source]
@@ -265,7 +293,7 @@ def delivery_entries(full):
 
 
 def delivery_cards(full, now):
-    """One card per source: its first active delivery, the sensor having sorted them by arrival."""
+    """One card per source: its first delivery that has a card, the sensor having sorted them by arrival."""
     cards = {}
     for delivery in delivery_entries(full):
         card = delivery_card(delivery, now)

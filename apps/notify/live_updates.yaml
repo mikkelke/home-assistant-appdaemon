@@ -31,8 +31,9 @@ LiveUpdates:
   doorbell_people: [mikkel]
   doorbell_max_s: 180
 
-  # HomeDelivery's sensor.home_delivery: one card per source (Wolt, Nemlig) for its next active delivery,
-  # cleared when delivered. A cancelled delivery also sends one real push through MobileNotifier, category
+  # HomeDelivery's sensor.home_delivery: one card per source (Wolt, Nemlig, and the parcel carriers Airmee,
+  # PostNord, GLS) for its next active delivery, cleared when delivered. A parcel has a card only while it is
+  # out for delivery. A cancelled delivery also sends one real push through MobileNotifier, category
   # delivery. Kristine orders on Mikkel's Wolt account; she gets these once she is in enabled_people.
   delivery_entity: sensor.home_delivery
   delivery_people: [mikkel, kristine]
