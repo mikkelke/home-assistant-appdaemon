@@ -147,6 +147,20 @@ class SmallRules(unittest.TestCase):
         self.assertEqual(uv.restore_target(None, 38), 38)
         self.assertIsNone(uv.restore_target(None, None))
 
+    def test_a_before_position_near_the_lowered_one_counts_as_unknown(self):
+        # A visit noticed late finds the blind already lowered: that is not where a resident left it.
+        for prior in (0, 3, 5):
+            with self.subTest(prior=prior):
+                self.assertEqual(uv.restore_target(prior, 38, 0), 38)
+        self.assertEqual(uv.restore_target(6, 38, 0), 6)
+        self.assertEqual(uv.restore_target(100, 38, 0), 100)
+        self.assertEqual(uv.restore_target(77, 38, 100), 77)
+        self.assertEqual(uv.restore_target(95, 38, 100), 38)
+
+    def test_without_a_default_an_unknown_before_position_is_not_restored(self):
+        self.assertIsNone(uv.restore_target(0, None, 0))
+        self.assertEqual(uv.restore_target(0, 38, None), 0)
+
     def test_sanitize_keeps_a_good_visit(self):
         raw = {"kind": "cleaner", "who": "Liga Cleaning", "since": 100.0, "anchor": 160.0,
                "blinds": {"bedroom": {"state": "lowered", "prior": 38, "asserted": 120.0}},
@@ -181,6 +195,13 @@ class SmallRules(unittest.TestCase):
         self.assertEqual(uv.ended_text(uv.QUIET, t, tz, 15, 2),
                          "Visit ended at 13:53: the front door is closed and the flat has been quiet for 15 min")
         self.assertEqual(uv.ended_text(uv.CAP, t, tz, 15, 2), "Visit ended at 13:53: 2 h limit reached")
+        self.assertEqual(uv.ended_text(uv.REPORTED, t, tz, 15, 2), "Visit ended at 13:53: reported by voice")
+        self.assertEqual(uv.reported_text(t, tz), "Cleaners reported by voice at 13:53")
+
+    def test_every_end_reason_has_its_text(self):
+        for why in uv.END_REASONS:
+            with self.subTest(why=why):
+                self.assertTrue(uv.ended_text(why, T0, TZ, 15, 2))
 
 
 # ---------- the app ----------
@@ -765,6 +786,169 @@ class Blinds(unittest.TestCase):
         unlock(app, 0, GUEST_NAME)
         tick(app, QUIET_S)
         self.assertEqual(owner_of(app, "BedroomBlindOwner").calls, [])
+
+
+def report(app, seconds, status="arrived"):
+    at(app, seconds)
+    app._on_report("untracked_visitor_report", {"status": status}, {})
+
+
+class ReportedByVoice(unittest.TestCase):
+    def test_the_report_event_is_listened_for(self):
+        app = make_app()
+        self.assertIn("untracked_visitor_report", [c.args[1] for c in app.listen_event.call_args_list])
+        self.assertEqual(app.listen_event.call_args_list[-1].args[0], app._on_report)
+
+    def test_arrived_starts_a_cleaner_visit_as_the_first_cleaner(self):
+        app = make_app(args={"cleaners": ["Liga Cleaning", "Ona Cleaning"]})
+        report(app, 5)
+        state, attrs = published(app)
+        self.assertEqual((state, attrs["who"]), ("cleaner", "Liga Cleaning"))
+        self.assertEqual(attrs["since"], iso(5))
+        self.assertEqual(attrs["reason"], "Cleaners reported by voice at 13:53")
+        self.assertEqual(attrs["end_reason"], "")
+
+    def test_arrived_lowers_both_blinds_through_their_owners_like_a_keypad_visit(self):
+        app = make_app()
+        report(app, 0)
+        for name in ("BedroomBlindOwner", "BathroomBlindOwner"):
+            calls = owner_of(app, name).requests()
+            self.assertEqual(len(calls), 1)
+            _, source, position, reason, ttl = calls[0]
+            self.assertEqual((source, position, ttl), ("visitor", 0, None))
+            self.assertIn(CLEANER_NAME, reason)
+
+    def test_every_published_attribute_is_still_a_string(self):
+        app = make_app()
+        report(app, 5)
+        for key, value in published(app)[1].items():
+            with self.subTest(key=key):
+                self.assertIsInstance(value, str)
+        report(app, 100, "left")
+        for key, value in published(app)[1].items():
+            with self.subTest(key=key):
+                self.assertIsInstance(value, str)
+
+    def test_arrived_while_the_cleaner_visit_is_on_keeps_it_alive_and_changes_nothing_else(self):
+        app = make_app()
+        unlock(app, 0, CLEANER_NAME)
+        before = published(app)
+        count = len(app.published)
+        report(app, 1000)
+        self.assertEqual(len(app.published), count)
+        self.assertEqual(published(app), before)
+        self.assertIn("unlocked the front door", published(app)[1]["reason"])
+        tick(app, 1000 + QUIET_S - 1)
+        self.assertEqual(published(app)[0], "cleaner")
+        tick(app, 1000 + QUIET_S)
+        self.assertEqual(published(app)[0], "none")
+
+    def test_arrived_replaces_a_guest_visit(self):
+        app = make_app()
+        unlock(app, 0, GUEST_NAME)
+        report(app, 10)
+        state, attrs = published(app)
+        self.assertEqual((state, attrs["who"], attrs["since"]), ("cleaner", CLEANER_NAME, iso(10)))
+        self.assertEqual(owner_of(app, "BedroomBlindOwner").positions(), [0])
+
+    def test_left_ends_a_cleaner_visit_at_once_and_gives_the_blinds_back(self):
+        app = make_app()
+        report(app, 0)
+        zone(app, 30, "kitchen", True)
+        report(app, 600, "left")
+        state, attrs = published(app)
+        self.assertEqual((state, attrs["who"], attrs["since"]), ("none", "", ""))
+        self.assertEqual(attrs["end_reason"], "reported")
+        self.assertEqual(attrs["reason"], "Visit ended at 14:03: reported by voice")
+        self.assertEqual(owner_of(app, "BedroomBlindOwner").positions(), [0, 38])
+        self.assertEqual(owner_of(app, "BathroomBlindOwner").positions(), [0, 40])
+        self.assertEqual(owner_of(app, "BedroomBlindOwner").requests()[-1][4], 3)
+
+    def test_left_puts_the_blinds_back_where_they_were_when_that_is_not_the_lowered_position(self):
+        app = make_app(attrs={("cover.bedroom_blind", "current_position"): 100,
+                              ("cover.bathroom_blind", "current_position"): 55})
+        report(app, 0)
+        report(app, 60, "left")
+        self.assertEqual(owner_of(app, "BedroomBlindOwner").positions(), [0, 100])
+        self.assertEqual(owner_of(app, "BathroomBlindOwner").positions(), [0, 55])
+
+    def test_a_visit_reported_after_the_blinds_were_lowered_by_hand_gives_them_the_default_back(self):
+        app = make_app(attrs={("cover.bedroom_blind", "current_position"): 0,
+                              ("cover.bathroom_blind", "current_position"): 2})
+        report(app, 0)
+        self.assertEqual(json.loads(Path(app.state_file).read_text())["visit"]["blinds"]["bedroom"]["prior"], 0)
+        report(app, 60, "left")
+        self.assertEqual(owner_of(app, "BedroomBlindOwner").positions(), [0, 38])
+        self.assertEqual(owner_of(app, "BathroomBlindOwner").positions(), [0, 40])
+
+    def test_the_end_of_an_ordinary_visit_with_a_blind_found_lowered_gives_the_default_back_too(self):
+        app = make_app(attrs={("cover.bedroom_blind", "current_position"): 0})
+        unlock(app, 0, CLEANER_NAME)
+        tick(app, QUIET_S)
+        self.assertEqual(owner_of(app, "BedroomBlindOwner").positions(), [0, 38])
+
+    def test_left_with_no_visit_does_nothing(self):
+        app = make_app()
+        count = len(app.published)
+        report(app, 10, "left")
+        self.assertEqual(len(app.published), count)
+        self.assertEqual(published(app)[0], "none")
+        for name in ("BedroomBlindOwner", "BathroomBlindOwner"):
+            self.assertEqual(owner_of(app, name).calls, [])
+
+    def test_left_never_ends_a_guest_visit(self):
+        app = make_app()
+        unlock(app, 0, GUEST_NAME)
+        report(app, 10, "left")
+        state, attrs = published(app)
+        self.assertEqual((state, attrs["who"]), ("guest", GUEST_NAME))
+
+    def test_anything_else_is_ignored_and_logged(self):
+        for data in ({"status": "maybe"}, {"status": None}, {"status": ["left"]}, {}, None, "left"):
+            with self.subTest(data=data):
+                app = make_app()
+                unlock(app, 0, CLEANER_NAME)
+                count = len(app.published)
+                app._on_report("untracked_visitor_report", data, {})
+                self.assertEqual(published(app)[0], "cleaner")
+                self.assertEqual(len(app.published), count)
+                self.assertEqual([lvl for lvl, msg in app.logged if "ignoring untracked_visitor_report" in msg],
+                                 ["WARNING"])
+
+    def test_case_and_spacing_of_the_status_do_not_matter(self):
+        app = make_app()
+        report(app, 0, " ARRIVED ")
+        self.assertEqual(published(app)[0], "cleaner")
+        report(app, 30, "Left")
+        self.assertEqual(published(app)[0], "none")
+
+    def test_without_any_cleaner_configured_a_report_is_ignored(self):
+        app = make_app(args={"cleaners": []})
+        report(app, 0)
+        self.assertEqual(published(app)[0], "none")
+        self.assertTrue(any(lvl == "WARNING" for lvl, _ in app.logged))
+
+    def test_the_reported_end_survives_a_restart_from_the_file_and_from_the_entity(self):
+        file = new_state_file()
+        first = make_app(state_file=file)
+        report(first, 0)
+        report(first, 60, "left")
+        self.assertEqual(json.loads(Path(file).read_text())["end_reason"], "reported")
+        again = make_app(state_file=file, now=3600)
+        self.assertEqual(published(again)[1]["end_reason"], "reported")
+        self.assertEqual(published(again)[1]["reason"], "Visit ended at 13:54: reported by voice")
+        no_file = make_app(states={ENTITY: "none"},
+                           attrs={(ENTITY, "end_reason"): "reported", (ENTITY, "reason"): "Visit ended"})
+        self.assertEqual(published(no_file)[1]["end_reason"], "reported")
+
+    def test_a_reported_visit_survives_a_restart_and_ends_by_the_usual_rules(self):
+        file = new_state_file()
+        first = make_app(state_file=file)
+        report(first, 0)
+        again = make_app(state_file=file, now=120)
+        self.assertEqual((published(again)[0], published(again)[1]["who"]), ("cleaner", CLEANER_NAME))
+        tick(again, QUIET_S)
+        self.assertEqual(published(again)[1]["end_reason"], "quiet")
 
 
 class Restart(unittest.TestCase):

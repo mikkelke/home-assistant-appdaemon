@@ -4,8 +4,8 @@ in the flat?
 
 State is none, cleaner or guest. Attributes: who (the keypad user's name), since (when the
 visit began, ISO), reason (one sentence for the current state) and end_reason (quiet,
-mounted, cap or hard_cap after a visit, otherwise ""). who and since are "" at none. Consumers
-read this entity, never the lock.
+mounted, cap, hard_cap or reported after a visit, otherwise ""). who and since are "" at none.
+Consumers read this entity, never the lock.
 
 ON. lock.yale reports unlocked and its changed_by names a keypad person who is not a
 resident: cleaner when the name is in `cleaners`, guest for any other person. Lock labels
@@ -16,13 +16,20 @@ full account names and this repo is public); a `non_person` label must match the
 A second unlock by the same person during a visit belongs to the same visit; an unlock by
 anyone else replaces it.
 
+REPORTED. The cleaners who come in with a key leave no keypad name, so they can be reported: the
+untracked_visitor_report event {status: arrived} starts a cleaner visit as the first entry of
+`cleaners`, or keeps the one that is on alive like a second unlock does, with the reason
+"Cleaners reported by voice at HH:MM". {status: left} ends a cleaner visit at once. It does
+nothing when no cleaner visit is on, and never ends a guest visit.
+
 OFF. The first of
   * the front door is closed and every `activity` entity has been explicitly off for quiet_min
     minutes (the quiet clock restarts at every door edge and every activity change),
   * the cleaner put the stick vacuum back on its mount during the visit and it has stayed
     there for mount_min minutes,
   * cap_hours have passed since the visit began,
-  * hard_cap_hours have passed since the visit began, even with a hold.
+  * hard_cap_hours have passed since the visit began, even with a hold,
+  * a cleaner visit is reported over (end_reason reported).
 For a cleaner visit, optional `hold` being on blocks the quiet exit and cap_hours; every
 hold change restarts the quiet clock. Guests ignore the hold and the mount.
 
@@ -30,8 +37,10 @@ BLINDS. While the visitor is the cleaner, each blind in `blinds` is held at lowe
 through its blind owner app (apps/blinds/bedroom_blind_owner.py) as the "visitor" source and
 asked again every blind_reassert_min minutes, so the claim never lapses mid-visit. This app
 never writes a cover itself. When the visit ends the claim is replaced by a short request
-for the position the blind had when the visit began (restore_position when that could not be
-read), then it lapses and whatever else drives the blind decides again. A blind the owner
+for the position the blind had when the visit began, then it lapses and whatever else drives the
+blind decides again. restore_position is used when that position could not be read, and also when
+it was within 5 of lowered_position: a blind found already lowered (a visit noticed late) was not
+left there by a resident, and putting it back would keep the room dark. A blind the owner
 refuses, because a hand outranks the visitor, is left alone for the rest of the visit.
 
 Restart: the visit, its quiet clock, hold, end cause and the per-blind state are written to
@@ -62,10 +71,20 @@ QUIET = "quiet"
 CAP = "cap"
 HARD_CAP = "hard_cap"
 MOUNTED = "mounted"
+REPORTED = "reported"
+
+# The two things the untracked_visitor_report event can say.
+ARRIVED = "arrived"
+LEFT = "left"
+
+# A "before" position this close to lowered_position counts as unknown (see the docstring).
+UNKNOWN_BEFORE_WITHIN = 5
 
 # sensor.stick_vacuum states (apps/appliances/stick_vacuum.py).
 ON_MOUNT = ("charging", "charged")
 OFF_MOUNT = ("in_use", "off_mount")
+
+END_REASONS = (QUIET, CAP, HARD_CAP, MOUNTED, REPORTED)
 
 BLIND_STATES = ("pending", "lowered", "yielded")
 UNLOCKED_STATES = ("unlocked", "unlocking", "open")
@@ -128,8 +147,11 @@ def end_reason(now, since, anchor, *, door_open, active, quiet_s, cap_s, hold=Fa
     return None
 
 
-def restore_target(prior, default):
-    """The position to give a blind back: where it was, else the configured default."""
+def restore_target(prior, default, lowered=None):
+    """The position to give a blind back: where it was, else the configured default. A `prior`
+    within UNKNOWN_BEFORE_WITHIN of `lowered` counts as unknown, so the default is used."""
+    if prior is not None and lowered is not None and abs(prior - int(lowered)) <= UNKNOWN_BEFORE_WITHIN:
+        prior = None
     chosen = prior if prior is not None else default
     return None if chosen is None else int(chosen)
 
@@ -175,12 +197,17 @@ def started_text(who, epoch, tz):
     return f"{who} unlocked the front door at {hhmm(epoch, tz)}"
 
 
+def reported_text(epoch, tz):
+    return f"Cleaners reported by voice at {hhmm(epoch, tz)}"
+
+
 def ended_text(why, epoch, tz, quiet_min, cap_hours, hard_cap_hours=4, mount_min=3):
     cause = {
         MOUNTED: f"the stick vacuum has been back on its mount for {mount_min:g} min",
         QUIET: f"the front door is closed and the flat has been quiet for {quiet_min:g} min",
         CAP: f"{cap_hours:g} h limit reached",
         HARD_CAP: f"{hard_cap_hours:g} h hard limit reached",
+        REPORTED: "reported by voice",
     }[why]
     return f"Visit ended at {hhmm(epoch, tz)}: {cause}"
 
@@ -231,6 +258,7 @@ class UntrackedVisitor(hass.Hass):
         if self.mount_entity:
             self.listen_state(self._on_mount, self.mount_entity)
         self.listen_event(self._on_plugin_started, "plugin_started")
+        self.listen_event(self._on_report, "untracked_visitor_report")
         self.run_every(self._tick, f"now+{TICK_S}", TICK_S)
 
         current = self._visit["kind"] if self._visit else NONE
@@ -279,13 +307,28 @@ class UntrackedVisitor(hass.Hass):
         with self._lock:
             self._publish(self._now())
 
+    def _on_report(self, event_name, data, kwargs):
+        status = str(data.get("status") or "").strip().lower() if isinstance(data, dict) else ""
+        if status not in (ARRIVED, LEFT) or not self.cleaners:
+            self.log(f"UntrackedVisitor: ignoring untracked_visitor_report {data!r}", level="WARNING")
+            return
+        with self._lock:
+            now = self._now()
+            if status == ARRIVED:
+                self._unlocked_by(now, CLEANER, self.cleaners[0], reported_text(now, self.get_now().tzinfo))
+            elif self._visit is not None and self._visit["kind"] == CLEANER:
+                self._end(now, REPORTED)
+            else:
+                self.log("UntrackedVisitor: the cleaners were reported gone, but no cleaner visit is on",
+                         level="INFO")
+
     def _tick(self, kwargs):
         with self._lock:
             self._step(self._now())
 
     # ---------- the visit ----------
 
-    def _unlocked_by(self, now, kind, who):
+    def _unlocked_by(self, now, kind, who, reason=None):
         visit = self._visit
         if visit is not None and visit["kind"] == kind and visit["who"] == who:
             visit["anchor"] = now
@@ -299,7 +342,7 @@ class UntrackedVisitor(hass.Hass):
         tz = self.get_now().tzinfo
         self._visit = {"kind": kind, "who": who, "since": now, "anchor": now, "blinds": blinds,
                        "mounted": None}
-        self._reason = started_text(who, now, tz)
+        self._reason = reason or started_text(who, now, tz)
         self._end_reason = ""
         if kind == CLEANER:
             self._sync_blinds(now)
@@ -410,7 +453,7 @@ class UntrackedVisitor(hass.Hass):
             owner = self._owner(cfg)
             if owner is None:
                 continue
-            target = restore_target(blind["prior"], cfg.get("restore_position"))
+            target = restore_target(blind["prior"], cfg.get("restore_position"), cfg.get("lowered_position"))
             if target is None:
                 self._withdraw(owner, "visit over")
                 continue
@@ -437,7 +480,7 @@ class UntrackedVisitor(hass.Hass):
             self._visit = sanitize_visit(raw.get("visit"))
             if isinstance(raw.get("reason"), str) and raw["reason"]:
                 self._reason = raw["reason"]
-            if raw.get("end_reason") in (QUIET, CAP, HARD_CAP, MOUNTED):
+            if raw.get("end_reason") in END_REASONS:
                 self._end_reason = raw["end_reason"]
             if (self._visit is not None and self._visit["kind"] == CLEANER
                     and isinstance(raw.get("hold"), bool) and raw["hold"] != self._hold):
@@ -450,7 +493,7 @@ class UntrackedVisitor(hass.Hass):
                 why = self.get_state(self.visitor_entity, attribute="end_reason")
                 if isinstance(reason, str) and reason:
                     self._reason = reason
-                if why in (QUIET, CAP, HARD_CAP, MOUNTED):
+                if why in END_REASONS:
                     self._end_reason = why
         if self._visit is not None:
             self._visit["since"] = min(self._visit["since"], now)
