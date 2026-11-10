@@ -65,6 +65,9 @@ bedroom_blind_control:
   property_key_partial: "002"
   partial_position: 38
   bathroom_partial_position: 40
+  # Window clear (device frame: 0 = fully retracted). Only the voice command moves a blind here;
+  # a held wall button has no gesture for it.
+  open_position: 0
   event_value_held: "KeyHeldDown"
   # Partial position matching tolerance (used when deciding if bedroom is at partial before closing)
   partial_match_tolerance: 2
@@ -90,7 +93,10 @@ bedroom_blind_control:
   # Bedroom-blind writes route through the single owner (bedroom_blind_owner.yaml)
   # as the "manual" rank - always wins, and starts the shared manual pause. When
   # the owner app is missing/broken this app writes directly, exactly as before.
-  # The bathroom blind is not owned and is always written directly.
+  # The wall remote always writes the bathroom blind directly.
   owner_app: BedroomBlindOwner
+  # Voice (the curtain_command event) asks each blind's owner as "manual" with the reason
+  # "voice: <position>", bathroom included; without an owner the cover is written directly.
+  bathroom_owner_app: BathroomBlindOwner
 
 

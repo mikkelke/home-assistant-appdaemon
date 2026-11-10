@@ -2,6 +2,10 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
 import cover_util
 
+# Positions the voice event can name, and the rooms it can name.
+VOICE_POSITIONS = ("fully_up", "standard", "fully_open", "automatic")
+VOICE_ROOMS = ("bedroom", "bathroom")
+
 
 class BedroomBlindControl(hass.Hass):
     """
@@ -14,6 +18,15 @@ class BedroomBlindControl(hass.Hass):
     - property_key_close: "001" -> sets position to 100 (fully closed)
     - property_key_partial: "002" -> sets position to 38 (preferred partial open)
     - event_value_held: "KeyHeldDown"
+
+    Voice: the curtain_command event {position, room} moves the bedroom and bathroom blinds
+    the way a hand on the remote does. position is fully_up (close_position), standard
+    (partial_position for the bedroom, bathroom_partial_position for the bathroom),
+    fully_open (open_position) or automatic; room is bedroom, bathroom or both. Each move is a
+    "manual" request to that blind's owner app, with the reason "voice: <position>", so it
+    starts the same manual hold as a hand move; without an owner the cover is written
+    directly. automatic withdraws the manual hold and moves nothing: whatever else drives the
+    blind decides again on its own schedule.
     """
 
     def initialize(self):
@@ -26,8 +39,11 @@ class BedroomBlindControl(hass.Hass):
         # gesture is the "manual" rank there - it always wins AND it starts the one
         # shared manual pause. Looked up lazily per press; when the owner is
         # missing/broken the write below stays exactly what it was before the owner
-        # existed (the bathroom blind is not owned and is always written directly).
+        # existed (a held wall button writes the bathroom blind directly; only the voice
+        # command asks the bathroom blind's owner).
         self.owner_app = self.args.get("owner_app", "BedroomBlindOwner")
+        # Voice moves of the bathroom blind go through this owner (see the class docstring).
+        self.bathroom_owner_app = self.args.get("bathroom_owner_app", "BathroomBlindOwner")
 
         if not self.device_id:
             self.error("'device_id' is missing in configuration. App will not listen to events.")
@@ -49,6 +65,8 @@ class BedroomBlindControl(hass.Hass):
         self.close_position = int(self.args.get("close_position", 100))
         self.partial_position = int(self.args.get("partial_position", 38))
         self.bathroom_partial_position = int(self.args.get("bathroom_partial_position", 40))
+        # Window clear (device frame: 0 = fully retracted). Only the voice event moves a blind here.
+        self.open_position = int(self.args.get("open_position", 0))
         # How close current position must be to partial_position to consider it a partial state
         self.partial_match_tolerance = int(self.args.get("partial_match_tolerance", 2))
         # Threshold for considering a blind "closed" (handles low battery cases where blind stops at 99%)
@@ -75,6 +93,9 @@ class BedroomBlindControl(hass.Hass):
         if self.bathroom_partial_position < 0 or self.bathroom_partial_position > 100:
             self.error(f"Invalid bathroom_partial_position: {self.bathroom_partial_position}. Must be 0-100.")
             return
+        if self.open_position < 0 or self.open_position > 100:
+            self.error(f"Invalid open_position: {self.open_position}. Must be 0-100.")
+            return
         if self.closed_threshold < 0 or self.closed_threshold > 100:
             self.error(f"Invalid closed_threshold: {self.closed_threshold}. Must be 0-100.")
             return
@@ -93,6 +114,7 @@ class BedroomBlindControl(hass.Hass):
             property_key=self.property_key_partial,
             description=f"partial to {self.partial_position}%",
         )
+        self.listen_event(self._on_curtain_command, "curtain_command")
 
         self.log(
             f"{self.__class__.__name__} initialized. Device={self.device_id}, "
@@ -328,10 +350,11 @@ class BedroomBlindControl(hass.Hass):
             level="INFO",
         )
 
-    def _blind_owner(self):
-        """The blind-owner app, or None - and None must degrade, never skip."""
+    def _blind_owner(self, name=None):
+        """The blind-owner app (the bedroom's unless `name` is given), or None - and None must
+        degrade, never skip."""
         try:
-            name = getattr(self, "owner_app", None)
+            name = name if name is not None else getattr(self, "owner_app", None)
             if not name:
                 return None
             app = self.get_app(name)
@@ -403,6 +426,70 @@ class BedroomBlindControl(hass.Hass):
             self.error(
                 f"Failed setting {self.target_cover} to {position}%{pos_context} ({reason}): {e}"
             )
+
+    def _on_curtain_command(self, event_name, data, kwargs):
+        """Voice: curtain_command {position, room} - see the class docstring. An unknown
+        position or room is logged and ignored, never guessed."""
+        data = data if isinstance(data, dict) else {}
+        word = str(data.get("position") or "").strip().lower()
+        room = str(data.get("room") or "both").strip().lower()
+        if word not in VOICE_POSITIONS:
+            self.log(f"Voice: ignoring curtain_command with position {data.get('position')!r}", level="WARNING")
+            return
+        if room != "both" and room not in VOICE_ROOMS:
+            self.log(f"Voice: ignoring curtain_command with room {data.get('room')!r}", level="WARNING")
+            return
+        for name in VOICE_ROOMS if room == "both" else (room,):
+            try:
+                self._voice_move(name, word)
+            except Exception as e:
+                self.error(f"Voice: {name} -> {word} failed: {e}")
+
+    def _voice_move(self, room, word):
+        """One room's share of a curtain_command. A missing or failing owner costs the hold, not
+        the move: the cover is written directly. An owner that does not grant is left alone."""
+        if room == "bedroom":
+            cover, owner_app, standard = self.target_cover, self.owner_app, self.partial_position
+        else:
+            cover, owner_app, standard = (
+                self.bathroom_blind_entity, self.bathroom_owner_app, self.bathroom_partial_position,
+            )
+        if not cover:
+            self.log(f"Voice: {room} has no blind configured, skipping", level="WARNING")
+            return
+        owner = self._blind_owner(owner_app)
+
+        if word == "automatic":
+            if owner is None:
+                self.log(f"Voice: {room} -> automatic, but blind owner {owner_app} is not loaded", level="WARNING")
+                return
+            owner.withdraw("manual", reason="voice: automatic")
+            self.log(f"Voice: {room} -> automatic (manual hold withdrawn)", level="INFO")
+            return
+
+        position = {
+            "fully_up": self.close_position,
+            "standard": standard,
+            "fully_open": self.open_position,
+        }[word]
+        if owner is not None:
+            try:
+                res = owner.request("manual", position, reason=f"voice: {word}")
+            except Exception as e:
+                self.log(f"Blind owner request failed ({e}) - falling back to the direct write", level="WARNING")
+            else:
+                granted = bool(res and res.get("granted"))
+                self.log(f"Voice: {room} -> {word} ({position}%)" + ("" if granted else ", not granted"), level="INFO")
+                return
+        self.call_service("cover/set_cover_position", entity_id=cover, position=position)
+        self.log(f"Voice: {room} -> {word} ({position}%), direct write", level="INFO")
+        self.run_in(
+            self._verify_position,
+            self.verification_delay,
+            entity_id=cover,
+            expected_position=position,
+            reason=f"VOICE_{word.upper()}",
+        )
 
     def _verify_position(self, kwargs):
         """Verify that cover reached expected position after service call."""
