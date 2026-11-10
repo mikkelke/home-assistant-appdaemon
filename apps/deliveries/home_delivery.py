@@ -8,9 +8,9 @@ KEEP_ENDED_S) and that one went missing (held HOLD_MISSING_S in case its source 
 
 A parcel is listed only when it matters today: out for delivery, registered or in transit with an expected time
 that falls today, or delivered. Everything else the aggregator holds (days away, at a pickup point, returning,
-a problem, an unmapped status, old parcels) stays out. The aggregator's parcel has no stops-away or live ETA,
-only planned_from and planned_to: both with planned_from before planned_to is a window, planned_from alone is
-an ETA.
+a problem, an unmapped status, old parcels) stays out of the deliveries and is published as upcoming. The
+aggregator's parcel has no stops-away or live ETA, only planned_from and planned_to: both with planned_from
+before planned_to is a window, planned_from alone is an ETA.
 
 state: the number of active deliveries (preparing, on_the_way, arriving).
 attributes:
@@ -18,6 +18,11 @@ attributes:
                   (a parcel's sender, else its carrier), stage: preparing|on_the_way|arriving|delivered|
                   cancelled, eta, window_start, window_end (ISO local), minutes_left, item_count}], active
                   first, each group by ETA or window start
+  upcoming        [{id, source, title, status, planned_from, planned_to}]: the parcels the aggregator holds as
+                  incoming that deliveries leaves out (not out for delivery, not expected today, not delivered).
+                  id, source and title are built as in deliveries; status is the aggregator's own status word;
+                  planned_from and planned_to are ISO local times when the carrier gives them. Soonest planned
+                  first, then as given
   next            the first active entry
   next_food       the first active entry of kind food
   courier_expected  an active delivery is on its way, near its ETA or inside its window
@@ -324,16 +329,24 @@ def tidy(value):
     return " ".join(value.split()) if isinstance(value, str) else ""
 
 
-def parcel_delivery(parcel, now):
-    """The Delivery for one Parcel Aggregator parcel; None unless it matters today: out for delivery, registered
-    or in transit with an expected time today, or delivered. Arriving means the expected time is within
-    PARCEL_ARRIVING_S or past. A delivered parcel ends when its carrier says; the ledger dates it otherwise."""
+def parcel_identity(parcel):
+    """(carrier, source, barcode) of an aggregator parcel, source being the carrier as a slug; None for anything
+    that is not a parcel with a carrier and a barcode."""
     if not isinstance(parcel, dict):
         return None
     carrier, barcode = tidy(parcel.get("carrier")), tidy(parcel.get("barcode"))
     source = re.sub(r"[^a-z0-9]+", "_", carrier.lower()).strip("_")
-    if not source or not barcode:
+    return (carrier, source, barcode) if source and barcode else None
+
+
+def parcel_delivery(parcel, now):
+    """The Delivery for one Parcel Aggregator parcel; None unless it matters today: out for delivery, registered
+    or in transit with an expected time today, or delivered. Arriving means the expected time is within
+    PARCEL_ARRIVING_S or past. A delivered parcel ends when its carrier says; the ledger dates it otherwise."""
+    identity = parcel_identity(parcel)
+    if identity is None:
         return None
+    carrier, source, barcode = identity
     start, end = epoch(parcel.get("planned_from")), epoch(parcel.get("planned_to"))
     window = start is not None and end is not None and start < end
     times = {"window_start": start, "window_end": end} if window else {"eta": start}
@@ -361,6 +374,30 @@ def parcel_deliveries(lists, now):
             if delivery and (delivery.id not in found or delivery.stage == "delivered"):
                 found[delivery.id] = delivery
     return list(found.values())
+
+
+def upcoming_parcels(parcels, listed):
+    """The incoming parcels whose id is not in `listed` (the published deliveries) and that are not delivered:
+    what is on its way but not today's. Soonest planned first, then as given."""
+    seen, found = set(listed), []
+    for parcel in parcels:
+        identity = parcel_identity(parcel)
+        if identity is None or parcel.get("status") == "delivered":
+            continue
+        carrier, source, barcode = identity
+        id_ = f"{source}:{barcode}"
+        if id_ in seen:
+            continue
+        seen.add(id_)
+        start, end = epoch(parcel.get("planned_from")), epoch(parcel.get("planned_to"))
+        status = parcel.get("status")
+        planned = start if start is not None else end
+        found.append((math.inf if planned is None else planned,
+                      {"id": id_, "source": source, "title": tidy(parcel.get("sender")) or carrier,
+                       "status": status if isinstance(status, str) and status else "unknown",
+                       "planned_from": iso(start), "planned_to": iso(end)}))
+    found.sort(key=lambda item: item[0])
+    return [item for _, item in found]
 
 
 class Ledger:
@@ -517,8 +554,8 @@ def spoken(active, now):
     return text
 
 
-def snapshot(deliveries, now):
-    """The published state and attributes for these deliveries."""
+def snapshot(deliveries, now, incoming=()):
+    """The published state and attributes for these deliveries and the aggregator's incoming parcels."""
     ordered = sorted(deliveries, key=sort_key)
     entries = [entry(delivery, now) for delivery in ordered]
     active = [delivery for delivery in ordered if delivery.stage in ACTIVE]
@@ -533,6 +570,7 @@ def snapshot(deliveries, now):
         reason = "no active delivery"
     return {"state": len(active),
             "attributes": {"friendly_name": "Home delivery", "icon": "mdi:truck-delivery", "deliveries": entries,
+                           "upcoming": upcoming_parcels(incoming, {delivery.id for delivery in ordered}),
                            "next": entries[0] if active else None, "next_food": next_food,
                            "courier_expected": expected, "food_courier_expected": courier_expected(food, now)[0],
                            "door_courier_kind": door_courier_kind(active, now),
@@ -547,6 +585,7 @@ class HomeDelivery(hass.Hass):
         self._listened = set()
         self._wolt = {}
         self._wolt_ok = True
+        self._incoming = []
         self._stages = {}
         self._nemlig = None
         self._nemlig_order = None
@@ -582,7 +621,7 @@ class HomeDelivery(hass.Hass):
             if self._stages.get(id_) != stage:
                 self.log(f"{id_}: {self._stages.get(id_, 'new')} -> {stage}")
         self._stages = stages
-        published = snapshot(deliveries, now)
+        published = snapshot(deliveries, now, self._incoming)
         self.set_state(self._entity, state=str(published["state"]), attributes=published["attributes"], replace=True)
 
     def _read_wolt(self, now):
@@ -613,6 +652,7 @@ class HomeDelivery(hass.Hass):
         for entity_id in (PARCELS_INCOMING, PARCELS_DELIVERED):
             parcels = attributes(self.get_state(entity_id, attribute="all")).get("parcels")
             lists.append(parcels if isinstance(parcels, list) else [])
+        self._incoming = lists[0]
         return parcel_deliveries(lists, now)
 
     def _poll_nemlig(self):
