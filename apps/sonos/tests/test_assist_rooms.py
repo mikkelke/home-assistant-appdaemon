@@ -27,7 +27,7 @@ import assist_rooms as ar  # noqa: E402
 BATHROOM = "media_player.bathroom"
 BEDROOM = "media_player.bedroom"
 SATELLITE = "assist_satellite.bathroom_bathroom_display_assist_satellite"
-ANSWER = "binary_sensor.bathroom_display_answer_playing"
+ANSWER = "binary_sensor.bathroom_bathroom_display_answer_playing"
 MASTER = "input_select.sonos_master_speaker"
 RADIO = "dr_podcasts://radio/p3"
 

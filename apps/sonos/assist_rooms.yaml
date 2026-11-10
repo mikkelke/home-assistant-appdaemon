@@ -9,7 +9,7 @@ AssistRooms:
 
   # Sensors that are on while a satellite's answer plays on a speaker.
   answer_sensors:
-    - binary_sensor.bathroom_display_answer_playing
+    - binary_sensor.bathroom_bathroom_display_answer_playing
 
   # HA area id -> Music Assistant player.
   speakers:
