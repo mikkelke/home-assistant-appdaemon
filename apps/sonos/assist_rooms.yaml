@@ -7,9 +7,9 @@ AssistRooms:
   satellites:
     assist_satellite.bathroom_bathroom_display_assist_satellite: bathroom
 
-  # Satellite entity -> its "answer is playing on the speaker" sensor.
+  # Sensors that are on while a satellite's answer plays on a speaker.
   answer_sensors:
-    assist_satellite.bathroom_bathroom_display_assist_satellite: binary_sensor.bathroom_display_answer_playing
+    - binary_sensor.bathroom_display_answer_playing
 
   # HA area id -> Music Assistant player.
   speakers:

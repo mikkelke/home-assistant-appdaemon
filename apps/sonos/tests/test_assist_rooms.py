@@ -130,7 +130,7 @@ def make_app():
         "satellites": {SATELLITE: "bathroom", "assist_satellite.hallway": "hallway"},
         "speakers": {"bathroom": BATHROOM, "bedroom": BEDROOM},
         "master_select": MASTER, "radio": RADIO, "duck_failsafe_s": 20,
-        "answer_sensors": {SATELLITE: ANSWER},
+        "answer_sensors": [ANSWER],
     }
     app.states = {BATHROOM: state(), BEDROOM: state(), MASTER: {
         "state": "Bedroom", "attributes": {"master_entity_id": BEDROOM},

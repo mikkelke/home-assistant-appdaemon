@@ -2,7 +2,7 @@
 
 satellites maps each Assist satellite entity to its HA area id; speakers maps areas
 to Music Assistant players. A satellite entering listening mutes its room's speaker
-only while it is playing and unmuted, and never while answer_sensors says that
+only while it is playing and unmuted, and never while one of answer_sensors says a
 satellite's answer is still playing on a speaker: Music Assistant lifts a mute for its
 announcement and restores the mute it saw, so a mute made then would come back after
 the release. Only mutes made here are released, either on
@@ -83,7 +83,7 @@ class AssistRooms(hass.Hass):
         self.master_select = self.args.get("master_select", "input_select.sonos_master_speaker")
         self.radio = self.args.get("radio", "dr_podcasts://radio/p3")
         self.duck_failsafe_s = float(self.args.get("duck_failsafe_s", 20))
-        self.answer_sensors = self.args.get("answer_sensors", {})
+        self.answer_sensors = self.args.get("answer_sensors", [])
         self._ducked = {}
         self._duck_generation = 0
 
@@ -101,7 +101,7 @@ class AssistRooms(hass.Hass):
         speaker = self.speakers.get(area)
         if not speaker or old == new:
             return
-        if new == "listening" and not self._answer_playing(entity):
+        if new == "listening" and not self._answer_playing():
             actions = duck_actions(speaker, self._read(speaker), True, area in self._ducked)
             if actions:
                 self._run_actions(area, actions)
@@ -112,9 +112,8 @@ class AssistRooms(hass.Hass):
         elif old == "listening":
             self._release_duck(area)
 
-    def _answer_playing(self, satellite):
-        sensor = self.answer_sensors.get(satellite)
-        return bool(sensor) and self.get_state(sensor) == "on"
+    def _answer_playing(self):
+        return any(self.get_state(sensor) == "on" for sensor in self.answer_sensors)
 
     def _release_duck(self, area):
         owned = self._ducked.pop(area, None) is not None
