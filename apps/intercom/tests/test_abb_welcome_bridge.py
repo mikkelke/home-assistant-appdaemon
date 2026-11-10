@@ -107,6 +107,8 @@ def _bare_bridge(tmpdir, clock):
     app.ring_push_photo_wait_s = 30.0
     app.announce_cameras = {"front door": "camera.abb_front"}
     app.announce_message = "The door is open."
+    app.announce_message_courier = "The door is open. Fifth floor."
+    app.delivery_entity = "sensor.home_delivery"
     app.announce_cooldown_s = 90
     app.voice_tts_entity = "tts.piper"
     app.voice_start_delay_s = 9.0
@@ -363,6 +365,11 @@ class YamlKnobTests(unittest.TestCase):
         value = _yaml_scalar_line(yaml_path.read_text(), "voice_unlock_lead_s")
         self.assertIsNotNone(value, "voice_unlock_lead_s must sit on one line, not a nested block")
         self.assertEqual(float(value), 0.3)
+
+    def test_the_courier_sentence_stays_a_plain_scalar_that_says_the_floor(self):
+        text = (Path(__file__).resolve().parent.parent / "abb_welcome_bridge.yaml").read_text()
+        self.assertEqual(_yaml_scalar_line(text, "announce_message_courier").strip("\"'"), "Door is opening. Fifth floor.")
+        self.assertEqual(_yaml_scalar_line(text, "delivery_entity").strip("\"'"), "sensor.home_delivery")
 
 
 class MissedCallTests(unittest.TestCase):
@@ -2949,6 +2956,94 @@ class RingArmedVoiceTests(unittest.TestCase):
         self.app.states.pop(("input_boolean.auto_open_intercom", None), None)
         self.app._open_episode("front door", "100000002", self.clock.now())
         self.assertEqual(self._voice_delays(), [])
+
+
+class CourierSentenceTests(unittest.TestCase):
+    """While sensor.home_delivery's door_courier_kind says a courier is due, the street
+    intercom adds the floor to its sentence; every other visitor hears the ordinary one."""
+
+    KIND = ("sensor.home_delivery", "door_courier_kind")
+    ORDINARY, COURIER = "The door is open.", "The door is open. Fifth floor."
+
+    def setUp(self):
+        self.clock = Clock(datetime(2026, 11, 10, 18, 0, 0, tzinfo=timezone.utc))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.app = _bare_bridge(self.tmp.name, self.clock)
+        self.app.native_ring_clips = True
+        self.app.voice_start_delay_s = 1.5
+        self.app.states[("input_boolean.auto_open_intercom", None)] = "on"
+
+    def armed(self):
+        return [kw["message"] for cb, _delay, kw in self.app.run_in_calls if cb.__name__ == "_native_voice_retry"]
+
+    def test_a_ring_while_any_courier_is_due_arms_the_sentence_with_the_floor(self):
+        for kind in ("food", "groceries", "parcel"):
+            with self.subTest(kind=kind):
+                self.app.run_in_calls.clear()
+                self.app.states[self.KIND] = kind
+                self.app._open_episode("front door", "100000002", self.clock.now())
+                self.assertEqual(self.armed(), [self.COURIER])
+
+    def test_every_other_ring_hears_the_ordinary_sentence(self):
+        for name, kind in (("nothing due", None), ("empty", ""), ("unknown kind", "mystery"), ("malformed", ["food"])):
+            with self.subTest(name):
+                self.app.run_in_calls.clear()
+                self.app.states[self.KIND] = kind
+                self.app._open_episode("front door", "100000002", self.clock.now())
+                self.assertEqual(self.armed(), [self.ORDINARY])
+
+    def test_a_sensor_that_cannot_be_read_gives_the_ordinary_sentence(self):
+        def broken(entity, attribute=None):
+            if entity == "sensor.home_delivery":
+                raise RuntimeError("sensor read failed")
+            return self.app.states.get((entity, attribute))
+        self.app.get_state = broken
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.assertEqual(self.armed(), [self.ORDINARY])
+
+    def test_no_courier_sentence_configured_keeps_the_ordinary_one(self):
+        self.app.announce_message_courier = ""
+        self.app.states[self.KIND] = "food"
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.assertEqual(self.armed(), [self.ORDINARY])
+
+    def test_the_sentence_is_chosen_at_the_ring_and_kept_through_the_retries(self):
+        self.app.states[self.KIND] = "food"
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.app.states[self.KIND] = None
+        self.app.call_service = lambda service, **kwargs: (_ for _ in ()).throw(RuntimeError("no talkback yet"))
+        _run_scheduled(self.app, "_native_voice_retry")
+        self.assertEqual(self.armed(), [self.COURIER])
+
+    def test_the_unlock_edge_speaks_the_same_sentence_when_auto_open_did_not_arm_the_ring(self):
+        self.app.states[("input_boolean.auto_open_intercom", None)] = "off"
+        self.app.states[self.KIND] = "food"
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.assertEqual(self.armed(), [])
+        self.app._maybe_announce("front door")
+        self.assertEqual(self.armed(), [self.COURIER])
+
+    def test_the_temporary_call_announce_carries_the_floor_too(self):
+        self.app.native_ring_clips = False
+        self.app.states[self.KIND] = "parcel"
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        self.clock.at += timedelta(seconds=9)
+        self.app._maybe_announce("front door")
+        announces = [c[1]["message"] for c in self.app.service_calls if c[0] == "abb_welcome/announce"]
+        self.assertEqual(announces, [self.COURIER])
+        self.assertTrue(any(self.COURIER in msg for _, msg in self.app.logs if msg.startswith("ANNOUNCE")))
+
+    def test_a_sentence_spoken_through_a_recording_carries_the_floor_too(self):
+        self.app.native_ring_clips = False
+        self.app.voice_tts_entity = "tts.piper"
+        self.app.states[self.KIND] = "food"
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        _run_scheduled(self.app, "_start_clip")
+        self.app._maybe_announce("front door")
+        media = [c[1]["media"]["media_content_id"] for c in self.app.service_calls if c[0] == "abb_welcome/play_audio"]
+        self.assertEqual(len(media), 1)
+        self.assertIn("Fifth%20floor", media[0])
 
 
 class CallReadyVoiceTests(unittest.TestCase):

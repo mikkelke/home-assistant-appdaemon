@@ -781,5 +781,175 @@ class AbbNativeUnlockTests(unittest.TestCase):
         self.assertTrue(any("stale" in msg.lower() for _, msg in app.logs))
 
 
+# ---------------------------------------------------------------------------
+# Courier wording: a ring says what sensor.home_delivery's door_courier_kind
+# says is due. Only the words change - the notifier gets the same single call
+# (so SonosNotifier's quiet hours, rooms and volume apply exactly as before).
+# ---------------------------------------------------------------------------
+
+
+class SpyNotifier:
+    def __init__(self):
+        self.calls = []
+
+    def notify(self, **kwargs):
+        self.calls.append(kwargs)
+
+
+def _fake_courier_app(state_file, states, clock):
+    app = _fake_handle_trigger_app(state_file, states)
+    app.trigger_map["binary_sensor.back"] = {
+        "message": "Someone is at the back door", "lock": "lock.back", "followup": "I opened the back door",
+        "door_sensor": None, "ring_label": "back door"}
+    app.trigger_map["binary_sensor.apartment"] = {
+        "message": "Someone is at the apartment door", "lock": None, "followup": None,
+        "ring_label": "apartment door", "apartment": True}
+    app.delivery_entity = "sensor.home_delivery"
+    app.owner_entity = "person.mikkel"
+    app._street_courier = None
+    app.sonos_notifier = SpyNotifier()
+    app.submit_to_executor = lambda fn, *args, **kwargs: fn(*args, **kwargs)
+    app.get_now = clock.now
+    app.get_state = lambda entity, attribute=None: states.get((entity, attribute)) if attribute else states.get(entity)
+    return app
+
+
+class CourierWordingTests(unittest.TestCase):
+    KIND = ("sensor.home_delivery", "door_courier_kind")
+
+    def setUp(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        self.clock = Clock(NOW)
+        self.states = {"input_boolean.auto_open": "on", "lock.front": "locked", "lock.back": "locked",
+                       "person.mikkel": "home", self.KIND: "food"}
+        self.app = _fake_courier_app(Path(tmpdir.name) / "intercom_state.json", self.states, self.clock)
+
+    def ring(self, sensor="binary_sensor.front", old="off", later=0):
+        self.clock.at = NOW + timedelta(seconds=later)
+        self.app._handle_trigger(sensor, "state", old, "on", {})
+
+    def spoken(self):
+        return [call["message"] for call in self.app.sonos_notifier.calls]
+
+    def test_food_with_mikkel_home_says_the_food_is_here_and_that_the_door_was_opened(self):
+        self.ring()
+        self.assertEqual(self.app.sonos_notifier.calls, [{"message": "The food is here. I opened the front door."}])
+
+    def test_food_while_mikkel_is_away_is_named_as_his(self):
+        for step, away in enumerate(("not_home", "work")):
+            with self.subTest(away=away):
+                self.states["person.mikkel"] = away
+                self.ring(later=10 * step)
+                self.assertEqual(self.spoken()[-1], "Mikkel's food is here. I opened the front door.")
+
+    def test_food_with_auto_open_off_does_not_claim_to_have_opened_the_door(self):
+        self.states["input_boolean.auto_open"] = "off"
+        self.ring()
+        self.states["person.mikkel"] = "not_home"
+        self.ring(later=10)
+        self.assertEqual(self.spoken(), ["The food is here.", "Mikkel's food is here."])
+        self.assertEqual(self.app.run_in_calls, [])
+
+    def test_a_replay_edge_never_claims_an_opened_door_and_never_unlocks(self):
+        self.ring(old="unavailable")
+        self.assertEqual(self.spoken(), ["The food is here."])
+        self.assertEqual(self.app.run_in_calls, [])
+
+    def test_the_back_door_says_it_opened_the_back_door(self):
+        self.ring("binary_sensor.back")
+        self.assertEqual(self.spoken(), ["The food is here. I opened the back door."])
+
+    def test_groceries_and_parcels_use_their_own_words(self):
+        for step, (kind, here) in enumerate((("groceries", "The groceries are here."), ("parcel", "A parcel is probably here."))):
+            with self.subTest(kind=kind):
+                self.states[self.KIND] = kind
+                self.states["input_boolean.auto_open"] = "on"
+                self.ring(later=20 * step)
+                self.states["input_boolean.auto_open"] = "off"
+                self.ring(later=20 * step + 10)
+                self.assertEqual(self.spoken()[-2:], [f"{here} I opened the front door.", here])
+
+    def test_no_courier_due_keeps_todays_words(self):
+        cases = {"no kind": None, "an unknown kind": "mystery", "a malformed kind": ["food"], "an empty kind": ""}
+        for step, (name, kind) in enumerate(cases.items()):
+            with self.subTest(name):
+                self.states[self.KIND] = kind
+                self.states["input_boolean.auto_open"] = "on"
+                self.ring(later=20 * step)
+                self.states["input_boolean.auto_open"] = "off"
+                self.ring(later=20 * step + 10)
+                self.assertEqual(self.spoken()[-2:], ["Someone is at the front door and I opened the front door",
+                                                      "Someone is at the front door"])
+
+    def test_a_sensor_that_cannot_be_read_keeps_todays_words_and_the_unlock(self):
+        def broken(entity, attribute=None):
+            if entity == "sensor.home_delivery":
+                raise RuntimeError("sensor read failed")
+            return self.states.get(entity)
+        self.app.get_state = broken
+        self.ring()
+        self.assertEqual(self.spoken(), ["Someone is at the front door and I opened the front door"])
+        self.assertEqual(len(self.app.run_in_calls), self.app.unlock_repeat_count)
+
+    def test_an_owner_who_cannot_be_read_is_not_called_away(self):
+        for step, owner in enumerate((None, "unknown", "unavailable")):
+            with self.subTest(owner=owner):
+                self.states["person.mikkel"] = owner
+                self.ring(later=10 * step)
+                self.assertEqual(self.spoken()[-1], "The food is here. I opened the front door.")
+
+    def test_the_unlock_is_scheduled_exactly_as_without_a_courier(self):
+        self.ring()
+        with_courier = [delay for delay, _ in self.app.run_in_calls]
+        self.states[self.KIND] = None
+        self.app.run_in_calls.clear()
+        self.ring(later=60)
+        self.assertEqual(len(with_courier), self.app.unlock_repeat_count)
+        self.assertEqual(with_courier, [delay for delay, _ in self.app.run_in_calls])
+
+    def test_an_apartment_ding_soon_after_a_matched_street_ring_says_the_courier_is_at_the_door(self):
+        for step, (kind, words) in enumerate((("food", "The food is at the door."),
+                                              ("groceries", "The groceries are at the door."),
+                                              ("parcel", "The parcel is at the door."))):
+            with self.subTest(kind=kind):
+                self.states[self.KIND] = kind
+                self.ring(later=1000 * step)
+                self.states[self.KIND] = None
+                self.ring("binary_sensor.apartment", later=1000 * step + 90)
+                self.assertEqual(self.spoken()[-1], words)
+
+    def test_the_apartment_window_is_ten_minutes(self):
+        for step, (later, words) in enumerate(((600, "The food is at the door."),
+                                               (601, "Someone is at the apartment door"))):
+            with self.subTest(later=later):
+                self.app._street_courier = None
+                self.ring(later=1000 * step)
+                self.ring("binary_sensor.apartment", later=1000 * step + later)
+                self.assertEqual(self.spoken()[-1], words)
+
+    def test_an_apartment_ding_with_no_matched_street_ring_keeps_todays_words(self):
+        self.ring("binary_sensor.apartment")
+        self.states[self.KIND] = None
+        self.ring(later=30)
+        self.ring("binary_sensor.apartment", later=60)
+        self.assertEqual(self.spoken(), ["Someone is at the apartment door",
+                                         "Someone is at the front door and I opened the front door",
+                                         "Someone is at the apartment door"])
+
+    def test_the_apartment_ding_is_not_a_street_ring(self):
+        self.ring("binary_sensor.apartment")
+        self.states[self.KIND] = None
+        self.ring("binary_sensor.apartment", later=30)
+        self.assertEqual(self.spoken(), ["Someone is at the apartment door"] * 2)
+
+    def test_the_words_come_from_a_pure_function(self):
+        self.assertEqual(intercom.courier_message("food", False, "I opened the front door"),
+                         "The food is here. I opened the front door.")
+        self.assertEqual(intercom.courier_message("food", True, None), "Mikkel's food is here.")
+        self.assertEqual(intercom.courier_message("parcel", True, None), "A parcel is probably here.")
+        self.assertEqual(intercom.courier_message("groceries", False, None), "The groceries are here.")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -290,6 +290,10 @@ class AbbWelcomeBridge(hass.Hass):
         raw_announce = self.args.get("announce_after_unlock", {}) or {}
         self.announce_cameras = {str(k): str(v) for k, v in raw_announce.items()} if isinstance(raw_announce, dict) else {}
         self.announce_message = str(self.args.get("announce_message", "Door is opening."))
+        # Said instead of announce_message while sensor.home_delivery's door_courier_kind
+        # says a courier is due at the door (see _door_sentence).
+        self.announce_message_courier = str(self.args.get("announce_message_courier", "Door is opening. Fifth floor."))
+        self.delivery_entity = self.args.get("delivery_entity", "sensor.home_delivery")
         self.announce_cooldown_s = int(self.args.get("announce_cooldown_s", 90))
         # TTS engine for speaking THROUGH a live recording (media-source URL fed to
         # abb_welcome/play_audio, which injects into the open stream's talkback leg
@@ -887,7 +891,7 @@ class AbbWelcomeBridge(hass.Hass):
             return
         self.run_in(self._native_voice_retry, self.voice_start_delay_s,
                     episode_id=episode["id"], door=door,
-                    camera=camera, message=self.announce_message, attempt=1)
+                    camera=camera, message=self._door_sentence(), attempt=1)
         self.log(f"VOICE-ARMED door={door} camera={camera} at ring+{self.voice_start_delay_s}s",
                  level="INFO")
 
@@ -1273,7 +1277,7 @@ class AbbWelcomeBridge(hass.Hass):
                     return
                 self.run_in(self._native_voice_retry, self.voice_start_delay_s,
                             episode_id=episode["id"], door=door,
-                            camera=camera, message=self.announce_message, attempt=1)
+                            camera=camera, message=self._door_sentence(), attempt=1)
                 return
             # Video first (user 2026-08-19): a recording in flight owns the station's
             # one call slot - speaking now would fail AND kill the clip's video, so
@@ -1293,7 +1297,7 @@ class AbbWelcomeBridge(hass.Hass):
                 episode = self._latest_open_episode(door, now)
                 if episode is not None and episode.get("voice_spoken"):
                     return
-                if self._voice_into_recording(door, camera, self.announce_message) and episode is not None:
+                if self._voice_into_recording(door, camera, self._door_sentence()) and episode is not None:
                     episode["voice_spoken"] = True
                 self._last_announce_at[door] = now
                 return
@@ -1310,14 +1314,28 @@ class AbbWelcomeBridge(hass.Hass):
                 return
             self._last_announce_at[door] = now
             self._self_call_until[door] = now + timedelta(seconds=20)
+            sentence = self._door_sentence()
             self.call_service(
                 "abb_welcome/announce",
                 entity_id=camera,
-                message=self.announce_message,
+                message=sentence,
             )
-            self.log(f"ANNOUNCE door={door} camera={camera} message={self.announce_message!r}")
+            self.log(f"ANNOUNCE door={door} camera={camera} message={sentence!r}")
         except Exception as e:
             self.log(f"Announce failed for {door}: {e}", level="WARNING")
+
+    def _door_sentence(self):
+        """The sentence for the street intercom: announce_message_courier while
+        sensor.home_delivery's door_courier_kind says a courier is due (HomeDelivery
+        decides whose, including whether Mikkel is home), else announce_message. Only
+        the words differ. Any problem reading the sensor is the ordinary sentence."""
+        try:
+            kind = self.get_state(self.delivery_entity, attribute="door_courier_kind")
+            if self.announce_message_courier and kind in ("food", "groceries", "parcel"):
+                return self.announce_message_courier
+        except Exception:
+            pass
+        return self.announce_message
 
     def _recording_in_flight(self, door, now):
         """True while a ring episode for this door has a recording underway - from the

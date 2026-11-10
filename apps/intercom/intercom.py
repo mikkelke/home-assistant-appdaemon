@@ -15,10 +15,33 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 # _own_abb_press_at).
 ABB_PRESS_FRESHNESS_S = 10
 
+# What a street ring says while sensor.home_delivery's door_courier_kind says a
+# courier of that kind is due, and what an apartment-door ding says when it comes
+# up to COURIER_APARTMENT_WINDOW_S after such a ring. Only the words change.
+COURIER_HERE = {
+    "food": "The food is here.",
+    "groceries": "The groceries are here.",
+    "parcel": "A parcel is probably here.",
+}
+COURIER_AT_THE_DOOR = {
+    "food": "The food is at the door.",
+    "groceries": "The groceries are at the door.",
+    "parcel": "The parcel is at the door.",
+}
+COURIER_APARTMENT_WINDOW_S = 600
+
 # ---------------------------------------------------------------------------
-# Pure module-level function - unit-testable without an AppDaemon runtime (see
+# Pure module-level functions - unit-testable without an AppDaemon runtime (see
 # tests/test_intercom.py).
 # ---------------------------------------------------------------------------
+
+
+def courier_message(kind, owner_away, opened):
+    """The street ring's sentence while a courier of `kind` is due. `opened` is the
+    door's own "I opened the ..." clause, None when the house is not opening it.
+    The food is named as Mikkel's only while he is away: then someone else hears it."""
+    here = "Mikkel's food is here." if kind == "food" and owner_away else COURIER_HERE[kind]
+    return f"{here} {opened}." if opened else here
 
 
 def resume_decision(record, age_s, max_age_s):
@@ -83,6 +106,12 @@ class Intercom(hass.Hass):
         self.msg_apt = self.args.get("tts_message_apt", "Someone is at the apartment door")
         self.msg_open_front = self.args.get("door_open_message_front", "I opened the front door")
         self.msg_open_back = self.args.get("door_open_message_back", "I opened the back door")
+
+        # door_courier_kind decides whose courier is due (including whether Mikkel is
+        # home); owner_entity only decides whether the food is named as his.
+        self.delivery_entity = self.args.get("delivery_entity", "sensor.home_delivery")
+        self.owner_entity = self.args.get("owner_entity", "person.mikkel")
+        self._street_courier = None  # (kind, time) of the latest street ring that matched a courier
 
         self.sonos_notifier = self._get_notifier()
         self.mobile_notifier = self._get_mobile_notifier()
@@ -164,6 +193,7 @@ class Intercom(hass.Hass):
                 "lock": None,
                 "followup": None,
                 "ring_label": "apartment door",
+                "apartment": True,
             }
             self.listen_state(self._handle_trigger, self.apt_sensor, new="on")
 
@@ -626,7 +656,11 @@ class Intercom(hass.Hass):
         # on reload; notify() self-logs its own errors to sonos_notifier_log.
         if self.sonos_notifier:
             try:
-                if auto_open_enabled and info.get("followup"):
+                courier_words = self._courier_message(info, auto_open_enabled)
+                if courier_words:
+                    self.submit_to_executor(self.sonos_notifier.notify, message=courier_words)
+                    self.log(f"Queued courier TTS message for {entity}", level="DEBUG")
+                elif auto_open_enabled and info.get("followup"):
                     # Combine messages: "Someone is at the front door and I opened the front door"
                     combined_message = f"{info['message']} and {info['followup']}"
                     self.submit_to_executor(self.sonos_notifier.notify, message=combined_message)
@@ -651,6 +685,33 @@ class Intercom(hass.Hass):
             )
         except Exception as e:
             self.log(f"house_events_report failed: {e}", level="DEBUG")
+
+    def _courier_message(self, info, auto_open_enabled):
+        """The words for this ring while a courier is due at the door, else None and
+        the caller says what it always said. Words only and strictly additive: the
+        unlock is already scheduled, and any problem reading the sensors is a None.
+        Never raises."""
+        try:
+            now = self.get_now()
+            if info.get("apartment"):
+                matched = self._street_courier
+                if matched and 0 <= (now - matched[1]).total_seconds() <= COURIER_APARTMENT_WINDOW_S:
+                    return COURIER_AT_THE_DOOR[matched[0]]
+                return None
+            kind = self.get_state(self.delivery_entity, attribute="door_courier_kind")
+            if kind not in COURIER_HERE:
+                return None
+            owner = self.get_state(self.owner_entity)
+            owner_away = owner not in (None, "", "unknown", "unavailable", "home")
+            words = courier_message(kind, owner_away, info.get("followup") if auto_open_enabled else None)
+            self._street_courier = (kind, now)
+            return words
+        except Exception as e:
+            try:
+                self.log(f"Courier wording unavailable: {e}", level="DEBUG")
+            except Exception:
+                pass
+        return None
 
     def _dispatch_unlock(self, entity, ring_ts, lock_entity, door_sensor, ring_label):
         """Start the actual unlock: ABB button if this door has one, else ESP.
