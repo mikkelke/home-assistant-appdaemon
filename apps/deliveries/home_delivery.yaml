@@ -5,6 +5,9 @@
 # sensors, one source per carrier, and are listed only when they matter today. See home_delivery.py
 # for the published contract.
 #
+# The doorbell and intercom wording follows door_courier_kind: Wolt always counts, Nemlig and parcels
+# only while owner_entity is home, since they are the owner's own errands.
+#
 # Nemlig's login lives in /data/appdaemon/secrets.yaml on the box (nemlig_user, nemlig_pass); drop
 # the two nemlig_* lines to track Wolt only. No `log:` key on purpose: a named log stream must be
 # declared in the box-only appdaemon.yaml first or the app fails to instantiate.
@@ -13,5 +16,6 @@ HomeDelivery:
   module: home_delivery
   class: HomeDelivery
   entity: sensor.home_delivery
+  owner_entity: person.mikkel
   nemlig_user: !secret nemlig_user
   nemlig_pass: !secret nemlig_pass

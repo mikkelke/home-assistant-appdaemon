@@ -86,6 +86,7 @@ def delivery(**kw):
     return hd.Delivery(**values)
 
 
+OWNER = "person.mikkel"
 AGGREGATOR_INCOMING = "sensor.parcel_aggregator_incoming_parcels"
 AGGREGATOR_DELIVERED = "sensor.parcel_aggregator_delivered_parcels"
 
@@ -853,7 +854,8 @@ class ParcelSpokenTests(unittest.TestCase):
         third = self.parcel(barcode="TESTPN0003", carrier="Airmee", start=local_time(10, 20))
         self.assertEqual(self.say(first, second), "A PostNord parcel is out for delivery, expected around 6:30 PM, and 1 more.")
         self.assertEqual(self.say(first, second, third), "A PostNord parcel is out for delivery, expected around 6:30 PM, and 2 more.")
-        self.assertEqual(self.say(first, delivery(eta=at(300))), "A PostNord parcel is out for delivery, expected around 6:30 PM, and 1 more.")
+        self.assertEqual(self.say(first, delivery(id="nemlig", source="nemlig", kind="groceries", title="Nemlig", eta=at(300))),
+                         "A PostNord parcel is out for delivery, expected around 6:30 PM, and 1 more.")
 
     def test_a_parcel_after_another_source_keeps_the_existing_phrasing(self):
         wolt_order = delivery(eta=at(8))
@@ -863,11 +865,127 @@ class ParcelSpokenTests(unittest.TestCase):
     def test_a_delivered_parcel_is_not_on_the_way(self):
         self.assertEqual(self.say(self.parcel(status="delivered", delivered_at=at(-2))), "There's no delivery on the way.")
 
+    def test_food_is_answered_before_a_delivery_that_is_due_sooner(self):
+        out = self.parcel(start=at(10))
+        self.assertEqual(self.say(out, delivery(eta=at(30))),
+                         "In about 30 minutes, around 6:18 PM. There's one more after that.")
+        self.assertEqual(self.say(out, delivery(eta=at(30)), self.parcel(barcode="TESTPN0002", start=at(20))),
+                         "In about 30 minutes, around 6:18 PM. There are 2 more after that.")
+
+    def test_without_food_the_next_delivery_is_said_generically(self):
+        self.assertEqual(self.say(self.parcel(start=at(10))), "A PostNord parcel is out for delivery, expected around 5:58 PM.")
+        self.assertEqual(self.say(delivery(stage="delivered"), self.parcel(start=at(10))),
+                         "A PostNord parcel is out for delivery, expected around 5:58 PM.")
+
+    def test_a_preparing_food_order_is_still_the_answer_to_where_is_the_food(self):
+        self.assertEqual(self.say(self.parcel(start=at(10)), delivery(stage="preparing", eta=at(40))),
+                         f"{KITCHEN} is still making it. Wolt expects it around 6:28 PM. There's one more after that.")
+
     def test_window_text_can_be_linked_with_and(self):
         self.assertEqual(hd.window_text(local_time(10, 14), local_time(10, 16)), "2 to 4 PM")
         self.assertEqual(hd.window_text(local_time(10, 14), local_time(10, 16), "and"), "2 and 4 PM")
         self.assertEqual(hd.window_text(local_time(10, 11), local_time(10, 13), "and"), "11 AM and 1 PM")
         self.assertIsNone(hd.window_text(None, local_time(10, 16), "and"))
+
+
+def nemlig_delivery(**kw):
+    return delivery(**{"id": "nemlig", "source": "nemlig", "kind": "groceries", "title": "Nemlig", **kw})
+
+
+class FoodCourierTests(unittest.TestCase):
+    def attrs(self, *deliveries, now=NOW):
+        return hd.snapshot(list(deliveries), now)["attributes"]
+
+    def test_the_food_flag_only_looks_at_food(self):
+        for other in (hd.parcel_delivery(parcel(), NOW), nemlig_delivery()):
+            with self.subTest(source=other.source):
+                attrs = self.attrs(other)
+                self.assertEqual((attrs["courier_expected"], attrs["food_courier_expected"]), (True, False))
+        attrs = self.attrs(delivery(), hd.parcel_delivery(parcel(), NOW))
+        self.assertEqual((attrs["courier_expected"], attrs["food_courier_expected"]), (True, True))
+
+    def test_the_food_flag_follows_the_same_window_as_the_general_one(self):
+        d = delivery(stage="preparing", eta=NOW)
+        for offset, expected in ((-1201, False), (-1200, True), (0, True), (1800, True), (1801, False)):
+            with self.subTest(offset=offset):
+                self.assertEqual(self.attrs(d, now=NOW + offset)["food_courier_expected"], expected)
+        self.assertEqual(self.attrs(delivery(stage="preparing"))["food_courier_expected"], False)
+
+    def test_an_order_that_ended_expects_no_courier(self):
+        for stage in ("delivered", "cancelled"):
+            with self.subTest(stage=stage):
+                self.assertEqual(self.attrs(delivery(stage=stage, eta=NOW))["food_courier_expected"], False)
+
+    def test_nothing_on_the_way_has_no_food(self):
+        attrs = self.attrs()
+        self.assertEqual((attrs["next_food"], attrs["food_courier_expected"], attrs["door_courier_kind"]), (None, False, None))
+
+    def test_next_food_is_the_first_active_food_entry_whatever_arrives_sooner(self):
+        sooner = hd.parcel_delivery(parcel(start=at(5)), NOW)
+        late = delivery(id="wolt:late", title="Late", stage="preparing", eta=at(40))
+        first = delivery(id="wolt:first", title="First", eta=at(15))
+        done = delivery(id="wolt:done", title="Done", stage="delivered", eta=at(-10))
+        attrs = self.attrs(done, late, sooner, first)
+        self.assertEqual(attrs["next"]["id"], "postnord:TESTPN0001")
+        self.assertEqual(attrs["next_food"], next(e for e in attrs["deliveries"] if e["id"] == "wolt:first"))
+        self.assertEqual(attrs["next_food"]["title"], "First")
+
+    def test_next_food_is_empty_without_an_active_food_order(self):
+        self.assertIsNone(self.attrs(hd.parcel_delivery(parcel(), NOW), nemlig_delivery(),
+                                     delivery(stage="delivered"))["next_food"])
+
+
+class DoorCourierKindTests(unittest.TestCase):
+    def kind(self, *deliveries, home=True, now=NOW):
+        return hd.snapshot(list(deliveries), now, home)["attributes"]["door_courier_kind"]
+
+    def test_food_counts_whether_or_not_the_owner_is_home(self):
+        for home in (True, False):
+            with self.subTest(home=home):
+                self.assertEqual(self.kind(delivery(), home=home), "food")
+                self.assertEqual(self.kind(delivery(stage="preparing", eta=at(15)), home=home), "food")
+
+    def test_groceries_and_parcels_count_only_while_the_owner_is_home(self):
+        for expected, d in (("groceries", nemlig_delivery()), ("parcel", hd.parcel_delivery(parcel(), NOW))):
+            with self.subTest(kind=expected):
+                self.assertEqual(self.kind(d, home=True), expected)
+                self.assertIsNone(self.kind(d, home=False))
+
+    def test_the_owner_defaults_to_away(self):
+        self.assertIsNone(hd.snapshot([hd.parcel_delivery(parcel(), NOW)], NOW)["attributes"]["door_courier_kind"])
+
+    def test_groceries_and_parcels_must_be_out_for_delivery(self):
+        window = {"window_start": at(-10), "window_end": at(50)}
+        booked = nemlig_delivery(stage="preparing", **window)
+        registered = hd.parcel_delivery(parcel(status="in_transit", start=at(-10), end=at(50)), NOW)
+        self.assertEqual(hd.courier_expected([booked], NOW), (True, "inside its window"))
+        self.assertEqual(hd.courier_expected([registered], NOW), (True, "inside its window"))
+        self.assertIsNone(self.kind(booked))
+        self.assertIsNone(self.kind(registered))
+        for stage in ("on_the_way", "arriving"):
+            with self.subTest(stage=stage):
+                self.assertEqual(self.kind(nemlig_delivery(stage=stage)), "groceries")
+                self.assertEqual(self.kind(delivery(id="p", source="postnord", kind="parcel", stage=stage)), "parcel")
+
+    def test_food_wins_over_groceries_and_groceries_over_parcels(self):
+        parcel_out = hd.parcel_delivery(parcel(), NOW)
+        self.assertEqual(self.kind(parcel_out, nemlig_delivery(), delivery()), "food")
+        self.assertEqual(self.kind(parcel_out, nemlig_delivery()), "groceries")
+        self.assertEqual(self.kind(parcel_out, nemlig_delivery(), home=False), None)
+
+    def test_away_with_food_and_a_parcel_is_food(self):
+        self.assertEqual(self.kind(hd.parcel_delivery(parcel(), NOW), delivery(), home=False), "food")
+
+    def test_food_still_in_the_kitchen_lets_the_parcel_answer_the_door(self):
+        self.assertEqual(self.kind(delivery(stage="preparing"), hd.parcel_delivery(parcel(), NOW)), "parcel")
+
+    def test_ended_deliveries_expect_nothing(self):
+        done = hd.parcel_delivery(parcel(status="delivered", delivered_at=at(-1)), NOW)
+        self.assertIsNone(self.kind(done, nemlig_delivery(stage="delivered"), delivery(stage="cancelled")))
+
+    def test_the_published_attributes_stay_plain_json(self):
+        attrs = hd.snapshot([delivery(eta=at(8)), nemlig_delivery()], NOW, True)["attributes"]
+        self.assertEqual(json.loads(json.dumps(attrs)), attrs)
 
 
 class Harness:
@@ -904,9 +1022,12 @@ class Harness:
         return appdaemon_render_result("J" + json.dumps(items))
 
     def get_state(self, entity_id, attribute=None):
-        if attribute != "all":
-            raise AssertionError(attribute)
-        return copy.deepcopy(self.states.get(entity_id))
+        value = copy.deepcopy(self.states.get(entity_id))
+        if attribute == "all":
+            return value
+        if attribute is None:
+            return value.get("state") if isinstance(value, dict) else None
+        raise AssertionError(attribute)
 
     @property
     def last(self):
@@ -1248,7 +1369,7 @@ class ParcelAppTests(unittest.TestCase):
         h = Harness()
         self.assertEqual([kw for entity, kw in h.listened if entity in (AGGREGATOR_INCOMING, AGGREGATOR_DELIVERED)],
                          [{"attribute": "all"}] * 2)
-        self.assertEqual({entity for entity, _ in h.listened}, {AGGREGATOR_INCOMING, AGGREGATOR_DELIVERED})
+        self.assertEqual({entity for entity, _ in h.listened}, {AGGREGATOR_INCOMING, AGGREGATOR_DELIVERED, OWNER})
         before = len(h.published)
         h.states[AGGREGATOR_INCOMING] = aggregator(parcel(start=at(30)))
         h.app._on_change(AGGREGATOR_INCOMING, "all", {}, {}, {})
@@ -1285,13 +1406,69 @@ class ParcelAppTests(unittest.TestCase):
         state, attrs = h.last
         self.assertEqual(state, "3")
         self.assertEqual([e["source"] for e in attrs["deliveries"]], ["postnord", "wolt", "airmee"])
-        self.assertEqual(attrs["spoken"], "A PostNord parcel is out for delivery, expected around 5:58 PM, and 2 more.")
+        self.assertEqual(attrs["spoken"], "In about 30 minutes, around 6:18 PM. There are 2 more after that.")
 
     def test_two_parcels_from_one_carrier_are_two_deliveries(self):
         h = Harness({AGGREGATOR_INCOMING: aggregator(parcel(), parcel(barcode="TESTPN0002"))})
         self.assertEqual((h.last[0], [e["id"] for e in h.last[1]["deliveries"]]),
                          ("2", ["postnord:TESTPN0001", "postnord:TESTPN0002"]))
         self.assertEqual(h.last[1]["spoken"], "A PostNord parcel is out for delivery, and 1 more.")
+
+
+class OwnerPresenceAppTests(unittest.TestCase):
+    PARCEL_OUT = {AGGREGATOR_INCOMING: aggregator(parcel(start=at(30)))}
+
+    def make(self, owner="home", **states):
+        return Harness({OWNER: {"state": owner, "attributes": {}}, **self.PARCEL_OUT, **states})
+
+    def test_a_parcel_answers_the_door_only_while_the_owner_is_home(self):
+        h = self.make("home")
+        self.assertEqual(h.last[1]["door_courier_kind"], "parcel")
+        h = self.make("not_home")
+        self.assertIsNone(h.last[1]["door_courier_kind"])
+        self.assertEqual(h.last[1]["courier_expected"], True)
+
+    def test_food_answers_the_door_whoever_is_home(self):
+        for owner in ("home", "not_home"):
+            with self.subTest(owner=owner):
+                h = self.make(owner, **wolt(courier=True, eta=at(10)))
+                self.assertEqual((h.last[1]["door_courier_kind"], h.last[1]["food_courier_expected"]), ("food", True))
+
+    def test_the_owner_arriving_or_leaving_publishes_at_once(self):
+        h = self.make("not_home")
+        self.assertIn((OWNER, {}), h.listened)
+        before = len(h.published)
+        h.states[OWNER]["state"] = "home"
+        h.app._on_change(OWNER, "state", "not_home", "home", {})
+        self.assertEqual((len(h.published), h.last[1]["door_courier_kind"]), (before + 1, "parcel"))
+        h.states[OWNER]["state"] = "not_home"
+        h.app._on_change(OWNER, "state", "home", "not_home", {})
+        self.assertIsNone(h.last[1]["door_courier_kind"])
+
+    def test_an_owner_who_cannot_be_read_is_away(self):
+        for value in ("unavailable", "unknown", None):
+            with self.subTest(value=value):
+                h = self.make(value)
+                self.assertIsNone(h.last[1]["door_courier_kind"])
+        h = Harness(self.PARCEL_OUT)
+        self.assertIsNone(h.last[1]["door_courier_kind"])
+
+        plain = h.app.get_state
+
+        def broken(entity_id, attribute=None):
+            if attribute is None:
+                raise RuntimeError("Home Assistant did not answer")
+            return plain(entity_id, attribute=attribute)
+
+        h.states[OWNER] = {"state": "home", "attributes": {}}
+        h.app.get_state = broken
+        h.tick(30)
+        self.assertEqual((h.last[0], h.last[1]["door_courier_kind"]), ("1", None))
+
+    def test_the_owner_entity_can_be_configured(self):
+        h = Harness({"person.other": {"state": "home", "attributes": {}}, **self.PARCEL_OUT}, owner_entity="person.other")
+        self.assertEqual(h.last[1]["door_courier_kind"], "parcel")
+        self.assertIn(("person.other", {}), h.listened)
 
 
 if __name__ == "__main__":
