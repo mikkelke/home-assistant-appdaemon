@@ -409,6 +409,17 @@ class SonosGroupManager(hass.Hass):
                 return True
         return False
 
+    def _plays_tv_audio(self, speaker):
+        """True when the Sonos itself is on its TV input (HDMI/optical), whatever the TV entity says."""
+        attrs = self._safe_get_state(speaker, attribute="all", default=None)
+        attrs = (attrs or {}).get("attributes") or {}
+        content = str(attrs.get("media_content_id") or "")
+        return (
+            attrs.get("app_id") == "tv"
+            or attrs.get("source") == "TV"
+            or content.startswith(("homeTheater", "x-sonos-htastream"))
+        )
+
     def _find_family_zone_group_anchor(self, current_family_zone):
         """
         Find a family-zone speaker to use as join anchor.
@@ -477,7 +488,7 @@ class SonosGroupManager(hass.Hass):
         any of them is playing - either already in a multi-speaker group with active
         audio, or playing solo (see _find_family_zone_group_anchor).
 
-        Skips while living room TV is on, or while family_zone_auto_group_entity is off.
+        Skips while a family speaker plays TV audio, or while family_zone_auto_group_entity is off.
         """
         if self._reset_in_progress:
             self.log("Scenario: skip_family_zone_sync_during_reset", level="DEBUG")
@@ -515,16 +526,11 @@ class SonosGroupManager(hass.Hass):
         if not self.family_zone_speakers:
             return
         
-        # Check if living room TV is on - if so, skip auto-grouping to avoid conflicts
-        try:
-            living_room_tv_state = self.get_state("media_player.living_room_tv")
-            if living_room_tv_state and living_room_tv_state not in [None, "off", "unavailable", "unknown", "standby"]:
-                self.log(f"Family Zone Auto-Group: Living room TV is on (state: {living_room_tv_state}), skipping auto-group to avoid conflicts", level="DEBUG")
-                return
-        except Exception:
-            # If we can't check TV state, continue (don't block on TV check failure)
-            pass
-            
+        tv_speakers = [m for m in self._current_family_zone_members() if self._plays_tv_audio(m)]
+        if tv_speakers:
+            self.log(f"Family Zone Auto-Group: {tv_speakers} on TV audio, skipping", level="DEBUG")
+            return
+
         # Use try/finally to ALWAYS reset the flag, even if callback is interrupted
         self._family_zone_sync_in_progress = True
         self._family_zone_sync_start_time = self.datetime()
