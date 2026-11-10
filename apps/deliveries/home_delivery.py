@@ -23,8 +23,8 @@ attributes:
   courier_expected  an active delivery is on its way, near its ETA or inside its window
   food_courier_expected  the same, for food deliveries only
   door_courier_kind  food|groceries|parcel: what a ring at the door most likely is, for the doorbell wording. Food
-                  counts whenever food_courier_expected; groceries and parcels only while the owner is home and one is
-                  out for delivery (on_the_way or arriving). Food first, then groceries, then parcels
+                  counts whenever food_courier_expected; groceries and parcels when one is out for delivery
+                  (on_the_way or arriving). Food first, then groceries, then parcels
   spoken          one short English answer for voice, food first
   reason          why the state is what it is
 
@@ -50,7 +50,6 @@ ENTITY = "sensor.home_delivery"
 TICK_S = 30
 ACTIVE = ("preparing", "on_the_way", "arriving")
 OUT = ("on_the_way", "arriving")
-OWNER = "person.mikkel"
 KEEP_ENDED_S = 1800
 HOLD_MISSING_S = 600
 COURIER_BEFORE_S = 1200
@@ -429,16 +428,14 @@ def courier_expected(active, now):
     return False, None
 
 
-def door_courier_kind(active, now, owner_home):
+def door_courier_kind(active, now):
     """What a ring at the door most likely is: food, else groceries, else a parcel, None when no courier is
-    expected. Food counts whenever its courier is expected; groceries and parcels only while the owner is home and one
-    is out for delivery, since only the owner's own errand may change what the house says to everyone."""
+    expected. Food counts whenever its courier is expected; groceries and parcels when one is out for delivery."""
     if courier_expected([delivery for delivery in active if delivery.kind == "food"], now)[0]:
         return "food"
-    if owner_home:
-        for kind in ("groceries", "parcel"):
-            if any(delivery.kind == kind and delivery.stage in OUT for delivery in active):
-                return kind
+    for kind in ("groceries", "parcel"):
+        if any(delivery.kind == kind and delivery.stage in OUT for delivery in active):
+            return kind
     return None
 
 
@@ -520,7 +517,7 @@ def spoken(active, now):
     return text
 
 
-def snapshot(deliveries, now, owner_home=False):
+def snapshot(deliveries, now):
     """The published state and attributes for these deliveries."""
     ordered = sorted(deliveries, key=sort_key)
     entries = [entry(delivery, now) for delivery in ordered]
@@ -538,7 +535,7 @@ def snapshot(deliveries, now, owner_home=False):
             "attributes": {"friendly_name": "Home delivery", "icon": "mdi:truck-delivery", "deliveries": entries,
                            "next": entries[0] if active else None, "next_food": next_food,
                            "courier_expected": expected, "food_courier_expected": courier_expected(food, now)[0],
-                           "door_courier_kind": door_courier_kind(active, now, owner_home),
+                           "door_courier_kind": door_courier_kind(active, now),
                            "spoken": spoken(active, now), "reason": reason}}
 
 
@@ -546,7 +543,6 @@ class HomeDelivery(hass.Hass):
     def initialize(self):
         args = self.args
         self._entity = args.get("entity", ENTITY)
-        self._owner = args.get("owner_entity", OWNER)
         self._ledger = Ledger()
         self._listened = set()
         self._wolt = {}
@@ -565,7 +561,6 @@ class HomeDelivery(hass.Hass):
         self._readers = [self._read_wolt, self._read_nemlig, self._read_parcels]
         for entity_id in (PARCELS_INCOMING, PARCELS_DELIVERED):
             self.listen_state(self._on_change, entity_id, attribute="all")
-        self.listen_state(self._on_change, self._owner)
         self.run_every(self._on_tick, "now+5", TICK_S)
         self._refresh()
 
@@ -587,14 +582,8 @@ class HomeDelivery(hass.Hass):
             if self._stages.get(id_) != stage:
                 self.log(f"{id_}: {self._stages.get(id_, 'new')} -> {stage}")
         self._stages = stages
-        published = snapshot(deliveries, now, self._owner_home())
+        published = snapshot(deliveries, now)
         self.set_state(self._entity, state=str(published["state"]), attributes=published["attributes"], replace=True)
-
-    def _owner_home(self):
-        try:
-            return self.get_state(self._owner) == "home"
-        except Exception:
-            return False
 
     def _read_wolt(self, now):
         try:

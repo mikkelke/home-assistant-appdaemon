@@ -1326,9 +1326,9 @@ class AbbWelcomeBridge(hass.Hass):
 
     def _door_sentence(self):
         """The sentence for the street intercom: announce_message_courier while
-        sensor.home_delivery's door_courier_kind says a courier is due (HomeDelivery
-        decides whose, including whether Mikkel is home), else announce_message. Only
-        the words differ. Any problem reading the sensor is the ordinary sentence."""
+        sensor.home_delivery's door_courier_kind says a courier is due, else
+        announce_message. Only the words differ. Any problem reading the sensor is
+        the ordinary sentence."""
         try:
             kind = self.get_state(self.delivery_entity, attribute="door_courier_kind")
             if self.announce_message_courier and kind in ("food", "groceries", "parcel"):

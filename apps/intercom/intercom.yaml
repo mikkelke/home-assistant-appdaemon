@@ -32,11 +32,11 @@ Intercom:
   door_open_message_front: "I opened the front door"
   door_open_message_back: "I opened the back door"
 
-  # While sensor.home_delivery's door_courier_kind says a courier is due (food always, Nemlig and
-  # parcels only while Mikkel is home), a street ring says "The food is here." and the like instead
-  # of the messages above, and an apartment-door ding within 10 minutes of such a ring says the
-  # courier is at the door. Only the words change. owner_entity decides whether the food is named
-  # as Mikkel's, which it is only while he is away.
+  # While sensor.home_delivery's door_courier_kind says a courier is due (food, Nemlig or a parcel),
+  # a street ring says "The food is here." and the like instead of the messages above, and an
+  # apartment-door ding within 10 minutes of such a ring says the courier is at the door. Only the
+  # words change. owner_entity decides whether the delivery is named as Mikkel's ("Mikkel's food is
+  # here."), which it is while he is away.
   delivery_entity: "sensor.home_delivery"
   owner_entity: "person.mikkel"
 

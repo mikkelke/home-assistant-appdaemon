@@ -16,12 +16,19 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 ABB_PRESS_FRESHNESS_S = 10
 
 # What a street ring says while sensor.home_delivery's door_courier_kind says a
-# courier of that kind is due, and what an apartment-door ding says when it comes
-# up to COURIER_APARTMENT_WINDOW_S after such a ring. Only the words change.
+# courier of that kind is due: COURIER_HERE, or COURIER_HERE_AWAY naming the owner
+# while he is away, since then someone else hears it. And what an apartment-door
+# ding says when it comes up to COURIER_APARTMENT_WINDOW_S after such a ring. Only
+# the words change.
 COURIER_HERE = {
     "food": "The food is here.",
     "groceries": "The groceries are here.",
     "parcel": "A parcel is probably here.",
+}
+COURIER_HERE_AWAY = {
+    "food": "Mikkel's food is here.",
+    "groceries": "Mikkel's groceries are here.",
+    "parcel": "A parcel for Mikkel is probably here.",
 }
 COURIER_AT_THE_DOOR = {
     "food": "The food is at the door.",
@@ -39,8 +46,8 @@ COURIER_APARTMENT_WINDOW_S = 600
 def courier_message(kind, owner_away, opened):
     """The street ring's sentence while a courier of `kind` is due. `opened` is the
     door's own "I opened the ..." clause, None when the house is not opening it.
-    The food is named as Mikkel's only while he is away: then someone else hears it."""
-    here = "Mikkel's food is here." if kind == "food" and owner_away else COURIER_HERE[kind]
+    While the owner is away the delivery is named as his: then someone else hears it."""
+    here = (COURIER_HERE_AWAY if owner_away else COURIER_HERE)[kind]
     return f"{here} {opened}." if opened else here
 
 
@@ -107,8 +114,8 @@ class Intercom(hass.Hass):
         self.msg_open_front = self.args.get("door_open_message_front", "I opened the front door")
         self.msg_open_back = self.args.get("door_open_message_back", "I opened the back door")
 
-        # door_courier_kind decides whose courier is due (including whether Mikkel is
-        # home); owner_entity only decides whether the food is named as his.
+        # door_courier_kind decides which courier is due; owner_entity only decides
+        # whether the delivery is named as Mikkel's, which it is while he is away.
         self.delivery_entity = self.args.get("delivery_entity", "sensor.home_delivery")
         self.owner_entity = self.args.get("owner_entity", "person.mikkel")
         self._street_courier = None  # (kind, time) of the latest street ring that matched a courier

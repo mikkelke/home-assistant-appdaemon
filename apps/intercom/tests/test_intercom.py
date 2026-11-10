@@ -843,6 +843,18 @@ class CourierWordingTests(unittest.TestCase):
                 self.ring(later=10 * step)
                 self.assertEqual(self.spoken()[-1], "Mikkel's food is here. I opened the front door.")
 
+    def test_groceries_and_parcels_while_mikkel_is_away_are_named_as_his(self):
+        self.states["person.mikkel"] = "not_home"
+        for step, (kind, here) in enumerate((("groceries", "Mikkel's groceries are here."),
+                                             ("parcel", "A parcel for Mikkel is probably here."))):
+            with self.subTest(kind=kind):
+                self.states[self.KIND] = kind
+                self.states["input_boolean.auto_open"] = "on"
+                self.ring(later=20 * step)
+                self.states["input_boolean.auto_open"] = "off"
+                self.ring(later=20 * step + 10)
+                self.assertEqual(self.spoken()[-2:], [f"{here} I opened the front door.", here])
+
     def test_food_with_auto_open_off_does_not_claim_to_have_opened_the_door(self):
         self.states["input_boolean.auto_open"] = "off"
         self.ring()
@@ -947,8 +959,12 @@ class CourierWordingTests(unittest.TestCase):
         self.assertEqual(intercom.courier_message("food", False, "I opened the front door"),
                          "The food is here. I opened the front door.")
         self.assertEqual(intercom.courier_message("food", True, None), "Mikkel's food is here.")
-        self.assertEqual(intercom.courier_message("parcel", True, None), "A parcel is probably here.")
+        self.assertEqual(intercom.courier_message("groceries", True, None), "Mikkel's groceries are here.")
+        self.assertEqual(intercom.courier_message("parcel", True, None), "A parcel for Mikkel is probably here.")
+        self.assertEqual(intercom.courier_message("parcel", True, "I opened the back door"),
+                         "A parcel for Mikkel is probably here. I opened the back door.")
         self.assertEqual(intercom.courier_message("groceries", False, None), "The groceries are here.")
+        self.assertEqual(intercom.courier_message("parcel", False, None), "A parcel is probably here.")
 
 
 if __name__ == "__main__":

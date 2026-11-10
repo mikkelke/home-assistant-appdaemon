@@ -936,23 +936,12 @@ class FoodCourierTests(unittest.TestCase):
 
 
 class DoorCourierKindTests(unittest.TestCase):
-    def kind(self, *deliveries, home=True, now=NOW):
-        return hd.snapshot(list(deliveries), now, home)["attributes"]["door_courier_kind"]
+    def kind(self, *deliveries, now=NOW):
+        return hd.snapshot(list(deliveries), now)["attributes"]["door_courier_kind"]
 
-    def test_food_counts_whether_or_not_the_owner_is_home(self):
-        for home in (True, False):
-            with self.subTest(home=home):
-                self.assertEqual(self.kind(delivery(), home=home), "food")
-                self.assertEqual(self.kind(delivery(stage="preparing", eta=at(15)), home=home), "food")
-
-    def test_groceries_and_parcels_count_only_while_the_owner_is_home(self):
-        for expected, d in (("groceries", nemlig_delivery()), ("parcel", hd.parcel_delivery(parcel(), NOW))):
-            with self.subTest(kind=expected):
-                self.assertEqual(self.kind(d, home=True), expected)
-                self.assertIsNone(self.kind(d, home=False))
-
-    def test_the_owner_defaults_to_away(self):
-        self.assertIsNone(hd.snapshot([hd.parcel_delivery(parcel(), NOW)], NOW)["attributes"]["door_courier_kind"])
+    def test_food_counts_from_the_moment_its_courier_is_expected(self):
+        self.assertEqual(self.kind(delivery()), "food")
+        self.assertEqual(self.kind(delivery(stage="preparing", eta=at(15))), "food")
 
     def test_groceries_and_parcels_must_be_out_for_delivery(self):
         window = {"window_start": at(-10), "window_end": at(50)}
@@ -971,10 +960,7 @@ class DoorCourierKindTests(unittest.TestCase):
         parcel_out = hd.parcel_delivery(parcel(), NOW)
         self.assertEqual(self.kind(parcel_out, nemlig_delivery(), delivery()), "food")
         self.assertEqual(self.kind(parcel_out, nemlig_delivery()), "groceries")
-        self.assertEqual(self.kind(parcel_out, nemlig_delivery(), home=False), None)
-
-    def test_away_with_food_and_a_parcel_is_food(self):
-        self.assertEqual(self.kind(hd.parcel_delivery(parcel(), NOW), delivery(), home=False), "food")
+        self.assertEqual(self.kind(parcel_out), "parcel")
 
     def test_food_still_in_the_kitchen_lets_the_parcel_answer_the_door(self):
         self.assertEqual(self.kind(delivery(stage="preparing"), hd.parcel_delivery(parcel(), NOW)), "parcel")
@@ -984,7 +970,7 @@ class DoorCourierKindTests(unittest.TestCase):
         self.assertIsNone(self.kind(done, nemlig_delivery(stage="delivered"), delivery(stage="cancelled")))
 
     def test_the_published_attributes_stay_plain_json(self):
-        attrs = hd.snapshot([delivery(eta=at(8)), nemlig_delivery()], NOW, True)["attributes"]
+        attrs = hd.snapshot([delivery(eta=at(8)), nemlig_delivery()], NOW)["attributes"]
         self.assertEqual(json.loads(json.dumps(attrs)), attrs)
 
 
@@ -1369,7 +1355,7 @@ class ParcelAppTests(unittest.TestCase):
         h = Harness()
         self.assertEqual([kw for entity, kw in h.listened if entity in (AGGREGATOR_INCOMING, AGGREGATOR_DELIVERED)],
                          [{"attribute": "all"}] * 2)
-        self.assertEqual({entity for entity, _ in h.listened}, {AGGREGATOR_INCOMING, AGGREGATOR_DELIVERED, OWNER})
+        self.assertEqual({entity for entity, _ in h.listened}, {AGGREGATOR_INCOMING, AGGREGATOR_DELIVERED})
         before = len(h.published)
         h.states[AGGREGATOR_INCOMING] = aggregator(parcel(start=at(30)))
         h.app._on_change(AGGREGATOR_INCOMING, "all", {}, {}, {})
@@ -1415,18 +1401,18 @@ class ParcelAppTests(unittest.TestCase):
         self.assertEqual(h.last[1]["spoken"], "A PostNord parcel is out for delivery, and 1 more.")
 
 
-class OwnerPresenceAppTests(unittest.TestCase):
+class DoorCourierAppTests(unittest.TestCase):
     PARCEL_OUT = {AGGREGATOR_INCOMING: aggregator(parcel(start=at(30)))}
 
     def make(self, owner="home", **states):
         return Harness({OWNER: {"state": owner, "attributes": {}}, **self.PARCEL_OUT, **states})
 
-    def test_a_parcel_answers_the_door_only_while_the_owner_is_home(self):
-        h = self.make("home")
-        self.assertEqual(h.last[1]["door_courier_kind"], "parcel")
-        h = self.make("not_home")
-        self.assertIsNone(h.last[1]["door_courier_kind"])
-        self.assertEqual(h.last[1]["courier_expected"], True)
+    def test_a_parcel_answers_the_door_whoever_is_home(self):
+        for owner in ("home", "not_home"):
+            with self.subTest(owner=owner):
+                h = self.make(owner)
+                self.assertEqual((h.last[1]["door_courier_kind"], h.last[1]["courier_expected"]), ("parcel", True))
+        self.assertEqual(Harness(self.PARCEL_OUT).last[1]["door_courier_kind"], "parcel")
 
     def test_food_answers_the_door_whoever_is_home(self):
         for owner in ("home", "not_home"):
@@ -1434,41 +1420,9 @@ class OwnerPresenceAppTests(unittest.TestCase):
                 h = self.make(owner, **wolt(courier=True, eta=at(10)))
                 self.assertEqual((h.last[1]["door_courier_kind"], h.last[1]["food_courier_expected"]), ("food", True))
 
-    def test_the_owner_arriving_or_leaving_publishes_at_once(self):
+    def test_who_is_home_is_not_listened_to(self):
         h = self.make("not_home")
-        self.assertIn((OWNER, {}), h.listened)
-        before = len(h.published)
-        h.states[OWNER]["state"] = "home"
-        h.app._on_change(OWNER, "state", "not_home", "home", {})
-        self.assertEqual((len(h.published), h.last[1]["door_courier_kind"]), (before + 1, "parcel"))
-        h.states[OWNER]["state"] = "not_home"
-        h.app._on_change(OWNER, "state", "home", "not_home", {})
-        self.assertIsNone(h.last[1]["door_courier_kind"])
-
-    def test_an_owner_who_cannot_be_read_is_away(self):
-        for value in ("unavailable", "unknown", None):
-            with self.subTest(value=value):
-                h = self.make(value)
-                self.assertIsNone(h.last[1]["door_courier_kind"])
-        h = Harness(self.PARCEL_OUT)
-        self.assertIsNone(h.last[1]["door_courier_kind"])
-
-        plain = h.app.get_state
-
-        def broken(entity_id, attribute=None):
-            if attribute is None:
-                raise RuntimeError("Home Assistant did not answer")
-            return plain(entity_id, attribute=attribute)
-
-        h.states[OWNER] = {"state": "home", "attributes": {}}
-        h.app.get_state = broken
-        h.tick(30)
-        self.assertEqual((h.last[0], h.last[1]["door_courier_kind"]), ("1", None))
-
-    def test_the_owner_entity_can_be_configured(self):
-        h = Harness({"person.other": {"state": "home", "attributes": {}}, **self.PARCEL_OUT}, owner_entity="person.other")
-        self.assertEqual(h.last[1]["door_courier_kind"], "parcel")
-        self.assertIn(("person.other", {}), h.listened)
+        self.assertNotIn(OWNER, [entity for entity, _ in h.listened])
 
 
 if __name__ == "__main__":
