@@ -1,8 +1,11 @@
 """Room-local music controls for Assist satellites.
 
 satellites maps each Assist satellite entity to its HA area id; speakers maps areas
-to Music Assistant players. A satellite entering listening mutes its room's speaker
-only while it is playing and unmuted. Only mutes made here are released, either on
+to Music Assistant players. A satellite entering listening from idle mutes its room's
+speaker only while it is playing and unmuted. A follow-up turn (responding to listening)
+never mutes: the answer is a Music Assistant announcement on that speaker, and Music
+Assistant restores the mute state it saw during the announcement, so a mute made then
+would come back after the release. Only mutes made here are released, either on
 leaving listening or after duck_failsafe_s. Release checks the current mute state,
 even if playback has stopped, and always forgets ownership. Responding needs no end
 signal. Volume levels never change, and ducking never pauses a group. FollowMe may
@@ -97,7 +100,7 @@ class AssistRooms(hass.Hass):
         speaker = self.speakers.get(area)
         if not speaker or old == new:
             return
-        if new == "listening":
+        if new == "listening" and old == "idle":
             actions = duck_actions(speaker, self._read(speaker), True, area in self._ducked)
             if actions:
                 self._run_actions(area, actions)

@@ -228,11 +228,25 @@ class AssistRoomsGlue(unittest.TestCase):
         app.states[BATHROOM] = state(muted=True)
         satellite(app, "listening", "responding")
         app.states[BATHROOM] = state()
-        satellite(app, "responding", "listening")
+        satellite(app, "responding", "idle")
+        satellite(app, "idle", "listening")
         app.states[BATHROOM] = state(muted=True)
         old_timer.args[0](old_timer.kwargs)
         self.assertEqual(app.call_service.call_count, 3)
         self.assertTrue(app._ducked)
+
+    def test_follow_up_turn_during_answer_never_mutes(self):
+        app = make_app()
+        satellite(app, "idle", "listening")
+        satellite(app, "listening", "processing")
+        satellite(app, "processing", "responding")
+        app.call_service.reset_mock()
+        app.run_in.reset_mock()
+        satellite(app, "responding", "listening")
+        satellite(app, "listening", "processing")
+        app.call_service.assert_not_called()
+        app.run_in.assert_not_called()
+        self.assertFalse(app._ducked)
 
     def test_satellite_without_speaker_does_nothing(self):
         app = make_app()
