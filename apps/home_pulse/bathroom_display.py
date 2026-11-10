@@ -20,8 +20,8 @@ Publishes sensor.bathroom_display, the one entity the display reads:
         line1..3    the title of each line, at most LINE_MAX characters; "" when unused
         icon1..3    the line's mdi icon, the row's own or the line's (mdi:train for transit); "" when unused
         due1..3     the text under the line's chip: when a row is due ("overdue", "today", "tomorrow" or
-                    "6 d"), or the short value of a weighing, alarm, rain or appliance line ("73.3 kg",
-                    "09:15", "09-11", "11:30"); "" when it has none
+                    "6 d"), or the short value of a weighing, alarm, rain, delivery or appliance line
+                    ("73.3 kg", "09:15", "09-11", "8 min", "11:30"); "" when it has none
         friendly_name, icon
     The lines are filled only for state mikkel, except while the night is on (below). The phone's dBm is not
     published (mikkel_rssi_min is calibrated from the history of its sensor), so the payload changes only
@@ -79,6 +79,16 @@ The lines for Mikkel, at most three, in this order:
     transit   one line for each of his routes (the `transit` list) whose status is Delayed or Disrupted
               and whose data is at most transit_max_age_min old: the first upcoming cancelled departure
               ("S-tog: cancelled 07:42"), else the first late one ("S-tog: 07:42 +12 min"), else the status.
+    delivery  the first delivery on its way in delivery_entity (sensor.home_delivery): one of its `deliveries`
+              whose stage is preparing, on_the_way or arriving, never the parcels it lists as `upcoming`. The
+              icon follows its kind and stage (food mdi:chef-hat while preparing and mdi:moped after,
+              groceries mdi:cart and mdi:truck-delivery, a parcel mdi:package-variant-closed) and the text
+              under the chip is its time: "8 min" for an ETA less than an hour away ("now" once a courier
+              that is out has passed it), the clock time ("17:42") from an hour out, else its window ("20-22",
+              "from 17:30" when it does not start and end on the hour), else "today". The title is its own
+              title and that clock time or window ("Restaurant Vita · 17:42"), cut back before the time. The
+              minutes are counted from `eta` and not read from `minutes_left`, which AppDaemon leaves out
+              when it is 0.
     laundry   washer_entity (sensor.washer_state), then dryer_entity (sensor.dryer_state), while Running or
               Paused and started_by names the resident, without regard to case. "Washer 42 min left" or
               "Dryer 1 h 05 left", with mdi:washing-machine or mdi:tumble-dryer and the finish time under
@@ -117,9 +127,9 @@ listen_state(attribute="all"), and a value from a callback is never replaced by 
 AppDaemon 4.5.13's state store can lag behind HA. The freshness of a reading is its own last_updated, so a
 late callback or a stale snapshot does not look new. Every TICK_S seconds everything is evaluated again, which
 is how a reading that stops coming, a lease that runs out, an old transit report, the minutes left on an
-appliance and a due chip that rolls over reach the display, and so is the end of the card; the result is
-published only when it differs from the last one published, and always on plugin_started, since HA forgets
-a set_state entity when it restarts.
+appliance or a delivery and a due chip that rolls over reach the display, and so is the end of the card; the
+result is published only when it differs from the last one published, and always on plugin_started, since HA
+forgets a set_state entity when it restarts.
 The recorder's answer and the forecast are fetched like HouseUpcoming's: an async method awaits the service
 call (with a timeout of FETCH_TIMEOUT_S), leaves the result in a hand-over and has run_in(.., 0) apply it.
 
@@ -176,6 +186,10 @@ WASHER = "sensor.washer_state"
 DRYER = "sensor.dryer_state"
 WASHER_ICON = "mdi:washing-machine"
 DRYER_ICON = "mdi:tumble-dryer"
+DELIVERY = "sensor.home_delivery"
+DELIVERY_KINDS = {"food": "Food", "groceries": "Groceries", "parcel": "Parcel"}
+DELIVERY_STAGES = ("preparing", "on_the_way", "arriving")
+CLOCK_FROM_MIN = 60
 ICON_MAX = 80
 PLAY_EVENT = "esphome.bathroom_display_play"
 SPEAKER = "media_player.bathroom"
@@ -379,6 +393,59 @@ def appliance_line(label, icon, full, now, resident=RESIDENT):
         minutes = max(0, ceil((end.astimezone(timezone.utc) - now.astimezone(timezone.utc)).total_seconds() / 60))
         word = f"{minutes} min left" if minutes < 60 else f"{minutes // 60} h {minutes % 60:02d} left"
     return Line(fit(f"{label} {word}"), icon, end.astimezone(maint.HOUSE_TZ).strftime("%H:%M") if end else "")
+
+
+def delivery_icon(kind, stage):
+    """The icon of a delivery on its way: a parcel's, else the kitchen's or the cart's while it is preparing and
+    the courier's after."""
+    if kind == "parcel":
+        return "mdi:package-variant-closed"
+    waiting = stage == "preparing"
+    if kind == "groceries":
+        return "mdi:cart" if waiting else "mdi:truck-delivery"
+    return "mdi:chef-hat" if waiting else "mdi:moped"
+
+
+def delivery_window(entry):
+    """(chip, title part) for the window of a delivery entry, house time: "20-22" for both when it starts and ends
+    on the hour, else "from 17:30" and "17:30-19:30"; None without a window, which needs both ends in order."""
+    start, end = maint.parse_iso(entry.get("window_start")), maint.parse_iso(entry.get("window_end"))
+    if start is None or end is None or start >= end:
+        return None
+    start, end = start.astimezone(maint.HOUSE_TZ), end.astimezone(maint.HOUSE_TZ)
+    if start.minute or end.minute:
+        return f"from {start:%H:%M}", f"{start:%H:%M}-{end:%H:%M}"
+    return (f"{start:%H}-{end:%H}",) * 2
+
+
+def delivery_line(full, now):
+    """The line for the first delivery on its way in the state dict of sensor.home_delivery, else None: an entry
+    of `deliveries` of a known kind whose stage is preparing, on_the_way or arriving. Under its icon (see
+    delivery_icon) goes the time: the minutes to its ETA while that is less than CLOCK_FROM_MIN away, the ETA's
+    clock time from then on, "now" once a courier that is out has passed it, else the window, else "today";
+    a kitchen that has passed its ETA has no time of its own. The minutes are counted from `eta` at `now`,
+    since AppDaemon leaves minutes_left out when it is 0. The title is the delivery's title (the kind's word
+    without one) cut back to leave room for " · " and the clock time or window, or "today"."""
+    attrs = full.get("attributes") if isinstance(full, dict) and isinstance(full.get("attributes"), dict) else {}
+    entries = attrs.get("deliveries") if isinstance(attrs.get("deliveries"), list) else []
+    entry = next((item for item in entries if isinstance(item, dict) and isinstance(item.get("kind"), str)
+                  and item["kind"] in DELIVERY_KINDS and item.get("stage") in DELIVERY_STAGES), None)
+    if entry is None:
+        return None
+    kind, stage = entry["kind"], entry["stage"]
+    chip = tail = None
+    eta = maint.parse_iso(entry.get("eta"))
+    if eta is not None:
+        minutes = max(0, ceil((eta - now).total_seconds() / 60))
+        if minutes > 0 or stage != "preparing":
+            tail = eta.astimezone(maint.HOUSE_TZ).strftime("%H:%M")
+            chip = tail if minutes >= CLOCK_FROM_MIN else f"{minutes} min" if minutes else "now"
+    if chip is None:
+        chip, tail = delivery_window(entry) or ("today", "today")
+    title = entry.get("title")
+    name = " ".join(title.split()) if isinstance(title, str) else ""
+    suffix = f" · {tail}"
+    return Line(fit(name or DELIVERY_KINDS[kind], LINE_MAX - len(suffix)) + suffix, delivery_icon(kind, stage), chip)
 
 
 def live_rows(full, now):
@@ -696,6 +763,7 @@ class BathroomDisplay(hass.Hass):
         self.transit_max_age = timedelta(minutes=float(a.get("transit_max_age_min", TRANSIT_MAX_AGE_MIN)))
         self.washer_entity = a.get("washer_entity", WASHER)
         self.dryer_entity = a.get("dryer_entity", DRYER)
+        self.delivery_entity = a.get("delivery_entity", DELIVERY)
         self.sleep_entity = a.get("sleep_entity", "input_boolean.mikkel_sleep_mode")
         self.light_entity = a.get("light_entity", "light.bathroom_main_lights")
         self.play_event = a.get("play_event", PLAY_EVENT)
@@ -742,7 +810,7 @@ class BathroomDisplay(hass.Hass):
         return list(dict.fromkeys([self.rssi_entity, self.upcoming_entity, self.sleep_entity, self.light_entity,
                                    self.measured_entity, self.weight_entity, self.fat_entity, self.rain_entity,
                                    self.alarm_entity, self.alarm_time_entity, self.alarm_from_entity,
-                                   self.washer_entity, self.dryer_entity]
+                                   self.washer_entity, self.dryer_entity, self.delivery_entity]
                                   + [entity for _, entity in self.routes]))
 
     def _read(self, entity):
@@ -921,6 +989,9 @@ class BathroomDisplay(hass.Hass):
             lines = lines + self._rain(now)
         routes = [(label, self._cache.get(entity)) for label, entity in self.routes]
         lines = lines + transit_lines(routes, now, self.transit_max_age)
+        delivery = delivery_line(self._cache.get(self.delivery_entity), now)
+        if delivery:
+            lines.append(delivery)
         for label, icon, entity in (("Washer", WASHER_ICON, self.washer_entity),
                                     ("Dryer", DRYER_ICON, self.dryer_entity)):
             line = appliance_line(label, icon, self._cache.get(entity), now, self.resident)

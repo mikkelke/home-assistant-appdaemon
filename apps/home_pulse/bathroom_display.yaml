@@ -40,7 +40,10 @@ BathroomDisplay:
     - {entity: sensor.transit_enghave_metro_kbh, label: Metro}
     - {entity: sensor.transit_carlsberg_stog_kbh, label: S-tog}
   transit_max_age_min: 45
-  # Running or paused laundry started by the resident, after transit and before the rows.
+  # The first delivery on its way (Wolt, Nemlig, parcels due today): an icon by kind and stage, the minutes
+  # to its ETA or else its window under the chip, after transit and before the laundry.
+  delivery_entity: sensor.home_delivery
+  # Running or paused laundry started by the resident, after the delivery and before the rows.
   washer_entity: sensor.washer_state
   dryer_entity: sensor.dryer_state
   # The display fires play_event when its round play button is tapped. The speaker then pauses if it is

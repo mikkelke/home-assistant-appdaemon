@@ -19,6 +19,7 @@ APPS = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(APPS / "home_pulse"))
 sys.path.insert(0, str(APPS / "presence"))
 sys.path.insert(0, str(APPS / "climate"))
+sys.path.insert(0, str(APPS / "deliveries"))
 _hassapi = types.ModuleType("appdaemon.plugins.hass.hassapi")
 _hassapi.Hass = object
 for _name, _mod in (
@@ -30,6 +31,7 @@ for _name, _mod in (
     sys.modules.setdefault(_name, _mod)
 
 import bathroom_display as bd  # noqa: E402
+import home_delivery as hd  # noqa: E402
 import upcoming_core as core  # noqa: E402
 import upcoming_maint as maint  # noqa: E402
 import upcoming_once as once  # noqa: E402
@@ -63,6 +65,7 @@ ALARM_TIME = CONFIG["alarm_time_entity"]
 ALARM_FROM_ENTITY = CONFIG["alarm_from_entity"]
 WASHER = CONFIG["washer_entity"]
 DRYER = CONFIG["dryer_entity"]
+DELIVERY = CONFIG["delivery_entity"]
 
 
 def iso(moment):
@@ -118,6 +121,36 @@ def route(state, departures=(), as_of=NOW - 2 * MIN, threshold=10, **extra):
 
 def upcoming(rows, expires=NOW + 10 * MIN):
     return full(iso(NOW), {"expires": iso(expires), "rows": rows})
+
+
+def stamp(moment):
+    """A time as HomeDelivery publishes it: ISO, house time, to the second."""
+    return moment.astimezone(HOUSE).isoformat(timespec="seconds")
+
+
+def a_delivery(kind="food", stage="on_the_way", title="Restaurant Vita", eta=None, window=None):
+    """An entry of the deliveries attribute of sensor.home_delivery, with the times it has."""
+    entry = {"id": f"test:{title}", "source": "wolt", "kind": kind, "title": title, "stage": stage}
+    if eta is not None:
+        entry["eta"] = stamp(eta)
+    if window is not None:
+        entry["window_start"], entry["window_end"] = stamp(window[0]), stamp(window[1])
+    return entry
+
+
+def delivery_state(*entries, **attributes):
+    """The state dict of sensor.home_delivery for these entries, as it is in HA."""
+    active = [entry for entry in entries if entry["stage"] in bd.DELIVERY_STAGES]
+    return full(str(len(active)), {"deliveries": list(entries), **attributes})
+
+
+def ad_drop(value):
+    """`value` as AppDaemon 4.5.13's set_state leaves it in HA: every key whose value is None, False or 0 is
+    gone, at any depth."""
+    if isinstance(value, dict):
+        return {key: ad_drop(item) for key, item in value.items()
+                if not (item is None or (isinstance(item, (bool, int, float)) and item == 0))}
+    return [ad_drop(item) for item in value] if isinstance(value, list) else value
 
 
 def attrs_of(**overrides):
@@ -585,6 +618,154 @@ class TransitLineTests(unittest.TestCase):
                                  TRANSIT_AGE)
         self.assertEqual(lines, [bd.Line("Metro: cancelled 08:35", "mdi:train"),
                                  bd.Line("S-tog: 08:39 +11 min", "mdi:train")])
+
+
+class DeliveryLineTests(unittest.TestCase):
+    VITA = bd.Line("Restaurant Vita · 08:38", "mdi:moped", "8 min")
+
+    def line(self, *entries, now=NOW, **attributes):
+        return bd.delivery_line(delivery_state(*entries, **attributes), now)
+
+    def test_the_icon_follows_the_kind_and_the_stage(self):
+        parcel = "mdi:package-variant-closed"
+        cases = (("food", "preparing", "mdi:chef-hat"), ("food", "on_the_way", "mdi:moped"),
+                 ("food", "arriving", "mdi:moped"), ("groceries", "preparing", "mdi:cart"),
+                 ("groceries", "on_the_way", "mdi:truck-delivery"), ("groceries", "arriving", "mdi:truck-delivery"),
+                 ("parcel", "preparing", parcel), ("parcel", "on_the_way", parcel), ("parcel", "arriving", parcel))
+        for kind, stage, icon in cases:
+            with self.subTest(kind=kind, stage=stage):
+                self.assertEqual(bd.delivery_icon(kind, stage), icon)
+                self.assertEqual(self.line(a_delivery(kind, stage, eta=NOW + 8 * MIN)).icon, icon)
+
+    def test_an_eta_under_an_hour_away_is_the_minutes_left_and_the_title_has_its_clock_time(self):
+        self.assertEqual(self.line(a_delivery(eta=NOW + 8 * MIN)), self.VITA)
+        self.assertEqual(self.line(a_delivery("groceries", "preparing", "Nemlig", eta=NOW + 25 * MIN)),
+                         bd.Line("Nemlig · 08:55", "mdi:cart", "25 min"))
+
+    def test_the_minutes_round_up(self):
+        for delta, chip in ((7 * MIN + SEC, "8 min"), (7 * MIN, "7 min"), (SEC, "1 min"), (59 * MIN, "59 min")):
+            with self.subTest(delta=delta):
+                self.assertEqual(self.line(a_delivery(eta=NOW + delta)).due, chip)
+
+    def test_from_an_hour_out_the_time_is_the_clock_time(self):
+        for delta, clock in ((59 * MIN + SEC, "09:29"), (60 * MIN, "09:30"), (3 * HOUR, "11:30")):
+            with self.subTest(delta=delta):
+                self.assertEqual(self.line(a_delivery(eta=NOW + delta)),
+                                 bd.Line(f"Restaurant Vita · {clock}", "mdi:moped", clock))
+
+    def test_a_courier_that_is_out_and_has_passed_its_eta_is_now(self):
+        for stage in ("on_the_way", "arriving"):
+            for delta, clock in ((-5 * MIN, "08:25"), (-SEC, "08:29"), (0 * MIN, "08:30")):
+                with self.subTest(stage=stage, delta=delta):
+                    self.assertEqual(self.line(a_delivery(stage=stage, eta=NOW + delta)),
+                                     bd.Line(f"Restaurant Vita · {clock}", "mdi:moped", "now"))
+
+    def test_a_kitchen_that_has_passed_its_eta_has_no_time_of_its_own(self):
+        passed = NOW - 2 * MIN
+        self.assertEqual(self.line(a_delivery(stage="preparing", eta=passed)),
+                         bd.Line("Restaurant Vita · today", "mdi:chef-hat", "today"))
+        window = (house(11, 5, 20), house(11, 5, 22))
+        self.assertEqual(self.line(a_delivery(stage="preparing", eta=passed, window=window)),
+                         bd.Line("Restaurant Vita · 20-22", "mdi:chef-hat", "20-22"))
+
+    def test_without_an_eta_the_window_is_the_time(self):
+        entry = a_delivery("groceries", "preparing", "Nemlig", window=(house(11, 5, 20), house(11, 5, 22)))
+        self.assertEqual(self.line(entry), bd.Line("Nemlig · 20-22", "mdi:cart", "20-22"))
+
+    def test_a_window_that_is_off_the_hour_shows_from_its_start_and_whole_in_the_title(self):
+        for start, end, whole in ((house(11, 5, 17, 30), house(11, 5, 19, 30), "17:30-19:30"),
+                                  (house(11, 5, 17), house(11, 5, 19, 30), "17:00-19:30"),
+                                  (house(11, 5, 17, 30), house(11, 5, 19), "17:30-19:00")):
+            with self.subTest(whole=whole):
+                chip = f"from {whole[:5]}"
+                self.assertEqual(self.line(a_delivery("groceries", "on_the_way", "Nemlig", window=(start, end))),
+                                 bd.Line(f"Nemlig · {whole}", "mdi:truck-delivery", chip))
+
+    def test_a_window_in_another_zone_is_read_in_house_time(self):
+        entry = {**a_delivery("groceries", "preparing", "Nemlig"), "window_start": "2026-11-05T19:00:00+00:00",
+                 "window_end": "2026-11-05T21:00:00+00:00"}
+        self.assertEqual(self.line(entry).due, "20-22")
+
+    def test_a_window_needs_both_ends_in_order(self):
+        start, end = stamp(house(11, 5, 20)), stamp(house(11, 5, 22))
+        for window in ({"window_start": start}, {"window_end": end}, {"window_start": end, "window_end": start},
+                       {"window_start": start, "window_end": start}, {"window_start": start, "window_end": "late"},
+                       {"window_start": 20, "window_end": 22}):
+            with self.subTest(window=window):
+                entry = {**a_delivery("groceries", "preparing", "Nemlig"), **window}
+                self.assertEqual(self.line(entry), bd.Line("Nemlig · today", "mdi:cart", "today"))
+
+    def test_with_no_time_at_all_it_says_today(self):
+        self.assertEqual(self.line(a_delivery("parcel", "on_the_way", "ComputerSalg A/S")),
+                         bd.Line("ComputerSalg A/S · today", "mdi:package-variant-closed", "today"))
+
+    def test_an_eta_is_preferred_to_a_window(self):
+        entry = a_delivery("groceries", "on_the_way", "Nemlig", eta=NOW + 20 * MIN,
+                           window=(house(11, 5, 8), house(11, 5, 10)))
+        self.assertEqual(self.line(entry), bd.Line("Nemlig · 08:50", "mdi:truck-delivery", "20 min"))
+
+    def test_a_time_that_cannot_be_read_is_no_time(self):
+        for eta in ("soon", "", "2026-13-45T00:00:00", 5, ["x"], None):
+            with self.subTest(eta=eta):
+                entry = {**a_delivery(), "eta": eta}
+                self.assertEqual(self.line(entry), bd.Line("Restaurant Vita · today", "mdi:moped", "today"))
+
+    def test_an_eta_without_a_zone_is_house_time(self):
+        entry = {**a_delivery(), "eta": "2026-11-05T08:38:00"}
+        self.assertEqual(self.line(entry), self.VITA)
+
+    def test_ended_deliveries_and_unknown_ones_are_not_on_the_way(self):
+        soon = NOW + 8 * MIN
+        for stage in ("delivered", "cancelled", "", None, "lost", 5, ["on_the_way"]):
+            with self.subTest(stage=stage):
+                self.assertIsNone(self.line(a_delivery(stage=stage, eta=soon)))
+        for kind in ("drone", "", None, ["food"], {"food": 1}, 5):
+            with self.subTest(kind=kind):
+                self.assertIsNone(self.line(a_delivery(kind=kind, eta=soon)))
+
+    def test_the_first_delivery_on_the_way_is_the_one_shown(self):
+        ended = a_delivery(stage="delivered", title="Old Kitchen", eta=NOW - 20 * MIN)
+        nemlig = a_delivery("groceries", "preparing", "Nemlig", window=(house(11, 5, 20), house(11, 5, 22)))
+        vita = a_delivery(eta=NOW + MIN)
+        self.assertEqual(self.line(ended, nemlig, vita).text, "Nemlig · 20-22")
+        self.assertEqual(self.line(ended, vita, nemlig).text, "Restaurant Vita · 08:31")
+        junk = [None, 5, "x", [], {}, {"kind": "food"}, {"stage": "arriving"}, a_delivery(kind="drone", eta=NOW),
+                nemlig]
+        self.assertEqual(bd.delivery_line(full("1", {"deliveries": junk}), NOW).text, "Nemlig · 20-22")
+
+    def test_a_sensor_that_cannot_be_read_has_no_line(self):
+        for state in (None, {}, "x", {"state": "unavailable"}, {"attributes": None}, full("0"),
+                      full("1", {"deliveries": None}), full("1", {"deliveries": {"a": 1}}),
+                      full("1", {"deliveries": "soon"}), full("0", {"deliveries": []})):
+            with self.subTest(state=state):
+                self.assertIsNone(bd.delivery_line(state, NOW))
+
+    def test_parcels_that_are_not_due_today_are_not_a_line(self):
+        upcoming_parcels = [{"id": "gls:1", "source": "gls", "title": "ComputerSalg A/S", "status": "in_transit"}]
+        self.assertIsNone(self.line(upcoming=upcoming_parcels))
+
+    def test_a_missing_or_blank_title_is_the_words_of_its_kind(self):
+        for kind, word in (("food", "Food"), ("groceries", "Groceries"), ("parcel", "Parcel")):
+            for title in (None, "", "   ", 5, ["x"]):
+                with self.subTest(kind=kind, title=title):
+                    entry = {**a_delivery(kind, eta=NOW + 8 * MIN), "title": title}
+                    self.assertEqual(self.line(entry).text, f"{word} · 08:38")
+
+    def test_a_long_title_is_cut_back_before_its_time(self):
+        cases = ((a_delivery(title="The Very Long Restaurant Name Of Vesterbro", eta=NOW + 8 * MIN),
+                  "The Very Long... · 08:38"),
+                 (a_delivery(title="A" * 24, eta=NOW + 8 * MIN), "A" * 24 + " · 08:38"),
+                 (a_delivery(title="A" * 25, eta=NOW + 8 * MIN), "A" * 21 + "... · 08:38"),
+                 (a_delivery("groceries", "preparing", "A" * 25, window=(house(11, 5, 17, 30), house(11, 5, 19, 30))),
+                  "A" * 15 + "... · 17:30-19:30"))
+        for entry, text in cases:
+            with self.subTest(text=text):
+                self.assertEqual(self.line(entry).text, text)
+                self.assertLessEqual(len(text), bd.LINE_MAX)
+
+    def test_the_title_keeps_its_letters_and_loses_stray_spaces(self):
+        entry = a_delivery(title="  Café \n Nørrebro  ", eta=NOW + 8 * MIN)
+        self.assertEqual(self.line(entry).text, "Café Nørrebro · 08:38")
 
 
 class PayloadTests(unittest.TestCase):
@@ -1679,13 +1860,13 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(app.published, [{"entity": "sensor.bathroom_display", "state": "off",
                                           "attributes": attrs_of(reason=f"inactive:{ACTIVE}"), "replace": True}])
 
-    def test_it_listens_to_the_room_the_phone_the_rows_routes_scale_rain_alarm_and_appliances(self):
+    def test_it_listens_to_the_room_the_phone_the_rows_routes_scale_rain_alarm_deliveries_and_appliances(self):
         app = make_app()
         self.assertEqual(sorted((entity, kw.get("attribute")) for _, entity, kw in app.listened),
                          sorted([(ACTIVE, None), (RSSI, "all"), (UPCOMING, "all"), (SLEEP, "all"), (LIGHT, "all"),
                                  (METRO, "all"), (STOG, "all"), (MEASURED, "all"), (WEIGHT, "all"), (FAT, "all"),
                                  (PIEZO, "all"), (ALARM, "all"), (ALARM_TIME, "all"), (ALARM_FROM_ENTITY, "all"),
-                                 (WASHER, "all"), (DRYER, "all")]))
+                                 (WASHER, "all"), (DRYER, "all"), (DELIVERY, "all")]))
         self.assertEqual(app.events, [("_on_plugin_started", "plugin_started"),
                                       ("_on_play", "esphome.bathroom_display_play"),
                                       ("_on_alarm", "esphome.bathroom_display_alarm")])
@@ -2161,6 +2342,123 @@ class ApplianceFlowTests(unittest.TestCase):
         self.assertNotIn(DRYER, [entity for _, entity, _ in app.listened])
 
 
+class DeliveryFlowTests(unittest.TestCase):
+    VITA = ("Restaurant Vita · 08:38", "mdi:moped", "8 min")
+
+    def app(self, states=None, now=NOW, **kw):
+        return make_app({RSSI: full("-60", updated=now), **(states or {})}, now=now, **kw)
+
+    def test_his_delivery_on_the_way_has_the_minutes_under_its_icon_and_the_clock_time_in_the_title(self):
+        app = self.app({DELIVERY: delivery_state(a_delivery(eta=NOW + 8 * MIN))})
+        self.assertEqual(shown(app), [self.VITA, BLANK, BLANK])
+
+    def test_a_delivery_that_arrives_later_is_shown_at_once_and_goes_when_it_ends(self):
+        app = self.app()
+        self.assertEqual(shown(app), [BLANK] * 3)
+        fire(app, DELIVERY, delivery_state(a_delivery(stage="preparing", eta=NOW + 25 * MIN)))
+        self.assertEqual(shown(app)[0], ("Restaurant Vita · 08:55", "mdi:chef-hat", "25 min"))
+        fire(app, DELIVERY, delivery_state(a_delivery(eta=NOW + 8 * MIN)))
+        self.assertEqual(shown(app)[0], self.VITA)
+        for stage in ("delivered", "cancelled"):
+            fire(app, DELIVERY, delivery_state(a_delivery(eta=NOW + 8 * MIN)))
+            fire(app, DELIVERY, delivery_state(a_delivery(stage=stage, eta=NOW + 8 * MIN)))
+            self.assertEqual(shown(app), [BLANK] * 3)
+
+    def test_the_minutes_count_down_on_the_tick_without_republishing_the_same_line(self):
+        app = self.app({DELIVERY: delivery_state(a_delivery(eta=NOW + 8 * MIN))})
+        phone(app, "-90")
+        before = len(app.published)
+        tick(app, 10 * SEC)
+        self.assertEqual((shown(app)[0][2], len(app.published)), ("8 min", before))
+        tick(app, 50 * SEC)
+        self.assertEqual((shown(app)[0][2], len(app.published)), ("7 min", before + 1))
+
+    def test_it_says_now_once_the_eta_has_passed_though_the_sensor_has_left_the_minutes_out(self):
+        app = self.app({DELIVERY: delivery_state(a_delivery(eta=NOW + 2 * MIN))})
+        phone(app, "-90")
+        tick(app, 3 * MIN)
+        self.assertEqual(shown(app)[0], ("Restaurant Vita · 08:32", "mdi:moped", "now"))
+
+    def test_someone_and_an_empty_room_get_no_delivery_line(self):
+        for states, active in (({RSSI: full("-90")}, "on"), ({}, "off")):
+            with self.subTest(active=active):
+                app = self.app({DELIVERY: delivery_state(a_delivery(eta=NOW + 8 * MIN)), **states}, active=active)
+                self.assertEqual(shown(app), [BLANK] * 3)
+
+    def test_it_comes_after_transit_before_the_laundry_and_the_rows_within_three_lines(self):
+        app = self.app({DELIVERY: delivery_state(a_delivery(eta=NOW + 8 * MIN)),
+                        WASHER: full("Running", ApplianceFlowTests.WASH), UPCOMING: upcoming(LineTests.ROWS),
+                        STOG: route("Disrupted", [departure(12, "08:42", cancelled=True)])})
+        self.assertEqual([line[0] for line in shown(app)],
+                         ["S-tog: cancelled 08:42", "Restaurant Vita · 08:38", "Washer 42 min left"])
+        fire(app, STOG, route("OK"))
+        self.assertEqual([line[0] for line in shown(app)],
+                         ["Restaurant Vita · 08:38", "Washer 42 min left", "Spray the Alocasia"])
+
+    def test_only_the_first_delivery_gets_a_line(self):
+        app = self.app({DELIVERY: delivery_state(a_delivery(eta=NOW + 8 * MIN),
+                                                 a_delivery("parcel", "on_the_way", "GLS", eta=NOW + 40 * MIN))})
+        self.assertEqual(shown(app), [self.VITA, BLANK, BLANK])
+
+    def test_the_entity_is_from_the_yaml(self):
+        app = self.app({"sensor.den_delivery": delivery_state(a_delivery(eta=NOW + 8 * MIN))},
+                       delivery_entity="sensor.den_delivery")
+        self.assertEqual(shown(app), [self.VITA, BLANK, BLANK])
+        self.assertIn(("_on_source", "sensor.den_delivery", {"attribute": "all"}), app.listened)
+        self.assertNotIn(DELIVERY, [entity for _, entity, _ in app.listened])
+
+    def test_the_night_face_shows_the_alarm_and_no_delivery(self):
+        app = self.app({SLEEP: full("on"), LIGHT: full("on"), ALARM: full("on"), ALARM_TIME: full("09:15:00"),
+                        DELIVERY: delivery_state(a_delivery(eta=NOW + 8 * MIN))})
+        self.assertEqual(shown(app), [("Alarm 09:15", "mdi:alarm", "09:15"), BLANK, BLANK])
+
+    def test_every_attribute_is_a_string_and_the_line_fits(self):
+        app = self.app({DELIVERY: delivery_state(a_delivery(title="Pizzeria Luca & Sønner på Vesterbrogade",
+                                                           eta=NOW + 8 * MIN))})
+        for key, value in last(app)["attributes"].items():
+            with self.subTest(key=key):
+                self.assertIsInstance(value, str)
+        self.assertLessEqual(len(last(app)["attributes"]["line1"]), bd.LINE_MAX)
+        self.assertTrue(last(app)["attributes"]["line1"].endswith(" · 08:38"))
+
+
+class DeliveryContractTests(unittest.TestCase):
+    """What HomeDelivery really publishes, once AppDaemon has left out every None, False and 0."""
+
+    def published(self, *deliveries, incoming=()):
+        return full("1", ad_drop(hd.snapshot(list(deliveries), NOW.timestamp(), incoming)["attributes"]))
+
+    def test_a_courier_on_the_way(self):
+        wolt = hd.Delivery("wolt:vita", "wolt", "food", "Restaurant Vita", "on_the_way",
+                           eta=(NOW + 8 * MIN).timestamp(), item_count=2)
+        self.assertEqual(bd.delivery_line(self.published(wolt), NOW),
+                         bd.Line("Restaurant Vita · 08:38", "mdi:moped", "8 min"))
+
+    def test_the_minutes_are_gone_from_the_sensor_at_zero_and_the_line_still_says_now(self):
+        wolt = hd.Delivery("wolt:vita", "wolt", "food", "Restaurant Vita", "arriving", eta=(NOW - MIN).timestamp())
+        state = self.published(wolt)
+        self.assertNotIn("minutes_left", state["attributes"]["deliveries"][0])
+        self.assertEqual(bd.delivery_line(state, NOW), bd.Line("Restaurant Vita · 08:29", "mdi:moped", "now"))
+
+    def test_a_booked_window(self):
+        window = (house(11, 5, 20).timestamp(), house(11, 5, 22).timestamp())
+        nemlig = hd.Delivery("nemlig", "nemlig", "groceries", "Nemlig", "preparing", window_start=window[0],
+                             window_end=window[1])
+        self.assertEqual(bd.delivery_line(self.published(nemlig), NOW), bd.Line("Nemlig · 20-22", "mdi:cart", "20-22"))
+
+    def test_a_parcel_out_for_delivery_without_a_time(self):
+        gls = hd.Delivery("gls:1", "gls", "parcel", "ComputerSalg A/S", "on_the_way", carrier="GLS")
+        self.assertEqual(bd.delivery_line(self.published(gls), NOW),
+                         bd.Line("ComputerSalg A/S · today", "mdi:package-variant-closed", "today"))
+
+    def test_an_ended_delivery_and_the_upcoming_parcels_are_no_line(self):
+        ended = hd.Delivery("wolt:vita", "wolt", "food", "Restaurant Vita", "delivered", ended_at=NOW.timestamp())
+        incoming = [{"carrier": "GLS", "barcode": "2", "status": "in_transit", "sender": "ComputerSalg A/S"}]
+        state = self.published(ended, incoming=incoming)
+        self.assertTrue(state["attributes"]["upcoming"])
+        self.assertIsNone(bd.delivery_line(state, NOW))
+
+
 class WeighingFlowTests(unittest.TestCase):
     """The app runs in the afternoon, which is neither of the windows of the rain and the alarm line."""
 
@@ -2188,6 +2486,15 @@ class WeighingFlowTests(unittest.TestCase):
         self.assertEqual((last(app)["state"], shown(app)), ("mikkel", self.CARD))
         self.assertEqual((last(app)["attributes"]["person"], last(app)["attributes"]["greeting"]),
                          ("mikkel", "Hi Mikkel"))
+
+    def test_the_card_replaces_a_delivery_line_and_gives_it_back(self):
+        app = self.app({DELIVERY: delivery_state(a_delivery(eta=self.AFTERNOON + 8 * MIN))})
+        weigh(app)
+        thirty_days_ago(app)
+        drain(app)
+        self.assertEqual(shown(app), self.CARD)
+        tick(app, 91 * SEC)
+        self.assertEqual(shown(app)[0], ("Restaurant Vita · 14:08", "mdi:moped", "7 min"))
 
     def test_the_statistics_are_asked_for_once_with_both_sensors_around_30_days_ago(self):
         app = self.app()
@@ -2761,7 +3068,8 @@ class NightTests(unittest.TestCase):
     ALARM_LINE = ("Alarm 09:15", "mdi:alarm", "09:15")
     SLEEPING = {ALARM: full("on"), ALARM_TIME: full("09:15:00"), UPCOMING: upcoming(LineTests.ROWS),
                 STOG: route("Disrupted", [departure(12, "08:42", cancelled=True)]), PIEZO: full("on"),
-                WASHER: full("Running", ApplianceFlowTests.WASH), DRYER: full("Paused", ApplianceFlowTests.DRY)}
+                WASHER: full("Running", ApplianceFlowTests.WASH), DRYER: full("Paused", ApplianceFlowTests.DRY),
+                DELIVERY: delivery_state(a_delivery(eta=NOW + 8 * MIN))}
     CASES = (  # the room, its states, whether it is active and the state it gets
         ("an empty room", {SLEEP: full("on")}, "off", "off"),
         ("a room kept dark", {SLEEP: full("on"), LIGHT: full("off")}, "on", "off"),
@@ -2884,6 +3192,7 @@ class ConfigTests(unittest.TestCase):
                          ("esphome.bathroom_display_play", "media_player.bathroom", "dr_podcasts://radio/p3"))
         self.assertEqual((app.washer_entity, app.dryer_entity), (bd.WASHER, bd.DRYER))
         self.assertEqual((CONFIG["washer_entity"], CONFIG["dryer_entity"]), ("sensor.washer_state", "sensor.dryer_state"))
+        self.assertEqual((app.delivery_entity, CONFIG["delivery_entity"]), (bd.DELIVERY, "sensor.home_delivery"))
 
     def test_the_weighing_rain_and_alarm_defaults_are_the_yamls_values(self):
         app = make_app()
@@ -2911,7 +3220,8 @@ class ConfigTests(unittest.TestCase):
                          (bd.MEASURED, bd.WEIGHT, bd.BODY_FAT, bd.PIEZO, bd.WEATHER, bd.ALARM, bd.ALARM_TIME,
                           bd.ALARM_FROM_ENTITY, bd.ALARM_EVENT))
         self.assertEqual(app.alarm_event, CONFIG["alarm_event"])
-        self.assertEqual((app.washer_entity, app.dryer_entity), (bd.WASHER, bd.DRYER))
+        self.assertEqual((app.washer_entity, app.dryer_entity, app.delivery_entity),
+                         (bd.WASHER, bd.DRYER, bd.DELIVERY))
 
     def test_the_limits_and_windows_are_the_agreed_ones(self):
         self.assertEqual((bd.CARD_S, bd.WEIGH_FRESH, bd.COMPARE_AGO, bd.COMPARE_SLACK, bd.DEAD_BAND_KG),
@@ -2921,6 +3231,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((bd.HOME_FROM, bd.HOME_TO), (dtime(16), dtime(20)))
         self.assertEqual((bd.ALARM_FROM, bd.ALARM_TO), (dtime(21), dtime(2)))
         self.assertEqual((bd.LINES, bd.LINE_MAX), (3, 32))
+        self.assertEqual(bd.CLOCK_FROM_MIN, 60)
 
     def test_the_history_outlasts_the_baseline_window(self):
         self.assertGreater(bd.HISTORY_S, bd.BASELINE_FROM_S)
