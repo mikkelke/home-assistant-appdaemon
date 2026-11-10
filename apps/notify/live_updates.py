@@ -253,10 +253,10 @@ def card_changed(previous, card):
     return previous.critical_text != card.critical_text
 
 
-def notification_payload(card, now, channel="Live"):
+def notification_payload(card, now, channel="Live updates"):
     data = {"tag": card.tag, "live_update": True, "critical_text": card.critical_text,
             "notification_icon": card.icon, "sticky": True, "alert_once": True, "channel": channel,
-            "importance": "low", "priority": "low", "clickAction": card.link, "url": card.link}
+            "importance": "low", "clickAction": card.link, "url": card.link}
     if card.finish_at is not None:
         data.update(chronometer=True, when=max(0, math.ceil(card.finish_at - now)), when_relative=True)
     return {"title": card.title, "message": card.message, "data": data}
@@ -269,7 +269,7 @@ class LiveUpdates(hass.Hass):
         self.source_people = {source: people(args.get(source + "_people", ["mikkel"]))
                               for source in ("cook", "coffee", "doorbell")}
         self.entities = {source: args.get(source + "_entity", entity) for source, entity in ENTITIES.items()}
-        self.channel = args.get("channel", "Live")
+        self.channel = args.get("channel", "Live updates")
         self.stale_limit_s = max(0, number(args.get("stale_limit_s", 600)) or 0)
         self.doorbell_max_s = max(0, number(args.get("doorbell_max_s", 180)) or 0)
         self.state_file = Path(args.get("state_file") or Path(__file__).with_name("live_updates_state.json"))

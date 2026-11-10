@@ -37,7 +37,7 @@ LiveUpdates:
 
   # One quiet channel for every ongoing card. Existing channel settings on Android remain under
   # the phone user's control. Updates also carry alert_once and no sound field.
-  channel: Live
+  channel: Live updates
 
   # Durable cycle audiences, last cards and send times survive reloads. Default beside this app;
   # use a writable persistent path when overriding. No credentials are written here.

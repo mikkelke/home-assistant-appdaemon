@@ -171,7 +171,10 @@ class LiveUpdateIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(data["live_update"], True)
                 self.assertIs(data["sticky"], True)
                 self.assertIs(data["alert_once"], True)
-                self.assertEqual(data["channel"], "Live")
+                self.assertEqual(data["channel"], "Live updates")
+                self.assertEqual(data["importance"], "low")
+                # The push relay rejects the whole message when priority is "low".
+                self.assertNotIn("priority", data)
                 self.assertEqual(data["clickAction"], data["url"])
                 self.assertTrue(data["clickAction"].startswith("/dashboard-rooftop/home#"))
                 self.assertNotIn("progress", data)
