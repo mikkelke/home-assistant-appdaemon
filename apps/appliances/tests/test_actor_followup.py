@@ -400,6 +400,105 @@ class EmptyCallback(unittest.TestCase):
             self.assertEqual(records_in(host.feedback_file)[0]["emptied_by"], "kristine")
 
 
+class PairedHost(Host):
+    ACTOR_PAIRED = True
+
+
+class StarterIsEmptier(unittest.TestCase):
+    """Washer and dryer: whoever loaded the machine empties it, and the other way round."""
+    KW = EmptyCallback.KW
+
+    def follow_up(self, tmp, record, answer, host_cls=PairedHost):
+        host = host_cls(tmp)
+        host.state = "Emptied"
+        write_records(host, [record])
+        host.answers = [answer]
+        host._actor_followup_empty(self.KW)
+        return host, records_in(host.feedback_file)[0]
+
+    def test_an_emptier_nobody_named_is_the_starter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, record = self.follow_up(tmp, emptied_record(), verdict(reason="multi_occupant"))
+            self.assertEqual(record["emptied_by"], "mikkel")
+            self.assertEqual(record["attribution"]["empty"]["method"], "same_as_starter")
+            self.assertEqual(record["attribution"]["empty"]["reason"], "multi_occupant")
+            self.assertEqual(record["attribution"]["start"]["method"], "sole_occupant")
+            self.assertEqual(host.published[-1]["attributes"],
+                             {"emptied_by": "mikkel", "emptied_by_method": "same_as_starter"})
+
+    def test_a_starter_nobody_named_is_the_emptier(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            unnamed = emptied_record(started_by=None)
+            unnamed["attribution"]["start"] = verdict(reason="multi_occupant")
+            host, record = self.follow_up(tmp, unnamed, verdict("kristine", "room_elimination"))
+            self.assertEqual(record["started_by"], "kristine")
+            self.assertEqual(record["attribution"]["start"]["method"], "same_as_emptier")
+            self.assertEqual(record["attribution"]["start"]["reason"], "multi_occupant")
+            self.assertEqual(record["attribution"]["empty"]["method"], "room_elimination")
+            self.assertEqual(host.published[-1]["attributes"], {
+                "emptied_by": "kristine", "emptied_by_method": "room_elimination",
+                "started_by": "kristine", "started_by_method": "same_as_emptier",
+            })
+
+    def test_a_named_emptier_is_never_replaced_by_the_starter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, record = self.follow_up(tmp, emptied_record(), verdict("kristine", "ble_proximity"))
+            self.assertEqual((record["started_by"], record["emptied_by"]), ("mikkel", "kristine"))
+
+    def test_nobody_on_either_side_stays_nobody(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host, record = self.follow_up(tmp, emptied_record(started_by=None), verdict(reason="multi_occupant"))
+            self.assertIsNone(record["emptied_by"])
+            self.assertIsNone(record["started_by"])
+            self.assertEqual(host.published, [])
+
+    def test_the_dishwasher_does_not_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, record = self.follow_up(tmp, emptied_record(), verdict(reason="multi_occupant"), host_cls=Host)
+            self.assertIsNone(record["emptied_by"])
+
+    def test_at_the_emptying_the_running_starter_names_a_final_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = PairedHost(tmp)
+            host._cycle_actor = verdict("claudia", "sole_occupant")
+            empty, start = host._pair_emptier(verdict(reason="multi_occupant"))
+            self.assertEqual((empty["person"], empty["method"], start), ("claudia", "same_as_starter", None))
+
+    def test_at_the_emptying_a_pending_verdict_waits_for_its_follow_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = PairedHost(tmp)
+            host._cycle_actor = verdict("claudia", "sole_occupant")
+            pending = verdict(pending_until=PENDING)
+            self.assertEqual(host._pair_emptier(pending), (pending, None))
+
+    def test_at_the_emptying_the_saved_records_starter_is_used_after_a_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = PairedHost(tmp)
+            host._cycle_actor = None
+            write_records(host, [emptied_record(emptied_ts=None)])
+            empty, _ = host._pair_emptier(verdict(reason="multi_occupant"))
+            self.assertEqual(empty["person"], "mikkel")
+
+    def test_at_the_emptying_an_already_emptied_or_unsaved_record_is_not_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = PairedHost(tmp)
+            host._cycle_actor = None
+            write_records(host, [emptied_record()])
+            self.assertIsNone(host._pair_emptier(verdict(reason="multi_occupant"))[0].get("person"))
+            write_records(host, [emptied_record(emptied_ts=None)])
+            self.assertIsNone(host._pair_emptier(verdict(reason="multi_occupant"), saved=False)[0].get("person"))
+
+    def test_at_the_emptying_a_named_emptier_names_an_unknown_starter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = PairedHost(tmp)
+            host._cycle_actor = verdict(reason="multi_occupant", pending_until=PENDING)
+            empty, start = host._pair_emptier(verdict("kristine", "dashboard_action"), saved=False)
+            self.assertEqual(empty["method"], "dashboard_action")
+            self.assertEqual((start["person"], start["method"]), ("kristine", "same_as_emptier"))
+            self.assertNotIn("pending_until", start)
+            self.assertIs(host._cycle_actor, start)
+
+
 class NoShadowingOfAppDaemonMembers(unittest.TestCase):
 
     def test_the_mixin_assigns_no_log_attribute(self):
@@ -650,7 +749,7 @@ class DryerFollowUps(unittest.TestCase):
             self.assertEqual(named(tda.published(app), "emptied"), ("kristine", "room_elimination"))
             self.assertEqual(tda.feedback_cycles(app)[-1]["emptied_by"], "kristine")
 
-    def test_an_emptier_that_stays_unknown_records_the_final_reason(self):
+    def test_an_emptier_that_stays_unknown_is_the_starter_and_keeps_the_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
             app, clock, actor = self._unemptied(tmp)
             app._door_state_changed(tda.DOOR_SENSOR, None, "off", "on", {})
@@ -661,11 +760,12 @@ class DryerFollowUps(unittest.TestCase):
             fire(app, clock, cb, delay, kw)
 
             record = tda.feedback_cycles(app)[-1]
-            self.assertIsNone(record["emptied_by"])
+            self.assertEqual(record["emptied_by"], record["started_by"])
+            self.assertEqual(record["attribution"]["empty"]["method"], "same_as_starter")
             self.assertEqual(record["attribution"]["empty"]["reason"], "multi_occupant")
             self.assertNotIn("pending_until", record["attribution"]["empty"])
-            self.assertEqual(len(app.publishes), publishes)
-            self.assertEqual(named(tda.published(app), "emptied"), ("", "unknown"))
+            self.assertEqual(len(app.publishes), publishes + 1)
+            self.assertEqual(named(tda.published(app), "emptied"), (record["started_by"], "same_as_starter"))
 
     def test_a_record_that_is_no_longer_this_emptying_is_left_alone(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -868,7 +968,7 @@ class WasherFollowUps(unittest.TestCase):
         self.assertEqual(tr4.records(app)[-1]["emptied_by"], "kristine")
         self.assertEqual(named(self._entity(app), "emptied"), ("kristine", "room_elimination"))
 
-    def test_an_emptier_that_stays_unknown_records_the_final_reason(self):
+    def test_an_emptier_that_stays_unknown_is_the_starter_and_keeps_the_reason(self):
         app, actor = self._finished(on_since("mikkel", since=trs.NOW - timedelta(hours=1)))
         app._transition_to_emptied("Door opened - emptying")
         (cb, delay, kw), = callbacks_named(app.scheduled, "_actor_followup_empty")
@@ -879,10 +979,11 @@ class WasherFollowUps(unittest.TestCase):
         cb(kw)
 
         record = tr4.records(app)[-1]
-        self.assertIsNone(record["emptied_by"])
+        self.assertEqual(record["emptied_by"], record["started_by"])
+        self.assertEqual(record["attribution"]["empty"]["method"], "same_as_starter")
         self.assertEqual(record["attribution"]["empty"]["reason"], "multi_occupant")
         self.assertNotIn("pending_until", record["attribution"]["empty"])
-        self.assertEqual(len(app.set_state_calls), published_before)
+        self.assertEqual(len(app.set_state_calls), published_before + 1)
 
     def test_a_record_that_is_no_longer_this_emptying_is_left_alone(self):
         app, actor = self._finished(on_since("mikkel", since=trs.NOW - timedelta(hours=1)))
@@ -1022,7 +1123,7 @@ class DishwasherFollowUps(unittest.TestCase):
             self.assertEqual(record["attribution"]["empty"]["method"], "room_elimination")
             self.assertEqual(app.state, "Emptied")
 
-    def test_an_emptier_that_stays_unknown_records_the_final_reason(self):
+    def test_an_emptier_that_stays_unknown_is_the_starter_and_keeps_the_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
             app, clock, actor = self._unemptied(tmp)
             tdw.open_door(app)

@@ -135,9 +135,10 @@ def _first_name_if_resident(who):
 # ActorAttribution methods that name a person on evidence: the only person home
 # (sole_occupant), the HA user behind a dashboard tap (dashboard_action), the one resident
 # left once the others had stayed in their own rooms (room_elimination), a phone at the machine
-# (ble_proximity), or whoever confirmed the programme (programme_confirmed).
+# (ble_proximity), whoever confirmed the programme (programme_confirmed), or for the washer and
+# dryer the one named on the other side of the load (same_as_starter, same_as_emptier).
 RELIABLE_ACTOR_METHODS = ("sole_occupant", "dashboard_action", "room_elimination", "ble_proximity",
-                          "programme_confirmed")
+                          "programme_confirmed", "same_as_starter", "same_as_emptier")
 
 
 def _resident_name(person):

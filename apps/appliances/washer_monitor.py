@@ -118,6 +118,7 @@ _START_TIME_SOURCE_RANK = {
 
 
 class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
+    ACTOR_PAIRED = True  # the starter empties the machine, see ActorFollowupMixin
     # Programme profiles loaded from washer_programmes.yaml at startup.
     # Programme and temperature are independent dimensions.  For "bomuld",
     # the profile depends on the selected temperature (by_temperature dict).
@@ -3630,6 +3631,9 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                 or "cycle finished" in reason
             )
             self.state = "Emptied"
+            actor_empty, actor_start = self._pair_emptier(
+                actor_empty, self._last_saved_record_ts, saved=not came_from_running
+            )
 
             # Duration correction runs BEFORE the publish below so the published
             # run_time_minutes always matches what feedback (after the publish) records - never
@@ -3702,6 +3706,9 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             # Dashboard visibility for who emptied the machine (see _attribute above).
             attributes["emptied_by"] = (actor_empty or {}).get("person") or ""
             attributes["emptied_by_method"] = (actor_empty or {}).get("method") or "unknown"
+            if actor_start:
+                attributes["started_by"] = actor_start["person"]
+                attributes["started_by_method"] = actor_start["method"]
             if finished is None:
                 attributes["run_time_minutes"] = round(run_minutes, 1) if run_minutes > 0 else None
                 if energy_used > 0:
@@ -3756,11 +3763,15 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                 # emptied_by/emptied_ts onto it instead of guessing at a duplicate save.
                 # self._last_saved_record_ts names it (set at both live _save_cycle_feedback
                 # sites); _patch_cycle_record tolerates it being stale/absent.
-                self._patch_cycle_record(self._last_saved_record_ts, {
+                updates = {
                     "emptied_by": (actor_empty or {}).get("person"),
                     "emptied_ts": self._format_local(self._now_utc()),
                     "attribution": {"empty": actor_empty},
-                })
+                }
+                if actor_start:
+                    updates["started_by"] = actor_start["person"]
+                    updates["attribution"]["start"] = actor_start
+                self._patch_cycle_record(self._last_saved_record_ts, updates)
             self._follow_up_actor("empty", actor_empty, "washer_emptied")
 
             # Cancel unemptied watchdog since we're now emptying

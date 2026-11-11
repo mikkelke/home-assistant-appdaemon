@@ -459,6 +459,22 @@ class EmptiedAttribution(unittest.TestCase):
             self.assertIsNone(record["emptied_by"])
             self.assertEqual(record["attribution"]["empty"]["reason"], "multi_occupant")
 
+    def test_the_emptier_names_a_starter_nobody_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, actor, _clock = self._unemptied(
+                tmp, [(T0 - timedelta(hours=2), {"mikkel", "kristine"})], {KRISTINE_UID: "kristine"},
+            )
+
+            press_pill(app, KRISTINE_UID)
+
+            attrs = published(app)
+            self.assertEqual((attrs["started_by"], attrs["started_by_method"]), ("kristine", "same_as_emptier"))
+            self.assertEqual(house_events.appliance_actor("emptied", attrs), "Kristine")
+            record = feedback_cycles(app)[-1]
+            self.assertEqual((record["started_by"], record["emptied_by"]), ("kristine", "kristine"))
+            self.assertEqual(record["attribution"]["start"]["method"], "same_as_emptier")
+            self.assertEqual(record["attribution"]["start"]["reason"], "multi_occupant")
+
     def test_a_second_emptying_never_restamps_the_record(self):
         with tempfile.TemporaryDirectory() as tmp:
             app, actor, clock = self._unemptied(tmp, [(T0 - timedelta(hours=2), {"claudia"})])

@@ -76,6 +76,7 @@ except ImportError:
 
 
 class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
+    ACTOR_PAIRED = True  # the starter empties the machine, see ActorFollowupMixin
     PROGRAMME_PROFILES = {}
 
     # Attribution state (see _attribute), class-level so it also exists before initialize().
@@ -1971,8 +1972,9 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         if self._should_change_state("Emptied", force=True):  # Door event bypasses cooling
             if observed:
                 actor_empty = self._attribute("dryer_emptied", user_id=actor_user_id)
+                actor_empty, actor_start = self._pair_emptier(actor_empty, self._last_saved_record_ts)
             else:
-                actor_empty = self._unknown_actor("not_observed")
+                actor_empty, actor_start = self._unknown_actor("not_observed"), None
             self.log(f"Emptied attribution: {actor_empty}", level="INFO")
             finished = completed_measurements(
                 self.state, self.get_state(self.state_entity, attribute="all")
@@ -2004,11 +2006,15 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             self._set_state_entity(state="Emptied", attributes=attributes, replace=finished is None)
 
             if observed:
-                self._patch_cycle_record(self._last_saved_record_ts, {
+                updates = {
                     "emptied_by": actor_empty.get("person"),
                     "emptied_ts": self._format_local(self._now_utc()),
                     "attribution": {"empty": actor_empty},
-                })
+                }
+                if actor_start:
+                    updates["started_by"] = actor_start["person"]
+                    updates["attribution"]["start"] = actor_start
+                self._patch_cycle_record(self._last_saved_record_ts, updates)
                 self._follow_up_actor("empty", actor_empty, "dryer_emptied")
 
             # Cancel unemptied watchdog since we're now emptying

@@ -94,12 +94,17 @@ class CompletedMeasurements(unittest.TestCase):
         self.assertEqual(len(cycles), 1)
         # Emptying may add attribution, but never alter any recorded measurements
         # or the programme, timestamps, identity, and validation of the finish.
+        # A starter nobody named may become the emptier (same_as_emptier).
         after = cycles[0]
+        paired = (after.get("attribution") or {}).get("start", {}).get("method") == "same_as_emptier"
         for key, value in before.items():
             if key in ("emptied_by", "emptied_ts"):
                 continue
-            if key == "attribution":
-                self.assertEqual(after[key].get("start"), value.get("start"))
+            if paired and key == "started_by":
+                self.assertEqual(after[key], after["emptied_by"])
+            elif key == "attribution":
+                if not paired:
+                    self.assertEqual(after[key].get("start"), value.get("start"))
             else:
                 self.assertEqual(after[key], value, key)
 
