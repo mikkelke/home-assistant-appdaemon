@@ -11,7 +11,8 @@ AssistRooms:
   answer_sensors:
     - binary_sensor.bathroom_bathroom_display_answer_playing
 
-  # HA area id -> Music Assistant player.
+  # HA area id -> Music Assistant player. Only these rooms can be grouped by voice;
+  # the housemates' room speakers are left out on purpose.
   speakers:
     bathroom: media_player.bathroom
     bedroom: media_player.bedroom

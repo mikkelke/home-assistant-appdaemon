@@ -165,7 +165,8 @@ class AssistRoomsGlue(unittest.TestCase):
         for entity in app.args["satellites"]:
             self.assertTrue(any(call.args[1] == entity for call in app.listen_state.call_args_list))
         self.assertEqual({call.args[1] for call in app.listen_event.call_args_list},
-                         {"assist_music_here", "assist_music_leave", "assist_radio"})
+                         {"assist_music_here", "assist_music_leave", "assist_radio",
+                          "assist_music_group"})
 
     def test_listening_exit_releases_owned_mute_even_after_pause(self):
         for new in ("responding", "idle", "unavailable", None):
