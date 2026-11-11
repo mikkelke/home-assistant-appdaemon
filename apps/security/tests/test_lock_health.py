@@ -724,6 +724,23 @@ class CloudLadderTests(unittest.TestCase):
         self.assertEqual(app.service_calls[-1], ("switch/turn_off", {"entity_id": "switch.extender"}))
         self.assertEqual(app._heal_stage, "power_cycle")
 
+    def test_a_wake_press_that_did_not_help_is_followed_by_the_reload(self):
+        app = self.make_cloud_app()
+        app.states["lock.yale"] = "unavailable"  # still invalid when the wake wait ends
+        app.attrs[("lock.yale", "last_changed")] = (NOW - timedelta(minutes=10)).isoformat()
+        app._ladder_first_rung({"issue": "cloud"})
+        fire_next_timer(app)
+        self.assertEqual(called_services(app), ["button/press", "homeassistant/reload_config_entry"])
+        self.assertEqual(app._heal_stage, "reload")
+        self.assertEqual(app.notifications, [])
+
+    def test_a_reload_that_starts_the_ladder_still_respects_the_cloud_allowance(self):
+        app = self.make_cloud_app()
+        app._last_cloud_api_at = NOW - timedelta(minutes=5)
+        app._ladder_first_rung({"issue": "cloud"})  # wake skipped, reload skipped too
+        self.assertNotIn("homeassistant/reload_config_entry", called_services(app))
+        self.assertNotIn("button/press", called_services(app))
+
 
 class StateFileTests(unittest.TestCase):
     """The state file outlives code versions: a key a newer build no longer knows must

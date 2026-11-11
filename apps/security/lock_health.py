@@ -19,9 +19,11 @@ notifies):
   Bluetooth twin: refresh (``homeassistant.update_entity`` on the BLE twin) -> one reload
     of the BLE config entry.
   Cloud twin: wake button -> reload of the cloud config entry -> power-cycle of the
-    bridge plug. A rung that would overspend the Yale cloud API allowance
-    (``cloud_action_cooldown_minutes``) escalates to the next one instead; a bridge that
-    is itself down goes straight to the power-cycle.
+    bridge plug. The allowance (``cloud_action_cooldown_minutes``) is spent per ladder:
+    a wake press that would overspend it escalates to the reload, a reload that would
+    overspend it escalates to the power-cycle, but the reload right after the ladder's
+    own wake press is part of the same spend. A bridge that is itself down goes
+    straight to the power-cycle.
   Bridge: power-cycle of the bridge plug.
 The wake button and cloud reloads spend the Yale CLOUD API allowance; the Bluetooth
 refresh and reload are local and never touch it.
@@ -792,14 +794,14 @@ class LockHealth(hass.Hass):
         if not self._condition_active(issue):
             self._resolve_ladder(issue)
             return
-        self._reload_rung(issue)
+        self._reload_rung(issue, after_own_wake=True)
 
-    def _reload_rung(self, issue):
+    def _reload_rung(self, issue, after_own_wake=False):
         now = self.get_now()
         if issue == "cloud" and self.get_state(self.bridge_ping) == "off":
             self._power_cycle_rung(issue)
             return
-        if issue == "cloud" and not self._cloud_api_ok(now):
+        if issue == "cloud" and not after_own_wake and not self._cloud_api_ok(now):
             self.log("LockHealth[cloud]: reload skipped (Yale cloud API cooldown) - escalating to power-cycle",
                      level="INFO")
             self._power_cycle_rung(issue)
