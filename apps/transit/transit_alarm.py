@@ -324,6 +324,7 @@ class TransitAlarm(hass.Hass):
                 )
         else:
             if self.trigger_entity:
+                self._last_trigger_state = self.get_state(self.trigger_entity)
                 self.listen_state(self._on_trigger_state, self.trigger_entity)
             # Optional: extra run_every in the schedule window (more API calls).
             if self.args.get("secondary_schedule") and not (
@@ -562,6 +563,13 @@ class TransitAlarm(hass.Hass):
         )
 
     def _on_trigger_state(self, entity, attribute, old, new, kwargs) -> None:
+        # unknown/unavailable is a tracker dropout, not a move: an edge is judged
+        # between the last two real states.
+        if (new or "").lower() in ("unknown", "unavailable"):
+            return
+        if (old or "").lower() in ("unknown", "unavailable"):
+            old = getattr(self, "_last_trigger_state", None)
+        self._last_trigger_state = new
         was_active = self._is_active(old or "")
         is_active  = self._is_active(new or "")
 

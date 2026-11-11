@@ -761,3 +761,27 @@ class StateFileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DivergenceThresholdTests(unittest.TestCase):
+    """A stale BLE twin heals after 1 min; a stale cloud twin waits 4 min, since the
+    auto-lock usually brings a cloud twin that missed an unlock back into agreement."""
+
+    def make(self, side, minutes):
+        app = make_app(bridge_down_notified=False, bridge_down_since=None)
+        app.divergence_heal_minutes = 4.0
+        app.ble_divergence_heal_minutes = 1.0
+        app._currently_diverged = True
+        app._current_stale_side = side
+        app._diverged_since = NOW - timedelta(minutes=minutes)
+        app._notified = {}
+        return app
+
+    def test_ble_is_due_after_one_minute(self):
+        self.assertTrue(self.make("ble", 1.5)._divergence_due(NOW))
+
+    def test_cloud_is_not_due_after_three_minutes(self):
+        self.assertFalse(self.make("cloud", 3.0)._divergence_due(NOW))
+
+    def test_cloud_is_due_after_four_minutes(self):
+        self.assertTrue(self.make("cloud", 4.5)._divergence_due(NOW))

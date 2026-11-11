@@ -18,7 +18,8 @@ LockHealth:
   wake_button: button.yale_wake
   publish_entity: sensor.apartment_lock
   notify_target: mikkel
-  divergence_heal_minutes: 1
+  divergence_heal_minutes: 4
+  ble_divergence_heal_minutes: 1
   invalid_heal_minutes: 5
   bridge_down_heal_seconds: 150
   settle_guard_seconds: 45

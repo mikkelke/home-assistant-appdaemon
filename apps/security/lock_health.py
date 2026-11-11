@@ -282,7 +282,10 @@ class LockHealth(hass.Hass):
         self.publish_entity = a("publish_entity", "sensor.apartment_lock")
         self.notify_target = a("notify_target", "mikkel")
 
-        self.divergence_heal_minutes = float(a("divergence_heal_minutes", 1))
+        # The cloud twin can miss an unlock that the auto-lock ~3 min later brings back
+        # into agreement, so the cloud side waits longer than the BLE side.
+        self.divergence_heal_minutes = float(a("divergence_heal_minutes", 4))
+        self.ble_divergence_heal_minutes = float(a("ble_divergence_heal_minutes", 1))
         self.invalid_heal_minutes = float(a("invalid_heal_minutes", 5))
         # The bridge's own ~6-hourly reconnect blip self-heals in ~73 s (measured
         # 07-24..07-27, post-move, WITHOUT any power-cycling) - the trigger must sit
@@ -652,7 +655,10 @@ class LockHealth(hass.Hass):
         if side == "cloud" and self._bridge_recently_down(now):
             return False
         elapsed_min = (now - self._diverged_since).total_seconds() / 60.0
-        return elapsed_min >= self.divergence_heal_minutes
+        return elapsed_min >= self._divergence_minutes(side)
+
+    def _divergence_minutes(self, side):
+        return self.ble_divergence_heal_minutes if side == "ble" else self.divergence_heal_minutes
 
     def _invalid_due(self, side, now):
         since = self._invalid_since.get(side)
@@ -685,7 +691,7 @@ class LockHealth(hass.Hass):
             if self._is_flapping(side, now):
                 await self._notify_flapping(side)
             else:
-                cause = f"Yale {self._label(side)} twin stale {self.divergence_heal_minutes:.0f} min (diverged)"
+                cause = f"Yale {self._label(side)} twin stale {self._divergence_minutes(side):.0f} min (diverged)"
                 await self._start_ladder(side, "divergence", cause)
             return
         if self._invalid_due("ble", now):

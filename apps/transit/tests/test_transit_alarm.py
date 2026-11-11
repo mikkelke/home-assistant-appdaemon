@@ -999,7 +999,7 @@ class TestOperatorStatusConfig(unittest.TestCase):
                 app = ta.TransitAlarm.__new__(ta.TransitAlarm)
                 app.args = args
                 app.log = lambda *args, **kwargs: None
-                for method in ("listen_state", "run_every", "run_in", "create_task"):
+                for method in ("listen_state", "run_every", "run_in", "create_task", "get_state"):
                     setattr(app, method, lambda *args, **kwargs: None)
                 app.initialize()
                 self.assertEqual(app.routes, args["routes"])
@@ -1658,3 +1658,30 @@ class TestDepartureSourceConfig(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTriggerIgnoresTrackerDropouts(unittest.TestCase):
+    def setUp(self):
+        self.app = ta.TransitAlarm.__new__(ta.TransitAlarm)
+        self.app.trigger_mode = "falling"
+        self.app._last_trigger_state = "home"
+        self.app.log = lambda *a, **k: None
+        self.fired = []
+        self.app._handle_trigger = lambda: self.fired.append(True)
+
+    def change(self, old, new):
+        self.app._on_trigger_state("person.mikkel", "state", old, new, {})
+
+    def test_home_to_unknown_and_back_is_not_a_leave(self):
+        self.change("home", "unknown")
+        self.change("unknown", "home")
+        self.assertEqual(self.fired, [])
+
+    def test_leave_through_unknown_still_fires(self):
+        self.change("home", "unavailable")
+        self.change("unavailable", "not_home")
+        self.assertEqual(self.fired, [True])
+
+    def test_plain_leave_fires(self):
+        self.change("home", "not_home")
+        self.assertEqual(self.fired, [True])
