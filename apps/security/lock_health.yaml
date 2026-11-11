@@ -6,6 +6,9 @@
 # The power-cycle rung runs only when bridge_plug is set (optional: plug_power_entity,
 # plug_power_floor_w, plug_cycle_cooldown_minutes, plug_cycle_max_per_2h); without one it
 # gives up and notifies instead.
+# Every heal ladder and every BLE jam is appended to lock_health_episodes.jsonl beside the
+# module (gitignored); report_day (weekday name) at report_time (HH:MM:SS, quoted) pushes the
+# last 7 days of it as one Danish line. door is read when the BLE twin goes to jammed.
 
 LockHealth:
   module: lock_health
@@ -17,7 +20,10 @@ LockHealth:
   bridge_ping: binary_sensor.yale_bridge
   wake_button: button.yale_wake
   publish_entity: sensor.apartment_lock
+  door: binary_sensor.apartment_door_open
   notify_target: mikkel
+  report_day: saturday
+  report_time: "10:00:00"
   divergence_heal_minutes: 1
   invalid_heal_minutes: 5
   bridge_down_heal_seconds: 150

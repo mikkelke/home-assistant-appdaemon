@@ -1,13 +1,15 @@
 # tests/test_lock_health.py - unit tests for LockHealth's pure functions
 # (classify_transition, arbitrate, can_act) plus the startup plug-restore path, the
-# optional-bridge-plug paths, the heal ladders' first steps and the suppression guards,
-# which are exercised on a LockHealth built with __new__ + fake AD callables.
+# optional-bridge-plug paths, the heal ladders' first steps, the suppression guards, the
+# episode log and the weekly report, which are exercised on a LockHealth built with __new__
+# + fake AD callables.
 # Run from repo root: python3 -m unittest discover -s apps/security/tests -q
 # Imports the real module by stubbing the appdaemon package (not installed locally),
 # so the code under test is the deployed code, not a duplicate.
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 import types
@@ -312,7 +314,8 @@ def make_app(plug_off_at=NOW - timedelta(minutes=5), plug_state="off", bridge_do
     the app is CONFIGURED with it is the bridge_plug argument. `queried` records every
     entity get_state was asked for. `attrs[(entity, attribute)]` answers attribute reads
     such as last_changed; an attribute read with no entry falls back to the entity's
-    state. `events` records fire_event calls (the house feed)."""
+    state. `events` records fire_event calls (the house feed). Episode lines go to /dev/null
+    unless a test points `_episode_file` at a file of its own."""
     app = lh.LockHealth.__new__(lh.LockHealth)
     app.bridge_plug = bridge_plug
     app.plug_power_entity = plug_power_entity
@@ -320,6 +323,8 @@ def make_app(plug_off_at=NOW - timedelta(minutes=5), plug_state="off", bridge_do
     app.lock_bt = "lock.yale_bt"
     app.lock_cloud = "lock.yale"
     app.wake_button = "button.yale_wake"
+    app.door = "binary_sensor.apartment_door_open"
+    app.report_weekday = 5
     app.bridge_down_heal_seconds = 90.0
     app.recovery_debounce_minutes = 2.0
     app.settle_guard_seconds = 45.0
@@ -351,6 +356,8 @@ def make_app(plug_off_at=NOW - timedelta(minutes=5), plug_state="off", bridge_do
     app._ladder_handle = None
     app._ladder_key = None
     app._ladder_cause = None
+    app._episode = None
+    app._episode_file = Path(os.devnull)
     app._clear_since = {"divergence": None, "ble_invalid": None, "cloud_invalid": None, "bridge_down": None}
     app._notified = {"divergence": False, "ble_invalid": False, "cloud_invalid": False,
                      "bridge_down": bridge_down_notified, "flapping_ble": False, "flapping_cloud": False,
@@ -568,6 +575,9 @@ class PlugWithoutMeterTests(unittest.TestCase):
         self.assertNotIn(None, app.queried)
 
 
+LADDER_START = NOW - timedelta(minutes=3)
+
+
 def make_stale_ble_app():
     """The BLE twin sits on 'unlocked' while the cloud twin saw the auto-lock 5 min ago:
     BLE is the stale side and its ladder is the active one."""
@@ -579,6 +589,7 @@ def make_stale_ble_app():
     app._active_ladder = "ble"
     app._ladder_key = "divergence"
     app._ladder_cause = "Yale Bluetooth twin stale 1 min (diverged)"
+    app._episode = {"start": LADDER_START, "side": "ble", "key": "divergence", "actions": []}
     return app
 
 
@@ -594,6 +605,19 @@ def scheduled_steps(app):
 
 def called_services(app):
     return [service for service, _kw in app.service_calls]
+
+
+def capture_tasks(app):
+    """Replaces create_task with a recorder that closes each coroutine unrun (the evaluation
+    a lock change schedules needs a live AppDaemon)."""
+    tasks = []
+
+    def create_task(coro):
+        tasks.append(coro)
+        coro.close()
+
+    app.create_task = create_task
+    return tasks
 
 
 class GuardTests(unittest.TestCase):
@@ -700,6 +724,7 @@ class CloudLadderTests(unittest.TestCase):
         app._active_ladder = "cloud"
         app._ladder_key = "divergence"
         app._ladder_cause = "Yale cloud twin stale 1 min (diverged)"
+        app._episode = {"start": LADDER_START, "side": "cloud", "key": "divergence", "actions": []}
         return app
 
     def test_first_step_reloads_the_cloud_entry_and_never_presses_wake(self):
@@ -768,6 +793,368 @@ class StateFileTests(unittest.TestCase):
             data = json.loads(app._state_file.read_text())
             self.assertNotIn("last_wake_nudge_at", data)
             self.assertIn("last_cloud_api_at", data)
+
+
+class EpisodeLogTests(unittest.TestCase):
+    """Every ladder ends in exactly one line of the episode file: when it started and ended,
+    which rungs it took, and how it ended."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "lock_health_episodes.jsonl"
+
+    def lines(self):
+        return [json.loads(line) for line in self.path.read_text().splitlines()]
+
+    def expected(self, side, key, actions, outcome):
+        return {"kind": "episode", "start": LADDER_START.isoformat(timespec="seconds"),
+                "end": NOW.isoformat(timespec="seconds"), "side": side, "key": key,
+                "actions": actions, "outcome": outcome}
+
+    def stale_ble(self):
+        app = make_stale_ble_app()
+        app._episode_file = self.path
+        return app
+
+    def test_a_refresh_that_works_logs_healed_by_refresh(self):
+        app = self.stale_ble()
+        app._ladder_first_rung({"issue": "ble"})
+        app.states["lock.yale_bt"] = "locked"  # the twin caught up
+        fire_next_timer(app)
+        self.assertEqual(self.lines(), [self.expected("ble", "divergence", ["refresh"], "healed_by_refresh")])
+        self.assertIsNone(app._episode)
+
+    def test_a_reload_that_works_logs_healed_by_reload(self):
+        app = self.stale_ble()
+        app._ladder_first_rung({"issue": "ble"})
+        fire_next_timer(app)  # the refresh did not help: reload
+        app.states["lock.yale_bt"] = "locked"
+        fire_next_timer(app)
+        self.assertEqual(self.lines(),
+                         [self.expected("ble", "divergence", ["refresh", "reload"], "healed_by_reload")])
+
+    def test_a_ladder_that_gives_up_logs_gave_up(self):
+        app = self.stale_ble()
+        app._ladder_first_rung({"issue": "ble"})
+        fire_next_timer(app)
+        fire_next_timer(app)
+        self.assertEqual(self.lines(), [self.expected("ble", "divergence", ["refresh", "reload"], "gave_up")])
+        self.assertEqual(app.notifications, [])  # the line is the only trace of a lagging twin
+
+    def test_a_ladder_that_backs_off_logs_backed_off(self):
+        app = self.stale_ble()
+        app.attrs[("lock.yale", "last_changed")] = (NOW - timedelta(seconds=10)).isoformat()
+        app._ladder_first_rung({"issue": "ble"})
+        self.assertEqual(self.lines(), [self.expected("ble", "divergence", [], "backed_off")])
+        self.assertIsNone(app._episode)
+
+    def test_a_back_off_after_a_rung_keeps_the_actions_taken(self):
+        app = self.stale_ble()
+        app._ladder_first_rung({"issue": "ble"})
+        app.attrs[("lock.yale", "last_changed")] = (NOW - timedelta(seconds=10)).isoformat()
+        fire_next_timer(app)  # still stale, but a twin just changed: the reload waits
+        self.assertEqual(self.lines(), [self.expected("ble", "divergence", ["refresh"], "backed_off")])
+
+    def test_a_cloud_ladder_that_power_cycles_logs_healed_by_power_cycle(self):
+        app = make_app(plug_off_at=None, plug_state="on", bridge_down_notified=False, bridge_down_since=None)
+        app._episode_file = self.path
+        app._active_ladder = "cloud"
+        app._ladder_key = "cloud_invalid"
+        app._episode = {"start": LADDER_START, "side": "cloud", "key": "cloud_invalid", "actions": []}
+        app._ladder_first_rung({"issue": "cloud"})
+        fire_next_timer(app)  # the reload did not help: power-cycle
+        app.states.update({"lock.yale_bt": "locked", "lock.yale": "locked"})
+        fire_next_timer(app)
+        self.assertEqual(self.lines(), [self.expected("cloud", "cloud_invalid", ["reload", "power_cycle"],
+                                                      "healed_by_power_cycle")])
+
+    def test_a_bridge_ladder_without_a_plug_logs_gave_up_with_no_actions(self):
+        app = make_app(bridge_plug=None, plug_off_at=None, bridge_down_notified=False)
+        app._episode_file = self.path
+        app._active_ladder = "bridge"
+        app._ladder_key = "bridge_down"
+        app._episode = {"start": LADDER_START, "side": "bridge", "key": "bridge_down", "actions": []}
+        app._power_cycle_rung("bridge")
+        self.assertEqual(self.lines(), [self.expected("bridge", "bridge_down", [], "gave_up")])
+
+    def test_a_started_ladder_carries_its_start_and_key_to_the_line(self):
+        app = make_app(plug_off_at=None, bridge_down_notified=False, bridge_down_since=None)
+        app._episode_file = self.path
+
+        async def run_in(cb, delay, **kw):
+            return object()
+
+        app.run_in = run_in
+        asyncio.run(app._start_ladder("cloud", "cloud_invalid", "Yale cloud twin invalid 5 min", LADDER_START))
+        self.assertEqual(app._episode,
+                         {"start": LADDER_START, "side": "cloud", "key": "cloud_invalid", "actions": []})
+        app._abort_ladder("cloud", "test")
+        self.assertEqual(self.lines(), [self.expected("cloud", "cloud_invalid", [], "backed_off")])
+
+
+class JamLineTests(unittest.TestCase):
+    """Each time the Bluetooth twin goes to jammed, one line records the door's state."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "lock_health_episodes.jsonl"
+
+    def change(self, entity, old, new, door="on"):
+        app = make_app()
+        app._episode_file = self.path
+        if door is not None:
+            app.states["binary_sensor.apartment_door_open"] = door
+        tasks = capture_tasks(app)
+        app._on_lock_change(entity, None, old, new, {})
+        return tasks
+
+    def lines(self):
+        return [json.loads(line) for line in self.path.read_text().splitlines()]
+
+    def test_the_ble_twin_going_jammed_logs_the_door_state(self):
+        self.change("lock.yale_bt", "unlocking", "jammed", door="on")
+        self.change("lock.yale_bt", "unlocking", "jammed", door="off")
+        t = NOW.isoformat(timespec="seconds")
+        self.assertEqual(self.lines(), [{"kind": "jammed", "t": t, "door": "on"},
+                                        {"kind": "jammed", "t": t, "door": "off"}])
+
+    def test_a_door_that_cannot_be_read_logs_null(self):
+        self.change("lock.yale_bt", "unlocking", "jammed", door=None)
+        self.assertIsNone(self.lines()[0]["door"])
+
+    def test_other_changes_log_nothing(self):
+        for entity, old, new in (("lock.yale", "unlocking", "jammed"),
+                                 ("lock.yale_bt", "jammed", "jammed"),
+                                 ("lock.yale_bt", "jammed", "unlocked"),
+                                 ("lock.yale_bt", "locked", "unlocked")):
+            with self.subTest(entity=entity, old=old, new=new):
+                self.change(entity, old, new)
+        self.assertFalse(self.path.exists())
+
+    def test_a_jam_still_reaches_the_evaluation(self):
+        self.assertEqual(len(self.change("lock.yale_bt", "unlocking", "jammed")), 1)
+
+
+class EpisodeWriteFailureTests(unittest.TestCase):
+    """A write that fails is logged and nothing else: the ladder still ends the way it would."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        # A directory cannot be opened for appending.
+        self.broken = Path(tmp.name) / "lock_health_episodes.jsonl"
+        self.broken.mkdir()
+
+    def warnings(self, app):
+        return [msg for level, msg in app.logs if level == "WARNING" and "lock_health_episodes.jsonl" in msg]
+
+    def logging_app(self, app):
+        app._episode_file = self.broken
+        app.logs = []
+        app.log = lambda msg, **kw: app.logs.append((kw.get("level"), msg))
+        return app
+
+    def test_a_ladder_end_logs_a_warning_and_still_resets_the_ladder(self):
+        app = self.logging_app(make_stale_ble_app())
+        app._ladder_first_rung({"issue": "ble"})
+        fire_next_timer(app)
+        fire_next_timer(app)  # gives up
+        self.assertEqual(len(self.warnings(app)), 1)
+        self.assertEqual(app._heal_stage, "gave_up")
+        self.assertTrue(app._notified["divergence"])
+        self.assertIsNone(app._active_ladder)
+        self.assertIsNone(app._episode)
+
+    def test_a_back_off_logs_a_warning_and_still_resets_the_ladder(self):
+        app = self.logging_app(make_stale_ble_app())
+        app.attrs[("lock.yale", "last_changed")] = (NOW - timedelta(seconds=10)).isoformat()
+        app._ladder_first_rung({"issue": "ble"})
+        self.assertEqual(len(self.warnings(app)), 1)
+        self.assertIsNone(app._active_ladder)
+        self.assertEqual(app._heal_stage, "idle")
+
+    def test_a_jam_logs_a_warning_and_still_reaches_the_evaluation(self):
+        app = self.logging_app(make_app())
+        tasks = capture_tasks(app)
+        app._on_lock_change("lock.yale_bt", None, "unlocking", "jammed", {})
+        self.assertEqual(len(self.warnings(app)), 1)
+        self.assertEqual(len(tasks), 1)
+
+
+SAT = datetime(2026, 11, 14, 10, 0, 0, tzinfo=timezone(timedelta(hours=1)))  # ISO week 46
+
+
+def episode_line(days_ago, side, key, outcome, actions=()):
+    end = SAT - timedelta(days=days_ago)
+    return json.dumps({"kind": "episode", "start": (end - timedelta(minutes=2)).isoformat(timespec="seconds"),
+                       "end": end.isoformat(timespec="seconds"), "side": side, "key": key,
+                       "actions": list(actions), "outcome": outcome})
+
+
+def jam_line(days_ago, door):
+    return json.dumps({"kind": "jammed", "t": (SAT - timedelta(days=days_ago)).isoformat(timespec="seconds"),
+                       "door": door})
+
+
+BLE_REFRESH = ("ble", "divergence", "healed_by_refresh", ["refresh"])
+BLE_RELOAD = ("ble", "divergence", "healed_by_reload", ["refresh", "reload"])
+CLOUD_RELOAD = ("cloud", "divergence", "healed_by_reload", ["reload"])
+
+
+class WeeklyReportTests(unittest.TestCase):
+    """The report is built from the file alone, so it covers whatever the app wrote."""
+
+    def test_a_week_with_every_common_failure(self):
+        lines = [episode_line(6.5, *BLE_REFRESH), episode_line(5.2, *BLE_REFRESH),
+                 episode_line(4.1, *BLE_REFRESH), episode_line(3.3, *BLE_REFRESH),
+                 episode_line(2.4, *BLE_RELOAD), episode_line(1.5, *CLOUD_RELOAD),
+                 jam_line(5.0, "on"), jam_line(0.5, "off")]
+        self.assertEqual(lh.weekly_report(lines, SAT),
+                         "Yale uge 46: Bluetooth bagud 5 (refresh løste 4, reload 1). Cloud bagud 1 (reload løste). "
+                         "Fastlåst 2 (1 med døren åben).")
+
+    def test_every_kind_and_outcome_has_its_wording(self):
+        lines = [episode_line(1, "ble", "divergence", "gave_up", ["refresh", "reload"]),
+                 episode_line(2, "ble", "divergence", "gave_up", ["refresh", "reload"]),
+                 episode_line(1, "ble", "ble_invalid", "gave_up", ["refresh", "reload"]),
+                 episode_line(1, "cloud", "cloud_invalid", "healed_by_reload", ["reload"]),
+                 episode_line(2, "cloud", "cloud_invalid", "healed_by_power_cycle", ["reload", "power_cycle"]),
+                 jam_line(1, "off"),
+                 episode_line(1, "bridge", "bridge_down", "healed_by_power_cycle", ["power_cycle"]),
+                 episode_line(2, "bridge", "bridge_down", "healed_by_power_cycle", ["power_cycle"]),
+                 episode_line(3, "bridge", "bridge_down", "gave_up", ["power_cycle"])]
+        self.assertEqual(lh.weekly_report(lines, SAT),
+                         "Yale uge 46: Bluetooth bagud 2 (opgivet 2). Bluetooth udfald 1 (opgivet). "
+                         "Cloud udfald 2 (reload løste 1, power-cycle 1). Fastlåst 1. "
+                         "Bridge nede 3 (power-cycle løste 2, opgivet 1).")
+
+    def test_a_week_with_nothing_still_says_so(self):
+        self.assertEqual(lh.weekly_report([], SAT), "Yale uge 46: ingen fejl.")
+
+    def test_only_the_last_seven_days_count(self):
+        lines = [episode_line(7.5, *BLE_REFRESH), jam_line(8, "on"), episode_line(6.9, *CLOUD_RELOAD)]
+        self.assertEqual(lh.weekly_report(lines, SAT), "Yale uge 46: Cloud bagud 1 (reload løste).")
+
+    def test_a_ladder_counts_in_the_week_it_ended(self):
+        line = json.loads(episode_line(7, *BLE_REFRESH))
+        line["start"] = (SAT - timedelta(days=7, minutes=1)).isoformat(timespec="seconds")
+        line["end"] = (SAT - timedelta(days=7) + timedelta(minutes=1)).isoformat(timespec="seconds")
+        self.assertEqual(lh.weekly_report([json.dumps(line)], SAT), "Yale uge 46: Bluetooth bagud 1 (refresh løste).")
+
+    def test_backed_off_ladders_are_not_counted(self):
+        lines = [episode_line(1, "ble", "divergence", "backed_off"),
+                 episode_line(1, "cloud", "divergence", "backed_off", ["reload"])]
+        self.assertEqual(lh.weekly_report(lines, SAT), "Yale uge 46: ingen fejl.")
+
+    def test_lines_that_do_not_parse_are_skipped(self):
+        naive = json.loads(episode_line(1, *BLE_REFRESH))
+        naive["end"] = "2026-11-13T10:00:00"
+        lines = ["", "{not json", "[1, 2]", "7", '{"kind": "episode"}', json.dumps(naive),
+                 '{"kind": "jammed", "t": "yesterday", "door": "on"}',
+                 episode_line(1, *BLE_REFRESH)]
+        self.assertEqual(lh.weekly_report(lines, SAT), "Yale uge 46: Bluetooth bagud 1 (refresh løste).")
+
+    def test_jams_without_an_open_door_have_no_detail(self):
+        lines = [jam_line(1, "off"), jam_line(2, None), jam_line(3, "unavailable")]
+        self.assertEqual(lh.weekly_report(lines, SAT), "Yale uge 46: Fastlåst 3.")
+
+
+class WeeklyReportPushTests(unittest.TestCase):
+    """The push reads the episode file and goes out through the app's own _notify."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "lock_health_episodes.jsonl"
+        self.app = make_app()
+        self.app._episode_file = self.path
+        self.app.get_now = lambda: SAT
+        self.app.logs = []
+        self.app.log = lambda msg, **kw: self.app.logs.append((kw.get("level"), msg))
+
+    def test_the_report_names_the_week_and_reads_the_file(self):
+        self.path.write_text(episode_line(2, *BLE_REFRESH) + "\n" + jam_line(1, "on") + "\n")
+        self.app._send_report(SAT)
+        self.assertEqual(self.app.notifications,
+                         ["Yale uge 46: Bluetooth bagud 1 (refresh løste). Fastlåst 1 (1 med døren åben)."])
+
+    def test_no_file_yet_is_a_quiet_week(self):
+        self.app._send_report(SAT)
+        self.assertEqual(self.app.notifications, ["Yale uge 46: ingen fejl."])
+
+    def test_an_empty_file_is_a_quiet_week(self):
+        self.path.write_text("")
+        self.app._send_report(SAT)
+        self.assertEqual(self.app.notifications, ["Yale uge 46: ingen fejl."])
+
+    def test_the_push_is_titled_front_door_and_goes_to_the_notify_target(self):
+        calls = []
+
+        class Notifier:
+            async def notify(self, **kwargs):
+                calls.append(kwargs)
+
+        self.app._notify = lh.LockHealth._notify.__get__(self.app)  # the real one: make_app stubs it
+        self.app._notifier = Notifier()
+        self.app.notify_target = "mikkel"
+        self.app._send_report(SAT)
+        self.assertEqual(calls, [{"title": "Front door", "message": "Yale uge 46: ingen fejl.",
+                                  "target": "mikkel"}])
+
+    def test_an_unreadable_file_warns_and_sends_nothing(self):
+        self.path.mkdir()
+        self.app._send_report(SAT)
+        self.assertEqual(self.app.notifications, [])
+        self.assertEqual([level for level, _msg in self.app.logs], ["WARNING"])
+
+    def test_the_tick_reports_only_on_the_report_day(self):
+        for days, sent in ((0, 1), (1, 0), (-1, 0), (-3, 0), (7, 1)):
+            with self.subTest(days=days):
+                self.app.notifications.clear()
+                now = SAT + timedelta(days=days)
+                self.app.get_now = lambda now=now: now
+                self.app._on_report_tick({})
+                self.assertEqual(len(self.app.notifications), sent)
+
+
+class ReportScheduleTests(unittest.TestCase):
+    """report_day and report_time come from the yaml; initialize() schedules the push."""
+
+    def initialize(self, **args):
+        app = lh.LockHealth.__new__(lh.LockHealth)
+        app.args = args
+        app.logs = []
+        app.daily = []
+        app.log = lambda msg, **kw: app.logs.append((kw.get("level"), msg))
+        app.get_app = lambda name: object()
+        app.get_now = lambda: NOW
+        app.listen_state = lambda *a, **kw: None
+        app.run_every = lambda *a, **kw: None
+        app.run_daily = lambda cb, start, **kw: app.daily.append((cb.__name__, start))
+        app._load_state = lambda: None
+        app.initialize()
+        return app
+
+    def test_the_default_is_saturday_at_ten(self):
+        app = self.initialize()
+        self.assertEqual(app.report_weekday, 5)
+        self.assertEqual(app.daily, [("_on_report_tick", "10:00:00")])
+        self.assertEqual(app.door, "binary_sensor.apartment_door_open")
+
+    def test_the_day_and_time_are_configurable(self):
+        app = self.initialize(report_day="Sunday", report_time="18:30:00", door="binary_sensor.front_door")
+        self.assertEqual(app.report_weekday, 6)
+        self.assertEqual(app.daily, [("_on_report_tick", "18:30:00")])
+        self.assertEqual(app.door, "binary_sensor.front_door")
+
+    def test_an_unknown_day_falls_back_to_saturday_with_a_warning(self):
+        app = self.initialize(report_day="lørdag")
+        self.assertEqual(app.report_weekday, 5)
+        warnings = [msg for level, msg in app.logs if level == "WARNING"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("lørdag", warnings[0])
 
 
 if __name__ == "__main__":

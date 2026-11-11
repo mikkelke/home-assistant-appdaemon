@@ -10,6 +10,7 @@ apps/people/
 *.csv
 *_tape.jsonl
 *_log.jsonl
+*_episodes.jsonl
 
 # Media: copyrighted manuals, apartment layout drawings, maps
 *.pdf

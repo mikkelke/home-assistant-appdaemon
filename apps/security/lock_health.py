@@ -54,6 +54,20 @@ the request body is built. Booleans that legitimately go False often (``diverged
 real bool, and ``stale_side``/``heal_stage`` are always non-empty strings rather than
 None so they never silently vanish from the entity either.
 
+Episode log: every heal ladder appends ONE JSON line to ``lock_health_episodes.jsonl`` beside
+this module when it ends: {kind: "episode", start, end, side (ble/cloud/bridge), key
+(divergence/ble_invalid/cloud_invalid/bridge_down), actions (refresh/reload/power_cycle, in
+order), outcome}. The outcome is ``healed_by_<last action>`` (the condition cleared),
+``gave_up``, or ``backed_off`` (a guard or the action cooldown stopped the ladder; the next
+cycle starts a new one if the fault persists). Each time the Bluetooth twin goes to jammed one
+{kind: "jammed", t, door} line records the state of ``door`` at that moment. Times are ISO
+strings in AppDaemon's time zone. Nothing prunes the file, a write error is only logged as a
+WARNING, and a ladder cut short by an app restart leaves no line.
+
+Weekly report: on ``report_day`` at ``report_time`` one push (title "Front door") summarises
+the last 7 days read back from that file, in Danish - see weekly_report(). This is where a
+lagging twin shows up, since its give-ups and all-clears are never pushed.
+
 Safety invariant: a configured bridge power plug must NEVER be left off. The power-cycle
 routine always re-asserts ``switch/turn_on`` a safety-check interval after cycling and
 logs ERROR (never just retries silently) if the plug still isn't on by then.
@@ -98,6 +112,21 @@ SELF_INDUCED_POWER_CYCLE_WINDOW_S = 180
 JUST_RECOVERED_WINDOW_S = 120
 FLAPPING_WINDOW_S = 600
 FLAPPING_THRESHOLD = 4
+
+WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+# Weekly report: how far back it reads, its sentences in order (episode type -> Danish name)
+# and the ladder steps in the order they are tried (step -> Danish text).
+REPORT_DAYS = 7
+REPORT_TYPES = (
+    ("divergence_ble", "Bluetooth bagud"),
+    ("divergence_cloud", "Cloud bagud"),
+    ("ble_invalid", "Bluetooth udfald"),
+    ("cloud_invalid", "Cloud udfald"),
+    ("jammed", "Fastlåst"),
+    ("bridge_down", "Bridge nede"),
+)
+HEAL_STEPS = (("refresh", "refresh"), ("reload", "reload"), ("power_cycle", "power-cycle"))
 
 
 def is_valid_lock_state(state):
@@ -275,6 +304,57 @@ def plug_restore_decision(plug_off_at, plug_state):
     return "restore"
 
 
+def _heal_summary(outcomes):
+    """'refresh løste 4, reload 1' for the outcomes of one kind of ladder: the healing steps in
+    ladder order with 'løste' after the first, then 'opgivet'. With a single outcome the counts
+    are left out ('reload løste')."""
+    parts = [[label, outcomes.count(f"healed_by_{step}")] for step, label in HEAL_STEPS]
+    parts = [part for part in parts if part[1]]
+    if parts:
+        parts[0][0] += " løste"
+    if "gave_up" in outcomes:
+        parts.append(["opgivet", outcomes.count("gave_up")])
+    return ", ".join(label if len(outcomes) == 1 else f"{label} {n}" for label, n in parts)
+
+
+def weekly_report(lines, now):
+    """The weekly push text, Danish and on one line, for the REPORT_DAYS before `now`, built from
+    the lines of the episode file: 'Yale uge 46: Bluetooth bagud 5 (refresh løste 4, reload 1).
+    Fastlåst 2 (1 med døren åben).' One sentence per kind of failure that happened, in REPORT_TYPES
+    order: the count and what ended each episode, or for a jam how many had the door open. A week
+    without any says 'ingen fejl'. A ladder counts in the week it ended. backed_off lines are not
+    counted: they only postponed a ladder, and the next cycle starts another for the same fault.
+    Lines that do not parse are skipped."""
+    since = now - timedelta(days=REPORT_DAYS)
+    seen = {}
+    for raw in lines:
+        try:
+            rec = json.loads(raw)
+            if rec["kind"] == "jammed":
+                when, kind, detail = rec["t"], "jammed", rec.get("door")
+            elif rec["outcome"] == "backed_off":
+                continue
+            else:
+                when, detail = rec["end"], rec["outcome"]
+                kind = f"divergence_{rec['side']}" if rec["key"] == "divergence" else rec["key"]
+            if datetime.fromisoformat(when) > since:
+                seen.setdefault(kind, []).append(detail)
+        except (ValueError, KeyError, TypeError):
+            continue
+    sentences = []
+    for kind, label in REPORT_TYPES:
+        items = seen.get(kind)
+        if not items:
+            continue
+        if kind == "jammed":
+            opened = items.count("on")
+            detail = f"{opened} med døren åben" if opened else ""
+        else:
+            detail = _heal_summary(items)
+        sentences.append(f"{label} {len(items)}" + (f" ({detail})" if detail else "") + ".")
+    return f"Yale uge {now.isocalendar()[1]}: " + (" ".join(sentences) or "ingen fejl.")
+
+
 class LockHealth(hass.Hass):
     def initialize(self):
         a = self.args.get
@@ -284,6 +364,7 @@ class LockHealth(hass.Hass):
         self.bridge_plug = a("bridge_plug")
         self.wake_button = a("wake_button", "button.yale_wake")
         self.publish_entity = a("publish_entity", "sensor.apartment_lock")
+        self.door = a("door", "binary_sensor.apartment_door_open")
         self.notify_target = a("notify_target", "mikkel")
 
         self.divergence_heal_minutes = float(a("divergence_heal_minutes", 1))
@@ -303,8 +384,15 @@ class LockHealth(hass.Hass):
         self.recovery_debounce_minutes = float(a("recovery_debounce_minutes", 2))
         self.bridge_settle_minutes = float(a("bridge_settle_minutes", 10))
         self.cloud_action_cooldown_minutes = float(a("cloud_action_cooldown_minutes", 20))
+        report_day = str(a("report_day", "saturday")).strip().lower()
+        if report_day not in WEEKDAYS:
+            self.log(f"LockHealth: unknown report_day {report_day!r} - using saturday", level="WARNING")
+            report_day = "saturday"
+        self.report_weekday = WEEKDAYS.index(report_day)
+        self.report_time = str(a("report_time", "10:00:00"))
 
         self._state_file = Path(__file__).with_name("lock_health_state.json")
+        self._episode_file = Path(__file__).with_name("lock_health_episodes.jsonl")
         # get_app must be resolved in sync init - async context returns a Task.
         self._notifier = self.get_app("MobileNotifier")
 
@@ -345,6 +433,8 @@ class LockHealth(hass.Hass):
         self._ladder_handle = None
         self._ladder_key = None
         self._ladder_cause = None
+        # {start, side, key, actions} of the running ladder, until its line is written.
+        self._episode = None
 
         self._load_state()
         self._restore_plug_if_interrupted()
@@ -353,7 +443,9 @@ class LockHealth(hass.Hass):
             self.listen_state(self._on_lock_change, ent)
         self.listen_state(self._on_bridge_change, self.bridge_ping)
         self.run_every(self._tick, "now+30", 60)
-        self.log(f"LockHealth initialized - last_state={self._last_state}/{self._last_source}", level="INFO")
+        self.run_daily(self._on_report_tick, self.report_time)
+        self.log(f"LockHealth initialized - last_state={self._last_state}/{self._last_source}, "
+                 f"weekly report {report_day} {self.report_time}", level="INFO")
 
     # ---------- startup plug restore (safety invariant: never leave the plug off) ----------
     # Runs synchronously, directly from initialize() - before any listener can fire, and
@@ -408,8 +500,12 @@ class LockHealth(hass.Hass):
     # ---------- listeners ----------
     def _on_lock_change(self, entity, attribute, old, new, kwargs):
         side = "ble" if entity == self.lock_bt else "cloud"
-        self._record_transition(side, old, new, self.get_now())
+        now = self.get_now()
+        self._record_transition(side, old, new, now)
         self.create_task(self._eval())
+        if side == "ble" and new == "jammed" and old != "jammed":
+            self._append_line({"kind": "jammed", "t": now.isoformat(timespec="seconds"),
+                               "door": self.get_state(self.door)})
 
     def _on_bridge_change(self, entity, attribute, old, new, kwargs):
         self.create_task(self._eval())
@@ -612,8 +708,10 @@ class LockHealth(hass.Hass):
             return True
         return (now - self._last_action_at).total_seconds() >= self.action_cooldown_minutes * 60
 
-    def _record_action(self, now):
+    def _record_action(self, now, rung=None):
         self._last_action_at = now
+        if rung is not None and self._episode is not None:
+            self._episode["actions"].append(rung)
 
     def _reload_window_active(self, side, now):
         last = self._last_reload_at.get(side)
@@ -690,25 +788,25 @@ class LockHealth(hass.Hass):
                 await self._log_flapping(side)
             else:
                 cause = f"Yale {self._label(side)} twin stale {self.divergence_heal_minutes:.0f} min (diverged)"
-                await self._start_ladder(side, "divergence", cause)
+                await self._start_ladder(side, "divergence", cause, now)
             return
         if self._invalid_due("ble", now):
             if self._is_flapping("ble", now):
                 await self._log_flapping("ble")
             else:
                 await self._start_ladder("ble", "ble_invalid",
-                                         f"Yale Bluetooth twin invalid {self.invalid_heal_minutes:.0f} min")
+                                         f"Yale Bluetooth twin invalid {self.invalid_heal_minutes:.0f} min", now)
             return
         if self._invalid_due("cloud", now):
             if self._is_flapping("cloud", now):
                 await self._log_flapping("cloud")
             else:
                 await self._start_ladder("cloud", "cloud_invalid",
-                                         f"Yale cloud twin invalid {self.invalid_heal_minutes:.0f} min")
+                                         f"Yale cloud twin invalid {self.invalid_heal_minutes:.0f} min", now)
             return
         if self._bridge_down_due(now):
             await self._start_ladder("bridge", "bridge_down",
-                                     f"Yale bridge unreachable {self.bridge_down_heal_seconds:.0f}s")
+                                     f"Yale bridge unreachable {self.bridge_down_heal_seconds:.0f}s", now)
 
     @staticmethod
     def _label(side):
@@ -720,10 +818,11 @@ class LockHealth(hass.Hass):
     # shared bridge plug / Yale cloud API allowance) anyway, so this keeps the machinery
     # - and the single published heal_stage - simple without giving up real-world
     # concurrency.
-    async def _start_ladder(self, issue, key, cause):
+    async def _start_ladder(self, issue, key, cause, now):
         self._active_ladder = issue
         self._ladder_key = key
         self._ladder_cause = cause
+        self._episode = {"start": now, "side": issue, "key": key, "actions": []}
         # _eval runs ON the event loop, where AppDaemon's sync-style API (get_state,
         # call_service, run_in) returns un-run coroutines unless awaited - a wake press
         # issued from here would silently never fire. So the actual rung work is
@@ -755,7 +854,7 @@ class LockHealth(hass.Hass):
         # The BLE twin is local: no Yale cloud API allowance is spent, so this never
         # stamps _last_cloud_api_at.
         self.call_service("homeassistant/update_entity", entity_id=self.lock_bt)
-        self._record_action(now)
+        self._record_action(now, "refresh")
         self._heal_stage = "refresh"
         self.log(f"LockHealth[{issue}]: refreshed Bluetooth twin", level="INFO")
         self._save_state()
@@ -793,7 +892,7 @@ class LockHealth(hass.Hass):
         self._last_reload_at[issue] = now
         if issue == "cloud":
             self._last_cloud_api_at = now
-        self._record_action(now)
+        self._record_action(now, "reload")
         self._heal_stage = "reload"
         cause = ("Yale Bluetooth twin still not right after the refresh" if issue == "ble"
                  else self._ladder_cause or "Yale cloud lock issue")
@@ -852,7 +951,7 @@ class LockHealth(hass.Hass):
         self.call_service("switch/turn_off", entity_id=self.bridge_plug)
         self._plug_cycle_history.append(now)
         self._last_power_cycle_at = now
-        self._record_action(now)
+        self._record_action(now, "power_cycle")
         self._report_heal(self._ladder_cause or "Yale bridge issue", "power-cycled the Yale bridge plug")
         self.log(f"LockHealth[{issue}]: power-cycling bridge plug", level="INFO")
         self._save_state()
@@ -959,6 +1058,7 @@ class LockHealth(hass.Hass):
         self._heal_stage = "idle"
         self._ladder_key = None
         self._ladder_cause = None
+        self._end_episode("backed_off")
 
     def _resolve_ladder(self, issue):
         self.log(f"LockHealth[{issue}]: condition cleared on its own - healing worked, staying silent",
@@ -969,6 +1069,7 @@ class LockHealth(hass.Hass):
         self._ladder_key = None
         self._ladder_cause = None
         self._save_state()
+        self._end_episode("healed")
 
     def _cancel_ladder_handle(self):
         if self._ladder_handle is not None and self.timer_running(self._ladder_handle):
@@ -999,6 +1100,43 @@ class LockHealth(hass.Hass):
         if key not in SILENT_KEYS:
             self.create_task(self._notify(message))
         self._save_state()
+        self._end_episode("gave_up")
+
+    # ---------- episode log + weekly report ----------
+    def _end_episode(self, outcome):
+        """Writes the running ladder's line. `outcome` "healed" becomes healed_by_<last action>."""
+        episode, self._episode = self._episode, None
+        if episode is None:
+            return
+        actions = episode["actions"]
+        if outcome == "healed" and actions:
+            outcome = f"healed_by_{actions[-1]}"
+        self._append_line({"kind": "episode", "start": episode["start"].isoformat(timespec="seconds"),
+                           "end": self.get_now().isoformat(timespec="seconds"), "side": episode["side"],
+                           "key": episode["key"], "actions": actions, "outcome": outcome})
+
+    def _append_line(self, line):
+        try:
+            with open(self._episode_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(line) + "\n")
+        except OSError as e:
+            self.log(f"LockHealth: could not write {self._episode_file.name}: {e}", level="WARNING")
+
+    def _on_report_tick(self, kwargs):
+        now = self.get_now()
+        if now.weekday() == self.report_weekday:
+            self._send_report(now)
+
+    def _send_report(self, now):
+        try:
+            lines = self._episode_file.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            lines = []
+        except OSError as e:
+            self.log(f"LockHealth: weekly report skipped, could not read {self._episode_file.name}: {e}",
+                     level="WARNING")
+            return
+        self.create_task(self._notify(weekly_report(lines, now)))
 
     # ---------- one-shot side reports (flapping log / plug unavailable push) ----------
     async def _log_flapping(self, side):
