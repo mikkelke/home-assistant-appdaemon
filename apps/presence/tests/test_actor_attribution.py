@@ -1680,8 +1680,9 @@ if __name__ == "__main__":
 
 
 AREA = "sensor.mikkel_ble_area"
-WASHER = {"door": "binary_sensor.washer_door_contact", "distance": "sensor.mikkel_ble_distance_to_washer_plug",
-          "area": "Guest bathroom", "max_m": 5}
+WASHER = {"person": "mikkel", "appliance": "washer", "area_sensor": AREA, "area": "Guest bathroom",
+          "door": "binary_sensor.washer_door_contact", "distance": "sensor.mikkel_ble_distance_to_washer_plug",
+          "max_m": 5}
 
 
 def ble(*pairs):
@@ -1692,7 +1693,7 @@ def ble(*pairs):
 def make_ble_app(distance, area, door=ble((-120, "on"), (0, "off")), rooms=None, clock=420,
                  home=("mikkel", "kristine")):
     app = make_room_app(rooms or {}, home=home, clock=clock)
-    app.ble_witnesses = {"mikkel": {"area": AREA, "appliances": {"washer": dict(WASHER)}}}
+    app.ble_witnesses = [dict(WASHER)]
     app._ble_log = {WASHER["door"]: door, WASHER["distance"]: distance, AREA: area}
     return app
 

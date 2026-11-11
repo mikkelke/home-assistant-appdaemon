@@ -48,17 +48,14 @@ ActorAttribution:
     claudia: binary_sensor.claudias_room_active
   room_lead_seconds: 60
   room_hold_seconds: 360
-  # Person key -> Bermuda area sensor and, per appliance (the event's prefix), its door contact,
-  # the phone's distance to that appliance's scanner, the area name and the max distance. A
-  # listed resident near the machine in its area during the door session is named when 2+ are
-  # home (method ble_proximity). Only Mikkel's Android transmits a fixed beacon today.
+  # One row per witness and appliance (the event's prefix): the phone's Bermuda area sensor and
+  # the area the appliance sits in, its door contact, the phone's distance to its scanner and the
+  # max distance. A listed resident near the machine in its area during the door session is named
+  # when 2+ are home (method ble_proximity). Only Mikkel's Android transmits a fixed beacon today.
   ble_witnesses:
-    mikkel:
-      area: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area
-      appliances:
-        washer: {door: binary_sensor.washer_door_contact, distance: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_distance_to_washer_plug, area: Guest bathroom, max_m: 5}
-        dryer: {door: binary_sensor.dryer_door_contact, distance: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_distance_to_dryer_plug, area: Guest bathroom, max_m: 5}
-        dishwasher: {door: binary_sensor.dishwasher_door_contact, distance: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_distance_to_dishwasher_power_plug, area: Kitchen, max_m: 2}
+    - {person: mikkel, appliance: washer, area_sensor: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area, area: Guest bathroom, door: binary_sensor.washer_door_contact, distance: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_distance_to_washer_plug, max_m: 5}
+    - {person: mikkel, appliance: dryer, area_sensor: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area, area: Guest bathroom, door: binary_sensor.dryer_door_contact, distance: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_distance_to_dryer_plug, max_m: 5}
+    - {person: mikkel, appliance: dishwasher, area_sensor: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area, area: Kitchen, door: binary_sensor.dishwasher_door_contact, distance: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_distance_to_dishwasher_power_plug, max_m: 2}
   publish_sensor: sensor.household_actor
   # HA account id -> person key, for a resident whose person.*.user_id link is missing or
   # not (yet) made in Settings -> People - same override convention as
