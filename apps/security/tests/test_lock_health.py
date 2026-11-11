@@ -893,6 +893,41 @@ class EpisodeLogTests(unittest.TestCase):
         self.assertEqual(self.lines(), [self.expected("cloud", "cloud_invalid", [], "backed_off")])
 
 
+class LadderStartTests(unittest.TestCase):
+    """Whichever trigger starts a ladder opens its episode at that moment."""
+
+    def start(self, **setup):
+        app = make_app(bridge_down_notified=False, bridge_down_since=None)
+        app.divergence_heal_minutes = 1.0
+        app.invalid_heal_minutes = 5.0
+        app._notified = {}
+        for name, value in setup.items():
+            setattr(app, name, value)
+
+        async def run_in(cb, delay, **kw):
+            return object()
+
+        app.run_in = run_in
+        asyncio.run(app._maybe_start_ladder(NOW))
+        return app._episode
+
+    def test_each_trigger_opens_an_episode(self):
+        stale = NOW - timedelta(minutes=10)
+        cases = (
+            ("ble", "divergence", dict(_currently_diverged=True, _current_stale_side="ble", _diverged_since=stale)),
+            ("cloud", "divergence", dict(_currently_diverged=True, _current_stale_side="cloud", _diverged_since=stale)),
+            ("ble", "ble_invalid", dict(_invalid_since={"ble": stale, "cloud": None})),
+            ("cloud", "cloud_invalid", dict(_invalid_since={"ble": None, "cloud": stale})),
+            ("bridge", "bridge_down", dict(_bridge_down_since=stale)),
+        )
+        for side, key, setup in cases:
+            with self.subTest(key=key, side=side):
+                self.assertEqual(self.start(**setup), {"start": NOW, "side": side, "key": key, "actions": []})
+
+    def test_nothing_due_opens_nothing(self):
+        self.assertIsNone(self.start())
+
+
 class JamLineTests(unittest.TestCase):
     """Each time the Bluetooth twin goes to jammed, one line records the door's state."""
 
