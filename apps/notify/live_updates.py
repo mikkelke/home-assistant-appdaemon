@@ -30,6 +30,8 @@ PARCEL_ICON = "mdi:package-variant-closed"
 DELIVERY_KINDS = {"wolt": "food", "nemlig": "groceries", **dict.fromkeys(PARCEL_CARRIERS, "parcel")}
 STREET_DOORS = ("front door", "back door")
 COURIER_MESSAGE = "Probably the Wolt courier"
+COURIER_NAMES = {"wolt": "Wolt", "nemlig": "Nemlig", **PARCEL_CARRIERS}
+OUT_STAGES = ("on_the_way", "arriving")
 COURIER_RING_WINDOW_S = 600
 COURIER_RING_KEEP_S = 3600
 DELIVERY_STAGES = {"preparing": "Preparing", "on_the_way": "On the way", "arriving": "Arriving"}
@@ -221,16 +223,23 @@ def ring_key(at):
     return str(int(at))
 
 
-def doorbell_cards(full, now, max_age_s=180, matched=()):
-    """One card per door for its latest fresh ring. A ring whose ring_key is in matched says it is probably the
-    Wolt courier instead of how long ago it rang."""
+def courier_text(order):
+    """The doorbell card's line for a ring matched to this delivery id, or to no id ("") while food was due."""
+    source = order.split(":", 1)[0] if isinstance(order, str) else ""
+    return f"Probably the {COURIER_NAMES[source]} courier" if source in COURIER_NAMES else COURIER_MESSAGE
+
+
+def doorbell_cards(full, now, max_age_s=180, matched=None):
+    """One card per door for its latest fresh ring. A ring whose ring_key is in matched ({ring_key: delivery id})
+    names the courier instead of saying how long ago it rang."""
+    matched = matched if isinstance(matched, dict) else {}
     cards = {}
     for door, at in fresh_visits(full, now, max_age_s):
         minutes = int((now - at) // 60)
         critical = f"{minutes} min" if minutes else "Now"
         message = f"Rang {minutes} min ago" if minutes else "Someone is at the door"
         if ring_key(at) in matched:
-            message = COURIER_MESSAGE
+            message = courier_text(matched[ring_key(at)])
         tag = "live_doorbell_" + DOORS[door]
         card = Card(tag, f"Doorbell · {door}", message, critical, "mdi:bell-ring",
                     DASHBOARD_LINK_PREFIX + f"now=ring-{int(at)}")
@@ -332,19 +341,35 @@ def cancelled_deliveries(full):
             if delivery.get("stage") == "cancelled" and isinstance(delivery.get("id"), str)]
 
 
+def expected_order(delivery):
+    """Id of the delivery whose courier a street ring most likely is: the next food order while food is due ("" if
+    it has no id), else the first groceries or parcel delivery of door_courier_kind that is out; None for none."""
+    attrs = attributes(delivery)
+    if unavailable(delivery):
+        return None
+    if attrs.get("food_courier_expected") is True:
+        food = attrs.get("next_food")
+        return food.get("id") if isinstance(food, dict) and isinstance(food.get("id"), str) else ""
+    kind = attrs.get("door_courier_kind")
+    if kind not in ("groceries", "parcel"):
+        return None
+    for entry in delivery_entries(delivery):
+        if entry.get("kind") == kind and entry.get("stage") in OUT_STAGES and isinstance(entry.get("id"), str):
+            return entry["id"]
+    return None
+
+
 def matched_rings(previous, doorbell, delivery, now, max_age_s):
-    """Street-door rings that came while a food courier was expected, as {ring_key: id of the food order that was
-    next, or ""}. A ring is matched the first time it is seen with food expected and stays matched, so a card never
-    flips back; a matched ring is forgotten after COURIER_RING_KEEP_S."""
+    """Street-door rings that came while a courier was expected, as {ring_key: id of the delivery it most likely
+    brought, or ""}. A ring is matched the first time it is seen with a courier expected and stays matched, so a
+    card never flips back; a matched ring is forgotten after COURIER_RING_KEEP_S."""
     rings = {}
     for key, order in (previous.items() if isinstance(previous, dict) else ()):
         at = number(key)
         if at is not None and isinstance(order, str) and now - at < COURIER_RING_KEEP_S:
             rings[key] = order
-    attrs = attributes(delivery)
-    if not unavailable(delivery) and attrs.get("food_courier_expected") is True:
-        food = attrs.get("next_food")
-        order = food.get("id") if isinstance(food, dict) and isinstance(food.get("id"), str) else ""
+    order = expected_order(delivery)
+    if order is not None:
         for door, at in fresh_visits(doorbell, now, max_age_s):
             if door in STREET_DOORS:
                 rings.setdefault(ring_key(at), order)
@@ -352,8 +377,12 @@ def matched_rings(previous, doorbell, delivery, now, max_age_s):
 
 
 def apartment_ring_matched(rings, at):
-    """An apartment ring up to COURIER_RING_WINDOW_S after a matched street-door ring is the same courier."""
-    return at is not None and any(0 <= at - number(key) <= COURIER_RING_WINDOW_S for key in rings)
+    """An apartment ring up to COURIER_RING_WINDOW_S after a matched street-door ring is the same courier: the
+    delivery id of the latest such street ring, or None."""
+    if at is None:
+        return None
+    keys = [key for key in rings if 0 <= at - number(key) <= COURIER_RING_WINDOW_S]
+    return rings[max(keys, key=number)] if keys else None
 
 
 def laundry_audience(previous, cycle, starter, enabled, home, now=None):
@@ -564,7 +593,8 @@ class LiveUpdates(hass.Hass):
                     self._state["apartment_ring_at"] = max(at, self._state.get("apartment_ring_at") or at)
             ring_at = self._state.get("apartment_ring_at")
             virtual = {"state": "active", "attributes": {"visits": [{"door": "apartment door", "ring_at": ring_at}]}}
-            matched = {ring_key(ring_at): ""} if apartment_ring_matched(rings, ring_at) else {}
+            order = apartment_ring_matched(rings, ring_at)
+            matched = {ring_key(ring_at): order} if order is not None else {}
             cards = doorbell_cards(virtual, now, self.doorbell_max_s, matched)
             cards = self._retained("apartment", apartment, cards, now)
             for tag, card in cards.items():

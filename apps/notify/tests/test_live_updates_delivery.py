@@ -1,6 +1,6 @@
 """Delivery cards read sensor.home_delivery only: one card per source (Wolt, Nemlig, each parcel carrier),
 cleared on delivery, one push on a cancel and none for parcels. Only food reaches Kristine, and the first
-street ring while a Wolt courier is due turns the Wolt card into the doorbell's courier message."""
+street ring while a courier is due turns that delivery's card into the doorbell's courier message."""
 
 import json
 import re
@@ -514,10 +514,26 @@ class MatchedRingTests(unittest.TestCase):
 
     def test_an_apartment_ring_matches_up_to_ten_minutes_after_a_matched_street_ring(self):
         rings = {str(int(NOW)): ""}
-        for offset, matched in ((0, True), (600, True), (601, False), (-1, False)):
+        for offset, matched in ((0, ""), (600, ""), (601, None), (-1, None)):
             with self.subTest(offset=offset):
                 self.assertEqual(lu.apartment_ring_matched(rings, NOW + offset), matched)
-        self.assertFalse(lu.apartment_ring_matched(rings, None))
+        self.assertIsNone(lu.apartment_ring_matched(rings, None))
+        later = {str(int(NOW)): "wolt:a", str(int(NOW + 60)): "gls:B"}
+        self.assertEqual(lu.apartment_ring_matched(later, NOW + 90), "gls:B")
+
+    def test_a_street_ring_while_a_parcel_is_out_is_matched_to_that_parcel(self):
+        state = sensor(parcel_entry("gls", stage="in_transit", barcode="OLD"), parcel_entry("gls", barcode="B1"))
+        state["attributes"]["door_courier_kind"] = "parcel"
+        self.assertEqual(self.rings(delivery=state), {str(int(NOW)): "gls:B1"})
+        state["attributes"]["door_courier_kind"] = None
+        self.assertEqual(self.rings(delivery=state), {})
+
+    def test_the_doorbell_card_names_the_courier_of_the_matched_delivery(self):
+        for order, text in (("gls:B1", "Probably the GLS courier"), ("nemlig:1", "Probably the Nemlig courier"),
+                            ("wolt:a", COURIER), ("", COURIER), ("x:1", COURIER)):
+            with self.subTest(order=order):
+                [card] = lu.doorbell_cards(visit(), NOW, 180, {str(int(NOW)): order}).values()
+                self.assertEqual(card.message, text)
         self.assertFalse(lu.apartment_ring_matched({}, NOW))
 
     def test_only_the_matched_ring_gets_the_courier_message(self):
@@ -620,6 +636,21 @@ class CourierHandoverTests(unittest.IsolatedAsyncioTestCase):
         await h.reconcile(60)
         self.assertEqual([payload["message"] for _, payload in h.ongoing(FRONT)], [COURIER])
         self.assertEqual(h.clears(WOLT), [])
+
+    async def test_a_ring_while_a_parcel_is_out_hands_its_card_over_to_the_doorbell(self):
+        parcel = parcel_entry("gls", barcode="043312860948", title="ComputerSalg A/S")
+        state = sensor(parcel)
+        state["attributes"]["door_courier_kind"] = "parcel"
+        h = await self.make(states={ENTITIES["delivery"]: state})
+        self.assertEqual(h.ongoing(GLS)[0][1]["message"], "Out for delivery")
+        h.forget_calls()
+        h.states[ENTITIES["doorbell"]] = visit(at=NOW + 60)
+        await h.reconcile(60)
+        self.assertEqual([payload["message"] for _, payload in h.ongoing(FRONT)], ["Probably the GLS courier"])
+        self.assertEqual(len(h.clears(GLS)), 1)
+        h.forget_calls()
+        await h.reconcile(600)
+        self.assertEqual(h.ongoing(GLS), [])
 
     async def test_a_food_ring_leaves_nemlig_and_parcel_cards_alone(self):
         state = expecting(entry(eta=NOW + 300), entry("nemlig", eta=NOW + 1200), parcel_entry(eta=NOW + 900))

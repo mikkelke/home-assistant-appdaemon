@@ -37,8 +37,9 @@ LiveUpdates:
   # delivery. Only food concerns the household: Kristine orders on Mikkel's Wolt account, while Nemlig and
   # parcels are Mikkel's own errands. Each audience is cut down to enabled_people, so Kristine gets Wolt
   # cards (and the cancel push) once she is listed there, and never a Nemlig or parcel card.
-  # The first street-door ring while a Wolt courier is due changes the doorbell card's message to
-  # "Probably the Wolt courier" and takes that order's Wolt card away, since the courier is here.
+  # The first street-door ring while a courier is due (sensor.home_delivery's door_courier_kind) changes
+  # the doorbell card's message to "Probably the GLS courier" (or Wolt, Nemlig, ...) and takes that
+  # delivery's card away, since the courier is here.
   delivery_entity: sensor.home_delivery
   delivery_food_people: [mikkel, kristine]
   delivery_groceries_people: [mikkel]
