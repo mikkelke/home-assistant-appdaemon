@@ -158,18 +158,58 @@ class NobodyHomeTests(unittest.TestCase):
 class PresenceUnstableTests(unittest.TestCase):
     """Rule 3: the home-set itself must not move anywhere inside the stability window."""
 
-    def test_rule3_home_set_change_inside_window_is_unstable(self):
+    def test_rule3_departure_inside_window_is_unstable(self):
         app = make_app()  # stability_seconds=600
         app._now_utc = lambda: BASE
         app._snapshot_log = (
-            snap(BASE - timedelta(seconds=900), home=("mikkel",)),               # before window
-            snap(BASE - timedelta(seconds=200), home=("mikkel", "kristine")),    # inside window
+            snap(BASE - timedelta(seconds=900), home=("mikkel", "kristine")),    # before window
+            snap(BASE - timedelta(seconds=200), home=("mikkel",)),               # inside window
         )
 
         result = app.attribute("washer_start")
 
         self.assertIsNone(result["person"])
         self.assertEqual(result["reason"], "presence_unstable")
+
+    def test_rule3_leave_and_return_inside_window_is_unstable(self):
+        app = make_app()
+        app._now_utc = lambda: BASE
+        app._snapshot_log = (
+            snap(BASE - timedelta(seconds=900), home=("mikkel", "claudia")),
+            snap(BASE - timedelta(seconds=400), home=("mikkel",)),
+            snap(BASE - timedelta(seconds=350), home=("mikkel", "claudia")),
+        )
+
+        result = app.attribute("washer_start")
+
+        self.assertIsNone(result["person"])
+        self.assertEqual(result["reason"], "presence_unstable")
+
+    def test_rule3_arrival_into_an_empty_flat_names_the_arrival(self):
+        app = make_app()
+        app._now_utc = lambda: BASE
+        app._snapshot_log = (
+            snap(BASE - timedelta(seconds=7200)),
+            snap(BASE - timedelta(seconds=332), home=("kristine",)),
+        )
+
+        result = app.attribute("washer_start")
+
+        self.assertEqual(result["person"], "kristine")
+        self.assertEqual(result["method"], "sole_occupant")
+
+    def test_rule3_arrival_beside_someone_home_is_multi_occupant(self):
+        app = make_app()
+        app._now_utc = lambda: BASE
+        app._snapshot_log = (
+            snap(BASE - timedelta(seconds=900), home=("mikkel",)),
+            snap(BASE - timedelta(seconds=200), home=("mikkel", "kristine")),
+        )
+
+        result = app.attribute("washer_start")
+
+        self.assertIsNone(result["person"])
+        self.assertEqual(result["reason"], "multi_occupant")
 
     def test_single_stable_entry_spanning_the_whole_window_is_not_unstable(self):
         app = make_app()
@@ -1162,7 +1202,7 @@ class RoomEliminationChainTests(unittest.TestCase):
         two_home = ("mikkel", "kristine")
         cases = {
             "presence_unstable": lambda app: setattr(app, "_snapshot_log", (
-                snap(BASE - timedelta(seconds=900), home=("mikkel",)),
+                snap(BASE - timedelta(seconds=900), home=two_home + ("claudia",)),
                 snap(BASE - timedelta(seconds=200), home=two_home),
             )),
             "presence_unobservable": lambda app: setattr(app, "_snapshot_log", (

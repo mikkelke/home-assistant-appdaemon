@@ -8,8 +8,9 @@ presses carry no HA context_user_id at all - only an HA-native trigger does - so
 inference remains the only free signal for those.
 
 NEVER GUESS. Short of a dashboard tap (Phase 2), attribute() only ever names a person off
-a clean presence log: the tracked home-set has held exactly one person, continuously and
-fully observable, for the whole stability_seconds window ending at the anchor, AND the
+a clean presence log: the tracked home-set holds exactly one person at the anchor, stayed
+fully observable and lost nobody (arrivals only) in the stability_seconds window ending at
+the anchor, AND the
 apartment door has not opened in the trailing door_settle_seconds (a person who just walked
 in produces no presence *change* to be unstable about - their phone hasn't reported home
 yet - so a fresh door-open is read as "someone could have entered unnoticed", never as
@@ -319,10 +320,11 @@ class ActorAttribution(hass.Hass):
         if any(entry.unobservable for entry in window):
             return self._unknown(anchor, evaluated_at, "presence_unobservable", effective_home)
 
-        # Rule 3: the home-set itself must not have moved anywhere in the window, or a
-        # "sole occupant" verdict could really mean "two different people, one after
-        # another" rather than one person alone for the full stability_seconds.
-        if len({entry.home for entry in window}) > 1:
+        # Rule 3: nobody may have left the home-set anywhere in the window. A departure
+        # could be the actor walking out, and a leave-and-return is a tracker flap, so
+        # either way the anchor's home-set is not to be trusted. Arrivals alone are fine:
+        # whoever arrived is home at the anchor and stays a candidate.
+        if any(not earlier.home <= later.home for earlier, later in zip(window, window[1:])):
             return self._unknown(anchor, evaluated_at, "presence_unstable", effective_home)
 
         # Rule 4: a fresh arrival produces no presence *change* to be unstable about -
