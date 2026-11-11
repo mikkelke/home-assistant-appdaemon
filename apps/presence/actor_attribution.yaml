@@ -38,7 +38,7 @@ ActorAttribution:
     - person.claudia
   door_entity: binary_sensor.apartment_door_open
   stability_seconds: 600
-  door_settle_seconds: 300
+  door_settle_seconds: 120
   retention_hours: 26
   # Person key -> room_active entity of that resident's private room. A resident missing
   # here is never crossed off; empty disables room elimination.
