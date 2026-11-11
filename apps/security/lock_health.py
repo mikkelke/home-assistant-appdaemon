@@ -18,15 +18,14 @@ and the startup grace is over; a ladder whose last rung did not help gives up an
 notifies):
   Bluetooth twin: refresh (``homeassistant.update_entity`` on the BLE twin) -> one reload
     of the BLE config entry.
-  Cloud twin: wake button -> reload of the cloud config entry -> power-cycle of the
-    bridge plug. The allowance (``cloud_action_cooldown_minutes``) is spent per ladder:
-    a wake press that would overspend it escalates to the reload, a reload that would
-    overspend it escalates to the power-cycle, but the reload right after the ladder's
-    own wake press is part of the same spend. A bridge that is itself down goes
+  Cloud twin: reload of the cloud config entry -> power-cycle of the bridge plug. The
+    reload also restarts the cloud integration's push connection, which can die for good
+    at an HA start; a wake press cannot revive it. A bridge that is itself down goes
     straight to the power-cycle.
   Bridge: power-cycle of the bridge plug.
-The wake button and cloud reloads spend the Yale CLOUD API allowance; the Bluetooth
-refresh and reload are local and never touch it.
+Reloads are capped by ``reload_max_per_2h``. The tie/reconcile wake press spends the Yale
+CLOUD API allowance and waits ``cloud_action_cooldown_minutes`` after any cloud reload or
+wake; the Bluetooth refresh and reload are local and never touch it.
 
 Without a ``bridge_plug`` the power-cycle rung has nothing to act on: it gives up and
 notifies at that point instead, and no plug is ever touched.
@@ -79,7 +78,6 @@ TRANSITIONAL_LOCK_STATES = frozenset({"locking", "unlocking"})
 
 # Heal-ladder rung wait times (seconds).
 REFRESH_WAIT_S = 45
-WAKE_WAIT_S = 90
 RELOAD_WAIT_S = 120
 POWER_CYCLE_WAIT_S = 180
 PLUG_OFF_WAIT_S = 12
@@ -284,10 +282,7 @@ class LockHealth(hass.Hass):
         self.publish_entity = a("publish_entity", "sensor.apartment_lock")
         self.notify_target = a("notify_target", "mikkel")
 
-        # The cloud twin can miss an unlock that the auto-lock ~3 min later brings back
-        # into agreement, so the cloud side waits longer than the BLE side.
-        self.divergence_heal_minutes = float(a("divergence_heal_minutes", 4))
-        self.ble_divergence_heal_minutes = float(a("ble_divergence_heal_minutes", 1))
+        self.divergence_heal_minutes = float(a("divergence_heal_minutes", 1))
         self.invalid_heal_minutes = float(a("invalid_heal_minutes", 5))
         # The bridge's own ~6-hourly reconnect blip self-heals in ~73 s (measured
         # 07-24..07-27, post-move, WITHOUT any power-cycling) - the trigger must sit
@@ -657,10 +652,7 @@ class LockHealth(hass.Hass):
         if side == "cloud" and self._bridge_recently_down(now):
             return False
         elapsed_min = (now - self._diverged_since).total_seconds() / 60.0
-        return elapsed_min >= self._divergence_minutes(side)
-
-    def _divergence_minutes(self, side):
-        return self.ble_divergence_heal_minutes if side == "ble" else self.divergence_heal_minutes
+        return elapsed_min >= self.divergence_heal_minutes
 
     def _invalid_due(self, side, now):
         since = self._invalid_since.get(side)
@@ -693,7 +685,7 @@ class LockHealth(hass.Hass):
             if self._is_flapping(side, now):
                 await self._notify_flapping(side)
             else:
-                cause = f"Yale {self._label(side)} twin stale {self._divergence_minutes(side):.0f} min (diverged)"
+                cause = f"Yale {self._label(side)} twin stale {self.divergence_heal_minutes:.0f} min (diverged)"
                 await self._start_ladder(side, "divergence", cause)
             return
         if self._invalid_due("ble", now):
@@ -743,9 +735,10 @@ class LockHealth(hass.Hass):
             self._power_cycle_rung(issue)
         elif issue == "ble":
             self._refresh_ble(issue)
+        elif not self._can_heal_act(self.get_now()):
+            self._abort_ladder(issue, "cooldown blocked reload")
         else:
-            self._heal_stage = "wake"
-            self._press_wake(issue)
+            self._reload_rung(issue)
 
     def _refresh_ble(self, issue):
         now = self.get_now()
@@ -755,37 +748,14 @@ class LockHealth(hass.Hass):
         if not self._can_heal_act(now):
             self._abort_ladder(issue, "cooldown blocked refresh")
             return
-        # The BLE twin is local: no Yale cloud API allowance is spent, so unlike the wake
-        # press this neither checks _cloud_api_ok nor stamps _last_cloud_api_at.
+        # The BLE twin is local: no Yale cloud API allowance is spent, so this never
+        # stamps _last_cloud_api_at.
         self.call_service("homeassistant/update_entity", entity_id=self.lock_bt)
         self._record_action(now)
         self._heal_stage = "refresh"
         self.log(f"LockHealth[{issue}]: refreshed Bluetooth twin", level="INFO")
         self._save_state()
         self._ladder_handle = self.run_in(self._after_first_rung, REFRESH_WAIT_S, issue=issue)
-
-    # The wake button is a Yale cloud API call, so only the cloud ladder starts with it.
-    def _press_wake(self, issue):
-        now = self.get_now()
-        if not self._guards_ok(now):
-            self._abort_ladder(issue, "guard blocked wake press")
-            return
-        if not self._can_heal_act(now):
-            self._abort_ladder(issue, "cooldown blocked wake press")
-            return
-        if not self._cloud_api_ok(now):
-            self.log(f"LockHealth[{issue}]: wake skipped (Yale cloud API cooldown) - escalating to reload",
-                     level="INFO")
-            self._reload_rung(issue)
-            return
-        self.call_service("button/press", entity_id=self.wake_button)
-        self._last_cloud_api_at = now
-        self._record_action(now)
-        self._report_heal(self._ladder_cause or f"Yale {self._label(issue)} lock issue",
-                           "pressed Yale wake button")
-        self.log(f"LockHealth[{issue}]: pressed wake button", level="INFO")
-        self._save_state()
-        self._ladder_handle = self.run_in(self._after_first_rung, WAKE_WAIT_S, issue=issue)
 
     def _after_first_rung(self, kwargs):
         issue = kwargs["issue"]
@@ -794,16 +764,11 @@ class LockHealth(hass.Hass):
         if not self._condition_active(issue):
             self._resolve_ladder(issue)
             return
-        self._reload_rung(issue, after_own_wake=True)
+        self._reload_rung(issue)
 
-    def _reload_rung(self, issue, after_own_wake=False):
+    def _reload_rung(self, issue):
         now = self.get_now()
         if issue == "cloud" and self.get_state(self.bridge_ping) == "off":
-            self._power_cycle_rung(issue)
-            return
-        if issue == "cloud" and not after_own_wake and not self._cloud_api_ok(now):
-            self.log("LockHealth[cloud]: reload skipped (Yale cloud API cooldown) - escalating to power-cycle",
-                     level="INFO")
             self._power_cycle_rung(issue)
             return
         if not self._guards_ok(now):
@@ -826,8 +791,9 @@ class LockHealth(hass.Hass):
             self._last_cloud_api_at = now
         self._record_action(now)
         self._heal_stage = "reload"
-        first_rung = "the refresh" if issue == "ble" else "the wake press"
-        self._report_heal(f"Yale {self._label(issue)} twin still not right after {first_rung}",
+        cause = ("Yale Bluetooth twin still not right after the refresh" if issue == "ble"
+                 else self._ladder_cause or "Yale cloud lock issue")
+        self._report_heal(cause,
                            f"reloaded the {self._label(issue)} integration entry")
         self.log(f"LockHealth[{issue}]: reloaded the {self._label(issue)} integration entry", level="INFO")
         self._save_state()

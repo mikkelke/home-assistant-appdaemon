@@ -694,52 +694,48 @@ class BleLadderTests(unittest.TestCase):
 
 
 class CloudLadderTests(unittest.TestCase):
+    """The cloud ladder starts with a reload: it restarts the cloud integration's push
+    connection, which can die for good at an HA start, and a wake press cannot."""
+
     def make_cloud_app(self):
         app = make_app(plug_off_at=None, plug_state="on", bridge_down_notified=False, bridge_down_since=None)
         app._active_ladder = "cloud"
-        app._ladder_key = "cloud_invalid"
-        app._ladder_cause = "Yale cloud twin invalid 5 min"
+        app._ladder_key = "divergence"
+        app._ladder_cause = "Yale cloud twin stale 1 min (diverged)"
         return app
 
-    def test_first_step_still_presses_the_wake_button(self):
+    def test_first_step_reloads_the_cloud_entry_and_never_presses_wake(self):
         app = self.make_cloud_app()
         app._ladder_first_rung({"issue": "cloud"})
-        self.assertEqual(app.service_calls, [("button/press", {"entity_id": "button.yale_wake"})])
-        self.assertEqual(app._heal_stage, "wake")
-        self.assertEqual(app._last_cloud_api_at, NOW)
-        self.assertEqual(scheduled_steps(app),
-                         [("_after_first_rung", lh.WAKE_WAIT_S, {"issue": "cloud"})])
-        self.assertEqual(app.events[0][1]["cause"], "Yale cloud twin invalid 5 min")
-        self.assertEqual(app.events[0][1]["effect"], "pressed Yale wake button")
-
-    def test_reload_keeps_the_wake_press_wording_then_power_cycles(self):
-        app = self.make_cloud_app()
-        app._reload_rung("cloud")
         self.assertEqual(app.service_calls,
                          [("homeassistant/reload_config_entry", {"entity_id": "lock.yale"})])
-        self.assertEqual(app.events[0][1]["cause"], "Yale cloud twin still not right after the wake press")
+        self.assertEqual(app._heal_stage, "reload")
+        self.assertEqual(app._last_cloud_api_at, NOW)
+        self.assertEqual(app.events[0][1]["cause"], "Yale cloud twin stale 1 min (diverged)")
         self.assertEqual(app.events[0][1]["effect"], "reloaded the cloud integration entry")
         self.assertEqual(scheduled_steps(app), [("_after_reload", lh.RELOAD_WAIT_S, {"issue": "cloud"})])
-        fire_next_timer(app)  # still invalid after the reload
-        self.assertEqual(app.service_calls[-1], ("switch/turn_off", {"entity_id": "switch.extender"}))
-        self.assertEqual(app._heal_stage, "power_cycle")
-
-    def test_a_wake_press_that_did_not_help_is_followed_by_the_reload(self):
-        app = self.make_cloud_app()
-        app.states["lock.yale"] = "unavailable"  # still invalid when the wake wait ends
-        app.attrs[("lock.yale", "last_changed")] = (NOW - timedelta(minutes=10)).isoformat()
-        app._ladder_first_rung({"issue": "cloud"})
-        fire_next_timer(app)
-        self.assertEqual(called_services(app), ["button/press", "homeassistant/reload_config_entry"])
-        self.assertEqual(app._heal_stage, "reload")
         self.assertEqual(app.notifications, [])
 
-    def test_a_reload_that_starts_the_ladder_still_respects_the_cloud_allowance(self):
+    def test_a_recent_wake_press_does_not_block_the_reload(self):
         app = self.make_cloud_app()
-        app._last_cloud_api_at = NOW - timedelta(minutes=5)
-        app._ladder_first_rung({"issue": "cloud"})  # wake skipped, reload skipped too
-        self.assertNotIn("homeassistant/reload_config_entry", called_services(app))
-        self.assertNotIn("button/press", called_services(app))
+        app._last_cloud_api_at = NOW - timedelta(minutes=10)  # e.g. the reconcile wake after a restart
+        app._ladder_first_rung({"issue": "cloud"})
+        self.assertEqual(called_services(app), ["homeassistant/reload_config_entry"])
+
+    def test_the_first_reload_waits_for_the_action_cooldown(self):
+        app = self.make_cloud_app()
+        app._last_action_at = NOW - timedelta(minutes=1)
+        app._ladder_first_rung({"issue": "cloud"})
+        self.assertEqual(app.service_calls, [])
+        self.assertIsNone(app._active_ladder)
+        self.assertEqual(app.notifications, [])
+
+    def test_a_reload_that_did_not_help_power_cycles(self):
+        app = self.make_cloud_app()
+        app._ladder_first_rung({"issue": "cloud"})
+        fire_next_timer(app)  # still diverged after the reload
+        self.assertEqual(app.service_calls[-1], ("switch/turn_off", {"entity_id": "switch.extender"}))
+        self.assertEqual(app._heal_stage, "power_cycle")
 
 
 class StateFileTests(unittest.TestCase):
@@ -781,24 +777,22 @@ if __name__ == "__main__":
 
 
 class DivergenceThresholdTests(unittest.TestCase):
-    """A stale BLE twin heals after 1 min; a stale cloud twin waits 4 min, since the
-    auto-lock usually brings a cloud twin that missed an unlock back into agreement."""
+    """Either twin heals after 1 min of divergence."""
 
     def make(self, side, minutes):
         app = make_app(bridge_down_notified=False, bridge_down_since=None)
-        app.divergence_heal_minutes = 4.0
-        app.ble_divergence_heal_minutes = 1.0
+        app.divergence_heal_minutes = 1.0
         app._currently_diverged = True
         app._current_stale_side = side
         app._diverged_since = NOW - timedelta(minutes=minutes)
         app._notified = {}
         return app
 
+    def test_not_due_before_one_minute(self):
+        self.assertFalse(self.make("cloud", 0.5)._divergence_due(NOW))
+
     def test_ble_is_due_after_one_minute(self):
         self.assertTrue(self.make("ble", 1.5)._divergence_due(NOW))
 
-    def test_cloud_is_not_due_after_three_minutes(self):
-        self.assertFalse(self.make("cloud", 3.0)._divergence_due(NOW))
-
-    def test_cloud_is_due_after_four_minutes(self):
-        self.assertTrue(self.make("cloud", 4.5)._divergence_due(NOW))
+    def test_cloud_is_due_after_one_minute(self):
+        self.assertTrue(self.make("cloud", 1.5)._divergence_due(NOW))
