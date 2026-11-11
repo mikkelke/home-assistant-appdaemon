@@ -1,0 +1,30 @@
+# AssistTtsFailover - keeps the Assist pipeline's text-to-speech on primary_entity (the Wyoming
+# server on the GPU box) while that server answers, and on fallback_entity (the local server)
+# while it does not. SonosNotifier takes the voice of every announcement from the same health.
+# See assist_tts_failover.py for how health is decided.
+#
+# The app rewrites tts_engine, tts_voice and tts_language of pipeline_id and nothing else. To pin an
+# engine by hand, disable the app first; an engine other than the two below is never touched.
+AssistTtsFailover:
+  module: assist_tts_failover
+  class: AssistTtsFailover
+  log: sonos_log
+
+  pipeline_id: 01hjvht94y4d2br354snxvydy7
+  primary_entity: tts.acer_tts
+  primary_voice: af_heart
+  primary_language: en
+  fallback_entity: tts.piper
+  fallback_voice: en_US-hfc_female-medium
+  fallback_language: en_US
+
+  # Wyoming address of the primary server. The host lives in the box's secrets.yaml.
+  primary_host: !secret acer_stt_host
+  primary_port: 10210
+
+  # A probe every interval_s must return the whole audio of a short text within probe_timeout_s.
+  # down_after failures in a row switch to the fallback, up_after successes in a row switch back.
+  interval_s: 10
+  probe_timeout_s: 3
+  down_after: 2
+  up_after: 3

@@ -2,6 +2,10 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 from datetime import datetime, time # Added time for comparison
 from urllib.parse import urlsplit
 
+DEFAULT_CACHE = True
+DEFAULT_OFFSET = -300
+FAILOVER_APP = "AssistTtsFailover"
+
 # App to handle Sonos TTS notifications with sleep mode considerations
 class SonosNotifier(hass.Hass):
 
@@ -30,6 +34,13 @@ class SonosNotifier(hass.Hass):
         self.announce_volume_boost = self.args.get("announce_volume_boost")
         self.announce_volume_cap = self.args.get("announce_volume_cap")
         self.clip_base_url = (self.args.get("clip_base_url") or "").rstrip("/")
+        self.precache_messages = list(dict.fromkeys(m for m in self.args.get("precache_messages") or [] if m))
+        self.precache_delay_s = float(self.args.get("precache_delay_s", 60))
+        self.precache_gap_s = float(self.args.get("precache_gap_s", 2))
+        self._precache_jobs = []
+        self._precache_active = False
+        self._precache_rendered = 0
+        self._precache_failed = 0
 
         # Time Constraints using input_datetime entities
         self.time_constraints_enabled = False
@@ -82,6 +93,8 @@ class SonosNotifier(hass.Hass):
             level="DEBUG",
         )
         self.log(f"Default Chime Path: {self.default_chime_path}", level="DEBUG")
+        if self.precache_messages:
+            self.run_in(self._start_precache, self.precache_delay_s)
 
     @staticmethod
     def _parse_time_str(state_str):
@@ -165,7 +178,8 @@ class SonosNotifier(hass.Hass):
                 When omitted each room announces announce_volume_boost above its own volume, at
                 most announce_volume_cap.
             **kwargs: cache (default True), offset (default -300) and tts_platform for the
-                chime_tts render.
+                chime_tts render. Without tts_platform the voice is AssistTtsFailover's current
+                one, or the configured tts_platform when that app does not answer.
         """
         if not message:
             self.log("Notification attempt with no message. Aborting.", level="WARNING")
@@ -245,29 +259,45 @@ class SonosNotifier(hass.Hass):
         if not actual_chime_path:
             self.log(f"No chime path provided or configured. Sending TTS for '{message}' to {target_speakers} without chime.", level="WARNING")
 
-        cache = kwargs.get("cache", True)
-        offset = kwargs.get("offset", -300)
-        tts_platform = kwargs.get("tts_platform")
-        if tts_platform is None:
-            tts_platform = self.tts_platform
+        cache = kwargs.get("cache", DEFAULT_CACHE)
+        offset = kwargs.get("offset", DEFAULT_OFFSET)
+        voice = self._voice(kwargs.get("tts_platform"))
 
         self.log(
-            f"Sending TTS: '{message}' with chime '{actual_chime_path}' to {target_speakers} (cache={cache}, offset={offset}, volume_level={volume_level}, audio_conversion={self.audio_conversion!r})",
+            f"Sending TTS: '{message}' with chime '{actual_chime_path}' to {target_speakers} (cache={cache}, offset={offset}, volume_level={volume_level}, audio_conversion={self.audio_conversion!r}, tts_platform={voice.get('tts_platform')!r})",
             level=self.log_level,
         )
 
-        url = self._render_announcement(message, actual_chime_path, cache, offset, tts_platform)
+        url = self._render_announcement(message, actual_chime_path, cache, offset, voice)
         if url is None:
             return
         self._play_announcement(message, url, target_speakers, volume_level)
 
-    def _render_announcement(self, message, chime_path, cache, offset, tts_platform):
+    def _from_failover(self, method):
+        """What AssistTtsFailover's method returns, or None when that app is not running or fails."""
+        try:
+            failover = self.get_app(FAILOVER_APP)
+            return getattr(failover, method)() if failover else None
+        except Exception as e:
+            self.log(f"{FAILOVER_APP}.{method}() failed, using tts_platform {self.tts_platform!r}: {e}", level="WARNING")
+            return None
+
+    def _voice(self, tts_platform=None):
+        """The chime_tts voice settings of a render: a caller's tts_platform wins, then the voice
+        AssistTtsFailover names for now, then the configured tts_platform."""
+        if tts_platform is not None:
+            return {"tts_platform": tts_platform}
+        voice = self._from_failover("announcement_voice")
+        return voice if isinstance(voice, dict) and voice else {"tts_platform": self.tts_platform}
+
+    def _render_announcement(self, message, chime_path, cache, offset, voice):
         """Render chime + speech with chime_tts and return the URL of the combined mp3, or None."""
         service_data = {"message": message, "cache": cache, "offset": offset}
         if chime_path:
             service_data["chime_path"] = chime_path
-        if tts_platform:
-            service_data["tts_platform"] = tts_platform
+        for key in ("tts_platform", "options", "language"):
+            if voice.get(key):
+                service_data[key] = voice[key]
         if self.audio_conversion:
             service_data["audio_conversion"] = self.audio_conversion
         try:
@@ -354,6 +384,47 @@ class SonosNotifier(hass.Hass):
             self.log(f"Announced '{message}' on {rooms} ({volume})", level="INFO")
         else:
             self.log(f"Announcing '{message}' on {rooms} ({volume}) failed: {result}", level="ERROR")
+
+    def precache(self):
+        """Render every precache message ahead of time with each voice that may announce it, and play nothing.
+
+        chime_tts caches the clips (cache=True), so the first announcement of each sentence does not wait
+        for a render. One render every precache_gap_s keeps Home Assistant and the TTS servers calm. Runs
+        once after initialize and whenever AssistTtsFailover reports its primary server back. A call while a
+        run is under way starts the list over.
+        """
+        voices = self._from_failover("precache_voices") or [{"tts_platform": self.tts_platform}]
+        self._precache_jobs = [(message, voice) for voice in voices for message in self.precache_messages]
+        self._precache_rendered = self._precache_failed = 0
+        if self._precache_jobs and not self._precache_active:
+            self._precache_active = True
+            self.run_in(self._precache_step, 0)
+
+    def _start_precache(self, kwargs):
+        self.precache()
+
+    def _precache_step(self, kwargs):
+        """Render the next announcement of the run; the one after it follows precache_gap_s later."""
+        if self._precache_jobs:
+            message, voice = self._precache_jobs.pop(0)
+            try:
+                url = self._render_announcement(message, self.default_chime_path, DEFAULT_CACHE, DEFAULT_OFFSET, voice)
+            except Exception as e:
+                self.log(f"Pre-rendering '{message}' failed: {e}", level="ERROR")
+                url = None
+            if url is None:
+                self._precache_failed += 1
+            else:
+                self._precache_rendered += 1
+        if self._precache_jobs:
+            self.run_in(self._precache_step, self.precache_gap_s)
+            return
+        self._precache_active = False
+        failed = self._precache_failed
+        self.log(
+            f"Pre-rendered announcements: {self._precache_rendered} rendered, {failed} failed",
+            level="WARNING" if failed else "INFO",
+        )
 
     # Example of how another app might call this notifier:
     # notifier = self.get_app("SonosNotifier")  # Assuming 'SonosNotifier' is the name in apps.yaml

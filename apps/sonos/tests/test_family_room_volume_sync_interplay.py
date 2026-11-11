@@ -309,6 +309,8 @@ class SonosNotifierInterplay(unittest.TestCase):
         app.get_state = self.house.get_state
         app.call_service = self.house.call_service
         app.datetime = lambda: datetime(2026, 10, 13, 15, 0)
+        app.get_app = lambda name: None
+        app.run_in = lambda callback, delay, **kwargs: None
         app.initialize()
         self.app = app
         self.before = self.house.volumes()

@@ -55,6 +55,63 @@ SonosNotifier:
   announce_volume_boost: 0.0
   announce_volume_cap: 0.30
 
+  # --- Pre-rendered announcements ---
+  # Every fixed sentence an app hands to notify(), templated ones written out in full. precache()
+  # renders each with every voice that may announce it (AssistTtsFailover's primary and fallback)
+  # precache_delay_s after startup and whenever the primary server is back, one render every
+  # precache_gap_s, so chime_tts has the clip cached before it is needed. A sentence has to match
+  # byte for byte. A test fails when a literal sentence passed to notify() anywhere in apps/ is
+  # missing here.
+  precache_delay_s: 60
+  precache_gap_s: 2
+  precache_messages:
+    # Fire safety
+    - "Smoke is building in the kitchen"
+    - "Smoke has been detected in the kitchen. Please check the kitchen now."
+    - "The kitchen alarm has been silenced."
+    - "The kitchen alarm has reset. All clear."
+    - "Kitchen smoke alarm stopped reporting during the alarm — check the kitchen"
+    # Intercom: the ring, the ring with the door opened
+    - "Someone is at the front door"
+    - "Someone is at the back door"
+    - "Someone is at the apartment door"
+    - "Someone is at the front door and I opened the front door"
+    - "Someone is at the back door and I opened the back door"
+    # Intercom: a courier is due (street ring, with and without the door opened, then the apartment door)
+    - "The food is here."
+    - "The groceries are here."
+    - "A parcel is probably here."
+    - "Mikkel's food is here."
+    - "Mikkel's groceries are here."
+    - "A parcel for Mikkel is probably here."
+    - "The food is here. I opened the front door."
+    - "The groceries are here. I opened the front door."
+    - "A parcel is probably here. I opened the front door."
+    - "Mikkel's food is here. I opened the front door."
+    - "Mikkel's groceries are here. I opened the front door."
+    - "A parcel for Mikkel is probably here. I opened the front door."
+    - "The food is here. I opened the back door."
+    - "The groceries are here. I opened the back door."
+    - "A parcel is probably here. I opened the back door."
+    - "Mikkel's food is here. I opened the back door."
+    - "Mikkel's groceries are here. I opened the back door."
+    - "A parcel for Mikkel is probably here. I opened the back door."
+    - "The food is at the door."
+    - "The groceries are at the door."
+    - "The parcel is at the door."
+    # Washer, dryer and dishwasher
+    - "Washer is ready to be emptied"
+    - "Drum clean is done. Open the washer door to air it"
+    - "Dryer is ready to be emptied"
+    - "Dishwasher is ready to be emptied"
+    # Living room TV lift
+    - "TV moving to living room"
+    - "TV moving to kitchen"
+    # Rain with a terrace door open
+    - "Rain detected and the living room terrace door is open. Please close it."
+    - "Rain detected and Claudia's terrace door is open. Please close it."
+    - "Rain detected and both terrace doors are open. Please close them."
+
   # --- Time Constraints (using Home Assistant input_datetime helpers) ---
   # Notifications will only be sent *after* quiet_hours_end_entity 
   # AND *before* quiet_hours_start_entity.

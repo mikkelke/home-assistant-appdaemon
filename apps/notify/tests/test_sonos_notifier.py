@@ -76,6 +76,17 @@ def _new_app(state=None, now=None, time_constraints_enabled=True, volumes=None, 
     app.announce_volume_boost = announce_volume_boost
     app.announce_volume_cap = announce_volume_cap
     app.clip_base_url = ""
+    app.precache_messages = []
+    app.precache_delay_s = 60.0
+    app.precache_gap_s = 2.0
+    app._precache_jobs = []
+    app._precache_active = False
+    app._precache_rendered = 0
+    app._precache_failed = 0
+
+    app.get_app = lambda name: None
+    app.run_in_calls = []
+    app.run_in = lambda callback, delay, **kwargs: app.run_in_calls.append((callback, delay))
 
     app.time_constraints_enabled = time_constraints_enabled
     app.quiet_hours_end_entity = "input_datetime.quiet_hours_end"

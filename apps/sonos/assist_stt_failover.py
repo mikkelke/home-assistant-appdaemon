@@ -51,37 +51,49 @@ async def _read_event(reader):
     return header["type"], data
 
 
-async def probe_wyoming(host, port, timeout, language="en"):
-    """Stream silence to a Wyoming STT server and wait for its transcript."""
+async def run_probe(host, port, timeout, exchange, expected):
+    """Run exchange(reader, writer) on a new connection to a Wyoming server; it returns (ok, detail).
+
+    `expected` names what the server should send back, for the timeout's detail.
+    """
     started = time.monotonic()
 
-    async def exchange():
+    async def connected():
         reader, writer = await asyncio.open_connection(host, port)
         try:
-            audio = {"rate": RATE, "width": WIDTH, "channels": CHANNELS}
-            writer.write(_event("transcribe", {"language": language}))
-            writer.write(_event("audio-start", audio))
-            silence = bytes(int(RATE * WIDTH * PROBE_SECONDS))
-            for start in range(0, len(silence), CHUNK_BYTES):
-                writer.write(_event("audio-chunk", audio, silence[start:start + CHUNK_BYTES]))
-            writer.write(_event("audio-stop", {}))
-            await writer.drain()
-            while True:
-                kind, data = await _read_event(reader)
-                if kind == "transcript":
-                    return True, "transcript"
-                if kind == "error":
-                    return False, "server error " + str(data.get("code") or "")[:40]
+            return await exchange(reader, writer)
         finally:
             writer.close()
 
     try:
-        ok, detail = await asyncio.wait_for(exchange(), timeout)
+        ok, detail = await asyncio.wait_for(connected(), timeout)
     except TimeoutError:
-        ok, detail = False, f"no transcript within {timeout:g} s"
+        ok, detail = False, f"no {expected} within {timeout:g} s"
     except (OSError, ValueError, KeyError, EOFError) as err:
         ok, detail = False, type(err).__name__
     return Probe(ok, round(time.monotonic() - started, 3), detail)
+
+
+async def probe_wyoming(host, port, timeout, language="en"):
+    """Stream silence to a Wyoming STT server and wait for its transcript."""
+
+    async def exchange(reader, writer):
+        audio = {"rate": RATE, "width": WIDTH, "channels": CHANNELS}
+        writer.write(_event("transcribe", {"language": language}))
+        writer.write(_event("audio-start", audio))
+        silence = bytes(int(RATE * WIDTH * PROBE_SECONDS))
+        for start in range(0, len(silence), CHUNK_BYTES):
+            writer.write(_event("audio-chunk", audio, silence[start:start + CHUNK_BYTES]))
+        writer.write(_event("audio-stop", {}))
+        await writer.drain()
+        while True:
+            kind, data = await _read_event(reader)
+            if kind == "transcript":
+                return True, "transcript"
+            if kind == "error":
+                return False, "server error " + str(data.get("code") or "")[:40]
+
+    return await run_probe(host, port, timeout, exchange, "transcript")
 
 
 class Verdict:
@@ -123,16 +135,26 @@ def _failure(reply):
 
 
 class AssistSttFailover(hass.Hass):
+    """The failover for speech-to-text.
+
+    AssistTtsFailover reuses it for text-to-speech: it sets the class attributes and overrides _probe and _fields.
+    """
+
+    SERVICE = "speech-to-text"
+    ENGINE_FIELD = "stt_engine"
+    DEFAULT_PORT = 10300
+    REQUIRED = REQUIRED
+
     def initialize(self):
-        missing = [key for key in REQUIRED if not self.args.get(key)]
+        missing = [key for key in self.REQUIRED if not self.args.get(key)]
         if missing:
-            self.log("AssistSttFailover is missing " + ", ".join(missing), level="ERROR")
+            self.log(f"{type(self).__name__} is missing " + ", ".join(missing), level="ERROR")
             return
         self.pipeline_id = self.args["pipeline_id"]
         self.primary = self.args["primary_entity"]
         self.fallback = self.args["fallback_entity"]
         self.host = self.args["primary_host"]
-        self.port = int(self.args.get("primary_port", 10300))
+        self.port = int(self.args.get("primary_port", self.DEFAULT_PORT))
         self.language = str(self.args.get("language", "en"))
         self.interval_s = int(self.args.get("interval_s", 10))
         self.probe_timeout_s = float(self.args.get("probe_timeout_s", 2))
@@ -141,7 +163,7 @@ class AssistSttFailover(hass.Hass):
         self._warned = False
         self._last_warning = None
         self.run_every(self._on_tick, f"now+{FIRST_CYCLE_S}", self.interval_s)
-        self.log(f"Assist speech-to-text: {self.primary} while it answers, else {self.fallback}",
+        self.log(f"Assist {self.SERVICE}: {self.primary} while it answers, else {self.fallback}",
                  level="INFO")
 
     def _on_tick(self, kwargs):
@@ -157,7 +179,7 @@ class AssistSttFailover(hass.Hass):
     async def _cycle(self, primary_state):
         self._warned = False
         try:
-            probe = await probe_wyoming(self.host, self.port, self.probe_timeout_s, self.language)
+            probe = await self._probe()
             before = self.verdict.healthy
             healthy = self.verdict.observe(probe.ok)
             if healthy is not before:
@@ -169,15 +191,19 @@ class AssistSttFailover(hass.Hass):
             if pipeline is None:
                 return
             primary_loaded = primary_state not in (None, "unavailable")
-            engine = plan(pipeline.get("stt_engine"), self.primary, self.fallback, healthy, primary_loaded)
+            engine = plan(pipeline.get(self.ENGINE_FIELD), self.primary, self.fallback, healthy,
+                          primary_loaded)
             if engine:
                 await self._switch(pipeline, engine)
         except Exception as err:
-            self._warn(f"Assist speech-to-text failover cycle failed: {err!r}")
+            self._warn(f"Assist {self.SERVICE} failover cycle failed: {err!r}")
         finally:
             if not self._warned:
                 self._last_warning = None
             self._busy = False
+
+    async def _probe(self):
+        return await probe_wyoming(self.host, self.port, self.probe_timeout_s, self.language)
 
     async def _pipeline(self):
         listing = await self._call(type="assist_pipeline/pipeline/list")
@@ -190,11 +216,15 @@ class AssistSttFailover(hass.Hass):
 
     async def _switch(self, pipeline, engine):
         body = {key: value for key, value in pipeline.items() if key != "id"}
-        body["stt_engine"] = engine
+        body.update(self._fields(engine))
         updated = await self._call_with_nulls(type="assist_pipeline/pipeline/update",
                                               pipeline_id=self.pipeline_id, **body)
         if updated is not None:
-            self.log(f"Assist pipeline speech-to-text is now {engine}", level="INFO")
+            self.log(f"Assist pipeline {self.SERVICE} is now {engine}", level="INFO")
+
+    def _fields(self, engine):
+        """The pipeline fields that change when the pipeline moves to `engine`."""
+        return {self.ENGINE_FIELD: engine}
 
     def _warn(self, text):
         self._warned = True
