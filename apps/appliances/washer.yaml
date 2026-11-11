@@ -145,7 +145,7 @@
 #     last_door_closed_trusted  bool — if false, last_door_closed_at is ignored for clamps (e.g. after Off or infer-only)
 #     last_off_at          ISO datetime in your timezone, when we last went to Off (for restore/clamp)
 #     started_by           Lowercase person key (e.g. "mikkel") who loaded the machine, or "" if not resolvable (ActorAttribution)
-#     started_by_method    How started_by was resolved: "sole_occupant" | "dashboard_action" | "room_elimination" | "ble_proximity" | "unknown"
+#     started_by_method    How started_by was resolved: "sole_occupant" | "dashboard_action" | "room_elimination" | "ble_proximity" | "programme_confirmed" | "unknown"
 #                          (see ActorAttribution; a room_elimination name is published once it settles, minutes after the start)
 #
 #   When state = Off: progress attributes above are cleared (null). last_door_closed_at and

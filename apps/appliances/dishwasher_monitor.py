@@ -727,6 +727,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             for entity in (self.confirmed_programme_entity, self.short_entity):
                 if entity:
                     self.listen_state(self._on_selector_changed, entity)
+        self._listen_confirmer(self.confirmed_programme_entity, "dishwasher_start")
 
         # Listen for unavailable states
         self.listen_state(self._handle_unavailable, self.state_entity, new="unavailable")

@@ -20,6 +20,11 @@ A host class supplies: _attribute(event, at=, user_id=), _cycle_actor, state, fe
 _cycle_store_cycle_id() and _set_state_entity() (CyclePersistenceMixin), _now_utc(), run_in, log.
 Its store's trigger fields should include the starter, so a late name is written to the cycle
 store at once instead of at the next heartbeat.
+
+A programme confirmation names the starter too (method programme_confirmed): whoever picks the
+programme in the dashboard is taken to have loaded the machine. It only fills a starter nobody
+named yet - the running cycle's, or after the finish the newest record's - and a later follow-up
+never replaces a name already held. A monitor calls _listen_confirmer for its programme selector.
 """
 
 import json
@@ -35,6 +40,10 @@ except ImportError:
     from cycle_store import parse_utc
 
 import feedback_io
+
+
+# Selector values that are not a human's pick: blanks and the "Auto (unconfirmed)" family.
+_UNCONFIRMED_VALUES = ("", "—", "unknown", "unavailable", "none")
 
 
 class ActorFollowupMixin:
@@ -78,6 +87,8 @@ class ActorFollowupMixin:
                 return
             if self.state not in ("Running", "Paused"):
                 return
+            if (self._cycle_actor or {}).get("person"):
+                return
             at = parse_utc(kwargs.get("actor_anchor"))
             if at is None:
                 return
@@ -111,6 +122,67 @@ class ActorFollowupMixin:
                 })
         except Exception as e:
             self.log(f"Emptied attribution follow-up failed: {e}", level="WARNING")
+
+    def _listen_confirmer(self, entity, event):
+        """Name the starter from whoever confirms the programme on `entity`. state_changed rather
+        than listen_state, so context.user_id survives. `event` is the start event, e.g.
+        washer_start."""
+        if entity:
+            self.listen_event(self._on_confirmer, "state_changed", entity_id=entity, actor_event=event)
+
+    def _on_confirmer(self, event_name, data, kwargs):
+        try:
+            new = (data or {}).get("new_state") or {}
+            old = (data or {}).get("old_state") or {}
+            value = str(new.get("state") or "").strip()
+            if value.lower() in _UNCONFIRMED_VALUES or value.lower().startswith("auto") or value == old.get("state"):
+                return
+            user_id = (new.get("context") or {}).get("user_id")
+            if not user_id:
+                return
+            verdict = self._attribute(kwargs.get("actor_event"), user_id=user_id)
+            if verdict.get("method") != "dashboard_action" or not verdict.get("person"):
+                return
+            if self.state in ("Running", "Paused"):
+                if (self._cycle_actor or {}).get("person"):
+                    return
+                anchor = (self._cycle_actor or {}).get("anchor") or verdict.get("anchor")
+                self._cycle_actor = dict(verdict, method="programme_confirmed", anchor=anchor)
+            elif not self._patch_start_attribution(dict(verdict, method="programme_confirmed")):
+                return
+            self.log(f"Starter named by programme confirmation: {verdict['person']}", level="INFO")
+            if self.state != "Off":
+                self._publish_actor_attrs({"started_by": verdict["person"], "started_by_method": "programme_confirmed"})
+        except Exception as e:
+            self.log(f"Programme-confirmation starter failed: {e}", level="WARNING")
+
+    def _patch_start_attribution(self, verdict):
+        """Write `verdict` as started_by and attribution.start on the newest feedback record when
+        it still names no starter, keeping that record's own anchor. True when it changed."""
+        path = getattr(self, "feedback_file", None)
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            self.log(f"Confirmation starter: could not read {path}: {e}", level="DEBUG")
+            return False
+        cycles = data.get("cycles") if isinstance(data, dict) else None
+        record = cycles[-1] if isinstance(cycles, list) and cycles else None
+        if not isinstance(record, dict) or record.get("started_by"):
+            return False
+        attribution = record.get("attribution") if isinstance(record.get("attribution"), dict) else {}
+        anchor = (attribution.get("start") or {}).get("anchor") or verdict.get("anchor")
+        attribution["start"] = dict(verdict, anchor=anchor)
+        record["attribution"] = attribution
+        record["started_by"] = verdict["person"]
+        try:
+            feedback_io.write_json(path, data)
+        except Exception as e:
+            self.log(f"Confirmation starter: could not write {path}: {e}", level="WARNING")
+            return False
+        return True
 
     def _publish_actor_attrs(self, attrs):
         """Merge `attrs` into the state entity without touching the state. Never raises."""

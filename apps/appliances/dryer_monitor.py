@@ -524,6 +524,7 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         # The dashboard presses this helper: input_button.press works for every housemate, while
         # firing the event above needs an HA admin.
         self.listen_event(self._on_emptied_button, "state_changed", entity_id=self.emptied_button_entity)
+        self._listen_confirmer(self.programme_entity, "dryer_start")
 
         # Get Sonos Notifier App instance
         self.sonos_notifier = None

@@ -1306,6 +1306,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             self.listen_state(self._on_confirm_changed, self.confirm_entity)
         if self.temperature_entity:
             self.listen_state(self._on_confirm_changed, self.temperature_entity)
+        self._listen_confirmer(self.confirm_entity, "washer_start")
         if self.option_soak_entity:
             self.listen_state(self._on_soak_option_changed, self.option_soak_entity)
         if self.vibration_sensor:

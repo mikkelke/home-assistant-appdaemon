@@ -1088,3 +1088,104 @@ class DishwasherFollowUps(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ----------------------------------------------------------------------------------------------
+# Programme confirmation names the starter
+# ----------------------------------------------------------------------------------------------
+
+def confirm_event(value, user_id="u-kristine", old="Auto (unconfirmed)"):
+    return {"new_state": {"state": value, "context": {"user_id": user_id}}, "old_state": {"state": old}}
+
+
+def tap(person):
+    return dict(verdict(person, "dashboard_action"), anchor="2026-10-15T16:40:00Z")
+
+
+class ConfirmationStarter(unittest.TestCase):
+
+    def test_a_confirmation_while_running_names_an_unknown_starter_and_keeps_the_anchor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host(tmp)
+            host.answers = [tap("kristine")]
+
+            host._on_confirmer("state_changed", confirm_event("Bomuld"), {"actor_event": "washer_start"})
+
+            self.assertEqual(host.asked, [("washer_start", None, "u-kristine")])
+            self.assertEqual(host._cycle_actor["person"], "kristine")
+            self.assertEqual(host._cycle_actor["method"], "programme_confirmed")
+            self.assertEqual(host._cycle_actor["anchor"], ANCHOR)
+            self.assertEqual(host.published[-1]["attributes"],
+                             {"started_by": "kristine", "started_by_method": "programme_confirmed"})
+
+    def test_a_named_starter_is_never_replaced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host(tmp)
+            host._cycle_actor = verdict("mikkel", "sole_occupant")
+            host.answers = [tap("kristine")]
+
+            host._on_confirmer("state_changed", confirm_event("Bomuld"), {"actor_event": "washer_start"})
+
+            self.assertEqual(host._cycle_actor["person"], "mikkel")
+            self.assertEqual(host.published, [])
+
+    def test_resets_service_accounts_and_repeats_are_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host(tmp)
+            host.answers = [verdict()]
+            for data in (confirm_event("Auto (unconfirmed)"), confirm_event("—"),
+                         confirm_event("Bomuld", user_id=None), confirm_event("Bomuld", old="Bomuld")):
+                host._on_confirmer("state_changed", data, {"actor_event": "washer_start"})
+            host._on_confirmer("state_changed", confirm_event("Bomuld", user_id="u-service"), {"actor_event": "washer_start"})
+
+            self.assertIsNone(host._cycle_actor["person"])
+            self.assertEqual(len(host.asked), 1)
+
+    def test_after_the_finish_it_fills_the_newest_record_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host(tmp)
+            host.state = "Unemptied"
+            write_records(host, [emptied_record(started_by=None,
+                                                attribution={"start": verdict(), "empty": verdict()})])
+            host.answers = [tap("claudia"), tap("mikkel")]
+
+            host._on_confirmer("state_changed", confirm_event("ECO"), {"actor_event": "dishwasher_start"})
+            host._on_confirmer("state_changed", confirm_event("Intensive", old="ECO"), {"actor_event": "dishwasher_start"})
+
+            record, = records_in(host.feedback_file)
+            self.assertEqual(record["started_by"], "claudia")
+            self.assertEqual(record["attribution"]["start"]["method"], "programme_confirmed")
+            self.assertEqual(record["attribution"]["start"]["anchor"], ANCHOR)
+            self.assertEqual(len(host.published), 1)
+
+    def test_off_writes_the_record_but_publishes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host(tmp)
+            host.state = "Off"
+            write_records(host, [emptied_record(started_by=None)])
+            host.answers = [tap("kristine")]
+
+            host._on_confirmer("state_changed", confirm_event("ECO"), {"actor_event": "dryer_start"})
+
+            self.assertEqual(records_in(host.feedback_file)[0]["started_by"], "kristine")
+            self.assertEqual(host.published, [])
+
+    def test_a_follow_up_keeps_a_name_the_confirmation_already_gave(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host(tmp)
+            host._cycle_actor = dict(verdict("kristine", "dashboard_action"), method="programme_confirmed")
+            host.answers = [verdict()]
+
+            host._actor_followup_start({"actor_event": "washer_start", "actor_anchor": ANCHOR, "actor_cycle_id": "cycle-1"})
+
+            self.assertEqual(host._cycle_actor["person"], "kristine")
+            self.assertEqual(host.asked, [])
+
+    def test_every_monitor_listens_on_its_programme_selector(self):
+        here = Path(__file__).resolve().parents[1]
+        for module, call in (("washer_monitor.py", 'self._listen_confirmer(self.confirm_entity, "washer_start")'),
+                             ("dryer_monitor.py", 'self._listen_confirmer(self.programme_entity, "dryer_start")'),
+                             ("dishwasher_monitor.py",
+                              'self._listen_confirmer(self.confirmed_programme_entity, "dishwasher_start")')):
+            with self.subTest(module=module):
+                self.assertIn(call, (here / module).read_text())
