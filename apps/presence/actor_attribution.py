@@ -52,8 +52,10 @@ A cross-off can only be revoked as time passes (an off row not recorded yet), so
 evaluated before anchor + room_hold_seconds + 30 s never names anyone: while it could still
 end up naming one (at most one candidate) it carries pending_until (ISO Z) - ask again at
 or after that instant with the same at=; with two or more candidates it is already final.
-A future BLE-presence signal remains a possible further method, chained ahead of room
-elimination in _attribute_unsafe and, like it, only ever consulted for multi_occupant.
+Phase 4 (filled): after room elimination, _by_ble may name a resident listed in
+ble_witnesses whose phone was near the appliance during its door session (see _by_ble).
+It only ever proves presence at the machine, never absence, and like room elimination it
+is consulted only for multi_occupant and decides nothing before the settle instant.
 
 Hard rule - zero AppDaemon API calls inside attribute() and everything it calls (no
 get_state/call_service/run_in/create_task/set_state/get_history): it reads only the
@@ -138,6 +140,11 @@ _REASON_TO_STATE = {
 # belongs inside the hold window has landed by then.
 _ROOM_MARGIN_SECONDS = 30
 
+# BLE proximity looks back at most this far for the door opening that began the session
+# an anchor belongs to, and pads the session by _BLE_PAD_SECONDS on both sides.
+_BLE_SESSION_MAX_SECONDS = 900
+_BLE_PAD_SECONDS = 30
+
 
 class ActorAttribution(hass.Hass):
     # Class-level defaults so attribute()/probe() are well-defined even before
@@ -157,6 +164,8 @@ class ActorAttribution(hass.Hass):
     _user_id_to_person = {}   # {normalized_user_id: person_key}, see _refresh_user_map
     private_rooms = {}        # {person_key: room occupancy entity}; empty = no room elimination
     _room_log = {}            # {person_key: tuple[(ts, is_on)]}, change-only, ascending by ts
+    ble_witnesses = {}        # {person_key: {"area": entity, "appliances": {name: cfg}}}, see _by_ble
+    _ble_log = {}             # {entity: tuple[(ts, raw_state)]}, change-only, ascending by ts
     stability_seconds = 600
     door_settle_seconds = 300
     retention_hours = 26
@@ -178,6 +187,7 @@ class ActorAttribution(hass.Hass):
         self.private_rooms = dict(a("private_rooms", {}) or {})
         self.room_lead_seconds = int(a("room_lead_seconds", 60))
         self.room_hold_seconds = int(a("room_hold_seconds", 360))
+        self.ble_witnesses = dict(a("ble_witnesses", {}) or {})
         self.publish_sensor = a("publish_sensor", "sensor.household_actor")
         # HA account id -> person key, merged in after the automatic person_entities
         # resolution (see _refresh_user_map) - a gap-filler for a resident whose
@@ -195,6 +205,8 @@ class ActorAttribution(hass.Hass):
         self.listen_state(self._on_door_change, self.door_entity)
         for person, entity in self.private_rooms.items():
             self.listen_state(self._on_room_change, entity, person=person)
+        for entity in self._ble_entities():
+            self.listen_state(self._on_ble_change, entity)
         self.listen_event(self._on_probe_event, "actor_attribution_probe")
 
         # Deferred so initialize() returns immediately - get_history's response time
@@ -208,7 +220,8 @@ class ActorAttribution(hass.Hass):
             f"ActorAttribution initialized: {len(self.person_entities)} person(s), "
             f"door={self.door_entity}, stability={self.stability_seconds}s, "
             f"door_settle={self.door_settle_seconds}s, retention={self.retention_hours:.0f}h, "
-            f"{len(self.private_rooms)} private room(s)",
+            f"{len(self.private_rooms)} private room(s), "
+            f"{len(self.ble_witnesses)} BLE witness(es)",
             level="INFO",
         )
 
@@ -246,7 +259,9 @@ class ActorAttribution(hass.Hass):
             # Past every hard stop of _by_sole_occupancy with 2+ people home. Methods that
             # can still tell them apart chain here, strongest evidence first, each only
             # while the verdict is still multi_occupant.
-            result = self._by_room_elimination(event, anchor, evaluated_at, result)
+            multi = result
+            result = self._by_room_elimination(event, anchor, evaluated_at, multi)
+            result = self._by_ble(event, anchor, evaluated_at, multi, result)
         if self._door_state in _UNOBSERVABLE_STATES:
             # The door guard itself is blind, so rule 4 below could have missed a real
             # open edge. Per spec we still attribute - the absence of a recorded edge is
@@ -400,6 +415,81 @@ class ActorAttribution(hass.Hass):
         if not candidates:
             return self._unknown(anchor, evaluated_at, "room_contradiction", home)
         return multi
+
+    def _by_ble(self, event, anchor, evaluated_at, multi, room_result):
+        """Runs after room elimination on a multi_occupant verdict. A home resident listed in
+        ble_witnesses whose phone, during the appliance door session the anchor belongs to,
+        read within max_m of the appliance's scanner while Bermuda put it in the appliance's
+        area is named (method ble_proximity) - provided they were the only such witness and
+        room elimination did not place them in their own room. Distance away is never used:
+        a phone left on a nightstand reads far while its owner is at the machine.
+
+        The session can run past the anchor (an emptying is anchored at the door opening), so
+        nothing is decided before the room elimination settle instant; until then a verdict
+        with a witness home carries pending_until for that instant."""
+        appliance = event.split("_", 1)[0]
+        home = set(multi["people_home"])
+        witnesses = [p for p in sorted(home)
+                     if appliance in ((self.ble_witnesses.get(p) or {}).get("appliances") or {})]
+        if not witnesses:
+            return room_result
+        settled_at = anchor + timedelta(seconds=self.room_hold_seconds + _ROOM_MARGIN_SECONDS)
+        if evaluated_at < settled_at:
+            return dict(room_result, pending_until=self._iso_up(settled_at))
+        near = [p for p in witnesses if self._ble_near(p, appliance, anchor)
+                and not self._room_occupied_through(p, anchor, evaluated_at)]
+        if len(near) != 1:
+            return room_result
+        return {
+            "person": near[0],
+            "method": "ble_proximity",
+            "reason": None,
+            "people_home": sorted(home),
+            "anchor": self._iso(anchor),
+            "evaluated_at": self._iso(evaluated_at),
+            "version": _VERSION,
+        }
+
+    def _ble_near(self, person, appliance, anchor):
+        """True when person's phone read within max_m of the appliance's scanner and their
+        Bermuda area was the appliance's area at some point in the door session around
+        anchor: from the last opening at most _BLE_SESSION_MAX_SECONDS before anchor (else
+        anchor itself) to the next closing, capped at anchor + room_hold_seconds, padded by
+        _BLE_PAD_SECONDS. Unparseable distances and area rows before the window are
+        ignored, except the area already in effect when the window opens."""
+        witness = self.ble_witnesses.get(person) or {}
+        cfg = (witness.get("appliances") or {}).get(appliance) or {}
+        door_rows = self._ble_log.get(cfg.get("door"), ())
+        lookback = anchor - timedelta(seconds=_BLE_SESSION_MAX_SECONDS)
+        tolerance = anchor + timedelta(seconds=5)
+        opened = [ts for ts, state in door_rows if state == "on" and lookback <= ts <= tolerance]
+        start = opened[-1] if opened else anchor
+        cap = anchor + timedelta(seconds=self.room_hold_seconds)
+        closed = [ts for ts, state in door_rows if state != "on" and start < ts <= cap]
+        end = max(closed[0], anchor) if closed else cap
+        pad = timedelta(seconds=_BLE_PAD_SECONDS)
+        lo, hi = start - pad, end + pad
+        max_m = float(cfg.get("max_m", 0))
+        close_enough = False
+        for ts, state in self._ble_log.get(cfg.get("distance"), ()):
+            if lo <= ts <= hi:
+                try:
+                    if float(state) <= max_m:
+                        close_enough = True
+                        break
+                except (TypeError, ValueError):
+                    continue
+        if not close_enough:
+            return False
+        areas = set()
+        in_effect = None
+        for ts, state in self._ble_log.get(witness.get("area"), ()):
+            if ts <= lo:
+                in_effect = state
+            elif ts <= hi:
+                areas.add(state)
+        areas.add(in_effect)
+        return cfg.get("area") in areas
 
     def _room_occupied_through(self, person, anchor, evaluated_at):
         """True when person's private room was on at anchor - room_lead_seconds and has no
@@ -561,6 +651,12 @@ class ActorAttribution(hass.Hass):
         except Exception as e:
             self.log(f"ActorAttribution: room-change handler failed for {entity}: {e}", level="ERROR")
 
+    def _on_ble_change(self, entity, attribute, old, new, kwargs):
+        try:
+            self._append_ble_row(entity, self._now_utc(), new)
+        except Exception as e:
+            self.log(f"ActorAttribution: BLE-change handler failed for {entity}: {e}", level="ERROR")
+
     def _on_probe_event(self, event_name, data, kwargs):
         """Test hook: fire event actor_attribution_probe (e.g. from Developer Tools ->
         Events) to log the current verdict at INFO without waiting for a real appliance
@@ -658,6 +754,7 @@ class ActorAttribution(hass.Hass):
             self._prune_log(now)
             self._prune_door_events(now)
             self._prune_room_log(now)
+            self._prune_ble_log(now)
             self._refresh_user_map()
             self._publish()
         except Exception as e:
@@ -765,6 +862,7 @@ class ActorAttribution(hass.Hass):
                 self._door_state = last_door_state
 
             room_log = self._room_log_from_history(window_start, now)
+            ble_log = self._ble_log_from_history(window_start, now)
 
             events.sort(key=lambda e: e[0])
             log_entries = []
@@ -787,14 +885,16 @@ class ActorAttribution(hass.Hass):
             self._snapshot_log = tuple(log_entries)
             self._door_events = tuple(sorted(door_open_events))
             self._room_log = room_log
+            self._ble_log = ble_log
             self._prune_log(now)
             self._prune_door_events(now)
             self._prune_room_log(now)
+            self._prune_ble_log(now)
 
             self.log(
                 f"ActorAttribution backfill complete: {len(self._snapshot_log)} presence "
                 f"transition(s), {len(self._door_events)} door-open event(s), "
-                f"{len(self._room_log)} private-room log(s) over the "
+                f"{len(self._room_log)} private-room log(s), {len(self._ble_log)} BLE log(s) over the "
                 f"last {self.retention_hours:.0f}h",
                 level="INFO",
             )
@@ -893,6 +993,69 @@ class ActorAttribution(hass.Hass):
                 continue
             room_log[person] = tuple(changes)
         return room_log
+
+    def _ble_entities(self):
+        """Every entity _by_ble reads: each witness's area sensor and each appliance's door
+        and distance sensor."""
+        entities = []
+        for witness in self.ble_witnesses.values():
+            witness = witness or {}
+            entities.append(witness.get("area"))
+            for cfg in (witness.get("appliances") or {}).values():
+                entities += [(cfg or {}).get("door"), (cfg or {}).get("distance")]
+        return list(dict.fromkeys(e for e in entities if e))
+
+    def _ble_log_from_history(self, window_start, now):
+        """_backfill's seed for self._ble_log, first row clamped to window_start like the
+        other logs. An entity whose history cannot be fetched is left out, which only ever
+        costs a BLE name."""
+        ble_log = {}
+        for entity in self._ble_entities():
+            try:
+                hist = self.get_history(entity_id=entity, start_time=window_start, end_time=now)
+            except Exception as e:
+                self.log(f"ActorAttribution backfill: get_history({entity}) failed: {e}", level="WARNING")
+                continue
+            rows = []
+            first = True
+            for entry in self._flatten_history(hist, entity):
+                ts = _parse_utc(entry.get("last_changed") or entry.get("last_updated"))
+                if ts is None:
+                    continue
+                if first:
+                    ts = window_start if ts <= window_start else ts
+                    first = False
+                state = entry.get("state")
+                if not rows or rows[-1][1] != state:
+                    rows.append((ts, state))
+            if rows:
+                ble_log[entity] = tuple(sorted(rows, key=lambda r: r[0]))
+        return ble_log
+
+    def _append_ble_row(self, entity, ts, state):
+        """Same change-only, replace-never-mutate convention as _append_room_row."""
+        rows = self._ble_log.get(entity, ())
+        if rows and rows[-1][1] == state:
+            return False
+        ble_log = dict(self._ble_log)
+        ble_log[entity] = rows + ((ts, state),)
+        self._ble_log = ble_log
+        return True
+
+    def _prune_ble_log(self, now=None):
+        """Same carry-in reasoning as _prune_room_log, reaching back the longest session
+        lookback plus its pad."""
+        now = now or self._now_utc()
+        cutoff = (now - timedelta(hours=self.retention_hours)
+                  - timedelta(seconds=_BLE_SESSION_MAX_SECONDS + _BLE_PAD_SECONDS))
+        pruned = {}
+        for entity, rows in self._ble_log.items():
+            kept = tuple(r for r in rows if r[0] >= cutoff)
+            older = [r for r in rows if r[0] < cutoff]
+            if older:
+                kept = (older[-1],) + kept
+            pruned[entity] = kept
+        self._ble_log = pruned
 
     def _append_snapshot_if_changed(self, ts):
         """Recompute the (home, unobservable) pair from self._person_state and append a

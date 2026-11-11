@@ -1677,3 +1677,109 @@ class NoAppDaemonInternalShadowing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+AREA = "sensor.mikkel_ble_area"
+WASHER = {"door": "binary_sensor.washer_door_contact", "distance": "sensor.mikkel_ble_distance_to_washer_plug",
+          "area": "Guest bathroom", "max_m": 5}
+
+
+def ble(*pairs):
+    """BLE-log tuple from (seconds relative to BASE, raw state) pairs."""
+    return tuple((BASE + timedelta(seconds=s), state) for s, state in pairs)
+
+
+def make_ble_app(distance, area, door=ble((-120, "on"), (0, "off")), rooms=None, clock=420,
+                 home=("mikkel", "kristine")):
+    app = make_room_app(rooms or {}, home=home, clock=clock)
+    app.ble_witnesses = {"mikkel": {"area": AREA, "appliances": {"washer": dict(WASHER)}}}
+    app._ble_log = {WASHER["door"]: door, WASHER["distance"]: distance, AREA: area}
+    return app
+
+
+class BleProximityTests(unittest.TestCase):
+    """Phase 4: a witness's phone near the appliance in its area during the door session
+    names them, only for multi_occupant, only after the settle instant, never on distance away."""
+
+    NEAR = ble((-3600, "13.2"), (-90, "2.4"), (-30, "1.1"))
+    IN_ROOM = ble((-3600, "Bedroom"), (-100, "Guest bathroom"))
+
+    def test_near_in_the_appliance_area_during_the_loading_session_names_the_witness(self):
+        result = make_ble_app(self.NEAR, self.IN_ROOM).attribute("washer_start", at=BASE)
+
+        self.assertEqual(result["person"], "mikkel")
+        self.assertEqual(result["method"], "ble_proximity")
+        self.assertEqual(result["people_home"], ["kristine", "mikkel"])
+
+    def test_an_emptying_session_after_the_anchor_counts(self):
+        door = ble((0, "on"), (150, "off"))
+        distance = ble((-3600, "12.0"), (100, "1.9"))
+        area = ble((-3600, "Bedroom"), (80, "Guest bathroom"))
+
+        result = make_ble_app(distance, area, door=door).attribute("washer_emptied", at=BASE)
+
+        self.assertEqual(result["person"], "mikkel")
+
+    def test_far_away_names_nobody_and_never_crosses_anyone_off(self):
+        far = ble((-3600, "13.2"), (-60, "11.7"))
+
+        result = make_ble_app(far, ble((-3600, "Bedroom"))).attribute("washer_start", at=BASE)
+
+        self.assertIsNone(result["person"])
+        self.assertEqual(result["reason"], "multi_occupant")
+
+    def test_near_but_never_in_the_appliance_area_names_nobody(self):
+        result = make_ble_app(self.NEAR, ble((-3600, "Hallway"))).attribute("washer_start", at=BASE)
+
+        self.assertIsNone(result["person"])
+
+    def test_readings_outside_the_padded_session_do_not_count(self):
+        early = ble((-3600, "13.2"), (-600, "1.0"), (-500, "12.0"))
+        area = ble((-3600, "Guest bathroom"), (-500, "Bedroom"))
+
+        result = make_ble_app(early, area).attribute("washer_start", at=BASE)
+
+        self.assertIsNone(result["person"])
+
+    def test_before_the_settle_instant_it_is_pending_even_with_two_candidates(self):
+        result = make_ble_app(self.NEAR, self.IN_ROOM, clock=60).attribute("washer_start", at=BASE)
+
+        self.assertIsNone(result["person"])
+        self.assertEqual(result["reason"], "multi_occupant")
+        self.assertEqual(result["pending_until"], "2026-07-27T12:06:30Z")
+
+    def test_a_witness_room_elimination_puts_in_their_room_is_not_named(self):
+        rooms = {"mikkel": rows((-3600, True))}
+
+        result = make_ble_app(self.NEAR, self.IN_ROOM, rooms=rooms).attribute("washer_start", at=BASE)
+
+        self.assertEqual(result["person"], "kristine")
+        self.assertEqual(result["method"], "room_elimination")
+
+    def test_an_appliance_without_witness_config_is_untouched(self):
+        result = make_ble_app(self.NEAR, self.IN_ROOM, clock=60).attribute("dishwasher_start", at=BASE)
+
+        self.assertNotIn("pending_until", result)
+
+    def test_a_sole_occupant_never_reaches_ble(self):
+        result = make_ble_app(ble(), ble(), home=("kristine",)).attribute("washer_start", at=BASE)
+
+        self.assertEqual(result["person"], "kristine")
+        self.assertEqual(result["method"], "sole_occupant")
+
+    def test_listener_appends_change_only_rows_and_prune_keeps_a_carry_in(self):
+        app = make_ble_app(ble(), ble())
+        app._ble_log = {}
+        app._now_utc = lambda: BASE
+        app._on_ble_change(AREA, "state", None, "Kitchen", {})
+        app._on_ble_change(AREA, "state", "Kitchen", "Kitchen", {})
+        app._now_utc = lambda: BASE + timedelta(hours=30)
+        app._on_ble_change(AREA, "state", "Kitchen", "Hallway", {})
+        app._prune_ble_log(BASE + timedelta(hours=30))
+
+        self.assertEqual([state for _, state in app._ble_log[AREA]], ["Kitchen", "Hallway"])
+
+    def test_ble_entities_lists_every_configured_sensor_once(self):
+        app = make_ble_app(ble(), ble())
+
+        self.assertEqual(app._ble_entities(), [AREA, WASHER["door"], WASHER["distance"]])
