@@ -1664,6 +1664,8 @@ class TestTriggerIgnoresTrackerDropouts(unittest.TestCase):
     def setUp(self):
         self.app = ta.TransitAlarm.__new__(ta.TransitAlarm)
         self.app.trigger_mode = "falling"
+        self.app.trigger_quiet_start = ""
+        self.app.trigger_quiet_end = ""
         self.app._last_trigger_state = "home"
         self.app.log = lambda *a, **k: None
         self.fired = []
@@ -1685,3 +1687,26 @@ class TestTriggerIgnoresTrackerDropouts(unittest.TestCase):
     def test_plain_leave_fires(self):
         self.change("home", "not_home")
         self.assertEqual(self.fired, [True])
+
+
+class TestTriggerQuietWindow(unittest.TestCase):
+    def make(self, hour):
+        app = ta.TransitAlarm.__new__(ta.TransitAlarm)
+        app.trigger_mode = "falling"
+        app._last_trigger_state = "home"
+        app.trigger_quiet_start = "00:00"
+        app.trigger_quiet_end = "05:00"
+        app.log = lambda *a, **k: None
+        fired = []
+        app._handle_trigger = lambda: fired.append(True)
+        fake_now = datetime(2026, 11, 11, hour, 30)
+        with mock.patch.object(ta, "datetime", wraps=datetime) as dt:
+            dt.now.return_value = fake_now
+            app._on_trigger_state("person.mikkel", "state", "home", "not_home", {})
+        return fired
+
+    def test_leave_at_night_is_ignored(self):
+        self.assertEqual(self.make(3), [])
+
+    def test_leave_in_the_morning_fires(self):
+        self.assertEqual(self.make(8), [True])

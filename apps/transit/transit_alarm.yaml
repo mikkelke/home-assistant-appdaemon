@@ -154,6 +154,9 @@ TransitMikkel:
 
   trigger_entity: person.mikkel
   trigger_mode: "falling"
+  # No leave-home check at night: nobody needs a transit alert then, and tracker dropouts look like leaving.
+  trigger_quiet_start: "00:00"
+  trigger_quiet_end: "05:00"
 
   # Notification window only (when we may send alerts); line data comes from TransitStatus.
   schedule_start: "08:00"

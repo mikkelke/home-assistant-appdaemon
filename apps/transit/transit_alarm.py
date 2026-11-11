@@ -176,6 +176,8 @@ class TransitAlarm(hass.Hass):
         #   "falling"  - entity becomes inactive (person leaves home)
         #   "schedule" - time window + optional home check (for morning alerts)
         self.trigger_mode: str = self.args.get("trigger_mode", "rising").lower()
+        self.trigger_quiet_start: str = self.args.get("trigger_quiet_start", "")
+        self.trigger_quiet_end: str = self.args.get("trigger_quiet_end", "")
 
         # Schedule trigger settings (used when trigger_mode == "schedule")
         self.schedule_start: str   = self.args.get("schedule_start", "07:00")
@@ -570,6 +572,10 @@ class TransitAlarm(hass.Hass):
         if (old or "").lower() in ("unknown", "unavailable"):
             old = getattr(self, "_last_trigger_state", None)
         self._last_trigger_state = new
+        if self.trigger_quiet_start and self._within_window(
+            self.trigger_quiet_start, self.trigger_quiet_end, False
+        ):
+            return
         was_active = self._is_active(old or "")
         is_active  = self._is_active(new or "")
 
