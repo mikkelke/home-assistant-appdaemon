@@ -391,8 +391,7 @@ def laundry_audience(previous, cycle, starter, enabled, home, now=None):
                   "attributed": bool(previous.get("attributed"))}
     else:
         audience = [person for person in enabled if person in home]
-        result = {"cycle": cycle, "people": audience or (["mikkel"] if "mikkel" in enabled else []),
-                  "attributed": False}
+        result = {"cycle": cycle, "people": audience, "attributed": False}
     if now is not None:
         result["last_seen_at"] = now
     if starter and not result["attributed"]:

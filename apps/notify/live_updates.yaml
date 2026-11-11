@@ -11,7 +11,7 @@ LiveUpdates:
   enabled_people: [mikkel]
 
   # Laundry goes to started_by, including late attribution. Until that is known, the audience is
-  # enabled people home when this app first sees the cycle (Mikkel if none). It stays fixed for
+  # enabled people home when this app first sees the cycle (nobody if none). It stays fixed for
   # that cycle, including reloads; the first named starter replaces that audience once.
   washer_entity: sensor.washer_state
   dryer_entity: sensor.dryer_state

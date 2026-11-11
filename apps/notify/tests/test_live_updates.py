@@ -309,11 +309,15 @@ class LiveUpdateIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(h.ongoing(TAGS["washer"]), [])
         self.assertEqual(h.clears(TAGS["washer"]), [])
 
-    async def test_unattributed_no_one_home_falls_back_to_enabled_mikkel(self):
+    async def test_unattributed_cycle_with_no_enabled_person_home_reaches_nobody(self):
         empty = {f"person.{name}": full("not_home") for name in MOBILE}
         h = await self.make(enabled=["mikkel", "kristine"],
                             states={**empty, ENTITIES["dryer"]: laundry("dryer", starter="")})
-        self.assertEqual([s for s, _ in h.ongoing(TAGS["dryer"])], ["notify/mobile_app_mikkels_ofx9p"])
+        self.assertEqual(h.ongoing(TAGS["dryer"]), [])
+        only_kristine = {**empty, "person.kristine": full("home")}
+        h = await Harness(Path(self.temp.name) / "kristine.json", enabled=["mikkel"],
+                          states={**only_kristine, ENTITIES["washer"]: laundry(starter="")}).initialize()
+        self.assertEqual(h.ongoing(TAGS["washer"]), [])
 
     async def test_disabled_people_receive_neither_cards_nor_startup_clears(self):
         h = await self.make(states={ENTITIES["washer"]: laundry(starter="kristine"),
