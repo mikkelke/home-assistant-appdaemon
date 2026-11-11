@@ -23,9 +23,11 @@ LiveUpdates:
   cook_people: [mikkel]
   coffee_people: [mikkel]
 
-  # AbbWelcomeBridge publishes its open street-door visits, and closes them when its episode ends.
-  # Yale's apartment bell has no published visit end: retain its ring pulse until doorbell_max_s.
-  # Every door has a stable tag, and tapping opens the existing dashboard ring view.
+  # Only the apartment door has a doorbell card, tagged live_doorbell_apartment; tapping it opens the existing
+  # dashboard ring view. Yale's apartment bell has no published visit end: retain its ring pulse until
+  # doorbell_max_s. A street-door ring already gets a real push from the intercom apps, so it gets no card;
+  # doorbell_entity (AbbWelcomeBridge's open street-door visits) is read only to match such a ring to a courier,
+  # see delivery_entity.
   doorbell_entity: sensor.intercom_visit
   apartment_entity: binary_sensor.yale_doorbell_ding
   doorbell_people: [mikkel]
@@ -37,15 +39,15 @@ LiveUpdates:
   # delivery. Only food concerns the household: Kristine orders on Mikkel's Wolt account, while Nemlig and
   # parcels are Mikkel's own errands. Each audience is cut down to enabled_people, so Kristine gets Wolt
   # cards (and the cancel push) once she is listed there, and never a Nemlig or parcel card.
-  # The first street-door ring while a courier is due (sensor.home_delivery's door_courier_kind) changes
-  # the doorbell card's message to "Probably the GLS courier" (or Wolt, Nemlig, ...) and takes that
-  # delivery's card away, since the courier is here.
+  # A street-door ring while sensor.home_delivery names a door_courier (the delivery a ring most likely
+  # brings) takes that delivery's card away, since the courier is here. An apartment-door ring within ten
+  # minutes of such a ring says "Probably the GLS courier" (or Wolt, Nemlig, ...) instead of how long ago it rang.
   delivery_entity: sensor.home_delivery
   delivery_food_people: [mikkel, kristine]
   delivery_groceries_people: [mikkel]
   delivery_parcel_people: [mikkel]
 
-  # Unknown/unavailable sources retain their last card for this long. Doorbells also obey their
+  # Unknown/unavailable sources retain their last card for this long. The apartment doorbell also obeys its
   # shorter hard maximum. Source recovery resumes reconciliation; an explicit end clears at once.
   stale_limit_s: 600
 

@@ -33,15 +33,16 @@ ENTITIES = {
     "cook": "sensor.cook_state",
     "coffee": "sensor.coffee_state",
     "doorbell": "sensor.intercom_visit",
+    "apartment": "binary_sensor.yale_doorbell_ding",
     "delivery": "sensor.home_delivery",
 }
 TAGS = {
     "washer": "live_washer", "dryer": "live_dryer", "bath": "live_cook_bath",
-    "probe": "live_cook_probe", "coffee": "live_coffee", "front": "live_doorbell_front",
-    "back": "live_doorbell_back", "apartment": "live_doorbell_apartment",
+    "probe": "live_cook_probe", "coffee": "live_coffee", "apartment": "live_doorbell_apartment",
     "wolt": "live_delivery_wolt", "nemlig": "live_delivery_nemlig",
     "airmee": "live_delivery_airmee", "postnord": "live_delivery_postnord", "gls": "live_delivery_gls",
 }
+STREET_TAGS = ("live_doorbell_front", "live_doorbell_back")
 
 
 def iso(at):
@@ -88,7 +89,7 @@ class Harness:
             ENTITIES["cook"]: full("off", {"bath_phase": "off", "probe_phase": "off"}),
             ENTITIES["coffee"]: full("idle"), ENTITIES["doorbell"]: full("idle", {"visits": []}),
             ENTITIES["delivery"]: full("0", {"deliveries": []}),
-            "binary_sensor.yale_doorbell_ding": full("off"),
+            ENTITIES["apartment"]: full("off"),
             "person.mikkel": full("home"), "person.kristine": full("home"),
             "person.claudia": full("not_home"),
         }
@@ -228,15 +229,15 @@ class LiveUpdateIntegrationTests(unittest.IsolatedAsyncioTestCase):
         h = await self.make(enabled=["mikkel", "kristine"], cook_people=["kristine", "claudia"],
                             coffee_people=[], doorbell_people=["claudia"],
                             states={ENTITIES["cook"]: bath(), ENTITIES["coffee"]: coffee(),
-                                    ENTITIES["doorbell"]: visit()})
+                                    ENTITIES["apartment"]: full("on")})
         self.assertEqual([s for s, _ in h.ongoing(TAGS["bath"])], ["notify/mobile_app_kristine_iphone_2"])
         self.assertEqual(h.ongoing(TAGS["coffee"]), [])
-        self.assertEqual(h.ongoing(TAGS["front"]), [])
+        self.assertEqual(h.ongoing(TAGS["apartment"]), [])
 
     async def test_restart_does_not_resend_unchanged_active_cards_for_each_source(self):
         fixtures = (("washer", laundry(), TAGS["washer"]), ("dryer", laundry("dryer"), TAGS["dryer"]),
                     ("cook", bath(), TAGS["bath"]), ("cook", probe(), TAGS["probe"]),
-                    ("coffee", coffee(), TAGS["coffee"]), ("doorbell", visit(), TAGS["front"]))
+                    ("coffee", coffee(), TAGS["coffee"]), ("apartment", full("on"), TAGS["apartment"]))
         for index, (source, running, tag) in enumerate(fixtures):
             with self.subTest(source=source, tag=tag):
                 path = Path(self.temp.name) / f"restart{index}.json"
@@ -267,8 +268,7 @@ class LiveUpdateIntegrationTests(unittest.IsolatedAsyncioTestCase):
                  ("dryer", laundry("dryer"), full("Emptied"), TAGS["dryer"]),
                  ("cook", bath(), bath(phase="done"), TAGS["bath"]),
                  ("cook", probe(), probe(phase="carve"), TAGS["probe"]),
-                 ("coffee", coffee(), coffee(phase="ready"), TAGS["coffee"]),
-                 ("doorbell", visit(), full("idle", {"visits": []}), TAGS["front"]))
+                 ("coffee", coffee(), coffee(phase="ready"), TAGS["coffee"]))
         for index, (source, running, ended, tag) in enumerate(cases):
             with self.subTest(source=source, tag=tag):
                 h = await Harness(Path(self.temp.name) / f"end{index}.json",
@@ -322,7 +322,7 @@ class LiveUpdateIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all("mikkels_ofx9p" in service for service, _ in h.calls))
         h = await Harness(Path(self.temp.name) / "nobody.json", enabled=[],
                           states={ENTITIES["washer"]: laundry(), ENTITIES["coffee"]: coffee(),
-                                  ENTITIES["cook"]: bath(), ENTITIES["doorbell"]: visit()}).initialize()
+                                  ENTITIES["cook"]: bath(), ENTITIES["apartment"]: full("on")}).initialize()
         self.assertEqual(h.calls, [])
 
     async def test_late_attribution_to_disabled_person_clears_initial_audience(self):
@@ -393,7 +393,7 @@ class LiveUpdateIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_unavailable_holds_then_clears_per_source(self):
         fixtures = (("washer", laundry(), TAGS["washer"]), ("dryer", laundry("dryer"), TAGS["dryer"]),
                     ("cook", bath(), TAGS["bath"]), ("coffee", coffee(), TAGS["coffee"]),
-                    ("doorbell", visit(), TAGS["front"]))
+                    ("apartment", full("on"), TAGS["apartment"]))
         for index, (source, running, tag) in enumerate(fixtures):
             with self.subTest(source=source):
                 h = await Harness(Path(self.temp.name) / f"stale{index}.json", stale_limit_s=90,
@@ -421,33 +421,44 @@ class LiveUpdateIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await restored.reconcile(60)
         self.assertEqual(len(restored.ongoing(TAGS["coffee"])), 1)
 
-    async def test_doorbell_elapsed_card_deep_link_and_max_age(self):
-        h = await self.make(states={ENTITIES["doorbell"]: visit()})
-        [(_, payload)] = h.ongoing(TAGS["front"])
-        self.assertIn("front door", (payload["title"] + payload["message"]).lower())
+    async def test_apartment_doorbell_elapsed_card_deep_link_and_max_age(self):
+        h = await self.make(states={ENTITIES["apartment"]: full("on")})
+        [(_, payload)] = h.ongoing(TAGS["apartment"])
+        self.assertIn("apartment door", (payload["title"] + payload["message"]).lower())
         self.assertNotIn("chronometer", payload["data"])
         self.assertNotIn("when", payload["data"])
         self.assertEqual(payload["data"]["clickAction"], f"/dashboard-rooftop/home#now=ring-{int(NOW)}")
         self.assertNotIn("sound", payload["data"])
         h.forget_calls()
         await h.reconcile(59)
-        self.assertEqual(h.ongoing(TAGS["front"]), [])
+        self.assertEqual(h.ongoing(TAGS["apartment"]), [])
         await h.reconcile(1)
-        self.assertEqual(len(h.ongoing(TAGS["front"])), 1)
+        self.assertEqual(len(h.ongoing(TAGS["apartment"])), 1)
         h.forget_calls()
         await h.reconcile(120)
-        self.assertEqual(len(h.clears(TAGS["front"])), 1)
+        self.assertEqual(len(h.clears(TAGS["apartment"])), 1)
 
-    async def test_multiple_doors_and_cook_lanes_have_independent_tags(self):
+    async def test_a_street_door_ring_sends_no_card_of_its_own(self):
+        both = visit()
+        both["attributes"]["visits"].append({"door": "back door", "ring_at": iso(NOW)})
+        h = await self.make(states={ENTITIES["doorbell"]: both})
+        for seconds in (0, 60, 120):
+            await h.reconcile(seconds)
+            for tag in STREET_TAGS:
+                self.assertEqual(h.ongoing(tag), [])
+        self.assertEqual(h.ongoing(), [])
+
+    async def test_cook_lanes_and_the_apartment_door_have_independent_tags_while_street_doors_have_none(self):
         both = bath()
         both["state"] = "both"
         both["attributes"].update(probe()["attributes"])
         both["attributes"]["bath_phase"] = "cooking"
         doors = visit()
         doors["attributes"]["visits"].append({"door": "back door", "ring_at": iso(NOW)})
-        h = await self.make(states={ENTITIES["cook"]: both, ENTITIES["doorbell"]: doors})
+        h = await self.make(states={ENTITIES["cook"]: both, ENTITIES["doorbell"]: doors,
+                                    ENTITIES["apartment"]: full("on")})
         self.assertEqual({p["data"]["tag"] for _, p in h.ongoing()},
-                         {TAGS["bath"], TAGS["probe"], TAGS["front"], TAGS["back"]})
+                         {TAGS["bath"], TAGS["probe"], TAGS["apartment"]})
 
     async def test_apartment_ring_pulse_keeps_card_until_max_and_survives_reload(self):
         entity = "binary_sensor.yale_doorbell_ding"

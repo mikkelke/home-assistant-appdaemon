@@ -36,6 +36,10 @@ COURIER_AT_THE_DOOR = {
     "parcel": "The parcel is at the door.",
 }
 COURIER_APARTMENT_WINDOW_S = 600
+# Carrier names for the auto-open push of a street ring that matched a courier, keyed by
+# the source of sensor.home_delivery's door_courier.
+COURIER_NAMES = {"wolt": "Wolt", "nemlig": "Nemlig", "gls": "GLS", "postnord": "PostNord", "airmee": "Airmee"}
+COURIER_PUSH_MATCH_S = 10
 
 # ---------------------------------------------------------------------------
 # Pure module-level functions - unit-testable without an AppDaemon runtime (see
@@ -49,6 +53,12 @@ def courier_message(kind, owner_away, opened):
     While the owner is away the delivery is named as his: then someone else hears it."""
     here = (COURIER_HERE_AWAY if owner_away else COURIER_HERE)[kind]
     return f"{here} {opened}." if opened else here
+
+
+def courier_push_title(source):
+    """The auto-open push title for a street ring that matched a courier from `source`."""
+    name = COURIER_NAMES.get(source) if isinstance(source, str) else None
+    return f"Probably the {name} courier" if name else "Probably the courier"
 
 
 def resume_decision(record, age_s, max_age_s):
@@ -118,7 +128,7 @@ class Intercom(hass.Hass):
         # whether the delivery is named as Mikkel's, which it is while he is away.
         self.delivery_entity = self.args.get("delivery_entity", "sensor.home_delivery")
         self.owner_entity = self.args.get("owner_entity", "person.mikkel")
-        self._street_courier = None  # (kind, time) of the latest street ring that matched a courier
+        self._street_courier = None  # (kind, time, source) of the latest street ring that matched a courier
 
         self.sonos_notifier = self._get_notifier()
         self.mobile_notifier = self._get_mobile_notifier()
@@ -711,7 +721,8 @@ class Intercom(hass.Hass):
             owner = self.get_state(self.owner_entity)
             owner_away = owner not in (None, "", "unknown", "unavailable", "home")
             words = courier_message(kind, owner_away, info.get("followup") if auto_open_enabled else None)
-            self._street_courier = (kind, now)
+            courier = self.get_state(self.delivery_entity, attribute="door_courier")
+            self._street_courier = (kind, now, courier.get("source") if isinstance(courier, dict) else None)
             return words
         except Exception as e:
             try:
@@ -1152,6 +1163,12 @@ class Intercom(hass.Hass):
         if self.mobile_notifier:
             title = "Intercom auto-opened"
             message = f"Someone rang the {ring_label} and the door was unlocked automatically."
+            courier = self._street_courier
+            ring_ts = outcome.get("ring_ts")
+            if courier and isinstance(ring_ts, datetime) \
+                    and abs((courier[1] - ring_ts).total_seconds()) <= COURIER_PUSH_MATCH_S:
+                title = courier_push_title(courier[2])
+                message = f"Rang the {ring_label} and was let in automatically."
             # Offer the push to the ABB bridge first: it can hold it the few
             # seconds the gateway needs to produce THIS visitor's photo, instead
             # of sending now with the previous visitor's (Mikkel, 2026-08-27).

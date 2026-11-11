@@ -30,6 +30,8 @@ attributes:
   door_courier_kind  food|groceries|parcel: what a ring at the door most likely is, for the doorbell wording. Food
                   counts whenever food_courier_expected; groceries and parcels when one is out for delivery
                   (on_the_way or arriving). Food first, then groceries, then parcels
+  door_courier    the entry whose courier a ring at the door most likely is (the first of door_courier_kind
+                  counted above), None when door_courier_kind is None
   spoken          one short English answer for voice, food first
   reason          why the state is what it is
 
@@ -465,14 +467,16 @@ def courier_expected(active, now):
     return False, None
 
 
-def door_courier_kind(active, now):
-    """What a ring at the door most likely is: food, else groceries, else a parcel, None when no courier is
-    expected. Food counts whenever its courier is expected; groceries and parcels when one is out for delivery."""
-    if courier_expected([delivery for delivery in active if delivery.kind == "food"], now)[0]:
-        return "food"
+def door_courier(active, now):
+    """The delivery a ring at the door most likely brings: the first food order while its courier is expected,
+    else the first groceries, else the first parcel out for delivery; None when no courier is expected."""
+    food = [delivery for delivery in active if delivery.kind == "food"]
+    if courier_expected(food, now)[0]:
+        return food[0]
     for kind in ("groceries", "parcel"):
-        if any(delivery.kind == kind and delivery.stage in OUT for delivery in active):
-            return kind
+        for delivery in active:
+            if delivery.kind == kind and delivery.stage in OUT:
+                return delivery
     return None
 
 
@@ -560,6 +564,7 @@ def snapshot(deliveries, now, incoming=()):
     entries = [entry(delivery, now) for delivery in ordered]
     active = [delivery for delivery in ordered if delivery.stage in ACTIVE]
     expected, why = courier_expected(active, now)
+    courier = door_courier(active, now)
     food = [delivery for delivery in active if delivery.kind == "food"]
     next_food = next((item for delivery, item in zip(ordered, entries)
                       if delivery.kind == "food" and delivery.stage in ACTIVE), None)
@@ -573,7 +578,9 @@ def snapshot(deliveries, now, incoming=()):
                            "upcoming": upcoming_parcels(incoming, {delivery.id for delivery in ordered}),
                            "next": entries[0] if active else None, "next_food": next_food,
                            "courier_expected": expected, "food_courier_expected": courier_expected(food, now)[0],
-                           "door_courier_kind": door_courier_kind(active, now),
+                           "door_courier_kind": courier.kind if courier else None,
+                           "door_courier": next((item for delivery, item in zip(ordered, entries)
+                                                 if delivery is courier), None),
                            "spoken": spoken(active, now), "reason": reason}}
 
 

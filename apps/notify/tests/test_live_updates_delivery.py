@@ -1,6 +1,6 @@
 """Delivery cards read sensor.home_delivery only: one card per source (Wolt, Nemlig, each parcel carrier),
-cleared on delivery, one push on a cancel and none for parcels. Only food reaches Kristine, and the first
-street ring while a courier is due turns that delivery's card into the doorbell's courier message."""
+cleared on delivery, one push on a cancel and none for parcels. Only food reaches Kristine. A street ring while the
+sensor names a door courier takes that delivery's card away and words the apartment ring that follows it."""
 
 import json
 import re
@@ -12,13 +12,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_live_updates import ENTITIES, HOUSE, NOW, TAGS, Harness, full, iso, visit  # noqa: E402
+from test_live_updates import ENTITIES, HOUSE, NOW, TAGS, Harness, full, visit  # noqa: E402
 
 import live_updates as lu  # noqa: E402
 
 WOLT, NEMLIG = TAGS["wolt"], TAGS["nemlig"]
 AIRMEE, POSTNORD, GLS = TAGS["airmee"], TAGS["postnord"], TAGS["gls"]
-FRONT, BACK, APARTMENT = TAGS["front"], TAGS["back"], TAGS["apartment"]
+APARTMENT = TAGS["apartment"]
 YALE_DING = "binary_sensor.yale_doorbell_ding"
 COURIER = "Probably the Wolt courier"
 SHIPPED = Path(__file__).resolve().parents[1] / "live_updates.yaml"
@@ -62,15 +62,19 @@ def shipped_audiences():
     return found
 
 
+def with_courier(state, named):
+    """state with HomeDelivery's door_courier set: the entry a ring at the door most likely brings. Without a
+    courier the key is absent, as AppDaemon leaves out a None."""
+    state["attributes"]["door_courier"] = named
+    return state
+
+
 def expecting(*entries, due=True):
-    """sensor(...) as HomeDelivery publishes it: while a Wolt courier is due it adds food_courier_expected,
-    otherwise the key is absent; next_food is the first active food entry."""
+    """sensor(...) as HomeDelivery publishes it while a Wolt courier is due: door_courier is the first active food
+    entry."""
     state = sensor(*entries)
     food = [e for e in entries if e["kind"] == "food" and e["stage"] in ("preparing", "on_the_way", "arriving")]
-    state["attributes"]["next_food"] = food[0] if food else None
-    if due:
-        state["attributes"]["food_courier_expected"] = True
-    return state
+    return with_courier(state, food[0]) if due and food else state
 
 
 def card(**kw):
@@ -478,15 +482,27 @@ class MatchedRingTests(unittest.TestCase):
     def rings(self, previous=None, delivery=None, doorbell=None, now=NOW):
         return lu.matched_rings(previous, doorbell or visit(), expecting(entry()) if delivery is None else delivery, now, 180)
 
-    def test_a_street_ring_while_food_is_due_is_matched_to_the_next_food_order(self):
+    def test_a_street_ring_is_matched_to_the_sensors_door_courier(self):
         self.assertEqual(self.rings(), {str(int(NOW)): "wolt:test_kitchen"})
         self.assertEqual(self.rings(doorbell=visit(door="back door")), {str(int(NOW)): "wolt:test_kitchen"})
+
+    def test_a_street_ring_is_matched_to_whatever_delivery_the_sensor_names(self):
+        for named in (entry("nemlig"), parcel_entry("gls", barcode="B1")):
+            with self.subTest(id=named["id"]):
+                state = with_courier(sensor(entry(), named), named)
+                self.assertEqual(self.rings(delivery=state), {str(int(NOW)): named["id"]})
 
     def test_the_apartment_door_never_matches_by_itself(self):
         self.assertEqual(self.rings(doorbell=visit(door="apartment door")), {})
 
-    def test_nothing_matches_without_a_due_food_courier(self):
-        for delivery in (sensor(entry()), expecting(entry(), due=False), full("unavailable"), full("1", {"food_courier_expected": "true"})):
+    def test_nothing_matches_without_a_door_courier(self):
+        named = entry()
+        cases = (sensor(named), expecting(named, due=False), full("unavailable", {"door_courier": named}),
+                 full("1", {"door_courier": named["id"]}), full("1", {"door_courier": [named]}),
+                 full("1", {"door_courier": {"id": 5}}), full("1", {"door_courier": {"title": "no id"}}),
+                 full("1", {"deliveries": [named], "next_food": named, "food_courier_expected": True,
+                            "door_courier_kind": "food"}))
+        for delivery in cases:
             with self.subTest(delivery=delivery):
                 self.assertEqual(self.rings(delivery=delivery), {})
         self.assertEqual(lu.matched_rings({}, visit(), None, NOW, 180), {})
@@ -499,11 +515,6 @@ class MatchedRingTests(unittest.TestCase):
         first = self.rings()
         self.assertEqual(self.rings(previous=first, delivery=expecting(entry(title="Pizza Test")), now=NOW + 30), first)
 
-    def test_a_match_without_an_order_hands_nothing_over(self):
-        state = expecting(entry())
-        state["attributes"]["next_food"] = None
-        self.assertEqual(self.rings(delivery=state), {str(int(NOW)): ""})
-
     def test_a_match_is_forgotten_after_an_hour_and_damaged_ones_are_dropped(self):
         old = {str(int(NOW)): "wolt:a"}
         self.assertEqual(self.rings(previous=old, delivery=sensor(), now=NOW + 3599), old)
@@ -513,37 +524,25 @@ class MatchedRingTests(unittest.TestCase):
                 self.assertEqual(self.rings(previous=bad, delivery=sensor()), {})
 
     def test_an_apartment_ring_matches_up_to_ten_minutes_after_a_matched_street_ring(self):
-        rings = {str(int(NOW)): ""}
-        for offset, matched in ((0, ""), (600, ""), (601, None), (-1, None)):
+        rings = {str(int(NOW)): "wolt:a"}
+        for offset, matched in ((0, "wolt:a"), (600, "wolt:a"), (601, None), (-1, None)):
             with self.subTest(offset=offset):
                 self.assertEqual(lu.apartment_ring_matched(rings, NOW + offset), matched)
         self.assertIsNone(lu.apartment_ring_matched(rings, None))
         later = {str(int(NOW)): "wolt:a", str(int(NOW + 60)): "gls:B"}
         self.assertEqual(lu.apartment_ring_matched(later, NOW + 90), "gls:B")
 
-    def test_a_street_ring_while_a_parcel_is_out_is_matched_to_that_parcel(self):
-        state = sensor(parcel_entry("gls", stage="in_transit", barcode="OLD"), parcel_entry("gls", barcode="B1"))
-        state["attributes"]["door_courier_kind"] = "parcel"
-        self.assertEqual(self.rings(delivery=state), {str(int(NOW)): "gls:B1"})
-        state["attributes"]["door_courier_kind"] = None
-        self.assertEqual(self.rings(delivery=state), {})
-
-    def test_the_doorbell_card_names_the_courier_of_the_matched_delivery(self):
+    def test_the_apartment_card_names_the_courier_of_the_matched_delivery(self):
+        ring = visit(door="apartment door")
+        [plain] = lu.doorbell_cards(ring, NOW, 180).values()
         for order, text in (("gls:B1", "Probably the GLS courier"), ("nemlig:1", "Probably the Nemlig courier"),
-                            ("wolt:a", COURIER), ("", COURIER), ("x:1", COURIER)):
+                            ("wolt:a", COURIER), ("", "Probably the courier"), ("x:1", "Probably the courier")):
             with self.subTest(order=order):
-                [card] = lu.doorbell_cards(visit(), NOW, 180, {str(int(NOW)): order}).values()
+                [card] = lu.doorbell_cards(ring, NOW, 180, {str(int(NOW)): order}).values()
                 self.assertEqual(card.message, text)
+                self.assertEqual((card.tag, card.title, card.critical_text, card.link, card.icon),
+                                 (plain.tag, plain.title, plain.critical_text, plain.link, plain.icon))
         self.assertFalse(lu.apartment_ring_matched({}, NOW))
-
-    def test_only_the_matched_ring_gets_the_courier_message(self):
-        state = full("active", {"visits": [{"door": "front door", "ring_at": iso(NOW)},
-                                           {"door": "back door", "ring_at": iso(NOW + 1)}]})
-        cards = lu.doorbell_cards(state, NOW + 1, 180, {str(int(NOW)): ""})
-        self.assertEqual((cards[FRONT].message, cards[BACK].message), (COURIER, "Someone is at the door"))
-        plain = lu.doorbell_cards(state, NOW + 1, 180)
-        self.assertEqual({tag: (card.title, card.critical_text, card.link, card.icon) for tag, card in cards.items()},
-                         {tag: (card.title, card.critical_text, card.link, card.icon) for tag, card in plain.items()})
 
 
 class CourierHandoverTests(unittest.IsolatedAsyncioTestCase):
@@ -555,38 +554,32 @@ class CourierHandoverTests(unittest.IsolatedAsyncioTestCase):
     async def make(self, **kwargs):
         return await Harness(self.path, **kwargs).initialize()
 
-    async def test_a_street_ring_while_food_is_due_says_probably_the_wolt_courier(self):
-        for door, tag in (("front door", FRONT), ("back door", BACK)):
+    async def test_a_street_ring_while_food_is_due_sends_no_card_and_takes_the_wolt_card_away(self):
+        for index, door in enumerate(("front door", "back door")):
             with self.subTest(door=door):
-                h = await Harness(Path(self.temp.name) / f"{tag}.json", states={
+                h = await Harness(Path(self.temp.name) / f"street{index}.json", states={
                     ENTITIES["delivery"]: expecting(entry()), ENTITIES["doorbell"]: visit(door=door)}).initialize()
-                [(service, payload)] = h.ongoing(tag)
-                self.assertEqual((service, payload["title"], payload["message"]), (MIKKEL, f"Doorbell · {door}", COURIER))
-                self.assertEqual((payload["data"]["critical_text"], payload["data"]["clickAction"]),
-                                 ("Now", f"/dashboard-rooftop/home#now=ring-{int(NOW)}"))
+                self.assertEqual(h.ongoing(), [])
+                self.assertEqual(h.app._state["courier_rings"], {str(int(NOW)): "wolt:test_kitchen"})
 
-    async def test_a_ring_with_no_food_courier_due_keeps_the_usual_wording(self):
-        cases = {"no order": sensor(), "food not due": expecting(entry(eta=NOW + 3600), due=False),
-                 "a parcel is out": sensor(parcel_entry(eta=NOW + 600)),
-                 "nemlig is out": sensor(entry("nemlig", eta=NOW + 600)), "sensor unavailable": full("unavailable")}
-        for name, delivery in cases.items():
+    async def test_a_street_ring_with_no_door_courier_matches_nothing_and_leaves_the_wolt_card(self):
+        cases = {"no order": (sensor(), 0), "food not due": (expecting(entry(eta=NOW + 3600), due=False), 1),
+                 "sensor names none": (sensor(entry(eta=NOW + 600)), 1), "sensor unavailable": (full("unavailable"), 0)}
+        for index, (name, (delivery, wolt_cards)) in enumerate(cases.items()):
             with self.subTest(name):
-                h = await Harness(Path(self.temp.name) / f"{name}.json",
+                h = await Harness(Path(self.temp.name) / f"none{index}.json",
                                   states={ENTITIES["delivery"]: delivery, ENTITIES["doorbell"]: visit()}).initialize()
-                [(_, payload)] = h.ongoing(FRONT)
-                self.assertEqual(payload["message"], "Someone is at the door")
-                h.forget_calls()
-                await h.reconcile(60)
-                self.assertEqual(h.ongoing(FRONT)[0][1]["message"], "Rang 1 min ago")
+                self.assertEqual(len(h.ongoing(WOLT)), wolt_cards)
                 self.assertEqual(h.app._state["courier_rings"], {})
 
     async def test_the_match_sticks_after_the_order_is_delivered(self):
         h = await self.make(states={ENTITIES["delivery"]: expecting(entry()), ENTITIES["doorbell"]: visit()})
         h.forget_calls()
         h.states[ENTITIES["delivery"]] = sensor(entry(stage="delivered", eta=None))
-        await h.reconcile(60)
-        [(_, payload)] = h.ongoing(FRONT)
-        self.assertEqual((payload["message"], payload["data"]["critical_text"]), (COURIER, "1 min"))
+        h.states[YALE_DING] = full("on", at=NOW + 90)
+        await h.reconcile(90)
+        [(_, payload)] = h.ongoing(APARTMENT)
+        self.assertEqual(payload["message"], COURIER)
 
     async def test_a_reload_keeps_the_match_and_the_hand_over(self):
         h = await self.make(states={ENTITIES["delivery"]: expecting(entry(eta=NOW + 480)), ENTITIES["doorbell"]: visit()})
@@ -595,8 +588,10 @@ class CourierHandoverTests(unittest.IsolatedAsyncioTestCase):
         restored = await Harness(self.path, states=states, now=NOW + 30).initialize()
         self.assertEqual(restored.ongoing(), [])
         await restored.reconcile(60)
-        self.assertEqual([payload["message"] for _, payload in restored.ongoing(FRONT)], [COURIER])
-        self.assertEqual(restored.ongoing(WOLT), [])
+        self.assertEqual(restored.ongoing(), [])
+        restored.states[YALE_DING] = full("on", at=restored.now)
+        await restored.reconcile()
+        self.assertEqual([payload["message"] for _, payload in restored.ongoing(APARTMENT)], [COURIER])
 
     async def test_the_first_matched_ring_takes_that_orders_wolt_card_away_for_good(self):
         h = await self.make(states={ENTITIES["delivery"]: sensor(entry(eta=NOW + 480))})
@@ -606,7 +601,7 @@ class CourierHandoverTests(unittest.IsolatedAsyncioTestCase):
         h.states[ENTITIES["doorbell"]] = visit(at=NOW + 60)
         await h.reconcile(60)
         self.assertEqual(len(h.clears(WOLT)), 1)
-        self.assertEqual([payload["message"] for _, payload in h.ongoing(FRONT)], [COURIER])
+        self.assertEqual(h.ongoing(), [])
         h.forget_calls()
         for seconds in (10, 60, 300, 1800):
             await h.reconcile(seconds)
@@ -626,36 +621,33 @@ class CourierHandoverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["title"], f"Wolt · {KITCHEN}")
         self.assertEqual(h.clears(WOLT), [])
 
-    async def test_a_ring_that_matched_no_order_hands_no_card_over(self):
-        h = await self.make(states={ENTITIES["delivery"]: sensor(entry(eta=NOW + 480))})
-        state = expecting(entry(eta=NOW + 480))
-        state["attributes"]["next_food"] = None
-        h.forget_calls()
-        h.states[ENTITIES["delivery"]] = state
-        h.states[ENTITIES["doorbell"]] = visit(at=NOW + 60)
-        await h.reconcile(60)
-        self.assertEqual([payload["message"] for _, payload in h.ongoing(FRONT)], [COURIER])
-        self.assertEqual(h.clears(WOLT), [])
-
-    async def test_a_ring_while_a_parcel_is_out_hands_its_card_over_to_the_doorbell(self):
+    async def test_a_ring_while_a_parcel_is_out_takes_its_card_away_for_good(self):
         parcel = parcel_entry("gls", barcode="043312860948", title="ComputerSalg A/S")
-        state = sensor(parcel)
-        state["attributes"]["door_courier_kind"] = "parcel"
-        h = await self.make(states={ENTITIES["delivery"]: state})
+        h = await self.make(states={ENTITIES["delivery"]: with_courier(sensor(parcel), parcel)})
         self.assertEqual(h.ongoing(GLS)[0][1]["message"], "Out for delivery")
         h.forget_calls()
         h.states[ENTITIES["doorbell"]] = visit(at=NOW + 60)
         await h.reconcile(60)
-        self.assertEqual([payload["message"] for _, payload in h.ongoing(FRONT)], ["Probably the GLS courier"])
         self.assertEqual(len(h.clears(GLS)), 1)
+        self.assertEqual(h.ongoing(), [])
         h.forget_calls()
         await h.reconcile(600)
         self.assertEqual(h.ongoing(GLS), [])
 
+    async def test_an_apartment_ring_soon_after_a_matched_parcel_ring_names_the_carrier(self):
+        parcel = parcel_entry("gls", barcode="043312860948")
+        h = await self.make(states={ENTITIES["delivery"]: with_courier(sensor(parcel), parcel),
+                                    ENTITIES["doorbell"]: visit()})
+        h.forget_calls()
+        h.states[YALE_DING] = full("on", at=NOW + 90)
+        await h.reconcile(90)
+        [(service, payload)] = h.ongoing(APARTMENT)
+        self.assertEqual((service, payload["message"]), (MIKKEL, "Probably the GLS courier"))
+
     async def test_a_food_ring_leaves_nemlig_and_parcel_cards_alone(self):
         state = expecting(entry(eta=NOW + 300), entry("nemlig", eta=NOW + 1200), parcel_entry(eta=NOW + 900))
         h = await self.make(states={ENTITIES["delivery"]: state, ENTITIES["doorbell"]: visit()})
-        self.assertEqual([len(h.ongoing(tag)) for tag in (WOLT, NEMLIG, POSTNORD, FRONT)], [0, 1, 1, 1])
+        self.assertEqual({payload["data"]["tag"] for _, payload in h.ongoing()}, {NEMLIG, POSTNORD})
 
     async def test_an_apartment_ring_soon_after_a_matched_street_ring_is_the_same_courier(self):
         h = await self.make(states={ENTITIES["delivery"]: expecting(entry()), ENTITIES["doorbell"]: visit()})

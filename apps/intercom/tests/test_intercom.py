@@ -281,6 +281,7 @@ def _fake_abb_app(tmpdir, clock, states, abb_unlock_doors=None, voice_before_unl
     app.sonos_notifier = None  # skip TTS - not under test here
     app.notify_target = "mikkel"
     app.abb_bridge = None
+    app._street_courier = None
 
     app.get_now = clock.now
     app.logs = []
@@ -954,6 +955,15 @@ class CourierWordingTests(unittest.TestCase):
         self.states[self.KIND] = None
         self.ring("binary_sensor.apartment", later=30)
         self.assertEqual(self.spoken(), ["Someone is at the apartment door"] * 2)
+
+    def test_a_matched_street_ring_remembers_which_carrier_the_courier_is_from(self):
+        self.states[self.KIND] = "parcel"
+        self.states[("sensor.home_delivery", "door_courier")] = {"id": "gls:1", "source": "gls", "kind": "parcel"}
+        self.ring()
+        self.assertEqual(self.app._street_courier, ("parcel", NOW, "gls"))
+        self.states[("sensor.home_delivery", "door_courier")] = "broken"
+        self.ring(later=30)
+        self.assertEqual(self.app._street_courier, ("parcel", NOW + timedelta(seconds=30), None))
 
     def test_the_words_come_from_a_pure_function(self):
         self.assertEqual(intercom.courier_message("food", False, "I opened the front door"),

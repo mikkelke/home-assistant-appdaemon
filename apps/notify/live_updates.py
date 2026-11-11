@@ -17,8 +17,7 @@ HOUSE_TZ = ZoneInfo("Europe/Copenhagen")
 SEND_INTERVAL_S = 60
 TICK_S = 10
 TAGS = ("live_washer", "live_dryer", "live_cook_bath", "live_cook_probe", "live_coffee",
-        "live_doorbell_front", "live_doorbell_back", "live_doorbell_apartment",
-        "live_delivery_wolt", "live_delivery_nemlig",
+        "live_doorbell_apartment", "live_delivery_wolt", "live_delivery_nemlig",
         "live_delivery_airmee", "live_delivery_postnord", "live_delivery_gls")
 DOORS = {"front door": "front", "back door": "back", "apartment door": "apartment"}
 DELIVERY_APPS = {"wolt": "app://com.wolt.android", "nemlig": "app://com.nemlig",
@@ -29,9 +28,7 @@ PARCEL_CARRIERS = {"airmee": "Airmee", "postnord": "PostNord", "gls": "GLS"}
 PARCEL_ICON = "mdi:package-variant-closed"
 DELIVERY_KINDS = {"wolt": "food", "nemlig": "groceries", **dict.fromkeys(PARCEL_CARRIERS, "parcel")}
 STREET_DOORS = ("front door", "back door")
-COURIER_MESSAGE = "Probably the Wolt courier"
 COURIER_NAMES = {"wolt": "Wolt", "nemlig": "Nemlig", **PARCEL_CARRIERS}
-OUT_STAGES = ("on_the_way", "arriving")
 COURIER_RING_WINDOW_S = 600
 COURIER_RING_KEEP_S = 3600
 DELIVERY_STAGES = {"preparing": "Preparing", "on_the_way": "On the way", "arriving": "Arriving"}
@@ -224,9 +221,10 @@ def ring_key(at):
 
 
 def courier_text(order):
-    """The doorbell card's line for a ring matched to this delivery id, or to no id ("") while food was due."""
+    """The doorbell card's line for a ring matched to this delivery id: its courier by name when the id's source
+    is known."""
     source = order.split(":", 1)[0] if isinstance(order, str) else ""
-    return f"Probably the {COURIER_NAMES[source]} courier" if source in COURIER_NAMES else COURIER_MESSAGE
+    return f"Probably the {COURIER_NAMES[source]} courier" if source in COURIER_NAMES else "Probably the courier"
 
 
 def doorbell_cards(full, now, max_age_s=180, matched=None):
@@ -323,7 +321,7 @@ def delivery_entries(full):
 
 def delivery_cards(full, now, handed_over=()):
     """One card per source: its first delivery that has a card, the sensor having sorted them by arrival. An order
-    in handed_over has gone to the doorbell card and gets none."""
+    in handed_over, whose courier has rung at the door, is here and gets none."""
     cards = {}
     for delivery in delivery_entries(full):
         if delivery.get("id") in handed_over:
@@ -342,27 +340,19 @@ def cancelled_deliveries(full):
 
 
 def expected_order(delivery):
-    """Id of the delivery whose courier a street ring most likely is: the next food order while food is due ("" if
-    it has no id), else the first groceries or parcel delivery of door_courier_kind that is out; None for none."""
-    attrs = attributes(delivery)
+    """Id of the delivery whose courier a street ring most likely is, as sensor.home_delivery names it in
+    door_courier; None when it names none or the sensor is unavailable."""
     if unavailable(delivery):
         return None
-    if attrs.get("food_courier_expected") is True:
-        food = attrs.get("next_food")
-        return food.get("id") if isinstance(food, dict) and isinstance(food.get("id"), str) else ""
-    kind = attrs.get("door_courier_kind")
-    if kind not in ("groceries", "parcel"):
-        return None
-    for entry in delivery_entries(delivery):
-        if entry.get("kind") == kind and entry.get("stage") in OUT_STAGES and isinstance(entry.get("id"), str):
-            return entry["id"]
-    return None
+    courier = attributes(delivery).get("door_courier")
+    order = courier.get("id") if isinstance(courier, dict) else None
+    return order if isinstance(order, str) else None
 
 
 def matched_rings(previous, doorbell, delivery, now, max_age_s):
     """Street-door rings that came while a courier was expected, as {ring_key: id of the delivery it most likely
-    brought, or ""}. A ring is matched the first time it is seen with a courier expected and stays matched, so a
-    card never flips back; a matched ring is forgotten after COURIER_RING_KEEP_S."""
+    brought}. A ring is matched the first time it is seen with a courier expected and stays matched whatever the
+    sensor says later; a matched ring is forgotten after COURIER_RING_KEEP_S."""
     rings = {}
     for key, order in (previous.items() if isinstance(previous, dict) else ()):
         at = number(key)
@@ -573,18 +563,12 @@ class LiveUpdates(hass.Hass):
             self._state["courier_rings"] = rings
             source_cards = {"cook": cook_cards(full["cook"], now),
                             "coffee": {"live_coffee": coffee_card(full["coffee"], now)},
-                            "doorbell": doorbell_cards(full["doorbell"], now, self.doorbell_max_s, rings),
                             "delivery": delivery_cards(full["delivery"], now,
                                                        {order for order in rings.values() if order})}
             source_cards["coffee"] = {tag: card for tag, card in source_cards["coffee"].items() if card}
             for source, cards in source_cards.items():
                 cards = self._retained(source, full[source], cards, now)
                 for tag, card in cards.items():
-                    # A stale intercom source cannot extend a visit beyond the hard maximum.
-                    if source == "doorbell":
-                        at = epoch(card.link.rsplit("-", 1)[-1])
-                        if at is None or now - at >= self.doorbell_max_s:
-                            continue
                     desired[tag] = (card, self._services(self._audience(source, tag)))
             apartment = full["apartment"]
             if isinstance(apartment, dict) and apartment.get("state") == "on":

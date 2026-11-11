@@ -917,6 +917,7 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
     def _bare_intercom(self):
         app = intercom.Intercom.__new__(intercom.Intercom)
         app.abb_bridge = None
+        app._street_courier = None
         app.logs = []
         app.log = lambda msg, level="INFO": app.logs.append((level, msg))
         app.notify_target = "mikkel"
@@ -935,6 +936,27 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
         self.addCleanup(tmpdir.cleanup)
         app._state_file = Path(tmpdir.name) / "intercom_state.json"
         return app
+
+    def test_a_ring_that_matched_a_courier_names_it_in_the_push(self):
+        ring = datetime(2026, 11, 11, 10, 17, 44)
+        cases = {"gls": ("gls", ring, "Probably the GLS courier"), "wolt": ("wolt", ring, "Probably the Wolt courier"),
+                 "no source": (None, ring, "Probably the courier"),
+                 "an older ring": ("gls", ring - timedelta(seconds=11), "Intercom auto-opened")}
+        for name, (source, matched_at, title) in cases.items():
+            with self.subTest(name):
+                app = self._bare_intercom()
+                app.get_app = lambda name: None
+                app._street_courier = ("parcel", matched_at, source)
+                app._report_auto_open_success("binary_sensor.front", "lock.front",
+                                              {"ring_label": "front door", "ring_ts": ring}, 1)
+                self.assertEqual(app.pushes[0]["title"], title)
+        self.assertEqual(app.pushes[0]["message"],
+                         "Someone rang the front door and the door was unlocked automatically.")
+        app = self._bare_intercom()
+        app.get_app = lambda name: None
+        app._street_courier = ("parcel", ring, "gls")
+        app._report_auto_open_success("binary_sensor.front", "lock.front", {"ring_label": "front door"}, 1)
+        self.assertEqual(app.pushes[0]["title"], "Intercom auto-opened")
 
     def test_attachment_passed_through_on_success_push(self):
         app = self._bare_intercom()

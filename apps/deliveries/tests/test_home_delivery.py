@@ -1038,6 +1038,14 @@ class DoorCourierKindTests(unittest.TestCase):
         self.assertEqual(self.kind(parcel_out, nemlig_delivery()), "groceries")
         self.assertEqual(self.kind(parcel_out), "parcel")
 
+    def test_door_courier_is_the_entry_of_that_delivery(self):
+        parcel_out = hd.parcel_delivery(parcel(), NOW)
+        attrs = hd.snapshot([parcel_out, nemlig_delivery()], NOW)["attributes"]
+        self.assertEqual((attrs["door_courier"]["source"], attrs["door_courier"]["kind"]), ("nemlig", "groceries"))
+        attrs = hd.snapshot([parcel_out], NOW)["attributes"]
+        self.assertEqual(attrs["door_courier"]["id"], parcel_out.id)
+        self.assertIsNone(hd.snapshot([], NOW)["attributes"]["door_courier"])
+
     def test_food_still_in_the_kitchen_lets_the_parcel_answer_the_door(self):
         self.assertEqual(self.kind(delivery(stage="preparing"), hd.parcel_delivery(parcel(), NOW)), "parcel")
 
