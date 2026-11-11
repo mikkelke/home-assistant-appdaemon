@@ -674,9 +674,7 @@ class BleLadderTests(unittest.TestCase):
         self.assertIsNone(app._active_ladder)
         self.assertEqual(app._heal_stage, "gave_up")
         self.assertTrue(app._notified["divergence"])
-        self.assertEqual(app.notifications, [
-            "Bluetooth side of the Yale lock is stuck and refresh/reload didn't help - if this "
-            "persists the HA box's Bluetooth adapter may be wedged. Trust 'locked'."])
+        self.assertEqual(app.notifications, [])  # a lagging twin is logged, never pushed
         self.assertNotIn("button/press", called_services(app))
         self.assertIsNone(app._last_cloud_api_at)
 

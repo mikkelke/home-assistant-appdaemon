@@ -76,6 +76,10 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 VALID_LOCK_STATES = frozenset({"locked", "unlocked", "locking", "unlocking", "jammed"})
 TRANSITIONAL_LOCK_STATES = frozenset({"locking", "unlocking"})
 
+# A twin that lags the other is only a stale copy: the physical lock still auto-locks and the
+# other twin carries the truth, so these give-ups and all-clears are logged, never pushed.
+SILENT_KEYS = frozenset({"divergence"})
+
 # Heal-ladder rung wait times (seconds).
 REFRESH_WAIT_S = 45
 RELOAD_WAIT_S = 120
@@ -683,21 +687,21 @@ class LockHealth(hass.Hass):
         if self._divergence_due(now):
             side = self._current_stale_side
             if self._is_flapping(side, now):
-                await self._notify_flapping(side)
+                await self._log_flapping(side)
             else:
                 cause = f"Yale {self._label(side)} twin stale {self.divergence_heal_minutes:.0f} min (diverged)"
                 await self._start_ladder(side, "divergence", cause)
             return
         if self._invalid_due("ble", now):
             if self._is_flapping("ble", now):
-                await self._notify_flapping("ble")
+                await self._log_flapping("ble")
             else:
                 await self._start_ladder("ble", "ble_invalid",
                                          f"Yale Bluetooth twin invalid {self.invalid_heal_minutes:.0f} min")
             return
         if self._invalid_due("cloud", now):
             if self._is_flapping("cloud", now):
-                await self._notify_flapping("cloud")
+                await self._log_flapping("cloud")
             else:
                 await self._start_ladder("cloud", "cloud_invalid",
                                          f"Yale cloud twin invalid {self.invalid_heal_minutes:.0f} min")
@@ -992,24 +996,19 @@ class LockHealth(hass.Hass):
         self._notified[key] = True
         self._clear_since[key] = None
         self.log(f"LockHealth[{issue}]: gave up ({key}) - {message}", level="WARNING")
-        self.create_task(self._notify(message))
+        if key not in SILENT_KEYS:
+            self.create_task(self._notify(message))
         self._save_state()
 
-    # ---------- one-shot side notifications (flapping / plug unavailable) ----------
-    async def _notify_flapping(self, side):
-        # async + awaited notify: this runs on the event loop (via _maybe_start_ladder),
-        # where create_task - like the rest of the sync-style AD API - returns an un-run
-        # coroutine unless awaited. _gave_up/_notify_plug_unavailable keep create_task
-        # because they only ever run in worker-thread rung callbacks.
+    # ---------- one-shot side reports (flapping log / plug unavailable push) ----------
+    async def _log_flapping(self, side):
         key = f"flapping_{side}"
         if self._notified.get(key):
             return
         self._notified[key] = True
         self._save_state()
-        message = (f"Yale {self._label(side)} twin is flapping (repeated connect/disconnect) - "
-                   f"leaving it alone instead of reload-storming it until it settles.")
-        self.log(f"LockHealth: {side} flapping - notifying instead of healing", level="WARNING")
-        await self._notify(message)
+        self.log(f"LockHealth: Yale {self._label(side)} twin is flapping (repeated connect/disconnect) - "
+                 f"leaving it alone instead of reload-storming it until it settles", level="WARNING")
 
     def _notify_plug_unavailable(self):
         if self._notified.get("plug_unavailable"):
@@ -1041,7 +1040,8 @@ class LockHealth(hass.Hass):
                     self._heal_stage = "idle"
                 self.log(f"LockHealth: {key} cleared for {self.recovery_debounce_minutes:.0f} min - "
                          f"all-clear", level="INFO")
-                await self._notify(f"Yale lock: {self._clear_message(key)}")
+                if key not in SILENT_KEYS:
+                    await self._notify(f"Yale lock: {self._clear_message(key)}")
         if changed:
             self._save_state()
 
