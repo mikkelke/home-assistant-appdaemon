@@ -12,8 +12,22 @@ exact same thing in reverse on 2026-07-22 (stuck "unlocked" 1.5 h while the clou
 correctly saw the auto-lock). Normal operation: the twins agree within ~2-5 s, and the
 lock auto-locks ~3 min after unlock (the cloud twin's ``changed_by`` reads "Auto Lock").
 
-Without a ``bridge_plug`` the heal ladder's power-cycle rung has nothing to act on: it
-gives up and notifies at that point instead, and no plug is ever touched.
+Heal ladders (one runs at a time; every rung re-verifies that the problem is still real
+before escalating and acts only when neither twin changed within ``settle_guard_seconds``
+and the startup grace is over; a ladder whose last rung did not help gives up and
+notifies):
+  Bluetooth twin: refresh (``homeassistant.update_entity`` on the BLE twin) -> one reload
+    of the BLE config entry.
+  Cloud twin: wake button -> reload of the cloud config entry -> power-cycle of the
+    bridge plug. A rung that would overspend the Yale cloud API allowance
+    (``cloud_action_cooldown_minutes``) escalates to the next one instead; a bridge that
+    is itself down goes straight to the power-cycle.
+  Bridge: power-cycle of the bridge plug.
+The wake button and cloud reloads spend the Yale CLOUD API allowance; the Bluetooth
+refresh and reload are local and never touch it.
+
+Without a ``bridge_plug`` the power-cycle rung has nothing to act on: it gives up and
+notifies at that point instead, and no plug is ever touched.
 ``plug_power_entity`` (the plug's power meter) is an optional extra witness that a
 power-cycle really happened.
 
@@ -62,6 +76,7 @@ VALID_LOCK_STATES = frozenset({"locked", "unlocked", "locking", "unlocking", "ja
 TRANSITIONAL_LOCK_STATES = frozenset({"locking", "unlocking"})
 
 # Heal-ladder rung wait times (seconds).
+REFRESH_WAIT_S = 45
 WAKE_WAIT_S = 90
 RELOAD_WAIT_S = 120
 POWER_CYCLE_WAIT_S = 180
@@ -264,11 +279,10 @@ class LockHealth(hass.Hass):
         self.bridge_ping = a("bridge_ping", "binary_sensor.yale_bridge")
         self.bridge_plug = a("bridge_plug")
         self.wake_button = a("wake_button", "button.yale_wake")
-        self.door = a("door_open_entity", "binary_sensor.apartment_door_open")
         self.publish_entity = a("publish_entity", "sensor.apartment_lock")
         self.notify_target = a("notify_target", "mikkel")
 
-        self.divergence_heal_minutes = float(a("divergence_heal_minutes", 4))
+        self.divergence_heal_minutes = float(a("divergence_heal_minutes", 1))
         self.invalid_heal_minutes = float(a("invalid_heal_minutes", 5))
         # The bridge's own ~6-hourly reconnect blip self-heals in ~73 s (measured
         # 07-24..07-27, post-move, WITHOUT any power-cycling) - the trigger must sit
@@ -282,8 +296,6 @@ class LockHealth(hass.Hass):
         self.plug_cycle_cooldown_minutes = float(a("plug_cycle_cooldown_minutes", 15))
         self.plug_cycle_max_per_2h = int(a("plug_cycle_max_per_2h", 3))
         self.reload_max_per_2h = int(a("reload_max_per_2h", 4))
-        self.autolock_check_minutes = float(a("autolock_check_minutes", 4))
-        self.wake_nudge_cooldown_minutes = float(a("wake_nudge_cooldown_minutes", 30))
         self.recovery_debounce_minutes = float(a("recovery_debounce_minutes", 2))
         self.bridge_settle_minutes = float(a("bridge_settle_minutes", 10))
         self.cloud_action_cooldown_minutes = float(a("cloud_action_cooldown_minutes", 20))
@@ -321,7 +333,6 @@ class LockHealth(hass.Hass):
         # once the plug is confirmed back on - survives an AD restart mid-cycle so
         # _restore_plug_if_interrupted can find and fix a plug left off.
         self._plug_off_at = None
-        self._last_wake_nudge_at = None
         self._last_bridge_down_at = None
         self._last_cloud_api_at = None
 
@@ -337,9 +348,6 @@ class LockHealth(hass.Hass):
         for ent in (self.lock_bt, self.lock_cloud):
             self.listen_state(self._on_lock_change, ent)
         self.listen_state(self._on_bridge_change, self.bridge_ping)
-        self.listen_state(self._on_door_change, self.door)
-        # Separate, filtered listener just for the auto-lock corroborator (open -> closed).
-        self.listen_state(self._on_door_closed, self.door, new="off", old="on")
         self.run_every(self._tick, "now+30", 60)
         self.log(f"LockHealth initialized - last_state={self._last_state}/{self._last_source}", level="INFO")
 
@@ -401,14 +409,6 @@ class LockHealth(hass.Hass):
 
     def _on_bridge_change(self, entity, attribute, old, new, kwargs):
         self.create_task(self._eval())
-
-    def _on_door_change(self, entity, attribute, old, new, kwargs):
-        self.create_task(self._eval())
-
-    def _on_door_closed(self, entity, attribute, old, new, kwargs):
-        now = self.get_now()
-        self.run_in(self._check_autolock_corroborator, self.autolock_check_minutes * 60,
-                    door_closed_iso=now.isoformat())
 
     def _tick(self, kwargs):
         self.create_task(self._eval())
@@ -595,8 +595,6 @@ class LockHealth(hass.Hass):
 
     # ---------- suppression guards ----------
     def _guards_ok(self, now, allow_in_startup_grace=False):
-        if self.get_state(self.door) == "on":
-            return False
         for ent in (self.lock_bt, self.lock_cloud):
             changed = self._parse_ts(self.get_state(ent, attribute="last_changed"))
             if changed is not None and (now - changed).total_seconds() < self.settle_guard_seconds:
@@ -681,9 +679,7 @@ class LockHealth(hass.Hass):
         return elapsed_s >= self.bridge_down_heal_seconds
 
     async def _maybe_start_ladder(self, now):
-        # Priority order per the module spec: divergence, invalid-ble, invalid-cloud,
-        # bridge-down. The auto-lock corroborator (detector 4) is its own door-triggered
-        # path (_check_autolock_corroborator), not part of this per-tick order.
+        # Priority order: divergence, invalid-ble, invalid-cloud, bridge-down.
         if self._divergence_due(now):
             side = self._current_stale_side
             if self._is_flapping(side, now):
@@ -716,9 +712,10 @@ class LockHealth(hass.Hass):
 
     # ---------- heal ladders ----------
     # Single-flight (see _active_ladder): only one ladder is ever mid-run at a time.
-    # They all bottleneck through the same wake button / bridge plug and the same
-    # global action_cooldown_minutes gate anyway, so this keeps the machinery - and the
-    # single published heal_stage - simple without giving up real-world concurrency.
+    # They all bottleneck through the same global action_cooldown_minutes gate (and the
+    # shared bridge plug / Yale cloud API allowance) anyway, so this keeps the machinery
+    # - and the single published heal_stage - simple without giving up real-world
+    # concurrency.
     async def _start_ladder(self, issue, key, cause):
         self._active_ladder = issue
         self._ladder_key = key
@@ -736,10 +733,30 @@ class LockHealth(hass.Hass):
             return  # superseded/cancelled
         if issue == "bridge" or (issue == "cloud" and self.get_state(self.bridge_ping) == "off"):
             self._power_cycle_rung(issue)
+        elif issue == "ble":
+            self._refresh_ble(issue)
         else:
             self._heal_stage = "wake"
             self._press_wake(issue)
 
+    def _refresh_ble(self, issue):
+        now = self.get_now()
+        if not self._guards_ok(now):
+            self._abort_ladder(issue, "guard blocked refresh")
+            return
+        if not self._can_heal_act(now):
+            self._abort_ladder(issue, "cooldown blocked refresh")
+            return
+        # The BLE twin is local: no Yale cloud API allowance is spent, so unlike the wake
+        # press this neither checks _cloud_api_ok nor stamps _last_cloud_api_at.
+        self.call_service("homeassistant/update_entity", entity_id=self.lock_bt)
+        self._record_action(now)
+        self._heal_stage = "refresh"
+        self.log(f"LockHealth[{issue}]: refreshed Bluetooth twin", level="INFO")
+        self._save_state()
+        self._ladder_handle = self.run_in(self._after_first_rung, REFRESH_WAIT_S, issue=issue)
+
+    # The wake button is a Yale cloud API call, so only the cloud ladder starts with it.
     def _press_wake(self, issue):
         now = self.get_now()
         if not self._guards_ok(now):
@@ -751,7 +768,7 @@ class LockHealth(hass.Hass):
         if not self._cloud_api_ok(now):
             self.log(f"LockHealth[{issue}]: wake skipped (Yale cloud API cooldown) - escalating to reload",
                      level="INFO")
-            self._reload_rung(issue, attempt=1)
+            self._reload_rung(issue)
             return
         self.call_service("button/press", entity_id=self.wake_button)
         self._last_cloud_api_at = now
@@ -760,18 +777,18 @@ class LockHealth(hass.Hass):
                            "pressed Yale wake button")
         self.log(f"LockHealth[{issue}]: pressed wake button", level="INFO")
         self._save_state()
-        self._ladder_handle = self.run_in(self._after_wake, WAKE_WAIT_S, issue=issue)
+        self._ladder_handle = self.run_in(self._after_first_rung, WAKE_WAIT_S, issue=issue)
 
-    def _after_wake(self, kwargs):
+    def _after_first_rung(self, kwargs):
         issue = kwargs["issue"]
         if self._active_ladder != issue:
             return  # superseded/cancelled
         if not self._condition_active(issue):
             self._resolve_ladder(issue)
             return
-        self._reload_rung(issue, attempt=1)
+        self._reload_rung(issue)
 
-    def _reload_rung(self, issue, attempt):
+    def _reload_rung(self, issue):
         now = self.get_now()
         if issue == "cloud" and self.get_state(self.bridge_ping) == "off":
             self._power_cycle_rung(issue)
@@ -784,10 +801,10 @@ class LockHealth(hass.Hass):
         if not self._guards_ok(now):
             self._abort_ladder(issue, "guard blocked reload")
             return
-        # No _can_heal_act here: the global action cooldown (5 min) gates STARTING
-        # actions (ladder entry via _press_wake, nudges) - it must not gate advancing
-        # an active ladder, whose rung waits (90-120s) are deliberately shorter.
-        # Escalation is bounded by the reload/plug budgets below instead.
+        # No _can_heal_act here: the global action cooldown gates STARTING actions (a
+        # ladder's first rung, the reconcile wake press) - it must not gate advancing an
+        # active ladder, whose rung waits are deliberately shorter. Escalation is bounded
+        # by the reload/plug budgets below instead.
         if not can_act(self._reload_history, now, cooldown_s=0,
                        cap_n=self.reload_max_per_2h, cap_window_s=7200):
             self.log(f"LockHealth[{issue}]: reload budget exhausted - giving up", level="WARNING")
@@ -801,25 +818,24 @@ class LockHealth(hass.Hass):
             self._last_cloud_api_at = now
         self._record_action(now)
         self._heal_stage = "reload"
-        self._report_heal(f"Yale {self._label(issue)} twin still not right after the wake press",
-                           f"reloaded the {self._label(issue)} integration entry (attempt {attempt})")
-        self.log(f"LockHealth[{issue}]: reload attempt {attempt}", level="INFO")
+        first_rung = "the refresh" if issue == "ble" else "the wake press"
+        self._report_heal(f"Yale {self._label(issue)} twin still not right after {first_rung}",
+                           f"reloaded the {self._label(issue)} integration entry")
+        self.log(f"LockHealth[{issue}]: reloaded the {self._label(issue)} integration entry", level="INFO")
         self._save_state()
-        self._ladder_handle = self.run_in(self._after_reload, RELOAD_WAIT_S, issue=issue, attempt=attempt)
+        self._ladder_handle = self.run_in(self._after_reload, RELOAD_WAIT_S, issue=issue)
 
     def _after_reload(self, kwargs):
         issue = kwargs["issue"]
-        attempt = kwargs["attempt"]
         if self._active_ladder != issue:
             return
         if not self._condition_active(issue):
             self._resolve_ladder(issue)
             return
-        if issue == "ble" and attempt < 2:
-            self._reload_rung(issue, attempt=2)
-        elif issue == "ble":
+        # One reload per ladder: Bluetooth gives up, cloud escalates to the power-cycle.
+        if issue == "ble":
             self._gave_up(issue)
-        else:  # cloud: one reload attempt, then power-cycle
+        else:
             self._power_cycle_rung(issue)
 
     def _power_cycle_rung(self, issue):
@@ -985,7 +1001,7 @@ class LockHealth(hass.Hass):
         key = self._ladder_key or issue
         trusted = self._last_state or "unknown"
         if issue == "ble":
-            message = (f"Bluetooth side of the Yale lock is stuck and reloads didn't help - if this "
+            message = (f"Bluetooth side of the Yale lock is stuck and refresh/reload didn't help - if this "
                        f"persists the HA box's Bluetooth adapter may be wedged. Trust '{trusted}'.")
         elif issue == "cloud":
             tried = "reload/power-cycle" if self.bridge_plug else "reload"
@@ -1075,41 +1091,6 @@ class LockHealth(hass.Hass):
             "bridge_down": "the bridge is reachable again.",
         }.get(key, "back to normal.")
 
-    # ---------- auto-lock corroborator (detector 4) ----------
-    def _check_autolock_corroborator(self, kwargs):
-        door_closed_at = self._parse_ts(kwargs.get("door_closed_iso"))
-        if door_closed_at is None:
-            return
-        if self._last_state != "unlocked" or self._currently_diverged:
-            return
-        bt_changed = self._parse_ts(self.get_state(self.lock_bt, attribute="last_changed"))
-        cloud_changed = self._parse_ts(self.get_state(self.lock_cloud, attribute="last_changed"))
-        newest = max([t for t in (bt_changed, cloud_changed) if t is not None], default=None)
-        if newest is not None and newest > door_closed_at:
-            return  # something DID update since the door closed - corroborated, no nudge needed
-        self._maybe_wake_nudge(self.get_now())
-
-    def _maybe_wake_nudge(self, now):
-        if self._active_ladder is not None:
-            return
-        if (self._last_wake_nudge_at is not None
-                and (now - self._last_wake_nudge_at).total_seconds() < self.wake_nudge_cooldown_minutes * 60):
-            return
-        if not self._can_heal_act(now):
-            return
-        if not self._guards_ok(now):
-            return
-        if not self._cloud_api_ok(now):
-            return
-        self.call_service("button/press", entity_id=self.wake_button)
-        self._last_wake_nudge_at = now
-        self._last_cloud_api_at = now
-        self._record_action(now)
-        self._report_heal("Door closed while the lock still read unlocked with no corroborating update",
-                           "pressed Yale wake button (auto-lock corroborator nudge)")
-        self.log("LockHealth: auto-lock corroborator nudge - pressed wake", level="INFO")
-        self._save_state()
-
     # ---------- tie/needs_reconcile wake press ----------
     async def _maybe_reconcile_wake(self, now):
         if self._active_ladder is not None:
@@ -1188,7 +1169,6 @@ class LockHealth(hass.Hass):
                 "last_reload_at": {k: self._iso(v) for k, v in self._last_reload_at.items()},
                 "last_power_cycle_at": self._iso(self._last_power_cycle_at),
                 "plug_off_at": self._iso(self._plug_off_at),
-                "last_wake_nudge_at": self._iso(self._last_wake_nudge_at),
                 "last_bridge_down_at": self._iso(self._last_bridge_down_at),
                 "last_cloud_api_at": self._iso(self._last_cloud_api_at),
             }
@@ -1227,7 +1207,6 @@ class LockHealth(hass.Hass):
                                 "cloud": self._parse_ts(reload_at.get("cloud"))}
         self._last_power_cycle_at = self._parse_ts(data.get("last_power_cycle_at"))
         self._plug_off_at = self._parse_ts(data.get("plug_off_at"))
-        self._last_wake_nudge_at = self._parse_ts(data.get("last_wake_nudge_at"))
         self._last_bridge_down_at = self._parse_ts(data.get("last_bridge_down_at"))
         self._last_cloud_api_at = self._parse_ts(data.get("last_cloud_api_at"))
         # heal_stage is derived, not persisted directly: a "gave up" episode survives

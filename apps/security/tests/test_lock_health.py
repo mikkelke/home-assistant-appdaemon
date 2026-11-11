@@ -1,13 +1,15 @@
 # tests/test_lock_health.py - unit tests for LockHealth's pure functions
-# (classify_transition, arbitrate, can_act) plus the startup plug-restore path and the
-# optional-bridge-plug paths, which are exercised on a LockHealth built with __new__ +
-# fake AD callables.
+# (classify_transition, arbitrate, can_act) plus the startup plug-restore path, the
+# optional-bridge-plug paths, the heal ladders' first steps and the suppression guards,
+# which are exercised on a LockHealth built with __new__ + fake AD callables.
 # Run from repo root: python3 -m unittest discover -s apps/security/tests -q
 # Imports the real module by stubbing the appdaemon package (not installed locally),
 # so the code under test is the deployed code, not a duplicate.
 
 import asyncio
+import json
 import sys
+import tempfile
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -308,18 +310,23 @@ def make_app(plug_off_at=NOW - timedelta(minutes=5), plug_state="off", bridge_do
     heal_stage derived from them, clear_since deliberately never restored). The plug
     entity switch.extender always exists in the fake HA (reading plug_state); whether
     the app is CONFIGURED with it is the bridge_plug argument. `queried` records every
-    entity get_state was asked for."""
+    entity get_state was asked for. `attrs[(entity, attribute)]` answers attribute reads
+    such as last_changed; an attribute read with no entry falls back to the entity's
+    state. `events` records fire_event calls (the house feed)."""
     app = lh.LockHealth.__new__(lh.LockHealth)
     app.bridge_plug = bridge_plug
     app.plug_power_entity = plug_power_entity
     app.bridge_ping = "binary_sensor.yale_bridge"
-    app.door = "binary_sensor.apartment_door_open"
     app.lock_bt = "lock.yale_bt"
     app.lock_cloud = "lock.yale"
+    app.wake_button = "button.yale_wake"
     app.bridge_down_heal_seconds = 90.0
     app.recovery_debounce_minutes = 2.0
     app.settle_guard_seconds = 45.0
     app.startup_grace_seconds = 150.0
+    app.action_cooldown_minutes = 5.0
+    app.cloud_action_cooldown_minutes = 20.0
+    app.reload_max_per_2h = 4
     app.plug_power_floor_w = 0.5
     app.plug_cycle_cooldown_minutes = 15.0
     app.plug_cycle_max_per_2h = 3
@@ -329,7 +336,13 @@ def make_app(plug_off_at=NOW - timedelta(minutes=5), plug_state="off", bridge_do
     app._last_bridge_down_at = None
     app._last_power_cycle_at = None
     app._last_action_at = None
+    app._last_cloud_api_at = None
+    app._last_source = None
+    app._diverged_since = None
     app._plug_cycle_history = []
+    app._reload_history = []
+    app._last_reload_at = {"ble": None, "cloud": None}
+    app._history = {"ble": [], "cloud": []}
     app._startup_at = NOW - timedelta(hours=1)
     app._last_state = "locked"
     app._currently_diverged = False
@@ -345,21 +358,29 @@ def make_app(plug_off_at=NOW - timedelta(minutes=5), plug_state="off", bridge_do
     app._heal_stage = "gave_up" if bridge_down_notified else "idle"
 
     app.states = {"switch.extender": plug_state}
+    app.attrs = {}
     app.queried = []
     app.service_calls = []
     app.scheduled = []
     app.notifications = []
+    app.events = []
+    app.cancelled = []
     app.saves = []
 
     app.log = lambda *a, **kw: None
     app.get_now = lambda: NOW
     app.call_service = lambda service, **kw: app.service_calls.append((service, kw))
-    app.fire_event = lambda *a, **kw: None
+    app.fire_event = lambda *a, **kw: app.events.append((a, kw))
     app.create_task = asyncio.run
+    app.timer_running = lambda handle: True
+    app.cancel_timer = lambda handle: app.cancelled.append(handle)
     app._save_state = lambda: app.saves.append(True)
 
     def get_state(entity, **kw):
         app.queried.append(entity)
+        key = (entity, kw.get("attribute"))
+        if key in app.attrs:
+            return app.attrs[key]
         return app.states.get(entity)
 
     async def state(entity):
@@ -545,6 +566,197 @@ class PlugWithoutMeterTests(unittest.TestCase):
                          [lh.PLUG_OFF_WAIT_S, lh.PLUG_VERIFY_WAIT_S, lh.POWER_CYCLE_WAIT_S])
         app._plug_cycle_verify({"pre_switch_lc": None, "pre_meter_lu": None})
         self.assertNotIn(None, app.queried)
+
+
+def make_stale_ble_app():
+    """The BLE twin sits on 'unlocked' while the cloud twin saw the auto-lock 5 min ago:
+    BLE is the stale side and its ladder is the active one."""
+    app = make_app(plug_off_at=None, bridge_down_notified=False, bridge_down_since=None)
+    app.states.update({"lock.yale_bt": "unlocked", "lock.yale": "locked"})
+    app.attrs[("lock.yale_bt", "last_changed")] = (NOW - timedelta(minutes=90)).isoformat()
+    app.attrs[("lock.yale", "last_changed")] = (NOW - timedelta(minutes=5)).isoformat()
+    app.attrs[("lock.yale", "changed_by")] = "Auto Lock"
+    app._active_ladder = "ble"
+    app._ladder_key = "divergence"
+    app._ladder_cause = "Yale Bluetooth twin stale 1 min (diverged)"
+    return app
+
+
+def fire_next_timer(app):
+    """Run the most recently scheduled run_in callback, as AppDaemon does when it fires."""
+    cb, _delay, kw = app.scheduled.pop()
+    cb(dict(kw))
+
+
+def scheduled_steps(app):
+    return [(cb.__name__, delay, kw) for cb, delay, kw in app.scheduled]
+
+
+def called_services(app):
+    return [service for service, _kw in app.service_calls]
+
+
+class GuardTests(unittest.TestCase):
+    """Only the settle guard and the startup grace gate a rung."""
+
+    def test_an_open_door_does_not_block_healing(self):
+        app = make_app()
+        app.states["binary_sensor.apartment_door_open"] = "on"
+        self.assertTrue(app._guards_ok(NOW))
+        self.assertNotIn("binary_sensor.apartment_door_open", app.queried)
+
+    def test_a_twin_that_just_changed_blocks(self):
+        app = make_app()
+        app.attrs[("lock.yale", "last_changed")] = (NOW - timedelta(seconds=10)).isoformat()
+        self.assertFalse(app._guards_ok(NOW))
+
+    def test_startup_grace_blocks_unless_exempted(self):
+        app = make_app()
+        app._startup_at = NOW - timedelta(seconds=30)
+        self.assertFalse(app._guards_ok(NOW))
+        self.assertTrue(app._guards_ok(NOW, allow_in_startup_grace=True))
+
+
+class BleLadderTests(unittest.TestCase):
+    """The Bluetooth ladder is local end to end: refresh, one reload, give up. It never
+    presses the wake button (a Yale cloud API call) and never spends the cloud allowance."""
+
+    def assert_backed_off(self, app):
+        self.assertEqual(app.service_calls, [])
+        self.assertEqual(app.scheduled, [])
+        self.assertIsNone(app._active_ladder)
+        self.assertEqual(app._heal_stage, "idle")
+
+    def test_first_step_refreshes_the_ble_twin_and_never_presses_wake(self):
+        app = make_stale_ble_app()
+        spent = NOW - timedelta(minutes=1)  # cloud allowance just used: irrelevant here
+        app._last_cloud_api_at = spent
+        app._ladder_first_rung({"issue": "ble"})
+        self.assertEqual(app.service_calls,
+                         [("homeassistant/update_entity", {"entity_id": "lock.yale_bt"})])
+        self.assertEqual(app._heal_stage, "refresh")
+        self.assertEqual(app._last_action_at, NOW)
+        self.assertEqual(app._last_cloud_api_at, spent)  # not re-stamped
+        self.assertEqual(app.events, [])  # no house-feed line for the refresh
+        self.assertEqual(scheduled_steps(app),
+                         [("_after_first_rung", lh.REFRESH_WAIT_S, {"issue": "ble"})])
+
+    def test_a_refresh_that_works_ends_the_ladder_silently(self):
+        app = make_stale_ble_app()
+        app._ladder_first_rung({"issue": "ble"})
+        app.states["lock.yale_bt"] = "locked"  # the twin caught up
+        app.attrs[("lock.yale_bt", "last_changed")] = (NOW - timedelta(seconds=30)).isoformat()
+        fire_next_timer(app)
+        self.assertEqual(called_services(app), ["homeassistant/update_entity"])
+        self.assertIsNone(app._active_ladder)
+        self.assertEqual(app._heal_stage, "idle")
+        self.assertEqual(app.events, [])
+        self.assertEqual(app.notifications, [])
+
+    def test_still_stale_after_the_refresh_reloads_once_then_gives_up(self):
+        app = make_stale_ble_app()
+        app._ladder_first_rung({"issue": "ble"})
+
+        fire_next_timer(app)  # the refresh did not help
+        self.assertEqual(app.service_calls[-1],
+                         ("homeassistant/reload_config_entry", {"entity_id": "lock.yale_bt"}))
+        self.assertEqual(app._heal_stage, "reload")
+        self.assertEqual(len(app.events), 1)
+        self.assertEqual(app.events[0][1]["cause"], "Yale Bluetooth twin still not right after the refresh")
+        self.assertEqual(app.events[0][1]["effect"], "reloaded the Bluetooth integration entry")
+        self.assertEqual(scheduled_steps(app), [("_after_reload", lh.RELOAD_WAIT_S, {"issue": "ble"})])
+
+        fire_next_timer(app)  # the reload did not help either
+        self.assertEqual(called_services(app),
+                         ["homeassistant/update_entity", "homeassistant/reload_config_entry"])
+        self.assertEqual(app.scheduled, [])
+        self.assertEqual(app._reload_history, [NOW])
+        self.assertIsNone(app._active_ladder)
+        self.assertEqual(app._heal_stage, "gave_up")
+        self.assertTrue(app._notified["divergence"])
+        self.assertEqual(app.notifications, [
+            "Bluetooth side of the Yale lock is stuck and refresh/reload didn't help - if this "
+            "persists the HA box's Bluetooth adapter may be wedged. Trust 'locked'."])
+        self.assertNotIn("button/press", called_services(app))
+        self.assertIsNone(app._last_cloud_api_at)
+
+    def test_refresh_backs_off_when_a_twin_just_changed(self):
+        app = make_stale_ble_app()
+        app.attrs[("lock.yale", "last_changed")] = (NOW - timedelta(seconds=10)).isoformat()
+        app._ladder_first_rung({"issue": "ble"})
+        self.assert_backed_off(app)
+
+    def test_refresh_respects_the_action_cooldown(self):
+        app = make_stale_ble_app()
+        app._last_action_at = NOW - timedelta(minutes=1)
+        app._ladder_first_rung({"issue": "ble"})
+        self.assert_backed_off(app)
+
+
+class CloudLadderTests(unittest.TestCase):
+    def make_cloud_app(self):
+        app = make_app(plug_off_at=None, plug_state="on", bridge_down_notified=False, bridge_down_since=None)
+        app._active_ladder = "cloud"
+        app._ladder_key = "cloud_invalid"
+        app._ladder_cause = "Yale cloud twin invalid 5 min"
+        return app
+
+    def test_first_step_still_presses_the_wake_button(self):
+        app = self.make_cloud_app()
+        app._ladder_first_rung({"issue": "cloud"})
+        self.assertEqual(app.service_calls, [("button/press", {"entity_id": "button.yale_wake"})])
+        self.assertEqual(app._heal_stage, "wake")
+        self.assertEqual(app._last_cloud_api_at, NOW)
+        self.assertEqual(scheduled_steps(app),
+                         [("_after_first_rung", lh.WAKE_WAIT_S, {"issue": "cloud"})])
+        self.assertEqual(app.events[0][1]["cause"], "Yale cloud twin invalid 5 min")
+        self.assertEqual(app.events[0][1]["effect"], "pressed Yale wake button")
+
+    def test_reload_keeps_the_wake_press_wording_then_power_cycles(self):
+        app = self.make_cloud_app()
+        app._reload_rung("cloud")
+        self.assertEqual(app.service_calls,
+                         [("homeassistant/reload_config_entry", {"entity_id": "lock.yale"})])
+        self.assertEqual(app.events[0][1]["cause"], "Yale cloud twin still not right after the wake press")
+        self.assertEqual(app.events[0][1]["effect"], "reloaded the cloud integration entry")
+        self.assertEqual(scheduled_steps(app), [("_after_reload", lh.RELOAD_WAIT_S, {"issue": "cloud"})])
+        fire_next_timer(app)  # still invalid after the reload
+        self.assertEqual(app.service_calls[-1], ("switch/turn_off", {"entity_id": "switch.extender"}))
+        self.assertEqual(app._heal_stage, "power_cycle")
+
+
+class StateFileTests(unittest.TestCase):
+    """The state file outlives code versions: a key a newer build no longer knows must
+    load without complaint, and must not be written back."""
+
+    def make_file_app(self, tmp):
+        app = make_app(plug_off_at=None, bridge_down_notified=False, bridge_down_since=None)
+        app._state_file = Path(tmp) / "lock_health_state.json"
+        app.logs = []
+        app.log = lambda msg, **kw: app.logs.append((kw.get("level"), msg))
+        return app
+
+    def test_load_tolerates_the_retired_wake_nudge_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_file_app(tmp)
+            app._state_file.write_text(json.dumps({
+                "last_state": "unlocked",
+                "last_action_at": NOW.isoformat(),
+                "last_wake_nudge_at": NOW.isoformat(),
+            }))
+            app._load_state()
+            self.assertEqual(app.logs, [])
+            self.assertEqual(app._last_state, "unlocked")
+            self.assertEqual(app._last_action_at, NOW)
+
+    def test_save_does_not_write_the_retired_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.make_file_app(tmp)
+            lh.LockHealth._save_state(app)  # the real one: make_app stubs the instance attribute
+            self.assertEqual(app.logs, [])
+            data = json.loads(app._state_file.read_text())
+            self.assertNotIn("last_wake_nudge_at", data)
+            self.assertIn("last_cloud_api_at", data)
 
 
 if __name__ == "__main__":
