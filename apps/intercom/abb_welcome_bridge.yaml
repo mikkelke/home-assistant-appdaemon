@@ -110,9 +110,13 @@ AbbWelcomeBridge:
   announce_message_courier: "Door is opening. Fifth floor."
   delivery_entity: "sensor.home_delivery"
   # Voices during a recording go THROUGH the recording's call (play_audio into the
-  # open stream's talkback leg) using this TTS engine - so video and voice run
-  # together instead of the voice being skipped. "" disables in-recording voices.
+  # open stream's talkback leg) - so video and voice run together instead of the
+  # voice being skipped. The voice is AssistTtsFailover's announcement voice; this
+  # engine and language are used only while that app is not running. The language
+  # must be given: without it Piper picks an arbitrary one of its voices.
+  # "" disables in-recording voices.
   voice_tts_entity: "tts.piper"
+  voice_tts_language: "en_US"
   # Which call the sentence lands in decides whether anyone hears it. The
   # station does NOT render audio on its own ring call (114 clean packets,
   # three human nulls at the door) but DOES on a call HA dialled. The

@@ -111,6 +111,8 @@ def _bare_bridge(tmpdir, clock):
     app.delivery_entity = "sensor.home_delivery"
     app.announce_cooldown_s = 90
     app.voice_tts_entity = "tts.piper"
+    app.voice_tts_language = "en_US"
+    app.get_app = lambda name: None
     app.voice_start_delay_s = 9.0
     app.voice_retry_interval_s = 1.0
     app.voice_retry_attempts = 10
@@ -1342,6 +1344,27 @@ class RingClipTests(unittest.TestCase):
         self.assertIn("The%20door%20is%20open.", media)
         # and crucially: no announce (temporary-call) service went out
         self.assertNotIn("abb_welcome/announce", [c[0] for c in new_calls])
+
+    def test_voices_speak_in_the_announcement_voice_of_the_moment(self):
+        class Failover:
+            def announcement_media_id(self, message):
+                return f"media-source://tts/tts.kokoro?message={message}"
+        self.app.get_app = lambda name: Failover() if name == "AssistTtsFailover" else None
+        self.app._open_episode("front door", "100000002", self.clock.now())
+        _run_scheduled(self.app, "_start_clip")
+        n_calls = len(self.app.service_calls)
+        self.app._door_voice("front door", "One moment, please.")
+        media = self.app.service_calls[n_calls][1]["media"]["media_content_id"]
+        self.assertEqual(media, "media-source://tts/tts.kokoro?message=One moment, please.")
+
+    def test_without_the_failover_voices_fall_back_to_the_configured_engine_in_its_language(self):
+        def boom(name):
+            raise RuntimeError("not loaded")
+        for get_app in (lambda name: None, boom):
+            with self.subTest(get_app=get_app):
+                self.app.get_app = get_app
+                self.assertEqual(self.app._voice_media_id("Door is opening."),
+                                 "media-source://tts/tts.piper?message=Door%20is%20opening.&language=en_US")
 
     def test_disabled_tts_keeps_voices_silent_while_recording(self):
         self.app.voice_tts_entity = ""

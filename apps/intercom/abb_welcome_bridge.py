@@ -299,6 +299,7 @@ class AbbWelcomeBridge(hass.Hass):
         # abb_welcome/play_audio, which injects into the open stream's talkback leg
         # instead of dialing its own call). Empty disables in-recording voices.
         self.voice_tts_entity = str(self.args.get("voice_tts_entity", "tts.piper"))
+        self.voice_tts_language = str(self.args.get("voice_tts_language", "en_US"))
         # WHICH CALL the sentence lands in decides whether anyone hears it.
         # The station does NOT render audio on its own ring call - 114 clean
         # packets, zero send errors, three separate human nulls at the door.
@@ -1360,6 +1361,19 @@ class AbbWelcomeBridge(hass.Hass):
                 return True
         return False
 
+    def _voice_media_id(self, message):
+        """The TTS media-source id of message: AssistTtsFailover's voice of the moment, else voice_tts_entity."""
+        try:
+            failover = self.get_app("AssistTtsFailover")
+            if failover:
+                return failover.announcement_media_id(message)
+        except Exception as e:
+            self.log(f"AssistTtsFailover.announcement_media_id() failed, using {self.voice_tts_entity}: {e}",
+                     level="WARNING")
+        from urllib.parse import quote
+        return (f"media-source://tts/{self.voice_tts_entity}?message={quote(message)}"
+                f"&language={quote(self.voice_tts_language)}")
+
     def _voice_into_recording(self, door, camera, message):
         """Inject a spoken sentence into the LIVE recording call via play_audio's
         talkback leg. The media id is HA's TTS media-source URL; the integration
@@ -1372,8 +1386,7 @@ class AbbWelcomeBridge(hass.Hass):
         if not self.voice_tts_entity:
             return False
         try:
-            from urllib.parse import quote
-            media_id = f"media-source://tts/{self.voice_tts_entity}?message={quote(message)}"
+            media_id = self._voice_media_id(message)
             result = self.call_service(
                 "abb_welcome/play_audio",
                 entity_id=camera,

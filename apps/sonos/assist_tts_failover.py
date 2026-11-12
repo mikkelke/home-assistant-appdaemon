@@ -6,9 +6,12 @@ path a spoken answer takes. down_after failures in a row move the pipeline's tts
 tts_language to the fallback; up_after successes in a row, with the primary entity loaded in Home Assistant,
 move them back.
 
-Announcements follow the same health, not the pipeline: SonosNotifier asks announcement_voice() for every
-render, so a pipeline set to another engine by hand does not change them.
+Announcements follow the same health, not the pipeline: SonosNotifier asks announcement_voice() and the
+door-station bridge announcement_media_id() for every sentence, so a pipeline set to another engine by hand
+does not change them.
 """
+
+from urllib.parse import quote, urlencode
 
 from assist_stt_failover import AssistSttFailover, _event, _read_event, run_probe
 
@@ -47,7 +50,17 @@ class AssistTtsFailover(AssistSttFailover):
 
         The primary's unless the probes say it is down; unknown counts as the primary.
         """
-        return self._voice("fallback" if self.verdict.healthy is False else "primary")
+        return self._voice(self._announcement_side())
+
+    def announcement_media_id(self, message):
+        """Home Assistant's TTS media-source id that speaks message in the voice an announcement should use now."""
+        side = self._announcement_side()
+        query = urlencode({"message": message, "language": self.args[f"{side}_language"],
+                           "voice": self.args[f"{side}_voice"]}, quote_via=quote)
+        return f"media-source://tts/{self.args[f'{side}_entity']}?{query}"
+
+    def _announcement_side(self):
+        return "fallback" if self.verdict.healthy is False else "primary"
 
     def precache_voices(self):
         """The voices worth rendering ahead: the fallback always, the primary unless it is down."""

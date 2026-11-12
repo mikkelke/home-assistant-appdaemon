@@ -346,6 +346,15 @@ class AnnouncementVoice(unittest.TestCase):
         app.announcement_voice()["options"]["voice"] = "changed"
         self.assertEqual(app.announcement_voice(), PRIMARY_VOICE)
 
+    def test_the_door_station_media_id_names_engine_language_and_voice_of_the_moment(self):
+        app = self.app()
+        self.assertEqual(app.announcement_media_id("Door is opening. Fifth floor."),
+                         "media-source://tts/tts.fast?message=Door%20is%20opening.%20Fifth%20floor."
+                         "&language=en&voice=fast-voice")
+        cycle(app, False, False)
+        self.assertEqual(app.announcement_media_id("Ok."),
+                         "media-source://tts/tts.local?message=Ok.&language=en_US&voice=local-voice")
+
     def test_the_voices_to_render_ahead_are_both_while_the_primary_is_not_known_to_be_down(self):
         app = self.app()
         self.assertEqual(app.precache_voices(), [PRIMARY_VOICE, FALLBACK_VOICE])
