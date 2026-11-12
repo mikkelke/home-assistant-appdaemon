@@ -196,6 +196,7 @@ class Monitor(unittest.TestCase):
         attrs = self.run_to(app, 21, 0.01)
         self.assertEqual(attrs["programme_duration_min"], app._get_programme_duration("bomuld", "30°C", use_learned=False))
         self.assertNotEqual(attrs["programme_duration_min"], 180)
+        self.assertEqual(app._classify_programme(), ("bomuld", "30°C"))
 
     def test_the_marks_are_never_an_entity_attribute(self):
         attrs = self.run_to(self.running_app(), 21, 0.01)

@@ -78,8 +78,6 @@ def make_restore_app(*, cycle_start=CYCLE_START, last_changed=WIPE_LAST_CHANGED,
     app.detected_temperature = None
     app.programme_confirmed_by_user = False
     app.confirmed_by_username = None
-    app.expected_dur_at_start = None
-    app._guard_bar_class = None
     app._delayed_start_trimmed = False
     app.start_time = None
     app.energy_start = None

@@ -83,7 +83,6 @@ class RunningTickPublishesTheTailEta(unittest.TestCase):
 
     def test_each_spin_moves_the_published_end_to_the_one_it_gives(self):
         tick(self.app, self.clock, 60)
-        held = (self.app.expected_dur_at_start, self.app._guard_bar_class)
         for t, end_s, remaining, pct in ((1040, 4000, 49, 70), (2300, 4120, 30, 82), (3320, 4000, 11, 93)):
             a = tick(self.app, self.clock, t)
             with self.subTest(second=t):
@@ -91,8 +90,6 @@ class RunningTickPublishesTheTailEta(unittest.TestCase):
                 self.assertEqual(a["estimated_remaining_min"], remaining)
                 self.assertEqual(a["progress_pct"], pct)
                 self.assertEqual(a["programme_duration_min"], 159)
-                self.assertEqual(a["expected_dur_at_start"], 159)
-        self.assertEqual((self.app.expected_dur_at_start, self.app._guard_bar_class), held)
         self.assertEqual(self.app.state, "Running")
 
     def test_the_spins_outlive_their_reads_in_the_ring(self):
@@ -151,6 +148,33 @@ class OtherProgrammesKeepTheStaticEta(unittest.TestCase):
         a = tick(app, clock, 3900)
         self.assertEqual(a["estimated_end_time"], local(app, 4000))
         self.assertEqual(a["programme_duration_min"], 159)
+
+
+class UserChoiceSetsTheDuration(unittest.TestCase):
+    """The programme and temperature the user picks give the published duration at once, in either order: a programme
+    picked before its temperature does not leave the cold fallback's duration behind."""
+
+    def choose(self, app, entity, value):
+        old = app.states.get(entity)
+        app.states[entity] = value
+        app._on_confirm_changed(entity, "state", old, value, {})
+        return trs.last_publish(app)["attributes"]["programme_duration_min"]
+
+    def test_programme_then_a_shorter_temperature_lowers_the_duration(self):
+        app, _ = running_app()
+        app.states[TEMPERATURE] = ""
+        cold = self.choose(app, CONFIRM, "Bomuld")
+        warm = self.choose(app, TEMPERATURE, "60°C")
+        self.assertLess(warm, cold)
+        self.assertEqual(warm, app._get_programme_duration("bomuld", "60°C", use_learned=False))
+
+    def test_a_shorter_programme_replaces_a_longer_one(self):
+        app, _ = running_app()
+        self.choose(app, CONFIRM, "ECO")
+        eco = self.choose(app, TEMPERATURE, "60°C")
+        bomuld = self.choose(app, CONFIRM, "Bomuld")
+        self.assertLess(bomuld, eco)
+        self.assertEqual(bomuld, app._get_programme_duration("bomuld", "60°C", use_learned=False))
 
 
 class TailEtaLog(unittest.TestCase):

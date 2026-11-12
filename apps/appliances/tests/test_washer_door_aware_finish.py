@@ -13,6 +13,7 @@
 #   FIX 4  Unemptied reconciler: an ajar door (open edge in history, contact reads closed now)
 #          moves Unemptied -> Emptied.
 #   REGRESSION GUARD: an untouched-door standby finish still announces Unemptied.
+#   POWER GATE: a standby finish skips the recorder power-pattern gate; a plain low-power finish is held to it.
 #
 # Only the AppDaemon surface and the feedback/notify/classify LEAVES are faked; every door /
 # freshness / reconcile decision runs for real. Any state_file stays in a tmpdir (none is needed
@@ -39,6 +40,7 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     sys.modules["appdaemon.plugins.hass"] = hassmod
     sys.modules["appdaemon.plugins.hass.hassapi"] = hassapi
 
+import washer_classify as wcls  # noqa: E402
 import washer_monitor as wm  # noqa: E402
 from washer_plug_fixture import attach_plug  # noqa: E402
 
@@ -91,13 +93,9 @@ def make_finish_app(
     app.notification_sent = False
     app.programme_confirmed_by_user = False
     app.confirmed_by_username = None
-    app.expected_dur_at_start = None
     app.heating_phase_count = 0
     app.max_power_seen = 40.0
     app.observed_heating = True
-    app._guard_bar_class = None
-    app._live_class_key = None
-    app._live_class_since = None
     app._cycle_actor = None
     app._session_cost_kr = 0.0
     app.track_cycle_cost = False
@@ -268,6 +266,39 @@ class RegressionGuardUntouchedDoor(unittest.TestCase):
         self.assertEqual(app.mobile_calls, [])
         self.assertEqual(len(app.saved_feedback), 1)
         self.assertEqual(app.saved_feedback[0]["end_reason"], "standby")
+
+
+class PowerGate(unittest.TestCase):
+    """The standby end reason carries its own evidence (consecutive plug reads at standby after wash activity), so it
+    skips the recorder power-pattern gate; a plain low-power finish is held to a gate that refuses."""
+
+    def gated_app(self, pending_end_reason):
+        app = make_finish_app(pending_end_reason=pending_end_reason, door_now="off", door_history=[])
+        app.gate_queries = []
+        app._power_looks_like_cycle_end = lambda *a, **kw: (app.gate_queries.append(1) or (False, 200.0, 500.0))
+        return app
+
+    def test_the_standby_end_reason_skips_the_gate_and_is_published(self):
+        app = self.gated_app("standby")
+        app._transition_to_unemptied()
+        self.assertEqual(app.state, "Unemptied")
+        self.assertEqual(app.gate_queries, [])
+        unemptied = [c for c in app.set_state_calls if c["state"] == "Unemptied"]
+        self.assertEqual(len(unemptied), 1)
+        self.assertEqual(unemptied[0]["attributes"]["end_reason"], "standby")
+        self.assertTrue(unemptied[0]["attributes"]["cycle_complete"])
+
+    def test_a_plain_low_power_finish_is_held_to_the_gate(self):
+        app = self.gated_app(None)
+        app._transition_to_unemptied()
+        self.assertEqual(app.state, "Running")
+        self.assertEqual(app.gate_queries, [1])
+        self.assertEqual(app.sonos_calls, [])
+        self.assertEqual(app.saved_feedback, [])
+
+    def test_end_reasons_are_known_transition_paths(self):
+        for reason in ("standby", "spin_end", "standby_backstop", "tail_to_standby", "anti_crease_pattern"):
+            self.assertIn(reason, wcls.KNOWN_TRANSITION_PATHS)
 
 
 class DrumCleanFinish(unittest.TestCase):

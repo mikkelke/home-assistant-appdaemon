@@ -11,8 +11,7 @@
 # 13:24 (progress_pct 24 instead of ~93) and finish detection was blocked for ~1.5h.
 #
 # Two fixes under test, driving the REAL WasherMonitor._check_energy_finish (and, for the
-# reset case, _reset_cycle_tracking) end to end (same WasherMonitor.__new__ harness style as
-# test_washer_guard_bar.py):
+# reset case, _reset_cycle_tracking) end to end (WasherMonitor.__new__ with the AppDaemon surface faked):
 #   (a) self._entity_recreated_at, stamped in initialize() when the state entity was found
 #       erased - the "entity last_changed = cycle 2 start" correction (block C) now skips
 #       whenever the candidate last_changed falls within a 5s window of our own recreation
@@ -93,20 +92,14 @@ def make_app(start_time, start_time_source, entity_recreated_at, entity_last_cha
 
     app.energy_start = None
 
-    # Classification / guard bar
+    # Classification
     app.confirm_entity = None
     app.temperature_entity = None
     app.programme_confirmed_by_user = False
     app.observed_heating = True
     app.heating_phase_count = 2
     app.max_power_seen = 2114.0
-    app.expected_dur_at_start = None
-    app._guard_bar_class = None
-    app._live_class_key = None
-    app._live_class_since = None
     app._history_centroids = {}
-    app.guard_reclass_stable_minutes = 15.0
-    app.guard_energy_disproof_margin = 1.10
     app.detected_programme = "unknown"
     app.detected_temperature = None
 
