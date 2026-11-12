@@ -49,6 +49,7 @@ Duration, progress, announcement:
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 import collections
+import json
 import time
 import os
 import uuid
@@ -61,6 +62,7 @@ from pathlib import Path
 # These hold the pure parts - tables, signal maths, classification, feedback shaping -
 # while every stateful, AppDaemon-coupled method stays on WasherMonitor below.
 import washer_classify as wcls
+import washer_eta as weta
 import washer_feedback as wfb
 import washer_history as whist
 import washer_power as wpow
@@ -133,6 +135,15 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
     # The oldest door close still taken as the moment the machine was loaded.
     LOAD_ANCHOR_MAX_AGE_S = 12 * 3600
 
+    # RunProfiles' extraction cache: the energy profile of each past wash, for the ETA of an unconfirmed run.
+    RUN_PROFILES_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_profiles_cache_state.json")
+
+    # The feedback records the ETA history is built from, that history, and this cycle's own energy marks with the
+    # (elapsed_min, kWh) of its last tick - see washer_eta.py. Assigned, never mutated.
+    _eta_cycles = ()
+    _eta_history = ()
+    _eta_marks = ()
+    _eta_prev = None
 
     def _get_profile(self, programme: str, temperature=None):
         """Return the flat profile dict for a programme + optional temperature.
@@ -530,6 +541,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             "expected_dur_key": lambda: self._guard_bar_key_str(),
             "programme_confirmed_by_user": lambda: bool(self.programme_confirmed_by_user),
             "programme_confirmed_by": lambda: self.confirmed_by_username or "",
+            "eta_marks": lambda: list(self._eta_marks),
             # Deliberately deferred: _delay_waiting / _delay_plateau_start interact with
             # _slide_start_for_delayed_start in ways needing separate study - only the
             # already-applied outcome (delayed_start_trimmed) is persisted.
@@ -1489,6 +1501,9 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             if store_data.get("observed_heating"):
                 self.observed_heating = True
             self.door_opened_during_cycle = bool(store_data.get("door_opened_during_cycle"))
+            stored_marks = store_data.get("eta_marks")
+            if isinstance(stored_marks, list):
+                self._eta_marks = [m if isinstance(m, (int, float)) else None for m in stored_marks]
         else:
             if store_data is not None:
                 self.log(
@@ -4110,6 +4125,9 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         self._guard_bar_class = None
         self._live_class_key = None
         self._live_class_since = None
+        self._eta_marks = []
+        self._eta_prev = None
+        self._refresh_eta_history()
         self._delay_plateau_start = None
         self._delayed_start_trimmed = False
         self._delay_waiting = False
@@ -4208,6 +4226,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         self.detected_programme = "unknown"
         self.detected_temperature = None
         profile = self._get_profile("unknown")
+        start_dur = weta.typical_total_after(self._eta_history, [], 0.0, 0) or profile["duration_min"]
         attrs = {
             "detected_programme": "unknown",
             "detected_temperature": "",
@@ -4219,9 +4238,9 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             "started_at_display": self.start_time.astimezone(self._local_tz()).strftime("%H:%M"),
             "elapsed_minutes": 0,
             "progress_pct": 0,
-            "estimated_remaining_min": self._falsy_drop_safe(profile["duration_min"]),
-            "estimated_end_time": (self.start_time + timedelta(minutes=profile["duration_min"])).astimezone(self._local_tz()).strftime("%H:%M"),
-            "programme_duration_min": profile["duration_min"],
+            "estimated_remaining_min": self._falsy_drop_safe(start_dur),
+            "estimated_end_time": (self.start_time + timedelta(minutes=start_dur)).astimezone(self._local_tz()).strftime("%H:%M"),
+            "programme_duration_min": start_dur,
             "delayed_start_trimmed": bool(self._delayed_start_trimmed),
             "delayed_start_waiting": bool(self._delay_waiting),
             "supports_soak": bool(self.option_soak_entity),
@@ -4739,7 +4758,24 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         buckets, centroids, skipped_unconfirmed = wfb.aggregate_cycles(cycles, self.PROGRAMME_PROFILES)
         self._history_centroids = centroids
         self._learned_durations = {k: {"n": len(b["durations"]), "avg": sum(b["durations"]) / len(b["durations"])} for k, b in buckets.items() if b["durations"]}
+        self._eta_cycles = cycles
+        self._refresh_eta_history()
         return skipped_unconfirmed
+
+    def _refresh_eta_history(self):
+        """The ETA history (washer_eta.eta_history) from the feedback records last loaded and the energy profiles
+        RunProfiles has extracted so far; without a readable cache the washes count by duration alone."""
+        try:
+            with open(self.RUN_PROFILES_CACHE, "r") as f:
+                entries = json.load(f).get("entries")
+        except Exception:
+            entries = None
+        self._eta_history = weta.eta_history(self._eta_cycles, entries if isinstance(entries, dict) else {})
+
+    def _note_eta_marks(self, elapsed_min, kwh):
+        """Record this tick's reading towards the run's energy marks. Memory and the cycle store only: never an entity attribute."""
+        self._eta_marks = weta.note_marks(self._eta_marks, self._eta_prev, elapsed_min, kwh)
+        self._eta_prev = (elapsed_min, kwh)
 
     def _load_and_apply_feedback(self):
         """Load washer_feedback.json and apply learned programme data.
@@ -5913,6 +5949,8 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         self._guard_bar_class = None
         self._live_class_key = None
         self._live_class_since = None
+        self._eta_marks = []
+        self._eta_prev = None
 
         # Re-arm the max-running-hours watchdog from the real start.
         self._safe_cancel_timer(self.running_watchdog_timer)
@@ -6109,32 +6147,21 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             except Exception:
                 pass
         profile = self._get_profile(new_prog, new_temp)
-        # ETA display: when user has selected a programme, use that duration so countdown matches
-        # what they chose. When on Auto, use expected_dur_at_start (from classification) so we don't
-        # show a wrong long countdown from an early wrong classification.
+        # ETA display: a programme the user has selected gives its own duration, so the countdown matches what they
+        # chose. On Auto the run is expected to last like the household's washes that resemble it so far (washer_eta.py),
+        # and like the classified programme once too few washes lasted longer.
         user_has_selected = bool(
             self.programme_confirmed_by_user
             and self.confirm_entity
             and (self.get_state(self.confirm_entity) or "").strip() not in ("", "Auto (unconfirmed)", "unknown", "unavailable")
         )
-        if user_has_selected:
-            effective_dur = self._get_programme_duration(eta_prog, eta_temp, use_learned=False)
-        elif self.expected_dur_at_start is not None:
-            effective_dur = self.expected_dur_at_start
-        else:
-            effective_dur = self._get_programme_duration(eta_prog, eta_temp, use_learned=False)
-        # Eco/strygelet ambiguity blend when < 130 min (only when on Auto - if user selected ECO, use ECO duration)
-        if eta_prog == "eco" and new_prog == "eco" and not self.programme_confirmed_by_user and not user_has_selected:
-            run_min = (self._now_utc() - self.start_time).total_seconds() / 60
-            if run_min < 130:
-                strygelet_dur = self._get_programme_duration("strygelet", None, use_learned=False)
-                eco_dur = self._get_programme_duration("eco", None, use_learned=False)
-                energy_used = self._get_energy_used()
-                if run_min >= 60 and energy_used < 0.52:
-                    effective_dur = strygelet_dur
-                else:
-                    blend = min(1.0, run_min / 130.0)
-                    effective_dur = round(strygelet_dur + blend * (eco_dur - strygelet_dur))
+        now = self._now_utc()
+        elapsed_min = (now - self.start_time).total_seconds() / 60 if self.start_time else 0.0
+        static_dur = self._get_programme_duration(eta_prog, eta_temp, use_learned=False)
+        kwh = self._get_energy_used()
+        self._note_eta_marks(elapsed_min, kwh)
+        effective_dur = static_dur if user_has_selected else (
+            weta.typical_total_after(self._eta_history, self._eta_marks, kwh, elapsed_min) or static_dur)
         effective_dur += self._soak_offset_minutes()
         # Merge new attrs into existing HA state so persisted fields
         # (programme_confirmed_by_user, programme_confirmed_by, last_off_at, etc.)
@@ -6182,12 +6209,10 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             attrs["cycle_start_time"] = self._format_utc(self.start_time)
             attrs["cycle_start_time_local"] = self._format_local(self.start_time)
             attrs["started_at_display"] = self.start_time.astimezone(self._local_tz()).strftime("%H:%M")
-            now = self._now_utc()
-            elapsed_min = (now - self.start_time).total_seconds() / 60
             remaining = max(0, round(effective_dur - elapsed_min))
             est_end = self.start_time + timedelta(minutes=effective_dur)
             total_min = effective_dur
-            tail_end = self._tail_eta_utc(eta_prog, now)
+            tail_end = self._tail_eta_utc(eta_prog if user_has_selected else None, now)
             if tail_end is not None:
                 est_end = tail_end
                 remaining = max(0, round((est_end - now).total_seconds() / 60))

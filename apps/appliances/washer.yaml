@@ -516,8 +516,9 @@ washer_monitor:
   # ============================================================================
   #
   # Programme input_select (confirm_entity): YOUR choice only — the app does not write predictions there.
-  #   Leave "Auto (unconfirmed)" to use energy-based classification for ETA/guards; pick a programme to lock
-  #   duration and guards to that profile (programme_confirmed_by_user on state_entity becomes true).
+  #   Leave "Auto (unconfirmed)" and the ETA follows the household's own washes that resemble the run so far
+  #   (washer_eta.py); pick a programme to lock duration and guards to that profile (programme_confirmed_by_user
+  #   on state_entity becomes true).
   # Predicted programme (while on Auto): attributes on state_entity — predicted_programme,
   #   predicted_programme_label, predicted_temperature — pure signature estimate; cleared when you confirm
   #   a programme. Lovelace: e.g. {{ state_attr('sensor.washer_state','predicted_programme_label') }}.
