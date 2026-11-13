@@ -96,7 +96,7 @@ RoomFeel:
           rh_attribute: current_humidity
           label: salus_family
           fallback_only: true
-          offset_c: -0.5
+          offset_c: 0.0
       floor_entity: sensor.living_room_floor_thermometer_temperature
       floor_offset_c: 0.2
       floor_rh_entity: sensor.living_room_floor_thermometer_humidity
@@ -127,7 +127,7 @@ RoomFeel:
           rh_attribute: current_humidity
           label: salus_family
           fallback_only: true
-          offset_c: -0.2
+          offset_c: 0.3
       # No floor thermometer in the kitchen.
       window_contacts: [binary_sensor.kitchen_window_contact]
       air_quality:
@@ -160,7 +160,7 @@ RoomFeel:
           rh_attribute: current_humidity
           label: salus_family
           fallback_only: true
-          offset_c: -0.9
+          offset_c: -0.4
       floor_entity: sensor.dining_room_floor_thermometer_temperature
       floor_offset_c: -0.6
       floor_rh_entity: sensor.dining_room_floor_thermometer_humidity
@@ -191,7 +191,7 @@ RoomFeel:
           rh_entity: climate.family_room_thermostat
           rh_attribute: current_humidity
           label: salus_family
-          offset_c: -0.3
+          offset_c: 0.2
       # No hallway floor thermometer and no known exterior window/door contact (interior
       # corridor) - window_contacts intentionally empty.
       window_contacts: []

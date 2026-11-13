@@ -1108,11 +1108,11 @@ class ShippedRoomFeelConfig(unittest.TestCase):
     def test_seated_references_and_source_offsets(self):
         expected = {
             "living_room": ("median", [("seated", 0.0), ("fp300", 0.1),
-                                        ("salus_monitor", 0.2), ("salus_family", -0.5)], 0.2),
+                                        ("salus_monitor", 0.2), ("salus_family", 0.0)], 0.2),
             "kitchen": ("median", [("seated", 0.0), ("fp300", 0.45),
-                                    ("ceiling", -0.1), ("salus_family", -0.2)], None),
+                                    ("ceiling", -0.1), ("salus_family", 0.3)], None),
             "dining_room": ("primary", [("seated", 0.0), ("fp300", 0.15),
-                                         ("salus_family", -0.9)], -0.6),
+                                         ("salus_family", -0.4)], -0.6),
             "claudias_room": ("primary", [("seated", 0.0), ("fp300", 0.1), ("salus", 0.4)], 0.6),
             "kristines_room": ("primary", [("seated", 0.0), ("salus", 0.1)], -0.2),
             "bedroom": ("primary", [("seated", 0.0), ("salus", 0.4), ("fp300", 0.3)], 0.2),

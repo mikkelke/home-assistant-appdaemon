@@ -434,7 +434,7 @@ class ShippedYaml(unittest.TestCase):
         self.assertEqual([z[n].base_c for n in ZONES], [21.5, 20.5, 21.5, 22.0, 20.0])
         self.assertEqual([z[n].lower_c for n in ZONES], [19.0, 19.0, 19.0, 19.0, 18.0])
         self.assertEqual([z[n].upper_c for n in ZONES], [24.0, 24.0, 24.0, 25.0, 24.0])
-        self.assertEqual(z["family"].protected_min_c, 21.0)
+        self.assertEqual(z["family"].protected_min_c, 20.5)
         self.assertEqual(z["kristines_room"].trim, hp.TrimConfig(1.2, -1.0, 2.0))
         self.assertEqual(self.cfg.sun_term_factor, 0.5)
         self.assertEqual(self.cfg.keypad_relock_minutes, 15)
@@ -2330,8 +2330,8 @@ class SunCut(unittest.TestCase):
         h.tick()
         a = h.attrs("family")
         self.assertEqual(a["mode"], "sun_cut")
-        # aim: the day target 21.5 at 12:00, capped at 21.0, plus the trim of 0.5
-        self.assertEqual(a["setpoint_now"], 21.5)
+        # aim: the day target 21.5 at 12:00, capped at 20.5, plus the trim of 0.5
+        self.assertEqual(a["setpoint_now"], 21.0)
         self.assertEqual(
             a["cut_window"], ["2026-10-18T07:00:00+02:00", "2026-10-18T16:00:00+02:00"]
         )

@@ -161,7 +161,7 @@ HeatingController:
       base_c: 21.5
       lower_limit_c: 19.0
       upper_limit_c: 24.0
-      protected_min_c: 21.0
+      protected_min_c: 20.5
       profile:
         lead_hours: 4
         periods:
