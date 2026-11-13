@@ -58,7 +58,7 @@ RoomFeel:
           attribute: current_temperature
           rh_entity: sensor.bedroom_humidity
           label: salus
-          offset_c: -0.1
+          offset_c: 0.4
         - entity: sensor.bedroom_presence_temperature
           rh_entity: sensor.bedroom_presence_humidity
           label: fp300
