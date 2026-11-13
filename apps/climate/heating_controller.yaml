@@ -172,6 +172,8 @@ HeatingController:
       # setpoint rises by (u_eq - bias) / gain, at most max_c, with u_eq the day's expected duty
       # at the lead time. gain and bias are the thermostat's band: duty per K, duty at the setpoint.
       weather_offset: {gain: 0.85, bias: 0.22, max_c: 1.5}
+      # ITLC keeps calling for heat while the thermostat reads above its setpoint.
+      warm_hold: {enter_c: 1.0, release_c: 0.6}
       sun_cut: {enabled: true, azimuth: [100, 260], ghi_min: 150, before_hours: 2, end_before_hours: 1, credit_ratio: 0.5}
 
     kristines_room:

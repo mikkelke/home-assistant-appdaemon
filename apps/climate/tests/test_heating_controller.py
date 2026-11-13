@@ -101,6 +101,14 @@ def shipped_args(tmp: Path) -> dict:
     return args
 
 
+def zones_without_warm_hold() -> dict:
+    """The shipped zones less the family warm hold. The fixture thermostats read 22.8 around
+    the clock, which is more than a degree over the family hold setpoint at night."""
+    zones = copy.deepcopy(shipped_args(Path("."))["zones"])
+    del zones["family"]["warm_hold"]
+    return zones
+
+
 class Clock:
     def __init__(self, now=NOW):
         self.now = now
@@ -539,6 +547,10 @@ class ShippedYaml(unittest.TestCase):
             n: zc.weather_offset for n, zc in self.cfg.zones.items() if zc.weather_offset.enabled
         }
         self.assertEqual(shipped, {"family": hp.WeatherOffsetConfig(True, 0.85, 0.22, 1.5)})
+
+    def test_only_the_family_zone_ships_a_warm_hold(self):
+        shipped = {n: zc.warm_hold for n, zc in self.cfg.zones.items() if zc.warm_hold.enabled}
+        self.assertEqual(shipped, {"family": hp.WarmHoldConfig(True, 1.0, 0.6)})
 
     def test_helper_entities_are_ones_that_exist(self):
         wanted = {self.cfg.season_entity, self.cfg.bedroom.ceiling_entity}
@@ -1864,7 +1876,7 @@ class ForecastHandling(unittest.TestCase):
         self.assertTrue(any("forecast stale" in m for m in h.warnings()))
 
     def test_no_forecast_at_all_means_no_budget_and_no_cut(self):
-        h = Harness(self, forecast=False)
+        h = Harness(self, forecast=False, zones=zones_without_warm_hold())
         h.ha.set("input_boolean.heating_season", "on")
         h.at(3, 0, day=18)
         h.tick()
@@ -2055,6 +2067,255 @@ class FloorCapEndToEnd(unittest.TestCase):
         self.assertEqual(h.attrs("family")["mode"], "hold")
 
 
+class WarmHoldEndToEnd(unittest.TestCase):
+    """At noon the family zone's hold setpoint is 22.0: its thermostat has to read 23.0 for the
+    warm hold to begin and 22.6 for it to end."""
+
+    FAMILY = THERMOSTATS["family"]
+
+    @staticmethod
+    def read(h, value, zone="family"):
+        h.ha.update_attrs(THERMOSTATS[zone], current_temperature=value)
+
+    def warm_house(self, therm=23.4, floor="21.0", live=False):
+        extra = {"live_zones": ["family"]} if live else {}
+        h = Harness(self, forecast=False, **extra)
+        if live:
+            h.ha.set(h.app.cfg.live_switch_entity, "on")
+        h.ha.set(LIVING_FLOOR, floor)
+        self.read(h, therm)
+        h.season()
+        return h
+
+    @staticmethod
+    def decision(h):
+        return [r for r in h.log_lines("decision") if r["zone"] == "family"][-1]
+
+    @staticmethod
+    def temperatures(h):
+        return [call["temperature"] for call in h.calls]
+
+    def test_a_reading_well_over_the_hold_setpoint_holds_the_family_zone_at_the_minimum(self):
+        h = self.warm_house()
+        a, d = h.attrs("family"), self.decision(h)
+        self.assertEqual((a["mode"], a["plan_mode"], a["setpoint_now"]), ("warm", "warm", 19.0))
+        self.assertEqual(a["weather_offset"], "+0.00")
+        message = "Warm enough: heat held at the minimum until the thermostat reads 22.6 °C"
+        self.assertEqual((a["reasons"], d["reasons"]), ([message], [message]))
+        self.assertEqual((d["plan_mode"], d["aim"], d["setpoint"]), ("warm", None, 19.0))
+        self.assertEqual(d["thermostat"]["temp"], 23.4)
+        self.assertTrue(h.app._zones["family"].warm)
+        for published in h.published:
+            assert_publishable(self, published["attributes"])
+
+    def test_a_reading_just_under_a_full_degree_over_changes_nothing(self):
+        h = self.warm_house(therm=22.99)
+        a = h.attrs("family")
+        self.assertEqual((a["mode"], a["setpoint_now"]), ("hold", 22.0))
+        self.assertFalse(h.app._zones["family"].warm)
+
+    def test_the_other_zones_never_go_warm(self):
+        h = Harness(self, forecast=False)
+        for zone in ZONES[1:]:
+            self.read(h, 30.0, zone)
+        h.season()
+        self.assertEqual([h.attrs(zone)["plan_mode"] for zone in ZONES[1:]], ["hold"] * 4)
+        self.assertEqual([h.app._zones[zone].warm for zone in ZONES[1:]], [False] * 4)
+
+    def test_a_hot_thermostat_lowers_a_live_zone_after_the_stable_window(self):
+        h = self.warm_house(therm=22.8, live=True)
+        h.tick(minutes=10)
+        self.assertEqual(self.temperatures(h), [22.0])
+        h.clock.advance(seconds=5)
+        h.echo()
+        self.read(h, 23.0)
+        h.tick()
+        self.assertEqual(h.attrs("family")["mode"], "warm")
+        h.tick(minutes=9, seconds=59)
+        self.assertEqual(self.temperatures(h), [22.0])
+        h.tick(seconds=1)
+        self.assertEqual(self.temperatures(h), [22.0, 19.0])
+
+    def test_a_floor_cap_released_over_a_hot_thermostat_goes_warm_and_writes_no_hold(self):
+        h = self.warm_house(floor="24.5", live=True)  # the thermostat reads 1.4 over 22.0
+        self.assertEqual(h.attrs("family")["mode"], "floor_cap")
+        h.tick(minutes=10)
+        self.assertEqual(self.temperatures(h), [19.0])
+        h.clock.advance(seconds=5)
+        h.echo()
+        h.ha.set(LIVING_FLOOR, "23.9")
+        h.tick(minutes=5)
+        a, d = h.attrs("family"), self.decision(h)
+        self.assertEqual((a["mode"], a["setpoint_now"]), ("warm", 19.0))
+        self.assertEqual((d["plan_mode"], d["gate"]), ("warm", "unchanged"))
+        h.tick(minutes=45)
+        self.assertEqual(h.attrs("family")["mode"], "warm")
+        self.assertEqual(self.temperatures(h), [19.0])
+
+        self.read(h, 22.6)  # the release reading: 0.6 over the hold setpoint
+        h.tick()
+        self.assertEqual(h.attrs("family")["mode"], "hold")
+        self.assertFalse(h.app._zones["family"].warm)
+        h.tick(minutes=9, seconds=59)
+        self.assertEqual(self.temperatures(h), [19.0])
+        h.tick(seconds=1)
+        self.assertEqual(self.temperatures(h), [19.0, 22.0])
+        h.clock.advance(seconds=5)
+        h.echo()
+        h.tick(minutes=30)
+        self.assertEqual(self.temperatures(h), [19.0, 22.0])
+
+    def test_a_reading_between_the_two_limits_keeps_the_zone_where_it_was(self):
+        h = self.warm_house(therm=22.8)
+        self.assertEqual(h.attrs("family")["mode"], "hold")
+        h.tick(minutes=5)
+        self.assertEqual(h.attrs("family")["mode"], "hold")
+        self.read(h, 23.0)
+        h.tick(minutes=5)
+        self.assertEqual(h.attrs("family")["mode"], "warm")
+        for value in (22.9, 22.8, 22.61):
+            self.read(h, value)
+            h.tick(minutes=5)
+            self.assertEqual(h.attrs("family")["mode"], "warm", value)
+        self.read(h, 22.6)
+        h.tick(minutes=5)
+        self.assertEqual(h.attrs("family")["mode"], "hold")
+
+    def test_warm_survives_a_restart(self):
+        h = self.warm_house()
+        saved = json.loads((h.tmp / "state.json").read_text())
+        self.assertIs(saved["zones"]["family"]["warm"], True)
+        self.assertIs(saved["zones"]["kristines_room"]["warm"], False)
+        restarted = h.restart()
+        self.assertTrue(restarted.app._zones["family"].warm)
+        self.read(restarted, 22.7)  # inside the band: only the saved latch keeps it warm
+        restarted.tick()
+        self.assertEqual(restarted.attrs("family")["mode"], "warm")
+        self.read(restarted, 22.6)
+        restarted.tick(minutes=5)
+        self.assertEqual(restarted.attrs("family")["mode"], "hold")
+        self.assertFalse(restarted.app._zones["family"].warm)
+
+    def test_a_thermostat_that_goes_offline_or_stops_reading_keeps_the_latch(self):
+        def offline(h):
+            h.ha.set(self.FAMILY, "unavailable")
+
+        def no_reading(h):
+            attrs = dict(h.ha.entities[self.FAMILY]["attributes"])
+            del attrs["current_temperature"]
+            h.ha.set(self.FAMILY, "heat", attrs)
+
+        def junk_reading(h):
+            self.read(h, "unknown")
+
+        blips = (("offline", offline), ("no reading", no_reading), ("junk", junk_reading))
+        for name, blip in blips:
+            with self.subTest(blip=name):
+                h = self.warm_house()
+                blip(h)
+                h.tick(minutes=5)
+                h.tick(minutes=60)
+                a = h.attrs("family")
+                self.assertEqual(a["plan_mode"], "warm")
+                self.assertEqual(a["mode"], "device_offline" if name == "offline" else "warm")
+                self.assertTrue(h.app._zones["family"].warm)
+                h.ha.set(self.FAMILY, "heat", {"current_temperature": 22.7, "temperature": 15.0})
+                h.tick(minutes=5)
+                self.assertEqual(h.attrs("family")["mode"], "warm")
+                self.read(h, 22.6)
+                h.tick(minutes=5)
+                self.assertEqual(h.attrs("family")["mode"], "hold")
+
+    def test_a_blip_does_not_set_the_latch_either(self):
+        h = self.warm_house(therm=22.8)
+        h.ha.set(self.FAMILY, "unavailable")
+        h.tick(minutes=5)
+        self.assertEqual(h.attrs("family")["plan_mode"], "hold")
+        self.assertFalse(h.app._zones["family"].warm)
+
+    def test_no_next_change_is_announced_while_warm_and_the_timeline_projects_the_plain_plan(self):
+        h = self.warm_house(therm=22.8)
+        a = h.attrs("family")
+        self.assertEqual(
+            (a["mode"], a["next_change_at"], a["next_setpoint"]),
+            ("hold", "2026-10-17T19:00:00+02:00", 21.5),
+        )
+        self.read(h, 23.4)
+        h.tick(minutes=5)
+        h.tick(minutes=5)
+        a = h.attrs("family")
+        self.assertEqual(a["mode"], "warm")
+        self.assertNotIn("next_change_at", a)
+        self.assertNotIn("next_setpoint", a)
+        self.assertEqual(
+            [(b["start"], b["end"], b["mode"], b["setpoint"]) for b in a["day_blocks"]],
+            [
+                ("12:00", "12:05", "hold", "22.0"),
+                ("12:05", "12:10", "warm", "19.0"),
+                ("12:10", "19:00", "hold", "22.0"),
+                ("19:00", "24:00", "hold", "21.5"),
+            ],
+        )
+        self.read(h, 22.6)
+        h.tick(minutes=5)
+        a = h.attrs("family")
+        self.assertEqual(
+            (a["next_change_at"], a["next_setpoint"]), ("2026-10-17T19:00:00+02:00", 21.5)
+        )
+
+    def test_the_projection_is_not_recomputed_for_a_new_reading_or_latch(self):
+        h = self.warm_house(therm=22.8)
+        rt = h.app._zones["family"]
+        computed_at = rt.projection[1]
+        self.read(h, 23.4)
+        h.tick(minutes=5)
+        self.assertTrue(rt.warm)
+        self.assertEqual(rt.projection[1], computed_at)
+        key = rt.projection[0][0]
+        self.assertEqual((key.therm_temp, key.warm), (None, False))
+
+    def test_a_higher_mode_drops_the_latch_so_the_zone_needs_the_full_gap_again(self):
+        h = self.warm_house()
+        self.read(h, 22.7)
+        h.tick(minutes=5)
+        self.assertEqual(h.attrs("family")["mode"], "warm")
+        h.ha.set("binary_sensor.living_room_window_contact", "on")
+        h.tick(minutes=1)
+        h.tick(minutes=2)
+        self.assertEqual(h.attrs("family")["mode"], "window")
+        self.assertFalse(h.app._zones["family"].warm)
+        h.ha.set("binary_sensor.living_room_window_contact", "off")
+        h.tick(minutes=1)
+        self.assertEqual(h.attrs("family")["mode"], "settle")
+        h.tick(minutes=1)
+        self.assertEqual(h.attrs("family")["mode"], "hold")
+        self.read(h, 23.0)
+        h.tick(minutes=5)
+        self.assertEqual(h.attrs("family")["mode"], "warm")
+
+    def test_the_plan_shows_warm_outside_the_season(self):
+        h = Harness(self, forecast=False)
+        self.read(h, 23.4)
+        h.tick()
+        a = h.attrs("family")
+        self.assertEqual(
+            (a["mode"], a["plan_mode"], a["setpoint_now"]), ("off_season", "warm", 19.0)
+        )
+        self.assertEqual(a["reasons"][0], "Heating season is off: the thermostat is left alone")
+        self.assertTrue(h.app._zones["family"].warm)
+
+    def test_runtime_without_saved_warm_state_is_backwards_compatible(self):
+        h = Harness(self, forecast=False)
+        zc = h.app.cfg.zones["family"]
+        for saved in ({}, {"warm": "true"}, {"warm": []}, {"warm": 1}, {"warm": None}):
+            with self.subTest(saved=saved):
+                self.assertFalse(hc.ZoneRuntime(zc, h.app.cfg, saved).warm)
+        self.assertTrue(hc.ZoneRuntime(zc, h.app.cfg, {"warm": True}).warm)
+
+    def test_a_warm_zone_is_still_a_cold_room_to_the_alerts(self):
+        self.assertNotIn(hp.MODE_WARM, hc.al.COLD_EXEMPT_MODES)
+
+
 class SunCut(unittest.TestCase):
     def season(self, **kw):
         h = Harness(self, **kw)
@@ -2157,7 +2418,7 @@ class WeatherOffsetEndToEnd(unittest.TestCase):
         h.fetch()
 
     def cold_house(self, today=-3.0, tomorrow=-3.0):
-        h = Harness(self, forecast=False)
+        h = Harness(self, forecast=False, zones=zones_without_warm_hold())
         h.ha.set("input_boolean.heating_season", "on")
         self.forecast(h, today, tomorrow)
         return h
@@ -2409,7 +2670,7 @@ class PartyEndToEnd(unittest.TestCase):
         h.notifier.notify.assert_not_awaited()
 
     def test_the_manual_switch_pauses_the_zone_for_at_most_twelve_hours(self):
-        h = Harness(self)
+        h = Harness(self, zones=zones_without_warm_hold())
         h.ha.set("input_boolean.heating_season", "on")
         h.ha.set("input_boolean.party", "on")
         h.tick()
@@ -2435,7 +2696,7 @@ class PartyEndToEnd(unittest.TestCase):
 
 class BedroomEndToEnd(unittest.TestCase):
     def guarded(self):
-        zones = copy.deepcopy(shipped_args(Path("."))["zones"])
+        zones = zones_without_warm_hold()
         zones["bathroom"]["bedroom_guard"] = {"enabled": True, "cap": "lower_limit"}
         return Harness(self, zones=zones)
 
@@ -2552,7 +2813,7 @@ class TerminateAndEvents(unittest.TestCase):
 
 class Timeline(unittest.TestCase):
     def test_finished_blocks_stay_on_the_day_timeline(self):
-        h = Harness(self)
+        h = Harness(self, zones=zones_without_warm_hold())
         h.ha.set("input_boolean.heating_season", "on")
         h.at(5, 50)
         h.tick()
@@ -2743,7 +3004,7 @@ class DailyRollup(unittest.TestCase):
             h.clock.advance(minutes=5)
 
     def test_the_trim_moves_halfway_to_the_measured_bias_at_03_00(self):
-        h = Harness(self)
+        h = Harness(self, zones=zones_without_warm_hold())
         h.ha.set("input_boolean.heating_season", "on")
         self.run_day(h)
         h.at(3, 0, day=18)
@@ -2790,7 +3051,7 @@ class DailyRollup(unittest.TestCase):
         self.assertEqual(h.app._zones["family"].trim, 0.5)
 
     def test_yesterday_shows_up_on_the_sensor_and_the_day_is_not_closed_twice(self):
-        h = Harness(self)
+        h = Harness(self, zones=zones_without_warm_hold())
         h.ha.set("input_boolean.heating_season", "on")
         self.run_day(h)
         h.at(3, 0, day=18)

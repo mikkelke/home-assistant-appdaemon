@@ -159,6 +159,7 @@ class ZoneRuntime:
         }
         self.cut_day = saved.get("cut_day") if isinstance(saved.get("cut_day"), str) else None
         self.floor_cap = saved.get("floor_cap") is True
+        self.warm = saved.get("warm") is True
         self.comfort = (
             hp.ComfortSwitch(zc.control_air, _dict(saved.get("comfort")))
             if len(zc.control_air) > 1
@@ -209,6 +210,7 @@ class ZoneRuntime:
             "days": {d: acc.snapshot() for d, acc in self.days.items()},
             "cut_day": self.cut_day,
             "floor_cap": self.floor_cap,
+            "warm": self.warm,
             "daily": self.daily[-DAILY_KEEP:],
             "yesterday": self.yesterday,
             "held_off": self.held_off,
@@ -1275,8 +1277,11 @@ class HeatingController(hass.Hass):
                 if (zc.weather_offset.enabled and ctx["forecast_ok"])
                 else ()
             ),
+            therm_temp=reading["therm_temp"] if reading["therm_usable"] else None,
+            warm=rt.warm,
         )
         plan = hp.plan(zc, inp, now_ts, tz)
+        rt.warm = plan.plan_mode == hp.MODE_WARM
 
         if rt.last_plan_mode is not None and rt.last_plan_mode != plan.plan_mode:
             if hp.MODE_PARTY in (rt.last_plan_mode, plan.plan_mode):
@@ -1347,7 +1352,7 @@ class HeatingController(hass.Hass):
         today_part = [(s, min(e, day_end), m, sp) for s, e, m, sp in projected if s < day_end]
         timeline = hp.render_blocks(rt.blocks, today_part, now_ts, day_end, tz)
         next_change = None
-        if rt.tracker.state == hp.STATE_CLOSED:
+        if rt.tracker.state == hp.STATE_CLOSED and plan.plan_mode != hp.MODE_WARM:
             next_change = next((b for b in projected if b[3] != plan.setpoint), None)
         aired = rt.tracker.state != hp.STATE_CLOSED or bool(rt.tracker.open_openings())
         ctx["zones"][zone] = {"air": reading["air"], "target": plan.target, "window_active": aired}
@@ -1382,7 +1387,7 @@ class HeatingController(hass.Hass):
     def _project(rt: ZoneRuntime, inp: hp.ZoneInputs, now_ts: float, horizon: float, tz) -> list:
         """The plan from now to the horizon. It only depends on the inputs and the clock, so
         the blocks of the last projection are reused, trimmed to now, while the inputs hold."""
-        key = (replace(inp, window_state=hp.STATE_CLOSED), horizon)
+        key = (replace(inp, window_state=hp.STATE_CLOSED, therm_temp=None, warm=False), horizon)
         if rt.projection is None or rt.projection[0] != key or rt.projection[1] > now_ts:
             blocks = hp.project_blocks(rt.zc, inp, now_ts, horizon, tz)
             rt.projection = (key, now_ts, blocks)

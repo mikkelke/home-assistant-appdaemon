@@ -10,7 +10,10 @@ setpoint the controller would hand them, in two layers:
     and the seated-air reading the targets are defined in, plus the weather offset where a zone
     has one: the raise the thermostat's proportional band needs to call the day's expected duty.
   - COAST: the setpoint drops to a protected minimum (sun cut) or to the zone's lower limit
-    (open window, party, bedroom loop).
+    (open window, party, bedroom loop, warm hold). The warm hold latches on the thermostat's own
+    reading, because ITLC keeps calling for heat above its setpoint: once the reading is
+    enter_c or more above the setpoint HOLD would hand it, the zone coasts at its lower limit
+    until the reading is back within release_c of that setpoint.
 
 Terms used throughout:
   - lower limit / upper limit: the setpoint bounds of a zone, in the thermostat's own scale.
@@ -21,9 +24,9 @@ Terms used throughout:
     In a zone with several, a room whose 3 h mean is far from T* takes over (ComfortSwitch).
 
 Mode precedence, first match wins (see plan()): off_season / device_offline, window, settle,
-party, floor_cap, guard, sun_cut, fallback, hold. The plan is always computed, also when the
+party, floor_cap, guard, sun_cut, fallback, warm, hold. The plan is always computed, also when the
 first row gates the zone, so the log shows what would have been planned. `guard` is the bedroom loop
-holding the bathroom back (BedroomLoop).
+holding the bathroom back (BedroomLoop). `warm` is the warm hold (WarmHoldConfig).
 
 Timestamps are epoch seconds. Local clock times come from the tzinfo passed in.
 """
@@ -46,6 +49,7 @@ MODE_FLOOR_CAP = "floor_cap"
 MODE_GUARD = "guard"
 MODE_SUN_CUT = "sun_cut"
 MODE_FALLBACK = "fallback"
+MODE_WARM = "warm"
 MODE_HOLD = "hold"
 
 SETPOINT_STEP_C = 0.5
@@ -206,6 +210,17 @@ class WeatherOffsetConfig:
 
 
 @dataclass(frozen=True)
+class WarmHoldConfig:
+    """Whether a zone coasts at its lower limit while its thermostat reads well above the
+    setpoint HOLD would give it. It starts at enter_c above that setpoint and ends once the
+    reading is back within release_c of it."""
+
+    enabled: bool = False
+    enter_c: float = 1.0
+    release_c: float = 0.6
+
+
+@dataclass(frozen=True)
 class ZoneConfig:
     name: str
     thermostat: str
@@ -230,6 +245,7 @@ class ZoneConfig:
     weather_offset: WeatherOffsetConfig = WeatherOffsetConfig()
     floor_max_c: Optional[float] = None  # holds against the warmest of the floor_sensors
     control_air_weights: tuple = ()  # one per control_air sensor; empty weighs them equally
+    warm_hold: WarmHoldConfig = WarmHoldConfig()
 
 
 @dataclass(frozen=True)
@@ -421,6 +437,28 @@ def _parse_weather_offset(raw, budget: Optional[BudgetConfig], where: str) -> We
     return cfg
 
 
+def _parse_warm_hold(raw, where: str) -> WarmHoldConfig:
+    if not raw:
+        return WarmHoldConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where}: warm_hold is a mapping of enter_c and release_c")
+    d = WarmHoldConfig()
+    values = []
+    for key, default in (("enter_c", d.enter_c), ("release_c", d.release_c)):
+        value = raw.get(key, default)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise ConfigError(f"{where}: warm_hold {key} must be a finite number")
+        values.append(float(value))
+    enter_c, release_c = values
+    if not 0.0 < release_c < enter_c:
+        raise ConfigError(f"{where}: warm_hold needs 0 < release_c < enter_c")
+    return WarmHoldConfig(enabled=True, enter_c=enter_c, release_c=release_c)
+
+
 def _parse_sun_cut(raw, where: str) -> SunCutConfig:
     raw = raw or {}
     if not raw.get("enabled", False):
@@ -562,6 +600,7 @@ def _parse_zone(name: str, raw: dict) -> ZoneConfig:
         control_air_weights=_parse_control_air_weights(
             raw.get("control_air_weights"), control_air, where
         ),
+        warm_hold=_parse_warm_hold(raw.get("warm_hold"), where),
     )
 
 
@@ -1336,6 +1375,21 @@ def evaluate_floor_cap(
     return floor >= maximum - (0.5 if active else 0.0)
 
 
+def evaluate_warm(
+    cfg: WarmHoldConfig, therm: Optional[float], hold_raw: float, active: bool = False
+) -> bool:
+    """The warm-hold latch. `hold_raw` is the unrounded setpoint HOLD would give, aim plus trim
+    plus weather offset, never the setpoint last handed to the thermostat. The latch sets when
+    the thermostat reads at least enter_c above it and clears at release_c above it or below.
+    Without a reading the latch stays as it is."""
+    if not cfg.enabled:
+        return False
+    if therm is None:
+        return active
+    gap = round(therm - hold_raw, 3)
+    return gap > cfg.release_c if active else gap >= cfg.enter_c
+
+
 @dataclass(frozen=True)
 class ZoneInputs:
     season_on: bool
@@ -1353,6 +1407,8 @@ class ZoneInputs:
     last_planned: Optional[float] = None
     day_duty: tuple = ()
     floor_cap: bool = False
+    therm_temp: Optional[float] = None
+    warm: bool = False
 
 
 @dataclass(frozen=True)
@@ -1416,15 +1472,24 @@ def plan(zc: ZoneConfig, inp: ZoneInputs, now_ts: float, tz) -> Plan:
         plan_mode, aim = MODE_FALLBACK, fallback_aim
         reasons.append("No room temperature to go by: holds a fixed target")
     else:
-        plan_mode, aim = MODE_HOLD, t_lead
-        if abs(t_lead - target) < 0.05:
-            reasons.append(f"Holding {t_lead:.1f} °C")
-        else:
-            reasons.append(
-                f"Getting ready for {t_lead:.1f} °C in {zc.profile.lead_hours:g} h: the floor is slow"
-            )
         u_eq = dict(inp.day_duty).get(local_dt(lead_ts, tz).date().isoformat())
         offset = weather_offset(zc.weather_offset, u_eq)
+        hold_raw = t_lead + inp.trim + offset
+        if evaluate_warm(zc.warm_hold, inp.therm_temp, hold_raw, inp.warm):
+            plan_mode, aim = MODE_WARM, None
+            u_eq, offset = None, 0.0
+            reasons.append(
+                "Warm enough: heat held at the minimum until the thermostat reads "
+                f"{hold_raw + zc.warm_hold.release_c:.1f} °C"
+            )
+        else:
+            plan_mode, aim = MODE_HOLD, t_lead
+            if abs(t_lead - target) < 0.05:
+                reasons.append(f"Holding {t_lead:.1f} °C")
+            else:
+                reasons.append(
+                    f"Getting ready for {t_lead:.1f} °C in {zc.profile.lead_hours:g} h: the floor is slow"
+                )
 
     if aim is None:
         raw = lower
@@ -1450,14 +1515,20 @@ def project_blocks(
 ) -> list:
     """The plan from now until `until_ts` as (start_ts, end_ts, plan_mode, setpoint) blocks,
     assuming the openings stay closed and the dynamic inputs (bedroom hold-back, fallback)
-    keep their current value. The plan is sampled on the clock grid of step_s seconds, so block
+    keep their current value. The thermostat's reading cannot be projected, so a projection
+    never shows the warm hold. The plan is sampled on the clock grid of step_s seconds, so block
     edges fall on round times."""
     blocks = []
     last = inp.last_planned
     t = now_ts
     while t < until_ts:
         end = min((math.floor(t / step_s) + 1) * step_s, until_ts)
-        p = plan(zc, replace(inp, window_state=STATE_CLOSED, last_planned=last), t, tz)
+        p = plan(
+            zc,
+            replace(inp, window_state=STATE_CLOSED, last_planned=last, therm_temp=None, warm=False),
+            t,
+            tz,
+        )
         last = p.setpoint
         if blocks and blocks[-1][2] == p.plan_mode and blocks[-1][3] == p.setpoint:
             blocks[-1][1] = end

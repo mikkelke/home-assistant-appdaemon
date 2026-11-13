@@ -418,6 +418,78 @@ class ConfigParsing(unittest.TestCase):
             hp.parse_config(dict(ARGS, zones=zones))
         self.assertEqual(CFG.zones["guest_bathroom"].weather_offset, hp.WeatherOffsetConfig())
 
+    def warm_hold_of(self, raw):
+        return hp.parse_config(self._broken(warm_hold=raw)).zones["family"].warm_hold
+
+    def test_the_warm_hold_is_off_unless_a_zone_gives_one(self):
+        self.assertEqual(hp.WarmHoldConfig(), hp.WarmHoldConfig(False, 1.0, 0.6))
+        self.assertEqual({zc.warm_hold for zc in CFG.zones.values()}, {hp.WarmHoldConfig()})
+        for empty in (None, {}):
+            self.assertEqual(self.warm_hold_of(empty), hp.WarmHoldConfig(), repr(empty))
+
+    def test_a_warm_hold_is_read_and_leaves_out_what_the_default_covers(self):
+        self.assertEqual(
+            self.warm_hold_of({"enter_c": 1.0, "release_c": 0.6}),
+            hp.WarmHoldConfig(True, 1.0, 0.6),
+        )
+        self.assertEqual(self.warm_hold_of({"enter_c": 1.5}), hp.WarmHoldConfig(True, 1.5, 0.6))
+        self.assertEqual(self.warm_hold_of({"release_c": 0.3}), hp.WarmHoldConfig(True, 1.0, 0.3))
+        whole = self.warm_hold_of({"enter_c": 2, "release_c": 1})
+        self.assertEqual((whole.enter_c, whole.release_c), (2.0, 1.0))
+        self.assertIsInstance(whole.enter_c, float)
+        self.assertIsInstance(whole.release_c, float)
+
+    def test_a_warm_hold_needs_no_budget(self):
+        zones = dict(ARGS["zones"], guest_bathroom=dict(GUEST, warm_hold={"enter_c": 1.2}))
+        cfg = hp.parse_config(dict(ARGS, zones=zones))
+        self.assertEqual(cfg.zones["guest_bathroom"].warm_hold, hp.WarmHoldConfig(True, 1.2, 0.6))
+
+    def test_a_warm_hold_needs_a_release_above_zero_and_below_the_entry(self):
+        bad = [
+            {"enter_c": 0.6},
+            {"enter_c": 0.5},
+            {"release_c": 1.0},
+            {"release_c": 1.2},
+            {"release_c": 0},
+            {"release_c": -0.1},
+            {"enter_c": 0, "release_c": 0},
+            {"enter_c": 1.0, "release_c": 1.0},
+            {"enter_c": -1.0, "release_c": -2.0},
+        ]
+        for raw in bad:
+            with self.subTest(raw=raw), self.assertRaisesRegex(
+                hp.ConfigError, "zone family: warm_hold needs 0 < release_c < enter_c"
+            ):
+                self.warm_hold_of(raw)
+        self.assertTrue(self.warm_hold_of({"enter_c": 0.02, "release_c": 0.01}).enabled)
+
+    def test_a_warm_hold_takes_finite_numbers_only(self):
+        junk = [
+            {"enter_c": True},
+            {"enter_c": "1.0"},
+            {"enter_c": None},
+            {"enter_c": [1.0]},
+            {"enter_c": float("nan")},
+            {"enter_c": float("inf")},
+            {"release_c": False},
+            {"release_c": "0.6"},
+            {"release_c": None},
+            {"release_c": float("nan")},
+            {"release_c": -float("inf")},
+        ]
+        for raw in junk:
+            with self.subTest(raw=raw), self.assertRaisesRegex(
+                hp.ConfigError, "zone family: warm_hold (enter_c|release_c) must be a finite number"
+            ):
+                self.warm_hold_of(raw)
+
+    def test_a_warm_hold_is_a_mapping(self):
+        for raw in (True, 1.5, ["enter_c"], "on"):
+            with self.subTest(raw=raw), self.assertRaisesRegex(
+                hp.ConfigError, "zone family: warm_hold is a mapping"
+            ):
+                self.warm_hold_of(raw)
+
     ADVISED = {
         "family": {
             "rooms": ["sensor.living_room_feel", "sensor.dining_room_feel", "sensor.kitchen_feel"]
@@ -687,9 +759,14 @@ class SetpointByTime(unittest.TestCase):
 
 
 class ModePrecedence(unittest.TestCase):
-    """window > settle > party > floor_cap > guard > sun_cut > fallback > hold."""
+    """window > settle > party > floor_cap > guard > sun_cut > fallback > warm > hold."""
 
-    zone = replace(CFG.zones["family"], guard=hp.GuardConfig(True, "lower_limit"), floor_max_c=26.0)
+    zone = replace(
+        CFG.zones["family"],
+        guard=hp.GuardConfig(True, "lower_limit"),
+        floor_max_c=26.0,
+        warm_hold=hp.WarmHoldConfig(True),
+    )
 
     def mode_of(self, **kw):
         base = dict(
@@ -698,6 +775,8 @@ class ModePrecedence(unittest.TestCase):
             floor_cap=True,
             party_windows=((T(8), T(18)),),
             cut_windows=((T(1), T(14), "2026-10-17"),),
+            therm_temp=24.0,
+            warm=True,
         )
         base.update(kw)
         p = hp.plan(self.zone, inputs(**base), T(12), TZ)
@@ -716,12 +795,11 @@ class ModePrecedence(unittest.TestCase):
             self.mode_of(party_windows=(), floor_cap=False, hold_back=False, fallback=False),
             "sun_cut",
         )
-        self.assertEqual(
-            self.mode_of(
-                party_windows=(), floor_cap=False, hold_back=False, fallback=False, cut_windows=()
-            ),
-            "hold",
+        no_cut = dict(
+            party_windows=(), floor_cap=False, hold_back=False, fallback=False, cut_windows=()
         )
+        self.assertEqual(self.mode_of(**no_cut), "warm")
+        self.assertEqual(self.mode_of(**no_cut, therm_temp=None, warm=False), "hold")
 
     def test_fallback_suppresses_cuts_but_not_window_or_party(self):
         zc = CFG.zones["family"]
@@ -833,6 +911,125 @@ class FloorCap(unittest.TestCase):
                     ("floor_cap", None, 19.0, 19.0, 0.0),
                 )
                 self.assertIn("until the floor is below 25.5", result.reasons[0])
+
+
+class WarmHold(unittest.TestCase):
+    """The family zone at noon: the aim of 21.5 plus the trim of 0.5 is a hold setpoint of 22.0."""
+
+    zone = replace(CFG.zones["family"], warm_hold=hp.WarmHoldConfig(True, 1.0, 0.6))
+    HOLD_RAW = 22.0
+
+    def planned(self, therm, warm=False, **kw):
+        return hp.plan(self.zone, inputs(therm_temp=therm, warm=warm, **kw), T(12), TZ)
+
+    def test_enters_a_full_degree_over_the_hold_setpoint_and_releases_at_six_tenths(self):
+        active = False
+        steps = ((0.99, "hold"), (1.0, "warm"), (0.61, "warm"), (0.6, "hold"), (0.9, "hold"))
+        for gap, expected in steps:
+            with self.subTest(gap=gap, active=active):
+                therm = self.HOLD_RAW + gap
+                result = self.planned(therm, active)
+                self.assertEqual(result.plan_mode, expected)
+                latch = hp.evaluate_warm(self.zone.warm_hold, therm, self.HOLD_RAW, active)
+                self.assertEqual(latch, expected == "warm")
+                active = result.plan_mode == "warm"
+
+    def test_a_missing_reading_keeps_the_latch_as_it_is(self):
+        cfg = self.zone.warm_hold
+        self.assertTrue(hp.evaluate_warm(cfg, None, self.HOLD_RAW, True))
+        self.assertFalse(hp.evaluate_warm(cfg, None, self.HOLD_RAW, False))
+        self.assertEqual(self.planned(None, warm=True).plan_mode, "warm")
+        self.assertEqual(self.planned(None, warm=False).plan_mode, "hold")
+
+    def test_a_zone_without_the_config_never_enters(self):
+        off = hp.WarmHoldConfig()
+        for active in (False, True):
+            for therm in (None, 22.0, 30.0):
+                self.assertFalse(hp.evaluate_warm(off, therm, self.HOLD_RAW, active))
+        for zone in CFG.zones:
+            for active in (False, True):
+                result = plan_at(T(12), zone, therm_temp=40.0, warm=active)
+                self.assertEqual(result.plan_mode, "hold", zone)
+                self.assertEqual(result, plan_at(T(12), zone), zone)
+
+    def test_warm_stays_at_the_lower_limit_and_names_the_reading_that_ends_it(self):
+        result = self.planned(24.0, warm=True)
+        self.assertEqual(
+            (result.mode, result.plan_mode, result.aim, result.raw, result.setpoint),
+            ("warm", "warm", None, 19.0, 19.0),
+        )
+        self.assertEqual(result.weather_offset, 0.0)
+        self.assertEqual(
+            result.reasons,
+            ("Warm enough: heat held at the minimum until the thermostat reads 22.6 °C",),
+        )
+
+    def test_warm_ignores_trim_weather_and_the_aim(self):
+        result = self.planned(25.0, trim=1.0, day_duty=(("2026-10-17", 1.0),))
+        self.assertEqual(
+            (result.plan_mode, result.aim, result.raw, result.setpoint, result.weather_offset),
+            ("warm", None, 19.0, 19.0, 0.0),
+        )
+        # the hold setpoint it waits for is 21.5 + 1.0 + 0.92, and the release is 0.6 above it
+        self.assertEqual(
+            result.reasons,
+            ("Warm enough: heat held at the minimum until the thermostat reads 24.0 °C",),
+        )
+
+    def test_warm_sits_at_the_lower_limit_the_device_allows(self):
+        result = self.planned(25.0, lower_c=19.5)
+        self.assertEqual((result.plan_mode, result.setpoint), ("warm", 19.5))
+
+    def test_the_reading_is_judged_against_the_unrounded_hold_setpoint(self):
+        duty = (("2026-10-17", 0.55),)  # a raise of 0.39: 22.39, handed to the thermostat as 22.5
+        self.assertAlmostEqual(self.planned(None, day_duty=duty).raw, 22.39)
+        for therm, expected in ((23.39, "warm"), (23.38, "hold")):
+            with self.subTest(entering=therm):
+                self.assertEqual(self.planned(therm, day_duty=duty).plan_mode, expected)
+        for therm, expected in ((23.0, "warm"), (22.99, "hold")):
+            with self.subTest(releasing=therm):
+                self.assertEqual(self.planned(therm, True, day_duty=duty).plan_mode, expected)
+
+    def test_the_latch_is_measured_from_the_hold_setpoint_and_not_the_last_planned_one(self):
+        for therm, expected in ((22.61, "warm"), (22.6, "hold")):
+            with self.subTest(releasing=therm):
+                result = self.planned(therm, True, last_planned=19.0)
+                self.assertEqual(result.plan_mode, expected)
+        for therm, expected in ((22.99, "hold"), (23.0, "warm")):
+            with self.subTest(entering=therm):
+                self.assertEqual(self.planned(therm, last_planned=19.0).plan_mode, expected)
+        released = self.planned(22.6, True, last_planned=19.0)
+        self.assertEqual((released.plan_mode, released.setpoint), ("hold", 22.0))
+
+    def test_a_zone_that_is_not_warm_plans_what_it_would_plan_without_the_hold(self):
+        plain = plan_at(T(12))
+        self.assertEqual(self.planned(22.6, True), plain)
+        self.assertEqual(self.planned(22.99), plain)
+        self.assertEqual(self.planned(None), plain)
+
+    def test_the_season_and_device_gate_hide_the_mode_but_not_the_plan(self):
+        result = self.planned(24.0, season_on=False)
+        self.assertEqual(
+            (result.mode, result.plan_mode, result.setpoint), ("off_season", "warm", 19.0)
+        )
+        result = self.planned(24.0, online=False)
+        self.assertEqual((result.mode, result.plan_mode), ("device_offline", "warm"))
+
+    def test_a_projection_never_shows_the_warm_hold(self):
+        end = T(0, day=18)
+        plain = hp.project_blocks(self.zone, inputs(), T(12), end, TZ)
+        for kw in (dict(therm_temp=25.0), dict(therm_temp=25.0, warm=True), dict(warm=True)):
+            with self.subTest(kw=kw):
+                self.assertEqual(hp.project_blocks(self.zone, inputs(**kw), T(12), end, TZ), plain)
+        self.assertEqual({block[2] for block in plain}, {"hold"})
+        self.assertEqual(self.planned(25.0).plan_mode, "warm")
+
+    def test_the_inputs_with_a_reading_still_compare_and_hash(self):
+        a, b = inputs(therm_temp=23.0, warm=True), inputs(therm_temp=23.0, warm=True)
+        self.assertEqual((a, hash(a)), (b, hash(b)))
+        self.assertNotEqual(a, inputs(therm_temp=23.0))
+        self.assertNotEqual(a, inputs(warm=True))
+        self.assertEqual((inputs().therm_temp, inputs().warm), (None, False))
 
 
 class BudgetAndCut(unittest.TestCase):
