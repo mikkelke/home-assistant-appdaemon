@@ -1113,7 +1113,7 @@ class ShippedRoomFeelConfig(unittest.TestCase):
                                     ("ceiling", -0.1), ("salus_family", -0.2)], None),
             "dining_room": ("primary", [("seated", 0.0), ("fp300", 0.15),
                                          ("salus_family", -0.9)], -0.6),
-            "claudias_room": ("primary", [("seated", 0.0), ("fp300", 0.1), ("salus", -0.1)], 0.6),
+            "claudias_room": ("primary", [("seated", 0.0), ("fp300", 0.1), ("salus", 0.4)], 0.6),
             "kristines_room": ("primary", [("seated", 0.0), ("salus", 0.1)], -0.2),
             "bedroom": ("primary", [("seated", 0.0), ("salus", -0.1), ("fp300", 0.3)], 0.2),
         }
