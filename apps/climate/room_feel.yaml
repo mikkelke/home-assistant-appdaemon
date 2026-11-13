@@ -253,7 +253,7 @@ RoomFeel:
           # sensor.bathroom_humidity: UNVERIFIED (pattern-inferred, not grepped directly).
           rh_entity: sensor.bathroom_humidity
           label: salus
-          offset_c: -0.7
+          offset_c: -0.2
       floor_entity: sensor.bathroom_floor_thermometer_temperature
       floor_rh_entity: sensor.bathroom_floor_thermometer_humidity
       window_contacts: [binary_sensor.bathroom_window_contact]
@@ -272,7 +272,7 @@ RoomFeel:
           # directly).
           rh_entity: sensor.guest_bathroom_humidity
           label: salus
-          offset_c: -0.8
+          offset_c: -0.3
       floor_entity: sensor.guest_bathroom_floor_thermometer_temperature
       floor_rh_entity: sensor.guest_bathroom_floor_thermometer_humidity
       # Only a door contact is known here (binary_sensor.guest_bathroom_door_contact, an
