@@ -40,6 +40,7 @@ if "appdaemon.plugins.hass.hassapi" not in sys.modules:
     sys.modules["appdaemon.plugins.hass.hassapi"] = hassapi
 
 import heating_controller as hc  # noqa: E402
+import heating_forecast as hf  # noqa: E402
 import heating_plan as hp  # noqa: E402
 
 TZ = ZoneInfo("Europe/Copenhagen")
@@ -434,7 +435,8 @@ class ShippedYaml(unittest.TestCase):
         self.assertEqual([z[n].base_c for n in ZONES], [21.5, 20.5, 21.5, 22.0, 20.0])
         self.assertEqual([z[n].lower_c for n in ZONES], [19.0, 19.0, 19.0, 19.0, 18.0])
         self.assertEqual([z[n].upper_c for n in ZONES], [24.0, 24.0, 24.0, 25.0, 24.0])
-        self.assertEqual(z["family"].protected_min_c, 20.5)
+        self.assertIsNone(z["family"].protected_min_c)
+        self.assertEqual(z["family"].protected_min_offset_c, -0.5)
         self.assertEqual(z["kristines_room"].trim, hp.TrimConfig(1.2, -1.0, 2.0))
         self.assertEqual(self.cfg.sun_term_factor, 0.5)
         self.assertEqual(self.cfg.keypad_relock_minutes, 15)
@@ -541,6 +543,48 @@ class ShippedYaml(unittest.TestCase):
         enabled = [n for n, zc in self.cfg.zones.items() if zc.sun_cut.enabled]
         self.assertEqual(enabled, ["family", "claudias_room"])
         self.assertEqual(self.cfg.zones["claudias_room"].sun_cut.az_min, 180.0)
+
+    def test_the_family_protected_minimum_is_half_a_degree_under_the_helper(self):
+        family = self.cfg.zones["family"]
+        self.assertEqual(hp.protected_min(family, 22.0, 0.0, family.lower_c), 21.5)
+        self.assertEqual(hp.protected_min(family, 21.5, 0.0, family.lower_c), 21.0)
+
+    def shipped_day(self, t_mean, wind, ghi, sun_hours):
+        """The family zone's budget of one day at the shipped trust in the sun, and the cut
+        windows that day is worth."""
+        family = self.cfg.zones["family"]
+        weather = hf.DayWeather(NOW.date(), 24, t_mean, max(0.0, hf.HDD_BASE_C - t_mean), wind, ghi)
+        starts = [NOW.replace(hour=h).timestamp() for h in sun_hours]
+        budget = hp.day_budget(family, weather, starts, self.cfg.sun_term_factor)
+        cut = hp.evaluate_cut(family, [budget], NOW.timestamp(), None)
+        return budget, cut.windows
+
+    def test_the_shipped_sun_cut_takes_a_cold_windy_day_with_five_bright_hours(self):
+        b, windows = self.shipped_day(4.9, 17.9, 1.31, range(10, 15))
+        self.assertEqual(b.n_sun, 5)
+        self.assertAlmostEqual(b.h_dull, 9.27, delta=0.05)
+        self.assertAlmostEqual(b.u_eq, 0.39, delta=0.01)
+        self.assertAlmostEqual(b.s_sun, 2.13, delta=0.01)
+        self.assertAlmostEqual(b.s_credit, 1.06, delta=0.01)
+        self.assertAlmostEqual(b.skipped_h, 0.77, delta=0.01)
+        self.assertAlmostEqual(b.ratio, 1.38, delta=0.01)
+        self.assertEqual(len(windows), 1)
+
+    def test_the_shipped_sun_cut_takes_a_cold_windy_day_with_three_bright_hours(self):
+        b, windows = self.shipped_day(5.5, 21.2, 0.76, range(11, 14))
+        self.assertEqual(b.n_sun, 3)
+        self.assertAlmostEqual(b.h_dull, 9.27, delta=0.05)
+        self.assertAlmostEqual(b.u_eq, 0.39, delta=0.01)
+        self.assertAlmostEqual(b.s_sun, 1.23, delta=0.01)
+        self.assertAlmostEqual(b.s_credit, 0.61, delta=0.01)
+        self.assertAlmostEqual(b.ratio, 0.80, delta=0.01)
+        self.assertEqual(len(windows), 1)
+
+    def test_the_shipped_sun_cut_leaves_a_dull_day_alone(self):
+        b, windows = self.shipped_day(4.9, 17.9, 0.3, [])
+        self.assertEqual(b.n_sun, 0)
+        self.assertIsNone(b.window_start)
+        self.assertEqual(windows, ())
 
     def test_only_the_family_zone_ships_a_weather_offset(self):
         shipped = {
@@ -2330,8 +2374,9 @@ class SunCut(unittest.TestCase):
         h.tick()
         a = h.attrs("family")
         self.assertEqual(a["mode"], "sun_cut")
-        # aim: the day target 21.5 at 12:00, capped at 20.5, plus the trim of 0.5
-        self.assertEqual(a["setpoint_now"], 21.0)
+        # aim: the day target 21.5 at 12:00, capped at the helper less half a degree (21.0),
+        # plus the trim of 0.5
+        self.assertEqual(a["setpoint_now"], 21.5)
         self.assertEqual(
             a["cut_window"], ["2026-10-18T07:00:00+02:00", "2026-10-18T16:00:00+02:00"]
         )
@@ -2385,15 +2430,15 @@ class SunCut(unittest.TestCase):
         for zone in ("kristines_room", "bathroom", "guest_bathroom"):
             self.assertNotEqual(h.attrs(zone)["mode"], "sun_cut")
 
-    def test_half_trust_cuts_a_sunny_day_that_quarter_trust_leaves_alone(self):
-        h = Harness(self, sun_term_factor=0.25)
+    def test_more_trust_in_the_sun_cuts_a_sunny_day_that_less_trust_leaves_alone(self):
+        h = Harness(self, sun_term_factor=0.05)
         h.ha.set("input_boolean.heating_season", "on")
         h.at(7, 55, day=18)
         h.fetch()
         h.at(8, 0, day=18)
-        h.tick()  # 18 October: ratio 0.48 at quarter trust
+        h.tick()  # the credit covers less than credit_ratio of the heat skipped
         self.assertEqual(h.attrs("family")["mode"], "hold")
-        h.app.cfg = dataclasses.replace(h.app.cfg, sun_term_factor=0.5)  # 0.96 at half trust
+        h.app.cfg = dataclasses.replace(h.app.cfg, sun_term_factor=0.1)  # and now more than that
         h.tick(minutes=5)
         self.assertEqual(h.attrs("family")["mode"], "sun_cut")
 

@@ -1057,8 +1057,8 @@ class BudgetAndCut(unittest.TestCase):
         self.assertAlmostEqual(b.s_sun, 5.7, delta=0.1)
         self.assertAlmostEqual(b.h_pred, 2.3, delta=0.1)
         self.assertEqual((b.window_start, b.window_end), (T(1), T(14)))
-        self.assertAlmostEqual(b.skipped_h, 0.334 * 13, delta=0.05)
-        self.assertAlmostEqual(b.ratio, 1.31, delta=0.02)
+        self.assertAlmostEqual(b.skipped_h, 2.671, delta=0.01)
+        self.assertAlmostEqual(b.ratio, 2.123, delta=0.01)
         cut = hp.evaluate_cut(self.zc, [b], T(2), None)
         self.assertEqual(cut.windows, ((T(1), T(14), "2026-10-17"),))
         self.assertEqual(cut.active_day, "2026-10-17")
@@ -1068,7 +1068,7 @@ class BudgetAndCut(unittest.TestCase):
         self.assertAlmostEqual(b.h_dull, 13.1, delta=0.1)
         self.assertAlmostEqual(b.u_eq, 0.55, delta=0.01)
         self.assertAlmostEqual(b.s_sun, 1.9, delta=0.1)
-        self.assertAlmostEqual(b.ratio, 0.36, delta=0.02)
+        self.assertAlmostEqual(b.ratio, 0.444, delta=0.01)
         self.assertEqual(hp.evaluate_cut(self.zc, [b], T(5), None).windows, ())
 
     def test_claudia_in_december_cuts_at_full_trust_and_not_at_half(self):
@@ -1078,10 +1078,10 @@ class BudgetAndCut(unittest.TestCase):
         self.assertAlmostEqual(b.h_dull, 11.3, delta=0.1)
         self.assertAlmostEqual(b.s_sun, 3.3, delta=0.1)
         self.assertEqual((b.window_start, b.window_end), (T(4), T(13)))
-        self.assertAlmostEqual(b.ratio, 0.78, delta=0.02)
+        self.assertAlmostEqual(b.ratio, 0.871, delta=0.01)
         self.assertEqual(len(hp.evaluate_cut(zc, [b], T(5), None).windows), 1)
         half = self.budget(weather, [12, 13], factor=0.5, zc=zc)
-        self.assertAlmostEqual(half.ratio, 0.39, delta=0.02)
+        self.assertAlmostEqual(half.ratio, 0.436, delta=0.01)
         self.assertEqual(hp.evaluate_cut(zc, [half], T(5), None).windows, ())
 
     def test_half_trust_only_changes_the_credit_not_the_expectation(self):
@@ -1098,9 +1098,20 @@ class BudgetAndCut(unittest.TestCase):
         b = self.budget(dw(5.0, 10.0, 3.5), [12])
         self.assertEqual(hp.evaluate_cut(self.zc, [b], T(2), None).windows, ())
 
+    def test_the_ratio_does_not_fall_as_the_sun_hours_rise(self):
+        short = self.budget(dw(5.0, 10.0, 3.5), [11, 12])
+        long = self.budget(dw(5.0, 10.0, 3.5), range(9, 15))
+        self.assertGreater(
+            long.window_end - long.window_start, short.window_end - short.window_start
+        )
+        self.assertEqual((short.skipped_h, short.ratio), (long.skipped_h, long.ratio))
+        self.assertEqual(short.skipped_h, short.u_eq * self.zc.sun_cut.before_hours)
+        for b in (short, long):
+            self.assertEqual(len(hp.evaluate_cut(self.zc, [b], T(2), None).windows), 1)
+
     def test_a_day_with_hardly_any_heat_to_skip_is_not_cut(self):
         b = self.budget(dw(16.5, 5.0, 3.5), range(9, 15))
-        self.assertLess(b.skipped_h, 0.5)
+        self.assertLess(b.skipped_h, self.zc.sun_cut.min_skipped_h)
         self.assertEqual(hp.evaluate_cut(self.zc, [b], T(2), None).windows, ())
 
     def test_a_running_cut_ends_early_only_below_the_lower_threshold(self):

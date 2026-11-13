@@ -183,7 +183,7 @@ class SunCutConfig:
     end_before_hours: float = 1.0
     credit_ratio: float = 0.5
     end_ratio: float = 0.35
-    min_skipped_h: float = 0.5
+    min_skipped_h: float = 0.2
 
 
 @dataclass(frozen=True)
@@ -475,7 +475,7 @@ def _parse_sun_cut(raw, where: str) -> SunCutConfig:
         end_before_hours=float(raw.get("end_before_hours", 1)),
         credit_ratio=float(raw.get("credit_ratio", 0.5)),
         end_ratio=float(raw.get("end_ratio", 0.35)),
-        min_skipped_h=float(raw.get("min_skipped_h", 0.5)),
+        min_skipped_h=float(raw.get("min_skipped_h", 0.2)),
     )
 
 
@@ -813,7 +813,7 @@ class DayBudget:
     sun_end: Optional[float] = None
     window_start: Optional[float] = None
     window_end: Optional[float] = None
-    skipped_h: Optional[float] = None  # heat the cut would skip, u_eq times the window length
+    skipped_h: Optional[float] = None  # heat skipped before the first sun hour: u_eq * before_hours
     ratio: Optional[float] = None  # s_credit over skipped_h
 
 
@@ -830,7 +830,8 @@ def day_budget(
 
     The cut window runs from before_hours ahead of the first sun hour to end_before_hours
     before the last one ends. A cut pays off when the sun credit covers at least credit_ratio
-    of the heat the window would skip."""
+    of the heat skipped in the before_hours ahead of the first sun hour. The credit is weighed
+    against those hours only, because from the first sun hour the zone hardly calls."""
     out = DayBudget(dw.day, dw.t_mean, dw.hdd, dw.wind_mean, dw.ghi_kwh)
     if zc.budget is None:
         return out
@@ -854,7 +855,7 @@ def day_budget(
     out = replace(out, sun_start=sun_start, sun_end=sun_end)
     if w_end <= w_start:
         return out
-    skipped = out.u_eq * (w_end - w_start) / 3600.0
+    skipped = out.u_eq * cut.before_hours
     ratio = out.s_credit / skipped if skipped > 0 else None
     return replace(out, window_start=w_start, window_end=w_end, skipped_h=skipped, ratio=ratio)
 
