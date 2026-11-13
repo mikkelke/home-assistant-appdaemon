@@ -255,12 +255,6 @@ class SonosGroupManager(hass.Hass):
         # Unmute if speaker became solo - use direct call_service for reliability
         if was_grouped and now_solo:
             self.log(f"Scenario: speaker_became_solo -> unmuting {entity}", level="INFO")
-            # First try the safe method
-            currently_muted = self._safe_get_state(entity, attribute="is_volume_muted", default="false") == "true"
-            if currently_muted:
-                self._safe_call_service("media_player/volume_mute", entity_id=entity, is_volume_muted=False)
-                
-            # Then try direct call as backup 
             self.call_service("media_player/volume_mute", entity_id=entity, is_volume_muted=False)
             # If this solo speaker is the current master and using AirPlay, restore volume if needed
             current_master_entity = self._friendly_to_entity_id(self.get_state(self.master_select))
@@ -1012,13 +1006,6 @@ class SonosGroupManager(hass.Hass):
             prev_members = self._prev_group_members.get(triggered_entity, [])
             curr_members = self._safe_get_state(triggered_entity, attribute="group_members", default=[])
         
-        was_grouped_now_solo = (
-            len(prev_members) > 1 and 
-            len(curr_members) == 1 and 
-            len(grouped_speakers) == 0 and 
-            len(playing_speakers) < 2
-        )
-        
         # Determine speaker grouping states
         group_state = self._determine_group_state(triggered_entity, grouped_speakers, playing_speakers, trigger_id, prev_members, curr_members)
         
@@ -1026,26 +1013,9 @@ class SonosGroupManager(hass.Hass):
         master_speaker = self._choose_master(playing_speakers, grouped_speakers, triggered_entity, curr_members)
         master_friendly = self._entity_to_friendly_name(master_speaker)
         current_master = self.get_state(self.master_select)
-        
-        # Get the entity_id of the current master
-        last_master_entity = self._friendly_to_entity_id(current_master)
-        
-        # Check if master is muted
-        master_is_muted = False
-        if master_speaker and master_speaker != "none":
-            master_is_muted = self.get_state(master_speaker, attribute="is_volume_muted") == "true"
-        elif last_master_entity and last_master_entity != "none":
-            master_is_muted = self.get_state(last_master_entity, attribute="is_volume_muted") == "true"
-        
+
         # --- DETERMINE ACTIONS ---
-        action_decisions = self._determine_actions(
-            follow_on, 
-            group_state, 
-            was_grouped_now_solo, 
-            master_is_muted, 
-            playing_speakers, 
-            trigger_id
-        )
+        action_decisions = self._determine_actions(follow_on, group_state, trigger_id)
         
         # --- CHECK FOR INCONSISTENCIES ---
         self._handle_inconsistencies(
@@ -1069,16 +1039,7 @@ class SonosGroupManager(hass.Hass):
         self._toggle_follow_me(action_decisions)
         
         # --- HANDLE UNMUTING ---
-        self._handle_unmuting(
-            action_decisions["should_unmute_master"], 
-            master_speaker, 
-            master_is_muted, 
-            last_master_entity, 
-            was_grouped_now_solo, 
-            triggered_entity, 
-            muted_solo_speakers, 
-            follow_on
-        )
+        self._handle_unmuting(master_speaker, muted_solo_speakers, follow_on)
         
         # Clean any stale entries in the previous group members dict
         self._clean_prev_group_members()
@@ -1160,7 +1121,7 @@ class SonosGroupManager(hass.Hass):
             
         return result
 
-    def _determine_actions(self, follow_on, group_state, was_grouped_now_solo, master_is_muted, playing_speakers, trigger_id):
+    def _determine_actions(self, follow_on, group_state, trigger_id):
         """Determine what actions should be taken"""
         result = {}
         
@@ -1181,16 +1142,6 @@ class SonosGroupManager(hass.Hass):
             # The decision to disable should be based purely on whether any groups exist AFTER the event.
             if not group_state["any_speakers_grouped"]:
                 result["should_disable_follow_me"] = True
-        
-        # Always unmute master when follow_me is being disabled
-        result["should_unmute_master"] = (
-            (trigger_id == "follow_me_disabled") or
-            (was_grouped_now_solo and master_is_muted) or
-            (result["should_disable_follow_me"] and master_is_muted)
-        )
-        
-        # Always unmute solo speakers when disabling follow_me
-        result["should_unmute_solo_speakers"] = result["should_disable_follow_me"]
             
         return result
 
@@ -1287,46 +1238,11 @@ class SonosGroupManager(hass.Hass):
             self.log("Scenario: follow_me_should_be_active -> conditions met", level="INFO")
         elif action_decisions["should_disable_follow_me"]:
             self.log("Scenario: follow_me_should_be_inactive -> conditions not met", level="INFO")
-            
-            # Unmute all solo speakers when follow_me becomes inactive
-            if action_decisions["should_unmute_solo_speakers"]:
-                self.log("Scenario: follow_me_inactive -> unmuting all solo speakers", level="INFO")
-                for sp in self.speakers:
-                    # Get group members to check if solo
-                    members = self.get_state(sp, attribute="group_members") or []
-                    is_solo = len(members) <= 1
-                    
-                    if is_solo:
-                        currently_muted = self.get_state(sp, attribute="is_volume_muted") == "true"
-                        if currently_muted:
-                            self.log(f"Scenario: unmuting_solo_on_inactive -> {sp}", level="INFO")
-                            self._safe_call_service("media_player/volume_mute", entity_id=sp, is_volume_muted=False)
 
-    def _handle_unmuting(self, should_unmute_master, master_speaker, master_is_muted, 
-                        last_master_entity, was_grouped_now_solo, triggered_entity, 
-                        muted_solo_speakers, follow_on):
-        """Handle various unmuting scenarios"""
-        # Create a list of speakers to unmute so we can do it once at the end
+    def _handle_unmuting(self, master_speaker, muted_solo_speakers, follow_on):
+        """Unmute muted solo speakers while follow_me is off."""
         speakers_to_unmute = []
         
-        if should_unmute_master:
-            if master_speaker != "none" and master_is_muted:
-                self.log(f"Scenario: unmuting_master -> {master_speaker}", level="INFO")
-                speakers_to_unmute.append(master_speaker)
-            elif last_master_entity != "none" and self.get_state(last_master_entity, attribute="is_volume_muted") == "true":
-                self.log(f"Scenario: unmuting_previous_master -> {last_master_entity}", level="INFO")
-                speakers_to_unmute.append(last_master_entity)
-        
-        # Handle speaker that was just ungrouped - check if it's muted before unmuting
-        if was_grouped_now_solo and triggered_entity != "none":
-            currently_muted = self.get_state(triggered_entity, attribute="is_volume_muted") == "true"
-            if currently_muted:
-                self.log(f"Scenario: speaker_just_ungrouped -> unmuting {triggered_entity}", level="INFO")
-                speakers_to_unmute.append(triggered_entity)
-            else:
-                self.log(f"Scenario: speaker_just_ungrouped -> {triggered_entity} already unmuted", level="DEBUG")
-        
-        # Unmute any solo speakers if they shouldn't be muted
         if len(muted_solo_speakers) > 0 and not follow_on:
             self.log(f"Scenario: unmuting_solo_speakers -> {len(muted_solo_speakers)} speakers", level="INFO")
             speakers_to_unmute.extend(muted_solo_speakers)
@@ -1342,9 +1258,7 @@ class SonosGroupManager(hass.Hass):
             follow_on = self._should_follow_me_be_active()
             current_master_entity = master_speaker if master_speaker and master_speaker != "none" else self._friendly_to_entity_id(self.get_state(self.master_select))
             if follow_on and current_master_entity and current_master_entity != "none":
-                is_muted_now = self.get_state(current_master_entity, attribute="is_volume_muted") == "true"
-                if not is_muted_now:
-                    self._restore_volume_if_airplay(current_master_entity)
+                self._restore_volume_if_airplay(current_master_entity)
 
     def _should_follow_me_be_active(self):
         """Delegate to Follow Me app so policy is defined in one place. Returns False if Follow Me app unavailable."""
