@@ -124,16 +124,20 @@ class ConfigLoadingTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("fixture")
             utils = types.ModuleType("appdaemon.utils")
-            utils.secrets = {"main": "not-printed"}
+            yaml_loader = types.ModuleType("appdaemon.utils.file.yaml")
+            yaml_loader.secrets = {"main": "not-printed"}
+            file_package = types.ModuleType("appdaemon.utils.file")
+            file_package.yaml = yaml_loader
+            utils.file = file_package
             calls = []
 
             def read_config(path, **_):
-                calls.append((path, dict(utils.secrets)))
-                utils.secrets = {"local": "not-printed"}
+                calls.append((path, dict(yaml_loader.secrets)))
+                yaml_loader.secrets = {"local": "not-printed"}
                 return {path.stem: App()}
 
-            utils.read_config_file = read_config
-            utils.recursive_get_files = lambda **kw: [] if kw["suffix"] == ".py" else paths
+            file_package.read_config_file = read_config
+            file_package.recursive_get_files = lambda **kw: [] if kw["suffix"] == ".py" else paths
             package = types.ModuleType("appdaemon")
             package.utils = utils
             dependency = types.ModuleType("appdaemon.dependency")
@@ -142,6 +146,8 @@ class ConfigLoadingTests(unittest.TestCase):
             models = types.ModuleType("appdaemon.models.config.app")
             models.AppConfig, models.AllAppConfig = App, Configs
             with patch.dict("sys.modules", {"appdaemon": package, "appdaemon.utils": utils,
+                                             "appdaemon.utils.file": file_package,
+                                             "appdaemon.utils.file.yaml": yaml_loader,
                                              "appdaemon.dependency": dependency,
                                              "appdaemon.models.config.app": models}), \
                     patch.object(deploy, "APP_SECRETS", {"main": "not-printed"}):

@@ -150,15 +150,15 @@ def check_supported(before, after, affected, changed=()):
 
 def snapshot(app_dir, exclude_dirs):
     """Use the installed release's loaders/import rules, privately on the box."""
-    from appdaemon import utils
     from appdaemon.dependency import get_dependency_graph, get_full_module_name
+    from appdaemon.utils import file as ad_file
     from appdaemon.models.config.app import AllAppConfig, AppConfig
 
-    python_files = set(utils.recursive_get_files(base=app_dir.resolve(), suffix=".py", exclude=set(exclude_dirs)))
+    python_files = set(ad_file.recursive_get_files(base=app_dir.resolve(), suffix=".py", exclude=set(exclude_dirs)))
     imports, failed = get_dependency_graph(python_files)
     if failed:
         raise DeployError("Python dependency scan failed; check the changed modules")
-    config_files = set(utils.recursive_get_files(
+    config_files = set(ad_file.recursive_get_files(
         base=app_dir.resolve(), suffix={".yaml", ".toml"},
         exclude=set(exclude_dirs) | {"ruff.toml", "pyproject.toml", "secrets.yaml"}))
     config_files = {path for path in config_files if str(path.relative_to(app_dir)) not in DATA_CONFIGS}
@@ -168,11 +168,11 @@ def snapshot(app_dir, exclude_dirs):
     with contextlib.redirect_stdout(sys.stderr):
         try:
             for path in sorted(config_files):
-                # The installed loader replaces utils.secrets when a directory
+                # The installed loader replaces its secrets when a directory
                 # has its own secrets file. Restore the main config's secrets
                 # for every document so sibling directories cannot inherit it.
-                utils.secrets = copy.deepcopy(APP_SECRETS)
-                raw = utils.read_config_file(path, app_config=True)
+                ad_file.yaml.secrets = copy.deepcopy(APP_SECRETS)
+                raw = ad_file.read_config_file(path, app_config=True)
                 if raw:
                     validated = AllAppConfig.model_validate(raw)
                     for name, definition in validated.root.items():
@@ -184,7 +184,7 @@ def snapshot(app_dir, exclude_dirs):
                         else:
                             merged[name] = definition
         finally:
-            utils.secrets = copy.deepcopy(APP_SECRETS)
+            ad_file.yaml.secrets = copy.deepcopy(APP_SECRETS)
     configs = AllAppConfig.model_construct(root=merged)
     apps, globals_ = {}, {}
     for name, app in configs.root.items():
@@ -208,12 +208,12 @@ def snapshot(app_dir, exclude_dirs):
 
 
 def read_settings(config_path):
-    from appdaemon import utils
+    from appdaemon.utils import file as ad_file
 
     global APP_SECRETS, ERROR_LOG
     with contextlib.redirect_stdout(sys.stderr):
-        config = utils.read_config_file(config_path, app_config=False)
-    APP_SECRETS = copy.deepcopy(utils.secrets)
+        config = ad_file.read_config_file(config_path, app_config=False)
+    APP_SECRETS = copy.deepcopy(ad_file.yaml.secrets)
     filename = config.get("logs", {}).get("error_log", {}).get("filename")
     ERROR_LOG = Path(filename) if filename and filename not in {"STDOUT", "STDERR"} else None
     if ERROR_LOG is not None and not ERROR_LOG.is_absolute():
