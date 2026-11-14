@@ -1,0 +1,10 @@
+# NewsHeadlines - DR's latest headlines as sensor.news_headlines, for the voice assistant to read out.
+# The RSS feed is fetched at start and every interval_s; the entity lists the newest max_items headlines
+# (title and local time) and keeps the last good ones while a fetch fails. See news_headlines.py.
+NewsHeadlines:
+  module: news_headlines
+  class: NewsHeadlines
+  entity: sensor.news_headlines
+  feed: https://www.dr.dk/nyheder/service/feeds/allenyheder
+  interval_s: 900
+  max_items: 20
