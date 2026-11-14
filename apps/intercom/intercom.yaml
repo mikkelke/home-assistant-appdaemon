@@ -14,11 +14,10 @@ Intercom:
   back_sensor: "binary_sensor.intercomproxy_doorbell_back_door"
   apt_sensor: "binary_sensor.yale_doorbell_ding"
 
-  # ABB station id -> door. A street ring triggers from whichever of the ABB SIP ring and the
-  # ESP sensor above arrives first; the other is debounced.
-  abb_ring_stations:
-    "100000002": front door
-    "100000001": back door
+  # ABB station ids of the two street doors. A street ring triggers from whichever of the ABB
+  # SIP ring and the ESP sensor above arrives first; the other is debounced.
+  abb_front_station: "100000002"
+  abb_back_station: "100000001"
 
   # Locks
   front_lock: "lock.intercomproxy_front_door"

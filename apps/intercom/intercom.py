@@ -223,12 +223,13 @@ class Intercom(hass.Hass):
         # A street ring usually reaches HA first as the ABB gateway's SIP INVITE, ahead of the ESP
         # bus tap. It is handled as an edge of that door's ESP sensor, so the ESP edge that
         # follows lands inside debounce_s and is dropped, and a ring the gateway misses still
-        # comes in through the ESP. Stations not in abb_ring_stations never trigger anything.
-        sensor_by_label = {info["ring_label"]: entity for entity, info in self.trigger_map.items()
-                           if info.get("lock")}
-        raw_stations = self.args.get("abb_ring_stations", {}) or {}
-        self.abb_ring_sensors = {str(station): sensor_by_label[label]
-                                 for station, label in raw_stations.items() if label in sensor_by_label}
+        # comes in through the ESP. Any other station never triggers anything.
+        self.abb_ring_sensors = {
+            str(station): sensor
+            for station, sensor in ((self.args.get("abb_front_station"), self.front_sensor),
+                                    (self.args.get("abb_back_station"), self.back_sensor))
+            if station and sensor
+        }
         if self.abb_ring_sensors:
             self.listen_event(self._on_abb_ring, self.args.get("abb_ring_event", "abb_welcome_ring"))
             self.log(f"ABB rings trigger: {self.abb_ring_sensors}", level="INFO")
