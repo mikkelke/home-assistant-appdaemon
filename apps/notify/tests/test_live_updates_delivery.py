@@ -70,12 +70,6 @@ def with_courier(state, named):
     return state
 
 
-def with_left(state, left):
-    """state with HomeDelivery's left_at_door set: the carriers whose courier left a parcel outside the door."""
-    state["attributes"]["left_at_door"] = left
-    return state
-
-
 def expecting(*entries, due=True):
     """sensor(...) as HomeDelivery publishes it while a Wolt courier is due: door_courier is the first active food
     entry."""
@@ -276,24 +270,6 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(matched=matched):
                 self.assertEqual(set(lu.delivery_cards(state, NOW, {matched})), {POSTNORD, GLS})
         self.assertEqual(set(lu.delivery_cards(state, NOW, {"airmee:TEST0001", "gls:TEST0004"})), {POSTNORD})
-
-    def test_a_carrier_that_left_a_parcel_at_the_door_loses_the_card_of_all_its_parcels(self):
-        state = with_left(sensor(parcel_entry("airmee", barcode="TEST0001"), parcel_entry("airmee", barcode="TEST0002"),
-                                 parcel_entry("postnord", barcode="TEST0003"), entry(title="Pizza Test", eta=NOW + 300)),
-                          ["airmee"])
-        self.assertEqual(set(lu.delivery_cards(state, NOW)), {AIRMEE, POSTNORD, WOLT})
-        self.assertEqual(set(lu.delivery_cards(state, NOW, lu.left_at_door(state))), {POSTNORD, WOLT})
-
-    def test_what_the_sensor_says_about_the_door_is_read_carefully(self):
-        self.assertEqual(lu.left_at_door(with_left(sensor(), ["postnord", "gls"])), {"postnord", "gls"})
-        self.assertEqual(lu.left_at_door(with_left(sensor(), ["postnord", 5, None, ["gls"]])), {"postnord"})
-        for value in ("postnord", {"postnord": 1}, 5, None):
-            with self.subTest(value=value):
-                self.assertEqual(lu.left_at_door(with_left(sensor(), value)), set())
-        for state in (sensor(), None, full("unavailable", {"left_at_door": ["postnord"]}),
-                      full("unknown", {"left_at_door": ["postnord"]})):
-            with self.subTest(state=state):
-                self.assertEqual(lu.left_at_door(state), set())
 
     def test_a_handed_over_food_or_groceries_order_takes_only_itself(self):
         state = sensor(entry(title="Pizza Test", eta=NOW + 300), entry(title=KITCHEN, eta=NOW + 900),
@@ -677,21 +653,6 @@ class CourierHandoverTests(unittest.IsolatedAsyncioTestCase):
         h.forget_calls()
         await h.reconcile(600)
         self.assertEqual(h.ongoing(GLS), [])
-
-    async def test_a_parcel_left_at_the_door_takes_its_carriers_card_away_while_the_sensor_says_so(self):
-        parcel, other = parcel_entry("postnord", barcode="TEST0001"), parcel_entry("gls", barcode="TEST0002")
-        h = await self.make(states={ENTITIES["delivery"]: sensor(parcel, other)})
-        self.assertEqual({payload["data"]["tag"] for _, payload in h.ongoing()}, {POSTNORD, GLS})
-        h.forget_calls()
-        h.states[ENTITIES["delivery"]] = with_left(sensor(parcel, other), ["postnord"])
-        await h.reconcile(10)
-        self.assertEqual((len(h.clears(POSTNORD)), h.clears(GLS), h.ongoing()), (1, [], []))
-        h.forget_calls()
-        await h.reconcile(600)
-        self.assertEqual((h.ongoing(), h.clears()), ([], []))
-        h.states[ENTITIES["delivery"]] = sensor(parcel, other)
-        await h.reconcile(1200)
-        self.assertEqual([payload["data"]["tag"] for _, payload in h.ongoing()], [POSTNORD])
 
     async def test_a_ring_matched_to_one_parcel_takes_its_carriers_other_parcels_away_for_good(self):
         first, second = parcel_entry("airmee", barcode="TEST0001"), parcel_entry("airmee", barcode="TEST0002")

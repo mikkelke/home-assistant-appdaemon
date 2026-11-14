@@ -144,7 +144,10 @@ APARTMENT_DOOR = "binary_sensor.apartment_test_door"
 APARTMENT_BELL = "binary_sensor.apartment_test_bell"
 LANDING_ARGS = {"landing_entity": LANDING, "apartment_door_entity": APARTMENT_DOOR,
                 "apartment_doorbell_entity": APARTMENT_BELL, "owner_entity": OWNER, "notify_target": "owner_test"}
-AIRMEE_SENTENCE = "Your Airmee parcel is outside the door."
+AIRMEE_SENTENCE = "Your Airmee parcel was delivered. It's outside the door."
+POSTNORD_SENTENCE = "Your PostNord parcel was delivered. It's outside the door."
+AIRMEE_PARCEL = ("Airmee", "TESTAM0001")
+POSTNORD_PARCEL = ("PostNord", "TESTPN0001")
 
 
 def shipped_setting(key):
@@ -157,6 +160,17 @@ def shipped_setting(key):
 
 def landing_watch(source="airmee", carrier="Airmee", until=NOW + hd.LANDING_WATCH_S, **kw):
     return hd.LandingWatch(source, carrier, until, **kw)
+
+
+def left_watch(source="airmee", carrier="Airmee", at=NOW + 90, **kw):
+    """The watch of a carrier whose landing sensor went off at `at`."""
+    return landing_watch(source, carrier, until=at + hd.CONFIRM_WINDOW_S, left=True, **kw)
+
+
+def out_for_delivery(*parcels):
+    """The aggregator's incoming sensor listing these (carrier, barcode) parcels as out for delivery."""
+    return {AGGREGATOR_INCOMING: aggregator(*[parcel(carrier=carrier, barcode=barcode)
+                                              for carrier, barcode in parcels])}
 
 
 def presses(h):
@@ -590,11 +604,6 @@ class SnapshotTests(unittest.TestCase):
     def test_the_published_attributes_are_plain_json(self):
         published = hd.snapshot([delivery(eta=at(8)), delivery(id="nemlig", stage="preparing", window_start=at(5), window_end=at(60))], NOW)
         self.assertEqual(json.loads(json.dumps(published["attributes"])), published["attributes"])
-
-    def test_the_carriers_that_left_a_parcel_at_the_door_are_published_as_given(self):
-        self.assertEqual(hd.snapshot([], NOW)["attributes"]["left_at_door"], [])
-        self.assertEqual(hd.snapshot([], NOW, left=["airmee", "postnord"])["attributes"]["left_at_door"],
-                         ["airmee", "postnord"])
 
     def test_courier_expected_when_something_is_on_the_way(self):
         for stage in ("on_the_way", "arriving"):
@@ -1894,13 +1903,44 @@ class CarrierNameTests(unittest.TestCase):
         self.assertEqual(hd.carrier_name([delivery()], "wolt"), "wolt")
 
 
-class LandingCourierTests(unittest.TestCase):
-    def courier(self, *deliveries, used=None, buttons=BUTTONS):
-        return hd.landing_courier(list(deliveries), NOW, buttons, used)
+class RefreshSourcesTests(unittest.TestCase):
+    def sources(self, *deliveries, buttons=BUTTONS):
+        return hd.refresh_sources(list(deliveries), NOW, buttons)
 
-    def test_a_parcel_courier_is_the_carrier_by_its_own_name(self):
-        self.assertEqual(self.courier(carrier_parcel()), ("airmee", "Airmee"))
-        self.assertEqual(self.courier(carrier_parcel("PostNord", "TESTPN0001", start=at(5))), ("postnord", "PostNord"))
+    def test_every_carrier_with_a_parcel_out_for_delivery_is_named_in_the_order_of_the_parcels(self):
+        soon = carrier_parcel("PostNord", "TESTPN0001", start=at(5))
+        later = carrier_parcel("Airmee", "TESTAM0001", start=at(40))
+        for deliveries in ([later, soon], [soon, later]):
+            with self.subTest(order=[d.source for d in deliveries]):
+                self.assertEqual(self.sources(*deliveries), ["postnord", "airmee"])
+
+    def test_a_carrier_is_named_once_however_many_parcels_it_has_out(self):
+        self.assertEqual(self.sources(carrier_parcel(), carrier_parcel(barcode="TESTAM0002")), ["airmee"])
+
+    def test_a_carrier_without_a_button_or_without_a_parcel_out_is_not_named(self):
+        gls = carrier_parcel("GLS", "TESTGL0001")
+        not_out = [carrier_parcel("PostNord", "TESTPN0001", status="in_transit", start=at(30)),
+                   carrier_parcel("PostNord", "TESTPN0002", status="delivered", delivered_at=at(-1))]
+        self.assertEqual(self.sources(gls, carrier_parcel(), *not_out), ["airmee"])
+        self.assertEqual(self.sources(gls, *not_out), [])
+        self.assertEqual(self.sources(carrier_parcel(), buttons={}), [])
+        self.assertEqual(self.sources(), [])
+
+    def test_nobody_is_named_while_a_food_or_groceries_courier_is_likelier(self):
+        parcel_out = carrier_parcel()
+        self.assertEqual(self.sources(parcel_out, delivery()), [])
+        self.assertEqual(self.sources(parcel_out, nemlig_delivery()), [])
+        self.assertEqual(self.sources(parcel_out, delivery(stage="preparing")), ["airmee"])
+
+
+class LandingCouriersTests(unittest.TestCase):
+    def couriers(self, *deliveries, used=None, buttons=BUTTONS):
+        return hd.landing_couriers(list(deliveries), NOW, buttons, used)
+
+    def test_each_carrier_with_a_parcel_out_is_a_courier_by_its_own_name(self):
+        self.assertEqual(self.couriers(carrier_parcel()), [("airmee", "Airmee")])
+        both = [carrier_parcel(), carrier_parcel("PostNord", "TESTPN0001", start=at(5))]
+        self.assertEqual(self.couriers(*both), [("postnord", "PostNord"), ("airmee", "Airmee")])
 
     def test_nobody_is_expected_unless_a_parcel_with_a_button_is_out_for_delivery(self):
         cases = {"nothing on the way": [], "only expected later": [carrier_parcel(status="in_transit", start=at(30))],
@@ -1909,94 +1949,145 @@ class LandingCourierTests(unittest.TestCase):
                  "groceries out": [carrier_parcel(), nemlig_delivery()]}
         for name, deliveries in cases.items():
             with self.subTest(name):
-                self.assertIsNone(self.courier(*deliveries))
+                self.assertEqual(self.couriers(*deliveries), [])
 
     def test_someone_who_has_just_used_the_apartment_door_is_not_taken_for_a_courier(self):
         for used, expected in ((None, True), (NOW - 3600, True), (NOW - 60, True), (NOW - 59, False), (NOW, False)):
             with self.subTest(used=used):
-                self.assertEqual(self.courier(carrier_parcel(), used=used) is not None, expected)
+                self.assertEqual(bool(self.couriers(carrier_parcel(), used=used)), expected)
 
 
 class LandingStepTests(unittest.TestCase):
     AIRMEE = ("airmee", "Airmee")
     POSTNORD = ("postnord", "PostNord")
 
-    def told_watch(self, source="airmee", carrier="Airmee", at=NOW + 90):
-        return landing_watch(source, carrier, until=at + hd.LEFT_AT_DOOR_S, told=True)
+    def test_an_arrival_watches_each_courier_for_ten_minutes(self):
+        watches, left = hd.landing_step({}, "arrived", NOW, [self.AIRMEE, self.POSTNORD])
+        self.assertEqual((watches, left),
+                         ({"airmee": landing_watch(), "postnord": landing_watch("postnord", "PostNord")}, []))
 
-    def test_an_arrival_with_a_courier_opens_a_watch_for_ten_minutes(self):
-        self.assertEqual(hd.landing_step([], "arrived", NOW, self.AIRMEE), ([landing_watch()], []))
+    def test_an_arrival_without_a_courier_watches_nothing(self):
+        self.assertEqual(hd.landing_step({}, "arrived", NOW), ({}, []))
 
-    def test_an_arrival_without_a_courier_opens_nothing(self):
-        self.assertEqual(hd.landing_step([], "arrived", NOW), ([], []))
+    def test_leaving_ends_the_watches_on_the_landing_and_gives_them_ten_minutes_to_be_confirmed(self):
+        watches, left = hd.landing_step({"airmee": landing_watch()}, "left", NOW + 90)
+        self.assertEqual((watches, left), ({"airmee": left_watch()}, [left_watch()]))
 
-    def test_leaving_fires_the_watch_and_keeps_it_as_told_for_half_an_hour(self):
-        watches, fired = hd.landing_step([landing_watch()], "left", NOW + 90)
-        self.assertEqual((watches, fired), ([self.told_watch()], [self.told_watch()]))
+    def test_leaving_with_nothing_watched_ends_nothing(self):
+        self.assertEqual(hd.landing_step({}, "left", NOW + 90), ({}, []))
 
-    def test_leaving_with_nothing_watched_fires_nothing(self):
-        self.assertEqual(hd.landing_step([], "left", NOW + 90), ([], []))
+    def test_a_visit_must_end_within_ten_minutes(self):
+        self.assertEqual(hd.landing_step({"airmee": landing_watch()}, "left", NOW + 599)[1],
+                         [left_watch(at=NOW + 599)])
+        self.assertEqual(hd.landing_step({"airmee": landing_watch()}, "left", NOW + 600), ({}, []))
 
-    def test_the_window_decides_what_still_counts(self):
-        self.assertEqual(hd.landing_step([landing_watch()], "left", NOW + 599)[1], [self.told_watch(at=NOW + 599)])
-        self.assertEqual(hd.landing_step([landing_watch()], "left", NOW + 600), ([], []))
+    def test_a_watch_marked_delivered_keeps_the_mark_when_it_leaves(self):
+        watches, left = hd.landing_step({"airmee": landing_watch(delivered=True)}, "left", NOW + 90)
+        self.assertEqual((watches, left), ({"airmee": left_watch(delivered=True)}, [left_watch(delivered=True)]))
 
-    def test_an_attended_door_drops_the_open_watches_without_firing(self):
-        watches, fired = hd.landing_step([landing_watch()], "attended", NOW + 30)
-        self.assertEqual((watches, fired), ([], []))
-        self.assertEqual(hd.landing_step(watches, "left", NOW + 90), ([], []))
+    def test_a_watch_that_has_left_is_not_ended_again(self):
+        watches, _ = hd.landing_step({"airmee": landing_watch()}, "left", NOW + 90)
+        self.assertEqual(hd.landing_step(watches, "left", NOW + 95), (watches, []))
 
-    def test_an_attended_door_leaves_a_carrier_told_about_alone(self):
-        told = self.told_watch()
-        watches = [told, landing_watch("postnord", "PostNord")]
-        self.assertEqual(hd.landing_step(watches, "attended", NOW + 100), ([told], []))
+    def test_each_carrier_on_the_landing_is_ended_and_one_that_has_left_already_is_left_alone(self):
+        waiting = left_watch("postnord", "PostNord", at=NOW + 10)
+        watches, left = hd.landing_step({"airmee": landing_watch(), "postnord": waiting}, "left", NOW + 90)
+        self.assertEqual((watches, left), ({"airmee": left_watch(), "postnord": waiting}, [left_watch()]))
 
-    def test_a_watch_fires_once(self):
-        watches, fired = hd.landing_step([landing_watch()], "left", NOW + 90)
-        watches, again = hd.landing_step(watches, "left", NOW + 95)
-        self.assertEqual((len(fired), again, watches), (1, [], [self.told_watch()]))
+    def test_the_door_opening_marks_every_watch_opened_on_the_landing_or_left(self):
+        watches = {"airmee": landing_watch(), "postnord": left_watch("postnord", "PostNord")}
+        self.assertEqual(hd.landing_step(watches, "opened", NOW + 100),
+                         ({"airmee": landing_watch(opened=True),
+                           "postnord": left_watch("postnord", "PostNord", opened=True)}, []))
 
-    def test_one_courier_is_told_once_however_many_watches_it_has(self):
-        watches, fired = hd.landing_step([landing_watch(), landing_watch(until=NOW + 650)], "left", NOW + 90)
-        self.assertEqual((len(fired), len(watches)), (1, 1))
+    def test_a_door_that_opens_with_nothing_watched_changes_nothing(self):
+        self.assertEqual(hd.landing_step({}, "opened", NOW), ({}, []))
 
-    def test_each_carrier_with_an_open_watch_is_told(self):
-        watches, fired = hd.landing_step([landing_watch(), landing_watch("postnord", "PostNord")], "left", NOW + 90)
-        self.assertEqual([watch.source for watch in fired], ["airmee", "postnord"])
+    def test_a_carrier_that_comes_back_is_on_the_landing_again_for_ten_minutes_and_keeps_its_open_door(self):
+        watches, left = hd.landing_step({"airmee": left_watch(opened=True)}, "arrived", NOW + 200, [self.AIRMEE])
+        self.assertEqual((watches, left),
+                         ({"airmee": landing_watch(until=NOW + 200 + hd.LANDING_WATCH_S, opened=True)}, []))
 
-    def test_a_carrier_told_about_gets_no_new_watch_for_half_an_hour(self):
-        told = self.told_watch()
-        again = NOW + 90 + hd.LEFT_AT_DOOR_S
-        self.assertEqual(hd.landing_step([told], "arrived", again - 1, self.AIRMEE), ([told], []))
-        self.assertEqual(hd.landing_step([told], "arrived", again, self.AIRMEE),
-                         ([landing_watch(until=again + hd.LANDING_WATCH_S)], []))
+    def test_another_carrier_arriving_leaves_the_one_waiting_for_a_delivery_alone(self):
+        waiting = left_watch()
+        watches, _ = hd.landing_step({"airmee": waiting}, "arrived", NOW + 200, [self.POSTNORD])
+        self.assertEqual(watches, {"airmee": waiting, "postnord": landing_watch(
+            "postnord", "PostNord", until=NOW + 200 + hd.LANDING_WATCH_S)})
 
-    def test_another_carrier_is_given_a_watch_whatever_the_first_was(self):
-        told = self.told_watch()
-        watches, _ = hd.landing_step([told], "arrived", NOW + 200, self.POSTNORD)
-        self.assertEqual(watches, [told, landing_watch("postnord", "PostNord", until=NOW + 200 + hd.LANDING_WATCH_S)])
+    def test_any_event_drops_the_watches_whose_time_is_over(self):
+        watches = {"airmee": left_watch(), "postnord": landing_watch("postnord", "PostNord")}
+        over = NOW + 90 + hd.CONFIRM_WINDOW_S
+        for event in ("arrived", "left", "opened"):
+            with self.subTest(event=event):
+                self.assertEqual(hd.landing_step(watches, event, over), ({}, []))
 
     def test_the_watches_given_are_left_alone(self):
-        watches = [landing_watch()]
-        for event in ("arrived", "attended", "left"):
-            hd.landing_step(watches, event, NOW + 10, self.AIRMEE)
-        self.assertEqual(watches, [landing_watch()])
+        watches = {"airmee": landing_watch()}
+        for event in ("arrived", "opened", "left"):
+            hd.landing_step(watches, event, NOW + 10, [self.AIRMEE])
+        self.assertEqual(watches, {"airmee": landing_watch()})
 
 
-class LeftAtDoorTests(unittest.TestCase):
-    def told(self, source="airmee", until=NOW + hd.LEFT_AT_DOOR_S):
-        return landing_watch(source, source.title(), until=until, told=True)
+class DeliveredStepTests(unittest.TestCase):
+    def test_a_carrier_that_left_the_landing_is_confirmed_by_its_delivery_and_its_watch_ends(self):
+        waiting = left_watch("postnord", "PostNord")
+        watches, confirmed = hd.delivered_step({"airmee": left_watch(), "postnord": waiting}, {"airmee"}, NOW + 200)
+        self.assertEqual((watches, confirmed), ({"postnord": waiting}, [left_watch()]))
 
-    def test_the_carriers_told_about_are_listed_while_their_half_hour_lasts(self):
-        watches = [self.told(), self.told("postnord", NOW + 1900), landing_watch("gls", "GLS", until=NOW + 5000)]
-        self.assertEqual(hd.left_at_door(watches, NOW + 100), ["airmee", "postnord"])
-        self.assertEqual(hd.left_at_door(watches, NOW + 1799), ["airmee", "postnord"])
-        self.assertEqual(hd.left_at_door(watches, NOW + 1800), ["postnord"])
-        self.assertEqual(hd.left_at_door(watches, NOW + 1900), [])
-        self.assertEqual(hd.left_at_door([], NOW), [])
+    def test_every_carrier_delivered_at_once_is_confirmed(self):
+        both = {"airmee": left_watch(), "postnord": left_watch("postnord", "PostNord")}
+        watches, confirmed = hd.delivered_step(both, {"airmee", "postnord"}, NOW + 200)
+        self.assertEqual((watches, [watch.source for watch in confirmed]), ({}, ["airmee", "postnord"]))
 
-    def test_a_carrier_told_about_twice_is_listed_once(self):
-        self.assertEqual(hd.left_at_door([self.told(), self.told()], NOW + 10), ["airmee"])
+    def test_a_carrier_still_on_the_landing_is_marked_delivered_and_not_yet_confirmed(self):
+        watches = {"airmee": landing_watch(), "postnord": landing_watch("postnord", "PostNord")}
+        marked, confirmed = hd.delivered_step(watches, {"airmee"}, NOW + 30)
+        self.assertEqual((marked, confirmed), (
+            {"airmee": landing_watch(delivered=True), "postnord": landing_watch("postnord", "PostNord")}, []))
+        self.assertEqual(hd.delivered_step(marked, {"airmee"}, NOW + 40), (marked, []))
+
+    def test_a_watch_marked_delivered_on_the_landing_is_confirmed_as_soon_as_it_leaves(self):
+        watches, left = hd.landing_step({"airmee": landing_watch(delivered=True)}, "left", NOW + 90)
+        self.assertEqual(hd.delivered_step(watches, {watch.source for watch in left if watch.delivered}, NOW + 90),
+                         ({}, [left_watch(delivered=True)]))
+
+    def test_a_visit_that_has_gone_on_for_ten_minutes_is_not_marked_either(self):
+        self.assertEqual(hd.delivered_step({"airmee": landing_watch()}, {"airmee"}, NOW + 599)[0],
+                         {"airmee": landing_watch(delivered=True)})
+        self.assertEqual(hd.delivered_step({"airmee": landing_watch()}, {"airmee"}, NOW + 600), ({}, []))
+
+    def test_the_delivery_must_come_within_ten_minutes_of_the_sensor_going_off(self):
+        watches = {"airmee": left_watch()}
+        self.assertEqual(hd.delivered_step(watches, {"airmee"}, NOW + 90 + 599)[1], [left_watch()])
+        self.assertEqual(hd.delivered_step(watches, {"airmee"}, NOW + 90 + 600), ({}, []))
+
+    def test_another_carriers_delivery_confirms_nothing(self):
+        watches = {"airmee": left_watch()}
+        self.assertEqual(hd.delivered_step(watches, {"gls", "postnord"}, NOW + 200), (watches, []))
+
+    def test_a_watch_whose_door_opened_is_confirmed_too_and_says_so(self):
+        watches = {"airmee": left_watch(opened=True)}
+        self.assertEqual(hd.delivered_step(watches, {"airmee"}, NOW + 200), ({}, [left_watch(opened=True)]))
+
+    def test_nothing_watched_nothing_confirmed(self):
+        self.assertEqual(hd.delivered_step({}, {"airmee"}, NOW), ({}, []))
+
+    def test_the_watches_given_are_left_alone(self):
+        watches = {"airmee": left_watch()}
+        hd.delivered_step(watches, {"airmee"}, NOW + 200)
+        self.assertEqual(watches, {"airmee": left_watch()})
+
+
+class ToldRecentlyTests(unittest.TestCase):
+    def test_a_carrier_is_told_about_again_after_half_an_hour(self):
+        told = {"airmee": NOW}
+        self.assertTrue(hd.told_recently(told, "airmee", NOW))
+        self.assertTrue(hd.told_recently(told, "airmee", NOW + hd.TELL_AGAIN_AFTER_S - 1))
+        self.assertFalse(hd.told_recently(told, "airmee", NOW + hd.TELL_AGAIN_AFTER_S))
+
+    def test_a_carrier_nobody_was_told_about_is_not_recent(self):
+        self.assertFalse(hd.told_recently({"airmee": NOW}, "postnord", NOW))
+        self.assertFalse(hd.told_recently({}, "airmee", NOW))
 
 
 class NoticeChannelTests(unittest.TestCase):
@@ -2010,8 +2101,9 @@ class NoticeChannelTests(unittest.TestCase):
                 with self.subTest(state=state, free=free):
                     self.assertEqual(hd.notice_channel(state, free), "push")
 
-    def test_the_sentence_names_the_carrier(self):
-        self.assertEqual(hd.parcel_outside_sentence("PostNord"), "Your PostNord parcel is outside the door.")
+    def test_the_sentence_says_the_carrier_delivered_and_where_the_parcel_is(self):
+        self.assertEqual(hd.parcel_outside_sentence("PostNord"),
+                         "Your PostNord parcel was delivered. It's outside the door.")
 
 
 class Speakers:
@@ -2040,18 +2132,18 @@ class Phone:
 
 
 class LandingWatchAppTests(unittest.TestCase):
-    AIRMEE_OUT = {AGGREGATOR_INCOMING: aggregator(parcel(carrier="Airmee", barcode="TESTAM0001"))}
     PUSH = {"title": "Parcel delivery", "message": AIRMEE_SENTENCE, "target": "owner_test"}
-    NO_PARCEL_COURIER = {
-        "a food courier is due": {**wolt(courier=True, eta=at(5))},
-        "nothing on the way": {AGGREGATOR_INCOMING: aggregator()},
+    NOBODY_EXPECTED = {
+        "a food courier is due": ({**wolt(courier=True, eta=at(5)), **out_for_delivery(AIRMEE_PARCEL)}, AIRMEE_PARCEL),
+        "nothing on the way": (out_for_delivery(), AIRMEE_PARCEL),
         "the parcel is only expected later today":
-            {AGGREGATOR_INCOMING: aggregator(parcel(carrier="Airmee", status="in_transit", start=at(30)))},
-        "the carrier has no button": {AGGREGATOR_INCOMING: aggregator(parcel(carrier="GLS", barcode="TESTGL0001"))},
+            ({AGGREGATOR_INCOMING: aggregator(parcel(carrier="Airmee", status="in_transit", start=at(30)))},
+             AIRMEE_PARCEL),
+        "the carrier has no button": (out_for_delivery(("GLS", "TESTGL0001")), ("GLS", "TESTGL0001")),
     }
 
-    def make(self, owner="home", quiet=False, states=None, **args):
-        h = Harness({OWNER: {"state": owner, "attributes": {}}, **self.AIRMEE_OUT, **(states or {})},
+    def make(self, owner="home", quiet=False, parcels=(AIRMEE_PARCEL,), states=None, **args):
+        h = Harness({OWNER: {"state": owner, "attributes": {}}, **out_for_delivery(*parcels), **(states or {})},
                     **{"refresh_buttons": BUTTONS, **LANDING_ARGS, **args})
         h.speakers, h.phone = Speakers(quiet), Phone()
         h.apps = {"SonosNotifier": h.speakers, "MobileNotifier": h.phone}
@@ -2063,41 +2155,322 @@ class LandingWatchAppTests(unittest.TestCase):
         h.change(LANDING, "on")
         h.advance(stayed)
         h.change(LANDING, "off")
-        h.run_executor()
 
-    def told(self, h):
-        return h.speakers.said, h.phone.pushed
+    def visit_touching(self, h, entity, on_the_landing):
+        """A visit in which `entity` goes on and off, 10 s after the sensor went on or 60 s after it went off."""
+        h.advance(60)
+        h.change(LANDING, "on")
+        h.advance(10)
+        if on_the_landing:
+            h.change(entity, "on")
+            h.change(entity, "off")
+        h.advance(30)
+        h.change(LANDING, "off")
+        h.advance(60)
+        if not on_the_landing:
+            h.change(entity, "on")
+            h.change(entity, "off")
+        h.advance(60)
 
-    def deliver(self, h):
-        """The carrier calls the parcel delivered, so that no parcel courier is expected any more."""
-        h.states[AGGREGATOR_INCOMING] = aggregator()
-        h.states[AGGREGATOR_DELIVERED] = aggregator(
-            parcel(carrier="Airmee", barcode="TESTAM0001", status="delivered", delivered_at=h.now))
+    def deliver(self, h, *delivered, out=()):
+        """The carriers call these (carrier, barcode) parcels delivered; the parcels in `out` are still out."""
+        h.states.update(out_for_delivery(*out))
+        h.states[AGGREGATOR_DELIVERED] = aggregator(*[
+            parcel(carrier=carrier, barcode=barcode, status="delivered", delivered_at=h.now)
+            for carrier, barcode in delivered])
         h.app._on_change(AGGREGATOR_INCOMING, "all", {}, {}, {})
 
-    def test_a_courier_who_came_up_and_left_is_told_and_the_carrier_refreshed_once(self):
+    def told(self, h):
+        h.run_executor()
+        return h.speakers.said, h.phone.pushed
+
+    def test_a_visit_presses_the_carriers_button_at_once_and_after_one_three_and_six_minutes(self):
         h = self.make()
         h.advance(60)
         h.change(LANDING, "on")
         h.advance(40)
-        self.assertEqual((self.told(h), presses(h), h.last[1]["left_at_door"]), (([], []), [], []))
-        h.change(LANDING, "off")
-        h.run_executor()
-        self.assertEqual(self.told(h), ([{"message": AIRMEE_SENTENCE}], []))
-        self.assertEqual(presses(h), ["button.airmee_test_refresh"])
-        self.assertEqual(h.last[1]["left_at_door"], ["airmee"])
+        self.assertEqual(presses(h), [])
         self.assertIn(("INFO", "Someone is on the landing while Airmee has a parcel out for delivery"), h.logs)
-        self.assertIn(("INFO", "An Airmee parcel is outside the door: telling the owner via speakers"), h.logs)
-        h.advance(3600)
-        self.assertEqual((len(h.speakers.said), len(presses(h))), (1, 1))
+        h.change(LANDING, "off")
+        self.assertEqual(len(presses(h)), 1)
+        for waited, total in ((59, 1), (1, 2), (119, 2), (1, 3), (179, 3), (1, 4), (3600, 4)):
+            h.advance(waited)
+            self.assertEqual(len(presses(h)), total, f"after waiting {waited} s more")
+        self.assertEqual(set(presses(h)), {"button.airmee_test_refresh"})
+        self.assertIn(("INFO", "Refreshing airmee after someone left the landing"), h.logs)
 
-    def test_the_presses_after_a_ring_stay_beside_the_one_for_the_visit(self):
+    def test_the_presses_stop_once_the_carrier_has_nothing_undelivered(self):
         h = self.make()
-        h.ring(("front door", NOW))
+        self.visit(h)
+        h.advance(60)
+        self.assertEqual(len(presses(h)), 2)
+        self.deliver(h, AIRMEE_PARCEL)
+        h.advance(3600)
+        self.assertEqual(len(presses(h)), 2)
+
+    def test_another_parcel_of_the_carrier_still_out_keeps_the_presses_coming(self):
+        two = [AIRMEE_PARCEL, ("Airmee", "TESTAM0002")]
+        h = self.make(parcels=two)
+        self.visit(h)
+        self.deliver(h, two[0], out=two[1:])
+        h.advance(3600)
+        self.assertEqual(len(presses(h)), 4)
+
+    def test_he_is_told_once_when_the_carrier_says_the_parcel_is_delivered_and_not_before(self):
+        h = self.make()
+        self.visit(h)
+        h.advance(300)
+        self.assertEqual(self.told(h), ([], []))
+        self.deliver(h, AIRMEE_PARCEL)
+        self.assertEqual(self.told(h), ([{"message": AIRMEE_SENTENCE}], []))
+        self.assertIn(("INFO", "An Airmee parcel was delivered outside the door: telling the owner via speakers"),
+                      h.logs)
+        self.assertEqual([entry["stage"] for entry in h.last[1]["deliveries"]], ["delivered"])
+        h.tick(60)
+        h.tick(3600)
+        self.assertEqual(self.told(h), ([{"message": AIRMEE_SENTENCE}], []))
+
+    def test_a_delivery_must_come_within_ten_minutes_of_the_sensor_going_off(self):
+        for waited, said in ((599, 1), (600, 0)):
+            with self.subTest(waited=waited):
+                h = self.make()
+                self.visit(h)
+                h.advance(waited)
+                self.deliver(h, AIRMEE_PARCEL)
+                self.assertEqual(len(self.told(h)[0]), said)
+
+    def test_a_parcel_that_is_never_delivered_tells_nothing_and_is_refreshed_no_more_after_six_minutes(self):
+        h = self.make()
         self.visit(h)
         h.advance(3600)
-        self.assertEqual(presses(h), ["button.airmee_test_refresh"] * 3)
-        self.assertEqual(len(h.speakers.said), 1)
+        h.tick(0)
+        self.assertEqual((self.told(h), len(presses(h))), (([], []), 4))
+
+    def test_a_delivery_reported_while_the_courier_is_on_the_landing_is_told_as_the_sensor_goes_off(self):
+        h = self.make()
+        h.advance(60)
+        h.change(LANDING, "on")
+        h.advance(20)
+        self.deliver(h, AIRMEE_PARCEL)
+        self.assertEqual(self.told(h), ([], []))
+        h.advance(20)
+        h.change(LANDING, "off")
+        self.assertEqual(self.told(h), ([{"message": AIRMEE_SENTENCE}], []))
+        self.assertEqual(presses(h), [])
+        h.advance(3600)
+        h.tick(0)
+        self.assertEqual(len(self.told(h)[0]), 1)
+
+    def test_a_delivery_reported_on_the_landing_is_handed_over_when_the_door_opens_during_the_visit(self):
+        for door_first in (True, False):
+            with self.subTest(door_first=door_first):
+                h = self.make()
+                h.advance(60)
+                h.change(LANDING, "on")
+                h.advance(10)
+                if door_first:
+                    h.change(APARTMENT_DOOR, "on")
+                    h.change(APARTMENT_DOOR, "off")
+                self.deliver(h, AIRMEE_PARCEL)
+                if not door_first:
+                    h.advance(10)
+                    h.change(APARTMENT_DOOR, "on")
+                    h.change(APARTMENT_DOOR, "off")
+                h.advance(10)
+                h.change(LANDING, "off")
+                self.assertEqual(self.told(h), ([], []))
+                self.assertIn(("INFO", "The Airmee parcel was delivered and the apartment door opened: "
+                                       "handed over, not announced"), h.logs)
+
+    def test_the_doorbell_alone_does_not_hand_over_a_delivery_reported_on_the_landing(self):
+        h = self.make()
+        h.advance(60)
+        h.change(LANDING, "on")
+        h.advance(10)
+        h.change(APARTMENT_BELL, "on")
+        h.change(APARTMENT_BELL, "off")
+        self.deliver(h, AIRMEE_PARCEL)
+        h.advance(20)
+        h.change(LANDING, "off")
+        self.assertEqual(self.told(h), ([{"message": AIRMEE_SENTENCE}], []))
+
+    def test_a_delivery_reported_during_a_visit_must_see_it_end_within_ten_minutes(self):
+        for stayed, said in ((599, 1), (600, 0)):
+            with self.subTest(stayed=stayed):
+                h = self.make()
+                h.advance(5)
+                h.change(LANDING, "on")
+                h.advance(10)
+                self.deliver(h, AIRMEE_PARCEL)
+                h.advance(stayed - 10)
+                h.change(LANDING, "off")
+                self.assertEqual(len(self.told(h)[0]), said)
+
+    def test_with_two_carriers_out_the_one_delivered_on_the_landing_is_told_when_it_ends_and_the_other_waits(self):
+        parcels = [AIRMEE_PARCEL, POSTNORD_PARCEL]
+        h = self.make(parcels=parcels)
+        h.advance(60)
+        h.change(LANDING, "on")
+        h.advance(20)
+        self.deliver(h, POSTNORD_PARCEL, out=[AIRMEE_PARCEL])
+        h.advance(20)
+        h.change(LANDING, "off")
+        self.assertEqual([said["message"] for said in self.told(h)[0]], [POSTNORD_SENTENCE])
+        h.advance(60)
+        self.deliver(h, AIRMEE_PARCEL)
+        self.assertEqual([said["message"] for said in self.told(h)[0]], [POSTNORD_SENTENCE, AIRMEE_SENTENCE])
+
+    def test_a_second_parcel_delivered_after_the_visit_adds_nothing_to_one_reported_on_the_landing(self):
+        two = [AIRMEE_PARCEL, ("Airmee", "TESTAM0002")]
+        h = self.make(parcels=two)
+        h.advance(60)
+        h.change(LANDING, "on")
+        h.advance(20)
+        self.deliver(h, two[0], out=two[1:])
+        h.advance(20)
+        h.change(LANDING, "off")
+        h.advance(30)
+        self.deliver(h, two[1])
+        self.assertEqual(len(self.told(h)[0]), 1)
+
+    def test_the_apartment_door_opening_hands_the_parcel_over_and_nothing_is_said(self):
+        for on_the_landing in (True, False):
+            with self.subTest(on_the_landing=on_the_landing):
+                h = self.make()
+                self.visit_touching(h, APARTMENT_DOOR, on_the_landing)
+                self.assertEqual(len(presses(h)), 2)
+                self.deliver(h, AIRMEE_PARCEL)
+                self.assertEqual(self.told(h), ([], []))
+                self.assertEqual([entry["stage"] for entry in h.last[1]["deliveries"]], ["delivered"])
+                self.assertIn(("INFO", "The Airmee parcel was delivered and the apartment door opened: "
+                                       "handed over, not announced"), h.logs)
+
+    def test_the_doorbell_ringing_without_the_door_opening_does_not_hand_the_parcel_over(self):
+        for on_the_landing in (True, False):
+            with self.subTest(on_the_landing=on_the_landing):
+                h = self.make()
+                self.visit_touching(h, APARTMENT_BELL, on_the_landing)
+                self.deliver(h, AIRMEE_PARCEL)
+                self.assertEqual(self.told(h), ([{"message": AIRMEE_SENTENCE}], []))
+
+    def test_a_door_opening_before_the_visit_is_no_part_of_it(self):
+        h = self.make()
+        h.change(APARTMENT_DOOR, "on")
+        h.change(APARTMENT_DOOR, "off")
+        self.visit(h, came=120)
+        h.advance(100)
+        self.deliver(h, AIRMEE_PARCEL)
+        self.assertEqual(len(self.told(h)[0]), 1)
+
+    def test_someone_who_has_just_gone_out_of_the_flat_is_not_a_courier(self):
+        for entity in (APARTMENT_DOOR, APARTMENT_BELL):
+            for gap, watched in ((3, False), (59, False), (60, True), (600, True)):
+                with self.subTest(entity=entity, gap=gap):
+                    h = self.make()
+                    h.change(entity, "on")
+                    h.change(entity, "off")
+                    self.visit(h, came=gap)
+                    self.assertEqual(len(presses(h)), 1 if watched else 0)
+                    h.advance(100)
+                    self.deliver(h, AIRMEE_PARCEL)
+                    self.assertEqual(len(self.told(h)[0]), 1 if watched else 0)
+
+    def test_a_courier_who_comes_back_before_the_carrier_confirms_is_told_once(self):
+        h = self.make()
+        self.visit(h)
+        h.advance(100)
+        self.visit(h, came=5, stayed=30)
+        h.advance(50)
+        self.deliver(h, AIRMEE_PARCEL)
+        self.assertEqual(len(self.told(h)[0]), 1)
+
+    def test_a_door_opened_in_the_first_stretch_of_a_visit_still_counts_when_the_courier_comes_back(self):
+        h = self.make()
+        h.advance(60)
+        h.change(LANDING, "on")
+        h.advance(10)
+        h.change(APARTMENT_DOOR, "on")
+        h.change(APARTMENT_DOOR, "off")
+        h.advance(20)
+        h.change(LANDING, "off")
+        h.advance(100)
+        h.change(LANDING, "on")
+        h.advance(30)
+        h.change(LANDING, "off")
+        h.advance(50)
+        self.deliver(h, AIRMEE_PARCEL)
+        self.assertEqual(self.told(h), ([], []))
+
+    def test_a_carrier_told_about_is_not_told_about_again_for_half_an_hour(self):
+        parcels = [("Airmee", "TESTAM0001"), ("Airmee", "TESTAM0002"), ("Airmee", "TESTAM0003")]
+        h = self.make(parcels=parcels)
+        self.visit(h)
+        self.deliver(h, parcels[0], out=parcels[1:])
+        self.assertEqual(len(self.told(h)[0]), 1)
+        h.advance(600)
+        self.visit(h, came=5, stayed=30)
+        self.deliver(h, parcels[1], out=parcels[2:])
+        self.assertEqual(len(self.told(h)[0]), 1)
+        self.assertIn(("INFO", "The Airmee parcel was delivered, not announced again within 30 minutes"), h.logs)
+        h.advance(hd.TELL_AGAIN_AFTER_S)
+        self.visit(h, came=5, stayed=30)
+        self.deliver(h, parcels[2])
+        self.assertEqual(len(self.told(h)[0]), 2)
+
+    def test_two_carriers_are_told_about_apart(self):
+        parcels = [AIRMEE_PARCEL, POSTNORD_PARCEL]
+        h = self.make(parcels=parcels)
+        self.visit(h)
+        self.deliver(h, parcels[0], out=parcels[1:])
+        h.advance(60)
+        self.deliver(h, parcels[1])
+        self.assertEqual([said["message"] for said in self.told(h)[0]], [AIRMEE_SENTENCE, POSTNORD_SENTENCE])
+
+    def test_two_parcels_of_one_carrier_delivered_together_are_told_about_once(self):
+        two = [AIRMEE_PARCEL, ("Airmee", "TESTAM0002")]
+        h = self.make(parcels=two)
+        self.visit(h)
+        self.deliver(h, *two)
+        self.assertEqual(len(self.told(h)[0]), 1)
+
+    def test_two_parcels_of_one_carrier_delivered_in_turn_are_told_about_once(self):
+        two = [AIRMEE_PARCEL, ("Airmee", "TESTAM0002")]
+        h = self.make(parcels=two)
+        self.visit(h)
+        self.deliver(h, two[0], out=two[1:])
+        h.advance(30)
+        self.deliver(h, two[1])
+        self.assertEqual(len(self.told(h)[0]), 1)
+
+    def test_with_two_carriers_out_the_one_whose_parcel_is_delivered_is_the_one_told(self):
+        h = self.make(states={AGGREGATOR_INCOMING: aggregator(
+            parcel(carrier="PostNord", barcode="TESTPN0001", start=at(5)),
+            parcel(carrier="Airmee", barcode="TESTAM0001", start=at(40)))})
+        self.assertEqual(h.last[1]["door_courier"]["source"], "postnord")
+        self.visit(h)
+        both = ["button.postnord_test_refresh", "button.airmee_test_refresh"]
+        self.assertEqual(presses(h), both)
+        h.advance(60)
+        self.assertEqual(presses(h), both * 2)
+        self.deliver(h, AIRMEE_PARCEL, out=[POSTNORD_PARCEL])
+        self.assertEqual(self.told(h), ([{"message": AIRMEE_SENTENCE}], []))
+        h.advance(3600)
+        self.assertEqual(presses(h), both * 2 + ["button.postnord_test_refresh"] * 2)
+        self.assertEqual(len(self.told(h)[0]), 1)
+
+    def test_a_carrier_not_delivered_in_the_ten_minutes_is_not_told_whatever_another_does(self):
+        h = self.make(parcels=[AIRMEE_PARCEL, POSTNORD_PARCEL])
+        self.visit(h)
+        self.deliver(h, POSTNORD_PARCEL, out=[AIRMEE_PARCEL])
+        h.advance(hd.CONFIRM_WINDOW_S)
+        self.deliver(h, AIRMEE_PARCEL)
+        self.assertEqual([said["message"] for said in self.told(h)[0]], [POSTNORD_SENTENCE])
+
+    def test_a_parcel_first_seen_when_delivered_counts_as_turning_delivered(self):
+        h = self.make()
+        self.visit(h)
+        self.deliver(h, ("Airmee", "TESTAM0002"), out=[AIRMEE_PARCEL])
+        self.assertEqual(len(self.told(h)[0]), 1)
 
     def test_in_quiet_hours_or_when_he_is_away_he_gets_a_push_instead(self):
         cases = [("home", True)] + [(owner, quiet) for owner in ("not_home", "work", "unknown", "unavailable")
@@ -2106,31 +2479,35 @@ class LandingWatchAppTests(unittest.TestCase):
             with self.subTest(owner=owner, quiet=quiet):
                 h = self.make(owner, quiet)
                 self.visit(h)
+                self.deliver(h, AIRMEE_PARCEL)
                 self.assertEqual(self.told(h), ([], [self.PUSH]))
-                self.assertEqual(presses(h), ["button.airmee_test_refresh"])
-                self.assertIn(("INFO", "An Airmee parcel is outside the door: telling the owner via push"), h.logs)
+                self.assertIn(("INFO", "An Airmee parcel was delivered outside the door: telling the owner via push"),
+                              h.logs)
 
     def test_the_push_goes_to_mikkel_unless_the_arg_says_otherwise(self):
         args = {key: value for key, value in LANDING_ARGS.items() if key != "notify_target"}
-        h = Harness({OWNER: {"state": "not_home", "attributes": {}}, **self.AIRMEE_OUT}, refresh_buttons=BUTTONS, **args)
+        h = Harness({OWNER: {"state": "not_home", "attributes": {}}, **out_for_delivery(AIRMEE_PARCEL)},
+                    refresh_buttons=BUTTONS, **args)
         h.apps = {"MobileNotifier": Phone()}
         self.visit(h)
+        self.deliver(h, AIRMEE_PARCEL)
         self.assertEqual([push["target"] for push in h.apps["MobileNotifier"].pushed], ["mikkel"])
 
     def test_without_speakers_he_is_pushed_even_at_home(self):
         h = self.make()
         del h.apps["SonosNotifier"]
         self.visit(h)
+        self.deliver(h, AIRMEE_PARCEL)
         self.assertEqual(h.phone.pushed, [self.PUSH])
 
-    def test_without_the_phone_notifier_nothing_breaks_and_the_carrier_is_still_refreshed(self):
+    def test_without_the_phone_notifier_nothing_breaks(self):
         h = self.make("not_home")
         del h.apps["MobileNotifier"]
         self.visit(h)
-        self.assertEqual(presses(h), ["button.airmee_test_refresh"])
+        self.deliver(h, AIRMEE_PARCEL)
         self.assertIn(("WARNING", "MobileNotifier is not running: the parcel push is not sent"), h.logs)
 
-    def test_a_failure_telling_him_does_not_stop_the_refresh(self):
+    def test_a_failure_telling_him_does_not_stop_the_sensor_being_published(self):
         h = self.make()
 
         def broken():
@@ -2138,106 +2515,61 @@ class LandingWatchAppTests(unittest.TestCase):
 
         h.speakers.in_quiet_hours = broken
         self.visit(h)
-        self.assertEqual(presses(h), ["button.airmee_test_refresh"])
+        self.deliver(h, AIRMEE_PARCEL)
         self.assertIn(("WARNING", "Telling the owner about the Airmee parcel failed: no helpers"), h.logs)
+        self.assertEqual([entry["stage"] for entry in h.last[1]["deliveries"]], ["delivered"])
 
-    def test_nothing_is_told_while_no_parcel_courier_is_expected(self):
-        for name, states in self.NO_PARCEL_COURIER.items():
+    def test_nothing_is_watched_while_no_parcel_courier_is_expected(self):
+        for name, (states, delivered) in self.NOBODY_EXPECTED.items():
             with self.subTest(name):
                 h = self.make(states=states)
                 self.visit(h)
-                self.assertEqual((self.told(h), presses(h), h.app._landing_watches), (([], []), [], []))
-                self.assertEqual(h.last[1]["left_at_door"], [])
+                self.deliver(h, delivered)
+                self.assertEqual((self.told(h), presses(h), h.app._landing_watches), (([], []), [], {}))
 
-    def test_a_parcel_that_goes_out_after_the_landing_went_on_does_not_count(self):
-        h = self.make(states={AGGREGATOR_INCOMING: aggregator()})
+    def test_a_parcel_that_goes_out_after_the_landing_went_on_is_not_watched(self):
+        h = self.make(states=out_for_delivery())
         h.advance(60)
         h.change(LANDING, "on")
-        h.states[AGGREGATOR_INCOMING] = self.AIRMEE_OUT[AGGREGATOR_INCOMING]
+        h.states.update(out_for_delivery(AIRMEE_PARCEL))
         h.app._on_change(AGGREGATOR_INCOMING, "all", {}, {}, {})
         h.advance(40)
         h.change(LANDING, "off")
-        h.run_executor()
+        self.deliver(h, AIRMEE_PARCEL)
+        self.assertEqual((self.told(h), presses(h)), (([], []), []))
+
+    def test_a_parcel_delivered_without_a_visit_tells_nothing(self):
+        h = self.make()
+        h.advance(300)
+        self.deliver(h, AIRMEE_PARCEL)
         self.assertEqual((self.told(h), presses(h)), (([], []), []))
 
     def test_a_landing_that_goes_off_without_having_gone_on_tells_nothing(self):
         h = self.make()
         h.advance(60)
         h.change(LANDING, "off")
-        h.run_executor()
+        self.deliver(h, AIRMEE_PARCEL)
         self.assertEqual((self.told(h), presses(h)), (([], []), []))
 
-    def test_someone_from_the_flat_arriving_tells_nothing(self):
-        for entity in (APARTMENT_DOOR, APARTMENT_BELL):
-            for opened in (8, 40):
-                with self.subTest(entity=entity, opened=opened):
-                    h = self.make()
-                    h.advance(60)
-                    h.change(LANDING, "on")
-                    h.advance(opened)
-                    h.change(entity, "on")
-                    h.advance(20)
-                    h.change(LANDING, "off")
-                    h.run_executor()
-                    self.assertEqual((self.told(h), presses(h)), (([], []), []))
-                    self.assertEqual(h.last[1]["left_at_door"], [])
-
-    def test_someone_who_has_just_gone_out_of_the_flat_is_not_a_courier(self):
-        for entity in (APARTMENT_DOOR, APARTMENT_BELL):
-            for gap, told in ((3, False), (59, False), (60, True), (600, True)):
-                with self.subTest(entity=entity, gap=gap):
-                    h = self.make()
-                    h.change(entity, "on")
-                    h.change(entity, "off")
-                    h.advance(gap)
-                    h.change(LANDING, "on")
-                    h.advance(40)
-                    h.change(LANDING, "off")
-                    h.run_executor()
-                    self.assertEqual(len(h.speakers.said), 1 if told else 0)
-
     def test_a_visit_to_the_landing_must_end_within_ten_minutes(self):
-        for stayed, told in ((599, True), (600, False)):
+        for stayed, watched in ((599, True), (600, False)):
             with self.subTest(stayed=stayed):
                 h = self.make()
                 self.visit(h, 5, stayed)
-                self.assertEqual(len(h.speakers.said), 1 if told else 0)
+                self.assertEqual(len(presses(h)), 1 if watched else 0)
+                h.advance(10)
+                self.deliver(h, AIRMEE_PARCEL)
+                self.assertEqual(len(self.told(h)[0]), 1 if watched else 0)
 
-    def test_a_carrier_told_about_is_not_told_about_again_for_half_an_hour(self):
+    def test_the_presses_after_a_ring_stay_beside_the_ones_for_the_visit(self):
         h = self.make()
+        h.ring(("front door", NOW))
         self.visit(h)
-        h.advance(600)
-        self.visit(h, 5, 30)
-        self.assertEqual((len(h.speakers.said), len(presses(h))), (1, 1))
-        h.advance(hd.LEFT_AT_DOOR_S)
-        self.visit(h, 5, 30)
-        self.assertEqual((len(h.speakers.said), len(presses(h))), (2, 2))
-
-    def test_the_carrier_told_about_is_published_as_left_at_the_door_for_half_an_hour(self):
-        h = self.make()
-        self.assertEqual(h.last[1]["left_at_door"], [])
-        h.advance(60)
-        h.change(LANDING, "on")
-        h.advance(40)
-        self.assertEqual(h.last[1]["left_at_door"], [])
-        h.change(LANDING, "off")
-        self.assertEqual(h.last[1]["left_at_door"], ["airmee"])
-        h.tick(hd.LEFT_AT_DOOR_S - 1)
-        self.assertEqual(h.last[1]["left_at_door"], ["airmee"])
-        h.tick(1)
-        self.assertEqual(h.last[1]["left_at_door"], [])
-
-    def test_a_parcel_the_carrier_calls_delivered_while_the_courier_is_there_is_told_but_not_refreshed(self):
-        h = self.make()
-        h.advance(60)
-        h.change(LANDING, "on")
-        h.advance(20)
-        self.deliver(h)
-        h.advance(20)
-        h.change(LANDING, "off")
-        h.run_executor()
-        self.assertEqual(h.speakers.said, [{"message": AIRMEE_SENTENCE}])
-        self.assertEqual(presses(h), [])
+        h.advance(3600)
+        self.assertEqual(presses(h), ["button.airmee_test_refresh"] * 6)
+        logged = [message for _, message in h.logs if message.startswith("Refreshing")]
+        self.assertEqual((logged.count("Refreshing airmee after the courier rang"),
+                          logged.count("Refreshing airmee after someone left the landing")), (2, 4))
 
     def test_the_sensors_are_listened_to_only_for_a_configured_landing_with_buttons(self):
         sensors = (LANDING, APARTMENT_DOOR, APARTMENT_BELL)
@@ -2246,21 +2578,24 @@ class LandingWatchAppTests(unittest.TestCase):
                          [(LANDING, {}), (APARTMENT_DOOR, {}), (APARTMENT_BELL, {})])
         self.assertNotIn(OWNER, [entity for entity, _ in h.listened])
         args = {key: value for key, value in LANDING_ARGS.items() if key != "landing_entity"}
-        for name, h in {"no landing entity": Harness(self.AIRMEE_OUT, refresh_buttons=BUTTONS, **args),
-                        "no buttons": Harness(self.AIRMEE_OUT, **LANDING_ARGS)}.items():
+        for name, h in {"no landing entity": Harness(out_for_delivery(AIRMEE_PARCEL), refresh_buttons=BUTTONS, **args),
+                        "no buttons": Harness(out_for_delivery(AIRMEE_PARCEL), **LANDING_ARGS)}.items():
             with self.subTest(name):
                 self.assertEqual([entity for entity, _ in h.listened if entity in sensors], [])
 
     def test_without_a_landing_entity_a_visit_tells_nothing_and_a_ring_presses_as_before(self):
-        h = Harness({OWNER: {"state": "home", "attributes": {}}, **self.AIRMEE_OUT}, refresh_buttons=BUTTONS)
-        h.speakers = Speakers()
-        h.apps = {"SonosNotifier": h.speakers}
+        h = Harness({OWNER: {"state": "home", "attributes": {}}, **out_for_delivery(AIRMEE_PARCEL)},
+                    refresh_buttons=BUTTONS)
+        h.speakers, h.phone = Speakers(), Phone()
+        h.apps = {"SonosNotifier": h.speakers, "MobileNotifier": h.phone}
         h.ring(("front door", NOW))
         h.change(LANDING, "on")
         h.advance(40)
         h.change(LANDING, "off")
         h.advance(400)
-        self.assertEqual((h.speakers.said, presses(h)), ([], ["button.airmee_test_refresh"] * 2))
+        self.assertEqual(presses(h), ["button.airmee_test_refresh"] * 2)
+        self.deliver(h, AIRMEE_PARCEL)
+        self.assertEqual(self.told(h), ([], []))
 
     def test_the_shipped_entities_are_the_ones_the_house_has(self):
         shipped = {key: shipped_setting(key) for key in LANDING_ARGS}
@@ -2273,8 +2608,8 @@ class LandingWatchAppTests(unittest.TestCase):
         h.change(shipped["landing_entity"], "on")
         h.advance(40)
         h.change(shipped["landing_entity"], "off")
-        h.run_executor()
-        self.assertEqual(h.speakers.said, [{"message": AIRMEE_SENTENCE}])
+        self.deliver(h, AIRMEE_PARCEL)
+        self.assertEqual(self.told(h), ([{"message": AIRMEE_SENTENCE}], []))
 
 
 if __name__ == "__main__":

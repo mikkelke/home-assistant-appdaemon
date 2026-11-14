@@ -324,18 +324,10 @@ def delivery_entries(full):
     return [value for value in values if isinstance(value, dict)] if isinstance(values, list) else []
 
 
-def left_at_door(full):
-    """The sources of the parcel carriers sensor.home_delivery says left a parcel outside the door; none when it is
-    unavailable."""
-    values = attributes(full).get("left_at_door") if not unavailable(full) else None
-    return {value for value in values if isinstance(value, str)} if isinstance(values, list) else set()
-
-
 def delivery_cards(full, now, handed_over=()):
     """One card per source: its first delivery that has a card, the sensor having sorted them by arrival. An order
     in handed_over, whose courier has rung at the door, is here and gets none; neither does any parcel of a carrier
-    that has one in handed_over, since one courier carries them all. A bare carrier source in handed_over, as
-    left_at_door gives, stands for the carrier's parcels."""
+    that has one in handed_over, since one courier carries them all."""
     carriers = {order_source(order) for order in handed_over} & PARCEL_CARRIERS.keys()
     cards = {}
     for delivery in delivery_entries(full):
@@ -578,8 +570,7 @@ class LiveUpdates(hass.Hass):
             source_cards = {"cook": cook_cards(full["cook"], now),
                             "coffee": {"live_coffee": coffee_card(full["coffee"], now)},
                             "delivery": delivery_cards(full["delivery"], now,
-                                                       {order for order in rings.values() if order}
-                                                       | left_at_door(full["delivery"]))}
+                                                       {order for order in rings.values() if order})}
             source_cards["coffee"] = {tag: card for tag, card in source_cards["coffee"].items() if card}
             for source, cards in source_cards.items():
                 cards = self._retained(source, full[source], cards, now)

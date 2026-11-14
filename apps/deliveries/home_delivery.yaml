@@ -19,13 +19,17 @@
 #
 # A courier often leaves a parcel outside the door without ringing the apartment doorbell, and some get
 # into the building without ringing the street door. When landing_entity (the presence sensor outside the
-# flat) goes on while a parcel is out for delivery, it is watched for ten minutes. If it goes off again,
-# and apartment_door_entity has not opened and apartment_doorbell_entity has not rung since it went on (nor
-# in the minute before: someone from the flat went out), the carrier is refreshed at once and the owner is
-# told once, "Your PostNord parcel is outside the door.": spoken by SonosNotifier while owner_entity is
-# home outside its quiet hours, else pushed to notify_target through MobileNotifier. The carrier is not told
-# about again for half an hour, and sensor.home_delivery lists it in left_at_door for that time, which takes
-# its Live Update card away. Drop landing_entity and none of this runs; it needs refresh_buttons.
+# flat) goes on while a parcel is out for delivery, every carrier with a button and a parcel out is
+# watched, as any of their couriers may have come (not when apartment_door_entity opened or
+# apartment_doorbell_entity rang in the minute before: someone from the flat went out). When the sensor
+# goes off within ten minutes, each watched carrier is refreshed at once and 1, 3 and 6 minutes later,
+# skipping a press once the carrier has nothing undelivered. If a parcel of a watched carrier turns
+# delivered while the sensor is on, or within ten minutes after it went off, the owner is told once (as the
+# sensor goes off, when it was still on), "Your PostNord parcel was delivered. It's outside the door.":
+# spoken by SonosNotifier while owner_entity is home outside its quiet hours, else pushed to notify_target
+# through MobileNotifier. Nothing is said when apartment_door_entity opened meanwhile (the parcel was
+# handed over; the doorbell alone does not count), nor about the same carrier again within half an hour.
+# Drop landing_entity and none of this runs; it needs refresh_buttons.
 
 HomeDelivery:
   module: home_delivery
