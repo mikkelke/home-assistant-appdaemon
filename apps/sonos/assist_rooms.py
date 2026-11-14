@@ -19,15 +19,17 @@ grouped and starts radio one second later; a solo speaker starts immediately.
 Group requests use GroupManager's custom events. Unknown areas warn and do nothing;
 satellites without a configured room speaker are ignored.
 
-assist_music_group carries mode (join, move or ungroup), source_area and target_areas
+assist_music_group carries mode (join, move, only or ungroup), source_area and target_areas
 (area ids as a list or a comma separated string; a multi-room phrase such as the family
 room is several ids). Join takes the first playing room among the named sources and then
 the targets as the music source, so "group A with B" works whichever of them plays, and
 every other named room joins the group that source plays in, through its leader. Move
 only accepts a named source: the targets join first, then the source rooms leave once all
-targets show in their group, which keeps the music going on the targets. Ungroup unjoins
-every speaker that follows a leader, so the music keeps playing on the leaders. Nothing
-playing means nothing happens. Only rooms listed in speakers take part, which keeps
+targets show in their group, which keeps the music going on the targets. Only leaves the
+music in exactly the target rooms: the group of the first playing target, else of the first
+playing room, gains the missing targets and then loses its other rooms the way a move does;
+other groups keep playing. Ungroup unjoins every speaker that follows a leader, so the
+music keeps playing on the leaders. Nothing playing means nothing happens. Only rooms listed in speakers take part, which keeps
 rooms that voice never groups out of it.
 """
 
@@ -133,6 +135,22 @@ def group_actions(mode, sources, targets, states):
     return [_join(master, s) for s in joiners if s != source and s not in members]
 
 
+def only_plan(targets, states):
+    """Turn "music only in the targets" into a join or a move.
+
+    Returns (mode, sources): the rooms of the chosen group outside the targets move away,
+    or, when there are none, the playing room is the source the targets join. Nothing
+    playing gives (None, []).
+    """
+    playing = [s for s in dict.fromkeys(targets) if _playing(states.get(s))]
+    playing += [s for s in states if _playing(states.get(s))]
+    if not playing:
+        return None, []
+    _, members = _group_of(playing[0], states[playing[0]])
+    outside = [m for m in members if m in states and m not in targets]
+    return ("move", outside) if outside else ("join", [playing[0]])
+
+
 def move_leave_actions(sources, targets, states):
     """Unjoin the moved-from rooms once every target shows in their group.
 
@@ -230,13 +248,18 @@ class AssistRooms(hass.Hass):
 
     def _on_group_intent(self, event_name, data, kwargs):
         mode = data.get("mode")
-        if mode not in ("join", "move", "ungroup"):
+        if mode not in ("join", "move", "only", "ungroup"):
             self.log(f"{event_name}: unknown mode {mode!r}", level="WARNING")
             return
         sources = self._group_speakers(data.get("source_area"))
         targets = self._group_speakers(data.get("target_areas"))
-        involved = list(self.speakers.values()) if mode == "ungroup" else sources + targets
+        involved = list(self.speakers.values()) if mode in ("only", "ungroup") else sources + targets
         states = {entity: self._read(entity) for entity in dict.fromkeys(involved)}
+        if mode == "only":
+            mode, sources = only_plan(targets, states)
+            if mode is None:
+                self.log(f"{event_name} only: nothing is playing", level="INFO")
+                return
         actions = group_actions(mode, sources, targets, states)
         if not actions and mode != "move":
             self.log(f"{event_name} {mode}: nothing to do", level="INFO")

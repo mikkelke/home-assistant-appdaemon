@@ -362,5 +362,55 @@ class MoveGlue(unittest.TestCase):
         app.run_in.assert_not_called()
 
 
+class OnlyDecisions(unittest.TestCase):
+    def test_rooms_outside_the_targets_move_away(self):
+        group = [BED, BATH, LIV, KIT]
+        states = {s: snap(group=group) for s in group}
+        states.update({DIN: snap("idle"), ROOF: snap("idle")})
+        self.assertEqual(ar.only_plan([BED, BATH], states), ("move", [LIV, KIT]))
+
+    def test_a_playing_target_already_alone_pulls_the_other_targets(self):
+        states = {BED: snap(), BATH: snap("idle"), KIT: snap("idle")}
+        self.assertEqual(ar.only_plan([BED, BATH], states), ("join", [BED]))
+
+    def test_music_elsewhere_moves_onto_the_targets(self):
+        states = {KIT: snap(group=[KIT, LIV]), LIV: snap(group=[KIT, LIV]), BED: snap("idle")}
+        self.assertEqual(ar.only_plan([BED], states), ("move", [KIT, LIV]))
+
+    def test_the_targets_group_wins_over_another_playing_group(self):
+        states = {KIT: snap(), BED: snap(group=[BED, ROOF]), ROOF: snap(group=[BED, ROOF])}
+        self.assertEqual(ar.only_plan([BED], states), ("move", [ROOF]))
+
+    def test_nothing_playing_gives_nothing(self):
+        self.assertEqual(ar.only_plan([BED], {BED: snap("idle"), KIT: snap("paused")}), (None, []))
+
+
+class OnlyGlue(unittest.TestCase):
+    def test_family_room_leaves_after_the_targets_are_in(self):
+        group = [BED, BATH, LIV, KIT, DIN]
+        app = make_app({s: snap(group=group) for s in group})
+        request(app, "only", None, ["bedroom", "bathroom"])
+        self.assertEqual(fired(app), [left(LIV), left(KIT), left(DIN)])
+
+    def test_missing_targets_join_first_then_the_rest_leaves(self):
+        group = [KIT, LIV]
+        app = make_app({KIT: snap(group=group), LIV: snap(group=group), BED: snap("idle")})
+        request(app, "only", None, "bedroom")
+        self.assertEqual(fired(app), [joined(KIT, BED)])
+        app.fire_event.reset_mock()
+        app.states[BED] = snap(group=[KIT, LIV, BED])
+        app.states[KIT] = snap(group=[KIT, LIV, BED])
+        app.states[LIV] = snap(group=[KIT, LIV, BED])
+        timer = app.run_in.call_args
+        timer.args[0](timer.kwargs)
+        self.assertEqual(fired(app), [left(LIV), left(KIT)])
+
+    def test_nothing_playing_sends_nothing(self):
+        app = make_app({BED: snap("idle")})
+        request(app, "only", None, ["bedroom"])
+        app.fire_event.assert_not_called()
+        app.run_in.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
