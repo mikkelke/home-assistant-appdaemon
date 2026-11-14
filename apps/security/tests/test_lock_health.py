@@ -1097,7 +1097,8 @@ class WeeklyReportTests(unittest.TestCase):
 
 
 class WeeklyReportPushTests(unittest.TestCase):
-    """The push reads the episode file and goes out through the app's own _notify."""
+    """The report reads the episode file, is always logged, and goes out through the app's own
+    _notify only in a week where a ladder gave up."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -1109,20 +1110,34 @@ class WeeklyReportPushTests(unittest.TestCase):
         self.app.logs = []
         self.app.log = lambda msg, **kw: self.app.logs.append((kw.get("level"), msg))
 
-    def test_the_report_names_the_week_and_reads_the_file(self):
-        self.path.write_text(episode_line(2, *BLE_REFRESH) + "\n" + jam_line(1, "on") + "\n")
+    def test_a_week_with_a_give_up_is_pushed(self):
+        self.path.write_text(episode_line(2, *BLE_REFRESH) + "\n" + jam_line(1, "on") + "\n"
+                             + episode_line(1, "ble", "divergence", "gave_up", ["refresh", "reload"]) + "\n")
         self.app._send_report(SAT)
         self.assertEqual(self.app.notifications,
-                         ["Yale uge 46: Bluetooth bagud 1 (refresh løste). Fastlåst 1 (1 med døren åben)."])
+                         ["Yale uge 46: Bluetooth bagud 2 (refresh løste 1, opgivet 1). Fastlåst 1 (1 med døren åben)."])
+
+    def test_a_week_that_healed_by_itself_is_logged_not_pushed(self):
+        self.path.write_text(episode_line(2, *BLE_REFRESH) + "\n" + jam_line(1, "on") + "\n")
+        self.app._send_report(SAT)
+        self.assertEqual(self.app.notifications, [])
+        self.assertEqual(self.app.logs, [("INFO", "LockHealth: Yale uge 46: Bluetooth bagud 1 (refresh løste). "
+                                                  "Fastlåst 1 (1 med døren åben).")])
+
+    def test_a_give_up_outside_the_week_is_not_pushed(self):
+        self.path.write_text(episode_line(8, "ble", "divergence", "gave_up", ["refresh", "reload"]) + "\n")
+        self.app._send_report(SAT)
+        self.assertEqual(self.app.notifications, [])
 
     def test_no_file_yet_is_a_quiet_week(self):
         self.app._send_report(SAT)
-        self.assertEqual(self.app.notifications, ["Yale uge 46: ingen fejl."])
+        self.assertEqual(self.app.notifications, [])
+        self.assertEqual(self.app.logs, [("INFO", "LockHealth: Yale uge 46: ingen fejl.")])
 
     def test_an_empty_file_is_a_quiet_week(self):
         self.path.write_text("")
         self.app._send_report(SAT)
-        self.assertEqual(self.app.notifications, ["Yale uge 46: ingen fejl."])
+        self.assertEqual(self.app.notifications, [])
 
     def test_the_push_is_titled_front_door_and_goes_to_the_notify_target(self):
         calls = []
@@ -1134,8 +1149,9 @@ class WeeklyReportPushTests(unittest.TestCase):
         self.app._notify = lh.LockHealth._notify.__get__(self.app)  # the real one: make_app stubs it
         self.app._notifier = Notifier()
         self.app.notify_target = "mikkel"
+        self.path.write_text(episode_line(1, "bridge", "bridge_down", "gave_up", ["power_cycle"]) + "\n")
         self.app._send_report(SAT)
-        self.assertEqual(calls, [{"title": "Front door", "message": "Yale uge 46: ingen fejl.",
+        self.assertEqual(calls, [{"title": "Front door", "message": "Yale uge 46: Bridge nede 1 (opgivet).",
                                   "target": "mikkel"}])
 
     def test_an_unreadable_file_warns_and_sends_nothing(self):
@@ -1147,11 +1163,11 @@ class WeeklyReportPushTests(unittest.TestCase):
     def test_the_tick_reports_only_on_the_report_day(self):
         for days, sent in ((0, 1), (1, 0), (-1, 0), (-3, 0), (7, 1)):
             with self.subTest(days=days):
-                self.app.notifications.clear()
+                self.app.logs.clear()
                 now = SAT + timedelta(days=days)
                 self.app.get_now = lambda now=now: now
                 self.app._on_report_tick({})
-                self.assertEqual(len(self.app.notifications), sent)
+                self.assertEqual(len(self.app.logs), sent)
 
 
 class ReportScheduleTests(unittest.TestCase):

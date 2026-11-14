@@ -61,9 +61,10 @@ cycle starts a new one if the fault persists). Each time the Bluetooth twin goes
 strings in AppDaemon's time zone. Nothing prunes the file, a write error is only logged as a
 WARNING, and a ladder cut short by an app restart leaves no line.
 
-Weekly report: on ``report_day`` at ``report_time`` one push (title "Front door") summarises
-the last 7 days read back from that file, in Danish - see weekly_report(). This is where a
-lagging twin shows up, since its give-ups and all-clears are never pushed.
+Weekly report: on ``report_day`` at ``report_time`` the last 7 days are read back from that
+file and summarised in Danish (see weekly_report()) and logged. It is pushed (title "Front
+door") only when a ladder gave up that week: a lagging twin's give-up is never pushed live, and
+a week where everything healed by itself needs nothing from anyone.
 
 Safety invariant: a configured bridge power plug must NEVER be left off. The power-cycle
 routine always re-asserts ``switch/turn_on`` a safety-check interval after cycling and
@@ -314,14 +315,11 @@ def _heal_summary(outcomes):
     return ", ".join(label if len(outcomes) == 1 else f"{label} {n}" for label, n in parts)
 
 
-def weekly_report(lines, now):
-    """The weekly push text, Danish and on one line, for the REPORT_DAYS before `now`, built from
-    the lines of the episode file: 'Yale uge 46: Bluetooth bagud 5 (refresh løste 4, reload 1).
-    Fastlåst 2 (1 med døren åben).' One sentence per kind of failure that happened, in REPORT_TYPES
-    order: the count and what ended each episode, or for a jam how many had the door open. A week
-    without any says 'ingen fejl'. A ladder counts in the week it ended. backed_off lines are not
-    counted: they only postponed a ladder, and the next cycle starts another for the same fault.
-    Lines that do not parse are skipped."""
+def _week_outcomes(lines, now):
+    """{episode type: [outcome or jam door state, ...]} for the REPORT_DAYS before `now`, read
+    from the lines of the episode file. A ladder counts in the week it ended. backed_off lines are
+    not counted: they only postponed a ladder, and the next cycle starts another for the same
+    fault. Lines that do not parse are skipped."""
     since = now - timedelta(days=REPORT_DAYS)
     seen = {}
     for raw in lines:
@@ -338,6 +336,16 @@ def weekly_report(lines, now):
                 seen.setdefault(kind, []).append(detail)
         except (ValueError, KeyError, TypeError):
             continue
+    return seen
+
+
+def weekly_report(lines, now):
+    """The weekly report text, Danish and on one line, for the REPORT_DAYS before `now`, built from
+    the lines of the episode file: 'Yale uge 46: Bluetooth bagud 5 (refresh løste 4, reload 1).
+    Fastlåst 2 (1 med døren åben).' One sentence per kind of failure that happened, in REPORT_TYPES
+    order: the count and what ended each episode, or for a jam how many had the door open. A week
+    without any says 'ingen fejl'."""
+    seen = _week_outcomes(lines, now)
     sentences = []
     for kind, label in REPORT_TYPES:
         items = seen.get(kind)
@@ -1130,7 +1138,10 @@ class LockHealth(hass.Hass):
             self.log(f"LockHealth: weekly report skipped, could not read {self._episode_file.name}: {e}",
                      level="WARNING")
             return
-        self.create_task(self._notify(weekly_report(lines, now)))
+        text = weekly_report(lines, now)
+        self.log(f"LockHealth: {text}", level="INFO")
+        if any("gave_up" in items for items in _week_outcomes(lines, now).values()):
+            self.create_task(self._notify(text))
 
     # ---------- one-shot side reports (flapping log / plug unavailable push) ----------
     async def _log_flapping(self, side):
