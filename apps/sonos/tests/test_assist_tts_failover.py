@@ -483,6 +483,10 @@ class Config(unittest.TestCase):
         self.assertEqual((config["fallback_entity"], config["fallback_voice"], config["fallback_language"]),
                          ("tts.piper", "en_US-hfc_female-medium", "en_US"))
         self.assertEqual(config["primary_port"], 10210)
+        notifier = self.load(SONOS.parent / "notify" / "sonos_notifier.yaml", "SonosNotifier")
+        self.assertEqual(config["primary_audio_conversion"],
+                         notifier["audio_conversion"].replace("volume=2dB", "volume=6dB"))
+        self.assertNotIn("fallback_audio_conversion", config)
 
     def test_it_watches_the_same_pipeline_as_the_speech_to_text_failover(self):
         stt = self.load(SONOS / "assist_stt_failover.yaml", "AssistSttFailover")
@@ -502,7 +506,7 @@ class Config(unittest.TestCase):
         self.assertEqual(logged(app, "ERROR"), [])
         self.assertEqual(app.announcement_voice(),
                          {"tts_platform": "acer_tts", "options": {"voice": "af_heart"},
-                          "language": "en"})
+                          "language": "en", "audio_conversion": app.args["primary_audio_conversion"]})
         self.assertEqual(app.precache_voices()[1],
                          {"tts_platform": "piper", "options": {"voice": "en_US-hfc_female-medium"},
                           "language": "en_US"})

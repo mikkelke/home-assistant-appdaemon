@@ -38,7 +38,8 @@ def config(relative, app):
 
 NOTIFIER = config("notify/sonos_notifier.yaml", "SonosNotifier")
 FAILOVER = config("sonos/assist_tts_failover.yaml", "AssistTtsFailover")
-PRIMARY = {"tts_platform": "acer_tts", "options": {"voice": "af_heart"}, "language": "en"}
+PRIMARY = {"tts_platform": "acer_tts", "options": {"voice": "af_heart"}, "language": "en",
+           "audio_conversion": FAILOVER["primary_audio_conversion"]}
 FALLBACK = {"tts_platform": "piper", "options": {"voice": "en_US-hfc_female-medium"}, "language": "en_US"}
 
 

@@ -69,9 +69,12 @@ class AssistTtsFailover(AssistSttFailover):
 
     def _voice(self, side):
         # chime_tts names an engine without its "tts." prefix, as the notifier's tts_platform is written.
-        return {"tts_platform": self.args[f"{side}_entity"].removeprefix("tts."),
-                "options": {"voice": self.args[f"{side}_voice"]},
-                "language": self.args[f"{side}_language"]}
+        voice = {"tts_platform": self.args[f"{side}_entity"].removeprefix("tts."),
+                 "options": {"voice": self.args[f"{side}_voice"]},
+                 "language": self.args[f"{side}_language"]}
+        if self.args.get(f"{side}_audio_conversion"):
+            voice["audio_conversion"] = self.args[f"{side}_audio_conversion"]
+        return voice
 
     def _fields(self, engine):
         voice = self._voice("primary" if engine == self.primary else "fallback")

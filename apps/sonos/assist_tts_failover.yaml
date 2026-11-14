@@ -14,6 +14,9 @@ AssistTtsFailover:
   primary_entity: tts.acer_tts
   primary_voice: af_heart
   primary_language: en
+  # Replaces SonosNotifier's audio_conversion for this voice: Kokoro speaks about 4 dB softer
+  # than Piper at its highest unclipped gain, so its announcements get 4 dB more.
+  primary_audio_conversion: "-af volume=6dB,alimiter=limit=0.89:attack=5:release=50:level=false"
   fallback_entity: tts.piper
   fallback_voice: en_US-hfc_female-medium
   fallback_language: en_US

@@ -31,7 +31,6 @@ class SonosNotifier(hass.Hass):
         self.default_chime_path = self.args.get("default_chime_path")
         self.tts_platform = self.args.get("tts_platform")
         self.audio_conversion = self.args.get("audio_conversion")
-        self.audio_conversion_by_engine = self.args.get("audio_conversion_by_engine") or {}
         self.announce_volume_boost = self.args.get("announce_volume_boost")
         self.announce_volume_cap = self.args.get("announce_volume_cap")
         self.clip_base_url = (self.args.get("clip_base_url") or "").rstrip("/")
@@ -292,8 +291,8 @@ class SonosNotifier(hass.Hass):
         return voice if isinstance(voice, dict) and voice else {"tts_platform": self.tts_platform}
 
     def _audio_conversion(self, voice):
-        """The FFmpeg arguments of a render: the engine's own from audio_conversion_by_engine, else audio_conversion."""
-        return self.audio_conversion_by_engine.get(voice.get("tts_platform"), self.audio_conversion)
+        """The FFmpeg arguments of a render: the voice's own, else audio_conversion."""
+        return voice.get("audio_conversion") or self.audio_conversion
 
     def _render_announcement(self, message, chime_path, cache, offset, voice):
         """Render chime + speech with chime_tts and return the URL of the combined mp3, or None."""
