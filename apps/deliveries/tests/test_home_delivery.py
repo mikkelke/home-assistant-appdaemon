@@ -6,6 +6,7 @@
 import ast
 import copy
 import json
+import re
 import sys
 import types
 import unittest
@@ -30,6 +31,7 @@ except ImportError:
 NOW = datetime(2026, 11, 10, 16, 48, tzinfo=timezone.utc).timestamp()  # 17:48 in Copenhagen
 SENSOR = "sensor.home_delivery"
 KITCHEN = "Test Kitchen"
+SHIPPED = Path(__file__).resolve().parents[1] / "home_delivery.yaml"
 
 # AppDaemon 4.5.13's private ADAPI, Hass and ADBase members: an app attribute with one of these names
 # breaks AppDaemon, as `_log` once did (ActorAttribution, 27.07).
@@ -110,6 +112,30 @@ def aggregator(*parcels):
 
 def local_time(day, hour, minute=0):
     return datetime(2026, 11, day, hour, minute, tzinfo=hd.HOUSE_TZ).timestamp()
+
+
+INTERCOM_VISIT = "sensor.intercom_visit"
+BUTTONS = {"airmee": "button.airmee_test_refresh", "postnord": "button.postnord_test_refresh"}
+
+
+def intercom(*rings):
+    """sensor.intercom_visit as AbbWelcomeBridge publishes it: a (door, ring time) per open visit, active while any."""
+    visits = [{"door": door, "ring_at": stamp(ring_at)} for door, ring_at in rings]
+    return {"state": "active" if visits else "idle", "attributes": {"visits": visits}}
+
+
+def shipped_refresh_buttons():
+    """The refresh_buttons map of the shipped home_delivery.yaml, read without PyYAML."""
+    found, inside = {}, False
+    for line in SHIPPED.read_text().splitlines():
+        if line.strip() == "refresh_buttons:":
+            inside = True
+        elif inside:
+            match = re.fullmatch(r"\s+(\w+): (button\.\w+)", line)
+            if not match:
+                break
+            found[match[1]] = match[2]
+    return found
 
 
 class WoltStageTests(unittest.TestCase):
@@ -1058,6 +1084,95 @@ class DoorCourierKindTests(unittest.TestCase):
         self.assertEqual(json.loads(json.dumps(attrs)), attrs)
 
 
+def carrier_parcel(carrier="Airmee", barcode="TESTAM0001", **kw):
+    return hd.parcel_delivery(parcel(carrier=carrier, barcode=barcode, **kw), NOW)
+
+
+class StreetRingTests(unittest.TestCase):
+    def test_each_open_street_door_visit_gives_its_ring_time(self):
+        self.assertEqual(hd.street_rings(intercom(("front door", at(0)), ("back door", at(1)))), [at(0), at(1)])
+
+    def test_other_doors_and_damaged_visits_give_nothing(self):
+        visits = [{"door": "apartment door", "ring_at": stamp(NOW)}, {"door": "", "ring_at": stamp(NOW)},
+                  {"ring_at": stamp(NOW)}, {"door": "front door"}, {"door": "front door", "ring_at": "soon"},
+                  {"door": "front door", "ring_at": "2026-11-10T16:48:00"}, "front door", None, 5]
+        self.assertEqual(hd.street_rings({"state": "active", "attributes": {"visits": visits}}), [])
+        for value in (None, {}, "x", intercom(), {"attributes": {"visits": "x"}}, {"attributes": ["x"]}):
+            with self.subTest(value=value):
+                self.assertEqual(hd.street_rings(value), [])
+
+
+class RefreshDelaysTests(unittest.TestCase):
+    def test_both_moments_are_counted_from_the_ring(self):
+        self.assertEqual(hd.refresh_delays(NOW, NOW), [180, 360])
+        self.assertEqual(hd.refresh_delays(NOW, NOW + 60), [120, 300])
+        self.assertEqual(hd.refresh_delays(NOW + 2, NOW), [182, 362])
+
+    def test_delays_are_whole_seconds_never_early(self):
+        self.assertEqual(hd.refresh_delays(NOW - 0.5, NOW), [180, 360])
+        self.assertEqual(hd.refresh_delays(NOW - 0.1, NOW), [180, 360])
+        self.assertEqual(hd.refresh_delays(NOW + 0.5, NOW), [181, 361])
+        self.assertTrue(all(isinstance(delay, int) for delay in hd.refresh_delays(NOW - 0.5, NOW)))
+
+    def test_a_moment_that_has_come_is_not_made_up(self):
+        self.assertEqual(hd.refresh_delays(NOW, NOW + 179), [1, 181])
+        self.assertEqual(hd.refresh_delays(NOW, NOW + 180), [180])
+        self.assertEqual(hd.refresh_delays(NOW, NOW + 359), [1])
+        self.assertEqual(hd.refresh_delays(NOW, NOW + 360), [])
+
+
+class RefreshSourceTests(unittest.TestCase):
+    def source(self, *deliveries, buttons=BUTTONS):
+        return hd.refresh_source(list(deliveries), NOW, buttons)
+
+    def test_a_parcel_out_for_delivery_names_its_carrier(self):
+        self.assertEqual(self.source(carrier_parcel()), "airmee")
+        self.assertEqual(self.source(carrier_parcel("PostNord", "TESTPN0001", start=at(5))), "postnord")
+
+    def test_a_parcel_that_is_not_out_yet_or_already_delivered_names_nobody(self):
+        self.assertIsNone(self.source(carrier_parcel(status="in_transit", start=at(30))))
+        self.assertIsNone(self.source(carrier_parcel(status="delivered", delivered_at=at(-1))))
+        self.assertIsNone(self.source())
+
+    def test_a_carrier_without_a_button_names_nobody(self):
+        self.assertIsNone(self.source(carrier_parcel("GLS", "TESTGL0001")))
+        self.assertIsNone(self.source(carrier_parcel(), buttons={}))
+
+    def test_only_a_parcel_courier_calls_for_a_refresh_whatever_the_buttons_say(self):
+        buttons = {**BUTTONS, "wolt": "button.wolt_test_refresh", "nemlig": "button.nemlig_test_refresh"}
+        self.assertIsNone(self.source(delivery(), buttons=buttons))
+        self.assertIsNone(self.source(nemlig_delivery(), buttons=buttons))
+
+    def test_a_ring_the_food_or_groceries_courier_more_likely_made_names_nobody(self):
+        parcel_out = carrier_parcel()
+        self.assertIsNone(self.source(parcel_out, delivery()))
+        self.assertIsNone(self.source(parcel_out, nemlig_delivery()))
+        self.assertEqual(self.source(parcel_out, delivery(stage="preparing")), "airmee")
+
+    def test_it_is_the_carrier_the_published_door_courier_names_whatever_order_they_come_in(self):
+        soon = carrier_parcel("PostNord", "TESTPN0001", start=at(5))
+        later = carrier_parcel("Airmee", "TESTAM0001", start=at(40))
+        for deliveries in ([later, soon], [soon, later]):
+            with self.subTest(order=[d.source for d in deliveries]):
+                self.assertEqual(hd.snapshot(deliveries, NOW)["attributes"]["door_courier"]["source"], "postnord")
+                self.assertEqual(self.source(*deliveries), "postnord")
+
+
+class ParcelsUndeliveredTests(unittest.TestCase):
+    def test_a_parcel_that_is_not_delivered_keeps_the_carrier_wanting_a_refresh(self):
+        for stage in ("preparing", "on_the_way", "arriving"):
+            with self.subTest(stage=stage):
+                parcel_there = delivery(id="airmee:A", source="airmee", kind="parcel", stage=stage)
+                self.assertTrue(hd.parcels_undelivered([parcel_there], "airmee"))
+
+    def test_delivered_gone_and_other_carriers_parcels_do_not(self):
+        done = carrier_parcel(status="delivered", delivered_at=at(-1))
+        elsewhere = carrier_parcel("PostNord", "TESTPN0001")
+        self.assertFalse(hd.parcels_undelivered([done, elsewhere, delivery()], "airmee"))
+        self.assertFalse(hd.parcels_undelivered([], "airmee"))
+        self.assertTrue(hd.parcels_undelivered([done, elsewhere, carrier_parcel(barcode="TESTAM0002")], "airmee"))
+
+
 class Harness:
     def __init__(self, states=None, now=NOW, **args):
         self.now = now
@@ -1066,6 +1181,8 @@ class Harness:
         self.listened = []
         self.logs = []
         self.queue = []
+        self.timers = []
+        self.calls = []
         self.unreadable = None
         self.app = hd.HomeDelivery.__new__(hd.HomeDelivery)
         self.app.args = args
@@ -1078,6 +1195,8 @@ class Harness:
         self.app.listen_state = lambda callback, entity, **kw: self.listened.append((entity, kw)) or "handle"
         self.app.run_every = lambda *a, **kw: "timer"
         self.app.submit_to_executor = lambda func, *a, callback=None: self.queue.append((func, a, callback))
+        self.app.run_in = lambda callback, delay, **kw: self.timers.append((self.now + delay, callback, kw))
+        self.app.call_service = lambda service, **data: self.calls.append((service, data))
         self.app.initialize()
 
     def render_template(self, template):
@@ -1112,6 +1231,20 @@ class Harness:
         queue, self.queue = self.queue, []
         for func, args, callback in queue:
             callback(result=func(*args))
+
+    def ring(self, *rings):
+        self.states[INTERCOM_VISIT] = intercom(*rings)
+        self.app._on_visit(INTERCOM_VISIT, "all", {}, copy.deepcopy(self.states[INTERCOM_VISIT]), {})
+
+    def advance(self, seconds):
+        """Move the clock on, running each timer that falls due on the way."""
+        end = self.now + seconds
+        for due, callback, kw in sorted(self.timers, key=lambda timer: timer[0]):
+            if due <= end:
+                self.now = due
+                callback(kw)
+        self.timers = [timer for timer in self.timers if timer[0] > end]
+        self.now = end
 
 
 class AppTests(unittest.TestCase):
@@ -1553,6 +1686,153 @@ class DoorCourierAppTests(unittest.TestCase):
     def test_who_is_home_is_not_listened_to(self):
         h = self.make("not_home")
         self.assertNotIn(OWNER, [entity for entity, _ in h.listened])
+
+
+class CarrierRefreshAppTests(unittest.TestCase):
+    AIRMEE_OUT = {AGGREGATOR_INCOMING: aggregator(parcel(carrier="Airmee", barcode="TESTAM0001"))}
+
+    def make(self, states=None, **args):
+        return Harness({**self.AIRMEE_OUT, **(states or {})}, **{"refresh_buttons": BUTTONS, **args})
+
+    def pressed(self, h):
+        return [data["entity_id"] for service, data in h.calls if service == "button/press"]
+
+    def deliver(self, h, *still_out):
+        h.states[AGGREGATOR_INCOMING] = aggregator(*still_out)
+        h.states[AGGREGATOR_DELIVERED] = aggregator(
+            parcel(carrier="Airmee", barcode="TESTAM0001", status="delivered", delivered_at=h.now))
+        h.app._on_change(AGGREGATOR_INCOMING, "all", {}, {}, {})
+
+    def test_a_street_ring_while_a_parcel_is_out_presses_its_carriers_button_at_three_and_six_minutes(self):
+        h = self.make()
+        h.ring(("front door", NOW))
+        h.advance(179)
+        self.assertEqual(h.calls, [])
+        h.advance(1)
+        self.assertEqual(h.calls, [("button/press", {"entity_id": "button.airmee_test_refresh"})])
+        h.advance(179)
+        self.assertEqual(len(h.calls), 1)
+        h.advance(1)
+        self.assertEqual(self.pressed(h), ["button.airmee_test_refresh"] * 2)
+        h.advance(3600)
+        self.assertEqual(len(h.calls), 2)
+        self.assertEqual([message for _, message in h.logs if message.startswith("Refreshing")],
+                         ["Refreshing airmee after the courier rang"] * 2)
+
+    def test_the_back_door_counts_and_the_apartment_door_does_not(self):
+        for door, presses in (("front door", 2), ("back door", 2), ("apartment door", 0), ("", 0)):
+            with self.subTest(door=door):
+                h = self.make()
+                h.ring((door, NOW))
+                h.advance(400)
+                self.assertEqual(len(self.pressed(h)), presses)
+
+    def test_a_re_ring_of_the_same_visit_schedules_no_more_presses(self):
+        h = self.make()
+        h.ring(("front door", NOW))
+        self.assertEqual(len(h.timers), 2)
+        for _ in range(3):
+            h.advance(20)
+            h.ring(("front door", NOW))
+        h.advance(20)
+        h.ring()
+        self.assertEqual(len(h.timers), 2)
+        h.advance(400)
+        self.assertEqual(len(self.pressed(h)), 2)
+
+    def test_a_second_visit_is_a_ring_of_its_own(self):
+        h = self.make()
+        h.ring(("front door", NOW))
+        h.advance(30)
+        h.ring(("front door", NOW), ("back door", NOW + 30))
+        h.advance(400)
+        self.assertEqual(len(self.pressed(h)), 4)
+
+    def test_a_ring_that_no_parcel_courier_made_presses_nothing(self):
+        cases = {
+            "nothing on the way": {},
+            "the parcel is only expected later today":
+                {AGGREGATOR_INCOMING: aggregator(parcel(carrier="Airmee", status="in_transit", start=at(30)))},
+            "a food courier is due": {**wolt(courier=True, eta=at(5)), **self.AIRMEE_OUT},
+            "the parcel is delivered": {AGGREGATOR_DELIVERED: aggregator(
+                parcel(carrier="Airmee", barcode="TESTAM0001", status="delivered", delivered_at=at(-1)))},
+            "the carrier has no button": {AGGREGATOR_INCOMING: aggregator(parcel(carrier="GLS", barcode="TESTGL0001"))},
+        }
+        for name, states in cases.items():
+            with self.subTest(name):
+                h = Harness(states, refresh_buttons=BUTTONS)
+                h.ring(("front door", NOW))
+                self.assertEqual(h.timers, [])
+                h.advance(400)
+                self.assertEqual(h.calls, [])
+
+    def test_a_press_is_skipped_once_every_parcel_of_the_carrier_is_delivered(self):
+        h = self.make()
+        h.ring(("front door", NOW))
+        h.advance(100)
+        self.deliver(h)
+        h.advance(400)
+        self.assertEqual(h.calls, [])
+
+    def test_the_second_press_is_skipped_when_the_first_brought_the_delivery(self):
+        h = self.make()
+        h.ring(("front door", NOW))
+        h.advance(180)
+        self.assertEqual(len(h.calls), 1)
+        self.deliver(h)
+        h.advance(400)
+        self.assertEqual(len(h.calls), 1)
+
+    def test_another_parcel_of_the_carrier_still_out_keeps_the_presses_coming(self):
+        second = parcel(carrier="Airmee", barcode="TESTAM0002")
+        h = self.make({AGGREGATOR_INCOMING: aggregator(parcel(carrier="Airmee", barcode="TESTAM0001"), second)})
+        h.ring(("front door", NOW))
+        h.advance(100)
+        self.deliver(h, second)
+        h.advance(400)
+        self.assertEqual(len(self.pressed(h)), 2)
+
+    def test_another_carriers_parcel_does_not_keep_the_presses_coming(self):
+        h = self.make({AGGREGATOR_INCOMING: aggregator(parcel(carrier="Airmee", barcode="TESTAM0001"),
+                                                       parcel(carrier="PostNord", barcode="TESTPN0001"))})
+        h.ring(("front door", NOW))
+        h.advance(100)
+        self.deliver(h, parcel(carrier="PostNord", barcode="TESTPN0001"))
+        h.advance(400)
+        self.assertEqual(h.calls, [])
+
+    def test_a_visit_that_rang_a_while_ago_only_gets_the_moments_still_ahead(self):
+        h = self.make()
+        h.ring(("front door", NOW - 200))
+        h.advance(400)
+        self.assertEqual(len(self.pressed(h)), 1)
+        h = self.make()
+        h.ring(("front door", NOW - 400))
+        self.assertEqual(h.timers, [])
+
+    def test_a_ring_is_forgotten_once_its_last_moment_has_passed(self):
+        h = self.make()
+        h.ring(("front door", NOW))
+        self.assertEqual(h.app._refreshed_rings, {NOW})
+        h.advance(361)
+        h.ring()
+        self.assertEqual(h.app._refreshed_rings, set())
+
+    def test_the_intercom_is_read_only_when_there_are_buttons(self):
+        self.assertNotIn(INTERCOM_VISIT, [entity for entity, _ in Harness(self.AIRMEE_OUT).listened])
+        listened = [kw for entity, kw in self.make().listened if entity == INTERCOM_VISIT]
+        self.assertEqual(listened, [{"attribute": "all"}])
+
+    def test_the_shipped_buttons_are_keyed_by_the_carrier_slugs_the_parcels_get(self):
+        shipped = shipped_refresh_buttons()
+        carriers = {"airmee": "Airmee", "postnord": "PostNord", "gls": "GLS"}
+        self.assertEqual(set(shipped), set(carriers))
+        for source, carrier in carriers.items():
+            with self.subTest(source=source):
+                h = Harness({AGGREGATOR_INCOMING: aggregator(parcel(carrier=carrier))}, refresh_buttons=shipped)
+                h.ring(("front door", NOW))
+                h.advance(180)
+                self.assertEqual(self.pressed(h), [shipped[source]])
 
 
 if __name__ == "__main__":

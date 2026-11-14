@@ -12,6 +12,10 @@ a problem, an unmapped status, old parcels) stays out of the deliveries and is p
 aggregator's parcel has no stops-away or live ETA, only planned_from and planned_to: both with planned_from
 before planned_to is a window, planned_from alone is an ETA.
 
+The carrier integrations poll slowly, so a street-door ring in sensor.intercom_visit while door_courier is a parcel
+makes the app press that carrier's refresh button (the refresh_buttons arg, source -> button entity) REFRESH_AFTER_S
+seconds after the ring, each press skipped once the carrier has no undelivered parcel left.
+
 state: the number of active deliveries (preparing, on_the_way, arriving).
 attributes:
   deliveries      [{id, source: wolt|nemlig|<carrier slug, e.g. postnord>, kind: food|groceries|parcel, title
@@ -65,6 +69,10 @@ PARCELS_INCOMING = "sensor.parcel_aggregator_incoming_parcels"
 PARCELS_DELIVERED = "sensor.parcel_aggregator_delivered_parcels"
 PARCEL_NOT_YET_OUT = ("registered", "in_transit")
 PARCEL_ARRIVING_S = 900
+
+INTERCOM_VISIT = "sensor.intercom_visit"
+STREET_DOORS = ("front door", "back door")
+REFRESH_AFTER_S = (180, 360)
 
 WOLT_DELIVERY = "sensor.wolt_delivery_"
 WOLT_ORDER = re.compile(r"sensor\.wolt_order_(.+?)_(estimated_arrival|item_count)(_\d+)?")
@@ -583,6 +591,37 @@ def snapshot(deliveries, now, incoming=()):
                            "spoken": spoken(active, now), "reason": reason}}
 
 
+def street_rings(full):
+    """Ring time, in seconds since the epoch, of each street-door visit open in sensor.intercom_visit."""
+    visits = attributes(full).get("visits")
+    rings = []
+    for visit in visits if isinstance(visits, list) else ():
+        if isinstance(visit, dict) and visit.get("door") in STREET_DOORS:
+            at = epoch(visit.get("ring_at"))
+            if at is not None:
+                rings.append(at)
+    return rings
+
+
+def refresh_source(deliveries, now, buttons):
+    """The carrier whose refresh button a street ring calls for: the source of the door courier when that is a parcel
+    out for delivery and the carrier has a button in `buttons`; None otherwise."""
+    active = [delivery for delivery in sorted(deliveries, key=sort_key) if delivery.stage in ACTIVE]
+    courier = door_courier(active, now)
+    return courier.source if courier and courier.kind == "parcel" and courier.source in buttons else None
+
+
+def refresh_delays(ring_at, now):
+    """Whole seconds from now to each REFRESH_AFTER_S moment after the ring that is still ahead."""
+    return [math.ceil(ring_at + after - now) for after in REFRESH_AFTER_S if ring_at + after > now]
+
+
+def parcels_undelivered(deliveries, source):
+    """True while some parcel of this carrier is neither delivered nor gone."""
+    return any(delivery.kind == "parcel" and delivery.source == source and delivery.stage in ACTIVE
+               for delivery in deliveries)
+
+
 class HomeDelivery(hass.Hass):
     def initialize(self):
         args = self.args
@@ -593,6 +632,9 @@ class HomeDelivery(hass.Hass):
         self._wolt_ok = True
         self._incoming = []
         self._stages = {}
+        self._deliveries = []
+        self._buttons = dict(args.get("refresh_buttons") or {})
+        self._refreshed_rings = set()
         self._nemlig = None
         self._nemlig_order = None
         self._nemlig_at = 0.0
@@ -606,6 +648,8 @@ class HomeDelivery(hass.Hass):
         self._readers = [self._read_wolt, self._read_nemlig, self._read_parcels]
         for entity_id in (PARCELS_INCOMING, PARCELS_DELIVERED):
             self.listen_state(self._on_change, entity_id, attribute="all")
+        if self._buttons:
+            self.listen_state(self._on_visit, INTERCOM_VISIT, attribute="all")
         self.run_every(self._on_tick, "now+5", TICK_S)
         self._refresh()
 
@@ -616,12 +660,31 @@ class HomeDelivery(hass.Hass):
     def _on_change(self, entity, attribute, old, new, kwargs):
         self._refresh()
 
+    def _on_visit(self, entity, attribute, old, new, kwargs):
+        now = self.get_now().timestamp()
+        self._refreshed_rings = {at for at in self._refreshed_rings if now - at < max(REFRESH_AFTER_S)}
+        source = refresh_source(self._deliveries, now, self._buttons)
+        if source is None:
+            return
+        for at in street_rings(new):
+            if at not in self._refreshed_rings:
+                self._refreshed_rings.add(at)
+                for delay in refresh_delays(at, now):
+                    self.run_in(self._press_refresh, delay, source=source)
+
+    def _press_refresh(self, kwargs):
+        source = kwargs["source"]
+        if parcels_undelivered(self._deliveries, source):
+            self.log(f"Refreshing {source} after the courier rang")
+            self.call_service("button/press", entity_id=self._buttons[source])
+
     def _refresh(self):
         now = self.get_now().timestamp()
         observed = []
         for read in self._readers:
             observed.extend(read(now))
         deliveries = self._ledger.update(observed, now)
+        self._deliveries = deliveries
         stages = {delivery.id: delivery.stage for delivery in deliveries}
         for id_, stage in stages.items():
             if self._stages.get(id_) != stage:
