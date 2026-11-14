@@ -47,7 +47,9 @@ Intercom:
 
   # ESP unlock: up to unlock_repeat_count attempts at 1s, 4s, 7s, each 3 s long.
   # The ladder stops at the first attempt the ESP confirms, so a working door
-  # gets one unlock and one module announcement.
+  # gets one unlock and one module announcement. The first attempt waits a
+  # moment on purpose: a door that buzzes the instant the bell is pressed feels
+  # wrong to the visitor.
   unlock_delay_s: 1
   unlock_repeat_count: 3
   unlock_repeat_interval_s: 3
