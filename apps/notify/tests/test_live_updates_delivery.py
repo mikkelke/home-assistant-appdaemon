@@ -1,6 +1,7 @@
 """Delivery cards read sensor.home_delivery only: one card per source (Wolt, Nemlig, each parcel carrier),
 cleared on delivery, one push on a cancel and none for parcels. Only food reaches Kristine. A street ring while the
-sensor names a door courier takes that delivery's card away and words the apartment ring that follows it."""
+sensor names a door courier takes that delivery's card away, a parcel's with every other parcel of its carrier, and
+words the apartment ring that follows it."""
 
 import json
 import re
@@ -260,6 +261,25 @@ class SelectionTests(unittest.TestCase):
         cards = lu.delivery_cards(state, NOW)
         self.assertEqual(set(cards), {WOLT, POSTNORD, AIRMEE})
         self.assertEqual((cards[POSTNORD].message, cards[AIRMEE].message), ("Out for delivery · 13:20", "Out for delivery · 14–15"))
+
+    def test_a_handed_over_parcel_takes_every_parcel_of_its_carrier_with_it(self):
+        state = sensor(parcel_entry("airmee", barcode="TEST0001"), parcel_entry("airmee", barcode="TEST0002"),
+                       parcel_entry("postnord", barcode="TEST0003"), parcel_entry("gls", barcode="TEST0004"))
+        self.assertEqual(set(lu.delivery_cards(state, NOW)), {AIRMEE, POSTNORD, GLS})
+        for matched in ("airmee:TEST0001", "airmee:TEST0002", "airmee:ENDED"):
+            with self.subTest(matched=matched):
+                self.assertEqual(set(lu.delivery_cards(state, NOW, {matched})), {POSTNORD, GLS})
+        self.assertEqual(set(lu.delivery_cards(state, NOW, {"airmee:TEST0001", "gls:TEST0004"})), {POSTNORD})
+
+    def test_a_handed_over_food_or_groceries_order_takes_only_itself(self):
+        state = sensor(entry(title="Pizza Test", eta=NOW + 300), entry(title=KITCHEN, eta=NOW + 900),
+                       entry("nemlig", eta=NOW + 600), parcel_entry("postnord"))
+        cards = lu.delivery_cards(state, NOW, {"wolt:pizza_test"})
+        self.assertEqual(set(cards), {WOLT, NEMLIG, POSTNORD})
+        self.assertEqual(cards[WOLT].title, f"Wolt · {KITCHEN}")
+        both = {"wolt:pizza_test", "wolt:test_kitchen"}
+        self.assertEqual(set(lu.delivery_cards(state, NOW, both)), {NEMLIG, POSTNORD})
+        self.assertEqual(set(lu.delivery_cards(state, NOW, {"nemlig:test_kitchen"})), {WOLT, POSTNORD})
 
     def test_parcels_are_never_cancelled_announcements(self):
         self.assertEqual(lu.cancelled_deliveries(sensor(parcel_entry(stage="delivered"), parcel_entry("airmee", stage="on_the_way"))), [])
@@ -633,6 +653,23 @@ class CourierHandoverTests(unittest.IsolatedAsyncioTestCase):
         h.forget_calls()
         await h.reconcile(600)
         self.assertEqual(h.ongoing(GLS), [])
+
+    async def test_a_ring_matched_to_one_parcel_takes_its_carriers_other_parcels_away_for_good(self):
+        first, second = parcel_entry("airmee", barcode="TEST0001"), parcel_entry("airmee", barcode="TEST0002")
+        other = parcel_entry("postnord", barcode="TEST0003")
+        h = await self.make(states={ENTITIES["delivery"]: sensor(first, second, other)})
+        self.assertEqual({payload["data"]["tag"] for _, payload in h.ongoing()}, {AIRMEE, POSTNORD})
+        h.forget_calls()
+        h.states[ENTITIES["delivery"]] = with_courier(sensor(first, second, other), first)
+        h.states[ENTITIES["doorbell"]] = visit(at=NOW + 60)
+        await h.reconcile(60)
+        self.assertEqual(len(h.clears(AIRMEE)), 1)
+        self.assertEqual((h.ongoing(), h.clears(POSTNORD)), ([], []))
+        h.forget_calls()
+        delivered = parcel_entry("airmee", stage="delivered", barcode="TEST0001")
+        h.states[ENTITIES["delivery"]] = sensor(delivered, second, other)
+        await h.reconcile(600)
+        self.assertEqual((h.ongoing(), h.clears(AIRMEE)), ([], []))
 
     async def test_an_apartment_ring_soon_after_a_matched_parcel_ring_names_the_carrier(self):
         parcel = parcel_entry("gls", barcode="043312860948")

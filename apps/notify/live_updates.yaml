@@ -40,7 +40,8 @@ LiveUpdates:
   # parcels are Mikkel's own errands. Each audience is cut down to enabled_people, so Kristine gets Wolt
   # cards (and the cancel push) once she is listed there, and never a Nemlig or parcel card.
   # A street-door ring while sensor.home_delivery names a door_courier (the delivery a ring most likely
-  # brings) takes that delivery's card away, since the courier is here. An apartment-door ring within ten
+  # brings) takes that delivery's card away, since the courier is here; for a parcel it takes the card of every
+  # parcel of that carrier, one courier carrying them all. An apartment-door ring within ten
   # minutes of such a ring says "Probably the GLS courier" (or Wolt, Nemlig, ...) instead of how long ago it rang.
   delivery_entity: sensor.home_delivery
   delivery_food_people: [mikkel, kristine]

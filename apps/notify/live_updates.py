@@ -220,10 +220,15 @@ def ring_key(at):
     return str(int(at))
 
 
+def order_source(order):
+    """The source a delivery id belongs to, 'gls' for 'gls:043312860948'; '' for anything that is not an id."""
+    return order.split(":", 1)[0] if isinstance(order, str) else ""
+
+
 def courier_text(order):
     """The doorbell card's line for a ring matched to this delivery id: its courier by name when the id's source
     is known."""
-    source = order.split(":", 1)[0] if isinstance(order, str) else ""
+    source = order_source(order)
     return f"Probably the {COURIER_NAMES[source]} courier" if source in COURIER_NAMES else "Probably the courier"
 
 
@@ -321,10 +326,12 @@ def delivery_entries(full):
 
 def delivery_cards(full, now, handed_over=()):
     """One card per source: its first delivery that has a card, the sensor having sorted them by arrival. An order
-    in handed_over, whose courier has rung at the door, is here and gets none."""
+    in handed_over, whose courier has rung at the door, is here and gets none; neither does any parcel of a carrier
+    that has one in handed_over, since one courier carries them all."""
+    carriers = {order_source(order) for order in handed_over} & PARCEL_CARRIERS.keys()
     cards = {}
     for delivery in delivery_entries(full):
-        if delivery.get("id") in handed_over:
+        if delivery.get("id") in handed_over or delivery.get("source") in carriers:
             continue
         card = delivery_card(delivery, now)
         if card is not None and card.tag not in cards:
