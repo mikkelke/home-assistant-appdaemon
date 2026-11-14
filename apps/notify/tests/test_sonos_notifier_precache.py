@@ -16,10 +16,11 @@ from test_sonos_notifier import (
 )
 
 APPS = Path(__file__).resolve().parents[2]
-for app_dir in ("sonos", "intercom", "weather"):
+for app_dir in ("sonos", "intercom", "weather", "deliveries"):
     sys.path.insert(0, str(APPS / app_dir))
 
 import assist_tts_failover as atf  # noqa: E402
+import home_delivery  # noqa: E402
 import intercom  # noqa: E402
 import weather_opening_alert  # noqa: E402
 
@@ -347,6 +348,7 @@ REVIEWED = {
     ("appliances/dryer_monitor.py", "msg"): "announce_message of dryer.yaml, else the literal the scan finds",
     ("appliances/washer_monitor.py", "self._finish_announcement(programme)"): "announce_message or drum clean",
     ("appliances/washer_monitor.py", "self._finish_announcement(confirmed_prog)"): "announce_message or drum clean",
+    ("deliveries/home_delivery.py", "parcel_outside_sentence(carrier)"): "one per carrier with a refresh button",
     ("intercom/intercom.py", "courier_words"): "courier_message() and COURIER_AT_THE_DOOR",
     ("intercom/intercom.py", "combined_message"): "a door's ring and its opening",
     ("intercom/intercom.py", "info['message']"): "a door's ring",
@@ -461,6 +463,11 @@ def rooftop_sentences():
         weather_opening_alert.rooftop_tts_message(names)}
 
 
+def parcel_sentences():
+    carriers = config("deliveries/home_delivery.yaml", "HomeDelivery")["refresh_buttons"]
+    return {home_delivery.parcel_outside_sentence(intercom.COURIER_NAMES[source]) for source in carriers}
+
+
 def appliance_sentences():
     washer = config("appliances/washer.yaml", "washer_monitor")
     dryer = config("appliances/dryer.yaml", "dryer_monitor")
@@ -515,6 +522,7 @@ class PrecacheList(unittest.TestCase):
             ("intercom", intercom_sentences(self.sites)),
             ("tv lift", tv_sentences(self.sites)),
             ("rooftop rain", rooftop_sentences()),
+            ("parcel outside", parcel_sentences()),
             ("appliances", appliance_sentences()),
         ):
             self.assertTrue(sentences, name)

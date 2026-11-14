@@ -637,6 +637,47 @@ class QuietHoursHelperFailSafe(unittest.TestCase):
         self.assertFalse(_logged(app, "readable again"))
 
 
+class InQuietHours(unittest.TestCase):
+    """in_quiet_hours() says what notify() is about to decide, without announcing anything."""
+
+    def test_inside_and_outside_the_helpers_window(self):
+        for hour, minute, quiet in ((3, 0, True), (7, 29, True), (7, 30, False), (12, 0, False), (21, 59, False),
+                                    (22, 0, True), (23, 30, True)):
+            with self.subTest(at=f"{hour}:{minute:02d}"):
+                app = _new_app(now=datetime(2026, 9, 11, hour, minute))
+                self.assertIs(app.in_quiet_hours(), quiet)
+
+    def test_it_matches_whether_notify_holds_the_announcement_back(self):
+        for hour in range(24):
+            with self.subTest(hour=hour):
+                app = _new_app(now=datetime(2026, 9, 11, hour, 10))
+                quiet = app.in_quiet_hours()
+                app.notify("Hello", target_speakers=[EXPLICIT])
+                self.assertEqual(len(_plays(app)), 0 if quiet else 1)
+
+    def test_asking_announces_nothing(self):
+        app = _new_app(now=DAYTIME)
+        app.in_quiet_hours()
+        self.assertEqual(app.calls, [])
+
+    def test_unreadable_helpers_use_the_default_window(self):
+        for hour, minute, quiet in ((23, 30, True), (6, 59, True), (7, 10, False), (14, 0, False)):
+            with self.subTest(at=f"{hour}:{minute:02d}"):
+                app = _new_app(state=QuietHoursHelperFailSafe.UNAVAILABLE, now=datetime(2026, 9, 11, hour, minute))
+                self.assertIs(app.in_quiet_hours(), quiet)
+
+    def test_unreadable_helpers_are_reported_once_however_it_is_asked(self):
+        app = _new_app(state=QuietHoursHelperFailSafe.UNAVAILABLE, now=datetime(2026, 9, 11, 23, 30))
+        app.in_quiet_hours()
+        app.in_quiet_hours()
+        app.notify("Hello", target_speakers=[EXPLICIT])
+        self.assertEqual([1 for a, kw in app.log_calls if "Falling back" in str(a)], [1])
+
+    def test_without_time_constraints_it_is_never_quiet(self):
+        app = _new_app(time_constraints_enabled=False)
+        self.assertIs(app.in_quiet_hours(), False)
+
+
 class SleepModeEntityFailSafe(unittest.TestCase):
     """An unavailable sleep-mode entity is only assumed 'sleeping' while inside quiet
     hours; outside quiet hours it is treated as not sleeping."""

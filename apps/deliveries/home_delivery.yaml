@@ -16,6 +16,16 @@
 # is a parcel out for delivery presses that carrier's refresh button (source -> button entity) 3 and
 # 6 minutes after the ring, skipping a press once the carrier has no undelivered parcel left. A carrier
 # without a button is left alone; drop refresh_buttons and the intercom is not read at all.
+#
+# A courier often leaves a parcel outside the door without ringing the apartment doorbell, and some get
+# into the building without ringing the street door. When landing_entity (the presence sensor outside the
+# flat) goes on while a parcel is out for delivery, it is watched for ten minutes. If it goes off again,
+# and apartment_door_entity has not opened and apartment_doorbell_entity has not rung since it went on (nor
+# in the minute before: someone from the flat went out), the carrier is refreshed at once and the owner is
+# told once, "Your PostNord parcel is outside the door.": spoken by SonosNotifier while owner_entity is
+# home outside its quiet hours, else pushed to notify_target through MobileNotifier. The carrier is not told
+# about again for half an hour, and sensor.home_delivery lists it in left_at_door for that time, which takes
+# its Live Update card away. Drop landing_entity and none of this runs; it needs refresh_buttons.
 
 HomeDelivery:
   module: home_delivery
@@ -27,3 +37,8 @@ HomeDelivery:
     airmee: button.airmee_refresh
     postnord: button.postnord_refresh
     gls: button.gls_refresh
+  landing_entity: binary_sensor.landing_presence_presence
+  apartment_door_entity: binary_sensor.apartment_door_open
+  apartment_doorbell_entity: binary_sensor.yale_doorbell_ding
+  owner_entity: person.mikkel
+  notify_target: mikkel

@@ -154,6 +154,40 @@ class SonosNotifier(hass.Hass):
                 node = node[key]
         return node if isinstance(node, dict) else {}
 
+    def in_quiet_hours(self):
+        """True while notify() holds announcements back (override_quiet_hours aside): now is inside the quiet-hours
+        helpers' window, or the configured defaults' while a helper is unreadable. Always False when no helpers
+        are configured."""
+        return self._quiet_hours()[0]
+
+    def _quiet_hours(self):
+        """(inside the window, window start, window end, the time checked) for now; (False, None, None, None) when
+        time constraints are disabled."""
+        if not self.time_constraints_enabled:
+            return False, None, None, None
+        raw_quiet_hours_end = self._get_time_from_entity(self.quiet_hours_end_entity)
+        raw_quiet_hours_start = self._get_time_from_entity(self.quiet_hours_start_entity)
+        helpers_ok = raw_quiet_hours_end is not None and raw_quiet_hours_start is not None
+
+        if not helpers_ok and not self._quiet_hours_fallback_active:
+            self._quiet_hours_fallback_active = True
+            self.log(
+                "Quiet-hours helper(s) unavailable/unparseable. Falling back to configured defaults "
+                f"({self._default_quiet_hours_start.strftime('%H:%M')}-{self._default_quiet_hours_end.strftime('%H:%M')}) "
+                "until helpers recover.",
+                level="WARNING",
+            )
+        elif helpers_ok and self._quiet_hours_fallback_active:
+            self._quiet_hours_fallback_active = False
+            self.log("Quiet-hours helpers are readable again. Resuming normal quiet-hours checks.", level="INFO")
+
+        # Fall back per-entity: an outage on one helper doesn't have to blind the other.
+        quiet_hours_end = raw_quiet_hours_end if raw_quiet_hours_end is not None else self._default_quiet_hours_end
+        quiet_hours_start = raw_quiet_hours_start if raw_quiet_hours_start is not None else self._default_quiet_hours_start
+        current_time_obj = self.datetime().time()
+        in_quiet_hours_now = self._is_quiet_hours_now(current_time_obj, quiet_hours_start, quiet_hours_end)
+        return in_quiet_hours_now, quiet_hours_start, quiet_hours_end, current_time_obj
+
     def notify(
         self,
         message,
@@ -191,29 +225,7 @@ class SonosNotifier(hass.Hass):
         #     pass # Bypass the actual time check logic below
         # elif self.time_constraints_enabled:
         # END TEMPORARY BYPASS
-        in_quiet_hours_now = False
-        if self.time_constraints_enabled:
-            raw_quiet_hours_end = self._get_time_from_entity(self.quiet_hours_end_entity)
-            raw_quiet_hours_start = self._get_time_from_entity(self.quiet_hours_start_entity)
-            helpers_ok = raw_quiet_hours_end is not None and raw_quiet_hours_start is not None
-
-            if not helpers_ok and not self._quiet_hours_fallback_active:
-                self._quiet_hours_fallback_active = True
-                self.log(
-                    "Quiet-hours helper(s) unavailable/unparseable. Falling back to configured defaults "
-                    f"({self._default_quiet_hours_start.strftime('%H:%M')}-{self._default_quiet_hours_end.strftime('%H:%M')}) "
-                    "until helpers recover.",
-                    level="WARNING",
-                )
-            elif helpers_ok and self._quiet_hours_fallback_active:
-                self._quiet_hours_fallback_active = False
-                self.log("Quiet-hours helpers are readable again. Resuming normal quiet-hours checks.", level="INFO")
-
-            # Fall back per-entity: an outage on one helper doesn't have to blind the other.
-            quiet_hours_end = raw_quiet_hours_end if raw_quiet_hours_end is not None else self._default_quiet_hours_end
-            quiet_hours_start = raw_quiet_hours_start if raw_quiet_hours_start is not None else self._default_quiet_hours_start
-            current_time_obj = self.datetime().time()
-            in_quiet_hours_now = self._is_quiet_hours_now(current_time_obj, quiet_hours_start, quiet_hours_end)
+        in_quiet_hours_now, quiet_hours_start, quiet_hours_end, current_time_obj = self._quiet_hours()
 
         if override_quiet_hours:
             self.log(f"override_quiet_hours=True: bypassing quiet-hours check for '{message}'.", level="WARNING")

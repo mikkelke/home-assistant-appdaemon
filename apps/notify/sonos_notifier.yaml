@@ -100,6 +100,10 @@ SonosNotifier:
     - "The food is at the door."
     - "The groceries are at the door."
     - "The parcel is at the door."
+    # A parcel left outside the door, one per carrier with a refresh button in home_delivery.yaml
+    - "Your Airmee parcel is outside the door."
+    - "Your PostNord parcel is outside the door."
+    - "Your GLS parcel is outside the door."
     # Washer, dryer and dishwasher
     - "Washer is ready to be emptied"
     - "Drum clean is done. Open the washer door to air it"
