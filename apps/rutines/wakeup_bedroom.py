@@ -1039,8 +1039,10 @@ class WakeupRoutine(hass.Hass):
                 self._stop_light_ramp()
         self.log("[wake] Alarm firing.", log=self.user_log)
         self._alarm_fired_at = self.datetime()
-        self._session_status = "ringing"
-        self._session_reason = ""
+        # A manual wake-now needs no snooze/dismiss prompt: it starts dismissed with the radio kept.
+        manual = self._manual_fire_in_progress
+        self._session_status = "dismissed" if manual else "ringing"
+        self._session_reason = "radio_kept" if manual else ""
         self._session_started_at = self._session_now().isoformat()
         self._session_id = uuid4().hex
         self._snooze_minutes = getattr(self, "_snooze_minutes", 10)
@@ -1048,7 +1050,7 @@ class WakeupRoutine(hass.Hass):
         self._radio_playing = True
         self._persist_wake_session()
         self._publish_wake_session()
-        self._queue_wake_notification("ringing")
+        self._queue_wake_notification("clear" if manual else "ringing")
         try:
             self._open_wake_window()
         except Exception as e:
