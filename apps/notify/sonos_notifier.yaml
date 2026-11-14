@@ -50,6 +50,10 @@ SonosNotifier:
   # FFmpeg arguments chime_tts applies to every rendered clip: a fixed gain to about -14 LUFS,
   # 2 dB below DR P3's loudness, with a limiter on the chime's peaks. loudnorm is avoided: it flattens the voice.
   audio_conversion: "-af volume=2dB,alimiter=limit=0.89:attack=5:release=50:level=false"
+  # Used instead of audio_conversion for an engine named here (tts_platform without "tts.").
+  # Kokoro speaks about 4 dB softer than Piper at its highest unclipped gain, so it gets 4 dB more.
+  audio_conversion_by_engine:
+    acer_tts: "-af volume=6dB,alimiter=limit=0.89:attack=5:release=50:level=false"
   # Fractions (0.0-1.0). Without a volume_level from the caller, a room announces this much above
   # its own volume, at most announce_volume_cap. An explicit volume_level is used as given.
   announce_volume_boost: 0.0

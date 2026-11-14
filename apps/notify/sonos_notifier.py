@@ -31,6 +31,7 @@ class SonosNotifier(hass.Hass):
         self.default_chime_path = self.args.get("default_chime_path")
         self.tts_platform = self.args.get("tts_platform")
         self.audio_conversion = self.args.get("audio_conversion")
+        self.audio_conversion_by_engine = self.args.get("audio_conversion_by_engine") or {}
         self.announce_volume_boost = self.args.get("announce_volume_boost")
         self.announce_volume_cap = self.args.get("announce_volume_cap")
         self.clip_base_url = (self.args.get("clip_base_url") or "").rstrip("/")
@@ -264,7 +265,7 @@ class SonosNotifier(hass.Hass):
         voice = self._voice(kwargs.get("tts_platform"))
 
         self.log(
-            f"Sending TTS: '{message}' with chime '{actual_chime_path}' to {target_speakers} (cache={cache}, offset={offset}, volume_level={volume_level}, audio_conversion={self.audio_conversion!r}, tts_platform={voice.get('tts_platform')!r})",
+            f"Sending TTS: '{message}' with chime '{actual_chime_path}' to {target_speakers} (cache={cache}, offset={offset}, volume_level={volume_level}, audio_conversion={self._audio_conversion(voice)!r}, tts_platform={voice.get('tts_platform')!r})",
             level=self.log_level,
         )
 
@@ -290,6 +291,10 @@ class SonosNotifier(hass.Hass):
         voice = self._from_failover("announcement_voice")
         return voice if isinstance(voice, dict) and voice else {"tts_platform": self.tts_platform}
 
+    def _audio_conversion(self, voice):
+        """The FFmpeg arguments of a render: the engine's own from audio_conversion_by_engine, else audio_conversion."""
+        return self.audio_conversion_by_engine.get(voice.get("tts_platform"), self.audio_conversion)
+
     def _render_announcement(self, message, chime_path, cache, offset, voice):
         """Render chime + speech with chime_tts and return the URL of the combined mp3, or None."""
         service_data = {"message": message, "cache": cache, "offset": offset}
@@ -298,8 +303,9 @@ class SonosNotifier(hass.Hass):
         for key in ("tts_platform", "options", "language"):
             if voice.get(key):
                 service_data[key] = voice[key]
-        if self.audio_conversion:
-            service_data["audio_conversion"] = self.audio_conversion
+        audio_conversion = self._audio_conversion(voice)
+        if audio_conversion:
+            service_data["audio_conversion"] = audio_conversion
         try:
             response = self.call_service("chime_tts/say_url", return_response=True, **service_data)
         except Exception as e:

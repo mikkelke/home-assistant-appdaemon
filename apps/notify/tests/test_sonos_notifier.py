@@ -73,6 +73,7 @@ def _new_app(state=None, now=None, time_constraints_enabled=True, volumes=None, 
     app.default_chime_path = "/config/www/chimes/alert.mp3"
     app.tts_platform = "piper"
     app.audio_conversion = AUDIO_CONVERSION
+    app.audio_conversion_by_engine = {}
     app.announce_volume_boost = announce_volume_boost
     app.announce_volume_cap = announce_volume_cap
     app.clip_base_url = ""
@@ -251,6 +252,14 @@ class RenderAndPlayPayloads(unittest.TestCase):
         self.assertEqual([r["audio_conversion"] for r in _renders(app)], [AUDIO_CONVERSION, AUDIO_CONVERSION])
         self.assertTrue(_logged(app, f"audio_conversion='{AUDIO_CONVERSION}'"))
 
+    def test_an_engine_with_its_own_conversion_renders_with_it(self):
+        app = _new_app(now=DAYTIME)
+        app.audio_conversion_by_engine = {"kokoro": "-af volume=6dB"}
+        app.notify("Loud", target_speakers=[EXPLICIT], tts_platform="kokoro")
+        app.notify("Plain", target_speakers=[EXPLICIT], tts_platform="piper")
+        self.assertEqual([r["audio_conversion"] for r in _renders(app)], ["-af volume=6dB", AUDIO_CONVERSION])
+        self.assertTrue(_logged(app, "audio_conversion='-af volume=6dB'"))
+
     def test_no_audio_conversion_configured_is_not_sent(self):
         for value in (None, ""):
             app = _new_app(now=DAYTIME)
@@ -379,6 +388,10 @@ class ShippedConfig(unittest.TestCase):
         self.assertIn("alimiter", self.args["audio_conversion"])
         self.assertNotIn("loudnorm", self.args["audio_conversion"])
         self.assertEqual(_renders(app)[0]["audio_conversion"], self.args["audio_conversion"])
+
+    def test_kokoro_gets_four_db_more_than_the_other_engines(self):
+        kokoro = self.args["audio_conversion_by_engine"]["acer_tts"]
+        self.assertEqual(kokoro, self.args["audio_conversion"].replace("volume=2dB", "volume=6dB"))
 
     def test_boost_and_cap_reach_the_announce_volume(self):
         boost, cap = self.args["announce_volume_boost"], self.args["announce_volume_cap"]
