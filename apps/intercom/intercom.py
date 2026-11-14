@@ -220,6 +220,19 @@ class Intercom(hass.Hass):
             sensors = ", ".join(self.trigger_map.keys())
             self.log(f"Intercom initialized; listening for rings on: {sensors}", level="INFO")
 
+        # A street ring usually reaches HA first as the ABB gateway's SIP INVITE, ahead of the ESP
+        # bus tap. It is handled as an edge of that door's ESP sensor, so the ESP edge that
+        # follows lands inside debounce_s and is dropped, and a ring the gateway misses still
+        # comes in through the ESP. Stations not in abb_ring_stations never trigger anything.
+        sensor_by_label = {info["ring_label"]: entity for entity, info in self.trigger_map.items()
+                           if info.get("lock")}
+        raw_stations = self.args.get("abb_ring_stations", {}) or {}
+        self.abb_ring_sensors = {str(station): sensor_by_label[label]
+                                 for station, label in raw_stations.items() if label in sensor_by_label}
+        if self.abb_ring_sensors:
+            self.listen_event(self._on_abb_ring, self.args.get("abb_ring_event", "abb_welcome_ring"))
+            self.log(f"ABB rings trigger: {self.abb_ring_sensors}", level="INFO")
+
         # ABB-native unlock wiring (see abb_unlock_doors in intercom.yaml), built
         # from trigger_map so it only ever wires up doors that already have a
         # configured ESP lock. Empty abb_unlock_doors (the default) means none of
@@ -543,6 +556,15 @@ class Intercom(hass.Hass):
             )
             handle_ref[0] = handle  # Store handle for removal in callback
             self.pending_unlocks[entity].append(handle)
+
+    def _on_abb_ring(self, event_name, data, kwargs):
+        station_id = str((data or {}).get("station_id", "") or "")
+        entity = self.abb_ring_sensors.get(station_id)
+        if not entity:
+            self.log(f"ABB ring from unmapped station {station_id!r} ignored", level="INFO")
+            return
+        self.log(f"ABB ring station={station_id} -> {entity}", level="INFO")
+        self._handle_trigger(entity, "state", "off", "on", {})
 
     def _handle_trigger(self, entity, attr, old, new, kwargs):
         """Handle doorbell sensor trigger."""

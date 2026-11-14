@@ -199,6 +199,40 @@ class HandleTriggerEdgeTests(unittest.TestCase):
         self.assertFalse(self.state_file.exists())
 
 
+class AbbRingTriggerTests(unittest.TestCase):
+    """An ABB SIP ring is handled as a clean edge of its door's ESP sensor."""
+
+    def setUp(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        self.state_file = Path(tmpdir.name) / "intercom_state.json"
+        self.states = {"input_boolean.auto_open": "on", "lock.front": "locked"}
+        self.app = _fake_handle_trigger_app(self.state_file, self.states)
+        self.app.abb_ring_sensors = {"100000002": "binary_sensor.front"}
+
+    def test_abb_ring_schedules_the_unlock(self):
+        self.app._on_abb_ring("abb_welcome_ring", {"station_id": "100000002"}, {})
+        self.assertEqual(len(self.app.run_in_calls), self.app.unlock_repeat_count)
+        self.assertIn("binary_sensor.front", json.loads(self.state_file.read_text()))
+
+    def test_the_esp_edge_after_an_abb_ring_is_debounced(self):
+        self.app._on_abb_ring("abb_welcome_ring", {"station_id": "100000002"}, {})
+        self.app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+        self.assertEqual(len(self.app.run_in_calls), self.app.unlock_repeat_count)
+
+    def test_an_abb_ring_after_the_esp_edge_is_debounced(self):
+        self.app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+        self.app._on_abb_ring("abb_welcome_ring", {"station_id": "100000002"}, {})
+        self.assertEqual(len(self.app.run_in_calls), self.app.unlock_repeat_count)
+
+    def test_unmapped_or_missing_station_does_nothing(self):
+        for data in ({"station_id": "100000009"}, {"station_id": ""}, {}, None):
+            with self.subTest(data=data):
+                self.app._on_abb_ring("abb_welcome_ring", data, {})
+        self.assertEqual(self.app.run_in_calls, [])
+        self.assertFalse(self.state_file.exists())
+
+
 # ---------------------------------------------------------------------------
 # ABB-native unlock experiment (see abb_unlock_doors in intercom.yaml).
 #
