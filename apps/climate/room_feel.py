@@ -33,14 +33,10 @@ the case where the sun exclusion removed the last plain one.
 
 Publish contract: one direction, no consumers read this app's own output back in. Booleans
 (window_open/sun_hit/airing_helps/stale) are published as the literal strings "true"/"false"
-rather than Python bools - AppDaemon 4.5.13's set_state silently drops an attribute whose
-value is exactly False;
-`sources`/`excluded`/`open_labels` use a ["<none>"] sentinel rather than [] for the same
-reason. Optional numeric attributes (floor_temp_c etc.) are still passed as plain None on a
-missing reading, matching bedroom_comfort.py's precedent - a real 0.0/None reading is rare
-enough there that working around the same set_state quirk for every numeric field is not
-worth it, and the numbers rule below is the real safety net: nothing here is ever a
-fabricated 0.
+rather than Python bools; `sources`/`excluded`/`open_labels` use a ["<none>"] sentinel
+rather than []. Optional numeric attributes (floor_temp_c etc.) are passed as plain None on
+a missing reading, matching bedroom_comfort.py's precedent; the numbers rule below is the
+real safety net: nothing here is ever a fabricated 0.
 
 Numbers rule: unavailable/unknown/non-numeric readings are excluded with a reason and never
 enter the median as a 0. A room left with zero fresh, readable air sources falls back to

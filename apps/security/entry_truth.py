@@ -85,8 +85,8 @@ class EntryTruth(hass.Hass):
                 reason = (f"door contact reports {door_state}; "
                           f"lock reports {effective_state or 'unknown'} ({lock_source_used})")
 
-            # String booleans survive AppDaemon 4.5.13's attribute filtering, which
-            # drops False. An unreadable contact must never masquerade as closed.
+            # door_open is "true"/"false"/"unknown": an unreadable contact must never
+            # masquerade as closed.
             await self.set_state(self.publish_entity,
                                  state=state,
                                  replace=True,

@@ -588,8 +588,7 @@ class ActorAttribution(hass.Hass):
         """UTC ISO8601 with 'Z' suffix - matches washer_monitor.py's _format_utc
         convention. "" for None (never used for anchor/evaluated_at, which are always
         real datetimes; used for the optional stable_since/last_door_open sensor
-        attributes, where AppDaemon's set_state silently drops None/False/0 but "" is
-        never dropped - see smart_cooling.py's _publish() for the mechanism)."""
+        attributes)."""
         if dt is None:
             return ""
         return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -1140,9 +1139,6 @@ class ActorAttribution(hass.Hass):
                 attributes={
                     "friendly_name": "Household actor",
                     "people_home": verdict["people_home"],
-                    # "" sentinel, not None: AppDaemon 4.5.13's set_state silently drops
-                    # any attribute equal to None/False/0 before the /api/states POST -
-                    # see smart_cooling.py's _publish() for the mechanism - but "" survives.
                     "stable_since": self._iso(stable_since),
                     "last_door_open": self._iso(last_door_open),
                     "source_entities": list(self.person_entities) + [self.door_entity],

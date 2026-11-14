@@ -31,14 +31,10 @@ first reads nothing-asserting (published immediately, even though the state stri
 stays "on" until the timer completes), so a consumer/dashboard can see a zone is about to
 clear before the hard state transition happens.
 
-Publish contract, absolute: AppDaemon 4.5.13's set_state silently drops any attribute value
-that is exactly None/False/0 (and empty containers are one bad accident away from becoming
-falsy-adjacent bugs too, so this app avoids them on principle) - see bed_presence_compare.py's
-module docstring or apps/lights/presence_model.py's history for the reference incident. Every
-attribute here is therefore a non-empty string or a non-empty list of strings:
-active_witnesses is ["<none>"] rather than [] when nothing asserts, witness_states is a list
-of "<entity_id>=<state>" strings rather than a dict, and settling/stale/auto_on_ok are the
-literal strings "true"/"false" rather than Python bools.
+Publish contract, absolute: every attribute here is a non-empty string or a non-empty list
+of strings: active_witnesses is ["<none>"] rather than [] when nothing asserts,
+witness_states is a list of "<entity_id>=<state>" strings rather than a dict, and
+settling/stale/auto_on_ok are the literal strings "true"/"false" rather than Python bools.
 
 auto_on_ok is hardcoded "true" for every zone for now - wiring presence_trust.presence_suspect()
 in for the zones it covers (kitchen/bedroom/bathroom ghost-interference rules) is a later phase.

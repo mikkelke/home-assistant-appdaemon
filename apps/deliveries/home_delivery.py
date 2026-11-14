@@ -35,8 +35,7 @@ attributes:
   spoken          one short English answer for voice, food first
   reason          why the state is what it is
 
-AppDaemon 4.5.13 drops None, False and 0 from set_state attributes at any depth and from the state itself, so
-the state is published as a string and a missing key reads as null, 0 or false.
+The state is published as a string.
 """
 
 import json

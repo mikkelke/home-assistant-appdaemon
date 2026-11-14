@@ -412,13 +412,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         return utc.isoformat(timespec="seconds").replace("+00:00", "Z")
 
     def _falsy_drop_safe(self, value):
-        """AppDaemon 4.5.13 silently drops any set_state attribute whose value == False
-        (covers int/float 0 too, since 0 == False in Python) before the /api/states POST
-        body is built -- see appdaemon-deploy memory / smart_cooling.py's _publish(). A
-        genuinely-zero estimated_remaining_min (cycle at/past expected end) was vanishing
-        from sensor.washer_state entirely instead of showing "0 min left". Only exactly 0
-        needs the workaround: None must pass through unchanged (it means "blank the ETA",
-        e.g. during a suspected delayed start, and is a deliberate different case)."""
+        """Publish a zero ETA as the string "0"; every other value, None included, passes through."""
         return "0" if value == 0 else value
 
     def _strftime_local(self, dt, fmt="%H:%M"):
@@ -564,15 +558,9 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             attrs["cycle_start_time_local"] = self._format_local(self.start_time)
             attrs["started_at_display"] = self.start_time.astimezone(self._local_tz()).strftime("%H:%M")
             attrs["last_door_closed_trusted"] = bool(self.last_door_closed_trusted)
-            # last_door_closed_trusted silently drops from published attributes whenever it's
-            # False (no trusted door-close yet, e.g. after a restart) -- AppDaemon 4.5.13
-            # set_state bug, not ours; see smart_cooling.py's _publish() for details.
             self._set_state_entity(state="Running", attributes=attrs, replace=True)
         except Exception as e:
             self.log(f"Could not push corrected cycle_start_time: {e}", level="WARNING")
-            # last_door_closed_trusted silently drops from published attributes whenever it's
-            # False (no trusted door-close yet, e.g. after a restart) -- AppDaemon 4.5.13
-            # set_state bug, not ours; see smart_cooling.py's _publish() for details.
             self._set_state_entity(
                 state="Running",
                 attributes={
@@ -2563,9 +2551,6 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             pause_attrs["reason"] = reason_override or "Door opened during cycle (AddLoad)"
             pause_attrs["run_time_minutes"] = round(self._get_run_duration_minutes(), 1)
             pause_attrs["energy_used"] = round(self._get_energy_used(), 3)
-            # run_time_minutes/energy_used can legitimately be 0 here (AddLoad fires early in the
-            # cycle, before heating starts) -- AppDaemon 4.5.13 set_state bug, not ours; see
-            # smart_cooling.py's _publish() for details.
             self._set_state_entity( state="Paused", attributes=pause_attrs)
             r = pause_attrs.get("reason", "Paused")
             self.log(f"State -> Paused: {r}", level="INFO")
@@ -2716,8 +2701,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             
             self.state = "Off"
             # Clear Running-specific attributes so the UI does not show previous cycle's
-            # start time, ETA or progress. Use empty string so HA actually replaces the
-            # value (None can leave the old value in place in some setups).
+            # start time, ETA or progress.
             now_utc = self._now_utc()
             clear_attrs = {
                 "cycle_start_time": "",
@@ -2750,9 +2734,6 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                 "last_door_closed_trusted": False,
                 "last_off_at": self._format_local(now_utc),
             }
-            # programme_confirmed_by_user/last_door_closed_trusted are always False here (cleared
-            # every time a cycle ends) -- AppDaemon 4.5.13 set_state bug, not ours; see
-            # smart_cooling.py's _publish() for details.
             self._set_state_entity( state="Off", attributes=clear_attrs)
             self.last_door_closed_trusted = False
             self.log(f"State -> Off ({reason})", level="INFO")
@@ -3147,10 +3128,6 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         if self.last_door_closed_at:
             run_attrs["last_door_closed_at"] = self._format_local(self.last_door_closed_at)
         run_attrs["last_door_closed_trusted"] = bool(self.last_door_closed_trusted)
-        # cycle_complete is always False here; heating_bursts/estimated_remaining_min/
-        # programme_confirmed_by_user/last_door_closed_trusted can also legitimately be 0/False
-        # (cold programme, near end-of-cycle recovery, Auto mode, no trusted door-close) --
-        # AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish() for details.
         self._set_state_entity( state="Running", attributes=run_attrs)
         self._remove_last_cycle_feedback()
         self._plug.clear()
@@ -3371,10 +3348,6 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             attributes["programme_confirmed_by_user"] = False
             attributes["programme_confirmed_by"] = ""
 
-            # programme_confirmed_by_user is always False here (cleared for next load);
-            # heating_bursts/last_door_closed_trusted can also be 0/False (cold programme,
-            # no trusted door-close) -- AppDaemon 4.5.13 set_state bug, not ours; see
-            # smart_cooling.py's _publish() for details.
             self._set_state_entity( state="Unemptied", attributes=attributes)
 
             saved_record = self._save_cycle_feedback(**feedback)
@@ -4143,9 +4116,8 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             "supports_soak": bool(self.option_soak_entity),
             "session_cost_kr": round(self._session_cost_kr, 2),
         }
-        # Use "" not None - AppDaemon 4.5.13 drops attributes equal to None/False/0 (see
-        # smart_cooling.py's _publish() for details); "unknown" mirrors detected_programme's
-        # own placeholder above.
+        # An unknown starter publishes "" for the person and "unknown" for the method, like
+        # detected_programme's placeholder above.
         attrs["started_by"] = self._cycle_actor.get("person") or ""
         attrs["started_by_method"] = self._cycle_actor.get("method") or "unknown"
         if self.energy_start is not None:
@@ -4176,11 +4148,6 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         self.confirmed_by_username = confirmed_by or None
         attrs["programme_confirmed_by_user"] = confirmed
         attrs["programme_confirmed_by"] = confirmed_by
-        # elapsed_minutes/progress_pct/heating_bursts/max_power_w are always 0/0.0 at cycle start
-        # (just reset); last_door_closed_trusted/programme_confirmed_by_user/delayed_start_trimmed/
-        # delayed_start_waiting are commonly False too (no trusted door-close yet, Auto-mode default,
-        # fresh cycle) -- AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish()
-        # for details.
         self._set_state_entity( state="Running", attributes=attrs, replace=True)
         self._follow_up_actor("start", self._cycle_actor, "washer_start")
 
@@ -4689,8 +4656,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         actor_start/actor_empty: ActorAttribution results (see _attribute) for who loaded / who
         emptied the machine. started_by and attribution.start are written on every save from here
         on - an absent key on an old record just means it predates this feature - and a plain
-        JSON null is fine when unknown (the AppDaemon 4.5.13 None-dropping bug only applies to
-        HA entity attributes, not this file). emptied_by/emptied_ts/attribution.empty are only
+        JSON null means unknown. emptied_by/emptied_ts/attribution.empty are only
         written when actor_empty is given (the machine went Running straight to Emptied, so both
         are known at save time); the far more common Unemptied-first path saves without them and
         _patch_cycle_record fills them in later when the door actually opens.
@@ -5027,9 +4993,9 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         the state entity. Used when a cycle resumes without re-invoking _begin_running_cycle -
         an AppDaemon reload mid-Running restore (_restore_running_state), or
         _recover_from_false_unemptied reverting a false finish - so self._cycle_actor would
-        otherwise fall back to unknown even though we captured it before. "" is AppDaemon
-        4.5.13 dropping a None/False/0-valued attribute (see smart_cooling.py's _publish()),
-        not a real value - treated the same as missing, like every other restore field here."""
+        otherwise fall back to unknown even though we captured it before. "" (how an unknown
+        starter is published) is treated the same as missing, like every other restore field
+        here."""
         person = attrs.get("started_by") or None
         method = attrs.get("started_by_method") or None
         result = self._unknown_actor("restored_from_entity")
@@ -5394,9 +5360,6 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                 attrs["programme_confirmed_by_user"] = False
                 attrs["programme_confirmed_by"] = ""
                 current_state = self.get_state(self.state_entity) or "Running"
-                # programme_confirmed_by_user is always False here (user reset the selector to
-                # Auto) -- AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's
-                # _publish() for details.
                 self._set_state_entity( state=current_state, attributes=attrs, replace=True)
             except Exception:
                 pass
@@ -5549,9 +5512,6 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             attrs["predicted_programme"] = ""
             attrs["predicted_programme_label"] = ""
             attrs["predicted_temperature"] = ""
-            # progress_pct/estimated_remaining_min can legitimately be 0 here (just after cycle
-            # start, or near the end of the countdown) -- AppDaemon 4.5.13 set_state bug, not
-            # ours; see smart_cooling.py's _publish() for details.
             self._set_state_entity( state="Running", attributes=attrs, replace=True)
         except Exception as e:
             self.log(f"Could not push running ETA attributes: {e}", level="DEBUG")
@@ -5980,11 +5940,6 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         attrs["programme_confirmed_by_user"] = bool(self.programme_confirmed_by_user)
         attrs["programme_confirmed_by"] = self.confirmed_by_username or ""
         attrs["session_cost_kr"] = round(self._session_cost_kr, 2)
-        # cycle_complete/heating_bursts/progress_pct/estimated_remaining_min/last_door_closed_trusted/
-        # programme_confirmed_by_user/delayed_start_trimmed/delayed_start_waiting can all legitimately
-        # be False/0 on a normal mid-cycle tick (still running, pre-heating, near start/end of
-        # countdown, Auto mode, no trusted door-close, no delayed start suspected) --
-        # AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish() for details.
         self._set_state_entity( state="Running", attributes=attrs)
 
         # Do not write classified programme into input_select.washer_confirmed_programme.

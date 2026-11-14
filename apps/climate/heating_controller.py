@@ -45,9 +45,8 @@ room whose 3 h mean is far from the comfort target takes over (heating_plan.Comf
 zone sensor and the decision log name the basis. A floor maximum holds against the warmest of the
 zone's floor sensors that reported within FLOOR_CAP_FRESH_MIN.
 
-Publish contract (AppDaemon 4.5.13's set_state drops any attribute whose value is 0, False or
-None, also inside lists and dicts): booleans go out as the strings "true"/"false", values that
-can be exactly zero as strings, and lists are never empty (["<none>"]).
+Publish contract: booleans go out as the strings "true"/"false", values that can be exactly
+zero as strings, and lists are never empty (["<none>"]).
 
 Callbacks may run on several AppDaemon threads; one lock serialises the evaluation.
 Log strings are ASCII only.
@@ -107,7 +106,7 @@ def _text(value: Optional[float], places: int = 1) -> Optional[str]:
 
 
 def _publishable(value):
-    """Make a value survive AppDaemon's set_state: see the module docstring."""
+    """Shape a value for publishing per the publish contract in the module docstring."""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):

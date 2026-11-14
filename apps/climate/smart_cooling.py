@@ -2022,9 +2022,6 @@ class SmartCooling(hass.Hass):
             v_armed = (await self._state(self.enable_entity)) == "on"
             v_title, v_text = cm.compose_briefing(
                 plan["recommendation"], plan, {}, v_deployed, v_armed)
-            # Load-bearing strings (cost_label/windows_summary) never rely on a 0/False/None
-            # value that AppDaemon 4.5.13 would drop; est_cost_kr==0 legitimately vanishes and
-            # the dashboard reads cost_label instead. open_windows stays a list ([] survives).
             attrs = {
                 "friendly_name": "Sleep plan",
                 "icon": "mdi:bed-clock",
@@ -2045,9 +2042,7 @@ class SmartCooling(hass.Hass):
                                     *self.window_contact_entities.values()],
                 "computed_at": now.isoformat(timespec="seconds"),
                 # Transparency: the raw weather peak, the reality anchors, and the grounded
-                # value actually projected. All non-zero floats/strings so AppDaemon 4.5.13's
-                # False/0/None drop can't silently strip a load-bearing one; grounded is a
-                # STRING ("true"/"false") for the same reason (a raw False would vanish).
+                # value actually projected. grounded is published as the string "true"/"false".
                 "grounded": "true" if grounded else "false",
             }
             if plan["projected_peak"] is not None:
@@ -2068,8 +2063,8 @@ class SmartCooling(hass.Hass):
                                       else "door" if vent_tau == self.vent_tau_door_h
                                       else "indirect")
                 # "true" = credited on the feasibility assumption alone (no window observed
-                # open yet); "false" = a contact was actually observed open. String, not bool
-                # -- AppDaemon 4.5.13 drops a raw False (same reason `grounded` is a string).
+                # open yet); "false" = a contact was actually observed open. A string, like
+                # `grounded`.
                 attrs["vent_assumed"] = "false" if open_windows else "true"
             if night_outdoor is not None:
                 attrs["night_outdoor_min"] = round(night_outdoor, 1)
@@ -2410,21 +2405,16 @@ class SmartCooling(hass.Hass):
         sensor.smart_cooling_status on those (daytime-dominant) ticks -- bedroom_comfort
         reads it back as a display passthrough and would silently fall to its 0.5 fallback
         despite a learned ~0.7. Same value the armed _attrs publishes, so the two never
-        disagree. rise_frac is a non-zero float so it survives AppDaemon 4.5.13's
-        False/0/None attribute-drop; rise_samples can be 0 (dropped then -- display only,
-        harmless).
+        disagree.
 
         Also carries the live/learned session-cost numbers (see _track_session_cost /
         _finalize_session): last_night_cost_kr / night_cost_ema_kr once a night's been
         metered, and session_cost_kr / session_kwh while a session is open or has anything
-        to show. Each is included only when meaningful -- AppDaemon 4.5.13 silently drops a
-        False/0/None attribute anyway, so publishing a raw 0.0 here would be misleading
-        (looks like "metered, cost 0" rather than "nothing metered yet").
+        to show. Each is included only when meaningful -- a raw 0.0 here would be
+        misleading (looks like "metered, cost 0" rather than "nothing metered yet").
 
         kwh_per_deg rides unconditionally like rise_frac -- it always has a non-zero value
-        (the seeded default or a real EMA, never legitimately 0) so the attribute-drop bug
-        never bites it; kwh_per_deg_samples can be 0 (dropped then -- display only, same as
-        rise_samples)."""
+        (the seeded default or a real EMA, never legitimately 0)."""
         out = {"rise_frac": round(self._rise_frac, 2), "rise_samples": self._rise_samples,
                "kwh_per_deg": round(self._kwh_per_deg, 3),
                "kwh_per_deg_samples": self._kwh_per_deg_samples,
@@ -2469,8 +2459,8 @@ class SmartCooling(hass.Hass):
             "rise_frac": round(self._rise_frac, 2), "rise_samples": self._rise_samples,
             "price_now": round(price_now, 2), "window_open": window_open,
             "minutes_needed": run_min, "next_start": next_start.strftime("%H:%M") if next_start else None,
-            # The scheduler's actual chosen stretches (ISO pairs, no Nones -- safe from the
-            # 4.5.13 publish strip). The card draws these instead of projecting now+minutes.
+            # The scheduler's actual chosen stretches (ISO pairs). The card draws these
+            # instead of projecting now+minutes.
             "planned_cool_windows": [[w[0].isoformat(), w[1].isoformat()] for w in plan_windows],
             "est_cost_kr": est_cost, "dry_run": self.dry_run,
             "last_burp": self._last_burp.strftime("%H:%M") if self._last_burp else None,
@@ -2483,15 +2473,13 @@ class SmartCooling(hass.Hass):
         out.update(self._status_base())
         # Weather-model shadow attributes (equilibrium_weather/legacy, solar/outdoor/kitchen
         # estimates) for predicted-vs-actual comparison on the status entity. wm_shadow is
-        # published as a STRING to survive AppDaemon's False/0/None attribute-drop (see the
-        # _publish comment / window_open pattern) -- a raw False would vanish from the entity.
+        # published as the string "true"/"false".
         if wm_dbg:
             out.update(wm_dbg)
         out["wm_shadow"] = "true" if self.wm_shadow else "false"
         # Forecast staleness (see _get_forecast/_fc_served_age_min): omitted when nothing
         # has been served yet (mirrors the equilibrium_weather/bedroom_zone_now "only when
-        # meaningful" pattern above). Published as a float so a genuinely-fresh 0 survives
-        # AppDaemon 4.5.13's False/0/None attribute-drop (the bug hits int 0/False).
+        # meaningful" pattern above). Published as a float.
         if self._fc_served_age_min is not None:
             out["wm_forecast_age_min"] = float(self._fc_served_age_min)
         return out
@@ -2868,18 +2856,6 @@ class SmartCooling(hass.Hass):
         self._track_cool_intervals(status, now)
         a["cool_intervals_today"] = list(self._cool_intervals)
         try:
-            # AppDaemon 4.5.13 bug, not ours: every set_state() HTTP publish runs through
-            # appdaemon.utils.clean_http_kwargs -> remove_literals(val, (None, False)), which
-            # deletes any attribute key whose value equals False (or 0, since 0 == False)
-            # before the /api/states POST body is built. True survives only because it's
-            # separately rewritten to the string "true" first -- so a present "boolean"
-            # attribute is actually that string, never a JSON bool; a MISSING key means false.
-            # dry_run/floor_limited vanish from this entity whenever they're False. No supported
-            # AppDaemon API bypasses this and a value-mangling wrapper would be a hack, so this
-            # is left as a known framework limitation -- do not chase it here.
-            # Fixed upstream by PR #2594 (merged to AppDaemon dev 2026-05-13): POST bodies now go
-            # raw, query-param cleaning got its own identity-checking helper. No release carries
-            # it yet (latest 4.5.13) -- these comments self-obsolete on the first upgrade past that.
             await self.set_state(self.status_entity, state=status, attributes=a, replace=True)
         except Exception as e:
             self.log(f"publish failed: {e}", level="WARNING")

@@ -1117,10 +1117,8 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         Not yet overrun (dur - elapsed > 0): unchanged passthrough -- remaining is the plain
         dur-elapsed and progress is the usual elapsed/dur percentage.
 
-        Once overrun, the old remaining=0/progress=100 was indistinguishable from "actually
-        done" and got silently dropped from the published attributes entirely (AppDaemon
-        4.5.13 set_state bug -- see the comment in _update_running_attributes). Instead, ask
-        what the dryer's own signals say:
+        Once overrun, remaining=0/progress=100 would be indistinguishable from "actually
+        done", so ask what the dryer's own signals say:
           - keep_fresh_detected (anti-crease/keep-fresh pattern) -> main cycle is genuinely
             done, finish flow imminent -> remaining=2, progress=100.
           - current_power >= main_cycle_power -> still heating/drying hard, provably not
@@ -1179,7 +1177,6 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             "programme_duration_min": dur,
             "elapsed_minutes": round(elapsed, 1),
             "progress_pct": progress,
-            # NEVER 0 -- see the AppDaemon 4.5.13 zero-drop note below.
             "estimated_remaining_min": max(1, round(remaining)),
             "estimated_end_time": self._format_utc(eta) if eta else None,
             "energy_at_start": self.energy_start,
@@ -1193,20 +1190,13 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             existing = dict((full or {}).get("attributes") or {})
             existing.update(attrs)
             # Emptying preserves the finished summary; a new live cycle must
-            # drop its completion flag explicitly (False/None partial updates
-            # are discarded by AppDaemon's falsy-attribute handling).
+            # drop its completion flag explicitly.
             existing.pop("cycle_complete", None)
             if overrun <= 0:
                 # attrs merges over the previous publish, so a past overrun_min would otherwise
                 # linger after dur grows mid-cycle (selector/classification change) and leak a
                 # phantom "+X min over" into later ticks. Absent == no overrun for the card.
                 existing.pop("overrun_min", None)
-            # elapsed_minutes/progress_pct/energy_used silently drop from published attributes
-            # whenever they're 0/0.0 (every cycle's first tick(s)) -- AppDaemon 4.5.13 set_state
-            # bug, not ours; see smart_cooling.py's _publish() for details. estimated_remaining_min
-            # is now always published as max(1, ...) so it can never hit that zero-drop path, even
-            # deep into an overrun. overrun_min is only in attrs when overrun > 0 and popped from
-            # the merge otherwise, so it never depends on the zero-drop behavior at all.
             self._set_state_entity( state=self.get_state(self.state_entity), attributes=existing, replace=True)
         except Exception:
             pass
@@ -1676,9 +1666,6 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         """
         if self._should_change_state("Paused"):
             self.state = "Paused"
-            # keep_fresh_detected silently drops from published attributes whenever it's False
-            # (always False on this path -- Paused excludes the keep-fresh branch) -- AppDaemon
-            # 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish() for details.
             self._set_state_entity(
                 state="Paused",
                 attributes={
@@ -2536,8 +2523,8 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         }
 
     def _cycle_actor_from_state_attrs(self, attrs) -> dict:
-        """The starter rebuilt from a persisted started_by/started_by_method. "" reads as unknown:
-        AppDaemon drops None-valued attributes, so unknown is published as ""."""
+        """The starter rebuilt from a persisted started_by/started_by_method. "" reads as unknown;
+        that is how an unknown starter is published."""
         result = self._unknown_actor("restored_from_entity")
         result["person"] = attrs.get("started_by") or None
         result["method"] = attrs.get("started_by_method") or "unknown"

@@ -17,9 +17,7 @@ The output is on when either side is on; the `side` attribute says which.
 
 Everything is decided in _evaluate(now), run on every input change and on a TICK_SEC tick for
 the two timers. The entity is published on every change of state or side and at least every
-REPUBLISH_SEC, because HA drops entities set from AppDaemon when it restarts. AppDaemon's
-set_state drops attributes equal to None, False or 0, so a baseline or pressure of exactly 0
-is absent from the attributes.
+REPUBLISH_SEC, because HA drops entities set from AppDaemon when it restarts.
 
 All timestamps are epoch seconds via the single _now() helper (never naive local datetime
 arithmetic), so tests can fake the clock directly.

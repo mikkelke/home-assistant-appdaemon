@@ -635,9 +635,7 @@ class BedroomBlindOwner(hass.Hass):
                               a position-less manual veto reports where the blind
                               sits, since a hold keeps it exactly there)
           manual_pause_until- ISO-8601 timestamp string while a manual pause is
-                              active, otherwise "" (EMPTY STRING, not null: AD
-                              4.5.13 drops some falsy attrs from set_state - see
-                              smart_cooling._publish - and "" survives)
+                              active, otherwise "" (EMPTY STRING, not null)
           claims            - list of {"source", "position"} for every ACTIVE
                               NON-winning request, highest rank first, may be []
           reason            - one short human sentence

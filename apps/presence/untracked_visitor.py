@@ -46,7 +46,7 @@ refuses, because a hand outranks the visitor, is left alone for the rest of the 
 Restart: the visit, its quiet clock, hold, end cause and the per-blind state are written to
 state_file and read back at start; without the file the published entity is used.
 
-Attribute values are strings only: set_state drops None, False and 0.
+Attribute values are strings only.
 """
 
 from __future__ import annotations

@@ -16,8 +16,7 @@ house_upcoming_done with the row id) and ``items`` (a plain list, one line each,
 summarises several things). A maintenance row may also carry ``photo``, the key of its picture in the
 dashboard: lowercase letters, digits and underscores.
 
-Every value is a string or a list of strings: AppDaemon 4.5.13 drops None, False and 0 from
-set_state attributes at any depth and turns True into "true".
+Every value is a string or a list of strings.
 """
 
 import json

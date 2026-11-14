@@ -17,9 +17,9 @@ Entity contract, for key washer|dishwasher:
     claims that waiting saves nothing. No programme selection, deadline or dryer
     chain: the first published programme and done-by any are the dashboard defaults.
 
-Numeric zero attributes travel as "0" and estimated as "true"/"false" to survive
-AppDaemon's HTTP cleaning. Other numeric attributes remain numbers. Unknown optional
-attributes are absent. Replacement writes remove obsolete plan and press-by fields.
+Numeric zero attributes travel as "0" and estimated as "true"/"false". Other numeric
+attributes remain numbers. Unknown optional attributes are absent. Replacement writes
+remove obsolete plan and press-by fields.
 
 Recomputes on initialization, every minute and on profile, price or appliance state
 changes. Each entity is published only when its state or attributes change; missing
@@ -37,7 +37,7 @@ import start_advice_model as model
 
 
 def _attributes(values):
-    """Preserve zero and false through AppDaemon's attribute transport."""
+    """Zero becomes "0", booleans become "true"/"false", and None values are left out."""
     return {key: ("true" if value else "false") if isinstance(value, bool)
             else "0" if isinstance(value, (int, float)) and value == 0 else value
             for key, value in values.items() if value is not None}

@@ -5,7 +5,7 @@ Publishes sensor.bathroom_display, the one entity the display reads:
     state       "off" (the bathroom is not active), "someone" (active, Mikkel not identified yet) or
                 "mikkel" (active, and his phone has been near or has risen during this visit, or he has
                 weighed himself)
-    attributes  every value a string, since AppDaemon 4.5.13's set_state drops None, False and 0:
+    attributes  every value a string:
         reason      why, in RoomActive's style: "inactive:binary_sensor.bathroom_active"; "unknown:..."
                     for a first evaluation room_active_read has no opinion on;
                     "sleep:input_boolean.mikkel_sleep_mode" for an active room kept dark; while active

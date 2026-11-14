@@ -867,8 +867,8 @@ class TransitAlarm(hass.Hass):
         source = route.get("operator_status")
         if not source:
             return {}
-        # AppDaemon 4.5.13 publishes True as "true" and drops False and None, so a consumer reads an
-        # operator_status without operator_status_ok as a disruption, and neither as no status.
+        # A consumer reads an operator_status whose operator_status_ok is not true as a
+        # disruption, and no operator_status as no status.
         return {
             "operator_status": res.get("operator_status"),
             "operator_status_ok": res.get("operator_status_ok"),
@@ -943,9 +943,6 @@ class TransitAlarm(hass.Hass):
 
             # 3. Transient sensor (rich attributes - recreated on startup)
             lines_str = ", ".join(str(ln) for ln in route.get("lines", []))
-            # mins_to_next silently drops from published attributes whenever it's 0 (departure
-            # due right now/imminently is a normal value, confirmed live) -- AppDaemon 4.5.13
-            # set_state bug, not ours; see smart_cooling.py's _publish() for details.
             self.set_state(
                 self._sensor_entity(route),
                 state=status,
@@ -960,7 +957,7 @@ class TransitAlarm(hass.Hass):
                     "lines":          lines_str,
                     # Evaluation settings the frontend must agree with - it derives line status from
                     # `departures` as the clock moves past this poll, so it needs OUR thresholds, not
-                    # a hardcoded guess. Absent (never 0) => frontend keeps its documented fallback.
+                    # a hardcoded guess. None => frontend keeps its documented fallback.
                     "rescue_window_min":  self._rescue_window_for(route),
                     "delay_threshold_min": int(route.get("delay_threshold_min", 5)),
                     "last_checked":   now_str,
@@ -993,9 +990,6 @@ class TransitAlarm(hass.Hass):
                     if in_active
                     else getattr(self, "poll_interval_night_min", 30)
                 )
-            # poll_interval_night_min/poll_max_stale_min silently drop from published attributes
-            # whenever configured as 0 (a legitimate "disabled" config value, not an error) --
-            # AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish() for details.
             self.set_state(
                 self.last_updated_sensor,
                 state=data_as_of_iso,

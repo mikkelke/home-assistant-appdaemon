@@ -27,7 +27,7 @@ class SonosFollowMe(hass.Hass):
     • Every mute or unmute FollowMe does goes through _set_mute, which records what it did and why
       and publishes status_entity (sensor.follow_me): the state is how many speakers FollowMe last
       left muted, the attribute `speakers` maps each speaker it has touched to {action: muted |
-      unmuted, at: ISO time, why: a short phrase}. Strings only: set_state drops falsy attributes.
+      unmuted, at: ISO time, why: a short phrase}. Strings only.
     """
 
     # Entity that publishes the records; None publishes nothing.

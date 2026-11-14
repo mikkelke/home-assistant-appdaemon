@@ -13,9 +13,6 @@ the `self` state these functions read and write.
 
 Sibling-import module (AppDaemon puts app dirs on sys.path), matching the
 existing `import climate_model as cm` precedent in apps/climate/.
-
-Note on JSON nulls: a plain null for an unknown actor is fine in this file. The
-AppDaemon 4.5.13 None-dropping bug only applies to HA entity attributes.
 """
 
 from datetime import datetime, timezone
@@ -149,8 +146,6 @@ def build_cycle_record(
         record["cost_kr"] = round(cost_kr, 2)
     if vibration is not None:
         record["vibration"] = vibration
-    # started_by/attribution.start: written unconditionally (plain null when unknown is
-    # correct JSON, unlike the entity-attribute None-dropping bug noted above).
     record["started_by"] = (actor_start or {}).get("person")
     record["attribution"] = {"start": actor_start}
     if actor_empty is not None:

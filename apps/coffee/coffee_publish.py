@@ -1,10 +1,9 @@
 """The coffee app's published shapes: the seven sensor.coffee_* entities (contract v1) and the files under
 /media/coffee. Pure.
 
-AppDaemon 4.5.13 drops None, False and 0 from set_state attributes at any depth, so every attribute
-value is a string, a list of strings, or a list of flat dicts of strings: numbers are decimal strings,
-series are CSV strings of tenths, a missing attribute means unknown. Each entity is kept under its size
-cap (serialized attributes), the oldest list entries going first.
+Every attribute value is a string, a list of strings, or a list of flat dicts of strings: numbers are
+decimal strings, series are CSV strings of tenths, a missing attribute means unknown. Each entity is
+kept under its size cap (serialized attributes), the oldest list entries going first.
 """
 
 import json

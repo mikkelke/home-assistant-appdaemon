@@ -28,9 +28,8 @@ Two durations per programme:
             the point where the cycle had used 95 % of its energy is not trusted. Omitted
             when fewer than three trusted finishes exist.
 
-Transport: AppDaemon 4.5.13 drops None/False/0/0.0 anywhere in an attribute tree and turns
-True into "true", so profiles travel as comma-separated strings and every other published
-value is a non-zero number or a non-empty string (see transport_safe()).
+Transport: profiles travel as comma-separated strings and every other published value is a
+non-zero number or a non-empty string (see transport_safe()).
 """
 
 from __future__ import annotations
@@ -635,8 +634,7 @@ def build_attributes(blocks, max_bytes=MAX_PAYLOAD_BYTES):
 
 
 def transport_safe(value):
-    """True when AppDaemon's attribute cleaning would leave value unchanged: no None, no
-    booleans and no numeric zero anywhere."""
+    """True when value holds no None, no booleans and no numeric zero anywhere."""
     if isinstance(value, bool) or value is None:
         return False
     if isinstance(value, (int, float)):

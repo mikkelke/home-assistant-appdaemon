@@ -915,9 +915,6 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                         self.energy_start = float(cur) - float(used)
                 except (TypeError, ValueError):
                     pass
-            # AppDaemon 4.5.13 silently drops a published attribute whenever its value is
-            # False (see _transition_to_paused) - attrs.get's own default kicks in exactly
-            # when that has happened, so this still reaches the store's copy correctly.
             self.pause_from_low_power = bool(attrs.get("pause_from_low_power", store.get("pause_from_low_power")))
 
             prog = attrs.get("detected_programme") or store.get("detected_programme")
@@ -2430,10 +2427,6 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             full = self.get_state(self.state_entity, attribute="all")
             existing = dict((full or {}).get("attributes") or {})
             existing.update(attrs)
-            # elapsed_minutes/progress_pct/energy_used silently drop from published attributes at
-            # 0/0.0 (every cycle's first tick(s)); estimated_remaining_min drops the same way on
-            # overrun, and short_detected drops while still False (early ECO, before short confirms)
-            # -- AppDaemon 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish() for details.
             self._set_state_entity( state="Running", attributes=existing, replace=True)
         except Exception:
             pass
@@ -2711,9 +2704,6 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                 pause_attrs["cycle_start_time"] = self._format_utc(self.start_time)
             if self.energy_start is not None:
                 pause_attrs["energy_at_start"] = self.energy_start
-            # pause_from_low_power silently drops from published attributes whenever it's False
-            # (the common "adding dishes" pause, vs. the low-power/Miele-pause variant) -- AppDaemon
-            # 4.5.13 set_state bug, not ours; see smart_cooling.py's _publish() for details.
             self._set_state_entity(state="Paused", attributes=pause_attrs, replace=True)
             label = "machine paused (low power)" if low_power else "adding dishes mid-cycle"
             self.log(f"State -> Paused ({label})", level="INFO")
@@ -3646,8 +3636,8 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         }
 
     def _cycle_actor_from_state_attrs(self, attrs) -> dict:
-        """The starter rebuilt from a persisted started_by/started_by_method. "" reads as unknown:
-        AppDaemon drops None-valued attributes, so unknown is published as ""."""
+        """The starter rebuilt from a persisted started_by/started_by_method. "" reads as unknown;
+        that is how an unknown starter is published."""
         result = self._unknown_actor("restored_from_entity")
         result["person"] = attrs.get("started_by") or None
         result["method"] = attrs.get("started_by_method") or "unknown"

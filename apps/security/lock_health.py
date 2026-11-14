@@ -47,12 +47,9 @@ Layering: locks -> LockHealth (this app: arbitrate + heal) -> ``sensor.apartment
 touches the raw lock twins at all (see entry_truth.py); this app owns divergence/
 invalidity/bridge-outage detection and healing exclusively.
 
-AppDaemon 4.5.13 bug (not ours - see entry_truth.py / smart_cooling.py's ``_publish``):
-every ``set_state()`` HTTP publish drops any attribute whose value is False/0/None before
-the request body is built. Booleans that legitimately go False often (``diverged``,
-``bridge_online``) are therefore published as the STRINGS "true"/"false" instead of a
-real bool, and ``stale_side``/``heal_stage`` are always non-empty strings rather than
-None so they never silently vanish from the entity either.
+Publish contract: the booleans ``diverged`` and ``bridge_online`` are published as the
+STRINGS "true"/"false" instead of a real bool, and ``stale_side``/``heal_stage`` are
+always strings rather than None.
 
 Episode log: every heal ladder appends ONE JSON line to ``lock_health_episodes.jsonl`` beside
 this module when it ends: {kind: "episode", start, end, side (ble/cloud/bridge), key
@@ -588,11 +585,8 @@ class LockHealth(hass.Hass):
             "cloud_state": cloud["state"],
             "bt_changed": bt["changed"].isoformat() if bt["changed"] else None,
             "cloud_changed": cloud["changed"].isoformat() if cloud["changed"] else None,
-            # AppDaemon 4.5.13 set_state silently DROPS an attribute whose value is
-            # False/0/None (see entry_truth.py / smart_cooling.py's _publish for the
-            # full story) - diverged/bridge_online legitimately go False often, so they
-            # ride as the STRINGS "true"/"false"; stale_side/heal_stage are always a
-            # non-empty string ("" / "idle") rather than None so they never vanish either.
+            # diverged/bridge_online ride as the STRINGS "true"/"false"; stale_side ("" when
+            # none) and heal_stage ("idle" when none) are always strings rather than None.
             "diverged": "true" if result["diverged"] else "false",
             "stale_side": result["stale_side"] or "",
             "heal_stage": self._heal_stage,

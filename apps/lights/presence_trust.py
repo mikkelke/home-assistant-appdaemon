@@ -14,9 +14,7 @@ island + counter lights on.
 
 This module recomputes the rule from the RAW member sensors. It deliberately
 does NOT read ``binary_sensor.presence_*``: those are ``set_state`` entities
-that vanish on HA restart, so they are unacceptable as a load-bearing input
-(and their ``suspect`` attribute silently drops from attributes whenever it is
-False - AppDaemon 4.5.13 ``set_state`` bug - absence means False).
+that vanish on HA restart, so they are unacceptable as a load-bearing input.
 
 SUSPECT definition (presence_model's published logic plus a duration guard):
   - the room's composite (``binary_sensor.<room>_pir_presence``) is ``on``, AND
