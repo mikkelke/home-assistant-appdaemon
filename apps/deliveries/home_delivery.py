@@ -18,15 +18,15 @@ seconds after the ring, each press skipped once the carrier has no undelivered p
 
 A courier often leaves a parcel outside the door without ringing the apartment doorbell, and some get into the building
 without ringing the street door. With the landing_entity arg set, its presence sensor going on while door_courier is a
-parcel watches every carrier with a button and a parcel out for delivery, since any of their couriers may have come
-(not when the apartment door was opened or its doorbell rung in the APARTMENT_USED_S before: someone from the flat
-went out). When the sensor goes off within LANDING_WATCH_S (the courier came up and left), each watched carrier's button
-is pressed at once and again REFRESH_AFTER_LANDING_S after, each press skipped once the carrier has no undelivered
-parcel left. A parcel of a watched carrier turning delivered while the sensor is on, or within CONFIRM_WINDOW_S after it
-went off, tells the owner once (as the sensor goes off, when it was still on), "Your PostNord parcel was delivered.
-It's outside the door.": on the speakers while he is home outside quiet hours, else by push. When the apartment door
-opened between the sensor going on and that moment, the parcel was handed over and nothing is said; its doorbell
-ringing does not count. A carrier is not told about again for TELL_AGAIN_AFTER_S.
+parcel watches every carrier with a button and a parcel out for delivery whose courier courier_plausible finds plausible
+now, since any of them may have come (not when the apartment door was opened or its doorbell rung in the
+APARTMENT_USED_S before: someone from the flat went out). When the sensor goes off within LANDING_WATCH_S (the courier
+came up and left), each watched carrier's button is pressed at once and again REFRESH_AFTER_LANDING_S after, each press
+skipped once the carrier has no undelivered parcel left, and the owner is told at once, "Your PostNord parcel is
+probably outside the door." (with several carriers, "Your Airmee or PostNord parcel ..."): on the speakers while he is
+home outside quiet hours, else by push. When the apartment door opened between the sensor going on and off, the parcel
+was handed over and nothing is said; its doorbell ringing does not count. A carrier is not told about again for
+TELL_AGAIN_AFTER_S, and what its parcels report afterwards is not announced.
 
 state: the number of active deliveries (preparing, on_the_way, arriving).
 attributes:
@@ -87,9 +87,11 @@ STREET_DOORS = ("front door", "back door")
 REFRESH_AFTER_S = (180, 360)
 REFRESH_AFTER_LANDING_S = (60, 180, 360)
 LANDING_WATCH_S = 600
-CONFIRM_WINDOW_S = 600
 TELL_AGAIN_AFTER_S = 1800
 APARTMENT_USED_S = 60
+PLAUSIBLE_WINDOW_MARGIN_S = 1800
+PLAUSIBLE_ETA_MARGIN_S = 2700
+PLAUSIBLE_HOURS = range(8, 18)
 SPEAKERS_APP = "SonosNotifier"
 PHONE_APP = "MobileNotifier"
 PARCEL_PUSH_TITLE = "Parcel delivery"
@@ -645,15 +647,12 @@ def parcels_undelivered(deliveries, source):
 @dataclass(frozen=True)
 class LandingWatch:
     """A carrier whose courier may be the one on the landing. `until` ends the watch: LANDING_WATCH_S after the
-    sensor went on, CONFIRM_WINDOW_S after it went off (`left`). `opened`: the apartment door opened meanwhile.
-    `delivered`: the carrier's parcels turned delivered while the sensor was still on."""
+    sensor went on. `opened`: the apartment door opened meanwhile."""
 
     source: str
     carrier: str
     until: float
-    left: bool = False
     opened: bool = False
-    delivered: bool = False
 
 
 def carrier_name(deliveries, source):
@@ -662,16 +661,34 @@ def carrier_name(deliveries, source):
     return next((delivery.carrier for delivery in deliveries if delivery.source == source and delivery.carrier), source)
 
 
+def courier_plausible(parcels, now):
+    """True when a carrier's courier may be at the door at `now`, going by its parcels out for delivery: when any has
+    a window, inside one of the windows, each widened by PLAUSIBLE_WINDOW_MARGIN_S either side; else, when any has an
+    ETA, within PLAUSIBLE_ETA_MARGIN_S of one; else, with no times at all, in the house's PLAUSIBLE_HOURS."""
+    windows = [(parcel.window_start, parcel.window_end) for parcel in parcels
+               if parcel.window_start is not None and parcel.window_end is not None]
+    if windows:
+        return any(start - PLAUSIBLE_WINDOW_MARGIN_S <= now <= end + PLAUSIBLE_WINDOW_MARGIN_S
+                   for start, end in windows)
+    etas = [parcel.eta for parcel in parcels if parcel.eta is not None]
+    if etas:
+        return any(abs(now - eta) <= PLAUSIBLE_ETA_MARGIN_S for eta in etas)
+    return datetime.fromtimestamp(now, HOUSE_TZ).hour in PLAUSIBLE_HOURS
+
+
 def refresh_sources(deliveries, now, buttons):
     """The carriers whose refresh buttons someone on the landing calls for: every source in `buttons` with a parcel out
-    for delivery, in the order of those parcels, since the courier may be any of theirs. Empty while the door courier
-    is not a parcel: a food or groceries courier is then likelier."""
+    for delivery and a courier courier_plausible finds plausible now, in the order of those parcels, since the courier
+    may be any of theirs. Empty while the door courier is not a parcel: a food or groceries courier is then likelier."""
     active = [delivery for delivery in sorted(deliveries, key=sort_key) if delivery.stage in ACTIVE]
     courier = door_courier(active, now)
     if courier is None or courier.kind != "parcel":
         return []
-    return list(dict.fromkeys(delivery.source for delivery in active
-                              if delivery.kind == "parcel" and delivery.stage in OUT and delivery.source in buttons))
+    out = {}
+    for delivery in active:
+        if delivery.kind == "parcel" and delivery.stage in OUT and delivery.source in buttons:
+            out.setdefault(delivery.source, []).append(delivery)
+    return [source for source, parcels in out.items() if courier_plausible(parcels, now)]
 
 
 def landing_couriers(deliveries, now, buttons, apartment_used_at):
@@ -687,36 +704,19 @@ def landing_step(watches, event, now, couriers=()):
     """(watches, left) after one event at `now`, the watches being LandingWatch by source and those whose time is over
     dropped. The events are "arrived" (the landing sensor went on), "left" (it went off) and "opened" (the apartment
     door opened). "arrived" watches each of `couriers` ([(source, carrier)], see landing_couriers) for LANDING_WATCH_S,
-    a carrier watched already being watched afresh. "left" ends the watches on the landing: they wait CONFIRM_WINDOW_S
-    for a delivery, and are returned as `left`, those already delivered to be confirmed by delivered_step. "opened"
+    a carrier watched already being watched afresh. "left" ends every watch and returns them as `left`. "opened"
     marks every watch opened."""
     live = {source: watch for source, watch in watches.items() if now < watch.until}
     left = []
     if event == "arrived":
         for source, carrier in couriers:
             watch = live.get(source, LandingWatch(source, carrier, now))
-            live[source] = replace(watch, until=now + LANDING_WATCH_S, left=False)
+            live[source] = replace(watch, until=now + LANDING_WATCH_S)
     elif event == "left":
-        left = [replace(watch, until=now + CONFIRM_WINDOW_S, left=True) for watch in live.values() if not watch.left]
-        live.update({watch.source: watch for watch in left})
+        left, live = list(live.values()), {}
     elif event == "opened":
         live = {source: replace(watch, opened=True) for source, watch in live.items()}
     return live, left
-
-
-def delivered_step(watches, sources, now):
-    """(watches, confirmed) when parcels of the carriers in `sources` have turned delivered at `now`: their watches that
-    have left the landing, and whose CONFIRM_WINDOW_S is not over, are confirmed and end; those still on the landing are
-    marked delivered, to be confirmed once they leave."""
-    live = {source: watch for source, watch in watches.items() if now < watch.until}
-    confirmed = []
-    for source, watch in list(live.items()):
-        if source in sources:
-            if watch.left:
-                confirmed.append(live.pop(source))
-            else:
-                live[source] = replace(watch, delivered=True)
-    return live, confirmed
 
 
 def told_recently(told_at, source, now):
@@ -724,8 +724,13 @@ def told_recently(told_at, source, now):
     return source in told_at and now - told_at[source] < TELL_AGAIN_AFTER_S
 
 
+def carrier_list(carriers):
+    """The carrier names as speech: "Airmee", "Airmee or PostNord", "Airmee, PostNord or GLS"."""
+    return ", ".join(carriers[:-1]) + (" or " if len(carriers) > 1 else "") + carriers[-1]
+
+
 def parcel_outside_sentence(carrier):
-    return f"Your {carrier} parcel was delivered. It's outside the door."
+    return f"Your {carrier} parcel is probably outside the door."
 
 
 def notice_channel(owner_state, speakers_free):
@@ -807,14 +812,12 @@ class HomeDelivery(hass.Hass):
             self._landing_watches, _ = landing_step(self._landing_watches, "arrived", now, couriers)
         elif new == "off":
             self._landing_watches, left = landing_step(self._landing_watches, "left", now)
+            self._tell_parcels_outside(left, now)
             for watch in left:
                 after = "someone left the landing"
                 self._press_refresh({"source": watch.source, "after": after})
                 for delay in REFRESH_AFTER_LANDING_S:
                     self.run_in(self._press_refresh, delay, source=watch.source, after=after)
-            delivered = {watch.source for watch in left if watch.delivered}
-            if delivered:
-                self._on_parcels_delivered(delivered, now)
 
     def _on_apartment_door(self, entity, attribute, old, new, kwargs):
         if new == "on":
@@ -825,27 +828,30 @@ class HomeDelivery(hass.Hass):
         if new == "on":
             self._apartment_used_at = self.get_now().timestamp()
 
-    def _on_parcels_delivered(self, sources, now):
-        self._landing_watches, confirmed = delivered_step(self._landing_watches, sources, now)
-        for watch in confirmed:
+    def _tell_parcels_outside(self, watches, now):
+        carriers = []
+        for watch in watches:
             if watch.opened:
-                self.log(f"The {watch.carrier} parcel was delivered and the apartment door opened: "
+                self.log(f"The apartment door opened while the {watch.carrier} courier may have been on the landing: "
                          "handed over, not announced")
             elif told_recently(self._told_at, watch.source, now):
-                self.log(f"The {watch.carrier} parcel was delivered, not announced again within "
+                self.log(f"The {watch.carrier} parcel is probably outside the door, not announced again within "
                          f"{TELL_AGAIN_AFTER_S // 60} minutes")
             else:
                 self._told_at[watch.source] = now
-                try:
-                    self._tell_owner(watch.carrier)
-                except Exception as error:
-                    self.log(f"Telling the owner about the {watch.carrier} parcel failed: {error}", level="WARNING")
+                carriers.append(watch.carrier)
+        if carriers:
+            names = carrier_list(carriers)
+            try:
+                self._tell_owner(names)
+            except Exception as error:
+                self.log(f"Telling the owner about the {names} parcel failed: {error}", level="WARNING")
 
     def _tell_owner(self, carrier):
         speakers = self.get_app(SPEAKERS_APP)
         free = speakers is not None and not speakers.in_quiet_hours()
         channel = notice_channel(self.get_state(self._owner_entity), free)
-        self.log(f"{article(carrier)} {carrier} parcel was delivered outside the door: telling the owner via {channel}")
+        self.log(f"{article(carrier)} {carrier} parcel is probably outside the door: telling the owner via {channel}")
         if channel == "speakers":
             self.submit_to_executor(speakers.notify, message=parcel_outside_sentence(carrier))
             return
@@ -867,13 +873,9 @@ class HomeDelivery(hass.Hass):
         for id_, stage in stages.items():
             if self._stages.get(id_) != stage:
                 self.log(f"{id_}: {self._stages.get(id_, 'new')} -> {stage}")
-        delivered = {delivery.source for delivery in deliveries if delivery.kind == "parcel"
-                     and delivery.stage == "delivered" and self._stages.get(delivery.id) != "delivered"}
         self._stages = stages
         published = snapshot(deliveries, now, self._incoming)
         self.set_state(self._entity, state=str(published["state"]), attributes=published["attributes"], replace=True)
-        if delivered:
-            self._on_parcels_delivered(delivered, now)
 
     def _read_wolt(self, now):
         try:

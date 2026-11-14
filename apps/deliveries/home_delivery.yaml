@@ -19,16 +19,16 @@
 #
 # A courier often leaves a parcel outside the door without ringing the apartment doorbell, and some get
 # into the building without ringing the street door. When landing_entity (the presence sensor outside the
-# flat) goes on while a parcel is out for delivery, every carrier with a button and a parcel out is
-# watched, as any of their couriers may have come (not when apartment_door_entity opened or
-# apartment_doorbell_entity rang in the minute before: someone from the flat went out). When the sensor
-# goes off within ten minutes, each watched carrier is refreshed at once and 1, 3 and 6 minutes later,
-# skipping a press once the carrier has nothing undelivered. If a parcel of a watched carrier turns
-# delivered while the sensor is on, or within ten minutes after it went off, the owner is told once (as the
-# sensor goes off, when it was still on), "Your PostNord parcel was delivered. It's outside the door.":
-# spoken by SonosNotifier while owner_entity is home outside its quiet hours, else pushed to notify_target
-# through MobileNotifier. Nothing is said when apartment_door_entity opened meanwhile (the parcel was
-# handed over; the doorbell alone does not count), nor about the same carrier again within half an hour.
+# flat) goes on while a parcel is out for delivery, every carrier with a button and a parcel out whose
+# courier is plausible now (inside a parcel's window or around its ETA, else between 08:00 and 18:00) is
+# watched, as any of them may have come (not when apartment_door_entity opened or apartment_doorbell_entity
+# rang in the minute before: someone from the flat went out). When the sensor goes off within ten minutes,
+# each watched carrier is refreshed at once and 1, 3 and 6 minutes later, skipping a press once the carrier
+# has nothing undelivered, and the owner is told at once, "Your PostNord parcel is probably outside the
+# door." (several carriers: "Your Airmee or PostNord parcel ..."): spoken by SonosNotifier while
+# owner_entity is home outside its quiet hours, else pushed to notify_target through MobileNotifier.
+# Nothing is said when apartment_door_entity opened meanwhile (the parcel was handed over; the doorbell
+# alone does not count), nor about the same carrier again within half an hour.
 # Drop landing_entity and none of this runs; it needs refresh_buttons.
 
 HomeDelivery:
