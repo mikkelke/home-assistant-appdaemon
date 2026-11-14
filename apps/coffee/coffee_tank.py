@@ -4,8 +4,8 @@ The tank is filled by hand and the machine only says when it has run dry, so the
 water the machine measured dispensing since the last fill, and unknown until the first one. Every brew debits its
 water once. A fill or a run-dry in the middle of a brew moves `offset_ml` to that brew's reading, so only the
 water it pours after the event is debited. The water used may pass the capacity, which shows as zero left.
-The machine says it has run dry while some water is left and finishes the brew, so the rest of that brew is no
-refill. After a run-dry the tank is `dry`: a later brew that pours more than REFILL_MIN_ML means it was refilled, and
+A run-dry is a brew the machine stopped for want of water; its low-water warning during a brew that pours on is
+no run-dry. After a run-dry the tank is `dry`: a later brew that pours more than REFILL_MIN_ML means it was refilled, and
 the tank counts as full from that brew on. `empties` keeps the water used at each of the last EMPTIES_MAX run-dry
 moments.
 """
@@ -47,12 +47,19 @@ class Tank:
         self.offset_ml = _ml(brew_water_ml)
         self.dry = False
 
-    def empty(self, now, brew_water_ml=None):
-        """The machine ran dry: the water used since the fill, None while the level is unknown."""
+    def used(self, brew_water_ml=None):
+        """The water used since the fill, counting the running brew's reading; None while the level is unknown."""
         if self.filled_at is None:
             return None
         reading = _ml(brew_water_ml)
-        used = self.used_ml + (max(0.0, reading - (self.offset_ml or 0.0)) if reading is not None else 0.0)
+        return self.used_ml + (max(0.0, reading - (self.offset_ml or 0.0)) if reading is not None else 0.0)
+
+    def empty(self, now, brew_water_ml=None):
+        """The machine ran dry: the water used since the fill, None while the level is unknown."""
+        used = self.used(brew_water_ml)
+        if used is None:
+            return None
+        reading = _ml(brew_water_ml)
         self.empties = (self.empties + [{"at": now.isoformat(timespec="seconds"), "used_ml": round(used, 1)}])[
             -EMPTIES_MAX:]
         self.used_ml = self.capacity

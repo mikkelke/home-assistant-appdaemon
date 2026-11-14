@@ -66,7 +66,6 @@ OPS = ("start", "cup_confirmed", "cancel", "stop", "pause", "resume", "connect",
        "beans_add", "beans_undo", "water_filled", "select", "save_brew", "trial_accept", "trial_undo", "trial_keep",
        "trial_revert", "advice_dismiss", "advisor_reply")
 RATE_PREFIX = "COFFEE_RATE|"
-WATER_FILLED_ACTION = "COFFEE_WATER_FILLED"
 ENTITIES = ("coffee_state", "coffee_live", "coffee_baseline", "coffee_beans", "coffee_brews", "coffee_recipes",
             "coffee_advice")
 
@@ -574,8 +573,7 @@ class CoffeeMachine(hass.Hass):
                 self._info(f"Start {self._tracker.dropped[0]} dropped: {self._tracker.dropped[1]}")
             elif effect == "fault":
                 if brew and brew["phase"] in cf.RUNNING:
-                    self._tank_empty(brew)
-                self._fault_push(brew)
+                    self._water_warning(brew)
         if "live" in effects or "ready" in effects or "closed" in effects or "expired" in effects:
             self._publish("coffee_live", force=True)
         if "state" in effects:
@@ -748,8 +746,16 @@ class CoffeeMachine(hass.Hass):
         if was_dry and not self._tank.dry:
             self._info(f"Water tank refilled: brew {brew['id']} poured after a run-dry")
 
+    def _water_warning(self, brew):
+        """The machine warned of low water and pours the cup on: logged once per brew, the count stays as it is."""
+        if "no_water" not in brew.get("faults", []) or brew.get("water_warned"):
+            return
+        brew["water_warned"] = True
+        used = self._tank.used(self._tracker.water)
+        self._info("Low-water warning" if used is None else f"Low-water warning after {used:.0f} ml")
+
     def _tank_empty(self, brew):
-        """The machine said no water during this brew: the tank is empty, noted once per brew."""
+        """The machine stopped this brew for want of water: the tank is empty, noted once per brew."""
         if "no_water" not in brew.get("faults", []) or brew.get("tank_empty"):
             return
         brew["tank_empty"] = True
@@ -1175,23 +1181,6 @@ class CoffeeMachine(hass.Hass):
         self._upsert_record(brew_id=brew_id, push=push)
         self._info(f"Ready push for {brew_id}: {push}")
 
-    def _fault_push(self, brew):
-        if brew is None or "no_water" not in brew.get("faults", []) or brew.get("fault_pushed"):
-            return
-        if brew["phase"] not in cf.RUNNING or brew.get("notify") not in PEOPLE:
-            return
-        brew["fault_pushed"] = True
-        self.create_task(self._send_fault_push(brew["notify"]))
-
-    async def _send_fault_push(self, person):
-        try:
-            actions = [{"action": WATER_FILLED_ACTION, "title": "Filled"}]
-            await self._notifier.notify(title="Coffee: water low", message="Fill the xBloom's tank before the next cup.",
-                                        target=[person], data={"data": {"tag": "coffee_fault", "actions": actions}},
-                                        link=self.push_link)
-        except Exception as e:
-            self.log(ascii_text(f"Fault push failed: {e!r}"), level="WARNING")
-
     def _house_event(self, brew):
         payload = {"icon": "mdi:coffee", "text": "Coffee ready"}
         cup = (brew.get("final") or {}).get("cup_g")
@@ -1306,9 +1295,6 @@ class CoffeeMachine(hass.Hass):
 
     def _on_push_action(self, event_name, data, kwargs):
         action = (data or {}).get("action") if isinstance(data, dict) else None
-        if action == WATER_FILLED_ACTION:
-            self._op_water_filled(None, {}, self._now())
-            return
         if not isinstance(action, str) or not action.startswith(RATE_PREFIX):
             return
         parts = action.split("|")
