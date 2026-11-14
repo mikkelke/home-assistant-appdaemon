@@ -116,6 +116,10 @@ class Intercom(hass.Hass):
         # an ABB press before giving up on it and falling back to the ESP
         # sequence (see _arm_abb_watchdog).
         self.abb_unlock_ack_timeout_s = float(self.args.get("abb_unlock_ack_timeout_s", 2.5))
+        # Back door only: station whose door the ABB integration is asked to unlock inside the
+        # call HA already holds with it, when ESP unlock attempt 1 of a ring is not confirmed
+        # (see _abb_rescue). Empty or absent = off.
+        self.abb_rescue_back_station = str(self.args.get("abb_rescue_back_station") or "").strip()
 
         # Messages
         self.msg_front = self.args.get("tts_message_front", "Someone is at the front door")
@@ -257,6 +261,9 @@ class Intercom(hass.Hass):
             self.listen_state(self._on_esp_lock_ack, lock_info["lock"], door_label=door_label)
             self.listen_state(self._on_abb_button_state, abb_button)
             self.log(f"ABB-native unlock enabled for {door_label} via {abb_button}", level="INFO")
+
+        if self.abb_rescue_back_station:
+            self.log(f"ABB-RESCUE enabled for the back door, station {self.abb_rescue_back_station}", level="INFO")
 
         # The bridge speaks the door sentence into the call HA dialled and fires
         # this the instant play_audio returns - which the integration only does
@@ -1080,6 +1087,16 @@ class Intercom(hass.Hass):
             self.log(f"WARNING: Cannot check lock state for {lock_entity} (state: {current_state})", level="WARNING")
             return
 
+        # After a rescue in this ring, a lock that already reports the door open is taken as the
+        # rescue having worked: confirm the ring instead of pulsing it again.
+        outcome = self.unlock_outcomes.get(trigger_entity)
+        ring_ts = kwargs.get("ring_ts")
+        if outcome is not None and ring_ts is not None and outcome.get("ring_ts") != ring_ts:
+            outcome = None
+        if outcome is not None and outcome.get("abb_rescue") and current_state in ["unlocked", "unlocking"]:
+            self._abb_rescue_ok(trigger_entity, lock_entity, outcome, unlock_attempt)
+            return
+
         # Always attempt unlock - even if already unlocked, this triggers the relay action
         # which helps delivery people notice the door is open (they hear/see the unlock happen)
         state_before = self.get_state(lock_entity)
@@ -1162,8 +1179,10 @@ class Intercom(hass.Hass):
                 self._report_auto_open_success(trigger_entity, lock_entity, outcome, unlock_attempt)
         elif current_state == state_before:
             self.log(f"FAIL: Unlock failed for {lock_entity} (attempt {unlock_attempt}): state unchanged ({current_state})", level="WARNING")
+            self._abb_rescue(lock_entity, unlock_attempt, outcome)
         else:
             self.log(f"WARN: Unlock state unclear for {lock_entity} (attempt {unlock_attempt}): was {state_before}, now {current_state}", level="WARNING")
+            self._abb_rescue(lock_entity, unlock_attempt, outcome)
 
         # After the LAST attempt of a ring: if no attempt succeeded, tell Mikkel.
         # The house already announced "I opened the door" - a silent failure
@@ -1174,6 +1193,54 @@ class Intercom(hass.Hass):
             and not outcome.get("succeeded")
         ):
             self._report_auto_open_failure(trigger_entity, lock_entity, outcome)
+
+    def _abb_rescue(self, lock_entity, unlock_attempt, outcome):
+        """ESP attempt 1 of a back-door ring was not confirmed: once per ring, ask the ABB
+        integration to unlock inside the call HA already holds with the station. It sends
+        nothing when there is no such call. The ESP ladder carries on either way;
+        _perform_unlock sees whether the rescue opened the door. Never raises, so the ring's
+        failure reporting is unaffected."""
+        if (
+            not self.abb_rescue_back_station
+            or lock_entity != self.back_lock
+            or unlock_attempt != 1
+            or outcome is None
+            or outcome.get("abb_rescue")
+        ):
+            return
+        outcome["abb_rescue"] = True
+        ring_label = outcome.get("ring_label", "door")
+        self.log(f"ABB-RESCUE attempt door={ring_label} station={self.abb_rescue_back_station}", level="INFO")
+        try:
+            self.submit_to_executor(self._call_abb_rescue, self.abb_rescue_back_station)
+        except Exception as e:
+            self.log(f"ABB-RESCUE dispatch failed for {ring_label}: {e}", level="WARNING")
+
+    def _call_abb_rescue(self, station_id):
+        """Executor-thread body of the rescue (see _abb_rescue): call_service blocks and this
+        app is pinned to one thread. Self-logs any failure, like _press_abb_button."""
+        try:
+            result = self.call_service("abb_welcome/unlock_in_call", station_id=station_id)
+            if isinstance(result, dict) and result.get("success") is False:
+                err = result.get("error") or {}
+                self.log(f"ABB-RESCUE REJECTED station={station_id} {err.get('code')}: {err.get('message')}", level="WARNING")
+        except Exception as e:
+            self.log(f"ABB-RESCUE call failed for station {station_id}: {e}", level="WARNING")
+
+    def _abb_rescue_ok(self, trigger_entity, lock_entity, outcome, unlock_attempt):
+        """The lock reports the door open before ESP attempt `unlock_attempt` after a rescue:
+        confirm the ring exactly like the first confirmed ESP attempt (see _verify_unlock),
+        and stop the ladder."""
+        self.log(
+            f"ABB-RESCUE ok door={outcome.get('ring_label', 'door')} (ESP attempt {unlock_attempt} skipped)",
+            level="INFO",
+        )
+        first_success = not outcome.get("succeeded")
+        outcome["succeeded"] = True
+        if first_success:
+            self._mark_ring_succeeded(trigger_entity)
+            self._cancel_pending_unlocks(trigger_entity)
+            self._report_auto_open_success(trigger_entity, lock_entity, outcome, "abb-rescue")
 
     def _report_auto_open_success(self, trigger_entity, lock_entity, outcome, unlock_attempt):
         """First confirmed unlock of a ring: notify Mikkel, log to the house feed."""

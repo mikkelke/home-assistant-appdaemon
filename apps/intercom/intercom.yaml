@@ -108,6 +108,12 @@ Intercom:
   # button press before giving up on it and falling back to the ESP sequence.
   abb_unlock_ack_timeout_s: 2.5
 
+  # Back door only. When ESP unlock attempt 1 of a ring is not confirmed, ask the ABB integration
+  # to unlock inside the call HA already holds with this station; it sends nothing when there is
+  # no such call. The ESP attempts carry on, and one that finds the lock already unlocking after
+  # the rescue does not pulse again. Empty or absent = off.
+  abb_rescue_back_station: "100000001"
+
   # ring -> recording -> announcement -> unlock. The visitor stands in front of
   # the intercom only until the door opens; this gateway needs ~2 s to produce
   # a first video frame while the unlock used to fire at ~+0.45 s, so opening

@@ -273,7 +273,8 @@ def _run_scheduled(app, callback_name):
     return ran
 
 
-def _fake_abb_app(tmpdir, clock, states, abb_unlock_doors=None, voice_before_unlock=None):
+def _fake_abb_app(tmpdir, clock, states, abb_unlock_doors=None, voice_before_unlock=None,
+                  abb_rescue_back_station=""):
     """A bare Intercom instance with the full duck-typed AD surface the
     ABB-native unlock path touches: run_in is captured AND replayable (see
     _run_scheduled), submit_to_executor runs inline (so _press_abb_button's
@@ -290,8 +291,17 @@ def _fake_abb_app(tmpdir, clock, states, abb_unlock_doors=None, voice_before_unl
             "followup": "I opened the front door",
             "door_sensor": None,
             "ring_label": "front door",
-        }
+        },
+        "binary_sensor.back": {
+            "message": "Someone is at the back door",
+            "lock": "lock.back",
+            "followup": "I opened the back door",
+            "door_sensor": None,
+            "ring_label": "back door",
+        },
     }
+    app.back_lock = "lock.back"
+    app.abb_rescue_back_station = abb_rescue_back_station
     app.door_lock_info = {"front door": {"lock": "lock.front", "door_sensor": None}}
     app.abb_unlock_doors = dict(abb_unlock_doors or {})
     app.abb_button_to_door = {v: k for k, v in app.abb_unlock_doors.items()}
@@ -814,6 +824,292 @@ class AbbNativeUnlockTests(unittest.TestCase):
         self.assertEqual(app._abb_watchdogs, {})
         self.assertEqual(app.run_in_calls, [])
         self.assertTrue(any("stale" in msg.lower() for _, msg in app.logs))
+
+
+# ---------------------------------------------------------------------------
+# ABB rescue (see abb_rescue_back_station in intercom.yaml): back door only. When
+# ESP attempt 1 of a ring is not confirmed, the ABB integration is asked to
+# unlock inside the call HA already holds with the station; a later ESP attempt
+# that finds the lock already unlocking confirms the ring instead of pulsing.
+# ---------------------------------------------------------------------------
+
+
+class AbbRescueTests(unittest.TestCase):
+    BACK = "binary_sensor.back"
+    FRONT = "binary_sensor.front"
+    RESCUE = ("abb_welcome/unlock_in_call", {"station_id": "100000001"})
+    PULSE = ("lock/unlock", {"entity_id": "lock.back"})
+
+    def setUp(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        self.tmpdir = tmpdir.name
+        self.clock = Clock(NOW)
+        self.states = {"input_boolean.auto_open": "on", "lock.front": "locked", "lock.back": "locked"}
+
+    def _ring(self, sensor=None, station="100000001"):
+        sensor = sensor or self.BACK
+        app = _fake_abb_app(self.tmpdir, self.clock, self.states, abb_rescue_back_station=station)
+        app.unlock_repeat_count = 3
+        self.running = set()
+        self.cancelled = []
+        app.timer_running = lambda handle: handle in self.running
+        app.cancel_timer = lambda handle: (self.cancelled.append(handle), self.running.discard(handle))
+        app._handle_trigger(sensor, "state", "off", "on", {})
+        self.running.update(app.pending_unlocks[sensor])
+        return app
+
+    def _attempt(self, app, sensor=None):
+        """Fire the ladder's next ESP attempt, as its timer would."""
+        self.running.discard(app.pending_unlocks[sensor or self.BACK][0])
+        index = [cb.__name__ for cb, _, _ in app.run_in_calls].index("unlock_callback")
+        callback, _, kwargs = app.run_in_calls.pop(index)
+        callback(kwargs)
+
+    def _failed_first_attempt(self, app):
+        self._attempt(app)
+        _run_scheduled(app, "_verify_unlock")
+
+    def _rescues(self, app):
+        return [c for c in app.service_calls if c[0] == "abb_welcome/unlock_in_call"]
+
+    def _pulses(self, app):
+        return [c for c in app.service_calls if c[0] == "lock/unlock"]
+
+    def _logged(self, app, text):
+        return any(text in msg for _, msg in app.logs)
+
+    def test_a_confirmed_first_attempt_does_not_rescue(self):
+        app = self._ring()
+        self._attempt(app)
+        self.states["lock.back"] = "unlocking"
+        _run_scheduled(app, "_verify_unlock")
+
+        self.assertEqual(self._rescues(app), [])
+        self.assertEqual([p["title"] for p in app.pushes], ["Intercom auto-opened"])
+
+    def test_an_unconfirmed_first_attempt_rescues_exactly_once_per_ring(self):
+        app = self._ring()
+        self._failed_first_attempt(app)
+
+        self.assertEqual(self._rescues(app), [self.RESCUE])
+        self.assertIn(("INFO", "ABB-RESCUE attempt door=back door station=100000001"), app.logs)
+        self.assertEqual([cb.__name__ for cb, _, _ in app.run_in_calls], ["unlock_callback"] * 2)
+
+        for _ in range(2):  # attempts 2 and 3 pulse and fail too
+            self._attempt(app)
+            _run_scheduled(app, "_verify_unlock")
+        self.assertEqual(self._rescues(app), [self.RESCUE])
+        self.assertEqual(len(self._pulses(app)), 3)
+        self.assertEqual([p["title"] for p in app.pushes], ["Intercom auto-open failed"])
+
+    def _verify(self, app, attempt):
+        app._verify_unlock({
+            "lock_entity": "lock.back", "state_before": "locked", "unlock_attempt": attempt,
+            "followup": None, "door_sensor": None, "trigger_entity": self.BACK, "ring_ts": NOW,
+        })
+
+    def test_only_a_failed_first_attempt_rescues(self):
+        app = self._ring()
+        self._verify(app, 2)
+        self.assertEqual(self._rescues(app), [])
+        self._verify(app, 1)
+        self.assertEqual(self._rescues(app), [self.RESCUE])
+
+    def test_a_second_verify_of_the_first_attempt_does_not_rescue_again(self):
+        app = self._ring()
+        self._verify(app, 1)
+        self._verify(app, 1)
+        self.assertEqual(self._rescues(app), [self.RESCUE])
+
+    def test_an_unclear_lock_state_after_the_first_attempt_rescues_too(self):
+        app = self._ring()
+        self._attempt(app)
+        self.states["lock.back"] = "jammed"
+        _run_scheduled(app, "_verify_unlock")
+
+        self.assertTrue(self._logged(app, "Unlock state unclear"))
+        self.assertEqual(self._rescues(app), [self.RESCUE])
+
+    def test_a_lock_unlocking_at_the_next_attempt_confirms_the_ring_without_a_pulse(self):
+        app = self._ring()
+        self._failed_first_attempt(app)
+        last_attempt = app.pending_unlocks[self.BACK][-1]
+        self.states["lock.back"] = "unlocking"
+        self._attempt(app)
+
+        self.assertEqual(self._pulses(app), [self.PULSE])  # attempt 1's only
+        self.assertTrue(self._logged(app, "ABB-RESCUE ok door=back door"))
+        self.assertTrue(self._logged(
+            app, "AUTO-OPEN: confirmed unlock of lock.back after back door ring (attempt abb-rescue)"))
+        self.assertTrue(app.unlock_outcomes[self.BACK]["succeeded"])
+        on_disk = json.loads((Path(self.tmpdir) / "intercom_state.json").read_text())
+        self.assertTrue(on_disk[self.BACK]["succeeded"])
+        self.assertEqual([p["title"] for p in app.pushes], ["Intercom auto-opened"])
+        self.assertEqual(self.cancelled, [last_attempt])
+        self.assertNotIn(self.BACK, app.pending_unlocks)
+        self.assertNotIn("_verify_unlock", [cb.__name__ for cb, _, _ in app.run_in_calls])
+
+    def test_an_unlocked_lock_at_the_next_attempt_confirms_the_ring_too(self):
+        app = self._ring()
+        self._failed_first_attempt(app)
+        self.states["lock.back"] = "unlocked"
+        self._attempt(app)
+
+        self.assertEqual(self._pulses(app), [self.PULSE])
+        self.assertEqual([p["title"] for p in app.pushes], ["Intercom auto-opened"])
+
+    def test_a_lock_still_locked_at_the_next_attempt_is_pulsed_as_before(self):
+        app = self._ring()
+        self._failed_first_attempt(app)
+        self._attempt(app)
+
+        self.assertEqual(self._pulses(app), [self.PULSE, self.PULSE])
+        self.assertFalse(self._logged(app, "ABB-RESCUE ok"))
+        self.assertFalse(app.unlock_outcomes[self.BACK]["succeeded"])
+        self.states["lock.back"] = "unlocking"
+        _run_scheduled(app, "_verify_unlock")
+        self.assertTrue(self._logged(
+            app, "AUTO-OPEN: confirmed unlock of lock.back after back door ring (attempt 2)"))
+        self.assertEqual([p["title"] for p in app.pushes], ["Intercom auto-opened"])
+
+    def test_another_rings_rescue_does_not_suppress_this_rings_pulse(self):
+        app = self._ring()
+        app.unlock_outcomes[self.BACK] = {
+            "ring_ts": NOW + timedelta(seconds=30), "succeeded": False,
+            "ring_label": "back door", "abb_rescue": True,
+        }
+        self.states["lock.back"] = "unlocking"
+        self._attempt(app)
+
+        self.assertEqual(self._pulses(app), [self.PULSE])
+        self.assertFalse(self._logged(app, "ABB-RESCUE ok"))
+
+    def test_without_the_key_nothing_is_ever_rescued(self):
+        app = self._ring(station="")
+        self._failed_first_attempt(app)
+        self.states["lock.back"] = "unlocking"
+        self._attempt(app)
+
+        self.assertEqual(self._rescues(app), [])
+        self.assertFalse(self._logged(app, "ABB-RESCUE"))
+        self.assertNotIn("abb_rescue", app.unlock_outcomes[self.BACK])
+        self.assertEqual(self._pulses(app), [self.PULSE, self.PULSE])  # unlocking is pulsed again, as before
+
+    def test_an_already_unlocked_lock_is_still_pulsed_when_no_rescue_fired(self):
+        self.states["lock.back"] = "unlocked"
+        app = self._ring()
+        self._attempt(app)
+
+        self.assertEqual(self._pulses(app), [self.PULSE])
+        self.assertTrue(self._logged(
+            app, "Lock lock.back already unlocked, but sending unlock command again (attempt 1)"))
+
+    def test_the_front_door_never_rescues(self):
+        app = self._ring(sensor=self.FRONT)
+        self._attempt(app, self.FRONT)
+        _run_scheduled(app, "_verify_unlock")
+        self.states["lock.front"] = "unlocking"
+        self._attempt(app, self.FRONT)
+
+        self.assertEqual(self._rescues(app), [])
+        self.assertFalse(self._logged(app, "ABB-RESCUE"))
+        self.assertEqual(self._pulses(app), [("lock/unlock", {"entity_id": "lock.front"})] * 2)
+
+    def test_a_superseded_ring_does_not_rescue(self):
+        app = self._ring()
+        self._attempt(app)
+        app.unlock_outcomes[self.BACK]["ring_ts"] = NOW + timedelta(seconds=30)  # a newer ring owns the record
+        _run_scheduled(app, "_verify_unlock")
+
+        self.assertEqual(self._rescues(app), [])
+
+    def test_a_rescue_the_integration_rejects_is_logged_and_the_ladder_carries_on(self):
+        app = self._ring()
+
+        def reject(service, **kwargs):
+            app.service_calls.append((service, kwargs))
+            if service == "abb_welcome/unlock_in_call":
+                return {"success": False, "error": {"code": "service_not_found", "message": "no such service"}}
+            return None
+
+        app.call_service = reject
+        self._failed_first_attempt(app)
+
+        self.assertIn(
+            ("WARNING", "ABB-RESCUE REJECTED station=100000001 service_not_found: no such service"), app.logs)
+        self.assertEqual([cb.__name__ for cb, _, _ in app.run_in_calls], ["unlock_callback"] * 2)
+
+    def _assert_failed_rescue_leaves_the_ring_alone(self, app):
+        self._failed_first_attempt(app)
+        self.assertEqual([cb.__name__ for cb, _, _ in app.run_in_calls], ["unlock_callback"] * 2)
+        for _ in range(2):
+            self._attempt(app)
+            _run_scheduled(app, "_verify_unlock")
+        self.assertEqual([p["title"] for p in app.pushes], ["Intercom auto-open failed"])
+
+    def test_a_rescue_call_that_raises_does_not_disturb_the_ladder_or_the_failure_report(self):
+        app = self._ring()
+        record_call = app.call_service
+
+        def call_service(service, **kwargs):
+            if service == "abb_welcome/unlock_in_call":
+                raise RuntimeError("synthetic")
+            record_call(service, **kwargs)
+
+        app.call_service = call_service
+        self._assert_failed_rescue_leaves_the_ring_alone(app)
+        self.assertIn(("WARNING", "ABB-RESCUE call failed for station 100000001: synthetic"), app.logs)
+
+    def test_a_rescue_that_cannot_be_dispatched_does_not_disturb_the_ladder_or_the_failure_report(self):
+        app = self._ring()
+        run_inline = app.submit_to_executor
+
+        def submit_to_executor(function, *args, **kwargs):
+            if function == app._call_abb_rescue:
+                raise RuntimeError("synthetic")
+            run_inline(function, *args, **kwargs)
+
+        app.submit_to_executor = submit_to_executor
+        self._assert_failed_rescue_leaves_the_ring_alone(app)
+        self.assertIn(("WARNING", "ABB-RESCUE dispatch failed for back door: synthetic"), app.logs)
+
+
+class AbbRescueConfigTests(unittest.TestCase):
+    """initialize() reads abb_rescue_back_station as one plain string."""
+
+    def _initialized(self, **extra):
+        app = intercom.Intercom.__new__(intercom.Intercom)
+        app.args = {
+            "front_sensor": "binary_sensor.front",
+            "back_sensor": "binary_sensor.back",
+            "front_lock": "lock.front",
+            "back_lock": "lock.back",
+            **extra,
+        }
+        app.logs = []
+        app.log = lambda msg, level="INFO": app.logs.append((level, msg))
+        app.get_app = lambda name: None
+        app.get_state = lambda entity, attribute=None: "locked"
+        app.listen_state = lambda *a, **kw: None
+        app.listen_event = lambda *a, **kw: None
+        app._resume_pending_rings = lambda: None
+        app.initialize()
+        return app
+
+    def test_an_absent_or_empty_key_means_off(self):
+        for extra in ({}, {"abb_rescue_back_station": ""}, {"abb_rescue_back_station": None}):
+            with self.subTest(extra=extra):
+                app = self._initialized(**extra)
+                self.assertEqual(app.abb_rescue_back_station, "")
+                self.assertFalse(any("ABB-RESCUE" in msg for _, msg in app.logs))
+
+    def test_the_station_is_read_as_a_stripped_string(self):
+        for raw in ("100000001", " 100000001 ", 100000001):
+            with self.subTest(raw=raw):
+                app = self._initialized(abb_rescue_back_station=raw)
+                self.assertEqual(app.abb_rescue_back_station, "100000001")
+                self.assertIn(("INFO", "ABB-RESCUE enabled for the back door, station 100000001"), app.logs)
 
 
 # ---------------------------------------------------------------------------
