@@ -30,3 +30,23 @@ ArrivalUnlock:
   window_s: 180
   # Defaults to arrival_unlock_log.jsonl beside the module (*_log.jsonl is gitignored).
   # log_file: /conf/apps/security/arrival_unlock_log.jsonl
+
+# Claudia's iPhone cannot transmit a beacon; Bermuda tracks it through its IRK (Private BLE Device).
+ArrivalUnlockClaudia:
+  module: arrival_unlock
+  class: ArrivalUnlock
+
+  tracker: device_tracker.claudias_iphone_2
+  away_min: 10
+
+  landing_area_sensor: sensor.claudias_iphone_ble_area
+  landing_area: Landing
+  landing_distance: sensor.claudias_iphone_ble_distance_to_ble_proxy_landing
+  landing_online: sensor.ble_proxy_landing_uptime
+
+  lock: sensor.apartment_lock
+  door: binary_sensor.apartment_door_open
+  keypad: lock.yale
+
+  window_s: 180
+  log_file: /conf/apps/security/arrival_unlock_claudia_log.jsonl
