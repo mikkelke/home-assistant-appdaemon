@@ -6,8 +6,8 @@ there is no room air to go by. Zones in live_zones are written only while live_s
 on; all other zones record the shadow decisions, and turning the switch off hands each live zone
 back to its thermostat with the aim as an ordinary setpoint. Writes use the thermostat's
 reported state, a saved token bucket and ten-minute stability, except that a call starting or
-stopping is written at once, with one pending write per zone and a three-minute read-back
-deadline.
+stopping and a restore after a live thermostat change are written at once, with one pending
+write per zone and a three-minute read-back deadline.
 
 The planning rules live in heating_plan.py, the weather side in heating_forecast.py, the rules
 for who changed what in heating_signals.py, the plant alerts in heating_alerts.py and the season
@@ -22,7 +22,7 @@ open, up to lockout_max_hours, unless the air gets back to where it was before.
 Signals: a thermostat setpoint, mode or preset change is attributed from the service calls the
 app sees on the thermostats; the four nudge buttons and the helpers the owner owns are read from
 raw state-change events, which carry the context that names the human. A resident's nudge moves
-the plan. Live thermostat changes are restored after ten minutes; the owner's off choice is
+the plan. Live thermostat changes are restored at once; the owner's off choice is
 held until the thermostat leaves off or the next heating season starts. Target helpers remain
 the owner's controls. Helper reverts and shadow thermostat effects are only recorded.
 
@@ -632,7 +632,7 @@ class HeatingController(hass.Hass):
             else:
                 effect = sig.EFFECT_RESTORE
                 rt.desired_since = change.ts
-                rt.priority = None
+                rt.priority = "restore"
                 self._count_write(rt, "restores", change.ts)
         extra: dict = {}
         before = rt.nudge

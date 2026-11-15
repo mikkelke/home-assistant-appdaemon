@@ -914,7 +914,7 @@ class LiveWrites(unittest.TestCase):
         self.assertEqual(len(h.calls), 1)
         self.assertEqual(h.attrs("family")["mode"], "window")
 
-    def test_foreign_setpoint_changes_are_restored_after_ten_minutes(self):
+    def test_foreign_setpoint_changes_are_restored_at_once(self):
         for caller in (None, APP_ID, MIKKEL_ID):
             with self.subTest(caller=caller):
                 h = self.confirmed()
@@ -925,8 +925,6 @@ class LiveWrites(unittest.TestCase):
                 changed_at = h.clock.now.timestamp()
                 self.assertEqual(h.effects("family")[-1], "restore")
                 self.assertEqual(h.app._zones["family"].desired_since, changed_at)
-                h.tick(minutes=9, seconds=59)
-                self.assertEqual(len(h.calls), 1)
                 h.tick(seconds=1)
                 self.assertEqual(len(h.calls), 2)
                 self.assertEqual(h.calls[-1]["temperature"], 5.0)
@@ -934,15 +932,13 @@ class LiveWrites(unittest.TestCase):
                 self.assertEqual(h.app._zones["family"].nudge, 0.0)
                 self.assertEqual(h.ha.get_state("input_number.heating_target_family"), "21.5")
 
-    def test_foreign_mode_changes_restore_heat_after_ten_minutes(self):
+    def test_foreign_mode_changes_restore_heat_at_once(self):
         for mode in ("off", "auto"):
             with self.subTest(mode=mode):
                 h = self.confirmed()
                 h.clock.advance(seconds=1)
                 h.report("family", state=mode)
-                h.tick(minutes=9)
-                self.assertEqual(len(h.calls), 1)
-                h.tick(minutes=1)
+                h.tick(seconds=1)
                 self.assertEqual(len(h.calls), 2)
                 self.assertEqual(h.calls[-1]["hvac_mode"], "heat")
                 self.assertEqual(h.attrs("family")["held_off"], "false")
@@ -1080,8 +1076,6 @@ class LiveWrites(unittest.TestCase):
         h.report("family", temperature=15.0)
         self.assertEqual(h.signals("family")[-1]["source"], "ha")
         self.assertEqual(h.effects("family")[-1], "restore")
-        h.tick(minutes=9, seconds=59)
-        self.assertEqual(len(h.calls), 1)
         h.tick(seconds=1)
         self.assertEqual(len(h.calls), 2)
         self.assertEqual(h.app._zones["family"].days["2026-10-17"].failed, 0)
@@ -1769,9 +1763,6 @@ class AiringLockoutEndToEnd(LiveZones, unittest.TestCase):
         self.assertEqual(h.effects("kristines_room")[-1], "restore")
         rt = h.app._zones["kristines_room"]
         self.assertEqual(rt.nudge, 0.0)
-        sent = len(h.calls)
-        h.tick(minutes=9, seconds=59)
-        self.assertEqual(len(h.calls), sent)
         h.tick(seconds=1)
         self.assertEqual(self.sent(h), [5.0, 5.0])
         self.assertEqual(h.attrs("kristines_room")["mode"], "settle")
