@@ -70,6 +70,9 @@ def make_app(spotify_accounts=None):
     app.spotify_poll_s = 5.0
     app.ledger = ma.PlaybackLedger(idle_s=1200, call_window_s=30)
     app._person_by_user_id = {}
+    app.sessions_sensor = "sensor.music_sessions"
+    app.sessions = {}
+    app.published = []
 
     app.clock = 100000.0
     app.states = {}
@@ -95,6 +98,7 @@ def make_app(spotify_accounts=None):
     app.get_now = lambda: datetime.fromtimestamp(app.clock, tz=timezone.utc)
     app.run_in = run_in
     app.fire_event = lambda name, **kw: app.events.append((name, kw))
+    app.set_state = lambda entity, **kw: app.published.append((entity, kw))
     app.log = lambda *a, **k: None
 
     app.states["person.mikkel"] = {"state": "home", "attributes": {"friendly_name": "Mikkel", "user_id": MIKKEL}}
@@ -389,6 +393,94 @@ class Sessions(unittest.TestCase):
         ledger.transition(raw("kitchen"), "idle", "playing", 10.0)
         ledger.transition(raw("kitchen"), "playing", "idle", 11.0)
         self.assertEqual(ledger.settle(raw("kitchen"), 10.0, [raw("kitchen")]), "stale")
+
+
+class Stops(unittest.TestCase):
+    def session(self, app, room):
+        return app.sessions.get(f"media_player.{room}") or {}
+
+    def play(self, app, room, user_id=KRISTINE, group=None):
+        call(app, "play_media", user_id=user_id, entity_id=[f"media_player.{room}"], media_content_id="x")
+        advance(app, 2)
+        for r in group or [room]:
+            set_speaker(app, r, "playing", MA_STREAM, group=group)
+        advance(app, 10)
+
+    def test_stop_without_a_call_is_outside_home_assistant(self):
+        app = make_app()
+        self.play(app, "kitchen")
+        set_speaker(app, "kitchen", "idle", MA_STREAM)
+        advance(app, 10)
+        rec = self.session(app, "kitchen")
+        self.assertEqual(rec["started_by"], "Kristine")
+        self.assertEqual(rec["stopped_by"], ma.OUTSIDE_LABEL)
+        self.assertEqual(len(rows(app)), 1)
+        self.assertEqual(app.published[-1][0], "sensor.music_sessions")
+
+    def test_resident_pause_names_the_resident(self):
+        app = make_app()
+        self.play(app, "kitchen")
+        call(app, "media_pause", user_id=MIKKEL, entity_id=["media_player.kitchen"])
+        advance(app, 1)
+        set_speaker(app, "kitchen", "paused", MA_STREAM)
+        advance(app, 10)
+        self.assertEqual(self.session(app, "kitchen")["stopped_by"], "Mikkel")
+
+    def test_house_stop_is_the_house(self):
+        app = make_app()
+        self.play(app, "bedroom")
+        call(app, "media_stop", user_id=APPDAEMON, entity_id=["media_player.bedroom_2"])
+        advance(app, 1)
+        set_speaker(app, "bedroom", "idle", MA_STREAM)
+        advance(app, 10)
+        self.assertEqual(self.session(app, "bedroom")["stopped_by"], ma.HOUSE_LABEL)
+
+    def test_stop_on_the_coordinator_covers_the_group(self):
+        app = make_app()
+        self.play(app, "dining_room", group=["dining_room", "kitchen"])
+        self.assertEqual(self.session(app, "kitchen")["started_by"], "Kristine")
+        call(app, "media_stop", user_id=MIKKEL, entity_id=["media_player.dining_room"])
+        advance(app, 1)
+        set_speaker(app, "dining_room", "idle", MA_STREAM, group=["dining_room", "kitchen"])
+        set_speaker(app, "kitchen", "idle", MA_STREAM, group=["dining_room", "kitchen"])
+        advance(app, 10)
+        self.assertEqual(self.session(app, "kitchen")["stopped_by"], "Mikkel")
+        self.assertEqual(self.session(app, "dining_room")["stopped_by"], "Mikkel")
+
+    def test_blip_is_not_a_stop(self):
+        app = make_app()
+        self.play(app, "kitchen")
+        set_speaker(app, "kitchen", "paused", MA_STREAM)
+        advance(app, 1)
+        set_speaker(app, "kitchen", "playing", MA_STREAM)
+        advance(app, 10)
+        self.assertNotIn("stopped_at", self.session(app, "kitchen"))
+
+    def test_resume_clears_the_stop(self):
+        app = make_app()
+        self.play(app, "kitchen")
+        set_speaker(app, "kitchen", "paused", MA_STREAM)
+        advance(app, 60)
+        self.assertIn("stopped_at", self.session(app, "kitchen"))
+        set_speaker(app, "kitchen", "playing", MA_STREAM)
+        advance(app, 10)
+        rec = self.session(app, "kitchen")
+        self.assertNotIn("stopped_by", rec)
+        self.assertEqual(rec["started_by"], "Kristine")
+
+    def test_unjoin_by_the_house(self):
+        app = make_app()
+        self.play(app, "dining_room", group=["dining_room", "kitchen"])
+        call(app, "unjoin", user_id=APPDAEMON, entity_id=["media_player.kitchen"])
+        advance(app, 1)
+        set_speaker(app, "kitchen", "idle", MA_STREAM)
+        advance(app, 10)
+        self.assertEqual(self.session(app, "kitchen")["stopped_by"], ma.HOUSE_LABEL)
+        self.assertNotIn("stopped_at", self.session(app, "dining_room"))
+
+    def test_play_pause_counts_as_a_stop_when_playing(self):
+        self.assertEqual(ma.stop_call_targets("media_player", "media_play_pause", {"entity_id": "a"}), ["a"])
+        self.assertIsNone(ma.stop_call_targets("media_player", "volume_mute", {"entity_id": "a"}))
 
 
 class Spotify(unittest.TestCase):

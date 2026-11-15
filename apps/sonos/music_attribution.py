@@ -26,6 +26,16 @@ Who started it:
 Rows are text-only ``house_events_report`` events, scoped like manual_override_timeout's
 ROOM_AUDIENCE: a session touching a shared room is public, otherwise its rooms' occupants and the
 admins see it.
+
+Who stopped it: a speaker that leaves playing for idle, paused or off and is still not playing
+``settle_seconds`` later stopped. A stopping service call (media_stop, media_pause, unjoin, ...)
+on it or its group within ``call_window_seconds`` before names a resident or the house, as for
+starts; without one the stop came from outside Home Assistant (the Sonos or Music Assistant app,
+a speaker button, or the music ending). Stops get no feed row.
+
+``sessions_sensor`` holds, per Music Assistant speaker entity, when its current or last session
+started and who started it, and when and by whom it stopped, so the house status can answer who
+started or stopped the music.
 """
 
 import time
@@ -49,7 +59,22 @@ START_SERVICES = frozenset(
         ("sonos", "play_queue"),
     }
 )
+STOP_SERVICES = frozenset(
+    {
+        ("media_player", "media_stop"),
+        ("media_player", "media_pause"),
+        ("media_player", "media_play_pause"),
+        ("media_player", "turn_off"),
+        ("media_player", "clear_playlist"),
+        ("media_player", "unjoin"),
+    }
+)
 CALL_DOMAINS = ("media_player", "music_assistant", "sonos")
+STOPPED_STATES = ("idle", "paused", "off")
+
+HOUSE_LABEL = "the house"
+HA_SOMEONE_LABEL = "someone in Home Assistant"
+OUTSIDE_LABEL = "outside Home Assistant: an app, a speaker button, or the music ended"
 
 ROOM_AUDIENCE = {
     "bedroom": {"audience": "admin"},
@@ -94,6 +119,29 @@ def start_call_targets(domain, service, service_data):
     if _truthy(data.get("announce")):
         return None
     return _as_list(data.get("entity_id"))
+
+
+def stop_call_targets(domain, service, service_data):
+    """Entity ids targeted by a service call that stops or pauses playback, or None."""
+    if (domain, service) not in STOP_SERVICES:
+        return None
+    data = service_data if isinstance(service_data, dict) else {}
+    return _as_list(data.get("entity_id"))
+
+
+def origin_label(origin):
+    """Display text for who started or stopped a session; None (no call) is outside HA."""
+    if origin is None:
+        return OUTSIDE_LABEL
+    if origin == HOUSE:
+        return HOUSE_LABEL
+    if origin == SOMEONE:
+        return HA_SOMEONE_LABEL
+    return origin[1]
+
+
+def iso(ts):
+    return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
 
 
 def call_origin(user_id, parent_id, house_user_ids, resident_for):
@@ -302,19 +350,19 @@ class PlaybackLedger:
                 self._heard[member] = max(self._heard.get(member) or run_ts, run_ts)
         return verdict
 
-    def add_call(self, ts, speakers, origin):
+    def add_call(self, ts, speakers, origin, kind="start"):
         if not speakers:
             return
-        self._calls.append((ts, frozenset(speakers), origin))
+        self._calls.append((ts, frozenset(speakers), origin, kind))
         horizon = ts - max(self.call_window_s, 60.0)
         self._calls = [call for call in self._calls if call[0] >= horizon]
 
-    def origin_for(self, speakers, run_ts):
-        """Origin of the newest start call on any of `speakers` within the call window before
-        run_ts, or None."""
+    def origin_for(self, speakers, run_ts, kind="start"):
+        """Origin of the newest `kind` call ('start' or 'stop') on any of `speakers` within the
+        call window before run_ts, or None."""
         wanted = set(speakers)
-        for ts, targets, origin in reversed(self._calls):
-            if run_ts - self.call_window_s <= ts <= run_ts + 1.0 and targets & wanted:
+        for ts, targets, origin, call_kind in reversed(self._calls):
+            if call_kind == kind and run_ts - self.call_window_s <= ts <= run_ts + 1.0 and targets & wanted:
                 return origin
         return None
 
@@ -338,6 +386,9 @@ class MusicAttribution(hass.Hass):
             call_window_s=float(self.args.get("call_window_seconds", 30)),
         )
         self._person_by_user_id = {}
+        self.sessions_sensor = self.args.get("sessions_sensor", "sensor.music_sessions")
+        kept = self._attr(self.sessions_sensor, "rooms")
+        self.sessions = {k: dict(v) for k, v in kept.items() if isinstance(v, dict)} if isinstance(kept, dict) else {}
 
         now = self._now()
         for raw in self.raw_to_base:
@@ -353,6 +404,7 @@ class MusicAttribution(hass.Hass):
             f"MusicAttribution: {len(self.raw_to_base)} speakers, "
             f"{len(self.spotify_accounts)}/{len(self.residents)} Spotify accounts linked"
         )
+        self.run_every(self._republish, "now+10", 600)
 
     def _now(self):
         try:
@@ -366,18 +418,25 @@ class MusicAttribution(hass.Hass):
         ts = self._now()
         if self.ledger.transition(entity, old, new, ts):
             self.run_in(self._settle, self.settle_s, speaker=entity, run_ts=ts)
+        elif old == "playing" and new in STOPPED_STATES:
+            self.run_in(self._settle_stop, self.settle_s, speaker=entity, stop_ts=ts, group=self._group(entity))
 
     def _on_call(self, event_name, data, kwargs):
         try:
-            targets = start_call_targets(data.get("domain"), data.get("service"), data.get("service_data"))
-            speakers = self._speakers_for(targets or [])
-            if not speakers:
-                return
-            context = (data.get("metadata") or {}).get("context") or {}
-            origin = call_origin(
-                context.get("user_id"), context.get("parent_id"), self.house_user_ids, self._resident_for
+            domain, service, service_data = data.get("domain"), data.get("service"), data.get("service_data")
+            calls = (
+                ("start", start_call_targets(domain, service, service_data)),
+                ("stop", stop_call_targets(domain, service, service_data)),
             )
-            self.ledger.add_call(self._now(), speakers, origin)
+            context = (data.get("metadata") or {}).get("context") or {}
+            for kind, targets in calls:
+                speakers = self._speakers_for(targets or [])
+                if not speakers:
+                    continue
+                origin = call_origin(
+                    context.get("user_id"), context.get("parent_id"), self.house_user_ids, self._resident_for
+                )
+                self.ledger.add_call(self._now(), speakers, origin, kind)
         except Exception as e:
             self.log(f"call_service handling failed: {e}", level="WARNING")
 
@@ -388,6 +447,12 @@ class MusicAttribution(hass.Hass):
         run_ts = kwargs["run_ts"]
         group = self._group(speaker)
         verdict = self.ledger.settle(speaker, run_ts, group)
+        if verdict == "join":
+            self._record_join(speaker, group[0])
+            return
+        if verdict == "resume":
+            self._record_resume(speaker)
+            return
         if verdict != "new":
             return
         kind = content_kind(self._content(speaker), self._attr(speaker, "source"))
@@ -397,14 +462,15 @@ class MusicAttribution(hass.Hass):
         if origin is not None:
             if origin == HOUSE:
                 self.log(f"Session on {speaker} started by the house - no row", level="DEBUG")
+                self._record_start(group, HOUSE_LABEL, run_ts)
                 return
-            self._report(origin[1] or "Someone", kind, speaker, group, by=origin[1])
+            self._report(origin[1] or "Someone", kind, speaker, group, by=origin[1], run_ts=run_ts)
             return
         if kind == "spotify" and self.spotify_accounts:
             deadline = run_ts + self.spotify_wait_s
             self.run_in(self._spotify_poll, self.spotify_poll_s, speaker=speaker, group=group, deadline=deadline)
             return
-        self._report("Someone", kind, speaker, group)
+        self._report("Someone", kind, speaker, group, run_ts=run_ts)
 
     def _spotify_poll(self, kwargs):
         speaker = kwargs["speaker"]
@@ -413,7 +479,7 @@ class MusicAttribution(hass.Hass):
         states = {entity: self._full_state(entity) for entity in self.spotify_accounts.values()}
         hits = spotify_matches(self.spotify_accounts, states, self._device_keys(group))
         if len(hits) == 1:
-            self._report(hits[0], "spotify", speaker, group, by=hits[0])
+            self._report(hits[0], "spotify", speaker, group, by=hits[0], run_ts=deadline - self.spotify_wait_s)
             return
         if self._now() < deadline:
             self.run_in(self._spotify_poll, self.spotify_poll_s, speaker=speaker, group=group, deadline=deadline)
@@ -421,11 +487,58 @@ class MusicAttribution(hass.Hass):
         still_spotify = self.ledger.playing(speaker) and content_kind(self._content(speaker)) == "spotify"
         track = track_key(self._full_state(speaker).get("attributes"))
         guest = not hits and spotify_is_guest(self.residents, self.spotify_accounts, states, still_spotify, track)
-        self._report("A guest" if guest else "Someone", "spotify", speaker, group)
+        self._report("A guest" if guest else "Someone", "spotify", speaker, group, run_ts=deadline - self.spotify_wait_s)
+
+    def _settle_stop(self, kwargs):
+        speaker = kwargs["speaker"]
+        if self.ledger.playing(speaker):
+            return
+        if content_kind(self._content(speaker), self._attr(speaker, "source")) == "tv":
+            return
+        group = set(kwargs["group"]) | {speaker}
+        origin = self.ledger.origin_for(group, kwargs["stop_ts"], kind="stop")
+        rec = self.sessions.setdefault(self.raw_to_base[speaker], {})
+        rec.update(stopped_at=iso(kwargs["stop_ts"]), stopped_by=origin_label(origin))
+        self.log(f"Music stopped on {speaker}: {rec['stopped_by']}")
+        self._publish()
+
+    # -- session records ----------------------------------------------------
+
+    def _record_start(self, members, who, run_ts):
+        for raw in members:
+            self.sessions[self.raw_to_base[raw]] = {"started_at": iso(run_ts), "started_by": who}
+        self._publish()
+
+    def _record_join(self, speaker, coordinator):
+        lead = self.sessions.get(self.raw_to_base.get(coordinator))
+        if lead and "started_at" in lead:
+            self.sessions[self.raw_to_base[speaker]] = {k: lead[k] for k in ("started_at", "started_by")}
+            self._publish()
+
+    def _record_resume(self, speaker):
+        rec = self.sessions.get(self.raw_to_base[speaker])
+        if rec and rec.pop("stopped_at", None):
+            rec.pop("stopped_by", None)
+            self._publish()
+
+    def _republish(self, kwargs):
+        if self.sessions:
+            self._publish()
+
+    def _publish(self):
+        try:
+            self.set_state(
+                self.sessions_sensor,
+                state=iso(self._now()),
+                attributes={"friendly_name": "Music sessions", "rooms": self.sessions},
+                replace=True,
+            )
+        except Exception as e:
+            self.log(f"publishing {self.sessions_sensor} failed: {e}", level="WARNING")
 
     # -- reporting ----------------------------------------------------------
 
-    def _report(self, who, kind, speaker, group, by=None):
+    def _report(self, who, kind, speaker, group, by=None, run_ts=None):
         current = self._group(speaker) if self.ledger.playing(speaker) else []
         members = current if len(current) >= len(group) else group
         text = session_text(who, kind, where_label([room_label(self.raw_to_base[m]) for m in members]))
@@ -434,6 +547,7 @@ class MusicAttribution(hass.Hass):
         if by:
             payload["by"] = by
         self.log(f"Music session: {text}")
+        self._record_start(members, who, self._now() if run_ts is None else run_ts)
         try:
             self.fire_event("house_events_report", **payload)
         except Exception:

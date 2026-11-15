@@ -39,6 +39,9 @@ MusicAttribution:
     # Kristine: media_player.spotify_kristine
     # Claudia: media_player.spotify_claudia
 
+  # Per speaker: who started and who stopped its current or last session (house_status reads it).
+  sessions_sensor: sensor.music_sessions
+
   # Same idle time as SonosStateReset's inactivity_seconds.
   session_idle_minutes: 20
   settle_seconds: 5
