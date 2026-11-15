@@ -22,6 +22,9 @@ AssistRooms:
     guest_bathroom: media_player.guest_bathroom
     rooftop: media_player.rooftop
 
+  # HA area id -> Sonos local API host of the room speaker the satellite ducks.
+  duck_hosts:
+    bathroom: !secret bathroom_sonos_host
+
   master_select: input_select.sonos_master_speaker
   radio: dr_podcasts://radio/p3
-  duck_failsafe_s: 20

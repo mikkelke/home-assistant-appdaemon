@@ -1,15 +1,16 @@
 """Room-local music controls for Assist satellites.
 
 satellites maps each Assist satellite entity to its HA area id; speakers maps areas
-to Music Assistant players. A satellite entering listening mutes its room's speaker
-only while it is playing and unmuted, and never while one of answer_sensors says a
-satellite's answer is still playing on a speaker: Music Assistant lifts a mute for its
-announcement and restores the mute it saw, so a mute made then would come back after
-the release. Only mutes made here are released, either on
-leaving listening or after duck_failsafe_s. Release checks the current mute state,
-even if playback has stopped, and always forgets ownership. Responding needs no end
-signal. Volume levels never change, and ducking never pauses a group. FollowMe may
-change mute independently; this app never retries a mute or restores somebody else's.
+to Music Assistant players; duck_hosts maps areas to the Sonos local API host of the
+room speaker. A satellite is busy while it is listening or processing; answer_sensors
+(on while a satellite's answer plays on a speaker) name no room, so one that is on
+makes every room in duck_hosts busy. Each state change while a room is busy ducks its
+speaker through Sonos's own duck if Music Assistant says it is playing, which also
+catches music that starts mid-conversation, and renews a duck already held; Sonos lifts
+a duck itself after DUCK_MS. A held duck is lifted once its room has been quiet for
+QUIET_S, which bridges the gap between an answer and a follow-up turn. Nothing is muted,
+no volume is written and ducking never pauses a group. Only ducks made here are lifted;
+a request that fails is logged and owns nothing.
 
 Intent events carry area_id. assist_music_here joins a different playing master,
 otherwise resumes a paused room speaker, otherwise starts radio. The master comes
@@ -33,10 +34,19 @@ music keeps playing on the leaders. Nothing playing means nothing happens. Only 
 rooms that voice never groups out of it.
 """
 
+import json
+import ssl
+import urllib.request
+
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
 MOVE_POLL_S = 1
 MOVE_GIVE_UP_S = 15
+# The public key aiosonos and Home Assistant send to the speaker's local API.
+SONOS_LOCAL_KEY = "123e4567-e89b-12d3-a456-426655440000"
+QUIET_S = 2
+# Sonos lifts a duck itself after this; every busy edge renews it.
+DUCK_MS = 60000
 
 
 def _attributes(state):
@@ -44,22 +54,22 @@ def _attributes(state):
     return attrs if isinstance(attrs, dict) else {}
 
 
-def _is_muted(state):
-    value = _attributes(state).get("is_volume_muted")
-    return value is True or str(value).lower() in ("true", "on", "yes", "1")
+def sonos_duck(host, duck):
+    """Duck a speaker through its local API, or lift the duck.
 
-
-def duck_actions(speaker, state, listening, owned):
-    """Decide a listening-edge mute or an owned release from a player snapshot."""
-    if not speaker:
-        return []
-    if listening:
-        if owned or (state or {}).get("state") != "playing" or _is_muted(state):
-            return []
-    elif not owned or not _is_muted(state):
-        return []
-    return [{"service": "media_player/volume_mute",
-             "data": {"entity_id": speaker, "is_volume_muted": listening}}]
+    Blocking, with a 2 s socket timeout. The speaker's certificate is self-signed, so it
+    is not verified.
+    """
+    body = {"durationMillis": DUCK_MS} if duck else {}
+    request = urllib.request.Request(
+        f"https://{host}:1443/api/v1/players/local/playerVolume/{'duck' if duck else 'unduck'}",
+        data=json.dumps(body).encode(), method="POST",
+        headers={"X-Sonos-Api-Key": SONOS_LOCAL_KEY, "Content-Type": "application/json"})
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(request, context=context, timeout=2):
+        pass
 
 
 def intent_actions(event_name, speaker, state, master, master_state, radio):
@@ -172,15 +182,17 @@ class AssistRooms(hass.Hass):
     def initialize(self):
         self.satellites = self.args.get("satellites", {})
         self.speakers = self.args.get("speakers", {})
+        self.duck_hosts = self.args.get("duck_hosts", {})
         self.master_select = self.args.get("master_select", "input_select.sonos_master_speaker")
         self.radio = self.args.get("radio", "dr_podcasts://radio/p3")
-        self.duck_failsafe_s = float(self.args.get("duck_failsafe_s", 20))
         self.answer_sensors = self.args.get("answer_sensors", [])
-        self._ducked = {}
-        self._duck_generation = 0
+        self._ducked = set()
+        self._gen = {}
 
-        for satellite in self.satellites:
-            self.listen_state(self._on_satellite_state, satellite)
+        watched = [*self.satellites, *self.answer_sensors]
+        for entity in watched:
+            self.listen_state(self._on_state, entity)
+        self._seen = {entity: self.get_state(entity) for entity in watched}
         for event in ("assist_music_here", "assist_music_leave", "assist_radio"):
             self.listen_event(self._on_intent, event)
         self.listen_event(self._on_group_intent, "assist_music_group")
@@ -189,35 +201,48 @@ class AssistRooms(hass.Hass):
         state = self.get_state(entity, attribute="all")
         return state if isinstance(state, dict) else {}
 
-    def _on_satellite_state(self, entity, attribute, old, new, kwargs):
-        area = self.satellites.get(entity)
-        speaker = self.speakers.get(area)
-        if not speaker or old == new:
+    def _on_state(self, entity, attribute, old, new, kwargs):
+        if old == new:
             return
-        if new == "listening" and not self._answer_playing():
-            actions = duck_actions(speaker, self._read(speaker), True, area in self._ducked)
-            if actions:
-                self._run_actions(area, actions)
-                self._duck_generation += 1
-                self._ducked[area] = self._duck_generation
-                self.run_in(self._duck_failsafe, self.duck_failsafe_s,
-                            area=area, generation=self._duck_generation)
-        elif old == "listening":
-            self._release_duck(area)
-
-    def _answer_playing(self):
-        return any(self.get_state(sensor) == "on" for sensor in self.answer_sensors)
-
-    def _release_duck(self, area):
-        owned = self._ducked.pop(area, None) is not None
-        if owned:
+        self._seen[entity] = new
+        areas = [self.satellites[entity]] if entity in self.satellites else list(self.duck_hosts)
+        for area in areas:
             speaker = self.speakers.get(area)
-            self._run_actions(area, duck_actions(speaker, self._read(speaker), False, owned))
+            if not speaker:
+                continue
+            self._gen[area] = self._gen.get(area, 0) + 1
+            if self._busy(area):
+                if self.get_state(speaker) == "playing" and self._send(area, True):
+                    if area not in self._ducked:
+                        self._ducked.add(area)
+                        self.log(f"Ducked {speaker} for assist ({area})", level="INFO")
+            elif area in self._ducked:
+                self.run_in(self._on_quiet, QUIET_S, area=area, generation=self._gen[area])
 
-    def _duck_failsafe(self, kwargs):
+    def _busy(self, area):
+        satellites = [entity for entity, room in self.satellites.items() if room == area]
+        return (any(self._seen.get(entity) in ("listening", "processing") for entity in satellites)
+                or any(self._seen.get(sensor) == "on" for sensor in self.answer_sensors))
+
+    def _on_quiet(self, kwargs):
         area = kwargs["area"]
-        if self._ducked.get(area) == kwargs["generation"]:
-            self._release_duck(area)
+        if kwargs["generation"] != self._gen.get(area) or area not in self._ducked:
+            return
+        self._ducked.discard(area)
+        if self._send(area, False):
+            self.log(f"Unducked {self.speakers[area]} ({area})", level="INFO")
+
+    def _send(self, area, duck):
+        host = self.duck_hosts.get(area)
+        if not host:
+            return False
+        try:
+            sonos_duck(host, duck)
+        except Exception as error:
+            self.log(f"Sonos {'duck' if duck else 'unduck'} of {self.speakers[area]} failed "
+                     f"({area}): {type(error).__name__}: {error}", level="WARNING")
+            return False
+        return True
 
     def _on_intent(self, event_name, data, kwargs):
         area = data.get("area_id")
@@ -299,10 +324,7 @@ class AssistRooms(hass.Hass):
                 service = action["service"]
                 self.call_service(service, **data)
                 speaker = data["entity_id"]
-                if service == "media_player/volume_mute":
-                    verb = "Muted" if data["is_volume_muted"] else "Unmuted"
-                    message = f"{verb} {speaker}"
-                elif service == "media_player/play_media":
+                if service == "media_player/play_media":
                     message = f"Started radio on {speaker}"
                 elif service == "media_player/media_play":
                     message = f"Resumed {speaker}"

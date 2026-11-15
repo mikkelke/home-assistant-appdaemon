@@ -1,13 +1,15 @@
-"""AssistRooms: room voice ducking and music intents without changing volume levels."""
+"""AssistRooms: the Sonos duck while a satellite is busy, and room music intents."""
 
 from __future__ import annotations
 
 import copy
+import json
+import ssl
 import sys
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -27,14 +29,16 @@ import assist_rooms as ar  # noqa: E402
 BATHROOM = "media_player.bathroom"
 BEDROOM = "media_player.bedroom"
 SATELLITE = "assist_satellite.bathroom_bathroom_display_assist_satellite"
+HALLWAY = "assist_satellite.hallway"
 ANSWER = "binary_sensor.bathroom_bathroom_display_answer_playing"
 MASTER = "input_select.sonos_master_speaker"
 RADIO = "dr_podcasts://radio/p3"
+HOST = "192.0.2.10"
+BEDROOM_HOST = "10.21.0.160"
 
 
-def state(value="playing", muted=False, grouped=False):
+def state(value="playing", grouped=False):
     return {"state": value, "attributes": {
-        "is_volume_muted": muted,
         "group_members": [BATHROOM, BEDROOM] if grouped else [BATHROOM],
     }}
 
@@ -47,39 +51,16 @@ def radio_action():
     return service("play_media", media_content_id=RADIO, media_content_type="music")
 
 
-class DuckDecisions(unittest.TestCase):
-    def test_mute_only_playing_unmuted_speaker(self):
-        self.assertEqual(ar.duck_actions(BATHROOM, state(), True, False),
-                         [service("volume_mute", is_volume_muted=True)])
-        for value in ("paused", "idle", "off", "unavailable", "unknown", None):
-            with self.subTest(value=value):
-                self.assertEqual(ar.duck_actions(BATHROOM, state(value), True, False), [])
-        self.assertEqual(ar.duck_actions(BATHROOM, state(muted=True), True, False), [])
-        self.assertEqual(ar.duck_actions(BATHROOM, state(), True, True), [])
-
-    def test_release_only_owned_mute_regardless_playback(self):
-        for value in ("playing", "paused", "idle"):
-            with self.subTest(value=value):
-                self.assertEqual(ar.duck_actions(BATHROOM, state(value, muted=True), False, True),
-                                 [service("volume_mute", is_volume_muted=False)])
-        self.assertEqual(ar.duck_actions(BATHROOM, state(muted=True), False, False), [])
-        self.assertEqual(ar.duck_actions(BATHROOM, state(), False, True), [])
-
-    def test_decisions_do_not_mutate_state(self):
-        full = state(muted=True, grouped=True)
-        before = copy.deepcopy(full)
-        ar.duck_actions(BATHROOM, full, False, True)
-        ar.intent_actions("assist_radio", BATHROOM, full, BEDROOM, state(), RADIO)
-        self.assertEqual(full, before)
-
-    def test_no_speaker_has_no_duck_actions(self):
-        self.assertEqual(ar.duck_actions(None, state(), True, False), [])
-
-
 class IntentDecisions(unittest.TestCase):
     def decide(self, event, full=None, master=BEDROOM, master_state=None):
         return ar.intent_actions(event, BATHROOM, full or state(), master,
                                  master_state or state("idle"), RADIO)
+
+    def test_decisions_do_not_mutate_state(self):
+        full = state(grouped=True)
+        before = copy.deepcopy(full)
+        ar.intent_actions("assist_radio", BATHROOM, full, BEDROOM, state(), RADIO)
+        self.assertEqual(full, before)
 
     def test_music_here_joins_playing_master_before_resuming_room(self):
         self.assertEqual(self.decide("assist_music_here", state("paused"), master_state=state()), [{
@@ -124,17 +105,19 @@ class IntentDecisions(unittest.TestCase):
             self.assertEqual(ar.intent_actions(event, None, state(), BEDROOM, state(), RADIO), [])
 
 
-def make_app():
+def make_app(duck_hosts=None, states=None):
     app = ar.AssistRooms.__new__(ar.AssistRooms)
     app.args = {
-        "satellites": {SATELLITE: "bathroom", "assist_satellite.hallway": "hallway"},
+        "satellites": {SATELLITE: "bathroom", HALLWAY: "hallway"},
         "speakers": {"bathroom": BATHROOM, "bedroom": BEDROOM},
-        "master_select": MASTER, "radio": RADIO, "duck_failsafe_s": 20,
+        "master_select": MASTER, "radio": RADIO,
         "answer_sensors": [ANSWER],
+        "duck_hosts": {"bathroom": HOST} if duck_hosts is None else duck_hosts,
     }
-    app.states = {BATHROOM: state(), BEDROOM: state(), MASTER: {
-        "state": "Bedroom", "attributes": {"master_entity_id": BEDROOM},
-    }}
+    app.states = {BATHROOM: state(), BEDROOM: state(),
+                  SATELLITE: {"state": "idle"}, ANSWER: {"state": "off"},
+                  MASTER: {"state": "Bedroom", "attributes": {"master_entity_id": BEDROOM}}}
+    app.states.update(states or {})
 
     def get_state(entity, attribute=None):
         full = app.states.get(entity, {})
@@ -155,108 +138,50 @@ def make_app():
     return app
 
 
-def satellite(app, old, new):
-    app._on_satellite_state(SATELLITE, "state", old, new, {})
+def feed(app, entity, new):
+    old = app.states.get(entity, {}).get("state")
+    app.states[entity] = {"state": new}
+    app._on_state(entity, "state", old, new, {})
 
 
-class AssistRoomsGlue(unittest.TestCase):
-    def test_registers_all_satellites_and_intents(self):
+def satellite(app, *states):
+    for new in states:
+        feed(app, SATELLITE, new)
+
+
+def answer(app, new):
+    feed(app, ANSWER, new)
+
+
+def fire(timer):
+    timer.args[0](timer.kwargs)
+
+
+def logged(app, prefix, level="INFO"):
+    return [call.args[0] for call in app.log.call_args_list
+            if call.kwargs.get("level") == level and call.args[0].startswith(prefix)]
+
+
+class AppTest(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(ar, "sonos_duck")
+        self.duck = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def ducks(self):
+        return [call.args for call in self.duck.call_args_list]
+
+
+class AssistRoomsGlue(AppTest):
+    def test_registers_all_satellites_answer_sensors_and_intents(self):
         app = make_app()
-        for entity in app.args["satellites"]:
-            self.assertTrue(any(call.args[1] == entity for call in app.listen_state.call_args_list))
+        for entity in [*app.args["satellites"], *app.args["answer_sensors"]]:
+            self.assertTrue(any(call.args[0] == app._on_state and call.args[1] == entity
+                                for call in app.listen_state.call_args_list))
+        self.assertEqual(len(app.listen_state.call_args_list), 3)
         self.assertEqual({call.args[1] for call in app.listen_event.call_args_list},
                          {"assist_music_here", "assist_music_leave", "assist_radio",
                           "assist_music_group"})
-
-    def test_listening_exit_releases_owned_mute_even_after_pause(self):
-        for new in ("responding", "idle", "unavailable", None):
-            with self.subTest(new=new):
-                app = make_app()
-                satellite(app, "idle", "listening")
-                app.call_service.assert_called_once_with(
-                    "media_player/volume_mute", entity_id=BATHROOM, is_volume_muted=True)
-                app.states[BATHROOM] = state("paused", muted=True)
-                satellite(app, "listening", new)
-                self.assertEqual(app.call_service.call_count, 2)
-                app.call_service.assert_called_with(
-                    "media_player/volume_mute", entity_id=BATHROOM, is_volume_muted=False)
-                self.assertFalse(app._ducked)
-
-    def test_already_muted_is_never_owned_or_released(self):
-        app = make_app()
-        app.states[BATHROOM] = state(muted=True)
-        satellite(app, "idle", "listening")
-        satellite(app, "listening", "responding")
-        app.call_service.assert_not_called()
-        app.run_in.assert_not_called()
-        self.assertFalse(app._ducked)
-
-    def test_failsafe_releases_once_and_clears_ownership(self):
-        app = make_app()
-        satellite(app, "idle", "listening")
-        timer = app.run_in.call_args
-        self.assertEqual(timer.args[1], 20)
-        app.states[BATHROOM] = state(muted=True)
-        timer.args[0](timer.kwargs)
-        timer.args[0](timer.kwargs)
-        satellite(app, "listening", "responding")
-        self.assertEqual(app.call_service.call_count, 2)
-        self.assertFalse(app._ducked)
-
-    def test_external_unmute_prevents_release_and_clears_ownership(self):
-        app = make_app()
-        satellite(app, "idle", "listening")
-        satellite(app, "listening", "responding")
-        self.assertEqual(app.call_service.call_count, 1)
-        self.assertFalse(app._ducked)
-
-    def test_failsafe_after_external_unmute_clears_ownership(self):
-        app = make_app()
-        satellite(app, "idle", "listening")
-        timer = app.run_in.call_args
-        timer.args[0](timer.kwargs)
-        self.assertEqual(app.call_service.call_count, 1)
-        self.assertFalse(app._ducked)
-
-    def test_responding_to_idle_has_no_duck_actions(self):
-        app = make_app()
-        satellite(app, "responding", "idle")
-        app.call_service.assert_not_called()
-        app.run_in.assert_not_called()
-
-    def test_old_failsafe_cannot_release_new_listening_cycle(self):
-        app = make_app()
-        satellite(app, "idle", "listening")
-        old_timer = app.run_in.call_args
-        app.states[BATHROOM] = state(muted=True)
-        satellite(app, "listening", "responding")
-        app.states[BATHROOM] = state()
-        satellite(app, "responding", "listening")
-        app.states[BATHROOM] = state(muted=True)
-        old_timer.args[0](old_timer.kwargs)
-        self.assertEqual(app.call_service.call_count, 3)
-        self.assertTrue(app._ducked)
-
-    def test_wake_while_answer_plays_never_mutes(self):
-        app = make_app()
-        app.states[ANSWER] = {"state": "on"}
-        satellite(app, "responding", "listening")
-        app.call_service.assert_not_called()
-        app.run_in.assert_not_called()
-        self.assertFalse(app._ducked)
-
-    def test_follow_up_after_answer_mutes(self):
-        app = make_app()
-        app.states[ANSWER] = {"state": "off"}
-        satellite(app, "responding", "listening")
-        app.call_service.assert_called_once_with(
-            "media_player/volume_mute", entity_id=BATHROOM, is_volume_muted=True)
-
-    def test_satellite_without_speaker_does_nothing(self):
-        app = make_app()
-        app._on_satellite_state("assist_satellite.hallway", "state", "idle", "listening", {})
-        app.call_service.assert_not_called()
-        app.run_in.assert_not_called()
 
     def test_unknown_or_missing_area_warns_without_actions(self):
         for data in ({}, {"area_id": "unknown"}, {"area_id": "hallway"}):
@@ -290,6 +215,250 @@ class AssistRoomsGlue(unittest.TestCase):
         app.call_service.assert_called_once_with(
             "media_player/play_media", entity_id=BATHROOM,
             media_content_id=RADIO, media_content_type="music")
+
+
+class DuckGlue(AppTest):
+    def test_wake_while_playing_ducks_once_and_never_touches_volume(self):
+        app = make_app()
+        satellite(app, "listening")
+        self.duck.assert_called_once_with(HOST, True)
+        app.call_service.assert_not_called()
+        self.assertEqual(logged(app, "Ducked"), [f"Ducked {BATHROOM} for assist (bathroom)"])
+        self.assertEqual(app._ducked, {"bathroom"})
+
+    def test_replayed_conversation_ducks_each_busy_edge_and_lifts_once_after_the_last(self):
+        app = make_app()
+        steps = [(SATELLITE, "listening", 1), (SATELLITE, "processing", 2),
+                 (SATELLITE, "responding", 2), (ANSWER, "on", 3), (ANSWER, "off", 3),
+                 (SATELLITE, "idle", 3), (SATELLITE, "listening", 4),
+                 (SATELLITE, "processing", 5), (SATELLITE, "idle", 5)]
+        for entity, new, ducks in steps:
+            feed(app, entity, new)
+            self.assertEqual(self.duck.call_count, ducks, (entity, new))
+        self.assertEqual(set(self.ducks()), {(HOST, True)})
+        self.assertEqual(logged(app, "Ducked"), [f"Ducked {BATHROOM} for assist (bathroom)"])
+        timers = app.run_in.call_args_list
+        self.assertEqual([timer.args[1] for timer in timers], [ar.QUIET_S] * 4)
+
+        for timer in timers[:3]:
+            fire(timer)
+        self.assertEqual(self.duck.call_count, 5)
+        self.assertEqual(app._ducked, {"bathroom"})
+        self.assertEqual(logged(app, "Unducked"), [])
+
+        fire(timers[3])
+        self.assertEqual(self.ducks()[5:], [(HOST, False)])
+        self.assertFalse(app._ducked)
+        for timer in timers:
+            fire(timer)
+        self.assertEqual(self.ducks()[5:], [(HOST, False)])
+        self.assertEqual(logged(app, "Unducked"), [f"Unducked {BATHROOM} (bathroom)"])
+        self.assertEqual(logged(app, "Ducked"), [f"Ducked {BATHROOM} for assist (bathroom)"])
+
+    def test_processing_to_idle_ends_the_conversation(self):
+        app = make_app()
+        satellite(app, "listening", "processing", "idle")
+        self.assertEqual(self.duck.call_count, 2)
+        fire(app.run_in.call_args)
+        self.assertEqual(self.ducks(), [(HOST, True), (HOST, True), (HOST, False)])
+        self.assertFalse(app._ducked)
+
+    def test_responding_without_an_answer_ends_the_conversation(self):
+        app = make_app()
+        satellite(app, "listening", "processing", "responding")
+        self.assertEqual(self.duck.call_count, 2)
+        fire(app.run_in.call_args)
+        self.assertEqual(self.ducks(), [(HOST, True), (HOST, True), (HOST, False)])
+        self.assertFalse(app._ducked)
+
+    def test_satellite_going_away_ends_the_conversation(self):
+        for new in ("unavailable", "unknown", None):
+            with self.subTest(new=new):
+                self.duck.reset_mock()
+                app = make_app()
+                satellite(app, "listening", new)
+                fire(app.run_in.call_args)
+                self.assertEqual(self.ducks(), [(HOST, True), (HOST, False)])
+                self.assertFalse(app._ducked)
+
+    def test_follow_up_inside_the_quiet_time_keeps_the_duck(self):
+        app = make_app()
+        satellite(app, "listening", "responding", "idle", "listening")
+        for timer in app.run_in.call_args_list:
+            fire(timer)
+        self.assertEqual(self.ducks(), [(HOST, True), (HOST, True)])
+        self.assertEqual(app._ducked, {"bathroom"})
+
+    def test_room_that_is_not_playing_gets_no_duck_timer_or_unduck(self):
+        for value in ("paused", "idle", "off", "unavailable", "unknown", None):
+            with self.subTest(value=value):
+                self.duck.reset_mock()
+                app = make_app()
+                app.states[BATHROOM] = state(value)
+                satellite(app, "listening", "processing", "responding", "idle")
+                answer(app, "on")
+                answer(app, "off")
+                self.duck.assert_not_called()
+                app.run_in.assert_not_called()
+                app.call_service.assert_not_called()
+                app.log.assert_not_called()
+                self.assertFalse(app._ducked)
+
+    def test_music_started_mid_conversation_is_ducked_at_the_next_busy_edge(self):
+        app = make_app()
+        app.states[BATHROOM] = state("idle")
+        satellite(app, "listening")
+        self.duck.assert_not_called()
+        app.states[BATHROOM] = state("playing")
+        satellite(app, "processing")
+        self.assertEqual(self.ducks(), [(HOST, True)])
+        self.assertEqual(logged(app, "Ducked"), [f"Ducked {BATHROOM} for assist (bathroom)"])
+        satellite(app, "idle")
+        fire(app.run_in.call_args)
+        self.assertEqual(self.ducks(), [(HOST, True), (HOST, False)])
+
+    def test_failed_duck_warns_once_and_owns_nothing(self):
+        app = make_app()
+        self.duck.side_effect = OSError("unreachable")
+        satellite(app, "listening")
+        self.assertEqual(app.log.call_count, 1)
+        warning = logged(app, "Sonos duck", level="WARNING")
+        self.assertEqual(len(warning), 1)
+        self.assertIn("OSError: unreachable", warning[0])
+        self.assertFalse(app._ducked)
+        satellite(app, "idle")
+        app.run_in.assert_not_called()
+        self.duck.assert_called_once_with(HOST, True)
+
+    def test_failed_duck_is_tried_again_at_the_next_busy_edge(self):
+        app = make_app()
+        self.duck.side_effect = [OSError("unreachable"), None]
+        satellite(app, "listening", "processing")
+        self.assertEqual(self.ducks(), [(HOST, True), (HOST, True)])
+        self.assertEqual(app._ducked, {"bathroom"})
+        self.assertEqual(logged(app, "Ducked"), [f"Ducked {BATHROOM} for assist (bathroom)"])
+
+    def test_failed_unduck_warns_and_forgets_the_duck(self):
+        app = make_app()
+        satellite(app, "listening", "idle")
+        timer = app.run_in.call_args
+        self.duck.side_effect = OSError("unreachable")
+        fire(timer)
+        self.assertEqual(len(logged(app, "Sonos unduck", level="WARNING")), 1)
+        self.assertEqual(logged(app, "Unducked"), [])
+        self.assertFalse(app._ducked)
+        fire(timer)
+        self.assertEqual(self.ducks(), [(HOST, True), (HOST, False)])
+
+    def test_room_without_a_host_does_nothing(self):
+        app = make_app(duck_hosts={})
+        satellite(app, "listening", "processing", "idle")
+        answer(app, "on")
+        answer(app, "off")
+        self.duck.assert_not_called()
+        app.run_in.assert_not_called()
+        app.call_service.assert_not_called()
+        app.log.assert_not_called()
+        self.assertFalse(app._ducked)
+
+    def test_satellite_without_a_speaker_does_nothing(self):
+        app = make_app()
+        feed(app, HALLWAY, "listening")
+        feed(app, HALLWAY, "idle")
+        self.duck.assert_not_called()
+        app.run_in.assert_not_called()
+        app.call_service.assert_not_called()
+
+    def test_answer_sensor_alone_renews_the_duck(self):
+        app = make_app()
+        satellite(app, "listening", "responding")
+        stale = app.run_in.call_args
+        answer(app, "on")
+        self.assertEqual(self.ducks(), [(HOST, True), (HOST, True)])
+        self.assertEqual(logged(app, "Ducked"), [f"Ducked {BATHROOM} for assist (bathroom)"])
+        answer(app, "off")
+        fire(stale)
+        self.assertEqual(self.duck.call_count, 2)
+        fire(app.run_in.call_args)
+        self.assertEqual(self.ducks()[-1], (HOST, False))
+        self.assertFalse(app._ducked)
+
+    def test_answer_sensor_alone_ducks_a_playing_room(self):
+        app = make_app()
+        answer(app, "on")
+        self.duck.assert_called_once_with(HOST, True)
+        answer(app, "off")
+        fire(app.run_in.call_args)
+        self.assertEqual(self.ducks(), [(HOST, True), (HOST, False)])
+
+    def test_satellite_ducks_only_its_own_room(self):
+        app = make_app(duck_hosts={"bathroom": HOST, "bedroom": BEDROOM_HOST})
+        satellite(app, "listening")
+        self.duck.assert_called_once_with(HOST, True)
+        self.assertEqual(app._ducked, {"bathroom"})
+        answer(app, "on")
+        self.assertEqual(self.ducks()[1:], [(HOST, True), (BEDROOM_HOST, True)])
+        satellite(app, "processing")
+        self.assertEqual(self.ducks()[3:], [(HOST, True)])
+
+    def test_answer_sensor_names_no_room_so_it_holds_every_duck_room(self):
+        app = make_app(duck_hosts={"bathroom": HOST, "bedroom": BEDROOM_HOST})
+        answer(app, "on")
+        self.assertEqual(self.ducks(), [(HOST, True), (BEDROOM_HOST, True)])
+        self.assertEqual(app._ducked, {"bathroom", "bedroom"})
+        answer(app, "off")
+        for timer in app.run_in.call_args_list:
+            fire(timer)
+        self.assertEqual(self.ducks()[2:], [(HOST, False), (BEDROOM_HOST, False)])
+        self.assertFalse(app._ducked)
+
+    def test_unchanged_state_is_ignored(self):
+        app = make_app()
+        app._on_state(SATELLITE, "state", "listening", "listening", {})
+        self.duck.assert_not_called()
+        self.assertEqual(app._seen[SATELLITE], "idle")
+
+    def test_callback_values_win_over_a_stale_state_store(self):
+        app = make_app()
+        app._on_state(ANSWER, "state", "off", "on", {})
+        self.duck.assert_called_once_with(HOST, True)
+        app.states[ANSWER] = {"state": "on"}
+        app._on_state(ANSWER, "state", "on", "off", {})
+        self.assertEqual(len(app.run_in.call_args_list), 1)
+
+    def test_answer_playing_at_startup_counts(self):
+        app = make_app(states={ANSWER: {"state": "on"}})
+        satellite(app, "responding")
+        self.duck.assert_called_once_with(HOST, True)
+
+
+class SonosDuckRequest(unittest.TestCase):
+    def send(self, duck):
+        with patch.object(ar.urllib.request, "urlopen") as urlopen:
+            ar.sonos_duck(HOST, duck)
+        urlopen.assert_called_once()
+        return urlopen
+
+    def check(self, urlopen, action, body):
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url,
+                         f"https://{HOST}:1443/api/v1/players/local/playerVolume/{action}")
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(json.loads(request.data), body)
+        headers = {name.lower(): value for name, value in request.header_items()}
+        self.assertEqual(headers["x-sonos-api-key"], "123e4567-e89b-12d3-a456-426655440000")
+        self.assertEqual(headers["content-type"], "application/json")
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 2)
+        context = urlopen.call_args.kwargs["context"]
+        self.assertEqual(context.verify_mode, ssl.CERT_NONE)
+        self.assertFalse(context.check_hostname)
+        urlopen.return_value.__exit__.assert_called_once()
+
+    def test_duck_asks_for_a_timed_duck(self):
+        self.check(self.send(True), "duck", {"durationMillis": 60000})
+
+    def test_unduck_sends_an_empty_body(self):
+        self.check(self.send(False), "unduck", {})
 
 
 if __name__ == "__main__":
