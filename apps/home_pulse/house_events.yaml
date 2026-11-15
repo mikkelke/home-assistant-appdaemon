@@ -16,5 +16,4 @@ HouseEvents:
     lock.yale_bt: Front door
   lock_attribution:
     lock.yale_bt: lock.yale
-  lock_doors:
-    lock.yale_bt: binary_sensor.apartment_door_open
+  lock_door: binary_sensor.apartment_door_open

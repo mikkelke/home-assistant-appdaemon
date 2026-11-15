@@ -392,8 +392,8 @@ class DoorOpenedFromInsideTests(unittest.TestCase):
         feed = house_events.HouseEvents()
         feed.locks = {"lock.yale_bt": "Front door"}
         feed.lock_attribution = {"lock.yale_bt": "lock.yale"}
-        feed.lock_doors = {"lock.yale_bt": "binary_sensor.apartment_door_open"}
-        feed._door_opened_at = {}
+        feed.lock_door = "binary_sensor.apartment_door_open"
+        feed._door_opened_at = None
         feed.lock_report_delay_s = 20
         feed.lock_attribution_fresh_s = 180
         feed.events = []

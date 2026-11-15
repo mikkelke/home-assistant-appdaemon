@@ -16,7 +16,7 @@ things you can see/hear yourself has no value):
    from inside". The authoritative BLE lock entity carries no attribution, so the
    entry is emitted after a short delay and enriched from the cloud twin's
    `changed_by` if that attribute is fresh by then - see `lock_event` and the
-   `locks`/`lock_attribution`/`lock_doors` app config.
+   `locks`/`lock_attribution`/`lock_door` app config.
 
 Feed shape (attributes, replace=True on every publish):
     events: newest-first list of {"ts": <UTC ISO>, "icon": <mdi:...>, "text": <ascii>,
@@ -309,13 +309,13 @@ class HouseEvents(hass.Hass):
         # operation and must not be pinned on this one.
         self.lock_report_delay_s = int(self.args.get("lock_report_delay_s", 20))
         self.lock_attribution_fresh_s = int(self.args.get("lock_attribution_fresh_s", 180))
-        # The door contact beside each lock: a thumb-turn only counts once the door opened.
-        self.lock_doors = self.args.get("lock_doors", {})
-        self._door_opened_at = {}
+        # The contact of the door the locks sit on: a thumb-turn only counts once it opened.
+        self.lock_door = self.args.get("lock_door")
+        self._door_opened_at = None
         for entity in self.locks:
             self.listen_state(self._on_lock, entity)
-        for door in set(self.lock_doors.values()):
-            self.listen_state(self._on_door_open, door, new="on")
+        if self.lock_door:
+            self.listen_state(self._on_door_open, self.lock_door, new="on")
 
         # Automation apps explain themselves through this event - see module docstring.
         self.listen_event(self._on_report, "house_events_report")
@@ -364,18 +364,18 @@ class HouseEvents(hass.Hass):
         )
 
     def _on_door_open(self, entity, attribute, old, new, kwargs):
-        self._door_opened_at[entity] = self.get_now().timestamp()
+        self._door_opened_at = self.get_now().timestamp()
 
-    def _door_opened_since(self, lock_entity, since_ts):
-        """True when the lock's door contact opened from DOOR_BEFORE_LOCK_S before since_ts on."""
-        opened = self._door_opened_at.get(self.lock_doors.get(lock_entity))
+    def _door_opened_since(self, since_ts):
+        """True when the door contact opened from DOOR_BEFORE_LOCK_S before since_ts on."""
+        opened = self._door_opened_at
         return opened is not None and opened >= since_ts - DOOR_BEFORE_LOCK_S
 
     def _emit_lock_event(self, kwargs):
         entity = kwargs["lock_entity"]
         name = self.locks.get(entity, entity)
         changed_by = self._fresh_changed_by(self.lock_attribution.get(entity))
-        door_opened = self._door_opened_since(entity, kwargs["changed_at"])
+        door_opened = self._door_opened_since(kwargs["changed_at"])
         result = lock_event(name, kwargs["old"], kwargs["new"], changed_by, door_opened)
         if result:
             icon, text, by = result
