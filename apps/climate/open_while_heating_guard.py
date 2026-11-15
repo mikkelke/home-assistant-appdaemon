@@ -15,7 +15,7 @@ room; a room without a zone sensor uses its thermostat's setpoint.
 An episode ends only when all watched contacts in the room are closed. If heating is
 enabled after the allowance has elapsed, warn immediately while the opening is still
 open. Recipients come from the room's notify list; unmapped phones are skipped by
-MobileNotifier. The too-cold half of the problem remains climate_alarm's job.
+MobileNotifier. A room that stays cold is HeatingController's cold alert.
 
 Interior room doors are deliberately not watched - heat moving between rooms is not
 waste. The living-room window and terrace door share one open episode.
