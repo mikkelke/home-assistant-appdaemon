@@ -1,0 +1,18 @@
+# AssistBrief - runs the Assist house tool scripts and publishes their responses as one sensor,
+# which the conversation agent's prompt template reads, so common questions need no tool round.
+# See assist_brief.py.
+AssistBrief:
+  module: assist_brief
+  class: AssistBrief
+  log: sonos_log
+
+  sensor: sensor.assist_house_brief
+  # Refreshed when a satellite starts listening, and every refresh_every_s.
+  satellites:
+    - assist_satellite.bathroom_bathroom_display_assist_satellite
+  refresh_every_s: 300
+  scripts:
+    - who_is_home
+    - house_status
+    - house_upcoming
+    - deliveries
