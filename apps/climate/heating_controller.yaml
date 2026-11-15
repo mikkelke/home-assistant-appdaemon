@@ -2,8 +2,9 @@
 # HeatingController - per-zone live control and shadow planning for the floor-heating zones.
 # Only live_zones are written, while live_switch_entity is on. See heating_controller.py,
 # heating_plan.py, heating_signals.py, heating_alerts.py and heating_season.py. Targets are
-# seated-air temperatures (what sensor.<room>_feel shows); the thermostat hangs higher and
-# reads warmer, which `trim` learns. Limits are the setpoint bounds of the zone's thermostat.
+# seated-air temperatures (what sensor.<room>_feel shows). The controller starts and stops every
+# heat call itself from that air and uses the thermostats as relays. lower_limit_c is the lowest
+# air a zone aims for, upper_limit_c the highest setpoint written to its thermostat.
 # No `log:` key: it logs to the main log.
 
 HeatingController:
@@ -27,8 +28,9 @@ HeatingController:
   state_file: /conf/apps/climate/heating_controller_state.json
   log_dir: /conf/heating_log
   # A change of setpoint needs a free token (refilled continuously) and either a priority
-  # event or a value that has stayed the same for write_stable_minutes.
-  writes_per_hour: 2
+  # event (a call starting or stopping, an opening) or a value that has stayed the same for
+  # write_stable_minutes.
+  writes_per_hour: 4
   write_stable_minutes: 10
   # Fraction of the forecast sun credit the cut decision trusts; 1.0 trusts it fully.
   sun_term_factor: 0.5
@@ -124,12 +126,32 @@ HeatingController:
     airing_bands: [stuffy, poor]
     airing_repeat_minutes: 45
 
+  # A zone calls for heat when its control air is more than hysteresis_c under the aim, at least
+  # min_off_minutes after its last call and in the first start_window_minutes of a
+  # start_every_minutes slot (so the zones start together). It stops when the air is more than
+  # hysteresis_c over the aim, after min_on_minutes at the earliest, and at once when heat is not
+  # allowed. A call sets the thermostat high_margin_c over the aim, rounded up to 0.5, for the
+  # whole call; otherwise it sits at its minimum. Without room air the aim is written as an
+  # ordinary setpoint.
+  call:
+    hysteresis_c: 0.2
+    min_on_minutes: 20
+    min_off_minutes: 20
+    start_every_minutes: 30
+    start_window_minutes: 6
+    high_margin_c: 2.0
+
+  # After an airing heat stays locked out until the air is back within settle_recovered_c of what
+  # it was before the opening, or until lockout_per_open_hour times the time the zone was open
+  # (zones with residents only; the others use settle_max_minutes) has passed since the close,
+  # at least settle_max_minutes and at most lockout_max_hours.
   window:
     open_debounce_minutes: 2
-    long_open_minutes: 30
     settle_max_minutes: 60
     settle_recovered_c: 0.3
     unavailable_closed_minutes: 10
+    lockout_per_open_hour: 2.0
+    lockout_max_hours: 8
 
   zones:
     family:
@@ -166,14 +188,7 @@ HeatingController:
         lead_hours: 4
         periods:
           - {from: "23:00", to: "10:00", offset: -0.5}
-      trim: {initial: 0.5, min: -0.5, max: 1.5}
       budget: {a: 0.55, b_om: -1.62, c: 1.21, d: -0.04}
-      # ITLC settles below its setpoint in proportion to the heat the room needs. While holding, the
-      # setpoint rises by (u_eq - bias) / gain, at most max_c, with u_eq the day's expected duty
-      # at the lead time. gain and bias are the thermostat's band: duty per K, duty at the setpoint.
-      weather_offset: {gain: 0.85, bias: 0.22, max_c: 1.5}
-      # ITLC keeps calling for heat while the thermostat reads above its setpoint.
-      warm_hold: {enter_c: 1.0, release_c: 0.6}
       sun_cut: {enabled: true, azimuth: [100, 260], ghi_min: 150, before_hours: 2, end_before_hours: 1, credit_ratio: 0.5}
 
     kristines_room:
@@ -188,7 +203,6 @@ HeatingController:
       upper_limit_c: 24.0
       protected_min_offset_c: -0.5
       profile: {lead_hours: 4}
-      trim: {initial: 1.2, min: -1.0, max: 2.0}
       budget: {changepoint: {k: 0.17, base_c: 15.5}}
       residents: [kristine]
       nudge: {min: -1.0, max: 1.0, step: 0.5}
@@ -208,7 +222,6 @@ HeatingController:
       upper_limit_c: 24.0
       protected_min_offset_c: -0.5
       profile: {lead_hours: 6}
-      trim: {initial: 0.0, min: -1.0, max: 1.0}
       budget: {a: 0.50, b_om: -2.74, c: 0, d: 2.32}
       sun_cut: {enabled: true, azimuth: [180, 290], ghi_min: 150, before_hours: 8, end_before_hours: 1, credit_ratio: 0.5}
       residents: [claudia]
@@ -232,7 +245,6 @@ HeatingController:
         outside: lower_limit
         periods:
           - {from: "02:30", to: "09:00", offset: 0}
-      trim: {initial: 0.0, min: -1.0, max: 1.0}
       budget: {a: 0.64, b_om: -2.47, c: 0, d: -1.24}
 
     guest_bathroom:
@@ -244,4 +256,3 @@ HeatingController:
       lower_limit_c: 18.0
       upper_limit_c: 24.0
       profile: {lead_hours: 0}
-      trim: {initial: 0.0, min: -1.0, max: 1.0}

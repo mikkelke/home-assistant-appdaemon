@@ -6,8 +6,11 @@ season is enabled, and actual heat ran within heating_lookback_hours. The timer 
 the open episode, not current heat demand: ordinary floor-heating cycles must never
 restart the airing allowance. A confirmed off-to-on heat call while an opening is
 already open warns immediately instead of waiting for the allowance.
-Warm rooms delay the allowance until air reaches setpoint + warm_margin_c; once
-started it keeps running. Heat-start warnings are suppressed while air is warm.
+Warm rooms delay the allowance until air reaches the room's aim + warm_margin_c; once
+started it keeps running. Heat-start warnings are suppressed while air is warm. The aim is
+the setpoint_now of the room's heating zone sensor (`aim`), because the thermostat of a
+controller zone sits at its minimum or at a call's high setpoint and says nothing about the
+room; a room without a zone sensor uses its thermostat's setpoint.
 
 An episode ends only when all watched contacts in the room are closed. If heating is
 enabled after the allowance has elapsed, warn immediately while the opening is still
@@ -42,7 +45,9 @@ class OpenWhileHeatingGuard(hass.Hass):
             for signal in (cfg.get("thermostat"), cfg.get("heating"), cfg.get("air")):
                 if signal:
                     self.listen_state(self._on_change, signal, room=room)
-            if cfg.get("thermostat"):
+            if cfg.get("aim"):
+                self.listen_state(self._on_change, cfg["aim"], attribute="setpoint_now", room=room)
+            elif cfg.get("thermostat"):
                 self.listen_state(self._on_change, cfg["thermostat"], attribute="temperature", room=room)
         if self.season_entity:
             self.listen_state(self._on_change, self.season_entity)
@@ -126,13 +131,21 @@ class OpenWhileHeatingGuard(hass.Hass):
         cfg = self.rooms.get(room) or {}
         return [c for c in cfg.get("contacts", []) if self.get_state(c) == "on"]
 
+    def _setpoint(self, room):
+        cfg = self.rooms[room]
+        if cfg.get("aim"):
+            return self.get_state(cfg["aim"], attribute="setpoint_now")
+        if cfg.get("thermostat"):
+            return self.get_state(cfg["thermostat"], attribute="temperature")
+        return None
+
     def _too_warm(self, room):
         cfg = self.rooms[room]
-        if not cfg.get("air") or not cfg.get("thermostat"):
+        if not cfg.get("air") or not (cfg.get("aim") or cfg.get("thermostat")):
             return None
         try:
             air = float(self.get_state(cfg["air"]))
-            target = float(self.get_state(cfg["thermostat"], attribute="temperature"))
+            target = float(self._setpoint(room))
             if isfinite(air) and isfinite(target):
                 return air > target + self.warm_margin_c
         except (TypeError, ValueError):

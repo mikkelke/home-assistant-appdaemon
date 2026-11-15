@@ -2,31 +2,36 @@
 Planning logic for the floor-heating controller. Pure functions and small state machines, no
 AppDaemon import and no I/O, so every rule can be unit-tested on its own.
 
-The thermostats keep running their own ITLC floor-heating algorithm. This module decides what
-setpoint the controller would hand them, in two layers:
+The controller decides every heat call itself, from the zone's seated control air, and uses the
+thermostats as relays. This module holds the three layers:
 
-  - HOLD: the setpoint follows the comfort profile, shifted EARLIER by the slab lag (the floor
-    answers hours late), plus `trim`, the learned offset between the thermostat's own reading
-    and the seated-air reading the targets are defined in, plus the weather offset where a zone
-    has one: the raise the thermostat's proportional band needs to call the day's expected duty.
-  - COAST: the setpoint drops to a protected minimum (sun cut) or to the zone's lower limit
-    (open window, party, bedroom loop, warm hold). The warm hold latches on the thermostat's own
-    reading, because ITLC keeps calling for heat above its setpoint: once the reading is
-    enter_c or more above the setpoint HOLD would hand it, the zone coasts at its lower limit
-    until the reading is back within release_c of that setpoint.
+  - PLAN: whether heat is allowed, and the air temperature to aim for. The aim follows the
+    comfort profile, shifted EARLIER by the slab lag (the floor answers hours late); a sun cut
+    or the bedroom loop lowers it. An open window, the lockout after an airing, a party and the
+    floor cap each make heat not allowed.
+  - CALL: decide_call starts and stops the zone's call from the control air against the aim,
+    with a hysteresis, a minimum on and off time, and starts batched into the first minutes of
+    each half hour so the zones call together.
+  - DRIVE: what the thermostat is set to. Not calling it sits at the device minimum; a call
+    sets it to a high setpoint, fixed for the whole call, so the unit heats until the call ends;
+    with no room air to go by the aim itself goes out as an ordinary setpoint and the unit
+    regulates itself.
 
 Terms used throughout:
-  - lower limit / upper limit: the setpoint bounds of a zone, in the thermostat's own scale.
+  - lower limit: the lowest air temperature a zone aims for. upper limit: the highest setpoint
+    the controller writes to its thermostat.
   - target (T*): the comfort target in seated-air terms, base + nudge + profile offset.
-  - aim: the air temperature the setpoint is meant to produce (T* shifted by the lead, or capped).
+  - aim: the air temperature a call heats towards (T* shifted by the lead, or capped).
   - protected minimum: the air temperature a sun cut still defends.
   - control air: the zone's measured seated air, the weighted mean of its room sensors that read.
     In a zone with several, a room whose 3 h mean is far from T* takes over (ComfortSwitch).
 
 Mode precedence, first match wins (see plan()): off_season / device_offline, window, settle,
-party, floor_cap, guard, sun_cut, fallback, warm, hold. The plan is always computed, also when the
-first row gates the zone, so the log shows what would have been planned. `guard` is the bedroom loop
-holding the bathroom back (BedroomLoop). `warm` is the warm hold (WarmHoldConfig).
+party, floor_cap, guard, sun_cut, fallback, hold. Window, settle, party and floor_cap make heat
+not allowed; guard, sun_cut, fallback and hold only set the aim, which is worked out in every
+mode. The plan is always computed, also when the first row gates the zone, so the log shows what
+would have been planned. `settle` is the lockout after an airing (WindowTracker). `guard` is the
+bedroom loop holding the bathroom back (BedroomLoop).
 
 Timestamps are epoch seconds. Local clock times come from the tzinfo passed in.
 """
@@ -49,16 +54,10 @@ MODE_FLOOR_CAP = "floor_cap"
 MODE_GUARD = "guard"
 MODE_SUN_CUT = "sun_cut"
 MODE_FALLBACK = "fallback"
-MODE_WARM = "warm"
 MODE_HOLD = "hold"
 
 SETPOINT_STEP_C = 0.5
-QUANTIZE_HOLD_C = 0.4
-TRIM_HOURS = range(0, 10)
-TRIM_MIN_TICKS_PER_HOUR = 6
-TRIM_MIN_HOURS = 6
-TRIM_GAIN = 0.5
-TRIM_STEP_C = 0.05
+DEVICE_MIN_C = 5.0
 CONTROL_AIR_MAX_AGE_MIN = 180.0
 COMFORT_WINDOW_S = 3 * 3600.0
 COMFORT_SAMPLE_GAP_S = 240.0
@@ -154,13 +153,6 @@ class Profile:
 
 
 @dataclass(frozen=True)
-class TrimConfig:
-    initial: float = 0.0
-    minimum: float = -1.0
-    maximum: float = 1.0
-
-
-@dataclass(frozen=True)
 class BudgetConfig:
     """Expected call-hours per day. Either a linear model on degree-days, sun and wind
     (a, b_om, c, d), or a change-point model (k hours per K below base_c)."""
@@ -202,25 +194,6 @@ class NudgeConfig:
 
 
 @dataclass(frozen=True)
-class WeatherOffsetConfig:
-    enabled: bool = False
-    gain: float = 0.85
-    bias: float = 0.22
-    max_c: float = 1.5
-
-
-@dataclass(frozen=True)
-class WarmHoldConfig:
-    """Whether a zone coasts at its lower limit while its thermostat reads well above the
-    setpoint HOLD would give it. It starts at enter_c above that setpoint and ends once the
-    reading is back within release_c of it."""
-
-    enabled: bool = False
-    enter_c: float = 1.0
-    release_c: float = 0.6
-
-
-@dataclass(frozen=True)
 class ZoneConfig:
     name: str
     thermostat: str
@@ -234,7 +207,6 @@ class ZoneConfig:
     protected_min_c: Optional[float]
     protected_min_offset_c: Optional[float]
     profile: Profile
-    trim: TrimConfig
     budget: Optional[BudgetConfig]
     sun_cut: SunCutConfig
     guard: GuardConfig
@@ -242,19 +214,33 @@ class ZoneConfig:
     nudge: NudgeConfig
     buttons: dict
     evenness_floors: tuple = ()  # (reference, compared): the alert watches compared minus reference
-    weather_offset: WeatherOffsetConfig = WeatherOffsetConfig()
     floor_max_c: Optional[float] = None  # holds against the warmest of the floor_sensors
     control_air_weights: tuple = ()  # one per control_air sensor; empty weighs them equally
-    warm_hold: WarmHoldConfig = WarmHoldConfig()
 
 
 @dataclass(frozen=True)
 class WindowConfig:
     open_debounce_minutes: float = 2.0
-    long_open_minutes: float = 30.0
     settle_max_minutes: float = 60.0
     settle_recovered_c: float = 0.3
     unavailable_closed_minutes: float = 10.0
+    lockout_per_open_hour: float = 2.0
+    lockout_max_hours: float = 8.0
+
+
+@dataclass(frozen=True)
+class CallConfig:
+    """The call rule, see decide_call: how far the air may stray from the aim before a call
+    starts or stops, how long a call and the pause after it last at least, the half-hour grid the
+    starts are batched on and how long into each slot a start is still taken, and how far above
+    the aim the thermostat is set while a zone calls."""
+
+    hysteresis_c: float = 0.2
+    min_on_minutes: float = 20.0
+    min_off_minutes: float = 20.0
+    start_every_minutes: float = 30.0
+    start_window_minutes: float = 6.0
+    high_margin_c: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -351,6 +337,7 @@ class Config:
     bedroom: BedroomConfig
     party: Optional[PartyConfig]
     window: WindowConfig
+    call: CallConfig = field(default_factory=CallConfig)
     zones: dict = field(default_factory=dict)
     owner: str = "mikkel"
     appdaemon_user_id: str = ""
@@ -411,52 +398,6 @@ def _parse_budget(raw) -> Optional[BudgetConfig]:
         c=float(raw.get("c", 0.0)),
         d=float(raw.get("d", 0.0)),
     )
-
-
-def _parse_weather_offset(raw, budget: Optional[BudgetConfig], where: str) -> WeatherOffsetConfig:
-    if not raw:
-        return WeatherOffsetConfig()
-    if not isinstance(raw, dict):
-        raise ConfigError(f"{where}: weather_offset is a mapping of gain, bias and max_c")
-    d = WeatherOffsetConfig()
-    cfg = WeatherOffsetConfig(
-        enabled=True,
-        gain=float(raw.get("gain", d.gain)),
-        bias=float(raw.get("bias", d.bias)),
-        max_c=float(raw.get("max_c", d.max_c)),
-    )
-    if not (cfg.gain > 0 and cfg.max_c >= 0 and 0.0 <= cfg.bias <= 1.0):
-        raise ConfigError(
-            f"{where}: weather_offset gain must be positive, bias between 0 and 1, "
-            "max_c not negative"
-        )
-    if budget is None:
-        raise ConfigError(
-            f"{where}: weather_offset needs a budget, the expected duty comes from it"
-        )
-    return cfg
-
-
-def _parse_warm_hold(raw, where: str) -> WarmHoldConfig:
-    if not raw:
-        return WarmHoldConfig()
-    if not isinstance(raw, dict):
-        raise ConfigError(f"{where}: warm_hold is a mapping of enter_c and release_c")
-    d = WarmHoldConfig()
-    values = []
-    for key, default in (("enter_c", d.enter_c), ("release_c", d.release_c)):
-        value = raw.get(key, default)
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-        ):
-            raise ConfigError(f"{where}: warm_hold {key} must be a finite number")
-        values.append(float(value))
-    enter_c, release_c = values
-    if not 0.0 < release_c < enter_c:
-        raise ConfigError(f"{where}: warm_hold needs 0 < release_c < enter_c")
-    return WarmHoldConfig(enabled=True, enter_c=enter_c, release_c=release_c)
 
 
 def _parse_sun_cut(raw, where: str) -> SunCutConfig:
@@ -557,7 +498,6 @@ def _parse_zone(name: str, raw: dict) -> ZoneConfig:
     control_air = _as_tuple(raw.get("control_air"))
     if not control_air:
         raise ConfigError(f"{where}: control_air needs at least one sensor")
-    trim = raw.get("trim") or {}
     nudge = raw.get("nudge") or {}
     buttons = dict(raw.get("buttons") or {})
     if set(buttons) - {"warmer", "colder"}:
@@ -579,11 +519,6 @@ def _parse_zone(name: str, raw: dict) -> ZoneConfig:
         protected_min_c=None if pm_abs is None else float(pm_abs),
         protected_min_offset_c=None if pm_off is None else float(pm_off),
         profile=_parse_profile(raw.get("profile"), where),
-        trim=TrimConfig(
-            initial=float(trim.get("initial", 0.0)),
-            minimum=float(trim.get("min", -1.0)),
-            maximum=float(trim.get("max", 1.0)),
-        ),
         budget=budget,
         sun_cut=_parse_sun_cut(raw.get("sun_cut"), where),
         guard=_parse_guard(raw.get("bedroom_guard"), where),
@@ -595,13 +530,49 @@ def _parse_zone(name: str, raw: dict) -> ZoneConfig:
         ),
         buttons=buttons,
         evenness_floors=evenness,
-        weather_offset=_parse_weather_offset(raw.get("weather_offset"), budget, where),
         floor_max_c=floor_max,
         control_air_weights=_parse_control_air_weights(
             raw.get("control_air_weights"), control_air, where
         ),
-        warm_hold=_parse_warm_hold(raw.get("warm_hold"), where),
     )
+
+
+def _parse_window(raw: dict) -> WindowConfig:
+    d = WindowConfig()
+    cfg = WindowConfig(
+        open_debounce_minutes=float(raw.get("open_debounce_minutes", d.open_debounce_minutes)),
+        settle_max_minutes=float(raw.get("settle_max_minutes", d.settle_max_minutes)),
+        settle_recovered_c=float(raw.get("settle_recovered_c", d.settle_recovered_c)),
+        unavailable_closed_minutes=float(
+            raw.get("unavailable_closed_minutes", d.unavailable_closed_minutes)
+        ),
+        lockout_per_open_hour=float(raw.get("lockout_per_open_hour", d.lockout_per_open_hour)),
+        lockout_max_hours=float(raw.get("lockout_max_hours", d.lockout_max_hours)),
+    )
+    numbers = [getattr(cfg, name) for name in cfg.__dataclass_fields__]
+    if not all(math.isfinite(v) and v >= 0 for v in numbers):
+        raise ConfigError("window: every setting must be a number, not negative")
+    if cfg.lockout_max_hours * 60.0 < cfg.settle_max_minutes:
+        raise ConfigError("window: lockout_max_hours must not be less than settle_max_minutes")
+    return cfg
+
+
+def _parse_call(raw: dict) -> CallConfig:
+    d = CallConfig()
+    cfg = CallConfig(
+        hysteresis_c=float(raw.get("hysteresis_c", d.hysteresis_c)),
+        min_on_minutes=float(raw.get("min_on_minutes", d.min_on_minutes)),
+        min_off_minutes=float(raw.get("min_off_minutes", d.min_off_minutes)),
+        start_every_minutes=float(raw.get("start_every_minutes", d.start_every_minutes)),
+        start_window_minutes=float(raw.get("start_window_minutes", d.start_window_minutes)),
+        high_margin_c=float(raw.get("high_margin_c", d.high_margin_c)),
+    )
+    numbers = [getattr(cfg, name) for name in cfg.__dataclass_fields__]
+    if not all(math.isfinite(v) and v >= 0 for v in numbers):
+        raise ConfigError("call: every setting must be a number, not negative")
+    if not 0 < cfg.start_window_minutes <= cfg.start_every_minutes:
+        raise ConfigError("call: start_window_minutes must be positive and fit in start_every_minutes")
+    return cfg
 
 
 def _parse_alerts(raw: dict) -> AlertConfig:
@@ -727,20 +698,15 @@ def parse_config(args: dict) -> Config:
         forecast_refresh_minutes=float(forecast.get("refresh_minutes", 60)),
         forecast_stale_hours=float(forecast.get("stale_hours", 12)),
         sun_term_factor=float(args.get("sun_term_factor", 0.5)),
-        writes_per_hour=float(args.get("writes_per_hour", 2)),
+        writes_per_hour=float(args.get("writes_per_hour", 4)),
         write_stable_minutes=float(args.get("write_stable_minutes", 10)),
         keypad_relock_minutes=float(args.get("keypad_relock_minutes", 15)),
         outdoor_entities=_as_tuple(args.get("outdoor_entities")),
         relay_power_entity=args.get("relay_power_entity", ""),
         bedroom=_parse_bedroom(bedroom),
         party=party,
-        window=WindowConfig(
-            open_debounce_minutes=float(window.get("open_debounce_minutes", 2)),
-            long_open_minutes=float(window.get("long_open_minutes", 30)),
-            settle_max_minutes=float(window.get("settle_max_minutes", 60)),
-            settle_recovered_c=float(window.get("settle_recovered_c", 0.3)),
-            unavailable_closed_minutes=float(window.get("unavailable_closed_minutes", 10)),
-        ),
+        window=_parse_window(window),
+        call=_parse_call(args.get("call") or {}),
         zones=zones,
         owner=str(args.get("owner", "mikkel")).lower(),
         appdaemon_user_id=str(args.get("appdaemon_user_id") or ""),
@@ -781,12 +747,14 @@ def protected_min(zc: ZoneConfig, base: float, nudge: float, lower_c: float) -> 
     return max(value, lower_c)
 
 
-def quantize(raw: float, last: Optional[float], step: float = SETPOINT_STEP_C) -> float:
-    """Round to the device step, but keep `last` while the new value is within
-    QUANTIZE_HOLD_C of it, so a value hovering between two steps does not flap."""
-    if last is not None and round(abs(raw - last), 6) < QUANTIZE_HOLD_C:
-        return last
-    return round(math.floor(raw / step + 0.5) * step, 2)
+def round_step(value: float, step: float = SETPOINT_STEP_C) -> float:
+    """The nearest device step, halves rounding up."""
+    return round(math.floor(value / step + 0.5) * step, 2)
+
+
+def ceil_step(value: float, step: float = SETPOINT_STEP_C) -> float:
+    """The device step at or above the value."""
+    return round(math.ceil(round(value / step, 6)) * step, 2)
 
 
 def clamp(value: float, lower: float, upper: float) -> float:
@@ -858,27 +826,6 @@ def day_budget(
     skipped = out.u_eq * cut.before_hours
     ratio = out.s_credit / skipped if skipped > 0 else None
     return replace(out, window_start=w_start, window_end=w_end, skipped_h=skipped, ratio=ratio)
-
-
-def weather_offset(cfg: WeatherOffsetConfig, u_eq: Optional[float]) -> float:
-    """Setpoint raise in K that makes the thermostat's proportional band, duty = gain * error +
-    bias (gain in duty per K), call the expected duty u_eq: (u_eq - bias) / gain, limited to
-    [0, max_c] and rounded to 0.01 K. Zero when disabled or u_eq is unknown."""
-    if not cfg.enabled or u_eq is None:
-        return 0.0
-    return round(clamp((u_eq - cfg.bias) / cfg.gain, 0.0, cfg.max_c), 2)
-
-
-def setpoint_reason(setpoint: float, trim: float, offset: float, u_eq: Optional[float]) -> str:
-    """The thermostat setting and what was added to the aim to get it, in words."""
-    parts = []
-    if round(trim, 1):
-        side = "warmer" if trim > 0 else "colder"
-        parts.append(f"{trim:+.1f} as it reads {side} than the room")
-    if round(offset, 1) and u_eq is not None:
-        parts.append(f"{offset:+.1f} for the cold weather")
-    text = f"Thermostat at {setpoint:.1f} °C"
-    return f"{text}: {', '.join(parts)}" if parts else text
 
 
 @dataclass(frozen=True)
@@ -1272,18 +1219,23 @@ EVENT_RESTORED = "window_restored"
 
 
 class WindowTracker:
-    """Open/closed state of a zone's outward openings.
+    """Open/closed state of a zone's outward openings, and the lockout after an airing.
 
     CLOSED -> OPEN when an opening has read 'on' for open_debounce_minutes. When everything is
-    closed again: after an airing of at most long_open_minutes the zone SETTLEs (stays at its
-    lower limit until the air is back within settle_recovered_c of what it was, or
-    settle_max_minutes), because a short dip recovers from the room's own mass and heating
-    against it would only overshoot hours later. After a longer opening the room has really
-    cooled and the plan is restored at once. An opening unavailable for
+    closed again the zone SETTLEs: heat stays locked out until the air is back within
+    settle_recovered_c of what it was before the opening, or until the deadline, however long
+    the opening was. The deadline is lockout_per_open_hour times the time the zone was open, at
+    least settle_max_minutes and at most lockout_max_hours, counted from the close. A short dip
+    recovers from the room's own mass and heating against it would only overshoot hours later;
+    a long opening has cooled the walls and the slab, and the heat that goes in is lost again
+    for as long as the room is cold. A zone without residents passes lockout_per_open_hour 0 and
+    so settles for settle_max_minutes. A reopening while settling keeps the first opening's
+    time, so the deadline only moves later. An opening unavailable for
     unavailable_closed_minutes counts as closed, so a dead contact cannot pin a room."""
 
-    def __init__(self, cfg: WindowConfig, saved: Optional[dict] = None):
+    def __init__(self, cfg: WindowConfig, saved: Optional[dict] = None, per_open_hour: float = 0.0):
         self.cfg = cfg
+        self.per_open_hour = per_open_hour
         saved = saved or {}
         self.state = saved.get("state", STATE_CLOSED)
         if self.state not in (STATE_CLOSED, STATE_OPEN, STATE_SETTLE):
@@ -1304,6 +1256,18 @@ class WindowTracker:
 
     def open_openings(self) -> list:
         return sorted(self._on_since)
+
+    def deadline(self) -> Optional[float]:
+        """When the lockout ends at the latest, or None unless the zone is settling."""
+        if self.state != STATE_SETTLE or self.settle_since is None:
+            return None
+        opened = self.settle_since if self.opened_at is None else self.opened_at
+        lockout_s = clamp(
+            self.per_open_hour * (self.settle_since - opened),
+            self.cfg.settle_max_minutes * 60.0,
+            self.cfg.lockout_max_hours * 3600.0,
+        )
+        return self.settle_since + lockout_s
 
     def update(self, now_ts: float, openings: dict, air: Optional[float]) -> Optional[str]:
         """Feed the current state of every opening ('on', 'off', 'unavailable', ...). Returns
@@ -1330,19 +1294,17 @@ class WindowTracker:
         if self.state in (STATE_CLOSED, STATE_SETTLE) and confirmed:
             was_closed = self.state == STATE_CLOSED
             self.state = STATE_OPEN
-            self.opened_at = min(confirmed)
+            if was_closed or self.opened_at is None:
+                self.opened_at = min(confirmed)
             if was_closed or self.pre_open_air is None:
                 self.pre_open_air = air
             self.settle_since = None
             return EVENT_OPENED
 
         if self.state == STATE_OPEN and not self._on_since:
-            if now_ts - (self.opened_at or now_ts) <= cfg.long_open_minutes * 60.0:
-                self.state = STATE_SETTLE
-                self.settle_since = now_ts
-                return EVENT_SETTLE
-            self._to_closed()
-            return EVENT_RESTORED
+            self.state = STATE_SETTLE
+            self.settle_since = now_ts
+            return EVENT_SETTLE
 
         if self.state == STATE_SETTLE:
             recovered = (
@@ -1350,8 +1312,8 @@ class WindowTracker:
                 and self.pre_open_air is not None
                 and air >= self.pre_open_air - cfg.settle_recovered_c
             )
-            timed_out = now_ts - (self.settle_since or now_ts) >= cfg.settle_max_minutes * 60.0
-            if recovered or timed_out:
+            deadline = self.deadline()
+            if recovered or (deadline is not None and now_ts >= deadline):
                 self._to_closed()
                 return EVENT_RESTORED
         return None
@@ -1376,28 +1338,12 @@ def evaluate_floor_cap(
     return floor >= maximum - (0.5 if active else 0.0)
 
 
-def evaluate_warm(
-    cfg: WarmHoldConfig, therm: Optional[float], hold_raw: float, active: bool = False
-) -> bool:
-    """The warm-hold latch. `hold_raw` is the unrounded setpoint HOLD would give, aim plus trim
-    plus weather offset, never the setpoint last handed to the thermostat. The latch sets when
-    the thermostat reads at least enter_c above it and clears at release_c above it or below.
-    Without a reading the latch stays as it is."""
-    if not cfg.enabled:
-        return False
-    if therm is None:
-        return active
-    gap = round(therm - hold_raw, 3)
-    return gap > cfg.release_c if active else gap >= cfg.enter_c
-
-
 @dataclass(frozen=True)
 class ZoneInputs:
     season_on: bool
     online: bool
     base: float
     nudge: float
-    trim: float
     lower_c: float
     upper_c: float
     fallback: bool = False
@@ -1405,11 +1351,7 @@ class ZoneInputs:
     party_windows: tuple = ()
     hold_back: bool = False
     cut_windows: tuple = ()
-    last_planned: Optional[float] = None
-    day_duty: tuple = ()
     floor_cap: bool = False
-    therm_temp: Optional[float] = None
-    warm: bool = False
 
 
 @dataclass(frozen=True)
@@ -1417,16 +1359,15 @@ class Plan:
     mode: str  # what the zone is doing, including the season and device gate
     plan_mode: str  # what the plan says, ignoring that gate
     target: float  # T* now
-    aim: Optional[float]  # air temperature the setpoint is meant to produce; None at the limit
-    raw: float
-    setpoint: float
+    allowed: bool  # whether the plan lets the zone call for heat, ignoring that gate
+    aim: float  # air temperature a call heats towards, also while heat is not allowed
     protected_min: float
     reasons: tuple = ()
-    weather_offset: float = 0.0
 
 
 def plan(zc: ZoneConfig, inp: ZoneInputs, now_ts: float, tz) -> Plan:
-    """The setpoint for one zone at `now_ts`, with the mode that decided it."""
+    """Whether heat is allowed for one zone at `now_ts` and the air to aim for, with the mode
+    that decided it. The aim never leaves the zone's limits."""
     lower, upper = inp.lower_c, inp.upper_c
     target = comfort_target(zc, inp.base, inp.nudge, now_ts, tz, lower)
     lead_ts = now_ts + zc.profile.lead_hours * 3600.0
@@ -1441,64 +1382,50 @@ def plan(zc: ZoneConfig, inp: ZoneInputs, now_ts: float, tz) -> Plan:
     guard = zc.guard
     guard_now = guard.enabled and inp.hold_back
 
-    aim: Optional[float]
-    u_eq: Optional[float] = None
-    offset = 0.0
-    reasons: list = []
+    if guard_now:
+        cap = lower if guard.cap == "lower_limit" else pmin
+        aim_mode, raw_aim = MODE_GUARD, min(t_lead, cap)
+        aim_reason = f"The bedroom is too warm for bedtime: aims no higher than {cap:.1f} °C"
+    elif zc.sun_cut.enabled and in_cut and not inp.fallback:
+        aim_mode, raw_aim = MODE_SUN_CUT, min(t_lead, pmin)
+        end = max(e for s, e, _d in inp.cut_windows if s <= now_ts < e)
+        aim_reason = (
+            f"Sun expected until {hhmm(end, tz)}: aims no higher than {pmin:.1f} °C "
+            "and lets the sun warm the room"
+        )
+    elif inp.fallback:
+        aim_mode, raw_aim = MODE_FALLBACK, fallback_aim
+        aim_reason = "No room temperature to go by: holds a fixed target"
+    else:
+        aim_mode, raw_aim = MODE_HOLD, t_lead
+        if abs(t_lead - target) < 0.05:
+            aim_reason = f"Holding {t_lead:.1f} °C"
+        else:
+            aim_reason = (
+                f"Getting ready for {t_lead:.1f} °C in {zc.profile.lead_hours:g} h: the floor is slow"
+            )
+    aim = round(clamp(raw_aim, lower, upper), 2)
+
+    allowed = False
     if inp.window_state == STATE_OPEN:
-        plan_mode, aim = MODE_WINDOW, None
-        reasons.append("A window or door is open: heat held at the minimum")
+        plan_mode = MODE_WINDOW
+        reason = "A window or door is open: heat held at the minimum"
     elif inp.window_state == STATE_SETTLE:
-        plan_mode, aim = MODE_SETTLE, None
-        reasons.append("Just aired: heat held at the minimum until the air has recovered")
+        plan_mode = MODE_SETTLE
+        reason = "Just aired: heat held at the minimum until the air has recovered"
     elif in_party:
-        plan_mode, aim = MODE_PARTY, None
+        plan_mode = MODE_PARTY
         end = max(e for s, e in inp.party_windows if s <= now_ts < e)
-        reasons.append(f"Party until {hhmm(end, tz)}: heat held at the minimum")
+        reason = f"Party until {hhmm(end, tz)}: heat held at the minimum"
     elif inp.floor_cap and zc.floor_max_c is not None:
-        plan_mode, aim = MODE_FLOOR_CAP, None
-        reasons.append(
+        plan_mode = MODE_FLOOR_CAP
+        reason = (
             f"The floor reached its {zc.floor_max_c:.1f} °C limit: heat held at the minimum "
             f"until the floor is below {zc.floor_max_c - 0.5:.1f} °C"
         )
-    elif guard_now:
-        cap = lower if guard.cap == "lower_limit" else pmin
-        plan_mode, aim = MODE_GUARD, min(t_lead, cap)
-        reasons.append(f"The bedroom is too warm for bedtime: aims no higher than {cap:.1f} °C")
-    elif zc.sun_cut.enabled and in_cut and not inp.fallback:
-        plan_mode, aim = MODE_SUN_CUT, min(t_lead, pmin)
-        end = max(e for s, e, _d in inp.cut_windows if s <= now_ts < e)
-        reasons.append(f"Sun expected until {hhmm(end, tz)}: aims no higher than {pmin:.1f} °C and lets the sun warm the room")
-    elif inp.fallback:
-        plan_mode, aim = MODE_FALLBACK, fallback_aim
-        reasons.append("No room temperature to go by: holds a fixed target")
     else:
-        u_eq = dict(inp.day_duty).get(local_dt(lead_ts, tz).date().isoformat())
-        offset = weather_offset(zc.weather_offset, u_eq)
-        hold_raw = t_lead + inp.trim + offset
-        if evaluate_warm(zc.warm_hold, inp.therm_temp, hold_raw, inp.warm):
-            plan_mode, aim = MODE_WARM, None
-            u_eq, offset = None, 0.0
-            reasons.append(
-                "Warm enough: heat held at the minimum until the thermostat reads "
-                f"{hold_raw + zc.warm_hold.release_c:.1f} °C"
-            )
-        else:
-            plan_mode, aim = MODE_HOLD, t_lead
-            if abs(t_lead - target) < 0.05:
-                reasons.append(f"Holding {t_lead:.1f} °C")
-            else:
-                reasons.append(
-                    f"Getting ready for {t_lead:.1f} °C in {zc.profile.lead_hours:g} h: the floor is slow"
-                )
-
-    if aim is None:
-        raw = lower
-        setpoint = clamp(lower, lower, upper)
-    else:
-        raw = aim + inp.trim + offset
-        setpoint = clamp(quantize(raw, inp.last_planned), lower, upper)
-        reasons.append(setpoint_reason(setpoint, inp.trim, offset, u_eq))
+        allowed, plan_mode, reason = True, aim_mode, aim_reason
+    reasons = [reason]
 
     if not inp.season_on:
         mode = MODE_OFF_SEASON
@@ -1508,33 +1435,25 @@ def plan(zc: ZoneConfig, inp: ZoneInputs, now_ts: float, tz) -> Plan:
         reasons.insert(0, "The thermostat is offline: nothing can be set")
     else:
         mode = plan_mode
-    return Plan(mode, plan_mode, target, aim, raw, setpoint, pmin, tuple(reasons), offset)
+    return Plan(mode, plan_mode, target, allowed, aim, pmin, tuple(reasons))
 
 
 def project_blocks(
     zc: ZoneConfig, inp: ZoneInputs, now_ts: float, until_ts: float, tz, step_s: float = 300.0
 ) -> list:
-    """The plan from now until `until_ts` as (start_ts, end_ts, plan_mode, setpoint) blocks,
+    """The plan from now until `until_ts` as (start_ts, end_ts, plan_mode, aim) blocks,
     assuming the openings stay closed and the dynamic inputs (bedroom hold-back, fallback)
-    keep their current value. The thermostat's reading cannot be projected, so a projection
-    never shows the warm hold. The plan is sampled on the clock grid of step_s seconds, so block
+    keep their current value. The plan is sampled on the clock grid of step_s seconds, so block
     edges fall on round times."""
     blocks = []
-    last = inp.last_planned
     t = now_ts
     while t < until_ts:
         end = min((math.floor(t / step_s) + 1) * step_s, until_ts)
-        p = plan(
-            zc,
-            replace(inp, window_state=STATE_CLOSED, last_planned=last, therm_temp=None, warm=False),
-            t,
-            tz,
-        )
-        last = p.setpoint
-        if blocks and blocks[-1][2] == p.plan_mode and blocks[-1][3] == p.setpoint:
+        p = plan(zc, replace(inp, window_state=STATE_CLOSED), t, tz)
+        if blocks and blocks[-1][2] == p.plan_mode and blocks[-1][3] == p.aim:
             blocks[-1][1] = end
         else:
-            blocks.append([t, end, p.plan_mode, p.setpoint])
+            blocks.append([t, end, p.plan_mode, p.aim])
         t = end
     return [tuple(b) for b in blocks]
 
@@ -1552,18 +1471,19 @@ class BlockLog:
     def snapshot(self) -> dict:
         return {"day": self.day, "closed": self.closed, "current": self.current}
 
-    def observe(self, now_ts: float, day: str, mode: str, setpoint: float) -> None:
+    def observe(self, now_ts: float, day: str, mode: str, aim: float) -> None:
         if day != self.day:
             self.day, self.closed, self.current = day, [], None
         if self.current is None:
-            self.current = [now_ts, mode, setpoint]
-        elif self.current[1] != mode or self.current[2] != setpoint:
+            self.current = [now_ts, mode, aim]
+        elif self.current[1] != mode or self.current[2] != aim:
             self.closed.append([self.current[0], now_ts, self.current[1], self.current[2]])
-            self.current = [now_ts, mode, setpoint]
+            self.current = [now_ts, mode, aim]
 
 
 def render_blocks(log: BlockLog, projected: list, now_ts: float, day_end_ts: float, tz) -> list:
-    """The day timeline: finished blocks, the running one, and the projection after now."""
+    """The day timeline: finished blocks, the running one, and the projection after now. The
+    block's `setpoint` is the aim, in the unit the dashboard has always read it."""
 
     def clock(ts: float) -> str:
         return "24:00" if ts >= day_end_ts else hhmm(ts, tz)
@@ -1571,15 +1491,119 @@ def render_blocks(log: BlockLog, projected: list, now_ts: float, day_end_ts: flo
     rows = [[b[0], b[1], b[2], b[3]] for b in log.closed]
     if log.current is not None:
         rows.append([log.current[0], now_ts, log.current[1], log.current[2]])
-    for start, end, mode, setpoint in projected:
-        if rows and rows[-1][2] == mode and rows[-1][3] == setpoint and rows[-1][1] >= start:
+    for start, end, mode, aim in projected:
+        if rows and rows[-1][2] == mode and rows[-1][3] == aim and rows[-1][1] >= start:
             rows[-1][1] = end
         else:
-            rows.append([start, end, mode, setpoint])
+            rows.append([start, end, mode, aim])
     return [
         {"start": clock(r[0]), "end": clock(r[1]), "mode": r[2], "setpoint": f"{r[3]:.1f}"}
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------- call and drive
+
+CALL_NOT_ALLOWED = "not_allowed"
+CALL_NO_AIR = "no_air"
+CALL_AIR_OK = "air_ok"
+CALL_MIN_OFF = "min_off"
+CALL_WAIT_SLOT = "wait_slot"
+CALL_START = "start"
+CALL_ON = "calling"
+CALL_MIN_ON = "min_on"
+CALL_STOP = "stop"
+
+
+class CallState:
+    """Whether a zone is calling for heat, since when it last started or stopped, and the
+    setpoint it is driven at while it calls, which is fixed when the call starts."""
+
+    def __init__(self, saved: Optional[dict] = None):
+        s = saved if isinstance(saved, dict) else {}
+        self.on = s.get("on") is True
+        self.since = self._number(s.get("since"))
+        self.high = self._number(s.get("high")) if self.on else None
+
+    @staticmethod
+    def _number(value) -> Optional[float]:
+        numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+        return float(value) if numeric and math.isfinite(value) else None
+
+    def snapshot(self) -> dict:
+        return {"on": self.on, "since": self.since, "high": self.high}
+
+    def apply(self, on: bool, now_ts: float, high: Optional[float] = None) -> bool:
+        """Take a decision of decide_call; True when the call started or stopped. `high` is the
+        setpoint a call that starts is driven at."""
+        if on == self.on:
+            if on and self.high is None:
+                self.high = high
+            return False
+        self.on, self.since = on, now_ts
+        self.high = high if on else None
+        return True
+
+
+def in_start_window(cfg: CallConfig, now_ts: float) -> bool:
+    """Whether `now_ts` is in the first start_window_minutes of a start_every_minutes slot."""
+    return now_ts % (cfg.start_every_minutes * 60.0) < cfg.start_window_minutes * 60.0
+
+
+def decide_call(
+    cfg: CallConfig,
+    state: CallState,
+    aim: float,
+    air: Optional[float],
+    allowed: bool,
+    now_ts: float,
+) -> tuple:
+    """(on, reason): whether the zone calls for heat now. It does not change `state`.
+
+    A call starts when heat is allowed and the air is more than hysteresis_c under the aim, at
+    least min_off_minutes after the last stop, and only in the first start_window_minutes of
+    each start_every_minutes slot, so zones that need heat start together. It stops when the
+    air is more than hysteresis_c over the aim, but not before min_on_minutes, and at once when
+    heat is no longer allowed. Without room air there is no call: the zone is driven by the aim
+    alone, see drive_setpoint."""
+    if not allowed:
+        return False, CALL_NOT_ALLOWED
+    if air is None:
+        return False, CALL_NO_AIR
+    gap = round(air - aim, 3)
+    held_s = math.inf if state.since is None else now_ts - state.since
+    if state.on:
+        if gap <= cfg.hysteresis_c:
+            return True, CALL_ON
+        if held_s < cfg.min_on_minutes * 60.0:
+            return True, CALL_MIN_ON
+        return False, CALL_STOP
+    if gap >= -cfg.hysteresis_c:
+        return False, CALL_AIR_OK
+    if held_s < cfg.min_off_minutes * 60.0:
+        return False, CALL_MIN_OFF
+    if not in_start_window(cfg, now_ts):
+        return False, CALL_WAIT_SLOT
+    return True, CALL_START
+
+
+def high_limit(cfg: CallConfig, aim: float, upper: float) -> float:
+    """The setpoint a call is driven at: high_margin_c over the aim, rounded up to the device
+    step, and at most the device's upper limit."""
+    return min(upper, ceil_step(aim + cfg.high_margin_c))
+
+
+def drive_setpoint(
+    state: CallState, aim: float, fallback: bool, lower: float, upper: float
+) -> float:
+    """What the thermostat is set to, within the device's `lower` and `upper`: the aim as an
+    ordinary setpoint while `fallback` (heat is allowed but there is no room air to go by), the
+    call's fixed high setpoint while it calls, else the device minimum."""
+    if fallback:
+        return clamp(round_step(aim), lower, upper)
+    if state.on and state.high is not None:
+        return clamp(state.high, lower, upper)
+    return lower
 
 
 # ---------------------------------------------------------------- writes
@@ -1644,34 +1668,6 @@ def write_gate(
     return GateResult(True, f"priority:{priority}" if priority else "stable")
 
 
-# ---------------------------------------------------------------- trim
-
-
-@dataclass(frozen=True)
-class TrimUpdate:
-    trim: float
-    bias: Optional[float]
-    valid_hours: int
-    changed: bool
-
-
-def update_trim(trim: float, hours: dict, cfg: TrimConfig) -> TrimUpdate:
-    """Move the trim half-way to yesterday's mean (thermostat minus control air). `hours`
-    maps a clock hour to [sum, count] of valid samples. Fewer than TRIM_MIN_HOURS hours with
-    at least TRIM_MIN_TICKS_PER_HOUR samples each leave the trim as it is."""
-    means = [
-        s / n
-        for h, (s, n) in hours.items()
-        if int(h) in TRIM_HOURS and n >= TRIM_MIN_TICKS_PER_HOUR
-    ]
-    if len(means) < TRIM_MIN_HOURS:
-        return TrimUpdate(trim, None, len(means), False)
-    bias = sum(means) / len(means)
-    new = trim + TRIM_GAIN * (bias - trim)
-    new = round(round(clamp(new, cfg.minimum, cfg.maximum) / TRIM_STEP_C) * TRIM_STEP_C, 2)
-    return TrimUpdate(new, bias, len(means), new != trim)
-
-
 # ---------------------------------------------------------------- daily statistics
 
 
@@ -1690,7 +1686,6 @@ class TickSample:
     air: Optional[float]
     target: float
     lower_c: float
-    bias: Optional[float]  # thermostat minus control air when the sample is valid for the trim
     fallback: bool
 
 
@@ -1709,7 +1704,6 @@ class ZoneDay:
         self.band = list(s.get("band", [0, 0]))  # in band, counted (07-23 h, season, no coast)
         self.below_lower = s.get("below_lower", 0)
         self.afternoon_excess_max = s.get("afternoon_excess_max")
-        self.bias = {int(h): list(v) for h, v in s.get("bias", {}).items()}
         self.would_writes = [list(w) for w in s.get("would_writes", [])]
         self.reverts = s.get("reverts", 0)
         self.writes = s.get("writes", 0)
@@ -1728,7 +1722,6 @@ class ZoneDay:
             "band": self.band,
             "below_lower": self.below_lower,
             "afternoon_excess_max": self.afternoon_excess_max,
-            "bias": {str(h): v for h, v in self.bias.items()},
             "would_writes": self.would_writes,
             "reverts": self.reverts,
             "writes": self.writes,
@@ -1762,13 +1755,9 @@ class ZoneDay:
                     excess = t.air - t.target
                     if self.afternoon_excess_max is None or excess > self.afternoon_excess_max:
                         self.afternoon_excess_max = excess
-        if t.bias is not None and t.hour in TRIM_HOURS:
-            entry = self.bias.setdefault(t.hour, [0.0, 0])
-            entry[0] += t.bias
-            entry[1] += 1
 
     def add_would_write(self, ts: float, value: float) -> None:
-        """A change of the planned setpoint, with the revert counter the shadow acceptance
+        """A change of the drive setpoint, with the revert counter the shadow acceptance
         watches: going back to the value from two writes ago within 30 minutes."""
         if (
             len(self.would_writes) >= 2
@@ -1782,7 +1771,7 @@ class ZoneDay:
         if self.budget is None:
             self.budget = budget
 
-    def record(self, zone: str, trim_before: float, update: TrimUpdate) -> dict:
+    def record(self, zone: str) -> dict:
         n_air = self.air[1]
         return {
             "type": "daily",
@@ -1808,8 +1797,4 @@ class ZoneDay:
             "restores": self.restores,
             "would_write_reverts": self.reverts,
             "budget": self.budget,
-            "trim_before": trim_before,
-            "trim_after": update.trim,
-            "trim_bias": None if update.bias is None else round(update.bias, 3),
-            "trim_valid_hours": update.valid_hours,
         }

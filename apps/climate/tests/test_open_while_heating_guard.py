@@ -6,7 +6,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import yaml
 
@@ -27,13 +27,14 @@ THERMOSTAT = "climate.family_room_thermostat"
 SEASON = "input_boolean.heating_season"
 ACTIVE = "binary_sensor.living_room_heating_active"
 AIR = "sensor.living_room_feel"
+AIM = "sensor.heating_zone_family"
 
 
 class OpeningReminder(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 10, 27, 20, 0, tzinfo=timezone.utc)
         self.states = {DOOR: "off", WINDOW: "off", THERMOSTAT: "heat", SEASON: "on", ACTIVE: "off", AIR: "21"}
-        self.attributes = {THERMOSTAT: {"temperature": 21}}
+        self.attributes = {THERMOSTAT: {"temperature": 5}, AIM: {"setpoint_now": 21}}
         self.changed = {}
         self.pending = {}
         self.notifier = MagicMock()
@@ -113,10 +114,32 @@ class OpeningReminder(unittest.TestCase):
         self.app.listen_state.assert_any_call(self.app._on_change, ACTIVE, room="living_room")
         self.app.listen_state.assert_any_call(self.app._on_change, DOOR, room="living_room")
         self.app.listen_state.assert_any_call(self.app._on_change, THERMOSTAT, room="living_room")
-        self.app.listen_state.assert_any_call(
-            self.app._on_change, THERMOSTAT, attribute="temperature", room="living_room"
-        )
         self.app.listen_state.assert_any_call(self.app._on_change, SEASON)
+
+    def test_shipped_zone_rooms_read_the_aim_of_their_zone_and_the_bedroom_its_thermostat(self):
+        controller = yaml.safe_load((APPS / "heating_controller.yaml").read_text())["HeatingController"]
+        zone_of = {z["thermostat"]: name for name, z in controller["zones"].items()}
+        for room, cfg in self.app.rooms.items():
+            zone = zone_of.get(cfg["thermostat"])
+            if zone is None:
+                self.assertNotIn("aim", cfg, room)
+                self.app.listen_state.assert_any_call(
+                    self.app._on_change, cfg["thermostat"], attribute="temperature", room=room
+                )
+            else:
+                self.assertEqual(cfg["aim"], f"sensor.heating_zone_{zone}", room)
+                self.app.listen_state.assert_any_call(
+                    self.app._on_change, cfg["aim"], attribute="setpoint_now", room=room
+                )
+                self.assertNotIn(
+                    call(self.app._on_change, cfg["thermostat"], attribute="temperature", room=room),
+                    self.app.listen_state.call_args_list,
+                )
+        self.assertEqual(set(zone_of.values()) - {"guest_bathroom"}, {
+            cfg["aim"].removeprefix("sensor.heating_zone_")
+            for cfg in self.app.rooms.values()
+            if "aim" in cfg
+        })
 
     def test_warm_airing_with_short_heat_pulses_stays_silent_for_forty_minutes(self):
         self.change(AIR, "23.5")
@@ -202,12 +225,12 @@ class OpeningReminder(unittest.TestCase):
         self.app.fire_event.assert_called_once()
 
     def test_invalid_air_or_target_uses_opening_allowance(self):
-        for entity, attribute in ((AIR, "state"), (THERMOSTAT, "temperature")):
+        for entity, attribute in ((AIR, "state"), (AIM, "setpoint_now")):
             for value in (None, "unknown", "unavailable", "bad", "nan", "inf", "-inf"):
                 with self.subTest(entity=entity, value=value):
                     self.change(DOOR, "off")
                     self.states[AIR] = "23.5"
-                    self.attributes[THERMOSTAT]["temperature"] = 21
+                    self.attributes[AIM]["setpoint_now"] = 21
                     self.change(entity, value, attribute)
                     self.change(DOOR, "on")
                     before = self.app.fire_event.call_count
@@ -215,11 +238,11 @@ class OpeningReminder(unittest.TestCase):
                     self.assertEqual(self.app.fire_event.call_count, before + 1)
 
     def test_invalid_reading_during_warm_airing_falls_back_to_opening_time(self):
-        for entity, attribute in ((AIR, "state"), (THERMOSTAT, "temperature")):
+        for entity, attribute in ((AIR, "state"), (AIM, "setpoint_now")):
             with self.subTest(entity=entity):
                 self.change(DOOR, "off")
                 self.states[AIR] = "23.5"
-                self.attributes[THERMOSTAT]["temperature"] = 21
+                self.attributes[AIM]["setpoint_now"] = 21
                 self.change(DOOR, "on")
                 self.advance(20 * 60)
                 before = self.app.fire_event.call_count
@@ -227,14 +250,64 @@ class OpeningReminder(unittest.TestCase):
                 self.assertEqual(self.app.fire_event.call_count, before + 1)
                 self.assertNotIn("living_room", self.app._timers)
 
-    def test_setpoint_change_can_start_warm_airing_allowance(self):
+    def test_aim_change_can_start_warm_airing_allowance(self):
         self.change(AIR, "23.5")
         self.change(DOOR, "on")
         self.advance(20 * 60)
-        self.change(THERMOSTAT, "23", "temperature")
+        self.change(AIM, "23", "setpoint_now")
         self.app.fire_event.assert_not_called()
         self.elapse()
         self.app.fire_event.assert_called_once()
+
+    def test_warm_delay_ends_when_the_air_is_within_half_a_degree_of_the_aim(self):
+        self.change(AIR, "21.5")
+        self.change(DOOR, "on")
+        self.elapse()
+        self.app.fire_event.assert_called_once()
+        self.change(DOOR, "off")
+        self.change(AIR, "21.6")
+        self.change(DOOR, "on")
+        self.assertNotIn("living_room", self.app._timers)
+
+    def test_the_warm_delay_reads_the_aim_and_not_the_thermostat_at_its_minimum(self):
+        self.attributes[THERMOSTAT]["temperature"] = 5
+        self.change(AIR, "21.4")
+        self.change(DOOR, "on")
+        self.assertIn("living_room", self.app._timers)
+        self.elapse()
+        self.app.fire_event.assert_called_once()
+
+    def test_the_warm_delay_reads_the_aim_and_not_the_thermostat_at_a_calls_high_setpoint(self):
+        self.attributes[THERMOSTAT]["temperature"] = 24
+        self.change(AIR, "22.5")
+        self.change(DOOR, "on")
+        self.assertNotIn("living_room", self.app._timers)
+        self.app.fire_event.assert_not_called()
+
+    def test_the_thermostat_moving_between_minimum_and_high_does_not_touch_a_warm_delay(self):
+        self.change(AIR, "23.5")
+        self.change(DOOR, "on")
+        self.advance(20 * 60)
+        for value in (24, 5, 24):
+            self.change(THERMOSTAT, value, "temperature")
+        self.assertNotIn("living_room", self.app._timers)
+        self.app.fire_event.assert_not_called()
+
+    def test_a_room_without_a_zone_sensor_reads_its_thermostat_setpoint(self):
+        self.app.rooms["living_room"].pop("aim")
+        self.attributes[THERMOSTAT]["temperature"] = 21
+        self.change(AIR, "23.5")
+        self.change(DOOR, "on")
+        self.assertNotIn("living_room", self.app._timers)
+        self.change(AIR, "21.4")
+        self.elapse()
+        self.app.fire_event.assert_called_once()
+
+    def test_a_room_with_a_zone_sensor_but_no_thermostat_still_reads_the_aim(self):
+        self.app.rooms["living_room"].pop("thermostat")
+        self.change(AIR, "23.5")
+        self.change(DOOR, "on")
+        self.assertNotIn("living_room", self.app._timers)
 
     def test_restart_while_warm_waits_for_threshold(self):
         self.states[DOOR], self.states[AIR] = "on", "23.5"

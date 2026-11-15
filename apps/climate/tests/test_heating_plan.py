@@ -1,7 +1,7 @@
 # tests/test_heating_plan.py - the floor-heating controller's planning logic (heating_plan.py):
-# config parsing, comfort target and lead shift, mode precedence, budget and sun cut, party,
-# bedroom loop, window tracker, trim, write bookkeeping and daily statistics. Pure logic, so no
-# AppDaemon harness is needed.
+# config parsing, comfort target and lead shift, allowed and aim by mode, budget and sun cut, party,
+# bedroom loop, window tracker and the airing lockout, the call rule and the drive setpoint, write
+# bookkeeping and daily statistics. Pure logic, so no AppDaemon harness is needed.
 # Run from repo root: python3 -m unittest discover -s apps/climate/tests -q
 
 from __future__ import annotations
@@ -48,9 +48,7 @@ FAMILY = {
             {"from": "17:00", "to": "23:00", "offset": 0.5},
         ],
     },
-    "trim": {"initial": 0.5, "min": -0.5, "max": 1.5},
     "budget": {"a": 0.55, "b_om": -1.62, "c": 1.21, "d": -0.04},
-    "weather_offset": {"gain": 0.85, "bias": 0.22, "max_c": 1.5},
     "sun_cut": {
         "enabled": True,
         "azimuth": [100, 260],
@@ -71,7 +69,6 @@ KRISTINE = {
     "upper_limit_c": 24.0,
     "protected_min_offset_c": -0.5,
     "profile": {"lead_hours": 4},
-    "trim": {"initial": 0.0, "min": -1.0, "max": 1.0},
     "budget": {"changepoint": {"k": 0.17, "base_c": 15.5}},
     "residents": ["kristine"],
     "nudge": {"min": -1.0, "max": 1.0, "step": 0.5},
@@ -135,7 +132,6 @@ def inputs(zone="family", **kw):
         online=True,
         base=zc.base_c,
         nudge=0.0,
-        trim=zc.trim.initial,
         lower_c=zc.lower_c,
         upper_c=zc.upper_c,
     )
@@ -221,12 +217,10 @@ class ConfigParsing(unittest.TestCase):
         self.assertFalse(CFG.zones["kristines_room"].sun_cut.enabled)
         self.assertEqual(CFG.zones["kristines_room"].nudge.maximum, 1.0)
         self.assertEqual(CFG.zones["kristines_room"].budget.changepoint_k, 0.17)
-        self.assertEqual(zc.weather_offset, hp.WeatherOffsetConfig(True, 0.85, 0.22, 1.5))
-        self.assertEqual([n for n, z in CFG.zones.items() if z.weather_offset.enabled], ["family"])
 
     def test_defaults(self):
         self.assertEqual(CFG.sun_term_factor, 0.5)
-        self.assertEqual(CFG.writes_per_hour, 2)
+        self.assertEqual(CFG.writes_per_hour, 4)
         self.assertEqual(CFG.keypad_relock_minutes, 15)
         self.assertEqual(CFG.window.open_debounce_minutes, 2)
         self.assertEqual(CFG.bedroom.ceiling_default_c, 21.0)
@@ -274,6 +268,84 @@ class ConfigParsing(unittest.TestCase):
         self.assertEqual(cfg.alerts.calling_hours, 4.0)
         self.assertEqual(cfg.zones["family"].evenness_floors, ("sensor.a", "sensor.b"))
 
+    def test_the_call_rule_has_defaults(self):
+        c = CFG.call
+        self.assertEqual((c.hysteresis_c, c.min_on_minutes, c.min_off_minutes), (0.2, 20.0, 20.0))
+        self.assertEqual((c.start_every_minutes, c.start_window_minutes), (30.0, 6.0))
+        self.assertEqual(c.high_margin_c, 2.0)
+        self.assertEqual(c, hp.CallConfig())
+
+    def test_the_call_rule_is_read_and_leaves_out_what_the_default_covers(self):
+        cfg = hp.parse_config(
+            dict(
+                ARGS,
+                call={
+                    "hysteresis_c": 0.3,
+                    "min_on_minutes": 15,
+                    "min_off_minutes": 25,
+                    "start_every_minutes": 60,
+                    "start_window_minutes": 10,
+                    "high_margin_c": 1.5,
+                },
+            )
+        )
+        self.assertEqual(cfg.call, hp.CallConfig(0.3, 15.0, 25.0, 60.0, 10.0, 1.5))
+        part = hp.parse_config(dict(ARGS, call={"high_margin_c": 3}))
+        self.assertEqual(part.call, hp.CallConfig(high_margin_c=3.0))
+        for empty in (None, {}):
+            self.assertEqual(hp.parse_config(dict(ARGS, call=empty)).call, hp.CallConfig())
+
+    def test_a_bad_call_rule_is_refused(self):
+        bad = [
+            {"hysteresis_c": -0.1},
+            {"min_on_minutes": -1},
+            {"min_off_minutes": float("nan")},
+            {"start_every_minutes": float("inf")},
+            {"high_margin_c": -2},
+            {"start_window_minutes": 0},
+            {"start_window_minutes": 31},
+            {"start_every_minutes": 5},
+        ]
+        for raw in bad:
+            with self.subTest(raw=raw), self.assertRaisesRegex(hp.ConfigError, "call:"):
+                hp.parse_config(dict(ARGS, call=raw))
+        hp.parse_config(dict(ARGS, call={"start_window_minutes": 30}))
+        hp.parse_config(dict(ARGS, call={"hysteresis_c": 0, "min_on_minutes": 0}))
+
+    def test_the_window_lockout_has_defaults_and_is_read(self):
+        w = CFG.window
+        self.assertEqual((w.lockout_per_open_hour, w.lockout_max_hours), (2.0, 8.0))
+        self.assertEqual((w.settle_max_minutes, w.settle_recovered_c), (60.0, 0.3))
+        cfg = hp.parse_config(
+            dict(ARGS, window={"lockout_per_open_hour": 1.5, "lockout_max_hours": 4})
+        )
+        self.assertEqual((cfg.window.lockout_per_open_hour, cfg.window.lockout_max_hours), (1.5, 4.0))
+        self.assertEqual(cfg.window.settle_max_minutes, 60.0)
+
+    def test_a_bad_window_setting_is_refused(self):
+        bad = [
+            {"lockout_per_open_hour": -1},
+            {"lockout_max_hours": -1},
+            {"settle_max_minutes": float("nan")},
+            {"open_debounce_minutes": -2},
+            {"lockout_max_hours": 0.5},
+            {"settle_max_minutes": 600, "lockout_max_hours": 8},
+        ]
+        for raw in bad:
+            with self.subTest(raw=raw), self.assertRaisesRegex(hp.ConfigError, "window:"):
+                hp.parse_config(dict(ARGS, window=raw))
+        hp.parse_config(dict(ARGS, window={"lockout_per_open_hour": 0, "lockout_max_hours": 1}))
+
+    def test_the_settings_of_the_old_model_are_ignored(self):
+        old = {
+            "trim": {"initial": 0.5, "min": -0.5, "max": 1.5},
+            "weather_offset": {"gain": 0.85, "bias": 0.22, "max_c": 1.5},
+            "warm_hold": {"enter_c": 1.0, "release_c": 0.6},
+        }
+        cfg = hp.parse_config(dict(self._broken(**old), window={"long_open_minutes": 30}))
+        self.assertEqual(cfg.zones["family"].base_c, 21.5)
+        self.assertEqual(cfg.window, hp.WindowConfig())
+
     def test_bad_signal_and_alert_settings_are_refused(self):
         zones = lambda **kw: dict(ARGS["zones"], kristines_room=dict(KRISTINE, **kw))  # noqa: E731
         cases = [
@@ -288,9 +360,6 @@ class ConfigParsing(unittest.TestCase):
         for args in cases:
             with self.assertRaises(hp.ConfigError, msg=repr(args)[:80]):
                 hp.parse_config(args)
-
-    def weather_offset_of(self, raw):
-        return hp.parse_config(self._broken(weather_offset=raw)).zones["family"].weather_offset
 
     def test_floor_max_is_optional_and_may_exceed_the_upper_setpoint_limit(self):
         self.assertIsNone(CFG.zones["family"].floor_max_c)
@@ -373,122 +442,6 @@ class ConfigParsing(unittest.TestCase):
                 hp.ConfigError, "zone family: floor"
             ):
                 self.floors_of(raw)
-
-    def test_the_weather_offset_is_off_unless_a_zone_gives_one(self):
-        self.assertEqual(hp.WeatherOffsetConfig(), hp.WeatherOffsetConfig(False, 0.85, 0.22, 1.5))
-        self.assertEqual(CFG.zones["kristines_room"].weather_offset, hp.WeatherOffsetConfig())
-        for empty in (None, {}):
-            self.assertEqual(self.weather_offset_of(empty), hp.WeatherOffsetConfig(), repr(empty))
-
-    def test_a_weather_offset_is_read_and_leaves_out_what_the_default_covers(self):
-        self.assertEqual(
-            self.weather_offset_of({"gain": 0.9, "bias": 0.3, "max_c": 1}),
-            hp.WeatherOffsetConfig(True, 0.9, 0.3, 1.0),
-        )
-        self.assertEqual(
-            self.weather_offset_of({"max_c": 1}), hp.WeatherOffsetConfig(True, max_c=1.0)
-        )
-        self.assertEqual(self.weather_offset_of({"gain": 2}).gain, 2.0)
-
-    def test_the_edges_of_what_a_weather_offset_allows_are_accepted(self):
-        for raw in ({"bias": 0}, {"bias": 1}, {"max_c": 0}, {"gain": 0.01}):
-            self.assertTrue(self.weather_offset_of(raw).enabled, repr(raw))
-
-    def test_a_bad_weather_offset_is_refused(self):
-        bad = [{"gain": 0}, {"gain": -0.85}, {"max_c": -0.1}, {"bias": -0.01}, {"bias": 1.01}]
-        for raw in bad:
-            with self.assertRaisesRegex(
-                hp.ConfigError, "zone family: weather_offset", msg=repr(raw)
-            ):
-                self.weather_offset_of(raw)
-        for raw in (True, 1.5, ["gain"], "on"):
-            with self.assertRaisesRegex(
-                hp.ConfigError, "weather_offset is a mapping", msg=repr(raw)
-            ):
-                self.weather_offset_of(raw)
-
-    def test_a_weather_offset_needs_the_budget_the_duty_comes_from(self):
-        for budget in (None, {}):
-            with self.assertRaisesRegex(
-                hp.ConfigError, "zone family: weather_offset needs a budget"
-            ):
-                hp.parse_config(self._broken(budget=budget))
-        zones = dict(ARGS["zones"], guest_bathroom=dict(GUEST, weather_offset={"max_c": 1.5}))
-        with self.assertRaisesRegex(hp.ConfigError, "zone guest_bathroom: weather_offset needs"):
-            hp.parse_config(dict(ARGS, zones=zones))
-        self.assertEqual(CFG.zones["guest_bathroom"].weather_offset, hp.WeatherOffsetConfig())
-
-    def warm_hold_of(self, raw):
-        return hp.parse_config(self._broken(warm_hold=raw)).zones["family"].warm_hold
-
-    def test_the_warm_hold_is_off_unless_a_zone_gives_one(self):
-        self.assertEqual(hp.WarmHoldConfig(), hp.WarmHoldConfig(False, 1.0, 0.6))
-        self.assertEqual({zc.warm_hold for zc in CFG.zones.values()}, {hp.WarmHoldConfig()})
-        for empty in (None, {}):
-            self.assertEqual(self.warm_hold_of(empty), hp.WarmHoldConfig(), repr(empty))
-
-    def test_a_warm_hold_is_read_and_leaves_out_what_the_default_covers(self):
-        self.assertEqual(
-            self.warm_hold_of({"enter_c": 1.0, "release_c": 0.6}),
-            hp.WarmHoldConfig(True, 1.0, 0.6),
-        )
-        self.assertEqual(self.warm_hold_of({"enter_c": 1.5}), hp.WarmHoldConfig(True, 1.5, 0.6))
-        self.assertEqual(self.warm_hold_of({"release_c": 0.3}), hp.WarmHoldConfig(True, 1.0, 0.3))
-        whole = self.warm_hold_of({"enter_c": 2, "release_c": 1})
-        self.assertEqual((whole.enter_c, whole.release_c), (2.0, 1.0))
-        self.assertIsInstance(whole.enter_c, float)
-        self.assertIsInstance(whole.release_c, float)
-
-    def test_a_warm_hold_needs_no_budget(self):
-        zones = dict(ARGS["zones"], guest_bathroom=dict(GUEST, warm_hold={"enter_c": 1.2}))
-        cfg = hp.parse_config(dict(ARGS, zones=zones))
-        self.assertEqual(cfg.zones["guest_bathroom"].warm_hold, hp.WarmHoldConfig(True, 1.2, 0.6))
-
-    def test_a_warm_hold_needs_a_release_above_zero_and_below_the_entry(self):
-        bad = [
-            {"enter_c": 0.6},
-            {"enter_c": 0.5},
-            {"release_c": 1.0},
-            {"release_c": 1.2},
-            {"release_c": 0},
-            {"release_c": -0.1},
-            {"enter_c": 0, "release_c": 0},
-            {"enter_c": 1.0, "release_c": 1.0},
-            {"enter_c": -1.0, "release_c": -2.0},
-        ]
-        for raw in bad:
-            with self.subTest(raw=raw), self.assertRaisesRegex(
-                hp.ConfigError, "zone family: warm_hold needs 0 < release_c < enter_c"
-            ):
-                self.warm_hold_of(raw)
-        self.assertTrue(self.warm_hold_of({"enter_c": 0.02, "release_c": 0.01}).enabled)
-
-    def test_a_warm_hold_takes_finite_numbers_only(self):
-        junk = [
-            {"enter_c": True},
-            {"enter_c": "1.0"},
-            {"enter_c": None},
-            {"enter_c": [1.0]},
-            {"enter_c": float("nan")},
-            {"enter_c": float("inf")},
-            {"release_c": False},
-            {"release_c": "0.6"},
-            {"release_c": None},
-            {"release_c": float("nan")},
-            {"release_c": -float("inf")},
-        ]
-        for raw in junk:
-            with self.subTest(raw=raw), self.assertRaisesRegex(
-                hp.ConfigError, "zone family: warm_hold (enter_c|release_c) must be a finite number"
-            ):
-                self.warm_hold_of(raw)
-
-    def test_a_warm_hold_is_a_mapping(self):
-        for raw in (True, 1.5, ["enter_c"], "on"):
-            with self.subTest(raw=raw), self.assertRaisesRegex(
-                hp.ConfigError, "zone family: warm_hold is a mapping"
-            ):
-                self.warm_hold_of(raw)
 
     ADVISED = {
         "family": {
@@ -674,27 +627,25 @@ class ComfortTarget(unittest.TestCase):
         self.assertEqual(hp.protected_min(kri, 19.2, 0.0, 19.0), 19.0)
 
 
-class QuantizeAndClamp(unittest.TestCase):
-    def test_rounds_to_the_device_step_half_up(self):
-        self.assertEqual(hp.quantize(21.24, None), 21.0)
-        self.assertEqual(hp.quantize(21.25, None), 21.5)
-        self.assertEqual(hp.quantize(21.74, None), 21.5)
-        self.assertEqual(hp.quantize(21.75, None), 22.0)
-        self.assertEqual(hp.quantize(22.0, None), 22.0)
+class RoundingHelpers(unittest.TestCase):
+    def test_round_step_takes_the_nearest_device_step_half_up(self):
+        self.assertEqual(hp.round_step(21.24), 21.0)
+        self.assertEqual(hp.round_step(21.25), 21.5)
+        self.assertEqual(hp.round_step(21.74), 21.5)
+        self.assertEqual(hp.round_step(21.75), 22.0)
+        self.assertEqual(hp.round_step(22.0), 22.0)
 
-    def test_keeps_the_last_value_while_within_the_hysteresis(self):
-        self.assertEqual(hp.quantize(21.8, 21.5), 21.5)
-        self.assertEqual(hp.quantize(21.15, 21.5), 21.5)
-        self.assertEqual(hp.quantize(21.9, 21.5), 22.0)
-        self.assertEqual(hp.quantize(21.05, 21.5), 21.0)
+    def test_ceil_step_takes_the_step_at_or_above(self):
+        self.assertEqual(hp.ceil_step(23.5), 23.5)
+        self.assertEqual(hp.ceil_step(23.51), 24.0)
+        self.assertEqual(hp.ceil_step(23.0), 23.0)
+        self.assertEqual(hp.ceil_step(22.01), 22.5)
+        self.assertEqual(hp.ceil_step(19.1 + 2.0), 21.5)
 
-    def test_a_value_hovering_between_two_steps_does_not_flap(self):
-        last = None
-        seen = set()
-        for raw in (21.7, 21.8, 21.76, 21.6, 21.72, 21.8, 21.7):
-            last = hp.quantize(raw, last)
-            seen.add(last)
-        self.assertEqual(len(seen), 1)
+    def test_ceil_step_is_not_pushed_up_by_float_noise(self):
+        self.assertEqual(hp.ceil_step(21.1 + 2.4), 23.5)
+        self.assertEqual(hp.ceil_step(0.1 + 0.2 + 22.2), 22.5)
+        self.assertEqual(hp.ceil_step(20.3 + 2.2), 22.5)
 
     def test_clamp(self):
         self.assertEqual(hp.clamp(25.5, 19.0, 24.0), 24.0)
@@ -702,70 +653,117 @@ class QuantizeAndClamp(unittest.TestCase):
         self.assertEqual(hp.clamp(21.0, 19.0, 24.0), 21.0)
 
 
-class SetpointByTime(unittest.TestCase):
-    """The family day: trim 0.5, lead 4 h, so the setpoint leads the profile by four hours."""
+class AimByTime(unittest.TestCase):
+    """The family day: lead 4 h, so the aim leads the profile by four hours."""
 
-    def sp(self, hour, minute=0, **kw):
+    def aim(self, hour, minute=0, **kw):
         return plan_at(T(hour, minute), **kw)
 
     def test_hold_follows_the_shifted_profile(self):
-        expected = {(0, 0): 21.5, (5, 59): 21.5, (6, 0): 22.0, (12, 59): 22.0, (13, 0): 22.5}
-        expected.update({(18, 59): 22.5, (19, 0): 21.5, (23, 59): 21.5})
+        expected = {(0, 0): 21.0, (5, 59): 21.0, (6, 0): 21.5, (12, 59): 21.5, (13, 0): 22.0}
+        expected.update({(18, 59): 22.0, (19, 0): 21.0, (23, 59): 21.0})
         for (h, m), want in expected.items():
-            p = self.sp(h, m)
-            self.assertEqual((p.mode, p.setpoint), ("hold", want), (h, m))
+            p = self.aim(h, m)
+            self.assertEqual((p.mode, p.allowed, p.aim), ("hold", True, want), (h, m))
 
     def test_the_decided_target_numbers(self):
-        self.assertEqual(self.sp(12).target, 21.5)
-        self.assertEqual(self.sp(18).target, 22.0)
-        self.assertEqual(self.sp(2).target, 21.0)
+        self.assertEqual(self.aim(12).target, 21.5)
+        self.assertEqual(self.aim(18).target, 22.0)
+        self.assertEqual(self.aim(2).target, 21.0)
 
     def test_resident_room_is_flat_and_moves_with_the_nudge(self):
         for h in (3, 12, 20):
-            self.assertEqual(plan_at(T(h), "kristines_room", nudge=0.0).setpoint, 21.5)
-            self.assertEqual(plan_at(T(h), "kristines_room", nudge=-1.0).setpoint, 20.5)
-        self.assertEqual(plan_at(T(12), "claudias_room", nudge=1.0).setpoint, 22.5)
+            self.assertEqual(plan_at(T(h), "kristines_room", nudge=0.0).aim, 21.5)
+            self.assertEqual(plan_at(T(h), "kristines_room", nudge=-1.0).aim, 20.5)
+        self.assertEqual(plan_at(T(12), "claudias_room", nudge=1.0).aim, 22.5)
 
     def test_guest_bathroom_is_flat_at_its_own_level(self):
         for h in (3, 12, 20):
-            self.assertEqual(plan_at(T(h), "guest_bathroom").setpoint, 20.0)
+            self.assertEqual(plan_at(T(h), "guest_bathroom").aim, 20.0)
 
     def test_bathroom_has_no_overnight_block(self):
         for minutes in range(0, 24 * 60, 5):
             p = plan_at(T(minutes // 60, minutes % 60), "bathroom")
             if 6 * 60 <= minutes < 9 * 60:
-                self.assertEqual(p.setpoint, 22.0, minutes)
+                self.assertEqual(p.aim, 22.0, minutes)
             else:
-                self.assertEqual(p.setpoint, 19.0, minutes)
+                self.assertEqual(p.aim, 19.0, minutes)
 
-    def test_setpoint_is_clamped_to_the_limits(self):
-        p = plan_at(T(12), base=24.0, trim=1.5)
-        self.assertEqual(p.raw, 25.5)
-        self.assertEqual(p.setpoint, 24.0)
-        p = plan_at(T(12), base=18.0, trim=-0.5)
-        self.assertEqual(p.setpoint, 19.0)
+    def test_the_aim_is_clamped_to_the_limits(self):
+        self.assertEqual(plan_at(T(12), base=25.5).aim, 24.0)
+        self.assertEqual(plan_at(T(12), base=18.0).aim, 19.0)
+        self.assertEqual(plan_at(T(12), base=23.5).aim, 23.5)
 
     def test_effective_limits_can_be_tighter_than_the_configured_ones(self):
-        p = plan_at(T(12), lower_c=21.0, upper_c=21.5, trim=0.5)
-        self.assertEqual(p.setpoint, 21.5)
-        self.assertEqual(plan_at(T(8, 0), "bathroom", lower_c=19.5).setpoint, 22.0)
-        self.assertEqual(plan_at(T(2, 0), "bathroom", lower_c=19.5).setpoint, 19.5)
+        self.assertEqual(plan_at(T(12), lower_c=21.0, upper_c=21.0).aim, 21.0)
+        self.assertEqual(plan_at(T(12), lower_c=21.8, upper_c=22.5).aim, 21.8)
+        self.assertEqual(plan_at(T(8, 0), "bathroom", lower_c=19.5).aim, 22.0)
+        self.assertEqual(plan_at(T(2, 0), "bathroom", lower_c=19.5).aim, 19.5)
 
-    def test_last_planned_value_holds_a_hovering_setpoint(self):
-        p = plan_at(T(12), trim=0.8, last_planned=22.0)  # raw 22.3 is within 0.4 of 22.0
-        self.assertEqual(p.setpoint, 22.0)
-        p = plan_at(T(12), trim=0.8)
-        self.assertEqual(p.setpoint, 22.5)
+    def test_the_aim_has_no_trim_and_no_rounding_to_the_device_step(self):
+        self.assertEqual(plan_at(T(12), base=21.7).aim, 21.7)
+        self.assertEqual(plan_at(T(12), base=21.3, nudge=0.25).aim, 21.55)
+
+    def test_the_plan_does_not_depend_on_what_was_written_before(self):
+        self.assertEqual(plan_at(T(12)), plan_at(T(12)))
+
+    def test_the_plan_decides_only_whether_heat_is_allowed_and_the_aim(self):
+        self.assertEqual(
+            list(hp.Plan.__dataclass_fields__),
+            ["mode", "plan_mode", "target", "allowed", "aim", "protected_min", "reasons"],
+        )
+
+
+class AllowedByMode(unittest.TestCase):
+    """Heat is allowed in the aim modes and not allowed in the gate modes."""
+
+    CUT = ((T(1), T(14), "2026-10-17"),)
+    PARTY = ((T(8), T(18)),)
+
+    def test_the_aim_modes_allow_heat(self):
+        cases = [
+            ("hold", "family", T(12), {}),
+            ("sun_cut", "family", T(4), dict(cut_windows=self.CUT)),
+            ("fallback", "family", T(12), dict(fallback=True)),
+            ("guard", "bathroom", T(7), dict(hold_back=True)),
+        ]
+        for mode, zone, now, kw in cases:
+            p = plan_at(now, zone, **kw)
+            self.assertEqual((p.mode, p.allowed), (mode, True), mode)
+
+    def test_the_gate_modes_do_not_allow_heat_and_keep_the_aim(self):
+        cases = [
+            ("window", dict(window_state=hp.STATE_OPEN)),
+            ("settle", dict(window_state=hp.STATE_SETTLE)),
+            ("party", dict(party_windows=self.PARTY)),
+            ("floor_cap", dict(floor_cap=True)),
+        ]
+        zone = replace(CFG.zones["family"], floor_max_c=26.0)
+        for mode, kw in cases:
+            p = hp.plan(zone, inputs(**kw), T(12), TZ)
+            self.assertEqual((p.mode, p.allowed, p.aim), (mode, False, 21.5), mode)
+
+    def test_a_gate_mode_still_computes_the_aim_of_the_modes_below_it(self):
+        p = plan_at(T(4), window_state=hp.STATE_OPEN, cut_windows=self.CUT)
+        self.assertEqual((p.mode, p.allowed, p.aim), ("window", False, 20.5))
+        p = plan_at(T(7), "bathroom", window_state=hp.STATE_SETTLE, hold_back=True)
+        self.assertEqual((p.mode, p.allowed, p.aim), ("settle", False, 19.0))
+
+    def test_the_season_and_the_device_do_not_change_what_the_plan_allows(self):
+        for kw, mode in ((dict(season_on=False), "off_season"), (dict(online=False), "device_offline")):
+            p = plan_at(T(12), **kw)
+            self.assertEqual((p.mode, p.plan_mode, p.allowed, p.aim), (mode, "hold", True, 21.5))
+        p = plan_at(T(12), season_on=False, window_state=hp.STATE_OPEN)
+        self.assertEqual((p.mode, p.plan_mode, p.allowed), ("off_season", "window", False))
 
 
 class ModePrecedence(unittest.TestCase):
-    """window > settle > party > floor_cap > guard > sun_cut > fallback > warm > hold."""
+    """window > settle > party > floor_cap > guard > sun_cut > fallback > hold."""
 
     zone = replace(
         CFG.zones["family"],
         guard=hp.GuardConfig(True, "lower_limit"),
         floor_max_c=26.0,
-        warm_hold=hp.WarmHoldConfig(True),
     )
 
     def mode_of(self, **kw):
@@ -775,8 +773,6 @@ class ModePrecedence(unittest.TestCase):
             floor_cap=True,
             party_windows=((T(8), T(18)),),
             cut_windows=((T(1), T(14), "2026-10-17"),),
-            therm_temp=24.0,
-            warm=True,
         )
         base.update(kw)
         p = hp.plan(self.zone, inputs(**base), T(12), TZ)
@@ -798,8 +794,7 @@ class ModePrecedence(unittest.TestCase):
         no_cut = dict(
             party_windows=(), floor_cap=False, hold_back=False, fallback=False, cut_windows=()
         )
-        self.assertEqual(self.mode_of(**no_cut), "warm")
-        self.assertEqual(self.mode_of(**no_cut, therm_temp=None, warm=False), "hold")
+        self.assertEqual(self.mode_of(**no_cut), "hold")
 
     def test_fallback_suppresses_cuts_but_not_window_or_party(self):
         zc = CFG.zones["family"]
@@ -822,26 +817,26 @@ class ModePrecedence(unittest.TestCase):
 
     def test_the_season_and_device_gate_hide_the_mode_but_not_the_plan(self):
         p = plan_at(T(12), season_on=False)
-        self.assertEqual((p.mode, p.plan_mode, p.setpoint), ("off_season", "hold", 22.0))
+        self.assertEqual((p.mode, p.plan_mode, p.aim), ("off_season", "hold", 21.5))
         p = plan_at(T(12), online=False)
         self.assertEqual((p.mode, p.plan_mode), ("device_offline", "hold"))
         p = plan_at(T(12), season_on=False, online=False)
         self.assertEqual(p.mode, "off_season")
         self.assertIn("Heating season is off", p.reasons[0])
 
-    def test_window_party_and_settle_sit_at_the_lower_limit(self):
+    def test_window_party_and_settle_keep_heat_off_and_the_aim_in_view(self):
         for kw in (
             dict(window_state="open"),
             dict(window_state="settle"),
             dict(party_windows=((T(8), T(18)),)),
         ):
             p = plan_at(T(12), **kw)
-            self.assertEqual((p.setpoint, p.aim), (19.0, None), kw)
+            self.assertEqual((p.allowed, p.aim), (False, 21.5), kw)
 
-    def test_sun_cut_holds_the_protected_minimum_plus_trim(self):
+    def test_sun_cut_aims_at_the_protected_minimum(self):
         cut = ((T(1), T(14), "2026-10-17"),)
         p = plan_at(T(4), cut_windows=cut)
-        self.assertEqual((p.mode, p.aim, p.setpoint), ("sun_cut", 20.5, 21.0))
+        self.assertEqual((p.mode, p.allowed, p.aim), ("sun_cut", True, 20.5))
         # the cut never raises the plan: an aim below the protected minimum stays where it is
         p = plan_at(T(4), cut_windows=cut, base=19.5)
         self.assertEqual((p.target, p.aim), (19.0, 19.0))
@@ -851,25 +846,25 @@ class ModePrecedence(unittest.TestCase):
         self.assertEqual(plan_at(T(4), "kristines_room", cut_windows=cut).mode, "hold")
 
     def test_fallback_is_a_constant_without_profile(self):
-        p = plan_at(T(13), fallback=True)  # hold would be 22.5 here
-        self.assertEqual((p.mode, p.aim, p.setpoint), ("fallback", 21.5, 22.0))
+        p = plan_at(T(13), fallback=True)  # hold would aim at 22.0 here
+        self.assertEqual((p.mode, p.aim), ("fallback", 21.5))
         p = plan_at(T(20), fallback=True, nudge=0.5)
-        self.assertEqual(p.setpoint, 22.5)
+        self.assertEqual(p.aim, 22.0)
 
     def test_bathroom_fallback_stays_at_the_lower_limit(self):
         p = plan_at(T(3), "bathroom", fallback=True)
-        self.assertEqual((p.mode, p.setpoint), ("fallback", 19.0))
+        self.assertEqual((p.mode, p.aim), ("fallback", 19.0))
 
-    def test_bedroom_hold_back_keeps_the_bathroom_at_the_lower_limit(self):
+    def test_bedroom_hold_back_aims_the_bathroom_at_the_lower_limit(self):
         p = plan_at(T(7), "bathroom", hold_back=True)
-        self.assertEqual((p.mode, p.setpoint), ("guard", 19.0))
+        self.assertEqual((p.mode, p.allowed, p.aim), ("guard", True, 19.0))
         p = plan_at(T(7), "bathroom", hold_back=False)
-        self.assertEqual((p.mode, p.setpoint), ("hold", 22.0))
+        self.assertEqual((p.mode, p.allowed, p.aim), ("hold", True, 22.0))
 
     def test_hold_back_does_not_touch_the_family_zone(self):
         p = plan_at(T(4), "family", hold_back=True)
         self.assertEqual(p.mode, "hold")
-        self.assertEqual(p.setpoint, 21.5)
+        self.assertEqual(p.aim, 21.0)
 
     def test_window_in_the_bathroom_beats_the_hold_back_and_the_morning(self):
         self.assertEqual(plan_at(T(7), "bathroom", window_state="open").mode, "window")
@@ -897,139 +892,14 @@ class FloorCap(unittest.TestCase):
         self.assertFalse(hp.evaluate_floor_cap(None, 30.0, True))
         self.assertEqual(plan_at(T(12), floor_cap=True).plan_mode, "hold")
 
-    def test_floor_cap_stays_at_the_lower_limit_despite_trim_weather_or_sun_cut(self):
-        for extra in ({}, {"cut_windows": ((T(1), T(14), "2026-10-17"),)}):
+    def test_floor_cap_holds_heat_off_whatever_the_aim_or_sun_cut(self):
+        for extra, aim in (({}, 21.5), ({"cut_windows": ((T(1), T(14), "2026-10-17"),)}, 20.5)):
             with self.subTest(extra=extra):
-                result = hp.plan(
-                    self.zone,
-                    inputs(floor_cap=True, trim=1.5, day_duty=(("2026-10-17", 1.0),), **extra),
-                    T(12),
-                    TZ,
-                )
+                result = hp.plan(self.zone, inputs(floor_cap=True, **extra), T(12), TZ)
                 self.assertEqual(
-                    (result.mode, result.aim, result.raw, result.setpoint, result.weather_offset),
-                    ("floor_cap", None, 19.0, 19.0, 0.0),
+                    (result.mode, result.allowed, result.aim), ("floor_cap", False, aim)
                 )
                 self.assertIn("until the floor is below 25.5", result.reasons[0])
-
-
-class WarmHold(unittest.TestCase):
-    """The family zone at noon: the aim of 21.5 plus the trim of 0.5 is a hold setpoint of 22.0."""
-
-    zone = replace(CFG.zones["family"], warm_hold=hp.WarmHoldConfig(True, 1.0, 0.6))
-    HOLD_RAW = 22.0
-
-    def planned(self, therm, warm=False, **kw):
-        return hp.plan(self.zone, inputs(therm_temp=therm, warm=warm, **kw), T(12), TZ)
-
-    def test_enters_a_full_degree_over_the_hold_setpoint_and_releases_at_six_tenths(self):
-        active = False
-        steps = ((0.99, "hold"), (1.0, "warm"), (0.61, "warm"), (0.6, "hold"), (0.9, "hold"))
-        for gap, expected in steps:
-            with self.subTest(gap=gap, active=active):
-                therm = self.HOLD_RAW + gap
-                result = self.planned(therm, active)
-                self.assertEqual(result.plan_mode, expected)
-                latch = hp.evaluate_warm(self.zone.warm_hold, therm, self.HOLD_RAW, active)
-                self.assertEqual(latch, expected == "warm")
-                active = result.plan_mode == "warm"
-
-    def test_a_missing_reading_keeps_the_latch_as_it_is(self):
-        cfg = self.zone.warm_hold
-        self.assertTrue(hp.evaluate_warm(cfg, None, self.HOLD_RAW, True))
-        self.assertFalse(hp.evaluate_warm(cfg, None, self.HOLD_RAW, False))
-        self.assertEqual(self.planned(None, warm=True).plan_mode, "warm")
-        self.assertEqual(self.planned(None, warm=False).plan_mode, "hold")
-
-    def test_a_zone_without_the_config_never_enters(self):
-        off = hp.WarmHoldConfig()
-        for active in (False, True):
-            for therm in (None, 22.0, 30.0):
-                self.assertFalse(hp.evaluate_warm(off, therm, self.HOLD_RAW, active))
-        for zone in CFG.zones:
-            for active in (False, True):
-                result = plan_at(T(12), zone, therm_temp=40.0, warm=active)
-                self.assertEqual(result.plan_mode, "hold", zone)
-                self.assertEqual(result, plan_at(T(12), zone), zone)
-
-    def test_warm_stays_at_the_lower_limit_and_names_the_reading_that_ends_it(self):
-        result = self.planned(24.0, warm=True)
-        self.assertEqual(
-            (result.mode, result.plan_mode, result.aim, result.raw, result.setpoint),
-            ("warm", "warm", None, 19.0, 19.0),
-        )
-        self.assertEqual(result.weather_offset, 0.0)
-        self.assertEqual(
-            result.reasons,
-            ("Warm enough: heat held at the minimum until the thermostat reads 22.6 °C",),
-        )
-
-    def test_warm_ignores_trim_weather_and_the_aim(self):
-        result = self.planned(25.0, trim=1.0, day_duty=(("2026-10-17", 1.0),))
-        self.assertEqual(
-            (result.plan_mode, result.aim, result.raw, result.setpoint, result.weather_offset),
-            ("warm", None, 19.0, 19.0, 0.0),
-        )
-        # the hold setpoint it waits for is 21.5 + 1.0 + 0.92, and the release is 0.6 above it
-        self.assertEqual(
-            result.reasons,
-            ("Warm enough: heat held at the minimum until the thermostat reads 24.0 °C",),
-        )
-
-    def test_warm_sits_at_the_lower_limit_the_device_allows(self):
-        result = self.planned(25.0, lower_c=19.5)
-        self.assertEqual((result.plan_mode, result.setpoint), ("warm", 19.5))
-
-    def test_the_reading_is_judged_against_the_unrounded_hold_setpoint(self):
-        duty = (("2026-10-17", 0.55),)  # a raise of 0.39: 22.39, handed to the thermostat as 22.5
-        self.assertAlmostEqual(self.planned(None, day_duty=duty).raw, 22.39)
-        for therm, expected in ((23.39, "warm"), (23.38, "hold")):
-            with self.subTest(entering=therm):
-                self.assertEqual(self.planned(therm, day_duty=duty).plan_mode, expected)
-        for therm, expected in ((23.0, "warm"), (22.99, "hold")):
-            with self.subTest(releasing=therm):
-                self.assertEqual(self.planned(therm, True, day_duty=duty).plan_mode, expected)
-
-    def test_the_latch_is_measured_from_the_hold_setpoint_and_not_the_last_planned_one(self):
-        for therm, expected in ((22.61, "warm"), (22.6, "hold")):
-            with self.subTest(releasing=therm):
-                result = self.planned(therm, True, last_planned=19.0)
-                self.assertEqual(result.plan_mode, expected)
-        for therm, expected in ((22.99, "hold"), (23.0, "warm")):
-            with self.subTest(entering=therm):
-                self.assertEqual(self.planned(therm, last_planned=19.0).plan_mode, expected)
-        released = self.planned(22.6, True, last_planned=19.0)
-        self.assertEqual((released.plan_mode, released.setpoint), ("hold", 22.0))
-
-    def test_a_zone_that_is_not_warm_plans_what_it_would_plan_without_the_hold(self):
-        plain = plan_at(T(12))
-        self.assertEqual(self.planned(22.6, True), plain)
-        self.assertEqual(self.planned(22.99), plain)
-        self.assertEqual(self.planned(None), plain)
-
-    def test_the_season_and_device_gate_hide_the_mode_but_not_the_plan(self):
-        result = self.planned(24.0, season_on=False)
-        self.assertEqual(
-            (result.mode, result.plan_mode, result.setpoint), ("off_season", "warm", 19.0)
-        )
-        result = self.planned(24.0, online=False)
-        self.assertEqual((result.mode, result.plan_mode), ("device_offline", "warm"))
-
-    def test_a_projection_never_shows_the_warm_hold(self):
-        end = T(0, day=18)
-        plain = hp.project_blocks(self.zone, inputs(), T(12), end, TZ)
-        for kw in (dict(therm_temp=25.0), dict(therm_temp=25.0, warm=True), dict(warm=True)):
-            with self.subTest(kw=kw):
-                self.assertEqual(hp.project_blocks(self.zone, inputs(**kw), T(12), end, TZ), plain)
-        self.assertEqual({block[2] for block in plain}, {"hold"})
-        self.assertEqual(self.planned(25.0).plan_mode, "warm")
-
-    def test_the_inputs_with_a_reading_still_compare_and_hash(self):
-        a, b = inputs(therm_temp=23.0, warm=True), inputs(therm_temp=23.0, warm=True)
-        self.assertEqual((a, hash(a)), (b, hash(b)))
-        self.assertNotEqual(a, inputs(therm_temp=23.0))
-        self.assertNotEqual(a, inputs(warm=True))
-        self.assertEqual((inputs().therm_temp, inputs().warm), (None, False))
 
 
 class BudgetAndCut(unittest.TestCase):
@@ -1167,195 +1037,6 @@ class BudgetAndCut(unittest.TestCase):
         self.assertEqual(b.u_eq, 1.0)
 
 
-class WeatherOffsetMath(unittest.TestCase):
-    """The setpoint raise (u_eq - bias) / gain, limited to [0, max_c], in hundredths of a degree."""
-
-    cfg = CFG.zones["family"].weather_offset
-
-    def test_a_duty_at_or_below_the_bias_needs_no_raise(self):
-        for u_eq in (0.0, 0.1, 0.22):
-            self.assertEqual(hp.weather_offset(self.cfg, u_eq), 0.0, u_eq)
-
-    def test_the_raise_is_the_error_the_band_needs_for_the_duty(self):
-        self.assertEqual(hp.weather_offset(self.cfg, 0.55), 0.39)  # 0.33 / 0.85
-        self.assertEqual(hp.weather_offset(self.cfg, 0.33), 0.13)  # 0.11 / 0.85
-        self.assertEqual(hp.weather_offset(self.cfg, 1.0), 0.92)  # 0.78 / 0.85
-        band = hp.WeatherOffsetConfig(True, gain=0.5, bias=0.1, max_c=1.5)
-        self.assertEqual(hp.weather_offset(band, 0.4), 0.6)
-
-    def test_the_raise_is_rounded_to_a_hundredth(self):
-        self.assertEqual(hp.weather_offset(self.cfg, 0.4), 0.21)  # 0.2118
-        self.assertIsInstance(hp.weather_offset(self.cfg, 0.4), float)
-        self.assertIsInstance(hp.weather_offset(self.cfg, 0.1), float)
-
-    def test_the_raise_stops_at_max_c(self):
-        capped = replace(self.cfg, max_c=0.3)
-        self.assertEqual(hp.weather_offset(capped, 0.55), 0.3)
-        self.assertEqual(hp.weather_offset(capped, 1.0), 0.3)
-        self.assertEqual(hp.weather_offset(capped, 0.3), 0.09)
-        self.assertEqual(hp.weather_offset(replace(self.cfg, max_c=0.0), 1.0), 0.0)
-        self.assertEqual(hp.weather_offset(replace(self.cfg, gain=0.1), 1.0), 1.5)
-
-    def test_disabled_or_without_a_duty_is_zero(self):
-        self.assertEqual(hp.weather_offset(hp.WeatherOffsetConfig(), 0.9), 0.0)
-        self.assertEqual(hp.weather_offset(replace(self.cfg, enabled=False), 0.9), 0.0)
-        self.assertEqual(hp.weather_offset(self.cfg, None), 0.0)
-        self.assertIsInstance(hp.weather_offset(self.cfg, None), float)
-
-    def test_the_budget_of_a_cold_day_gives_a_raise_and_a_mild_day_none(self):
-        zc = CFG.zones["family"]
-        cold = hp.day_budget(zc, dw(-1.0, 15.0, 1.2), [], 0.5)
-        mild = hp.day_budget(zc, dw(11.4, 17.6, 0.3), [], 0.5)
-        self.assertEqual(hp.weather_offset(zc.weather_offset, cold.u_eq), 0.38)
-        self.assertEqual(hp.weather_offset(zc.weather_offset, mild.u_eq), 0.0)
-
-
-class WeatherOffsetInPlan(unittest.TestCase):
-    """The family zone in hold with trim 0.5 and a lead of 4 h: aim plus trim plus the raise of
-    the day the lead time falls on. Today needs 0.39 K, tomorrow 0.56 K."""
-
-    DUTY = (("2026-10-17", 0.55), ("2026-10-18", 0.70))
-    family = CFG.zones["family"]
-
-    def test_hold_adds_the_raise_to_the_raw_setpoint_and_leaves_the_aim_alone(self):
-        p = plan_at(T(12), day_duty=self.DUTY)
-        self.assertEqual(
-            (p.mode, p.plan_mode, p.aim, p.weather_offset), ("hold", "hold", 21.5, 0.39)
-        )
-        self.assertAlmostEqual(p.raw, 22.39)
-        self.assertEqual(p.setpoint, 22.5)
-        self.assertEqual(plan_at(T(12)).setpoint, 22.0)
-
-    def test_the_reasons_tell_the_raise_and_the_duty_before_the_setpoint(self):
-        p = plan_at(T(12), day_duty=self.DUTY)
-        self.assertEqual(
-            p.reasons,
-            (
-                "Holding 21.5 °C",
-                "Thermostat at 22.5 °C: +0.5 as it reads warmer than the room, +0.4 for the cold weather",
-            ),
-        )
-
-    def test_a_season_off_zone_still_plans_the_raise(self):
-        p = plan_at(T(12), day_duty=self.DUTY, season_on=False)
-        self.assertEqual((p.mode, p.plan_mode, p.weather_offset), ("off_season", "hold", 0.39))
-        self.assertEqual(p.reasons[0], "Heating season is off: the thermostat is left alone")
-        self.assertIn("+0.4 for the cold weather", p.reasons[-1])
-
-    def test_a_mild_day_changes_nothing_and_says_nothing(self):
-        for duty in ((("2026-10-17", 0.18),), (("2026-10-17", 0.22),), (("2026-10-17", 0.0),)):
-            p = plan_at(T(12), day_duty=duty)
-            self.assertEqual(p.weather_offset, 0.0, duty)
-            self.assertEqual(
-                p.reasons, ("Holding 21.5 °C", "Thermostat at 22.0 °C: +0.5 as it reads warmer than the room")
-            )
-            self.assertEqual(p, plan_at(T(12)), duty)
-
-    def test_no_duty_at_all_gives_no_raise(self):
-        p = plan_at(T(12), day_duty=())
-        self.assertEqual((p.weather_offset, p.raw, p.setpoint), (0.0, 22.0, 22.0))
-        self.assertEqual(p, plan_at(T(12)))
-
-    def test_a_zone_that_was_not_given_one_ignores_the_duty(self):
-        for zone in ("kristines_room", "claudias_room", "guest_bathroom"):
-            self.assertEqual(plan_at(T(12), zone, day_duty=self.DUTY), plan_at(T(12), zone), zone)
-        self.assertEqual(plan_at(T(7), "bathroom", day_duty=self.DUTY), plan_at(T(7), "bathroom"))
-
-    def test_the_raise_cannot_lift_the_setpoint_over_the_upper_limit(self):
-        p = plan_at(T(12), base=24.0, day_duty=self.DUTY)
-        self.assertGreater(p.raw, 24.0)
-        self.assertEqual(p.setpoint, 24.0)
-        p = plan_at(T(12), upper_c=22.0, day_duty=self.DUTY)
-        self.assertEqual(p.setpoint, 22.0)
-
-    def test_the_raise_goes_through_the_same_step_and_hysteresis_as_the_rest(self):
-        p = plan_at(T(12), day_duty=self.DUTY, last_planned=22.0)  # raw 22.39 is within 0.4 of 22.0
-        self.assertEqual(p.setpoint, 22.0)
-        p = plan_at(T(12), day_duty=self.DUTY, last_planned=21.5)
-        self.assertEqual(p.setpoint, 22.5)
-
-    def test_only_a_plain_hold_takes_the_raise(self):
-        guarded = replace(self.family, guard=hp.GuardConfig(True, "lower_limit"))
-        cases = [
-            ("sun_cut", self.family, dict(cut_windows=((T(1), T(14), "2026-10-17"),)), T(4)),
-            ("window", self.family, dict(window_state=hp.STATE_OPEN), T(12)),
-            ("settle", self.family, dict(window_state=hp.STATE_SETTLE), T(12)),
-            ("party", self.family, dict(party_windows=((T(8), T(18)),)), T(12)),
-            ("guard", guarded, dict(hold_back=True), T(12)),
-            ("fallback", self.family, dict(fallback=True), T(12)),
-        ]
-        for mode, zone, kw, now in cases:
-            warm = hp.plan(zone, inputs(day_duty=self.DUTY, **kw), now, TZ)
-            plain = hp.plan(zone, inputs(**kw), now, TZ)
-            self.assertEqual(warm.plan_mode, mode)
-            self.assertEqual(warm.weather_offset, 0.0, mode)
-            self.assertEqual(warm, plain, mode)
-            self.assertFalse(any(r.startswith("Weather") for r in warm.reasons), mode)
-
-    def test_the_duty_is_the_one_of_the_day_the_lead_time_falls_on(self):
-        self.assertEqual(plan_at(T(1), day_duty=self.DUTY).weather_offset, 0.39)  # lead 05:00
-        self.assertEqual(plan_at(T(19, 59), day_duty=self.DUTY).weather_offset, 0.39)  # 23:59
-        self.assertEqual(plan_at(T(20, 0), day_duty=self.DUTY).weather_offset, 0.56)  # 00:00
-        p = plan_at(T(21), day_duty=self.DUTY)  # lead 01:00 tomorrow
-        self.assertEqual(p.weather_offset, 0.56)
-        self.assertEqual(p.reasons[-1], "Thermostat at 22.0 °C: +0.5 as it reads warmer than the room, +0.6 for the cold weather")
-
-    def test_the_day_is_the_local_one_not_the_utc_one(self):
-        duty = (("2026-10-16", 0.9), ("2026-10-17", 0.55))
-        now = T(21, 30, day=16)  # lead 01:30 local on the 17th, which is still the 16th in UTC
-        self.assertEqual(plan_at(now, day_duty=duty).weather_offset, 0.39)
-
-    def test_without_a_lead_the_day_is_today(self):
-        profile = replace(self.family.profile, lead_hours=0.0)
-        zone = replace(self.family, profile=profile)
-        p = hp.plan(zone, inputs(day_duty=self.DUTY), T(21), TZ)
-        self.assertEqual(p.weather_offset, 0.39)
-
-    def test_a_day_that_has_no_duty_gets_no_raise(self):
-        self.assertEqual(plan_at(T(21), day_duty=self.DUTY[:1]).weather_offset, 0.0)
-        self.assertEqual(plan_at(T(12), day_duty=self.DUTY[1:]).weather_offset, 0.0)
-        self.assertEqual(plan_at(T(12), day_duty=(("2026-10-16", 0.9),)).weather_offset, 0.0)
-
-    def test_the_inputs_with_a_duty_still_compare_and_hash(self):
-        a, b = inputs(day_duty=self.DUTY), inputs(day_duty=tuple(self.DUTY))
-        self.assertEqual((a, hash(a)), (b, hash(b)))
-        self.assertNotEqual(a, inputs(day_duty=self.DUTY[:1]))
-        self.assertNotEqual(a, inputs())
-        self.assertEqual(inputs().day_duty, ())
-        self.assertEqual(hp.Plan("hold", "hold", 21.5, 21.5, 22.0, 22.0, 20.5).weather_offset, 0.0)
-
-    def test_the_projection_carries_the_raise_and_changes_day_at_the_lead_time(self):
-        def blocks(duty):
-            projected = hp.project_blocks(
-                self.family, inputs(day_duty=duty), T(12), T(0, day=18), TZ
-            )
-            return [(hp.hhmm(b[0], TZ), hp.hhmm(b[1], TZ), b[2], b[3]) for b in projected]
-
-        self.assertEqual(
-            blocks(()),
-            [
-                ("12:00", "13:00", "hold", 22.0),
-                ("13:00", "19:00", "hold", 22.5),
-                ("19:00", "00:00", "hold", 21.5),
-            ],
-        )
-        # raw 22.39 rounds to 22.5 and 22.89 stays there inside the hysteresis, 21.89 rounds to 22.0
-        flat = (("2026-10-17", 0.55), ("2026-10-18", 0.55))
-        self.assertEqual(
-            blocks(flat), [("12:00", "19:00", "hold", 22.5), ("19:00", "00:00", "hold", 22.0)]
-        )
-        # from 20:00 the lead time is tomorrow, which needs only 0.09 K: raw 21.59 steps down
-        mild_tomorrow = (("2026-10-17", 0.55), ("2026-10-18", 0.30))
-        self.assertEqual(
-            blocks(mild_tomorrow),
-            [
-                ("12:00", "19:00", "hold", 22.5),
-                ("19:00", "20:00", "hold", 22.0),
-                ("20:00", "00:00", "hold", 21.5),
-            ],
-        )
-
-
 class PartyWindows(unittest.TestCase):
     pc = CFG.party
 
@@ -1417,7 +1098,7 @@ class PartyWindows(unittest.TestCase):
     def test_plan_uses_the_windows(self):
         s = self.state(T(12), T(19), T(23))
         p = plan_at(T(12), party_windows=s.windows)
-        self.assertEqual((p.mode, p.setpoint), ("party", 19.0))
+        self.assertEqual((p.mode, p.allowed, p.aim), ("party", False, 21.5))
         self.assertIn("until 23:00", p.reasons[0])
 
 
@@ -1865,8 +1546,8 @@ class ComfortSwitchTests(unittest.TestCase):
 class WindowTrackerTests(unittest.TestCase):
     A, B = "binary_sensor.a", "binary_sensor.b"
 
-    def tracker(self, **kw):
-        return hp.WindowTracker(hp.WindowConfig(**kw))
+    def tracker(self, per_open_hour=0.0, **kw):
+        return hp.WindowTracker(hp.WindowConfig(**kw), per_open_hour=per_open_hour)
 
     def drive(self, tr, t0, steps):
         """steps: list of (seconds from t0, {entity: state}, air) -> list of (t, event)."""
@@ -1937,30 +1618,22 @@ class WindowTrackerTests(unittest.TestCase):
         self.assertIsNone(tr.update(t0 + 1200, {self.A: "off"}, 25.0))
         self.assertEqual(tr.update(t0 + 600 + 3600, {self.A: "off"}, 25.0), hp.EVENT_RESTORED)
 
-    def test_a_long_opening_is_restored_at_once_without_settling(self):
-        tr = self.tracker()
-        t0 = T(12)
-        events = self.drive(
-            tr,
-            t0,
-            [
-                (0, {self.A: "on"}, 21.5),
-                (120, {self.A: "on"}, 21.5),
-                (31 * 60, {self.A: "off"}, 18.0),
-            ],
-        )
-        self.assertEqual(events[-1], (31 * 60, hp.EVENT_RESTORED))
-        self.assertEqual(tr.state, "closed")
-
-    def test_thirty_minutes_exactly_is_still_an_airing(self):
-        tr = self.tracker()
-        t0 = T(12)
-        events = self.drive(
-            tr,
-            t0,
-            [(0, {self.A: "on"}, 21.5), (120, {self.A: "on"}, 21.5), (1800, {self.A: "off"}, 20.0)],
-        )
-        self.assertEqual(events[-1], (1800, hp.EVENT_SETTLE))
+    def test_every_close_settles_however_long_the_opening_was(self):
+        for minutes in (10, 30, 31, 180, 600):
+            with self.subTest(minutes=minutes):
+                tr = self.tracker()
+                t0 = T(12)
+                events = self.drive(
+                    tr,
+                    t0,
+                    [
+                        (0, {self.A: "on"}, 21.5),
+                        (120, {self.A: "on"}, 21.5),
+                        (minutes * 60, {self.A: "off"}, 18.0),
+                    ],
+                )
+                self.assertEqual(events[-1], (minutes * 60, hp.EVENT_SETTLE))
+                self.assertEqual(tr.state, "settle")
 
     def test_reopening_during_settle_keeps_the_original_air_to_recover_to(self):
         tr = self.tracker()
@@ -1973,7 +1646,7 @@ class WindowTrackerTests(unittest.TestCase):
         ev = self.drive(tr, t0, [(700, {self.A: "on"}, 20.2), (820, {self.A: "on"}, 20.2)])
         self.assertEqual(ev, [(820, hp.EVENT_OPENED)])
         self.assertEqual(tr.pre_open_air, 21.5)
-        self.assertEqual(tr.opened_at, t0 + 700)
+        self.assertEqual(tr.opened_at, t0)
 
     def test_two_openings_the_zone_waits_for_the_last_one(self):
         tr = self.tracker()
@@ -2038,12 +1711,386 @@ class WindowTrackerTests(unittest.TestCase):
         self.assertEqual(back.update(t0 + 900, {self.A: "off"}, 20.0), hp.EVENT_SETTLE)
         self.assertEqual(back.pre_open_air, 21.5)
 
+    def test_a_settle_that_was_saved_is_resumed_with_its_deadline(self):
+        tr = self.tracker(per_open_hour=2.0)
+        t0 = T(12)
+        self.drive(
+            tr,
+            t0,
+            [(0, {self.A: "on"}, 21.5), (120, {self.A: "on"}, 21.5), (3 * 3600, {self.A: "off"}, 18.0)],
+        )
+        saved = json.loads(json.dumps(tr.snapshot()))
+        back = hp.WindowTracker(hp.WindowConfig(), saved, per_open_hour=2.0)
+        self.assertEqual(back.state, "settle")
+        self.assertEqual(back.deadline(), tr.deadline())
+        self.assertEqual(back.deadline(), t0 + 3 * 3600 + 6 * 3600)
+        self.assertIsNone(back.update(back.deadline() - 1, {self.A: "off"}, 18.0))
+        self.assertEqual(back.update(back.deadline(), {self.A: "off"}, 18.0), hp.EVENT_RESTORED)
+
     def test_garbage_saved_state_means_closed(self):
         tr = hp.WindowTracker(hp.WindowConfig(), {"state": "bogus", "opened_at": 5})
         self.assertEqual(tr.state, "closed")
 
 
+class AiringLockoutTests(unittest.TestCase):
+    """How long heat stays locked out after an opening: lockout_per_open_hour times the open time,
+    from the close, at least settle_max_minutes and at most lockout_max_hours."""
+
+    A = "binary_sensor.a"
+    COLD = 17.0  # never within settle_recovered_c of the air before the opening
+
+    def aired(self, hours, per_open_hour=2.0, cfg=None, pre=21.5):
+        """A tracker that was open for `hours` from T(12) and has just closed (settling)."""
+        tr = hp.WindowTracker(cfg or hp.WindowConfig(), per_open_hour=per_open_hour)
+        t0 = T(12)
+        tr.update(t0, {self.A: "on"}, pre)
+        tr.update(t0 + 120, {self.A: "on"}, pre)
+        closed = t0 + hours * 3600
+        self.assertEqual(tr.update(closed, {self.A: "off"}, self.COLD), hp.EVENT_SETTLE)
+        return tr, closed
+
+    def lockout_minutes(self, hours, **kw):
+        tr, closed = self.aired(hours, **kw)
+        return (tr.deadline() - closed) / 60.0
+
+    def test_the_lockout_is_twice_the_open_time_between_an_hour_and_eight_hours(self):
+        self.assertEqual(self.lockout_minutes(20 / 60), 60)
+        self.assertEqual(self.lockout_minutes(3), 6 * 60)
+        self.assertEqual(self.lockout_minutes(6), 8 * 60)
+        self.assertEqual(self.lockout_minutes(12), 8 * 60)
+        self.assertEqual(self.lockout_minutes(1), 2 * 60)
+
+    def test_a_zone_without_residents_waits_an_hour_whatever_the_open_time(self):
+        for hours in (20 / 60, 3, 6):
+            self.assertEqual(self.lockout_minutes(hours, per_open_hour=0.0), 60, hours)
+
+    def test_the_settings_move_the_floor_and_the_ceiling(self):
+        cfg = hp.WindowConfig(settle_max_minutes=30, lockout_max_hours=2)
+        self.assertEqual(self.lockout_minutes(5 / 60, cfg=cfg), 30)
+        self.assertEqual(self.lockout_minutes(1.5, cfg=cfg), 2 * 60)
+        self.assertEqual(self.lockout_minutes(3, cfg=cfg), 2 * 60)
+        cfg = hp.WindowConfig(lockout_per_open_hour=1.0)
+        self.assertEqual(self.lockout_minutes(3, per_open_hour=1.0, cfg=cfg), 3 * 60)
+
+    def test_the_lockout_ends_at_the_deadline_and_not_a_second_before(self):
+        for hours, minutes in ((20 / 60, 60), (3, 360), (6, 480)):
+            with self.subTest(hours=hours):
+                tr, closed = self.aired(hours)
+                end = closed + minutes * 60
+                self.assertEqual(tr.deadline(), end)
+                self.assertIsNone(tr.update(end - 1, {self.A: "off"}, self.COLD))
+                self.assertEqual(tr.state, "settle")
+                self.assertEqual(tr.update(end, {self.A: "off"}, self.COLD), hp.EVENT_RESTORED)
+                self.assertEqual(tr.state, "closed")
+                self.assertIsNone(tr.deadline())
+
+    def test_the_lockout_ends_early_when_the_air_is_back_within_three_tenths(self):
+        tr, closed = self.aired(3, pre=21.5)
+        self.assertIsNone(tr.update(closed + 600, {self.A: "off"}, 21.1))
+        self.assertEqual(tr.update(closed + 1200, {self.A: "off"}, 21.2), hp.EVENT_RESTORED)
+        self.assertEqual(tr.state, "closed")
+
+    def test_a_long_airing_that_is_back_at_once_is_not_held_for_the_deadline(self):
+        tr, closed = self.aired(6, pre=21.5)
+        self.assertEqual(tr.update(closed + 60, {self.A: "off"}, 21.5), hp.EVENT_RESTORED)
+
+    def test_the_lockout_is_counted_from_the_close_and_not_from_the_opening(self):
+        tr, closed = self.aired(3)
+        self.assertEqual(tr.settle_since, closed)
+        self.assertEqual(tr.deadline(), closed + 6 * 3600)
+
+    def test_reopening_keeps_the_first_opening_and_the_deadline_only_moves_later(self):
+        tr, closed = self.aired(3)
+        first = tr.deadline()
+        reopen = closed + 600
+        tr.update(reopen, {self.A: "on"}, 18.0)
+        self.assertEqual(tr.update(reopen + 120, {self.A: "on"}, 18.0), hp.EVENT_OPENED)
+        self.assertEqual(tr.opened_at, T(12))
+        self.assertEqual(tr.pre_open_air, 21.5)
+        self.assertIsNone(tr.deadline())
+        again = reopen + 300
+        self.assertEqual(tr.update(again, {self.A: "off"}, self.COLD), hp.EVENT_SETTLE)
+        self.assertGreater(tr.deadline(), first)
+        self.assertEqual(tr.deadline(), again + 2 * (again - T(12)))
+
+    def test_a_reopening_after_a_short_airing_never_shortens_the_wait(self):
+        tr, closed = self.aired(20 / 60)
+        first = tr.deadline()
+        tr.update(closed + 60, {self.A: "on"}, 19.0)
+        tr.update(closed + 180, {self.A: "on"}, 19.0)
+        tr.update(closed + 200, {self.A: "off"}, self.COLD)
+        self.assertGreaterEqual(tr.deadline(), first)
+
+    def test_the_deadline_exists_only_while_settling(self):
+        tr = hp.WindowTracker(hp.WindowConfig(), per_open_hour=2.0)
+        self.assertIsNone(tr.deadline())
+        tr.update(T(12), {self.A: "on"}, 21.5)
+        tr.update(T(12, 2), {self.A: "on"}, 21.5)
+        self.assertEqual(tr.state, "open")
+        self.assertIsNone(tr.deadline())
+
+    def test_the_deadline_comes_from_the_snapshot_when_the_opening_time_was_lost(self):
+        tr = hp.WindowTracker(
+            hp.WindowConfig(),
+            {"state": "settle", "settle_since": T(12), "opened_at": None, "pre_open_air": 21.5},
+            per_open_hour=2.0,
+        )
+        self.assertEqual(tr.deadline(), T(13))
+
+    def test_a_snapshot_from_before_the_lockout_loads_and_times_out(self):
+        saved = {"state": "settle", "opened_at": T(11), "pre_open_air": 21.5, "settle_since": T(12)}
+        tr = hp.WindowTracker(hp.WindowConfig(), saved)
+        self.assertEqual(tr.deadline(), T(13))
+        self.assertEqual(tr.update(T(13), {}, 18.0), hp.EVENT_RESTORED)
+
+    def test_the_snapshot_round_trip_keeps_every_field(self):
+        tr, _closed = self.aired(3)
+        saved = json.loads(json.dumps(tr.snapshot()))
+        self.assertEqual(
+            set(saved), {"state", "opened_at", "pre_open_air", "settle_since"}
+        )
+        back = hp.WindowTracker(hp.WindowConfig(), saved, per_open_hour=2.0)
+        self.assertEqual(back.snapshot(), tr.snapshot())
+        self.assertEqual(back.deadline(), tr.deadline())
+
+
+class StartWindow(unittest.TestCase):
+    cfg = hp.CallConfig()
+
+    def test_a_start_is_taken_in_the_first_six_minutes_of_each_half_hour(self):
+        for hour, minute, expected in (
+            (12, 0, True), (12, 5, True), (12, 6, False), (12, 29, False),
+            (12, 30, True), (12, 35, True), (12, 36, False), (13, 0, True),
+        ):
+            self.assertEqual(hp.in_start_window(self.cfg, T(hour, minute)), expected, (hour, minute))
+        self.assertTrue(hp.in_start_window(self.cfg, T(12, 5) + 59))
+        self.assertFalse(hp.in_start_window(self.cfg, T(12, 6)))
+
+    def test_the_slot_and_the_window_follow_the_config(self):
+        cfg = hp.CallConfig(start_every_minutes=60, start_window_minutes=10)
+        self.assertTrue(hp.in_start_window(cfg, T(12, 9)))
+        self.assertFalse(hp.in_start_window(cfg, T(12, 10)))
+        self.assertFalse(hp.in_start_window(cfg, T(12, 30)))
+        self.assertTrue(hp.in_start_window(cfg, T(13, 0)))
+
+
+class DecideCall(unittest.TestCase):
+    cfg = hp.CallConfig()
+    AIM = 21.5
+
+    def decide(self, air, now=T(12), on=False, since=None, allowed=True, aim=None, cfg=None):
+        state = hp.CallState({"on": on, "since": since, "high": 23.5 if on else None})
+        aim = self.AIM if aim is None else aim
+        return hp.decide_call(cfg or self.cfg, state, aim, air, allowed, now)
+
+    def test_a_cold_room_starts_a_call_at_the_start_of_a_slot(self):
+        self.assertEqual(self.decide(21.0, T(12)), (True, "start"))
+        self.assertEqual(self.decide(21.0, T(12, 5)), (True, "start"))
+        self.assertEqual(self.decide(21.0, T(12, 30)), (True, "start"))
+
+    def test_outside_the_start_window_it_waits_for_the_next_slot(self):
+        for now in (T(12, 6), T(12, 15), T(12, 29), T(12, 36)):
+            self.assertEqual(self.decide(21.0, now), (False, "wait_slot"), hp.hhmm(now, TZ))
+
+    def test_a_start_needs_the_air_more_than_two_tenths_under_the_aim(self):
+        self.assertEqual(self.decide(21.3), (False, "air_ok"))
+        self.assertEqual(self.decide(21.29), (True, "start"))
+        self.assertEqual(self.decide(21.5), (False, "air_ok"))
+        self.assertEqual(self.decide(23.0), (False, "air_ok"))
+
+    def test_a_call_runs_while_the_air_is_at_most_two_tenths_over_the_aim(self):
+        self.assertEqual(self.decide(20.0, on=True, since=T(11)), (True, "calling"))
+        self.assertEqual(self.decide(21.7, on=True, since=T(11)), (True, "calling"))
+        self.assertEqual(self.decide(21.71, on=True, since=T(11)), (False, "stop"))
+
+    def test_a_call_lasts_at_least_twenty_minutes(self):
+        self.assertEqual(self.decide(22.5, T(12, 1), on=True, since=T(12)), (True, "min_on"))
+        self.assertEqual(self.decide(22.5, T(12, 19), on=True, since=T(12)), (True, "min_on"))
+        self.assertEqual(self.decide(22.5, T(12, 20), on=True, since=T(12)), (False, "stop"))
+
+    def test_the_pause_after_a_call_lasts_at_least_twenty_minutes(self):
+        self.assertEqual(self.decide(21.0, T(12), since=T(11, 41)), (False, "min_off"))
+        self.assertEqual(self.decide(21.0, T(12), since=T(11, 40)), (True, "start"))
+        self.assertEqual(self.decide(21.0, T(12, 30), since=T(12, 20)), (False, "min_off"))
+        self.assertEqual(self.decide(21.0, T(12, 30), since=T(12, 10)), (True, "start"))
+
+    def test_a_pause_that_has_run_out_still_waits_for_the_slot(self):
+        self.assertEqual(self.decide(21.0, T(12, 10), since=T(11, 0)), (False, "wait_slot"))
+
+    def test_a_zone_that_has_never_called_may_start_at_once(self):
+        self.assertEqual(self.decide(21.0, T(12), since=None), (True, "start"))
+
+    def test_heat_that_is_not_allowed_stops_a_call_at_once(self):
+        self.assertEqual(
+            self.decide(20.0, T(12, 1), on=True, since=T(12), allowed=False), (False, "not_allowed")
+        )
+
+    def test_heat_that_is_not_allowed_never_starts_a_call(self):
+        self.assertEqual(self.decide(15.0, T(12), allowed=False), (False, "not_allowed"))
+
+    def test_without_room_air_there_is_no_call(self):
+        self.assertEqual(self.decide(None), (False, "no_air"))
+        self.assertEqual(self.decide(None, on=True, since=T(11)), (False, "no_air"))
+        self.assertEqual(self.decide(None, allowed=False), (False, "not_allowed"))
+
+    def test_the_decision_leaves_the_state_alone(self):
+        state = hp.CallState({"on": False, "since": T(11)})
+        hp.decide_call(self.cfg, state, 21.5, 20.0, True, T(12))
+        self.assertEqual(state.snapshot(), {"on": False, "since": T(11), "high": None})
+
+    def test_an_air_hovering_around_the_aim_neither_starts_nor_stops_a_call(self):
+        for air in (21.4, 21.45, 21.5, 21.6, 21.7, 21.35):
+            self.assertEqual(self.decide(air, T(12))[0], False, air)
+        for air in (21.35, 21.5, 21.65, 21.7):
+            self.assertEqual(self.decide(air, T(13), on=True, since=T(12))[0], True, air)
+
+    def test_the_rule_follows_the_config(self):
+        cfg = hp.CallConfig(hysteresis_c=0.5, min_on_minutes=5, min_off_minutes=0)
+        self.assertEqual(self.decide(21.01, cfg=cfg), (False, "air_ok"))
+        self.assertEqual(self.decide(20.99, cfg=cfg), (True, "start"))
+        self.assertEqual(self.decide(22.0, T(12, 5), on=True, since=T(12), cfg=cfg), (True, "calling"))
+        self.assertEqual(self.decide(22.1, T(12, 4), on=True, since=T(12), cfg=cfg), (True, "min_on"))
+        self.assertEqual(self.decide(22.1, T(12, 5), on=True, since=T(12), cfg=cfg), (False, "stop"))
+        self.assertEqual(self.decide(20.0, T(12), since=T(11, 59), cfg=cfg), (True, "start"))
+
+    def test_the_aim_decides_not_the_old_setpoint(self):
+        self.assertEqual(self.decide(21.0, aim=20.5), (False, "air_ok"))
+        self.assertEqual(self.decide(21.0, aim=21.5), (True, "start"))
+
+    def test_a_slot_start_through_a_whole_cycle(self):
+        state = hp.CallState()
+        log = []
+        air = 21.0
+        for step in range(0, 6 * 12):
+            now = T(12) + step * 300
+            on, reason = hp.decide_call(self.cfg, state, 21.5, air, True, now)
+            if state.apply(on, now, 23.5):
+                log.append((hp.hhmm(now, TZ), "on" if on else "off", reason))
+            air += 0.125 if state.on else -0.0625
+        self.assertEqual(
+            log,
+            [
+                ("12:00", "on", "start"),
+                ("12:30", "off", "stop"),
+                ("13:30", "on", "start"),
+                ("14:00", "off", "stop"),
+                ("15:00", "on", "start"),
+                ("15:30", "off", "stop"),
+                ("16:30", "on", "start"),
+                ("17:00", "off", "stop"),
+            ],
+        )
+
+
+class CallStateTests(unittest.TestCase):
+    def test_a_new_state_is_not_calling(self):
+        s = hp.CallState()
+        self.assertEqual((s.on, s.since, s.high), (False, None, None))
+        self.assertEqual(s.snapshot(), {"on": False, "since": None, "high": None})
+
+    def test_apply_reports_a_start_and_a_stop_and_nothing_else(self):
+        s = hp.CallState()
+        self.assertFalse(s.apply(False, T(12)))
+        self.assertIsNone(s.since)
+        self.assertTrue(s.apply(True, T(12), 23.5))
+        self.assertEqual((s.on, s.since, s.high), (True, T(12), 23.5))
+        self.assertFalse(s.apply(True, T(12, 10), 24.0))
+        self.assertEqual((s.since, s.high), (T(12), 23.5))
+        self.assertTrue(s.apply(False, T(12, 30), 24.0))
+        self.assertEqual((s.on, s.since, s.high), (False, T(12, 30), None))
+
+    def test_a_call_without_a_stored_high_setpoint_takes_the_next_one_offered(self):
+        s = hp.CallState({"on": True, "since": T(12)})
+        self.assertIsNone(s.high)
+        self.assertFalse(s.apply(True, T(12, 5), 23.5))
+        self.assertEqual((s.since, s.high), (T(12), 23.5))
+
+    def test_the_state_survives_a_json_round_trip(self):
+        s = hp.CallState()
+        s.apply(True, T(12), 23.5)
+        again = hp.CallState(json.loads(json.dumps(s.snapshot())))
+        self.assertEqual(again.snapshot(), s.snapshot())
+        s.apply(False, T(12, 30))
+        again = hp.CallState(json.loads(json.dumps(s.snapshot())))
+        self.assertEqual(again.snapshot(), {"on": False, "since": T(12, 30), "high": None})
+
+    def test_junk_in_the_saved_state_is_ignored(self):
+        for junk in (None, [], "on", 5, {"on": "yes"}, {"on": 1}, {"since": "x"}, {"high": "x"}):
+            s = hp.CallState(junk)
+            self.assertEqual((s.on, s.since, s.high), (False, None, None), junk)
+        s = hp.CallState({"on": True, "since": True, "high": float("nan")})
+        self.assertEqual((s.on, s.since, s.high), (True, None, None))
+        s = hp.CallState({"on": True, "since": float("inf"), "high": False})
+        self.assertEqual((s.on, s.since, s.high), (True, None, None))
+
+    def test_a_high_setpoint_is_only_kept_for_a_call_that_is_on(self):
+        self.assertIsNone(hp.CallState({"on": False, "since": T(12), "high": 23.5}).high)
+        self.assertEqual(hp.CallState({"on": True, "since": T(12), "high": 23.5}).high, 23.5)
+
+    def test_whole_numbers_come_back_as_floats(self):
+        s = hp.CallState({"on": True, "since": 5, "high": 24})
+        self.assertEqual((s.since, s.high), (5.0, 24.0))
+        self.assertIsInstance(s.since, float)
+        self.assertIsInstance(s.high, float)
+
+
+class HighLimitAndDrive(unittest.TestCase):
+    cfg = hp.CallConfig()
+
+    def test_the_high_setpoint_is_two_degrees_over_the_aim_rounded_up_to_the_step(self):
+        for aim, expected in ((21.5, 23.5), (21.6, 24.0), (21.0, 23.0), (20.3, 22.5), (19.0, 21.0)):
+            self.assertEqual(hp.high_limit(self.cfg, aim, 25.0), expected, aim)
+
+    def test_the_high_setpoint_stops_at_the_device_upper_limit(self):
+        self.assertEqual(hp.high_limit(self.cfg, 22.5, 24.0), 24.0)
+        self.assertEqual(hp.high_limit(self.cfg, 24.0, 25.0), 25.0)
+        self.assertEqual(hp.high_limit(self.cfg, 23.0, 24.0), 24.0)
+
+    def test_the_margin_follows_the_config(self):
+        self.assertEqual(hp.high_limit(hp.CallConfig(high_margin_c=1.0), 21.5, 24.0), 22.5)
+        self.assertEqual(hp.high_limit(hp.CallConfig(high_margin_c=0.0), 21.3, 24.0), 21.5)
+
+    def calling(self, high=23.5):
+        s = hp.CallState()
+        s.apply(True, T(12), high)
+        return s
+
+    def test_a_zone_that_is_not_calling_sits_at_the_device_minimum(self):
+        self.assertEqual(hp.drive_setpoint(hp.CallState(), 21.5, False, 5.0, 24.0), 5.0)
+        self.assertEqual(hp.drive_setpoint(hp.CallState(), 24.0, False, 5.0, 24.0), 5.0)
+
+    def test_a_call_is_driven_at_its_fixed_high_setpoint_whatever_the_aim_does(self):
+        s = self.calling(23.5)
+        for aim in (21.5, 22.0, 19.0):
+            self.assertEqual(hp.drive_setpoint(s, aim, False, 5.0, 24.0), 23.5, aim)
+
+    def test_the_drive_stays_inside_what_the_device_takes(self):
+        self.assertEqual(hp.drive_setpoint(self.calling(26.0), 21.5, False, 5.0, 24.0), 24.0)
+        self.assertEqual(hp.drive_setpoint(self.calling(3.0), 21.5, False, 5.0, 24.0), 5.0)
+        self.assertEqual(hp.drive_setpoint(hp.CallState(), 21.5, False, 7.0, 24.0), 7.0)
+
+    def test_a_call_that_lost_its_high_setpoint_falls_back_to_the_minimum(self):
+        s = hp.CallState({"on": True, "since": T(12)})
+        self.assertEqual(hp.drive_setpoint(s, 21.5, False, 5.0, 24.0), 5.0)
+
+    def test_without_room_air_the_aim_goes_out_as_an_ordinary_setpoint(self):
+        self.assertEqual(hp.drive_setpoint(hp.CallState(), 21.3, True, 5.0, 24.0), 21.5)
+        self.assertEqual(hp.drive_setpoint(hp.CallState(), 21.2, True, 5.0, 24.0), 21.0)
+        self.assertEqual(hp.drive_setpoint(self.calling(23.5), 21.5, True, 5.0, 24.0), 21.5)
+        self.assertEqual(hp.drive_setpoint(hp.CallState(), 30.0, True, 5.0, 24.0), 24.0)
+        self.assertEqual(hp.drive_setpoint(hp.CallState(), 3.0, True, 5.0, 24.0), 5.0)
+
+
 class TokenBucketTests(unittest.TestCase):
+    def test_four_writes_an_hour_give_a_token_every_quarter_hour(self):
+        b = hp.TokenBucket(4)
+        for _ in range(4):
+            self.assertTrue(b.take(T(12)))
+        self.assertFalse(b.take(T(12, 14)))
+        self.assertTrue(b.take(T(12, 15)))
+        self.assertFalse(b.take(T(12, 16)))
+        self.assertTrue(b.take(T(12, 30)))
+
     def test_two_writes_then_empty(self):
         b = hp.TokenBucket(2)
         self.assertTrue(b.take(T(12)))
@@ -2129,39 +2176,104 @@ class WriteGateTests(unittest.TestCase):
         self.assertEqual(bucket.available(T(12)), 1.0)
 
 
-class FamilyDayReplay(unittest.TestCase):
-    """A whole constant-weather day through plan, gate and bucket, as the shadow run does."""
+class CallDayReplay(unittest.TestCase):
+    """A day of one zone through plan, call rule, drive and write gate in five-minute ticks, with a
+    room that cools while the heat is off and warms while the zone calls."""
 
-    def replay(self, zone, **kw):
-        last, desired, since = None, None, T(0)
-        bucket = hp.TokenBucket(2)
-        writes = []
-        for step in range(0, 24 * 12):
-            now = T(0) + step * 300
-            p = hp.plan(CFG.zones[zone], inputs(zone, last_planned=last, **kw), now, TZ)
-            if p.setpoint != desired:
-                desired, since = p.setpoint, now
-            if last is None:
-                last = desired  # the state file already holds yesterday's evening value
-            g = hp.write_gate(desired, last, now, since, None, bucket, 600)
-            if g.write:
-                last = desired
-                writes.append((hp.hhmm(now, TZ), desired))
-        return writes
+    TICK = 300
 
-    def test_family_makes_three_changes_ten_minutes_after_each_step(self):
-        self.assertEqual(self.replay("family"), [("06:10", 22.0), ("13:10", 22.5), ("19:10", 21.5)])
+    def replay(self, zone="family", air=21.0, cool=0.02, warm=0.06, **kw):
+        zc = CFG.zones[zone]
+        state = hp.CallState()
+        bucket = hp.TokenBucket(CFG.writes_per_hour)
+        last, desired, since, priority = hp.DEVICE_MIN_C, None, T(0), None
+        ticks, writes = [], []
+        for step in range(24 * 12):
+            now = T(0) + step * self.TICK
+            p = hp.plan(zc, inputs(zone, **kw), now, TZ)
+            on, _reason = hp.decide_call(CFG.call, state, p.aim, air, p.allowed, now)
+            if state.apply(on, now, hp.high_limit(CFG.call, p.aim, zc.upper_c)):
+                priority = "call"
+            drive = hp.drive_setpoint(state, p.aim, False, hp.DEVICE_MIN_C, zc.upper_c)
+            if drive != desired:
+                desired, since = drive, now
+            gate = hp.write_gate(desired, last, now, since, priority, bucket, 600)
+            if gate.write:
+                last, priority = desired, None
+                writes.append((now, desired))
+            ticks.append((now, state.on, air, p.aim))
+            air += warm if state.on else -cool
+        return ticks, writes
 
-    def test_project_blocks_gives_the_same_day(self):
+    def runs(self, ticks):
+        """(start, end) of every call that began and ended inside the day."""
+        out, start = [], None
+        for ts, on, _air, _aim in ticks:
+            if on and start is None:
+                start = ts
+            elif not on and start is not None:
+                out.append((start, ts))
+                start = None
+        return out
+
+    def test_every_call_starts_in_a_start_window_and_lasts_at_least_twenty_minutes(self):
+        ticks, _writes = self.replay()
+        runs = self.runs(ticks)
+        self.assertGreaterEqual(len(runs), 3)
+        for start, end in runs:
+            self.assertTrue(hp.in_start_window(CFG.call, start), hp.hhmm(start, TZ))
+            self.assertGreaterEqual(end - start, 20 * 60, hp.hhmm(start, TZ))
+
+    def test_the_pause_between_calls_is_at_least_twenty_minutes(self):
+        ticks, _writes = self.replay()
+        runs = self.runs(ticks)
+        for (_s1, end), (start, _e2) in zip(runs, runs[1:]):
+            self.assertGreaterEqual(start - end, 20 * 60, hp.hhmm(end, TZ))
+
+    def test_the_air_stays_near_the_aim_while_the_aim_is_flat(self):
+        ticks, _writes = self.replay()
+        flat = [air - aim for ts, _on, air, aim in ticks if T(7) <= ts < T(13)]
+        self.assertLess(max(flat), 0.4)
+        self.assertGreater(min(flat), -0.4)
+
+    def test_the_thermostat_is_written_at_the_minimum_or_at_a_high_setpoint_above_the_aim(self):
+        _ticks, writes = self.replay()
+        self.assertGreaterEqual(len(writes), 6)
+        values = [value for _ts, value in writes]
+        for value in values:
+            self.assertTrue(value == hp.DEVICE_MIN_C or 22.5 <= value <= 24.0, value)
+        for a, b in zip(values, values[1:]):
+            self.assertNotEqual(a, b)
+
+    def test_a_call_is_written_in_the_tick_it_starts_and_stops(self):
+        ticks, writes = self.replay()
+        written = {ts for ts, _value in writes}
+        for start, end in self.runs(ticks):
+            self.assertIn(start, written, hp.hhmm(start, TZ))
+            self.assertIn(end, written, hp.hhmm(end, TZ))
+
+    def test_a_day_with_the_window_open_never_calls_nor_writes_high(self):
+        ticks, writes = self.replay(window_state=hp.STATE_OPEN)
+        self.assertFalse(any(on for _ts, on, _air, _aim in ticks))
+        self.assertEqual(writes, [])
+
+    def test_a_cold_room_that_is_not_allowed_heat_is_left_alone_until_it_is(self):
+        ticks, _writes = self.replay(air=18.0, cool=0.0, warm=0.0, party_windows=((T(0), T(6)),))
+        first_on = min(ts for ts, on, _air, _aim in ticks if on)
+        self.assertEqual(first_on, T(6))
+
+
+class ProjectBlocks(unittest.TestCase):
+    def test_project_blocks_gives_the_aim_of_the_day(self):
         zc = CFG.zones["family"]
         blocks = hp.project_blocks(zc, inputs(), T(0), T(0, day=18), TZ)
         self.assertEqual(
             [(hp.hhmm(b[0], TZ), hp.hhmm(b[1], TZ), b[2], b[3]) for b in blocks],
             [
-                ("00:00", "06:00", "hold", 21.5),
-                ("06:00", "13:00", "hold", 22.0),
-                ("13:00", "19:00", "hold", 22.5),
-                ("19:00", "00:00", "hold", 21.5),
+                ("00:00", "06:00", "hold", 21.0),
+                ("06:00", "13:00", "hold", 21.5),
+                ("13:00", "19:00", "hold", 22.0),
+                ("19:00", "00:00", "hold", 21.0),
             ],
         )
 
@@ -2183,10 +2295,10 @@ class FamilyDayReplay(unittest.TestCase):
         self.assertEqual(
             modes,
             [
-                ("00:00", "hold", 21.5),
-                ("01:00", "sun_cut", 21.0),
-                ("14:00", "hold", 22.5),
-                ("19:00", "hold", 21.5),
+                ("00:00", "hold", 21.0),
+                ("01:00", "sun_cut", 20.5),
+                ("14:00", "hold", 22.0),
+                ("19:00", "hold", 21.0),
             ],
         )
 
@@ -2241,62 +2353,6 @@ class BlockLogTests(unittest.TestCase):
         )
 
 
-class TrimTests(unittest.TestCase):
-    cfg = hp.TrimConfig(initial=0.5, minimum=-0.5, maximum=1.5)
-
-    @staticmethod
-    def hours(bias, n_hours=10, ticks=12, first=0):
-        return {h: [bias * ticks, ticks] for h in range(first, first + n_hours)}
-
-    def test_moves_halfway_to_the_measured_bias(self):
-        u = hp.update_trim(0.5, self.hours(0.9), self.cfg)
-        self.assertEqual((u.trim, u.valid_hours, u.changed), (0.7, 10, True))
-        self.assertAlmostEqual(u.bias, 0.9)
-
-    def test_rounded_to_five_hundredths(self):
-        u = hp.update_trim(0.5, self.hours(0.77), self.cfg)
-        self.assertEqual(u.trim, 0.65)  # 0.635 -> nearest 0.05
-
-    def test_too_few_valid_hours_leave_it_alone(self):
-        u = hp.update_trim(0.5, self.hours(1.2, n_hours=5), self.cfg)
-        self.assertEqual((u.trim, u.bias, u.valid_hours, u.changed), (0.5, None, 5, False))
-
-    def test_an_hour_needs_six_samples(self):
-        hours = self.hours(1.2, n_hours=6)
-        hours[0] = [1.2 * 5, 5]
-        self.assertFalse(hp.update_trim(0.5, hours, self.cfg).changed)
-
-    def test_only_the_trim_hours_count(self):
-        hours = {h: [1.0 * 12, 12] for h in (10, 11, 12, 21, 22, 23)}
-        self.assertEqual(hp.update_trim(0.5, hours, self.cfg).valid_hours, 0)
-        hours = {str(h): [1.0 * 12, 12] for h in range(4, 10)}  # json keys are strings
-        self.assertEqual(hp.update_trim(0.5, hours, self.cfg).valid_hours, 6)
-
-    def test_trim_window_is_midnight_through_nine(self):
-        self.assertEqual(list(hp.TRIM_HOURS), list(range(0, 10)))
-        hours = {h: [12.0, 12] for h in (0, 9, 10, 23)}
-        self.assertEqual(hp.update_trim(0.5, hours, self.cfg).valid_hours, 2)
-
-    def test_six_of_the_ten_hours_are_enough(self):
-        u = hp.update_trim(0.5, self.hours(0.9, n_hours=6), self.cfg)
-        self.assertEqual((u.trim, u.valid_hours, u.changed), (0.7, 6, True))
-
-    def test_clamped_to_the_zone_range(self):
-        self.assertEqual(hp.update_trim(1.5, self.hours(4.0), self.cfg).trim, 1.5)
-        self.assertEqual(hp.update_trim(-0.5, self.hours(-4.0), self.cfg).trim, -0.5)
-
-    def test_a_zone_whose_air_is_its_thermostat_stays_at_zero(self):
-        cfg = hp.TrimConfig(0.0, -1.0, 1.0)
-        u = hp.update_trim(0.0, self.hours(0.0), cfg)
-        self.assertEqual((u.trim, u.changed), (0.0, False))
-
-    def test_converges_towards_a_constant_bias(self):
-        trim = 0.0
-        for _ in range(8):
-            trim = hp.update_trim(trim, self.hours(0.6), self.cfg).trim
-        self.assertAlmostEqual(trim, 0.6, delta=0.05)
-
-
 def tick(
     ts=T(12),
     hour=12,
@@ -2306,13 +2362,10 @@ def tick(
     air=21.5,
     target=21.5,
     lower=19.0,
-    bias=None,
     fallback=False,
     dt_s=300.0,
 ):
-    return hp.TickSample(
-        ts, hour, dt_s, plan_mode, season_on, calling, air, target, lower, bias, fallback
-    )
+    return hp.TickSample(ts, hour, dt_s, plan_mode, season_on, calling, air, target, lower, fallback)
 
 
 class ZoneDayTests(unittest.TestCase):
@@ -2322,7 +2375,7 @@ class ZoneDayTests(unittest.TestCase):
             d.add_tick(tick(calling=True))
         for _ in range(6):
             d.add_tick(tick(plan_mode="sun_cut"))
-        rec = d.record("family", 0.5, hp.TrimUpdate(0.5, None, 0, False))
+        rec = d.record("family")
         self.assertEqual(rec["mode_hours"], {"hold": 1.0, "sun_cut": 0.5})
         self.assertEqual(rec["call_hours"], 1.0)
         self.assertEqual(rec["ticks"], 18)
@@ -2334,7 +2387,7 @@ class ZoneDayTests(unittest.TestCase):
         d.add_tick(tick(hour=3, air=25.0))  # night: not counted
         d.add_tick(tick(plan_mode="window", air=18.0))  # coasting: not counted
         d.add_tick(tick(season_on=False, air=25.0))  # off season: not counted
-        rec = d.record("family", 0.5, hp.TrimUpdate(0.5, None, 0, False))
+        rec = d.record("family")
         self.assertEqual((rec["band_ticks"], rec["in_band_pct"]), (2, 50.0))
 
     def test_air_range_and_below_lower_limit(self):
@@ -2342,7 +2395,7 @@ class ZoneDayTests(unittest.TestCase):
         for air in (20.0, 18.5, 22.0, None):
             d.add_tick(tick(air=air))
         d.add_tick(tick(plan_mode="settle", air=17.0))
-        rec = d.record("family", 0.5, hp.TrimUpdate(0.5, None, 0, False))
+        rec = d.record("family")
         self.assertEqual((rec["air_min"], rec["air_max"]), (17.0, 22.0))
         self.assertEqual(rec["below_lower_ticks"], 1)
         self.assertEqual(rec["air_mean"], round((20.0 + 18.5 + 22.0 + 17.0) / 4, 2))
@@ -2352,25 +2405,14 @@ class ZoneDayTests(unittest.TestCase):
         d.add_tick(tick(hour=9, air=25.0, target=21.5))
         d.add_tick(tick(hour=14, air=22.4, target=21.5))
         d.add_tick(tick(hour=15, air=22.9, target=21.5))
-        rec = d.record("family", 0.5, hp.TrimUpdate(0.5, None, 0, False))
+        rec = d.record("family")
         self.assertEqual(rec["afternoon_excess_max"], 1.4)
-
-    def test_bias_goes_into_the_trim_hours(self):
-        d = hp.ZoneDay("2026-10-17")
-        d.add_tick(tick(hour=8, bias=0.4))
-        d.add_tick(tick(hour=8, bias=0.6))
-        d.add_tick(tick(hour=0, bias=0.2))
-        d.add_tick(tick(hour=9, bias=0.3))
-        d.add_tick(tick(hour=10, bias=9.0))
-        d.add_tick(tick(hour=23, bias=9.0))
-        d.add_tick(tick(hour=9, bias=None))
-        self.assertEqual(d.bias, {0: [0.2, 1], 8: [1.0, 2], 9: [0.3, 1]})
 
     def test_fallback_hours(self):
         d = hp.ZoneDay("2026-10-17")
         d.add_tick(tick(fallback=True))
         d.add_tick(tick())
-        self.assertEqual(d.record("z", 0, hp.TrimUpdate(0, None, 0, False))["fallback_hours"], 0.08)
+        self.assertEqual(d.record("z")["fallback_hours"], 0.08)
 
     def test_would_write_reverts_within_half_an_hour(self):
         d = hp.ZoneDay("2026-10-17")
@@ -2383,32 +2425,33 @@ class ZoneDayTests(unittest.TestCase):
         self.assertEqual(d.reverts, 1)
         self.assertEqual(len(d.would_writes), 5)
 
-    def test_budget_is_noted_once_and_the_record_carries_the_trim_update(self):
+    def test_budget_is_noted_once_and_the_record_names_the_zone_and_the_day(self):
         d = hp.ZoneDay("2026-10-17")
         d.note_budget({"h_pred": 4.0})
         d.note_budget({"h_pred": 9.0})
-        rec = d.record("family", 0.5, hp.TrimUpdate(0.55, 0.6, 9, True))
+        rec = d.record("family")
         self.assertEqual(rec["budget"], {"h_pred": 4.0})
-        self.assertEqual(
-            (rec["trim_before"], rec["trim_after"], rec["trim_bias"], rec["trim_valid_hours"]),
-            (0.5, 0.55, 0.6, 9),
-        )
         self.assertEqual((rec["type"], rec["zone"], rec["day"]), ("daily", "family", "2026-10-17"))
+
+    def test_the_record_has_no_trim_fields(self):
+        rec = hp.ZoneDay("2026-10-17").record("family")
+        self.assertEqual([k for k in rec if "trim" in k or "bias" in k], [])
+
+    def test_a_saved_day_from_the_old_model_loads(self):
+        old = {"ticks": 3, "mode_s": {"warm": 600.0}, "call_s": 300.0, "bias": {"8": [1.0, 2]}}
+        d = hp.ZoneDay("2026-10-17", old)
+        self.assertEqual(d.record("family")["mode_hours"], {"warm": 0.17})
 
     def test_state_survives_a_json_round_trip(self):
         import json
 
         d = hp.ZoneDay("2026-10-17")
         for h in (8, 9, 14):
-            d.add_tick(tick(hour=h, bias=0.4, calling=True, air=22.0 + h / 100))
+            d.add_tick(tick(hour=h, calling=True, air=22.0 + h / 100))
         d.add_would_write(T(10), 22.0)
         d.note_budget({"h_pred": 4.0})
         again = hp.ZoneDay("2026-10-17", json.loads(json.dumps(d.snapshot())))
-        self.assertEqual(
-            again.record("z", 0, hp.TrimUpdate(0, None, 0, False)),
-            d.record("z", 0, hp.TrimUpdate(0, None, 0, False)),
-        )
-        self.assertEqual(again.bias, d.bias)
+        self.assertEqual(again.record("z"), d.record("z"))
 
 
 if __name__ == "__main__":

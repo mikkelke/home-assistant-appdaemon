@@ -116,7 +116,9 @@ a resident's confirmation and a successful physical action.
   wake/blind decisions and notifications. Do not derive competing comfort physics in a card.
 - **Modes:** [HeatingController](../apps/climate/heating_controller.py) writes thermostat
   setpoints only for configured `live_zones` while its live switch is on; other zones stay
-  in shadow. Each zone publishes its live status. An open window lowers a live zone's setpoint.
+  in shadow. Each zone publishes its live status. A live zone sits at its device minimum and is
+  set high only for a heat call the controller starts from the room air; an open window ends the
+  call and keeps heat locked out after it closes. `setpoint_now` is the air the zone aims for.
   Source freshness and excluded sensors belong to the interpretation, not just the temperature.
 - **Proof:** [RoomFeel](../apps/climate/tests/test_room_feel.py),
   [cooling](../apps/climate/tests/test_smart_cooling.py) and relevant wake tests.

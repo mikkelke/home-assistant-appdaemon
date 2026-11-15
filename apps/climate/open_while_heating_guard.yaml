@@ -11,6 +11,9 @@ open_while_heating_guard:
   # the preceding 24 hours. Ordinary heat cycles do not reset the opening allowance.
   # A confirmed new heat call while an opening is already open warns immediately.
   # The season switch keeps summer airing silent.
+  # aim: the heating zone sensor whose setpoint_now is the air the controller aims for in the
+  # room. The controller zones' thermostats sit at their minimum or at a call's high setpoint,
+  # so the warm delay reads the aim instead; the bedroom is no zone and keeps its thermostat.
   # Per-room push audience (person names from MobileNotifier's device_mapping).
   # Mikkel gets every room; Kristine/Claudia get their own room + the shared family
   # space (kitchen/living/dining). A name without a mapped phone is skipped.
@@ -27,6 +30,7 @@ open_while_heating_guard:
       contacts: ["binary_sensor.bathroom_window_contact"]
       thermostat: "climate.bathroom_thermostat"
       heating: "binary_sensor.bathroom_heating_active"
+      aim: "sensor.heating_zone_bathroom"
       air: "sensor.bathroom_feel"
       notify: ["mikkel"]
     kitchen:
@@ -34,6 +38,7 @@ open_while_heating_guard:
       contacts: ["binary_sensor.kitchen_window_contact"]
       thermostat: "climate.family_room_thermostat"
       heating: "binary_sensor.kitchen_heating_active"
+      aim: "sensor.heating_zone_family"
       air: "sensor.kitchen_feel"
       notify: ["mikkel", "kristine", "claudia"]
     living_room:
@@ -45,6 +50,7 @@ open_while_heating_guard:
         binary_sensor.rooftop_door_1_contact: "rooftop door"
       thermostat: "climate.family_room_thermostat"
       heating: "binary_sensor.living_room_heating_active"
+      aim: "sensor.heating_zone_family"
       air: "sensor.living_room_feel"
       notify: ["mikkel", "kristine", "claudia"]
     kristines_room:
@@ -52,6 +58,7 @@ open_while_heating_guard:
       contacts: ["binary_sensor.kristines_room_window_contact"]
       thermostat: "climate.kristines_room_thermostat"
       heating: "binary_sensor.kristines_room_heating_active"
+      aim: "sensor.heating_zone_kristines_room"
       air: "sensor.kristines_room_feel"
       notify: ["mikkel", "kristine"]
     dining_room:
@@ -62,6 +69,7 @@ open_while_heating_guard:
         - "binary_sensor.dining_room_window_3_contact"
       thermostat: "climate.family_room_thermostat"
       heating: "binary_sensor.dining_room_heating_active"
+      aim: "sensor.heating_zone_family"
       air: "sensor.dining_room_feel"
       notify: ["mikkel", "kristine", "claudia"]
     claudias_room:
@@ -70,5 +78,6 @@ open_while_heating_guard:
       contacts: ["binary_sensor.rooftop_door_2_contact"]
       thermostat: "climate.claudias_room_thermostat"
       heating: "binary_sensor.claudias_room_heating_active"
+      aim: "sensor.heating_zone_claudias_room"
       air: "sensor.claudias_room_feel"
       notify: ["mikkel", "claudia"]

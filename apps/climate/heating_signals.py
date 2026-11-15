@@ -16,7 +16,9 @@ same entity shortly before it. A call that explains the change decides who made 
   - from an account nobody maps: unknown
 No explaining call means the keypad, credited to the room's resident when the zone has exactly
 one. The controller's own writes are excluded first; a return to the pre-write value or mode
-without an explaining call is attributed to a device rejection.
+without an explaining call is attributed to a device rejection. A mode call (off, on, toggle)
+also explains the setpoint change the thermostat makes by itself right after it, which is a
+side effect of that call and means nothing for the plan.
 
 Meaning, by who and what:
   - A resident's button press, or their setpoint change in their own room (Home Assistant or
@@ -44,6 +46,7 @@ import heating_plan as hp
 
 CALL_EVENT = "call_service"
 CALL_DOMAINS = ("climate",)
+MODE_SERVICES = ("set_hvac_mode", "turn_on", "turn_off", "toggle")
 CALL_KEEP_S = 600.0
 CALL_MATCH_S = 120.0
 CALL_LATE_S = 2.0
@@ -276,9 +279,12 @@ def _is_own_call(call: CallRecord, own: OwnWrite) -> bool:
 
 def call_explains(call: CallRecord, change: Change) -> bool:
     """Whether a service call can have produced a change. A setpoint is matched within one
-    device step, because the thermostat rounds what it is given."""
+    device step, because the thermostat rounds what it is given; a mode call explains any
+    setpoint, because the thermostat moves its setpoint when its mode changes."""
     data = call.data
     if change.kind == KIND_SETPOINT:
+        if call.service in MODE_SERVICES:
+            return True
         asked, got = _num(data.get("temperature")), _num(change.new)
         return (
             call.service == "set_temperature"
@@ -349,10 +355,20 @@ def attribute_change(
     return Attribution(SRC_KEYPAD, who)
 
 
+def setpoint_echo(change: Change, attr: Attribution) -> bool:
+    """Whether a setpoint change is the thermostat's own move after a mode call, not a setting
+    anybody made."""
+    return (
+        change.kind == KIND_SETPOINT
+        and attr.call is not None
+        and attr.call.service in MODE_SERVICES
+    )
+
+
 def thermostat_effect(zc: hp.ZoneConfig, owner: str, change: Change, attr: Attribution) -> str:
     """What a thermostat change means. EFFECT_NUDGE is the intent to move the nudge; whether it
     moves, stops at a bound or collapses into an earlier step is step_nudge's call."""
-    if attr.source in (SRC_OWN, SRC_REVERT):
+    if attr.source in (SRC_OWN, SRC_REVERT) or setpoint_echo(change, attr):
         return EFFECT_NONE
     by_owner = attr.source == SRC_HA and attr.who in (owner, AGENT)
     if change.kind == KIND_MODE:

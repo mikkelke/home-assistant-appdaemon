@@ -1,13 +1,23 @@
 """
-HeatingController - plans setpoints for the managed floor-heating zones. Zones in live_zones
-are written only while live_switch_entity is on; all other zones record the shadow plan.
-Writes use the thermostat's reported state, a saved token bucket and ten-minute stability,
-with one pending write per zone and a three-minute read-back deadline.
+HeatingController - decides every heat call of the managed floor-heating zones from their
+seated control air and drives the thermostats as relays: at the device minimum while a zone does
+not call, at a high setpoint fixed for the whole call while it does, and at the aim itself while
+there is no room air to go by. Zones in live_zones are written only while live_switch_entity is
+on; all other zones record the shadow decisions, and turning the switch off hands each live zone
+back to its thermostat with the aim as an ordinary setpoint. Writes use the thermostat's
+reported state, a saved token bucket and ten-minute stability, except that a call starting or
+stopping is written at once, with one pending write per zone and a three-minute read-back
+deadline.
 
 The planning rules live in heating_plan.py, the weather side in heating_forecast.py, the rules
 for who changed what in heating_signals.py, the plant alerts in heating_alerts.py and the season
 advice in heating_season.py; this file reads Home Assistant, runs those rules and publishes the
 result.
+
+Heat is not allowed, and so there is no call, while a window is open, for the lockout after an
+airing, in a party, at the floor cap, while the owner has the zone off and while the season is
+off. A zone with residents stays locked out for lockout_per_open_hour times the time it was
+open, up to lockout_max_hours, unless the air gets back to where it was before.
 
 Signals: a thermostat setpoint, mode or preset change is attributed from the service calls the
 app sees on the thermostats; the four nudge buttons and the helpers the owner owns are read from
@@ -21,8 +31,9 @@ shadow too. So does the season advice: a push that asks the owner to start the s
 autumn or stop it in the spring, never a change of the season switch.
 
 Outputs:
-  - sensor.heating_zone_<zone>: the zone's comfort target as state; mode, planned setpoint,
-    trim, nudge, last signal, day timeline, budget and reasons as attributes.
+  - sensor.heating_zone_<zone>: the zone's comfort target as state; mode, aim (setpoint_now),
+    whether it calls and since when, when the lockout ends at the latest, nudge, last signal, day
+    timeline, budget and reasons as attributes.
   - sensor.heating_controller: live, shadow or off_season, with forecast and outdoor status, the
     active alerts and the latest season advice.
   - <log_dir>/decisions-YYYY-MM.jsonl, append only. Line types: forecast (every fetch),
@@ -30,10 +41,11 @@ Outputs:
     evening of the bedroom loop), signal (each classified change), alert (each start,
     suppressed start and clear), season_advice (each judgement that advises something, pushed
     or not), write (send and read-back result), daily (per zone and for the house, once a day).
-  - state_file: trims, nudges, window and bucket state, day timeline and statistics, the
-    bedroom loop, the last signals, the alert episodes and the season advisor's morning means
-    and asks, held-off and season-off flags, write counts and failures. Pending writes and
-    desired stability are not saved. A missing or corrupt file falls back to the yaml defaults.
+  - state_file: nudges, call and window state (so a restart keeps a call and a lockout going),
+    bucket state, day timeline and statistics, the bedroom loop, the last signals, the alert
+    episodes and the season advisor's morning means and asks, held-off and season-off flags,
+    write counts and failures. Pending writes and desired stability are not saved. A missing or
+    corrupt file falls back to the yaml defaults; keys it no longer reads are ignored.
 
 Reading policy: AppDaemon 4.5.13 can serve a stale get_state value while still firing the
 state callback, so every read takes the fresher of the last callback value and the store. An
@@ -77,7 +89,6 @@ MAX_TICK_GAP_S = 900.0
 FLOOR_FRESH_MIN = 60.0
 FLOOR_CAP_FRESH_MIN = 1440.0
 OUTDOOR_FRESH_MIN = 20.0
-NO_SETPOINT_CHANGE_S = 7200.0
 DAILY_KEEP = 60
 NOTIFIED_KEEP_S = 3 * 86400.0
 SIGNALS_KEEP = 50
@@ -138,17 +149,18 @@ class ZoneRuntime:
     def __init__(self, zc: hp.ZoneConfig, cfg: hp.Config, saved: dict):
         saved = _dict(saved)
         self.zc = zc
-        self.trim = _num(saved.get("trim"))
-        if self.trim is None:
-            self.trim = zc.trim.initial
-        self.trim = hp.clamp(self.trim, zc.trim.minimum, zc.trim.maximum)
         nudge = _num(saved.get("nudge")) or 0.0
         self.nudge = hp.clamp(nudge, zc.nudge.minimum, zc.nudge.maximum) if zc.residents else 0.0
         self.nudge_at = _num(saved.get("nudge_at"))
         direction = _num(saved.get("nudge_dir")) or 0
         self.nudge_dir = (direction > 0) - (direction < 0)
         self.last_planned = _num(saved.get("last_planned"))
-        self.tracker = hp.WindowTracker(cfg.window, _dict(saved.get("window")))
+        self.tracker = hp.WindowTracker(
+            cfg.window,
+            _dict(saved.get("window")),
+            cfg.window.lockout_per_open_hour if zc.residents else 0.0,
+        )
+        self.call = hp.CallState(saved.get("call"))
         self.bucket = hp.TokenBucket(cfg.writes_per_hour, _dict(saved.get("bucket")))
         self.blocks = hp.BlockLog(_dict(saved.get("blocks")))
         self.days = {
@@ -158,7 +170,6 @@ class ZoneRuntime:
         }
         self.cut_day = saved.get("cut_day") if isinstance(saved.get("cut_day"), str) else None
         self.floor_cap = saved.get("floor_cap") is True
-        self.warm = saved.get("warm") is True
         self.comfort = (
             hp.ComfortSwitch(zc.control_air, _dict(saved.get("comfort")))
             if len(zc.control_air) > 1
@@ -176,7 +187,6 @@ class ZoneRuntime:
         self.last_mode: Optional[str] = None
         self.last_plan_mode: Optional[str] = None
         self.setpoint_seen: Optional[float] = None
-        self.setpoint_changed_ts: Optional[float] = None
         self.mode_seen: Optional[str] = None
         self.preset_seen: Optional[str] = None
         self.gap = False
@@ -189,6 +199,9 @@ class ZoneRuntime:
         self.projection = None
         self.own_write: Optional[sig.OwnWrite] = None
         self.pending_write: Optional[sig.OwnWrite] = None
+        self.allowed = False
+        self.call_reason: Optional[str] = None
+        self.drive: Optional[float] = None
         self.held_off = saved.get("held_off") is True
         self.season_off_pending = saved.get("season_off_pending") is True
         self.season_off_sent = saved.get("season_off_sent") is True
@@ -198,18 +211,17 @@ class ZoneRuntime:
 
     def snapshot(self) -> dict:
         data = {
-            "trim": self.trim,
             "nudge": self.nudge,
             "nudge_at": self.nudge_at,
             "nudge_dir": self.nudge_dir,
             "last_planned": self.last_planned,
             "window": self.tracker.snapshot(),
+            "call": self.call.snapshot(),
             "bucket": self.bucket.snapshot(),
             "blocks": self.blocks.snapshot(),
             "days": {d: acc.snapshot() for d, acc in self.days.items()},
             "cut_day": self.cut_day,
             "floor_cap": self.floor_cap,
-            "warm": self.warm,
             "daily": self.daily[-DAILY_KEEP:],
             "yesterday": self.yesterday,
             "held_off": self.held_off,
@@ -279,6 +291,8 @@ class HeatingController(hass.Hass):
         )
         season_saved = saved.get("season_on")
         self._season_prev: Optional[bool] = season_saved if isinstance(season_saved, bool) else None
+        live_saved = saved.get("live_on")
+        self._live_prev: Optional[bool] = live_saved if isinstance(live_saved, bool) else None
         if not cfg.appdaemon_user_id:
             self._warn_once(
                 "appdaemon id",
@@ -561,7 +575,7 @@ class HeatingController(hass.Hass):
             self._request_eval()
             return
         previous = rt.setpoint_seen
-        self._note_setpoint(rt, attrs.get("temperature"), now_ts)
+        self._note_setpoint(rt, attrs.get("temperature"))
         setpoint = _num(attrs.get("temperature"))
         preset = attrs.get("preset_mode") if isinstance(attrs.get("preset_mode"), str) else None
         changes = []
@@ -601,8 +615,10 @@ class HeatingController(hass.Hass):
             zc, change, self._calls, self._identity_for(change.ts), own=rt.own_write
         )
         effect = sig.thermostat_effect(zc, self.cfg.owner, change, attr)
-        live_change = self._is_live(zc.name) and change.kind in (
-            sig.KIND_SETPOINT, sig.KIND_MODE
+        live_change = (
+            self._is_live(zc.name)
+            and change.kind in (sig.KIND_SETPOINT, sig.KIND_MODE)
+            and not sig.setpoint_echo(change, attr)
         )
         if live_change and attr.source != sig.SRC_OWN:
             if attr.source == sig.SRC_REVERT:
@@ -753,13 +769,10 @@ class HeatingController(hass.Hass):
         snap = self._snap(entity)
         return None if snap is None else snap["state"]
 
-    def _note_setpoint(self, rt: ZoneRuntime, value, now_ts: float) -> None:
+    def _note_setpoint(self, rt: ZoneRuntime, value) -> None:
         setpoint = _num(value)
-        if setpoint is None:
-            return
-        if rt.setpoint_seen is None or abs(setpoint - rt.setpoint_seen) > 1e-9:
-            rt.setpoint_changed_ts = now_ts
-        rt.setpoint_seen = setpoint
+        if setpoint is not None:
+            rt.setpoint_seen = setpoint
 
     def _datetime_ts(self, entity: str, tz) -> Optional[float]:
         """An input_datetime (date and time, local) as epoch seconds."""
@@ -928,6 +941,10 @@ class HeatingController(hass.Hass):
                 level="INFO" if forecast_ok else "WARNING",
             )
         self._forecast_was_usable = forecast_ok
+        live_state = self._state_of(cfg.live_switch_entity)
+        release = self._live_prev is True and live_state == "off"
+        if live_state in ("on", "off"):
+            self._live_prev = live_state == "on"
 
         self._feed_loop(now)
         bedroom = self._bedroom_view(now_ts, tz)
@@ -951,6 +968,7 @@ class HeatingController(hass.Hass):
             "periodic": periodic,
             "season_on": season_on,
             "season_known": season_state in ("on", "off"),
+            "release": release,
             "forecast_ok": forecast_ok,
             "bedroom": bedroom,
             "party": party,
@@ -1053,17 +1071,18 @@ class HeatingController(hass.Hass):
 
     def _device_limits(self, rt: ZoneRuntime) -> tuple:
         """Effective (lower, upper): the configured limits, tightened by what the device
-        itself enforces. A mismatch is logged once per change."""
+        itself enforces. A device that cannot take the minimum the controller writes, or tops
+        out under the zone's upper limit, is logged once per change."""
         zc = rt.zc
         stem = zc.thermostat.split(".", 1)[1]
         dev_min = _num(self._state_of(f"number.{stem}_min_heat_setpoint"))
         dev_max = _num(self._state_of(f"number.{stem}_max_heat_setpoint"))
         seen = (dev_min, dev_max)
         if seen != rt.device_limits_seen and None not in seen:
-            if dev_min != zc.lower_c or dev_max != zc.upper_c:
+            if dev_min > hp.DEVICE_MIN_C or dev_max < zc.upper_c:
                 self.log(
-                    f"HeatingController {zc.name}: thermostat limits {dev_min}-{dev_max} differ "
-                    f"from the planned {zc.lower_c}-{zc.upper_c}",
+                    f"HeatingController {zc.name}: thermostat limits {dev_min}-{dev_max} do not "
+                    f"fit the {hp.DEVICE_MIN_C}-{zc.upper_c} the controller writes",
                     level="WARNING",
                 )
         rt.device_limits_seen = seen
@@ -1098,7 +1117,7 @@ class HeatingController(hass.Hass):
         if online and not therm_usable:
             stale.append(f"thermostat_reading:{zc.thermostat}")
 
-        feels, sun_hit = [], False
+        feels = []
         for entity in zc.control_air:
             s = self._snap(entity)
             value = None
@@ -1106,7 +1125,6 @@ class HeatingController(hass.Hass):
                 raw = _num(s["state"])
                 if raw is not None and s["attributes"].get("stale") != "true":
                     value = self._guard.filter(entity, raw, now_ts, window_active)
-                sun_hit = sun_hit or s["attributes"].get("sun_hit") == "true"
             if value is None:
                 stale.append(f"control_air:{entity}")
             feels.append(value)
@@ -1172,7 +1190,6 @@ class HeatingController(hass.Hass):
             "comfort_means": None,
             "air_fresh": source in ("feel", "thermostat")
             or (source == "floor" and floor_pair is not None and floor_pair[1] <= FLOOR_FRESH_MIN),
-            "sun_hit": sun_hit,
             "stale": stale,
         }
 
@@ -1219,7 +1236,7 @@ class HeatingController(hass.Hass):
                 {"temperature": reading["setpoint"], "preset_mode": reading["preset"]}, now_ts,
             )
         if rt.setpoint_seen is None:
-            self._note_setpoint(rt, reading["setpoint"], now_ts)
+            self._note_setpoint(rt, reading["setpoint"])
         if rt.mode_seen is None and reading["online"]:
             rt.mode_seen = reading["hvac_mode"]
         if rt.preset_seen is None and isinstance(reading["preset"], str):
@@ -1231,9 +1248,7 @@ class HeatingController(hass.Hass):
         openings = {e: self._state_of(e) for e in zc.openings}
         event = rt.tracker.update(now_ts, openings, reading["air"])
 
-        if self._is_live(zone) and not all(
-            math.isfinite(value) for value in (base, rt.nudge, rt.trim)
-        ):
+        if self._is_live(zone) and not all(math.isfinite(value) for value in (base, rt.nudge)):
             self._invalid_write(rt)
             return
         priority = rt.priority
@@ -1261,7 +1276,6 @@ class HeatingController(hass.Hass):
             online=reading["online"],
             base=base,
             nudge=rt.nudge,
-            trim=rt.trim,
             lower_c=lower,
             upper_c=upper,
             fallback=reading["air_source"] == "none",
@@ -1269,30 +1283,39 @@ class HeatingController(hass.Hass):
             party_windows=party_windows,
             hold_back=self._loop.hold and zc.guard.enabled,
             cut_windows=cut.windows,
-            last_planned=rt.last_planned,
             floor_cap=rt.floor_cap and reading["floor_fresh"],
-            day_duty=(
-                tuple((b.day.isoformat(), b.u_eq) for b in budgets if b.u_eq is not None)
-                if (zc.weather_offset.enabled and ctx["forecast_ok"])
-                else ()
-            ),
-            therm_temp=reading["therm_temp"] if reading["therm_usable"] else None,
-            warm=rt.warm,
         )
         plan = hp.plan(zc, inp, now_ts, tz)
-        rt.warm = plan.plan_mode == hp.MODE_WARM
-
-        if rt.last_plan_mode is not None and rt.last_plan_mode != plan.plan_mode:
-            if hp.MODE_PARTY in (rt.last_plan_mode, plan.plan_mode):
-                priority = "party"
         rt.last_plan_mode = plan.plan_mode
+
+        limits = self._write_limits(rt)
+        rt.allowed = plan.allowed and plan.mode != hp.MODE_OFF_SEASON and not rt.held_off
+        on, rt.call_reason = hp.decide_call(
+            cfg.call, rt.call, plan.aim, reading["air"], rt.allowed, now_ts
+        )
+        high = hp.high_limit(cfg.call, plan.aim, limits[1] if limits else upper)
+        if rt.call.apply(on, now_ts, high):
+            priority = "call"
+            self.log(
+                f"HeatingController {zone}: call {'starts' if on else 'stops'} ({rt.call_reason}), "
+                f"air {_text(reading['air']) or 'n/a'}, aim {plan.aim:.1f}",
+                level="INFO",
+            )
+        rt.drive = None if limits is None else hp.drive_setpoint(
+            rt.call, plan.aim, rt.allowed and reading["air"] is None, *limits
+        )
 
         acc = rt.days.setdefault(day, hp.ZoneDay(day))
         if self._is_live(zone):
             gate = self._live_gate(rt, plan, reading, now_ts, priority, acc)
         else:
             rt.pending_write = None
-            gate = self._shadow_gate(rt, plan, now_ts, priority, acc)
+            if ctx["release"] and zone in cfg.live_zones and self._release(
+                rt, plan, reading, limits, now_ts
+            ):
+                gate = hp.GateResult(True, "release")
+            else:
+                gate = self._shadow_gate(rt, plan, now_ts, priority, acc)
         if gate.write or gate.reason == "unchanged":
             priority = None
         rt.priority = priority
@@ -1301,7 +1324,6 @@ class HeatingController(hass.Hass):
         if today_budget is not None:
             acc.note_budget(self._budget_summary(today_budget))
 
-        bias = self._trim_sample(rt, plan, reading, window_active, now_ts)
         if ctx["periodic"]:
             if rt.last_tick_ts is None:
                 gap = float(TICK_SECONDS)
@@ -1337,35 +1359,34 @@ class HeatingController(hass.Hass):
                     air=reading["air"],
                     target=plan.target,
                     lower_c=lower,
-                    bias=bias,
                     fallback=reading["air_source"] == "none",
                 )
             )
         for stale_day in [d for d in rt.days if d < (ctx["today"] - timedelta(days=3)).isoformat()]:
             del rt.days[stale_day]
 
-        rt.blocks.observe(now_ts, day, plan.plan_mode, plan.setpoint)
+        rt.blocks.observe(now_ts, day, plan.plan_mode, plan.aim)
         day_end = hp.local_midnight_ts(ctx["today"] + timedelta(days=1), tz)
         horizon = hp.local_midnight_ts(ctx["today"] + timedelta(days=2), tz)
         projected = self._project(rt, inp, now_ts, horizon, tz)
         today_part = [(s, min(e, day_end), m, sp) for s, e, m, sp in projected if s < day_end]
         timeline = hp.render_blocks(rt.blocks, today_part, now_ts, day_end, tz)
         next_change = None
-        if rt.tracker.state == hp.STATE_CLOSED and plan.plan_mode != hp.MODE_WARM:
-            next_change = next((b for b in projected if b[3] != plan.setpoint), None)
+        if rt.tracker.state == hp.STATE_CLOSED:
+            next_change = next(
+                (b for b in projected if (b[2], b[3]) != (plan.plan_mode, plan.aim)), None
+            )
         aired = rt.tracker.state != hp.STATE_CLOSED or bool(rt.tracker.open_openings())
         ctx["zones"][zone] = {"air": reading["air"], "target": plan.target, "window_active": aired}
 
         if rt.last_mode is not None and rt.last_mode != plan.mode:
             self.log(
-                f"HeatingController {zone}: {rt.last_mode} -> {plan.mode}, planned setpoint {plan.setpoint:.1f}",
+                f"HeatingController {zone}: {rt.last_mode} -> {plan.mode}, aim {plan.aim:.1f}",
                 level="INFO",
             )
         rt.last_mode = plan.mode
 
-        self._log_decision(
-            zone, rt, ctx, plan, reading, gate, budgets, lower, upper, base, party, bias
-        )
+        self._log_decision(zone, rt, ctx, plan, reading, gate, budgets, lower, upper, base, party)
         self._publish_zone(
             zone,
             rt,
@@ -1386,7 +1407,7 @@ class HeatingController(hass.Hass):
     def _project(rt: ZoneRuntime, inp: hp.ZoneInputs, now_ts: float, horizon: float, tz) -> list:
         """The plan from now to the horizon. It only depends on the inputs and the clock, so
         the blocks of the last projection are reused, trimmed to now, while the inputs hold."""
-        key = (replace(inp, window_state=hp.STATE_CLOSED, therm_temp=None, warm=False), horizon)
+        key = (replace(inp, window_state=hp.STATE_CLOSED), horizon)
         if rt.projection is None or rt.projection[0] != key or rt.projection[1] > now_ts:
             blocks = hp.project_blocks(rt.zc, inp, now_ts, horizon, tz)
             rt.projection = (key, now_ts, blocks)
@@ -1396,14 +1417,16 @@ class HeatingController(hass.Hass):
     def _shadow_gate(
         self, rt: ZoneRuntime, plan: hp.Plan, now_ts: float, priority, acc
     ) -> hp.GateResult:
-        """What the writer would do with this plan: the same token and stability rules, with
+        """What the writer would do with this drive: the same token and stability rules, with
         no write behind it. Only counts while the zone is neither off season nor offline."""
         if plan.mode != plan.plan_mode:
             return hp.GateResult(False, f"gated:{plan.mode}")
-        if rt.desired is None or abs(plan.setpoint - rt.desired) > 1e-9:
-            rt.desired, rt.desired_since = plan.setpoint, now_ts
+        if rt.drive is None:
+            return hp.GateResult(False, "invalid_setpoint")
+        if rt.desired is None or abs(rt.drive - rt.desired) > 1e-9:
+            rt.desired, rt.desired_since = rt.drive, now_ts
         result = hp.write_gate(
-            plan.setpoint,
+            rt.drive,
             rt.last_planned,
             now_ts,
             rt.desired_since,
@@ -1412,8 +1435,8 @@ class HeatingController(hass.Hass):
             self.cfg.write_stable_minutes * 60.0,
         )
         if result.write:
-            rt.last_planned = plan.setpoint
-            acc.add_would_write(now_ts, plan.setpoint)
+            rt.last_planned = rt.drive
+            acc.add_would_write(now_ts, rt.drive)
         return result
 
     # ---------------------------------------------------------------- live writes
@@ -1429,11 +1452,13 @@ class HeatingController(hass.Hass):
         return hp.GateResult(False, "invalid_setpoint")
 
     def _write_limits(self, rt: ZoneRuntime) -> Optional[tuple]:
+        """(lowest, highest) setpoint the thermostat takes: its own minimum, DEVICE_MIN_C when
+        it reports none, and at most the zone's upper limit. None when the limits cannot be
+        used."""
         stem = rt.zc.thermostat.split(".", 1)[1]
         snap = self._snap(rt.zc.thermostat)
         attrs = snap["attributes"] if snap else {}
         lows = [
-            rt.zc.lower_c,
             _num(self._state_of(f"number.{stem}_min_heat_setpoint")),
             _num(attrs.get("min_temp")),
         ]
@@ -1444,14 +1469,10 @@ class HeatingController(hass.Hass):
         ]
         values = [v for v in lows + highs if v is not None]
         if not all(math.isfinite(v) for v in values):
-            self._invalid_write(rt)
             return None
-        lower, upper = max(v for v in lows if v is not None), min(v for v in highs if v is not None)
-        if lower > upper:
-            self._invalid_write(rt)
-            return None
-        effective_lower, effective_upper = self._device_limits(rt)
-        return max(lower, effective_lower), min(upper, effective_upper)
+        lower = max((v for v in lows if v is not None), default=hp.DEVICE_MIN_C)
+        upper = min(v for v in highs if v is not None)
+        return None if lower > upper else (lower, upper)
 
     def _live_gate(
         self, rt: ZoneRuntime, plan: hp.Plan, reading: dict, now_ts: float, priority, acc
@@ -1479,13 +1500,9 @@ class HeatingController(hass.Hass):
                 self._send_write(rt, None, "off", reading, now_ts)
                 return hp.GateResult(True, "season_off")
             return hp.GateResult(False, "gated:off_season")
-        if not math.isfinite(plan.setpoint) or not math.isfinite(plan.raw):
+        desired = rt.drive
+        if desired is None or not math.isfinite(desired):
             return self._invalid_write(rt)
-        limits = self._write_limits(rt)
-        if limits is None:
-            return hp.GateResult(False, "invalid_setpoint")
-        lower, upper = limits
-        desired = hp.clamp(plan.setpoint, lower, upper)
         if not math.isclose(
             desired / hp.SETPOINT_STEP_C, round(desired / hp.SETPOINT_STEP_C), abs_tol=1e-9
         ):
@@ -1508,8 +1525,29 @@ class HeatingController(hass.Hass):
                 rt.last_planned = desired
         return result
 
-    def _send_write(self, rt, setpoint, mode, reading: dict, now_ts: float) -> bool:
-        if not self._is_live(rt.zc.name) or rt.held_off or not self._plugin_online:
+    def _release(self, rt, plan: hp.Plan, reading: dict, limits, now_ts: float) -> bool:
+        """Hand a zone back to its thermostat when the live switch has gone off: the aim as an
+        ordinary setpoint, written once and outside the token bucket, so no unit is left at the
+        minimum or at a call's high setpoint. Whatever the owner or the season has switched off
+        stays off."""
+        if (
+            not reading["online"]
+            or rt.held_off
+            or reading["hvac_mode"] == "off"
+            or plan.mode == hp.MODE_OFF_SEASON
+            or limits is None
+        ):
+            return False
+        setpoint = hp.clamp(hp.round_step(plan.aim), *limits)
+        if reading["hvac_mode"] == "heat" and reading["setpoint"] == setpoint:
+            return False
+        mode = "heat" if reading["hvac_mode"] != "heat" else None
+        return self._send_write(rt, setpoint, mode, reading, now_ts, release=True)
+
+    def _send_write(
+        self, rt, setpoint, mode, reading: dict, now_ts: float, release: bool = False
+    ) -> bool:
+        if (not release and not self._is_live(rt.zc.name)) or rt.held_off or not self._plugin_online:
             return False
         current = self._state_of(rt.zc.thermostat)
         if current in UNREADABLE:
@@ -1609,26 +1647,6 @@ class HeatingController(hass.Hass):
             f"HeatingController write {rt.zc.name}: {result}, setpoint {own.value}, mode {own.mode}",
             level="INFO" if result in ("pending", "confirmed") else "WARNING",
         )
-
-    def _trim_sample(
-        self, rt, plan, reading, window_active: bool, now_ts: float
-    ) -> Optional[float]:
-        """Thermostat minus control air, when the hour is fit to learn the offset from."""
-        quiet = (
-            rt.setpoint_changed_ts is not None
-            and now_ts - rt.setpoint_changed_ts >= NO_SETPOINT_CHANGE_S
-        )
-        if (
-            plan.mode == hp.MODE_HOLD
-            and reading["air_source"] == "feel"
-            and reading["therm_temp"] is not None
-            and reading["therm_usable"]
-            and quiet
-            and not window_active
-            and not reading["sun_hit"]
-        ):
-            return reading["therm_temp"] - reading["air"]
-        return None
 
     @staticmethod
     def _budget_summary(b: hp.DayBudget) -> dict:
@@ -1890,6 +1908,7 @@ class HeatingController(hass.Hass):
             "signals": self._signals,
             "alerts": self._alerts.snapshot(),
             "season_on": self._season_prev,
+            "live_on": self._live_prev,
         }
         if self._advisor is not None:
             data["season_advisor"] = self._advisor.snapshot()
@@ -1901,14 +1920,14 @@ class HeatingController(hass.Hass):
         except Exception as e:
             self._warn_once("state save", f"HeatingController: state not saved: {e}")
 
-    def _log_decision(
-        self, zone, rt, ctx, plan, reading, gate, budgets, lower, upper, base, party, bias
-    ):
+    def _log_decision(self, zone, rt, ctx, plan, reading, gate, budgets, lower, upper, base, party):
         now_ts, tz = ctx["now_ts"], ctx["tz"]
         key = (
             plan.mode,
             plan.plan_mode,
-            plan.setpoint,
+            plan.aim,
+            rt.call.on,
+            rt.drive,
             gate.write,
             rt.tracker.state,
             rt.cut_day,
@@ -1932,17 +1951,17 @@ class HeatingController(hass.Hass):
             "plan_mode": plan.plan_mode,
             "season": ctx["season_on"],
             "target": round(plan.target, 2),
-            "aim": None if plan.aim is None else round(plan.aim, 2),
-            "raw": round(plan.raw, 2),
-            "setpoint": plan.setpoint,
+            "aim": plan.aim,
+            "allowed": rt.allowed,
+            "call": rt.call.on,
+            "call_reason": rt.call_reason,
+            "drive": rt.drive,
             "protected_min": plan.protected_min,
             "would_write": gate.write,
             "gate": gate.reason,
             "tokens": round(rt.bucket.available(now_ts), 2),
             "base": base,
             "nudge": rt.nudge,
-            "trim": rt.trim,
-            "weather_offset": plan.weather_offset,
             "limits": [lower, upper],
             "thermostat": {
                 "online": reading["online"],
@@ -1957,7 +1976,6 @@ class HeatingController(hass.Hass):
             "air_source": reading["air_source"],
             "air_basis": reading["air_basis"],
             "floor": reading["floor_temp"],
-            "bias_sample": None if bias is None else round(bias, 3),
             "window": rt.tracker.state,
             "openings_on": rt.tracker.open_openings(),
             "party": party.pause if self.cfg.party and self.cfg.party.zone == zone else None,
@@ -1994,8 +2012,8 @@ class HeatingController(hass.Hass):
             self._save_state()
 
     def _rollup_if_due(self, now) -> None:
-        """Close every finished day: learn the trim, write the daily records, keep the last
-        60. Idempotent, so a missed 03:00 run is made up at the next tick."""
+        """Close every finished day: write the daily records, keep the last 60. Idempotent, so a
+        missed 03:00 run is made up at the next tick."""
         if now.hour < 3:
             return
         today = hp.local_dt(now.timestamp(), now.tzinfo).date().isoformat()
@@ -2004,9 +2022,7 @@ class HeatingController(hass.Hass):
                 acc = rt.days.pop(day)
                 if not acc.ticks and not acc.writes and not acc.restores:
                     continue
-                update = hp.update_trim(rt.trim, acc.bias, rt.zc.trim)
-                record = acc.record(zone, rt.trim, update)
-                rt.trim = update.trim
+                record = acc.record(zone)
                 record["ts"] = self._iso(now.timestamp(), now.tzinfo)
                 rt.daily.append(record)
                 rt.daily = rt.daily[-DAILY_KEEP:]
@@ -2016,7 +2032,6 @@ class HeatingController(hass.Hass):
                     "in_band_pct": record["in_band_pct"],
                     "would_writes": record["would_writes"],
                     "h_pred": (record["budget"] or {}).get("h_pred"),
-                    "trim": update.trim,
                 }
                 self._append_log(now, record)
         for day in sorted(d for d in self._house if d < today and not self._house[d].get("closed")):
@@ -2084,6 +2099,7 @@ class HeatingController(hass.Hass):
         acc = rt.days.get(ctx["today"].isoformat())
         window = next((w for w in cut.windows if w[1] > now_ts), None)
         party_window = next((w for w in party_windows if w[1] > now_ts), None)
+        lockout_end = rt.tracker.deadline()
 
         def iso(ts):
             return self._iso(ts, tz)
@@ -2103,13 +2119,14 @@ class HeatingController(hass.Hass):
             "last_write": (
                 {**rt.last_write, "at": iso(rt.last_write["at"])} if rt.last_write else None
             ),
-            "setpoint_now": plan.setpoint,
+            "setpoint_now": plan.aim,
+            "call": rt.call.on,
+            "call_since": None if rt.call.since is None else iso(rt.call.since),
+            "heat_allowed_at": None if lockout_end is None else iso(lockout_end),
             "base_target": base,
             "nudge": _signed(rt.nudge),
             "nudge_min": _signed(zc.nudge.minimum),
             "nudge_max": _signed(zc.nudge.maximum),
-            "trim": _signed(rt.trim, 2),
-            "weather_offset": _signed(plan.weather_offset, 2),
             "profile_offset": _signed(plan.target - base - rt.nudge),
             "lower_limit": lower,
             "upper_limit": upper,

@@ -274,9 +274,37 @@ class Attribution(unittest.TestCase):
         a = self.who(
             setpoint(22.0, ts=T0 + 40),
             call(T0, user=KRISTINE, temperature=22.0),
-            call(T0 + 30, "set_hvac_mode", user=MIKKEL, hvac_mode="heat"),
+            call(T0 + 30, "set_preset_mode", user=MIKKEL, preset_mode="schedule"),
         )
         self.assertEqual((a.source, a.who), (sig.SRC_HA, "kristine"))
+
+    def test_a_mode_call_explains_the_setpoint_the_thermostat_moves_by_itself(self):
+        for service, data in (
+            ("turn_off", {}),
+            ("set_hvac_mode", {"hvac_mode": "off"}),
+            ("toggle", {}),
+            ("turn_on", {}),
+        ):
+            a = self.who(setpoint(15.0, ts=T0 + 8, old=19.0), call(T0, service, user=MIKKEL, **data))
+            self.assertEqual((a.source, a.who), (sig.SRC_HA, "mikkel"), service)
+            self.assertEqual(a.call.service, service)
+
+    def test_the_setpoint_echo_of_an_off_call_is_within_the_two_minute_window(self):
+        off = call(T0, "turn_off", user=MIKKEL)
+        self.assertEqual(self.who(setpoint(15.0, ts=T0 + 120, old=19.0), off).source, sig.SRC_HA)
+        a = self.who(setpoint(15.0, ts=T0 + 121, old=19.0), off)
+        self.assertEqual((a.source, a.who), (sig.SRC_KEYPAD, "kristine"))
+
+    def test_a_mode_call_on_another_thermostat_explains_no_setpoint(self):
+        other = call(T0, "turn_off", entity=THERMOSTATS["claudias_room"], user=MIKKEL)
+        a = self.who(setpoint(15.0, ts=T0 + 8, old=19.0), other)
+        self.assertEqual(a.source, sig.SRC_KEYPAD)
+
+    def test_the_controllers_own_mode_write_claims_the_setpoint_echo_before_any_call(self):
+        own = sig.OwnWrite(None, T0, prev_reported=21.0, mode="off")
+        mine = call(T0, "set_hvac_mode", user=APP, hvac_mode="off")
+        a = self.who(setpoint(5.0, ts=T0 + 8, old=21.0), mine, own=own)
+        self.assertEqual(a.source, sig.SRC_OWN)
 
     def test_a_mode_change_is_matched_to_the_calls_that_set_a_mode(self):
         to_off = sig.Change(sig.KIND_MODE, "heat", "off", T0 + 5)
@@ -508,6 +536,93 @@ class ThermostatEffects(unittest.TestCase):
     def test_the_controllers_own_writes_and_rejections_mean_nothing(self):
         for source in (sig.SRC_OWN, sig.SRC_REVERT):
             self.assertEqual(self.effect(KRISTINES, setpoint(22.0), source), sig.EFFECT_NONE)
+
+    def test_the_setpoint_a_thermostat_moves_after_a_mode_call_means_nothing(self):
+        echo = setpoint(15.0, ts=T0 + 8, old=19.0)
+        for who in ("mikkel", "kristine", "claudia"):
+            for service in sig.MODE_SERVICES:
+                attr = sig.Attribution(sig.SRC_HA, who, call(T0, service, user=MIKKEL))
+                self.assertEqual(
+                    sig.thermostat_effect(KRISTINES, "mikkel", echo, attr), sig.EFFECT_NONE, (who, service)
+                )
+
+    def test_a_setpoint_call_and_a_keypad_change_still_mean_what_they_did(self):
+        up = setpoint(22.0, ts=T0 + 8, old=19.0)
+        asked = call(T0, "set_temperature", user=KRISTINE, temperature=22.0)
+        attr = sig.Attribution(sig.SRC_HA, "kristine", asked)
+        self.assertEqual(sig.thermostat_effect(KRISTINES, "mikkel", up, attr), sig.EFFECT_NUDGE)
+        attr = sig.Attribution(sig.SRC_KEYPAD, "kristine")
+        self.assertEqual(sig.thermostat_effect(KRISTINES, "mikkel", up, attr), sig.EFFECT_NUDGE)
+
+    def test_the_off_choice_itself_is_still_the_owners_when_a_mode_call_made_it(self):
+        off = sig.Change(sig.KIND_MODE, "heat", "off", T0 + 2)
+        attr = sig.Attribution(sig.SRC_HA, "mikkel", call(T0, "turn_off", user=MIKKEL))
+        self.assertEqual(
+            sig.thermostat_effect(KRISTINES, "mikkel", off, attr), sig.EFFECT_OFF_BY_OWNER
+        )
+        attr = sig.Attribution(sig.SRC_HA, "claudia", call(T0, "turn_off", user=CLAUDIA))
+        self.assertEqual(
+            sig.thermostat_effect(KRISTINES, "mikkel", off, attr), sig.EFFECT_WOULD_RESTORE
+        )
+
+
+class SetpointEcho(unittest.TestCase):
+    """The owner switches a zone off and the thermostat drops its setpoint from 19 to 15 a few
+    seconds later: the second change is the first one's side effect."""
+
+    def attr(self, change, *calls, zc=KRISTINES):
+        return sig.attribute_change(zc, change, buffer(*calls), IDENTITY, None)
+
+    def test_the_echo_is_the_callers_and_has_no_effect(self):
+        off = call(T0, "turn_off", user=MIKKEL)
+        echo = setpoint(15.0, ts=T0 + 8, old=19.0)
+        attr = self.attr(echo, off)
+        self.assertEqual((attr.source, attr.who), (sig.SRC_HA, "mikkel"))
+        self.assertEqual(sig.thermostat_effect(KRISTINES, "mikkel", echo, attr), sig.EFFECT_NONE)
+
+    def test_the_off_change_and_its_echo_are_both_settled_by_the_one_call(self):
+        off = call(T0, "set_hvac_mode", user=MIKKEL, hvac_mode="off")
+        mode = sig.Change(sig.KIND_MODE, "heat", "off", T0 + 2)
+        echo = setpoint(15.0, ts=T0 + 8, old=19.0)
+        effects = [
+            sig.thermostat_effect(KRISTINES, "mikkel", c, self.attr(c, off)) for c in (mode, echo)
+        ]
+        self.assertEqual(effects, [sig.EFFECT_OFF_BY_OWNER, sig.EFFECT_NONE])
+
+    def test_setpoint_echo_is_a_setpoint_change_explained_by_a_mode_call(self):
+        change = setpoint(15.0, old=19.0)
+        for service in sig.MODE_SERVICES:
+            attr = sig.Attribution(sig.SRC_HA, "mikkel", call(T0, service, user=MIKKEL))
+            self.assertTrue(sig.setpoint_echo(change, attr), service)
+
+    def test_setpoint_echo_is_false_for_everything_else(self):
+        change = setpoint(15.0, old=19.0)
+        asked = sig.Attribution(sig.SRC_HA, "mikkel", call(T0, "set_temperature", temperature=15.0))
+        self.assertFalse(sig.setpoint_echo(change, asked))
+        self.assertFalse(sig.setpoint_echo(change, sig.Attribution(sig.SRC_KEYPAD, "kristine")))
+        self.assertFalse(sig.setpoint_echo(change, sig.Attribution(sig.SRC_OWN)))
+        mode = sig.Change(sig.KIND_MODE, "heat", "off", T0)
+        turned = sig.Attribution(sig.SRC_HA, "mikkel", call(T0, "turn_off", user=MIKKEL))
+        self.assertFalse(sig.setpoint_echo(mode, turned))
+        preset = sig.Change(sig.KIND_PRESET, "schedule", "permanent_hold", T0)
+        self.assertFalse(sig.setpoint_echo(preset, turned))
+
+    def test_call_explains_a_setpoint_by_a_mode_call_or_a_matching_set_temperature(self):
+        change = setpoint(15.0, old=19.0)
+        for service in sig.MODE_SERVICES:
+            self.assertTrue(sig.call_explains(call(T0, service), change), service)
+        self.assertTrue(sig.call_explains(call(T0, "set_temperature", temperature=15.0), change))
+        self.assertTrue(sig.call_explains(call(T0, "set_temperature", temperature=15.4), change))
+        self.assertFalse(sig.call_explains(call(T0, "set_temperature", temperature=17.0), change))
+        self.assertFalse(sig.call_explains(call(T0, "set_preset_mode", preset_mode="x"), change))
+        self.assertFalse(sig.call_explains(call(T0, "set_fan_mode", fan_mode="x"), change))
+
+    def test_a_mode_call_still_explains_only_its_own_mode_change(self):
+        to_off = sig.Change(sig.KIND_MODE, "heat", "off", T0)
+        self.assertTrue(sig.call_explains(call(T0, "turn_off"), to_off))
+        self.assertFalse(sig.call_explains(call(T0, "turn_on"), to_off))
+        preset = sig.Change(sig.KIND_PRESET, "schedule", "permanent_hold", T0)
+        self.assertFalse(sig.call_explains(call(T0, "turn_off"), preset))
 
 
 class ButtonsAndHelpers(unittest.TestCase):
