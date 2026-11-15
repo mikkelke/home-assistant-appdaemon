@@ -6,10 +6,10 @@ responses as one sensor, which the agent's prompt template reads, so a common qu
 tool call at all. The scripts stay the only place their logic lives.
 
 The brief is refreshed whenever a satellite starts listening (the scripts answer in well under a
-second, while speech-to-text has not even finished), every refresh_every_s, and at startup. The
-sensor is written only when the brief changed. Its state is the refresh time, its attributes
-are the script names with their responses; a script that fails or times out is left out, so the
-agent falls back to calling it.
+second, while speech-to-text has not even finished), every refresh_every_s, and at startup. Its
+state is the refresh time, so a reader can tell a stale brief; the recorder keeps identical
+attributes only once. Its attributes are the script names with their responses; a script that
+fails or times out is left out, so the agent falls back to calling it.
 """
 
 import asyncio
@@ -39,7 +39,6 @@ class AssistBrief(hass.Hass):
     async def initialize(self):
         self.scripts = list(self.args["scripts"])
         self.sensor = self.args["sensor"]
-        self._last = None
         self._busy = False
         for sat in self.args["satellites"]:
             await self.listen_state(self._on_satellite, sat, new="listening")
@@ -66,9 +65,6 @@ class AssistBrief(hass.Hass):
         self._busy = True
         try:
             brief = build_brief(await asyncio.gather(*(self._run(n) for n in self.scripts)))
-            if brief == self._last:
-                return
-            self._last = brief
             await self.set_state(self.sensor, state=datetime.now().astimezone().isoformat(timespec="seconds"),
                                  attributes={"friendly_name": "Assist house brief", **brief}, replace=True)
         finally:

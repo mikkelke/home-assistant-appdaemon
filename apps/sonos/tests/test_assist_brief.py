@@ -1,4 +1,4 @@
-"""AssistBrief: the published brief is exactly the scripts' responses, written only on change."""
+"""AssistBrief: the published brief is exactly the scripts' responses."""
 
 from __future__ import annotations
 
@@ -48,7 +48,6 @@ class Refresh(unittest.TestCase):
         app = ab.AssistBrief.__new__(ab.AssistBrief)
         app.scripts = list(responses)
         app.sensor = "sensor.assist_house_brief"
-        app._last = None
         app._busy = False
         app.log = lambda *a, **k: None
 
@@ -62,17 +61,12 @@ class Refresh(unittest.TestCase):
         app.set_state = AsyncMock()
         return app
 
-    def test_writes_once_until_changed(self):
-        responses = {"who_is_home": {"home": ["Mikkel"]}, "deliveries": {"status": "none"}}
-        app = self.make(responses)
+    def test_publishes_every_response(self):
+        app = self.make({"who_is_home": {"home": ["Mikkel"]}, "deliveries": {"status": "none"}})
         asyncio.run(app.refresh())
-        asyncio.run(app.refresh())
-        self.assertEqual(app.set_state.await_count, 1)
         attrs = app.set_state.await_args.kwargs["attributes"]
         self.assertEqual(attrs["who_is_home"], {"home": ["Mikkel"]})
-        responses["deliveries"] = {"status": "a parcel"}
-        asyncio.run(app.refresh())
-        self.assertEqual(app.set_state.await_count, 2)
+        self.assertEqual(attrs["deliveries"], {"status": "none"})
 
     def test_failed_script_is_left_out(self):
         app = self.make({"who_is_home": {"home": ["Mikkel"]}, "deliveries": RuntimeError("down")})
