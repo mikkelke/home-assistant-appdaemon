@@ -12,11 +12,11 @@ things you can see/hear yourself has no value):
    alone instead ("Kristine started Spotify in Kitchen" - MusicAttribution).
 2. A small set of observed appliance milestones that carry information you can't
    see from the machine itself (finished + energy used; emptied).
-3. Observed lock activity (v3): "Front door unlocked by Mikkel" / "locked
-   automatically". The authoritative BLE lock entity carries no attribution, so the
+3. Observed lock activity (v3): "Front door unlocked" by Mikkel / "Front door opened
+   from inside". The authoritative BLE lock entity carries no attribution, so the
    entry is emitted after a short delay and enriched from the cloud twin's
    `changed_by` if that attribute is fresh by then - see `lock_event` and the
-   `locks`/`lock_attribution` app config.
+   `locks`/`lock_attribution`/`lock_doors` app config.
 
 Feed shape (attributes, replace=True on every publish):
     events: newest-first list of {"ts": <UTC ISO>, "icon": <mdi:...>, "text": <ascii>,
@@ -72,6 +72,8 @@ EMPTIED_ENRICH_S = 900
 # Reports come from other apps but are still validated like external data - a bug
 # elsewhere must not be able to bloat the feed entity past what a dashboard expects.
 MAX_TEXT_LEN = 120
+# The door contact can report the door opening before the BLE lock reports the thumb-turn.
+DOOR_BEFORE_LOCK_S = 10
 
 APPLIANCE_ICONS = {
     "washer": "mdi:washing-machine",
@@ -188,16 +190,17 @@ def enrich_by(events, appliance, by, now):
     return out
 
 
-def lock_event(name, old, new, changed_by):
+def lock_event(name, old, new, changed_by, door_opened=False):
     """Event tuple (icon, text, by) for a lock transition worth telling humans about, or None.
 
-    v6 (user 2026-07-24, after one ordinary day put 16 routine lock lines in the 40-entry
-    feed and drowned everything else): only a NAMED unlock is news - "who came in while I
-    wasn't looking" (a resident by name, first-name-trimmed, or a lock user like Cleaning).
-    Everything else is just the door being used:
-    - locking (manual or auto) is the steady state the lock always returns to - never logged;
-    - "Manual Unlock" is the physical thumb-turn - whoever turned it is standing at the door;
-    - an unattributed unlock tells nobody anything they can act on.
+    Two kinds of unlock are news:
+    - a NAMED unlock: "who came in while I wasn't looking" (a resident by name,
+      first-name-trimmed, or a lock user like Cleaning);
+    - the thumb-turn ("Manual Unlock") followed by the door actually opening: someone went
+      out (or let someone in) - the only trace a leaving guest leaves. The thumb-turn alone,
+      with the door staying shut, is not.
+    Everything else is just the door being used: locking (manual or auto) is the steady state
+    the lock always returns to, and an unattributed unlock tells nobody anything.
     Lock FAILURES are lock_health's job (phone push + its own admin feed entries), not this
     observer's.
     """
@@ -208,7 +211,9 @@ def lock_event(name, old, new, changed_by):
     if not isinstance(changed_by, str) or not changed_by.strip():
         return None
     who = changed_by.strip()[:MAX_TEXT_LEN]
-    if who in ("Auto Lock", "Manual Unlock"):
+    if who == "Manual Unlock":
+        return ("mdi:door-open", f"{name} opened from inside", None) if door_opened else None
+    if who == "Auto Lock":
         return None
     return "mdi:lock-open-variant", f"{name} unlocked", _first_name_if_resident(who)
 
@@ -304,8 +309,13 @@ class HouseEvents(hass.Hass):
         # operation and must not be pinned on this one.
         self.lock_report_delay_s = int(self.args.get("lock_report_delay_s", 20))
         self.lock_attribution_fresh_s = int(self.args.get("lock_attribution_fresh_s", 180))
+        # The door contact beside each lock: a thumb-turn only counts once the door opened.
+        self.lock_doors = self.args.get("lock_doors", {})
+        self._door_opened_at = {}
         for entity in self.locks:
             self.listen_state(self._on_lock, entity)
+        for door in set(self.lock_doors.values()):
+            self.listen_state(self._on_door_open, door, new="on")
 
         # Automation apps explain themselves through this event - see module docstring.
         self.listen_event(self._on_report, "house_events_report")
@@ -344,13 +354,29 @@ class HouseEvents(hass.Hass):
     def _on_lock(self, entity, attribute, old, new, kwargs):
         # Emit later, not now: attribution (cloud changed_by) usually hasn't landed yet
         # when the BLE entity flips. lock_event() re-validates old/new at emit time.
-        self.run_in(self._emit_lock_event, self.lock_report_delay_s, lock_entity=entity, old=old, new=new)
+        self.run_in(
+            self._emit_lock_event,
+            self.lock_report_delay_s,
+            lock_entity=entity,
+            old=old,
+            new=new,
+            changed_at=self.get_now().timestamp(),
+        )
+
+    def _on_door_open(self, entity, attribute, old, new, kwargs):
+        self._door_opened_at[entity] = self.get_now().timestamp()
+
+    def _door_opened_since(self, lock_entity, since_ts):
+        """True when the lock's door contact opened from DOOR_BEFORE_LOCK_S before since_ts on."""
+        opened = self._door_opened_at.get(self.lock_doors.get(lock_entity))
+        return opened is not None and opened >= since_ts - DOOR_BEFORE_LOCK_S
 
     def _emit_lock_event(self, kwargs):
         entity = kwargs["lock_entity"]
         name = self.locks.get(entity, entity)
         changed_by = self._fresh_changed_by(self.lock_attribution.get(entity))
-        result = lock_event(name, kwargs["old"], kwargs["new"], changed_by)
+        door_opened = self._door_opened_since(entity, kwargs["changed_at"])
+        result = lock_event(name, kwargs["old"], kwargs["new"], changed_by, door_opened)
         if result:
             icon, text, by = result
             self._add(icon, text, by=by)

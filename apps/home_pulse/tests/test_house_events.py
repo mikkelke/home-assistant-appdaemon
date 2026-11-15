@@ -299,9 +299,8 @@ class SanitizeFeedTests(unittest.TestCase):
 
 
 class LockEventTests(unittest.TestCase):
-    # v6: only NAMED unlocks are events - locking (manual or auto), thumb-turn "Manual
-    # Unlock", and unattributed unlocks are the door simply being used, never feed-worthy
-    # (2026-07-24: 16 routine lock lines in one day drowned the 40-entry feed).
+    # Named unlocks and a thumb-turn the door actually opened after are events; locking,
+    # a thumb-turn with the door shut, and unattributed unlocks are not.
     def test_unlocked_with_name(self):
         icon, text, by = house_events.lock_event("Front door", "locked", "unlocked", "Mikkel")
         self.assertEqual(icon, "mdi:lock-open-variant")
@@ -325,9 +324,17 @@ class LockEventTests(unittest.TestCase):
         self.assertIsNone(house_events.lock_event("Front door", "unlocked", "locked", "Mikkel"))
         self.assertIsNone(house_events.lock_event("Front door", "unlocked", "locked", None))
 
-    def test_thumb_turn_unlock_suppressed(self):
-        # "Manual Unlock" = someone physically at the door - not news to anyone.
+    def test_thumb_turn_with_door_shut_suppressed(self):
         self.assertIsNone(house_events.lock_event("Front door", "locked", "unlocked", "Manual Unlock"))
+
+    def test_thumb_turn_then_door_opened(self):
+        icon, text, by = house_events.lock_event("Front door", "locked", "unlocked", "Manual Unlock", True)
+        self.assertEqual(icon, "mdi:door-open")
+        self.assertEqual(text, "Front door opened from inside")
+        self.assertIsNone(by)
+
+    def test_door_opening_never_names_auto_lock(self):
+        self.assertIsNone(house_events.lock_event("Front door", "locked", "unlocked", "Auto Lock", True))
 
     def test_unattributed_unlock_suppressed(self):
         self.assertIsNone(house_events.lock_event("Front door", "locked", "unlocked", None))
@@ -374,6 +381,59 @@ class LockEventTests(unittest.TestCase):
         for bad in (None, "", "Admin", "private", 1, True):
             event = house_events.build_report_event({"cause": "c", "effect": "e", "audience": bad})
             self.assertIsNone(event["audience"], f"audience={bad!r} must not narrow")
+
+
+class DoorOpenedFromInsideTests(unittest.TestCase):
+    # Replays 15.11: door contact on at 05:04:50.4, BLE unlock at 05:04:52.4, cloud
+    # changed_by "Manual Unlock" at 05:04:54, emit 20 s after the unlock.
+    UNLOCK = datetime(2026, 11, 15, 4, 4, 52, 400000, tzinfo=timezone.utc)
+
+    def make_feed(self):
+        feed = house_events.HouseEvents()
+        feed.locks = {"lock.yale_bt": "Front door"}
+        feed.lock_attribution = {"lock.yale_bt": "lock.yale"}
+        feed.lock_doors = {"lock.yale_bt": "binary_sensor.apartment_door_open"}
+        feed._door_opened_at = {}
+        feed.lock_report_delay_s = 20
+        feed.lock_attribution_fresh_s = 180
+        feed.events = []
+        feed.clock = self.UNLOCK
+        feed.get_now = lambda: feed.clock
+        cloud_at = (self.UNLOCK + timedelta(seconds=2)).isoformat()
+        feed.get_state = lambda entity, attribute=None: {
+            "attributes": {"changed_by": "Manual Unlock"},
+            "last_updated": cloud_at,
+        }
+        feed.scheduled = []
+        feed.run_in = lambda cb, delay, **kw: feed.scheduled.append((cb, kw))
+        feed._publish = lambda: None
+        feed._write_state_file = lambda: None
+        feed.log = lambda *a, **kw: None
+        return feed
+
+    def run_night(self, door_offset_s):
+        feed = self.make_feed()
+        if door_offset_s is not None:
+            feed.clock = self.UNLOCK + timedelta(seconds=door_offset_s)
+            feed._on_door_open("binary_sensor.apartment_door_open", "state", "off", "on", {})
+        feed.clock = self.UNLOCK
+        feed._on_lock("lock.yale_bt", "state", "locked", "unlocked", {})
+        feed.clock = self.UNLOCK + timedelta(seconds=20)
+        cb, kw = feed.scheduled[0]
+        cb(kw)
+        return [e["text"] for e in feed.events]
+
+    def test_door_opening_just_before_the_unlock_reported(self):
+        self.assertEqual(self.run_night(-2), ["Front door opened from inside"])
+
+    def test_door_opening_after_the_unlock_reported(self):
+        self.assertEqual(self.run_night(5), ["Front door opened from inside"])
+
+    def test_door_left_shut_not_reported(self):
+        self.assertEqual(self.run_night(None), [])
+
+    def test_an_earlier_opening_not_pinned_on_this_unlock(self):
+        self.assertEqual(self.run_night(-7200), [])
 
 
 if __name__ == "__main__":
