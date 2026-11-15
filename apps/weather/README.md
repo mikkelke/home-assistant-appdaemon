@@ -7,7 +7,7 @@ AppDaemon apps driven by **outside conditions** (weather station, wind, rain).
 | Easterly wind monitor | `easterly_wind_monitor` | Wind-direction / easterly monitoring (see `easterly_wind_monitor.yaml`). |
 | Weather opening alert | `weather_opening_alert` | Rain + wind exposure + open windows/rooftop doors → synthetic `weather_opening_alert_*` entities for dashboards (e.g. Home Pulse). |
 
-**Climate / room temperature** apps live in [`../climate/`](../climate/) (`climate_alarm`, etc.).
+**Climate / room temperature** apps live in [`../climate/`](../climate/).
 
 ## Weather opening alert
 
@@ -43,7 +43,7 @@ Change **`exposure_band_degrees`** (half-width, default 30) in YAML. **335°** w
 
 ### Phase 2 — cold-opening
 
-Not implemented here. Belongs under **`climate/`** (e.g. extend `climate_alarm`). See [HOME_PULSE.md](../home_pulse/HOME_PULSE.md).
+Not implemented here. Belongs under **`climate/`**. See [HOME_PULSE.md](../home_pulse/HOME_PULSE.md).
 
 ### Manual verification
 

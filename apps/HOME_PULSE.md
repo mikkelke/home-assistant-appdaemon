@@ -14,7 +14,7 @@ Backend logic is split by **source of truth**:
 | Layer | Folder | Role |
 |-------|--------|------|
 | **Weather-driven opening risk** | [`apps/weather/`](weather/) | Rain, wind, facade exposure, open windows/rooftop doors → `weather_opening_alert_*` entities (see [`weather/README.md`](weather/README.md)). |
-| **Thermal / comfort** | [`apps/climate/`](climate/) | Room heating vs threshold, open-window context → e.g. `climate_alarm` (`input_boolean.climate_alarm_active`, …). Future **cold-opening** for the same UI belongs here, not under `weather/`. |
+| **Thermal / comfort** | [`apps/climate/`](climate/) | HeatingController and its alerts. Future **cold-opening** for the same UI belongs here, not under `weather/`. |
 | **Home Pulse UI** | (Lovelace / custom frontend) | Subscribes to the entities above; picks what to show first (priority). |
 
 ---
@@ -34,8 +34,6 @@ Implemented by **`WeatherOpeningAlert`** via `set_state` (see plan for exact IDs
 
 Optional per-type binaries/reason sensors are listed in [`weather/README.md`](weather/README.md).
 
-**Climate side (existing):** `input_boolean.climate_alarm_active`, `input_text.climate_alarm_message` from **ClimateAlarm**.
-
 ---
 
 ## Combined priority for the dashboard
@@ -44,7 +42,7 @@ Suggested order (highest first):
 
 1. **Rooftop rain** (`weather_opening_alert_*` priority `rooftop_rain`)
 2. **Window rain** (`window_rain`)
-3. **Climate / cold-opening** (from `climate_alarm` or a future climate app—not `weather_opening_alert`)
+3. **Climate / cold-opening** (a climate app, not `weather_opening_alert`)
 
 The UI can merge `weather_opening_alert_priority` with climate alarm state to decide a single “headline” alert.
 
@@ -54,7 +52,7 @@ The UI can merge `weather_opening_alert_priority` with climate alarm state to de
 
 - **Rooftop:** Open rooftop contact + sustained rain (no wind-direction check).
 - **Window:** Open window + sustained rain + wind from exposure band (±30° around bearing) + minimum wind speed/gust.
-- **Cold-opening (Phase 2, `climate/`):** Room below thermostat threshold + related opening open for a sustained period. **Do not** use `sensor.temperture_difference` for this (bedroom sensor disagreement, not “cold from opening”). See room–opening mapping notes in ClimateAlarm config / older design sections below.
+- **Cold-opening (Phase 2, `climate/`):** Room below thermostat threshold + related opening open for a sustained period. **Do not** use `sensor.temperture_difference` for this (bedroom sensor disagreement, not “cold from opening”).
 
 **Numeric thresholds and debounce** for rain/wind alerts: authoritative values live in the app config [`weather_opening_alert.yaml`](weather/weather_opening_alert.yaml).
 
@@ -70,6 +68,6 @@ The UI can merge `weather_opening_alert_priority` with climate alarm state to de
 ## Historical note
 
 An earlier draft described a **single AppDaemon app `HomePulse`**. That was superseded:
-weather alerts live in `weather/weather_opening_alert.py`, thermal alerts in
-`climate/climate_alarm.py`, and the current `home_pulse/` directory contains the separate
+weather alerts live in `weather/weather_opening_alert.py`, heating alerts in
+`climate/heating_alerts.py`, and the current `home_pulse/` directory contains the separate
 HouseEvents and HouseUpcoming apps and their helpers/tests.

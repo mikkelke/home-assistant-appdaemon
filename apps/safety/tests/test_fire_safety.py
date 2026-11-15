@@ -1,5 +1,5 @@
 # tests/test_fire_safety.py - unit tests for the Bosch Twinguard phase machine.
-# Same __new__ + monkeypatched-callables harness as apps/climate/tests/test_climate_alarm.py.
+# Same __new__ + monkeypatched-callables harness as the apps/climate/tests files.
 # Run from repo root: python3 -m unittest discover -s apps/safety/tests -q
 
 from __future__ import annotations

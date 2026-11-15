@@ -1607,7 +1607,7 @@ class FireSafety(hass.Hass):
         except Exception as e:
             self.log(f"publish failed: {e}", level="WARNING")
 
-    # ---------- persistence (tmp + os.replace, see house_events.py / climate_alarm.py) ----------
+    # ---------- persistence (tmp + os.replace, see house_events.py) ----------
 
     @staticmethod
     def _parse_dt(value):

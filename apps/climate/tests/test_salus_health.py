@@ -1,7 +1,7 @@
 # tests/test_salus_health.py - SalusHealth watchdog (connectivity for the Salus thermostats +
 # the wiring centre, and thermostat battery, all on zigbee2mqtt). Same __new__ +
 # monkeypatched-callables harness as the other apps/climate/tests files; async notify
-# bodies are tested directly via IsolatedAsyncioTestCase, matching climate_alarm.py.
+# bodies are tested directly via IsolatedAsyncioTestCase.
 # Run from repo root: python3 -m unittest discover -s apps/climate/tests -q
 
 from __future__ import annotations

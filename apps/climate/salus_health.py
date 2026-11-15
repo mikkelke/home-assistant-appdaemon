@@ -110,9 +110,7 @@ class SalusHealth(hass.Hass):
         return entity_id == self.controller_entity
 
     def _room_label(self, entity_id):
-        """Derive a short room label from a discovered thermostat entity_id - same
-        string-manipulation convention as climate_alarm.py's
-        _room_name_from_entity."""
+        """Derive a short room label from a discovered thermostat entity_id."""
         part = entity_id.split(".", 1)[-1]
         part = part.removesuffix("_battery_level")
         part = part.replace("_thermostat", "")
