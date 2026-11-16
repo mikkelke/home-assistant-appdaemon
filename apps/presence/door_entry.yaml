@@ -1,0 +1,28 @@
+# /conf/apps/presence/door_entry.yaml
+# Publishes sensor.door_entry (entered | left | unknown, none before the first opening): who came
+# in or went out each time the apartment door opens, from each resident's phone on Bluetooth and
+# their wifi tracker. See door_entry.py's module docstring for the rules.
+#
+# A resident is listed only once their phone is tracked by Bermuda (Mikkel's beacon, an iPhone
+# through its IRK). Anyone else at the door reads as unknown.
+#
+# No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
+# first or the app fails to instantiate.
+
+DoorEntry:
+  module: door_entry
+  class: DoorEntry
+
+  entity: sensor.door_entry
+  door: binary_sensor.apartment_door_open
+  landing_area: Landing
+  landing_online: sensor.ble_proxy_landing_uptime
+
+  residents:
+    - {name: Mikkel, area_sensor: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area, tracker: device_tracker.mikkels_ofx9p}
+    - {name: Claudia, area_sensor: sensor.claudias_iphone_ble_area, tracker: device_tracker.claudias_iphone_2}
+
+  pre_s: 120
+  post_s: 30
+  away_s: 300
+  # Defaults to door_entry_log.jsonl beside the module (*_log.jsonl is gitignored).
