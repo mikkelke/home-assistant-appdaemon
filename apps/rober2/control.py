@@ -1283,6 +1283,15 @@ class Rober2Control(hass.Hass):
                 self.log(f"{trigger}: Outside cleaning hours, not queuing next room", level="INFO")
                 return
 
+            battery = await self.get_state("sensor.rober2_battery")
+            try:
+                if float(battery) <= 20:
+                    self.log(f"{trigger}: Battery low ({battery}%), charging before the next room", level="INFO")
+                    await self._set_narrative("Charging - battery low")
+                    return
+            except (TypeError, ValueError):
+                pass
+
             # Queue the next room immediately
             room_name = self.room_config.get(next_room, next_room)
             # Log a snapshot of selection for diagnosis
@@ -1560,12 +1569,12 @@ class Rober2Control(hass.Hass):
                 battery_level = float(new)
                 old_level = float(old) if old and old != "unavailable" else None
                 
-                # If battery is low and we're cleaning, stop
+                # Low battery mid-room: finish the room, queue_next_room then lets it dock to charge.
+                # The robot's own firmware still returns home before the battery runs flat.
                 if battery_level <= 20 and self.cleaning:
-                    self.log_state_conclusion("battery_low", f"battery_{battery_level}%", "stop_and_charge", 
-                                            f"Battery low ({battery_level}%), stopping cleaning")
-                    await self.stop_cleaning()
-                    await self._set_narrative("Stopped - battery low")
+                    if old_level is None or old_level > 20:
+                        self.log_state_conclusion("battery_low", f"battery_{battery_level}%", "finish_room_then_charge",
+                                                f"Battery low ({battery_level}%), finishing this room before charging")
                 # Auto-resume: If battery charged above 80% and we have pending rooms, re-evaluate
                 elif old_level is not None and old_level < 80 and battery_level >= 80:
                     # Battery just crossed above 80% threshold - enough charge to resume cleaning
