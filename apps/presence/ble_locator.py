@@ -19,7 +19,9 @@ scanner is fresh for 30 s whatever fresh_s says. One reading per scanner, its ne
 dB = -55 - 30 * log10(metres), at least -100 (the model file's constants).
 
 ANSWER. The model answers for a device when the model file is usable, Bermuda's own area (the state
-of bermuda_area) is one of the model's rooms and at least min_scanners readings are fresh. In every
+of bermuda_area) is one of the model's rooms or one of unreachable_areas (rooms nobody can be in,
+which Bermuda still names when their scanner is the nearest) and at least min_scanners readings are
+fresh. In every
 other case the answer is Bermuda's area as it is, source "bermuda": no model file, one that cannot be
 read or was trained more than max_model_age_days ago (each warned about once until the model is
 usable), an area the model has no room for (Landing, unknown, not_home, any other), too few readings.
@@ -257,6 +259,7 @@ class BleLocator(hass.Hass):
         self.interval_s = float(a.get("interval_s", 5))
         self.fresh_s = float(a.get("fresh_s", 120))
         self.min_scanners = int(a.get("min_scanners", 3))
+        self.unreachable_areas = set(a.get("unreachable_areas") or ())
         self.offset_tau_s = float(a.get("offset_tau_s", 3600))
         self.max_model_age_days = float(a.get("max_model_age_days", 14))
         if min(self.interval_s, self.fresh_s, self.offset_tau_s, self.max_model_age_days) <= 0 or self.min_scanners < 1:
@@ -365,7 +368,8 @@ class BleLocator(hass.Hass):
         readings = readings_from(device, model, now, self.fresh_s) if model else {}
         base = {"confidence": None, "runner_up": None, "runner_up_p": None, "source": "bermuda",
                 "fresh": len(readings), "offset": round(track.offset, 1)}
-        if model is None or area not in model.rooms or len(readings) < self.min_scanners:
+        modelled = area in model.rooms or area in self.unreachable_areas if model else False
+        if not modelled or len(readings) < self.min_scanners:
             return {**base, "room": area if isinstance(area, str) and area else "unknown"}
 
         if track.belief is None or track.rooms != model.rooms or now - track.belief_at > self.fresh_s:

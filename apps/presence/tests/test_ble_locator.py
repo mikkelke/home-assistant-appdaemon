@@ -463,6 +463,14 @@ class Fallback(unittest.TestCase):
         tick(app, 30)
         self.assertEqual(last(app)["attributes"]["source"], "model")
 
+    def test_an_unreachable_bermuda_area_gets_the_model_s_answer(self):
+        _, shown = self.run_one("Technical room", reading("Kitchen"), args={"unreachable_areas": ["Technical room"]})
+        self.assertEqual((shown["state"], shown["attributes"]["source"]), ("Kitchen", "model"))
+
+    def test_without_unreachable_areas_bermuda_s_unmodelled_area_shows(self):
+        _, shown = self.run_one("Technical room", reading("Kitchen"))
+        self.assertEqual((shown["state"], shown["attributes"]["source"]), ("Technical room", "bermuda"))
+
     def test_min_scanners_comes_from_the_yaml(self):
         _, shown = self.run_one("Kitchen", reading("Kitchen", scanners=(S1, S2, S3)), args={"min_scanners": 4})
         self.assert_bermuda(shown, "Kitchen", 3)

@@ -16,6 +16,9 @@ BleLocator:
   min_scanners: 3
   offset_tau_s: 3600
   max_model_age_days: 14
+  # Bermuda areas nobody can be in: when Bermuda names one (the host adapter in the technical room is
+  # sometimes the nearest scanner from the hallway), the model answers instead.
+  unreachable_areas: ["Technical room"]
 
   # Default beside the module; the model, the log and the state file are all gitignored.
   # model_file: /conf/apps/presence/ble_locator_model.json
