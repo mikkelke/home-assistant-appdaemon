@@ -537,8 +537,7 @@ class ShippedYaml(unittest.TestCase):
 
     def test_sun_cuts_only_where_the_glass_looks_at_the_sun(self):
         enabled = [n for n, zc in self.cfg.zones.items() if zc.sun_cut.enabled]
-        self.assertEqual(enabled, ["family", "claudias_room"])
-        self.assertEqual(self.cfg.zones["claudias_room"].sun_cut.az_min, 180.0)
+        self.assertEqual(enabled, ["family"])
 
     def test_the_family_protected_minimum_is_half_a_degree_under_the_helper(self):
         family = self.cfg.zones["family"]
@@ -587,7 +586,7 @@ class ShippedYaml(unittest.TestCase):
         self.assertEqual(cfg.call, hp.CallConfig(0.2, 20.0, 20.0, 30.0, 6.0, 2.0))
         self.assertEqual(cfg.writes_per_hour, 4)
         self.assertEqual(cfg.write_stable_minutes, 10)
-        self.assertEqual(cfg.window, hp.WindowConfig(2.0, 60.0, 0.3, 10.0, 2.0, 8.0))
+        self.assertEqual(cfg.window, hp.WindowConfig(2.0, 60.0, 0.3, 10.0, 1.0, 4.0))
 
     def test_no_zone_ships_the_settings_of_the_model_that_was_replaced(self):
         for name, raw in self.args["zones"].items():
@@ -1730,10 +1729,10 @@ class AiringLockoutEndToEnd(LiveZones, unittest.TestCase):
         self.assertEqual(h.attrs(zone)["mode"], "settle")
         return closed
 
-    def test_a_three_hour_airing_in_a_residents_room_keeps_the_heat_off_for_six_hours(self):
+    def test_a_three_hour_airing_in_a_residents_room_keeps_the_heat_off_for_three_hours(self):
         h = self.live("kristines_room")
         closed = self.air_out(h, "kristines_room", KRISTINE_WINDOW)
-        deadline = closed + timedelta(hours=6)
+        deadline = closed + timedelta(hours=3)
         self.assertEqual(h.attrs("kristines_room")["heat_allowed_at"], deadline.isoformat())
         while h.clock.now + timedelta(minutes=5) < deadline:
             h.tick(minutes=5)
@@ -1747,10 +1746,10 @@ class AiringLockoutEndToEnd(LiveZones, unittest.TestCase):
         self.assertNotIn("heat_allowed_at", a)
         self.assertEqual(self.sent(h), [5.0, 22.5])
 
-    def test_a_three_hour_airing_in_a_room_without_residents_is_over_after_an_hour(self):
+    def test_a_three_hour_airing_in_the_family_room_keeps_the_heat_off_for_three_hours(self):
         h = self.live("family")
         closed = self.air_out(h, "family", FAMILY_DOOR)
-        deadline = closed + timedelta(hours=1)
+        deadline = closed + timedelta(hours=3)
         self.assertEqual(h.attrs("family")["heat_allowed_at"], deadline.isoformat())
         while h.clock.now + timedelta(minutes=5) < deadline:
             h.tick(minutes=5)
@@ -1762,11 +1761,26 @@ class AiringLockoutEndToEnd(LiveZones, unittest.TestCase):
         self.assertEqual((a["mode"], a["call"]), ("hold", "true"))
         self.assertEqual(self.sent(h), [5.0, 23.5])
 
+    def test_every_zone_with_openings_waits_the_open_time_between_an_hour_and_four_hours(self):
+        openings = {
+            "family": FAMILY_DOOR,
+            "kristines_room": KRISTINE_WINDOW,
+            "claudias_room": "binary_sensor.rooftop_door_2_contact",
+            "bathroom": "binary_sensor.bathroom_window_contact",
+        }
+        for zone, opening in openings.items():
+            for hours, wait in ((20 / 60, 1), (3, 3), (6, 4)):
+                with self.subTest(zone=zone, hours=hours):
+                    h = self.live(zone)
+                    closed = self.air_out(h, zone, opening, hours=hours)
+                    deadline = closed + timedelta(hours=wait)
+                    self.assertEqual(h.attrs(zone)["heat_allowed_at"], deadline.isoformat())
+
     def test_heat_waits_for_the_next_slot_when_the_lockout_ends_between_two(self):
         h = self.live("kristines_room")
-        closed = self.air_out(h, "kristines_room", KRISTINE_WINDOW, hours=3.2)
-        deadline = closed + timedelta(hours=6.4)
-        self.assertEqual(deadline, datetime(2026, 10, 17, 21, 37, tzinfo=TZ))
+        closed = self.air_out(h, "kristines_room", KRISTINE_WINDOW, hours=3.4)
+        deadline = closed + timedelta(hours=3.4)
+        self.assertEqual(deadline, datetime(2026, 10, 17, 18, 49, tzinfo=TZ))
         while deadline - h.clock.now > timedelta(minutes=5):
             h.tick(minutes=5)
         h.tick(minutes=5)
@@ -1774,10 +1788,10 @@ class AiringLockoutEndToEnd(LiveZones, unittest.TestCase):
         self.assertEqual((h.clock.now, a["mode"], a["call"]), (deadline + timedelta(minutes=1), "hold", "false"))
         self.assertEqual(h.app._zones["kristines_room"].call_reason, "wait_slot")
         self.assertEqual(self.sent(h), [5.0])
-        while h.clock.now < datetime(2026, 10, 17, 22, 0, tzinfo=TZ):
+        while h.clock.now < datetime(2026, 10, 17, 19, 0, tzinfo=TZ):
             h.tick(minutes=5)
         a = h.attrs("kristines_room")
-        self.assertEqual((h.clock.now.hour, h.clock.now.minute < 6), (22, True))
+        self.assertEqual((h.clock.now.hour, h.clock.now.minute < 6), (19, True))
         self.assertEqual((a["call"], a["call_since"]), ("true", h.clock.now.isoformat()))
         self.assertEqual(self.sent(h), [5.0, 22.5])
 
@@ -1794,8 +1808,8 @@ class AiringLockoutEndToEnd(LiveZones, unittest.TestCase):
     def test_a_restart_in_the_lockout_keeps_its_deadline(self):
         h = self.live("kristines_room")
         closed = self.air_out(h, "kristines_room", KRISTINE_WINDOW)
-        deadline = closed + timedelta(hours=6)
-        h.tick(minutes=180)
+        deadline = closed + timedelta(hours=3)
+        h.tick(minutes=90)
         restarted = h.restart()
         restarted.tick()
         a = restarted.attrs("kristines_room")
@@ -1834,9 +1848,7 @@ class AiringLockoutEndToEnd(LiveZones, unittest.TestCase):
         a = h.attrs("kristines_room")
         self.assertEqual(a["mode"], "settle")
         opened = datetime(2026, 10, 17, 12, 1, tzinfo=TZ)
-        self.assertEqual(
-            a["heat_allowed_at"], (reclosed + 2 * (reclosed - opened)).isoformat()
-        )
+        self.assertEqual(a["heat_allowed_at"], (reclosed + (reclosed - opened)).isoformat())
 
 
 class OffSeasonPlan(unittest.TestCase):
@@ -2736,22 +2748,11 @@ class SunCut(unittest.TestCase):
         # one bright hour is no sun day; the window shown is tomorrow's
         self.assertEqual(h.attrs("family")["cut_window"][0], "2026-10-18T07:00:00+02:00")
 
-    def test_claudias_window_opens_later_because_her_glass_looks_west(self):
-        h = self.season()
-        h.at(4, 30, day=18)
-        h.tick()
-        self.assertEqual(h.attrs("claudias_room")["mode"], "hold")
-        h.at(5, 5, day=18)
-        h.tick()
-        a = h.attrs("claudias_room")
-        self.assertEqual(a["mode"], "sun_cut")
-        self.assertEqual(a["setpoint_now"], 21.0)  # her protected minimum, base minus half a degree
-
     def test_the_other_zones_are_never_cut(self):
         h = self.season()
         h.at(10, 0, day=18)
         h.tick()
-        for zone in ("kristines_room", "bathroom", "guest_bathroom"):
+        for zone in ("kristines_room", "claudias_room", "bathroom", "guest_bathroom"):
             self.assertNotEqual(h.attrs(zone)["mode"], "sun_cut")
 
     def test_more_trust_in_the_sun_cuts_a_sunny_day_that_less_trust_leaves_alone(self):

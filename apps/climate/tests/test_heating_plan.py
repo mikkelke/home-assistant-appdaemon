@@ -314,12 +314,12 @@ class ConfigParsing(unittest.TestCase):
 
     def test_the_window_lockout_has_defaults_and_is_read(self):
         w = CFG.window
-        self.assertEqual((w.lockout_per_open_hour, w.lockout_max_hours), (2.0, 8.0))
+        self.assertEqual((w.lockout_per_open_hour, w.lockout_max_hours), (1.0, 4.0))
         self.assertEqual((w.settle_max_minutes, w.settle_recovered_c), (60.0, 0.3))
         cfg = hp.parse_config(
-            dict(ARGS, window={"lockout_per_open_hour": 1.5, "lockout_max_hours": 4})
+            dict(ARGS, window={"lockout_per_open_hour": 1.5, "lockout_max_hours": 6})
         )
-        self.assertEqual((cfg.window.lockout_per_open_hour, cfg.window.lockout_max_hours), (1.5, 4.0))
+        self.assertEqual((cfg.window.lockout_per_open_hour, cfg.window.lockout_max_hours), (1.5, 6.0))
         self.assertEqual(cfg.window.settle_max_minutes, 60.0)
 
     def test_a_bad_window_setting_is_refused(self):
@@ -1546,8 +1546,8 @@ class ComfortSwitchTests(unittest.TestCase):
 class WindowTrackerTests(unittest.TestCase):
     A, B = "binary_sensor.a", "binary_sensor.b"
 
-    def tracker(self, per_open_hour=0.0, **kw):
-        return hp.WindowTracker(hp.WindowConfig(**kw), per_open_hour=per_open_hour)
+    def tracker(self, **kw):
+        return hp.WindowTracker(hp.WindowConfig(**kw))
 
     def drive(self, tr, t0, steps):
         """steps: list of (seconds from t0, {entity: state}, air) -> list of (t, event)."""
@@ -1712,7 +1712,7 @@ class WindowTrackerTests(unittest.TestCase):
         self.assertEqual(back.pre_open_air, 21.5)
 
     def test_a_settle_that_was_saved_is_resumed_with_its_deadline(self):
-        tr = self.tracker(per_open_hour=2.0)
+        tr = self.tracker()
         t0 = T(12)
         self.drive(
             tr,
@@ -1720,10 +1720,10 @@ class WindowTrackerTests(unittest.TestCase):
             [(0, {self.A: "on"}, 21.5), (120, {self.A: "on"}, 21.5), (3 * 3600, {self.A: "off"}, 18.0)],
         )
         saved = json.loads(json.dumps(tr.snapshot()))
-        back = hp.WindowTracker(hp.WindowConfig(), saved, per_open_hour=2.0)
+        back = hp.WindowTracker(hp.WindowConfig(), saved)
         self.assertEqual(back.state, "settle")
         self.assertEqual(back.deadline(), tr.deadline())
-        self.assertEqual(back.deadline(), t0 + 3 * 3600 + 6 * 3600)
+        self.assertEqual(back.deadline(), t0 + 3 * 3600 + 3 * 3600)
         self.assertIsNone(back.update(back.deadline() - 1, {self.A: "off"}, 18.0))
         self.assertEqual(back.update(back.deadline(), {self.A: "off"}, 18.0), hp.EVENT_RESTORED)
 
@@ -1739,9 +1739,9 @@ class AiringLockoutTests(unittest.TestCase):
     A = "binary_sensor.a"
     COLD = 17.0  # never within settle_recovered_c of the air before the opening
 
-    def aired(self, hours, per_open_hour=2.0, cfg=None, pre=21.5):
+    def aired(self, hours, cfg=None, pre=21.5):
         """A tracker that was open for `hours` from T(12) and has just closed (settling)."""
-        tr = hp.WindowTracker(cfg or hp.WindowConfig(), per_open_hour=per_open_hour)
+        tr = hp.WindowTracker(cfg or hp.WindowConfig())
         t0 = T(12)
         tr.update(t0, {self.A: "on"}, pre)
         tr.update(t0 + 120, {self.A: "on"}, pre)
@@ -1753,27 +1753,29 @@ class AiringLockoutTests(unittest.TestCase):
         tr, closed = self.aired(hours, **kw)
         return (tr.deadline() - closed) / 60.0
 
-    def test_the_lockout_is_twice_the_open_time_between_an_hour_and_eight_hours(self):
+    def test_the_lockout_is_the_open_time_between_an_hour_and_four_hours(self):
         self.assertEqual(self.lockout_minutes(20 / 60), 60)
-        self.assertEqual(self.lockout_minutes(3), 6 * 60)
-        self.assertEqual(self.lockout_minutes(6), 8 * 60)
-        self.assertEqual(self.lockout_minutes(12), 8 * 60)
-        self.assertEqual(self.lockout_minutes(1), 2 * 60)
+        self.assertEqual(self.lockout_minutes(1), 60)
+        self.assertEqual(self.lockout_minutes(2), 2 * 60)
+        self.assertEqual(self.lockout_minutes(3), 3 * 60)
+        self.assertEqual(self.lockout_minutes(6), 4 * 60)
+        self.assertEqual(self.lockout_minutes(12), 4 * 60)
 
-    def test_a_zone_without_residents_waits_an_hour_whatever_the_open_time(self):
+    def test_a_factor_of_zero_waits_the_minimum_whatever_the_open_time(self):
+        cfg = hp.WindowConfig(lockout_per_open_hour=0.0)
         for hours in (20 / 60, 3, 6):
-            self.assertEqual(self.lockout_minutes(hours, per_open_hour=0.0), 60, hours)
+            self.assertEqual(self.lockout_minutes(hours, cfg=cfg), 60, hours)
 
     def test_the_settings_move_the_floor_and_the_ceiling(self):
         cfg = hp.WindowConfig(settle_max_minutes=30, lockout_max_hours=2)
         self.assertEqual(self.lockout_minutes(5 / 60, cfg=cfg), 30)
-        self.assertEqual(self.lockout_minutes(1.5, cfg=cfg), 2 * 60)
+        self.assertEqual(self.lockout_minutes(1.5, cfg=cfg), 90)
         self.assertEqual(self.lockout_minutes(3, cfg=cfg), 2 * 60)
-        cfg = hp.WindowConfig(lockout_per_open_hour=1.0)
-        self.assertEqual(self.lockout_minutes(3, per_open_hour=1.0, cfg=cfg), 3 * 60)
+        cfg = hp.WindowConfig(lockout_per_open_hour=2.0)
+        self.assertEqual(self.lockout_minutes(1.5, cfg=cfg), 3 * 60)
 
     def test_the_lockout_ends_at_the_deadline_and_not_a_second_before(self):
-        for hours, minutes in ((20 / 60, 60), (3, 360), (6, 480)):
+        for hours, minutes in ((20 / 60, 60), (3, 180), (6, 240)):
             with self.subTest(hours=hours):
                 tr, closed = self.aired(hours)
                 end = closed + minutes * 60
@@ -1797,7 +1799,7 @@ class AiringLockoutTests(unittest.TestCase):
     def test_the_lockout_is_counted_from_the_close_and_not_from_the_opening(self):
         tr, closed = self.aired(3)
         self.assertEqual(tr.settle_since, closed)
-        self.assertEqual(tr.deadline(), closed + 6 * 3600)
+        self.assertEqual(tr.deadline(), closed + 3 * 3600)
 
     def test_reopening_keeps_the_first_opening_and_the_deadline_only_moves_later(self):
         tr, closed = self.aired(3)
@@ -1811,7 +1813,7 @@ class AiringLockoutTests(unittest.TestCase):
         again = reopen + 300
         self.assertEqual(tr.update(again, {self.A: "off"}, self.COLD), hp.EVENT_SETTLE)
         self.assertGreater(tr.deadline(), first)
-        self.assertEqual(tr.deadline(), again + 2 * (again - T(12)))
+        self.assertEqual(tr.deadline(), again + (again - T(12)))
 
     def test_a_reopening_after_a_short_airing_never_shortens_the_wait(self):
         tr, closed = self.aired(20 / 60)
@@ -1822,7 +1824,7 @@ class AiringLockoutTests(unittest.TestCase):
         self.assertGreaterEqual(tr.deadline(), first)
 
     def test_the_deadline_exists_only_while_settling(self):
-        tr = hp.WindowTracker(hp.WindowConfig(), per_open_hour=2.0)
+        tr = hp.WindowTracker(hp.WindowConfig())
         self.assertIsNone(tr.deadline())
         tr.update(T(12), {self.A: "on"}, 21.5)
         tr.update(T(12, 2), {self.A: "on"}, 21.5)
@@ -1833,7 +1835,6 @@ class AiringLockoutTests(unittest.TestCase):
         tr = hp.WindowTracker(
             hp.WindowConfig(),
             {"state": "settle", "settle_since": T(12), "opened_at": None, "pre_open_air": 21.5},
-            per_open_hour=2.0,
         )
         self.assertEqual(tr.deadline(), T(13))
 
@@ -1849,7 +1850,7 @@ class AiringLockoutTests(unittest.TestCase):
         self.assertEqual(
             set(saved), {"state", "opened_at", "pre_open_air", "settle_since"}
         )
-        back = hp.WindowTracker(hp.WindowConfig(), saved, per_open_hour=2.0)
+        back = hp.WindowTracker(hp.WindowConfig(), saved)
         self.assertEqual(back.snapshot(), tr.snapshot())
         self.assertEqual(back.deadline(), tr.deadline())
 

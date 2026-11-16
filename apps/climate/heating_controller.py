@@ -16,8 +16,9 @@ result.
 
 Heat is not allowed, and so there is no call, while a window is open, for the lockout after an
 airing, in a party, at the floor cap, while the owner has the zone off and while the season is
-off. A zone with residents stays locked out for lockout_per_open_hour times the time it was
-open, up to lockout_max_hours, unless the air gets back to where it was before.
+off. Every zone with openings stays locked out for lockout_per_open_hour times the time it was
+open, at least settle_max_minutes and at most lockout_max_hours, unless the air gets back to
+where it was before.
 
 Signals: a thermostat setpoint, mode or preset change is attributed from the service calls the
 app sees on the thermostats; the four nudge buttons and the helpers the owner owns are read from
@@ -155,11 +156,7 @@ class ZoneRuntime:
         direction = _num(saved.get("nudge_dir")) or 0
         self.nudge_dir = (direction > 0) - (direction < 0)
         self.last_planned = _num(saved.get("last_planned"))
-        self.tracker = hp.WindowTracker(
-            cfg.window,
-            _dict(saved.get("window")),
-            cfg.window.lockout_per_open_hour if zc.residents else 0.0,
-        )
+        self.tracker = hp.WindowTracker(cfg.window, _dict(saved.get("window")))
         self.call = hp.CallState(saved.get("call"))
         self.bucket = hp.TokenBucket(cfg.writes_per_hour, _dict(saved.get("bucket")))
         self.blocks = hp.BlockLog(_dict(saved.get("blocks")))

@@ -224,8 +224,8 @@ class WindowConfig:
     settle_max_minutes: float = 60.0
     settle_recovered_c: float = 0.3
     unavailable_closed_minutes: float = 10.0
-    lockout_per_open_hour: float = 2.0
-    lockout_max_hours: float = 8.0
+    lockout_per_open_hour: float = 1.0
+    lockout_max_hours: float = 4.0
 
 
 @dataclass(frozen=True)
@@ -1231,15 +1231,13 @@ class WindowTracker:
     the opening was. The deadline is lockout_per_open_hour times the time the zone was open, at
     least settle_max_minutes and at most lockout_max_hours, counted from the close. A short dip
     recovers from the room's own mass and heating against it would only overshoot hours later;
-    a long opening has cooled the walls and the slab, and the heat that goes in is lost again
-    for as long as the room is cold. A zone without residents passes lockout_per_open_hour 0 and
-    so settles for settle_max_minutes. A reopening while settling keeps the first opening's
-    time, so the deadline only moves later. An opening unavailable for
+    a long opening has cooled the walls and the slab, and heat started during a room's own
+    recovery arrives after it, as overshoot. A reopening while settling keeps the first
+    opening's time, so the deadline only moves later. An opening unavailable for
     unavailable_closed_minutes counts as closed, so a dead contact cannot pin a room."""
 
-    def __init__(self, cfg: WindowConfig, saved: Optional[dict] = None, per_open_hour: float = 0.0):
+    def __init__(self, cfg: WindowConfig, saved: Optional[dict] = None):
         self.cfg = cfg
-        self.per_open_hour = per_open_hour
         saved = saved or {}
         self.state = saved.get("state", STATE_CLOSED)
         if self.state not in (STATE_CLOSED, STATE_OPEN, STATE_SETTLE):
@@ -1267,7 +1265,7 @@ class WindowTracker:
             return None
         opened = self.settle_since if self.opened_at is None else self.opened_at
         lockout_s = clamp(
-            self.per_open_hour * (self.settle_since - opened),
+            self.cfg.lockout_per_open_hour * (self.settle_since - opened),
             self.cfg.settle_max_minutes * 60.0,
             self.cfg.lockout_max_hours * 3600.0,
         )
