@@ -12,6 +12,9 @@ apps/people/
 *_log.jsonl
 *_episodes.jsonl
 
+# Room model fitted on the box by scripts/ble_locator_train.py
+ble_locator_model.json
+
 # Media: copyrighted manuals, apartment layout drawings, maps
 *.pdf
 *.png

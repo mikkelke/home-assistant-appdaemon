@@ -1,0 +1,32 @@
+# /conf/apps/presence/ble_locator.yaml
+# MEASUREMENT ONLY. Per listed device it works out which room the device is in from what every
+# Bluetooth scanner hears of it, with the model scripts/ble_locator_train.py fits on the beacon stuck
+# on Rober2, and publishes sensor.<name>_ble_room next to Bermuda's own area. Nothing consumes these
+# sensors yet. See ble_locator.py's module docstring for the rules.
+#
+# No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
+# first or the app fails to instantiate.
+
+BleLocator:
+  module: ble_locator
+  class: BleLocator
+
+  interval_s: 5
+  fresh_s: 120
+  min_scanners: 3
+  offset_tau_s: 3600
+  max_model_age_days: 14
+
+  # Default beside the module; the model, the log and the state file are all gitignored.
+  # model_file: /conf/apps/presence/ble_locator_model.json
+  # log_file: /conf/apps/presence/ble_locator_log.jsonl
+  # state_file: /conf/apps/presence/ble_locator_state.json
+
+  # name: the sensor is sensor.<name>_ble_room. address: what bermuda.dump_devices lists the device
+  # under. bermuda_area: the device's Bermuda area sensor, the answer whenever the model gives none.
+  # The beacon on Rober2 is the regression check: its room against sensor.rober2_current_room while
+  # the robot cleans.
+  devices:
+    - {name: mikkel, address: "d6462f88944242db9e31bdff598edc25_100_40004", bermuda_area: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area}
+    - {name: claudia, address: "89f35c9874aed44c554015fe6eaa3545", bermuda_area: sensor.claudias_iphone_ble_area}
+    - {name: rober2_beacon, address: "7c:d9:f4:14:23:77", bermuda_area: sensor.mp1_142377_area}
