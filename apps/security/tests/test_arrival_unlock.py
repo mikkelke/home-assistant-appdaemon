@@ -516,7 +516,8 @@ class Missed(unittest.TestCase):
         app = make_app()
         wifi_home(app, 100)
         self.assertEqual(lines(app), [{"kind": "missed", "t": iso(100), "away_since": iso(-3600), "door_open": None,
-                                       "proxy_online": None, "last_landing_distance_state": "unknown"}])
+                                       "proxy_online": None, "landing_seen": None,
+                                       "last_landing_distance_state": "unknown"}])
         message = f"ArrivalUnlock: tracker home after 62 min away and no window opened, missed -> {app.log_file.name}"
         self.assertIn(("INFO", message), app.logged)
 
@@ -535,6 +536,16 @@ class Missed(unittest.TestCase):
         wifi_home(app, 100)
         self.assertEqual((lines(app)[0]["last_landing_distance_state"], lines(app)[0]["proxy_online"]),
                          ("9.4", iso(10)))
+
+    def test_a_landing_sighting_while_not_armed_is_carried_for_5_minutes(self):
+        for flip, expected in ((350, iso(50)), (351, None)):
+            with self.subTest(flip=flip):
+                app = make_app(states={LOCK: "unlocked"})
+                sight(app, 50)
+                self.assertEqual(app.scheduled, [])
+                wifi_home(app, flip)
+                (line,) = lines(app)
+                self.assertEqual((line["kind"], line["landing_seen"]), ("missed", expected))
 
     def test_a_power_up_more_than_5_minutes_before_the_flip_is_null(self):
         app = make_app()

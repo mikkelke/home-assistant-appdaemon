@@ -36,9 +36,11 @@ the window lives in memory only.
 
 MISSED. When the tracker flips to home after being away for away_min and no window opened in the 5
 minutes before, one line is appended: {kind: missed, t, away_since, door_open, proxy_online,
-last_landing_distance_state}. door_open is the latest door opening within 3 minutes before the flip
-and last_landing_distance_state the landing distance entity's state at the flip, null when it does
-not exist or is not configured.
+landing_seen, last_landing_distance_state}. door_open is the latest door opening within 3 minutes
+before the flip, landing_seen the latest change of the area sensor to landing_area within 5 minutes
+before the flip whether armed or not (an arrival to an already unlocked door still shows how early
+the phone was seen), and last_landing_distance_state the landing distance entity's state at the
+flip, null when it does not exist or is not configured.
 
 Times are ISO strings in AppDaemon's time zone. All arithmetic runs on epoch seconds, so a daylight
 saving change inside a window cannot skew a duration.
@@ -103,6 +105,7 @@ class ArrivalUnlock(hass.Hass):
         self._away_since = None
         self._door_opened = None
         self._last_start = None
+        self._landing_seen = None
         a = self.args
         self.tracker_entity = a["tracker"]
         self.area_entity = a["landing_area_sensor"]
@@ -142,6 +145,7 @@ class ArrivalUnlock(hass.Hass):
         distance = distance_of(self._landing_distance_state())
         now = self._now()
         with self._lock:
+            self._landing_seen = now
             if self._win is not None or not armed(tracker, changed, lock, door, now, self.away_s):
                 return
             wid = next(self._ids)
@@ -171,11 +175,12 @@ class ArrivalUnlock(hass.Hass):
             caught = within(self._last_start, now, WINDOW_RECENT_S) is not None
             door_open = within(self._door_opened, now, DOOR_RECENT_S)
             proxy_online = within(self._proxy_online, now, PROXY_RECENT_S)
+            landing_seen = within(self._landing_seen, now, WINDOW_RECENT_S)
         if away_since is None or now - away_since < self.away_s or caught:
             return
         if self._append({"kind": "missed", "t": self._iso(now), "away_since": self._iso(away_since),
                          "door_open": self._iso(door_open), "proxy_online": self._iso(proxy_online),
-                         "last_landing_distance_state": self._landing_distance_state()}, "missed record"):
+                         "landing_seen": self._iso(landing_seen), "last_landing_distance_state": self._landing_distance_state()}, "missed record"):
             self.log(f"ArrivalUnlock: tracker home after {(now - away_since) / 60:.0f} min away and no window "
                      f"opened, missed -> {self.log_file.name}", level="INFO")
 
