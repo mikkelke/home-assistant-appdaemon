@@ -179,10 +179,8 @@ def scanner_table(entities, devices, areas):
             address = f"{head}{last + step:02x}"
             if address in bluetooth:
                 name, area = bluetooth[address]
-                area = area or area_of.get(base)
-                if area:
-                    table[e["entity_id"][len(prefix):]] = {"address": address, "name": named.get(base) or name,
-                                                           "area": area}
+                table[e["entity_id"][len(prefix):]] = {"address": address, "name": named.get(base) or name,
+                                                       "area": area or area_of.get(base)}
                 break
     return table
 
@@ -271,9 +269,10 @@ def mark_samples(points, by_address):
 # ---------- held-out scoring ----------
 
 def nearest(readings, table_by_address):
-    if not readings:
+    placed = {a: db for a, db in readings.items() if table_by_address[a]["area"]}
+    if not placed:
         return None
-    return table_by_address[max(readings, key=readings.get)]["area"]
+    return table_by_address[max(placed, key=placed.get)]["area"]
 
 
 def best(probs, rooms, readings):
