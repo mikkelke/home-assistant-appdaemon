@@ -225,6 +225,7 @@ class Rober2Control(hass.Hass):
         # Per-room consecutive 0% interrupt counter (resets on success or manual re-enable)
         self._room_interrupt_counts = {}
         self.MAX_ROOM_RETRIES = int(self.args.get("max_room_retries", 3))
+        self._room_done_pct = {str(k): int(v) for k, v in (self.args.get("room_done_pct") or {}).items()}
         self.MIN_DURATION_FOR_ZERO_PROGRESS = int(self.args.get("min_duration_zero_progress_sec", 10))
         # Max time (seconds) after segment command to count a dock as a "failed attempt". Prevents
         # unavailable->docked (e.g. network blip) hours later from being counted as attempt 3/3.
@@ -490,6 +491,10 @@ class Rober2Control(hass.Hass):
     async def _is_cleaner_visiting(self) -> bool:
         entity = getattr(self, "_visitor_entity", "sensor.untracked_visitor")
         return await self.get_state(entity) == "cleaner"
+
+    def _done_pct(self, room_name) -> int:
+        """Peak progress at which a room counts as cleaned; furnished rooms never reach 90."""
+        return self._room_done_pct.get(room_name, 90)
 
     async def is_away(self) -> bool:
         """Return True if home is considered away.
@@ -836,7 +841,7 @@ class Rober2Control(hass.Hass):
                     except Exception:
                         allow_init_grace = False
 
-                    if progress_value >= 90 and (cleaning_duration > 60 or allow_init_grace):
+                    if progress_value >= self._done_pct(room_name) and (cleaning_duration > 60 or allow_init_grace):
                         await self._set_narrative(
                             f"{self._pretty_room_from_segment_id(self.current_room)} finished - returning"
                         )
@@ -929,7 +934,7 @@ class Rober2Control(hass.Hass):
                         # NEW GUARD: Only allow fallback completion if we actually observed the robot in this room
                         # during a cleaning state at least once in this cycle.
                         visited = current_room_text in self._visited_rooms
-                        if robot_status == "returning_home" and progress_value >= 80 and visited:
+                        if robot_status == "returning_home" and progress_value >= min(80, self._done_pct(room_name)) and visited:
                             await self._set_narrative(
                                 f"{self._pretty_room_from_segment_id(current_room_text)} finished - returning"
                             )
@@ -960,7 +965,7 @@ class Rober2Control(hass.Hass):
                             
                             await self.queue_next_room(trigger="room_completed_detected")
                             await self.save_map_image(trigger_context=f"{room_name}")
-                        elif progress_value >= 90 and visited:  # High confidence completion only if visited
+                        elif progress_value >= self._done_pct(room_name) and visited:
                             await self._set_narrative(
                                 f"{self._pretty_room_from_segment_id(current_room_text)} finished - returning"
                             )

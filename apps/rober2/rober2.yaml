@@ -25,6 +25,10 @@ rober2_control:
   # Min cleaning duration (seconds) to count as a zero-progress attempt; default 10 (was 20)
   # min_duration_zero_progress_sec: 10
   # max_room_retries: 3
+  # Peak progress (%) at which a room counts as cleaned (default 90). The robot's progress is
+  # cleaned area over the room's map area, so a room whose floor is mostly under furniture tops out lower.
+  room_done_pct:
+    claudias_room: 50
   # Max seconds after segment command to count a dock as a failed attempt (default 30 min); avoids
   # counting unavailable->docked or state refresh hours later as attempt 3/3
   # max_elapsed_zero_progress_sec: 1800
