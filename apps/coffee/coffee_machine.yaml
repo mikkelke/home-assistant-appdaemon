@@ -31,10 +31,14 @@ CoffeeMachine:
   tablet_notify: notify/mobile_app_oppopad4pro
   tablet_interactive: binary_sensor.oppopad4pro_interactive
 
-  # Mikkel's phone, the only one Bermuda can identify.
-  bermuda_person: person.mikkel
-  bermuda_distance: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_distance_to_pour_over_plug
-  bermuda_area: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area
+  # The phones Bermuda can identify: distance to the coffee-bar proxy and the phone's area.
+  bermuda_phones:
+    - person: person.mikkel
+      distance: sensor.mikkel_oppo_ble_distance_to_ble_proxy_coffee_bar
+      area: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area
+    - person: person.claudia
+      distance: sensor.claudias_iphone_ble_distance_to_ble_proxy_coffee_bar
+      area: sensor.claudias_iphone_ble_area
   person_entities: [person.mikkel, person.kristine, person.claudia]
   # Name the brewer when exactly one person is home (ActorAttribution's rule). false: Bermuda only.
   sole_occupancy: true

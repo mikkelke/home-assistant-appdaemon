@@ -115,8 +115,8 @@ def base_states(now):
         "person.kristine": full("home"),
         "person.claudia": full("not_home"),
         "binary_sensor.oppopad4pro_interactive": full("off", changed=now - 900),
-        CONFIG["bermuda_distance"]: full("6.0"),
-        CONFIG["bermuda_area"]: full("Bedroom"),
+        **{phone["distance"]: full("6.0") for phone in CONFIG["bermuda_phones"]},
+        **{phone["area"]: full("Bedroom") for phone in CONFIG["bermuda_phones"]},
     }
 
 

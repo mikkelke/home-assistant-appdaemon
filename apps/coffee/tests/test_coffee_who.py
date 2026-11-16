@@ -19,6 +19,24 @@ def track(points):
     return t
 
 
+class PickTests(unittest.TestCase):
+    def test_the_one_confident_phone_wins(self):
+        phones = {"mikkel": (True, {"closest_m": "1.8"}), "claudia": (False, {"closest_m": "0.5"})}
+        self.assertEqual(cw.pick(phones), ("mikkel", "closest"))
+
+    def test_of_several_the_clearly_closest_wins(self):
+        phones = {"mikkel": (True, {"closest_m": "1.9"}), "claudia": (True, {"closest_m": "0.8"})}
+        self.assertEqual(cw.pick(phones), ("claudia", "closest"))
+
+    def test_two_phones_equally_near_name_nobody(self):
+        phones = {"mikkel": (True, {"closest_m": "1.2"}), "claudia": (True, {"closest_m": "0.9"})}
+        self.assertEqual(cw.pick(phones), (None, "tie"))
+
+    def test_no_confident_phone_names_nobody(self):
+        self.assertEqual(cw.pick({"mikkel": (False, {})}), (None, "none_near"))
+        self.assertEqual(cw.pick({}), (None, "none_near"))
+
+
 class BermudaTests(unittest.TestCase):
     def test_near_and_moving_is_confident(self):
         distance = track([(-600, "6.0"), (-120, "3.1"), (-30, "1.6"), (10, "1.4")])

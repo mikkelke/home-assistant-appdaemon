@@ -146,9 +146,8 @@ class CoffeeMachine(hass.Hass):
         self.tablet_user = str(a.get("tablet_user_id") or "").replace("-", "").lower()
         self.tablet_notify = a.get("tablet_notify", "notify/mobile_app_oppopad4pro")
         self.tablet_interactive = a.get("tablet_interactive", "binary_sensor.oppopad4pro_interactive")
-        self.bermuda_distance = a.get("bermuda_distance")
-        self.bermuda_area = a.get("bermuda_area")
-        self.bermuda_person = a.get("bermuda_person", "person.mikkel")
+        self.bermuda_phones = [{"person": str(p["person"]), "distance": p.get("distance"), "area": p.get("area")}
+                               for p in a.get("bermuda_phones") or [] if isinstance(p, dict) and p.get("person")]
         self.person_entities = list(a.get("person_entities") or ["person.mikkel", "person.kristine", "person.claudia"])
         self.sole_occupancy = bool(a.get("sole_occupancy", True))
         self.advisor_entity = str(a.get("advisor_entity") or "").strip()
@@ -185,23 +184,22 @@ class CoffeeMachine(hass.Hass):
         self._power = cpow.PowerBrew()
         self._power.restore(saved.get("power"))
         self._meter = cpow.MachineMeter()
-        self._tracks = {"distance": cw.Track(), "area": cw.Track()}
+        self._tracks = {(p["person"], kind): cw.Track() for p in self.bermuda_phones for kind in ("distance", "area")}
         self._values = {}
 
         now = self._now()
         for entity in [self.plug_entity, self.connect_entity, self.status_entity, self.paused_entity, self.fault_entity,
-                       self.pour_entity, self.bermuda_person, self.tablet_interactive] + self.person_entities:
+                       self.pour_entity, self.tablet_interactive] + self.person_entities:
             self._values[entity] = self._read(entity)
         self._meter.plug_on = (self._state_of(self.plug_entity) or "on") == "on"
         power = self._read(self.power_entity)
         self._meter.update(now, (power or {}).get("state"))
         if self._machine(now) in ("asleep", "off"):
             self._cup.asleep()
-        for key, entity in (("distance", self.bermuda_distance), ("area", self.bermuda_area)):
-            if entity:
-                full = self._read(entity)
-                if full:
-                    self._tracks[key].add(now, full.get("state"))
+        for key, entity in self._bermuda_entities():
+            full = self._read(entity)
+            if full:
+                self._tracks[key].add(now, full.get("state"))
 
         self.listen_state(self._on_power, self.power_entity)
         self.listen_state(self._on_value, self.plug_entity)
@@ -215,11 +213,11 @@ class CoffeeMachine(hass.Hass):
         self.listen_state(self._on_fault, self.fault_entity)
         self.listen_state(self._on_value, self.pour_entity, attribute="all")
         self.listen_state(self._on_recipe_options, self.recipe_select, attribute="options")
-        for entity in dict.fromkeys([self.bermuda_person, self.tablet_interactive] + self.person_entities):
+        for entity in dict.fromkeys([self.tablet_interactive] + self.person_entities
+                                    + [p["person"] for p in self.bermuda_phones]):
             self.listen_state(self._on_value, entity, attribute="all")
-        for entity in (self.bermuda_distance, self.bermuda_area):
-            if entity:
-                self.listen_state(self._on_bermuda, entity)
+        for entity in dict.fromkeys(entity for _, entity in self._bermuda_entities()):
+            self.listen_state(self._on_bermuda, entity)
         for event in ("xbloom_brew_started", "xbloom_brew_completed", "xbloom_brew_failed", "xbloom_brew_stopped",
                       "xbloom_brew_timeout", "xbloom_machine_brew_started", "xbloom_connect_ready",
                       "xbloom_connect_failed", "xbloom_connect_stopped", "xbloom_connect_auto_stopped"):
@@ -448,9 +446,26 @@ class CoffeeMachine(hass.Hass):
         self._apply(self._tracker.fault(new, self._now()))
         self._publish_state()
 
+    def _bermuda_entities(self):
+        return [((p["person"], kind), p[kind]) for p in self.bermuda_phones for kind in ("distance", "area") if p[kind]]
+
     def _on_bermuda(self, entity, attribute, old, new, kwargs):
-        key = "distance" if entity == self.bermuda_distance else "area"
-        self._tracks[key].add(self._now(), new)
+        for key, tracked in self._bermuda_entities():
+            if tracked == entity:
+                self._tracks[key].add(self._now(), new)
+
+    def _bermuda_pick(self, t0):
+        """(person or None, evidence) from every configured phone at `t0`, by coffee_who.pick."""
+        phones = {}
+        for p in self.bermuda_phones:
+            if p["distance"]:
+                phones[p["person"].split(".", 1)[-1]] = cw.bermuda(
+                    self._state_of(p["person"]), self._tracks[(p["person"], "distance")],
+                    self._tracks[(p["person"], "area")], t0)
+        person, reason = cw.pick(phones)
+        evidence = {"rule": "v2", "pick": person or "none", "reason": reason,
+                    **{name: ev for name, (_, ev) in phones.items()}}
+        return person, evidence
 
     def _on_xbloom(self, event_name, data, kwargs):
         data = data if isinstance(data, dict) else {}
@@ -637,12 +652,8 @@ class CoffeeMachine(hass.Hass):
         t0 = brew.get("requested_ts") or brew.get("started_ts") or self._now()
         start_person = self._person_for(brew.get("user_id"), t0) if brew.get("user_id") else None
         bermuda_person = None
-        if self.bermuda_distance and brew.get("who_method") not in ("dashboard_action", "chip"):
-            person_state = self._track_person_state()
-            confident, evidence = cw.bermuda(person_state, self._tracks["distance"], self._tracks["area"], t0)
-            brew["who_evidence"] = evidence
-            if confident:
-                bermuda_person = "mikkel"
+        if self.bermuda_phones and brew.get("who_method") not in ("dashboard_action", "chip"):
+            bermuda_person, brew["who_evidence"] = self._bermuda_pick(t0)
         sole = None
         if self.sole_occupancy and self._anyone_home():
             verdict = self._attribution("coffee_start", t0)
@@ -653,9 +664,6 @@ class CoffeeMachine(hass.Hass):
         brew["notify"] = cw.notify_target(who, brew.get("chip"))
         if final:
             brew["who_final"] = True
-
-    def _track_person_state(self):
-        return self._state_of(self.bermuda_person)
 
     def _anyone_home(self):
         return any(self._state_of(entity) == "home" for entity in self.person_entities)
@@ -1594,9 +1602,8 @@ class CoffeeMachine(hass.Hass):
         if self._tracker.brew is not None:
             return None
         person = None
-        if self.bermuda_distance:
-            confident, _ = cw.bermuda(self._track_person_state(), self._tracks["distance"], self._tracks["area"], now)
-            person = "mikkel" if confident else None
+        if self.bermuda_phones:
+            person = self._bermuda_pick(now)[0]
         if person is None and self.sole_occupancy and self._anyone_home():
             verdict = self._attribution("coffee_guess")
             person = verdict.get("person") if verdict.get("method") == "sole_occupant" else None

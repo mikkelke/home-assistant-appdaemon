@@ -815,14 +815,42 @@ class WhoTests(unittest.TestCase):
 
     def test_bermuda_names_mikkel_when_his_phone_came_to_the_machine(self):
         app = fake.make_app()
-        distance, area = fake.CONFIG["bermuda_distance"], fake.CONFIG["bermuda_area"]
-        fake.set_entity(app, area, "Kitchen")
+        mikkel = fake.CONFIG["bermuda_phones"][0]
+        fake.set_entity(app, mikkel["area"], "Kitchen")
         fake.advance(app, 60)
-        fake.set_entity(app, distance, "1.4")
+        fake.set_entity(app, mikkel["distance"], "1.4")
         brew(app, ours=False)
         record = fake.ledger(app)[-1]
         self.assertEqual((record["who"], record["who_method"]), ("mikkel", "bermuda"))
-        self.assertEqual(record["who_evidence"]["closest_m"], "1.4")
+        self.assertEqual(record["who_evidence"]["mikkel"]["closest_m"], "1.4")
+        self.assertEqual(record["who_evidence"]["pick"], "mikkel")
+
+    def test_bermuda_names_claudia_when_she_is_clearly_closer(self):
+        app = fake.make_app()
+        mikkel, claudia = fake.CONFIG["bermuda_phones"]
+        fake.set_entity(app, "person.claudia", "home")
+        for phone in (mikkel, claudia):
+            fake.set_entity(app, phone["area"], "Kitchen")
+        fake.advance(app, 60)
+        fake.set_entity(app, mikkel["distance"], "1.9")
+        fake.set_entity(app, claudia["distance"], "0.7")
+        brew(app, ours=False)
+        record = fake.ledger(app)[-1]
+        self.assertEqual((record["who"], record["who_method"]), ("claudia", "bermuda"))
+
+    def test_bermuda_names_nobody_when_two_phones_are_equally_near(self):
+        app = fake.make_app()
+        mikkel, claudia = fake.CONFIG["bermuda_phones"]
+        fake.set_entity(app, "person.claudia", "home")
+        for phone in (mikkel, claudia):
+            fake.set_entity(app, phone["area"], "Kitchen")
+        fake.advance(app, 60)
+        fake.set_entity(app, mikkel["distance"], "1.2")
+        fake.set_entity(app, claudia["distance"], "1.0")
+        brew(app, ours=False)
+        record = fake.ledger(app)[-1]
+        self.assertEqual(record["who"], "none")
+        self.assertEqual(record["who_evidence"]["reason"], "tie")
 
     def test_no_push_for_a_plug_only_brew(self):
         app = fake.make_app()

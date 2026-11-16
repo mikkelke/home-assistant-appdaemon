@@ -1,13 +1,14 @@
 """Who made a brew, and who is told it is ready. Pure.
 
 In order: the person whose start it was (their HA user, through ActorAttribution's dashboard_action),
-a person picked on the notify chip, Mikkel's phone by Bermuda when that is confident, the sole
-occupant when sole occupancy is on, else nobody. Nobody named means no push.
+a person picked on the notify chip, a phone Bermuda picks, the sole occupant when sole occupancy is on,
+else nobody. Nobody named means no push.
 
-Bermuda is confident (provisional rule, its evidence kept with the brew for calibration) when
-person.mikkel is home, the phone's distance to the pour-over plug read CONFIDENT_M or less at an update
-from BEFORE_S before the start to AFTER_S after it, and the phone moved in the MOVED_S before the start
-(its area changed, or that distance changed by MOVED_M or more). A phone lying still is never evidence.
+A phone is confident (provisional rule, its evidence kept with the brew for calibration) when its
+person is home, its distance to the coffee bar read CONFIDENT_M or less at an update from BEFORE_S
+before the start to AFTER_S after it, and it moved in the MOVED_S before the start (its area changed,
+or that distance changed by MOVED_M or more). A phone lying still is never evidence. Bermuda picks the
+one confident phone; of several, the closest when the next is MARGIN_M or more farther, else nobody.
 """
 
 CONFIDENT_M = 2.0
@@ -15,6 +16,7 @@ BEFORE_S = 180
 AFTER_S = 30
 MOVED_S = 900
 MOVED_M = 1.0
+MARGIN_M = 1.0
 KEEP_S = 1200
 PEOPLE = ("mikkel", "kristine", "claudia")
 
@@ -51,7 +53,7 @@ class Track:
 
 
 def bermuda(person_state, distance, area, t0):
-    """(confident, evidence) for Mikkel's phone at a start at `t0`."""
+    """(confident, evidence) for one phone at a start at `t0`."""
     near = [(t, as_float(s)) for t, s in distance.window(t0 - BEFORE_S, t0 + AFTER_S)]
     near = [(t, m) for t, m in near if m is not None]
     closest = min((m for _, m in near), default=None)
@@ -67,6 +69,17 @@ def bermuda(person_state, distance, area, t0):
     confident = person_state == "home" and closest is not None and closest <= CONFIDENT_M and (
         area_moved or distance_moved)
     return confident, evidence
+
+
+def pick(phones):
+    """(person or None, reason) from {person: (confident, evidence)} by the rule in the module docstring."""
+    near = sorted((float(evidence["closest_m"]), person) for person, (confident, evidence) in phones.items()
+                  if confident)
+    if not near:
+        return None, "none_near"
+    if len(near) == 1 or near[1][0] - near[0][0] >= MARGIN_M:
+        return near[0][1], "closest"
+    return None, "tie"
 
 
 def resolve(start_person=None, chip_person=None, bermuda_person=None, sole_person=None, sole_enabled=True):
