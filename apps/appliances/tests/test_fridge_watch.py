@@ -37,13 +37,13 @@ MIN = 60
 ARGS = {
     "power_sensor": POWER,
     "health_entity": HEALTH,
-    "display_name": "Køleskab",
+    "display_name": "Fridge",
     "alert_minutes": 180,
 }
 WINE_ARGS = {
     "power_sensor": "sensor.wine_fridge_power",
     "health_entity": "sensor.wine_fridge_health",
-    "display_name": "Vinkøleskab",
+    "display_name": "Wine fridge",
     "alert_minutes": 45,
 }
 
@@ -199,8 +199,8 @@ class AlertPush(unittest.TestCase):
         app = make_app()
         run_for(app, T0, 180)
         app.notifier.notify.assert_awaited_once_with(
-            title="Køleskab kører uafbrudt",
-            message="Kompressoren har kørt i 3 t. Står døren på klem?",
+            title="Fridge is running non-stop",
+            message="The compressor has run for 3 h. Is the door ajar?",
             target="mikkel",
             data={"tag": "fridge_health"},
         )
@@ -212,7 +212,7 @@ class AlertPush(unittest.TestCase):
         tick(app, T0 + 185 * MIN)
         self.assertEqual(
             app.notifier.notify.await_args.kwargs["message"],
-            "Kompressoren har kørt i 3 t 5 min. Står døren på klem?",
+            "The compressor has run for 3 h 5 min. Is the door ajar?",
         )
 
     def test_no_second_push_in_the_same_run(self):
@@ -269,8 +269,8 @@ class AlertPush(unittest.TestCase):
         self.assertEqual(
             app.notifier.notify.await_args.kwargs,
             {
-                "title": "Vinkøleskab kører uafbrudt",
-                "message": "Kompressoren har kørt i 45 min. Står døren på klem?",
+                "title": "Wine fridge is running non-stop",
+                "message": "The compressor has run for 45 min. Is the door ajar?",
                 "target": "mikkel",
                 "data": {"tag": "wine_fridge_health"},
             },
@@ -471,6 +471,138 @@ class Publishing(unittest.TestCase):
         self.assertTrue(any(lvl == "WARNING" and "publish failed" in m for lvl, m in app.logs))
 
 
+TEMP = "sensor.fridge_thermometer_temperature"
+TEMP_ARGS = {**ARGS, "temperature_sensor": TEMP, "warm_c": 8.0, "warm_minutes": 60, "rearm_c": 7.0}
+
+
+def temp(app, t, value):
+    app.clock["now"] = t
+    app._on_temperature(TEMP, "state", None, value, {})
+
+
+def warm_pushes(app):
+    return [c for c in app.notifier.notify.await_args_list if c.kwargs["data"]["tag"] == "fridge_health_warm"]
+
+
+class WarmRule(unittest.TestCase):
+    def test_no_temperature_sensor_means_no_warm_rule(self):
+        app = make_app()
+        self.assertNotIn("temperature", published(app)[0][1])
+        app.listen_state.assert_called_once_with(app._on_power, POWER)
+
+    def test_one_push_after_sixty_minutes_at_or_above_eight(self):
+        app = make_app(args=TEMP_ARGS)
+        temp(app, T0, 8.0)
+        tick(app, T0 + 59 * MIN)
+        self.assertEqual(warm_pushes(app), [])
+        temp(app, T0 + 59 * MIN + 30, 8.4)
+        tick(app, T0 + 60 * MIN)
+        self.assertEqual(len(warm_pushes(app)), 1)
+        self.assertEqual(warm_pushes(app)[0].kwargs, {
+            "title": "Fridge is warm",
+            "message": "It reads 8.4 °C and has been at 8 °C or above for 1 h.",
+            "target": "mikkel",
+            "data": {"tag": "fridge_health_warm"},
+        })
+        self.assertEqual(published(app)[-1][0], "warm")
+        for m in range(61, 200):
+            tick(app, T0 + m * MIN)
+        self.assertEqual(len(warm_pushes(app)), 1)
+
+    def test_a_reading_below_eight_breaks_the_spell(self):
+        app = make_app(args=TEMP_ARGS)
+        temp(app, T0, 9.0)
+        temp(app, T0 + 50 * MIN, 7.9)
+        temp(app, T0 + 51 * MIN, 8.5)
+        tick(app, T0 + 100 * MIN)
+        self.assertEqual(warm_pushes(app), [])
+        tick(app, T0 + 111 * MIN)
+        self.assertEqual(len(warm_pushes(app)), 1)
+
+    def test_the_measured_compressor_cycle_never_pushes(self):
+        app = make_app(args=TEMP_ARGS)
+        t = T0
+        for _ in range(24):
+            for c in (5.2, 5.7, 6.2, 6.7, 7.2, 7.7, 8.2, 8.7, 9.1, 8.6, 7.6, 6.6, 5.6):
+                temp(app, t, c)
+                t += 5 * MIN
+                tick(app, t)
+        self.assertEqual(warm_pushes(app), [])
+
+    def test_no_second_push_until_it_falls_below_seven(self):
+        app = make_app(args=TEMP_ARGS)
+        temp(app, T0, 9.0)
+        tick(app, T0 + 60 * MIN)
+        temp(app, T0 + 70 * MIN, 7.5)
+        self.assertEqual(published(app)[-1][0], "warm")
+        temp(app, T0 + 80 * MIN, 8.5)
+        tick(app, T0 + 200 * MIN)
+        self.assertEqual(len(warm_pushes(app)), 1)
+        temp(app, T0 + 210 * MIN, 6.9)
+        self.assertEqual(published(app)[-1][0], "ok")
+        temp(app, T0 + 220 * MIN, 8.5)
+        tick(app, T0 + 280 * MIN)
+        self.assertEqual(len(warm_pushes(app)), 2)
+
+    def test_unavailable_readings_neither_break_nor_start_a_spell(self):
+        app = make_app(args=TEMP_ARGS)
+        temp(app, T0, "unavailable")
+        self.assertIsNone(app._warm_since)
+        temp(app, T0 + MIN, 8.5)
+        temp(app, T0 + 30 * MIN, "unavailable")
+        tick(app, T0 + 61 * MIN)
+        self.assertEqual(len(warm_pushes(app)), 1)
+
+    def test_a_failed_warm_push_is_retried(self):
+        app = make_app(args=TEMP_ARGS, delivered=0)
+        temp(app, T0, 9.0)
+        tick(app, T0 + 60 * MIN)
+        tick(app, T0 + 65 * MIN)
+        self.assertEqual(len(warm_pushes(app)), 1)
+        app.notifier.notify.return_value = 1
+        tick(app, T0 + 70 * MIN)
+        self.assertEqual(len(warm_pushes(app)), 2)
+        tick(app, T0 + 90 * MIN)
+        self.assertEqual(len(warm_pushes(app)), 2)
+
+    def test_warm_outranks_long_run_in_the_published_state(self):
+        app = make_app(args=TEMP_ARGS)
+        temp(app, T0, 9.0)
+        run_for(app, T0, 180)
+        state, attrs = published(app)[-1]
+        self.assertEqual(state, "warm")
+        self.assertEqual(attrs["reason"], "At 8 °C or above for 3 h (now 9.0 °C)")
+        self.assertEqual(attrs["icon"], "mdi:fridge-alert")
+        self.assertEqual(app.notifier.notify.await_count, 2)
+
+    def test_restart_rebuilds_the_spell_from_history(self):
+        rows = [row(T0 - 100 * MIN, 5.0), row(T0 - 40 * MIN, 8.5), row(T0 - 10 * MIN, 9.0)]
+        app = make_app(args=TEMP_ARGS, states={TEMP: "9.0"}, history=rows)
+        self.assertEqual(app._warm_since, T0 - 40 * MIN)
+        tick(app, T0 + 19 * MIN)
+        self.assertEqual(warm_pushes(app), [])
+        tick(app, T0 + 20 * MIN)
+        self.assertEqual(len(warm_pushes(app)), 1)
+
+    def test_restart_inside_a_warm_spell_that_already_pushed_does_not_push_again(self):
+        rows = [row(T0 - 200 * MIN, 9.0)]
+        app = make_app(args=TEMP_ARGS, states={TEMP: "9.0", HEALTH: "warm"}, history=rows)
+        tick(app, T0 + MIN)
+        self.assertEqual(warm_pushes(app), [])
+        self.assertEqual(published(app)[-1][0], "warm")
+
+    def test_restart_with_a_warm_state_below_rearm_clears(self):
+        app = make_app(args=TEMP_ARGS, states={TEMP: "5.0", HEALTH: "warm"}, history=[])
+        self.assertFalse(app._warm_alerted)
+        self.assertEqual(published(app)[0][0], "ok")
+
+    def test_publishes_the_temperature_and_thresholds(self):
+        app = make_app(args=TEMP_ARGS, states={TEMP: "4.5"}, history=[])
+        attrs = published(app)[0][1]
+        self.assertEqual((attrs["temperature"], attrs["warm_c"], attrs["warm_minutes"]), (4.5, 8.0, 60.0))
+        self.assertEqual(attrs["reason"], "Compressor is off")
+
+
 class Registration(unittest.TestCase):
     def test_listens_to_the_power_sensor_and_ticks_every_minute(self):
         app = make_app()
@@ -518,7 +650,7 @@ class AsciiLogs(unittest.TestCase):
                         self.assertTrue(const.value.isascii(), const.value)
         self.assertGreater(checked, 5)
 
-    def test_logged_messages_are_ascii_with_a_danish_display_name(self):
+    def test_logged_messages_are_ascii(self):
         app = make_app(states={POWER: "40"}, history=RuntimeError("recorder down"), delivered=0)
         for m in range(1, 200):
             tick(app, T0 + m * MIN)

@@ -1,5 +1,6 @@
 """
-FridgeWatch - one push when a fridge compressor runs without a break for too long.
+FridgeWatch - one push when a fridge compressor runs without a break for too long, and one when
+the fridge has been warm for too long.
 
 A fridge that cannot hold its temperature (door left ajar, failing compressor) never switches
 off, which its own plug shows. A run starts when power reaches `running_w` and ends only once
@@ -16,6 +17,12 @@ unavailable/unknown/non-numeric power readings are ignored: they neither start n
 On start-up the run in progress is rebuilt by replaying the recorder history through the same
 rules as live readings, and a run whose entity still reads long_run does not push again; when
 the history cannot be read, a fridge that is running now counts as starting now.
+
+Optional temperature rule (`temperature_sensor`): a warm spell starts at the first reading at or
+above `warm_c` and is broken by any reading below it. A spell lasting `warm_minutes` pushes once;
+no further warm push until a reading falls below `rearm_c`. The last reading counts until the next
+one, so a sensor that reports only on change still accumulates the spell. Start-up replays the
+temperature history the same way, and a spell whose entity already reads warm does not push again.
 
 One yaml instance per fridge (fridge_watch.yaml). All timestamps are epoch seconds.
 """
@@ -34,13 +41,13 @@ RETRY_S = 600
 HISTORY_MARGIN_S = 3600
 
 
-def _watts(value):
+def _number(value):
     """The reading as a float, or None for unavailable/unknown/non-numeric."""
     try:
-        watts = float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
-    return watts if math.isfinite(watts) else None
+    return number if math.isfinite(number) else None
 
 
 def _duration(minutes, hour_unit):
@@ -60,6 +67,10 @@ class FridgeWatch(hass.Hass):
         self.running_w = float(a.get("running_w", 20))
         self.off_hold_s = float(a.get("off_hold_s", 120))
         self.notify_target = a.get("notify_target", "mikkel")
+        self.temperature_sensor = a.get("temperature_sensor")
+        self.warm_c = float(a.get("warm_c", 8.0))
+        self.warm_minutes = float(a.get("warm_minutes", 60))
+        self.rearm_c = float(a.get("rearm_c", 7.0))
 
         self.alert_s = float(self.alert_minutes) * 60
         self._tag = self.health_entity.split(".", 1)[-1]
@@ -72,10 +83,17 @@ class FridgeWatch(hass.Hass):
         self._next_push_at = 0.0
         self._published_key = None
         self._published_at = 0.0
+        self._temp = None
+        self._warm_since = None
+        self._warm_alerted = False
+        self._warm_next_push_at = 0.0
 
         now = self._now()
         self._recover(now)
         self.listen_state(self._on_power, self.power_sensor)
+        if self.temperature_sensor:
+            self._recover_temperature(now)
+            self.listen_state(self._on_temperature, self.temperature_sensor)
         self.run_every(self._tick, "now+60", 60)
         self._refresh(now)
 
@@ -88,11 +106,19 @@ class FridgeWatch(hass.Hass):
     # ---------- run tracking ----------
 
     def _on_power(self, entity, attribute, old, new, kwargs):
-        watts = _watts(new)
+        watts = _number(new)
         if watts is None:
             return
         now = self._now()
         self._observe(now, watts)
+        self._refresh(now)
+
+    def _on_temperature(self, entity, attribute, old, new, kwargs):
+        celsius = _number(new)
+        if celsius is None:
+            return
+        now = self._now()
+        self._observe_temperature(now, celsius)
         self._refresh(now)
 
     def _tick(self, kwargs):
@@ -131,31 +157,61 @@ class FridgeWatch(hass.Hass):
     def _is_long(self, now):
         return self._run_started is not None and self._elapsed_s(now) >= self.alert_s
 
+    # ---------- temperature ----------
+
+    def _observe_temperature(self, now, celsius):
+        self._temp = celsius
+        if celsius < self.rearm_c and self._warm_alerted:
+            self.log(f"FridgeWatch {self.health_entity}: back below {self.rearm_c} C ({celsius} C), warm alert re-armed", level="INFO")
+            self._warm_alerted = False
+            self._warm_next_push_at = 0.0
+        if celsius >= self.warm_c:
+            if self._warm_since is None:
+                self._warm_since = now
+        else:
+            self._warm_since = None
+
+    def _warm_s(self, now):
+        return 0.0 if self._warm_since is None else now - self._warm_since
+
+    def _is_warm(self, now):
+        return self._warm_alerted or self._warm_s(now) >= self.warm_minutes * 60
+
     # ---------- start-up recovery ----------
 
     def _recover(self, now):
-        for t, watts in self._history_points(now):
+        for t, watts in self._history_points(self.power_sensor, now - self.alert_s - HISTORY_MARGIN_S, now):
             self._observe(t, watts)
         self._settle(now)
-        current = _watts(self.get_state(self.power_sensor))
+        current = _number(self.get_state(self.power_sensor))
         if current is not None:
             self._observe(now, current)
         if self._run_started is not None:
             self._alerted = self.get_state(self.health_entity) == "long_run"
 
-    def _history_points(self, now):
-        """Chronological [(epoch, watts)] of the sensor's recorder history; [] when unreadable."""
+    def _recover_temperature(self, now):
+        start = now - self.warm_minutes * 60 - HISTORY_MARGIN_S
+        for t, celsius in self._history_points(self.temperature_sensor, start, now):
+            self._observe_temperature(t, celsius)
+        current = _number(self.get_state(self.temperature_sensor))
+        if current is not None:
+            self._observe_temperature(now, current)
+        if self.get_state(self.health_entity) == "warm" and self._temp is not None and self._temp >= self.rearm_c:
+            self._warm_alerted = True
+
+    def _history_points(self, entity, start, now):
+        """Chronological [(epoch, value)] of the entity's recorder history; [] when unreadable."""
         try:
             raw = self.get_history(
-                entity_id=self.power_sensor,
-                start_time=datetime.fromtimestamp(now - self.alert_s - HISTORY_MARGIN_S, timezone.utc),
+                entity_id=entity,
+                start_time=datetime.fromtimestamp(start, timezone.utc),
                 end_time=datetime.fromtimestamp(now, timezone.utc),
                 minimal_response=True,
                 no_attributes=True,
             )
-            points = whist.parse_power_points(whist.flatten_history(raw, self.power_sensor))
+            points = whist.parse_power_points(whist.flatten_history(raw, entity))
         except Exception as e:
-            self.log(f"FridgeWatch {self.health_entity}: history unreadable, starting from now: {e}", level="WARNING")
+            self.log(f"FridgeWatch {self.health_entity}: {entity} history unreadable, starting from now: {e}", level="WARNING")
             return []
         return sorted((t.timestamp(), w) for t, w in points if math.isfinite(w))
 
@@ -166,6 +222,7 @@ class FridgeWatch(hass.Hass):
         self._publish(now)
 
     def _evaluate(self, now):
+        self._evaluate_warm(now)
         if self._alerted or now < self._next_push_at or not self._is_long(now):
             return
         self._alerted = True
@@ -174,30 +231,62 @@ class FridgeWatch(hass.Hass):
         self.log(f"FridgeWatch {self.health_entity}: compressor running {minutes:.0f} min, pushing", level="WARNING")
         self.create_task(self._push(minutes))
 
+    def _evaluate_warm(self, now):
+        if self._warm_alerted or now < self._warm_next_push_at or self._warm_s(now) < self.warm_minutes * 60:
+            return
+        self._warm_alerted = True
+        self._warm_next_push_at = now + RETRY_S
+        minutes = self._warm_s(now) / 60
+        self.log(f"FridgeWatch {self.health_entity}: {self._temp} C, at or above {self.warm_c} C for {minutes:.0f} min, pushing", level="WARNING")
+        self.create_task(self._push_warm(minutes, self._temp))
+
     async def _push(self, minutes):
+        if not await self._send(
+            f"{self.display_name} is running non-stop",
+            f"The compressor has run for {_duration(minutes, 'h')}. Is the door ajar?",
+            self._tag,
+        ):
+            self._alerted = False
+
+    async def _push_warm(self, minutes, celsius):
+        if not await self._send(
+            f"{self.display_name} is warm",
+            f"It reads {celsius:.1f} °C and has been at {self.warm_c:g} °C or above for {_duration(minutes, 'h')}.",
+            f"{self._tag}_warm",
+        ):
+            self._warm_alerted = False
+
+    async def _send(self, title, message, tag):
+        """True when the push reached someone."""
         try:
-            sent = await self._notifier.notify(
-                title=f"{self.display_name} kører uafbrudt",
-                message=f"Kompressoren har kørt i {_duration(minutes, 't')}. Står døren på klem?",
-                target=self.notify_target,
-                data={"tag": self._tag},
-            )
+            sent = await self._notifier.notify(title=title, message=message, target=self.notify_target, data={"tag": tag})
         except Exception as e:
             self.log(f"FridgeWatch {self.health_entity}: notify failed: {e}", level="WARNING")
             sent = 0
         if not sent:
-            self._alerted = False
             self.log(f"FridgeWatch {self.health_entity}: push reached no one, will retry", level="WARNING")
+        return bool(sent)
 
     # ---------- semantic entity ----------
 
     def _snapshot(self, now):
-        state = "long_run" if self._is_long(now) else "ok"
+        warm = self.temperature_sensor and self._is_warm(now)
+        state = "warm" if warm else "long_run" if self._is_long(now) else "ok"
         attrs = {
             "friendly_name": self._friendly_name,
-            "icon": "mdi:fridge-alert" if state == "long_run" else "mdi:fridge",
+            "icon": "mdi:fridge" if state == "ok" else "mdi:fridge-alert",
             "alert_minutes": self.alert_minutes,
         }
+        if self.temperature_sensor:
+            attrs["temperature"] = self._temp
+            attrs["warm_c"] = self.warm_c
+            attrs["warm_minutes"] = self.warm_minutes
+        if warm:
+            if self._warm_since is None:
+                attrs["reason"] = f"Was at {self.warm_c:g} °C or above for {_duration(self.warm_minutes, 'h')}; now {self._temp} °C, clears below {self.rearm_c:g} °C"
+            else:
+                attrs["reason"] = f"At {self.warm_c:g} °C or above for {_duration(self._warm_s(now) / 60, 'h')} (now {self._temp} °C)"
+            return state, attrs
         if self._run_started is None:
             attrs["reason"] = "Compressor is off"
             return state, attrs
@@ -213,7 +302,7 @@ class FridgeWatch(hass.Hass):
 
     def _publish(self, now):
         state, attrs = self._snapshot(now)
-        key = (state, self._run_started)
+        key = (state, self._run_started, self._temp)
         if key == self._published_key and now - self._published_at < REPUBLISH_S:
             return
         try:
