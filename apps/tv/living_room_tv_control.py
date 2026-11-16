@@ -110,6 +110,7 @@ class LivingRoomTvControl(hass.Hass):
         self._apple_tv_input_unconfirmed = False
         self.apple_tv_input_wait_seconds = float(self.args.get("apple_tv_input_wait_seconds", 60))
         self._apple_tv_input_wait_handle = None
+        self._apple_tv_woken = False
 
         # Power-aware wall move (optional; default off until YAML opts in)
         self.power_aware_wall_move_enabled = bool(self.args.get("power_aware_wall_move_enabled", False))
@@ -1184,6 +1185,7 @@ class LivingRoomTvControl(hass.Hass):
         
         # Debounce "off" state changes to avoid premature lift movement
         if new == "off" and old != "off":
+            self._apple_tv_woken = False
             self._arm_apple_tv_disconnect("TV off")
             self._cancel_apple_tv_input_wait()
             self._cancel_power_standby_monitor("universal TV off")
@@ -1378,6 +1380,8 @@ class LivingRoomTvControl(hass.Hass):
         source_name = getattr(self, "apple_tv_source_name", None)
         if source_name is None or old == new:
             return
+        if new == source_name:
+            self._apple_tv_woken = False
         try:
             if self.get_state(self.hisense_tv_entity) != "on":
                 return
@@ -1385,6 +1389,7 @@ class LivingRoomTvControl(hass.Hass):
                 return
             if new == source_name:
                 self._reconnect_apple_tv_if_needed("Apple TV input selected")
+                self._wake_apple_tv_if_asleep("Apple TV input selected")
             elif old == source_name:
                 selection_script = getattr(self, "source_selection_script_entity", None)
                 if selection_script and self.get_state(selection_script) == "on":
@@ -1399,6 +1404,7 @@ class LivingRoomTvControl(hass.Hass):
     def _on_hisense_reported_on(self, entity, attribute, old, new, kwargs):
         """Native apps and casting report no input, so the source listener may never fire."""
         self._settle_unconfirmed_apple_tv_input(self.get_state(self.hisense_tv_entity, attribute="source"))
+        self._wake_apple_tv_if_asleep("TV reported on")
 
     def _settle_unconfirmed_apple_tv_input(self, source, wait_over=False):
         """After a connect made before the TV could report its input, keep the connection only
@@ -1417,6 +1423,7 @@ class LivingRoomTvControl(hass.Hass):
         self._end_apple_tv_input_wait()
         if source == self.apple_tv_source_name:
             self.log(f"Apple TV early connect confirmed: TV reports {source}")
+            self._wake_apple_tv_if_asleep("early connect confirmed")
             return True
         if source is None:
             reason = f"TV reported no input within the {self.apple_tv_input_wait_seconds:.0f}s wait"
@@ -1454,7 +1461,7 @@ class LivingRoomTvControl(hass.Hass):
         """Reconnect the Apple TV integration when the TV is on but it holds no connection.
         The remote reads off exactly when the integration is disconnected; the player
         reads off both then and when connected to a sleeping box. Only remote.turn_on is
-        used: it connects without waking the box, which media_player.turn_on would."""
+        used: it connects without waking the box. Waking it is _wake_apple_tv_if_asleep's job."""
         try:
             remote_state = self.get_state(self.apple_tv_remote_entity)
             player_state = self.get_state(self.apple_tv_entity)
@@ -1502,6 +1509,37 @@ class LivingRoomTvControl(hass.Hass):
         except Exception as e:
             self.log(f"Apple TV reconnect ({reason}) failed: {e}", level="WARNING")
 
+    def _wake_apple_tv_if_asleep(self, reason):
+        """Wake the box while the TV is on its input: the TV's HDMI-CEC does not, and the
+        picture stays at no signal. media_player.turn_on only works while the integration
+        is connected (remote on); the player then reads off for a sleeping box. Once per TV
+        session, because the integration also reconnects by itself after the box was put to
+        sleep on purpose; an explicit switch to the input starts a new one."""
+        source_name = getattr(self, "apple_tv_source_name", None)
+        if source_name is None or getattr(self, "_apple_tv_woken", False):
+            return
+        try:
+            if self.get_state(self.hisense_tv_entity) != "on":
+                return
+            source = self.get_state(self.hisense_tv_entity, attribute="source")
+            if source != source_name:
+                return
+            selection_script = getattr(self, "source_selection_script_entity", None)
+            if selection_script and self.get_state(selection_script) == "on":
+                return
+            if self.get_state(self.apple_tv_remote_entity) != "on":
+                return
+            if self.get_state(self.apple_tv_entity) != "off":
+                return
+            self.call_service("media_player/turn_on", entity_id=self.apple_tv_entity)
+            self._apple_tv_woken = True
+            self.log(
+                f"Apple TV wake ({reason}): TV on {source} and the box is asleep - "
+                f"media_player.turn_on sent to {self.apple_tv_entity}"
+            )
+        except Exception as e:
+            self.log(f"Apple TV wake ({reason}) failed: {e}", level="WARNING")
+
     def _arm_apple_tv_disconnect_on_init(self, kwargs):
         if self._tv_is_on():
             self.log("Apple TV disconnect (startup): TV is on - nothing to do")
@@ -1537,9 +1575,12 @@ class LivingRoomTvControl(hass.Hass):
 
     def _on_apple_tv_remote_connected(self, entity, attribute, old, new, kwargs):
         """While the box sleeps the integration keeps reconnecting by itself; once the grace
-        has elapsed with the TV off, every such reconnect is cut again."""
+        has elapsed with the TV off, every such reconnect is cut again. With the TV on the
+        Apple TV input, a connection to a sleeping box is the moment to wake it."""
         if self._apple_tv_grace_elapsed and not self._tv_is_on():
             self._disconnect_apple_tv("reconnected while the TV is off", remote_state=new)
+            return
+        self._wake_apple_tv_if_asleep("Apple TV integration connected")
 
     def _disconnect_apple_tv(self, reason, remote_state=None):
         """remote.turn_off only closes the integration's connection; it sends no command to

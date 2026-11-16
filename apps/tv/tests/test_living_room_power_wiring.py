@@ -13,6 +13,7 @@ SOURCE_SCRIPT = "script.living_room_tv_select_source"
 POWER_ON = ("media_player/turn_on", {"entity_id": TV})
 CONNECT = ("remote/turn_on", {"entity_id": REMOTE})
 DISCONNECT = ("remote/turn_off", {"entity_id": REMOTE})
+WAKE = ("media_player/turn_on", {"entity_id": APPLE})
 
 
 def configured_app(source=None, **overrides):
@@ -290,7 +291,7 @@ class AppleTvEarlyConnectWaitsForTheInput(unittest.TestCase):
         source_changes(app, None, "HDMI2")
         self.assertEqual(pending(app, app._apple_tv_input_wait_due), [])
         fire(app, app._apple_tv_input_wait_due)
-        self.assertEqual(app.service_calls, [CONNECT])
+        self.assertEqual(app.service_calls, [CONNECT, WAKE])
         self.assertFalse(app._apple_tv_input_unconfirmed)
         self.assertIn("Apple TV early connect confirmed: TV reports HDMI2", app.logs)
 
@@ -318,7 +319,7 @@ class AppleTvEarlyConnectWaitsForTheInput(unittest.TestCase):
         app.source = "HDMI2"
         provider_reports_on(app)
         self.assertEqual(pending(app, app._apple_tv_input_wait_due), [])
-        self.assertEqual(app.service_calls, [CONNECT])
+        self.assertEqual(app.service_calls, [CONNECT, WAKE])
         self.assertFalse(app._apple_tv_input_unconfirmed)
         self.assertIn("Apple TV early connect confirmed: TV reports HDMI2", app.logs)
 
