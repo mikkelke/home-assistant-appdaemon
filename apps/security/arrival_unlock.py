@@ -1,10 +1,9 @@
 """
-ArrivalUnlock - MEASUREMENT ONLY: would "the resident's phone is on the landing" unlock the front
-door early enough, and without false triggers? A Bluetooth proxy on the landing outside the flat,
-powered only while the stairwell lights are on, makes Bermuda place the resident's phone beacon in
-the landing's area. This app records what an unlock on that signal would have done, so the rule can
-be judged offline before anything unlocks for real. It decides nothing: it never calls a lock
-service, creates no entity and sends no notification. One resident.
+ArrivalUnlock - unlocks the front door when the resident's phone reaches the landing, and records
+every arrival so the rule can be judged against what really happened. A Bluetooth proxy on the
+landing outside the flat, powered only while the stairwell lights are on, makes Bermuda place the
+resident's phone in the landing's area. One resident per instance. Without `unlock_switch`, or while
+it is not on, the app only measures: it calls no service and creates no entity.
 
 ARMED. `tracker` (the router's wifi tracker) is not home and has been so for away_min (its
 last_changed), `lock` reads locked and `door` reads off. Any state but home counts as away.
@@ -41,6 +40,15 @@ before the flip, landing_seen the latest change of the area sensor to landing_ar
 before the flip whether armed or not (an arrival to an already unlocked door still shows how early
 the phone was seen), and last_landing_distance_state the landing distance entity's state at the
 flip, null when it does not exist or is not configured.
+
+UNLOCK. When `unlock_switch` reads on as a window opens, the app calls lock.unlock on `unlock_lock`
+(the lock's Bluetooth entity), or on `unlock_fallback` when that entity is unknown, unavailable or
+missing, and pushes `notify` when one is set. relock_s later, unless the door has opened since, it
+locks the same entity again when `lock` does not read locked and pushes that too. A second sighting
+inside the window does not unlock again. The arrival line then also carries
+unlock {t, entity, error} and relocked (ISO, null when no relock was needed or made). A failed
+unlock call is logged as a warning and still gets its relock check. The lock's own auto-lock covers
+an AppDaemon restart between the unlock and the relock.
 
 Times are ISO strings in AppDaemon's time zone. All arithmetic runs on epoch seconds, so a daylight
 saving change inside a window cannot skew a duration.
@@ -118,8 +126,16 @@ class ArrivalUnlock(hass.Hass):
         self.away_s = float(a.get("away_min", 10)) * 60
         self.window_s = float(a.get("window_s", 180))
         self.log_file = Path(a.get("log_file") or Path(__file__).resolve().parent / "arrival_unlock_log.jsonl")
+        self.switch_entity = a.get("unlock_switch") or None
+        if self.switch_entity is not None:
+            self.unlock_entity = a["unlock_lock"]
+            self.unlock_fallback = a.get("unlock_fallback") or None
+        self.relock_s = float(a.get("relock_s", 60))
+        self.notify_service = (a.get("notify") or "").replace(".", "/", 1) or None
         if self.window_s <= 0:
             raise ValueError("ArrivalUnlock: window_s must be positive")
+        if self.switch_entity is not None and not 0 < self.relock_s < self.window_s:
+            raise ValueError("ArrivalUnlock: relock_s must be positive and shorter than window_s")
         self._tz = self.get_now().tzinfo
         if self.get_state(self.tracker_entity) != "home":
             self._away_since = epoch_of(self.get_state(self.tracker_entity, attribute="last_changed"))
@@ -129,7 +145,9 @@ class ArrivalUnlock(hass.Hass):
         self.listen_state(self._on_tracker, self.tracker_entity)
         self.listen_state(self._on_door, self.door_entity, new="on")
         self.listen_state(self._on_keypad, self.keypad_entity, attribute="changed_by")
-        self.log(f"ArrivalUnlock initialized (measurement only, nothing is unlocked): a window of up to "
+        mode = ("measurement only, nothing is unlocked" if self.switch_entity is None
+                else f"unlocks {self.unlock_entity} while {self.switch_entity} is on")
+        self.log(f"ArrivalUnlock initialized ({mode}): a window of up to "
                  f"{self.window_s:g} s opens when {self.area_entity} changes to {self.landing_area!a} while "
                  f"{self.tracker_entity} has been away {self.away_s / 60:g} min and {self.lock_entity} is "
                  f"locked -> {self.log_file}", level="INFO")
@@ -143,6 +161,7 @@ class ArrivalUnlock(hass.Hass):
         lock = self.get_state(self.lock_entity)
         door = self.get_state(self.door_entity)
         distance = distance_of(self._landing_distance_state())
+        unlock = self.switch_entity is not None and self.get_state(self.switch_entity) == "on"
         now = self._now()
         with self._lock:
             self._landing_seen = now
@@ -151,11 +170,63 @@ class ArrivalUnlock(hass.Hass):
             wid = next(self._ids)
             self._win = {"id": wid, "start": now, "distance": distance, "lock": lock, "door": door,
                          "proxy_online": within(self._proxy_online, now, PROXY_RECENT_S),
-                         "away_since": changed, "door_open": None, "wifi_home": None, "keypad": []}
+                         "away_since": changed, "door_open": None, "wifi_home": None, "keypad": [],
+                         "unlock": None, "relocked": None}
             self._last_start = now
         self.run_in(self._on_expired, self.window_s, wid=wid)
-        self.log(f"ArrivalUnlock: window {wid} opened, phone in {self.landing_area!a}, an unlock would happen now",
+        if not unlock:
+            self.log(f"ArrivalUnlock: window {wid} opened, phone in {self.landing_area!a}, an unlock would "
+                     f"happen now", level="INFO")
+            return
+        self._unlock(wid, now)
+
+    def _unlock(self, wid, now):
+        entity = self.unlock_entity
+        if self.unlock_fallback is not None and self.get_state(entity) in (None, "unknown", "unavailable"):
+            entity = self.unlock_fallback
+        error = None
+        try:
+            self.call_service("lock/unlock", entity_id=entity)
+        except Exception as e:  # the relock check below still runs: the lock may have moved anyway
+            error = f"{type(e).__name__}: {e}"
+        with self._lock:
+            if self._win is not None and self._win["id"] == wid:
+                self._win["unlock"] = {"t": now, "entity": entity, "error": error}
+        self.run_in(self._on_relock, self.relock_s, wid=wid, t=now, entity=entity)
+        if error is not None:
+            self.log(f"ArrivalUnlock: window {wid}: unlocking {entity} failed: {error!a}", level="WARNING")
+            return
+        self.log(f"ArrivalUnlock: window {wid} opened, phone in {self.landing_area!a}, unlocked {entity}",
                  level="INFO")
+        self._push("Front door unlocked", f"You reached the landing. It locks again in {self.relock_s:g} s "
+                                          f"if the door is not opened.")
+
+    def _on_relock(self, kwargs):
+        t, entity = kwargs["t"], kwargs["entity"]
+        with self._lock:
+            opened = self._door_opened is not None and self._door_opened >= t
+        if opened or self.get_state(self.door_entity) != "off" or self.get_state(self.lock_entity) == "locked":
+            return
+        try:
+            self.call_service("lock/lock", entity_id=entity)
+        except Exception as e:
+            self.log(f"ArrivalUnlock: relocking {entity} failed: {type(e).__name__}: {e}", level="WARNING")
+            return
+        now = self._now()
+        with self._lock:
+            if self._win is not None and self._win["id"] == kwargs["wid"]:
+                self._win["relocked"] = now
+        self.log(f"ArrivalUnlock: window {kwargs['wid']}: door not opened {self.relock_s:g} s after the "
+                 f"unlock, locked {entity} again", level="INFO")
+        self._push("Front door locked again", f"It was not opened within {self.relock_s:g} s of the unlock.")
+
+    def _push(self, title, message):
+        if self.notify_service is None:
+            return
+        try:
+            self.call_service(self.notify_service, title=title, message=message)
+        except Exception as e:
+            self.log(f"ArrivalUnlock: push {title!a} not sent: {type(e).__name__}: {e}", level="WARNING")
 
     def _on_online(self, entity, attribute, old, new, kwargs):
         if old in OFFLINE and new not in OFFLINE:
@@ -222,6 +293,9 @@ class ArrivalUnlock(hass.Hass):
                 "outcome": "entered" if entered else "no_door"}
         if entered:
             line["lead_s"] = round(win["door_open"] - win["start"], 1)
+        if win["unlock"] is not None:
+            line["unlock"] = {**win["unlock"], "t": self._iso(win["unlock"]["t"])}
+            line["relocked"] = self._iso(win["relocked"])
         if self._append(line, f"window {win['id']}"):
             lead = f", lead {line['lead_s']:g} s" if entered else ""
             self.log(f"ArrivalUnlock: window {win['id']} closed, {line['outcome']}{lead} -> {self.log_file.name}",

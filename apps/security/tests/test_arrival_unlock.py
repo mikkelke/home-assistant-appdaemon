@@ -1,9 +1,9 @@
 # tests/test_arrival_unlock.py - ArrivalUnlock: when a landing sighting is armed, the window it opens
 # and closes, the arrival and missed JSONL lines, and the tolerance for landing entities that do not
 # exist yet. The app is driven through its real initialize() with a fake clock, a fake scheduler and
-# fake states. The fake app has no call_service, set_state, notify or other service, so anything but
-# reading states and scheduling the close would fail the test (a source check below pins that too);
-# every AppDaemon call is also checked to be made without the app's lock held.
+# fake states. call_service only records, and without an unlock switch that is on nothing may be
+# called (a source check below pins which services the app can call at all); every AppDaemon call is
+# also checked to be made without the app's lock held. The Unlocking tests cover the real unlock.
 # Run from repo root: python3 -m unittest discover -s apps/security/tests -q
 
 from __future__ import annotations
@@ -116,6 +116,14 @@ def make_app(args=None, states=None, away_for=3600, missing=(), drop=(), tz=TZ):
         app.scheduled.append((delay, kw))
         app.timers.append((app.clock["now"] + delay, next(order), callback, kw))
 
+    def call_service(service, **kw):
+        api()
+        if app.fail_service.get(service):
+            raise RuntimeError(app.fail_service[service])
+        app.calls.append((app.clock["now"] - T0, service, kw))
+
+    app.calls, app.fail_service = [], {}
+    app.call_service = call_service
     app.get_state = get_state
     app.get_now = lambda: datetime.fromtimestamp(app.clock["now"], tz)
     app._now = lambda: app.clock["now"]
@@ -730,15 +738,156 @@ class Helpers(unittest.TestCase):
                 self.assertFalse(au.armed(*args, 600, 600))
 
 
-class MeasurementOnly(unittest.TestCase):
-    def test_the_app_only_reads_listens_and_schedules_its_own_callbacks(self):
+SWITCH = "input_boolean.arrival_unlock_phone"
+BLE = "lock.yale_bt"
+UNLOCKING = {"unlock_switch": SWITCH, "unlock_lock": BLE, "unlock_fallback": KEYPAD,
+             "notify": "notify.mobile_app_phone"}
+
+
+def unlocking_app(states=None, **kw):
+    return make_app(args={**UNLOCKING, **kw.pop("args", {})},
+                    states={SWITCH: "on", BLE: "locked", **(states or {})}, **kw)
+
+
+def services(app):
+    return [(t, service, kw.get("entity_id")) for t, service, kw in app.calls]
+
+
+class Unlocking(unittest.TestCase):
+    def test_a_sighting_while_armed_and_switched_on_unlocks_the_bluetooth_lock_and_pushes(self):
+        app = unlocking_app()
+        sight(app, 5)
+        self.assertEqual(services(app), [(5, "lock/unlock", BLE), (5, "notify/mobile_app_phone", None)])
+        self.assertEqual(app.calls[1][2]["title"], "Front door unlocked")
+        self.assertIn((60, {"wid": 1, "t": T0 + 5, "entity": BLE}), app.scheduled)
+
+    def test_nothing_is_called_without_the_switch_with_it_off_or_missing_or_when_not_armed(self):
+        cases = {"no switch configured": make_app(),
+                 "switch off": unlocking_app(states={SWITCH: "off"}),
+                 "switch missing": unlocking_app(missing=(SWITCH,)),
+                 "not armed": unlocking_app(states={LOCK: "unlocked"})}
+        for name, app in cases.items():
+            with self.subTest(name):
+                sight(app, 5)
+                open_door(app, 20)
+                advance(app, 400)
+                self.assertEqual(app.calls, [])
+
+    def test_the_cloud_lock_is_used_when_the_bluetooth_lock_is_not_available(self):
+        for name, app in {"unavailable": unlocking_app(states={BLE: "unavailable"}),
+                          "unknown": unlocking_app(states={BLE: "unknown"}),
+                          "missing": unlocking_app(missing=(BLE,))}.items():
+            with self.subTest(name):
+                sight(app, 0)
+                self.assertEqual(services(app)[0], (0, "lock/unlock", KEYPAD))
+
+    def test_without_a_fallback_the_bluetooth_lock_is_tried_anyway(self):
+        app = unlocking_app(states={BLE: "unavailable"}, args={"unlock_fallback": None})
+        sight(app, 0)
+        self.assertEqual(services(app)[0], (0, "lock/unlock", BLE))
+
+    def test_a_second_sighting_inside_the_window_does_not_unlock_again(self):
+        app = unlocking_app()
+        sight(app, 0)
+        sight(app, 10)
+        self.assertEqual([s for _, s, _ in services(app)].count("lock/unlock"), 1)
+
+    def test_an_opened_door_is_not_relocked_and_the_line_carries_the_unlock(self):
+        app = unlocking_app()
+        sight(app, 0)
+        open_door(app, 20)
+        app.states[LOCK] = "unlocked"
+        advance(app, 400)
+        self.assertEqual([s for _, s, _ in services(app)], ["lock/unlock", "notify/mobile_app_phone"])
+        (line,) = lines(app)
+        self.assertEqual((line["outcome"], line["unlock"], line["relocked"]),
+                         ("entered", {"t": iso(0), "entity": BLE, "error": None}, None))
+
+    def test_a_door_not_opened_within_relock_s_is_locked_again_and_pushed(self):
+        app = unlocking_app()
+        sight(app, 0)
+        app.states[LOCK] = "unlocked"
+        advance(app, 400)
+        self.assertEqual(services(app)[2:], [(60, "lock/lock", BLE), (60, "notify/mobile_app_phone", None)])
+        self.assertEqual(app.calls[3][2]["title"], "Front door locked again")
+        (line,) = lines(app)
+        self.assertEqual((line["outcome"], line["relocked"]), ("no_door", iso(60)))
+
+    def test_the_relock_uses_the_entity_that_unlocked(self):
+        app = unlocking_app(states={BLE: "unavailable"})
+        sight(app, 0)
+        app.states[LOCK] = "unlocked"
+        advance(app, 60)
+        self.assertEqual(services(app)[2], (60, "lock/lock", KEYPAD))
+
+    def test_no_relock_when_already_locked_or_the_door_stands_open(self):
+        for name, states in {"locked": {LOCK: "locked"}, "door open": {LOCK: "unlocked", DOOR: "on"}}.items():
+            with self.subTest(name):
+                app = unlocking_app()
+                sight(app, 0)
+                app.states.update(states)
+                advance(app, 400)
+                self.assertNotIn("lock/lock", [s for _, s, _ in services(app)])
+
+    def test_a_door_opening_before_the_unlock_does_not_cancel_the_relock(self):
+        app = unlocking_app()
+        open_door(app, 0)
+        app.states[DOOR] = "off"
+        sight(app, 100)
+        app.states[LOCK] = "unlocked"
+        advance(app, 160)
+        self.assertEqual(services(app)[2], (160, "lock/lock", BLE))
+
+    def test_a_failed_unlock_is_a_warning_with_no_push_and_still_gets_its_relock_check(self):
+        app = unlocking_app()
+        app.fail_service["lock/unlock"] = "timeout"
+        sight(app, 0)
+        self.assertEqual(app.calls, [])
+        self.assertTrue(any("unlocking lock.yale_bt failed" in w for w in warnings(app)))
+        app.states[LOCK] = "unlocked"
+        advance(app, 400)
+        self.assertEqual([s for _, s, _ in services(app)], ["lock/lock", "notify/mobile_app_phone"])
+        self.assertEqual(lines(app)[0]["unlock"]["error"], "RuntimeError: timeout")
+
+    def test_a_failed_push_or_relock_is_only_a_warning(self):
+        app = unlocking_app()
+        app.fail_service["notify/mobile_app_phone"] = "offline"
+        app.fail_service["lock/lock"] = "jammed"
+        sight(app, 0)
+        app.states[LOCK] = "unlocked"
+        advance(app, 400)
+        self.assertEqual(services(app), [(0, "lock/unlock", BLE)])
+        self.assertEqual(len(warnings(app)), 2)
+        self.assertIsNone(lines(app)[0]["relocked"])
+
+    def test_no_notify_configured_means_no_push(self):
+        app = unlocking_app(args={"notify": None})
+        sight(app, 0)
+        self.assertEqual(services(app), [(0, "lock/unlock", BLE)])
+
+    def test_relock_s_must_be_positive_and_shorter_than_the_window(self):
+        for bad in (0, -1, 180, 200):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                unlocking_app(args={"relock_s": bad})
+        self.assertEqual(unlocking_app(args={"relock_s": 30}).relock_s, 30)
+
+    def test_a_switch_needs_the_lock_to_unlock(self):
+        with self.assertRaises(KeyError):
+            make_app(args={"unlock_switch": SWITCH})
+
+
+class Services(unittest.TestCase):
+    def test_the_app_calls_only_lock_unlock_lock_and_its_push(self):
         tree = ast.parse(Path(au.__file__).read_text(encoding="utf-8"))
         (cls,) = [node for node in tree.body if isinstance(node, ast.ClassDef)]
         own = {node.name for node in cls.body if isinstance(node, ast.FunctionDef)}
-        called = {node.func.attr for node in ast.walk(cls)
-                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                  and isinstance(node.func.value, ast.Name) and node.func.value.id == "self"}
-        self.assertLessEqual(called - own, {"listen_state", "get_state", "run_in", "get_now", "log"})
+        calls = [node for node in ast.walk(cls)
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                 and isinstance(node.func.value, ast.Name) and node.func.value.id == "self"]
+        self.assertLessEqual({c.func.attr for c in calls} - own,
+                             {"listen_state", "get_state", "run_in", "get_now", "log", "call_service"})
+        targets = [ast.unparse(c.args[0]) for c in calls if c.func.attr == "call_service"]
+        self.assertEqual(sorted(targets), ["'lock/lock'", "'lock/unlock'", "self.notify_service"])
 
 
 if __name__ == "__main__":

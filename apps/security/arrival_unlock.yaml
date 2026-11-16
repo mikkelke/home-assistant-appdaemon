@@ -1,8 +1,8 @@
 # /conf/apps/security/arrival_unlock.yaml
-# MEASUREMENT ONLY. Records what unlocking the front door when the resident's phone is seen on
-# the landing would have done: one JSON line per would-be unlock (did the door open, how soon) and
-# one per arrival that no window caught. It never calls a lock service and publishes nothing. See
-# arrival_unlock.py's module docstring.
+# Unlocks the front door when the resident's phone reaches the landing, while that resident's
+# unlock_switch is on, and locks it again after relock_s when the door was not opened. With the
+# switch off it only measures. Either way it writes one JSON line per window (did the door open, how
+# soon) and one per arrival that no window caught. See arrival_unlock.py's module docstring.
 #
 # No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
 # first or the app fails to instantiate.
@@ -28,6 +28,12 @@ ArrivalUnlock:
   keypad: lock.yale
 
   window_s: 180
+
+  unlock_switch: input_boolean.arrival_unlock_mikkel
+  unlock_lock: lock.yale_bt
+  unlock_fallback: lock.yale
+  relock_s: 60
+  notify: notify.mobile_app_mikkels_ofx9p
   # Defaults to arrival_unlock_log.jsonl beside the module (*_log.jsonl is gitignored).
   # log_file: /conf/apps/security/arrival_unlock_log.jsonl
 
@@ -49,4 +55,10 @@ ArrivalUnlockClaudia:
   keypad: lock.yale
 
   window_s: 180
+
+  unlock_switch: input_boolean.arrival_unlock_claudia
+  unlock_lock: lock.yale_bt
+  unlock_fallback: lock.yale
+  relock_s: 60
+  notify: notify.mobile_app_claudias_iphone
   log_file: /conf/apps/security/arrival_unlock_claudia_log.jsonl
