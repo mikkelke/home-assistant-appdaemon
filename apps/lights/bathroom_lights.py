@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import appdaemon.plugins.hass.hassapi as hass # type: ignore
 
 import cover_util
@@ -24,6 +26,11 @@ class BathroomLights(hass.Hass):
     
     Switch is independent toggle.
     Uses centralized darkness calculator for consistency.
+
+    Why the lights are as they are is published as reason_sensor (state: one plain sentence,
+    attribute at), so the voice assistant can answer "why is the light off?". It changes only
+    when the app acts or holds back; it is republished every 10 min because a set_state
+    sensor does not survive a Home Assistant restart.
     """
 
     def initialize(self):
@@ -57,6 +64,17 @@ class BathroomLights(hass.Hass):
         self.log_level = self.args.get("verbosity_level", "normal")
 
         self._last_off_is_dark = None
+
+        self.reason_sensor = self.args.get("reason_sensor", "sensor.bathroom_lights_reason")
+        self._reason = None
+        self._reason_at = None
+        try:
+            if self.get_state(self.reason_sensor) not in (None, "unknown", "unavailable"):
+                self._reason = self.get_state(self.reason_sensor)
+                self._reason_at = self.get_state(self.reason_sensor, attribute="at")
+        except Exception:
+            pass
+        self.run_every(self._republish_reason, "now+10", 600)
 
         # --- Listeners ---
         if self.switch_device_id:
@@ -167,6 +185,7 @@ class BathroomLights(hass.Hass):
         """Handle manual switch press - independent toggle."""
         self.log("Bathroom: Switch pressed - toggling all lights", level="INFO")
         self.toggle(self.all_spots_group)
+        self._set_reason("Someone pressed the bathroom wall switch.")
 
     def _on_bath_presence_change(self, entity, attribute, old, new, kwargs):
         """Handle bath area presence - SUB-LOGIC only for bath spot."""
@@ -224,15 +243,16 @@ class BathroomLights(hass.Hass):
         """
         try:
             if lighting_actions.manual_override_active(self, self.manual_override_entity):
+                self._set_reason("Automatic bathroom lighting is paused by its manual override.")
                 return
-            sleep_mode = self._is_sleep_mode_active()
+            sleep_why = self._sleep_reason()
             lights_on = self._are_any_lights_on()
             occupied = self._is_local_occupied()
             if trigger in ("PIR_ON", "DOOR_OPEN"):
                 occupied = True
             if occupied is None:
                 return
-            lighting_actions.apply_global_lighting(
+            action = lighting_actions.apply_global_lighting(
                 self,
                 room_state_entity=self.room_state_text_entity,
                 darkness_sensor=self.darkness_confirmed_sensor,
@@ -241,7 +261,7 @@ class BathroomLights(hass.Hass):
                 turn_on=self._turn_on_all,
                 turn_off=self._turn_off_all,
                 occupied=occupied,
-                block_auto_on=sleep_mode,
+                block_auto_on=sleep_why is not None,
                 log_fn=lambda m: self.log(f"Bathroom: {m}", level="INFO"),
                 # Bright shutoff targets mains only: the bath spot is the bath
                 # sub-logic's to manage, and killing it here strands the shower
@@ -249,6 +269,9 @@ class BathroomLights(hass.Hass):
                 bright_lights_on=self.get_state(self.main_5_spots_group) == "on",
                 turn_off_bright=self._turn_off_mains,
             )
+            reason = action_reason(action, lights_on, sleep_why)
+            if reason:
+                self._set_reason(reason)
         except Exception as e:
             self.log(f"Error in main light evaluation: {e}", level="ERROR")
 
@@ -347,19 +370,36 @@ class BathroomLights(hass.Hass):
             pass
         return False
 
-    def _is_sleep_mode_active(self) -> bool:
-        """Check if sleep mode is active (prevents auto-on)."""
+    def _sleep_reason(self) -> str | None:
+        """Why auto-on is held back for a sleeper in the bedroom, or None."""
         try:
             if self.get_state(self.mikkel_sleep_entity) == "on":
-                return True
+                return "Mikkel's sleep mode is on"
             # Bedroom blind closed = sleep proxy (threshold-based; 99% low-battery park counts)
             if cover_util.is_closed(
                 self, self.bedroom_blind_entity, threshold=self.blind_closed_threshold
             ):
-                return True
+                return "the bedroom blind is down, which the house takes as someone sleeping"
         except Exception:
             pass
-        return False
+        return None
+
+    def _set_reason(self, text):
+        if text == self._reason:
+            return
+        self._reason = text
+        self._reason_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        self._republish_reason({})
+
+    def _republish_reason(self, kwargs):
+        if not self._reason:
+            return
+        try:
+            self.set_state(self.reason_sensor, state=self._reason[:255],
+                           attributes={"friendly_name": "Bathroom lights reason", "at": self._reason_at},
+                           replace=True)
+        except Exception as e:
+            self.log(f"Bathroom: reason publish failed: {e}", level="WARNING")
 
 
     def _on_manual_override_change(self, entity, attribute, old, new, kwargs):
@@ -382,3 +422,21 @@ class BathroomLights(hass.Hass):
                 self.log("Bathroom: manual override OFF - resuming automatic lighting", level="INFO")
                 self._evaluate_main_lights("OVERRIDE_CLEARED")
                 self._evaluate_bath_spot("OVERRIDE_CLEARED")
+
+
+def action_reason(action, lights_were_on, sleep_why):
+    """The sentence for an apply_global_lighting action, or None when nothing changed."""
+    if action == "on_dark":
+        return "Turned on because someone came in and it is dark."
+    if action == "off_vacant":
+        return "Turned off because nobody is in the bathroom." if lights_were_on else None
+    if action == "off_bright":
+        return "Main lights turned off because there is enough daylight."
+    if action == "noop_bright":
+        return "Left off because there is enough daylight."
+    if action == "blocked":
+        if lights_were_on:
+            return None
+        return (f"Not turned on by itself because {sleep_why}, so it does not wake the sleeper. "
+                "The wall switch turns it on.")
+    return None

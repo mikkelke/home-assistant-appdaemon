@@ -45,3 +45,6 @@ bathroom_lights:
   # Committed dark/bright from darkness_calculator (bedroom_bathroom zone)
   room_state_text_entity: "sensor.room_state_bathroom"
   darkness_confirmed_sensor_entity: "sensor.darkness_bathroom"
+
+  # Why the lights are as they are, one sentence for the voice assistant
+  reason_sensor: "sensor.bathroom_lights_reason"

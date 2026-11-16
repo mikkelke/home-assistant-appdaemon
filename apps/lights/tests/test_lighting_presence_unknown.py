@@ -47,6 +47,8 @@ def bathroom_app(guest=False, presence="unknown", light="off", shower="off"):
     app.listen_state = MagicMock()
     app.listen_event = MagicMock()
     app.run_in = MagicMock()
+    app.run_every = MagicMock()
+    app.set_state = MagicMock()
     app.log = MagicMock()
     app.error = MagicMock()
     app.initialize()
