@@ -1,0 +1,22 @@
+# /conf/apps/presence/ble_scanner_watch.yaml
+# Pushes the owner when a Bluetooth scanner that feeds Bermuda (ESPHome proxy, Shelly, the host's
+# adapter) stops hearing devices. Notify only, never controls a device. See
+# ble_scanner_watch.py's module docstring for the rule.
+#
+# No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
+# first or the app fails to instantiate.
+
+BleScannerWatch:
+  module: ble_scanner_watch
+  class: BleScannerWatch
+  dependencies:
+    - MobileNotifier
+
+  interval_min: 10
+  fresh_s: 120
+  deaf_min: 30
+
+  # Lowercase scanner addresses that are never judged. Quoted: YAML reads an address made of
+  # digits only as a number.
+  ignore:
+    - "c8:85:41:68:25:52"   # landing proxy: loses power whenever the landing light is off
