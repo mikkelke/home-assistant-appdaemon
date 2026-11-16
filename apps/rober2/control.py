@@ -225,7 +225,6 @@ class Rober2Control(hass.Hass):
         # Per-room consecutive 0% interrupt counter (resets on success or manual re-enable)
         self._room_interrupt_counts = {}
         self.MAX_ROOM_RETRIES = int(self.args.get("max_room_retries", 3))
-        self._room_done_pct = {str(k): int(v) for k, v in (self.args.get("room_done_pct") or {}).items()}
         self.MIN_DURATION_FOR_ZERO_PROGRESS = int(self.args.get("min_duration_zero_progress_sec", 10))
         # Max time (seconds) after segment command to count a dock as a "failed attempt". Prevents
         # unavailable->docked (e.g. network blip) hours later from being counted as attempt 3/3.
@@ -492,9 +491,12 @@ class Rober2Control(hass.Hass):
         entity = getattr(self, "_visitor_entity", "sensor.untracked_visitor")
         return await self.get_state(entity) == "cleaner"
 
+    # Peak progress (%) at which a room counts as cleaned (default 90). Progress is cleaned area over the
+    # room's map area; under Claudia's bed the lidar sees floor the robot cannot reach.
+    ROOM_DONE_PCT = {"claudias_room": 50}
+
     def _done_pct(self, room_name) -> int:
-        """Peak progress at which a room counts as cleaned; furnished rooms never reach 90."""
-        return self._room_done_pct.get(room_name, 90)
+        return self.ROOM_DONE_PCT.get(room_name, 90)
 
     async def is_away(self) -> bool:
         """Return True if home is considered away.
