@@ -212,7 +212,8 @@ class Harness:
     """A HeatingController with initialize() run for real against the fake house."""
 
     def __init__(
-        self, testcase, args=None, clock=None, with_house=True, forecast=True, **overrides
+        self, testcase, args=None, clock=None, with_house=True, forecast=True, settle=False,
+        **overrides
     ):
         self.tmp = Path(tempfile.mkdtemp(prefix="heating-test-"))
         self.testcase = testcase
@@ -237,6 +238,8 @@ class Harness:
 
         app = hc.HeatingController.__new__(hc.HeatingController)
         app.args = args if args is not None else {**shipped_args(self.tmp), **overrides}
+        if not settle:
+            app.args = {**app.args, "call": {**app.args["call"], "settle_minutes": 0}}
         app.log = lambda msg, level="INFO", **kw: self.logs.append((level, msg))
         app.get_app = lambda name: self.notifier
         app.get_now = lambda: self.clock.now
@@ -291,10 +294,11 @@ class Harness:
             attrs = {"temperature": call["temperature"], **attrs}
         self.report(zone, state=call.get("hvac_mode"), **attrs)
 
-    def restart(self):
+    def restart(self, settle=False):
         self.app.terminate()
         restarted = Harness(
-            self.testcase, args=self.app.args, clock=self.clock, with_house=False, forecast=False
+            self.testcase, args=self.app.args, clock=self.clock, with_house=False, forecast=False,
+            settle=settle,
         )
         restarted.ha.entities = copy.deepcopy(self.ha.entities)
         restarted.fetch()
@@ -1435,6 +1439,56 @@ class LiveZones:
     @staticmethod
     def iso(hour, minute=0, day=17):
         return datetime(2026, 10, day, hour, minute, tzinfo=TZ).isoformat()
+
+
+class CallsSurviveRestarts(LiveZones, unittest.TestCase):
+    """Home Assistant restarts several times a day. The room sensors come back one by one, and
+    a room's feel built from the first one back can be more than a degree off for up to a
+    minute, so a call is kept as it was until the house has settled."""
+
+    def calling(self):
+        h = Harness(self, live_zones=["family"], settle=True)
+        h.ha.set(h.app.cfg.live_switch_entity, "on")
+        h.season()
+        self.air(h, 20.5)
+        h.tick(minutes=4)
+        self.assertEqual(h.attrs("family")["call"], "false")
+        self.assertEqual(h.app._zones["family"].call_reason, "settling")
+        h.tick(minutes=1)
+        self.assertEqual(h.attrs("family")["call"], "true")
+        h.echo()
+        h.tick(minutes=35)
+        self.air(h, 21.6)
+        h.tick()
+        return h
+
+    def test_a_too_warm_first_feel_after_a_restart_does_not_stop_a_call(self):
+        h = self.calling()
+        writes = len(h.calls)
+        self.air(h, 22.7)
+        h = h.restart(settle=True)
+        h.tick()
+        self.assertEqual(h.attrs("family")["call"], "true")
+        self.assertEqual(self.decision(h)["gate"], "gated:settling")
+        self.air(h, 21.6)
+        h.tick(minutes=4)
+        h.tick(minutes=2)
+        self.assertEqual(h.attrs("family")["call"], "true")
+        self.assertEqual(h.app._zones["family"].call_reason, "calling")
+        self.assertEqual(len(h.calls), 0)
+        self.assertGreater(writes, 0)
+
+    def test_after_home_assistant_comes_back_a_call_is_kept_until_the_house_settles(self):
+        h = self.calling()
+        writes = len(h.calls)
+        h.app._on_plugin_started("plugin_started", {}, {})
+        self.air(h, 22.7)
+        h.tick(minutes=4)
+        self.assertEqual(h.attrs("family")["call"], "true")
+        self.assertEqual(len(h.calls), writes)
+        h.tick(minutes=1)
+        self.assertEqual(h.attrs("family")["call"], "false")
+        self.assertEqual(self.sent(h)[-1], 5.0)
 
 
 class CallEndToEnd(LiveZones, unittest.TestCase):

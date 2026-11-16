@@ -233,7 +233,9 @@ class CallConfig:
     """The call rule, see decide_call: how far the air may stray from the aim before a call
     starts or stops, how long a call and the pause after it last at least, the half-hour grid the
     starts are batched on and how long into each slot a start is still taken, and how far above
-    the aim the thermostat is set while a zone calls."""
+    the aim the thermostat is set while a zone calls. For settle_minutes after the controller
+    starts or Home Assistant comes back every call is kept as it was, because the room sensors
+    return one by one and a room's feel is built from whichever came first."""
 
     hysteresis_c: float = 0.2
     min_on_minutes: float = 20.0
@@ -241,6 +243,7 @@ class CallConfig:
     start_every_minutes: float = 30.0
     start_window_minutes: float = 6.0
     high_margin_c: float = 2.0
+    settle_minutes: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -566,6 +569,7 @@ def _parse_call(raw: dict) -> CallConfig:
         start_every_minutes=float(raw.get("start_every_minutes", d.start_every_minutes)),
         start_window_minutes=float(raw.get("start_window_minutes", d.start_window_minutes)),
         high_margin_c=float(raw.get("high_margin_c", d.high_margin_c)),
+        settle_minutes=float(raw.get("settle_minutes", d.settle_minutes)),
     )
     numbers = [getattr(cfg, name) for name in cfg.__dataclass_fields__]
     if not all(math.isfinite(v) and v >= 0 for v in numbers):
@@ -1513,6 +1517,7 @@ CALL_START = "start"
 CALL_ON = "calling"
 CALL_MIN_ON = "min_on"
 CALL_STOP = "stop"
+CALL_SETTLING = "settling"
 
 
 class CallState:

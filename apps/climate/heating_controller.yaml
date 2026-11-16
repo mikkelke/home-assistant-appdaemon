@@ -132,7 +132,9 @@ HeatingController:
   # hysteresis_c over the aim, after min_on_minutes at the earliest, and at once when heat is not
   # allowed. A call sets the thermostat high_margin_c over the aim, rounded up to 0.5, for the
   # whole call; otherwise it sits at its minimum. Without room air the aim is written as an
-  # ordinary setpoint.
+  # ordinary setpoint. For settle_minutes after AppDaemon starts the controller or Home Assistant
+  # comes back, every call stays as it was and nothing is written: the room sensors return one
+  # by one, and a feel built from the first one back can be more than a degree off.
   call:
     hysteresis_c: 0.2
     min_on_minutes: 20
@@ -140,6 +142,7 @@ HeatingController:
     start_every_minutes: 30
     start_window_minutes: 6
     high_margin_c: 2.0
+    settle_minutes: 5
 
   # After an airing heat stays locked out until the air is back within settle_recovered_c of what
   # it was before the opening, or until lockout_per_open_hour times the time the zone was open

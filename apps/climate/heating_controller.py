@@ -268,6 +268,7 @@ class HeatingController(hass.Hass):
             k: float(v) for k, v in _dict(saved.get("notified")).items() if _num(v) is not None
         }
         self._started_ts = self.get_now().timestamp()
+        self._settle_until = self._started_ts + cfg.call.settle_minutes * 60.0
         self._thermostats = {zc.thermostat: zone for zone, zc in cfg.zones.items()}
         self._buttons = self._button_map()
         self._owned = self._owned_helpers()
@@ -423,6 +424,7 @@ class HeatingController(hass.Hass):
         with self._lock:
             self.log("HeatingController: plugin_started - republishing", level="INFO")
             self._plugin_online = True
+            self._settle_until = self.get_now().timestamp() + self.cfg.call.settle_minutes * 60.0
             for rt in self._zones.values():
                 rt.published = None
                 rt.gap = True
@@ -1290,9 +1292,13 @@ class HeatingController(hass.Hass):
 
         limits = self._write_limits(rt)
         rt.allowed = plan.allowed and plan.mode != hp.MODE_OFF_SEASON and not rt.held_off
-        on, rt.call_reason = hp.decide_call(
-            cfg.call, rt.call, plan.aim, reading["air"], rt.allowed, now_ts
-        )
+        settling = now_ts < self._settle_until
+        if settling:
+            on, rt.call_reason = rt.call.on, hp.CALL_SETTLING
+        else:
+            on, rt.call_reason = hp.decide_call(
+                cfg.call, rt.call, plan.aim, reading["air"], rt.allowed, now_ts
+            )
         high = hp.high_limit(cfg.call, plan.aim, limits[1] if limits else upper)
         if rt.call.apply(on, now_ts, high):
             priority = "call"
@@ -1306,7 +1312,9 @@ class HeatingController(hass.Hass):
         )
 
         acc = rt.days.setdefault(day, hp.ZoneDay(day))
-        if self._is_live(zone):
+        if self._is_live(zone) and settling:
+            gate = hp.GateResult(False, "gated:settling")
+        elif self._is_live(zone):
             gate = self._live_gate(rt, plan, reading, now_ts, priority, acc)
         else:
             rt.pending_write = None
