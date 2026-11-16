@@ -1,0 +1,22 @@
+# /conf/apps/presence/beacon_position_log.yaml
+# MEASUREMENT ONLY. While the robot vacuum cleans or returns to its dock, and tail_s after, it
+# records every interval_s the robot's floor position and the RSSI every Bluetooth scanner hears
+# from the beacon stuck on it, one JSON line per sample, to train an RSSI-fingerprint locator.
+# It decides nothing and publishes nothing. See beacon_position_log.py's module docstring.
+#
+# No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
+# first or the app fails to instantiate.
+
+BeaconPositionLog:
+  module: beacon_position_log
+  class: BeaconPositionLog
+
+  vacuum: vacuum.rober2
+  room: sensor.rober2_current_room
+  beacon: "7c:d9:f4:14:23:77"
+
+  active_states: [cleaning, returning]
+  tail_s: 60
+  interval_s: 10
+  # Defaults to beacon_position_log.jsonl beside the module (*_log.jsonl is gitignored).
+  # log_file: /conf/apps/presence/beacon_position_log.jsonl
