@@ -108,6 +108,8 @@ class LivingRoomTvControl(hass.Hass):
         self._apple_tv_disconnect_handle = None
         self._apple_tv_grace_elapsed = False
         self._apple_tv_input_unconfirmed = False
+        self.apple_tv_input_wait_seconds = float(self.args.get("apple_tv_input_wait_seconds", 60))
+        self._apple_tv_input_wait_handle = None
 
         # Power-aware wall move (optional; default off until YAML opts in)
         self.power_aware_wall_move_enabled = bool(self.args.get("power_aware_wall_move_enabled", False))
@@ -249,6 +251,9 @@ class LivingRoomTvControl(hass.Hass):
         self.run_in(self._arm_apple_tv_disconnect_on_init, 5)
         
         self.log("LivingRoomTvControl Initialization complete.")
+
+    def terminate(self):
+        self._cancel_apple_tv_input_wait()
 
     def handle_zwave_event(self, event_name, data, kwargs):
         button_id = kwargs.get("button_id")
@@ -1180,6 +1185,7 @@ class LivingRoomTvControl(hass.Hass):
         # Debounce "off" state changes to avoid premature lift movement
         if new == "off" and old != "off":
             self._arm_apple_tv_disconnect("TV off")
+            self._cancel_apple_tv_input_wait()
             self._cancel_power_standby_monitor("universal TV off")
             self._cancel_power_on_confirm(reason="TV transitioning off: cancel pending power-on confirm")
             self._invalidate_wall_timer("debounce")
@@ -1394,20 +1400,55 @@ class LivingRoomTvControl(hass.Hass):
         """Native apps and casting report no input, so the source listener may never fire."""
         self._settle_unconfirmed_apple_tv_input(self.get_state(self.hisense_tv_entity, attribute="source"))
 
-    def _settle_unconfirmed_apple_tv_input(self, source):
+    def _settle_unconfirmed_apple_tv_input(self, source, wait_over=False):
         """After a connect made before the TV could report its input, keep the connection only
-        if the first reported input is the Apple TV's. Returns True when it acted."""
+        if the TV reports the Apple TV's input. No input at all is waited out first, because
+        the TV may just not have reported yet; wait_over says the wait has run out.
+        Returns True when it acted."""
         if not self._apple_tv_input_unconfirmed:
             return False
-        self._apple_tv_input_unconfirmed = False
         selection_script = getattr(self, "source_selection_script_entity", None)
         if selection_script and self.get_state(selection_script) == "on":
+            self._end_apple_tv_input_wait()
             return True
+        if source is None and not wait_over:
+            self._arm_apple_tv_input_wait()
+            return True
+        self._end_apple_tv_input_wait()
         if source == self.apple_tv_source_name:
             self.log(f"Apple TV early connect confirmed: TV reports {source}")
             return True
-        self._disconnect_apple_tv(f"TV reports input '{source}', not the Apple TV")
+        if source is None:
+            reason = f"TV reported no input within the {self.apple_tv_input_wait_seconds:.0f}s wait"
+        else:
+            reason = f"TV reports input '{source}', not the Apple TV"
+        self._disconnect_apple_tv(reason)
         return True
+
+    def _arm_apple_tv_input_wait(self):
+        """A native app or a cast never reports an input, and neither has a TV that is still
+        starting up. Only the first such report starts the wait; later ones leave it running."""
+        if self._apple_tv_input_wait_handle:
+            return
+        self._apple_tv_input_wait_handle = self.run_in(
+            self._apple_tv_input_wait_due, self.apple_tv_input_wait_seconds
+        )
+        self.log(
+            f"Apple TV early connect: TV reports no input yet - "
+            f"waiting up to {self.apple_tv_input_wait_seconds:.0f}s"
+        )
+
+    def _cancel_apple_tv_input_wait(self):
+        self._safe_cancel_timer(self._apple_tv_input_wait_handle)
+        self._apple_tv_input_wait_handle = None
+
+    def _end_apple_tv_input_wait(self):
+        self._apple_tv_input_unconfirmed = False
+        self._cancel_apple_tv_input_wait()
+
+    def _apple_tv_input_wait_due(self, kwargs):
+        self._apple_tv_input_wait_handle = None
+        self._settle_unconfirmed_apple_tv_input(None, wait_over=True)
 
     def _reconnect_apple_tv_if_needed(self, reason):
         """Reconnect the Apple TV integration when the TV is on but it holds no connection.
@@ -1504,7 +1545,7 @@ class LivingRoomTvControl(hass.Hass):
         """remote.turn_off only closes the integration's connection; it sends no command to
         the Apple TV or the TV."""
         try:
-            self._apple_tv_input_unconfirmed = False
+            self._end_apple_tv_input_wait()
             if remote_state is None:
                 remote_state = self.get_state(self.apple_tv_remote_entity)
             if remote_state != "on":

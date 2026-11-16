@@ -1,6 +1,11 @@
 import unittest
+from pathlib import Path
 
-from test_living_room_apple_tv_disconnect import APPLE, HISENSE, REMOTE, TV, make_app, states
+import yaml
+
+from test_living_room_apple_tv_disconnect import (
+    APPLE, HISENSE, REMOTE, TV, fire, make_app, pending, states, tv_changes,
+)
 
 
 LOCAL_TV = "media_player.hisense_vidaa_local"
@@ -17,9 +22,11 @@ def configured_app(source=None, **overrides):
         "apple_tv_reset_enabled": False,
     })
 
+    app.source = source
+
     def get_state(entity, attribute=None, **kwargs):
         if entity == LOCAL_TV and attribute == "source":
-            return source
+            return app.source
         return app.states.get(entity)
 
     app.get_state = get_state
@@ -206,11 +213,13 @@ class AppleTvConnectsWhenTheTvDrawsPower(unittest.TestCase):
         self.assertEqual(app.service_calls, [CONNECT, DISCONNECT])
         self.assertFalse(app._apple_tv_input_unconfirmed)
 
-    def test_native_app_without_an_input_disconnects(self):
+    def test_native_app_without_an_input_disconnects_when_the_wait_runs_out(self):
         app = booting_app()
         app._reconnect_apple_tv_if_needed("TV drawing power")
         app.states.update({LOCAL_TV: "on", REMOTE: "on"})
         app._on_hisense_reported_on(LOCAL_TV, "state", "unavailable", "on", {})
+        self.assertEqual(app.service_calls, [CONNECT])
+        fire(app, app._apple_tv_input_wait_due)
         self.assertEqual(app.service_calls, [CONNECT, DISCONNECT])
 
     def test_apple_tv_input_keeps_the_early_connection(self):
@@ -243,3 +252,151 @@ class AppleTvConnectsWhenTheTvDrawsPower(unittest.TestCase):
         app.states.update({LOCAL_TV: "on", REMOTE: "on"})
         app._on_tv_source_changed(LOCAL_TV, "source", None, "HDMI1", {})
         self.assertEqual(app.service_calls, [CONNECT])
+
+
+def early_connected_app(**overrides):
+    """Apple TV connected on the power rise; the provider is about to report on."""
+    app = booting_app(**overrides)
+    app.logs = []
+    app.log = lambda message, **kwargs: app.logs.append(message)
+    app._reconnect_apple_tv_if_needed("TV drawing power")
+    app.states.update({LOCAL_TV: "on", REMOTE: "on"})
+    return app
+
+
+def provider_reports_on(app):
+    app._on_hisense_reported_on(LOCAL_TV, "state", "unavailable", "on", {})
+
+
+def source_changes(app, old, new):
+    app.source = new
+    app._on_tv_source_changed(LOCAL_TV, "source", old, new, {})
+
+
+class AppleTvEarlyConnectWaitsForTheInput(unittest.TestCase):
+    """The provider can report on before it knows the input, and a native app or a cast never
+    gets one. No input is waited out; a named input decides at once."""
+
+    def test_no_input_yet_waits_instead_of_disconnecting(self):
+        app = early_connected_app()
+        provider_reports_on(app)
+        self.assertEqual(app.service_calls, [CONNECT])
+        self.assertEqual(pending(app, app._apple_tv_input_wait_due), [60.0])
+        self.assertTrue(app._apple_tv_input_unconfirmed)
+
+    def test_the_apple_tv_input_arriving_inside_the_wait_keeps_the_connection(self):
+        app = early_connected_app()
+        provider_reports_on(app)
+        source_changes(app, None, "HDMI2")
+        self.assertEqual(pending(app, app._apple_tv_input_wait_due), [])
+        fire(app, app._apple_tv_input_wait_due)
+        self.assertEqual(app.service_calls, [CONNECT])
+        self.assertFalse(app._apple_tv_input_unconfirmed)
+        self.assertIn("Apple TV early connect confirmed: TV reports HDMI2", app.logs)
+
+    def test_no_input_for_the_whole_wait_disconnects_and_names_the_wait(self):
+        app = early_connected_app()
+        provider_reports_on(app)
+        fire(app, app._apple_tv_input_wait_due)
+        self.assertEqual(app.service_calls, [CONNECT, DISCONNECT])
+        self.assertFalse(app._apple_tv_input_unconfirmed)
+        self.assertTrue(any("no input within the 60s wait" in line for line in app.logs), app.logs)
+
+    def test_another_input_inside_the_wait_disconnects_at_once(self):
+        for source in ("HDMI1", "Home"):
+            with self.subTest(source=source):
+                app = early_connected_app()
+                provider_reports_on(app)
+                source_changes(app, None, source)
+                self.assertEqual(app.service_calls, [CONNECT, DISCONNECT])
+                self.assertEqual(pending(app, app._apple_tv_input_wait_due), [])
+                fire(app, app._apple_tv_input_wait_due)
+                self.assertEqual(app.service_calls, [CONNECT, DISCONNECT])
+
+    def test_a_first_report_naming_the_apple_tv_input_confirms_without_a_wait(self):
+        app = early_connected_app()
+        app.source = "HDMI2"
+        provider_reports_on(app)
+        self.assertEqual(pending(app, app._apple_tv_input_wait_due), [])
+        self.assertEqual(app.service_calls, [CONNECT])
+        self.assertFalse(app._apple_tv_input_unconfirmed)
+        self.assertIn("Apple TV early connect confirmed: TV reports HDMI2", app.logs)
+
+    def test_a_first_report_naming_another_input_disconnects_without_a_wait(self):
+        app = early_connected_app()
+        app.source = "HDMI1"
+        provider_reports_on(app)
+        self.assertEqual(pending(app, app._apple_tv_input_wait_due), [])
+        self.assertEqual(app.service_calls, [CONNECT, DISCONNECT])
+
+    def test_repeated_reports_of_no_input_keep_one_timer(self):
+        app = early_connected_app()
+        provider_reports_on(app)
+        provider_reports_on(app)
+        self.assertEqual(pending(app, app._apple_tv_input_wait_due), [60.0])
+
+    def test_tv_off_during_the_wait_cancels_it_and_leaves_the_disconnect_to_the_grace(self):
+        app = early_connected_app()
+        provider_reports_on(app)
+        tv_changes(app, "on", "off")
+        self.assertEqual(pending(app, app._apple_tv_input_wait_due), [])
+        fire(app, app._apple_tv_input_wait_due)
+        self.assertEqual(app.service_calls, [CONNECT])
+        self.assertEqual(pending(app, app._apple_tv_disconnect_due), [120.0])
+
+    def test_tv_back_on_after_a_cancelled_wait_waits_again_for_its_input(self):
+        app = early_connected_app()
+        provider_reports_on(app)
+        tv_changes(app, "on", "off")
+        tv_changes(app, "off", "on")
+        provider_reports_on(app)
+        self.assertEqual(pending(app, app._apple_tv_input_wait_due), [60.0])
+        fire(app, app._apple_tv_input_wait_due)
+        self.assertEqual(app.service_calls, [CONNECT, DISCONNECT])
+
+    def test_terminate_cancels_the_wait(self):
+        app = early_connected_app()
+        provider_reports_on(app)
+        app.terminate()
+        self.assertEqual(pending(app, app._apple_tv_input_wait_due), [])
+        self.assertEqual(app.service_calls, [CONNECT])
+
+    def test_any_disconnect_ends_the_wait(self):
+        app = early_connected_app()
+        provider_reports_on(app)
+        app._disconnect_apple_tv("grace elapsed")
+        self.assertEqual(pending(app, app._apple_tv_input_wait_due), [])
+        self.assertFalse(app._apple_tv_input_unconfirmed)
+        self.assertEqual(app.service_calls, [CONNECT, DISCONNECT])
+
+    def test_managed_selection_owning_the_switch_starts_no_wait(self):
+        app = early_connected_app(**{SOURCE_SCRIPT: "on"})
+        app.source_selection_script_entity = SOURCE_SCRIPT
+        provider_reports_on(app)
+        self.assertEqual(pending(app, app._apple_tv_input_wait_due), [])
+        self.assertEqual(app.service_calls, [CONNECT])
+        self.assertFalse(app._apple_tv_input_unconfirmed)
+
+    def test_managed_selection_starting_inside_the_wait_keeps_the_connection(self):
+        app = early_connected_app(**{SOURCE_SCRIPT: "off"})
+        app.source_selection_script_entity = SOURCE_SCRIPT
+        provider_reports_on(app)
+        app.states[SOURCE_SCRIPT] = "on"
+        fire(app, app._apple_tv_input_wait_due)
+        self.assertEqual(app.service_calls, [CONNECT])
+        self.assertFalse(app._apple_tv_input_unconfirmed)
+
+    def test_wait_length_follows_the_setting(self):
+        app = early_connected_app()
+        app.apple_tv_input_wait_seconds = 45.0
+        provider_reports_on(app)
+        self.assertEqual(pending(app, app._apple_tv_input_wait_due), [45.0])
+        fire(app, app._apple_tv_input_wait_due)
+        self.assertTrue(any("no input within the 45s wait" in line for line in app.logs), app.logs)
+
+    def test_wait_comes_from_the_yaml_args(self):
+        self.assertEqual(make_app(states(), {"apple_tv_input_wait_seconds": 45}).apple_tv_input_wait_seconds, 45.0)
+        self.assertEqual(make_app(states()).apple_tv_input_wait_seconds, 60.0)
+        config_path = Path(__file__).resolve().parents[1] / "living_room_tv_control.yaml"
+        config = yaml.safe_load(config_path.read_text())["living_room_tv_control"]
+        self.assertEqual(config["apple_tv_input_wait_seconds"], 60)
