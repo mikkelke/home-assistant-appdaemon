@@ -1,7 +1,7 @@
 # Mikkel sleep mode: home + Withings in bed + phone charging or not_charging -> sleep on,
 # gated by the bedroom being in sleep configuration (bottom-up blind risen >= 95 =
-# covering the window, OR inside 21:00-04:00) so a daytime in-bed charge with the blind
-# parked open no longer flips sleep + DND (2026-08-12).
+# covering the window, AND every bedroom light off), so lying in bed with a lamp on or
+# the blind parked open does not flip sleep + DND.
 # Phone discharging -> sleep off (also off if home / in-bed / battery combo no longer
 # matches) - immediately by day; while input_boolean.house_night_mode is on, out-of-bed
 # needs >= 12 min sustained (2026-08-07 04:14: a 30-min bathroom-plus trip cascaded into
@@ -45,8 +45,10 @@ MikkelSleepMode:
   # trust HA's open/closed word for it, only the position.
   blind_entity: cover.bedroom_blind
   blind_covering_min: 95
-  night_window_start: "21:00"
-  night_window_end: "04:00"
+  # ...and every bedroom light off: in bed with a lamp on is not sleeping.
+  bedroom_lights:
+    - light.bedroom_bed_lights
+    - light.bedroom_ceiling_lights
 
   # OFF-debounce while the house is in night mode (apps/presence/house_night_mode.py).
   house_night_entity: input_boolean.house_night_mode

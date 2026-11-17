@@ -3,8 +3,8 @@ Mikkel sleep mode - Withings in-bed + phone battery + home, gated by the bedroom
 actually being in sleep configuration.
 
 Sleep mode ON: person.mikkel is home, any configured bedside in-bed sensor is on,
-sensor.mikkels_ofx9p_battery_state is charging or not_charging, AND the night gate is
-open: the bedroom blind covers the window OR the clock is inside 21:00-04:00.
+sensor.mikkels_ofx9p_battery_state is charging or not_charging, AND the bedroom is
+ready for sleep: the blind covers the window AND every bedroom light is off.
 
 In-bed witnesses (2026-08-12): in_bed_entities is an OR list - the two Withings
 mats plus the new ESPHome pressure strip (binary_sensor.bed_presence_6b9c94_
@@ -24,8 +24,11 @@ make sense"): cover.bedroom_blind is BOTTOM-UP - current_position 100 means full
 risen = COVERING the window = sleep configuration; ~38 is parked open. HA's open/
 closed wording is inverted for it, so only current_position is trusted (>= 95 counts
 as covering). A daytime in-bed charge with the blind parked open no longer flips
-sleep mode + DND. The gate only arms ON; it never clears an already-on sleep mode
-(the window ending at 04:00 must not wake the phone while he is still in bed).
+sleep mode + DND. The same holds at night: lying in bed reading with the lights on or
+the blind down is not sleeping (Mikkel 2026-11-17), so there is no time window that
+opens the gate by itself. Only a light reading exactly "on" blocks, so an unavailable
+lamp cannot keep sleep mode off. The gate only arms ON; it never clears an already-on
+sleep mode (a night-time lamp or lowering the blind must not wake the phone).
 
 Sleep mode OFF:
 - While input_boolean.house_night_mode is ON (see apps/presence/house_night_mode.py):
@@ -50,37 +53,21 @@ out of bed.
 
 import json
 import os
-from datetime import datetime, time as dtime
+from datetime import datetime
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
 import room_active_read  # apps/presence - AppDaemon puts every app dir on sys.path
 
 
-def _in_window(t, start, end):
-    """True when time-of-day t lies in [start, end), handling windows that wrap
-    midnight (21:00-04:00)."""
-    if start <= end:
-        return start <= t < end
-    return t >= start or t < end
-
-
-def _parse_hhmm(value, fallback):
-    try:
-        parts = [int(p) for p in str(value).split(":")]
-        return dtime(parts[0], parts[1] if len(parts) > 1 else 0)
-    except (ValueError, IndexError, TypeError):
-        return fallback
-
-
 class MikkelSleepMode(hass.Hass):
     # Class-level defaults so bare __new__() test instances (the harness the older
     # tests in tests/test_mikkel_sleep_mode.py use) keep the legacy behaviour:
-    # blind_entity/night_window None -> the ON gate is open, house_night_entity
+    # no blind_entity and no bedroom_lights -> the ON gate is open, house_night_entity
     # None -> OFF stays immediate. initialize() sets the real values.
     blind_entity = None
     blind_covering_min = 95.0
-    night_window = None
+    bedroom_lights = ()
     house_night_entity = None
     out_of_bed_clear_seconds = 12 * 60
     _out_of_bed_since = None
@@ -119,14 +106,11 @@ class MikkelSleepMode(hass.Hass):
         )
         self._off_battery_state = self.args.get("off_battery_state", "discharging")
 
-        # Night gate: ON requires the blind covering (bottom-up: position 100 =
-        # covering) OR the clock inside the night window. See module docstring.
+        # Bedroom gate: ON requires the blind covering (bottom-up: position 100 =
+        # covering) AND every bedroom light off. See module docstring.
         self.blind_entity = self.args.get("blind_entity", "cover.bedroom_blind")
         self.blind_covering_min = float(self.args.get("blind_covering_min", 95))
-        self.night_window = (
-            _parse_hhmm(self.args.get("night_window_start", "21:00"), dtime(21, 0)),
-            _parse_hhmm(self.args.get("night_window_end", "04:00"), dtime(4, 0)),
-        )
+        self.bedroom_lights = tuple(self.args.get("bedroom_lights") or ())
         # OFF-debounce while the house is in night mode. See module docstring.
         self.house_night_entity = self.args.get(
             "house_night_entity", "input_boolean.house_night_mode"
@@ -161,16 +145,19 @@ class MikkelSleepMode(hass.Hass):
             *self.in_bed_entities,
         ):
             self.listen_state(self._on_relevant_change, entity_id)
-        # The gate/debounce inputs must also trigger re-evaluation: the blind rising
-        # at 20:45 or house night mode ending must not wait for a bed/battery event.
+        # The gate/debounce inputs must also trigger re-evaluation: the blind rising,
+        # the last lamp going off or house night mode ending must not wait for a
+        # bed/battery event.
         if self.blind_entity:
             self.listen_state(
                 self._on_relevant_change, self.blind_entity, attribute="current_position"
             )
+        for light in self.bedroom_lights:
+            self.listen_state(self._on_relevant_change, light)
         if self.house_night_entity:
             self.listen_state(self._on_relevant_change, self.house_night_entity)
-        # Minutely tick: crossing 21:00 opens the gate and the night OFF-debounce
-        # clocks expire with no state change to ride on (same pattern as
+        # Minutely tick: the night OFF-debounce clocks expire with no state change
+        # to ride on (same pattern as
         # actor_attribution's reconcile tick).
         self.run_every(self._tick, "now+30", 60)
 
@@ -255,29 +242,27 @@ class MikkelSleepMode(hass.Hass):
             and battery in self._on_battery_states
         )
 
-    def _night_gate_open(self) -> bool:
+    def _bedroom_ready(self) -> bool:
         """ON-arming gate: the bedroom must be in sleep configuration - blind
-        covering the window (bottom-up: current_position >= blind_covering_min) OR
-        the clock inside the night window. Bare test instances with neither
-        configured keep the legacy always-open gate. An unreadable blind position
-        counts as not covering: only the time window can open the gate then."""
-        if self.blind_entity is None and self.night_window is None:
+        covering the window (bottom-up: current_position >= blind_covering_min) AND
+        no bedroom light reading "on". Bare test instances with neither configured
+        keep the legacy always-open gate. An unreadable blind position counts as not
+        covering."""
+        if self.blind_entity is None and not self.bedroom_lights:
             return True
-        if self.night_window is not None and _in_window(
-            self._local_time(), *self.night_window
-        ):
-            return True
-        if self.blind_entity is not None:
+        for light in self.bedroom_lights:
             try:
-                pos = self.get_state(self.blind_entity, attribute="current_position")
-            except Exception:
-                pos = None
-            if pos is not None:
-                try:
-                    return float(pos) >= self.blind_covering_min
-                except (TypeError, ValueError):
+                if self.get_state(light) == "on":
                     return False
-        return False
+            except Exception:
+                pass
+        if self.blind_entity is None:
+            return True
+        try:
+            pos = self.get_state(self.blind_entity, attribute="current_position")
+            return pos is not None and float(pos) >= self.blind_covering_min
+        except Exception:
+            return False
 
     def _night_debounce_active(self) -> bool:
         if not self.house_night_entity:
@@ -305,7 +290,7 @@ class MikkelSleepMode(hass.Hass):
             if (
                 want_on_raw
                 and not self._block_rearm_until_out_of_bed
-                and self._night_gate_open()
+                and self._bedroom_ready()
             ):
                 self.call_service(
                     "input_boolean/turn_on", entity_id=self.sleep_mode_entity
@@ -384,9 +369,6 @@ class MikkelSleepMode(hass.Hass):
             return self.datetime()
         except Exception:
             return datetime.now()
-
-    def _local_time(self):
-        return self._now_local().time()
 
     def _send_dnd_command(self, command: str) -> None:
         if not command:

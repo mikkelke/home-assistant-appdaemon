@@ -1,7 +1,7 @@
 # tests/test_mikkel_sleep_mode_night.py - the 2026-08-12 night-regime changes to
 # mikkel_sleep_mode.py: (i) ON is gated by the bedroom being in sleep configuration
-# (bottom-up blind current_position >= 95 = covering, OR inside 21:00-04:00), so a
-# daytime in-bed charge with the blind parked open no longer flips sleep + DND;
+# (bottom-up blind current_position >= 95 = covering, AND every bedroom light off), so
+# lying in bed with a lamp on or the blind parked open does not flip sleep + DND;
 # (ii) while input_boolean.house_night_mode is on, out-of-bed only clears after
 # >= 12 min sustained (2026-08-07 04:14-04:44: a 30-min mid-night trip out of bed
 # used to clear instantly and cascade into the whole house leaving night mode) and
@@ -53,7 +53,7 @@ def make_app(states, *, now, blind_position=None, block_rearm=False):
 
     app.blind_entity = "cover.bedroom_blind"
     app.blind_covering_min = 95.0
-    app.night_window = (dtime(21, 0), dtime(4, 0))
+    app.bedroom_lights = ("light.bedroom_bed_lights", "light.bedroom_ceiling_lights")
     app.house_night_entity = "input_boolean.house_night_mode"
     app.out_of_bed_clear_seconds = 12 * 60
     app._out_of_bed_since = None
@@ -112,9 +112,31 @@ class NightGateArmsOn(unittest.TestCase):
         app._apply_sleep_mode()
         self.assertEqual(turn_ons(app), [])
 
-    def test_evening_bed_and_charger_turns_on_even_with_blind_parked_open(self):
-        # 22:30 is inside 21:00-04:00, so the time window alone opens the gate.
+    def test_evening_bed_and_charger_with_blind_parked_open_stays_off(self):
+        # 2026-11-16 22:32: in bed, not going to sleep yet; the blind rose at 23:56.
         app = make_app(dict(IN_BED_CHARGING), now=EVENING, blind_position=38)
+        app._apply_sleep_mode()
+        self.assertEqual(turn_ons(app), [])
+
+    def test_a_lamp_on_keeps_sleep_mode_off(self):
+        for light in ("light.bedroom_bed_lights", "light.bedroom_ceiling_lights"):
+            with self.subTest(light=light):
+                states = dict(IN_BED_CHARGING, **{light: "on"})
+                app = make_app(states, now=EVENING, blind_position=100)
+                app._apply_sleep_mode()
+                self.assertEqual(turn_ons(app), [])
+
+    def test_last_lamp_off_arms(self):
+        states = dict(IN_BED_CHARGING, **{"light.bedroom_bed_lights": "on"})
+        app = make_app(states, now=EVENING, blind_position=100)
+        app._apply_sleep_mode()
+        states["light.bedroom_bed_lights"] = "off"
+        app._apply_sleep_mode()
+        self.assertEqual(len(turn_ons(app)), 1)
+
+    def test_unavailable_lamp_does_not_block(self):
+        states = dict(IN_BED_CHARGING, **{"light.bedroom_bed_lights": "unavailable"})
+        app = make_app(states, now=EVENING, blind_position=100)
         app._apply_sleep_mode()
         self.assertEqual(len(turn_ons(app)), 1)
 
@@ -131,7 +153,6 @@ class NightGateArmsOn(unittest.TestCase):
         self.assertEqual(len(turn_ons(app)), 1)
 
     def test_unreadable_blind_position_daytime_stays_off(self):
-        # Only the time window can open the gate when the position can't be read.
         app = make_app(dict(IN_BED_CHARGING), now=DAY, blind_position=None)
         app._apply_sleep_mode()
         self.assertEqual(turn_ons(app), [])
@@ -147,9 +168,9 @@ class NightGateArmsOn(unittest.TestCase):
         self.assertEqual(len(dnd), 1)
 
     def test_gate_never_clears_an_already_on_sleep_mode(self):
-        # 04:10: window over, blind parked open (say a summer night with the blind
-        # down), still in bed + charging - sleep mode must stay on.
-        states = dict(IN_BED_CHARGING)
+        # Blind lowered and a lamp on mid-night, still in bed + charging - sleep
+        # mode must stay on.
+        states = dict(IN_BED_CHARGING, **{"light.bedroom_bed_lights": "on"})
         states["input_boolean.mikkel_sleep_mode"] = "on"
         app = make_app(states, now=datetime(2026, 8, 13, 4, 10), blind_position=38)
         app._apply_sleep_mode()
@@ -159,7 +180,7 @@ class NightGateArmsOn(unittest.TestCase):
         # The older tests build instances via __new__ with no gate config at all -
         # class defaults must leave the gate open for them.
         app = msm.MikkelSleepMode.__new__(msm.MikkelSleepMode)
-        self.assertTrue(app._night_gate_open())
+        self.assertTrue(app._bedroom_ready())
 
 
 class NightModeOffDebounce(unittest.TestCase):
