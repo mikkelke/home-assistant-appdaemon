@@ -16,14 +16,12 @@ def reason(app):
 
 
 class BathroomReason(unittest.TestCase):
-    def test_sleep_mode_holds_back_and_says_so(self):
+    def test_turns_on_while_someone_sleeps(self):
         app = bathroom_app(presence="off")
         app.states["input_boolean.sleep"] = "on"
         app.states["sensor.room_state"] = "Occupied (Dark)"
         presence_event(app, "on")
-        app.turn_on.assert_not_called()
-        self.assertIn("Mikkel's sleep mode is on", reason(app))
-        self.assertIn("wall switch", reason(app))
+        app.turn_on.assert_called()
         self.assertTrue(app.set_state.call_args.kwargs["attributes"]["at"])
 
     def test_dark_entry_turns_on(self):
@@ -37,7 +35,7 @@ class BathroomReason(unittest.TestCase):
         app = bathroom_app(presence="on", light="on")
         presence_event(app, "off")
         self.assertEqual(reason(app), "Turned off because nobody is in the bathroom.")
-        self.assertIsNone(bathroom_lights.action_reason("off_vacant", False, None))
+        self.assertIsNone(bathroom_lights.action_reason("off_vacant", False))
 
     def test_manual_override(self):
         app = bathroom_app(presence="off")
@@ -47,16 +45,12 @@ class BathroomReason(unittest.TestCase):
 
     def test_same_reason_is_not_republished(self):
         app = bathroom_app(presence="off")
-        app.states["input_boolean.sleep"] = "on"
+        app.states["input_boolean.manual"] = "on"
         presence_event(app, "on")
         presence_event(app, "off")
         presence_event(app, "on")
         self.assertEqual(app.set_state.call_count, 1)
 
-    def test_blind_down_is_named(self):
-        text = bathroom_lights.action_reason("blocked", False, "the bedroom blind is down")
-        self.assertIn("the bedroom blind is down", text)
-        self.assertIsNone(bathroom_lights.action_reason("blocked", True, "x"))
 
 
 if __name__ == "__main__":

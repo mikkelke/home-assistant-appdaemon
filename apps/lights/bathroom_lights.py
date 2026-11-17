@@ -2,7 +2,6 @@ from datetime import datetime
 
 import appdaemon.plugins.hass.hassapi as hass # type: ignore
 
-import cover_util
 import lighting_actions
 import room_state_darkness
 
@@ -12,8 +11,8 @@ class BathroomLights(hass.Hass):
     
     Main Logic:
       - No presence -> all lights OFF
-      - Presence + dark + sleep mode -> no auto-on (use manual switch)
-      - Presence + dark -> all lights ON
+      - Presence + dark -> all lights ON, also while someone sleeps: Adaptive Lighting
+        intercepts the turn-on and sets its dim night level
       - Presence + bright -> turn off main lights (sun is sufficient; bath spot still handles dark corner)
     
     Key principle: Dark = auto-on, Bright = auto-off (matches family room / claudias room).
@@ -47,17 +46,12 @@ class BathroomLights(hass.Hass):
         # Centralized, human-readable room state published by darkness_calculator
         self.room_state_text_entity = self.args.get("room_state_text_entity", "sensor.room_state_bathroom")
         self.darkness_confirmed_sensor = self.args.get("darkness_confirmed_sensor_entity")
-        self.mikkel_sleep_entity = self.args.get("mikkel_sleep_entity")
-        self.bedroom_blind_entity = self.args.get("bedroom_blind_entity")
-        # A closed bedroom blind is a sleep proxy; threshold handles 99% low-battery park.
-        self.blind_closed_threshold = int(self.args.get("blind_closed_threshold", 95))
         # Global mechanism: per-room manual override pauses ALL automatic light actions
         self.manual_override_entity = self.args.get("manual_override_boolean")
 
         if not all([self.all_spots_group, self.main_5_spots_group, self.bath_spot_light,
                     self.raw_pir_sensor, self.specific_bath_presence_entity,
-                    self.switch_device_id,
-                    self.mikkel_sleep_entity]):
+                    self.switch_device_id]):
             self.error("One or more critical entities are missing. App may not function correctly.")
 
         # Logging configuration
@@ -230,7 +224,6 @@ class BathroomLights(hass.Hass):
 
         Decision:
           - No presence -> lights OFF
-          - Presence + dark + sleep mode -> no auto-on of mains (manual switch if needed)
           - Presence + dark -> all lights ON
           - Presence + bright -> mains OFF when on (natural light sufficient); bath spot
             may still turn on separately for the shower corner via _evaluate_bath_spot
@@ -245,7 +238,6 @@ class BathroomLights(hass.Hass):
             if lighting_actions.manual_override_active(self, self.manual_override_entity):
                 self._set_reason("Automatic bathroom lighting is paused by its manual override.")
                 return
-            sleep_why = self._sleep_reason()
             lights_on = self._are_any_lights_on()
             occupied = self._is_local_occupied()
             if trigger in ("PIR_ON", "DOOR_OPEN"):
@@ -261,7 +253,6 @@ class BathroomLights(hass.Hass):
                 turn_on=self._turn_on_all,
                 turn_off=self._turn_off_all,
                 occupied=occupied,
-                block_auto_on=sleep_why is not None,
                 log_fn=lambda m: self.log(f"Bathroom: {m}", level="INFO"),
                 # Bright shutoff targets mains only: the bath spot is the bath
                 # sub-logic's to manage, and killing it here strands the shower
@@ -269,7 +260,7 @@ class BathroomLights(hass.Hass):
                 bright_lights_on=self.get_state(self.main_5_spots_group) == "on",
                 turn_off_bright=self._turn_off_mains,
             )
-            reason = action_reason(action, lights_on, sleep_why)
+            reason = action_reason(action, lights_on)
             if reason:
                 self._set_reason(reason)
         except Exception as e:
@@ -370,20 +361,6 @@ class BathroomLights(hass.Hass):
             pass
         return False
 
-    def _sleep_reason(self) -> str | None:
-        """Why auto-on is held back for a sleeper in the bedroom, or None."""
-        try:
-            if self.get_state(self.mikkel_sleep_entity) == "on":
-                return "Mikkel's sleep mode is on"
-            # Bedroom blind closed = sleep proxy (threshold-based; 99% low-battery park counts)
-            if cover_util.is_closed(
-                self, self.bedroom_blind_entity, threshold=self.blind_closed_threshold
-            ):
-                return "the bedroom blind is down, which the house takes as someone sleeping"
-        except Exception:
-            pass
-        return None
-
     def _set_reason(self, text):
         if text == self._reason:
             return
@@ -424,7 +401,7 @@ class BathroomLights(hass.Hass):
                 self._evaluate_bath_spot("OVERRIDE_CLEARED")
 
 
-def action_reason(action, lights_were_on, sleep_why):
+def action_reason(action, lights_were_on):
     """The sentence for an apply_global_lighting action, or None when nothing changed."""
     if action == "on_dark":
         return "Turned on because someone came in and it is dark."
@@ -434,9 +411,4 @@ def action_reason(action, lights_were_on, sleep_why):
         return "Main lights turned off because there is enough daylight."
     if action == "noop_bright":
         return "Left off because there is enough daylight."
-    if action == "blocked":
-        if lights_were_on:
-            return None
-        return (f"Not turned on by itself because {sleep_why}, so it does not wake the sleeper. "
-                "The wall switch turns it on.")
     return None

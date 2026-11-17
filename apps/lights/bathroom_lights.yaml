@@ -29,15 +29,8 @@ bathroom_lights:
   # --- Sensors & Controls ---
   # illuminance_entity: (not required)
   # outside_entity: (not required)
-  mikkel_sleep_entity: "input_boolean.mikkel_sleep_mode"
   # Global mechanism: manual override toggle — ON pauses ALL automatic actions for this room
   manual_override_boolean: "input_boolean.bathroom_lights_manual"
-
-  # --- Blind proxy (optional) ---
-  # If the bedroom blind is closed (>= blind_closed_threshold), suppress bathroom
-  # auto-on due to darkness. Threshold handles a 99% low-battery park.
-  bedroom_blind_entity: "cover.bedroom_blind"
-  blind_closed_threshold: 95
 
   # Logging configuration
   verbosity_level: "normal"  # "quiet", "normal", "debug"  
