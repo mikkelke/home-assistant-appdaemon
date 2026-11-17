@@ -14,6 +14,8 @@ apps/people/
 
 # Room model fitted on the box by scripts/ble_locator_train.py
 ble_locator_model.json
+# Raw per-scanner readings BleLocator appends on the box
+ble_locator_readings.jsonl
 
 # Media: copyrighted manuals, apartment layout drawings, maps
 *.pdf

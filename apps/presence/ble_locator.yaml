@@ -16,14 +16,17 @@ BleLocator:
   min_scanners: 3
   offset_tau_s: 3600
   max_model_age_days: 14
+  # A write waits at least this long and ticks come every interval_s, so 9 writes on every second tick.
+  readings_interval_s: 9
   # Bermuda areas nobody can be in: when Bermuda names one (the host adapter in the technical room is
   # sometimes the nearest scanner from the hallway), the model answers instead.
   unreachable_areas: ["Technical room"]
 
-  # Default beside the module; the model, the log and the state file are all gitignored.
+  # Default beside the module; the model, the log, the state file and the readings file are all gitignored.
   # model_file: /conf/apps/presence/ble_locator_model.json
   # log_file: /conf/apps/presence/ble_locator_log.jsonl
   # state_file: /conf/apps/presence/ble_locator_state.json
+  # readings_file: /conf/apps/presence/ble_locator_readings.jsonl
 
   # name: the sensor is sensor.<name>_ble_room. address: what bermuda.dump_devices lists the device
   # under. bermuda_area: the device's Bermuda area sensor, the answer whenever the model gives none.

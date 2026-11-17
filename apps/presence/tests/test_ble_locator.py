@@ -1,5 +1,5 @@
 # tests/test_ble_locator.py - BleLocator: the likelihood and the filter, the device offset, when the
-# answer is Bermuda's area, what a failed dump leaves and the model file.
+# answer is Bermuda's area, what a failed dump leaves, the model file and the raw readings log.
 # The app runs through its real initialize() and tick on a fake clock (T0 plus the seconds a test
 # gives; the monotonic clock the dump's stamps are on is MONO0 plus the same), a scheduler that only
 # records, a bermuda.dump_devices that answers app.dump(), area states from app.states and a
@@ -123,7 +123,8 @@ def make_app(args=None, devices=(ANNA,), model=True, areas=None, world=None):
     records into app.published and a bermuda.dump_devices that answers app.dump()."""
     app = bl.BleLocator.__new__(bl.BleLocator)
     app.args = {"model_file": new_path("model.json"), "log_file": new_path("log.jsonl"),
-                "state_file": new_path("state.json"), "devices": [dict(d) for d in devices], **(args or {})}
+                "state_file": new_path("state.json"), "readings_file": new_path("readings.jsonl"),
+                "devices": [dict(d) for d in devices], **(args or {})}
     if model:
         write_model(app.args["model_file"], None if model is True else model)
     app.states = {d["bermuda_area"]: "Kitchen" for d in devices}
@@ -198,6 +199,18 @@ def log_lines(app):
             return [json.loads(line) for line in f]
     except FileNotFoundError:
         return []
+
+
+def readings_lines(app):
+    try:
+        with open(app.readings_file, encoding="utf-8") as f:
+            return [json.loads(line) for line in f]
+    except FileNotFoundError:
+        return []
+
+
+def seconds_of(lines):
+    return [round(line["t"] - T0) for line in lines]
 
 
 class Likelihood(unittest.TestCase):
@@ -712,9 +725,9 @@ class ModelFile(unittest.TestCase):
         app.run_every = lambda *a: None
         app.initialize()
         here = Path(bl.__file__).resolve().parent
-        self.assertEqual((app.model_file, app.log_file, app.state_file),
+        self.assertEqual((app.model_file, app.log_file, app.state_file, app.readings_file),
                          tuple(str(here / name) for name in ("ble_locator_model.json", "ble_locator_log.jsonl",
-                                                             "ble_locator_state.json")))
+                                                             "ble_locator_state.json", "ble_locator_readings.jsonl")))
 
 
 class Output(unittest.TestCase):
@@ -765,23 +778,220 @@ class Output(unittest.TestCase):
             "addresses": f"{ANNA['address']} {BEN['address']}"}))
 
 
+class ReadingsLog(unittest.TestCase):
+    NOW = MONO0 + 500.0
+    OUTSIDER = "ee:ee:ee:ee:ee:ee"
+
+    def test_each_scanner_counts_once_by_its_newest_advert(self):
+        dev = {"adverts": {"old": advert(S1, -80, self.NOW, age=9.0), "new": advert(S1, -55, self.NOW, age=2.0),
+                           "older": advert(S1, -90, self.NOW, age=20.0), "other": advert(S2, -70, self.NOW, age=29.0)}}
+        self.assertEqual(bl.raw_readings(dev, self.NOW, 30), {S1: -55.0, S2: -70.0})
+
+    def test_an_advert_counts_only_when_it_is_0_to_max_age_s_old(self):
+        dev = {"adverts": {"now": advert(S1, -60, self.NOW, age=0.0), "edge": advert(S2, -60, self.NOW, age=30.0),
+                           "late": advert(S3, -60, self.NOW, age=30.5), "future": advert(S4, -60, self.NOW, age=-0.5)}}
+        self.assertEqual(bl.RAW_MAX_AGE_S, 30)
+        self.assertEqual(set(bl.raw_readings(dev, self.NOW, bl.RAW_MAX_AGE_S)), {S1, S2})
+        self.assertEqual(set(bl.raw_readings(dev, self.NOW, 10)), {S1})
+
+    def test_an_advert_without_a_distance_above_zero_is_no_reading_and_does_not_hide_an_older_one(self):
+        bad = (None, "None", "", 0.0, 0, -2.0, True, float("nan"), float("inf"))
+        dev = {"adverts": {i: {**advert(f"bb:00:00:00:00:{i:02x}", -60, self.NOW), "rssi_distance": value}
+                           for i, value in enumerate(bad)}}
+        dev["adverts"]["absent"] = {"scanner_address": S1, "stamp": self.NOW - 1.0}
+        self.assertEqual(bl.raw_readings(dev, self.NOW, 30), {})
+        dev["adverts"]["newer"] = {**advert(S2, -60, self.NOW, age=1.0), "rssi_distance": None}
+        dev["adverts"]["older"] = advert(S2, -70, self.NOW, age=9.0)
+        self.assertEqual(bl.raw_readings(dev, self.NOW, 30), {S2: -70.0})
+
+    def test_junk_in_a_device_is_skipped(self):
+        stamp = self.NOW - 1.0
+        dev = {"adverts": {"text": "x", "null": None, "no scanner": {"stamp": stamp, "rssi_distance": 2.0},
+                           "null scanner": {"scanner_address": None, "stamp": stamp, "rssi_distance": 2.0},
+                           "blank scanner": {"scanner_address": "", "stamp": stamp, "rssi_distance": 2.0},
+                           "no stamp": {"scanner_address": S1, "rssi_distance": 2.0},
+                           "ok": advert(S2, -60, self.NOW)}}
+        self.assertEqual(bl.raw_readings(dev, self.NOW, 30), {S2: -60.0})
+        for empty in (None, {}, {"adverts": None}, {"adverts": {}}):
+            self.assertEqual(bl.raw_readings(empty, self.NOW, 30), {})
+
+    def test_every_scanner_counts_not_only_the_ones_the_model_knows_and_addresses_are_lower_case(self):
+        dev = {"adverts": {"a": advert(S1.upper(), -60, self.NOW), "b": advert(self.OUTSIDER.upper(), -70, self.NOW)}}
+        self.assertEqual(bl.raw_readings(dev, self.NOW, 30), {S1: -60.0, self.OUTSIDER: -70.0})
+        self.assertEqual(set(bl.readings_from(dev, bl.Model(model_doc()), self.NOW, 120)), {S1})
+
+    def test_db_is_rounded_to_the_nearest_half_and_floored_at_minus_100(self):
+        for db, expected in ((-55.0, -55.0), (-61.2, -61.0), (-61.3, -61.5), (-75.7, -75.5), (-75.8, -76.0),
+                             (-99.9, -100.0)):
+            with self.subTest(db=db):
+                dev = {"adverts": {"a": advert(S1, db, self.NOW)}}
+                self.assertEqual(bl.raw_readings(dev, self.NOW, 30), {S1: expected})
+        far = {"adverts": {"a": advert(S1, -130, self.NOW, distance=200.0),
+                           "b": advert(S2, -130, self.NOW, distance=1e6)}}
+        self.assertEqual(bl.raw_readings(far, self.NOW, 30), {S1: -100.0, S2: -100.0})
+        near = {"adverts": {"a": advert(S1, -25, self.NOW, distance=0.1)}}
+        self.assertEqual(bl.raw_readings(near, self.NOW, 30), {S1: -25.0})
+
+    def test_the_conversion_is_the_one_the_model_uses(self):
+        model = bl.Model(model_doc())
+        for metres in (0.3, 1.0, 4.2, 17.0, 31.6, 80.0, 400.0):
+            dev = {"adverts": {"a": {"scanner_address": S1, "stamp": self.NOW - 1.0, "rssi_distance": metres}}}
+            self.assertEqual(bl.raw_readings(dev, self.NOW, 30), {S1: round(model.to_db(metres) * 2) / 2})
+
+    def test_a_line_per_device_with_readings_holds_every_scanner_the_model_knows_or_not(self):
+        app = make_app(devices=(ANNA, BEN), areas={"sensor.anna_area": "Living room"})
+        heard = {**reading("Kitchen"), self.OUTSIDER: -72.0}
+        hear(app, heard)
+        tick(app, 5)
+        self.assertEqual(readings_lines(app),
+                         [{"t": T0 + 5, "device": "anna", "bermuda_area": "Living room", "db": heard}])
+        self.assertEqual((len(readings_lines(app)[0]["db"]), log_lines(app)[0]["fresh_scanners"]), (6, 5))
+
+    def test_the_first_tick_writes_and_then_one_every_readings_interval_s_at_most(self):
+        for args, expected in (({}, [5, 15, 25, 35, 45, 55, 65]), ({"readings_interval_s": 25}, [5, 30, 55]),
+                               ({"readings_interval_s": 1}, list(range(5, 70, 5)))):
+            with self.subTest(args=args):
+                app = make_app(args=args)
+                hear(app, reading("Kitchen"))
+                ticks(app, 5, 13)
+                self.assertEqual(seconds_of(readings_lines(app)), expected)
+
+    def test_the_interval_follows_the_monotonic_clock_and_a_line_carries_the_epoch(self):
+        app = make_app()
+        hear(app, reading("Kitchen"))
+        tick(app, 5)
+        app._epoch = lambda: app.clock["now"] + 3600
+        ticks(app, 10, 2)
+        self.assertEqual(seconds_of(readings_lines(app)), [5, 15 + 3600])
+
+    def test_a_failed_dump_writes_nothing_and_is_no_write_for_the_interval(self):
+        app = make_app()
+        hear(app, reading("Kitchen"))
+        good = app.dump
+
+        def down():
+            raise RuntimeError("bermuda is down")
+
+        app.dump = down
+        tick(app, 5)
+        self.assertEqual(readings_lines(app), [])
+        app.dump = good
+        tick(app, 10)
+        app.dump = down
+        tick(app, 15)
+        app.dump = good
+        tick(app, 20)
+        self.assertEqual(seconds_of(readings_lines(app)), [10, 20])
+
+    def test_a_tick_where_nothing_is_heard_writes_nothing_and_the_next_one_that_hears_writes_at_once(self):
+        app = make_app()
+        hear(app, reading("Kitchen"))
+        tick(app, 5)
+        hear(app, {})
+        ticks(app, 10, 2)
+        self.assertEqual(seconds_of(readings_lines(app)), [5])
+        hear(app, reading("Kitchen"))
+        tick(app, 20)
+        self.assertEqual(seconds_of(readings_lines(app)), [5, 20])
+
+    def test_a_reading_is_at_most_30_s_old_whatever_fresh_s_says(self):
+        for fresh_s, model_fresh in ((10, 1), (120, 3)):
+            with self.subTest(fresh_s=fresh_s):
+                app = make_app(args={"fresh_s": fresh_s})
+                app.dump = lambda now=app._monotonic: envelope({ANNA["address"]: device(ANNA["address"], [
+                    advert(S1, -50, now(), age=1.0), advert(S2, -60, now(), age=25.0),
+                    advert(S3, -70, now(), age=31.0)])})
+                tick(app, 5)
+                self.assertEqual(set(readings_lines(app)[0]["db"]), {S1, S2})
+                self.assertEqual(log_lines(app)[0]["fresh_scanners"], model_fresh)
+
+    def test_it_is_written_without_a_usable_model(self):
+        for model in (False, model_doc(trained_at=iso(T0 - 15 * 86400))):
+            with self.subTest(model=bool(model)):
+                app = make_app(model=model, areas={"sensor.anna_area": "Hallway"})
+                hear(app, reading("Kitchen"))
+                tick(app, 5)
+                shown = last(app)["attributes"]
+                self.assertEqual((shown["source"], shown["fresh_scanners"]), ("bermuda", 0))
+                self.assertEqual(readings_lines(app), [{"t": T0 + 5, "device": "anna", "bermuda_area": "Hallway",
+                                                        "db": reading("Kitchen")}])
+
+    def test_bermuda_area_is_the_state_the_answer_log_has(self):
+        for area in ("Living room", "Landing", "unavailable", None):
+            with self.subTest(area=area):
+                app = make_app(areas={"sensor.anna_area": area})
+                hear(app, reading("Kitchen"))
+                tick(app, 5)
+                self.assertEqual(readings_lines(app)[0]["bermuda_area"], area)
+                self.assertEqual(log_lines(app)[0]["bermuda_area"], area)
+
+    def test_the_answers_their_log_and_the_state_are_the_same_whatever_happens_to_the_readings_log(self):
+        outcomes = []
+        for args in ({}, {"readings_interval_s": 1},
+                     {"readings_file": os.path.join(_DIR.name, "no", "such", "dir", "readings.jsonl")}):
+            app = make_app(args=args)
+            hear(app, reading("Kitchen", delta=-3.0))
+            ticks(app, 5, 8)
+            hear(app, reading("Bedroom", delta=-6.0))
+            ticks(app, 45, 20)
+            with open(app.state_file, encoding="utf-8") as f:
+                outcomes.append((app.published, log_lines(app), json.load(f)))
+        self.assertGreater(len(outcomes[0][0]), 20)
+        self.assertGreater(len(outcomes[0][1]), 2)
+        self.assertEqual(outcomes[1], outcomes[0])
+        self.assertEqual(outcomes[2], outcomes[0])
+
+    def test_a_readings_file_that_cannot_be_written_is_warned_about_once_and_tried_again_every_tick(self):
+        folder = os.path.join(_DIR.name, f"{next(_SEQ)}_readings")
+        path = os.path.join(folder, "readings.jsonl")
+        app = make_app(args={"readings_file": path})
+        hear(app, reading("Kitchen"))
+        with patch.object(bl, "append_lines", wraps=bl.append_lines) as appended:
+            ticks(app, 5, 3)
+        self.assertEqual([call.args[0] for call in appended.call_args_list].count(path), 3)
+        self.assertEqual(len(logged(app, "WARNING")), 1)
+        self.assertIn("could not write", logged(app, "WARNING")[0])
+        self.assertIn(path, logged(app, "WARNING")[0])
+        self.assertEqual(states_of(app), ["Kitchen"] * 3)
+        self.assertEqual(len(log_lines(app)), 1)
+        os.mkdir(folder)
+        tick(app, 20)
+        self.assertEqual(seconds_of(readings_lines(app)), [20])
+        self.assertEqual(len(logged(app, "WARNING")), 1)
+        self.assertEqual(len([m for m in logged(app, "INFO") if m.endswith(f"writing {path} again")]), 1)
+
+    def test_the_file_is_written_on_the_executor_not_on_the_event_loop(self):
+        app = make_app()
+        hear(app, reading("Kitchen"))
+        calls, run = [], app.run_in_executor
+
+        async def recording(func, *args):
+            calls.append((func, args[0]))
+            return await run(func, *args)
+
+        app.run_in_executor = recording
+        tick(app, 5)
+        self.assertIn((bl.append_lines, app.readings_file), calls)
+
+
 class Setup(unittest.TestCase):
     def test_defaults_and_the_first_tick_one_interval_after_start(self):
         app = make_app()
-        self.assertEqual((app.interval_s, app.fresh_s, app.min_scanners, app.offset_tau_s, app.max_model_age_days),
-                         (5.0, 120.0, 3, 3600.0, 14.0))
+        self.assertEqual((app.interval_s, app.fresh_s, app.min_scanners, app.offset_tau_s, app.max_model_age_days,
+                          app.readings_interval_s), (5.0, 120.0, 3, 3600.0, 14.0, 10.0))
         self.assertEqual(app.scheduled, [(app._on_tick, "now+5", 5.0)])
 
     def test_the_yaml_values_pass_through(self):
         app = make_app(args={"interval_s": 10, "fresh_s": 60, "min_scanners": 4, "offset_tau_s": 900,
-                             "max_model_age_days": 3})
-        self.assertEqual((app.interval_s, app.fresh_s, app.min_scanners, app.offset_tau_s, app.max_model_age_days),
-                         (10.0, 60.0, 4, 900.0, 3.0))
+                             "max_model_age_days": 3, "readings_interval_s": 30})
+        self.assertEqual((app.interval_s, app.fresh_s, app.min_scanners, app.offset_tau_s, app.max_model_age_days,
+                          app.readings_interval_s), (10.0, 60.0, 4, 900.0, 3.0, 30.0))
         self.assertEqual(app.scheduled[0][1:], ("now+10", 10.0))
 
     def test_a_value_that_would_break_the_app_fails_at_start(self):
         for args in ({"interval_s": 0}, {"fresh_s": -1}, {"min_scanners": 0}, {"offset_tau_s": 0},
-                     {"max_model_age_days": 0}, {"devices": []}, {"devices": [{"name": "x", "address": "y"}]},
+                     {"max_model_age_days": 0}, {"readings_interval_s": 0}, {"readings_interval_s": -10},
+                     {"devices": []}, {"devices": [{"name": "x", "address": "y"}]},
                      {"devices": ["x"]}, {"devices": [dict(ANNA), dict(ANNA, name="other")]},
                      {"devices": [dict(ANNA), dict(BEN, name="anna")]}):
             with self.subTest(args=args):
@@ -805,8 +1015,9 @@ class Setup(unittest.TestCase):
             "mikkel": "sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area",
             "claudia": "sensor.claudias_iphone_ble_area", "rober2_beacon": "sensor.mp1_142377_area"})
         self.assertEqual({k: config[k] for k in ("interval_s", "fresh_s", "min_scanners", "offset_tau_s",
-                                                 "max_model_age_days")}, {
-            "interval_s": 5, "fresh_s": 120, "min_scanners": 3, "offset_tau_s": 3600, "max_model_age_days": 14})
+                                                 "max_model_age_days", "readings_interval_s")}, {
+            "interval_s": 5, "fresh_s": 120, "min_scanners": 3, "offset_tau_s": 3600, "max_model_age_days": 14,
+            "readings_interval_s": 9})
         args = {k: v for k, v in config.items() if k not in ("module", "class")}
         app = make_app(args=args, devices=config["devices"])
         self.assertEqual([t.entity for t in app._tracks], ["sensor.mikkel_ble_room", "sensor.claudia_ble_room",

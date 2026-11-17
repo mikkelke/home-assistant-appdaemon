@@ -49,6 +49,15 @@ bermuda), fresh_scanners, offset_db and model_date (null without a usable model)
 LOG. log_file gets one JSON line {t, device, room, confidence, runner_up, source, bermuda_area,
 fresh_scanners, offset_db} whenever a device's room changes and once a minute per device, appended on
 a worker thread; nothing prunes it. model_file is read again when its mtime changes.
+
+READINGS LOG. readings_file gets what every scanner hears of each device as it is, to fit a model on. On a
+tick whose dump succeeded and that comes at least readings_interval_s after the last write to it (the
+first such tick writes), one JSON line {t, device, bermuda_area, db} is appended per device with at least
+one reading, db being {scanner address: dB to the nearest 0.5}. Every scanner in the device's adverts
+counts, the model's or not, and no model file is needed. A scanner's reading is its newest advert whose
+stamp is 0 to 30 s old on the monotonic clock and whose rssi_distance is above zero, 30 s whatever fresh_s
+says, as dB = -55 - 30 * log10(metres), at least -100 (constants of the module, not read from the model
+file). Appended on a worker thread; nothing prunes it.
 """
 
 import asyncio
@@ -68,6 +77,8 @@ STATE_VERSION = 1
 OFFSET_MIN_SCANNERS = 4
 WRITE_EVERY_S = 60
 DAY_S = 86400
+RAW_MAX_AGE_S = 30
+RAW_REF_POWER_DB, RAW_DB_PER_DECADE, RAW_FLOOR_DB = -55.0, 30.0, -100.0
 CONSTANTS = ("ref_power_db", "db_per_decade", "floor_db", "unseen_mean_db", "unseen_sd_db", "p_stay",
              "p_stay_step_s", "emission_power", "emission_floor")
 
@@ -210,6 +221,24 @@ def readings_from(device, model, now, fresh_s):
     return {scanner: model.to_db(metres) for scanner, (_, metres) in newest.items()}
 
 
+def raw_readings(device, now, max_age_s):
+    """{scanner address: dB to the nearest 0.5} of a device's readings from every scanner in its adverts. `now`
+    is the monotonic clock. Each scanner counts by its newest advert that is 0 to max_age_s seconds old and
+    carries a distance above zero."""
+    newest = {}
+    for advert in (device.get("adverts") or {}).values() if device else ():
+        if not isinstance(advert, dict):
+            continue
+        scanner = str(advert.get("scanner_address") or "").lower()
+        stamp, metres = _number(advert.get("stamp")), _number(advert.get("rssi_distance"))
+        if not scanner or stamp is None or metres is None or metres <= 0:
+            continue
+        if 0 <= now - stamp <= max_age_s and stamp > newest.get(scanner, (-math.inf, 0))[0]:
+            newest[scanner] = (stamp, metres)
+    return {scanner: round(max(RAW_REF_POWER_DB - RAW_DB_PER_DECADE * math.log10(metres), RAW_FLOOR_DB) * 2) / 2
+            for scanner, (_, metres) in newest.items()}
+
+
 def read_state(path):
     """{address: (offset dB, seconds of evidence)} out of the state file, {} when it holds none."""
     try:
@@ -256,15 +285,18 @@ class BleLocator(hass.Hass):
         self.model_file = str(a.get("model_file") or here / "ble_locator_model.json")
         self.log_file = str(a.get("log_file") or here / "ble_locator_log.jsonl")
         self.state_file = str(a.get("state_file") or here / "ble_locator_state.json")
+        self.readings_file = str(a.get("readings_file") or here / "ble_locator_readings.jsonl")
         self.interval_s = float(a.get("interval_s", 5))
         self.fresh_s = float(a.get("fresh_s", 120))
         self.min_scanners = int(a.get("min_scanners", 3))
         self.unreachable_areas = set(a.get("unreachable_areas") or ())
         self.offset_tau_s = float(a.get("offset_tau_s", 3600))
         self.max_model_age_days = float(a.get("max_model_age_days", 14))
-        if min(self.interval_s, self.fresh_s, self.offset_tau_s, self.max_model_age_days) <= 0 or self.min_scanners < 1:
-            raise ValueError("BleLocator: interval_s, fresh_s, offset_tau_s and max_model_age_days must be positive "
-                             "and min_scanners at least 1")
+        self.readings_interval_s = float(a.get("readings_interval_s", 10))
+        if (min(self.interval_s, self.fresh_s, self.offset_tau_s, self.max_model_age_days,
+                self.readings_interval_s) <= 0 or self.min_scanners < 1):
+            raise ValueError("BleLocator: interval_s, fresh_s, offset_tau_s, max_model_age_days and "
+                             "readings_interval_s must be positive and min_scanners at least 1")
         listed = a.get("devices") or []
         if not listed or not all(isinstance(d, dict) and d.get("name") and d.get("address") and d.get("bermuda_area")
                                  for d in listed):
@@ -281,6 +313,7 @@ class BleLocator(hass.Hass):
         self._problems, self._missing = {}, set()
         self._busy = False
         self._saved, self._saved_at = self._offsets(), None
+        self._readings_at = None
 
         self.run_every(self._on_tick, f"now+{self.interval_s:g}", self.interval_s)
         self.log(f"BleLocator initialized: shadow mode, {len(self._tracks)} device(s) every {self.interval_s:g} s -> "
@@ -339,6 +372,7 @@ class BleLocator(hass.Hass):
             if state != self._saved and (self._saved_at is None or now - self._saved_at >= WRITE_EVERY_S):
                 if await self._write("state", write_json, self.state_file, self._state_document()):
                     self._saved, self._saved_at = state, now
+            await self._log_readings(devices, areas, now, epoch)
         except Exception as e:
             self._problem("tick", f"tick failed: {e!a}")
         else:
@@ -407,6 +441,17 @@ class BleLocator(hass.Hass):
             self._problem("publish", f"could not publish {track.entity}: {e!a}")
         else:
             self._recovered("publish", "publishing again")
+
+    async def _log_readings(self, devices, areas, now, epoch):
+        if self._readings_at is not None and now - self._readings_at < self.readings_interval_s:
+            return
+        lines = []
+        for track in self._tracks:
+            db = raw_readings(devices.get(track.address), now, RAW_MAX_AGE_S)
+            if db:
+                lines.append({"t": round(epoch, 1), "device": track.name, "bermuda_area": areas[track.name], "db": db})
+        if lines and await self._write("readings", append_lines, self.readings_file, lines):
+            self._readings_at = now
 
     # ---------- the model file and the state file ----------
 
