@@ -492,8 +492,8 @@ class Rober2Control(hass.Hass):
         return await self.get_state(entity) == "cleaner"
 
     # Peak progress (%) at which a room counts as cleaned (default 90). Progress is cleaned area over the
-    # room's map area; under Claudia's bed the lidar sees floor the robot cannot reach.
-    ROOM_DONE_PCT = {"claudias_room": 50}
+    # room's map area; in Claudia's and Kristine's rooms the lidar sees floor the robot cannot reach.
+    ROOM_DONE_PCT = {"claudias_room": 50, "kristines_room": 80}
 
     def _done_pct(self, room_name) -> int:
         return self.ROOM_DONE_PCT.get(room_name, 90)
