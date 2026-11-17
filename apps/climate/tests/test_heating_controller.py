@@ -95,6 +95,17 @@ AGENT_ID = "f3cc2e6da7c849aba3f366f044725316"
 PRESS_TIME = "2026-10-01T10:00:00+00:00"
 
 
+def zones_with_family_night_offset() -> dict:
+    zones = copy.deepcopy(
+        yaml.safe_load((APPS / "heating_controller.yaml").read_text())["HeatingController"]["zones"]
+    )
+    zones["family"]["profile"] = {
+        "lead_hours": 4,
+        "periods": [{"from": "23:00", "to": "10:00", "offset": -0.5}],
+    }
+    return zones
+
+
 def shipped_args(tmp: Path) -> dict:
     args = dict(yaml.safe_load((APPS / "heating_controller.yaml").read_text())["HeatingController"])
     args["state_file"] = str(tmp / "state.json")
@@ -521,9 +532,8 @@ class ShippedYaml(unittest.TestCase):
         for zone in a.zones:
             self.assertEqual(a.rooms[zone], self.cfg.zones[zone].control_air, zone)
 
-    def test_family_profile_is_minus_half_nights_and_mornings(self):
-        periods = {(p.start, p.end): p.offset for p in self.cfg.zones["family"].profile.periods}
-        self.assertEqual(periods, {(23 * 60, 10 * 60): -0.5})
+    def test_family_holds_one_aim_all_day(self):
+        self.assertFalse(self.cfg.zones["family"].profile.periods)
 
     def test_bathroom_heats_from_night_to_morning_only(self):
         zc = self.cfg.zones["bathroom"]
@@ -1891,7 +1901,7 @@ class OffSeasonPlan(unittest.TestCase):
             self.assertEqual(h.attrs(zone)["setpoint_now"], setpoint, zone)
 
     def test_the_first_plan_has_a_timeline_and_a_next_change(self):
-        h = Harness(self)
+        h = Harness(self, zones=zones_with_family_night_offset())
         h.tick()
         a = h.attrs("family")
         self.assertEqual(
@@ -3028,7 +3038,7 @@ class TerminateAndEvents(unittest.TestCase):
         self.assertTrue(h.app._loop.airing)
 
     def test_a_day_with_the_clocks_going_back_has_a_timeline_to_midnight(self):
-        h = Harness(self)
+        h = Harness(self, zones=zones_with_family_night_offset())
         h.at(12, 0, day=25)
         h.ha.set("input_boolean.heating_season", "on")
         h.tick()
@@ -3058,7 +3068,7 @@ class TerminateAndEvents(unittest.TestCase):
 
 class Timeline(unittest.TestCase):
     def test_finished_blocks_stay_on_the_day_timeline(self):
-        h = Harness(self)
+        h = Harness(self, zones=zones_with_family_night_offset())
         h.ha.set("input_boolean.heating_season", "on")
         h.at(5, 50)
         h.tick()
