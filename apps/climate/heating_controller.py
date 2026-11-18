@@ -20,6 +20,11 @@ off. Every zone with openings stays locked out for lockout_per_open_hour times t
 open, at least settle_max_minutes and at most lockout_max_hours, unless the air gets back to
 where it was before.
 
+A zone with a transit block stops its call early by the heat its loops already hold in the
+floor. Every evaluation adds the loops' power to that heat (heating_plan.TransitState): flow
+times the drop from the supply clamp to the loop's return probe, counted while the zone's call
+has water flowing and both probes have reported lately.
+
 Signals: a thermostat setpoint, mode or preset change is attributed from the service calls the
 app sees on the thermostats; the four nudge buttons and the helpers the owner owns are read from
 raw state-change events, which carry the context that names the human. A resident's nudge moves
@@ -34,19 +39,23 @@ autumn or stop it in the spring, never a change of the season switch.
 Outputs:
   - sensor.heating_zone_<zone>: the zone's comfort target as state; mode, aim (setpoint_now),
     whether it calls and since when, when the lockout ends at the latest, nudge, last signal, day
-    timeline, budget and reasons as attributes.
+    timeline, budget and reasons as attributes, and for a zone with a transit block the loops'
+    power, the heat in transit and the coast it gives.
   - sensor.heating_controller: live, shadow or off_season, with forecast and outdoor status, the
     active alerts and the latest season advice.
   - <log_dir>/decisions-YYYY-MM.jsonl, append only. Line types: forecast (every fetch),
     decision (per zone when anything changed, at least every 30 minutes), bedroom (each closed
     evening of the bedroom loop), signal (each classified change), alert (each start,
     suppressed start and clear), season_advice (each judgement that advises something, pushed
-    or not), write (send and read-back result), daily (per zone and for the house, once a day).
+    or not), write (send and read-back result), daily (per zone and for the house, once a day),
+    call_stop (each stop of a zone with a transit block, with the readings behind its coast) and
+    call_start (the same zones, 15 minutes into each call).
   - state_file: nudges, call and window state (so a restart keeps a call and a lockout going),
-    bucket state, day timeline and statistics, the bedroom loop, the last signals, the alert
-    episodes and the season advisor's morning means and asks, held-off and season-off flags,
-    write counts and failures. Pending writes and desired stability are not saved. A missing or
-    corrupt file falls back to the yaml defaults; keys it no longer reads are ignored.
+    the heat in transit, bucket state, day timeline and statistics, the bedroom loop, the last
+    signals, the alert episodes and the season advisor's morning means and asks, held-off and
+    season-off flags, write counts and failures. Pending writes and desired stability are not
+    saved. A missing or corrupt file falls back to the yaml defaults; keys it no longer reads are
+    ignored.
 
 Reading policy: AppDaemon 4.5.13 can serve a stale get_state value while still firing the
 state callback, so every read takes the fresher of the last callback value and the store. An
@@ -90,6 +99,8 @@ MAX_TICK_GAP_S = 900.0
 FLOOR_FRESH_MIN = 60.0
 FLOOR_CAP_FRESH_MIN = 1440.0
 OUTDOOR_FRESH_MIN = 20.0
+PROBE_FRESH_MIN = 15.0
+CALL_START_LOG_S = 900.0
 DAILY_KEEP = 60
 NOTIFIED_KEEP_S = 3 * 86400.0
 SIGNALS_KEEP = 50
@@ -115,6 +126,10 @@ def _signed(value: float, places: int = 1) -> str:
 
 def _text(value: Optional[float], places: int = 1) -> Optional[str]:
     return None if value is None else f"{value:.{places}f}"
+
+
+def _rounded(value: Optional[float], places: int = 2) -> Optional[float]:
+    return None if value is None else round(value, places)
 
 
 def _publishable(value):
@@ -158,6 +173,7 @@ class ZoneRuntime:
         self.last_planned = _num(saved.get("last_planned"))
         self.tracker = hp.WindowTracker(cfg.window, _dict(saved.get("window")))
         self.call = hp.CallState(saved.get("call"))
+        self.transit = hp.TransitState(saved.get("transit")) if zc.transit else None
         self.bucket = hp.TokenBucket(cfg.writes_per_hour, _dict(saved.get("bucket")))
         self.blocks = hp.BlockLog(_dict(saved.get("blocks")))
         self.days = {
@@ -198,6 +214,8 @@ class ZoneRuntime:
         self.pending_write: Optional[sig.OwnWrite] = None
         self.allowed = False
         self.call_reason: Optional[str] = None
+        self.transit_view: Optional[dict] = None
+        self.start_probe: Optional[dict] = None
         self.drive: Optional[float] = None
         self.held_off = saved.get("held_off") is True
         self.season_off_pending = saved.get("season_off_pending") is True
@@ -229,6 +247,8 @@ class ZoneRuntime:
         }
         if self.comfort is not None:
             data["comfort"] = self.comfort.snapshot()
+        if self.transit is not None:
+            data["transit"] = self.transit.snapshot()
         return data
 
 
@@ -971,6 +991,13 @@ class HeatingController(hass.Hass):
             "forecast_ok": forecast_ok,
             "bedroom": bedroom,
             "party": party,
+            "outdoor": outdoor[0],
+            "pump_w": relay_w,
+            "transit_supply": self._clamp_temp(cfg.supply_temp_entity, now_ts),
+            "flowing": {
+                zone: hp.loops_flowing(rt.call, relay_w, now_ts)
+                for zone, rt in self._zones.items()
+            },
             "zones": {},
             "obs": [],
         }
@@ -993,12 +1020,18 @@ class HeatingController(hass.Hass):
         self._prune_notified(now_ts)
         self._save_state()
 
-    def _clamp_temp(self, entity: str) -> Optional[float]:
+    def _clamp_temp(self, entity: str, now_ts: Optional[float] = None) -> Optional[float]:
         """A pipe clamp reading. It runs far above the 5-35 C a room can read, so it does not
-        go through the reading guard. Empty while no clamp is configured."""
-        if not entity:
+        go through the reading guard. Empty while no clamp is configured. Given `now_ts`, a
+        reading that has not reported within PROBE_FRESH_MIN is no reading."""
+        snap = self._snap(entity)
+        if snap is None:
             return None
-        value = _num(self._state_of(entity))
+        if now_ts is not None:
+            reported = snap["ts"]
+            if reported is None or now_ts - reported > PROBE_FRESH_MIN * 60.0:
+                return None
+        value = _num(snap["state"])
         return value if value is not None and -20.0 <= value <= 120.0 else None
 
     @staticmethod
@@ -1290,13 +1323,17 @@ class HeatingController(hass.Hass):
         limits = self._write_limits(rt)
         rt.allowed = plan.allowed and plan.mode != hp.MODE_OFF_SEASON and not rt.held_off
         settling = now_ts < self._settle_until
+        rt.transit_view = self._transit_step(zone, rt, ctx)
+        self._log_call_start(zone, rt, ctx, reading)
         if settling:
             on, rt.call_reason = rt.call.on, hp.CALL_SETTLING
         else:
+            coast = rt.transit_view["coast_c"] if rt.transit_view else 0.0
             on, rt.call_reason = hp.decide_call(
-                cfg.call, rt.call, plan.aim, reading["air"], rt.allowed, now_ts
+                cfg.call, rt.call, plan.aim, reading["air"], rt.allowed, now_ts, coast
             )
         high = hp.high_limit(cfg.call, plan.aim, limits[1] if limits else upper)
+        started_ts = rt.call.since
         if rt.call.apply(on, now_ts, high):
             priority = "call"
             self.log(
@@ -1304,6 +1341,7 @@ class HeatingController(hass.Hass):
                 f"air {_text(reading['air']) or 'n/a'}, aim {plan.aim:.1f}",
                 level="INFO",
             )
+            self._transit_call_change(zone, rt, ctx, plan, reading, on, started_ts)
         rt.drive = None if limits is None else hp.drive_setpoint(
             rt.call, plan.aim, rt.allowed and reading["air"] is None, *limits
         )
@@ -1671,6 +1709,117 @@ class HeatingController(hass.Hass):
             "ratio": r(b.ratio),
             "skipped_h": r(b.skipped_h),
         }
+
+    # ---------------------------------------------------------------- heat in transit
+
+    def _transit_step(self, zone: str, rt: ZoneRuntime, ctx: dict) -> Optional[dict]:
+        """Carry the zone's heat in transit on to now. Returns what it rests on, for the call
+        decision, the zone sensor and the log; None for a zone without a transit block."""
+        tc = rt.zc.transit
+        if tc is None:
+            return None
+        now_ts, supply, flowing = ctx["now_ts"], ctx["transit_supply"], ctx["flowing"][zone]
+        loops = []
+        for loop in tc.loops:
+            returned = self._clamp_temp(loop.entity, now_ts)
+            loops.append(
+                {
+                    "loop": loop.name,
+                    "return": returned,
+                    "delta": None if supply is None or returned is None else supply - returned,
+                    "lpm": loop.lpm,
+                    "w": hp.loop_power_w(loop, supply, returned) if flowing else 0.0,
+                }
+            )
+            if flowing and returned is not None and rt.start_probe is not None:
+                low = rt.start_probe[loop.name]
+                rt.start_probe[loop.name] = returned if low is None else min(low, returned)
+        power_w = sum(loop["w"] for loop in loops)
+        rt.transit.advance(tc, power_w, now_ts)
+        return {
+            "supply": supply,
+            "loops": loops,
+            "power_w": power_w,
+            "q_kwh": rt.transit.q_kwh,
+            "coast_c": rt.transit.coast_c(tc),
+        }
+
+    def _transit_call_change(
+        self, zone: str, rt: ZoneRuntime, ctx: dict, plan, reading: dict, on: bool, started_ts
+    ) -> None:
+        """Open the start log of a call that just began, or write the stop log of one that ended
+        (`started_ts` is when that call began)."""
+        tc = rt.zc.transit
+        if tc is None:
+            return
+        rt.start_probe = {loop.name: None for loop in tc.loops} if on else None
+        if not on:
+            self._log_call_stop(zone, rt, ctx, plan, reading, started_ts)
+
+    def _log_call_start(self, zone: str, rt: ZoneRuntime, ctx: dict, reading: dict) -> None:
+        """The lowest return each loop showed while water flowed, written once the call is
+        CALL_START_LOG_S old. A call this run did not see begin is not logged."""
+        view, since, now_ts, tz = rt.transit_view, rt.call.since, ctx["now_ts"], ctx["tz"]
+        if view is None or rt.start_probe is None or not rt.call.on or since is None:
+            return
+        if now_ts - since < CALL_START_LOG_S:
+            return
+        low_returns, rt.start_probe = rt.start_probe, None
+        self._append_log(
+            ctx["now"],
+            {
+                "type": "call_start",
+                "ts": self._iso(now_ts, tz),
+                "zone": zone,
+                "call_start": self._iso(since, tz),
+                "low_returns": {name: _rounded(low) for name, low in low_returns.items()},
+                "power_w": _rounded(view["power_w"], 1),
+                "air": _rounded(reading["air"]),
+                "floor": reading["floor_temp"],
+                "q_kwh": _rounded(view["q_kwh"], 4),
+            },
+        )
+
+    def _log_call_stop(
+        self, zone: str, rt: ZoneRuntime, ctx: dict, plan, reading: dict, started_ts
+    ) -> None:
+        view, tc, now_ts, tz = rt.transit_view, rt.zc.transit, ctx["now_ts"], ctx["tz"]
+        self._append_log(
+            ctx["now"],
+            {
+                "type": "call_stop",
+                "ts": self._iso(now_ts, tz),
+                "zone": zone,
+                "reason": rt.call_reason,
+                "call_start": None if started_ts is None else self._iso(started_ts, tz),
+                "minutes_on": (
+                    None if started_ts is None else round((now_ts - started_ts) / 60.0, 1)
+                ),
+                "aim": plan.aim,
+                "air": _rounded(reading["air"]),
+                "floor": reading["floor_temp"],
+                "outdoor": _rounded(ctx["outdoor"], 1),
+                "pump_w": ctx["pump_w"],
+                "supply": _rounded(view["supply"]),
+                "common_return": _rounded(self._clamp_temp(self.cfg.return_temp_entity)),
+                "loops": [
+                    {
+                        "loop": loop["loop"],
+                        "return": _rounded(loop["return"]),
+                        "delta": _rounded(loop["delta"]),
+                        "lpm": loop["lpm"],
+                        "w": _rounded(loop["w"], 1),
+                    }
+                    for loop in view["loops"]
+                ],
+                "power_w": _rounded(view["power_w"], 1),
+                "q_kwh": _rounded(view["q_kwh"], 4),
+                "coast_c": _rounded(view["coast_c"], 3),
+                "k_per_kwh": tc.k_per_kwh,
+                "tau_minutes": tc.tau_minutes,
+                "flowing_zones": [name for name, flowing in ctx["flowing"].items() if flowing],
+            },
+        )
 
     # ---------------------------------------------------------------- party notices
 
@@ -2161,6 +2310,10 @@ class HeatingController(hass.Hass):
             "stale_inputs": reading["stale"],
             "yesterday": rt.yesterday,
         }
+        if rt.transit_view is not None:
+            attrs["transit_power_w"] = _text(rt.transit_view["power_w"], 0)
+            attrs["transit_q_kwh"] = _text(rt.transit_view["q_kwh"], 3)
+            attrs["coast_c"] = _text(rt.transit_view["coast_c"], 2)
         if rt.last_signal:
             sg = rt.last_signal
             attrs["last_signal"] = {

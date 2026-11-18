@@ -2,8 +2,9 @@
 # decision log, forecast handling, the plan end to end, the nudge buttons, helper and thermostat
 # signals, the alerts, the season advice and the state file. Same __new__ + monkeypatched-callables
 # harness as test_salus_health.py, with a small fake Home Assistant behind get_state. The planning
-# rules are tested in test_heating_plan.py, the signal rules in test_heating_signals.py, the
-# alert rules in test_heating_alerts.py and the season rules in test_heating_season.py.
+# rules, the heat in transit included, are tested in test_heating_plan.py, the signal rules in
+# test_heating_signals.py, the alert rules in test_heating_alerts.py and the season rules in
+# test_heating_season.py.
 # Run from repo root: python3 -m unittest discover -s apps/climate/tests -q
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import ast
 import copy
 import dataclasses
 import json
+import math
 import re
 import shutil
 import sys
@@ -93,6 +95,9 @@ KRISTINE_ID = "5bee78148825439488b70f92565e6c26"
 STRANGER_ID = "44444444444444444444444444444444"
 AGENT_ID = "f3cc2e6da7c849aba3f366f044725316"
 PRESS_TIME = "2026-10-01T10:00:00+00:00"
+SUPPLY_PROBE = "sensor.heating_room_floor_heating_supply"
+COMMON_RETURN_PROBE = "sensor.heating_room_floor_heating_return"
+PUMP_POWER = "sensor.floor_heating_relay_power"
 
 
 def zones_with_family_night_offset() -> dict:
@@ -103,6 +108,14 @@ def zones_with_family_night_offset() -> dict:
         "lead_hours": 4,
         "periods": [{"from": "23:00", "to": "10:00", "offset": -0.5}],
     }
+    return zones
+
+
+def zones_without_family_transit() -> dict:
+    zones = copy.deepcopy(
+        yaml.safe_load((APPS / "heating_controller.yaml").read_text())["HeatingController"]["zones"]
+    )
+    del zones["family"]["transit"]
     return zones
 
 
@@ -597,6 +610,32 @@ class ShippedYaml(unittest.TestCase):
         self.assertEqual(cfg.writes_per_hour, 4)
         self.assertEqual(cfg.write_stable_minutes, 10)
         self.assertEqual(cfg.window, hp.WindowConfig(2.0, 60.0, 0.3, 10.0, 1.0, 4.0))
+
+    def test_every_zone_ships_the_loops_its_call_is_stopped_on(self):
+        def probe(loop):
+            return f"sensor.heating_room_{loop}_return"
+
+        shipped = {
+            n: (
+                [(loop.name, loop.entity, loop.lpm) for loop in zc.transit.loops],
+                zc.transit.tau_minutes,
+                zc.transit.k_per_kwh,
+            )
+            for n, zc in self.cfg.zones.items()
+        }
+        family = [("zone_1", probe("zone_1"), 2.0), ("zone_4", probe("zone_4"), 2.0)]
+        self.assertEqual(
+            shipped,
+            {
+                "family": (family, 40.0, 0.2),
+                "kristines_room": ([("zone_2", probe("zone_2"), 1.2)], 25.0, 1.2),
+                "claudias_room": ([("zone_3", probe("zone_3"), 0.95)], 25.0, 1.4),
+                "bathroom": ([("zone_7", probe("zone_7"), 1.2)], 20.0, 2.7),
+                "guest_bathroom": ([("zone_6", probe("zone_6"), 0.35)], 20.0, 3.2),
+            },
+        )
+        self.assertEqual(self.cfg.supply_temp_entity, SUPPLY_PROBE)
+        self.assertEqual(self.cfg.relay_power_entity, PUMP_POWER)
 
     def test_no_zone_ships_the_settings_of_the_model_that_was_replaced(self):
         for name, raw in self.args["zones"].items():
@@ -1712,6 +1751,336 @@ class CallEndToEnd(LiveZones, unittest.TestCase):
         for first in times:
             in_the_hour = [t for t in times if first <= t < first + timedelta(hours=1)]
             self.assertLessEqual(len(in_the_hour), 4, first)
+
+
+def loop_probe(loop):
+    return f"sensor.heating_room_{loop}_return"
+
+
+class HeatInTransitEndToEnd(LiveZones, unittest.TestCase):
+    """The family zone calls from 12:00. With 36.0 on the supply and 33.0 on both family returns,
+    each of its two loops gives off 2.0 L/min x 69.8 x 3.0 K, and the pump draws 25 W."""
+
+    LOOP_W = 2.0 * 69.8 * 3.0
+    FAMILY_W = 2 * LOOP_W
+    STEP_KWH = FAMILY_W * 300 / 3.6e6
+    DECAY = math.exp(-300 / (40 * 60))
+
+    @staticmethod
+    def water(h, supply=36.0, pump=25.0, common=31.4, **returns):
+        """The pipe probes, the pump and the outdoor sensor as they read now."""
+        h.ha.set(SUPPLY_PROBE, str(supply))
+        h.ha.set(COMMON_RETURN_PROBE, str(common))
+        h.ha.set(PUMP_POWER, str(pump))
+        h.ha.set("sensor.gw2000a_outdoor_temperature", "11.3")
+        for loop, value in {"zone_1": 33.0, "zone_4": 33.0, **returns}.items():
+            h.ha.set(loop_probe(loop), str(value))
+
+    def calling(self, air=21.56, harness=None):
+        """The family zone, called at 12:00 from cold air that then reads `air`."""
+        h = harness or self.live("family")
+        self.air(h, 20.5)
+        h.tick()
+        h.echo()
+        self.air(h, air)
+        return h
+
+    def kwh_after(self, steps):
+        q_kwh = 0.0
+        for _ in range(steps):
+            q_kwh = q_kwh * self.DECAY + self.STEP_KWH
+        return q_kwh
+
+    def run_ticks(self, h, count, **water):
+        for _ in range(count):
+            self.water(h, **water)
+            h.tick(minutes=5)
+
+    def stopped(self):
+        """The family zone at 12:20, the tick its call stops on the coast."""
+        h = self.calling()
+        self.run_ticks(h, 4)
+        return h
+
+    def test_the_heat_in_transit_builds_up_while_water_flows(self):
+        h = self.calling(21.5)
+        rt = h.app._zones["family"]
+        self.assertEqual(rt.transit.q_kwh, 0.0)
+        for steps in (1, 2, 3):
+            self.run_ticks(h, 1)
+            self.assertAlmostEqual(rt.transit.q_kwh, self.kwh_after(steps))
+        a = h.attrs("family")
+        self.assertEqual(a["transit_power_w"], f"{self.FAMILY_W:.0f}")
+        self.assertEqual(a["transit_q_kwh"], f"{self.kwh_after(3):.3f}")
+        self.assertEqual(a["coast_c"], f"{0.2 * self.kwh_after(3):.2f}")
+
+    def test_a_call_stops_on_the_coast_where_the_plain_rule_would_run_on(self):
+        h = self.calling()
+        for _ in range(3):
+            self.run_ticks(h, 1)
+            self.assertEqual(h.attrs("family")["call"], "true")
+        self.run_ticks(h, 1)
+        a = h.attrs("family")
+        self.assertEqual(h.clock.now, NOW + timedelta(minutes=20))
+        self.assertEqual((a["call"], a["call_since"]), ("false", self.iso(12, 20)))
+        self.assertEqual(h.app._zones["family"].call_reason, "stop")
+        self.assertEqual(self.sent(h), [23.5, 5.0])
+
+    def test_the_same_air_keeps_a_call_running_when_no_water_flows(self):
+        h = self.calling()
+        for _ in range(8):
+            self.run_ticks(h, 1, pump=1.6)
+            self.assertEqual(h.attrs("family")["call"], "true")
+        self.assertEqual(h.app._zones["family"].transit.q_kwh, 0.0)
+        self.assertEqual(h.attrs("family")["coast_c"], "0.00")
+        self.air(h, 21.75)
+        self.run_ticks(h, 1, pump=1.6)
+        self.assertEqual(h.attrs("family")["call"], "false")
+
+    def test_a_call_that_is_not_yet_at_the_aim_runs_on_with_a_coast(self):
+        h = self.calling(21.2)
+        for _ in range(8):
+            self.run_ticks(h, 1)
+            self.assertEqual(h.attrs("family")["call"], "true")
+
+    def test_a_stop_is_logged_with_the_readings_behind_the_coast(self):
+        h = self.stopped()
+        (line,) = h.log_lines("call_stop")
+        q_kwh = self.kwh_after(4)
+        self.assertEqual(
+            set(line),
+            {
+                "type", "ts", "zone", "reason", "call_start", "minutes_on", "aim", "air", "floor",
+                "outdoor", "pump_w", "supply", "common_return", "loops", "power_w", "q_kwh",
+                "coast_c", "k_per_kwh", "tau_minutes", "flowing_zones",
+            },
+        )
+        self.assertEqual(line["ts"], "2026-10-17T12:20:00+02:00")
+        self.assertEqual(
+            (line["type"], line["zone"], line["reason"]), ("call_stop", "family", "stop")
+        )
+        self.assertEqual((line["call_start"], line["minutes_on"]), (self.iso(12), 20.0))
+        self.assertEqual(
+            (line["aim"], line["air"], line["floor"], line["outdoor"]), (21.5, 21.56, 21.0, 11.3)
+        )
+        self.assertEqual(
+            (line["pump_w"], line["supply"], line["common_return"]), (25.0, 36.0, 31.4)
+        )
+        self.assertEqual(
+            line["loops"],
+            [
+                {"loop": "zone_1", "return": 33.0, "delta": 3.0, "lpm": 2.0, "w": 418.8},
+                {"loop": "zone_4", "return": 33.0, "delta": 3.0, "lpm": 2.0, "w": 418.8},
+            ],
+        )
+        self.assertEqual(line["power_w"], 837.6)
+        self.assertAlmostEqual(line["q_kwh"], q_kwh, places=4)
+        self.assertAlmostEqual(line["coast_c"], 0.2 * q_kwh, places=3)
+        self.assertEqual((line["k_per_kwh"], line["tau_minutes"]), (0.2, 40.0))
+        self.assertEqual(line["flowing_zones"], ["family"])
+
+    def test_a_call_that_goes_on_logs_no_stop(self):
+        h = self.calling(21.2)
+        self.run_ticks(h, 6)
+        self.assertEqual(h.log_lines("call_stop"), [])
+
+    def test_a_stop_names_every_zone_that_had_water_flowing(self):
+        h = self.live("family", "claudias_room")
+        self.air(h, 20.5)
+        self.air(h, 20.5, "claudias_room")
+        h.tick()
+        for index in range(len(h.calls)):
+            h.echo(index)
+        self.air(h, 21.56)
+        self.run_ticks(h, 4, zone_3=32.0)
+        (line,) = h.log_lines("call_stop")
+        self.assertEqual(line["zone"], "family")
+        self.assertEqual(line["flowing_zones"], ["family", "claudias_room"])
+        self.assertEqual(h.attrs("claudias_room")["call"], "true")
+
+    def test_fifteen_minutes_into_a_call_the_lowest_returns_are_logged_once(self):
+        h = self.calling(21.4)
+        q_kwh = 0.0
+        for first, fourth in [(33.5, 34.0), (31.0, 33.5), (32.0, 33.0)]:
+            self.assertEqual(h.log_lines("call_start"), [])
+            self.run_ticks(h, 1, zone_1=first, zone_4=fourth)
+            watts = 2.0 * 69.8 * (36.0 - first) + 2.0 * 69.8 * (36.0 - fourth)
+            q_kwh = q_kwh * self.DECAY + watts * 300 / 3.6e6
+        (line,) = h.log_lines("call_start")
+        self.assertEqual(
+            (line["type"], line["ts"], line["zone"], line["call_start"]),
+            ("call_start", "2026-10-17T12:15:00+02:00", "family", self.iso(12)),
+        )
+        self.assertEqual(line["low_returns"], {"zone_1": 31.0, "zone_4": 33.0})
+        self.assertEqual((line["air"], line["floor"]), (21.4, 21.0))
+        self.assertAlmostEqual(line["power_w"], watts, places=1)
+        self.assertAlmostEqual(line["q_kwh"], q_kwh, places=4)
+        self.assertEqual(
+            set(line),
+            {"type", "ts", "zone", "call_start", "low_returns", "power_w", "air", "floor", "q_kwh"},
+        )
+        self.run_ticks(h, 4)
+        self.assertEqual(len(h.log_lines("call_start")), 1)
+
+    def test_a_loop_that_never_flowed_has_no_lowest_return(self):
+        h = self.calling(21.4)
+        self.run_ticks(h, 3, zone_4="unavailable")
+        (line,) = h.log_lines("call_start")
+        self.assertEqual(line["low_returns"], {"zone_1": 33.0, "zone_4": None})
+
+    def test_a_call_that_ends_early_logs_its_stop_and_no_start(self):
+        h = self.calling(21.4)
+        self.run_ticks(h, 1)
+        h.ha.set(FAMILY_DOOR, "on")
+        h.tick(minutes=1)
+        h.tick(minutes=2)
+        (line,) = h.log_lines("call_stop")
+        self.assertEqual((line["reason"], line["minutes_on"]), ("not_allowed", 8.0))
+        self.assertEqual(line["flowing_zones"], ["family"])
+        self.run_ticks(h, 6)
+        self.assertEqual(h.log_lines("call_start"), [])
+
+    def test_a_call_the_controller_did_not_see_begin_is_not_logged_as_a_start(self):
+        h = self.calling(21.4)
+        self.run_ticks(h, 1)
+        restarted = h.restart()
+        self.run_ticks(restarted, 4)
+        self.assertEqual(restarted.attrs("family")["call"], "true")
+        self.assertEqual(restarted.log_lines("call_start"), [])
+
+    def test_nothing_is_counted_before_the_actuators_have_opened(self):
+        h = self.calling(21.5)
+        rt = h.app._zones["family"]
+        self.water(h)
+        h.tick(minutes=2)
+        self.assertEqual(rt.transit.q_kwh, 0.0)
+        self.assertEqual(h.attrs("family")["transit_power_w"], "0")
+        h.tick(minutes=1)
+        self.assertAlmostEqual(rt.transit.q_kwh, self.FAMILY_W * 60 / 3.6e6)
+
+    def test_nothing_is_counted_while_the_pump_is_at_rest(self):
+        for pump, counted in ((1.6, False), (15.0, False), (15.1, True)):
+            with self.subTest(pump=pump):
+                h = self.calling(21.5)
+                self.run_ticks(h, 1, pump=pump)
+                self.assertEqual(h.app._zones["family"].transit.q_kwh > 0, counted)
+
+    def test_a_pump_that_cannot_be_read_counts_nothing(self):
+        h = self.calling(21.5)
+        self.water(h)
+        h.ha.set(PUMP_POWER, "unavailable")
+        h.tick(minutes=5)
+        self.assertEqual(h.app._zones["family"].transit.q_kwh, 0.0)
+
+    def test_a_probe_counts_while_it_reported_within_fifteen_minutes(self):
+        h = self.calling(21.5)
+        rt = h.app._zones["family"]
+        self.water(h)
+        h.ha.set(loop_probe("zone_4"), "33.0", updated=h.clock.now - timedelta(minutes=10))
+        h.tick(minutes=5)
+        self.assertAlmostEqual(rt.transit.q_kwh, self.STEP_KWH)
+        before = rt.transit.q_kwh
+        self.water(h)
+        quiet = h.clock.now - timedelta(minutes=10, seconds=1)
+        h.ha.set(loop_probe("zone_4"), "33.0", updated=quiet)
+        h.tick(minutes=5)
+        self.assertAlmostEqual(rt.transit.q_kwh, before * self.DECAY + self.LOOP_W * 300 / 3.6e6)
+
+    def test_a_supply_that_has_gone_quiet_counts_nothing(self):
+        h = self.calling(21.5)
+        self.water(h)
+        h.ha.set(SUPPLY_PROBE, "36.0", updated=h.clock.now - timedelta(minutes=11))
+        h.tick(minutes=5)
+        self.assertEqual(h.app._zones["family"].transit.q_kwh, 0.0)
+
+    def test_a_probe_that_reads_nonsense_leaves_its_loop_out(self):
+        for reading in ("unavailable", "unknown", "150.0", "-30.0", "n/a", "36.5"):
+            with self.subTest(reading=reading):
+                h = self.calling(21.5)
+                self.run_ticks(h, 1, zone_4=reading)
+                rt = h.app._zones["family"]
+                self.assertAlmostEqual(rt.transit.q_kwh, self.LOOP_W * 300 / 3.6e6)
+
+    def test_the_heat_leaves_once_the_call_has_stopped(self):
+        h = self.stopped()
+        rt = h.app._zones["family"]
+        before = rt.transit.q_kwh
+        self.run_ticks(h, 1)
+        self.assertEqual(h.attrs("family")["call"], "false")
+        self.assertAlmostEqual(rt.transit.q_kwh, before * self.DECAY)
+        self.assertEqual(h.attrs("family")["transit_power_w"], "0")
+
+    def test_a_restart_keeps_the_heat_in_transit(self):
+        h = self.calling(21.5)
+        self.run_ticks(h, 3)
+        rt = h.app._zones["family"]
+        saved = json.loads((h.tmp / "state.json").read_text())["zones"]["family"]["transit"]
+        self.assertEqual(saved, {"q_kwh": rt.transit.q_kwh, "ts": h.clock.now.timestamp()})
+        restarted = h.restart()
+        again = restarted.app._zones["family"].transit
+        self.assertEqual((again.q_kwh, again.ts), (rt.transit.q_kwh, h.clock.now.timestamp()))
+        self.run_ticks(restarted, 1)
+        self.assertAlmostEqual(again.q_kwh, self.kwh_after(4))
+
+    def test_a_lost_state_starts_with_no_heat_in_transit(self):
+        h = Harness(self, forecast=False)
+        for rt in h.app._zones.values():
+            self.assertEqual((rt.transit.q_kwh, rt.transit.ts), (0.0, None), rt.zc.name)
+        for junk in (
+            '{"zones": {"family": {"transit": "x"}}}',
+            '{"zones": {"family": {"transit": {"q_kwh": "x"}}}}',
+        ):
+            tmp = Path(tempfile.mkdtemp())
+            self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+            args = shipped_args(tmp)
+            Path(args["state_file"]).write_text(junk)
+            h = Harness(self, args=args, forecast=False)
+            h.tick()
+            self.assertEqual(h.app._zones["family"].transit.q_kwh, 0.0, junk)
+            self.assertEqual(h.warnings(), [], junk)
+
+    def test_the_coast_is_never_more_than_half_a_degree(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        args = shipped_args(tmp)
+        saved = {"zones": {"family": {"transit": {"q_kwh": 10.0, "ts": NOW.timestamp()}}}}
+        Path(args["state_file"]).write_text(json.dumps(saved))
+        h = Harness(self, args=args, forecast=False)
+        h.tick()
+        a = h.attrs("family")
+        self.assertEqual((a["transit_q_kwh"], a["coast_c"]), ("10.000", "0.50"))
+
+    def test_the_zone_sensor_publishes_the_heat_in_transit_as_text(self):
+        h = self.calling(21.5)
+        self.run_ticks(h, 1)
+        for published in h.published:
+            assert_publishable(self, published["attributes"])
+        for zone in ZONES:
+            for key in ("transit_power_w", "transit_q_kwh", "coast_c"):
+                self.assertIsInstance(h.attrs(zone)[key], str, (zone, key))
+        quiet = h.attrs("bathroom")
+        self.assertEqual(
+            (quiet["transit_power_w"], quiet["transit_q_kwh"], quiet["coast_c"]),
+            ("0", "0.000", "0.00"),
+        )
+
+    def test_a_zone_without_a_transit_block_keeps_the_plain_rule(self):
+        h = Harness(self, live_zones=["family"], zones=zones_without_family_transit())
+        h.ha.set(h.app.cfg.live_switch_entity, "on")
+        h.season()
+        self.calling(harness=h)
+        self.run_ticks(h, 8)
+        a = h.attrs("family")
+        self.assertEqual(a["call"], "true")
+        for key in ("transit_power_w", "transit_q_kwh", "coast_c"):
+            self.assertNotIn(key, a)
+        self.assertIsNone(h.app._zones["family"].transit)
+        saved = json.loads((h.tmp / "state.json").read_text())["zones"]["family"]
+        self.assertNotIn("transit", saved)
+        self.air(h, 21.75)
+        self.run_ticks(h, 1)
+        self.assertEqual(h.attrs("family")["call"], "false")
+        self.assertEqual((h.log_lines("call_stop"), h.log_lines("call_start")), ([], []))
 
 
 KRISTINE_WINDOW = "binary_sensor.kristines_room_window_contact"

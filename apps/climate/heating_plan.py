@@ -11,7 +11,8 @@ thermostats as relays. This module holds the three layers:
     floor cap each make heat not allowed.
   - CALL: decide_call starts and stops the zone's call from the control air against the aim,
     with a hysteresis, a minimum on and off time, and starts batched into the first minutes of
-    each half hour so the zones call together.
+    each half hour so the zones call together. A zone with a transit block stops earlier by the
+    heat its loops already hold in the floor (TransitState).
   - DRIVE: what the thermostat is set to. Not calling it sits at the device minimum; a call
     sets it to a high setpoint, fixed for the whole call, so the unit heats until the call ends;
     with no room air to go by the aim itself goes out as an ordinary setpoint and the unit
@@ -194,6 +195,26 @@ class NudgeConfig:
 
 
 @dataclass(frozen=True)
+class TransitLoop:
+    """One floor loop of a zone: its name on the manifold, the probe on its return pipe and the
+    flow through it in L/min."""
+
+    name: str
+    entity: str
+    lpm: float
+
+
+@dataclass(frozen=True)
+class TransitConfig:
+    """What the zone's call is stopped on, see TransitState: the loops it heats through, the
+    minutes the heat in them takes to leave the floor and the degrees of air each kWh of it adds."""
+
+    loops: tuple
+    tau_minutes: float
+    k_per_kwh: float
+
+
+@dataclass(frozen=True)
 class ZoneConfig:
     name: str
     thermostat: str
@@ -216,6 +237,7 @@ class ZoneConfig:
     evenness_floors: tuple = ()  # (reference, compared): the alert watches compared minus reference
     floor_max_c: Optional[float] = None  # holds against the warmest of the floor_sensors
     control_air_weights: tuple = ()  # one per control_air sensor; empty weighs them equally
+    transit: Optional[TransitConfig] = None
 
 
 @dataclass(frozen=True)
@@ -460,6 +482,38 @@ def _parse_control_air_weights(raw, control_air: tuple, where: str) -> tuple:
     return tuple(weights)
 
 
+def _positive(value, name: str, where: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ConfigError(f"{where}: {name} must be a positive number")
+    return float(value)
+
+
+def _parse_transit(raw, where: str) -> Optional[TransitConfig]:
+    """Loops are named after their manifold zone ('zone_1') and read from the probe
+    sensor.heating_room_<name>_return."""
+    if not raw:
+        return None
+    loops_raw = raw.get("loops")
+    if not isinstance(loops_raw, dict) or not loops_raw:
+        raise ConfigError(f"{where}: transit needs loops, mapping each loop name to its L/min")
+    loops = []
+    for name, lpm in loops_raw.items():
+        if not isinstance(name, str) or not name:
+            raise ConfigError(f"{where}: transit loop names must be text")
+        flow = _positive(lpm, f"transit loop {name}", where)
+        loops.append(TransitLoop(name, f"sensor.heating_room_{name}_return", flow))
+    return TransitConfig(
+        loops=tuple(loops),
+        tau_minutes=_positive(raw.get("tau_minutes"), "transit tau_minutes", where),
+        k_per_kwh=_positive(raw.get("k_per_kwh"), "transit k_per_kwh", where),
+    )
+
+
 def _parse_bedroom(raw: dict) -> BedroomConfig:
     cfg = BedroomConfig(
         air_entity=raw.get("air_entity", "sensor.bedroom_feel"),
@@ -537,6 +591,7 @@ def _parse_zone(name: str, raw: dict) -> ZoneConfig:
         control_air_weights=_parse_control_air_weights(
             raw.get("control_air_weights"), control_air, where
         ),
+        transit=_parse_transit(raw.get("transit"), where),
     )
 
 
@@ -693,6 +748,10 @@ def parse_config(args: dict) -> Config:
     for zc in zones.values():
         if zc.guard.enabled and not bedroom.get("ceiling_entity"):
             raise ConfigError(f"zone {zc.name}: bedroom_guard needs bedroom.ceiling_entity")
+        if zc.transit and not (args.get("supply_temp_entity") and args.get("relay_power_entity")):
+            raise ConfigError(
+                f"zone {zc.name}: transit needs supply_temp_entity and relay_power_entity"
+            )
 
     return Config(
         season_entity=_req(args, "season_entity", "config"),
@@ -1504,6 +1563,69 @@ def render_blocks(log: BlockLog, projected: list, now_ts: float, day_end_ts: flo
     ]
 
 
+# ---------------------------------------------------------------- heat in transit
+
+WATER_W_PER_LPM_K = 69.8
+JOULES_PER_KWH = 3.6e6
+LOOP_DROP_MAX_C = 15.0
+PUMP_RUNNING_W = 15.0
+ACTUATOR_OPEN_S = 180.0
+TRANSIT_MAX_STEP_S = 900.0
+COAST_MAX_C = 0.5
+COAST_STOP_MARGIN_C = 0.1
+
+
+def loops_flowing(state: CallState, pump_w: Optional[float], now_ts: float) -> bool:
+    """Whether water runs through the zone's loops: its call has lasted long enough for the
+    actuators to open and the pump draws power."""
+    return (
+        state.on
+        and state.since is not None
+        and now_ts - state.since >= ACTUATOR_OPEN_S
+        and pump_w is not None
+        and pump_w > PUMP_RUNNING_W
+    )
+
+
+def loop_power_w(loop: TransitLoop, supply: Optional[float], returned: Optional[float]) -> float:
+    """Watts the water gives off in a loop: its flow times the drop from the supply to its
+    return. Without both readings, or with a drop of zero or less or of LOOP_DROP_MAX_C or more
+    (a probe that is off), it counts as nothing."""
+    if supply is None or returned is None:
+        return 0.0
+    drop = supply - returned
+    if not 0.0 < drop < LOOP_DROP_MAX_C:
+        return 0.0
+    return loop.lpm * WATER_W_PER_LPM_K * drop
+
+
+class TransitState:
+    """The heat in transit of one zone, in kWh: what its loops have put into the floor that has
+    not yet reached the room. It grows by the loops' power and decays with the zone's tau also
+    while no water flows. A state that is lost starts at nothing."""
+
+    def __init__(self, saved: Optional[dict] = None):
+        s = saved if isinstance(saved, dict) else {}
+        q_kwh, ts = CallState._number(s.get("q_kwh")), CallState._number(s.get("ts"))
+        self.q_kwh = q_kwh if q_kwh is not None and q_kwh > 0 else 0.0
+        self.ts = ts
+
+    def snapshot(self) -> dict:
+        return {"q_kwh": self.q_kwh, "ts": self.ts}
+
+    def advance(self, cfg: TransitConfig, power_w: float, now_ts: float) -> None:
+        """Carry the heat on to `now_ts`, the loops giving off `power_w` at that moment. A step
+        is at most TRANSIT_MAX_STEP_S long, and the first one after a lost state has no length."""
+        step_s = 0.0 if self.ts is None else min(max(now_ts - self.ts, 0.0), TRANSIT_MAX_STEP_S)
+        decay = math.exp(-step_s / (cfg.tau_minutes * 60.0))
+        self.q_kwh = self.q_kwh * decay + power_w * step_s / JOULES_PER_KWH
+        self.ts = now_ts
+
+    def coast_c(self, cfg: TransitConfig) -> float:
+        """How far the air still rises once the call stops, at most COAST_MAX_C."""
+        return min(cfg.k_per_kwh * self.q_kwh, COAST_MAX_C)
+
+
 # ---------------------------------------------------------------- call and drive
 
 CALL_NOT_ALLOWED = "not_allowed"
@@ -1560,6 +1682,7 @@ def decide_call(
     air: Optional[float],
     allowed: bool,
     now_ts: float,
+    coast: float = 0.0,
 ) -> tuple:
     """(on, reason): whether the zone calls for heat now. It does not change `state`.
 
@@ -1568,7 +1691,11 @@ def decide_call(
     each start_every_minutes slot, so zones that need heat start together. It stops when the
     air is more than hysteresis_c over the aim, but not before min_on_minutes, and at once when
     heat is no longer allowed. Without room air there is no call: the zone is driven by the aim
-    alone, see drive_setpoint."""
+    alone, see drive_setpoint.
+
+    `coast` is the degrees the heat already in the zone's loops will still add (see
+    TransitState). With any, the call stops once the air plus the coast reaches the aim plus
+    COAST_STOP_MARGIN_C instead."""
     if not allowed:
         return False, CALL_NOT_ALLOWED
     if air is None:
@@ -1576,7 +1703,11 @@ def decide_call(
     gap = round(air - aim, 3)
     held_s = math.inf if state.since is None else now_ts - state.since
     if state.on:
-        if gap <= cfg.hysteresis_c:
+        if coast > 0.0:
+            over = gap >= COAST_STOP_MARGIN_C - coast
+        else:
+            over = gap > cfg.hysteresis_c
+        if not over:
             return True, CALL_ON
         if held_s < cfg.min_on_minutes * 60.0:
             return True, CALL_MIN_ON

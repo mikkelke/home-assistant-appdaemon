@@ -156,6 +156,12 @@ HeatingController:
     lockout_per_open_hour: 1.0
     lockout_max_hours: 4
 
+  # A zone with a transit block stops its call early by the heat its loops already hold in the
+  # floor. The loops are named after their manifold zone, each with its flow in L/min, and read
+  # from sensor.heating_room_<loop>_return. While the zone's call has water flowing, a loop's
+  # flow times the drop from the supply clamp to its return is the power it puts into the floor.
+  # That power is summed into a heat in transit that leaves with tau_minutes, and each kWh of it
+  # is expected to add k_per_kwh degrees of air after the call ends.
   zones:
     family:
       thermostat: climate.family_room_thermostat
@@ -190,6 +196,7 @@ HeatingController:
       profile: {lead_hours: 4}
       budget: {a: 0.55, b_om: -1.62, c: 1.21, d: -0.04}
       sun_cut: {enabled: true, azimuth: [100, 260], ghi_min: 150, before_hours: 2, end_before_hours: 1, credit_ratio: 0.5}
+      transit: {loops: {zone_1: 2.0, zone_4: 2.0}, tau_minutes: 40, k_per_kwh: 0.2}
 
     kristines_room:
       thermostat: climate.kristines_room_thermostat
@@ -204,6 +211,7 @@ HeatingController:
       protected_min_offset_c: -0.5
       profile: {lead_hours: 4}
       budget: {changepoint: {k: 0.17, base_c: 15.5}}
+      transit: {loops: {zone_2: 1.2}, tau_minutes: 25, k_per_kwh: 1.2}
       residents: [kristine]
       nudge: {min: -1.0, max: 1.0, step: 0.5}
       buttons:
@@ -223,6 +231,7 @@ HeatingController:
       protected_min_offset_c: -0.5
       profile: {lead_hours: 6}
       budget: {changepoint: {k: 0.4, base_c: -5.0}}
+      transit: {loops: {zone_3: 0.95}, tau_minutes: 25, k_per_kwh: 1.4}
       residents: [claudia]
       nudge: {min: -1.0, max: 1.0, step: 0.5}
       buttons:
@@ -245,6 +254,7 @@ HeatingController:
         periods:
           - {from: "02:30", to: "09:00", offset: 0}
       budget: {a: 0.64, b_om: -2.47, c: 0, d: -1.24}
+      transit: {loops: {zone_7: 1.2}, tau_minutes: 20, k_per_kwh: 2.7}
 
     guest_bathroom:
       thermostat: climate.guest_bathroom_thermostat
@@ -255,3 +265,4 @@ HeatingController:
       lower_limit_c: 18.0
       upper_limit_c: 24.0
       profile: {lead_hours: 0}
+      transit: {loops: {zone_6: 0.35}, tau_minutes: 20, k_per_kwh: 3.2}

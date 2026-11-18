@@ -1,12 +1,14 @@
 # tests/test_heating_plan.py - the floor-heating controller's planning logic (heating_plan.py):
 # config parsing, comfort target and lead shift, allowed and aim by mode, budget and sun cut, party,
-# bedroom loop, window tracker and the airing lockout, the call rule and the drive setpoint, write
-# bookkeeping and daily statistics. Pure logic, so no AppDaemon harness is needed.
+# bedroom loop, window tracker and the airing lockout, the call rule with the coast of the heat in
+# transit and the drive setpoint, write bookkeeping and daily statistics. Pure logic, so no
+# AppDaemon harness is needed.
 # Run from repo root: python3 -m unittest discover -s apps/climate/tests -q
 
 from __future__ import annotations
 
 import json
+import math
 import sys
 import unittest
 from dataclasses import replace
@@ -552,6 +554,73 @@ class ConfigParsing(unittest.TestCase):
                 hp.parse_config(args)
         hp.parse_config(self.advisor(evaluate_at="06:00", look_back_days=5, idle_days=5))
         hp.parse_config(self.advisor(stop_from="03-01", stop_until="03-01", season_min_days=0))
+
+    TRANSIT = {"loops": {"zone_1": 2.0, "zone_4": 1.5}, "tau_minutes": 40, "k_per_kwh": 0.2}
+    PLANT = {"supply_temp_entity": "sensor.supply", "relay_power_entity": "sensor.relay"}
+
+    def transit_of(self, transit, **plant):
+        args = dict(self._broken(transit=transit), **(plant or self.PLANT))
+        return hp.parse_config(args).zones["family"].transit
+
+    def test_a_zone_has_no_transit_unless_the_config_gives_one(self):
+        self.assertEqual({zc.transit for zc in CFG.zones.values()}, {None})
+        for empty in (None, {}):
+            self.assertIsNone(self.transit_of(empty))
+
+    def test_a_transit_block_is_read_with_the_probe_of_each_loop(self):
+        transit = self.transit_of(self.TRANSIT)
+        self.assertEqual(
+            transit.loops,
+            (
+                hp.TransitLoop("zone_1", "sensor.heating_room_zone_1_return", 2.0),
+                hp.TransitLoop("zone_4", "sensor.heating_room_zone_4_return", 1.5),
+            ),
+        )
+        self.assertEqual((transit.tau_minutes, transit.k_per_kwh), (40.0, 0.2))
+        self.assertIsInstance(transit.tau_minutes, float)
+
+    def test_a_bad_transit_block_is_refused(self):
+        bad = [
+            {"loops": {}},
+            {"loops": None},
+            {"loops": ["zone_1"]},
+            {"loops": {"zone_1": 0}},
+            {"loops": {"zone_1": -1.0}},
+            {"loops": {"zone_1": True}},
+            {"loops": {"zone_1": "2"}},
+            {"loops": {"zone_1": float("nan")}},
+            {"loops": {"zone_1": float("inf")}},
+            {"loops": {1: 2.0}},
+            {"loops": {"": 2.0}},
+            {"tau_minutes": 0},
+            {"tau_minutes": None},
+            {"tau_minutes": float("inf")},
+            {"k_per_kwh": 0},
+            {"k_per_kwh": -0.2},
+            {"k_per_kwh": "0.2"},
+        ]
+        for change in bad:
+            with self.subTest(change=change), self.assertRaisesRegex(
+                hp.ConfigError, "zone family: transit"
+            ):
+                self.transit_of(dict(self.TRANSIT, **change))
+        for missing in ("loops", "tau_minutes", "k_per_kwh"):
+            with self.subTest(missing=missing), self.assertRaisesRegex(
+                hp.ConfigError, "zone family: transit"
+            ):
+                self.transit_of({k: v for k, v in self.TRANSIT.items() if k != missing})
+
+    def test_a_transit_block_needs_the_supply_probe_and_the_pump_power(self):
+        plants = (
+            {},
+            {"supply_temp_entity": "sensor.supply"},
+            {"relay_power_entity": "sensor.relay"},
+        )
+        for plant in plants:
+            with self.subTest(plant=plant), self.assertRaisesRegex(
+                hp.ConfigError, "transit needs supply_temp_entity and relay_power_entity"
+            ):
+                hp.parse_config(dict(self._broken(transit=self.TRANSIT), **plant))
 
     def _broken(self, **zone_change):
         zones = dict(ARGS["zones"], family=dict(FAMILY, **zone_change))
@@ -1855,6 +1924,118 @@ class AiringLockoutTests(unittest.TestCase):
         self.assertEqual(back.deadline(), tr.deadline())
 
 
+class HeatInTransit(unittest.TestCase):
+    cfg = hp.TransitConfig(
+        loops=(
+            hp.TransitLoop("zone_1", "sensor.a", 2.0),
+            hp.TransitLoop("zone_4", "sensor.b", 1.0),
+        ),
+        tau_minutes=40.0,
+        k_per_kwh=0.2,
+    )
+
+    @staticmethod
+    def calling(on=True, since=T(12)):
+        return hp.CallState({"on": on, "since": since, "high": 23.5 if on else None})
+
+    def test_water_flows_three_minutes_into_a_call_while_the_pump_runs(self):
+        state = self.calling()
+        self.assertFalse(hp.loops_flowing(state, 25.0, T(12) + 179))
+        self.assertTrue(hp.loops_flowing(state, 25.0, T(12) + 180))
+        self.assertTrue(hp.loops_flowing(state, 25.0, T(13)))
+
+    def test_water_does_not_flow_with_the_pump_at_rest_or_unread(self):
+        state = self.calling()
+        self.assertFalse(hp.loops_flowing(state, 15.0, T(12, 30)))
+        self.assertTrue(hp.loops_flowing(state, 15.1, T(12, 30)))
+        self.assertFalse(hp.loops_flowing(state, 1.6, T(12, 30)))
+        self.assertFalse(hp.loops_flowing(state, None, T(12, 30)))
+
+    def test_water_does_not_flow_for_a_zone_that_is_not_calling(self):
+        self.assertFalse(hp.loops_flowing(self.calling(on=False), 25.0, T(12, 30)))
+        self.assertFalse(hp.loops_flowing(hp.CallState(), 25.0, T(12, 30)))
+        self.assertFalse(hp.loops_flowing(hp.CallState({"on": True}), 25.0, T(12, 30)))
+
+    def test_a_loop_gives_off_its_flow_times_the_drop(self):
+        loop = self.cfg.loops[0]
+        self.assertAlmostEqual(hp.loop_power_w(loop, 36.0, 33.0), 2.0 * 69.8 * 3.0)
+        self.assertAlmostEqual(hp.loop_power_w(self.cfg.loops[1], 35.5, 33.0), 1.0 * 69.8 * 2.5)
+        self.assertGreater(hp.loop_power_w(loop, 36.0, 21.01), 0.0)
+        self.assertGreater(hp.loop_power_w(loop, 36.0, 35.99), 0.0)
+
+    def test_a_loop_with_a_reading_missing_or_off_gives_nothing(self):
+        loop = self.cfg.loops[0]
+        nan = float("nan")
+        for supply, returned in (
+            (None, 33.0), (36.0, None), (None, None), (36.0, 36.0), (36.0, 37.0), (36.0, 21.0),
+            (36.0, 20.0), (nan, 30.0), (36.0, nan),
+        ):
+            self.assertEqual(hp.loop_power_w(loop, supply, returned), 0.0, (supply, returned))
+
+    def test_the_heat_grows_by_the_power_over_the_step(self):
+        state = hp.TransitState()
+        state.advance(self.cfg, 0.0, T(12))
+        state.advance(self.cfg, 3600.0, T(12) + 600)
+        self.assertAlmostEqual(state.q_kwh, 0.6)
+        self.assertEqual(state.ts, T(12) + 600)
+
+    def test_the_heat_leaves_with_tau_also_while_nothing_flows(self):
+        state = hp.TransitState({"q_kwh": 1.0, "ts": T(12)})
+        for step in range(1, 5):
+            state.advance(self.cfg, 0.0, T(12) + step * 600)
+        self.assertAlmostEqual(state.q_kwh, math.exp(-1.0))
+
+    def test_the_heat_adds_what_the_step_brings_after_what_is_left(self):
+        state = hp.TransitState({"q_kwh": 1.0, "ts": T(12)})
+        state.advance(self.cfg, 1800.0, T(12) + 600)
+        self.assertAlmostEqual(state.q_kwh, math.exp(-600 / 2400) + 0.3)
+
+    def test_a_step_is_at_most_fifteen_minutes(self):
+        state = hp.TransitState({"q_kwh": 0.0, "ts": T(12)})
+        state.advance(self.cfg, 3600.0, T(15))
+        self.assertAlmostEqual(state.q_kwh, 0.9)
+        state = hp.TransitState({"q_kwh": 1.0, "ts": T(12)})
+        state.advance(self.cfg, 0.0, T(15))
+        self.assertAlmostEqual(state.q_kwh, math.exp(-900 / 2400))
+
+    def test_the_first_step_after_a_lost_state_has_no_length(self):
+        state = hp.TransitState()
+        state.advance(self.cfg, 5000.0, T(12))
+        self.assertEqual((state.q_kwh, state.ts), (0.0, T(12)))
+        state.advance(self.cfg, 3600.0, T(12) + 600)
+        self.assertAlmostEqual(state.q_kwh, 0.6)
+
+    def test_a_clock_that_goes_back_adds_nothing(self):
+        state = hp.TransitState({"q_kwh": 0.5, "ts": T(12)})
+        state.advance(self.cfg, 5000.0, T(12) - 300)
+        self.assertEqual((state.q_kwh, state.ts), (0.5, T(12) - 300))
+
+    def test_the_coast_is_k_per_kwh_of_the_heat_up_to_half_a_degree(self):
+        for q_kwh, expected in ((0.0, 0.0), (0.5, 0.1), (2.0, 0.4), (2.5, 0.5), (10.0, 0.5)):
+            state = hp.TransitState({"q_kwh": q_kwh, "ts": T(12)})
+            self.assertAlmostEqual(state.coast_c(self.cfg), expected, msg=q_kwh)
+        hot = hp.TransitConfig(self.cfg.loops, 20.0, 3.2)
+        self.assertEqual(hp.TransitState({"q_kwh": 0.3, "ts": T(12)}).coast_c(hot), 0.5)
+
+    def test_the_state_survives_a_json_round_trip(self):
+        state = hp.TransitState()
+        state.advance(self.cfg, 0.0, T(12))
+        state.advance(self.cfg, 2000.0, T(12) + 300)
+        again = hp.TransitState(json.loads(json.dumps(state.snapshot())))
+        self.assertEqual(again.snapshot(), state.snapshot())
+        self.assertEqual(set(state.snapshot()), {"q_kwh", "ts"})
+
+    def test_junk_in_the_saved_state_is_a_lost_state(self):
+        for junk in (
+            None, [], "x", 5, {"q_kwh": "x", "ts": "y"}, {"q_kwh": True, "ts": True},
+            {"q_kwh": float("nan"), "ts": float("inf")}, {"q_kwh": -1.0, "ts": None},
+        ):
+            state = hp.TransitState(junk)
+            self.assertEqual((state.q_kwh, state.ts), (0.0, None), junk)
+        state = hp.TransitState({"q_kwh": 5, "ts": 7})
+        self.assertEqual((state.q_kwh, state.ts), (5.0, 7.0))
+
+
 class StartWindow(unittest.TestCase):
     cfg = hp.CallConfig()
 
@@ -1879,10 +2060,12 @@ class DecideCall(unittest.TestCase):
     cfg = hp.CallConfig()
     AIM = 21.5
 
-    def decide(self, air, now=T(12), on=False, since=None, allowed=True, aim=None, cfg=None):
+    def decide(
+        self, air, now=T(12), on=False, since=None, allowed=True, aim=None, cfg=None, coast=0.0
+    ):
         state = hp.CallState({"on": on, "since": since, "high": 23.5 if on else None})
         aim = self.AIM if aim is None else aim
-        return hp.decide_call(cfg or self.cfg, state, aim, air, allowed, now)
+        return hp.decide_call(cfg or self.cfg, state, aim, air, allowed, now, coast)
 
     def test_a_cold_room_starts_a_call_at_the_start_of_a_slot(self):
         self.assertEqual(self.decide(21.0, T(12)), (True, "start"))
@@ -1957,6 +2140,45 @@ class DecideCall(unittest.TestCase):
     def test_the_aim_decides_not_the_old_setpoint(self):
         self.assertEqual(self.decide(21.0, aim=20.5), (False, "air_ok"))
         self.assertEqual(self.decide(21.0, aim=21.5), (True, "start"))
+
+    def test_a_coast_stops_the_call_once_the_air_plus_the_coast_is_a_tenth_over_the_aim(self):
+        self.assertEqual(self.decide(21.39, on=True, since=T(11), coast=0.2), (True, "calling"))
+        self.assertEqual(self.decide(21.41, on=True, since=T(11), coast=0.2), (False, "stop"))
+        self.assertEqual(self.decide(21.51, on=True, since=T(11), coast=0.05), (True, "calling"))
+        self.assertEqual(self.decide(21.56, on=True, since=T(11), coast=0.05), (False, "stop"))
+        self.assertEqual(self.decide(21.0, on=True, since=T(11), coast=0.5), (True, "calling"))
+        self.assertEqual(self.decide(21.2, on=True, since=T(11), coast=0.5), (False, "stop"))
+
+    def test_without_a_coast_the_call_keeps_running_to_two_tenths_over_the_aim(self):
+        for coast in (0.0, -0.1):
+            running = dict(on=True, since=T(11), coast=coast)
+            self.assertEqual(self.decide(21.65, **running), (True, "calling"))
+            self.assertEqual(self.decide(21.69, **running), (True, "calling"))
+            self.assertEqual(self.decide(21.71, **running), (False, "stop"))
+
+    def test_a_coast_leaves_a_call_its_minimum_time(self):
+        running = dict(on=True, since=T(12), coast=0.3)
+        self.assertEqual(self.decide(22.0, T(12, 1), **running), (True, "min_on"))
+        self.assertEqual(self.decide(22.0, T(12, 19), **running), (True, "min_on"))
+        self.assertEqual(self.decide(22.0, T(12, 20), **running), (False, "stop"))
+
+    def test_a_coast_does_not_change_when_a_call_starts_or_when_heat_is_refused(self):
+        for coast in (0.0, 0.3, 0.5):
+            with self.subTest(coast=coast):
+                self.assertEqual(self.decide(21.29, coast=coast), (True, "start"))
+                self.assertEqual(self.decide(21.3, coast=coast), (False, "air_ok"))
+                self.assertEqual(self.decide(21.0, T(12, 10), coast=coast), (False, "wait_slot"))
+                resting = self.decide(21.0, since=T(11, 50), coast=coast)
+                self.assertEqual(resting, (False, "min_off"))
+                self.assertEqual(
+                    self.decide(20.0, T(12, 1), on=True, since=T(12), allowed=False, coast=coast),
+                    (False, "not_allowed"),
+                )
+                blind = self.decide(None, on=True, since=T(11), coast=coast)
+                self.assertEqual(blind, (False, "no_air"))
+
+    def test_a_call_is_kept_while_the_coast_is_still_short_of_the_aim(self):
+        self.assertEqual(self.decide(20.9, on=True, since=T(11), coast=0.3), (True, "calling"))
 
     def test_a_slot_start_through_a_whole_cycle(self):
         state = hp.CallState()
