@@ -218,8 +218,7 @@ RoomFeel:
       floor_entity: sensor.claudias_room_floor_thermometer_temperature
       floor_offset_c: 0.6
       floor_rh_entity: sensor.claudias_room_floor_thermometer_humidity
-      # Her only outward opening is the rooftop door (open_while_heating_guard.yaml) -
-      # the room has no window contact of its own.
+      # Her only outward opening is the rooftop door; the room has no window contact of its own.
       window_contacts: [{entity: binary_sensor.rooftop_door_2_contact, label: rooftop door}]
 
     kristines_room:
@@ -276,8 +275,7 @@ RoomFeel:
       floor_entity: sensor.guest_bathroom_floor_thermometer_temperature
       floor_rh_entity: sensor.guest_bathroom_floor_thermometer_humidity
       # Only a door contact is known here (binary_sensor.guest_bathroom_door_contact, an
-      # interior door - not counted, see open_while_heating_guard.yaml's convention); no
-      # known exterior window contact.
+      # interior door, not counted); no known exterior window contact.
       window_contacts: []
       mould_risk: true
 
