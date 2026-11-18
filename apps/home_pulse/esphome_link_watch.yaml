@@ -1,0 +1,12 @@
+# EsphomeLinkWatch - reloads an ESPHome device's HA connection when its entities hang
+# unavailable. See esphome_link_watch.py.
+EsphomeLinkWatch:
+  module: esphome_link_watch
+  class: EsphomeLinkWatch
+
+  # One entity per device that reports whenever the device is connected.
+  probes:
+    - sensor.bathroom_bathroom_display_loop_time
+  stale_s: 120
+  cooldown_s: 600
+  max_reloads: 3
