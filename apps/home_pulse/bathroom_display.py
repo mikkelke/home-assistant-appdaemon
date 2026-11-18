@@ -1,6 +1,10 @@
 """BathroomDisplay - what the round display in the main bathroom (ESPHome node bathroom-display) shows, and the
 speaker its play button works.
 
+Each instance takes occupancy and upcoming rows from its zone. Without phone RSSI, resident_when_active
+identifies the resident by occupancy. A players list gives playing devices priority in list order, then
+resumes the most recently paused device.
+
 Publishes sensor.bathroom_display, the one entity the display reads:
     state       "off" (the bathroom is not active), "someone" (active, Mikkel not identified yet) or
                 "mikkel" (active, and his phone has been near or has risen during this visit, or he has
@@ -196,9 +200,6 @@ SPEAKER = "media_player.bathroom"
 RADIO = "dr_podcasts://radio/p3"
 RADIO_TYPE = "music"
 RADIO_DELAY_S = 1
-MEASURED = "sensor.mikkel_last_measurement"
-WEIGHT = "sensor.mikkel_weight"
-BODY_FAT = "sensor.mikkel_body_fat"
 WEIGH_FRESH = timedelta(seconds=120)
 WEIGH_SPREAD = timedelta(seconds=30)
 CARD_S = 90
@@ -720,10 +721,10 @@ def alarm_line(armed, clock):
     return Line(f"Alarm {at}", ALARM_ICON, at)
 
 
-def payload(state, reason, resident, lines, night=False):
-    """The attributes of sensor.bathroom_display: strings only, the lines padded with empty ones."""
+def payload(state, reason, resident, lines, night=False, zone=ZONE):
+    """The display sensor's attributes: strings only, the lines padded with empty ones."""
     mikkel = state == "mikkel"
-    attributes = {"friendly_name": "Bathroom display", "icon": ICON, "reason": reason,
+    attributes = {"friendly_name": f"{zone.capitalize()} display", "icon": ICON, "reason": reason,
                   "person": resident.lower() if mikkel else "", "greeting": f"Hi {resident}" if mikkel else "",
                   "night": "on" if night else ""}
     for number, line in enumerate((list(lines) + [Line("")] * LINES)[:LINES], 1):
@@ -753,7 +754,8 @@ class BathroomDisplay(hass.Hass):
         self.zone = a.get("zone", ZONE)
         self.active_entity = f"binary_sensor.{self.zone}_active"
         self.resident = str(a.get("resident", RESIDENT))
-        self.rssi_entity = a.get("rssi_entity", "sensor.bathroom_display_mikkel_phone_rssi")
+        self.rssi_entity = a.get("rssi_entity")
+        self.resident_when_active = a.get("resident_when_active", False) and not self.rssi_entity
         self.rssi_min = float(a.get("mikkel_rssi_min", RSSI_MIN))
         self.rise_min = float(a.get("rssi_rise_min", RISE_MIN))
         self.rise_db = float(a.get("rssi_rise_db", RISE_DB))
@@ -765,13 +767,14 @@ class BathroomDisplay(hass.Hass):
         self.dryer_entity = a.get("dryer_entity", DRYER)
         self.delivery_entity = a.get("delivery_entity", DELIVERY)
         self.sleep_entity = a.get("sleep_entity", "input_boolean.mikkel_sleep_mode")
-        self.light_entity = a.get("light_entity", "light.bathroom_main_lights")
+        self.light_entity = a.get("light_entity")
         self.play_event = a.get("play_event", PLAY_EVENT)
+        self.players = a.get("players")
         self.speaker = a.get("speaker", SPEAKER)
         self.radio = str(a.get("radio", RADIO))
-        self.measured_entity = a.get("measured_entity", MEASURED)
-        self.weight_entity = a.get("weight_entity", WEIGHT)
-        self.fat_entity = a.get("body_fat_entity", BODY_FAT)
+        self.weight_entity = a.get("weight_entity")
+        self.measured_entity = a.get("measured_entity") if self.weight_entity else None
+        self.fat_entity = a.get("body_fat_entity")
         self.rain_entity = a.get("rain_entity", PIEZO)
         self.weather_entity = a.get("weather_entity", WEATHER)
         self.alarm_entity = a.get("alarm_entity", ALARM)
@@ -799,19 +802,24 @@ class BathroomDisplay(hass.Hass):
         self.run_every(self._on_tick, f"now+{TICK_S}", TICK_S)
 
         self._evaluate(publish=True)
-        self.log(f"BathroomDisplay initialized - {self.entity} from {self.active_entity}, "
-                 f"phone >= {self.rssi_min:g} dBm, or >= {self.rise_min:g} dBm and {self.rise_db:g} dB over its "
-                 f"baseline, within {self.rssi_fresh.total_seconds():g} s, {len(self.routes)} transit routes, "
-                 f"{self.play_event} works {self.speaker}, {self.alarm_event} toggles {self.alarm_entity}")
+        identity = "occupancy"
+        if self.rssi_entity:
+            identity = (f"phone >= {self.rssi_min:g} dBm, or >= {self.rise_min:g} dBm and {self.rise_db:g} dB over its "
+                        f"baseline, within {self.rssi_fresh.total_seconds():g} s")
+        targets = ", ".join(self.players) if self.players is not None else self.speaker
+        self.log(f"BathroomDisplay initialized - {self.entity} from {self.active_entity}, {identity}, "
+                 f"{len(self.routes)} transit routes, {self.play_event} works {targets}, "
+                 f"{self.alarm_event} toggles {self.alarm_entity}")
 
     # -- sources --------------------------------------------------------------
 
     def _sources(self):
-        return list(dict.fromkeys([self.rssi_entity, self.upcoming_entity, self.sleep_entity, self.light_entity,
-                                   self.measured_entity, self.weight_entity, self.fat_entity, self.rain_entity,
-                                   self.alarm_entity, self.alarm_time_entity, self.alarm_from_entity,
-                                   self.washer_entity, self.dryer_entity, self.delivery_entity]
-                                  + [entity for _, entity in self.routes]))
+        sources = [self.rssi_entity, self.upcoming_entity, self.sleep_entity, self.light_entity,
+                   self.measured_entity, self.weight_entity, self.fat_entity, self.rain_entity,
+                   self.alarm_entity, self.alarm_time_entity, self.alarm_from_entity,
+                   self.washer_entity, self.dryer_entity, self.delivery_entity]
+        sources.extend(entity for _, entity in self.routes)
+        return list(dict.fromkeys(entity for entity in sources if entity))
 
     def _read(self, entity):
         try:
@@ -849,6 +857,9 @@ class BathroomDisplay(hass.Hass):
         self._evaluate()
 
     def _on_play(self, event_name, data, kwargs):
+        if self.players is not None:
+            self._toggle_player()
+            return
         full = self._read(self.speaker) or {}
         attrs = full.get("attributes") if isinstance(full.get("attributes"), dict) else {}
         state = full.get("state")
@@ -863,6 +874,23 @@ class BathroomDisplay(hass.Hass):
         else:
             self._call("media_player/unjoin", entity_id=self.speaker)
             self.run_in(self._start_radio, RADIO_DELAY_S)
+
+    def _toggle_player(self):
+        target = None
+        oldest = last_paused = datetime.min.replace(tzinfo=timezone.utc)
+        for entity in self.players:
+            full = self._read(entity) or {}
+            state = full.get("state")
+            if state == "playing":
+                target = entity
+                break
+            if state == "paused":
+                changed = maint.parse_iso(full.get("last_changed")) or oldest
+                if target is None or changed > last_paused:
+                    target, last_paused = entity, changed
+        if target:
+            self.log(f"Play button: toggles {target}")
+            self._call("media_player/media_play_pause", entity_id=target)
 
     def _start_radio(self, kwargs):
         self._call("media_player/play_media", entity_id=self.speaker, media_content_id=self.radio,
@@ -890,11 +918,12 @@ class BathroomDisplay(hass.Hass):
             self.log(f"Weighing at {core.utc_iso(moment)} ignored, {self.active_entity} is not active")
             return False
         now = self.get_now()
-        self._weighing = {"seen": now, "updated": maint.parse_iso(full.get("last_updated")) or now, "ready": False,
-                          "before": None}
+        self._weighing = {"seen": now, "updated": maint.parse_iso(full.get("last_updated")) or now,
+                          "ready": not self.fat_entity, "before": None}
         self.log(f"Weighing at {core.utc_iso(moment)}: the card for {CARD_S} s")
         self.run_in(self._on_card_end, CARD_S)
-        self.create_task(self._fetch_comparison(now))
+        if self.fat_entity:
+            self.create_task(self._fetch_comparison(now))
         return True
 
     async def _fetch_comparison(self, seen):
@@ -957,18 +986,21 @@ class BathroomDisplay(hass.Hass):
 
     def _compute(self, prev, active, weighed=False):
         now = self.get_now()
-        night = self._state_of(self.sleep_entity) == "on"
-        if active and kept_dark(self._state_of(self.sleep_entity), self._state_of(self.light_entity)):
-            return "off", payload("off", f"sleep:{self.sleep_entity}", self.resident, self._lines(now, "off", night),
-                                  night)
-        if active and prev in (None, "off"):
-            self._baseline = baseline_at(self._history, now)
-        value, at = phone_reading(self._cache.get(self.rssi_entity))
-        status = phone_status(value, at, now, self.rssi_min, self.rssi_fresh, self._baseline, self.rise_min,
-                              self.rise_db)
-        state = next_state(prev, active, status, weighed)
-        reason = reason_text(self.active_entity, active, state, status)
-        return state, payload(state, reason, self.resident, self._lines(now, state, night), night)
+        sleep = self._state_of(self.sleep_entity)
+        night = sleep == "on"
+        if active and self.light_entity and kept_dark(sleep, self._state_of(self.light_entity)):
+            state, reason = "off", f"sleep:{self.sleep_entity}"
+        elif active and self.resident_when_active:
+            state, reason = "mikkel", f"active:{self.active_entity}"
+        else:
+            if active and prev in (None, "off"):
+                self._baseline = baseline_at(self._history, now)
+            value, at = phone_reading(self._cache.get(self.rssi_entity))
+            status = phone_status(value, at, now, self.rssi_min, self.rssi_fresh, self._baseline, self.rise_min,
+                                  self.rise_db)
+            state = next_state(prev, active, status, weighed)
+            reason = reason_text(self.active_entity, active, state, status)
+        return state, payload(state, reason, self.resident, self._lines(now, state, night), night, self.zone)
 
     def _state_of(self, entity):
         full = self._cache.get(entity)

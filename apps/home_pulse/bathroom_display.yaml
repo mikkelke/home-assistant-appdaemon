@@ -73,3 +73,30 @@ BathroomDisplay:
   # The alarm line shows from this time until 02:00 and all through sleep mode; 21:00 while this helper
   # cannot be read as a time.
   alarm_from_entity: input_datetime.bathroom_display_alarm_from
+
+BedroomDisplay:
+  module: bathroom_display
+  class: BathroomDisplay
+  entity: sensor.bedroom_display
+  zone: bedroom
+  resident: Mikkel
+  resident_when_active: true
+  upcoming_entity: sensor.house_upcoming
+  sleep_entity: input_boolean.mikkel_sleep_mode
+  transit:
+    - {entity: sensor.transit_enghave_metro_kbh, label: Metro}
+    - {entity: sensor.transit_carlsberg_stog_kbh, label: S-tog}
+  transit_max_age_min: 45
+  delivery_entity: sensor.home_delivery
+  washer_entity: sensor.washer_state
+  dryer_entity: sensor.dryer_state
+  play_event: esphome.bedroom_display_play
+  players:
+    - media_player.bedroom_tv
+    - media_player.bedroom_2
+  rain_entity: binary_sensor.gw2000a_rain_state_piezo
+  weather_entity: weather.forecast_home
+  alarm_entity: input_boolean.wakeup_bedroom
+  alarm_time_entity: input_datetime.wakeup_bedroom
+  alarm_event: esphome.bedroom_display_alarm
+  alarm_from_entity: input_datetime.bathroom_display_alarm_from

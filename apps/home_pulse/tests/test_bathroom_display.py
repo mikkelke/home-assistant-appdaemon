@@ -38,7 +38,9 @@ import upcoming_once as once  # noqa: E402
 import upcoming_plants as plants  # noqa: E402
 import upcoming_rain as rain  # noqa: E402
 
-CONFIG = yaml.safe_load((APPS / "home_pulse" / "bathroom_display.yaml").read_text())["BathroomDisplay"]
+DISPLAY_CONFIG = yaml.safe_load((APPS / "home_pulse" / "bathroom_display.yaml").read_text())
+CONFIG = DISPLAY_CONFIG["BathroomDisplay"]
+BEDROOM_CONFIG = DISPLAY_CONFIG["BedroomDisplay"]
 HOUSE = maint.HOUSE_TZ
 NOW = datetime(2026, 11, 5, 7, 30, tzinfo=timezone.utc)  # 08:30 in the house, on a Thursday
 SEC = timedelta(seconds=1)
@@ -1361,15 +1363,16 @@ def tearDownModule():
             task.close()
 
 
-def make_app(states=None, active="on", now=NOW, fail=0, **args):
+def make_app(states=None, active="on", now=NOW, fail=0, *, config=CONFIG, **args):
     """The app after initialize(), the first `fail` publishes of which fail. Its fetches are the coroutines in
     `tasks`, run by drain(); the answers to them are in `responses`, by service, and the calls that asked for
     one are in `requests`."""
     app = bd.BathroomDisplay.__new__(bd.BathroomDisplay)
     MADE.append(app)
-    app.args = {**CONFIG, **args}
+    app.args = {**config, **args}
     app.now = now
-    app.states = {ACTIVE: room(active), **(states or {})}
+    active_entity = f"binary_sensor.{app.args['zone']}_active"
+    app.states = {active_entity: room(active), **(states or {})}
     app.published, app.logs, app.listened, app.events, app.scheduled = [], [], [], [], []
     app.calls, app.later, app.fail_services = [], [], set()
     app.tasks, app.requests, app.responses, app.hang = [], [], {}, set()
@@ -1379,7 +1382,7 @@ def make_app(states=None, active="on", now=NOW, fail=0, **args):
         value = app.states.get(entity)
         if attribute == "all" or value is None:
             return value
-        if attribute == "computed_at" and entity == ACTIVE:
+        if attribute == "computed_at" and entity == active_entity:
             return datetime.now(timezone.utc).isoformat()
         if attribute is not None:
             return value["attributes"].get(attribute)
@@ -1423,9 +1426,10 @@ def fire(app, entity, new):
 
 
 def occupy(app, state):
-    old = app.states[ACTIVE]["state"]
-    app.states[ACTIVE] = room(state)
-    app._on_active(ACTIVE, "state", old, state, {})
+    entity = app.active_entity
+    old = app.states[entity]["state"]
+    app.states[entity] = room(state)
+    app._on_active(entity, "state", old, state, {})
 
 
 def phone(app, dbm, age=0):
@@ -3164,6 +3168,88 @@ class NightTests(unittest.TestCase):
         self.assertLessEqual(len(last(app)["attributes"]["line1"]), bd.LINE_MAX)
 
 
+class BedroomDisplayTests(unittest.TestCase):
+    TV = "media_player.bedroom_tv"
+    SONOS = "media_player.bedroom_2"
+    PLAY_EVENT = "esphome.bedroom_display_play"
+    ALARM_EVENT = "esphome.bedroom_display_alarm"
+    PLAY_PAUSE = "media_player/media_play_pause"
+
+    def app(self, states=None, **kwargs):
+        return make_app(states, config=BEDROOM_CONFIG, **kwargs)
+
+    def test_an_active_bedroom_identifies_mikkel_without_rssi(self):
+        app = self.app(active="off")
+        self.assertNotIn("rssi_entity", BEDROOM_CONFIG)
+        self.assertNotIn(RSSI, {entity for _, entity, _ in app.listened})
+        self.assertIn(("_on_active", "binary_sensor.bedroom_active", {}), app.listened)
+        self.assertEqual((last(app)["entity"], last(app)["state"]), ("sensor.bedroom_display", "off"))
+        occupy(app, "on")
+        self.assertEqual(last(app)["state"], "mikkel")
+        self.assertEqual(last(app)["attributes"], attrs_of(
+            friendly_name="Bedroom display", reason="active:binary_sensor.bedroom_active",
+            person="mikkel", greeting="Hi Mikkel"))
+        occupy(app, "off")
+        self.assertEqual(last(app)["state"], "off")
+
+    def test_weighing_sources_can_be_omitted(self):
+        app = self.app(scale_states(), now=house(11, 5, 14))
+        self.assertFalse({"measured_entity", "weight_entity", "body_fat_entity"} & BEDROOM_CONFIG.keys())
+        self.assertFalse({MEASURED, WEIGHT, FAT, None} & {entity for _, entity, _ in app.listened})
+        self.assertEqual(shown(app), [BLANK] * 3)
+        self.assertEqual(app.tasks, [])
+
+    def test_sleep_mode_shows_the_alarm_face_without_a_light_entity(self):
+        app = self.app({SLEEP: full("on"), ALARM: full("on"), ALARM_TIME: full("09:15:00"),
+                        UPCOMING: upcoming(LineTests.ROWS)})
+        self.assertNotIn("light_entity", BEDROOM_CONFIG)
+        self.assertNotIn(LIGHT, {entity for _, entity, _ in app.listened})
+        self.assertEqual((last(app)["state"], last(app)["attributes"]["night"]), ("mikkel", "on"))
+        self.assertEqual(shown(app), [("Alarm 09:15", "mdi:alarm", "09:15"), BLANK, BLANK])
+        self.assertEqual(app.tasks, [])
+
+    def test_the_bedroom_gets_its_own_upcoming_rows(self):
+        rows = [maint_row("bathroom", "Bathroom in eight days", at=NOW + 8 * DAY, area="bathroom"),
+                maint_row("bedroom", "Bedroom in nine days", at=NOW + 9 * DAY, area="bedroom")]
+        app = self.app({UPCOMING: upcoming(rows)})
+        self.assertEqual(shown(app), [("Bedroom in nine days", "mdi:information-outline", "9 d"), BLANK, BLANK])
+
+    def test_the_bedroom_alarm_event_toggles_the_same_alarm(self):
+        app = self.app()
+        self.assertIn(("_on_alarm", self.ALARM_EVENT), app.events)
+        self.assertNotIn(("_on_alarm", CONFIG["alarm_event"]), app.events)
+        app._on_alarm(self.ALARM_EVENT, {}, {})
+        self.assertEqual(app.calls, [("homeassistant/toggle", {"entity_id": ALARM})])
+
+    def test_the_tv_wins_when_both_players_are_playing(self):
+        app = self.app({self.TV: full("playing"), self.SONOS: full("playing")})
+        self.assertIn(("_on_play", self.PLAY_EVENT), app.events)
+        self.assertNotIn(("_on_play", CONFIG["play_event"]), app.events)
+        app._on_play(self.PLAY_EVENT, {}, {})
+        self.assertEqual(app.calls, [(self.PLAY_PAUSE, {"entity_id": self.TV})])
+
+    def test_a_playing_player_wins_over_a_paused_player(self):
+        app = self.app({self.TV: {**full("paused"), "last_changed": iso(NOW)}, self.SONOS: full("playing")})
+        app._on_play(self.PLAY_EVENT, {}, {})
+        self.assertEqual(app.calls, [(self.PLAY_PAUSE, {"entity_id": self.SONOS})])
+
+    def test_the_most_recent_pause_uses_last_changed(self):
+        for newer, older in ((self.TV, self.SONOS), (self.SONOS, self.TV)):
+            with self.subTest(newer=newer):
+                app = self.app({
+                    newer: {**full("paused", updated=NOW - MIN), "last_changed": iso(NOW - MIN)},
+                    older: {**full("paused", updated=NOW), "last_changed": iso(NOW - 2 * MIN)},
+                })
+                app._on_play(self.PLAY_EVENT, {}, {})
+                self.assertEqual(app.calls, [(self.PLAY_PAUSE, {"entity_id": newer})])
+
+    def test_without_a_playing_or_paused_player_the_button_does_nothing(self):
+        app = self.app({self.TV: full("off"), self.SONOS: full("idle", {"group_members": [self.SONOS, SPEAKER]})})
+        app._on_play(self.PLAY_EVENT, {}, {})
+        self.assertEqual(app.calls, [])
+        self.assertEqual(app.later, [])
+
+
 class ConfigTests(unittest.TestCase):
     def test_the_yaml_names_the_module_and_class(self):
         self.assertEqual((CONFIG["module"], CONFIG["class"]), ("bathroom_display", "BathroomDisplay"))
@@ -3197,7 +3283,7 @@ class ConfigTests(unittest.TestCase):
     def test_the_weighing_rain_and_alarm_defaults_are_the_yamls_values(self):
         app = make_app()
         self.assertEqual((app.measured_entity, app.weight_entity, app.fat_entity),
-                         (bd.MEASURED, bd.WEIGHT, bd.BODY_FAT))
+                         (CONFIG["measured_entity"], CONFIG["weight_entity"], CONFIG["body_fat_entity"]))
         self.assertEqual((CONFIG["measured_entity"], CONFIG["weight_entity"], CONFIG["body_fat_entity"]),
                          ("sensor.mikkel_last_measurement", "sensor.mikkel_weight", "sensor.mikkel_body_fat"))
         self.assertEqual((app.rain_entity, app.weather_entity), (bd.PIEZO, bd.WEATHER))
@@ -3217,7 +3303,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((app.measured_entity, app.weight_entity, app.fat_entity, app.rain_entity,
                           app.weather_entity, app.alarm_entity, app.alarm_time_entity, app.alarm_from_entity,
                           app.alarm_event),
-                         (bd.MEASURED, bd.WEIGHT, bd.BODY_FAT, bd.PIEZO, bd.WEATHER, bd.ALARM, bd.ALARM_TIME,
+                         (None, None, None, bd.PIEZO, bd.WEATHER, bd.ALARM, bd.ALARM_TIME,
                           bd.ALARM_FROM_ENTITY, bd.ALARM_EVENT))
         self.assertEqual(app.alarm_event, CONFIG["alarm_event"])
         self.assertEqual((app.washer_entity, app.dryer_entity, app.delivery_entity),
