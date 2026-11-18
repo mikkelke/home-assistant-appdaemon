@@ -7,8 +7,9 @@ thermostats as relays. This module holds the three layers:
 
   - PLAN: whether heat is allowed, and the air temperature to aim for. The aim follows the
     comfort profile, shifted EARLIER by the slab lag (the floor answers hours late); a sun cut
-    or the bedroom loop lowers it. An open window, the lockout after an airing, a party and the
-    floor cap each make heat not allowed.
+    or the bedroom loop lowers it, and so does the user being away when the profile waits for
+    them. An open window, the lockout after an airing, a party and the floor cap each make heat
+    not allowed.
   - CALL: decide_call starts and stops the zone's call from the control air against the aim,
     with a hysteresis, a minimum on and off time, and starts batched into the first minutes of
     each half hour so the zones call together. A zone with a transit block stops earlier by the
@@ -28,11 +29,13 @@ Terms used throughout:
     In a zone with several, a room whose 3 h mean is far from T* takes over (ComfortSwitch).
 
 Mode precedence, first match wins (see plan()): off_season / device_offline, window, settle,
-party, floor_cap, guard, sun_cut, fallback, hold. Window, settle, party and floor_cap make heat
-not allowed; guard, sun_cut, fallback and hold only set the aim, which is worked out in every
-mode. The plan is always computed, also when the first row gates the zone, so the log shows what
-would have been planned. `settle` is the lockout after an airing (WindowTracker). `guard` is the
-bedroom loop holding the bathroom back (BedroomLoop).
+party, floor_cap, guard, sun_cut, fallback, away, hold. Window, settle, party and floor_cap make
+heat not allowed; guard, sun_cut, fallback, away and hold only set the aim, which is worked out
+in every mode. The plan is always computed, also when the first row gates the zone, so the log
+shows what would have been planned. `settle` is the lockout after an airing (WindowTracker).
+`guard` is the bedroom loop holding the bathroom back (BedroomLoop). `away` is a profile that
+waits for its user (Profile.when_home) while none of the user's entities reads home: the periods
+do not run and the aim is what the profile gives outside them.
 
 Timestamps are epoch seconds. Local clock times come from the tzinfo passed in.
 """
@@ -55,6 +58,7 @@ MODE_FLOOR_CAP = "floor_cap"
 MODE_GUARD = "guard"
 MODE_SUN_CUT = "sun_cut"
 MODE_FALLBACK = "fallback"
+MODE_AWAY = "away"
 MODE_HOLD = "hold"
 
 SETPOINT_STEP_C = 0.5
@@ -70,6 +74,8 @@ JUMP_C = 2.0
 JUMP_WINDOW_S = 600.0
 MIN_VALID_EPOCH = 365 * 86400.0
 PLANNED_PARTY_MAX_S = 24 * 3600.0
+HOME_STATE = "home"
+NO_READING = (None, "", "unknown", "unavailable")
 SEASON_MORNING_FROM = 5 * 60
 SEASON_MORNING_TO = 9 * 60
 
@@ -151,6 +157,7 @@ class Profile:
     periods: tuple = ()
     default_offset: float = 0.0
     outside_is_lower_limit: bool = False
+    when_home: tuple = ()  # entities the periods wait for, see user_away; empty: always run
 
 
 @dataclass(frozen=True)
@@ -401,11 +408,15 @@ def _parse_profile(raw, where: str) -> Profile:
     outside = raw.get("outside")
     if outside not in (None, "lower_limit"):
         raise ConfigError(f"{where}: profile outside must be 'lower_limit'")
+    when_home = _as_tuple(raw.get("when_home"))
+    if not all(isinstance(e, str) and e for e in when_home):
+        raise ConfigError(f"{where}: profile when_home is an entity or a list of entities")
     return Profile(
         lead_hours=float(raw.get("lead_hours", 0.0)),
         periods=tuple(periods),
         default_offset=float(raw.get("default_offset", 0.0)),
         outside_is_lower_limit=outside == "lower_limit",
+        when_home=when_home,
     )
 
 
@@ -788,16 +799,32 @@ def parse_config(args: dict) -> Config:
 
 
 def comfort_target(
-    zc: ZoneConfig, base: float, nudge: float, ts: float, tz, lower_c: float
+    zc: ZoneConfig, base: float, nudge: float, ts: float, tz, lower_c: float, away: bool = False
 ) -> float:
-    """T*(ts): the comfort target in seated-air terms at the local clock time of ts."""
-    minute = clock_minute(ts, tz)
-    for p in zc.profile.periods:
-        if in_span(minute, p.start, p.end):
-            return base + nudge + p.offset
+    """T*(ts): the comfort target in seated-air terms at the local clock time of ts. A zone
+    whose user is `away` is outside every period."""
+    if not away:
+        minute = clock_minute(ts, tz)
+        for p in zc.profile.periods:
+            if in_span(minute, p.start, p.end):
+                return base + nudge + p.offset
     if zc.profile.outside_is_lower_limit:
         return lower_c
     return base + nudge + zc.profile.default_offset
+
+
+def user_away(profile: Profile, states: dict) -> bool:
+    """Whether the user a profile waits for is away: it lists when_home entities and every one
+    reads a state other than 'home'. An entity that is unknown, unavailable or missing counts as
+    home, so a gap in the data never holds heat back. `states` maps each entity to its state."""
+    readings = [states.get(entity) for entity in profile.when_home]
+    return bool(readings) and all(s not in NO_READING and s != HOME_STATE for s in readings)
+
+
+def home_label(profile: Profile) -> str:
+    """The name in the profile's first person entity, for a reason text: person.mikkel is Mikkel."""
+    people = [e.split(".", 1)[1] for e in profile.when_home if e.startswith("person.")]
+    return people[0].replace("_", " ").title() if people else "User"
 
 
 def protected_min(zc: ZoneConfig, base: float, nudge: float, lower_c: float) -> float:
@@ -1413,6 +1440,7 @@ class ZoneInputs:
     hold_back: bool = False
     cut_windows: tuple = ()
     floor_cap: bool = False
+    away: bool = False
 
 
 @dataclass(frozen=True)
@@ -1430,13 +1458,14 @@ def plan(zc: ZoneConfig, inp: ZoneInputs, now_ts: float, tz) -> Plan:
     """Whether heat is allowed for one zone at `now_ts` and the air to aim for, with the mode
     that decided it. The aim never leaves the zone's limits."""
     lower, upper = inp.lower_c, inp.upper_c
-    target = comfort_target(zc, inp.base, inp.nudge, now_ts, tz, lower)
+    away = bool(zc.profile.when_home) and inp.away
+    target = comfort_target(zc, inp.base, inp.nudge, now_ts, tz, lower, away)
     lead_ts = now_ts + zc.profile.lead_hours * 3600.0
     fallback_aim = lower if zc.profile.outside_is_lower_limit else inp.base + inp.nudge
     if inp.fallback:
         t_lead = fallback_aim
     else:
-        t_lead = comfort_target(zc, inp.base, inp.nudge, lead_ts, tz, lower)
+        t_lead = comfort_target(zc, inp.base, inp.nudge, lead_ts, tz, lower, away)
     pmin = protected_min(zc, inp.base, inp.nudge, lower)
     in_party = any(s <= now_ts < e for s, e in inp.party_windows)
     in_cut = any(s <= now_ts < e for s, e, _day in inp.cut_windows)
@@ -1457,6 +1486,9 @@ def plan(zc: ZoneConfig, inp: ZoneInputs, now_ts: float, tz) -> Plan:
     elif inp.fallback:
         aim_mode, raw_aim = MODE_FALLBACK, fallback_aim
         aim_reason = "No room temperature to go by: holds a fixed target"
+    elif away:
+        aim_mode, raw_aim = MODE_AWAY, t_lead
+        aim_reason = f"{home_label(zc.profile)} away: holding {t_lead:.1f} °C"
     else:
         aim_mode, raw_aim = MODE_HOLD, t_lead
         if abs(t_lead - target) < 0.05:

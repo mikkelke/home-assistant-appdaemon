@@ -20,6 +20,11 @@ off. Every zone with openings stays locked out for lockout_per_open_hour times t
 open, at least settle_max_minutes and at most lockout_max_hours, unless the air gets back to
 where it was before.
 
+A zone whose profile lists when_home entities runs its periods only while one of them reads
+home. While all of them read something else the zone is in mode away and holds what its profile
+gives outside the periods; an entity that is missing, unknown or unavailable counts as home. A
+change of state of any of them triggers an evaluation, a new position of a phone does not.
+
 A zone with a transit block stops its call early by the heat its loops already hold in the
 floor. Every evaluation adds the loops' power to that heat (heating_plan.TransitState): flow
 times the drop from the supply clamp to the loop's return probe, counted while the zone's call
@@ -320,6 +325,7 @@ class HeatingController(hass.Hass):
 
         self._watched = self._watched_entities()
         self._triggers = self._trigger_entities()
+        self._when_home = {e for zc in cfg.zones.values() for e in zc.profile.when_home}
         for entity in sorted(self._watched):
             self.listen_state(self._on_state, entity, attribute="all")
         self._wire_events()
@@ -345,6 +351,7 @@ class HeatingController(hass.Hass):
             names.update([zc.thermostat, zc.target_entity, *zc.floor_sensors])
             names.update(zc.control_air)
             names.update(zc.openings)
+            names.update(zc.profile.when_home)
         if cfg.party:
             names.update([cfg.party.start_entity, cfg.party.end_entity, cfg.party.switch_entity])
         names.discard("")
@@ -357,6 +364,7 @@ class HeatingController(hass.Hass):
         for zc in cfg.zones.values():
             names.add(zc.target_entity)
             names.update(zc.openings)
+            names.update(zc.profile.when_home)
         if cfg.party:
             names.update([cfg.party.start_entity, cfg.party.end_entity, cfg.party.switch_entity])
         names.discard("")
@@ -420,8 +428,17 @@ class HeatingController(hass.Hass):
                 )
             if entity == self.cfg.bedroom.air_entity:
                 self._feed_loop(self.get_now())
-        if entity in self._triggers:
+        if entity in self._triggers and not self._attributes_only(entity, old, new):
             self._request_eval()
+
+    def _attributes_only(self, entity: str, old, new: dict) -> bool:
+        """Whether a callback for a when_home entity moved only its attributes: a phone reports
+        its position every few minutes, and only a change of state is worth an evaluation."""
+        return (
+            entity in self._when_home
+            and isinstance(old, dict)
+            and old.get("state") == new.get("state")
+        )
 
     def _request_eval(self) -> None:
         if not self._eval_pending:
@@ -1231,7 +1248,7 @@ class HeatingController(hass.Hass):
 
     def _comfort_air(
         self, rt: ZoneRuntime, reading: dict, now_ts: float, tz, base: float, lower: float,
-        window_active: bool,
+        window_active: bool, away: bool,
     ) -> None:
         """Feed the zone's comfort switch the room readings of this evaluation and let the room
         it picks, if any, stand in for the weighted mean as the control air. An airing is not
@@ -1240,7 +1257,7 @@ class HeatingController(hass.Hass):
         if comfort is None:
             return
         comfort.observe(now_ts, reading["feels"], record=not window_active)
-        target = hp.comfort_target(zc, base, rt.nudge, now_ts, tz, lower)
+        target = hp.comfort_target(zc, base, rt.nudge, now_ts, tz, lower, away)
         before = comfort.active
         comfort.decide(now_ts, target)
         reading["comfort_means"] = means = comfort.means(now_ts)
@@ -1276,7 +1293,8 @@ class HeatingController(hass.Hass):
         helper = _num(self._state_of(zc.target_entity))
         base = helper if helper is not None else zc.base_c
         lower, upper = self._device_limits(rt)
-        self._comfort_air(rt, reading, now_ts, tz, base, lower, window_active)
+        away = hp.user_away(zc.profile, {e: self._state_of(e) for e in zc.profile.when_home})
+        self._comfort_air(rt, reading, now_ts, tz, base, lower, window_active, away)
         openings = {e: self._state_of(e) for e in zc.openings}
         event = rt.tracker.update(now_ts, openings, reading["air"])
 
@@ -1316,6 +1334,7 @@ class HeatingController(hass.Hass):
             hold_back=self._loop.hold and zc.guard.enabled,
             cut_windows=cut.windows,
             floor_cap=rt.floor_cap and reading["floor_fresh"],
+            away=away,
         )
         plan = hp.plan(zc, inp, now_ts, tz)
         rt.last_plan_mode = plan.plan_mode

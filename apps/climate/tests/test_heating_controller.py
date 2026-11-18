@@ -95,6 +95,7 @@ KRISTINE_ID = "5bee78148825439488b70f92565e6c26"
 STRANGER_ID = "44444444444444444444444444444444"
 AGENT_ID = "f3cc2e6da7c849aba3f366f044725316"
 PRESS_TIME = "2026-10-01T10:00:00+00:00"
+MIKKEL_PHONE = "device_tracker.of9p"
 SUPPLY_PROBE = "sensor.heating_room_floor_heating_supply"
 COMMON_RETURN_PROBE = "sensor.heating_room_floor_heating_return"
 PUMP_POWER = "sensor.floor_heating_relay_power"
@@ -209,6 +210,7 @@ def house(ha: FakeHA):
     ha.set("sensor.dining_room_floor_thermometer_temperature", "21.0")
     ha.set("climate.living_room_thermostat", "off", {"current_temperature": 22.0})
     ha.set("person.mikkel", "home", {"user_id": MIKKEL_ID})
+    ha.set(MIKKEL_PHONE, "home")
     ha.set("person.claudia", "home", {"user_id": CLAUDIA_ID})
     ha.set("person.kristine", "home", {})
     for button in BUTTONS.values():
@@ -554,6 +556,13 @@ class ShippedYaml(unittest.TestCase):
         self.assertTrue(zc.profile.outside_is_lower_limit)
         self.assertEqual([(p.start, p.end) for p in zc.profile.periods], [(150, 9 * 60)])
 
+    def test_only_the_bathroom_waits_for_its_user_to_be_home(self):
+        waiting = {n: zc.profile.when_home for n, zc in self.cfg.zones.items()}
+        self.assertEqual(
+            {n: entities for n, entities in waiting.items() if entities},
+            {"bathroom": ("person.mikkel", MIKKEL_PHONE)},
+        )
+
     def test_no_zone_is_held_back_for_the_bedroom(self):
         guarded = [n for n, zc in self.cfg.zones.items() if zc.guard.enabled]
         self.assertEqual(guarded, [])
@@ -746,6 +755,13 @@ class Initialize(unittest.TestCase):
         )
         self.assertEqual(len(events), 2 + 1 + len(BUTTONS) + len(owned))
         self.assertTrue(any("live-enabled" in m and "zones" in m for _lvl, m in h.logs))
+
+    def test_where_the_bathroom_user_is_counts_as_an_input(self):
+        h = Harness(self, forecast=False)
+        watched = {c.args[1] for c in h.app.listen_state.call_args_list}
+        for entity in ("person.mikkel", MIKKEL_PHONE):
+            self.assertIn(entity, watched)
+            self.assertIn(entity, h.app._triggers)
 
     def test_a_bad_config_logs_an_error_and_starts_nothing(self):
         args = shipped_args(Path("/tmp"))
@@ -2695,6 +2711,26 @@ class ComfortSwitchEndToEnd(unittest.TestCase):
         self.ticks(h, 3)
         self.assertGreater(len(comfort.samples[self.LIVING]), 1)
 
+    def test_a_user_who_is_away_moves_the_target_the_rooms_are_judged_against(self):
+        zones = zones_with_family_night_offset()
+        zones["family"]["profile"] = {
+            "lead_hours": 0,
+            "when_home": ["person.mikkel"],
+            "periods": [{"from": "09:00", "to": "17:00", "offset": 1.0}],
+        }
+        h = Harness(self, forecast=False, zones=zones)
+        h.at(10, 0)
+        self.rooms(h, 22.5, 22.5, 22.5)
+        h.ha.set("input_boolean.heating_season", "on")
+        h.tick()
+        self.ticks(h, hp.COMFORT_MIN_SAMPLES)
+        self.assertEqual(self.basis(h), "weighted")
+        h.ha.set("person.mikkel", "not_home", {"user_id": MIKKEL_ID})
+        h.tick(minutes=5)
+        self.assertEqual(self.basis(h), f"comfort:{self.LIVING}")
+        (line,) = [m for _lvl, m in h.logs if "control air" in m]
+        self.assertIn("target 21.5", line)
+
     def test_the_picked_room_steers_the_call(self):
         h = self.house(20.0, 22.0, 22.0)
         h.tick()
@@ -3374,6 +3410,199 @@ class BedroomEndToEnd(unittest.TestCase):
         self.evening(h, 21.4)
         h2 = Harness(self, args=h.app.args, clock=h.clock, with_house=False, forecast=False)
         self.assertTrue(h2.app._loop.hold)
+
+
+class UserAwayEndToEnd(LiveZones, unittest.TestCase):
+    """The bathroom's morning heat is for its user: the period runs while person.mikkel or the
+    phone's GPS reads home, or while neither can be read."""
+
+    @staticmethod
+    def whereabouts(h, person, phone):
+        """Where the person entity and the phone read; None takes the entity away."""
+        if person is None:
+            h.ha.remove("person.mikkel")
+        else:
+            h.ha.set("person.mikkel", person, {"user_id": MIKKEL_ID})
+        if phone is None:
+            h.ha.remove(MIKKEL_PHONE)
+        else:
+            h.ha.set(MIKKEL_PHONE, phone)
+
+    def morning(self, person="home", phone="home"):
+        """04:00, inside the bathroom's period, season on."""
+        h = Harness(self)
+        h.ha.set("input_boolean.heating_season", "on")
+        h.at(4, 0, day=18)
+        self.whereabouts(h, person, phone)
+        h.tick()
+        return h
+
+    def live_morning(self, person, phone):
+        """04:00 with the bathroom live and its air at 20.0, between the lower limit and the
+        period's 22.0."""
+        h = self.live("bathroom")
+        h.at(4, 0, day=18)
+        self.whereabouts(h, person, phone)
+        self.air(h, 20.0, "bathroom")
+        h.tick()
+        if h.calls:
+            h.echo()
+        return h
+
+    @staticmethod
+    def bathroom(h):
+        a = h.attrs("bathroom")
+        return a["mode"], a["setpoint_now"]
+
+    @staticmethod
+    def timeline(h):
+        return [
+            (b["start"], b["end"], b["mode"], b["setpoint"])
+            for b in h.attrs("bathroom")["day_blocks"]
+        ]
+
+    def deliver(self, h, entity, old):
+        """The state callback for `entity`, with nothing scheduled before it."""
+        h.app._eval_pending = False
+        h.app.run_in.reset_mock()
+        h.app._on_state(entity, "all", old, copy.deepcopy(h.ha.entities[entity]), {})
+
+    def test_at_home_the_period_applies(self):
+        h = self.morning()
+        self.assertEqual(self.bathroom(h), ("hold", 22.0))
+        self.assertEqual(h.zone("bathroom")["state"], 22.0)
+
+    def test_with_both_away_the_bathroom_holds_its_lower_limit_and_says_why(self):
+        for person, phone in (
+            ("not_home", "not_home"),
+            ("not_home", "Pernille"),
+            ("Office", "Pernille"),
+        ):
+            with self.subTest(person=person, phone=phone):
+                h = self.morning(person, phone)
+                a = h.attrs("bathroom")
+                self.assertEqual((a["mode"], a["plan_mode"]), ("away", "away"))
+                self.assertEqual(a["setpoint_now"], 19.0)
+                self.assertEqual(h.zone("bathroom")["state"], 19.0)
+                self.assertEqual(a["reasons"], ["Mikkel away: holding 19.0 °C"])
+                self.assertEqual(self.decision(h, "bathroom")["mode"], "away")
+                assert_publishable(self, a)
+
+    def test_one_entity_at_home_keeps_the_period(self):
+        for person, phone in (
+            ("home", "not_home"),
+            ("not_home", "home"),
+            ("home", "Pernille"),
+            ("Office", "home"),
+        ):
+            with self.subTest(person=person, phone=phone):
+                self.assertEqual(self.bathroom(self.morning(person, phone)), ("hold", 22.0))
+
+    def test_an_entity_that_cannot_be_read_counts_as_home(self):
+        for person, phone in (
+            ("not_home", "unavailable"),
+            ("not_home", "unknown"),
+            ("unavailable", "not_home"),
+            ("unknown", "unknown"),
+            ("not_home", None),
+            (None, "not_home"),
+            (None, None),
+        ):
+            with self.subTest(person=person, phone=phone):
+                self.assertEqual(self.bathroom(self.morning(person, phone)), ("hold", 22.0))
+
+    def test_no_other_zone_looks_at_where_the_user_is(self):
+        h = self.morning("not_home", "not_home")
+        for zone in ZONES:
+            if zone != "bathroom":
+                self.assertEqual(h.attrs(zone)["mode"], "hold", zone)
+
+    def test_coming_home_mid_period_applies_it_from_then(self):
+        h = self.morning("not_home", "not_home")
+        self.assertEqual(self.bathroom(h), ("away", 19.0))
+        h.clock.advance(minutes=5)
+        self.whereabouts(h, "home", "not_home")
+        self.deliver(h, "person.mikkel", None)
+        h.app.run_in.assert_called_once_with(h.app._evaluate_pending, 2)
+        h.app._evaluate_pending({})
+        self.assertEqual(self.bathroom(h), ("hold", 22.0))
+        self.assertEqual(
+            self.timeline(h),
+            [
+                ("04:00", "04:05", "away", "19.0"),
+                ("04:05", "09:00", "hold", "22.0"),
+                ("09:00", "24:00", "hold", "19.0"),
+            ],
+        )
+        self.assertTrue(any("bathroom: away -> hold, aim 22.0" in m for _l, m in h.logs))
+
+    def test_leaving_mid_period_takes_the_heat_away_once_both_entities_have_left(self):
+        h = self.morning()
+        h.clock.set(6, 30, day=18)
+        self.whereabouts(h, "not_home", "home")
+        h.tick()
+        self.assertEqual(self.bathroom(h), ("hold", 22.0))
+        self.whereabouts(h, "not_home", "Pernille")
+        h.tick(minutes=5)
+        self.assertEqual(self.bathroom(h), ("away", 19.0))
+        self.assertEqual(
+            self.timeline(h),
+            [("04:00", "06:35", "hold", "22.0"), ("06:35", "24:00", "away", "19.0")],
+        )
+        self.assertTrue(any("bathroom: hold -> away, aim 19.0" in m for _l, m in h.logs))
+
+    def test_a_change_of_state_asks_for_an_evaluation_at_once_and_a_new_position_does_not(self):
+        h = self.morning()
+        for entity in ("person.mikkel", MIKKEL_PHONE):
+            with self.subTest(entity=entity):
+                old = copy.deepcopy(h.ha.entities[entity])
+                h.ha.update_attrs(entity, latitude=55.1, longitude=12.1)
+                self.deliver(h, entity, old)
+                h.app.run_in.assert_not_called()
+                old = copy.deepcopy(h.ha.entities[entity])
+                h.ha.set(entity, "not_home", old["attributes"])
+                self.deliver(h, entity, old)
+                h.app.run_in.assert_called_once_with(h.app._evaluate_pending, 2)
+                self.deliver(h, entity, None)
+                h.app.run_in.assert_called_once_with(h.app._evaluate_pending, 2)
+
+    def test_a_new_attribute_of_any_other_trigger_still_asks_for_an_evaluation(self):
+        h = self.morning()
+        door = "binary_sensor.rooftop_door_1_contact"
+        old = copy.deepcopy(h.ha.entities[door])
+        h.ha.update_attrs(door, battery=80)
+        self.deliver(h, door, old)
+        h.app.run_in.assert_called_once_with(h.app._evaluate_pending, 2)
+
+    def test_no_call_starts_while_the_user_is_away_and_one_starts_when_he_comes_home(self):
+        h = self.live_morning("not_home", "not_home")
+        a = h.attrs("bathroom")
+        self.assertEqual((a["mode"], a["call"]), ("away", "false"))
+        self.assertEqual(self.sent(h, "bathroom"), [5.0])
+        self.whereabouts(h, "home", "not_home")
+        h.tick(minutes=5)
+        a = h.attrs("bathroom")
+        self.assertEqual(
+            (a["mode"], a["call"], a["call_since"]), ("hold", "true", self.iso(4, 5, 18))
+        )
+        self.assertEqual(self.sent(h, "bathroom"), [5.0, 24.0])
+
+    def test_a_call_ends_after_its_minimum_time_when_the_user_leaves(self):
+        h = self.live_morning("home", "home")
+        a = h.attrs("bathroom")
+        self.assertEqual((a["mode"], a["call"]), ("hold", "true"))
+        self.assertEqual(self.sent(h, "bathroom"), [24.0])
+        self.whereabouts(h, "not_home", "not_home")
+        h.tick(minutes=19)
+        a = h.attrs("bathroom")
+        self.assertEqual((a["mode"], a["call"]), ("away", "true"))
+        self.assertEqual(h.app._zones["bathroom"].call_reason, "min_on")
+        h.tick(minutes=1)
+        a = h.attrs("bathroom")
+        self.assertEqual(
+            (a["mode"], a["call"], a["call_since"]), ("away", "false", self.iso(4, 20, 18))
+        )
+        self.assertEqual(self.sent(h, "bathroom"), [24.0, 5.0])
 
 
 class TerminateAndEvents(unittest.TestCase):

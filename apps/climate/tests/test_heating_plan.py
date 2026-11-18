@@ -1,8 +1,8 @@
 # tests/test_heating_plan.py - the floor-heating controller's planning logic (heating_plan.py):
-# config parsing, comfort target and lead shift, allowed and aim by mode, budget and sun cut, party,
-# bedroom loop, window tracker and the airing lockout, the call rule with the coast of the heat in
-# transit and the drive setpoint, write bookkeeping and daily statistics. Pure logic, so no
-# AppDaemon harness is needed.
+# config parsing, comfort target and lead shift, allowed and aim by mode, a user who is away from
+# home, budget and sun cut, party, bedroom loop, window tracker and the airing lockout, the call
+# rule with the coast of the heat in transit and the drive setpoint, write bookkeeping and daily
+# statistics. Pure logic, so no AppDaemon harness is needed.
 # Run from repo root: python3 -m unittest discover -s apps/climate/tests -q
 
 from __future__ import annotations
@@ -98,6 +98,7 @@ BATHROOM = {
     "profile": {
         "lead_hours": 0,
         "outside": "lower_limit",
+        "when_home": ["person.mikkel", "device_tracker.of9p"],
         "periods": [{"from": "06:00", "to": "09:00", "offset": 0}],
     },
     "budget": {"a": 0.64, "b_om": -2.47, "c": 0, "d": -1.24},
@@ -622,6 +623,29 @@ class ConfigParsing(unittest.TestCase):
             ):
                 hp.parse_config(dict(self._broken(transit=self.TRANSIT), **plant))
 
+    def when_home_of(self, value):
+        profile = {"lead_hours": 4, "when_home": value}
+        return hp.parse_config(self._broken(profile=profile)).zones["family"].profile.when_home
+
+    def test_only_a_profile_that_lists_when_home_entities_waits_for_anyone(self):
+        waiting = {n: zc.profile.when_home for n, zc in CFG.zones.items() if zc.profile.when_home}
+        self.assertEqual(waiting, {"bathroom": ("person.mikkel", "device_tracker.of9p")})
+
+    def test_when_home_is_an_entity_or_a_list_of_entities(self):
+        self.assertEqual(self.when_home_of("person.a"), ("person.a",))
+        self.assertEqual(
+            self.when_home_of(["person.a", "device_tracker.b"]), ("person.a", "device_tracker.b")
+        )
+        for empty in (None, "", []):
+            self.assertEqual(self.when_home_of(empty), ())
+
+    def test_a_bad_when_home_is_refused(self):
+        for bad in ([1], [None], [""], [["person.a"]], {"person.a": "home"}, 5, True):
+            with self.subTest(bad=bad), self.assertRaisesRegex(
+                hp.ConfigError, "zone family: profile when_home"
+            ):
+                self.when_home_of(bad)
+
     def _broken(self, **zone_change):
         zones = dict(ARGS["zones"], family=dict(FAMILY, **zone_change))
         return dict(ARGS, zones=zones)
@@ -686,6 +710,13 @@ class ComfortTarget(unittest.TestCase):
         # moving the base moves the morning level only
         self.assertEqual(at(7, base=23.0), 23.0)
         self.assertEqual(at(12, base=23.0), 19.0)
+
+    def test_a_user_who_is_away_is_outside_every_period(self):
+        bath = CFG.zones["bathroom"]
+        self.assertEqual(hp.comfort_target(bath, 22.0, 0.0, T(7), TZ, 19.0), 22.0)
+        self.assertEqual(hp.comfort_target(bath, 22.0, 0.0, T(7), TZ, 19.0, away=True), 19.0)
+        self.assertEqual(self.target(23, nudge=0.5), 21.5)
+        self.assertEqual(hp.comfort_target(self.zc, 21.5, 0.5, T(23), TZ, 19.0, away=True), 22.0)
 
     def test_protected_minimum(self):
         fam, kri, bath = (CFG.zones[z] for z in ("family", "kristines_room", "bathroom"))
@@ -827,13 +858,14 @@ class AllowedByMode(unittest.TestCase):
 
 
 class ModePrecedence(unittest.TestCase):
-    """window > settle > party > floor_cap > guard > sun_cut > fallback > hold."""
+    """window > settle > party > floor_cap > guard > sun_cut > fallback > away > hold."""
 
     zone = replace(
         CFG.zones["family"],
         guard=hp.GuardConfig(True, "lower_limit"),
         floor_max_c=26.0,
     )
+    waiting = replace(zone, profile=replace(zone.profile, when_home=("person.mikkel",)))
 
     def mode_of(self, **kw):
         base = dict(
@@ -864,6 +896,22 @@ class ModePrecedence(unittest.TestCase):
             party_windows=(), floor_cap=False, hold_back=False, fallback=False, cut_windows=()
         )
         self.assertEqual(self.mode_of(**no_cut), "hold")
+
+    def test_away_wins_over_hold_and_nothing_else(self):
+        def mode_of(**kw):
+            base = dict(away=True, fallback=False, hold_back=False, floor_cap=False)
+            base.update(kw)
+            return hp.plan(self.waiting, inputs(**base), T(12), TZ).plan_mode
+
+        self.assertEqual(mode_of(), "away")
+        self.assertEqual(mode_of(away=False), "hold")
+        self.assertEqual(mode_of(fallback=True), "fallback")
+        self.assertEqual(mode_of(cut_windows=((T(1), T(14), "2026-10-17"),)), "sun_cut")
+        self.assertEqual(mode_of(hold_back=True), "guard")
+        self.assertEqual(mode_of(floor_cap=True), "floor_cap")
+        self.assertEqual(mode_of(party_windows=((T(8), T(18)),)), "party")
+        self.assertEqual(mode_of(window_state=hp.STATE_SETTLE), "settle")
+        self.assertEqual(mode_of(window_state=hp.STATE_OPEN), "window")
 
     def test_fallback_suppresses_cuts_but_not_window_or_party(self):
         zc = CFG.zones["family"]
@@ -937,6 +985,142 @@ class ModePrecedence(unittest.TestCase):
 
     def test_window_in_the_bathroom_beats_the_hold_back_and_the_morning(self):
         self.assertEqual(plan_at(T(7), "bathroom", window_state="open").mode, "window")
+
+
+class UserAway(unittest.TestCase):
+    profile = CFG.zones["bathroom"].profile
+    PERSON, PHONE = profile.when_home
+
+    def away(self, person, phone):
+        return hp.user_away(self.profile, {self.PERSON: person, self.PHONE: phone})
+
+    def test_both_entities_elsewhere_is_away_at_not_home_or_in_a_zone(self):
+        self.assertTrue(self.away("not_home", "not_home"))
+        self.assertTrue(self.away("not_home", "Pernille"))
+        self.assertTrue(self.away("Office", "Pernille"))
+
+    def test_either_entity_at_home_is_home(self):
+        self.assertFalse(self.away("home", "home"))
+        self.assertFalse(self.away("home", "not_home"))
+        self.assertFalse(self.away("not_home", "home"))
+        self.assertFalse(self.away("Pernille", "home"))
+
+    def test_an_entity_that_cannot_be_read_counts_as_home(self):
+        for unreadable in ("unknown", "unavailable", "", None):
+            with self.subTest(unreadable=unreadable):
+                self.assertFalse(self.away("not_home", unreadable))
+                self.assertFalse(self.away(unreadable, "Pernille"))
+                self.assertFalse(self.away(unreadable, unreadable))
+
+    def test_a_missing_entity_counts_as_home(self):
+        self.assertFalse(hp.user_away(self.profile, {self.PERSON: "not_home"}))
+        self.assertFalse(hp.user_away(self.profile, {self.PHONE: "not_home"}))
+        self.assertFalse(hp.user_away(self.profile, {}))
+
+    def test_only_the_listed_entities_count(self):
+        states = {self.PERSON: "not_home", self.PHONE: "not_home", "person.claudia": "home"}
+        self.assertTrue(hp.user_away(self.profile, states))
+
+    def test_a_profile_that_waits_for_nobody_is_never_away(self):
+        family = CFG.zones["family"].profile
+        self.assertFalse(hp.user_away(family, {}))
+        self.assertFalse(hp.user_away(family, {self.PERSON: "not_home", self.PHONE: "not_home"}))
+
+    def test_the_reason_names_the_first_person_entity(self):
+        self.assertEqual(hp.home_label(self.profile), "Mikkel")
+        named = replace(self.profile, when_home=("device_tracker.x", "person.mikkel_eskildsen"))
+        self.assertEqual(hp.home_label(named), "Mikkel Eskildsen")
+        nameless = replace(self.profile, when_home=("device_tracker.of9p",))
+        self.assertEqual(hp.home_label(nameless), "User")
+
+
+class AwayFromHome(unittest.TestCase):
+    """A profile that waits for its user runs its periods only while the user is home."""
+
+    def test_at_home_the_period_applies(self):
+        p = plan_at(T(7), "bathroom")
+        self.assertEqual((p.mode, p.allowed, p.target, p.aim), ("hold", True, 22.0, 22.0))
+
+    def test_away_the_bathroom_holds_its_lower_limit_around_the_clock(self):
+        for minutes in range(0, 24 * 60, 5):
+            p = plan_at(T(minutes // 60, minutes % 60), "bathroom", away=True)
+            self.assertEqual((p.mode, p.allowed, p.target, p.aim), ("away", True, 19.0, 19.0))
+            self.assertEqual(p.reasons, ("Mikkel away: holding 19.0 °C",))
+
+    def test_the_limits_still_bound_the_aim_while_away(self):
+        self.assertEqual(plan_at(T(7), "bathroom", away=True, lower_c=19.5).aim, 19.5)
+
+    def test_coming_home_mid_period_applies_it_from_that_moment(self):
+        sweep = [(6, 0), (6, 55), (7, 0), (7, 5)]
+        aims = [plan_at(T(h, m), "bathroom", away=(h, m) < (7, 0)).aim for h, m in sweep]
+        self.assertEqual(aims, [19.0, 19.0, 22.0, 22.0])
+
+    def test_leaving_mid_period_takes_the_rest_of_it_away(self):
+        sweep = [(6, 0), (7, 0), (7, 5), (8, 55)]
+        aims = [plan_at(T(h, m), "bathroom", away=(h, m) >= (7, 5)).aim for h, m in sweep]
+        self.assertEqual(aims, [22.0, 22.0, 19.0, 19.0])
+
+    def test_a_profile_without_a_lower_limit_falls_to_its_default_offset_while_away(self):
+        family = CFG.zones["family"]
+        zone = replace(family, profile=replace(family.profile, when_home=("person.mikkel",)))
+        home = hp.plan(zone, inputs(), T(20), TZ)
+        away = hp.plan(zone, inputs(away=True), T(20), TZ)
+        self.assertEqual((home.mode, home.target, home.aim), ("hold", 22.0, 21.0))
+        self.assertEqual((away.mode, away.target, away.aim), ("away", 21.5, 21.5))
+        self.assertEqual(away.reasons, ("Mikkel away: holding 21.5 °C",))
+
+    def test_a_zone_that_waits_for_nobody_ignores_the_flag(self):
+        for zone in ("family", "kristines_room", "claudias_room", "guest_bathroom"):
+            for hour in (3, 7, 12, 20):
+                with self.subTest(zone=zone, hour=hour):
+                    self.assertEqual(plan_at(T(hour), zone, away=True), plan_at(T(hour), zone))
+
+    def test_away_allows_heat_and_the_gates_still_hold_it_back(self):
+        p = plan_at(T(7), "bathroom", away=True)
+        self.assertEqual((p.mode, p.allowed), ("away", True))
+        for state, mode in ((hp.STATE_OPEN, "window"), (hp.STATE_SETTLE, "settle")):
+            p = plan_at(T(7), "bathroom", away=True, window_state=state)
+            self.assertEqual((p.mode, p.allowed, p.aim), (mode, False, 19.0))
+
+    def test_the_season_and_the_device_gate_hide_the_mode_but_not_the_plan(self):
+        gates = ((dict(season_on=False), "off_season"), (dict(online=False), "device_offline"))
+        for kw, mode in gates:
+            p = plan_at(T(7), "bathroom", away=True, **kw)
+            self.assertEqual((p.mode, p.plan_mode, p.aim), (mode, "away", 19.0))
+
+    def test_the_projection_shows_the_stretch_as_one_away_block(self):
+        zc = CFG.zones["bathroom"]
+
+        def span(inp):
+            blocks = hp.project_blocks(zc, inp, T(0), T(0, day=18), TZ)
+            return [(hp.hhmm(s, TZ), hp.hhmm(e, TZ), m, aim) for s, e, m, aim in blocks]
+
+        self.assertEqual(
+            span(inputs("bathroom")),
+            [
+                ("00:00", "06:00", "hold", 19.0),
+                ("06:00", "09:00", "hold", 22.0),
+                ("09:00", "00:00", "hold", 19.0),
+            ],
+        )
+        self.assertEqual(span(inputs("bathroom", away=True)), [("00:00", "00:00", "away", 19.0)])
+
+    def test_the_timeline_keeps_the_hours_at_home_and_shows_the_away_stretch(self):
+        zc = CFG.zones["bathroom"]
+        log = hp.BlockLog()
+        log.observe(T(0), "2026-10-17", "hold", 19.0)
+        log.observe(T(6), "2026-10-17", "hold", 22.0)
+        log.observe(T(7, 30), "2026-10-17", "away", 19.0)
+        projected = hp.project_blocks(zc, inputs("bathroom", away=True), T(7, 30), T(0, day=18), TZ)
+        rows = hp.render_blocks(log, projected, T(7, 30), T(0, day=18), TZ)
+        self.assertEqual(
+            rows,
+            [
+                {"start": "00:00", "end": "06:00", "mode": "hold", "setpoint": "19.0"},
+                {"start": "06:00", "end": "07:30", "mode": "hold", "setpoint": "22.0"},
+                {"start": "07:30", "end": "24:00", "mode": "away", "setpoint": "19.0"},
+            ],
+        )
 
 
 class FloorCap(unittest.TestCase):
