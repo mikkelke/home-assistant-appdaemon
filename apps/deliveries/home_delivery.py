@@ -387,13 +387,9 @@ def parcel_day(parcel):
 
 def amazon_order(parcels):
     """One parcel for the Amazon items of one order due the same day: delivered only when every item is, else the
-    first item still under way, with the order id and that day as its barcode."""
+    first item still under way. Its barcode is the lowest item barcode, so it keeps its id when the day moves."""
     under_way = [parcel for parcel in parcels if parcel.get("status") != "delivered"]
-    first = (under_way or parcels)[0]
-    order, day = AMAZON_ORDER.match(tidy(first.get("barcode"))), parcel_day(first)
-    if order is None:
-        return first
-    return {**first, "barcode": f"{order.group(0)}-{day.isoformat()}" if day else order.group(0)}
+    return {**(under_way or parcels)[0], "barcode": min(tidy(parcel.get("barcode")) for parcel in parcels)}
 
 
 def without_amazon_copies(lists):
