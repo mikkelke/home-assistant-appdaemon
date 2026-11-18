@@ -826,6 +826,60 @@ class ParcelDeliveriesTests(unittest.TestCase):
         self.assertEqual(hd.parcel_deliveries([], NOW), [])
 
 
+class AmazonCopiesTests(unittest.TestCase):
+    @staticmethod
+    def amazon(item, order="028-0000001-0000001", status="in_transit", tracking=None, **times):
+        """As the aggregator passes it on: no raw, the barcode Amazon's tracking id, else order id plus item."""
+        return parcel(carrier="Amazon", barcode=tracking or f"{order}-t{item}", status=status, sender=None, **times)
+
+    def barcodes(self, lists):
+        return [[p["barcode"] for p in parcels] for parcels in hd.without_amazon_copies(lists)]
+
+    def test_the_items_of_one_order_are_one_parcel(self):
+        items = [self.amazon("1", start=at(60)), self.amazon("2", start=at(60)),
+                 self.amazon("3", order="028-0000002-0000002", start=at(60))]
+        self.assertEqual(self.barcodes([items, []]), [["028-0000001-0000001", "028-0000002-0000002"], []])
+
+    def test_an_order_is_delivered_only_when_every_item_is(self):
+        items = [self.amazon("1", status="delivered", delivered_at=at(-5)), self.amazon("2", start=at(60))]
+        [[order]] = hd.without_amazon_copies([items])
+        self.assertEqual(order["status"], "in_transit")
+
+    def test_a_carrier_parcel_from_amazon_on_the_same_day_hides_amazons_copy(self):
+        airmee = parcel(carrier="Airmee", barcode="c443dc28", sender="Amazon", start=at(30), end=at(240))
+        mine = self.amazon("1", start=at(60))
+        self.assertEqual(self.barcodes([[airmee, mine]]), [["c443dc28"]])
+        found = hd.parcel_deliveries(hd.without_amazon_copies([[airmee, mine], []]), NOW)
+        self.assertEqual([d.id for d in found], ["airmee:c443dc28"])
+
+    def test_the_carrier_copy_hides_amazon_across_lists(self):
+        done = parcel(carrier="Airmee", barcode="c443dc28", sender="Amazon", status="delivered", delivered_at=at(-5))
+        mine = self.amazon("1", status="delivered", delivered_at=at(-20))
+        self.assertEqual(self.barcodes([[], [done, mine]]), [[], ["c443dc28"]])
+
+    def test_amazons_tracking_id_at_a_carrier_hides_it_whatever_the_sender(self):
+        postnord = parcel(barcode="LA508420838NL", sender="Netherlands (the)")
+        mine = self.amazon("1", tracking="LA508420838NL", start=at(60 * 24 * 3))
+        self.assertEqual(self.barcodes([[postnord, mine]]), [["LA508420838NL"]])
+
+    def test_amazon_stays_when_no_carrier_has_it(self):
+        other_day = parcel(carrier="Airmee", barcode="c443dc28", sender="Amazon", start=at(60 * 24), end=at(60 * 25))
+        other_shop = parcel(sender="Test Shop", start=at(60))
+        mine = self.amazon("1", start=at(60))
+        self.assertEqual(self.barcodes([[other_day, other_shop, mine]]),
+                         [["c443dc28", "TESTPN0001", "028-0000001-0000001"]])
+        [d] = [d for d in hd.parcel_deliveries(hd.without_amazon_copies([[mine]]), NOW)]
+        self.assertEqual((d.id, d.title), ("amazon:028-0000001-0000001", "Amazon"))
+
+    def test_a_tracking_id_without_an_order_id_is_its_own_parcel(self):
+        mine = self.amazon("1", tracking="1Z999AA10123456784", start=at(60))
+        self.assertEqual(self.barcodes([[mine]]), [["1Z999AA10123456784"]])
+
+    def test_other_carriers_and_junk_pass_untouched(self):
+        lists = [[parcel(), None, parcel(carrier="Airmee", barcode="X1", sender="Amazon")], []]
+        self.assertEqual(hd.without_amazon_copies(lists), lists)
+
+
 class ParcelUpcomingTests(unittest.TestCase):
     def upcoming(self, *parcels, listed=()):
         return hd.upcoming_parcels(list(parcels), set(listed))

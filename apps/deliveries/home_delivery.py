@@ -3,8 +3,9 @@
 Each source is a reader that returns Delivery records. Wolt comes from the Wait for Wolt integration's
 entities, found by name so a new venue needs no config; Nemlig comes from the signed-in homepage's featured
 order, polled slowly until the delivery day; parcels come from the Parcel Aggregator's incoming and delivered
-lists, one source per carrier. A ledger remembers what the readers cannot: that an order ended (kept
-KEEP_ENDED_S) and that one went missing (held HOLD_MISSING_S in case its source blinked).
+lists, one source per carrier, Amazon's own parcels only where no carrier tracks the package. A ledger remembers
+what the readers cannot: that an order ended (kept KEEP_ENDED_S) and that one went missing (held HOLD_MISSING_S in
+case its source blinked).
 
 A parcel is listed only when it matters today: out for delivery, registered or in transit with an expected time
 that falls today, or delivered. Everything else the aggregator holds (days away, at a pickup point, returning,
@@ -82,6 +83,8 @@ PARCELS_DELIVERED = "sensor.parcel_aggregator_delivered_parcels"
 PARCEL_NOT_YET_OUT = ("registered", "in_transit")
 PARCEL_ARRIVING_S = 900
 CARRIER_BRANDS = {"posten_bring": "Bring"}
+AMAZON = "amazon"
+AMAZON_ORDER = re.compile(r"\d{3}-\d{7}-\d{7}")
 DANISH_LETTERS = str.maketrans({"æ": "ae", "ø": "oe", "å": "aa"})
 
 INTERCOM_VISIT = "sensor.intercom_visit"
@@ -371,6 +374,54 @@ def parcel_identity(parcel):
     carrier, barcode = tidy(parcel.get("carrier")), tidy(parcel.get("barcode"))
     source = re.sub(r"[^a-z0-9]+", "_", carrier.lower().translate(DANISH_LETTERS)).strip("_")
     return (CARRIER_BRANDS.get(source, carrier), source, barcode) if source and barcode else None
+
+
+def parcel_day(parcel):
+    """The local day a parcel was delivered or is planned for; None when it gives no time."""
+    for key in ("delivered_at", "planned_from", "planned_to"):
+        at = epoch(parcel.get(key))
+        if at is not None:
+            return local_day(at)
+    return None
+
+
+def amazon_order(parcels):
+    """One parcel for the Amazon items of one order: delivered only when every item is, else the first item still
+    under way, with the order id as its barcode."""
+    under_way = [parcel for parcel in parcels if parcel.get("status") != "delivered"]
+    first = (under_way or parcels)[0]
+    order = AMAZON_ORDER.match(tidy(first.get("barcode")))
+    return {**first, "barcode": order.group(0)} if order else first
+
+
+def without_amazon_copies(lists):
+    """The aggregator's lists with Amazon's own parcels cut to one per order, and dropped where a carrier already
+    tracks the package: a carrier parcel with Amazon's barcode (its tracking id, when Amazon has one), or one from
+    an Amazon sender on the same day. Amazon lists every item of an order as a parcel (barcode order id plus item)
+    and hands most to carriers whose own parcels carry the courier, window and ETA, so the carrier's is kept."""
+    carried, days = set(), set()
+    for parcels in lists:
+        for parcel in parcels:
+            identity = parcel_identity(parcel)
+            if identity is None or identity[1] == AMAZON:
+                continue
+            carried.add(identity[2])
+            if AMAZON in tidy(parcel.get("sender")).lower():
+                days.add(parcel_day(parcel))
+    days.discard(None)
+    result = []
+    for parcels in lists:
+        kept, orders = [], {}
+        for parcel in parcels:
+            identity = parcel_identity(parcel)
+            if identity is None or identity[1] != AMAZON:
+                kept.append(parcel)
+            elif identity[2] not in carried:
+                order = AMAZON_ORDER.match(identity[2])
+                orders.setdefault(order.group(0) if order else identity[2], []).append(parcel)
+        kept.extend(order for order in map(amazon_order, orders.values()) if parcel_day(order) not in days)
+        result.append(kept)
+    return result
 
 
 def parcel_delivery(parcel, now):
@@ -908,6 +959,7 @@ class HomeDelivery(hass.Hass):
         for entity_id in (PARCELS_INCOMING, PARCELS_DELIVERED):
             parcels = attributes(self.get_state(entity_id, attribute="all")).get("parcels")
             lists.append(parcels if isinstance(parcels, list) else [])
+        lists = without_amazon_copies(lists)
         self._incoming = lists[0]
         return parcel_deliveries(lists, now)
 
