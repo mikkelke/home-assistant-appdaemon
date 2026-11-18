@@ -2,12 +2,13 @@
 
 An add opens or tops up a bag of that bean and closes other bags without a full dose left. A brew
 that ground debits its bag once. Negative estimates are shown as zero. Undo restores the bags before
-the add and reapplies subsequent debits and manual closures.
+the add and reapplies subsequent debits, retags and manual closures.
 """
 
 from datetime import datetime, timedelta
 
 UNDO_S = 600
+RETAG_S = 86400
 LOW_BREWS = 2
 MAX_OPS = 40
 MAX_ADD_G = 2000
@@ -65,7 +66,7 @@ class Beans:
 
     def _op_id(self, now):
         self.seq += 1
-        return f"o{int(now.timestamp())}{self.seq % 100:02d}"
+        return f"o{int(now.timestamp())}{self.seq:02d}"
 
     def _name(self, bean_id):
         return next((b["name"] for b in self.known if b["id"] == bean_id), None)
@@ -84,12 +85,14 @@ class Beans:
     def _snapshot(self):
         return {"bags": [dict(bag) for bag in self.bags], "known": [dict(b) for b in self.known]}
 
-    def _keep(self, op):
-        self.ops = (self.ops + [op])[-MAX_OPS:]
-
     def _record(self, kind, now, **fields):
         op_id = self._op_id(now)
-        self._keep({"id": op_id, "kind": kind, "at": now.isoformat(timespec="seconds"), **fields})
+        self.ops = self.ops + [{"id": op_id, "kind": kind, "at": now.isoformat(timespec="seconds"), **fields}]
+        if len(self.ops) > MAX_OPS:
+            # Keep the accounting history of any brew that can still be retagged.
+            cutoff = int(now.timestamp()) - RETAG_S
+            self.ops = [change for change in self.ops[:-MAX_OPS]
+                        if (at := _parse(change.get("at"))) and at.timestamp() >= cutoff] + self.ops[-MAX_OPS:]
         return op_id
 
     def bag(self, bean_id):
@@ -172,6 +175,43 @@ class Beans:
         self._record("debit", now, brew_id=brew_id, grams=grams, bean_id=bean_id, applied=applied)
         return applied
 
+    def _retag_credit(self, op):
+        old_bean_id = op["from_bean_id"]
+        if old_bean_id is None:
+            return 0, False
+        opening = None
+        for change in reversed(self.ops):
+            if change.get("bean_id") != old_bean_id:
+                continue
+            kind = change.get("kind")
+            if kind in ("debit", "retag") and change.get("brew_id") == op["brew_id"]:
+                # Undo can change whether this charge landed. A reopened bag never held the old charge.
+                credit_g = change.get("grams") if change.get("applied") else 0
+                return credit_g, opening is None
+            if kind == "add" and opening is None:
+                before = _load_bags(change.get("before") or {})
+                if not any(bag["bean_id"] == old_bean_id for bag in before):
+                    opening = change
+        # A legacy ledger may outlast its debit op. Its charge predates any opening after the brew finished.
+        at = _parse((opening or {}).get("at"))
+        finished_at = op.get("finished_at")
+        reopened = opening is not None and (finished_at is None or (at is not None and at.timestamp() > finished_at))
+        return op["credit_g"], not reopened
+
+    def _apply_retag(self, op):
+        credit_g, same_bag = self._retag_credit(op)
+        if credit_g and same_bag:
+            self._apply_debit(op["from_bean_id"], -float(credit_g))
+        grams = op["grams"]
+        return {**op, "credit_g": credit_g, "applied": bool(grams and self._apply_debit(op["bean_id"], grams))}
+
+    def retag(self, brew_id, old_bean_id, debited_g, bean_id, grams, now, finished_at=None):
+        """Moves a brew's charge to its corrected bean and returns the grams charged there."""
+        op = self._apply_retag({"brew_id": brew_id, "from_bean_id": old_bean_id, "credit_g": debited_g or 0,
+                                "bean_id": bean_id, "grams": grams, "finished_at": finished_at})
+        self._record("retag", now, **op)
+        return grams if op["applied"] else 0
+
     def undoable(self, now):
         """The newest add that can still be undone, with its deadline: (op, until) or (None, None)."""
         for op in reversed(self.ops):
@@ -196,11 +236,13 @@ class Beans:
             bean_id = change.get("bean_id")
             if change.get("kind") == "debit":
                 change = {**change, "applied": self._apply_debit(bean_id, change.get("grams"))}
+            elif change.get("kind") == "retag":
+                change = self._apply_retag(change)
             elif change.get("kind") == "empty":
                 bag = self.bag(bean_id)
                 if bag is not None:
                     self.bags.remove(bag)
-            self._keep(change)
+            self.ops.append(change)
         return True
 
     def _bag_view(self, bag, dose_g):

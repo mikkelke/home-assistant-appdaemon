@@ -123,6 +123,62 @@ class DebitTests(unittest.TestCase):
         self.assertEqual(beans.bag("b1")["remaining_g"], 250.0)
 
 
+class RetagTests(unittest.TestCase):
+    def test_retag_credits_a_topped_up_bag(self):
+        beans = cbeans.Beans()
+        beans.add(100, NOW, new_name="Kenya")
+        beans.add(100, NOW, new_name="Ethiopia")
+        beans.debit("c1", 18, NOW + MIN, bean_id="b1")
+        beans.add(50, NOW + 2 * MIN, bean_id="b1")
+
+        self.assertEqual(beans.retag("c1", "b1", 18, "b2", 18, NOW + 3 * MIN), 18)
+        self.assertEqual((beans.bag("b1")["remaining_g"], beans.bag("b2")["remaining_g"]), (150.0, 82.0))
+
+    def test_retag_does_not_credit_a_reopened_bag(self):
+        beans = cbeans.Beans()
+        beans.add(100, NOW, new_name="Kenya")
+        beans.add(100, NOW, new_name="Ethiopia")
+        beans.debit("c1", 18, NOW + MIN, bean_id="b1")
+        beans.empty("b1", NOW + 2 * MIN)
+        beans.add(150, NOW + 3 * MIN, bean_id="b1")
+
+        self.assertEqual(beans.retag("c1", "b1", 18, "b2", 18, NOW + 4 * MIN), 18)
+        self.assertEqual((beans.bag("b1")["remaining_g"], beans.bag("b2")["remaining_g"]), (150.0, 82.0))
+
+    def test_retag_uses_the_ledger_charge_for_a_bag_opened_before_the_finish(self):
+        for reopened in (False, True):
+            with self.subTest(reopened=reopened):
+                beans = cbeans.Beans()
+                beans.add(100, NOW, new_name="Kenya")
+                beans.add(100, NOW, new_name="Ethiopia")
+                beans.debit("c1", 18, NOW + MIN, bean_id="b1")
+                if reopened:
+                    beans.empty("b1", NOW + 2 * MIN)
+                    beans.add(150, NOW + 3 * MIN, bean_id="b1")
+                beans.ops = [op for op in beans.ops if op["kind"] != "debit"]
+
+                beans.retag("c1", "b1", 18, "b2", 18, NOW + 4 * MIN, finished_at=(NOW + MIN).timestamp())
+
+                self.assertEqual(beans.bag("b1")["remaining_g"], 150.0 if reopened else 100.0)
+                self.assertEqual(beans.bag("b2")["remaining_g"], 82.0)
+
+    def test_recent_accounting_survives_more_than_the_usual_operation_limit(self):
+        beans = cbeans.Beans()
+        beans.add(100, NOW, new_name="Kenya")
+        beans.add(100, NOW, new_name="Ethiopia")
+        beans.debit("c1", 18, NOW + MIN, bean_id="b1")
+        beans.empty("b1", NOW + 2 * MIN)
+        beans.add(150, NOW + 3 * MIN, bean_id="b1")
+        op_ids = {beans.add(1, NOW + 4 * MIN, bean_id="b2") for _ in range(105)}
+        self.assertEqual(len(op_ids), 105)
+        beans = cbeans.Beans(json.loads(json.dumps(beans.to_dict())))
+
+        beans.retag("c1", "b1", 18, "b2", 18, NOW + 5 * MIN)
+        self.assertEqual(beans.bag("b1")["remaining_g"], 150.0)
+        beans.add(1, NOW + timedelta(days=2), bean_id="b2")
+        self.assertEqual(len(beans.ops), cbeans.MAX_OPS)
+
+
 class UndoTests(unittest.TestCase):
     def test_undo_restores_exactly_what_was_there(self):
         beans = cbeans.Beans()
@@ -174,6 +230,48 @@ class UndoTests(unittest.TestCase):
         self.assertTrue(beans.undo(op, NOW + 4 * MIN))
         self.assertEqual(beans.bag("b1")["remaining_g"], 250.0)
         self.assertIsNone(beans.bag("b2"))
+
+    def test_undo_retag_credits_an_old_bag_closed_by_the_add(self):
+        beans = cbeans.Beans()
+        beans.add(30, NOW, new_name="Kenya")
+        beans.add(100, NOW, new_name="Ethiopia")
+        beans.debit("c1", 18, NOW + MIN, bean_id="b1")
+        op = beans.add(250, NOW + 2 * MIN, new_name="Colombia", dose_g=18)
+        self.assertIsNone(beans.bag("b1"))
+        self.assertEqual(beans.retag("c1", "b1", 18, "b2", 18, NOW + 3 * MIN), 18)
+
+        self.assertTrue(beans.undo(op, NOW + 4 * MIN))
+        self.assertEqual([(bag["bean_id"], bag["remaining_g"]) for bag in beans.bags],
+                         [("b2", 82.0), ("b1", 30.0)])
+
+    def test_undo_retag_credits_a_debit_that_only_applied_during_replay(self):
+        beans = cbeans.Beans()
+        beans.add(12, NOW, new_name="Kenya")
+        beans.add(100, NOW, new_name="Ethiopia")
+        op = beans.add(250, NOW + MIN, new_name="Colombia", dose_g=18)
+        self.assertFalse(beans.debit("c1", 18, NOW + 2 * MIN, bean_id="b1"))
+        self.assertEqual(beans.retag("c1", "b1", 0, "b2", 18, NOW + 3 * MIN), 18)
+
+        self.assertTrue(beans.undo(op, NOW + 4 * MIN))
+        self.assertEqual([(bag["bean_id"], bag["remaining_g"]) for bag in beans.bags],
+                         [("b2", 82.0), ("b1", 12.0)])
+
+    def test_retag_after_undo_does_not_credit_a_debit_that_no_longer_applies(self):
+        beans = cbeans.Beans()
+        beans.add(40, NOW, new_name="Kenya")
+        beans.add(100, NOW, new_name="Ethiopia")
+        beans.empty("b2", NOW)
+        beans.debit("c1", 18, NOW + MIN, bean_id="b1")
+        op = beans.add(100, NOW + 2 * MIN, bean_id="b2")
+        beans.retag("c1", "b1", 18, "b2", 18, NOW + 3 * MIN)
+        self.assertTrue(beans.undo(op, NOW + 4 * MIN))
+        self.assertEqual(beans.bag("b1")["remaining_g"], 40.0)
+        self.assertIsNone(beans.bag("b2"))
+
+        beans.add(100, NOW + 5 * MIN, bean_id="b2")
+        beans.retag("c1", "b2", 18, "b1", 18, NOW + 6 * MIN)
+        self.assertEqual([(bag["bean_id"], bag["remaining_g"]) for bag in beans.bags],
+                         [("b2", 100.0), ("b1", 22.0)])
 
     def test_undo_only_the_newest_add_and_only_within_ten_minutes(self):
         beans = cbeans.Beans()

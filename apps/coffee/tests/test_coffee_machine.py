@@ -9,6 +9,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import coffee_fake as fake  # noqa: E402
@@ -893,6 +894,9 @@ class BeansTests(unittest.TestCase):
         fake.op(app, "beans_add", {"grams": 500, "new_name": "Signature Brew"})
         return app
 
+    def bean_balances(self, app):
+        return {bag["bean_id"]: bag["remaining"] for bag in fake.last(app, "sensor.coffee_beans")[1]["bags"]}
+
     def test_add_brew_open_another_bag_and_undo(self):
         app = fake.make_app()
         fake.op(app, "beans_add", {"grams": 250, "new_name": "Kenya Kiambu"})
@@ -997,6 +1001,181 @@ class BeansTests(unittest.TestCase):
         again = fake.make_app(state_dir=app.dir, now=app.now + 1, recipes=())
         self.assertEqual([b["bean_id"] for b in fake.last(again, "sensor.coffee_beans")[1]["bags"]], ["b2"])
         self.assertEqual(fake.last(again, "sensor.coffee_baseline")[1]["bean_id"], "b2")
+
+    def test_retag_moves_the_dose_and_updates_the_finished_brew_and_baseline(self):
+        app = self.two_bags()
+        tape = fake.synthetic_brew(BREW_ID)
+        fake.replay(app, [step for step in tape if step[0] <= 240])
+        self.assertEqual(coffee_state(app)[0], "ready")
+        self.assertEqual(fake.last(app, "sensor.coffee_baseline")[1]["n"], "1")
+        fake.op(app, "rate", {"brew_id": BREW_ID, "taste": "balanced"})
+        before = fake.ledger(app)[-1]
+        before_history = len(app.history)
+
+        fake.op(app, "beans_retag", {"brew_id": BREW_ID, "bean_id": "b2"})
+
+        after = {**before, "bean": {"id": "b2", "name": "Signature Brew"}}
+        self.assertEqual(fake.ledger(app)[-1], after)
+        self.assertEqual(self.bean_balances(app), {"b1": "214", "b2": "485"})
+        self.assertEqual(coffee_state(app)[1]["bean_id"], "b2")
+        self.assertEqual(coffee_state(app)[1]["bean_name"], "Signature Brew")
+        brews = fake.last(app, "sensor.coffee_brews")[1]
+        self.assertEqual(brews["brews"][0]["bean_name"], "Signature Brew")
+        self.assertEqual(brews["rated_current_beans"], "0")
+        self.assertEqual(fake.last(app, "sensor.coffee_baseline")[1]["n"], "0")
+        self.assertEqual(cm.ca.rated_evidence(fake.ledger(app), "b2", before["recipe"]["key"]), [after])
+        published = {entity for _, entity, _, _ in app.history[before_history:]}
+        self.assertTrue({"sensor.coffee_beans", "sensor.coffee_brews", "sensor.coffee_state"} <= published)
+        state = json.loads((app.dir / "coffee_state.json").read_text())
+        op = state["beans"]["ops"][-1]
+        self.assertEqual((op["kind"], op["brew_id"], op["bean_id"]), ("retag", BREW_ID, "b2"))
+
+        fake.op(app, "picked_up", {"brew_id": BREW_ID})
+        self.assertEqual(fake.ledger(app)[-1]["bean"], after["bean"])
+
+    def test_a_second_retag_moves_the_dose_back_once_after_restart(self):
+        app = self.two_bags()
+        brew(app, power=False)
+        fake.op(app, "beans_retag", {"brew_id": BREW_ID, "bean_id": "b2"})
+        app = fake.make_app(state_dir=app.dir, now=app.now + 1, recipes=())
+        self.assertEqual(self.bean_balances(app), {"b1": "214", "b2": "485"})
+
+        fake.op(app, "beans_retag", {"brew_id": BREW_ID, "bean_id": "b1"})
+        fake.op(app, "beans_retag", {"brew_id": BREW_ID, "bean_id": "b1"})
+
+        self.assertEqual(self.bean_balances(app), {"b1": "199", "b2": "500"})
+        self.assertEqual(fake.ledger(app)[-1]["bean"], {"id": "b1", "name": "Daybreak"})
+
+    def test_retag_debits_the_target_when_the_old_bag_is_closed(self):
+        app = self.two_bags()
+        brew(app, power=False)
+        fake.op(app, "beans_empty", {"bean_id": "b1"})
+
+        fake.op(app, "beans_retag", {"brew_id": BREW_ID, "bean_id": "b2"})
+
+        self.assertEqual(self.bean_balances(app), {"b2": "485"})
+        self.assertEqual(fake.ledger(app)[-1]["bean"]["id"], "b2")
+        fake.op(app, "beans_add", {"bean_id": "b1", "grams": 100})
+        self.assertEqual(self.bean_balances(app), {"b1": "100", "b2": "485"})
+
+    def test_retag_uses_the_brew_finish_for_the_24_hour_window(self):
+        app = self.two_bags()
+        brew(app, power=False)
+        record = fake.ledger(app)[-1]
+        finish = cm.cf.epoch(record["ts"])
+        app.now = finish + 86400
+        before = (self.bean_balances(app), fake.ledger(app), len(app.logs))
+
+        fake.op(app, "beans_retag", {"brew_id": BREW_ID, "bean_id": "b2"})
+
+        self.assertEqual((self.bean_balances(app), fake.ledger(app)), before[:2])
+        self.assertTrue(any(level == "WARNING" and "beans_retag" in msg for level, msg in app.logs[before[2]:]))
+
+        app.now = finish + 86400 - 1
+        self.assertGreater(app.now - cm.cf.epoch(record["started_at"]), 86400)
+        fake.op(app, "beans_retag", {"brew_id": BREW_ID, "bean_id": "b2"})
+        self.assertEqual(self.bean_balances(app), {"b1": "214", "b2": "485"})
+
+    def test_retag_rejects_invalid_brews_or_target_beans(self):
+        app = self.two_bags()
+        brew(app, power=False)
+        fake.op(app, "beans_empty", {"bean_id": "b2"})
+        before = (self.bean_balances(app), fake.ledger(app), (app.dir / "coffee_state.json").read_text())
+        for brew_id, bean_id in ((BREW_ID, "b9"), (BREW_ID, "b2"), (BREW_ID, "b1"), ("unknown", "b1")):
+            with self.subTest(brew_id=brew_id, bean_id=bean_id):
+                log_start = len(app.logs)
+                fake.op(app, "beans_retag", {"brew_id": brew_id, "bean_id": bean_id})
+                self.assertEqual((self.bean_balances(app), fake.ledger(app),
+                                  (app.dir / "coffee_state.json").read_text()), before)
+                self.assertTrue(any(level == "WARNING" and "beans_retag" in msg
+                                    for level, msg in app.logs[log_start:]))
+
+    def test_retag_uses_the_recorded_dose_for_an_untagged_brew(self):
+        app = self.two_bags()
+        fake.op(app, "select", {"recipe_id": "81696"})
+        brew(app, power=False)
+        self.assertIsNone(fake.ledger(app)[-1]["bean"])
+
+        fake.op(app, "beans_retag", {"brew_id": BREW_ID, "bean_id": "b2"})
+
+        self.assertEqual(self.bean_balances(app), {"b1": "214", "b2": "485"})
+        record = fake.ledger(app)[-1]
+        self.assertEqual((record["bean"]["id"], record["debited_g"]), ("b2", 15.0))
+
+    def test_retag_charges_a_stopped_brew_only_if_it_ground(self):
+        for ground in (False, True):
+            with self.subTest(ground=ground):
+                app = self.two_bags()
+                fake.op(app, "select", {"recipe_id": "81696"})
+                tape = [step for step in fake.synthetic_brew(BREW_ID) if step[0] < 24]
+                tape.append((24, ("event", "xbloom_brew_stopped", {"by": "machine", "ground": ground,
+                                                                  "run_id": "r1",
+                                                                  "context": {"coffee_brew_id": BREW_ID}})))
+                fake.replay(app, tape)
+                self.assertIsNone(fake.ledger(app)[-1]["bean"])
+                app = fake.make_app(state_dir=app.dir, now=app.now + 1, recipes=())
+
+                fake.op(app, "beans_retag", {"brew_id": BREW_ID, "bean_id": "b2"})
+
+                record = fake.ledger(app)[-1]
+                self.assertEqual((record["bean"]["id"], record["debited_g"]), ("b2", 15.0 if ground else 0))
+                self.assertEqual(self.bean_balances(app), {"b1": "214", "b2": "485" if ground else "500"})
+
+    def test_undo_replays_the_retagged_brew_debit_to_its_new_bag(self):
+        app = self.two_bags()
+        fake.op(app, "beans_add", {"bean_id": "b1", "grams": 100})
+        op_id = fake.last(app, "sensor.coffee_beans")[1]["last_op_id"]
+        brew(app, power=False)
+        fake.op(app, "beans_retag", {"brew_id": BREW_ID, "bean_id": "b2"})
+
+        fake.op(app, "beans_undo", {"op_id": op_id})
+
+        self.assertEqual(self.bean_balances(app), {"b1": "214", "b2": "485"})
+        self.assertEqual(fake.ledger(app)[-1]["bean"]["id"], "b2")
+        fake.op(app, "beans_retag", {"brew_id": BREW_ID, "bean_id": "b1"})
+        self.assertEqual(self.bean_balances(app), {"b1": "199", "b2": "500"})
+
+    def test_retag_ledger_write_failure_keeps_the_dose_on_the_original_bag(self):
+        app = self.two_bags()
+        brew(app, power=False)
+        before = fake.ledger(app)
+        write_json = cm.feedback_io.write_json
+
+        def fail_ledger_write(path, data):
+            if Path(path) == app.ledger_file:
+                raise OSError("ledger unavailable")
+            return write_json(path, data)
+
+        with patch.object(cm.feedback_io, "write_json", side_effect=fail_ledger_write):
+            fake.op(app, "beans_retag", {"brew_id": BREW_ID, "bean_id": "b2"})
+
+        self.assertEqual(fake.ledger(app), before)
+        self.assertEqual(self.bean_balances(app), {"b1": "199", "b2": "500"})
+        fake.op(app, "beans_retag", {"brew_id": BREW_ID, "bean_id": "b2"})
+        self.assertEqual(self.bean_balances(app), {"b1": "214", "b2": "485"})
+
+    def test_restart_recovers_a_retag_if_the_final_state_write_failed(self):
+        app = self.two_bags()
+        brew(app, power=False)
+        write_json = cm.feedback_io.write_json
+        state_writes = []
+
+        def fail_final_state_write(path, data):
+            if Path(path) == app.state_file:
+                state_writes.append(path)
+                if len(state_writes) > 1:
+                    raise OSError("state unavailable")
+            return write_json(path, data)
+
+        with patch.object(cm.feedback_io, "write_json", side_effect=fail_final_state_write):
+            fake.op(app, "beans_retag", {"brew_id": BREW_ID, "bean_id": "b2"})
+
+        self.assertGreaterEqual(len(state_writes), 2)
+        self.assertEqual(fake.ledger(app)[-1]["bean"]["id"], "b2")
+        app = fake.make_app(state_dir=app.dir, now=app.now + 1, recipes=())
+        self.assertEqual(self.bean_balances(app), {"b1": "214", "b2": "485"})
+        fake.op(app, "beans_retag", {"brew_id": BREW_ID, "bean_id": "b2"})
+        self.assertEqual(self.bean_balances(app), {"b1": "214", "b2": "485"})
 
     def test_a_stopped_brew_that_ground_debits_its_dose(self):
         app = fake.make_app()

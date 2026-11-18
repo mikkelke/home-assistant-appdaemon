@@ -63,8 +63,8 @@ RESTORED = (None, "unavailable", "unknown")
 VARIANTS = ("usual", "base", "tweak", "other")
 PEOPLE = cw.PEOPLE
 OPS = ("start", "cup_confirmed", "cancel", "stop", "pause", "resume", "connect", "notify", "picked_up", "rate",
-       "beans_add", "beans_empty", "beans_undo", "water_filled", "select", "save_brew", "trial_accept", "trial_undo",
-       "trial_keep", "trial_revert", "advice_dismiss", "advisor_reply")
+       "beans_add", "beans_empty", "beans_undo", "beans_retag", "water_filled", "select", "save_brew", "trial_accept",
+       "trial_undo", "trial_keep", "trial_revert", "advice_dismiss", "advisor_reply")
 RATE_PREFIX = "COFFEE_RATE|"
 ENTITIES = ("coffee_state", "coffee_live", "coffee_baseline", "coffee_beans", "coffee_brews", "coffee_recipes",
             "coffee_advice")
@@ -231,6 +231,7 @@ class CoffeeMachine(hass.Hass):
 
         self._ensure_files()
         self._load_ledger(force=True)
+        self._restore_beans_retag(saved.get("pending_beans_retag"))
         self._resume(now)
         if self._switch_on():
             self._link_ready = True
@@ -836,7 +837,7 @@ class CoffeeMachine(hass.Hass):
                 "rpm": recipe.get("rpm"), "cup_type": recipe.get("cup_type"), "pours": recipe.get("pours")},
             "recipe_match": brew.get("recipe_match") or "unknown", "variant": brew.get("variant") or "unknown",
             "trial": brew.get("trial"), "bean": brew.get("bean"), "dose_g": brew.get("dose_g"),
-            "dose_basis": brew.get("dose_basis"), "debited_g": brew.get("debited_g", 0),
+            "dose_basis": brew.get("dose_basis"), "debited_g": brew.get("debited_g", 0), "ground": brew.get("ground"),
             "who": brew.get("who") or "none", "who_method": brew.get("who_method"),
             "who_evidence": brew.get("who_evidence"), "notify": brew.get("notify") or "none",
             "push": brew.get("push") or "none", "faults": brew.get("faults") or [],
@@ -1361,6 +1362,44 @@ class CoffeeMachine(hass.Hass):
         self._info(f"Beans: emptied {bean['name']}")
         self._after_beans(now)
 
+    def _op_beans_retag(self, user, data, now):
+        brew_id, bean_id = data.get("brew_id"), data.get("bean_id")
+        self._load_ledger()
+        record = next((r for r in self._records if r["id"] == brew_id), None)
+        finished = cf.epoch((record or {}).get("ts"))
+        old_bean_id = ((record or {}).get("bean") or {}).get("id")
+        bean = self._beans.bean(bean_id)
+        if (finished is None or not 0 <= now - finished < cbeans.RETAG_S or bean is None
+                or bean["name"] is None or old_bean_id == bean_id):
+            self._warn(f"beans_retag ignored: {ascii_text(data, 120)}")
+            return
+
+        debited = record.get("debited_g") or 0
+        # A brew can have ground its recorded dose without charging any bag.
+        outcome = record.get("outcome")
+        ground = record.get("ground", bool(record.get("first_bloom_at")) or outcome in (None, "complete", "unobserved"))
+        grams = debited or (record.get("dose_g") if ground else None)
+        beans = cbeans.Beans(self._beans.to_dict())
+        charged = beans.retag(brew_id, old_bean_id, debited, bean_id, grams, self._now_dt(), finished_at=finished)
+        pending = {"brew_id": brew_id, "bean_id": bean_id, "beans": beans.to_dict()}
+        if not self._save_state(pending_beans_retag=pending):
+            self._warn(f"beans_retag ignored: could not save inventory for {ascii_text(brew_id, 40)}")
+            return
+        updated = self._upsert_record(brew_id=brew_id, bean=bean, debited_g=charged)
+        if updated is None:
+            self._warn(f"beans_retag ignored: could not update brew {ascii_text(brew_id, 40)}")
+            return
+        self._apply_beans_retag(beans, updated)
+        self._info(f"Beans: retagged brew {brew_id} to {bean['name']}")
+        self._after_beans(now, force=True)
+        self._publish_state()
+
+    def _apply_beans_retag(self, beans, record):
+        self._beans = beans
+        for brew in (self._tracker.brew, self._tracker.last):
+            if brew is not None and brew["id"] == record["id"]:
+                brew.update(bean=record["bean"], debited_g=record["debited_g"])
+
     def _op_beans_undo(self, user, data, now):
         if not self._beans.undo(data.get("op_id"), self._now_dt()):
             self._warn(f"beans_undo ignored: {ascii_text(data.get('op_id'), 40)}")
@@ -1368,9 +1407,9 @@ class CoffeeMachine(hass.Hass):
         self._info("Beans: add undone")
         self._after_beans(now)
 
-    def _after_beans(self, now):
+    def _after_beans(self, now, force=False):
         self._recompute_baseline(now)
-        self._publish("coffee_beans")
+        self._publish("coffee_beans", force=force)
         self._publish("coffee_brews", force=True)
         self._publish("coffee_advice")
         self._save_state()
@@ -1741,12 +1780,25 @@ class CoffeeMachine(hass.Hass):
         self._saved_at = data.get("saved_at")
         return data
 
-    def _save_state(self):
+    def _restore_beans_retag(self, pending):
+        """Finish a checkpointed correction if its ledger update made it to disk."""
+        if not isinstance(pending, dict) or not isinstance(pending.get("beans"), dict):
+            return
+        record = next((r for r in self._records if r["id"] == pending.get("brew_id")), None)
+        bean_id = pending.get("bean_id")
+        if bean_id and record and (record.get("bean") or {}).get("id") == bean_id:
+            self._apply_beans_retag(cbeans.Beans(pending["beans"]), record)
+
+    def _save_state(self, pending_beans_retag=None):
         data = {"version": STATE_VERSION, "saved_at": cf.iso(self._now()), "usual_id": self._usual_id,
                 "beans": self._beans.to_dict(), "tank": self._tank.to_dict(), "advice": self._advice.to_dict(),
                 "connect": self._connect.to_dict(), "pending_notify": self._pending_notify, "recipes": self._recipes,
                 "baseline": self._baseline, "tracker": self._tracker.to_dict(), "power": self._power.snapshot()}
+        if pending_beans_retag is not None:
+            data["pending_beans_retag"] = pending_beans_retag
         try:
             feedback_io.write_json(str(self.state_file), data)
         except Exception as e:
             self._warn(f"State file write failed: {e!r}")
+            return False
+        return True
