@@ -142,11 +142,11 @@ class Rober2Control(hass.Hass):
             '25',  # kitchen_2
             '18',  # living_room
             '21',  # dining_room
-            '23',  # claudias room
             '16',  # kristines_room
             '20',  # bedroom
             '24',  # bathroom
-            '19'   # guest_bathroom
+            '19',  # guest_bathroom
+            '23',  # claudias room last: the robot gets trapped there
         ]
         
         # Constants for immediate room queuing
