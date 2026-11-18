@@ -7,6 +7,7 @@ EsphomeLinkWatch:
   # One entity per device that reports whenever the device is connected.
   probes:
     - sensor.bathroom_bathroom_display_loop_time
+    - sensor.airdot_b49928_co2
   stale_s: 120
   cooldown_s: 600
   max_reloads: 3
