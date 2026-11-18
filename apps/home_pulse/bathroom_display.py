@@ -108,7 +108,8 @@ The lines for Mikkel, at most three, in this order:
               detail) and any other row with no time (an offline battery, a dry sensor plant), which is
               due now, as it is on the dashboard. Then the rows of the zone's own area (the zone doubles
               as the HA area id) timed within 14 days. A line is the row's title, cut back to a whole word
-              and ended in "..." when it is longer than LINE_MAX; its due chip counts house days.
+              and ended in "..." when it is longer than LINE_MAX; its due chip counts house days. With
+              task_days, only rows due by that many house days after today (the bedroom: 1).
 
 The weighing: the scale claims a weighing for Mikkel only while his phone is in the bathroom. It is a change
 of the state of measured_entity (sensor.mikkel_last_measurement, a timestamp) to a moment at most WEIGH_FRESH
@@ -513,14 +514,17 @@ def _icon(row):
     return core.clean_text(icon, ICON_MAX) if isinstance(icon, str) and icon.startswith("mdi:") else ""
 
 
-def task_lines(rows, now, resident=RESIDENT, area=ZONE, limit=LINES):
+def task_lines(rows, now, resident=RESIDENT, area=ZONE, limit=LINES, days=None):
     """At most `limit` lines from the house_upcoming rows: what is due by SOON from now (including anything
-    overdue or due now), earliest first, then the rows of `area` due within AHEAD, earliest first."""
+    overdue or due now), earliest first, then the rows of `area` due within AHEAD, earliest first. With `days`,
+    only rows due by that many house days after today."""
     soon, later = [], []
     for row in rows if isinstance(rows, list) else []:
         if not _wanted(row, resident):
             continue
         due = due_at(row, now)
+        if days is not None and (maint.house_date(due) - maint.house_date(now)).days > days:
+            continue
         if due <= now + SOON:
             soon.append((due, str(row.get("id")), row))
         elif row.get("area") == area and due <= now + AHEAD:
@@ -761,6 +765,7 @@ class BathroomDisplay(hass.Hass):
         self.rise_db = float(a.get("rssi_rise_db", RISE_DB))
         self.rssi_fresh = timedelta(seconds=float(a.get("rssi_fresh_s", RSSI_FRESH_S)))
         self.upcoming_entity = a.get("upcoming_entity", "sensor.house_upcoming")
+        self.task_days = a.get("task_days")
         self.routes = [(str(route["label"]), route["entity"]) for route in a.get("transit") or []]
         self.transit_max_age = timedelta(minutes=float(a.get("transit_max_age_min", TRANSIT_MAX_AGE_MIN)))
         self.washer_entity = a.get("washer_entity", WASHER)
@@ -1030,7 +1035,7 @@ class BathroomDisplay(hass.Hass):
             if line:
                 lines.append(line)
         rows = live_rows(self._cache.get(self.upcoming_entity), now)
-        return (lines + task_lines(rows, now, self.resident, self.zone, LINES - len(lines)))[:LINES]
+        return (lines + task_lines(rows, now, self.resident, self.zone, LINES - len(lines), self.task_days))[:LINES]
 
     def _card(self, now):
         """The weighing card while it shows: CARD_S from the weighing, once the look at 30 days ago is in, and

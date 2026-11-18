@@ -463,6 +463,16 @@ class RowTests(unittest.TestCase):
                                                          "Kitchen in six days", "Bathroom soon", "Bathroom later"])
         self.assertEqual([line.due for line in lines], ["overdue", "today", "6 d", "8 d", "9 d"])
 
+    def test_with_days_only_rows_due_by_that_many_house_days_after_today_are_lines(self):
+        rows = [maint_row("old", "Overdue", at=NOW - 3 * DAY),
+                maint_row("today", "Tonight", at=NOW + 14 * HOUR),
+                maint_row("tomorrow", "Tomorrow night", at=NOW + DAY + 15 * HOUR, area="bathroom"),
+                maint_row("after", "After tomorrow", at=NOW + DAY + 16 * HOUR, area="bathroom"),
+                maint_row("week", "In five days", at=NOW + 5 * DAY)]
+        self.assertEqual([(line.text, line.due) for line in self.lines(rows, limit=10, days=1)],
+                         [("Overdue", "overdue"), ("Tonight", "today"), ("Tomorrow night", "tomorrow")])
+        self.assertEqual(len(self.lines(rows, limit=10)), 5)
+
     def test_at_most_three_lines(self):
         rows = [maint_row(f"r{i}", f"Row {i}", at=NOW + i * HOUR) for i in range(5)]
         self.assertEqual([line.text for line in self.lines(rows)], ["Row 0", "Row 1", "Row 2"])
@@ -3209,11 +3219,12 @@ class BedroomDisplayTests(unittest.TestCase):
         self.assertEqual(shown(app), [("Alarm 09:15", "mdi:alarm", "09:15"), BLANK, BLANK])
         self.assertEqual(app.tasks, [])
 
-    def test_the_bedroom_gets_its_own_upcoming_rows(self):
-        rows = [maint_row("bathroom", "Bathroom in eight days", at=NOW + 8 * DAY, area="bathroom"),
+    def test_the_bedroom_shows_only_rows_due_today_or_tomorrow(self):
+        rows = [maint_row("kitchen", "Kitchen tomorrow", at=NOW + DAY, area="kitchen"),
+                maint_row("drum", "Washer in two days", at=NOW + 2 * DAY, area="guest_bathroom"),
                 maint_row("bedroom", "Bedroom in nine days", at=NOW + 9 * DAY, area="bedroom")]
         app = self.app({UPCOMING: upcoming(rows)})
-        self.assertEqual(shown(app), [("Bedroom in nine days", "mdi:information-outline", "9 d"), BLANK, BLANK])
+        self.assertEqual(shown(app), [("Kitchen tomorrow", "mdi:information-outline", "tomorrow"), BLANK, BLANK])
 
     def test_the_bedroom_alarm_event_toggles_the_same_alarm(self):
         app = self.app()

@@ -82,6 +82,7 @@ BedroomDisplay:
   resident: Mikkel
   resident_when_active: true
   upcoming_entity: sensor.house_upcoming
+  task_days: 1
   sleep_entity: input_boolean.mikkel_sleep_mode
   transit:
     - {entity: sensor.transit_enghave_metro_kbh, label: Metro}
