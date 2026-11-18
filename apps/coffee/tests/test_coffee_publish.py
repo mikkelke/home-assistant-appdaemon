@@ -213,11 +213,24 @@ class OtherEntityTests(unittest.TestCase):
         beans = cbeans.Beans()
         now = datetime.fromtimestamp(NOW, timezone.utc)
         for i in range(80):
-            beans.add(250, now, new_name=f"A long bean name from a roaster number {i:02d}")
-        state, attrs = pub.beans_entity(beans.view(15.0, now))
+            beans.add(250, now, new_name=f"{i:02d} A long bean name from a coffee roaster")
+            beans.empty(f"b{i + 1}", now)
+        beans.add(214, now, new_name="Daybreak")
+        beans.add(500, now + timedelta(minutes=1), new_name="Signature Brew")
+        recipes = [{"id": "Daybreak", "name": "Daybreak", "dose_g": 18.0},
+                   {"id": "Signature Brew", "name": "Signature Brew", "dose_g": 16.0}]
+        state, attrs = pub.beans_entity(beans.view(18.0, now + timedelta(minutes=1), "Daybreak", recipes))
         all_strings(self, attrs, "coffee_beans")
-        self.assertEqual(state, "20000")
-        self.assertEqual(attrs["dose_g"], "15")
+        self.assertEqual((state, attrs["remaining"], attrs["bean_name"], attrs["brews_left"], attrs["dose_g"]),
+                         ("214", "214", "Daybreak", "11", "18"))
+        self.assertLess(len(attrs["known_beans"]), len(beans.known))
+        self.assertEqual(attrs["known_beans"][-1], beans.known[-1])
+        self.assertEqual(attrs["bags"], [
+            {"bean_id": "b82", "bean_name": "Signature Brew", "remaining": "500", "brews_left": "31",
+             "low": "no", "added_at": "2026-10-20T06:01:00+00:00", "recipe_id": "Signature Brew"},
+            {"bean_id": "b81", "bean_name": "Daybreak", "remaining": "214", "brews_left": "11",
+             "low": "no", "added_at": "2026-10-20T06:00:00+00:00", "recipe_id": "Daybreak"},
+        ])
 
     def test_the_beans_example(self):
         beans = cbeans.Beans()
@@ -228,7 +241,13 @@ class OtherEntityTests(unittest.TestCase):
                                                                                              "Kenya Kiambu", "7"))
         self.assertNotIn("low", attrs)
         self.assertEqual(attrs["known_beans"], [{"id": "b1", "name": "Kenya Kiambu"}])
-        self.assertEqual(pub.beans_entity(cbeans.Beans().view(15.0, now))[0], "unknown")
+        self.assertEqual(attrs["bags"], [
+            {"bean_id": "b1", "bean_name": "Kenya Kiambu", "remaining": "112", "brews_left": "7",
+             "low": "no", "added_at": "2026-10-20T06:00:00+00:00", "recipe_id": ""},
+        ])
+        state, attrs = pub.beans_entity(cbeans.Beans().view(15.0, now))
+        self.assertEqual((state, attrs["bags"]), ("unknown", []))
+        self.assertNotIn("remaining", attrs)
 
     def test_brews_cap_and_aggregates(self):
         records = [record(i) for i in range(120)]

@@ -1,5 +1,5 @@
 """CoffeeMachine - the xBloom Studio in the house: one owner for each brew's lifecycle, its 1 Hz curve,
-the brew ledger, the usual's baseline, the beans container, the water tank, the Bluetooth link, the cup on
+the brew ledger, the usual's baseline, the open bags of beans, the water tank, the Bluetooth link, the cup on
 the scale, who made it and who is told, the maintenance counts and the advisor. Publishes sensor.coffee_state,
 _live, _baseline, _beans, _brews, _recipes and _advice (contract v1, see coffee_publish.py) and the files under
 /media/coffee.
@@ -10,7 +10,7 @@ user is data.metadata.context.user_id), the ready push's rating buttons, and Ber
 who. A value from a state callback is never replaced by a later read: AppDaemon 4.5.13's store can lag.
 
 Files: coffee_feedback.json (the ledger, one record per brew that ground; HouseUpcoming counts its
-maintenance runs from it), coffee_state.json (beans container, water tank, usual, advice, link suppression
+maintenance runs from it), coffee_state.json (open bean bags, water tank, usual, advice, link suppression
 and the brew in flight, saved every CHECKPOINT_S), /media/coffee/brews/<id>.json (each brew's 1 Hz curve),
 /media/coffee/bands/<baseline id>.json and /media/coffee/recent.json (60 days at 2 s with the bands
 the brews were compared with; read by the dashboard through shell_command.coffee_recent).
@@ -63,8 +63,8 @@ RESTORED = (None, "unavailable", "unknown")
 VARIANTS = ("usual", "base", "tweak", "other")
 PEOPLE = cw.PEOPLE
 OPS = ("start", "cup_confirmed", "cancel", "stop", "pause", "resume", "connect", "notify", "picked_up", "rate",
-       "beans_add", "beans_undo", "water_filled", "select", "save_brew", "trial_accept", "trial_undo", "trial_keep",
-       "trial_revert", "advice_dismiss", "advisor_reply")
+       "beans_add", "beans_empty", "beans_undo", "water_filled", "select", "save_brew", "trial_accept", "trial_undo",
+       "trial_keep", "trial_revert", "advice_dismiss", "advisor_reply")
 RATE_PREFIX = "COFFEE_RATE|"
 ENTITIES = ("coffee_state", "coffee_live", "coffee_baseline", "coffee_beans", "coffee_brews", "coffee_recipes",
             "coffee_advice")
@@ -294,6 +294,9 @@ class CoffeeMachine(hass.Hass):
 
     def _usual(self):
         return cp.by_id(self._recipes, self._usual_id)
+
+    def _usual_bean(self):
+        return self._beans.for_recipe((self._usual() or {}).get("name"))
 
     def _person_for(self, user_id, at=None):
         """The resident whose HA account `user_id` is, through ActorAttribution; None for anyone else."""
@@ -620,9 +623,18 @@ class CoffeeMachine(hass.Hass):
                 brew["dose_g"], brew["dose_basis"] = recipe["dose_g"], "sent"
             elif usual is not None:
                 brew["dose_g"], brew["dose_basis"] = usual["dose_g"], "usual"
-        brew["bean"] = self._beans.bean()
+        if "bean" not in brew:
+            brew["bean"] = self._beans.for_recipe((recipe or {}).get("name") or brew.get("recipe_name"))
         if brew.get("variant") in ("usual", "base", "trial", "tweak"):
-            brew["baseline"] = cb.frozen(self._baseline)
+            bean_id = (brew["bean"] or {}).get("id")
+            base = self._baseline or {}
+            usual_adjusted = (brew["variant"] in ("trial", "tweak") and usual and recipe
+                              and usual["id"] == recipe["id"])
+            if base.get("bean_id") == bean_id and (base.get("recipe_key") == brew.get("recipe_key")
+                                                   or usual_adjusted):
+                brew["baseline"] = cb.frozen(base)
+            elif recipe is not None and brew.get("variant") in cb.COHORT_VARIANTS:
+                brew["baseline"] = cb.frozen(self._baseline_for(recipe, bean_id, now))
         if brew.get("variant") == "other" and recipe is not None:
             self._set_usual(recipe, now)
         self._take_pending_chip(brew, now)
@@ -740,8 +752,9 @@ class CoffeeMachine(hass.Hass):
         self._info(f"Brew {brew['id']} stopped: {brew.get('stop_reason')}, ground {bool(brew.get('ground'))}")
 
     def _debit(self, brew):
-        if brew.get("ground") and brew.get("dose_g"):
-            if self._beans.debit(brew["id"], brew["dose_g"], self._now_dt()):
+        bean_id = (brew.get("bean") or {}).get("id")
+        if bean_id and brew.get("ground") and brew.get("dose_g"):
+            if self._beans.debit(brew["id"], brew["dose_g"], self._now_dt(), bean_id=bean_id):
                 brew["debited_g"] = brew["dose_g"]
 
     def _debit_water(self, brew):
@@ -833,7 +846,7 @@ class CoffeeMachine(hass.Hass):
         for key in ("total_s", "drawdown_s", "cup_g", "water_ml", "coverage", "paused_s"):
             if final.get(key) is not None:
                 record[key] = final[key]
-        return {k: v for k, v in record.items() if v is not None}
+        return {k: v for k, v in record.items() if v is not None or k == "bean"}
 
     def _upsert_record(self, brew=None, brew_id=None, **fields):
         """Writes the brew's record (or `fields` onto the record `brew_id`) into the ledger file, read again
@@ -931,6 +944,12 @@ class CoffeeMachine(hass.Hass):
             return {"water": [], "pours": None, "total_s": None}
         return {"water": cp.plan_water(recipe), "pours": cp.plan_pours(recipe), "total_s": cp.plan_total_s(recipe)}
 
+    def _baseline_for(self, recipe, bean_id, now):
+        key = cp.recipe_key(recipe)
+        members = cb.cohort(self._records, key, bean_id)
+        curves = self._curves([r["id"] for r in members])
+        return cb.compute(self._records, curves, recipe, key, bean_id, self._plan_of({"recipe": recipe}), cf.iso(now))
+
     def _recompute_baseline(self, now):
         usual = self._usual()
         if usual is None and self._recipes:
@@ -938,15 +957,9 @@ class CoffeeMachine(hass.Hass):
             if match is not None:
                 self._usual_id = match["id"]
                 usual = match
-        bean = self._beans.bean()
-        if usual is None:
-            self._baseline = cb.none_baseline(cf.iso(now))
-        else:
-            key = cp.recipe_key(usual)
-            members = cb.cohort(self._records, key, (bean or {}).get("id"))
-            curves = self._curves([r["id"] for r in members])
-            self._baseline = cb.compute(self._records, curves, usual, key, (bean or {}).get("id"), self._plan_of(),
-                                        cf.iso(now))
+        bean_id = (self._usual_bean() or {}).get("id")
+        self._advice.bean_changed(bean_id)
+        self._baseline = self._baseline_for(usual, bean_id, now) if usual else cb.none_baseline(cf.iso(now))
         self._publish("coffee_baseline")
 
     # -- the start ---------------------------------------------------------------------------------
@@ -955,12 +968,22 @@ class CoffeeMachine(hass.Hass):
         if self._tracker.active():
             self._info(f"Start ignored: a brew is {self._tracker.phase()}")
             return
-        variant = data.get("variant") or "usual"
+        bean_id = data.get("bean_id")
+        bean = None
+        usual = self._usual()
+        if bean_id is not None:
+            bean = self._beans.bean(bean_id)
+            recipe = self._beans.recipe_for(bean_id, self._recipes) if bean else None
+            if recipe is None:
+                self._warn(f"Start ignored: no recipe for open bag {ascii_text(bean_id, 40)!r}")
+                return
+            variant = "usual"
+        else:
+            variant = data.get("variant") or "usual"
+            recipe = cp.by_id(self._recipes, data.get("recipe_id")) if variant == "other" else usual
         if variant not in VARIANTS:
             self._warn(f"Start ignored: variant {variant!r}")
             return
-        usual = self._usual()
-        recipe = cp.by_id(self._recipes, data.get("recipe_id")) if variant == "other" else usual
         overrides = {}
         if variant == "tweak":
             for key, low, high, whole in (("dose", 5, 25, False), ("ratio", 5, 25, False), ("grind_size", 1, 80, True),
@@ -972,7 +995,7 @@ class CoffeeMachine(hass.Hass):
                         return
                     overrides[key] = value
         trial = None
-        grind = self._advice.trial_grind(variant)
+        grind = self._advice.trial_grind(variant) if bean is None else None
         if grind is not None and usual is not None:
             overrides, variant, trial = {"grind_size": int(grind)}, "trial", self._advice.trial_text()
         brew_id = cf.brew_id_for(now)
@@ -980,6 +1003,8 @@ class CoffeeMachine(hass.Hass):
             brew_id = cf.brew_id_for(now + 1)
         source = "tablet" if user and user == self.tablet_user else "phone"
         fields = {"user_id": user, "variant": variant, "recipe_match": "sent", "trial": trial}
+        if bean is not None:
+            fields["bean"] = bean
         if recipe is not None:
             used = cp.with_overrides(recipe, overrides.get("dose"), overrides.get("ratio"), overrides.get("grind_size"),
                                      overrides.get("temperature"))
@@ -1299,7 +1324,7 @@ class CoffeeMachine(hass.Hass):
             return
         self._info(f"Brew {brew_id} rated {taste}")
         self._publish("coffee_brews", force=True)
-        self._maybe_ask(now)
+        self._maybe_ask(record, now)
 
     def _on_push_action(self, event_name, data, kwargs):
         action = (data or {}).get("action") if isinstance(data, dict) else None
@@ -1315,13 +1340,25 @@ class CoffeeMachine(hass.Hass):
         self._rate(parts[1], parts[2], person if person in PEOPLE else None, now)
 
     def _op_beans_add(self, user, data, now):
+        usual = self._usual() or {}
+        primary = self._beans.primary(usual.get("name")) or {}
         op_id = self._beans.add(data.get("grams"), self._now_dt(), bean_id=data.get("bean_id"),
-                                new_name=data.get("new_name"))
+                                new_name=data.get("new_name"), dose_g=usual.get("dose_g"), recipes=self._recipes,
+                                default_bean_id=primary.get("id"))
         if op_id is None:
             self._warn(f"beans_add ignored: {ascii_text(data, 120)}")
             return
-        self._advice.bean_changed(self._beans.bean_id)
-        self._info(f"Beans: added {data.get('grams')} g of {(self._beans.bean() or {}).get('name')}")
+        bean = self._beans.bean(self._beans.ops[-1]["bean_id"])
+        self._info(f"Beans: added {data.get('grams')} g of {bean['name']}")
+        self._after_beans(now)
+
+    def _op_beans_empty(self, user, data, now):
+        bean_id = data.get("bean_id")
+        bean = self._beans.bean(bean_id)
+        if not self._beans.empty(bean_id, self._now_dt()):
+            self._warn(f"beans_empty ignored: {ascii_text(bean_id, 40)}")
+            return
+        self._info(f"Beans: emptied {bean['name']}")
         self._after_beans(now)
 
     def _op_beans_undo(self, user, data, now):
@@ -1391,6 +1428,8 @@ class CoffeeMachine(hass.Hass):
         self._recompute_baseline(now)
         self._publish("coffee_recipes")
         self._publish("coffee_beans")
+        self._publish("coffee_brews")
+        self._publish("coffee_advice")
         self._save_state()
 
     def _op_trial_accept(self, user, data, now):
@@ -1469,18 +1508,21 @@ class CoffeeMachine(hass.Hass):
 
     # -- the advisor ---------------------------------------------------------------------------------
 
-    def _maybe_ask(self, now):
+    def _maybe_ask(self, record, now):
         usual = self._usual()
-        bean = self._beans.bean()
+        bean = self._usual_bean()
         if usual is None or bean is None:
             return
-        evidence = ca.rated_evidence(self._records, bean["id"], cp.recipe_key(usual))
+        key = cp.recipe_key(usual)
+        if (record.get("bean") or {}).get("id") != bean["id"] or (record.get("recipe") or {}).get("key") != key:
+            return
+        evidence = ca.rated_evidence(self._records, bean["id"], key)
         if self._advice.should_ask(evidence):
             self._ask(now)
 
     def _ask(self, now):
         usual = self._usual()
-        bean = self._beans.bean()
+        bean = self._usual_bean()
         if usual is None or bean is None or not self.advisor_entity:
             return
         evidence = ca.rated_evidence(self._records, bean["id"], cp.recipe_key(usual))
@@ -1556,6 +1598,8 @@ class CoffeeMachine(hass.Hass):
         self._recompute_baseline(self._now())
         self._publish("coffee_recipes")
         self._publish("coffee_beans")
+        self._publish("coffee_brews")
+        self._publish("coffee_advice")
         self._save_state()
 
     # -- restart -------------------------------------------------------------------------------------
@@ -1638,17 +1682,17 @@ class CoffeeMachine(hass.Hass):
         elif key == "coffee_baseline":
             state, attrs = pub.baseline_entity(self._baseline)
         elif key == "coffee_beans":
-            usual = self._usual()
-            state, attrs = pub.beans_entity(self._beans.view(usual["dose_g"] if usual else None,
-                                                             self._now_dt()))
+            usual = self._usual() or {}
+            state, attrs = pub.beans_entity(self._beans.view(usual.get("dose_g"), self._now_dt(),
+                                                             usual.get("name"), self._recipes))
         elif key == "coffee_brews":
-            bean = self._beans.bean()
+            bean = self._beans.primary((self._usual() or {}).get("name"))
             changed = self._ledger_stamp[0] / 1e9 if self._ledger_stamp else None
             state, attrs = pub.brews_entity(self._records, now, (bean or {}).get("id"), self._last_curve(), changed)
         elif key == "coffee_recipes":
             state, attrs = pub.recipes_entity([cp.recipe_entry(r) for r in self._recipes], self._usual())
         else:
-            state, attrs = pub.advice_entity(self._advice.view((self._beans.bean() or {}).get("id")))
+            state, attrs = pub.advice_entity(self._advice.view((self._usual_bean() or {}).get("id")))
         if not force and self._published.get(key) == (state, attrs):
             return
         self._published[key] = (state, attrs)

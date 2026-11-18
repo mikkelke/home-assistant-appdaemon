@@ -2,8 +2,8 @@
 /media/coffee. Pure.
 
 Every attribute value is a string, a list of strings, or a list of flat dicts of strings: numbers are
-decimal strings, series are CSV strings of tenths, a missing attribute means unknown. Each entity is
-kept under its size cap (serialized attributes), the oldest list entries going first.
+decimal strings, series are CSV strings of tenths, a missing attribute means unknown. Size caps are
+measured on serialized attributes.
 """
 
 import json
@@ -196,17 +196,25 @@ def baseline_entity(base):
 
 
 def beans_entity(view):
-    remaining = view.get("remaining")
+    remaining = num(view.get("remaining"))
     attrs = {"bean_id": view.get("bean_id"), "bean_name": view.get("bean_name"), "added_at": view.get("added_at"),
-             "dose_g": num(view.get("dose_g"), 1), "brews_left": num(view.get("brews_left")),
+             "remaining": remaining, "dose_g": num(view.get("dose_g"), 1), "brews_left": num(view.get("brews_left")),
              "low": "yes" if view.get("low") else None, "last_op_id": view.get("last_op_id"),
              "undo_until": view.get("undo_until"),
              "known_beans": [{"id": b["id"], "name": b["name"]} for b in view.get("known_beans") or []]}
     out = finish("coffee_beans", attrs)
-    while size(out) > CAPS["coffee_beans"] and attrs["known_beans"]:
-        attrs["known_beans"] = attrs["known_beans"][1:]
-        out = finish("coffee_beans", attrs)
-    return ("unknown" if remaining is None else str(remaining)), out
+    out["bags"] = [
+        {"bean_id": bag["bean_id"], "bean_name": bag["bean_name"], "remaining": num(bag.get("remaining")) or "",
+         "brews_left": num(bag.get("brews_left")) or "", "low": {True: "yes", False: "no"}.get(bag.get("low"), ""),
+         "added_at": bag.get("added_at") or "", "recipe_id": bag.get("recipe_id") or ""}
+        for bag in view.get("bags") or []
+    ]
+    known = attrs["known_beans"]
+    while known and size(out) > CAPS["coffee_beans"]:
+        known.pop(0)
+    if not known:
+        out.pop("known_beans", None)
+    return remaining or "unknown", out
 
 
 # -- sensor.coffee_brews ------------------------------------------------------------------------

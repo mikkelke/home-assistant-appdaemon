@@ -73,10 +73,10 @@ def calls(app, service):
     return [data for name, data in app.calls if name == service]
 
 
-def brew(app, ours=True, user=TABLET, power=True, brew_id=BREW_ID, **kw):
+def brew(app, ours=True, user=TABLET, power=True, brew_id=BREW_ID, start=None, **kw):
     tape = fake.synthetic_brew(brew_id, POWER["brew_2026_10_17"] if power else None, ours=ours, **kw)
     if ours:
-        tape = [(0, ("op", "start", {"variant": "usual"}, user))] + [s for s in tape if s[1][0] != "op"]
+        tape = [(0, ("op", "start", start or {"variant": "usual"}, user))] + [s for s in tape if s[1][0] != "op"]
     fake.cup_on(app)
     fake.replay(app, tape)
 
@@ -90,12 +90,12 @@ def seed_ledger(app, records):
 
 
 def rated_usual(app, i, taste):
-    usual = cp.normalize(fake.USUAL)
+    usual = app._usual()
     at = fake.iso(T0 - (10 - i) * 86400)
     return {"id": f"c{int(T0) - (10 - i) * 86400}", "ts": at, "started_at": at, "duration_min": 4.0,
             "completion_class": "complete", "outcome": "complete", "source": "tablet", "variant": "usual",
             "recipe": {"id": usual["id"], "name": usual["name"], "key": cp.recipe_key(usual), "grind": 46},
-            "bean": app._beans.bean(), "coverage": 0.98, "total_s": 205, "cup_g": 215.0, "drawdown_s": 60,
+            "bean": app._usual_bean(), "coverage": 0.98, "total_s": 205, "cup_g": 215.0, "drawdown_s": 60,
             "rating": taste}
 
 
@@ -885,7 +885,15 @@ class WhoTests(unittest.TestCase):
 
 
 class BeansTests(unittest.TestCase):
-    def test_add_brew_switch_and_undo(self):
+    def two_bags(self, **args):
+        daybreak = {**fake.USUAL, "id": None, "name": "Daybreak"}
+        signature = {**fake.OTHER, "id": None, "name": "Signature Brew"}
+        app = fake.make_app(recipes=(daybreak, signature, fake.USUAL), usual_name="Daybreak", **args)
+        fake.op(app, "beans_add", {"grams": 214, "new_name": "Daybreak"})
+        fake.op(app, "beans_add", {"grams": 500, "new_name": "Signature Brew"})
+        return app
+
+    def test_add_brew_open_another_bag_and_undo(self):
         app = fake.make_app()
         fake.op(app, "beans_add", {"grams": 250, "new_name": "Kenya Kiambu"})
         state, attrs = fake.last(app, "sensor.coffee_beans")
@@ -898,11 +906,97 @@ class BeansTests(unittest.TestCase):
         fake.advance(app, 600)
         fake.op(app, "beans_add", {"grams": "250", "new_name": "Ethiopia Guji"})
         state, attrs = fake.last(app, "sensor.coffee_beans")
-        self.assertEqual((state, attrs["bean_id"]), ("485", "b2"))
+        self.assertEqual((state, attrs["bean_id"]), ("250", "b2"))
+        self.assertEqual([(bag["bean_id"], bag["remaining"]) for bag in attrs["bags"]],
+                         [("b2", "250"), ("b1", "235")])
         fake.op(app, "beans_undo", {"op_id": attrs["last_op_id"]})
         state, attrs = fake.last(app, "sensor.coffee_beans")
         self.assertEqual((state, attrs["bean_id"]), ("235", "b1"))
         self.assertNotIn("last_op_id", attrs)
+
+    def test_start_for_a_bag_uses_its_recipe_and_cohort_without_changing_the_usual(self):
+        app = self.two_bags(advisor_entity="ai_task.stub")
+        daybreak = rated_usual(app, 0, "sour")
+        signature = cp.by_id(app._recipes, "Signature Brew")
+        signature_key = cp.recipe_key(signature)
+        signature_bean = {"id": "b2", "name": "Signature Brew"}
+        prior = {**rated_usual(app, 1, "balanced"), "bean": signature_bean,
+                 "recipe": {"id": signature["id"], "name": signature["name"], "key": signature_key}}
+        seed_ledger(app, [daybreak, prior])
+        fake.op(app, "select", {"recipe_id": "Daybreak"})
+        before = fake.last(app, "sensor.coffee_baseline")[1]
+        self.assertEqual((before["bean_id"], before["n"]), ("b1", "1"))
+        app._advice.data.update(state="trial_queued", bean_id="b1", **{"from": 46, "to": 44})
+
+        brew(app, user=MIKKEL, start={"bean_id": "b2", "variant": "other", "recipe_id": "Daybreak"})
+
+        sent = calls(app, "xbloom/start_brew")[-1]
+        self.assertEqual(sent["recipe_name"], "Signature Brew")
+        self.assertNotIn("grind_size", sent)
+        record = fake.ledger(app)[-1]
+        self.assertEqual((record["variant"], record["bean"], record["recipe"]["key"], record["debited_g"], record["who"]),
+                         ("usual", signature_bean, signature_key, 18.0, "mikkel"))
+        self.assertEqual(record["baseline_id"], cm.cb.baseline_id([prior["id"]], signature_key, "b2"))
+        self.assertEqual(fake.last(app, "sensor.coffee_recipes")[1]["usual_id"], "Daybreak")
+        self.assertEqual(fake.last(app, "sensor.coffee_baseline")[1]["baseline_id"], before["baseline_id"])
+        self.assertEqual(fake.last(app, "sensor.coffee_advice")[0], "trial_queued")
+        state, attrs = fake.last(app, "sensor.coffee_beans")
+        self.assertEqual((state, attrs["bean_id"]), ("214", "b1"))
+        self.assertEqual([(b["recipe_id"], b["remaining"]) for b in attrs["bags"]],
+                         [("Signature Brew", "482"), ("Daybreak", "214")])
+
+        fake.op(app, "rate", {"brew_id": BREW_ID, "taste": "balanced"})
+        self.assertEqual(len(cm.ca.rated_evidence(fake.ledger(app), "b2", signature_key)), 2)
+        fake.op(app, "select", {"recipe_id": "Signature Brew"})
+        self.assertEqual(fake.last(app, "sensor.coffee_baseline")[1]["n"], "2")
+        self.assertEqual(fake.last(app, "sensor.coffee_advice")[0], "none")
+
+    def test_start_for_an_unknown_or_unmatched_bag_is_ignored(self):
+        app = fake.make_app()
+        fake.op(app, "beans_add", {"grams": 250, "new_name": "Kenya"})
+        for bean_id in ("b9", "b1"):
+            fake.op(app, "start", {"bean_id": bean_id})
+        self.assertEqual(coffee_state(app)[0], "idle")
+        self.assertEqual(calls(app, "xbloom/start_brew"), [])
+        self.assertEqual(sum(level == "WARNING" and "Start ignored" in message for level, message in app.logs), 2)
+
+    def test_usual_start_debits_the_matching_bag_with_two_open(self):
+        app = self.two_bags()
+        brew(app)
+        record = fake.ledger(app)[-1]
+        self.assertEqual((record["bean"], record["debited_g"]), ({"id": "b1", "name": "Daybreak"}, 15.0))
+        self.assertEqual([b["remaining"] for b in fake.last(app, "sensor.coffee_beans")[1]["bags"]], ["500", "199"])
+
+    def test_rating_a_bag_brew_does_not_ask_for_advice_on_the_other_bag(self):
+        app = self.two_bags(advisor_entity="ai_task.stub")
+        seed_ledger(app, [rated_usual(app, i, "sour") for i in range(4)])
+        brew(app, start={"bean_id": "b2"})
+        fake.op(app, "rate", {"brew_id": BREW_ID, "taste": "balanced"})
+        self.assertEqual(calls(app, "ai_task/generate_data"), [])
+
+    def test_unmatched_template_with_two_bags_tags_no_bean(self):
+        app = self.two_bags()
+        fake.op(app, "select", {"recipe_id": "81696"})
+        self.assertNotIn("bean_id", fake.last(app, "sensor.coffee_baseline")[1])
+        self.assertEqual(fake.last(app, "sensor.coffee_beans")[1]["bean_id"], "b2")
+
+        brew(app)
+
+        record = fake.ledger(app)[-1]
+        self.assertIsNone(record["bean"])
+        self.assertEqual(record["debited_g"], 0)
+        self.assertEqual([b["remaining"] for b in fake.last(app, "sensor.coffee_beans")[1]["bags"]], ["500", "214"])
+
+    def test_empty_closes_only_that_bag_and_survives_restart(self):
+        app = self.two_bags()
+        fake.op(app, "beans_empty", {"bean_id": "b1"})
+        self.assertIn(("INFO", "Beans: emptied Daybreak"), app.logs)
+        fake.op(app, "beans_empty", {"bean_id": "b1"})
+        self.assertIn(("WARNING", "beans_empty ignored: b1"), app.logs)
+
+        again = fake.make_app(state_dir=app.dir, now=app.now + 1, recipes=())
+        self.assertEqual([b["bean_id"] for b in fake.last(again, "sensor.coffee_beans")[1]["bags"]], ["b2"])
+        self.assertEqual(fake.last(again, "sensor.coffee_baseline")[1]["bean_id"], "b2")
 
     def test_a_stopped_brew_that_ground_debits_its_dose(self):
         app = fake.make_app()
