@@ -16,7 +16,9 @@ Intent events carry area_id. assist_music_here joins a different playing master,
 otherwise resumes a paused room speaker, otherwise starts radio. The master comes
 from master_select's master_entity_id attribute. assist_music_leave requests unjoin
 when grouped, otherwise pauses a playing speaker. assist_radio requests unjoin when
-grouped and starts radio one second later; a solo speaker starts immediately.
+grouped and starts radio one second later; a solo speaker starts immediately. Its area_id
+may name several rooms (a list or a comma separated string): the first room starts the
+radio that way and the others join it RADIO_JOIN_S later, so they play as one group.
 Group requests use GroupManager's custom events. Unknown areas warn and do nothing;
 satellites without a configured room speaker are ignored.
 
@@ -45,6 +47,7 @@ MOVE_GIVE_UP_S = 15
 # The public key aiosonos and Home Assistant send to the speaker's local API.
 SONOS_LOCAL_KEY = "123e4567-e89b-12d3-a456-426655440000"
 QUIET_S = 2
+RADIO_JOIN_S = 2
 # Sonos lifts a duck itself after this; every busy edge renews it.
 DUCK_MS = 60000
 
@@ -100,6 +103,14 @@ def intent_actions(event_name, speaker, state, master, master_state, radio):
             return [unjoin, dict(play_radio, delay=1)]
         return [play_radio]
     return []
+
+
+def radio_actions(speakers, states, radio):
+    """Radio in the first speaker, the others joining it once it plays."""
+    leader = speakers[0]
+    actions = intent_actions("assist_radio", leader, states.get(leader), None, {}, radio)
+    start = max((action.get("delay", 0) for action in actions), default=0) + RADIO_JOIN_S
+    return actions + [dict(_join(leader, speaker), delay=start) for speaker in speakers[1:]]
 
 
 def _playing(state):
@@ -246,6 +257,13 @@ class AssistRooms(hass.Hass):
 
     def _on_intent(self, event_name, data, kwargs):
         area = data.get("area_id")
+        if event_name == "assist_radio":
+            speakers = self._group_speakers(area, event_name)
+            if len(speakers) > 1:
+                self._run_actions("radio", radio_actions(
+                    speakers, {entity: self._read(entity) for entity in speakers}, self.radio))
+                return
+            area = next((room for room, entity in self.speakers.items() if [entity] == speakers), None)
         speaker = self.speakers.get(area) if isinstance(area, str) else None
         if not speaker:
             self.log(f"{event_name}: no speaker configured for area {area!r}", level="WARNING")
@@ -255,7 +273,7 @@ class AssistRooms(hass.Hass):
         self._run_actions(area, intent_actions(event_name, speaker, self._read(speaker),
                                               master, master_state, self.radio))
 
-    def _group_speakers(self, areas):
+    def _group_speakers(self, areas, event_name="assist_music_group"):
         if isinstance(areas, str):
             areas = areas.split(",")
         speakers = []
@@ -267,7 +285,7 @@ class AssistRooms(hass.Hass):
             if speaker:
                 speakers.append(speaker)
             else:
-                self.log(f"assist_music_group: no speaker configured for area {area!r}",
+                self.log(f"{event_name}: no speaker configured for area {area!r}",
                          level="WARNING")
         return list(dict.fromkeys(speakers))
 

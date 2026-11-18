@@ -217,6 +217,37 @@ class AssistRoomsGlue(AppTest):
             media_content_id=RADIO, media_content_type="music")
 
 
+class MultiRoomRadio(AppTest):
+    def test_two_rooms_play_as_one_group(self):
+        for area_id in ("bathroom,bedroom", ["bathroom", "bedroom"]):
+            with self.subTest(area_id=area_id):
+                app = make_app()
+                app._on_intent("assist_radio", {"area_id": area_id}, {})
+                app.call_service.assert_called_once_with(
+                    "media_player/play_media", entity_id=BATHROOM,
+                    media_content_id=RADIO, media_content_type="music")
+                app.fire_event.assert_not_called()
+                timer = app.run_in.call_args
+                self.assertEqual(timer.args[1], ar.RADIO_JOIN_S)
+                fire(timer)
+                app.fire_event.assert_called_once_with(
+                    "request_sonos_group_join", master_entity_id=BATHROOM, slave_entity_id=BEDROOM)
+
+    def test_grouped_leader_leaves_first_then_the_others_join(self):
+        actions = ar.radio_actions([BATHROOM, BEDROOM], {BATHROOM: state(grouped=True)}, RADIO)
+        self.assertEqual([a.get("delay", 0) for a in actions], [0, 1, 1 + ar.RADIO_JOIN_S])
+        self.assertEqual(actions[0]["event"], "request_sonos_group_unjoin")
+        self.assertEqual(actions[2]["data"], {"master_entity_id": BATHROOM, "slave_entity_id": BEDROOM})
+
+    def test_one_room_in_a_list_is_the_single_room_path(self):
+        app = make_app()
+        app._on_intent("assist_radio", {"area_id": ["bedroom"]}, {})
+        app.call_service.assert_called_once_with(
+            "media_player/play_media", entity_id=BEDROOM,
+            media_content_id=RADIO, media_content_type="music")
+        app.run_in.assert_not_called()
+
+
 class DuckGlue(AppTest):
     def test_wake_while_playing_ducks_once_and_never_touches_volume(self):
         app = make_app()
