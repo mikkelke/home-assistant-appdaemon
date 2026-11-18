@@ -424,54 +424,16 @@ class RowTests(unittest.TestCase):
             with self.subTest(days_ago=days_ago):
                 self.assertEqual([line.due for line in self.lines([watering(days_ago, area="kitchen")])], [chip])
 
-    def test_timed_rows_inside_7_days_are_lines_whatever_the_room(self):
+    def test_rows_due_by_the_end_of_tomorrow_are_lines_whatever_the_room(self):
         rows = [maint_row("past", "Earlier today", at=NOW - 2 * HOUR, area="kitchen"),
-                maint_row("yesterday", "Since yesterday", at=NOW - DAY, area="kitchen"),
-                maint_row("edge", "Exactly 7 days", at=NOW + 7 * DAY, area="kitchen"),
-                maint_row("over", "A minute over 7 days", at=NOW + 7 * DAY + MIN, area="kitchen"),
-                maint_row("tonight", "Tonight", at=NOW + 6 * HOUR, area="living_room"),
-                maint_row("drum", "In three days", at=NOW + 3 * DAY, area="guest_bathroom")]
+                maint_row("yesterday", "Since yesterday", at=NOW - 3 * DAY, area="kitchen"),
+                maint_row("tonight", "Tonight", at=NOW + 14 * HOUR, area="living_room"),
+                maint_row("drum", "Tomorrow night", at=NOW + DAY + 15 * HOUR, area="guest_bathroom"),
+                maint_row("after", "After tomorrow", at=NOW + DAY + 16 * HOUR, area="bathroom"),
+                maint_row("week", "In five days", at=NOW + 5 * DAY, area="bathroom")]
         self.assertEqual([(line.text, line.due) for line in self.lines(rows, limit=10)],
                          [("Since yesterday", "overdue"), ("Earlier today", "today"), ("Tonight", "today"),
-                          ("In three days", "3 d"), ("Exactly 7 days", "7 d")])
-
-    def test_a_row_three_days_out_is_a_line_whatever_the_room(self):
-        row = maint_row("washer:drum", "Washer drum + drawer clean", at=NOW + 3 * DAY, area="guest_bathroom")
-        self.assertEqual(self.lines([row]), [bd.Line("Washer drum + drawer clean", "mdi:information-outline", "3 d")])
-
-    def test_beyond_7_days_only_the_bathroom_rows_within_14_days_are_lines(self):
-        rows = [maint_row("a", "Bathroom in ten days", at=NOW + 10 * DAY, area="bathroom"),
-                maint_row("b", "Kitchen in ten days", at=NOW + 10 * DAY, area="kitchen"),
-                maint_row("c", "Bathroom at 14 days", at=NOW + 14 * DAY, area="bathroom"),
-                maint_row("d", "Bathroom a minute later", at=NOW + 14 * DAY + MIN, area="bathroom"),
-                maint_row("e", "No room in ten days", at=NOW + 10 * DAY),
-                maint_row("f", "Guest bathroom in ten days", at=NOW + 10 * DAY, area="guest_bathroom"),
-                maint_row("g", "Bathroom a minute over 7 days", at=NOW + 7 * DAY + MIN, area="bathroom")]
-        self.assertEqual([(line.text, line.due) for line in self.lines(rows, limit=10)],
-                         [("Bathroom a minute over 7 days", "7 d"), ("Bathroom in ten days", "10 d"),
-                          ("Bathroom at 14 days", "14 d")])
-
-    def test_what_is_due_comes_first_earliest_first_then_the_bathroom_rows_earliest_first(self):
-        rows = [maint_row("later", "Bathroom later", at=NOW + 9 * DAY, area="bathroom"),
-                maint_row("soon", "Bathroom soon", at=NOW + 8 * DAY, area="bathroom"),
-                maint_row("kitchen", "Kitchen in six days", at=NOW + 6 * DAY, area="kitchen"),
-                maint_row("far", "Kitchen in eight days", at=NOW + 8 * DAY, area="kitchen"),
-                maint_row("afternoon", "This afternoon", at=NOW + 6 * HOUR),
-                maint_row("old", "Overdue since yesterday", at=NOW - DAY)]
-        lines = self.lines(rows, limit=10)
-        self.assertEqual([line.text for line in lines], ["Overdue since yesterday", "This afternoon",
-                                                         "Kitchen in six days", "Bathroom soon", "Bathroom later"])
-        self.assertEqual([line.due for line in lines], ["overdue", "today", "6 d", "8 d", "9 d"])
-
-    def test_with_days_only_rows_due_by_that_many_house_days_after_today_are_lines(self):
-        rows = [maint_row("old", "Overdue", at=NOW - 3 * DAY),
-                maint_row("today", "Tonight", at=NOW + 14 * HOUR),
-                maint_row("tomorrow", "Tomorrow night", at=NOW + DAY + 15 * HOUR, area="bathroom"),
-                maint_row("after", "After tomorrow", at=NOW + DAY + 16 * HOUR, area="bathroom"),
-                maint_row("week", "In five days", at=NOW + 5 * DAY)]
-        self.assertEqual([(line.text, line.due) for line in self.lines(rows, limit=10, days=1)],
-                         [("Overdue", "overdue"), ("Tonight", "today"), ("Tomorrow night", "tomorrow")])
-        self.assertEqual(len(self.lines(rows, limit=10)), 5)
+                          ("Tomorrow night", "tomorrow")])
 
     def test_at_most_three_lines(self):
         rows = [maint_row(f"r{i}", f"Row {i}", at=NOW + i * HOUR) for i in range(5)]
@@ -518,14 +480,14 @@ class RowTests(unittest.TestCase):
                 self.assertEqual(self.lines([row]),
                                  [bd.Line("Water the Philodendron: 0.5 L", "mdi:watering-can-outline", "today")])
 
-    def test_what_is_due_now_comes_after_what_is_overdue_and_before_what_is_timed_ahead(self):
+    def test_what_is_due_now_comes_after_what_is_overdue_and_before_what_is_timed_later(self):
         rows = [maint_row("ahead", "In three days", at=NOW + 3 * DAY),
                 dry_plant(),
                 maint_row("old", "Overdue since yesterday", at=NOW - DAY),
                 maint_row("tonight", "Tonight", at=NOW + 6 * HOUR)]
         self.assertEqual([(line.text, line.due) for line in self.lines(rows, limit=10)],
                          [("Overdue since yesterday", "overdue"), ("Water the Philodendron: 0.5 L", "today"),
-                          ("Tonight", "today"), ("In three days", "3 d")])
+                          ("Tonight", "today")])
 
     def test_a_row_needs_a_readable_title(self):
         rows = [{"id": "maint:x", "kind": "maint", "at": iso(NOW)}, {"id": "maint:y", "title": 5, "at": iso(NOW)},
@@ -1943,19 +1905,19 @@ class PublishTests(unittest.TestCase):
 
 class LineTests(unittest.TestCase):
     ROWS = [one_off(date(2026, 11, 3)), watering(7),
-            maint_row("battery", "Bathroom door battery", at=NOW + 9 * DAY, area="bathroom",
+            maint_row("battery", "Bathroom door battery", at=NOW + DAY, area="bathroom",
                       icon="mdi:battery-clock-outline")]
 
-    def test_mikkel_gets_the_rows_that_are_due_and_the_bathroom_rows_after_them(self):
+    def test_mikkel_gets_the_rows_due_by_tomorrow(self):
         app = make_app({RSSI: full("-60"), UPCOMING: upcoming(self.ROWS)})
         self.assertEqual(last(app)["attributes"], attrs_of(
             reason=f"active:{ACTIVE} phone:near", person="mikkel", greeting="Hi Mikkel",
             line1="Spray the Alocasia", icon1="mdi:spray", due1="overdue",
             line2="Water the Alocasia: 0.7 L", icon2="mdi:watering-can-outline", due2="today",
-            line3="Bathroom door battery", icon3="mdi:battery-clock-outline", due3="9 d"))
+            line3="Bathroom door battery", icon3="mdi:battery-clock-outline", due3="tomorrow"))
 
-    def test_a_dry_plant_and_a_washer_drum_clean_two_days_out_show_and_the_dryer_log_does_not(self):
-        rows = [maint_row("washer:drum", "Washer drum + drawer clean", at=NOW + 2 * DAY, area="guest_bathroom",
+    def test_a_dry_plant_and_a_washer_drum_clean_tomorrow_show_and_the_dryer_log_does_not(self):
+        rows = [maint_row("washer:drum", "Washer drum + drawer clean", at=NOW + DAY, area="guest_bathroom",
                           icon="mdi:washing-machine"),
                 dry_plant(),
                 maint_row("dryer:plinth", "Dryer plinth filter", area="guest_bathroom", tap_done=True,
@@ -1964,7 +1926,7 @@ class LineTests(unittest.TestCase):
         self.assertEqual(last(app)["attributes"], attrs_of(
             reason=f"active:{ACTIVE} phone:near", person="mikkel", greeting="Hi Mikkel",
             line1="Water the Philodendron: 0.5 L", icon1="mdi:watering-can-outline", due1="today",
-            line2="Washer drum + drawer clean", icon2="mdi:washing-machine", due2="2 d"))
+            line2="Washer drum + drawer clean", icon2="mdi:washing-machine", due2="tomorrow"))
 
     def test_a_route_that_is_bad_comes_first_and_takes_a_slot(self):
         app = make_app({RSSI: full("-60"), UPCOMING: upcoming(self.ROWS),

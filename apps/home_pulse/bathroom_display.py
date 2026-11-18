@@ -1,7 +1,7 @@
 """BathroomDisplay - what the round display in the main bathroom (ESPHome node bathroom-display) shows, and the
 speaker its play button works.
 
-Each instance takes occupancy and upcoming rows from its zone. Without phone RSSI, resident_when_active
+Each instance takes occupancy from its zone. Without phone RSSI, resident_when_active
 identifies the resident by occupancy. A players list gives playing devices priority in list order, then
 resumes the most recently paused device.
 
@@ -102,14 +102,13 @@ The lines for Mikkel, at most three, in this order:
               round up and stop at zero; without an end time the title is "Washer running" and the chip
               is empty. A paused line keeps the finish chip when known.
     rows      from sensor.house_upcoming while its lease (`expires`) holds, never a row that asks the next
-              chip to pass it over or names other people. First what is due by 7 days from now, earliest
-              first: a row timed in the past or inside 7 days, a one-off task that lost its time on its
-              day ("Due dd.mm" info), a calendar plant that is due ("due today", "due since dd.mm"
-              detail) and any other row with no time (an offline battery, a dry sensor plant), which is
-              due now, as it is on the dashboard. Then the rows of the zone's own area (the zone doubles
-              as the HA area id) timed within 14 days. A line is the row's title, cut back to a whole word
-              and ended in "..." when it is longer than LINE_MAX; its due chip counts house days. With
-              task_days, only rows due by that many house days after today (the bedroom: 1).
+              chip to pass it over or names other people. What is due by the end of tomorrow (house
+              days), earliest first: a row timed in the past, today or tomorrow, a one-off task that lost
+              its time on its day ("Due dd.mm" info), a calendar plant that is due ("due today", "due
+              since dd.mm" detail) and any other row with no time (an offline battery, a dry sensor
+              plant), which is due now, as it is on the dashboard. A line is the row's title, cut back to
+              a whole word and ended in "..." when it is longer than LINE_MAX; its due chip counts house
+              days.
 
 The weighing: the scale claims a weighing for Mikkel only while his phone is in the bathroom. It is a change
 of the state of measured_entity (sensor.mikkel_last_measurement, a timestamp) to a moment at most WEIGH_FRESH
@@ -182,8 +181,6 @@ RSSI_FRESH_S = 20.0
 IDENTIFIED = ("near", "rise")
 TRANSIT_MAX_AGE_MIN = 45.0
 LATE_MIN = 10
-SOON = timedelta(days=7)
-AHEAD = timedelta(days=14)
 BAD_STATUS = ("Delayed", "Disrupted")
 ICON = "mdi:monitor-dashboard"
 TRANSIT_ICON = "mdi:train"
@@ -514,22 +511,17 @@ def _icon(row):
     return core.clean_text(icon, ICON_MAX) if isinstance(icon, str) and icon.startswith("mdi:") else ""
 
 
-def task_lines(rows, now, resident=RESIDENT, area=ZONE, limit=LINES, days=None):
-    """At most `limit` lines from the house_upcoming rows: what is due by SOON from now (including anything
-    overdue or due now), earliest first, then the rows of `area` due within AHEAD, earliest first. With `days`,
-    only rows due by that many house days after today."""
-    soon, later = [], []
+def task_lines(rows, now, resident=RESIDENT, limit=LINES):
+    """At most `limit` lines from the house_upcoming rows due by the end of tomorrow (house days), including
+    anything overdue or due now, earliest first."""
+    picked = []
     for row in rows if isinstance(rows, list) else []:
         if not _wanted(row, resident):
             continue
         due = due_at(row, now)
-        if days is not None and (maint.house_date(due) - maint.house_date(now)).days > days:
-            continue
-        if due <= now + SOON:
-            soon.append((due, str(row.get("id")), row))
-        elif row.get("area") == area and due <= now + AHEAD:
-            later.append((due, str(row.get("id")), row))
-    picked = sorted(soon, key=lambda item: item[:2]) + sorted(later, key=lambda item: item[:2])
+        if (maint.house_date(due) - maint.house_date(now)).days <= 1:
+            picked.append((due, str(row.get("id")), row))
+    picked.sort(key=lambda item: item[:2])
     return [Line(fit(core.clean_text(row.get("title"))), _icon(row), due_chip(due, now))
             for due, _, row in picked[:max(0, limit)]]
 
@@ -765,7 +757,6 @@ class BathroomDisplay(hass.Hass):
         self.rise_db = float(a.get("rssi_rise_db", RISE_DB))
         self.rssi_fresh = timedelta(seconds=float(a.get("rssi_fresh_s", RSSI_FRESH_S)))
         self.upcoming_entity = a.get("upcoming_entity", "sensor.house_upcoming")
-        self.task_days = a.get("task_days")
         self.routes = [(str(route["label"]), route["entity"]) for route in a.get("transit") or []]
         self.transit_max_age = timedelta(minutes=float(a.get("transit_max_age_min", TRANSIT_MAX_AGE_MIN)))
         self.washer_entity = a.get("washer_entity", WASHER)
@@ -1035,7 +1026,7 @@ class BathroomDisplay(hass.Hass):
             if line:
                 lines.append(line)
         rows = live_rows(self._cache.get(self.upcoming_entity), now)
-        return (lines + task_lines(rows, now, self.resident, self.zone, LINES - len(lines), self.task_days))[:LINES]
+        return (lines + task_lines(rows, now, self.resident, LINES - len(lines)))[:LINES]
 
     def _card(self, now):
         """The weighing card while it shows: CARD_S from the weighing, once the look at 30 days ago is in, and
