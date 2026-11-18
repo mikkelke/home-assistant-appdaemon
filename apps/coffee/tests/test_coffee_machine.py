@@ -1063,7 +1063,8 @@ class BeansTests(unittest.TestCase):
 
         fake.op(app, "beans_retag", {"brew_id": BREW_ID, "bean_id": "b2"})
 
-        after = {**before, "bean": {"id": "b2", "name": "Signature Brew"}}
+        after = {**before, "bean": {"id": "b2", "name": "Signature Brew"}, "deltas": {}, "in_band": None,
+                 "baseline_id": None}
         self.assertEqual(fake.ledger(app)[-1], after)
         self.assertEqual(self.bean_balances(app), {"b1": "214", "b2": "485"})
         self.assertEqual(coffee_state(app)[1]["bean_id"], "b2")

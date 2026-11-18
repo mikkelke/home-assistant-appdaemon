@@ -1388,7 +1388,8 @@ class CoffeeMachine(hass.Hass):
         if not self._save_state(pending_beans_retag=pending):
             self._warn(f"beans_retag ignored: could not save inventory for {ascii_text(brew_id, 40)}")
             return
-        updated = self._upsert_record(brew_id=brew_id, bean=bean, debited_g=charged)
+        updated = self._upsert_record(brew_id=brew_id, bean=bean, debited_g=charged, deltas={}, in_band=None,
+                                      baseline_id=None)
         if updated is None:
             self._warn(f"beans_retag ignored: could not update brew {ascii_text(brew_id, 40)}")
             return
@@ -1401,7 +1402,7 @@ class CoffeeMachine(hass.Hass):
         self._beans = beans
         for brew in (self._tracker.brew, self._tracker.last):
             if brew is not None and brew["id"] == record["id"]:
-                brew.update(bean=record["bean"], debited_g=record["debited_g"])
+                brew.update(bean=record["bean"], debited_g=record["debited_g"], deltas={}, in_band=None, baseline=None)
 
     def _op_beans_undo(self, user, data, now):
         if not self._beans.undo(data.get("op_id"), self._now_dt()):
