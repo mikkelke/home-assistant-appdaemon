@@ -18,13 +18,19 @@ SEND_INTERVAL_S = 60
 TICK_S = 10
 TAGS = ("live_washer", "live_dryer", "live_cook_bath", "live_cook_probe", "live_coffee",
         "live_doorbell_apartment", "live_delivery_wolt", "live_delivery_nemlig",
-        "live_delivery_airmee", "live_delivery_postnord", "live_delivery_gls")
+        "live_delivery_airmee", "live_delivery_postnord", "live_delivery_gls", "live_delivery_budbee",
+        "live_delivery_posten_bring", "live_delivery_dao", "live_delivery_dhl", "live_delivery_ups",
+        "live_delivery_danske_fragtmaend")
 DOORS = {"front door": "front", "back door": "back", "apartment door": "apartment"}
 DELIVERY_APPS = {"wolt": "app://com.wolt.android", "nemlig": "app://com.nemlig",
                  "airmee": "app://com.airmee.customer", "postnord": "app://se.postnord.private",
-                 "gls": "app://dk.gls.consigneeapp"}
+                 "gls": "app://dk.gls.consigneeapp", "budbee": "app://com.budbee.tracking",
+                 "posten_bring": "app://com.bring.sporing.controller", "dao": "app://as.dao.app",
+                 "dhl": "app://com.dhl.exp.dhlmobile", "ups": "app://com.ups.mobile.android"}
 DELIVERY_ICONS = {"wolt": ("mdi:chef-hat", "mdi:moped"), "nemlig": ("mdi:cart", "mdi:truck-delivery")}
-PARCEL_CARRIERS = {"airmee": "Airmee", "postnord": "PostNord", "gls": "GLS"}
+PARCEL_CARRIERS = {"airmee": "Airmee", "postnord": "PostNord", "gls": "GLS", "budbee": "Budbee",
+                   "posten_bring": "Bring", "dao": "DAO", "dhl": "DHL", "ups": "UPS",
+                   "danske_fragtmaend": "Danske Fragtmænd"}
 PARCEL_ICON = "mdi:package-variant-closed"
 DELIVERY_KINDS = {"wolt": "food", "nemlig": "groceries", **dict.fromkeys(PARCEL_CARRIERS, "parcel")}
 STREET_DOORS = ("front door", "back door")
@@ -279,7 +285,7 @@ def parcel_card(delivery, now):
     source, stage = delivery.get("source"), delivery.get("stage")
     if stage not in ("on_the_way", "arriving"):
         return None
-    tag, title, link = "live_delivery_" + source, PARCEL_CARRIERS[source], DELIVERY_APPS[source]
+    tag, title, link = "live_delivery_" + source, PARCEL_CARRIERS[source], DELIVERY_APPS.get(source, "")
     label = "Arriving" if stage == "arriving" else "Out for delivery"
     eta = epoch(delivery.get("eta"))
     start, end = epoch(delivery.get("window_start")), epoch(delivery.get("window_end"))
@@ -426,7 +432,9 @@ def card_changed(previous, card):
 def notification_payload(card, now, channel="Live updates"):
     data = {"tag": card.tag, "live_update": True, "critical_text": card.critical_text,
             "notification_icon": card.icon, "sticky": True, "alert_once": True, "channel": channel,
-            "importance": "low", "clickAction": card.link, "url": card.link}
+            "importance": "low"}
+    if card.link:
+        data.update(clickAction=card.link, url=card.link)
     if card.finish_at is not None:
         data.update(chronometer=True, when=max(0, math.ceil(card.finish_at - now)), when_relative=True)
     return {"title": card.title, "message": card.message, "data": data}

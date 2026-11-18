@@ -771,10 +771,26 @@ class ParcelStageTests(unittest.TestCase):
 
     def test_the_source_is_the_carrier_name_as_a_slug(self):
         for carrier, source in (("PostNord", "postnord"), ("Airmee", "airmee"), ("GLS", "gls"), ("DHL (DE)", "dhl_de"),
-                                ("  Posten   Bring ", "posten_bring")):
+                                ("Budbee", "budbee"), ("DAO", "dao"), ("DHL", "dhl"), ("UPS", "ups"),
+                                ("  Danske   Fragtmænd ", "danske_fragtmaend")):
             with self.subTest(carrier=carrier):
                 d = self.one(carrier=carrier, barcode=" TESTX1 ")
                 self.assertEqual((d.source, d.id, d.carrier), (source, f"{source}:TESTX1", " ".join(carrier.split())))
+
+    def test_the_danish_letters_of_a_carrier_are_spelled_out_in_its_slug_and_kept_in_its_name(self):
+        for carrier, source in (("Danske Fragtmænd", "danske_fragtmaend"), ("DANSKE FRAGTMÆND", "danske_fragtmaend"),
+                                ("Ærø Ålbæk Ørsted", "aeroe_aalbaek_oersted")):
+            with self.subTest(carrier=carrier):
+                d = self.one(carrier=carrier, barcode="TESTX1")
+                self.assertEqual((d.source, d.id, d.carrier), (source, f"{source}:TESTX1", carrier))
+
+    def test_posten_bring_is_named_bring_in_the_carrier_and_the_title_but_not_in_the_source(self):
+        for carrier in ("Posten Bring", "  posten   BRING "):
+            with self.subTest(carrier=carrier):
+                d = self.one(carrier=carrier, barcode="TESTBR1", sender=None)
+                self.assertEqual((d.source, d.id, d.carrier, d.title),
+                                 ("posten_bring", "posten_bring:TESTBR1", "Bring", "Bring"))
+        self.assertEqual(self.one(carrier="Posten Bring", sender="Test Shop").title, "Test Shop")
 
     def test_unusable_parcels_are_skipped(self):
         for bad in (None, 3, "x", [], {}, parcel(carrier=None), parcel(carrier=""), parcel(carrier="()"),
@@ -831,6 +847,13 @@ class ParcelUpcomingTests(unittest.TestCase):
         found = self.upcoming(parcel(status="in_transit", sender="  Test   Shop "),
                               parcel(barcode="TESTPN0002", status="in_transit", sender=None))
         self.assertEqual([item["title"] for item in found], ["Test Shop", "PostNord"])
+
+    def test_a_parcel_without_a_sender_is_titled_by_its_carriers_brand_and_sourced_by_its_slug(self):
+        found = self.upcoming(parcel(carrier="Posten Bring", barcode="TESTBR1", status="in_transit", sender=None),
+                              parcel(carrier="Danske Fragtmænd", barcode="TESTDF1", status="in_transit", sender=None))
+        self.assertEqual([(item["id"], item["source"], item["title"]) for item in found],
+                         [("posten_bring:TESTBR1", "posten_bring", "Bring"),
+                          ("danske_fragtmaend:TESTDF1", "danske_fragtmaend", "Danske Fragtmænd")])
 
     def test_what_the_deliveries_hold_and_what_is_delivered_are_left_out(self):
         found = self.upcoming(parcel(barcode="TESTPN0001", status="out_for_delivery"),
@@ -983,6 +1006,16 @@ class ParcelSpokenTests(unittest.TestCase):
         self.assertEqual(self.say(self.parcel(carrier="GLS")), "A GLS parcel is out for delivery.")
         self.assertEqual(self.say(self.parcel(carrier="DHL (DE)")), "A DHL (DE) parcel is out for delivery.")
         self.assertEqual(self.say(self.parcel(carrier="InPost")), "An InPost parcel is out for delivery.")
+        self.assertEqual(self.say(self.parcel(carrier="Budbee")), "A Budbee parcel is out for delivery.")
+        self.assertEqual(self.say(self.parcel(carrier="DAO")), "A DAO parcel is out for delivery.")
+        self.assertEqual(self.say(self.parcel(carrier="UPS")), "A UPS parcel is out for delivery.")
+        self.assertEqual(self.say(self.parcel(carrier="Danske Fragtmænd")),
+                         "A Danske Fragtmænd parcel is out for delivery.")
+
+    def test_posten_bring_is_spoken_as_bring(self):
+        self.assertEqual(self.say(self.parcel(carrier="Posten Bring")), "A Bring parcel is out for delivery.")
+        self.assertEqual(self.say(self.parcel(carrier="Posten Bring", status="in_transit", start=local_time(10, 18, 30))),
+                         "A Bring parcel is expected around 6:30 PM.")
 
     def test_more_deliveries_are_counted_in_the_same_sentence_after_a_parcel(self):
         first = self.parcel(start=local_time(10, 18, 30))
@@ -1877,7 +1910,8 @@ class CarrierRefreshAppTests(unittest.TestCase):
 
     def test_the_shipped_buttons_are_keyed_by_the_carrier_slugs_the_parcels_get(self):
         shipped = shipped_refresh_buttons()
-        carriers = {"airmee": "Airmee", "postnord": "PostNord", "gls": "GLS"}
+        carriers = {"airmee": "Airmee", "postnord": "PostNord", "gls": "GLS", "budbee": "Budbee",
+                    "posten_bring": "Posten Bring", "dao": "DAO", "dhl": "DHL", "danske_fragtmaend": "Danske Fragtmænd"}
         self.assertEqual(set(shipped), set(carriers))
         for source, carrier in carriers.items():
             with self.subTest(source=source):
@@ -1886,12 +1920,24 @@ class CarrierRefreshAppTests(unittest.TestCase):
                 h.advance(180)
                 self.assertEqual(self.pressed(h), [shipped[source]])
 
+    def test_ups_has_no_shipped_button_since_its_refreshes_are_rate_limited(self):
+        self.assertNotIn("ups", shipped_refresh_buttons())
+        h = Harness({AGGREGATOR_INCOMING: aggregator(parcel(carrier="UPS"))}, refresh_buttons=shipped_refresh_buttons())
+        h.ring(("front door", NOW))
+        h.advance(400)
+        self.assertEqual(self.pressed(h), [])
+
 
 class CarrierNameTests(unittest.TestCase):
     def test_a_parcel_source_is_named_as_its_carrier_names_itself(self):
         deliveries = [delivery(), carrier_parcel("PostNord", "TESTPN0001"), carrier_parcel("Airmee", "TESTAM0001")]
         self.assertEqual(hd.carrier_name(deliveries, "postnord"), "PostNord")
         self.assertEqual(hd.carrier_name(deliveries, "airmee"), "Airmee")
+
+    def test_posten_bring_is_named_bring_and_danske_fragtmaend_keeps_its_letters(self):
+        deliveries = [carrier_parcel("Posten Bring", "TESTBR1"), carrier_parcel("Danske Fragtmænd", "TESTDF1")]
+        self.assertEqual(hd.carrier_name(deliveries, "posten_bring"), "Bring")
+        self.assertEqual(hd.carrier_name(deliveries, "danske_fragtmaend"), "Danske Fragtmænd")
 
     def test_a_source_without_a_parcel_is_named_as_it_is(self):
         self.assertEqual(hd.carrier_name([], "postnord"), "postnord")
@@ -2368,6 +2414,16 @@ class LandingWatchAppTests(unittest.TestCase):
         h = self.make(parcels=[AIRMEE_PARCEL, ("Airmee", "TESTAM0002")])
         self.visit(h)
         self.assertEqual(self.told(h), ([{"message": AIRMEE_SENTENCE}], []))
+
+    def test_posten_bring_is_named_bring_and_danske_fragtmaend_by_its_own_letters(self):
+        buttons = {"posten_bring": "button.bring_test_refresh", "danske_fragtmaend": "button.danske_test_refresh"}
+        for carrier, source, name in (("Posten Bring", "posten_bring", "Bring"),
+                                      ("Danske Fragtmænd", "danske_fragtmaend", "Danske Fragtmænd")):
+            with self.subTest(carrier=carrier):
+                h = self.make(parcels=[(carrier, "TESTX0001")], refresh_buttons=buttons)
+                self.visit(h)
+                self.assertEqual(self.told(h), ([{"message": f"Your {name} parcel is probably outside the door."}], []))
+                self.assertEqual(presses(h), [buttons[source]])
 
     def test_only_a_carrier_with_a_plausible_courier_is_named_and_refreshed(self):
         h = self.make(states={AGGREGATOR_INCOMING: aggregator(

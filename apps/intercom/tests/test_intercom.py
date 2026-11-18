@@ -1306,6 +1306,16 @@ class CourierWordingTests(unittest.TestCase):
         self.assertEqual(intercom.courier_message("groceries", False, None), "The groceries are here.")
         self.assertEqual(intercom.courier_message("parcel", False, None), "A parcel is probably here.")
 
+    def test_the_push_title_names_the_courier_by_its_source(self):
+        for source, name in (("wolt", "Wolt"), ("nemlig", "Nemlig"), ("gls", "GLS"), ("postnord", "PostNord"),
+                             ("airmee", "Airmee"), ("posten_bring", "Bring"), ("budbee", "Budbee"), ("dao", "DAO"),
+                             ("dhl", "DHL"), ("ups", "UPS"), ("danske_fragtmaend", "Danske Fragtmænd")):
+            with self.subTest(source=source):
+                self.assertEqual(intercom.courier_push_title(source), f"Probably the {name} courier")
+        for source in (None, "", "mystery", 5):
+            with self.subTest(source=source):
+                self.assertEqual(intercom.courier_push_title(source), "Probably the courier")
+
 
 if __name__ == "__main__":
     unittest.main()

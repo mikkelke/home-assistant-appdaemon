@@ -41,6 +41,11 @@ HomeDelivery:
     airmee: button.airmee_refresh
     postnord: button.postnord_refresh
     gls: button.gls_refresh
+    budbee: button.budbee_refresh
+    posten_bring: button.posten_bring_refresh
+    dao: button.dao_refresh
+    dhl: button.dhl_refresh
+    danske_fragtmaend: button.danske_fragtmaend_refresh
   landing_entity: binary_sensor.landing_presence_presence
   apartment_door_entity: binary_sensor.apartment_door_open
   apartment_doorbell_entity: binary_sensor.yale_doorbell_ding

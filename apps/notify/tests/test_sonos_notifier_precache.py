@@ -517,6 +517,13 @@ class PrecacheList(unittest.TestCase):
                          "precache_messages and add the call to REVIEWED")
         self.assertEqual(set(REVIEWED) - dynamic, set(), "REVIEWED names a call that is gone")
 
+    def test_a_carrier_is_spoken_by_the_name_its_listed_sentence_has(self):
+        for carrier in ("Airmee", "PostNord", "GLS", "Budbee", "Posten Bring", "DAO", "DHL", "Danske Fragtmænd"):
+            with self.subTest(carrier=carrier):
+                name, source, _ = home_delivery.parcel_identity({"carrier": carrier, "barcode": "TEST0001"})
+                self.assertEqual(name, intercom.COURIER_NAMES[source])
+                self.assertIn(home_delivery.parcel_outside_sentence(name), self.messages)
+
     def test_the_templated_sentences_are_listed_as_the_code_builds_them(self):
         for name, sentences in (
             ("intercom", intercom_sentences(self.sites)),

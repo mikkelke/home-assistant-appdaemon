@@ -34,11 +34,12 @@ LiveUpdates:
   doorbell_max_s: 180
 
   # HomeDelivery's sensor.home_delivery: one card per source (Wolt, Nemlig, and the parcel carriers Airmee,
-  # PostNord, GLS) for its next active delivery, cleared when delivered. A parcel has a card only while it is
-  # out for delivery. A cancelled Wolt order also sends one real push through MobileNotifier, category
-  # delivery. Only food concerns the household: Kristine orders on Mikkel's Wolt account, while Nemlig and
-  # parcels are Mikkel's own errands. Each audience is cut down to enabled_people, so Kristine gets Wolt
-  # cards (and the cancel push) once she is listed there, and never a Nemlig or parcel card.
+  # PostNord, GLS, Budbee, Bring, DAO, DHL, UPS, Danske Fragtmænd) for its next active delivery, cleared when
+  # delivered. A parcel has a card only while it is out for delivery. A cancelled Wolt order also sends one
+  # real push through MobileNotifier, category delivery. Only food concerns the household: Kristine orders on
+  # Mikkel's Wolt account, while Nemlig and parcels are Mikkel's own errands. Each audience is cut down to
+  # enabled_people, so Kristine gets Wolt cards (and the cancel push) once she is listed there, and never a
+  # Nemlig or parcel card.
   # A street-door ring while sensor.home_delivery names a door_courier (the delivery a ring most likely
   # brings) takes that delivery's card away, since the courier is here; for a parcel it takes the card of every
   # parcel of that carrier, one courier carrying them all. An apartment-door ring within ten

@@ -105,6 +105,11 @@ SonosNotifier:
     - "Your Airmee parcel is probably outside the door."
     - "Your PostNord parcel is probably outside the door."
     - "Your GLS parcel is probably outside the door."
+    - "Your Budbee parcel is probably outside the door."
+    - "Your Bring parcel is probably outside the door."
+    - "Your DAO parcel is probably outside the door."
+    - "Your DHL parcel is probably outside the door."
+    - "Your Danske Fragtmænd parcel is probably outside the door."
     # Washer, dryer and dishwasher
     - "Washer is ready to be emptied"
     - "Drum clean is done. Open the washer door to air it"

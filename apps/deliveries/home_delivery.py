@@ -81,6 +81,8 @@ PARCELS_INCOMING = "sensor.parcel_aggregator_incoming_parcels"
 PARCELS_DELIVERED = "sensor.parcel_aggregator_delivered_parcels"
 PARCEL_NOT_YET_OUT = ("registered", "in_transit")
 PARCEL_ARRIVING_S = 900
+CARRIER_BRANDS = {"posten_bring": "Bring"}
+DANISH_LETTERS = str.maketrans({"æ": "ae", "ø": "oe", "å": "aa"})
 
 INTERCOM_VISIT = "sensor.intercom_visit"
 STREET_DOORS = ("front door", "back door")
@@ -361,13 +363,14 @@ def tidy(value):
 
 
 def parcel_identity(parcel):
-    """(carrier, source, barcode) of an aggregator parcel, source being the carrier as a slug; None for anything
-    that is not a parcel with a carrier and a barcode."""
+    """(carrier, source, barcode) of an aggregator parcel, source being the carrier as a slug with æ, ø and å spelled
+    ae, oe and aa, and carrier its name as CARRIER_BRANDS gives it for that source, else as the aggregator spells it;
+    None for anything that is not a parcel with a carrier and a barcode."""
     if not isinstance(parcel, dict):
         return None
     carrier, barcode = tidy(parcel.get("carrier")), tidy(parcel.get("barcode"))
-    source = re.sub(r"[^a-z0-9]+", "_", carrier.lower()).strip("_")
-    return (carrier, source, barcode) if source and barcode else None
+    source = re.sub(r"[^a-z0-9]+", "_", carrier.lower().translate(DANISH_LETTERS)).strip("_")
+    return (CARRIER_BRANDS.get(source, carrier), source, barcode) if source and barcode else None
 
 
 def parcel_delivery(parcel, now):

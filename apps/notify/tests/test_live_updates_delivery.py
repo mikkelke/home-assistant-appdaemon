@@ -8,6 +8,7 @@ import re
 import sys
 import tempfile
 import unittest
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -175,10 +176,32 @@ class ParcelCardTests(unittest.TestCase):
     def test_each_carrier_has_its_own_tag_title_icon_and_app(self):
         for source, title, link in (("airmee", "Airmee", "app://com.airmee.customer"),
                                     ("postnord", "PostNord", "app://se.postnord.private"),
-                                    ("gls", "GLS", "app://dk.gls.consigneeapp")):
+                                    ("gls", "GLS", "app://dk.gls.consigneeapp"),
+                                    ("budbee", "Budbee", "app://com.budbee.tracking"),
+                                    ("posten_bring", "Bring", "app://com.bring.sporing.controller"),
+                                    ("dao", "DAO", "app://as.dao.app"),
+                                    ("dhl", "DHL", "app://com.dhl.exp.dhlmobile"),
+                                    ("ups", "UPS", "app://com.ups.mobile.android"),
+                                    ("danske_fragtmaend", "Danske Fragtmænd", "")):
             with self.subTest(source=source):
                 c = parcel_card(source=source, eta=NOW + 1800)
                 self.assertEqual((c.tag, c.title, c.icon, c.link), (TAGS[source], title, "mdi:package-variant-closed", link))
+
+    def test_every_delivery_source_has_a_tag_and_every_carrier_a_parcel_kind_and_an_app_but_one(self):
+        for source in ("wolt", "nemlig", *lu.PARCEL_CARRIERS):
+            self.assertIn("live_delivery_" + source, lu.TAGS)
+        self.assertEqual({lu.DELIVERY_KINDS[source] for source in lu.PARCEL_CARRIERS}, {"parcel"})
+        self.assertEqual(set(lu.PARCEL_CARRIERS) - set(lu.DELIVERY_APPS), {"danske_fragtmaend"})
+
+    def test_a_carrier_without_an_app_has_a_card_that_opens_nothing(self):
+        c = parcel_card(source="danske_fragtmaend", eta=NOW + 1800)
+        self.assertEqual((c.message, c.critical_text, c.finish_at), ("Out for delivery · 13:30", "30 min", NOW + 1800))
+        data = lu.notification_payload(c, NOW)["data"]
+        self.assertEqual((data["tag"], data["when"]), (TAGS["danske_fragtmaend"], 1800))
+        self.assertNotIn("clickAction", data)
+        self.assertNotIn("url", data)
+        self.assertEqual(lu.stored_card(asdict(c)), c)
+        self.assertFalse(lu.card_changed(c, parcel_card(source="danske_fragtmaend", eta=NOW + 1800)))
 
     def test_the_title_is_the_carrier_not_the_sender(self):
         self.assertEqual(parcel_card(title="Some Webshop").title, "PostNord")
@@ -224,7 +247,7 @@ class ParcelCardTests(unittest.TestCase):
                 self.assertIsNone(parcel_card(stage=stage, start=NOW + 600, end=NOW + 3600))
 
     def test_other_carriers_have_no_card(self):
-        self.assertIsNone(lu.delivery_card(parcel_entry(source="dao"), NOW))
+        self.assertIsNone(lu.delivery_card(parcel_entry(source="inpost"), NOW))
         self.assertIsNone(lu.delivery_card(parcel_entry(source="dhl_de", eta=NOW + 600), NOW))
 
     def test_the_payload_is_the_quiet_live_card_and_the_countdown_only_comes_with_an_eta(self):
@@ -426,9 +449,24 @@ class DeliveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(h.ongoing(POSTNORD), [])
         h.notify.assert_not_awaited()
 
+    async def test_the_newer_carriers_each_get_a_card_and_the_one_without_an_app_opens_nothing(self):
+        carriers = {"budbee": ("Budbee", "app://com.budbee.tracking"),
+                    "posten_bring": ("Bring", "app://com.bring.sporing.controller"),
+                    "dao": ("DAO", "app://as.dao.app"), "dhl": ("DHL", "app://com.dhl.exp.dhlmobile"),
+                    "ups": ("UPS", "app://com.ups.mobile.android"), "danske_fragtmaend": ("Danske Fragtmænd", None)}
+        h = await self.make(states={ENTITIES["delivery"]: sensor(
+            *[parcel_entry(source, eta=NOW + 900) for source in carriers])})
+        for source, (title, link) in carriers.items():
+            with self.subTest(source=source):
+                [(service, payload)] = h.ongoing(TAGS[source])
+                self.assertEqual((service, payload["title"], payload["message"]), (MIKKEL, title, "Out for delivery · 13:15"))
+                self.assertEqual((payload["data"].get("clickAction"), payload["data"].get("url")), (link, link))
+        h.notify.assert_not_awaited()
+
     async def test_a_reload_clears_every_parcel_tag_on_each_enabled_phone(self):
         h = await self.make()
-        for tag in (AIRMEE, POSTNORD, GLS):
+        for tag in (AIRMEE, POSTNORD, GLS, *(TAGS[source] for source in ("budbee", "posten_bring", "dao", "dhl", "ups",
+                                                                         "danske_fragtmaend"))):
             self.assertEqual([service for service, _ in h.clears(tag)], [MIKKEL])
 
     async def test_an_unavailable_sensor_holds_the_card_then_clears_it(self):
@@ -556,6 +594,8 @@ class MatchedRingTests(unittest.TestCase):
         ring = visit(door="apartment door")
         [plain] = lu.doorbell_cards(ring, NOW, 180).values()
         for order, text in (("gls:B1", "Probably the GLS courier"), ("nemlig:1", "Probably the Nemlig courier"),
+                            ("posten_bring:B1", "Probably the Bring courier"),
+                            ("danske_fragtmaend:B1", "Probably the Danske Fragtmænd courier"),
                             ("wolt:a", COURIER), ("", "Probably the courier"), ("x:1", "Probably the courier")):
             with self.subTest(order=order):
                 [card] = lu.doorbell_cards(ring, NOW, 180, {str(int(NOW)): order}).values()

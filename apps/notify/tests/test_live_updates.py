@@ -41,6 +41,8 @@ TAGS = {
     "probe": "live_cook_probe", "coffee": "live_coffee", "apartment": "live_doorbell_apartment",
     "wolt": "live_delivery_wolt", "nemlig": "live_delivery_nemlig",
     "airmee": "live_delivery_airmee", "postnord": "live_delivery_postnord", "gls": "live_delivery_gls",
+    "budbee": "live_delivery_budbee", "posten_bring": "live_delivery_posten_bring", "dao": "live_delivery_dao",
+    "dhl": "live_delivery_dhl", "ups": "live_delivery_ups", "danske_fragtmaend": "live_delivery_danske_fragtmaend",
 }
 STREET_TAGS = ("live_doorbell_front", "live_doorbell_back")
 

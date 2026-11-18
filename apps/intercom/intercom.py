@@ -38,7 +38,9 @@ COURIER_AT_THE_DOOR = {
 COURIER_APARTMENT_WINDOW_S = 600
 # Carrier names for the auto-open push of a street ring that matched a courier, keyed by
 # the source of sensor.home_delivery's door_courier.
-COURIER_NAMES = {"wolt": "Wolt", "nemlig": "Nemlig", "gls": "GLS", "postnord": "PostNord", "airmee": "Airmee"}
+COURIER_NAMES = {"wolt": "Wolt", "nemlig": "Nemlig", "gls": "GLS", "postnord": "PostNord", "airmee": "Airmee",
+                 "budbee": "Budbee", "posten_bring": "Bring", "dao": "DAO", "dhl": "DHL", "ups": "UPS",
+                 "danske_fragtmaend": "Danske Fragtmænd"}
 COURIER_PUSH_MATCH_S = 10
 
 # ---------------------------------------------------------------------------
