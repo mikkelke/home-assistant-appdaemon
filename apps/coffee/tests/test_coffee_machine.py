@@ -918,6 +918,16 @@ class BeansTests(unittest.TestCase):
         self.assertEqual((state, attrs["bean_id"]), ("235", "b1"))
         self.assertNotIn("last_op_id", attrs)
 
+    def test_add_rejects_a_name_that_cleans_to_empty(self):
+        app = self.two_bags()
+        before = fake.last(app, "sensor.coffee_beans")
+
+        fake.op(app, "beans_add", {"grams": 100, "new_name": "珈琲"})
+
+        self.assertEqual(fake.last(app, "sensor.coffee_beans"), before)
+        self.assertTrue(any(level == "WARNING" and message.startswith("beans_add ignored")
+                            for level, message in app.logs))
+
     def test_start_for_a_bag_uses_its_recipe_and_cohort_without_changing_the_usual(self):
         app = self.two_bags(advisor_entity="ai_task.stub")
         daybreak = rated_usual(app, 0, "sour")
@@ -970,6 +980,45 @@ class BeansTests(unittest.TestCase):
         record = fake.ledger(app)[-1]
         self.assertEqual((record["bean"], record["debited_g"]), ({"id": "b1", "name": "Daybreak"}, 15.0))
         self.assertEqual([b["remaining"] for b in fake.last(app, "sensor.coffee_beans")[1]["bags"]], ["500", "199"])
+
+    def test_start_for_the_usual_bag_keeps_the_requested_variant_and_trial(self):
+        tweak = {"dose": 16, "ratio": 16, "grind_size": 42, "temperature": 90}
+        for requested, variant, sent_overrides, advice_state in (
+            ({"variant": "usual"}, "trial", {"grind_size": 44}, "trial_brewed"),
+            ({"variant": "base"}, "base", {}, "trial_queued"),
+            ({"variant": "tweak", **tweak}, "tweak", tweak, "trial_queued"),
+        ):
+            with self.subTest(variant=requested["variant"]):
+                app = self.two_bags(advisor_entity="ai_task.stub")
+                app._advice.data.update(state="trial_queued", bean_id="b1", **{"from": 46, "to": 44})
+
+                brew(app, start={"bean_id": "b1", **requested})
+
+                sent = calls(app, "xbloom/start_brew")[-1]
+                self.assertEqual(sent["recipe_name"], "Daybreak")
+                self.assertEqual({key: sent[key] for key in tweak if key in sent}, sent_overrides)
+                record = fake.ledger(app)[-1]
+                self.assertEqual((record["variant"], record["bean"], record["debited_g"]),
+                                 (variant, {"id": "b1", "name": "Daybreak"}, sent_overrides.get("dose", 15)))
+                self.assertEqual(fake.last(app, "sensor.coffee_advice")[0], advice_state)
+                self.assertEqual(fake.last(app, "sensor.coffee_recipes")[1]["usual_id"], "Daybreak")
+
+    def test_another_recipe_brew_keeps_the_usual_with_two_open_bags(self):
+        for source in ("phone", "inferred"):
+            for one_bag in (False, True):
+                with self.subTest(source=source, one_bag=one_bag):
+                    app = self.two_bags()
+                    if one_bag:
+                        fake.op(app, "beans_empty", {"bean_id": "b2"})
+                    started = {"run_id": "r1", "recipe_name": "Signature Brew"}
+                    if source == "phone":
+                        fake.op(app, "start", {"variant": "other", "recipe_id": "Signature Brew"}, user_id=MIKKEL)
+                        started["context"] = {"coffee_brew_id": coffee_state(app)[1]["brew_id"]}
+                    fake.fire(app, "xbloom_brew_started", started)
+
+                    self.assertEqual(coffee_state(app)[1]["variant"], "other")
+                    self.assertEqual(fake.last(app, "sensor.coffee_recipes")[1]["usual_id"],
+                                     "Signature Brew" if one_bag else "Daybreak")
 
     def test_rating_a_bag_brew_does_not_ask_for_advice_on_the_other_bag(self):
         app = self.two_bags(advisor_entity="ai_task.stub")

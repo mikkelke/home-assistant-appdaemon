@@ -636,7 +636,7 @@ class CoffeeMachine(hass.Hass):
                 brew["baseline"] = cb.frozen(base)
             elif recipe is not None and brew.get("variant") in cb.COHORT_VARIANTS:
                 brew["baseline"] = cb.frozen(self._baseline_for(recipe, bean_id, now))
-        if brew.get("variant") == "other" and recipe is not None:
+        if brew.get("variant") == "other" and recipe is not None and len(self._beans.bags) < 2:
             self._set_usual(recipe, now)
         self._take_pending_chip(brew, now)
         self._resolve_who(brew, final=False)
@@ -972,15 +972,18 @@ class CoffeeMachine(hass.Hass):
         bean_id = data.get("bean_id")
         bean = None
         usual = self._usual()
+        variant = data.get("variant") or "usual"
+        plain_bag_start = False
         if bean_id is not None:
             bean = self._beans.bean(bean_id)
             recipe = self._beans.recipe_for(bean_id, self._recipes) if bean else None
             if recipe is None:
                 self._warn(f"Start ignored: no recipe for open bag {ascii_text(bean_id, 40)!r}")
                 return
-            variant = "usual"
+            plain_bag_start = usual is None or recipe["id"] != usual["id"] or variant == "other"
+            if plain_bag_start:
+                variant = "usual"
         else:
-            variant = data.get("variant") or "usual"
             recipe = cp.by_id(self._recipes, data.get("recipe_id")) if variant == "other" else usual
         if variant not in VARIANTS:
             self._warn(f"Start ignored: variant {variant!r}")
@@ -996,7 +999,7 @@ class CoffeeMachine(hass.Hass):
                         return
                     overrides[key] = value
         trial = None
-        grind = self._advice.trial_grind(variant) if bean is None else None
+        grind = None if plain_bag_start else self._advice.trial_grind(variant)
         if grind is not None and usual is not None:
             overrides, variant, trial = {"grind_size": int(grind)}, "trial", self._advice.trial_text()
         brew_id = cf.brew_id_for(now)

@@ -64,9 +64,18 @@ class AddTests(unittest.TestCase):
         beans = cbeans.Beans()
         beans.add(214, NOW, new_name="Daybreak")
         beans.add(500, NOW + MIN, new_name="Signature Brew")
-        beans.add(50, NOW + 2 * MIN, new_name="  ", default_bean_id="b1")
+        beans.add(50, NOW + 2 * MIN, new_name="", default_bean_id="b1")
         self.assertEqual(beans.bag("b1")["remaining_g"], 264.0)
         self.assertEqual(beans.bag("b2")["remaining_g"], 500.0)
+
+    def test_a_nonempty_name_that_cleans_to_empty_is_rejected(self):
+        beans = cbeans.Beans()
+        beans.add(214, NOW, new_name="Daybreak")
+        before = json.dumps(beans.to_dict())
+        for name in ("咖啡", "  "):
+            with self.subTest(name=name):
+                self.assertIsNone(beans.add(50, NOW + MIN, new_name=name))
+                self.assertEqual(json.dumps(beans.to_dict()), before)
 
     def test_a_name_that_is_known_picks_those_beans(self):
         beans = cbeans.Beans()
@@ -358,6 +367,19 @@ class ViewTests(unittest.TestCase):
         beans.debit("c1", 80, NOW, bean_id="b1")
         self.assertTrue(beans.view(15.0, NOW)["low"])
         self.assertEqual(view["known_beans"], [{"id": "b1", "name": "Kenya Kiambu"}])
+
+    def test_primary_brews_left_and_low_match_its_bag_row(self):
+        beans = cbeans.Beans()
+        beans.add(214, NOW, new_name="Daybreak")
+        beans.add(45, NOW + MIN, new_name="Signature Brew")
+        signature = {"id": "Signature Brew", "name": "Signature Brew", "dose_g": 18}
+        for recipes, expected in (((signature,), (2, True)), ((), (3, False))):
+            with self.subTest(recipes=recipes):
+                view = beans.view(15, NOW + MIN, usual_name="4 Pour Recipe", recipes=recipes)
+                self.assertEqual(view["bean_id"], "b2")
+                self.assertEqual((view["brews_left"], view["low"]), expected)
+                row = view["bags"][0]
+                self.assertEqual((row["bean_id"], row["brews_left"], row["low"]), ("b2", *expected))
 
 
 if __name__ == "__main__":

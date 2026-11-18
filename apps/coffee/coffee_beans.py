@@ -132,8 +132,10 @@ class Beans:
             return None
         if not 0 < grams <= MAX_ADD_G:
             return None
-        before = self._snapshot()
         name = _clean_name(new_name)
+        if new_name and not name:
+            return None
+        before = self._snapshot()
         if name:
             target = self._named(name) or self._new_bean(name)
         elif bean_id:
@@ -261,8 +263,9 @@ class Beans:
 
     def view(self, dose_g, now, usual_name=None, recipes=()):
         """What sensor.coffee_beans shows, in numbers."""
-        primary = self.primary(usual_name)
-        out = self._bag_view(self.bag((primary or {}).get("id")), dose_g)
+        primary_id = (self.primary(usual_name) or {}).get("id")
+        primary_recipe = self.recipe_for(primary_id, recipes) or {}
+        out = self._bag_view(self.bag(primary_id), primary_recipe.get("dose_g") or dose_g)
         out["dose_g"] = dose_g
         out["known_beans"] = [{"id": b["id"], "name": b["name"]} for b in self.known]
         out["bags"] = []
