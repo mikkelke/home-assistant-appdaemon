@@ -838,7 +838,13 @@ class AmazonCopiesTests(unittest.TestCase):
     def test_the_items_of_one_order_are_one_parcel(self):
         items = [self.amazon("1", start=at(60)), self.amazon("2", start=at(60)),
                  self.amazon("3", order="028-0000002-0000002", start=at(60))]
-        self.assertEqual(self.barcodes([items, []]), [["028-0000001-0000001", "028-0000002-0000002"], []])
+        today = hd.local_day(NOW).isoformat()
+        self.assertEqual(self.barcodes([items, []]),
+                         [[f"028-0000001-0000001-{today}", f"028-0000002-0000002-{today}"], []])
+
+    def test_an_order_sent_on_two_days_is_two_parcels(self):
+        items = [self.amazon("1", start=at(60)), self.amazon("2", start=at(60 * 24 * 2)), self.amazon("3")]
+        self.assertEqual(len(hd.without_amazon_copies([items])[0]), 3)
 
     def test_an_order_is_delivered_only_when_every_item_is(self):
         items = [self.amazon("1", status="delivered", delivered_at=at(-5)), self.amazon("2", start=at(60))]
@@ -866,10 +872,10 @@ class AmazonCopiesTests(unittest.TestCase):
         other_day = parcel(carrier="Airmee", barcode="c443dc28", sender="Amazon", start=at(60 * 24), end=at(60 * 25))
         other_shop = parcel(sender="Test Shop", start=at(60))
         mine = self.amazon("1", start=at(60))
-        self.assertEqual(self.barcodes([[other_day, other_shop, mine]]),
-                         [["c443dc28", "TESTPN0001", "028-0000001-0000001"]])
+        order = f"028-0000001-0000001-{hd.local_day(NOW).isoformat()}"
+        self.assertEqual(self.barcodes([[other_day, other_shop, mine]]), [["c443dc28", "TESTPN0001", order]])
         [d] = [d for d in hd.parcel_deliveries(hd.without_amazon_copies([[mine]]), NOW)]
-        self.assertEqual((d.id, d.title), ("amazon:028-0000001-0000001", "Amazon"))
+        self.assertEqual((d.id, d.title), (f"amazon:{order}", "Amazon"))
 
     def test_a_tracking_id_without_an_order_id_is_its_own_parcel(self):
         mine = self.amazon("1", tracking="1Z999AA10123456784", start=at(60))

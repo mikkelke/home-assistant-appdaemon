@@ -386,19 +386,22 @@ def parcel_day(parcel):
 
 
 def amazon_order(parcels):
-    """One parcel for the Amazon items of one order: delivered only when every item is, else the first item still
-    under way, with the order id as its barcode."""
+    """One parcel for the Amazon items of one order due the same day: delivered only when every item is, else the
+    first item still under way, with the order id and that day as its barcode."""
     under_way = [parcel for parcel in parcels if parcel.get("status") != "delivered"]
     first = (under_way or parcels)[0]
-    order = AMAZON_ORDER.match(tidy(first.get("barcode")))
-    return {**first, "barcode": order.group(0)} if order else first
+    order, day = AMAZON_ORDER.match(tidy(first.get("barcode"))), parcel_day(first)
+    if order is None:
+        return first
+    return {**first, "barcode": f"{order.group(0)}-{day.isoformat()}" if day else order.group(0)}
 
 
 def without_amazon_copies(lists):
-    """The aggregator's lists with Amazon's own parcels cut to one per order, and dropped where a carrier already
-    tracks the package: a carrier parcel with Amazon's barcode (its tracking id, when Amazon has one), or one from
-    an Amazon sender on the same day. Amazon lists every item of an order as a parcel (barcode order id plus item)
-    and hands most to carriers whose own parcels carry the courier, window and ETA, so the carrier's is kept."""
+    """The aggregator's lists with Amazon's own parcels cut to one per order and day (an order sent on several days
+    stays several parcels), and dropped where a carrier already tracks the package: a carrier parcel with Amazon's
+    barcode (its tracking id, when Amazon has one), or one from an Amazon sender on the same day. Amazon lists every
+    item of an order as a parcel (barcode order id plus item) and hands most to carriers whose own parcels carry the
+    courier, window and ETA, so the carrier's is kept."""
     carried, days = set(), set()
     for parcels in lists:
         for parcel in parcels:
@@ -418,7 +421,8 @@ def without_amazon_copies(lists):
                 kept.append(parcel)
             elif identity[2] not in carried:
                 order = AMAZON_ORDER.match(identity[2])
-                orders.setdefault(order.group(0) if order else identity[2], []).append(parcel)
+                key = (order.group(0), parcel_day(parcel)) if order else (identity[2], None)
+                orders.setdefault(key, []).append(parcel)
         kept.extend(order for order in map(amazon_order, orders.values()) if parcel_day(order) not in days)
         result.append(kept)
     return result
