@@ -93,6 +93,7 @@ BedroomDisplay:
   play_event: esphome.bedroom_display_play
   players:
     - media_player.bedroom_tv
+    - media_player.bedroom
     - media_player.bedroom_2
   rain_entity: binary_sensor.gw2000a_rain_state_piezo
   weather_entity: weather.forecast_home

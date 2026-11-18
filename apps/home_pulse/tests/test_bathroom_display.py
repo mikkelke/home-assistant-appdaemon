@@ -3170,6 +3170,7 @@ class NightTests(unittest.TestCase):
 
 class BedroomDisplayTests(unittest.TestCase):
     TV = "media_player.bedroom_tv"
+    MA = "media_player.bedroom"
     SONOS = "media_player.bedroom_2"
     PLAY_EVENT = "esphome.bedroom_display_play"
     ALARM_EVENT = "esphome.bedroom_display_alarm"
@@ -3227,6 +3228,16 @@ class BedroomDisplayTests(unittest.TestCase):
         self.assertNotIn(("_on_play", CONFIG["play_event"]), app.events)
         app._on_play(self.PLAY_EVENT, {}, {})
         self.assertEqual(app.calls, [(self.PLAY_PAUSE, {"entity_id": self.TV})])
+
+    def test_music_assistant_wins_over_its_native_twin(self):
+        app = self.app({self.MA: full("playing"), self.SONOS: full("playing")})
+        app._on_play(self.PLAY_EVENT, {}, {})
+        self.assertEqual(app.calls, [(self.PLAY_PAUSE, {"entity_id": self.MA})])
+
+    def test_the_native_twin_is_toggled_when_music_assistant_is_idle(self):
+        app = self.app({self.MA: full("idle"), self.SONOS: full("playing")})
+        app._on_play(self.PLAY_EVENT, {}, {})
+        self.assertEqual(app.calls, [(self.PLAY_PAUSE, {"entity_id": self.SONOS})])
 
     def test_a_playing_player_wins_over_a_paused_player(self):
         app = self.app({self.TV: {**full("paused"), "last_changed": iso(NOW)}, self.SONOS: full("playing")})
