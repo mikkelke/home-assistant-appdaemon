@@ -39,6 +39,9 @@ CoffeeMachine:
     - person: person.claudia
       distance: sensor.claudias_iphone_ble_distance_to_ble_proxy_coffee_bar
       area: sensor.claudias_iphone_ble_area
+    - person: person.kristine
+      distance: sensor.kristines_iphone_ble_distance_to_ble_proxy_coffee_bar
+      area: sensor.kristines_iphone_ble_area
   person_entities: [person.mikkel, person.kristine, person.claudia]
   # Name the brewer when exactly one person is home (ActorAttribution's rule). false: Bermuda only.
   sole_occupancy: true

@@ -828,7 +828,7 @@ class WhoTests(unittest.TestCase):
 
     def test_bermuda_names_claudia_when_she_is_clearly_closer(self):
         app = fake.make_app()
-        mikkel, claudia = fake.CONFIG["bermuda_phones"]
+        mikkel, claudia = fake.CONFIG["bermuda_phones"][:2]
         fake.set_entity(app, "person.claudia", "home")
         for phone in (mikkel, claudia):
             fake.set_entity(app, phone["area"], "Kitchen")
@@ -841,7 +841,7 @@ class WhoTests(unittest.TestCase):
 
     def test_bermuda_names_nobody_when_two_phones_are_equally_near(self):
         app = fake.make_app()
-        mikkel, claudia = fake.CONFIG["bermuda_phones"]
+        mikkel, claudia = fake.CONFIG["bermuda_phones"][:2]
         fake.set_entity(app, "person.claudia", "home")
         for phone in (mikkel, claudia):
             fake.set_entity(app, phone["area"], "Kitchen")

@@ -35,4 +35,5 @@ BleLocator:
   devices:
     - {name: mikkel, address: "d6462f88944242db9e31bdff598edc25_100_40004", bermuda_area: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area}
     - {name: claudia, address: "89f35c9874aed44c554015fe6eaa3545", bermuda_area: sensor.claudias_iphone_ble_area}
+    - {name: kristine, address: "9dcbf915fd5fc9402c7e0d0001174ad6", bermuda_area: sensor.kristines_iphone_ble_area}
     - {name: rober2_beacon, address: "7c:d9:f4:14:23:77", bermuda_area: sensor.mp1_142377_area}

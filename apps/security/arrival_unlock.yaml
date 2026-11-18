@@ -62,3 +62,29 @@ ArrivalUnlockClaudia:
   relock_s: 60
   notify: notify.mobile_app_claudias_iphone
   log_file: /conf/apps/security/arrival_unlock_claudia_log.jsonl
+
+# Kristine's iPhone, same IRK route as Claudia's.
+ArrivalUnlockKristine:
+  module: arrival_unlock
+  class: ArrivalUnlock
+
+  tracker: device_tracker.kristines_iphone
+  away_min: 10
+
+  landing_area_sensor: sensor.kristines_iphone_ble_area
+  landing_area: Landing
+  landing_distance: sensor.kristines_iphone_ble_distance_to_ble_proxy_landing
+  landing_online: sensor.ble_proxy_landing_uptime
+
+  lock: sensor.apartment_lock
+  door: binary_sensor.apartment_door_open
+  keypad: lock.yale
+
+  window_s: 180
+
+  unlock_switch: input_boolean.arrival_unlock_kristine
+  unlock_lock: lock.yale_bt
+  unlock_fallback: lock.yale
+  relock_s: 60
+  notify: notify.mobile_app_kristine_iphone_2
+  log_file: /conf/apps/security/arrival_unlock_kristine_log.jsonl

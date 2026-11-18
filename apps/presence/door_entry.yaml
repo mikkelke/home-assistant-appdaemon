@@ -21,6 +21,7 @@ DoorEntry:
   residents:
     - {name: Mikkel, area_sensor: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area, tracker: device_tracker.mikkels_ofx9p}
     - {name: Claudia, area_sensor: sensor.claudias_iphone_ble_area, tracker: device_tracker.claudias_iphone_2}
+    - {name: Kristine, area_sensor: sensor.kristines_iphone_ble_area, tracker: device_tracker.kristines_iphone}
 
   pre_s: 120
   post_s: 30

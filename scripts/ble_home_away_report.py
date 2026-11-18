@@ -11,6 +11,7 @@ END = time.time()
 PEOPLE = {
   "Mikkel": ("device_tracker.mikkels_ofx9p", "sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area"),
   "Claudia": ("device_tracker.claudias_iphone_2", "sensor.claudias_iphone_ble_area"),
+  "Kristine": ("device_tracker.kristines_iphone", "sensor.kristines_iphone_ble_area"),
 }
 DOOR = "binary_sensor.apartment_door_open"
 def series(eid):

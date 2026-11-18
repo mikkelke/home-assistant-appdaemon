@@ -1002,7 +1002,7 @@ class Setup(unittest.TestCase):
         app = make_app(devices=(dict(ANNA, address="7C:D9:F4:14:23:77"),))
         self.assertEqual((app._tracks[0].address, app._tracks[0].entity), ("7c:d9:f4:14:23:77", "sensor.anna_ble_room"))
 
-    def test_the_shipped_yaml_runs_the_class_with_the_three_devices_and_the_documented_values(self):
+    def test_the_shipped_yaml_runs_the_class_with_the_four_devices_and_the_documented_values(self):
         path = Path(bl.__file__).with_suffix(".yaml")
         text = path.read_text(encoding="utf-8")
         self.assertNotRegex(text, r"(?m)^\s*log:")
@@ -1010,10 +1010,11 @@ class Setup(unittest.TestCase):
         self.assertEqual((config["module"], config["class"]), ("ble_locator", "BleLocator"))
         self.assertEqual({d["name"]: d["address"] for d in config["devices"]}, {
             "mikkel": "d6462f88944242db9e31bdff598edc25_100_40004", "claudia": "89f35c9874aed44c554015fe6eaa3545",
-            "rober2_beacon": "7c:d9:f4:14:23:77"})
+            "kristine": "9dcbf915fd5fc9402c7e0d0001174ad6", "rober2_beacon": "7c:d9:f4:14:23:77"})
         self.assertEqual({d["name"]: d["bermuda_area"] for d in config["devices"]}, {
             "mikkel": "sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area",
-            "claudia": "sensor.claudias_iphone_ble_area", "rober2_beacon": "sensor.mp1_142377_area"})
+            "claudia": "sensor.claudias_iphone_ble_area", "kristine": "sensor.kristines_iphone_ble_area",
+            "rober2_beacon": "sensor.mp1_142377_area"})
         self.assertEqual({k: config[k] for k in ("interval_s", "fresh_s", "min_scanners", "offset_tau_s",
                                                  "max_model_age_days", "readings_interval_s")}, {
             "interval_s": 5, "fresh_s": 120, "min_scanners": 3, "offset_tau_s": 3600, "max_model_age_days": 14,
@@ -1021,7 +1022,7 @@ class Setup(unittest.TestCase):
         args = {k: v for k, v in config.items() if k not in ("module", "class")}
         app = make_app(args=args, devices=config["devices"])
         self.assertEqual([t.entity for t in app._tracks], ["sensor.mikkel_ble_room", "sensor.claudia_ble_room",
-                                                           "sensor.rober2_beacon_ble_room"])
+                                                           "sensor.kristine_ble_room", "sensor.rober2_beacon_ble_room"])
 
 
 class TrainerAgrees(unittest.TestCase):
