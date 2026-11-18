@@ -125,10 +125,9 @@ Intercom:
   # have taken, this is invisible to the visitor.
   voice_before_unlock:
     front door: "camera.abb_welcome_gateway_outdoor_station_2_1"
-  # EMPTY on purpose: intercom.py holds the door, the bridge says the sentence.
-  # The bridge speaks into the call HA dialled (the only one the station
-  # renders); intercom.py could only speak into the station's own ring call,
-  # which is provably silent. Two speakers would collide on the single call slot.
+  # EMPTY on purpose: intercom.py holds the door, the bridge says the sentence
+  # into the answered ring call. Two speakers would collide on the station's
+  # single call slot.
   voice_before_unlock_message: ""
   voice_before_unlock_tts: "tts.piper"
   # CEILING, not a delay - the door opens when the sentence actually ends.
@@ -138,13 +137,8 @@ Intercom:
   # This value is only reached when that never happens: the station's talkback
   # never became ready and every retry attempt failed. A rejected, silent or
   # hung announcement therefore still cannot leave the door shut.
-  # 12 s derivation (2026-09-03): the station's own ring call cannot carry
-  # audio, so a companion integration change now hangs it up ~3 s in and
-  # redials before the sentence can be heard at all. glare hold 3.0 + redial
-  # settle 2.5 + call establish 0.45 + one refused redial 2.0 + sentence 1.35
-  # + margin 2.7 = 12.0 s. Nominal time-to-open therefore rises from ~3.4 s to
-  # ~8 s - the price of a sentence that can actually be heard - still far
-  # under the 15-30 s a human answering the intercom would have taken.
+  # 12 s leaves room for talkback that is slow to become ready and several
+  # failed play attempts.
   # Replaced voice_before_unlock_wait_s (3.5 s), a fixed timer that happened to
   # land 0.8-1.7 s after the sentence - correct ordering by luck, not by rule.
   voice_before_unlock_ceiling_s: 12.0
