@@ -48,7 +48,7 @@ def make_app(states, *, block_rearm=False):
     """MikkelSleepMode with the production three-witness list (two mats + strip),
     which is also RoomActive's bedroom bed tier in the shipped yaml."""
     app = msm.MikkelSleepMode.__new__(msm.MikkelSleepMode)
-    app.battery_entity = "sensor.mikkels_ofx9p_battery_state"
+    app.charger_entity = "sensor.mikkels_ofx9p_charger_type"
     app.person_entity = "person.mikkel"
     app.in_bed_entities = [LEFT_MAT, RIGHT_MAT, STRIP]
     app.get_app = lambda name: (
@@ -56,8 +56,8 @@ def make_app(states, *, block_rearm=False):
         if name == "RoomActive" else None
     )
     app.sleep_mode_entity = SLEEP
-    app._on_battery_states = frozenset(["charging", "not_charging"])
-    app._off_battery_state = "discharging"
+    app._charger_on_states = frozenset(["ac", "usb", "wireless", "dock"])
+    app._charger_off_state = "none"
     app._dnd_on_command = "priority_only"
     app._dnd_off_command = "off"
     app._notify_service_path = "notify/mobile_app_test"
@@ -75,7 +75,7 @@ def make_app(states, *, block_rearm=False):
 
 def base_states(overrides=None):
     states = {
-        "sensor.mikkels_ofx9p_battery_state": "charging",
+        "sensor.mikkels_ofx9p_charger_type": "wireless",
         "person.mikkel": "home",
         LEFT_MAT: "off",
         RIGHT_MAT: "off",

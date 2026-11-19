@@ -1,11 +1,11 @@
-# Mikkel sleep mode: home + Withings in bed + phone charging or not_charging -> sleep on,
+# Mikkel sleep mode: home + Withings in bed + phone on a charger -> sleep on,
 # gated by the bedroom being in sleep configuration (bottom-up blind risen >= 95 =
 # covering the window, AND every bedroom light off), so lying in bed with a lamp on or
 # the blind parked open does not flip sleep + DND.
-# Phone discharging -> sleep off (also off if home / in-bed / battery combo no longer
+# Phone off the charger -> sleep off (also off if home / in-bed / charger combo no longer
 # matches) - immediately by day; while input_boolean.house_night_mode is on, out-of-bed
 # needs >= 12 min sustained (2026-08-07 04:14: a 30-min bathroom-plus trip cascaded into
-# the whole house leaving night mode) and discharging >= 5 min sustained.
+# the whole house leaving night mode); off the charger clears instantly.
 
 MikkelSleepMode:
   module: mikkel_sleep_mode
@@ -15,7 +15,9 @@ MikkelSleepMode:
   # _load_state/_save_state.
   state_file: /conf/apps/rutines/mikkel_sleep_mode_state.json
 
-  battery_entity: sensor.mikkels_ofx9p_battery_state
+  # Charger presence, not battery state: with the phone's charge limit it reports
+  # discharging while on the charger until it is back down at the limit.
+  charger_entity: sensor.mikkels_ofx9p_charger_type
   person_entity: person.mikkel
   # OR list - any "on" counts as in bed (whole bed is yours now). Only an exact "on"
   # arms; unavailable/unknown are inert, so an offline witness can never hold sleep
@@ -56,5 +58,5 @@ MikkelSleepMode:
   discharging_clear_minutes: 5
 
   # Optional overrides if HA uses different state strings:
-  # on_battery_states: [charging, not_charging]
-  # off_battery_state: discharging
+  # charger_on_states: [ac, usb, wireless, dock]
+  # charger_off_state: none

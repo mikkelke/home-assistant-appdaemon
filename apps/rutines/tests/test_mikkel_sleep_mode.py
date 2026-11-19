@@ -48,12 +48,12 @@ def make_app(states, *, block_rearm=False):
     """MikkelSleepMode with just the state _apply_sleep_mode/_on_relevant_change/
     _set_block_rearm_until_out_of_bed need, without running AppDaemon's initialize()."""
     app = msm.MikkelSleepMode.__new__(msm.MikkelSleepMode)
-    app.battery_entity = "sensor.mikkels_ofx9p_battery_state"
+    app.charger_entity = "sensor.mikkels_ofx9p_charger_type"
     app.person_entity = "person.mikkel"
     app.in_bed_entities = ["binary_sensor.left_bedside", "binary_sensor.right_bedside"]
     app.sleep_mode_entity = "input_boolean.mikkel_sleep_mode"
-    app._on_battery_states = frozenset(["charging", "not_charging"])
-    app._off_battery_state = "discharging"
+    app._charger_on_states = frozenset(["ac", "usb", "wireless", "dock"])
+    app._charger_off_state = "none"
     # Turning sleep mode on also pushes command_dnd, so an app that gets that far needs
     # these too (they go through the same call_service mock).
     app._dnd_on_command = "priority_only"
@@ -73,7 +73,7 @@ def make_app(states, *, block_rearm=False):
 
 
 ON_STATES = {
-    "sensor.mikkels_ofx9p_battery_state": "charging",
+    "sensor.mikkels_ofx9p_charger_type": "wireless",
     "person.mikkel": "home",
     "binary_sensor.left_bedside": "on",
     "binary_sensor.right_bedside": "off",
@@ -151,7 +151,7 @@ class BlockerReleasedWheneverTheBedReadsEmpty(unittest.TestCase):
         app = make_app(states, block_rearm=True)
 
         app._on_relevant_change(
-            "sensor.mikkels_ofx9p_battery_state", "state", "charging", "discharging", {}
+            "sensor.mikkels_ofx9p_charger_type", "state", "wireless", "none", {}
         )
 
         self.assertFalse(app._block_rearm_until_out_of_bed)
@@ -313,7 +313,7 @@ class RestartSurvival(unittest.TestCase):
     def _args(path):
         return {
             "state_file": path,
-            "battery_entity": "sensor.mikkels_ofx9p_battery_state",
+            "charger_entity": "sensor.mikkels_ofx9p_charger_type",
             "person_entity": "person.mikkel",
             "in_bed_entities": ["binary_sensor.left_bedside", "binary_sensor.right_bedside"],
             "sleep_mode_entity": "input_boolean.mikkel_sleep_mode",

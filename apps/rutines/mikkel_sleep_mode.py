@@ -1,9 +1,9 @@
 """
-Mikkel sleep mode - Withings in-bed + phone battery + home, gated by the bedroom
+Mikkel sleep mode - Withings in-bed + phone on a charger + home, gated by the bedroom
 actually being in sleep configuration.
 
 Sleep mode ON: person.mikkel is home, any configured bedside in-bed sensor is on,
-sensor.mikkels_ofx9p_battery_state is charging or not_charging, AND the bedroom is
+sensor.mikkels_ofx9p_charger_type names a charger (ac/usb/wireless/dock), AND the bedroom is
 ready for sleep: the blind covers the window AND every bedroom light is off.
 
 In-bed witnesses (2026-08-12): in_bed_entities is an OR list - the two Withings
@@ -34,12 +34,12 @@ Sleep mode OFF:
 - While input_boolean.house_night_mode is ON (see apps/presence/house_night_mode.py):
   three paths clear it, each explicit - out of bed sustained >= 12 min (bathroom
   trips are shorter: on 2026-08-07 he was out 04:14-04:44 and the instant clear
-  cascaded into the whole house leaving night mode), battery DISCHARGING (instant -
+  cascaded into the whole house leaving night mode), charger type none (instant -
   user 2026-08-13: "the anti pop is not needed"; a 03:00 cable pop clears, replugging
   re-arms automatically, and the old 5-min wait just lost a race against his own thumb
   every morning), or person.mikkel explicitly away. Sensor dropouts (cloud bedsides,
-  companion battery unknown/unavailable) hold state instead of clearing it.
-- Otherwise (daytime): today's immediate behaviour, unchanged - discharging or any
+  companion charger type unknown/unavailable) hold state instead of clearing it.
+- Otherwise (daytime): today's immediate behaviour, unchanged - off the charger or any
   ON condition not met clears at once.
 
 When sleep mode turns on/off, sends Companion command_dnd via notify.mobile_app_*
@@ -73,8 +73,8 @@ class MikkelSleepMode(hass.Hass):
     _out_of_bed_since = None
 
     def initialize(self) -> None:
-        self.battery_entity = self.args.get(
-            "battery_entity", "sensor.mikkels_ofx9p_battery_state"
+        self.charger_entity = self.args.get(
+            "charger_entity", "sensor.mikkels_ofx9p_charger_type"
         )
         self.person_entity = self.args.get("person_entity", "person.mikkel")
         raw_in_bed = self.args.get("in_bed_entities")
@@ -101,10 +101,10 @@ class MikkelSleepMode(hass.Hass):
         # Set to null in YAML to skip DND when leaving sleep mode
         self._dnd_off_command = self.args.get("dnd_off_command", "off")
 
-        self._on_battery_states = frozenset(
-            self.args.get("on_battery_states", ["charging", "not_charging"])
+        self._charger_on_states = frozenset(
+            self.args.get("charger_on_states", ["ac", "usb", "wireless", "dock"])
         )
-        self._off_battery_state = self.args.get("off_battery_state", "discharging")
+        self._charger_off_state = self.args.get("charger_off_state", "none")
 
         # Bedroom gate: ON requires the blind covering (bottom-up: position 100 =
         # covering) AND every bedroom light off. See module docstring.
@@ -140,14 +140,14 @@ class MikkelSleepMode(hass.Hass):
         self._release_rearm_hold_if_out_of_bed("restored at startup")
 
         for entity_id in (
-            self.battery_entity,
+            self.charger_entity,
             self.person_entity,
             *self.in_bed_entities,
         ):
             self.listen_state(self._on_relevant_change, entity_id)
         # The gate/debounce inputs must also trigger re-evaluation: the blind rising,
         # the last lamp going off or house night mode ending must not wait for a
-        # bed/battery event.
+        # bed/charger event.
         if self.blind_entity:
             self.listen_state(
                 self._on_relevant_change, self.blind_entity, attribute="current_position"
@@ -178,7 +178,7 @@ class MikkelSleepMode(hass.Hass):
         self.listen_state(_on_sleep_boolean_change, self.sleep_mode_entity)
 
         self.log(
-            f"MikkelSleepMode: watching {self.battery_entity}, "
+            f"MikkelSleepMode: watching {self.charger_entity}, "
             f"{self.person_entity}, {self.in_bed_entities}",
             level="INFO",
         )
@@ -231,15 +231,15 @@ class MikkelSleepMode(hass.Hass):
         self._save_state()
 
     def _compute_want_on_raw(self) -> bool:
-        battery = self.get_state(self.battery_entity)
+        charger = self.get_state(self.charger_entity)
         person = self.get_state(self.person_entity)
         in_bed = self._any_in_bed()
-        if battery == self._off_battery_state:
+        if charger == self._charger_off_state:
             return False
         return (
             person == "home"
             and in_bed
-            and battery in self._on_battery_states
+            and charger in self._charger_on_states
         )
 
     def _bedroom_ready(self) -> bool:
@@ -277,7 +277,7 @@ class MikkelSleepMode(hass.Hass):
         # the next callback instead of on the next restart.
         self._release_rearm_hold_if_out_of_bed("live re-check")
 
-        battery = self.get_state(self.battery_entity)
+        charger = self.get_state(self.charger_entity)
         person = self.get_state(self.person_entity)
         in_bed = self._any_in_bed()
 
@@ -296,7 +296,7 @@ class MikkelSleepMode(hass.Hass):
                     "input_boolean/turn_on", entity_id=self.sleep_mode_entity
                 )
                 self.log(
-                    f"Sleep mode ON (battery={battery!r}, person={person!r}, in_bed={in_bed})",
+                    f"Sleep mode ON (charger={charger!r}, person={person!r}, in_bed={in_bed})",
                     level="INFO",
                 )
                 self._send_dnd_command(self._dnd_on_command)
@@ -309,13 +309,13 @@ class MikkelSleepMode(hass.Hass):
 
         if not self._night_debounce_active():
             # Daytime: today's immediate behaviour, unchanged.
-            self._turn_off_sleep(battery, person, in_bed, "immediate (house not in night mode)")
+            self._turn_off_sleep(charger, person, in_bed, "immediate (house not in night mode)")
             return
 
         # House night mode: only three OFF paths, each explicit. Everything else
-        # (cloud bedside dropouts, companion battery unknown/unavailable) holds.
+        # (cloud bedside dropouts, companion charger type unknown/unavailable) holds.
         if person not in ("home", "unknown", "unavailable", None):
-            self._turn_off_sleep(battery, person, in_bed, f"left home ({person!r})")
+            self._turn_off_sleep(charger, person, in_bed, f"left home ({person!r})")
             return
 
         now = self._now_local()
@@ -325,8 +325,8 @@ class MikkelSleepMode(hass.Hass):
         # automatically (bed + charging + night gate), so the failure is self-healing and
         # symmetric. The debounce it replaces cost him a five-minute race against his own
         # thumb every morning (06:48:43 vs our 06:53:36 on 2026-08-13).
-        if battery == self._off_battery_state:
-            self._turn_off_sleep(battery, person, in_bed, "unplugged (instant, user 2026-08-13)")
+        if charger == self._charger_off_state:
+            self._turn_off_sleep(charger, person, in_bed, "unplugged (instant, user 2026-08-13)")
             return
 
         if not in_bed:
@@ -347,17 +347,17 @@ class MikkelSleepMode(hass.Hass):
             >= self.out_of_bed_clear_seconds
         ):
             self._turn_off_sleep(
-                battery, person, in_bed,
+                charger, person, in_bed,
                 f"out of bed sustained >={self.out_of_bed_clear_seconds // 60} min",
             )
         # else: hold ON through the blip.
 
-    def _turn_off_sleep(self, battery, person, in_bed, reason: str) -> None:
+    def _turn_off_sleep(self, charger, person, in_bed, reason: str) -> None:
         self._out_of_bed_since = None
         self._discharging_since = None
         self.call_service("input_boolean/turn_off", entity_id=self.sleep_mode_entity)
         self.log(
-            f"Sleep mode OFF - {reason} (battery={battery!r}, person={person!r}, "
+            f"Sleep mode OFF - {reason} (charger={charger!r}, person={person!r}, "
             f"in_bed={in_bed})",
             level="INFO",
         )

@@ -41,12 +41,12 @@ def make_app(states, *, now, blind_position=None, block_rearm=False):
     way the deployed yaml configures them, a controllable clock, and a get_state
     that understands the blind's attribute read."""
     app = msm.MikkelSleepMode.__new__(msm.MikkelSleepMode)
-    app.battery_entity = "sensor.mikkels_ofx9p_battery_state"
+    app.charger_entity = "sensor.mikkels_ofx9p_charger_type"
     app.person_entity = "person.mikkel"
     app.in_bed_entities = ["binary_sensor.left_bedside", "binary_sensor.right_bedside"]
     app.sleep_mode_entity = "input_boolean.mikkel_sleep_mode"
-    app._on_battery_states = frozenset(["charging", "not_charging"])
-    app._off_battery_state = "discharging"
+    app._charger_on_states = frozenset(["ac", "usb", "wireless", "dock"])
+    app._charger_off_state = "none"
     app._dnd_on_command = "priority_only"
     app._dnd_off_command = "off"
     app._notify_service_path = "notify/mobile_app_test"
@@ -90,7 +90,7 @@ def turn_offs(app):
 
 
 IN_BED_CHARGING = {
-    "sensor.mikkels_ofx9p_battery_state": "charging",
+    "sensor.mikkels_ofx9p_charger_type": "wireless",
     "person.mikkel": "home",
     "binary_sensor.left_bedside": "on",
     "binary_sensor.right_bedside": "off",
@@ -236,7 +236,7 @@ class NightModeOffDebounce(unittest.TestCase):
         thumb every morning (his 06:48:43 vs our 06:53:36 on 2026-08-13)."""
         t0 = datetime(2026, 8, 13, 3, 0)
         app, states = self._night_app(t0)
-        states["sensor.mikkels_ofx9p_battery_state"] = "discharging"
+        states["sensor.mikkels_ofx9p_charger_type"] = "none"
         app._apply_sleep_mode()
         self.assertEqual(len(turn_offs(app)), 1)
 
@@ -245,12 +245,12 @@ class NightModeOffDebounce(unittest.TestCase):
         inside the night window - sleep mode arms again on the next evaluation."""
         t0 = datetime(2026, 8, 13, 3, 0)
         app, states = self._night_app(t0)
-        states["sensor.mikkels_ofx9p_battery_state"] = "discharging"
+        states["sensor.mikkels_ofx9p_charger_type"] = "none"
         app._apply_sleep_mode()
         self.assertEqual(len(turn_offs(app)), 1)
 
         states["input_boolean.mikkel_sleep_mode"] = "off"
-        states["sensor.mikkels_ofx9p_battery_state"] = "charging"
+        states["sensor.mikkels_ofx9p_charger_type"] = "wireless"
         app._clock["now"] = t0 + timedelta(minutes=2)
         app._apply_sleep_mode()
         self.assertEqual(len(turn_ons(app)), 1)
@@ -260,7 +260,7 @@ class NightModeOffDebounce(unittest.TestCase):
         # not evidence he got up, and at night it must not clear anything.
         t0 = datetime(2026, 8, 7, 3, 0)
         app, states = self._night_app(t0)
-        states["sensor.mikkels_ofx9p_battery_state"] = "unavailable"
+        states["sensor.mikkels_ofx9p_charger_type"] = "unavailable"
 
         for minutes in (0, 10, 60):
             app._clock["now"] = t0 + timedelta(minutes=minutes)
