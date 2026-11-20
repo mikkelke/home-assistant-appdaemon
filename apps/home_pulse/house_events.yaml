@@ -17,3 +17,13 @@ HouseEvents:
   lock_attribution:
     lock.yale_bt: lock.yale
   lock_door: binary_sensor.apartment_door_open
+  # Who came in or went out: names the front-door row of that opening, or adds its own.
+  door_entry: sensor.door_entry
+  # One "Night mode on" row per night, and one "Went to bed" row per sleeper per night, seen by
+  # that sleeper only (admin_sleepers: admins only), left out when it fell with the night row.
+  night_entity: input_boolean.house_night_mode
+  sleepers:
+    input_boolean.mikkel_sleep_mode: Mikkel
+    input_boolean.kristine_sleep_mode: Kristine
+    input_boolean.claudia_sleep_mode: Claudia
+  admin_sleepers: [Mikkel]

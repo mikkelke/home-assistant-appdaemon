@@ -24,6 +24,10 @@ no further warm push until a reading falls below `rearm_c`. The last reading cou
 one, so a sensor that reports only on change still accumulates the spell. Start-up replays the
 temperature history the same way, and a spell whose entity already reads warm does not push again.
 
+Each long run and each warm spell that pushes also adds one row to the house timeline
+(`house_events_report`), once per episode however often the push is retried; a run or spell
+already alerting at start-up adds none.
+
 One yaml instance per fridge (fridge_watch.yaml). All timestamps are epoch seconds.
 """
 
@@ -87,6 +91,8 @@ class FridgeWatch(hass.Hass):
         self._warm_since = None
         self._warm_alerted = False
         self._warm_next_push_at = 0.0
+        self._run_reported = False
+        self._warm_reported = False
 
         now = self._now()
         self._recover(now)
@@ -147,6 +153,7 @@ class FridgeWatch(hass.Hass):
         self._run_started = None
         self._below_since = None
         self._alerted = False
+        self._run_reported = False
         self._next_push_at = 0.0
 
     def _elapsed_s(self, now):
@@ -164,6 +171,7 @@ class FridgeWatch(hass.Hass):
         if celsius < self.rearm_c and self._warm_alerted:
             self.log(f"FridgeWatch {self.health_entity}: back below {self.rearm_c} C ({celsius} C), warm alert re-armed", level="INFO")
             self._warm_alerted = False
+            self._warm_reported = False
             self._warm_next_push_at = 0.0
         if celsius >= self.warm_c:
             if self._warm_since is None:
@@ -188,6 +196,7 @@ class FridgeWatch(hass.Hass):
             self._observe(now, current)
         if self._run_started is not None:
             self._alerted = self.get_state(self.health_entity) == "long_run"
+            self._run_reported = self._alerted
 
     def _recover_temperature(self, now):
         start = now - self.warm_minutes * 60 - HISTORY_MARGIN_S
@@ -198,6 +207,7 @@ class FridgeWatch(hass.Hass):
             self._observe_temperature(now, current)
         if self.get_state(self.health_entity) == "warm" and self._temp is not None and self._temp >= self.rearm_c:
             self._warm_alerted = True
+            self._warm_reported = True
 
     def _history_points(self, entity, start, now):
         """Chronological [(epoch, value)] of the entity's recorder history; [] when unreadable."""
@@ -229,6 +239,9 @@ class FridgeWatch(hass.Hass):
         self._next_push_at = now + RETRY_S
         minutes = self._elapsed_s(now) / 60
         self.log(f"FridgeWatch {self.health_entity}: compressor running {minutes:.0f} min, pushing", level="WARNING")
+        if not self._run_reported:
+            self._run_reported = True
+            self._report(f"{self.display_name} compressor running non-stop for {_duration(minutes, 'h')}")
         self.create_task(self._push(minutes))
 
     def _evaluate_warm(self, now):
@@ -238,7 +251,16 @@ class FridgeWatch(hass.Hass):
         self._warm_next_push_at = now + RETRY_S
         minutes = self._warm_s(now) / 60
         self.log(f"FridgeWatch {self.health_entity}: {self._temp} C, at or above {self.warm_c} C for {minutes:.0f} min, pushing", level="WARNING")
+        if not self._warm_reported:
+            self._warm_reported = True
+            self._report(f"{self.display_name} warm: {self._temp:.1f} C for {_duration(minutes, 'h')}")
         self.create_task(self._push_warm(minutes, self._temp))
+
+    def _report(self, text):
+        try:
+            self.fire_event("house_events_report", text=text, icon="mdi:fridge-alert")
+        except Exception as e:
+            self.log(f"FridgeWatch {self.health_entity}: house_events report failed: {e}", level="WARNING")
 
     async def _push(self, minutes):
         if not await self._send(

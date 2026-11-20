@@ -452,6 +452,7 @@ class FireSafety(hass.Hass):
 
             if in_self_test and not prev_in_self_test:
                 self.last_self_test_at = now
+                self.create_task(self._report_feed("self_test"))
 
             if not in_pre_alarm:
                 # The siren has left pre_alarm at least once - lifts the stuck-pre_alarm
@@ -983,6 +984,9 @@ class FireSafety(hass.Hass):
 
     async def _maybe_expire_self_test(self, now):
         if self.self_test_until and now >= self.self_test_until:
+            triggered_at = self.self_test_until - timedelta(seconds=self.self_test_floor_s)
+            if self.last_self_test_at is None or self.last_self_test_at < triggered_at:
+                self.create_task(self._report_feed("self_test_missed"))
             self.self_test_until = None
             self._save_state()
 
@@ -1047,6 +1051,7 @@ class FireSafety(hass.Hass):
         if local.day > self.monthly_test_max_retry_days:
             self.monthly_test_resolved = True
             self._save_state()
+            self.create_task(self._report_feed("self_test_skipped"))
             self.create_task(self._push_health(
                 now, "Monthly smoke alarm test skipped — someone was home; run it from the dashboard"
             ))
@@ -1489,6 +1494,7 @@ class FireSafety(hass.Hass):
 
     async def _report_feed(self, phase, by=None):
         icon = PHASE_ICONS.get(phase, "mdi:smoke-detector-variant")
+        audience = None
         if phase == "pre_alarm":
             cause, effect = "Kitchen smoke alarm sensing early smoke", "Kitchen chime warning played"
         elif phase == "alarm":
@@ -1502,13 +1508,23 @@ class FireSafety(hass.Hass):
             cause, effect = "Kitchen alarm confirmed clear", "Lights and overrides released"
         elif phase == "offline":
             cause, effect = "Kitchen smoke alarm stopped reporting", f"Marked offline after {self.offline_after_min} minutes"
+        elif phase == "self_test":
+            cause, effect = "Kitchen smoke alarm self-test ran", "Siren sounded briefly"
+        elif phase == "self_test_missed":
+            cause, effect = "Kitchen smoke alarm self-test sent", "The alarm did not start it"
+            audience = "admin"
+        elif phase == "self_test_skipped":
+            cause = "Monthly smoke alarm test skipped"
+            effect = f"Someone was home on days 1-{self.monthly_test_max_retry_days}"
+            audience = "admin"
         else:
             return
         if self.dry_run:
             self.log(f"[dry-run] would report to feed: {cause} -> {effect}")
             return
         try:
-            await self.fire_event("house_events_report", cause=cause, effect=effect, icon=icon, by=by)
+            extra = {"audience": audience} if audience else {}
+            await self.fire_event("house_events_report", cause=cause, effect=effect, icon=icon, by=by, **extra)
         except Exception as e:
             self.log(f"house_events report failed: {e}", level="DEBUG")
 

@@ -436,5 +436,169 @@ class DoorOpenedFromInsideTests(unittest.TestCase):
         self.assertEqual(self.run_night(-7200), [])
 
 
+class EntryGroupsTests(unittest.TestCase):
+    def test_entered_left_and_unknown(self):
+        groups = house_events.entry_groups
+        self.assertEqual(groups({"entered": ["Claudia"], "left": []}), [("entered", "Claudia")])
+        self.assertEqual(groups({"entered": [], "left": ["Mikkel", "Kristine"]}), [("left", "Mikkel and Kristine")])
+        self.assertEqual(groups({"entered": ["Claudia"], "left": ["Mikkel"]}), [("entered", "Claudia"), ("left", "Mikkel")])
+        self.assertEqual(groups({"entered": [], "left": []}), [])
+        self.assertEqual(groups(None), [])
+        self.assertEqual(groups({"entered": "Claudia"}), [])
+
+
+def lock_row(text, at, **extra):
+    return {"ts": at.isoformat(), "icon": "mdi:lock-open-variant", "text": text, **extra}
+
+
+class ApplyEntryTests(unittest.TestCase):
+    OPENED = NOW - timedelta(seconds=30)
+
+    def apply(self, events, kind="entered", by="Claudia"):
+        return house_events.apply_entry(events, ["Front door"], kind, by, self.OPENED.timestamp())
+
+    def test_an_unlock_row_of_that_opening_takes_the_name_and_keeps_its_text(self):
+        events = [lock_row("Front door unlocked", self.OPENED - timedelta(seconds=5), by="One-Touch Lock"),
+                  row("Washer emptied", 4000)]
+        out, matched = self.apply(events)
+        self.assertTrue(matched)
+        self.assertEqual(out[0]["text"], "Front door unlocked")
+        self.assertEqual((out[0]["by"], out[0]["entry"]), ("Claudia", "entered"))
+        self.assertEqual(out[1], events[1])
+        self.assertNotIn("entry", events[0])
+
+    def test_going_out_names_the_thumb_turn_row(self):
+        events = [lock_row("Front door opened from inside", self.OPENED + timedelta(seconds=22))]
+        out, matched = self.apply(events, kind="left", by="Mikkel")
+        self.assertTrue(matched)
+        self.assertEqual(out[0]["by"], "Mikkel")
+
+    def test_a_guest_let_in_from_inside_is_not_named_on_the_openers_row(self):
+        events = [lock_row("Front door opened from inside", self.OPENED + timedelta(seconds=20))]
+        out, matched = self.apply(events, kind="entered")
+        self.assertFalse(matched)
+        self.assertEqual(out, events)
+
+    def test_rows_outside_the_window_or_already_named_are_left(self):
+        for events in (
+            [lock_row("Front door unlocked", self.OPENED - timedelta(seconds=91))],
+            [lock_row("Front door unlocked", self.OPENED + timedelta(seconds=61))],
+            [lock_row("Front door unlocked", self.OPENED, by="Kristine", entry="entered")],
+            [row("Washer emptied", 30)],
+        ):
+            with self.subTest(events=events):
+                self.assertFalse(self.apply(events)[1])
+
+
+class DoorEntryListenerTests(unittest.TestCase):
+    OPENED = NOW - timedelta(seconds=30)
+
+    def make_feed(self, events, attrs):
+        feed = house_events.HouseEvents()
+        feed.locks = {"lock.yale_bt": "Front door"}
+        feed.events = list(events)
+        feed.get_state = lambda entity, attribute=None: {"attributes": attrs}
+        feed.get_now = lambda: NOW
+        feed._publish = lambda: None
+        feed._write_state_file = lambda: None
+        feed.log = lambda *a, **kw: None
+        return feed
+
+    def attrs(self, entered=(), left=(), decided=NOW):
+        return {"entered": list(entered), "left": list(left), "door_opened_at": self.OPENED.isoformat(),
+                "decided_at": decided.isoformat()}
+
+    def test_a_named_lock_row_stays_one_row(self):
+        feed = self.make_feed([lock_row("Front door unlocked", self.OPENED - timedelta(seconds=3))],
+                              self.attrs(entered=["Claudia"]))
+        feed._on_door_entry("sensor.door_entry", "decided_at", None, "x", {})
+        self.assertEqual(len(feed.events), 1)
+        self.assertEqual(feed.events[0]["by"], "Claudia")
+
+    def test_an_opening_with_no_lock_row_gets_its_own(self):
+        feed = self.make_feed([], self.attrs(entered=["Mikkel"]))
+        feed._on_door_entry("sensor.door_entry", "decided_at", None, "x", {})
+        self.assertEqual([(e["text"], e["by"], e["entry"], e["icon"]) for e in feed.events],
+                         [("Came home", "Mikkel", "entered", "mdi:door-open")])
+
+    def test_two_people_coming_home_minutes_apart_are_two_rows(self):
+        feed = self.make_feed([], self.attrs(entered=["Mikkel"]))
+        feed._on_door_entry("sensor.door_entry", "decided_at", None, "x", {})
+        feed.get_state = lambda entity, attribute=None: {"attributes": self.attrs(entered=["Kristine"])}
+        feed._on_door_entry("sensor.door_entry", "decided_at", None, "y", {})
+        self.assertEqual([e["by"] for e in feed.events], ["Kristine", "Mikkel"])
+
+    def test_an_unknown_or_stale_judgement_adds_nothing(self):
+        for attrs in (self.attrs(), self.attrs(entered=["Mikkel"], decided=NOW - timedelta(seconds=121))):
+            with self.subTest(attrs=attrs):
+                feed = self.make_feed([], attrs)
+                feed._on_door_entry("sensor.door_entry", "decided_at", None, "x", {})
+                self.assertEqual(feed.events, [])
+
+
+class NightTests(unittest.TestCase):
+    def test_noon_is_the_boundary(self):
+        tz = house_events.HOUSE_TZ
+        self.assertEqual(house_events.night_key(datetime(2026, 11, 16, 1, 30, tzinfo=tz)), "2026-11-15")
+        self.assertEqual(house_events.night_key(datetime(2026, 11, 15, 22, 0, tzinfo=tz)), "2026-11-15")
+        self.assertEqual(house_events.night_key(datetime(2026, 11, 16, 12, 0, tzinfo=tz)), "2026-11-16")
+
+    def make_feed(self, clock, states=None):
+        feed = house_events.HouseEvents()
+        feed.events = []
+        feed.clock = clock
+        feed.get_now = lambda: feed.clock
+        feed.sleepers = {"input_boolean.mikkel_sleep_mode": "Mikkel", "input_boolean.claudia_sleep_mode": "Claudia"}
+        feed.admin_sleepers = {"Mikkel"}
+        feed.get_state = lambda entity, attribute=None: (states or {}).get(entity, "on")
+        feed.scheduled = []
+        feed.run_in = lambda cb, delay, **kw: feed.scheduled.append((cb, delay, kw))
+        feed._publish = lambda: None
+        feed._write_state_file = lambda: None
+        feed.log = lambda *a, **kw: None
+        return feed
+
+    def sleep(self, feed, entity, at):
+        feed.clock = at
+        feed._on_sleep(entity, "state", "off", "on", {})
+        cb, delay, kw = feed.scheduled.pop()
+        feed.clock = at + timedelta(seconds=delay)
+        cb(kw)
+
+    def test_one_night_row_per_night(self):
+        tz = house_events.HOUSE_TZ
+        feed = self.make_feed(datetime(2026, 11, 15, 22, 21, tzinfo=tz))
+        feed._on_night("input_boolean.house_night_mode", "state", "off", "on", {})
+        feed.clock = datetime(2026, 11, 16, 3, 0, tzinfo=tz)
+        feed._on_night("input_boolean.house_night_mode", "state", "off", "on", {})
+        self.assertEqual([e["text"] for e in feed.events], ["Night mode on"])
+        feed.clock = datetime(2026, 11, 16, 22, 32, tzinfo=tz)
+        feed._on_night("input_boolean.house_night_mode", "state", "off", "on", {})
+        self.assertEqual(len(feed.events), 2)
+
+    def test_the_first_sleeper_is_the_night_row_and_a_later_one_gets_their_own(self):
+        tz = house_events.HOUSE_TZ
+        feed = self.make_feed(datetime(2026, 11, 15, 22, 21, tzinfo=tz))
+        feed._on_night("input_boolean.house_night_mode", "state", "off", "on", {})
+        self.sleep(feed, "input_boolean.mikkel_sleep_mode", datetime(2026, 11, 15, 22, 21, 1, tzinfo=tz))
+        self.sleep(feed, "input_boolean.claudia_sleep_mode", datetime(2026, 11, 15, 23, 19, tzinfo=tz))
+        rows = [(e["text"], e.get("by"), e.get("audience"), e.get("audience_users")) for e in feed.events]
+        self.assertEqual(rows, [("Went to bed", "Claudia", None, ["Claudia"]), ("Night mode on", None, None, None)])
+
+    def test_back_to_bed_the_same_night_is_not_a_second_row_and_mikkel_is_admin_only(self):
+        tz = house_events.HOUSE_TZ
+        feed = self.make_feed(datetime(2026, 11, 18, 23, 31, tzinfo=tz))
+        self.sleep(feed, "input_boolean.mikkel_sleep_mode", datetime(2026, 11, 18, 23, 31, tzinfo=tz))
+        self.sleep(feed, "input_boolean.mikkel_sleep_mode", datetime(2026, 11, 19, 6, 59, tzinfo=tz))
+        self.assertEqual([(e["by"], e.get("audience")) for e in feed.events], [("Mikkel", "admin")])
+
+    def test_a_sleep_mode_off_again_before_the_row_is_written_adds_nothing(self):
+        tz = house_events.HOUSE_TZ
+        feed = self.make_feed(datetime(2026, 11, 18, 23, 31, tzinfo=tz),
+                              states={"input_boolean.claudia_sleep_mode": "off"})
+        self.sleep(feed, "input_boolean.claudia_sleep_mode", datetime(2026, 11, 18, 23, 31, tzinfo=tz))
+        self.assertEqual(feed.events, [])
+
+
 if __name__ == "__main__":
     unittest.main()

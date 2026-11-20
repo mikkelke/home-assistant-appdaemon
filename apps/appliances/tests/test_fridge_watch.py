@@ -85,6 +85,7 @@ def make_app(args=None, states=None, history=None, now=T0, delivered=1):
     app.notifier.notify = AsyncMock(return_value=delivered)
     app.get_app = MagicMock(return_value=app.notifier)
     app.create_task = lambda coro: asyncio.run(coro)
+    app.fire_event = MagicMock()
     app.initialize()
     return app
 
@@ -659,6 +660,46 @@ class AsciiLogs(unittest.TestCase):
         self.assertGreater(len(app.logs), 3)
         for _, message in app.logs:
             self.assertTrue(message.isascii(), message)
+
+
+def reports(app):
+    return [c.kwargs for c in app.fire_event.call_args_list if c.args == ("house_events_report",)]
+
+
+class TimelineRows(unittest.TestCase):
+    def test_a_long_run_is_one_row_however_often_the_push_is_retried(self):
+        app = make_app(delivered=0)
+        run_for(app, T0, 180)
+        app.notifier.notify.return_value = 1
+        for m in range(181, 200):
+            tick(app, T0 + m * MIN)
+        self.assertEqual(app.notifier.notify.await_count, 2)
+        self.assertEqual(reports(app), [{"text": "Fridge compressor running non-stop for 3 h", "icon": "mdi:fridge-alert"}])
+
+    def test_the_next_long_run_is_a_new_row(self):
+        app = make_app()
+        run_for(app, T0, 180)
+        feed(app, T0 + 181 * MIN, 2)
+        tick(app, T0 + 184 * MIN)
+        run_for(app, T0 + 200 * MIN, 180)
+        self.assertEqual(len(reports(app)), 2)
+
+    def test_a_warm_spell_is_one_row_until_it_falls_below_seven(self):
+        app = make_app(args=TEMP_ARGS, delivered=0)
+        temp(app, T0, 9.0)
+        tick(app, T0 + 60 * MIN)
+        app.notifier.notify.return_value = 1
+        tick(app, T0 + 70 * MIN)
+        self.assertEqual(reports(app), [{"text": "Fridge warm: 9.0 C for 1 h", "icon": "mdi:fridge-alert"}])
+        temp(app, T0 + 80 * MIN, 6.9)
+        temp(app, T0 + 90 * MIN, 8.5)
+        tick(app, T0 + 150 * MIN)
+        self.assertEqual(len(reports(app)), 2)
+
+    def test_a_spell_already_alerting_at_start_up_adds_no_row(self):
+        app = make_app(args=TEMP_ARGS, states={TEMP: "9.0", HEALTH: "warm"}, history=[row(T0 - 200 * MIN, 9.0)])
+        tick(app, T0 + MIN)
+        self.assertEqual(reports(app), [])
 
 
 if __name__ == "__main__":

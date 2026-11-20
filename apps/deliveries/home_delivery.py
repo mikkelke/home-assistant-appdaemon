@@ -53,6 +53,12 @@ attributes:
   reason          why the state is what it is
 
 The state is published as a string.
+
+The house timeline (`house_events_report`, admin only like the deliveries themselves) gets one row
+when a delivery ends, per carrier and refresh ("Wolt order from Vita delivered", "2 Airmee parcels
+delivered"), and one when a parcel is probably outside the door; a parcel of that carrier delivered
+within OUTSIDE_COVERS_S after it adds none. What the first refresh after start-up finds ended is not
+news.
 """
 
 import json
@@ -100,6 +106,12 @@ PLAUSIBLE_HOURS = range(8, 18)
 SPEAKERS_APP = "SonosNotifier"
 PHONE_APP = "MobileNotifier"
 PARCEL_PUSH_TITLE = "Parcel delivery"
+FEED_EVENT = "house_events_report"
+ENDED = ("delivered", "cancelled")
+DELIVERED_ICONS = {"food": "mdi:moped", "groceries": "mdi:cart", "parcel": "mdi:package-variant-closed-check"}
+CANCELLED_ICON = "mdi:close-circle-outline"
+OUTSIDE_ICON = "mdi:package-variant-closed"
+OUTSIDE_COVERS_S = 7200
 
 WOLT_DELIVERY = "sensor.wolt_delivery_"
 WOLT_ORDER = re.compile(r"sensor\.wolt_order_(.+?)_(estimated_arrival|item_count)(_\d+)?")
@@ -787,6 +799,40 @@ def parcel_outside_sentence(carrier):
     return f"Your {carrier} parcel is probably outside the door."
 
 
+def ended_text(kind, stage, deliveries):
+    """The timeline sentence for deliveries of one kind and source that reached `stage` together."""
+    first = deliveries[0]
+    if kind == "food":
+        return f"Wolt order from {first.title} {stage}"
+    if kind == "groceries":
+        return "Nemlig groceries delivered" if stage == "delivered" else "Nemlig order cancelled"
+    carrier = first.carrier or first.source
+    titles = {delivery.title for delivery in deliveries}
+    sender = f" from {first.title}" if len(titles) == 1 and first.title != carrier else ""
+    if len(deliveries) == 1:
+        return f"{carrier} parcel{sender} {stage}"
+    return f"{len(deliveries)} {carrier} parcels{sender} {stage}"
+
+
+def ended_rows(before, deliveries, told_at, now):
+    """[(icon, text)] for the timeline: the deliveries that reached delivered or cancelled since the
+    stages `before` ({id: stage} of the last refresh; None on the first, which reports nothing), one row
+    per kind, source and stage. A parcel delivered within OUTSIDE_COVERS_S of its carrier being told
+    "probably outside the door" (`told_at`, by source) already has its row."""
+    if before is None:
+        return []
+    groups = {}
+    for delivery in deliveries:
+        if delivery.stage not in ENDED or before.get(delivery.id) == delivery.stage:
+            continue
+        told = told_at.get(delivery.source)
+        if delivery.kind == "parcel" and told is not None and 0 <= now - told < OUTSIDE_COVERS_S:
+            continue
+        groups.setdefault((delivery.kind, delivery.source, delivery.stage), []).append(delivery)
+    return [(DELIVERED_ICONS.get(kind, OUTSIDE_ICON) if stage == "delivered" else CANCELLED_ICON,
+             ended_text(kind, stage, group)) for (kind, _, stage), group in groups.items()]
+
+
 def notice_channel(owner_state, speakers_free):
     """How the owner is told: "speakers" while he is home and the speakers may speak, else "push"."""
     return "speakers" if owner_state == "home" and speakers_free else "push"
@@ -802,6 +848,7 @@ class HomeDelivery(hass.Hass):
         self._wolt_ok = True
         self._incoming = []
         self._stages = {}
+        self._refreshed = False
         self._deliveries = []
         self._buttons = dict(args.get("refresh_buttons") or {})
         self._refreshed_rings = set()
@@ -896,10 +943,17 @@ class HomeDelivery(hass.Hass):
                 carriers.append(watch.carrier)
         if carriers:
             names = carrier_list(carriers)
+            self._report(OUTSIDE_ICON, f"{names} parcel probably outside the door")
             try:
                 self._tell_owner(names)
             except Exception as error:
                 self.log(f"Telling the owner about the {names} parcel failed: {error}", level="WARNING")
+
+    def _report(self, icon, text):
+        try:
+            self.fire_event(FEED_EVENT, text=text, icon=icon, audience="admin")
+        except Exception as error:
+            self.log(f"house_events report failed: {error}", level="WARNING")
 
     def _tell_owner(self, carrier):
         speakers = self.get_app(SPEAKERS_APP)
@@ -927,7 +981,10 @@ class HomeDelivery(hass.Hass):
         for id_, stage in stages.items():
             if self._stages.get(id_) != stage:
                 self.log(f"{id_}: {self._stages.get(id_, 'new')} -> {stage}")
+        for icon, text in ended_rows(self._stages if self._refreshed else None, deliveries, self._told_at, now):
+            self._report(icon, text)
         self._stages = stages
+        self._refreshed = True
         published = snapshot(deliveries, now, self._incoming)
         self.set_state(self._entity, state=str(published["state"]), attributes=published["attributes"], replace=True)
 

@@ -2640,5 +2640,52 @@ class PersistenceRoundTrip(unittest.TestCase):
         self.assertFalse(os.path.exists(path + ".tmp"))
 
 
+def _feed_reports(app):
+    return [c.kwargs for c in app.fire_event.call_args_list if c.args == ("house_events_report",)]
+
+
+class SelfTestTimelineRows(_FrozenTimeTestCase):
+    """One timeline row per self-test: ran (everyone sees it, the siren sounded), and for the
+    admin a test that was sent but never started, or a month skipped because someone was home."""
+
+    async def test_the_siren_entering_self_test_is_one_public_row(self):
+        app = _make_app(phase="clear", last_siren="clear")
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "self_test"
+        await _tick(app)
+        await _tick(app)
+        rows = _feed_reports(app)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["cause"], rows[0]["effect"]), ("Kitchen smoke alarm self-test ran", "Siren sounded briefly"))
+        self.assertNotIn("audience", rows[0])
+
+    async def test_a_test_that_never_started_is_an_admin_row_when_its_floor_ends(self):
+        app = _make_app(phase="clear", last_siren="clear", self_test_until=FIXED_NOW - timedelta(seconds=1))
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
+        await _tick(app)
+        rows = _feed_reports(app)
+        self.assertEqual([(r["cause"], r["audience"]) for r in rows],
+                         [("Kitchen smoke alarm self-test sent", "admin")])
+        self.assertIsNone(app.self_test_until)
+
+    async def test_a_test_that_started_adds_no_missed_row(self):
+        app = _make_app(phase="clear", last_siren="clear", self_test_until=FIXED_NOW - timedelta(seconds=1),
+                        last_self_test_at=FIXED_NOW - timedelta(seconds=50))
+        app.states[app.smoke_entity] = "off"
+        app.states[app.siren_state_entity] = "clear"
+        await _tick(app)
+        self.assertEqual(_feed_reports(app), [])
+
+    async def test_a_skipped_month_is_an_admin_row(self):
+        app = _make_app()
+        app.states["person.mikkel"] = "home"
+        await app._maybe_run_monthly_test(datetime(2026, 9, 8, 11, 0, tzinfo=timezone.utc))
+        await asyncio.gather(*app._test_tasks)
+        rows = _feed_reports(app)
+        self.assertEqual([(r["cause"], r["effect"], r["audience"]) for r in rows],
+                         [("Monthly smoke alarm test skipped", "Someone was home on days 1-7", "admin")])
+
+
 if __name__ == "__main__":
     unittest.main()

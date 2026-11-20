@@ -1331,6 +1331,8 @@ class Harness:
         self.app.create_task = asyncio.run
         self.app.run_in = lambda callback, delay, **kw: self.timers.append((self.now + delay, callback, kw))
         self.app.call_service = lambda service, **data: self.calls.append((service, data))
+        self.feed = []
+        self.app.fire_event = lambda event, **data: self.feed.append((event, data))
         self.app.initialize()
 
     def listen_state(self, callback, entity, **kw):
@@ -2645,6 +2647,66 @@ class LandingWatchAppTests(unittest.TestCase):
         h.advance(40)
         h.change(shipped["landing_entity"], "off")
         self.assertEqual(self.told(h), ([{"message": AIRMEE_SENTENCE}], []))
+
+    def rows(self, h):
+        return [(data["text"], data["audience"]) for event, data in h.feed if event == "house_events_report"]
+
+    def test_a_parcel_delivered_without_a_landing_visit_is_one_admin_row(self):
+        h = self.make()
+        h.advance(600)
+        self.deliver(h, AIRMEE_PARCEL)
+        h.advance(30)
+        h.app._on_change(AGGREGATOR_INCOMING, "all", {}, {}, {})
+        self.assertEqual(self.rows(h), [("Airmee parcel from Test Shop delivered", "admin")])
+
+    def test_probably_outside_the_door_is_the_row_and_the_later_delivered_adds_none(self):
+        h = self.make()
+        self.visit(h)
+        self.told(h)
+        h.advance(900)
+        self.deliver(h, AIRMEE_PARCEL)
+        self.assertEqual(self.rows(h), [("Airmee parcel probably outside the door", "admin")])
+
+    def test_a_parcel_already_delivered_at_start_up_is_not_news(self):
+        h = Harness({AGGREGATOR_DELIVERED: aggregator(parcel(carrier="Airmee", barcode="TESTAM0001",
+                                                             status="delivered", delivered_at=NOW - 60))})
+        h.app._on_change(AGGREGATOR_INCOMING, "all", {}, {}, {})
+        self.assertEqual(self.rows(h), [])
+
+
+class EndedRowsTests(unittest.TestCase):
+    def parcel_delivery(self, barcode, stage="delivered", source="airmee", carrier="Airmee", title="Amazon"):
+        return delivery(id=f"{source}:{barcode}", source=source, kind="parcel", title=title, stage=stage,
+                        carrier=carrier)
+
+    def test_the_first_refresh_reports_nothing(self):
+        self.assertEqual(hd.ended_rows(None, [delivery(stage="delivered")], {}, NOW), [])
+
+    def test_one_row_per_delivery_that_ended_since_the_last_refresh(self):
+        rows = hd.ended_rows({"wolt:x": "arriving"}, [delivery(stage="delivered")], {}, NOW)
+        self.assertEqual(rows, [("mdi:moped", f"Wolt order from {KITCHEN} delivered")])
+        self.assertEqual(hd.ended_rows({"wolt:x": "delivered"}, [delivery(stage="delivered")], {}, NOW), [])
+        self.assertEqual(hd.ended_rows({"wolt:x": "preparing"}, [delivery(stage="cancelled")], {}, NOW),
+                         [("mdi:close-circle-outline", f"Wolt order from {KITCHEN} cancelled")])
+
+    def test_parcels_of_one_carrier_delivered_together_are_one_row(self):
+        parcels = [self.parcel_delivery("A1"), self.parcel_delivery("A2")]
+        self.assertEqual(hd.ended_rows({}, parcels, {}, NOW),
+                         [("mdi:package-variant-closed-check", "2 Airmee parcels from Amazon delivered")])
+        gls = self.parcel_delivery("G1", source="gls", carrier="GLS", title="ComputerSalg A/S")
+        self.assertEqual(hd.ended_rows({}, [gls], {}, NOW),
+                         [("mdi:package-variant-closed-check", "GLS parcel from ComputerSalg A/S delivered")])
+        bare = self.parcel_delivery("P1", source="postnord", carrier="PostNord", title="PostNord")
+        self.assertEqual(hd.ended_rows({}, [bare], {}, NOW)[0][1], "PostNord parcel delivered")
+
+    def test_a_parcel_already_told_outside_the_door_has_its_row(self):
+        parcels = [self.parcel_delivery("A1")]
+        self.assertEqual(hd.ended_rows({}, parcels, {"airmee": NOW - 600}, NOW), [])
+        self.assertEqual(len(hd.ended_rows({}, parcels, {"airmee": NOW - hd.OUTSIDE_COVERS_S}, NOW)), 1)
+
+    def test_nemlig(self):
+        groceries = delivery(id="nemlig:1", source="nemlig", kind="groceries", title="Nemlig", stage="delivered")
+        self.assertEqual(hd.ended_rows({}, [groceries], {}, NOW), [("mdi:cart", "Nemlig groceries delivered")])
 
 
 if __name__ == "__main__":

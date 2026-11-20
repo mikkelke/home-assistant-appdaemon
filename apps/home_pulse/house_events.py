@@ -18,6 +18,14 @@ things you can see/hear yourself has no value):
    `changed_by` if that attribute is fresh by then - see `lock_event` and the
    `locks`/`lock_attribution`/`lock_door` app config.
 
+4. Who came in or went out (v6), from sensor.door_entry: the front-door lock row of that
+   opening takes the resident in `by`, so an opening stays one row; an opening with no such
+   row (a BLE auto-unlock, a door left on the latch, a guest let in) gets its own "Came home"
+   / "Went out" row. See `entry_groups` and `apply_entry`.
+5. The night (v6): one "Night mode on" row per night from the household night boolean, and
+   one "Went to bed" row per resident per night, seen only by that resident (and admins),
+   left out when it fell with the household row. See `night_key`.
+
 Feed shape (attributes, replace=True on every publish):
     events: newest-first list of {"ts": <UTC ISO>, "icon": <mdi:...>, "text": <ascii>,
                                   "cause": <ascii, optional>, "effect": <ascii, optional>,
@@ -58,13 +66,15 @@ than guessing (see manual_override_timeout).
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
+HOUSE_TZ = ZoneInfo("Europe/Copenhagen")
 MAX_EVENTS = 40
-# One source emitting the exact same text again within this window is flapping
+# One source emitting the exact same text by the same person again within this window is flapping
 # (e.g. washer Unemptied->Emptied->Off lands in the same second), not news.
 DUP_SUPPRESS_S = 300
 # An emptied row still takes the emptier's name this long after it was written (see enrich_by).
@@ -74,6 +84,24 @@ EMPTIED_ENRICH_S = 900
 MAX_TEXT_LEN = 120
 # The door contact can report the door opening before the BLE lock reports the thumb-turn.
 DOOR_BEFORE_LOCK_S = 10
+
+# A front-door lock row belongs to the door opening it lies within this many seconds of: it is
+# written lock_report_delay_s after the lock moved, which comes before the door opens when
+# someone unlocks to come in and just before or after it when someone turns the thumb-turn.
+ENTRY_MATCH_BEFORE_S = 90
+ENTRY_MATCH_AFTER_S = 60
+# sensor.door_entry decides 30 s after the door opened; an older decision is a replay.
+ENTRY_FRESH_S = 120
+ENTRY_TEXTS = {"entered": "Came home", "left": "Went out"}
+ENTRY_ICON = "mdi:door-open"
+NIGHT_TEXT = "Night mode on"
+NIGHT_ICON = "mdi:weather-night"
+BED_TEXT = "Went to bed"
+BED_ICON = "mdi:bed"
+# A sleeper's row is written this long after their sleep mode went on, and left out when the
+# household night row is within BED_WITH_NIGHT_S of that moment: the first sleeper starts the night.
+BED_REPORT_DELAY_S = 60
+BED_WITH_NIGHT_S = 120
 
 APPLIANCE_ICONS = {
     "washer": "mdi:washing-machine",
@@ -218,6 +246,95 @@ def lock_event(name, old, new, changed_by, door_opened=False):
     return "mdi:lock-open-variant", f"{name} unlocked", _first_name_if_resident(who)
 
 
+def _names_text(names):
+    """["Claudia"] -> "Claudia"; ["Claudia", "Kristine"] -> "Claudia and Kristine"."""
+    names = [n for n in names if n]
+    return ", ".join(names[:-1]) + (" and " if len(names) > 1 else "") + (names[-1] if names else "")
+
+
+def entry_groups(attrs):
+    """[(kind, by)] for a sensor.door_entry judgement: ("entered", "Claudia") when anyone came
+    in, ("left", "Mikkel and Kristine") when anyone went out, both when both happened; [] for
+    an opening no resident's phone explains (state unknown)."""
+    if not isinstance(attrs, dict):
+        return []
+    out = []
+    for kind in ("entered", "left"):
+        names = attrs.get(kind)
+        if isinstance(names, (list, tuple)):
+            names = [n.strip()[:40] for n in names if isinstance(n, str) and n.strip()]
+            if names:
+                out.append((kind, _names_text(names)))
+    return out
+
+
+def _ts(event):
+    try:
+        return datetime.fromisoformat(event["ts"]).timestamp()
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+# The lock row an entry kind can name: someone who came in unlocked the door, someone who went out
+# turned the thumb-turn. A guest let in from inside is not named on the row of whoever opened.
+ENTRY_LOCK_TEXTS = {"entered": "{} unlocked", "left": "{} opened from inside"}
+
+
+def apply_entry(events, lock_names, kind, by, opened_at):
+    """(events, matched): a copy of the newest-first feed in which the front-door lock row of the
+    door opening at `opened_at` (epoch) carries `by` and entry=kind, and whether one was found.
+
+    The row must read as that kind (ENTRY_LOCK_TEXTS), lie within ENTRY_MATCH_BEFORE_S before to
+    ENTRY_MATCH_AFTER_S after the opening and carry no entry yet. Its text stays as written: the
+    dashboard knows a row by its time and text, so a changed text would show it twice in history.
+    The lock's own attribution ("One-Touch Lock", a keypad name) gives way to the phones: they say
+    who walked through, the lock only who turned it."""
+    texts = {ENTRY_LOCK_TEXTS[kind].format(name) for name in lock_names}
+    out = list(events)
+    for i, event in enumerate(out):
+        ts = _ts(event)
+        if ts is None:
+            continue
+        if ts < opened_at - ENTRY_MATCH_BEFORE_S:
+            break
+        if ts > opened_at + ENTRY_MATCH_AFTER_S or event.get("entry") or event.get("text") not in texts:
+            continue
+        out[i] = dict(event, by=by, entry=kind)
+        return out, True
+    return out, False
+
+
+def night_key(at):
+    """The night an aware datetime belongs to, as the house date it started on: 01:30 on the
+    16th is the night of the 15th. Noon is the boundary."""
+    return (at.astimezone(HOUSE_TZ) - timedelta(hours=12)).date().isoformat()
+
+
+def written_tonight(events, text, by, at):
+    """True when the feed already has a `text` row by `by` (None = no name) in the night of `at`."""
+    key = night_key(at)
+    for event in events:
+        if event.get("text") != text or event.get("by") != by:
+            continue
+        try:
+            if night_key(datetime.fromisoformat(event["ts"])) == key:
+                return True
+        except (ValueError, TypeError, KeyError):
+            continue
+    return False
+
+
+def night_row_near(events, at):
+    """True when a NIGHT_TEXT row lies within BED_WITH_NIGHT_S of `at` (epoch)."""
+    for event in events:
+        if event.get("text") != NIGHT_TEXT:
+            continue
+        ts = _ts(event)
+        if ts is not None and abs(ts - at) <= BED_WITH_NIGHT_S:
+            return True
+    return False
+
+
 def _clean_str(value):
     return value.strip()[:MAX_TEXT_LEN] if isinstance(value, str) and value.strip() else None
 
@@ -317,6 +434,19 @@ class HouseEvents(hass.Hass):
         if self.lock_door:
             self.listen_state(self._on_door_open, self.lock_door, new="on")
 
+        # Who came in or went out (sensor.door_entry), and the night.
+        self.door_entry = self.args.get("door_entry")
+        if self.door_entry:
+            self.listen_state(self._on_door_entry, self.door_entry, attribute="decided_at")
+        self.night_entity = self.args.get("night_entity")
+        if self.night_entity:
+            self.listen_state(self._on_night, self.night_entity, old="off", new="on")
+        # entity -> resident display name; an admin sleeper's row is for admins only.
+        self.sleepers = self.args.get("sleepers", {})
+        self.admin_sleepers = set(self.args.get("admin_sleepers", []))
+        for entity in self.sleepers:
+            self.listen_state(self._on_sleep, entity, old="off", new="on")
+
         # Automation apps explain themselves through this event - see module docstring.
         self.listen_event(self._on_report, "house_events_report")
 
@@ -401,6 +531,45 @@ class HouseEvents(hass.Hass):
             self.log(f"Lock attribution lookup failed for {attribution_entity}: {e}", level="DEBUG")
         return None
 
+    def _on_door_entry(self, entity, attribute, old, new, kwargs):
+        attrs = (self.get_state(entity, attribute="all") or {}).get("attributes") or {}
+        try:
+            opened_at = datetime.fromisoformat(attrs["door_opened_at"]).timestamp()
+            decided_at = datetime.fromisoformat(attrs["decided_at"]).timestamp()
+        except (ValueError, TypeError, KeyError):
+            return
+        if not 0 <= self.get_now().timestamp() - decided_at <= ENTRY_FRESH_S:
+            return
+        for kind, by in entry_groups(attrs):
+            events, matched = apply_entry(self.events, list(self.locks.values()), kind, by, opened_at)
+            if matched:
+                self.events = events
+                self._publish()
+                self._write_state_file()
+                self.log(f"Event: front door row named {by} ({kind})")
+            else:
+                self._add(ENTRY_ICON, ENTRY_TEXTS[kind], by=by, entry_kind=kind)
+
+    def _on_night(self, entity, attribute, old, new, kwargs):
+        if not written_tonight(self.events, NIGHT_TEXT, None, self.get_now()):
+            self._add(NIGHT_ICON, NIGHT_TEXT)
+
+    def _on_sleep(self, entity, attribute, old, new, kwargs):
+        self.run_in(self._emit_bed, BED_REPORT_DELAY_S, sleep_entity=entity,
+                    at=self.get_now().timestamp())
+
+    def _emit_bed(self, kwargs):
+        entity = kwargs["sleep_entity"]
+        name = self.sleepers.get(entity)
+        if not name or self.get_state(entity) != "on":
+            return
+        if night_row_near(self.events, kwargs["at"]) or written_tonight(self.events, BED_TEXT, name, self.get_now()):
+            return
+        if name in self.admin_sleepers:
+            self._add(BED_ICON, BED_TEXT, by=name, audience="admin")
+        else:
+            self._add(BED_ICON, BED_TEXT, by=name, audience_users=[name])
+
     def _on_report(self, event_name, data, kwargs):
         event = build_report_event(data)
         if event:
@@ -437,12 +606,12 @@ class HouseEvents(hass.Hass):
             self.log(f"Could not restore previous feed from state file: {e}", level="WARNING")
             return []
 
-    def _add(self, icon, text, cause=None, effect=None, by=None, audience=None, audience_users=None):
+    def _add(self, icon, text, cause=None, effect=None, by=None, audience=None, audience_users=None, entry_kind=None):
         now = self.get_now()
         now_iso = now.isoformat()
-        # Flap guard: identical text again within the window is noise, not news.
+        # Flap guard: identical text by the same person again within the window is noise, not news.
         for event in self.events:
-            if event.get("text") != text:
+            if event.get("text") != text or event.get("by") != by:
                 continue
             try:
                 from datetime import datetime
@@ -463,6 +632,8 @@ class HouseEvents(hass.Hass):
             entry["audience"] = "admin"
         elif audience_users:
             entry["audience_users"] = list(audience_users)
+        if entry_kind:
+            entry["entry"] = entry_kind
         self.events.insert(0, entry)
         del self.events[MAX_EVENTS:]
         self._publish()
