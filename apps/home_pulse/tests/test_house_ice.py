@@ -61,7 +61,7 @@ def pushes(app):
 class WiringTests(unittest.TestCase):
     def test_the_shipped_settings_are_read_and_the_thermometer_and_the_person_are_sources(self):
         app = start()
-        self.assertEqual(app.ice_cfg, ice.parse(CONFIG["ice"]))
+        self.assertEqual(app.ice_cfg, ice.parse(CONFIG))
         self.assertIn((SENSOR, {"attribute": "all"}), app.listened)
         self.assertIn((CLAUDIA, {"attribute": "all"}), app.listened)
 
@@ -260,7 +260,7 @@ class PushTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
     def test_the_hours_are_settings(self):
-        app = self.cold(ice={**CONFIG["ice"], "push_from": "09:00:00", "push_until": "10:00:00"})
+        app = self.cold(ice_push_from="09:00:00", ice_push_until="10:00:00")
         run_to(app, at(8, 55))
         self.assertEqual(pushes(app), [])
         run_to(app, at(9, 0))

@@ -2,18 +2,19 @@
 timing of the push that tells the person who uses the bath. Pure: each step takes the persisted state and
 returns new state.
 
-A cold spell starts with a reading at or below `likely_at_or_below_c` and ends with one above
-`clear_above_c`. A reading in between ends a spell that has not yet lasted `likely_for_hours` and leaves one
-that has, so once ice is likely it stays so until the water is clearly warmer. Unavailable and unknown readings
-are no readings: they neither start nor end a spell. Ice is likely once a spell has lasted `likely_for_hours`,
-which the clock tells without a new reading, because a sensor whose value has not changed sends no new state.
+A cold spell starts with a reading at or below `ice_likely_at_or_below_c` and ends with one above
+`ice_clear_above_c`. A reading in between ends a spell that has not yet lasted `ice_likely_for_hours` and leaves
+one that has, so once ice is likely it stays so until the water is clearly warmer. Unavailable and unknown
+readings are no readings: they neither start nor end a spell. Ice is likely once a spell has lasted
+`ice_likely_for_hours`, which the clock tells without a new reading, because a sensor whose value has not changed
+sends no new state.
 
 The state is {"since": start of the spell, UTC ISO, "value": the last reading, "pushed_on": house day of the
 last push}; `since` and `value` exist only during a spell.
 
-The push goes at most once a house day, from `push_from` until `push_until` house time, while ice is likely and
-`person` is home. The row is untimed, in `area`, and has no audience. Its kind is "rain" because the dashboard
-knows two kinds and shows a maintenance row to admins only.
+The push goes at most once a house day, from `ice_push_from` until `ice_push_until` house time, while ice is
+likely and `ice_person` is home. The row is untimed, in `ice_area`, and has no audience. Its kind is "rain"
+because the dashboard knows two kinds and shows a maintenance row to admins only.
 """
 
 from datetime import date, time, timedelta
@@ -28,26 +29,26 @@ ICON = "mdi:snowflake"
 PUSH_TITLE = "Ice bath"
 
 
-def parse(raw):
-    """The `ice` section of house_upcoming.yaml, validated. Raises ValueError on a missing or bad value, so a
-    typo fails at start instead of silently turning the rule off."""
-    cfg = raw if isinstance(raw, dict) else {}
+def parse(args):
+    """The ice_* keys of the app's arguments (house_upcoming.yaml), validated. Raises ValueError on a missing or
+    bad value, so a typo fails at start instead of silently turning the rule off."""
+    cfg = args if isinstance(args, dict) else {}
     try:
         out = {
-            "entity": str(cfg["temperature"]), "person": str(cfg["person"]), "area": str(cfg["area"]),
-            "likely_at": float(cfg["likely_at_or_below_c"]), "clear_above": float(cfg["clear_above_c"]),
-            "hold": timedelta(hours=float(cfg["likely_for_hours"])),
-            "push_from": time.fromisoformat(str(cfg["push_from"])),
-            "push_until": time.fromisoformat(str(cfg["push_until"])),
+            "entity": str(cfg["ice_temperature"]), "person": str(cfg["ice_person"]), "area": str(cfg["ice_area"]),
+            "likely_at": float(cfg["ice_likely_at_or_below_c"]), "clear_above": float(cfg["ice_clear_above_c"]),
+            "hold": timedelta(hours=float(cfg["ice_likely_for_hours"])),
+            "push_from": time.fromisoformat(str(cfg["ice_push_from"])),
+            "push_until": time.fromisoformat(str(cfg["ice_push_until"])),
         }
     except (KeyError, TypeError, ValueError) as e:
         raise ValueError(f"ice: missing or invalid value {e}") from None
     if not (out["entity"].startswith("sensor.") and out["person"].startswith("person.") and out["area"]):
-        raise ValueError("ice: temperature must be a sensor, person a person entity and area an area id")
+        raise ValueError("ice: ice_temperature must be a sensor, ice_person a person entity and ice_area an area id")
     if not out["likely_at"] <= out["clear_above"]:
-        raise ValueError("ice: likely_at_or_below_c must not be above clear_above_c")
+        raise ValueError("ice: ice_likely_at_or_below_c must not be above ice_clear_above_c")
     if out["hold"] <= timedelta(0) or not out["push_from"] < out["push_until"]:
-        raise ValueError("ice: likely_for_hours must be positive and push_from before push_until")
+        raise ValueError("ice: ice_likely_for_hours must be positive and ice_push_from before ice_push_until")
     return out
 
 

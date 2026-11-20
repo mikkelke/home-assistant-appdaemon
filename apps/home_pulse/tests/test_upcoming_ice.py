@@ -15,7 +15,8 @@ sys.path.insert(0, str(HOME_PULSE))
 import upcoming_core as core  # noqa: E402
 import upcoming_ice as ice  # noqa: E402
 
-SHIPPED = yaml.safe_load((HOME_PULSE / "house_upcoming.yaml").read_text())["HouseUpcoming"]["ice"]
+APP = yaml.safe_load((HOME_PULSE / "house_upcoming.yaml").read_text())["HouseUpcoming"]
+SHIPPED = {key: value for key, value in APP.items() if key.startswith("ice_")}
 CFG = ice.parse(SHIPPED)
 LOCAL = ZoneInfo("Europe/Copenhagen")
 MIN = timedelta(minutes=1)
@@ -40,21 +41,23 @@ class ParseTests(unittest.TestCase):
                          ("sensor.ice_bath_temperature", "person.claudia", "rooftop"))
         self.assertEqual((CFG["likely_at"], CFG["clear_above"], CFG["hold"]), (0.3, 0.5, 2 * HOUR))
         self.assertEqual((CFG["push_from"], CFG["push_until"]), (time(7), time(22)))
+        self.assertEqual(len(SHIPPED), 8)
 
     def test_a_missing_or_bad_value_fails_at_start(self):
         for key in SHIPPED:
             with self.assertRaises(ValueError, msg=key):
                 ice.parse({k: v for k, v in SHIPPED.items() if k != key})
-        for bad in ({"likely_at_or_below_c": "cold"}, {"likely_at_or_below_c": 0.6}, {"likely_for_hours": 0},
-                    {"likely_for_hours": -1}, {"push_from": "22:00:00"}, {"push_from": 420}, {"push_until": "later"},
-                    {"temperature": "binary_sensor.ice"}, {"person": "device_tracker.claudia"}, {"area": ""}):
+        for bad in ({"ice_likely_at_or_below_c": "cold"}, {"ice_likely_at_or_below_c": 0.6}, {"ice_likely_for_hours": 0},
+                    {"ice_likely_for_hours": -1}, {"ice_push_from": "22:00:00"}, {"ice_push_from": 420},
+                    {"ice_push_until": "later"}, {"ice_temperature": "binary_sensor.ice"},
+                    {"ice_person": "device_tracker.claudia"}, {"ice_area": ""}):
             with self.assertRaises(ValueError, msg=bad):
                 ice.parse({**SHIPPED, **bad})
         with self.assertRaises(ValueError):
             ice.parse(None)
 
     def test_the_two_thresholds_may_be_equal(self):
-        self.assertEqual(ice.parse({**SHIPPED, "clear_above_c": 0.3})["clear_above"], 0.3)
+        self.assertEqual(ice.parse({**SHIPPED, "ice_clear_above_c": 0.3})["clear_above"], 0.3)
 
 
 class StepTests(unittest.TestCase):
@@ -123,7 +126,7 @@ class LikelyTests(unittest.TestCase):
         self.assertTrue(ice.likely(st, CFG, at(21, 6, 30)))
 
     def test_the_hours_are_a_setting(self):
-        short = ice.parse({**SHIPPED, "likely_for_hours": 0.5})
+        short = ice.parse({**SHIPPED, "ice_likely_for_hours": 0.5})
         st = ice.step({}, short, 0.1, at(21, 3, 0))
         self.assertFalse(ice.likely(st, short, at(21, 3, 29)))
         self.assertTrue(ice.likely(st, short, at(21, 3, 30)))
@@ -169,7 +172,7 @@ class RowTests(unittest.TestCase):
         self.assertEqual(ice.rows(st, CFG, at(21, 7, 1)), [])
 
     def test_the_area_is_a_setting(self):
-        other = ice.parse({**SHIPPED, "area": "living_room"})
+        other = ice.parse({**SHIPPED, "ice_area": "living_room"})
         st = ice.step({}, other, 0.1, at(21, 3, 0))
         self.assertEqual(ice.rows(st, other, at(21, 6, 0))[0]["area"], "living_room")
 

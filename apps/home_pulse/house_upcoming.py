@@ -41,10 +41,10 @@ Yale keypad unlocks by residents still registered away 15 minutes later add quie
 (upcoming_yale), closed with Done. Notes and Done survive reload; pending checks are dropped. These
 notes have no push key and never enter the maintenance digest.
 
-The ice bath's thermometer and the person who uses the bath (the `ice` section of house_upcoming.yaml) are
+The ice bath's thermometer and the person who uses the bath (the ice_* keys of house_upcoming.yaml) are
 sources like the rest. Water that has sat at about 0 C long enough for an ice skin to be likely gives a row in
 the rooftop area (upcoming_ice), and one push a day through MobileNotifier's ice_bath category, whose
-audience says who gets it, while that person is home between push_from and push_until.
+audience says who gets it, while that person is home between ice_push_from and ice_push_until.
 
 Latches, push keys, battery facts, the cleaning rate, the tapped tasks' anchors and the ice bath's cold spell
 and last push day persist in house_upcoming_state.json next to this module; rain forecast fixtures go to
@@ -140,7 +140,7 @@ class HouseUpcoming(hass.Hass):
         self.rain_home = rn.get("home", "zone.home")
         self.rain_ahead_home = timedelta(hours=float(rn.get("horizon_home_hours", 1)))
         self.rain_ahead_away = timedelta(hours=float(rn.get("horizon_away_hours", 3)))
-        self.ice_cfg = ice.parse(a.get("ice"))
+        self.ice_cfg = ice.parse(a)
         self.inventory = maint.parse_inventory(a.get("batteries"))
         self.plants = plants.parse_plants(a.get("plants"))
         self.timed_plants = plants.parse_timed(a.get("plants"))

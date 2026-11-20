@@ -74,19 +74,18 @@ HouseUpcoming:
       binary_sensor.rooftop_door_1_contact: {label: living-room terrace door, area: living_room}
       binary_sensor.rooftop_door_2_contact: {label: "Claudia's terrace door", area: office}
 
-  # The terrace ice bath: the water at or below likely_at_or_below_c for likely_for_hours, with no reading above
-  # it, makes ice likely. That gives a row in area, which stays until a reading above clear_above_c, and one push a
-  # day between push_from and push_until while person is home. MobileNotifier's ice_bath category
-  # (mobile_notifier.yaml) says who gets it. Unavailable and unknown readings change nothing.
-  ice:
-    temperature: sensor.ice_bath_temperature
-    person: person.claudia
-    area: rooftop
-    likely_at_or_below_c: 0.3
-    likely_for_hours: 2
-    clear_above_c: 0.5
-    push_from: "07:00:00"
-    push_until: "22:00:00"
+  # The terrace ice bath: the water at or below ice_likely_at_or_below_c for ice_likely_for_hours, with no reading
+  # above it, makes ice likely. That gives a row in ice_area, which stays until a reading above ice_clear_above_c,
+  # and one push a day between ice_push_from and ice_push_until while ice_person is home. MobileNotifier's
+  # ice_bath category (mobile_notifier.yaml) says who gets it. Unavailable and unknown readings change nothing.
+  ice_temperature: sensor.ice_bath_temperature
+  ice_person: person.claudia
+  ice_area: rooftop
+  ice_likely_at_or_below_c: 0.3
+  ice_likely_for_hours: 2
+  ice_clear_above_c: 0.5
+  ice_push_from: "07:00:00"
+  ice_push_until: "22:00:00"
 
   # One line per houseplant: name, area and water (optional, the litres to pour, which the row's title
   # shows), then either moisture or every_days. With moisture, its soil moisture sensor, the plant needs
