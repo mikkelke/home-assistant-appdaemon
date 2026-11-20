@@ -35,3 +35,4 @@ __pycache__/
 
 # Test tapes are fixtures, not runtime state - re-include them past the runtime-file patterns above
 !apps/appliances/tests/tapes/*.json
+apps/home_pulse/house_events_backfill.json

@@ -139,6 +139,18 @@ def appliance_event(name, old, new, attrs):
     return None
 
 
+# The backfill (rows worked out afterwards from the recorder, see backfill_rows) is published whole.
+MAX_BACKFILL = 300
+
+
+def backfill_rows(raw):
+    """The valid rows of a backfill file's list, newest first, at most MAX_BACKFILL."""
+    if not isinstance(raw, list):
+        return []
+    rows = [e for e in raw if isinstance(e, dict) and _ts(e) is not None and isinstance(e.get("text"), str) and e["text"]]
+    return sorted(rows, key=_ts, reverse=True)[:MAX_BACKFILL]
+
+
 def sanitize_feed(events):
     """Validated copy of an events list from ANY persistence layer (entity attributes
     or the state file) - malformed entries dropped, newest-first order trusted (the
@@ -402,6 +414,7 @@ class HouseEvents(hass.Hass):
         self.feed_entity = self.args.get("feed_entity", "sensor.house_events")
         self._state_file = Path(self.args.get("state_file") or Path(__file__).with_name("house_events_state.json"))
         self.events = self._load_previous_feed()
+        self._publish_backfill()
 
         self.appliances = self.args.get(
             "appliances",
@@ -649,6 +662,27 @@ class HouseEvents(hass.Hass):
             os.replace(tmp, self._state_file)
         except Exception as e:
             self.log(f"State file write failed: {e}", level="WARNING")
+
+    def _publish_backfill(self):
+        """Publishes backfill_file (default house_events_backfill.json beside this module, kept on the box
+        only) to backfill_entity: rows of days before a source fed this feed, which the dashboard
+        merges into its history. Its copy of a row wins there, so it may also name a row written unnamed."""
+        entity = self.args.get("backfill_entity")
+        if not entity:
+            return
+        path = Path(self.args.get("backfill_file") or Path(__file__).with_name("house_events_backfill.json"))
+        try:
+            rows = backfill_rows(json.loads(path.read_text()))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as e:
+            self.log(f"Backfill {path.name} unreadable: {e}", level="WARNING")
+            return
+        try:
+            self.set_state(entity, state=str(len(rows)), replace=True,
+                           attributes={"friendly_name": "House events backfill", "icon": "mdi:history", "events": rows})
+        except Exception as e:
+            self.log(f"Backfill publish failed: {e}", level="WARNING")
 
     def _publish(self):
         try:

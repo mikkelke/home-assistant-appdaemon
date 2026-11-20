@@ -600,5 +600,19 @@ class NightTests(unittest.TestCase):
         self.assertEqual(feed.events, [])
 
 
+class BackfillRowsTest(unittest.TestCase):
+    def test_keeps_valid_rows_newest_first(self):
+        raw = [{"ts": "2026-11-10T08:00:00+00:00", "text": "a"}, {"ts": "2026-11-12T08:00:00+00:00", "text": "b"},
+               {"ts": "junk", "text": "c"}, {"ts": "2026-11-11T08:00:00+00:00", "text": ""}, "x", None]
+        self.assertEqual([r["text"] for r in house_events.backfill_rows(raw)], ["b", "a"])
+
+    def test_not_a_list_is_empty(self):
+        self.assertEqual(house_events.backfill_rows({"events": []}), [])
+
+    def test_capped(self):
+        raw = [{"ts": f"2026-11-01T00:00:{i % 60:02d}+00:00", "text": str(i)} for i in range(400)]
+        self.assertEqual(len(house_events.backfill_rows(raw)), house_events.MAX_BACKFILL)
+
+
 if __name__ == "__main__":
     unittest.main()
