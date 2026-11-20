@@ -14,6 +14,8 @@ TICK_S = 10
 LIVE_S = 30
 TABLET_IDLE_S = 120
 SERVICE_TIMEOUT_S = 20
+WHO_AFTER_S = 300
+FALLBACK_PERSON = "mikkel"
 PUSH_ACTIONS = {"COOK_BAG_IN": "bag_in", "COOK_STOP": "bath_stop", "COOK_ICE": "chill",
                 "COOK_PULLED": "probe_pulled", "COOK_SILENCE": "silence"}
 
@@ -58,6 +60,7 @@ class CookAssistant(hass.Hass):
         self.tablet_interactive = self.args.get("tablet_interactive", "binary_sensor.oppopad4pro_interactive")
         self.push_link = self.args.get("push_link", "/dashboard-rooftop/home#room=kitchen")
         self._notifier = self.get_app("MobileNotifier")
+        self._kitchen = self.get_app("KitchenCook")
         self._values = {}
         self._published = {}
         self._curves = {}
@@ -165,6 +168,7 @@ class CookAssistant(hass.Hass):
 
     def _on_tick(self, kwargs):
         now = self.get_now_ts()
+        self._assign_cooks(now)
         self._apply(self._tracker.tick(now))
         if self._last_live is None or now - self._last_live >= LIVE_S:
             self._sample(now)
@@ -210,7 +214,7 @@ class CookAssistant(hass.Hass):
             elif kind == "service":
                 self.create_task(self._device_command(effect))
             elif kind == "push":
-                self.create_task(self._send_push(effect))
+                self.create_task(self._send_push(effect, self._push_person(effect)))
                 if effect.get("wake"):
                     self._wake_tablet(effect.get("id", "cook"))
             elif kind == "report":
@@ -241,10 +245,47 @@ class CookAssistant(hass.Hass):
             await self._call_service("button/press", entity_id=self.stop_entity if op == "bath_stop"
                                      else self.silence_entity)
 
-    async def _send_push(self, effect):
+    def _kitchen_cook(self, start):
+        start = number(start)
+        if self._kitchen is None or start is None:
+            return None
+        try:
+            person = self._kitchen.cook_for(start)
+        except Exception as error:
+            self.log(f"KitchenCook failed: {error!r}", level="WARNING")
+            return None
+        return person if isinstance(person, str) and person else None
+
+    def _assign_cooks(self, now):
+        for lane in (self._tracker.bath, self._tracker.probe):
+            start = number(lane.get("start"))
+            if (lane.get("phase", "off") == "off" or start is None or "cook_person" in lane
+                    or now < start + WHO_AFTER_S):
+                continue
+            lane["cook_person"] = self._kitchen_cook(start)
+            self._record_active()
+
+    def _cook_row(self, cook_id):
+        if cook_id is None:
+            return None
+        rows = [self._tracker.bath, self._tracker.probe, *reversed(self._records)]
+        return next((row for row in rows if row.get("id") == cook_id), None)
+
+    def _push_person(self, effect):
+        row = self._cook_row(effect.get("id"))
+        person = None
+        if row is not None:
+            person = row["cook_person"] if "cook_person" in row else self._kitchen_cook(row.get("start"))
+        if person:
+            self.log(f"Cook push to {person} (kitchen_cook)")
+            return person
+        self.log(f"Cook push to {FALLBACK_PERSON} (fallback)")
+        return FALLBACK_PERSON
+
+    async def _send_push(self, effect, person):
         try:
             await self._notifier.notify(title=effect["title"], message=effect.get("message", ""),
-                                        target=["mikkel"], category="cook", link=self.push_link,
+                                        target=[person], category="cook", link=self.push_link,
                                         data={"data": {"tag": f"cook_{effect.get('id', 'alarm')}_{effect['kind']}",
                                                        "actions": effect.get("actions", [])}})
         except Exception as error:

@@ -1,0 +1,30 @@
+# /conf/apps/presence/kitchen_cook.yaml
+# Publishes sensor.kitchen_cook (a resident's name, unknown, or idle without a cooking session):
+# who is cooking, read from the residents' phones on Bluetooth (Bermuda's area sensor per phone).
+# CookAssistant asks this app who to send its pushes to. See kitchen_cook.py's module docstring
+# for the rules.
+#
+# A resident is listed only once their phone is tracked by Bermuda.
+#
+# No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
+# first or the app fails to instantiate.
+
+KitchenCook:
+  module: kitchen_cook
+  class: KitchenCook
+
+  entity: sensor.kitchen_cook
+  kitchen_area: Kitchen
+
+  # Cooking is on while any of these reads power_w or more, or the cooker heats.
+  power_w: 50
+  power_sensors:
+    - sensor.hotplate_power_monitor_total_active_power
+    - sensor.oven_plug_switch_0_power
+    - sensor.microwave_plug_power
+  cooker: climate.anova_cooker
+
+  residents:
+    - {name: mikkel, person: person.mikkel, area_sensor: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area}
+    - {name: claudia, person: person.claudia, area_sensor: sensor.claudias_iphone_ble_area}
+    - {name: kristine, person: person.kristine, area_sensor: sensor.kristines_iphone_ble_area}

@@ -1,7 +1,9 @@
 CookAssistant:
   module: cook_assistant
   class: CookAssistant
-  dependencies: MobileNotifier
+  dependencies:
+    - MobileNotifier
+    - KitchenCook
   climate_entity: climate.anova_cooker
   status_entity: sensor.anova_cooker_status
   low_water_entity: binary_sensor.anova_cooker_low_water

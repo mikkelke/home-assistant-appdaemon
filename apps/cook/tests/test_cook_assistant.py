@@ -28,11 +28,26 @@ def full(state, attributes=None, changed=None):
             "last_changed": datetime.fromtimestamp(changed or NOW - 3600, timezone.utc).isoformat()}
 
 
+class Kitchen:
+    """Stands in for KitchenCook: answers cook_for with `person`, or raises it when it is an exception."""
+
+    def __init__(self):
+        self.person = None
+        self.asked = []
+
+    def cook_for(self, start):
+        self.asked.append(start)
+        if isinstance(self.person, Exception):
+            raise self.person
+        return self.person
+
+
 class Fake:
     def __init__(self, root, states=None, now=NOW):
         app = ca.CookAssistant.__new__(ca.CookAssistant)
         self.app = app
         self.now = now
+        self.kitchen = Kitchen()
         self.states = {"climate.anova_cooker": full("off", {"current_temperature": 20, "temperature": 58}),
                        "binary_sensor.anova_cooker_low_water": full("off"),
                        "binary_sensor.oppopad4pro_interactive": full("off")}
@@ -45,7 +60,7 @@ class Fake:
         app.get_now_ts = lambda: self.now
         app.get_state = lambda entity, **kw: self.states.get(entity)
         app.set_state = self.set_state
-        app.get_app = lambda name: self
+        app.get_app = lambda name: self.kitchen if name == "KitchenCook" else self
         app.listen_state = lambda callback, entity, **kw: self.listeners.append((entity, callback))
         app.listen_event = lambda callback, event, **kw: self.events.append((event, callback))
         app.run_every = lambda *args, **kw: self.timers.append(args)
@@ -113,7 +128,7 @@ class AdapterTests(unittest.TestCase):
 
     def test_registration_and_contract(self):
         config = yaml.safe_load((HERE / "cook_assistant.yaml").read_text())["CookAssistant"]
-        self.assertEqual(config["dependencies"], "MobileNotifier")
+        self.assertEqual(set(config["dependencies"]), {"MobileNotifier", "KitchenCook"})
         notifier = yaml.safe_load((HERE.parent / "notify" / "mobile_notifier.yaml").read_text())
         self.assertEqual(notifier["MobileNotifier"]["category_audience"]["cook"], ["mikkel"])
         self.assertEqual(set(self.fake.published), {"sensor.cook_state", "sensor.cook_live", "sensor.cook_log"})
@@ -310,6 +325,109 @@ class AdapterTests(unittest.TestCase):
         assigned = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
                     and isinstance(node.ctx, ast.Store)}
         self.assertFalse(assigned & reserved)
+
+
+class CookPersonTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.fake = Fake(self.root)
+
+    def logged(self, text):
+        return (text,) in self.fake.logs
+
+    def test_pushes_go_to_mikkel_when_kitchen_cook_names_nobody(self):
+        self.fake.bath(58)
+        self.assertEqual(self.fake.pushes[-1]["target"], ["mikkel"])
+        self.assertTrue(self.logged("Cook push to mikkel (fallback)"))
+
+    def test_the_cook_is_stored_in_the_record_five_minutes_after_the_start_and_later_pushes_go_to_them(self):
+        self.fake.kitchen.person = "claudia"
+        self.fake.bath(20)
+        start = self.fake.app._tracker.bath["start"]
+        self.fake.tick(ca.WHO_AFTER_S - 1)
+        self.assertNotIn("cook_person", self.fake.app._tracker.bath)
+        self.assertEqual(self.fake.kitchen.asked, [])
+        self.fake.tick(1)
+        self.assertEqual(self.fake.app._tracker.bath["cook_person"], "claudia")
+        self.assertEqual(self.fake.kitchen.asked, [start])
+        self.assertEqual(storage.read_json(self.root / "cook_log.json", {})["cooks"][-1]["cook_person"], "claudia")
+        self.fake.bath(58)
+        self.assertEqual(self.fake.pushes[-1]["target"], ["claudia"])
+        self.assertTrue(self.logged("Cook push to claudia (kitchen_cook)"))
+        self.assertEqual(self.fake.kitchen.asked, [start])
+
+    def test_a_push_before_the_five_minutes_asks_at_once_and_stores_nothing(self):
+        self.fake.kitchen.person = "kristine"
+        self.fake.bath(58)
+        self.assertEqual(self.fake.pushes[-1]["target"], ["kristine"])
+        self.assertEqual(self.fake.kitchen.asked, [self.fake.app._tracker.bath["start"]])
+        self.assertNotIn("cook_person", self.fake.app._tracker.bath)
+
+    def test_a_cook_nobody_is_named_for_is_stored_as_nobody_and_asked_once(self):
+        self.fake.bath(20)
+        self.fake.tick(ca.WHO_AFTER_S)
+        self.assertIsNone(self.fake.app._tracker.bath["cook_person"])
+        self.fake.kitchen.person = "claudia"
+        self.fake.tick(60)
+        self.fake.bath(58)
+        self.assertEqual(len(self.fake.kitchen.asked), 1)
+        self.assertIsNone(self.fake.app._tracker.bath["cook_person"])
+        self.assertEqual(self.fake.pushes[-1]["target"], ["mikkel"])
+        self.assertTrue(self.logged("Cook push to mikkel (fallback)"))
+
+    def test_the_stored_cook_survives_a_restart_and_is_not_asked_again(self):
+        self.fake.kitchen.person = "claudia"
+        self.fake.bath(20)
+        self.fake.tick(ca.WHO_AFTER_S)
+        self.fake.app.terminate()
+        again = Fake(self.root, self.fake.states, self.fake.now)
+        again.kitchen.person = "kristine"
+        self.assertEqual(again.app._tracker.bath["cook_person"], "claudia")
+        again.bath(58)
+        self.assertEqual(again.pushes[-1]["target"], ["claudia"])
+        self.assertEqual(again.kitchen.asked, [])
+
+    def test_the_closed_record_keeps_the_cook(self):
+        self.fake.kitchen.person = "kristine"
+        self.fake.bath(20)
+        self.fake.tick(ca.WHO_AFTER_S)
+        self.fake.command("bath_clear")
+        record = storage.read_json(self.root / "cook_log.json", {})["cooks"][-1]
+        self.assertEqual((record["kind"], record["cook_person"]), ("bath", "kristine"))
+        self.assertNotIn("cook_person", self.fake.app._tracker.bath)
+
+    def test_the_probe_cook_has_its_own_person(self):
+        self.fake.kitchen.person = "kristine"
+        self.fake.probe(40, 100, [40, 41, 42, 43])
+        self.fake.tick(30)
+        self.fake.probe(41, 100, [41, 42, 43, 44])
+        self.fake.tick(ca.WHO_AFTER_S)
+        self.assertEqual(self.fake.app._tracker.probe["cook_person"], "kristine")
+        self.fake.kitchen.person = "claudia"
+        self.fake.probe(50, 100, [50, 52, 53, 54])
+        self.assertTrue(self.fake.pushes[-1]["title"].startswith("Pull the roast now"))
+        self.assertEqual(self.fake.pushes[-1]["target"], ["kristine"])
+
+    def test_an_alarm_outside_any_cook_goes_to_mikkel_without_asking(self):
+        self.fake.kitchen.person = "claudia"
+        self.fake.change("binary_sensor.anova_cooker_low_water", "on")
+        self.assertEqual(self.fake.pushes[-1]["target"], ["mikkel"])
+        self.assertEqual(self.fake.kitchen.asked, [])
+
+    def test_a_failing_or_missing_kitchen_cook_falls_back_to_mikkel(self):
+        self.fake.kitchen.person = RuntimeError("boom")
+        self.fake.bath(58)
+        self.assertEqual(self.fake.pushes[-1]["target"], ["mikkel"])
+        self.assertTrue(any("KitchenCook failed" in str(row) for row in self.fake.logs))
+        self.fake.kitchen.person = "claudia"
+        self.fake.app._kitchen = None
+        self.fake.command("bath_clear")
+        self.fake.bath(58, state="off")
+        self.fake.bath(58)
+        self.assertEqual([push["target"] for push in self.fake.pushes], [["mikkel"], ["mikkel"]])
+        self.assertEqual(len(self.fake.kitchen.asked), 1)
 
 
 if __name__ == "__main__":
