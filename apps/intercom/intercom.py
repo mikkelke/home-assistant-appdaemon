@@ -98,7 +98,7 @@ class Intercom(hass.Hass):
         self.unlock_repeat_interval_s = int(self.args.get("unlock_repeat_interval_s", 7))
         self.debounce_s = int(self.args.get("debounce_s", 5))
         self.notify_target = self.args.get("notify_target", "mikkel")
-        self.courier_notify = self.args.get("courier_notify") or {}
+        self.food_courier_notify = self.args.get("food_courier_notify") or self.notify_target
         # How stale a persisted "rang but auto-open unlock was never confirmed"
         # record can be at startup and still be worth alerting on - older than this
         # and the visitor is long gone, so alerting would just be noise (see
@@ -1263,7 +1263,8 @@ class Intercom(hass.Hass):
                     and abs((courier[1] - ring_ts).total_seconds()) <= COURIER_PUSH_MATCH_S:
                 title = courier_push_title(courier[2])
                 message = f"Rang the {ring_label} and was let in automatically."
-                target = self.courier_notify.get(courier[0], target)
+                if courier[0] == "food":
+                    target = self.food_courier_notify
             # Offer the push to the ABB bridge first: it can hold it the few
             # seconds the gateway needs to produce THIS visitor's photo, instead
             # of sending now with the previous visitor's (Mikkel, 2026-08-27).

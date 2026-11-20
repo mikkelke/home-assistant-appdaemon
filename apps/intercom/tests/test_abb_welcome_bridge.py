@@ -923,7 +923,7 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
         app.logs = []
         app.log = lambda msg, level="INFO": app.logs.append((level, msg))
         app.notify_target = "mikkel"
-        app.courier_notify = {"food": ["mikkel", "kristine"]}
+        app.food_courier_notify = ["mikkel", "kristine"]
         app.unlock_outcomes = {}
         app.unlock_repeat_count = 3
         app.pushes = []
