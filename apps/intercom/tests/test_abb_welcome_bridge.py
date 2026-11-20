@@ -104,7 +104,6 @@ def _bare_bridge(tmpdir, clock):
     app.door_open_ring_window_s = 90
     app._last_door_open_edge_at = {}
     app._last_ring_closed_at = {}
-    app.ring_push_photo_wait_s = 30.0
     app.announce_cameras = {"front door": "camera.abb_front"}
     app.announce_message = "The door is open."
     app.announce_message_courier = "The door is open. Fifth floor."
@@ -913,11 +912,12 @@ class VoiceAlreadySpokenTests(unittest.TestCase):
 
 
 class IntercomAttachmentSeamTests(unittest.TestCase):
-    """The strictly-additive seam in intercom.py: pushes gain an image when the
-    bridge offers one, and remain byte-identical to today when it cannot."""
+    """The strictly-additive seam in intercom.py: the auto-open failure push gains an
+    image when the bridge offers one, and goes out without it when it cannot. A
+    confirmed auto-open is not pushed at all."""
 
     RING = datetime(2026, 11, 11, 10, 17, 44)
-    WOLT = ("food", RING, "wolt")
+    WOLT = ("food", RING)
 
     class RecordingBridge:
         def __init__(self):
@@ -927,10 +927,6 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
             self.calls.append("ring_attachment_data")
             return None
 
-        def defer_ring_push(self, door, title, message, target):
-            self.calls.append("defer_ring_push")
-            return False
-
     def _bare_intercom(self):
         app = intercom.Intercom.__new__(intercom.Intercom)
         app.abb_bridge = None
@@ -938,7 +934,6 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
         app.logs = []
         app.log = lambda msg, level="INFO": app.logs.append((level, msg))
         app.notify_target = "mikkel"
-        app.food_courier_notify = ["mikkel", "kristine"]
         app.states = {"person.mikkel": "home", "person.kristine": "home"}
         app.get_state = lambda entity, attribute=None: app.states.get(entity)
         app.get_now = lambda: self.RING + timedelta(seconds=5)
@@ -966,115 +961,35 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
             outcome["ring_ts"] = ring_ts
         app._report_auto_open_success("binary_sensor.front", "lock.front", outcome, 1)
 
-    def test_a_ring_that_matched_a_food_courier_names_it_in_the_push(self):
-        cases = {"wolt": (self.WOLT, "Probably the Wolt courier"),
-                 "no source": (("food", self.RING, None), "Probably the courier"),
-                 "matched 10 s before the ring": (("food", self.RING - timedelta(seconds=10), "wolt"),
-                                                  "Probably the Wolt courier"),
-                 "matched 10 s after the ring": (("food", self.RING + timedelta(seconds=10), "wolt"),
-                                                 "Probably the Wolt courier")}
-        for case, (courier, title) in cases.items():
-            with self.subTest(case):
-                app = self._bare_intercom()
-                app.get_app = lambda _: None
-                self._door_opened(app, courier)
-                self.assertEqual([(push["title"], push["message"]) for push in app.pushes],
-                                 [(title, "Rang the front door and was let in automatically.")])
-
-    def test_a_ring_that_did_not_match_a_food_courier_is_not_pushed_or_offered_to_the_bridge(self):
+    def test_a_confirmed_auto_open_sends_no_push_and_is_the_rings_one_feed_row(self):
         cases = {"a plain ring": (None, self.RING),
-                 "a parcel courier": (("parcel", self.RING, "gls"), self.RING),
-                 "a groceries courier": (("groceries", self.RING, "nemlig"), self.RING),
-                 "a food courier matched 11 s before the ring": (
-                     ("food", self.RING - timedelta(seconds=11), "wolt"), self.RING),
-                 "a food courier matched 11 s after the ring": (
-                     ("food", self.RING + timedelta(seconds=11), "wolt"), self.RING),
-                 "a ring with no time": (self.WOLT, None)}
-        for case, (courier, ring_ts) in cases.items():
-            with self.subTest(case):
-                app = self._bare_intercom()
-                bridge = self.RecordingBridge()
-                app.get_app = lambda _: bridge
-                self._door_opened(app, courier, ring_ts)
-                self.assertEqual(app.pushes, [])
-                self.assertEqual(bridge.calls, [])
-                self.assertEqual([name for name, _ in app.rows], ["house_events_report"])
+                 "a food courier": (self.WOLT, self.RING),
+                 "a groceries courier": (("groceries", self.RING), self.RING),
+                 "a parcel courier": (("parcel", self.RING), self.RING),
+                 "a food courier and a ring with no time": (self.WOLT, None)}
+        for people in ("home", "not_home"):
+            for case, (courier, ring_ts) in cases.items():
+                with self.subTest(case, people=people):
+                    app = self._bare_intercom()
+                    bridge = self.RecordingBridge()
+                    app.get_app = lambda _: bridge
+                    app.states.update({"person.mikkel": people, "person.kristine": people})
+                    self._door_opened(app, courier, ring_ts)
+                    self.assertEqual(app.pushes, [])
+                    self.assertEqual(bridge.calls, [])
+                    self.assertEqual([name for name, _ in app.rows], ["house_events_report"])
 
-    def test_a_food_courier_push_goes_to_the_food_audience_who_are_home(self):
-        cases = {"both home": ({}, ["mikkel", "kristine"]),
-                 "only Mikkel home": ({"person.kristine": "not_home"}, ["mikkel"]),
-                 "only Kristine home": ({"person.mikkel": "not_home"}, ["kristine"]),
-                 "one in a zone": ({"person.mikkel": "work"}, ["kristine"])}
-        for case, (states, target) in cases.items():
-            with self.subTest(case):
-                app = self._bare_intercom()
-                app.get_app = lambda _: None
-                app.states.update(states)
-                self._door_opened(app, self.WOLT)
-                self.assertEqual([push["target"] for push in app.pushes], [target])
-
-    def test_a_food_courier_ring_with_nobody_home_is_not_pushed_or_offered_to_the_bridge(self):
-        for state in ("not_home", "work", "unavailable", "unknown", None):
-            with self.subTest(state):
-                app = self._bare_intercom()
-                bridge = self.RecordingBridge()
-                app.get_app = lambda _: bridge
-                app.states.update({"person.mikkel": state, "person.kristine": state})
-                self._door_opened(app, self.WOLT)
-                self.assertEqual(app.pushes, [])
-                self.assertEqual(bridge.calls, [])
-                self.assertEqual([name for name, _ in app.rows], ["house_events_report"])
-
-    def test_attachment_passed_through_on_success_push(self):
+    def test_attachment_passed_through_on_failure_push(self):
         app = self._bare_intercom()
         payload = {"data": {"image": "/api/image_proxy/image.x?token=t"}}
 
         class FakeBridge:
             def ring_attachment_data(self, door=None):
                 return payload
-
-            def defer_ring_push(self, door, title, message, target):
-                return False  # declines: intercom sends it itself
         app.get_app = lambda name: FakeBridge()
-        self._door_opened(app, self.WOLT)
-        self.assertEqual([push["data"] for push in app.pushes], [payload])
-
-    def test_bridge_taking_the_push_stops_intercom_sending_it(self):
-        # Exactly one notification per ring: when the bridge holds the push to
-        # wait for this visitor's photo, intercom must not also send its own.
-        app = self._bare_intercom()
-        taken = {}
-        consulted = []
-
-        class FakeBridge:
-            def ring_attachment_data(self, door=None):
-                consulted.append(door)
-                return None
-
-            def defer_ring_push(self, door, title, message, target):
-                taken.update(door=door, title=title, message=message, target=target)
-                return True
-        app.get_app = lambda name: FakeBridge()
-        self._door_opened(app, self.WOLT)
-        self.assertEqual(app.pushes, [])
-        self.assertEqual(consulted, [], "must not be consulted once the push is deferred")
-        self.assertEqual(taken, {"door": "front door", "title": "Probably the Wolt courier",
-                                 "message": "Rang the front door and was let in automatically.",
-                                 "target": ["mikkel", "kristine"]})
-
-    def test_bridge_declining_the_defer_still_pushes_immediately(self):
-        app = self._bare_intercom()
-
-        class FakeBridge:
-            def ring_attachment_data(self, door=None):
-                return None
-
-            def defer_ring_push(self, door, title, message, target):
-                raise RuntimeError("bridge mid-reload")
-        app.get_app = lambda name: FakeBridge()
-        self._door_opened(app, self.WOLT)
-        self.assertEqual([(push["title"], push["target"]) for push in app.pushes],
-                         [("Probably the Wolt courier", ["mikkel", "kristine"])])
+        app._report_auto_open_failure("binary_sensor.front", "lock.front", {"ring_label": "front door"})
+        self.assertEqual([(push["title"], push["target"], push["data"]) for push in app.pushes],
+                         [("Intercom auto-open failed", "mikkel", payload)])
 
     def test_a_confirmed_auto_open_is_the_ring_s_one_feed_row(self):
         app = self._bare_intercom()
@@ -1091,7 +1006,8 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
     def test_bridge_absent_push_goes_out_as_today(self):
         app = self._bare_intercom()
         app.get_app = lambda name: None
-        self._door_opened(app, self.WOLT)
+        app._report_auto_open_failure("binary_sensor.front", "lock.front",
+                                      {"ring_label": "front door"})
         self.assertEqual(len(app.pushes), 1)
         self.assertIsNone(app.pushes[0]["data"])
 
@@ -1141,37 +1057,21 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
 
 
 class RingPushPhotoTests(unittest.TestCase):
-    """The push must show THIS visitor (2026-08-27, Mikkel: "the image that is
-    included in the notification is at least a image delayed - the current
-    notification have the ring before that").
-
-    Measured that evening: ring 18:57:30.8, auto-open push 18:57:34.6, and the
-    gateway's screenshot for that ring only surfaced at 18:57:55.4 - 20.7 s later.
-    Every auto-open push carried the previous visitor. The archive has always
-    refused a stale frame ("a missing photo is honest, the wrong person is
-    misleading"); the push now agrees with it, and waits a few seconds rather
-    than settling for nothing."""
+    """The photo offered for a ring push is this ring's own, never the last visitor's.
+    The archive has always refused a stale frame ("a missing photo is honest, the wrong
+    person is misleading"); the attachment applies the same rule."""
 
     def setUp(self):
         self.clock = Clock(datetime(2026, 8, 27, 18, 57, 30, tzinfo=timezone.utc))
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.app = _bare_bridge(self.tmp.name, self.clock)
-        self.pushes = []
-
-        class FakeNotifier:
-            def notify(inner, **kwargs):
-                self.pushes.append(kwargs)
-        self.app.mobile_notifier = FakeNotifier()
-        self.app.create_task = lambda coro: None
 
     def _set_screenshot(self, captured_at):
         key = (self.app.abb_image_entity, "captured_at")
         self.app.states[key] = captured_at.isoformat() if captured_at else None
         self.app.states[(self.app.abb_image_entity, "entity_picture")] = \
             "/api/image_proxy/image.abb?token=t"
-
-    # --- freshness gate on the immediate (undeferred) attachment ---
 
     def test_screenshot_older_than_the_ring_is_not_attached(self):
         self.app._open_episode("front door", "100000002", self.clock.now())
@@ -1191,92 +1091,6 @@ class RingPushPhotoTests(unittest.TestCase):
     def test_omitting_the_door_keeps_the_old_unchecked_behaviour(self):
         self._set_screenshot(self.clock.now() - timedelta(seconds=40))
         self.assertIsNotNone(self.app.ring_attachment_data())
-
-    # --- deferred push ---
-
-    def test_push_is_held_until_the_photo_arrives(self):
-        episode = self.app._open_episode("front door", "100000002", self.clock.now())
-        self.assertTrue(self.app.defer_ring_push(
-            "front door", "Intercom auto-opened", "Someone rang.", "mikkel"))
-        self.assertEqual(self.pushes, [])  # nothing yet - no photo of this visitor
-        self._set_screenshot(self.clock.now() + timedelta(seconds=6))
-        episode["snapshot"] = {"bytes": b"jpeg", "captured_at": self.clock.now(),
-                               "event_id": "e1"}
-        _run_scheduled(self.app, "_ring_push_due")
-        self.assertEqual(len(self.pushes), 1)
-        self.assertEqual(self.pushes[0]["data"]["image"], "/api/image_proxy/image.abb?token=t")
-
-    def test_push_goes_out_text_only_when_no_photo_ever_lands(self):
-        self.app._open_episode("front door", "100000002", self.clock.now())
-        self.app.defer_ring_push("front door", "Intercom auto-opened", "Someone rang.", "mikkel")
-        _run_scheduled(self.app, "_ring_push_due")  # the deadline fires
-        self.assertEqual(len(self.pushes), 1)
-        self.assertNotIn("image", self.pushes[0]["data"])
-
-    def test_held_push_links_the_ring_start_not_the_send_time(self):
-        ring_at = self.clock.now()
-        episode = self.app._open_episode("front door", "100000002", ring_at)
-        self.app.defer_ring_push("front door", "Intercom auto-opened", "Someone rang.", "mikkel")
-        self.clock.at = ring_at + timedelta(seconds=22.6)
-        self._set_screenshot(self.clock.now() - timedelta(seconds=1))
-        episode["snapshot"] = {"bytes": b"jpeg", "captured_at": self.clock.now(), "event_id": "e1"}
-        _run_scheduled(self.app, "_ring_push_due")
-        self.assertEqual(len(self.pushes), 1)
-        self.assertEqual(self.pushes[0]["link"], f"/dashboard-rooftop/home#now=ring-{int(ring_at.timestamp())}")
-        self.assertEqual(self.pushes[0]["data"]["image"], "/api/image_proxy/image.abb?token=t")
-
-    def test_last_visitors_screenshot_stays_off_a_linked_push(self):
-        ring_at = self.clock.now()
-        self.app._fetch_image_bytes = lambda: JPEG
-        self.app._open_episode("front door", "100000002", ring_at)
-        stale = ring_at - timedelta(seconds=40)
-        self._set_screenshot(stale)
-        self.app.states[self.app.abb_image_entity] = {
-            "attributes": {"captured_at": stale.isoformat(), "event_id": "last-visitor"}}
-        self.app.defer_ring_push("front door", "Intercom auto-opened", "Someone rang.", "mikkel")
-        self.clock.at = ring_at + timedelta(seconds=30)
-        self.app._try_capture("image-update")
-        self.assertIsNone(next(iter(self.app.episodes.values()))["snapshot"])
-        _run_scheduled(self.app, "_ring_push_due")
-        self.assertEqual(len(self.pushes), 1)
-        self.assertNotIn("image", self.pushes[0]["data"])
-        self.assertEqual(self.pushes[0]["link"], f"/dashboard-rooftop/home#now=ring-{int(ring_at.timestamp())}")
-
-    def test_exactly_one_push_even_if_photo_and_deadline_both_fire(self):
-        episode = self.app._open_episode("front door", "100000002", self.clock.now())
-        self.app.defer_ring_push("front door", "Intercom auto-opened", "Someone rang.", "mikkel")
-        episode["snapshot"] = {"bytes": b"jpeg", "captured_at": self.clock.now(),
-                               "event_id": "e1"}
-        self._set_screenshot(self.clock.now())
-        for _ in range(3):
-            _run_scheduled(self.app, "_ring_push_due")
-        self.app._close_episode({"episode_id": episode["id"]})
-        self.assertEqual(len(self.pushes), 1)
-
-    def test_photo_already_present_sends_immediately(self):
-        episode = self.app._open_episode("front door", "100000002", self.clock.now())
-        episode["snapshot"] = {"bytes": b"jpeg", "captured_at": self.clock.now(),
-                               "event_id": "e1"}
-        self._set_screenshot(self.clock.now())
-        self.app.defer_ring_push("front door", "Intercom auto-opened", "Someone rang.", "mikkel")
-        self.assertEqual(len(self.pushes), 1)
-
-    def test_no_open_episode_declines_so_intercom_pushes_itself(self):
-        self.assertFalse(self.app.defer_ring_push(
-            "front door", "Intercom auto-opened", "Someone rang.", "mikkel"))
-
-    def test_no_notifier_declines(self):
-        self.app.mobile_notifier = None
-        self.app._open_episode("front door", "100000002", self.clock.now())
-        self.assertFalse(self.app.defer_ring_push(
-            "front door", "Intercom auto-opened", "Someone rang.", "mikkel"))
-
-    def test_close_flushes_a_push_whose_timer_was_lost(self):
-        episode = self.app._open_episode("front door", "100000002", self.clock.now())
-        self.app.defer_ring_push("front door", "Intercom auto-opened", "Someone rang.", "mikkel")
-        self.app.run_in_calls = []  # the deadline timer never fires
-        self.app._close_episode({"episode_id": episode["id"]})
-        self.assertEqual(len(self.pushes), 1)
 
 
 if __name__ == "__main__":
@@ -2049,21 +1863,6 @@ class RealNotifierPayloadTests(unittest.TestCase):
         self.assertTrue(next(iter(self.app.episodes.values()))["rejected"])
         self.assertEqual(self.sent[-1][1]["message"], "clear_notification")
 
-    def test_auto_opened_push_carries_tag_and_photo_under_data(self):
-        self.app.states[("input_boolean.auto_open_intercom", None)] = "on"
-        episode = self.app._open_episode("front door", "100000002", self.clock.now())
-        episode["snapshot"] = {"bytes": b"jpeg", "captured_at": self.clock.now(), "event_id": "e1"}
-        self.app.states[(self.app.abb_image_entity, "entity_picture")] = "/api/image_proxy/image.abb?token=t"
-        self.assertTrue(self.app.defer_ring_push(
-            "front door", "Intercom auto-opened", "Someone rang.", "mikkel"))
-        link = f"/dashboard-rooftop/home#now=ring-{int(self.clock.at.timestamp())}"
-        self.assertEqual(self.sent, [(self.PHONE, {
-            "title": "Intercom auto-opened",
-            "message": "Someone rang.",
-            "data": {"tag": "abb_autoopen_front", "image": "/api/image_proxy/image.abb?token=t",
-                     "url": link, "clickAction": link},
-        })])
-
     def test_missed_ring_push_carries_photo_and_timeline_link(self):
         self.app.states[(self.app.abb_image_entity, "entity_picture")] = "/api/image_proxy/image.abb?token=t"
         self.clock.at += timedelta(seconds=16)
@@ -2493,54 +2292,13 @@ class ClipPosterTests(unittest.TestCase):
         self.app._on_native_ring_clip("abb_welcome_ring_clip", payload, {})
         return payload
 
-    def _photo_arrived(self):
-        return [(cb, delay, kw) for cb, delay, kw in self.app.run_in_calls
-                if cb.__name__ == "_ring_push_due" and kw.get("reason") == "photo-arrived"]
-
-    def _defer_push(self):
-        self.clock.at = self.ring + timedelta(seconds=3.7)
-        return self.app.defer_ring_push("front door", "Intercom auto-opened", "Someone rang.", "mikkel")
-
-    def test_poster_becomes_the_snapshot_and_releases_the_held_push(self):
-        self.assertTrue(self._defer_push())
-        self.assertEqual(self.app.pushes, [])
+    def test_poster_becomes_the_snapshot(self):
         payload = self._clip_event()
         snap = self.episode["snapshot"]
         self.assertEqual(snap["bytes"], self.poster_bytes)
         self.assertEqual(snap["captured_at"], bridge_mod.parse_iso_ts(payload["started_at"]))
         self.assertEqual(snap["event_id"], f"clip:{self.POSTER}")
         self.assertEqual(snap["url"], self.POSTER_URL)
-        released = self._photo_arrived()
-        self.assertEqual([delay for _, delay, _ in released], [0])
-        callback, _, kwargs = released[0]
-        callback(kwargs)
-        self.assertEqual(len(self.app.pushes), 1)
-        self.assertEqual(self.app.pushes[0]["data"]["image"], self.POSTER_URL)
-        self.assertTrue(any("reason=photo-arrived photo=True" in m for _, m in self.app.logs))
-        _run_scheduled(self.app, "_ring_push_due")  # the 30 s deadline still fires later
-        self.assertEqual(len(self.app.pushes), 1)
-
-    def test_poster_already_in_hand_goes_out_with_the_push_at_once(self):
-        self._clip_event()
-        self.assertTrue(self._defer_push())
-        self.assertEqual(len(self.app.pushes), 1)
-        self.assertEqual(self.app.pushes[0]["data"]["image"], self.POSTER_URL)
-
-    def test_poster_push_image_is_its_archive_path_whatever_the_event_says(self):
-        for event_url in ("", "/local/abb_doorbell/" + self.POSTER):
-            with self.subTest(poster_url=event_url):
-                self.setUp()
-                self._clip_event(poster_url=event_url)
-                self.assertEqual(self.episode["snapshot"]["bytes"], self.poster_bytes)
-                self._defer_push()
-                self.assertEqual(len(self.app.pushes), 1)
-                self.assertEqual(self.app.pushes[0]["data"]["image"], self.POSTER_URL)
-
-    def test_poster_push_image_follows_the_configured_archive_prefix(self):
-        self.app.archive_url_prefix = "/media/local/elsewhere/"
-        self._clip_event()
-        self._defer_push()
-        self.assertEqual(self.app.pushes[0]["data"]["image"], f"/media/local/elsewhere/{self.POSTER}")
 
     def test_intercom_attachment_never_offers_the_stale_picture_beside_a_poster(self):
         self._clip_event()
@@ -2587,7 +2345,6 @@ class ClipPosterTests(unittest.TestCase):
                                     "captured_at": self.ring + timedelta(seconds=2)}
         self._clip_event()
         self.assertEqual(self.episode["snapshot"]["event_id"], "shot-1")
-        self.assertEqual(self._photo_arrived(), [])
 
     def test_gateway_frame_landing_while_the_poster_is_read_keeps_its_place(self):
         # Dispatched on an empty snapshot, but a gateway frame got there first.
@@ -2596,17 +2353,11 @@ class ClipPosterTests(unittest.TestCase):
         self.app._capture_poster_for_episode(self.episode["id"], self.POSTER,
                                              self.ring + timedelta(seconds=3.6))
         self.assertEqual(self.episode["snapshot"]["event_id"], "shot-1")
-        self.assertEqual(self._photo_arrived(), [])
 
-    def test_no_poster_keeps_the_clip_only_archive_and_text_push(self):
-        self._defer_push()
+    def test_no_poster_keeps_the_clip_only_archive(self):
         payload = self._clip_event(poster_filename="", poster_url="")
         (self.app.archive_dir / payload["filename"]).write_bytes(b"mp4data")
         self.assertIsNone(self.episode["snapshot"])
-        self.assertEqual(self._photo_arrived(), [])
-        _run_scheduled(self.app, "_ring_push_due")  # the deadline
-        self.assertEqual(len(self.app.pushes), 1)
-        self.assertNotIn("image", self.app.pushes[0]["data"])
         self.clock.at = self.ring + timedelta(seconds=76)
         _run_scheduled(self.app, "_close_episode")
         entry = self.app._load_index()[0]
@@ -2628,7 +2379,6 @@ class ClipPosterTests(unittest.TestCase):
             with self.subTest(name=name):
                 self._clip_event(poster_filename=name)
                 self.assertIsNone(self.episode["snapshot"])
-        self.assertEqual(self._photo_arrived(), [])
 
     def test_a_poster_nobody_indexed_is_swept_after_a_day(self):
         old_poster = self.app.archive_dir / "abb_ringclip_20261011_181153_100000002.jpg"
@@ -2638,7 +2388,7 @@ class ClipPosterTests(unittest.TestCase):
         self.app._archive_write(JPEG, self.ring.isoformat(), "100000002", "front door",
                                 "ring_auto_opened")
         self.assertFalse(old_poster.exists())
-        self.assertTrue((self.app.archive_dir / self.POSTER).exists())  # young: its push may still fetch it
+        self.assertTrue((self.app.archive_dir / self.POSTER).exists())  # young: inside the 24 h grace
 
 
 class EarlyArchiveTests(unittest.TestCase):

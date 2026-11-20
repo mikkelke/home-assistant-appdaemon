@@ -324,7 +324,6 @@ def _fake_abb_app(tmpdir, clock, states, abb_unlock_doors=None, voice_before_unl
     app.unlock_repeat_interval_s = 7
     app.sonos_notifier = None  # skip TTS - not under test here
     app.notify_target = "mikkel"
-    app.food_courier_notify = ["mikkel", "kristine"]
     app.abb_bridge = None
     app._street_courier = None
 
@@ -735,19 +734,18 @@ class AbbNativeUnlockTests(unittest.TestCase):
         self.assertEqual(_opened(app), ["Someone rang the front door"])  # exactly once, not once per attempt
         self.assertEqual(app.pushes, [])
 
-    def test_a_food_courier_ring_is_pushed_once_to_whoever_is_home_not_once_per_attempt(self):
+    def test_a_food_courier_ring_is_not_pushed_and_is_one_feed_row_not_one_per_attempt(self):
         app = self._app({"front door": "button.abb_front"})
         app.get_app = lambda name: None
-        app._street_courier = ("food", NOW, "wolt")
-        self.states.update({"person.mikkel": "not_home", "person.kristine": "home"})
+        app._street_courier = ("food", NOW)
+        self.states.update({"person.mikkel": "home", "person.kristine": "home"})
         app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
         _run_scheduled(app, "on_timeout")
         _run_scheduled(app, "unlock_callback")
         self.states["lock.front"] = "unlocking"
         _run_scheduled(app, "_verify_unlock")
 
-        self.assertEqual([(p["title"], p["target"]) for p in app.pushes],
-                         [("Probably the Wolt courier", ["kristine"])])
+        self.assertEqual(app.pushes, [])
         self.assertEqual(_opened(app), ["Someone rang the front door"])
 
     def test_esp_ladder_stops_after_first_confirmed_unlock(self):
@@ -1319,14 +1317,12 @@ class CourierWordingTests(unittest.TestCase):
         self.ring("binary_sensor.apartment", later=30)
         self.assertEqual(self.spoken(), ["Someone is at the apartment door"] * 2)
 
-    def test_a_matched_street_ring_remembers_which_carrier_the_courier_is_from(self):
+    def test_a_matched_street_ring_is_remembered_with_its_kind_and_time(self):
         self.states[self.KIND] = "parcel"
-        self.states[("sensor.home_delivery", "door_courier")] = {"id": "gls:1", "source": "gls", "kind": "parcel"}
         self.ring()
-        self.assertEqual(self.app._street_courier, ("parcel", NOW, "gls"))
-        self.states[("sensor.home_delivery", "door_courier")] = "broken"
+        self.assertEqual(self.app._street_courier, ("parcel", NOW))
         self.ring(later=30)
-        self.assertEqual(self.app._street_courier, ("parcel", NOW + timedelta(seconds=30), None))
+        self.assertEqual(self.app._street_courier, ("parcel", NOW + timedelta(seconds=30)))
 
     def test_the_words_come_from_a_pure_function(self):
         self.assertEqual(intercom.courier_message("food", False, "I opened the front door"),
@@ -1338,16 +1334,6 @@ class CourierWordingTests(unittest.TestCase):
                          "A parcel for Mikkel is probably here. I opened the back door.")
         self.assertEqual(intercom.courier_message("groceries", False, None), "The groceries are here.")
         self.assertEqual(intercom.courier_message("parcel", False, None), "A parcel is probably here.")
-
-    def test_the_push_title_names_the_courier_by_its_source(self):
-        for source, name in (("wolt", "Wolt"), ("nemlig", "Nemlig"), ("gls", "GLS"), ("postnord", "PostNord"),
-                             ("airmee", "Airmee"), ("posten_bring", "Bring"), ("budbee", "Budbee"), ("dao", "DAO"),
-                             ("dhl", "DHL"), ("ups", "UPS"), ("danske_fragtmaend", "Danske Fragtmænd")):
-            with self.subTest(source=source):
-                self.assertEqual(intercom.courier_push_title(source), f"Probably the {name} courier")
-        for source in (None, "", "mystery", 5):
-            with self.subTest(source=source):
-                self.assertEqual(intercom.courier_push_title(source), "Probably the courier")
 
 
 if __name__ == "__main__":

@@ -36,12 +36,10 @@ COURIER_AT_THE_DOOR = {
     "parcel": "The parcel is at the door.",
 }
 COURIER_APARTMENT_WINDOW_S = 600
-# Carrier names for the auto-open push of a street ring that matched a courier, keyed by
-# the source of sensor.home_delivery's door_courier.
+# Carrier names, keyed by the source of sensor.home_delivery's door_courier.
 COURIER_NAMES = {"wolt": "Wolt", "nemlig": "Nemlig", "gls": "GLS", "postnord": "PostNord", "airmee": "Airmee",
                  "budbee": "Budbee", "posten_bring": "Bring", "dao": "DAO", "dhl": "DHL", "ups": "UPS",
                  "danske_fragtmaend": "Danske Fragtmænd"}
-COURIER_PUSH_MATCH_S = 10
 
 # ---------------------------------------------------------------------------
 # Pure module-level functions - unit-testable without an AppDaemon runtime (see
@@ -55,12 +53,6 @@ def courier_message(kind, owner_away, opened):
     While the owner is away the delivery is named as his: then someone else hears it."""
     here = (COURIER_HERE_AWAY if owner_away else COURIER_HERE)[kind]
     return f"{here} {opened}." if opened else here
-
-
-def courier_push_title(source):
-    """The auto-open push title for a street ring that matched a courier from `source`."""
-    name = COURIER_NAMES.get(source) if isinstance(source, str) else None
-    return f"Probably the {name} courier" if name else "Probably the courier"
 
 
 def resume_decision(record, age_s, max_age_s):
@@ -98,7 +90,6 @@ class Intercom(hass.Hass):
         self.unlock_repeat_interval_s = int(self.args.get("unlock_repeat_interval_s", 7))
         self.debounce_s = int(self.args.get("debounce_s", 5))
         self.notify_target = self.args.get("notify_target", "mikkel")
-        self.food_courier_notify = self.args.get("food_courier_notify") or []
         # How stale a persisted "rang but auto-open unlock was never confirmed"
         # record can be at startup and still be worth alerting on - older than this
         # and the visitor is long gone, so alerting would just be noise (see
@@ -135,7 +126,7 @@ class Intercom(hass.Hass):
         # whether the delivery is named as Mikkel's, which it is while he is away.
         self.delivery_entity = self.args.get("delivery_entity", "sensor.home_delivery")
         self.owner_entity = self.args.get("owner_entity", "person.mikkel")
-        self._street_courier = None  # (kind, time, source) of the latest street ring that matched a courier
+        self._street_courier = None  # (kind, time) of the latest street ring that matched a courier
 
         self.sonos_notifier = self._get_notifier()
         self.mobile_notifier = self._get_mobile_notifier()
@@ -317,33 +308,12 @@ class Intercom(hass.Hass):
                 pass
         return None
 
-    def _abb_defer_ring_push(self, ring_label, title, message, target):
-        """Hand the auto-open push to the ABB bridge so it can wait for a photo.
-
-        True means the bridge OWNS the push and this app must not send it; False
-        means send it now, exactly as before. Same contract as
-        _abb_ring_attachment: any problem at all is a False, because a household
-        that loses the notification is worse off than one that gets it without a
-        picture. Never raises."""
-        try:
-            if self.abb_bridge is None:
-                self.abb_bridge = self.get_app("AbbWelcomeBridge")
-            if self.abb_bridge:
-                return bool(self.abb_bridge.defer_ring_push(
-                    ring_label, title, message, target))
-        except Exception as e:
-            try:
-                self.log(f"ABB deferred ring push unavailable: {e}", level="DEBUG")
-            except Exception:
-                pass
-        return False
-
     def _abb_voice_already_spoken(self, ring_label):
         """True when the bridge says this visit's sentence has already played,
         so a repeat ring has no new sentence to hold the door for.
 
-        Same contract as _abb_defer_ring_push: any problem at all is a False,
-        and the caller holds the door exactly as before. Never raises."""
+        Any problem at all is a False, and the caller holds the door exactly as
+        before. Never raises."""
         try:
             # Looked up on every call, never cached: a bridge that reloaded on its
             # own leaves its old instance with a visit nobody will ever close, and
@@ -756,8 +726,7 @@ class Intercom(hass.Hass):
             owner = self.get_state(self.owner_entity)
             owner_away = owner not in (None, "", "unknown", "unavailable", "home")
             words = courier_message(kind, owner_away, info.get("followup") if auto_open_enabled else None)
-            courier = self.get_state(self.delivery_entity, attribute="door_courier")
-            self._street_courier = (kind, now, courier.get("source") if isinstance(courier, dict) else None)
+            self._street_courier = (kind, now)
             return words
         except Exception as e:
             try:
@@ -1248,35 +1217,13 @@ class Intercom(hass.Hass):
             self._report_auto_open_success(trigger_entity, lock_entity, outcome, "abb-rescue")
 
     def _report_auto_open_success(self, trigger_entity, lock_entity, outcome, unlock_attempt):
-        """First confirmed unlock of a ring: a food courier is pushed to whoever of its audience is home; every ring
-        gets a house feed row."""
+        """First confirmed unlock of a ring: log it and give the house feed the ring's one row. A confirmed
+        auto-open sends no mobile push; only a failed one does (see _report_auto_open_failure)."""
         ring_label = outcome.get("ring_label", "door")
         self.log(
             f"AUTO-OPEN: confirmed unlock of {lock_entity} after {ring_label} ring (attempt {unlock_attempt})",
             level="INFO",
         )
-
-        courier = self._street_courier
-        ring_ts = outcome.get("ring_ts")
-        food_courier = bool(courier) and courier[0] == "food" and isinstance(ring_ts, datetime) \
-            and abs((courier[1] - ring_ts).total_seconds()) <= COURIER_PUSH_MATCH_S
-        target = [person for person in self.food_courier_notify
-                  if self.get_state(f"person.{person}") == "home"] if food_courier else []
-        if self.mobile_notifier and target:
-            title = courier_push_title(courier[2])
-            message = f"Rang the {ring_label} and was let in automatically."
-            # The ABB bridge may hold the push until it has this visitor's photo; it declines when it cannot.
-            if not self._abb_defer_ring_push(ring_label, title, message, target):
-                attachment = self._abb_ring_attachment(ring_label)
-                try:
-                    self.create_task(self.mobile_notifier.notify(
-                        title=title,
-                        message=message,
-                        target=target,
-                        data=attachment,
-                    ))
-                except Exception as e:
-                    self.log(f"Auto-open success notification failed: {e}", level="WARNING")
 
         # The ring's one feed row: who rang, and how long the door took to open.
         try:
@@ -1304,7 +1251,7 @@ class Intercom(hass.Hass):
         )
 
         if self.mobile_notifier:
-            # Same strictly-additive ABB snapshot as the success push (None = today's push).
+            # Strictly-additive ABB snapshot: None sends the push without a photo.
             attachment = self._abb_ring_attachment()
             try:
                 self.create_task(self.mobile_notifier.notify(

@@ -60,10 +60,6 @@ Intercom:
   # Mobile alert target when all unlock attempts of a ring fail
   notify_target: "mikkel"
 
-  # An auto-opened ring gets a push only when it matched a food courier, to whoever of these is home (Kristine
-  # orders food on Mikkel's Wolt account). Every other auto-open is only announced on the speakers.
-  food_courier_notify: [mikkel, kristine]
-
   # Reboot-survival resume window (intercom_state.json): how stale a persisted
   # "rang but auto-open unlock was never confirmed" record can be at startup and
   # still be worth alerting on. Older than this, the visitor is long gone - alerting
