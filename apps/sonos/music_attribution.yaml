@@ -46,5 +46,5 @@ MusicAttribution:
   session_idle_minutes: 20
   settle_seconds: 5
   call_window_seconds: 30
-  spotify_wait_seconds: 60
+  spotify_wait_seconds: 300
   spotify_poll_seconds: 5
