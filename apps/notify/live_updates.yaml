@@ -7,8 +7,8 @@ LiveUpdates:
     - MobileNotifier
 
   # People resolve through MobileNotifier.device_mapping. Nobody outside this list receives even
-  # a cleanup message. Add Kristine/Claudia here to enable their iPhone Live Activities.
-  enabled_people: [mikkel]
+  # a cleanup message.
+  enabled_people: [mikkel, claudia, kristine]
 
   # Laundry goes to started_by, including late attribution. Until that is known, the audience is
   # enabled people home when this app first sees the cycle (nobody if none). It stays fixed for
@@ -23,7 +23,7 @@ LiveUpdates:
   cook_entity: sensor.cook_state
   coffee_entity: sensor.coffee_state
   cook_people: [mikkel]
-  coffee_people: [mikkel]
+  coffee_people: [mikkel, claudia, kristine]
 
   # Only the apartment door has a doorbell card, tagged live_doorbell_apartment; tapping it opens the existing
   # dashboard ring view. Yale's apartment bell has no published visit end: retain its ring pulse until
