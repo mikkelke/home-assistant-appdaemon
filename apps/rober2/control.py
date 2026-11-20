@@ -274,9 +274,9 @@ class Rober2Control(hass.Hass):
         self._last_narrative = None
         self._narrative_max_len = int(self.args.get("narrative_max_len", 255))
 
-        # House activity feed: last "doors closed" report text (evaluate_cleaning_conditions
-        # runs on every trigger, so only report when the blocked-room set actually changes -
-        # see _report_house_event and the blocked_rooms handling below).
+        # House activity feed: last "didn't start - doors closed" text. evaluate_cleaning_conditions
+        # re-runs on every trigger, so a blocked start is reported once until the room set changes
+        # or the vacuum stops being due (someone home without clean-while-home).
         self._last_blocked_report: str | None = None
         # House activity feed: whole-session guard (spans multiple rooms) - set True on the
         # first successful segment dispatch (start_cleaning), cleared when the queue empties
@@ -419,6 +419,20 @@ class Rober2Control(hass.Hass):
                 effect=effect,
                 icon="mdi:robot-vacuum",
             )
+        except Exception:
+            pass
+
+    async def _report_doors_blocked(self, blocked_rooms, cause: str, effect_template: str, once=False) -> None:
+        """Feed row naming the rooms a closed door kept the vacuum out of. once=True: skip it while
+        the last such row had the same text (the evaluation loop re-runs while nothing changes)."""
+        try:
+            pretty = ", ".join(self._pretty_room_from_segment_id(r) for r in blocked_rooms)
+            effect = effect_template.format(rooms=pretty)
+            if once:
+                if effect == self._last_blocked_report:
+                    return
+                self._last_blocked_report = effect
+            await self._report_house_event(cause, effect)
         except Exception:
             pass
 
@@ -723,30 +737,21 @@ class Rober2Control(hass.Hass):
             rooms_all = await self.get_rooms_to_clean()
             rooms, blocked_rooms = await self._partition_accessible_rooms(rooms_all)
 
-            # House activity feed: report doors blocking queued rooms, whether some rooms are
-            # still proceeding or everything is blocked. This eval runs on every trigger, so
-            # gate on the report TEXT changing (not just "blocked_rooms truthy") to avoid
-            # re-emitting the same line every few seconds; reset once nothing is blocked so
-            # the next blockage reports again.
-            if blocked_rooms:
-                try:
-                    blocked_pretty = ", ".join(
-                        self._pretty_room_from_segment_id(r) for r in blocked_rooms
-                    )
-                    blocked_report_text = f"Vacuum skipped {blocked_pretty} - doors closed"
-                    if blocked_report_text != self._last_blocked_report:
-                        await self._report_house_event(
-                            "Doors closed to queued rooms",
-                            blocked_report_text,
-                        )
-                        self._last_blocked_report = blocked_report_text
-                except Exception:
-                    pass
-            else:
+            # A closed door is only news once the vacuum would have gone in: doors can still open
+            # before the house empties, and rooms behind them wait in the queue meanwhile.
+            would_start = away or clean_while_home == "on"
+            if not blocked_rooms or not would_start:
                 self._last_blocked_report = None
 
             # If there are flagged rooms but none are accessible (closed doors), don't treat as "completed".
             if rooms_all and not rooms:
+                if would_start:
+                    await self._report_doors_blocked(
+                        blocked_rooms,
+                        "Nobody home" if away else "Clean-while-home is on",
+                        "Vacuum didn't start: {rooms} - doors closed",
+                        once=True,
+                    )
                 try:
                     blocked_names = [self.room_config.get(r, r) for r in blocked_rooms]
                     blocked_pretty = ", ".join(
@@ -1244,6 +1249,11 @@ class Rober2Control(hass.Hass):
                     )
                 return
             if not rooms:
+                if self._cleaning_session_active:
+                    self._cleaning_session_active = False
+                    await self._report_doors_blocked(
+                        blocked_rooms, "Vacuum finished the open rooms", "Vacuum skipped {rooms} - doors closed"
+                    )
                 try:
                     blocked_names = ", ".join([self.room_config.get(r, r) for r in blocked_rooms])
                     blocked_pretty = ", ".join(

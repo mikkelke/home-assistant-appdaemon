@@ -2649,7 +2649,7 @@ class LandingWatchAppTests(unittest.TestCase):
         self.assertEqual(self.told(h), ([{"message": AIRMEE_SENTENCE}], []))
 
     def rows(self, h):
-        return [(data["text"], data["audience"]) for event, data in h.feed if event == "house_events_report"]
+        return [(data["text"], data.get("audience")) for event, data in h.feed if event == "house_events_report"]
 
     def test_a_parcel_delivered_without_a_landing_visit_is_one_admin_row(self):
         h = self.make()
@@ -2684,18 +2684,18 @@ class EndedRowsTests(unittest.TestCase):
 
     def test_one_row_per_delivery_that_ended_since_the_last_refresh(self):
         rows = hd.ended_rows({"wolt:x": "arriving"}, [delivery(stage="delivered")], {}, NOW)
-        self.assertEqual(rows, [("mdi:moped", f"Wolt order from {KITCHEN} delivered")])
+        self.assertEqual(rows, [("mdi:moped", f"Wolt order from {KITCHEN} delivered", None)])
         self.assertEqual(hd.ended_rows({"wolt:x": "delivered"}, [delivery(stage="delivered")], {}, NOW), [])
         self.assertEqual(hd.ended_rows({"wolt:x": "preparing"}, [delivery(stage="cancelled")], {}, NOW),
-                         [("mdi:close-circle-outline", f"Wolt order from {KITCHEN} cancelled")])
+                         [("mdi:close-circle-outline", f"Wolt order from {KITCHEN} cancelled", None)])
 
     def test_parcels_of_one_carrier_delivered_together_are_one_row(self):
         parcels = [self.parcel_delivery("A1"), self.parcel_delivery("A2")]
         self.assertEqual(hd.ended_rows({}, parcels, {}, NOW),
-                         [("mdi:package-variant-closed-check", "2 Airmee parcels from Amazon delivered")])
+                         [("mdi:package-variant-closed-check", "2 Airmee parcels from Amazon delivered", "admin")])
         gls = self.parcel_delivery("G1", source="gls", carrier="GLS", title="ComputerSalg A/S")
         self.assertEqual(hd.ended_rows({}, [gls], {}, NOW),
-                         [("mdi:package-variant-closed-check", "GLS parcel from ComputerSalg A/S delivered")])
+                         [("mdi:package-variant-closed-check", "GLS parcel from ComputerSalg A/S delivered", "admin")])
         bare = self.parcel_delivery("P1", source="postnord", carrier="PostNord", title="PostNord")
         self.assertEqual(hd.ended_rows({}, [bare], {}, NOW)[0][1], "PostNord parcel delivered")
 
@@ -2706,7 +2706,7 @@ class EndedRowsTests(unittest.TestCase):
 
     def test_nemlig(self):
         groceries = delivery(id="nemlig:1", source="nemlig", kind="groceries", title="Nemlig", stage="delivered")
-        self.assertEqual(hd.ended_rows({}, [groceries], {}, NOW), [("mdi:cart", "Nemlig groceries delivered")])
+        self.assertEqual(hd.ended_rows({}, [groceries], {}, NOW), [("mdi:cart", "Nemlig groceries delivered", "admin")])
 
 
 if __name__ == "__main__":

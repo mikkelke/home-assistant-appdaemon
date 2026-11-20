@@ -54,11 +54,10 @@ attributes:
 
 The state is published as a string.
 
-The house timeline (`house_events_report`, admin only like the deliveries themselves) gets one row
-when a delivery ends, per carrier and refresh ("Wolt order from Vita delivered", "2 Airmee parcels
+The house timeline (`house_events_report`) gets one row when a delivery ends, per carrier and refresh ("Wolt order from Vita delivered", "2 Airmee parcels
 delivered"), and one when a parcel is probably outside the door; a parcel of that carrier delivered
 within OUTSIDE_COVERS_S after it adds none. What the first refresh after start-up finds ended is not
-news.
+news. Food rows are for the whole household, the rest are admin only, like the dashboard's delivery audience.
 """
 
 import json
@@ -108,6 +107,8 @@ PHONE_APP = "MobileNotifier"
 PARCEL_PUSH_TITLE = "Parcel delivery"
 FEED_EVENT = "house_events_report"
 ENDED = ("delivered", "cancelled")
+# Kinds whose timeline rows every resident sees; any other kind's rows are admin only.
+PUBLIC_KINDS = ("food",)
 DELIVERED_ICONS = {"food": "mdi:moped", "groceries": "mdi:cart", "parcel": "mdi:package-variant-closed-check"}
 CANCELLED_ICON = "mdi:close-circle-outline"
 OUTSIDE_ICON = "mdi:package-variant-closed"
@@ -815,7 +816,7 @@ def ended_text(kind, stage, deliveries):
 
 
 def ended_rows(before, deliveries, told_at, now):
-    """[(icon, text)] for the timeline: the deliveries that reached delivered or cancelled since the
+    """[(icon, text, audience)] for the timeline (audience None = everyone, see PUBLIC_KINDS): the deliveries that reached delivered or cancelled since the
     stages `before` ({id: stage} of the last refresh; None on the first, which reports nothing), one row
     per kind, source and stage. A parcel delivered within OUTSIDE_COVERS_S of its carrier being told
     "probably outside the door" (`told_at`, by source) already has its row."""
@@ -830,7 +831,8 @@ def ended_rows(before, deliveries, told_at, now):
             continue
         groups.setdefault((delivery.kind, delivery.source, delivery.stage), []).append(delivery)
     return [(DELIVERED_ICONS.get(kind, OUTSIDE_ICON) if stage == "delivered" else CANCELLED_ICON,
-             ended_text(kind, stage, group)) for (kind, _, stage), group in groups.items()]
+             ended_text(kind, stage, group), None if kind in PUBLIC_KINDS else "admin")
+            for (kind, _, stage), group in groups.items()]
 
 
 def notice_channel(owner_state, speakers_free):
@@ -949,9 +951,12 @@ class HomeDelivery(hass.Hass):
             except Exception as error:
                 self.log(f"Telling the owner about the {names} parcel failed: {error}", level="WARNING")
 
-    def _report(self, icon, text):
+    def _report(self, icon, text, audience="admin"):
         try:
-            self.fire_event(FEED_EVENT, text=text, icon=icon, audience="admin")
+            data = {"text": text, "icon": icon}
+            if audience:
+                data["audience"] = audience
+            self.fire_event(FEED_EVENT, **data)
         except Exception as error:
             self.log(f"house_events report failed: {error}", level="WARNING")
 
@@ -981,8 +986,8 @@ class HomeDelivery(hass.Hass):
         for id_, stage in stages.items():
             if self._stages.get(id_) != stage:
                 self.log(f"{id_}: {self._stages.get(id_, 'new')} -> {stage}")
-        for icon, text in ended_rows(self._stages if self._refreshed else None, deliveries, self._told_at, now):
-            self._report(icon, text)
+        for icon, text, audience in ended_rows(self._stages if self._refreshed else None, deliveries, self._told_at, now):
+            self._report(icon, text, audience)
         self._stages = stages
         self._refreshed = True
         published = snapshot(deliveries, now, self._incoming)
