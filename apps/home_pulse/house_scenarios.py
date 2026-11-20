@@ -12,7 +12,6 @@ backfill_entity.
 """
 
 import json
-from datetime import timedelta
 from pathlib import Path
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
@@ -111,7 +110,6 @@ class HouseScenarios(hass.Hass):
 
     def _seed(self):
         """Readings from Home Assistant's history for a signal with none of its own, as after a first start."""
-        now = self.get_now()
         seeds = [("night", None, self.night_entity, KEEP_S)]
         seeds += [("machines", k, e, KEEP_S) for k, e in self.machine_entities.items()]
         seeds += [("power", k, e, SEED_POWER_S) for k, e in self.power_entities.items()]
@@ -121,7 +119,8 @@ class HouseScenarios(hass.Hass):
             if points:
                 continue
             try:
-                history = self.get_history(entity_id=entity, start_time=now - timedelta(seconds=span), end_time=now)
+                # With entity_id AppDaemon ignores end_time, and a start_time alone reads one day: `days` reads to now.
+                history = self.get_history(entity_id=entity, days=max(1, -(-span // 86400)))
             except Exception as e:
                 self.log(f"History seed for {entity} failed: {e}", level="WARNING")
                 continue
