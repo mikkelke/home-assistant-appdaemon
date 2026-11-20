@@ -755,11 +755,10 @@ def services(app):
 
 
 class Unlocking(unittest.TestCase):
-    def test_a_sighting_while_armed_and_switched_on_unlocks_the_bluetooth_lock_and_pushes(self):
+    def test_a_sighting_while_armed_and_switched_on_unlocks_the_bluetooth_lock_without_a_push(self):
         app = unlocking_app()
         sight(app, 5)
-        self.assertEqual(services(app), [(5, "lock/unlock", BLE), (5, "notify/mobile_app_phone", None)])
-        self.assertEqual(app.calls[1][2]["title"], "Apartment door unlocked")
+        self.assertEqual(services(app), [(5, "lock/unlock", BLE)])
         self.assertIn((60, {"wid": 1, "t": T0 + 5, "entity": BLE}), app.scheduled)
 
     def test_an_unlock_tells_the_timeline_who_arrived(self):
@@ -810,7 +809,7 @@ class Unlocking(unittest.TestCase):
         open_door(app, 20)
         app.states[LOCK] = "unlocked"
         advance(app, 400)
-        self.assertEqual([s for _, s, _ in services(app)], ["lock/unlock", "notify/mobile_app_phone"])
+        self.assertEqual([s for _, s, _ in services(app)], ["lock/unlock"])
         (line,) = lines(app)
         self.assertEqual((line["outcome"], line["unlock"], line["relocked"]),
                          ("entered", {"t": iso(0), "entity": BLE, "error": None}, None))
@@ -820,8 +819,8 @@ class Unlocking(unittest.TestCase):
         sight(app, 0)
         app.states[LOCK] = "unlocked"
         advance(app, 400)
-        self.assertEqual(services(app)[2:], [(60, "lock/lock", BLE), (60, "notify/mobile_app_phone", None)])
-        self.assertEqual(app.calls[3][2]["title"], "Apartment door locked again")
+        self.assertEqual(services(app)[1:], [(60, "lock/lock", BLE), (60, "notify/mobile_app_phone", None)])
+        self.assertEqual(app.calls[2][2]["title"], "Apartment door locked again")
         (line,) = lines(app)
         self.assertEqual((line["outcome"], line["relocked"]), ("no_door", iso(60)))
 
@@ -830,7 +829,7 @@ class Unlocking(unittest.TestCase):
         sight(app, 0)
         app.states[LOCK] = "unlocked"
         advance(app, 60)
-        self.assertEqual(services(app)[2], (60, "lock/lock", KEYPAD))
+        self.assertEqual(services(app)[1], (60, "lock/lock", KEYPAD))
 
     def test_no_relock_when_already_locked_or_the_door_stands_open(self):
         for name, states in {"locked": {LOCK: "locked"}, "door open": {LOCK: "unlocked", DOOR: "on"}}.items():
@@ -848,7 +847,7 @@ class Unlocking(unittest.TestCase):
         sight(app, 100)
         app.states[LOCK] = "unlocked"
         advance(app, 160)
-        self.assertEqual(services(app)[2], (160, "lock/lock", BLE))
+        self.assertEqual(services(app)[1], (160, "lock/lock", BLE))
 
     def test_a_failed_unlock_is_a_warning_with_no_push_and_still_gets_its_relock_check(self):
         app = unlocking_app()
@@ -864,18 +863,27 @@ class Unlocking(unittest.TestCase):
     def test_a_failed_push_or_relock_is_only_a_warning(self):
         app = unlocking_app()
         app.fail_service["notify/mobile_app_phone"] = "offline"
+        sight(app, 0)
+        app.states[LOCK] = "unlocked"
+        advance(app, 400)
+        self.assertEqual([s for _, s, _ in services(app)], ["lock/unlock", "lock/lock"])
+        self.assertEqual(len(warnings(app)), 1)
+
+        app = unlocking_app()
         app.fail_service["lock/lock"] = "jammed"
         sight(app, 0)
         app.states[LOCK] = "unlocked"
         advance(app, 400)
         self.assertEqual(services(app), [(0, "lock/unlock", BLE)])
-        self.assertEqual(len(warnings(app)), 2)
+        self.assertEqual(len(warnings(app)), 1)
         self.assertIsNone(lines(app)[0]["relocked"])
 
     def test_no_notify_configured_means_no_push(self):
         app = unlocking_app(args={"notify": None})
         sight(app, 0)
-        self.assertEqual(services(app), [(0, "lock/unlock", BLE)])
+        app.states[LOCK] = "unlocked"
+        advance(app, 400)
+        self.assertEqual([s for _, s, _ in services(app)], ["lock/unlock", "lock/lock"])
 
     def test_relock_s_must_be_positive_and_shorter_than_the_window(self):
         for bad in (0, -1, 180, 200):

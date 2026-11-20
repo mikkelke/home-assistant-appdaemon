@@ -43,9 +43,9 @@ flip, null when it does not exist or is not configured.
 
 UNLOCK. When `unlock_switch` reads on as a window opens, the app calls lock.unlock on `unlock_lock`
 (the lock's Bluetooth entity), or on `unlock_fallback` when that entity is unknown, unavailable or
-missing, fires lock_unlocked_on_arrival {lock, by: `name`} for HouseEvents' timeline row, and
-pushes `notify` when one is set. relock_s later, unless the door has opened since, it
-locks the same entity again when `lock` does not read locked and pushes that too. A second sighting
+missing, and fires lock_unlocked_on_arrival {lock, by: `name`} for HouseEvents' timeline row. An
+unlock gives no push. relock_s later, unless the door has opened since, it locks the same entity
+again when `lock` does not read locked and pushes `notify` when one is set. A second sighting
 inside the window does not unlock again. The arrival line then also carries
 unlock {t, entity, error} and relocked (ISO, null when no relock was needed or made). A failed
 unlock call is logged as a warning and still gets its relock check. The lock's own auto-lock covers
@@ -201,8 +201,6 @@ class ArrivalUnlock(hass.Hass):
         self.log(f"ArrivalUnlock: window {wid} opened, phone in {self.landing_area!a}, unlocked {entity}",
                  level="INFO")
         self.fire_event("lock_unlocked_on_arrival", lock=entity, by=self.person_name)
-        self._push("Apartment door unlocked", f"You reached the landing. It locks again in {self.relock_s:g} s "
-                                          f"if the door is not opened.")
 
     def _on_relock(self, kwargs):
         t, entity = kwargs["t"], kwargs["entity"]
