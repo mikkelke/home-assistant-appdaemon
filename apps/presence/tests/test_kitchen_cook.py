@@ -130,23 +130,30 @@ class Windows(unittest.TestCase):
 
 
 class Pick(unittest.TestCase):
-    def test_a_clear_leader_is_the_cook(self):
-        self.assertEqual(kc.pick({"mikkel": 0.1, "claudia": 0.9, "kristine": 0.0}), ("claudia", "leads"))
+    def test_a_resident_clearly_in_the_kitchen_is_the_only_cook(self):
+        self.assertEqual(kc.pick({"mikkel": 0.1, "claudia": 0.9, "kristine": 0.0}), (["claudia"], "named"))
+        self.assertEqual(kc.pick({"mikkel": 0.68}), (["mikkel"], "named"))
 
-    def test_the_thresholds_themselves_are_enough(self):
-        self.assertEqual(kc.pick({"mikkel": 0.6, "claudia": 0.3}), ("mikkel", "leads"))
-        self.assertEqual(kc.pick({"mikkel": 0.6}), ("mikkel", "leads"))
+    def test_a_resident_passing_through_is_not_a_cook_next_to_the_one_who_stays(self):
+        self.assertEqual(kc.pick({"mikkel": 0.71, "kristine": 0.18}), (["mikkel"], "named"))
 
-    def test_below_sixty_percent_is_nobody(self):
-        self.assertEqual(kc.pick({"mikkel": 0.59, "claudia": 0.0}), (None, "too_little"))
-        self.assertEqual(kc.pick({"mikkel": 0.0, "claudia": 0.0}), (None, "too_little"))
+    def test_two_residents_each_in_the_kitchen_for_a_good_part_of_it_are_both_cooks(self):
+        self.assertEqual(kc.pick({"mikkel": 0.54, "kristine": 0.49}), (["mikkel", "kristine"], "named"))
+        self.assertEqual(kc.pick({"mikkel": 1.0, "claudia": 1.0}), (["mikkel", "claudia"], "named"))
 
-    def test_a_leader_not_twice_the_next_is_nobody(self):
-        self.assertEqual(kc.pick({"mikkel": 0.8, "claudia": 0.5}), (None, "no_lead"))
-        self.assertEqual(kc.pick({"mikkel": 1.0, "claudia": 1.0}), (None, "no_lead"))
+    def test_cooks_come_largest_share_first_and_equal_shares_in_config_order(self):
+        self.assertEqual(kc.pick({"mikkel": 0.45, "claudia": 0.5, "kristine": 0.9}),
+                         (["kristine", "claudia", "mikkel"], "named"))
+        self.assertEqual(kc.pick({"mikkel": 0.8, "claudia": 0.0, "kristine": 0.8}), (["mikkel", "kristine"], "named"))
+
+    def test_forty_percent_is_enough_and_less_is_not(self):
+        self.assertEqual(kc.pick({"mikkel": 0.4, "claudia": 0.0}), (["mikkel"], "named"))
+        self.assertEqual(kc.pick({"mikkel": 0.48}), (["mikkel"], "named"))
+        self.assertEqual(kc.pick({"mikkel": 0.39, "claudia": 0.0}), ([], "too_little"))
+        self.assertEqual(kc.pick({"mikkel": 0.0, "claudia": 0.0}), ([], "too_little"))
 
     def test_nobody_home_is_nobody(self):
-        self.assertEqual(kc.pick({}), (None, "no_one_home"))
+        self.assertEqual(kc.pick({}), ([], "no_one_home"))
 
 
 MIKKEL_AREA, CLAUDIA_AREA, KRISTINE_AREA = "sensor.mikkel_area", "sensor.claudia_area", "sensor.kristine_area"
@@ -230,8 +237,8 @@ class App(unittest.TestCase):
     def test_starts_idle_and_listens_to_every_input(self):
         app = make_app()
         (entity, state, attributes), = app.published
-        self.assertEqual((entity, state, attributes["session_start"], attributes["shares"], attributes["reason"]),
-                         (ENTITY, "idle", None, {}, "no_session"))
+        self.assertEqual((entity, state, attributes["session_start"], attributes["cooks"], attributes["shares"],
+                          attributes["reason"]), (ENTITY, "idle", None, [], {}, "no_session"))
         watched = {c.args[1] for c in app.listen_state.call_args_list}
         self.assertEqual(watched, set(AREAS.values()) | set(PERSONS.values()) | {HOB, OVEN, COOKER})
         app.run_every.assert_called_once()
@@ -242,8 +249,8 @@ class App(unittest.TestCase):
         app = make_app()
         at(app, 10, HOB, "1800.0")
         state, attributes = last(app)
-        self.assertEqual((state, attributes["session_start"], attributes["reason"]),
-                         ("unknown", iso(10), "too_little"))
+        self.assertEqual((state, attributes["cooks"], attributes["session_start"], attributes["reason"]),
+                         ("unknown", [], iso(10), "too_little"))
         self.assertEqual(attributes["shares"], {"mikkel": 0.0, "claudia": 0.0, "kristine": 0.0})
 
     def test_the_resident_in_the_kitchen_since_before_the_start_is_named_in_lower_case(self):
@@ -253,28 +260,43 @@ class App(unittest.TestCase):
         at(app, 20, MIKKEL_AREA, "Hallway")
         tick(app, 60)
         state, attributes = last(app)
-        self.assertEqual((state, attributes["reason"], attributes["session_start"]), ("claudia", "leads", iso(0)))
+        self.assertEqual((state, attributes["cooks"], attributes["reason"], attributes["session_start"]),
+                         ("claudia", ["claudia"], "named", iso(0)))
         self.assertEqual(attributes["shares"], {"mikkel": 0.0, "claudia": 1.0, "kristine": 0.0})
 
     def test_a_resident_who_arrives_at_the_hob_after_the_start_is_named_once_the_share_is_enough(self):
         app = make_app()
         at(app, 0, HOB, "1800.0")
         at(app, 60, MIKKEL_AREA, K)
-        tick(app, 90)
+        tick(app, 240)
         self.assertEqual(last(app)[0], "unknown")
-        tick(app, 720)
+        tick(app, 330)
         state, attributes = last(app)
         self.assertEqual(state, "mikkel")
-        self.assertEqual(attributes["shares"]["mikkel"], round(660 / 1020, 2))
+        self.assertEqual(attributes["shares"]["mikkel"], round(270 / 630, 2))
 
-    def test_two_residents_cooking_together_are_nobody(self):
+    def test_two_residents_cooking_together_are_both_named_largest_share_first(self):
         app = make_app()
         at(app, -400, MIKKEL_AREA, K)
-        at(app, -400, KRISTINE_AREA, K)
         at(app, 0, HOB, "1800.0")
-        tick(app, 120)
+        at(app, 160, KRISTINE_AREA, K)
+        at(app, 186, MIKKEL_AREA, "Dining room")
+        tick(app, 600)
         state, attributes = last(app)
-        self.assertEqual((state, attributes["reason"]), ("unknown", "no_lead"))
+        self.assertEqual((state, attributes["cooks"], attributes["reason"]),
+                         ("mikkel, kristine", ["mikkel", "kristine"], "named"))
+        self.assertEqual((attributes["shares"]["mikkel"], attributes["shares"]["kristine"]), (0.54, 0.49))
+
+    def test_a_resident_only_passing_through_the_kitchen_is_not_named(self):
+        app = make_app()
+        at(app, -400, MIKKEL_AREA, K)
+        at(app, 0, HOB, "1800.0")
+        at(app, 339, MIKKEL_AREA, "Dining room")
+        at(app, 438, KRISTINE_AREA, K)
+        tick(app, 600)
+        state, attributes = last(app)
+        self.assertEqual((state, attributes["cooks"]), ("mikkel", ["mikkel"]))
+        self.assertEqual((attributes["shares"]["mikkel"], attributes["shares"]["kristine"]), (0.71, 0.18))
 
     def test_a_resident_who_is_not_home_is_not_counted(self):
         app = make_app()
@@ -284,7 +306,7 @@ class App(unittest.TestCase):
         at(app, 0, HOB, "1800.0")
         tick(app, 60)
         state, attributes = last(app)
-        self.assertEqual(state, "claudia")
+        self.assertEqual((state, attributes["cooks"]), ("claudia", ["claudia"]))
         self.assertNotIn("mikkel", attributes["shares"])
 
     def test_nobody_home_is_unknown(self):
@@ -293,7 +315,8 @@ class App(unittest.TestCase):
             at(app, -10, person, "not_home")
         at(app, 0, HOB, "1800.0")
         state, attributes = last(app)
-        self.assertEqual((state, attributes["shares"], attributes["reason"]), ("unknown", {}, "no_one_home"))
+        self.assertEqual((state, attributes["cooks"], attributes["shares"], attributes["reason"]),
+                         ("unknown", [], {}, "no_one_home"))
 
     def test_the_session_ends_ten_minutes_after_the_power_dropped_and_goes_idle(self):
         app = make_app()
@@ -305,8 +328,8 @@ class App(unittest.TestCase):
         self.assertEqual(last(app)[0], "claudia")
         tick(app, 300 + kc.END_S)
         state, attributes = last(app)
-        self.assertEqual((state, attributes["session_start"], attributes["shares"], attributes["reason"]),
-                         ("idle", None, {}, "no_session"))
+        self.assertEqual((state, attributes["session_start"], attributes["cooks"], attributes["shares"],
+                          attributes["reason"]), ("idle", None, [], {}, "no_session"))
 
     def test_the_cooker_heating_starts_a_session_and_switching_it_off_ends_it(self):
         app = make_app()
@@ -344,12 +367,14 @@ class App(unittest.TestCase):
         at(app, 0, HOB, "1800.0")
         at(app, 60, MIKKEL_AREA, "Dining room")
         at(app, 1800, CLAUDIA_AREA, K)
+        tick(app, 2160)
+        state, attributes = last(app)
+        self.assertEqual((state, attributes["shares"]["claudia"], attributes["shares"]["mikkel"]),
+                         ("unknown", 0.3, 0.0))
         tick(app, 2400)
         state, attributes = last(app)
         self.assertEqual((state, attributes["shares"]["claudia"], attributes["shares"]["mikkel"]),
-                         ("unknown", 0.5, 0.0))
-        tick(app, 2760)
-        self.assertEqual(last(app)[0], "claudia")
+                         ("claudia", 0.5, 0.0))
 
     def test_nothing_is_published_while_nothing_changes(self):
         app = make_app()
@@ -377,8 +402,8 @@ class App(unittest.TestCase):
     def test_a_restart_in_the_middle_of_cooking_reads_the_spell_the_sensor_has_held_since_before(self):
         app = make_app({CLAUDIA_AREA: K, HOB: "1500.0"}, changed={CLAUDIA_AREA: -1500})
         state, attributes = last(app)
-        self.assertEqual((state, attributes["shares"]["claudia"], attributes["session_start"]),
-                         ("claudia", 1.0, iso(0)))
+        self.assertEqual((state, attributes["cooks"], attributes["shares"]["claudia"], attributes["session_start"]),
+                         ("claudia", ["claudia"], 1.0, iso(0)))
 
     def test_a_seed_never_dates_from_the_future(self):
         app = make_app({CLAUDIA_AREA: K}, changed={CLAUDIA_AREA: 500})
@@ -400,43 +425,50 @@ class CookFor(unittest.TestCase):
         at(app, -400, CLAUDIA_AREA, K)
         at(app, 250, CLAUDIA_AREA, "Hallway")
         app.clock["now"] = T0 + 700
-        self.assertEqual(app.cook_for(T0), "claudia")
+        self.assertEqual(app.cook_for(T0), ["claudia"])
         self.assertEqual(len(app.published), 1)
 
-    def test_a_young_start_is_read_to_now_and_the_answer_can_change_as_the_window_fills(self):
+    def test_several_cooks_come_largest_share_first(self):
+        app = make_app()
+        at(app, -400, KRISTINE_AREA, K)
+        at(app, 0, MIKKEL_AREA, K)
+        app.clock["now"] = T0 + 700
+        self.assertEqual(app.cook_for(T0), ["kristine", "mikkel"])
+
+    def test_a_young_start_is_read_to_now_and_the_answer_grows_as_the_window_fills(self):
         app = make_app()
         at(app, -300, CLAUDIA_AREA, K)
         at(app, 0, CLAUDIA_AREA, "Hallway")
         at(app, 0, KRISTINE_AREA, K)
         app.clock["now"] = T0 + 10
-        self.assertEqual(app.cook_for(T0), "claudia")
+        self.assertEqual(app.cook_for(T0), ["claudia"])
         app.clock["now"] = T0 + 700
-        self.assertIsNone(app.cook_for(T0))
+        self.assertEqual(app.cook_for(T0), ["claudia", "kristine"])
 
-    def test_nobody_in_the_kitchen_is_none(self):
+    def test_nobody_in_the_kitchen_is_nobody(self):
         app = make_app()
         app.clock["now"] = T0 + 400
-        self.assertIsNone(app.cook_for(T0))
+        self.assertEqual(app.cook_for(T0), [])
 
     def test_a_resident_who_is_not_home_when_asked_is_not_named(self):
         app = make_app()
         at(app, -400, MIKKEL_AREA, K)
         at(app, 350, PERSONS["mikkel"], "not_home")
-        self.assertIsNone(app.cook_for(T0))
+        self.assertEqual(app.cook_for(T0), [])
 
-    def test_a_start_older_than_the_history_kept_is_none(self):
+    def test_a_start_older_than_the_history_kept_is_nobody(self):
         app = make_app()
         at(app, -400, CLAUDIA_AREA, K)
         at(app, 300, CLAUDIA_AREA, "Hallway")
         for i in range(1, 40):
             at(app, 300 + i * 100, CLAUDIA_AREA, K if i % 2 else "Hallway")
         app.clock["now"] = T0 + 4300
-        self.assertIsNone(app.cook_for(T0))
+        self.assertEqual(app.cook_for(T0), [])
 
-    def test_a_start_that_is_not_a_number_is_none(self):
+    def test_a_start_that_is_not_a_number_is_nobody(self):
         app = make_app()
-        self.assertIsNone(app.cook_for(None))
-        self.assertIsNone(app.cook_for("soon"))
+        self.assertEqual(app.cook_for(None), [])
+        self.assertEqual(app.cook_for("soon"), [])
 
 
 if __name__ == "__main__":

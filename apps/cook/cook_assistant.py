@@ -41,6 +41,18 @@ def command_data(raw):
     return raw if isinstance(raw, dict) else None
 
 
+def stored_people(row):
+    """The people a cook was assigned to: cook_people, or the one name an older record holds in cook_person.
+    None while the cook has not been assigned."""
+    if "cook_people" in row:
+        names = row["cook_people"]
+    elif "cook_person" in row:
+        names = [row["cook_person"]]
+    else:
+        return None
+    return [name for name in names if isinstance(name, str) and name] if isinstance(names, list) else []
+
+
 class CookAssistant(hass.Hass):
     def initialize(self):
         here = Path(__file__).resolve().parent
@@ -214,7 +226,7 @@ class CookAssistant(hass.Hass):
             elif kind == "service":
                 self.create_task(self._device_command(effect))
             elif kind == "push":
-                self.create_task(self._send_push(effect, self._push_person(effect)))
+                self.create_task(self._send_push(effect, self._push_people(effect)))
                 if effect.get("wake"):
                     self._wake_tablet(effect.get("id", "cook"))
             elif kind == "report":
@@ -245,24 +257,24 @@ class CookAssistant(hass.Hass):
             await self._call_service("button/press", entity_id=self.stop_entity if op == "bath_stop"
                                      else self.silence_entity)
 
-    def _kitchen_cook(self, start):
+    def _kitchen_cooks(self, start):
         start = number(start)
         if self._kitchen is None or start is None:
-            return None
+            return []
         try:
-            person = self._kitchen.cook_for(start)
+            names = self._kitchen.cook_for(start)
         except Exception as error:
             self.log(f"KitchenCook failed: {error!r}", level="WARNING")
-            return None
-        return person if isinstance(person, str) and person else None
+            return []
+        return [name for name in names if isinstance(name, str) and name] if isinstance(names, (list, tuple)) else []
 
     def _assign_cooks(self, now):
         for lane in (self._tracker.bath, self._tracker.probe):
             start = number(lane.get("start"))
-            if (lane.get("phase", "off") == "off" or start is None or "cook_person" in lane
+            if (lane.get("phase", "off") == "off" or start is None or stored_people(lane) is not None
                     or now < start + WHO_AFTER_S):
                 continue
-            lane["cook_person"] = self._kitchen_cook(start)
+            lane["cook_people"] = self._kitchen_cooks(start)
             self._record_active()
 
     def _cook_row(self, cook_id):
@@ -271,21 +283,23 @@ class CookAssistant(hass.Hass):
         rows = [self._tracker.bath, self._tracker.probe, *reversed(self._records)]
         return next((row for row in rows if row.get("id") == cook_id), None)
 
-    def _push_person(self, effect):
+    def _push_people(self, effect):
         row = self._cook_row(effect.get("id"))
-        person = None
+        people = None
         if row is not None:
-            person = row["cook_person"] if "cook_person" in row else self._kitchen_cook(row.get("start"))
-        if person:
-            self.log(f"Cook push to {person} (kitchen_cook)")
-            return person
+            people = stored_people(row)
+            if people is None:
+                people = self._kitchen_cooks(row.get("start"))
+        if people:
+            self.log(f"Cook push to {', '.join(people)} (kitchen_cook)")
+            return people
         self.log(f"Cook push to {FALLBACK_PERSON} (fallback)")
-        return FALLBACK_PERSON
+        return [FALLBACK_PERSON]
 
-    async def _send_push(self, effect, person):
+    async def _send_push(self, effect, people):
         try:
             await self._notifier.notify(title=effect["title"], message=effect.get("message", ""),
-                                        target=[person], category="cook", link=self.push_link,
+                                        target=people, category="cook", link=self.push_link,
                                         data={"data": {"tag": f"cook_{effect.get('id', 'alarm')}_{effect['kind']}",
                                                        "actions": effect.get("actions", [])}})
         except Exception as error:

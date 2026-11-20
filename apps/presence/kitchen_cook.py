@@ -6,22 +6,23 @@ CookAssistant asks it, through cook_for, who to send its pushes to.
 SESSION. Cooking is on while any power sensor reads power_w or more, or the sous vide cooker is
 heating. A session starts when cooking turns on and ends once it has stayed off for END_S.
 
-COOK. A resident counts only while their person entity is home. Over the window from BEFORE_S
+COOKS. A resident counts only while their person entity is home. Over the window from BEFORE_S
 before the session started until now (never more than the last WINDOW_S), each counted resident's
 share is the part of the window their phone's area sensor read the kitchen area. Any other area,
 unknown, unavailable, and the time before the sensor was first recorded all count as elsewhere.
-The cook is the resident whose share is at least MIN_SHARE and at least LEAD times the next
-resident's, else nobody.
+The cooks are all counted residents whose share is at least MIN_SHARE, the largest share first
+(equal shares in config order), so several people can cook at once; nobody reaching it means
+nobody is named.
 
-State is the cook's name in lower case, unknown when nobody is named, or idle without a session.
-Attributes: session_start (ISO, null when idle), shares ({name: share of the window}) and reason:
-leads, too_little (nobody reached MIN_SHARE), no_lead (the best was not LEAD times the next),
-no_one_home or no_session.
+State is the cooks' names in lower case joined with ", " (e.g. "mikkel, kristine"), unknown when
+nobody is named, or idle without a session. Attributes: session_start (ISO, null when idle), cooks
+(the names as a list), shares ({name: share of the window}) and reason: named, too_little (nobody
+reached MIN_SHARE), no_one_home or no_session.
 
 cook_for(start) judges a start at epoch `start` by the same rule over the window from BEFORE_S
-before it to AFTER_S after it, or to now when that is sooner, and returns a name or None. It needs
-no session, so a caller can ask a few minutes after its own start. The phones' history is kept in
-memory: after a restart it begins at each sensor's last change.
+before it to AFTER_S after it, or to now when that is sooner, and returns the names as a list,
+empty when nobody is named. It needs no session, so a caller can ask a few minutes after its own
+start. The phones' history is kept in memory: after a restart it begins at each sensor's last change.
 """
 
 from __future__ import annotations
@@ -40,8 +41,7 @@ AFTER_S = 300
 WINDOW_S = 1200
 END_S = 600
 KEEP_S = 1800
-MIN_SHARE = 0.60
-LEAD = 2.0
+MIN_SHARE = 0.40
 TICK_S = 30
 
 
@@ -126,16 +126,12 @@ def shares(tracks, area, lo, hi):
 
 
 def pick(by_name):
-    """(name or None, reason) from {name: share} by the rule in the module docstring."""
+    """([names], reason) from {name: share} by the rule in the module docstring."""
     if not by_name:
-        return None, "no_one_home"
+        return [], "no_one_home"
     ranked = sorted(by_name.items(), key=lambda item: item[1], reverse=True)
-    name, best = ranked[0]
-    if best < MIN_SHARE:
-        return None, "too_little"
-    if len(ranked) > 1 and best < LEAD * ranked[1][1]:
-        return None, "no_lead"
-    return name, "leads"
+    names = [name for name, share in ranked if share >= MIN_SHARE]
+    return names, "named" if names else "too_little"
 
 
 class KitchenCook(hass.Hass):
@@ -179,25 +175,25 @@ class KitchenCook(hass.Hass):
         self.run_every(self._on_tick, f"now+{TICK_S}", TICK_S)
         self._refresh()
         names = ", ".join(name for name, _, _ in self.residents)
-        self.log(f"KitchenCook initialized: names the cook among {names} while {len(self.power_entities)} power "
+        self.log(f"KitchenCook initialized: names who cooks among {names} while {len(self.power_entities)} power "
                  f"sensors read {self.power_w:g} W or more or {self.cooker_entity} heats -> {self.entity}",
                  level="INFO")
 
     def cook_for(self, start):
-        """The resident who was cooking at epoch `start`, None when the rule names nobody."""
+        """The residents who were cooking at epoch `start`, largest share first; empty when the rule names nobody."""
         start = as_float(start)
         if start is None:
-            return None
+            return []
         lo, hi = start_window(start, self._now())
         with self._lock:
             return self._judge(lo, hi)[0]
 
     def _judge(self, lo, hi):
-        """(name or None, {name: share}, reason) over [lo, hi] for the residents who are home."""
+        """([names], {name: share}, reason) over [lo, hi] for the residents who are home."""
         home = {name: track for name, track in self._tracks.items() if self._home[name]}
         by_name = shares(home, self.kitchen, lo, hi)
-        name, reason = pick(by_name)
-        return name, by_name, reason
+        names, reason = pick(by_name)
+        return names, by_name, reason
 
     def _since(self, entity, now):
         since = epoch_of(self.get_state(entity, attribute="last_changed"))
@@ -232,12 +228,13 @@ class KitchenCook(hass.Hass):
             with self._lock:
                 now = self._now()
                 if self._session.update(now, cooking(self._watts.values(), self._cooker, self.power_w)):
-                    person, by_name, reason = self._judge(*session_window(self._session.start, now))
-                    state, start = person or "unknown", self._session.start
+                    cooks, by_name, reason = self._judge(*session_window(self._session.start, now))
+                    state, start = ", ".join(cooks) or "unknown", self._session.start
                 else:
-                    state, start, by_name, reason = "idle", None, {}, "no_session"
-            attributes = {"session_start": self._iso(start), "shares": {n: round(s, 2) for n, s in by_name.items()},
-                          "reason": reason, "friendly_name": "Kitchen cook", "icon": "mdi:chef-hat"}
+                    state, start, cooks, by_name, reason = "idle", None, [], {}, "no_session"
+            attributes = {"session_start": self._iso(start), "cooks": cooks,
+                          "shares": {n: round(s, 2) for n, s in by_name.items()}, "reason": reason,
+                          "friendly_name": "Kitchen cook", "icon": "mdi:chef-hat"}
             if not force and (state, attributes) == self._published:
                 return
             previous = self._published
