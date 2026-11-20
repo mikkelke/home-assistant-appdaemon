@@ -36,6 +36,7 @@ ArrivalUnlock:
   unlock_fallback: lock.yale
   relock_s: 60
   notify: notify.mobile_app_mikkels_ofx9p
+  alarm_notify: notify.mobile_app_mikkels_ofx9p
   # Defaults to arrival_unlock_log.jsonl beside the module (*_log.jsonl is gitignored).
   # log_file: /conf/apps/security/arrival_unlock_log.jsonl
 
@@ -64,6 +65,7 @@ ArrivalUnlockClaudia:
   unlock_fallback: lock.yale
   relock_s: 60
   notify: notify.mobile_app_claudias_iphone
+  alarm_notify: notify.mobile_app_mikkels_ofx9p
   log_file: /conf/apps/security/arrival_unlock_claudia_log.jsonl
 
 # Kristine's iPhone, same IRK route as Claudia's.
@@ -91,4 +93,5 @@ ArrivalUnlockKristine:
   unlock_fallback: lock.yale
   relock_s: 60
   notify: notify.mobile_app_kristine_iphone_2
+  alarm_notify: notify.mobile_app_mikkels_ofx9p
   log_file: /conf/apps/security/arrival_unlock_kristine_log.jsonl

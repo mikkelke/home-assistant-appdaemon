@@ -45,7 +45,9 @@ UNLOCK. When `unlock_switch` reads on as a window opens, the app calls lock.unlo
 (the lock's Bluetooth entity), or on `unlock_fallback` when that entity is unknown, unavailable or
 missing, and fires lock_unlocked_on_arrival {lock, by: `name`} for HouseEvents' timeline row. An
 unlock gives no push. relock_s later, unless the door has opened since, it locks the same entity
-again when `lock` does not read locked and pushes `notify` when one is set. A second sighting
+again when `lock` does not read locked and pushes `notify` when one is set. When the window
+closes after an unlock that failed, was relocked or saw no door opening, it pushes `alarm_notify`
+"Suspicious arrival" (a relock only when that is not the resident's own `notify`). A second sighting
 inside the window does not unlock again. The arrival line then also carries
 unlock {t, entity, error} and relocked (ISO, null when no relock was needed or made). A failed
 unlock call is logged as a warning and still gets its relock check. The lock's own auto-lock covers
@@ -134,6 +136,7 @@ class ArrivalUnlock(hass.Hass):
             self.person_name = a["name"]
         self.relock_s = float(a.get("relock_s", 60))
         self.notify_service = (a.get("notify") or "").replace(".", "/", 1) or None
+        self.alarm_service = (a.get("alarm_notify") or "").replace(".", "/", 1) or None
         if self.window_s <= 0:
             raise ValueError("ArrivalUnlock: window_s must be positive")
         if self.switch_entity is not None and not 0 < self.relock_s < self.window_s:
@@ -221,11 +224,28 @@ class ArrivalUnlock(hass.Hass):
                  f"unlock, locked {entity} again", level="INFO")
         self._push("Apartment door locked again", f"It was not opened within {self.relock_s:g} s of the unlock.")
 
-    def _push(self, title, message):
-        if self.notify_service is None:
+    def _alarm(self, line):
+        unlock = line.get("unlock")
+        if self.alarm_service is None or unlock is None:
+            return
+        if unlock["error"] is not None:
+            what = f"the unlock failed: {unlock['error']}"
+        elif line["relocked"] is not None:
+            if self.alarm_service == self.notify_service:
+                return
+            what = f"the door was not opened and was locked again after {self.relock_s:g} s"
+        elif line["door_open"] is None:
+            what = "the door contact saw no opening"
+        else:
+            return
+        self._push("Suspicious arrival", f"{self.person_name} at {line['start'][11:16]}: {what}.", self.alarm_service)
+
+    def _push(self, title, message, service=None):
+        service = service or self.notify_service
+        if service is None:
             return
         try:
-            self.call_service(self.notify_service, title=title, message=message)
+            self.call_service(service, title=title, message=message)
         except Exception as e:
             self.log(f"ArrivalUnlock: push {title!a} not sent: {type(e).__name__}: {e}", level="WARNING")
 
@@ -297,6 +317,7 @@ class ArrivalUnlock(hass.Hass):
         if win["unlock"] is not None:
             line["unlock"] = {**win["unlock"], "t": self._iso(win["unlock"]["t"])}
             line["relocked"] = self._iso(win["relocked"])
+        self._alarm(line)
         if self._append(line, f"window {win['id']}"):
             lead = f", lead {line['lead_s']:g} s" if entered else ""
             self.log(f"ArrivalUnlock: window {win['id']} closed, {line['outcome']}{lead} -> {self.log_file.name}",

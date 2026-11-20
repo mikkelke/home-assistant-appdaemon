@@ -896,6 +896,62 @@ class Unlocking(unittest.TestCase):
             make_app(args={"unlock_switch": SWITCH})
 
 
+OWNER = "notify.mobile_app_owner"
+
+
+def alarms(app):
+    return [kw["message"] for _, service, kw in app.calls if service == "notify/mobile_app_owner"]
+
+
+class Alarm(unittest.TestCase):
+    def test_an_unlock_with_the_door_opened_gives_no_alarm(self):
+        app = unlocking_app(args={"alarm_notify": OWNER})
+        sight(app, 0)
+        open_door(app, 20)
+        app.states[LOCK] = "unlocked"
+        advance(app, 400)
+        self.assertEqual(alarms(app), [])
+
+    def test_a_relock_alarms_the_owner(self):
+        app = unlocking_app(args={"alarm_notify": OWNER})
+        sight(app, 0)
+        app.states[LOCK] = "unlocked"
+        advance(app, 400)
+        (message,) = alarms(app)
+        self.assertIn("Claudia at", message)
+        self.assertIn("not opened and was locked again after 60 s", message)
+
+    def test_a_relock_of_the_owner_is_pushed_once(self):
+        app = unlocking_app(args={"alarm_notify": "notify.mobile_app_phone"})
+        sight(app, 0)
+        app.states[LOCK] = "unlocked"
+        advance(app, 400)
+        self.assertEqual([s for _, s, _ in services(app)].count("notify/mobile_app_phone"), 1)
+
+    def test_an_unseen_door_alarms_the_owner(self):
+        app = unlocking_app(args={"alarm_notify": OWNER})
+        sight(app, 0)
+        app.states[LOCK] = "locked"
+        advance(app, 400)
+        (message,) = alarms(app)
+        self.assertIn("the door contact saw no opening", message)
+
+    def test_a_failed_unlock_alarms_the_owner(self):
+        app = unlocking_app(args={"alarm_notify": OWNER})
+        app.fail_service["lock/unlock"] = "timeout"
+        sight(app, 0)
+        app.states[LOCK] = "locked"
+        advance(app, 400)
+        (message,) = alarms(app)
+        self.assertIn("the unlock failed: RuntimeError: timeout", message)
+
+    def test_no_unlock_means_no_alarm(self):
+        app = make_app(args={"alarm_notify": OWNER})
+        sight(app, 0)
+        advance(app, 400)
+        self.assertEqual(alarms(app), [])
+
+
 class Services(unittest.TestCase):
     def test_the_app_calls_only_lock_unlock_lock_its_push_and_the_timeline_event(self):
         tree = ast.parse(Path(au.__file__).read_text(encoding="utf-8"))
@@ -907,7 +963,7 @@ class Services(unittest.TestCase):
         self.assertLessEqual({c.func.attr for c in calls} - own,
                              {"listen_state", "get_state", "run_in", "get_now", "log", "call_service", "fire_event"})
         targets = [ast.unparse(c.args[0]) for c in calls if c.func.attr == "call_service"]
-        self.assertEqual(sorted(targets), ["'lock/lock'", "'lock/unlock'", "self.notify_service"])
+        self.assertEqual(sorted(targets), ["'lock/lock'", "'lock/unlock'", "service"])
 
 
 if __name__ == "__main__":
