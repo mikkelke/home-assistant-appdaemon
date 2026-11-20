@@ -121,7 +121,7 @@ class HouseScenarios(hass.Hass):
             if points:
                 continue
             try:
-                history = self.get_history(entity_id=entity, start_time=now - timedelta(seconds=span))
+                history = self.get_history(entity_id=entity, start_time=now - timedelta(seconds=span), end_time=now)
             except Exception as e:
                 self.log(f"History seed for {entity} failed: {e}", level="WARNING")
                 continue
