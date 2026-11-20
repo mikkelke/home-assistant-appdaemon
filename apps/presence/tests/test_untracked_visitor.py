@@ -191,9 +191,9 @@ class SmallRules(unittest.TestCase):
     def test_texts(self):
         tz = timezone(timedelta(hours=2))
         t = datetime(2026, 10, 21, 13, 53, tzinfo=tz).timestamp()
-        self.assertEqual(uv.started_text("Liga Cleaning", t, tz), "Liga Cleaning unlocked the front door at 13:53")
+        self.assertEqual(uv.started_text("Liga Cleaning", t, tz), "Liga Cleaning unlocked the apartment door at 13:53")
         self.assertEqual(uv.ended_text(uv.QUIET, t, tz, 15, 2),
-                         "Visit ended at 13:53: the front door is closed and the flat has been quiet for 15 min")
+                         "Visit ended at 13:53: the apartment door is closed and the flat has been quiet for 15 min")
         self.assertEqual(uv.ended_text(uv.CAP, t, tz, 15, 2), "Visit ended at 13:53: 2 h limit reached")
         self.assertEqual(uv.ended_text(uv.REPORTED, t, tz, 15, 2), "Visit ended at 13:53: reported by voice")
         self.assertEqual(uv.reported_text(t, tz), "Cleaners reported by voice at 13:53")
@@ -837,7 +837,7 @@ class ReportedByVoice(unittest.TestCase):
         report(app, 1000)
         self.assertEqual(len(app.published), count)
         self.assertEqual(published(app), before)
-        self.assertIn("unlocked the front door", published(app)[1]["reason"])
+        self.assertIn("unlocked the apartment door", published(app)[1]["reason"])
         tick(app, 1000 + QUIET_S - 1)
         self.assertEqual(published(app)[0], "cleaner")
         tick(app, 1000 + QUIET_S)

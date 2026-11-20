@@ -1252,7 +1252,7 @@ class LockHealth(hass.Hass):
     # ---------- notification (entry_truth pattern: awaited + try/except) ----------
     async def _notify(self, message):
         try:
-            await self._notifier.notify(title="Front door", message=message, target=self.notify_target)
+            await self._notifier.notify(title="Apartment door", message=message, target=self.notify_target)
         except Exception as e:
             self.log(f"notify failed: {e}", level="WARNING")
 

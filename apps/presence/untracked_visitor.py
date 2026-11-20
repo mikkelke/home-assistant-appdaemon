@@ -194,7 +194,7 @@ def hhmm(epoch, tz):
 
 
 def started_text(who, epoch, tz):
-    return f"{who} unlocked the front door at {hhmm(epoch, tz)}"
+    return f"{who} unlocked the apartment door at {hhmm(epoch, tz)}"
 
 
 def reported_text(epoch, tz):
@@ -204,7 +204,7 @@ def reported_text(epoch, tz):
 def ended_text(why, epoch, tz, quiet_min, cap_hours, hard_cap_hours=4, mount_min=3):
     cause = {
         MOUNTED: f"the stick vacuum has been back on its mount for {mount_min:g} min",
-        QUIET: f"the front door is closed and the flat has been quiet for {quiet_min:g} min",
+        QUIET: f"the apartment door is closed and the flat has been quiet for {quiet_min:g} min",
         CAP: f"{cap_hours:g} h limit reached",
         HARD_CAP: f"{hard_cap_hours:g} h hard limit reached",
         REPORTED: "reported by voice",

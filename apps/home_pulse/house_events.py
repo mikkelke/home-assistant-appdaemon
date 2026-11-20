@@ -12,15 +12,15 @@ things you can see/hear yourself has no value):
    alone instead ("Kristine started Spotify in Kitchen" - MusicAttribution).
 2. A small set of observed appliance milestones that carry information you can't
    see from the machine itself (finished + energy used; emptied).
-3. Observed lock activity (v3): "Front door unlocked" by Mikkel / "Front door opened
+3. Observed lock activity (v3): "Apartment door unlocked" by Mikkel / "Apartment door opened
    from inside". The authoritative BLE lock entity carries no attribution, so the
    entry is emitted after a short delay and enriched from the cloud twin's
    `changed_by` if that attribute is fresh by then - see `lock_event` and the
    `locks`/`lock_attribution`/`lock_door` app config.
 
-4. Who came in or went out (v6), from sensor.door_entry: the front-door lock row of that
+4. Who came in or went out (v6), from sensor.door_entry: the apartment-door lock row of that
    opening takes the resident in `by`, so an opening stays one row; an opening with no such
-   row (a BLE auto-unlock, a door left on the latch, a guest let in) gets its own "Came home"
+   row (a door left on the latch, a guest let in) gets its own "Came home"
    / "Went out" row. See `entry_groups` and `apply_entry`.
 5. The night (v6): one "Night mode on" row per night from the household night boolean, and
    one "Went to bed" row per resident per night, seen only by that resident (and admins),
@@ -85,7 +85,7 @@ MAX_TEXT_LEN = 120
 # The door contact can report the door opening before the BLE lock reports the thumb-turn.
 DOOR_BEFORE_LOCK_S = 10
 
-# A front-door lock row belongs to the door opening it lies within this many seconds of: it is
+# An apartment-door lock row belongs to the door opening it lies within this many seconds of: it is
 # written lock_report_delay_s after the lock moved, which comes before the door opens when
 # someone unlocks to come in and just before or after it when someone turns the thumb-turn.
 ENTRY_MATCH_BEFORE_S = 90
@@ -230,7 +230,23 @@ def enrich_by(events, appliance, by, now):
     return out
 
 
-def lock_event(name, old, new, changed_by, door_opened=False):
+# Yale's own operator words for an operation no lock user made: "<how> <what>", such as
+# "One-Touch Lock", "Auto Lock", "Bluetooth Unlock" or "Manual Unlock" (yalexs activity.py).
+YALE_HOW = ("Auto", "One-Touch", "Bluetooth", "Manual")
+YALE_WHAT = ("Lock", "Unlock", "Unlatch")
+# The integration's word for an operation made through Home Assistant.
+YALE_HA_OPERATORS = ("Home Assistant", "Home Assistant user", "Home Assistant-bruger")
+# An ArrivalUnlock unlock names the lock row that follows it when the lock moved within this long.
+ARRIVAL_HINT_S = 30
+
+
+def yale_system_operator(who):
+    """True for a changed_by that names how the lock moved rather than who moved it."""
+    parts = who.split()
+    return who in YALE_HA_OPERATORS or (len(parts) == 2 and parts[0] in YALE_HOW and parts[1] in YALE_WHAT)
+
+
+def lock_event(name, old, new, changed_by, door_opened=False, arrival_by=None):
     """Event tuple (icon, text, by) for a lock transition worth telling humans about, or None.
 
     Two kinds of unlock are news:
@@ -239,8 +255,11 @@ def lock_event(name, old, new, changed_by, door_opened=False):
     - the thumb-turn ("Manual Unlock") followed by the door actually opening: someone went
       out (or let someone in) - the only trace a leaving guest leaves. The thumb-turn alone,
       with the door staying shut, is not.
+    - an unlock ArrivalUnlock made for `arrival_by`.
     Everything else is just the door being used: locking (manual or auto) is the steady state
-    the lock always returns to, and an unattributed unlock tells nobody anything.
+    the lock always returns to, and an unattributed unlock tells nobody anything. Yale's own
+    operator words never become `by`: on an unlock a lock word is the previous operation's, left
+    in changed_by because the cloud had not reported this one yet.
     Lock FAILURES are lock_health's job (phone push + its own admin feed entries), not this
     observer's.
     """
@@ -248,12 +267,14 @@ def lock_event(name, old, new, changed_by, door_opened=False):
         return None
     if new != "unlocked":
         return None
+    if arrival_by:
+        return "mdi:lock-open-variant", f"{name} unlocked on arrival", arrival_by
     if not isinstance(changed_by, str) or not changed_by.strip():
         return None
     who = changed_by.strip()[:MAX_TEXT_LEN]
-    if who == "Manual Unlock":
+    if who in ("Manual Unlock", "Manual Unlatch"):
         return ("mdi:door-open", f"{name} opened from inside", None) if door_opened else None
-    if who == "Auto Lock":
+    if yale_system_operator(who):
         return None
     return "mdi:lock-open-variant", f"{name} unlocked", _first_name_if_resident(who)
 
@@ -289,11 +310,11 @@ def _ts(event):
 
 # The lock row an entry kind can name: someone who came in unlocked the door, someone who went out
 # turned the thumb-turn. A guest let in from inside is not named on the row of whoever opened.
-ENTRY_LOCK_TEXTS = {"entered": "{} unlocked", "left": "{} opened from inside"}
+ENTRY_LOCK_TEXTS = {"entered": ("{} unlocked", "{} unlocked on arrival"), "left": ("{} opened from inside",)}
 
 
 def apply_entry(events, lock_names, kind, by, opened_at):
-    """(events, matched): a copy of the newest-first feed in which the front-door lock row of the
+    """(events, matched): a copy of the newest-first feed in which the apartment-door lock row of the
     door opening at `opened_at` (epoch) carries `by` and entry=kind, and whether one was found.
 
     The row must read as that kind (ENTRY_LOCK_TEXTS), lie within ENTRY_MATCH_BEFORE_S before to
@@ -301,7 +322,7 @@ def apply_entry(events, lock_names, kind, by, opened_at):
     dashboard knows a row by its time and text, so a changed text would show it twice in history.
     The lock's own attribution ("One-Touch Lock", a keypad name) gives way to the phones: they say
     who walked through, the lock only who turned it."""
-    texts = {ENTRY_LOCK_TEXTS[kind].format(name) for name in lock_names}
+    texts = {text.format(name) for text in ENTRY_LOCK_TEXTS[kind] for name in lock_names}
     out = list(events)
     for i, event in enumerate(out):
         ts = _ts(event)
@@ -442,8 +463,10 @@ class HouseEvents(hass.Hass):
         # The contact of the door the locks sit on: a thumb-turn only counts once it opened.
         self.lock_door = self.args.get("lock_door")
         self._door_opened_at = None
+        self._arrival_hint = None
         for entity in self.locks:
             self.listen_state(self._on_lock, entity)
+        self.listen_event(self._on_arrival_unlock, "lock_unlocked_on_arrival")
         if self.lock_door:
             self.listen_state(self._on_door_open, self.lock_door, new="on")
 
@@ -506,6 +529,17 @@ class HouseEvents(hass.Hass):
             changed_at=self.get_now().timestamp(),
         )
 
+    def _on_arrival_unlock(self, event_name, data, kwargs):
+        by = data.get("by") if isinstance(data, dict) else None
+        if isinstance(by, str) and by.strip():
+            self._arrival_hint = (self.get_now().timestamp(), by.strip()[:40])
+
+    def _arrival_by(self, changed_at):
+        hint = self._arrival_hint
+        if hint is not None and abs(changed_at - hint[0]) <= ARRIVAL_HINT_S:
+            return hint[1]
+        return None
+
     def _on_door_open(self, entity, attribute, old, new, kwargs):
         self._door_opened_at = self.get_now().timestamp()
 
@@ -519,7 +553,8 @@ class HouseEvents(hass.Hass):
         name = self.locks.get(entity, entity)
         changed_by = self._fresh_changed_by(self.lock_attribution.get(entity))
         door_opened = self._door_opened_since(kwargs["changed_at"])
-        result = lock_event(name, kwargs["old"], kwargs["new"], changed_by, door_opened)
+        result = lock_event(name, kwargs["old"], kwargs["new"], changed_by, door_opened,
+                            self._arrival_by(kwargs["changed_at"]))
         if result:
             icon, text, by = result
             self._add(icon, text, by=by)
@@ -559,7 +594,7 @@ class HouseEvents(hass.Hass):
                 self.events = events
                 self._publish()
                 self._write_state_file()
-                self.log(f"Event: front door row named {by} ({kind})")
+                self.log(f"Event: apartment door row named {by} ({kind})")
             else:
                 self._add(ENTRY_ICON, ENTRY_TEXTS[kind], by=by, entry_kind=kind)
 

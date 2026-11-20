@@ -1139,7 +1139,7 @@ class WeeklyReportPushTests(unittest.TestCase):
         self.app._send_report(SAT)
         self.assertEqual(self.app.notifications, [])
 
-    def test_the_push_is_titled_front_door_and_goes_to_the_notify_target(self):
+    def test_the_push_is_titled_apartment_door_and_goes_to_the_notify_target(self):
         calls = []
 
         class Notifier:
@@ -1151,7 +1151,7 @@ class WeeklyReportPushTests(unittest.TestCase):
         self.app.notify_target = "mikkel"
         self.path.write_text(episode_line(1, "bridge", "bridge_down", "gave_up", ["power_cycle"]) + "\n")
         self.app._send_report(SAT)
-        self.assertEqual(calls, [{"title": "Front door", "message": "Yale uge 46: Bridge nede 1 (opgivet).",
+        self.assertEqual(calls, [{"title": "Apartment door", "message": "Yale uge 46: Bridge nede 1 (opgivet).",
                                   "target": "mikkel"}])
 
     def test_an_unreadable_file_warns_and_sends_nothing(self):

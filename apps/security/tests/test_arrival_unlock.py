@@ -122,8 +122,9 @@ def make_app(args=None, states=None, away_for=3600, missing=(), drop=(), tz=TZ):
             raise RuntimeError(app.fail_service[service])
         app.calls.append((app.clock["now"] - T0, service, kw))
 
-    app.calls, app.fail_service = [], {}
+    app.calls, app.fail_service, app.fired = [], {}, []
     app.call_service = call_service
+    app.fire_event = lambda event, **kw: app.fired.append((app.clock["now"] - T0, event, kw))
     app.get_state = get_state
     app.get_now = lambda: datetime.fromtimestamp(app.clock["now"], tz)
     app._now = lambda: app.clock["now"]
@@ -741,7 +742,7 @@ class Helpers(unittest.TestCase):
 SWITCH = "input_boolean.arrival_unlock_phone"
 BLE = "lock.yale_bt"
 UNLOCKING = {"unlock_switch": SWITCH, "unlock_lock": BLE, "unlock_fallback": KEYPAD,
-             "notify": "notify.mobile_app_phone"}
+             "notify": "notify.mobile_app_phone", "name": "Claudia"}
 
 
 def unlocking_app(states=None, **kw):
@@ -758,8 +759,19 @@ class Unlocking(unittest.TestCase):
         app = unlocking_app()
         sight(app, 5)
         self.assertEqual(services(app), [(5, "lock/unlock", BLE), (5, "notify/mobile_app_phone", None)])
-        self.assertEqual(app.calls[1][2]["title"], "Front door unlocked")
+        self.assertEqual(app.calls[1][2]["title"], "Apartment door unlocked")
         self.assertIn((60, {"wid": 1, "t": T0 + 5, "entity": BLE}), app.scheduled)
+
+    def test_an_unlock_tells_the_timeline_who_arrived(self):
+        app = unlocking_app()
+        sight(app, 5)
+        self.assertEqual(app.fired, [(5, "lock_unlocked_on_arrival", {"lock": BLE, "by": "Claudia"})])
+
+    def test_a_failed_unlock_tells_the_timeline_nothing(self):
+        app = unlocking_app()
+        app.fail_service["lock/unlock"] = "timeout"
+        sight(app, 5)
+        self.assertEqual(app.fired, [])
 
     def test_nothing_is_called_without_the_switch_with_it_off_or_missing_or_when_not_armed(self):
         cases = {"no switch configured": make_app(),
@@ -809,7 +821,7 @@ class Unlocking(unittest.TestCase):
         app.states[LOCK] = "unlocked"
         advance(app, 400)
         self.assertEqual(services(app)[2:], [(60, "lock/lock", BLE), (60, "notify/mobile_app_phone", None)])
-        self.assertEqual(app.calls[3][2]["title"], "Front door locked again")
+        self.assertEqual(app.calls[3][2]["title"], "Apartment door locked again")
         (line,) = lines(app)
         self.assertEqual((line["outcome"], line["relocked"]), ("no_door", iso(60)))
 
@@ -877,7 +889,7 @@ class Unlocking(unittest.TestCase):
 
 
 class Services(unittest.TestCase):
-    def test_the_app_calls_only_lock_unlock_lock_and_its_push(self):
+    def test_the_app_calls_only_lock_unlock_lock_its_push_and_the_timeline_event(self):
         tree = ast.parse(Path(au.__file__).read_text(encoding="utf-8"))
         (cls,) = [node for node in tree.body if isinstance(node, ast.ClassDef)]
         own = {node.name for node in cls.body if isinstance(node, ast.FunctionDef)}
@@ -885,7 +897,7 @@ class Services(unittest.TestCase):
                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                  and isinstance(node.func.value, ast.Name) and node.func.value.id == "self"]
         self.assertLessEqual({c.func.attr for c in calls} - own,
-                             {"listen_state", "get_state", "run_in", "get_now", "log", "call_service"})
+                             {"listen_state", "get_state", "run_in", "get_now", "log", "call_service", "fire_event"})
         targets = [ast.unparse(c.args[0]) for c in calls if c.func.attr == "call_service"]
         self.assertEqual(sorted(targets), ["'lock/lock'", "'lock/unlock'", "self.notify_service"])
 

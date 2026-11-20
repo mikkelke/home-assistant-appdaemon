@@ -1,5 +1,5 @@
 """
-ArrivalUnlock - unlocks the front door when the resident's phone reaches the landing, and records
+ArrivalUnlock - unlocks the apartment door when the resident's phone reaches the landing, and records
 every arrival so the rule can be judged against what really happened. A Bluetooth proxy on the
 landing outside the flat, powered only while the stairwell lights are on, makes Bermuda place the
 resident's phone in the landing's area. One resident per instance. Without `unlock_switch`, or while
@@ -43,7 +43,8 @@ flip, null when it does not exist or is not configured.
 
 UNLOCK. When `unlock_switch` reads on as a window opens, the app calls lock.unlock on `unlock_lock`
 (the lock's Bluetooth entity), or on `unlock_fallback` when that entity is unknown, unavailable or
-missing, and pushes `notify` when one is set. relock_s later, unless the door has opened since, it
+missing, fires lock_unlocked_on_arrival {lock, by: `name`} for HouseEvents' timeline row, and
+pushes `notify` when one is set. relock_s later, unless the door has opened since, it
 locks the same entity again when `lock` does not read locked and pushes that too. A second sighting
 inside the window does not unlock again. The arrival line then also carries
 unlock {t, entity, error} and relocked (ISO, null when no relock was needed or made). A failed
@@ -130,6 +131,7 @@ class ArrivalUnlock(hass.Hass):
         if self.switch_entity is not None:
             self.unlock_entity = a["unlock_lock"]
             self.unlock_fallback = a.get("unlock_fallback") or None
+            self.person_name = a["name"]
         self.relock_s = float(a.get("relock_s", 60))
         self.notify_service = (a.get("notify") or "").replace(".", "/", 1) or None
         if self.window_s <= 0:
@@ -198,7 +200,8 @@ class ArrivalUnlock(hass.Hass):
             return
         self.log(f"ArrivalUnlock: window {wid} opened, phone in {self.landing_area!a}, unlocked {entity}",
                  level="INFO")
-        self._push("Front door unlocked", f"You reached the landing. It locks again in {self.relock_s:g} s "
+        self.fire_event("lock_unlocked_on_arrival", lock=entity, by=self.person_name)
+        self._push("Apartment door unlocked", f"You reached the landing. It locks again in {self.relock_s:g} s "
                                           f"if the door is not opened.")
 
     def _on_relock(self, kwargs):
@@ -218,7 +221,7 @@ class ArrivalUnlock(hass.Hass):
                 self._win["relocked"] = now
         self.log(f"ArrivalUnlock: window {kwargs['wid']}: door not opened {self.relock_s:g} s after the "
                  f"unlock, locked {entity} again", level="INFO")
-        self._push("Front door locked again", f"It was not opened within {self.relock_s:g} s of the unlock.")
+        self._push("Apartment door locked again", f"It was not opened within {self.relock_s:g} s of the unlock.")
 
     def _push(self, title, message):
         if self.notify_service is None:

@@ -73,6 +73,6 @@ def rows(notes, configured):
         at = parse_iso(note["at"])
         clock = at.astimezone(HOUSE_TZ).strftime("%H:%M")
         result.append(make_row(key, "maint", f"{people[note['person']]}'s code used, not home",
-                               f"front door {clock}; phone not home 15 min later", icon="mdi:door-open",
+                               f"apartment door {clock}; phone not home 15 min later", icon="mdi:door-open",
                                audience="admin", tap_done=True, skip_next=True))
     return result

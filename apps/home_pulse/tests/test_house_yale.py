@@ -80,7 +80,7 @@ class YaleNoteTests(unittest.TestCase):
         until(app, NOW + 15 * MIN)
         row, = notes(app)
         self.assertEqual(row["title"], "Kristine's code used, not home")
-        self.assertEqual(row["detail"], "front door 12:30; phone not home 15 min later")
+        self.assertEqual(row["detail"], "apartment door 12:30; phone not home 15 min later")
         self.assertEqual(row["audience"], "admin")
         self.assertEqual(row["done"], "tap")
         self.assertEqual(row["next"], "skip")

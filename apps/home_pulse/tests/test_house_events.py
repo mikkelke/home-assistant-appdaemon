@@ -302,54 +302,73 @@ class LockEventTests(unittest.TestCase):
     # Named unlocks and a thumb-turn the door actually opened after are events; locking,
     # a thumb-turn with the door shut, and unattributed unlocks are not.
     def test_unlocked_with_name(self):
-        icon, text, by = house_events.lock_event("Front door", "locked", "unlocked", "Mikkel")
+        icon, text, by = house_events.lock_event("Apartment door", "locked", "unlocked", "Mikkel")
         self.assertEqual(icon, "mdi:lock-open-variant")
-        self.assertEqual(text, "Front door unlocked")
+        self.assertEqual(text, "Apartment door unlocked")
         self.assertEqual(by, "Mikkel")
 
     def test_resident_full_name_trimmed_to_first_name(self):
-        _, _, by = house_events.lock_event("Front door", "locked", "unlocked", "Mikkel Eskildsen")
+        _, _, by = house_events.lock_event("Apartment door", "locked", "unlocked", "Mikkel Eskildsen")
         self.assertEqual(by, "Mikkel")
 
     def test_non_resident_names_never_clipped(self):
         # Lock code users keep their full wording - "Cleaning" stays valuable and intact.
-        _, _, by = house_events.lock_event("Front door", "locked", "unlocked", "Cleaning")
+        _, _, by = house_events.lock_event("Apartment door", "locked", "unlocked", "Cleaning")
         self.assertEqual(by, "Cleaning")
-        _, _, by = house_events.lock_event("Front door", "locked", "unlocked", "Keypad Code 3")
+        _, _, by = house_events.lock_event("Apartment door", "locked", "unlocked", "Keypad Code 3")
         self.assertEqual(by, "Keypad Code 3")
 
     def test_locking_is_never_an_event(self):
         # The steady state the lock always returns to - auto, manual, or named.
-        self.assertIsNone(house_events.lock_event("Front door", "unlocked", "locked", "Auto Lock"))
-        self.assertIsNone(house_events.lock_event("Front door", "unlocked", "locked", "Mikkel"))
-        self.assertIsNone(house_events.lock_event("Front door", "unlocked", "locked", None))
+        self.assertIsNone(house_events.lock_event("Apartment door", "unlocked", "locked", "Auto Lock"))
+        self.assertIsNone(house_events.lock_event("Apartment door", "unlocked", "locked", "Mikkel"))
+        self.assertIsNone(house_events.lock_event("Apartment door", "unlocked", "locked", None))
 
     def test_thumb_turn_with_door_shut_suppressed(self):
-        self.assertIsNone(house_events.lock_event("Front door", "locked", "unlocked", "Manual Unlock"))
+        self.assertIsNone(house_events.lock_event("Apartment door", "locked", "unlocked", "Manual Unlock"))
 
     def test_thumb_turn_then_door_opened(self):
-        icon, text, by = house_events.lock_event("Front door", "locked", "unlocked", "Manual Unlock", True)
+        icon, text, by = house_events.lock_event("Apartment door", "locked", "unlocked", "Manual Unlock", True)
         self.assertEqual(icon, "mdi:door-open")
-        self.assertEqual(text, "Front door opened from inside")
+        self.assertEqual(text, "Apartment door opened from inside")
         self.assertIsNone(by)
 
     def test_door_opening_never_names_auto_lock(self):
-        self.assertIsNone(house_events.lock_event("Front door", "locked", "unlocked", "Auto Lock", True))
+        self.assertIsNone(house_events.lock_event("Apartment door", "locked", "unlocked", "Auto Lock", True))
 
     def test_unattributed_unlock_suppressed(self):
-        self.assertIsNone(house_events.lock_event("Front door", "locked", "unlocked", None))
-        self.assertIsNone(house_events.lock_event("Front door", "locked", "unlocked", "   "))
+        self.assertIsNone(house_events.lock_event("Apartment door", "locked", "unlocked", None))
+        self.assertIsNone(house_events.lock_event("Apartment door", "locked", "unlocked", "   "))
 
     def test_restart_replay_suppressed(self):
-        self.assertIsNone(house_events.lock_event("Front door", None, "unlocked", "Mikkel"))
-        self.assertIsNone(house_events.lock_event("Front door", "unavailable", "unlocked", "Mikkel"))
+        self.assertIsNone(house_events.lock_event("Apartment door", None, "unlocked", "Mikkel"))
+        self.assertIsNone(house_events.lock_event("Apartment door", "unavailable", "unlocked", "Mikkel"))
 
     def test_non_milestone_states_suppressed(self):
-        self.assertIsNone(house_events.lock_event("Front door", "locked", "jammed", "Mikkel"))
-        self.assertIsNone(house_events.lock_event("Front door", "locked", "locked", "Mikkel"))
+        self.assertIsNone(house_events.lock_event("Apartment door", "locked", "jammed", "Mikkel"))
+        self.assertIsNone(house_events.lock_event("Apartment door", "locked", "locked", "Mikkel"))
+
+    def test_yale_operator_words_never_name_anyone(self):
+        # On an unlock a lock word is the previous operation's (19.11 18:20: "One-Touch Lock").
+        for word in ("One-Touch Lock", "Manual Lock", "Auto Lock", "Bluetooth Unlock", "Bluetooth Lock",
+                     "Home Assistant", "Home Assistant user"):
+            self.assertIsNone(house_events.lock_event("Apartment door", "locked", "unlocked", word), word)
+            self.assertIsNone(house_events.lock_event("Apartment door", "locked", "unlocked", word, True), word)
+
+    def test_lock_users_with_operator_like_names_still_name(self):
+        _, _, by = house_events.lock_event("Apartment door", "locked", "unlocked", "Manual Override Guest")
+        self.assertEqual(by, "Manual Override Guest")
+
+    def test_arrival_unlock_names_the_arriving_resident(self):
+        icon, text, by = house_events.lock_event("Apartment door", "locked", "unlocked", "One-Touch Lock",
+                                                 arrival_by="Claudia")
+        self.assertEqual((icon, text, by), ("mdi:lock-open-variant", "Apartment door unlocked on arrival", "Claudia"))
+
+    def test_arrival_hint_does_not_name_a_lock(self):
+        self.assertIsNone(house_events.lock_event("Apartment door", "unlocked", "locked", None, arrival_by="Claudia"))
 
     def test_attribution_length_capped(self):
-        _, _, by = house_events.lock_event("Front door", "locked", "unlocked", "x" * 500)
+        _, _, by = house_events.lock_event("Apartment door", "locked", "unlocked", "x" * 500)
         self.assertLessEqual(len(by), house_events.MAX_TEXT_LEN)
 
     def test_report_by_passthrough(self):
@@ -390,10 +409,11 @@ class DoorOpenedFromInsideTests(unittest.TestCase):
 
     def make_feed(self):
         feed = house_events.HouseEvents()
-        feed.locks = {"lock.yale_bt": "Front door"}
+        feed.locks = {"lock.yale_bt": "Apartment door"}
         feed.lock_attribution = {"lock.yale_bt": "lock.yale"}
         feed.lock_door = "binary_sensor.apartment_door_open"
         feed._door_opened_at = None
+        feed._arrival_hint = None
         feed.lock_report_delay_s = 20
         feed.lock_attribution_fresh_s = 180
         feed.events = []
@@ -424,13 +444,34 @@ class DoorOpenedFromInsideTests(unittest.TestCase):
         return [e["text"] for e in feed.events]
 
     def test_door_opening_just_before_the_unlock_reported(self):
-        self.assertEqual(self.run_night(-2), ["Front door opened from inside"])
+        self.assertEqual(self.run_night(-2), ["Apartment door opened from inside"])
 
     def test_door_opening_after_the_unlock_reported(self):
-        self.assertEqual(self.run_night(5), ["Front door opened from inside"])
+        self.assertEqual(self.run_night(5), ["Apartment door opened from inside"])
 
     def test_door_left_shut_not_reported(self):
         self.assertEqual(self.run_night(None), [])
+
+    def run_arrival(self, hint_offset_s, cloud="One-Touch Lock"):
+        feed = self.make_feed()
+        cloud_at = (self.UNLOCK + timedelta(seconds=2)).isoformat()
+        feed.get_state = lambda entity, attribute=None: {"attributes": {"changed_by": cloud}, "last_updated": cloud_at}
+        feed.clock = self.UNLOCK + timedelta(seconds=hint_offset_s)
+        feed._on_arrival_unlock("lock_unlocked_on_arrival", {"lock": "lock.yale_bt", "by": "Claudia"}, {})
+        feed.clock = self.UNLOCK
+        feed._on_lock("lock.yale_bt", "state", "locked", "unlocked", {})
+        feed.clock = self.UNLOCK + timedelta(seconds=20)
+        cb, kw = feed.scheduled[0]
+        cb(kw)
+        return [(e["text"], e.get("by")) for e in feed.events]
+
+    def test_arrival_unlock_row_names_the_resident_not_the_cloud_word(self):
+        # Replays 19.11 18:20: ArrivalUnlockClaudia unlocked 2 s before the BLE lock reported it,
+        # while the cloud twin still read the previous operation's "One-Touch Lock".
+        self.assertEqual(self.run_arrival(-2), [("Apartment door unlocked on arrival", "Claudia")])
+
+    def test_a_stale_arrival_hint_names_nobody(self):
+        self.assertEqual(self.run_arrival(-120), [])
 
     def test_an_earlier_opening_not_pinned_on_this_unlock(self):
         self.assertEqual(self.run_night(-7200), [])
@@ -455,35 +496,41 @@ class ApplyEntryTests(unittest.TestCase):
     OPENED = NOW - timedelta(seconds=30)
 
     def apply(self, events, kind="entered", by="Claudia"):
-        return house_events.apply_entry(events, ["Front door"], kind, by, self.OPENED.timestamp())
+        return house_events.apply_entry(events, ["Apartment door"], kind, by, self.OPENED.timestamp())
+
+    def test_an_arrival_unlock_row_is_the_entered_row(self):
+        events = [lock_row("Apartment door unlocked on arrival", self.OPENED - timedelta(seconds=5), by="Claudia")]
+        out, matched = self.apply(events)
+        self.assertTrue(matched)
+        self.assertEqual(out[0]["entry"], "entered")
 
     def test_an_unlock_row_of_that_opening_takes_the_name_and_keeps_its_text(self):
-        events = [lock_row("Front door unlocked", self.OPENED - timedelta(seconds=5), by="One-Touch Lock"),
+        events = [lock_row("Apartment door unlocked", self.OPENED - timedelta(seconds=5), by="One-Touch Lock"),
                   row("Washer emptied", 4000)]
         out, matched = self.apply(events)
         self.assertTrue(matched)
-        self.assertEqual(out[0]["text"], "Front door unlocked")
+        self.assertEqual(out[0]["text"], "Apartment door unlocked")
         self.assertEqual((out[0]["by"], out[0]["entry"]), ("Claudia", "entered"))
         self.assertEqual(out[1], events[1])
         self.assertNotIn("entry", events[0])
 
     def test_going_out_names_the_thumb_turn_row(self):
-        events = [lock_row("Front door opened from inside", self.OPENED + timedelta(seconds=22))]
+        events = [lock_row("Apartment door opened from inside", self.OPENED + timedelta(seconds=22))]
         out, matched = self.apply(events, kind="left", by="Mikkel")
         self.assertTrue(matched)
         self.assertEqual(out[0]["by"], "Mikkel")
 
     def test_a_guest_let_in_from_inside_is_not_named_on_the_openers_row(self):
-        events = [lock_row("Front door opened from inside", self.OPENED + timedelta(seconds=20))]
+        events = [lock_row("Apartment door opened from inside", self.OPENED + timedelta(seconds=20))]
         out, matched = self.apply(events, kind="entered")
         self.assertFalse(matched)
         self.assertEqual(out, events)
 
     def test_rows_outside_the_window_or_already_named_are_left(self):
         for events in (
-            [lock_row("Front door unlocked", self.OPENED - timedelta(seconds=91))],
-            [lock_row("Front door unlocked", self.OPENED + timedelta(seconds=61))],
-            [lock_row("Front door unlocked", self.OPENED, by="Kristine", entry="entered")],
+            [lock_row("Apartment door unlocked", self.OPENED - timedelta(seconds=91))],
+            [lock_row("Apartment door unlocked", self.OPENED + timedelta(seconds=61))],
+            [lock_row("Apartment door unlocked", self.OPENED, by="Kristine", entry="entered")],
             [row("Washer emptied", 30)],
         ):
             with self.subTest(events=events):
@@ -495,7 +542,7 @@ class DoorEntryListenerTests(unittest.TestCase):
 
     def make_feed(self, events, attrs):
         feed = house_events.HouseEvents()
-        feed.locks = {"lock.yale_bt": "Front door"}
+        feed.locks = {"lock.yale_bt": "Apartment door"}
         feed.events = list(events)
         feed.get_state = lambda entity, attribute=None: {"attributes": attrs}
         feed.get_now = lambda: NOW
@@ -509,7 +556,7 @@ class DoorEntryListenerTests(unittest.TestCase):
                 "decided_at": decided.isoformat()}
 
     def test_a_named_lock_row_stays_one_row(self):
-        feed = self.make_feed([lock_row("Front door unlocked", self.OPENED - timedelta(seconds=3))],
+        feed = self.make_feed([lock_row("Apartment door unlocked", self.OPENED - timedelta(seconds=3))],
                               self.attrs(entered=["Claudia"]))
         feed._on_door_entry("sensor.door_entry", "decided_at", None, "x", {})
         self.assertEqual(len(feed.events), 1)

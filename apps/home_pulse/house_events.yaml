@@ -13,13 +13,13 @@ HouseEvents:
   # Lock feed entries read from the BLE entity (authoritative - see yale-lock notes);
   # "by <name>" enrichment comes from the cloud twin's changed_by when fresh.
   locks:
-    lock.yale_bt: Front door
+    lock.yale_bt: Apartment door
   lock_attribution:
     lock.yale_bt: lock.yale
   lock_door: binary_sensor.apartment_door_open
   # Rows worked out afterwards from the recorder (house_events_backfill.json on the box, not in git).
   backfill_entity: sensor.house_events_backfill
-  # Who came in or went out: names the front-door row of that opening, or adds its own.
+  # Who came in or went out: names the apartment-door row of that opening, or adds its own.
   door_entry: sensor.door_entry
   # One "Night mode on" row per night, and one "Went to bed" row per sleeper per night, seen by
   # that sleeper only (admin_sleepers: admins only), left out when it fell with the night row.

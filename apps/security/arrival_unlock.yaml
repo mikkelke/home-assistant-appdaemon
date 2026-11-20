@@ -1,5 +1,5 @@
 # /conf/apps/security/arrival_unlock.yaml
-# Unlocks the front door when the resident's phone reaches the landing, while that resident's
+# Unlocks the apartment door when the resident's phone reaches the landing, while that resident's
 # unlock_switch is on, and locks it again after relock_s when the door was not opened. With the
 # switch off it only measures. Either way it writes one JSON line per window (did the door open, how
 # soon) and one per arrival that no window caught. See arrival_unlock.py's module docstring.
@@ -30,6 +30,8 @@ ArrivalUnlock:
   window_s: 180
 
   unlock_switch: input_boolean.arrival_unlock_mikkel
+  # Who the timeline's unlock row names.
+  name: Mikkel
   unlock_lock: lock.yale_bt
   unlock_fallback: lock.yale
   relock_s: 60
@@ -57,6 +59,7 @@ ArrivalUnlockClaudia:
   window_s: 180
 
   unlock_switch: input_boolean.arrival_unlock_claudia
+  name: Claudia
   unlock_lock: lock.yale_bt
   unlock_fallback: lock.yale
   relock_s: 60
@@ -83,6 +86,7 @@ ArrivalUnlockKristine:
   window_s: 180
 
   unlock_switch: input_boolean.arrival_unlock_kristine
+  name: Kristine
   unlock_lock: lock.yale_bt
   unlock_fallback: lock.yale
   relock_s: 60

@@ -649,9 +649,7 @@ class SonosStateReset(hass.Hass):
         """True when the speaker deviates from its default state: grouped, muted, or off its
         configured default volume. Lets _do_reset skip speakers (and whole resets) that would
         change nothing. A no-op reset is not free - it pauses GroupManager and follow_me for
-        the full ceremony and drops a feed entry that reads like a duplicate (user hit exactly
-        this 2026-07-16: a TV-triggered reset at 20:12 and an idle-timeout reset at 20:15,
-        the second restoring nothing). Fail-open: unreadable state -> reset as before."""
+        the full ceremony. Fail-open: unreadable state -> reset as before."""
         try:
             if not self._speaker_is_solo(sp):
                 return True
@@ -846,34 +844,6 @@ class SonosStateReset(hass.Hass):
                            targets=targets,
                            trigger=trigger,
                            source=source)
-            # Explain the invisible cleanup to the dashboard's Home activity feed
-            # (admin audience - housekeeping Mikkel cares about, housemates don't).
-            # Names, not counts: two resets minutes apart ("living room speaker after the
-            # TV grabbed it" / "rooftop speaker idle 5 min") read as a duplicate-event bug
-            # when both just say "1 speaker" (user hit exactly this 2026-07-16 20:12/20:15).
-            try:
-                rooms = [self._speaker_room_label(t) for t in targets] if isinstance(targets, (list, tuple)) else []
-                if len(rooms) > 3:
-                    rooms_txt = ", ".join(rooms[:3]) + f" + {len(rooms) - 3} more"
-                else:
-                    rooms_txt = ", ".join(rooms) if rooms else "Speaker"
-                plural_s = "s" if len(rooms) != 1 else ""
-                if trigger == "auto_trigger":
-                    # source here is the idle entity itself, not a human string - say the rule.
-                    cause = f"{rooms_txt} speaker{plural_s} idle for {int(self.inactivity_sec // 60)} min"
-                elif isinstance(source, str) and source.strip() and not source.startswith("media_player."):
-                    cause = source.strip()[:120]
-                else:
-                    cause = "Speaker reset requested"
-                self.fire_event(
-                    "house_events_report",
-                    cause=cause,
-                    effect=f"{rooms_txt} speaker{plural_s} back to default volume and ungrouped",
-                    icon="mdi:speaker-multiple",
-                    audience="admin",
-                )
-            except Exception:
-                pass
         finally:
             self._clear_reset_wedge_timer()
             self._active_reset_ctx = None
@@ -883,12 +853,6 @@ class SonosStateReset(hass.Hass):
             if isinstance(targets, (list, tuple)):
                 for t in targets:
                     self._clear_inactive_since(t)
-
-    @staticmethod
-    def _speaker_room_label(entity):
-        """media_player.living_room -> 'Living room' (for the feed entry)."""
-        name = str(entity).split(".", 1)[-1]
-        return name.replace("_", " ").strip().capitalize()
 
     def _safe_call_service(self, service, **kwargs):
         """Call service with error handling"""
