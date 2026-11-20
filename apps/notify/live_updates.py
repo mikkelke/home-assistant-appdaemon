@@ -412,6 +412,14 @@ def laundry_audience(previous, cycle, starter, enabled, home, now=None):
     return result
 
 
+def coffee_audience(full, enabled, home):
+    """The brew's notify target once the coffee app has named it ("none" = nobody), else enabled people home."""
+    target = attributes(full).get("notify")
+    if isinstance(target, str) and target:
+        return [target] if target in enabled else []
+    return [person for person in enabled if person in home]
+
+
 def card_changed(previous, card):
     if not isinstance(previous, Card):
         previous = stored_card(previous)
@@ -583,7 +591,10 @@ class LiveUpdates(hass.Hass):
             for source, cards in source_cards.items():
                 cards = self._retained(source, full[source], cards, now)
                 for tag, card in cards.items():
-                    desired[tag] = (card, self._services(self._audience(source, tag)))
+                    audience = self._audience(source, tag)
+                    if source == "coffee":
+                        audience = coffee_audience(full["coffee"], audience, home)
+                    desired[tag] = (card, self._services(audience))
             apartment = full["apartment"]
             if isinstance(apartment, dict) and apartment.get("state") == "on":
                 at = epoch(apartment.get("last_changed"))

@@ -18,6 +18,8 @@ LiveUpdates:
 
   # Independent bath/probe cards support cooking both at once. Coffee's published brewing phase
   # includes heating; eta appears when the source has an estimate. Finished phases clear the card.
+  # The coffee card goes to the brew's notify target ("none" = nobody) once CoffeeMachine names it, before
+  # that to coffee_people who are home; either way only people in coffee_people.
   cook_entity: sensor.cook_state
   coffee_entity: sensor.coffee_state
   cook_people: [mikkel]

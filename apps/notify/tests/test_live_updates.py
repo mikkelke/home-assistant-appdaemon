@@ -236,6 +236,16 @@ class LiveUpdateIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(h.ongoing(TAGS["coffee"]), [])
         self.assertEqual(h.ongoing(TAGS["apartment"]), [])
 
+    async def test_coffee_card_follows_the_brews_notify_target(self):
+        for notify, home, expected in (("claudia", "home", 0), ("none", "home", 0), ("mikkel", "not_home", 1),
+                                       (None, "home", 1), (None, "not_home", 0)):
+            self.path.unlink(missing_ok=True)
+            brew = coffee()
+            if notify is not None:
+                brew["attributes"]["notify"] = notify
+            h = await self.make(states={ENTITIES["coffee"]: brew, "person.mikkel": full(home)})
+            self.assertEqual(len(h.ongoing(TAGS["coffee"])), expected, (notify, home))
+
     async def test_restart_does_not_resend_unchanged_active_cards_for_each_source(self):
         fixtures = (("washer", laundry(), TAGS["washer"]), ("dryer", laundry("dryer"), TAGS["dryer"]),
                     ("cook", bath(), TAGS["bath"]), ("cook", probe(), TAGS["probe"]),
