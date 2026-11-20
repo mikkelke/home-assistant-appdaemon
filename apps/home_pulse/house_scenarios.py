@@ -12,6 +12,7 @@ backfill_entity.
 """
 
 import json
+from datetime import timedelta
 from pathlib import Path
 
 import appdaemon.plugins.hass.hassapi as hass  # type: ignore
@@ -110,29 +111,34 @@ class HouseScenarios(hass.Hass):
 
     def _seed(self):
         """Readings from Home Assistant's history for a signal with none of its own, as after a first start."""
+        now = self.get_now()
         seeds = [("night", None, self.night_entity, KEEP_S)]
         seeds += [("machines", k, e, KEEP_S) for k, e in self.machine_entities.items()]
         seeds += [("power", k, e, SEED_POWER_S) for k, e in self.power_entities.items()]
         seeds += [("areas", k, e, KEEP_S) for k, e in self.area_entities.items()]
         for kind, key, entity, span in seeds:
-            points = self._points(kind, key)
-            if points:
+            if self._points(kind, key):
                 continue
-            try:
-                # With entity_id AppDaemon ignores end_time, and a start_time alone reads one day: `days` reads to now.
-                history = self.get_history(entity_id=entity, days=max(1, -(-span // 86400)))
-            except Exception as e:
-                self.log(f"History seed for {entity} failed: {e}", level="WARNING")
-                continue
-            for state in (history[0] if history else []):
-                t = core.epoch(state.get("last_changed"))
-                if t is not None:
-                    self._add(kind, key, t, state.get("state"))
+            # With an entity_id AppDaemon ignores end_time, and Home Assistant reads one day from a start_time,
+            # so the window is read a day at a time.
+            for day in range(-(-span // 86400)):
+                start = now - timedelta(seconds=span - day * 86400)
+                try:
+                    history = self.get_history(entity_id=entity, start_time=start)
+                except Exception as e:
+                    self.log(f"History seed for {entity} failed: {e}", level="WARNING")
+                    break
+                for state in (history[0] if history else []):
+                    t = core.epoch(state.get("last_changed"))
+                    if t is not None and t <= now.timestamp():
+                        self._add(kind, key, t, state.get("state"))
 
     def _add(self, kind, key, t, value):
         if value in (None, "unknown", "unavailable"):
             return False
         points = self._points(kind, key)
+        if points and t < points[-1][0]:
+            return False
         if kind == "power":
             return power_point(points, t, value, core.POWER_THRESHOLDS.get(key, 0.0))
         return append_point(points, t, value)
