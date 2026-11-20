@@ -2,8 +2,8 @@
 and the house's own sessions by scenarios_core (door visits, nights, machine runs, cooking).
 
 Observer only. Each change of the feed or of a signal entity rebuilds the scenarios a few seconds later from
-the rows and signal readings of the last KEEP_S, kept in memory and in house_scenarios_state.json beside this
-module, and publishes the ones still going on or ended within PUBLISH_S:
+the rows and signal readings of the last KEEP_S (rows kept in house_scenarios_state.json beside this module,
+readings read back from Home Assistant's history at each start), and publishes the ones still going on or ended within PUBLISH_S:
     attributes.scenarios: oldest first, scenarios_core's dicts
     state: how many are going on
 The recorder keeps every published state, so older scenarios are read back from its history, and the days
@@ -97,28 +97,21 @@ class HouseScenarios(hass.Hass):
         return self.signals[kind] if key is None else self.signals[kind][key]
 
     def _load(self):
+        """The rows kept from earlier feeds; the signals are read back from Home Assistant's history instead."""
         try:
             saved = json.loads(self.state_file.read_text())
         except (OSError, ValueError):
             return
         self._take_rows(saved.get("rows"))
-        for kind in ("night",):
-            self.signals[kind] = [tuple(p) for p in saved.get("signals", {}).get(kind) or []]
-        for kind in ("machines", "power", "areas"):
-            stored = saved.get("signals", {}).get(kind) or {}
-            for key in self.signals[kind]:
-                self.signals[kind][key] = [tuple(p) for p in stored.get(key) or []]
 
     def _seed(self):
-        """Readings from Home Assistant's history for a signal with none of its own, as after a first start."""
+        """Each signal's readings over its window, from Home Assistant's history."""
         now = self.get_now()
         seeds = [("night", None, self.night_entity, KEEP_S)]
         seeds += [("machines", k, e, KEEP_S) for k, e in self.machine_entities.items()]
         seeds += [("power", k, e, SEED_POWER_S) for k, e in self.power_entities.items()]
         seeds += [("areas", k, e, KEEP_S) for k, e in self.area_entities.items()]
         for kind, key, entity, span in seeds:
-            if self._points(kind, key):
-                continue
             # With an entity_id AppDaemon ignores end_time, and Home Assistant reads one day from a start_time,
             # so the window is read a day at a time.
             for day in range(-(-span // 86400)):
@@ -190,7 +183,7 @@ class HouseScenarios(hass.Hass):
 
     def _save(self):
         try:
-            self.state_file.write_text(json.dumps({"rows": list(self.rows.values()), "signals": self.signals}))
+            self.state_file.write_text(json.dumps({"rows": list(self.rows.values())}))
         except OSError as e:
             self.log(f"Saving {self.state_file.name} failed: {e}", level="WARNING")
 
