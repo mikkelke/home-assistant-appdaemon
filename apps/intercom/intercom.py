@@ -725,16 +725,18 @@ class Intercom(hass.Hass):
 
         # Tell the house feed (dashboard's activity log). Guarded and after the TTS attempt:
         # the feed is cosmetic, the intercom is not - a feed problem must never block a ring.
-        try:
-            effect = "Announcing on the speakers and opening the door" if auto_open_enabled else "Announcing on the speakers"
-            self.fire_event(
-                "house_events_report",
-                cause=f"Someone rang the {info.get('ring_label', 'door')}",
-                effect=effect,
-                icon="mdi:bell-ring",
-            )
-        except Exception as e:
-            self.log(f"house_events_report failed: {e}", level="DEBUG")
+        # A ring the intercom opens gets its one row from the outcome instead (opened after N s,
+        # or the auto-open failure), so a ring is one row.
+        if not auto_open_enabled:
+            try:
+                self.fire_event(
+                    "house_events_report",
+                    cause=f"Someone rang the {info.get('ring_label', 'door')}",
+                    effect="Announcing on the speakers",
+                    icon="mdi:bell-ring",
+                )
+            except Exception as e:
+                self.log(f"house_events_report failed: {e}", level="DEBUG")
 
     def _courier_message(self, info, auto_open_enabled):
         """The words for this ring while a courier is due at the door, else None and
@@ -1286,10 +1288,20 @@ class Intercom(hass.Hass):
                 except Exception as e:
                     self.log(f"Auto-open success notification failed: {e}", level="WARNING")
 
-        # No feed entry for a CONFIRMED auto-open (removed 2026-07-24): the ring-time
-        # "Announcing on the speakers and opening the door" line already told the story,
-        # and success is the expected outcome. Only FAILURE is feed-worthy - see
-        # _report_auto_open_failure, which has its own entry.
+        # The ring's one feed row: who rang, and how long the door took to open.
+        try:
+            ring_ts = outcome.get("ring_ts")
+            after = None
+            if isinstance(ring_ts, datetime):
+                after = max(0, int(round((self.get_now() - ring_ts).total_seconds())))
+            self.fire_event(
+                "house_events_report",
+                cause=f"Someone rang the {ring_label}",
+                effect=f"Opened after {after} s" if after is not None else "Opened",
+                icon="mdi:bell-ring",
+            )
+        except Exception as e:
+            self.log(f"house_events_report failed: {e}", level="DEBUG")
 
     def _report_auto_open_failure(self, trigger_entity, lock_entity, outcome):
         """All unlock attempts for a ring failed: log, mobile-notify, house feed."""

@@ -1022,6 +1022,18 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
                                       {"ring_label": "front door"}, 1)
         self.assertEqual(len(app.pushes), 1)
 
+    def test_a_confirmed_auto_open_is_the_ring_s_one_feed_row(self):
+        app = self._bare_intercom()
+        app.get_app = lambda name: None
+        ring = datetime(2026, 11, 19, 20, 10, 2)
+        app.get_now = lambda: ring + timedelta(seconds=5.4)
+        rows = []
+        app.fire_event = lambda name, **kw: rows.append((name, kw))
+        app._report_auto_open_success("binary_sensor.front", "lock.front",
+                                      {"ring_label": "front door", "ring_ts": ring}, 1)
+        self.assertEqual(rows, [("house_events_report", {"cause": "Someone rang the front door",
+                                                         "effect": "Opened after 5 s", "icon": "mdi:bell-ring"})])
+
     def test_bridge_absent_push_goes_out_as_today(self):
         app = self._bare_intercom()
         app.get_app = lambda name: None
@@ -3268,6 +3280,13 @@ class DoorOpenFeedTests(unittest.TestCase):
         self.assertEqual(reports[0]["cause"], "Someone rang the front door")
         self.assertEqual(reports[0]["effect"], "The door was opened for them")
         self.assertEqual(reports[0]["icon"], "mdi:door-open")
+
+    def test_opening_for_a_ring_the_intercom_opens_writes_no_second_row(self):
+        self.app.states[("input_boolean.auto_open_intercom", None)] = "on"
+        self.app._register_ring("esp", "front door", "", self.clock.at, "esp:test")
+        self.clock.at += timedelta(seconds=5)
+        self._unlock()
+        self.assertEqual(self._door_open_reports(), [])
 
     def test_opening_with_no_ring_emits_no_ring_wording(self):
         self._unlock()

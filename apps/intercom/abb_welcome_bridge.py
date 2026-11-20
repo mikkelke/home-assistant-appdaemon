@@ -1235,6 +1235,8 @@ class AbbWelcomeBridge(hass.Hass):
                 return  # same opening as the previous edge - already reported
             label = door or "door"
             if self._door_had_ring(door, now):
+                if self.get_state(self.auto_open_entity) == "on":
+                    return  # intercom.py's ring row already says the door opened, and after how long
                 cause = f"Someone rang the {label}"
                 effect = "The door was opened for them"
             else:
