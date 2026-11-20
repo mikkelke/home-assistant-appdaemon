@@ -1,0 +1,23 @@
+# HouseScenarios - sensor.house_scenarios: the timeline's rows and the house's own sessions narrowed into what
+# was going on (door visits, nights, machine runs, cooking). Observer only. See house_scenarios.py and
+# scenarios_core.py.
+HouseScenarios:
+  module: house_scenarios
+  class: HouseScenarios
+  feed_entity: sensor.house_events
+  scenarios_entity: sensor.house_scenarios
+  # Scenarios worked out afterwards from the recorder (house_scenarios_backfill.json on the box, not in git).
+  backfill_entity: sensor.house_scenarios_backfill
+  night_entity: input_boolean.house_night_mode
+  machines:
+    washer: sensor.washer_state
+    dryer: sensor.dryer_state
+    dish: sensor.dishwasher_state
+  power:
+    hob: sensor.hotplate_power_monitor_total_active_power
+    oven: sensor.oven_plug_switch_0_power
+  # Who was in the kitchen while cooking: each resident's phone area from Bermuda.
+  areas:
+    Mikkel: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area
+    Claudia: sensor.claudias_iphone_ble_area
+    Kristine: sensor.kristines_iphone_ble_area
