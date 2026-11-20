@@ -44,6 +44,7 @@ resident outcomes and tests for the first eight groups. Read it before changing 
 | [LockHealth](../apps/security/lock_health.py) -> [EntryTruth](../apps/security/entry_truth.py) | `sensor.apartment_lock` -> `binary_sensor.apartment_entry_secure` | Distinguishes effective lock state from a securely closed entrance. |
 | [Appliance monitors](../apps/appliances/README_appliance_state_entities.md) | `sensor.washer_state`, `sensor.dryer_state`, `sensor.dishwasher_state` and attributes | Dashboard progress, completion reminders, activity feed, maintenance and learning. |
 | [Coffee publishing](../apps/coffee/coffee_publish.py) | Seven versioned `sensor.coffee_*` entities | [Dashboard contract](../../home-assistant-hakit-dashboard/src/coffee/entities.ts) and resident commands. |
+| [RainNow](../apps/weather/rain_now.py) | `binary_sensor.raining` | The one "is it raining": measured rate, never the bare piezo contact. Lights' gloomy sky, the opening alert, the room displays and the dashboard sky read it; [weather contract](../apps/weather/README.md). |
 | [WeatherOpeningAlert](../apps/weather/weather_opening_alert.py) | `weather_opening_alert_*` entities | Opening-risk messages, pushes and dashboard alerts; [weather contract](../apps/weather/README.md). |
 | [HouseEvents](../apps/home_pulse/house_events.py) | `sensor.house_events`, `house_events_report` event | Explains meaningful cause/effect and reliable human attribution. |
 | [HouseUpcoming](../apps/home_pulse/house_upcoming.py) | `sensor.house_upcoming`, [row schema](../apps/home_pulse/upcoming_core.py) | Upcoming maintenance, train and rain needs; daily maintenance reminder from the same conditions; ice in the terrace ice bath (a rooftop row, and one push a day to Claudia). |
@@ -125,7 +126,7 @@ would be an inaccurate model. Changes to shared advice must trace both implement
 
 ### 3. Rain approaches an open terrace door or window
 
-Weather + contact + exposure -> [opening-risk decision](../apps/weather/weather_opening_alert.py)
+Rain ([RainNow](../apps/weather/rain_now.py)) + contact + exposure -> [opening-risk decision](../apps/weather/weather_opening_alert.py)
 -> alert/reminder. Forecast rain and open-door context also feed
 [HouseUpcoming](../apps/home_pulse/house_upcoming.py). Closing the opening is a resident task.
 Weather exposure belongs to weather; thermal consequences belong to climate.

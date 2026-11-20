@@ -54,6 +54,8 @@ The UI can merge `weather_opening_alert_priority` with climate alarm state to de
 - **Window:** Open window + sustained rain + wind from exposure band (±30° around bearing) + minimum wind speed/gust.
 - **Cold-opening (Phase 2, `climate/`):** Room below thermostat threshold + related opening open for a sustained period. **Do not** use `sensor.temperture_difference` for this (bedroom sensor disagreement, not “cold from opening”).
 
+Rain in both rules is `binary_sensor.raining`, the house's one rain flag ([RainNow](weather/rain_now.py)): measured rate, never the bare piezo contact.
+
 **Numeric thresholds and debounce** for rain/wind alerts: authoritative values live in the app config [`weather_opening_alert.yaml`](weather/weather_opening_alert.yaml).
 
 ---

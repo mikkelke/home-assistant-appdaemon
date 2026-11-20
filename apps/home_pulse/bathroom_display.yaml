@@ -60,11 +60,11 @@ BathroomDisplay:
   measured_entity: sensor.mikkel_last_measurement
   weight_entity: sensor.mikkel_weight
   body_fat_entity: sensor.mikkel_body_fat
-  # On the way out, 06:00-12:00: "Raining now" while the roof station's rain rate is >= 0.5 mm/h, else the first
+  # On the way out, 06:00-12:00: "Raining now" while binary_sensor.raining is on, else the first
   # run of forecast hours with rain in the next 4 hours ("Rain 09-11", or "Rain from 09" when it goes on
   # past them). Monday to Friday the line also tells of rain on the way home, 16:00-20:00 ("Rain 09-11 ·
   # home 17-19"). The hourly forecast is fetched at most every 30 minutes, and only while it is wanted.
-  rain_entity: sensor.gw2000a_rain_rate_piezo
+  rain_entity: binary_sensor.raining
   weather_entity: weather.forecast_home
   # The wake-up alarm line. Tapping it on the display fires alarm_event, which toggles alarm_entity.
   alarm_entity: input_boolean.wakeup_bedroom
@@ -95,7 +95,7 @@ BedroomDisplay:
     - media_player.bedroom_tv
     - media_player.bedroom
     - media_player.bedroom_2
-  rain_entity: sensor.gw2000a_rain_rate_piezo
+  rain_entity: binary_sensor.raining
   weather_entity: weather.forecast_home
   alarm_entity: input_boolean.wakeup_bedroom
   alarm_time_entity: input_datetime.wakeup_bedroom

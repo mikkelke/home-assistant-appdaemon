@@ -4,6 +4,7 @@ import asyncio
 import sys
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -377,29 +378,88 @@ class FacadeWindDirectionSource(unittest.TestCase):
         self.assertNotIn(self.MEAN, listened)
 
 
-class RainGateUsesTheRateNotTheContact(unittest.TestCase):
-    """This app was already right about rain, and must stay right: it gates on the piezo RATE.
+class RainGateUsesTheSharedRainFlag(unittest.TestCase):
+    """This app asks "is it raining?" of binary_sensor.raining (RainNow) and of nothing else.
 
     binary_sensor.gw2000a_rain_state_piezo is an impact detector, not a rain sensor - over the
     60 days to 2026-08-12 it reported 375 episodes / 142 h of "rain", 298 of which produced
     0.0 mm/h and never moved the accumulator by a single 0.1 mm tick. Terrace door 1 alone
     stood open for 1533 of those contact-on minutes. Had this app believed the contact, 1467
     of them would have announced "rain on the roof" over Sonos and pushed every phone in the
-    house, for weather that was not happening.
+    house, for weather that was not happening. RainNow folds the contact and the measured rate
+    into one answer (see test_rain_now); this app keeps only its own sustain/clear timing."""
 
-    The 0.5 mm/h bar is "any measurable rain", not "moderate rain": the rate quantises in
-    0.6 mm/h steps, so the smallest non-zero reading the sensor can produce already clears it."""
+    RAINING = "binary_sensor.raining"
+    DOOR = "cover.rooftop_hatch"
+    RATE = "sensor.gw2000a_rain_rate_piezo"
+    CONTACT = "binary_sensor.gw2000a_rain_state_piezo"
 
-    def test_the_configured_rain_entity_is_the_rate_sensor(self):
+    def _app(self, states, raining_for=timedelta(minutes=3)):
         app = make_app(VALID_ARGS)
         app.initialize()
-        self.assertEqual(app.rain_entity, "sensor.gw2000a_rain_rate_piezo")
-        self.assertNotIn("rain_state", app.rain_entity)
+        app.sonos_notifier = None
+        app.mobile_notifier = None
+        app.published = {}
+        app.set_state = lambda entity, state=None, **kw: app.published.__setitem__(entity, state)
+        changed = (datetime.now(timezone.utc) - raining_for).isoformat()
 
-    def test_the_smallest_reportable_rate_clears_the_bar(self):
+        async def get_state(entity, attribute=None, **kw):
+            if attribute == "last_changed":
+                return changed
+            if attribute is not None:
+                return None
+            return states.get(entity)
+
+        async def fire_event(*args, **kw):
+            return None
+
+        app.get_state = get_state
+        app.fire_event = fire_event
+        return app
+
+    def _rooftop(self, app):
+        asyncio.run(app._evaluate())
+        return app.published["binary_sensor.weather_opening_alert_rooftop_rain"]
+
+    def test_the_configured_rain_entity_is_the_shared_flag(self):
         app = make_app(VALID_ARGS)
         app.initialize()
-        self.assertLessEqual(app.rain_min, 0.6)
+        self.assertEqual(app.rain_entity, self.RAINING)
+        self.assertNotIn("piezo", app.rain_entity)
+        self.assertIn(self.RAINING, [c.args[1] for c in app.listen_state.call_args_list])
+
+    def test_rain_on_an_open_terrace_door_raises_the_rooftop_alert(self):
+        app = self._app({self.RAINING: "on", self.DOOR: "on"})
+        self.assertEqual(self._rooftop(app), "on")
+
+    def test_dry_or_unreadable_with_the_door_open_raises_nothing(self):
+        for state in ("off", "unavailable", None):
+            with self.subTest(flag=state):
+                app = self._app({self.RAINING: state, self.DOOR: "on"})
+                self.assertEqual(self._rooftop(app), "off")
+
+    def test_a_measured_rate_or_a_tapped_plate_does_not_count_without_the_flag(self):
+        """The alert must not read the piezo itself: only RainNow decides, so the alert and the
+        lights cannot disagree about whether it is raining."""
+        app = self._app({self.RAINING: "off", self.RATE: "5.4", self.CONTACT: "on", self.DOOR: "on"})
+        self.assertEqual(self._rooftop(app), "off")
+
+    def test_the_sustain_time_still_applies(self):
+        """rooftop_rain_sustain_minutes (2): rain that has only just started does not alert."""
+        app = self._app({self.RAINING: "on", self.DOOR: "on"}, raining_for=timedelta(seconds=30))
+        self.assertEqual(self._rooftop(app), "off")
+
+    def test_a_dry_spell_shorter_than_the_clear_time_keeps_the_alert(self):
+        app = self._app({self.RAINING: "off", self.DOOR: "on"})
+        app._rooftop_latched = True
+        self.assertEqual(self._rooftop(app), "on")
+
+    def test_a_dry_spell_longer_than_the_clear_time_ends_it(self):
+        """rooftop_rain_clear_minutes (1)."""
+        app = self._app({self.RAINING: "off", self.DOOR: "on"})
+        app._rooftop_latched = True
+        app._rain_below_since = datetime.now(timezone.utc) - timedelta(minutes=2)
+        self.assertEqual(self._rooftop(app), "off")
 
 
 if __name__ == "__main__":

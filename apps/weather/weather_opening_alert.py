@@ -88,7 +88,7 @@ class WeatherOpeningAlert(hass.Hass):
     def initialize(self) -> None:
         self.log("WeatherOpeningAlert initializing...")
 
-        self.rain_entity = self.args.get("rain_rate_entity", "sensor.gw2000a_rain_rate_piezo")
+        self.rain_entity = self.args.get("rain_entity", "binary_sensor.raining")
         self.wind_speed_entity = self.args.get("wind_speed_entity", "sensor.gw2000a_wind_speed")
         self.wind_gust_entity = self.args.get("wind_gust_entity", "sensor.gw2000a_wind_gust")
         self.wind_dir_entity = self.args.get("wind_direction_entity", "sensor.gw2000a_wind_direction")
@@ -96,7 +96,6 @@ class WeatherOpeningAlert(hass.Hass):
         # _facade_wind_direction. Unset = legacy behaviour (instantaneous vane only).
         self.wind_dir_mean_entity = self.args.get("wind_direction_mean_entity")
 
-        self.rain_min = float(self.args.get("rain_rate_min_mmh", 0.5))
         self.wind_speed_min = float(self.args.get("wind_speed_min_kmh", 5))
         self.wind_gust_min = float(self.args.get("wind_gust_min_kmh", 10))
         self.half_band = float(self.args.get("exposure_band_degrees", 30))
@@ -142,7 +141,7 @@ class WeatherOpeningAlert(hass.Hass):
 
         self._debounce_handle: Optional[str] = None
 
-        # Rooftop alert stays on through brief rain dips until rain below threshold
+        # Rooftop alert stays on through brief rain dips until it has not rained
         # for rooftop_rain_clear_minutes (see _evaluate).
         self._rooftop_latched: bool = False
 
@@ -239,6 +238,12 @@ class WeatherOpeningAlert(hass.Hass):
         except (TypeError, ValueError):
             return None
 
+    async def _raining(self) -> bool:
+        try:
+            return (await self.get_state(self.rain_entity)) == "on"
+        except Exception:
+            return False
+
     async def _wind_speed_kmh(self) -> Optional[float]:
         val = await self._parse_numeric_state(self.wind_speed_entity)
         if val is None:
@@ -291,16 +296,14 @@ class WeatherOpeningAlert(hass.Hass):
     async def _evaluate(self) -> None:
         now = datetime.now(timezone.utc)
 
-        rain_rate = await self._parse_numeric_state(self.rain_entity)
+        rain_ok_now = await self._raining()
         wind_dir, wind_dir_src = await self._facade_wind_direction()
         speed_kmh = await self._wind_speed_kmh()
         gust_kmh = await self._wind_gust_kmh()
 
-        rain_ok_now = rain_rate is not None and rain_rate >= self.rain_min
-
         # --- Rain sustain / clear timestamps ---
-        # Do not clear _rain_above_since on a brief dip below threshold; only reset the
-        # rain episode after rain has stayed below rooftop_rain_clear_minutes.
+        # Do not clear _rain_above_since on a brief dry spell; only reset the rain
+        # episode after it has not rained for rooftop_rain_clear_minutes.
         if rain_ok_now:
             if self._rain_above_since is None:
                 self._rain_above_since = (await self._get_lc(self.rain_entity)) or now

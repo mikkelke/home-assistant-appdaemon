@@ -60,7 +60,7 @@ SPEAKER = CONFIG["speaker"]
 MEASURED = CONFIG["measured_entity"]
 WEIGHT = CONFIG["weight_entity"]
 FAT = CONFIG["body_fat_entity"]
-RAIN_RATE = CONFIG["rain_entity"]
+RAINING = CONFIG["rain_entity"]
 WEATHER = CONFIG["weather_entity"]
 ALARM = CONFIG["alarm_entity"]
 ALARM_TIME = CONFIG["alarm_time_entity"]
@@ -1841,7 +1841,7 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(sorted((entity, kw.get("attribute")) for _, entity, kw in app.listened),
                          sorted([(ACTIVE, None), (RSSI, "all"), (UPCOMING, "all"), (SLEEP, "all"), (LIGHT, "all"),
                                  (METRO, "all"), (STOG, "all"), (MEASURED, "all"), (WEIGHT, "all"), (FAT, "all"),
-                                 (RAIN_RATE, "all"), (ALARM, "all"), (ALARM_TIME, "all"), (ALARM_FROM_ENTITY, "all"),
+                                 (RAINING, "all"), (ALARM, "all"), (ALARM_TIME, "all"), (ALARM_FROM_ENTITY, "all"),
                                  (WASHER, "all"), (DRYER, "all"), (DELIVERY, "all")]))
         self.assertEqual(app.events, [("_on_plugin_started", "plugin_started"),
                                       ("_on_play", "esphome.bathroom_display_play"),
@@ -2507,14 +2507,14 @@ class WeighingFlowTests(unittest.TestCase):
     def test_a_weekend_morning_weighing_also_asks_for_the_forecast_and_the_card_takes_the_place_of_the_rain(self):
         now = SATURDAY
         stog = route("Disrupted", [departure(12, "08:42", cancelled=True, now=now)], as_of=now - 2 * MIN)
-        app = self.app({RAIN_RATE: full("1.2"), STOG: stog}, now=now)
+        app = self.app({RAINING: full("on"), STOG: stog}, now=now)
         weigh(app)
         self.assertEqual([task.cr_code.co_name for task in app.tasks], ["_fetch_comparison"])
         self.assertEqual([line[0] for line in shown(app)], ["Raining now", "S-tog: cancelled 08:42", "Spray the Alocasia"])
         thirty_days_ago(app)
         drain(app)
         self.assertEqual(shown(app), self.CARD)
-        fire(app, RAIN_RATE, full("0.0"))
+        fire(app, RAINING, full("off"))
         self.assertEqual(app.tasks, [])
         app.responses[FORECAST] = weather_answer((utc(8, day=7), 0.6))
         app.now += 90 * SEC
@@ -2524,7 +2524,7 @@ class WeighingFlowTests(unittest.TestCase):
         self.assertEqual(shown(app)[0], ("Rain 09-10", "mdi:weather-rainy", "09-10"))
 
     def test_a_workday_morning_weighing_in_the_rain_asks_for_the_forecast_and_the_way_home_follows_the_card(self):
-        app = self.app({RAIN_RATE: full("1.2")}, now=NOW)
+        app = self.app({RAINING: full("on")}, now=NOW)
         weigh(app)
         self.assertEqual([task.cr_code.co_name for task in app.tasks], ["_fetch_comparison", "_fetch_forecast"])
         thirty_days_ago(app)
@@ -2760,29 +2760,24 @@ class RainFlowTests(unittest.TestCase):
         for now, line in ((house(11, 5, 5, 59), BLANK), (house(11, 5, 6, 0), ("Raining now", "mdi:weather-rainy", "now")),
                           (house(11, 5, 11, 59), ("Raining now", "mdi:weather-rainy", "now")), (house(11, 5, 12, 0), BLANK)):
             with self.subTest(now=now):
-                self.assertEqual(shown(self.app(now=now, states={RAIN_RATE: full("1.2")}))[0], line)
+                self.assertEqual(shown(self.app(now=now, states={RAINING: full("on")}))[0], line)
 
     def test_someone_an_empty_room_and_a_dark_room_get_no_forecast_and_no_line(self):
         for states, active in (({RSSI: full("-90")}, "on"), ({}, "off"), ({SLEEP: full("on"), LIGHT: full("off")}, "on")):
             with self.subTest(states=states, active=active):
-                app = make_app({RAIN_RATE: full("1.2"), **states}, active=active)
+                app = make_app({RAINING: full("on"), **states}, active=active)
                 self.assertEqual((app.tasks, shown(app)), ([], [BLANK] * 3))
 
-    def test_raining_now_needs_a_measured_rate(self):
-        for state, raining in (("0.0", False), ("0.4", False), ("0.5", True), ("unavailable", False), (None, False)):
-            with self.subTest(state=state):
-                self.assertEqual(bd.rate_raining(state), raining)
-
     def test_it_raining_now_needs_no_forecast_on_a_weekend(self):
-        app = self.app(now=SATURDAY, states={RAIN_RATE: full("1.2")})
+        app = self.app(now=SATURDAY, states={RAINING: full("on")})
         self.assertEqual((app.tasks, shown(app)[0]), ([], ("Raining now", "mdi:weather-rainy", "now")))
-        fire(app, RAIN_RATE, full("0.0"))
+        fire(app, RAINING, full("off"))
         self.assertEqual((len(app.tasks), shown(app)[0]), (1, BLANK))
-        fire(app, RAIN_RATE, full("1.2"))
+        fire(app, RAINING, full("on"))
         self.assertEqual(shown(app)[0][0], "Raining now")
 
     def test_it_raining_now_asks_for_the_forecast_on_a_workday_for_the_way_home(self):
-        app = self.app(states={RAIN_RATE: full("1.2")})
+        app = self.app(states={RAINING: full("on")})
         self.assertEqual((len(app.tasks), shown(app)[0]), (1, ("Raining now", "mdi:weather-rainy", "now")))
         app.responses[FORECAST] = weather_answer(*self.HOME)
         drain(app)
@@ -2821,7 +2816,7 @@ class RainFlowTests(unittest.TestCase):
         self.assertEqual(shown(app), [BLANK] * 3)
 
     def test_the_way_home_goes_with_a_stale_forecast_and_raining_now_stays(self):
-        app = self.app(states={RAIN_RATE: full("1.2")})
+        app = self.app(states={RAINING: full("on")})
         app.responses[FORECAST] = weather_answer(*self.HOME)
         drain(app)
         app.fail_services = {FORECAST}
@@ -2833,11 +2828,20 @@ class RainFlowTests(unittest.TestCase):
         tick(app, 1 * SEC)
         self.assertEqual(shown(app)[0], ("Raining now", "mdi:weather-rainy", "now"))
 
-    def test_a_piezo_that_cannot_be_read_is_not_rain(self):
+    def test_a_rain_flag_that_cannot_be_read_is_not_rain(self):
         for state in ("unknown", "unavailable", "off", None):
             with self.subTest(state=state):
-                app = self.app(states={RAIN_RATE: full(state)} if state else {})
+                app = self.app(states={RAINING: full(state)} if state else {})
                 self.assertEqual(shown(app)[0], BLANK)
+
+    def test_only_the_shared_rain_flag_says_raining_now(self):
+        """The roof station's piezo contact and rate are not sources of the line: the flag is the one place that
+        folds them into rain, so a tapped plate or a rate on its own shows nothing."""
+        app = self.app(states={"binary_sensor.gw2000a_rain_state_piezo": full("on"),
+                               "sensor.gw2000a_rain_rate_piezo": full("5.4")})
+        self.assertEqual(shown(app)[0], BLANK)
+        fire(app, RAINING, full("on"))
+        self.assertEqual(shown(app)[0][0], "Raining now")
 
     def test_no_rain_in_the_forecast_no_line(self):
         app = self.app()
@@ -2893,7 +2897,7 @@ class RainFlowTests(unittest.TestCase):
         self.assertEqual(shown(app)[0][0], "Rain 10-11")
 
     def test_the_rain_comes_before_transit_and_rows(self):
-        app = self.app(states={UPCOMING: upcoming(LineTests.ROWS), RAIN_RATE: full("1.2"),
+        app = self.app(states={UPCOMING: upcoming(LineTests.ROWS), RAINING: full("on"),
                                STOG: route("Disrupted", [departure(12, "08:42", cancelled=True)])})
         self.assertEqual([line[0] for line in shown(app)],
                          ["Raining now", "S-tog: cancelled 08:42", "Spray the Alocasia"])
@@ -2902,7 +2906,7 @@ class RainFlowTests(unittest.TestCase):
         app = self.app(weather_entity="weather.den")
         drain(app)
         self.assertEqual(app.requests[0][1]["entity_id"], "weather.den")
-        app = self.app(rain_entity="sensor.den_rain_rate", states={"sensor.den_rain_rate": full("1.2")})
+        app = self.app(rain_entity="binary_sensor.den_rain", states={"binary_sensor.den_rain": full("on")})
         self.assertEqual(shown(app)[0][0], "Raining now")
 
 
@@ -3048,7 +3052,7 @@ class NightTests(unittest.TestCase):
 
     ALARM_LINE = ("Alarm 09:15", "mdi:alarm", "09:15")
     SLEEPING = {ALARM: full("on"), ALARM_TIME: full("09:15:00"), UPCOMING: upcoming(LineTests.ROWS),
-                STOG: route("Disrupted", [departure(12, "08:42", cancelled=True)]), RAIN_RATE: full("1.2"),
+                STOG: route("Disrupted", [departure(12, "08:42", cancelled=True)]), RAINING: full("on"),
                 WASHER: full("Running", ApplianceFlowTests.WASH), DRYER: full("Paused", ApplianceFlowTests.DRY),
                 DELIVERY: delivery_state(a_delivery(eta=NOW + 8 * MIN))}
     CASES = (  # the room, its states, whether it is active and the state it gets
@@ -3114,7 +3118,7 @@ class NightTests(unittest.TestCase):
         self.assertEqual(app.tasks, [])
 
     def test_sleep_mode_turning_on_and_off_changes_the_payload_at_once(self):
-        app = make_app({**self.SLEEPING, SLEEP: full("off"), RSSI: full("-60"), RAIN_RATE: full("0.0")})
+        app = make_app({**self.SLEEPING, SLEEP: full("off"), RSSI: full("-60"), RAINING: full("off")})
         before = last(app)["attributes"]
         self.assertEqual((before["night"], before["line1"]), ("", "S-tog: cancelled 08:42"))
         count = len(app.published)
@@ -3275,9 +3279,9 @@ class ConfigTests(unittest.TestCase):
                          (CONFIG["measured_entity"], CONFIG["weight_entity"], CONFIG["body_fat_entity"]))
         self.assertEqual((CONFIG["measured_entity"], CONFIG["weight_entity"], CONFIG["body_fat_entity"]),
                          ("sensor.mikkel_last_measurement", "sensor.mikkel_weight", "sensor.mikkel_body_fat"))
-        self.assertEqual((app.rain_entity, app.weather_entity), (bd.RAIN_RATE, bd.WEATHER))
+        self.assertEqual((app.rain_entity, app.weather_entity), (bd.RAINING, bd.WEATHER))
         self.assertEqual((CONFIG["rain_entity"], CONFIG["weather_entity"]),
-                         ("sensor.gw2000a_rain_rate_piezo", "weather.forecast_home"))
+                         ("binary_sensor.raining", "weather.forecast_home"))
         self.assertEqual((app.alarm_entity, app.alarm_time_entity, app.alarm_from_entity, app.alarm_event),
                          (bd.ALARM, bd.ALARM_TIME, bd.ALARM_FROM_ENTITY, bd.ALARM_EVENT))
         self.assertEqual((CONFIG["alarm_entity"], CONFIG["alarm_time_entity"], CONFIG["alarm_from_entity"],
@@ -3292,7 +3296,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((app.measured_entity, app.weight_entity, app.fat_entity, app.rain_entity,
                           app.weather_entity, app.alarm_entity, app.alarm_time_entity, app.alarm_from_entity,
                           app.alarm_event),
-                         (None, None, None, bd.RAIN_RATE, bd.WEATHER, bd.ALARM, bd.ALARM_TIME,
+                         (None, None, None, bd.RAINING, bd.WEATHER, bd.ALARM, bd.ALARM_TIME,
                           bd.ALARM_FROM_ENTITY, bd.ALARM_EVENT))
         self.assertEqual(app.alarm_event, CONFIG["alarm_event"])
         self.assertEqual((app.washer_entity, app.dryer_entity, app.delivery_entity),

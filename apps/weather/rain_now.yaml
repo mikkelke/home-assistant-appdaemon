@@ -1,0 +1,14 @@
+# RainNow - publishes binary_sensor.raining, the one "is it raining now" every consumer reads
+# (darkness_calculator, weather_opening_alert, the room displays, the dashboard sky). See rain_now.py.
+
+RainNow:
+  module: rain_now
+  class: RainNow
+
+  entity: binary_sensor.raining
+  # The piezo "rain state" is an impact detector, not a rain sensor: it only extends an episode
+  # the rate has already confirmed.
+  contact_entity: binary_sensor.gw2000a_rain_state_piezo
+  rate_entity: sensor.gw2000a_rain_rate_piezo
+  rate_min_mmh: 0.5            # the sensor steps in 0.6 mm/h, so this is "any measurable rain"
+  periodic_seconds: 60         # re-pull both sources, and republish if HA lost the entity

@@ -5,9 +5,24 @@ AppDaemon apps driven by **outside conditions** (weather station, wind, rain).
 | App | Module | Purpose |
 |-----|--------|---------|
 | Easterly wind monitor | `easterly_wind_monitor` | Wind-direction / easterly monitoring (see `easterly_wind_monitor.yaml`). |
+| Rain now | `rain_now` | The house's one "is it raining now": `binary_sensor.raining` (see [Rain now](#rain-now)). |
 | Weather opening alert | `weather_opening_alert` | Rain + wind exposure + open windows/rooftop doors → synthetic `weather_opening_alert_*` entities for dashboards (e.g. Home Pulse). |
 
 **Climate / room temperature** apps live in [`../climate/`](../climate/).
+
+## Rain now
+
+`binary_sensor.raining` (`on`/`off`, device class moisture) is the only place that decides whether it is
+raining. Lights (`darkness_calculator`), the opening alert below, the room displays and the dashboard sky
+read it; none of them thresholds a rain sensor itself.
+
+- **Rule:** the roof station's piezo rate (`sensor.gw2000a_rain_rate_piezo`) measures water, so a rate of
+  at least **0.5 mm/h** is rain. The piezo contact (`binary_sensor.gw2000a_rain_state_piezo`) fires on any
+  impact, so it only extends an episode the rate has already confirmed. See `apply_rain` in
+  [`rain_now.py`](rain_now.py).
+- **Attributes:** `reason` (why, in words), `rate_mmh`, `piezo` (the contact as HA reports it).
+- **Restart:** the app republishes at start and every 60 s if HA lost the entity. At start the contact
+  alone is never enough; rain is the measured rate until a reading has confirmed the contact episode.
 
 ## Weather opening alert
 
@@ -29,7 +44,7 @@ AppDaemon apps driven by **outside conditions** (weather station, wind, rain).
 
 ### Thresholds (defaults in YAML)
 
-- Rain ≥ **0.5 mm/h**; rooftop sustain **2 min**, clear after rain below **1 min** (or any rooftop door closed).
+- Rain = `binary_sensor.raining` **on** (see [Rain now](#rain-now)); rooftop sustain **2 min**, clear after it has been off **1 min** (or any rooftop door closed).
 - Window: rain + wind in **bearing ± 30°** + (speed ≥ **5 km/h** or gust ≥ **10 km/h**); combined sustain **4 min** (`max(open_ready, rain_since, wind_since)`); clear **2 min** after conditions fail.
 - Wind speed/gust: normalized to **km/h** from `unit_of_measurement` when it looks like **mph**, **m/s**, **knots**, **ft/s**; otherwise values are assumed km/h (GW2000A default).
 

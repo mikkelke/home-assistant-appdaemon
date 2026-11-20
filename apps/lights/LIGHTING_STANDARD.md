@@ -4,8 +4,9 @@
 
 **Contract — two independent questions:**
 - *Is the room dark?* — `darkness_calculator` only, from environment (sun elevation, smoothed
-  outdoor lux, rain, indoor daylight with lamp lux subtracted). Rolling for every zone, 24/7,
-  so the state exists **before** anyone enters. Occupancy is never an input.
+  outdoor lux, rain from `binary_sensor.raining` (RainNow), indoor daylight with lamp lux
+  subtracted). Rolling for every zone, 24/7, so the state exists **before** anyone enters.
+  Occupancy is never an input.
 - *Do we need light?* — light apps: `occupied AND dark → on`; `not occupied → off`;
   `occupied AND bright → off`.
 
