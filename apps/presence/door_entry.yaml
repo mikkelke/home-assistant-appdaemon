@@ -24,6 +24,6 @@ DoorEntry:
     - {name: Kristine, area_sensor: sensor.kristines_iphone_ble_area, tracker: device_tracker.kristines_iphone}
 
   pre_s: 120
-  post_s: 30
+  post_s: 45
   away_s: 300
   # Defaults to door_entry_log.jsonl beside the module (*_log.jsonl is gitignored).
