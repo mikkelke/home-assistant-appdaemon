@@ -916,6 +916,21 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
     """The strictly-additive seam in intercom.py: pushes gain an image when the
     bridge offers one, and remain byte-identical to today when it cannot."""
 
+    RING = datetime(2026, 11, 11, 10, 17, 44)
+    WOLT = ("food", RING, "wolt")
+
+    class RecordingBridge:
+        def __init__(self):
+            self.calls = []
+
+        def ring_attachment_data(self, door=None):
+            self.calls.append("ring_attachment_data")
+            return None
+
+        def defer_ring_push(self, door, title, message, target):
+            self.calls.append("defer_ring_push")
+            return False
+
     def _bare_intercom(self):
         app = intercom.Intercom.__new__(intercom.Intercom)
         app.abb_bridge = None
@@ -924,6 +939,9 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
         app.log = lambda msg, level="INFO": app.logs.append((level, msg))
         app.notify_target = "mikkel"
         app.food_courier_notify = ["mikkel", "kristine"]
+        app.states = {"person.mikkel": "home", "person.kristine": "home"}
+        app.get_state = lambda entity, attribute=None: app.states.get(entity)
+        app.get_now = lambda: self.RING + timedelta(seconds=5)
         app.unlock_outcomes = {}
         app.unlock_repeat_count = 3
         app.pushes = []
@@ -934,43 +952,78 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
                 return None
         app.mobile_notifier = FakeNotifier()
         app.create_task = lambda x: None
-        app.fire_event = lambda *a, **kw: None
+        app.rows = []
+        app.fire_event = lambda name, **kwargs: app.rows.append((name, kwargs))
         tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(tmpdir.cleanup)
         app._state_file = Path(tmpdir.name) / "intercom_state.json"
         return app
 
-    def test_a_ring_that_matched_a_courier_names_it_in_the_push(self):
-        ring = datetime(2026, 11, 11, 10, 17, 44)
-        cases = {"gls": ("gls", ring, "Probably the GLS courier"), "wolt": ("wolt", ring, "Probably the Wolt courier"),
-                 "no source": (None, ring, "Probably the courier"),
-                 "an older ring": ("gls", ring - timedelta(seconds=11), "Intercom auto-opened")}
-        for name, (source, matched_at, title) in cases.items():
-            with self.subTest(name):
-                app = self._bare_intercom()
-                app.get_app = lambda name: None
-                app._street_courier = ("parcel", matched_at, source)
-                app._report_auto_open_success("binary_sensor.front", "lock.front",
-                                              {"ring_label": "front door", "ring_ts": ring}, 1)
-                self.assertEqual(app.pushes[0]["title"], title)
-        self.assertEqual(app.pushes[0]["message"],
-                         "Someone rang the front door and the door was unlocked automatically.")
-        app = self._bare_intercom()
-        app.get_app = lambda name: None
-        app._street_courier = ("parcel", ring, "gls")
-        app._report_auto_open_success("binary_sensor.front", "lock.front", {"ring_label": "front door"}, 1)
-        self.assertEqual(app.pushes[0]["title"], "Intercom auto-opened")
+    def _door_opened(self, app, courier=None, ring_ts=RING):
+        app._street_courier = courier
+        outcome = {"ring_label": "front door"}
+        if ring_ts is not None:
+            outcome["ring_ts"] = ring_ts
+        app._report_auto_open_success("binary_sensor.front", "lock.front", outcome, 1)
 
-    def test_a_food_courier_push_goes_to_the_food_audience(self):
-        ring = datetime(2026, 11, 11, 10, 17, 44)
-        for kind, target in (("food", ["mikkel", "kristine"]), ("parcel", "mikkel")):
-            with self.subTest(kind):
+    def test_a_ring_that_matched_a_food_courier_names_it_in_the_push(self):
+        cases = {"wolt": (self.WOLT, "Probably the Wolt courier"),
+                 "no source": (("food", self.RING, None), "Probably the courier"),
+                 "matched 10 s before the ring": (("food", self.RING - timedelta(seconds=10), "wolt"),
+                                                  "Probably the Wolt courier"),
+                 "matched 10 s after the ring": (("food", self.RING + timedelta(seconds=10), "wolt"),
+                                                 "Probably the Wolt courier")}
+        for case, (courier, title) in cases.items():
+            with self.subTest(case):
                 app = self._bare_intercom()
-                app.get_app = lambda name: None
-                app._street_courier = (kind, ring, "wolt")
-                app._report_auto_open_success("binary_sensor.front", "lock.front",
-                                              {"ring_label": "front door", "ring_ts": ring}, 1)
-                self.assertEqual(app.pushes[0]["target"], target)
+                app.get_app = lambda _: None
+                self._door_opened(app, courier)
+                self.assertEqual([(push["title"], push["message"]) for push in app.pushes],
+                                 [(title, "Rang the front door and was let in automatically.")])
+
+    def test_a_ring_that_did_not_match_a_food_courier_is_not_pushed_or_offered_to_the_bridge(self):
+        cases = {"a plain ring": (None, self.RING),
+                 "a parcel courier": (("parcel", self.RING, "gls"), self.RING),
+                 "a groceries courier": (("groceries", self.RING, "nemlig"), self.RING),
+                 "a food courier matched 11 s before the ring": (
+                     ("food", self.RING - timedelta(seconds=11), "wolt"), self.RING),
+                 "a food courier matched 11 s after the ring": (
+                     ("food", self.RING + timedelta(seconds=11), "wolt"), self.RING),
+                 "a ring with no time": (self.WOLT, None)}
+        for case, (courier, ring_ts) in cases.items():
+            with self.subTest(case):
+                app = self._bare_intercom()
+                bridge = self.RecordingBridge()
+                app.get_app = lambda _: bridge
+                self._door_opened(app, courier, ring_ts)
+                self.assertEqual(app.pushes, [])
+                self.assertEqual(bridge.calls, [])
+                self.assertEqual([name for name, _ in app.rows], ["house_events_report"])
+
+    def test_a_food_courier_push_goes_to_the_food_audience_who_are_home(self):
+        cases = {"both home": ({}, ["mikkel", "kristine"]),
+                 "only Mikkel home": ({"person.kristine": "not_home"}, ["mikkel"]),
+                 "only Kristine home": ({"person.mikkel": "not_home"}, ["kristine"]),
+                 "one in a zone": ({"person.mikkel": "work"}, ["kristine"])}
+        for case, (states, target) in cases.items():
+            with self.subTest(case):
+                app = self._bare_intercom()
+                app.get_app = lambda _: None
+                app.states.update(states)
+                self._door_opened(app, self.WOLT)
+                self.assertEqual([push["target"] for push in app.pushes], [target])
+
+    def test_a_food_courier_ring_with_nobody_home_is_not_pushed_or_offered_to_the_bridge(self):
+        for state in ("not_home", "work", "unavailable", "unknown", None):
+            with self.subTest(state):
+                app = self._bare_intercom()
+                bridge = self.RecordingBridge()
+                app.get_app = lambda _: bridge
+                app.states.update({"person.mikkel": state, "person.kristine": state})
+                self._door_opened(app, self.WOLT)
+                self.assertEqual(app.pushes, [])
+                self.assertEqual(bridge.calls, [])
+                self.assertEqual([name for name, _ in app.rows], ["house_events_report"])
 
     def test_attachment_passed_through_on_success_push(self):
         app = self._bare_intercom()
@@ -983,30 +1036,31 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
             def defer_ring_push(self, door, title, message, target):
                 return False  # declines: intercom sends it itself
         app.get_app = lambda name: FakeBridge()
-        app._report_auto_open_success("binary_sensor.front", "lock.front",
-                                      {"ring_label": "front door"}, 1)
-        self.assertEqual(app.pushes[0]["data"], payload)
+        self._door_opened(app, self.WOLT)
+        self.assertEqual([push["data"] for push in app.pushes], [payload])
 
     def test_bridge_taking_the_push_stops_intercom_sending_it(self):
         # Exactly one notification per ring: when the bridge holds the push to
         # wait for this visitor's photo, intercom must not also send its own.
         app = self._bare_intercom()
         taken = {}
+        consulted = []
 
         class FakeBridge:
             def ring_attachment_data(self, door=None):
-                raise AssertionError("must not be consulted once the push is deferred")
+                consulted.append(door)
+                return None
 
             def defer_ring_push(self, door, title, message, target):
                 taken.update(door=door, title=title, message=message, target=target)
                 return True
         app.get_app = lambda name: FakeBridge()
-        app._report_auto_open_success("binary_sensor.front", "lock.front",
-                                      {"ring_label": "front door"}, 1)
+        self._door_opened(app, self.WOLT)
         self.assertEqual(app.pushes, [])
-        self.assertEqual(taken["door"], "front door")
-        self.assertEqual(taken["target"], "mikkel")
-        self.assertIn("front door", taken["message"])
+        self.assertEqual(consulted, [], "must not be consulted once the push is deferred")
+        self.assertEqual(taken, {"door": "front door", "title": "Probably the Wolt courier",
+                                 "message": "Rang the front door and was let in automatically.",
+                                 "target": ["mikkel", "kristine"]})
 
     def test_bridge_declining_the_defer_still_pushes_immediately(self):
         app = self._bare_intercom()
@@ -1018,9 +1072,9 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
             def defer_ring_push(self, door, title, message, target):
                 raise RuntimeError("bridge mid-reload")
         app.get_app = lambda name: FakeBridge()
-        app._report_auto_open_success("binary_sensor.front", "lock.front",
-                                      {"ring_label": "front door"}, 1)
-        self.assertEqual(len(app.pushes), 1)
+        self._door_opened(app, self.WOLT)
+        self.assertEqual([(push["title"], push["target"]) for push in app.pushes],
+                         [("Probably the Wolt courier", ["mikkel", "kristine"])])
 
     def test_a_confirmed_auto_open_is_the_ring_s_one_feed_row(self):
         app = self._bare_intercom()
@@ -1037,8 +1091,7 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
     def test_bridge_absent_push_goes_out_as_today(self):
         app = self._bare_intercom()
         app.get_app = lambda name: None
-        app._report_auto_open_success("binary_sensor.front", "lock.front",
-                                      {"ring_label": "front door"}, 1)
+        self._door_opened(app, self.WOLT)
         self.assertEqual(len(app.pushes), 1)
         self.assertIsNone(app.pushes[0]["data"])
 

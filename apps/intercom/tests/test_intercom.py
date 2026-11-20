@@ -324,6 +324,7 @@ def _fake_abb_app(tmpdir, clock, states, abb_unlock_doors=None, voice_before_unl
     app.unlock_repeat_interval_s = 7
     app.sonos_notifier = None  # skip TTS - not under test here
     app.notify_target = "mikkel"
+    app.food_courier_notify = ["mikkel", "kristine"]
     app.abb_bridge = None
     app._street_courier = None
 
@@ -331,7 +332,8 @@ def _fake_abb_app(tmpdir, clock, states, abb_unlock_doors=None, voice_before_unl
     app.logs = []
     app.log = lambda msg, level="INFO": app.logs.append((level, msg))
     app.get_state = lambda entity, attribute=None: states.get(entity)
-    app.fire_event = lambda *a, **kw: None
+    app.events = []
+    app.fire_event = lambda name, **kwargs: app.events.append((name, kwargs))
     app.timer_running = lambda handle: False
     app.cancel_timer = lambda handle: None
 
@@ -359,6 +361,12 @@ def _fake_abb_app(tmpdir, clock, states, abb_unlock_doors=None, voice_before_unl
     app.created_tasks = []
     app.create_task = lambda x: app.created_tasks.append(x)
     return app
+
+
+def _opened(app):
+    """The cause of every house feed row that reports a confirmed auto-open: one per ring the intercom opened."""
+    return [kwargs["cause"] for name, kwargs in app.events
+            if name == "house_events_report" and kwargs["effect"].startswith("Opened")]
 
 
 class AbbNativeUnlockTests(unittest.TestCase):
@@ -694,14 +702,15 @@ class AbbNativeUnlockTests(unittest.TestCase):
 
         self.assertNotIn("front door", app._abb_watchdogs)
         self.assertTrue(any("ABB-UNLOCK ok door=front door" in msg for _, msg in app.logs))
-        self.assertEqual(len(app.pushes), 1)
-        self.assertEqual(app.pushes[0]["title"], "Intercom auto-opened")
+        self.assertEqual(_opened(app), ["Someone rang the front door"])
+        self.assertEqual(app.pushes, [])
         on_disk = json.loads((Path(self.tmpdir) / "intercom_state.json").read_text())
         self.assertTrue(on_disk["binary_sensor.front"]["succeeded"])
 
         # A later ack for the same, already-resolved watchdog must not double-report.
         app._on_esp_lock_ack("lock.front", "state", "unlocking", "unlocked", {"door_label": "front door"})
-        self.assertEqual(len(app.pushes), 1)
+        self.assertEqual(_opened(app), ["Someone rang the front door"])
+        self.assertEqual(app.pushes, [])
         # The ESP ladder itself was never touched.
         self.assertEqual(app.service_calls, [("button/press", {"entity_id": "button.abb_front"})])
 
@@ -723,8 +732,23 @@ class AbbNativeUnlockTests(unittest.TestCase):
         self.states["lock.front"] = "unlocking"  # ESP's physical ack, before either verify runs
         _run_scheduled(app, "_verify_unlock")
 
-        titles = [p["title"] for p in app.pushes]
-        self.assertEqual(titles, ["Intercom auto-opened"])  # exactly once, not once per attempt
+        self.assertEqual(_opened(app), ["Someone rang the front door"])  # exactly once, not once per attempt
+        self.assertEqual(app.pushes, [])
+
+    def test_a_food_courier_ring_is_pushed_once_to_whoever_is_home_not_once_per_attempt(self):
+        app = self._app({"front door": "button.abb_front"})
+        app.get_app = lambda name: None
+        app._street_courier = ("food", NOW, "wolt")
+        self.states.update({"person.mikkel": "not_home", "person.kristine": "home"})
+        app._handle_trigger("binary_sensor.front", "state", "off", "on", {})
+        _run_scheduled(app, "on_timeout")
+        _run_scheduled(app, "unlock_callback")
+        self.states["lock.front"] = "unlocking"
+        _run_scheduled(app, "_verify_unlock")
+
+        self.assertEqual([(p["title"], p["target"]) for p in app.pushes],
+                         [("Probably the Wolt courier", ["kristine"])])
+        self.assertEqual(_opened(app), ["Someone rang the front door"])
 
     def test_esp_ladder_stops_after_first_confirmed_unlock(self):
         app = self._app(abb_unlock_doors={})
@@ -744,7 +768,8 @@ class AbbNativeUnlockTests(unittest.TestCase):
 
         self.assertEqual(cancelled, later_handles)
         self.assertNotIn("binary_sensor.front", app.pending_unlocks)
-        self.assertEqual([p["title"] for p in app.pushes], ["Intercom auto-opened"])
+        self.assertEqual(_opened(app), ["Someone rang the front door"])
+        self.assertEqual(app.pushes, [])
 
     def test_esp_ladder_keeps_retrying_while_unconfirmed(self):
         app = self._app(abb_unlock_doors={})
@@ -772,6 +797,7 @@ class AbbNativeUnlockTests(unittest.TestCase):
 
         titles = [p["title"] for p in app.pushes]
         self.assertEqual(titles, ["Intercom auto-open failed"])  # exactly once
+        self.assertEqual(_opened(app), [])
 
     def test_unconfigured_abb_unlock_doors_is_a_no_op(self):
         app = self._app(abb_unlock_doors={})
@@ -805,6 +831,7 @@ class AbbNativeUnlockTests(unittest.TestCase):
         self.states["lock.front"] = "unlocking"
         _run_scheduled(app, "_verify_unlock")
         self.assertEqual(app.pushes, [])
+        self.assertEqual(app.events, [])
 
     def test_own_press_does_not_arm_second_watchdog(self):
         app = self._app({"front door": "button.abb_front"})
@@ -886,7 +913,8 @@ class AbbRescueTests(unittest.TestCase):
         _run_scheduled(app, "_verify_unlock")
 
         self.assertEqual(self._rescues(app), [])
-        self.assertEqual([p["title"] for p in app.pushes], ["Intercom auto-opened"])
+        self.assertEqual(_opened(app), ["Someone rang the back door"])
+        self.assertEqual(app.pushes, [])
 
     def test_an_unconfirmed_first_attempt_rescues_exactly_once_per_ring(self):
         app = self._ring()
@@ -902,6 +930,7 @@ class AbbRescueTests(unittest.TestCase):
         self.assertEqual(self._rescues(app), [self.RESCUE])
         self.assertEqual(len(self._pulses(app)), 3)
         self.assertEqual([p["title"] for p in app.pushes], ["Intercom auto-open failed"])
+        self.assertEqual(_opened(app), [])
 
     def _verify(self, app, attempt):
         app._verify_unlock({
@@ -945,7 +974,8 @@ class AbbRescueTests(unittest.TestCase):
         self.assertTrue(app.unlock_outcomes[self.BACK]["succeeded"])
         on_disk = json.loads((Path(self.tmpdir) / "intercom_state.json").read_text())
         self.assertTrue(on_disk[self.BACK]["succeeded"])
-        self.assertEqual([p["title"] for p in app.pushes], ["Intercom auto-opened"])
+        self.assertEqual(_opened(app), ["Someone rang the back door"])
+        self.assertEqual(app.pushes, [])
         self.assertEqual(self.cancelled, [last_attempt])
         self.assertNotIn(self.BACK, app.pending_unlocks)
         self.assertNotIn("_verify_unlock", [cb.__name__ for cb, _, _ in app.run_in_calls])
@@ -957,7 +987,8 @@ class AbbRescueTests(unittest.TestCase):
         self._attempt(app)
 
         self.assertEqual(self._pulses(app), [self.PULSE])
-        self.assertEqual([p["title"] for p in app.pushes], ["Intercom auto-opened"])
+        self.assertEqual(_opened(app), ["Someone rang the back door"])
+        self.assertEqual(app.pushes, [])
 
     def test_a_lock_still_locked_at_the_next_attempt_is_pulsed_as_before(self):
         app = self._ring()
@@ -971,7 +1002,8 @@ class AbbRescueTests(unittest.TestCase):
         _run_scheduled(app, "_verify_unlock")
         self.assertTrue(self._logged(
             app, "AUTO-OPEN: confirmed unlock of lock.back after back door ring (attempt 2)"))
-        self.assertEqual([p["title"] for p in app.pushes], ["Intercom auto-opened"])
+        self.assertEqual(_opened(app), ["Someone rang the back door"])
+        self.assertEqual(app.pushes, [])
 
     def test_another_rings_rescue_does_not_suppress_this_rings_pulse(self):
         app = self._ring()
@@ -1047,6 +1079,7 @@ class AbbRescueTests(unittest.TestCase):
             self._attempt(app)
             _run_scheduled(app, "_verify_unlock")
         self.assertEqual([p["title"] for p in app.pushes], ["Intercom auto-open failed"])
+        self.assertEqual(_opened(app), [])
 
     def test_a_rescue_call_that_raises_does_not_disturb_the_ladder_or_the_failure_report(self):
         app = self._ring()

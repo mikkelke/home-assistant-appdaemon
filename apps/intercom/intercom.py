@@ -98,7 +98,7 @@ class Intercom(hass.Hass):
         self.unlock_repeat_interval_s = int(self.args.get("unlock_repeat_interval_s", 7))
         self.debounce_s = int(self.args.get("debounce_s", 5))
         self.notify_target = self.args.get("notify_target", "mikkel")
-        self.food_courier_notify = self.args.get("food_courier_notify") or self.notify_target
+        self.food_courier_notify = self.args.get("food_courier_notify") or []
         # How stale a persisted "rang but auto-open unlock was never confirmed"
         # record can be at startup and still be worth alerting on - older than this
         # and the visitor is long gone, so alerting would just be noise (see
@@ -1248,35 +1248,25 @@ class Intercom(hass.Hass):
             self._report_auto_open_success(trigger_entity, lock_entity, outcome, "abb-rescue")
 
     def _report_auto_open_success(self, trigger_entity, lock_entity, outcome, unlock_attempt):
-        """First confirmed unlock of a ring: notify Mikkel, log to the house feed."""
+        """First confirmed unlock of a ring: a food courier is pushed to whoever of its audience is home; every ring
+        gets a house feed row."""
         ring_label = outcome.get("ring_label", "door")
         self.log(
             f"AUTO-OPEN: confirmed unlock of {lock_entity} after {ring_label} ring (attempt {unlock_attempt})",
             level="INFO",
         )
 
-        if self.mobile_notifier:
-            title = "Intercom auto-opened"
-            message = f"Someone rang the {ring_label} and the door was unlocked automatically."
-            target = self.notify_target
-            courier = self._street_courier
-            ring_ts = outcome.get("ring_ts")
-            if courier and isinstance(ring_ts, datetime) \
-                    and abs((courier[1] - ring_ts).total_seconds()) <= COURIER_PUSH_MATCH_S:
-                title = courier_push_title(courier[2])
-                message = f"Rang the {ring_label} and was let in automatically."
-                if courier[0] == "food":
-                    target = self.food_courier_notify
-            # Offer the push to the ABB bridge first: it can hold it the few
-            # seconds the gateway needs to produce THIS visitor's photo, instead
-            # of sending now with the previous visitor's (Mikkel, 2026-08-27).
-            # Strictly additive - a bridge that is absent, reloading or broken
-            # declines, and the immediate push below is byte-for-byte today's.
+        courier = self._street_courier
+        ring_ts = outcome.get("ring_ts")
+        food_courier = bool(courier) and courier[0] == "food" and isinstance(ring_ts, datetime) \
+            and abs((courier[1] - ring_ts).total_seconds()) <= COURIER_PUSH_MATCH_S
+        target = [person for person in self.food_courier_notify
+                  if self.get_state(f"person.{person}") == "home"] if food_courier else []
+        if self.mobile_notifier and target:
+            title = courier_push_title(courier[2])
+            message = f"Rang the {ring_label} and was let in automatically."
+            # The ABB bridge may hold the push until it has this visitor's photo; it declines when it cannot.
             if not self._abb_defer_ring_push(ring_label, title, message, target):
-                # ABB doorbell snapshot, if the bridge can offer one - computed
-                # OUTSIDE the try so a (impossible-by-contract) failure could never
-                # skip the push itself; None simply reproduces today's text-only
-                # notification.
                 attachment = self._abb_ring_attachment(ring_label)
                 try:
                     self.create_task(self.mobile_notifier.notify(
