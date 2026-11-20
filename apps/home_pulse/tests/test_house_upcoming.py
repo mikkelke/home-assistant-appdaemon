@@ -1612,7 +1612,7 @@ class PlantTests(unittest.TestCase):
             title = f"Water the {plant['name']}" + (f": {plant['water']:g} L" if plant["water"] else "")
             fire(app, entity, full(dry))
             row = plant_rows(app, PLANTS.values())[f"maint:plant:{plant['slug']}"]
-            self.assertEqual((row["title"], row["detail"], row.get("area")),
+            self.assertEqual((row["title"], row["detail"].split(";")[0], row.get("area")),
                              (title, f"soil {dry}%, water at {dry}%", plant["area"]), entity)
             self.assertEqual(row.get("info"), plant["info"] or None, entity)
             self.assertEqual(row.get("photo"), plant["photo"], entity)
@@ -1623,8 +1623,10 @@ class PlantTests(unittest.TestCase):
                 fed = plant_rows(app, PLANTS.values())[f"maint:plant:{plant['slug']}"]["title"]
                 self.assertEqual(fed, f"{title} + {plants.tsp_text(plant['water'])} tsp fertiliser", entity)
                 fire(app, plant["conductivity"], full("800"))
-                plain = plant_rows(app, PLANTS.values())[f"maint:plant:{plant['slug']}"]["title"]
-                self.assertEqual(plain, title, entity)
+                plain = plant_rows(app, PLANTS.values())[f"maint:plant:{plant['slug']}"]
+                self.assertEqual(plain["title"], title, entity)
+                self.assertEqual(plain["detail"], f"soil {dry}%, water at {dry}%; fertiliser 800, feed under 350",
+                                 entity)
         self.assertEqual(len(plant_rows(app, PLANTS.values())), len(PLANTS))
         for entity, plant in PLANTS.items():
             fire(app, entity, full(f"{plant['dry'] + plants.CLOSE_MARGIN:g}"))

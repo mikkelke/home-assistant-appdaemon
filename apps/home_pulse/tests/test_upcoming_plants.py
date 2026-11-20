@@ -277,7 +277,7 @@ class FeedTitleTests(unittest.TestCase):
             plant = plants.parse_plants([{**RAW[0], "water": water}])[ENTITY]
             row, _ = plants.plant_row(ENTITY, plant, feed([(T0, 12)], plant=plant), 12.0, 90)
             self.assertEqual(row["title"], title, water)
-            self.assertEqual(row["detail"], "soil 12%, water at 15%")
+            self.assertEqual(row["detail"], "soil 12%, water at 15%; fertiliser 90, feed under 350")
             self.assertTrue(core.is_valid_row(row), water)
     def test_a_long_name_gives_up_the_word_before_it_gives_up_the_name_and_the_dose_before_neither(self):
         def title(name, water=1):

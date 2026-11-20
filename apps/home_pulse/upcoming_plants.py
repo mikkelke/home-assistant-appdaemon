@@ -211,8 +211,11 @@ def plant_row(entity, plant, st, value, conductivity=None):
     st = st or {}
     if "since" not in st or value is None:
         return None
+    detail = f"soil {_percent(value)}, water at {_percent(plant['dry'])}"
+    if conductivity is not None:
+        detail += f"; fertiliser {round(conductivity)}, feed under {FEED_BELOW}"
     row = make_row(ID_PREFIX + plant["slug"], "maint", _title(plant, soil_feeds(conductivity)),
-                   f"soil {_percent(value)}, water at {_percent(plant['dry'])}", icon=ICON, area=plant["area"],
+                   detail, icon=ICON, area=plant["area"],
                    audience="admin", info=plant["info"], photo=plant["photo"])
     return row, f"plant:{entity}:{st['since']}"
 
