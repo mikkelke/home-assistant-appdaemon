@@ -13,6 +13,9 @@ import json
 
 MAP_URL_PREFIX = "/media/local/rober2_maps"
 
+# Residents by person.<name> entity and notify device_mapping key.
+RESIDENTS = ("mikkel", "claudia", "kristine")
+
 
 class MapIndexError(Exception):
     """index.json exists but is not a readable maps index."""
@@ -63,6 +66,11 @@ def write_map_index(index_file, index_data):
     os.replace(tmp, index_file)
 
 
+def problem_recipients(person_states, told):
+    """Residents who are home (person state "home", by name) and not yet in told."""
+    return [name for name in RESIDENTS if person_states.get(name) == "home" and name not in told]
+
+
 class Rober2Control(hass.Hass):
     """Simple vacuum control for Rober2 with door checking."""
     
@@ -90,6 +98,12 @@ class Rober2Control(hass.Hass):
         # Session-scoped: incremented when a room is fully completed; cleared after bin empty finishes.
         self._rooms_completed_this_session = 0
         
+        self._problem_file = self.args.get("problem_state_file") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "rober2_problem_state.json"
+        )
+        self._problem_lock = asyncio.Lock()
+        self._problems = self._load_problems()
+
         # Get reference to MobileNotifier app (if available)
         try:
             self.mobile_notifier = self.get_app("MobileNotifier")
@@ -184,6 +198,9 @@ class Rober2Control(hass.Hass):
         ]
         for person in self.person_entities:
             self.listen_state(self.handle_person_state, person)
+        for name in RESIDENTS:
+            self.listen_state(self.handle_problem_arrival, f"person.{name}")
+        self.run_in(self._drop_resolved_problems, 3)
         
         # Listen to room cleaning flag changes to update the job queue live
         self._room_flag_entity_to_id = {}
@@ -1100,27 +1117,27 @@ class Rober2Control(hass.Hass):
                                     if self._is_dock_room_attempt(self.current_room, room_name):
                                         reason = f"Stuck in {dock_pretty}"
                                         self.log(f"Robot stuck cleaning {dock_pretty} after {count} attempts", level="WARNING")
-                                        await self.send_notification(
+                                        await self._open_problem(
+                                            "stuck",
                                             title=f"Rober2 - Stuck in {dock_pretty}",
                                             message=f"Robot got stuck trying to clean {dock_pretty} after {count} attempts.",
-                                            target=["mikkel", "kristine", "claudia"]
                                         )
                                     else:
                                         reason = f"Stuck trying to leave {dock_pretty}"
                                         self.log(f"Robot never left dock after {count} attempts - stuck trying to leave {dock_pretty}", level="WARNING")
-                                        await self.send_notification(
+                                        await self._open_problem(
+                                            "stuck",
                                             title=f"Rober2 - Stuck trying to leave {dock_pretty}",
                                             message=f"Robot cannot leave {dock_pretty} after {count} attempts. Something is blocking the exit.",
-                                            target=["mikkel", "kristine", "claudia"]
                                         )
                                     await self._set_automation_paused(reason)
                                     await self.save_map_image(trigger_context=reason.replace(" ", "_").lower())
                                 else:
                                     self.log(f"Room {room_name} unreachable after {count} attempts - flag turned off", level="WARNING")
-                                    await self.send_notification(
+                                    await self._open_problem(
+                                        f"unreachable:{room_name}",
                                         title="Rober2 - Room unreachable",
                                         message=f"Could not reach {room_name.replace('_', ' ')} after {count} attempts. Skipping for this session.",
-                                        target=["mikkel", "kristine", "claudia"]
                                     )
                     else:
                         self.log(f"Room {room_name} interrupted with unknown cleaning duration - leaving flag on", level="WARNING")
@@ -1157,27 +1174,27 @@ class Rober2Control(hass.Hass):
                                     if self._is_dock_room_attempt(room_id, room_name):
                                         reason = f"Stuck in {dock_pretty}"
                                         self.log(f"Robot stuck cleaning {dock_pretty} after {count} attempts", level="WARNING")
-                                        await self.send_notification(
+                                        await self._open_problem(
+                                            "stuck",
                                             title=f"Rober2 - Stuck in {dock_pretty}",
                                             message=f"Robot got stuck trying to clean {dock_pretty} after {count} attempts.",
-                                            target=["mikkel", "kristine", "claudia"]
                                         )
                                     else:
                                         reason = f"Stuck trying to leave {dock_pretty}"
                                         self.log(f"Robot never left dock after {count} attempts - stuck trying to leave {dock_pretty}", level="WARNING")
-                                        await self.send_notification(
+                                        await self._open_problem(
+                                            "stuck",
                                             title=f"Rober2 - Stuck trying to leave {dock_pretty}",
                                             message=f"Robot cannot leave {dock_pretty} after {count} attempts. Something is blocking the exit.",
-                                            target=["mikkel", "kristine", "claudia"]
                                         )
                                     await self._set_automation_paused(reason)
                                     await self.save_map_image(trigger_context=reason.replace(" ", "_").lower())
                                 else:
                                     self.log(f"Room {room_name} unreachable after {count} attempts - flag turned off", level="WARNING")
-                                    await self.send_notification(
+                                    await self._open_problem(
+                                        f"unreachable:{room_name}",
                                         title="Rober2 - Room unreachable",
                                         message=f"Could not reach {room_name.replace('_', ' ')} after {count} attempts. Skipping for this session.",
-                                        target=["mikkel", "kristine", "claudia"]
                                     )
                             # When count < 3 we keep _last_attempted_room_id so next dock can count again
                 
@@ -2231,6 +2248,7 @@ class Rober2Control(hass.Hass):
         """Mark a room as cleaned."""
         try:
             room_name = self.room_config.get(room_id, room_id)
+            await self._close_problem(f"unreachable:{room_name}")
             
             # Update last cleaned date
             today = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -2515,13 +2533,14 @@ class Rober2Control(hass.Hass):
                                         f"Error '{old}' cleared - automation resuming")
                 await self._set_narrative(f"Error cleared - {str(old).replace('_', ' ')} - resuming")
 
-                # Send notification that error is cleared (always to Mikkel and Kristine)
-                await self.send_notification(
-                    title="Rober2 Error Resolved",
-                    message=f"Error '{old.replace('_', ' ').title()}' has been cleared.\nAutomation resuming.",
-                    target=["mikkel", "kristine", "claudia"],  # Always send regardless of presence
-                    data={"data": {"importance": "default", "channel": "alerts"}}
-                )
+                told = await self._close_problem("error")
+                if told:
+                    await self.send_notification(
+                        title="Rober2 Error Resolved",
+                        message=f"Error '{old.replace('_', ' ').title()}' has been cleared.\nAutomation resuming.",
+                        target=told,
+                        data={"data": {"importance": "default", "channel": "alerts"}}
+                    )
                 
                 # Re-evaluate cleaning conditions now that error is cleared
                 self.run_in(self.evaluate_cleaning_conditions, 2, trigger="error_cleared")
@@ -2570,11 +2589,10 @@ class Rober2Control(hass.Hass):
                 else:
                     await self._set_narrative(f"Error - {err_pretty} - stopped")
                 
-                # Send notification for critical error (always to Mikkel and Kristine)
-                await self.send_notification(
+                await self._open_problem(
+                    "error",
                     title="Rober2 Error - Cleaning Stopped",
                     message=f"Critical error detected: {new.replace('_', ' ').title()}\nRoom: {room_name}\nCleaning has been stopped.",
-                    target=["mikkel", "kristine", "claudia"],  # Always send regardless of presence
                     data={"data": {"importance": "high", "channel": "alerts"}}
                 )
                 await self._report_house_event(
@@ -2589,11 +2607,10 @@ class Rober2Control(hass.Hass):
                                         f"Error '{new}' detected - monitoring")
                 await self._set_narrative(f"Error - {str(new).replace('_', ' ')} - idle")
 
-                # Send notification for critical error (not cleaning, always to Mikkel and Kristine)
-                await self.send_notification(
+                await self._open_problem(
+                    "error",
                     title="Rober2 Error Detected",
                     message=f"Critical error detected: {new.replace('_', ' ').title()}\nAutomation is paused.",
-                    target=["mikkel", "kristine", "claudia"],  # Always send regardless of presence
                     data={"data": {"importance": "high", "channel": "alerts"}}
                 )
                 await self._report_house_event(
@@ -2623,6 +2640,7 @@ class Rober2Control(hass.Hass):
         """When user turns off the pause boolean, send robot home and clear reason."""
         try:
             if old == "on" and new == "off":
+                await self._close_problem("stuck")
                 self.log("Automation pause reset - sending robot home", level="INFO")
                 await self._set_narrative("Pause cleared - sending robot home")
                 await self._safe_call_service("vacuum/return_to_base", entity_id="vacuum.rober2")
@@ -2633,7 +2651,7 @@ class Rober2Control(hass.Hass):
         except Exception as e:
             self.log(f"Error in automation paused reset: {e}", level="ERROR")
             
-    async def send_notification(self, title: str, message: str, target: str = "user", data: dict = None):
+    async def send_notification(self, title: str, message: str, target: str = "user", data: dict = None) -> int:
         """Send notification via MobileNotifier app.
         
         Args:
@@ -2646,12 +2664,126 @@ class Rober2Control(hass.Hass):
                 - List of person names: Send to specific people
                 - Notification service string: Send to specific service
             data: Optional additional data (e.g., {"data": {"importance": "high"}})
+
+        Returns:
+            The number of devices reached, 0 when none.
         """
         if not self.mobile_notifier:
             self.log("Mobile Notifier not available, skipping notification", level="DEBUG")
-            return
+            return 0
         
         try:
-            await self.mobile_notifier.notify(title=title, message=message, target=target, data=data)
+            return await self.mobile_notifier.notify(title=title, message=message, target=target, data=data) or 0
         except Exception as e:
-            self.log(f"Error sending notification: {e}", level="ERROR") 
+            self.log(f"Error sending notification: {e}", level="ERROR")
+            return 0
+
+    # --- Problem pushes: residents at home hear at once, the others when they arrive ---
+    def _load_problems(self) -> dict:
+        """The open problem episodes _save_problems wrote, by kind; {} when there are none or the file is unreadable."""
+        try:
+            with open(self._problem_file, "r") as f:
+                stored = json.load(f)
+            return {
+                kind: {
+                    "title": str(episode["title"]),
+                    "message": str(episode["message"]),
+                    "data": episode.get("data"),
+                    "told": [name for name in episode["told"] if name in RESIDENTS],
+                }
+                for kind, episode in stored.items()
+            }
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            self.log(f"Problem state {self._problem_file} unreadable, starting with none: {e}", level="WARNING")
+            return {}
+
+    def _save_problems(self) -> None:
+        tmp = f"{self._problem_file}.tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(self._problems, f)
+            os.replace(tmp, self._problem_file)
+        except Exception as e:
+            self.log(f"Could not save problem state: {e}", level="WARNING")
+
+    async def _tell_residents(self, title: str, message: str, data: dict = None, told=()) -> list[str]:
+        """Push to each resident who is home and not in told, one push per person.
+        Returns the names it reached, so a failed delivery does not count as told."""
+        reached = []
+        try:
+            states = {name: await self.get_state(f"person.{name}") for name in RESIDENTS}
+            for name in problem_recipients(states, told):
+                if await self.send_notification(title=title, message=message, target=[name], data=data):
+                    reached.append(name)
+        except Exception as e:
+            self.log(f"Error telling residents: {e}", level="ERROR")
+        return reached
+
+    async def _open_problem(self, kind: str, title: str, message: str, data: dict = None) -> None:
+        """A problem started or went on: tell the residents at home who have not heard about it.
+        The others hear on arrival (handle_problem_arrival) until _close_problem. There is one
+        episode per kind; a different title or message starts a new one with nobody told.
+
+        Kinds and what closes them: "error" when sensor.rober2_vacuum_error clears, "stuck" when
+        the automation-paused boolean is turned off, "unreachable:<room>" when that room is cleaned."""
+        async with self._problem_lock:
+            episode = self._problems.get(kind)
+            if episode is None or (episode["title"], episode["message"]) != (title, message):
+                episode = self._problems[kind] = {"title": title, "message": message, "data": data, "told": []}
+            reached = await self._tell_residents(title, message, data, episode["told"])
+            episode["told"] += reached
+            self._save_problems()
+            self.log(f"Problem '{title}' ({kind}): told {', '.join(reached) or 'nobody'}", level="INFO")
+
+    async def _close_problem(self, kind: str) -> list[str]:
+        """The problem is over: forget its episode and return the residents who were told about it."""
+        async with self._problem_lock:
+            episode = self._problems.pop(kind, None)
+            if episode is None:
+                return []
+            self._save_problems()
+            self.log(f"Problem '{episode['title']}' ({kind}) over, told {', '.join(episode['told']) or 'nobody'}", level="INFO")
+            return episode["told"]
+
+    async def handle_problem_arrival(self, entity, attribute, old, new, kwargs):
+        """A resident came home: tell them about the problems that are still open."""
+        try:
+            if new != "home" or old == "home" or not self._problems:
+                return
+            async with self._problem_lock:
+                told_someone = False
+                for kind, episode in self._problems.items():
+                    reached = await self._tell_residents(
+                        episode["title"], episode["message"], episode["data"], episode["told"]
+                    )
+                    if reached:
+                        episode["told"] += reached
+                        told_someone = True
+                        self.log(f"Problem '{episode['title']}' ({kind}): told {', '.join(reached)} on arrival", level="INFO")
+                if told_someone:
+                    self._save_problems()
+        except Exception as e:
+            self.log(f"Error telling arrivals about open problems: {e}", level="ERROR")
+
+    async def _drop_resolved_problems(self, kwargs):
+        """After a reload, forget the saved problems that ended while the app was down."""
+        try:
+            async with self._problem_lock:
+                dropped = False
+                for kind in list(self._problems):
+                    if kind == "error":
+                        active = (await self.has_active_error())[0]
+                    elif kind == "stuck":
+                        active = await self.get_state("input_boolean.rober2_automation_paused") == "on"
+                    else:
+                        active = True
+                    if not active:
+                        del self._problems[kind]
+                        dropped = True
+                        self.log(f"Dropped pending {kind} problem: the robot is fine", level="INFO")
+                if dropped:
+                    self._save_problems()
+        except Exception as e:
+            self.log(f"Error dropping resolved problems: {e}", level="ERROR")

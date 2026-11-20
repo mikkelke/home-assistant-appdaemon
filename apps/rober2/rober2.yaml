@@ -28,6 +28,9 @@ rober2_control:
   # Max seconds after segment command to count a dock as a failed attempt (default 30 min); avoids
   # counting unavailable->docked or state refresh hours later as attempt 3/3
   # max_elapsed_zero_progress_sec: 1800
+  # Open problems (robot error, stuck, unreachable room) wait here for residents who are away, also across
+  # an app reload. Default: rober2_problem_state.json beside control.py.
+  # problem_state_file: /conf/apps/rober2/rober2_problem_state.json
   # Segment clean uses HA script.rober2_app_segment_clean (script.turn_on). Optional: use_segment_clean_script,
   # segment_clean_script_entity, segment_script_hass_timeout_s, ha_call_timeout_s, vacuum_command_timeout_s
 
