@@ -35,7 +35,7 @@ MusicAttribution:
   # Resident -> media_player of their own Spotify integration config entry. Spotify Connect
   # starts read "Someone" while this is empty, and "A guest" needs every resident listed.
   spotify_accounts:
-    # Mikkel: media_player.spotify_mikkel
+    Mikkel: media_player.spotify_mikkel
     # Kristine: media_player.spotify_kristine
     # Claudia: media_player.spotify_claudia
 
