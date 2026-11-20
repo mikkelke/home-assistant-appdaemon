@@ -4,8 +4,8 @@ Two kinds of entries (v2 - reshaped after user feedback that raw on/off logging 
 things you can see/hear yourself has no value):
 
 1. cause -> effect reports from the automation apps themselves, fired as a
-   `house_events_report` AppDaemon event ("Living room TV button held" ->
-   "TV moving to kitchen"; "Bedroom TV turned on" -> "TV lift going down").
+   `house_events_report` AppDaemon event ("Rain on the roof sensor" -> "Close the
+   terrace door" from WeatherOpeningAlert).
    Event-based on purpose: no get_app coupling, no init-order dependency - an
    emitting app just fire_event()s and never notices whether this app is running.
    An observer app reporting a plain fact with no automation behind it sends `text`

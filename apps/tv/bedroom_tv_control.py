@@ -18,17 +18,6 @@ class BedroomTVControl(hass.Hass):
             pass
         return False
 
-
-    def _report_house_event(self, cause, effect):
-        """Explain an automated lift move to the dashboard's Home activity feed.
-        Fire-and-forget: HouseEvents (apps/home_pulse) listens for this event; if it
-        is not running the event just evaporates. Must never break lift control.
-        audience=admin: Mikkel's bedroom TV - not the housemates' business."""
-        try:
-            self.fire_event("house_events_report", cause=cause, effect=effect, icon="mdi:television", audience="admin")
-        except Exception:
-            pass
-
     def initialize(self):
         # Initialize the flag for Apple TV connection reset
         self.apple_tv_reset_in_progress = False
@@ -602,12 +591,6 @@ class BedroomTVControl(hass.Hass):
                         target="mikkel"))
                 except Exception as e:
                     self.log(f"raise-failure notify failed: {e}", level="WARNING")
-                # Push says "act now"; the feed entry explains the exposed TV in the
-                # timeline (rare terminal give-up, once per raise sequence).
-                self._report_house_event(
-                    "Bedroom TV lift never confirmed going up",
-                    f"Gave up after {len(self.RAISE_RETRY_DELAYS_S)} retries - the lift needs a manual raise",
-                )
                 self._raise_attempt = 1
                 return
             delay = self.RAISE_RETRY_DELAYS_S[attempt - 1]
@@ -978,10 +961,9 @@ class BedroomTVControl(hass.Hass):
 
         # Startup/heal invocations trust the persistent position tracker (mirror of the
         # already-Down skip in _ensure_lift_down_if_tv_active): lift already Up means
-        # nothing to heal, and commanding anyway would also re-report "TV turned off ->
-        # lift going up" to the activity feed on EVERY app reload (user saw one phantom
-        # entry per deploy, 2026-07-16). A real tv_off transition still always commands -
-        # right after the TV was on, a tracker claiming "Up" is stale by definition.
+        # nothing to heal, and commanding anyway would move the lift on every app reload.
+        # A real tv_off transition still always commands - right after the TV was on, a
+        # tracker claiming "Up" is stale by definition.
         if path_marker == "initial_state_check" and self._get_lift_position() == "Up":
             self.log("Initial state check: lift already Up - nothing to heal", level="INFO")
             self._stop_periodic_verification()
@@ -1000,7 +982,6 @@ class BedroomTVControl(hass.Hass):
                     pass
             self.call_service("script/turn_on", entity_id="script.bedroom_tv_lift_position_up")
             self.log(f"TV OFF: Raising lift to UP position", level="INFO")
-            self._report_house_event("Bedroom TV turned off", "TV lift going up")
             # Update persistent position tracking
             self._update_lift_position("Up")
             # Stop periodic verification when TV is off
@@ -1103,7 +1084,6 @@ class BedroomTVControl(hass.Hass):
                         pass
                 self.call_service("script/turn_on", entity_id="script.bedroom_tv_lift_position_down")
                 self.log("TV ON: Lowering lift to DOWN position", level="INFO")
-                self._report_house_event("Bedroom TV turned on", "TV lift going down")
                 # Update persistent position tracking
                 self._update_lift_position("Down")
                 # Start periodic verification if enabled

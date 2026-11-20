@@ -15,16 +15,6 @@ class LivingRoomTvControl(hass.Hass):
             pass
         return False
 
-
-    def _report_house_event(self, cause, effect):
-        """Explain an automated TV/lift move to the dashboard's Home activity feed.
-        Fire-and-forget: HouseEvents (apps/home_pulse) listens for this event; if it
-        is not running the event just evaporates. Must never break TV control."""
-        try:
-            self.fire_event("house_events_report", cause=cause, effect=effect, icon="mdi:television")
-        except Exception:
-            pass
-
     def initialize(self):
         self.log("LivingRoomTvControl Initializing")
 
@@ -373,7 +363,6 @@ class LivingRoomTvControl(hass.Hass):
                             pass
                     self.call_service("select/select_option", entity_id=self.lift_select_entity, option=target_pos)
                     self.log(f"Lift moved to '{target_pos}' (immediate)")
-                    self._report_house_event(f"Living room TV button {button_id} held", f"TV moving to {announce_phrase}")
                 except Exception as e:
                     self.error(f"Error moving lift to '{target_pos}': {e}")
                     # Clear verification on error
@@ -1318,7 +1307,6 @@ class LivingRoomTvControl(hass.Hass):
             return
         try:
             self.call_service("select/select_option", entity_id=self.lift_select_entity, option="Wall")
-            self._report_house_event("Living room TV turned off", "TV moving to wall")
         except Exception as e:
             self.error(f"Error executing delayed move to 'Wall': {e}", exc_info=True)
 
