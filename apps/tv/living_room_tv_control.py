@@ -406,6 +406,15 @@ class LivingRoomTvControl(hass.Hass):
     def _stop_living_room_media_and_reset(self, reason=""):
         # Stop living room media if it looks stuck playing from TV
         try:
+            raw = self.living_room_speaker_entity + "_2"
+            members = self.get_state(raw, attribute="group_members")
+            source = self.get_state(raw, attribute="source")
+            if isinstance(members, list) and len(members) > 1 and source != "TV":
+                self.log(
+                    f"TV off: {self.living_room_speaker_entity} is in a {len(members)}-speaker group "
+                    f"playing {source or 'music'}, leaving the group alone"
+                )
+                return
             state = None
             try:
                 state = self.get_state(self.living_room_speaker_entity)
