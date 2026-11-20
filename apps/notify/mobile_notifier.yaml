@@ -35,6 +35,7 @@ MobileNotifier:
     fire_health: ["mikkel"]   # FireSafety self-tests only; real fire alarms use an unlisted category so they broadcast to everyone
     arrival_lists: ["mikkel"]   # ArrivalLists: open Husk to-do items on arrival home or at the office
     delivery: ["mikkel", "kristine"]   # Wolt only (Kristine orders on Mikkel's Wolt account); Nemlig and parcels are Mikkel's alone, LiveUpdates sets each kind's audience itself
+    ice_bath: ["claudia"]   # HouseUpcoming: ice is likely in the terrace ice bath; Claudia uses it
 
   # Default notification service for user (for vacuum errors, etc.)
   # This will always be used when target="user"

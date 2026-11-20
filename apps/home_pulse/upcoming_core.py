@@ -6,7 +6,7 @@ Entity shape:
         so rows vanish within LEASE of the publisher stopping
     attributes.rows: list of rows, sorted by ``at`` then ``id``, untimed rows last
 
-Row fields: ``id`` (stable), ``kind`` (rain | maint), ``at`` (UTC ISO, absent =
+Row fields: ``id`` (stable), ``kind`` (rain | maint; any weather row is rain), ``at`` (UTC ISO, absent =
 untimed), ``icon``, ``title``, ``detail``, ``chip``, ``area`` (HA area id a tap opens),
 ``audience`` ("admin") or ``audience_users`` (HA display names), ``next`` ("skip": the
 dashboard's next chip passes the row over). A maintenance row may carry what its sheet shows, and

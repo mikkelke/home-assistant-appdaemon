@@ -1,8 +1,8 @@
 """HouseUpcoming - what is coming up in the house that only the server can know, for the dashboard's
 Now timeline: maintenance (the Rober2 parts, the appliances' run-based tasks, the drum clean and the
 hygiene run at their cheapest start, batteries by their replace-by day and
-offline devices, and houseplants that need water and one-off tasks; admin only), and
-rain, forecast or falling, while a terrace door is open (exploratory).
+offline devices, and houseplants that need water and one-off tasks; admin only),
+rain, forecast or falling, while a terrace door is open (exploratory), and ice in the terrace ice bath.
 
 Publishes sensor.house_upcoming (shape in upcoming_core.py) plus one maintenance push a day, built
 from the same conditions the rows show. With push_person set the push goes at push_time only while
@@ -41,8 +41,13 @@ Yale keypad unlocks by residents still registered away 15 minutes later add quie
 (upcoming_yale), closed with Done. Notes and Done survive reload; pending checks are dropped. These
 notes have no push key and never enter the maintenance digest.
 
-Latches, push keys, battery facts, the cleaning rate and the tapped tasks' anchors persist in
-house_upcoming_state.json next to this module; rain forecast fixtures go to
+The ice bath's thermometer and the person who uses the bath (the `ice` section of house_upcoming.yaml) are
+sources like the rest. Water that has sat at about 0 C long enough for an ice skin to be likely gives a row in
+the rooftop area (upcoming_ice), and one push a day through MobileNotifier's ice_bath category, whose
+audience says who gets it, while that person is home between push_from and push_until.
+
+Latches, push keys, battery facts, the cleaning rate, the tapped tasks' anchors and the ice bath's cold spell
+and last push day persist in house_upcoming_state.json next to this module; rain forecast fixtures go to
 house_upcoming_rain_fixtures.jsonl.
 """
 
@@ -61,6 +66,7 @@ import run_ledger  # apps/appliances
 import upcoming_battery_age as age
 import upcoming_core as core
 import upcoming_drum as drum
+import upcoming_ice as ice
 import upcoming_maint as maint
 import upcoming_once as once
 import upcoming_plants as plants
@@ -73,6 +79,7 @@ HISTORY_DELAY_S = 45
 STATE_WRITE_MIN_S = 60
 FORECAST_TIMEOUT_S = 12
 FETCH_STUCK = timedelta(minutes=5)
+ICE_RETRY = timedelta(minutes=10)
 STATE_VERSION = 1
 
 
@@ -133,6 +140,7 @@ class HouseUpcoming(hass.Hass):
         self.rain_home = rn.get("home", "zone.home")
         self.rain_ahead_home = timedelta(hours=float(rn.get("horizon_home_hours", 1)))
         self.rain_ahead_away = timedelta(hours=float(rn.get("horizon_away_hours", 3)))
+        self.ice_cfg = ice.parse(a.get("ice"))
         self.inventory = maint.parse_inventory(a.get("batteries"))
         self.plants = plants.parse_plants(a.get("plants"))
         self.timed_plants = plants.parse_timed(a.get("plants"))
@@ -165,6 +173,8 @@ class HouseUpcoming(hass.Hass):
             saved.get("done"), self.run_tasks,
             [plants.anchor_key(plant) for plant in self.timed_plants.values()]
             + [once.anchor_key(task) for task in self.once_tasks.values()])
+        self._ice = ice.restore(saved.get("ice"))
+        self._ice_retry_at = None
         self._ledger_files = {}
         self._state_text = None
         self._state_written_at = None
@@ -179,11 +189,13 @@ class HouseUpcoming(hass.Hass):
         for entity in self._sources():
             self._cache[entity] = self._read(entity)
             self.listen_state(self._on_source, entity, attribute="all")
+        self._observe_ice(self._cache.get(self.ice_cfg["entity"]))
         self.listen_event(self._on_plugin_started, "plugin_started")
         self.listen_event(self._on_done, "house_upcoming_done")
         self.listen_event(self._on_undo, "house_upcoming_undo")
         self.run_every(self._on_tick, f"now+{TICK_S}", TICK_S)
         self.run_daily(self._on_push_time, self.push_time)
+        self.run_daily(self._on_ice_hours, self.ice_cfg["push_from"])
         if self.push_person:
             self.listen_state(self._on_push_person_home, self.push_person, new="home")
         self.run_daily(self._history_job, _clock(a.get("history_time"), "03:40:00"))
@@ -203,7 +215,7 @@ class HouseUpcoming(hass.Hass):
     def _sources(self):
         sources = list(self.rober2_entities.values())
         sources += [self.washer_entity, self.price_entity, self.profiles_entity, self.rain_alert, self.rain_home,
-                    self.stick_entity]
+                    self.stick_entity, self.ice_cfg["entity"], self.ice_cfg["person"]]
         sources += list(self.rain_doors) + list(self.inventory["devices"]) + list(self.plants)
         if self.yale_operators:
             sources += [self.yale_lock, self.yale_operator]
@@ -255,6 +267,8 @@ class HouseUpcoming(hass.Hass):
     def _on_source(self, entity, attribute, old, new, kwargs):
         self._cache[entity] = new if isinstance(new, dict) else None
         self._on_yale_source(entity, old, new)
+        if entity == self.ice_cfg["entity"]:
+            self._observe_ice(self._cache[entity])
         if entity in self.inventory["devices"] and isinstance(new, dict):
             was = maint.reading(old.get("state")) if isinstance(old, dict) else None
             if was is not None and maint.reading(new.get("state")) is None:
@@ -453,6 +467,7 @@ class HouseUpcoming(hass.Hass):
                 conditions.append((item[0]["title"], item[1]))
 
         rows.extend(self._rain_rows(now))
+        rows.extend(ice.rows(self._ice, self.ice_cfg, now))
         # Informative notes never enter maintenance push conditions.
         rows.extend(yale.rows(self._yale_notes, self.yale_operators))
 
@@ -467,6 +482,7 @@ class HouseUpcoming(hass.Hass):
             self._publish(rows, now)
         self._save_state()
         self._push_stick(stick)
+        self._push_ice(now)
 
     def _run_rows(self, now):
         ledgers = self._ledgers()
@@ -607,6 +623,50 @@ class HouseUpcoming(hass.Hass):
                 f.write(json.dumps(record, sort_keys=True) + "\n")
         except Exception as e:
             self.log(f"Rain fixture write failed: {e!r}", level="WARNING")
+
+    # -- ice bath -------------------------------------------------------------
+
+    def _observe_ice(self, full):
+        """A reading of the ice bath thermometer, taken when its state last changed."""
+        full = full if isinstance(full, dict) else {}
+        at = maint.parse_iso(full.get("last_changed")) or self.get_now()
+        self._ice = ice.step(self._ice, self.ice_cfg, maint.reading(full.get("state")), at)
+
+    def _on_ice_hours(self, kwargs):
+        self._evaluate()
+
+    def _push_ice(self, now):
+        if "ice" in self._handoff or (self._ice_retry_at and now < self._ice_retry_at):
+            return
+        home = self._state_of(self.ice_cfg["person"]) == "home"
+        if ice.push_due(self._ice, self.ice_cfg, home, now):
+            self._handoff["ice"] = None
+            self.create_task(self._send_ice(ice.push(self._ice, now)))
+
+    async def _send_ice(self, found):
+        delivered = 0
+        try:
+            delivered = await self._notifier.notify(title=found["title"], message=found["message"], target="home",
+                                                    category=found["category"])
+        except Exception as e:
+            self.log(f"Ice bath push failed: {e!r}", level="WARNING")
+        self._handoff["ice"] = (found, delivered or 0)
+        await self.run_in(self._apply_ice_push, 0)
+
+    def _apply_ice_push(self, kwargs):
+        found, delivered = self._handoff.pop("ice", None) or (None, 0)
+        if not found:
+            return
+        now = self.get_now()
+        if not delivered:
+            self._ice_retry_at = now + ICE_RETRY
+            self.log(f"Ice bath push not delivered; trying again in {ICE_RETRY.total_seconds() / 60:.0f} minutes",
+                     level="WARNING")
+            return
+        self._ice_retry_at = None
+        self._ice = ice.pushed(self._ice, now)
+        self._save_state(force=True)
+        self.log(f"Ice bath push sent: {found['title']}, {found['message']}")
 
     # -- recorder history -----------------------------------------------------
 
@@ -756,7 +816,8 @@ class HouseUpcoming(hass.Hass):
     def _save_state(self, force=False):
         data = {"version": STATE_VERSION, "rober2": self._rober2, "rober2_rate": self._rober2_rate,
                 "batteries": self._batteries, "plants": self._plant_latches, "pushed": self._pushed,
-                "facts": self._facts, "content": self._content, "done": self._anchors, "yale": self._yale_notes}
+                "facts": self._facts, "content": self._content, "done": self._anchors, "yale": self._yale_notes,
+                "ice": self._ice}
         text = json.dumps(data, sort_keys=True)
         if text == self._state_text:
             return

@@ -219,7 +219,8 @@ def make_app(states=None, state_dir=None, now=NOW, ledgers=None, **args):
     app.reports = []
     app.fire_event = lambda event, **kw: app.reports.append((event, kw))
     app.run_every = lambda *a, **kw: None
-    app.run_daily = lambda *a, **kw: None
+    app.daily = []
+    app.run_daily = lambda callback, start, **kw: app.daily.append((callback.__name__, start))
     app.log = lambda msg, level="INFO", **kw: app.logs.append((level, msg))
     app.initialize()
     return app
