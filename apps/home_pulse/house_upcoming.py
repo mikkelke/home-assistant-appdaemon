@@ -1,7 +1,7 @@
 """HouseUpcoming - what is coming up in the house that only the server can know, for the dashboard's
 Now timeline: maintenance (the Rober2 parts, the appliances' run-based tasks, the drum clean and the
 hygiene run at their cheapest start, batteries by their replace-by day and
-offline devices, and houseplants that need water and one-off tasks; admin only), Kristine's train, and
+offline devices, and houseplants that need water and one-off tasks; admin only), and
 rain, forecast or falling, while a terrace door is open (exploratory).
 
 Publishes sensor.house_upcoming (shape in upcoming_core.py) plus one maintenance push a day, built
@@ -66,7 +66,6 @@ import upcoming_once as once
 import upcoming_plants as plants
 import upcoming_rain as rain
 import upcoming_runs as runs
-import upcoming_train as train
 import upcoming_yale as yale
 
 TICK_S = 300
@@ -127,11 +126,6 @@ class HouseUpcoming(hass.Hass):
                                             or here.parent / "appliances" / "stick_vacuum_feedback.json")
         self.run_tasks = runs.configured(runs.interval_from(dryer.get("interval_runs")))
         self.done_log_file = Path(a.get("done_log_file") or here / "house_upcoming_done_log.jsonl")
-        tr = a.get("train") or {}
-        self.train_route = tr.get("route", "sensor.transit_kbh_ic_odense")
-        self.train_stog = tr.get("stog_status", "input_select.transit_carlsberg_stog_kbh_status")
-        self.train_person = tr.get("person", "person.kristine")
-        self.train_users = tuple(tr.get("users") or ["Kristine"])
         rn = a.get("rain") or {}
         self.weather_entity = rn.get("weather", "weather.forecast_home")
         self.rain_alert = rn.get("alert", "binary_sensor.weather_opening_alert_rooftop_rain")
@@ -208,8 +202,8 @@ class HouseUpcoming(hass.Hass):
 
     def _sources(self):
         sources = list(self.rober2_entities.values())
-        sources += [self.washer_entity, self.price_entity, self.profiles_entity, self.train_route, self.train_stog,
-                    self.train_person, self.rain_alert, self.rain_home, self.stick_entity]
+        sources += [self.washer_entity, self.price_entity, self.profiles_entity, self.rain_alert, self.rain_home,
+                    self.stick_entity]
         sources += list(self.rain_doors) + list(self.inventory["devices"]) + list(self.plants)
         if self.yale_operators:
             sources += [self.yale_lock, self.yale_operator]
@@ -458,8 +452,6 @@ class HouseUpcoming(hass.Hass):
                 rows.append(item[0])
                 conditions.append((item[0]["title"], item[1]))
 
-        rows.append(train.train_row(self._cache.get(self.train_route), self._state_of(self.train_stog),
-                                    self._state_of(self.train_person), now, self.train_users))
         rows.extend(self._rain_rows(now))
         # Informative notes never enter maintenance push conditions.
         rows.extend(yale.rows(self._yale_notes, self.yale_operators))

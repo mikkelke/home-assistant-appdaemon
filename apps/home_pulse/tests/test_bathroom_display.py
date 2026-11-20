@@ -452,14 +452,14 @@ class RowTests(unittest.TestCase):
         self.assertEqual([line.text for line in self.lines(rows)], ["Real row"])
 
     def test_a_row_for_other_people_is_not_a_line_for_mikkel(self):
-        rows = [core.make_row("train:kristine", "train", "Train to Odense", at=NOW + 20 * MIN,
+        rows = [core.make_row("rain:kristine", "rain", "Rain for Kristine", at=NOW + 20 * MIN,
                               audience_users=["Kristine"]),
-                core.make_row("train:both", "train", "Shared train", at=NOW + 30 * MIN,
+                core.make_row("rain:both", "rain", "Shared rain", at=NOW + 30 * MIN,
                               audience_users=["Kristine", "mikkel"]),
                 core.make_row("rain:living_room", "rain", "Rain forecast", at=NOW + HOUR, area="living_room")]
-        self.assertEqual([line.text for line in self.lines(rows)], ["Shared train", "Rain forecast"])
+        self.assertEqual([line.text for line in self.lines(rows)], ["Shared rain", "Rain forecast"])
         self.assertEqual([line.text for line in self.lines(rows, resident="Kristine")],
-                         ["Train to Odense", "Shared train", "Rain forecast"])
+                         ["Rain for Kristine", "Shared rain", "Rain forecast"])
 
     def test_a_row_with_no_time_is_due_now_and_a_line_with_a_today_chip(self):
         rows = [core.make_row("maint:battery:sensor.door", "maint", "Bathroom door battery", "no data since 03.11",

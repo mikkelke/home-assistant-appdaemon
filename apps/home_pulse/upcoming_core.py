@@ -6,7 +6,7 @@ Entity shape:
         so rows vanish within LEASE of the publisher stopping
     attributes.rows: list of rows, sorted by ``at`` then ``id``, untimed rows last
 
-Row fields: ``id`` (stable), ``kind`` (rain | train | maint), ``at`` (UTC ISO, absent =
+Row fields: ``id`` (stable), ``kind`` (rain | maint), ``at`` (UTC ISO, absent =
 untimed), ``icon``, ``title``, ``detail``, ``chip``, ``area`` (HA area id a tap opens),
 ``audience`` ("admin") or ``audience_users`` (HA display names), ``next`` ("skip": the
 dashboard's next chip passes the row over). A maintenance row may carry what its sheet shows, and
@@ -28,7 +28,7 @@ TEXT_MAX = 60
 CHIP_MAX = 30
 NAME_MAX = 40
 LEASE = timedelta(minutes=15)
-KINDS = ("rain", "train", "maint")
+KINDS = ("rain", "maint")
 INFO_MAX = 4
 STEPS_MAX = 8
 STEP_MAX = 150

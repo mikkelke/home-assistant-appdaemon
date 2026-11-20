@@ -29,8 +29,8 @@ def battery(i):
 
 class MakeRowTests(unittest.TestCase):
     def test_every_value_is_an_ascii_string_or_a_list_of_them(self):
-        row = core.make_row("train:kristine", "train", "Train to Odense", "07:46 +5, 08:02", at=NOW,
-                            icon="mdi:train", chip="S-tog delayed", audience_users=["Kristine"])
+        row = core.make_row("rain:terrace", "rain", "Rain forecast", "09-11, 2.1 mm", at=NOW,
+                            icon="mdi:weather-rainy", chip="Door open", audience_users=["Kristine"])
         self.assertTrue(all(strings_only(v) for v in row.values()))
         self.assertEqual(row["at"], "2026-10-14T10:00:00+00:00")
         self.assertTrue(core.is_valid_row(row))
@@ -104,8 +104,8 @@ class PhotoTests(unittest.TestCase):
         self.assertTrue(core.is_valid_row({**good, "photo": "a" * core.TEXT_MAX}))
         rain = core.make_row("rain:terrace", "rain", "Rain forecast", photo="monstera")
         self.assertFalse(core.is_valid_row(rain))
-        train = core.make_row("train:kristine", "train", "Train", audience_users=["Kristine"], photo="monstera")
-        self.assertFalse(core.is_valid_row(train))
+        scoped = core.make_row("rain:kristine", "rain", "Rain", audience_users=["Kristine"], photo="monstera")
+        self.assertFalse(core.is_valid_row(scoped))
 
     def test_a_row_with_a_key_goes_through_finalize_untouched_and_one_with_a_wrong_key_is_dropped(self):
         row = self.make(photo="monstera")
@@ -223,11 +223,11 @@ class FinalizeTests(unittest.TestCase):
         rows = [
             battery(1),
             core.make_row("rain:terrace", "rain", "Rain forecast", at=NOW + timedelta(hours=2)),
-            core.make_row("train:kristine", "train", "Train", at=NOW, audience_users=["Kristine"]),
+            core.make_row("rain:kristine", "rain", "Rain", at=NOW, audience_users=["Kristine"]),
             core.make_row("maint:washer:drum", "maint", "Washer drum clean", audience="admin"),
         ]
         ids = [row["id"] for row in core.finalize_rows(rows)]
-        self.assertEqual(ids, ["train:kristine", "rain:terrace", "maint:battery:sensor.device_01_battery",
+        self.assertEqual(ids, ["rain:kristine", "rain:terrace", "maint:battery:sensor.device_01_battery",
                                "maint:washer:drum"])
 
     def test_invalid_rows_are_dropped(self):

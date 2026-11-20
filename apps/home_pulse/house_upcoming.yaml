@@ -1,6 +1,6 @@
 # HouseUpcoming - sensor.house_upcoming for the dashboard's Now timeline: maintenance (Rober2 parts,
 # the dishwasher's and the washer's run-based tasks, batteries and offline devices, houseplants to
-# water; admin only), Kristine's train, and rain while a terrace door is open. Plus one maintenance
+# water; admin only), and rain while a terrace door is open. Plus one maintenance
 # push a day to Mikkel while he is home. See house_upcoming.py.
 #
 # Keep sensor.house_upcoming out of the recorder (configuration.yaml recorder: exclude:): the lease
@@ -61,11 +61,6 @@ HouseUpcoming:
     area: kitchen
     # One cleaner visit in stick_vacuum_feedback.json is one run; wash the filters every four visits.
     # Faults push once per episode; a clog waits until the stick session has closed.
-  train:
-    route: sensor.transit_kbh_ic_odense
-    stog_status: input_select.transit_carlsberg_stog_kbh_status
-    person: person.kristine
-    users: [Kristine]
   rain:
     weather: weather.forecast_home
     alert: binary_sensor.weather_opening_alert_rooftop_rain

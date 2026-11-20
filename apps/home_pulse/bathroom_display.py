@@ -163,7 +163,6 @@ import room_active_read  # apps/presence
 import upcoming_core as core
 import upcoming_maint as maint
 import upcoming_rain as rain
-import upcoming_train as train
 
 TICK_S = 10
 LINE_MAX = 32
@@ -325,6 +324,33 @@ def fit(title, limit=LINE_MAX):
     return head.rstrip(" ,:;-+") + "..."
 
 
+def _truthy(value):
+    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
+
+
+def departures(raw, now):
+    """TransitAlarm's departures as future [(time, scheduled "HH:MM", delay minutes, cancelled)],
+    soonest first. They need the absolute `ts` TransitAlarm writes with expose_departure_ts;
+    AppDaemon drops a 0 delay and a False cancelled and writes True as "true"."""
+    out = []
+    for dep in raw if isinstance(raw, list) else []:
+        if not isinstance(dep, dict) or isinstance(dep.get("ts"), bool):
+            continue
+        try:
+            when = datetime.fromtimestamp(float(dep["ts"]), timezone.utc)
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            continue
+        if when <= now:
+            continue
+        try:
+            delay = int(float(dep.get("delay_min") or 0))
+        except (TypeError, ValueError):
+            delay = 0
+        label = str(dep.get("scheduled_time") or dep.get("time") or when.astimezone(maint.HOUSE_TZ).strftime("%H:%M"))[:5]
+        out.append((when, label, delay, _truthy(dep.get("cancelled"))))
+    return sorted(out)
+
+
 def transit_line(label, full, now, max_age):
     """The title for a route whose status is Delayed or Disrupted and whose data is at most `max_age` old, else
     "". With a cancelled departure ahead (the first one, whatever else is wrong, when Disrupted) it names
@@ -341,7 +367,7 @@ def transit_line(label, full, now, max_age):
         threshold = float(attrs.get("delay_threshold_min") or LATE_MIN)
     except (TypeError, ValueError):
         threshold = LATE_MIN
-    problems = [dep for dep in train.departures(attrs.get("departures"), now) if dep[3] or dep[2] >= threshold]
+    problems = [dep for dep in departures(attrs.get("departures"), now) if dep[3] or dep[2] >= threshold]
     if state == "Disrupted":
         problems = [dep for dep in problems if dep[3]] or problems
     if not problems:

@@ -94,8 +94,6 @@ def base_states():
         states[f"sensor.rober2_{part}_time_left"] = full("500000")
     states["sensor.washer_state"] = full("Off")
     states["person.mikkel"] = full("home")
-    states["sensor.transit_kbh_ic_odense"] = full("OK", {"departures": []})
-    states["input_select.transit_carlsberg_stog_kbh_status"] = full("OK")
     states["person.kristine"] = full("not_home")
     states["binary_sensor.weather_opening_alert_rooftop_rain"] = full("off")
     states["binary_sensor.rooftop_door_1_contact"] = full("off")
@@ -1166,8 +1164,8 @@ class PushRunTests(unittest.TestCase):
         self.assertEqual([s["message"] for s in app.notifier.sent], ["Dryer plinth filter"])
 
 
-class TrainTests(unittest.TestCase):
-    def test_kristines_morning_train(self):
+class NoTrainTests(unittest.TestCase):
+    def test_a_morning_train_is_not_a_row(self):
         morning = datetime(2026, 10, 14, 5, 0, tzinfo=timezone.utc)
         states = base_states()
         states["person.kristine"] = full("home")
@@ -1175,10 +1173,7 @@ class TrainTests(unittest.TestCase):
         as_of = (morning - MIN).astimezone(maint.HOUSE_TZ).replace(tzinfo=None).isoformat()
         states["sensor.transit_kbh_ic_odense"] = full("OK", {"departures": departures, "data_as_of": as_of})
         app = make_app(states, now=morning)
-        row = rows(app)["train:kristine"]
-        self.assertEqual((row["detail"], row["audience_users"]), ("07:46", ["Kristine"]))
-        tick(app, 12 * MIN)
-        self.assertNotIn("train:kristine", rows(app))
+        self.assertFalse([row_id for row_id in rows(app) if row_id.startswith("train:")])
 
 
 class HistoryTests(unittest.TestCase):
