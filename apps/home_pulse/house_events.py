@@ -12,16 +12,15 @@ things you can see/hear yourself has no value):
    alone instead ("Kristine started Spotify in Kitchen" - MusicAttribution).
 2. A small set of observed appliance milestones that carry information you can't
    see from the machine itself (finished + energy used; emptied).
-3. Observed lock activity (v3): "Apartment door unlocked" by Mikkel / "Apartment door opened
-   from inside". The authoritative BLE lock entity carries no attribution, so the
-   entry is emitted after a short delay and enriched from the cloud twin's
-   `changed_by` if that attribute is fresh by then - see `lock_event` and the
-   `locks`/`lock_attribution`/`lock_door` app config.
-
-4. Who came in or went out (v6), from sensor.door_entry: the apartment-door lock row of that
-   opening takes the resident in `by`, so an opening stays one row; an opening with no such
-   row (a door left on the latch, a guest let in) gets its own "Came home"
-   / "Went out" row. See `entry_groups` and `apply_entry`.
+3. Observed lock activity (v3): "Apartment door unlocked" by Mikkel. The authoritative BLE
+   lock entity carries no attribution, so the entry is emitted after a short delay and
+   enriched from the cloud twin's `changed_by` if that attribute is fresh by then - see
+   `lock_event` and the `locks`/`lock_attribution` app config. The thumb-turn from inside
+   gets no row: opening the door to put the trash out is not news.
+4. Who came in or went out (v6), from sensor.door_entry: a resident coming in names the
+   apartment-door unlock row of that opening in `by`, so an opening stays one row; an arrival
+   with no such row (a door left on the latch) gets its own "Came home" row, and a resident
+   going out always gets a "Went out" row. See `entry_groups` and `apply_entry`.
 5. The night (v6): one "Night mode on" row per night from the household night boolean, and
    one "Went to bed" row per resident per night, seen only by that resident (and admins),
    left out when it fell with the household row. See `night_key`.
@@ -82,12 +81,9 @@ EMPTIED_ENRICH_S = 900
 # Reports come from other apps but are still validated like external data - a bug
 # elsewhere must not be able to bloat the feed entity past what a dashboard expects.
 MAX_TEXT_LEN = 120
-# The door contact can report the door opening before the BLE lock reports the thumb-turn.
-DOOR_BEFORE_LOCK_S = 10
-
 # An apartment-door lock row belongs to the door opening it lies within this many seconds of: it is
-# written lock_report_delay_s after the lock moved, which comes before the door opens when
-# someone unlocks to come in and just before or after it when someone turns the thumb-turn.
+# written lock_report_delay_s after the lock moved, which is before or just after the door opens
+# when someone unlocks to come in.
 ENTRY_MATCH_BEFORE_S = 90
 ENTRY_MATCH_AFTER_S = 60
 # sensor.door_entry decides 30 s after the door opened; an older decision is a replay.
@@ -246,18 +242,17 @@ def yale_system_operator(who):
     return who in YALE_HA_OPERATORS or (len(parts) == 2 and parts[0] in YALE_HOW and parts[1] in YALE_WHAT)
 
 
-def lock_event(name, old, new, changed_by, door_opened=False, arrival_by=None):
+def lock_event(name, old, new, changed_by, arrival_by=None):
     """Event tuple (icon, text, by) for a lock transition worth telling humans about, or None.
 
     Two kinds of unlock are news:
     - a NAMED unlock: "who came in while I wasn't looking" (a resident by name,
       first-name-trimmed, or a lock user like Cleaning);
-    - the thumb-turn ("Manual Unlock") followed by the door actually opening: someone went
-      out (or let someone in) - the only trace a leaving guest leaves. The thumb-turn alone,
-      with the door staying shut, is not.
     - an unlock ArrivalUnlock made for `arrival_by`.
     Everything else is just the door being used: locking (manual or auto) is the steady state
-    the lock always returns to, and an unattributed unlock tells nobody anything. Yale's own
+    the lock always returns to, and an unattributed unlock tells nobody anything. The thumb-turn
+    from inside is not news either (trash out, a guest let in): a resident going out gets a
+    "Went out" row from sensor.door_entry instead. Yale's own
     operator words never become `by`: on an unlock a lock word is the previous operation's, left
     in changed_by because the cloud had not reported this one yet.
     Lock FAILURES are lock_health's job (phone push + its own admin feed entries), not this
@@ -272,8 +267,6 @@ def lock_event(name, old, new, changed_by, door_opened=False, arrival_by=None):
     if not isinstance(changed_by, str) or not changed_by.strip():
         return None
     who = changed_by.strip()[:MAX_TEXT_LEN]
-    if who in ("Manual Unlock", "Manual Unlatch"):
-        return ("mdi:door-open", f"{name} opened from inside", None) if door_opened else None
     if yale_system_operator(who):
         return None
     return "mdi:lock-open-variant", f"{name} unlocked", _first_name_if_resident(who)
@@ -308,9 +301,9 @@ def _ts(event):
         return None
 
 
-# The lock row an entry kind can name: someone who came in unlocked the door, someone who went out
-# turned the thumb-turn. A guest let in from inside is not named on the row of whoever opened.
-ENTRY_LOCK_TEXTS = {"entered": ("{} unlocked", "{} unlocked on arrival"), "left": ("{} opened from inside",)}
+# The lock row an entry kind can name: someone who came in unlocked the door. Going out leaves no
+# lock row (the thumb-turn is not news), so a departure always gets its own "Went out" row.
+ENTRY_LOCK_TEXTS = {"entered": ("{} unlocked", "{} unlocked on arrival"), "left": ()}
 
 
 def apply_entry(events, lock_names, kind, by, opened_at):
@@ -460,15 +453,10 @@ class HouseEvents(hass.Hass):
         # operation and must not be pinned on this one.
         self.lock_report_delay_s = int(self.args.get("lock_report_delay_s", 20))
         self.lock_attribution_fresh_s = int(self.args.get("lock_attribution_fresh_s", 180))
-        # The contact of the door the locks sit on: a thumb-turn only counts once it opened.
-        self.lock_door = self.args.get("lock_door")
-        self._door_opened_at = None
         self._arrival_hint = None
         for entity in self.locks:
             self.listen_state(self._on_lock, entity)
         self.listen_event(self._on_arrival_unlock, "lock_unlocked_on_arrival")
-        if self.lock_door:
-            self.listen_state(self._on_door_open, self.lock_door, new="on")
 
         # Who came in or went out (sensor.door_entry), and the night.
         self.door_entry = self.args.get("door_entry")
@@ -540,20 +528,11 @@ class HouseEvents(hass.Hass):
             return hint[1]
         return None
 
-    def _on_door_open(self, entity, attribute, old, new, kwargs):
-        self._door_opened_at = self.get_now().timestamp()
-
-    def _door_opened_since(self, since_ts):
-        """True when the door contact opened from DOOR_BEFORE_LOCK_S before since_ts on."""
-        opened = self._door_opened_at
-        return opened is not None and opened >= since_ts - DOOR_BEFORE_LOCK_S
-
     def _emit_lock_event(self, kwargs):
         entity = kwargs["lock_entity"]
         name = self.locks.get(entity, entity)
         changed_by = self._fresh_changed_by(self.lock_attribution.get(entity))
-        door_opened = self._door_opened_since(kwargs["changed_at"])
-        result = lock_event(name, kwargs["old"], kwargs["new"], changed_by, door_opened,
+        result = lock_event(name, kwargs["old"], kwargs["new"], changed_by,
                             self._arrival_by(kwargs["changed_at"]))
         if result:
             icon, text, by = result
