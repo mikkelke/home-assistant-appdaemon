@@ -60,6 +60,11 @@ Intercom:
   # Mobile alert target when all unlock attempts of a ring fail
   notify_target: "mikkel"
 
+  # A ring matched to a courier of this kind tells these people instead (Kristine orders food on Mikkel's
+  # Wolt account).
+  courier_notify:
+    food: [mikkel, kristine]
+
   # Reboot-survival resume window (intercom_state.json): how stale a persisted
   # "rang but auto-open unlock was never confirmed" record can be at startup and
   # still be worth alerting on. Older than this, the visitor is long gone - alerting

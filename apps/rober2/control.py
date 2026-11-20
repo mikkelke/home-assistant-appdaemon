@@ -1103,7 +1103,7 @@ class Rober2Control(hass.Hass):
                                         await self.send_notification(
                                             title=f"Rober2 - Stuck in {dock_pretty}",
                                             message=f"Robot got stuck trying to clean {dock_pretty} after {count} attempts.",
-                                            target=["mikkel", "kristine"]
+                                            target=["mikkel", "kristine", "claudia"]
                                         )
                                     else:
                                         reason = f"Stuck trying to leave {dock_pretty}"
@@ -1111,7 +1111,7 @@ class Rober2Control(hass.Hass):
                                         await self.send_notification(
                                             title=f"Rober2 - Stuck trying to leave {dock_pretty}",
                                             message=f"Robot cannot leave {dock_pretty} after {count} attempts. Something is blocking the exit.",
-                                            target=["mikkel", "kristine"]
+                                            target=["mikkel", "kristine", "claudia"]
                                         )
                                     await self._set_automation_paused(reason)
                                     await self.save_map_image(trigger_context=reason.replace(" ", "_").lower())
@@ -1120,7 +1120,7 @@ class Rober2Control(hass.Hass):
                                     await self.send_notification(
                                         title="Rober2 - Room unreachable",
                                         message=f"Could not reach {room_name.replace('_', ' ')} after {count} attempts. Skipping for this session.",
-                                        target=["mikkel", "kristine"]
+                                        target=["mikkel", "kristine", "claudia"]
                                     )
                     else:
                         self.log(f"Room {room_name} interrupted with unknown cleaning duration - leaving flag on", level="WARNING")
@@ -1160,7 +1160,7 @@ class Rober2Control(hass.Hass):
                                         await self.send_notification(
                                             title=f"Rober2 - Stuck in {dock_pretty}",
                                             message=f"Robot got stuck trying to clean {dock_pretty} after {count} attempts.",
-                                            target=["mikkel", "kristine"]
+                                            target=["mikkel", "kristine", "claudia"]
                                         )
                                     else:
                                         reason = f"Stuck trying to leave {dock_pretty}"
@@ -1168,7 +1168,7 @@ class Rober2Control(hass.Hass):
                                         await self.send_notification(
                                             title=f"Rober2 - Stuck trying to leave {dock_pretty}",
                                             message=f"Robot cannot leave {dock_pretty} after {count} attempts. Something is blocking the exit.",
-                                            target=["mikkel", "kristine"]
+                                            target=["mikkel", "kristine", "claudia"]
                                         )
                                     await self._set_automation_paused(reason)
                                     await self.save_map_image(trigger_context=reason.replace(" ", "_").lower())
@@ -1177,7 +1177,7 @@ class Rober2Control(hass.Hass):
                                     await self.send_notification(
                                         title="Rober2 - Room unreachable",
                                         message=f"Could not reach {room_name.replace('_', ' ')} after {count} attempts. Skipping for this session.",
-                                        target=["mikkel", "kristine"]
+                                        target=["mikkel", "kristine", "claudia"]
                                     )
                             # When count < 3 we keep _last_attempted_room_id so next dock can count again
                 
@@ -2519,7 +2519,7 @@ class Rober2Control(hass.Hass):
                 await self.send_notification(
                     title="Rober2 Error Resolved",
                     message=f"Error '{old.replace('_', ' ').title()}' has been cleared.\nAutomation resuming.",
-                    target=["mikkel", "kristine"],  # Always send regardless of presence
+                    target=["mikkel", "kristine", "claudia"],  # Always send regardless of presence
                     data={"data": {"importance": "default", "channel": "alerts"}}
                 )
                 
@@ -2574,7 +2574,7 @@ class Rober2Control(hass.Hass):
                 await self.send_notification(
                     title="Rober2 Error - Cleaning Stopped",
                     message=f"Critical error detected: {new.replace('_', ' ').title()}\nRoom: {room_name}\nCleaning has been stopped.",
-                    target=["mikkel", "kristine"],  # Always send regardless of presence
+                    target=["mikkel", "kristine", "claudia"],  # Always send regardless of presence
                     data={"data": {"importance": "high", "channel": "alerts"}}
                 )
                 await self._report_house_event(
@@ -2593,7 +2593,7 @@ class Rober2Control(hass.Hass):
                 await self.send_notification(
                     title="Rober2 Error Detected",
                     message=f"Critical error detected: {new.replace('_', ' ').title()}\nAutomation is paused.",
-                    target=["mikkel", "kristine"],  # Always send regardless of presence
+                    target=["mikkel", "kristine", "claudia"],  # Always send regardless of presence
                     data={"data": {"importance": "high", "channel": "alerts"}}
                 )
                 await self._report_house_event(

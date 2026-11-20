@@ -923,6 +923,7 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
         app.logs = []
         app.log = lambda msg, level="INFO": app.logs.append((level, msg))
         app.notify_target = "mikkel"
+        app.courier_notify = {"food": ["mikkel", "kristine"]}
         app.unlock_outcomes = {}
         app.unlock_repeat_count = 3
         app.pushes = []
@@ -959,6 +960,17 @@ class IntercomAttachmentSeamTests(unittest.TestCase):
         app._street_courier = ("parcel", ring, "gls")
         app._report_auto_open_success("binary_sensor.front", "lock.front", {"ring_label": "front door"}, 1)
         self.assertEqual(app.pushes[0]["title"], "Intercom auto-opened")
+
+    def test_a_food_courier_push_goes_to_the_food_audience(self):
+        ring = datetime(2026, 11, 11, 10, 17, 44)
+        for kind, target in (("food", ["mikkel", "kristine"]), ("parcel", "mikkel")):
+            with self.subTest(kind):
+                app = self._bare_intercom()
+                app.get_app = lambda name: None
+                app._street_courier = (kind, ring, "wolt")
+                app._report_auto_open_success("binary_sensor.front", "lock.front",
+                                              {"ring_label": "front door", "ring_ts": ring}, 1)
+                self.assertEqual(app.pushes[0]["target"], target)
 
     def test_attachment_passed_through_on_success_push(self):
         app = self._bare_intercom()

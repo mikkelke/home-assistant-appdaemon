@@ -98,6 +98,7 @@ class Intercom(hass.Hass):
         self.unlock_repeat_interval_s = int(self.args.get("unlock_repeat_interval_s", 7))
         self.debounce_s = int(self.args.get("debounce_s", 5))
         self.notify_target = self.args.get("notify_target", "mikkel")
+        self.courier_notify = self.args.get("courier_notify") or {}
         # How stale a persisted "rang but auto-open unlock was never confirmed"
         # record can be at startup and still be worth alerting on - older than this
         # and the visitor is long gone, so alerting would just be noise (see
@@ -316,7 +317,7 @@ class Intercom(hass.Hass):
                 pass
         return None
 
-    def _abb_defer_ring_push(self, ring_label, title, message):
+    def _abb_defer_ring_push(self, ring_label, title, message, target):
         """Hand the auto-open push to the ABB bridge so it can wait for a photo.
 
         True means the bridge OWNS the push and this app must not send it; False
@@ -329,7 +330,7 @@ class Intercom(hass.Hass):
                 self.abb_bridge = self.get_app("AbbWelcomeBridge")
             if self.abb_bridge:
                 return bool(self.abb_bridge.defer_ring_push(
-                    ring_label, title, message, self.notify_target))
+                    ring_label, title, message, target))
         except Exception as e:
             try:
                 self.log(f"ABB deferred ring push unavailable: {e}", level="DEBUG")
@@ -1255,18 +1256,20 @@ class Intercom(hass.Hass):
         if self.mobile_notifier:
             title = "Intercom auto-opened"
             message = f"Someone rang the {ring_label} and the door was unlocked automatically."
+            target = self.notify_target
             courier = self._street_courier
             ring_ts = outcome.get("ring_ts")
             if courier and isinstance(ring_ts, datetime) \
                     and abs((courier[1] - ring_ts).total_seconds()) <= COURIER_PUSH_MATCH_S:
                 title = courier_push_title(courier[2])
                 message = f"Rang the {ring_label} and was let in automatically."
+                target = self.courier_notify.get(courier[0], target)
             # Offer the push to the ABB bridge first: it can hold it the few
             # seconds the gateway needs to produce THIS visitor's photo, instead
             # of sending now with the previous visitor's (Mikkel, 2026-08-27).
             # Strictly additive - a bridge that is absent, reloading or broken
             # declines, and the immediate push below is byte-for-byte today's.
-            if not self._abb_defer_ring_push(ring_label, title, message):
+            if not self._abb_defer_ring_push(ring_label, title, message, target):
                 # ABB doorbell snapshot, if the bridge can offer one - computed
                 # OUTSIDE the try so a (impossible-by-contract) failure could never
                 # skip the push itself; None simply reproduces today's text-only
@@ -1276,7 +1279,7 @@ class Intercom(hass.Hass):
                     self.create_task(self.mobile_notifier.notify(
                         title=title,
                         message=message,
-                        target=self.notify_target,
+                        target=target,
                         data=attachment,
                     ))
                 except Exception as e:
