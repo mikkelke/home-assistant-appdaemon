@@ -5,6 +5,8 @@ HouseScenarios:
   module: house_scenarios
   class: HouseScenarios
   feed_entity: sensor.house_events
+  # Feed rows worked out afterwards from the recorder; its copy of a row wins, as on the dashboard.
+  feed_backfill_entity: sensor.house_events_backfill
   scenarios_entity: sensor.house_scenarios
   # Scenarios worked out afterwards from the recorder (house_scenarios_backfill.json on the box, not in git).
   backfill_entity: sensor.house_scenarios_backfill

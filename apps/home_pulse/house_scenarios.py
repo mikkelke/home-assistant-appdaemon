@@ -1,5 +1,5 @@
 """HouseScenarios - sensor.house_scenarios: what was going on in the house, built from sensor.house_events rows
-and the house's own sessions by scenarios_core (door visits, nights, machine runs, cooking).
+(plus the rows of feed_backfill_entity) and the house's own sessions by scenarios_core (door visits, nights, machine runs, cooking).
 
 Observer only. Each change of the feed or of a signal entity rebuilds the scenarios a few seconds later from
 the rows and signal readings of the last KEEP_S (rows kept in house_scenarios_state.json beside this module,
@@ -62,6 +62,7 @@ def prune(points, oldest):
 class HouseScenarios(hass.Hass):
     def initialize(self):
         self.feed_entity = self.args.get("feed_entity", "sensor.house_events")
+        self.feed_backfill_entity = self.args.get("feed_backfill_entity")
         self.entity = self.args.get("scenarios_entity", "sensor.house_scenarios")
         self.night_entity = self.args["night_entity"]
         self.machine_entities = dict(self.args.get("machines") or {})
@@ -77,6 +78,9 @@ class HouseScenarios(hass.Hass):
         self._seed()
         self._take_rows(self.get_state(self.feed_entity, attribute="events"))
         self.listen_state(self._on_feed, self.feed_entity, attribute="events")
+        if self.feed_backfill_entity:
+            self._take_rows(self.get_state(self.feed_backfill_entity, attribute="events"))
+            self.listen_state(self._on_feed, self.feed_backfill_entity, attribute="events")
         self.listen_state(self._on_signal, self.night_entity, kind="night")
         for key, entity in self.machine_entities.items():
             self.listen_state(self._on_signal, entity, kind="machines", key=key)
