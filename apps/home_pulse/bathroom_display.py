@@ -66,7 +66,7 @@ The lines for Mikkel, at most three, in this order:
               alarm_entity (input_boolean.wakeup_bedroom) is on, with the time of alarm_time_entity, else
               "No alarm"; none while alarm_entity cannot be read as on or off.
     rain      06:00-12:00 house time, on the way out: "Raining now" while rain_entity (the roof station's
-              piezo sensor) is on, else the first run of consecutive forecast hours with at least
+              piezo rain rate) reads at least RAIN_MIN_MMH, else the first run of consecutive forecast hours with at least
               upcoming_rain.MIN_MM that starts within RAIN_AHEAD (4 h): "Rain 09-11", from the start of
               its first hour to the end of its last, or "Rain from 09" when it goes on past those 4 hours.
               An hour that is going on counts, one that is over does not, and a missing hour ends a run.
@@ -206,7 +206,8 @@ DEAD_BAND_KG = 0.3
 SCALE_ICON = "mdi:scale-bathroom"
 FAT_ICON = "mdi:water-percent"
 LEAN_ICON = "mdi:arm-flex"
-PIEZO = "binary_sensor.gw2000a_rain_state_piezo"
+RAIN_RATE = "sensor.gw2000a_rain_rate_piezo"
+RAIN_MIN_MMH = 0.5
 WEATHER = "weather.forecast_home"
 RAIN_ICON = "mdi:weather-rainy"
 RAIN_FROM = time(6)
@@ -690,6 +691,15 @@ def _house_hours(run):
     return tuple(moment.astimezone(maint.HOUSE_TZ).strftime("%H") for moment in run)
 
 
+def rate_raining(state):
+    """Whether a rain rate `state` (mm/h) reads at least RAIN_MIN_MMH. The piezo contact is no rain sensor: it
+    reports any impact on the plate, so only the measured rate counts."""
+    try:
+        return float(state) >= RAIN_MIN_MMH
+    except (TypeError, ValueError):
+        return False
+
+
 def rain_line(raining, hours, fetched, now):
     """The rain on the way out and, on a workday, on the way home. Out: "Raining now" while it `raining`, else
     the forecast's first run of rain as "Rain 09-11" (house hours), or "Rain from 09" when it goes on past
@@ -797,7 +807,7 @@ class BathroomDisplay(hass.Hass):
         self.weight_entity = a.get("weight_entity")
         self.measured_entity = a.get("measured_entity") if self.weight_entity else None
         self.fat_entity = a.get("body_fat_entity")
-        self.rain_entity = a.get("rain_entity", PIEZO)
+        self.rain_entity = a.get("rain_entity", RAIN_RATE)
         self.weather_entity = a.get("weather_entity", WEATHER)
         self.alarm_entity = a.get("alarm_entity", ALARM)
         self.alarm_time_entity = a.get("alarm_time_entity", ALARM_TIME)
@@ -1069,7 +1079,7 @@ class BathroomDisplay(hass.Hass):
     def _rain(self, now):
         """The rain line, as a list. The hourly forecast is asked for, at most every RAIN_REFETCH, unless it
         rains on a Saturday or Sunday, when the line needs none."""
-        raining = self._state_of(self.rain_entity) == "on"
+        raining = rate_raining(self._state_of(self.rain_entity))
         wanted = workday(now) or not raining
         if wanted and (self._forecast_asked is None or now - self._forecast_asked >= RAIN_REFETCH):
             self._forecast_asked = now
