@@ -1,0 +1,8 @@
+[Unit]
+Description=Dry-run requests for the Music Assistant restart path (no restart)
+
+[Path]
+PathExists=/data/appdaemon/host-requests/ma-restart-dryrun.request
+
+[Install]
+WantedBy=paths.target

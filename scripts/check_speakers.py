@@ -14,6 +14,7 @@ Checked:
   - assist_rooms.yaml room speakers (registry Music Assistant entities)
   - family_room_volume_sync.yaml speakers (registry MA ids with <id>_2 twins) + tv_speaker
   - music_attribution.yaml raw_to_base_map pairs
+  - ma_twin_watch.yaml pairs
   - sonos_notifier.yaml  TTS target groups (registry `tts:` tags all/family/kristine/ms/claudia)
   - fire_safety.yaml     house-wide announcement rooms + media pause rooms, kitchen entity
   - living_room_tv_control.yaml announcement speakers (registry MA entities, never a native twin)
@@ -101,6 +102,13 @@ def main():
           f"music_attribution raw_to_base_map drift: only-in-yaml="
           f"{sorted(set(mus_map.items()) - set(pairs.items()))} "
           f"missing={sorted(set(pairs.items()) - set(mus_map.items()))}")
+
+    mtw = next(iter(load("apps/sonos/ma_twin_watch.yaml").values()))
+    mtw_map = mtw.get("pairs") or {}
+    check(mtw_map == pairs,
+          f"ma_twin_watch pairs drift: only-in-yaml="
+          f"{sorted(set(mtw_map.items()) - set(pairs.items()))} "
+          f"missing={sorted(set(pairs.items()) - set(mtw_map.items()))}")
 
     tts_rooms = {}
     for v in reg.values():

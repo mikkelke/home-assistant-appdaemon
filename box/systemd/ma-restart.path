@@ -1,0 +1,8 @@
+[Unit]
+Description=Music Assistant restart requests from AppDaemon (MaTwinWatch)
+
+[Path]
+PathExists=/data/appdaemon/host-requests/ma-restart.request
+
+[Install]
+WantedBy=paths.target

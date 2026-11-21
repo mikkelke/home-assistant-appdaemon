@@ -77,6 +77,24 @@ archive the pending journal before starting a fresh deploy transaction.
 Run the deploy unit tests without contacting the box:
 `python3 -m unittest discover -s scripts/tests -p test_appdaemon_deploy.py -q`.
 
+## Box-side helpers
+
+AppDaemon has no Docker socket. The one host action it can ask for is a Music Assistant
+restart (`apps/sonos/ma_twin_watch.py`): it creates the empty file
+`/data/appdaemon/host-requests/ma-restart.request` (`/conf/host-requests/` in the
+container), and the root systemd units in `box/systemd/` delete it and run
+`docker restart musicassistant`. The host never reads the file or writes into
+`/data/appdaemon`, and allows 3 starts per 6 h. `ma-restart-dryrun.{path,service}` does
+the same for `ma-restart-dryrun.request` but only logs MA's start time.
+
+- Install: `sudo install -d -o mke -g mke -m 0775 /data/appdaemon/host-requests`, copy the
+  four units to `/etc/systemd/system` (root:root 0644, never symlinked), then
+  `sudo systemctl daemon-reload && sudo systemctl enable --now ma-restart.path ma-restart-dryrun.path`.
+- Dry run: `docker exec appdaemon touch /conf/host-requests/ma-restart-dryrun.request`, then
+  `journalctl -u ma-restart-dryrun.service -n 5`.
+- After the start limit or a request the host could not delete, the path unit stays failed:
+  `sudo systemctl reset-failed ma-restart.service ma-restart.path && sudo systemctl start ma-restart.path`.
+
 ## Private archives
 
 The doorbell archive (`apps/intercom/abb_welcome_bridge.*`, plus the ABB Welcome
