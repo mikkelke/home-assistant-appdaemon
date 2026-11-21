@@ -242,9 +242,9 @@ class AssistMyMusic(hass.Hass):
         os.replace(tmp, self.state_file)
 
     def _seed(self, person, entity):
-        start = datetime.now(timezone.utc) - timedelta(days=self.recent_days)
+        end = datetime.now(timezone.utc)
         try:
-            raw = self.get_history(entity_id=entity, start_time=start)
+            raw = self.get_history(entity_id=entity, start_time=end - timedelta(days=self.recent_days), end_time=end)
         except Exception as err:  # noqa: BLE001 - the recorder is optional for this
             self.log(f"History of {entity} unavailable: {err}", level="WARNING")
             return
