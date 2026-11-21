@@ -132,7 +132,9 @@ class HouseScenarios(hass.Hass):
 
     def _add(self, kind, key, t, value):
         if value in (None, "unknown", "unavailable"):
-            return False
+            if kind != "areas":
+                return False
+            value = None
         points = self._points(kind, key)
         if points and t < points[-1][0]:
             return False

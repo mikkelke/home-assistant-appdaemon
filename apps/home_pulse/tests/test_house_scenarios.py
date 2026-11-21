@@ -170,6 +170,18 @@ class CookingTests(unittest.TestCase):
         self.assertIsNone(cooking["end"])
 
 
+class AreaIntakeTests(unittest.TestCase):
+    def test_an_unheard_phone_is_out_of_the_kitchen(self):
+        # 21.11: Claudia's phone last heard in the living room 10:31:30, unknown from 10:31:51, oven 10:57-11:21.
+        app = house_scenarios.HouseScenarios.__new__(house_scenarios.HouseScenarios)
+        app.signals = {"areas": {"Claudia": []}}
+        app._add("areas", "Claudia", at("2026-11-21T10:31:30"), "Living room")
+        app._add("areas", "Claudia", at("2026-11-21T10:31:51"), "unknown")
+        areas = app.signals["areas"]
+        self.assertEqual(core.present(areas, at("2026-11-21T10:57:34"), at("2026-11-21T11:21:09"),
+                                      core.KITCHEN_ZONE), [])
+
+
 class OwnershipTests(unittest.TestCase):
     def test_a_row_belongs_to_one_scenario_at_most(self):
         members = [ts for s in build() for ts in s["members"]]
