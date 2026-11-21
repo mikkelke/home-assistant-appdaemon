@@ -558,15 +558,19 @@ class Spotify(unittest.TestCase):
         advance(app, 70)
         self.assertEqual(rows(app)[0]["text"], "Someone started Spotify in Kitchen")
 
-    def test_two_matching_accounts_is_someone(self):
+    def test_two_matching_accounts_are_both_named(self):
         app = make_app(ACCOUNTS)
         for person in ACCOUNTS:
             spotify_account(app, person, "idle")
         spotify_account(app, "Mikkel", "playing", source="Kitchen")
         spotify_account(app, "Kristine", "playing", source="Kitchen")
         self.start(app)
-        advance(app, 70)
-        self.assertEqual(rows(app), [{"text": "Someone started Spotify in Kitchen", "icon": "mdi:spotify"}])
+        advance(app, 10)
+        self.assertEqual(rows(app), [{"text": "Mikkel and Kristine started Spotify in Kitchen", "icon": "mdi:spotify"}])
+
+    def test_people_text(self):
+        self.assertEqual(ma.people_text(["Mikkel"]), "Mikkel")
+        self.assertEqual(ma.people_text(["Mikkel", "Kristine", "Claudia"]), "Mikkel, Kristine and Claudia")
 
     def test_spotify_stopped_before_the_deadline_is_someone(self):
         app = make_app(ACCOUNTS)

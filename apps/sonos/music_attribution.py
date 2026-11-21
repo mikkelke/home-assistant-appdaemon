@@ -15,9 +15,9 @@ Who started it:
    automations (a ``context.parent_id`` without a user) are the house itself: no row, the apps and
    automations that do it report their own actions. Announcements and joins are not starts. Any
    other account is "Someone".
-2. Spotify Connect: the resident whose Spotify account entity (``spotify_accounts``) is playing on
+2. Spotify Connect: every resident whose Spotify account entity (``spotify_accounts``) is playing on
    the group's Spotify Connect device ("Kitchen", or "Kitchen + 3" for a group), polled for up to
-   ``spotify_wait_seconds``. "A guest" only when every resident's account is configured and
+   ``spotify_wait_seconds``; several (a Jam) are all named. "A guest" only when every resident's account is configured and
    available, none matched or plays the same track, and Spotify still plays at the deadline;
    otherwise "Someone".
 3. AirPlay, Music Assistant's own app, line-in and the Sonos app expose no identity: "Someone".
@@ -256,6 +256,11 @@ def spotify_matches(accounts, states, device_keys):
     return hits
 
 
+def people_text(names):
+    """'Mikkel', 'Mikkel and Kristine', 'Mikkel, Kristine and Claudia'."""
+    return ", ".join(names[:-1]) + (" and " if len(names) > 1 else "") + names[-1]
+
+
 def spotify_is_guest(residents, accounts, states, still_spotify, track):
     """True when an unmatched Spotify start can only be a guest's: every resident's account is
     configured and available, none plays the speaker's current track, and Spotify still plays on
@@ -478,8 +483,9 @@ class MusicAttribution(hass.Hass):
         deadline = kwargs["deadline"]
         states = {entity: self._full_state(entity) for entity in self.spotify_accounts.values()}
         hits = spotify_matches(self.spotify_accounts, states, self._device_keys(group))
-        if len(hits) == 1:
-            self._report(hits[0], "spotify", speaker, group, by=hits[0], run_ts=deadline - self.spotify_wait_s)
+        if hits:
+            by = hits[0] if len(hits) == 1 else None
+            self._report(people_text(hits), "spotify", speaker, group, by=by, run_ts=deadline - self.spotify_wait_s)
             return
         if self._now() < deadline:
             self.run_in(self._spotify_poll, self.spotify_poll_s, speaker=speaker, group=group, deadline=deadline)
