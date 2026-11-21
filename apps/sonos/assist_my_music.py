@@ -41,6 +41,8 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 RESULT_EVENT = "assist_my_music_result"
 NOT_PEOPLE = ("someone", "outside home assistant")
 MA_SOURCE = "Music Assistant Playback"
+FAMILY_AREAS = ["dining_room", "kitchen", "living_room"]
+FAMILY_ROOM = "family room"
 
 
 def device_key(name):
@@ -173,10 +175,11 @@ def who_plays(players, session):
     return ""
 
 
-def what_playing_text(here, speaker, states, names, accounts, account_states, sessions):
+def what_playing_text(here, speaker, states, names, accounts, account_states, sessions, room=None):
     """The answer to "what is playing" in `speaker`'s room; here: the room is the satellite's own.
 
-    states: {MA speaker entity: state dict} for every house speaker, in a stable order."""
+    states: {MA speaker entity: state dict} for every house speaker, in a stable order. room: how
+    to name the room asked about, else the speaker's name."""
     def describe(entity):
         state = states.get(entity) or {}
         attrs = state.get("attributes") or {}
@@ -193,7 +196,7 @@ def what_playing_text(here, speaker, states, names, accounts, account_states, se
             return f"{song}, {who}"
         return f"{who}: {song}" if who else song
 
-    room = names.get(speaker, area_label(speaker)).lower() if speaker else ""
+    room = room or (names.get(speaker, area_label(speaker)).lower() if speaker else "")
     where = "here" if here else f"in the {room}"
     if speaker and (states.get(speaker) or {}).get("state") == "playing":
         text = describe(speaker)
@@ -332,11 +335,14 @@ class AssistMyMusic(hass.Hass):
         satellite_area = self._satellite_area({})
         area = asked[0] if asked else (data.get("area_id") or satellite_area)
         here = not asked and area == satellite_area
-        speaker = self.speakers.get(area)
         states = {s: self._read(s) for s in self.sonos}
+        candidates = [self.speakers[a] for a in (asked or [area]) if a in self.speakers]
+        speaker = next((s for s in candidates if states.get(s, {}).get("state") == "playing"),
+                       candidates[0] if candidates else None)
+        room = FAMILY_ROOM if sorted(asked) == FAMILY_AREAS else None
         names = {s: (st.get("attributes") or {}).get("friendly_name") or area_label(s) for s, st in states.items()}
         account_states = {e: self._read(e) for e in self.accounts.values()}
         sessions = (self._read(self.sessions_sensor).get("attributes") or {}).get("rooms") or {}
-        speech = what_playing_text(here, speaker, states, names, self.accounts, account_states, sessions)
+        speech = what_playing_text(here, speaker, states, names, self.accounts, account_states, sessions, room)
         self._reply(data, speech)
         self.log(f"What is playing ({area}): {speech}", level="INFO")

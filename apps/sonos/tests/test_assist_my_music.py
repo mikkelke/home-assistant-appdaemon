@@ -160,6 +160,11 @@ class WhatIsPlaying(unittest.TestCase):
         states = {BATH: speaker(), KITCHEN: speaker("playing", title="Whine Dat", artist="Kongsted")}
         self.assertEqual(self.answer(states, here=False, spk=KITCHEN), "In the kitchen: Whine Dat by Kongsted.")
 
+    def test_room_name_given(self):
+        states = {BATH: speaker(), KITCHEN: speaker()}
+        self.assertEqual(mm.what_playing_text(False, KITCHEN, states, NAMES, ACCOUNTS, {}, {}, "family room"),
+                         "Nothing is playing in the family room.")
+
     def test_title_from_account_when_speaker_has_none(self):
         states = {BATH: speaker("playing")}
         self.assertEqual(self.answer(states, {"Mikkel": account(source="Bathroom")}),
