@@ -1,0 +1,56 @@
+# AssistMyMusic - the voice answers for "play my music" (the speaker's own Spotify in the room) and
+# "what is playing" (with who plays it). The intents live in the box's intent_script.yaml and wait
+# for this app's assist_my_music_result event. See assist_my_music.py for the rules.
+AssistMyMusic:
+  module: assist_my_music
+  class: AssistMyMusic
+  log: sonos_log
+
+  # Satellite entity -> HA area id; a request without an area is about the only satellite's area.
+  satellites:
+    assist_satellite.bathroom_bathroom_display_assist_satellite: bathroom
+
+  # HA area id -> Music Assistant player that plays "my music" there (same rooms as AssistRooms).
+  speakers:
+    bathroom: media_player.bathroom
+    bedroom: media_player.bedroom
+    kitchen: media_player.kitchen
+    living_room: media_player.living_room
+    dining_room: media_player.dining_room
+    guest_bathroom: media_player.guest_bathroom
+    rooftop: media_player.rooftop
+
+  # Every house Sonos as a Music Assistant player: what is playing elsewhere, and the speaker a
+  # Spotify Connect source names.
+  sonos:
+    - media_player.bathroom
+    - media_player.bedroom
+    - media_player.living_room
+    - media_player.kitchen
+    - media_player.dining_room
+    - media_player.guest_bathroom
+    - media_player.rooftop
+    - media_player.claudias_room
+    - media_player.kristines_room
+
+  # Resident -> their HA Spotify account entity.
+  accounts:
+    Mikkel: media_player.spotify_mikkel
+    Kristine: media_player.spotify_kristine
+    Claudia: media_player.spotify_claudia
+
+  # Who is speaking: the identity sensor of an area, then the only resident Bermuda places there,
+  # then the area's owner.
+  identity:
+    bathroom: {entity: sensor.bathroom_display, state: mikkel, person: Mikkel}
+  ble_areas:
+    Mikkel: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area
+    Claudia: sensor.claudias_iphone_ble_area
+    Kristine: sensor.kristines_iphone_ble_area
+  owners:
+    bathroom: Mikkel
+    bedroom: Mikkel
+
+  sessions_sensor: sensor.music_sessions
+  # The last song counts as "lately" for this many days; also how far back the recorder is read at start.
+  recent_days: 7

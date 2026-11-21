@@ -86,6 +86,12 @@ def main():
         check(speaker in ma,
               f"{ar_fname}: speaker {speaker} for {area} is not a registry Music Assistant entity")
 
+    mm_fname = "apps/sonos/assist_my_music.yaml"
+    mm = next(iter(load(mm_fname).values()))
+    for speaker in [*(mm.get("speakers") or {}).values(), *(mm.get("sonos") or [])]:
+        check(speaker in ma,
+              f"{mm_fname}: speaker {speaker} is not a registry Music Assistant entity")
+
     fv_fname = "apps/sonos/family_room_volume_sync.yaml"
     fv = next(iter(load(fv_fname).values()))
     fv_speakers = fv.get("speakers") or []
