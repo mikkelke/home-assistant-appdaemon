@@ -98,6 +98,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
     # Attribution state (see _attribute), class-level so it also exists before initialize().
     _cycle_actor = None  # ActorAttribution result for whoever started the current cycle
     last_door_closed_at = None  # UTC of the last door close with the machine Off or Emptied
+    door_handled_until = None  # UTC up to which door events in Unemptied were already handled
     announce_entity = None  # input_boolean; off silences the Sonos finish announcement
     # The start is anchored on the door close that loaded the machine, which can precede the power
     # edge by hours on a delayed start; a close older than this is not trusted.
@@ -173,6 +174,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             lambda: self.detected_programme,
             lambda: self.expected_dur_at_start,
             lambda: (self._cycle_actor or {}).get("person"),
+            lambda: self.door_handled_until,
         )
 
     def _cycle_store_field_map(self):
@@ -192,6 +194,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             "max_power_w": lambda: self.max_power_w,
             "door_opened_during_cycle": lambda: self.door_opened_during_cycle,
             "last_door_closed_at": lambda: format_utc(self.last_door_closed_at) if self.last_door_closed_at else None,
+            "door_handled_until": lambda: format_utc(self.door_handled_until) if self.door_handled_until else None,
             "strict_start_until_door_or_sustain": lambda: self._strict_start_until_door_or_sustain,
             "last_high_power_time": (
                 lambda: format_utc(self._last_high_power_time) if self._last_high_power_time else None
@@ -345,6 +348,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         # Door-close fast start (power still gates Running): factual close vs temporary arm
         self.door_close_fast_start_window_s = int(self.args.get("door_close_fast_start_window_s", 900))
         self.last_door_closed_at = None  # timezone-aware UTC
+        self.door_handled_until = None
         self.door_fast_start_armed_until = None
         self.pending_start_used_fast_path = False
 
@@ -502,6 +506,8 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             self.state_since = parse_utc(boot_last_changed)
         elif store_data:
             self.state_since = parse_utc(store_data.get("state_since"))
+        if store_data and store_data.get("door_handled_until"):
+            self.door_handled_until = parse_utc(store_data.get("door_handled_until"))
 
         # Capture the mirror BEFORE any publish below syncs our own state into it - the
         # history-resume fallback (_maybe_resume_cycle_from_history, step 3 in the precedence
@@ -3117,6 +3123,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         # leave it unknown rather than counting the wait/peek as extra wash time.
         if self.short_entity:
             attrs["short_selected"] = self.get_state(self.short_entity)
+        self.door_handled_until = self._now_utc()
         self._set_state_entity( state="Unemptied", attributes=attrs, replace=True)
         self._safe_cancel_timer(self.unemptied_watchdog_timer)
         self.unemptied_watchdog_timer = None
@@ -3238,6 +3245,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         self.pending_start_used_fast_path = False
         self.door_fast_start_armed_until = None
         self.last_door_closed_at = None
+        self.door_handled_until = None
         self._sustain_start_begin = None
 
         if self.poll_timer:
@@ -3453,9 +3461,12 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             # without this a missed edge left the machine wedged in Unemptied forever. The
             # recorder, not power, is the arbiter: 0W here is the NORMAL steady state (a
             # finished, unemptied dishwasher), never evidence of anything on its own.
-            if self._door_open_edge_since(self.state_since):
+            since = self.state_since
+            if self.door_handled_until and (since is None or self.door_handled_until > since):
+                since = self.door_handled_until
+            if self._door_open_edge_since(since):
                 self.log(
-                    "Poll: Unemptied door-open edge found in history since state_since - "
+                    "Poll: Unemptied door-open edge found in history since the last handled door event - "
                     "a door event was missed",
                     level="INFO",
                 )
