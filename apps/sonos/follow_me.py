@@ -820,7 +820,7 @@ class SonosFollowMe(hass.Hass):
                 self._restore_volume_if_airplay(speaker_entity, delay_seconds=1.2)
 
     # Rooms that do NOT get follow_me mute/unmute when they are the solo playing speaker (e.g. TV in living room).
-    _SOLO_EXCLUDED_ROOMS = ("living_room", "kristines_room", "rooftop")
+    _SOLO_EXCLUDED_ROOMS = ("living_room", "kristines_room", "claudias_room", "rooftop")
 
     def _should_follow_me_be_active(self):
         """Determine if follow_me should be active based on automatic detection.
@@ -830,7 +830,7 @@ class SonosFollowMe(hass.Hass):
         2. Any speaker is playing AND the currently playing speaker is NOT in the solo-excluded list.
         
         When solo, we mute/unmute based on presence for bathroom, guest_bathroom, bedroom, etc.
-        We do NOT apply follow_me when the solo playing speaker is living_room, kristines_room, or rooftop.
+        We do NOT apply follow_me when the solo playing speaker is in _SOLO_EXCLUDED_ROOMS.
         
         Returns:
             bool: True if follow_me should be active, False otherwise
@@ -863,10 +863,7 @@ class SonosFollowMe(hass.Hass):
         
         Bedroom is NOT excluded - it works the same as bathroom.
         
-        Excluded when NOT grouped:
-        - kristines_room
-        - rooftop
-        - living_room
+        Excluded when NOT grouped: the rooms in _SOLO_EXCLUDED_ROOMS.
         
         Args:
             room: Room name to check
@@ -886,7 +883,7 @@ class SonosFollowMe(hass.Hass):
         if is_grouped:
             return False
         
-        # When NOT grouped, exclude same rooms as solo-excluded (living_room, kristines_room, rooftop)
+        # When NOT grouped, exclude the solo-excluded rooms
         if room in self._SOLO_EXCLUDED_ROOMS:
             return True
         
