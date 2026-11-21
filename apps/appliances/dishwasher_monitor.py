@@ -1418,7 +1418,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         defaults = {
             "quick": {
                 "label": "QuickPowerWash", "duration_min": 58, "duration_short_min": 14,
-                "max_energy_kwh": 1.2, "dry_tail_minutes": 0,
+                "max_energy_kwh": 1.2, "dry_tail_minutes": 33,
             },
             "gentle": {"label": "Gentle", "duration_min": 149, "max_energy_kwh": 1.1, "dry_tail_minutes": 0},
             "eco": {

@@ -20,7 +20,8 @@ programmes:
     duration_min: 58
     duration_short_min: 14   # QuickPowerWash with short = Yes (rinse/salt cycle)
     max_energy_kwh: 1.2
-    dry_tail_minutes: 0      # unmeasured
+    # Heating ends ~50 min in, then ~0 W drying while the display still counts down to ~88 min.
+    dry_tail_minutes: 33
 
   gentle:
     label: "Gentle"
