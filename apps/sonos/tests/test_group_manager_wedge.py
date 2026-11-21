@@ -54,6 +54,8 @@ def make_app():
     app._family_zone_sync_in_progress = False
     app._family_zone_sync_start_time = None
     app._family_zone_recheck_pending = False
+    app._family_detached = {}
+    app._family_detach_handle = None
 
     app.log_calls = []      # (level, message)
     app.scheduled = []      # (callback, delay, kwargs, handle)

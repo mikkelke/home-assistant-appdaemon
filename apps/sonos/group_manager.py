@@ -10,6 +10,11 @@ import threading
 # it needs its own timer rather than a lazy elapsed-time check.
 RESET_WEDGE_TIMEOUT_S = 120
 
+# After a person takes one family speaker out of a mixed group, Auto-Group leaves that group's
+# other speakers alone this long, while the rest of the zone is unjoined from it.
+FAMILY_DETACH_S = 30
+FAMILY_DETACH_ROUND_DELAY_S = 1.5
+
 class SonosGroupManager(hass.Hass):
     """
     Comprehensive Sonos group management that:
@@ -59,6 +64,9 @@ class SonosGroupManager(hass.Hass):
         # 2nd of two playing-transitions from a Spotify handoff blip within ~3s of each
         # other), remember it and re-run once the in-flight sync's flag clears.
         self._family_zone_recheck_pending = False
+        # Non-family speaker -> epoch until which Auto-Group keeps the zone out of its group
+        self._family_detached = {}
+        self._family_detach_handle = None
         
         # Operation queue for serializing group operations
         self._group_operation_queue = []  # Queue of pending group operations
@@ -99,6 +107,8 @@ class SonosGroupManager(hass.Hass):
 
         # Clean stale entries in _prev_group_members
         self._clean_prev_group_members()
+        # Current group_members per speaker; the twins report [] when solo
+        self._last_group = {sp: self._members(sp) for sp in self.speakers}
 
         # listen to any state or group change
         for sp in self.speakers:
@@ -243,10 +253,16 @@ class SonosGroupManager(hass.Hass):
         # Update previous group members with thread safety
         with self.lock:
             self._prev_group_members[entity] = old_members
+            self._last_group[entity] = list(new_members)
 
         if self._reset_in_progress:
             self.log("Scenario: skip_group_change_during_reset -> StateReset owns group/mute during reset", level="DEBUG")
             return
+
+        if ({entity} | set(new_members)) & self._family_detached_now() and (
+            set(new_members) & set(self._current_family_zone_members())
+        ):
+            self._schedule_family_detach_round()
         
         # Check if speaker became solo (was in a group and now isn't)
         was_grouped = len(old_members) > 1
@@ -543,6 +559,15 @@ class SonosGroupManager(hass.Hass):
                 )
                 return
 
+            kept_out = set(target_group) & self._family_detached_now()
+            if kept_out:
+                self.log(
+                    f"Family Zone Auto-Group: {anchor_member}'s group holds {sorted(kept_out)}, "
+                    "which a person took the zone out of. Skipping.",
+                    level="INFO",
+                )
+                return
+
             target_master = self._resolve_group_master(anchor_member, target_group)
             self.log(
                 f"Family Zone Auto-Group: Anchor {anchor_member} ({anchor_reason}) in "
@@ -577,6 +602,97 @@ class SonosGroupManager(hass.Hass):
             # but ensure we reset even if this callback is interrupted
             self.run_in(self._reset_family_zone_sync_flag, 3.0)
     
+    def _members(self, speaker):
+        members = self._safe_get_state(speaker, attribute="group_members", default=[])
+        return list(members) if isinstance(members, list) else []
+
+    def _person_call(self, data):
+        """True when a call_service event comes from a person's HA account: a user id that is not
+        one of MusicAttribution's house_user_ids. Calls without a user (automations) are the house."""
+        context = (data.get("metadata") or {}).get("context") or {}
+        user_id = str(context.get("user_id") or "").replace("-", "").strip().lower()
+        if not user_id:
+            return False
+        try:
+            house = self.get_app("MusicAttribution").house_user_ids
+        except Exception:
+            return False
+        return user_id not in house
+
+    def _call_speakers(self, data, *keys):
+        service_data = data.get("service_data") or {}
+        found = []
+        for key in keys:
+            value = service_data.get(key)
+            for entity in [value] if isinstance(value, str) else (value or []):
+                if entity in self.speakers and entity not in found:
+                    found.append(entity)
+        return found
+
+    def _family_detached_now(self):
+        now = self.datetime().timestamp()
+        for speaker, until in list(self._family_detached.items()):
+            if until <= now:
+                del self._family_detached[speaker]
+        return set(self._family_detached)
+
+    def _on_family_unjoin_call(self, data):
+        """A person taking one family speaker out of a group that also holds non-family speakers
+        takes the whole family zone out of it. A family-only group re-joins as before."""
+        if not self._person_call(data):
+            return
+        zone = set(self._current_family_zone_members())
+        for target in self._call_speakers(data, "entity_id"):
+            group = self._last_group.get(target) or []
+            stay = set(group) - zone
+            if target not in zone or len(group) <= 1 or not stay:
+                continue
+            until = self.datetime().timestamp() + FAMILY_DETACH_S
+            for speaker in stay:
+                self._family_detached[speaker] = until
+            with self._group_operation_lock:
+                self._group_operation_queue = [
+                    op for op in self._group_operation_queue
+                    if not (op["type"] == "join" and op["priority"] == "normal" and set(op["members"]) <= zone)
+                ]
+            self.log(
+                f"Family Zone Auto-Group: a person took {target} out of the group with {sorted(stay)}; "
+                "the family zone leaves that group",
+                level="INFO",
+            )
+            self._schedule_family_detach_round()
+
+    def _on_family_join_call(self, data):
+        """A person adding a family speaker to any group lets Auto-Group pull the rest in again."""
+        if self._family_detached and self._person_call(data):
+            zone = set(self._current_family_zone_members())
+            if zone & set(self._call_speakers(data, "entity_id", "group_members")):
+                self.log(f"Family Zone Auto-Group: a person added a family speaker, re-allowing {sorted(self._family_detached)}", level="INFO")
+                self._family_detached.clear()
+
+    def _schedule_family_detach_round(self):
+        self._safe_cancel_timer(self._family_detach_handle)
+        self._family_detach_handle = self.run_in(self._family_detach_round, FAMILY_DETACH_ROUND_DELAY_S)
+
+    def _family_detach_round(self, kwargs=None):
+        """Unjoin the family speakers still grouped with a detached speaker. The coordinator goes
+        last: unjoining it makes Music Assistant re-form the group, which brings the next round."""
+        self._family_detach_handle = None
+        if self._reset_in_progress:
+            return
+        zone = set(self._current_family_zone_members())
+        leaving = []
+        for speaker in sorted(self._family_detached_now()):
+            group = self._members(speaker)
+            family = [m for m in group if m in zone]
+            followers = [m for m in family if m != group[0]] if group else []
+            for member in followers or family:
+                if member not in leaving:
+                    leaving.append(member)
+        if leaving:
+            self.log(f"Family Zone Auto-Group: unjoining {leaving} from the group a person took the zone out of", level="INFO")
+            self._queue_group_operation("unjoin", None, leaving, priority="high")
+
     def _reset_family_zone_sync_flag(self, kwargs=None):
         """Reset the family zone sync flag after operations complete"""
         self._family_zone_sync_in_progress = False
@@ -791,6 +907,11 @@ class SonosGroupManager(hass.Hass):
             )
             return
         
+        if service == "unjoin":
+            self._on_family_unjoin_call(data)
+        elif service == "join":
+            self._on_family_join_call(data)
+
         # Update timestamp for join events (follow_me is now automatically detected)
         if service == "join":
             self.log(f"Scenario: join_service_detected -> follow_me will be active if conditions met", level="INFO")
@@ -854,6 +975,7 @@ class SonosGroupManager(hass.Hass):
         self._group_changes.clear()
         self._family_zone_sync_in_progress = False
         self._family_zone_sync_start_time = None
+        self._family_detached.clear()
         self.fire_event(
             "sonos_reset_ready",
             targets=data.get("targets", []),
