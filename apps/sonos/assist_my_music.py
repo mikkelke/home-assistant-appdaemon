@@ -17,8 +17,8 @@ polled about every 30 s):
       group): the room joins that speaker, already there means nothing to do;
     - playing or paused elsewhere (a phone; Music Assistant's own Spotify stream does not count):
       the room's speaker plays the account's current track through Music Assistant with radio
-      mode, so similar songs follow (shuffle off, or the queue would not start with that track),
-      and a playing phone is paused, which moves the music;
+      mode, so similar songs follow (the track first on its own: a radio queue is a shuffled
+      smart mix that would not start with it), and a playing phone is paused, which moves the music;
     - idle: the account's last track, remembered by this app from every playing or paused state
       (persisted in state_file, seeded from the recorder for `recent_days` at startup), the same way;
     - nothing within recent_days: it says so.
@@ -43,6 +43,7 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 RESULT_EVENT = "assist_my_music_result"
 NOT_PEOPLE = ("someone", "outside home assistant")
 MA_SOURCE = "Music Assistant Playback"
+RADIO_AFTER_S = 2
 FAMILY_AREAS = ["dining_room", "kitchen", "living_room"]
 FAMILY_ROOM = "family room"
 
@@ -124,10 +125,10 @@ def my_music_plan(person, speaker, speaker_state, account, account_state, last_i
     actions = []
     if len(_members(speaker_state)) > 1:
         actions.append({"event": "request_sonos_group_unjoin", "data": {"entity_id": speaker}})
-    delay = {"delay": 1} if actions else {}
-    actions.append({"service": "media_player/shuffle_set", "data": {"entity_id": speaker, "shuffle": False}, **delay})
-    actions.append({"service": "music_assistant/play_media",
-                    "data": {"entity_id": speaker, "media_id": item["uri"], "radio_mode": True}, **delay})
+    first = 1 if actions else 0
+    play = {"service": "music_assistant/play_media", "data": {"entity_id": speaker, "media_id": item["uri"]}}
+    actions.append(dict(play, data=dict(play["data"], enqueue="replace"), **({"delay": first} if first else {})))
+    actions.append(dict(play, data=dict(play["data"], enqueue="add", radio_mode=True), delay=first + RADIO_AFTER_S))
     song = song_text(item["title"], item["artist"])
     if item is current and current["state"] == "playing":
         actions.append({"service": "media_player/media_pause", "data": {"entity_id": account}})

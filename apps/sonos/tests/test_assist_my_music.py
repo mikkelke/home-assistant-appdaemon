@@ -74,15 +74,17 @@ class MyMusicPlan(unittest.TestCase):
         speech, actions = self.plan(account())
         self.assertEqual(speech, "Kristine, your Spotify moves here: Op med ho'det by Natasja.")
         self.assertEqual(actions, [
-            {"service": "media_player/shuffle_set", "data": {"entity_id": BATH, "shuffle": False}},
             {"service": "music_assistant/play_media",
-             "data": {"entity_id": BATH, "media_id": "spotify:track:2hj4INbCeEhiYsuBgAoNc8", "radio_mode": True}},
+             "data": {"entity_id": BATH, "media_id": "spotify:track:2hj4INbCeEhiYsuBgAoNc8", "enqueue": "replace"}},
+            {"service": "music_assistant/play_media", "delay": 2,
+             "data": {"entity_id": BATH, "media_id": "spotify:track:2hj4INbCeEhiYsuBgAoNc8", "enqueue": "add",
+                      "radio_mode": True}},
             {"service": "media_player/media_pause", "data": {"entity_id": ACCOUNTS["Kristine"]}}])
 
     def test_paused_phone_plays_without_pause_call(self):
         speech, actions = self.plan(account(state="paused"))
         self.assertEqual(speech, "Kristine, your last song, Op med ho'det by Natasja, then more like it.")
-        self.assertEqual([a["service"] for a in actions], ["media_player/shuffle_set", "music_assistant/play_media"])
+        self.assertEqual([a["service"] for a in actions], ["music_assistant/play_media"] * 2)
 
     def test_spotify_on_another_sonos_joins_it(self):
         speech, actions = self.plan(account(source="Kitchen + 2"))
@@ -99,7 +101,7 @@ class MyMusicPlan(unittest.TestCase):
                 "at": (NOW - timedelta(days=2)).isoformat()}
         speech, actions = self.plan(account(state="idle"), last)
         self.assertEqual(speech, "Kristine, your last song, Fugle by Djämes Braun, then more like it.")
-        self.assertEqual(actions[1]["data"]["media_id"], "spotify:track:x")
+        self.assertEqual(actions[0]["data"]["media_id"], "spotify:track:x")
 
     def test_old_song_is_not_lately(self):
         last = {"uri": "spotify:track:x", "title": "Fugle", "artist": "", "at": (NOW - timedelta(days=9)).isoformat()}
@@ -109,13 +111,13 @@ class MyMusicPlan(unittest.TestCase):
     def test_grouped_speaker_leaves_first(self):
         _, actions = self.plan(account(state="paused"), spk=speaker("playing", [KITCHEN, BATH]))
         self.assertEqual(actions[0], {"event": "request_sonos_group_unjoin", "data": {"entity_id": BATH}})
-        self.assertEqual([a.get("delay") for a in actions[1:]], [1, 1])
+        self.assertEqual([a.get("delay") for a in actions[1:]], [1, 3])
 
     def test_music_assistant_stream_is_not_own_listening(self):
         last = {"uri": "spotify:track:x", "title": "Fugle", "artist": "Djämes Braun", "at": NOW.isoformat()}
         speech, actions = self.plan(account(source="Music Assistant Playback"), last)
         self.assertEqual(speech, "Kristine, your last song, Fugle by Djämes Braun, then more like it.")
-        self.assertEqual([a["service"] for a in actions], ["media_player/shuffle_set", "music_assistant/play_media"])
+        self.assertEqual([a["service"] for a in actions], ["music_assistant/play_media"] * 2)
 
     def test_unknown_person(self):
         self.assertEqual(mm.my_music_plan(None, BATH, {}, None, {}, None, SONOS_KEYS, NOW, 7),
