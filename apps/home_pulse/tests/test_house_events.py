@@ -431,6 +431,58 @@ class BackdatedReportTests(unittest.TestCase):
                 self.assertEqual(datetime.fromisoformat(feed.events[0]["ts"]), clock)
 
 
+class KeyedReportTests(unittest.TestCase):
+    NOW = datetime(2026, 11, 20, 16, 49, 0, tzinfo=timezone.utc)
+
+    def make_feed(self):
+        feed = house_events.HouseEvents()
+        feed.events = []
+        feed.clock = self.NOW
+        feed.get_now = lambda: feed.clock
+        feed.published = []
+        feed._publish = lambda: feed.published.append(list(feed.events))
+        feed._write_state_file = lambda: None
+        feed.log = lambda *a, **kw: None
+        return feed
+
+    def report(self, feed, **data):
+        feed._on_report("house_events_report", data, {})
+
+    def test_same_key_rewrites_the_row_and_keeps_its_time(self):
+        feed = self.make_feed()
+        self.report(feed, text="Kristine started Spotify in Kitchen", icon="mdi:spotify", by="Kristine", key="music:k:1")
+        self.report(feed, text="Door opened")
+        feed.clock = self.NOW + timedelta(minutes=4)
+        self.report(feed, text="Kristine and Mikkel started Spotify in Kitchen", icon="mdi:spotify", key="music:k:1")
+        self.assertEqual([e["text"] for e in feed.events], ["Door opened", "Kristine and Mikkel started Spotify in Kitchen"])
+        row = feed.events[1]
+        self.assertEqual(datetime.fromisoformat(row["ts"]), self.NOW)
+        self.assertEqual(row["key"], "music:k:1")
+        self.assertNotIn("by", row)
+
+    def test_unchanged_report_does_not_republish(self):
+        feed = self.make_feed()
+        self.report(feed, text="Mikkel started Spotify in Kitchen", by="Mikkel", key="music:k:1")
+        self.report(feed, text="Mikkel started Spotify in Kitchen", by="Mikkel", key="music:k:1")
+        self.assertEqual(len(feed.events), 1)
+        self.assertEqual(len(feed.published), 1)
+
+    def test_other_key_is_a_new_row(self):
+        feed = self.make_feed()
+        self.report(feed, text="Mikkel started Spotify in Kitchen", key="music:k:1")
+        feed.clock = self.NOW + timedelta(hours=1)
+        self.report(feed, text="Mikkel started Spotify in Kitchen", key="music:k:2")
+        self.assertEqual(len(feed.events), 2)
+
+    def test_update_takes_the_new_audience(self):
+        feed = self.make_feed()
+        self.report(feed, text="Guest started Spotify in Bedroom", audience="admin", key="music:b:1")
+        self.report(feed, text="Guest and Kristine started Spotify in Bedroom + 1 more", audience_users=["Kristine"],
+                    key="music:b:1")
+        self.assertNotIn("audience", feed.events[0])
+        self.assertEqual(feed.events[0]["audience_users"], ["Kristine"])
+
+
 class LockListenerTests(unittest.TestCase):
     # Replays 15.11: door contact on at 05:04:50.4, BLE unlock at 05:04:52.4, cloud
     # changed_by "Manual Unlock" at 05:04:54, emit 20 s after the unlock.

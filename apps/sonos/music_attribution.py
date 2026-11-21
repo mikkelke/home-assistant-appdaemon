@@ -17,9 +17,12 @@ Who started it:
    other account is "Someone".
 2. Spotify Connect: every resident whose Spotify account entity (``spotify_accounts``) is playing on
    the group's Spotify Connect device ("Kitchen", or "Kitchen + 3" for a group), polled for up to
-   ``spotify_wait_seconds``; several (a Jam) are all named. "A guest" only when every resident's account is configured and
-   available, none matched or plays the same track, and Spotify still plays at the deadline;
-   otherwise "Someone".
+   ``spotify_wait_seconds``; several (a Jam) are all named. "A guest" only when every resident's
+   account is configured and available, none matched or plays the same track, and Spotify still
+   plays at the deadline; otherwise "Someone". A resident whose account turns up playing on the
+   session's lead speaker after the row was written joined it (a Jam): the same row (its ``key``)
+   is re-sent naming them too, "Guest and Mikkel started Spotify in Kitchen". Names are never
+   removed.
 3. AirPlay, Music Assistant's own app, line-in and the Sonos app expose no identity: "Someone".
 4. TV audio is not music: no row.
 
@@ -84,6 +87,9 @@ ROOM_AUDIENCE = {
 }
 
 WHAT = {"spotify": "Spotify", "airplay": "AirPlay"}
+GUEST = "Guest"
+# A session's row grows with joiners for at most this long after it started.
+SPOTIFY_TRACK_S = 12 * 3600
 ICONS = {"spotify": "mdi:spotify", "airplay": "mdi:airplay", "line_in": "mdi:cast-audio"}
 
 
@@ -279,6 +285,24 @@ def spotify_is_guest(residents, accounts, states, still_spotify, track):
     return True
 
 
+class SpotifySession:
+    """One Spotify Connect session being attributed: who started it (`starter`: GUEST, "Someone" or
+    None when the starters are in `names`), the residents named, the speakers its row names and
+    the row's key."""
+
+    def __init__(self, speaker, group, run_ts):
+        self.speaker = speaker
+        self.group = list(group)
+        self.rooms = set(group) | {speaker}
+        self.run_ts = run_ts
+        self.lead_speaker = self.group[0] if self.group else speaker
+        self.key = f"music:{speaker}:{int(run_ts)}"
+        self.starter = None
+        self.names = []
+        self.members = None
+        self.written = False
+
+
 def parse_ts(value):
     """Epoch seconds from an HA ISO timestamp, or None."""
     if not value:
@@ -333,6 +357,10 @@ class PlaybackLedger:
     def playing(self, speaker):
         return speaker in self._run_start
 
+    def settled(self, speaker):
+        """Playing in a run whose settle check has run, so its session is known."""
+        return speaker in self._confirmed
+
     def settle(self, speaker, run_ts, group):
         """Verdict for the run that began at run_ts, judged now: 'stale' (that run is over),
         'join', 'resume' or 'new'. `group` is the speaker's current group, coordinator first."""
@@ -386,6 +414,7 @@ class MusicAttribution(hass.Hass):
         self.settle_s = float(self.args.get("settle_seconds", 5))
         self.spotify_wait_s = float(self.args.get("spotify_wait_seconds", 60))
         self.spotify_poll_s = float(self.args.get("spotify_poll_seconds", 5))
+        self._spotify_sessions = []
         self.ledger = PlaybackLedger(
             idle_s=float(self.args.get("session_idle_minutes", 20)) * 60.0,
             call_window_s=float(self.args.get("call_window_seconds", 30)),
@@ -405,6 +434,8 @@ class MusicAttribution(hass.Hass):
             self.listen_state(self._on_speaker, raw)
         for domain in CALL_DOMAINS:
             self.listen_event(self._on_call, "call_service", domain=domain)
+        for entity in self.spotify_accounts.values():
+            self.listen_state(self._on_account, entity, attribute="all")
         self.log(
             f"MusicAttribution: {len(self.raw_to_base)} speakers, "
             f"{len(self.spotify_accounts)}/{len(self.residents)} Spotify accounts linked"
@@ -460,6 +491,10 @@ class MusicAttribution(hass.Hass):
             return
         if verdict != "new":
             return
+        rooms = set(group) | {speaker}
+        self._spotify_sessions = [
+            s for s in self._spotify_sessions if not (s.rooms & rooms) and run_ts - s.run_ts < SPOTIFY_TRACK_S
+        ]
         kind = content_kind(self._content(speaker), self._attr(speaker, "source"))
         if kind == "tv":
             return
@@ -472,28 +507,69 @@ class MusicAttribution(hass.Hass):
             self._report(origin[1] or "Someone", kind, speaker, group, by=origin[1], run_ts=run_ts)
             return
         if kind == "spotify" and self.spotify_accounts:
-            deadline = run_ts + self.spotify_wait_s
-            self.run_in(self._spotify_poll, self.spotify_poll_s, speaker=speaker, group=group, deadline=deadline)
+            session = SpotifySession(speaker, group, run_ts)
+            self._spotify_sessions.append(session)
+            self.run_in(self._spotify_poll, self.spotify_poll_s, session=session)
             return
         self._report("Someone", kind, speaker, group, run_ts=run_ts)
 
     def _spotify_poll(self, kwargs):
-        speaker = kwargs["speaker"]
-        group = kwargs["group"]
-        deadline = kwargs["deadline"]
-        states = {entity: self._full_state(entity) for entity in self.spotify_accounts.values()}
-        hits = spotify_matches(self.spotify_accounts, states, self._device_keys(group))
-        if hits:
-            by = hits[0] if len(hits) == 1 else None
-            self._report(people_text(hits), "spotify", speaker, group, by=by, run_ts=deadline - self.spotify_wait_s)
+        session = kwargs["session"]
+        if session not in self._spotify_sessions:
             return
-        if self._now() < deadline:
-            self.run_in(self._spotify_poll, self.spotify_poll_s, speaker=speaker, group=group, deadline=deadline)
+        speaker = session.speaker
+        states = {entity: self._full_state(entity) for entity in self.spotify_accounts.values()}
+        hits = spotify_matches(self.spotify_accounts, states, self._device_keys(session.group))
+        if hits:
+            session.names = list(hits)
+            self._report_session(session)
+            return
+        if self._now() < session.run_ts + self.spotify_wait_s:
+            self.run_in(self._spotify_poll, self.spotify_poll_s, session=session)
             return
         still_spotify = self.ledger.playing(speaker) and content_kind(self._content(speaker)) == "spotify"
         track = track_key(self._full_state(speaker).get("attributes"))
-        guest = not hits and spotify_is_guest(self.residents, self.spotify_accounts, states, still_spotify, track)
-        self._report("A guest" if guest else "Someone", "spotify", speaker, group, run_ts=deadline - self.spotify_wait_s)
+        guest = spotify_is_guest(self.residents, self.spotify_accounts, states, still_spotify, track)
+        session.starter = GUEST if guest else "Someone"
+        self._report_session(session)
+
+    def _on_account(self, entity, attribute, old, new, kwargs):
+        """A resident whose account turns up playing on a session's speaker after its row is written
+        joined it: the row grows to name them."""
+        state = new if isinstance(new, dict) else {}
+        person = next((p for p, e in self.spotify_accounts.items() if e == entity), None)
+        if person is None or state.get("state") != "playing":
+            return
+        source = device_key((state.get("attributes") or {}).get("source"))
+        for session in list(self._spotify_sessions):
+            if not session.written or person in session.names:
+                continue
+            if self._now() - session.run_ts >= SPOTIFY_TRACK_S:
+                self._spotify_sessions.remove(session)
+                continue
+            lead = session.lead_speaker
+            if not self.ledger.settled(lead) or content_kind(self._content(lead)) != "spotify":
+                continue
+            if source in self._device_keys([lead]):
+                session.names.append(person)
+                self.log(f"{person} joined the Spotify session on {lead}")
+                self._report_session(session)
+
+    def _report_session(self, session):
+        session.written = True
+        names = list(session.names)
+        starter = session.starter
+        if starter and names:
+            who = people_text([starter] + names)
+        elif starter:
+            who = "A guest" if starter == GUEST else starter
+        else:
+            who = people_text(names)
+        by = names[0] if len(names) == 1 and not starter else None
+        session.members = self._report(
+            who, "spotify", session.speaker, session.group, by=by, run_ts=session.run_ts, key=session.key,
+            members=session.members,
+        )
 
     def _settle_stop(self, kwargs):
         speaker = kwargs["speaker"]
@@ -544,20 +620,25 @@ class MusicAttribution(hass.Hass):
 
     # -- reporting ----------------------------------------------------------
 
-    def _report(self, who, kind, speaker, group, by=None, run_ts=None):
-        current = self._group(speaker) if self.ledger.playing(speaker) else []
-        members = current if len(current) >= len(group) else group
+    def _report(self, who, kind, speaker, group, by=None, run_ts=None, key=None, members=None):
+        """Fires the row and returns the speakers it names; `members` fixes them for a re-sent row."""
+        if members is None:
+            current = self._group(speaker) if self.ledger.playing(speaker) else []
+            members = current if len(current) >= len(group) else group
         text = session_text(who, kind, where_label([room_label(self.raw_to_base[m]) for m in members]))
         payload = {"text": text, "icon": icon_for(kind)}
         payload.update(audience_for([room_key(self.raw_to_base[m]) for m in members]))
         if by:
             payload["by"] = by
+        if key:
+            payload["key"] = key
         self.log(f"Music session: {text}")
         self._record_start(members, who, self._now() if run_ts is None else run_ts)
         try:
             self.fire_event("house_events_report", **payload)
         except Exception:
             pass
+        return members
 
     # -- HA state helpers ---------------------------------------------------
 

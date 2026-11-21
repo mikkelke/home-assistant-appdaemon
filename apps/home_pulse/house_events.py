@@ -47,6 +47,9 @@ audience="admin" (admin-only outranks; the users list is ignored then).
 `at` (optional): ISO time the event happened, for an observer that only knows it after the fact
 (a watering seen once the soil stops rising). Kept when it lies within MAX_BACKDATE before now, else
 the entry gets now; the entry sorts into the feed at that time.
+`key` (optional): an emitter's id for a row that grows after it was written ("Mikkel and Kristine
+started Spotify" once Kristine joins). A report whose key is already in the feed rewrites that row
+in place (text, icon, by, audience) and keeps its time; the dashboard knows such a row by its key.
 
 Persistence (v3): entity first, state file second. The feed is re-read from the
 entity on app reload (survives code deploys), and from `house_events_state.json`
@@ -425,6 +428,7 @@ def build_report_event(data):
         "audience": audience,
         "audience_users": audience_users,
         "at": _parse_at(data.get("at")),
+        "key": _clean_str(data.get("key")),
     }
 
 
@@ -634,6 +638,7 @@ class HouseEvents(hass.Hass):
                 audience=event["audience"],
                 audience_users=event["audience_users"],
                 at=event["at"],
+                key=event["key"],
             )
 
     # -- feed management ----------------------------------------------------
@@ -660,7 +665,9 @@ class HouseEvents(hass.Hass):
             return []
 
     def _add(self, icon, text, cause=None, effect=None, by=None, audience=None, audience_users=None, entry_kind=None,
-             at=None):
+             at=None, key=None):
+        if key and self._update_keyed(key, icon, text, by, audience, audience_users):
+            return
         now = self.get_now()
         if at is not None and now - MAX_BACKDATE <= at <= now:
             now = at.astimezone(now.tzinfo)
@@ -690,11 +697,34 @@ class HouseEvents(hass.Hass):
             entry["audience_users"] = list(audience_users)
         if entry_kind:
             entry["entry"] = entry_kind
+        if key:
+            entry["key"] = key
         self.events.insert(_position(self.events, now), entry)
         del self.events[MAX_EVENTS:]
         self._publish()
         self._write_state_file()
         self.log(f"Event: {text}")
+
+    def _update_keyed(self, key, icon, text, by, audience, audience_users):
+        """Rewrites the feed row carrying `key`; False when there is none."""
+        for i, event in enumerate(self.events):
+            if event.get("key") != key:
+                continue
+            entry = {k: v for k, v in event.items() if k not in ("by", "audience", "audience_users")}
+            entry.update(icon=icon, text=text)
+            if by:
+                entry["by"] = by
+            if audience == "admin":
+                entry["audience"] = "admin"
+            elif audience_users:
+                entry["audience_users"] = list(audience_users)
+            if entry != event:
+                self.events[i] = entry
+                self._publish()
+                self._write_state_file()
+                self.log(f"Event updated: {text}")
+            return True
+        return False
 
     def _write_state_file(self):
         # tmp + os.replace so a crash mid-write can't leave a truncated file for the

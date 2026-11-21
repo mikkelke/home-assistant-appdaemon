@@ -46,6 +46,7 @@ ROOFTOP_TABLET = "aaaa0000000000000000000000000004"
 
 SPOTIFY = "x-sonos-vli:RINCON_74CA6064C9BF01400:2,spotify:6eff5f32d1a6e15f7758545aec6d0e0c"
 MA_STREAM = "http://10.21.0.5:8097/single/cGCeFG6t/RINCON_F0F6C1A525A201400.flac"
+KEY = "music:media_player.kitchen_2:100000"
 ACCOUNTS = {
     "Mikkel": "media_player.spotify_mikkel",
     "Kristine": "media_player.spotify_kristine",
@@ -68,6 +69,7 @@ def make_app(spotify_accounts=None):
     app.settle_s = 5.0
     app.spotify_wait_s = 60.0
     app.spotify_poll_s = 5.0
+    app._spotify_sessions = []
     app.ledger = ma.PlaybackLedger(idle_s=1200, call_window_s=30)
     app._person_by_user_id = {}
     app.sessions_sensor = "sensor.music_sessions"
@@ -497,7 +499,7 @@ class Spotify(unittest.TestCase):
         spotify_account(app, "Kristine", "playing", source="Kitchen + 2")
         advance(app, 10)
         self.assertEqual(
-            rows(app), [{"text": "Kristine started Spotify in Kitchen + 2 more", "icon": "mdi:spotify", "by": "Kristine"}]
+            rows(app), [{"text": "Kristine started Spotify in Kitchen + 2 more", "icon": "mdi:spotify", "by": "Kristine", "key": KEY}]
         )
 
     def test_row_names_the_group_as_it_stands_at_the_match(self):
@@ -529,7 +531,7 @@ class Spotify(unittest.TestCase):
         spotify_account(app, "Mikkel", "playing", source="Mikkels iPhone", title="Other", artist="Else")
         self.start(app)
         advance(app, 70)
-        self.assertEqual(rows(app), [{"text": "A guest started Spotify in Kitchen", "icon": "mdi:spotify"}])
+        self.assertEqual(rows(app), [{"text": "A guest started Spotify in Kitchen", "icon": "mdi:spotify", "key": KEY}])
 
     def test_not_all_accounts_linked_is_someone(self):
         accounts = {k: v for k, v in ACCOUNTS.items() if k != "Claudia"}
@@ -566,7 +568,7 @@ class Spotify(unittest.TestCase):
         spotify_account(app, "Kristine", "playing", source="Kitchen")
         self.start(app)
         advance(app, 10)
-        self.assertEqual(rows(app), [{"text": "Mikkel and Kristine started Spotify in Kitchen", "icon": "mdi:spotify"}])
+        self.assertEqual(rows(app), [{"text": "Mikkel and Kristine started Spotify in Kitchen", "icon": "mdi:spotify", "key": KEY}])
 
     def test_people_text(self):
         self.assertEqual(ma.people_text(["Mikkel"]), "Mikkel")
@@ -596,6 +598,124 @@ class Spotify(unittest.TestCase):
         self.assertFalse(ma.spotify_is_guest(residents, ACCOUNTS, states, False, ("song", "band")))
         self.assertFalse(ma.spotify_is_guest(residents, {}, states, True, None))
         self.assertFalse(ma.spotify_is_guest([], ACCOUNTS, states, True, None))
+
+
+class SpotifyJam(unittest.TestCase):
+    def start(self, app, room="kitchen", title="Song", artist="Band"):
+        for person in ACCOUNTS:
+            spotify_account(app, person, "idle")
+        set_speaker(app, room, "playing", SPOTIFY, source="Spotify Connect", title=title, artist=artist)
+
+    def account(self, app, person, state, source=None, title=None):
+        spotify_account(app, person, state, source=source, title=title)
+        app._on_account(ACCOUNTS[person], "all", None, app.states[ACCOUNTS[person]], {})
+
+    def test_resident_who_joins_later_is_added_to_the_same_row(self):
+        # 20.11: Kristine started 17:48:15, Mikkel's account showed on Kitchen 266 s later.
+        app = make_app(ACCOUNTS)
+        self.start(app)
+        advance(app, 20)
+        self.account(app, "Kristine", "playing", source="Kitchen")
+        advance(app, 10)
+        advance(app, 236)
+        self.account(app, "Mikkel", "playing", source="Kitchen + 4")
+        self.assertEqual(
+            rows(app),
+            [
+                {"text": "Kristine started Spotify in Kitchen", "icon": "mdi:spotify", "by": "Kristine", "key": KEY},
+                {"text": "Kristine and Mikkel started Spotify in Kitchen", "icon": "mdi:spotify", "key": KEY},
+            ],
+        )
+        self.assertEqual(app.sessions["media_player.kitchen"]["started_by"], "Kristine and Mikkel")
+
+    def test_phone_moved_to_the_speaker_late_in_the_window_is_the_starter(self):
+        app = make_app(ACCOUNTS)
+        self.start(app)
+        spotify_account(app, "Mikkel", "playing", source="OPPO Find X9 Pro", title="Song")
+        advance(app, 50)
+        spotify_account(app, "Mikkel", "playing", source="Kitchen", title="Song")
+        advance(app, 6)
+        self.assertEqual(rows(app), [{"text": "Mikkel started Spotify in Kitchen", "icon": "mdi:spotify", "by": "Mikkel",
+                                      "key": KEY}])
+
+    def test_guest_row_grows_with_a_resident_joining_after_the_deadline(self):
+        app = make_app(ACCOUNTS)
+        self.start(app)
+        advance(app, 70)
+        self.account(app, "Claudia", "playing", source="Kitchen")
+        self.assertEqual([r["text"] for r in rows(app)],
+                         ["A guest started Spotify in Kitchen", "Guest and Claudia started Spotify in Kitchen"])
+        self.assertEqual({r["key"] for r in rows(app)}, {KEY})
+
+    def test_tv_session_ends_the_tracked_spotify_session(self):
+        app = make_app(ACCOUNTS)
+        self.start(app)
+        self.account(app, "Mikkel", "playing", source="Kitchen")
+        advance(app, 10)
+        set_speaker(app, "kitchen", "idle", SPOTIFY)
+        advance(app, 1500)
+        set_speaker(app, "kitchen", "playing", "x-sonos-htastream:RINCON_X:spdif")
+        advance(app, 10)
+        set_speaker(app, "kitchen", "paused", "x-sonos-htastream:RINCON_X:spdif")
+        set_speaker(app, "kitchen", "playing", SPOTIFY, source="Spotify Connect")
+        advance(app, 10)
+        self.account(app, "Kristine", "playing", source="Kitchen")
+        self.assertEqual([r["text"] for r in rows(app)], ["Mikkel started Spotify in Kitchen"])
+
+    def test_joiner_on_another_group_lead_is_not_added(self):
+        app = make_app(ACCOUNTS)
+        self.start(app)
+        self.account(app, "Kristine", "playing", source="Kitchen")
+        advance(app, 10)
+        for room in ("bedroom", "kitchen"):
+            app.states[raw(room)]["attributes"]["group_members"] = [raw("bedroom"), raw("kitchen")]
+        app.states[raw("bedroom")]["state"] = "playing"
+        app.states[raw("bedroom")]["attributes"]["media_content_id"] = SPOTIFY
+        self.account(app, "Mikkel", "playing", source="Bedroom + 1")
+        self.assertEqual(len(rows(app)), 1)
+
+    def test_update_keeps_the_rows_rooms(self):
+        app = make_app(ACCOUNTS)
+        self.start(app)
+        self.account(app, "Kristine", "playing", source="Kitchen")
+        advance(app, 10)
+        for room in ("kitchen", "dining_room"):
+            app.states[raw(room)]["attributes"]["group_members"] = [raw("kitchen"), raw("dining_room")]
+        self.account(app, "Mikkel", "playing", source="Kitchen + 1")
+        self.assertEqual(rows(app)[1]["text"], "Kristine and Mikkel started Spotify in Kitchen")
+
+    def test_names_are_never_removed_and_a_repeat_is_no_update(self):
+        app = make_app(ACCOUNTS)
+        self.start(app)
+        self.account(app, "Mikkel", "playing", source="Kitchen")
+        advance(app, 10)
+        self.account(app, "Mikkel", "playing", source="Mikkels iPhone")
+        self.account(app, "Mikkel", "playing", source="Kitchen")
+        self.assertEqual(len(rows(app)), 1)
+
+    def test_joiner_after_the_speaker_stopped_is_not_added(self):
+        app = make_app(ACCOUNTS)
+        self.start(app)
+        self.account(app, "Mikkel", "playing", source="Kitchen")
+        advance(app, 10)
+        set_speaker(app, "kitchen", "paused", SPOTIFY)
+        self.account(app, "Kristine", "playing", source="Kitchen")
+        self.assertEqual(len(rows(app)), 1)
+
+    def test_new_session_on_the_speaker_ends_the_old_one(self):
+        app = make_app(ACCOUNTS)
+        self.start(app)
+        self.account(app, "Mikkel", "playing", source="Kitchen")
+        advance(app, 10)
+        set_speaker(app, "kitchen", "idle", SPOTIFY)
+        advance(app, 1500)
+        self.account(app, "Mikkel", "idle")
+        set_speaker(app, "kitchen", "playing", SPOTIFY, source="Spotify Connect", title="Other")
+        self.account(app, "Kristine", "playing", source="Kitchen")
+        advance(app, 10)
+        self.assertEqual([r["text"] for r in rows(app)],
+                         ["Mikkel started Spotify in Kitchen", "Kristine started Spotify in Kitchen"])
+        self.assertNotEqual(rows(app)[0]["key"], rows(app)[1]["key"])
 
 
 class GroupNaming(unittest.TestCase):
