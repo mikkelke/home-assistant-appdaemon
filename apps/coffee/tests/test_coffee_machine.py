@@ -1394,6 +1394,23 @@ class TankTests(unittest.TestCase):
         self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "0")
 
 
+    def test_a_start_refused_for_no_water_then_a_brew_counts_as_a_refill(self):
+        app = fake.make_app()
+        fake.op(app, "water_filled")
+        brew(app)
+        fake.advance(app, 600)
+        fake.cup_on(app)
+        fake.op(app, "start", {"variant": "usual"})
+        fake.fire(app, "xbloom_brew_failed", {"reason": "no_water", "run_id": "r1",
+                                              "context": {"coffee_brew_id": coffee_state(app)[1]["brew_id"]}})
+        self.assertEqual(coffee_state(app)[1]["start_error"], "no_water")
+        self.assertTrue(app._tank.dry)
+        self.assertEqual(len(app._tank.empties), 1)
+        fake.advance(app, 70)
+        brew(app, brew_id="c1792476200")
+        self.assertFalse(app._tank.dry)
+        self.assertGreater(int(coffee_state(app)[1]["tank_left_ml"]), 946 - 400)
+
 class AdvisorTests(unittest.TestCase):
     def test_no_agent_by_default_and_no_ask(self):
         app = fake.make_app()

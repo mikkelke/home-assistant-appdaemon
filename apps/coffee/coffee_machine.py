@@ -688,6 +688,11 @@ class CoffeeMachine(hass.Hass):
             self._publish("coffee_advice")
         self._connect.activity(self._now())
         self._info(f"Brew {brew['id']} did not start: {brew.get('start_error')}")
+        if brew.get("start_error") == "no_water" and not self._tank.dry:
+            used = self._tank.empty(self._now_dt())
+            self._info("Water tank empty" if used is None else f"Water tank empty after {used:.0f} ml")
+            self._publish_state()
+            self._save_state()
 
     def _finalize(self, brew):
         """Totals, band and deltas of a brew that is over, from its curve."""
