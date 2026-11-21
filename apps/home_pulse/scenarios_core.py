@@ -51,7 +51,7 @@ COOK_MERGE_S = 900
 # A session counts once the hob and oven drew power this long in it (the hob cycles its zones on and off).
 COOK_MIN_S = 300
 COOK_ROW_MARGIN_S = 1800
-KITCHEN_ZONE = ("Kitchen", "Dining room", "Living room")
+KITCHEN_ZONE = ("Kitchen",)
 RESIDENTS = ("Mikkel", "Claudia", "Kristine")
 WHO_SHARE = 0.3
 
