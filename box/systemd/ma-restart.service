@@ -1,5 +1,5 @@
 [Unit]
-Description=Restart the Music Assistant container on an AppDaemon request
+Description=Reload Music Assistant's Sonos provider on an AppDaemon request (container restart as fallback)
 After=docker.service
 StartLimitIntervalSec=6h
 StartLimitBurst=3
@@ -8,7 +8,7 @@ StartLimitBurst=3
 Type=oneshot
 # The AppDaemon container controls /data/appdaemon: root only unlinks the fixed request path
 # there (unlink never follows it) and never reads, opens or writes anything under that tree.
-# The restart runs only if the unlink succeeded, so a request that cannot be removed cannot loop.
+# The reload runs only if the unlink succeeded, so a request that cannot be removed cannot loop.
 ExecStart=/usr/bin/unlink /data/appdaemon/host-requests/ma-restart.request
-ExecStart=/usr/bin/docker restart musicassistant
-TimeoutStartSec=90
+ExecStart=/usr/local/sbin/ma-sonos-reload
+TimeoutStartSec=180

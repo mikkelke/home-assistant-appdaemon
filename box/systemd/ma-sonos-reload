@@ -1,0 +1,25 @@
+#!/bin/bash
+# Reloads Music Assistant's Sonos provider through MA's API, and restarts the container when
+# that call fails. With --dry-run it only reads the Sonos provider config with the same token.
+# The token is a long-lived MA admin token in /etc/ma-restart/token (root, 0600); it goes to
+# curl on stdin, never on the command line.
+set -u
+
+api() {
+  printf 'Authorization: Bearer %s\n' "$(cat /etc/ma-restart/token 2>/dev/null)" \
+    | curl -fsS --max-time 60 -o /dev/null -H @- -H 'Content-Type: application/json' \
+      --data-raw "{\"message_id\":\"ma-restart\",\"command\":\"$1\",\"args\":{\"instance_id\":\"sonos\"}}" \
+      http://127.0.0.1:8095/api
+}
+
+if [ "${1:-}" = "--dry-run" ]; then
+  api config/providers/get && echo "Dry run: Music Assistant API and token work, nothing reloaded"
+  exit
+fi
+
+if api config/providers/reload; then
+  echo "Reloaded Music Assistant's Sonos provider"
+  exit 0
+fi
+echo "Sonos provider reload failed: restarting the musicassistant container" >&2
+exec /usr/bin/docker restart musicassistant

@@ -79,17 +79,23 @@ Run the deploy unit tests without contacting the box:
 
 ## Box-side helpers
 
-AppDaemon has no Docker socket. The one host action it can ask for is a Music Assistant
-restart (`apps/sonos/ma_twin_watch.py`): it creates the empty file
+AppDaemon has no Docker socket. The one host action it can ask for is a reload of Music
+Assistant's Sonos provider (`apps/sonos/ma_twin_watch.py`): it creates the empty file
 `/data/appdaemon/host-requests/ma-restart.request` (`/conf/host-requests/` in the
 container), and the root systemd units in `box/systemd/` delete it and run
-`docker restart musicassistant`. The host never reads the file or writes into
-`/data/appdaemon`, and allows 3 starts per 6 h. `ma-restart-dryrun.{path,service}` does
-the same for `ma-restart-dryrun.request` but only logs MA's start time.
+`box/systemd/ma-sonos-reload`, which calls MA's `config/providers/reload` for `sonos` and
+runs `docker restart musicassistant` when that call fails. The host never reads the file
+or writes into `/data/appdaemon`, and allows 3 starts per 6 h. `ma-restart-dryrun.{path,service}`
+does the same for `ma-restart-dryrun.request` but only reads the Sonos provider config with
+the same token.
 
 - Install: `sudo install -d -o mke -g mke -m 0775 /data/appdaemon/host-requests`, copy the
-  four units to `/etc/systemd/system` (root:root 0644, never symlinked), then
+  four units to `/etc/systemd/system` (root:root 0644, never symlinked) and
+  `ma-sonos-reload` to `/usr/local/sbin` (root:root 0755), then
   `sudo systemctl daemon-reload && sudo systemctl enable --now ma-restart.path ma-restart-dryrun.path`.
+- Token: a long-lived MA admin token (`auth/token/create`, valid 1 year) in
+  `/etc/ma-restart/token` (root:root 0600, directory 0700). Never in this repo. Without a
+  working token every request falls back to the container restart.
 - Dry run: `docker exec appdaemon touch /conf/host-requests/ma-restart-dryrun.request`, then
   `journalctl -u ma-restart-dryrun.service -n 5`.
 - After the start limit or a request the host could not delete, the path unit stays failed:

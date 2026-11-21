@@ -1,5 +1,5 @@
 [Unit]
-Description=Dry run of ma-restart.service: consume the request, log MA's start time, restart nothing
+Description=Dry run of ma-restart.service: consume the request, check MA's API and token, reload nothing
 After=docker.service
 StartLimitIntervalSec=6h
 StartLimitBurst=3
@@ -7,5 +7,5 @@ StartLimitBurst=3
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/unlink /data/appdaemon/host-requests/ma-restart-dryrun.request
-ExecStart=/usr/bin/docker inspect -f "musicassistant started {{.State.StartedAt}}" musicassistant
+ExecStart=/usr/local/sbin/ma-sonos-reload --dry-run
 TimeoutStartSec=90

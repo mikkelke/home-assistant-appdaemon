@@ -1,4 +1,4 @@
-"""MaTwinWatch: restart MA after a 5 min continuous twin mismatch, never for unavailable twins."""
+"""MaTwinWatch: reload MA's Sonos provider after a 1 min continuous twin mismatch, never for unavailable twins."""
 
 import sys
 import tempfile
@@ -59,7 +59,7 @@ class Rule(unittest.TestCase):
         self.assertEqual(start, mtw._ts("2027-01-15T08:01:00+00:00"))
 
 
-CFG = {"hold_s": 300, "cooldown_s": 1800, "max_per_day": 3}
+CFG = {"hold_s": 60, "cooldown_s": 1800, "max_per_day": 3}
 
 
 def st(**kw):
@@ -69,14 +69,14 @@ def st(**kw):
 
 
 class Decide(unittest.TestCase):
-    def test_restart_only_after_five_minutes(self):
-        self.assertIsNone(mtw.decide(st(), T0, 299, False, CFG))
-        self.assertEqual(mtw.decide(st(), T0, 300, False, CFG), "restart")
+    def test_reload_only_after_one_minute(self):
+        self.assertIsNone(mtw.decide(st(), T0, 59, False, CFG))
+        self.assertEqual(mtw.decide(st(), T0, 60, False, CFG), "restart")
 
     def test_mismatch_again_within_cooldown_is_persisted(self):
         s = st(restarts=[T0])
-        self.assertEqual(mtw.decide(s, T0 + 400, 300, False, CFG), "persisted")
-        self.assertEqual(mtw.decide(s, T0 + 1800, 300, False, CFG), "restart")
+        self.assertEqual(mtw.decide(s, T0 + 400, 60, False, CFG), "persisted")
+        self.assertEqual(mtw.decide(s, T0 + 1800, 60, False, CFG), "restart")
 
     def test_verify_window(self):
         s = st(restarts=[T0], verify_at=T0 + 600)
@@ -135,14 +135,15 @@ class App(unittest.TestCase):
     def pushes(self):
         return self.app.create_task.call_count
 
-    def test_freeze_restarts_once_then_verifies(self):
-        self.run_for(290)
+    def test_freeze_reloads_once_then_verifies(self):
+        self.run_for(50)
         self.assertFalse(self.req.exists())
         self.run_for(30)
         self.assertTrue(self.req.exists())
         self.assertEqual(self.pushes(), 1)
         self.app.fire_event.assert_called_once()
         self.assertEqual(self.app.fire_event.call_args.kwargs["audience"], "admin")
+        self.assertIn("Sonos provider", self.app.fire_event.call_args.kwargs["text"])
         self.host_consumes()
         self.states[TWIN] = "unavailable"
         self.run_for(300)
@@ -153,14 +154,14 @@ class App(unittest.TestCase):
         self.assertEqual(self.pushes(), 1)
         self.assertEqual(len(self.app.state["restarts"]), 1)
 
-    def test_unavailable_twin_never_restarts(self):
+    def test_unavailable_twin_never_reloads(self):
         self.states[TWIN] = "unavailable"
         self.run_for(3600)
         self.assertFalse(self.req.exists())
         self.assertEqual(self.pushes(), 0)
 
-    def test_mismatch_persisting_after_restart_pushes_and_stops(self):
-        self.run_for(330)
+    def test_mismatch_persisting_after_reload_pushes_and_stops(self):
+        self.run_for(90)
         self.host_consumes()
         self.run_for(3 * 3600)
         self.assertTrue(self.app.state["gave_up"])
@@ -172,7 +173,7 @@ class App(unittest.TestCase):
         self.assertFalse(self.app.state["gave_up"])
 
     def test_twin_still_unavailable_at_verify_gives_up(self):
-        self.run_for(330)
+        self.run_for(90)
         self.host_consumes()
         self.states[TWIN] = "unavailable"
         self.run_for(1200)
@@ -180,7 +181,7 @@ class App(unittest.TestCase):
         self.assertEqual(self.pushes(), 2)
 
     def test_host_not_consuming_gives_up_and_clears_request(self):
-        self.run_for(330)
+        self.run_for(90)
         self.assertTrue(self.req.exists())
         self.run_for(120)
         self.assertFalse(self.req.exists())
@@ -189,7 +190,7 @@ class App(unittest.TestCase):
         self.assertEqual(self.pushes(), 2)
 
     def test_cooldown_and_history_survive_reload(self):
-        self.run_for(330)
+        self.run_for(90)
         self.host_consumes()
         self.app.initialize()
         self.assertEqual(len(self.app.state["restarts"]), 1)
