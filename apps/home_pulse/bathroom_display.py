@@ -61,6 +61,10 @@ display wakes it to the same.
 
 The lines for Mikkel, at most three, in this order:
     weighing  for CARD_S (90) seconds from a weighing of his, the card below in place of all the others.
+    spotify   while his Spotify account (spotify_entity, media_player.spotify_mikkel) is playing on a device of
+              his own - a source that is not a speaker of the house (SPEAKER_SOURCES, "Kitchen + 3" being
+              Kitchen's group) - and none of the room's own players (`players`, else `speaker`) is playing:
+              "Title · Artist" with mdi:spotify and "here" under the chip, the offer to play it here (below).
     alarm     from the time of alarm_from_entity (input_datetime.bathroom_display_alarm_from; ALARM_FROM,
               21:00, while it cannot be read as a time) until 02:00 house time: "Alarm 09:15" while
               alarm_entity (input_boolean.wakeup_bedroom) is on, with the time of alarm_time_entity, else
@@ -144,6 +148,14 @@ unavailable, unreadable) starts `radio` (dr_podcasts://radio/p3) as music, and a
 holds more than one member first leaves its group (media_player/unjoin) and starts the radio a second later
 (RADIO_DELAY_S). A tap logs one line, and a service call that fails logs a warning.
 
+Play here: the bathroom display fires spotify_event (esphome.bathroom_display_spotify) when the Spotify chip is
+tapped; a display with no spotify_event (the bedroom's) uses its play button for it while the Spotify line is on
+it. The app reads the account afresh and, while it still plays on a device of his own, pauses it there and has
+Music Assistant play its track on spotify_player (default `speaker`) in radio mode, so similar music follows,
+and seeks to where the track was SEEK_DELAY_S later. Spotify Connect cannot do this: the Web API does not list
+the Sonos speakers as devices to move playback to, and the track is all HA tells of what was playing. Music
+Assistant's Spotify is Mikkel's account. A grouped player leaves its group first, as for the radio.
+
 The alarm button: the display fires the HA event alarm_event (esphome.bathroom_display_alarm) when the alarm
 line is tapped, in a chip or on the night face. The app then toggles alarm_entity, and the line follows
 the entity's new state like any other source. A tap logs one line, and a failed call logs a warning.
@@ -223,6 +235,10 @@ ALARM_FROM = time(21)
 ALARM_TO = time(2)
 ALARM_EVENT = "esphome.bathroom_display_alarm"
 FETCH_TIMEOUT_S = 12
+SPOTIFY_ICON = "mdi:spotify"
+SEEK_DELAY_S = 3
+SPEAKER_SOURCES = ("living room", "kitchen", "dining room", "bedroom", "bathroom", "guest bathroom", "kristines room",
+                   "claudias room", "rooftop", "music assistant playback", "jam session")
 
 _DUE_INFO = re.compile(r"Due (\d\d)\.(\d\d)(?:\.(\d\d))?")
 _DUE_DETAIL = re.compile(r"due (?:today|since (\d\d)\.(\d\d)(?:\.(\d\d))?)")
@@ -743,6 +759,39 @@ def alarm_line(armed, clock):
     return Line(f"Alarm {at}", ALARM_ICON, at)
 
 
+# -- spotify on his own device ---------------------------------------------------
+
+
+def own_device(source):
+    """Whether a Spotify account's source is a device of the listener's own: not empty and, without the " + 2"
+    of a Sonos group, none of SPEAKER_SOURCES, case aside."""
+    base = re.sub(r"\s*\+\s*\d+$", "", source.strip()).lower() if isinstance(source, str) else ""
+    return bool(base) and base not in SPEAKER_SOURCES
+
+
+def spotify_line(full, room_playing):
+    """The offer to play here, else None: the account's state dict `full` playing a track with a title on a
+    device of its own while nothing in the room is playing (`room_playing`)."""
+    if room_playing or not isinstance(full, dict) or full.get("state") != "playing":
+        return None
+    attrs = full.get("attributes") if isinstance(full.get("attributes"), dict) else {}
+    title, artist = (" ".join(str(attrs.get(key) or "").split()) for key in ("media_title", "media_artist"))
+    if not title or not own_device(attrs.get("source")):
+        return None
+    return Line(fit(f"{title} · {artist}" if artist else title), SPOTIFY_ICON, "here")
+
+
+def track_position(attrs, now, ahead=0):
+    """Whole seconds into the track at `now` plus `ahead`, from media_position at media_position_updated_at;
+    None when they cannot be read or that is past the track's media_duration."""
+    position, at = maint.reading(attrs.get("media_position")), maint.parse_iso(attrs.get("media_position_updated_at"))
+    if position is None or at is None:
+        return None
+    seconds = int(position + max(0.0, (now - at).total_seconds()) + ahead)
+    duration = maint.reading(attrs.get("media_duration"))
+    return None if duration is not None and seconds >= duration else max(0, seconds)
+
+
 def payload(state, reason, resident, lines, night=False, zone=ZONE):
     """The display sensor's attributes: strings only, the lines padded with empty ones."""
     mikkel = state == "mikkel"
@@ -803,6 +852,10 @@ class BathroomDisplay(hass.Hass):
         self.alarm_time_entity = a.get("alarm_time_entity", ALARM_TIME)
         self.alarm_from_entity = a.get("alarm_from_entity", ALARM_FROM_ENTITY)
         self.alarm_event = a.get("alarm_event", ALARM_EVENT)
+        self.spotify_entity = a.get("spotify_entity")
+        self.spotify_player = a.get("spotify_player", self.speaker)
+        self.spotify_event = a.get("spotify_event")
+        self.room_players = list(self.players) if self.players is not None else [self.speaker]
 
         self._cache = {}
         self._history = []  # (last_updated, dBm) of the phone's readings of the last HISTORY_S seconds
@@ -821,6 +874,8 @@ class BathroomDisplay(hass.Hass):
         self.listen_event(self._on_plugin_started, "plugin_started")
         self.listen_event(self._on_play, self.play_event)
         self.listen_event(self._on_alarm, self.alarm_event)
+        if self.spotify_entity and self.spotify_event:
+            self.listen_event(self._on_spotify, self.spotify_event)
         self.run_every(self._on_tick, f"now+{TICK_S}", TICK_S)
 
         self._evaluate(publish=True)
@@ -831,7 +886,9 @@ class BathroomDisplay(hass.Hass):
         targets = ", ".join(self.players) if self.players is not None else self.speaker
         self.log(f"BathroomDisplay initialized - {self.entity} from {self.active_entity}, {identity}, "
                  f"{len(self.routes)} transit routes, {self.play_event} works {targets}, "
-                 f"{self.alarm_event} toggles {self.alarm_entity}")
+                 f"{self.alarm_event} toggles {self.alarm_entity}"
+                 + (f", {self.spotify_event or self.play_event} plays {self.spotify_entity} on {self.spotify_player}"
+                    if self.spotify_entity else ""))
 
     # -- sources --------------------------------------------------------------
 
@@ -841,6 +898,8 @@ class BathroomDisplay(hass.Hass):
                    self.alarm_entity, self.alarm_time_entity, self.alarm_from_entity,
                    self.washer_entity, self.dryer_entity, self.delivery_entity]
         sources.extend(entity for _, entity in self.routes)
+        if self.spotify_entity:
+            sources.extend([self.spotify_entity, *self.room_players])
         return list(dict.fromkeys(entity for entity in sources if entity))
 
     def _read(self, entity):
@@ -879,6 +938,9 @@ class BathroomDisplay(hass.Hass):
         self._evaluate()
 
     def _on_play(self, event_name, data, kwargs):
+        if self.spotify_entity and not self.spotify_event and self._spotify_shown():
+            self._move_spotify()
+            return
         if self.players is not None:
             self._toggle_player()
             return
@@ -917,6 +979,41 @@ class BathroomDisplay(hass.Hass):
     def _start_radio(self, kwargs):
         self._call("media_player/play_media", entity_id=self.speaker, media_content_id=self.radio,
                    media_content_type=RADIO_TYPE)
+
+    def _spotify_shown(self):
+        attributes = self._current[1] if self._current else {}
+        return SPOTIFY_ICON in (attributes.get(f"icon{number}") for number in range(1, LINES + 1))
+
+    def _on_spotify(self, event_name, data, kwargs):
+        self._move_spotify()
+
+    def _move_spotify(self):
+        full = self._read(self.spotify_entity)
+        attrs = full.get("attributes") if isinstance(full, dict) and isinstance(full.get("attributes"), dict) else {}
+        uri = attrs.get("media_content_id")
+        room_playing = any((self._read(entity) or {}).get("state") == "playing" for entity in self.room_players)
+        if not spotify_line(full, room_playing) or not isinstance(uri, str) or not uri.startswith("spotify:track:"):
+            self.log(f"Play here: {self.spotify_entity} has no track playing on a device of its own")
+            return
+        position = track_position(attrs, self.get_now(), SEEK_DELAY_S)
+        self.log(f"Play here: {uri} from {attrs.get('source')} to {self.spotify_player} at {position} s")
+        self._call("media_player/media_pause", entity_id=self.spotify_entity)
+        player = self._read(self.spotify_player) or {}
+        members = player["attributes"].get("group_members") if isinstance(player.get("attributes"), dict) else None
+        if isinstance(members, list) and len(members) > 1:
+            self._call("media_player/unjoin", entity_id=self.spotify_player)
+            self.run_in(self._play_spotify, RADIO_DELAY_S, uri=uri, position=position)
+        else:
+            self._play_spotify({"uri": uri, "position": position})
+
+    def _play_spotify(self, kwargs):
+        self._call("music_assistant/play_media", entity_id=self.spotify_player, media_id=kwargs["uri"],
+                   media_type="track", enqueue="replace", radio_mode=True)
+        if kwargs.get("position"):
+            self.run_in(self._seek_spotify, SEEK_DELAY_S, position=kwargs["position"])
+
+    def _seek_spotify(self, kwargs):
+        self._call("media_player/media_seek", entity_id=self.spotify_player, seek_position=kwargs["position"])
 
     def _on_alarm(self, event_name, data, kwargs):
         self.log(f"Alarm button: toggles {self.alarm_entity}")
@@ -1039,6 +1136,10 @@ class BathroomDisplay(hass.Hass):
         if card:
             return card
         lines = alarm if in_window(now, alarm_start(self._state_of(self.alarm_from_entity)), ALARM_TO) else []
+        if self.spotify_entity:
+            room_playing = any(self._state_of(entity) == "playing" for entity in self.room_players)
+            spotify = spotify_line(self._cache.get(self.spotify_entity), room_playing)
+            lines = ([spotify] if spotify else []) + lines
         if in_window(now, RAIN_FROM, RAIN_TO):
             lines = lines + self._rain(now)
         routes = [(label, self._cache.get(entity)) for label, entity in self.routes]

@@ -73,6 +73,11 @@ BathroomDisplay:
   # The alarm line shows from this time until 02:00 and all through sleep mode; 21:00 while this helper
   # cannot be read as a time.
   alarm_from_entity: input_datetime.bathroom_display_alarm_from
+  # While his Spotify account plays on his phone, headphones or computer and the speaker is not playing, the
+  # first line is "Title · Artist" with a Spotify chip; tapping the chip fires spotify_event, and Music
+  # Assistant then plays that track here in radio mode from where it was, after pausing it on his device.
+  spotify_entity: media_player.spotify_mikkel
+  spotify_event: esphome.bathroom_display_spotify
 
 BedroomDisplay:
   module: bathroom_display
@@ -101,3 +106,7 @@ BedroomDisplay:
   alarm_time_entity: input_datetime.wakeup_bedroom
   alarm_event: esphome.bedroom_display_alarm
   alarm_from_entity: input_datetime.bathroom_display_alarm_from
+  # The same Spotify line; with no spotify_event the button plays it here, on Music Assistant's bedroom
+  # player, while the line shows.
+  spotify_entity: media_player.spotify_mikkel
+  spotify_player: media_player.bedroom

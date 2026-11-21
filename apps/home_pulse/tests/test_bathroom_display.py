@@ -1842,10 +1842,12 @@ class PublishTests(unittest.TestCase):
                          sorted([(ACTIVE, None), (RSSI, "all"), (UPCOMING, "all"), (SLEEP, "all"), (LIGHT, "all"),
                                  (METRO, "all"), (STOG, "all"), (MEASURED, "all"), (WEIGHT, "all"), (FAT, "all"),
                                  (RAINING, "all"), (ALARM, "all"), (ALARM_TIME, "all"), (ALARM_FROM_ENTITY, "all"),
-                                 (WASHER, "all"), (DRYER, "all"), (DELIVERY, "all")]))
+                                 (WASHER, "all"), (DRYER, "all"), (DELIVERY, "all"),
+                                 ("media_player.spotify_mikkel", "all"), (SPEAKER, "all")]))
         self.assertEqual(app.events, [("_on_plugin_started", "plugin_started"),
                                       ("_on_play", "esphome.bathroom_display_play"),
-                                      ("_on_alarm", "esphome.bathroom_display_alarm")])
+                                      ("_on_alarm", "esphome.bathroom_display_alarm"),
+                                      ("_on_spotify", "esphome.bathroom_display_spotify")])
         self.assertEqual(app.scheduled, [("_on_tick", "now+10", 10)])
 
     def test_it_publishes_only_when_the_payload_changes(self):
@@ -3241,6 +3243,119 @@ class BedroomDisplayTests(unittest.TestCase):
         app._on_play(self.PLAY_EVENT, {}, {})
         self.assertEqual(app.calls, [])
         self.assertEqual(app.later, [])
+
+
+SPOTIFY = CONFIG["spotify_entity"]
+TRACK = "spotify:track:2hj4INbCeEhiYsuBgAoNc8"
+
+
+def playing_spotify(source="OPPO Find X9 Pro", state="playing", position=60, at=NOW - 10 * SEC, **extra):
+    """The account entity as HA's Spotify integration writes it."""
+    return full(state, {"source": source, "media_title": "Op med ho'det", "media_artist": "Natasja",
+                        "media_content_id": TRACK, "media_duration": 160, "media_position": position,
+                        "media_position_updated_at": iso(at), **extra})
+
+
+class SpotifyLineTests(unittest.TestCase):
+    LINE = bd.Line("Op med ho'det · Natasja", "mdi:spotify", "here")
+
+    def test_a_phone_headphones_or_computer_is_his_own_device(self):
+        for source in ("OPPO Find X9 Pro", "Mikkel's MacBook", "Web Player (Chrome)"):
+            self.assertTrue(bd.own_device(source), source)
+
+    def test_a_house_speaker_its_group_music_assistant_or_a_jam_is_not(self):
+        for source in ("Kitchen", "Kitchen + 6", "Living Room + 1", "bathroom", "Claudias Room",
+                       "Music Assistant Playback", "Jam Session", "", "  ", None):
+            self.assertFalse(bd.own_device(source), source)
+
+    def test_the_line_is_title_and_artist_with_the_spotify_chip(self):
+        self.assertEqual(bd.spotify_line(playing_spotify(), False), self.LINE)
+
+    def test_no_line_while_the_room_plays_or_the_account_is_not_playing_on_his_device(self):
+        self.assertIsNone(bd.spotify_line(playing_spotify(), True))
+        for state in ("paused", "idle", "unavailable"):
+            self.assertIsNone(bd.spotify_line(playing_spotify(state=state), False))
+        self.assertIsNone(bd.spotify_line(playing_spotify(source="Kitchen + 3"), False))
+        self.assertIsNone(bd.spotify_line(playing_spotify(media_title=""), False))
+        self.assertIsNone(bd.spotify_line(None, False))
+
+    def test_a_long_title_is_cut_and_no_artist_leaves_the_title(self):
+        line = bd.spotify_line(playing_spotify(media_title="Save Me Tonight - DJs From Mars Remix"), False)
+        self.assertLessEqual(len(line.text), bd.LINE_MAX)
+        self.assertEqual(bd.spotify_line(playing_spotify(media_artist=None), False).text, "Op med ho'det")
+
+    def test_the_position_runs_on_from_its_update(self):
+        attrs = playing_spotify()["attributes"]
+        self.assertEqual(bd.track_position(attrs, NOW), 70)
+        self.assertEqual(bd.track_position(attrs, NOW, 3), 73)
+        self.assertIsNone(bd.track_position(attrs, NOW + 2 * MIN))
+        self.assertIsNone(bd.track_position({"media_position": 5}, NOW))
+
+
+class PlayHereTests(unittest.TestCase):
+    PLAY = ("music_assistant/play_media", {"entity_id": SPEAKER, "media_id": TRACK, "media_type": "track",
+                                           "enqueue": "replace", "radio_mode": True})
+    PAUSE = ("media_player/media_pause", {"entity_id": SPOTIFY})
+
+    def app(self, spotify=None, speaker="idle", members=None, now=NOW, **kwargs):
+        states = {SPOTIFY: spotify or playing_spotify(), SPEAKER: full(speaker, {"group_members": members or [SPEAKER]}),
+                  RSSI: full("-70", updated=now)}
+        return make_app(states, now=now, **kwargs)
+
+    def test_the_line_comes_first_for_mikkel(self):
+        app = self.app(now=house(11, 5, 14))
+        self.assertEqual(last(app)["state"], "mikkel")
+        self.assertEqual(shown(app)[0], ("Op med ho'det · Natasja", "mdi:spotify", "here"))
+
+    def test_the_line_goes_when_the_speaker_plays_and_never_shows_to_someone(self):
+        app = self.app(now=house(11, 5, 14))
+        fire(app, SPEAKER, full("playing", {"group_members": [SPEAKER]}))
+        self.assertEqual(shown(app)[0], BLANK)
+        someone = make_app({SPOTIFY: playing_spotify(), RSSI: full("-95")}, now=house(11, 5, 14))
+        self.assertEqual((last(someone)["state"], shown(someone)), ("someone", [BLANK] * 3))
+        self.assertIn(("_on_spotify", "esphome.bathroom_display_spotify"), app.events)
+
+    def test_the_chip_pauses_the_phone_plays_the_track_here_and_seeks(self):
+        app = self.app()
+        app._on_spotify(CONFIG["spotify_event"], {}, {})
+        self.assertEqual(app.calls, [self.PAUSE, self.PLAY])
+        self.assertEqual([(callback.__name__, delay, kw) for callback, delay, kw in app.later],
+                         [("_seek_spotify", bd.SEEK_DELAY_S, {"position": 73})])
+        run_later(app)
+        self.assertEqual(app.calls[-1], ("media_player/media_seek", {"entity_id": SPEAKER, "seek_position": 73}))
+
+    def test_a_grouped_speaker_leaves_its_group_first(self):
+        app = self.app(members=[SPEAKER, "media_player.kitchen"])
+        app._on_spotify(CONFIG["spotify_event"], {}, {})
+        self.assertEqual(app.calls, [self.PAUSE, ("media_player/unjoin", {"entity_id": SPEAKER})])
+        run_later(app)
+        self.assertEqual(app.calls[-1], self.PLAY)
+
+    def test_nothing_moves_when_it_stopped_or_moved_to_a_speaker_meanwhile(self):
+        for spotify, speaker in ((playing_spotify(state="paused"), "idle"),
+                                 (playing_spotify(source="Bathroom"), "idle"), (playing_spotify(), "playing")):
+            app = self.app(spotify, speaker)
+            app._on_spotify(CONFIG["spotify_event"], {}, {})
+            self.assertEqual((app.calls, app.later), ([], []))
+
+    def test_the_bathroom_play_button_keeps_its_radio(self):
+        app = self.app()
+        tap(app)
+        self.assertEqual([call for call, _ in app.calls], ["media_player/play_media"])
+
+    def test_the_bedroom_button_plays_it_here_while_the_line_shows(self):
+        ma = BEDROOM_CONFIG["spotify_player"]
+        app = make_app({SPOTIFY: playing_spotify(), ma: full("idle")}, config=BEDROOM_CONFIG, now=house(11, 5, 14))
+        self.assertEqual(shown(app)[0], ("Op med ho'det · Natasja", "mdi:spotify", "here"))
+        self.assertNotIn("_on_spotify", {name for name, _ in app.events})
+        app._on_play(BEDROOM_CONFIG["play_event"], {}, {})
+        self.assertEqual(app.calls, [self.PAUSE, ("music_assistant/play_media", {**self.PLAY[1], "entity_id": ma})])
+
+    def test_the_bedroom_button_toggles_its_player_without_the_line(self):
+        ma = BEDROOM_CONFIG["spotify_player"]
+        app = make_app({SPOTIFY: playing_spotify(), ma: full("playing")}, config=BEDROOM_CONFIG, now=house(11, 5, 14))
+        app._on_play(BEDROOM_CONFIG["play_event"], {}, {})
+        self.assertEqual(app.calls, [("media_player/media_play_pause", {"entity_id": ma})])
 
 
 class ConfigTests(unittest.TestCase):
