@@ -160,6 +160,20 @@ class WhatIsPlaying(unittest.TestCase):
         states = {BATH: speaker(), KITCHEN: speaker("playing", title="Whine Dat", artist="Kongsted")}
         self.assertEqual(self.answer(states, here=False, spk=KITCHEN), "In the kitchen: Whine Dat by Kongsted.")
 
+    def test_music_this_app_started(self):
+        states = {BATH: speaker("playing", title="Sim Sima", artist="Troo.L.S")}
+        mine = {BATH: {"person": "Kristine", "at": "2026-11-21T15:00:00+01:00"}}
+        before = {BATH: {"started_at": "2026-11-21T09:00:00+01:00", "started_by": "Mikkel",
+                         "stopped_at": "2026-11-21T10:00:00+01:00"}}
+        answer = mm.what_playing_text(True, BATH, states, NAMES, ACCOUNTS, {}, before, mine=mine)
+        self.assertEqual(answer, "Kristine's music: Sim Sima by Troo.L.S.")
+        stopped = {BATH: {"stopped_at": "2026-11-21T15:10:00+01:00"}}
+        self.assertEqual(mm.what_playing_text(True, BATH, states, NAMES, ACCOUNTS, {}, stopped, mine=mine),
+                         "Sim Sima by Troo.L.S.")
+        newer = {BATH: {"started_at": "2026-11-21T15:20:00+01:00", "started_by": "Mikkel"}}
+        self.assertEqual(mm.what_playing_text(True, BATH, states, NAMES, ACCOUNTS, {}, newer, mine=mine),
+                         "Sim Sima by Troo.L.S, put on by Mikkel.")
+
     def test_room_name_given(self):
         states = {BATH: speaker(), KITCHEN: speaker()}
         self.assertEqual(mm.what_playing_text(False, KITCHEN, states, NAMES, ACCOUNTS, {}, {}, "family room"),

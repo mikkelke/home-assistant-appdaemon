@@ -29,7 +29,8 @@ another speaker leaves its group first.
 WHAT IS PLAYING. For the room (the satellite's area unless one is named): the playing speaker's
 title and artist, else the first playing room elsewhere. Who: residents whose account plays on that
 speaker's group ("Kristine's Jam with Mikkel" for several, the host being the one sensor.music_sessions
-names first), else the session's started_by when it names a person.
+names first), else the person this app last played music for there (until the speaker stops), else
+the session's started_by when it names a person.
 """
 
 import json
@@ -157,10 +158,13 @@ def spotify_players(speaker, speaker_state, names, accounts, account_states):
             and device_key(((account_states.get(entity) or {}).get("attributes") or {}).get("source")) in keys]
 
 
-def who_plays(players, session):
-    """"Kristine's Jam with Mikkel", "Claudia's Spotify", 'put on by Mikkel' or ''.
+def who_plays(players, session, mine=None):
+    """"Kristine's Jam with Mikkel", "Claudia's Spotify", "Mikkel's music", 'put on by Mikkel' or ''.
 
-    players: spotify_players(). session: the speaker's row in sensor.music_sessions, or {}."""
+    players: spotify_players(). session: the speaker's row in sensor.music_sessions, or {}. mine:
+    {person, at} when this app last played someone's music on the speaker: the house account starts
+    it, so the session names nobody, and it holds until the speaker stops or a person puts on
+    something newer."""
     session = session or {}
     started = str(session.get("started_by") or "")
     began, ended = _parse(session.get("started_at")), _parse(session.get("stopped_at"))
@@ -170,16 +174,20 @@ def who_plays(players, session):
         if len(order) > 1:
             return f"{order[0]}'s Jam with {people_text(order[1:])}"
         return f"{order[0]}'s Spotify"
-    if current and not started.lower().startswith(NOT_PEOPLE):
+    person = current and not started.lower().startswith(NOT_PEOPLE)
+    mine_at = _parse((mine or {}).get("at"))
+    if mine_at and (ended is None or ended < mine_at) and not (person and began > mine_at):
+        return f"{mine['person']}'s music"
+    if person:
         return "put on by " + (started[0].lower() + started[1:] if started.startswith("A ") else started)
     return ""
 
 
-def what_playing_text(here, speaker, states, names, accounts, account_states, sessions, room=None):
+def what_playing_text(here, speaker, states, names, accounts, account_states, sessions, room=None, mine=None):
     """The answer to "what is playing" in `speaker`'s room; here: the room is the satellite's own.
 
     states: {MA speaker entity: state dict} for every house speaker, in a stable order. room: how
-    to name the room asked about, else the speaker's name."""
+    to name the room asked about, else the speaker's name. mine: {speaker: who_plays' mine}."""
     def describe(entity):
         state = states.get(entity) or {}
         attrs = state.get("attributes") or {}
@@ -191,7 +199,7 @@ def what_playing_text(here, speaker, states, names, accounts, account_states, se
         if not title:
             return None
         song = song_text(title, artist)
-        who = who_plays(players, sessions.get(entity))
+        who = who_plays(players, sessions.get(entity), (mine or {}).get(entity))
         if who.startswith("put on by"):
             return f"{song}, {who}"
         return f"{who}: {song}" if who else song
@@ -228,6 +236,7 @@ class AssistMyMusic(hass.Hass):
         self.state_file = self.args.get("state_file") or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "assist_my_music_state.json")
         self.last = self._load()
+        self.started_here = {}
         for person, entity in self.accounts.items():
             if person not in self.last:
                 self._seed(person, entity)
@@ -314,6 +323,8 @@ class AssistMyMusic(hass.Hass):
                                         self.recent_days)
         self._reply(data, speech)
         self.log(f"My music ({area}, {person or 'nobody'}): {speech}", level="INFO")
+        if any(a.get("service") == "music_assistant/play_media" for a in actions):
+            self.started_here[speaker] = {"person": person, "at": datetime.now(timezone.utc).isoformat()}
         for action in actions:
             if action.get("delay"):
                 self.run_in(self._run_delayed, action["delay"],
@@ -343,6 +354,7 @@ class AssistMyMusic(hass.Hass):
         names = {s: (st.get("attributes") or {}).get("friendly_name") or area_label(s) for s, st in states.items()}
         account_states = {e: self._read(e) for e in self.accounts.values()}
         sessions = (self._read(self.sessions_sensor).get("attributes") or {}).get("rooms") or {}
-        speech = what_playing_text(here, speaker, states, names, self.accounts, account_states, sessions, room)
+        speech = what_playing_text(here, speaker, states, names, self.accounts, account_states, sessions, room,
+                                   self.started_here)
         self._reply(data, speech)
         self.log(f"What is playing ({area}): {speech}", level="INFO")
