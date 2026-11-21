@@ -701,7 +701,7 @@ class CalendarRowTests(unittest.TestCase):
 
 
 class RiseTests(unittest.TestCase):
-    """A watering is a rise of ten points or more within half an hour that has stopped climbing for fifteen
+    """A watering is a rise of ten points or more within half an hour that has stopped climbing for five
     minutes."""
 
     T = datetime(2026, 10, 21, 14, 0, tzinfo=timezone.utc)
@@ -719,15 +719,15 @@ class RiseTests(unittest.TestCase):
 
     def test_a_rise_that_has_stopped_climbing_is_one_watering_told_with_its_lowest_and_highest_reading(self):
         found, _ = self.feed([(0, 15), (5, 28), (10, 40), (15, 42)], until=60)
-        self.assertEqual(found, [(30, {"at": core.utc_iso(self.T + 5 * MIN), "low": 15, "peak": 42})])
+        self.assertEqual(found, [(20, {"at": core.utc_iso(self.T + 5 * MIN), "low": 15, "peak": 42})])
 
-    def test_it_is_told_only_when_fifteen_minutes_have_passed_without_a_higher_reading(self):
-        found, _ = self.feed([(0, 15), (5, 28), (10, 40), (15, 42)], until=29)
+    def test_it_is_told_only_when_five_minutes_have_passed_without_a_higher_reading(self):
+        found, _ = self.feed([(0, 15), (5, 28), (10, 40), (15, 42)], until=19)
         self.assertEqual(found, [])
-        found, _ = self.feed([(0, 15), (5, 28), (10, 40), (15, 42), (20, 43)], until=34)
+        found, _ = self.feed([(0, 15), (5, 28), (10, 40), (15, 42), (20, 43)], until=24)
         self.assertEqual(found, [])
-        found, _ = self.feed([(0, 15), (5, 28), (10, 40), (15, 42), (20, 43)], until=35)
-        self.assertEqual([minute for minute, _ in found], [35])
+        found, _ = self.feed([(0, 15), (5, 28), (10, 40), (15, 42), (20, 43)], until=25)
+        self.assertEqual([minute for minute, _ in found], [25])
         self.assertEqual(found[0][1]["peak"], 43)
 
     def test_less_than_ten_points_or_a_climb_slower_than_the_window_is_no_watering(self):
@@ -745,7 +745,7 @@ class RiseTests(unittest.TestCase):
         readings = [(0, 15), (5, 40), (60, 30), (65, 20), (120, 12), (125, 35)]
         found, _ = self.feed(readings, until=180)
         self.assertEqual([(minute, event["low"], event["peak"]) for minute, event in found],
-                         [(20, 15, 40), (140, 12, 35)])
+                         [(10, 15, 40), (130, 12, 35)])
 
     def test_the_state_given_is_never_changed_in_place(self):
         st, _ = plants.step_rise(None, 15, self.T)

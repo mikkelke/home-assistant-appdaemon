@@ -395,6 +395,42 @@ class LockEventTests(unittest.TestCase):
             self.assertIsNone(event["audience"], f"audience={bad!r} must not narrow")
 
 
+class BackdatedReportTests(unittest.TestCase):
+    # Replays 21.11: the Strelitzia watering began 14:23:49, the soil settled and was reported later.
+    WATERED = datetime(2026, 11, 21, 13, 23, 49, tzinfo=timezone.utc)
+
+    def make_feed(self, clock):
+        feed = house_events.HouseEvents()
+        feed.events = [
+            {"ts": "2026-11-21T14:30:00+01:00", "icon": "mdi:a", "text": "Later"},
+            {"ts": "2026-11-21T13:12:37+01:00", "icon": "mdi:b", "text": "Earlier"},
+        ]
+        feed.get_now = lambda: clock
+        feed._publish = lambda: None
+        feed._write_state_file = lambda: None
+        feed.log = lambda *a, **kw: None
+        return feed
+
+    def report(self, clock, at):
+        feed = self.make_feed(clock)
+        feed._on_report("house_events_report", {"text": "Watered Strelitzia", "audience": "admin", "at": at}, {})
+        return feed
+
+    def test_entry_takes_its_time_and_sorts_into_the_feed(self):
+        feed = self.report(self.WATERED + timedelta(minutes=7), self.WATERED.isoformat())
+        self.assertEqual([e["text"] for e in feed.events], ["Later", "Watered Strelitzia", "Earlier"])
+        self.assertEqual(datetime.fromisoformat(feed.events[1]["ts"]), self.WATERED)
+
+    def test_future_too_old_or_bad_at_gets_now(self):
+        clock = self.WATERED + timedelta(minutes=7)
+        for at in ((clock + timedelta(minutes=1)).isoformat(), (clock - timedelta(hours=3)).isoformat(),
+                   "2026-11-21T13:23:49", "soon", None):
+            with self.subTest(at=at):
+                feed = self.report(clock, at)
+                self.assertEqual(feed.events[0]["text"], "Watered Strelitzia")
+                self.assertEqual(datetime.fromisoformat(feed.events[0]["ts"]), clock)
+
+
 class LockListenerTests(unittest.TestCase):
     # Replays 15.11: door contact on at 05:04:50.4, BLE unlock at 05:04:52.4, cloud
     # changed_by "Manual Unlock" at 05:04:54, emit 20 s after the unlock.

@@ -50,7 +50,7 @@ LEAD_DAYS = 1
 FEED_BELOW = 350
 RISE_POINTS = 10
 RISE_WINDOW = timedelta(minutes=30)
-RISE_SETTLE = timedelta(minutes=15)
+RISE_SETTLE = timedelta(minutes=5)
 FEED_EVERY_DAYS = 28
 SUMMER_MONTHS = range(3, 10)
 

@@ -504,13 +504,14 @@ class HouseUpcoming(hass.Hass):
         slug = plant["slug"]
         self._rise[slug], event = plants.step_rise(self._rise.get(slug), value, now)
         if event:
-            self._report(f"Watered {plant['name']}, soil {event['low']:g}% to {event['peak']:g}%")
+            self._report(f"Watered {plant['name']}, soil {event['low']:g}% to {event['peak']:g}%", at=event["at"])
 
-    def _report(self, text):
+    def _report(self, text, at=None):
         """One line for the house events feed, admin only like the plant rows; HouseEvents listens, and
         if it is not there the event evaporates."""
         try:
-            self.fire_event("house_events_report", text=text, icon=plants.ICON, audience="admin")
+            extra = {"at": at} if at else {}
+            self.fire_event("house_events_report", text=text, icon=plants.ICON, audience="admin", **extra)
         except Exception as e:
             self.log(f"House event not sent: {e!r}", level="WARNING")
 

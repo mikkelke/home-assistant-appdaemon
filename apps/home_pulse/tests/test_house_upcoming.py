@@ -1560,13 +1560,13 @@ class PlantTests(unittest.TestCase):
         for minutes, value in ((5, 28), (10, 40), (15, 42)):
             app.now = start + minutes * MIN
             fire(app, MOISTURE, full(str(value), changed=app.now))
-        for _ in range(2):
-            tick(app, 5 * MIN)
+        tick(app, 4 * MIN)
         self.assertEqual(app.reports, [])
-        tick(app, 5 * MIN)
+        tick(app, MIN)
         text = "Watered Strelitzia, soil 12% to 42%"
         self.assertEqual(app.reports, [("house_events_report",
-                                        {"text": text, "icon": "mdi:watering-can-outline", "audience": "admin"})])
+                                        {"text": text, "icon": "mdi:watering-can-outline", "audience": "admin",
+                                         "at": core.utc_iso(start + 5 * MIN)})])
         for _ in range(6):
             tick(app, 5 * MIN)
         self.assertEqual(len(app.reports), 1)

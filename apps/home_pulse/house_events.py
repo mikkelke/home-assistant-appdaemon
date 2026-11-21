@@ -44,6 +44,9 @@ direction - a typo must never vanish an entry for the admin).
 the dashboard) who see the entry besides admins - room-scoped entries like "Claudias
 room lights switched to manual" -> ["Claudia"]. Mutually exclusive with
 audience="admin" (admin-only outranks; the users list is ignored then).
+`at` (optional): ISO time the event happened, for an observer that only knows it after the fact
+(a watering seen once the soil stops rising). Kept when it lies within MAX_BACKDATE before now, else
+the entry gets now; the entry sorts into the feed at that time.
 
 Persistence (v3): entity first, state file second. The feed is re-read from the
 entity on app reload (survives code deploys), and from `house_events_state.json`
@@ -76,6 +79,7 @@ MAX_EVENTS = 40
 # One source emitting the exact same text by the same person again within this window is flapping
 # (e.g. washer Unemptied->Emptied->Off lands in the same second), not news.
 DUP_SUPPRESS_S = 300
+MAX_BACKDATE = timedelta(hours=2)
 # An emptied row still takes the emptier's name this long after it was written (see enrich_by).
 EMPTIED_ENRICH_S = 900
 # Reports come from other apps but are still validated like external data - a bug
@@ -420,7 +424,28 @@ def build_report_event(data):
         "by": by,
         "audience": audience,
         "audience_users": audience_users,
+        "at": _parse_at(data.get("at")),
     }
+
+
+def _position(events, when):
+    """Index in the newest-first `events` for an entry at `when`: before the first entry not later."""
+    for index, event in enumerate(events):
+        try:
+            if datetime.fromisoformat(event["ts"]) <= when:
+                return index
+        except (KeyError, TypeError, ValueError):
+            return index
+    return len(events)
+
+
+def _parse_at(value):
+    """The aware datetime of an ISO `at`, None when absent, naive or not a time."""
+    try:
+        at = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return at if at.tzinfo else None
 
 
 class HouseEvents(hass.Hass):
@@ -608,6 +633,7 @@ class HouseEvents(hass.Hass):
                 by=event["by"],
                 audience=event["audience"],
                 audience_users=event["audience_users"],
+                at=event["at"],
             )
 
     # -- feed management ----------------------------------------------------
@@ -633,8 +659,11 @@ class HouseEvents(hass.Hass):
             self.log(f"Could not restore previous feed from state file: {e}", level="WARNING")
             return []
 
-    def _add(self, icon, text, cause=None, effect=None, by=None, audience=None, audience_users=None, entry_kind=None):
+    def _add(self, icon, text, cause=None, effect=None, by=None, audience=None, audience_users=None, entry_kind=None,
+             at=None):
         now = self.get_now()
+        if at is not None and now - MAX_BACKDATE <= at <= now:
+            now = at.astimezone(now.tzinfo)
         now_iso = now.isoformat()
         # Flap guard: identical text by the same person again within the window is noise, not news.
         for event in self.events:
@@ -661,7 +690,7 @@ class HouseEvents(hass.Hass):
             entry["audience_users"] = list(audience_users)
         if entry_kind:
             entry["entry"] = entry_kind
-        self.events.insert(0, entry)
+        self.events.insert(_position(self.events, now), entry)
         del self.events[MAX_EVENTS:]
         self._publish()
         self._write_state_file()
