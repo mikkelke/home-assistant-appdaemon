@@ -299,9 +299,10 @@ class TailAlreadyElapsedAtGuardTime(BaseTailTest):
 class ZeroTailProgrammesUnchanged(BaseTailTest):
     def test_quick_transitions_immediately_as_before(self):
         """dry_tail_minutes: 0 (unmeasured) -> exactly the old immediate behaviour."""
-        # QuickPowerWash: 1.5 kWh classifies as quick; guard = nominal 58 * 0.92 = 53.4 min.
+        # QuickPowerWash (its early heating latched the classification); guard = nominal 58 * 0.92 = 53.4 min.
         t_met = START + timedelta(minutes=56)
         app = make_running_app(t_met, energy_now="2.50")
+        app.quick_shape_seen = True
         app.min_cycle_minutes = 40  # harness value: quick's 58 min nominal < the eco-tuned 74
         app._last_high_power_time = START + timedelta(minutes=54)
         app._confirm_finished({})

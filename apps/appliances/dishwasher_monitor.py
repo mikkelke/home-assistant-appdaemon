@@ -187,6 +187,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             "detected_programme": lambda: self.detected_programme,
             "detected_short": lambda: self.detected_short,
             "detected_quick_short": lambda: self.detected_quick_short,
+            "quick_shape_seen": lambda: self.quick_shape_seen,
             "expected_dur_at_start": lambda: self.expected_dur_at_start,
             "max_power_w": lambda: self.max_power_w,
             "door_opened_during_cycle": lambda: self.door_opened_during_cycle,
@@ -380,6 +381,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         self.detected_programme = "unknown"
         self.detected_short = False  # ECO with short=Yes inferred from energy+runtime
         self.detected_quick_short = False  # QuickPowerWash with short=Yes (rinse/salt cycle)
+        self.quick_shape_seen = False
         self.max_power_w = 0.0
         self._last_high_power_time = None  # Last time power was high (e.g. >50 W); used to detect drying phase
 
@@ -938,6 +940,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                 self.detected_short = bool(store.get("detected_short"))
             if "detected_quick_short" in store:
                 self.detected_quick_short = bool(store.get("detected_quick_short"))
+            self.quick_shape_seen = bool(store.get("quick_shape_seen"))
             max_power_w = store.get("max_power_w")
             if max_power_w is not None:
                 try:
@@ -1104,6 +1107,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             self._last_high_power_time = None
             self.detected_short = False
             self.detected_quick_short = False
+            self.quick_shape_seen = False
             return False
 
         self.state = "Running"
@@ -1506,6 +1510,10 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                 return True  # Long low-power stretch after heating = drying phase
         return run_min > 120 and current_w <= 20  # Past 2 h with low power
 
+    QUICK_SHAPE_MINUTES = 45
+    QUICK_SHAPE_KWH = 0.5
+    quick_shape_seen = False
+
     def _classify_programme(self):
         """Classify programme from energy + runtime. ECO has short toggle (set in self.detected_short).
         Uses drying-phase pattern (long 0–3 W after heating) to prefer ECO full over ECO short when appropriate."""
@@ -1542,18 +1550,22 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
 
         eco_max = _rated_max_energy_kwh("eco", 0.9)
         gentle_max = _rated_max_energy_kwh("gentle", 1.2)
-        # Auto is the one concretely documented case of a legitimate higher-energy programme
-        # the old hardcoded 1.4 catch-all swallowed into "quick" (58-min guard vs Auto's 108) -
-        # raise the catch-all to at least cover it. Floored at the original 1.4 literal (never
-        # shrunk below it) so a profile set that does not define "auto" at all - e.g. a partial
-        # test double - keeps exactly today's catch-all threshold.
-        upper_ceiling = max(1.4, _rated_max_energy_kwh("auto", 1.4))
 
-        # QuickPowerWash with short = rinse/salt cycle (< 0.2 kWh, < 20 min)
+        # QuickPowerWash heats from its first minutes; ECO, Intensive and Gentle start with a cold
+        # pre-rinse, so no other programme has drawn this much this early. Latched for the cycle:
+        # later on, Quick's total energy alone overlaps Gentle and Intensive.
+        if self.quick_shape_seen or (
+            run_min <= self.QUICK_SHAPE_MINUTES and energy >= self.QUICK_SHAPE_KWH
+        ):
+            self.quick_shape_seen = True
+            self.detected_short = False
+            self.detected_quick_short = False
+            return "quick"
+        # Under 20 min and 0.2 kWh every programme looks alike; a rinse/salt cycle ends here.
         if energy < 0.2 and run_min < 20:
             self.detected_short = False
-            self.detected_quick_short = True
-            return "quick"
+            self.detected_quick_short = False
+            return "unknown"
         # ECO: 0.4 kWh up to its own rated ceiling; short = Yes when runtime suggests short run (~74 min)
         # If we're in the long drying phase (past 100 min, low power), treat as ECO full.
         if 0.4 <= energy <= eco_max:
@@ -1563,16 +1575,11 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                 return "eco"
             self.detected_short = False
             return "eco"
-        # Gentle: up to its own rated ceiling (manual)
-        if eco_max < energy <= gentle_max:
+        # Past ECO's ceiling without Quick's early heating: Gentle up to its own rating, else Intensive.
+        if energy > eco_max:
             self.detected_short = False
             self.detected_quick_short = False
-            return "gentle"
-        # Quick: above every known programme's ceiling (full QuickPowerWash)
-        if energy > upper_ceiling:
-            self.detected_short = False
-            self.detected_quick_short = False
-            return "quick"
+            return "gentle" if energy <= gentle_max else "intensive"
         # Ambiguous: use runtime; drying phase => ECO full
         self.detected_quick_short = False
         if run_min < 100 and not in_drying:
@@ -2174,6 +2181,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         self.detected_programme = "unknown"
         self.detected_short = False
         self.detected_quick_short = False
+        self.quick_shape_seen = False
         self.max_power_w = watts_confirm
 
         try:
@@ -3222,6 +3230,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         self.detected_programme = "unknown"
         self.detected_short = False
         self.detected_quick_short = False
+        self.quick_shape_seen = False
         self.max_power_w = 0.0
         self._last_high_power_time = None
         self.low_power_counter = 0
