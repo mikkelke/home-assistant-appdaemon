@@ -15,9 +15,9 @@ PLAY MY MUSIC. From the speaker's Spotify account entity (`accounts`, HA's Spoti
 polled about every 30 s):
     - playing on a house Sonos (its Spotify Connect source is a speaker's name, "Kitchen + 2" for a
       group): the room joins that speaker, already there means nothing to do;
-    - playing or paused elsewhere (a phone): the room's speaker plays the account's current track
-      through Music Assistant with radio mode, so similar songs follow, and a playing phone is
-      paused, which moves the music;
+    - playing or paused elsewhere (a phone; Music Assistant's own Spotify stream does not count):
+      the room's speaker plays the account's current track through Music Assistant with radio
+      mode, so similar songs follow, and a playing phone is paused, which moves the music;
     - idle: the account's last track, remembered by this app from every playing or paused state
       (persisted in state_file, seeded from the recorder for `recent_days` at startup), the same way;
     - nothing within recent_days: it says so.
@@ -40,6 +40,7 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 
 RESULT_EVENT = "assist_my_music_result"
 NOT_PEOPLE = ("someone", "outside home assistant")
+MA_SOURCE = "Music Assistant Playback"
 
 
 def device_key(name):
@@ -75,11 +76,16 @@ def resolve_speaker(area, identity, ble_states, owner):
 
 
 def item_from_state(state):
-    """{uri, title, artist, source, state} from a Spotify account state dict, or None."""
+    """{uri, title, artist, source, state} from a Spotify account state dict, or None.
+
+    Music Assistant streams Spotify through Mikkel's account as the device MA_SOURCE: that is the
+    house playing, never his own listening, so it is None too."""
     state = state if isinstance(state, dict) else {}
     attrs = state.get("attributes") or {}
     uri = attrs.get("media_content_id")
     if state.get("state") not in ("playing", "paused") or not isinstance(uri, str) or not uri.startswith("spotify:"):
+        return None
+    if attrs.get("source") == MA_SOURCE:
         return None
     return {"uri": uri, "title": attrs.get("media_title") or "", "artist": attrs.get("media_artist") or "",
             "source": attrs.get("source") or "", "state": state.get("state")}

@@ -110,6 +110,12 @@ class MyMusicPlan(unittest.TestCase):
         self.assertEqual(actions[0], {"event": "request_sonos_group_unjoin", "data": {"entity_id": BATH}})
         self.assertEqual(actions[1]["delay"], 1)
 
+    def test_music_assistant_stream_is_not_own_listening(self):
+        last = {"uri": "spotify:track:x", "title": "Fugle", "artist": "Djämes Braun", "at": NOW.isoformat()}
+        speech, actions = self.plan(account(source="Music Assistant Playback"), last)
+        self.assertEqual(speech, "Kristine, your last song, Fugle by Djämes Braun, then more like it.")
+        self.assertEqual([a["service"] for a in actions], ["music_assistant/play_media"])
+
     def test_unknown_person(self):
         self.assertEqual(mm.my_music_plan(None, BATH, {}, None, {}, None, SONOS_KEYS, NOW, 7),
                          ("I can't tell whose music to play.", []))
