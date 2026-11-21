@@ -347,15 +347,13 @@ class BathroomLights(hass.Hass):
             self.log(f"Error turning off lights: {e}", level="ERROR")
 
     def _turn_off_mains(self):
-        """Turn off the 5 main spots only — bath spot stays with the bath sub-logic.
-
-        Only reached from the confirmed-bright auto-off path (``turn_off_bright``). This
-        used to report to the Home activity feed; removed 2026-07-22 after it fired twice
-        in 16 minutes on an ordinary sunny morning (relight -> re-off re-reports once past
-        the feed's 5-min dup window) - a routine, self-evident action, not feed-worthy.
-        The INFO log below keeps the decision traceable."""
+        """Bright auto-off: the 5 main spots go off; the shower spot stays only while
+        someone is in the shower cabin, otherwise all 6 go off together."""
         try:
-            self.turn_off(self.main_5_spots_group)
+            if self.get_state(self.specific_bath_presence_entity) == "on":
+                self.turn_off(self.main_5_spots_group)
+            else:
+                self.turn_off(self.all_spots_group)
         except Exception as e:
             self.log(f"Error turning off main lights: {e}", level="ERROR")
 
