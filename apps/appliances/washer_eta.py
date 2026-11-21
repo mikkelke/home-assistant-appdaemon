@@ -10,6 +10,10 @@ washes that lasted longer and had used the energy it has. A wash's distance from
 largest gap over the run's marks so far and its reading now. Before the first mark, or while fewer
 than MIN_SAMPLES longer washes have marks, the median is over all the longer washes; with fewer than
 MIN_SAMPLES longer washes there is no estimate.
+
+A wash run with Kort is not in that history: it is a sample of its programme with Kort, kept apart by the programme
+and temperature it ran (short_eta_history). A run with Kort on expects the length of those that lasted longer, and
+while fewer than MIN_SAMPLES did, the length an unconfirmed run expects.
 """
 
 import statistics
@@ -48,24 +52,46 @@ def profile_marks(entry, duration_min, energy_kwh):
     return marks
 
 
+def _wash(rec, entries):
+    """(duration_min, marks or None) of an eligible record, None when its length is no real wash's. `entries` is
+    RunProfiles' extraction cache, keyed by model.cache_key; a wash without a valid entry has no marks."""
+    duration, energy = rec["duration_min"], rec["energy_kwh"]
+    if not MIN_WASH_MIN <= duration <= MAX_WASH_MIN:
+        return None
+    entry = entries.get(model.cache_key("washer", rec))
+    marks = None
+    try:
+        if model.entry_rejection(rec, entry) is None:
+            marks = profile_marks(entry, duration, energy)
+    except (KeyError, TypeError, ValueError):
+        pass
+    return (float(duration), marks)
+
+
 def eta_history(cycles, entries):
-    """[(duration_min, marks or None)] of the real washes among the feedback `cycles`; `entries` is
-    RunProfiles' extraction cache, keyed by model.cache_key. A wash without a valid entry has no marks."""
+    """[(duration_min, marks or None)] of the real washes among the feedback `cycles`, Kort washes left out."""
     history = []
     for rec in cycles:
         if model.record_eligibility(rec) is not None:
             continue
-        duration, energy = rec["duration_min"], rec["energy_kwh"]
-        if not MIN_WASH_MIN <= duration <= MAX_WASH_MIN:
+        wash = _wash(rec, entries)
+        if wash is not None:
+            history.append(wash)
+    return history
+
+
+def short_eta_history(cycles, entries, key_of):
+    """{key: [(duration_min, marks or None)]} of the real washes among `cycles` that ran with Kort, grouped by the key
+    `key_of(record)` gives them; a record it gives None is left out. RunProfiles extracts no profile of a Kort wash,
+    so one has marks only when it was extracted before the wash was marked Kort."""
+    history = {}
+    for rec in cycles:
+        if model.record_eligibility(rec) != model.SHORT:
             continue
-        entry = entries.get(model.cache_key("washer", rec))
-        marks = None
-        try:
-            if model.entry_rejection(rec, entry) is None:
-                marks = profile_marks(entry, duration, energy)
-        except (KeyError, TypeError, ValueError):
-            pass
-        history.append((float(duration), marks))
+        key = key_of(rec)
+        wash = _wash(rec, entries) if key is not None else None
+        if wash is not None:
+            history.setdefault(key, []).append(wash)
     return history
 
 
@@ -112,3 +138,10 @@ def typical_total_after(history, live_marks, live_kwh, elapsed_min):
             scored.sort()
             return round(statistics.median(d for _, d in scored[:NEIGHBOURS]))
     return round(statistics.median(d for d, _ in longer))
+
+
+def typical_total_with_short(short_history, history, key, live_marks, live_kwh, elapsed_min):
+    """Expected total minutes of a run with Kort on: like the Kort washes of `key` that lasted longer, else like an
+    unconfirmed run; None while too few washes of either lasted longer."""
+    return (typical_total_after(short_history.get(key, ()), live_marks, live_kwh, elapsed_min)
+            or typical_total_after(history, live_marks, live_kwh, elapsed_min))

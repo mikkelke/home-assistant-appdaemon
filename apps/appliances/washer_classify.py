@@ -146,7 +146,9 @@ def classify_cycle_completion(
     nominal_dur = profile.get("duration_min") or profile.get("nominal_duration_min") or 180
     max_dur = profile.get("max_dur_min") or profile.get("max_valid_duration_min") or int(nominal_dur * 1.2)
     frac = guard_fraction
-    min_valid_dur = max(frac * nominal_dur, min_cycle_minutes)
+    short = (selected_options or {}).get("short") == "on"
+    # Kort shortens the programme by an amount the tables do not carry, so no share of the plain duration is a floor.
+    min_valid_dur = min_cycle_minutes if short else max(frac * nominal_dur, min_cycle_minutes)
     min_energy = profile.get("min_valid_energy_kwh") or min_energy_kwh
     if min_energy is None:
         min_energy = min_energy_kwh
@@ -169,6 +171,8 @@ def classify_cycle_completion(
         flags.append("unknown_programme")
     if (selected_options or {}).get("soak") == "on":
         flags.append("soak_selected")  # soak stretches the cycle by an unreported amount: never a duration sample
+    if short:
+        flags.append("short_selected")  # Kort shortens it by an amount the tables lack: never a sample of the plain programme
 
     if "runtime_too_short" in flags and run_minutes < min_cycle_minutes:
         completion_class = "interrupted"
@@ -194,6 +198,7 @@ def classify_cycle_completion(
         and "energy_too_low" not in flags
         and "unknown_programme" not in flags
         and "soak_selected" not in flags
+        and "short_selected" not in flags
     )
     if transition_path == "door_opened_first" and completion_class != "completed":
         valid_for_learning = False

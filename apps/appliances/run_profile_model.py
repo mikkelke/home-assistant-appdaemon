@@ -70,6 +70,7 @@ USE_WINDOW_DAYS = 90
 MAX_PROGRAMMES = 7
 MAX_PAYLOAD_BYTES = 8192
 NOT_TYPICAL = ("drum_clean",)
+SHORT = "short"
 
 _MISSING_STATES = ("unknown", "unavailable", "none", "")
 
@@ -135,7 +136,8 @@ def record_ts(rec):
 
 
 def record_eligibility(rec):
-    """None when the record may feed a profile, else the reason it may not."""
+    """None when the record may feed a profile, else the reason it may not. A wash run with Kort (SHORT) is a real
+    wash but not a sample of its plain programme; washer_eta keeps those apart."""
     if record_ts(rec) is None:
         return "bad_ts"
     energy = _num(rec.get("energy_kwh"))
@@ -149,8 +151,11 @@ def record_eligibility(rec):
     if rec.get("completion_class") == "interrupted":
         return "interrupted"
     options = rec.get("selected_options")
-    if isinstance(options, dict) and str(options.get("soak", "")).lower() == "on":
-        return "soak"
+    if isinstance(options, dict):
+        if str(options.get("soak", "")).lower() == "on":
+            return "soak"
+        if str(options.get("short", "")).lower() == "on":
+            return SHORT
     return None
 
 

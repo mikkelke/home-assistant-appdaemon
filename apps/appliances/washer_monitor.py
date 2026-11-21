@@ -138,10 +138,12 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
     # RunProfiles' extraction cache: the energy profile of each past wash, for the ETA of an unconfirmed run.
     RUN_PROFILES_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_profiles_cache_state.json")
 
-    # The feedback records the ETA history is built from, that history, and this cycle's own energy marks with the
-    # (elapsed_min, kWh) of its last tick - see washer_eta.py. Assigned, never mutated.
+    # The feedback records the ETA history is built from, that history, the history of the washes run with Kort by
+    # learn key, and this cycle's own energy marks with the (elapsed_min, kWh) of its last tick - see washer_eta.py.
+    # Assigned, never mutated.
     _eta_cycles = ()
     _eta_history = ()
+    _eta_history_short = {}
     _eta_marks = ()
     _eta_prev = None
 
@@ -164,6 +166,21 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             return self._soak_duration_min if self.get_state(entity) == "on" else 0
         except Exception:
             return 0
+
+    def _short_on(self, programme) -> bool:
+        """Kort is on for a programme that has it; a programme without the option runs without it whatever the helper says."""
+        entity = getattr(self, "option_short_entity", None)
+        if not entity or not wp.supports_short(self.PROGRAMME_PROFILES, programme):
+            return False
+        try:
+            return self.get_state(entity) == "on"
+        except Exception:
+            return False
+
+    def _short_total_minutes(self, programme, temperature, elapsed_min, kwh):
+        """Expected total minutes of a run with Kort on (washer_eta.typical_total_with_short); None while the washes on record cannot tell."""
+        key = wp.learn_key_for(self.PROGRAMME_PROFILES, programme, temperature)
+        return weta.typical_total_with_short(self._eta_history_short, self._eta_history, key, self._eta_marks, kwh, elapsed_min)
 
     def _start_plug_poller(self, kwargs):
         """Started once initialize() has fully succeeded, so a failed initialize never leaves a thread behind. After an
@@ -1292,6 +1309,8 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         self._listen_confirmer(self.confirm_entity, "washer_start")
         if self.option_soak_entity:
             self.listen_state(self._on_soak_option_changed, self.option_soak_entity)
+        if self.option_short_entity:
+            self.listen_state(self._on_short_option_changed, self.option_short_entity)
         if self.vibration_sensor:
             self.listen_state(self._vibration_changed, self.vibration_sensor)
 
@@ -2745,6 +2764,11 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                     self.call_service("input_boolean/turn_off", entity_id=self.option_soak_entity)
                 except Exception as e:
                     self.log(f"Could not reset {self.option_soak_entity}: {e}", level="DEBUG")
+            if self.option_short_entity:
+                try:
+                    self.call_service("input_boolean/turn_off", entity_id=self.option_short_entity)
+                except Exception as e:
+                    self.log(f"Could not reset {self.option_short_entity}: {e}", level="DEBUG")
 
             # Auto-analyze after cycle completes (if enabled and we had a valid cycle)
             if self.args.get("auto_analyze_cycles", False) and had_valid_cycle:
@@ -2821,7 +2845,22 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                     opts[name] = state
             except Exception:
                 pass
+        if opts.get("short") == "on" and not wp.supports_short(self.PROGRAMME_PROFILES, self._confirmed_programme_key()):
+            opts["short"] = "off"
         return opts if opts else None
+
+    def _confirmed_programme_key(self):
+        """Key of the programme the user has picked, None while it is Auto (unconfirmed)."""
+        entity = getattr(self, "confirm_entity", None)
+        if not entity:
+            return None
+        try:
+            label = self.get_state(entity)
+        except Exception:
+            return None
+        if not label or label in ("Auto (unconfirmed)", "unknown", "unavailable"):
+            return None
+        return self._LABEL_TO_KEY.get(label)
 
     def _get_spin_rpm_for_feedback(self) -> int | None:
         """Read spin_entity for feedback record. Returns rpm or None. Tolerates get_state failure."""
@@ -4509,7 +4548,18 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                 entries = json.load(f).get("entries")
         except Exception:
             entries = None
-        self._eta_history = weta.eta_history(self._eta_cycles, entries if isinstance(entries, dict) else {})
+        entries = entries if isinstance(entries, dict) else {}
+        self._eta_history = weta.eta_history(self._eta_cycles, entries)
+        self._eta_history_short = weta.short_eta_history(self._eta_cycles, entries, self._confirmed_learn_key)
+
+    def _confirmed_learn_key(self, rec):
+        """Learn key (programme and temperature) of a feedback record whose programme a person confirmed, else None."""
+        prog = rec.get("confirmed")
+        if not (rec.get("programme_user_confirmed") or rec.get("programme_confirmed_by_human")):
+            return None
+        if not isinstance(prog, str) or not prog or prog == "unknown":
+            return None
+        return wp.learn_key_for(self.PROGRAMME_PROFILES, prog, wcls.temp_from_storage(rec.get("confirmed_temperature")))
 
     def _note_eta_marks(self, elapsed_min, kwh):
         """Record this tick's reading towards the run's energy marks. Memory and the cycle store only: never an entity attribute."""
@@ -5445,6 +5495,52 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         if current_state == "Running" and self.start_time:
             self._push_running_eta_attributes()
 
+    def _on_short_option_changed(self, entity, attribute, old, new, kwargs):
+        """Kort toggled. While Running the published ETA follows at once, as for soak. Once the wash has finished and
+        waits to be emptied, the toggle marks that wash's record instead."""
+        if new not in ("on", "off"):
+            return
+        current_state = self.get_state(self.state_entity) or ""
+        if current_state == "Running" and self.start_time:
+            self._push_running_eta_attributes()
+        elif current_state == "Unemptied":
+            self._mark_last_cycle_short(new == "on")
+
+    def _mark_last_cycle_short(self, on: bool):
+        """Set or clear Kort on the newest feedback record, the wash waiting to be emptied, and classify it again, so a
+        Kort wash is never learned as a plain one. Only a record saved in the last 12 h and with a confirmed programme
+        is touched: the learning of a programme the classifier merely guessed is not for Kort to decide."""
+        try:
+            with open(self.feedback_file, "r") as f:
+                data = json.load(f)
+            cycles = data.get("cycles") or []
+            rec = cycles[-1] if cycles else None
+            if rec is None or not rec.get("programme_user_confirmed"):
+                return
+            if (self._now_utc() - datetime.fromisoformat(rec["ts"])).total_seconds() > 12 * 3600:
+                return
+            options = dict(rec.get("selected_options") or {})
+            if (options.get("short") == "on") == on:
+                return
+            options["short"] = "on" if on else "off"
+            rec["selected_options"] = options
+            classification = self._classify_cycle_completion(
+                run_minutes=float(rec.get("duration_min", 0) or 0), energy_kwh=float(rec.get("energy_kwh", 0) or 0),
+                heating_bursts=int(rec.get("heating_bursts", 0) or 0), max_power_w=float(rec.get("max_power_w", 0) or 0),
+                predicted=rec.get("predicted", ""), predicted_temperature=self._temp_from_storage(rec.get("predicted_temperature")),
+                confirmed=rec.get("confirmed", ""), confirmed_temperature=self._temp_from_storage(rec.get("confirmed_temperature")),
+                transition_path=rec.get("transition_path") or rec.get("end_reason") or "low_power_detected",
+                spin_rpm=rec.get("spin_rpm"), user_confirmed_override=True, selected_options=options,
+            )
+            rec["completion_class"] = classification["completion_class"]
+            rec["valid_for_learning"] = classification["valid_for_learning"]
+            rec["validation_flags"] = classification["validation_flags"]
+            feedback_io.write_json(self.feedback_file, data)
+            self._reload_learning(cycles)
+            self.log(f"Kort {'on' if on else 'off'} on the finished wash ts={rec['ts']}, valid_for_learning={rec['valid_for_learning']}", level="INFO")
+        except Exception as e:
+            self.log(f"Could not mark the finished wash with Kort {'on' if on else 'off'}: {e}", level="WARNING")
+
     def _tail_eta_utc(self, eta_prog, now):
         """UTC time a Bomuld wash ends, from the strong spins the plug has read since this cycle's last heating
         (washer_plug.bomuld_tail_eta); None for any other programme and while it has read no real spin. The tracker is
@@ -5479,7 +5575,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             effective_dur = self._get_programme_duration(eta_prog, eta_temp, use_learned=False)
             if not effective_dur:
                 return
-            effective_dur += self._soak_offset_minutes()
+            short = self._short_on(eta_prog)
             # Sync the classifier's own state too, not just the published attrs -- other call
             # sites (e.g. _get_programme_duration_hint_for_history, line ~3057) read
             # self.detected_programme directly and would otherwise keep using the stale
@@ -5488,10 +5584,13 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             self.detected_temperature = eta_temp
             now = self._now_utc()
             elapsed_min = (now - self.start_time).total_seconds() / 60
+            if short:
+                effective_dur = self._short_total_minutes(eta_prog, eta_temp, elapsed_min, self._get_energy_used()) or effective_dur
+            effective_dur += self._soak_offset_minutes()
             remaining = max(0, round(effective_dur - elapsed_min))
             est_end = self.start_time + timedelta(minutes=effective_dur)
             total_min = effective_dur
-            tail_end = self._tail_eta_utc(eta_prog, now)
+            tail_end = self._tail_eta_utc(None if short else eta_prog, now)
             if tail_end is not None:
                 est_end = tail_end
                 remaining = max(0, round((est_end - now).total_seconds() / 60))
@@ -5528,6 +5627,9 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             return
         no_choice = "—"
         try:
+            if self.option_short_entity and not wp.supports_short(self.PROGRAMME_PROFILES, prog_key):
+                if self.get_state(self.option_short_entity) == "on":
+                    self.call_service("input_boolean/turn_off", entity_id=self.option_short_entity)
             if self.temperature_entity:
                 allowed_temps = profile.get("allowed_temperatures") or []
                 # ECO always gets 40-60, 40, 60 so HA dropdown shows all three
@@ -5859,8 +5961,12 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         static_dur = self._get_programme_duration(eta_prog, eta_temp, use_learned=False)
         kwh = self._get_energy_used()
         self._note_eta_marks(elapsed_min, kwh)
-        effective_dur = static_dur if user_has_selected else (
-            weta.typical_total_after(self._eta_history, self._eta_marks, kwh, elapsed_min) or static_dur)
+        short = user_has_selected and self._short_on(eta_prog)
+        if short:
+            effective_dur = self._short_total_minutes(eta_prog, eta_temp, elapsed_min, kwh) or static_dur
+        else:
+            effective_dur = static_dur if user_has_selected else (
+                weta.typical_total_after(self._eta_history, self._eta_marks, kwh, elapsed_min) or static_dur)
         effective_dur += self._soak_offset_minutes()
         # Merge new attrs into existing HA state so persisted fields
         # (programme_confirmed_by_user, programme_confirmed_by, last_off_at, etc.)
@@ -5911,7 +6017,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             remaining = max(0, round(effective_dur - elapsed_min))
             est_end = self.start_time + timedelta(minutes=effective_dur)
             total_min = effective_dur
-            tail_end = self._tail_eta_utc(eta_prog if user_has_selected else None, now)
+            tail_end = self._tail_eta_utc(eta_prog if user_has_selected and not short else None, now)
             if tail_end is not None:
                 est_end = tail_end
                 remaining = max(0, round((est_end - now).total_seconds() / 60))

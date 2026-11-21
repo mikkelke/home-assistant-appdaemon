@@ -29,7 +29,7 @@ SPIN_MAX_900 = ["900 rpm", "700 rpm", "No spin"]                 # Manual: Finva
 # (see docs/miele-wea035-washer.md).
 DEFAULT_SOAK_DURATION_MIN = 30
 DEFAULT_PROFILES = {
-    "ekspres":   {"label": "Ekspres",   "default_temp": None,   "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C"], "allowed_spin_speeds": SPIN_MAX_1200, "default_temperature": "40°C", "default_spin": "1200 rpm", "available_options": ["short"], "by_temperature": {
+    "ekspres":   {"label": "Ekspres",   "default_temp": None,   "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C"], "allowed_spin_speeds": SPIN_MAX_1200, "default_temperature": "40°C", "default_spin": "1200 rpm", "available_options": [], "by_temperature": {
         "cold": {"duration_min": 20, "max_energy_kwh": 0.25, "heats": False, "stable_min":  8, "max_dur_min": 30, "supports_anti_crease": True},
         "20°C": {"duration_min": 20, "max_energy_kwh": 0.40, "heats":  True, "stable_min":  8, "max_dur_min": 30, "supports_anti_crease": True},
         "30°C": {"duration_min": 20, "max_energy_kwh": 0.40, "heats":  True, "stable_min":  8, "max_dur_min": 30, "supports_anti_crease": True},
@@ -41,7 +41,7 @@ DEFAULT_PROFILES = {
         "30°C": {"duration_min":  39, "max_energy_kwh": 0.28, "heats":  True, "stable_min": 10, "max_dur_min":  55, "supports_anti_crease": False},
         "40°C": {"duration_min":  39, "max_energy_kwh": 0.28, "heats":  True, "stable_min": 10, "max_dur_min":  55, "supports_anti_crease": False},
     }},  # Manual: Uld 40°C -> cold; max spin 1200 rpm
-    "bomuld":    {"label": "Bomuld",    "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C", "60°C", "90°C"], "allowed_spin_speeds": CANONICAL_SPIN, "default_temperature": "40°C", "default_spin": "1400 rpm", "available_options": ["water_plus", "soak", "prewash"], "by_temperature": {
+    "bomuld":    {"label": "Bomuld",    "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C", "60°C", "90°C"], "allowed_spin_speeds": CANONICAL_SPIN, "default_temperature": "40°C", "default_spin": "1400 rpm", "available_options": ["water_plus", "soak", "prewash", "short"], "supports_short": True, "by_temperature": {
         "cold": {"duration_min": 159, "max_energy_kwh": 0.35, "heats": False, "stable_min": 10, "max_dur_min": 185, "supports_anti_crease": True},
         "20°C": {"duration_min": 159, "max_energy_kwh": 0.55, "heats":  True, "stable_min": 15, "max_dur_min": 185, "supports_anti_crease": True},
         "30°C": {"duration_min": 159, "max_energy_kwh": 0.75, "heats":  True, "stable_min": 15, "max_dur_min": 185, "supports_anti_crease": True},
@@ -49,13 +49,13 @@ DEFAULT_PROFILES = {
         "60°C": {"duration_min": 149, "max_energy_kwh": 1.40, "heats":  True, "stable_min": 15, "max_dur_min": 175, "supports_anti_crease": True},
         "90°C": {"duration_min": 160, "max_energy_kwh": 2.20, "heats":  True, "stable_min": 15, "max_dur_min": 195, "supports_anti_crease": True},
     }},
-    "finvask":   {"label": "Finvask",   "default_temp": "40°C", "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C"], "allowed_spin_speeds": SPIN_MAX_900, "default_temperature": "40°C", "default_spin": "900 rpm", "available_options": ["water_plus", "soak"], "by_temperature": {
+    "finvask":   {"label": "Finvask",   "default_temp": "40°C", "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C"], "allowed_spin_speeds": SPIN_MAX_900, "default_temperature": "40°C", "default_spin": "900 rpm", "available_options": ["water_plus", "soak", "short"], "supports_short": True, "by_temperature": {
         "cold": {"duration_min":  65, "max_energy_kwh": 0.25, "heats": False, "stable_min": 10, "max_dur_min":  90, "supports_anti_crease": True},
         "20°C": {"duration_min":  65, "max_energy_kwh": 0.35, "heats":  True, "stable_min": 10, "max_dur_min":  90, "supports_anti_crease": True},
         "30°C": {"duration_min":  65, "max_energy_kwh": 0.38, "heats":  True, "stable_min": 10, "max_dur_min":  90, "supports_anti_crease": True},
         "40°C": {"duration_min":  65, "max_energy_kwh": 0.40, "heats":  True, "stable_min": 10, "max_dur_min":  90, "supports_anti_crease": True},
     }},  # Manual: 40°C -> cold; allows all lower temps (Cold, 20, 30, 40)
-    "strygelet": {"label": "Strygelet", "default_temp": "30°C", "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C", "60°C"], "allowed_spin_speeds": SPIN_MAX_1200, "default_temperature": "30°C", "default_spin": "1200 rpm", "available_options": ["water_plus", "soak"], "by_temperature": {
+    "strygelet": {"label": "Strygelet", "default_temp": "30°C", "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C", "60°C"], "allowed_spin_speeds": SPIN_MAX_1200, "default_temperature": "30°C", "default_spin": "1200 rpm", "available_options": ["water_plus", "soak", "short"], "supports_short": True, "by_temperature": {
         "cold": {"duration_min": 119, "max_energy_kwh": 0.35, "heats": False, "stable_min": 15, "max_dur_min": 140, "supports_anti_crease": True},
         "20°C": {"duration_min": 119, "max_energy_kwh": 0.45, "heats":  True, "stable_min": 15, "max_dur_min": 140, "supports_anti_crease": True},
         "30°C": {"duration_min": 119, "max_energy_kwh": 0.52, "heats":  True, "stable_min": 15, "max_dur_min": 140, "supports_anti_crease": True},
@@ -70,14 +70,14 @@ DEFAULT_PROFILES = {
         "40°C": {"duration_min": 199, "max_energy_kwh": 0.78, "heats":  True, "stable_min": 15, "max_dur_min": 235, "supports_anti_crease": True},
         "60°C": {"duration_min": 199, "max_energy_kwh": 0.78, "heats":  True, "stable_min": 15, "max_dur_min": 235, "supports_anti_crease": True},
     }},
-    "morkt_denim":  {"label": "Mørkt/Denim", "default_temp": "60°C", "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C", "60°C"], "allowed_spin_speeds": SPIN_MAX_1200, "default_temperature": "60°C", "default_spin": "1200 rpm", "available_options": ["water_plus"], "by_temperature": {
+    "morkt_denim":  {"label": "Mørkt/Denim", "default_temp": "60°C", "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C", "60°C"], "allowed_spin_speeds": SPIN_MAX_1200, "default_temperature": "60°C", "default_spin": "1200 rpm", "available_options": ["water_plus", "short"], "supports_short": True, "by_temperature": {
         "cold": {"duration_min":  90, "max_energy_kwh": 0.35, "heats": False, "stable_min": 12, "max_dur_min": 110, "supports_anti_crease": True},
         "20°C": {"duration_min":  90, "max_energy_kwh": 0.42, "heats":  True, "stable_min": 12, "max_dur_min": 110, "supports_anti_crease": True},
         "30°C": {"duration_min":  90, "max_energy_kwh": 0.48, "heats":  True, "stable_min": 12, "max_dur_min": 110, "supports_anti_crease": True},
         "40°C": {"duration_min":  90, "max_energy_kwh": 0.52, "heats":  True, "stable_min": 12, "max_dur_min": 110, "supports_anti_crease": True},
         "60°C": {"duration_min":  90, "max_energy_kwh": 0.55, "heats":  True, "stable_min": 12, "max_dur_min": 110, "supports_anti_crease": True},
     }},  # Manual: 60°C -> cold; intermediate temps 20–40
-    "outdoor":   {"label": "Outdoor",   "default_temp": "40°C", "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C"], "allowed_spin_speeds": SPIN_MAX_900, "default_temperature": "40°C", "default_spin": "900 rpm", "available_options": ["water_plus"], "by_temperature": {
+    "outdoor":   {"label": "Outdoor",   "default_temp": "40°C", "allowed_temperatures": ["Cold", "20°C", "30°C", "40°C"], "allowed_spin_speeds": SPIN_MAX_900, "default_temperature": "40°C", "default_spin": "900 rpm", "available_options": ["water_plus", "short"], "supports_short": True, "by_temperature": {
         "cold": {"duration_min":  50, "max_energy_kwh": 0.25, "heats": False, "stable_min": 10, "max_dur_min":  65, "supports_anti_crease": True},
         "20°C": {"duration_min":  50, "max_energy_kwh": 0.32, "heats":  True, "stable_min": 10, "max_dur_min":  65, "supports_anti_crease": True},
         "30°C": {"duration_min":  50, "max_energy_kwh": 0.36, "heats":  True, "stable_min": 10, "max_dur_min":  65, "supports_anti_crease": True},
@@ -158,6 +158,12 @@ def programme_has_temperature(profiles: dict, programme: str) -> bool:
     Only then do we persist/learn temperature; otherwise learn_key is just programme."""
     prof = profiles.get(programme, profiles.get("unknown", {}))
     return isinstance(prof, dict) and "by_temperature" in prof
+
+
+def supports_short(profiles: dict, programme: str) -> bool:
+    """True when Kort (Miele's shorter wash) can be selected for the programme. Ekspres 20 has it built in and has no switch."""
+    prof = profiles.get(programme)
+    return isinstance(prof, dict) and bool(prof.get("supports_short"))
 
 
 def learn_key_for(profiles: dict, programme: str, temperature) -> str:

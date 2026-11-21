@@ -22,13 +22,13 @@
 | Programme (manual) | Temp range | Max spin | Max load | Extras (manual) |
 |---|---|---|---|---|
 | ECO 40-60 (YAML label "ECO") | 40–60 °C (fixed pair) | 1400 | 7.0 kg | Vand +, Iblødsætning |
-| Bomuld | 90 °C → Cold | 1400 | 7.0 kg | Vand +, Iblødsætning, Forvask (selector position "Med forvask") |
-| Strygelet | 60 °C → Cold | 1200 | 3.5 kg | Vand +, Iblødsætning |
+| Bomuld | 90 °C → Cold | 1400 | 7.0 kg | Vand +, Iblødsætning, Kort, Forvask (selector position "Med forvask") |
+| Strygelet | 60 °C → Cold | 1200 | 3.5 kg | Vand +, Iblødsætning, Kort |
 | Uld  | 40 °C → Cold | 1200 | 2.0 kg | — |
-| Finvask | 40 °C → Cold | 900 | 2.0 kg | Vand +, Iblødsætning |
+| Finvask | 40 °C → Cold | 900 | 2.0 kg | Vand +, Iblødsætning, Kort |
 | Ekspres 20 (YAML label "Ekspres") | 40 °C → Cold | 1200 | 3.5 kg | Kort auto-active |
-| Mørkt/Denim | 60 °C → Cold | 1200 | 3.0 kg | Vand + |
-| Outdoor | 40 °C → Cold | 900 | 2.5 kg | Vand + (no fabric softener) |
+| Mørkt/Denim | 60 °C → Cold | 1200 | 3.0 kg | Vand +, Kort |
+| Outdoor | 40 °C → Cold | 900 | 2.5 kg | Vand + (no fabric softener), Kort |
 | Imprægnering | 40 °C fixed | 1200 | 2.5 kg | — (thermal after-treatment advised) |
 | Pumpe/Centrifugering | — | 1400 | — | drain-only when spin set to "no spin" |
 | Kun skyl/stivelse | — | 1400 | 7.0 kg | Vand + → second rinse |
@@ -54,6 +54,12 @@ Note the "max temp reached in textiles" column: a "60 °C" selection actually pe
 around 54 °C — temperature selections are targets, not guarantees.
 
 ## Behaviours the monitor cares about
+
+- **Kort:** shortens the programme by an amount the manual does not give. It is a switch on Bomuld, Strygelet, Finvask,
+  Mørkt/Denim and Outdoor (`supports_short` in `washer_programmes.yaml`), built in on Ekspres 20, and not offered on ECO,
+  Uld, Imprægnering or Kun skyl/stivelse. The record keeps it as `selected_options.short`; a Kort wash is never learned
+  as its plain programme (`short_selected`), and a run with Kort on expects the length of the household's Kort washes of
+  that programme and temperature, else an unconfirmed run's (`washer_eta.py`), not the table duration or the Bomuld tail.
 
 - **Antikrøl (anti-crease):** drum keeps moving up to **30 min** after programme end
   (setting: on by default, can be disabled). **Exception: Uld has none.** Door can be

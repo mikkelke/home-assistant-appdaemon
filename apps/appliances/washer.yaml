@@ -571,7 +571,11 @@ washer_monitor:
   # clean. Cycles with soak on are excluded from duration learning (see _save_cycle_feedback).
   option_soak_entity: input_boolean.washer_option_soak
   # option_prewash_entity: input_boolean.washer_option_prewash
-  # option_short_entity: input_boolean.washer_option_short
+  # Kort (shorter wash), for the programmes with supports_short in washer_programmes.yaml (Ekspres 20 has it built in).
+  # Stored in feedback like the other options, but a Kort wash is never learned as its plain programme. A run with Kort
+  # on expects the length of the household's Kort washes of that programme and temperature, else what an unconfirmed
+  # run expects (washer_eta.py), never the programme table or the Bomuld tail. Reset to off in _transition_to_off.
+  option_short_entity: input_boolean.washer_option_short
   #
   # Programme profiles (machine specs): loaded from washer_programmes.yaml in the same directory.
   # Override only with an in-container path: host /data/appdaemon is mounted at /conf, so a

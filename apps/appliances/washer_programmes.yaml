@@ -87,7 +87,7 @@ programmes:
     allowed_spin_speeds: ["1200 rpm", "900 rpm", "600 rpm", "No spin"]   # Manual: max 1200
     default_temperature: "30°C"
     default_spin: "1200 rpm"
-    available_options: ["water_plus", "soak"]
+    available_options: ["water_plus", "soak", "short"]
     duration_min: 119
     max_dur_min: 140
     max_energy_kwh: 0.52
@@ -101,7 +101,7 @@ programmes:
     supports_water_plus: true
     supports_soak: true
     supports_prewash: false
-    supports_short: false
+    supports_short: true
 
   finvask:
     label: "Finvask"
@@ -109,7 +109,7 @@ programmes:
     allowed_spin_speeds: ["900 rpm", "600 rpm", "No spin"]   # Manual: max 900
     default_temperature: "40°C"
     default_spin: "900 rpm"
-    available_options: ["water_plus", "soak"]
+    available_options: ["water_plus", "soak", "short"]
     duration_min: 65
     max_dur_min: 90
     nominal_duration_min: 65
@@ -123,7 +123,7 @@ programmes:
     supports_water_plus: true
     supports_soak: true
     supports_prewash: false
-    supports_short: false
+    supports_short: true
 
   ekspres:
     label: "Ekspres"
@@ -131,7 +131,7 @@ programmes:
     allowed_spin_speeds: ["1200 rpm", "900 rpm", "600 rpm", "No spin"]   # Manual: max 1200
     default_temperature: "40°C"
     default_spin: "1200 rpm"
-    available_options: ["short"]
+    available_options: []   # Kort is built into Ekspres 20, so it has no switch
     duration_min: 20
     max_dur_min: 30
     nominal_duration_min: 20
@@ -145,7 +145,7 @@ programmes:
     supports_water_plus: false
     supports_soak: false
     supports_prewash: false
-    supports_short: true
+    supports_short: false
 
   bomuld:
     label: "Bomuld"
@@ -153,7 +153,7 @@ programmes:
     allowed_spin_speeds: ["1400 rpm", "1200 rpm", "900 rpm", "600 rpm", "No spin"]
     default_temperature: "40°C"
     default_spin: "1400 rpm"
-    available_options: ["water_plus", "soak", "prewash"]
+    available_options: ["water_plus", "soak", "prewash", "short"]
     # Per-temp duration/energy from Python defaults; YAML adds validation bands (fallback when temp unknown)
     nominal_duration_min: 159
     min_valid_duration_min: 103
@@ -165,7 +165,7 @@ programmes:
     supports_water_plus: true
     supports_soak: true
     supports_prewash: true
-    supports_short: false
+    supports_short: true
     # Warm Bomuld 20/30: wider energy envelope + 15 min stable (soaks); merged into Python defaults.
     by_temperature:
       "20°C":
@@ -186,7 +186,7 @@ programmes:
     allowed_spin_speeds: ["1200 rpm", "900 rpm", "600 rpm", "No spin"]   # Manual: max 1200
     default_temperature: "60°C"
     default_spin: "1200 rpm"
-    available_options: ["water_plus"]
+    available_options: ["water_plus", "short"]
     duration_min: 90
     max_dur_min: 110
     nominal_duration_min: 90
@@ -200,7 +200,7 @@ programmes:
     supports_water_plus: true
     supports_soak: false
     supports_prewash: false
-    supports_short: false
+    supports_short: true
 
   outdoor:
     label: "Outdoor"
@@ -208,7 +208,7 @@ programmes:
     allowed_spin_speeds: ["900 rpm", "600 rpm", "No spin"]   # Manual: max 900
     default_temperature: "40°C"
     default_spin: "900 rpm"
-    available_options: ["water_plus"]
+    available_options: ["water_plus", "short"]
     duration_min: 50
     max_dur_min: 65
     nominal_duration_min: 50
@@ -222,7 +222,7 @@ programmes:
     supports_water_plus: true
     supports_soak: false
     supports_prewash: false
-    supports_short: false
+    supports_short: true
 
   impraegnering:
     label: "Imprægnering"
