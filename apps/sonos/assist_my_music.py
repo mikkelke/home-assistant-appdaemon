@@ -17,7 +17,8 @@ polled about every 30 s):
       group): the room joins that speaker, already there means nothing to do;
     - playing or paused elsewhere (a phone; Music Assistant's own Spotify stream does not count):
       the room's speaker plays the account's current track through Music Assistant with radio
-      mode, so similar songs follow, and a playing phone is paused, which moves the music;
+      mode, so similar songs follow (shuffle off, or the queue would not start with that track),
+      and a playing phone is paused, which moves the music;
     - idle: the account's last track, remembered by this app from every playing or paused state
       (persisted in state_file, seeded from the recorder for `recent_days` at startup), the same way;
     - nothing within recent_days: it says so.
@@ -123,9 +124,10 @@ def my_music_plan(person, speaker, speaker_state, account, account_state, last_i
     actions = []
     if len(_members(speaker_state)) > 1:
         actions.append({"event": "request_sonos_group_unjoin", "data": {"entity_id": speaker}})
-    play = {"service": "music_assistant/play_media",
-            "data": {"entity_id": speaker, "media_id": item["uri"], "radio_mode": True}}
-    actions.append(dict(play, delay=1) if actions else play)
+    delay = {"delay": 1} if actions else {}
+    actions.append({"service": "media_player/shuffle_set", "data": {"entity_id": speaker, "shuffle": False}, **delay})
+    actions.append({"service": "music_assistant/play_media",
+                    "data": {"entity_id": speaker, "media_id": item["uri"], "radio_mode": True}, **delay})
     song = song_text(item["title"], item["artist"])
     if item is current and current["state"] == "playing":
         actions.append({"service": "media_player/media_pause", "data": {"entity_id": account}})
