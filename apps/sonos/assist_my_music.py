@@ -252,7 +252,8 @@ class AssistMyMusic(hass.Hass):
         for row in reversed(rows if isinstance(rows, list) else []):
             item = item_from_state(row)
             if item:
-                item["at"] = row.get("last_updated") or row.get("last_changed")
+                at = row.get("last_updated") or row.get("last_changed")
+                item["at"] = at.isoformat() if isinstance(at, datetime) else str(at)
                 self.last[person] = item
                 self._save()
                 return
