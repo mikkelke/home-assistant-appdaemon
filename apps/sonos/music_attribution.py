@@ -20,15 +20,18 @@ Who started it:
    ``spotify_wait_seconds``; several (a Jam) are all named. "A guest" only when every resident's
    account is configured and available, none matched or plays the same track, and Spotify still
    plays at the deadline; otherwise "Someone". A resident whose account turns up playing on the
-   session's lead speaker after the row was written joined it (a Jam): the same row (its ``key``)
-   is re-sent naming them too, "Guest and Mikkel started Spotify in Kitchen". Names are never
-   removed.
+   session's lead speaker after the row was written joined it (a Jam): the same row is re-sent
+   naming them too, "Guest and Mikkel started Spotify in Kitchen". Names are never removed.
 3. AirPlay, Music Assistant's own app, line-in and the Sonos app expose no identity: "Someone".
 4. TV audio is not music: no row.
 
-Rows are text-only ``house_events_report`` events, scoped like manual_override_timeout's
-ROOM_AUDIENCE: a session touching a shared room is public, otherwise its rooms' occupants and the
-admins see it.
+Rows are text-only, public ``house_events_report`` events naming the rooms coordinator first:
+"Bathroom", "Bathroom and Bedroom", "Bathroom, Bedroom and Kitchen", or "the whole house" when every
+speaker plays. Each row carries a ``key`` and is re-sent in place when it grows: a speaker that
+joins the group led by the session's lead speaker is added to its rooms (and gets the session's
+start in ``sessions_sensor``), whoever grouped it; rooms are never removed. A session is followed
+until a new session starts on one of its speakers, for ``SESSION_TRACK_S``, or until AppDaemon
+restarts.
 
 Who stopped it: a speaker that leaves playing for idle, paused or off and is still not playing
 ``settle_seconds`` later stopped. A stopping service call (media_stop, media_pause, unjoin, ...)
@@ -91,17 +94,10 @@ HOUSE_LABEL = "the house"
 HA_SOMEONE_LABEL = "someone in Home Assistant"
 OUTSIDE_LABEL = "outside Home Assistant: an app, a speaker button, or the music ended"
 
-ROOM_AUDIENCE = {
-    "bedroom": {"audience": "admin"},
-    "bathroom": {"audience": "admin"},
-    "claudias_room": {"audience_users": ["Claudia"]},
-    "kristines_room": {"audience_users": ["Kristine"]},
-}
-
 WHAT = {"spotify": "Spotify", "airplay": "AirPlay"}
 GUEST = "Guest"
-# A session's row grows with joiners for at most this long after it started.
-SPOTIFY_TRACK_S = 12 * 3600
+# A session's row grows with joining rooms and residents for at most this long after it started.
+SESSION_TRACK_S = 12 * 3600
 # Stop matching: an account change this long before the stop still belongs to it; an unchanged
 # poll decides only from this long after it; an account this close to its track's end let it end.
 STOP_LOOKBACK_S = 5.0
@@ -212,13 +208,12 @@ def room_label(entity):
     return room_key(entity).replace("_", " ").strip().capitalize()
 
 
-def where_label(labels):
-    """Coordinator-first room labels -> 'Kitchen' or 'Kitchen + 3 more'."""
-    if not labels:
-        return "the house"
-    if len(labels) == 1:
-        return labels[0]
-    return f"{labels[0]} + {len(labels) - 1} more"
+def where_label(labels, total=None):
+    """Coordinator-first room labels -> 'Kitchen', 'Kitchen and Bedroom', 'Kitchen, Bedroom and
+    Bathroom', or 'the whole house' once they are all `total` speakers."""
+    if not labels or (total and len(labels) >= total):
+        return "the whole house"
+    return people_text(list(labels))
 
 
 def session_text(who, kind, where):
@@ -228,22 +223,6 @@ def session_text(who, kind, where):
 
 def icon_for(kind):
     return ICONS.get(kind, "mdi:music")
-
-
-def audience_for(room_keys):
-    """Feed audience for a session over these rooms: {} (public) as soon as one room is shared,
-    else the union of the rooms' occupants, or admin-only for admin-only rooms."""
-    users = []
-    for key in room_keys:
-        rule = ROOM_AUDIENCE.get(key)
-        if rule is None:
-            return {}
-        for user in rule.get("audience_users", []):
-            if user not in users:
-                users.append(user)
-    if users:
-        return {"audience_users": users}
-    return {"audience": "admin"} if room_keys else {}
 
 
 def device_key(name):
@@ -329,21 +308,25 @@ def spotify_is_guest(residents, accounts, states, still_spotify, track):
     return True
 
 
-class SpotifySession:
-    """One Spotify Connect session being attributed: who started it (`starter`: GUEST, "Someone" or
-    None when the starters are in `names`), the residents named, the speakers its row names and
-    the row's key."""
+class MusicSession:
+    """One music session with a feed row: what plays (`kind`), who started it (`starter`: GUEST,
+    "Someone" or None when the starters are in `names`), the residents named, the speakers its row
+    names (`members`, fixed once written; `joined` holds speakers that joined before that) and the
+    row's key. `accounts` marks a Spotify session whose row grows with residents' accounts."""
 
-    def __init__(self, speaker, group, run_ts):
+    def __init__(self, speaker, group, run_ts, kind="spotify"):
         self.speaker = speaker
         self.group = list(group)
         self.rooms = set(group) | {speaker}
         self.run_ts = run_ts
+        self.kind = kind
         self.lead_speaker = self.group[0] if self.group else speaker
         self.key = f"music:{speaker}:{int(run_ts)}"
         self.starter = None
         self.names = []
         self.members = None
+        self.joined = []
+        self.accounts = False
         self.written = False
 
 
@@ -460,7 +443,7 @@ class MusicAttribution(hass.Hass):
         self.spotify_poll_s = float(self.args.get("spotify_poll_seconds", 5))
         self.stop_watch_s = float(self.args.get("spotify_stop_watch_seconds", 40))
         self.refresh_min_s = float(self.args.get("spotify_refresh_min_seconds", 10))
-        self._spotify_sessions = []
+        self._sessions = []
         self._stop_watch = {}
         self._account_change = {}
         self._refreshed = {}
@@ -538,6 +521,7 @@ class MusicAttribution(hass.Hass):
         verdict = self.ledger.settle(speaker, run_ts, group)
         if verdict == "join":
             self._record_join(speaker, group[0])
+            self._grow_rooms(speaker, group[0])
             return
         if verdict == "resume":
             self._record_resume(speaker)
@@ -545,31 +529,37 @@ class MusicAttribution(hass.Hass):
         if verdict != "new":
             return
         rooms = set(group) | {speaker}
-        self._spotify_sessions = [
-            s for s in self._spotify_sessions if not (s.rooms & rooms) and run_ts - s.run_ts < SPOTIFY_TRACK_S
+        self._sessions = [
+            s for s in self._sessions if not (s.rooms & rooms) and run_ts - s.run_ts < SESSION_TRACK_S
         ]
         kind = content_kind(self._content(speaker), self._attr(speaker, "source"))
         if kind == "tv":
             return
         origin = self.ledger.origin_for(set(group) | {speaker}, run_ts)
+        if origin == HOUSE:
+            self.log(f"Session on {speaker} started by the house - no row", level="DEBUG")
+            self._record_start(group, HOUSE_LABEL, run_ts)
+            return
+        session = MusicSession(speaker, group, run_ts, kind)
+        self._sessions.append(session)
         if origin is not None:
-            if origin == HOUSE:
-                self.log(f"Session on {speaker} started by the house - no row", level="DEBUG")
-                self._record_start(group, HOUSE_LABEL, run_ts)
-                return
-            self._report(origin[1] or "Someone", kind, speaker, group, by=origin[1], run_ts=run_ts)
+            if origin[1]:
+                session.names = [origin[1]]
+            else:
+                session.starter = "Someone"
+            self._report_session(session)
             return
         if kind == "spotify" and self.spotify_accounts:
-            session = SpotifySession(speaker, group, run_ts)
-            self._spotify_sessions.append(session)
+            session.accounts = True
             self._refresh_accounts(self.spotify_accounts.values())
             self.run_in(self._spotify_poll, self.spotify_poll_s, session=session)
             return
-        self._report("Someone", kind, speaker, group, run_ts=run_ts)
+        session.starter = "Someone"
+        self._report_session(session)
 
     def _spotify_poll(self, kwargs):
         session = kwargs["session"]
-        if session not in self._spotify_sessions:
+        if session not in self._sessions:
             return
         speaker = session.speaker
         states = {entity: self._full_state(entity) for entity in self.spotify_accounts.values()}
@@ -601,11 +591,11 @@ class MusicAttribution(hass.Hass):
         if state.get("state") != "playing":
             return
         source = device_key((state.get("attributes") or {}).get("source"))
-        for session in list(self._spotify_sessions):
-            if not session.written or person in session.names:
+        for session in list(self._sessions):
+            if not session.accounts or not session.written or person in session.names:
                 continue
-            if self._now() - session.run_ts >= SPOTIFY_TRACK_S:
-                self._spotify_sessions.remove(session)
+            if self._now() - session.run_ts >= SESSION_TRACK_S:
+                self._sessions.remove(session)
                 continue
             lead = session.lead_speaker
             if not self.ledger.settled(lead) or content_kind(self._content(lead)) != "spotify":
@@ -615,7 +605,29 @@ class MusicAttribution(hass.Hass):
                 self.log(f"{person} joined the Spotify session on {lead}")
                 self._report_session(session)
 
+    def _grow_rooms(self, speaker, coordinator):
+        """`speaker` joined the group `coordinator` leads: the session led from there gains it."""
+        now = self._now()
+        for session in list(self._sessions):
+            if session.lead_speaker != coordinator:
+                continue
+            if now - session.run_ts >= SESSION_TRACK_S:
+                self._sessions.remove(session)
+                continue
+            session.rooms.add(speaker)
+            if session.written:
+                if speaker not in session.members:
+                    session.members.append(speaker)
+                    self.log(f"{speaker} joined the music session on {coordinator}")
+                    self._report_session(session)
+            elif speaker not in session.joined:
+                session.joined.append(speaker)
+
     def _report_session(self, session):
+        if session.members is None:
+            current = self._group(session.speaker) if self.ledger.playing(session.speaker) else []
+            members = current if len(current) >= len(session.group) else list(session.group)
+            session.members = members + [s for s in session.joined if s not in members]
         session.written = True
         names = list(session.names)
         starter = session.starter
@@ -626,10 +638,7 @@ class MusicAttribution(hass.Hass):
         else:
             who = people_text(names)
         by = names[0] if len(names) == 1 and not starter else None
-        session.members = self._report(
-            who, "spotify", session.speaker, session.group, by=by, run_ts=session.run_ts, key=session.key,
-            members=session.members,
-        )
+        self._report(who, session.kind, session.members, by, session.run_ts, session.key)
 
     def _settle_stop(self, kwargs):
         speaker = kwargs["speaker"]
@@ -741,8 +750,15 @@ class MusicAttribution(hass.Hass):
     # -- session records ----------------------------------------------------
 
     def _record_start(self, members, who, run_ts):
+        """Writes the session's start on its speakers. A speaker already holding this start keeps
+        its stop; one holding a newer session is left alone."""
+        started_at = iso(run_ts)
         for raw in members:
-            self.sessions[self.raw_to_base[raw]] = {"started_at": iso(run_ts), "started_by": who}
+            rec = self.sessions.get(self.raw_to_base[raw])
+            if rec and rec.get("started_at") == started_at:
+                rec["started_by"] = who
+            elif not rec or (parse_ts(rec.get("started_at")) or 0) < run_ts:
+                self.sessions[self.raw_to_base[raw]] = {"started_at": started_at, "started_by": who}
         self._publish()
 
     def _record_join(self, speaker, coordinator):
@@ -774,25 +790,19 @@ class MusicAttribution(hass.Hass):
 
     # -- reporting ----------------------------------------------------------
 
-    def _report(self, who, kind, speaker, group, by=None, run_ts=None, key=None, members=None):
-        """Fires the row and returns the speakers it names; `members` fixes them for a re-sent row."""
-        if members is None:
-            current = self._group(speaker) if self.ledger.playing(speaker) else []
-            members = current if len(current) >= len(group) else group
-        text = session_text(who, kind, where_label([room_label(self.raw_to_base[m]) for m in members]))
-        payload = {"text": text, "icon": icon_for(kind)}
-        payload.update(audience_for([room_key(self.raw_to_base[m]) for m in members]))
+    def _report(self, who, kind, members, by, run_ts, key):
+        """Fires the public feed row naming `members` and records the start on them."""
+        labels = [room_label(self.raw_to_base[m]) for m in members]
+        text = session_text(who, kind, where_label(labels, len(self.raw_to_base)))
+        payload = {"text": text, "icon": icon_for(kind), "key": key}
         if by:
             payload["by"] = by
-        if key:
-            payload["key"] = key
         self.log(f"Music session: {text}")
-        self._record_start(members, who, self._now() if run_ts is None else run_ts)
+        self._record_start(members, who, run_ts)
         try:
             self.fire_event("house_events_report", **payload)
         except Exception:
             pass
-        return members
 
     # -- HA state helpers ---------------------------------------------------
 

@@ -69,7 +69,7 @@ def make_app(spotify_accounts=None):
     app.settle_s = 5.0
     app.spotify_wait_s = 60.0
     app.spotify_poll_s = 5.0
-    app._spotify_sessions = []
+    app._sessions = []
     app.stop_watch_s = 40.0
     app.refresh_min_s = 10.0
     app._stop_watch = {}
@@ -244,7 +244,7 @@ class HouseExclusion(unittest.TestCase):
         set_speaker(app, "kitchen", "playing", MA_STREAM, group=["kitchen", "dining_room"])
         set_speaker(app, "dining_room", "playing", MA_STREAM, group=["kitchen", "dining_room"])
         advance(app, 10)
-        self.assertEqual([r["text"] for r in rows(app)], ["Claudia started music in Kitchen + 1 more"])
+        self.assertEqual([r["text"] for r in rows(app)], ["Claudia started music in Kitchen and Dining room"])
 
 
 class HaStarts(unittest.TestCase):
@@ -254,7 +254,8 @@ class HaStarts(unittest.TestCase):
         advance(app, 4)
         set_speaker(app, "kitchen", "playing", MA_STREAM)
         advance(app, 10)
-        self.assertEqual(rows(app), [{"text": "Kristine started music in Kitchen", "icon": "mdi:music", "by": "Kristine"}])
+        self.assertEqual(rows(app), [{"text": "Kristine started music in Kitchen", "icon": "mdi:music", "by": "Kristine",
+                                      "key": "music:media_player.kitchen_2:100004"}])
 
     def test_raw_entity_target_counts(self):
         app = make_app()
@@ -282,7 +283,8 @@ class HaStarts(unittest.TestCase):
         advance(app, 3)
         set_speaker(app, "rooftop", "playing", MA_STREAM)
         advance(app, 10)
-        self.assertEqual(rows(app), [{"text": "Someone started music in Rooftop", "icon": "mdi:music"}])
+        self.assertEqual(rows(app), [{"text": "Someone started music in Rooftop", "icon": "mdi:music",
+                                      "key": "music:media_player.rooftop_2:100003"}])
 
     def test_call_outside_the_window_is_ignored(self):
         app = make_app()
@@ -311,7 +313,8 @@ class HaStarts(unittest.TestCase):
         set_speaker(app, "bathroom", "playing", "x-sonos-vli:RINCON_F0F6C1A5264A01400:1,airplay:164e173d3f26")
         advance(app, 10)
         self.assertEqual(
-            rows(app), [{"text": "Someone started AirPlay in Bathroom", "icon": "mdi:airplay", "audience": "admin"}]
+            rows(app), [{"text": "Someone started AirPlay in Bathroom", "icon": "mdi:airplay",
+                         "key": "music:media_player.bathroom_2:100000"}]
         )
 
 
@@ -324,7 +327,9 @@ class Sessions(unittest.TestCase):
         set_speaker(app, "kitchen", "playing", SPOTIFY, group=["kitchen"])
         app.states[raw("kitchen")]["attributes"]["group_members"] = [raw("living_room"), raw("kitchen")]
         advance(app, 10)
-        self.assertEqual(len(rows(app)), 1)
+        self.assertEqual([r["text"] for r in rows(app)],
+                         ["Someone started Spotify in Living room", "Someone started Spotify in Living room and Kitchen"])
+        self.assertEqual(len({r["key"] for r in rows(app)}), 1)
 
     def test_group_starting_together_is_one_session(self):
         app = make_app()
@@ -334,7 +339,7 @@ class Sessions(unittest.TestCase):
         set_speaker(app, "living_room", "playing", SPOTIFY, group=group)
         set_speaker(app, "dining_room", "playing", SPOTIFY, group=group)
         advance(app, 10)
-        self.assertEqual([r["text"] for r in rows(app)], ["Someone started Spotify in Living room + 2 more"])
+        self.assertEqual([r["text"] for r in rows(app)], ["Someone started Spotify in Living room, Kitchen and Dining room"])
 
     def test_resume_inside_idle_window_is_same_session(self):
         app = make_app()
@@ -506,7 +511,7 @@ class Spotify(unittest.TestCase):
         spotify_account(app, "Kristine", "playing", source="Kitchen + 2")
         advance(app, 10)
         self.assertEqual(
-            rows(app), [{"text": "Kristine started Spotify in Kitchen + 2 more", "icon": "mdi:spotify", "by": "Kristine", "key": KEY}]
+            rows(app), [{"text": "Kristine started Spotify in Kitchen, Dining room and Rooftop", "icon": "mdi:spotify", "by": "Kristine", "key": KEY}]
         )
 
     def test_row_names_the_group_as_it_stands_at_the_match(self):
@@ -520,7 +525,7 @@ class Spotify(unittest.TestCase):
             app.states[raw(room)]["attributes"]["group_members"] = [raw(g) for g in group]
         spotify_account(app, "Mikkel", "playing", source="Living Room + 2")
         advance(app, 10)
-        self.assertEqual(rows(app)[0]["text"], "Mikkel started Spotify in Living room + 2 more")
+        self.assertEqual(rows(app)[0]["text"], "Mikkel started Spotify in Living room, Kitchen and Dining room")
 
     def test_match_is_tolerant_of_case_and_punctuation(self):
         keys = {ma.device_key("Claudias room")}
@@ -725,6 +730,108 @@ class SpotifyJam(unittest.TestCase):
         self.assertNotEqual(rows(app)[0]["key"], rows(app)[1]["key"])
 
 
+class RoomsJoin(unittest.TestCase):
+    """A room that joins the session's group after its row is written grows the same row."""
+
+    def join(self, app, room, group):
+        for r in group:
+            app.states[raw(r)]["attributes"]["group_members"] = [raw(g) for g in group]
+        set_speaker(app, room, "playing", SPOTIFY, group=group, source="Spotify Connect")
+
+    def bathroom_session(self):
+        # 21.11: Bathroom started 16:23:16, row 16:23:26.6, Bedroom joined 16:23:27.85.
+        app = make_app(ACCOUNTS)
+        for person in ACCOUNTS:
+            spotify_account(app, person, "idle")
+        set_speaker(app, "bathroom", "playing", SPOTIFY, source="Spotify Connect", title="Song")
+        advance(app, 8)
+        spotify_account(app, "Mikkel", "playing", source="Bathroom", title="Song")
+        advance(app, 2.6)
+        return app
+
+    def test_room_joining_right_after_the_row_is_added(self):
+        app = self.bathroom_session()
+        self.join(app, "bedroom", ["bathroom", "bedroom"])
+        advance(app, 6)
+        self.assertEqual([r["text"] for r in rows(app)],
+                         ["Mikkel started Spotify in Bathroom", "Mikkel started Spotify in Bathroom and Bedroom"])
+        self.assertEqual({r["key"] for r in rows(app)}, {"music:media_player.bathroom_2:100000"})
+        self.assertEqual(rows(app)[1]["by"], "Mikkel")
+        self.assertNotIn("audience", rows(app)[1])
+        start = app.sessions["media_player.bathroom"]
+        self.assertEqual(app.sessions["media_player.bedroom"], start)
+        self.assertEqual(start["started_by"], "Mikkel")
+
+    def test_room_joining_before_the_row_is_in_it(self):
+        app = make_app(ACCOUNTS)
+        for person in ACCOUNTS:
+            spotify_account(app, person, "idle")
+        set_speaker(app, "bathroom", "playing", SPOTIFY, source="Spotify Connect")
+        advance(app, 6)
+        self.join(app, "bedroom", ["bathroom", "bedroom"])
+        advance(app, 6)
+        app.states[raw("bedroom")]["attributes"]["group_members"] = [raw("bedroom")]
+        app.states[raw("bathroom")]["attributes"]["group_members"] = [raw("bathroom")]
+        spotify_account(app, "Mikkel", "playing", source="Bathroom")
+        advance(app, 6)
+        self.assertEqual([r["text"] for r in rows(app)], ["Mikkel started Spotify in Bathroom and Bedroom"])
+
+    def test_later_join_and_a_leave(self):
+        app = self.bathroom_session()
+        advance(app, 600)
+        self.join(app, "kitchen", ["bathroom", "kitchen"])
+        advance(app, 6)
+        set_speaker(app, "kitchen", "idle", SPOTIFY, group=["kitchen"])
+        app.states[raw("bathroom")]["attributes"]["group_members"] = [raw("bathroom")]
+        advance(app, 6)
+        self.join(app, "bedroom", ["bathroom", "bedroom"])
+        advance(app, 6)
+        self.assertEqual([r["text"] for r in rows(app)], [
+            "Mikkel started Spotify in Bathroom",
+            "Mikkel started Spotify in Bathroom and Kitchen",
+            "Mikkel started Spotify in Bathroom, Kitchen and Bedroom",
+        ])
+        self.assertEqual(app.sessions["media_player.kitchen"]["started_by"], "Mikkel")
+        self.assertIn("stopped_at", app.sessions["media_player.kitchen"])
+
+    def test_every_speaker_is_the_whole_house(self):
+        app = self.bathroom_session()
+        house = ["bathroom"] + [r for r in ROOMS if r != "bathroom"]
+        for room in house[1:]:
+            self.join(app, room, house)
+        advance(app, 6)
+        self.assertEqual(rows(app)[-1]["text"], "Mikkel started Spotify in the whole house")
+
+    def test_room_moving_to_another_session_is_not_added(self):
+        app = self.bathroom_session()
+        set_speaker(app, "kitchen", "playing", MA_STREAM)
+        advance(app, 10)
+        self.join(app, "bedroom", ["kitchen", "bedroom"])
+        advance(app, 6)
+        texts = [r["text"] for r in rows(app)]
+        self.assertEqual(texts, ["Mikkel started Spotify in Bathroom", "Someone started music in Kitchen",
+                                 "Someone started music in Kitchen and Bedroom"])
+        self.assertEqual(app.sessions["media_player.bedroom"]["started_by"], "Someone")
+
+    def test_house_start_on_the_lead_ends_the_old_session(self):
+        app = self.bathroom_session()
+        set_speaker(app, "bathroom", "idle", SPOTIFY)
+        advance(app, 1500)
+        call(app, "play_media", user_id=APPDAEMON, entity_id=["media_player.bathroom"], media_content_id="x")
+        set_speaker(app, "bathroom", "playing", MA_STREAM)
+        advance(app, 6)
+        self.join(app, "bedroom", ["bathroom", "bedroom"])
+        advance(app, 6)
+        self.assertEqual(len(rows(app)), 1)
+
+    def test_tracking_ends_after_12_h(self):
+        app = self.bathroom_session()
+        advance(app, 12 * 3600)
+        self.join(app, "bedroom", ["bathroom", "bedroom"])
+        advance(app, 6)
+        self.assertEqual(len(rows(app)), 1)
+
+
 class SpotifyStop(unittest.TestCase):
     """Who stopped Spotify: the 20.11 stops on Kitchen + 6 replayed."""
 
@@ -907,7 +1014,9 @@ class SpotifyStop(unittest.TestCase):
 class GroupNaming(unittest.TestCase):
     def test_where_label(self):
         self.assertEqual(ma.where_label(["Kitchen"]), "Kitchen")
-        self.assertEqual(ma.where_label(["Kitchen", "Dining room", "Living room", "Rooftop"]), "Kitchen + 3 more")
+        self.assertEqual(ma.where_label(["Bathroom", "Bedroom"], 9), "Bathroom and Bedroom")
+        self.assertEqual(ma.where_label(["Bathroom", "Bedroom", "Kitchen"], 9), "Bathroom, Bedroom and Kitchen")
+        self.assertEqual(ma.where_label([f"Room {i}" for i in range(9)], 9), "the whole house")
 
     def test_room_label(self):
         self.assertEqual(ma.room_label("media_player.claudias_room"), "Claudias room")
@@ -921,7 +1030,7 @@ class GroupNaming(unittest.TestCase):
 
     def test_session_text_is_ascii(self):
         self.assertEqual(
-            ma.session_text("Kristine", "spotify", "Kitchen + 3 more"), "Kristine started Spotify in Kitchen + 3 more"
+            ma.session_text("Kristine", "spotify", "Kitchen and Bedroom"), "Kristine started Spotify in Kitchen and Bedroom"
         )
         self.assertEqual(ma.session_text("Someone", "other", "Køkken"), "Someone started music in Kkken")
 
@@ -934,7 +1043,7 @@ class GroupNaming(unittest.TestCase):
         for room in group:
             app.states[raw(room)]["attributes"]["group_members"] = [raw(g) for g in group]
         advance(app, 10)
-        self.assertEqual(rows(app)[0]["text"], "Mikkel started music in Living room + 3 more")
+        self.assertEqual(rows(app)[0]["text"], "Mikkel started music in Living room, Kitchen, Dining room and Rooftop")
 
     def test_content_kind(self):
         self.assertEqual(ma.content_kind(SPOTIFY), "spotify")
@@ -947,30 +1056,14 @@ class GroupNaming(unittest.TestCase):
 
 
 class Audience(unittest.TestCase):
-    def test_private_rooms(self):
-        self.assertEqual(ma.audience_for(["kristines_room"]), {"audience_users": ["Kristine"]})
-        self.assertEqual(ma.audience_for(["claudias_room"]), {"audience_users": ["Claudia"]})
-        self.assertEqual(ma.audience_for(["bedroom"]), {"audience": "admin"})
-        self.assertEqual(ma.audience_for(["bedroom", "bathroom"]), {"audience": "admin"})
-
-    def test_mixed_private_rooms_union_their_occupants(self):
-        self.assertEqual(ma.audience_for(["bedroom", "claudias_room"]), {"audience_users": ["Claudia"]})
-        self.assertEqual(
-            ma.audience_for(["claudias_room", "kristines_room"]), {"audience_users": ["Claudia", "Kristine"]}
-        )
-
-    def test_any_shared_room_is_public(self):
-        self.assertEqual(ma.audience_for(["kitchen"]), {})
-        self.assertEqual(ma.audience_for(["bedroom", "kitchen"]), {})
-        self.assertEqual(ma.audience_for(["guest_bathroom"]), {})
-
-    def test_row_carries_the_audience(self):
+    def test_private_room_rows_are_public(self):
         app = make_app()
         call(app, "media_play", user_id=KRISTINE, entity_id=["media_player.kristines_room"])
         advance(app, 3)
         set_speaker(app, "kristines_room", "playing", MA_STREAM)
         advance(app, 10)
-        self.assertEqual(rows(app)[0]["audience_users"], ["Kristine"])
+        self.assertEqual(rows(app), [{"text": "Kristine started music in Kristines room", "icon": "mdi:music",
+                                      "by": "Kristine", "key": "music:media_player.kristines_room_2:100003"}])
 
 
 if __name__ == "__main__":
