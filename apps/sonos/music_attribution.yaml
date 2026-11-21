@@ -48,3 +48,8 @@ MusicAttribution:
   call_window_seconds: 30
   spotify_wait_seconds: 60
   spotify_poll_seconds: 5
+  # A Spotify stop from outside HA waits this long for the accounts' polls to name who stopped it.
+  spotify_stop_watch_seconds: 40
+  # On-demand account refreshes: at most one per account per this many seconds (HA's own
+  # refresh cooldown for the Spotify coordinator is 10 s).
+  spotify_refresh_min_seconds: 10

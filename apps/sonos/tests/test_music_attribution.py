@@ -70,6 +70,12 @@ def make_app(spotify_accounts=None):
     app.spotify_wait_s = 60.0
     app.spotify_poll_s = 5.0
     app._spotify_sessions = []
+    app.stop_watch_s = 40.0
+    app.refresh_min_s = 10.0
+    app._stop_watch = {}
+    app._account_change = {}
+    app._refreshed = {}
+    app.refreshes = []
     app.ledger = ma.PlaybackLedger(idle_s=1200, call_window_s=30)
     app._person_by_user_id = {}
     app.sessions_sensor = "sensor.music_sessions"
@@ -101,6 +107,7 @@ def make_app(spotify_accounts=None):
     app.run_in = run_in
     app.fire_event = lambda name, **kw: app.events.append((name, kw))
     app.set_state = lambda entity, **kw: app.published.append((entity, kw))
+    app.call_service = lambda service, **kw: app.refreshes.append((app.clock, service, sorted(kw["entity_id"])))
     app.log = lambda *a, **k: None
 
     app.states["person.mikkel"] = {"state": "home", "attributes": {"friendly_name": "Mikkel", "user_id": MIKKEL}}
@@ -716,6 +723,185 @@ class SpotifyJam(unittest.TestCase):
         self.assertEqual([r["text"] for r in rows(app)],
                          ["Mikkel started Spotify in Kitchen", "Kristine started Spotify in Kitchen"])
         self.assertNotEqual(rows(app)[0]["key"], rows(app)[1]["key"])
+
+
+class SpotifyStop(unittest.TestCase):
+    """Who stopped Spotify: the 20.11 stops on Kitchen + 6 replayed."""
+
+    def account(self, app, person, state, source=None, title="Song", position=None, duration=None):
+        old = app.states.get(ACCOUNTS[person])
+        attrs = {"media_title": title}
+        if source:
+            attrs["source"] = source
+        if position is not None:
+            attrs.update(media_position=position, media_duration=duration,
+                         media_position_updated_at=datetime.fromtimestamp(app.clock, tz=timezone.utc).isoformat())
+        app.states[ACCOUNTS[person]] = {"state": state, "attributes": attrs}
+        app._on_account(ACCOUNTS[person], "all", old, app.states[ACCOUNTS[person]], {})
+
+    def playing(self, app, group=("kitchen", "dining_room"), **mikkel):
+        app = app or make_app(ACCOUNTS)
+        for person in ACCOUNTS:
+            self.account(app, person, "idle")
+        for room in group:
+            set_speaker(app, room, "playing", SPOTIFY, group=list(group), source="Spotify Connect", title="Song")
+        self.account(app, "Mikkel", "playing", source=f"Kitchen + {len(group) - 1}", **mikkel)
+        advance(app, 300)
+        app.refreshes.clear()
+        return app
+
+    def stop(self, app, group=("kitchen", "dining_room"), state="paused"):
+        for room in group:
+            set_speaker(app, room, state, SPOTIFY, group=list(group), source="Spotify Connect")
+
+    def stopped_by(self, app, room="kitchen"):
+        return app.sessions[f"media_player.{room}"].get("stopped_by")
+
+    def test_pause_after_the_stop_names_the_account(self):
+        app = self.playing(None)
+        self.stop(app)
+        advance(app, 8.8)
+        self.account(app, "Mikkel", "paused", source="Kitchen + 1")
+        self.assertEqual(self.stopped_by(app), "Mikkel")
+        self.assertEqual(self.stopped_by(app, "dining_room"), "Mikkel")
+
+    def test_unrefreshed_pause_at_29_s_still_counts(self):
+        app = self.playing(None)
+        self.stop(app)
+        advance(app, 29.8)
+        self.assertEqual(self.stopped_by(app), ma.OUTSIDE_LABEL)
+        self.account(app, "Mikkel", "paused", source="Kitchen + 1")
+        self.assertEqual(self.stopped_by(app), "Mikkel")
+
+    def test_move_to_the_phone_names_the_account(self):
+        app = self.playing(None)
+        self.stop(app, state="idle")
+        advance(app, 24.8)
+        self.account(app, "Mikkel", "playing", source="OPPO Find X9 Pro")
+        self.assertEqual(self.stopped_by(app), "Mikkel")
+
+    def test_first_poll_still_on_the_speaker_decides_no(self):
+        # 20.11 19:03Z: still on Kitchen at +9.7 s, an unrelated move to the iPhone at +39.8 s.
+        app = self.playing(None)
+        self.stop(app, state="idle")
+        advance(app, 9.7)
+        self.account(app, "Mikkel", "playing", source="Kitchen + 1")
+        advance(app, 30.1)
+        self.account(app, "Mikkel", "playing", source="iPhone")
+        advance(app, 10)
+        self.assertEqual(self.stopped_by(app), ma.OUTSIDE_LABEL)
+
+    def test_track_end_is_not_a_stop_by_the_account(self):
+        app = self.playing(None, position=10.0, duration=311.0)
+        self.stop(app, state="idle")
+        advance(app, 1)
+        self.account(app, "Mikkel", "paused", source="Kitchen + 1")
+        advance(app, 60)
+        self.assertEqual(self.stopped_by(app), ma.OUTSIDE_LABEL)
+
+    def test_pause_mid_track_counts(self):
+        app = self.playing(None, position=10.0, duration=400.0)
+        self.stop(app)
+        advance(app, 6)
+        self.account(app, "Mikkel", "paused", source="Kitchen + 1")
+        self.assertEqual(self.stopped_by(app), "Mikkel")
+
+    def test_account_not_on_the_speaker_is_not_named(self):
+        app = self.playing(None)
+        self.account(app, "Mikkel", "playing", source="OPPO Find X9 Pro")
+        advance(app, 60)
+        self.stop(app)
+        advance(app, 8)
+        self.account(app, "Mikkel", "paused", source="OPPO Find X9 Pro")
+        advance(app, 60)
+        self.assertEqual(self.stopped_by(app), ma.OUTSIDE_LABEL)
+        self.assertEqual(app.refreshes, [])
+
+    def test_ungrouped_member_stopping_is_not_the_group_account(self):
+        app = self.playing(None)
+        set_speaker(app, "dining_room", "idle", SPOTIFY, group=["dining_room"], source="Spotify Connect")
+        advance(app, 8)
+        self.account(app, "Mikkel", "playing", source="Kitchen")
+        advance(app, 60)
+        self.assertEqual(self.stopped_by(app, "dining_room"), ma.OUTSIDE_LABEL)
+
+    def test_jam_names_every_account_that_paused(self):
+        app = self.playing(None)
+        self.account(app, "Kristine", "playing", source="Kitchen + 1")
+        advance(app, 30)
+        self.stop(app)
+        advance(app, 6)
+        self.account(app, "Kristine", "paused", source="Jam Session")
+        self.assertEqual(self.stopped_by(app), ma.OUTSIDE_LABEL)
+        advance(app, 6)
+        self.account(app, "Mikkel", "paused", source="Jam Session")
+        self.assertEqual(self.stopped_by(app), "Mikkel and Kristine")
+
+    def test_resume_before_the_decision_drops_it(self):
+        app = self.playing(None)
+        self.stop(app)
+        advance(app, 7)
+        for room in ("kitchen", "dining_room"):
+            set_speaker(app, room, "playing", SPOTIFY, group=["kitchen", "dining_room"], source="Spotify Connect")
+        self.account(app, "Mikkel", "paused", source="Kitchen + 1")
+        advance(app, 60)
+        self.assertNotIn("stopped_by", app.sessions["media_player.kitchen"])
+
+    def test_ha_call_wins_over_the_account(self):
+        app = self.playing(None)
+        call(app, "media_pause", user_id=KRISTINE, entity_id=["media_player.kitchen"])
+        self.stop(app)
+        advance(app, 8)
+        self.account(app, "Mikkel", "paused", source="Kitchen + 1")
+        self.assertEqual(self.stopped_by(app), "Kristine")
+        self.assertEqual(app.refreshes, [])
+
+    def test_change_just_before_the_stop_counts(self):
+        app = self.playing(None)
+        self.account(app, "Mikkel", "paused", source="Kitchen + 1")
+        advance(app, 1)
+        self.stop(app)
+        advance(app, 6)
+        self.assertEqual(self.stopped_by(app), "Mikkel")
+
+    def test_stop_refreshes_the_candidates_twice_at_most(self):
+        app = self.playing(None)
+        stop_ts = app.clock
+        self.stop(app)
+        advance(app, 60)
+        self.assertEqual(app.refreshes, [(stop_ts + 5, "homeassistant/update_entity", [ACCOUNTS["Mikkel"]]),
+                                         (stop_ts + 15, "homeassistant/update_entity", [ACCOUNTS["Mikkel"]])])
+
+    def test_start_refreshes_every_account_once_per_10_s(self):
+        app = make_app(ACCOUNTS)
+        for person in ACCOUNTS:
+            spotify_account(app, person, "idle")
+        start = app.clock
+        set_speaker(app, "kitchen", "playing", SPOTIFY, source="Spotify Connect", title="Song")
+        set_speaker(app, "dining_room", "playing", SPOTIFY, source="Spotify Connect", title="Song")
+        advance(app, 90)
+        times = [t - start for t, _, _ in app.refreshes]
+        self.assertEqual(times, [5, 15, 25, 35, 45, 55])
+        self.assertEqual(app.refreshes[0][2], sorted(ACCOUNTS.values()))
+
+    def test_start_refresh_ends_at_the_match(self):
+        app = make_app(ACCOUNTS)
+        for person in ACCOUNTS:
+            spotify_account(app, person, "idle")
+        set_speaker(app, "kitchen", "playing", SPOTIFY, source="Spotify Connect", title="Song")
+        advance(app, 6)
+        spotify_account(app, "Mikkel", "playing", source="Kitchen")
+        advance(app, 120)
+        self.assertEqual(len(app.refreshes), 1)
+
+    def test_stop_verdict(self):
+        before = {"state": "playing", "attributes": {"source": "Kitchen + 6"}}
+        house = {"kitchen", "diningroom"}
+        self.assertTrue(ma.stop_verdict(before, {"state": "idle", "attributes": {}}, 0, house))
+        self.assertTrue(ma.stop_verdict(before, {"state": "playing", "attributes": {"source": "iPhone"}}, 0, house))
+        self.assertFalse(ma.stop_verdict(before, {"state": "playing", "attributes": {"source": "Dining Room + 5"}},
+                                         0, house))
+        self.assertIsNone(ma.stop_verdict(before, {"state": "unavailable", "attributes": {}}, 0, house))
 
 
 class GroupNaming(unittest.TestCase):

@@ -36,6 +36,18 @@ on it or its group within ``call_window_seconds`` before names a resident or the
 starts; without one the stop came from outside Home Assistant (the Sonos or Music Assistant app,
 a speaker button, or the music ending). Stops get no feed row.
 
+A Spotify stop from outside Home Assistant names the residents whose account was playing on the
+stopped group's device just before it and whose first poll from ``STOP_DECIDE_FROM_S`` after the
+stop (or a change from ``STOP_LOOKBACK_S`` before it) shows it paused, idle or playing on a device
+that is not a house speaker; an account that was at the end of its track (``TRACK_END_S``) let
+the music end. Several are all named; accounts still undecided after ``spotify_stop_watch_seconds``
+are not.
+
+The account entities poll Spotify every 30 s. While a Spotify start waits for its account and
+right after a Spotify stop with candidates, the app asks Home Assistant to refresh them
+(homeassistant.update_entity), at most once per ``spotify_refresh_min_seconds`` per account, which
+is also the cooldown Home Assistant's own refresh debouncer applies.
+
 ``sessions_sensor`` holds, per Music Assistant speaker entity, when its current or last session
 started and who started it, and when and by whom it stopped, so the house status can answer who
 started or stopped the music.
@@ -90,6 +102,11 @@ WHAT = {"spotify": "Spotify", "airplay": "AirPlay"}
 GUEST = "Guest"
 # A session's row grows with joiners for at most this long after it started.
 SPOTIFY_TRACK_S = 12 * 3600
+# Stop matching: an account change this long before the stop still belongs to it; an unchanged
+# poll decides only from this long after it; an account this close to its track's end let it end.
+STOP_LOOKBACK_S = 5.0
+STOP_DECIDE_FROM_S = 3.0
+TRACK_END_S = 3.0
 ICONS = {"spotify": "mdi:spotify", "airplay": "mdi:airplay", "line_in": "mdi:cast-audio"}
 
 
@@ -262,6 +279,33 @@ def spotify_matches(accounts, states, device_keys):
     return hits
 
 
+def account_view(state):
+    """(state, device key) of a Spotify account state dict - what a change means."""
+    state = state if isinstance(state, dict) else {}
+    return state.get("state"), device_key((state.get("attributes") or {}).get("source"))
+
+
+def track_ended(state, at_ts):
+    """True when the account's playing state had at most TRACK_END_S of its track left at at_ts."""
+    attrs = (state or {}).get("attributes") or {}
+    position, duration = attrs.get("media_position"), attrs.get("media_duration")
+    updated = parse_ts(attrs.get("media_position_updated_at"))
+    if not isinstance(position, (int, float)) or not isinstance(duration, (int, float)) or updated is None:
+        return False
+    return position + (at_ts - updated) >= duration - TRACK_END_S
+
+
+def stop_verdict(before, after, stop_ts, house_keys):
+    """Did this account stop the speaker? `before` is its playing state on the speaker just before
+    the stop, `after` a later poll. True, False, or None while it says nothing (unavailable)."""
+    state, key = account_view(after)
+    if state in UNKNOWN_STATES:
+        return None
+    if state == "playing":
+        return key not in house_keys
+    return not track_ended(before, stop_ts)
+
+
 def people_text(names):
     """'Mikkel', 'Mikkel and Kristine', 'Mikkel, Kristine and Claudia'."""
     return ", ".join(names[:-1]) + (" and " if len(names) > 1 else "") + names[-1]
@@ -414,7 +458,12 @@ class MusicAttribution(hass.Hass):
         self.settle_s = float(self.args.get("settle_seconds", 5))
         self.spotify_wait_s = float(self.args.get("spotify_wait_seconds", 60))
         self.spotify_poll_s = float(self.args.get("spotify_poll_seconds", 5))
+        self.stop_watch_s = float(self.args.get("spotify_stop_watch_seconds", 40))
+        self.refresh_min_s = float(self.args.get("spotify_refresh_min_seconds", 10))
         self._spotify_sessions = []
+        self._stop_watch = {}
+        self._account_change = {}
+        self._refreshed = {}
         self.ledger = PlaybackLedger(
             idle_s=float(self.args.get("session_idle_minutes", 20)) * 60.0,
             call_window_s=float(self.args.get("call_window_seconds", 30)),
@@ -452,10 +501,14 @@ class MusicAttribution(hass.Hass):
 
     def _on_speaker(self, entity, attribute, old, new, kwargs):
         ts = self._now()
+        if new == "playing":
+            self._stop_watch.pop(entity, None)
         if self.ledger.transition(entity, old, new, ts):
             self.run_in(self._settle, self.settle_s, speaker=entity, run_ts=ts)
         elif old == "playing" and new in STOPPED_STATES:
-            self.run_in(self._settle_stop, self.settle_s, speaker=entity, stop_ts=ts, group=self._group(entity))
+            group = self._group(entity)
+            self._watch_stop(entity, group, ts)
+            self.run_in(self._settle_stop, self.settle_s, speaker=entity, stop_ts=ts, group=group)
 
     def _on_call(self, event_name, data, kwargs):
         try:
@@ -509,6 +562,7 @@ class MusicAttribution(hass.Hass):
         if kind == "spotify" and self.spotify_accounts:
             session = SpotifySession(speaker, group, run_ts)
             self._spotify_sessions.append(session)
+            self._refresh_accounts(self.spotify_accounts.values())
             self.run_in(self._spotify_poll, self.spotify_poll_s, session=session)
             return
         self._report("Someone", kind, speaker, group, run_ts=run_ts)
@@ -525,6 +579,7 @@ class MusicAttribution(hass.Hass):
             self._report_session(session)
             return
         if self._now() < session.run_ts + self.spotify_wait_s:
+            self._refresh_accounts(self.spotify_accounts.values())
             self.run_in(self._spotify_poll, self.spotify_poll_s, session=session)
             return
         still_spotify = self.ledger.playing(speaker) and content_kind(self._content(speaker)) == "spotify"
@@ -535,10 +590,15 @@ class MusicAttribution(hass.Hass):
 
     def _on_account(self, entity, attribute, old, new, kwargs):
         """A resident whose account turns up playing on a session's speaker after its row is written
-        joined it: the row grows to name them."""
+        joined it: the row grows to name them. Every poll also feeds the Spotify stop watch."""
         state = new if isinstance(new, dict) else {}
         person = next((p for p, e in self.spotify_accounts.items() if e == entity), None)
-        if person is None or state.get("state") != "playing":
+        if person is None:
+            return
+        if account_view(old) != account_view(state):
+            self._account_change[entity] = (self._now(), old if isinstance(old, dict) else {})
+        self._stop_poll(person, state)
+        if state.get("state") != "playing":
             return
         source = device_key((state.get("attributes") or {}).get("source"))
         for session in list(self._spotify_sessions):
@@ -583,6 +643,100 @@ class MusicAttribution(hass.Hass):
         rec.update(stopped_at=iso(kwargs["stop_ts"]), stopped_by=origin_label(origin))
         self.log(f"Music stopped on {speaker}: {rec['stopped_by']}")
         self._publish()
+        watch = self._stop_watch.get(speaker)
+        if watch is None or watch["stop_ts"] != kwargs["stop_ts"]:
+            return
+        if origin is not None:
+            del self._stop_watch[speaker]
+            return
+        watch["settled"] = True
+        if not self._stop_done(speaker):
+            self._refresh_accounts(self._undecided(watch))
+            self.run_in(self._stop_refresh, 10, speaker=speaker, stop_ts=watch["stop_ts"])
+            self.run_in(self._stop_deadline, max(0.0, watch["stop_ts"] + self.stop_watch_s - self._now()),
+                        speaker=speaker, stop_ts=watch["stop_ts"])
+
+    # -- who stopped Spotify ------------------------------------------------
+
+    def _watch_stop(self, speaker, group, stop_ts):
+        """Spotify stop on `speaker`: note the accounts that were playing on its group's device
+        just before, and any that changed in the last STOP_LOOKBACK_S."""
+        if not self.spotify_accounts or content_kind(self._content(speaker), self._attr(speaker, "source")) != "spotify":
+            return
+        keys = self._device_keys(group)
+        candidates, decided = {}, {}
+        for person, entity in self.spotify_accounts.items():
+            current = self._full_state(entity)
+            change = self._account_change.get(entity)
+            early = change is not None and stop_ts - change[0] <= STOP_LOOKBACK_S
+            before = change[1] if early else current
+            view = account_view(before)
+            if view[0] != "playing" or view[1] not in keys:
+                continue
+            candidates[person] = before
+            if early:
+                verdict = stop_verdict(before, current, stop_ts, self._house_keys())
+                if verdict is not None:
+                    decided[person] = verdict
+        if candidates:
+            self._stop_watch[speaker] = {"stop_ts": stop_ts, "candidates": candidates, "decided": decided,
+                                         "settled": False}
+
+    def _undecided(self, watch):
+        return [self.spotify_accounts[p] for p in watch["candidates"] if p not in watch["decided"]]
+
+    def _stop_poll(self, person, state):
+        for speaker, watch in list(self._stop_watch.items()):
+            if person not in watch["candidates"] or person in watch["decided"]:
+                continue
+            before = watch["candidates"][person]
+            if self._now() < watch["stop_ts"] + STOP_DECIDE_FROM_S and account_view(state) == account_view(before):
+                continue
+            verdict = stop_verdict(before, state, watch["stop_ts"], self._house_keys())
+            if verdict is not None:
+                watch["decided"][person] = verdict
+                self._stop_done(speaker)
+
+    def _stop_refresh(self, kwargs):
+        watch = self._stop_watch.get(kwargs["speaker"])
+        if watch is not None and watch["stop_ts"] == kwargs["stop_ts"]:
+            self._refresh_accounts(self._undecided(watch))
+
+    def _stop_deadline(self, kwargs):
+        watch = self._stop_watch.get(kwargs["speaker"])
+        if watch is not None and watch["stop_ts"] == kwargs["stop_ts"]:
+            self._stop_done(kwargs["speaker"], final=True)
+
+    def _stop_done(self, speaker, final=False):
+        """Writes the named stoppers once the stop is settled and every candidate is decided (or at
+        the deadline). True when the watch is over."""
+        watch = self._stop_watch.get(speaker)
+        if watch is None:
+            return True
+        if not watch["settled"] or (not final and self._undecided(watch)):
+            return False
+        del self._stop_watch[speaker]
+        names = [p for p in self.spotify_accounts if watch["decided"].get(p)]
+        rec = self.sessions.get(self.raw_to_base[speaker]) or {}
+        if names and rec.get("stopped_at") == iso(watch["stop_ts"]) and not self.ledger.playing(speaker):
+            rec["stopped_by"] = people_text(names)
+            self.log(f"Spotify stopped on {speaker} by {rec['stopped_by']}")
+            self._publish()
+        return True
+
+    def _refresh_accounts(self, entities):
+        """Ask HA to poll these Spotify accounts now, each at most once per refresh_min_s."""
+        now = self._now()
+        due = [e for e in entities if now - self._refreshed.get(e, float("-inf")) >= self.refresh_min_s]
+        if not due:
+            return
+        for entity in due:
+            self._refreshed[entity] = now
+        self.log(f"Spotify refresh: {', '.join(sorted(due))}")
+        try:
+            self.call_service("homeassistant/update_entity", entity_id=due)
+        except Exception as e:
+            self.log(f"Spotify refresh failed: {e}", level="WARNING")
 
     # -- session records ----------------------------------------------------
 
@@ -690,6 +844,9 @@ class MusicAttribution(hass.Hass):
                 if key:
                     keys.add(key)
         return keys
+
+    def _house_keys(self):
+        return self._device_keys(self.raw_to_base)
 
     def _resident_for(self, user_id):
         """Resident display name for an HA account id via the person entities, or None. The map
