@@ -1,0 +1,5 @@
+# AppDaemonStarted - marks each AppDaemon start for Home Assistant's watchdog.
+# See appdaemon_started.py.
+AppDaemonStarted:
+  module: appdaemon_started
+  class: AppDaemonStarted
