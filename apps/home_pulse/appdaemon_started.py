@@ -15,7 +15,7 @@ ENTITY = "sensor.appdaemon_started"
 
 class AppDaemonStarted(hass.Hass):
     def initialize(self):
-        self.set_state(ENTITY, state=int(time.time()), attributes={
+        self.set_state(ENTITY, state=int(time.time()), replace=True, check_existence=False, attributes={
             "friendly_name": "AppDaemon started",
             "icon": "mdi:restart",
         })
