@@ -38,7 +38,8 @@ COFFEE = "9c:cc:01:33:d8:d6"
 LANDING = "c8:85:41:68:25:52"
 NAMES = {LIFT: "Living room TV lift", DINING: "BLE proxy dining room",
          COFFEE: "BLE proxy coffee bar", LANDING: "BLE proxy landing"}
-HEALTHY = {LIFT: [3, 60], DINING: [5, 40], COFFEE: [8]}
+HEALTHY = {LIFT: 3, DINING: 5, COFFEE: 8}
+PHONE = "aa:bb:cc:00:00:01"
 MINUTES = range(0, 130, 10)
 
 
@@ -51,16 +52,13 @@ def device(addr, **fields):
 
 
 def build_dump(world, now):
-    """What bermuda.dump_devices answers for `world`, {scanner address: [age in seconds of the latest
-    advert of each device that scanner heard]}: every scanner as a scanner device, and one device per
-    age with an advert from that scanner."""
-    devices = {scanner: device(scanner, name=NAMES.get(scanner), _is_scanner=True) for scanner in world}
-    for k, (scanner, ages) in enumerate(world.items()):
-        for i, age in enumerate(ages):
-            addr = f"aa:bb:cc:{k:02x}:00:{i:02x}"
-            advert = {"scanner_address": scanner, "name": NAMES.get(scanner), "area_name": None,
-                      "stamp": now - age, "rssi": -70.0}
-            devices[addr] = device(addr, last_seen=now - age, adverts={f"{addr}__{scanner}": advert})
+    """What bermuda.dump_devices answers for `world`, {scanner address: seconds since the scanner last
+    delivered an advertisement, None when it never did}: every scanner as a scanner device with that
+    last_seen, and one configured device that is not a scanner."""
+    devices = {scanner: device(scanner, name=NAMES.get(scanner), _is_scanner=True,
+                               last_seen=0.0 if age is None else now - age)
+               for scanner, age in world.items()}
+    devices[PHONE] = device(PHONE, name="Phone", last_seen=now - 1)
     return envelope(devices)
 
 
@@ -131,14 +129,14 @@ def lift_message(minutes):
 
 class DeafRule(unittest.TestCase):
     def test_a_scanner_deaf_for_30_minutes_is_pushed_once_with_the_contract(self):
-        app = make_app(world={LIFT: [], DINING: [5, 40], COFFEE: [8]})
+        app = make_app(world={LIFT: None, DINING: 5, COFFEE: 8})
         run(app)
         self.assertEqual(pushed_at(app), [(30, lift_message(30))])
         self.assertEqual(app.pushes[0][1], {"title": "Bluetooth scanner deaf", "message": lift_message(30),
                                             "target": "user"})
 
     def test_no_push_before_deaf_min(self):
-        app = make_app(world={LIFT: [], DINING: [5]})
+        app = make_app(world={LIFT: None, DINING: 5})
         run(app, (0, 10, 20))
         self.assertEqual(app.pushes, [])
         check(app, 30)
@@ -152,80 +150,76 @@ class DeafRule(unittest.TestCase):
         self.assertIn("initialized", logged(app, "INFO")[0])
         self.assertEqual(logged(app, "WARNING"), [])
 
-    def test_a_scanner_with_no_adverts_at_all_is_deaf(self):
-        app = make_app(world={LIFT: [], DINING: [5]})
-        devices = bsw.devices_from(app.dump())
-        self.assertEqual(devices[LIFT]["adverts"], {})
-        self.assertFalse(any(LIFT in key for dev in devices.values() for key in dev["adverts"]))
+    def test_a_scanner_that_was_never_seen_is_deaf(self):
+        app = make_app(world={LIFT: None, DINING: 5})
+        self.assertEqual(bsw.devices_from(app.dump())[LIFT]["last_seen"], 0.0)
         run(app)
         self.assertEqual([at_minute for at_minute, _ in pushed_at(app)], [30])
 
     def test_every_scanner_deaf_at_once_is_judged_too(self):
-        app = make_app(world={LIFT: [], DINING: [], COFFEE: []})
+        app = make_app(world={LIFT: None, DINING: None, COFFEE: None})
         run(app)
         self.assertEqual([at_minute for at_minute, _ in pushed_at(app)], [30, 30, 30])
         self.assertEqual({kw["message"].split(" has heard")[0] for _, kw in app.pushes},
                          {NAMES[LIFT], NAMES[DINING], NAMES[COFFEE]})
 
     def test_stale_adverts_that_are_still_a_sane_age_count_as_deaf_not_as_a_clock_problem(self):
-        app = make_app(world={LIFT: [1000, 80000], DINING: [1000]})
+        app = make_app(world={LIFT: 1000, DINING: 1000})
         run(app)
         self.assertEqual(len(app.pushes), 2)
         self.assertEqual(logged(app, "WARNING"), [])
 
     def test_only_the_deaf_scanner_is_named_and_the_others_stay_quiet(self):
-        app = make_app(world={LIFT: [3], DINING: [], COFFEE: [8], LANDING: [9]})
+        app = make_app(world={LIFT: 3, DINING: None, COFFEE: 8, LANDING: 9})
         run(app)
         self.assertEqual(len(app.pushes), 1)
         self.assertIn("BLE proxy dining room has heard no Bluetooth devices for 30 min.", app.pushes[0][1]["message"])
 
-    def test_an_advert_exactly_fresh_s_old_is_heard_and_one_second_older_is_not(self):
-        heard = make_app(world={LIFT: [120.0], DINING: [5]})
+    def test_a_last_seen_exactly_fresh_s_old_is_heard_and_one_second_older_is_not(self):
+        heard = make_app(world={LIFT: 120.0, DINING: 5})
         run(heard)
         self.assertEqual(heard.pushes, [])
-        deaf = make_app(world={LIFT: [121.0], DINING: [5]})
+        deaf = make_app(world={LIFT: 121.0, DINING: 5})
         run(deaf)
         self.assertEqual(len(deaf.pushes), 1)
 
     def test_fresh_s_and_deaf_min_and_interval_min_come_from_the_yaml(self):
-        app = make_app(args={"fresh_s": 300, "deaf_min": 20, "interval_min": 5}, world={LIFT: [250], DINING: [5]})
+        app = make_app(args={"fresh_s": 300, "deaf_min": 20, "interval_min": 5}, world={LIFT: 250, DINING: 5})
         self.assertEqual(app.scheduled[0][2], 300)
         run(app, range(0, 60, 5))
         self.assertEqual(app.pushes, [])
-        app.world = {LIFT: [301], DINING: [5]}
+        app.world = {LIFT: 301, DINING: 5}
         run(app, range(60, 120, 5))
         self.assertEqual(pushed_at(app), [(80, lift_message(20))])
 
-    def test_the_count_is_per_scanner_from_the_adverts_own_scanner_address(self):
+    def test_deafness_is_the_scanners_own_last_seen_not_other_devices_adverts(self):
         now = MONO0 + 100.0
         devices = {
-            LIFT: device(LIFT, name=NAMES[LIFT], _is_scanner=True),
-            DINING: device(DINING, name=NAMES[DINING], _is_scanner=True),
-            "aa:bb:cc:00:00:01": device("aa:bb:cc:00:00:01", adverts={
-                "aa:bb:cc:00:00:01__elsewhere": {"scanner_address": DINING, "stamp": now - 5},
-                "aa:bb:cc:00:00:01__other": {"scanner_address": COFFEE, "stamp": now - 5},
-                "aa:bb:cc:00:00:01__old": {"scanner_address": LIFT, "stamp": now - 500},
-            }),
+            LIFT: device(LIFT, name=NAMES[LIFT], _is_scanner=True, last_seen=now - 500),
+            DINING: device(DINING, name=NAMES[DINING], _is_scanner=True, last_seen=now - 5),
+            PHONE: device(PHONE, last_seen=now - 1, adverts={
+                f"{PHONE}__lift": {"scanner_address": LIFT, "stamp": now - 1}}),
         }
-        scanners, heard, mismatch = bsw.read_dump(devices, now, 120)
-        self.assertEqual({a: len(heard.get(a, ())) for a in scanners}, {LIFT: 0, DINING: 1})
+        scanners, ages, mismatch = bsw.read_dump(devices, now)
+        self.assertEqual(ages, {LIFT: 500, DINING: 5})
+        self.assertEqual([a for a in scanners if bsw.is_deaf(ages[a], 120)], [LIFT])
         self.assertFalse(mismatch)
 
 
 class Episodes(unittest.TestCase):
     def test_recovery_is_logged_not_pushed_and_rearms_for_the_next_episode(self):
-        app = make_app(world={LIFT: [], DINING: [5]})
+        app = make_app(world={LIFT: None, DINING: 5})
         run(app, (0, 10, 20, 30))
         self.assertEqual(pushed_at(app), [(30, lift_message(30))])
         run(app, (40, 50))
         self.assertEqual(len(app.pushes), 1)
 
-        app.world = {LIFT: [4], DINING: [5]}
+        app.world = {LIFT: 4, DINING: 5}
         check(app, 60)
         self.assertEqual(len(app.pushes), 1)
-        self.assertEqual(len([m for m in logged(app, "INFO") if "hears 1 device(s) again after 6 deaf" in m]), 1)
+        self.assertEqual(len([m for m in logged(app, "INFO") if "hears again after 6 deaf check(s), last heard 4 s ago" in m]), 1)
 
-        app.world = {LIFT: [], DINING: [5]}
+        app.world = {LIFT: None, DINING: 5}
         run(app, (70, 80, 90))
         self.assertEqual(len(app.pushes), 1)
         check(app, 100)
@@ -234,57 +228,57 @@ class Episodes(unittest.TestCase):
         self.assertEqual(len(app.pushes), 2)
 
     def test_a_deaf_spell_shorter_than_deaf_min_starts_again_from_zero(self):
-        app = make_app(world={LIFT: [], DINING: [5]})
+        app = make_app(world={LIFT: None, DINING: 5})
         run(app, (0, 10, 20))
-        app.world = {LIFT: [2], DINING: [5]}
+        app.world = {LIFT: 2, DINING: 5}
         check(app, 30)
-        app.world = {LIFT: [], DINING: [5]}
+        app.world = {LIFT: None, DINING: 5}
         run(app, (40, 50, 60))
         self.assertEqual(app.pushes, [])
         check(app, 70)
         self.assertEqual([at_minute for at_minute, _ in pushed_at(app)], [70])
 
     def test_deaf_start_push_and_recovery_are_logged_at_info_once_each(self):
-        app = make_app(world={LIFT: [], DINING: [5]})
+        app = make_app(world={LIFT: None, DINING: 5})
         run(app, (0, 10, 20, 30, 40))
-        app.world = {LIFT: [1], DINING: [5]}
+        app.world = {LIFT: 1, DINING: 5}
         check(app, 50)
         info = logged(app, "INFO")[1:]
         self.assertEqual(len(info), 3)
         self.assertIn("Living room TV lift (5c:01:3b:53:2b:12) is deaf", info[0])
         self.assertIn("deaf for 30 min, pushing the owner", info[1])
-        self.assertIn("hears 1 device(s) again after 5 deaf check(s)", info[2])
+        self.assertIn("hears again after 5 deaf check(s), last heard 1 s ago", info[2])
 
-    def test_every_check_logs_the_counts_at_debug(self):
-        app = make_app(world={LIFT: [], DINING: [5, 40], COFFEE: [8]})
+    def test_every_check_logs_the_ages_at_debug(self):
+        app = make_app(world={LIFT: None, DINING: 5, COFFEE: 8})
         run(app, (0, 10))
         debug = logged(app, "DEBUG")
         self.assertEqual(len(debug), 2)
-        self.assertIn("BLE proxy coffee bar 1, BLE proxy dining room 2, Living room TV lift 0", debug[0])
+        self.assertIn("BLE proxy coffee bar 8 s, BLE proxy dining room 5 s, Living room TV lift never", debug[0])
 
     def test_one_scanner_recovering_does_not_touch_the_streak_of_another(self):
-        app = make_app(world={LIFT: [], DINING: []})
+        app = make_app(world={LIFT: None, DINING: None})
         run(app, (0, 10))
-        app.world = {LIFT: [], DINING: [5]}
+        app.world = {LIFT: None, DINING: 5}
         run(app, (20, 30))
         self.assertEqual([m["message"].split(" has")[0] for _, m in app.pushes], [NAMES[LIFT]])
 
 
 class Ignore(unittest.TestCase):
     def test_an_ignored_scanner_never_pushes_or_starts_a_streak(self):
-        app = make_app(args={"ignore": [LANDING]}, world={LIFT: [3], LANDING: []})
+        app = make_app(args={"ignore": [LANDING]}, world={LIFT: 3, LANDING: None})
         run(app)
         self.assertEqual(app.pushes, [])
         self.assertEqual(app._deaf, {})
         self.assertFalse([m for m in logged(app, "INFO") if "landing" in m.lower()])
 
     def test_ignoring_one_scanner_leaves_a_deaf_neighbour_judged(self):
-        app = make_app(args={"ignore": [LANDING]}, world={LIFT: [], LANDING: [], DINING: [5]})
+        app = make_app(args={"ignore": [LANDING]}, world={LIFT: None, LANDING: None, DINING: 5})
         run(app)
         self.assertEqual(pushed_at(app), [(30, lift_message(30))])
 
     def test_the_yaml_address_is_matched_case_insensitively(self):
-        app = make_app(args={"ignore": [LANDING.upper()]}, world={LANDING: [], DINING: [5]})
+        app = make_app(args={"ignore": [LANDING.upper()]}, world={LANDING: None, DINING: 5})
         run(app)
         self.assertEqual(app.pushes, [])
 
@@ -315,20 +309,21 @@ class SkippedChecks(unittest.TestCase):
                 self.assertEqual(logged(app, "INFO"), [logged(app, "INFO")[0]])
 
     def test_a_dump_that_hangs_is_skipped_after_the_timeout(self):
-        app = make_app(world={LIFT: [], DINING: [5]})
+        app = make_app(world={LIFT: None, DINING: 5})
         app.delay = 5
         with patch.object(bsw, "DUMP_TIMEOUT_S", 0.01):
             run(app)
         self.assertEqual(app.pushes, [])
         self.assertEqual(len(logged(app, "WARNING")), len(MINUTES))
 
-    def test_the_dump_is_asked_for_every_device_and_with_a_response(self):
+    def test_the_dump_is_asked_for_the_configured_devices_only_and_with_a_response(self):
         app = make_app()
         check(app, 0)
-        self.assertEqual(app.service_calls, [("bermuda/dump_devices", {"return_response": True})])
+        self.assertEqual(app.service_calls,
+                         [("bermuda/dump_devices", {"configured_devices": True, "return_response": True})])
 
     def test_a_failed_check_in_the_middle_neither_counts_as_deaf_nor_ends_the_streak(self):
-        app = make_app(world={LIFT: [], DINING: [5]})
+        app = make_app(world={LIFT: None, DINING: 5})
         run(app, (0, 10))
         good = app.dump
 
@@ -352,10 +347,10 @@ class SkippedChecks(unittest.TestCase):
         self.assertEqual(len(logged(app, "WARNING")), len(MINUTES))
         self.assertIn("no scanner devices", logged(app, "WARNING")[0])
 
-    def test_adverts_that_are_all_in_the_future_or_over_a_day_old_are_a_clock_mismatch_warned_once(self):
-        for name, ages in (("future", [-500, -20]), ("ancient", [90000, 200000]), ("both", [-500, 90000])):
+    def test_scanners_all_in_the_future_or_over_a_day_old_are_a_clock_mismatch_warned_once(self):
+        for name, lift, dining in (("future", -500, -20), ("ancient", 90000, 200000), ("both", -500, 90000)):
             with self.subTest(name):
-                app = make_app(world={LIFT: ages, DINING: ages})
+                app = make_app(world={LIFT: lift, DINING: dining})
                 run(app)
                 self.assertEqual(app.pushes, [])
                 self.assertEqual(app._deaf, {})
@@ -363,35 +358,24 @@ class SkippedChecks(unittest.TestCase):
                 self.assertIn("the clocks differ", logged(app, "WARNING")[0])
                 self.assertEqual(logged(app, "DEBUG"), [])
 
-    def test_a_dump_where_no_advert_has_a_usable_stamp_is_skipped_like_a_mismatch(self):
-        app = make_app()
-        devices = bsw.devices_from(app.dump())
-        for dev in devices.values():
-            for advert in dev["adverts"].values():
-                advert.pop("stamp")
-        app.dump = lambda: envelope(devices)
-        run(app)
-        self.assertEqual(app.pushes, [])
-        self.assertEqual(len(logged(app, "WARNING")), 1)
-
-    def test_one_sane_advert_among_wild_ones_is_not_a_mismatch(self):
-        app = make_app(world={LIFT: [], DINING: [-500, 90000, 5]})
+    def test_one_sane_scanner_among_wild_ones_is_not_a_mismatch(self):
+        app = make_app(world={LIFT: None, DINING: 5, COFFEE: -500})
         run(app)
         self.assertEqual(logged(app, "WARNING"), [])
-        self.assertEqual([at_minute for at_minute, _ in pushed_at(app)], [30])
+        self.assertEqual(sorted(at_minute for at_minute, _ in pushed_at(app)), [30, 30])
 
     def test_the_mismatch_warning_comes_again_after_a_check_that_reads_fine(self):
-        app = make_app(world={LIFT: [-500], DINING: [-500]})
+        app = make_app(world={LIFT: -500, DINING: -500})
         run(app, (0, 10))
         self.assertEqual(len(logged(app, "WARNING")), 1)
-        app.world = {LIFT: [5], DINING: [5]}
+        app.world = {LIFT: 5, DINING: 5}
         check(app, 20)
-        app.world = {LIFT: [-500], DINING: [-500]}
+        app.world = {LIFT: -500, DINING: -500}
         run(app, (30, 40))
         self.assertEqual(len(logged(app, "WARNING")), 2)
 
-    def test_a_scanner_with_no_adverts_and_a_dump_with_no_adverts_at_all_is_not_a_mismatch(self):
-        app = make_app(world={LIFT: [], DINING: []})
+    def test_scanners_that_were_never_seen_are_deaf_not_a_mismatch(self):
+        app = make_app(world={LIFT: None, DINING: None})
         run(app, (0,))
         self.assertEqual(logged(app, "WARNING"), [])
         self.assertEqual(set(app._deaf), {LIFT, DINING})
@@ -399,7 +383,7 @@ class SkippedChecks(unittest.TestCase):
 
 class Notify(unittest.TestCase):
     def test_a_push_that_raises_is_tried_again_at_the_next_check_and_then_kept(self):
-        app = make_app(world={LIFT: [], DINING: [5]})
+        app = make_app(world={LIFT: None, DINING: 5})
         app.sent = RuntimeError("boom")
         run(app, (0, 10, 20, 30))
         self.assertEqual(len(app.pushes), 1)
@@ -410,7 +394,7 @@ class Notify(unittest.TestCase):
         self.assertEqual(pushed_at(app), [(30, lift_message(30)), (40, lift_message(40))])
 
     def test_a_push_that_reached_nobody_is_tried_again_at_the_next_check(self):
-        app = make_app(world={LIFT: [], DINING: [5]})
+        app = make_app(world={LIFT: None, DINING: 5})
         app.sent = 0
         run(app, (0, 10, 20, 30, 40))
         self.assertEqual([at_minute for at_minute, _ in pushed_at(app)], [30, 40])
@@ -420,16 +404,16 @@ class Notify(unittest.TestCase):
         self.assertEqual([at_minute for at_minute, _ in pushed_at(app)], [30, 40, 50])
 
     def test_a_scanner_whose_push_failed_still_recovers_cleanly(self):
-        app = make_app(world={LIFT: [], DINING: [5]})
+        app = make_app(world={LIFT: None, DINING: 5})
         app.sent = 0
         run(app, (0, 10, 20, 30))
-        app.world = {LIFT: [3], DINING: [5]}
+        app.world = {LIFT: 3, DINING: 5}
         run(app, (40, 50, 60))
         self.assertEqual(len(app.pushes), 1)
         self.assertEqual(app._deaf, {})
 
     def test_the_notifier_is_only_ever_called_with_title_message_and_target(self):
-        app = make_app(world={LIFT: [], DINING: []})
+        app = make_app(world={LIFT: None, DINING: None})
         run(app)
         for _, kw in app.pushes:
             self.assertEqual(set(kw), {"title", "message", "target"})
@@ -466,8 +450,8 @@ class Setup(unittest.TestCase):
 class Reading(unittest.TestCase):
     NOW = 1_000_000.0
 
-    def read(self, devices, fresh_s=120):
-        return bsw.read_dump(devices, self.NOW, fresh_s)
+    def read(self, devices):
+        return bsw.read_dump(devices, self.NOW)
 
     def test_every_envelope_shape_reaches_the_devices(self):
         devices = {LIFT: device(LIFT, _is_scanner=True)}
@@ -484,23 +468,14 @@ class Reading(unittest.TestCase):
                 self.assertEqual(bsw.devices_from(resp), {})
 
     def test_the_age_limits_are_inclusive_at_zero_and_fresh_s(self):
-        advert = lambda age: {"scanner_address": LIFT, "stamp": self.NOW - age}  # noqa: E731
-        devices = {name: device(name, adverts={"k": advert(age)}) for name, age in
-                   (("now", 0), ("limit", 120), ("over", 121), ("future", -1), ("recent", 30))}
-        _, heard, mismatch = self.read(devices)
-        self.assertEqual(heard[LIFT], {"now", "limit", "recent"})
-        self.assertFalse(mismatch)
+        for age, deaf in ((0, False), (120, False), (121, True), (-1, True), (None, True), (30, False)):
+            with self.subTest(age=age):
+                self.assertEqual(bsw.is_deaf(age, 120), deaf)
 
-    def test_a_device_with_two_adverts_from_one_scanner_counts_once(self):
-        devices = {"d": device("d", adverts={"d__a": {"scanner_address": LIFT, "stamp": self.NOW - 5},
-                                             "d__b": {"scanner_address": LIFT.upper(), "stamp": self.NOW - 9}})}
-        self.assertEqual(self.read(devices)[1], {LIFT: {"d"}})
-
-    def test_scanner_addresses_are_compared_in_lowercase(self):
-        devices = {LIFT.upper(): device(LIFT.upper(), name="Lift", _is_scanner=True),
-                   "d": device("d", adverts={"k": {"scanner_address": LIFT.upper(), "stamp": self.NOW - 5}})}
-        scanners, heard, _ = self.read(devices)
-        self.assertEqual((scanners, heard), ({LIFT: "Lift"}, {LIFT: {"d"}}))
+    def test_scanner_addresses_are_lowercased(self):
+        devices = {LIFT.upper(): device(LIFT.upper(), name="Lift", _is_scanner=True, last_seen=self.NOW - 5)}
+        scanners, ages, _ = self.read(devices)
+        self.assertEqual((scanners, ages), ({LIFT: "Lift"}, {LIFT: 5}))
 
     def test_a_scanner_without_a_name_is_named_by_its_address(self):
         devices = {LIFT: device(LIFT, _is_scanner=True), DINING: device(DINING, name="", _is_scanner=True)}
@@ -511,19 +486,15 @@ class Reading(unittest.TestCase):
                    (("yes", True), ("no", False), ("text", "true"), ("one", 1), ("none", None))}
         self.assertEqual(set(self.read(devices)[0]), {"yes"})
 
-    def test_adverts_that_are_not_dicts_or_have_no_usable_stamp_are_ignored(self):
-        devices = {"d": device("d", adverts={"a": None, "b": "x", "c": {"scanner_address": LIFT, "stamp": None},
-                                             "d": {"scanner_address": LIFT, "stamp": True},
-                                             "e": {"scanner_address": LIFT, "stamp": float("nan")},
-                                             "f": {"scanner_address": None, "stamp": self.NOW - 1}})}
-        scanners, heard, mismatch = self.read(devices)
-        self.assertEqual((scanners, heard), ({}, {}))
-        self.assertFalse(mismatch)
+    def test_a_last_seen_that_is_not_a_positive_number_is_never_seen(self):
+        for value in (0, 0.0, None, True, "5", float("nan"), -3):
+            with self.subTest(value=value):
+                devices = {LIFT: device(LIFT, _is_scanner=True, last_seen=value)}
+                self.assertEqual(self.read(devices)[1], {LIFT: None})
 
-    def test_the_mismatch_is_adverts_with_no_stamp_between_zero_and_a_day(self):
+    def test_the_mismatch_is_last_seens_with_none_between_zero_and_a_day(self):
         def devices(*ages):
-            return {"d": device("d", adverts={str(i): {"scanner_address": LIFT, "stamp": self.NOW - age}
-                                              for i, age in enumerate(ages)})}
+            return {f"s{i}": device(f"s{i}", _is_scanner=True, last_seen=self.NOW - age) for i, age in enumerate(ages)}
 
         for ages, expected in (((), False), ((-1, 90000), True), ((90000,), True), ((-5,), True),
                                ((2000, 90000), False), ((0,), False), ((86400,), False), ((86401, -1), True),
