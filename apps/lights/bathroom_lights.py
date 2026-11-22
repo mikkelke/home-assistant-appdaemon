@@ -38,6 +38,10 @@ class BathroomLights(hass.Hass):
         self.all_spots_group = self.args.get("all_spots_group")
         self.main_5_spots_group = self.args.get("main_5_spots_group")
         self.bath_spot_light = self.args.get("bath_spot_light")
+        self.adaptive_lighting_switch = self.args.get("adaptive_lighting_switch")
+        self.adaptive_brightness_switch = self.args.get("adaptive_brightness_switch")
+        self.adaptive_color_switch = self.args.get("adaptive_color_switch")
+        self._adaptive_handoff = None
 
         self.raw_pir_sensor = self.args.get("raw_pir_sensor")
         self.bathroom_door_sensor = self.args.get("bathroom_door_sensor")
@@ -184,7 +188,10 @@ class BathroomLights(hass.Hass):
     def _on_switch_event(self, event_name, data, kwargs):
         """Handle manual switch press - independent toggle."""
         self.log("Bathroom: Switch pressed - toggling all lights", level="INFO")
-        self.toggle(self.all_spots_group)
+        if self.get_state(self.all_spots_group) == "on":
+            self._turn_off_all()
+        else:
+            self._turn_on_all()
         self._set_reason("Someone pressed the bathroom wall switch.")
 
     def _on_bath_presence_change(self, entity, attribute, old, new, kwargs):
@@ -333,14 +340,90 @@ class BathroomLights(hass.Hass):
     # ─────────────────────────────────────────────────────────────
     
     def _turn_on_all(self):
-        """Turn on all bathroom lights."""
+        """Turn on all six spots with one Zigbee group command."""
+        self._cancel_adaptive_handoff()
         try:
-            self.turn_on(self.all_spots_group)
+            targets, settings = self._group_turn_on_settings()
+        except Exception as e:
+            self.log(f"Could not read adaptive lighting settings: {e}", level="WARNING")
+            targets, settings = [], {}
+
+        try:
+            self.turn_on(self.all_spots_group, **settings)
+            if targets and settings:
+                self._adaptive_handoff = self.run_in(
+                    self._resume_adaptive_lighting, 1.5, lights=targets, settings=settings,
+                )
         except Exception as e:
             self.log(f"Error turning on lights: {e}", level="ERROR")
 
+    def _group_turn_on_settings(self):
+        if not self.adaptive_lighting_switch:
+            return [], {}
+        adaptive = self.get_state(self.adaptive_lighting_switch, attribute="all") or {}
+        if adaptive.get("state") != "on":
+            return [], {}
+        attrs = adaptive.get("attributes", {})
+        settings = {}
+        brightness_pct = attrs.get("brightness_pct")
+        if (
+            isinstance(brightness_pct, (int, float)) and 0 < brightness_pct <= 100
+            and self.adaptive_brightness_switch
+            and self.get_state(self.adaptive_brightness_switch) == "on"
+        ):
+            settings["brightness"] = max(1, round(brightness_pct * 255 / 100))
+        kelvin = attrs.get("color_temp_kelvin")
+        if (
+            isinstance(kelvin, (int, float)) and 1000 <= kelvin <= 10000
+            and self.adaptive_color_switch
+            and self.get_state(self.adaptive_color_switch) == "on"
+        ):
+            group = self.get_state(self.all_spots_group, attribute="all") or {}
+            limits = group.get("attributes", {})
+            warmest = limits.get("min_color_temp_kelvin") or kelvin
+            coolest = limits.get("max_color_temp_kelvin") or max(warmest, kelvin)
+            settings["color_temp_kelvin"] = round(min(coolest, max(warmest, kelvin)))
+        manual = attrs.get("manual_control") or []
+        targets = [
+            light for light in (self.main_5_spots_group, self.bath_spot_light)
+            if light not in manual and self.get_state(light) == "off"
+        ]
+        return targets, settings
+
+    def _resume_adaptive_lighting(self, kwargs):
+        self._adaptive_handoff = None
+        adaptive = self.get_state(self.adaptive_lighting_switch, attribute="all") or {}
+        if adaptive.get("state") != "on":
+            return
+        manual = adaptive.get("attributes", {}).get("manual_control") or []
+        lights = []
+        for light in kwargs["lights"]:
+            state = self.get_state(light, attribute="all") or {}
+            if light not in manual or state.get("state") != "on":
+                continue
+            attrs = state.get("attributes", {})
+            # Release only the flags caused by the group command. Zigbee can round
+            # brightness and reports color temperature in whole mireds.
+            if all(
+                isinstance(attrs.get(key), (int, float))
+                and abs(attrs[key] - value) <= (2 if key == "brightness" else 12)
+                for key, value in kwargs["settings"].items()
+            ):
+                lights.append(light)
+        if lights:
+            self.call_service(
+                "adaptive_lighting/set_manual_control",
+                entity_id=self.adaptive_lighting_switch, lights=lights, manual_control=False,
+            )
+
+    def _cancel_adaptive_handoff(self):
+        if self._adaptive_handoff is not None:
+            self.cancel_timer(self._adaptive_handoff)
+            self._adaptive_handoff = None
+
     def _turn_off_all(self):
         """Turn off all bathroom lights."""
+        self._cancel_adaptive_handoff()
         try:
             self.turn_off(self.all_spots_group)
         except Exception as e:
@@ -353,7 +436,7 @@ class BathroomLights(hass.Hass):
             if self.get_state(self.specific_bath_presence_entity) == "on":
                 self.turn_off(self.main_5_spots_group)
             else:
-                self.turn_off(self.all_spots_group)
+                self._turn_off_all()
         except Exception as e:
             self.log(f"Error turning off main lights: {e}", level="ERROR")
 

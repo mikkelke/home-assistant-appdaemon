@@ -9,7 +9,7 @@ bathroom_lights:
   switch_device_id: "70e3c56c1ff23ce8f0f762b23bd67d3c" # For manual toggle
 
   # --- Light Entities ---
-  # The existing Zigbee2MQTT group of all 6 spots (used by _on_switch, darkness checks if general presence is on)
+  # One Zigbee2MQTT group command when all six spots should change together.
   all_spots_group: "light.bathroom_lights" 
 
   # The new Zigbee2MQTT group of the 5 main spots (excluding the single bath spot)
@@ -17,6 +17,11 @@ bathroom_lights:
 
   # The single bath spot entity (also a member of all_spots_group)
   bath_spot_light: "light.bathroom_bath_light"      
+
+  # Use the bathroom profile's current targets on the six-spot group command.
+  adaptive_lighting_switch: "switch.adaptive_lighting_bathroom"
+  adaptive_brightness_switch: "switch.adaptive_lighting_adapt_brightness_bathroom"
+  adaptive_color_switch: "switch.adaptive_lighting_adapt_color_bathroom"
 
   # --- Presence Sensors ---
   raw_pir_sensor: "binary_sensor.bathroom_active"
