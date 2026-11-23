@@ -673,10 +673,22 @@ class LinkTests(unittest.TestCase):
         fake.set_entity(app, "switch.xbloom_studio_connect", "off")
         self.assertEqual(coffee_state(app)[1]["link"], "not_connected")
 
-    def test_a_running_brew_is_judged_by_its_frames(self):
+    def test_a_held_link_stays_connected_through_a_silent_grind_or_pause(self):
         app = fake.make_app()
         tape = [s for s in fake.synthetic_brew(BREW_ID, None) if s[0] <= 60 and s[1][0] != "call"]
         fake.replay(app, tape)
+        fake.set_entity(app, "sensor.xbloom_studio_scale_weight", "40.0")
+        fake.advance(app, 30)
+        self.assertEqual(coffee_state(app)[1]["link"], "connected")
+        self.assertEqual(fake.last(app, "sensor.coffee_live")[0], "live")
+        self.assertTrue(all(app._tracker.curve.fresh[-30:]))
+
+    def test_a_running_brew_on_a_link_we_lost_is_judged_by_its_frames(self):
+        app = fake.make_app()
+        tape = [s for s in fake.synthetic_brew(BREW_ID, None) if s[0] <= 60 and s[1][0] != "call"]
+        fake.replay(app, tape)
+        fake.fire(app, "xbloom_connect_stopped", {})
+        fake.set_entity(app, "switch.xbloom_studio_connect", "off")
         fake.set_entity(app, "sensor.xbloom_studio_scale_weight", "40.0")
         self.assertEqual(coffee_state(app)[1]["link"], "connected")
         fake.advance(app, 15)

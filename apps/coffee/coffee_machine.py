@@ -180,6 +180,7 @@ class CoffeeMachine(hass.Hass):
         self._recipes = [r for r in (saved.get("recipes") or []) if isinstance(r, dict) and r.get("pours")]
         self._baseline = saved.get("baseline") if isinstance(saved.get("baseline"), dict) else None
         self._tracker = cf.Tracker.from_dict(saved.get("tracker"))
+        self._tracker.link_held = lambda: self._switch_on() and self._link_ready
         self._cup = ccup.Cup()
         self._power = cpow.PowerBrew()
         self._power.restore(saved.get("power"))
@@ -282,9 +283,11 @@ class CoffeeMachine(hass.Hass):
         return self._meter.state(now)
 
     def _link(self, now):
-        """A held session is silent while the machine idles, so the link is the Connect switch and the
-        integration's connect events; only a running brew is judged by its frames, which a brew on its own
-        link sends too."""
+        """A held session is silent while the machine idles or a brew grinds or pauses, so the link is the
+        Connect switch and the integration's connect events; only a running brew on a link we do not hold is
+        judged by its frames."""
+        if self._switch_on() and self._link_ready:
+            return "connected"
         if self._tracker.phase() in cf.RUNNING:
             if self._tracker.fresh(now):
                 return "connected"
@@ -1750,7 +1753,7 @@ class CoffeeMachine(hass.Hass):
         brew = self._tracker.brew
         if brew is not None and brew["phase"] in ("grinding", "brewing", "paused") and brew["source"] != "power":
             plan = self._plan_of(brew)
-            return pub.live_entity(brew, self._tracker.curve, now, self._tracker.fresh(now), self._tracker.frame_at,
+            return pub.live_entity(brew, self._tracker.curve, now, self._tracker.live(now), self._tracker.frame_at,
                                    plan["water"], plan["pours"])
         last = brew if brew is not None else self._tracker.last
         if last is not None and last.get("bloom_ts") and last.get("source") != "power":

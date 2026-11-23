@@ -70,6 +70,7 @@ class Tracker:
         self.frame_at = None
         self.below_since = None
         self.dropped = None
+        self.link_held = lambda: False
 
     # -- persistence ------------------------------------------------------------------------
 
@@ -108,6 +109,14 @@ class Tracker:
 
     def _fresh_until(self):
         return None if self.frame_at is None else self.frame_at + FRESH_S
+
+    def live(self, now):
+        """Whether the curve holds the latest reading: HA records no repeat of a steady value, so a held link
+        is live through a silent grind or pause."""
+        return (self.frame_at is not None and self.link_held()) or self.fresh(now)
+
+    def _live_until(self):
+        return None if self.frame_at is not None and self.link_held() else self._fresh_until()
 
     def reading_cup(self, now, grams):
         if sleep_frame(grams):
@@ -296,7 +305,7 @@ class Tracker:
 
     def _ready(self, now, enjoy):
         if self.curve is not None:
-            self.curve.end(now, self.cup, self.water, self.fresh(now), self._fresh_until())
+            self.curve.end(now, self.cup, self.water, self.live(now), self._live_until())
         self._set("ready", now, ready_ts=now, outcome="complete", ground=True, paused_since_ts=None)
         if enjoy:
             self.brew["enjoy_ts"] = now
@@ -339,7 +348,7 @@ class Tracker:
 
     def _stop(self, now, reason, outcome="stopped"):
         if self.curve is not None:
-            self.curve.end(now, self.cup, self.water, self.fresh(now), self._fresh_until())
+            self.curve.end(now, self.cup, self.water, self.live(now), self._live_until())
         asked = self.brew.get("stop_asked_ts")
         if reason == "machine" and asked is not None and now - asked <= STOP_ASKED_S:
             reason = "home_assistant"
@@ -411,7 +420,7 @@ class Tracker:
             return ["start_failed", "state"]
         effects = []
         if phase in ("brewing", "paused") and self.curve is not None:
-            self.curve.sample(now, self.cup, self.water, self.fresh(now), self._fresh_until())
+            self.curve.sample(now, self.cup, self.water, self.live(now), self._live_until())
             effects.append("live")
         power_end = self.brew.get("power_end_ts")
         if phase in RUNNING and power_end and not self.fresh(now) and now - power_end >= POWER_GRACE_S:
