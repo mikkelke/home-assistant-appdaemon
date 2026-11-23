@@ -1,0 +1,34 @@
+# Measure early departures while Wi-Fi continues to drive Home Assistant presence.
+# Each input_boolean controls measurement for its resident. All instances append to
+# ble_fast_departure_log.jsonl beside the module.
+
+BleFastDepartureMikkel:
+  module: ble_fast_departure
+  class: BleFastDeparture
+  pin_app: true
+  resident: Mikkel
+  door: binary_sensor.apartment_door_open
+  area_sensor: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area
+  tracker: device_tracker.mikkels_ofx9p
+  transmitter: sensor.mikkels_ofx9p_ble_transmitter
+  shadow_switch: input_boolean.ble_fast_departure_shadow_mikkel
+
+BleFastDepartureClaudia:
+  module: ble_fast_departure
+  class: BleFastDeparture
+  pin_app: true
+  resident: Claudia
+  door: binary_sensor.apartment_door_open
+  area_sensor: sensor.claudias_iphone_ble_area
+  tracker: device_tracker.claudias_iphone_2
+  shadow_switch: input_boolean.ble_fast_departure_shadow_claudia
+
+BleFastDepartureKristine:
+  module: ble_fast_departure
+  class: BleFastDeparture
+  pin_app: true
+  resident: Kristine
+  door: binary_sensor.apartment_door_open
+  area_sensor: sensor.kristines_iphone_ble_area
+  tracker: device_tracker.kristines_iphone
+  shadow_switch: input_boolean.ble_fast_departure_shadow_kristine
