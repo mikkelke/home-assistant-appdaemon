@@ -871,6 +871,18 @@ class AmazonCopiesTests(unittest.TestCase):
         mine = self.amazon("1", tracking="LA508420838NL", start=at(60 * 24 * 3))
         self.assertEqual(self.barcodes([[postnord, mine]]), [["LA508420838NL"]])
 
+    def test_amazons_copy_handed_to_a_carrier_hides_behind_the_carriers_own(self):
+        airmee = parcel(carrier="Airmee", barcode="86f26ce6", sender="Amazon", start=at(30), end=at(330))
+        url = "https://www.amazon.de/-/en/progress-tracker/package/?orderId=028-8570771-0724307&itemId=x"
+        mine = parcel(carrier="Airmee", barcode="AM029499125", status="in_transit", sender=None, url=url,
+                      start=at(-17 * 60), end=at(7 * 60 - 1))
+        self.assertEqual(self.barcodes([[mine, airmee], []]), [["86f26ce6"], []])
+
+    def test_a_handed_off_copy_stays_when_the_carrier_does_not_track_it(self):
+        url = "https://www.amazon.com/gp/your-account/ship-track?itemId=x"
+        mine = parcel(carrier="GLS", barcode="021636668242", sender=None, url=url, start=at(60))
+        self.assertEqual(self.barcodes([[mine]]), [["021636668242"]])
+
     def test_amazon_stays_when_no_carrier_has_it(self):
         other_day = parcel(carrier="Airmee", barcode="c443dc28", sender="Amazon", start=at(60 * 24), end=at(60 * 25))
         other_shop = parcel(sender="Test Shop", start=at(60))

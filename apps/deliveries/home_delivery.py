@@ -67,6 +67,7 @@ import time
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import requests  # type: ignore
@@ -405,6 +406,14 @@ def amazon_order(parcels):
     return {**(under_way or parcels)[0], "barcode": min(tidy(parcel.get("barcode")) for parcel in parcels)}
 
 
+def amazon_copy(parcel, identity):
+    """Whether a parcel is Amazon's own listing: under carrier Amazon, or handed to a carrier but still linking to
+    Amazon's tracker, where it carries the carrier's shipment id and Amazon's day-long estimate."""
+    url = parcel.get("url")
+    host = (urlparse(url).hostname or "") if isinstance(url, str) else ""
+    return identity[1] == AMAZON or AMAZON in host.split(".")
+
+
 def without_amazon_copies(lists):
     """The aggregator's lists with Amazon's own parcels cut to one per order and day (an order sent on several days
     stays several parcels), and dropped where a carrier already tracks the package: a carrier parcel with Amazon's
@@ -415,7 +424,7 @@ def without_amazon_copies(lists):
     for parcels in lists:
         for parcel in parcels:
             identity = parcel_identity(parcel)
-            if identity is None or identity[1] == AMAZON:
+            if identity is None or amazon_copy(parcel, identity):
                 continue
             carried.add(identity[2])
             if AMAZON in tidy(parcel.get("sender")).lower():
@@ -426,7 +435,7 @@ def without_amazon_copies(lists):
         kept, orders = [], {}
         for parcel in parcels:
             identity = parcel_identity(parcel)
-            if identity is None or identity[1] != AMAZON:
+            if identity is None or not amazon_copy(parcel, identity):
                 kept.append(parcel)
             elif identity[2] not in carried:
                 order = AMAZON_ORDER.match(identity[2])
