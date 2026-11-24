@@ -1,5 +1,6 @@
 # tests/test_coffee_publish.py - the seven entities keep the contract's string encoding and their size caps
-# with worst-case content, the example payloads' shapes, the brews' aggregates and recent.json.
+# with worst-case content, the example payloads' shapes, the brews' aggregates (who made them, who filled the tank)
+# and recent.json.
 # Run from repo root: python3 -m unittest discover -s apps/coffee/tests
 
 import json
@@ -257,6 +258,7 @@ class OtherEntityTests(unittest.TestCase):
         self.assertGreater(len(attrs["brews"]), 20)
         self.assertEqual(attrs["brews"][0]["id"], records[0]["id"])
         self.assertEqual(attrs["brews_60d"], "120")
+        self.assertEqual(attrs["who_brews"], "mikkel:120")
         self.assertEqual(len(attrs["weeks"].split(",")), 9)
         self.assertEqual(len(attrs["hours"].split(",")), 24)
         self.assertEqual(sum(int(n) for n in attrs["hours"].split(",")), 120)
@@ -270,6 +272,33 @@ class OtherEntityTests(unittest.TestCase):
         _, attrs = pub.brews_entity(records, NOW, "b1", None, NOW)
         self.assertEqual(attrs["brews_60d"], str(sum(1 for r in records if NOW - int(r["id"][1:]) <= 60 * DAY)))
         self.assertNotIn("last_curve", attrs)
+
+    def test_who_made_the_brews_and_who_filled_the_tank_over_sixty_days(self):
+        no_who = {k: v for k, v in record(6).items() if k != "who"}
+        records = [record(1), record(2, outcome="stopped"), record(3, who="claudia"), record(4, who="none"),
+                   record(5, who=None), no_who, record(130, who="kristine")]
+        started = {i: NOW - i * DAY / 2 for i in range(1, 7)}
+
+        def fill(at, user=None, **extra):
+            return {"at": pub.iso(at), "source": "tap", "user": user, **extra}
+
+        fills = [fill(started[3] - 10, "claudia"), fill(started[1] - 10), fill(started[4] - 20, "mikkel"),
+                 {**fill(started[2] + 200), "source": "inferred", "brew": records[1]["id"]},
+                 fill(NOW - 70 * DAY, "mikkel"), fill(NOW - 60)]
+        _, attrs = pub.brews_entity(records, NOW, "b1", None, NOW, fills)
+        all_strings(self, attrs, "coffee_brews")
+        self.assertEqual(attrs["brews_60d"], "6")
+        self.assertEqual(attrs["who_brews"], "mikkel:2,claudia:1,none:3")
+        self.assertEqual(attrs["who_fills"], "mikkel:3,claudia:1")
+
+    def test_a_fill_without_a_brew_counts_once_its_window_has_passed(self):
+        fills = [{"at": pub.iso(NOW - 14 * 60), "source": "tap", "user": "claudia"}]
+        self.assertNotIn("who_fills", pub.brews_entity([], NOW, "b1", None, NOW, fills)[1])
+        self.assertEqual(pub.brews_entity([], NOW + 60, "b1", None, NOW, fills)[1]["who_fills"], "claudia:1")
+
+    def test_no_brews_and_no_fills_leave_the_counts_out(self):
+        attrs = pub.brews_entity([], NOW, "b1", None, NOW)[1]
+        self.assertFalse([key for key in attrs if key.startswith("who_")])
 
     def test_a_brew_row_leaves_out_what_is_unknown(self):
         row = pub.brew_row({"id": "c1", "started_at": "2026-10-01T06:00:00+00:00", "outcome": "unobserved",

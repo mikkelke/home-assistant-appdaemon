@@ -1,7 +1,7 @@
 # tests/test_coffee_machine.py - CoffeeMachine end to end on a fake AppDaemon (coffee_fake.py): what it
 # publishes, a replayed brew (real plug readings, the integration's event order) into the ledger and a
-# curve file, the start, the cup check and the wake, the link, who is told, beans, the water tank, the advisor with a
-# stubbed AI task, restarts, and guards against shadowing AppDaemon.
+# curve file, the start, the cup check and the wake, the link, who is told, beans, the water tank and who filled it,
+# the advisor with a stubbed AI task, restarts, and guards against shadowing AppDaemon.
 # Run from repo root: python3 -m unittest discover -s apps/coffee/tests
 
 import ast
@@ -1422,6 +1422,83 @@ class TankTests(unittest.TestCase):
         brew(app, brew_id="c1792476200")
         self.assertFalse(app._tank.dry)
         self.assertGreater(int(coffee_state(app)[1]["tank_left_ml"]), 946 - 400)
+
+
+class WhoFilledTests(unittest.TestCase):
+    def counts(self, app):
+        attrs = fake.last(app, "sensor.coffee_brews")[1]
+        return attrs.get("who_brews"), attrs.get("who_fills")
+
+    def test_a_tap_is_logged_with_the_resident_whose_account_it_was(self):
+        app = fake.make_app()
+        fake.op(app, "water_filled", user_id=MIKKEL)
+        fake.advance(app, 60)
+        fake.op(app, "water_filled")
+        self.assertEqual(app._tank.fills, [{"at": cm.cf.iso(T0), "source": "tap", "user": "mikkel"},
+                                           {"at": cm.cf.iso(T0 + 60), "source": "tap", "user": None}])
+
+    def test_the_log_is_saved_and_survives_a_restart(self):
+        app = fake.make_app()
+        fake.op(app, "water_filled", user_id=MIKKEL)
+        saved = json.loads((app.dir / "coffee_state.json").read_text())
+        self.assertEqual(saved["tank"]["fills"], [{"at": cm.cf.iso(T0), "source": "tap", "user": "mikkel"}])
+        again = fake.make_app(state_dir=app.dir, now=app.now, states=app.states)
+        self.assertEqual(again._tank.fills, app._tank.fills)
+
+    def test_the_brew_after_a_tap_tells_who_filled(self):
+        for tap_user, brew_user, who_brews, who_fills in (
+                (TABLET, MIKKEL, "mikkel:1", "mikkel:1"), (TABLET, TABLET, "none:1", "none:1"),
+                (MIKKEL, TABLET, "none:1", "mikkel:1"), (MIKKEL, KRISTINE, "kristine:1", "kristine:1")):
+            with self.subTest(tap=tap_user, brew=brew_user):
+                app = fake.make_app()
+                fake.op(app, "water_filled", user_id=tap_user)
+                self.assertEqual(self.counts(app), (None, None))
+                brew(app, user=brew_user)
+                self.assertEqual(self.counts(app), (who_brews, who_fills))
+
+    def test_a_tap_no_brew_follows_counts_when_its_window_has_passed(self):
+        app = fake.make_app()
+        fake.advance(app, 300)
+        fake.op(app, "water_filled", user_id=MIKKEL)
+        fake.advance(app, 899)
+        self.assertEqual(self.counts(app), (None, None))
+        fake.advance(app, 3)
+        self.assertEqual(self.counts(app), (None, "mikkel:1"))
+
+    def test_a_restart_inside_the_window_still_settles_the_fill(self):
+        app = fake.make_app()
+        fake.op(app, "water_filled", user_id=MIKKEL)
+        fake.advance(app, 600)
+        again = fake.make_app(state_dir=app.dir, now=app.now, states=app.states)
+        self.assertEqual(self.counts(again), (None, None))
+        fake.advance(again, 902)
+        self.assertEqual(self.counts(again), (None, "mikkel:1"))
+
+    def test_a_refill_seen_from_a_brew_is_logged_and_counted_for_that_brew(self):
+        app = fake.make_app()
+        fake.op(app, "water_filled")
+        brew(app)
+        fake.advance(app, 600)
+        fake.cup_on(app)
+        fake.op(app, "start", {"variant": "usual"})
+        fake.fire(app, "xbloom_brew_failed", {"reason": "no_water", "run_id": "r1",
+                                              "context": {"coffee_brew_id": coffee_state(app)[1]["brew_id"]}})
+        fake.advance(app, 70)
+        brew(app, user=MIKKEL, brew_id="c1792476200")
+        revealing = fake.ledger(app)[-1]
+        self.assertEqual(revealing["who"], "mikkel")
+        self.assertEqual([(f["source"], f.get("brew")) for f in app._tank.fills], [("tap", None),
+                                                                                  ("inferred", revealing["id"])])
+        self.assertEqual(self.counts(app), ("mikkel:1,none:1", "mikkel:1,none:1"))
+
+    def test_a_chip_pick_while_the_brew_is_ready_changes_the_count(self):
+        app = fake.make_app()
+        fake.replay(app, [s for s in fake.synthetic_brew(BREW_ID, None) if s[0] <= 250])
+        self.assertEqual(coffee_state(app)[0], "ready")
+        self.assertEqual(self.counts(app)[0], "none:1")
+        fake.op(app, "notify", {"person": "claudia"})
+        self.assertEqual(self.counts(app)[0], "claudia:1")
+
 
 class AdvisorTests(unittest.TestCase):
     def test_no_agent_by_default_and_no_ask(self):

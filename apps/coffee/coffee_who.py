@@ -9,7 +9,13 @@ person is home, its distance to the coffee bar read CONFIDENT_M or less at an up
 before the start to AFTER_S after it, and it moved in the MOVED_S before the start (its area changed,
 or that distance changed by MOVED_M or more). A phone lying still is never evidence. Bermuda picks the
 one confident phone; of several, the closest when the next is MARGIN_M or more farther, else nobody.
+
+Who filled the water tank is told by the brew that follows (fill_by): the first to start within FILL_WINDOW_S
+after a tap, or the one that showed an inferred refill. Its person fills; a brew that names nobody leaves it to
+the resident whose account tapped, else nobody.
 """
+
+from coffee_fsm import epoch
 
 CONFIDENT_M = 2.0
 BEFORE_S = 180
@@ -18,6 +24,7 @@ MOVED_S = 900
 MOVED_M = 1.0
 MARGIN_M = 1.0
 KEEP_S = 1200
+FILL_WINDOW_S = 900
 PEOPLE = ("mikkel", "kristine", "claudia")
 
 
@@ -100,3 +107,45 @@ def notify_target(who, chip):
     if chip in PEOPLE or chip == "none":
         return chip
     return who if who in PEOPLE else "none"
+
+
+def named(who):
+    """`who` when it is a resident, else "none"."""
+    return who if who in PEOPLE else "none"
+
+
+def _started(record):
+    return epoch(record.get("started_at")) or epoch(record.get("ts"))
+
+
+def fill_by(fill, records, now):
+    """Who filled the tank at `fill` (a coffee_tank fill), by the ledger `records`: a resident or "none", and None
+    while it is pending: no brew yet and the fill under FILL_WINDOW_S old."""
+    at = epoch(fill["at"])
+    if fill.get("brew"):
+        brew = next((r for r in records if r.get("id") == fill["brew"]), None)
+    else:
+        brew = min((r for r in records if at <= (_started(r) or -1) <= at + FILL_WINDOW_S), key=_started, default=None)
+    if brew is None and now - at < FILL_WINDOW_S:
+        return None
+    who = named((brew or {}).get("who"))
+    return who if who != "none" else named(fill.get("user"))
+
+
+def fill_counts(fills, records, now, since):
+    """{who: fills} of the fills at `since` (epoch s) or later that are not pending."""
+    counts = {}
+    for fill in fills:
+        if epoch(fill["at"]) < since:
+            continue
+        by = fill_by(fill, records, now)
+        if by is not None:
+            counts[by] = counts.get(by, 0) + 1
+    return counts
+
+
+def counts_csv(counts):
+    """`mikkel:18,claudia:2,none:15`: the most first, "none" last, nobody with no count."""
+    ranked = sorted((who, n) for who, n in counts.items() if n > 0)
+    ranked.sort(key=lambda item: (item[0] == "none", -item[1]))
+    return ",".join(f"{who}:{n}" for who, n in ranked)

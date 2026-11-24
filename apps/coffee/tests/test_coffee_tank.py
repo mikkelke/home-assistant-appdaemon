@@ -1,6 +1,6 @@
 # tests/test_coffee_tank.py - the water tank: unknown until the first fill, a brew's water debited once, a fill or a
 # run-dry in the middle of a brew, a refill seen from water poured after a run-dry, the last ten run-dry moments,
-# and the store.
+# the log of fills, and the store.
 # Run from repo root: python3 -m unittest discover -s apps/coffee/tests
 
 import json
@@ -14,6 +14,7 @@ import coffee_tank as ctank  # noqa: E402
 
 NOW = datetime(2026, 10, 20, 6, 0, tzinfo=timezone.utc)
 MIN = timedelta(minutes=1)
+DAY = timedelta(days=1)
 
 
 def filled(**kw):
@@ -133,16 +134,70 @@ class EmptiesTests(unittest.TestCase):
         self.assertEqual([e["used_ml"] for e in tank.empties], [102.0 + i for i in range(10)])
 
 
+class FillLogTests(unittest.TestCase):
+    def test_a_tap_is_logged_with_the_resident_whose_account_it_was(self):
+        tank = ctank.Tank()
+        tank.fill(NOW, user="mikkel")
+        tank.fill(NOW + MIN)
+        self.assertEqual(tank.fills, [{"at": "2026-10-20T06:00:00+00:00", "source": "tap", "user": "mikkel"},
+                                      {"at": "2026-10-20T06:01:00+00:00", "source": "tap", "user": None}])
+        self.assertEqual(tank.filled_at, tank.fills[-1]["at"])
+
+    def test_a_refill_seen_from_the_water_poured_is_logged_with_the_brew_that_showed_it(self):
+        tank = filled()
+        tank.empty(NOW + MIN, 250.0)
+        tank.brew_done(250.0, "c1", NOW + MIN)
+        tank.brew_done(103.5, "c2", NOW + 2 * MIN)
+        self.assertEqual(tank.fills[1:], [{"at": "2026-10-20T06:02:00+00:00", "source": "inferred", "user": None,
+                                           "brew": "c2"}])
+        self.assertEqual(tank.filled_at, tank.fills[-1]["at"])
+
+    def test_a_start_refused_for_want_of_water_then_a_brew_is_logged_the_same_way(self):
+        tank = filled()
+        tank.brew_done(255.0, "c1", NOW)
+        tank.empty(NOW + MIN)
+        tank.brew_done(272.0, "c2", NOW + 2 * MIN)
+        self.assertEqual([(f["source"], f.get("brew")) for f in tank.fills], [("tap", None), ("inferred", "c2")])
+
+    def test_what_is_no_refill_is_not_logged(self):
+        tank = filled()
+        tank.empty(NOW + MIN, 250.0)
+        tank.brew_done(410.0, "c1", NOW + 2 * MIN)
+        tank.brew_done(ctank.REFILL_MIN_ML, "c2", NOW + 3 * MIN)
+        self.assertEqual([f["source"] for f in tank.fills], ["tap"])
+
+    def test_the_last_ninety_days_are_kept(self):
+        tank = filled()
+        tank.fill(NOW + 89 * DAY)
+        self.assertEqual(len(tank.fills), 2)
+        tank.fill(NOW + 91 * DAY)
+        self.assertEqual([f["at"] for f in tank.fills], ["2027-01-17T06:00:00+00:00", "2027-01-19T06:00:00+00:00"])
+
+
 class StoreTests(unittest.TestCase):
     def test_a_round_trip(self):
         tank = filled()
         tank.brew_done(255.0, "c1")
-        tank.fill(NOW + MIN, 100.0)
+        tank.fill(NOW + MIN, 100.0, "claudia")
         tank.empty(NOW + 2 * MIN, 130.0)
+        tank.brew_done(150.0, "c2", NOW + 3 * MIN)
+        tank.brew_done(103.5, "c3", NOW + 4 * MIN)
         again = ctank.Tank(json.loads(json.dumps(tank.to_dict())))
         self.assertEqual(again.to_dict(), tank.to_dict())
+        self.assertEqual([f["source"] for f in again.fills], ["tap", "tap", "inferred"])
         self.assertEqual(again.view(), tank.view())
-        self.assertFalse(again.brew_done(1.0, "c1"))
+        self.assertFalse(again.brew_done(1.0, "c3"))
+
+    def test_a_saved_fill_that_is_no_fill_is_dropped(self):
+        good = {"at": "2026-10-20T06:00:00+00:00", "source": "tap", "user": "mikkel"}
+        saved = [good, None, "x", {"at": "2026-10-20T06:00:00+00:00"}, {"at": 5, "source": "tap"},
+                 {"at": "yesterday", "source": "tap"}, {"at": "2026-10-20T06:00:00+00:00", "source": "pour"},
+                 {"at": "2026-10-20T06:01:00+00:00", "source": "inferred", "user": 7, "brew": 3}]
+        self.assertEqual(ctank.Tank({"fills": saved}).fills,
+                         [good, {"at": "2026-10-20T06:01:00+00:00", "source": "inferred", "user": None}])
+        for data in ("x", 5, {"at": "a"}, None):
+            self.assertEqual(ctank.Tank({"fills": data}).fills, [], data)
+        self.assertEqual(ctank.Tank({}).to_dict()["fills"], [])
 
     def test_nothing_usable_is_no_state(self):
         for data in (None, "x", [], {"used_ml": "x", "filled_at": 5, "offset_ml": True, "empties": "x"},

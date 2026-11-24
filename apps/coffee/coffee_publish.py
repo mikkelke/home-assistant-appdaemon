@@ -7,11 +7,13 @@ measured on serialized attributes.
 """
 
 import json
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import coffee_baseline as cb
 import coffee_curve as cc
+import coffee_who as cw
 from coffee_fsm import FAULTS, epoch, iso
 
 V = "1"
@@ -242,7 +244,8 @@ def brew_row(record):
     return {k: v for k, v in row.items() if isinstance(v, str) and v != ""}
 
 
-def brews_entity(records, now, bean_id, last_curve, changed_at):
+def brews_entity(records, now, bean_id, last_curve, changed_at, fills=()):
+    """`fills` are coffee_tank.Tank.fills."""
     since = now - BREWS_DAYS * 86400
     recent = [r for r in records if (_record_ts(r) or 0) >= since]
     recent.sort(key=lambda r: _record_ts(r) or 0, reverse=True)
@@ -265,6 +268,8 @@ def brews_entity(records, now, bean_id, last_curve, changed_at):
              "brews_60d": str(len(recent)), "beans_planned_g_60d": num(planned),
              "hours": ",".join(str(n) for n in hours), "taste": ",".join(f"{k}:{v}" for k, v in tastes.items()),
              "rated_current_beans": str(sum(tastes.values())),
+             "who_brews": cw.counts_csv(Counter(cw.named(r.get("who")) for r in recent)),
+             "who_fills": cw.counts_csv(cw.fill_counts(fills, records, now, since)),
              "last_curve": cc.csv(cc.every(last_curve, LAST_CURVE_STEP)) if last_curve else None}
     out = finish("coffee_brews", attrs)
     while size(out) > CAPS["coffee_brews"] and attrs["brews"]:

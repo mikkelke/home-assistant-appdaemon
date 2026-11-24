@@ -7,16 +7,36 @@ water it pours after the event is debited. The water used may pass the capacity,
 A run-dry is a brew the machine stopped for want of water; its low-water warning during a brew that pours on is
 no run-dry. After a run-dry the tank is `dry`: a later brew that pours more than REFILL_MIN_ML means it was refilled, and
 the tank counts as full from that brew on. `empties` keeps the water used at each of the last EMPTIES_MAX run-dry
-moments.
+moments. `fills` keeps every fill of the last FILLS_KEEP_S: a tap on "Filled" with the resident whose account it was
+(None for a shared one), or a refill seen from the water poured, with the id of the brew that showed it. Who filled
+is worked out from them and the ledger (coffee_who.fill_by), never stored.
 """
+
+from coffee_fsm import epoch
 
 DEFAULT_ML = 946
 EMPTIES_MAX = 10
 REFILL_MIN_ML = 30
+FILLS_KEEP_S = 90 * 86400
+FILL_SOURCES = ("tap", "inferred")
 
 
 def _ml(value):
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _fill(value):
+    """A saved fill as it is kept, None when it is no fill."""
+    if not isinstance(value, dict) or value.get("source") not in FILL_SOURCES:
+        return None
+    at = value.get("at")
+    if not isinstance(at, str) or epoch(at) is None:
+        return None
+    user = value.get("user")
+    fill = {"at": at, "source": value["source"], "user": user if isinstance(user, str) else None}
+    if isinstance(value.get("brew"), str):
+        fill["brew"] = value["brew"]
+    return fill
 
 
 class Tank:
@@ -31,21 +51,32 @@ class Tank:
                         ][-EMPTIES_MAX:]
         self.debited_id = data.get("debited_id") if isinstance(data.get("debited_id"), str) else None
         self.dry = data.get("dry") is True
+        saved = data.get("fills") if isinstance(data.get("fills"), list) else []
+        self.fills = [fill for fill in map(_fill, saved) if fill]
 
     def to_dict(self):
         return {"filled_at": self.filled_at, "used_ml": self.used_ml, "offset_ml": self.offset_ml,
-                "empties": self.empties, "debited_id": self.debited_id, "dry": self.dry}
+                "empties": self.empties, "debited_id": self.debited_id, "dry": self.dry, "fills": self.fills}
 
     @property
     def left(self):
         return None if self.filled_at is None else max(0.0, self.capacity - self.used_ml)
 
-    def fill(self, now, brew_water_ml=None):
-        """The tank is full. `brew_water_ml`: what the running brew has dispensed so far, if one runs."""
+    def fill(self, now, brew_water_ml=None, user=None):
+        """The tank is full. `brew_water_ml`: what the running brew has dispensed so far, if one runs; `user`: the
+        resident whose account tapped."""
         self.used_ml = 0.0
         self.filled_at = now.isoformat(timespec="seconds")
         self.offset_ml = _ml(brew_water_ml)
         self.dry = False
+        self._log_fill(now, "tap", user)
+
+    def _log_fill(self, now, source, user=None, brew=None):
+        fill = {"at": now.isoformat(timespec="seconds"), "source": source, "user": user}
+        if brew is not None:
+            fill["brew"] = brew
+        cutoff = now.timestamp() - FILLS_KEEP_S
+        self.fills = [f for f in self.fills + [fill] if epoch(f["at"]) >= cutoff]
 
     def used(self, brew_water_ml=None):
         """The water used since the fill, counting the running brew's reading; None while the level is unknown."""
@@ -78,6 +109,7 @@ class Tank:
                 self.used_ml = round(poured, 1)
                 self.filled_at = now.isoformat(timespec="seconds")
                 self.dry = False
+                self._log_fill(now, "inferred", brew=brew_id)
             else:
                 self.used_ml = round(self.used_ml + poured, 1)
         self.offset_ml = None

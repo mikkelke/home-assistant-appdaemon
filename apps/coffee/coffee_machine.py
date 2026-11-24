@@ -229,6 +229,7 @@ class CoffeeMachine(hass.Hass):
         self.run_every(self._on_house_tick, f"now+{HOUSE_TICK_S}", HOUSE_TICK_S)
         self.run_daily(self._on_midnight, time(0, 5))
         self.run_in(self._refresh_recipes, RECIPES_DELAY_S)
+        self.run_in(self._on_fills_settle, cw.FILL_WINDOW_S + 1)
 
         self._ensure_files()
         self._load_ledger(force=True)
@@ -566,6 +567,10 @@ class CoffeeMachine(hass.Hass):
     def _on_midnight(self, kwargs):
         self._write_recent(self._now())
         self._publish("coffee_brews", force=True)
+
+    def _on_fills_settle(self, kwargs):
+        """A fill that no brew has followed counts once its window has passed."""
+        self._publish("coffee_brews")
 
     # -- effects ------------------------------------------------------------------------------------
 
@@ -1315,6 +1320,7 @@ class CoffeeMachine(hass.Hass):
             self._resolve_who(brew, final=brew.get("who_final", False))
             if brew["phase"] == "ready":
                 self._upsert_record(brew)
+                self._publish("coffee_brews")
         else:
             self._pending_notify = {"person": person, "at": cf.iso(now)}
         self._publish_state()
@@ -1428,8 +1434,9 @@ class CoffeeMachine(hass.Hass):
 
     def _op_water_filled(self, user, data, now):
         running = self._tracker.phase() in cf.RUNNING
-        self._tank.fill(self._now_dt(), self._tracker.water if running else None)
+        self._tank.fill(self._now_dt(), self._tracker.water if running else None, self._person_for(user, now))
         self._info("Water tank filled")
+        self.run_in(self._on_fills_settle, cw.FILL_WINDOW_S + 1)
         self._publish_state()
         self._save_state()
 
@@ -1739,7 +1746,8 @@ class CoffeeMachine(hass.Hass):
         elif key == "coffee_brews":
             bean = self._beans.primary((self._usual() or {}).get("name"))
             changed = self._ledger_stamp[0] / 1e9 if self._ledger_stamp else None
-            state, attrs = pub.brews_entity(self._records, now, (bean or {}).get("id"), self._last_curve(), changed)
+            state, attrs = pub.brews_entity(self._records, now, (bean or {}).get("id"), self._last_curve(), changed,
+                                            self._tank.fills)
         elif key == "coffee_recipes":
             state, attrs = pub.recipes_entity([cp.recipe_entry(r) for r in self._recipes], self._usual())
         else:
