@@ -1,0 +1,10 @@
+/var/log/wan-probe/events.jsonl {
+    monthly
+    rotate 12
+    dateext
+    compress
+    delaycompress
+    copytruncate
+    missingok
+    notifempty
+}

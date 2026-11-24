@@ -1,0 +1,14 @@
+[Unit]
+Description=WAN outage forensics probe (1 Hz ping and DNS checks, mtr capture during incidents)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/wan-probe
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
