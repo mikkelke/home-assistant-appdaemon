@@ -23,7 +23,9 @@ where it was before.
 A zone whose profile lists when_home entities runs its periods only while one of them reads
 home. While all of them read something else the zone is in mode away and holds what its profile
 gives outside the periods; an entity that is missing, unknown or unavailable counts as home. A
-change of state of any of them triggers an evaluation, a new position of a phone does not.
+change of state of any of them triggers an evaluation, a new position of a phone does not. A
+profile with a travel tracker is in mode travel instead while that tracker's last fix, at most
+12 h old, is farther from zone.home than the travel distance; no usable fix means not travelling.
 
 A zone with a transit block stops its call early by the heat its loops already hold in the
 floor. Every evaluation adds the loops' power to that heat (heating_plan.TransitState): flow
@@ -106,6 +108,7 @@ FLOOR_CAP_FRESH_MIN = 1440.0
 OUTDOOR_FRESH_MIN = 20.0
 PROBE_FRESH_MIN = 15.0
 CALL_START_LOG_S = 900.0
+TRAVEL_FIX_MAX_AGE_S = 12 * 3600.0
 DAILY_KEEP = 60
 NOTIFIED_KEEP_S = 3 * 86400.0
 SIGNALS_KEEP = 50
@@ -840,6 +843,19 @@ class HeatingController(hass.Hass):
             self._location = (lat, lon)
         return self._location
 
+    def _travelling(self, travel: Optional[hp.Travel], now_ts: float) -> bool:
+        """Whether the travel tracker's last fix is farther from home than the travel distance."""
+        if travel is None:
+            return False
+        home, snap = self._read_location(), self._snap(travel.tracker)
+        if home is None or snap is None or snap["ts"] is None:
+            return False
+        attrs = snap["attributes"]
+        lat, lon = _num(attrs.get("latitude")), _num(attrs.get("longitude"))
+        if lat is None or lon is None or now_ts - snap["ts"] > TRAVEL_FIX_MAX_AGE_S:
+            return False
+        return hp.distance_km(home, (lat, lon)) > travel.km
+
     def _fetch_forecast(self, kwargs):
         with self._lock:
             location = self._read_location()
@@ -1248,7 +1264,7 @@ class HeatingController(hass.Hass):
 
     def _comfort_air(
         self, rt: ZoneRuntime, reading: dict, now_ts: float, tz, base: float, lower: float,
-        window_active: bool, away: bool,
+        window_active: bool, away: bool, travelling: bool,
     ) -> None:
         """Feed the zone's comfort switch the room readings of this evaluation and let the room
         it picks, if any, stand in for the weighted mean as the control air. An airing is not
@@ -1257,7 +1273,7 @@ class HeatingController(hass.Hass):
         if comfort is None:
             return
         comfort.observe(now_ts, reading["feels"], record=not window_active)
-        target = hp.comfort_target(zc, base, rt.nudge, now_ts, tz, lower, away)
+        target = hp.comfort_target(zc, base, rt.nudge, now_ts, tz, lower, away, travelling)
         before = comfort.active
         comfort.decide(now_ts, target)
         reading["comfort_means"] = means = comfort.means(now_ts)
@@ -1294,7 +1310,10 @@ class HeatingController(hass.Hass):
         base = helper if helper is not None else zc.base_c
         lower, upper = self._device_limits(rt)
         away = hp.user_away(zc.profile, {e: self._state_of(e) for e in zc.profile.when_home})
-        self._comfort_air(rt, reading, now_ts, tz, base, lower, window_active, away)
+        travelling = away and self._travelling(zc.profile.travel, now_ts)
+        if travelling:
+            lower = min(lower, zc.profile.travel.lower_c)
+        self._comfort_air(rt, reading, now_ts, tz, base, lower, window_active, away, travelling)
         openings = {e: self._state_of(e) for e in zc.openings}
         event = rt.tracker.update(now_ts, openings, reading["air"])
 
@@ -1335,6 +1354,7 @@ class HeatingController(hass.Hass):
             cut_windows=cut.windows,
             floor_cap=rt.floor_cap and reading["floor_fresh"],
             away=away,
+            travelling=travelling,
         )
         plan = hp.plan(zc, inp, now_ts, tz)
         rt.last_plan_mode = plan.plan_mode

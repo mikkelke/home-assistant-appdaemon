@@ -646,6 +646,31 @@ class ConfigParsing(unittest.TestCase):
             ):
                 self.when_home_of(bad)
 
+    def travel_of(self, value, when_home=("person.a",)):
+        profile = {"lead_hours": 4, "when_home": list(when_home), "travel": value}
+        return hp.parse_config(self._broken(profile=profile)).zones["family"].profile.travel
+
+    def test_a_travel_block_names_its_tracker_distance_and_lower_limit(self):
+        travel = {"tracker": "device_tracker.p", "km": 50, "lower_limit_c": 17}
+        self.assertEqual(self.travel_of(travel), hp.Travel("device_tracker.p", 50.0, 17.0))
+        self.assertIsNone(CFG.zones["family"].profile.travel)
+        bad = [
+            ({"km": 50, "lower_limit_c": 17}, ("person.a",)),
+            (travel, ()),
+            ({**travel, "km": 0}, ("person.a",)),
+            ({**travel, "lower_limit_c": 4}, ("person.a",)),
+            ("device_tracker.p", ("person.a",)),
+        ]
+        for value, when_home in bad:
+            with self.subTest(value=value), self.assertRaisesRegex(
+                hp.ConfigError, "zone family: profile travel"
+            ):
+                self.travel_of(value, when_home)
+
+    def test_distance_is_the_great_circle_in_km(self):
+        self.assertAlmostEqual(hp.distance_km((55.6761, 12.5683), (56.1629, 10.2039)), 156.9, 0)
+        self.assertEqual(hp.distance_km((55.0, 12.0), (55.0, 12.0)), 0.0)
+
     def _broken(self, **zone_change):
         zones = dict(ARGS["zones"], family=dict(FAMILY, **zone_change))
         return dict(ARGS, zones=zones)
@@ -858,7 +883,7 @@ class AllowedByMode(unittest.TestCase):
 
 
 class ModePrecedence(unittest.TestCase):
-    """window > settle > party > floor_cap > guard > sun_cut > fallback > away > hold."""
+    """window > settle > party > floor_cap > guard > sun_cut > fallback > travel > away > hold."""
 
     zone = replace(
         CFG.zones["family"],
@@ -866,6 +891,9 @@ class ModePrecedence(unittest.TestCase):
         floor_max_c=26.0,
     )
     waiting = replace(zone, profile=replace(zone.profile, when_home=("person.mikkel",)))
+    travelling = replace(
+        waiting, profile=replace(waiting.profile, travel=hp.Travel("device_tracker.p", 50.0, 17.0))
+    )
 
     def mode_of(self, **kw):
         base = dict(
@@ -912,6 +940,24 @@ class ModePrecedence(unittest.TestCase):
         self.assertEqual(mode_of(party_windows=((T(8), T(18)),)), "party")
         self.assertEqual(mode_of(window_state=hp.STATE_SETTLE), "settle")
         self.assertEqual(mode_of(window_state=hp.STATE_OPEN), "window")
+
+    def test_travel_holds_the_lower_limit_given_and_wins_over_away(self):
+        def plan(**kw):
+            base = dict(away=True, travelling=True, fallback=False, hold_back=False)
+            base.update(floor_cap=False, lower_c=17.0, **kw)
+            return hp.plan(self.travelling, inputs(**base), T(12), TZ)
+
+        p = plan()
+        self.assertEqual((p.plan_mode, p.aim, p.reasons), (
+            "travel", 17.0, ("Mikkel travelling: holding 17.0 °C",)
+        ))
+        self.assertEqual(plan(travelling=False).plan_mode, "away")
+        self.assertEqual(plan(away=False).plan_mode, "hold")
+        self.assertEqual(plan(fallback=True).plan_mode, "fallback")
+        self.assertEqual(plan(window_state=hp.STATE_OPEN).plan_mode, "window")
+        without = hp.plan(self.waiting, inputs(away=True, travelling=True, fallback=False,
+                                               hold_back=False, floor_cap=False), T(12), TZ)
+        self.assertEqual(without.plan_mode, "away")
 
     def test_fallback_suppresses_cuts_but_not_window_or_party(self):
         zc = CFG.zones["family"]

@@ -553,11 +553,16 @@ class ShippedYaml(unittest.TestCase):
     def test_bathroom_is_warm_from_night_to_morning_and_20_the_rest_of_the_day(self):
         zc = self.cfg.zones["bathroom"]
         self.assertEqual(zc.profile.lead_hours, 0)
-        self.assertTrue(zc.profile.outside_is_lower_limit)
+        self.assertFalse(zc.profile.outside_is_lower_limit)
         self.assertEqual(
             [(p.start, p.end, p.offset) for p in zc.profile.periods],
             [(150, 9 * 60, 0.0), (9 * 60, 150, -2.0)],
         )
+
+    def test_bathroom_holds_20_while_mikkel_is_out_and_17_while_he_travels(self):
+        zc = self.cfg.zones["bathroom"]
+        self.assertEqual((zc.base_c, zc.profile.default_offset, zc.lower_c), (22.0, -2.0, 19.0))
+        self.assertEqual(zc.profile.travel, hp.Travel(MIKKEL_PHONE, 50.0, 17.0))
 
     def test_only_the_bathroom_waits_for_its_user_to_be_home(self):
         waiting = {n: zc.profile.when_home for n, zc in self.cfg.zones.items()}
@@ -3441,12 +3446,12 @@ class UserAwayEndToEnd(LiveZones, unittest.TestCase):
         return h
 
     def live_morning(self, person, phone):
-        """04:00 with the bathroom live and its air at 20.0, between the lower limit and the
-        period's 22.0."""
+        """04:00 with the bathroom live and its air at 20.5, between the 20.0 it holds while
+        Mikkel is out and the period's 22.0."""
         h = self.live("bathroom")
         h.at(4, 0, day=18)
         self.whereabouts(h, person, phone)
-        self.air(h, 20.0, "bathroom")
+        self.air(h, 20.5, "bathroom")
         h.tick()
         if h.calls:
             h.echo()
@@ -3475,7 +3480,7 @@ class UserAwayEndToEnd(LiveZones, unittest.TestCase):
         self.assertEqual(self.bathroom(h), ("hold", 22.0))
         self.assertEqual(h.zone("bathroom")["state"], 22.0)
 
-    def test_with_both_away_the_bathroom_holds_its_lower_limit_and_says_why(self):
+    def test_with_both_away_nearby_the_bathroom_holds_20_and_says_why(self):
         for person, phone in (
             ("not_home", "not_home"),
             ("not_home", "Pernille"),
@@ -3485,9 +3490,10 @@ class UserAwayEndToEnd(LiveZones, unittest.TestCase):
                 h = self.morning(person, phone)
                 a = h.attrs("bathroom")
                 self.assertEqual((a["mode"], a["plan_mode"]), ("away", "away"))
-                self.assertEqual(a["setpoint_now"], 19.0)
-                self.assertEqual(h.zone("bathroom")["state"], 19.0)
-                self.assertEqual(a["reasons"], ["Mikkel away: holding 19.0 °C"])
+                self.assertEqual(a["setpoint_now"], 20.0)
+                self.assertEqual(h.zone("bathroom")["state"], 20.0)
+                self.assertEqual(a["lower_limit"], 19.0)
+                self.assertEqual(a["reasons"], ["Mikkel away: holding 20.0 °C"])
                 self.assertEqual(self.decision(h, "bathroom")["mode"], "away")
                 assert_publishable(self, a)
 
@@ -3522,7 +3528,7 @@ class UserAwayEndToEnd(LiveZones, unittest.TestCase):
 
     def test_coming_home_mid_period_applies_it_from_then(self):
         h = self.morning("not_home", "not_home")
-        self.assertEqual(self.bathroom(h), ("away", 19.0))
+        self.assertEqual(self.bathroom(h), ("away", 20.0))
         h.clock.advance(minutes=5)
         self.whereabouts(h, "home", "not_home")
         self.deliver(h, "person.mikkel", None)
@@ -3532,7 +3538,7 @@ class UserAwayEndToEnd(LiveZones, unittest.TestCase):
         self.assertEqual(
             self.timeline(h),
             [
-                ("04:00", "04:05", "away", "19.0"),
+                ("04:00", "04:05", "away", "20.0"),
                 ("04:05", "09:00", "hold", "22.0"),
                 ("09:00", "24:00", "hold", "20.0"),
             ],
@@ -3547,12 +3553,77 @@ class UserAwayEndToEnd(LiveZones, unittest.TestCase):
         self.assertEqual(self.bathroom(h), ("hold", 22.0))
         self.whereabouts(h, "not_home", "Pernille")
         h.tick(minutes=5)
-        self.assertEqual(self.bathroom(h), ("away", 19.0))
+        self.assertEqual(self.bathroom(h), ("away", 20.0))
         self.assertEqual(
             self.timeline(h),
-            [("04:00", "06:35", "hold", "22.0"), ("06:35", "24:00", "away", "19.0")],
+            [("04:00", "06:35", "hold", "22.0"), ("06:35", "24:00", "away", "20.0")],
         )
-        self.assertTrue(any("bathroom: hold -> away, aim 19.0" in m for _l, m in h.logs))
+        self.assertTrue(any("bathroom: hold -> away, aim 20.0" in m for _l, m in h.logs))
+
+    FAR = (56.1629, 10.2039)  # about 160 km from HOME_LAT, HOME_LON
+    NEAR = (55.70, 12.30)  # about 17 km
+
+    @staticmethod
+    def fix(h, point, hours_ago=0):
+        h.ha.set(
+            MIKKEL_PHONE, h.ha.entities[MIKKEL_PHONE]["state"],
+            {"latitude": point[0], "longitude": point[1], "gps_accuracy": 20},
+            updated=h.clock.now - timedelta(hours=hours_ago),
+        )
+
+    def test_a_phone_far_from_home_holds_the_travel_limit_and_never_tells_where(self):
+        h = self.morning("not_home", "not_home")
+        self.fix(h, self.FAR)
+        h.tick(minutes=5)
+        a = h.attrs("bathroom")
+        self.assertEqual((a["mode"], a["plan_mode"], a["setpoint_now"]), ("travel", "travel", 17.0))
+        self.assertEqual(a["lower_limit"], 17.0)
+        self.assertEqual(a["reasons"], ["Mikkel travelling: holding 17.0 °C"])
+        self.assertEqual(self.decision(h, "bathroom")["mode"], "travel")
+        self.assertTrue(any("bathroom: away -> travel, aim 17.0" in m for _l, m in h.logs))
+        assert_publishable(self, a)
+        blob = json.dumps(h.published, default=str) + json.dumps(h.logs)
+        blob += "".join(f.read_text() for f in (h.tmp / "heating_log").glob("*"))
+        for needle in ("56.16", "10.20", "latitude", "longitude"):
+            self.assertNotIn(needle, blob)
+
+    def test_away_within_50_km_or_without_a_usable_fix_holds_20(self):
+        for point, hours_ago in ((self.NEAR, 0), (self.FAR, 13), ((None, None), 0)):
+            with self.subTest(point=point, hours_ago=hours_ago):
+                h = self.morning("not_home", "not_home")
+                self.fix(h, point, hours_ago)
+                h.tick(minutes=5)
+                self.assertEqual(self.bathroom(h), ("away", 20.0))
+                self.assertEqual(h.attrs("bathroom")["lower_limit"], 19.0)
+
+    def test_a_far_phone_while_mikkel_is_home_changes_nothing(self):
+        h = self.morning("home", "not_home")
+        self.fix(h, self.FAR)
+        h.tick(minutes=5)
+        self.assertEqual(self.bathroom(h), ("hold", 22.0))
+
+    def test_coming_home_from_a_trip_restores_the_morning_and_the_20_day(self):
+        h = Harness(self)
+        h.ha.set("input_boolean.heating_season", "on")
+        h.at(4, 0, day=18)
+        self.whereabouts(h, "not_home", "not_home")
+        self.fix(h, self.FAR)
+        h.tick()
+        self.assertEqual(self.bathroom(h), ("travel", 17.0))
+        h.clock.advance(minutes=5)
+        self.whereabouts(h, "home", "not_home")
+        self.deliver(h, "person.mikkel", None)
+        h.app._evaluate_pending({})
+        self.assertEqual(self.bathroom(h), ("hold", 22.0))
+        self.assertEqual(h.attrs("bathroom")["lower_limit"], 19.0)
+        self.assertEqual(
+            self.timeline(h),
+            [
+                ("04:00", "04:05", "travel", "17.0"),
+                ("04:05", "09:00", "hold", "22.0"),
+                ("09:00", "24:00", "hold", "20.0"),
+            ],
+        )
 
     def test_a_change_of_state_asks_for_an_evaluation_at_once_and_a_new_position_does_not(self):
         h = self.morning()
