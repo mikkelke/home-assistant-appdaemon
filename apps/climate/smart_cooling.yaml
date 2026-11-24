@@ -179,7 +179,7 @@ SmartCooling:
   # actuation ceiling is the same effective_ceiling() fn on the same temp/RH/persons + params,
   # so the pre-cool target stays byte-identical. If you retune one file, retune the other.
   comfort_temp_entity: sensor.bedroom_median_temperature
-  comfort_rh_entity: sensor.bedroom_humidity
+  comfort_rh_entity: sensor.bedroom_seated_thermometer_humidity
   comfort_persons:
     - person.mikkel
   comfort_anchor_c: 23.0

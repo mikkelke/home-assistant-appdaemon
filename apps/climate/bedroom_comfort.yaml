@@ -12,7 +12,7 @@ BedroomComfort:
   module: bedroom_comfort
   class: BedroomComfort
   temperature_entity: sensor.bedroom_median_temperature
-  humidity_entity: sensor.bedroom_humidity
+  humidity_entity: sensor.bedroom_seated_thermometer_humidity
   outdoor_temperature_entity: sensor.gw2000a_outdoor_temperature
   outdoor_humidity_entity: sensor.gw2000a_humidity
   # Mikkel's bedroom only (2026-07-15) -- Kristine has her own room, never a second
