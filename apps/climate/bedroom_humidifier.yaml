@@ -1,14 +1,17 @@
 # /conf/apps/climate/bedroom_humidifier.yaml
-# Runs the bedroom's SwitchBot evaporative humidifier through Mikkel's night and dries its wick in
-# the morning - see bedroom_humidifier.py's module docstring for the rules. Publishes
-# sensor.bedroom_humidifier (off | humidifying | drying | manual | no_water | unknown) with a
-# `reason` attribute.
+# Runs the bedroom's SwitchBot evaporative humidifier before bed and through Mikkel's night and
+# dries its wick in the morning - see bedroom_humidifier.py's module docstring for the rules.
+# Publishes sensor.bedroom_humidifier (off | humidifying | drying | manual | no_water | unknown)
+# with a `reason` attribute and, before bed and at night, a `phase` attribute (preload | night).
 #
 # Night: only while sleep_mode is on and the window is closed. On below on_below % of the bedroom
-# humidity, off from off_at %, in run_mode (the quietest). Morning: when sleep mode turns off after
-# a night in which it ran, drying_mode for drying_hours. Sleep mode off and the humidifier on =
-# manual use, left alone. Water: one push to notify_target per empty spell, while `person` is home
-# or on arrival.
+# humidity, off from off_at %, in run_mode (the quietest). Before bed: the same rule from
+# preload_from until sleep mode turns on, at the latest until preload_until, while `person` is home
+# and the window is closed; in preload_mode while `occupancy` is off, in run_mode while it is on or
+# unreadable. Morning: when sleep mode turns off after a night or an evening in which it ran (or
+# preload_until passes without sleep mode), drying_mode for drying_hours. Outside the evening's
+# window, sleep mode off and the humidifier on = manual use, left alone. Water: one push to
+# notify_target per empty spell, while `person` is home or on arrival.
 #
 # Run log: one JSON line per run, appended to bedroom_humidifier_log.jsonl beside the module
 # (*_log.jsonl is gitignored); set log_file to move it. Restart state: state_file.
@@ -39,7 +42,13 @@ BedroomHumidifier:
   person: person.mikkel
   notify_target: mikkel
   health_entity: sensor.bedroom_humidifier
+  # FP300 radar, on = someone in the bedroom
+  occupancy: binary_sensor.bedroom_presence_presence
   run_mode: sleep
+  # Before bed, house time, quoted HH:MM. An empty preload_from turns the phase off.
+  preload_from: "21:00"
+  preload_until: "02:00"
+  preload_mode: medium
   drying_mode: drying_filter
   drying_hours: 2
   on_below: 40

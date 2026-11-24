@@ -1,10 +1,12 @@
 # tests/test_bedroom_humidifier.py - BedroomHumidifier: night control with hysteresis, window and
 # unreadable inputs, the choice between the humidity sources by freshness, morning drying with its
 # off after two hours, manual use left alone, one water push per empty spell, command retry and
-# pause, restart survival, the run log and the published sensor. The world is a fake Home Assistant
-# whose humidifier obeys service calls and, like the real one, reports state off with mode
-# drying_filter after every turn_off; events caused by the app's own commands arrive after the
-# callback that sent them has returned, as in AppDaemon.
+# pause, restart survival, the run log and the published sensor, and the before-bed phase of the
+# evening (its window, its mode by occupancy, the hand-over to the night, the end without sleep
+# mode). The world is a fake Home Assistant whose humidifier obeys service calls and, like the real
+# one, reports state off with mode drying_filter after every turn_off; events caused by the app's
+# own commands arrive after the callback that sent them has returned, as in AppDaemon. The classes
+# before BeforeBed run with the before-bed phase off, so their clock at 22:00 is not an evening.
 # Run from repo root: python3 -m unittest discover -s apps/climate/tests -q
 
 from __future__ import annotations
@@ -48,15 +50,23 @@ SOURCES = (PRIMARY, FALLBACK)
 SLEEP = "input_boolean.mikkel_sleep_mode"
 WINDOW = "binary_sensor.bedroom_window_contact"
 PERSON = "person.mikkel"
+OCCUPANCY = "binary_sensor.bedroom_presence_presence"
 HEALTH = "sensor.bedroom_humidifier"
 
 MIN = 60
 H = 3600
 T0 = datetime(2026, 11, 24, 22, 0, tzinfo=bh.HOUSE_TZ).timestamp()
 
+
+def at(hour, minute=0, day=24):
+    """A moment of November 2026 (the 25th and later are the next days), house time."""
+    return datetime(2026, 11, day, hour, minute, tzinfo=bh.HOUSE_TZ).timestamp()
+
+
 TURN_ON = ("humidifier/turn_on", {})
 TURN_OFF = ("humidifier/turn_off", {})
 SLEEP_MODE = ("humidifier/set_mode", {"mode": "sleep"})
+MEDIUM_MODE = ("humidifier/set_mode", {"mode": "medium"})
 DRYING_MODE = ("humidifier/set_mode", {"mode": "drying_filter"})
 
 
@@ -69,7 +79,9 @@ class World:
 
     def __init__(self, tmp, now=T0, args=None, **states):
         self.clock = now
-        self.states = {SLEEP: "off", WINDOW: "off", PRIMARY: "35.0", FALLBACK: "unavailable", PERSON: "home"}
+        self.states = {
+            SLEEP: "off", WINDOW: "off", PRIMARY: "35.0", FALLBACK: "unavailable", PERSON: "home", OCCUPANCY: "off",
+        }
         self.states.update(states)
         self.stamps = {}
         self.device = {"state": "off", "mode": "quiet"}
@@ -78,6 +90,7 @@ class World:
         self.calls = []
         self.timeouts = []
         self.timers = []
+        self.daily = []
         self.logs = []
         self.fail = 0
         self.raise_next = None
@@ -93,6 +106,7 @@ class World:
         self.args["state_file"] = str(Path(tmp) / "state.json")
         self.args["log_file"] = str(Path(tmp) / "run_log.jsonl")
         self.args["humidity_max_age_min"] = 30
+        self.args["preload_from"] = None
         self.args.update(args or {})
         self.state_file = Path(self.args["state_file"])
         self.log_file = Path(self.args["log_file"])
@@ -109,6 +123,7 @@ class World:
         app.set_state = MagicMock()
         app.listen_state = MagicMock()
         app.run_every = MagicMock()
+        app.run_daily = lambda callback, start, **kw: self.daily.append((callback.__name__, start.strftime("%H:%M")))
         app.run_in = lambda callback, delay, **kw: self.timers.append((callback.__name__, delay))
         app.log = lambda msg, level="INFO", **kw: self.logs.append((level, msg))
         app.get_app = MagicMock(return_value=self.notifier)
@@ -221,6 +236,9 @@ class World:
 
     def person(self, state):
         self.event(PERSON, state)
+
+    def occupied(self, on):
+        self.event(OCCUPANCY, "on" if on else "off")
 
     def tank(self, level):
         self.level, self.level_changed = level, self.clock
@@ -1153,6 +1171,7 @@ class RunLog(Base):
         self.assertEqual(record, {
             "night": "2026-11-24",
             "kind": "humidify",
+            "phase": "night",
             "start": "2026-11-24T23:00:00+01:00",
             "stop": "2026-11-25T00:30:00+01:00",
             "minutes": 90.0,
@@ -1448,6 +1467,361 @@ class HumiditySources(Base):
         self.assertEqual((record["humidity_source_start"], record["humidity_source_stop"]), (None, PRIMARY))
 
 
+class BeforeBed(Base):
+    """The evening's window, 21:00 to 02:00 as the yaml has it: the night's rule on the same humidity
+    while sleep mode is still off, in medium while the room is empty."""
+
+    def evening(self, clock=at(21, 0), **states):
+        return self.world(now=clock, args={"preload_from": "21:00"}, **states)
+
+    def test_it_starts_at_21_00_in_a_dry_room_and_not_a_second_before(self):
+        w = self.evening(at(20, 0))
+        w.tick_for(59 * MIN + 59)
+        self.assertEqual(w.calls, [])
+        self.assertEqual(w.sensor()[0], "off")
+        w.tick(1)
+        self.assertEqual(w.calls, [TURN_ON, MEDIUM_MODE])
+        self.assertEqual(w.device, {"state": "on", "mode": "medium"})
+        w.tick_for(3 * H)
+        self.assertEqual(len(w.calls), 2, "it runs on, nothing more is sent")
+
+    def test_the_window_is_scheduled_so_the_start_and_the_end_are_on_the_minute(self):
+        w = self.evening(at(20, 0))
+        self.assertEqual(w.daily, [("_tick", "21:00"), ("_tick", "02:00")])
+
+    def test_a_deploy_inside_the_window_starts_at_once(self):
+        w = self.evening(at(22, 15))
+        self.assertEqual(w.calls, [TURN_ON, MEDIUM_MODE])
+        self.assertEqual(w.sensor()[0], "humidifying")
+
+    def test_after_midnight_it_is_still_the_evening_that_began_at_21_00(self):
+        w = self.evening(at(0, 30, 25))
+        self.assertEqual(w.calls, [TURN_ON, MEDIUM_MODE])
+
+    def test_the_same_thresholds_as_the_night_decide_start_and_stop(self):
+        w = self.evening(at(21, 30), **{PRIMARY: "40.0"})
+        self.assertEqual(w.calls, [], "no start at 40 %")
+        w.humidity(39.9)
+        self.assertEqual(w.calls, [TURN_ON, MEDIUM_MODE])
+        w.humidity(41.9)
+        self.assertEqual(w.calls[2:], [], "keeps running in the band")
+        w.humidity(42.0)
+        self.assertEqual(w.calls[2:], [TURN_OFF])
+        w.humidity(41.0)
+        self.assertEqual(w.calls[3:], [], "stays off in the band")
+        w.humidity(39.0)
+        self.assertEqual(w.calls[3:], [TURN_ON, MEDIUM_MODE])
+
+    def test_medium_while_the_room_is_empty_and_sleep_while_someone_is_in_it(self):
+        empty = self.evening(at(22, 0), **{OCCUPANCY: "off"})
+        self.assertEqual(empty.calls, [TURN_ON, MEDIUM_MODE])
+        occupied = self.evening(at(22, 0), **{OCCUPANCY: "on"})
+        self.assertEqual(occupied.calls, [TURN_ON, SLEEP_MODE])
+        self.assertEqual(occupied.device, {"state": "on", "mode": "sleep"})
+
+    def test_an_unreadable_occupancy_counts_as_someone_in_the_room(self):
+        for value in ("unavailable", "unknown"):
+            with self.subTest(value=value):
+                w = self.evening(at(22, 0), **{OCCUPANCY: value})
+                self.assertEqual(w.calls, [TURN_ON, SLEEP_MODE])
+        w = self.evening(at(20, 0))
+        del w.states[OCCUPANCY]
+        w.tick(2 * H)
+        self.assertEqual(w.calls, [TURN_ON, SLEEP_MODE])
+
+    def test_the_mode_follows_the_room_while_it_runs_and_never_turns_it_off(self):
+        w = self.evening(at(22, 0))
+        w.occupied(True)
+        self.assertEqual(w.calls[2:], [SLEEP_MODE])
+        w.occupied(False)
+        self.assertEqual(w.calls[3:], [MEDIUM_MODE])
+        self.assertNotIn(TURN_OFF, w.calls)
+        self.assertEqual(w.device, {"state": "on", "mode": "medium"})
+
+    def test_the_room_changes_nothing_while_the_humidifier_is_off(self):
+        w = self.evening(at(22, 0), **{PRIMARY: "45.0"})
+        w.occupied(True)
+        w.occupied(False)
+        w.tick_for(H)
+        self.assertEqual(w.calls, [])
+
+    def test_leaving_home_stops_it_and_coming_back_starts_it_again(self):
+        w = self.evening(at(21, 30), **{PERSON: "not_home"})
+        self.assertEqual(w.calls, [])
+        self.assertEqual(w.sensor()[1]["reason"], "Not home")
+        w.person("home")
+        self.assertEqual(w.calls, [TURN_ON, MEDIUM_MODE])
+        w.tick(20 * MIN)
+        w.person("not_home")
+        self.assertEqual(w.calls[2:], [TURN_OFF])
+        self.assertEqual(w.sensor()[0], "off")
+        (record,) = w.run_log()
+        self.assertEqual((record["phase"], record["minutes"], record["stop_reason"]), ("preload", 20.0, "Not home"))
+        w.person("home")
+        self.assertEqual(w.calls[3:], [TURN_ON, MEDIUM_MODE])
+
+    def test_another_zone_is_not_home_either(self):
+        w = self.evening(at(22, 0))
+        w.person("office")
+        self.assertEqual(w.calls[2:], [TURN_OFF])
+
+    def test_a_person_away_does_not_stop_the_night(self):
+        w = self.evening(at(22, 0))
+        w.sleep(True)
+        w.person("not_home")
+        w.tick_for(H)
+        self.assertNotIn(TURN_OFF, w.calls)
+        self.assertEqual(w.device["state"], "on")
+
+    def test_an_open_window_stops_it_and_closing_it_decides_afresh(self):
+        w = self.evening(at(22, 0))
+        w.window(True)
+        self.assertEqual(w.calls[2:], [TURN_OFF])
+        self.assertEqual(w.sensor()[1]["reason"], "Window open")
+        w.window(False)
+        self.assertEqual(w.calls[3:], [TURN_ON, MEDIUM_MODE])
+        w.window(True)
+        w.humidity(41)
+        w.window(False)
+        self.assertEqual(w.calls[6:], [], "closed inside the band: stays off")
+
+    def test_an_open_window_at_21_00_blocks_the_start(self):
+        w = self.evening(at(20, 0), **{WINDOW: "on"})
+        w.tick(2 * H)
+        self.assertEqual(w.calls, [])
+
+    def test_an_unreadable_humidity_or_window_leaves_the_humidifier_as_it_is(self):
+        for entity in (PRIMARY, WINDOW):
+            with self.subTest(entity=entity):
+                w = self.evening(at(22, 0), **{PRIMARY: "38.0"})
+                w.event(entity, "unavailable")
+                w.tick_for(30 * MIN)
+                self.assertEqual(w.calls, [TURN_ON, MEDIUM_MODE])
+                self.assertEqual(w.device["state"], "on")
+        w = self.evening(at(22, 0), **{PRIMARY: "unavailable"})
+        self.assertEqual(w.calls, [])
+
+    def test_an_empty_tank_holds_back_the_start(self):
+        w = self.evening(at(20, 0))
+        w.tank("empty")
+        w.tick(2 * H)
+        self.assertEqual(w.calls, [])
+        self.assertEqual(w.sensor()[0], "no_water")
+
+    def test_a_humidifier_on_by_hand_is_manual_before_the_window_and_the_apps_inside_it(self):
+        w = self.evening(at(20, 0))
+        w.by_hand("on", "high")
+        self.assertEqual(w.sensor()[0], "manual")
+        self.assertEqual(w.calls, [])
+        w.tick(H)
+        self.assertEqual(w.calls, [MEDIUM_MODE])
+        self.assertEqual(w.sensor()[0], "humidifying")
+        w.humidity(45)
+        self.assertEqual(w.calls[1:], [TURN_OFF])
+
+    def test_the_apps_own_commands_are_not_manual_use(self):
+        w = self.evening(at(22, 0))
+        w.tick_for(H)
+        state, attrs = w.sensor()
+        self.assertEqual(state, "humidifying")
+        self.assertEqual(w.lines("INFO", "-> manual"), [])
+
+    def test_sleep_mode_turning_on_hands_over_to_the_night_without_turning_it_off(self):
+        w = self.evening(at(22, 0), **{PRIMARY: "38.0"})
+        w.tick(30 * MIN)
+        w.sleep(True)
+        self.assertEqual(w.calls, [TURN_ON, MEDIUM_MODE, SLEEP_MODE])
+        self.assertEqual(w.device, {"state": "on", "mode": "sleep"})
+        state, attrs = w.sensor()
+        self.assertEqual((state, attrs["phase"]), ("humidifying", "night"))
+        (record,) = w.run_log()
+        self.assertEqual(
+            (record["phase"], record["minutes"], record["stop_reason"]), ("preload", 30.0, "Sleep mode on"),
+        )
+        w.tick(H)
+        w.humidity(42)
+        self.assertEqual(w.calls[3:], [TURN_OFF])
+        self.assertEqual([r["phase"] for r in w.run_log()], ["preload", "night"])
+        self.assertEqual(w.run_log()[1]["minutes"], 60.0)
+
+    def test_the_hand_over_sends_nothing_when_it_already_runs_in_sleep_mode(self):
+        w = self.evening(at(22, 0), **{OCCUPANCY: "on"})
+        w.sleep(True)
+        self.assertEqual(w.calls, [TURN_ON, SLEEP_MODE])
+
+    def test_the_hand_over_stops_it_when_the_room_is_already_humid_enough(self):
+        w = self.evening(at(22, 0), **{PRIMARY: "38.0"})
+        w.humidity(41)
+        w.sleep(True)
+        self.assertEqual(w.calls[2:], [SLEEP_MODE], "still in the band: the night keeps it running")
+        w.humidity(43)
+        self.assertEqual(w.calls[3:], [TURN_OFF])
+
+    def test_the_sensor_says_before_bed_or_night_and_carries_the_phase(self):
+        w = self.evening(at(22, 0), **{PRIMARY: "38.0"})
+        state, attrs = w.sensor()
+        self.assertEqual((state, attrs["phase"], attrs["mode"]), ("humidifying", "preload", "medium"))
+        self.assertIn("before bed", attrs["reason"])
+        self.assertNotIn("night", attrs["reason"])
+        self.assertIn("Humidity 38 % is below 40 %", attrs["reason"])
+        self.assertIn("room empty", attrs["reason"])
+        w.occupied(True)
+        self.assertIn("someone in the room", w.sensor()[1]["reason"])
+        w.sleep(True)
+        state, attrs = w.sensor()
+        self.assertEqual((state, attrs["phase"]), ("humidifying", "night"))
+        self.assertIn("night", attrs["reason"])
+        self.assertNotIn("before bed", attrs["reason"])
+
+    def test_the_phase_is_published_while_it_is_off_too_and_not_by_day(self):
+        w = self.evening(at(22, 0), **{PRIMARY: "45.0"})
+        state, attrs = w.sensor()
+        self.assertEqual((state, attrs["phase"]), ("off", "preload"))
+        by_day = self.evening(at(12, 0))
+        self.assertNotIn("phase", by_day.sensor()[1])
+
+    def test_a_run_before_bed_counts_for_the_morning_drying_even_when_the_night_runs_nothing(self):
+        w = self.evening(at(21, 0), **{PRIMARY: "38.0"})
+        w.tick(H)
+        w.humidity(43)
+        self.assertEqual(w.calls, [TURN_ON, MEDIUM_MODE, TURN_OFF])
+        w.sleep(True)
+        self.assertEqual(len(w.calls), 3, "the night starts nothing in a humid room")
+        w.tick(7 * H)
+        w.sleep(False)
+        self.assertEqual(w.calls[3:], [DRYING_MODE])
+        self.assertEqual(w.device, {"state": "on", "mode": "drying_filter"})
+
+    def test_log_lines_are_ascii(self):
+        w = self.evening(at(21, 30), **{PRIMARY: "38.0"})
+        w.person("not_home")
+        w.person("home")
+        w.window(True)
+        w.window(False)
+        w.sleep(True)
+        w.sleep(False)
+        w.tick_for(8 * H)
+        self.assertTrue(w.lines("INFO", "before bed"))
+        for _, line in w.logs:
+            self.assertTrue(line.isascii(), line)
+
+    def test_a_run_by_hand_that_the_window_takes_over_wets_the_wick_too(self):
+        w = self.evening(at(20, 0), **{PRIMARY: "45.0"})
+        w.by_hand("on", "high")
+        w.tick(H)
+        self.assertEqual(w.calls, [TURN_OFF], "21:00, the window owns the humidifier and 45 % is enough")
+        w.sleep(True)
+        w.tick(7 * H)
+        w.sleep(False)
+        self.assertEqual(w.calls[1:], [DRYING_MODE])
+
+    def test_an_evening_without_a_run_leaves_nothing_to_dry(self):
+        w = self.evening(at(21, 0), **{PRIMARY: "45.0"})
+        w.tick(2 * H)
+        w.sleep(True)
+        w.tick(7 * H)
+        w.sleep(False)
+        w.tick_for(3 * H)
+        self.assertEqual(w.calls, [])
+
+    def test_without_sleep_mode_the_window_ends_at_02_00_with_the_drying_and_nothing_more(self):
+        w = self.evening(at(21, 30))
+        w.tick_for(4 * H + 25 * MIN)
+        self.assertEqual(w.calls, [TURN_ON, MEDIUM_MODE], "01:55, still running before bed")
+        w.tick(5 * MIN)
+        self.assertEqual(w.calls[2:], [DRYING_MODE], "02:00")
+        self.assertEqual(w.device, {"state": "on", "mode": "drying_filter"})
+        self.assertEqual(w.sensor()[0], "drying")
+        (record,) = w.run_log()
+        self.assertEqual(
+            (record["phase"], record["minutes"], record["stop_reason"]), ("preload", 270.0, "Before-bed window over"),
+        )
+        w.tick_for(2 * H - 5 * MIN)
+        self.assertNotIn(TURN_OFF, w.calls)
+        w.tick(5 * MIN)
+        self.assertEqual(w.calls[3:], [TURN_OFF], "dried for two hours, then off")
+        self.assertEqual([r["phase"] for r in w.run_log()], ["preload", None])
+        w.tick_for(17 * H - 5 * MIN)
+        self.assertEqual(w.calls[3:], [TURN_OFF], "35 % all day and night, but the window is over")
+        w.tick(5 * MIN)
+        self.assertEqual(w.calls[4:], [TURN_ON, MEDIUM_MODE], "the next 21:00 opens the next evening")
+
+    def test_the_window_ending_in_a_humid_room_dries_nothing_that_was_never_wet(self):
+        w = self.evening(at(21, 0), **{PRIMARY: "45.0"})
+        w.tick_for(6 * H)
+        self.assertEqual(w.calls, [])
+        self.assertEqual(w.saved()["wick"], "dry")
+
+    def test_a_restart_inside_the_window_goes_on_without_new_commands(self):
+        w = self.evening(at(21, 30))
+        w.tick(H)
+        w.start()
+        self.assertEqual(w.calls, [TURN_ON, MEDIUM_MODE])
+        self.assertEqual(w.sensor()[1]["phase"], "preload")
+        w.humidity(42)
+        (record,) = w.run_log()
+        self.assertEqual((record["phase"], record["start"]), ("preload", "2026-11-24T21:30:00+01:00"))
+
+    def test_a_restart_after_the_window_still_dries(self):
+        w = self.evening(at(21, 30))
+        w.clock = at(2, 30, 25)
+        w.start()
+        self.assertEqual(w.calls[2:], [DRYING_MODE])
+
+    def test_sleep_mode_turning_off_again_inside_the_window_does_not_start_before_bed_again(self):
+        w = self.evening(at(22, 0), **{PRIMARY: "38.0"})
+        w.sleep(True)
+        w.tick(30 * MIN)
+        w.sleep(False)
+        self.assertEqual(w.calls[2:], [SLEEP_MODE, DRYING_MODE])
+        w.tick_for(2 * H)
+        self.assertEqual(w.calls[4:], [TURN_OFF], "the drying ended at 00:30")
+        w.tick_for(90 * MIN)
+        self.assertEqual(w.calls[4:], [TURN_OFF], "01:55 in a dry room: no second before bed")
+        w.start()
+        w.tick_for(H)
+        self.assertEqual(w.calls[4:], [TURN_OFF], "not after a restart either")
+
+    def test_sleep_mode_already_on_when_the_window_opens_means_no_before_bed(self):
+        w = self.evening(at(20, 30), **{PRIMARY: "45.0", SLEEP: "on"})
+        w.tick(H)
+        w.sleep(False)
+        w.humidity(35)
+        w.tick_for(H)
+        self.assertEqual(w.calls, [])
+
+    def test_a_drying_under_way_is_not_interrupted_and_before_bed_follows_it(self):
+        w = self.world(now=at(18, 0), args={"preload_from": "21:00"}, **{PRIMARY: "38.0", SLEEP: "on"})
+        w.tick(90 * MIN)
+        w.sleep(False)
+        self.assertEqual(w.calls, [TURN_ON, SLEEP_MODE, DRYING_MODE], "dries from 19:30 until 21:30")
+        w.tick_for(H + 55 * MIN)
+        self.assertEqual(w.calls, [TURN_ON, SLEEP_MODE, DRYING_MODE], "21:25, the window is open but the drying goes on")
+        self.assertEqual(w.sensor()[0], "drying")
+        w.tick(5 * MIN)
+        self.assertEqual(w.calls[3:], [TURN_OFF, TURN_ON, MEDIUM_MODE])
+        self.assertEqual(w.sensor()[1]["phase"], "preload")
+
+    def test_a_run_saved_by_an_older_version_without_a_phase_is_a_night_run(self):
+        w = self.night(38)
+        saved = w.saved()
+        del saved["run"]["phase"]
+        w.state_file.write_text(json.dumps(saved))
+        w.start()
+        w.humidity(43)
+        (record,) = w.run_log()
+        self.assertEqual(record["phase"], "night")
+
+    def test_a_state_file_from_before_the_phase_existed_starts_the_evening_afresh(self):
+        w = self.evening(at(22, 0), **{PRIMARY: "38.0"})
+        saved = w.saved()
+        del saved["preload_evening"], saved["preload_open"]
+        w.state_file.write_text(json.dumps(saved))
+        w.start()
+        self.assertEqual(w.calls, [TURN_ON, MEDIUM_MODE])
+        self.assertTrue(w.saved()["preload_open"])
+
+
 class Configuration(unittest.TestCase):
     def test_the_yaml_names_the_entities_and_thresholds_of_the_assignment(self):
         self.assertEqual(YAML_ARGS["module"], "bedroom_humidifier")
@@ -1472,6 +1846,69 @@ class Configuration(unittest.TestCase):
 
     def test_the_state_file_lives_beside_the_app_on_the_box(self):
         self.assertEqual(YAML_ARGS["state_file"], "/conf/apps/climate/bedroom_humidifier_state.json")
+
+    def test_the_yaml_names_the_before_bed_options(self):
+        self.assertEqual(
+            (YAML_ARGS["preload_from"], YAML_ARGS["preload_until"], YAML_ARGS["preload_mode"]),
+            ("21:00", "02:00", "medium"),
+        )
+        self.assertEqual(YAML_ARGS["occupancy"], OCCUPANCY)
+
+    def test_the_before_bed_options_default_to_the_values_in_the_yaml(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        w = World(tmp)
+        for key in ("preload_from", "preload_until", "preload_mode", "occupancy"):
+            del w.args[key]
+        w.start()
+        app = w.app
+        self.assertEqual((app.preload_from.strftime("%H:%M"), app.preload_until.strftime("%H:%M")), ("21:00", "02:00"))
+        self.assertEqual((app.preload_mode, app.occupancy_entity), ("medium", OCCUPANCY))
+
+    def test_the_before_bed_times_must_be_hh_mm_and_differ(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for args in (
+            {"preload_from": "9pm"},
+            {"preload_from": 2100},
+            {"preload_from": "21:00", "preload_until": "26:00"},
+            {"preload_from": "21:00", "preload_until": None},
+            {"preload_from": "21:00", "preload_until": "21:00"},
+        ):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                World(tmp, args=args)
+
+    def test_an_empty_preload_from_turns_before_bed_off(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for off in (None, "", False):
+            with self.subTest(off=off):
+                w = World(tmp, now=at(22, 0), args={"preload_from": off})
+                self.assertEqual((w.calls, w.daily), ([], []))
+                self.assertIn("before bed off", w.lines("INFO", "initialized")[0])
+
+    def test_a_window_inside_one_day_starts_and_ends_on_its_own_times(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        w = World(tmp, now=at(20, 0), args={"preload_from": "20:30", "preload_until": "23:30"})
+        self.assertEqual(w.daily, [("_tick", "20:30"), ("_tick", "23:30")])
+        w.tick_for(25 * MIN)
+        self.assertEqual(w.calls, [])
+        w.tick(5 * MIN)
+        self.assertEqual(w.calls, [TURN_ON, MEDIUM_MODE])
+        w.tick_for(2 * H + 55 * MIN)
+        self.assertEqual(w.calls, [TURN_ON, MEDIUM_MODE])
+        w.tick(5 * MIN)
+        self.assertEqual(w.calls[2:], [DRYING_MODE])
+        w.tick_for(3 * H)
+        self.assertEqual(w.calls[2:], [DRYING_MODE, TURN_OFF], "dried, then nothing at 00:00 to 02:30 either")
+
+    def test_the_init_line_names_the_before_bed_window(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        w = World(tmp, now=at(12, 0), args={"preload_from": "21:00"})
+        (line,) = w.lines("INFO", "initialized")
+        self.assertIn(f"before bed 21:00 to 02:00 in medium while {OCCUPANCY} is off", line)
 
     def test_every_arg_the_app_requires_is_in_the_yaml(self):
         source = (Path(bh.__file__)).read_text()
@@ -1520,6 +1957,7 @@ class Configuration(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
         w = World(tmp)
         args = {k: v for k, v in YAML_ARGS.items() if k != "state_file"}
+        args["preload_from"] = None
         app = bh.BedroomHumidifier.__new__(bh.BedroomHumidifier)
         app.args = args
         app._now = lambda: T0
@@ -1541,7 +1979,7 @@ class Configuration(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
         w = World(tmp)
         listened = {c.args[1]: c.kwargs for c in w.app.listen_state.call_args_list}
-        self.assertEqual(set(listened), {SLEEP, WINDOW, PRIMARY, FALLBACK, WATER, PERSON, HUMIDIFIER})
+        self.assertEqual(set(listened), {SLEEP, WINDOW, PRIMARY, FALLBACK, WATER, PERSON, OCCUPANCY, HUMIDIFIER})
         self.assertNotIn("sensor.bedroom_humidity", listened)
         self.assertEqual(listened[HUMIDIFIER], {"attribute": "all"})
         w.app.run_every.assert_called_once_with(w.app._tick, "now+60", 300)
