@@ -10,20 +10,23 @@ LiveUpdates:
   # a cleanup message.
   enabled_people: [mikkel, claudia, kristine]
 
-  # Laundry goes to started_by, including late attribution. Until that is known, the audience is
-  # enabled people home when this app first sees the cycle (nobody if none). It stays fixed for
-  # that cycle, including reloads; the first named starter replaces that audience once.
+  # Laundry goes to started_by, including late attribution. Until that is known the card goes to
+  # nobody for up to laundry_hold_s, then to enabled people home at that moment (nobody if none). That
+  # audience stays fixed for the cycle, including reloads; the first named starter replaces it once.
   washer_entity: sensor.washer_state
   dryer_entity: sensor.dryer_state
+  laundry_hold_s: 420
 
   # Independent bath/probe cards support cooking both at once. Coffee's published brewing phase
   # includes heating; eta appears when the source has an estimate. Finished phases clear the card.
-  # The coffee card goes to the brew's notify target ("none" = nobody) once CoffeeMachine names it, before
-  # that to coffee_people who are home; either way only people in coffee_people.
+  # The coffee card goes to the brew's notify target ("none" = nobody) once CoffeeMachine names it. Before
+  # that it goes to nobody for up to coffee_hold_s, then to coffee_people who are home; either way only
+  # people in coffee_people.
   cook_entity: sensor.cook_state
   coffee_entity: sensor.coffee_state
   cook_people: [mikkel]
   coffee_people: [mikkel, claudia, kristine]
+  coffee_hold_s: 30
 
   # Only the apartment door has a doorbell card, tagged live_doorbell_apartment; tapping it opens the existing
   # dashboard ring view. Yale's apartment bell has no published visit end: retain its ring pulse until

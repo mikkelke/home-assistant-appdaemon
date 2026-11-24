@@ -38,6 +38,8 @@ COURIER_NAMES = {"wolt": "Wolt", "nemlig": "Nemlig", **PARCEL_CARRIERS}
 COURIER_RING_WINDOW_S = 600
 COURIER_RING_KEEP_S = 3600
 DELIVERY_STAGES = {"preparing": "Preparing", "on_the_way": "On the way", "arriving": "Arriving"}
+RELEVANCE = {"live_doorbell": 1.0, "live_cook": 0.8, "live_coffee": 0.6, "live_washer": 0.4, "live_dryer": 0.4,
+             "live_delivery": 0.2}
 ENTITIES = {"washer": "sensor.washer_state", "dryer": "sensor.dryer_state", "cook": "sensor.cook_state",
             "coffee": "sensor.coffee_state", "doorbell": "sensor.intercom_visit",
             "apartment": "binary_sensor.yale_doorbell_ding", "delivery": "sensor.home_delivery"}
@@ -388,8 +390,9 @@ def apartment_ring_matched(rings, at):
     return rings[max(keys, key=number)] if keys else None
 
 
-def laundry_audience(previous, cycle, starter, enabled, home, now=None):
-    """Keep the start-time audience until the first named attribution, including across reloads."""
+def laundry_audience(previous, cycle, starter, enabled, home, now=None, hold_s=0):
+    """Nobody until the starter is named or hold_s has passed, then the people home at that moment; that audience
+    stays until the first named attribution, including across reloads."""
     enabled = people(enabled)
     starter = starter.strip().lower() if isinstance(starter, str) else ""
     previous = previous if isinstance(previous, dict) else {}
@@ -401,23 +404,26 @@ def laundry_audience(previous, cycle, starter, enabled, home, now=None):
     if same_cycle:
         result = {"cycle": cycle if cycle != "active" else previous_cycle,
                   "people": [person for person in people(previous.get("people")) if person in enabled],
-                  "attributed": bool(previous.get("attributed"))}
+                  "attributed": bool(previous.get("attributed")), "held_since": number(previous.get("held_since"))}
     else:
-        audience = [person for person in enabled if person in home]
-        result = {"cycle": cycle, "people": audience, "attributed": False}
+        result = {"cycle": cycle, "people": [], "attributed": False, "held_since": now}
     if now is not None:
         result["last_seen_at"] = now
     if starter and not result["attributed"]:
-        result.update(people=[starter] if starter in enabled else [], attributed=True)
+        result.update(people=[starter] if starter in enabled else [], attributed=True, held_since=None)
+    elif (not result["attributed"] and result["held_since"] is not None
+          and (now is None or now - result["held_since"] >= hold_s)):
+        result.update(people=[person for person in enabled if person in home], held_since=None)
     return result
 
 
-def coffee_audience(full, enabled, home):
-    """The brew's notify target once the coffee app has named it ("none" = nobody), else enabled people home."""
+def coffee_audience(full, enabled, home, held=False):
+    """The brew's notify target once the coffee app has named it ("none" = nobody); until then nobody while held,
+    else enabled people home."""
     target = attributes(full).get("notify")
     if isinstance(target, str) and target:
         return [target] if target in enabled else []
-    return [person for person in enabled if person in home]
+    return [] if held else [person for person in enabled if person in home]
 
 
 def card_changed(previous, card):
@@ -437,16 +443,21 @@ def card_changed(previous, card):
     return previous.critical_text != card.critical_text
 
 
+def relevance(tag):
+    return next((score for prefix, score in RELEVANCE.items() if tag.startswith(prefix)), 0.0)
+
+
 def notification_payload(card, now, channel="Live updates", update=False):
     """update: the phone already shows this card. iOS ignores alert_once: a Live Activity update is quiet only
     with silent, a plain iOS notification only with a passive interruption level."""
     data = {"tag": card.tag, "live_update": True, "critical_text": card.critical_text,
             "notification_icon": card.icon, "sticky": True, "alert_once": True, "channel": channel,
-            "importance": "low"}
+            "importance": "low", "relevance_score": relevance(card.tag)}
     if card.link:
         data.update(clickAction=card.link, url=card.link)
     if card.finish_at is not None:
-        data.update(chronometer=True, when=max(0, math.ceil(card.finish_at - now)), when_relative=True)
+        data.update(chronometer=True, when=max(0, math.ceil(card.finish_at - now)), when_relative=True,
+                    content_state={"critical_text": card.message})
     if update:
         data.update(silent=True, push={"interruption-level": "passive"})
     return {"title": card.title, "message": card.message, "data": data}
@@ -464,6 +475,8 @@ class LiveUpdates(hass.Hass):
         self.channel = args.get("channel", "Live updates")
         self.stale_limit_s = max(0, number(args.get("stale_limit_s", 600)) or 0)
         self.doorbell_max_s = max(0, number(args.get("doorbell_max_s", 180)) or 0)
+        self.laundry_hold_s = max(0, number(args.get("laundry_hold_s", 0)) or 0)
+        self.coffee_hold_s = max(0, number(args.get("coffee_hold_s", 0)) or 0)
         self.state_file = Path(args.get("state_file") or Path(__file__).with_name("live_updates_state.json"))
         self._lock = asyncio.Lock()
         self._notifier = await self.get_app("MobileNotifier")
@@ -489,7 +502,8 @@ class LiveUpdates(hass.Hass):
                 "deliveries": value.get("deliveries") if isinstance(value.get("deliveries"), dict) else {},
                 "delivery_ends": value.get("delivery_ends") if isinstance(value.get("delivery_ends"), dict) else {},
                 "courier_rings": value.get("courier_rings") if isinstance(value.get("courier_rings"), dict) else {},
-                "apartment_ring_at": epoch(value.get("apartment_ring_at"))}
+                "apartment_ring_at": epoch(value.get("apartment_ring_at")),
+                "coffee_held_since": number(value.get("coffee_held_since"))}
 
     def _save(self):
         serialized = json.dumps(self._state, ensure_ascii=False, sort_keys=True, allow_nan=False)
@@ -576,7 +590,8 @@ class LiveUpdates(hass.Hass):
                     if card:
                         attrs = attributes(full[source])
                         cycle = str(attrs.get("cycle_start_time") or "active")
-                        previous = laundry_audience(previous, cycle, attrs.get("started_by"), self.enabled_people, home, now)
+                        previous = laundry_audience(previous, cycle, attrs.get("started_by"), self.enabled_people, home, now,
+                                                    self.laundry_hold_s)
                         self._state["laundry"][source] = previous
                     else:
                         self._state["laundry"].pop(source, None)
@@ -597,8 +612,13 @@ class LiveUpdates(hass.Hass):
                 for tag, card in cards.items():
                     audience = self._audience(source, tag)
                     if source == "coffee":
-                        audience = coffee_audience(full["coffee"], audience, home)
+                        if self._state.get("coffee_held_since") is None:
+                            self._state["coffee_held_since"] = now
+                        held = now - self._state["coffee_held_since"] < self.coffee_hold_s
+                        audience = coffee_audience(full["coffee"], audience, home, held)
                     desired[tag] = (card, self._services(audience))
+            if "live_coffee" not in desired:
+                self._state["coffee_held_since"] = None
             apartment = full["apartment"]
             if isinstance(apartment, dict) and apartment.get("state") == "on":
                 at = epoch(apartment.get("last_changed"))

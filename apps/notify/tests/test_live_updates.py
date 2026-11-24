@@ -294,6 +294,54 @@ class LiveUpdateIntegrationTests(unittest.IsolatedAsyncioTestCase):
         [(_, again)] = h.ongoing(TAGS["coffee"])
         self.assertNotIn("push", again["data"])
 
+    async def test_unattributed_laundry_waits_for_its_starter_until_the_hold_ends(self):
+        h = await self.make(enabled=["mikkel", "kristine", "claudia"], laundry_hold_s=420,
+                            states={ENTITIES["washer"]: laundry(starter=None)})
+        self.assertEqual(h.ongoing(TAGS["washer"]), [])
+        h.states[ENTITIES["washer"]] = laundry(starter="claudia")
+        await h.reconcile(300)
+        self.assertEqual([s for s, _ in h.ongoing(TAGS["washer"])], ["notify/mobile_app_claudias_iphone"])
+
+    async def test_unattributed_laundry_falls_back_to_people_home_after_the_hold_even_across_a_reload(self):
+        h = await self.make(enabled=["mikkel", "kristine", "claudia"], laundry_hold_s=420,
+                            states={ENTITIES["washer"]: laundry(starter=None)})
+        await h.reconcile(300)
+        self.assertEqual(h.ongoing(TAGS["washer"]), [])
+        h = await Harness(self.path, enabled=["mikkel", "kristine", "claudia"], laundry_hold_s=420,
+                          states={ENTITIES["washer"]: laundry(starter=None)}, now=h.now).initialize()
+        self.assertEqual(h.ongoing(TAGS["washer"]), [])
+        await h.reconcile(120)
+        self.assertEqual({s for s, _ in h.ongoing(TAGS["washer"])},
+                         {"notify/mobile_app_mikkels_ofx9p", "notify/mobile_app_kristine_iphone_2"})
+
+    async def test_coffee_without_a_notify_target_waits_for_it_until_the_hold_ends(self):
+        h = await self.make(coffee_hold_s=30, states={ENTITIES["coffee"]: coffee()})
+        self.assertEqual(h.ongoing(TAGS["coffee"]), [])
+        await h.reconcile(30)
+        self.assertEqual(len(h.ongoing(TAGS["coffee"])), 1)
+        h.states[ENTITIES["coffee"]] = full("idle")
+        await h.reconcile(60)
+        h.forget_calls()
+        brew = coffee()
+        brew["attributes"]["notify"] = "mikkel"
+        h.states[ENTITIES["coffee"]] = brew
+        await h.reconcile(60)
+        self.assertEqual(len(h.ongoing(TAGS["coffee"])), 1)
+
+    def test_a_running_countdown_shows_the_phase_beside_the_ios_timer(self):
+        card = lu.coffee_card(coffee(), NOW)
+        data = lu.notification_payload(card, NOW)["data"]
+        self.assertEqual(data["content_state"], {"critical_text": "Brewing · Morning"})
+        self.assertEqual(data["critical_text"], card.critical_text)
+        self.assertNotIn("content_state", lu.notification_payload(lu.coffee_card(coffee(phase="paused"), NOW), NOW)["data"])
+
+    def test_relevance_puts_the_doorbell_first_and_deliveries_last(self):
+        scores = [lu.relevance(tag) for tag in ("live_doorbell_apartment", "live_cook_bath", "live_coffee",
+                                                 "live_washer", "live_delivery_gls")]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertEqual(scores[0], 1.0)
+        self.assertTrue(all(lu.relevance(tag) > 0 for tag in lu.TAGS))
+
     async def test_end_clears_each_source_immediately(self):
         cases = (("washer", laundry(), full("Unemptied"), TAGS["washer"]),
                  ("dryer", laundry("dryer"), full("Emptied"), TAGS["dryer"]),
