@@ -15,7 +15,7 @@ LiveUpdates:
   # audience stays fixed for the cycle, including reloads; the first named starter replaces it once.
   washer_entity: sensor.washer_state
   dryer_entity: sensor.dryer_state
-  laundry_hold_s: 420
+  laundry_hold_s: 1200
 
   # Independent bath/probe cards support cooking both at once. Coffee's published brewing phase
   # includes heating; eta appears when the source has an estimate. Finished phases clear the card.

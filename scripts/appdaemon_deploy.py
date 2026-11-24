@@ -7,6 +7,7 @@ The process holds the deploy lock while the caller transfers files.
 """
 
 import argparse
+import ast
 import asyncio
 import contextlib
 import copy
@@ -41,6 +42,22 @@ def digest(path):
 def manifest(root):
     files = subprocess.check_output(["git", "ls-files", "-z", "apps"], cwd=root)
     return {"files": {name: digest(root / name) for name in files.decode().split("\0") if name}}
+
+
+def hidden_imports(app_dir):
+    """`from <app module> import ...` nested in a module-level block (try, if): AppDaemon's dependency
+    scan reads only top-level imports, so the importer would keep the old names after that module changes."""
+    files = [path for path in sorted(app_dir.rglob("*.py")) if "tests" not in path.relative_to(app_dir).parts]
+    modules = {path.stem for path in files}
+    found = []
+    for path in files:
+        for statement in ast.parse(path.read_text(), filename=str(path)).body:
+            if isinstance(statement, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            for node in ast.walk(statement):
+                if isinstance(node, ast.ImportFrom) and not node.level and node.module in modules:
+                    found.append(f"{path.relative_to(app_dir.parent)}:{node.lineno} from {node.module} import")
+    return found
 
 
 def emit(**message):
@@ -461,6 +478,7 @@ async def deploy(args, stream=sys.stdin):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", action="store_true")
+    parser.add_argument("--check-imports", action="store_true")
     parser.add_argument("--config", type=Path, default=Path("/conf/appdaemon.yaml"))
     parser.add_argument("--state-dir", type=Path, default=Path("/conf/.deploy"))
     parser.add_argument("--pid", type=int, default=1)
@@ -469,6 +487,11 @@ def main():
     try:
         if args.manifest:
             emit(**manifest(Path.cwd()))
+        elif args.check_imports:
+            found = hidden_imports(Path.cwd() / "apps")
+            for line in found:
+                print(line, file=sys.stderr)
+            return 1 if found else 0
         else:
             asyncio.run(deploy(args))
     except DeployError as error:

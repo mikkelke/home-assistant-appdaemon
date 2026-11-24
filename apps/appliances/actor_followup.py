@@ -35,13 +35,7 @@ import json
 import math
 import os
 
-try:
-    from cycle_store import parse_utc
-except ImportError:
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from cycle_store import parse_utc
+from cycle_store import parse_utc
 
 import feedback_io
 

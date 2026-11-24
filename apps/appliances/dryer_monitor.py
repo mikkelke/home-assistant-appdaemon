@@ -36,28 +36,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import statistics
 
-# Durable on-disk shadow of cycle state - sibling module in this same app directory.
-# AppDaemon puts app dirs on sys.path, so a plain import normally resolves; the fallback
-# covers any context where that has not happened yet (same defensive shape as the sibling
-# imports at the top of washer_monitor.py). CycleStore itself is no longer referenced by name
-# here - CyclePersistenceMixin._init_cycle_store (below) owns constructing it - but format_utc/
-# parse_utc are still used throughout this file's own boot-resolution code.
-try:
-    from cycle_store import format_utc, parse_utc
-except ImportError:
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from cycle_store import format_utc, parse_utc
+# Sibling modules import at top level so AppDaemon's dependency scan sees them and reloads this app
+# when they change.
+from cycle_store import format_utc, parse_utc
 
 # Shared save/restore-snapshot/staleness-check plumbing for the on-disk store above - see
 # cycle_persistence.py's module docstring for the split between what it owns and what stays
 # here (boot resolution policy, detection/guard/classification logic).
-try:
-    from cycle_persistence import CyclePersistenceMixin
-except ImportError:
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from cycle_persistence import CyclePersistenceMixin
+from cycle_persistence import CyclePersistenceMixin
 
 # Atomic writes of the feedback file, and the history set aside when it cannot be read.
 import feedback_io
@@ -67,12 +53,7 @@ from completed_measurements import completed_measurements
 import door_history
 
 # A start or emptying that ActorAttribution can only settle minutes after the event.
-try:
-    from actor_followup import ActorFollowupMixin
-except ImportError:
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from actor_followup import ActorFollowupMixin
+from actor_followup import ActorFollowupMixin
 
 
 class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):

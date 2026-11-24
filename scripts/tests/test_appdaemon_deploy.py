@@ -35,6 +35,25 @@ def app(module, digest="config", disabled=False, dictionaries=()):
             "dict_paths": [list(path) for path in dictionaries]}
 
 
+class HiddenImportTests(unittest.TestCase):
+    def test_a_sibling_from_import_inside_a_top_level_try_is_reported(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            apps = Path(temporary) / "apps"
+            (apps / "room").mkdir(parents=True)
+            (apps / "room" / "helper.py").write_text("VALUE = 1\n")
+            (apps / "room" / "visible.py").write_text("from helper import VALUE\nimport json\n")
+            (apps / "room" / "lazy.py").write_text("def read():\n    from helper import VALUE\n    return VALUE\n")
+            (apps / "room" / "optional.py").write_text("try:\n    import helper\nexcept ImportError:\n    helper = None\n")
+            (apps / "room" / "hidden.py").write_text("try:\n    from helper import VALUE\nexcept ImportError:\n    VALUE = 0\n"
+                                                     "try:\n    from zoneinfo import ZoneInfo\nexcept ImportError:\n    pass\n")
+            (apps / "room" / "tests").mkdir()
+            (apps / "room" / "tests" / "test_x.py").write_text("try:\n    from helper import VALUE\nexcept ImportError:\n    pass\n")
+            self.assertEqual(deploy.hidden_imports(apps), ["apps/room/hidden.py:2 from helper import"])
+
+    def test_the_repository_has_no_hidden_sibling_imports(self):
+        self.assertEqual(deploy.hidden_imports(Path(__file__).parents[2] / "apps"), [])
+
+
 class MappingTests(unittest.TestCase):
     def test_comments_and_documents_do_not_require_reload(self):
         before = snapshot()

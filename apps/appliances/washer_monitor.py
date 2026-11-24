@@ -77,22 +77,11 @@ import run_ledger
 
 # Shared save/restore-snapshot/staleness-check plumbing for the on-disk store above - see
 # cycle_persistence.py's module docstring for the split between what it owns and what stays
-# here (boot resolution policy, detection/guard/classification logic). Imported defensively,
-# same shape as dryer_monitor.py's cycle_store import, so it resolves under AppDaemon's loader.
-try:
-    from cycle_persistence import CyclePersistenceMixin
-except ImportError:
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from cycle_persistence import CyclePersistenceMixin
+# here (boot resolution policy, detection/guard/classification logic).
+from cycle_persistence import CyclePersistenceMixin
 
 # A start or emptying that ActorAttribution can only settle minutes after the event.
-try:
-    from actor_followup import ActorFollowupMixin
-except ImportError:
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from actor_followup import ActorFollowupMixin
+from actor_followup import ActorFollowupMixin
 
 try:
     from zoneinfo import ZoneInfo

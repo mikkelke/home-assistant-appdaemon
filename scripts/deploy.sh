@@ -72,6 +72,14 @@ for stream in $used; do
 done
 echo "log-stream guard OK"
 
+# 2d. A sibling module imported with `from X import` inside a top-level try/if is invisible to
+# AppDaemon's dependency scan, so the importer keeps the old names when X changes.
+if ! python3 scripts/appdaemon_deploy.py --check-imports; then
+  echo "FATAL: move these imports to the top level of the module" >&2
+  exit 1
+fi
+echo "import guard OK"
+
 # 3. Build an immutable byte manifest before taking the remote deploy lock.
 LIST=$(mktemp)
 ITEMS=$(mktemp)

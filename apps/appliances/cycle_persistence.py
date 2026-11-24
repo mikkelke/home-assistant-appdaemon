@@ -43,12 +43,7 @@ docstring for exactly what it expects to find on self.
 import hashlib
 import sys
 
-try:
-    from cycle_store import CycleStore, format_utc
-except ImportError:
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from cycle_store import CycleStore, format_utc
+from cycle_store import CycleStore, format_utc
 
 
 class CyclePersistenceMixin:
