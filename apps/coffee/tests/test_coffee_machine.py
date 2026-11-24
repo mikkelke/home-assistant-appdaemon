@@ -1456,6 +1456,15 @@ class WhoFilledTests(unittest.TestCase):
                 brew(app, user=brew_user)
                 self.assertEqual(self.counts(app), (who_brews, who_fills))
 
+    def test_a_second_tap_within_half_an_hour_is_the_same_fill(self):
+        app = fake.make_app()
+        fake.op(app, "water_filled", user_id=MIKKEL)
+        fake.advance(app, 600)
+        fake.op(app, "water_filled", user_id=MIKKEL)
+        brew(app, user=MIKKEL)
+        self.assertEqual(len(app._tank.fills), 2)
+        self.assertEqual(self.counts(app), ("mikkel:1", "mikkel:1"))
+
     def test_a_tap_no_brew_follows_counts_when_its_window_has_passed(self):
         app = fake.make_app()
         fake.advance(app, 300)

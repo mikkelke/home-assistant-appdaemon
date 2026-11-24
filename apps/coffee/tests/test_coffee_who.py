@@ -167,6 +167,33 @@ class CountTests(unittest.TestCase):
         counts = cw.fill_counts(fills, records, T0, T0 - 60 * 86400)
         self.assertEqual(counts, {"kristine": 1, "claudia": 1, "mikkel": 1})
 
+    def test_a_tap_under_half_an_hour_after_a_fill_counts_with_it(self):
+        fills = [tap(0), tap(13 * MIN, "claudia")]
+        records = [brew(10, "mikkel", "c1"), brew(13 * MIN + 10, "claudia", "c2")]
+        self.assertEqual(cw.fill_counts(fills, records, T0 + 3600, T0 - 86400), {"mikkel": 1})
+
+    def test_half_an_hour_after_a_fill_a_tap_is_a_fill_of_its_own(self):
+        fills = [tap(0), tap(30 * MIN - 1, "claudia"), tap(30 * MIN)]
+        records = [brew(10, "mikkel", "c1"), brew(30 * MIN + 10, "claudia", "c2")]
+        self.assertEqual(cw.fill_counts(fills, records, T0 + 3600, T0 - 86400), {"mikkel": 1, "claudia": 1})
+
+    def test_taps_merge_into_the_first_whatever_their_order(self):
+        fills = [tap(40 * MIN), tap(0), tap(20 * MIN)]
+        self.assertEqual([f["at"] for f in cw.single_fills(fills)], [iso(T0), iso(T0 + 40 * MIN)])
+        self.assertEqual(cw.single_fills([]), [])
+
+    def test_a_refill_seen_from_a_brew_is_no_double_tap_but_a_tap_after_it_is(self):
+        refill = {"at": iso(T0 + 20 * MIN), "source": "inferred", "user": None, "brew": "c2"}
+        records = [brew(10, "mikkel", "c1"), brew(20 * MIN, "claudia", "c2")]
+        self.assertEqual(cw.fill_counts([tap(0), refill], records, T0 + 3600, T0 - 86400),
+                         {"mikkel": 1, "claudia": 1})
+        self.assertEqual(cw.fill_counts([refill, tap(25 * MIN, "mikkel")], records, T0 + 3600, T0 - 86400),
+                         {"claudia": 1})
+
+    def test_a_double_tap_across_the_start_of_the_window_is_no_fill_of_its_own(self):
+        fills = [tap(-60 * 86400 - 60), tap(-60 * 86400 + 60)]
+        self.assertEqual(cw.fill_counts(fills, [], T0, T0 - 60 * 86400), {})
+
     def test_the_csv_is_the_most_first_and_nobody_last(self):
         self.assertEqual(cw.counts_csv({"mikkel": 18, "claudia": 2, "none": 15}), "mikkel:18,claudia:2,none:15")
         self.assertEqual(cw.counts_csv({"none": 3, "kristine": 1, "claudia": 1, "mikkel": 1}),

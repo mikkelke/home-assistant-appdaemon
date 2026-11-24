@@ -296,6 +296,11 @@ class OtherEntityTests(unittest.TestCase):
         self.assertNotIn("who_fills", pub.brews_entity([], NOW, "b1", None, NOW, fills)[1])
         self.assertEqual(pub.brews_entity([], NOW + 60, "b1", None, NOW, fills)[1]["who_fills"], "claudia:1")
 
+    def test_a_double_tap_is_one_fill(self):
+        at = NOW - DAY / 2 - 10
+        fills = [{"at": pub.iso(at + i * 13 * 60), "source": "tap", "user": None} for i in range(2)]
+        self.assertEqual(pub.brews_entity([record(1)], NOW, "b1", None, NOW, fills)[1]["who_fills"], "mikkel:1")
+
     def test_no_brews_and_no_fills_leave_the_counts_out(self):
         attrs = pub.brews_entity([], NOW, "b1", None, NOW)[1]
         self.assertFalse([key for key in attrs if key.startswith("who_")])

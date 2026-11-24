@@ -12,7 +12,8 @@ one confident phone; of several, the closest when the next is MARGIN_M or more f
 
 Who filled the water tank is told by the brew that follows (fill_by): the first to start within FILL_WINDOW_S
 after a tap, or the one that showed an inferred refill. Its person fills; a brew that names nobody leaves it to
-the resident whose account tapped, else nobody.
+the resident whose account tapped, else nobody. A tap less than FILL_MERGE_S after the fill kept before it is a
+double tap and counts with that fill (single_fills).
 """
 
 from coffee_fsm import epoch
@@ -25,6 +26,7 @@ MOVED_M = 1.0
 MARGIN_M = 1.0
 KEEP_S = 1200
 FILL_WINDOW_S = 900
+FILL_MERGE_S = 1800
 PEOPLE = ("mikkel", "kristine", "claudia")
 
 
@@ -132,10 +134,21 @@ def fill_by(fill, records, now):
     return who if who != "none" else named(fill.get("user"))
 
 
+def single_fills(fills):
+    """`fills` in time order without the double taps: a tap less than FILL_MERGE_S after the fill kept before it. A
+    refill seen from a brew is never one: the tank ran dry in between."""
+    kept = []
+    for fill in sorted(fills, key=lambda f: epoch(f["at"])):
+        if kept and fill.get("source") == "tap" and epoch(fill["at"]) - epoch(kept[-1]["at"]) < FILL_MERGE_S:
+            continue
+        kept.append(fill)
+    return kept
+
+
 def fill_counts(fills, records, now, since):
-    """{who: fills} of the fills at `since` (epoch s) or later that are not pending."""
+    """{who: fills} of the fills at `since` (epoch s) or later that are not pending, a double tap counted once."""
     counts = {}
-    for fill in fills:
+    for fill in single_fills(fills):
         if epoch(fill["at"]) < since:
             continue
         by = fill_by(fill, records, now)
