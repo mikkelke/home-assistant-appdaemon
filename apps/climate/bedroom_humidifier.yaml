@@ -4,10 +4,11 @@
 # sensor.bedroom_humidifier (off | humidifying | drying | manual | no_water | unknown) with a
 # `reason` attribute.
 #
-# Night: only while sleep_mode is on and the window is closed. On below on_below % of `humidity`,
-# off from off_at %, in run_mode (the quietest). Morning: when sleep mode turns off after a night in
-# which it ran, drying_mode for drying_hours. Sleep mode off and the humidifier on = manual use, left
-# alone. Water: one push to notify_target per empty spell, while `person` is home or on arrival.
+# Night: only while sleep_mode is on and the window is closed. On below on_below % of the bedroom
+# humidity, off from off_at %, in run_mode (the quietest). Morning: when sleep mode turns off after
+# a night in which it ran, drying_mode for drying_hours. Sleep mode off and the humidifier on =
+# manual use, left alone. Water: one push to notify_target per empty spell, while `person` is home
+# or on arrival.
 #
 # Run log: one JSON line per run, appended to bedroom_humidifier_log.jsonl beside the module
 # (*_log.jsonl is gitignored); set log_file to move it. Restart state: state_file.
@@ -22,8 +23,14 @@ BedroomHumidifier:
   dependencies: MobileNotifier
   humidifier: humidifier.evaporative_humidifier_271a
   water_level: sensor.evaporative_humidifier_271a_water_level
-  # The trusted bedroom sensor; the humidifier's own humidity sensor reads unknown.
-  humidity: sensor.bedroom_humidity
+  # The bedroom humidity comes from the first of these that reads a number and reported within
+  # humidity_max_age_min minutes; none are averaged. Not the Salus (sensor.bedroom_humidity): it reads
+  # whole percents, can stay quiet for hours and hangs above the humidifier. The humidifier's own
+  # humidity sensor reads unknown.
+  humidity_sources:
+    - sensor.reference_thermometer_1_humidity
+    - sensor.airdot_b49928_humidity
+  humidity_max_age_min: 30
   sleep_mode: input_boolean.mikkel_sleep_mode
   # on = open
   window: binary_sensor.bedroom_window_contact

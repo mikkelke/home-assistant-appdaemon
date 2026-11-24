@@ -2,12 +2,18 @@
 BedroomHumidifier - runs the bedroom's SwitchBot evaporative humidifier through the night and dries
 its wick in the morning.
 
-NIGHT. Only while `sleep_mode` is on and `window` is closed. Below `on_below` % on `humidity` the app
-starts the humidifier in `run_mode` (sleep, its quietest), from `off_at` % it stops it, and in
-between it keeps doing what it does. An open window stops it; once the window is closed the app
-decides afresh. An unreadable humidity, window or sleep-mode reading leaves the humidifier as it is.
-While sleep mode is on the app owns the humidifier: it sets another mode back to `run_mode` and never
-dries.
+NIGHT. Only while `sleep_mode` is on and `window` is closed. Below `on_below` % of the bedroom
+humidity the app starts the humidifier in `run_mode` (sleep, its quietest), from `off_at` % it stops
+it, and in between it keeps doing what it does. An open window stops it; once the window is closed
+the app decides afresh. An unreadable humidity, window or sleep-mode reading leaves the humidifier
+as it is. While sleep mode is on the app owns the humidifier: it sets another mode back to `run_mode`
+and never dries.
+
+HUMIDITY. `humidity_sources` lists the sensors in order of preference. The bedroom humidity is the
+first one that reads a number and reported within `humidity_max_age_min` minutes (last_reported,
+else last_updated), rounded to 0.1 %; the sources are never averaged. When none qualifies the
+humidity is unreadable. The stamps come from AppDaemon's cached state, which moves only when a state
+or attribute changes, so a sensor that repeats its value looks as old as its last change.
 
 MORNING. A night in which the humidifier ran leaves the wick wet. When sleep mode turns off the app
 sets `drying_mode` (drying_filter) and, `drying_hours` later, turns the humidifier off if it is still
@@ -34,12 +40,14 @@ sends nothing for COOLDOWN_S and logs an error. Every evaluation compares the hu
 with the wanted one, so a command that was reported done but did not take is noticed the same way.
 
 Publishes `health_entity` (off | humidifying | drying | manual | no_water | unknown) with a
-`reason` attribute. AppDaemon-published sensors vanish when Home Assistant restarts, so the entity
-is re-published at every five-minute check as well as on every change.
+`reason` attribute, the control `humidity` and the `humidity_source` that gave it. AppDaemon-published
+sensors vanish when Home Assistant restarts, so the entity is re-published at every five-minute check
+as well as on every change.
 
 Each run of the humidifier while sleep mode is on, and each drying, appends one JSON line to
 `log_file` when it ends: {night, kind (humidify | dry), start, stop, minutes, humidity_start,
-humidity_stop, stop_reason}. `night` is the date of the evening the night began.
+humidity_source_start, humidity_stop, humidity_source_stop, stop_reason}. `night` is the date of the
+evening the night began.
 
 The state that must outlive a restart (the last sleep-mode reading, the wick, the drying deadline,
 the open run, the water push) lives in `state_file`. All timestamps are epoch seconds.
@@ -134,7 +142,8 @@ class BedroomHumidifier(hass.Hass):
         a = self.args
         self.humidifier = a["humidifier"]
         self.water_entity = a["water_level"]
-        self.humidity_entity = a["humidity"]
+        self.humidity_sources = a["humidity_sources"]
+        self.humidity_max_age_s = float(a.get("humidity_max_age_min", 30)) * 60
         self.sleep_entity = a["sleep_mode"]
         self.window_entity = a["window"]
         self.person_entity = a["person"]
@@ -152,6 +161,14 @@ class BedroomHumidifier(hass.Hass):
             raise ValueError("BedroomHumidifier: on_below must be below off_at")
         if self.drying_s <= 0:
             raise ValueError("BedroomHumidifier: drying_hours must be positive")
+        if not (
+            isinstance(self.humidity_sources, list)
+            and self.humidity_sources
+            and all(isinstance(source, str) for source in self.humidity_sources)
+        ):
+            raise ValueError("BedroomHumidifier: humidity_sources must be a non-empty list of entity ids")
+        if self.humidity_max_age_s <= 0:
+            raise ValueError("BedroomHumidifier: humidity_max_age_min must be positive")
 
         self._notifier = self.get_app("MobileNotifier")
         saved = self._load_state()
@@ -174,7 +191,7 @@ class BedroomHumidifier(hass.Hass):
         self._published_key = None
         self._saved_text = None
 
-        for entity in (self.sleep_entity, self.window_entity, self.humidity_entity, self.water_entity, self.person_entity):
+        for entity in (self.sleep_entity, self.window_entity, *self.humidity_sources, self.water_entity, self.person_entity):
             self.listen_state(self._on_change, entity)
         # A mode change leaves the state "on" untouched, so only attribute="all" sees it.
         self.listen_state(self._on_change, self.humidifier, attribute="all")
@@ -185,8 +202,9 @@ class BedroomHumidifier(hass.Hass):
         if self._wick == WICK_DRYING:
             self.run_in(self._tick, max(0.0, self._dry_until - now) + 5)
         self.log(
-            f"BedroomHumidifier {self.health_entity} initialized: {self.humidifier}, on below {self.on_below:g} %, "
-            f"off at {self.off_at:g} %, sleep mode {self._asleep}, wick {self._wick}",
+            f"BedroomHumidifier {self.health_entity} initialized: {self.humidifier}, "
+            f"humidity from {', '.join(self.humidity_sources)} (at most {self.humidity_max_age_s / 60:g} min old), "
+            f"on below {self.on_below:g} %, off at {self.off_at:g} %, sleep mode {self._asleep}, wick {self._wick}",
             level="INFO",
         )
 
@@ -201,22 +219,35 @@ class BedroomHumidifier(hass.Hass):
     def _evaluate(self, now, force=False):
         sleep = {"on": True, "off": False}.get(self.get_state(self.sleep_entity))
         window = {"on": "open", "off": "closed"}.get(self.get_state(self.window_entity))
-        humidity = _number(self.get_state(self.humidity_entity))
+        humidity, source = self._read_humidity(now)
         kind, mode = self._read_device()
         water = self.get_state(self.water_entity, attribute="all") or {}
         level = water.get("state")
         level_since = _epoch(water.get("last_changed"))
 
         self._note_unreadable(sleep, window, humidity, kind)
-        self._observe(now, kind, humidity, self._sleep_edge(sleep))
+        self._observe(now, kind, humidity, source, self._sleep_edge(sleep))
         decision = self._decide(now, kind, mode, window, humidity)
         decision = self._guard_water(decision, level)
         self._act(now, decision, kind)
         self._water(now, level, level_since)
-        self._publish(kind, mode, humidity, level, level_since, force)
+        self._publish(kind, mode, humidity, source, level, level_since, force)
         self._persist()
 
     # ---------- readings ----------
+
+    def _read_humidity(self, now):
+        """(humidity, source): the first listed source that reads a number and reported within
+        humidity_max_age_s, else (None, None). The humidity is rounded to 0.1 %."""
+        for source in self.humidity_sources:
+            full = self.get_state(source, attribute="all") or {}
+            value = _number(full.get("state"))
+            stamp = _epoch(full.get("last_reported"))
+            if stamp is None:
+                stamp = _epoch(full.get("last_updated"))
+            if value is not None and stamp is not None and now - stamp <= self.humidity_max_age_s:
+                return round(value, 1), source
+        return None, None
 
     def _read_device(self):
         """(kind, mode): kind is off, humidify, dry, or None when the humidifier is unreadable.
@@ -258,7 +289,7 @@ class BedroomHumidifier(hass.Hass):
 
     # ---------- bookkeeping ----------
 
-    def _observe(self, now, kind, humidity, edge):
+    def _observe(self, now, kind, humidity, source, edge):
         if edge == "on":
             self.log("BedroomHumidifier: sleep mode on", level="INFO")
             if self._wick in (WICK_DUE, WICK_DRYING):
@@ -274,9 +305,9 @@ class BedroomHumidifier(hass.Hass):
                 self._wick = WICK_DUE
         if self._asleep and kind == "humidify" and self._wick == WICK_DRY:
             self._wick = WICK_WET
-        self._track(now, kind, humidity)
+        self._track(now, kind, humidity, source)
 
-    def _track(self, now, kind, humidity):
+    def _track(self, now, kind, humidity, source):
         """Open and close the run that goes to the run log: a humidifier that is on while sleep mode
         is on, or one that is drying during our drying."""
         if kind is None:
@@ -287,11 +318,11 @@ class BedroomHumidifier(hass.Hass):
         elif kind == "dry" and self._wick == WICK_DRYING:
             tracked = "dry"
         if self._run is not None and self._run["kind"] != tracked:
-            self._close_run(now, kind, humidity)
+            self._close_run(now, kind, humidity, source)
         if tracked is not None and self._run is None:
-            self._run = {"kind": tracked, "start": now, "humidity": humidity}
+            self._run = {"kind": tracked, "start": now, "humidity": humidity, "source": source}
 
-    def _close_run(self, now, kind, humidity):
+    def _close_run(self, now, kind, humidity, source):
         run, self._run = self._run, None
         reason, self._off_reason = self._off_reason, None
         if reason is None:
@@ -303,7 +334,9 @@ class BedroomHumidifier(hass.Hass):
             "stop": _iso(now),
             "minutes": round((now - run["start"]) / 60, 1),
             "humidity_start": run.get("humidity"),
+            "humidity_source_start": run.get("source"),
             "humidity_stop": humidity,
+            "humidity_source_stop": source,
             "stop_reason": reason,
         }
         try:
@@ -518,7 +551,7 @@ class BedroomHumidifier(hass.Hass):
 
     # ---------- semantic entity ----------
 
-    def _publish(self, kind, mode, humidity, level, level_since, force):
+    def _publish(self, kind, mode, humidity, source, level, level_since, force):
         if level == WATER_EMPTY:
             state = "no_water"
             reason = f"Water tank is empty since {_clock(level_since)}" if level_since else "Water tank is empty"
@@ -533,11 +566,12 @@ class BedroomHumidifier(hass.Hass):
         attrs = {"friendly_name": "Bedroom humidifier", "icon": ICONS[state], "reason": reason}
         if humidity is not None:
             attrs["humidity"] = humidity
+            attrs["humidity_source"] = source
         if level is not None:
             attrs["water_level"] = level
         if kind in ("humidify", "dry") and mode:
             attrs["mode"] = mode
-        key = (state, reason, humidity, level, attrs.get("mode"))
+        key = (state, reason, humidity, source, level, attrs.get("mode"))
         if key == self._published_key and not force:
             return
         try:

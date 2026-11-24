@@ -1,9 +1,10 @@
 # tests/test_bedroom_humidifier.py - BedroomHumidifier: night control with hysteresis, window and
-# unreadable inputs, morning drying with its off after two hours, manual use left alone, one water
-# push per empty spell, command retry and pause, restart survival, the run log and the published
-# sensor. The world is a fake Home Assistant whose humidifier obeys service calls and, like the real
-# one, reports state off with mode drying_filter after every turn_off; events caused by the app's own
-# commands arrive after the callback that sent them has returned, as in AppDaemon.
+# unreadable inputs, the choice between the humidity sources by freshness, morning drying with its
+# off after two hours, manual use left alone, one water push per empty spell, command retry and
+# pause, restart survival, the run log and the published sensor. The world is a fake Home Assistant
+# whose humidifier obeys service calls and, like the real one, reports state off with mode
+# drying_filter after every turn_off; events caused by the app's own commands arrive after the
+# callback that sent them has returned, as in AppDaemon.
 # Run from repo root: python3 -m unittest discover -s apps/climate/tests -q
 
 from __future__ import annotations
@@ -41,7 +42,9 @@ YAML_ARGS = yaml.safe_load(YAML_FILE.read_text())["BedroomHumidifier"]
 
 HUMIDIFIER = "humidifier.evaporative_humidifier_271a"
 WATER = "sensor.evaporative_humidifier_271a_water_level"
-HUMIDITY = "sensor.bedroom_humidity"
+PRIMARY = "sensor.reference_thermometer_1_humidity"
+FALLBACK = "sensor.airdot_b49928_humidity"
+SOURCES = (PRIMARY, FALLBACK)
 SLEEP = "input_boolean.mikkel_sleep_mode"
 WINDOW = "binary_sensor.bedroom_window_contact"
 PERSON = "person.mikkel"
@@ -66,8 +69,9 @@ class World:
 
     def __init__(self, tmp, now=T0, args=None, **states):
         self.clock = now
-        self.states = {SLEEP: "off", WINDOW: "off", HUMIDITY: "35.0", PERSON: "home"}
+        self.states = {SLEEP: "off", WINDOW: "off", PRIMARY: "35.0", FALLBACK: "unavailable", PERSON: "home"}
         self.states.update(states)
+        self.stamps = {}
         self.device = {"state": "off", "mode": "quiet"}
         self.level = "high"
         self.level_changed = now - 3600
@@ -124,9 +128,22 @@ class World:
         if entity == WATER and attribute == "all":
             changed = datetime.fromtimestamp(self.level_changed, timezone.utc).isoformat()
             return {"state": self.level, "last_changed": changed}
+        if entity in SOURCES and attribute == "all":
+            return self._source(entity)
         if attribute is not None:
             raise AssertionError(f"unexpected get_state({entity}, attribute={attribute})")
         return self.states.get(entity)
+
+    def _source(self, entity):
+        """A humidity source as AppDaemon caches it. Unless the test made it quiet, it reports right now."""
+        if entity not in self.states:
+            return None
+        reported, updated = self.stamps.get(entity, (self.clock, self.clock))
+        full = {"state": self.states[entity]}
+        for key, stamp in (("last_reported", reported), ("last_updated", updated)):
+            if stamp is not None:
+                full[key] = stamp if isinstance(stamp, str) else datetime.fromtimestamp(stamp, timezone.utc).isoformat()
+        return full
 
     def _action(self):
         """The action attribute as Home Assistant derives it from the power and the mode."""
@@ -180,14 +197,23 @@ class World:
 
     def event(self, entity, value):
         self.states[entity] = value
+        if entity in self.stamps:
+            self.stamps[entity] = (self.clock, self.clock)
         self.app._on_change(entity, "state", None, value, {})
         self._drain()
+
+    def quiet(self, source, seconds=0):
+        """The source last reported `seconds` ago and says nothing more until its next event."""
+        self.stamps[source] = (self.clock - seconds, self.clock - seconds)
 
     def sleep(self, on):
         self.event(SLEEP, "on" if on else "off")
 
     def humidity(self, value):
-        self.event(HUMIDITY, str(value))
+        self.event(PRIMARY, str(value))
+
+    def fallback(self, value):
+        self.event(FALLBACK, str(value))
 
     def window(self, open_):
         self.event(WINDOW, "on" if open_ else "off")
@@ -253,7 +279,7 @@ class Base(unittest.TestCase):
 
 class NightControl(Base):
     def test_nothing_happens_while_sleep_mode_is_off(self):
-        w = self.world(**{HUMIDITY: "30.0"})
+        w = self.world(**{PRIMARY: "30.0"})
         w.tick_for(3 * H)
         self.assertEqual(w.calls, [])
         self.assertEqual(w.sensor()[0], "off")
@@ -303,7 +329,7 @@ class NightControl(Base):
     def test_five_minute_check_notices_humidity_without_an_event(self):
         w = self.world()
         w.sleep(True)
-        w.states[HUMIDITY] = "36.0"
+        w.states[PRIMARY] = "36.0"
         w.tick(5 * MIN)
         self.assertEqual(w.calls, [TURN_ON, SLEEP_MODE])
 
@@ -339,7 +365,7 @@ class NightControl(Base):
             with self.subTest(bad=bad):
                 w = self.night(38)
                 n = len(w.calls)
-                w.event(HUMIDITY, bad)
+                w.event(PRIMARY, bad)
                 w.tick_for(30 * MIN)
                 self.assertEqual(len(w.calls), n)
                 self.assertEqual(len(w.lines("WARNING", "bedroom humidity unreadable")), 1)
@@ -349,7 +375,7 @@ class NightControl(Base):
 
     def test_unreadable_humidity_does_not_start_a_stopped_one(self):
         w = self.world()
-        w.event(HUMIDITY, "unavailable")
+        w.event(PRIMARY, "unavailable")
         w.sleep(True)
         w.tick_for(H)
         self.assertEqual(w.calls, [])
@@ -627,7 +653,7 @@ class ManualUse(Base):
         self.assertIn("by hand", manual[0])
 
     def test_start_up_with_the_humidifier_already_on_in_sleep_mode_does_nothing(self):
-        w = self.world(**{HUMIDITY: "30.0"})
+        w = self.world(**{PRIMARY: "30.0"})
         w.device.update(state="on", mode="sleep")
         w.start()
         w.tick_for(2 * H)
@@ -707,7 +733,7 @@ class AutoDry(Base):
         for humidity in (41, 45):
             for asleep in (False, True):
                 with self.subTest(humidity=humidity, asleep=asleep):
-                    w = self.world(**{HUMIDITY: str(humidity), SLEEP: "on" if asleep else "off"})
+                    w = self.world(**{PRIMARY: str(humidity), SLEEP: "on" if asleep else "off"})
                     w.device.update(state="off", mode="drying_filter")
                     w.start()
                     w.tick_for(H)
@@ -1130,7 +1156,9 @@ class RunLog(Base):
             "stop": "2026-11-25T00:30:00+01:00",
             "minutes": 90.0,
             "humidity_start": 37.0,
+            "humidity_source_start": PRIMARY,
             "humidity_stop": 42.0,
+            "humidity_source_stop": PRIMARY,
             "stop_reason": "Humidity 42 % is at or above 42 %",
         })
 
@@ -1228,6 +1256,7 @@ class PublishedSensor(Base):
         state, attrs = w.sensor()
         self.assertEqual(state, "humidifying")
         self.assertEqual((attrs["humidity"], attrs["water_level"], attrs["mode"]), (38.5, "high", "sleep"))
+        self.assertEqual(attrs["humidity_source"], PRIMARY)
         self.assertIn("38.5", attrs["reason"])
 
     def test_it_is_republished_at_every_check_and_not_on_an_event_that_changes_nothing(self):
@@ -1256,6 +1285,168 @@ class PublishedSensor(Base):
         self.assertTrue(w.lines("INFO", "off -> humidifying: Humidity 38 % is below 40 %"))
 
 
+class HumiditySources(Base):
+    """The bedroom humidity is the first listed source that reads a number and reported within 30 minutes."""
+
+    def source(self, w):
+        return w.sensor()[1].get("humidity_source")
+
+    def test_the_first_source_is_used_when_it_is_fresh_and_nothing_is_averaged(self):
+        w = self.world(**{PRIMARY: "38.0", FALLBACK: "45.0"})
+        w.sleep(True)
+        self.assertEqual(w.calls, [TURN_ON, SLEEP_MODE], "38 % from the first source, not 45 % or their mean")
+        _, attrs = w.sensor()
+        self.assertEqual((attrs["humidity"], attrs["humidity_source"]), (38.0, PRIMARY))
+        self.assertIn("Humidity 38 %", attrs["reason"])
+
+    def test_the_second_source_is_used_when_the_first_has_gone_quiet(self):
+        w = self.world(**{PRIMARY: "38.0", FALLBACK: "45.0"})
+        w.quiet(PRIMARY, 31 * MIN)
+        w.sleep(True)
+        self.assertEqual(w.calls, [], "45 % from the second source; the old 38 % is not used")
+        _, attrs = w.sensor()
+        self.assertEqual((attrs["humidity"], attrs["humidity_source"]), (45.0, FALLBACK))
+
+    def test_a_report_exactly_thirty_minutes_old_counts_and_one_second_older_does_not(self):
+        for age, used in ((30 * MIN, PRIMARY), (30 * MIN + 1, FALLBACK)):
+            with self.subTest(age=age):
+                w = self.world(**{PRIMARY: "38.0", FALLBACK: "45.0"})
+                w.quiet(PRIMARY, age)
+                w.sleep(True)
+                self.assertEqual(self.source(w), used)
+
+    def test_a_first_source_that_ages_out_hands_over_at_the_next_check(self):
+        w = self.world(**{PRIMARY: "38.0", FALLBACK: "45.0"})
+        w.sleep(True)
+        w.quiet(PRIMARY)
+        w.tick_for(30 * MIN)
+        self.assertEqual(self.source(w), PRIMARY)
+        self.assertEqual(w.calls, [TURN_ON, SLEEP_MODE])
+        w.fallback(45.0)
+        w.tick(MIN)
+        self.assertEqual(self.source(w), FALLBACK)
+        self.assertEqual(w.calls[2:], [TURN_OFF])
+
+    def test_the_second_source_is_used_when_the_first_does_not_read_a_number(self):
+        for bad in ("unavailable", "unknown", "", "abc", "nan"):
+            with self.subTest(bad=bad):
+                w = self.world(**{PRIMARY: bad, FALLBACK: "38.0"})
+                w.sleep(True)
+                self.assertEqual(w.calls, [TURN_ON, SLEEP_MODE])
+                self.assertEqual(self.source(w), FALLBACK)
+
+    def test_the_second_source_is_used_when_the_first_does_not_exist(self):
+        w = self.world(**{FALLBACK: "38.0"})
+        del w.states[PRIMARY]
+        w.sleep(True)
+        self.assertEqual(w.calls, [TURN_ON, SLEEP_MODE])
+        self.assertEqual(self.source(w), FALLBACK)
+
+    def test_the_first_source_is_used_again_as_soon_as_it_reports(self):
+        w = self.world(**{PRIMARY: "38.0", FALLBACK: "45.0"})
+        w.quiet(PRIMARY, 31 * MIN)
+        w.sleep(True)
+        self.assertEqual(self.source(w), FALLBACK)
+        w.humidity(38.0)
+        self.assertEqual(self.source(w), PRIMARY)
+        self.assertEqual(w.calls, [TURN_ON, SLEEP_MODE])
+
+    def test_an_event_on_the_second_source_is_acted_on_while_the_first_is_quiet(self):
+        w = self.world(**{PRIMARY: "45.0", FALLBACK: "45.0"})
+        w.quiet(PRIMARY, 31 * MIN)
+        w.sleep(True)
+        self.assertEqual(w.calls, [])
+        w.fallback(39.9)
+        self.assertEqual(w.calls, [TURN_ON, SLEEP_MODE])
+
+    def test_no_fresh_source_does_not_start_a_stopped_humidifier(self):
+        w = self.world(**{PRIMARY: "35.0", FALLBACK: "35.0"})
+        w.quiet(PRIMARY, 31 * MIN)
+        w.quiet(FALLBACK, 31 * MIN)
+        w.sleep(True)
+        w.tick_for(2 * H)
+        self.assertEqual(w.calls, [])
+        state, attrs = w.sensor()
+        self.assertEqual(state, "off")
+        self.assertIn("unreadable", attrs["reason"])
+        self.assertNotIn("humidity", attrs)
+        self.assertNotIn("humidity_source", attrs)
+        self.assertEqual(len(w.lines("WARNING", "bedroom humidity unreadable")), 1)
+
+    def test_no_fresh_source_leaves_a_running_humidifier_as_it_is(self):
+        w = self.night(38)
+        w.fallback(45)
+        self.assertEqual(w.calls, [TURN_ON, SLEEP_MODE], "the second source does not count while the first is fresh")
+        w.quiet(PRIMARY)
+        w.quiet(FALLBACK)
+        w.tick_for(31 * MIN)
+        self.assertEqual(w.calls, [TURN_ON, SLEEP_MODE], "no stop on a 45 % that is 31 minutes old")
+        self.assertEqual(w.device["state"], "on")
+        self.assertEqual(len(w.lines("WARNING", "bedroom humidity unreadable")), 1)
+        w.fallback(45)
+        self.assertEqual(w.calls[2:], [TURN_OFF])
+        self.assertTrue(w.lines("INFO", "readable again"))
+
+    def test_the_stamp_is_last_reported_and_then_last_updated(self):
+        cases = (
+            ("repeated value, reported a minute ago", MIN, 2 * H, PRIMARY),
+            ("reported 31 minutes ago", 31 * MIN, 31 * MIN, FALLBACK),
+            ("no last_reported, updated 5 minutes ago", None, 5 * MIN, PRIMARY),
+            ("no last_reported, updated 31 minutes ago", None, 31 * MIN, FALLBACK),
+            ("no stamps at all", None, None, FALLBACK),
+            ("unparseable stamps", "yesterday", "never", FALLBACK),
+        )
+        for name, reported, updated, used in cases:
+            with self.subTest(name):
+                w = self.world(**{PRIMARY: "38.0", FALLBACK: "45.0"})
+                w.stamps[PRIMARY] = tuple(x if x is None or isinstance(x, str) else w.clock - x for x in (reported, updated))
+                w.sleep(True)
+                self.assertEqual(self.source(w), used)
+
+    def test_the_humidity_is_rounded_to_a_tenth_of_a_percent(self):
+        w = self.world(**{PRIMARY: "unavailable", FALLBACK: "30.0300006866455"})
+        w.tick()
+        self.assertEqual(w.sensor()[1]["humidity"], 30.0)
+        w.fallback("41.949999")
+        self.assertEqual(w.sensor()[1]["humidity"], 41.9)
+
+    def test_the_sensor_names_the_source_and_changes_it_with_the_source(self):
+        w = self.world(**{PRIMARY: "36.0", FALLBACK: "36.5"})
+        self.assertEqual(self.source(w), PRIMARY)
+        w.quiet(PRIMARY, 31 * MIN)
+        w.tick()
+        self.assertEqual(self.source(w), FALLBACK)
+        self.assertEqual(w.sensor()[1]["humidity"], 36.5)
+
+    def test_the_run_log_names_the_source_at_the_start_and_at_the_stop(self):
+        w = self.world(**{PRIMARY: "38.0"})
+        w.sleep(True)
+        w.tick(H)
+        w.quiet(PRIMARY, 31 * MIN)
+        w.fallback(43)
+        (record,) = w.run_log()
+        self.assertEqual((record["humidity_start"], record["humidity_source_start"]), (38.0, PRIMARY))
+        self.assertEqual((record["humidity_stop"], record["humidity_source_stop"]), (43.0, FALLBACK))
+
+    def test_a_run_open_across_a_restart_keeps_the_source_it_started_on(self):
+        w = self.world(**{PRIMARY: "38.0"})
+        w.sleep(True)
+        w.start()
+        w.humidity(43)
+        (record,) = w.run_log()
+        self.assertEqual((record["humidity_source_start"], record["humidity_source_stop"]), (PRIMARY, PRIMARY))
+
+    def test_a_run_saved_without_a_source_still_closes(self):
+        w = self.night(38)
+        saved = w.saved()
+        del saved["run"]["source"]
+        w.state_file.write_text(json.dumps(saved))
+        w.start()
+        w.humidity(43)
+        (record,) = w.run_log()
+        self.assertEqual((record["humidity_source_start"], record["humidity_source_stop"]), (None, PRIMARY))
+
+
 class Configuration(unittest.TestCase):
     def test_the_yaml_names_the_entities_and_thresholds_of_the_assignment(self):
         self.assertEqual(YAML_ARGS["module"], "bedroom_humidifier")
@@ -1263,7 +1454,9 @@ class Configuration(unittest.TestCase):
         self.assertEqual(YAML_ARGS["dependencies"], "MobileNotifier")
         self.assertEqual(YAML_ARGS["humidifier"], HUMIDIFIER)
         self.assertEqual(YAML_ARGS["water_level"], WATER)
-        self.assertEqual(YAML_ARGS["humidity"], HUMIDITY)
+        self.assertEqual(YAML_ARGS["humidity_sources"], [PRIMARY, FALLBACK])
+        self.assertEqual(YAML_ARGS["humidity_max_age_min"], 30)
+        self.assertNotIn("humidity", YAML_ARGS)
         self.assertEqual(YAML_ARGS["sleep_mode"], SLEEP)
         self.assertEqual(YAML_ARGS["window"], WINDOW)
         self.assertEqual(YAML_ARGS["health_entity"], HEALTH)
@@ -1271,7 +1464,7 @@ class Configuration(unittest.TestCase):
         self.assertEqual((YAML_ARGS["on_below"], YAML_ARGS["off_at"]), (40, 42))
         self.assertEqual((YAML_ARGS["run_mode"], YAML_ARGS["drying_mode"], YAML_ARGS["drying_hours"]), ("sleep", "drying_filter", 2))
 
-    def test_the_yaml_declares_no_log_stream_and_only_scalars(self):
+    def test_the_yaml_declares_no_log_stream_and_no_dictionary_values(self):
         self.assertNotIn("log", YAML_ARGS)
         for key, value in YAML_ARGS.items():
             self.assertNotIsInstance(value, dict, key)
@@ -1281,7 +1474,7 @@ class Configuration(unittest.TestCase):
 
     def test_every_arg_the_app_requires_is_in_the_yaml(self):
         source = (Path(bh.__file__)).read_text()
-        for key in ("humidifier", "water_level", "humidity", "sleep_mode", "window", "person", "health_entity"):
+        for key in ("humidifier", "water_level", "humidity_sources", "sleep_mode", "window", "person", "health_entity"):
             self.assertIn(f'a["{key}"]', source)
             self.assertIn(key, YAML_ARGS)
 
@@ -1291,6 +1484,35 @@ class Configuration(unittest.TestCase):
         for args in ({"on_below": 42, "off_at": 42}, {"on_below": 43, "off_at": 42}, {"drying_hours": 0}):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 World(tmp, args=args)
+
+    def test_the_humidity_sources_must_be_a_list_of_entity_ids_and_the_age_positive(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for args in (
+            {"humidity_sources": []},
+            {"humidity_sources": PRIMARY},
+            {"humidity_sources": [PRIMARY, 3]},
+            {"humidity_max_age_min": 0},
+        ):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                World(tmp, args=args)
+
+    def test_the_age_limit_is_an_option_in_minutes(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        w = World(tmp, args={"humidity_max_age_min": 90}, **{PRIMARY: "38.0", FALLBACK: "45.0"})
+        w.quiet(PRIMARY, 89 * MIN)
+        w.tick()
+        self.assertEqual(w.sensor()[1]["humidity_source"], PRIMARY)
+        w.quiet(PRIMARY, 91 * MIN)
+        w.tick()
+        self.assertEqual(w.sensor()[1]["humidity_source"], FALLBACK)
+
+    def test_the_init_line_names_the_sources_and_the_age_limit(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (line,) = World(tmp).lines("INFO", "initialized")
+        self.assertIn(f"humidity from {PRIMARY}, {FALLBACK} (at most 30 min old)", line)
 
     def test_the_log_and_state_files_default_beside_the_module(self):
         tmp = tempfile.mkdtemp()
@@ -1318,7 +1540,8 @@ class Configuration(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
         w = World(tmp)
         listened = {c.args[1]: c.kwargs for c in w.app.listen_state.call_args_list}
-        self.assertEqual(set(listened), {SLEEP, WINDOW, HUMIDITY, WATER, PERSON, HUMIDIFIER})
+        self.assertEqual(set(listened), {SLEEP, WINDOW, PRIMARY, FALLBACK, WATER, PERSON, HUMIDIFIER})
+        self.assertNotIn("sensor.bedroom_humidity", listened)
         self.assertEqual(listened[HUMIDIFIER], {"attribute": "all"})
         w.app.run_every.assert_called_once_with(w.app._tick, "now+60", 300)
 
