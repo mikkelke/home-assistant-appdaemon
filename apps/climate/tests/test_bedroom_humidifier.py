@@ -92,6 +92,7 @@ class World:
         self.args = dict(YAML_ARGS)
         self.args["state_file"] = str(Path(tmp) / "state.json")
         self.args["log_file"] = str(Path(tmp) / "run_log.jsonl")
+        self.args["humidity_max_age_min"] = 30
         self.args.update(args or {})
         self.state_file = Path(self.args["state_file"])
         self.log_file = Path(self.args["log_file"])
@@ -1455,7 +1456,7 @@ class Configuration(unittest.TestCase):
         self.assertEqual(YAML_ARGS["humidifier"], HUMIDIFIER)
         self.assertEqual(YAML_ARGS["water_level"], WATER)
         self.assertEqual(YAML_ARGS["humidity_sources"], [PRIMARY, FALLBACK])
-        self.assertEqual(YAML_ARGS["humidity_max_age_min"], 30)
+        self.assertEqual(YAML_ARGS["humidity_max_age_min"], 240)
         self.assertNotIn("humidity", YAML_ARGS)
         self.assertEqual(YAML_ARGS["sleep_mode"], SLEEP)
         self.assertEqual(YAML_ARGS["window"], WINDOW)
