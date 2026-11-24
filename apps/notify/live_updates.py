@@ -438,7 +438,8 @@ def card_changed(previous, card):
 
 
 def notification_payload(card, now, channel="Live updates", update=False):
-    """update: the phone already shows this card. iOS ignores alert_once, so an update is passive there."""
+    """update: the phone already shows this card. iOS ignores alert_once: a Live Activity update is quiet only
+    with silent, a plain iOS notification only with a passive interruption level."""
     data = {"tag": card.tag, "live_update": True, "critical_text": card.critical_text,
             "notification_icon": card.icon, "sticky": True, "alert_once": True, "channel": channel,
             "importance": "low"}
@@ -447,7 +448,7 @@ def notification_payload(card, now, channel="Live updates", update=False):
     if card.finish_at is not None:
         data.update(chronometer=True, when=max(0, math.ceil(card.finish_at - now)), when_relative=True)
     if update:
-        data["push"] = {"interruption-level": "passive"}
+        data.update(silent=True, push={"interruption-level": "passive"})
     return {"title": card.title, "message": card.message, "data": data}
 
 
