@@ -1,0 +1,38 @@
+# /conf/apps/climate/bedroom_humidifier.yaml
+# Runs the bedroom's SwitchBot evaporative humidifier through Mikkel's night and dries its wick in
+# the morning - see bedroom_humidifier.py's module docstring for the rules. Publishes
+# sensor.bedroom_humidifier (off | humidifying | drying | manual | no_water | unknown) with a
+# `reason` attribute.
+#
+# Night: only while sleep_mode is on and the window is closed. On below on_below % of `humidity`,
+# off from off_at %, in run_mode (the quietest). Morning: when sleep mode turns off after a night in
+# which it ran, drying_mode for drying_hours. Sleep mode off and the humidifier on = manual use, left
+# alone. Water: one push to notify_target per empty spell, while `person` is home or on arrival.
+#
+# Run log: one JSON line per run, appended to bedroom_humidifier_log.jsonl beside the module
+# (*_log.jsonl is gitignored); set log_file to move it. Restart state: state_file.
+#
+# No `log:` key on purpose: a named log stream must be declared in the box-only appdaemon.yaml
+# first or the app fails to instantiate.
+
+BedroomHumidifier:
+  module: bedroom_humidifier
+  class: BedroomHumidifier
+  # Init-order guarantee for get_app("MobileNotifier") cached in initialize(); also reloads this app when MobileNotifier reloads.
+  dependencies: MobileNotifier
+  humidifier: humidifier.evaporative_humidifier_271a
+  water_level: sensor.evaporative_humidifier_271a_water_level
+  # The trusted bedroom sensor; the humidifier's own humidity sensor reads unknown.
+  humidity: sensor.bedroom_humidity
+  sleep_mode: input_boolean.mikkel_sleep_mode
+  # on = open
+  window: binary_sensor.bedroom_window_contact
+  person: person.mikkel
+  notify_target: mikkel
+  health_entity: sensor.bedroom_humidifier
+  run_mode: sleep
+  drying_mode: drying_filter
+  drying_hours: 2
+  on_below: 40
+  off_at: 42
+  state_file: /conf/apps/climate/bedroom_humidifier_state.json
