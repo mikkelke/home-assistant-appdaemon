@@ -30,7 +30,9 @@ BedroomHumidifier:
   humidity_sources:
     - sensor.reference_thermometer_1_humidity
     - sensor.airdot_b49928_humidity
-  humidity_max_age_min: 30
+  # Reference thermometer 1 reports on every ~1 point change plus an hourly heartbeat that does not
+  # change the state, so a quiet hour means an unchanged value; the age only catches a dead sensor.
+  humidity_max_age_min: 240
   sleep_mode: input_boolean.mikkel_sleep_mode
   # on = open
   window: binary_sensor.bedroom_window_contact
