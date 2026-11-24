@@ -456,6 +456,8 @@ def notification_payload(card, now, channel="Live updates", update=False):
     if card.link:
         data.update(clickAction=card.link, url=card.link)
     if card.finish_at is not None:
+        # A fixed critical_text would freeze the Android status chip; without it the chip runs the chronometer.
+        data.pop("critical_text")
         data.update(chronometer=True, when=max(0, math.ceil(card.finish_at - now)), when_relative=True,
                     content_state={"critical_text": card.message})
     if update:

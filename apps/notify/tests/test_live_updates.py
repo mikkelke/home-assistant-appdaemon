@@ -171,7 +171,7 @@ class LiveUpdateIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(service, "notify/mobile_app_mikkels_ofx9p")
                 self.assertEqual(payload["title"], title)
                 data = payload["data"]
-                self.assertEqual(data["critical_text"], "12 min")
+                self.assertNotIn("critical_text", data)
                 self.assertEqual(data["notification_icon"], icon)
                 self.assertEqual(data["when"], 720)
                 self.assertIs(data["chronometer"], True)
@@ -332,7 +332,9 @@ class LiveUpdateIntegrationTests(unittest.IsolatedAsyncioTestCase):
         card = lu.coffee_card(coffee(), NOW)
         data = lu.notification_payload(card, NOW)["data"]
         self.assertEqual(data["content_state"], {"critical_text": "Brewing · Morning"})
-        self.assertEqual(data["critical_text"], card.critical_text)
+        self.assertNotIn("critical_text", data)
+        paused = lu.notification_payload(lu.coffee_card(coffee(phase="paused"), NOW), NOW)["data"]
+        self.assertEqual(paused["critical_text"], "Pause")
         self.assertNotIn("content_state", lu.notification_payload(lu.coffee_card(coffee(phase="paused"), NOW), NOW)["data"])
 
     def test_relevance_puts_the_doorbell_first_and_deliveries_last(self):

@@ -123,8 +123,8 @@ class WoltCardTests(unittest.TestCase):
         payload = lu.notification_payload(card(), NOW)
         data = payload["data"]
         self.assertEqual(payload["title"], f"Wolt · {KITCHEN}")
-        self.assertEqual((data["tag"], data["channel"], data["importance"], data["critical_text"]),
-                         (WOLT, "Live updates", "low", "8 min"))
+        self.assertEqual((data["tag"], data["channel"], data["importance"]), (WOLT, "Live updates", "low"))
+        self.assertNotIn("critical_text", data)
         self.assertEqual((data["when"], data["chronometer"], data["when_relative"], data["live_update"]), (480, True, True, True))
         self.assertEqual((data["clickAction"], data["url"]), ("app://com.wolt.android",) * 2)
         self.assertNotIn("priority", data)
@@ -254,8 +254,8 @@ class ParcelCardTests(unittest.TestCase):
         payload = lu.notification_payload(parcel_card(eta=NOW + 1800), NOW)
         data = payload["data"]
         self.assertEqual(payload["title"], "PostNord")
-        self.assertEqual((data["tag"], data["channel"], data["importance"], data["critical_text"]),
-                         (POSTNORD, "Live updates", "low", "30 min"))
+        self.assertEqual((data["tag"], data["channel"], data["importance"]), (POSTNORD, "Live updates", "low"))
+        self.assertNotIn("critical_text", data)
         self.assertEqual((data["when"], data["chronometer"], data["when_relative"], data["live_update"]), (1800, True, True, True))
         self.assertEqual((data["clickAction"], data["url"]), ("app://se.postnord.private",) * 2)
         self.assertEqual(data["notification_icon"], "mdi:package-variant-closed")
@@ -350,7 +350,7 @@ class DeliveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         h.states[ENTITIES["delivery"]] = sensor(entry(stage="on_the_way", eta=NOW + 840))
         await h.reconcile(60)
         [(_, payload)] = h.ongoing(WOLT)
-        self.assertEqual((payload["message"], payload["data"]["critical_text"]), ("On the way · 13:14", "13 min"))
+        self.assertEqual((payload["message"], payload["data"]["when"]), ("On the way · 13:14", 780))
         h.forget_calls()
         h.states[ENTITIES["delivery"]] = sensor(entry(stage="delivered", eta=None))
         await h.reconcile(60)
@@ -441,7 +441,7 @@ class DeliveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         h.states[ENTITIES["delivery"]] = sensor(parcel_entry(stage="arriving", eta=NOW + 540))
         await h.reconcile(60)
         [(_, payload)] = h.ongoing(POSTNORD)
-        self.assertEqual((payload["message"], payload["data"]["critical_text"]), ("Arriving · 13:09", "8 min"))
+        self.assertEqual((payload["message"], payload["data"]["when"]), ("Arriving · 13:09", 480))
         h.forget_calls()
         h.states[ENTITIES["delivery"]] = sensor(parcel_entry(stage="delivered", eta=None))
         await h.reconcile(60)
