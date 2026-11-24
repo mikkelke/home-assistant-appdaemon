@@ -437,7 +437,8 @@ def card_changed(previous, card):
     return previous.critical_text != card.critical_text
 
 
-def notification_payload(card, now, channel="Live updates"):
+def notification_payload(card, now, channel="Live updates", update=False):
+    """update: the phone already shows this card. iOS ignores alert_once, so an update is passive there."""
     data = {"tag": card.tag, "live_update": True, "critical_text": card.critical_text,
             "notification_icon": card.icon, "sticky": True, "alert_once": True, "channel": channel,
             "importance": "low"}
@@ -445,6 +446,8 @@ def notification_payload(card, now, channel="Live updates"):
         data.update(clickAction=card.link, url=card.link)
     if card.finish_at is not None:
         data.update(chronometer=True, when=max(0, math.ceil(card.finish_at - now)), when_relative=True)
+    if update:
+        data["push"] = {"interruption-level": "passive"}
     return {"title": card.title, "message": card.message, "data": data}
 
 
@@ -647,7 +650,8 @@ class LiveUpdates(hass.Hass):
                     continue
                 record["attempt_at"] = now
                 records[service] = record
-                if await self._send(service, notification_payload(card, now, self.channel)):
+                if await self._send(service, notification_payload(card, now, self.channel,
+                                                                   update=record.get("card") is not None)):
                     record.update(card=asdict(card), at=now, pending_clear=False)
 
     async def _announce_cancelled(self, full, now):

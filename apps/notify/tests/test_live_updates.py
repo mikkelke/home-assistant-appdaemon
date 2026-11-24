@@ -275,6 +275,23 @@ class LiveUpdateIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("when", payload["data"])
                 self.assertNotIn("chronometer", payload["data"])
 
+    async def test_only_the_first_push_of_a_card_may_alert_an_iphone(self):
+        h = await Harness(self.path, states={ENTITIES["coffee"]: coffee(phase="grinding")}).initialize()
+        [(_, first)] = h.ongoing(TAGS["coffee"])
+        self.assertNotIn("push", first["data"])
+        h.forget_calls()
+        h.states[ENTITIES["coffee"]] = coffee(phase="brewing")
+        await h.reconcile(60)
+        [(_, update)] = h.ongoing(TAGS["coffee"])
+        self.assertEqual(update["data"]["push"], {"interruption-level": "passive"})
+        h.states[ENTITIES["coffee"]] = full("idle")
+        await h.reconcile(60)
+        h.forget_calls()
+        h.states[ENTITIES["coffee"]] = coffee(phase="grinding")
+        await h.reconcile(60)
+        [(_, again)] = h.ongoing(TAGS["coffee"])
+        self.assertNotIn("push", again["data"])
+
     async def test_end_clears_each_source_immediately(self):
         cases = (("washer", laundry(), full("Unemptied"), TAGS["washer"]),
                  ("dryer", laundry("dryer"), full("Emptied"), TAGS["dryer"]),
