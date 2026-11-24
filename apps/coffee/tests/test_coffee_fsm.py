@@ -391,6 +391,64 @@ class PowerPathTests(unittest.TestCase):
         self.assertEqual(tracker.brew["enjoy_ts"], T + 260)
 
 
+class RanDryTests(unittest.TestCase):
+    def ran_dry(self):
+        tracker = cf.Tracker()
+        brewing(tracker)
+        tracker.fault("no_water", T + 41)
+        tracker.frame(T + 100)
+        tracker.power(("ended", T + 6, T + 200, 7, True))
+        tracker.tick(T + 320)
+        return tracker
+
+    def test_a_brew_with_no_water_and_no_end_from_the_machine_ran_dry(self):
+        tracker = self.ran_dry()
+        self.assertEqual((tracker.phase(), tracker.brew["stop_reason"], tracker.brew["outcome"]),
+                         ("stopped", "ran_dry", "failed"))
+        self.assertEqual(tracker.ran_dry_ts, T + 200)
+
+    def test_a_low_water_warning_on_a_brew_the_machine_finishes_is_ready(self):
+        tracker = cf.Tracker()
+        brewing(tracker)
+        tracker.fault("no_water", T + 41)
+        tracker.power(("ended", T + 6, T + 200, 7, True))
+        for second in range(200, 230):
+            tracker.frame(T + second)
+            tracker.tick(T + second)
+        tracker.enjoy(T + 230)
+        self.assertEqual(tracker.phase(), "ready")
+        self.assertIsNone(tracker.ran_dry_ts)
+
+    def test_a_refused_start_after_a_run_dry_is_out_of_water(self):
+        tracker = self.ran_dry()
+        tracker.request("c2", T + 900, "tablet")
+        tracker.refused("c2", None, "machine_busy", T + 901)
+        self.assertEqual((tracker.brew["start_error"], tracker.brew["machine_error"]), ("out_of_water", "machine_busy"))
+        tracker.request("c3", T + 960, "tablet")
+        tracker.refused("c3", None, "restore_incomplete", T + 961)
+        self.assertEqual(tracker.brew["start_error"], "out_of_water")
+
+    def test_no_water_keeps_its_own_word(self):
+        tracker = self.ran_dry()
+        tracker.request("c2", T + 900, "tablet")
+        tracker.refused("c2", None, "no_water", T + 901)
+        self.assertEqual(tracker.brew["start_error"], "no_water")
+
+    def test_a_brew_that_starts_clears_it(self):
+        tracker = self.ran_dry()
+        started(tracker, T + 900, "c2")
+        self.assertIsNone(tracker.ran_dry_ts)
+        tracker.stopped("c2", None, "home_assistant", False, T + 910)
+        tracker.request("c3", T + 1300, "tablet")
+        tracker.refused("c3", None, "machine_busy", T + 1301)
+        self.assertEqual(tracker.brew["start_error"], "machine_busy")
+
+    def test_it_survives_a_restart(self):
+        tracker = self.ran_dry()
+        again = cf.Tracker.from_dict(json.loads(json.dumps(tracker.to_dict())))
+        self.assertEqual(again.ran_dry_ts, T + 200)
+
+
 class PersistenceTests(unittest.TestCase):
     def test_the_tracker_survives_a_round_trip_mid_brew(self):
         tracker = cf.Tracker()

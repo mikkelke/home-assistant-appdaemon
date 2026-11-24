@@ -38,6 +38,7 @@ RESUME_MAX_S = 1200
 POWER_GRACE_S = 120
 STOP_ASKED_S = 30
 STOP_FAULTS = ("no_beans",)
+STUCK_ERRORS = ("machine_busy", "restore_incomplete", "not_ready", "not_on_home_screen")
 FAULTS = ("no_water", "no_beans", "dose_water_error", "gear_position_error")
 
 
@@ -70,13 +71,14 @@ class Tracker:
         self.frame_at = None
         self.below_since = None
         self.dropped = None
+        self.ran_dry_ts = None
         self.link_held = lambda: False
 
     # -- persistence ------------------------------------------------------------------------
 
     def to_dict(self):
         return {"brew": self.brew, "last": self.last, "curve": self.curve.to_dict() if self.curve else None,
-                "cup": self.cup, "water": self.water, "frame_at": self.frame_at}
+                "cup": self.cup, "water": self.water, "frame_at": self.frame_at, "ran_dry_ts": self.ran_dry_ts}
 
     @classmethod
     def from_dict(cls, data):
@@ -91,6 +93,7 @@ class Tracker:
             except (KeyError, TypeError, ValueError):
                 tracker.curve = None
         tracker.cup, tracker.water, tracker.frame_at = data.get("cup"), data.get("water"), data.get("frame_at")
+        tracker.ran_dry_ts = epoch(data.get("ran_dry_ts"))
         return tracker
 
     # -- reading ----------------------------------------------------------------------------
@@ -156,6 +159,8 @@ class Tracker:
         self.cup = self.water = None
         self.filter = CupFilter()
         self.below_since = None
+        if phase not in REQUESTED:
+            self.ran_dry_ts = None
 
     def _set(self, phase, now, **fields):
         self.brew.update(phase=phase, phase_ts=now, **fields)
@@ -194,6 +199,7 @@ class Tracker:
 
     def _grinding(self, now):
         self._set("grinding", now, started_ts=now)
+        self.ran_dry_ts = None
         self.cup = self.water = None
         self.filter = CupFilter()
         return ["started", "state", "live"]
@@ -223,6 +229,9 @@ class Tracker:
         if not self._mine(brew_id, run_id):
             return []
         if self.phase() == "starting":
+            if self.ran_dry_ts is not None and reason in STUCK_ERRORS:
+                self.brew["machine_error"] = reason
+                reason = "out_of_water"
             self._set("start_failed", now, start_error=reason or "no_reply")
             return ["start_failed", "state"]
         if self.phase() in RUNNING:
@@ -424,6 +433,9 @@ class Tracker:
             effects.append("live")
         power_end = self.brew.get("power_end_ts")
         if phase in RUNNING and power_end and not self.fresh(now) and now - power_end >= POWER_GRACE_S:
+            if "no_water" in self.brew["faults"]:
+                self.ran_dry_ts = power_end
+                return self._stop(power_end, "ran_dry", "failed")
             return self._ready(power_end, enjoy=False) if self.brew.get("power_complete") else \
                 self._stop(power_end, "abandoned")
         if phase == "ready":

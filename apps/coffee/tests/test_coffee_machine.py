@@ -1406,6 +1406,25 @@ class TankTests(unittest.TestCase):
         self.assertEqual(coffee_state(app)[1]["tank_left_ml"], "0")
 
 
+    def test_a_brew_that_runs_dry_is_no_ready_cup_and_a_stuck_start_says_out_of_water(self):
+        app = self.mid_brew([(90, ("state", "sensor.xbloom_studio_machine_status", "no_water")),
+                             (120, ("call", lambda app: app._apply(app._tracker.power(("ended", T0, app.now, 7, True)))))],
+                            until=120)
+        fake.set_entity(app, "switch.xbloom_studio_connect", "off")
+        fake.fire(app, "xbloom_connect_stopped", {})
+        fake.advance(app, 150)
+        record = fake.ledger(app)[-1]
+        self.assertEqual((record["outcome"], record["stop_reason"]), ("failed", "ran_dry"))
+        self.assertEqual(coffee_state(app)[1]["stop_reason"], "ran_dry")
+        self.assertTrue(app._tank.dry)
+        fake.advance(app, 600)
+        fake.op(app, "water_filled")
+        fake.cup_on(app)
+        fake.op(app, "start", {"variant": "usual"})
+        fake.fire(app, "xbloom_brew_failed", {"reason": "machine_busy",
+                                              "context": {"coffee_brew_id": coffee_state(app)[1]["brew_id"]}})
+        self.assertEqual(coffee_state(app)[1]["start_error"], "out_of_water")
+
     def test_a_start_refused_for_no_water_then_a_brew_counts_as_a_refill(self):
         app = fake.make_app()
         fake.op(app, "water_filled")
