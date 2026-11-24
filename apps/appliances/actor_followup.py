@@ -56,10 +56,14 @@ class ActorFollowupMixin:
     ACTOR_PAIRED = False
 
     def _paired_actor(self, verdict, person, method):
-        """`verdict` naming `person` by `method` when it names nobody, else `verdict`. The caller
-        makes sure the verdict is final; a start verdict is, once the machine is emptied."""
+        """`verdict` naming `person` by `method` when it names nobody and `person` was home for it,
+        else `verdict`. The caller makes sure the verdict is final; a start verdict is, once the
+        machine is emptied."""
         verdict = verdict or {}
         if not self.ACTOR_PAIRED or not person or verdict.get("person"):
+            return verdict
+        home = verdict.get("people_home")
+        if isinstance(home, list) and person not in home:
             return verdict
         paired = dict(verdict, person=person, method=method)
         paired.pop("pending_until", None)

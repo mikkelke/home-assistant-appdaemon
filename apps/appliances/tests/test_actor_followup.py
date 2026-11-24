@@ -460,9 +460,20 @@ class StarterIsEmptier(unittest.TestCase):
     def test_at_the_emptying_the_running_starter_names_a_final_unknown(self):
         with tempfile.TemporaryDirectory() as tmp:
             host = PairedHost(tmp)
-            host._cycle_actor = verdict("claudia", "sole_occupant")
+            host._cycle_actor = verdict("kristine", "sole_occupant")
             empty, start = host._pair_emptier(verdict(reason="multi_occupant"))
-            self.assertEqual((empty["person"], empty["method"], start), ("claudia", "same_as_starter", None))
+            self.assertEqual((empty["person"], empty["method"], start), ("kristine", "same_as_starter", None))
+
+    def test_nobody_is_paired_with_someone_who_was_not_home_for_that_verdict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = PairedHost(tmp)
+            host._cycle_actor = verdict("claudia", "sole_occupant")
+            empty, _ = host._pair_emptier(verdict(reason="multi_occupant"))
+            self.assertIsNone(empty["person"])
+            host._cycle_actor = verdict(reason="multi_occupant")
+            gone = dict(verdict("claudia", "sole_occupant"), people_home=["claudia"])
+            _, start = host._pair_emptier(gone, saved=False)
+            self.assertIsNone(start)
 
     def test_at_the_emptying_a_pending_verdict_waits_for_its_follow_up(self):
         with tempfile.TemporaryDirectory() as tmp:
