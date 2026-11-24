@@ -28,9 +28,9 @@ BedroomHumidifier:
   # whole percents, can stay quiet for hours and hangs above the humidifier. The humidifier's own
   # humidity sensor reads unknown.
   humidity_sources:
-    - sensor.reference_thermometer_1_humidity
+    - sensor.bedroom_seated_thermometer_humidity
     - sensor.airdot_b49928_humidity
-  # Reference thermometer 1 reports on every ~1 point change plus an hourly heartbeat that does not
+  # The seated thermometer reports on every ~1 point change plus an hourly heartbeat that does not
   # change the state, so a quiet hour means an unchanged value; the age only catches a dead sensor.
   humidity_max_age_min: 240
   sleep_mode: input_boolean.mikkel_sleep_mode

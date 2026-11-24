@@ -42,7 +42,7 @@ YAML_ARGS = yaml.safe_load(YAML_FILE.read_text())["BedroomHumidifier"]
 
 HUMIDIFIER = "humidifier.evaporative_humidifier_271a"
 WATER = "sensor.evaporative_humidifier_271a_water_level"
-PRIMARY = "sensor.reference_thermometer_1_humidity"
+PRIMARY = "sensor.bedroom_seated_thermometer_humidity"
 FALLBACK = "sensor.airdot_b49928_humidity"
 SOURCES = (PRIMARY, FALLBACK)
 SLEEP = "input_boolean.mikkel_sleep_mode"
