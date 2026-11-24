@@ -550,11 +550,14 @@ class ShippedYaml(unittest.TestCase):
     def test_family_holds_one_aim_all_day(self):
         self.assertFalse(self.cfg.zones["family"].profile.periods)
 
-    def test_bathroom_heats_from_night_to_morning_only(self):
+    def test_bathroom_is_warm_from_night_to_morning_and_20_the_rest_of_the_day(self):
         zc = self.cfg.zones["bathroom"]
         self.assertEqual(zc.profile.lead_hours, 0)
         self.assertTrue(zc.profile.outside_is_lower_limit)
-        self.assertEqual([(p.start, p.end) for p in zc.profile.periods], [(150, 9 * 60)])
+        self.assertEqual(
+            [(p.start, p.end, p.offset) for p in zc.profile.periods],
+            [(150, 9 * 60, 0.0), (9 * 60, 150, -2.0)],
+        )
 
     def test_only_the_bathroom_waits_for_its_user_to_be_home(self):
         waiting = {n: zc.profile.when_home for n, zc in self.cfg.zones.items()}
@@ -2273,12 +2276,12 @@ class OffSeasonPlan(unittest.TestCase):
     def test_the_decided_numbers_show_up_per_zone(self):
         h = Harness(self)
         h.tick()
-        # 12:00: the family target is the base, the others are flat, the bathroom is below its window
+        # 12:00: the family target is the base, the others are flat, the bathroom holds its day level
         want = {
             "family": (21.5, 21.5),
             "kristines_room": (20.5, 20.5),
             "claudias_room": (21.5, 21.5),
-            "bathroom": (19.0, 19.0),
+            "bathroom": (20.0, 20.0),
             "guest_bathroom": (20.0, 20.0),
         }
         for zone, (state, setpoint) in want.items():
@@ -2847,12 +2850,12 @@ class DeviceLimits(unittest.TestCase):
 
     def test_a_stricter_device_limit_wins(self):
         h = Harness(self)
-        h.ha.set("number.bathroom_thermostat_min_heat_setpoint", 19.5)
+        h.ha.set("number.bathroom_thermostat_min_heat_setpoint", 20.5)
         h.ha.set("number.family_room_thermostat_max_heat_setpoint", 22.0)
         h.ha.set("input_number.heating_target_family", "23.0")
         h.tick()
-        self.assertEqual(h.attrs("bathroom")["lower_limit"], 19.5)
-        self.assertEqual(h.attrs("bathroom")["setpoint_now"], 19.5)
+        self.assertEqual(h.attrs("bathroom")["lower_limit"], 20.5)
+        self.assertEqual(h.attrs("bathroom")["setpoint_now"], 20.5)
         self.assertEqual(h.attrs("family")["upper_limit"], 22.0)
         self.assertEqual(h.attrs("family")["setpoint_now"], 22.0)
 
@@ -3531,7 +3534,7 @@ class UserAwayEndToEnd(LiveZones, unittest.TestCase):
             [
                 ("04:00", "04:05", "away", "19.0"),
                 ("04:05", "09:00", "hold", "22.0"),
-                ("09:00", "24:00", "hold", "19.0"),
+                ("09:00", "24:00", "hold", "20.0"),
             ],
         )
         self.assertTrue(any("bathroom: away -> hold, aim 22.0" in m for _l, m in h.logs))

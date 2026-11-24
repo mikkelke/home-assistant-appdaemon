@@ -256,6 +256,7 @@ HeatingController:
         when_home: [person.mikkel, device_tracker.of9p]
         periods:
           - {from: "02:30", to: "09:00", offset: 0}
+          - {from: "09:00", to: "02:30", offset: -2.0}
       budget: {a: 0.64, b_om: -2.47, c: 0, d: -1.24}
       transit: {loops: {zone_7: 1.2}, tau_minutes: 20, k_per_kwh: 2.7}
 
