@@ -1850,7 +1850,7 @@ class Configuration(unittest.TestCase):
     def test_the_yaml_names_the_before_bed_options(self):
         self.assertEqual(
             (YAML_ARGS["preload_from"], YAML_ARGS["preload_until"], YAML_ARGS["preload_mode"]),
-            ("18:00", "02:00", "medium"),
+            ("22:00", "02:00", "medium"),
         )
         self.assertEqual(YAML_ARGS["occupancy"], OCCUPANCY)
 
