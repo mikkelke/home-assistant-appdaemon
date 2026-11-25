@@ -14,7 +14,8 @@ a tap on such a row opens that sheet instead of its room: ``info`` (short lines)
 to do, in order) with ``warn`` (the safety note), ``done`` ("tap": a Done button, which fires
 house_upcoming_done with the row id) and ``items`` (a plain list, one line each, for a row that
 summarises several things). A maintenance row may also carry ``photo``, the key of its picture in the
-dashboard: lowercase letters, digits and underscores.
+dashboard: lowercase letters, digits and underscores. The ice bath's row carries ``level`` (thin | thick): how
+thick its ice is.
 
 Every value is a string or a list of strings.
 """
@@ -29,6 +30,7 @@ CHIP_MAX = 30
 NAME_MAX = 40
 LEASE = timedelta(minutes=15)
 KINDS = ("rain", "maint")
+LEVELS = ("thin", "thick")
 INFO_MAX = 4
 STEPS_MAX = 8
 STEP_MAX = 150
@@ -40,7 +42,7 @@ OVERFLOW_ID = "maint:more"
 _SPACE = re.compile(r"\s+")
 _PHOTO = re.compile(r"[a-z0-9_]+")
 _FIELDS = ("id", "kind", "at", "icon", "title", "detail", "chip", "area", "audience", "audience_users", "next",
-           "done", "info", "steps", "warn", "items", "photo")
+           "done", "info", "steps", "warn", "items", "photo", "level")
 
 
 def clean_text(value, limit=TEXT_MAX):
@@ -57,7 +59,7 @@ def utc_iso(dt):
 
 def make_row(row_id, kind, title, detail="", *, at=None, icon="mdi:information-outline", area=None, chip=None,
              audience=None, audience_users=None, skip_next=False, tap_done=False, info=None, steps=None, warn=None,
-             items=None, photo=None):
+             items=None, photo=None, level=None):
     row = {"id": row_id, "kind": kind, "icon": icon, "title": clean_text(title)}
     detail = clean_text(detail)
     if detail:
@@ -97,6 +99,8 @@ def make_row(row_id, kind, title, detail="", *, at=None, icon="mdi:information-o
         row["items"] = listed
     if photo:
         row["photo"] = photo
+    if level:
+        row["level"] = level
     return row
 
 
@@ -147,6 +151,8 @@ def is_valid_row(row):
             return False
         if not _PHOTO.fullmatch(photo):
             return False
+    if "level" in row and row["level"] not in LEVELS:
+        return False
     if "audience_users" in row:
         users = row["audience_users"]
         if "audience" in row or not isinstance(users, list) or not users:

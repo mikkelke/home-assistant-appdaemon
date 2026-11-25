@@ -41,14 +41,15 @@ Yale keypad unlocks by residents still registered away 15 minutes later add quie
 (upcoming_yale), closed with Done. Notes and Done survive reload; pending checks are dropped. These
 notes have no push key and never enter the maintenance digest.
 
-The ice bath's thermometer and the person who uses the bath (the ice_* keys of house_upcoming.yaml) are
-sources like the rest. Water that has sat at about 0 C long enough for an ice skin to be likely gives a row in
-the rooftop area (upcoming_ice), and one push a day through MobileNotifier's ice_bath category, whose
-audience says who gets it, while that person is home between ice_push_from and ice_push_until.
+The ice bath's thermometer, the outdoor air and the person who uses the bath (the ice_* keys of
+house_upcoming.yaml) are sources like the rest. Water that has sat at about 0 C long enough for an ice skin to
+be likely gives a row in the rooftop area (upcoming_ice), thin ice until the air's freezing degree-hours since
+the cold began make it thick. Thick ice also gives one push per freeze-up through MobileNotifier's ice_bath
+category, whose audience says who gets it, while that person is home between ice_push_from and ice_push_until.
 
-Latches, push keys, battery facts, the cleaning rate, the tapped tasks' anchors and the ice bath's cold spell
-and last push day persist in house_upcoming_state.json next to this module; rain forecast fixtures go to
-house_upcoming_rain_fixtures.jsonl.
+Latches, push keys, battery facts, the cleaning rate, the tapped tasks' anchors and the ice bath's cold spell,
+its freezing degree-hours and whether it has been told persist in house_upcoming_state.json next to this module;
+rain forecast fixtures go to house_upcoming_rain_fixtures.jsonl.
 """
 
 import asyncio
@@ -215,7 +216,7 @@ class HouseUpcoming(hass.Hass):
     def _sources(self):
         sources = list(self.rober2_entities.values())
         sources += [self.washer_entity, self.price_entity, self.profiles_entity, self.rain_alert, self.rain_home,
-                    self.stick_entity, self.ice_cfg["entity"], self.ice_cfg["person"]]
+                    self.stick_entity, self.ice_cfg["entity"], self.ice_cfg["air"], self.ice_cfg["person"]]
         sources += list(self.rain_doors) + list(self.inventory["devices"]) + list(self.plants)
         if self.yale_operators:
             sources += [self.yale_lock, self.yale_operator]
@@ -431,6 +432,7 @@ class HouseUpcoming(hass.Hass):
 
     def _evaluate(self, publish=False):
         now = self.get_now()
+        self._ice = ice.accrue(self._ice, maint.reading(self._state_of(self.ice_cfg["air"])), now)
         rows, conditions = [], []
 
         left = {part: maint.reading(self._state_of(entity)) for part, entity in self.rober2_entities.items()}
@@ -665,7 +667,7 @@ class HouseUpcoming(hass.Hass):
                      level="WARNING")
             return
         self._ice_retry_at = None
-        self._ice = ice.pushed(self._ice, now)
+        self._ice = ice.pushed(self._ice)
         self._save_state(force=True)
         self.log(f"Ice bath push sent: {found['title']}, {found['message']}")
 

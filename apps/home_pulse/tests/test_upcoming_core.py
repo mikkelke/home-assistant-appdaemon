@@ -1,5 +1,5 @@
 # tests/test_upcoming_core.py - the sensor.house_upcoming row schema: strings only, ASCII, order,
-# overflow, lease and the picture key of a maintenance row.
+# overflow, lease, the picture key of a maintenance row and the thickness of the ice bath's ice.
 # Run from repo root: python3 -m unittest discover -s apps/home_pulse/tests
 
 import json
@@ -112,6 +112,37 @@ class PhotoTests(unittest.TestCase):
         self.assertEqual(core.finalize_rows([battery(1), row])[1], row)
         wrong = self.make(photo="Monstera")
         self.assertEqual(wrong["photo"], "Monstera")
+        self.assertEqual(core.finalize_rows([battery(1), wrong]), [battery(1)])
+
+
+class LevelTests(unittest.TestCase):
+    """level: how thick the ice on the ice bath is."""
+
+    def make(self, **extra):
+        return core.make_row("ice:bath", "rain", "Ice bath: thin ice at 0.1 C since 03:10", icon="mdi:snowflake",
+                             area="rooftop", **extra)
+
+    def test_a_row_may_say_thin_or_thick(self):
+        for level in ("thin", "thick"):
+            row = self.make(level=level)
+            self.assertEqual(row["level"], level)
+            self.assertTrue(all(strings_only(v) for v in row.values()))
+            self.assertTrue(core.is_valid_row(row), level)
+            self.assertEqual(core.finalize_rows([row]), [row])
+
+    def test_a_row_without_one_has_no_field(self):
+        for level in (None, ""):
+            self.assertNotIn("level", self.make(level=level))
+        self.assertNotIn("level", self.make())
+
+    def test_the_contract_is_thin_or_thick(self):
+        good = self.make(level="thick")
+        for bad in ("", "Thin", "thin ice", "medium", 1, True, None, ["thin"], {"thin": "thin"}):
+            self.assertFalse(core.is_valid_row({**good, "level": bad}), repr(bad))
+
+    def test_a_row_with_another_level_is_dropped_by_finalize(self):
+        wrong = self.make(level="slush")
+        self.assertEqual(wrong["level"], "slush")
         self.assertEqual(core.finalize_rows([battery(1), wrong]), [battery(1)])
 
 

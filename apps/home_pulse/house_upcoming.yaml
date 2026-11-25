@@ -1,7 +1,7 @@
 # HouseUpcoming - sensor.house_upcoming for the dashboard's Now timeline: maintenance (Rober2 parts,
 # the dishwasher's and the washer's run-based tasks, batteries and offline devices, houseplants to
 # water; admin only), rain while a terrace door is open, and ice in the terrace ice bath. Plus one
-# maintenance push a day to Mikkel while he is home, and one ice bath push a day. See house_upcoming.py.
+# maintenance push a day to Mikkel while he is home, and one ice bath push per freeze-up. See house_upcoming.py.
 #
 # Keep sensor.house_upcoming out of the recorder (configuration.yaml recorder: exclude:): the lease
 # renews every 5 minutes.
@@ -75,15 +75,23 @@ HouseUpcoming:
       binary_sensor.rooftop_door_2_contact: {label: "Claudia's terrace door", area: office}
 
   # The terrace ice bath: the water at or below ice_likely_at_or_below_c for ice_likely_for_hours, with no reading
-  # above it, makes ice likely. That gives a row in ice_area, which stays until a reading above ice_clear_above_c,
-  # and one push a day between ice_push_from and ice_push_until while ice_person is home. MobileNotifier's
-  # ice_bath category (mobile_notifier.yaml) says who gets it. Unavailable and unknown readings change nothing.
+  # above it, makes thin ice likely. That gives a row in ice_area, which stays until a reading above ice_clear_above_c.
+  # The ice turns thick once the net freezing degree-hours of ice_air since the spell began reach
+  # ice_thick_degree_hours (every hour at T degrees adds -T, never below 0): the row says so and one push goes per
+  # freeze-up, between ice_push_from and ice_push_until while ice_person is home, and again only after the
+  # degree-hours have been back at 0 or the spell has ended. MobileNotifier's ice_bath category
+  # (mobile_notifier.yaml) says who gets it. Unavailable and unknown readings change nothing, and an unavailable air
+  # sensor adds no degree-hours.
+  # The ice_* settings are flat keys: AppDaemon 4.5.13 cannot apply a new dictionary-valued key to a running app
+  # (README, Deploy workflow).
   ice_temperature: sensor.ice_bath_temperature
+  ice_air: sensor.gw2000a_outdoor_temperature
   ice_person: person.claudia
   ice_area: rooftop
   ice_likely_at_or_below_c: 0.3
   ice_likely_for_hours: 2
   ice_clear_above_c: 0.5
+  ice_thick_degree_hours: 80
   ice_push_from: "07:00:00"
   ice_push_until: "22:00:00"
 
