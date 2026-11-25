@@ -84,6 +84,9 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
     # The start is anchored on the door close that loaded the machine, which can precede the power
     # edge by hours on a delayed start; a close older than this is not trusted.
     LOAD_ANCHOR_MAX_AGE_S = 12 * 3600
+    # A reading at or above this is main wash activity (the 50 W that stamps _last_high_power_time),
+    # never a programme-end blip.
+    END_BLIP_MAX_W = 50.0
     # Closed-door standby: below this the machine idles; a running delay countdown draws more.
     TIMER_IDLE_BELOW_W = 0.04
     # A countdown draws 0.06-0.09 W; above this the display is awake (0.6-1.5 W), which says nothing.
@@ -1222,6 +1225,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         energy_used,
         end_reason,
         boot_self_heal=False,
+        end_blip=False,
     ):
         """Finish conditions (guards + energy idle) are met: either transition now (no tail /
         tail already elapsed) or defer Unemptied + announcement to the machine's own end.
@@ -1231,6 +1235,13 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         announce gate (see below) before announcing. The DEFERRED branch (machine still drying)
         is identical either way - it announces at the real end, never from a boot hypothesis.
 
+        end_blip: the programme-end blip has been seen and followed by stop_for seconds of quiet
+        (see _power_changed), so the finish lands now instead of at the tail target. The caller
+        evaluated run_minutes / duration_source / energy_used at this moment rather than taking
+        them from the guard-time stash: that is the value the learned-duration series records
+        for a blip cycle, and the guard-time value would lower every learned average and with
+        it the next guard.
+
         run_minutes / duration_source / energy_used were computed by the caller at guard
         time and are stashed as-is: the feedback record and the learned-duration series must
         record the SAME run_minutes they do today, never silently absorb the tail (a learned
@@ -1238,9 +1249,17 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         tail later - a ratchet)."""
         target = self._dry_tail_target(display_prog, guard_dur)
         now = self._now_utc()
-        if target is None or target <= now:
-            # Zero-tail programme (unchanged behaviour), or the tail already elapsed at
-            # guard time (late evaluation, e.g. restart after the machine's own end).
+        if end_blip:
+            ahead_min = max(0.0, (target - now).total_seconds() / 60) if target is not None else 0.0
+            self.log(
+                f"End blip: {self.stop_for}s quiet after the machine's end blip - finishing "
+                f"{ahead_min:.0f} min ahead of the dry-tail target",
+                level="INFO",
+            )
+        if target is None or target <= now or end_blip:
+            # Zero-tail programme (unchanged behaviour), the tail already elapsed at guard
+            # time (late evaluation, e.g. restart after the machine's own end), or the
+            # machine's end blip cut the tail short.
             #
             # FIX (2026-08-20): from the boot self-heal this immediate branch used to always
             # fire the full Sonos announcement (skip_announce=False), gated only by
@@ -1311,6 +1330,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             "idle_min": idle_min,
             "energy_used": energy_used,
             "end_reason": end_reason,
+            "end_blip": bool(self._get_profile(display_prog).get("end_blip")),
         }
         delay_s = max(1, int(round((target - now).total_seconds())))
         self._safe_cancel_timer(self.dry_tail_timer)
@@ -1416,6 +1436,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             "eco": {
                 "label": "ECO", "duration_min": 234, "duration_short_min": 74,
                 "max_energy_kwh": 0.95, "dry_tail_minutes": 35, "dry_tail_short_minutes": 0,
+                "end_blip": True,
             },
             "auto": {"label": "Auto", "duration_min": 108, "max_energy_kwh": 1.45, "dry_tail_minutes": 0},
             "intensive": {"label": "Intensive", "duration_min": 150, "max_energy_kwh": 1.2, "dry_tail_minutes": 0},
@@ -3430,9 +3451,20 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                 self.low_power_timer = None
                 self.log(f"Power recovered to {watts}W, cancelled finish timer", level="DEBUG")
             # Power during the dry-tail wait means the guards were premature (machine still
-            # active) - drop the pending finish; detection restarts from the live signal.
-            if getattr(self, "dry_tail_timer", None) is not None or getattr(self, "_dry_tail_pending", None) is not None:
-                self._cancel_dry_tail(f"power {watts:.1f}W during dry tail - cycle still active")
+            # active) - drop the pending finish; detection restarts from the live signal. On an
+            # end_blip programme a small reading is the machine's own end blip instead: the tail
+            # stays as the fallback and the quiet that follows finishes the cycle (_confirm_finished).
+            pending = getattr(self, "_dry_tail_pending", None)
+            if getattr(self, "dry_tail_timer", None) is not None or pending is not None:
+                if pending is not None and pending.get("end_blip") and watts < self.END_BLIP_MAX_W:
+                    if not pending.get("blip_seen"):
+                        pending["blip_seen"] = True
+                        self.log(
+                            f"End blip: {watts:.1f}W during the dry tail - the finish follows {self.stop_for}s of quiet",
+                            level="INFO",
+                        )
+                else:
+                    self._cancel_dry_tail(f"power {watts:.1f}W during dry tail - cycle still active")
 
     def _poll_power(self, kwargs):
         """Conditional polling"""
@@ -3524,10 +3556,13 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             self.low_power_timer = None
             return
 
-        if getattr(self, "dry_tail_timer", None) is not None:
+        pending = getattr(self, "_dry_tail_pending", None)
+        end_blip = bool(pending and pending.get("blip_seen"))
+        if getattr(self, "dry_tail_timer", None) is not None and not end_blip:
             # Finish already confirmed; the dry-tail transition is scheduled. The 60s poll
             # keeps re-arming the low-power timer during the passive dry, so this re-entry
-            # is routine - never re-confirm or double-schedule.
+            # is routine - never re-confirm or double-schedule. Once the end blip has been
+            # seen, this quiet is what finishes the cycle ahead of the tail.
             self.log("_confirm_finished: dry tail already pending - skipping", level="DEBUG")
             self.low_power_timer = None
             return
@@ -3577,6 +3612,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                     idle_min=idle_min,
                     energy_used=energy_kwh,
                     end_reason="low_power_detected",
+                    end_blip=end_blip,
                 )
             else:
                 run_min = self._get_run_duration_minutes()

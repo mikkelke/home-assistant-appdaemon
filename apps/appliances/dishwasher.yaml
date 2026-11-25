@@ -151,6 +151,9 @@ dishwasher_monitor:
   # until guard-open + dry_tail, so "finished" means the MACHINE is finished. Door opens
   # keep their immediate semantics, and feedback still records the guard-time run_minutes -
   # the learned-duration series must not absorb the tail.
+  # A programme with end_blip: true finishes sooner when the machine signals its own end:
+  # a reading above stop_w while the tail is pending, then stop_for seconds at or below stop_w,
+  # ends the cycle at once. Feedback then records the run time at that moment, never the tail.
 
   # Pause timeout - if door stays open while adding dishes
   pause_timeout_minutes: 5

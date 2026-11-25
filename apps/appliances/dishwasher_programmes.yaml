@@ -13,6 +13,11 @@
 # Sonos/push announcement) waits until guard-open + dry_tail_minutes.
 # A value of 0 means UNMEASURED, not "no tail" — set it only from an observed
 # guard-open-vs-machine-display gap, like eco's was.
+#
+# end_blip: true lets the machine's own programme-end draw cut dry_tail_minutes short. While the
+# tail is pending, the first reading above stop_w (and below 50 W) followed by stop_for seconds
+# at or below stop_w finishes the cycle at once; a cycle without that blip still ends at the
+# tail. Opt in only for a programme whose plug trace shows the blip at the end of every run.
 
 programmes:
   quick:
@@ -39,6 +44,7 @@ programmes:
     # draws literally 0 W for over an hour.
     dry_tail_minutes: 35
     dry_tail_short_minutes: 0  # Express dry, unmeasured
+    end_blip: true
 
   auto:
     label: "Auto"
