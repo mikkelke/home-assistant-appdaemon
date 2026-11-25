@@ -46,7 +46,7 @@ BedroomHumidifier:
   occupancy: binary_sensor.bedroom_presence_presence
   run_mode: sleep
   # Before bed, house time, quoted HH:MM. An empty preload_from turns the phase off.
-  preload_from: "21:00"
+  preload_from: "18:00"
   preload_until: "02:00"
   preload_mode: medium
   drying_mode: drying_filter
