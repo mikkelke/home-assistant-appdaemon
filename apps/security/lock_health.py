@@ -1159,7 +1159,7 @@ class LockHealth(hass.Hass):
         self._notified["plug_unavailable"] = True
         self._save_state()
         self.log("LockHealth: can't power-cycle - plug unavailable", level="ERROR")
-        self.create_task(self._notify("Can't power-cycle the Yale bridge - the plug (switch.extender) "
+        self.create_task(self._notify(f"Can't power-cycle the Yale bridge - the plug ({self.bridge_plug}) "
                                       "is unavailable."))
 
     # ---------- episode bookkeeping (gave-up notify already happened -> all-clear) ----------
