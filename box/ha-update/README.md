@@ -7,6 +7,10 @@ The run happens when all of these hold:
 1. A run is armed (`/data/ha-update/armed.json`).
 2. Local time is 08:00-22:00.
 3. `zone.home` is `0` and has been for at least 10 minutes. A HA restart resets `last_changed`, so the 10 minutes count from the later of the last departure and the last HA start.
+4. Nobody is heading home: every resident GPS fix (`device_tracker.of9p`, `device_tracker.kristine_iphone`, `device_tracker.claudias_iphone`) is more than 1.5 km from `zone.home` after subtracting its `gps_accuracy`. Any age counts, since the iPhones only report after a move of about 500 m. A tracker without a fix is skipped and is used as soon as it reports one.
+5. No parcel is close: nothing in `sensor.parcel_aggregator_incoming_parcels` is `out_for_delivery`, or due today with `planned_from` within 60 minutes (an open window or a passed ETA counts as close). An unreadable list blocks.
+
+A restart takes arrival auto-unlock and the intercom down for 2-3 minutes, which is what gates 4 and 5 protect. `status` and `run --dry` print each gate's verdict, and every run JSON carries them under `gates`.
 
 Then it checks the configuration (`check_config`), copies the compose file to `docker-compose.yaml.bak-ha-update-<stamp>`, tars `.storage` to `storage-backup-ha-update-<stamp>.tar.gz` (the last 5 of each are kept), stops HA with a 120 s grace period and recreates the container once. When HA answers it waits for AppDaemon's namespace restart plus 3 minutes, then verifies:
 
@@ -29,13 +33,19 @@ Each run writes `/data/ha-update/runs/<stamp>.json` and `last.json` and consumes
 sudo ha-update-restart arm --touched gls,parcel_aggregator --note "GLS 2.0.1, Parcel Aggregator 3.0.0" \
     --session "claude --resume <id>"
 sudo ha-update-restart arm --touched gls --core 2026.11.3 --rollback-image ha-rollback:2026.11.1
-sudo ha-update-restart run --dry   # window and every check against the running HA, changes nothing
+sudo ha-update-restart run --dry   # gates and every check against the running HA, changes nothing; works unarmed
 sudo ha-update-restart status
 ```
 
 `--touched` takes integration domains (the `custom_components/<domain>` folder name). Arming again replaces the armed batch. To disarm, `sudo rm /data/ha-update/armed.json`.
 
 Before a dry run on staged but not yet loaded HACS updates, expect the repairs check to fail on their `restart_required` issues; that is the check working.
+
+## Tests
+
+```
+python3 -m unittest discover -s box/ha-update/tests
+```
 
 ## Install
 

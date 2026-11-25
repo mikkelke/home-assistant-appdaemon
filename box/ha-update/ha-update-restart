@@ -7,7 +7,9 @@ and arms a run:
   ha-update-restart arm --touched gls,parcel_aggregator [--core 2026.11.3] [--note TEXT]
 
 The timer runs `ha-update-restart run` every 5 minutes. It does nothing unless a run is
-armed, the local time is inside WINDOW and zone.home has been 0 for at least EMPTY_FOR.
+armed and every gate holds: local time inside WINDOW, zone.home 0 for at least EMPTY_FOR,
+every resident GPS fix farther than NEAR_M from home, and no parcel out for delivery or due
+within DELIVERY_SOON (a restart takes arrival auto-unlock and the intercom down for minutes).
 Then it checks the configuration, backs up .storage and the compose file, stops HA with a
 long grace period, recreates the container once and verifies:
 
@@ -28,6 +30,7 @@ import argparse
 import datetime as dt
 import fcntl
 import json
+import math
 import os
 import re
 import shutil
@@ -53,6 +56,12 @@ CONTAINER = "homeassistant"
 TOKEN_CONTAINER = "ha-mcp"
 WINDOW = (8, 22)
 EMPTY_FOR = dt.timedelta(minutes=10)
+NEAR_M = 1500
+DELIVERY_SOON = dt.timedelta(minutes=60)
+PARCELS = "sensor.parcel_aggregator_incoming_parcels"
+# GPS trackers of the residents (not the Wi-Fi ones person.* uses); one without a fix is skipped until it reports.
+GPS_TRACKERS = {"Mikkel": "device_tracker.of9p", "Kristine": "device_tracker.kristine_iphone",
+                "Claudia": "device_tracker.claudias_iphone"}
 UP_TIMEOUT = 600
 SETTLE_TIMEOUT = 600
 SETTLE_EXTRA = 180
@@ -128,19 +137,78 @@ def parse_ts(value):
     return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def window(at):
-    """Return (ok, reason, zone_home_state)."""
-    if not WINDOW[0] <= at.hour < WINDOW[1]:
-        return False, f"outside {WINDOW[0]:02d}-{WINDOW[1]:02d}", None
-    zone = probe({"states": ["zone.home"]})["states"]["zone.home"]
+def distance_m(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    h = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2
+    return 2 * 6371000 * math.asin(math.sqrt(h))
+
+
+def empty_gate(zone, at):
     if zone is None:
-        return False, "zone.home missing", None
+        return False, "zone.home missing BLOCK"
     if zone["state"] != "0":
-        return False, f"zone.home={zone['state']}", zone
-    empty = at - parse_ts(zone["last_changed"])
-    if empty < EMPTY_FOR:
-        return False, f"empty for {int(empty.total_seconds() // 60)} min", zone
-    return True, f"empty since {parse_ts(zone['last_changed']).astimezone(CPH):%H:%M}", zone
+        return False, f"zone.home={zone['state']} BLOCK"
+    since = parse_ts(zone["last_changed"])
+    if at - since < EMPTY_FOR:
+        return False, f"empty for {int((at - since).total_seconds() // 60)} min BLOCK"
+    return True, f"empty since {since.astimezone(CPH):%H:%M} ok"
+
+
+def gps_gate(zone, trackers):
+    """Every GPS fix must be farther than NEAR_M from home by more than its accuracy. A tracker without a fix
+    (no permission yet) is skipped; any fix counts whatever its age, since iOS only reports after a move."""
+    attrs = (zone or {}).get("attributes", {})
+    if attrs.get("latitude") is None:
+        return False, "gps: zone.home has no position BLOCK"
+    ok, parts = True, []
+    for name, state in trackers.items():
+        a = (state or {}).get("attributes", {})
+        if a.get("latitude") is None or a.get("longitude") is None:
+            parts.append(f"{name} no fix")
+            continue
+        d = distance_m(attrs["latitude"], attrs["longitude"], a["latitude"], a["longitude"])
+        accuracy = float(a.get("gps_accuracy") or 0)
+        if d - accuracy > NEAR_M:
+            parts.append(f"{name} {d / 1000:.1f} km ok")
+        else:
+            ok = False
+            parts.append(f"{name} {d / 1000:.1f} km (+-{accuracy:.0f} m) BLOCK")
+    return ok, "gps: " + ", ".join(parts)
+
+
+def delivery_gate(incoming, at):
+    """Block while a parcel is out for delivery, or is due today with its window or ETA starting within
+    DELIVERY_SOON (an open window or a passed ETA without a delivery counts as close)."""
+    parcels = ((incoming or {}).get("attributes") or {}).get("parcels")
+    if not isinstance(parcels, list):
+        return False, "deliveries: incoming parcel list unreadable BLOCK"
+    close = []
+    for p in parcels:
+        name = f"{p.get('carrier')} {p.get('barcode')}"
+        if p.get("status") == "delivered":
+            continue
+        if p.get("status") == "out_for_delivery":
+            close.append(f"{name} out for delivery")
+            continue
+        start = parse_ts(p["planned_from"]) if p.get("planned_from") else None
+        end = parse_ts(p["planned_to"]) if p.get("planned_to") else None
+        if start and start.astimezone(CPH).date() == at.date() and start - at <= DELIVERY_SOON \
+                and (end is None or end >= at):
+            close.append(f"{name} due {start.astimezone(CPH):%H:%M}")
+    if close:
+        return False, "deliveries: " + "; ".join(close) + " BLOCK"
+    return True, f"deliveries: {len(parcels)} incoming, none close ok"
+
+
+def gates(at):
+    """(ok, verdicts) of every condition a restart needs."""
+    if not WINDOW[0] <= at.hour < WINDOW[1]:
+        return False, [f"time: outside {WINDOW[0]:02d}-{WINDOW[1]:02d} BLOCK"]
+    st = probe({"states": ["zone.home", PARCELS, *GPS_TRACKERS.values()]})["states"]
+    checks = [empty_gate(st["zone.home"], at),
+              gps_gate(st["zone.home"], {n: st[e] for n, e in GPS_TRACKERS.items()}),
+              delivery_gate(st[PARCELS], at)]
+    return all(ok for ok, _ in checks), [f"time: {at:%H:%M} ok"] + [v for _, v in checks]
 
 
 def container_image():
@@ -276,22 +344,22 @@ def settle(started):
 
 def cmd_run(args):
     STATE.mkdir(parents=True, exist_ok=True)
-    if not ARMED.exists():
+    if not ARMED.exists() and not args.dry:
         return 0
     with LOCK.open("a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 0
-        armed = json.loads(ARMED.read_text())
+        armed = json.loads(ARMED.read_text()) if ARMED.exists() else {"touched": [], "note": "dry run, nothing armed"}
         at = now()
-        ok, reason, _ = window(at)
+        ok, verdicts = gates(at)
         if args.dry:
-            print(f"window: {'open' if ok else 'closed'} ({reason})")
+            print(f"window: {'open' if ok else 'closed'}", *verdicts, sep="\n  ")
         elif not ok:
             return 0
         stamp = at.strftime("%Y%m%dT%H%M%S")
-        result = {"stamp": stamp, "dry": args.dry, "armed": armed, "window": reason, "steps": []}
+        result = {"stamp": stamp, "dry": args.dry, "armed": armed, "gates": verdicts, "steps": []}
         try:
             restart(args, armed, result, stamp)
         except Exception as e:
@@ -345,6 +413,11 @@ def cmd_arm(args):
 
 def cmd_status(_args):
     print("armed:", ARMED.read_text() if ARMED.exists() else "no")
+    try:
+        ok, verdicts = gates(now())
+        print(f"window now: {'open' if ok else 'closed'}", *verdicts, sep="\n  ")
+    except Exception as e:
+        print(f"window now: unknown ({type(e).__name__}: {e})")
     print("last:", LAST.read_text() if LAST.exists() else "none")
 
 
