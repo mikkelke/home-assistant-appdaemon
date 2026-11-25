@@ -106,6 +106,7 @@ class World:
         self.args["state_file"] = str(Path(tmp) / "state.json")
         self.args["log_file"] = str(Path(tmp) / "run_log.jsonl")
         self.args["humidity_max_age_min"] = 30
+        self.args["run_mode"] = "sleep"
         self.args["preload_from"] = None
         self.args.update(args or {})
         self.state_file = Path(self.args["state_file"])
@@ -1837,7 +1838,7 @@ class Configuration(unittest.TestCase):
         self.assertEqual(YAML_ARGS["health_entity"], HEALTH)
         self.assertEqual(YAML_ARGS["notify_target"], "mikkel")
         self.assertEqual((YAML_ARGS["on_below"], YAML_ARGS["off_at"]), (40, 42))
-        self.assertEqual((YAML_ARGS["run_mode"], YAML_ARGS["drying_mode"], YAML_ARGS["drying_hours"]), ("sleep", "drying_filter", 2))
+        self.assertEqual((YAML_ARGS["run_mode"], YAML_ARGS["drying_mode"], YAML_ARGS["drying_hours"]), ("quiet", "drying_filter", 2))
 
     def test_the_yaml_declares_no_log_stream_and_no_dictionary_values(self):
         self.assertNotIn("log", YAML_ARGS)

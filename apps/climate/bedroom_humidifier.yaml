@@ -44,7 +44,7 @@ BedroomHumidifier:
   health_entity: sensor.bedroom_humidifier
   # on = someone in the bedroom (room_active union of radar, PIR and bed sensors)
   occupancy: binary_sensor.bedroom_active
-  run_mode: sleep
+  run_mode: quiet
   # Before bed, house time, quoted HH:MM. An empty preload_from turns the phase off.
   preload_from: "22:00"
   preload_until: "02:00"
