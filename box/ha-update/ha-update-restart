@@ -7,7 +7,7 @@ and arms a run:
   ha-update-restart arm --touched gls,parcel_aggregator [--core 2026.11.3] [--note TEXT]
 
 The timer runs `ha-update-restart run` every 5 minutes. It does nothing unless a run is
-armed and every gate holds: local time inside WINDOW, zone.home 0 for at least EMPTY_FOR,
+armed and every gate holds: zone.home 0 for at least EMPTY_FOR,
 every resident GPS fix farther than NEAR_M from home, and no parcel out for delivery or due
 within DELIVERY_SOON (a restart takes arrival auto-unlock and the intercom down for minutes).
 Then it checks the configuration, backs up .storage and the compose file, stops HA with a
@@ -20,7 +20,7 @@ long grace period, recreates the container once and verifies:
 
 The result goes to RUNS/<stamp>.json and LAST; the arm file is consumed either way.
 A run that cannot get HA answering within UP_TIMEOUT restores the rollback image and the
-.storage backup when the arm file named a core version. `run --dry` evaluates the window
+.storage backup when the arm file named a core version. `run --dry` evaluates the gates
 and runs every check against the running instance without stopping anything.
 
 Root only. Python standard library on the host; HA calls run inside the homeassistant
@@ -54,7 +54,6 @@ HA_LOG = HA_CONFIG / "home-assistant.log"
 AD_LOG = Path("/data/appdaemon/logs/appdaemon.log")
 CONTAINER = "homeassistant"
 TOKEN_CONTAINER = "ha-mcp"
-WINDOW = (8, 22)
 EMPTY_FOR = dt.timedelta(minutes=10)
 NEAR_M = 1500
 DELIVERY_SOON = dt.timedelta(minutes=60)
@@ -217,13 +216,11 @@ def delivery_gate(incoming, at):
 
 def gates(at):
     """(ok, verdicts) of every condition a restart needs."""
-    if not WINDOW[0] <= at.hour < WINDOW[1]:
-        return False, [f"time: outside {WINDOW[0]:02d}-{WINDOW[1]:02d} BLOCK"]
     st = probe({"states": ["zone.home", PARCELS, *GPS_TRACKERS.values()]})["states"]
     checks = [empty_gate(st["zone.home"], at),
               gps_gate(st["zone.home"], {n: st[e] for n, e in GPS_TRACKERS.items()}),
               delivery_gate(st[PARCELS], at)]
-    return all(ok for ok, _ in checks), [f"time: {at:%H:%M} ok"] + [v for _, v in checks]
+    return all(ok for ok, _ in checks), [v for _, v in checks]
 
 
 def container_image():
