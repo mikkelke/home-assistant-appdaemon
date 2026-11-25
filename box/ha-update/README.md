@@ -27,6 +27,16 @@ If HA is not `RUNNING` 10 minutes after the recreate and the run was armed with 
 
 Each run writes `/data/ha-update/runs/<stamp>.json` and `last.json` and consumes the arm file, whatever the result. The Acer watch `agent-watch-ha-update-restart` reads those files: a pass only leaves a report, a failure sends a Signal message.
 
+## Host rounds
+
+`arm --host` turns the batch into an OS round, run under the same gates: backups (compose, `.storage`, and the compose files of every `--project`), `apt-get update`, `full-upgrade` and `autoremove --purge` (Ubuntu keeps the running and the newest kernel, so the previous one stays in GRUB; log in `runs/<stamp>-apt.log`), `docker compose up -d` for the `--recreate` services and each `--project`, a clean HA stop, then a reboot. `ha-update-restart-boot.service` runs `post-boot` at the next boot: it waits for HA, restarts zigbee2mqtt when `mqtt` was recreated, and adds host checks to the usual ones: running kernel is the newest installed, no `reboot-required`, `apt-get -s full-upgrade` has nothing left (phased packages do not count), every container that ran before is running and not unhealthy, recreated services run the staged image, no dead Z-Wave node, every Kuma monitor up, Traefik answers for ha, ma, rethink and the Ziti router SNI, and no Traefik `ERR` since boot. A host round has no automatic rollback; the previous kernel is the fallback. `run --dry --host` shows the plan and runs every check against the running box.
+
+```
+sudo ha-update-restart arm --host --recreate mqtt,zwavejs2mqtt --project /data/opengym --touched mqtt,zwave_js --note "..."
+```
+
+SSH to the box rides Ziti, so it drops while Traefik or the ziti router restarts and during the reboot.
+
 ## Use
 
 ```
@@ -51,9 +61,10 @@ python3 -m unittest discover -s box/ha-update/tests
 
 ```
 sudo install -m 0755 ha-update-restart /usr/local/sbin/ha-update-restart
-sudo install -m 0644 ha-update-restart.service ha-update-restart.timer /etc/systemd/system/
+sudo install -m 0644 ha-update-restart.service ha-update-restart.timer ha-update-restart-boot.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now ha-update-restart.timer
+sudo systemctl enable ha-update-restart-boot.service
 ```
 
 Python 3 standard library on the host. The HA calls run inside the `homeassistant` container (its aiohttp) with the token of the `ha-mcp` container, so both containers must be running.

@@ -67,6 +67,18 @@ SETTLE_TIMEOUT = 600
 SETTLE_EXTRA = 180
 KEEP_BACKUPS = 5
 Z2M_BRIDGE = "binary_sensor.zigbee2mqtt_bridge_connection_state"
+PENDING = STATE / "pending-boot.json"
+APT_ENV = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+APT_OPTS = ["-y", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold"]
+ZWAVE_DEAD = "{{ states.sensor | selectattr('entity_id', 'search', '_node_status$') | selectattr('state', 'eq', 'dead') | map(attribute='entity_id') | list | join(',') }}"
+KUMA_DOWN = (
+    "const D=require('/app/node_modules/@louislam/sqlite3');const db=new D.Database('/app/data/kuma.db');"
+    "db.all(\"select m.name, h.status from monitor m join heartbeat h on h.id=(select max(id) from heartbeat "
+    "where monitor_id=m.id) where m.active=1\",(e,r)=>console.log(JSON.stringify(e?{error:String(e)}:r)))")
+# (host header or SNI, check) pairs Traefik must answer on the box's LAN address after a host round.
+HOST_IP = "10.21.0.5"
+ROUTES = [("ha.me2go.dk", "http"), ("ma.me2go.dk", "http"), ("rethink.lan", "http"),
+          ("rtr02-dkcph.edge.visotia.com", "tls")]
 
 PROBE = r'''
 import asyncio, json, os, sys
@@ -82,6 +94,9 @@ async def main(what):
         if "check_config" in what:
             async with s.post(URL + "/api/config/core/check_config", headers=H) as r:
                 out["check_config"] = await r.json()
+        if "template" in what:
+            async with s.post(URL + "/api/template", headers=H, json={"template": what["template"]}) as r:
+                out["template"] = await r.text()
         for eid in what.get("states", []):
             async with s.get(URL + "/api/states/" + eid, headers=H) as r:
                 out.setdefault("states", {})[eid] = await r.json() if r.status == 200 else None
@@ -352,6 +367,8 @@ def cmd_run(args):
         except BlockingIOError:
             return 0
         armed = json.loads(ARMED.read_text()) if ARMED.exists() else {"touched": [], "note": "dry run, nothing armed"}
+        if args.dry and args.host:
+            armed = {**armed, "mode": "host"}
         at = now()
         ok, verdicts = gates(at)
         if args.dry:
@@ -378,6 +395,16 @@ def restart(args, armed, result, stamp):
     pre_ids = {i["issue_id"] for i in pre["repairs"] if i.get("translation_key") != "restart_required"}
     if pre["check_config"].get("result") != "valid":
         result.update(ok=False, failures=["config check: " + str(pre["check_config"].get("errors"))[:300]])
+    elif armed.get("mode") == "host":
+        host_round(args, armed, result, stamp, pre_ids)
+        if args.dry:
+            result.update(verify(armed, ha_started(), pre_ids))
+            failures, facts = host_checks({"expected_kernel": newest_kernel(kernel_files()),
+                                           "running_before": [r["Names"] for r in docker_rows() if r["State"] == "running"]},
+                                          now() - dt.timedelta(minutes=30))
+            result["host"] = facts
+            result["failures"] = result["failures"] + failures
+            result["ok"] = not result["failures"]
     elif args.dry:
         started = ha_started()
         result["steps"].append(f"would back up and recreate {CONTAINER} ({' '.join(container_image())})")
@@ -400,9 +427,187 @@ def restart(args, armed, result, stamp):
             result.update(verify(armed, started, pre_ids))
 
 
+def newest_kernel(vmlinuz_names):
+    """Release string of the newest /boot/vmlinuz-<release>."""
+    releases = [n.split("vmlinuz-", 1)[1] for n in vmlinuz_names if "vmlinuz-" in n]
+    return max(releases, key=lambda r: [int(x) if x.isdigit() else x for x in re.split(r"[.-]", r)], default=None)
+
+
+def apt_pending(simulate_output):
+    """Packages a full-upgrade would still install; phased (deferred) ones do not count."""
+    m = re.search(r"^(\d+) upgraded, (\d+) newly installed", simulate_output, re.M)
+    return int(m.group(1)) + int(m.group(2)) if m else None
+
+
+def container_problems(before, rows):
+    """Containers that ran before the round and are not running and healthy now."""
+    now_rows = {r["Names"]: r for r in rows}
+    problems = []
+    for name in before:
+        r = now_rows.get(name)
+        if r is None:
+            problems.append(f"{name} missing")
+        elif r["State"] != "running":
+            problems.append(f"{name} {r['State']}")
+        elif r.get("HealthStatus") not in (None, "", "none", "healthy"):
+            problems.append(f"{name} {r['HealthStatus']}")
+    return problems
+
+
+def docker_rows():
+    out = sh("docker", "ps", "-a", "--format", "{{json .}}").stdout
+    return [json.loads(l) for l in out.splitlines() if l.strip()]
+
+
+def kernel_files():
+    return [str(p) for p in Path("/boot").glob("vmlinuz-*")]
+
+
+def boot_id():
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
+def route_ok(name, kind):
+    if kind == "http":
+        r = sh("curl", "-sk", "-m", "10", "-o", "/dev/null", "-w", "%{http_code}", "--resolve", f"{name}:443:{HOST_IP}",
+               f"https://{name}/", check=False)
+        return r.stdout.strip() in ("200", "302"), r.stdout.strip()
+    r = sh("sh", "-c", f"echo | openssl s_client -connect {HOST_IP}:443 -servername {name} 2>/dev/null | "
+           "openssl x509 -noout -subject", check=False)
+    return bool(r.stdout.strip()), r.stdout.strip()[:80]
+
+
+def host_checks(pending, booted_at):
+    failures, facts = [], {}
+    kernel = os.uname().release
+    facts["kernel"] = kernel
+    if kernel != pending["expected_kernel"]:
+        failures.append(f"kernel {kernel}, expected {pending['expected_kernel']}")
+    if Path("/var/run/reboot-required").exists():
+        failures.append("reboot-required still set")
+    left = apt_pending(sh("apt-get", "-s", "full-upgrade", check=False).stdout)
+    facts["apt_pending"] = left
+    if left != 0:
+        failures.append(f"apt full-upgrade would still install {left}")
+    end = time.monotonic() + 300
+    while True:
+        problems = container_problems(pending["running_before"], docker_rows())
+        if not problems or time.monotonic() > end:
+            break
+        time.sleep(15)
+    facts["containers"] = problems or "all running"
+    failures += [f"container {p}" for p in problems]
+    images = {r["Names"]: r["Image"] for r in docker_rows()}
+    for svc, image in pending.get("expected_images", {}).items():
+        if images.get(svc) != image:
+            failures.append(f"{svc} runs {images.get(svc)}, expected {image}")
+    dead = probe({"template": ZWAVE_DEAD})["template"].strip()
+    facts["zwave_dead"] = dead or "none"
+    if dead:
+        failures.append(f"Z-Wave dead nodes: {dead}")
+    kuma = json.loads(sh("docker", "exec", "uptime", "node", "-e", KUMA_DOWN).stdout or "[]")
+    down = [m["name"] for m in kuma if m.get("status") != 1] if isinstance(kuma, list) else [str(kuma)]
+    facts["kuma"] = f"{len(kuma) - len(down)}/{len(kuma)} up" if isinstance(kuma, list) else kuma
+    if down:
+        failures.append("Kuma down: " + ", ".join(down))
+    for name, kind in ROUTES:
+        ok, got = route_ok(name, kind)
+        facts.setdefault("routes", {})[name] = got
+        if not ok:
+            failures.append(f"route {name}: {got or 'no answer'}")
+    since = booted_at.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    logs = sh("docker", "logs", "--since", since, "traefik", check=False)
+    errs = [l for l in (logs.stdout + logs.stderr).splitlines() if " ERR " in l]
+    facts["traefik_err"] = len(errs)
+    if errs:
+        failures.append(f"Traefik ERR lines: {len(errs)} ({errs[0][-160:]})")
+    return failures, facts
+
+
+def host_round(args, armed, result, stamp, pre_ids):
+    services = armed.get("recreate", [])
+    projects = armed.get("projects", [])
+    simulate = sh("apt-get", "-s", "full-upgrade", check=False).stdout
+    result["apt_planned"] = apt_pending(simulate)
+    if args.dry:
+        result["steps"] += [f"would apt full-upgrade {result['apt_planned']} packages, autoremove, "
+                            f"recreate {services} and projects {projects}, then reboot",
+                            f"newest kernel installed now: {newest_kernel(kernel_files())}"]
+        return
+    ARMED.rename(STATE / f"armed-{stamp}.json")
+    compose_copy, tarball = backup(stamp)
+    result["backups"] = [compose_copy, tarball]
+    for proj in projects:
+        for f in Path(proj).glob("docker-compose*.yml"):
+            shutil.copy2(f, f.with_name(f.name + f".bak-ha-update-{stamp}"))
+    log = RUNS / f"{stamp}-apt.log"
+    RUNS.mkdir(parents=True, exist_ok=True)
+    with log.open("w") as out:
+        for cmd in (["apt-get", "update"], ["apt-get", *APT_OPTS, "full-upgrade"], ["apt-get", *APT_OPTS, "autoremove", "--purge"]):
+            out.write(f"$ {' '.join(cmd)}\n")
+            out.flush()
+            subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT, env=APT_ENV, check=True, timeout=3600)
+    result["steps"].append(f"apt done, log {log}")
+    running = [r["Names"] for r in docker_rows() if r["State"] == "running"]
+    if services:
+        sh("docker", "compose", "-f", str(COMPOSE), "up", "-d", "--no-deps", *services, timeout=900)
+    for proj in projects:
+        subprocess.run(["docker", "compose", "up", "-d", "--remove-orphans"], cwd=proj, check=True,
+                       capture_output=True, text=True, timeout=900)
+    result["steps"].append(f"recreated {services} {projects}")
+    rows = {r["Names"]: r["Image"] for r in docker_rows()}
+    labels = {r["Names"]: r.get("Labels", "") for r in docker_rows()}
+    expected = {}
+    for name, image in rows.items():
+        m = re.search(r"com\.docker\.compose\.service=([^,]+)", labels[name])
+        if m and m.group(1) in services:
+            expected[name] = image
+    pending = {"stamp": stamp, "result": result, "pre_ids": sorted(pre_ids), "boot_id": boot_id(),
+               "expected_kernel": newest_kernel(kernel_files()), "running_before": running,
+               "expected_images": expected, "restart_z2m": "mqtt" in services}
+    PENDING.write_text(json.dumps(pending, indent=1, default=str) + "\n")
+    sh("docker", "stop", "-t", "120", CONTAINER, timeout=200)
+    result["steps"].append("rebooting")
+    subprocess.run(["systemctl", "reboot"], check=False)
+    raise SystemExit(0)
+
+
+def cmd_post_boot(_args):
+    if not PENDING.exists():
+        return 0
+    pending = json.loads(PENDING.read_text())
+    if pending["boot_id"] == boot_id():
+        return 0
+    PENDING.rename(STATE / f"pending-boot-{pending['stamp']}.json")
+    result = pending["result"]
+    booted_at = now()
+    result["booted_at"] = booted_at.isoformat(timespec="seconds")
+    try:
+        if not wait_up(UP_TIMEOUT):
+            result.update(ok=False, failures=[f"HA not RUNNING {UP_TIMEOUT // 60} min after boot"])
+        else:
+            if pending.get("restart_z2m"):
+                time.sleep(30)
+                sh("docker", "restart", "zigbee2mqtt", timeout=180)
+                result["steps"].append("restarted zigbee2mqtt after the broker")
+            settle(ha_started())
+            result.update(verify(result["armed"], ha_started(), set(pending["pre_ids"])))
+            failures, facts = host_checks(pending, booted_at)
+            result["host"] = facts
+            result["failures"] = result["failures"] + failures
+            result["ok"] = not result["failures"]
+    except Exception as e:
+        result.update(ok=False, failures=result.get("failures", []) + [f"{type(e).__name__}: {e}"[:400]])
+    result["finished"] = now().isoformat(timespec="seconds")
+    print("ok" if result["ok"] else "FAILED", write_result(pending["stamp"], result))
+    return 0 if result["ok"] else 1
+
+
 def cmd_arm(args):
     STATE.mkdir(parents=True, exist_ok=True)
-    armed = {"touched": [d for d in args.touched.split(",") if d], "core": args.core,
+    armed = {"mode": "host" if args.host else "ha", "recreate": [x for x in args.recreate.split(",") if x],
+             "projects": args.project or [],
+             "touched": [d for d in args.touched.split(",") if d], "core": args.core,
              "rollback_image": args.rollback_image, "note": args.note, "session": args.session,
              "armed_at": now().isoformat(timespec="seconds")}
     if args.core and not args.rollback_image:
@@ -413,6 +618,8 @@ def cmd_arm(args):
 
 def cmd_status(_args):
     print("armed:", ARMED.read_text() if ARMED.exists() else "no")
+    if PENDING.exists():
+        print("pending reboot check:", json.loads(PENDING.read_text())["stamp"])
     try:
         ok, verdicts = gates(now())
         print(f"window now: {'open' if ok else 'closed'}", *verdicts, sep="\n  ")
@@ -427,16 +634,21 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("arm")
-    a.add_argument("--touched", required=True, help="comma-separated integration domains")
+    a.add_argument("--touched", default="", help="comma-separated integration domains")
     a.add_argument("--core", help="HA version the recreate must bring up")
     a.add_argument("--rollback-image", help="local tag of the image running now, e.g. ha-rollback:2026.11.1")
+    a.add_argument("--host", action="store_true", help="host round: apt full-upgrade, recreate, reboot")
+    a.add_argument("--recreate", default="", help="host round: compose services in /data to recreate")
+    a.add_argument("--project", action="append", help="host round: other compose project dir to bring up")
     a.add_argument("--note", default="")
     a.add_argument("--session", default="", help="how to reopen the arming conversation")
     r = sub.add_parser("run")
     r.add_argument("--dry", action="store_true", help="evaluate window and checks only, change nothing")
+    r.add_argument("--host", action="store_true", help="with --dry, treat the batch as a host round")
     sub.add_parser("status")
+    sub.add_parser("post-boot", help="boot oneshot: finish a host round after its reboot")
     args = ap.parse_args()
-    return {"arm": cmd_arm, "run": cmd_run, "status": cmd_status}[args.cmd](args)
+    return {"arm": cmd_arm, "run": cmd_run, "status": cmd_status, "post-boot": cmd_post_boot}[args.cmd](args)
 
 
 if __name__ == "__main__":

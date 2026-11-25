@@ -97,5 +97,34 @@ class DeliveryGate(unittest.TestCase):
         self.assertFalse(hur.delivery_gate(None, AT)[0])
 
 
+class HostRound(unittest.TestCase):
+    def test_newest_kernel_sorts_numerically(self):
+        names = ["/boot/vmlinuz-7.0.0-38-generic", "/boot/vmlinuz-7.0.0-44-generic", "/boot/vmlinuz-7.0.0-9-generic"]
+        self.assertEqual(hur.newest_kernel(names), "7.0.0-44-generic")
+
+    def test_newest_kernel_none(self):
+        self.assertIsNone(hur.newest_kernel([]))
+
+    def test_apt_pending_counts_upgrades_and_new(self):
+        self.assertEqual(hur.apt_pending("x\n34 upgraded, 1 newly installed, 0 to remove and 1 not upgraded.\n"), 35)
+
+    def test_apt_pending_ignores_phased(self):
+        text = "The following upgrades have been deferred due to phasing:\n  libsqlite3-0\n" \
+               "0 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n"
+        self.assertEqual(hur.apt_pending(text), 0)
+
+    def test_apt_pending_unparsable(self):
+        self.assertIsNone(hur.apt_pending("E: could not get lock"))
+
+    def test_container_problems(self):
+        rows = [{"Names": "a", "State": "running", "HealthStatus": "healthy"},
+                {"Names": "b", "State": "running", "HealthStatus": "none"},
+                {"Names": "c", "State": "exited", "HealthStatus": "none"},
+                {"Names": "d", "State": "running", "HealthStatus": "unhealthy"},
+                {"Names": "e", "State": "exited", "HealthStatus": "none"}]
+        self.assertEqual(hur.container_problems(["a", "b", "c", "d", "f"], rows),
+                         ["c exited", "d unhealthy", "f missing"])
+
+
 if __name__ == "__main__":
     unittest.main()

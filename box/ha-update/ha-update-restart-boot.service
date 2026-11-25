@@ -1,0 +1,12 @@
+[Unit]
+Description=Finish an ha-update-restart host round after its reboot: run the post-checks
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ha-update-restart post-boot
+TimeoutStartSec=45min
+
+[Install]
+WantedBy=multi-user.target
