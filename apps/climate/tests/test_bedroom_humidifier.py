@@ -50,7 +50,7 @@ SOURCES = (PRIMARY, FALLBACK)
 SLEEP = "input_boolean.mikkel_sleep_mode"
 WINDOW = "binary_sensor.bedroom_window_contact"
 PERSON = "person.mikkel"
-OCCUPANCY = "binary_sensor.bedroom_presence_presence"
+OCCUPANCY = "binary_sensor.bedroom_active"
 HEALTH = "sensor.bedroom_humidifier"
 
 MIN = 60

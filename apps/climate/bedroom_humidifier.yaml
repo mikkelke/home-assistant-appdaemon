@@ -42,8 +42,8 @@ BedroomHumidifier:
   person: person.mikkel
   notify_target: mikkel
   health_entity: sensor.bedroom_humidifier
-  # FP300 radar, on = someone in the bedroom
-  occupancy: binary_sensor.bedroom_presence_presence
+  # on = someone in the bedroom (room_active union of radar, PIR and bed sensors)
+  occupancy: binary_sensor.bedroom_active
   run_mode: sleep
   # Before bed, house time, quoted HH:MM. An empty preload_from turns the phase off.
   preload_from: "22:00"

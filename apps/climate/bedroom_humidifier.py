@@ -189,7 +189,7 @@ class BedroomHumidifier(hass.Hass):
         self.run_mode = a.get("run_mode", "sleep")
         self.drying_mode = a.get("drying_mode", "drying_filter")
         self.preload_mode = a.get("preload_mode", "medium")
-        self.occupancy_entity = a.get("occupancy", "binary_sensor.bedroom_presence_presence")
+        self.occupancy_entity = a.get("occupancy", "binary_sensor.bedroom_active")
         before_bed = a.get("preload_from", "21:00")
         self.preload_from = _clock_time("preload_from", before_bed) if before_bed else None
         self.preload_until = _clock_time("preload_until", a.get("preload_until", "02:00")) if before_bed else None
