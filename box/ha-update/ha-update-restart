@@ -273,19 +273,24 @@ def rollback(armed, tarball, image_ref):
     return "rolled back to " + image + (" and HA answers" if wait_up(UP_TIMEOUT) else ", HA still not answering")
 
 
-def ad_after(started):
-    """AppDaemon lines since its reconnect to HA after `started` (naive local timestamps)."""
-    lines = AD_LOG.read_text(errors="replace").splitlines()
+def ad_summary(lines, started):
+    """AppDaemon's reconnect after `started`: its apps re-initialise either on a namespace restart (HA restarted
+    under a running AppDaemon) or on AppDaemon's own start (host reboot, container restart)."""
     since = started.astimezone(CPH).replace(tzinfo=None).isoformat(sep=" ")
     tail = [l for l in lines if l[:26] >= since[:26]]
     connected = next((l for l in tail if "Connected to Home Assistant" in l), None)
-    restart_i = next((i for i, l in enumerate(tail) if "Processing restart for plugin namespace 'default'" in l), None)
-    if restart_i is None:
+    marks = ("Processing restart for plugin namespace 'default'", "AppDaemon Version")
+    start_i = next((i for i, l in enumerate(tail) if any(m in l for m in marks)), None)
+    if start_i is None:
         return {"connected": connected, "namespace_restart": False}
-    after = tail[restart_i:]
+    after = tail[start_i:]
     return {"connected": connected, "namespace_restart": True,
             "initialized": sum("Calling initialize()" in l for l in after),
             "errors": [l[:300] for l in after if re.search(r" (ERROR|CRITICAL) ", l)][:20]}
+
+
+def ad_after(started):
+    return ad_summary(AD_LOG.read_text(errors="replace").splitlines(), started)
 
 
 def ha_errors(domains):
@@ -398,7 +403,8 @@ def restart(args, armed, result, stamp):
     elif armed.get("mode") == "host":
         host_round(args, armed, result, stamp, pre_ids)
         if args.dry:
-            result.update(verify(armed, ha_started(), pre_ids))
+            # After a reboot AppDaemon starts a few seconds before HA writes its first log line.
+            result.update(verify(armed, ha_started() - dt.timedelta(minutes=2), pre_ids))
             failures, facts = host_checks({"expected_kernel": newest_kernel(kernel_files()),
                                            "running_before": [r["Names"] for r in docker_rows() if r["State"] == "running"]},
                                           now() - dt.timedelta(minutes=30))
@@ -590,8 +596,8 @@ def cmd_post_boot(_args):
                 time.sleep(30)
                 sh("docker", "restart", "zigbee2mqtt", timeout=180)
                 result["steps"].append("restarted zigbee2mqtt after the broker")
-            settle(ha_started())
-            result.update(verify(result["armed"], ha_started(), set(pending["pre_ids"])))
+            settle(booted_at)
+            result.update(verify(result["armed"], booted_at, set(pending["pre_ids"])))
             failures, facts = host_checks(pending, booted_at)
             result["host"] = facts
             result["failures"] = result["failures"] + failures

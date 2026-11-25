@@ -126,5 +126,31 @@ class HostRound(unittest.TestCase):
                          ["c exited", "d unhealthy", "f missing"])
 
 
+class AppDaemonReconnect(unittest.TestCase):
+    START = dt.datetime(2026, 11, 25, 12, 29, tzinfo=hur.CPH)
+
+    def test_namespace_restart(self):
+        lines = ["2026-11-25 12:28:00.000000 ERROR HASS: Websocket connection lost",
+                 "2026-11-25 12:30:05.000000 INFO HASS: Connected to Home Assistant 2026.11.3 with aiohttp websocket",
+                 "2026-11-25 12:31:00.000000 INFO AppDaemon: Processing restart for plugin namespace 'default'",
+                 "2026-11-25 12:31:01.000000 INFO AppDaemon: Calling initialize() for x"]
+        got = hur.ad_summary(lines, self.START)
+        self.assertTrue(got["namespace_restart"])
+        self.assertEqual((got["initialized"], got["errors"]), (1, []))
+
+    def test_cold_start_after_reboot(self):
+        lines = ["2026-11-25 12:30:00.000000 INFO AppDaemon: AppDaemon Version 4.5.16 starting",
+                 "2026-11-25 12:30:05.000000 INFO HASS: Connected to Home Assistant 2026.11.3 with aiohttp websocket",
+                 "2026-11-25 12:30:40.000000 INFO AppDaemon: Calling initialize() for x",
+                 "2026-11-25 12:30:41.000000 ERROR x: boom"]
+        got = hur.ad_summary(lines, self.START)
+        self.assertTrue(got["namespace_restart"])
+        self.assertEqual(got["initialized"], 1)
+        self.assertEqual(len(got["errors"]), 1)
+
+    def test_nothing_yet(self):
+        self.assertFalse(hur.ad_summary(["2026-11-25 12:00:00.000000 INFO old"], self.START)["namespace_restart"])
+
+
 if __name__ == "__main__":
     unittest.main()
