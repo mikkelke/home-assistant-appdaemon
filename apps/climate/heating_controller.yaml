@@ -89,7 +89,7 @@ HeatingController:
     reask_days: 3
     zones:
       family:
-        rooms: [sensor.living_room_feel, sensor.dining_room_feel, sensor.kitchen_feel]
+        rooms: [sensor.living_room_feel]
       kristines_room:
         rooms: [sensor.kristines_room_feel]
         margin_c: 0.2
@@ -165,14 +165,9 @@ HeatingController:
   zones:
     family:
       thermostat: climate.family_room_thermostat
-      # Control air: the rooms that read, averaged by control_air_weights. A room whose 3 h mean
-      # is more than 0.7 from the target stands in for the average until its mean is back within
-      # 0.4; with rooms off on both sides of the target the average stays.
-      control_air: [sensor.living_room_feel, sensor.dining_room_feel, sensor.kitchen_feel]
-      control_air_weights:
-        sensor.living_room_feel: 19
-        sensor.dining_room_feel: 18.5
-        sensor.kitchen_feel: 18.5
+      # Control air: the living room's seated air alone, although the zone's two loops also heat
+      # the dining room and the kitchen.
+      control_air: [sensor.living_room_feel]
       # floor_max_c applies to the warmer of the floors.
       floor:
         - sensor.living_room_floor_thermometer_temperature

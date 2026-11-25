@@ -1107,8 +1107,8 @@ class ShippedRoomFeelConfig(unittest.TestCase):
 
     def test_seated_references_and_source_offsets(self):
         expected = {
-            "living_room": ("median", [("seated", 0.0), ("fp300", 0.1),
-                                        ("salus_monitor", 0.2), ("salus_family", 0.0)], 0.2),
+            "living_room": ("primary", [("seated", 0.0), ("fp300", 0.1),
+                                         ("salus_monitor", 0.2), ("salus_family", 0.0)], 0.2),
             "kitchen": ("median", [("seated", 0.0), ("fp300", 0.45),
                                     ("ceiling", -0.1), ("salus_family", 0.3)], None),
             "dining_room": ("primary", [("seated", 0.0), ("fp300", 0.15),
@@ -1129,23 +1129,42 @@ class ShippedRoomFeelConfig(unittest.TestCase):
                 self.assertEqual(cfg.get("floor_offset_c"), floor_offset)
         self.assertEqual(self._source("kitchen", "sensor.kitchen_smoke_alarm_temperature")["offset_rh"], 1.8)
 
-    def test_shipped_living_room_fuses_sources_and_survives_fp300_loss(self):
-        app = _make_app({"living_room": self.rooms["living_room"]}, plain={
+    def _living(self, last_updated=None, **plain):
+        readings = {
             "sensor.living_room_seated_thermometer_temperature": "23.3",
             "sensor.living_room_seated_thermometer_humidity": "50",
-            "sensor.living_room_presence_temperature": "23.2",
+            "sensor.living_room_presence_temperature": "24.4",
             "sensor.living_room_presence_humidity": "50",
             "climate.living_room_thermostat": "off",
             "climate.family_room_thermostat": "off",
             "sensor.living_room_floor_thermometer_temperature": "22.5",
-        }, attrs=LIVING_ATTRS)
+        }
+        readings.update(plain)
+        app = _make_app({"living_room": self.rooms["living_room"]}, plain=readings,
+                        attrs=LIVING_ATTRS, last_updated=last_updated)
         app._evaluate_room("living_room")
-        self.assertEqual(app._captured["sensor.living_room_feel"]["state"], 23.3)
-        app.get_state = (lambda orig: lambda entity, attribute=None: (
-            "unavailable" if entity == "sensor.living_room_presence_temperature"
-            else orig(entity, attribute)))(app.get_state)
-        app._evaluate_room("living_room")
-        self.assertEqual(app._captured["sensor.living_room_feel"]["state"], 23.4)
+        return app._captured["sensor.living_room_feel"]
+
+    def test_shipped_living_room_reads_the_seated_thermometer_alone(self):
+        cap = self._living()
+        self.assertEqual(cap["state"], 23.3)  # the median of its sources would be 23.5
+        self.assertEqual(cap["attrs"]["fusion"], "primary")
+        self.assertEqual(cap["attrs"]["sources"], [
+            "sensor.living_room_seated_thermometer_temperature",
+            "sensor.living_room_seated_thermometer_humidity",
+        ])
+
+    def test_shipped_living_room_takes_the_other_sensors_while_the_seated_one_is_gone(self):
+        gone = self._living(**{"sensor.living_room_seated_thermometer_temperature": "unavailable"})
+        self.assertEqual(gone["state"], 24.0)
+        old = (NOW - timedelta(minutes=90)).isoformat()
+        stale = self._living(last_updated={
+            "sensor.living_room_seated_thermometer_temperature": old,
+            "sensor.living_room_seated_thermometer_humidity": old,
+        })
+        self.assertEqual(stale["state"], 24.0)
+        self.assertIn("sensor.living_room_seated_thermometer_temperature: stale",
+                      stale["attrs"]["excluded"])
 
 
 if __name__ == "__main__":

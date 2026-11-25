@@ -69,9 +69,8 @@ state callback, so every read takes the fresher of the last callback value and t
 entity created while AppDaemon runs reads as None until it restarts; a missing nudge button is
 logged once and the app carries on.
 
-Control air is the weighted mean of the zone's room sensors that read. In a zone with several, a
-room whose 3 h mean is far from the comfort target takes over (heating_plan.ComfortSwitch); the
-zone sensor and the decision log name the basis. A floor maximum holds against the warmest of the
+Control air is the weighted mean of the zone's room sensors that read; a zone with several names
+that basis in its sensor and in the decision log. A floor maximum holds against the warmest of the
 zone's floor sensors that reported within FLOOR_CAP_FRESH_MIN.
 
 Publish contract: booleans go out as the strings "true"/"false", values that can be exactly
@@ -191,11 +190,6 @@ class ZoneRuntime:
         }
         self.cut_day = saved.get("cut_day") if isinstance(saved.get("cut_day"), str) else None
         self.floor_cap = saved.get("floor_cap") is True
-        self.comfort = (
-            hp.ComfortSwitch(zc.control_air, _dict(saved.get("comfort")))
-            if len(zc.control_air) > 1
-            else None
-        )
         daily = saved.get("daily")
         self.daily = list(daily)[-DAILY_KEEP:] if isinstance(daily, list) else []
         self.yesterday = (
@@ -253,8 +247,6 @@ class ZoneRuntime:
             "write_failures": self.write_failures,
             "last_write": self.last_write,
         }
-        if self.comfort is not None:
-            data["comfort"] = self.comfort.snapshot()
         if self.transit is not None:
             data["transit"] = self.transit.snapshot()
         return data
@@ -1251,42 +1243,10 @@ class HeatingController(hass.Hass):
             "air": air,
             "air_source": source,
             "air_basis": "weighted" if source == "feel" and len(zc.control_air) > 1 else None,
-            "feels": dict(zip(zc.control_air, feels)),
-            "comfort_means": None,
             "air_fresh": source in ("feel", "thermostat")
             or (source == "floor" and floor_pair is not None and floor_pair[1] <= FLOOR_FRESH_MIN),
             "stale": stale,
         }
-
-    @staticmethod
-    def _basis(active: Optional[str]) -> str:
-        return "weighted" if active is None else f"comfort:{active}"
-
-    def _comfort_air(
-        self, rt: ZoneRuntime, reading: dict, now_ts: float, tz, base: float, lower: float,
-        window_active: bool, away: bool, travelling: bool,
-    ) -> None:
-        """Feed the zone's comfort switch the room readings of this evaluation and let the room
-        it picks, if any, stand in for the weighted mean as the control air. An airing is not
-        sampled: it says nothing about how the heating suits the rooms."""
-        comfort, zc = rt.comfort, rt.zc
-        if comfort is None:
-            return
-        comfort.observe(now_ts, reading["feels"], record=not window_active)
-        target = hp.comfort_target(zc, base, rt.nudge, now_ts, tz, lower, away, travelling)
-        before = comfort.active
-        comfort.decide(now_ts, target)
-        reading["comfort_means"] = means = comfort.means(now_ts)
-        if comfort.active != before:
-            self.log(
-                f"HeatingController {zc.name}: control air {self._basis(before)} -> "
-                f"{self._basis(comfort.active)}, target {target:.1f}, 3 h means "
-                + ", ".join(f"{entity} {mean:.2f}" for entity, mean in means.items()),
-                level="INFO",
-            )
-        own = reading["feels"].get(comfort.active)
-        if reading["air_source"] == "feel" and own is not None:
-            reading["air"], reading["air_basis"] = own, self._basis(comfort.active)
 
     def _evaluate_zone(self, zone: str, rt: ZoneRuntime, ctx: dict) -> None:
         zc, cfg = rt.zc, self.cfg
@@ -1313,7 +1273,6 @@ class HeatingController(hass.Hass):
         travelling = away and self._travelling(zc.profile.travel, now_ts)
         if travelling:
             lower = min(lower, zc.profile.travel.lower_c)
-        self._comfort_air(rt, reading, now_ts, tz, base, lower, window_active, away, travelling)
         openings = {e: self._state_of(e) for e in zc.openings}
         event = rt.tracker.update(now_ts, openings, reading["air"])
 
@@ -2179,8 +2138,6 @@ class HeatingController(hass.Hass):
         }
         if reading["floor_temps"]:
             record["floors"] = reading["floor_temps"]
-        if reading["comfort_means"] is not None:
-            record["comfort_means"] = {e: round(m, 2) for e, m in reading["comfort_means"].items()}
         if rt.zc.guard.enabled:
             record["bedroom"] = {
                 "air": bedroom["air"],

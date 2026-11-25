@@ -72,7 +72,7 @@ RoomFeel:
       window_contacts: [binary_sensor.bedroom_window_contact]
 
     living_room:
-      fusion: median
+      fusion: primary
       air_sources:
         - entity: sensor.living_room_seated_thermometer_temperature
           rh_entity: sensor.living_room_seated_thermometer_humidity

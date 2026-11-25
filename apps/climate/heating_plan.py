@@ -26,7 +26,6 @@ Terms used throughout:
   - aim: the air temperature a call heats towards (T* shifted by the lead, or capped).
   - protected minimum: the air temperature a sun cut still defends.
   - control air: the zone's measured seated air, the weighted mean of its room sensors that read.
-    In a zone with several, a room whose 3 h mean is far from T* takes over (ComfortSwitch).
 
 Mode precedence, first match wins (see plan()): off_season / device_offline, window, settle,
 party, floor_cap, guard, sun_cut, fallback, travel, away, hold. Window, settle, party and
@@ -67,11 +66,6 @@ MODE_HOLD = "hold"
 SETPOINT_STEP_C = 0.5
 DEVICE_MIN_C = 5.0
 CONTROL_AIR_MAX_AGE_MIN = 180.0
-COMFORT_WINDOW_S = 3 * 3600.0
-COMFORT_SAMPLE_GAP_S = 240.0
-COMFORT_MIN_SAMPLES = 24
-COMFORT_ENTER_C = 0.7
-COMFORT_RELEASE_C = 0.4
 VALID_RANGE_C = (5.0, 35.0)
 JUMP_C = 2.0
 JUMP_WINDOW_S = 600.0
@@ -1239,95 +1233,6 @@ def resolve_control_air(
     if floor is not None and floor[1] <= CONTROL_AIR_MAX_AGE_MIN:
         return floor[0] + 0.5, "floor"
     return None, "none"
-
-
-# ---------------------------------------------------------------- comfort switch
-
-
-def comfort_pick(means: dict, target: float, active: Optional[str]) -> Optional[str]:
-    """The room sensor that becomes the zone's control air, or None for the weighted mean.
-
-    `means` maps each room sensor to its mean over the comfort window. A sensor is off when its
-    mean is more than COMFORT_ENTER_C from the target, and the active one stays off until its
-    mean is back within COMFORT_RELEASE_C. Sensors off on both sides of the target cancel out:
-    the weighted mean is the compromise, and the pick starts over once one side is back. With
-    several off on one side the active one stays, else the furthest from the target wins."""
-    if not math.isfinite(target):
-        return None
-    off = {}
-    for entity, mean in means.items():
-        gap = round(mean - target, 3)
-        if abs(gap) > (COMFORT_RELEASE_C if entity == active else COMFORT_ENTER_C):
-            off[entity] = gap
-    if not off or min(off.values()) < 0 < max(off.values()):
-        return None
-    if active in off:
-        return active
-    return max(off, key=lambda entity: abs(off[entity]))
-
-
-class ComfortSwitch:
-    """The rolling means behind comfort_pick, for the room sensors of one zone.
-
-    A sensor's readings are kept for COMFORT_WINDOW_S, at most one per COMFORT_SAMPLE_GAP_S, and
-    its mean only counts on COMFORT_MIN_SAMPLES of them: a cold start or a long outage leaves
-    the weighted mean in charge instead of judging a room on a few readings. The samples and the
-    active sensor are saved with the zone, so a restart carries on where it stopped."""
-
-    def __init__(self, entities: tuple, saved: Optional[dict] = None):
-        self.entities = tuple(entities)
-        s = saved if isinstance(saved, dict) else {}
-        raw = s.get("samples") if isinstance(s.get("samples"), dict) else {}
-        self.samples = {e: self._load(raw.get(e)) for e in self.entities}
-        self.active = s.get("active") if s.get("active") in self.entities else None
-
-    @staticmethod
-    def _load(items) -> list:
-        out = []
-        for item in items if isinstance(items, list) else []:
-            numbers = isinstance(item, list) and len(item) == 2
-            if numbers and all(
-                isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
-                for x in item
-            ):
-                out.append([float(item[0]), float(item[1])])
-        return sorted(out)
-
-    def snapshot(self) -> dict:
-        return {
-            "samples": {
-                e: [[int(ts), round(v, 2)] for ts, v in samples]
-                for e, samples in self.samples.items()
-            },
-            "active": self.active,
-        }
-
-    def observe(self, now_ts: float, readings: dict, record: bool = True) -> None:
-        """Take the current readings (None for a sensor that does not read) and drop what has
-        left the window. With record off only the dropping happens."""
-        cutoff = now_ts - COMFORT_WINDOW_S
-        for entity in self.entities:
-            kept = [s for s in self.samples[entity] if cutoff < s[0] <= now_ts]
-            value = readings.get(entity)
-            if (
-                record
-                and value is not None
-                and (not kept or now_ts - kept[-1][0] >= COMFORT_SAMPLE_GAP_S)
-            ):
-                kept.append([now_ts, value])
-            self.samples[entity] = kept
-
-    def means(self, now_ts: float) -> dict:
-        out = {}
-        for entity in self.entities:
-            values = [v for ts, v in self.samples[entity] if ts > now_ts - COMFORT_WINDOW_S]
-            if len(values) >= COMFORT_MIN_SAMPLES:
-                out[entity] = sum(values) / len(values)
-        return out
-
-    def decide(self, now_ts: float, target: float) -> Optional[str]:
-        self.active = comfort_pick(self.means(now_ts), target, self.active)
-        return self.active
 
 
 # ---------------------------------------------------------------- window tracker
