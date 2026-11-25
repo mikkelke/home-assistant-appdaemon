@@ -324,10 +324,32 @@ class ScanErrors:
                     raise DeployError("AppDaemon error log was truncated; reload verification uncertain")
                 chunk = self.tails.get(identity, b"") + stream.read()
                 self.tails[identity] = chunk[-256:]
-                if self.pattern.search(chunk):
+                if self.pattern.search(self.without_data_tables(chunk)):
                     raise DeployError("AppDaemon config scan failed; check the private error log; pending deploy retained")
         except OSError:
             raise DeployError("AppDaemon error log became unreadable; reload verification uncertain") from None
+
+    @staticmethod
+    def without_data_tables(chunk):
+        """Drop complete 'Reading user apps' blocks that only reject *_programmes.yaml lookup
+        tables: they hold no module, and AppDaemon rejects them on every edit."""
+        lines, kept, block = chunk.split(b"\n"), [], None
+        for line in lines:
+            if block is None:
+                if b"Reading user apps" in line:
+                    block = [line]
+                else:
+                    kept.append(line)
+                continue
+            block.append(line)
+            if re.search(rb"Error:\s*={20,}\s*$", line):
+                files = re.findall(rb"BadAppConfigFile:\s*(\S+)", b"\n".join(block))
+                if not files or not all(f.endswith(b"_programmes.yaml") for f in files):
+                    kept.extend(block)
+                block = None
+        if block is not None:
+            kept.extend(block)
+        return b"\n".join(kept)
 
     def close(self):
         for stream in self.streams.values():

@@ -208,6 +208,27 @@ class ScanErrorTests(unittest.TestCase):
         with self.assertRaises(deploy.DeployError):
             self.errors.check()
 
+    def block(self, path):
+        return ("2026-11-25 ERROR Error: =====  Reading user apps  ===========================\n"
+                f"2026-11-25 ERROR Error: BadAppConfigFile: {path}\n"
+                "2026-11-25 ERROR Error:   BadAppConfig: missing field 'module'\n"
+                "2026-11-25 ERROR Error: ==========================================================\n")
+
+    def test_programme_table_rejection_does_not_fail(self):
+        self.append(self.block("/conf/apps/appliances/dishwasher_programmes.yaml"))
+        self.errors.check()
+
+    def test_real_app_config_rejection_still_fails(self):
+        self.append(self.block("/conf/apps/appliances/dishwasher_programmes.yaml"))
+        self.append(self.block("/conf/apps/appliances/dishwasher.yaml"))
+        with self.assertRaises(deploy.DeployError):
+            self.errors.check()
+
+    def test_unfinished_programme_table_block_still_fails(self):
+        self.append(self.block("/conf/apps/appliances/washer_programmes.yaml").rsplit("2026", 1)[0])
+        with self.assertRaises(deploy.DeployError):
+            self.errors.check()
+
     def test_rotation_checks_both_original_and_replacement_log(self):
         self.path.rename(self.path.with_suffix(".log.1"))
         self.path.write_text("BadAppConfig: private-details\n")
