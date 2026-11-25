@@ -1,0 +1,8 @@
+[Unit]
+Description=Restart Home Assistant once for an armed update batch while the flat is empty
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ha-update-restart run
+TimeoutStartSec=45min

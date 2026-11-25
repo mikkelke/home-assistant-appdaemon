@@ -1,0 +1,8 @@
+[Unit]
+Description=Check every 5 minutes, 08-22 local, whether an armed HA update batch can restart
+
+[Timer]
+OnCalendar=*-*-* 08..21:00/5:00 Europe/Copenhagen
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""Restart Home Assistant once for staged updates while the flat is empty, then verify.
+
+An agent stages the updates (image pulled, HACS files installed, local patches re-applied)
+and arms a run:
+
+  ha-update-restart arm --touched gls,parcel_aggregator [--core 2026.11.3] [--note TEXT]
+
+The timer runs `ha-update-restart run` every 5 minutes. It does nothing unless a run is
+armed, the local time is inside WINDOW and zone.home has been 0 for at least EMPTY_FOR.
+Then it checks the configuration, backs up .storage and the compose file, stops HA with a
+long grace period, recreates the container once and verifies:
+
+  core RUNNING (and the armed version), no repair created since the restart and no
+  restart_required repair left, z2m bridge online, AppDaemon reconnected and its apps
+  re-initialised without errors, every config entry of the touched domains loaded, and
+  no ERROR/CRITICAL line from the touched domains in home-assistant.log.
+
+The result goes to RUNS/<stamp>.json and LAST; the arm file is consumed either way.
+A run that cannot get HA answering within UP_TIMEOUT restores the rollback image and the
+.storage backup when the arm file named a core version. `run --dry` evaluates the window
+and runs every check against the running instance without stopping anything.
+
+Root only. Python standard library on the host; HA calls run inside the homeassistant
+container (aiohttp) with the ha-mcp container's token.
+"""
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+CPH = ZoneInfo("Europe/Copenhagen")
+STATE = Path("/data/ha-update")
+ARMED = STATE / "armed.json"
+RUNS = STATE / "runs"
+LAST = STATE / "last.json"
+LOCK = STATE / "lock"
+COMPOSE_DIR = Path("/data")
+COMPOSE = COMPOSE_DIR / "docker-compose.yaml"
+HA_CONFIG = Path("/data/homeassistant")
+HA_LOG = HA_CONFIG / "home-assistant.log"
+AD_LOG = Path("/data/appdaemon/logs/appdaemon.log")
+CONTAINER = "homeassistant"
+TOKEN_CONTAINER = "ha-mcp"
+WINDOW = (8, 22)
+EMPTY_FOR = dt.timedelta(minutes=10)
+UP_TIMEOUT = 600
+SETTLE_TIMEOUT = 600
+SETTLE_EXTRA = 180
+KEEP_BACKUPS = 5
+Z2M_BRIDGE = "binary_sensor.zigbee2mqtt_bridge_connection_state"
+
+PROBE = r'''
+import asyncio, json, os, sys
+import aiohttp
+
+URL = "http://127.0.0.1:8123"
+TOKEN = os.environ["HA_TOKEN"]
+H = {"Authorization": "Bearer " + TOKEN}
+
+async def main(what):
+    out = {}
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as s:
+        if "check_config" in what:
+            async with s.post(URL + "/api/config/core/check_config", headers=H) as r:
+                out["check_config"] = await r.json()
+        for eid in what.get("states", []):
+            async with s.get(URL + "/api/states/" + eid, headers=H) as r:
+                out.setdefault("states", {})[eid] = await r.json() if r.status == 200 else None
+        async with s.ws_connect(URL + "/api/websocket", max_msg_size=64 * 1024 * 1024) as ws:
+            await ws.receive_json()
+            await ws.send_json({"type": "auth", "access_token": TOKEN})
+            if (await ws.receive_json()).get("type") != "auth_ok":
+                raise SystemExit("auth failed")
+            calls = {1: {"type": "get_config"}, 2: {"type": "repairs/list_issues"},
+                     3: {"type": "config_entries/get"}}
+            for i, c in calls.items():
+                await ws.send_json({"id": i, **c})
+            got = {}
+            while len(got) < len(calls):
+                m = await ws.receive_json()
+                if m.get("type") == "result":
+                    got[m["id"]] = m.get("result")
+            cfg = got[1] or {}
+            out["core"] = {"state": cfg.get("state"), "version": cfg.get("version")}
+            out["repairs"] = [i for i in (got[2] or {}).get("issues", []) if not i.get("ignored")]
+            out["entries"] = [{"domain": e["domain"], "title": e.get("title"), "state": e.get("state"),
+                               "disabled_by": e.get("disabled_by")} for e in (got[3] or [])]
+    print(json.dumps(out))
+
+asyncio.run(main(json.loads(sys.argv[1])))
+'''
+
+
+def now():
+    return dt.datetime.now(CPH)
+
+
+def sh(*cmd, check=True, timeout=300):
+    return subprocess.run(cmd, capture_output=True, text=True, check=check, timeout=timeout)
+
+
+def token():
+    return sh("docker", "exec", TOKEN_CONTAINER, "printenv", "HOMEASSISTANT_TOKEN").stdout.strip()
+
+
+def probe(what):
+    r = sh("docker", "exec", "-i", "-e", "HA_TOKEN=" + token(), CONTAINER, "python3", "-c", PROBE,
+           json.dumps(what), timeout=180)
+    return json.loads(r.stdout)
+
+
+def ha_up():
+    r = sh("curl", "-s", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}", "http://127.0.0.1:8123/", check=False)
+    return r.stdout.strip() == "200"
+
+
+def parse_ts(value):
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def window(at):
+    """Return (ok, reason, zone_home_state)."""
+    if not WINDOW[0] <= at.hour < WINDOW[1]:
+        return False, f"outside {WINDOW[0]:02d}-{WINDOW[1]:02d}", None
+    zone = probe({"states": ["zone.home"]})["states"]["zone.home"]
+    if zone is None:
+        return False, "zone.home missing", None
+    if zone["state"] != "0":
+        return False, f"zone.home={zone['state']}", zone
+    empty = at - parse_ts(zone["last_changed"])
+    if empty < EMPTY_FOR:
+        return False, f"empty for {int(empty.total_seconds() // 60)} min", zone
+    return True, f"empty since {parse_ts(zone['last_changed']).astimezone(CPH):%H:%M}", zone
+
+
+def container_image():
+    return sh("docker", "inspect", "-f", "{{.Config.Image}} {{.Image}}", CONTAINER).stdout.split()
+
+
+def backup(stamp):
+    compose_copy = COMPOSE_DIR / f"docker-compose.yaml.bak-ha-update-{stamp}"
+    shutil.copy2(COMPOSE, compose_copy)
+    tarball = COMPOSE_DIR / f"storage-backup-ha-update-{stamp}.tar.gz"
+    with tarfile.open(tarball, "w:gz") as t:
+        t.add(HA_CONFIG / ".storage", arcname=".storage")
+    for pattern in ("storage-backup-ha-update-*.tar.gz", "docker-compose.yaml.bak-ha-update-*"):
+        for old in sorted(COMPOSE_DIR.glob(pattern))[:-KEEP_BACKUPS]:
+            old.unlink()
+    return str(compose_copy), str(tarball)
+
+
+def recreate():
+    sh("docker", "stop", "-t", "120", CONTAINER, timeout=200)
+    sh("docker", "compose", "-f", str(COMPOSE), "up", "-d", "--no-deps", CONTAINER, timeout=300)
+
+
+def wait_up(timeout):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if ha_up():
+            try:
+                if probe({})["core"]["state"] == "RUNNING":
+                    return True
+            except Exception:
+                pass
+        time.sleep(10)
+    return False
+
+
+def rollback(armed, tarball, image_ref):
+    image = armed.get("rollback_image")
+    if not image:
+        return "no rollback_image armed"
+    sh("docker", "stop", "-t", "120", CONTAINER, timeout=200)
+    sh("docker", "tag", image, image_ref)
+    shutil.rmtree(HA_CONFIG / ".storage")
+    with tarfile.open(tarball) as t:
+        t.extractall(HA_CONFIG, filter="fully_trusted")
+    sh("docker", "compose", "-f", str(COMPOSE), "up", "-d", "--no-deps", CONTAINER, timeout=300)
+    return "rolled back to " + image + (" and HA answers" if wait_up(UP_TIMEOUT) else ", HA still not answering")
+
+
+def ad_after(started):
+    """AppDaemon lines since its reconnect to HA after `started` (naive local timestamps)."""
+    lines = AD_LOG.read_text(errors="replace").splitlines()
+    since = started.astimezone(CPH).replace(tzinfo=None).isoformat(sep=" ")
+    tail = [l for l in lines if l[:26] >= since[:26]]
+    connected = next((l for l in tail if "Connected to Home Assistant" in l), None)
+    restart_i = next((i for i, l in enumerate(tail) if "Processing restart for plugin namespace 'default'" in l), None)
+    if restart_i is None:
+        return {"connected": connected, "namespace_restart": False}
+    after = tail[restart_i:]
+    return {"connected": connected, "namespace_restart": True,
+            "initialized": sum("Calling initialize()" in l for l in after),
+            "errors": [l[:300] for l in after if re.search(r" (ERROR|CRITICAL) ", l)][:20]}
+
+
+def ha_errors(domains):
+    pats = [re.compile(rf"\[(custom_components|homeassistant\.components)\.{re.escape(d)}(\.|\])") for d in domains]
+    pats += [re.compile(rf"\bfor {re.escape(d)}\b") for d in domains]
+    out = []
+    for line in HA_LOG.read_text(errors="replace").splitlines():
+        if re.search(r" (ERROR|CRITICAL) \(", line) and any(p.search(line) for p in pats):
+            out.append(line[:300])
+    return out[:30]
+
+
+def verify(armed, started, pre_repair_ids):
+    touched = armed["touched"]
+    p = probe({"states": [Z2M_BRIDGE]})
+    failures = []
+    core = p["core"]
+    if core["state"] != "RUNNING":
+        failures.append(f"core state {core['state']}")
+    if armed.get("core") and core["version"] != armed["core"]:
+        failures.append(f"core {core['version']}, expected {armed['core']}")
+    new_repairs = [f"{i['domain']}/{i['issue_id']}" for i in p["repairs"]
+                   if i["issue_id"] not in pre_repair_ids or i.get("translation_key") == "restart_required"]
+    if new_repairs:
+        failures.append("repairs: " + ", ".join(new_repairs))
+    z2m = (p["states"].get(Z2M_BRIDGE) or {}).get("state")
+    if z2m != "on":
+        failures.append(f"z2m bridge {z2m}")
+    entries = {}
+    for d in touched:
+        states = [e["state"] for e in p["entries"] if e["domain"] == d and not e["disabled_by"]]
+        entries[d] = states
+        if not states:
+            failures.append(f"{d}: no config entry")
+        elif any(s != "loaded" for s in states):
+            failures.append(f"{d}: entries {states}")
+    ad = ad_after(started)
+    if not ad.get("connected"):
+        failures.append("AppDaemon did not reconnect")
+    elif not ad.get("namespace_restart"):
+        failures.append("AppDaemon did not re-initialise its apps")
+    elif ad.get("errors"):
+        failures.append(f"AppDaemon errors: {len(ad['errors'])}")
+    errors = ha_errors(touched)
+    if errors:
+        failures.append(f"HA log errors from touched domains: {len(errors)}")
+    return {"ok": not failures, "failures": failures, "core": core, "repairs": len(p["repairs"]),
+            "z2m": z2m, "entries": entries, "appdaemon": ad, "ha_errors": errors}
+
+
+def write_result(stamp, result):
+    RUNS.mkdir(parents=True, exist_ok=True)
+    path = RUNS / f"{stamp}.json"
+    path.write_text(json.dumps(result, indent=1, default=str) + "\n")
+    LAST.write_text(path.read_text())
+    return path
+
+
+def ha_started():
+    """Start of the running HA instance: home-assistant.log is recreated at every start."""
+    first = HA_LOG.open(errors="replace").readline()
+    return parse_ts(first[:29].replace(" ", "T", 1))
+
+
+def settle(started):
+    end = time.monotonic() + SETTLE_TIMEOUT
+    while time.monotonic() < end and not ad_after(started).get("namespace_restart"):
+        time.sleep(15)
+    time.sleep(SETTLE_EXTRA)
+
+
+def cmd_run(args):
+    STATE.mkdir(parents=True, exist_ok=True)
+    if not ARMED.exists():
+        return 0
+    with LOCK.open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        armed = json.loads(ARMED.read_text())
+        at = now()
+        ok, reason, _ = window(at)
+        if args.dry:
+            print(f"window: {'open' if ok else 'closed'} ({reason})")
+        elif not ok:
+            return 0
+        stamp = at.strftime("%Y%m%dT%H%M%S")
+        result = {"stamp": stamp, "dry": args.dry, "armed": armed, "window": reason, "steps": []}
+        try:
+            restart(args, armed, result, stamp)
+        except Exception as e:
+            result.update(ok=False, failures=result.get("failures", []) + [f"{type(e).__name__}: {e}"[:400]])
+        result["finished"] = now().isoformat(timespec="seconds")
+        if args.dry:
+            print(json.dumps(result, indent=1, default=str))
+        else:
+            print("ok" if result["ok"] else "FAILED", write_result(stamp, result))
+        return 0 if result["ok"] else 1
+
+
+def restart(args, armed, result, stamp):
+    pre = probe({"check_config": True})
+    result["pre_repairs"] = len(pre["repairs"])
+    pre_ids = {i["issue_id"] for i in pre["repairs"] if i.get("translation_key") != "restart_required"}
+    if pre["check_config"].get("result") != "valid":
+        result.update(ok=False, failures=["config check: " + str(pre["check_config"].get("errors"))[:300]])
+    elif args.dry:
+        started = ha_started()
+        result["steps"].append(f"would back up and recreate {CONTAINER} ({' '.join(container_image())})")
+        result.update(verify(armed, started, pre_ids))
+    else:
+        ARMED.rename(RUNS.parent / f"armed-{stamp}.json")
+        compose_copy, tarball = backup(stamp)
+        result["backups"] = [compose_copy, tarball]
+        image_ref, old_id = container_image()
+        result["image_before"] = old_id
+        started = now()
+        recreate()
+        if not wait_up(UP_TIMEOUT):
+            result.update(ok=False, failures=[f"HA not RUNNING {UP_TIMEOUT // 60} min after recreate"],
+                          rollback=rollback(armed, tarball, image_ref) if armed.get("core") else "not attempted")
+        else:
+            result["up_at"] = now().isoformat(timespec="seconds")
+            result["image_after"] = container_image()[1]
+            settle(started)
+            result.update(verify(armed, started, pre_ids))
+
+
+def cmd_arm(args):
+    STATE.mkdir(parents=True, exist_ok=True)
+    armed = {"touched": [d for d in args.touched.split(",") if d], "core": args.core,
+             "rollback_image": args.rollback_image, "note": args.note, "session": args.session,
+             "armed_at": now().isoformat(timespec="seconds")}
+    if args.core and not args.rollback_image:
+        sys.exit("--core needs --rollback-image (the tag of the image running now)")
+    ARMED.write_text(json.dumps(armed, indent=1) + "\n")
+    print(ARMED.read_text(), end="")
+
+
+def cmd_status(_args):
+    print("armed:", ARMED.read_text() if ARMED.exists() else "no")
+    print("last:", LAST.read_text() if LAST.exists() else "none")
+
+
+def main():
+    if os.geteuid() != 0:
+        sys.exit("run as root")
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    a = sub.add_parser("arm")
+    a.add_argument("--touched", required=True, help="comma-separated integration domains")
+    a.add_argument("--core", help="HA version the recreate must bring up")
+    a.add_argument("--rollback-image", help="local tag of the image running now, e.g. ha-rollback:2026.11.1")
+    a.add_argument("--note", default="")
+    a.add_argument("--session", default="", help="how to reopen the arming conversation")
+    r = sub.add_parser("run")
+    r.add_argument("--dry", action="store_true", help="evaluate window and checks only, change nothing")
+    sub.add_parser("status")
+    args = ap.parse_args()
+    return {"arm": cmd_arm, "run": cmd_run, "status": cmd_status}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
