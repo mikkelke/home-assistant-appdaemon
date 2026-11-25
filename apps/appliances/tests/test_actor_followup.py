@@ -1301,3 +1301,50 @@ class ConfirmationStarter(unittest.TestCase):
                               'self._listen_confirmer(self.confirmed_programme_entity, "dishwasher_start")')):
             with self.subTest(module=module):
                 self.assertIn(call, (here / module).read_text())
+
+
+class FastBleStarter(unittest.TestCase):
+    """A ble_start name, its contradictions, and the follow-up that waits out a pending window."""
+
+    def test_a_confirmation_by_someone_else_replaces_a_ble_start_name_and_is_logged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host(tmp)
+            host._cycle_actor = verdict("mikkel", "ble_start")
+            host.answers = [tap("kristine")]
+
+            host._on_confirmer("state_changed", confirm_event("Bomuld"), {"actor_event": "washer_start"})
+
+            self.assertEqual((host._cycle_actor["person"], host._cycle_actor["method"]), ("kristine", "programme_confirmed"))
+            self.assertIn(("WARNING", "Fast BLE name mikkel contradicted by programme_confirmed kristine"), host.logs)
+
+    def test_a_confirmation_by_the_same_person_keeps_the_ble_start_name_quietly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host(tmp)
+            host._cycle_actor = verdict("kristine", "ble_start")
+            host.answers = [tap("kristine")]
+
+            host._on_confirmer("state_changed", confirm_event("Bomuld"), {"actor_event": "washer_start"})
+
+            self.assertEqual(host._cycle_actor["method"], "ble_start")
+            self.assertFalse([m for _, m in host.logs if m.startswith("Fast BLE name")])
+
+    def test_another_emptier_is_logged_as_a_contradiction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host(tmp)
+            host.ACTOR_PAIRED = True
+            host._cycle_actor = verdict("mikkel", "ble_start")
+
+            host._pair_emptier(verdict("claudia", "ble_proximity"), saved=False)
+
+            self.assertIn(("WARNING", "Fast BLE name mikkel contradicted by emptier claudia"), host.logs)
+
+    def test_a_follow_up_answer_still_pending_arms_the_next_follow_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Host(tmp)
+            host.answers = [verdict(pending_until=PENDING)]
+
+            host._actor_followup_start({"actor_event": "washer_start", "actor_anchor": ANCHOR, "actor_cycle_id": "cycle-1"})
+
+            (callback, delay, kwargs), = host.timers
+            self.assertEqual(callback.__func__, af.ActorFollowupMixin._actor_followup_start)
+            self.assertEqual(delay, 375)

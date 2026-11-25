@@ -145,6 +145,15 @@ _ROOM_MARGIN_SECONDS = 30
 _BLE_SESSION_MAX_SECONDS = 900
 _BLE_PAD_SECONDS = 30
 
+# Starts named from the phones at the machine as its door closes (_by_ble_start), ahead of room
+# elimination. The dishwasher is left out: its kitchen is shared, so being near it names nobody.
+_BLE_START_EVENTS = ("washer_start", "dryer_start")
+_BLE_START_BEFORE_SECONDS = 30
+_BLE_START_AFTER_SECONDS = 10
+_BLE_START_NEAR_M = 3.5
+_BLE_START_NEAR_READINGS = 2
+_BLE_START_CLEAR_M = 6.0
+
 
 class ActorAttribution(hass.Hass):
     # Class-level defaults so attribute()/probe() are well-defined even before
@@ -260,8 +269,12 @@ class ActorAttribution(hass.Hass):
             # can still tell them apart chain here, strongest evidence first, each only
             # while the verdict is still multi_occupant.
             multi = result
-            result = self._by_room_elimination(event, anchor, evaluated_at, multi)
-            result = self._by_ble(event, anchor, evaluated_at, multi, result)
+            if event in _BLE_START_EVENTS:
+                result = (self._by_ble_start(event, anchor, evaluated_at, multi)
+                          or self._by_room_elimination(event, anchor, evaluated_at, multi))
+            else:
+                result = self._by_room_elimination(event, anchor, evaluated_at, multi)
+                result = self._by_ble(event, anchor, evaluated_at, multi, result)
         if self._door_state in _UNOBSERVABLE_STATES:
             # The door guard itself is blind, so rule 4 below could have missed a real
             # open edge. Per spec we still attribute - the absence of a recorded edge is
@@ -443,6 +456,48 @@ class ActorAttribution(hass.Hass):
         return {
             "person": near[0],
             "method": "ble_proximity",
+            "reason": None,
+            "people_home": sorted(home),
+            "anchor": self._iso(anchor),
+            "evaluated_at": self._iso(evaluated_at),
+            "version": _VERSION,
+        }
+
+    def _by_ble_start(self, event, anchor, evaluated_at, multi):
+        """A start on a multi_occupant verdict, from the phones at the machine as its door closed
+        (anchor): readings recorded from _BLE_START_BEFORE_SECONDS before it to
+        _BLE_START_AFTER_SECONDS after it. A home witness with at least _BLE_START_NEAR_READINGS
+        readings within _BLE_START_NEAR_M is named (method ble_start) when no other home witness
+        read within _BLE_START_CLEAR_M; a witness without readings does not block. Neither the
+        room hold nor the named person's room is consulted. Before the window has closed the
+        verdict is multi with pending_until its end; otherwise None, and room elimination decides."""
+        appliance = event.split("_", 1)[0]
+        home = set(multi["people_home"])
+        witnesses = [row for row in self.ble_witnesses
+                     if row.get("appliance") == appliance and row.get("person") in home]
+        if not witnesses:
+            return None
+        lo = anchor - timedelta(seconds=_BLE_START_BEFORE_SECONDS)
+        hi = anchor + timedelta(seconds=_BLE_START_AFTER_SECONDS)
+        if evaluated_at < hi:
+            return dict(multi, pending_until=self._iso_up(hi))
+        readings = {}
+        for row in witnesses:
+            for ts, state in self._ble_log.get(row.get("distance"), ()):
+                if lo <= ts <= hi:
+                    try:
+                        readings.setdefault(row["person"], []).append(float(state))
+                    except (TypeError, ValueError):
+                        continue
+        near = [person for person, metres in readings.items()
+                if sum(m <= _BLE_START_NEAR_M for m in metres) >= _BLE_START_NEAR_READINGS]
+        if len(near) != 1:
+            return None
+        if any(m <= _BLE_START_CLEAR_M for person, metres in readings.items() if person != near[0] for m in metres):
+            return None
+        return {
+            "person": near[0],
+            "method": "ble_start",
             "reason": None,
             "people_home": sorted(home),
             "anchor": self._iso(anchor),

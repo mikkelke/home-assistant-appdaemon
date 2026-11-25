@@ -183,6 +183,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             "notification_sent": lambda: self.notification_sent,
             "started_by": lambda: (self._cycle_actor or {}).get("person"),
             "started_by_method": lambda: (self._cycle_actor or {}).get("method"),
+            "started_by_anchor": lambda: (self._cycle_actor or {}).get("anchor"),
         }
 
     def initialize(self):
@@ -2854,6 +2855,7 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             "run_time_minutes": None,
             "started_by": None,
             "started_by_method": None,
+            "started_by_anchor": None,
         }
         try:
             full = self.get_state(self.state_entity, attribute="all") or {}
@@ -3642,6 +3644,8 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         result = self._unknown_actor("restored_from_entity")
         result["person"] = attrs.get("started_by") or None
         result["method"] = attrs.get("started_by_method") or "unknown"
+        if attrs.get("started_by_anchor"):
+            result["anchor"] = attrs["started_by_anchor"]
         return result
 
     def _restored_cycle_actor(self) -> dict:
@@ -3797,4 +3801,5 @@ class DishwasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         return {
             "started_by": actor.get("person") or "",
             "started_by_method": actor.get("method") or "unknown",
+            "started_by_anchor": actor.get("anchor") or "",
         }

@@ -29,6 +29,10 @@ never replaces a name already held. A monitor calls _listen_confirmer for its pr
 A host with ACTOR_PAIRED (washer, dryer) takes whoever loaded the machine to be the one who empties
 it, and the other way round: a final verdict that names nobody gets the other side's name, method
 same_as_starter or same_as_emptier. A pending emptying verdict waits for its follow-up first.
+
+A starter named by ble_start (the phones at the machine as its door closed) is the one name a
+programme confirmation replaces. Whenever a programme confirmation or an emptier names someone
+else, the line "Fast BLE name <x> contradicted by <method> <y>" is logged.
 """
 
 import json
@@ -48,6 +52,13 @@ class ActorFollowupMixin:
     # Past pending_until, so the question is asked after the instant it names and not on it.
     ACTOR_FOLLOWUP_SLACK_S = 5
     ACTOR_PAIRED = False
+
+    def _check_fast_name(self, start, person, method):
+        """Log when `start`, a starter verdict, came from ble_start and `person` (named by `method`)
+        is someone else."""
+        start = start or {}
+        if start.get("method") == "ble_start" and person and start.get("person") and person != start["person"]:
+            self.log(f"Fast BLE name {start['person']} contradicted by {method} {person}", level="WARNING")
 
     def _paired_actor(self, verdict, person, method):
         """`verdict` naming `person` by `method` when it names nobody and `person` was home for it,
@@ -72,6 +83,8 @@ class ActorFollowupMixin:
         the emptier, or None. That one is also set as _cycle_actor."""
         named = (self._cycle_actor or {}).get("person")
         record = self._unemptied_record(record_ts) if saved and not named else None
+        start = self._cycle_actor if named else ((record or {}).get("attribution") or {}).get("start")
+        self._check_fast_name(start, (actor_empty or {}).get("person"), "emptier")
         starter = (self._cycle_actor or {}).get("person") or (record or {}).get("started_by")
         actor_empty = actor_empty or {}
         if actor_empty.get("pending_until"):
@@ -151,6 +164,8 @@ class ActorFollowupMixin:
                     "started_by": verdict["person"],
                     "started_by_method": verdict.get("method") or "unknown",
                 })
+            else:
+                self._follow_up_actor("start", verdict, kwargs.get("actor_event"))
         except Exception as e:
             self.log(f"Start attribution follow-up failed: {e}", level="WARNING")
 
@@ -193,7 +208,9 @@ class ActorFollowupMixin:
             if verdict.get("method") != "dashboard_action" or not verdict.get("person"):
                 return
             if self.state in ("Running", "Paused"):
-                if (self._cycle_actor or {}).get("person"):
+                self._check_fast_name(self._cycle_actor, verdict["person"], "programme_confirmed")
+                held = self._cycle_actor or {}
+                if held.get("person") and (held.get("method") != "ble_start" or held["person"] == verdict["person"]):
                     return
                 anchor = (self._cycle_actor or {}).get("anchor") or verdict.get("anchor")
                 self._cycle_actor = dict(verdict, method="programme_confirmed", anchor=anchor)
@@ -219,9 +236,12 @@ class ActorFollowupMixin:
             return False
         cycles = data.get("cycles") if isinstance(data, dict) else None
         record = cycles[-1] if isinstance(cycles, list) and cycles else None
-        if not isinstance(record, dict) or record.get("started_by"):
+        if not isinstance(record, dict):
             return False
         attribution = record.get("attribution") if isinstance(record.get("attribution"), dict) else {}
+        if record.get("started_by"):
+            self._check_fast_name(attribution.get("start"), verdict.get("person"), "programme_confirmed")
+            return False
         anchor = (attribution.get("start") or {}).get("anchor") or verdict.get("anchor")
         attribution["start"] = dict(verdict, anchor=anchor)
         record["attribution"] = attribution
@@ -262,6 +282,7 @@ class ActorFollowupMixin:
         if not isinstance(empty, dict) or empty.get("anchor") != anchor or record.get("emptied_by") is not None:
             self.log("Emptied follow-up: the newest record is not this emptying's - leaving it", level="DEBUG")
             return None
+        self._check_fast_name(attribution.get("start"), verdict.get("person"), "emptier")
         verdict = self._paired_actor(verdict, record.get("started_by"), "same_as_starter")
         record["emptied_by"] = verdict.get("person")
         attribution["empty"] = verdict

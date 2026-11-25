@@ -529,6 +529,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             "energy_at_start": lambda: self.energy_start,
             "started_by": lambda: (self._cycle_actor or {}).get("person") or "",
             "started_by_method": lambda: (self._cycle_actor or {}).get("method") or "unknown",
+            "started_by_anchor": lambda: (self._cycle_actor or {}).get("anchor") or "",
             "session_cost_kr": lambda: self._session_cost_kr,
             "detected_programme": lambda: self.detected_programme,
             "detected_temperature": lambda: self.detected_temperature,
@@ -1436,6 +1437,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             ("energy_at_start", "energy_at_start"),
             ("started_by", "started_by"),
             ("started_by_method", "started_by_method"),
+            ("started_by_anchor", "started_by_anchor"),
             ("session_cost_kr", "session_cost_kr"),
             ("detected_programme", "detected_programme"),
             ("detected_temperature", "detected_temperature"),
@@ -1653,7 +1655,8 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             started_by = attrs.get("started_by")
             started_by_method = attrs.get("started_by_method")
             self._cycle_actor = self._cycle_actor_from_state_attrs(
-                {"started_by": started_by, "started_by_method": started_by_method}
+                {"started_by": started_by, "started_by_method": started_by_method,
+                 "started_by_anchor": attrs.get("started_by_anchor")}
             )
             if self._cycle_actor.get("person"):
                 self.log(f"Restored started_by: {self._cycle_actor['person']}", level="DEBUG")
@@ -2736,6 +2739,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                 # next cycle's _begin_running_cycle re-attributes from scratch.
                 "started_by": "",
                 "started_by_method": "",
+                "started_by_anchor": "",
                 "activity_seen": "",
                 # Persist so after restart we can clamp restored start_time (no start before last Off/door close)
                 "last_door_closed_at": self._format_local(self.last_door_closed_at) if self.last_door_closed_at else "",
@@ -3356,6 +3360,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             # _recover_from_false_unemptied revert re-seeded self._cycle_actor mid-cycle.
             attributes["started_by"] = (self._cycle_actor or {}).get("person") or ""
             attributes["started_by_method"] = (self._cycle_actor or {}).get("method") or "unknown"
+            attributes["started_by_anchor"] = (self._cycle_actor or {}).get("anchor") or ""
             if energy_used > 0:
                 attributes["energy_used"] = round(energy_used, 3)
             if spin_rpm is not None:
@@ -4070,6 +4075,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
                         level="INFO",
                     )
         self._cycle_actor = self._attribute("washer_start", at=attribution_anchor)
+        self.log(f"Start attribution: {self._cycle_actor}", level="INFO")
         self.start_time = self._now_utc()
         self._start_time_source = "live"  # directly observed the start - see _START_TIME_SOURCE_RANK
         self._entity_recreated_at = None  # observed a real start; any earlier recreation stamp is now irrelevant
@@ -4148,6 +4154,7 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         # detected_programme's placeholder above.
         attrs["started_by"] = self._cycle_actor.get("person") or ""
         attrs["started_by_method"] = self._cycle_actor.get("method") or "unknown"
+        attrs["started_by_anchor"] = self._cycle_actor.get("anchor") or ""
         if self.energy_start is not None:
             attrs["energy_at_start"] = self.energy_start
         if self.last_door_closed_at:
@@ -5040,6 +5047,8 @@ class WasherMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         result = self._unknown_actor("restored_from_entity")
         result["person"] = person
         result["method"] = method or "unknown"
+        if attrs.get("started_by_anchor"):
+            result["anchor"] = attrs["started_by_anchor"]
         return result
 
     def _attribute(self, event, at=None, user_id=None) -> dict:

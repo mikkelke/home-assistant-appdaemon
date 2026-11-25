@@ -1705,8 +1705,8 @@ class BleProximityTests(unittest.TestCase):
     NEAR = ble((-3600, "13.2"), (-90, "2.4"), (-30, "1.1"))
     IN_ROOM = ble((-3600, "Bedroom"), (-100, "Guest bathroom"))
 
-    def test_near_in_the_appliance_area_during_the_loading_session_names_the_witness(self):
-        result = make_ble_app(self.NEAR, self.IN_ROOM).attribute("washer_start", at=BASE)
+    def test_near_in_the_appliance_area_during_the_door_session_names_the_witness(self):
+        result = make_ble_app(self.NEAR, self.IN_ROOM).attribute("washer_emptied", at=BASE)
 
         self.assertEqual(result["person"], "mikkel")
         self.assertEqual(result["method"], "ble_proximity")
@@ -1743,7 +1743,7 @@ class BleProximityTests(unittest.TestCase):
         self.assertIsNone(result["person"])
 
     def test_before_the_settle_instant_it_is_pending_even_with_two_candidates(self):
-        result = make_ble_app(self.NEAR, self.IN_ROOM, clock=60).attribute("washer_start", at=BASE)
+        result = make_ble_app(self.NEAR, self.IN_ROOM, clock=60).attribute("washer_emptied", at=BASE)
 
         self.assertIsNone(result["person"])
         self.assertEqual(result["reason"], "multi_occupant")
@@ -1784,3 +1784,87 @@ class BleProximityTests(unittest.TestCase):
         app = make_ble_app(ble(), ble())
 
         self.assertEqual(app._ble_entities(), [AREA, WASHER["door"], WASHER["distance"]])
+
+
+def witness(person, appliance="washer"):
+    return {"person": person, "appliance": appliance, "area_sensor": f"sensor.{person}_ble_area",
+            "area": "Guest bathroom", "door": f"binary_sensor.{appliance}_door_contact",
+            "distance": f"sensor.{person}_ble_distance_to_{appliance}_plug", "max_m": 5}
+
+
+def make_start_app(distances, rooms=None, clock=60, home=("mikkel", "claudia", "kristine"), appliance="washer"):
+    """Multi-occupant app with the anchor (door close) at BASE and one distance log per person."""
+    app = make_room_app(rooms or {}, home=home, clock=clock)
+    app.ble_witnesses = [witness(p, appliance) for p in ("mikkel", "claudia", "kristine")]
+    app._ble_log = {f"sensor.{p}_ble_distance_to_{appliance}_plug": rows_ for p, rows_ in distances.items()}
+    return app
+
+
+class BleStartTests(unittest.TestCase):
+    """Washer and dryer starts named from the phones at the machine as the door closed."""
+
+    def test_the_only_phone_near_at_the_close_is_named_at_once(self):
+        result = make_start_app({"mikkel": ble((-20, "2.2"), (5, "1.9")),
+                                 "claudia": ble((-15, "11.7"))}).attribute("washer_start", at=BASE)
+
+        self.assertEqual(result["person"], "mikkel")
+        self.assertEqual(result["method"], "ble_start")
+        self.assertNotIn("pending_until", result)
+
+    def test_a_housemate_at_the_machine_before_the_window_does_not_count(self):
+        claudia = ble((-111, "1.5"), (-90, "1.8"), (-58, "2.5"), (-40, "9.0"))
+        result = make_start_app({"mikkel": ble((-25, "2.3"), (-5, "2.2")),
+                                 "claudia": claudia}).attribute("washer_start", at=BASE)
+
+        self.assertEqual(result["person"], "mikkel")
+
+    def test_a_housemate_near_inside_the_window_blocks_the_name(self):
+        result = make_start_app({"mikkel": ble((-25, "2.3"), (-5, "2.2")),
+                                 "claudia": ble((-28, "5.4"))}).attribute("washer_start", at=BASE)
+
+        self.assertIsNone(result["person"])
+
+    def test_a_housemate_at_5_4_m_a_minute_before_does_not_block_the_dryer(self):
+        result = make_start_app({"mikkel": ble((-20, "2.3"), (2, "2.0")),
+                                 "kristine": ble((-53, "5.4"))}, appliance="dryer").attribute("dryer_start", at=BASE)
+
+        self.assertEqual(result["person"], "mikkel")
+        self.assertEqual(result["method"], "ble_start")
+
+    def test_one_near_reading_is_not_enough(self):
+        result = make_start_app({"mikkel": ble((-20, "2.3"), (5, "4.0"))}).attribute("washer_start", at=BASE)
+
+        self.assertIsNone(result["person"])
+
+    def test_two_phones_near_name_nobody(self):
+        result = make_start_app({"mikkel": ble((-20, "2.3"), (5, "2.0")),
+                                 "claudia": ble((-10, "1.5"), (0, "1.6"))}).attribute("washer_start", at=BASE)
+
+        self.assertIsNone(result["person"])
+
+    def test_the_named_persons_room_is_not_consulted(self):
+        result = make_start_app({"mikkel": ble((-20, "2.3"), (5, "2.0"))},
+                                rooms={"mikkel": rows((-3600, True))}).attribute("washer_start", at=BASE)
+
+        self.assertEqual(result["person"], "mikkel")
+
+    def test_before_the_window_closes_it_is_pending_until_its_end(self):
+        result = make_start_app({"mikkel": ble((-20, "2.3"))}, clock=4).attribute("washer_start", at=BASE)
+
+        self.assertIsNone(result["person"])
+        self.assertEqual(result["pending_until"], "2026-07-27T12:00:10Z")
+
+    def test_without_a_name_room_elimination_still_decides_after_its_hold(self):
+        rooms = {"claudia": rows((-3600, True)), "kristine": rows((-3600, True))}
+        early = make_start_app({}, rooms=rooms).attribute("washer_start", at=BASE)
+        late = make_start_app({}, rooms=rooms, clock=420).attribute("washer_start", at=BASE)
+
+        self.assertEqual(early["pending_until"], "2026-07-27T12:06:30Z")
+        self.assertEqual((late["person"], late["method"]), ("mikkel", "room_elimination"))
+
+    def test_the_dishwasher_keeps_the_session_rule(self):
+        result = make_start_app({"mikkel": ble((-20, "1.0"), (5, "1.0"))},
+                                appliance="dishwasher").attribute("dishwasher_start", at=BASE)
+
+        self.assertNotEqual(result.get("method"), "ble_start")
+

@@ -543,6 +543,26 @@ class ReloadRestore(unittest.TestCase):
             self.assertEqual(published(second)["started_by"], "kristine")
             self.assertEqual(published(second)["started_by_method"], "sole_occupant")
 
+    def test_the_starters_anchor_is_the_door_close_after_a_reload_and_an_ha_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clock = Clock(T0)
+            actor = make_actor(clock, [(T0 - timedelta(hours=2), {"kristine"})])
+            first = make_app(tmp, clock, actor)
+            first.initialize()
+            load_and_start(first, clock, close_at=T0)
+            anchor = first._cycle_actor["anchor"]
+
+            clock.now += timedelta(minutes=5)
+            reloaded = make_app(tmp, clock, actor, sensor_state="Running",
+                                sensor_attrs=published(first), power_w="900", energy_kwh="10.0")
+            reloaded.initialize()
+            clock.now += timedelta(minutes=5)
+            restarted = make_app(tmp, clock, actor, sensor_state=None, power_w="900")
+            restarted.initialize()
+
+            self.assertEqual(reloaded._cycle_actor["anchor"], anchor)
+            self.assertEqual(restarted._cycle_actor["anchor"], anchor)
+
     def test_starter_survives_a_reload_while_unemptied_for_the_emptied_publish(self):
         with tempfile.TemporaryDirectory() as tmp:
             clock = Clock(T0)

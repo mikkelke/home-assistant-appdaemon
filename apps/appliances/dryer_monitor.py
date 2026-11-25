@@ -128,6 +128,7 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
             "notification_sent": lambda: self.notification_sent,
             "started_by": lambda: (self._cycle_actor or {}).get("person"),
             "started_by_method": lambda: (self._cycle_actor or {}).get("method"),
+            "started_by_anchor": lambda: (self._cycle_actor or {}).get("anchor"),
         }
 
     def initialize(self):
@@ -2509,6 +2510,8 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         result = self._unknown_actor("restored_from_entity")
         result["person"] = attrs.get("started_by") or None
         result["method"] = attrs.get("started_by_method") or "unknown"
+        if attrs.get("started_by_anchor"):
+            result["anchor"] = attrs["started_by_anchor"]
         return result
 
     def _restored_cycle_actor(self) -> dict:
@@ -2557,6 +2560,7 @@ class DryerMonitor(ActorFollowupMixin, CyclePersistenceMixin, hass.Hass):
         return {
             "started_by": actor.get("person") or "",
             "started_by_method": actor.get("method") or "unknown",
+            "started_by_anchor": actor.get("anchor") or "",
         }
 
     def _patch_cycle_record(self, ts, updates):

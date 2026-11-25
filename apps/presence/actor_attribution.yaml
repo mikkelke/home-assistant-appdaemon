@@ -51,7 +51,8 @@ ActorAttribution:
   # One row per witness and appliance (the event's prefix): the phone's Bermuda area sensor and
   # the area the appliance sits in, its door contact, the phone's distance to its scanner and the
   # max distance. A listed resident near the machine in its area during the door session is named
-  # when 2+ are home (method ble_proximity).
+  # when 2+ are home (method ble_proximity). A washer or dryer start is decided instead from the
+  # readings around the door close alone (method ble_start, see _by_ble_start).
   ble_witnesses:
     - {person: mikkel, appliance: washer, area_sensor: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area, area: Guest bathroom, door: binary_sensor.washer_door_contact, distance: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_distance_to_washer_plug, max_m: 5}
     - {person: mikkel, appliance: dryer, area_sensor: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area, area: Guest bathroom, door: binary_sensor.dryer_door_contact, distance: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_distance_to_dryer_plug, max_m: 5}

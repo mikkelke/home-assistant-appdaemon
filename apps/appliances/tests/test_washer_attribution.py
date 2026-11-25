@@ -178,6 +178,12 @@ class CycleActorFromStateAttrs(unittest.TestCase):
         self.assertIsNone(result["person"])
         self.assertEqual(result["method"], "unknown")
 
+    def test_the_persisted_anchor_is_kept(self):
+        app = _base_app()
+        result = app._cycle_actor_from_state_attrs({"started_by": "mikkel", "started_by_method": "ble_start",
+                                                    "started_by_anchor": "2026-11-24T11:46:19Z"})
+        self.assertEqual(result["anchor"], "2026-11-24T11:46:19Z")
+
     def test_missing_keys_treated_as_missing(self):
         app = _base_app()
         result = app._cycle_actor_from_state_attrs({})
