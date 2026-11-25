@@ -1,0 +1,22 @@
+# PriceForecast - sensor.electricity_price_forecast: Stromligning's price forecast for the hours the price
+# entity has no published price for, priced the way that entity prices its own hours. See price_forecast.py.
+PriceForecast:
+  module: price_forecast
+  class: PriceForecast
+
+  entity: sensor.electricity_price_forecast
+  price_entity: sensor.energi_data_service
+
+  # Local times. 12:40 is the last look before tomorrow's prices are published; a refresh also follows
+  # tomorrow_valid turning true on the price entity.
+  refresh_times: ["06:45:00", "12:40:00", "15:30:00", "20:45:00"]
+  retry_minutes: 15
+
+  # What the price entity adds to the spot price: the supplier's addon (its cost template, kr/kWh ex VAT) and VAT.
+  supplier_addon: 0.012
+  vat: 0.25
+
+  price_area: DK2
+  # Stromligning's supplierId is the grid company, productId the retail product.
+  stromligning_grid: radius_c
+  stromligning_product: vindstoed_vestroem

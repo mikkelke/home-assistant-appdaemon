@@ -3,8 +3,8 @@
 Reads sensor.appliance_run_profiles, sensor.energi_data_service and each appliance's
 state sensor. The price entity is the grid flow's entity_energy_price in HA Energy
 preferences, also used by the dashboard; price_entity may override it. Prices come
-from raw_today, raw_tomorrow when tomorrow_valid is true, and forecast. Forecast
-hours join the timeline but never choose a start, matching assembleAppliancePlan.
+from raw_today and raw_tomorrow when tomorrow_valid is true. Forecast hours never
+choose a start, matching assembleAppliancePlan, so none are read.
 
 Entity contract, for key washer|dishwasher:
   sensor.<key>_best_start: device_class timestamp; recommended power-onset UTC ISO
@@ -66,7 +66,7 @@ class StartAdvice(hass.Hass):
                 model.parse_raw_points(attrs.get("raw_today")),
                 model.parse_raw_points(attrs.get("raw_tomorrow")),
                 attrs.get("tomorrow_valid") is True,
-                model.parse_raw_points(attrs.get("forecast")))
+                None)
             now_ms = int(time.time() * 1000)
             for key, entity in self.appliances.items():
                 result = model.build_advice(key, profiles, timeline, now_ms, self.get_state(entity))
