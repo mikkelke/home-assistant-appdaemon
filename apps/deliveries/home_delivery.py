@@ -86,6 +86,7 @@ COURIER_AFTER_S = 1800
 
 PARCELS_INCOMING = "sensor.parcel_aggregator_incoming_parcels"
 PARCELS_DELIVERED = "sensor.parcel_aggregator_delivered_parcels"
+AIRMEE_PARCEL_PREFIX = "sensor.airmee_parcel_"
 PARCEL_NOT_YET_OUT = ("registered", "in_transit")
 PARCEL_ARRIVING_S = 900
 CARRIER_BRANDS = {"posten_bring": "Bring"}
@@ -446,9 +447,29 @@ def without_amazon_copies(lists):
     return result
 
 
-def parcel_delivery(parcel, now):
+def airmee_etas(states):
+    """{barcode: drop-off ETA in seconds since the epoch} from the Airmee parcel sensors among `states` (entity id
+    to state dict), read from the raw `dropoff_eta` the aggregator leaves out: decimal seconds as a string."""
+    etas = {}
+    for entity_id, full in states.items():
+        if not entity_id.startswith(AIRMEE_PARCEL_PREFIX):
+            continue
+        attrs = attributes(full)
+        raw, barcode = attrs.get("raw"), tidy(attrs.get("barcode"))
+        value = raw.get("dropoff_eta") if isinstance(raw, dict) else None
+        try:
+            eta = float(value)
+        except (TypeError, ValueError):
+            continue
+        if barcode and eta > 0:
+            etas[barcode] = eta
+    return etas
+
+
+def parcel_delivery(parcel, now, etas=None):
     """The Delivery for one Parcel Aggregator parcel; None unless it matters today: out for delivery, registered
-    or in transit with an expected time today, or delivered. Arriving means the expected time is within
+    or in transit with an expected time today, or delivered. `etas` gives the carrier's own ETA by barcode,
+    kept next to the window. Arriving means the expected time (that ETA, else the window's start) is within
     PARCEL_ARRIVING_S or past. A delivered parcel ends when its carrier says; the ledger dates it otherwise."""
     identity = parcel_identity(parcel)
     if identity is None:
@@ -457,9 +478,13 @@ def parcel_delivery(parcel, now):
     start, end = epoch(parcel.get("planned_from")), epoch(parcel.get("planned_to"))
     window = start is not None and end is not None and start < end
     times = {"window_start": start, "window_end": end} if window else {"eta": start}
+    eta = (etas or {}).get(barcode)
+    if eta is not None:
+        times["eta"] = eta
     status, ended_at = parcel.get("status"), None
     if status == "out_for_delivery":
-        soon = start is not None and start - now <= PARCEL_ARRIVING_S
+        expected = times.get("eta") or start
+        soon = expected is not None and expected - now <= PARCEL_ARRIVING_S
         stage = "arriving" if soon else "on_the_way"
     elif status in PARCEL_NOT_YET_OUT and start is not None and local_day(start) == local_day(now):
         stage = "preparing"
@@ -471,13 +496,13 @@ def parcel_delivery(parcel, now):
                     ended_at=ended_at, carrier=carrier, **times)
 
 
-def parcel_deliveries(lists, now):
+def parcel_deliveries(lists, now, etas=None):
     """Deliveries from the aggregator's parcel lists. A parcel in two lists is delivered if either says so:
     that end is final."""
     found = {}
     for parcels in lists:
         for parcel in parcels:
-            delivery = parcel_delivery(parcel, now)
+            delivery = parcel_delivery(parcel, now, etas)
             if delivery and (delivery.id not in found or delivery.stage == "delivered"):
                 found[delivery.id] = delivery
     return list(found.values())
@@ -611,13 +636,13 @@ def parcel_sentence(delivery, now):
     parcel = f"{article(carrier)} {carrier} parcel"
     window = window_text(delivery.window_start, delivery.window_end, "and")
     when = None
-    if window:
-        when = f"between {window}"
-    elif delivery.eta is not None:
+    if delivery.eta is not None:
         when = f"around {clock(delivery.eta, whole=True)}"
+    elif window:
+        when = f"between {window}"
     if delivery.stage == "preparing":
         return f"{parcel} is expected {when or 'today'}."
-    due = delivery.window_end if delivery.window_end is not None else delivery.eta
+    due = delivery.eta if delivery.eta is not None else delivery.window_end
     if due is not None and due <= now:
         return f"{parcel} should be there any moment now."
     return f"{parcel} is out for delivery" + (f", expected {when}." if when else ".")
@@ -1032,7 +1057,8 @@ class HomeDelivery(hass.Hass):
             lists.append(parcels if isinstance(parcels, list) else [])
         lists = without_amazon_copies(lists)
         self._incoming = lists[0]
-        return parcel_deliveries(lists, now)
+        sensors = self.get_state("sensor")
+        return parcel_deliveries(lists, now, airmee_etas(sensors if isinstance(sensors, dict) else {}))
 
     def _poll_nemlig(self):
         now = self.get_now().timestamp()

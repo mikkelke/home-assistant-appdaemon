@@ -901,6 +901,35 @@ class AmazonCopiesTests(unittest.TestCase):
         self.assertEqual(hd.without_amazon_copies(lists), lists)
 
 
+class AirmeeEtaTests(unittest.TestCase):
+    @staticmethod
+    def sensor(barcode, eta):
+        return {"state": "out_for_delivery", "attributes": {"barcode": barcode, "raw": {"dropoff_eta": eta}}}
+
+    def test_the_raw_dropoff_eta_of_each_airmee_parcel(self):
+        states = {"sensor.airmee_parcel_86f26ce6": self.sensor("86f26ce6", "1795466224"),
+                  "sensor.airmee_parcel_x": self.sensor("x", None),
+                  "sensor.airmee_parcel_y": self.sensor("y", "soon"),
+                  "sensor.postnord_parcel_z": self.sensor("z", "1795466224"),
+                  "sensor.airmee_parcel_w": {"state": "unavailable"}}
+        self.assertEqual(hd.airmee_etas(states), {"86f26ce6": 1795466224.0})
+
+    def test_the_eta_sits_beside_the_window_and_decides_arriving(self):
+        airmee = parcel(carrier="Airmee", barcode="86f26ce6", sender="Amazon", start=at(-40), end=at(260))
+        [d] = hd.parcel_deliveries([[airmee]], NOW, {"86f26ce6": at(237)})
+        self.assertEqual((d.eta, d.window_start, d.window_end, d.stage), (at(237), at(-40), at(260), "on_the_way"))
+        [d] = hd.parcel_deliveries([[airmee]], NOW, {"86f26ce6": at(10)})
+        self.assertEqual(d.stage, "arriving")
+        [d] = hd.parcel_deliveries([[airmee]], NOW)
+        self.assertEqual((d.eta, d.stage), (None, "arriving"))
+
+    def test_speech_gives_the_eta_before_the_window(self):
+        airmee = parcel(carrier="Airmee", barcode="b", start=local_time(10, 17), end=local_time(10, 22))
+        [d] = hd.parcel_deliveries([[airmee]], local_time(10, 17, 40), {"b": local_time(10, 21, 37)})
+        self.assertEqual(hd.parcel_sentence(d, local_time(10, 17, 40)),
+                         "An Airmee parcel is out for delivery, expected around 9:37 PM.")
+
+
 class ParcelUpcomingTests(unittest.TestCase):
     def upcoming(self, *parcels, listed=()):
         return hd.upcoming_parcels(list(parcels), set(listed))
