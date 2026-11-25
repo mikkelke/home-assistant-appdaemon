@@ -1,4 +1,4 @@
-# tests/test_ble_locator.py - BleLocator: the likelihood and the filter, the device offset, when the
+# tests/test_ble_locator.py - BleLocator: the likelihood and the filter, the room offset, when the
 # answer is Bermuda's area, what a failed dump leaves, the model file and the raw readings log.
 # The app runs through its real initialize() and tick on a fake clock (T0 plus the seconds a test
 # gives; the monotonic clock the dump's stamps are on is MONO0 plus the same), a scheduler that only
@@ -123,7 +123,7 @@ def make_app(args=None, devices=(ANNA,), model=True, areas=None, world=None):
     records into app.published and a bermuda.dump_devices that answers app.dump()."""
     app = bl.BleLocator.__new__(bl.BleLocator)
     app.args = {"model_file": new_path("model.json"), "log_file": new_path("log.jsonl"),
-                "state_file": new_path("state.json"), "readings_file": new_path("readings.jsonl"),
+                "readings_file": new_path("readings.jsonl"),
                 "devices": [dict(d) for d in devices], **(args or {})}
     if model:
         write_model(app.args["model_file"], None if model is True else model)
@@ -218,9 +218,11 @@ class Likelihood(unittest.TestCase):
         self.model = bl.Model(model_doc())
 
     def test_a_scanner_that_is_not_heard_adds_nothing_to_any_room(self):
-        lls = self.model.log_likelihoods({S1: -50.0, S2: -70.0})
+        heard = ((S1, -50.0), (S2, -70.0))
+        lls = self.model.log_likelihoods(dict(heard))
         for room in ROOMS:
-            expected = sum(-0.5 * ((db - MEANS[room][s]) / SD) ** 2 - math.log(SD) for s, db in ((S1, -50.0), (S2, -70.0)))
+            offset = sum(db - MEANS[room][s] for s, db in heard) / len(heard)
+            expected = sum(-0.5 * ((db - offset - MEANS[room][s]) / SD) ** 2 - math.log(SD) for s, db in heard)
             self.assertAlmostEqual(lls[room], expected)
 
     def test_a_missing_scanner_is_not_filled_with_a_weak_reading(self):
@@ -234,11 +236,22 @@ class Likelihood(unittest.TestCase):
         del doc["stats"]["Kitchen"][S3]
         lls = bl.Model(doc).log_likelihoods({S3: -80.0})
         self.assertAlmostEqual(lls["Kitchen"], -0.5 * ((-80.0 + 95.0) / 10.0) ** 2 - math.log(10.0))
-        self.assertAlmostEqual(lls["Bedroom"], -0.5 * ((-80.0 + 50.0) / SD) ** 2 - math.log(SD))
+        self.assertAlmostEqual(lls["Bedroom"], -math.log(SD))
 
-    def test_the_device_offset_is_subtracted_from_every_reading(self):
-        weaker = self.model.log_likelihoods({s: db - 8 for s, db in reading("Kitchen").items()}, offset_db=-8.0)
-        self.assertEqual(weaker, self.model.log_likelihoods(reading("Kitchen")))
+    def test_a_device_that_is_weaker_at_every_scanner_scores_every_room_alike(self):
+        for room in ROOMS:
+            weaker = self.model.log_likelihoods(reading(room, delta=-8.0))
+            same = self.model.log_likelihoods(reading(room))
+            for other in ROOMS:
+                self.assertAlmostEqual(weaker[other], same[other])
+
+    def test_each_room_subtracts_the_offset_that_fits_the_readings_best_to_it(self):
+        readings = blend("Kitchen", "Bedroom", 0.3)
+        lls = self.model.log_likelihoods(readings)
+        for room in ROOMS:
+            offset = self.model.best_offset(room, readings)
+            expected = sum(-0.5 * ((db - offset - MEANS[room][s]) / SD) ** 2 - math.log(SD) for s, db in readings.items())
+            self.assertAlmostEqual(lls[room], expected)
 
     def test_the_best_room_is_the_one_whose_means_the_readings_follow(self):
         for room in ROOMS:
@@ -374,82 +387,66 @@ class Filter(unittest.TestCase):
 
 
 class Offset(unittest.TestCase):
-    def test_a_device_8_db_weaker_is_learned_and_the_room_stays_right(self):
-        app = make_app(args={"offset_tau_s": 600})
+    def test_a_device_8_db_weaker_stays_in_the_right_room_and_reports_its_offset(self):
+        app = make_app()
         rng = random.Random(7)
         for i in range(200):
             hear(app, {s: db - 8 + rng.gauss(0, 3) for s, db in reading("Kitchen").items()})
             tick(app, 5 * (i + 1))
         shown = last(app)
         self.assertEqual(shown["state"], "Kitchen")
-        self.assertAlmostEqual(shown["attributes"]["offset_db"], -8.0, delta=1.0)
+        self.assertAlmostEqual(shown["attributes"]["offset_db"], -8.0, delta=2.0)
         self.assertEqual(set(states_of(app)), {"Kitchen"})
 
-    def test_a_device_that_starts_wrong_by_8_db_in_the_living_room_is_located_after_the_first_ticks(self):
+    def test_a_device_8_db_weaker_in_the_living_room_is_located_at_the_first_tick(self):
         app = make_app()
         hear(app, reading("Living room", delta=-8.0))
-        ticks(app, 5, 30)
+        tick(app, 5)
         self.assertEqual(last(app)["state"], "Living room")
-        self.assertAlmostEqual(last(app)["attributes"]["offset_db"], -8.0, delta=0.5)
+        self.assertAlmostEqual(last(app)["attributes"]["offset_db"], -8.0)
 
-    def test_the_offset_is_a_mean_until_it_spans_tau_and_then_an_exponential_average(self):
-        app = make_app(args={"offset_tau_s": 60})
-        hear(app, reading("Kitchen", delta=-8.0))
-        ticks(app, 5, 60)
-        track = app._tracks[0]
-        self.assertAlmostEqual(track.offset, -8.0, places=3)
-        self.assertEqual(track.offset_s, 60)
-        hear(app, reading("Kitchen"))
-        ticks(app, 305, 12)
-        self.assertAlmostEqual(track.offset, -8.0 * (1 - 5 / 60) ** 12, delta=0.05)
-
-    def test_a_tick_with_fewer_than_four_fresh_scanners_answers_but_does_not_move_the_offset(self):
-        app = make_app()
-        hear(app, reading("Kitchen", delta=-8.0, scanners=(S1, S2, S3)))
-        ticks(app, 5, 5)
-        self.assertEqual(last(app)["attributes"]["source"], "model")
-        self.assertEqual(app._tracks[0].offset, 0.0)
-        hear(app, reading("Kitchen", delta=-8.0, scanners=(S1, S2, S3, S4)))
-        tick(app, 30)
-        self.assertNotEqual(app._tracks[0].offset, 0.0)
-
-    def test_a_bermuda_answer_never_moves_the_offset(self):
+    def test_a_bermuda_answer_carries_no_offset(self):
         app = make_app(areas={"sensor.anna_area": "Landing"})
         hear(app, reading("Kitchen", delta=-8.0))
         ticks(app, 5, 5)
-        self.assertEqual((last(app)["attributes"]["source"], app._tracks[0].offset, app._tracks[0].offset_s), ("bermuda", 0.0, 0.0))
+        self.assertEqual((last(app)["attributes"]["source"], last(app)["attributes"]["offset_db"]), ("bermuda", None))
 
-    def test_offsets_are_saved_at_most_once_a_minute_and_read_back_at_start(self):
-        app = make_app()
-        hear(app, reading("Kitchen", delta=-8.0))
-        with patch.object(bl, "write_json", wraps=bl.write_json) as write:
-            ticks(app, 5, 24)
-            self.assertEqual(write.call_count, 2)
-        with open(app.state_file, encoding="utf-8") as f:
-            saved = json.load(f)
-        self.assertEqual(saved["version"], 1)
-        self.assertAlmostEqual(saved["offsets"][ANNA["address"]]["db"], -8.0, delta=0.01)
-        self.assertEqual(saved["offsets"][ANNA["address"]]["s"], 65.0)
-        again = make_app(args={"state_file": app.state_file, "model_file": app.model_file})
-        self.assertAlmostEqual(again._tracks[0].offset, -8.0, delta=0.01)
-        self.assertEqual(again._tracks[0].offset_s, 65.0)
 
-    def test_the_state_file_is_written_when_the_app_stops(self):
-        app = make_app()
-        hear(app, reading("Kitchen", delta=-8.0))
-        ticks(app, 5, 2)
-        os.remove(app.state_file)
-        app.terminate()
-        self.assertAlmostEqual(bl.read_state(app.state_file)[ANNA["address"]][0], -8.0, delta=0.01)
+class Hold(unittest.TestCase):
+    def test_the_room_stays_until_another_beats_it_by_the_switch_margin(self):
+        app = make_app(args={"switch_margin": 0.6})
+        hear(app, reading("Kitchen"))
+        ticks(app, 5, 6)
+        hear(app, blend("Kitchen", "Bedroom", 0.56))
+        seen = []
+        for i in range(40):
+            tick(app, 35 + 5 * i)
+            belief = dict(zip(app._tracks[0].rooms, app._tracks[0].belief))
+            seen.append((states_of(app)[-1], belief["Bedroom"] - belief["Kitchen"]))
+        switched = [i for i, (room, _) in enumerate(seen) if room == "Bedroom"]
+        self.assertTrue(switched)
+        first = switched[0]
+        self.assertGreaterEqual(seen[first][1], 0.6)
+        self.assertTrue(all(room == "Kitchen" and gap < 0.6 for room, gap in seen[:first]))
+        self.assertTrue(any(gap > 0 for _, gap in seen[:first]))
 
-    def test_a_state_file_that_cannot_be_read_means_no_offsets(self):
-        path = new_path("state.json")
-        for content in ("", "[1]", "{", '{"version": 1, "offsets": {"x": {"db": "a", "s": 1}}}', '{"version": 2, "offsets": {}}'):
-            with self.subTest(content=content):
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                self.assertEqual(bl.read_state(path), {})
-        self.assertEqual(bl.read_state(new_path("none.json")), {})
+    def test_a_margin_of_zero_answers_the_most_likely_room(self):
+        app = make_app(args={"switch_margin": 0.0})
+        hear(app, reading("Kitchen"))
+        ticks(app, 5, 6)
+        hear(app, reading("Bedroom"))
+        for i in range(20):
+            tick(app, 35 + 5 * i)
+            track = app._tracks[0]
+            self.assertEqual(states_of(app)[-1], track.rooms[max(range(3), key=track.belief.__getitem__)])
+
+    def test_a_bermuda_answer_clears_the_held_room(self):
+        app = make_app(args={"switch_margin": 0.6})
+        hear(app, reading("Kitchen"))
+        ticks(app, 5, 6)
+        app.states["sensor.anna_area"] = "Landing"
+        tick(app, 35)
+        self.assertIsNone(app._tracks[0].model_room)
 
 
 class Fallback(unittest.TestCase):
@@ -725,9 +722,9 @@ class ModelFile(unittest.TestCase):
         app.run_every = lambda *a: None
         app.initialize()
         here = Path(bl.__file__).resolve().parent
-        self.assertEqual((app.model_file, app.log_file, app.state_file, app.readings_file),
+        self.assertEqual((app.model_file, app.log_file, app.readings_file),
                          tuple(str(here / name) for name in ("ble_locator_model.json", "ble_locator_log.jsonl",
-                                                             "ble_locator_state.json", "ble_locator_readings.jsonl")))
+                                                             "ble_locator_readings.jsonl")))
 
 
 class Output(unittest.TestCase):
@@ -925,7 +922,7 @@ class ReadingsLog(unittest.TestCase):
                 self.assertEqual(readings_lines(app)[0]["bermuda_area"], area)
                 self.assertEqual(log_lines(app)[0]["bermuda_area"], area)
 
-    def test_the_answers_their_log_and_the_state_are_the_same_whatever_happens_to_the_readings_log(self):
+    def test_the_answers_and_their_log_are_the_same_whatever_happens_to_the_readings_log(self):
         outcomes = []
         for args in ({}, {"readings_interval_s": 1},
                      {"readings_file": os.path.join(_DIR.name, "no", "such", "dir", "readings.jsonl")}):
@@ -934,8 +931,7 @@ class ReadingsLog(unittest.TestCase):
             ticks(app, 5, 8)
             hear(app, reading("Bedroom", delta=-6.0))
             ticks(app, 45, 20)
-            with open(app.state_file, encoding="utf-8") as f:
-                outcomes.append((app.published, log_lines(app), json.load(f)))
+            outcomes.append((app.published, log_lines(app)))
         self.assertGreater(len(outcomes[0][0]), 20)
         self.assertGreater(len(outcomes[0][1]), 2)
         self.assertEqual(outcomes[1], outcomes[0])
@@ -977,19 +973,19 @@ class ReadingsLog(unittest.TestCase):
 class Setup(unittest.TestCase):
     def test_defaults_and_the_first_tick_one_interval_after_start(self):
         app = make_app()
-        self.assertEqual((app.interval_s, app.fresh_s, app.min_scanners, app.offset_tau_s, app.max_model_age_days,
-                          app.readings_interval_s), (5.0, 120.0, 3, 3600.0, 14.0, 10.0))
+        self.assertEqual((app.interval_s, app.fresh_s, app.min_scanners, app.switch_margin, app.max_model_age_days,
+                          app.readings_interval_s), (5.0, 120.0, 3, 0.6, 14.0, 10.0))
         self.assertEqual(app.scheduled, [(app._on_tick, "now+5", 5.0)])
 
     def test_the_yaml_values_pass_through(self):
-        app = make_app(args={"interval_s": 10, "fresh_s": 60, "min_scanners": 4, "offset_tau_s": 900,
+        app = make_app(args={"interval_s": 10, "fresh_s": 60, "min_scanners": 4, "switch_margin": 0.3,
                              "max_model_age_days": 3, "readings_interval_s": 30})
-        self.assertEqual((app.interval_s, app.fresh_s, app.min_scanners, app.offset_tau_s, app.max_model_age_days,
-                          app.readings_interval_s), (10.0, 60.0, 4, 900.0, 3.0, 30.0))
+        self.assertEqual((app.interval_s, app.fresh_s, app.min_scanners, app.switch_margin, app.max_model_age_days,
+                          app.readings_interval_s), (10.0, 60.0, 4, 0.3, 3.0, 30.0))
         self.assertEqual(app.scheduled[0][1:], ("now+10", 10.0))
 
     def test_a_value_that_would_break_the_app_fails_at_start(self):
-        for args in ({"interval_s": 0}, {"fresh_s": -1}, {"min_scanners": 0}, {"offset_tau_s": 0},
+        for args in ({"interval_s": 0}, {"fresh_s": -1}, {"min_scanners": 0}, {"switch_margin": -0.1}, {"switch_margin": 1},
                      {"max_model_age_days": 0}, {"readings_interval_s": 0}, {"readings_interval_s": -10},
                      {"devices": []}, {"devices": [{"name": "x", "address": "y"}]},
                      {"devices": ["x"]}, {"devices": [dict(ANNA), dict(ANNA, name="other")]},
@@ -1015,9 +1011,9 @@ class Setup(unittest.TestCase):
             "mikkel": "sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area",
             "claudia": "sensor.claudias_iphone_ble_area", "kristine": "sensor.kristines_iphone_ble_area",
             "rober2_beacon": "sensor.mp1_142377_area"})
-        self.assertEqual({k: config[k] for k in ("interval_s", "fresh_s", "min_scanners", "offset_tau_s",
+        self.assertEqual({k: config[k] for k in ("interval_s", "fresh_s", "min_scanners", "switch_margin",
                                                  "max_model_age_days", "readings_interval_s")}, {
-            "interval_s": 5, "fresh_s": 120, "min_scanners": 3, "offset_tau_s": 3600, "max_model_age_days": 14,
+            "interval_s": 5, "fresh_s": 120, "min_scanners": 3, "switch_margin": 0.6, "max_model_age_days": 14,
             "readings_interval_s": 9})
         args = {k: v for k, v in config.items() if k not in ("module", "class")}
         app = make_app(args=args, devices=config["devices"])
@@ -1058,9 +1054,8 @@ class TrainerAgrees(unittest.TestCase):
         belief_t = belief_a = [1 / 3] * 3
         for _ in range(60):
             readings = {s: rng.uniform(-100, -45) for s in SCANNERS if rng.random() < 0.8}
-            offset = rng.uniform(-8, 3)
-            theirs = t.log_likelihoods(rounded, ROOMS, readings, offset)
-            ours = model.log_likelihoods(readings, offset)
+            theirs = t.log_likelihoods(rounded, ROOMS, readings)
+            ours = model.log_likelihoods(readings)
             for room in ROOMS:
                 self.assertAlmostEqual(theirs[room], ours[room])
             if not readings:

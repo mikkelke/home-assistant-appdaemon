@@ -29,18 +29,19 @@ usable), an area the model has no room for (Landing, unknown, not_home, any othe
 FILTER. Per device a belief over the model's rooms starts uniform. Each model answer updates it once:
 it stays in its room with probability p_stay ** (dt / step), dt the seconds since the last update,
 and leaves for the other rooms in equal parts; then each room's likelihood of the readings (the sum
-over the fresh readings of the Gaussian log density of the reading minus the device offset under the
+over the fresh readings of the Gaussian log density of the reading minus the room's offset under the
 room's mean and sd for that scanner, mean -95 and sd 10 where the room has none) is made into
 probabilities, floored, raised to the emission power and multiplied in. An update more than fresh_s
 after the last one, or after the model's rooms changed, starts from uniform again. The room is the
-most likely one, confidence its probability, runner_up the next room and runner_up_p its probability.
+most likely one, except that the room the model answered last stays until another room's probability
+beats it by switch_margin; confidence is the room's probability, runner_up the most likely other room and
+runner_up_p its probability. A Bermuda answer or a belief that starts again clears the room the model
+answered last.
 
-OFFSET. A phone does not transmit like the beacon, so a per-device offset in dB is subtracted from its
-readings. Each model answer with at least OFFSET_MIN_SCANNERS fresh readings gives the offset that
-fits them best to the answered room (mean of reading minus the room's mean, weighted by 1 / sd^2).
-The offset is the average of those: the mean so far until it spans offset_tau_s, then an exponential
-average with that time constant. Offsets are saved to state_file every minute when they changed and
-at stop, and read back at start.
+OFFSET. A phone does not transmit like the beacon, so each room scores the readings after subtracting
+the offset in dB that fits them best to it (mean of reading minus the room's mean over the scanners the
+room has stats for, weighted by 1 / sd^2). The room then rests on how the readings differ between
+scanners, never on how loud the device is. offset_db is that offset for the answered room.
 
 PUBLISH. sensor.<name>_ble_room is the room, or Bermuda's area as it is (unknown when it has none),
 with attributes confidence, runner_up, runner_up_p (null on a Bermuda answer), source (model or
@@ -73,8 +74,6 @@ import appdaemon.plugins.hass.hassapi as hass  # type: ignore
 DUMP_SERVICE = "bermuda/dump_devices"
 CALL_TIMEOUT_S = 10
 MODEL_VERSION = 1
-STATE_VERSION = 1
-OFFSET_MIN_SCANNERS = 4
 WRITE_EVERY_S = 60
 DAY_S = 86400
 RAW_MAX_AGE_S = 30
@@ -132,13 +131,16 @@ class Model:
     def to_db(self, metres):
         return max(self.c["ref_power_db"] - self.c["db_per_decade"] * math.log10(metres), self.c["floor_db"])
 
-    def log_likelihoods(self, readings, offset_db=0.0):
-        """{room: log-likelihood} of `readings` ({scanner address: dB}) after subtracting offset_db. A scanner
-        with no reading adds nothing to any room."""
+    def log_likelihoods(self, readings):
+        """{room: log-likelihood} of `readings` ({scanner address: dB}), each room scored after subtracting
+        the offset that fits the readings best to it (best_offset over the scanners the room has stats
+        for), so a device's transmit level never decides the room. A scanner with no reading adds nothing."""
         unseen = (self.c["unseen_mean_db"], self.c["unseen_sd_db"])
         out = {}
         for room in self.rooms:
             per, total = self.stats[room], 0.0
+            shared = {address: db for address, db in readings.items() if address in per}
+            offset_db = self.best_offset(room, shared) if shared else 0.0
             for address, db in readings.items():
                 mean, sd = per.get(address, unseen)
                 z = (db - offset_db - mean) / sd
@@ -239,28 +241,6 @@ def raw_readings(device, now, max_age_s):
             for scanner, (_, metres) in newest.items()}
 
 
-def read_state(path):
-    """{address: (offset dB, seconds of evidence)} out of the state file, {} when it holds none."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            doc = json.load(f)
-        if doc["version"] != STATE_VERSION:
-            return {}
-        return {str(address).lower(): (_finite(v["db"], "db"), max(_finite(v["s"], "s"), 0.0))
-                for address, v in doc["offsets"].items()}
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        return {}
-
-
-def write_json(path, doc):
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(doc, f, separators=(",", ":"))
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-
-
 def append_lines(path, lines):
     data = "".join(json.dumps(line, separators=(",", ":"), default=str) + "\n" for line in lines)
     with open(path, "a", encoding="utf-8") as f:
@@ -270,12 +250,11 @@ def append_lines(path, lines):
 class Track:
     """What the app keeps per device."""
 
-    def __init__(self, name, address, area_entity, offset, offset_s):
+    def __init__(self, name, address, area_entity):
         self.name, self.address, self.area_entity = name, address, area_entity
         self.entity = f"sensor.{name}_ble_room"
-        self.offset, self.offset_s, self.offset_at = offset, offset_s, None
         self.rooms = self.belief = self.belief_at = None
-        self.room = self.logged_at = None
+        self.room = self.logged_at = self.model_room = None
 
 
 class BleLocator(hass.Hass):
@@ -284,26 +263,23 @@ class BleLocator(hass.Hass):
         here = Path(__file__).resolve().parent
         self.model_file = str(a.get("model_file") or here / "ble_locator_model.json")
         self.log_file = str(a.get("log_file") or here / "ble_locator_log.jsonl")
-        self.state_file = str(a.get("state_file") or here / "ble_locator_state.json")
         self.readings_file = str(a.get("readings_file") or here / "ble_locator_readings.jsonl")
         self.interval_s = float(a.get("interval_s", 5))
         self.fresh_s = float(a.get("fresh_s", 120))
         self.min_scanners = int(a.get("min_scanners", 3))
+        self.switch_margin = float(a.get("switch_margin", 0.6))
         self.unreachable_areas = set(a.get("unreachable_areas") or ())
-        self.offset_tau_s = float(a.get("offset_tau_s", 3600))
         self.max_model_age_days = float(a.get("max_model_age_days", 14))
         self.readings_interval_s = float(a.get("readings_interval_s", 10))
-        if (min(self.interval_s, self.fresh_s, self.offset_tau_s, self.max_model_age_days,
-                self.readings_interval_s) <= 0 or self.min_scanners < 1):
-            raise ValueError("BleLocator: interval_s, fresh_s, offset_tau_s, max_model_age_days and "
-                             "readings_interval_s must be positive and min_scanners at least 1")
+        if (min(self.interval_s, self.fresh_s, self.max_model_age_days,
+                self.readings_interval_s) <= 0 or self.min_scanners < 1 or not 0 <= self.switch_margin < 1):
+            raise ValueError("BleLocator: interval_s, fresh_s, max_model_age_days and readings_interval_s must be "
+                             "positive, min_scanners at least 1 and switch_margin from 0 to below 1")
         listed = a.get("devices") or []
         if not listed or not all(isinstance(d, dict) and d.get("name") and d.get("address") and d.get("bermuda_area")
                                  for d in listed):
             raise ValueError("BleLocator: devices must list at least one {name, address, bermuda_area}")
-        saved = read_state(self.state_file)
-        self._tracks = [Track(str(d["name"]), str(d["address"]).lower(), str(d["bermuda_area"]),
-                              *saved.get(str(d["address"]).lower(), (0.0, 0.0))) for d in listed]
+        self._tracks = [Track(str(d["name"]), str(d["address"]).lower(), str(d["bermuda_area"])) for d in listed]
         if (len({t.address for t in self._tracks}) != len(self._tracks)
                 or len({t.name for t in self._tracks}) != len(self._tracks)):
             raise ValueError("BleLocator: every device needs its own name and address")
@@ -312,18 +288,11 @@ class BleLocator(hass.Hass):
         self._model, self._model_stamp, self._active = None, None, None
         self._problems, self._missing = {}, set()
         self._busy = False
-        self._saved, self._saved_at = self._offsets(), None
         self._readings_at = None
 
         self.run_every(self._on_tick, f"now+{self.interval_s:g}", self.interval_s)
         self.log(f"BleLocator initialized: shadow mode, {len(self._tracks)} device(s) every {self.interval_s:g} s -> "
                  f"sensor.<name>_ble_room, {self.log_file}", level="INFO")
-
-    def terminate(self):
-        try:
-            write_json(self.state_file, self._state_document())
-        except OSError as e:
-            self.log(f"BleLocator: offsets not saved to {self.state_file}: {e!a}", level="WARNING")
 
     def _on_tick(self, kwargs):
         if self._busy:
@@ -368,10 +337,6 @@ class BleLocator(hass.Hass):
                                   "fresh_scanners": answer["fresh"], "offset_db": answer["offset"]})
             if lines:
                 await self._write("log", append_lines, self.log_file, lines)
-            state = self._offsets()
-            if state != self._saved and (self._saved_at is None or now - self._saved_at >= WRITE_EVERY_S):
-                if await self._write("state", write_json, self.state_file, self._state_document()):
-                    self._saved, self._saved_at = state, now
             await self._log_readings(devices, areas, now, epoch)
         except Exception as e:
             self._problem("tick", f"tick failed: {e!a}")
@@ -401,32 +366,33 @@ class BleLocator(hass.Hass):
         model = self._active
         readings = readings_from(device, model, now, self.fresh_s) if model else {}
         base = {"confidence": None, "runner_up": None, "runner_up_p": None, "source": "bermuda",
-                "fresh": len(readings), "offset": round(track.offset, 1)}
+                "fresh": len(readings), "offset": None}
         modelled = area in model.rooms or area in self.unreachable_areas if model else False
         if not modelled or len(readings) < self.min_scanners:
+            track.model_room = None
             return {**base, "room": area if isinstance(area, str) and area else "unknown"}
 
         if track.belief is None or track.rooms != model.rooms or now - track.belief_at > self.fresh_s:
             track.belief, dt = [1.0 / len(model.rooms)] * len(model.rooms), model.c["p_stay_step_s"]
+            track.model_room = None
         else:
             dt = now - track.belief_at
-        probs = model.posterior(model.log_likelihoods(readings, track.offset))
+        probs = model.posterior(model.log_likelihoods(readings))
         track.belief = model.advance(track.belief, probs, dt)
         track.rooms, track.belief_at = model.rooms, now
-        first, second = sorted(range(len(model.rooms)), key=lambda i: -track.belief[i])[:2]
-        if len(readings) >= OFFSET_MIN_SCANNERS:
-            self._learn(track, model.best_offset(model.rooms[first], readings), now)
+        order = sorted(range(len(model.rooms)), key=lambda i: -track.belief[i])
+        first = order[0]
+        if track.model_room in model.rooms:
+            held = model.rooms.index(track.model_room)
+            if held != first and track.belief[first] - track.belief[held] < self.switch_margin:
+                first = held
+        second = next(i for i in order if i != first)
+        track.model_room = model.rooms[first]
+        shared = {address: db for address, db in readings.items() if address in model.stats[model.rooms[first]]}
+        offset = model.best_offset(model.rooms[first], shared) if shared else 0.0
         return {**base, "room": model.rooms[first], "confidence": round(track.belief[first], 3),
                 "runner_up": model.rooms[second], "runner_up_p": round(track.belief[second], 3),
-                "source": "model", "offset": round(track.offset, 1)}
-
-    def _learn(self, track, observed, now):
-        dt = self.interval_s if track.offset_at is None else min(now - track.offset_at, self.fresh_s)
-        track.offset_at = now
-        if dt <= 0:
-            return
-        track.offset_s = min(track.offset_s + dt, self.offset_tau_s)
-        track.offset += (observed - track.offset) * min(dt / track.offset_s, 1.0)
+                "source": "model", "offset": round(offset, 1)}
 
     async def _publish(self, track, answer):
         name = track.name.replace("_", " ").capitalize()
@@ -453,7 +419,7 @@ class BleLocator(hass.Hass):
         if lines and await self._write("readings", append_lines, self.readings_file, lines):
             self._readings_at = now
 
-    # ---------- the model file and the state file ----------
+    # ---------- the model file ----------
 
     async def _refresh_model(self):
         read = await self.run_in_executor(read_model, self.model_file, self._model_stamp)
@@ -476,13 +442,6 @@ class BleLocator(hass.Hass):
         elif model is not None:
             self._recovered("model", "the model is usable")
         self._active = model
-
-    def _offsets(self):
-        return {track.address: (round(track.offset, 3), round(track.offset_s, 1)) for track in self._tracks}
-
-    def _state_document(self):
-        return {"version": STATE_VERSION, "offsets": {address: {"db": db, "s": seconds}
-                                                      for address, (db, seconds) in self._offsets().items()}}
 
     async def _write(self, kind, writer, path, content):
         try:

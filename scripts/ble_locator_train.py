@@ -17,9 +17,10 @@ sample reads as the offsets of today would have made it.
 MODEL. Per (room, scanner) the mean and sample standard deviation of the dB readings, the deviation at
 least 6, and 10 for a pair read fewer than twice. A pair never read is not stored and reads as mean
 -95, sd 10. A room's log-likelihood is the sum over the scanners heard of the Gaussian log density of
-the reading minus the device offset; a scanner not heard adds nothing. The filter keeps a belief over
-the rooms: it stays put with probability 0.98 ** (dt / 5), leaves for the other rooms in equal parts,
-and each reading's posterior (uniform prior, at least 1e-12) raised to the power 0.3 multiplies in.
+the reading minus the offset that fits the readings best to the room (the 1 / sd^2 weighted mean of
+reading minus mean over the scanners it has statistics for); a scanner not heard adds nothing. The
+filter keeps a belief over the rooms: it stays put with probability 0.98 ** (dt / 5), leaves for the
+other rooms in equal parts, and each reading's posterior (uniform prior, at least 1e-12) raised to the power 0.3 multiplies in.
 ble_locator.py does the same arithmetic on the model file's `constants`.
 
 HELD-OUT. Each 2 min block of the grid is left out in turn with 30 s on each side, the model is
@@ -91,15 +92,29 @@ def to_db(metres, c=CONSTANTS):
 
 # ---------- the model: likelihood and filter ----------
 
-def log_likelihoods(stats, rooms, readings, offset_db=0.0, c=CONSTANTS):
-    """{room: log-likelihood} of `readings` ({address: dB}) after subtracting offset_db. A room with no
-    statistics at all is impossible (-inf)."""
+def best_offset(per, readings):
+    """The offset in dB that fits `readings` best to a room's statistics `per`: the 1 / sd^2 weighted mean of
+    reading minus mean over the scanners the room has statistics for, 0 when it has none of them."""
+    weighted = weights = 0.0
+    for address, db in readings.items():
+        if address in per:
+            mean, sd = per[address][:2]
+            weighted += (db - mean) / (sd * sd)
+            weights += 1.0 / (sd * sd)
+    return weighted / weights if weights else 0.0
+
+
+def log_likelihoods(stats, rooms, readings, c=CONSTANTS):
+    """{room: log-likelihood} of `readings` ({address: dB}), each room scored after subtracting the offset that
+    fits the readings best to it, so how loud a device is never decides the room. A room with no statistics
+    at all is impossible (-inf)."""
     out = {}
     for room in rooms:
         per = stats.get(room)
         if not per:
             out[room] = -math.inf
             continue
+        offset_db = best_offset(per, readings)
         total = 0.0
         for address, db in readings.items():
             mean, sd = per[address][:2] if address in per else (c["unseen_mean_db"], c["unseen_sd_db"])
@@ -303,7 +318,7 @@ def held_out(points, rooms, by_address, c=CONSTANTS):
                 belief, previous, inside = [1.0 / len(rooms)] * len(rooms), None, set(mine)
                 for i in sequence:
                     p = points[i]
-                    probs = posterior(log_likelihoods(stats, rooms, p["db"], 0.0, c), rooms)
+                    probs = posterior(log_likelihoods(stats, rooms, p["db"], c), rooms)
                     dt = GRID_S if previous is None else p["t"] - previous
                     belief, previous = advance(belief, probs, dt, c), p["t"]
                     if i in inside and p["scored"]:
