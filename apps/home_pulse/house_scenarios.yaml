@@ -17,7 +17,7 @@ HouseScenarios:
     dish: sensor.dishwasher_state
   power:
     hob: sensor.hotplate_power_monitor_total_active_power
-    oven: sensor.oven_plug_switch_0_power
+    oven: sensor.oven_relay_power
   # Who was in the kitchen while cooking: each resident's phone area from Bermuda.
   areas:
     Mikkel: sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area

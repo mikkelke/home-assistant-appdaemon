@@ -16,7 +16,7 @@ DB = "file:/config/home-assistant_v2.db?mode=ro"
 FEED = "sensor.house_events"
 NIGHT = "input_boolean.house_night_mode"
 MACHINES = {"washer": "sensor.washer_state", "dryer": "sensor.dryer_state", "dish": "sensor.dishwasher_state"}
-POWER = {"hob": "sensor.hotplate_power_monitor_total_active_power", "oven": "sensor.oven_plug_switch_0_power"}
+POWER = {"hob": "sensor.hotplate_power_monitor_total_active_power", "oven": "sensor.oven_relay_power"}
 AREAS = {
     "Mikkel": "sensor.bermuda_d6462f88944242db9e31bdff598edc25_100_40004_area",
     "Claudia": "sensor.claudias_iphone_ble_area",
