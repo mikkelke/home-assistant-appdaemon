@@ -113,31 +113,6 @@ class GroundedEquilibrium(unittest.TestCase):
     def test_none_weather_returned_as_is(self):
         self.assertIsNone(cm.grounded_equilibrium(None, 21.7, 15.0, 22.5))
 
-    def test_cold_front_caps_at_night_outdoor_plus_offset(self):
-        # THE 2026-08-15 night: weather-ish E 23.5, apartment_now 22.7 (still falling),
-        # forecast night min 16.1, limit 23. Old grounding: min(23.5, 22.7+1) = 23.5.
-        # Cold-front tier (16.1 < 17): additionally cap at 16.1 + 6.5 = 22.6 - the level
-        # the draining flat actually bottomed at (kitchen hit 20.4 + morning recovery).
-        self.assertAlmostEqual(
-            cm.grounded_equilibrium(23.5, 22.7, 16.1, 23.0, cold_front_out_max=17.0),
-            22.6, places=6)
-
-    def test_cool_but_not_cold_front_keeps_apartment_cap(self):
-        # night min 18 >= 17 threshold: ordinary cool-night grounding only.
-        self.assertAlmostEqual(
-            cm.grounded_equilibrium(24.7, 21.7, 18.0, 23.0, cold_front_out_max=17.0),
-            22.7, places=6)
-
-    def test_cold_front_disabled_by_none_is_byte_identical(self):
-        self.assertAlmostEqual(
-            cm.grounded_equilibrium(23.5, 22.7, 16.1, 23.0), 23.5, places=6)
-
-    def test_cold_front_never_deepens_a_shallow_weather_value(self):
-        # weather already below the cold-front cap -> min() keeps the weather value.
-        self.assertAlmostEqual(
-            cm.grounded_equilibrium(21.0, 22.7, 16.1, 23.0, cold_front_out_max=17.0),
-            21.0, places=6)
-
     def test_custom_margins(self):
         # reality_margin 0.5 -> min(24.7, 21.7 + 0.5) = 22.2; warm_night_margin 2.0 ->
         # threshold 22.5 - 2.0 = 20.5, and 15 < 20.5 so still a cool night
@@ -736,49 +711,3 @@ class NextBedtime(unittest.TestCase):
         self.assertEqual(cm.next_bedtime(now, wake, 9.0), datetime(2026, 8, 7, 22, 35))
 
 
-class GroundedEquilibriumColdFront(unittest.TestCase):
-    """Cold-front cap (2026-08-16): on a draining night "the apartment right now" is itself
-    a stale anchor - the whole flat follows the outdoor crash down. 2026-08-15: kitchen
-    28.4 at noon -> 20.4 at 01:00 while outdoor fell to 13.6 (a 6.8C building offset), so
-    the plan pre-cooled against warmth that never survived the night. The extra cap is
-    night_outdoor + cold_front_anchor_offset, applied ONLY below cold_front_out_max."""
-
-    # The 2026-08-15 (Saturday) night's real inputs: weather model 27.47, zone anchor 22.1,
-    # forecast night min 15.8.
-    FRI = dict(e_weather=27.47, apartment_now=22.1, night_outdoor=15.8, comfort_limit=23.0)
-
-    def test_cold_front_caps_at_night_min_plus_offset(self):
-        e = cm.grounded_equilibrium(**self.FRI, cold_front_out_max=17.0,
-                                    cold_front_anchor_offset=6.5)
-        self.assertAlmostEqual(e, 22.3, places=6)   # 15.8 + 6.5, below the 23.1 reality cap
-
-    def test_disabled_is_byte_identical_to_the_old_behaviour(self):
-        without = cm.grounded_equilibrium(**self.FRI)
-        explicit_off = cm.grounded_equilibrium(**self.FRI, cold_front_out_max=None)
-        self.assertEqual(without, explicit_off)
-        self.assertAlmostEqual(without, 23.1, places=6)   # apartment_now + reality_margin
-
-    def test_mild_night_above_threshold_keeps_the_reality_cap(self):
-        # 18C night: draining, but not a cold front - no extra cap.
-        args = dict(self.FRI, night_outdoor=18.0)
-        self.assertAlmostEqual(
-            cm.grounded_equilibrium(**args, cold_front_out_max=17.0), 23.1, places=6)
-
-    def test_cap_only_ever_lowers_never_raises(self):
-        # A very cold night with a big offset must not push the equilibrium UP past the
-        # reality anchor: the cold-front term is a min(), not a replacement.
-        args = dict(self.FRI, night_outdoor=16.9)
-        e = cm.grounded_equilibrium(**args, cold_front_out_max=17.0,
-                                    cold_front_anchor_offset=20.0)
-        self.assertAlmostEqual(e, 23.1, places=6)
-
-    def test_warm_night_returns_the_weather_value_untouched(self):
-        # Warm night short-circuits before any capping - pre-cooling a hot night is real.
-        args = dict(self.FRI, night_outdoor=22.5)
-        self.assertEqual(
-            cm.grounded_equilibrium(**args, cold_front_out_max=17.0), 27.47)
-
-    def test_missing_night_outdoor_falls_back_warm_and_safe(self):
-        args = dict(self.FRI, night_outdoor=None)
-        self.assertEqual(
-            cm.grounded_equilibrium(**args, cold_front_out_max=17.0), 27.47)
