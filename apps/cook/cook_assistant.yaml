@@ -14,3 +14,4 @@ CookAssistant:
   kitchen_speaker: media_player.kitchen
   ring_sensor: binary_sensor.abb_welcome_gateway_intercom_ringing
   ring_event_entity: event.abb_welcome_gateway_intercom
+  scenarios_entity: sensor.house_scenarios

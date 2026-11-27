@@ -207,6 +207,17 @@ class AdapterTests(unittest.TestCase):
                          [("Probe in the meat · no target set", ["mikkel"])])
         self.assertEqual(self.fake.published["sensor.cook_state"]["attributes"]["next_label"], "No target set")
 
+    def test_uncommanded_cook_goes_to_the_one_person_cooking_in_the_kitchen(self):
+        start = datetime.fromtimestamp(self.fake.now - 600, timezone.utc).isoformat()
+        self.fake.states["sensor.house_scenarios"] = {"state": "1", "attributes": {}}
+        self.fake.app.get_state = lambda entity, **kw: (
+            [{"type": "cooking", "start": start, "end": None, "who": ["Kristine"]}]
+            if entity == "sensor.house_scenarios" else (self.fake.states.get(entity) or {}).get("state"))
+        self.fake.probe(30, 100)
+        self.fake.tick(30)
+        self.fake.probe(30, 100)
+        self.assertEqual(self.fake.pushes[-1]["target"], ["kristine"])
+
     def test_caller_becomes_owner_and_steps_announce_only_while_owner_home(self):
         self.fake.verdicts["abc"] = {"person": "claudia", "method": "dashboard_action"}
         self.fake.states["person.claudia"] = full("home")

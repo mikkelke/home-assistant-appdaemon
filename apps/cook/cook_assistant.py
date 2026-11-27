@@ -14,6 +14,7 @@ TICK_S = 10
 LIVE_S = 30
 TABLET_IDLE_S = 120
 RING_FRESH_S = 120
+COOKING_RECENT_S = 1800
 DEFAULT_OWNER = "mikkel"
 SERVICE_TIMEOUT_S = 20
 PUSH_ACTIONS = {"COOK_BAG_IN": "bag_in", "COOK_STOP": "bath_stop", "COOK_ICE": "chill",
@@ -64,6 +65,7 @@ class CookAssistant(hass.Hass):
         self.kitchen_speaker = self.args.get("kitchen_speaker", "media_player.kitchen")
         self.ring_sensor = self.args.get("ring_sensor", "binary_sensor.abb_welcome_gateway_intercom_ringing")
         self.ring_event_entity = self.args.get("ring_event_entity", "event.abb_welcome_gateway_intercom")
+        self.scenarios_entity = self.args.get("scenarios_entity", "sensor.house_scenarios")
         self._notifier = self.get_app("MobileNotifier")
         self._values = {}
         self._published = {}
@@ -219,8 +221,20 @@ class CookAssistant(hass.Hass):
         owner = effect.get("owner")
         if owner in self.people:
             return owner
-        person = self._attribution("cook_push").get("person")
-        return person if person in self.people else DEFAULT_OWNER
+        return self._kitchen_cook() or DEFAULT_OWNER
+
+    def _kitchen_cook(self):
+        scenarios = self.get_state(self.scenarios_entity, attribute="scenarios")
+        now = self.get_now_ts()
+        for scenario in reversed(scenarios if isinstance(scenarios, list) else []):
+            if not isinstance(scenario, dict) or scenario.get("type") != "cooking":
+                continue
+            end = pub.epoch(scenario.get("end"))
+            who = [str(name).lower() for name in scenario.get("who") or []]
+            if (end is None or now - end <= COOKING_RECENT_S) and len(who) == 1 and who[0] in self.people:
+                return who[0]
+            return None
+        return None
 
     def _on_ring(self, entity, attribute, old, new, kwargs):
         self._ring()

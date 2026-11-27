@@ -15,8 +15,8 @@ Every push goes to one person, the cook's owner. The owner is set by any command
 
 1. `owner` in `data` (`mikkel`, `kristine`, `claudia`) wins.
 2. Otherwise the caller's HA user, resolved by ActorAttribution (the agent account resolves to Mikkel).
-3. A cook nobody commanded goes to whoever ActorAttribution names from presence (one person
-   home on a clean log, or the one left after room elimination), else to Mikkel.
+3. A cook nobody commanded goes to the one person `sensor.house_scenarios` names for the current
+   (or last 30 min) cooking session, from phones in the kitchen, else to Mikkel.
 
 Steps with a `say` text are also announced on the kitchen Sonos (SonosNotifier, quiet hours
 respected) only while the owner's `person.*` is `home`. The owner is cleared when the cook closes.
