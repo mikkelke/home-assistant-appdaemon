@@ -1,5 +1,5 @@
 # Every delivery on its way to the flat, as one entity: sensor.home_delivery. Wolt comes from the
-# Wait for Wolt integration's entities (found by name, so a new venue needs no config); Nemlig is
+# Wait for Wolt tracking sensors with a confirmed home dropoff (see box/ha-wait-for-wolt). Nemlig is
 # polled from the signed-in homepage's featured order: every 15 min, every 90 s from an hour before
 # the booked window until delivered. Parcels come from the Parcel Aggregator's incoming and delivered
 # sensors, one source per carrier, and are listed only when they matter today. See home_delivery.py

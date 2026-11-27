@@ -1,0 +1,311 @@
+diff --git a/custom_components/wait_for_wolt/coordinator.py b/custom_components/wait_for_wolt/coordinator.py
+index caeb369..a46a3cc 100644
+--- a/custom_components/wait_for_wolt/coordinator.py
++++ b/custom_components/wait_for_wolt/coordinator.py
+@@ -10,8 +10,15 @@ from time import monotonic
+ from typing import Any
+
+ from homeassistant.config_entries import ConfigEntry, ConfigEntryAuthFailed
+-from homeassistant.core import HomeAssistant
++from homeassistant.const import (
++    ATTR_LATITUDE,
++    ATTR_LONGITUDE,
++    STATE_UNAVAILABLE,
++    STATE_UNKNOWN,
++)
++from homeassistant.core import HomeAssistant, State
+ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
++from homeassistant.util.location import distance
+
+ from .api import (
+     WoltApi,
+@@ -22,12 +29,48 @@ from .api import (
+     is_active_order,
+ )
+ from .const import DOMAIN
++from .facts import dropoff_coordinates
+ from .privacy import location_enabled
+
+ _LOGGER = logging.getLogger(__name__)
+
+ ACTIVE_UPDATE_INTERVAL = timedelta(seconds=30)
+ IDLE_UPDATE_INTERVAL = timedelta(minutes=1)
++# The presence zone can be wider than the building a courier should visit.
++HOME_DROPOFF_MAX_DISTANCE_M = 50
++
++
++def delivers_to_home(
++    order: dict[str, Any], details: dict[str, Any], home: State | None
++) -> bool | None:
++    """Compare an explicit Wolt dropoff to Home Assistant's home location."""
++    for source in (order, details):
++        method = source.get("delivery_method")
++        if isinstance(method, str) and method.lower() in {"pickup", "takeaway"}:
++            return False
++
++    point = dropoff_coordinates(details)
++    if (
++        point is None
++        or home is None
++        or home.state in {STATE_UNAVAILABLE, STATE_UNKNOWN}
++    ):
++        return None
++
++    lat = home.attributes.get(ATTR_LATITUDE)
++    lon = home.attributes.get(ATTR_LONGITUDE)
++    radius = home.attributes.get("radius")
++    if not (
++        type(lat) in (float, int)
++        and -90 <= lat <= 90
++        and type(lon) in (float, int)
++        and -180 <= lon <= 180
++        and type(radius) in (float, int)
++        and 0 < radius < float("inf")
++    ):
++        return None
++    meters = distance(*point, lat, lon)
++    return None if meters is None else meters < min(radius, HOME_DROPOFF_MAX_DISTANCE_M)
+
+
+ @dataclass(frozen=True, slots=True)
+@@ -38,6 +81,7 @@ class WoltCoordinatorData:
+     active_order_ids: frozenset[str]
+     details: dict[str, dict[str, Any]]
+     pickups: dict[str, dict[str, Any]] = field(default_factory=dict)
++    home_deliveries: dict[str, bool] = field(default_factory=dict)
+
+
+ class WoltDataUpdateCoordinator(DataUpdateCoordinator[WoltCoordinatorData]):
+@@ -125,7 +169,20 @@ class WoltDataUpdateCoordinator(DataUpdateCoordinator[WoltCoordinatorData]):
+         self.update_interval = (
+             ACTIVE_UPDATE_INTERVAL if active_order_ids else IDLE_UPDATE_INTERVAL
+         )
+-        return WoltCoordinatorData(orders, active_order_ids, details, pickups)
++        home = self.hass.states.get("zone.home")
++        home_deliveries: dict[str, bool] = {}
++        # Rich details can go missing during an outage and disappear at completion.
++        # Carry forward only classifications for the same purchase still in the list.
++        previous = self.data.home_deliveries if self.data is not None else {}
++        for order_id, order in orders.items():
++            result = delivers_to_home(order, details.get(order_id, {}), home)
++            if result is None:
++                result = previous.get(order_id)
++            if result is not None:
++                home_deliveries[order_id] = result
++        return WoltCoordinatorData(
++            orders, active_order_ids, details, pickups, home_deliveries
++        )
+
+     @staticmethod
+     def order_id(order: dict[str, Any]) -> str | None:
+diff --git a/custom_components/wait_for_wolt/facts.py b/custom_components/wait_for_wolt/facts.py
+index 15606ae..d305409 100644
+--- a/custom_components/wait_for_wolt/facts.py
++++ b/custom_components/wait_for_wolt/facts.py
+@@ -2,7 +2,6 @@
+
+ from __future__ import annotations
+
+-import math
+ import re
+ from decimal import Decimal
+ from typing import Any
+@@ -97,7 +96,7 @@ def dropoff_coordinates(details: dict[str, Any]) -> tuple[float, float] | None:
+     if not isinstance(coordinates, list) or len(coordinates) != 2:
+         return None
+     lon, lat = coordinates
+-    if any(type(x) not in (float, int) or not math.isfinite(x) for x in (lat, lon)):
++    if type(lat) not in (float, int) or type(lon) not in (float, int):
+         return None
+     if not -90 <= lat <= 90 or not -180 <= lon <= 180:
+         return None
+diff --git a/custom_components/wait_for_wolt/tracking.py b/custom_components/wait_for_wolt/tracking.py
+index 345b720..84bbec2 100644
+--- a/custom_components/wait_for_wolt/tracking.py
++++ b/custom_components/wait_for_wolt/tracking.py
+@@ -172,11 +172,17 @@ class WoltTrackingSensor(CoordinatorEntity[WoltDataUpdateCoordinator], SensorEnt
+             "order_status": normalize_order_status(order),
+             "is_arriving_soon": False,
+         }
+-        from .facts import venue_name
++        from .facts import item_count, venue_name
+
+         if label := venue_name(summary):
+             attrs["venue_name"] = label
+-        if self.kind != "delivery":
++        if self.kind == "delivery":
++            is_home = self.coordinator.data.home_deliveries.get(self.order_id)
++            if is_home is not None:
++                attrs["delivers_to_home"] = is_home
++            if (quantity := item_count(summary)) is not None:
++                attrs["item_count"] = quantity
++        else:
+             attrs.update(route_point_type=self.kind, coordinate_source="unavailable")
+         if not self.active:
+             return attrs  # Never leave stale coordinates/arrival flags on completion.
+@@ -207,6 +213,7 @@ class WoltTrackingSensor(CoordinatorEntity[WoltDataUpdateCoordinator], SensorEnt
+         # A past estimate is not proof of imminent arrival. Keep it visible but
+         # never let a stale zero-minute value trigger door/arrival automations.
+         if eta is not None:
++            attrs["estimated_arrival"] = eta.isoformat()
+             remaining = eta - dt_util.utcnow()
+             if -timedelta(minutes=1) <= remaining <= timedelta(hours=6):
+                 minutes = max(0, math.ceil(remaining.total_seconds() / 60))
+diff --git a/tests/test_coordinator.py b/tests/test_coordinator.py
+index 46a82ff..7ae1850 100644
+--- a/tests/test_coordinator.py
++++ b/tests/test_coordinator.py
+@@ -1,11 +1,11 @@
+ """Tests for shared Wolt polling and Home Assistant error semantics."""
+
+-from datetime import timedelta
++from datetime import UTC, datetime, timedelta
+ from unittest.mock import AsyncMock, call
+
+ import pytest
+ from homeassistant.config_entries import ConfigEntryAuthFailed
+-from homeassistant.core import HomeAssistant
++from homeassistant.core import HomeAssistant, State
+ from homeassistant.helpers.update_coordinator import UpdateFailed
+ from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+@@ -21,7 +21,9 @@ from custom_components.wait_for_wolt.coordinator import (
+     ACTIVE_UPDATE_INTERVAL,
+     IDLE_UPDATE_INTERVAL,
+     WoltDataUpdateCoordinator,
++    delivers_to_home,
+ )
++from custom_components.wait_for_wolt.tracking import WoltTrackingSensor
+
+
+ def make_coordinator(
+@@ -185,3 +187,129 @@ def test_poll_intervals_discover_new_orders_promptly() -> None:
+     """Bound discovery latency so short orders can trigger automations."""
+     assert timedelta(seconds=30) == ACTIVE_UPDATE_INTERVAL
+     assert timedelta(minutes=1) == IDLE_UPDATE_INTERVAL
++
++
++def dropoff_at(latitude: float, longitude: float) -> dict:
++    """Build only the observed destination fields from Wolt tracking."""
++    return {
++        "delivery_location": {
++            "coordinates": {"type": "Point", "coordinates": [longitude, latitude]},
++        }
++    }
++
++
++@pytest.mark.parametrize(
++    ("latitude", "radius", "result"),
++    [
++        (55.0, 100, True),
++        (55.00025, 100, True),
++        (55.0007, 100, False),
++        (55.00025, 15, False),
++        (float("nan"), 100, None),
++        (10**400, 100, None),
++        (55.0, 0, None),
++    ],
++)
++def test_actual_dropoff_must_be_close_to_home(latitude, radius, result) -> None:
++    """Use the tighter of the home zone and the courier-specific limit."""
++    home = State("zone.home", "0", {"latitude": 55, "longitude": 12, "radius": radius})
++    assert delivers_to_home({}, dropoff_at(latitude, 12), home) is result
++
++
++def test_pickup_or_unknown_does_not_confirm_home() -> None:
++    """A pickup is outside scope even if the supplied point matches home."""
++    attributes = {"latitude": 55, "longitude": 12, "radius": 100}
++    home = State("zone.home", "0", attributes)
++    dropoff = dropoff_at(55, 12)
++    assert delivers_to_home({"delivery_method": "takeaway"}, dropoff, home) is False
++    assert delivers_to_home({}, {**dropoff, "delivery_method": "pickup"}, home) is False
++    assert delivers_to_home({}, {"latitude": 55, "longitude": 12}, home) is None
++    assert delivers_to_home({}, dropoff, None) is None
++    assert (
++        delivers_to_home({}, dropoff, State("zone.home", "unavailable", attributes))
++        is None
++    )
++
++
++async def test_home_delivery_signal_is_per_order_and_survives_terminal(
++    hass: HomeAssistant,
++) -> None:
++    """Keep the latest classification for each active or terminal purchase."""
++    hass.states.async_set(
++        "zone.home", "0", {"latitude": 55, "longitude": 12, "radius": 100}
++    )
++    now = datetime.now(UTC)
++    home_eta = (now + timedelta(hours=8)).isoformat()
++    summary_eta = (now + timedelta(hours=2)).isoformat()
++    home = {
++        "purchase_id": "home",
++        "telemetry": {"order_status_type": "IN_PROGRESS"},
++        "venue": {"name": "Same restaurant"},
++        "items": [{"count": 2}],
++        "delivery_eta": summary_eta,
++    }
++    work = {**home, "purchase_id": "work", "items": [{"count": 9}]}
++    unknown = {**home, "purchase_id": "unknown"}
++    home_delivered = {**home, "telemetry": {"order_status_type": "DELIVERED"}}
++    work_cancelled = {**work, "telemetry": {"order_status_type": "CANCELLED"}}
++    api = AsyncMock(spec=WoltApi)
++    coordinator = make_coordinator(hass, api)
++    sensor = WoltTrackingSensor(
++        coordinator, coordinator.entry.entry_id, "home", "delivery"
++    )
++    other = WoltTrackingSensor(
++        coordinator, coordinator.entry.entry_id, "work", "delivery"
++    )
++
++    api.fetch_orders.return_value = [home, work, unknown]
++    api.fetch_order_details.side_effect = [
++        {
++            **dropoff_at(55, 12),
++            "_drivers": [{"delivering_your_order": True, "delivery_eta": home_eta}],
++        },
++        {},
++        dropoff_at(55.5, 12.5),
++    ]
++    coordinator.data = await coordinator._async_update_data()
++    assert coordinator.data.home_deliveries == {"home": True, "work": False}
++    attrs = sensor.extra_state_attributes
++    assert attrs["delivers_to_home"] is True
++    assert attrs["item_count"] == 2
++    assert attrs["estimated_arrival"] == home_eta
++    assert "delivery_eta" not in attrs  # Existing duration guard still applies.
++    assert {
++        "latitude",
++        "longitude",
++        "delivery_location",
++        "items",
++        "purchase_id",
++    }.isdisjoint(attrs)
++    assert other.extra_state_attributes["item_count"] == 9
++    assert other.extra_state_attributes["estimated_arrival"] == summary_eta
++    assert other.extra_state_attributes["delivery_eta"] == summary_eta
++
++    api.fetch_order_details.side_effect = WoltInvalidPayloadError("missing details")
++    coordinator.data = await coordinator._async_update_data()
++    assert coordinator.data.home_deliveries == {"home": True, "work": False}
++    assert sensor.extra_state_attributes["delivers_to_home"] is True
++
++    api.fetch_orders.return_value = [home_delivered, work_cancelled]
++    coordinator.data = await coordinator._async_update_data()
++    assert coordinator.data.home_deliveries == {"home": True, "work": False}
++    terminal_attrs = sensor.extra_state_attributes
++    assert terminal_attrs["delivers_to_home"] is True
++    assert terminal_attrs["item_count"] == 2
++    assert "estimated_arrival" not in terminal_attrs
++
++    api.fetch_orders.return_value = [{**home, "delivery_method": "takeaway"}, work]
++    coordinator.data = await coordinator._async_update_data()
++    assert coordinator.data.home_deliveries == {"home": False, "work": False}
++    assert sensor.extra_state_attributes["delivers_to_home"] is False
++
++    api.fetch_orders.return_value = [home]
++    coordinator.data = await coordinator._async_update_data()
++    assert coordinator.data.home_deliveries == {"home": False}
++
++    api.fetch_orders.return_value = [work_cancelled]
++    coordinator.data = await coordinator._async_update_data()
++    assert coordinator.data.home_deliveries == {}

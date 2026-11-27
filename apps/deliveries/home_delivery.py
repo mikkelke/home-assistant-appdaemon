@@ -117,13 +117,12 @@ OUTSIDE_ICON = "mdi:package-variant-closed"
 OUTSIDE_COVERS_S = 7200
 
 WOLT_DELIVERY = "sensor.wolt_delivery_"
-WOLT_ORDER = re.compile(r"sensor\.wolt_order_(.+?)_(estimated_arrival|item_count)(_\d+)?")
 # Asked of Home Assistant itself: AppDaemon 4.5.13's entity cache misses entities created after it started, and
 # Wait for Wolt creates new entities for every order. The J stops AppDaemon's render_template from
 # literal_eval-ing the JSON into a Python object.
 WOLT_SENSORS = (
     "{% set ns = namespace(found=[]) %}"
-    "{% for s in states.sensor if s.entity_id.startswith('sensor.wolt_') %}"
+    "{% for s in states.sensor if s.entity_id.startswith('sensor.wolt_delivery_') %}"
     "{% set ns.found = ns.found + [{'entity_id': s.entity_id, 'state': s.state, 'attributes': dict(s.attributes)}] %}"
     "{% endfor %}J{{ ns.found | to_json }}"
 )
@@ -227,17 +226,18 @@ def wolt_stage(attrs):
     return "preparing"
 
 
+def wolt_home_flag(full):
+    if not isinstance(full, dict) or full.get("state") == "unavailable":
+        return None
+    flag = attributes(full).get("delivers_to_home")
+    return flag if isinstance(flag, bool) else None
+
+
 def wolt_deliveries(states):
-    """Wolt orders from the integration's sensors. The tracking sensor holds the stage; the estimated-arrival
-    and item-count sensors join it by venue and entity-id suffix, since only the tracking sensor lacks a device."""
-    siblings = {}
-    for entity_id, full in states.items():
-        match = WOLT_ORDER.fullmatch(entity_id)
-        if match and isinstance(full, dict):
-            siblings[(attributes(full).get("venue_name"), match[2], match[1] + (match[3] or ""))] = full.get("state")
+    """Read each confirmed home order's details directly from its tracking sensor."""
     found = []
     for entity_id, full in states.items():
-        if not entity_id.startswith(WOLT_DELIVERY):
+        if not entity_id.startswith(WOLT_DELIVERY) or wolt_home_flag(full) is not True:
             continue
         attrs = attributes(full)
         stage = wolt_stage(attrs)
@@ -245,11 +245,11 @@ def wolt_deliveries(states):
             continue
         key = entity_id[len(WOLT_DELIVERY):]
         venue = attrs.get("venue_name")
-        eta = epoch(siblings.get((venue, "estimated_arrival", key)))
+        eta = epoch(attrs.get("estimated_arrival"))
         if eta is None:
             eta = epoch(attrs.get("delivery_eta"))
         found.append(Delivery(f"wolt:{key}", "wolt", "food", venue if isinstance(venue, str) and venue else "Wolt",
-                              stage, eta=eta, item_count=count(siblings.get((venue, "item_count", key)))))
+                              stage, eta=eta, item_count=count(attrs.get("item_count"))))
     return found
 
 
@@ -539,6 +539,9 @@ class Ledger:
         self._keep_s = keep_s
         self._hold_s = hold_s
         self._records = {}
+
+    def discard(self, delivery_id):
+        self._records.pop(delivery_id, None)
 
     def update(self, observed, now):
         """Fold in one round of observations; returns the deliveries to publish. An ended delivery counts only
@@ -1038,8 +1041,12 @@ class HomeDelivery(hass.Hass):
             if not self._wolt_ok:
                 self.log("Wolt sensors readable again")
             self._wolt_ok = True
-        for entity_id in self._wolt:
-            if entity_id.startswith(WOLT_DELIVERY) and entity_id not in self._listened:
+        for entity_id, full in self._wolt.items():
+            if not entity_id.startswith(WOLT_DELIVERY):
+                continue
+            if wolt_home_flag(full) is False:
+                self._ledger.discard(f"wolt:{entity_id[len(WOLT_DELIVERY):]}")
+            if entity_id not in self._listened:
                 self._listened.add(entity_id)
                 self.listen_state(self._on_change, entity_id, attribute="all")
         return wolt_deliveries(self._wolt)

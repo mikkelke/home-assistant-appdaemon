@@ -58,20 +58,19 @@ def stamp(seconds):
 
 
 def wolt(venue=KITCHEN, slug="test_kitchen", suffix="", status="pending", kind="IN_PROGRESS", courier=None,
-         soon=False, eta=None, items=1, tracking_eta=None):
+         soon=False, eta=None, items=1, tracking_eta=None, delivers_to_home=True):
     attrs = {"order_status_type": kind, "order_status": status, "is_arriving_soon": soon, "venue_name": venue}
+    if delivers_to_home is not None:
+        attrs["delivers_to_home"] = delivers_to_home
     if courier is not None:
         attrs["delivering_your_order"] = courier
     if tracking_eta is not None:
         attrs["delivery_eta"] = stamp(tracking_eta)
-    sibling = {"venue_name": venue}
-    return {
-        f"sensor.wolt_delivery_{slug}{suffix}": {"state": "unknown", "attributes": attrs},
-        f"sensor.wolt_order_{slug}_status{suffix}": {"state": status, "attributes": sibling},
-        f"sensor.wolt_order_{slug}_estimated_arrival{suffix}":
-            {"state": stamp(eta) if eta is not None else "unknown", "attributes": sibling},
-        f"sensor.wolt_order_{slug}_item_count{suffix}": {"state": str(items), "attributes": sibling},
-    }
+    if eta is not None:
+        attrs["estimated_arrival"] = stamp(eta)
+    if items is not None:
+        attrs["item_count"] = items
+    return {f"sensor.wolt_delivery_{slug}{suffix}": {"state": "unknown", "attributes": attrs}}
 
 
 def nemlig_order(status="EnRoute", eta=None, estimated=None, booked=None, **extra):
@@ -203,7 +202,7 @@ class WoltStageTests(unittest.TestCase):
 
 
 class WoltDiscoveryTests(unittest.TestCase):
-    def test_orders_are_found_by_name_with_eta_and_items_from_their_siblings(self):
+    def test_orders_include_eta_and_items_from_the_tracking_sensor(self):
         states = {**wolt(courier=True, eta=at(8), items=3),
                   **wolt(venue="Pizza Test", slug="pizza_test", eta=at(30), items=2),
                   "sensor.washer_state": {"state": "Off", "attributes": {}}}
@@ -214,18 +213,16 @@ class WoltDiscoveryTests(unittest.TestCase):
                          ("wolt", "food", KITCHEN, "on_the_way", at(8), 3))
         self.assertEqual((found["wolt:pizza_test"].stage, found["wolt:pizza_test"].eta), ("preparing", at(30)))
 
-    def test_eta_falls_back_to_the_tracking_sensor_and_items_to_none(self):
-        states = wolt(courier=True, tracking_eta=at(5))
-        del states["sensor.wolt_order_test_kitchen_estimated_arrival"]
-        del states["sensor.wolt_order_test_kitchen_item_count"]
+    def test_eta_falls_back_to_the_tracking_eta_and_items_to_none(self):
+        states = wolt(courier=True, tracking_eta=at(5), items=None)
         [d] = hd.wolt_deliveries(states)
         self.assertEqual((d.eta, d.item_count), (at(5), None))
 
-    def test_a_passed_eta_survives_in_the_estimate_sensor(self):
+    def test_a_passed_eta_survives_as_the_estimate(self):
         [d] = hd.wolt_deliveries(wolt(courier=True, eta=at(-4)))
         self.assertEqual(d.eta, at(-4))
 
-    def test_the_same_venue_twice_keeps_each_orders_siblings_apart(self):
+    def test_the_same_venue_twice_keeps_each_orders_details_apart(self):
         old = wolt(status="delivered", kind="DELIVERED", items=7)
         new = wolt(suffix="_2", courier=True, eta=at(6), items=2)
         found = {d.id: d for d in hd.wolt_deliveries({**old, **new})}
@@ -234,8 +231,12 @@ class WoltDiscoveryTests(unittest.TestCase):
         self.assertEqual((found["wolt:test_kitchen_2"].stage, found["wolt:test_kitchen_2"].eta,
                           found["wolt:test_kitchen_2"].item_count), ("on_the_way", at(6), 2))
 
-    def test_a_venue_named_like_a_sibling_suffix_still_joins(self):
+    def test_an_old_sibling_with_the_same_id_suffix_cannot_override_the_orders_details(self):
         states = wolt(venue="Status Item Count", slug="status_item_count", courier=True, eta=at(3), items=4)
+        states["sensor.wolt_order_status_item_count_estimated_arrival"] = {
+            "state": stamp(at(1)), "attributes": {"venue_name": "Status Item Count"}}
+        states["sensor.wolt_order_status_item_count_item_count"] = {
+            "state": "9", "attributes": {"venue_name": "Status Item Count"}}
         [d] = hd.wolt_deliveries(states)
         self.assertEqual((d.eta, d.item_count), (at(3), 4))
 
@@ -254,8 +255,7 @@ class WoltDiscoveryTests(unittest.TestCase):
         states = {"sensor.wolt_delivery_a": None, "sensor.wolt_delivery_b": {"attributes": []},
                   "sensor.wolt_order_a_item_count": {"state": "nan", "attributes": None},
                   **wolt(courier=True, eta=at(4))}
-        states["sensor.wolt_order_test_kitchen_estimated_arrival"]["state"] = "not a time"
-        states["sensor.wolt_order_test_kitchen_item_count"]["state"] = "-3"
+        states["sensor.wolt_delivery_test_kitchen"]["attributes"].update(estimated_arrival="not a time", item_count=-3)
         [d] = hd.wolt_deliveries(states)
         self.assertEqual((d.eta, d.item_count), (None, None))
 
@@ -289,19 +289,20 @@ class WoltSensorsTemplateTests(unittest.TestCase):
                                              for entity_id, value in sensors.items()])
         return appdaemon_render_result(environment.from_string(hd.WOLT_SENSORS).render(states=fake))
 
-    def test_only_wolt_sensors_come_out_with_their_state_and_attributes(self):
+    def test_only_wolt_delivery_sensors_come_out_with_their_state_and_attributes(self):
         sensors = {**wolt(courier=True, eta=at(8), items=3), "sensor.washer_state": {"state": "Off", "attributes": {}},
-                   "sensor.woltish": {"state": "1", "attributes": {}}}
+                   "sensor.woltish": {"state": "1", "attributes": {}},
+                   "sensor.wolt_destination_test_kitchen": {"state": "unknown", "attributes": {}}}
         out = hd.wolt_states(self.render(sensors))
-        self.assertEqual(set(out), {key for key in sensors if key.startswith("sensor.wolt_")})
+        self.assertEqual(set(out), {"sensor.wolt_delivery_test_kitchen"})
         tracking = out["sensor.wolt_delivery_test_kitchen"]
         self.assertEqual((tracking["state"], tracking["attributes"]), ("unknown", sensors["sensor.wolt_delivery_test_kitchen"]["attributes"]))
         self.assertEqual([d.stage for d in hd.wolt_deliveries(out)], ["on_the_way"])
 
     def test_json_types_survive(self):
         attributes = {"flag": True, "nothing": None, "list": [1, "a"], "number": 2.5}
-        out = hd.wolt_states(self.render({"sensor.wolt_x": {"state": "s", "attributes": attributes}}))
-        self.assertEqual(out["sensor.wolt_x"]["attributes"], attributes)
+        out = hd.wolt_states(self.render({"sensor.wolt_delivery_x": {"state": "s", "attributes": attributes}}))
+        self.assertEqual(out["sensor.wolt_delivery_x"]["attributes"], attributes)
 
     def test_appdaemon_leaves_even_an_empty_result_a_string(self):
         self.assertEqual(self.render({}), "J[]")
@@ -1439,6 +1440,29 @@ class Harness:
 
 
 class AppTests(unittest.TestCase):
+    def test_only_confirmed_home_orders_reach_delivery_and_courier_signals(self):
+        home = wolt(courier=True, eta=at(3))
+        for destination in (False, None, "true", 1):
+            with self.subTest(destination=destination):
+                away = wolt(suffix="_2", courier=True, eta=at(1), delivers_to_home=destination)
+                h = Harness(away)
+                state, attrs = h.last
+                self.assertEqual((state, attrs["deliveries"], attrs["door_courier_kind"]), ("0", [], None))
+                h.states.update(home)
+                h.tick(30)
+                state, attrs = h.last
+                self.assertEqual(state, "1")
+                self.assertEqual([entry["id"] for entry in attrs["deliveries"]], ["wolt:test_kitchen"])
+                self.assertEqual(attrs["door_courier"]["id"], "wolt:test_kitchen")
+
+    def test_confirmed_non_home_update_clears_the_courier_immediately(self):
+        h = Harness(wolt(courier=True, eta=at(3)))
+        self.assertEqual(h.last[1]["door_courier_kind"], "food")
+        h.states.update(wolt(delivers_to_home=False))
+        h.tick(30)
+        state, attrs = h.last
+        self.assertEqual((state, attrs["deliveries"], attrs["door_courier_kind"]), ("0", [], None))
+
     def test_init_publishes_a_complete_replacing_idle_entity_and_ignores_old_orders(self):
         old = wolt(status="delivered", kind="DELIVERED")
         h = Harness(old)
@@ -1512,14 +1536,15 @@ class AppTests(unittest.TestCase):
         self.assertEqual(len(h.published), before + 1)
         self.assertEqual(h.last[1]["next"]["stage"], "on_the_way")
 
-    def test_an_order_whose_sensor_blinks_is_held_not_dropped(self):
+    def test_a_confirmed_wolt_order_is_held_through_a_temporary_sensor_gap(self):
         h = Harness(wolt(courier=True, eta=at(10)))
         for entity in list(h.states):
             h.states[entity] = {"state": "unavailable", "attributes": {"friendly_name": "Wolt"}}
         h.tick(60)
         self.assertEqual(h.last[0], "1")
-        h.tick(600)
-        self.assertEqual(h.last[0], "0")
+        h.states.update(wolt(status="delivered", kind="DELIVERED"))
+        h.tick(30)
+        self.assertEqual([entry["stage"] for entry in h.last[1]["deliveries"]], ["delivered"])
 
     def test_two_orders_are_sorted_and_counted(self):
         h = Harness({**wolt(courier=True, eta=at(20)), **wolt(venue="Pizza Test", slug="pizza_test", courier=True, eta=at(6))})
