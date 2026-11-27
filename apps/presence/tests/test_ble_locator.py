@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
+import io
 import itertools
 import json
 import math
@@ -1174,6 +1176,47 @@ class TrainerHygiene(unittest.TestCase):
             self.assertEqual({room: total for room, (_, total) in result[method].items()},
                              {room: 60 * t.ALIGNMENTS for room in ROOMS})
         self.assertEqual(sum(right for right, _ in result["model"].values()), 3 * 60 * t.ALIGNMENTS)
+
+
+class TrainerWindows(unittest.TestCase):
+    """The trainer takes any number of windows: the runs of one are numbered on from the runs before it, the
+    model file records each window, and windows that make no sense are refused before the database is opened."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.t = load_trainer()
+
+    def test_runs_are_numbered_on_from_the_first_run_given(self):
+        t = self.t
+        table = {"one": {"address": S1, "name": "one", "area": "Kitchen"}}
+        series = {"one": t.Series([(0.0, 1.0)])}
+        truth = t.Series([(0.0, "Kitchen")])
+        vacuum = t.Series([(0.0, "cleaning"), (20.0, "docked"), (40.0, "cleaning"), (60.0, "docked")])
+        runs = lambda *first: [p["run"] for p in t.grid(series, table, truth, vacuum, 0.0, 100.0, *first)]
+        self.assertEqual(runs(), [0] * 4 + [1] * 4)
+        self.assertEqual(runs(7), [7] * 4 + [8] * 4)
+
+    def test_the_model_file_records_each_window_and_their_span(self):
+        t = self.t
+        windows = [(T0 - 7200, T0 - 3600), (T0 - 1800, T0 - 900)]
+        by_address = {s: {"address": s, "name": f"scanner {s[-1]}", "area": "Kitchen"} for s in SCANNERS}
+        stats = {room: {s: (m, 6.0, 5) for s, m in MEANS[room].items()} for room in ROOMS}
+        doc = t.model_document(ROOMS, by_address, stats, (windows[0][0], windows[-1][1]), {}, windows=windows)
+        self.assertEqual(doc["trained_window"], {"start": t.iso(T0 - 7200), "end": t.iso(T0 - 900)})
+        self.assertEqual(doc["trained_windows"], [{"start": t.iso(a), "end": t.iso(b)} for a, b in windows])
+        self.assertEqual(bl.Model(json.loads(json.dumps(doc))).rooms, ROOMS)
+        single = t.model_document(ROOMS, by_address, stats, windows[0], {})
+        self.assertEqual(single["trained_windows"], [single["trained_window"]])
+
+    def test_windows_that_make_no_sense_are_refused_before_the_database_is_opened(self):
+        first = ["2026-11-17T17:54Z", "2026-11-17T18:56Z"]
+        for name, args in (("a start without an end", first + ["2026-11-18T09:08Z"]),
+                           ("an end before its start", first[::-1]),
+                           ("windows that overlap", first + ["2026-11-17T18:30Z", "2026-11-18T09:08Z"])):
+            with self.subTest(name), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    self.t.main(args)
+                self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

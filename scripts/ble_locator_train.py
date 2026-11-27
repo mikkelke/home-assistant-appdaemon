@@ -2,15 +2,16 @@
 read-only; the only write is the model file, and only on request.
 
 SAMPLES. The beacon stuck on Rober2 (sensor.mp1_142377_distance_to_*) is heard by every scanner that
-feeds Bermuda. Every 5 s of the window in which the vacuum is `cleaning` is a grid point carrying what
-each scanner heard: its last recorded distance, when that is a number and under 120 s old, as dB =
--55 - 30 * log10(metres), at least -100. The room is the robot's (sensor.rober2_current_room, with
-Kitchen1 and Claudias room renamed to the area names), and a point is a sample once the robot has been
-in that room for 30 s. A room is modelled when a scanner in its own area heard the beacon in at least
-MIN_ROOM_SAMPLES of its samples: a room whose own scanner is deaf would teach the model what a deaf
-scanner looks like, and Bermuda's own area stays the answer for it. A scanner is the Bermuda scanner
-device named by the distance entity's unique id; its address is the first of that MAC + 0..3 with a
-bluetooth connection in the device registry, and its area that device's (else the base MAC's).
+feeds Bermuda. Every 5 s of the windows (one or more, each a start and an end) in which the vacuum is
+`cleaning` is a grid point carrying what each scanner heard: its last recorded distance, when that is a
+number and under 120 s old, as dB = -55 - 30 * log10(metres), at least -100. The room is the robot's
+(sensor.rober2_current_room, with Kitchen1 and Claudias room renamed to the area names), and a point is
+a sample once the robot has been in that room for 30 s. A room is modelled when a scanner in its own
+area heard the beacon in at least MIN_ROOM_SAMPLES of its samples: a room whose own scanner is deaf
+would teach the model what a deaf scanner looks like, and Bermuda's own area stays the answer for it.
+A scanner is the Bermuda scanner device named by the distance entity's unique id; its address is the
+first of that MAC + 0..3 with a bluetooth connection in the device registry, and its area that
+device's (else the base MAC's).
 OFFSET_HISTORY replays the scanner offsets set in Bermuda after a distance was recorded, so every
 sample reads as the offsets of today would have made it.
 
@@ -42,14 +43,15 @@ laid out ALIGNMENTS times, each shifted by a share of a block, and the counts ad
 boundary falls in a short visit moves the filter's score by several points. The table gives the share
 right per room, the mean over rooms and the share of all samples.
 
-OUTPUT. The window, the rooms and scanners and the table are printed. With --write PATH the model is
+OUTPUT. The windows, the rooms and scanners and the table are printed. With --write PATH the model is
 written there, through a temporary file and a rename, as {version, rooms, scanners: {address: {name,
-area}}, stats: {room: {address: [median, sd, n]}}, constants, offset_history, trained_window,
-trained_at}; but only when the model beats the nearest scanner by MIN_GAIN points over the rooms. If
-it does not, nothing is written and the exit status is 1.
+area}}, stats: {room: {address: [median, sd, n]}}, constants, offset_history, trained_window (the first
+start and the last end), trained_windows (each window), trained_at}; but only when the model beats the
+nearest scanner by MIN_GAIN points over the rooms. If it does not, nothing is written and the exit
+status is 1.
 
 Run on the box:
-  ssh 10.21.0.5 "sudo python3 - <UTC start> <UTC end> [--write PATH]" < scripts/ble_locator_train.py
+  ssh 10.21.0.5 "sudo python3 - <UTC start> <UTC end> [<UTC start> <UTC end> ...] [--write PATH]" < scripts/ble_locator_train.py
 """
 
 import argparse
@@ -287,10 +289,10 @@ def distance_series(rows, table, offset_history=OFFSET_HISTORY, c=CONSTANTS):
     return out
 
 
-def grid(series, table, truth, vacuum, start, end):
+def grid(series, table, truth, vacuum, start, end, first_run=0):
     """The 5 s grid points while the vacuum cleans: {t, room (the robot's, mapped, or None), settled, db, run}.
-    Points more than one grid step apart start a new run."""
-    points, run, previous = [], 0, None
+    Points more than one grid step apart start a new run, the first being number `first_run`."""
+    points, run, previous = [], first_run, None
     t = start
     while t < end:
         if vacuum.at(t)[1] == "cleaning":
@@ -397,8 +399,10 @@ def print_table(result, rooms):
 
 # ---------- the model file ----------
 
-def model_document(rooms, by_address, stats, window, by_suffix, c=CONSTANTS, offset_history=OFFSET_HISTORY):
-    """The model file's content. Its scanners are those that heard the beacon in at least one room."""
+def model_document(rooms, by_address, stats, window, by_suffix, c=CONSTANTS, offset_history=OFFSET_HISTORY,
+                   windows=None):
+    """The model file's content. Its scanners are those that heard the beacon in at least one room. `window` is
+    the first start and the last end, `windows` each (start, end) trained on, `window` alone when not given."""
     heard = {a for per in stats.values() for a in per}
     return {
         "version": MODEL_VERSION,
@@ -410,6 +414,7 @@ def model_document(rooms, by_address, stats, window, by_suffix, c=CONSTANTS, off
         "offset_history": [{"from": when + "Z", "scanner": by_suffix[suffix]["address"], "db": db}
                            for when, suffix, db in offset_history if suffix in by_suffix],
         "trained_window": {"start": iso(window[0]), "end": iso(window[1])},
+        "trained_windows": [{"start": iso(a), "end": iso(b)} for a, b in (windows or [window])],
         "trained_at": iso(datetime.now(timezone.utc).timestamp()),
     }
 
@@ -427,28 +432,34 @@ def write_model(path, document):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Fit and score the BleLocator room model from the recorder.")
-    parser.add_argument("start", help="window start, ISO date and time, UTC")
-    parser.add_argument("end", help="window end, ISO date and time, UTC")
+    parser.add_argument("window", nargs="+", metavar="UTC",
+                        help="a window's start and its end, ISO date and time, UTC; more pairs add more windows")
     parser.add_argument("--write", metavar="PATH", help="write the model JSON here if it beats the nearest scanner")
     args = parser.parse_args(argv)
-    start, end = ts(args.start), ts(args.end)
+    if len(args.window) % 2:
+        parser.error("each window needs a start and an end")
+    windows = sorted((ts(a), ts(b)) for a, b in zip(args.window[::2], args.window[1::2]))
+    if any(b <= a for a, b in windows) or any(x[1] > y[0] for x, y in zip(windows, windows[1:])):
+        parser.error("a window must end after it starts and windows must not overlap")
 
     db = sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True)
     areas = {a["id"]: a["name"] for a in read_storage("core.area_registry")["areas"]}
     table = scanner_table(read_storage("core.entity_registry")["entities"],
                           read_storage("core.device_registry")["devices"], areas)
     prefix = BEACON + "_distance_to_"
-    rows = history(db, [prefix + s for s in table] + ["sensor.rober2_current_room", "vacuum.rober2"], start, end)
-    points = grid(distance_series(rows, table), table, Series(rows["sensor.rober2_current_room"]),
-                  Series(rows["vacuum.rober2"]), start, end)
+    points = []
+    for start, end in windows:
+        rows = history(db, [prefix + s for s in table] + ["sensor.rober2_current_room", "vacuum.rober2"], start, end)
+        points += grid(distance_series(rows, table), table, Series(rows["sensor.rober2_current_room"]),
+                       Series(rows["vacuum.rober2"]), start, end, points[-1]["run"] + 1 if points else 0)
     by_address = {s["address"]: s for s in table.values()}
     counts = mark_samples(points, by_address)
     rooms = sorted({p["room"] for p in points if p["scored"]})
     if not rooms:
         sys.exit(f"no room has {MIN_ROOM_SAMPLES} settled cleaning samples heard by a scanner of its own area")
 
-    print(f"window {iso(start)} to {iso(end)}: {len(points)} cleaning points of 5 s, "
-          f"{sum(p['scored'] for p in points)} samples in {len(rooms)} rooms")
+    print(f"{'window' if len(windows) == 1 else 'windows'} " + ", ".join(f"{iso(a)} to {iso(b)}" for a, b in windows)
+          + f": {len(points)} cleaning points of 5 s, {sum(p['scored'] for p in points)} samples in {len(rooms)} rooms")
     skipped = {r: n for r, n in counts.items() if r not in rooms}
     if skipped:
         print("not modelled (settled points / of them heard by a scanner of the room's own area): "
@@ -473,7 +484,7 @@ def main(argv=None):
     print_table(result, rooms)
     gain = (balanced(result["model"]) - balanced(result["nearest"])) * 100
 
-    document = model_document(rooms, by_address, stats, (start, end), table)
+    document = model_document(rooms, by_address, stats, (windows[0][0], windows[-1][1]), table, windows=windows)
     print(f"\nthe model beats the nearest scanner by {gain:.1f} points over rooms (needs {MIN_GAIN:.0f})")
     if not args.write:
         print("not written: no --write")
