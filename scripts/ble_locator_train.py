@@ -14,14 +14,25 @@ bluetooth connection in the device registry, and its area that device's (else th
 OFFSET_HISTORY replays the scanner offsets set in Bermuda after a distance was recorded, so every
 sample reads as the offsets of today would have made it.
 
-MODEL. Per (room, scanner) the mean and sample standard deviation of the dB readings, the deviation at
-least 6, and 10 for a pair read fewer than twice. A pair never read is not stored and reads as mean
--95, sd 10. A room's log-likelihood is the sum over the scanners heard of the Gaussian log density of
-the reading minus the offset that fits the readings best to the room (the 1 / sd^2 weighted mean of
-reading minus mean over the scanners it has statistics for); a scanner not heard adds nothing. The
-filter keeps a belief over the rooms: it stays put with probability 0.98 ** (dt / 5), leaves for the
-other rooms in equal parts, and each reading's posterior (uniform prior, at least 1e-12) raised to the power 0.3 multiplies in.
-ble_locator.py does the same arithmetic on the model file's `constants`.
+MODEL. Per (room, scanner) the median and the sample standard deviation of the dB readings, the
+deviation at least 6. A pair read fewer than MIN_READINGS times in the room is not stored, like a pair
+never read, and reads as mean -95, sd 10. A room's log-likelihood is the sum over the scanners heard of
+the Gaussian log density of the reading minus the offset that fits the readings best to the room (the
+1 / sd^2 weighted mean of reading minus the room's median over the scanners it has statistics for); a
+scanner not heard adds nothing. The filter keeps a belief over the rooms: it stays put with probability
+0.98 ** (dt / 5), leaves for the other rooms in equal parts, and each reading's posterior (uniform prior,
+at least 1e-12) raised to the power 0.3 multiplies in. ble_locator.py does the same arithmetic on the
+model file's `constants`, reading the stored median as the room's mean level.
+
+TRAINING HYGIENE. Besides the median and the MIN_READINGS rule above, the fit learns only from the
+samples that pass two rules, taken in time order. A sample that heard fewer than MIN_SCANNERS scanners
+is left out: the model rests on how the levels differ between scanners, which one reading says nothing
+about. At most SPOT_MAX_S seconds of samples are taken from any one spot, so that a stretch where the
+robot stands still (at its dock, say) is not counted as many independent samples. A spot is a stretch
+of consecutive grid points in one room whose readings all stay within SPOT_DB dB of the stretch's first
+sample (the mean absolute difference over the scanners both heard); a gap, another room or a reading
+further away starts a new spot. These rules shape the fit only, in every held-out refit as well: all
+settled points of a modelled room are still scored.
 
 HELD-OUT. Each 2 min block of the grid is left out in turn with 30 s on each side, the model is
 refitted without it, and the block's samples are answered three ways: the nearest scanner (the
@@ -33,7 +44,7 @@ right per room, the mean over rooms and the share of all samples.
 
 OUTPUT. The window, the rooms and scanners and the table are printed. With --write PATH the model is
 written there, through a temporary file and a rename, as {version, rooms, scanners: {address: {name,
-area}}, stats: {room: {address: [mean, sd, n]}}, constants, offset_history, trained_window,
+area}}, stats: {room: {address: [median, sd, n]}}, constants, offset_history, trained_window,
 trained_at}; but only when the model beats the nearest scanner by MIN_GAIN points over the rooms. If
 it does not, nothing is written and the exit status is 1.
 
@@ -48,6 +59,7 @@ import json
 import math
 import os
 import sqlite3
+import statistics
 import sys
 from datetime import datetime, timezone
 
@@ -61,6 +73,10 @@ GRID_S = 5
 SETTLE_S = 30
 FRESH_S = 120
 MIN_ROOM_SAMPLES = 24
+MIN_READINGS = 3
+MIN_SCANNERS = 2
+SPOT_DB = 3.0
+SPOT_MAX_S = 60
 BLOCK_S, GAP_S, LEAD_S, ALIGNMENTS = 120, 30, 30, 4
 MIN_GAIN = 10.0
 MODEL_VERSION = 1
@@ -94,7 +110,7 @@ def to_db(metres, c=CONSTANTS):
 
 def best_offset(per, readings):
     """The offset in dB that fits `readings` best to a room's statistics `per`: the 1 / sd^2 weighted mean of
-    reading minus mean over the scanners the room has statistics for, 0 when it has none of them."""
+    reading minus median over the scanners the room has statistics for, 0 when it has none of them."""
     weighted = weights = 0.0
     for address, db in readings.items():
         if address in per:
@@ -144,10 +160,37 @@ def advance(belief, probs, dt, c=CONSTANTS):
     return [x / total for x in new]
 
 
-def fit(samples, c=CONSTANTS):
-    """{room: {address: (mean, sd, n)}} of the dB readings of `samples`, a pair per room and scanner heard."""
-    values = collections.defaultdict(lambda: collections.defaultdict(list))
+def same_spot(a, b):
+    """True when the readings `a` and `b` ({address: dB}) are within SPOT_DB of each other: the mean absolute
+    difference over the scanners both heard."""
+    common = a.keys() & b.keys()
+    return bool(common) and sum(abs(a[address] - b[address]) for address in common) / len(common) <= SPOT_DB
+
+
+def training_samples(samples):
+    """The samples of `samples` (in time order) that the fit learns from: those that heard at least MIN_SCANNERS
+    scanners, and of each spot only the first SPOT_MAX_S seconds' worth. A spot is a stretch of samples on
+    consecutive grid points in one room whose readings all stay within SPOT_DB of the stretch's first sample."""
+    kept, anchor, taken, previous = [], None, 0, None
     for sample in samples:
+        if len(sample["db"]) < MIN_SCANNERS:
+            continue
+        if (previous is not None and sample["room"] == previous["room"] and sample["t"] - previous["t"] <= GRID_S * 1.1
+                and same_spot(anchor["db"], sample["db"])):
+            taken += 1
+        else:
+            anchor, taken = sample, 1
+        previous = sample
+        if taken * GRID_S <= SPOT_MAX_S:
+            kept.append(sample)
+    return kept
+
+
+def fit(samples, c=CONSTANTS):
+    """{room: {address: (median, sd, n)}} of the dB readings of training_samples(samples), `samples` in time order: a
+    triple per room and scanner read at least MIN_READINGS times, the sd the sample deviation about the mean."""
+    values = collections.defaultdict(lambda: collections.defaultdict(list))
+    for sample in training_samples(samples):
         for address, db in sample["db"].items():
             values[sample["room"]][address].append(db)
     stats = {}
@@ -155,10 +198,11 @@ def fit(samples, c=CONSTANTS):
         stats[room] = {}
         for address, xs in per.items():
             n = len(xs)
+            if n < MIN_READINGS:
+                continue
             mean = sum(xs) / n
-            sd = (max(math.sqrt(sum((x - mean) ** 2 for x in xs) / (n - 1)), c["sd_floor_db"]) if n > 1
-                  else c["unseen_sd_db"])
-            stats[room][address] = (mean, sd, n)
+            sd = max(math.sqrt(sum((x - mean) ** 2 for x in xs) / (n - 1)), c["sd_floor_db"])
+            stats[room][address] = (statistics.median(xs), sd, n)
     return stats
 
 
@@ -310,7 +354,7 @@ def held_out(points, rooms, by_address, c=CONSTANTS):
         for block, test in sorted(blocks.items()):
             low, high = origin + block * BLOCK_S, origin + (block + 1) * BLOCK_S
             train = {i for i in scored if points[i]["t"] < low - GAP_S or points[i]["t"] >= high + GAP_S}
-            stats = fit([points[i] for i in train], c)
+            stats = fit([points[i] for i in sorted(train)], c)
             for run in sorted({points[i]["run"] for i in test}):
                 mine = [i for i in test if points[i]["run"] == run]
                 first, last = points[mine[0]]["t"], points[mine[-1]]["t"]
@@ -412,13 +456,16 @@ def main(argv=None):
     unnamed = sorted(r for r in rooms if r not in areas.values())
     if unnamed:
         print("rooms that are no area name:", ", ".join(unnamed))
-    stats = fit([p for p in points if p["scored"]])
+    scored = [p for p in points if p["scored"]]
+    print(f"training samples: {len(training_samples(scored))} of {len(scored)} kept "
+          f"(at least {MIN_SCANNERS} scanners heard, at most {SPOT_MAX_S} s from one spot)")
+    stats = fit(scored)
     heard = {a for per in stats.values() for a in per}
     print(f"{len(heard)} scanners heard the beacon: " + ", ".join(
         f"{by_address[a]['name']} [{by_address[a]['area']}]" for a in sorted(heard, key=lambda a: by_address[a]["name"])))
     silent = sorted(s["name"] for a, s in by_address.items() if a not in heard)
     if silent:
-        print("scanners that heard nothing in the samples, left out:", ", ".join(silent))
+        print(f"scanners read fewer than {MIN_READINGS} times in every room, left out:", ", ".join(silent))
 
     result = held_out(points, rooms, by_address)
     print(f"\nleave-one-block-out, {BLOCK_S} s blocks with {GAP_S} s left out on each side, filter restarted per "

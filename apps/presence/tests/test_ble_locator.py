@@ -15,6 +15,7 @@ import json
 import math
 import os
 import random
+import statistics
 import sys
 import tempfile
 import types
@@ -1021,24 +1022,30 @@ class Setup(unittest.TestCase):
                                                            "sensor.kristine_ble_room", "sensor.rober2_beacon_ble_room"])
 
 
+def load_trainer():
+    path = Path(__file__).resolve().parents[3] / "scripts" / "ble_locator_train.py"
+    spec = importlib.util.spec_from_file_location("ble_locator_train", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class TrainerAgrees(unittest.TestCase):
     """scripts/ble_locator_train.py scores the model held-out with its own copy of the arithmetic; its model
     file must be one the app reads and both must give the same numbers."""
 
     @classmethod
     def setUpClass(cls):
-        path = Path(__file__).resolve().parents[3] / "scripts" / "ble_locator_train.py"
-        spec = importlib.util.spec_from_file_location("ble_locator_train", path)
-        cls.trainer = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.trainer)
+        cls.trainer = load_trainer()
 
     def points(self):
         rng = random.Random(3)
         out = []
         for room in ROOMS:
             for i in range(40):
-                out.append({"room": room, "db": {s: max(m + rng.gauss(0, 5), -100.0) for s, m in MEANS[room].items()
-                                                 if not (s == S4 and i % 5 == 0)}})
+                out.append({"t": 5.0 * len(out), "room": room,
+                            "db": {s: max(m + rng.gauss(0, 5), -100.0) for s, m in MEANS[room].items()
+                                   if not (s == S4 and i % 5 == 0)}})
         return out
 
     def test_the_file_the_trainer_writes_is_a_model_the_app_reads_and_scores_alike(self):
@@ -1072,6 +1079,101 @@ class TrainerAgrees(unittest.TestCase):
             self.assertEqual(self.trainer.to_db(metres), model.to_db(metres))
         self.assertEqual(self.trainer.CONSTANTS["p_stay"], CONSTANTS["p_stay"])
         self.assertEqual(self.trainer.CONSTANTS, CONSTANTS)
+
+
+class TrainerHygiene(unittest.TestCase):
+    """The trainer fits the room statistics from the samples that pass its hygiene rules: the median of a
+    pair's readings, no pair read fewer than MIN_READINGS times, no sample that heard fewer than MIN_SCANNERS
+    scanners, and at most SPOT_MAX_S seconds of samples from one spot."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.t = load_trainer()
+        cls.cap = cls.t.SPOT_MAX_S // cls.t.GRID_S
+
+    def moving(self, room, readings, start=0):
+        """One sample per grid step in `room` whose S2 and S3 readings jump 12 dB at every step, so that no two
+        neighbours are the same spot. `readings` are the S1 values."""
+        return [{"t": 5.0 * (start + k), "room": room,
+                 "db": {S1: db, S2: -60.0 - 12.0 * (k % 2), S3: -70.0 + 12.0 * (k % 2)}}
+                for k, db in enumerate(readings)]
+
+    def still(self, room, count, start=0):
+        """`count` consecutive samples in `room` that read the same within 2 dB."""
+        return [{"t": 5.0 * (start + k), "room": room,
+                 "db": {S1: -50.0 + (k % 3 - 1), S2: -60.0 + (k % 2), S3: -70.0 - (k % 3 - 1)}}
+                for k in range(count)]
+
+    def test_a_pairs_level_is_the_median_and_its_spread_the_sample_deviation_about_the_mean(self):
+        readings = [-50.0, -52.0, -51.0, -90.0, -49.0]
+        median, sd, n = self.t.fit(self.moving("Kitchen", readings))["Kitchen"][S1]
+        self.assertEqual((median, n), (-51.0, 5))
+        self.assertAlmostEqual(sd, statistics.stdev(readings))
+
+    def test_the_spread_is_never_below_the_floor(self):
+        stats = self.t.fit(self.moving("Kitchen", [-50.0, -50.5, -50.0, -49.5]))
+        self.assertEqual(stats["Kitchen"][S1][1], CONSTANTS["sd_floor_db"])
+
+    def test_a_scanner_read_fewer_than_three_times_in_a_room_is_not_stored(self):
+        for reads, stored in ((2, {S1, S2}), (3, {S1, S2, S3})):
+            samples = self.moving("Kitchen", [-50.0, -52.0, -51.0, -53.0, -49.0])
+            for sample in samples[reads:]:
+                del sample["db"][S3]
+            with self.subTest(reads=reads):
+                stats = self.t.fit(samples)
+                self.assertEqual(set(stats["Kitchen"]), stored)
+                self.assertEqual(stats["Kitchen"][S1][2], 5)
+
+    def test_a_sample_that_heard_fewer_than_two_scanners_teaches_nothing(self):
+        alone = [{"t": 500.0 + 5.0 * k, "room": "Kitchen", "db": {S4: -60.0 - 12.0 * (k % 2)}} for k in range(4)]
+        silent = [{"t": 600.0 + 5.0 * k, "room": "Kitchen", "db": {}} for k in range(4)]
+        stats = self.t.fit(self.moving("Kitchen", [-50.0, -52.0, -51.0, -53.0]) + alone + silent)
+        self.assertEqual(set(stats["Kitchen"]), {S1, S2, S3})
+        self.assertEqual(stats["Kitchen"][S1][2], 4)
+
+    def test_a_spot_gives_only_its_first_samples_up_to_the_cap(self):
+        samples = self.still("Kitchen", 40)
+        self.assertEqual(self.t.training_samples(samples), samples[:self.cap])
+        self.assertEqual(self.t.fit(samples)["Kitchen"][S1][2], self.cap)
+
+    def test_a_stretch_that_moves_is_not_capped(self):
+        samples = self.moving("Kitchen", [-50.0 - 3.0 * (k % 4) for k in range(40)])
+        self.assertEqual(self.t.training_samples(samples), samples)
+        self.assertEqual(self.t.fit(samples)["Kitchen"][S1][2], 40)
+
+    def test_a_gap_a_room_change_or_a_reading_further_away_starts_a_new_spot(self):
+        gap = self.still("Kitchen", 20) + self.still("Kitchen", 20, start=30)
+        self.assertEqual(len(self.t.training_samples(gap)), 2 * self.cap)
+        change = self.still("Kitchen", 20) + self.still("Living room", 20, start=20)
+        stats = self.t.fit(change)
+        self.assertEqual((stats["Kitchen"][S1][2], stats["Living room"][S1][2]), (self.cap, self.cap))
+        shifted = [dict(s, db={a: db - 10.0 for a, db in s["db"].items()}) for s in self.still("Kitchen", 20, start=20)]
+        self.assertEqual(len(self.t.training_samples(self.still("Kitchen", 20) + shifted)), 2 * self.cap)
+
+    def test_samples_are_compared_on_the_scanners_both_heard(self):
+        partly = self.still("Kitchen", 20)
+        for sample in partly[1::2]:
+            sample["db"] = {S1: sample["db"][S1], S4: -80.0}
+        self.assertEqual(len(self.t.training_samples(partly)), self.cap)
+        apart = self.still("Kitchen", 20)
+        apart[5]["db"] = {S4: -70.0, S5: -60.0}
+        self.assertEqual(len(self.t.training_samples(apart)), 5 + 1 + self.cap)
+
+    def test_the_held_out_still_scores_every_sample_though_the_fit_leaves_some_out(self):
+        t = self.t
+        points = []
+        for room in ROOMS:
+            for k in range(60):
+                points.append({"t": 5.0 * len(points), "room": room, "settled": True, "scored": True, "run": 0,
+                               "db": reading(room, delta=0.5 * (k % 3 - 1))})
+        by_address = {s: {"address": s, "name": s, "area": area} for s, area in
+                      zip(SCANNERS, ("Kitchen", "Living room", "Bedroom", "Bedroom", "Kitchen"))}
+        self.assertLess(len(t.training_samples(points)), len(points))
+        result = t.held_out(points, ROOMS, by_address)
+        for method in ("nearest", "model", "filter"):
+            self.assertEqual({room: total for room, (_, total) in result[method].items()},
+                             {room: 60 * t.ALIGNMENTS for room in ROOMS})
+        self.assertEqual(sum(right for right, _ in result["model"].values()), 3 * 60 * t.ALIGNMENTS)
 
 
 if __name__ == "__main__":
