@@ -1,7 +1,8 @@
 """HouseUpcoming - what is coming up in the house that only the server can know, for the dashboard's
 Now timeline: maintenance (the Rober2 parts, the appliances' run-based tasks, the drum clean and the
 hygiene run at their cheapest start, batteries by their replace-by day and
-offline devices, and houseplants that need water and one-off tasks; admin only),
+offline devices, houseplants that need water, one-off tasks and the bedroom humidifier's tank
+(upcoming_humidifier); admin only),
 rain, forecast or falling, while a terrace door is open (exploratory), and ice in the terrace ice bath.
 
 Publishes sensor.house_upcoming (shape in upcoming_core.py) plus one maintenance push a day, built
@@ -67,6 +68,7 @@ import run_ledger  # apps/appliances
 import upcoming_battery_age as age
 import upcoming_core as core
 import upcoming_drum as drum
+import upcoming_humidifier as humid
 import upcoming_ice as ice
 import upcoming_maint as maint
 import upcoming_once as once
@@ -142,6 +144,7 @@ class HouseUpcoming(hass.Hass):
         self.rain_ahead_home = timedelta(hours=float(rn.get("horizon_home_hours", 1)))
         self.rain_ahead_away = timedelta(hours=float(rn.get("horizon_away_hours", 3)))
         self.ice_cfg = ice.parse(a)
+        self.humid_cfg = humid.parse(a)
         self.inventory = maint.parse_inventory(a.get("batteries"))
         self.plants = plants.parse_plants(a.get("plants"))
         self.timed_plants = plants.parse_timed(a.get("plants"))
@@ -218,6 +221,8 @@ class HouseUpcoming(hass.Hass):
         sources += [self.washer_entity, self.price_entity, self.profiles_entity, self.rain_alert, self.rain_home,
                     self.stick_entity, self.ice_cfg["entity"], self.ice_cfg["air"], self.ice_cfg["person"]]
         sources += list(self.rain_doors) + list(self.inventory["devices"]) + list(self.plants)
+        if self.humid_cfg:
+            sources.append(self.humid_cfg["entity"])
         if self.yale_operators:
             sources += [self.yale_lock, self.yale_operator]
             sources += [item["person"] for item in self.yale_operators.values()]
@@ -470,6 +475,8 @@ class HouseUpcoming(hass.Hass):
 
         rows.extend(self._rain_rows(now))
         rows.extend(ice.rows(self._ice, self.ice_cfg, now))
+        if self.humid_cfg:
+            rows.extend(humid.rows(self.humid_cfg, self._state_of(self.humid_cfg["entity"])))
         # Informative notes never enter maintenance push conditions.
         rows.extend(yale.rows(self._yale_notes, self.yale_operators))
 

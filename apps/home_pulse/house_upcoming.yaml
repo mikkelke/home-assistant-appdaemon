@@ -1,7 +1,8 @@
 # HouseUpcoming - sensor.house_upcoming for the dashboard's Now timeline: maintenance (Rober2 parts,
 # the dishwasher's and the washer's run-based tasks, batteries and offline devices, houseplants to
-# water; admin only), rain while a terrace door is open, and ice in the terrace ice bath. Plus one
-# maintenance push a day to Mikkel while he is home, and one ice bath push per freeze-up. See house_upcoming.py.
+# water, the bedroom humidifier's tank; admin only), rain while a terrace door is open, and ice in the
+# terrace ice bath. Plus one maintenance push a day to Mikkel while he is home, and one ice bath push per
+# freeze-up. See house_upcoming.py.
 #
 # Keep sensor.house_upcoming out of the recorder (configuration.yaml recorder: exclude:): the lease
 # renews every 5 minutes.
@@ -94,6 +95,11 @@ HouseUpcoming:
   ice_thick_degree_hours: 80
   ice_push_from: "07:00:00"
   ice_push_until: "22:00:00"
+
+  # The bedroom humidifier's water level: a "Refill the humidifier" row in humidifier_area while it reads low or
+  # empty. Never pushed here; BedroomHumidifier pushes the empty tank.
+  humidifier_water: sensor.evaporative_humidifier_271a_water_level
+  humidifier_area: bedroom
 
   # One line per houseplant: name, area and water (optional, the litres to pour, which the row's title
   # shows), then either moisture or every_days. With moisture, its soil moisture sensor, the plant needs
