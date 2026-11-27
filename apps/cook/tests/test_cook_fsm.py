@@ -378,8 +378,9 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual((tracker.probe["pull"], tracker.probe.get("owner")), (None, None))
 
     def test_saved_off_lane_from_an_old_cook_is_not_a_target(self):
-        tracker = Tracker({"probe": {"phase": "off", "preset": "custom", "serve": 83, "pull": 80, "rest": 15}})
-        self.assertIsNone(tracker.probe["pull"])
+        tracker = Tracker({"probe": {"phase": "off", "preset": "custom", "serve": 83, "pull": 80, "rest": 15,
+                                     "owner": "mikkel", "_armed": True}})
+        self.assertEqual((tracker.probe["pull"], tracker.probe.get("owner")), (None, None))
         probe(tracker)
         self.assertIsNone(tracker.probe["pull"])
 

@@ -104,6 +104,7 @@ class Tracker:
         self.probe = _valid_saved(saved.get("probe"), _probe(), PROBE_PHASES)
         if self.probe["phase"] == "off" and number(self.probe.get("_armed")) is None:
             self.probe.update({key: _probe()[key] for key in PLAN_KEYS})
+            self.probe.pop("owner", None)
         timer = saved.get("timer")
         self.timer = timer if isinstance(timer, dict) and number(timer.get("end_at")) is not None else None
 
