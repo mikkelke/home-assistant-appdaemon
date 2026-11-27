@@ -19,6 +19,7 @@ PROBE_PHASES = ("off", "tracking", "near", "pull", "resting", "carve")
 PLAN_KEYS = ("preset", "serve", "pull", "rest", "steps", "hold")
 STEP_ID = re.compile(r"^[a-z0-9_-]{1,32}$")
 MAX_STEPS = 10
+PLAN_KEEP_S = 6 * 3600
 BATH_OPS = ("bath_start", "bath_stop", "silence", "bag_in", "bath_extend", "chill", "bath_clear")
 
 
@@ -101,7 +102,7 @@ class Tracker:
         saved = saved if isinstance(saved, dict) else {}
         self.bath = _valid_saved(saved.get("bath"), _bath(), BATH_PHASES)
         self.probe = _valid_saved(saved.get("probe"), _probe(), PROBE_PHASES)
-        if self.probe["phase"] == "off" and not self.probe.get("_armed"):
+        if self.probe["phase"] == "off" and number(self.probe.get("_armed")) is None:
             self.probe.update({key: _probe()[key] for key in PLAN_KEYS})
         timer = saved.get("timer")
         self.timer = timer if isinstance(timer, dict) and number(timer.get("end_at")) is not None else None
@@ -132,11 +133,10 @@ class Tracker:
     def _new_probe(self, now):
         old = self.probe
         self.probe = _probe()
-        if old.get("_armed"):
-            for key in PLAN_KEYS:
+        armed = number(old.get("_armed"))
+        if armed is not None and now - armed <= PLAN_KEEP_S:
+            for key in PLAN_KEYS + ("owner",):
                 self.probe[key] = copy.deepcopy(old.get(key))
-        if old.get("owner"):
-            self.probe["owner"] = old["owner"]
         self.probe.update(id=f"probe{int(now * 1000)}", start=now, phase="tracking")
 
     def _close(self, kind, now):
@@ -471,7 +471,7 @@ class Tracker:
                 preset.update(serve=serve, pull=serve - 3)
             probe.update(preset=preset["key"], serve=preset["serve"], pull=preset["pull"], rest=preset["rest"])
             if probe["phase"] == "off":
-                probe["_armed"] = True
+                probe["_armed"] = now
             return effects
         if op == "probe_steps":
             steps = parse_steps(data.get("steps"))
@@ -479,7 +479,7 @@ class Tracker:
                 return ignored
             probe["steps"] = steps
             if probe["phase"] == "off":
-                probe["_armed"] = True
+                probe["_armed"] = now
             return effects + self._plan(now)
         if op == "probe_hold":
             if data.get("cancel") is True:
@@ -490,7 +490,7 @@ class Tracker:
                 return ignored
             probe["hold"] = hold
             if probe["phase"] == "off":
-                probe["_armed"] = True
+                probe["_armed"] = now
             return effects + self._plan(now)
         if op == "timer_start":
             minutes, push, say = number(data.get("minutes")), data.get("push", "Kitchen timer done"), data.get("say")

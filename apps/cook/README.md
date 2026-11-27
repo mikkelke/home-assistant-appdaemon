@@ -28,8 +28,9 @@ an agent sets one. Once the probe is in meat, the owner gets one push "Probe in 
 set" and `sensor.cook_state` shows `next_kind: no_target`, `next_label: No target set`, and no
 `probe_target`, `probe_pull` or `probe_serve`.
 
-A plan sent while the probe lane is `off` (preset, steps, hold) is kept for the next probe cook and
-dropped when that cook closes. The next cook starts without a plan again.
+A plan sent while the probe lane is `off` (preset, steps, hold, owner) is kept for a probe cook that
+starts within 6 h of the last such command, and dropped when that cook closes. Every other cook
+starts without a plan.
 
 ## Probe ops
 
