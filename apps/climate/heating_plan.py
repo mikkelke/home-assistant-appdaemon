@@ -192,6 +192,7 @@ class SunCutConfig:
     credit_ratio: float = 0.5
     end_ratio: float = 0.35
     min_skipped_h: float = 0.2
+    min_ghi_kwh: float = 0.0  # kWh/m² of forecast sun a day needs before a cut may start
 
 
 @dataclass(frozen=True)
@@ -470,6 +471,7 @@ def _parse_sun_cut(raw, where: str) -> SunCutConfig:
         credit_ratio=float(raw.get("credit_ratio", 0.5)),
         end_ratio=float(raw.get("end_ratio", 0.35)),
         min_skipped_h=float(raw.get("min_skipped_h", 0.2)),
+        min_ghi_kwh=float(raw.get("min_ghi_kwh", 0.0)),
     )
 
 
@@ -959,7 +961,7 @@ def evaluate_cut(
 
     A window qualifies at credit_ratio. A window that is already running only has to stay
     above end_ratio, so a forecast hovering around one threshold does not end and restart a
-    cut."""
+    cut. A window that is not running also needs a day of at least min_ghi_kwh sun."""
     cut = zc.sun_cut
     if not cut.enabled:
         return CutEval()
@@ -969,7 +971,10 @@ def evaluate_cut(
             continue
         if b.skipped_h < cut.min_skipped_h:
             continue
-        threshold = cut.end_ratio if b.day.isoformat() == active_day else cut.credit_ratio
+        running = b.day.isoformat() == active_day
+        if not running and b.ghi_kwh < cut.min_ghi_kwh:
+            continue
+        threshold = cut.end_ratio if running else cut.credit_ratio
         if b.ratio >= threshold:
             windows.append((b.window_start, b.window_end, b.day.isoformat()))
     running = next((w[2] for w in windows if w[0] <= now_ts < w[1]), None)

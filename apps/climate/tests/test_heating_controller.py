@@ -611,7 +611,7 @@ class ShippedYaml(unittest.TestCase):
         self.assertAlmostEqual(b.ratio, 1.38, delta=0.01)
         self.assertEqual(len(windows), 1)
 
-    def test_the_shipped_sun_cut_takes_a_cold_windy_day_with_three_bright_hours(self):
+    def test_the_shipped_sun_cut_skips_a_cold_windy_day_with_three_dim_hours(self):
         b, windows = self.shipped_day(5.5, 21.2, 0.76, range(11, 14))
         self.assertEqual(b.n_sun, 3)
         self.assertAlmostEqual(b.h_dull, 9.27, delta=0.05)
@@ -619,7 +619,8 @@ class ShippedYaml(unittest.TestCase):
         self.assertAlmostEqual(b.s_sun, 1.23, delta=0.01)
         self.assertAlmostEqual(b.s_credit, 0.61, delta=0.01)
         self.assertAlmostEqual(b.ratio, 0.80, delta=0.01)
-        self.assertEqual(len(windows), 1)
+        self.assertLess(b.ghi_kwh, self.cfg.zones["family"].sun_cut.min_ghi_kwh)
+        self.assertEqual(windows, ())
 
     def test_the_shipped_sun_cut_leaves_a_dull_day_alone(self):
         b, windows = self.shipped_day(4.9, 17.9, 0.3, [])

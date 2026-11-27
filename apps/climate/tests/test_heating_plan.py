@@ -1292,6 +1292,15 @@ class BudgetAndCut(unittest.TestCase):
         cut = hp.evaluate_cut(self.zc, [gone], T(2), "2026-10-17")
         self.assertEqual((cut.windows, cut.active_day), ((), None))
 
+    def test_a_dim_day_does_not_start_a_cut_but_a_running_one_carries_on(self):
+        zc = replace(self.zc, sun_cut=replace(self.zc.sun_cut, min_ghi_kwh=1.2))
+        b = self.budget(dw(5.0, 10.0, 1.0), range(9, 15), zc=zc)
+        self.assertGreaterEqual(b.ratio, zc.sun_cut.credit_ratio)
+        self.assertEqual(len(hp.evaluate_cut(self.zc, [b], T(2), None).windows), 1)
+        self.assertEqual(hp.evaluate_cut(zc, [b], T(2), None).windows, ())
+        cut = hp.evaluate_cut(zc, [b], T(2), "2026-10-17")
+        self.assertEqual(cut.active_day, "2026-10-17")
+
     def test_a_window_not_started_yet_qualifies_but_is_not_running(self):
         b = self.budget(dw(5.0, 10.0, 3.5), range(9, 15))
         cut = hp.evaluate_cut(self.zc, [b], T(0, 30), None)
