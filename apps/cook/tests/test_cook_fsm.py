@@ -22,6 +22,12 @@ def probe(tracker, now=T, core=40, ambient=100, needles=None):
     return tracker.probe_reading(now, core, ambient, needles or [core, core + 1, core + 2, core + 3])
 
 
+def armed(key="beef"):
+    tracker = Tracker()
+    tracker.command("probe_preset", {"key": key}, T - 10)
+    return tracker
+
+
 def in_meat(tracker, core=40):
     probe(tracker, T, core)
     return probe(tracker, T + 30, core)
@@ -183,20 +189,34 @@ class BathTests(unittest.TestCase):
 
 class ProbeTests(unittest.TestCase):
     def test_automatic_tracking_and_preset_table(self):
-        tracker = Tracker()
+        tracker = armed()
         probe(tracker)
         self.assertEqual((tracker.probe["phase"], tracker.probe["preset"]), ("tracking", "beef"))
         expected = {"beef": (54, 50, 15), "lamb": (58, 54, 15), "pork": (63, 60, 15),
-                    "chicken": (66, 64, 10), "duck": (54, 51, 10), "fish": (50, 48, 5)}
+                    "chicken": (66, 64, 10), "duck": (54, 51, 10), "fish": (50, 48, 5),
+                    "chicken_thigh": (80, 78, 5)}
         for key, values in expected.items():
             tracker.command("probe_preset", {"key": key}, T + 1)
             self.assertEqual(tuple(tracker.probe[field] for field in ("serve", "pull", "rest")), values)
-        self.assertEqual(len(PRESETS), 7)
+        self.assertEqual(len(PRESETS), 8)
         tracker.command("probe_preset", {"key": "custom", "serve": 57.5}, T + 2)
         self.assertEqual((tracker.probe["serve"], tracker.probe["pull"], tracker.probe["rest"]), (57.5, 54.5, 15))
 
-    def test_in_meat_needs_continuous_thirty_seconds_and_three_degrees(self):
+    def test_no_target_never_arms_a_pull_and_pushes_once_in_meat(self):
         tracker = Tracker()
+        effects = probe(tracker, T, 51, 100)
+        self.assertEqual((tracker.probe["phase"], tracker.probe["preset"], tracker.probe["pull"]),
+                         ("tracking", None, None))
+        effects += probe(tracker, T + 30, 60, 100)
+        effects += probe(tracker, T + 60, 90, 120)
+        self.assertEqual([push["kind"] for push in pushes(effects)], ["no_target"])
+        self.assertEqual(tracker.probe["phase"], "tracking")
+        self.assertIsNone(tracker.probe["eta"])
+        tracker.command("probe_preset", {"key": "chicken_thigh"}, T + 61)
+        self.assertEqual([push["kind"] for push in pushes(probe(tracker, T + 90, 79, 120))], ["pull"])
+
+    def test_in_meat_needs_continuous_thirty_seconds_and_three_degrees(self):
+        tracker = armed()
         probe(tracker, T, 40, 42.9)
         probe(tracker, T + 30, 40, 43)
         self.assertFalse(tracker.probe["in_meat"])
@@ -208,7 +228,7 @@ class ProbeTests(unittest.TestCase):
         self.assertTrue(tracker.probe["in_meat"])
 
     def test_unavailable_resets_in_meat_confirmation(self):
-        tracker = Tracker()
+        tracker = armed()
         probe(tracker)
         tracker.probe_reading(T + 29, None, None, None)
         probe(tracker, T + 31)
@@ -217,7 +237,7 @@ class ProbeTests(unittest.TestCase):
         self.assertTrue(tracker.probe["in_meat"])
 
     def test_numeric_gap_or_restart_does_not_prove_continuous_in_meat(self):
-        tracker = Tracker()
+        tracker = armed()
         probe(tracker)
         tracker = Tracker(json.loads(json.dumps(tracker.to_dict())))
         probe(tracker, T + 120)
@@ -226,7 +246,7 @@ class ProbeTests(unittest.TestCase):
         self.assertTrue(tracker.probe["in_meat"])
 
     def test_numeric_rest_gap_cannot_trigger_plateau(self):
-        tracker = Tracker()
+        tracker = armed()
         in_meat(tracker, 51)
         tracker.command("probe_pulled", {}, T + 30)
         probe(tracker, T + 150, 51)
@@ -236,7 +256,7 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(tracker.probe["phase"], "carve")
 
     def test_no_probe_push_without_in_meat_then_pull_once_and_never_auto_pulled(self):
-        tracker = Tracker()
+        tracker = armed()
         self.assertEqual(pushes(probe(tracker, T, 51.2, 51.2)), [])
         self.assertEqual(tracker.probe["phase"], "pull")
         self.assertEqual(tracker.probe["_pull_at"], T)
@@ -249,18 +269,18 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(pushes(tracker.tick(T + 100)), [])
 
     def test_near_temperature_or_eta_has_no_push(self):
-        tracker = Tracker()
+        tracker = armed()
         in_meat(tracker)
         self.assertEqual(pushes(probe(tracker, T + 60, 47)), [])
         self.assertEqual(tracker.probe["phase"], "near")
-        other = Tracker()
+        other = armed()
         for at in range(0, 301, 30):
             self.assertEqual(pushes(probe(other, T + at, 20 + at / 60 * 3)), [])
         self.assertEqual(other.probe["phase"], "near")
         self.assertAlmostEqual(other.probe["eta"] - (T + 300), 300)
 
     def test_pulled_locks_coldest_index_ignores_surface_cooling_and_tracks_peak(self):
-        tracker = Tracker()
+        tracker = armed()
         in_meat(tracker, 51)
         probe(tracker, T + 31, 51, needles=[55, 51, 54, 56])
         tracker.command("probe_pulled", {}, T + 32)
@@ -271,7 +291,7 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual((tracker.probe["core"], tracker.probe["peak"]), (53.5, 54.1))
 
     def test_rest_plateau_after_two_minutes_carve_push_and_report_once(self):
-        tracker = Tracker()
+        tracker = armed()
         in_meat(tracker, 51)
         tracker.command("probe_pulled", {}, T + 30)
         effects = []
@@ -290,7 +310,7 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(pushes(probe(restored, T + 180, 51)), [])
 
     def test_maximum_rest_and_no_false_plateau_across_a_gap(self):
-        tracker = Tracker()
+        tracker = armed()
         tracker.command("probe_preset", {"key": "fish"}, T - 1)
         in_meat(tracker, 49)
         tracker.command("probe_pulled", {}, T + 30)
@@ -303,7 +323,7 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(len(pushes(effects, "carve")), 1)
 
     def test_lost_only_after_ninety_seconds_push_once_before_pull_then_unplug_closes(self):
-        tracker = Tracker()
+        tracker = armed()
         in_meat(tracker)
         tracker.probe_reading(T + 40, None, None, None)
         self.assertEqual(tracker.probe["core"], 40)
@@ -319,7 +339,7 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(effects[0]["record"]["kind"], "probe")
 
     def test_no_lost_push_after_pull_and_recovery_clears_alarm(self):
-        tracker = Tracker()
+        tracker = armed()
         in_meat(tracker, 51)
         tracker.probe_reading(T + 40, None, None, None)
         self.assertEqual(pushes(tracker.tick(T + 131)), [])
@@ -328,10 +348,11 @@ class ProbeTests(unittest.TestCase):
         self.assertFalse(tracker.probe["lost"])
         self.assertNotIn("stale_since", tracker.probe)
 
-    def test_done_suppresses_rearming_until_unplug_then_remembers_last_preset(self):
-        tracker = Tracker()
-        tracker.command("probe_preset", {"key": "duck"}, T - 1)
+    def test_done_suppresses_rearming_until_unplug_and_next_cook_starts_without_a_plan(self):
+        tracker = armed("duck")
+        tracker.command("probe_steps", {"steps": [{"id": "a", "core": 30, "push": "x"}]}, T - 1)
         probe(tracker)
+        self.assertEqual((tracker.probe["preset"], len(tracker.probe["steps"])), ("duck", 1))
         effects = tracker.command("probe_done", {}, T + 10)
         self.assertEqual(effects[0]["record"]["preset"], "duck")
         probe(tracker, T + 20)
@@ -339,10 +360,25 @@ class ProbeTests(unittest.TestCase):
         tracker.probe_reading(T + 30, None, None, None)
         tracker.tick(T + 630)
         probe(tracker, T + 631)
-        self.assertEqual((tracker.probe["phase"], tracker.probe["preset"]), ("tracking", "duck"))
+        self.assertEqual((tracker.probe["phase"], tracker.probe["preset"], tracker.probe["steps"]),
+                         ("tracking", None, []))
+
+    def test_plan_set_before_the_probe_goes_in_carries_into_the_cook(self):
+        tracker = Tracker()
+        tracker.command("probe_preset", {"key": "chicken_thigh"}, T - 5, owner="claudia")
+        tracker.command("probe_hold", {"guest_push": "Ud med fadet", "ceiling": 85}, T - 4)
+        probe(tracker)
+        self.assertEqual((tracker.probe["pull"], tracker.probe["owner"], tracker.probe["hold"]["ceiling"]),
+                         (78, "claudia", 85))
+
+    def test_saved_off_lane_from_an_old_cook_is_not_a_target(self):
+        tracker = Tracker({"probe": {"phase": "off", "preset": "custom", "serve": 83, "pull": 80, "rest": 15}})
+        self.assertIsNone(tracker.probe["pull"])
+        probe(tracker)
+        self.assertIsNone(tracker.probe["pull"])
 
     def test_shadow_eta_once_a_minute_persisted_in_record_without_early_push(self):
-        tracker = Tracker()
+        tracker = armed()
         for at in range(0, 301):
             self.assertEqual(pushes(probe(tracker, T + at, 20 + at / 60)), [])
         self.assertEqual(len(tracker.probe["shadow"]), 6)
@@ -350,6 +386,105 @@ class ProbeTests(unittest.TestCase):
         tracker = Tracker(json.loads(json.dumps(tracker.to_dict())))
         effects = tracker.command("probe_done", {}, T + 301)
         self.assertEqual(len(effects[0]["record"]["shadow"]), 6)
+
+
+THIGHS = [{"id": "olives", "core": 65, "push": "Kom oliven i fadet", "say": "Add the olives now."},
+          {"id": "pan", "before_pull": 3, "push": "Sæt panden på", "say": "Put the pan on."}]
+
+
+class PlanTests(unittest.TestCase):
+    def test_core_and_before_pull_steps_fire_once_with_owner_and_announcement(self):
+        tracker = armed("chicken_thigh")
+        self.assertEqual(tracker.command("probe_steps", {"steps": THIGHS}, T - 1, owner="kristine"),
+                         [{"type": "state"}])
+        self.assertEqual(pushes(probe(tracker, T, 66, 150)), [])
+        effects = probe(tracker, T + 30, 66, 150)
+        step = pushes(effects, "step_olives")
+        self.assertEqual((len(step), step[0]["title"], step[0]["say"], step[0]["owner"]),
+                         (1, "Kom oliven i fadet", "Add the olives now.", "kristine"))
+        effects = []
+        for at in range(60, 900, 30):
+            effects += probe(tracker, T + at, 66 + (at - 60) / 50, 150)
+            if pushes(effects, "step_pan"):
+                break
+        self.assertEqual(tracker.probe["phase"], "near")
+        self.assertLessEqual(tracker.probe["eta"] - (T + at), 180)
+        self.assertEqual(len(pushes(effects, "step_olives")), 0)
+        self.assertEqual(len(pushes(effects, "step_pan")), 1)
+        self.assertEqual([row[0] for row in tracker.probe["fired"]], ["olives", "pan"])
+        tracker.command("probe_steps", {"steps": THIGHS}, T + 901)
+        self.assertEqual([push["kind"] for push in pushes(probe(tracker, T + 930, 79, 150))], ["pull"])
+
+    def test_steps_wait_for_meat_and_before_pull_needs_a_target(self):
+        tracker = Tracker()
+        tracker.command("probe_steps", {"steps": THIGHS}, T - 1)
+        self.assertEqual(pushes(probe(tracker, T, 70, 70)), [])
+        effects = probe(tracker, T + 60, 70, 150) + probe(tracker, T + 90, 70, 150)
+        self.assertEqual(sorted(push["kind"] for push in pushes(effects)), ["no_target", "step_olives"])
+
+    def test_hold_reports_pull_as_holding_warns_at_ceiling_and_fires_guest_once(self):
+        tracker = armed("chicken_thigh")
+        tracker.command("probe_hold", {"ceiling": 85, "guest_push": "Tag fadet ud og start panden",
+                                       "guest_say": "The guest is here."}, T - 1)
+        in_meat(tracker, 70)
+        effects = probe(tracker, T + 60, 78.5, 150)
+        self.assertEqual(pushes(effects, "pull")[0]["message"], "Holding until the guest rings")
+        self.assertEqual(tracker.probe["phase"], "pull")
+        effects = probe(tracker, T + 90, 85.5, 150)
+        ceiling = pushes(effects, "ceiling")
+        self.assertEqual((len(ceiling), ceiling[0]["say"]), (1, "The core is past 85 degrees."))
+        self.assertEqual(pushes(probe(tracker, T + 120, 86, 150)), [])
+        effects = tracker.guest_rang(T + 130)
+        guest = pushes(effects, "guest")
+        self.assertEqual((guest[0]["title"], guest[0]["say"], tracker.probe["guest_at"]),
+                         ("Tag fadet ud og start panden", "The guest is here.", T + 130))
+        self.assertEqual(tracker.guest_rang(T + 140), [])
+        restored = Tracker(json.loads(json.dumps(tracker.to_dict())))
+        self.assertEqual(pushes(probe(restored, T + 150, 86, 150)), [])
+
+    def test_guest_before_pull_fires_at_pull_and_ring_without_hold_is_ignored(self):
+        tracker = armed("chicken_thigh")
+        in_meat(tracker, 60)
+        self.assertEqual(tracker.guest_rang(T + 40), [])
+        tracker.command("probe_hold", {"guest_push": "Ud med fadet"}, T + 41)
+        self.assertEqual(pushes(tracker.guest_rang(T + 42)), [])
+        effects = probe(tracker, T + 60, 78, 150)
+        self.assertEqual(pushes(effects, "pull")[0]["title"], "Pull the roast now · 78.0°")
+        self.assertEqual(len(pushes(effects, "guest")), 1)
+
+    def test_timer_fires_once_with_core_and_cancel(self):
+        tracker = armed()
+        in_meat(tracker, 45)
+        tracker.command("timer_start", {"minutes": 2, "push": "Tjek kartoflerne", "say": "Check the potatoes."},
+                        T + 40, owner="claudia")
+        self.assertEqual(pushes(tracker.tick(T + 159)), [])
+        effects = pushes(tracker.tick(T + 160))
+        self.assertEqual((effects[0]["title"], effects[0]["message"], effects[0]["say"], effects[0]["owner"]),
+                         ("Tjek kartoflerne", "Core 45.0°", "Check the potatoes.", "claudia"))
+        self.assertIsNone(tracker.timer)
+        tracker.command("timer_start", {"minutes": 1}, T + 200)
+        self.assertEqual(tracker.timer["push"], "Kitchen timer done")
+        restored = Tracker(json.loads(json.dumps(tracker.to_dict())))
+        self.assertEqual(restored.command("timer_cancel", {}, T + 210), [{"type": "state"}])
+        self.assertEqual(pushes(restored.tick(T + 300)), [])
+
+    def test_bad_plans_are_ignored(self):
+        tracker = Tracker()
+        bad = [[{"id": "a", "push": "x"}], [{"id": "a", "core": 60, "before_pull": 5, "push": "x"}],
+               [{"id": "A B", "core": 60, "push": "x"}], [{"id": "a", "core": 60}],
+               [{"id": "a", "core": 60, "push": "x"}, {"id": "a", "core": 70, "push": "y"}],
+               [{"id": "a", "core": 200, "push": "x"}], [{"id": "a", "before_pull": 0, "push": "x"}],
+               [{"id": "a", "core": 60, "push": "x", "say": ""}], "nope",
+               [{"id": f"s{index}", "core": 60, "push": "x"} for index in range(11)]]
+        for steps in bad:
+            self.assertEqual(tracker.command("probe_steps", {"steps": steps}, T)[0]["type"], "ignored")
+        for data in ({}, {"ceiling": 85}, {"guest_push": "x", "ceiling": "hot"}):
+            self.assertEqual(tracker.command("probe_hold", data, T)[0]["type"], "ignored")
+        for data in ({}, {"minutes": 0}, {"minutes": 5, "push": ""}):
+            self.assertEqual(tracker.command("timer_start", data, T)[0]["type"], "ignored")
+        self.assertEqual(tracker.command("timer_cancel", {}, T)[0]["type"], "ignored")
+        self.assertEqual(tracker.command("timer_start", {}, T, owner="mikkel")[0]["type"], "ignored")
+        self.assertEqual(tracker.command("probe_steps", {"steps": []}, T), [{"type": "state"}])
 
 
 class ValidationTests(unittest.TestCase):
@@ -365,6 +500,7 @@ class ValidationTests(unittest.TestCase):
         bath_ready(tracker)
         for value in (0, -1, True, "nan", "bad"):
             self.assertEqual(tracker.command("bag_in", {"minutes": value}, T)[0]["type"], "ignored")
+        tracker.command("probe_preset", {"key": "beef"}, T + 1)
         in_meat(tracker, 51)
         self.assertEqual(tracker.command("probe_preset", {"key": "fish"}, T + 31)[0]["type"], "ignored")
 

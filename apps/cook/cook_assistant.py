@@ -13,6 +13,8 @@ import cook_publish as pub
 TICK_S = 10
 LIVE_S = 30
 TABLET_IDLE_S = 120
+RING_FRESH_S = 120
+DEFAULT_OWNER = "mikkel"
 SERVICE_TIMEOUT_S = 20
 PUSH_ACTIONS = {"COOK_BAG_IN": "bag_in", "COOK_STOP": "bath_stop", "COOK_ICE": "chill",
                 "COOK_PULLED": "probe_pulled", "COOK_SILENCE": "silence"}
@@ -57,6 +59,11 @@ class CookAssistant(hass.Hass):
         self.tablet_notify = self.args.get("tablet_notify", "notify/mobile_app_oppopad4pro")
         self.tablet_interactive = self.args.get("tablet_interactive", "binary_sensor.oppopad4pro_interactive")
         self.push_link = self.args.get("push_link", "/dashboard-rooftop/home#room=kitchen")
+        self.people = {str(key): str(value) for key, value in (self.args.get("people") or {
+            "mikkel": "person.mikkel", "kristine": "person.kristine", "claudia": "person.claudia"}).items()}
+        self.kitchen_speaker = self.args.get("kitchen_speaker", "media_player.kitchen")
+        self.ring_sensor = self.args.get("ring_sensor", "binary_sensor.abb_welcome_gateway_intercom_ringing")
+        self.ring_event_entity = self.args.get("ring_event_entity", "event.abb_welcome_gateway_intercom")
         self._notifier = self.get_app("MobileNotifier")
         self._values = {}
         self._published = {}
@@ -78,6 +85,8 @@ class CookAssistant(hass.Hass):
         for entity in entities:
             self._values[entity] = self.get_state(entity, attribute="all") or {}
             self.listen_state(self._on_value, entity, attribute="all")
+        self.listen_state(self._on_ring, self.ring_sensor, new="on")
+        self.listen_state(self._on_ring_event, self.ring_event_entity, attribute="all")
         self.listen_event(self._on_command, "cook_command")
         self.listen_event(self._on_push_action, "mobile_app_notification_action")
         self.listen_event(self._on_plugin_started, "plugin_started")
@@ -181,9 +190,54 @@ class CookAssistant(hass.Hass):
         if payload is None:
             self.log("cook_command ignored: invalid data")
             return
-        self._apply(self._tracker.command(data.get("op"), payload, self.get_now_ts()))
+        owner = self._command_owner(data, payload)
+        self._apply(self._tracker.command(data.get("op"), payload, self.get_now_ts(), owner))
         self._checkpoint()
         self._publish()
+
+    def _command_owner(self, data, payload):
+        named = payload.get("owner")
+        if isinstance(named, str) and named in self.people:
+            return named
+        context = ((data.get("metadata") or {}).get("context") or {}) if isinstance(data, dict) else {}
+        user = str(context.get("user_id") or "").replace("-", "").lower()
+        if not user:
+            return None
+        verdict = self._attribution("cook_command", user)
+        return verdict.get("person") if verdict.get("method") == "dashboard_action" else None
+
+    def _attribution(self, event, user_id=None):
+        try:
+            app = self.get_app("ActorAttribution")
+            verdict = app.attribute(event, user_id=user_id) if app is not None else {}
+        except Exception as error:
+            self.log(f"ActorAttribution failed: {error!r}", level="WARNING")
+            return {}
+        return verdict if isinstance(verdict, dict) else {}
+
+    def _owner(self, effect):
+        owner = effect.get("owner")
+        if owner in self.people:
+            return owner
+        person = self._attribution("cook_push").get("person")
+        return person if person in self.people else DEFAULT_OWNER
+
+    def _on_ring(self, entity, attribute, old, new, kwargs):
+        self._ring()
+
+    def _on_ring_event(self, entity, attribute, old, new, kwargs):
+        attrs = (new.get("attributes") or {}) if isinstance(new, dict) else {}
+        at = pub.epoch(attrs.get("timestamp"))
+        if attrs.get("event_type") == "ring" and at is not None and abs(self.get_now_ts() - at) <= RING_FRESH_S:
+            self._ring()
+
+    def _ring(self):
+        effects = self._tracker.guest_rang(self.get_now_ts())
+        if effects:
+            self.log("Guest rang while holding the cook")
+            self._apply(effects)
+            self._checkpoint()
+            self._publish()
 
     def _on_push_action(self, event_name, data, kwargs):
         op = PUSH_ACTIONS.get((data or {}).get("action"))
@@ -210,7 +264,10 @@ class CookAssistant(hass.Hass):
             elif kind == "service":
                 self.create_task(self._device_command(effect))
             elif kind == "push":
-                self.create_task(self._send_push(effect))
+                owner = self._owner(effect)
+                if effect.get("say"):
+                    self._announce(owner, effect["say"])
+                self.create_task(self._send_push(effect, owner))
                 if effect.get("wake"):
                     self._wake_tablet(effect.get("id", "cook"))
             elif kind == "report":
@@ -241,14 +298,27 @@ class CookAssistant(hass.Hass):
             await self._call_service("button/press", entity_id=self.stop_entity if op == "bath_stop"
                                      else self.silence_entity)
 
-    async def _send_push(self, effect):
+    async def _send_push(self, effect, owner):
         try:
             await self._notifier.notify(title=effect["title"], message=effect.get("message", ""),
-                                        target=["mikkel"], category="cook", link=self.push_link,
+                                        target=[owner], category="cook", link=self.push_link,
                                         data={"data": {"tag": f"cook_{effect.get('id', 'alarm')}_{effect['kind']}",
                                                        "actions": effect.get("actions", [])}})
         except Exception as error:
             self.log(f"Cook push failed: {error!r}", level="WARNING")
+
+    def _announce(self, owner, message):
+        if self.get_state(self.people[owner]) != "home":
+            self.log(f"Kitchen announcement skipped, {owner} is not home: {message}")
+            return
+        try:
+            speakers = self.get_app("SonosNotifier")
+            if speakers is None:
+                self.log("SonosNotifier is not running: the kitchen announcement is not played", level="WARNING")
+                return
+            self.submit_to_executor(speakers.notify, message=message, target_speakers=[self.kitchen_speaker])
+        except Exception as error:
+            self.log(f"Kitchen announcement failed: {error!r}", level="WARNING")
 
     def _wake_tablet(self, cook_id):
         full = self._values.get(self.tablet_interactive) or {}
@@ -346,7 +416,8 @@ class CookAssistant(hass.Hass):
         self._published[key] = payload
 
     def _publish(self, force=False):
-        self._set("cook_state", pub.state_entity(self._tracker.bath, self._tracker.probe, self.get_now_ts()), force)
+        self._set("cook_state", pub.state_entity(self._tracker.bath, self._tracker.probe, self.get_now_ts(),
+                                                 self._tracker.timer), force)
         self._set("cook_log", pub.log_entity(self._records), force)
         if force:
             probe = self._tracker.probe

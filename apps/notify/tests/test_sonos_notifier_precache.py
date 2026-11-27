@@ -348,6 +348,7 @@ REVIEWED = {
     ("appliances/dryer_monitor.py", "msg"): "announce_message of dryer.yaml, else the literal the scan finds",
     ("appliances/washer_monitor.py", "self._finish_announcement(programme)"): "announce_message or drum clean",
     ("appliances/washer_monitor.py", "self._finish_announcement(confirmed_prog)"): "announce_message or drum clean",
+    ("cook/cook_assistant.py", "message"): "an agent's cook step sentence, written per cook, none fixed",
     ("deliveries/home_delivery.py", "parcel_outside_sentence(carrier)"): "one per carrier with a refresh button",
     ("intercom/intercom.py", "courier_words"): "courier_message() and COURIER_AT_THE_DOOR",
     ("intercom/intercom.py", "combined_message"): "a door's ring and its opening",

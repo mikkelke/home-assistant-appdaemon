@@ -81,7 +81,7 @@ def _label(prefix, at, approximate=False):
     return f"{prefix} {'≈ ' if approximate else ''}{clock}" if clock else prefix
 
 
-def _moment(bath, probe, now):
+def _moment(bath, probe, now, timer=None):
     if bath.get("low_water"):
         return "low_water", bath.get("_low_since"), "Low water · top up"
     if probe.get("lost"):
@@ -114,8 +114,13 @@ def _moment(bath, probe, now):
     elif phase == "chilling":
         add(3, "chill_done", bath.get("chill_until"), _label("Fridge", bath.get("chill_until")))
 
+    if timer:
+        add(3, "timer", timer.get("end_at"), _label("Timer", timer.get("end_at")))
     phase = probe.get("phase", "off")
-    if phase == "pull":
+    if phase in ("tracking", "near") and probe.get("pull") is None:
+        if probe.get("in_meat"):
+            add(1, "no_target", None, "No target set")
+    elif phase == "pull":
         at = probe.get("_pull_at")
         add(1, "pull", at, _label("Pull", at))
     elif phase == "carve":
@@ -131,12 +136,12 @@ def _moment(bath, probe, now):
     return kind, at, label
 
 
-def state_entity(bath, probe, now):
+def state_entity(bath, probe, now, timer=None):
     bath, probe = bath or {}, probe or {}
     bath_active = bath.get("phase", "off") != "off" or bool(bath.get("low_water"))
     probe_active = probe.get("phase", "off") != "off"
     state = "both" if bath_active and probe_active else "bath" if bath_active else "probe" if probe_active else "off"
-    kind, at, label = _moment(bath, probe, now)
+    kind, at, label = _moment(bath, probe, now, timer)
     attrs = {"bath_phase": bath.get("phase", "off"), "probe_phase": probe.get("phase", "off"),
              "next_kind": kind, "next_at": iso(at), "next_label": label,
              "presets": [{k: str(row[k]) if k == "key" else num(row[k], 1)
@@ -155,6 +160,22 @@ def state_entity(bath, probe, now):
     attrs["bath_low_water"] = "1" if bath.get("low_water") else None
     attrs["probe_in_meat"] = "1" if probe.get("in_meat") else None
     attrs["probe_preset"] = probe.get("preset")
+    attrs["probe_target"] = "1" if probe.get("pull") is not None else None
+    attrs["probe_owner"] = probe.get("owner")
+    attrs["bath_owner"] = bath.get("owner")
+    fired = {row[0]: row[1] for row in probe.get("fired") or [] if isinstance(row, list) and len(row) == 2}
+    attrs["probe_steps"] = [{"id": step["id"],
+                             "on": f"core {num(step['core'], 1)}" if "core" in step
+                             else f"pull -{num(step['before_pull'], 1)} min",
+                             "fired": iso(fired.get(step["id"])) or ""}
+                            for step in probe.get("steps") or [] if isinstance(step, dict)] or None
+    hold = probe.get("hold") if isinstance(probe.get("hold"), dict) else None
+    attrs["probe_hold"] = "1" if hold else None
+    attrs["probe_hold_ceiling"] = num(hold.get("ceiling"), 1) if hold else None
+    attrs["probe_guest_at"] = iso(probe.get("guest_at"))
+    if timer:
+        attrs["timer_at"] = iso(timer.get("end_at"))
+        attrs["timer_owner"] = timer.get("owner")
     if probe.get("needle"):
         values = list(probe["needle"][:4])
         values.extend([None] * (4 - len(values)))

@@ -1,4 +1,5 @@
 import copy
+import re
 
 from cook_predict import add_sample, bath_eta, number, probe_eta, slope
 
@@ -10,10 +11,15 @@ PRESETS = [
     {"key": "chicken", "serve": 66, "pull": 64, "rest": 10},
     {"key": "duck", "serve": 54, "pull": 51, "rest": 10},
     {"key": "fish", "serve": 50, "pull": 48, "rest": 5},
+    {"key": "chicken_thigh", "serve": 80, "pull": 78, "rest": 5},
     {"key": "custom", "serve": 54, "pull": 51, "rest": 15},
 ]
 BATH_PHASES = ("off", "heating", "too_hot", "ready", "cooking", "done", "chilling", "chilled", "interrupted")
 PROBE_PHASES = ("off", "tracking", "near", "pull", "resting", "carve")
+PLAN_KEYS = ("preset", "serve", "pull", "rest", "steps", "hold")
+STEP_ID = re.compile(r"^[a-z0-9_-]{1,32}$")
+MAX_STEPS = 10
+BATH_OPS = ("bath_start", "bath_stop", "silence", "bag_in", "bath_extend", "chill", "bath_clear")
 
 
 def _bath():
@@ -22,9 +28,51 @@ def _bath():
 
 
 def _probe():
-    return {"phase": "off", "preset": "beef", "serve": 54, "pull": 50, "rest": 15,
-            "in_meat": False, "lost": False, "_samples": [], "_rest_samples": [],
-            "_pushed": [], "shadow": [], "_suppressed": False}
+    return {"phase": "off", "preset": None, "serve": None, "pull": None, "rest": None,
+            "in_meat": False, "lost": False, "steps": [], "hold": None, "fired": [], "_samples": [],
+            "_rest_samples": [], "_pushed": [], "shadow": [], "_suppressed": False}
+
+
+def _text(value, limit):
+    return value.strip() if isinstance(value, str) and 0 < len(value.strip()) <= limit else None
+
+
+def parse_steps(raw):
+    if not isinstance(raw, list) or len(raw) > MAX_STEPS:
+        return None
+    steps, seen = [], set()
+    for row in raw:
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not STEP_ID.match(row["id"]):
+            return None
+        core, before = number(row.get("core")), number(row.get("before_pull"))
+        push, say = _text(row.get("push"), 140), row.get("say")
+        if row["id"] in seen or push is None or (core is None) == (before is None):
+            return None
+        if say is not None and _text(say, 200) is None:
+            return None
+        if (core is not None and not 0 < core <= 110) or (before is not None and not 0 < before <= 60):
+            return None
+        seen.add(row["id"])
+        step = {"id": row["id"], "push": push}
+        step.update({"core": core} if core is not None else {"before_pull": before})
+        if say is not None:
+            step["say"] = say.strip()
+        steps.append(step)
+    return steps
+
+
+def parse_hold(raw):
+    ceiling, push, say = number(raw.get("ceiling")), _text(raw.get("guest_push"), 140), raw.get("guest_say")
+    if push is None or (say is not None and _text(say, 200) is None):
+        return None
+    if raw.get("ceiling") is not None and (ceiling is None or not 0 < ceiling <= 110):
+        return None
+    hold = {"guest_push": push}
+    if say is not None:
+        hold["guest_say"] = say.strip()
+    if ceiling is not None:
+        hold["ceiling"] = ceiling
+    return hold
 
 
 def _valid_saved(data, defaults, phases):
@@ -37,9 +85,11 @@ def _valid_saved(data, defaults, phases):
             rows = restored[key] if isinstance(restored[key], list) else []
             restored[key] = [[number(value) for value in row] for row in rows if isinstance(row, (list, tuple))
                              and len(row) == 2 and all(number(value) is not None for value in row)][-100:]
-    for key in ("_pushed", "shadow"):
+    for key in ("_pushed", "shadow", "steps", "fired"):
         if key in restored and not isinstance(restored[key], list):
             restored[key] = []
+    if "hold" in restored and not isinstance(restored["hold"], dict):
+        restored["hold"] = None
     if restored["phase"] != "off" and (not isinstance(restored.get("id"), str)
                                        or number(restored.get("start")) is None):
         return defaults
@@ -51,23 +101,30 @@ class Tracker:
         saved = saved if isinstance(saved, dict) else {}
         self.bath = _valid_saved(saved.get("bath"), _bath(), BATH_PHASES)
         self.probe = _valid_saved(saved.get("probe"), _probe(), PROBE_PHASES)
+        if self.probe["phase"] == "off" and not self.probe.get("_armed"):
+            self.probe.update({key: _probe()[key] for key in PLAN_KEYS})
+        timer = saved.get("timer")
+        self.timer = timer if isinstance(timer, dict) and number(timer.get("end_at")) is not None else None
 
     def to_dict(self):
-        return copy.deepcopy({"bath": self.bath, "probe": self.probe})
+        return copy.deepcopy({"bath": self.bath, "probe": self.probe, "timer": self.timer})
 
-    def _push(self, lane, kind, title, message="", actions=(), wake=False, repeat=False):
+    def _push(self, lane, kind, title, message="", actions=(), wake=False, repeat=False, say=None):
         if kind in lane["_pushed"] and not repeat:
             return []
         lane["_pushed"].append(kind)
-        return [{"type": "push", "kind": kind, "id": lane.get("id", "cook_alarm"),
-                 "title": title, "message": message,
-                 "actions": [{"action": action, "title": label} for action, label in actions], "wake": wake}]
+        effect = {"type": "push", "kind": kind, "id": lane.get("id", "cook_alarm"),
+                  "title": title, "message": message, "owner": lane.get("owner"),
+                  "actions": [{"action": action, "title": label} for action, label in actions], "wake": wake}
+        if say:
+            effect["say"] = say
+        return [effect]
 
     def _new_bath(self, now):
         old = self.bath
         self.bath = _bath()
         for key in ("last_target", "last_minutes", "temp", "target", "low_water", "_mode", "_last_rate",
-                    "_low_since", "_low_repeated"):
+                    "_low_since", "_low_repeated", "owner"):
             if key in old:
                 self.bath[key] = old[key]
         self.bath.update(id=f"bath{int(now * 1000)}", start=now, phase="heating")
@@ -75,8 +132,11 @@ class Tracker:
     def _new_probe(self, now):
         old = self.probe
         self.probe = _probe()
-        for key in ("preset", "serve", "pull", "rest"):
-            self.probe[key] = old[key]
+        if old.get("_armed"):
+            for key in PLAN_KEYS:
+                self.probe[key] = copy.deepcopy(old.get(key))
+        if old.get("owner"):
+            self.probe["owner"] = old["owner"]
         self.probe.update(id=f"probe{int(now * 1000)}", start=now, phase="tracking")
 
     def _close(self, kind, now):
@@ -97,9 +157,8 @@ class Tracker:
             self.bath["_suppressed"] = True
         else:
             self.probe = _probe()
-            for key in ("preset", "serve", "pull", "rest", "_missing_since"):
-                if key in lane:
-                    self.probe[key] = lane[key]
+            if "_missing_since" in lane:
+                self.probe["_missing_since"] = lane["_missing_since"]
             self.probe["_suppressed"] = True
         return [{"type": "closed", "record": record}]
 
@@ -223,26 +282,81 @@ class Tracker:
                 else:
                     probe["_meat_since"] = None
             add_sample(probe["_samples"], now, core, 600)
-            probe["eta"], probe["slope"] = probe_eta(probe["_samples"], now, core, probe["pull"])
-            if probe["phase"] != "pull":
-                if core >= probe["pull"]:
-                    probe.update(phase="pull", _pull_at=now)
-                elif core >= probe["pull"] - 3 or (probe["eta"] is not None and probe["eta"] - now <= 300):
-                    probe["phase"] = "near"
-                else:
-                    probe["phase"] = "tracking"
-            if probe["phase"] == "pull" and probe["in_meat"]:
-                effects += self._push(probe, "pull", f"Pull the roast now · {core:.1f}°",
-                                      f"Rests to about {probe['serve']:g}°",
-                                      (("COOK_PULLED", "Pulled"),), wake=True)
+            if probe["pull"] is None:
+                probe["eta"], probe["slope"] = None, probe_eta(probe["_samples"], now, core, core)[1]
+                if probe["in_meat"]:
+                    effects += self._push(probe, "no_target", "Probe in the meat · no target set",
+                                          "No pull alarm until a target is set.")
+            else:
+                probe["eta"], probe["slope"] = probe_eta(probe["_samples"], now, core, probe["pull"])
+                if probe["phase"] != "pull":
+                    if core >= probe["pull"]:
+                        probe.update(phase="pull", _pull_at=now)
+                    elif core >= probe["pull"] - 3 or (probe["eta"] is not None and probe["eta"] - now <= 300):
+                        probe["phase"] = "near"
+                    else:
+                        probe["phase"] = "tracking"
+                if probe["phase"] == "pull" and probe["in_meat"]:
+                    if probe["hold"] and probe.get("guest_at") is None:
+                        title, message = f"Pull temperature reached · {core:.1f}°", "Holding until the guest rings"
+                    else:
+                        title, message = f"Pull the roast now · {core:.1f}°", f"Rests to about {probe['serve']:g}°"
+                    effects += self._push(probe, "pull", title, message, (("COOK_PULLED", "Pulled"),), wake=True)
+            effects += self._plan(now)
         elif probe["phase"] in ("resting", "carve"):
             probe["peak"] = max(probe.get("peak", core), core)
             add_sample(probe["_rest_samples"], now, core, 150)
+            effects += self._plan(now)
         return effects + self.tick(now)
+
+    def _plan(self, now):
+        probe, effects = self.probe, []
+        core, live = probe.get("core"), probe["phase"] in ("tracking", "near", "pull")
+        if core is None or not probe["in_meat"]:
+            return effects
+        for step in probe["steps"] if live else ():
+            if "core" in step:
+                due = core >= step["core"]
+            else:
+                eta = probe.get("eta")
+                due = probe["pull"] is not None and (
+                    probe["phase"] == "pull" or (eta is not None and eta - now <= step["before_pull"] * 60))
+            if due and f"step_{step['id']}" not in probe["_pushed"]:
+                probe["fired"].append([step["id"], now])
+                effects += self._push(probe, f"step_{step['id']}", step["push"], f"Core {core:.1f}°",
+                                      say=step.get("say"))
+        hold = probe["hold"]
+        if not hold:
+            return effects
+        ceiling = hold.get("ceiling")
+        if live and ceiling is not None and core >= ceiling:
+            effects += self._push(probe, "ceiling", f"Core past {ceiling:g}° · {core:.1f}°",
+                                  "Still holding for the guest" if probe.get("guest_at") is None else "",
+                                  say=f"The core is past {ceiling:g} degrees.")
+        if probe.get("guest_at") is not None and probe["phase"] in ("pull", "resting", "carve"):
+            effects += self._push(probe, "guest", hold["guest_push"], f"Core {core:.1f}°",
+                                  wake=True, say=hold.get("guest_say"))
+        return effects
+
+    def guest_rang(self, now):
+        probe = self.probe
+        if probe["phase"] == "off" or not probe["hold"] or probe.get("guest_at") is not None:
+            return []
+        probe["guest_at"] = now
+        return [{"type": "state"}] + self._plan(now)
 
     def tick(self, now):
         effects = []
         bath, probe = self.bath, self.probe
+        if self.timer is not None and now >= self.timer["end_at"]:
+            timer, self.timer = self.timer, None
+            core = probe.get("core") if probe["phase"] != "off" and probe.get("stale_since") is None else None
+            effect = {"type": "push", "kind": "timer", "id": timer["id"], "title": timer["push"],
+                      "message": f"Core {core:.1f}°" if core is not None else "", "owner": timer.get("owner"),
+                      "actions": [], "wake": True}
+            if timer.get("say"):
+                effect["say"] = timer["say"]
+            effects.append(effect)
         if (bath["low_water"] and bath.get("_low_since") is not None and not bath.get("_low_repeated")
                 and now - bath["_low_since"] >= 600):
             bath["_low_repeated"] = True
@@ -288,8 +402,21 @@ class Tracker:
             probe["_shadow_at"] = now
         return effects
 
-    def command(self, op, data, now):
+    def command(self, op, data, now, owner=None):
         data = data if isinstance(data, dict) else {}
+        lane = self.bath if op in BATH_OPS else self.probe if isinstance(op, str) and op.startswith("probe_") else None
+        before = lane.get("owner") if lane is not None else None
+        if owner and lane is not None and op != "probe_done":
+            lane["owner"] = owner
+        effects = self._command(op, data, now)
+        if effects == [{"type": "ignored", "op": op}]:
+            if lane is not None:
+                lane["owner"] = before
+        elif owner and op == "timer_start":
+            self.timer["owner"] = owner
+        return effects
+
+    def _command(self, op, data, now):
         bath, probe = self.bath, self.probe
         ignored = [{"type": "ignored", "op": op}]
         effects = [{"type": "state"}]
@@ -343,6 +470,43 @@ class Tracker:
                     return ignored
                 preset.update(serve=serve, pull=serve - 3)
             probe.update(preset=preset["key"], serve=preset["serve"], pull=preset["pull"], rest=preset["rest"])
+            if probe["phase"] == "off":
+                probe["_armed"] = True
+            return effects
+        if op == "probe_steps":
+            steps = parse_steps(data.get("steps"))
+            if steps is None:
+                return ignored
+            probe["steps"] = steps
+            if probe["phase"] == "off":
+                probe["_armed"] = True
+            return effects + self._plan(now)
+        if op == "probe_hold":
+            if data.get("cancel") is True:
+                probe["hold"] = None
+                return effects
+            hold = parse_hold(data)
+            if hold is None or probe["phase"] in ("resting", "carve"):
+                return ignored
+            probe["hold"] = hold
+            if probe["phase"] == "off":
+                probe["_armed"] = True
+            return effects + self._plan(now)
+        if op == "timer_start":
+            minutes, push, say = number(data.get("minutes")), data.get("push", "Kitchen timer done"), data.get("say")
+            if minutes is None or not 0 < minutes <= 720 or _text(push, 140) is None:
+                return ignored
+            if say is not None and _text(say, 200) is None:
+                return ignored
+            self.timer = {"id": f"timer{int(now * 1000)}", "start": now, "end_at": now + minutes * 60,
+                          "push": push.strip()}
+            if say is not None:
+                self.timer["say"] = say.strip()
+            return effects
+        if op == "timer_cancel":
+            if self.timer is None:
+                return ignored
+            self.timer = None
             return effects
         if op == "probe_pulled":
             if probe["phase"] != "pull" or probe.get("stale_since") is not None:

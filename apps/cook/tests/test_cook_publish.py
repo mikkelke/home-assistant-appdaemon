@@ -96,13 +96,32 @@ class StateTests(unittest.TestCase):
                     "probe_preset", "probe_serve", "probe_pull", "probe_core", "probe_ambient", "probe_needle",
                     "probe_core_index", "probe_in_meat", "probe_eta", "probe_slope", "probe_pulled_at",
                     "probe_pulled_core", "probe_peak", "probe_carve_at", "probe_stale_since", "presets",
-                    "friendly_name", "icon"}
+                    "probe_target", "friendly_name", "icon"}
         self.assertEqual(set(attrs), expected)
         rows = {row["key"]: row for row in attrs["presets"]}
         self.assertEqual(rows["beef"], {"key": "beef", "serve": "54", "pull": "50", "rest": "15"})
         self.assertEqual(rows["chicken"], {"key": "chicken", "serve": "66", "pull": "64", "rest": "10"})
         for row in rows.values():
             self.assertEqual(set(row), {"key", "serve", "pull", "rest"})
+
+    def test_plan_hold_timer_and_missing_target_are_published(self):
+        roast = probe("tracking", pull=None, serve=None, preset=None, in_meat=True, eta=None, owner="claudia",
+                      steps=[{"id": "olives", "core": 65, "push": "Oliven i"},
+                             {"id": "pan", "before_pull": 5, "push": "Panden på"}],
+                      fired=[["olives", NOW - 60]], hold={"guest_push": "Fadet ud", "ceiling": 85},
+                      guest_at=NOW - 30)
+        _, attrs = pub.state_entity({}, roast, NOW, {"end_at": NOW + 600, "owner": "mikkel"})
+        self.assertNotIn("probe_target", attrs)
+        self.assertNotIn("probe_pull", attrs)
+        self.assertEqual((attrs["next_kind"], attrs["next_label"]), ("no_target", "No target set"))
+        self.assertEqual(attrs["probe_steps"], [{"id": "olives", "on": "core 65", "fired": pub.iso(NOW - 60)},
+                                                {"id": "pan", "on": "pull -5 min", "fired": ""}])
+        self.assertEqual((attrs["probe_hold"], attrs["probe_hold_ceiling"], attrs["probe_owner"]), ("1", "85", "claudia"))
+        self.assertEqual((attrs["timer_at"], attrs["timer_owner"]), (pub.iso(NOW + 600), "mikkel"))
+        self.assertEqual(attrs["probe_guest_at"], pub.iso(NOW - 30))
+        strings(self, attrs, "cook_state")
+        rows = {row["key"]: row for row in attrs["presets"]}
+        self.assertEqual(rows["chicken_thigh"], {"key": "chicken_thigh", "serve": "80", "pull": "78", "rest": "5"})
 
     def test_unknown_values_omitted_false_flags_omitted_and_zero_preserved(self):
         _, attrs = pub.state_entity(bath(temp=0, low_water=False, ready_at=None),

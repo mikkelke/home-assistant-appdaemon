@@ -40,12 +40,17 @@ class Fake:
         self.published, self.history, self.tasks, self.calls = {}, [], [], []
         self.events, self.logs, self.listeners, self.timers, self.pushes = [], [], [], [], []
         self.responses = {}
+        self.announced, self.verdicts = [], {}
+        self.apps = {"MobileNotifier": self, "SonosNotifier": types.SimpleNamespace(notify=None),
+                     "ActorAttribution": self}
         app.args = {"state_file": str(root / "cook_state.json"), "ledger_file": str(root / "cook_log.json"),
                     "media_dir": str(root / "media")}
         app.get_now_ts = lambda: self.now
-        app.get_state = lambda entity, **kw: self.states.get(entity)
+        app.get_state = lambda entity, **kw: (self.states.get(entity) if kw.get("attribute") == "all"
+                                              else (self.states.get(entity) or {}).get("state"))
         app.set_state = self.set_state
-        app.get_app = lambda name: self
+        app.get_app = lambda name: self.apps.get(name)
+        app.submit_to_executor = lambda callback, **kw: self.announced.append(kw)
         app.listen_state = lambda callback, entity, **kw: self.listeners.append((entity, callback))
         app.listen_event = lambda callback, event, **kw: self.events.append((event, callback))
         app.run_every = lambda *args, **kw: self.timers.append(args)
@@ -55,6 +60,9 @@ class Fake:
         app.log = lambda *args, **kw: self.logs.append(args)
         app.initialize()
         self.drain()
+
+    def attribute(self, event, at=None, user_id=None):
+        return self.verdicts.get(user_id, {"person": None, "method": None})
 
     async def notify(self, **kwargs):
         self.pushes.append(kwargs)
@@ -82,8 +90,11 @@ class Fake:
         self.app._on_value(entity, "all", old, new, {})
         self.drain()
 
-    def command(self, op, data=None):
-        self.app._on_command("cook_command", {"op": op, "data": json.dumps(data or {})}, {})
+    def command(self, op, data=None, user=None):
+        event = {"op": op, "data": json.dumps(data or {})}
+        if user:
+            event["metadata"] = {"context": {"user_id": user}}
+        self.app._on_command("cook_command", event, {})
         self.drain()
 
     def tick(self, seconds):
@@ -120,6 +131,8 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(all(row["replace"] for row in self.fake.published.values()))
         self.assertEqual({event for event, _ in self.fake.events},
                          {"cook_command", "mobile_app_notification_action", "plugin_started"})
+        self.assertIn("binary_sensor.abb_welcome_gateway_intercom_ringing",
+                      {entity for entity, _ in self.fake.listeners})
         self.assertTrue((self.root / "cook_state.json").exists())
         self.assertTrue((self.root / "cook_log.json").exists())
 
@@ -186,6 +199,48 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(again.app._tracker.bath["phase"], "cooking")
         self.assertEqual(again.app._tracker.bath["minutes"], 150)
 
+    def test_unset_probe_pushes_no_target_to_mikkel_by_default(self):
+        self.fake.probe(30, 100)
+        self.fake.tick(30)
+        self.fake.probe(30, 100)
+        self.assertEqual([(push["title"], push["target"]) for push in self.fake.pushes],
+                         [("Probe in the meat · no target set", ["mikkel"])])
+        self.assertEqual(self.fake.published["sensor.cook_state"]["attributes"]["next_label"], "No target set")
+
+    def test_caller_becomes_owner_and_steps_announce_only_while_owner_home(self):
+        self.fake.verdicts["abc"] = {"person": "claudia", "method": "dashboard_action"}
+        self.fake.states["person.claudia"] = full("home")
+        self.fake.command("probe_preset", {"key": "chicken_thigh"}, user="a-b-c")
+        self.fake.command("probe_steps", {"steps": [
+            {"id": "olives", "core": 65, "push": "Oliven i", "say": "Add the olives."}]})
+        self.fake.probe(66, 150)
+        self.fake.tick(30)
+        self.fake.probe(66, 150)
+        self.assertEqual([(push["title"], push["target"]) for push in self.fake.pushes], [("Oliven i", ["claudia"])])
+        self.assertEqual(self.fake.announced, [{"message": "Add the olives.",
+                                                "target_speakers": ["media_player.kitchen"]}])
+        self.assertEqual(self.fake.published["sensor.cook_state"]["attributes"]["probe_owner"], "claudia")
+        self.fake.command("probe_steps", {"owner": "kristine", "steps": [
+            {"id": "pan", "core": 66, "push": "Panden på", "say": "Pan on."}]})
+        self.fake.probe(66.5, 150)
+        self.assertEqual(self.fake.pushes[-1]["target"], ["kristine"])
+        self.assertEqual(len(self.fake.announced), 1)
+
+    def test_intercom_ring_fires_guest_step_and_stale_event_does_not(self):
+        self.fake.command("probe_preset", {"key": "chicken_thigh"})
+        self.fake.command("probe_hold", {"guest_push": "Ud med fadet", "ceiling": 85})
+        self.fake.probe(78.5, 150)
+        self.fake.tick(30)
+        self.fake.probe(78.5, 150)
+        self.assertEqual(self.fake.pushes[-1]["message"], "Holding until the guest rings")
+        stale = datetime.fromtimestamp(self.fake.now - 600, timezone.utc).isoformat()
+        self.fake.change("event.abb_welcome_gateway_intercom", stale, {"event_type": "ring", "timestamp": stale})
+        self.assertIsNone(self.fake.app._tracker.probe.get("guest_at"))
+        callback = dict(self.fake.listeners)["binary_sensor.abb_welcome_gateway_intercom_ringing"]
+        callback("binary_sensor.abb_welcome_gateway_intercom_ringing", "state", "off", "on", {})
+        self.fake.drain()
+        self.assertEqual(self.fake.pushes[-1]["title"], "Ud med fadet")
+
     def test_recently_active_tablet_is_not_woken(self):
         self.fake.change("binary_sensor.oppopad4pro_interactive", "on")
         self.fake.bath(58)
@@ -247,6 +302,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(len(again.app._records), 1)
 
     def test_probe_shadow_record_and_house_event(self):
+        self.fake.command("probe_preset", {"key": "beef"})
         self.fake.probe(49, 100, [49, 51, 52, 53])
         self.fake.tick(30)
         self.fake.probe(50, 100, [50, 52, 53, 54])
